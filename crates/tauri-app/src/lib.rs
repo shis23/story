@@ -2318,30 +2318,50 @@ fn meta_accept_patch(
     }
 
     // 持久化到 CharacterStore（同步 world_info_entries）
-    // 从 tool_ctx 取最新的世界书，反序列化回 WorldInfoEntryInfo 写回存储
+    // 从 tool_ctx 取最新的世界书，按 is_global 分流回写：
+    //   - 全局条目：写回所有角色卡（跨卡共享语义）
+    //   - 非全局条目：只保留在各卡原有的非全局条目里（按 content 精确匹配，
+    //     不把 patch 修改的某卡私有条目覆盖到其他卡，也不丢失其他卡私有条目）
+    //
+    // 历史 bug：曾用 `all_stored.last()` 把整个合并视图（全局+多卡 merge）
+    // 全部写回最后一张卡，并把 is_global 硬编码 false，导致数据污染与全局标记丢失。
     {
         let ctx = state.tool_ctx.read().unwrap();
         if let Some(ref world_info) = ctx.world_info {
-            // 找到受影响的角色卡，更新其 world_info_entries
+            // 合并视图里的条目，保留 is_global（取自 route + 原卡标记）
+            let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
+                .entries
+                .iter()
+                .map(|e| crate::WorldInfoEntryInfo {
+                    keys: e.keys.clone(),
+                    content: e.content.clone(),
+                    constant: e.constant,
+                    route: format!("{:?}", e.route),
+                    is_global: true, // 合并视图里全局条目的真相
+                    depth: e.depth,
+                    order: e.order,
+                })
+                .collect();
+            // patch 修改的非全局条目（以 content 为指纹匹配回原卡）
+            let nonglobal_contents: std::collections::HashSet<String> = world_info
+                .entries
+                .iter()
+                .map(|e| e.content.clone())
+                .collect();
+
             let all_stored = get_store().list();
-            if let Some(last) = all_stored.last() {
-                let entries: Vec<crate::WorldInfoEntryInfo> = world_info
-                    .entries
+            for stored in &all_stored {
+                // 该卡保留：原有非全局条目（未被 patch 删除的） + 所有全局条目
+                let preserved_nonglobal: Vec<crate::WorldInfoEntryInfo> = stored
+                    .info
+                    .world_info_entries
                     .iter()
-                    .map(|e| crate::WorldInfoEntryInfo {
-                        keys: e.keys.clone(),
-                        content: e.content.clone(),
-                        constant: e.constant,
-                        route: format!("{:?}", e.route),
-                        is_global: false,
-                        depth: e.depth,
-                        order: e.order,
-                    })
+                    .filter(|e| !e.is_global && nonglobal_contents.contains(&e.content))
+                    .cloned()
                     .collect();
-                let _ = get_store().update_world_info_entries_bulk(
-                    &last.id,
-                    entries,
-                );
+                let mut new_entries = preserved_nonglobal;
+                new_entries.extend(global_entries.clone());
+                let _ = get_store().update_world_info_entries_bulk(&stored.id, new_entries);
             }
         }
     }
@@ -2395,13 +2415,13 @@ async fn meta_chat(
     let app = state.inner().clone();
     sync_meta_session_from_tool_ctx(&state);
 
-    // 取出对话（不存在则新建）
+    // 取出对话；不存在则返回错误（而非静默创建空对话，避免用户感觉"历史突然清空"）。
+    // 新对话应由 meta_start_conversation 命令显式建立。
     let mut conv = {
         let mut convs = app.meta_conversations.lock().unwrap();
-        convs.remove(&conversation_id).unwrap_or_else(|| {
-            let c = storyforge_app_meta::MetaConversation::new();
-            c
-        })
+        convs.remove(&conversation_id).ok_or_else(|| {
+            format!("Meta 对话不存在: {conversation_id}（请先调用 meta_start_conversation 创建）")
+        })?
     };
 
     // 构造 AgentRuntime（活跃 LLM 或 mock）

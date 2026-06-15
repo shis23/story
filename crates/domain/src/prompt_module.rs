@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 use crate::Id;
 use crate::agent::AgentRole;
 
+/// 判断模块是否适用于某个 Agent 角色，支持 `Subagent("*")` 通配符。
+///
+/// 与 `PromptProfile::selected_ids` / `override_text` 的通配符回退保持一致：
+/// 当模块的 `applicable_roles` 含 `Subagent("*")` 时，对任意 `Subagent(id)` 角色
+/// 都视为适用（避免内置子 Agent 模块因精确 `PartialEq` 比较而永远匹配不上具体角色）。
+fn role_applicable(applicable: &[AgentRole], role: &AgentRole) -> bool {
+    if applicable.iter().any(|r| r == role) {
+        return true;
+    }
+    // Subagent 通配符回退：applicable 含 Subagent("*") 则匹配任意 Subagent(_)
+    match role {
+        AgentRole::Subagent(_) => applicable
+            .iter()
+            .any(|r| matches!(r, AgentRole::Subagent(w) if w == "*")),
+        _ => false,
+    }
+}
+
 // ─── 提示词模块（对应设计 §3.6.6 三层预设体系 Layer ①）───────────────────
 
 /// 模块分类组（单选互斥 / 多选叠加）
@@ -154,7 +172,7 @@ pub fn assemble_system_prompt(
         for cat in &category_order {
             let ids = profile.selected_ids(role, cat);
             for mid in ids {
-                if let Some(m) = modules.iter().find(|m| &m.id == mid && m.applicable_roles.contains(role)) {
+                if let Some(m) = modules.iter().find(|m| &m.id == mid && role_applicable(&m.applicable_roles, role)) {
                     parts.push(m.content.clone());
                 }
             }
@@ -404,6 +422,62 @@ pub mod builtins {
             let text = "没有占位符的普通文本";
             let result = replace_template_vars(text, "Seraphina", "玩家");
             assert_eq!(result, "没有占位符的普通文本");
+        }
+
+        #[test]
+        fn test_role_applicable_subagent_wildcard() {
+            // 模块声明 applicable_roles 含 Subagent("*")，应匹配任意 Subagent(id)
+            let wildcard = vec![AgentRole::Subagent("*".into())];
+            assert!(super::role_applicable(&wildcard, &AgentRole::Subagent("林医生".into())));
+            assert!(super::role_applicable(&wildcard, &AgentRole::Subagent("any".into())));
+            // 精确匹配
+            let exact = vec![AgentRole::Director];
+            assert!(super::role_applicable(&exact, &AgentRole::Director));
+            assert!(!super::role_applicable(&exact, &AgentRole::Editor));
+            // 通配符不匹配非 Subagent 角色
+            assert!(!super::role_applicable(&wildcard, &AgentRole::Editor));
+        }
+
+        /// 回归：子 Agent 角色应能命中 applicable_roles 含 Subagent("*") 的模块。
+        /// Bug-2：旧实现 `applicable_roles.contains(role)` 用精确 PartialEq，
+        /// `Subagent("林医生") != Subagent("*")`，导致字数控制等子Agent模块永不生效。
+        #[test]
+        fn test_assemble_subagent_wildcard_module_applies() {
+            use std::collections::HashMap;
+            // 构造一个只对 Subagent("*") 生效的模块
+            let module = PromptModule {
+                id: Id::from_str("m-sub-control"),
+                name: "子Agent字数控制".into(),
+                category: ModuleCategory::Output,
+                content: "[子Agent专属约束]".into(),
+                exclusivity: crate::prompt_module::Exclusivity::Single,
+                source: crate::prompt_module::ModuleSource::BuiltIn,
+                applicable_roles: vec![AgentRole::Subagent("*".into())],
+                tags: vec![],
+            };
+            // Profile 把 Subagent("*") 的 Output 类别指向该模块
+            let mut selections = HashMap::new();
+            let mut cats = HashMap::new();
+            cats.insert(ModuleCategory::Output, vec![Id::from_str("m-sub-control")]);
+            selections.insert(AgentRole::Subagent("*".into()), cats);
+            let profile = PromptProfile {
+                id: Id::from_str("p1"),
+                name: "test".into(),
+                selections,
+                overrides: HashMap::new(),
+                source: crate::prompt_module::ProfileSource::BuiltIn,
+            };
+
+            // 子 Agent 角色组装时应包含该模块
+            let out = assemble_system_prompt(
+                &AgentRole::Subagent("林医生".into()),
+                "你是角色。",
+                Some(&profile),
+                &[module],
+                "",
+            );
+            assert!(out.contains("[子Agent专属约束]"),
+                "子Agent 应命中 Subagent(\"*\") 通配符模块，实际: {out}");
         }
     }
 }

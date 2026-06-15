@@ -186,14 +186,12 @@ impl CharacterInstance {
 
 // --- helpers --------------------------------------------------------------
 
+/// 当前时间的 ISO-8601 / RFC3339 字符串（与 RoundSummary.created_at 格式一致）。
+///
+/// 历史版本误用 `SystemTime::as_secs()` 返回 Unix 秒数字符串，与字段名 `created_at`
+/// 暗示的 ISO 格式矛盾，且与 `agent::RoundSummary` 的 rfc3339 格式不一致，统一修正。
 fn now_iso() -> String {
-    format!(
-        "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    )
+    chrono::Utc::now().to_rfc3339()
 }
 
 // --- tests ----------------------------------------------------------------

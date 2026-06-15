@@ -165,7 +165,11 @@ pub async fn chat(
         .await
         .map_err(|e| crate::MetaError::ExecutionFailed(format!("Meta Agent 运行失败: {e}")))?;
 
-    // 检查本轮是否提议了 patch（看 tool_calls 里有没有 meta_propose_patch）
+    // 解析本轮工具调用结果用于展示。
+    //
+    // 注意：meta_propose_patch 的实际 propose 副作用已在工具循环内由 handler 完成
+    // （register_meta_runtime_tools 注册的 meta_propose_patch handler 调 session.patches.propose）。
+    // 这里只读已提议的 patch 用于展示，**不再重复 propose**，否则会产生 2 个相同 patch。
     let mut new_patch: Option<Patch> = None;
     let mut tool_result = ToolResultDisplay::None;
 
@@ -184,21 +188,14 @@ pub async fn chat(
                 }
             }
             "meta_propose_patch" => {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                    let description = args
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("无描述")
-                        .to_string();
-                    let actions_val = args.get("actions").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-                    let actions: Vec<PatchAction> = serde_json::from_value(actions_val).unwrap_or_default();
-                    let patch = session.patches.propose(description, actions);
+                // handler 已 propose，取最近一条未采纳 patch 用于展示
+                if let Some(patch) = session.patches.pending().into_iter().last() {
                     tool_result = ToolResultDisplay::PatchProposed {
                         patch_id: patch.id.clone(),
                         description: patch.description.clone(),
                         action_count: patch.actions.len(),
                     };
-                    new_patch = Some(patch.clone());
+                    new_patch = Some(patch);
                 }
             }
             _ => {}

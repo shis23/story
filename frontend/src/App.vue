@@ -14,7 +14,7 @@ import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -440,6 +440,19 @@ async function handleAddVariant({ nodeId }) {
   }
 }
 
+// 切换变体（左右箭头 ‹ ›）：持久化到后端 + 更新本地 active_variant
+async function handleSwitchVariant({ messageId, index }) {
+  if (!currentConversationId.value) return
+  const msg = messages.value.find((m) => m.id === messageId)
+  if (!msg) return
+  try {
+    await apiSwitchVariant(currentConversationId.value, messageId, index)
+    msg.active_variant = index
+  } catch (e) {
+    console.error('切换变体失败:', e)
+  }
+}
+
 // 处理流水线事件（更新 UI）
 function handlePipelineEvent(event) {
   switch (event.event_type) {
@@ -639,12 +652,13 @@ function handlePipelineEvent(event) {
           :message="m"
           :conversation-id="currentConversationId"
           :busy="isWriting"
-          @reroll="handleReroll"
-          @edit-variant="handleEditVariant"
-          @accept-variant="handleAcceptVariant"
-          @delete-variant="handleDeleteVariant"
-          @add-variant="handleAddVariant"
-        />
+  @reroll="handleReroll"
+  @edit-variant="handleEditVariant"
+  @accept-variant="handleAcceptVariant"
+  @delete-variant="handleDeleteVariant"
+  @add-variant="handleAddVariant"
+  @switch-variant="handleSwitchVariant"
+/>
       </div>
 
       <div class="h-4"></div>
