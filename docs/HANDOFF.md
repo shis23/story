@@ -729,7 +729,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | ~~🔴 高~~ | ~~世界书条目 CRUD~~ | ✅ 已完成：update/add/delete_world_info_entry 3 命令 + CharacterDetail 内联编辑/新增/删除 | — |
 | ~~🔴 高~~ | ~~启动恢复 tool_ctx~~ | ✅ 已完成：AppState::new 从 characters.json 恢复角色卡+世界书到 tool_ctx（重启后不再丢失） | — |
 | 🔴 高 | **全局世界书** | 角色卡世界书条目可标记「全局共享」，标记后切其他角色卡也生效（蓝灯进导演常驻，绿灯进共享向量池）。方案：条目级标记（非整卡） | — |
-| 🔴 高 | **世界书 depth 生效** | 前端可看可改 depth/order 字段 + depth 控制蓝灯常驻条目在导演上下文的排序（depth 小靠后=重要，对齐 ST「近因效应」语义） | — |
+| ~~🔴 高~~ | ~~**世界书 depth 生效**~~ | ✅ 已完成：编辑表单加 depth/order 数字输入 + 查看模式显示 depth 徽章（d2）+ 后端已支持排序 | — |
 | 🔴 高 | **预设持久化+查看** | 预设导入后持久化（目前只返回字符串不存）+ 列表查看 + 详情（每条 prompt 的 role/content/identifier）。`{{char}}` `{{user}}` 占位符替换归入此线（ST prompt-template 功能） | — |
 | 🔴 高 | **Android 模拟器验证** | NDK + Gradle + APK 编译已成功，模拟器启动需开 VT-x + 装 HAXM | 用户操作 BIOS + 安装 HAXM |
 | 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环 + **P2 后处理流水线已全部完成**。剩余：前端 Campaign 开档 UI + 共享 WebView 兜底（P3） | — |
