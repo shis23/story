@@ -119,6 +119,50 @@ export async function setPluginEnabled(id, enabled) {
   }
 }
 
+// ─── 预设/模块系统 ──────────────────────────────────────────────────────────
+
+/** 列出所有模块（内置+自定义，含 enabled 状态） */
+export async function listModules() {
+  if (isTauri()) {
+    return await invoke('list_modules')
+  }
+}
+
+/** 更新模块内容或启停状态 */
+export async function updateModule(id, content, enabled) {
+  if (isTauri()) {
+    return await invoke('update_module', { id, content, enabled })
+  }
+}
+
+/** 列出所有 Profile */
+export async function listProfiles() {
+  if (isTauri()) {
+    return await invoke('list_profiles')
+  }
+}
+
+/** 获取当前活跃 Profile */
+export async function getActiveProfile() {
+  if (isTauri()) {
+    return await invoke('get_active_profile')
+  }
+}
+
+/** 保存/更新 Profile */
+export async function saveProfile(profileJson) {
+  if (isTauri()) {
+    return await invoke('save_profile', { profileJson })
+  }
+}
+
+/** 设置活跃 Profile */
+export async function setActiveProfile(id) {
+  if (isTauri()) {
+    return await invoke('set_active_profile', { id })
+  }
+}
+
 /**
  * 获取版本号
  */

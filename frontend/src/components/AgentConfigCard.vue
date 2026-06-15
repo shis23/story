@@ -1,17 +1,22 @@
 <script setup>
-import { promptModules } from '../mock.js'
-import { ref, onMounted } from 'vue'
-import { listConnections, setActiveConnection as apiSetActive } from '../tauri-api.js'
+import { ref, onMounted, computed } from 'vue'
+import { listConnections, setActiveConnection as apiSetActive, listModules, getActiveProfile, saveProfile, updateModule } from '../tauri-api.js'
 
-const modules = ref(promptModules)
 const connections = ref([])
 const activeConnId = ref(null)
 const showConnList = ref(false)
+
+// 模块系统
+const allModules = ref([])
+const activeProfile = ref(null)
+const loadingModules = ref(false)
+const saving = ref(false)
 
 const emit = defineEmits(['open-connection-config'])
 
 onMounted(async () => {
   await loadConnections()
+  await loadModules()
 })
 
 async function loadConnections() {
@@ -39,21 +44,107 @@ async function selectConn(id) {
   }
 }
 
-// 单选组：点新的，同组其他取消
-function selectSingle(category, id) {
-  modules.value[category].forEach(m => m.selected = (m.id === id))
-}
-// 多选组：切换
-function toggleMulti(category, id) {
-  const m = modules.value[category].find(x => x.id === id)
-  if (m) m.selected = !m.selected
+// ─── 模块系统 ──────────────────────────────────────────────────────────
+
+const categoryLabels = {
+  Perspective: '视角',
+  Style: '文风',
+  Cot: '思维链',
+  Quality: '约束',
+  Output: '输出',
+  Tone: '基调',
 }
 
-const categoryMeta = {
-  perspective: { label: '视角', single: true },
-  style: { label: '文风', single: true },
-  cot: { label: '思维链', single: true },
-  quality: { label: '约束', single: false },
+const singleCategories = new Set(['Perspective', 'Style', 'Cot', 'Tone'])
+
+async function loadModules() {
+  loadingModules.value = true
+  try {
+    const [modules, profile] = await Promise.all([listModules(), getActiveProfile()])
+    allModules.value = modules || []
+    activeProfile.value = profile || null
+  } catch (e) {
+    console.error('加载模块失败:', e)
+  } finally {
+    loadingModules.value = false
+  }
+}
+
+// 按 category 分组的模块
+const modulesByCategory = computed(() => {
+  const groups = {}
+  for (const m of allModules.value) {
+    if (!groups[m.category]) groups[m.category] = []
+    groups[m.category].push(m)
+  }
+  return groups
+})
+
+// 当前 Profile 中每个 category 选中的模块 ID
+function getSelectedIds(category) {
+  if (!activeProfile.value?.selections) return []
+  // selections: { "Director": { "Perspective": ["id1"], ... }, ... }
+  // 我们显示 Editor 的选择（最直观）
+  const editorSelections = activeProfile.value.selections['Editor'] || {}
+  return editorSelections[category] || []
+}
+
+function isSelected(category, moduleId) {
+  return getSelectedIds(category).includes(moduleId)
+}
+
+async function toggleModule(category, moduleId) {
+  if (!activeProfile.value) return
+
+  const isSingle = singleCategories.has(category)
+  const selections = JSON.parse(JSON.stringify(activeProfile.value.selections))
+
+  // 确保 Editor 的 category 存在
+  if (!selections['Editor']) selections['Editor'] = {}
+  if (!selections['Editor'][category]) selections['Editor'][category] = []
+
+  let ids = selections['Editor'][category]
+  const idx = ids.indexOf(moduleId)
+
+  if (isSingle) {
+    // 单选：切换到新选项
+    ids = [moduleId]
+  } else {
+    // 多选：toggle
+    if (idx >= 0) {
+      ids.splice(idx, 1)
+    } else {
+      ids.push(moduleId)
+    }
+  }
+  selections['Editor'][category] = ids
+
+  // 同步更新 Subagent("*") 的 Output 选择
+  if (category === 'Output') {
+    if (!selections['Subagent("*")']) selections['Subagent("*")'] = {}
+    selections['Subagent("*")']['Output'] = [...ids]
+  }
+
+  // 保存
+  saving.value = true
+  try {
+    const profile = { ...activeProfile.value, selections }
+    await saveProfile(JSON.stringify(profile))
+    activeProfile.value = profile
+  } catch (e) {
+    console.error('保存 Profile 失败:', e)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function toggleModuleEnabled(module) {
+  try {
+    await updateModule(module.id, null, !module.enabled)
+    await loadModules()
+  } catch (e) {
+    console.error('更新模块状态失败:', e)
+  }
 }
 
 defineExpose({ loadConnections })
@@ -64,24 +155,35 @@ defineExpose({ loadConnections })
     <div class="flex items-center gap-2 mb-3">
       <span class="text-base">🎬</span>
       <span class="text-sm font-medium text-ink">导演 Agent</span>
-      <span class="ml-auto text-xs text-ink-soft">小说预设v2</span>
+      <span class="ml-auto text-xs text-ink-soft">
+        {{ activeProfile?.name || '默认预设' }}
+        <span v-if="saving" class="text-accent ml-1">保存中…</span>
+      </span>
     </div>
 
+    <!-- 加载中 -->
+    <div v-if="loadingModules" class="text-center text-ink-soft text-xs py-4">加载模块…</div>
+
     <!-- 各模块组 -->
-    <div class="space-y-3">
-      <div v-for="(mods, cat) in categoryMeta" :key="cat">
-        <div class="text-[11px] text-ink-soft mb-1.5">{{ mods.label }}</div>
+    <div v-else class="space-y-3">
+      <div v-for="(mods, cat) in modulesByCategory" :key="cat">
+        <div class="text-[11px] text-ink-soft mb-1.5">{{ categoryLabels[cat] || cat }}</div>
         <div class="flex flex-wrap gap-1.5">
           <button
-            v-for="m in modules[cat]"
+            v-for="m in mods"
             :key="m.id"
-            @click="mods.single ? selectSingle(cat, m.id) : toggleMulti(cat, m.id)"
-            class="px-2.5 py-1 rounded-full text-xs transition-all"
-            :class="m.selected
-              ? 'bg-accent text-white'
-              : 'bg-bg text-ink-soft hover:bg-line'"
+            @click="toggleModule(cat, m.id)"
+            class="px-2.5 py-1 rounded-full text-xs transition-all relative"
+            :class="[
+              isSelected(cat, m.id)
+                ? 'bg-accent text-white'
+                : 'bg-bg text-ink-soft hover:bg-line',
+              !m.enabled ? 'opacity-40' : ''
+            ]"
+            :title="!m.enabled ? '已禁用（点击切换选择）' : m.content?.substring(0, 80)"
           >
             {{ m.name }}
+            <span v-if="!m.enabled" class="absolute -top-1 -right-1 text-[8px] text-warn">✕</span>
           </button>
         </div>
       </div>
@@ -132,7 +234,10 @@ defineExpose({ loadConnections })
     </div>
 
     <!-- 保存预设 -->
-    <button class="w-full mt-3 py-2 text-xs text-accent border border-dashed border-accent-border rounded-lg hover:bg-accent-soft">
+    <button
+      @click="null"
+      class="w-full mt-3 py-2 text-xs text-accent border border-dashed border-accent-border rounded-lg hover:bg-accent-soft"
+    >
       💾 保存当前为新预设
     </button>
   </div>
