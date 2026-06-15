@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-15（前端 Campaign UI 实现）
+> 最后更新：2026-06-16（M4 插件系统前端实现）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线**），
@@ -670,9 +670,12 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 任务 | 说明 | 状态 |
 |------|------|------|
 | ~~infra-plugin-host~~ | PluginManifest / Permission / UiSlot / PluginRegistry / 权限校验 / ST API 映射 | ✅ 完成 |
-| 前端：iframe 沙箱宿主 | 插件 iframe + postMessage API 桥 | ⏳ 后续 |
-| 前端：角色卡 iframe 渲染 | 带 HTML 的 ST 角色卡渲染 | ⏳ 后续 |
-| 前端：插件管理页 | 安装/卸载/启用/禁用 + UI slot 挂载 | ⏳ 后续 |
+| ~~后端：AppState + Tauri Commands~~ | plugin_registry 接入 AppState + list/install/uninstall/set_enabled 4 命令 | ✅ 完成 |
+| ~~前端：插件管理页~~ | PluginPanel.vue + tauri-api.js 4 函数 + App.vue 集成 | ✅ 完成 |
+| ~~前端：iframe 沙箱宿主~~ | PluginHost.vue + plugin-bridge.js（postMessage 协议 + window.storyforge stub） | ✅ 完成 |
+| ~~前端：Slot 挂载集成~~ | 侧栏插件面板（SidebarPanel slot）+ 可折叠区域 | ✅ 完成 |
+| ~~后端：插件 API 命令~~ | plugin_list_characters / plugin_read_character / plugin_get_variable / plugin_set_variable（权限二次校验） | ✅ 完成 |
+| 前端：角色卡 iframe 渲染 | 带 HTML 的 ST 角色卡渲染（需共享 WebView，§19.6） | ⏳ 后续 |
 
 ### 7.5 M5：Meta Agent ✅ 后端骨架完成（部分能力待补）
 
@@ -740,7 +743,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | ~~🟡 中~~ | ~~归档器接入~~ | ✅ 已完成：accept_variant 后自动 spawn 后台任务触发 maybe_archive（阈值 50 条，未配嵌入 API 静默跳过） | — |
 | 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
 | ~~🟡 中~~ | ~~ST 占位符替换~~ | ✅ 已完成：`replace_template_vars()` 支持 `{{char}}` `{{user}}` `{{charIfNotUser}}`，待接入流水线 | — |
-| 🟢 低 | M4 插件运行时前端 | iframe 沙箱 + window.storyforge API 桥 + 角色卡 HTML 渲染 | 工作量大 |
+| ~~🟢 低~~ | ~~M4 插件运行时前端~~ | ✅ 已完成：PluginPanel.vue + PluginHost.vue + plugin-bridge.js + 4 个插件 API 命令 + 侧栏 Slot 挂载 | — |
 | 🟢 低 | app-meta 插件生成 / ST 预设导入分析 | 设计 §9.2/§9.4 的 meta_generate_plugin_from_st 等 | 工作量大 |
 | 🟢 低 | infra-secrets + Keystore | API key 改走安全存储 | Android 环境 |
 
