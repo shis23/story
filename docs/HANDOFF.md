@@ -735,6 +735,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环 + **P2 后处理流水线已全部完成**。剩余：前端 Campaign 开档 UI + 共享 WebView 兜底（P3） | — |
 | 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。**P1 已完成字段级 stat_data 解析**（探测 extensions.mvu.initvar / stat_data / variables，合并进 CharacterDefinition.variable_schema）。剩余：重 DOM 卡 JS 分析 + WebView 兜底（P3） | 共享 WebView 依赖插件运行时 |
 | ~~🔴 高~~ | ~~**前端 Campaign 开档 UI**~~ | ✅ 已完成：CampaignPanel.vue（3 tab：角色卡/游玩档/档详情）+ tauri-api.js 21 个 P1/P2 函数 + AppHeader Campaign 按钮 + App.vue 集成 | — |
+| ~~🔴 高~~ | ~~**全局世界书**~~ | ✅ 已完成：条目级 is_global 标记 + 前端「🌐 全局共享」开关 + 跨卡 merge 逻辑 | — |
 | 🟡 中 | 归档器接入 | accept_variant 后触发 maybe_archive | 需配嵌入 API |
 | 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
 | 🟢 低 | M4 插件运行时前端 | iframe 沙箱 + window.storyforge API 桥 + 角色卡 HTML 渲染 | 工作量大 |
