@@ -206,15 +206,7 @@ fn parse_definitions_from_content(content: &str) -> Option<Vec<CharacterDefiniti
 
 /// 从 content 提取指定语言的代码块内容
 fn try_extract_codeblock(content: &str, lang: &str) -> Option<String> {
-    let fence = if lang.is_empty() {
-        "```".to_string()
-    } else {
-        format!("```{lang}")
-    };
-    let start = content.find(&fence)?;
-    let after_fence = &content[start + fence.len()..];
-    let end = after_fence.find("```")?;
-    Some(after_fence[..end].trim().to_string())
+    crate::llm_parse::extract_codeblock(content, lang)
 }
 
 /// 手写括号配平：找 `[` ... `]` 数组，逐个提取 `{...}` 对象解析
@@ -235,7 +227,7 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
             None => break,
         };
         let brace_start = search_from + rel;
-        if let Some(end) = match_braces(after_bracket, brace_start) {
+        if let Some(end) = crate::llm_parse::match_braces(after_bracket, brace_start) {
             let candidate = &after_bracket[brace_start..=end];
             if let Ok(dto) = serde_json::from_str::<CharacterDefDto>(candidate) {
                 defs.push(dto_to_definition(dto));
@@ -255,42 +247,10 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
     }
 }
 
-/// 从 pos 位置的 `{` 开始，找配平的 `}` byte index（处理字符串转义）
+/// 从 pos 位置的 `{` 开始，找配平的 `}` byte index（处理字符串转义）—— 委托公共模块
+#[allow(dead_code)]
 fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    let chars: Vec<char> = content[pos..].chars().collect();
-    if chars.is_empty() || chars[0] != '{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut byte_offset = pos;
-
-    for ch in chars {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else {
-            match ch {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(byte_offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-        byte_offset += ch.len_utf8();
-    }
-    None
+    crate::llm_parse::match_braces(content, pos)
 }
 
 // ─── 测试 ─────────────────────────────────────────────────────────────────

@@ -1120,36 +1120,26 @@ fn make_editor_config(
 /// 4. ``` ... ``` 代码块（无 json 标签）
 /// 5. 大括号提取：从 content 中贪心抓最大的 {...} 块
 fn parse_plan_from_response(resp: &storyforge_domain::llm::ChatResponse) -> Result<Plan, PipelineError> {
-    // ① tool_calls 中的 emit_plan
-    for tc in &resp.tool_calls {
-        if tc.function.name == "emit_plan" {
-            let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                .map_err(|e| PipelineError::PlanParse(format!("emit_plan 参数解析失败: {e}")))?;
-            return parse_plan_json(&args);
-        }
+    let parse = |v: &serde_json::Value| -> Option<Plan> {
+        serde_json::from_value::<serde_json::Value>(v.clone())
+            .ok()
+            .and_then(|val| parse_plan_json(&val).ok())
+    };
+
+    // ① tool_calls 中的 emit_plan（层 1）
+    if let Some(plan) = storyforge_app_agent::llm_parse::from_tool_call(resp, "emit_plan", &parse) {
+        return Ok(plan);
     }
 
     let content = resp.content.trim();
     if !content.is_empty() {
-        // ② 整个 content 是 JSON
-        if let Ok(args) = serde_json::from_str::<serde_json::Value>(content) {
-            if let Ok(plan) = parse_plan_json(&args) {
-                return Ok(plan);
-            }
-        }
-
-        // ③ ```json ... ``` 代码块
-        if let Some(plan) = try_extract_codeblock(content, "json") {
-            return Ok(plan);
-        }
-
-        // ④ ``` ... ``` 代码块（无语言标签）
-        if let Some(plan) = try_extract_codeblock(content, "") {
-            return Ok(plan);
-        }
-
-        // ⑤ 大括号提取：贪心抓最大的 {...} 块
-        if let Some(plan) = try_extract_braces(content) {
+        // ②-⑤：整体 JSON / ```json / 裸代码块 / 括号配平（层 2-5）
+        let parse_text = |s: &str| -> Option<Plan> {
+            serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|val| parse_plan_json(&val).ok())
+        };
+        if let Some(plan) = storyforge_app_agent::llm_parse::parse_from_content(content, parse_text) {
             return Ok(plan);
         }
     }
@@ -1158,95 +1148,6 @@ fn parse_plan_from_response(resp: &storyforge_domain::llm::ChatResponse) -> Resu
         "导演响应中未找到有效 Plan。导演原始输出（前 500 字）：{}",
         resp.content.chars().take(500).collect::<String>()
     )))
-}
-
-/// 从 ```lang ... ``` 代码块中提取并解析 Plan
-fn try_extract_codeblock(content: &str, lang: &str) -> Option<Plan> {
-    let pattern = if lang.is_empty() {
-        r"```([\s\S]*?)```"
-    } else {
-        r"```[a-zA-Z]*([\s\S]*?)```"
-    };
-    let re = regress::Regex::new(pattern).ok()?;
-    for m in re.find_iter(content) {
-        if let Some(json_str) = m.group(1).and_then(|g| content.get(g)) {
-            let trimmed = json_str.trim();
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Ok(plan) = parse_plan_json(&args) {
-                    return Some(plan);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 从 content 中提取第一个**括号配平**的 {...} 块（手写，不依赖正则）
-///
-/// 从第一个 `{` 开始，计数 `{` 和 `}`（考虑字符串内的转义），到配平为止。
-/// 这样能正确处理中文、嵌套对象、代码块外的文字。
-/// 比正则贪心匹配更可靠（regress 对多字节字符的 range 可能有坑）。
-fn try_extract_braces(content: &str) -> Option<Plan> {
-    // 找所有候选：从每个 `{` 开始尝试配平
-    let bytes = content.as_bytes();
-    let mut start_idx = 0;
-    while start_idx < content.len() {
-        // 找下一个 `{`
-        let rel = content[start_idx..].find('{')?;
-        let brace_start = start_idx + rel;
-        // 从这个 `{` 开始配平
-        if let Some(end) = match_braces(content, brace_start) {
-            let candidate = &content[brace_start..=end];
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(candidate) {
-                if let Ok(plan) = parse_plan_json(&args) {
-                    return Some(plan);
-                }
-            }
-        }
-        start_idx = brace_start + 1;
-        let _ = bytes; // 避免未用警告
-    }
-    None
-}
-
-/// 从 pos 位置的 `{` 开始，找配平的 `}` 位置（处理字符串内的引号转义）
-///
-/// 返回 `}` 的 byte index。如果中途括号不匹配（如未闭合），返回 None。
-fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    let chars: Vec<char> = content[pos..].chars().collect();
-    if chars.is_empty() || chars[0] != '{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut byte_offset = pos;
-
-    for ch in chars {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else {
-            match ch {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(byte_offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-        byte_offset += ch.len_utf8();
-    }
-    None // 未闭合
 }
 
 /// 解析 Plan JSON（宽松：允许 subagent_tasks 缺失或为空）

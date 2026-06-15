@@ -6,6 +6,7 @@
 /// - 工具注册（search_world_info / get_character / emit_plan / compose）
 pub mod runtime;
 pub mod tools;
+pub mod llm_parse;
 
 pub mod character_extractor;
 pub mod pipeline_postprocess;

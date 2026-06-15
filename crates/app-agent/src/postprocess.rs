@@ -257,65 +257,12 @@ fn parse_from_content(content: &str) -> Option<PostProcessResult> {
 }
 
 fn extract_codeblock(content: &str, lang: &str) -> Option<String> {
-    let fence = if lang.is_empty() {
-        "```".to_string()
-    } else {
-        format!("```{lang}")
-    };
-    let start = content.find(&fence)?;
-    let after = &content[start + fence.len()..];
-    let end = after.find("```")?;
-    Some(after[..end].trim().to_string())
+    crate::llm_parse::extract_codeblock(content, lang)
 }
 
-/// 从 content 找第一个配平的 {...}
+/// 从 content 找第一个配平的 {...}（委托公共模块，retry=true 更健壮）
 fn extract_first_braces(content: &str) -> Option<String> {
-    let mut start = 0;
-    while start < content.len() {
-        let rel = content[start..].find('{')?;
-        let brace_start = start + rel;
-        if let Some(end) = match_braces(content, brace_start) {
-            return Some(content[brace_start..=end].to_string());
-        }
-        start = brace_start + 1;
-    }
-    None
-}
-
-fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    let chars: Vec<char> = content[pos..].chars().collect();
-    if chars.is_empty() || chars[0] != '{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut byte_offset = pos;
-    for ch in chars {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else {
-            match ch {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(byte_offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-        byte_offset += ch.len_utf8();
-    }
-    None
+    crate::llm_parse::extract_first_braces(content, true)
 }
 
 // ─── 测试 ─────────────────────────────────────────────────────────────────

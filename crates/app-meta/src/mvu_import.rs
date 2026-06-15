@@ -162,7 +162,7 @@ fn parse_mvu_from_content(content: &str, field_schema: &[VariableField]) -> Opti
     }
 
     // 层 3：```json 代码块
-    if let Some(extracted) = try_extract_codeblock(content, "json") {
+    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "json") {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
             if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
                 return Some(t);
@@ -171,7 +171,7 @@ fn parse_mvu_from_content(content: &str, field_schema: &[VariableField]) -> Opti
     }
 
     // 层 4：裸代码块
-    if let Some(extracted) = try_extract_codeblock(content, "") {
+    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "") {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
             if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
                 return Some(t);
@@ -179,17 +179,13 @@ fn parse_mvu_from_content(content: &str, field_schema: &[VariableField]) -> Opti
         }
     }
 
-    // 层 5：手写括号配平（从第一个 `{` 开始，提取配平的 {...} 对象）
-    if let Some(start) = content.find('{') {
-        if let Some(end) = match_braces(content, start) {
-            // 只取 {start..=end}（JSON 本体），不含前后噪声文本
-            let candidate = &content[start..=end];
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
-                if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
-                    return Some(t);
-                }
-            }
-        }
+    // 层 5：括号配平（委托公共模块，逐个 `{` 尝试，比"只试第一个"更健壮）
+    if let Some(t) = storyforge_app_agent::llm_parse::try_each_braces(content, |candidate| {
+        serde_json::from_str::<serde_json::Value>(candidate)
+            .ok()
+            .and_then(|val| parse_mvu_from_value(&val, field_schema).ok())
+    }) {
+        return Some(t);
     }
 
     None
@@ -499,59 +495,6 @@ fn parse_action(val: &serde_json::Value) -> InteractionAction {
     }
 }
 
-/// 从 content 提取指定语言的代码块内容
-fn try_extract_codeblock(content: &str, lang: &str) -> Option<String> {
-    let fence = if lang.is_empty() {
-        "```".to_string()
-    } else {
-        format!("```{lang}")
-    };
-    let start = content.find(&fence)?;
-    let after_fence = &content[start + fence.len()..];
-    let end = after_fence.find("```")?;
-    Some(after_fence[..end].trim().to_string())
-}
-
-/// 从 pos 位置的 `{` 开始，找配平的 `}` byte index（处理字符串转义）
-///
-/// 独立实现，不跨文件复用 character_extractor 的私有 fn（避免耦合）。
-fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    let chars: Vec<char> = content[pos..].chars().collect();
-    if chars.is_empty() || chars[0] != '{' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut byte_offset = pos;
-
-    for ch in chars {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else {
-            match ch {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(byte_offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-        byte_offset += ch.len_utf8();
-    }
-    None
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // ST 预设 LLM 分类
 // ═══════════════════════════════════════════════════════════════════════════
@@ -633,38 +576,15 @@ fn parse_st_classification(
             .map(|dto| dto.into_classification(&preset.name))
     };
 
-    // 层 1：整体 content 是 JSON
+    // 层 1-4：整体 JSON / ```json / 裸代码块 / 括号配平（委托公共模块）
     let content = resp.content.trim();
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Some(c) = parse_from(&val) {
-            return Ok(c);
-        }
-    }
-    // 层 2：```json
-    if let Some(extracted) = try_extract_codeblock(content, "json") {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
-            if let Some(c) = parse_from(&val) {
-                return Ok(c);
-            }
-        }
-    }
-    // 层 3：裸代码块
-    if let Some(extracted) = try_extract_codeblock(content, "") {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
-            if let Some(c) = parse_from(&val) {
-                return Ok(c);
-            }
-        }
-    }
-    // 层 4：括号配平
-    if let Some(start) = content.find('{') {
-        if let Some(end) = match_braces(content, start) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content[start..=end]) {
-                if let Some(c) = parse_from(&val) {
-                    return Ok(c);
-                }
-            }
-        }
+    let parse_text = |s: &str| -> Option<StPresetClassification> {
+        serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .and_then(|val| parse_from(&val))
+    };
+    if let Some(c) = storyforge_app_agent::llm_parse::parse_from_content(content, parse_text) {
+        return Ok(c);
     }
 
     Err(MetaError::ExecutionFailed(format!(
