@@ -48,7 +48,7 @@ pub enum PipelineError {
     InvalidState(String),
 }
 
-// ─── 编剧提示词（硬编码骨架，M3 再接模块系统）────────────────────────────────
+// ─── 编剧提示词（role_directive，模块系统通过 assemble_system_prompt 增强）───
 
 const DIRECTOR_SYSTEM_PROMPT: &str = r#"你是写作导演。用户给你写作意图，你要：
 
@@ -110,6 +110,10 @@ pub struct WritingContext {
     pub pending_tasks: Vec<storyforge_domain::story_task::StoryTask>,
     /// 故事时钟（P2 新增，用于任务 StoryTime 触发比对 + 后处理上下文）
     pub story_clock: String,
+    /// 预设 Profile（模块选择配置，用于组装 system prompt）
+    pub profile: Option<storyforge_domain::prompt_module::PromptProfile>,
+    /// 可用模块列表（Profile 引用的模块定义）
+    pub modules: Vec<storyforge_domain::prompt_module::PromptModule>,
 }
 
 impl WritingContext {
@@ -127,6 +131,8 @@ impl WritingContext {
             turn: 0,
             pending_tasks: vec![],
             story_clock: String::new(),
+            profile: None,
+            modules: vec![],
         }
     }
 }
@@ -216,7 +222,7 @@ impl PipelineOrchestrator {
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
-        let director_config = make_director_config();
+        let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
 
@@ -345,7 +351,7 @@ impl PipelineOrchestrator {
         });
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config();
+        let editor_config = make_editor_config(ctx.profile.as_ref(), &ctx.modules);
 
         // 构造编剧的用户消息（子 Agent 产出）
         let performances_text: String = performances
@@ -599,7 +605,7 @@ impl PipelineOrchestrator {
                 return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
             }
 
-            let director_config = make_director_config();
+            let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
 
@@ -719,6 +725,8 @@ impl PipelineOrchestrator {
                     &req,
                     event_tx,
                     cancel,
+                    ctx.profile.as_ref(),
+                    &ctx.modules,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -760,6 +768,8 @@ impl PipelineOrchestrator {
                     &req,
                     event_tx,
                     cancel,
+                    ctx.profile.as_ref(),
+                    &ctx.modules,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -797,7 +807,7 @@ impl PipelineOrchestrator {
             });
 
             // 重跑该子 Agent（单任务，注入 hint 到 system prompt）
-            let director_config = make_director_config();
+            let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
             let new_perf = {
                 let mut sys = format!(
                     "{}\n\n你是角色 {}。\n\n{}\n\n{}",
@@ -884,6 +894,8 @@ impl PipelineOrchestrator {
                     &req,
                     event_tx,
                     cancel,
+                    ctx.profile.as_ref(),
+                    &ctx.modules,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -909,6 +921,8 @@ impl PipelineOrchestrator {
         req: &RegenerateRequest,
         event_tx: mpsc::UnboundedSender<PipelineEvent>,
         cancel: watch::Receiver<bool>,
+        profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+        modules: &[storyforge_domain::prompt_module::PromptModule],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -919,7 +933,7 @@ impl PipelineOrchestrator {
         self.state = PipelineState::Editing;
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config();
+        let editor_config = make_editor_config(profile, modules);
 
         let performances_text: String = performances
             .iter()
@@ -1054,22 +1068,42 @@ fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
     msg
 }
 
-/// 构造导演 Agent 配置
-fn make_director_config() -> AgentConfig {
+/// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive）
+fn make_director_config(
+    profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+    modules: &[storyforge_domain::prompt_module::PromptModule],
+) -> AgentConfig {
+    let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+        &AgentRole::Director,
+        DIRECTOR_SYSTEM_PROMPT,
+        profile,
+        modules,
+        "",
+    );
     AgentConfig {
         role: AgentRole::Director,
-        system_prompt: DIRECTOR_SYSTEM_PROMPT.to_string(),
+        system_prompt,
         max_tool_rounds: 15,
-        model: "deepseek-chat".to_string(), // 默认模型，后续从连接配置读取
+        model: "deepseek-chat".to_string(),
         tools: vec![],
     }
 }
 
-/// 构造编剧 Agent 配置
-fn make_editor_config() -> AgentConfig {
+/// 构造编剧 Agent 配置（通过 assemble_system_prompt 增强 role_directive）
+fn make_editor_config(
+    profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+    modules: &[storyforge_domain::prompt_module::PromptModule],
+) -> AgentConfig {
+    let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+        &AgentRole::Editor,
+        EDITOR_SYSTEM_PROMPT,
+        profile,
+        modules,
+        "",
+    );
     AgentConfig {
         role: AgentRole::Editor,
-        system_prompt: EDITOR_SYSTEM_PROMPT.to_string(),
+        system_prompt,
         max_tool_rounds: 5,
         model: "deepseek-chat".to_string(),
         tools: vec![],

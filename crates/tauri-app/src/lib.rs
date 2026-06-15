@@ -1166,7 +1166,11 @@ async fn start_writing(
         turn: 0,
         pending_tasks: vec![],
         story_clock: String::new(),
+        profile: None,
+        modules: vec![],
     };
+    // 从模块/Profile 存储加载预设配置
+    fill_profile_context(&mut ctx, &app);
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
     fill_campaign_context(&mut ctx);
 
@@ -1241,6 +1245,25 @@ async fn start_writing(
             "node_id": node_id.to_string(),
         })),
         Err(e) => Err(format!("写作失败: {e}")),
+    }
+}
+
+/// 从模块/Profile 存储加载预设配置到 WritingContext
+///
+/// 无 Profile 时不动 ctx（profile 保持 None → 流水线用硬编码常量兜底）。
+fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
+    // 加载活跃 Profile
+    if let Some(profile) = state.profile_store.get_active() {
+        // 加载所有启用的模块
+        let modules: Vec<_> = state
+            .module_store
+            .list_all()
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(m, _)| m)
+            .collect();
+        ctx.profile = Some(profile);
+        ctx.modules = modules;
     }
 }
 
@@ -1467,7 +1490,10 @@ async fn regenerate(
         turn: 0,
         pending_tasks: vec![],
         story_clock: String::new(),
+        profile: None,
+        modules: vec![],
     };
+    fill_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx);
 
     // cancel channel
