@@ -44,7 +44,7 @@ pub struct VariableField {
 }
 
 impl VariableField {
-    fn int(key: &str, label: &str, default: i64, group: &str) -> Self {
+    pub(crate) fn int(key: &str, label: &str, default: i64, group: &str) -> Self {
         Self {
             key: key.into(),
             label: label.into(),
@@ -55,7 +55,7 @@ impl VariableField {
         }
     }
 
-    fn string(key: &str, label: &str, default: &str, group: &str) -> Self {
+    pub(crate) fn string(key: &str, label: &str, default: &str, group: &str) -> Self {
         Self {
             key: key.into(),
             label: label.into(),
@@ -66,7 +66,7 @@ impl VariableField {
         }
     }
 
-    fn json(key: &str, label: &str, default: serde_json::Value, group: &str) -> Self {
+    pub(crate) fn json(key: &str, label: &str, default: serde_json::Value, group: &str) -> Self {
         Self {
             key: key.into(),
             label: label.into(),
@@ -154,6 +154,140 @@ pub fn merge_schema(base: &[VariableField], extra: &[VariableField]) -> Vec<Vari
         map.insert(f.key.clone(), f.clone());
     }
     map.into_values().collect()
+}
+
+// ─── MVU initvar 探测（字段级解析，对应设计 §19 / §23.3）─────────────────
+//
+// P1 阶段只做字段级解析：探测 ST 卡 extensions 里的结构化 stat_data / initvar
+// 字段，解析成 Vec<VariableField>。复杂 JS 分析 + WebView 兜底留 P3。
+//
+// 探测的常见结构（按优先级）：
+// 1. extensions.mvu.initvar —— 显式 MVU 插件 initvar 字段（JSON 对象）
+// 2. extensions.stat_data —— ST 风格的扁平 stat_data（JSON 对象）
+// 3. extensions.variables / extensions.depth_prompt.variables —— 其他变量插件
+// 找不到返回空 vec（保守策略，不报错；调用方用基础表兜底）。
+
+/// 从 ST 卡的 extensions 探测 MVU / stat_data 字段，解析成变量 schema。
+///
+/// 输入是 `Character.extensions`（裸 serde_json::Value）。找不到结构化字段返回空 vec。
+pub fn extract_mvu_schema_from_extensions(extensions: &serde_json::Value) -> Vec<VariableField> {
+    // 候选路径（按优先级），任一命中即返回
+    let candidates: &[&str] = &[
+        // ① MVU 插件 initvar（最显式）
+        "mvu.initvar",
+        // ② ST 风格 stat_data
+        "stat_data",
+        // ③ 通用 variables 插件
+        "variables",
+        // ④ depth_prompt 内嵌变量
+        "depth_prompt.variables",
+    ];
+
+    for path in candidates {
+        if let Some(obj) = pick_nested(extensions, path) {
+            if let serde_json::Value::Object(map) = obj {
+                let fields = parse_variable_objects(&map);
+                if !fields.is_empty() {
+                    return fields;
+                }
+            }
+        }
+    }
+    vec![]
+}
+
+/// 按点分路径取嵌套字段（extensions.mvu.initvar → 取 obj["mvu"]["initvar"]）
+fn pick_nested<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for key in path.split('.') {
+        current = current.get(key)?;
+    }
+    Some(current)
+}
+
+/// 把 stat_data / initvar 对象解析成 Vec<VariableField>
+///
+/// 兼容两种 MVU 写法：
+/// - 标量值：`"hp": 100` → label 推断为 "hp"，类型按值推断
+/// - 完整对象：`"hp": {"label": "生命值", "type": "int", "default": 100}`
+fn parse_variable_objects(map: &serde_json::Map<String, serde_json::Value>) -> Vec<VariableField> {
+    map.iter()
+        .filter_map(|(key, val)| {
+            let field = match val {
+                // 完整字段定义对象
+                serde_json::Value::Object(o) => {
+                    let label = o
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(key)
+                        .to_string();
+                    let type_str = o
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("string");
+                    let default = o.get("default").cloned().unwrap_or(serde_json::Value::Null);
+                    let value_type = parse_type(type_str, &default);
+                    let description = o
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let group = o
+                        .get("group")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    Some(VariableField {
+                        key: key.clone(),
+                        label,
+                        value_type,
+                        default,
+                        description,
+                        group,
+                    })
+                }
+                // 标量值（直接当默认值）
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(VariableField {
+                    key: key.clone(),
+                    label: key.clone(),
+                    value_type: infer_scalar_type(val),
+                    default: val.clone(),
+                    description: None,
+                    group: None,
+                }),
+                serde_json::Value::String(s) => Some(VariableField {
+                    key: key.clone(),
+                    label: key.clone(),
+                    value_type: VariableType::String,
+                    default: serde_json::Value::String(s.clone()),
+                    description: None,
+                    group: None,
+                }),
+                // null / array / 其他形态跳过（保守，宁缺勿错）
+                _ => None,
+            };
+            field
+        })
+        .collect()
+}
+
+/// 根据 type 字符串 + 默认值推断 VariableType
+fn parse_type(type_str: &str, default: &serde_json::Value) -> VariableType {
+    match type_str.to_lowercase().as_str() {
+        "int" | "integer" | "number" if default.is_i64() => VariableType::Int,
+        "int" | "integer" => VariableType::Int,
+        "float" | "double" | "number" => VariableType::Float,
+        "bool" | "boolean" => VariableType::Bool,
+        "json" | "object" | "array" => VariableType::Json,
+        _ => VariableType::String,
+    }
+}
+
+fn infer_scalar_type(val: &serde_json::Value) -> VariableType {
+    match val {
+        serde_json::Value::Bool(_) => VariableType::Bool,
+        serde_json::Value::Number(n) if n.is_i64() => VariableType::Int,
+        serde_json::Value::Number(_) => VariableType::Float,
+        _ => VariableType::String,
+    }
 }
 
 // ─── 注入渲染（cache 友好：拼成文本放末尾 user message）──────────────────
@@ -317,5 +451,64 @@ mod tests {
         assert!(out.contains("林医生"));
         assert!(out.contains("生命 80"));
         assert!(out.contains("状态 受伤"));
+    }
+
+    // ─── MVU 探测测试 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_mvu_from_explicit_initvar() {
+        // 显式 MVU 插件 initvar（带完整字段定义）
+        let ext = serde_json::json!({
+            "mvu": {
+                "initvar": {
+                    "hp": {"label": "生命值", "type": "int", "default": 200},
+                    "sanity": {"label": "理智", "type": "int", "default": 50}
+                }
+            }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        assert_eq!(schema.len(), 2);
+        let hp = schema.iter().find(|f| f.key == "hp").unwrap();
+        assert_eq!(hp.default.as_i64(), Some(200));
+        assert_eq!(hp.value_type, VariableType::Int);
+    }
+
+    #[test]
+    fn test_extract_mvu_from_flat_stat_data() {
+        // ST 风格扁平 stat_data（标量值）
+        let ext = serde_json::json!({
+            "stat_data": {
+                "money": 1000,
+                "day": 1,
+                "location": "家"
+            }
+        });
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        assert_eq!(schema.len(), 3);
+        let money = schema.iter().find(|f| f.key == "money").unwrap();
+        assert_eq!(money.default.as_i64(), Some(1000));
+        assert_eq!(money.value_type, VariableType::Int);
+        let loc = schema.iter().find(|f| f.key == "location").unwrap();
+        assert_eq!(loc.value_type, VariableType::String);
+    }
+
+    #[test]
+    fn test_extract_mvu_empty_when_no_structure() {
+        // 无 stat_data 结构（普通卡）→ 返回空 vec
+        let ext = serde_json::json!({"depth_prompt": {"prompt": "无关字段"}});
+        let schema = extract_mvu_schema_from_extensions(&ext);
+        assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn test_extract_mvu_merge_with_defaults() {
+        // MVU 探测结果应能正确和基础表合并（hp 被覆盖、新字段追加）
+        let ext = serde_json::json!({"stat_data": {"hp": 200, "fatigue": 0}});
+        let mvu = extract_mvu_schema_from_extensions(&ext);
+        let merged = merge_schema(&default_character_variables(), &mvu);
+        let hp = merged.iter().find(|f| f.key == "hp").unwrap();
+        assert_eq!(hp.default.as_i64(), Some(200), "hp 应被 MVU 覆盖");
+        assert!(merged.iter().any(|f| f.key == "fatigue"), "应有新增字段");
+        assert!(merged.iter().any(|f| f.key == "mp"), "基础字段不丢");
     }
 }

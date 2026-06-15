@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-15（P0 数据模型层完成 + git 绑定到 Gitea）
+> 最后更新：2026-06-15（P1 角色识别 Agent + Campaign 开档闭环完成 + git 绑定到 Gitea）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行），
@@ -10,7 +10,8 @@
 > 新增模型列表拉取、世界书条目 CRUD、ST 风格 markdown 渲染（`*动作*`斜体）、消息列表自动滚动，
 > **Android 构建链路已打通**（APK 编译成功），模拟器启动待验证，
 > **本轮设计深化（2026-06-15）**：明确角色子 Agent 信息隔离、一卡多角色树形模型、Campaign 多会话隔离、角色知识系统、MVU 原生兼容方案、叙事计划系统（任务追踪/长程一致性）、cache 友好消息布局、变量层级体系（基础表+卡定义+实例存值），共 19 条决策（D30-D48），详见 §13，
-> **P0 数据模型层已完成（2026-06-15）**：domain 新增 5 模块（variables/campaign/character_knowledge/story_task/message_layout）+ character 树形模型 + infra-vector 标签过滤，129 个测试全过（详见 §13.1），
+> **P0 数据模型层已完成（2026-06-15）**：domain 新增 5 模块（variables/campaign/character_knowledge/story_task/message_layout）+ character 树形模型 + infra-vector 标签过滤，
+> **P1 角色识别 + Campaign 闭环已完成（2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析 + 5 层兜底 + 降级路径）+ Campaign 开档后端闭环（CampaignStore 持久化 cards/campaigns/instances + AppState 启动恢复 + 14 个 Tauri 命令 + 角色/全局变量读写）。前端开档 UI 留下一轮。151 个测试全过（详见 §13.2），
 > **git 仓库已绑定**：`https://git.2529985.xyz/ss/story.git`（main 分支），
 > 剩余工作见 §7 后续计划。
 
@@ -144,8 +145,18 @@ storyforge/
   - `get_embed_config` — 获取当前嵌入配置（不含 key）
   - `archive_conversation` — 手动触发对话归档（LLM 压缩 → 嵌入 → 入向量库）
 - `meta_accept_patch` — 接受并执行 Meta Agent 的 Patch（修改世界书条目/角色字段）
+- **P1 角色识别 / Campaign / 变量命令**（14 个）：
+  - `extract_characters` — 跑角色识别 Agent，为已导入的扁平 Character 建 CharacterCard（含多角色 CharacterDefinition + MVU 字段级 schema），失败降级单角色 Protagonist
+  - `list_cards` / `get_card` — 列出/查询 CharacterCard（含 character_definitions）
+  - `create_campaign` — 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化为 CharacterInstance
+  - `list_campaigns` / `get_campaign` — 列出/查询 Campaign（可按 card_id 过滤）
+  - `set_active_campaign` / `get_active_campaign` — 设置/查询活跃 Campaign（持久化到 data/active_campaign.json）
+  - `list_instances` / `get_instance` — 列出/查询 Campaign 内角色实例
+  - `get_character_variables` / `set_character_variable` — 角色实例变量读写（调试/纠错）
+  - `get_campaign_variables` / `set_campaign_variable` — Campaign 全局变量读写（story_clock/weather/world_state）
+  - `promote_temporary_instance` — 临场角色升级为常驻（翻 is_temporary flag）
 
-**测试**：129/129 单元测试通过（含 P0 新增：domain 43 个含 28 个新模块测试 + infra-vector 10 个含 4 个标签过滤测试 + app-pipeline 5 个流水线集成测试 + 其他 crate）。修复了 app-pipeline 测试中 `cancel` sender 误 drop 导致子 Agent 取消的既有 bug。
+**测试**：151/151 单元测试通过（含 P1 新增：domain 49 个含 7 个 MVU 探测/降级测试 + app-agent 15 个含 8 个角色识别 5 层兜底/端到端 mock 测试 + tauri-app 15 个含 5 个 CampaignStore 持久化测试 + infra-llm 19 个含 mock 识别脚本 + 其他 crate）。修复了 app-pipeline 测试中 `cancel` sender 误 drop 导致子 Agent 取消的既有 bug。
 
 ### 2.3 前端（M0 完成）
 
@@ -712,8 +723,9 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 🔴 高 | **世界书 depth 生效** | 前端可看可改 depth/order 字段 + depth 控制蓝灯常驻条目在导演上下文的排序（depth 小靠后=重要，对齐 ST「近因效应」语义） | — |
 | 🔴 高 | **预设持久化+查看** | 预设导入后持久化（目前只返回字符串不存）+ 列表查看 + 详情（每条 prompt 的 role/content/identifier）。`{{char}}` `{{user}}` 占位符替换归入此线（ST prompt-template 功能） | — |
 | 🔴 高 | **Android 模拟器验证** | NDK + Gradle + APK 编译已成功，模拟器启动需开 VT-x + 装 HAXM | 用户操作 BIOS + 安装 HAXM |
-| 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。方案已定（TECHNICAL_DESIGN §16-§23），P0-P2 顺序落地 | — |
-| 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。方案已定（TECHNICAL_DESIGN §19） | 共享 WebView 依赖插件运行时 |
+| 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环已完成，剩余 P2 后处理流水线接入 | — |
+| 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。**P1 已完成字段级 stat_data 解析**（探测 extensions.mvu.initvar / stat_data / variables，合并进 CharacterDefinition.variable_schema）。剩余：重 DOM 卡 JS 分析 + WebView 兜底（P3） | 共享 WebView 依赖插件运行时 |
+| 🔴 高 | **前端 Campaign 开档 UI** | Campaign 列表/新建/切换 + 角色实例展示 + 角色变量面板。后端命令已就绪（14 个），前端待接 | — |
 | 🟡 中 | 归档器接入 | accept_variant 后触发 maybe_archive | 需配嵌入 API |
 | 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
 | 🟢 低 | M4 插件运行时前端 | iframe 沙箱 + window.storyforge API 桥 + 角色卡 HTML 渲染 | 工作量大 |
@@ -748,8 +760,9 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | **Agent 接口索引** | 所有 Agent 的 prompt/上下文/输出解析位置集中记录在新文档 AGENT_INTERFACES.md | AGENT_INTERFACES.md |
 
 **落地优先级**（TECHNICAL_DESIGN §16-§23 的实现顺序）：
-- ✅ **P0 数据模型层（已完成 2026-06-15）**：domain 加 Campaign/角色树/knowledge/变量表/story_task 结构 + infra-vector 加标签过滤 + MessageLayout 抽象。129 个测试全过。详见 §13.1
-- ⏳ P1 角色识别 Agent + 导入集成（导入时拆多角色 + 解析 MVU initvar 建 schema，建实例）
+- ✅ **P0 数据模型层（已完成 2026-06-15）**：domain 加 Campaign/角色树/knowledge/变量表/story_task 结构 + infra-vector 加标签过滤 + MessageLayout 抽象。详见 §13.1
+- ✅ **P1 角色识别 Agent + 导入集成 + Campaign 开档闭环（已完成 2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析）+ CampaignStore 持久化 + 14 个 Tauri 命令 + 角色/全局变量读写。详见 §13.2
+- ⏳ P1.5 前端开档 UI（Campaign 列表/新建/切换 + 角色实例展示 + 变量面板）
 - ⏳ P2 后处理流水线（总结 Agent + 后处理 Agent 三合一：知识+变量+任务，并行编排）
 - ⏳ P3 共享 WebView 计算单元（重 DOM 卡兜底，依赖插件运行时）
 
@@ -768,6 +781,27 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | `infra-vector` 改造 | infra-vector | VectorRecord 加 metadata 字段 + VectorKind 加 CharacterKnowledge + MetadataFilter（for_character/for_campaign）+ search_by_vector_filtered/search_by_keywords_filtered + delete_by_campaign | 10 |
 
 **附带修复**：app-pipeline 测试里 `let (_, cancel_rx) = watch::channel(false)` 的 sender 被 `_` 立即 drop，导致子 Agent `cancel.wait_for()` 误触发取消。改成 `_cancel_tx` 保活后，5 个流水线集成测试恢复 green。这是 P0 之前就潜伏的 bug，被这次重新编译暴露。
+
+### 7.8 P1 角色识别 + Campaign 闭环交付清单（2026-06-15 完成）
+
+| 模块 | 位置 | 内容 | 测试数 |
+|------|------|------|--------|
+| `AgentRole::CharacterExtractor` | domain/agent.rs | 新增角色识别 Agent 角色变体（Display → "角色识别"） | — |
+| `extract_mvu_schema_from_extensions` | domain/variables.rs | 字段级 MVU 探测：4 个候选路径（mvu.initvar / stat_data / variables / depth_prompt.variables）+ 标量/对象双形态解析 | 4 |
+| `CharacterDefinition::fallback_from_character` | domain/character.rs | 识别失败降级：单角色 Protagonist + persona 取 description+personality + 变量 schema 合并 MVU | 2 |
+| `prompts/character_extractor.rs` | app-agent | `CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 常量（含 JSON 输出示例）+ `make_character_extractor_config()`（max_rounds: 8）+ `build_character_extractor_user_msg()`（拼 description/personality/first_mes/alternate_greetings/world_book 全文）+ `register_character_extractor_tools()`（emit_characters 工具） | 3 |
+| `character_extractor.rs` | app-agent | `extract_characters()` 编排（调 run_tool_loop）+ `parse_character_definitions_from_response()` 5 层兜底（emit_characters 工具 / 整体 JSON / ```json 块 / 裸代码块 / 手写括号配平）+ `attach_definitions_to_card()` 回填 card_id | 8（含端到端 mock LLM 闭环）|
+| `CampaignStore` | tauri-app/campaign_store.rs | CharacterCard / Campaign / CharacterInstance 三文件持久化（cards.json/campaigns.json/instances.json，原子写 .tmp→rename）+ CRUD + 级联删除（删卡→删档→删实例）+ 同 source 去重 | 5 |
+| `AppState.active_campaign` | tauri-app/lib.rs | 新增字段 + 持久化到 data/active_campaign.json + 启动恢复 | — |
+| 14 个 Tauri 命令 | tauri-app/lib.rs | extract_characters（失败降级）/ list_cards / get_card / create_campaign（实例化 Protagonist+Supporting）/ list_campaigns / get_campaign / set+get_active_campaign / list_instances / get_instance / get+set_character_variables / get+set_campaign_variables / promote_temporary_instance | — |
+| MockLlmClient 识别脚本 | infra-llm/mock_client.rs | match_keyword="卡内角色识别"，response=预设 Vec<CharacterDefinition> JSON，插在 scripts 最前避开"角色"冲突 | — |
+
+**关键设计点**：
+- **导入分两步**：`import_character`（同步纯解析，向后兼容）+ `extract_characters`（async 跑识别 Agent，失败降级）。前端导入成功后自动调 extract。
+- **5 层兜底解析**：照搬 app-pipeline 的 parse_plan_from_response 模式（含手写括号配平 match_braces），LLM 输出再不稳定也能解析。
+- **降级路径**：识别完全失败时建单角色 Protagonist definition（卡仍可用，不阻塞用户）。
+- **MVU 字段级解析**：保守策略，探测不到结构化字段就用基础表（hp/mp/state/...），不报错。重 DOM 卡的 JS 分析留 P3。
+- **导演工具暂不迁移**：P1 阶段导演的 get_character 继续读扁平 Character（兼容），CharacterDefinition 通过开档后的 CharacterInstance 暴露。P2 后处理接入时再迁移。
 
 ---
 
@@ -809,6 +843,11 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | **app-agent（Agent 运行时）** | |
 | `crates/app-agent/src/runtime.rs` | AgentRuntime + run_tool_loop + spawn_subagents |
 | `crates/app-agent/src/tools.rs` | ToolRegistry + 工具实现 |
+| **app-agent P1 新增（2026-06-15）** | |
+| `crates/app-agent/src/prompts/character_extractor.rs` | 角色识别 Agent system prompt / config / 工具注册 / 用户消息拼装（D33） |
+| `crates/app-agent/src/character_extractor.rs` | 角色识别编排（extract_characters）+ 5 层兜底输出解析（parse_character_definitions_from_response）|
+| **tauri-app P1 新增（2026-06-15）** | |
+| `crates/tauri-app/src/campaign_store.rs` | CharacterCard / Campaign / CharacterInstance 持久化（cards/campaigns/instances.json）+ CRUD + 级联删除 |
 | **app-conversation（对话管理）** | |
 | `crates/app-conversation/src/lib.rs` | ConversationStore + 对话树操作 |
 | **app-pipeline（写作流水线）** | |
@@ -974,5 +1013,6 @@ default_Seraphina.png
 | 2026-06-15 | 基础变量表（所有角色默认带，参考 MVU 变量构建方式，提供修改接口） | 用户 D48 |
 | 2026-06-15 | MVU 架构修正：渲染/逻辑分离 + 翻译=JS→ToolCallSpec（非→Rust 结构）+ 元素级混合（能翻译的翻译，不能的保留 JS 执行）。变量更新走后处理 Agent 的 tool-call（不走正则/不走写作 Agent 附带输出）。导入时 Meta Agent 五合一分析（schema+绑定+规则+交互+兜底）。规则/交互可翻译成 tool-call 注入 Agent，只有自由逻辑/重 DOM 走 WebView | 对话推敲 |
 | 2026-06-15 | P0 数据模型层完成（domain 5 新模块 + character 树形 + infra-vector 标签过滤，129 测试全过） | 落地实施 |
+| 2026-06-15 | P1 角色识别 Agent + Campaign 开档闭环（角色识别语义拆多角色 + MVU 字段级解析 + 5 层兜底 + 降级 + CampaignStore 持久化 + 14 个 Tauri 命令，151 测试全过） | 落地实施 |
 | 2026-06-15 | 修复 app-pipeline cancel sender 误 drop 导致子 Agent 取消的既有 bug | 测试回归 |
 | 2026-06-15 | git 绑定到 Gitea（`https://git.2529985.xyz/ss/story.git`，main 分支） | 用户要求 |

@@ -248,7 +248,7 @@ fn extract_renderable_assets(data: &StCharacterData) -> Option<RenderableAssets>
 // CharacterDefinition 是「模板」（卡级，全局共享），CharacterInstance 是「实例」（会话级）。
 // 角色识别 Agent 导入时产出 Vec<CharacterDefinition>。
 
-use crate::variables::VariableField;
+use crate::variables::{merge_schema, VariableField};
 
 /// 角色卡本体（一卡多角色的容器）
 ///
@@ -330,6 +330,47 @@ impl CharacterCard {
     }
 }
 
+impl CharacterDefinition {
+    /// 角色识别 Agent 失败时的降级构造（单角色 Protagonist）
+    ///
+    /// 把整张卡当作单一主角色，persona 取 description+personality，
+    /// behavior 留空，backstory 空（导演/玩家后续可补），变量 schema 用基础表合并 MVU 探测结果。
+    pub fn fallback_from_character(
+        character: &Character,
+        mvu_schema: &[VariableField],
+    ) -> Self {
+        let persona = format!(
+            "{}\n\n性格：{}",
+            character.description.trim(),
+            character.personality.trim()
+        )
+        .trim()
+        .to_string();
+
+        let merged_schema = merge_schema(
+            &crate::variables::default_character_variables(),
+            mvu_schema,
+        );
+
+        Self {
+            id: Id::new(),
+            card_id: Id::from_str("__pending__"), // 调用方回填
+            name: character.name.clone(),
+            persona_prompt: persona,
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: merged_schema,
+        }
+    }
+
+    /// 把卡级 MVU schema 合并进 definition 的 variable_schema（导入后处理用）
+    pub fn merge_variable_schema(&mut self, mvu_schema: &[VariableField]) {
+        self.variable_schema = merge_schema(&self.variable_schema, mvu_schema);
+    }
+}
+
 #[cfg(test)]
 mod multi_character_tests {
     use super::*;
@@ -401,5 +442,71 @@ mod multi_character_tests {
         assert!(card.find_definition("林医生").is_some());
         assert!(card.find_definition("陈警官").is_some());
         assert!(card.find_definition("不存在").is_none());
+    }
+
+    #[test]
+    fn test_fallback_from_character_builds_single_protagonist() {
+        let ch = Character {
+            id: Id::from_str("src-1"),
+            name: "林医生".into(),
+            description: "一位外科医生。".into(),
+            personality: "冷静、理性".into(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::Value::Null,
+            renderable_assets: None,
+            source: Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::Value::Null,
+        };
+        let def = CharacterDefinition::fallback_from_character(&ch, &[]);
+        assert_eq!(def.name, "林医生");
+        assert_eq!(def.role_type, RoleType::Protagonist);
+        assert!(def.persona_prompt.contains("外科医生"));
+        assert!(def.persona_prompt.contains("冷静、理性"));
+        // 默认带基础表
+        assert!(def.variable_schema.iter().any(|f| f.key == "hp"));
+    }
+
+    #[test]
+    fn test_fallback_merges_mvu_schema() {
+        let ch = Character {
+            id: Id::from_str("src-1"),
+            name: "x".into(),
+            description: "".into(),
+            personality: "".into(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::Value::Null,
+            renderable_assets: None,
+            source: Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::Value::Null,
+        };
+        let mvu = vec![crate::variables::VariableField::int(
+            "fatigue",
+            "疲劳度",
+            0,
+            "状态",
+        )];
+        let def = CharacterDefinition::fallback_from_character(&ch, &mvu);
+        assert!(def.variable_schema.iter().any(|f| f.key == "hp"));
+        assert!(def.variable_schema.iter().any(|f| f.key == "fatigue"));
     }
 }

@@ -6,7 +6,7 @@ use crate::world_info::WorldInfoEntry;
 
 // ─── Agent 角色 ──────────────────────────────────────────────────────────
 
-/// Agent 角色（对应设计 §3.2 的三个 Agent + Meta）
+/// Agent 角色（对应设计 §3.2 的三个 Agent + Meta + 导入期 Agent）
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentRole {
     /// 导演：解析意图、查资料、分配任务
@@ -17,6 +17,8 @@ pub enum AgentRole {
     Editor,
     /// Meta：配置调试助手
     Meta,
+    /// 角色识别：导入卡时分析卡内容、拆分多角色定义（D33，AGENT_INTERFACES §6.2）
+    CharacterExtractor,
 }
 
 impl std::fmt::Display for AgentRole {
@@ -26,6 +28,7 @@ impl std::fmt::Display for AgentRole {
             Self::Subagent(id) => write!(f, "子Agent({id})"),
             Self::Editor => write!(f, "编剧"),
             Self::Meta => write!(f, "Meta"),
+            Self::CharacterExtractor => write!(f, "角色识别"),
         }
     }
 }

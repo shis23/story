@@ -1868,6 +1868,8 @@ ContextPackage 注入子 Agent 时：
 
 ## 17. 多角色卡模型与 Campaign（D32-D38）
 
+> **P1 落地状态（2026-06-15）**：§17.1 树形模型数据结构已在 P0 完成，§17.2 角色识别 Agent 已在 P1 完成（`crates/app-agent/src/character_extractor.rs` + `prompts/character_extractor.rs`，5 层兜底解析 + 降级路径），§17.4 Campaign 隔离后端闭环已完成（CampaignStore 持久化 + 14 个 Tauri 命令）。§17.3 运行时新角色（导演自主建临场角色）+ §17.5 实例改动回写 UI 留 P2 后处理流水线接入。
+
 ### 17.1 角色模型：树形（D32）
 
 ```
@@ -2040,6 +2042,8 @@ struct CharacterKnowledgeUpdate {
 ---
 
 ## 19. MVU 变量框架原生兼容（D42-D43）
+
+> **P1 落地状态（2026-06-15）**：字段级 stat_data 解析已完成（`crates/domain/src/variables.rs::extract_mvu_schema_from_extensions`，探测 mvu.initvar / stat_data / variables / depth_prompt.variables 四个候选路径，合并进 CharacterDefinition.variable_schema）。§19.2-§19.7 的完整 MvuTranslation（UI 绑定 + 规则 + 交互映射 + 兜底 JS）+ Meta Agent 五合一分析 + 共享 WebView 计算单元留 P3（依赖插件运行时）。
 
 > 本章在对话中经过多轮推敲，核心认知有过两次重要修正：
 > ① "翻译 = JS → Rust 数据结构" 是错的，**翻译 = JS 逻辑 → tool-call 描述**
@@ -2333,6 +2337,8 @@ pub struct MessageLayout {
 ---
 
 ## 23. 变量层级体系（D47-D48）
+
+> **P1 落地状态（2026-06-15）**：数据结构 + 基础表 + schema 合并 + 注入渲染在 P0 完成；§23.4 变量更新流程的「用户手动」路径已完成（set_character_variable / set_campaign_variable 命令）。§23.4「每轮后处理 Agent 解析 _.set 自动更新」+ §23.5 注入接入流水线留 P2。
 
 > 角色/全局变量系统，参考 MVU 的 initvar + stat_data 机制：卡定义 schema + 默认值，实例只存值。
 

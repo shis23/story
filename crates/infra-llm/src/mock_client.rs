@@ -1,6 +1,7 @@
 /// Mock LLM 客户端（测试/开发用，无需真实 API key）
 ///
 /// 按请求内容自动返回对应的模拟响应：
+/// - 角色识别请求 → 产出卡内角色定义 JSON 数组
 /// - 导演请求 → 产出 Plan JSON
 /// - 子 Agent 请求 → 产出角色表演文本
 /// - 编剧请求 → 产出成文 Markdown
@@ -143,9 +144,34 @@ impl crate::LlmClient for MockLlmClient {
     }
 }
 
-/// 默认脚本集（导演 / 子 Agent / 编剧）
+/// 默认脚本集（角色识别 / 导演 / 子 Agent / 编剧）
 fn default_scripts() -> Vec<MockScript> {
     vec![
+        // 角色识别脚本：输出卡内角色定义 JSON 数组（插入最前，避开 "角色" 关键词冲突）
+        MockScript {
+            match_keyword: "卡内角色识别".into(),
+            response_content: r#"[
+              {
+                "name": "林医生",
+                "persona_prompt": "你是一位三十出头的外科医生，说话简短精确，习惯先评估后行动。",
+                "behavior_rules": "面对危重病人时先评估生命体征再处置；绝不主动透露病人隐私。",
+                "base_backstory": ["你是本市三甲医院急诊科主治", "三年前经历过一次失败的手术"],
+                "role_type": "protagonist",
+                "group": "主角团"
+              },
+              {
+                "name": "陈警官",
+                "persona_prompt": "你是一名老刑警，观察力敏锐，话不多但每句都在点上。",
+                "behavior_rules": "对证据保持怀疑；不在公开场合透露案情。",
+                "base_backstory": ["你在刑警队干了二十年"],
+                "role_type": "supporting",
+                "group": "主角团"
+              }
+            ]"#
+            .into(),
+            tool_calls: vec![],
+            stream: false,
+        },
         // 导演脚本：在 content 中直接输出 Plan JSON（避免工具调用循环）
         MockScript {
             match_keyword: "写作导演".into(),

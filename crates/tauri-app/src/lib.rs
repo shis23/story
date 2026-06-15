@@ -1,3 +1,4 @@
+mod campaign_store;
 mod connection_store;
 mod preset_store;
 mod storage;
@@ -50,6 +51,15 @@ fn get_preset_store() -> &'static PresetStore {
     })
 }
 
+static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new();
+
+fn get_campaign_store() -> &'static campaign_store::CampaignStore {
+    CAMPAIGN_STORE.get_or_init(|| {
+        let data_dir = get_app_data_dir();
+        campaign_store::CampaignStore::new(&data_dir)
+    })
+}
+
 fn get_app_data_dir() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -77,6 +87,23 @@ fn save_embed_config(data_dir: &PathBuf, config: &storyforge_infra_llm::EmbedCon
     }
 }
 
+fn load_active_campaign(data_dir: &PathBuf) -> Option<Id> {
+    let path = data_dir.join("active_campaign.json");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("campaign_id")
+        .and_then(|v| v.as_str())
+        .map(Id::from_str)
+}
+
+fn save_active_campaign(data_dir: &PathBuf, id: Option<&Id>) {
+    let path = data_dir.join("active_campaign.json");
+    let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
+    if let Ok(json) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 // ─── AppState（M1 新增，注入到 Tauri managed state）─────────────────────────
 
 /// 应用全局状态
@@ -99,6 +126,8 @@ pub struct AppState {
     pub meta_patches: Arc<RwLock<Vec<storyforge_app_meta::Patch>>>,
     /// 嵌入配置（持久化到 data/embed.json）
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
+    /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
+    pub active_campaign: Mutex<Option<Id>>,
 }
 
 impl AppState {
@@ -188,6 +217,7 @@ impl AppState {
             vector_store,
             meta_patches: Arc::new(RwLock::new(Vec::new())),
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
+            active_campaign: Mutex::new(load_active_campaign(&data_dir)),
         }
     }
 
@@ -1616,6 +1646,413 @@ fn meta_accept_patch(
     Ok(())
 }
 
+// ─── P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量 ──────────────
+
+/// 角色（CharacterDefinition）的精简 DTO（前端展示用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterDefinitionDto {
+    pub id: String,
+    pub name: String,
+    pub persona_prompt: String,
+    pub behavior_rules: String,
+    pub base_backstory: Vec<String>,
+    pub group: Option<String>,
+    pub role_type: String,
+    pub variable_schema: Vec<storyforge_domain::variables::VariableField>,
+}
+
+impl From<&storyforge_domain::character::CharacterDefinition> for CharacterDefinitionDto {
+    fn from(d: &storyforge_domain::character::CharacterDefinition) -> Self {
+        Self {
+            id: d.id.as_str().to_string(),
+            name: d.name.clone(),
+            persona_prompt: d.persona_prompt.clone(),
+            behavior_rules: d.behavior_rules.clone(),
+            base_backstory: d.base_backstory.clone(),
+            group: d.group.clone(),
+            role_type: format!("{:?}", d.role_type).to_lowercase(),
+            variable_schema: d.variable_schema.clone(),
+        }
+    }
+}
+
+/// CharacterCard 的详情 DTO（含卡内角色定义列表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardDetailDto {
+    pub id: String,
+    pub name: String,
+    pub source_character_id: String,
+    pub character_definitions: Vec<CharacterDefinitionDto>,
+    pub imported_at: String,
+    /// 识别是否成功（false = 走降级路径，单角色 Protagonist）
+    pub extracted: bool,
+}
+
+/// CharacterCard 列表项（轻量）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub source_character_id: String,
+    pub character_count: usize,
+    pub imported_at: String,
+    pub extracted: bool,
+}
+
+impl From<&campaign_store::StoredCard> for CardSummaryDto {
+    fn from(s: &campaign_store::StoredCard) -> Self {
+        Self {
+            id: s.card.id.as_str().to_string(),
+            name: s.card.name.clone(),
+            source_character_id: s.card.source_character_id.as_str().to_string(),
+            character_count: s.card.character_definitions.len(),
+            imported_at: s.imported_at.clone(),
+            extracted: !s.card.character_definitions.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignSummaryDto {
+    pub id: String,
+    pub card_id: String,
+    pub name: String,
+    pub created_at: String,
+    pub story_clock: String,
+    pub instance_count: usize,
+    pub fork_from: Option<(String, String)>,
+}
+
+impl From<&storyforge_domain::campaign::Campaign> for CampaignSummaryDto {
+    fn from(c: &storyforge_domain::campaign::Campaign) -> Self {
+        Self {
+            id: c.id.as_str().to_string(),
+            card_id: c.card_id.as_str().to_string(),
+            name: c.name.clone(),
+            created_at: c.created_at.clone(),
+            story_clock: c.story_clock.clone(),
+            instance_count: 0, // 调用方填
+            fork_from: c
+                .fork_from
+                .as_ref()
+                .map(|(cid, nid)| (cid.as_str().to_string(), nid.as_str().to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterInstanceDto {
+    pub id: String,
+    pub campaign_id: String,
+    pub definition_id: Option<String>,
+    pub name: String,
+    pub persona_override: Option<String>,
+    pub behavior_override: Option<String>,
+    pub is_temporary: bool,
+    pub variables: Vec<storyforge_domain::variables::VariableValue>,
+}
+
+impl From<&storyforge_domain::campaign::CharacterInstance> for CharacterInstanceDto {
+    fn from(i: &storyforge_domain::campaign::CharacterInstance) -> Self {
+        Self {
+            id: i.id.as_str().to_string(),
+            campaign_id: i.campaign_id.as_str().to_string(),
+            definition_id: i.definition_id.as_ref().map(|d| d.as_str().to_string()),
+            name: i.name.clone(),
+            persona_override: i.persona_override.clone(),
+            behavior_override: i.behavior_override.clone(),
+            is_temporary: i.is_temporary,
+            variables: i.variables.clone(),
+        }
+    }
+}
+
+/// 跑角色识别 Agent，为已导入的扁平 Character 建 CharacterCard
+///
+/// 失败时降级：建单角色 Protagonist definition（卡仍可用）。
+#[tauri::command]
+async fn extract_characters(
+    source_character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CardSummaryDto, String> {
+    use storyforge_app_agent::AgentRuntime;
+    use storyforge_domain::character::CharacterDefinition;
+    use storyforge_domain::variables::extract_mvu_schema_from_extensions;
+
+    // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
+    let character = {
+        let ctx = state.tool_ctx.read().unwrap();
+        ctx.characters
+            .iter()
+            .find(|c| c.id.as_str() == source_character_id)
+            .map(|c| (*c).clone())
+    }
+    .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的角色卡"))?;
+
+    // 已存在则直接返回
+    let store = get_campaign_store();
+    if let Some(existing) = store.get_card_by_source(&character.id) {
+        return Ok(CardSummaryDto::from(&existing));
+    }
+
+    // MVU schema 探测
+    let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
+    if !mvu_schema.is_empty() {
+        tracing::info!(
+            "卡「{}」探测到 {} 个 MVU 字段",
+            character.name,
+            mvu_schema.len()
+        );
+    }
+
+    // 跑识别 Agent
+    let llm = state.active_llm_or_mock();
+    let tool_ctx = state.snapshot_tool_ctx();
+    let runtime = AgentRuntime::new(llm, tool_ctx);
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+    let definitions_result =
+        storyforge_app_agent::extract_characters(&runtime, &character, &mvu_schema, cancel_rx)
+            .await;
+
+    let (definitions, extracted) = match definitions_result {
+        Ok(defs) => (defs, true),
+        Err(e) => {
+            tracing::warn!("角色识别失败，降级建单角色: {e}");
+            (
+                vec![CharacterDefinition::fallback_from_character(
+                    &character,
+                    &mvu_schema,
+                )],
+                false,
+            )
+        }
+    };
+
+    // 建卡 + 回填 card_id
+    let mut card =
+        storyforge_domain::character::CharacterCard::from_character(&character);
+    let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
+    card.character_definitions = definitions;
+    let stored = store.save_card(card);
+
+    let mut dto = CardSummaryDto::from(&stored);
+    dto.extracted = extracted;
+    Ok(dto)
+}
+
+#[tauri::command]
+fn list_cards() -> Vec<CardSummaryDto> {
+    get_campaign_store()
+        .list_cards()
+        .iter()
+        .map(CardSummaryDto::from)
+        .collect()
+}
+
+#[tauri::command]
+fn get_card(id: String) -> Result<CardDetailDto, String> {
+    let stored = get_campaign_store()
+        .get_card(&Id::from_str(&id))
+        .ok_or_else(|| format!("找不到 card id={id}"))?;
+    Ok(CardDetailDto {
+        id: stored.card.id.as_str().to_string(),
+        name: stored.card.name.clone(),
+        source_character_id: stored.card.source_character_id.as_str().to_string(),
+        character_definitions: stored
+            .card
+            .character_definitions
+            .iter()
+            .map(CharacterDefinitionDto::from)
+            .collect(),
+        imported_at: stored.imported_at.clone(),
+        extracted: !stored.card.character_definitions.is_empty(),
+    })
+}
+
+/// 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化
+#[tauri::command]
+fn create_campaign(
+    card_id: String,
+    name: String,
+) -> Result<CampaignSummaryDto, String> {
+    use storyforge_domain::character::RoleType;
+    use storyforge_domain::campaign::CharacterInstance;
+
+    let store = get_campaign_store();
+    let stored = store
+        .get_card(&Id::from_str(&card_id))
+        .ok_or_else(|| format!("找不到 card id={card_id}"))?;
+
+    let campaign =
+        storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
+    store.save_campaign(campaign.clone());
+
+    // 实例化所有 protagonist/supporting 定义
+    let mut instance_count = 0;
+    for def in &stored.card.character_definitions {
+        if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
+            let inst = CharacterInstance::from_definition(campaign.id.clone(), def);
+            store.add_instance(inst);
+            instance_count += 1;
+        }
+    }
+
+    let mut dto = CampaignSummaryDto::from(&campaign);
+    dto.instance_count = instance_count;
+    Ok(dto)
+}
+
+#[tauri::command]
+fn list_campaigns(card_id: Option<String>) -> Vec<CampaignSummaryDto> {
+    let store = get_campaign_store();
+    let campaigns = if let Some(cid) = card_id {
+        store.list_campaigns_of_card(&Id::from_str(&cid))
+    } else {
+        store.list_campaigns()
+    };
+    campaigns
+        .iter()
+        .map(|c| {
+            let mut dto = CampaignSummaryDto::from(c);
+            dto.instance_count = store.list_instances(&c.id).len();
+            dto
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn get_campaign(id: String) -> Result<CampaignSummaryDto, String> {
+    let store = get_campaign_store();
+    let c = store
+        .get_campaign(&Id::from_str(&id))
+        .ok_or_else(|| format!("找不到 campaign id={id}"))?;
+    let mut dto = CampaignSummaryDto::from(&c);
+    dto.instance_count = store.list_instances(&c.id).len();
+    Ok(dto)
+}
+
+#[tauri::command]
+fn set_active_campaign(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let campaign_id = Id::from_str(&id);
+    // 校验存在
+    if get_campaign_store()
+        .get_campaign(&campaign_id)
+        .is_none()
+    {
+        return Err(format!("找不到 campaign id={id}"));
+    }
+    *state.active_campaign.lock().unwrap() = Some(campaign_id.clone());
+    save_active_campaign(&get_app_data_dir(), Some(&campaign_id));
+    Ok(())
+}
+
+#[tauri::command]
+fn get_active_campaign(state: tauri::State<'_, Arc<AppState>>) -> Option<CampaignSummaryDto> {
+    let id = state.active_campaign.lock().unwrap().clone()?;
+    let store = get_campaign_store();
+    let c = store.get_campaign(&id)?;
+    let mut dto = CampaignSummaryDto::from(&c);
+    dto.instance_count = store.list_instances(&c.id).len();
+    Some(dto)
+}
+
+#[tauri::command]
+fn list_instances(campaign_id: String) -> Vec<CharacterInstanceDto> {
+    get_campaign_store()
+        .list_instances(&Id::from_str(&campaign_id))
+        .iter()
+        .map(CharacterInstanceDto::from)
+        .collect()
+}
+
+#[tauri::command]
+fn get_instance(campaign_id: String, instance_id: String) -> Result<CharacterInstanceDto, String> {
+    get_campaign_store()
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map(|i| CharacterInstanceDto::from(&i))
+        .ok_or_else(|| format!("找不到 instance {instance_id}"))
+}
+
+/// 查角色实例的当前变量值
+#[tauri::command]
+fn get_character_variables(
+    campaign_id: String,
+    instance_id: String,
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+    get_campaign_store()
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map(|i| i.variables)
+        .ok_or_else(|| format!("找不到 instance {instance_id}"))
+}
+
+/// 手动改角色实例变量值（调试/纠错用，turn 用 0 占位）
+#[tauri::command]
+fn set_character_variable(
+    campaign_id: String,
+    instance_id: String,
+    key: String,
+    value: serde_json::Value,
+    turn: Option<u32>,
+) -> Result<(), String> {
+    let store = get_campaign_store();
+    let mut inst = store
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .ok_or_else(|| format!("找不到 instance {instance_id}"))?;
+    inst.set_variable(&key, value, turn.unwrap_or(0));
+    store.update_instance(inst);
+    Ok(())
+}
+
+/// 查 Campaign 全局变量
+#[tauri::command]
+fn get_campaign_variables(
+    campaign_id: String,
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+    get_campaign_store()
+        .get_campaign(&Id::from_str(&campaign_id))
+        .map(|c| c.variables)
+        .ok_or_else(|| format!("找不到 campaign {campaign_id}"))
+}
+
+/// 改 Campaign 全局变量
+#[tauri::command]
+fn set_campaign_variable(
+    campaign_id: String,
+    key: String,
+    value: serde_json::Value,
+    turn: Option<u32>,
+) -> Result<(), String> {
+    let store = get_campaign_store();
+    let mut camp = store
+        .get_campaign(&Id::from_str(&campaign_id))
+        .ok_or_else(|| format!("找不到 campaign {campaign_id}"))?;
+    camp.set_variable(&key, value, turn.unwrap_or(0));
+    store.update_campaign(camp);
+    Ok(())
+}
+
+/// 把临场角色升级为常驻（仅翻 is_temporary flag）
+#[tauri::command]
+fn promote_temporary_instance(
+    campaign_id: String,
+    instance_id: String,
+) -> Result<(), String> {
+    let store = get_campaign_store();
+    let mut inst = store
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .ok_or_else(|| format!("找不到 instance {instance_id}"))?;
+    if !inst.is_temporary {
+        return Err("该角色已是常驻".into());
+    }
+    inst.promote_to_permanent();
+    store.update_instance(inst);
+    Ok(())
+}
+
 // ─── Tauri app 入口 ────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -1671,6 +2108,22 @@ pub fn run() {
             configure_embedder,
             get_embed_config,
             archive_conversation,
+            // P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量
+            extract_characters,
+            list_cards,
+            get_card,
+            create_campaign,
+            list_campaigns,
+            get_campaign,
+            set_active_campaign,
+            get_active_campaign,
+            list_instances,
+            get_instance,
+            get_character_variables,
+            set_character_variable,
+            get_campaign_variables,
+            set_campaign_variable,
+            promote_temporary_instance,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");

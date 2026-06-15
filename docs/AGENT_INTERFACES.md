@@ -20,6 +20,7 @@
 | 导演/编剧/子 Agent 的工具集（能调什么工具） | `crates/app-agent/src/tools.rs` | `register_director_tools()` / `register_subagent_tools()` / `register_editor_tools()` |
 | 导演的工具调用最大轮次 / 默认模型 | `crates/app-pipeline/src/lib.rs` | `make_director_config()` / `make_editor_config()` |
 | 导演 Plan 的解析（JSON→Plan 结构） | `crates/app-pipeline/src/lib.rs` | `parse_plan_from_response()` + 5 层兜底 |
+| **角色识别 Agent 的系统提示词 / config / 工具 / 输出解析** | `crates/app-agent/src/prompts/character_extractor.rs` + `crates/app-agent/src/character_extractor.rs` | `CHARACTER_EXTRACTOR_SYSTEM_PROMPT` / `make_character_extractor_config()` / `parse_character_definitions_from_response()`（5 层兜底，见 §6.2）|
 | 重 roll 时注入用户反馈（hint） | `crates/app-agent/src/runtime.rs` | `inject_hint_into_subagent()` / `inject_hint_into_editor()` |
 | 提示词「模块」（视角/文风/CoT/约束，三层预设体系） | `crates/domain/src/prompt_module.rs` | `assemble_system_prompt()` + `builtins::preset_modules()` |
 | **角色/全局变量表的字段定义** | `crates/domain/src/variables.rs` | `default_character_variables()` 工厂 + `VariableField` 结构（见 §7） |
@@ -288,12 +289,21 @@ let sys = assemble_system_prompt(
 
 ### 6.2 角色识别 Agent（导入时跑）
 
-- **crate**：`app-agent` 或 `infra-import`
-- **system prompt 常量**：`CHARACTER_EXTRACTOR_SYSTEM_PROMPT`
-- **输入**：导入的角色卡全文（description + first_mes + character_book 条目）
-- **输出**：`Vec<CharacterDefinition { name, persona_prompt, behavior_rules, backstory_items }>`
-- **输出解析**：JSON 解析（参考 `parse_plan_from_response` 的多层兜底）
-- **接口位置约定**：`crates/app-agent/src/prompts/character_extractor.rs`（新建子模块，集中放 prompt）
+> ✅ **P1 已实现（2026-06-15）**
+
+- **crate**：`app-agent`
+- **system prompt 常量**：`crates/app-agent/src/prompts/character_extractor.rs::CHARACTER_EXTRACTOR_SYSTEM_PROMPT`（含 JSON 输出格式示例）
+- **config 构造**：同文件 `make_character_extractor_config()`（max_tool_rounds: 8）
+- **用户消息拼装**：同文件 `build_character_extractor_user_msg(&Character)`（拼 description/personality/first_mes/alternate_greetings/character_book 全文）
+- **工具注册**：同文件 `register_character_extractor_tools()`（注册 emit_characters 工具，handler `Ok(args)`）
+- **编排入口**：`crates/app-agent/src/character_extractor.rs::extract_characters(runtime, character, mvu_schema, cancel)`（调 run_tool_loop）
+- **输出解析**：同文件 `parse_character_definitions_from_response()` —— 5 层兜底（照搬 parse_plan_from_response 模式）：emit_characters 工具调用 / 整体 JSON 数组 / ```json 块 / 裸代码块 / 手写括号配平（match_braces，UTF-8 安全）
+- **降级路径**：`domain::character::CharacterDefinition::fallback_from_character()`（识别失败建单角色 Protagonist）
+- **输出**：`Vec<CharacterDefinition { name, persona_prompt, behavior_rules, base_backstory, group, role_type, variable_schema }>`
+- **Tauri 命令**：`crates/tauri-app/src/lib.rs::extract_characters(source_character_id)`（跑识别 + 建卡 + 失败降级）
+- **Mock 测试**：`infra-llm/src/mock_client.rs` 加了识别脚本（match_keyword="卡内角色识别"，插在 scripts 最前避开"角色"冲突）
+
+**怎么改**：改 prompt → 编辑 `CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 常量；改输出 schema → 同步改 `CharacterDefDto` + `dto_to_definition()`（character_extractor.rs）。
 
 ### 6.3 剧情总结 Agent（编剧后并行，独立）
 
