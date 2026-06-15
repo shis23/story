@@ -1,5 +1,6 @@
 mod campaign_store;
 mod connection_store;
+mod module_store;
 mod preset_store;
 mod storage;
 
@@ -17,6 +18,7 @@ use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::agent::PipelineEvent;
+use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_domain::llm::{LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode};
 use storyforge_domain::Id;
 use storyforge_infra_llm::LlmClient;
@@ -131,6 +133,10 @@ pub struct AppState {
     pub active_campaign: Mutex<Option<Id>>,
     /// 插件注册表（持久化到 data/plugins.json）
     pub plugin_registry: Arc<PluginRegistry>,
+    /// 模块存储（内置 + 自定义模块 + 启用/禁用状态）
+    pub module_store: Arc<module_store::ModuleStore>,
+    /// Profile 存储（预设配置 + 活跃 Profile）
+    pub profile_store: Arc<module_store::ProfileStore>,
 }
 
 impl AppState {
@@ -214,6 +220,11 @@ impl AppState {
             data_dir.join("plugins.json"),
         ));
 
+        // 模块 + Profile 存储
+        let module_store = Arc::new(module_store::ModuleStore::new(&data_dir));
+        let profile_store = Arc::new(module_store::ProfileStore::new(&data_dir));
+        profile_store.ensure_default();
+
         Self {
             mock_llm,
             conv_store,
@@ -227,6 +238,8 @@ impl AppState {
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
             active_campaign: Mutex::new(load_active_campaign(&data_dir)),
             plugin_registry,
+            module_store,
+            profile_store,
         }
     }
 
@@ -911,6 +924,66 @@ fn plugin_set_variable(plugin_id: String, campaign_id: String, instance_id: Stri
     inst.set_variable(&key, value, 0);
     store.update_instance(inst);
     Ok(())
+}
+
+// ─── 预设/模块系统命令 ─────────────────────────────────────────────────────
+
+#[tauri::command]
+fn list_modules(state: tauri::State<'_, Arc<AppState>>) -> Vec<module_store::PromptModuleDto> {
+    state
+        .module_store
+        .list_all()
+        .iter()
+        .map(|(m, enabled)| module_store::module_to_dto(m, *enabled))
+        .collect()
+}
+
+#[tauri::command]
+fn update_module(
+    id: String,
+    content: Option<String>,
+    enabled: Option<bool>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if state
+        .module_store
+        .update(&id, content.as_deref(), enabled)
+    {
+        Ok(())
+    } else {
+        Err("内置模块不能修改内容".into())
+    }
+}
+
+#[tauri::command]
+fn list_profiles(state: tauri::State<'_, Arc<AppState>>) -> Vec<module_store::ProfileSummaryDto> {
+    state.profile_store.list()
+}
+
+#[tauri::command]
+fn get_active_profile(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<module_store::PromptProfileDto> {
+    state
+        .profile_store
+        .get_active()
+        .map(|p| module_store::profile_to_dto(&p, true))
+}
+
+#[tauri::command]
+fn save_profile(
+    profile_json: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let profile: PromptProfile =
+        serde_json::from_str(&profile_json).map_err(|e| format!("Profile 解析失败: {e}"))?;
+    state.profile_store.save(profile);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_active_profile(id: String, state: tauri::State<'_, Arc<AppState>>) {
+    state.profile_store.set_active(&id);
 }
 
 #[tauri::command]
@@ -2818,6 +2891,13 @@ pub fn run() {
             plugin_read_character,
             plugin_get_variable,
             plugin_set_variable,
+            // 预设/模块系统命令
+            list_modules,
+            update_module,
+            list_profiles,
+            get_active_profile,
+            save_profile,
+            set_active_profile,
             get_version,
             // LLM 连接管理命令
             list_connection_templates,
