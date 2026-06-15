@@ -1,0 +1,249 @@
+/// Mock LLM 客户端（测试/开发用，无需真实 API key）
+///
+/// 按请求内容自动返回对应的模拟响应：
+/// - 导演请求 → 产出 Plan JSON
+/// - 子 Agent 请求 → 产出角色表演文本
+/// - 编剧请求 → 产出成文 Markdown
+use async_trait::async_trait;
+use tokio::sync::{mpsc, watch};
+
+use storyforge_domain::llm::{ChatRequest, ChatResponse, StreamChunk, ToolCall, Usage};
+
+/// Mock 响应脚本
+pub struct MockScript {
+    /// 匹配 system prompt 中包含此字符串
+    pub match_keyword: String,
+    /// 模拟的完整响应文本
+    pub response_content: String,
+    /// 模拟的工具调用（可选）
+    pub tool_calls: Vec<ToolCall>,
+    /// 是否模拟流式输出（逐字发送）
+    pub stream: bool,
+}
+
+/// Mock LLM 客户端
+pub struct MockLlmClient {
+    scripts: Vec<MockScript>,
+}
+
+impl MockLlmClient {
+    /// 使用默认脚本（导演/子/编剧）创建
+    pub fn with_defaults() -> Self {
+        Self {
+            scripts: default_scripts(),
+        }
+    }
+
+    /// 使用自定义脚本创建
+    pub fn new(scripts: Vec<MockScript>) -> Self {
+        Self { scripts }
+    }
+
+    /// 根据请求匹配脚本
+    fn find_script(&self, req: &ChatRequest) -> Option<&MockScript> {
+        // 从 system prompt 中找匹配
+        let system_text: String = req
+            .messages
+            .iter()
+            .filter(|m| m.role == storyforge_domain::llm::ChatRole::System)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        self.scripts
+            .iter()
+            .find(|s| system_text.contains(&s.match_keyword))
+    }
+}
+
+#[async_trait]
+impl crate::LlmClient for MockLlmClient {
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, storyforge_domain::llm::LlmError> {
+        let script = self.find_script(req);
+
+        let (content, tool_calls) = if let Some(s) = script {
+            (s.response_content.clone(), s.tool_calls.clone())
+        } else {
+            // 默认：返回一段通用文本
+            (
+                "（MockLlmClient：未匹配到特定脚本，返回默认响应）".to_string(),
+                vec![],
+            )
+        };
+
+        Ok(ChatResponse {
+            content,
+            tool_calls,
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            }),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        tx: mpsc::UnboundedSender<StreamChunk>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ChatResponse, storyforge_domain::llm::LlmError> {
+        let script = self.find_script(req);
+        let content = script
+            .map(|s| s.response_content.clone())
+            .unwrap_or_else(|| "（Mock 默认响应）".to_string());
+        let tool_calls = script
+            .map(|s| s.tool_calls.clone())
+            .unwrap_or_default();
+        let do_stream = script.map(|s| s.stream).unwrap_or(true);
+
+        if do_stream {
+            // 逐字流式输出（模拟真实 SSE）
+            let mut cancel = cancel;
+            for ch in content.chars() {
+                tokio::select! {
+                    _ = cancel.changed() => {
+                        if *cancel.borrow() {
+                            return Err(storyforge_domain::llm::LlmError::Cancelled);
+                        }
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                        let _ = tx.send(StreamChunk {
+                            delta_content: Some(ch.to_string()),
+                            delta_tool_calls: None,
+                            finish_reason: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 发送最终 chunk
+        let _ = tx.send(StreamChunk {
+            delta_content: if do_stream { None } else { Some(content.clone()) },
+            delta_tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls.clone())
+            },
+            finish_reason: Some("stop".into()),
+        });
+
+        Ok(ChatResponse {
+            content,
+            tool_calls,
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            }),
+        })
+    }
+}
+
+/// 默认脚本集（导演 / 子 Agent / 编剧）
+fn default_scripts() -> Vec<MockScript> {
+    vec![
+        // 导演脚本：在 content 中直接输出 Plan JSON（避免工具调用循环）
+        MockScript {
+            match_keyword: "写作导演".into(),
+            response_content: serde_json::json!({
+                "scene_brief": "一场雨中告别戏，两个角色在屋檐下对话",
+                "subagent_tasks": [
+                    {
+                        "character_id": "Seraphina",
+                        "brief": "演出告别时的温柔与不舍",
+                        "context_package": {
+                            "character_brief": "Seraphina，一位温柔的精灵法师",
+                            "scene_brief": "雨中告别",
+                            "relevant_lore": [],
+                            "constant_lore": [],
+                            "recent_window": [],
+                            "task": "在这场雨中告别中，演出你温柔而不舍的情感"
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+            tool_calls: vec![],
+            stream: false,
+        },
+        // 子 Agent 脚本：产出表演文本
+        MockScript {
+            match_keyword: "角色".into(),
+            response_content: "雨丝如银线般从屋檐滑落，Seraphina 静静站在那里，银色的长发被雨水打湿，紧贴在苍白的脸颊上。她伸出纤细的手指，轻轻触碰了你掌心的温度。\n\n「你知道的……」她的声音如风铃般轻柔，却带着一丝不易察觉的颤抖，「有些告别，是为了更好的重逢。」\n\n*她微微垂下眼帘，睫毛上凝结的水珠分不清是雨还是泪。那一刻，时间仿佛凝固在了她的指尖与你掌心之间。*".into(),
+            tool_calls: vec![],
+            stream: true,
+        },
+        // 编剧脚本：产出成文
+        MockScript {
+            match_keyword: "编剧".into(),
+            response_content: "## 雨中告别\n\n雨幕低垂，将整个世界笼罩在一片朦胧的灰蓝色调中。屋檐下的积水映出两道身影，一道纤细如柳，一道沉默如山。\n\nSeraphina 站在那里，银色的长发被雨水浸透，水珠沿着发梢滴落，在她脚边汇成小小的溪流。她没有撑伞，只是静静地看着面前的人，目光中带着一种超越了悲伤的温柔。\n\n「你知道的……」\n\n她的声音很轻，几乎要被雨声淹没，却清晰地传入了你的耳中。那声音如风铃，如溪流，如所有美好事物在消逝前最后的回响。\n\n「有些告别，是为了更好的重逢。」\n\n*她伸出手指，轻轻触碰你的掌心。那一刻的温度，足以温暖此后所有漫长的雨季。*".into(),
+            tool_calls: vec![],
+            stream: true,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LlmClient;
+    use storyforge_domain::llm::ChatMessage;
+
+    #[tokio::test]
+    async fn test_mock_director_emits_plan() {
+        let client = MockLlmClient::with_defaults();
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("你是写作导演。用户给你写作意图，你要输出 Plan"),
+                ChatMessage::user("写一场戏"),
+            ],
+            tools: None,
+            params: Default::default(),
+            model: "mock".into(),
+        };
+
+        let resp = client.chat(&req).await.unwrap();
+        // 导演现在在 content 中输出 Plan JSON（避免工具调用循环）
+        assert!(resp.content.contains("scene_brief"));
+        assert!(resp.content.contains("subagent_tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_subagent_returns_performance() {
+        let client = MockLlmClient::with_defaults();
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("你是角色 Seraphina"),
+                ChatMessage::user("演出你的部分"),
+            ],
+            tools: None,
+            params: Default::default(),
+            model: "mock".into(),
+        };
+
+        let resp = client.chat(&req).await.unwrap();
+        assert!(resp.content.contains("Seraphina"));
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_editor_returns_draft() {
+        let client = MockLlmClient::with_defaults();
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("你是编剧。收集所有子 Agent 的表演，合并成连贯成文"),
+                ChatMessage::user("合并这些表演"),
+            ],
+            tools: None,
+            params: Default::default(),
+            model: "mock".into(),
+        };
+
+        let resp = client.chat(&req).await.unwrap();
+        assert!(resp.content.contains("雨中告别"));
+    }
+}

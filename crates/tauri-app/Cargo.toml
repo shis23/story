@@ -1,0 +1,36 @@
+[package]
+name = "storyforge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "storyforge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+storyforge-domain.workspace = true
+storyforge-infra-import.workspace = true
+storyforge-infra-llm.workspace = true
+storyforge-app-logging.workspace = true
+storyforge-app-agent.workspace = true
+storyforge-app-conversation.workspace = true
+storyforge-app-pipeline.workspace = true
+storyforge-app-meta.workspace = true
+storyforge-app-memory.workspace = true
+storyforge-infra-vector.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

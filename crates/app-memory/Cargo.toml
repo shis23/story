@@ -1,0 +1,17 @@
+[package]
+name = "storyforge-app-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+storyforge-domain = { path = "../domain" }
+storyforge-infra-llm = { path = "../infra-llm" }
+storyforge-infra-vector = { path = "../infra-vector" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true

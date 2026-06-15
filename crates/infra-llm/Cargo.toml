@@ -1,0 +1,20 @@
+[package]
+name = "storyforge-infra-llm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+storyforge-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+regress.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

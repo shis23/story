@@ -1,0 +1,12 @@
+[package]
+name = "storyforge-infra-regex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+storyforge-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regress.workspace = true

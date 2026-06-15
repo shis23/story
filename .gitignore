@@ -1,0 +1,31 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node / 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+node_modules/
+
+# Tauri 生成的 Android 工程（体积大，按需取消注释提交）
+# crates/tauri-app/gen/android/
+
+# 运行时数据（含 API key，绝不提交）
+data/
+*.log
+logs/
+
+# 编辑器/系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 临时/测试文件
+_test_out.txt
+_dbg.txt
+_mvu_inspect.png
+_analyze_mvu.cjs

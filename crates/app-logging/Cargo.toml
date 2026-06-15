@@ -1,0 +1,18 @@
+[package]
+name = "storyforge-app-logging"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+storyforge-domain = { path = "../domain" }
+storyforge-infra-llm = { path = "../infra-llm" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
