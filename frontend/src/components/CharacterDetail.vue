@@ -253,6 +253,19 @@ async function saveNew() {
                   <input type="checkbox" v-model="editDraft.is_global" />
                   🌐 全局共享（跨角色卡生效）
                 </label>
+                <div class="flex gap-3 items-center">
+                  <label class="flex items-center gap-1 text-xs text-ink-soft">
+                    depth
+                    <input type="number" v-model.number="editDraft.depth" min="0" max="100"
+                      class="w-14 px-1.5 py-0.5 text-xs rounded border border-line bg-surface focus:outline-none focus:border-accent text-center" />
+                  </label>
+                  <label class="flex items-center gap-1 text-xs text-ink-soft">
+                    order
+                    <input type="number" v-model.number="editDraft.order" min="0" max="999"
+                      class="w-14 px-1.5 py-0.5 text-xs rounded border border-line bg-surface focus:outline-none focus:border-accent text-center" />
+                  </label>
+                  <span class="text-[10px] text-ink-soft/60">depth 小=更重要</span>
+                </div>
                 <div class="flex gap-2">
                   <button @click="saveEdit(i)" class="flex-1 py-1.5 text-xs rounded bg-accent text-white hover:opacity-90">💾 保存</button>
                   <button @click="cancelEdit" class="flex-1 py-1.5 text-xs rounded border border-line text-ink-soft hover:bg-line">取消</button>
@@ -280,6 +293,7 @@ async function saveNew() {
                     </option>
                   </select>
                   <span v-if="entry.is_global" class="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent shrink-0">🌐 全局</span>
+                  <span class="px-1 py-0.5 rounded text-[10px] bg-ink-soft/10 text-ink-soft shrink-0">d{{ entry.depth ?? 2 }}</span>
                   <span class="text-xs text-ink-soft truncate flex-1 cursor-pointer" @click="toggleEntry(i)">{{ entry.keys?.join(', ') }}</span>
                   <button @click="startEdit(i, entry)" class="shrink-0 text-xs px-1.5 py-0.5 rounded text-ink-soft hover:bg-line hover:text-ink" title="编辑">✏️</button>
                   <button @click="handleDelete(i)" class="shrink-0 text-xs px-1.5 py-0.5 rounded text-err/70 hover:bg-err/10" title="删除">🗑</button>
