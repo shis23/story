@@ -89,6 +89,20 @@ export async function deletePreset(id) {
   }
 }
 
+/** 更新预设中某条 prompt 的内容和/或启用状态 */
+export async function updatePresetPrompt(presetId, promptIndex, content, enabled) {
+  if (isTauri()) {
+    return await invoke('update_preset_prompt', { presetId, promptIndex, content, enabled })
+  }
+}
+
+/** 更新预设中某条 regex 的禁用状态 */
+export async function updatePresetRegex(presetId, regexIndex, disabled) {
+  if (isTauri()) {
+    return await invoke('update_preset_regex', { presetId, regexIndex, disabled })
+  }
+}
+
 // ─── M4 插件命令 ──────────────────────────────────────────────────────────
 
 /** 列出所有已安装插件 */

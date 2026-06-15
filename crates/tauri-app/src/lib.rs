@@ -826,6 +826,33 @@ fn delete_preset(id: String) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn update_preset_prompt(
+    preset_id: String,
+    prompt_index: usize,
+    content: Option<String>,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    if get_preset_store().update_prompt(&preset_id, prompt_index, content.as_deref(), enabled) {
+        Ok(())
+    } else {
+        Err(format!("找不到预设 {preset_id} 的第 {prompt_index} 条 prompt"))
+    }
+}
+
+#[tauri::command]
+fn update_preset_regex(
+    preset_id: String,
+    regex_index: usize,
+    disabled: Option<bool>,
+) -> Result<(), String> {
+    if get_preset_store().update_regex(&preset_id, regex_index, disabled) {
+        Ok(())
+    } else {
+        Err(format!("找不到预设 {preset_id} 的第 {regex_index} 条正则"))
+    }
+}
+
 // ─── M4 插件命令 ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -2908,6 +2935,8 @@ pub fn run() {
             list_presets,
             get_preset,
             delete_preset,
+            update_preset_prompt,
+            update_preset_regex,
             // M4 插件命令
             list_plugins,
             install_plugin,

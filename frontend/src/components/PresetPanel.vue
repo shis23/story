@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { listPresets, getPreset, deletePreset } from '../tauri-api.js'
+import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex } from '../tauri-api.js'
 
 const emit = defineEmits(['close'])
 
@@ -9,6 +9,9 @@ const loading = ref(false)
 const expandedId = ref(null)
 const detail = ref(null)
 const detailTab = ref('prompts') // 'prompts' | 'regex'
+const editingPrompt = ref(null) // 正在编辑的 prompt index
+const editContent = ref('')
+const saving = ref(false)
 
 onMounted(() => { refresh() })
 
@@ -25,10 +28,12 @@ async function togglePreset(preset) {
   if (expandedId.value === preset.id) {
     expandedId.value = null
     detail.value = null
+    editingPrompt.value = null
   } else {
     expandedId.value = preset.id
     detail.value = await getPreset(preset.id)
     detailTab.value = 'prompts'
+    editingPrompt.value = null
   }
 }
 
@@ -43,6 +48,59 @@ async function handleDelete(preset) {
     await refresh()
   } catch (e) {
     alert('删除失败: ' + e)
+  }
+}
+
+// ─── 编辑功能 ──────────────────────────────────────────────────────────
+
+function startEditPrompt(index) {
+  editingPrompt.value = index
+  editContent.value = detail.value.prompts[index].content
+}
+
+function cancelEdit() {
+  editingPrompt.value = null
+  editContent.value = ''
+}
+
+async function saveEditPrompt(index) {
+  saving.value = true
+  try {
+    await updatePresetPrompt(expandedId.value, index, editContent.value, null)
+    // 更新本地数据
+    detail.value.prompts[index].content = editContent.value
+    editingPrompt.value = null
+    editContent.value = ''
+  } catch (e) {
+    alert('保存失败: ' + e)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function togglePromptEnabled(index) {
+  const prompt = detail.value.prompts[index]
+  saving.value = true
+  try {
+    await updatePresetPrompt(expandedId.value, index, null, !prompt.enabled)
+    prompt.enabled = !prompt.enabled
+  } catch (e) {
+    alert('操作失败: ' + e)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function toggleRegexDisabled(index) {
+  const regex = detail.value.regex_scripts[index]
+  saving.value = true
+  try {
+    await updatePresetRegex(expandedId.value, index, !regex.disabled)
+    regex.disabled = !regex.disabled
+  } catch (e) {
+    alert('操作失败: ' + e)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -61,7 +119,8 @@ function roleBadgeClass(role) {
       <div class="sticky top-0 z-10 bg-bg border-b border-line px-4 py-3 flex items-center justify-between shrink-0">
         <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>
         <span class="font-medium text-ink text-sm">预设管理</span>
-        <div class="w-12"></div>
+        <span v-if="saving" class="text-xs text-accent">保存中…</span>
+        <div v-else class="w-12"></div>
       </div>
 
       <!-- 内容区 -->
@@ -113,7 +172,7 @@ function roleBadgeClass(role) {
             </div>
 
             <div class="px-3 py-2 space-y-2 max-h-60 overflow-y-auto">
-              <!-- 提示词列表 -->
+              <!-- 提示词列表（可编辑） -->
               <template v-if="detailTab === 'prompts'">
                 <div
                   v-for="(prompt, i) in detail.prompts"
@@ -125,18 +184,47 @@ function roleBadgeClass(role) {
                     <span class="px-1.5 py-0.5 rounded text-[10px]" :class="roleBadgeClass(prompt.role)">{{ prompt.role }}</span>
                     <span class="font-medium text-ink truncate">{{ prompt.name || prompt.identifier }}</span>
                     <span v-if="prompt.marker" class="text-[10px] text-ink-soft">marker</span>
-                    <span v-if="!prompt.enabled" class="text-[10px] text-warn">禁用</span>
                     <span v-if="prompt.is_system_prompt" class="text-[10px] text-accent">系统提示词</span>
+
+                    <!-- 操作按钮 -->
+                    <div class="ml-auto flex gap-1 shrink-0">
+                      <button
+                        @click="togglePromptEnabled(i)"
+                        class="px-1.5 py-0.5 rounded text-[10px]"
+                        :class="prompt.enabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
+                        :title="prompt.enabled ? '点击禁用' : '点击启用'"
+                      >{{ prompt.enabled ? '✓' : '✕' }}</button>
+                      <button
+                        v-if="!prompt.marker"
+                        @click="startEditPrompt(i)"
+                        class="px-1.5 py-0.5 rounded text-[10px] bg-line text-ink-soft hover:bg-accent/10 hover:text-accent"
+                        title="编辑内容"
+                      >✎</button>
+                    </div>
                   </div>
-                  <div class="text-ink-soft whitespace-pre-wrap line-clamp-4">{{ prompt.content }}</div>
+
+                  <!-- 编辑模式 -->
+                  <div v-if="editingPrompt === i" class="mt-2">
+                    <textarea
+                      v-model="editContent"
+                      class="w-full h-24 text-xs font-mono p-2 rounded border border-line bg-surface resize-none focus:border-accent focus:outline-none"
+                    />
+                    <div class="flex justify-end gap-1.5 mt-1.5">
+                      <button @click="cancelEdit" class="px-2 py-1 text-[10px] rounded bg-line text-ink-soft hover:bg-bg">取消</button>
+                      <button @click="saveEditPrompt(i)" class="px-2 py-1 text-[10px] rounded bg-accent text-white hover:bg-accent/80">保存</button>
+                    </div>
+                  </div>
+
+                  <!-- 查看模式 -->
+                  <div v-else class="text-ink-soft whitespace-pre-wrap line-clamp-4">{{ prompt.content }}</div>
                 </div>
                 <div v-if="detail.prompts.length === 0" class="text-xs text-ink-soft text-center py-4">无提示词</div>
               </template>
 
-              <!-- 正则列表 -->
+              <!-- 正则列表（可启停） -->
               <template v-if="detailTab === 'regex'">
                 <div
-                  v-for="r in detail.regex_scripts"
+                  v-for="(r, i) in detail.regex_scripts"
                   :key="r.id"
                   class="bg-bg rounded-lg px-3 py-2 text-xs"
                   :class="{ 'opacity-50': r.disabled }"
@@ -147,6 +235,14 @@ function roleBadgeClass(role) {
                       :class="r.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'"
                     >{{ r.placement === 'input' ? '输入' : '输出' }}</span>
                     <span v-if="r.disabled" class="text-[10px] text-warn">禁用</span>
+
+                    <!-- 启停按钮 -->
+                    <button
+                      @click="toggleRegexDisabled(i)"
+                      class="ml-auto px-1.5 py-0.5 rounded text-[10px] shrink-0"
+                      :class="!r.disabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
+                      :title="r.disabled ? '点击启用' : '点击禁用'"
+                    >{{ !r.disabled ? '✓' : '✕' }}</button>
                   </div>
                   <div class="text-ink-soft font-mono text-[11px] break-all">
                     <div>匹配: {{ r.find_regex }}</div>

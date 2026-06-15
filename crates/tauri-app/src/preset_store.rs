@@ -71,6 +71,39 @@ impl PresetStore {
         }
     }
 
+    /// 更新单条 prompt 的内容和/或启用状态
+    pub fn update_prompt(&self, preset_id: &str, prompt_index: usize, content: Option<&str>, enabled: Option<bool>) -> bool {
+        let mut presets = self.inner.lock().unwrap();
+        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
+            if let Some(prompt) = stored.preset.prompts.get_mut(prompt_index) {
+                if let Some(c) = content {
+                    prompt.content = c.to_string();
+                }
+                if let Some(e) = enabled {
+                    prompt.enabled = e;
+                }
+                self.persist(&presets);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 更新单条 regex 的禁用状态
+    pub fn update_regex(&self, preset_id: &str, regex_index: usize, disabled: Option<bool>) -> bool {
+        let mut presets = self.inner.lock().unwrap();
+        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
+            if let Some(regex) = stored.preset.regex_scripts.get_mut(regex_index) {
+                if let Some(d) = disabled {
+                    regex.disabled = d;
+                }
+                self.persist(&presets);
+                return true;
+            }
+        }
+        false
+    }
+
     fn persist(&self, presets: &[StoredPreset]) {
         if let Some(parent) = self.path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
