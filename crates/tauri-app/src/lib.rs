@@ -691,6 +691,119 @@ fn import_preset(data: Vec<u8>) -> Result<String, String> {
     ))
 }
 
+/// 预设摘要 DTO（列表用）
+#[derive(Debug, Clone, Serialize)]
+pub struct PresetSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub prompt_count: usize,
+    pub regex_count: usize,
+    pub imported_at: String,
+}
+
+/// 预设详情 DTO
+#[derive(Debug, Clone, Serialize)]
+pub struct PresetDetailDto {
+    pub id: String,
+    pub name: String,
+    pub prompts: Vec<PresetPromptDto>,
+    pub regex_scripts: Vec<RegexScriptDto>,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PresetPromptDto {
+    pub identifier: String,
+    pub name: String,
+    pub role: String,
+    pub content: String,
+    pub enabled: bool,
+    pub marker: bool,
+    pub is_system_prompt: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegexScriptDto {
+    pub id: String,
+    pub script_name: String,
+    pub find_regex: String,
+    pub replace_string: String,
+    pub placement: String,
+    pub disabled: bool,
+}
+
+#[tauri::command]
+fn list_presets() -> Vec<PresetSummaryDto> {
+    get_preset_store()
+        .list()
+        .iter()
+        .map(|sp| PresetSummaryDto {
+            id: sp.id.clone(),
+            name: sp.preset.name.clone(),
+            prompt_count: sp.preset.prompts.len(),
+            regex_count: sp.preset.regex_scripts.len(),
+            imported_at: sp.imported_at.clone(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn get_preset(id: String) -> Result<PresetDetailDto, String> {
+    let sp = get_preset_store()
+        .get(&id)
+        .ok_or_else(|| format!("找不到预设 {id}"))?;
+    Ok(PresetDetailDto {
+        id: sp.id.clone(),
+        name: sp.preset.name.clone(),
+        prompts: sp
+            .preset
+            .prompts
+            .iter()
+            .map(|p| PresetPromptDto {
+                identifier: p.identifier.clone(),
+                name: p.name.clone(),
+                role: match p.role {
+                    storyforge_domain::preset::PromptRole::System => "system",
+                    storyforge_domain::preset::PromptRole::User => "user",
+                    storyforge_domain::preset::PromptRole::Assistant => "assistant",
+                }
+                .to_string(),
+                content: p.content.clone(),
+                enabled: p.enabled,
+                marker: p.marker,
+                is_system_prompt: p.is_system_prompt,
+            })
+            .collect(),
+        regex_scripts: sp
+            .preset
+            .regex_scripts
+            .iter()
+            .map(|r| RegexScriptDto {
+                id: r.id.clone(),
+                script_name: r.script_name.clone(),
+                find_regex: r.find_regex.clone(),
+                replace_string: r.replace_string.clone(),
+                placement: match r.placement {
+                    storyforge_domain::preset::RegexPlacement::Input => "input",
+                    storyforge_domain::preset::RegexPlacement::Output => "output",
+                }
+                .to_string(),
+                disabled: r.disabled,
+            })
+            .collect(),
+        imported_at: sp.imported_at.clone(),
+    })
+}
+
+#[tauri::command]
+fn delete_preset(id: String) -> Result<(), String> {
+    if get_preset_store().delete(&id) {
+        Ok(())
+    } else {
+        Err(format!("找不到预设 {id}"))
+    }
+}
+
 #[tauri::command]
 fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -2504,6 +2617,9 @@ pub fn run() {
             delete_world_info_entry,
             meta_accept_patch,
             import_preset,
+            list_presets,
+            get_preset,
+            delete_preset,
             get_version,
             // LLM 连接管理命令
             list_connection_templates,

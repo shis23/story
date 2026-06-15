@@ -66,6 +66,29 @@ export async function importPreset(data) {
   return '预设导入成功（mock）'
 }
 
+/** 列出所有预设（摘要） */
+export async function listPresets() {
+  if (isTauri()) {
+    return await invoke('list_presets')
+  }
+  return []
+}
+
+/** 获取预设详情（含每条 prompt 和正则） */
+export async function getPreset(id) {
+  if (isTauri()) {
+    return await invoke('get_preset', { id })
+  }
+  return null
+}
+
+/** 删除预设 */
+export async function deletePreset(id) {
+  if (isTauri()) {
+    return await invoke('delete_preset', { id })
+  }
+}
+
 /**
  * 获取版本号
  */
