@@ -575,9 +575,10 @@ fn add_world_info_entry(
     keys: Vec<String>,
     content: String,
     constant: bool,
+    is_global: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    let new_index = get_store().add_world_info_entry(&character_id, keys.clone(), content.clone(), constant)?;
+    let new_index = get_store().add_world_info_entry(&character_id, keys.clone(), content.clone(), constant, is_global.unwrap_or(false))?;
 
     // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目入向量库
     rebuild_world_info_in_tool_ctx(&state);

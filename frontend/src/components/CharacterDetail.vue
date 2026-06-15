@@ -18,9 +18,9 @@ const expandedEntry = ref(null) // 当前展开的条目索引
 
 // 编辑状态
 const editingIndex = ref(null) // 正在编辑的条目索引（null=未编辑）
-const editDraft = ref({ keys: '', content: '', constant: false }) // 编辑草稿
+const editDraft = ref({ keys: '', content: '', constant: false, is_global: false, depth: 2, order: 100 }) // 编辑草稿
 const addingNew = ref(false) // 是否在新增条目
-const newDraft = ref({ keys: '', content: '', constant: false })
+const newDraft = ref({ keys: '', content: '', constant: false, is_global: false })
 
 // 路由选项
 const routeOptions = [
@@ -51,6 +51,9 @@ function startEdit(i, entry) {
     keys: (entry.keys || []).join(', '),
     content: entry.content || '',
     constant: entry.constant,
+    is_global: entry.is_global || false,
+    depth: entry.depth ?? 2,
+    order: entry.order ?? 100,
   }
 }
 
@@ -69,9 +72,12 @@ async function saveEdit(i) {
       i,
       keys,
       editDraft.value.content,
-      editDraft.value.constant
+      editDraft.value.constant,
+      editDraft.value.is_global,
+      editDraft.value.depth,
+      editDraft.value.order
     )
-    emit('save-entry', { index: i, keys, content: editDraft.value.content, constant: editDraft.value.constant })
+    emit('save-entry', { index: i, keys, content: editDraft.value.content, constant: editDraft.value.constant, is_global: editDraft.value.is_global })
     editingIndex.value = null
   } catch (e) {
     console.error('保存条目失败:', e)
@@ -94,7 +100,7 @@ async function handleDelete(i) {
 // 新增条目
 function startAdd() {
   addingNew.value = true
-  newDraft.value = { keys: '', content: '', constant: false }
+  newDraft.value = { keys: '', content: '', constant: false, is_global: false }
 }
 
 async function saveNew() {
@@ -111,13 +117,15 @@ async function saveNew() {
       props.character.id,
       keys,
       newDraft.value.content,
-      newDraft.value.constant
+      newDraft.value.constant,
+      newDraft.value.is_global
     )
     emit('add-entry', {
       entry: {
         keys,
         content: newDraft.value.content,
         constant: newDraft.value.constant,
+        is_global: newDraft.value.is_global,
         route: newDraft.value.constant ? 'Constant' : 'Selective',
       },
     })
@@ -210,6 +218,10 @@ async function saveNew() {
                 <input type="checkbox" v-model="newDraft.constant" />
                 蓝灯（常驻，进导演上下文）
               </label>
+              <label class="flex items-center gap-1.5 text-xs text-accent">
+                <input type="checkbox" v-model="newDraft.is_global" />
+                🌐 全局共享（跨角色卡生效）
+              </label>
               <div class="flex gap-2">
                 <button @click="saveNew" class="flex-1 py-1.5 text-xs rounded bg-accent text-white hover:opacity-90">💾 保存</button>
                 <button @click="addingNew = false" class="flex-1 py-1.5 text-xs rounded border border-line text-ink-soft hover:bg-line">取消</button>
@@ -237,6 +249,10 @@ async function saveNew() {
                   <input type="checkbox" v-model="editDraft.constant" />
                   蓝灯（常驻）
                 </label>
+                <label class="flex items-center gap-1.5 text-xs text-accent">
+                  <input type="checkbox" v-model="editDraft.is_global" />
+                  🌐 全局共享（跨角色卡生效）
+                </label>
                 <div class="flex gap-2">
                   <button @click="saveEdit(i)" class="flex-1 py-1.5 text-xs rounded bg-accent text-white hover:opacity-90">💾 保存</button>
                   <button @click="cancelEdit" class="flex-1 py-1.5 text-xs rounded border border-line text-ink-soft hover:bg-line">取消</button>
@@ -263,6 +279,7 @@ async function saveNew() {
                       {{ opt.label }}
                     </option>
                   </select>
+                  <span v-if="entry.is_global" class="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent shrink-0">🌐 全局</span>
                   <span class="text-xs text-ink-soft truncate flex-1 cursor-pointer" @click="toggleEntry(i)">{{ entry.keys?.join(', ') }}</span>
                   <button @click="startEdit(i, entry)" class="shrink-0 text-xs px-1.5 py-0.5 rounded text-ink-soft hover:bg-line hover:text-ink" title="编辑">✏️</button>
                   <button @click="handleDelete(i)" class="shrink-0 text-xs px-1.5 py-0.5 rounded text-err/70 hover:bg-err/10" title="删除">🗑</button>

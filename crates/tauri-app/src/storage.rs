@@ -142,6 +142,7 @@ impl CharacterStore {
         keys: Vec<String>,
         content: String,
         constant: bool,
+        is_global: bool,
     ) -> Result<usize, String> {
         let mut chars = self.inner.lock().unwrap();
         let char = chars
@@ -156,7 +157,7 @@ impl CharacterStore {
             content,
             constant,
             route,
-            is_global: false,
+            is_global,
             depth: 2,
             order: 100,
         };

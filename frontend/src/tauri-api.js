@@ -89,20 +89,20 @@ export async function updateWorldInfoRoute(characterId, entryIndex, route) {
 }
 
 /**
- * 更新世界书条目的 keys/content/constant
+ * 更新世界书条目的 keys/content/constant/is_global/depth/order
  */
-export async function updateWorldInfoEntry(characterId, entryIndex, keys, content, constant) {
+export async function updateWorldInfoEntry(characterId, entryIndex, keys, content, constant, isGlobal = false, depth = 2, order = 100) {
   if (isTauri()) {
-    return await invoke('update_world_info_entry', { characterId, entryIndex, keys, content, constant })
+    return await invoke('update_world_info_entry', { characterId, entryIndex, keys, content, constant, isGlobal, depth, order })
   }
 }
 
 /**
  * 新增世界书条目，返回新索引
  */
-export async function addWorldInfoEntry(characterId, keys, content, constant) {
+export async function addWorldInfoEntry(characterId, keys, content, constant, isGlobal = false) {
   if (isTauri()) {
-    return await invoke('add_world_info_entry', { characterId, keys, content, constant })
+    return await invoke('add_world_info_entry', { characterId, keys, content, constant, isGlobal })
   }
   return 0
 }
