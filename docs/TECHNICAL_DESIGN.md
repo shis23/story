@@ -1172,14 +1172,25 @@ window.storyforge = {
 
 ### 8.6 角色卡 iframe 渲染（D7，与插件运行时共用沙箱）
 
-带前端的角色卡 = 一种特殊插件：
+> **⚠️ 歧义标注（2026-06-16）**：
+> "共用沙箱"需区分两层含义——
+> - **API 桥层**：插件和角色卡共用同一套 `window.storyforge` postMessage 协议 ✅
+> - **执行环境层**：插件和角色卡**不应共用同一个 iframe 实例**。
+>   插件数量少 → 每个一个 iframe（安全隔离）；
+>   角色卡渲染是 O(N)（每条消息可能都需要）→ 应使用共享 WebView（O(1)，§19.6）。
+>
+> 见 §19.6 兜底执行方案对比。下文 `SandboxKind` 仅表示 API 协议共用，不代表执行环境共用。
+
+带前端的角色卡 = 一种特殊插件（从 API 协议角度）：
 ```rust
 enum SandboxKind {
-    Plugin(PluginManifest),     // 用户安装的插件
-    CharacterCard(CardAssets),  // 角色卡内嵌 HTML（来自 ST 导入）
+    Plugin(PluginManifest),     // 用户安装的插件 → 独立 iframe
+    CharacterCard(CardAssets),  // 角色卡内嵌 HTML → 共享 WebView（§19.6）
 }
-// 共用同一套沙箱+API桥，但权限不同：
-// 角色卡默认只有 ReadCharacters + WriteVariables
+// API 桥共用，但执行环境不同：
+// - 插件：每个一个 iframe（安全隔离，数量少）
+// - 角色卡：共享 WebView（O(1) 内存，数量大）
+// 权限也不同：角色卡默认只有 ReadCharacters + WriteVariables
 ```
 
 ---
@@ -2172,6 +2183,8 @@ struct FallbackFragment {
 **为什么共享 WebView 比每消息 iframe 好**：iframe 是 O(N) 内存（每条消息一个渲染上下文），共享 WebView 是 O(1)（全局一个计算单元）。
 
 **依赖**：兜底执行依赖插件运行时（§8）基础设施。落地顺序：先做翻译 + 原生路径（不等插件运行时），WebView 兜底后做。
+
+> **⚠️ 与 §8.6 的关系**：共享 WebView 是角色卡 JS 执行的推荐方案。插件仍用独立 iframe（§8.1）。两者共用 API 桥协议但执行环境隔离。详见 §8.6 歧义标注。
 
 ### 19.7 与 §8 插件运行时的关系
 
