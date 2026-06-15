@@ -89,6 +89,36 @@ export async function deletePreset(id) {
   }
 }
 
+// ─── M4 插件命令 ──────────────────────────────────────────────────────────
+
+/** 列出所有已安装插件 */
+export async function listPlugins() {
+  if (isTauri()) {
+    return await invoke('list_plugins')
+  }
+}
+
+/** 安装插件（传入 manifest JSON 字符串） */
+export async function installPlugin(manifestJson) {
+  if (isTauri()) {
+    return await invoke('install_plugin', { manifestJson })
+  }
+}
+
+/** 卸载插件 */
+export async function uninstallPlugin(id) {
+  if (isTauri()) {
+    return await invoke('uninstall_plugin', { id })
+  }
+}
+
+/** 启用/禁用插件 */
+export async function setPluginEnabled(id, enabled) {
+  if (isTauri()) {
+    return await invoke('set_plugin_enabled', { id, enabled })
+  }
+}
+
 /**
  * 获取版本号
  */

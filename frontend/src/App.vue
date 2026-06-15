@@ -11,6 +11,7 @@ import LogPanel from './components/LogPanel.vue'
 import ConnectionConfig from './components/ConnectionConfig.vue'
 import CampaignPanel from './components/CampaignPanel.vue'
 import PresetPanel from './components/PresetPanel.vue'
+import PluginPanel from './components/PluginPanel.vue'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign } from './tauri-api.js'
 
 const powerMode = ref(false)
@@ -27,6 +28,7 @@ const showCharList = ref(false)
 const showCampaignPanel = ref(false)
 const activeCampaign = ref(null)
 const showPresetPanel = ref(false)
+const showPluginPanel = ref(false)
 
 // 流水线状态
 const pipeline = reactive({
@@ -539,6 +541,13 @@ function handlePipelineEvent(event) {
           📑
         </button>
         <button
+          @click="showPluginPanel = true"
+          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
+          title="插件管理"
+        >
+          🔌
+        </button>
+        <button
           @click="handleImport"
           class="px-3 py-1.5 rounded-full text-xs font-medium bg-accent-soft text-accent hover:bg-accent hover:text-white transition-all shrink-0"
         >
@@ -665,6 +674,12 @@ function handlePipelineEvent(event) {
     <PresetPanel
       v-if="showPresetPanel"
       @close="showPresetPanel = false"
+    />
+
+    <!-- 插件管理弹层 -->
+    <PluginPanel
+      v-if="showPluginPanel"
+      @close="showPluginPanel = false"
     />
   </div>
 </template>
