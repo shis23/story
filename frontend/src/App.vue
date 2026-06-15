@@ -12,7 +12,8 @@ import ConnectionConfig from './components/ConnectionConfig.vue'
 import CampaignPanel from './components/CampaignPanel.vue'
 import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign } from './tauri-api.js'
+import PluginHost from './components/PluginHost.vue'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -29,6 +30,16 @@ const showCampaignPanel = ref(false)
 const activeCampaign = ref(null)
 const showPresetPanel = ref(false)
 const showPluginPanel = ref(false)
+const sidebarPlugins = ref([])
+const showSidebarPlugins = ref(false)
+
+// 加载侧栏插件
+async function loadSidebarPlugins() {
+  try {
+    const all = await listPlugins()
+    sidebarPlugins.value = (all || []).filter(p => p.enabled && p.ui_slots?.includes('SidebarPanel'))
+  } catch {}
+}
 
 // 流水线状态
 const pipeline = reactive({
@@ -68,6 +79,7 @@ onMounted(async () => {
   await refreshActiveConnection()
   await loadRecentConversation()
   try { activeCampaign.value = await getActiveCampaign() } catch {}
+  await loadSidebarPlugins()
   setupConsoleForwarding()
 })
 
@@ -635,6 +647,25 @@ function handlePipelineEvent(event) {
       <div class="h-4"></div>
     </main>
 
+    <!-- 插件侧栏面板 -->
+    <div v-if="sidebarPlugins.length > 0" class="border-t border-line/50">
+      <button
+        @click="showSidebarPlugins = !showSidebarPlugins"
+        class="w-full px-4 py-1.5 text-xs text-ink-soft hover:bg-line/30 flex items-center gap-1"
+      >
+        <span class="transition-transform" :class="showSidebarPlugins ? 'rotate-90' : ''">▸</span>
+        🧩 插件面板 ({{ sidebarPlugins.length }})
+      </button>
+      <div v-if="showSidebarPlugins" class="px-4 pb-2 space-y-2">
+        <PluginHost
+          v-for="p in sidebarPlugins"
+          :key="p.id"
+          :plugin="p"
+          height="150px"
+        />
+      </div>
+    </div>
+
     <!-- 底部输入栏 -->
     <Composer @start-writing="startWriting" />
 
@@ -679,7 +710,7 @@ function handlePipelineEvent(event) {
     <!-- 插件管理弹层 -->
     <PluginPanel
       v-if="showPluginPanel"
-      @close="showPluginPanel = false"
+      @close="showPluginPanel = false; loadSidebarPlugins()"
     />
   </div>
 </template>
