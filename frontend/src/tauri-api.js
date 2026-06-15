@@ -420,6 +420,187 @@ export async function metaAcceptPatch(patchId) {
   }
 }
 
+// ─── P1 角色识别 / CharacterCard / Campaign ────────────────────────────────
+
+/**
+ * 跑角色识别 Agent，为已导入的扁平 Character 建 CharacterCard
+ * 失败时降级建单角色 Protagonist
+ * @param {string} sourceCharacterId - 原角色卡 ID
+ * @returns {Promise<{id, name, source_character_id, definition_count, extracted}>}
+ */
+export async function extractCharacters(sourceCharacterId) {
+  if (isTauri()) {
+    return await invoke('extract_characters', { source_character_id: sourceCharacterId })
+  }
+  return { id: 'mock-card-1', name: 'Mock Card', source_character_id: sourceCharacterId, definition_count: 1, extracted: false }
+}
+
+/** 列出所有 CharacterCard */
+export async function listCards() {
+  if (isTauri()) {
+    return await invoke('list_cards')
+  }
+  return []
+}
+
+/** 获取 CharacterCard 详情（含 character_definitions） */
+export async function getCard(id) {
+  if (isTauri()) {
+    return await invoke('get_card', { id })
+  }
+  return null
+}
+
+/**
+ * 开档：建 Campaign，实例化所有 Protagonist/Supporting 角色
+ * @param {string} cardId - CharacterCard ID
+ * @param {string} name - 档名
+ */
+export async function createCampaign(cardId, name) {
+  if (isTauri()) {
+    return await invoke('create_campaign', { card_id: cardId, name })
+  }
+  return { id: 'mock-campaign-1', card_id: cardId, name, instance_count: 1 }
+}
+
+/** 列出 Campaign（可按 card_id 过滤） */
+export async function listCampaigns(cardId = null) {
+  if (isTauri()) {
+    return await invoke('list_campaigns', { card_id: cardId })
+  }
+  return []
+}
+
+/** 获取单个 Campaign 详情 */
+export async function getCampaign(id) {
+  if (isTauri()) {
+    return await invoke('get_campaign', { id })
+  }
+  return null
+}
+
+/** 设置活跃 Campaign */
+export async function setActiveCampaign(id) {
+  if (isTauri()) {
+    return await invoke('set_active_campaign', { id })
+  }
+}
+
+/** 获取当前活跃 Campaign */
+export async function getActiveCampaign() {
+  if (isTauri()) {
+    return await invoke('get_active_campaign')
+  }
+  return null
+}
+
+/** 列出 Campaign 内的角色实例 */
+export async function listInstances(campaignId) {
+  if (isTauri()) {
+    return await invoke('list_instances', { campaign_id: campaignId })
+  }
+  return []
+}
+
+/** 获取单个角色实例详情 */
+export async function getInstance(campaignId, instanceId) {
+  if (isTauri()) {
+    return await invoke('get_instance', { campaign_id: campaignId, instance_id: instanceId })
+  }
+  return null
+}
+
+/** 查角色实例的当前变量值 */
+export async function getCharacterVariables(campaignId, instanceId) {
+  if (isTauri()) {
+    return await invoke('get_character_variables', { campaign_id: campaignId, instance_id: instanceId })
+  }
+  return []
+}
+
+/** 手动改角色实例变量值 */
+export async function setCharacterVariable(campaignId, instanceId, key, value) {
+  if (isTauri()) {
+    return await invoke('set_character_variable', { campaign_id: campaignId, instance_id: instanceId, key, value })
+  }
+}
+
+/** 查 Campaign 全局变量 */
+export async function getCampaignVariables(campaignId) {
+  if (isTauri()) {
+    return await invoke('get_campaign_variables', { campaign_id: campaignId })
+  }
+  return []
+}
+
+/** 改 Campaign 全局变量 */
+export async function setCampaignVariable(campaignId, key, value) {
+  if (isTauri()) {
+    return await invoke('set_campaign_variable', { campaign_id: campaignId, key, value })
+  }
+}
+
+/** 临场角色升级为常驻 */
+export async function promoteTemporaryInstance(campaignId, instanceId) {
+  if (isTauri()) {
+    return await invoke('promote_temporary_instance', { campaign_id: campaignId, instance_id: instanceId })
+  }
+}
+
+// ─── P2 知识 / 任务 / 摘要 ──────────────────────────────────────────────────
+
+/** 列角色可见信息（不传 characterId 则返回整个 campaign 所有角色的知识） */
+export async function listCharacterKnowledge(campaignId, characterId = null) {
+  if (isTauri()) {
+    return await invoke('list_character_knowledge', { campaign_id: campaignId, character_id: characterId })
+  }
+  return []
+}
+
+/** 列叙事计划任务（可按状态筛：pending/active/likely_completed/completed/abandoned） */
+export async function listTasks(campaignId, statusFilter = null) {
+  if (isTauri()) {
+    return await invoke('list_tasks', { campaign_id: campaignId, status_filter: statusFilter })
+  }
+  return []
+}
+
+/**
+ * 用户手动建任务（伏笔/目标）
+ * @param {string} campaignId
+ * @param {string} title
+ * @param {string} description
+ * @param {Array} triggers - [{Event: "描述"}, {TurnReminder: 30}, {StoryTime: "第2年6月"}, "Manual"]
+ */
+export async function createTask(campaignId, title, description, triggers) {
+  if (isTauri()) {
+    return await invoke('create_task', { campaign_id: campaignId, title, description, triggers })
+  }
+  return 'mock-task-id'
+}
+
+/** 标记任务完成 */
+export async function completeTask(taskId) {
+  if (isTauri()) {
+    return await invoke('complete_task', { task_id: taskId })
+  }
+}
+
+/** 放弃任务 */
+export async function abandonTask(taskId) {
+  if (isTauri()) {
+    return await invoke('abandon_task', { task_id: taskId })
+  }
+}
+
+/** 列本轮剧情摘要（按 turn 升序） */
+export async function listRoundSummaries(campaignId) {
+  if (isTauri()) {
+    return await invoke('list_round_summaries', { campaign_id: campaignId })
+  }
+  return []
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {

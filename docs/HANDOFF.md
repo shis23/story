@@ -1,18 +1,18 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-15（P2 后处理流水线完整实现）
+> 最后更新：2026-06-15（前端 Campaign UI 实现）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线**），
 > 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
+> **前端 Campaign UI 已完成（2026-06-15）**：tauri-api.js 补全 21 个 P1/P2 API 函数 + CampaignPanel.vue 新组件（3 tab：角色卡/游玩档/档详情，含变量编辑/知识/任务/摘要面板）+ AppHeader 加 Campaign 按钮 + App.vue 集成（activeCampaign 状态 + 事件绑定），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
 > **写作链路已全通**：真实 LLM 流式调用（导演+编剧 token 实时推送）+ Plan 解析多层兜底（手写括号配平）+ 子 Agent 产出展示，
 > 新增模型列表拉取、世界书条目 CRUD、ST 风格 markdown 渲染（`*动作*`斜体）、消息列表自动滚动，
 > **Android 构建链路已打通**（APK 编译成功），模拟器启动待验证，
-> **本轮设计深化（2026-06-15）**：明确角色子 Agent 信息隔离、一卡多角色树形模型、Campaign 多会话隔离、角色知识系统、MVU 原生兼容方案、叙事计划系统（任务追踪/长程一致性）、cache 友好消息布局、变量层级体系（基础表+卡定义+实例存值），共 19 条决策（D30-D48），详见 §13，
 > **P0 数据模型层已完成（2026-06-15）**：domain 新增 5 模块（variables/campaign/character_knowledge/story_task/message_layout）+ character 树形模型 + infra-vector 标签过滤，
-> **P1 角色识别 + Campaign 闭环已完成（2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析 + 5 层兜底 + 降级路径）+ Campaign 开档后端闭环（CampaignStore 持久化 cards/campaigns/instances + AppState 启动恢复 + 14 个 Tauri 命令 + 角色/全局变量读写）。前端开档 UI 留下一轮。151 个测试全过（详见 §13.2），
-> **P2 后处理流水线已完成（2026-06-15）**：后处理 Agent（知识/变量/任务三合一，5 层兜底）+ 剧情总结 Agent（本轮摘要 200-500 字）+ 并行编排（tokio::join!，best-effort）+ CampaignStore 扩展（knowledge/tasks/round_summaries 三文件持久化 + CRUD + 级联删除）+ 流水线接入（start_writing/regenerate 后自动触发，有 campaign 才跑）+ 任务注入导演（确定性查表，零 LLM）+ WritingContext 扩展（campaign_id/turn/pending_tasks/story_clock）+ 6 个 Tauri 命令 + 4 个 PipelineEvent 新事件 + 前端事件桥接。**188 个测试全过**（详见 §13.3），
+> **P1 角色识别 + Campaign 闭环已完成（2026-06-15）**：角色识别 Agent + Campaign 开档后端闭环 + 14 个 Tauri 命令 + **前端 Campaign UI 已接入**，
+> **P2 后处理流水线已完成（2026-06-15）**：后处理 Agent + 剧情总结 Agent + 并行编排 + CampaignStore 扩展 + 流水线接入 + 任务注入导演 + 6 个 Tauri 命令 + 前端事件桥接 + **前端知识/任务/摘要面板已接入**，
 > **git 仓库已绑定**：`https://git.2529985.xyz/ss/story.git`（main 分支），
 > 剩余工作见 §7 后续计划。
 
@@ -198,17 +198,18 @@ storyforge/
 **组件列表**：
 ```
 frontend/src/
-├── App.vue                     # 主应用（对话恢复 + 流水线 + 对话操作事件处理）
-├── tauri-api.js                # Tauri IPC 桥（36 个命令全覆盖）
+├── App.vue                     # 主应用（对话恢复 + 流水线 + 对话操作事件处理 + Campaign 集成）
+├── tauri-api.js                # Tauri IPC 桥（57 个命令全覆盖，含 P1/P2 Campaign/知识/任务）
 ├── useTheme.js                 # 主题切换
 ├── mock.js                     # 演示数据
 ├── style.css                   # 全局样式（Tailwind + 主题变量）
 └── components/
-    ├── AppHeader.vue           # 顶栏（角色名/导入/列表/主题/高玩切换）
+    ├── AppHeader.vue           # 顶栏（角色名/导入/列表/Campaign/主题/高玩切换）
     ├── ChatMessage.vue         # 对话消息（编辑/采纳/删除/分支 + 重roll菜单 + 内联编辑）
     ├── Composer.vue            # 输入栏
     ├── PipelinePanel.vue       # 流水线状态面板
     ├── AgentConfigCard.vue     # Agent 配置卡片
+    ├── CampaignPanel.vue       # Campaign 管理弹层（角色卡/游玩档/档详情 3 tab）
     ├── CharacterDetail.vue     # 角色详情弹层（含世界书路由选择器）
     ├── CharacterList.vue       # 角色列表弹层
     ├── ConnectionConfig.vue    # LLM 连接配置弹层
@@ -733,7 +734,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 🔴 高 | **Android 模拟器验证** | NDK + Gradle + APK 编译已成功，模拟器启动需开 VT-x + 装 HAXM | 用户操作 BIOS + 安装 HAXM |
 | 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环 + **P2 后处理流水线已全部完成**。剩余：前端 Campaign 开档 UI + 共享 WebView 兜底（P3） | — |
 | 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。**P1 已完成字段级 stat_data 解析**（探测 extensions.mvu.initvar / stat_data / variables，合并进 CharacterDefinition.variable_schema）。剩余：重 DOM 卡 JS 分析 + WebView 兜底（P3） | 共享 WebView 依赖插件运行时 |
-| 🔴 高 | **前端 Campaign 开档 UI** | Campaign 列表/新建/切换 + 角色实例展示 + 角色变量面板。后端命令已就绪（14 个），前端待接 | — |
+| ~~🔴 高~~ | ~~**前端 Campaign 开档 UI**~~ | ✅ 已完成：CampaignPanel.vue（3 tab：角色卡/游玩档/档详情）+ tauri-api.js 21 个 P1/P2 函数 + AppHeader Campaign 按钮 + App.vue 集成 | — |
 | 🟡 中 | 归档器接入 | accept_variant 后触发 maybe_archive | 需配嵌入 API |
 | 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
 | 🟢 低 | M4 插件运行时前端 | iframe 沙箱 + window.storyforge API 桥 + 角色卡 HTML 渲染 | 工作量大 |

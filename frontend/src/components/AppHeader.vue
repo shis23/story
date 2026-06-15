@@ -5,7 +5,7 @@ defineProps({
   powerMode: { type: Boolean, default: false },
   activeCharName: { type: String, default: null },
 })
-const emit = defineEmits(['toggle-power'])
+const emit = defineEmits(['toggle-power', 'open-campaign'])
 const { theme, toggle: toggleTheme } = useTheme()
 </script>
 
@@ -25,6 +25,15 @@ const { theme, toggle: toggleTheme } = useTheme()
 
       <!-- 自定义操作按钮（导入等） -->
       <slot name="actions" />
+
+      <!-- Campaign 管理 -->
+      <button
+        @click="emit('open-campaign')"
+        class="w-8 h-8 flex items-center justify-center rounded-full text-ink-soft hover:bg-accent-soft transition-colors shrink-0"
+        title="Campaign 管理"
+      >
+        🎪
+      </button>
 
       <!-- 主题切换 -->
       <button

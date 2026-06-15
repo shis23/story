@@ -9,7 +9,8 @@ import CharacterDetail from './components/CharacterDetail.vue'
 import CharacterList from './components/CharacterList.vue'
 import LogPanel from './components/LogPanel.vue'
 import ConnectionConfig from './components/ConnectionConfig.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend } from './tauri-api.js'
+import CampaignPanel from './components/CampaignPanel.vue'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -22,6 +23,8 @@ const activeCharDetail = ref(null)
 const importError = ref('')
 const showCharDetail = ref(false)
 const showCharList = ref(false)
+const showCampaignPanel = ref(false)
+const activeCampaign = ref(null)
 
 // 流水线状态
 const pipeline = reactive({
@@ -60,6 +63,7 @@ onMounted(async () => {
   try { appVersion.value = await getVersion() } catch {}
   await refreshActiveConnection()
   await loadRecentConversation()
+  try { activeCampaign.value = await getActiveCampaign() } catch {}
   setupConsoleForwarding()
 })
 
@@ -503,6 +507,7 @@ function handlePipelineEvent(event) {
       :power-mode="powerMode"
       :active-char-name="activeChar?.name"
       @toggle-power="powerMode = !powerMode"
+      @open-campaign="showCampaignPanel = true"
     >
       <template #actions>
         <button
@@ -638,6 +643,13 @@ function handlePipelineEvent(event) {
       v-if="showConnConfig"
       @close="showConnConfig = false"
       @changed="refreshActiveConnection"
+    />
+
+    <!-- Campaign 管理弹层 -->
+    <CampaignPanel
+      v-if="showCampaignPanel"
+      @close="showCampaignPanel = false"
+      @campaign-changed="(c) => activeCampaign = c"
     />
   </div>
 </template>
