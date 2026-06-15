@@ -29,3 +29,7 @@ _test_out.txt
 _dbg.txt
 _mvu_inspect.png
 _analyze_mvu.cjs
+.card_arg
+test-card.png
+test-card-seraphina.png
+*.png.bak
