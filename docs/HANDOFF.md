@@ -739,6 +739,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | ~~🔴 高~~ | ~~**预设持久化+查看**~~ | ✅ 已完成：list_presets/get_preset/delete_preset 命令 + PresetPanel.vue（提示词/正则双 tab 查看）+ 📑 按钮入口 | — |
 | ~~🟡 中~~ | ~~归档器接入~~ | ✅ 已完成：accept_variant 后自动 spawn 后台任务触发 maybe_archive（阈值 50 条，未配嵌入 API 静默跳过） | — |
 | 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
+| ~~🟡 中~~ | ~~ST 占位符替换~~ | ✅ 已完成：`replace_template_vars()` 支持 `{{char}}` `{{user}}` `{{charIfNotUser}}`，待接入流水线 | — |
 | 🟢 低 | M4 插件运行时前端 | iframe 沙箱 + window.storyforge API 桥 + 角色卡 HTML 渲染 | 工作量大 |
 | 🟢 低 | app-meta 插件生成 / ST 预设导入分析 | 设计 §9.2/§9.4 的 meta_generate_plugin_from_st 等 | 工作量大 |
 | 🟢 低 | infra-secrets + Keystore | API key 改走安全存储 | Android 环境 |
