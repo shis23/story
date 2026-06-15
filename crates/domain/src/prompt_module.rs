@@ -173,6 +173,20 @@ pub fn assemble_system_prompt(
     parts.join("\n\n---\n\n")
 }
 
+/// ST 风格占位符替换（设计 §7.5 prompt-template 功能）
+///
+/// 支持的占位符：
+/// - `{{char}}` → 角色名
+/// - `{{user}}` → 用户名（默认 "玩家"）
+/// - `{{charIfNotUser}}` → 如果不是用户则显示角色名（简化为 char）
+///
+/// 在组装 system prompt 后、发送给 LLM 前调用。
+pub fn replace_template_vars(text: &str, char_name: &str, user_name: &str) -> String {
+    text.replace("{{char}}", char_name)
+        .replace("{{user}}", user_name)
+        .replace("{{charIfNotUser}}", char_name)
+}
+
 // ─── 预置模块（M1 内置 5 个核心模块）──────────────────────────────────────
 
 /// 预置模块工厂（对应设计 §3.6.5：内置 5-8 个核心模块覆盖 80% 场景）
@@ -376,6 +390,20 @@ pub mod builtins {
             assert!(assembled.contains("杀八股"));         // 模块 content 中含"杀八股"
             assert!(assembled.contains("目标字数"));       // 字数控制模块的 content
             assert!(assembled.contains("工具说明"));
+        }
+
+        #[test]
+        fn test_replace_template_vars() {
+            let text = "你是 {{char}}，正在和 {{user}} 对话。{{charIfNotUser}} 会回应。";
+            let result = replace_template_vars(text, "Seraphina", "玩家");
+            assert_eq!(result, "你是 Seraphina，正在和 玩家 对话。Seraphina 会回应。");
+        }
+
+        #[test]
+        fn test_replace_template_vars_no_placeholders() {
+            let text = "没有占位符的普通文本";
+            let result = replace_template_vars(text, "Seraphina", "玩家");
+            assert_eq!(result, "没有占位符的普通文本");
         }
     }
 }
