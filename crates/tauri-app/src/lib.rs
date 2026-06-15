@@ -864,6 +864,55 @@ fn set_plugin_enabled(id: String, enabled: bool, state: tauri::State<'_, Arc<App
     state.plugin_registry.set_enabled(&id, enabled).map_err(|e| format!("{e}"))
 }
 
+// ─── M4 插件 API 命令（带权限二次校验）──────────────────────────────────────
+
+#[tauri::command]
+fn plugin_list_characters(plugin_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<CharacterSummary>, String> {
+    use storyforge_infra_plugin_host::Permission;
+    state.plugin_registry.ensure_permission(&plugin_id, &Permission::ReadCharacters).map_err(|e| format!("{e}"))?;
+    Ok(get_store().list().into_iter().map(|stored| CharacterSummary {
+        id: stored.id,
+        name: stored.info.name,
+        description: stored.info.description,
+        tags: stored.info.tags,
+        creator: stored.info.creator,
+        spec_version: stored.info.spec_version,
+        world_info_count: stored.info.world_info_count,
+        has_renderable_assets: stored.info.has_renderable_assets,
+        imported_at: stored.imported_at,
+    }).collect())
+}
+
+#[tauri::command]
+fn plugin_read_character(plugin_id: String, character_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<CharacterInfo, String> {
+    use storyforge_infra_plugin_host::Permission;
+    state.plugin_registry.ensure_permission(&plugin_id, &Permission::ReadCharacters).map_err(|e| format!("{e}"))?;
+    get_store().get(&character_id).map(|s| s.info).ok_or_else(|| format!("角色卡不存在: {character_id}"))
+}
+
+#[tauri::command]
+fn plugin_get_variable(plugin_id: String, campaign_id: String, instance_id: String, key: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+    use storyforge_infra_plugin_host::Permission;
+    state.plugin_registry.ensure_permission(&plugin_id, &Permission::WriteVariables).map_err(|e| format!("{e}"))?;
+    let store = get_campaign_store();
+    store.get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .map(|i| i.variables)
+        .ok_or_else(|| format!("找不到实例 {instance_id}"))
+}
+
+#[tauri::command]
+fn plugin_set_variable(plugin_id: String, campaign_id: String, instance_id: String, key: String, value: serde_json::Value, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    use storyforge_infra_plugin_host::Permission;
+    state.plugin_registry.ensure_permission(&plugin_id, &Permission::WriteVariables).map_err(|e| format!("{e}"))?;
+    let store = get_campaign_store();
+    let mut inst = store
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+        .ok_or_else(|| format!("找不到实例 {instance_id}"))?;
+    inst.set_variable(&key, value, 0);
+    store.update_instance(inst);
+    Ok(())
+}
+
 #[tauri::command]
 fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -2765,6 +2814,10 @@ pub fn run() {
             install_plugin,
             uninstall_plugin,
             set_plugin_enabled,
+            plugin_list_characters,
+            plugin_read_character,
+            plugin_get_variable,
+            plugin_set_variable,
             get_version,
             // LLM 连接管理命令
             list_connection_templates,
