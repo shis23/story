@@ -27,6 +27,11 @@
 | **变量的注入提示词模板** | `crates/domain/src/variables.rs` | `render_variables_for_injection()`（见 §7.5） |
 | **任务（伏笔/计划）的数据结构** | `crates/domain/src/story_task.rs` | `StoryTask` + `TaskTrigger`（见 §9） |
 | **任务注入导演提示词的位置** | `crates/app-pipeline/src/lib.rs` | `build_director_user_msg()` 末尾追加（见 §9.4） |
+| **剧情总结 Agent 的系统提示词 / config / 用户消息** | `crates/app-agent/src/prompts/summarizer.rs` + `crates/app-agent/src/summarizer.rs` | `SUMMARIZER_SYSTEM_PROMPT` / `make_summarizer_config()` / `run_summarizer()`（见 §6.3） |
+| **后处理 Agent 的系统提示词 / config / 用户消息 / 输出解析** | `crates/app-agent/src/prompts/postprocess.rs` + `crates/app-agent/src/postprocess.rs` | `POSTPROCESS_SYSTEM_PROMPT` / `make_postprocess_config()` / `run_postprocess()` / `parse_postprocess_from_response()`（5 层兜底，见 §6.4） |
+| **后处理并行编排（总结 + 后处理并发）** | `crates/app-agent/src/pipeline_postprocess.rs` | `run_postprocess_pipeline()` → tokio::join!（见 §6.4） |
+| **后处理结果持久化（知识/变量/任务/摘要落盘）** | `crates/tauri-app/src/lib.rs` | `persist_postprocess_outcome()` + `fill_campaign_context()` |
+| **task/knowledge/summary 的 Tauri 命令** | `crates/tauri-app/src/lib.rs` | `list_character_knowledge` / `list_tasks` / `create_task` / `complete_task` / `abandon_task` / `list_round_summaries`（见 §9.5） |
 | **cache 友好消息布局（三段分离）** | `crates/domain/src/message_layout.rs` | `MessageLayout` + builder（见 §10） |
 
 ---
@@ -307,22 +312,46 @@ let sys = assemble_system_prompt(
 
 ### 6.3 剧情总结 Agent（编剧后并行，独立）
 
-- **crate**：`app-memory`（已有 archiver/recall，总结逻辑放这）
-- **system prompt 常量**：`SUMMARIZER_SYSTEM_PROMPT`
-- **输入**：本轮成文 + 最近窗口溢出的原文
-- **输出**：`ArchivedSummary`（≤500TK 高密度总结，复用现有结构）
-- **接口位置约定**：`crates/app-memory/src/prompts/summarizer.rs`
+> ✅ **P2 已实现（2026-06-15）**
 
-### 6.4 后处理 Agent（编剧后并行，变量+知识合一）
+- **crate**：`app-agent`（与后处理 Agent 同 crate，便于共享 runtime）
+- **system prompt 常量**：`crates/app-agent/src/prompts/summarizer.rs::SUMMARIZER_SYSTEM_PROMPT`（本轮剧情总结助手，含内容优先级 6 项 + 200-500 字硬约束）
+- **config 构造**：同文件 `make_summarizer_config()`（`AgentRole::Summarizer`，无工具）
+- **用户消息拼装**：同文件 `build_summarizer_user_msg(final_text, scene_brief, turn)`
+- **编排入口**：`crates/app-agent/src/summarizer.rs::run_summarizer(runtime, final_text, scene_brief, turn, cancel)`（调 run_tool_loop，纯文本输出）
+- **工具**：无（纯文本输出，ToolRegistry::new()）
+- **输出**：`String`（本轮摘要正文，200-500 字）
+- **持久化**：`tauri-app/campaign_store::CampaignStore::add_summary()` → `data/round_summaries.json`（每轮一条，同 campaign_id + turn 覆盖）
+- **Mock 测试**：`infra-llm/src/mock_client.rs` match_keyword="本轮剧情总结"
 
-- **crate**：新建 `app-postprocess`（或放 `app-pipeline`）
-- **system prompt 常量**：`POSTPROCESS_SYSTEM_PROMPT`
-- **输入**：本轮成文 + 在场角色列表（来自导演 Plan）+ MVU schema（如卡有 MVU）
-- **输出**（一次调用双产出）：
-  - `Vec<CharacterKnowledgeUpdate>`（各角色获知的信息，带 source 分类）
-  - `MvuVariableUpdate`（stat_data 的 `_.set` 指令解析结果）
-- **输出解析**：从成文里抽 `<knowledge>` / `<mvu_set>` 标签块（参考 MVU parseMessages 思路）
-- **接口位置约定**：`crates/app-postprocess/src/prompts.rs`
+**关键设计**：本轮摘要（200-500 字，每轮一条）**≠ archiver 批量归档**（窗口溢出时把多条原文压成远记忆）。两者职责不重叠：summarizer 是「事件级原子单位」，archiver 是「长期压缩」。
+
+**怎么改**：改 prompt → 编辑 `SUMMARIZER_SYSTEM_PROMPT` 常量。
+
+### 6.4 后处理 Agent（编剧后并行，知识+变量+任务三合一）
+
+> ✅ **P2 已实现（2026-06-15）**
+
+- **crate**：`app-agent`
+- **system prompt 常量**：`crates/app-agent/src/prompts/postprocess.rs::POSTPROCESS_SYSTEM_PROMPT`（含 JSON 输出格式示例，三大任务：角色知识/变量/任务）
+- **config 构造**：同文件 `make_postprocess_config()`（`AgentRole::PostProcessor`，max_rounds: 8）
+- **用户消息拼装**：同文件 `build_postprocess_user_msg(final_text, present_characters, variable_keys, turn, story_clock)`
+- **工具注册**：同文件 `register_postprocess_tools()`（注册 emit_postprocess 工具，handler `Ok(args)`）
+- **编排入口**：`crates/app-agent/src/postprocess.rs::run_postprocess(...)`（调 run_tool_loop）
+- **输出解析**：同文件 `parse_postprocess_from_response()` —— 5 层兜底（照搬 parse_plan_from_response 模式）：emit_postprocess 工具调用 / 整体 JSON / ```json 块 / 裸代码块 / 手写括号配平（match_braces，UTF-8 安全）。**best-effort**：失败返回空 `PostProcessResult`，不报错
+- **输出**：`PostProcessResult { knowledge_updates, variable_updates, task_updates }`
+  - `knowledge_updates: Vec<CharacterKnowledgeUpdate>`（角色知识，四元 source 分类 + pinned）
+  - `variable_updates: Vec<VariableUpdate>`（角色级 instance_id + 全局级 None）
+  - `task_updates: Vec<TaskUpdate>`（新建伏笔 task_id=None + new_task / 改已有任务状态）
+- **持久化**：`tauri-app` 的 `persist_postprocess_outcome()` 写进 `CampaignStore`：
+  - knowledge → `data/knowledge.json`（update → entry，assign campaign_id + turn）
+  - variables → `instances.json`（角色级，按 name 匹配 instance）/ `campaigns.json`（全局级，含 story_clock 推进）
+  - tasks → `data/tasks.json`（新建 / 状态变化）
+- **Mock 测试**：`infra-llm/src/mock_client.rs` match_keyword="后处理"
+
+**并行编排**（关键）：`crates/app-agent/src/pipeline_postprocess.rs::run_postprocess_pipeline()` 用 `tokio::join!` 并发跑总结 + 后处理，**任一失败不影响另一个**（best-effort）。返回 `PostProcessOutcome { summary: Option<String>, post_process: Option<PostProcessResult> }`。
+
+**怎么改**：改 prompt → 编辑 `POSTPROCESS_SYSTEM_PROMPT` 常量；改输出 schema → 同步改 `PostProcessDto` + `dto_to_result()`（postprocess.rs）。
 
 ---
 
@@ -594,24 +623,29 @@ struct TaskUpdate {
 - 陈警官得知真相（事件触发：本轮角色X提到了证据）
 ```
 
-注入规则（在 `build_director_user_msg` 里实现）：
-- 遍历该 campaign 的 Pending/Active 任务
-- 任一 trigger 满足 → 注入
+注入规则（在 `build_director_user_msg` 里实现，**P2 已接入**）：
+- 遍历该 campaign 的 Pending/Active 任务（`ctx.pending_tasks`，从 `CampaignStore::list_tasks` 加载）
+- 任一 trigger 满足（`render_tasks_for_injection` 过滤）→ 注入
 - 已 Completed/Abandoned → 跳过
 - LikelyCompleted（置信度 > 0.8）→ 提示用户确认，不自动注入（避免误判消失）
+- 零 LLM：纯确定性查表（`ctx.turn` / `ctx.story_clock` 比对 trigger）
 
 ### 9.5 任务的 Tauri 命令接口（用户手动管理）
 
-**位置约定**：`crates/tauri-app/src/lib.rs`
+> ✅ **P2 已实现（2026-06-15）**
 
-| 命令 | 作用 |
-|------|------|
-| `list_tasks(campaign_id, status_filter)` | 列任务（按状态筛） |
-| `create_task(campaign_id, task)` | 用户手动建任务 |
-| `update_task(task_id, change)` | 改任务（标题/触发/描述） |
-| `complete_task(task_id)` | 手动标记完成（覆盖 Agent 判断） |
-| `abandon_task(task_id)` | 放弃任务 |
-| `confirm_likely_completed(task_id, accept)` | 确认/驳回 LikelyCompleted 提示 |
+**位置**：`crates/tauri-app/src/lib.rs`
+
+| 命令 | 作用 | 实现状态 |
+|------|------|---------|
+| `list_character_knowledge(campaign_id, character_id?)` | 列角色可见信息（character_knowledge，P2 新增） | ✅ |
+| `list_tasks(campaign_id, status_filter?)` | 列任务（按状态筛：pending/active/likely_completed/completed/abandoned） | ✅ |
+| `create_task(campaign_id, title, description, triggers, created_turn?)` | 用户手动建任务 | ✅ |
+| `complete_task(task_id)` | 手动标记完成（覆盖 Agent 判断） | ✅ |
+| `abandon_task(task_id)` | 放弃任务 | ✅ |
+| `list_round_summaries(campaign_id)` | 列本轮剧情摘要（按 turn 升序，P2 新增） | ✅ |
+| `update_task(task_id, change)` | 改任务（标题/触发/描述） | ⏳ 未做（用 create + abandon 替代） |
+| `confirm_likely_completed(task_id, accept)` | 确认/驳回 LikelyCompleted 提示 | ⏳ 未做（用 complete_task 替代） |
 
 ---
 

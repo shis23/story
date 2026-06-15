@@ -787,6 +787,30 @@ impl WritingEvent {
                 "draft_ready".into(),
                 serde_json::json!({ "text": text }),
             ),
+            PipelineEvent::PostProcessStarted => (
+                "postprocess_started".into(),
+                serde_json::json!({}),
+            ),
+            PipelineEvent::PostProcessDone {
+                knowledge_count,
+                variable_count,
+                task_count,
+            } => (
+                "postprocess_done".into(),
+                serde_json::json!({
+                    "knowledge_count": knowledge_count,
+                    "variable_count": variable_count,
+                    "task_count": task_count,
+                }),
+            ),
+            PipelineEvent::PostProcessFailed { reason } => (
+                "postprocess_failed".into(),
+                serde_json::json!({ "reason": reason }),
+            ),
+            PipelineEvent::SummaryDone { char_count } => (
+                "summary_done".into(),
+                serde_json::json!({ "char_count": char_count }),
+            ),
             PipelineEvent::Committed {
                 session_id,
                 variant_id,
@@ -838,11 +862,17 @@ async fn start_writing(
     let tool_snapshot = app.snapshot_tool_ctx();
     let conv = app.conv_store.create(character_id);
     let conversation_id = conv.id.clone();
-    let ctx = WritingContext {
+    let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
         conversation_id: conversation_id.clone(),
+        campaign_id: None,
+        turn: 0,
+        pending_tasks: vec![],
+        story_clock: String::new(),
     };
+    // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
+    fill_campaign_context(&mut ctx);
 
     // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -858,8 +888,49 @@ async fn start_writing(
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let mut pipeline = app.new_pipeline();
     let result = pipeline
-        .start_writing(intent, &ctx, event_tx, cancel_rx)
+        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
         .await;
+
+    // ─── P2 后处理流水线（best-effort，不阻断成文返回）──────────────────────
+    // 成文（DraftReady）后并行跑：剧情总结 + 后处理三合一。
+    // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
+    if result.is_ok() {
+        // 从 session.plan 取在场角色 + 基础变量键
+        let (final_text, present_chars, var_keys) = match &result {
+            Ok((text, _, _)) => {
+                let chars: Vec<String> = pipeline
+                    .session()
+                    .and_then(|s| s.plan.as_ref())
+                    .map(|p| {
+                        p.subagent_tasks
+                            .iter()
+                            .map(|t| t.character_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (text.clone(), chars, default_variable_keys())
+            }
+            _ => unreachable!(),
+        };
+        // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
+        let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
+        let outcome = pipeline
+            .run_postprocess(
+                &final_text,
+                "", // scene_brief：传空，summarizer/postprocess 从 final_text 自取
+                &present_chars,
+                &var_keys,
+                &ctx,
+                &event_tx,
+                pp_cancel_rx,
+            )
+            .await;
+        // 落盘到 CampaignStore（有 outcome 才落盘）
+        if let Some(outcome) = outcome {
+            persist_postprocess_outcome(&ctx, &outcome, &present_chars);
+        }
+        let _ = pp_cancel_tx; // 保活（其实不需要，写作已完，这里只是避免 unused）
+    }
 
     // 清理 cancel sender
     {
@@ -875,6 +946,128 @@ async fn start_writing(
         })),
         Err(e) => Err(format!("写作失败: {e}")),
     }
+}
+
+/// 从活跃 Campaign 填充 WritingContext 的 P2 字段（campaign_id / turn / pending_tasks / story_clock）
+///
+/// 无活跃 Campaign 时不动 ctx（campaign_id 保持 None → 后处理跳过）。
+fn fill_campaign_context(ctx: &mut WritingContext) {
+    let data_dir = get_app_data_dir();
+    let active_id = match load_active_campaign(&data_dir) {
+        Some(id) => id,
+        None => return,
+    };
+    let store = get_campaign_store();
+
+    let camp = match store.get_campaign(&active_id) {
+        Some(c) => c,
+        None => return,
+    };
+    ctx.campaign_id = Some(active_id.clone());
+    ctx.story_clock = camp.story_clock.clone();
+    // turn = 已有 round_summaries 数 + 1（下一轮）
+    let existing_turns = store.list_summaries(&active_id).len() as u32;
+    ctx.turn = existing_turns + 1;
+    // pending_tasks：该 Campaign 下所有任务（build_director_user_msg 内部按触发条件过滤）
+    ctx.pending_tasks = store.list_tasks(&active_id);
+}
+
+/// 默认变量键列表（喂给后处理 Agent，让它知道有哪些字段可更新）
+fn default_variable_keys() -> Vec<String> {
+    storyforge_domain::variables::default_character_variables()
+        .iter()
+        .map(|f| f.key.clone())
+        .collect()
+}
+
+/// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
+fn persist_postprocess_outcome(
+    ctx: &WritingContext,
+    outcome: &storyforge_app_agent::PostProcessOutcome,
+    present_chars: &[String],
+) {
+    let camp_id = match &ctx.campaign_id {
+        Some(id) => id,
+        None => return,
+    };
+    let store = get_campaign_store();
+
+    // 本轮摘要
+    if let Some(summary) = &outcome.summary {
+        store.add_summary(storyforge_domain::agent::RoundSummary::new(
+            camp_id.clone(),
+            ctx.conversation_id.clone(),
+            ctx.turn,
+            summary.clone(),
+        ));
+    }
+
+    // 后处理三合一
+    if let Some(pp) = &outcome.post_process {
+        // 知识：update → entry（assign campaign_id + turn）
+        let knowledge_entries: Vec<_> = pp
+            .knowledge_updates
+            .iter()
+            .map(|u| u.clone().into_entry(camp_id.clone(), ctx.turn))
+            .collect();
+        if !knowledge_entries.is_empty() {
+            store.add_knowledge(knowledge_entries);
+        }
+
+        // 变量更新：角色级（按 name 匹配 instance）/ 全局级（无 instance_id）
+        for vu in &pp.variable_updates {
+            if let Some(inst_id) = &vu.instance_id {
+                // instance_id 可能是角色名（后处理 Agent 按名字输出），尝试匹配 campaign 内 instance
+                if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
+                    let mut inst = inst;
+                    inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
+                    store.update_instance(inst);
+                }
+            } else {
+                // 全局 Campaign 变量
+                if let Some(mut camp) = store.get_campaign(camp_id) {
+                    camp.set_variable(&vu.key, vu.value.clone(), ctx.turn);
+                    store.update_campaign(camp);
+                }
+            }
+        }
+
+        // 任务更新：新建 / 状态变化
+        for tu in &pp.task_updates {
+            if let Some(tid) = &tu.task_id {
+                if let Some(mut task) = store.get_task(tid) {
+                    task.status = tu.new_status.clone();
+                    store.update_task(task);
+                }
+            } else if let Some(spec) = &tu.new_task {
+                // present_chars 里的角色名转 Id（这里简化：后处理 Agent 给的角色 id 直接用）
+                let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
+                    camp_id.clone(),
+                    spec.title.clone(),
+                    spec.description.clone(),
+                    spec.triggers.clone(),
+                    ctx.turn,
+                );
+                store.add_task(new_task);
+            }
+        }
+    }
+    let _ = present_chars; // 目前用于知识更新的字符匹配已通过 instance_id 路径处理
+}
+
+/// 按名字或 Id 查 campaign 内的 CharacterInstance（后处理 Agent 输出的是角色名，需翻译成 instance）
+fn find_instance_by_name_or_id(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    name_or_id: &Id,
+) -> Option<storyforge_domain::campaign::CharacterInstance> {
+    let instances = store.list_instances(camp_id);
+    // 先精确 id 匹配
+    if let Some(i) = instances.iter().find(|i| i.id == *name_or_id) {
+        return Some(i.clone());
+    }
+    // 再按 instance.name 匹配（后处理 Agent 给的是角色名）
+    instances.into_iter().find(|i| i.name.as_str() == name_or_id.as_str())
 }
 
 /// Tauri command: 取消当前运行的写作流水线
@@ -970,11 +1163,16 @@ async fn regenerate(
 
     // tool_ctx 快照（保持与 start_writing 一致）
     let tool_snapshot = app.snapshot_tool_ctx();
-    let ctx = WritingContext {
+    let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
         conversation_id: conversation_id.clone(),
+        campaign_id: None,
+        turn: 0,
+        pending_tasks: vec![],
+        story_clock: String::new(),
     };
+    fill_campaign_context(&mut ctx);
 
     // cancel channel
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -987,7 +1185,40 @@ async fn regenerate(
     }
 
     let mut pipeline = app.new_pipeline();
-    let result = pipeline.regenerate(pipeline_req, &ctx, event_tx, cancel_rx).await;
+    let result = pipeline.regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx).await;
+
+    // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
+    if let Ok((text, _)) = &result {
+        let (final_text, present_chars, var_keys) = (
+            text.clone(),
+            pipeline
+                .session()
+                .and_then(|s| s.plan.as_ref())
+                .map(|p| {
+                    p.subagent_tasks
+                        .iter()
+                        .map(|t| t.character_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            default_variable_keys(),
+        );
+        let (_pp_tx, pp_rx) = watch::channel(false);
+        let outcome = pipeline
+            .run_postprocess(
+                &final_text,
+                "",
+                &present_chars,
+                &var_keys,
+                &ctx,
+                &event_tx,
+                pp_rx,
+            )
+            .await;
+        if let Some(outcome) = outcome {
+            persist_postprocess_outcome(&ctx, &outcome, &present_chars);
+        }
+    }
 
     {
         let mut slot = app.current_cancel.lock().unwrap();
@@ -2053,6 +2284,202 @@ fn promote_temporary_instance(
     Ok(())
 }
 
+// ─── P2 后处理产出查询 / 任务管理命令（6 个）──────────────────────────────────
+
+/// 角色知识条目 DTO（前端展示用）
+#[derive(Debug, Clone, Serialize)]
+pub struct KnowledgeEntryDto {
+    pub id: String,
+    pub campaign_id: String,
+    pub character_id: String,
+    pub knowledge_text: String,
+    pub source: String,
+    pub source_character_id: Option<String>,
+    pub turn_number: u32,
+    pub pinned: bool,
+}
+
+impl From<&storyforge_domain::character_knowledge::CharacterKnowledgeEntry> for KnowledgeEntryDto {
+    fn from(e: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry) -> Self {
+        use storyforge_domain::character_knowledge::KnowledgeSource;
+        let source = match e.source {
+            KnowledgeSource::Witnessed => "witnessed",
+            KnowledgeSource::ToldByOther => "told_by_other",
+            KnowledgeSource::Inferred => "inferred",
+            KnowledgeSource::Backstory => "backstory",
+        };
+        Self {
+            id: e.id.to_string(),
+            campaign_id: e.campaign_id.to_string(),
+            character_id: e.character_id.to_string(),
+            knowledge_text: e.knowledge_text.clone(),
+            source: source.into(),
+            source_character_id: e.source_character_id.as_ref().map(|i| i.to_string()),
+            turn_number: e.turn_number,
+            pinned: e.pinned,
+        }
+    }
+}
+
+/// 列出某 campaign 下某角色的可见信息（character_knowledge）
+///
+/// 不传 character_id 则返回整个 campaign 所有角色的知识。
+#[tauri::command]
+fn list_character_knowledge(
+    campaign_id: String,
+    character_id: Option<String>,
+) -> Vec<KnowledgeEntryDto> {
+    let store = get_campaign_store();
+    let camp = Id::from_str(&campaign_id);
+    let entries = if let Some(cid) = character_id {
+        store.list_knowledge_of(&camp, &Id::from_str(&cid))
+    } else {
+        store.list_knowledge(&camp)
+    };
+    entries.iter().map(KnowledgeEntryDto::from).collect()
+}
+
+/// 任务 DTO（前端展示用）
+#[derive(Debug, Clone, Serialize)]
+pub struct StoryTaskDto {
+    pub id: String,
+    pub campaign_id: String,
+    pub title: String,
+    pub description: String,
+    pub triggers: Vec<storyforge_domain::story_task::TaskTrigger>,
+    pub status: storyforge_domain::story_task::TaskStatus,
+    pub created_turn: u32,
+    pub related_characters: Vec<String>,
+    pub source: String,
+    pub injected_turns: Vec<u32>,
+}
+
+impl From<&storyforge_domain::story_task::StoryTask> for StoryTaskDto {
+    fn from(t: &storyforge_domain::story_task::StoryTask) -> Self {
+        use storyforge_domain::story_task::TaskSource;
+        let source = match t.source {
+            TaskSource::UserPlanned => "user_planned",
+            TaskSource::ExtractedFromNarrative => "from_narrative",
+        };
+        Self {
+            id: t.id.to_string(),
+            campaign_id: t.campaign_id.to_string(),
+            title: t.title.clone(),
+            description: t.description.clone(),
+            triggers: t.triggers.clone(),
+            status: t.status.clone(),
+            created_turn: t.created_turn,
+            related_characters: t.related_characters.iter().map(|i| i.to_string()).collect(),
+            source: source.into(),
+            injected_turns: t.injected_turns.clone(),
+        }
+    }
+}
+
+/// 列出某 campaign 的所有任务（可按状态筛：pending/active/likely_completed/completed/abandoned）
+#[tauri::command]
+fn list_tasks(
+    campaign_id: String,
+    status_filter: Option<String>,
+) -> Vec<StoryTaskDto> {
+    let store = get_campaign_store();
+    let camp = Id::from_str(&campaign_id);
+    let mut tasks = store.list_tasks(&camp);
+    if let Some(filter) = status_filter {
+        tasks.retain(|t| {
+            let s = serde_json::to_string(&t.status).unwrap_or_default();
+            // TaskStatus 序列化为 "pending"/"active"/{"likely_completed":...}/"completed"/"abandoned"
+            s.starts_with(&format!("\"{filter}")) || s.starts_with('{') && filter == "likely_completed"
+        });
+    }
+    tasks.iter().map(StoryTaskDto::from).collect()
+}
+
+/// 创建任务（前端 UI：用户手动规划伏笔/目标）
+#[tauri::command]
+fn create_task(
+    campaign_id: String,
+    title: String,
+    description: String,
+    triggers: Vec<storyforge_domain::story_task::TaskTrigger>,
+    created_turn: Option<u32>,
+) -> Result<String, String> {
+    if title.trim().is_empty() {
+        return Err("任务标题不能为空".into());
+    }
+    let store = get_campaign_store();
+    let task = storyforge_domain::story_task::StoryTask::user_planned(
+        Id::from_str(&campaign_id),
+        title,
+        description,
+        triggers,
+        created_turn.unwrap_or(0),
+    );
+    let id = task.id.to_string();
+    store.add_task(task);
+    Ok(id)
+}
+
+/// 标记任务完成（用户确认）
+#[tauri::command]
+fn complete_task(task_id: String) -> Result<(), String> {
+    let store = get_campaign_store();
+    let mut task = store
+        .get_task(&Id::from_str(&task_id))
+        .ok_or_else(|| format!("找不到任务 {task_id}"))?;
+    task.complete();
+    store.update_task(task);
+    Ok(())
+}
+
+/// 放弃任务
+#[tauri::command]
+fn abandon_task(task_id: String) -> Result<(), String> {
+    let store = get_campaign_store();
+    let mut task = store
+        .get_task(&Id::from_str(&task_id))
+        .ok_or_else(|| format!("找不到任务 {task_id}"))?;
+    task.abandon();
+    store.update_task(task);
+    Ok(())
+}
+
+/// 本轮摘要 DTO
+#[derive(Debug, Clone, Serialize)]
+pub struct RoundSummaryDto {
+    pub id: String,
+    pub campaign_id: String,
+    pub conversation_id: String,
+    pub turn: u32,
+    pub content: String,
+    pub created_at: String,
+}
+
+impl From<&storyforge_domain::agent::RoundSummary> for RoundSummaryDto {
+    fn from(s: &storyforge_domain::agent::RoundSummary) -> Self {
+        Self {
+            id: s.id.to_string(),
+            campaign_id: s.campaign_id.to_string(),
+            conversation_id: s.conversation_id.to_string(),
+            turn: s.turn,
+            content: s.content.clone(),
+            created_at: s.created_at.clone(),
+        }
+    }
+}
+
+/// 列出某 campaign 的所有本轮剧情摘要（按 turn 升序）
+#[tauri::command]
+fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
+    let store = get_campaign_store();
+    let camp = Id::from_str(&campaign_id);
+    store
+        .list_summaries(&camp)
+        .iter()
+        .map(RoundSummaryDto::from)
+        .collect()
+}
+
 // ─── Tauri app 入口 ────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -2124,6 +2551,13 @@ pub fn run() {
             get_campaign_variables,
             set_campaign_variable,
             promote_temporary_instance,
+            // P2 后处理产出查询 / 任务管理
+            list_character_knowledge,
+            list_tasks,
+            create_task,
+            complete_task,
+            abandon_task,
+            list_round_summaries,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");

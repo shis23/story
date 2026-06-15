@@ -1,9 +1,9 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-15（P1 角色识别 Agent + Campaign 开档闭环完成 + git 绑定到 Gitea）
+> 最后更新：2026-06-15（P2 后处理流水线完整实现）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
-> **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行），
+> **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线**），
 > 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
 > **写作链路已全通**：真实 LLM 流式调用（导演+编剧 token 实时推送）+ Plan 解析多层兜底（手写括号配平）+ 子 Agent 产出展示，
@@ -12,6 +12,7 @@
 > **本轮设计深化（2026-06-15）**：明确角色子 Agent 信息隔离、一卡多角色树形模型、Campaign 多会话隔离、角色知识系统、MVU 原生兼容方案、叙事计划系统（任务追踪/长程一致性）、cache 友好消息布局、变量层级体系（基础表+卡定义+实例存值），共 19 条决策（D30-D48），详见 §13，
 > **P0 数据模型层已完成（2026-06-15）**：domain 新增 5 模块（variables/campaign/character_knowledge/story_task/message_layout）+ character 树形模型 + infra-vector 标签过滤，
 > **P1 角色识别 + Campaign 闭环已完成（2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析 + 5 层兜底 + 降级路径）+ Campaign 开档后端闭环（CampaignStore 持久化 cards/campaigns/instances + AppState 启动恢复 + 14 个 Tauri 命令 + 角色/全局变量读写）。前端开档 UI 留下一轮。151 个测试全过（详见 §13.2），
+> **P2 后处理流水线已完成（2026-06-15）**：后处理 Agent（知识/变量/任务三合一，5 层兜底）+ 剧情总结 Agent（本轮摘要 200-500 字）+ 并行编排（tokio::join!，best-effort）+ CampaignStore 扩展（knowledge/tasks/round_summaries 三文件持久化 + CRUD + 级联删除）+ 流水线接入（start_writing/regenerate 后自动触发，有 campaign 才跑）+ 任务注入导演（确定性查表，零 LLM）+ WritingContext 扩展（campaign_id/turn/pending_tasks/story_clock）+ 6 个 Tauri 命令 + 4 个 PipelineEvent 新事件 + 前端事件桥接。**188 个测试全过**（详见 §13.3），
 > **git 仓库已绑定**：`https://git.2529985.xyz/ss/story.git`（main 分支），
 > 剩余工作见 §7 后续计划。
 
@@ -155,8 +156,15 @@ storyforge/
   - `get_character_variables` / `set_character_variable` — 角色实例变量读写（调试/纠错）
   - `get_campaign_variables` / `set_campaign_variable` — Campaign 全局变量读写（story_clock/weather/world_state）
   - `promote_temporary_instance` — 临场角色升级为常驻（翻 is_temporary flag）
+- **P2 后处理流水线 / 任务管理命令**（6 个）：
+  - `list_character_knowledge` — 列角色可见信息（character_knowledge，按 campaign_id + 可选 character_id 筛选，返回 id/text/source/source_character_id/turn/pinned）
+  - `list_tasks` — 列叙事计划任务（按 campaign_id 筛选，可选 status_filter：pending/active/likely_completed/completed/abandoned）
+  - `create_task` — 用户手动建任务（title/description/triggers/created_turn，自动分配 id）
+  - `complete_task` — 标记任务完成（覆盖 Agent 判断，手动确认）
+  - `abandon_task` — 放弃任务
+  - `list_round_summaries` — 列本轮剧情摘要（按 campaign_id 筛选，按 turn 升序，200-500 字/条）
 
-**测试**：151/151 单元测试通过（含 P1 新增：domain 49 个含 7 个 MVU 探测/降级测试 + app-agent 15 个含 8 个角色识别 5 层兜底/端到端 mock 测试 + tauri-app 15 个含 5 个 CampaignStore 持久化测试 + infra-llm 19 个含 mock 识别脚本 + 其他 crate）。修复了 app-pipeline 测试中 `cancel` sender 误 drop 导致子 Agent 取消的既有 bug。
+**测试**：188/188 单元测试通过（含 P2 新增：app-agent 31 个含 2 个并行编排 + app-pipeline 8 个含 3 个后处理接入 + tauri-app 10 个含 5 个 P2 CampaignStore 持久化 + domain 49 个 + infra-llm 19 个 + 其他 crate）。
 
 ### 2.3 前端（M0 完成）
 
@@ -723,7 +731,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 🔴 高 | **世界书 depth 生效** | 前端可看可改 depth/order 字段 + depth 控制蓝灯常驻条目在导演上下文的排序（depth 小靠后=重要，对齐 ST「近因效应」语义） | — |
 | 🔴 高 | **预设持久化+查看** | 预设导入后持久化（目前只返回字符串不存）+ 列表查看 + 详情（每条 prompt 的 role/content/identifier）。`{{char}}` `{{user}}` 占位符替换归入此线（ST prompt-template 功能） | — |
 | 🔴 高 | **Android 模拟器验证** | NDK + Gradle + APK 编译已成功，模拟器启动需开 VT-x + 装 HAXM | 用户操作 BIOS + 安装 HAXM |
-| 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环已完成，剩余 P2 后处理流水线接入 | — |
+| 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环 + **P2 后处理流水线已全部完成**。剩余：前端 Campaign 开档 UI + 共享 WebView 兜底（P3） | — |
 | 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。**P1 已完成字段级 stat_data 解析**（探测 extensions.mvu.initvar / stat_data / variables，合并进 CharacterDefinition.variable_schema）。剩余：重 DOM 卡 JS 分析 + WebView 兜底（P3） | 共享 WebView 依赖插件运行时 |
 | 🔴 高 | **前端 Campaign 开档 UI** | Campaign 列表/新建/切换 + 角色实例展示 + 角色变量面板。后端命令已就绪（14 个），前端待接 | — |
 | 🟡 中 | 归档器接入 | accept_variant 后触发 maybe_archive | 需配嵌入 API |
@@ -762,8 +770,8 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 **落地优先级**（TECHNICAL_DESIGN §16-§23 的实现顺序）：
 - ✅ **P0 数据模型层（已完成 2026-06-15）**：domain 加 Campaign/角色树/knowledge/变量表/story_task 结构 + infra-vector 加标签过滤 + MessageLayout 抽象。详见 §13.1
 - ✅ **P1 角色识别 Agent + 导入集成 + Campaign 开档闭环（已完成 2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析）+ CampaignStore 持久化 + 14 个 Tauri 命令 + 角色/全局变量读写。详见 §13.2
+- ✅ **P2 后处理流水线（已完成 2026-06-15）**：后处理 Agent（知识/变量/任务三合一，5 层兜底）+ 剧情总结 Agent（本轮摘要）+ 并行编排（tokio::join!，best-effort）+ CampaignStore 扩展（knowledge/tasks/round_summaries）+ 流水线接入（start_writing/regenerate 后自动触发）+ 任务注入导演（确定性查表，零 LLM）+ WritingContext 扩展 + 6 个 Tauri 命令 + 4 个 PipelineEvent + 前端事件桥接。详见 §13.3
 - ⏳ P1.5 前端开档 UI（Campaign 列表/新建/切换 + 角色实例展示 + 变量面板）
-- ⏳ P2 后处理流水线（总结 Agent + 后处理 Agent 三合一：知识+变量+任务，并行编排）
 - ⏳ P3 共享 WebView 计算单元（重 DOM 卡兜底，依赖插件运行时）
 
 **实测数据（缄默之秋1.4 MVU 卡）**：重 DOM 型，document.×179 / getElementById×108 / innerHTML×60 / 4 个 script 块 18 万字符。这类卡必须走共享 WebView，轻量卡走原生协议层即可。
@@ -802,6 +810,32 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 - **降级路径**：识别完全失败时建单角色 Protagonist definition（卡仍可用，不阻塞用户）。
 - **MVU 字段级解析**：保守策略，探测不到结构化字段就用基础表（hp/mp/state/...），不报错。重 DOM 卡的 JS 分析留 P3。
 - **导演工具暂不迁移**：P1 阶段导演的 get_character 继续读扁平 Character（兼容），CharacterDefinition 通过开档后的 CharacterInstance 暴露。P2 后处理接入时再迁移。
+
+### 7.9 P2 后处理流水线交付清单（2026-06-15 完成）
+
+| 模块 | 位置 | 内容 | 测试数 |
+|------|------|------|--------|
+| `prompts/postprocess.rs` | app-agent | `POSTPROCESS_SYSTEM_PROMPT` 常量（三大任务：知识/变量/任务，含 JSON 输出格式示例）+ `make_postprocess_config()`（max_rounds: 8）+ `build_postprocess_user_msg()`（拼成文+在场角色+变量键+轮次+时钟）+ `register_postprocess_tools()`（emit_postprocess 工具） | 3 |
+| `postprocess.rs` | app-agent | `run_postprocess()` 编排（调 run_tool_loop）+ `parse_postprocess_from_response()` 5 层兜底（emit_postprocess 工具 / 整体 JSON / ```json 块 / 裸代码块 / 手写括号配平 match_braces）+ DTO 转换（PostProcessDto → PostProcessResult）+ best-effort（失败返回空，不报错） | 8（含端到端 mock） |
+| `prompts/summarizer.rs` | app-agent | `SUMMARIZER_SYSTEM_PROMPT` 常量（内容优先级 6 项 + 200-500 字硬约束）+ `make_summarizer_config()` + `build_summarizer_user_msg()` | 3 |
+| `summarizer.rs` | app-agent | `run_summarizer()` 编排（调 run_tool_loop，纯文本输出，无工具） | 1 |
+| `pipeline_postprocess.rs` | app-agent | `run_postprocess_pipeline()` 并行编排（tokio::join! 并发跑总结+后处理，任一失败不影响另一个，返回 `PostProcessOutcome { summary, post_process }`）+ 模块 re-export（lib.rs） | 2（两个 succeed / cancel 测试） |
+| CampaignStore 扩展 | tauri-app/campaign_store.rs | knowledge.json / tasks.json / round_summaries.json 三文件持久化 + CRUD（list/get/add/update/delete）+ 按 campaign_id 级联删除（删 campaign 时自动清 knowledge/tasks/summaries） | 5（knowledge/task/summary CRUD + 级联删除 + 去重） |
+| WritingContext 扩展 | app-pipeline/src/lib.rs | `campaign_id: Option<Id>` + `turn: u32` + `pending_tasks: Vec<StoryTask>` + `story_clock: String` + `WritingContext::legacy()` 向后兼容构造 | — |
+| 任务注入导演 | app-pipeline/src/lib.rs | `build_director_user_msg()` 末尾追加 `render_tasks_for_injection()`（确定性查表，零 LLM，只注入 Pending/Active 且触发满足的任务） | 1（test_director_msg_includes_pending_tasks） |
+| 流水线接入 | app-pipeline/src/lib.rs | `PipelineOrchestrator::run_postprocess()` 新方法（有 campaign 才跑，推 PostProcessStarted/Done/Failed + SummaryDone 事件） | 2（无 campaign 跳过 / 有 campaign 跑通） |
+| Tauri start_writing/regenerate 接入 | tauri-app/src/lib.rs | `fill_campaign_context()`（从 CampaignStore 加载 campaign_id/turn/tasks/story_clock）+ `persist_postprocess_outcome()`（知识→knowledge.json / 变量→instances+campaigns / 任务→tasks.json / 摘要→summaries.json）+ start_writing/regenerate 成功后自动触发 | — |
+| 6 个 Tauri 命令 | tauri-app/src/lib.rs | `list_character_knowledge` / `list_tasks` / `create_task` / `complete_task` / `abandon_task` / `list_round_summaries` + DTO（KnowledgeEntryDto / StoryTaskDto / RoundSummaryDto） | — |
+| 4 个 PipelineEvent 新事件 | domain/agent.rs + tauri-app 事件桥接 | `PostProcessStarted` / `PostProcessDone { knowledge_count, variable_count, task_count }` / `PostProcessFailed { reason }` / `SummaryDone { char_count }` + WritingEvent::from_pipeline_event 匹配 | — |
+| MockLlmClient 新脚本 | infra-llm/mock_client.rs | match_keyword="后处理"（JSON 三件套）+ match_keyword="本轮剧情总结"（摘要文本） | — |
+
+**关键设计点**：
+- **总结 vs archiver 分离**：本轮摘要（200-500 字，每轮一条，存 round_summaries.json）≠ archiver 批量归档（窗口溢出时把多条摘要压成远记忆）。职责不重叠。
+- **并行不串行**：tokio::join! 并发跑总结+后处理，任一失败不影响另一个。用 join! 而非 spawn（固定两个任务，无需并发上限控制）。
+- **best-effort**：后处理失败只 warn，不阻断成文返回；无 campaign 时跳过（向后兼容）。
+- **任务注入零 LLM**：build_director_user_msg 末尾追加 render_tasks_for_injection（确定性查表，ctx.turn / ctx.story_clock 比对 trigger）。
+- **变量匹配**：后处理 Agent 输出的 instance_id 是角色名（String），persist_postprocess_outcome 通过 find_instance_by_name_or_id 翻译成 instance（先精确 id，再按 name 匹配）。
+- **解析复用模式**：postprocess 的 5 层兜底是自己写的独立 match_braces（不复用 character_extractor 的私有 fn，避免跨文件耦合），但算法相同（括号配平 + 字符串转义处理）。
 
 ---
 
@@ -846,8 +880,16 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | **app-agent P1 新增（2026-06-15）** | |
 | `crates/app-agent/src/prompts/character_extractor.rs` | 角色识别 Agent system prompt / config / 工具注册 / 用户消息拼装（D33） |
 | `crates/app-agent/src/character_extractor.rs` | 角色识别编排（extract_characters）+ 5 层兜底输出解析（parse_character_definitions_from_response）|
+| **app-agent P2 新增（2026-06-15）** | |
+| `crates/app-agent/src/prompts/postprocess.rs` | 后处理 Agent system prompt / config / 工具注册 / 用户消息拼装（D40-D41/D45） |
+| `crates/app-agent/src/postprocess.rs` | 后处理编排（run_postprocess）+ 5 层兜底输出解析（parse_postprocess_from_response） |
+| `crates/app-agent/src/prompts/summarizer.rs` | 剧情总结 Agent system prompt / config / 用户消息拼装（AGENT_INTERFACES §6.3） |
+| `crates/app-agent/src/summarizer.rs` | 总结编排（run_summarizer，纯文本输出） |
+| `crates/app-agent/src/pipeline_postprocess.rs` | 并行编排（run_postprocess_pipeline，tokio::join! best-effort） |
 | **tauri-app P1 新增（2026-06-15）** | |
 | `crates/tauri-app/src/campaign_store.rs` | CharacterCard / Campaign / CharacterInstance 持久化（cards/campaigns/instances.json）+ CRUD + 级联删除 |
+| **tauri-app P2 新增（2026-06-15）** | |
+| 同 `campaign_store.rs` | P2 扩展：knowledge.json / tasks.json / round_summaries.json 三文件持久化 + CRUD + 按 campaign 级联删除 |
 | **app-conversation（对话管理）** | |
 | `crates/app-conversation/src/lib.rs` | ConversationStore + 对话树操作 |
 | **app-pipeline（写作流水线）** | |
@@ -1016,3 +1058,4 @@ default_Seraphina.png
 | 2026-06-15 | P1 角色识别 Agent + Campaign 开档闭环（角色识别语义拆多角色 + MVU 字段级解析 + 5 层兜底 + 降级 + CampaignStore 持久化 + 14 个 Tauri 命令，151 测试全过） | 落地实施 |
 | 2026-06-15 | 修复 app-pipeline cancel sender 误 drop 导致子 Agent 取消的既有 bug | 测试回归 |
 | 2026-06-15 | git 绑定到 Gitea（`https://git.2529985.xyz/ss/story.git`，main 分支） | 用户要求 |
+| 2026-06-15 | P2 后处理流水线完整实现：后处理 Agent（知识/变量/任务三合一，5 层兜底，best-effort）+ 剧情总结 Agent（本轮摘要 200-500 字，独立于 archiver）+ 并行编排（tokio::join!，任一失败不影响另一个）+ CampaignStore 扩展（knowledge/tasks/round_summaries 三文件持久化 + CRUD + 按 campaign 级联删除）+ WritingContext 扩展（campaign_id/turn/pending_tasks/story_clock + legacy 向后兼容）+ 流水线接入（start_writing/regenerate 成功后自动触发，有 campaign 才跑，无 campaign 跳过）+ 任务注入导演（render_tasks_for_injection 确定性查表，零 LLM）+ 6 个 Tauri 命令（list_character_knowledge/list_tasks/create_task/complete_task/abandon_task/list_round_summaries）+ 4 个 PipelineEvent 新事件（PostProcessStarted/Done/Failed + SummaryDone）+ 前端事件桥接。188 测试全过（151→188，新增 37）。总结 vs archiver 分离（原子单位 vs 长期压缩）。变量匹配：后处理输出角色名，find_instance_by_name_or_id 翻译成 instance。 | 落地实施 |

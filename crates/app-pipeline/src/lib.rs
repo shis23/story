@@ -102,6 +102,33 @@ pub struct WritingContext {
     pub characters: Vec<Arc<storyforge_domain::character::Character>>,
     pub world_info: Option<Arc<storyforge_domain::world_info::WorldInfoBook>>,
     pub conversation_id: Id,
+    /// 当前 Campaign（P2 新增）。None = 无 campaign，跳过后处理流水线（向后兼容）
+    pub campaign_id: Option<Id>,
+    /// 当前轮次（P2 新增，用于后处理摘要 turn + 任务触发比对）
+    pub turn: u32,
+    /// 待注入导演的任务/伏笔（P2 新增，确定性查表，零 LLM）
+    pub pending_tasks: Vec<storyforge_domain::story_task::StoryTask>,
+    /// 故事时钟（P2 新增，用于任务 StoryTime 触发比对 + 后处理上下文）
+    pub story_clock: String,
+}
+
+impl WritingContext {
+    /// 向后兼容的构造（无 campaign，跳过后处理）
+    pub fn legacy(
+        characters: Vec<Arc<storyforge_domain::character::Character>>,
+        world_info: Option<Arc<storyforge_domain::world_info::WorldInfoBook>>,
+        conversation_id: Id,
+    ) -> Self {
+        Self {
+            characters,
+            world_info,
+            conversation_id,
+            campaign_id: None,
+            turn: 0,
+            pending_tasks: vec![],
+            story_clock: String::new(),
+        }
+    }
 }
 
 /// 流水线编排器
@@ -411,6 +438,74 @@ impl PipelineOrchestrator {
         info!(target: "app-pipeline", "流水线完成: session={session_id}");
 
         Ok((final_text, node_id, Some(provenance)))
+    }
+
+    /// 后处理流水线（P2 新增，对应 D40-D41/D45）
+    ///
+    /// 编剧成文（DraftReady）后并行跑：
+    /// - 剧情总结 Agent：产出本轮摘要
+    /// - 后处理 Agent：三合一产出角色知识 + 变量更新 + 任务更新
+    ///
+    /// **best-effort + 向后兼容**：
+    /// - `ctx.campaign_id` 为 None 时跳过（旧用法无 campaign），返回 None
+    /// - 任一 Agent 失败不影响另一个，失败只 warn 不阻断
+    /// - 推 PostProcessStarted / PostProcessDone / PostProcessFailed / SummaryDone 事件
+    ///
+    /// 返回 `Option<PostProcessOutcome>`：None 表示跳过，Some 表示跑过（产出可能为空）。
+    pub async fn run_postprocess(
+        &self,
+        final_text: &str,
+        scene_brief: &str,
+        present_characters: &[String],
+        variable_keys: &[String],
+        ctx: &WritingContext,
+        event_tx: &mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Option<storyforge_app_agent::PostProcessOutcome> {
+        let campaign_id = ctx.campaign_id.clone()?;
+
+        let _ = event_tx.send(PipelineEvent::PostProcessStarted);
+        info!(
+            target: "app-pipeline",
+            "后处理流水线启动: campaign={campaign_id} turn={}", ctx.turn
+        );
+
+        let outcome = storyforge_app_agent::run_postprocess_pipeline(
+            &self.runtime,
+            final_text,
+            scene_brief,
+            present_characters,
+            variable_keys,
+            ctx.turn,
+            &ctx.story_clock,
+            cancel,
+        )
+        .await;
+
+        // 摘要完成事件
+        if let Some(s) = &outcome.summary {
+            let _ = event_tx.send(PipelineEvent::SummaryDone {
+                char_count: s.chars().count(),
+            });
+        }
+
+        // 后处理完成/失败事件
+        match &outcome.post_process {
+            Some(r) => {
+                let _ = event_tx.send(PipelineEvent::PostProcessDone {
+                    knowledge_count: r.knowledge_updates.len(),
+                    variable_count: r.variable_updates.len(),
+                    task_count: r.task_updates.len(),
+                });
+            }
+            None => {
+                let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                    reason: "后处理 Agent 调用失败或被取消（best-effort，不阻断成文）".into(),
+                });
+            }
+        }
+
+        Some(outcome)
     }
 
     /// 整体重 roll（重新跑完整流水线）
@@ -941,6 +1036,20 @@ fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
         }
     }
 
+    // 任务/伏笔注入（P2 新增，确定性查表，零 LLM）
+    // 只注入 Pending/Active 且触发条件满足（轮次/时钟/事件）的任务。
+    if !ctx.pending_tasks.is_empty() {
+        let task_block = storyforge_domain::story_task::render_tasks_for_injection(
+            &ctx.pending_tasks,
+            ctx.turn,
+            &ctx.story_clock,
+        );
+        if !task_block.is_empty() {
+            msg.push_str(&task_block);
+            msg.push_str("\n（请在规划本场戏时考虑以上即将触发或正在推进的任务/伏笔。）\n\n");
+        }
+    }
+
     msg.push_str("请分析意图并输出 Plan。");
     msg
 }
@@ -1310,11 +1419,11 @@ mod tests {
 
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
 
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv_store.create(None).id,
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_store.create(None).id,
+        );
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -1404,11 +1513,11 @@ mod tests {
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
 
         let conv = conv_store.create(None);
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv.id.clone(),
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv.id.clone(),
+        );
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
         let (text, node_id, _prov) = orchestrator
@@ -1438,11 +1547,11 @@ mod tests {
             hint: Some("节奏太快".into()),
             seed: None,
         };
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv_id.clone(),
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_id.clone(),
+        );
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
         let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
@@ -1479,11 +1588,11 @@ mod tests {
             hint: Some("角色 B 语气太冷".into()),
             seed: Some(42),
         };
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv_id.clone(),
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_id.clone(),
+        );
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
         let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
@@ -1514,11 +1623,11 @@ mod tests {
             hint: None,
             seed: None,
         };
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv_id.clone(),
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_id.clone(),
+        );
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
         let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
@@ -1558,11 +1667,11 @@ mod tests {
             hint: Some("语气太冷".into()),
             seed: None,
         };
-        let ctx = WritingContext {
-            characters: vec![mock_character("Seraphina")],
-            world_info: None,
-            conversation_id: conv_id.clone(),
-        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_id.clone(),
+        );
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
         let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
@@ -1577,5 +1686,145 @@ mod tests {
         assert_eq!(variants_after, variants_before + 1);
 
         let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    // ─── P2 后处理流水线接入测试 ──────────────────────────────────────────────
+
+    fn make_orchestrator() -> (PipelineOrchestrator, Arc<ConversationStore>) {
+        let llm = Arc::new(MockLlmClient::with_defaults()) as Arc<dyn LlmClient>;
+        let conv_dir = std::env::temp_dir().join(format!(
+            "sf_postproc_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let conv_store = Arc::new(ConversationStore::new(conv_dir));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+        });
+        let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
+        (orch, conv_store)
+    }
+
+    /// 无 campaign（campaign_id=None）→ run_postprocess 返回 None（向后兼容，跳过后处理）
+    #[tokio::test]
+    async fn test_postprocess_skipped_without_campaign() {
+        let (orch, conv_store) = make_orchestrator();
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        let outcome = orch
+            .run_postprocess(
+                "成文内容",
+                "场景简述",
+                &["林医生".into()],
+                &["hp".into()],
+                &ctx,
+                &event_tx,
+                cancel,
+            )
+            .await;
+        assert!(outcome.is_none(), "无 campaign 应跳过后处理");
+    }
+
+    /// 有 campaign → run_postprocess 并行跑总结 + 后处理，返回 Some(outcome)，两件产出非空
+    #[tokio::test]
+    async fn test_postprocess_runs_with_campaign() {
+        let (orch, conv_store) = make_orchestrator();
+        let mut ctx = WritingContext::legacy(
+            vec![],
+            None,
+            conv_store.create(None).id,
+        );
+        ctx.campaign_id = Some(Id::new());
+        ctx.turn = 3;
+        ctx.story_clock = "第2天".into();
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        let outcome = orch
+            .run_postprocess(
+                "林医生走进急诊室，看到陈警官带来一具尸体。",
+                "急诊室",
+                &["林医生".into(), "陈警官".into()],
+                &["hp".into(), "state".into()],
+                &ctx,
+                &event_tx,
+                cancel,
+            )
+            .await;
+
+        let outcome = outcome.expect("有 campaign 应跑后处理");
+        // mock 脚本：summary 应非空，post_process 三件套应非空
+        assert!(outcome.summary.is_some(), "mock 总结应产出非空");
+        let pp = outcome
+            .post_process
+            .as_ref()
+            .expect("mock 后处理应产出非空");
+        assert!(
+            !pp.is_empty(),
+            "mock 后处理三件套应非空，实际 知识{} 变量{} 任务{}",
+            pp.knowledge_updates.len(),
+            pp.variable_updates.len(),
+            pp.task_updates.len()
+        );
+
+        // 验证事件序列：PostProcessStarted 在前
+        let mut events = vec![];
+        while let Ok(e) = event_rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessStarted)),
+            "应有 PostProcessStarted"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessDone { .. })),
+            "应有 PostProcessDone"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::SummaryDone { .. })),
+            "应有 SummaryDone"
+        );
+    }
+
+    /// 有 campaign + 任务待注入 → build_director_user_msg 末尾含任务块
+    #[test]
+    fn test_director_msg_includes_pending_tasks() {
+        use storyforge_domain::story_task::{StoryTask, TaskTrigger};
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!(
+                "sf_task_msg_{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.turn = 10; // 故意设大，确保 TurnReminder(at_turn=1) 触发
+        ctx.pending_tasks = vec![StoryTask::user_planned(
+            Id::new(),
+            "老王复仇",
+            "三个月期限到了",
+            vec![TaskTrigger::TurnReminder { at_turn: 1 }],
+            0,
+        )];
+
+        let msg = build_director_user_msg("写一场戏", &ctx);
+        assert!(
+            msg.contains("老王复仇"),
+            "导演消息应含待注入任务: {msg}"
+        );
+        assert!(msg.contains("即将触发"), "应有任务注入块标题");
     }
 }

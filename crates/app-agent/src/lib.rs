@@ -8,7 +8,10 @@ pub mod runtime;
 pub mod tools;
 
 pub mod character_extractor;
+pub mod pipeline_postprocess;
+pub mod postprocess;
 pub mod prompts;
+pub mod summarizer;
 
 // 重新导出核心类型
 pub use runtime::{
@@ -18,6 +21,7 @@ pub use runtime::{
 };
 pub use tools::{ToolContext, ToolError, ToolRegistry};
 pub use character_extractor::{extract_characters, attach_definitions_to_card, ExtractError};
+pub use pipeline_postprocess::{run_postprocess_pipeline, PostProcessOutcome};
 pub use prompts::character_extractor::{
     build_character_extractor_user_msg, make_character_extractor_config,
     register_character_extractor_tools, CHARACTER_EXTRACTOR_SYSTEM_PROMPT,

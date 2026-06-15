@@ -1,0 +1,209 @@
+//! 后处理 Agent 提示词 / 配置 / 工具注册（对应 AGENT_INTERFACES §6.4，D40-D41/D45）
+//!
+//! 编剧成文后并行跑（与剧情总结 Agent 并行）。一次调用产出三件套：
+//! 角色知识更新 + 变量更新 + 任务更新。
+//!
+//! 改 prompt 只改本文件的常量；改输出格式同步改 `postprocess::parse_*`。
+
+use storyforge_domain::agent::AgentRole;
+
+use crate::tools::ToolRegistry;
+use crate::AgentConfig;
+
+/// 后处理 Agent 系统提示词（含 JSON 输出格式示例）
+///
+/// 输出格式里字段名必须和 domain::agent::PostProcessResult 对齐。
+pub const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是后处理助手（postprocess）。给你一轮成文，你要抽取三件事，一次输出：
+
+【任务一：角色知识更新】
+为每个在场角色判断「这轮它新获知了什么」。注意信息来源分类：
+- witnessed（亲眼所见）：角色在场时发生的事
+- told_by_other（被他人告知）：别人明确告诉它的话，需记 source_character（告知者的名字）
+- inferred（自己推断）：角色根据观察推理出的结论
+- 不要给 backstory（背景设定只在导入时建立，不在这里）
+信息用该角色第一人称视角表述（"我看到了……" / "X 告诉我……"）。只抽「新的」信息，已有的不重复。如果某角色这轮没获知新信息，就不要给它写条目。
+
+【任务二：变量更新】
+根据成文里发生的事，更新角色变量（hp/state/location/mood 等）或全局变量（story_clock/weather/world_state）。只输出真正发生了变化的字段。全局变量（无 instance_id）用于 story_clock 推进、天气变化、大势扭转等。
+
+【任务三：任务/伏笔更新】
+- 如果成文里新埋了伏笔或新出现了长期目标（如"老王说要三个月后复仇"），抽成新任务，trigger 用 event（事件描述）。
+- 如果某个已存在的任务可能已完成，输出置信度（0-1），不要直接标 completed——由系统提示用户确认。
+- 不要重复抽已有的任务。
+
+【输出格式】
+调用 emit_postprocess 工具，或直接输出 JSON（不要多余解释）：
+{
+  "knowledge_updates": [
+    {
+      "character_id": "林医生",
+      "knowledge_text": "我看到陈警官在地下室发现了那具尸体",
+      "source": "witnessed",
+      "source_character_id": null,
+      "pinned": false
+    }
+  ],
+  "variable_updates": [
+    {"instance_id": "林医生", "key": "state", "value": "受伤"},
+    {"instance_id": null, "key": "story_clock", "value": "第2天"}
+  ],
+  "task_updates": [
+    {
+      "task_id": null,
+      "new_status": "pending",
+      "new_task": {
+        "title": "老王三个月后复仇",
+        "description": "老王被陷害后发誓三个月后报复",
+        "triggers": [{"kind": "event", "description": "三个月期限到达"}],
+        "related_characters": ["老王"]
+      }
+    }
+  ]
+}
+
+字段说明：
+- character_id / instance_id / source_character_id：传角色名（不是 ID），系统会解析匹配
+- source 取值：witnessed / told_by_other / inferred（小写）
+- new_status 取值：pending / active / likely_completed / completed / abandoned（小写）
+- 如果某一项没有更新，输出空数组
+
+【重要】抽取范围严格限制在「提供的在场角色列表」内，不要给不在场的角色抽知识。"#;
+
+/// 构造后处理 Agent 的运行配置
+pub fn make_postprocess_config() -> AgentConfig {
+    AgentConfig {
+        role: AgentRole::PostProcessor,
+        system_prompt: POSTPROCESS_SYSTEM_PROMPT.to_string(),
+        max_tool_rounds: 5,
+        model: "deepseek-chat".to_string(),
+        tools: vec![],
+    }
+}
+
+/// 构造后处理 Agent 的用户消息
+///
+/// - `final_text`：本轮成文
+/// - `present_characters`：在场角色名列表（来自导演 Plan）
+/// - `variable_keys`：可更新的变量键（提示 Agent 可改哪些字段）
+/// - `turn` / `story_clock`：当前轮次和故事时钟（给 Agent 判断任务触发用）
+pub fn build_postprocess_user_msg(
+    final_text: &str,
+    present_characters: &[String],
+    variable_keys: &[String],
+    turn: u32,
+    story_clock: &str,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("【当前轮次】第 {turn} 轮（故事时间：{story_clock}）"));
+    parts.push(format!(
+        "【在场角色】{}",
+        if present_characters.is_empty() {
+            "（无）".to_string()
+        } else {
+            present_characters.join("、")
+        }
+    ));
+    if !variable_keys.is_empty() {
+        parts.push(format!("【可更新变量】{}", variable_keys.join(", ")));
+    }
+    parts.push(format!("【本轮成文】\n{final_text}"));
+    parts.push("请按指定 JSON 格式输出后处理结果。".to_string());
+    parts.join("\n\n")
+}
+
+/// 注册后处理 Agent 的工具（emit_postprocess：声明产出）
+pub fn register_postprocess_tools(registry: &mut ToolRegistry) {
+    registry.register(
+        storyforge_domain::llm::ToolSpec::function(
+            "emit_postprocess",
+            "输出后处理三合一结果（角色知识 + 变量 + 任务）。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "knowledge_updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "character_id": {"type": "string"},
+                                "knowledge_text": {"type": "string"},
+                                "source": {"type": "string", "enum": ["witnessed", "told_by_other", "inferred"]},
+                                "source_character_id": {"type": "string"},
+                                "pinned": {"type": "boolean"}
+                            },
+                            "required": ["character_id", "knowledge_text", "source"]
+                        }
+                    },
+                    "variable_updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "instance_id": {"type": "string"},
+                                "key": {"type": "string"},
+                                "value": {}
+                            },
+                            "required": ["key", "value"]
+                        }
+                    },
+                    "task_updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": {"type": "string"},
+                                "new_status": {"type": "string"},
+                                "new_task": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "triggers": {"type": "array"},
+                                        "related_characters": {"type": "array", "items": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_has_correct_role() {
+        let cfg = make_postprocess_config();
+        assert_eq!(cfg.role, AgentRole::PostProcessor);
+    }
+
+    #[test]
+    fn test_prompt_mentions_three_outputs() {
+        // Mock 脚本靠 "后处理" 关键词命中，prompt 必须含此词
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("后处理"));
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("knowledge_updates"));
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("variable_updates"));
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("task_updates"));
+    }
+
+    #[test]
+    fn test_build_user_msg_includes_essentials() {
+        let msg = build_postprocess_user_msg(
+            "林医生走进急诊室",
+            &["林医生".to_string(), "陈警官".to_string()],
+            &["hp".to_string(), "state".to_string()],
+            3,
+            "第2天",
+        );
+        assert!(msg.contains("第 3 轮"));
+        assert!(msg.contains("第2天"));
+        assert!(msg.contains("林医生、陈警官"));
+        assert!(msg.contains("hp, state"));
+        assert!(msg.contains("林医生走进急诊室"));
+    }
+}

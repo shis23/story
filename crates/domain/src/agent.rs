@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Id;
+use crate::character_knowledge::CharacterKnowledgeUpdate;
 use crate::llm::ToolSpec;
+use crate::story_task::TaskUpdate;
 use crate::world_info::WorldInfoEntry;
 
 // ─── Agent 角色 ──────────────────────────────────────────────────────────
 
-/// Agent 角色（对应设计 §3.2 的三个 Agent + Meta + 导入期 Agent）
+/// Agent 角色（对应设计 §3.2 的三个 Agent + Meta + 导入/后处理 Agent）
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentRole {
     /// 导演：解析意图、查资料、分配任务
@@ -19,6 +21,10 @@ pub enum AgentRole {
     Meta,
     /// 角色识别：导入卡时分析卡内容、拆分多角色定义（D33，AGENT_INTERFACES §6.2）
     CharacterExtractor,
+    /// 剧情总结：编剧后并行，产出本轮摘要（AGENT_INTERFACES §6.3）
+    Summarizer,
+    /// 后处理：编剧后并行，三合一产出知识/变量/任务（AGENT_INTERFACES §6.4）
+    PostProcessor,
 }
 
 impl std::fmt::Display for AgentRole {
@@ -29,6 +35,8 @@ impl std::fmt::Display for AgentRole {
             Self::Editor => write!(f, "编剧"),
             Self::Meta => write!(f, "Meta"),
             Self::CharacterExtractor => write!(f, "角色识别"),
+            Self::Summarizer => write!(f, "剧情总结"),
+            Self::PostProcessor => write!(f, "后处理"),
         }
     }
 }
@@ -210,6 +218,22 @@ pub enum PipelineEvent {
     DraftReady {
         text: String,
     },
+    /// 后处理流水线启动（总结 + 后处理并行）
+    PostProcessStarted,
+    /// 后处理完成（三件套产出计数）
+    PostProcessDone {
+        knowledge_count: usize,
+        variable_count: usize,
+        task_count: usize,
+    },
+    /// 后处理失败（best-effort，不阻断成文）
+    PostProcessFailed {
+        reason: String,
+    },
+    /// 本轮剧情总结完成
+    SummaryDone {
+        char_count: usize,
+    },
     /// 完成（已写入树）
     Committed {
         session_id: String,
@@ -239,4 +263,70 @@ pub struct WritingSession {
     pub draft: Option<Draft>,
     /// 溯源信息（用于部分重 roll）
     pub seed: u64,
+}
+
+// ─── 后处理产出（P2 新增，对应 AGENT_INTERFACES §6.4 / §9.3）──────────────
+
+/// 后处理 Agent 一次调用产出的三件套
+///
+/// 编剧成文后并行跑（与剧情总结 Agent 并行），产出角色知识更新 + 变量更新 + 任务更新。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PostProcessResult {
+    /// 角色知识更新（各角色获知的新信息，带 source 分类）
+    #[serde(default)]
+    pub knowledge_updates: Vec<CharacterKnowledgeUpdate>,
+    /// 变量更新（角色级 + 全局级，stat_data 的 _.set 解析结果）
+    #[serde(default)]
+    pub variable_updates: Vec<VariableUpdate>,
+    /// 任务更新（新建伏笔 / 触发状态变化 / 完成检测置信度）
+    #[serde(default)]
+    pub task_updates: Vec<TaskUpdate>,
+}
+
+/// 单条变量更新（角色级或全局级）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariableUpdate {
+    /// 目标角色实例 ID（None = 全局 Campaign 变量，如 story_clock）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Id>,
+    /// 变量键名（如 "hp" / "story_clock"）
+    pub key: String,
+    /// 新值
+    pub value: serde_json::Value,
+}
+
+impl PostProcessResult {
+    pub fn is_empty(&self) -> bool {
+        self.knowledge_updates.is_empty()
+            && self.variable_updates.is_empty()
+            && self.task_updates.is_empty()
+    }
+}
+
+// ─── 本轮剧情摘要（P2 新增，每轮一条原子单位）─────────────────────────────
+
+/// 一轮写作的剧情摘要（剧情总结 Agent 产出，独立于 archiver 的批量归档）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundSummary {
+    pub id: Id,
+    pub campaign_id: Id,
+    pub conversation_id: Id,
+    /// 第几轮（与对话树节点对应）
+    pub turn: u32,
+    /// 摘要正文（200-500 字高密度总结）
+    pub content: String,
+    pub created_at: String,
+}
+
+impl RoundSummary {
+    pub fn new(campaign_id: Id, conversation_id: Id, turn: u32, content: String) -> Self {
+        Self {
+            id: Id::new(),
+            campaign_id,
+            conversation_id,
+            turn,
+            content,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
 }

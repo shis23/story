@@ -144,9 +144,35 @@ impl crate::LlmClient for MockLlmClient {
     }
 }
 
-/// 默认脚本集（角色识别 / 导演 / 子 Agent / 编剧）
+/// 默认脚本集（角色识别 / 后处理 / 导演 / 子 Agent / 编剧）
 fn default_scripts() -> Vec<MockScript> {
     vec![
+        // 后处理脚本：产出三件套 JSON（插在角色识别后，避开"角色"冲突）
+        MockScript {
+            match_keyword: "后处理".into(),
+            response_content: r#"{
+  "knowledge_updates": [
+    {"character_id": "林医生", "knowledge_text": "我看到陈警官在地下室发现了那具尸体", "source": "witnessed", "pinned": false}
+  ],
+  "variable_updates": [
+    {"instance_id": "林医生", "key": "state", "value": "受伤"},
+    {"instance_id": null, "key": "story_clock", "value": "第2天"}
+  ],
+  "task_updates": [
+    {"task_id": null, "new_status": "pending", "new_task": {"title": "老王复仇", "description": "老王被陷害后发誓复仇", "triggers": [{"kind": "event", "description": "三个月期限到达"}], "related_characters": ["老王"]}}
+  ]
+}"#
+            .into(),
+            tool_calls: vec![],
+            stream: false,
+        },
+        // 剧情总结脚本：产出本轮摘要文本
+        MockScript {
+            match_keyword: "本轮剧情总结".into(),
+            response_content: "本轮中，林医生在急诊室目睹陈警官带来一具尸体。陈警官透露尸体是在医院地下室发现的，死亡时间约 48 小时前。林医生检查后发现死者颈部有奇怪的针孔，怀疑是非常规药物致死。两人决定暂不公开发现，先私下调查。这一发现加深了林医生对近期医院异常事件的可疑。".into(),
+            tool_calls: vec![],
+            stream: false,
+        },
         // 角色识别脚本：输出卡内角色定义 JSON 数组（插入最前，避开 "角色" 关键词冲突）
         MockScript {
             match_keyword: "卡内角色识别".into(),

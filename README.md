@@ -162,7 +162,7 @@ ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 
 ---
 
-## 32 个 Tauri 命令
+## 42 个 Tauri 命令
 
 <details>
 <summary>点击展开完整列表</summary>
@@ -212,6 +212,14 @@ ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 
 **Meta Agent（M5）**
 - `meta_accept_patch` — 执行 Meta Agent Patch
+
+**后处理流水线（P2）**
+- `list_character_knowledge` — 列角色可见信息（character_knowledge，按 campaign/角色筛选）
+- `list_tasks` — 列叙事计划任务（按状态筛：pending/active/completed/abandoned）
+- `create_task` — 用户手动建任务（伏笔/目标，含触发条件）
+- `complete_task` — 标记任务完成（覆盖 Agent 判断）
+- `abandon_task` — 放弃任务
+- `list_round_summaries` — 列本轮剧情摘要（按 turn 升序，200-500 字/条）
 
 </details>
 
