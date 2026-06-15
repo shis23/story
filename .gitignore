@@ -27,6 +27,8 @@ Thumbs.db
 # 临时/测试文件
 _test_out.txt
 _dbg.txt
+_all_rs.txt
+_rs.txt
 _mvu_inspect.png
 _analyze_mvu.cjs
 .card_arg
