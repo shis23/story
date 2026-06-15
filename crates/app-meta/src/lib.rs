@@ -1,12 +1,26 @@
-/// Meta Agent（对应设计 §9）
-///
-/// 配置调试助手，独立于写作流水线。
-/// 核心能力：
-/// - 诊断工具集（inspect_world_info / inspect_preset / find_conflicts）
-/// - Patch 提议/采纳系统
-/// - 插件 CRUD（list / inspect / install / edit / delete）
-/// - ST 预设导入助手
+//! Meta Agent（对应设计 §9，AGENT_INTERFACES §8.3 / §9）
+//!
+//! 配置调试助手，独立于写作流水线。核心能力：
+//! - 诊断工具集（inspect_world_info / inspect_character）
+//! - Patch 提议/采纳系统
+//! - MVU 五合一分析（[`mvu_import`]，对应设计 §19.4）
+//! - ST 预设 LLM 分类（[`mvu_import::classify_st_preset_with_llm`]）
+//! - 多轮对话框架（[`meta_conversation`]，对应设计 §9.1）
+
+pub mod meta_conversation;
+pub mod mvu_import;
+pub mod prompts;
+
 use serde::{Deserialize, Serialize};
+
+// 重新导出常用类型（向后兼容现有 tauri-app 引用）
+pub use meta_conversation::{
+    chat as meta_chat, MetaConversation, MetaMessage, MetaSession, MetaTurn, ToolResultDisplay,
+};
+pub use mvu_import::{
+    analyze_mvu_card, classify_st_preset_with_llm, score_card as score_card_complexity,
+    AgentSuggestion, PromptClassification, StPresetClassification,
+};
 
 // ─── 诊断报告 ──────────────────────────────────────────────────────────────
 

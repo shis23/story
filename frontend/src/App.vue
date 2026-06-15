@@ -13,6 +13,7 @@ import CampaignPanel from './components/CampaignPanel.vue'
 import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
+import MetaPanel from './components/MetaPanel.vue'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins } from './tauri-api.js'
 
 const powerMode = ref(false)
@@ -27,6 +28,7 @@ const importError = ref('')
 const showCharDetail = ref(false)
 const showCharList = ref(false)
 const showCampaignPanel = ref(false)
+const showMetaPanel = ref(false)
 const activeCampaign = ref(null)
 const showPresetPanel = ref(false)
 const showPluginPanel = ref(false)
@@ -524,6 +526,7 @@ function handlePipelineEvent(event) {
       :active-char-name="activeChar?.name"
       @toggle-power="powerMode = !powerMode"
       @open-campaign="showCampaignPanel = true"
+      @open-meta="showMetaPanel = true"
     >
       <template #actions>
         <button
@@ -699,6 +702,12 @@ function handlePipelineEvent(event) {
       v-if="showCampaignPanel"
       @close="showCampaignPanel = false"
       @campaign-changed="(c) => activeCampaign = c"
+    />
+
+    <!-- Meta 配置助手弹层（P3 新增） -->
+    <MetaPanel
+      v-if="showMetaPanel"
+      @close="showMetaPanel = false"
     />
 
     <!-- 预设管理弹层 -->

@@ -5,7 +5,7 @@ defineProps({
   powerMode: { type: Boolean, default: false },
   activeCharName: { type: String, default: null },
 })
-const emit = defineEmits(['toggle-power', 'open-campaign'])
+const emit = defineEmits(['toggle-power', 'open-campaign', 'open-meta'])
 const { theme, toggle: toggleTheme } = useTheme()
 </script>
 
@@ -33,6 +33,16 @@ const { theme, toggle: toggleTheme } = useTheme()
         title="Campaign 管理"
       >
         🎪
+      </button>
+
+      <!-- Meta 配置助手（仅高玩模式可见，P3 新增） -->
+      <button
+        v-if="powerMode"
+        @click="emit('open-meta')"
+        class="w-8 h-8 flex items-center justify-center rounded-full text-ink-soft hover:bg-accent-soft transition-colors shrink-0"
+        title="Meta 配置助手"
+      >
+        🔧
       </button>
 
       <!-- 主题切换 -->

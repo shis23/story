@@ -719,6 +719,83 @@ export async function listRoundSummaries(campaignId) {
   return []
 }
 
+// ─── P3 Meta Agent / MVU 五合一 / ST 预设分类 ──────────────────────────────
+
+/** 开始一个新的 Meta 对话（返回 conversation_id） */
+export async function metaStartConversation() {
+  if (isTauri()) {
+    return await invoke('meta_start_conversation')
+  }
+  return 'mock-meta-conv-1'
+}
+
+/** 跑一轮 Meta 对话 */
+export async function metaChat(conversationId, userInput) {
+  if (isTauri()) {
+    return await invoke('meta_chat', { conversationId, userInput })
+  }
+  return {
+    conversation_id: conversationId,
+    agent_message: { role: 'agent', content: '（mock）我看了下配置，没发现明显问题。' },
+    new_patch: null,
+  }
+}
+
+/** 获取 Meta 对话完整历史 */
+export async function metaGetConversation(conversationId) {
+  if (isTauri()) {
+    return await invoke('meta_get_conversation', { conversationId })
+  }
+  return null
+}
+
+/** 列所有待采纳的 Meta Patch */
+export async function metaListPendingPatches() {
+  if (isTauri()) {
+    return await invoke('meta_list_pending_patches')
+  }
+  return []
+}
+
+/** 忽略一个 Meta Patch */
+export async function metaDismissPatch(patchId) {
+  if (isTauri()) {
+    return await invoke('meta_dismiss_patch', { patchId })
+  }
+}
+
+/** 手动触发 MVU 五合一分析（D44：手动按钮） */
+export async function metaAnalyzeMvuCard(sourceCharacterId) {
+  if (isTauri()) {
+    return await invoke('meta_analyze_mvu_card', { sourceCharacterId })
+  }
+  return null
+}
+
+/** 列所有已分析的 MVU 翻译 */
+export async function metaListMvuTranslations() {
+  if (isTauri()) {
+    return await invoke('meta_list_mvu_translations')
+  }
+  return []
+}
+
+/** 查某角色卡的 MVU 翻译详情（前端渲染状态栏用） */
+export async function metaGetMvuTranslation(sourceCharacterId) {
+  if (isTauri()) {
+    return await invoke('meta_get_mvu_translation', { sourceCharacterId })
+  }
+  return null
+}
+
+/** 手动触发 ST 预设 LLM 分类 */
+export async function metaClassifyStPreset(presetId) {
+  if (isTauri()) {
+    return await invoke('meta_classify_st_preset', { presetId })
+  }
+  return null
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {

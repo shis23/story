@@ -484,7 +484,7 @@ fn build_active_variables(campaign: &Campaign, present_characters: &[&CharacterI
 
 ### 8.1 翻译产物（MvuTranslation，Meta Agent 导入时产出）
 
-**位置约定**：`crates/domain/src/mvu_translation.rs`（新增）
+**位置**：`crates/domain/src/mvu_translation.rs`（✅ 已实现 2026-06-16，含 CardComplexityReport + score_card_complexity 启发式打分）
 
 ```rust
 struct MvuTranslation {
@@ -523,15 +523,17 @@ struct FallbackFragment { description: String, js_snippet: String, reason: Strin
 
 ### 8.3 Meta Agent 导入时五合一分析
 
-**位置约定**：`crates/app-meta/src/mvu_import.rs`（新增）
+**位置**：`crates/app-meta/src/mvu_import.rs`（✅ 已实现 2026-06-16，analyze_mvu_card 编排 + parse_mvu_translation_from_response 5 层兜底 + classify_st_preset_with_llm ST 分类）
 
 一次调用产出 `MvuTranslation`（变量 schema + UI 绑定 + 规则 + 交互映射 + 兜底片段）。元素级判定能翻译/不能翻译，不强制全卡统一。置信度低的标注"建议验证"。
 
-> Meta Agent 的 system prompt 位置：`crates/app-meta/src/prompts/mvu_analyzer.rs`（新建，约定位置）
+> Meta Agent 的 system prompt 位置：`crates/app-meta/src/prompts/mvu_analyzer.rs`（✅ 已实现，MVU_ANALYZER_SYSTEM_PROMPT）
+> Meta 多轮对话框架：`crates/app-meta/src/meta_conversation.rs`（✅ 已实现，chat 编排 + 工具结果结构化）
+> Meta 诊断 prompt：`crates/app-meta/src/prompts/meta_agent.rs`（✅ 已实现，META_AGENT_SYSTEM_PROMPT）
 
 ### 8.4 兜底执行（翻译不了的 JS）
 
-**位置约定**：`crates/infra-plugin-host/src/mvu_runtime.rs`（或前端）
+**位置**：`crates/infra-plugin-host/src/mvu_runtime.rs`（⚠️ 桩状态 2026-06-16，StubMvuRuntime 全部 NotImplemented；真实 WebView 执行待下一轮）
 
 | 方案 | 适用 | 触发 |
 |------|------|------|

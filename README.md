@@ -78,11 +78,11 @@ storyforge/
 │   ├── app-pipeline/                   # 写作流水线编排（状态机）
 │   ├── app-memory/                     # 记忆系统（归档器+召回器）
 │   ├── app-meta/                       # Meta Agent（诊断+Patch）
-│   └── tauri-app/                      # Tauri 入口（32 个命令）
+│   └── tauri-app/                      # Tauri 入口（88 个命令）
 └── frontend/                           # Vue 3 前端
     └── src/
         ├── App.vue                     # 主应用
-        ├── tauri-api.js                # Tauri IPC 桥（32 个命令）
+        ├── tauri-api.js                # Tauri IPC 桥（88 个命令）
         └── components/
             ├── ChatMessage.vue         # 对话消息（编辑/采纳/删除/分支/重roll）
             ├── PipelinePanel.vue       # 流水线状态面板
@@ -162,7 +162,7 @@ ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 
 ---
 
-## 42 个 Tauri 命令
+## 88 个 Tauri 命令
 
 <details>
 <summary>点击展开完整列表</summary>
@@ -220,6 +220,17 @@ ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 - `complete_task` — 标记任务完成（覆盖 Agent 判断）
 - `abandon_task` — 放弃任务
 - `list_round_summaries` — 列本轮剧情摘要（按 turn 升序，200-500 字/条）
+
+**Meta Agent / MVU 分析（P3）**
+- `meta_start_conversation` — 开始 Meta 多轮对话（返回 conversation_id）
+- `meta_chat` — 跑一轮 Meta 对话（诊断/ST 分类，可提议 Patch）
+- `meta_get_conversation` — 取 Meta 对话完整历史
+- `meta_list_pending_patches` — 列待采纳的 Patch
+- `meta_dismiss_patch` — 忽略一个 Patch
+- `meta_analyze_mvu_card` — 手动触发 MVU 五合一分析（产出 MvuTranslation，持久化）
+- `meta_list_mvu_translations` — 列已分析的 MVU 翻译
+- `meta_get_mvu_translation` — 查某卡的 MVU 翻译详情（前端渲染状态栏用）
+- `meta_classify_st_preset` — 手动触发 ST 预设 LLM 分类（增强启发式 bridge）
 
 </details>
 

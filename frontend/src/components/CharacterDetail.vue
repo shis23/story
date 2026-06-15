@@ -1,11 +1,13 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { formatContent } from '../utils/formatContent.js'
+import MvuStatusBar from './MvuStatusBar.vue'
 import {
   updateWorldInfoRoute,
   updateWorldInfoEntry,
   addWorldInfoEntry,
   deleteWorldInfoEntry,
+  metaGetMvuTranslation,
 } from '../tauri-api.js'
 
 const props = defineProps({
@@ -29,6 +31,18 @@ const routeOptions = [
   { value: 'Both', label: '🔵🟢 两者', desc: '常驻 + 向量检索' },
   { value: 'Disabled', label: '⚫ 禁用', desc: '不使用此条目' },
 ]
+
+// MVU 状态栏（P3 新增：有 MvuTranslation 才显示）
+const mvuTranslation = ref(null) // { ui_bindings, fallback_fragments, routing, ... }
+
+onMounted(async () => {
+  // 尝试加载此卡的 MVU 翻译（用户在 Meta 面板手动分析过才有）
+  try {
+    mvuTranslation.value = await metaGetMvuTranslation(props.character.id)
+  } catch {
+    // 无翻译或非 Tauri 环境，静默跳过（状态栏不显示）
+  }
+})
 
 function toggleEntry(i) {
   expandedEntry.value = expandedEntry.value === i ? null : i
@@ -156,6 +170,14 @@ async function saveNew() {
           <h2 class="text-2xl font-bold text-ink">{{ character.name }}</h2>
           <p class="text-sm text-ink-soft mt-2 leading-relaxed">{{ character.description }}</p>
         </div>
+
+        <!-- MVU 状态栏（P3：有 MvuTranslation 才显示，原生渲染零 JS） -->
+        <MvuStatusBar
+          v-if="mvuTranslation && mvuTranslation.translation"
+          :ui-bindings="mvuTranslation.translation.ui_bindings"
+          :fallback-count="mvuTranslation.translation.fallback_fragments.length"
+          :variables="[]"
+        />
 
         <!-- 标签 -->
         <div v-if="character.tags?.length" class="flex flex-wrap gap-1.5">

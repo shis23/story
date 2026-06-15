@@ -5,6 +5,7 @@ pub mod character_knowledge;
 pub mod conversation;
 pub mod llm;
 pub mod message_layout;
+pub mod mvu_translation;
 pub mod preset;
 pub mod prompt_module;
 pub mod story_task;

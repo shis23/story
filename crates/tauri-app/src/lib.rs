@@ -137,6 +137,10 @@ pub struct AppState {
     pub module_store: Arc<module_store::ModuleStore>,
     /// Profile 存储（预设配置 + 活跃 Profile）
     pub profile_store: Arc<module_store::ProfileStore>,
+    /// Meta Agent 会话（诊断工具的数据源 + PatchStore，P3 新增）
+    pub meta_session: Arc<storyforge_app_meta::MetaSession>,
+    /// Meta 对话历史（conversation_id → MetaConversation，内存态，重启清空，P3 新增）
+    pub meta_conversations: Mutex<std::collections::HashMap<String, storyforge_app_meta::MetaConversation>>,
 }
 
 impl AppState {
@@ -240,6 +244,8 @@ impl AppState {
             plugin_registry,
             module_store,
             profile_store,
+            meta_session: Arc::new(storyforge_app_meta::MetaSession::new()),
+            meta_conversations: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -519,6 +525,8 @@ fn delete_character(
             ctx.world_info = None;
         }
     }
+    // 级联删除：该卡的 MVU 翻译（source_character_id == 角色卡 id）
+    get_campaign_store().delete_mvu(&Id::from_str(id.clone()));
     Ok(())
 }
 
@@ -2350,6 +2358,272 @@ fn meta_accept_patch(
     Ok(())
 }
 
+// ─── P3：Meta Agent 多轮对话 / MVU 五合一分析 / ST 预设 LLM 分类 ────────────
+
+/// 把当前活跃角色卡 + 世界书同步进 MetaSession（每次 meta 操作前调）
+fn sync_meta_session_from_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
+    let ctx = state.tool_ctx.read().unwrap();
+    if let Some(card) = ctx.characters.last() {
+        state.meta_session.set_character(card.clone());
+    }
+    if let Some(book) = &ctx.world_info {
+        state.meta_session.set_world_info(book.clone());
+    }
+}
+
+/// Tauri command: 开始一个新的 Meta 对话（返回 conversation_id）
+#[tauri::command]
+fn meta_start_conversation(state: tauri::State<'_, Arc<AppState>>) -> String {
+    sync_meta_session_from_tool_ctx(&state);
+    let conv = storyforge_app_meta::MetaConversation::new();
+    let id = conv.id.clone();
+    state
+        .meta_conversations
+        .lock()
+        .unwrap()
+        .insert(id.clone(), conv);
+    id
+}
+
+/// Tauri command: 跑一轮 Meta 对话（返回本轮 Agent 回复 + 新 patch）
+#[tauri::command]
+async fn meta_chat(
+    conversation_id: String,
+    user_input: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let app = state.inner().clone();
+    sync_meta_session_from_tool_ctx(&state);
+
+    // 取出对话（不存在则新建）
+    let mut conv = {
+        let mut convs = app.meta_conversations.lock().unwrap();
+        convs.remove(&conversation_id).unwrap_or_else(|| {
+            let c = storyforge_app_meta::MetaConversation::new();
+            c
+        })
+    };
+
+    // 构造 AgentRuntime（活跃 LLM 或 mock）
+    let llm = app.active_llm_or_mock();
+    let tool_ctx = app.snapshot_tool_ctx();
+    let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_ctx);
+
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let turn = storyforge_app_meta::meta_chat(
+        &runtime,
+        &mut conv,
+        app.meta_session.clone(),
+        &user_input,
+        cancel_rx,
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+
+    // 把新提议的 patch 同步进 AppState.meta_patches（前端可用 meta_accept_patch 采纳）
+    if let Some(patch) = &turn.new_patch {
+        let mut patches = app.meta_patches.write().unwrap();
+        if !patches.iter().any(|p| p.id == patch.id) {
+            patches.push(patch.clone());
+        }
+    }
+
+    // 存回对话
+    let conv_id = conv.id.clone();
+    let messages = serde_json::to_value(&conv.messages).unwrap_or(serde_json::Value::Null);
+    app.meta_conversations
+        .lock()
+        .unwrap()
+        .insert(conv_id.clone(), conv);
+
+    Ok(serde_json::json!({
+        "conversation_id": conv_id,
+        "agent_message": turn.agent_message,
+        "messages": messages,
+        "new_patch": turn.new_patch,
+    }))
+}
+
+/// Tauri command: 获取某个 Meta 对话的完整消息历史
+#[tauri::command]
+fn meta_get_conversation(
+    conversation_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<serde_json::Value> {
+    let convs = state.meta_conversations.lock().unwrap();
+    convs.get(&conversation_id).map(|conv| {
+        serde_json::to_value(conv).unwrap_or(serde_json::Value::Null)
+    })
+}
+
+/// Tauri command: 列所有待采纳的 Meta Patch
+#[tauri::command]
+fn meta_list_pending_patches(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Vec<serde_json::Value> {
+    state
+        .meta_patches
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|p| !p.applied)
+        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+        .collect()
+}
+
+/// Tauri command: 忽略一个 Meta Patch（从 pending 移除）
+#[tauri::command]
+fn meta_dismiss_patch(
+    patch_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut patches = state.meta_patches.write().unwrap();
+    patches.retain(|p| p.id != patch_id);
+    Ok(())
+}
+
+/// MVU 翻译的精简 DTO（前端列表用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MvuTranslationSummaryDto {
+    pub source_character_id: String,
+    pub character_name: String,
+    pub analyzed_at: String,
+    pub routing: String,
+    pub ui_binding_count: usize,
+    pub fallback_count: usize,
+    pub analysis_confidence: f64,
+}
+
+/// MVU 翻译的完整 DTO（前端渲染状态栏用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MvuTranslationDetailDto {
+    pub source_character_id: String,
+    pub character_name: String,
+    pub analyzed_at: String,
+    pub translation: storyforge_domain::mvu_translation::MvuTranslation,
+    pub complexity: serde_json::Value,
+}
+
+/// Tauri command: 手动触发 MVU 五合一分析（D44：手动按钮，不自动跑）
+///
+/// 流程：取角色卡 → 启发式打分 → LLM 五合一分析 → 持久化 → 返回结果
+/// 失败降级：分析失败回退到字段级 schema，不报错
+#[tauri::command]
+async fn meta_analyze_mvu_card(
+    source_character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<MvuTranslationDetailDto, String> {
+    use storyforge_app_agent::AgentRuntime;
+
+    // 取原 Character
+    let character = {
+        let ctx = state.tool_ctx.read().unwrap();
+        ctx.characters
+            .iter()
+            .find(|c| c.id.as_str() == source_character_id)
+            .map(|c| (*c).clone())
+    }
+    .ok_or_else(|| format!("找不到角色卡 {source_character_id}"))?;
+
+    // 启发式打分（纯 Rust，先跑，给 LLM 当判据）
+    let complexity = storyforge_app_meta::score_card_complexity(&character);
+    let complexity_json = serde_json::to_value(&complexity).unwrap_or(serde_json::Value::Null);
+    tracing::info!(
+        "卡「{}」MVU 启发式分类: {:?}",
+        character.name,
+        complexity.classification
+    );
+
+    // 跑 LLM 五合一分析
+    let llm = state.active_llm_or_mock();
+    let tool_ctx = state.snapshot_tool_ctx();
+    let runtime = AgentRuntime::new(llm, tool_ctx);
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+    let translation = storyforge_app_meta::analyze_mvu_card(&runtime, &character, cancel_rx)
+        .await
+        .map_err(|e| format!("MVU 分析失败: {e}"))?;
+
+    // 持久化到 CampaignStore
+    let store = get_campaign_store();
+    let stored = campaign_store::StoredMvuTranslation {
+        source_character_id: character.id.clone(),
+        character_name: character.name.clone(),
+        translation: translation.clone(),
+        analyzed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    store.save_mvu(stored);
+
+    Ok(MvuTranslationDetailDto {
+        source_character_id: character.id.as_str().to_string(),
+        character_name: character.name.clone(),
+        analyzed_at: chrono::Utc::now().to_rfc3339(),
+        translation,
+        complexity: complexity_json,
+    })
+}
+
+/// Tauri command: 列所有已分析的 MVU 翻译
+#[tauri::command]
+fn meta_list_mvu_translations() -> Vec<MvuTranslationSummaryDto> {
+    get_campaign_store()
+        .list_all_mvu()
+        .iter()
+        .map(|m| MvuTranslationSummaryDto {
+            source_character_id: m.source_character_id.as_str().to_string(),
+            character_name: m.character_name.clone(),
+            analyzed_at: m.analyzed_at.clone(),
+            routing: format!("{:?}", m.translation.routing),
+            ui_binding_count: m.translation.ui_bindings.len(),
+            fallback_count: m.translation.fallback_fragments.len(),
+            analysis_confidence: m.translation.analysis_confidence,
+        })
+        .collect()
+}
+
+/// Tauri command: 查某角色卡的 MVU 翻译详情（前端渲染状态栏用）
+#[tauri::command]
+fn meta_get_mvu_translation(
+    source_character_id: String,
+) -> Option<MvuTranslationDetailDto> {
+    let store = get_campaign_store();
+    let id = Id::from_str(source_character_id);
+    store.get_mvu(&id).map(|m| MvuTranslationDetailDto {
+        source_character_id: m.source_character_id.as_str().to_string(),
+        character_name: m.character_name.clone(),
+        analyzed_at: m.analyzed_at.clone(),
+        translation: m.translation.clone(),
+        complexity: serde_json::Value::Null,
+    })
+}
+
+/// Tauri command: 手动触发 ST 预设 LLM 分类（增强现有纯启发式 bridge）
+///
+/// 失败时返回 Err，前端降级到现有 import_preset_as_modules。
+#[tauri::command]
+async fn meta_classify_st_preset(
+    preset_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    use storyforge_app_agent::AgentRuntime;
+
+    let stored = get_preset_store()
+        .get(&preset_id)
+        .ok_or_else(|| format!("预设不存在: {preset_id}"))?;
+
+    let llm = state.active_llm_or_mock();
+    let tool_ctx = state.snapshot_tool_ctx();
+    let runtime = AgentRuntime::new(llm, tool_ctx);
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+    let classification =
+        storyforge_app_meta::classify_st_preset_with_llm(&runtime, &stored.preset, cancel_rx)
+            .await
+            .map_err(|e| format!("ST 分类失败: {e}"))?;
+
+    serde_json::to_value(&classification).map_err(|e| format!("序列化失败: {e}"))
+}
+
 // ─── P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量 ──────────────
 
 /// 角色（CharacterDefinition）的精简 DTO（前端展示用）
@@ -3053,6 +3327,16 @@ pub fn run() {
             complete_task,
             abandon_task,
             list_round_summaries,
+            // P3 Meta Agent / MVU 五合一 / ST 预设分类
+            meta_start_conversation,
+            meta_chat,
+            meta_get_conversation,
+            meta_list_pending_patches,
+            meta_dismiss_patch,
+            meta_analyze_mvu_card,
+            meta_list_mvu_translations,
+            meta_get_mvu_translation,
+            meta_classify_st_preset,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");

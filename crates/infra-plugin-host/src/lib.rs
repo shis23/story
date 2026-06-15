@@ -5,9 +5,12 @@
 /// - Permission：权限模型（声明式 + 后端二次校验）
 /// - UiSlot：UI 挂载点枚举
 /// - PluginRegistry：插件注册表（CRUD + 权限校验）
+/// - mvu_runtime：MVU 兜底执行运行时 trait（P3 新增，当前为桩）
 ///
 /// 前端侧的 iframe 沙箱宿主 + postMessage API 桥在 JS 层实现，
 /// 本 crate 定义后端的权限校验和插件管理逻辑。
+pub mod mvu_runtime;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;

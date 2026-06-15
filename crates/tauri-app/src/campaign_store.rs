@@ -1,12 +1,13 @@
 //! Campaign / CharacterCard / CharacterInstance 持久化
 //!
-//! 分六个文件（对应 P1/P2 设计决策）：
+//! 分七个文件（对应 P1/P2/P3 设计决策）：
 //! - data/cards.json            —— CharacterCard（含 character_definitions）
 //! - data/campaigns.json        —— Campaign
 //! - data/instances.json        —— CharacterInstance（按 campaign_id 索引）
 //! - data/knowledge.json        —— CharacterKnowledgeEntry（角色可见信息，P2 新增）
 //! - data/tasks.json            —— StoryTask（叙事计划任务，P2 新增）
 //! - data/round_summaries.json  —— RoundSummary（本轮剧情摘要，P2 新增）
+//! - data/mvu_translations.json —— StoredMvuTranslation（MVU 五合一产物，P3 新增）
 //!
 //! 与现有 CharacterStore（扁平 Character）并存，向后兼容。
 
@@ -16,6 +17,7 @@ use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::CharacterCard;
 use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+use storyforge_domain::mvu_translation::MvuTranslation;
 use storyforge_domain::story_task::StoryTask;
 use storyforge_domain::Id;
 
@@ -27,6 +29,15 @@ pub struct StoredCard {
     pub imported_at: String,
 }
 
+/// MVU 翻译存储（带 source_character_id 索引 + 分析时间）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredMvuTranslation {
+    pub source_character_id: Id,
+    pub character_name: String,
+    pub translation: MvuTranslation,
+    pub analyzed_at: String,
+}
+
 pub struct CampaignStore {
     cards_path: PathBuf,
     campaigns_path: PathBuf,
@@ -34,6 +45,7 @@ pub struct CampaignStore {
     knowledge_path: PathBuf,
     tasks_path: PathBuf,
     summaries_path: PathBuf,
+    mvu_path: PathBuf,
 }
 
 impl CampaignStore {
@@ -45,6 +57,7 @@ impl CampaignStore {
             knowledge_path: data_dir.join("knowledge.json"),
             tasks_path: data_dir.join("tasks.json"),
             summaries_path: data_dir.join("round_summaries.json"),
+            mvu_path: data_dir.join("mvu_translations.json"),
         }
     }
 
@@ -95,6 +108,12 @@ impl CampaignStore {
     pub fn delete_card(&self, id: &Id) -> bool {
         let mut all = self.list_cards();
         let before = all.len();
+        // 先记下要删的卡的 source_character_id（用于级联删 MVU 翻译）
+        let source_ids: Vec<Id> = all
+            .iter()
+            .filter(|c| c.card.id == *id)
+            .map(|c| c.card.source_character_id.clone())
+            .collect();
         all.retain(|c| c.card.id != *id);
         let changed = all.len() != before;
         if changed {
@@ -108,6 +127,10 @@ impl CampaignStore {
                 .collect::<Vec<_>>();
             for camp_id in camps {
                 self.delete_campaign(&camp_id);
+            }
+            // 级联删除：该卡的 MVU 翻译
+            for source_id in source_ids {
+                self.delete_mvu(&source_id);
             }
         }
         changed
@@ -314,6 +337,44 @@ impl CampaignStore {
         all.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
         all.push(summary);
         persist(&self.summaries_path, &all);
+    }
+
+    // ─── MVU 翻译存储（P3 新增）──────────────────────────────────────────
+
+    /// 列所有 MVU 翻译
+    pub fn list_all_mvu(&self) -> Vec<StoredMvuTranslation> {
+        load_or_default(&self.mvu_path)
+    }
+
+    /// 查某角色卡的 MVU 翻译
+    pub fn get_mvu(&self, source_character_id: &Id) -> Option<StoredMvuTranslation> {
+        self.list_all_mvu()
+            .into_iter()
+            .find(|m| m.source_character_id == *source_character_id)
+    }
+
+    /// 保存/覆盖某角色卡的 MVU 翻译（按 source_character_id 去重）
+    pub fn save_mvu(&self, stored: StoredMvuTranslation) {
+        let mut all = self.list_all_mvu();
+        all.retain(|m| m.source_character_id != stored.source_character_id);
+        all.push(stored);
+        persist(&self.mvu_path, &all);
+    }
+
+    /// 删某角色卡的 MVU 翻译（删卡时级联）
+    pub fn delete_mvu(&self, source_character_id: &Id) -> bool {
+        let before = self.list_all_mvu();
+        let after: Vec<_> = before
+            .iter()
+            .filter(|m| m.source_character_id != *source_character_id)
+            .cloned()
+            .collect();
+        if after.len() != before.len() {
+            persist(&self.mvu_path, &after);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -629,6 +690,68 @@ mod tests {
         assert!(store.list_knowledge(&camp_id).is_empty());
         assert!(store.list_tasks(&camp_id).is_empty());
         assert!(store.list_summaries(&camp_id).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn make_mvu(source_id: &str, name: &str) -> StoredMvuTranslation {
+        StoredMvuTranslation {
+            source_character_id: Id::from_str(source_id),
+            character_name: name.into(),
+            translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(vec![]),
+            analyzed_at: "2026-06-16T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn test_mvu_save_get_list_delete() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+
+        // 空
+        assert!(store.list_all_mvu().is_empty());
+        assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
+
+        // 存
+        store.save_mvu(make_mvu("src-1", "测试卡A"));
+        store.save_mvu(make_mvu("src-2", "测试卡B"));
+        assert_eq!(store.list_all_mvu().len(), 2);
+        assert!(store.get_mvu(&Id::from_str("src-1")).is_some());
+        assert_eq!(
+            store.get_mvu(&Id::from_str("src-1")).unwrap().character_name,
+            "测试卡A"
+        );
+
+        // 覆盖（同 source_character_id 去重）
+        store.save_mvu(make_mvu("src-1", "测试卡A-改"));
+        assert_eq!(store.list_all_mvu().len(), 2);
+        assert_eq!(
+            store.get_mvu(&Id::from_str("src-1")).unwrap().character_name,
+            "测试卡A-改"
+        );
+
+        // 删
+        assert!(store.delete_mvu(&Id::from_str("src-1")));
+        assert_eq!(store.list_all_mvu().len(), 1);
+        assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
+        // 再删返回 false
+        assert!(!store.delete_mvu(&Id::from_str("src-1")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_mvu_cascade_delete_on_card_delete() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        store.save_card(make_card()); // card-1, source src-1
+        store.save_mvu(make_mvu("src-1", "测试卡"));
+
+        assert!(store.get_mvu(&Id::from_str("src-1")).is_some());
+
+        // 删卡 → MVU 级联清掉
+        assert!(store.delete_card(&Id::from_str("card-1")));
+        assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

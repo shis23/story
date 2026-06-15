@@ -1,9 +1,9 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（M4 插件系统前端实现）
+> 最后更新：2026-06-16（P3 Meta Agent + MVU 分析）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
-> **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线**），
+> **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
 > 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
 > **前端 Campaign UI 已完成（2026-06-15）**：tauri-api.js 补全 21 个 P1/P2 API 函数 + CampaignPanel.vue 新组件（3 tab：角色卡/游玩档/档详情，含变量编辑/知识/任务/摘要面板）+ AppHeader 加 Campaign 按钮 + App.vue 集成（activeCampaign 状态 + 事件绑定），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
@@ -164,7 +164,7 @@ storyforge/
   - `abandon_task` — 放弃任务
   - `list_round_summaries` — 列本轮剧情摘要（按 campaign_id 筛选，按 turn 升序，200-500 字/条）
 
-**测试**：168/168 单元测试通过（含 P2 新增：app-agent 31 个含 2 个并行编排 + app-pipeline 8 个含 3 个后处理接入 + tauri-app 10 个含 5 个 P2 CampaignStore 持久化 + domain 49 个 + infra-llm 19 个 + 其他 crate）。
+**测试**：215/215 单元测试通过（含 P3 新增：domain mvu_translation 11 个 + app-meta 24 个含 MVU 五合一/ST 分类/Meta 对话 + infra-plugin-host mvu_runtime 2 个 + tauri-app campaign_store MVU 持久化 2 个）。
 
 ### 2.3 前端（M0 完成）
 
@@ -761,8 +761,9 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 - ✅ **P0 数据模型层（已完成 2026-06-15）**：domain 加 Campaign/角色树/knowledge/变量表/story_task 结构 + infra-vector 加标签过滤 + MessageLayout 抽象。详见 §13.1
 - ✅ **P1 角色识别 Agent + 导入集成 + Campaign 开档闭环（已完成 2026-06-15）**：角色识别 Agent（语义级拆多角色 + MVU 字段级解析）+ CampaignStore 持久化 + 14 个 Tauri 命令 + 角色/全局变量读写。详见 §13.2
 - ✅ **P2 后处理流水线（已完成 2026-06-15）**：后处理 Agent（知识/变量/任务三合一，5 层兜底）+ 剧情总结 Agent（本轮摘要）+ 并行编排（tokio::join!，best-effort）+ CampaignStore 扩展（knowledge/tasks/round_summaries）+ 流水线接入（start_writing/regenerate 后自动触发）+ 任务注入导演（确定性查表，零 LLM）+ WritingContext 扩展 + 6 个 Tauri 命令 + 4 个 PipelineEvent + 前端事件桥接。详见 §13.3
-- ⏳ P1.5 前端开档 UI（Campaign 列表/新建/切换 + 角色实例展示 + 变量面板）
-- ⏳ P3 共享 WebView 计算单元（重 DOM 卡兜底，依赖插件运行时）
+- ✅ **P1.5 前端开档 UI（已完成 2026-06-15）**：CampaignPanel.vue（3 tab：角色卡/游玩档/档详情 + 4 子 tab：角色实例/知识/任务/摘要）+ 角色识别触发 + 开档表单 + 设为活跃 + 变量编辑 + 任务 CRUD（与 §7.7 一致）
+- ✅ **P3 Meta Agent + MVU 分析（已完成 2026-06-16）**：MvuTranslation 领域模型 + 卡复杂度启发式打分 + Meta Agent LLM 多轮对话框架 + MVU 五合一分析 + ST 预设 LLM 分类 + 9 个 Tauri 命令 + MvuStatusBar 原生渲染 + 共享 WebView 接口桩（待下一轮实现执行）。详见 §7.10
+- ⏳ P3 共享 WebView 真实 JS 执行（重 DOM 卡兜底，依赖真实卡端到端验证）
 
 **实测数据（缄默之秋1.4 MVU 卡）**：重 DOM 型，document.×179 / getElementById×108 / innerHTML×60 / 4 个 script 块 18 万字符。这类卡必须走共享 WebView，轻量卡走原生协议层即可。
 
@@ -1049,3 +1050,36 @@ default_Seraphina.png
 | 2026-06-15 | 修复 app-pipeline cancel sender 误 drop 导致子 Agent 取消的既有 bug | 测试回归 |
 | 2026-06-15 | git 绑定到 Gitea（`https://git.2529985.xyz/ss/story.git`，main 分支） | 用户要求 |
 | 2026-06-15 | P2 后处理流水线完整实现：后处理 Agent（知识/变量/任务三合一，5 层兜底，best-effort）+ 剧情总结 Agent（本轮摘要 200-500 字，独立于 archiver）+ 并行编排（tokio::join!，任一失败不影响另一个）+ CampaignStore 扩展（knowledge/tasks/round_summaries 三文件持久化 + CRUD + 按 campaign 级联删除）+ WritingContext 扩展（campaign_id/turn/pending_tasks/story_clock + legacy 向后兼容）+ 流水线接入（start_writing/regenerate 成功后自动触发，有 campaign 才跑，无 campaign 跳过）+ 任务注入导演（render_tasks_for_injection 确定性查表，零 LLM）+ 6 个 Tauri 命令（list_character_knowledge/list_tasks/create_task/complete_task/abandon_task/list_round_summaries）+ 4 个 PipelineEvent 新事件（PostProcessStarted/Done/Failed + SummaryDone）+ 前端事件桥接。188 测试全过（151→188，新增 37）。总结 vs archiver 分离（原子单位 vs 长期压缩）。变量匹配：后处理输出角色名，find_instance_by_name_or_id 翻译成 instance。 | 落地实施 |
+| 2026-06-16 | P3 Meta Agent + MVU 分析完成：MvuTranslation 领域模型（domain，11 测试）+ 卡复杂度启发式打分（document./innerHTML/script 阈值）+ Meta Agent LLM 多轮对话框架（meta_conversation，挂接 inspect/propose_patch）+ MVU 五合一分析（mvu_import，5 层兜底 + 降级 + 纯数据卡短路）+ ST 预设 LLM 分类（增强现有纯启发式 bridge）+ 9 个 Tauri 命令 + mvu_translations.json 持久化（CRUD + 删卡级联）+ MvuStatusBar.vue 原生渲染（bar/text/tag/icon，零 JS）+ MetaPanel.vue（聊天框 + patch 卡片 + MVU 分析详情）+ 共享 WebView 接口桩（MvuRuntime trait + StubMvuRuntime，全部 NotImplemented）。215 测试全过（188→215，新增 27）。MVU 与 Meta 设计上耦合（五合一分析是 Meta Agent 的一个工具）。共享 WebView 真实 JS 执行留下一轮（需真实重 DOM 卡端到端验证）。 | 落地实施 |
+
+---
+
+## 7.10 P3 Meta Agent + MVU 分析交付清单（2026-06-16 完成）
+
+| 模块 | 位置 | 内容 | 测试数 |
+|------|------|------|--------|
+| `mvu_translation.rs` | domain | MvuTranslation（5 字段：variable_schema/ui_bindings/update_rules/interactions/fallback_fragments + routing/confidence/notes）+ UiBinding/BindingDisplay（bar/text/tag/icon）+ InteractionMapping/InteractionAction（modify_variable/trigger_next_turn/multi/run_original_js）+ FallbackFragment + CardComplexityReport + score_card_complexity 启发式打分（document./innerHTML/script 阈值，基于缄默之秋1.4 实测倒推）+ pure_data_fallback 降级 + render_translation_for_review/render_update_rules_for_injection | 11 |
+| `prompts/mvu_analyzer.rs` | app-meta | MVU_ANALYZER_SYSTEM_PROMPT（含五合一产物表 + 元素级判定规则 + JSON 输出示例，对齐 serde tag）+ make_mvu_analyzer_config + build_mvu_analyzer_user_msg（拼卡 HTML/JS/CSS 全文 + 启发式打分 + P1 字段，truncate 防爆）+ register_mvu_tools（emit_mvu_translation） | 4 |
+| `prompts/meta_agent.rs` | app-meta | META_AGENT_SYSTEM_PROMPT（三大能力 + 安全约束）+ make_meta_agent_config + build_meta_user_msg（多轮历史拼接）+ register_meta_tools（inspect_world_info/inspect_character/propose_patch/classify_st_preset） | 4 |
+| `mvu_import.rs` | app-meta | analyze_mvu_card 编排（启发式打分 → 纯数据短路 → LLM 五合一 → 5 层兜底解析 → 失败降级）+ parse_mvu_translation_from_response（5 层：工具调用/整体JSON/json块/裸块/括号配平）+ 容错反序列化（MvuTranslationRaw 全 default + wrapper 解包 + routing 自相矛盾纠正 + confidence clamp）+ classify_st_preset_with_llm（ST 预设 LLM 分类，6 大模块组）+ parse_st_classification（4 层兜底） | 10 |
+| `meta_conversation.rs` | app-meta | MetaSession（character + world_info + PatchStore 共享状态）+ MetaConversation/MetaMessage/ToolResultDisplay（WorldInfoReport/CardReport/PatchProposed）+ chat 多轮编排（run_tool_loop + 工具结果结构化 + history_summary 截断）+ register_meta_runtime_tools（Arc<MetaSession> 捕获，挂接实际 inspect/propose） | 3 |
+| MockLlmClient 新脚本 | infra-llm | match_keyword="卡内状态栏分析"（MvuTranslation JSON）+ match_keyword="配置调试助手"（Meta 诊断） | — |
+| `mvu_runtime.rs` | infra-plugin-host | MvuRuntime trait + MvuExecResult + MvuRuntimeError + StubMvuRuntime（全部 NotImplemented，is_available=false）— **桩状态，下一轮实现 WebView 执行** | 2 |
+| CampaignStore 扩展 | tauri-app/campaign_store.rs | mvu_translations.json 持久化 + list_all_mvu/get_mvu/save_mvu/delete_mvu + 删卡级联（delete_card 同步删 source_character_id 的 MVU）+ delete_character 级联 | 2 |
+| AppState 扩展 | tauri-app/lib.rs | meta_session: Arc<MetaSession> + meta_conversations: Mutex<HashMap> + 初始化 | — |
+| 9 个 Tauri 命令 | tauri-app/lib.rs | meta_start_conversation / meta_chat（异步多轮）/ meta_get_conversation / meta_list_pending_patches / meta_dismiss_patch / meta_analyze_mvu_card（手动触发五合一）/ meta_list_mvu_translations / meta_get_mvu_translation / meta_classify_st_preset（手动触发 ST 分类）+ sync_meta_session_from_tool_ctx | — |
+| 前端 | frontend/src | MetaPanel.vue（聊天框 + patch 卡片 + MVU 分析下拉 + 详情浮层 + 诊断报告内嵌）+ MvuStatusBar.vue（bar/text/tag/icon 原生渲染，零 JS）+ tauri-api.js 9 函数 + AppHeader 🔧 按钮（高玩可见）+ App.vue 集成 + CharacterDetail 挂载状态栏 | — |
+
+**关键设计点**：
+- **MVU 与 Meta 耦合**：MVU 五合一分析是 Meta Agent 的一个工具（设计 §19.4），不是平行模块。Meta Agent = LLM 多轮对话框架（基础设施），MVU 五合一 + ST 预设分类都是它的工具。
+- **手动触发**（D44）：MVU 分析不自动跑，用户在 MetaPanel 点「分析状态栏」按钮才触发。纯数据卡（无 JS 无 extensions）短路不调 LLM。失败降级回 P1 字段级。
+- **启发式 + Meta 确认**：卡复杂度先纯 Rust 打分（document.>20 / innerHTML>10 / script>5KB → Heavy），结果喂给 LLM 做元素级二次判定。
+- **5 层兜底**：照搬 character_extractor 模式（工具调用/整体JSON/json块/裸块/手写括号配平），独立实现 match_braces（不跨文件复用）。routing 自相矛盾（标 native 却有 fallback）自动纠正为 hybrid。
+- **共享 WebView 留桩**：StubMvuRuntime 全部 NotImplemented。前端检测 fallback_fragments 非空时显示「需共享 WebView 支持」提示，不崩溃。真实 JS 执行留下一轮（需真实重 DOM 卡端到端验证）。
+- **原生渲染路径**：MvuStatusBar.vue 按 BindingDisplay 原生画（bar 进度条按百分比分级染色 >50 绿/25-50 黄/<25 红 / text / tag / icon 映射），零 JS。CharacterDetail 自动加载此卡的 MvuTranslation 挂载状态栏。
+
+**遗留（下一轮）**：
+- ⏳ 共享 WebView 真实 JS 执行（WebViewMvuRuntime 实现 MvuRuntime trait，全局单例 iframe + postMessage + Mvu.parseMessages/setData 桥）
+- ⏳ 真实重 DOM 卡（缄默之秋1.4）端到端验证 + prompt 调优
+- ⏳ update_rules 接入后处理 Agent（让 Agent 按规则调 update_variable tool）
+- ⏳ interactions 接入前端交互（用户点击按钮 → 调 modify_variable/trigger_next_turn）

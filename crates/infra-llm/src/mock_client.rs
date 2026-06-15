@@ -144,9 +144,37 @@ impl crate::LlmClient for MockLlmClient {
     }
 }
 
-/// 默认脚本集（角色识别 / 后处理 / 导演 / 子 Agent / 编剧）
+/// 默认脚本集（角色识别 / 后处理 / 导演 / 子 Agent / 编剧 / Meta / MVU）
 fn default_scripts() -> Vec<MockScript> {
     vec![
+        // MVU 五合一分析脚本：产出 MvuTranslation JSON（插最前，避开 "状态" 等宽泛词冲突）
+        MockScript {
+            match_keyword: "卡内状态栏分析".into(),
+            response_content: r#"{
+  "variable_schema": [
+    {"key": "hp", "label": "生命值", "value_type": "int", "default": 100}
+  ],
+  "ui_bindings": [
+    {"element": "hp_bar", "variable_key": "hp", "display": {"kind": "bar", "max": 100}}
+  ],
+  "update_rules": ["受伤时 hp 减少伤害值"],
+  "interactions": [],
+  "fallback_fragments": [],
+  "routing": {"kind": "native"},
+  "analysis_confidence": 0.9,
+  "notes": ["mock：纯数据绑定卡"]
+}"#
+            .into(),
+            tool_calls: vec![],
+            stream: false,
+        },
+        // Meta 配置调试脚本：匹配 "配置调试助手"，返回诊断结论
+        MockScript {
+            match_keyword: "配置调试助手".into(),
+            response_content: "我先检查一下当前配置。".into(),
+            tool_calls: vec![],
+            stream: false,
+        },
         // 后处理脚本：产出三件套 JSON（插在角色识别后，避开"角色"冲突）
         MockScript {
             match_keyword: "后处理".into(),
