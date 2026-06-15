@@ -95,11 +95,10 @@ impl ConversationStore {
         self.loaded.store(true, Ordering::Release);
     }
 
-    /// 持久化对话到磁盘
+    /// 持久化对话到磁盘（原子写：.tmp → rename）
     fn persist(&self, conv: &Conversation) -> Result<(), ConversationError> {
         let path = self.dir.join(format!("{}.json", conv.id.as_str()));
-        let json = serde_json::to_string_pretty(conv)?;
-        std::fs::write(&path, json)?;
+        storyforge_infra_util::atomic_write_json(&path, conv)?;
         Ok(())
     }
 

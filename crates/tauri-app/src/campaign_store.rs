@@ -394,28 +394,8 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
 }
 
 fn persist<T: serde::Serialize>(path: &PathBuf, data: &[T]) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::error!("创建数据目录失败: {e}");
-            return;
-        }
-    }
-    let json = match serde_json::to_string_pretty(data) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::error!("序列化失败: {e}");
-            return;
-        }
-    };
-    // 原子写入：.tmp → rename
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &json) {
-        tracing::error!("写临时文件失败 {}: {e}", tmp.display());
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::error!("rename 失败，回退直写: {e}");
-        let _ = std::fs::write(path, json);
+    if let Err(e) = storyforge_infra_util::atomic_write_json(path, data) {
+        tracing::error!("持久化失败 {}: {e}", path.display());
     }
 }
 

@@ -218,15 +218,15 @@ impl ModuleStore {
 
     fn persist_custom(&self) {
         let custom = self.custom.lock().unwrap();
-        if let Ok(json) = serde_json::to_string_pretty(&*custom) {
-            let _ = std::fs::write(&self.custom_path, json);
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.custom_path, &*custom) {
+            tracing::error!("持久化自定义模块失败: {e}");
         }
     }
 
     fn persist_disabled(&self) {
         let disabled = self.disabled.lock().unwrap();
-        if let Ok(json) = serde_json::to_string_pretty(&*disabled) {
-            let _ = std::fs::write(&self.disabled_path, json);
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.disabled_path, &*disabled) {
+            tracing::error!("持久化禁用模块列表失败: {e}");
         }
     }
 }
@@ -326,11 +326,13 @@ impl ProfileStore {
 
     /// 设置活跃 Profile
     pub fn set_active(&self, id: &str) {
-        let mut active_id = self.active_id.lock().unwrap();
-        *active_id = Some(id.to_string());
-        drop(active_id);
-        if let Ok(json) = serde_json::to_string(&*self.active_id.lock().unwrap()) {
-            let _ = std::fs::write(&self.active_path, json);
+        let json = {
+            let mut active_id = self.active_id.lock().unwrap();
+            *active_id = Some(id.to_string());
+            serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())
+        };
+        if let Err(e) = storyforge_infra_util::atomic_write_json_str(&self.active_path, &json) {
+            tracing::error!("持久化活跃 Profile 失败: {e}");
         }
     }
 
@@ -346,7 +348,12 @@ impl ProfileStore {
             let mut active_id = self.active_id.lock().unwrap();
             if active_id.as_deref() == Some(id) {
                 *active_id = None;
-                let _ = std::fs::write(&self.active_path, "null");
+                drop(active_id);
+                if let Err(e) =
+                    storyforge_infra_util::atomic_write_json_str(&self.active_path, "null")
+                {
+                    tracing::error!("清除活跃 Profile 失败: {e}");
+                }
             }
             true
         } else {
@@ -368,8 +375,9 @@ impl ProfileStore {
 
     fn persist(&self) {
         let profiles = self.profiles.lock().unwrap();
-        if let Ok(json) = serde_json::to_string_pretty(&*profiles) {
-            let _ = std::fs::write(&self.profiles_path, json);
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles)
+        {
+            tracing::error!("持久化 Profile 失败: {e}");
         }
     }
 }

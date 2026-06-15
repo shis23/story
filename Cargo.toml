@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/domain",
+    "crates/infra-util",
     "crates/infra-import",
     "crates/infra-llm",
     "crates/infra-vector",
@@ -43,6 +44,7 @@ crc32fast = "1"
 
 # 领域模型
 storyforge-domain = { path = "crates/domain" }
+storyforge-infra-util = { path = "crates/infra-util" }
 storyforge-infra-import = { path = "crates/infra-import" }
 storyforge-infra-llm = { path = "crates/infra-llm" }
 

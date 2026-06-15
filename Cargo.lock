@@ -3177,6 +3177,7 @@ dependencies = [
  "storyforge-infra-import",
  "storyforge-infra-llm",
  "storyforge-infra-plugin-host",
+ "storyforge-infra-util",
  "storyforge-infra-vector",
  "tauri",
  "tauri-build",
@@ -3210,6 +3211,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storyforge-domain",
+ "storyforge-infra-util",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3335,6 +3337,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storyforge-domain",
+ "storyforge-infra-util",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -3352,12 +3355,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "storyforge-infra-util"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "storyforge-infra-vector"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "storyforge-domain",
+ "storyforge-infra-util",
  "thiserror 2.0.18",
  "tracing",
  "uuid",

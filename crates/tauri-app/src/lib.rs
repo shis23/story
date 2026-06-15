@@ -85,8 +85,8 @@ fn load_embed_config(data_dir: &PathBuf) -> Option<storyforge_infra_llm::EmbedCo
 
 fn save_embed_config(data_dir: &PathBuf, config: &storyforge_infra_llm::EmbedConfig) {
     let path = data_dir.join("embed.json");
-    if let Ok(json) = serde_json::to_string_pretty(config) {
-        let _ = std::fs::write(&path, json);
+    if let Err(e) = storyforge_infra_util::atomic_write_json(&path, config) {
+        tracing::error!("保存嵌入配置失败: {e}");
     }
 }
 
@@ -102,8 +102,8 @@ fn load_active_campaign(data_dir: &PathBuf) -> Option<Id> {
 fn save_active_campaign(data_dir: &PathBuf, id: Option<&Id>) {
     let path = data_dir.join("active_campaign.json");
     let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
-    if let Ok(json) = serde_json::to_string_pretty(&v) {
-        let _ = std::fs::write(&path, json);
+    if let Err(e) = storyforge_infra_util::atomic_write_json(&path, &v) {
+        tracing::error!("保存活跃 Campaign 失败: {e}");
     }
 }
 

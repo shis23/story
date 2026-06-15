@@ -213,8 +213,8 @@ impl PluginRegistry {
     fn persist(&self) {
         if let Some(path) = &self.persist_path {
             let plugins = self.plugins.read().unwrap();
-            if let Ok(json) = serde_json::to_string_pretty(&*plugins) {
-                let _ = std::fs::write(path, json);
+            if let Err(e) = storyforge_infra_util::atomic_write_json(path, &*plugins) {
+                tracing::error!("持久化插件数据失败（历史 bug：静默吞错误会导致重启丢数据）: {e}");
             }
         }
     }

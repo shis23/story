@@ -210,30 +210,10 @@ impl CharacterStore {
         Ok(())
     }
 
-    /// 持久化到文件（原子写入：先写临时文件，再 rename）
+    /// 持久化到文件（原子写入：委托 infra-util）
     fn persist(&self, chars: &[StoredCharacter]) {
-        if let Some(parent) = self.path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::error!("创建数据目录失败: {e}");
-                return;
-            }
-        }
-        let json = match serde_json::to_string_pretty(chars) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("序列化角色卡数据失败: {e}");
-                return;
-            }
-        };
-        // 原子写入：先写临时文件，再 rename（防崩溃导致文件损坏）
-        let tmp_path = self.path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &json) {
-            tracing::error!("写入角色卡临时文件失败: {e}");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-            tracing::error!("角色卡文件 rename 失败，尝试直接写入: {e}");
-            let _ = std::fs::write(&self.path, json);
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.path, chars) {
+            tracing::error!("持久化角色卡失败: {e}");
         }
     }
 }

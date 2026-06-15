@@ -192,11 +192,10 @@ impl BruteForceStore {
         }
     }
 
-    /// 持久化到文件（由调用者持有写锁时调用，避免竞态）
+    /// 持久化到文件（原子写：.tmp → rename，由调用者持有写锁时调用，避免竞态）
     fn persist_records(&self, records: &HashMap<Id, VectorRecord>) -> Result<(), VectorError> {
         if let Some(path) = &self.persist_path {
-            let json = serde_json::to_string_pretty(records)?;
-            std::fs::write(path, json)?;
+            storyforge_infra_util::atomic_write_json(path, records)?;
         }
         Ok(())
     }
