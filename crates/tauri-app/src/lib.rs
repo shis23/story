@@ -21,6 +21,7 @@ use storyforge_domain::llm::{LlmConnection, LlmConnectionSummary, LlmProtocol, S
 use storyforge_domain::Id;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
+use storyforge_infra_plugin_host::PluginRegistry;
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -128,6 +129,8 @@ pub struct AppState {
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
     pub active_campaign: Mutex<Option<Id>>,
+    /// 插件注册表（持久化到 data/plugins.json）
+    pub plugin_registry: Arc<PluginRegistry>,
 }
 
 impl AppState {
@@ -206,6 +209,11 @@ impl AppState {
             }
         };
 
+        // 插件注册表（持久化到 data/plugins.json）
+        let plugin_registry = Arc::new(PluginRegistry::with_persistence(
+            data_dir.join("plugins.json"),
+        ));
+
         Self {
             mock_llm,
             conv_store,
@@ -218,6 +226,7 @@ impl AppState {
             meta_patches: Arc::new(RwLock::new(Vec::new())),
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
             active_campaign: Mutex::new(load_active_campaign(&data_dir)),
+            plugin_registry,
         }
     }
 
@@ -802,6 +811,57 @@ fn delete_preset(id: String) -> Result<(), String> {
     } else {
         Err(format!("找不到预设 {id}"))
     }
+}
+
+// ─── M4 插件命令 ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct InstalledPluginDto {
+    id: String,
+    name: String,
+    version: String,
+    permissions: Vec<String>,
+    ui_slots: Vec<String>,
+    description: Option<String>,
+    author: Option<String>,
+    enabled: bool,
+    installed_at: String,
+}
+
+fn plugin_to_dto(p: &storyforge_infra_plugin_host::InstalledPlugin) -> InstalledPluginDto {
+    InstalledPluginDto {
+        id: p.manifest.id.clone(),
+        name: p.manifest.name.clone(),
+        version: p.manifest.version.clone(),
+        permissions: p.manifest.permissions.iter().map(|perm| format!("{perm:?}")).collect(),
+        ui_slots: p.manifest.ui_slots.iter().map(|slot| format!("{slot:?}")).collect(),
+        description: p.manifest.description.clone(),
+        author: p.manifest.author.clone(),
+        enabled: p.enabled,
+        installed_at: p.installed_at.to_rfc3339(),
+    }
+}
+
+#[tauri::command]
+fn list_plugins(state: tauri::State<'_, Arc<AppState>>) -> Vec<InstalledPluginDto> {
+    state.plugin_registry.list().iter().map(|p| plugin_to_dto(p)).collect()
+}
+
+#[tauri::command]
+fn install_plugin(manifest_json: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let manifest: storyforge_infra_plugin_host::PluginManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| format!("manifest 解析失败: {e}"))?;
+    state.plugin_registry.install(manifest).map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn uninstall_plugin(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.plugin_registry.uninstall(&id).map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn set_plugin_enabled(id: String, enabled: bool, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.plugin_registry.set_enabled(&id, enabled).map_err(|e| format!("{e}"))
 }
 
 #[tauri::command]
@@ -2700,6 +2760,11 @@ pub fn run() {
             list_presets,
             get_preset,
             delete_preset,
+            // M4 插件命令
+            list_plugins,
+            install_plugin,
+            uninstall_plugin,
+            set_plugin_enabled,
             get_version,
             // LLM 连接管理命令
             list_connection_templates,

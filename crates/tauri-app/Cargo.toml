@@ -18,6 +18,7 @@ storyforge-app-pipeline.workspace = true
 storyforge-app-meta.workspace = true
 storyforge-app-memory.workspace = true
 storyforge-infra-vector.workspace = true
+storyforge-infra-plugin-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
