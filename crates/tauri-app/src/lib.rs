@@ -1749,9 +1749,9 @@ fn edit_variant(
         .map_err(|e| format!("{e}"))
 }
 
-/// 采纳当前变体（Draft → Final）
+/// 采纳当前变体（Draft → Final），并自动检查是否需要归档
 #[tauri::command]
-fn accept_variant(
+async fn accept_variant(
     conversation_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
@@ -1761,7 +1761,16 @@ fn accept_variant(
     state
         .conv_store
         .accept_variant(&conv_id, &nid)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?;
+
+    // 自动归档检查（后台异步，不阻塞响应）
+    let state_clone = state.inner().clone();
+    let conv_id_clone = conv_id.clone();
+    tokio::spawn(async move {
+        auto_archive_if_needed(&state_clone, &conv_id_clone).await;
+    });
+
+    Ok(())
 }
 
 /// 软删除当前变体（→ Discarded）
@@ -1899,6 +1908,77 @@ async fn archive_conversation(
         .map_err(|e| format!("归档失败: {e}"))?;
 
     Ok(summaries.len())
+}
+
+// ─── 自动归档辅助 ──────────────────────────────────────────────────────────
+
+/// 检查对话消息数是否超过归档阈值，超过则在后台触发归档
+///
+/// 阈值：50 条非 Discarded 消息（与 ArchiveConfig.default().threshold 一致）。
+/// 归档失败只 warn，不影响用户操作。
+async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
+    const ARCHIVE_THRESHOLD: usize = 50;
+
+    // 取对话，数非 Discarded 消息
+    let messages: Vec<String> = {
+        let conv = match state.conv_store.get(conv_id) {
+            Some(c) => c,
+            None => return,
+        };
+        conv.nodes
+            .iter()
+            .filter_map(|node| {
+                let v = node.active()?;
+                if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
+                    None
+                } else {
+                    Some(v.content.clone())
+                }
+            })
+            .collect()
+    };
+
+    if messages.len() < ARCHIVE_THRESHOLD {
+        return;
+    }
+
+    tracing::info!(
+        "自动归档触发：对话 {} 消息数 {} >= 阈值 {}",
+        conv_id,
+        messages.len(),
+        ARCHIVE_THRESHOLD
+    );
+
+    // 检查嵌入配置
+    let config = match state.embed_config.read().unwrap().clone() {
+        Some(c) => c,
+        None => {
+            tracing::debug!("未配置嵌入 API，跳过自动归档");
+            return;
+        }
+    };
+
+    let llm = state.active_llm_or_mock();
+    let vector_store = state.vector_store.clone();
+    let embedder = Arc::new(storyforge_infra_llm::Embedder::new(config));
+    let archiver = storyforge_app_memory::MemoryArchiver::new(
+        llm,
+        embedder,
+        vector_store,
+        storyforge_app_memory::ArchiveConfig::default(),
+    );
+
+    match archiver.maybe_archive(&messages).await {
+        Ok(summaries) if !summaries.is_empty() => {
+            tracing::info!("自动归档完成：{} 条总结", summaries.len());
+        }
+        Ok(_) => {
+            tracing::debug!("自动归档：无需归档");
+        }
+        Err(e) => {
+            tracing::warn!("自动归档失败（不影响用户操作）: {e}");
+        }
+    }
 }
 
 // ─── Meta Agent 命令 ──────────────────────────────────────────────────────
