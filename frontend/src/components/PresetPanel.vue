@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex } from '../tauri-api.js'
+import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex, importPresetAsModules } from '../tauri-api.js'
 
 const emit = defineEmits(['close'])
 
@@ -104,6 +104,15 @@ async function toggleRegexDisabled(index) {
   }
 }
 
+async function handleImportAsModules(preset) {
+  try {
+    const count = await importPresetAsModules(preset.id)
+    alert(`已导入 ${count} 条提示词为模块，可在导演 Agent 配置中选择使用`)
+  } catch (e) {
+    alert('导入失败: ' + e)
+  }
+}
+
 function roleBadgeClass(role) {
   if (role === 'system') return 'bg-accent/10 text-accent'
   if (role === 'user') return 'bg-ok/10 text-ok'
@@ -147,6 +156,11 @@ function roleBadgeClass(role) {
                 {{ p.prompt_count }} 条提示词 · {{ p.regex_count }} 条正则
               </div>
             </div>
+            <button
+              @click.stop="handleImportAsModules(p)"
+              class="shrink-0 text-xs px-1.5 py-0.5 rounded text-accent/70 hover:bg-accent/10"
+              title="导入为模块（可在导演配置中选择）"
+            >📦</button>
             <button
               @click.stop="handleDelete(p)"
               class="shrink-0 text-xs px-1.5 py-0.5 rounded text-err/70 hover:bg-err/10"

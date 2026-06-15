@@ -853,6 +853,50 @@ fn update_preset_regex(
     }
 }
 
+/// 将 ST 预设的 prompts 转换为 PromptModule 并存入 ModuleStore
+#[tauri::command]
+fn import_preset_as_modules(
+    preset_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    use storyforge_domain::prompt_module::{ModuleCategory, ModuleSource, Exclusivity, PromptModule};
+    use storyforge_domain::agent::AgentRole;
+
+    let stored = get_preset_store().get(&preset_id).ok_or_else(|| format!("找不到预设 {preset_id}"))?;
+    let mut count = 0;
+
+    for prompt in &stored.preset.prompts {
+        // 跳过 marker 和空内容
+        if prompt.marker || prompt.content.trim().is_empty() {
+            continue;
+        }
+
+        // 根据 ST role 映射到 ModuleCategory
+        let category = match prompt.role {
+            storyforge_domain::preset::PromptRole::System => ModuleCategory::Quality,
+            storyforge_domain::preset::PromptRole::User => ModuleCategory::Output,
+            storyforge_domain::preset::PromptRole::Assistant => ModuleCategory::Style,
+        };
+
+        let module_id = format!("st-{}-{}", preset_id, prompt.identifier);
+        let module = PromptModule {
+            id: Id::from_str(&module_id),
+            name: prompt.name.clone(),
+            category,
+            content: prompt.content.clone(),
+            exclusivity: Exclusivity::Multiple,
+            source: ModuleSource::ImportedFromST,
+            applicable_roles: vec![AgentRole::Editor, AgentRole::Subagent("*".into())],
+            tags: vec!["ST导入".into(), stored.preset.name.clone()],
+        };
+
+        state.module_store.add(module);
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 // ─── M4 插件命令 ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -2937,6 +2981,7 @@ pub fn run() {
             delete_preset,
             update_preset_prompt,
             update_preset_regex,
+            import_preset_as_modules,
             // M4 插件命令
             list_plugins,
             install_plugin,

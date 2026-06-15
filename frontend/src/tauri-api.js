@@ -103,6 +103,13 @@ export async function updatePresetRegex(presetId, regexIndex, disabled) {
   }
 }
 
+/** 将 ST 预设的 prompts 转换为模块（返回转换数量） */
+export async function importPresetAsModules(presetId) {
+  if (isTauri()) {
+    return await invoke('import_preset_as_modules', { presetId })
+  }
+}
+
 // ─── M4 插件命令 ──────────────────────────────────────────────────────────
 
 /** 列出所有已安装插件 */
