@@ -100,13 +100,13 @@ storyforge/
 │   ├── app-meta/                       # Meta Agent（M5 新增）
 │   │   └── lib.rs                      # 诊断工具 + Patch 系统
 │   └── tauri-app/                      # Tauri 入口
-│       ├── lib.rs                      # 66 个 Tauri 命令
+│       ├── lib.rs                      # 79 个 Tauri 命令
 │       ├── storage.rs                  # 角色卡持久化存储
 │       ├── tauri.conf.json             # Tauri 配置
 │       └── capabilities/default.json   # 权限定义
 ```
 
-**已实现的 Tauri 命令**（66 个）：
+**已实现的 Tauri 命令**（79 个）：
 - `import_character` — 导入角色卡（PNG/JSON，自动检测格式，同步写进 tool_ctx）
 - `list_characters` — 列出已导入的角色卡
 - `get_character` — 获取角色卡详情（含世界书条目）
@@ -188,7 +188,7 @@ storyforge/
 - **前端日志上报**（console.log/warn/error 自动转发到后端 LogStore，高玩模式日志面板可查）
 - Agent 配置卡片（高玩模式）
 - LLM 连接管理弹层（创建/删除/切换/测试连通）
-- **前端 IPC 桥**（66 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
+- **前端 IPC 桥**（79 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
 - **ST 风格 markdown 渲染**（`*动作*`→斜体、`**粗体**`、换行，覆盖对话消息和开场白，先 HTML 转义防 XSS）
 - **用户意图消息**（写作时自动把用户输入加入消息列表，消息流：开场白→意图→成文）
 - **消息列表滚动**（`h-screen flex flex-col` 布局 + `flex-1 overflow-y-auto`，新消息/成文后自动滚动到底）
@@ -199,7 +199,7 @@ storyforge/
 ```
 frontend/src/
 ├── App.vue                     # 主应用（对话恢复 + 流水线 + 对话操作事件处理 + Campaign 集成）
-├── tauri-api.js                # Tauri IPC 桥（66 个命令全覆盖，含 P1/P2 Campaign/知识/任务）
+├── tauri-api.js                # Tauri IPC 桥（79 个命令全覆盖，含 P1/P2 Campaign/知识/任务）
 ├── useTheme.js                 # 主题切换
 ├── mock.js                     # 演示数据
 ├── style.css                   # 全局样式（Tailwind + 主题变量）
@@ -724,7 +724,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | ~~🔴 高~~ | ~~**全局世界书**~~ | ✅ 已完成：条目级 is_global 标记 + 前端「🌐 全局共享」开关 + 跨卡 merge 逻辑 | — |
 | ~~🔴 高~~ | ~~**预设持久化+查看**~~ | ✅ 已完成：list_presets/get_preset/delete_preset 命令 + PresetPanel.vue（提示词/正则双 tab 查看）+ 📑 按钮入口 | — |
 | ~~🟡 中~~ | ~~归档器接入~~ | ✅ 已完成：accept_variant 后自动 spawn 后台任务触发 maybe_archive（阈值 50 条，未配嵌入 API 静默跳过） | — |
-| 🟡 中 | 预设编辑（进阶） | 编辑预设单条 prompt 内容/启停 + regex_scripts 管理（本轮先做到查看） | — |
+| ~~🟡 中~~ | ~~预设编辑 + 模块系统打通~~ | ✅ 已完成：ModuleStore + ProfileStore 持久化 + 流水线接入 assemble_system_prompt + AgentConfigCard 接真实数据 + PresetPanel 编辑（prompt 内容/启停 + regex 启停） + ST 预设→模块桥接 | — |
 | ~~🟡 中~~ | ~~ST 占位符替换~~ | ✅ 已完成：`replace_template_vars()` 支持 `{{char}}` `{{user}}` `{{charIfNotUser}}`，待接入流水线 | — |
 | ~~🟢 低~~ | ~~M4 插件运行时前端~~ | ✅ 已完成：PluginPanel.vue + PluginHost.vue + plugin-bridge.js + 4 个插件 API 命令 + 侧栏 Slot 挂载 | — |
 | 🟢 低 | app-meta 插件生成 / ST 预设导入分析 | 设计 §9.2/§9.4 的 meta_generate_plugin_from_st 等 | 工作量大 |
@@ -899,7 +899,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | `crates/infra-import/src/lib.rs` | 导入逻辑入口 |
 | `crates/infra-import/src/png.rs` | PNG embed 解析 |
 | **tauri-app（Tauri 入口）** | |
-| `crates/tauri-app/src/lib.rs` | Tauri 命令定义（66 个）+ AppState |
+| `crates/tauri-app/src/lib.rs` | Tauri 命令定义（79 个）+ AppState |
 | `crates/tauri-app/src/storage.rs` | 角色卡持久化 + 世界书路由更新 |
 | `crates/tauri-app/src/connection_store.rs` | LLM 连接持久化（CRUD + 活跃连接） |
 | `crates/tauri-app/gen/android/` | Android 项目（gradle 构建脚本 + APK 输出） |
