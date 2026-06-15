@@ -2,7 +2,7 @@
 
 > 项目代号：**StoryForge**（暂定，可改）
 > 基于 `INTENT.md` v3（D1–D44 全部锁定）编写
-> 状态：设计稿，待评审 → 评审通过后进入 M0 开发。§16-§20 为 2026-06-15 新增（角色子 Agent / Campaign / MVU 兼容方向）。
+> 状态：设计稿，M0–M5 均已完成或进行中（详见 HANDOFF.md）。§16-§20 为 2026-06-15 新增（角色子 Agent / Campaign / MVU 兼容方向）。
 
 ---
 
@@ -25,6 +25,7 @@
 | §13 | 里程碑规划（M0→M5） |
 | §14 | 首周任务清单 |
 | §15 | 技术风险与对策 |
+| §15b | 待评审的开放设计点 |
 | **§16** | **角色子 Agent 与信息隔离（D30-D31，新增）** |
 | **§17** | **多角色卡模型与 Campaign（D32-D38，新增）** |
 | **§18** | **角色知识系统与后处理流水线（D39-D41，新增）** |
@@ -39,7 +40,7 @@
 ## 1. 系统全景与设计原则
 
 ### 1.1 产品定位（一句话）
-**仅安卓**的 AI 多 Agent 协作写作 App：用「导演+编剧+子Agent」的显式编排替代 ST 的「单 prompt + 提示词注入」范式；导入兼容 ST 角色卡/世界书/预设；后端原生实现小白X 级别的总结/推进/向量化；自带插件运行时（自有 API）；附 Meta Agent 做配置调试。
+**移动端优先**（安卓为主，桌面端可选验证）的 AI 多 Agent 协作写作 App：用「导演+编剧+子Agent」的显式编排替代 ST 的「单 prompt + 提示词注入」范式；导入兼容 ST 角色卡/世界书/预设；后端原生实现小白X 级别的总结/推进/向量化；自带插件运行时（自有 API）；附 Meta Agent 做配置调试。
 
 ### 1.2 五条设计原则
 
@@ -52,7 +53,8 @@
 | P5 | **插件用自有 API** | 自建运行时，插件为我们写，不模拟 ST |
 
 ### 1.3 不做的事（明确排除）
-- ❌ iOS / 桌面端（D15）
+- ❌ iOS（D15）
+- ❌ 桌面端作为正式目标（仅作开发验证用途，移动端优先）
 - ❌ 真 ST 插件运行（D6/D17）
 - ❌ ST 提示词注入范式（蓝灯/绿灯拼 prompt）
 - ❌ 全局脚本兼容（shujuku 那类，改原生替代）
@@ -843,7 +845,7 @@ storyforge/
 │   │   ├── agent.rs
 │   │   └── plugin.rs
 │   │
-│   ├── infra-storage/         # 文件持久化（JSON）
+│   ├── (持久化在 tauri-app/storage.rs, connection_store.rs, campaign_store.rs 中实现)
 │   ├── infra-llm/             # LLM HTTP client 池 + 流式
 │   ├── infra-vector/          # 向量库（本地）+ 嵌入 API client
 │   ├── infra-import/          # ST 卡/世界书/预设导入解析
@@ -871,7 +873,7 @@ storyforge/
 └── docs/
     ├── INTENT.md
     ├── TECHNICAL_DESIGN.md    # 本文件
-    └── AGENT_DESIGN.md        # Agent 提示词/工具详细文档（后续）
+    └── AGENT_INTERFACES.md    # Agent 接口索引（D44）
 ```
 
 **依赖方向**（严格单向，禁止环）：
@@ -1051,11 +1053,11 @@ pub struct Embedder {
 pub struct EmbedConfig {
     pub endpoint: String,    // 如 OpenAI /v1/embeddings 或 SiliconFlow
     pub api_key: Secret<String>,
-    pub model: String,       // text-embedding-3-small / bge-large-zh
+    pub model: String,       // text-embedding-3-small / Qwen3-Embedding-8B
     pub dim: usize,
 }
 ```
-用户在高玩模式配置。**默认推荐 SiliconFlow 的 bge-large-zh**（中文效果好、便宜）。
+用户在高玩模式配置。**默认推荐 SiliconFlow + Qwen3-Embedding-8B**（4096 维，中文效果好）。
 
 ---
 
@@ -1787,7 +1789,7 @@ log_disable_stream(kind) -> ()                    // 关
 
 ---
 
-## 15. 待评审的开放设计点
+## 15b. 待评审的开放设计点（原 §15 重复，避免级联重编号）
 
 这些是**实现时再定**的细节，不阻塞 M0 启动：
 

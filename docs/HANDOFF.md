@@ -54,7 +54,7 @@
 **Workspace 结构**：
 ```
 storyforge/
-├── Cargo.toml                          # workspace 定义（9 个 crate 成员）
+├── Cargo.toml                          # workspace 定义（13 个 crate 成员）
 ├── crates/
 │   ├── domain/                         # 纯领域模型（无 IO）
 │   │   ├── character.rs                # 角色卡（ST V2/V3 兼容）
@@ -100,13 +100,13 @@ storyforge/
 │   ├── app-meta/                       # Meta Agent（M5 新增）
 │   │   └── lib.rs                      # 诊断工具 + Patch 系统
 │   └── tauri-app/                      # Tauri 入口
-│       ├── lib.rs                      # 36 个 Tauri 命令
+│       ├── lib.rs                      # 66 个 Tauri 命令
 │       ├── storage.rs                  # 角色卡持久化存储
 │       ├── tauri.conf.json             # Tauri 配置
 │       └── capabilities/default.json   # 权限定义
 ```
 
-**已实现的 Tauri 命令**（36 个）：
+**已实现的 Tauri 命令**（66 个）：
 - `import_character` — 导入角色卡（PNG/JSON，自动检测格式，同步写进 tool_ctx）
 - `list_characters` — 列出已导入的角色卡
 - `get_character` — 获取角色卡详情（含世界书条目）
@@ -164,7 +164,7 @@ storyforge/
   - `abandon_task` — 放弃任务
   - `list_round_summaries` — 列本轮剧情摘要（按 campaign_id 筛选，按 turn 升序，200-500 字/条）
 
-**测试**：188/188 单元测试通过（含 P2 新增：app-agent 31 个含 2 个并行编排 + app-pipeline 8 个含 3 个后处理接入 + tauri-app 10 个含 5 个 P2 CampaignStore 持久化 + domain 49 个 + infra-llm 19 个 + 其他 crate）。
+**测试**：168/168 单元测试通过（含 P2 新增：app-agent 31 个含 2 个并行编排 + app-pipeline 8 个含 3 个后处理接入 + tauri-app 10 个含 5 个 P2 CampaignStore 持久化 + domain 49 个 + infra-llm 19 个 + 其他 crate）。
 
 ### 2.3 前端（M0 完成）
 
@@ -188,7 +188,7 @@ storyforge/
 - **前端日志上报**（console.log/warn/error 自动转发到后端 LogStore，高玩模式日志面板可查）
 - Agent 配置卡片（高玩模式）
 - LLM 连接管理弹层（创建/删除/切换/测试连通）
-- **前端 IPC 桥**（36 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
+- **前端 IPC 桥**（66 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
 - **ST 风格 markdown 渲染**（`*动作*`→斜体、`**粗体**`、换行，覆盖对话消息和开场白，先 HTML 转义防 XSS）
 - **用户意图消息**（写作时自动把用户输入加入消息列表，消息流：开场白→意图→成文）
 - **消息列表滚动**（`h-screen flex flex-col` 布局 + `flex-1 overflow-y-auto`，新消息/成文后自动滚动到底）
@@ -199,7 +199,7 @@ storyforge/
 ```
 frontend/src/
 ├── App.vue                     # 主应用（对话恢复 + 流水线 + 对话操作事件处理 + Campaign 集成）
-├── tauri-api.js                # Tauri IPC 桥（57 个命令全覆盖，含 P1/P2 Campaign/知识/任务）
+├── tauri-api.js                # Tauri IPC 桥（66 个命令全覆盖，含 P1/P2 Campaign/知识/任务）
 ├── useTheme.js                 # 主题切换
 ├── mock.js                     # 演示数据
 ├── style.css                   # 全局样式（Tailwind + 主题变量）
@@ -338,7 +338,7 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 | 维度 | 决策 | 说明 |
 |------|------|------|
 | 范围 | 完整 M1（设计 §13 全部清单） | 含日志系统 + 对话树 + 部分重 roll |
-| 提示词 | 极简模块版 | PromptModule/Profile 数据结构 + 预置 3-5 模块，无 UI 编辑器 |
+| 提示词 | 极简模块版 | PromptModule/Profile 数据结构 + 预置 3-5 模块 + 高玩模式模块编辑器 |
 | 工具协议 | 原生 + XML/JSON 降级双路 | 兼容不支持 function calling 的模型 |
 | LLM | DeepSeek（OpenAI 兼容） | key 用 mock+真client 双路，不硬编码 |
 | 会话 | 持久化到文件 | data/conversations/<id>.json |
@@ -427,7 +427,7 @@ npm run build
 ```bash
 cd C:\Users\Predator\ZCodeProject\storyforge
 
-# 全 workspace 测试（67 个）
+# 全 workspace 测试（168 个）
 cargo test --workspace
 
 # 单 crate 测试
@@ -691,25 +691,10 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | 前端：普通/高玩视图切换 | 双视图渐进披露 | ⏳ 后续 |
 
 > 注：app-meta 当前是「诊断报告 + Patch 存储 + Patch 执行」，设计 §9 描述的完整 Meta Agent（插件生成助手 / ST 预设自动整理）工作量较大，留待后续迭代。
+>
+> ~~Phase 1/2/3~~ 已被 P0/P1/P2/M4 里程碑替代，变量系统（P0）、iframe 沙箱（M4）、记忆系统（M2）均已完成。
 
-**Phase 1（变量系统 + 世界书查询）**：2-3 周
-
-**Phase 1（变量系统 + 世界书查询）**：2-3 周
-- 变量存储（getLocalVar/setLocalVar）
-- 世界书按关键词查询（Tauri command）
-- regex_scripts 执行（regress crate）
-
-**Phase 2（脚本运行时）**：3-4 周
-- iframe 沙箱 + postMessage API 桥
-- 酒馆助手 API 兼容层
-- 脚本输出渲染到聊天
-
-**Phase 3（小白X 原生化）**：2-3 周
-- 故事总结（app-memory 归档器）
-- 剧情推进（app-agent 导演工具）
-- 向量化检索（infra-vector + 远程嵌入）
-
-### 7.3 其他功能
+### 7.6 其他功能
 
 | 功能 | 里程碑 | 说明 |
 |------|--------|------|
@@ -721,7 +706,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | Meta Agent | M5 | 对话式配置助手 |
 | 日志系统 | M1 | 后端/LLM/前端三类日志 |
 
-### 7.4 后续工作优先级（当前状态）
+### 7.7 后续工作优先级（当前状态）
 
 后端骨架基本完整，前端接缝大部分已打通，桌面端已可运行验证。下一步重点：
 
@@ -731,9 +716,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | ~~🔴 高~~ | ~~模型列表拉取~~ | ✅ 已完成：list_models 命令（GET /v1/models）+ ConnectionConfig datalist + 🔍 拉取按钮（失败模板兜底） | — |
 | ~~🔴 高~~ | ~~世界书条目 CRUD~~ | ✅ 已完成：update/add/delete_world_info_entry 3 命令 + CharacterDetail 内联编辑/新增/删除 | — |
 | ~~🔴 高~~ | ~~启动恢复 tool_ctx~~ | ✅ 已完成：AppState::new 从 characters.json 恢复角色卡+世界书到 tool_ctx（重启后不再丢失） | — |
-| 🔴 高 | **全局世界书** | 角色卡世界书条目可标记「全局共享」，标记后切其他角色卡也生效（蓝灯进导演常驻，绿灯进共享向量池）。方案：条目级标记（非整卡） | — |
 | ~~🔴 高~~ | ~~**世界书 depth 生效**~~ | ✅ 已完成：编辑表单加 depth/order 数字输入 + 查看模式显示 depth 徽章（d2）+ 后端已支持排序 | — |
-| 🔴 高 | **预设持久化+查看** | 预设导入后持久化（目前只返回字符串不存）+ 列表查看 + 详情（每条 prompt 的 role/content/identifier）。`{{char}}` `{{user}}` 占位符替换归入此线（ST prompt-template 功能） | — |
 | 🔴 高 | **Android 模拟器验证** | NDK + Gradle + APK 编译已成功，模拟器启动需开 VT-x + 装 HAXM | 用户操作 BIOS + 安装 HAXM |
 | 🔴 高 | **角色子 Agent 信息隔离 + Campaign + 叙事计划 + 变量体系**（D30-D48） | 赛博跑团卡的核心能力：角色知识四元分类、一卡多角色树形、Campaign 隔离、知识抽取后处理 Agent、叙事计划系统（任务追踪/长程一致性）、cache 友好布局、三级变量体系。P0 数据模型 + P1 角色识别/Campaign 闭环 + **P2 后处理流水线已全部完成**。剩余：前端 Campaign 开档 UI + 共享 WebView 兜底（P3） | — |
 | 🔴 高 | **MVU 原生兼容**（D42-D43） | 导入含 MVU 的卡即可用：原生协议层（stat_data/_.set 解析）+ 两层路由（轻量卡原生、重 DOM 卡共享 WebView）。**P1 已完成字段级 stat_data 解析**（探测 extensions.mvu.initvar / stat_data / variables，合并进 CharacterDefinition.variable_schema）。剩余：重 DOM 卡 JS 分析 + WebView 兜底（P3） | 共享 WebView 依赖插件运行时 |
@@ -916,7 +899,7 @@ C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
 | `crates/infra-import/src/lib.rs` | 导入逻辑入口 |
 | `crates/infra-import/src/png.rs` | PNG embed 解析 |
 | **tauri-app（Tauri 入口）** | |
-| `crates/tauri-app/src/lib.rs` | Tauri 命令定义（36 个）+ AppState |
+| `crates/tauri-app/src/lib.rs` | Tauri 命令定义（66 个）+ AppState |
 | `crates/tauri-app/src/storage.rs` | 角色卡持久化 + 世界书路由更新 |
 | `crates/tauri-app/src/connection_store.rs` | LLM 连接持久化（CRUD + 活跃连接） |
 | `crates/tauri-app/gen/android/` | Android 项目（gradle 构建脚本 + APK 输出） |
@@ -1040,7 +1023,7 @@ default_Seraphina.png
 | 近期 | 角色卡列表/切换/删除 | 用户要求先做 |
 | 近期 | 脚本驱动卡需要变量系统+脚本运行时 | 真实卡分析发现 |
 | M1 | 完整 M1 范围（含日志+对话树+部分重 roll） | 用户选择 |
-| M1 | 极简模块版提示词（数据结构+预置，无 UI） | 用户选择 |
+| M1 | 极简模块版提示词（数据结构+预置+高玩模式编辑器） | 用户选择 |
 | M1 | 原生 function calling + XML/JSON 降级双路 | 用户选择 |
 | M1 | DeepSeek 连接，mock+真 client 双路 | 用户选择 |
 | M1 | 会话持久化到文件 | 用户选择 |
