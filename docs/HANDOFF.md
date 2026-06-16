@@ -4,7 +4,8 @@
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
-> **流式改造已完成（2026-06-16）**：子 Agent + meta_chat 全流式（token 实时推前端）+ 子 Agent 并发改 Semaphore 排队（超额不再丢弃）+ 重 roll 最后一条改原地替换（中间消息仍开分支）。详见 §3.10。ARCHITECTURE.md 已同步更新（含新增 §3.7 Meta Agent 子系统专章）。
+> **流式改造已完成（2026-06-16）**：子 Agent + meta_chat 全流式（token 实时推前端）+ 子 Agent 并发改 Semaphore 排队（超额不再丢弃）+ 重 roll 最后一条改原地替换（中间消息仍开分支）。详见 §3.10。
+> **UI 修复轮完成（2026-06-16）**：AgentRole serde round-trip + 14 处 Campaign 命令参数名 camelCase + 导入自动识别 + 删卡级联 + 删除语义重做（truncate + 清流水线 + 回显开场白）+ 分支按钮改提示。详见 §3.11。ARCHITECTURE.md 已同步更新。
 > 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
 > **前端 Campaign UI 已完成（2026-06-15）**：tauri-api.js 补全 21 个 P1/P2 API 函数 + CampaignPanel.vue 新组件（3 tab：角色卡/游玩档/档详情，含变量编辑/知识/任务/摘要面板）+ AppHeader 加 Campaign 按钮 + App.vue 集成（activeCampaign 状态 + 事件绑定），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
@@ -389,6 +390,35 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **测试**：234 → 239 全绿（+5 新：1 Semaphore 排队 + 2 replace/is_last + 既有回归全过）。
 
 **文档**：commit `1aa396c` 新增 `docs/ARCHITECTURE.md`（代码架构总览）；本轮同步修正 ARCHITECTURE.md 被 C1/C3 推翻的描述（子 Agent 非流式/丢弃/SubagentProgress 死代码/add_variant 等），并新增 §3.7 Meta Agent 子系统专章（Session/Patch/meta_chat 流式/MVU 五合一）。
+
+### 3.11 UI 修复轮（2026-06-16，桌面端实测驱动）
+
+用户用 `cargo tauri dev` 实测后报告 6 类问题，6 个 commit 修复（`f892df8`→`3a0c4be`）。测试：domain 69 + tauri-app 21 + app-conversation 10 全绿（含新增 AgentRole round-trip 4 + truncate_from 1）。
+
+**已修复**：
+
+| 问题 | 根因 | 修复 | commit |
+|------|------|------|--------|
+| Profile 存不进（unknown variant `Subagent("*")`）| `AgentRole::Subagent(String)` 元组变体作 HashMap key，serde 无法 round-trip | 手写扁平序列化（`Subagent:*`）+ 反序列化兼容旧格式 `Subagent("...")`；4 个回归测试 | `f892df8` `1715f29` |
+| Campaign 面板看不到导入的卡 | `import_character` 返回存储随机 uuid，`extract_characters` 按 `Character.id` 查 tool_ctx 不匹配 | 导入后自动调 `extractCharacters`；extract_characters 加 name 回退（按存储 id 查 CharacterStore 拿 name 再按 name 查 tool_ctx） | `7d87fdd` `4470f9d` |
+| 高玩模式预设按钮按不动 | 模块切换走 saveProfile，①serde 失败被 catch 吞掉；「保存新预设」按钮 `@click=null` | serde 修后恢复 + `saveAsNewProfile`（prompt 命名）；selections key `Subagent("*")`→`Subagent:*` | `7d87fdd` |
+| 新建游玩档失败（missing `cardId`）| 14 个 Campaign 命令参数名全用 snake_case，Tauri v2 默认期望 camelCase | 全部改 camelCase（`create_campaign`/`list_instances`/`get_character_variables` 等 14 处） | `3a0c4be` |
+| 删除消息无反应/删一条全删 | `window.confirm` 在 Tauri WebView 不弹窗；soft_delete 只删一个 variant 导致灰条残留 | 删除语义重做：`truncate_from`（删该条+其后所有=撤销写作）+ 清流水线 + Tauri 原生 dialog；start_writing 不存开场白致 truncate 后对话空 → 回显 first_mes | `4470f9d` `1cec6d2` `3a0c4be` |
+| 分支按钮导致消息消失 | `addVariant` 是 ST 风格 swipe（加空 variant 切走原内容），与「分支=开新档」语义冲突 | 改提示（分支应在 Campaign 面板 fork）；`Campaign.fork` domain 方法已有，缺 Tauri 命令 | `4470f9d` |
+| 删卡后 Campaign 面板不更新 | `delete_character` 只删 CharacterStore，不级联删 CampaignStore 的 CharacterCard | 加级联删（按 source_character_id 找 card 再删，含其 Campaign） | `3a0c4be` |
+
+**遗留待办（本轮未做）**：
+
+| 待办 | 说明 | 优先级 | 工作量 |
+|------|------|--------|--------|
+| **角色卡列表集成到 Campaign** | 根本问题：CharacterStore（扁平 Character）与 CampaignStore（CharacterCard）是双数据源，导入只写前者、extract 才有后者、删卡只删前者，必然不一致。方案：废弃 CharacterStore 统一到 CampaignStore，或后者作前者缓存层。影响 88 命令中大量用 CharacterStore 的命令 | 🔴 高 | 大（架构级） |
+| **Campaign.fork Tauri 命令 + 前端入口** | `Campaign::fork(card_id, name, src, fork_node_id)` domain 方法已实现（`fork_from` 记录分叉点），但没暴露 Tauri 命令，前端无 fork 入口。「分支」按钮目前只弹提示。真分支=开新档复用对话树 | 🟡 中 | 中 |
+| **tauri-api.js 参数名一致性检查** | 本轮 14 处 snake_case 参数名是系统性 bug（散落各处手动改）。建议加脚本：静态检查 tauri-api.js 的 invoke 参数名 vs Rust `#[tauri::command]` 签名，CI 防回归 | 🟢 低 | 小 |
+| **顶部状态栏重构为侧边栏**（问题⑤）| AppHeader 按钮堆满（导入/列表/Campaign/预设/插件/Meta/主题/高玩）。改成点击「普通/高玩」唤出可折叠侧边栏，顶栏只留角色名 + 切换 | 🟢 低 | 中（纯 UI） |
+
+**新增 Tauri 命令**：`delete_message_from`（删除指定消息及其后所有，截断对话）。
+**新增 ConversationStore 方法**：`truncate_from`（+ 单测）、`replace_active_variant`、`is_last_assistant_node`（§3.10 C3 已加）。
+**新增 domain**：AgentRole 自定义 serde（扁平字符串 + 旧格式兼容，4 测试）。
 
 ---
 

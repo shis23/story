@@ -2,7 +2,7 @@
 
 > 本文档描述**代码实现层面**的架构，与代码同步。需求决策看 [INTENT.md](INTENT.md)，设计方案看 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)，改 prompt 看 [AGENT_INTERFACES.md](AGENT_INTERFACES.md)，进度状态看 [HANDOFF.md](HANDOFF.md)。
 >
-> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；88 个 Tauri 命令；234 个单元测试。
+> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；89 个 Tauri 命令；测试数见 HANDOFF.md。
 
 ---
 
@@ -107,7 +107,7 @@
 | `meta_session` / `meta_conversations` | | Meta Agent 对话状态 |
 | `meta_patches` | | 待采纳的 Patch |
 
-### 2.2 88 个命令的分组速查
+### 2.2 89 个命令的分组速查
 
 > 完整清单见 README。这里按「调用目标 + 副作用」归纳，重点是**谁会写文件、谁会推事件**。
 
@@ -116,7 +116,7 @@
 | 角色卡 + 世界书 CRUD | ~8 | CharacterStore + tool_ctx + vector_store | characters.json + vectors.json（绿灯条目） | 否 |
 | LLM 连接 | 8 | ConnectionStore + AppState.active_llm | connections.json | 否 |
 | **写作流水线** | 2 | PipelineOrchestrator | conversations/ + CampaignStore（后处理） | **是（Channel）** |
-| 对话操作/变体 | 9 | ConversationStore | conversations/<id>.json | 否 |
+| 对话操作/变体 | 10 | ConversationStore（delete_message_from 截断对话） | conversations/<id>.json | 否 |
 | 日志 | 4 | LogStore | logs/*.jsonl | 否 |
 | 记忆系统 | 3 | Embedder + MemoryArchiver | embed.json + vectors.json | 否 |
 | Campaign + 变量 | 14 | CampaignStore | cards/campaigns/instances.json + active_campaign.json | 否 |
@@ -281,6 +281,15 @@ draft_ready → state_changed(Review) → state_changed(Committed)
 - 重 roll **不更新** `self.session`，**不进 Committed**（停在 Review）。
 - 设计约束（已在 validate_partial_roll 落地）：**拒绝「只重导演却保留旧子产出」**——Plan 变了旧子产出不匹配，后端拦截。
 
+#### 3.6.1 删除消息（truncate 语义）
+
+「🗑 删除」按钮 = **撤销从这条开始的写作**（不是只软删一个 variant）：
+
+- 后端 `delete_message_from` 命令 → `ConversationStore::truncate_from`：删除指定 node 及其后所有 node，保留之前的。
+- 前端删除后：重新拉对话刷新 + 清流水线状态（导演/子Agent/编剧输出全置 idle，隐藏 pipeline 面板）。
+- **边界**：`start_writing` 不存开场白/用户意图进后端对话（只 append AI 成文 node）。所以删除成文（唯一 node）后对话空，前端检测空对话时从角色卡 `first_mes` **回显开场白**，回到「导入后未写作」状态。
+- 确认框用 `@tauri-apps/plugin-dialog` 的 `ask`（Tauri WebView 的 `window.confirm` 不弹窗）。
+
 ### 3.7 Meta Agent 子系统（独立于写作流水线）
 
 Meta Agent 是一个**配置调试助手**，与写作流水线完全解耦：不读 `current_cancel`、不碰 pipeline、不接触 API key，自建 `AgentRuntime` + 每轮新建 `ToolRegistry`。它的能力分三块：诊断对话、Patch 提议-采纳、MVU 五合一分析。
@@ -418,7 +427,7 @@ analyze_mvu_card 编排：
 | ├ `round_summaries.json` | CampaignStore | RoundSummary（本轮剧情摘要，每轮一条） |
 | └ `mvu_translations.json` | CampaignStore | StoredMvuTranslation（MVU 五合一产物） |
 
-**级联删除规则**：删 CharacterCard → 同步删其所有 Campaign → 删 Campaign → 同步删其 instances/knowledge/tasks/summaries；删扁平 Character → 同步删其 mvu_translations。
+**级联删除规则**：删扁平 Character → 同步删 CampaignStore 的 CharacterCard（按 source_character_id）+ 删 MVU 翻译；删 CharacterCard → 同步删其所有 Campaign → 删 Campaign → 同步删其 instances/knowledge/tasks/summaries。
 
 **原子写惯例**（infra-util 统一）：先写 `.tmp` 再 `rename`，避免崩溃写一半。
 
@@ -527,6 +536,10 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 | `match_braces` 2 处重复 | `llm_parse.rs:21`（公用）+ `character_extractor.rs:252`（自写） | 算法一致，可合并；非刻意设计 |
 | 共享 WebView 是桩 | `StubMvuRuntime` 全 NotImplemented | 重 DOM 卡（缄默之秋1.4 类）的 MVU 无法真实执行 |
 | `plugin_get_variable` 权限 | 校验的是 `WriteVariables` 而非读权限 | 代码现状，文档已标注 |
+| **CharacterStore/CampaignStore 双数据源** | 导入只写 CharacterStore（扁平 Character），Campaign 面板读 CampaignStore（CharacterCard）需 extract_characters 转换；删卡现已级联但两套数据天然易不一致 | 🔴 高：应统一（废弃 CharacterStore 或后者作缓存层）；见 HANDOFF §3.11 |
+| tauri-api.js 参数名无校验 | 曾系统性出现 14 处 snake_case 参数名（Tauri v2 期望 camelCase）；手动修易漏 | 应加脚本静态检查 invoke 参数名 vs Rust 命令签名 |
+| start_writing 不存开场白/用户意图进对话 | 后端对话只有 AI 成文 node；删除成文（truncate）后对话空，前端靠回显 first_mes 兜底 | 语义不严谨：用户意图从未持久化；删除后回显的开场白与对话树脱节 |
+| Campaign.fork 未暴露 | `Campaign::fork` domain 方法已实现（fork_from 记分叉点），但无 Tauri 命令 + 前端入口；「分支」按钮只弹提示 | 真「分支=开新档」能力未接通 |
 
 ---
 
