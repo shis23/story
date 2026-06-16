@@ -71,6 +71,9 @@ function scrollToBottom() {
 const isWriting = ref(false)
 // 当前对话 ID（重 roll 需要）
 const currentConversationId = ref(null)
+// 会话历史列表
+const conversationHistory = ref([])
+const showHistory = ref(true)
 // 连接配置弹层
 const showConnConfig = ref(false)
 // 当前活跃连接（顶栏显示用）
@@ -78,11 +81,11 @@ const activeConnection = ref(null)
 // AgentConfigCard 引用（连接变更后刷新）
 const agentConfigRef = ref(null)
 
-// 获取版本 + 加载活跃连接 + 恢复最近对话 + 拦截 console
+// 获取版本 + 加载会话历史列表 + 拦截 console
 onMounted(async () => {
   try { appVersion.value = await getVersion() } catch (e) { console.error('getVersion:', e) }
   await refreshActiveConnection()
-  await loadRecentConversation()
+  await loadConversationHistory()
   try { activeCampaign.value = await getActiveCampaign() } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()
@@ -125,22 +128,31 @@ function applyConversation(conv) {
     })
 }
 
-// 从后端恢复最近一次对话
-async function loadRecentConversation() {
+// 加载会话历史列表
+async function loadConversationHistory() {
   try {
     const convList = await listConversations()
-    if (!convList || convList.length === 0) return
-
-    // 按 updated_at 降序，取最近的对话
+    if (!convList || convList.length === 0) {
+      conversationHistory.value = []
+      return
+    }
     convList.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-    const latest = convList[0]
+    conversationHistory.value = convList
+  } catch (e) {
+    console.error('加载会话历史失败:', e)
+  }
+}
 
-    const conv = await getConversation(latest.id)
+// 打开一个会话
+async function openConversation(convSummary) {
+  try {
+    const conv = await getConversation(convSummary.id)
     if (!conv || !conv.nodes || conv.nodes.length === 0) return
 
     applyConversation(conv)
+    currentConversationId.value = convSummary.id
+    showHistory.value = false
 
-    // 如果有关联角色卡，加载角色信息
     if (conv.character_id) {
       try {
         const chars = await import('./tauri-api.js').then(m => m.listCharacters())
@@ -148,7 +160,6 @@ async function loadRecentConversation() {
         if (char) {
           activeChar.value = char
           await loadCharDetail(char.id)
-          // 用角色名更新 assistant 消息的 role_label
           messages.value.forEach((m) => {
             if (m.role === 'assistant') m.role_label = char.name
           })
@@ -156,8 +167,15 @@ async function loadRecentConversation() {
       } catch (e) { console.error('加载关联角色卡失败:', e) }
     }
   } catch (e) {
-    console.error('恢复对话失败:', e)
+    console.error('打开对话失败:', e)
   }
+}
+
+// 新建对话（从历史列表点「新对话」）
+function startNewConversation() {
+  messages.value = []
+  currentConversationId.value = null
+  showHistory.value = false
 }
 
 // 刷新活跃连接状态（连接配置变更后调用）
@@ -664,6 +682,13 @@ function handlePipelineEvent(event) {
       @open-meta="showMetaPanel = true"
     >
       <template #actions>
+        <button v-if="!showHistory"
+          @click="showHistory = true"
+          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
+          title="返回会话历史"
+        >
+          📜
+        </button>
         <button
           @click="showConnConfig = true"
           class="px-2.5 py-1.5 rounded-full text-xs font-medium transition-all shrink-0 flex items-center gap-1"
@@ -766,8 +791,32 @@ function handlePipelineEvent(event) {
         <LogPanel />
       </div>
 
+      <!-- 会话历史列表（启动时显示） -->
+      <div v-if="showHistory" class="flex-1 overflow-y-auto p-4">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold text-ink">会话历史</h2>
+          <button @click="startNewConversation"
+            class="px-3 py-1.5 text-sm rounded-lg bg-accent text-white hover:opacity-90">
+            ✚ 新对话
+          </button>
+        </div>
+        <div v-if="conversationHistory.length === 0" class="text-center text-ink-soft py-12">
+          暂无会话。导入角色卡后开始写作。
+        </div>
+        <div v-for="conv in conversationHistory" :key="conv.id"
+          @click="openConversation(conv)"
+          class="p-3 rounded-lg border border-line hover:bg-accent-soft cursor-pointer mb-2 transition-colors">
+          <div class="text-sm text-ink font-medium truncate">
+            {{ conv.nodes?.[0]?.variants?.[0]?.content?.slice(0, 50) || '空会话' }}
+          </div>
+          <div class="text-xs text-ink-soft mt-1">
+            {{ conv.nodes?.length || 0 }} 条消息 · {{ new Date(conv.updated_at).toLocaleString() }}
+          </div>
+        </div>
+      </div>
+
       <!-- 对话消息列表 -->
-      <div ref="messagesContainer" class="flex-1 divide-y divide-line/50 overflow-y-auto">
+      <div v-else ref="messagesContainer" class="flex-1 divide-y divide-line/50 overflow-y-auto">
         <ChatMessage
           v-for="m in messages"
           :key="m.id"
