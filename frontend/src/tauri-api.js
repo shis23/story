@@ -583,7 +583,7 @@ export async function getCard(id) {
  */
 export async function createCampaign(cardId, name) {
   if (isTauri()) {
-    return await invoke('create_campaign', { card_id: cardId, name })
+    return await invoke('create_campaign', { cardId, name })
   }
   return { id: 'mock-campaign-1', card_id: cardId, name, instance_count: 1 }
 }
@@ -591,7 +591,7 @@ export async function createCampaign(cardId, name) {
 /** 列出 Campaign（可按 card_id 过滤） */
 export async function listCampaigns(cardId = null) {
   if (isTauri()) {
-    return await invoke('list_campaigns', { card_id: cardId })
+    return await invoke('list_campaigns', { cardId })
   }
   return []
 }
@@ -622,7 +622,7 @@ export async function getActiveCampaign() {
 /** 列出 Campaign 内的角色实例 */
 export async function listInstances(campaignId) {
   if (isTauri()) {
-    return await invoke('list_instances', { campaign_id: campaignId })
+    return await invoke('list_instances', { campaignId })
   }
   return []
 }
@@ -630,7 +630,7 @@ export async function listInstances(campaignId) {
 /** 获取单个角色实例详情 */
 export async function getInstance(campaignId, instanceId) {
   if (isTauri()) {
-    return await invoke('get_instance', { campaign_id: campaignId, instance_id: instanceId })
+    return await invoke('get_instance', { campaignId, instanceId })
   }
   return null
 }
@@ -638,7 +638,7 @@ export async function getInstance(campaignId, instanceId) {
 /** 查角色实例的当前变量值 */
 export async function getCharacterVariables(campaignId, instanceId) {
   if (isTauri()) {
-    return await invoke('get_character_variables', { campaign_id: campaignId, instance_id: instanceId })
+    return await invoke('get_character_variables', { campaignId, instanceId })
   }
   return []
 }
@@ -646,14 +646,14 @@ export async function getCharacterVariables(campaignId, instanceId) {
 /** 手动改角色实例变量值 */
 export async function setCharacterVariable(campaignId, instanceId, key, value) {
   if (isTauri()) {
-    return await invoke('set_character_variable', { campaign_id: campaignId, instance_id: instanceId, key, value })
+    return await invoke('set_character_variable', { campaignId, instanceId, key, value })
   }
 }
 
 /** 查 Campaign 全局变量 */
 export async function getCampaignVariables(campaignId) {
   if (isTauri()) {
-    return await invoke('get_campaign_variables', { campaign_id: campaignId })
+    return await invoke('get_campaign_variables', { campaignId })
   }
   return []
 }
@@ -661,14 +661,14 @@ export async function getCampaignVariables(campaignId) {
 /** 改 Campaign 全局变量 */
 export async function setCampaignVariable(campaignId, key, value) {
   if (isTauri()) {
-    return await invoke('set_campaign_variable', { campaign_id: campaignId, key, value })
+    return await invoke('set_campaign_variable', { campaignId, key, value })
   }
 }
 
 /** 临场角色升级为常驻 */
 export async function promoteTemporaryInstance(campaignId, instanceId) {
   if (isTauri()) {
-    return await invoke('promote_temporary_instance', { campaign_id: campaignId, instance_id: instanceId })
+    return await invoke('promote_temporary_instance', { campaignId, instanceId })
   }
 }
 
@@ -677,7 +677,7 @@ export async function promoteTemporaryInstance(campaignId, instanceId) {
 /** 列角色可见信息（不传 characterId 则返回整个 campaign 所有角色的知识） */
 export async function listCharacterKnowledge(campaignId, characterId = null) {
   if (isTauri()) {
-    return await invoke('list_character_knowledge', { campaign_id: campaignId, character_id: characterId })
+    return await invoke('list_character_knowledge', { campaignId, characterId })
   }
   return []
 }
@@ -685,7 +685,7 @@ export async function listCharacterKnowledge(campaignId, characterId = null) {
 /** 列叙事计划任务（可按状态筛：pending/active/likely_completed/completed/abandoned） */
 export async function listTasks(campaignId, statusFilter = null) {
   if (isTauri()) {
-    return await invoke('list_tasks', { campaign_id: campaignId, status_filter: statusFilter })
+    return await invoke('list_tasks', { campaignId, statusFilter })
   }
   return []
 }
@@ -699,7 +699,7 @@ export async function listTasks(campaignId, statusFilter = null) {
  */
 export async function createTask(campaignId, title, description, triggers) {
   if (isTauri()) {
-    return await invoke('create_task', { campaign_id: campaignId, title, description, triggers })
+    return await invoke('create_task', { campaignId, title, description, triggers })
   }
   return 'mock-task-id'
 }
@@ -707,21 +707,21 @@ export async function createTask(campaignId, title, description, triggers) {
 /** 标记任务完成 */
 export async function completeTask(taskId) {
   if (isTauri()) {
-    return await invoke('complete_task', { task_id: taskId })
+    return await invoke('complete_task', { taskId })
   }
 }
 
 /** 放弃任务 */
 export async function abandonTask(taskId) {
   if (isTauri()) {
-    return await invoke('abandon_task', { task_id: taskId })
+    return await invoke('abandon_task', { taskId })
   }
 }
 
 /** 列本轮剧情摘要（按 turn 升序） */
 export async function listRoundSummaries(campaignId) {
   if (isTauri()) {
-    return await invoke('list_round_summaries', { campaign_id: campaignId })
+    return await invoke('list_round_summaries', { campaignId })
   }
   return []
 }

@@ -437,6 +437,7 @@ async function handleDeleteVariant({ nodeId }) {
     await apiDeleteMessageFrom(currentConversationId.value, nodeId)
     // 重新拉取对话刷新（truncate 后该消息及之后都消失）
     const refreshed = await getConversation(currentConversationId.value)
+    const hadNodes = refreshed && refreshed.nodes && refreshed.nodes.length > 0
     if (refreshed) {
       applyConversation(refreshed)
       if (activeChar.value) {
@@ -444,6 +445,22 @@ async function handleDeleteVariant({ nodeId }) {
           if (m.role === 'assistant') m.role_label = activeChar.value.name
         })
       }
+    }
+    // 删除后若对话空了（成文是唯一 node，被 truncate 删光），回显角色卡开场白，
+    // 回到「导入后未写作」的初始状态（start_writing 不存开场白进后端对话）。
+    if (!hadNodes && activeCharDetail.value?.first_mes) {
+      messages.value = [{
+        id: 'm1',
+        role: 'assistant',
+        role_label: activeCharDetail.value.name || 'AI',
+        active_variant: 0,
+        variants: [{
+          id: 'v1',
+          content: activeCharDetail.value.first_mes,
+          status: 'final',
+          provenance: null,
+        }],
+      }]
     }
     // 清流水线状态（删除 = 回到这条之前的状态，上次写作的导演/子Agent/编剧输出作废）
     pipeline.state = 'idle'

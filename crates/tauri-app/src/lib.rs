@@ -532,8 +532,12 @@ fn delete_character(
             ctx.world_info = None;
         }
     }
-    // 级联删除：该卡的 MVU 翻译（source_character_id == 角色卡 id）
-    get_campaign_store().delete_mvu(&Id::from_str(id.clone()));
+    // 级联删除：该卡的 MVU 翻译 + CampaignStore 的 CharacterCard（含其所有 Campaign）
+    let cid = Id::from_str(id.clone());
+    get_campaign_store().delete_mvu(&cid);
+    if let Some(stored_card) = get_campaign_store().get_card_by_source(&cid) {
+        get_campaign_store().delete_card(&stored_card.card.id);
+    }
     Ok(())
 }
 
