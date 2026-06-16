@@ -9,11 +9,16 @@ use crate::world_info::WorldInfoEntry;
 // ─── Agent 角色 ──────────────────────────────────────────────────────────
 
 /// Agent 角色（对应设计 §3.2 的三个 Agent + Meta + 导入/后处理 Agent）
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// 序列化为**扁平字符串**：`Director` → `"Director"`，`Subagent("*")` → `"Subagent:*"`。
+/// 原因：`PromptProfile` 用 `HashMap<AgentRole, ...>`，JSON 的 map key 必须是字符串，
+/// serde 默认对带数据的 enum 变体（`Subagent(String)`）会生成 `"Subagent("*")"`
+/// 这种格式，反序列化时无法 round-trip（报 unknown variant）。扁平字符串可作 map key。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AgentRole {
     /// 导演：解析意图、查资料、分配任务
     Director,
-    /// 子 Agent：按角色表演（附带角色 ID）
+    /// 子 Agent：按角色表演（附带角色 ID，"*" 表示通配符，对所有子 Agent 生效）
     Subagent(String),
     /// 编剧：收集子产出、合并润色
     Editor,
@@ -25,6 +30,64 @@ pub enum AgentRole {
     Summarizer,
     /// 后处理：编剧后并行，三合一产出知识/变量/任务（AGENT_INTERFACES §6.4）
     PostProcessor,
+}
+
+// ─── AgentRole 自定义 serde：扁平字符串 ────────────────────────────────────
+//
+// 序列化：Director → "Director"；Subagent("*") → "Subagent:*"（':' 分隔，可 round-trip）
+// 反序列化：先按 ':' 切，前缀匹配变体名；无 ':' 的当 unit 变体。
+// 兼容旧格式：纯 "Subagent" 当 Subagent("")（理论上不会出现，旧数据是 "Subagent(\"*\")" 无法兼容，
+//   但 profiles.json 此前因本 bug 从未成功保存，无旧数据需迁移）。
+impl Serialize for AgentRole {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            AgentRole::Subagent(id) => serializer.serialize_str(&format!("Subagent:{id}")),
+            other => serializer.serialize_str(other.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentRole {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.split_once(':') {
+            // "Subagent:*" → Subagent("*")
+            Some((variant, payload)) if variant == "Subagent" => {
+                Ok(AgentRole::Subagent(payload.to_string()))
+            }
+            _ => AgentRole::from_str(&s).ok_or_else(|| {
+                serde::de::Error::custom(format!("unknown AgentRole variant: {s}"))
+            }),
+        }
+    }
+}
+
+impl AgentRole {
+    /// unit 变体的字符串名（不含 Subagent，它走 Subagent:id 格式）
+    fn as_str(&self) -> &'static str {
+        match self {
+            AgentRole::Director => "Director",
+            AgentRole::Editor => "Editor",
+            AgentRole::Meta => "Meta",
+            AgentRole::CharacterExtractor => "CharacterExtractor",
+            AgentRole::Summarizer => "Summarizer",
+            AgentRole::PostProcessor => "PostProcessor",
+            AgentRole::Subagent(_) => "Subagent", // 序列化走 Subagent:id，这里只作 fallback
+        }
+    }
+
+    /// 从字符串解析 unit 变体（Subagent 不在此列，它带 :payload）
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Director" => Some(AgentRole::Director),
+            "Editor" => Some(AgentRole::Editor),
+            "Meta" => Some(AgentRole::Meta),
+            "CharacterExtractor" => Some(AgentRole::CharacterExtractor),
+            "Summarizer" => Some(AgentRole::Summarizer),
+            "PostProcessor" => Some(AgentRole::PostProcessor),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for AgentRole {
@@ -247,6 +310,53 @@ pub enum PipelineEvent {
     StateChanged {
         state: PipelineState,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：Subagent("*") 必须能 serde round-trip（曾因元组变体导致 unknown variant）
+    #[test]
+    fn agent_role_subagent_wildcard_roundtrips() {
+        let role = AgentRole::Subagent("*".into());
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"Subagent:*\"");
+        let back: AgentRole = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, role);
+    }
+
+    /// 回归：unit 变体 round-trip
+    #[test]
+    fn agent_role_unit_variants_roundtrip() {
+        for role in [
+            AgentRole::Director,
+            AgentRole::Editor,
+            AgentRole::Meta,
+            AgentRole::CharacterExtractor,
+            AgentRole::Summarizer,
+            AgentRole::PostProcessor,
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            let back: AgentRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, role, "{role:?} round-trip failed");
+        }
+    }
+
+    /// 回归：作为 HashMap key 能 round-trip（PromptProfile 的实际触发场景）
+    #[test]
+    fn agent_role_as_hashmap_key_roundtrips() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(AgentRole::Director, 1);
+        map.insert(AgentRole::Subagent("*".into()), 2);
+        map.insert(AgentRole::Editor, 3);
+
+        let json = serde_json::to_string(&map).unwrap();
+        let back: std::collections::HashMap<AgentRole, i32> =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back.get(&AgentRole::Subagent("*".into())), Some(&2));
+    }
 }
 
 // ─── 写作会话（运行时状态）───────────────────────────────────────────────
