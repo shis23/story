@@ -548,7 +548,7 @@ export async function metaAcceptPatch(patchId) {
  */
 export async function extractCharacters(sourceCharacterId) {
   if (isTauri()) {
-    return await invoke('extract_characters', { source_character_id: sourceCharacterId })
+    return await invoke('extract_characters', { sourceCharacterId })
   }
   return { id: 'mock-card-1', name: 'Mock Card', source_character_id: sourceCharacterId, definition_count: 1, extracted: false }
 }

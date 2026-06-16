@@ -51,13 +51,22 @@ impl<'de> Deserialize<'de> for AgentRole {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.split_once(':') {
-            // "Subagent:*" → Subagent("*")
+            // 新格式："Subagent:*" → Subagent("*")
             Some((variant, payload)) if variant == "Subagent" => {
                 Ok(AgentRole::Subagent(payload.to_string()))
             }
-            _ => AgentRole::from_str(&s).ok_or_else(|| {
-                serde::de::Error::custom(format!("unknown AgentRole variant: {s}"))
-            }),
+            _ => {
+                // 兼容旧格式：serde 默认对元组变体生成的 "Subagent(\"*\")" / `Subagent("xxx")`
+                // 用正则太重，手写解析：匹配 Subagent("...")
+                if let Some(rest) = s.strip_prefix("Subagent(\"") {
+                    if let Some(id) = rest.strip_suffix("\")") {
+                        return Ok(AgentRole::Subagent(id.to_string()));
+                    }
+                }
+                AgentRole::from_str(&s).ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown AgentRole variant: {s}"))
+                })
+            }
         }
     }
 }
@@ -356,6 +365,20 @@ mod tests {
             serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(back.get(&AgentRole::Subagent("*".into())), Some(&2));
+    }
+
+    /// 兼容旧格式：serde 默认生成的 `Subagent("xxx")` 也应能反序列化
+    #[test]
+    fn agent_role_legacy_format_compat() {
+        // 旧格式 "Subagent(\"*\")"
+        let role: AgentRole = serde_json::from_str("\"Subagent(\\\"*\\\")\"").unwrap();
+        assert_eq!(role, AgentRole::Subagent("*".into()));
+        // 旧格式带具体 id
+        let role: AgentRole = serde_json::from_str("\"Subagent(\\\"林医生\\\")\"").unwrap();
+        assert_eq!(role, AgentRole::Subagent("林医生".into()));
+        // 新格式仍然正常
+        let role: AgentRole = serde_json::from_str("\"Subagent:*\"").unwrap();
+        assert_eq!(role, AgentRole::Subagent("*".into()));
     }
 }
 
