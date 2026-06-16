@@ -425,6 +425,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let runtime = AgentRuntime::new(mock, tool_ctx);
 

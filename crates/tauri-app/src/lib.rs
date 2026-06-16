@@ -18,6 +18,7 @@ use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::agent::PipelineEvent;
+use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_domain::llm::{LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode};
 use storyforge_domain::Id;
@@ -161,6 +162,8 @@ impl AppState {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         }));
 
         // 启动恢复：从 CharacterStore 把已导入的角色卡 + 世界书同步进 tool_ctx
@@ -1284,6 +1287,7 @@ async fn start_writing(
         modules: vec![],
         // 加载最近 20 条对话历史（带角色标签，注入导演/编剧上下文）
         recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20, None),
+        campaign_runtime: None,
     };
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
@@ -1388,6 +1392,14 @@ fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
 /// 历史 bug：旧实现绕过内存直接读磁盘，若 `set_active_campaign` 先改内存后写盘
 /// 但写盘失败（非原子），会用旧/空 campaign。
 fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
+    // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留
+    // （如果后续 early return，至少不会有上一轮的脏快照）
+    ctx.campaign_runtime = None;
+    {
+        let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        tool_guard.campaign_runtime = None;
+    }
+
     let active_id = {
         let guard = state.active_campaign.lock().unwrap_or_else(|p| p.into_inner());
         guard.clone().or_else(|| load_active_campaign(&get_app_data_dir()))
@@ -1409,6 +1421,41 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     ctx.turn = existing_turns + 1;
     // pending_tasks：该 Campaign 下所有任务（build_director_user_msg 内部按触发条件过滤）
     ctx.pending_tasks = store.list_tasks(&active_id);
+
+    // 阶段 2：组装 CampaignRuntimeContext 快照
+    // 加载 instances、card definitions、knowledge，构建纯 domain 快照
+    let instances = store.list_instances(&active_id);
+    let knowledge = store.list_knowledge(&active_id);
+
+    // 从 card 的 character_definitions 构建 definitions_by_id
+    let definitions_by_id: std::collections::HashMap<Id, storyforge_domain::character::CharacterDefinition> =
+        if let Some(stored_card) = store.get_card(&camp.card_id) {
+            stored_card
+                .card
+                .character_definitions
+                .into_iter()
+                .map(|def| (def.id.clone(), def))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    let runtime = Arc::new(CampaignRuntimeContext {
+        campaign: camp,
+        instances,
+        definitions_by_id,
+        knowledge,
+        turn: ctx.turn,
+    });
+
+    // 写入 WritingContext
+    ctx.campaign_runtime = Some(runtime.clone());
+
+    // 同步到 ToolContext（快照，非 store 引用）
+    {
+        let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        tool_guard.campaign_runtime = Some(runtime);
+    }
 }
 
 /// 默认变量键列表（喂给后处理 Agent，让它知道有哪些字段可更新）
@@ -1614,6 +1661,7 @@ async fn regenerate(
         modules: vec![],
         // 重 roll 时排除目标节点及其后的消息（避免导演看到被重 roll 的旧内容）
         recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20, Some(&node_id)),
+        campaign_runtime: None,
     };
     fill_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx, &app);
@@ -3750,5 +3798,163 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── Phase 2: CampaignRuntimeContext 快照接入验证 ────────────────────────
+
+    /// 初始状态下 tool_ctx 的 campaign_runtime 应为 None（未开 Campaign）
+    #[test]
+    fn test_campaign_runtime_none_by_default() {
+        let state = AppState::new();
+        let snap = state.snapshot_tool_ctx();
+        assert!(snap.campaign_runtime.is_none(), "初始状态 campaign_runtime 应为 None");
+    }
+
+    /// 写入 CampaignRuntimeContext 后，快照应能读到
+    /// （模拟 fill_campaign_context 的同步机制）
+    #[test]
+    fn test_campaign_runtime_synced_through_rwlock() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let state = AppState::new();
+
+        // 构造一个最小的 CampaignRuntimeContext
+        let campaign = Campaign::new(Id::from_str("test-card"), "test-run");
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        // 写入 tool_ctx（模拟 fill_campaign_context 的行为）
+        {
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            ctx.campaign_runtime = Some(runtime.clone());
+        }
+
+        // 快照应能读到
+        let snap = state.snapshot_tool_ctx();
+        assert!(snap.campaign_runtime.is_some(), "写入后 campaign_runtime 不应为 None");
+        let rt = snap.campaign_runtime.as_ref().unwrap();
+        assert_eq!(rt.turn, 1);
+        assert!(rt.instances.is_empty());
+        assert_eq!(rt.campaign.name, "test-run");
+    }
+
+    /// CampaignRuntimeContext 写入 instances/definitions/knowledge 后，
+    /// 通过快照可完整读回
+    #[test]
+    fn test_campaign_runtime_full_snapshot_readable() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+        use storyforge_domain::variables::default_character_variables;
+
+        let state = AppState::new();
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "full-test");
+
+        let def = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec!["is a surgeon".into()],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+
+        let instance = storyforge_domain::campaign::CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+
+        let knowledge = CharacterKnowledgeEntry::backstory(
+            campaign.id.clone(),
+            Id::from_str("inst-lin"),
+            "我是外科医生",
+        );
+
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def.id.clone(), def);
+
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![knowledge],
+            turn: 3,
+        });
+
+        {
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            ctx.campaign_runtime = Some(runtime);
+        }
+
+        let snap = state.snapshot_tool_ctx();
+        let rt = snap.campaign_runtime.as_ref().unwrap();
+        assert_eq!(rt.turn, 3);
+        assert_eq!(rt.instances.len(), 1);
+        assert_eq!(rt.instances[0].name, "Lin");
+        assert_eq!(rt.definitions_by_id.len(), 1);
+        assert!(rt.definitions_by_id.contains_key(&Id::from_str("def-lin")));
+        assert_eq!(rt.knowledge.len(), 1);
+        assert_eq!(rt.knowledge[0].knowledge_text, "我是外科医生");
+
+        // 验证 helper 可用
+        let inst = rt.find_instance_by_id_or_name("Lin").unwrap();
+        assert_eq!(rt.resolved_persona_for(inst), Some("calm surgeon"));
+        assert_eq!(rt.resolved_behavior_for(inst), Some("save first"));
+    }
+
+    /// 验证 fill_campaign_context 在无 active campaign 时会清空旧 runtime
+    /// （stale runtime cleanup：防止上一轮的脏快照残留）
+    #[test]
+    fn test_fill_campaign_context_clears_stale_runtime() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let state = AppState::new();
+
+        // 模拟上一轮残留：手动写入一个 runtime
+        let campaign = Campaign::new(Id::from_str("stale-card"), "stale-run");
+        let stale_runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            turn: 99,
+        });
+        {
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            ctx.campaign_runtime = Some(stale_runtime);
+        }
+
+        // 确认写入成功
+        let snap_before = state.snapshot_tool_ctx();
+        assert!(snap_before.campaign_runtime.is_some(), "预置 stale runtime 应成功");
+
+        // 调用 fill_campaign_context（无 active campaign → early return，但 runtime 应被清空）
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        fill_campaign_context(&mut ctx, &state);
+
+        // 验证：WritingContext 的 runtime 应为 None
+        assert!(ctx.campaign_runtime.is_none(), "无 active campaign 时 ctx.campaign_runtime 应被清空");
+
+        // 验证：tool_ctx 的 runtime 也应被清空
+        let snap_after = state.snapshot_tool_ctx();
+        assert!(snap_after.campaign_runtime.is_none(), "无 active campaign 时 tool_ctx.campaign_runtime 应被清空");
     }
 }

@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use storyforge_domain::Id;
+use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::Character;
 use storyforge_domain::llm::ToolSpec;
 use storyforge_domain::world_info::WorldInfoBook;
@@ -38,6 +40,12 @@ pub struct ToolContext {
     pub vector_store: Option<Arc<dyn storyforge_infra_vector::VectorStore>>,
     /// 已归档的远记忆摘要（get_recent_summary 工具用）
     pub archived_summaries: Vec<String>,
+    /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
+    pub campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
+    /// 当前子 Agent 绑定的 instance id（阶段 4 新增）。
+    /// 用于子 Agent get_character 工具：只返回自己的 instance 数据，不泄露其他角色。
+    /// 导演/编剧/无 Campaign 时为 None。
+    pub current_character_instance_id: Option<Id>,
 }
 
 /// 工具处理器（异步函数 trait）
@@ -145,14 +153,16 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
     );
 
     // get_character: 获取角色卡详情
+    // 阶段 3：有 campaign_runtime 时优先查 Campaign 实例（含 definition/persona/behavior）
+    // 无 campaign_runtime 或查不到实例时，退回旧的扁平 Character 逻辑
     registry.register(
         ToolSpec::function(
             "get_character",
-            "获取指定角色卡的详细信息（名称、描述、性格、场景等）。",
+            "获取指定角色的详细信息。可传角色名或 instance_id。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "角色名称"}
+                    "name": {"type": "string", "description": "角色名称或 instance_id"}
                 },
                 "required": ["name"]
             }),
@@ -164,6 +174,32 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ToolError::BadArgs("缺少 name 参数".into()))?;
 
+                // 阶段 3：优先从 campaign_runtime 查实例
+                if let Some(runtime) = &ctx.campaign_runtime {
+                    if let Some(inst) = runtime.find_instance_by_id_or_name(name) {
+                        let def = runtime.definition_for_instance(inst);
+                        let persona = runtime.resolved_persona_for(inst);
+                        let behavior = runtime.resolved_behavior_for(inst);
+                        let role_type = def.map(|d| format!("{:?}", d.role_type));
+                        let backstory = def.map(|d| d.base_backstory.clone());
+
+                        return Ok(serde_json::json!({
+                            "id": inst.id.as_str(),
+                            "instance_id": inst.id.as_str(),
+                            "name": inst.name,
+                            "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
+                            "role_type": role_type,
+                            "persona": persona,
+                            "behavior": behavior,
+                            "backstory": backstory,
+                            "variables": inst.variables,
+                            "is_temporary": inst.is_temporary,
+                            "source": "campaign_instance",
+                        }));
+                    }
+                }
+
+                // fallback：旧的扁平 Character 逻辑
                 let character = ctx
                     .characters
                     .iter()
@@ -177,6 +213,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     "scenario": character.scenario,
                     "first_mes": character.first_mes,
                     "system_prompt": character.system_prompt,
+                    "source": "flat_character",
                 }))
             })
         },
@@ -311,9 +348,11 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
 }
 
 /// 注册子 Agent 的工具（只读，受限）
-#[allow(dead_code)]
+///
+/// 阶段 4 改造：有 `current_character_instance_id` 时，get_character 只返回
+/// 当前子 Agent 绑定的 instance 数据（信息隔离），不泄露其他角色。
 pub fn register_subagent_tools(registry: &mut ToolRegistry) {
-    // get_character: 子 Agent 只能查自己（上层通过 ContextPackage 控制）
+    // get_character: 子 Agent 只能查自己绑定的 instance
     registry.register(
         ToolSpec::function(
             "get_character",
@@ -333,6 +372,42 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ToolError::BadArgs("缺少 name 参数".into()))?;
 
+                // 阶段 4：如果有 current_character_instance_id，只返回该 instance 的数据
+                if let Some(ref instance_id) = ctx.current_character_instance_id {
+                    if let Some(ref runtime) = ctx.campaign_runtime {
+                        // 只允许查自己的 instance
+                        if let Some(inst) = runtime.instances.iter().find(|i| &i.id == instance_id) {
+                            let def = runtime.definition_for_instance(inst);
+                            let persona = runtime.resolved_persona_for(inst);
+                            let behavior = runtime.resolved_behavior_for(inst);
+                            let role_type = def.map(|d| format!("{:?}", d.role_type));
+                            let backstory = def.map(|d| d.base_backstory.clone());
+
+                            // 验证 name 参数匹配（允许传自己的名字或 id）
+                            if inst.name.eq_ignore_ascii_case(name) || inst.id.as_str() == name {
+                                return Ok(serde_json::json!({
+                                    "id": inst.id.as_str(),
+                                    "instance_id": inst.id.as_str(),
+                                    "name": inst.name,
+                                    "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
+                                    "role_type": role_type,
+                                    "persona": persona,
+                                    "behavior": behavior,
+                                    "backstory": backstory,
+                                    "variables": inst.variables,
+                                    "is_temporary": inst.is_temporary,
+                                    "source": "campaign_instance",
+                                }));
+                            } else {
+                                return Err(ToolError::NotFound(
+                                    format!("子 Agent 只能查询自己的角色信息，不能查询 '{name}'")
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // fallback：旧的扁平 Character 逻辑（无 Campaign 时）
                 let character = ctx
                     .characters
                     .iter()
@@ -372,4 +447,277 @@ pub fn register_editor_tools(registry: &mut ToolRegistry) {
             })
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::Id;
+    use storyforge_domain::campaign::{Campaign, CharacterInstance};
+    use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
+    use storyforge_domain::variables::default_character_variables;
+
+    fn make_flat_character(name: &str) -> Arc<Character> {
+        Arc::new(Character {
+            id: Id::from_str(name),
+            name: name.into(),
+            description: format!("{name} desc"),
+            personality: format!("{name} personality"),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: "test".into(),
+            character_version: "1.0".into(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::json!({}),
+            renderable_assets: None,
+            source: storyforge_domain::Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::json!({}),
+        })
+    }
+
+    fn make_campaign_runtime_with_lin() -> Arc<CampaignRuntimeContext> {
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let def = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec!["is a surgeon".into()],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let instance = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def.id.clone(), def);
+
+        Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![],
+            turn: 1,
+        })
+    }
+
+    /// 阶段 3：有 campaign_runtime 时，get_character 返回 instance 数据
+    #[tokio::test]
+    async fn test_get_character_returns_campaign_instance() {
+        let runtime = make_campaign_runtime_with_lin();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+
+        let result = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Lin"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["source"], "campaign_instance");
+        assert_eq!(result["name"], "Lin");
+        assert_eq!(result["instance_id"], "inst-lin");
+        assert_eq!(result["definition_id"], "def-lin");
+        assert_eq!(result["persona"], "calm surgeon");
+        assert_eq!(result["behavior"], "save first");
+        assert_eq!(result["is_temporary"], false);
+        assert!(result["role_type"].as_str().unwrap().contains("Protagonist"));
+    }
+
+    /// 阶段 3：有 campaign_runtime 但查不到实例时，fallback 到扁平 Character
+    #[tokio::test]
+    async fn test_get_character_fallback_to_flat_when_not_in_campaign() {
+        let runtime = make_campaign_runtime_with_lin();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![make_flat_character("Seraphina")],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+
+        let result = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Seraphina"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["source"], "flat_character");
+        assert_eq!(result["name"], "Seraphina");
+    }
+
+    /// 阶段 3：无 campaign_runtime 时，get_character 走旧的扁平 Character 逻辑
+    #[tokio::test]
+    async fn test_get_character_uses_flat_character_when_no_runtime() {
+        let ctx = Arc::new(ToolContext {
+            characters: vec![make_flat_character("Seraphina")],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+
+        let result = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Seraphina"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["source"], "flat_character");
+        assert_eq!(result["name"], "Seraphina");
+        assert_eq!(result["personality"], "Seraphina personality");
+    }
+
+    /// 阶段 3：campaign_runtime 存在但实例和扁平角色都没有 → NotFound
+    #[tokio::test]
+    async fn test_get_character_not_found_when_no_match() {
+        let runtime = make_campaign_runtime_with_lin();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+
+        let result = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Ghost"}),
+                ctx,
+            )
+            .await;
+
+        assert!(result.is_err(), "不存在的角色应返回错误");
+    }
+
+    // ── 阶段 4：子 Agent get_character 信息隔离测试 ──
+
+    /// 阶段 4：子 Agent 有 current_character_instance_id 时，只能查自己的 instance
+    #[tokio::test]
+    async fn test_subagent_get_character_only_returns_own_instance() {
+        let runtime = make_campaign_runtime_with_lin();
+        // 添加第二个 instance
+        let mut cr = (*runtime).clone();
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let def_chen = CharacterDefinition {
+            id: Id::from_str("def-chen"),
+            card_id: Id::from_str("card-1"),
+            name: "Chen".into(),
+            persona_prompt: "strict cop".into(),
+            behavior_rules: "follow rules".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let inst_chen = CharacterInstance {
+            id: Id::from_str("inst-chen"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def_chen.id.clone()),
+            name: "Chen".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        cr.instances.push(inst_chen);
+        cr.definitions_by_id.insert(def_chen.id.clone(), def_chen);
+        let cr = Arc::new(cr);
+
+        // 子 Agent 绑定到 inst-lin
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(cr),
+            current_character_instance_id: Some(Id::from_str("inst-lin")),
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_subagent_tools(&mut registry);
+
+        // 查自己的名字 → 成功
+        let result = registry
+            .dispatch("get_character", serde_json::json!({"name": "Lin"}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["source"], "campaign_instance");
+        assert_eq!(result["name"], "Lin");
+
+        // 查别人的名字 → 错误（信息隔离）
+        let result = registry
+            .dispatch("get_character", serde_json::json!({"name": "Chen"}), ctx)
+            .await;
+        assert!(result.is_err(), "子 Agent 不应能查其他角色");
+    }
+
+    /// 阶段 4：子 Agent 无 current_character_instance_id 时退回旧路径
+    #[tokio::test]
+    async fn test_subagent_get_character_fallback_when_no_instance_id() {
+        let ctx = Arc::new(ToolContext {
+            characters: vec![make_flat_character("Seraphina")],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_subagent_tools(&mut registry);
+
+        let result = registry
+            .dispatch("get_character", serde_json::json!({"name": "Seraphina"}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(result["name"], "Seraphina");
+    }
 }

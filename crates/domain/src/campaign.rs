@@ -180,12 +180,26 @@ impl CharacterInstance {
         self.is_temporary = false;
     }
 
-    pub fn resolved_persona(&self) -> Option<&str> {
-        self.persona_override.as_deref()
+    /// Resolved persona: override 优先，fallback 到 definition.persona_prompt。
+    ///
+    /// Phase 1: definition 作为参数传入（而非存入 instance），保持 instance 轻量。
+    pub fn resolved_persona<'a>(
+        &'a self,
+        definition: Option<&'a crate::character::CharacterDefinition>,
+    ) -> Option<&'a str> {
+        self.persona_override
+            .as_deref()
+            .or_else(|| definition.map(|d| d.persona_prompt.as_str()))
     }
 
-    pub fn resolved_behavior(&self) -> Option<&str> {
-        self.behavior_override.as_deref()
+    /// Resolved behavior: override 优先，fallback 到 definition.behavior_rules。
+    pub fn resolved_behavior<'a>(
+        &'a self,
+        definition: Option<&'a crate::character::CharacterDefinition>,
+    ) -> Option<&'a str> {
+        self.behavior_override
+            .as_deref()
+            .or_else(|| definition.map(|d| d.behavior_rules.as_str()))
     }
 }
 
@@ -285,13 +299,14 @@ mod tests {
     fn test_character_instance_promote_and_override() {
         let mut instance = CharacterInstance::temporary(Id::new(), "Wang");
         assert!(instance.is_temporary);
-        assert!(instance.resolved_persona().is_none());
+        // 无 override、无 definition → None
+        assert!(instance.resolved_persona(None).is_none());
 
         instance.promote_to_permanent();
         assert!(!instance.is_temporary);
 
         instance.persona_override = Some("actually undercover".into());
-        assert_eq!(instance.resolved_persona(), Some("actually undercover"));
+        assert_eq!(instance.resolved_persona(None), Some("actually undercover"));
     }
 
     #[test]
@@ -304,6 +319,116 @@ mod tests {
         assert_eq!(
             instance.get_variable("fatigue"),
             Some(&serde_json::json!(30))
+        );
+    }
+
+    // --- Phase 1: resolved_persona / resolved_behavior definition fallback ---
+
+    fn make_definition() -> CharacterDefinition {
+        CharacterDefinition {
+            id: Id::from_str("def-1"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first, ask later".into(),
+            base_backstory: vec!["is a surgeon".into()],
+            group: Some("protagonist".into()),
+            role_type: crate::character::RoleType::Protagonist,
+            variable_schema: crate::variables::default_character_variables(),
+        }
+    }
+
+    #[test]
+    fn resolved_persona_override_takes_priority() {
+        let mut instance = CharacterInstance::temporary(Id::new(), "Lin");
+        instance.persona_override = Some("angry variant".into());
+        let def = make_definition();
+        assert_eq!(
+            instance.resolved_persona(Some(&def)),
+            Some("angry variant"),
+            "override must take priority over definition"
+        );
+    }
+
+    #[test]
+    fn resolved_persona_falls_back_to_definition() {
+        let instance = CharacterInstance::temporary(Id::new(), "Lin");
+        // instance has no persona_override
+        assert!(instance.persona_override.is_none());
+        let def = make_definition();
+        assert_eq!(
+            instance.resolved_persona(Some(&def)),
+            Some("calm surgeon"),
+            "must fall back to definition.persona_prompt"
+        );
+    }
+
+    #[test]
+    fn resolved_persona_none_when_nothing_available() {
+        let instance = CharacterInstance::temporary(Id::new(), "Ghost");
+        assert_eq!(
+            instance.resolved_persona(None),
+            None,
+            "no override and no definition → None"
+        );
+    }
+
+    #[test]
+    fn resolved_behavior_override_takes_priority() {
+        let mut instance = CharacterInstance::temporary(Id::new(), "Lin");
+        instance.behavior_override = Some("reckless".into());
+        let def = make_definition();
+        assert_eq!(
+            instance.resolved_behavior(Some(&def)),
+            Some("reckless"),
+            "override must take priority over definition"
+        );
+    }
+
+    #[test]
+    fn resolved_behavior_falls_back_to_definition() {
+        let instance = CharacterInstance::temporary(Id::new(), "Lin");
+        assert!(instance.behavior_override.is_none());
+        let def = make_definition();
+        assert_eq!(
+            instance.resolved_behavior(Some(&def)),
+            Some("save first, ask later"),
+            "must fall back to definition.behavior_rules"
+        );
+    }
+
+    #[test]
+    fn resolved_behavior_none_when_nothing_available() {
+        let instance = CharacterInstance::temporary(Id::new(), "Ghost");
+        assert_eq!(
+            instance.resolved_behavior(None),
+            None,
+            "no override and no definition → None"
+        );
+    }
+
+    #[test]
+    fn resolved_persona_empty_override_does_not_fallback() {
+        let mut instance = CharacterInstance::temporary(Id::new(), "Lin");
+        instance.persona_override = Some("".into());
+        let def = make_definition();
+        // Empty string is still "present" — override wins even if empty
+        assert_eq!(
+            instance.resolved_persona(Some(&def)),
+            Some(""),
+            "explicit empty override is still an override"
+        );
+    }
+
+    #[test]
+    fn resolved_methods_from_definition_instance() {
+        // An instance created from_definition has no overrides
+        let def = make_definition();
+        let instance = CharacterInstance::from_definition(Id::new(), &def);
+        assert_eq!(instance.resolved_persona(Some(&def)), Some("calm surgeon"));
+        assert_eq!(
+            instance.resolved_behavior(Some(&def)),
+            Some("save first, ask later")
         );
     }
 }

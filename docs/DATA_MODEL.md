@@ -98,7 +98,7 @@ RoundSummary
 - 写作链路内部使用 `CharacterInstance.id`。
 - `resolved_persona()` 和 `resolved_behavior()` 应优先使用 override，再 fallback 到 definition。
 
-当前代码中 `resolved_persona()` 只返回 override，这是 Campaign 统一计划的第一步修正点。
+~~当前代码中 `resolved_persona()` 只返回 override，这是 Campaign 统一计划的第一步修正点。~~ **阶段 1 已修复**：`resolved_persona(definition)` / `resolved_behavior(definition)` 接收 `Option<&CharacterDefinition>`，override 优先，无 override 时 fallback 到 definition。
 
 ## 知识、变量、任务
 

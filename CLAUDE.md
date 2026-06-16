@@ -59,10 +59,11 @@ Respect these facts unless the current task explicitly changes them:
   - `behavior_rules`
   - `base_backstory: Vec<String>`
   - `variable_schema`
-- Existing `resolved_persona` / `resolved_behavior` only return overrides.
-- `WritingContext` currently does not contain `CampaignRuntimeContext`.
-- `ToolContext` currently does not contain `CampaignRuntimeContext`.
-- `fill_campaign_context` currently does not load instances, definitions, or knowledge.
+- `resolved_persona(definition)` / `resolved_behavior(definition)` accept `Option<&CharacterDefinition>` and fall back to definition when override is absent.
+- `WritingContext` has `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` (阶段 2). None = no active Campaign, legacy path.
+- `ToolContext` has `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` (阶段 2). None = no active Campaign, legacy path.
+- `fill_campaign_context` loads instances, definitions, knowledge from CampaignStore and assembles `Arc<CampaignRuntimeContext>` (阶段 2).
+- `CampaignRuntimeContext` is a pure domain snapshot in `crates/domain/src/campaign_runtime.rs`. No store/lock/Tauri state.
 - `app-agent` must not depend on `tauri-app`.
 
 ## Execution Process

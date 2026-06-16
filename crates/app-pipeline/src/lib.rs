@@ -63,7 +63,11 @@ const DIRECTOR_SYSTEM_PROMPT: &str = r#"你是写作导演。用户给你写作�
 【输出格式（必须严格遵守）】
 调用 emit_plan 工具输出 Plan；如果无法调用工具，则直接输出如下 JSON（前后不要有任何其他文字、解释或 markdown 标记）：
 
-{"scene_brief": "本场戏的一句话场景简述", "subagent_tasks": [{"character_id": "出场角色名（必须来自可用角色列表）", "brief": "该角色在本场戏的任务简述"}]}
+{"scene_brief": "本场戏的一句话场景简述", "subagent_tasks": [{"character_id": "角色标识", "brief": "该角色在本场戏的任务简述"}]}
+
+character_id 规则：
+- 如果可用角色列表显示为「Campaign 实例」，character_id 必须使用括号内的 instance_id（如 inst-xxx），不要使用角色名。
+- 如果可用角色列表为普通角色名，character_id 使用角色名。
 
 示例（用户意图「写一场雨中告别」，可用角色 Seraphina）：
 {"scene_brief": "雨中告别，屋檐下两人对话", "subagent_tasks": [{"character_id": "Seraphina", "brief": "演出告别时的温柔与不舍"}]}"#;
@@ -116,6 +120,8 @@ pub struct WritingContext {
     pub modules: Vec<storyforge_domain::prompt_module::PromptModule>,
     /// 最近 N 轮对话（用户意图 + AI 成文，用于注入导演/子Agent/编剧上下文）
     pub recent_messages: Vec<String>,
+    /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
+    pub campaign_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
 }
 
 impl WritingContext {
@@ -136,6 +142,7 @@ impl WritingContext {
             profile: None,
             modules: vec![],
             recent_messages: vec![],
+            campaign_runtime: None,
         }
     }
 }
@@ -217,10 +224,11 @@ impl PipelineOrchestrator {
         // ─── 阶段 1：导演 Agent（流式）──────────────────────────────────
         let _ = event_tx.send(PipelineEvent::DirectorStarted);
 
-        // 前置校验：没有可用角色卡时，导演无法分配子 Agent，提前返回友好错误
+        // 前置校验：没有可用角色时，导演无法分配子 Agent，提前返回友好错误
         // （避免导演陷入"搜不到角色 → 输出空 Plan → drift recovery 死循环"）
-        if ctx.characters.is_empty() {
-            let msg = "没有可用的角色卡。请先导入一张角色卡（角色详情 → 导入），导演才能分配子 Agent 并规划本场戏。";
+        // 兼容 Campaign 主线：campaign_runtime.instances 非空也可通过
+        if !has_available_characters(ctx) {
+            let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
             let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
@@ -315,6 +323,7 @@ impl PipelineOrchestrator {
             SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
             cancel.clone(),
             event_tx.clone(),
+            ctx.campaign_runtime.clone(),
         )
         .await;
 
@@ -617,9 +626,9 @@ impl PipelineOrchestrator {
             });
             let _ = event_tx.send(PipelineEvent::DirectorStarted);
 
-            // 前置校验：没有可用角色卡时提前返回友好错误（同 start_writing）
-            if ctx.characters.is_empty() {
-                let msg = "没有可用的角色卡。请先导入一张角色卡再重 roll。";
+            // 前置校验：没有可用角色时提前返回友好错误（同 start_writing，兼容 Campaign）
+            if !has_available_characters(ctx) {
+                let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
                 let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
                 return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
             }
@@ -719,6 +728,7 @@ impl PipelineOrchestrator {
                 SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
                 cancel.clone(),
                 event_tx.clone(),
+                ctx.campaign_runtime.clone(),
             )
             .await;
 
@@ -1139,6 +1149,18 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
     out
 }
 
+/// 检查是否有可用角色（兼容 Campaign 和旧扁平 Character 两条路径）
+///
+/// Campaign 主线：campaign_runtime.instances 非空即可通过。
+/// 旧路径：ctx.characters 非空。
+fn has_available_characters(ctx: &WritingContext) -> bool {
+    if let Some(runtime) = &ctx.campaign_runtime {
+        !runtime.instances.is_empty()
+    } else {
+        !ctx.characters.is_empty()
+    }
+}
+
 /// 构造导演的易变末尾（§22 volatile tail）：意图 + 可用角色 + 任务/伏笔
 ///
 /// 这些内容每轮可能变化（意图变、任务触发变），压在 user tail 段，保证
@@ -1149,15 +1171,63 @@ fn build_director_tail(
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
-    let char_names = ctx
-        .characters
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect::<Vec<_>>()
-        .join("、");
+    // 阶段 3：有 campaign_runtime 时，从 instances 渲染可用角色（含 id/role/persona/variables）
+    // 无 campaign_runtime 时，退回旧逻辑（扁平 Character 名称列表）
+    let char_block = if let Some(runtime) = &ctx.campaign_runtime {
+        let mut lines = Vec::new();
+        for inst in &runtime.instances {
+            let def = runtime.definition_for_instance(inst);
+            let role_str = def
+                .map(|d| format!("{:?}", d.role_type))
+                .unwrap_or_else(|| "unknown".into());
+            let persona_summary = runtime
+                .resolved_persona_for(inst)
+                .map(|p| truncate_chars(p, 80))
+                .unwrap_or_else(|| "(无 persona)".into());
+            // 阶段 3：附加该 instance 的 variables 摘要（hp/state/location/mood）
+            let var_summary = format_instance_variables(&inst.variables);
+            let var_part = if var_summary.is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", var_summary)
+            };
+            lines.push(format!(
+                "- {}（{}）[{}] {}{}",
+                inst.name, inst.id.as_str(), role_str, persona_summary, var_part
+            ));
+        }
+        lines.join("\n")
+    } else {
+        let char_names = ctx
+            .characters
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        char_names
+    };
 
     let mut tail = VolatileTail::new();
-    tail = tail.push(format!("用户的写作意图：{intent}\n\n可用角色：{char_names}"));
+
+    // 阶段 3：campaign_runtime 时用结构化角色列表，否则用旧的纯名称
+    if ctx.campaign_runtime.is_some() {
+        tail = tail.push(format!(
+            "用户的写作意图：{intent}\n\n可用角色（Campaign 实例）：\n{char_block}"
+        ));
+    } else {
+        tail = tail.push(format!("用户的写作意图：{intent}\n\n可用角色：{char_block}"));
+    }
+
+    // 阶段 3：Campaign 全局变量注入（story_clock/weather/world_state 等，压在 volatile tail）
+    if let Some(runtime) = &ctx.campaign_runtime {
+        let vars_text = storyforge_domain::variables::render_variables_for_injection(
+            &runtime.campaign.variables,
+            &[],
+        );
+        if !vars_text.trim().is_empty() {
+            tail = tail.push(vars_text);
+        }
+    }
 
     // 任务/伏笔注入（P2，确定性查表，零 LLM）：只注入 Pending/Active 且触发满足的任务
     if !ctx.pending_tasks.is_empty() {
@@ -1175,6 +1245,34 @@ fn build_director_tail(
 
     tail = tail.push("请分析意图并输出 Plan。");
     tail
+}
+
+/// UTF-8 安全的字符截断（按 char 而非 byte 截断，避免中文 panic）
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// 格式化 instance 的 variables 为紧凑摘要（hp/state/location/mood）
+fn format_instance_variables(variables: &[storyforge_domain::variables::VariableValue]) -> String {
+    let keys = ["hp", "state", "location", "mood"];
+    let mut parts = Vec::new();
+    for key in &keys {
+        if let Some(v) = variables.iter().find(|v| v.key == *key) {
+            let val = match &v.value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            parts.push(format!("{}:{}", key, val));
+        }
+    }
+    parts.join("/")
 }
 
 /// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive + 蓝灯进 system）
@@ -1517,6 +1615,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
 
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
@@ -1611,6 +1711,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
 
@@ -1805,6 +1907,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
         (orch, conv_store)
@@ -2032,5 +2136,358 @@ mod tests {
             layout2.prefix_fingerprint(),
             "相同蓝灯 → system 指纹应一致（cache 友好）"
         );
+    }
+
+    // ─── 阶段 3：Director tail 消费 campaign_runtime 测试 ────────────────────
+
+    /// 无 campaign_runtime 时，build_director_tail 仍用旧的扁平角色名
+    #[test]
+    fn test_director_tail_uses_flat_characters_when_no_runtime() {
+        use storyforge_domain::message_layout::MessageLayout;
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_flat_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina"), mock_character("Lin")],
+            None,
+            conv_store.create(None).id,
+        );
+
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(tail_content.contains("Seraphina"), "应含角色名: {tail_content}");
+        assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
+        // 无 campaign_runtime 时不应出现 instance_id 格式
+        assert!(!tail_content.contains("Campaign 实例"), "不应出现 Campaign 实例标题: {tail_content}");
+    }
+
+    /// 有 campaign_runtime 时，build_director_tail 从 instances 渲染（含 id/role/persona）
+    #[test]
+    fn test_director_tail_uses_campaign_instances() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign::CharacterInstance;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::variables::default_character_variables;
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_camp_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let def = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon who saves lives".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec!["is a surgeon".into()],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let instance = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def.id.clone(), def);
+
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.campaign_runtime = Some(runtime);
+
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(tail_content.contains("Campaign 实例"), "应出现 Campaign 实例标题: {tail_content}");
+        assert!(tail_content.contains("inst-lin"), "应含 instance id: {tail_content}");
+        assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
+        assert!(tail_content.contains("Protagonist"), "应含 role_type: {tail_content}");
+        assert!(tail_content.contains("calm surgeon"), "应含 persona 摘要: {tail_content}");
+    }
+
+    // ─── 阶段 3 cleanup：has_available_characters + UTF-8 截断 + variables 注入 ──
+
+    /// has_available_characters：旧路径 - characters 非空 → true
+    #[test]
+    fn test_has_available_characters_flat_true() {
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            Id::new(),
+        );
+        assert!(has_available_characters(&ctx));
+    }
+
+    /// has_available_characters：旧路径 - characters 空 → false
+    #[test]
+    fn test_has_available_characters_flat_false() {
+        let ctx = WritingContext::legacy(vec![], None, Id::new());
+        assert!(!has_available_characters(&ctx));
+    }
+
+    /// has_available_characters：Campaign 路径 - instances 非空 → true（即使 characters 空）
+    #[test]
+    fn test_has_available_characters_campaign_true() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign::CharacterInstance;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test");
+        let instance = CharacterInstance {
+            id: Id::from_str("inst-1"),
+            campaign_id: campaign.id.clone(),
+            definition_id: None,
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_runtime = Some(runtime);
+        assert!(has_available_characters(&ctx), "Campaign instances 非空应通过");
+    }
+
+    /// has_available_characters：Campaign 路径 - instances 空 → false
+    #[test]
+    fn test_has_available_characters_campaign_empty() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test");
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_runtime = Some(runtime);
+        assert!(!has_available_characters(&ctx), "Campaign instances 空应不通过");
+    }
+
+    /// 中文 persona 超过 80 字符时 build_director_tail 不 panic
+    #[test]
+    fn test_director_tail_chinese_persona_no_panic() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign::CharacterInstance;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::variables::default_character_variables;
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_zh_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+
+        // 构造一个超过 80 个中文字符的 persona
+        let long_persona = "她是一位经验丰富的外科医生，性格冷静理性，面对紧急情况总能保持镇定。她相信医学的力量，但也深知生命的脆弱。在手术台上她是最可靠的搭档，在生活中她是最值得信赖的朋友。".to_string();
+        assert!(long_persona.chars().count() > 80, "测试前提：persona 超过 80 字符");
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test");
+        let def = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "林医生".into(),
+            persona_prompt: long_persona.clone(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let instance = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "林医生".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def.id.clone(), def);
+
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.campaign_runtime = Some(runtime);
+
+        // 这里之前会 panic（按字节截断中文），现在应安全
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        // 验证截断后包含省略号和部分中文
+        assert!(tail_content.contains("…"), "应有省略号截断: {tail_content}");
+        assert!(tail_content.contains("林医生"), "应含角色名: {tail_content}");
+        // 验证不会包含完整 persona（因为被截断了）
+        assert!(!tail_content.contains(&long_persona), "不应包含完整 persona");
+    }
+
+    /// 有 campaign_runtime 时 director tail 包含 instance variables
+    #[test]
+    fn test_director_tail_includes_instance_variables() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::campaign::CharacterInstance;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::variables::{default_character_variables, VariableValue};
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_vars_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test");
+        let def = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let instance = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![
+                VariableValue {
+                    key: "hp".into(),
+                    value: serde_json::json!(80),
+                    last_updated_turn: 1,
+                },
+                VariableValue {
+                    key: "state".into(),
+                    value: serde_json::json!("受伤"),
+                    last_updated_turn: 1,
+                },
+                VariableValue {
+                    key: "location".into(),
+                    value: serde_json::json!("急诊室"),
+                    last_updated_turn: 1,
+                },
+            ],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def.id.clone(), def);
+
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![],
+            turn: 1,
+        });
+
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.campaign_runtime = Some(runtime);
+
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(tail_content.contains("hp:80"), "应含 hp 变量: {tail_content}");
+        assert!(tail_content.contains("state:受伤"), "应含 state 变量: {tail_content}");
+        assert!(tail_content.contains("location:急诊室"), "应含 location 变量: {tail_content}");
+    }
+
+    /// 无 campaign_runtime 时旧扁平角色列表仍然可用
+    #[test]
+    fn test_director_tail_flat_characters_still_works() {
+        use storyforge_domain::message_layout::MessageLayout;
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_flat2_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina"), mock_character("Lin")],
+            None,
+            conv_store.create(None).id,
+        );
+
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(tail_content.contains("Seraphina"), "应含角色名: {tail_content}");
+        assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
+        assert!(!tail_content.contains("Campaign 实例"), "不应出现 Campaign 实例标题");
+        assert!(!tail_content.contains("hp:"), "旧路径不应含变量摘要");
+    }
+
+    /// truncate_chars 基本功能验证
+    #[test]
+    fn test_truncate_chars() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        assert_eq!(truncate_chars("hello world", 5), "hello…");
+        // 中文
+        assert_eq!(truncate_chars("你好世界", 3), "你好世…");
+        assert_eq!(truncate_chars("你好世界", 4), "你好世界");
+        assert_eq!(truncate_chars("你好世界", 10), "你好世界");
     }
 }

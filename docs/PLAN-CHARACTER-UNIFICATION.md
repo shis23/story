@@ -1,6 +1,6 @@
 # 计划：Campaign 角色体系统一
 
-> **状态**：待执行（2026-06-16 修订）
+> **状态**：阶段 4 已完成（2026-06-16），Subagent persona 来自 Campaign 实例 + 信息隔离已落地；阶段 5（Postprocess ID 归一）待执行
 > **关联文档**：`README.md`、`docs/ARCHITECTURE.md`、`docs/DATA_MODEL.md`、`docs/AGENT_INTERFACES.md`、`docs/ROADMAP.md`
 > **前置事实**：`MessageLayout` 三段分离已存在，子 Agent 已支持稳定 system 段和易变 tail 段。
 >
@@ -59,13 +59,13 @@
 | # | 位置 | 现状 | 断点描述 |
 |---|------|------|---------|
 | 1 | `domain/campaign.rs:127-144` `CharacterInstance::from_definition` | 只 copy id/name，persona/behavior 置 None | 实例不携带 definition 的 persona_prompt/behavior_rules |
-| 2 | `domain/campaign.rs:183-189` `resolved_persona`/`resolved_behavior` | 只返回 override，无 definition 回退 | 即使想读 persona 也读不到完整设定 |
-| 3 | `tauri-app/lib.rs:1275-1287` 构造 WritingContext | characters 来自 tool_snapshot（扁平） | Campaign 的 instances 没进 WritingContext |
-| 4 | `tauri-app/lib.rs:1390-1412` `fill_campaign_context` | 只填 campaign_id/turn/tasks/story_clock | **不调 list_instances，不填角色实例/变量** |
-| 5 | `app-pipeline/lib.rs:102` `WritingContext.characters` | `Vec<Arc<Character>>` 扁平 | 无 instance/definition 字段 |
-| 6 | `app-pipeline/lib.rs:1146-1178` `build_director_tail` | 只把 name 拼成字符串 | 导演看不到 persona/variables/role_type |
-| 7 | `app-agent/tools.rs:31-41` `ToolContext` | 只有 `characters: Vec<Arc<Character>>` | 无 instances/definitions 字段 |
-| 8 | `app-agent/tools.rs:148-183` 导演 `get_character` | 读扁平 Character 字段 | 返回的不是 instance/definition 设定 |
+| 2 | `domain/campaign.rs` `resolved_persona`/`resolved_behavior` | ~~只返回 override，无 definition 回退~~ **阶段 1 已修复**：接收 `Option<&CharacterDefinition>`，override 优先，definition 兜底 | ~~即使想读 persona 也读不到完整设定~~ |
+| 3 | `tauri-app/lib.rs:1275-1287` 构造 WritingContext + `app-pipeline` 入口校验 | characters 来自 tool_snapshot（扁平）；**阶段 3 已修复入口校验**：`has_available_characters` 兼容 Campaign instances | ~~Campaign 的 instances 没进 WritingContext~~（阶段 2 已通过 campaign_runtime 字段解决） |
+| 4 | `tauri-app/lib.rs::fill_campaign_context` | ~~只填 campaign_id/turn/tasks/story_clock~~ **阶段 2 已修复**：加载 instances/definitions/knowledge，组装 `CampaignRuntimeContext` 快照，开头清空旧 runtime 防 stale | ~~不调 list_instances，不填角色实例/变量~~ |
+| 5 | `app-pipeline/lib.rs:102` `WritingContext` | ~~`Vec<Arc<Character>>` 扁平~~ **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` | ~~无 instance/definition 字段~~ |
+| 6 | `app-pipeline/lib.rs:1146-1178` `build_director_tail` | ~~只把 name 拼成字符串~~ **阶段 3 已修复**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断；无时退回旧逻辑 | ~~导演看不到 persona/variables/role_type~~ |
+| 7 | `app-agent/tools.rs:31-41` `ToolContext` | ~~只有 `characters: Vec<Arc<Character>>`~~ **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` | ~~无 instances/definitions 字段~~ |
+| 8 | `app-agent/tools.rs:148-183` 导演 `get_character` | ~~读扁平 Character 字段~~ **阶段 3 第一小步已修复**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到 fallback 到旧扁平 Character | ~~返回的不是 instance/definition 设定~~ |
 | 9 | `tauri-app/lib.rs` 多处同步 tool_ctx（173/445/453/527/567/713） | 只同步扁平 Character | 开档/实例化时不同步 instances 进 tool_ctx |
 | 10 | `app-agent/runtime.rs:473-480` `spawn_subagents` 签名 | 无 CampaignStore/instances 入参 | 无法按 character_id 查 instance |
 | 11 | `app-agent/runtime.rs:491,497-507` 子 Agent 派发 | character_id 仅作字面量，persona 靠导演生成的 context_package | 不读 instance 的 persona/variables |
@@ -73,7 +73,7 @@
 | 13 | `tauri-app/lib.rs:1423-1495` `persist_postprocess_outcome` | 只更新 instance.variables | persona/behavior 无写回路径 |
 | 14 | `tauri-app/lib.rs:1482-1494` `present_chars` | `let _ = present_chars;` 丢弃 | 名义预留未用 |
 
-**最关键的三个断点**（改这几处能打通主链路）：**#4**（fill_campaign_context 不填实例）、**#7+#9**（ToolContext 无 instances 且开档不同步）、**#10+#11**（spawn_subagents 拿不到实例、persona 靠 LLM 生成）。
+**最关键的三个断点**（改这几处能打通主链路）：~~**#4**（fill_campaign_context 不填实例）~~ **阶段 2 已修复**、~~**#7+#9**（ToolContext 无 instances 且开档不同步）~~ **阶段 2 已修复**、**#10+#11**（spawn_subagents 拿不到实例、persona 靠 LLM 生成，阶段 4 改造）。
 
 ### 1.4 附带 bug（改造时顺手修）
 

@@ -53,9 +53,9 @@ docs/archive/2026-06-16-pre-rewrite/
 
 执行顺序优先按 `docs/PLAN-CAMPAIGN-MAINLINE.md`，其中前置核心步骤是：
 
-1. 修正 `CharacterInstance::resolved_persona()` / `resolved_behavior()` fallback。
-2. 新增 `CampaignRuntimeContext`。
-3. Tauri 层组装 runtime snapshot。
+1. ~~修正 `CharacterInstance::resolved_persona()` / `resolved_behavior()` fallback。~~ **阶段 1 已完成**（2026-06-16）。
+2. 新增 `CampaignRuntimeContext`。**阶段 2 已完成**（2026-06-16）：DTO + helpers 在 `domain/campaign_runtime.rs`，已接入 WritingContext/ToolContext，`fill_campaign_context` 已组装快照。
+3. ~~Tauri 层组装 runtime snapshot。~~ **阶段 2 已完成**。
 4. Director 的可用角色列表改为 instances。
 5. `Plan` 内部使用 `CharacterInstance.id`。
 6. Subagent 上下文改为 instance + definition + variables + visible knowledge。

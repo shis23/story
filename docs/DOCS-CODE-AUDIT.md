@@ -39,11 +39,16 @@
 - `frontend/src/App.vue::startWriting` 仍调用 `apiStartWriting(intent, activeChar.value?.id, ..., currentConversationId.value)`。
 - `frontend/src/tauri-api.js::startWriting` 调用 Tauri command `start_writing`。
 - `crates/tauri-app/src/lib.rs::start_writing` 存在，并从 `snapshot_tool_ctx()` 构造写作上下文。
-- `crates/tauri-app/src/lib.rs::fill_campaign_context` 只填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`。
-- `crates/app-pipeline/src/lib.rs::WritingContext` 当前字段仍是 `characters/world_info/conversation_id/campaign_id/turn/pending_tasks/story_clock/profile/modules/recent_messages`，没有 `CampaignRuntimeContext`。
-- `crates/app-pipeline/src/lib.rs::build_director_tail` 仍基于 `ctx.characters` 渲染可用角色，并注入 pending tasks。
-- `crates/app-agent/src/tools.rs::ToolContext` 当前只有 `characters/world_info/vector_store/archived_summaries`，没有 Campaign runtime。
-- `crates/app-agent/src/runtime.rs::spawn_subagents` 当前只接收 `Vec<SubagentTask>`、runtime、registry 等，不接收 Campaign 快照。
+- `crates/tauri-app/src/lib.rs::fill_campaign_context` 填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`，**阶段 2 已扩展**：开头先清空旧 runtime 防 stale，然后从 CampaignStore 加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。
+- `crates/app-pipeline/src/lib.rs::WritingContext` **阶段 2 已新增** `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。字段列表为 `characters/world_info/conversation_id/campaign_id/turn/pending_tasks/story_clock/profile/modules/recent_messages/campaign_runtime`。
+- `crates/app-pipeline/src/lib.rs::build_director_tail` **阶段 3 已改造**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断（`truncate_chars` 按 char 而非 byte）；无时退回旧的扁平 Character 名称列表。pending tasks 注入不变。
+- `crates/app-pipeline/src/lib.rs::has_available_characters` **阶段 3 新增**：兼容 Campaign（instances 非空）和旧路径（characters 非空），`start_writing` 和 `regenerate` 共用。错误文案兼容两条路径。
+- `crates/app-pipeline/src/lib.rs::DIRECTOR_SYSTEM_PROMPT` **阶段 3 已更新**：character_id 规则区分 Campaign 实例（用 instance_id）和旧路径（用角色名）。
+- `crates/app-agent/src/tools.rs::ToolContext` **阶段 2 已新增** `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。字段列表为 `characters/world_info/vector_store/archived_summaries/campaign_runtime`。
+- `crates/app-agent/src/tools.rs` 导演 `get_character` **阶段 3 已改造**：有 `campaign_runtime` 时优先查实例（返回 id/instance_id/definition_id/role_type/persona/behavior/variables/is_temporary），查不到 fallback 到旧扁平 Character。
+- `crates/app-agent/src/tools.rs` 子 Agent `get_character` **阶段 4 已改造**：有 `current_character_instance_id` 时只返回该 instance 的数据，不允许查其他角色（信息隔离）。无时退回旧扁平 Character。
+- `crates/app-agent/src/tools.rs::ToolContext` **阶段 4 新增** `current_character_instance_id: Option<Id>`：子 Agent 绑定的 instance id，用于 get_character 信息隔离。导演/编剧/无 Campaign 时为 None。
+- `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` 已写回 Campaign summary、knowledge、variables、tasks，并在知识/变量写入时使用 `store.list_instances(camp_id)` 做部分角色名到实例 ID 的匹配。
 
 因此 `ARCHITECTURE-AUDIT.md` 和 `PLAN-CAMPAIGN-MAINLINE.md` 的主线判断与代码一致。
@@ -63,7 +68,7 @@
 
 - `Campaign`、`CharacterInstance`、`CharacterDefinition`、`CharacterKnowledgeEntry`、变量模型、任务模型、`MvuTranslation` 均存在。
 - `CharacterInstance` 当前只有 `persona_override` 和 `behavior_override`，没有 `backstory_override` 或 `variable_schema` 字段。
-- `CharacterInstance::resolved_persona()` / `resolved_behavior()` 当前已存在，但只返回 override，不接收 `CharacterDefinition` fallback。
+- `CharacterInstance::resolved_persona(definition)` / `resolved_behavior(definition)` 接收 `Option<&CharacterDefinition>`，override 优先，无 override 时 fallback 到 definition（阶段 1 已实现）。
 - `CharacterDefinition` 持有 `persona_prompt`、`behavior_rules`、`base_backstory`、`variable_schema`。
 
 本次已修正 `PLAN-CAMPAIGN-MAINLINE.md`：`resolved_backstory` / `resolved_variable_schema` 不应被写成当前实例天然字段，建议作为 `CampaignRuntimeContext` helper，除非先显式新增 instance override 字段。
@@ -164,7 +169,7 @@
 
 以下名称是推荐目标，不是当前代码事实：
 
-- `CampaignRuntimeContext`
+- ~~`CampaignRuntimeContext`~~ **阶段 2 已完成**：`crates/domain/src/campaign_runtime.rs` 包含 DTO + helpers，已接入 `WritingContext`/`ToolContext`，`fill_campaign_context` 已组装快照。
 - `meta_explain_generation`
 - `meta_preview_mvu_schema`
 - `propose_apply_mvu_schema`

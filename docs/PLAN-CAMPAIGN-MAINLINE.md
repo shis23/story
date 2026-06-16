@@ -1,6 +1,6 @@
 # 计划：Campaign 写作主线
 
-> 状态：待执行
+> 状态：阶段 4 已完成（2026-06-16），Subagent persona 来自 Campaign 实例 + 信息隔离已落地；阶段 5（Postprocess ID 归一）待执行
 > 目标读者：可交给小模型按阶段执行
 > 关联：`docs/ARCHITECTURE-AUDIT.md`、`docs/PLAN-CHARACTER-UNIFICATION.md`
 
@@ -25,11 +25,15 @@
 ## 当前事实
 
 - `crates/tauri-app/src/lib.rs::start_writing` 用 `snapshot_tool_ctx()` 构造 `WritingContext.characters`。
-- `crates/tauri-app/src/lib.rs::fill_campaign_context` 只填 `campaign_id/turn/pending_tasks/story_clock`。
-- `crates/app-pipeline/src/lib.rs::WritingContext` 没有 Campaign runtime 字段。
-- `crates/app-pipeline/src/lib.rs::build_director_tail` 从 `ctx.characters` 渲染可用角色。
-- `crates/app-agent/src/tools.rs::ToolContext` 没有 Campaign runtime 字段。
-- `crates/app-agent/src/runtime.rs::spawn_subagents` 只接收 `SubagentTask` 和 runtime，不接收 Campaign 快照。
+- `crates/tauri-app/src/lib.rs::fill_campaign_context` 阶段 2 已扩展：加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。开头先清空旧 runtime 防止 stale。
+- `crates/app-pipeline/src/lib.rs::WritingContext` 阶段 2 已新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
+- `crates/app-pipeline/src/lib.rs::build_director_tail` **阶段 3 已改造**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断；无时退回旧逻辑。
+- `crates/app-pipeline/src/lib.rs::has_available_characters` **阶段 3 新增**：兼容 Campaign（instances 非空）和旧路径（characters 非空），`start_writing` 和 `regenerate` 共用。
+- `crates/app-pipeline/src/lib.rs::DIRECTOR_SYSTEM_PROMPT` **阶段 3 已更新**：character_id 规则区分 Campaign 实例（用 instance_id）和旧路径（用角色名）。
+- `crates/app-agent/src/tools.rs::ToolContext` 阶段 2 已新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
+- `crates/app-agent/src/tools.rs` 导演 `get_character` **阶段 3 已改造**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到时 fallback 到旧扁平 Character。
+- `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance，使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`），注册子 Agent 工具。未匹配时 fallback 到旧 context_package。无 campaign_runtime 时走旧路径。
+- `crates/app-agent/src/tools.rs::register_subagent_tools` **阶段 4 已改造**：子 Agent get_character 有 `current_character_instance_id` 时只返回自己的 instance 数据，不泄露其他角色。无时退回旧扁平 Character。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` 已能写 CampaignStore，但 ID 归一和 `present_chars` 使用不完整。
 
 ## 阶段 0：基线保护
@@ -170,42 +174,11 @@ cargo test --workspace
 - active Campaign 下 `ctx.campaign_runtime` 非空。
 - 无 active Campaign 下旧路径不变。
 
-## 阶段 4：Director 改用 CharacterInstance
+## ~~阶段 4：Director 改用 CharacterInstance~~ **（已合并到阶段 3，全部完成）**
 
-目标：Director 看到的是 Campaign 实例、变量和任务，不是扁平角色卡名称。
+原阶段 4 的 Director 改造（build_director_tail / get_character / prompt 更新）已在阶段 3 中一并完成，不再单独列为阶段。
 
-改动文件：
-
-- `crates/app-pipeline/src/lib.rs`
-- `crates/app-agent/src/tools.rs`
-
-任务：
-
-1. `build_director_tail`：
-   - 有 `campaign_runtime` 时，渲染 `instance_id + name + role_type + persona 摘要`。
-   - 注入 campaign variables 和 instance variables。
-   - 保留 pending tasks 注入。
-   - 无 `campaign_runtime` 时保持旧角色列表。
-2. `get_character` 工具：
-   - 参数说明改为“角色名或 instance_id”。
-   - 有 Campaign 快照时优先查 instance id，再查 name。
-   - 返回 persona、behavior、variables、role_type、source definition id。
-   - 查不到时 fallback 到扁平 `Character`。
-3. Director prompt 明确要求 Campaign 路径中 `subagent_tasks[].character_id` 填 `instance_id`。
-
-验证：
-
-```bash
-cargo test -p storyforge-app-agent
-cargo test -p storyforge-app-pipeline
-```
-
-验收：
-
-- Campaign 路径 plan 内部身份使用 instance id。
-- 旧路径仍可用角色名。
-
-## 阶段 5：Subagent 接收 Campaign 快照并做信息隔离
+## 阶段 4：Subagent 接收 Campaign 快照并做信息隔离
 
 目标：子 Agent persona 来自实例化数据，只看到自己该看到的知识和变量。
 
@@ -242,7 +215,7 @@ cargo test --workspace
 - 同名角色通过 instance id 不混淆。
 - reroll 仍能定位对应子 Agent。
 
-## 阶段 6：Postprocess ID 归一和写回收尾
+## 阶段 5：Postprocess ID 归一和写回收尾
 
 目标：写回 CampaignStore 前，把名字、旧 character id、instance id 统一成 `CharacterInstance.id`。
 
@@ -285,11 +258,27 @@ cargo test --workspace
 - 写作输出能改变下一轮 Campaign 上下文。
 - postprocess 不再靠裸名字盲写。
 
+## 阶段 6：临场角色（D34，单独阶段）（中）
+
+目标：用户在游玩中提到新角色时，导演能提出临场角色创建请求，由 Tauri 层落盘为 `CharacterInstance::temporary`，下一轮写作可见。
+
+改动文件：
+
+- `crates/app-agent/src/tools.rs`
+- `crates/tauri-app/src/lib.rs`
+- `crates/domain/src/campaign.rs`
+
+任务：
+
+1. 导演工具新增 `request_ad_hoc_character`：只返回结构化请求，不直接写 `CampaignStore`。
+2. Tauri 层落盘：`CharacterInstance::temporary` + override 写入。
+3. 升格路径：保留 `promote_to_permanent`。
+
 ## 回滚策略
 
 - 所有新字段必须是 `Option`，旧路径可直接 fallback。
 - 每阶段一个 commit。
-- 如果阶段 4/5 失败，可保留阶段 1/2 的 domain DTO，不影响旧写作。
+- 如果阶段 4/5 失败，可保留阶段 1/2/3 的 domain DTO 和 Director 改造，不影响旧写作。
 
 ## 禁止改动
 
@@ -298,3 +287,43 @@ cargo test --workspace
 - 禁止让 `app-agent` 或 `app-pipeline` 依赖 `tauri-app`。
 - 禁止一次性重写前端大布局。
 - 禁止把 ST 卡导入格式改成 StoryForge 专有格式。
+
+## 文件改动清单（按阶段）
+
+| 阶段 | 文件 | 改动 |
+|------|------|------|
+| 1 | `domain/campaign.rs` | +resolved_persona/behavior/backstory/variable_schema 方法 + 测试 |
+| 2 | `domain/campaign_runtime.rs` | +CampaignRuntimeContext 快照结构 + helper |
+| 2 | `app-agent/tools.rs` | ToolContext + `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` |
+| 2 | `app-pipeline/lib.rs` | WritingContext + `campaign_runtime`，legacy() 补 None，空角色校验兼容 Campaign |
+| 2 | `tauri-app/lib.rs` | fill_campaign_context 加载 campaign/instances/definitions/knowledge，组装快照并同步 tool_ctx |
+| 3 | `app-pipeline/lib.rs` | build_director_tail 开档走实例 + 变量注入；DIRECTOR_SYSTEM_PROMPT 更新 |
+| 3 | `app-agent/tools.rs` | get_character（导演）开档返回实例设定 |
+| 4 | `app-agent/runtime.rs` | spawn_subagents 签名加 CampaignRuntimeContext，persona 走实例，信息隔离 |
+| 4 | `app-pipeline/lib.rs` | spawn_subagents 调用点传 campaign_runtime |
+| 4 | `app-agent/tools.rs` | 子 Agent get_character 限制为当前 instance |
+| 5 | `tauri-app/lib.rs` | persist_postprocess_outcome 做 ID 归一化；present_chars 启用；delete_character id 修复 |
+| 5 | `app-agent/prompts/postprocess.rs` | 明确输出可用角色名，但后端会解析成 instance id |
+| 6 | `app-agent/tools.rs` | +request_ad_hoc_character 工具（只返回请求，不落盘） |
+| 6 | `tauri-app/lib.rs` | 接收 pending ad-hoc 请求并写入 CampaignStore |
+
+## 工作量评估
+
+| 阶段 | 工作量 | 风险 |
+|------|--------|------|
+| 1 domain 补全 | 小（1-2h） | 低 |
+| 2 上下文扩展 | 中（3-4h） | 低（机械加字段） |
+| 3 导演接通 | 中（3-4h） | 中（get_character 返回变了） |
+| 4 子 Agent + 信息隔离 | 中-大（5-6h） | 中高（spawn_subagents 重构） |
+| 5 后处理 ID 归一化 + 收尾 | 中（3-4h） | 中（身份解析要严格） |
+| 6 临场角色 | 中（3-4h） | 中（工具协议 + 落盘事务） |
+
+## 给执行 agent 的提示
+
+1. **先读 §1.3 的断点清单**，对照行号确认现状（代码可能已演进，行号会漂移，以符号名为准）。
+2. **每阶段做完先跑 `cargo test --workspace`** 再进下一阶段，不要攒着一起测。
+3. **向后兼容是硬约束**：所有新字段必须 Option/默认空，每个消费点必须写「开档/未开档」分支。
+4. **阶段 4 的信息隔离**是本计划的核心价值点，不要跳过。子 Agent 只看自己的 character_knowledge 是 StoryForge 区别于普通写作壳的关键。
+5. **变量注入（阶段 3）**用现成的 `render_variables_for_injection()`，压在 tail 末尾，不要进 system。
+6. **临场角色（阶段 6）**不要让 `ToolContext` 持有 `CampaignStore`；工具只产出请求，Tauri 层统一落盘。
+7. **所有落盘前都做身份归一化**：LLM 可以说角色名，存储层必须写 instance id。

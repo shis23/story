@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod campaign;
+pub mod campaign_runtime;
 pub mod character;
 pub mod character_knowledge;
 pub mod conversation;

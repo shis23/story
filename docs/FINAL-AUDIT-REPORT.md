@@ -17,7 +17,7 @@ StoryForge 的代码已经包含 Campaign、多角色、后处理、Meta Agent �
 - `CampaignStore` 位于 `crates/tauri-app/src/campaign_store.rs`。
 - `WritingContext` 位于 `crates/app-pipeline/src/lib.rs`，当前仍包含 `characters: Vec<Arc<Character>>`。
 - `ToolContext` 位于 `crates/app-agent/src/tools.rs`，当前工具仍按扁平角色卡查角色。
-- `CharacterInstance::resolved_persona()` 当前只返回 override。
+- ~~`CharacterInstance::resolved_persona()` 当前只返回 override。~~ **阶段 1 已修复**：`resolved_persona(definition)` / `resolved_behavior(definition)` 接收 `Option<&CharacterDefinition>`，override 优先，definition 兜底。
 - `start_writing` 和 `regenerate` 是主要流式写作入口。
 
 ## 主要风险

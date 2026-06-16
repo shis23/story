@@ -41,9 +41,10 @@ frontend/App.vue startWriting()
        WritingContext { characters, world_info, campaign_id: None, ... }
        fill_profile_context()
        fill_campaign_context()
-          只填 campaign_id / story_clock / turn / pending_tasks
+          阶段 2 已扩展：清空旧 runtime → 加载 campaign/instances/definitions/knowledge → 组装 CampaignRuntimeContext 快照 → 写入 ctx.campaign_runtime + tool_ctx
        PipelineOrchestrator::start_writing()
-          Director 看 ctx.characters + world_info + tasks
+          has_available_characters() 校验（兼容 Campaign instances 和旧 characters）
+          Director 看 ctx.characters + world_info + tasks（阶段 3 已改造：Director tail 消费 campaign_runtime，含 id/role/persona/variables）
           spawn_subagents(plan.subagent_tasks)
           Editor 合并
           run_postprocess()
@@ -53,11 +54,13 @@ frontend/App.vue startWriting()
 
 关键断点：
 
-- `crates/tauri-app/src/lib.rs::fill_campaign_context` 只加载 Campaign 标量字段和任务，没有加载 instances、definitions、knowledge、变量快照。
-- `crates/app-pipeline/src/lib.rs::WritingContext` 没有 Campaign runtime 快照字段。
-- `crates/app-pipeline/src/lib.rs::build_director_tail` 仍从 `ctx.characters` 渲染可用角色。
-- `crates/app-agent/src/tools.rs::ToolContext` 只有 `characters/world_info/vector_store/archived_summaries`。
-- `crates/app-agent/src/runtime.rs::spawn_subagents` 不接收 Campaign 上下文，子 Agent persona 依赖 Director 生成的 `context_package`。
+- `crates/tauri-app/src/lib.rs::fill_campaign_context` **阶段 2 已修复**：加载 instances、definitions、knowledge，组装 `CampaignRuntimeContext` 快照。开头先清空旧 runtime 防 stale。
+- `crates/app-pipeline/src/lib.rs::WritingContext` **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
+- `crates/app-pipeline/src/lib.rs::build_director_tail` **阶段 3 已改造**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断；无时退回旧逻辑。
+- `crates/app-pipeline/src/lib.rs::has_available_characters` **阶段 3 新增**：兼容 Campaign（instances 非空）和旧路径（characters 非空），`start_writing` 和 `regenerate` 共用。
+- `crates/app-agent/src/tools.rs::ToolContext` **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
+- `crates/app-agent/src/tools.rs` 导演 `get_character` **阶段 3 已改造**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到 fallback 到旧扁平 Character。
+- `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime`，按 character_id 匹配 instance，用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，每个子 Agent 有独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到 context_package。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` 会写 CampaignStore，但变量/知识 ID 归一仍偏弱，`present_chars` 未真正使用。
 
 ## 是否要大修

@@ -50,6 +50,7 @@ crates/infra-*
 - Director 工具 `get_character` 从扁平 `Character` 查角色。
 - `SubagentTask.character_id` 实际仍可能是角色名字符串。
 - Campaign 后处理已接入，但 Campaign 还不是写作输入的真相源。
+- **阶段 2 已完成**：`WritingContext`/`ToolContext` 已有 `campaign_runtime` 字段，`fill_campaign_context` 已组装快照，但 Director/Subagent 尚未消费它（阶段 3/4）。
 
 ## Campaign 目标流
 
@@ -123,7 +124,7 @@ Tauri
 ## 当前最高优先级债务
 
 1. Campaign 不是写作输入真相源。
-2. `CharacterInstance.resolved_persona()` 当前只返回 override，没有 fallback 到 `CharacterDefinition`。
+2. ~~`CharacterInstance.resolved_persona()` 当前只返回 override，没有 fallback 到 `CharacterDefinition`。~~ **阶段 1 已修复**：`resolved_persona(definition)` / `resolved_behavior(definition)` 已支持 override → definition → None 回退。
 3. Director/Subagent 仍围绕角色名和扁平 `Character` 运作。
 4. 后处理输出需要更严格的 ID 归一化和校验。
 5. Meta Agent 已有入口，但还没有成为 Campaign 数据健康和写作链路解释的核心维护层。

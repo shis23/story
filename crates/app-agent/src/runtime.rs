@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use storyforge_domain::agent::{AgentRole, ContextPackage, Performance, PipelineEvent, SubagentTask};
+use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolSpec};
 use storyforge_domain::message_layout::MessageLayout;
 use storyforge_infra_llm::LlmClient;
@@ -33,6 +34,16 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     pub fn new(llm: Arc<dyn LlmClient>, tool_ctx: Arc<ToolContext>) -> Self {
         Self { llm, tool_ctx }
+    }
+
+    /// 获取 LLM 客户端（供子 Agent 构造独立 runtime 时 clone）
+    pub fn llm(&self) -> Arc<dyn LlmClient> {
+        self.llm.clone()
+    }
+
+    /// 获取 ToolContext（供子 Agent 构造独立 runtime 时 clone 并修改）
+    pub fn tool_ctx(&self) -> Arc<ToolContext> {
+        self.tool_ctx.clone()
     }
 
     /// 运行工具循环（对应 TT 的 run_tool_loop）
@@ -477,6 +488,7 @@ pub async fn spawn_subagents(
     base_system_prompt: &str,
     cancel: watch::Receiver<bool>,
     event_tx: mpsc::UnboundedSender<PipelineEvent>,
+    campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
     // Semaphore 限流：同时最多 MAX_CONCURRENT_SUBAGENTS 个子 Agent 跑，超出排队
@@ -491,20 +503,92 @@ pub async fn spawn_subagents(
         let character_id = task.character_id.clone();
         let model = director_config.model.clone(); // 子 Agent 用导演的模型（M1 简化）
 
-        // §22 cache 友好布局：子 Agent persona + 常驻世界设定进 system（整个 campaign 稳定），
-        // 场景 + 相关世界设定 + 最近对话 + 任务进 tail（每场戏变）。
-        // 子 Agent 是对话隔离容器，不看全局历史，故无 history 段。
-        let stable_system = format!(
-            "{}\n\n你是角色 {}。\n\n{}",
-            base_system_prompt,
-            task.character_id,
-            format_context_stable(&task.context_package),
-        );
-        let volatile_text = format!(
-            "{}\n\n{}",
-            format_context_volatile(&task.context_package),
-            task.brief,
-        );
+        // ── 阶段 4：Campaign 模式下按 character_id 匹配 instance ──
+        let matched_instance = campaign_runtime.as_ref().and_then(|cr| {
+            cr.find_instance_by_id_or_name(&task.character_id)
+        });
+
+        // ── 构造 system prompt（稳定段）──
+        let (stable_system, instance_id_for_ctx) = if let (Some(cr), Some(inst)) = (&campaign_runtime, matched_instance) {
+            // Campaign 模式：用 resolved persona/behavior 替代 context_package.character_brief
+            let persona = cr.resolved_persona_for(inst).unwrap_or("");
+            let behavior = cr.resolved_behavior_for(inst).unwrap_or("");
+            let display_name = if inst.name.is_empty() { &task.character_id } else { &inst.name };
+
+            let mut sys = format!("{}\n\n你是角色 {}。\n\n", base_system_prompt, display_name);
+            if !persona.is_empty() {
+                sys.push_str(&format!("## 你的角色设定\n{}\n\n", persona));
+            }
+            if !behavior.is_empty() {
+                sys.push_str(&format!("## 行为准则\n{}\n\n", behavior));
+            }
+            // 常驻世界设定仍然从 context_package 取（蓝灯）
+            let constant_lore = &task.context_package.constant_lore;
+            if !constant_lore.is_empty() {
+                sys.push_str("## 世界设定（常驻）\n");
+                for lore in constant_lore {
+                    sys.push_str(&format!("- {}: {}\n", lore.keys.join(", "), lore.content));
+                }
+                sys.push('\n');
+            }
+            (sys, Some(inst.id.clone()))
+        } else {
+            // 旧路径：用 context_package.character_brief
+            if matched_instance.is_none() && campaign_runtime.is_some() {
+                warn!(target: "app-agent",
+                    "子 Agent character_id='{}' 在 Campaign 实例中未找到，退回 context_package",
+                    task.character_id);
+            }
+            let sys = format!(
+                "{}\n\n你是角色 {}。\n\n{}",
+                base_system_prompt,
+                task.character_id,
+                format_context_stable(&task.context_package),
+            );
+            (sys, None)
+        };
+
+        // ── 构造 tail（易变段）──
+        let volatile_text = if let (Some(cr), Some(inst)) = (&campaign_runtime, matched_instance) {
+            // Campaign 模式：注入该 instance 的 knowledge（信息隔离）+ variables + scene + task
+            let mut parts = Vec::new();
+
+            // 当前场景
+            if !task.context_package.scene_brief.is_empty() {
+                parts.push(format!("## 当前场景\n{}\n", task.context_package.scene_brief));
+            }
+
+            // 相关世界设定（绿灯检索）
+            if !task.context_package.relevant_lore.is_empty() {
+                parts.push("## 相关世界设定\n".into());
+                for lore in &task.context_package.relevant_lore {
+                    parts.push(format!("- {}: {}\n", lore.keys.join(", "), lore.content));
+                }
+            }
+
+            // 该 instance 的可见知识（信息隔离：只看自己的）
+            let knowledge = cr.knowledge_for_instance(inst);
+            if !knowledge.is_empty() {
+                parts.push("## 你所知道的信息\n".into());
+                for k in &knowledge {
+                    parts.push(format!("- {}\n", k.knowledge_text));
+                }
+            }
+
+            // 该 instance 的变量
+            if !inst.variables.is_empty() {
+                parts.push("## 你的状态\n".into());
+                for v in &inst.variables {
+                    parts.push(format!("- {}: {}\n", v.key, v.value));
+                }
+            }
+
+            parts.join("\n")
+        } else {
+            // 旧路径
+            format_context_volatile(&task.context_package)
+        };
+
         let layout = MessageLayout::build()
             .system(stable_system)
             .tail(|_| {
@@ -525,11 +609,22 @@ pub async fn spawn_subagents(
             system_prompt: String::new(), // layout 版不使用此字段（system 由 layout 提供）
             max_tool_rounds: 10, // 子 Agent 轮次少
             model,
-            tools: vec![], // 子 Agent 无工具（纯表演）
+            tools: vec![], // 子 Agent 工具由 registry 提供
         };
 
-        // 子 Agent 无工具（纯表演），不注册工具
-        let registry = ToolRegistry::new();
+        // 阶段 4：为每个子 Agent 构造独立的 ToolContext，绑定 current_character_instance_id
+        // 这样子 Agent 的 get_character 工具只能查自己的 instance，不泄露其他角色
+        let sub_tool_ctx = {
+            let base = runtime.tool_ctx();
+            let mut ctx = (*base).clone();
+            ctx.current_character_instance_id = instance_id_for_ctx.clone();
+            Arc::new(ctx)
+        };
+        let sub_runtime = Arc::new(AgentRuntime::new(runtime.llm(), sub_tool_ctx));
+
+        // 注册子 Agent 工具（get_character 限制为当前 instance）
+        let mut registry = ToolRegistry::new();
+        crate::tools::register_subagent_tools(&mut registry);
 
         let handle = tokio::spawn(async move {
             // 排队等许可（超出并发上限的任务在此 await，不会丢弃）
@@ -553,7 +648,7 @@ pub async fn spawn_subagents(
                 }
             });
 
-            let result = runtime
+            let result = sub_runtime
                 .run_tool_loop_with_layout(&config, layout, &registry, child_cancel, sub_tx, None)
                 .await;
             // sub_tx 在此 drop，转发任务收到 None 后自然结束
@@ -707,6 +802,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -733,6 +830,7 @@ mod tests {
             "你是角色",
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0, // 测试不消费事件
+            None, // 无 Campaign runtime（旧路径测试）
         )
         .await;
 
@@ -782,6 +880,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -800,6 +900,7 @@ mod tests {
             "你是角色",
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
+            None, // 无 Campaign runtime（旧路径测试）
         )
         .await;
 
@@ -848,6 +949,8 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
         });
         let runtime = AgentRuntime::new(llm, tool_ctx);
 
@@ -880,6 +983,239 @@ mod tests {
 
         // 流式 progress 应有 token 推送（mock 的 stream=false 也会走 forward_fut）
         drop(prog_rx); // 仅证明 channel 正常（mock 非流式时 progress 可能为空，不强制断言）
+    }
+
+    // ── 阶段 4：Campaign 模式 spawn_subagents 测试 ──
+
+    use storyforge_domain::campaign::{Campaign, CharacterInstance};
+    use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
+    use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+    use storyforge_domain::variables::default_character_variables;
+    use storyforge_domain::Id;
+
+    fn make_campaign_runtime() -> Arc<CampaignRuntimeContext> {
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let def_lin = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: Id::from_str("card-1"),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec!["is a surgeon".into()],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let def_chen = CharacterDefinition {
+            id: Id::from_str("def-chen"),
+            card_id: Id::from_str("card-1"),
+            name: "Chen".into(),
+            persona_prompt: "strict cop".into(),
+            behavior_rules: "follow rules".into(),
+            base_backstory: vec!["is a cop".into()],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        let inst_lin = CharacterInstance {
+            id: Id::from_str("inst-lin"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def_lin.id.clone()),
+            name: "Lin".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let inst_chen = CharacterInstance {
+            id: Id::from_str("inst-chen"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def_chen.id.clone()),
+            name: "Chen".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def_lin.id.clone(), def_lin);
+        definitions_by_id.insert(def_chen.id.clone(), def_chen);
+
+        let knowledge = vec![
+            CharacterKnowledgeEntry::witnessed(
+                campaign.id.clone(),
+                Id::from_str("inst-lin"),
+                "Lin saw the explosion",
+                1,
+            ),
+            CharacterKnowledgeEntry::witnessed(
+                campaign.id.clone(),
+                Id::from_str("inst-chen"),
+                "Chen was at the station",
+                1,
+            ),
+        ];
+
+        Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![inst_lin, inst_chen],
+            definitions_by_id,
+            knowledge,
+            turn: 1,
+        })
+    }
+
+    /// 阶段 4：有 campaign_runtime 时，spawn_subagents 按 instance_id 匹配
+    #[tokio::test]
+    async fn test_spawn_subagents_campaign_routes_by_instance_id() {
+        let cr = make_campaign_runtime();
+        let tasks = vec![SubagentTask {
+            character_id: "inst-lin".into(), // 用 instance_id
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "旧的角色简介（不应被使用）".into(),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+        }];
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(cr.clone()),
+            current_character_instance_id: None,
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            Some(cr),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "子 Agent 应成功: {:?}", results[0]);
+    }
+
+    /// 阶段 4：task.character_id 是角色名时，fallback 匹配 instance name
+    #[tokio::test]
+    async fn test_spawn_subagents_campaign_fallback_to_name() {
+        let cr = make_campaign_runtime();
+        let tasks = vec![SubagentTask {
+            character_id: "Lin".into(), // 用角色名而非 instance_id
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "旧的角色简介".into(),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+        }];
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(cr.clone()),
+            current_character_instance_id: None,
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            Some(cr),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "名称 fallback 应成功: {:?}", results[0]);
+    }
+
+    /// 阶段 4：无 campaign_runtime 时旧路径仍通过
+    #[tokio::test]
+    async fn test_spawn_subagents_no_campaign_runtime_old_path() {
+        let tasks = vec![SubagentTask {
+            character_id: "Seraphina".into(),
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "角色设定".into(),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+        }];
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "旧路径应成功: {:?}", results[0]);
     }
 }
 
