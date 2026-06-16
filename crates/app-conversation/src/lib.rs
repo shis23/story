@@ -428,9 +428,10 @@ impl ConversationStore {
     }
 
     /// 获取最近 N 条消息（带角色标签，用于注入 Agent 上下文）
-    pub fn recent_messages_with_role(&self, conv_id: &Id, n: usize) -> Vec<String> {
+    /// `before_node_id`：如果指定，只返回该节点之前的消息（重 roll 时排除目标消息）
+    pub fn recent_messages_with_role(&self, conv_id: &Id, n: usize, before_node_id: Option<&Id>) -> Vec<String> {
         self.get(conv_id)
-            .map(|c| c.recent_messages_with_role(n))
+            .map(|c| c.recent_messages_with_role(n, before_node_id))
             .unwrap_or_default()
     }
 

@@ -264,8 +264,15 @@ impl Conversation {
 
     /// 获取最近 N 条消息（带角色标签，用于注入 Agent 上下文）
     /// 格式："用户: {content}" 或 "AI: {content}"
-    pub fn recent_messages_with_role(&self, n: usize) -> Vec<String> {
-        self.nodes
+    /// `before_node_id`：如果指定，只返回该节点之前的消息（不含该节点及其后的）
+    pub fn recent_messages_with_role(&self, n: usize, before_node_id: Option<&Id>) -> Vec<String> {
+        // 确定截止位置
+        let end_idx = if let Some(bid) = before_node_id {
+            self.nodes.iter().position(|n| &n.id == bid).unwrap_or(self.nodes.len())
+        } else {
+            self.nodes.len()
+        };
+        self.nodes[..end_idx]
             .iter()
             .rev()
             .take(n)

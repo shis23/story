@@ -807,10 +807,10 @@ function handlePipelineEvent(event) {
           @click="openConversation(conv)"
           class="p-3 rounded-lg border border-line hover:bg-accent-soft cursor-pointer mb-2 transition-colors">
           <div class="text-sm text-ink font-medium truncate">
-            {{ conv.nodes?.[0]?.variants?.[0]?.content?.slice(0, 50) || '空会话' }}
+            会话 {{ conv.id?.slice(0, 8) }}
           </div>
           <div class="text-xs text-ink-soft mt-1">
-            {{ conv.nodes?.length || 0 }} 条消息 · {{ new Date(conv.updated_at).toLocaleString() }}
+            {{ conv.message_count || 0 }} 条消息 · {{ new Date(conv.updated_at).toLocaleString() }}
           </div>
         </div>
       </div>
