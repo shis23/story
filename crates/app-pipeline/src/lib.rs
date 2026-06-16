@@ -114,6 +114,8 @@ pub struct WritingContext {
     pub profile: Option<storyforge_domain::prompt_module::PromptProfile>,
     /// 可用模块列表（Profile 引用的模块定义）
     pub modules: Vec<storyforge_domain::prompt_module::PromptModule>,
+    /// 最近 N 轮对话（用户意图 + AI 成文，用于注入导演/子Agent/编剧上下文）
+    pub recent_messages: Vec<String>,
 }
 
 impl WritingContext {
@@ -133,6 +135,7 @@ impl WritingContext {
             story_clock: String::new(),
             profile: None,
             modules: vec![],
+            recent_messages: vec![],
         }
     }
 }
@@ -361,10 +364,17 @@ impl PipelineOrchestrator {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        let editor_user_msg = format!(
+        let mut editor_user_msg = format!(
             "场景：{}\n\n子 Agent 表演：\n\n{}\n\n请合并成连贯成文。",
             plan.scene_brief, performances_text
         );
+        // 注入最近对话历史（让编剧保持风格和情节连贯）
+        if !ctx.recent_messages.is_empty() {
+            editor_user_msg.push_str("\n\n【最近对话历史】\n");
+            for line in &ctx.recent_messages {
+                editor_user_msg.push_str(&format!("{line}\n"));
+            }
+        }
 
         // 流式：编剧的输出 token 实时转成 EditorProgress 事件
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -729,6 +739,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -772,6 +783,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -919,6 +931,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -946,6 +959,7 @@ impl PipelineOrchestrator {
         cancel: watch::Receiver<bool>,
         profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
         modules: &[storyforge_domain::prompt_module::PromptModule],
+        recent_messages: &[String],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -970,6 +984,13 @@ impl PipelineOrchestrator {
         );
         if let Some(h) = hint {
             editor_user_msg = inject_hint_into_editor(&editor_user_msg, h);
+        }
+        // 注入最近对话历史（让编剧保持风格和情节连贯）
+        if !recent_messages.is_empty() {
+            editor_user_msg.push_str("\n\n【最近对话历史】\n");
+            for line in recent_messages {
+                editor_user_msg.push_str(&format!("{line}\n"));
+            }
         }
 
         // 流式：编剧输出实时推 EditorProgress
@@ -1058,6 +1079,15 @@ fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
         .join("、");
 
     let mut msg = format!("用户的写作意图：{intent}\n\n可用角色：{char_names}\n\n");
+
+    // 注入最近对话历史（让导演知道故事讲到哪了）
+    if !ctx.recent_messages.is_empty() {
+        msg.push_str("【最近对话历史】\n");
+        for line in &ctx.recent_messages {
+            msg.push_str(&format!("{line}\n"));
+        }
+        msg.push('\n');
+    }
 
     // 蓝灯常驻条目注入（按 depth 升序，depth 相同按 order）
     if let Some(book) = &ctx.world_info {

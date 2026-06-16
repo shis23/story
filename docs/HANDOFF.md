@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（start_writing 支持复用已有对话 + 完整对话链路图）
+> 最后更新：2026-06-16（对话历史注入导演/编剧 + 会话历史选择界面）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
@@ -456,6 +456,54 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 前端 `startWriting` 调用时传 `currentConversationId.value`，实现多轮写作在同一个对话里累积。
 
 **同步新增**：`docs/CONVERSATION_FLOW.md` 完整对话链路图（基于代码实测，覆盖首次写作/重 roll/user重 roll/删除/对话树结构/事件流/取消机制）。
+
+### 3.14 对话历史注入 Agent 上下文 + 会话历史选择界面（2026-06-16）
+
+**问题**：导演/编剧看不到之前的对话历史。`build_director_user_msg` 只注入 intent + 角色名 + 蓝灯世界书 + 任务，编剧只看当前轮子 Agent 产出。多轮写作时导演说「上文为空」，编剧风格断裂。
+
+**修复**：
+
+| 改动 | 文件 | 内容 |
+|------|------|------|
+| WritingContext 加 recent_messages | `app-pipeline/lib.rs` | 新字段 `recent_messages: Vec<String>`，最近 20 条带角色标签的对话 |
+| Conversation 加 recent_messages_with_role | `domain/conversation.rs` | 返回 `"用户: {content}"` / `"AI: {content}"` 格式 |
+| ConversationStore 加 recent_messages_with_role | `app-conversation/lib.rs` | 透传到 Conversation |
+| tauri-app 加载历史 | `tauri-app/lib.rs` | start_writing 和 regenerate 构造 ctx 时调 `conv_store.recent_messages_with_role` |
+| 导演注入历史 | `app-pipeline/lib.rs` | `build_director_user_msg` 末尾加「最近对话历史」段落 |
+| 编剧注入历史 | `app-pipeline/lib.rs` | start_writing 和 `run_editor_and_commit` 的 editor_user_msg 加「最近对话历史」段落 |
+| 会话历史选择界面 | `frontend/App.vue` | 启动时显示会话历史列表，点进一个会话加载上下文，📜 按钮返回历史 |
+
+**注入的上下文（每个 Agent 看到的）**：
+
+```
+导演 user message：
+  用户的写作意图：{intent}
+  可用角色：{names}
+  最近对话历史：           ← 新增
+    用户: 第1条消息
+    AI: 第2条消息
+    ...
+  世界设定（常驻）：...
+  叙事任务/伏笔：...
+
+子 Agent system prompt：
+  你是角色 {name}。
+  你的角色设定：...
+  当前场景：...
+  世界设定（常驻）：...
+  相关世界设定：...
+  最近对话：...           ← ContextPackage.recent_window（由导演 Plan 填充）
+
+编剧 user message：
+  场景：{scene_brief}
+  子 Agent 表演：...
+  最近对话历史：           ← 新增
+    用户: 第1条消息
+    AI: 第2条消息
+    ...
+```
+
+**测试**：242 全绿。
 
 ---
 

@@ -427,6 +427,13 @@ impl ConversationStore {
             .unwrap_or_default()
     }
 
+    /// 获取最近 N 条消息（带角色标签，用于注入 Agent 上下文）
+    pub fn recent_messages_with_role(&self, conv_id: &Id, n: usize) -> Vec<String> {
+        self.get(conv_id)
+            .map(|c| c.recent_messages_with_role(n))
+            .unwrap_or_default()
+    }
+
     // ─── 部分重 roll（对应设计 §3.7.3）─────────────────────────────────────
 
     /// 验证部分重 roll 的合法性

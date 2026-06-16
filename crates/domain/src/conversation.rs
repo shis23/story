@@ -262,6 +262,28 @@ impl Conversation {
             .collect()
     }
 
+    /// 获取最近 N 条消息（带角色标签，用于注入 Agent 上下文）
+    /// 格式："用户: {content}" 或 "AI: {content}"
+    pub fn recent_messages_with_role(&self, n: usize) -> Vec<String> {
+        self.nodes
+            .iter()
+            .rev()
+            .take(n)
+            .rev()
+            .filter_map(|node| {
+                let v = node.active()?;
+                if v.status == VariantStatus::Discarded {
+                    return None;
+                }
+                let role_label = match v.role {
+                    Role::User => "用户",
+                    Role::Assistant => "AI",
+                };
+                Some(format!("{}: {}", role_label, v.content))
+            })
+            .collect()
+    }
+
     /// 查找节点
     pub fn find_node(&self, id: &Id) -> Option<&MessageNode> {
         self.nodes.iter().find(|n| &n.id == id)

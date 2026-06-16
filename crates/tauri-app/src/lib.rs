@@ -1272,6 +1272,8 @@ async fn start_writing(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
+        // 加载最近 20 条对话历史（带角色标签，注入导演/编剧上下文）
+        recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20),
     };
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
@@ -1600,6 +1602,7 @@ async fn regenerate(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
+        recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20),
     };
     fill_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx, &app);
