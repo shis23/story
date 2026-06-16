@@ -308,6 +308,7 @@ Layer 3: Vector Index（向量检索池）→ 余弦相似度搜索
 | [INTENT.md](docs/INTENT.md) | 需求决策文档（48 条决策，D1-D48） |
 | [TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md) | 技术方案设计（23 章，含角色隔离/Campaign/MVU/叙事计划/cache 布局/变量体系） |
 | [HANDOFF.md](docs/HANDOFF.md) | 项目交接文档（当前状态 + 后续计划 + 决策时点） |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构总览（crate 依赖图 + 一次写作调用链 + 持久化总表 + 命令映射，与代码同步） |
 | [AGENT_INTERFACES.md](docs/AGENT_INTERFACES.md) | Agent 接口索引（所有 prompt/上下文/输出解析位置，改 prompt 只看这文件） |
 
 ---
