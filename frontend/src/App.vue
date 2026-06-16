@@ -101,6 +101,27 @@ function setupConsoleForwarding() {
   }
 }
 
+// 把后端 Conversation 应用到前端 messages（设 id + 转换 nodes → messages）
+// 复用点：恢复对话、重 roll 后刷新（单一事实源，避免前端臆测 variant 数组）
+function applyConversation(conv) {
+  currentConversationId.value = conv.id
+  messages.value = conv.nodes.map((node) => {
+    const active = node.variants[node.active_variant] || node.variants[0]
+    return {
+      id: node.id,
+      role: active.role === 'User' ? 'user' : 'assistant',
+      role_label: active.role === 'User' ? '我' : 'AI',
+      active_variant: node.active_variant,
+      variants: node.variants.map((v) => ({
+        id: v.id,
+        content: v.content,
+        status: v.status === 'Final' ? 'final' : v.status === 'Discarded' ? 'discarded' : 'draft',
+        provenance: v.provenance,
+      })),
+    }
+  })
+}
+
 // 从后端恢复最近一次对话
 async function loadRecentConversation() {
   try {
@@ -114,24 +135,7 @@ async function loadRecentConversation() {
     const conv = await getConversation(latest.id)
     if (!conv || !conv.nodes || conv.nodes.length === 0) return
 
-    currentConversationId.value = conv.id
-
-    // 转换 Conversation.nodes → 前端 messages 格式
-    messages.value = conv.nodes.map((node) => {
-      const active = node.variants[node.active_variant] || node.variants[0]
-      return {
-        id: node.id,
-        role: active.role === 'User' ? 'user' : 'assistant',
-        role_label: active.role === 'User' ? '我' : 'AI',
-        active_variant: node.active_variant,
-        variants: node.variants.map((v) => ({
-          id: v.id,
-          content: v.content,
-          status: v.status === 'Final' ? 'final' : v.status === 'Discarded' ? 'discarded' : 'draft',
-          provenance: v.provenance,
-        })),
-      }
-    })
+    applyConversation(conv)
 
     // 如果有关联角色卡，加载角色信息
     if (conv.character_id) {
@@ -359,17 +363,23 @@ async function handleReroll({ messageId, kind, hint }) {
       hint,
     }, (event) => handlePipelineEvent(event))
 
-    // 新 variant 加到同消息
-    msg.variants.push({
-      id: `v-${Date.now()}`,
-      content: result,
-      status: 'final',
-      provenance: null, // 后端已存，前端简化不回填
-    })
-    msg.active_variant = msg.variants.length - 1
+    // 重拉对话刷新 UI（单一事实源）：后端按「最后一条 → 原地替换 / 中间 → 开分支」
+    // 落库，前端不臆测 variant 数组，直接以后端真实状态为准。
+    const refreshed = await getConversation(currentConversationId.value)
+    if (refreshed) {
+      applyConversation(refreshed)
+      // 保留用户当前的角色卡 role_label 覆盖（applyConversation 重置为 AI/我）
+      if (activeChar.value) {
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = activeChar.value.name
+        })
+      }
+    }
 
     pipeline.state = 'done'
     pipeline.stateLabel = '重 roll 完成'
+    // result 含最终成文，但 UI 已由 refreshed 驱动，无需单独消费
+    void result
   } catch (err) {
     pipeline.state = 'error'
     pipeline.stateLabel = `重 roll 失败: ${err}`
