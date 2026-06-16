@@ -274,7 +274,7 @@ async function handleSelectChar(char) {
 }
 
 // 写作流水线（调用后端真实流水线，通过 Channel 接收事件）
-async function startWriting(intent) {
+async function startWriting(intent, skipLocalPush = false) {
   // 写作前检查：必须有活跃连接
   if (!activeConnection.value) {
     showConnConfig.value = true
@@ -292,21 +292,24 @@ async function startWriting(intent) {
   // 清除编剧流式消息占位（上次写作残留）
   messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
-  // 本地 push user 消息（即时反馈）
-  const userMsgId = `user-${Date.now()}`
-  messages.value.push({
-    id: userMsgId,
-    role: 'user',
-    role_label: '我',
-    active_variant: 0,
-    variants: [{
-      id: `uv-${Date.now()}`,
-      content: intent,
-      status: 'final',
-      provenance: null,
-    }],
-  })
-  scrollToBottom()
+  // 本地 push user 消息（即时反馈，skipLocalPush 时跳过——用户消息已在列表中）
+  let userMsgId = null
+  if (!skipLocalPush) {
+    userMsgId = `user-${Date.now()}`
+    messages.value.push({
+      id: userMsgId,
+      role: 'user',
+      role_label: '我',
+      active_variant: 0,
+      variants: [{
+        id: `uv-${Date.now()}`,
+        content: intent,
+        status: 'final',
+        provenance: null,
+      }],
+    })
+    scrollToBottom()
+  }
 
   try {
     const result = await apiStartWriting(intent, activeChar.value?.id, (event) => {
@@ -342,7 +345,9 @@ async function startWriting(intent) {
     scrollToBottom()
   } catch (err) {
     // 失败回滚：移除已 push 的用户消息（无对应 AI 回复，残留会误导重试）
-    messages.value = messages.value.filter((m) => m.id !== userMsgId)
+    if (userMsgId) {
+      messages.value = messages.value.filter((m) => m.id !== userMsgId)
+    }
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'error'
     pipeline.stateLabel = `失败: ${err}`
@@ -495,9 +500,9 @@ async function handleRerollUser({ messageId }) {
   // 找到紧随其后的 AI 消息（regenerate 的目标）
   const userIndex = messages.value.findIndex((m) => m.id === messageId)
   const aiMsg = messages.value.slice(userIndex + 1).find((m) => m.role === 'assistant')
-  // 没有 AI 消息（已被删除）→ 直接用 intent 重新写作
+  // 没有 AI 消息（已被删除）→ 直接用 intent 重新写作（跳过本地 push，u3 已在列表中）
   if (!aiMsg) {
-    await startWriting(intent)
+    await startWriting(intent, true)
     return
   }
 
