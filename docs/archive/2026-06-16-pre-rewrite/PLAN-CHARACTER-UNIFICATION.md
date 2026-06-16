@@ -1,10 +1,11 @@
-# 计划：Campaign 角色体系统一
+# 计划：角色体系接通（CharacterStore / CampaignStore 双数据源统一 + 临场角色 + 信息隔离）
 
-> **状态**：待执行（2026-06-16 修订）
-> **关联文档**：`README.md`、`docs/ARCHITECTURE.md`、`docs/DATA_MODEL.md`、`docs/AGENT_INTERFACES.md`、`docs/ROADMAP.md`
-> **前置事实**：`MessageLayout` 三段分离已存在，子 Agent 已支持稳定 system 段和易变 tail 段。
+> **状态**：待执行（2026-06-16 起草）
+> **作者**：基于代码实测（两个 Explore agent 交叉验证）
+> **对应设计**：TECHNICAL_DESIGN.md §16-§23，INTENT.md D30-D48
+> **前置**：§22 cache 友好消息布局已落地（commit `0256075`，MessageLayout 三段分离 + 子 Agent persona 进 system 稳定段已就绪）
 >
-> **本计划是 StoryForge 当前最大的架构债**。它阻塞的不只是「双数据源一致性」，还阻塞：变量注入、子 Agent 信息隔离、临场角色、Campaign 角色实例化在写作时真正生效。
+> **本计划是 StoryForge 当前最大的架构债**。README / ARCHITECTURE / HANDOFF 三处文档均点名此问题。它阻塞的不只是「双数据源一致性」，还阻塞：变量注入 Agent（§23.5）、子 Agent 信息隔离（§16 character_knowledge 注入）、临场角色（§17.3 D34）、Campaign 角色实例化在写作时真正生效。
 
 ---
 
@@ -85,9 +86,9 @@
 
 ### 2.1 核心原则
 
-1. **Campaign 优先，扁平兜底**：开 Campaign 时，写作流水线读 `CharacterInstance` + `CharacterDefinition`；未开时退回扁平 `Character`（旧用法不变）。
+1. **Campaign 优先，扁平兜底**：开 Campaign 时，写作流水线读 `CharacterInstance` + `CharacterDefinition`；未开时退回扁平 `Character`（M0 老用法不变）。
 2. **不废弃 CharacterStore**（本阶段）：废弃是更大动作，留后续。本阶段让两套数据在「开档写作」这条路径上达成一致——CampaignStore 成为写作时的角色权威源，CharacterStore 退为「导入 + 未开档写作」的源。
-3. **变量/知识/临场角色一并打通**：既然要动这条链路，把变量注入、子 Agent 信息隔离、临场角色一起落地，避免反复改同一段代码。
+3. **变量/知识/临场角色一并打通**：既然要动这条链路，把 §23.5（变量注入）、§16（子 Agent 信息隔离）、§17.3（临场角色）一起落地，避免反复改同一段代码。
 
 ### 2.2 目标数据流
 
@@ -133,10 +134,9 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
      - 有 `persona_override` → 返回 override
      - 否则有 definition → 返回 `definition.persona_prompt`
      - 都没有 → None
-   - 同理 `resolved_behavior`
-   - `resolved_backstory` 不应按 `Option<&str>` 设计：当前 `CharacterDefinition.base_backstory` 是 `Vec<String>`，实例也没有 backstory override。优先做成 runtime/helper 函数读取 `definition.base_backstory`，除非先显式新增 instance backstory override 字段。
+   - 同理 `resolved_behavior`、`resolved_backstory`（backstory 来自 definition.base_backstory）
    - **不改 `from_definition`**（实例仍只存 override，保持轻量；回退在读取时做）
-   - `resolved_variable_schema` 优先做成 runtime/helper 函数读取 `definition.variable_schema`；实例只保存当前变量值，不保存 schema。
+   - 加方法 `resolved_variable_schema<'a>(&'a self, definition: Option<&'a CharacterDefinition>) -> &[VariableField]`（schema 来自 definition）
 
 2. **测试**（domain/campaign.rs）：
    - override 优先于 definition
@@ -208,7 +208,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 1. **`app-pipeline/lib.rs`** `build_director_tail`（断点 #6）：
    - 开档时，「可用角色」列表改为从 `ctx.campaign_runtime.instances` 取，显示 `instance_id + name + role_type + persona 摘要`（如「inst_xxx：林医生（主角团，外科医生）」）
    - 未开档时退回扁平 Character name（现状）
-   - 新增变量注入：调用 `render_variables_for_injection()` 渲染当前变量，压在 tail 末尾（在任务块之后）。变量来源：开档时从 instances + campaign.variables 聚合；未开档时跳过。
+   - 新增变量注入（§23.5）：调用 `render_variables_for_injection()` 渲染当前变量，压在 tail 末尾（在任务块之后）。变量来源：开档时从 instances + campaign.variables 聚合；未开档时跳过。
 
 2. **`app-agent/tools.rs`** 导演 `get_character`（断点 #8）：
    - handler 改造：先看 `ctx.campaign_runtime` 是否有该 instance id / name 的实例
@@ -223,7 +223,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 4. **测试**：
    - 开档时导演 tail 含 persona 摘要 + 变量状态
    - get_character 开档返回 instance 设定，未开档返回扁平
-   - 变量注入在 tail 末尾，不进入稳定 system 段。
+   - 变量注入在 tail 末尾（不在 system，§22 cache 友好）
 
 **验证**：`cargo test -p storyforge-app-pipeline -p storyforge-app-agent` 全绿。
 
@@ -231,7 +231,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 
 ### 阶段 4：子 Agent 接通角色实例 + 信息隔离（中-大）
 
-**目标**：子 Agent 的 persona 来自实例化数据（而非导演 LLM 瞎编），且只看自己该看的知识，消除断点 #10、#11、#12，落地信息隔离。
+**目标**：子 Agent 的 persona 来自实例化数据（而非导演 LLM 瞎编），且只看自己该看的知识，消除断点 #10、#11、#12，落地 §16 信息隔离。
 
 **改动**：
 
@@ -242,7 +242,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
      - 找不到 → 退回 context_package（现状），并记录 warn，方便后续临场角色阶段处理
    - 子 Agent 的变量注入：从 instance.variables 取该角色的变量，压 tail
 
-2. **信息隔离（断点 #12 相关）**：
+2. **信息隔离（§16，断点 #12 相关）**：
    - 子 Agent tail 的「最近对话」段，改为「该角色可见的知识」：从 `campaign_runtime.knowledge` 按 **instance id** 过滤（`character_knowledge.character_id == instance.id`），只注入该角色 witnessed/told_by_other/inferred/backstory 的条目
    - 未开档（无 knowledge）→ 退回 `context_package.recent_window`（现状）
 
@@ -327,9 +327,9 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 | **向后兼容**（未开档的老用法不能破） | 🟡 中 | 所有新字段 `Option`/默认 None；每个消费点都写「开档走新路径，未开档退回扁平」分支 |
 | **app-agent 反向依赖 tauri-app store** | 🔴 高 | 禁止把 `CampaignStore` 放进 `ToolContext`；只传 `CampaignRuntimeContext` 快照 |
 | **角色身份混乱（name vs instance_id）** | 🔴 高 | 开 Campaign 写作内部统一 instance id；角色名只用于展示和 LLM 输入输出，落盘前解析 |
-| **子 Agent 信息隔离测试难**（要造 character_knowledge 数据） | 🟡 中 | 阶段 4 测试造完整的 mock Campaign runtime snapshot + knowledge 条目 |
+| **子 Agent 信息隔离测试难**（要造 character_knowledge 数据） | 🟡 中 | 阶段 4 测试造完整的 mock CampaignStore + knowledge 条目 |
 | **导演 LLM 行为变化**（get_character 返回内容变了，可能影响 Plan 质量） | 🟡 中 | 阶段 3 完成后用真实 LLM 跑一次开档写作，对比 Plan 质量 |
-| **变量注入导致 tail 变长** | 🟢 低 | 变量压 tail 末尾，只影响最后一段；监控 tail 长度 |
+| **变量注入导致 tail 变长**（§22 cache） | 🟢 低 | 变量压 tail 末尾，只影响最后一段；监控 tail 长度 |
 
 ---
 
@@ -337,7 +337,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 
 ### 5.1 每阶段验证
 - `cargo build --workspace` 通过
-- `cargo test --workspace` 全绿
+- `cargo test --workspace` 全绿（当前基线 250 测试）
 - 该阶段新增测试覆盖核心断点
 
 ### 5.2 全部完成后的端到端验证
@@ -400,7 +400,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 1. **先读 §1.3 的断点清单**，对照行号确认现状（代码可能已演进，行号会漂移，以符号名为准）。
 2. **每阶段做完先跑 `cargo test --workspace`** 再进下一阶段，不要攒着一起测。
 3. **向后兼容是硬约束**：所有新字段必须 Option/默认空，所有消费点必须写「开档/未开档」分支。未开档的老用法（`WritingContext::legacy()`）行为必须不变。
-4. **阶段 4 的信息隔离**是本计划的核心价值点，不要跳过。子 Agent 只看自己的 character_knowledge 是 StoryForge 区别于普通写作壳的关键。
+4. **阶段 4 的信息隔离**是本计划的核心价值点（§16 D30-D31），不要偷懒跳过——子 Agent 只看自己的 character_knowledge 是「赛博跑团卡」区别于普通写作的关键。
 5. **变量注入（阶段 3）**用现成的 `render_variables_for_injection()`（`domain/variables.rs`），压在 tail 末尾（任务块之后），不要进 system。
 6. **临场角色（阶段 6）**不要让 `ToolContext` 持有 `CampaignStore`；工具只产出请求，Tauri 层统一落盘。
 7. **所有落盘前都做身份归一化**：LLM 可以说角色名，存储层必须写 instance id。
@@ -408,4 +408,4 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 
 ---
 
-*起草：2026-06-16。代码演进后请重新核对行号，以符号名和当前源码为准。*
+*起草：2026-06-16。基于代码实测（两个 Explore agent 交叉验证 14 处断点）。代码演进后请重新核对行号。*
