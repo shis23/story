@@ -164,7 +164,7 @@ storyforge/
   - `abandon_task` — 放弃任务
   - `list_round_summaries` — 列本轮剧情摘要（按 campaign_id 筛选，按 turn 升序，200-500 字/条）
 
-**测试**：215/215 单元测试通过（含 P3 新增：domain mvu_translation 11 个 + app-meta 24 个含 MVU 五合一/ST 分类/Meta 对话 + infra-plugin-host mvu_runtime 2 个 + tauri-app campaign_store MVU 持久化 2 个）。
+**测试**：234/234 单元测试通过（含 P3 新增：domain mvu_translation 11 个 + app-meta 24 个含 MVU 五合一/ST 分类/Meta 对话 + infra-plugin-host mvu_runtime 2 个 + tauri-app campaign_store MVU 持久化 2 个；代码审查修复新增 19 个：domain prompt_module 通配符匹配 2 + story_task trigger 优先级 1 + infra-util 4 + llm_parse 10 + infra-regex ReDoS 1 + postprocess parse_succeeded 1）。
 
 ### 2.3 前端（M0 完成）
 
@@ -342,6 +342,29 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 | 工具协议 | 原生 + XML/JSON 降级双路 | 兼容不支持 function calling 的模型 |
 | LLM | DeepSeek（OpenAI 兼容） | key 用 mock+真client 双路，不硬编码 |
 | 会话 | 持久化到文件 | data/conversations/<id>.json |
+
+### 3.9 代码审查修复（2026-06-16）
+
+对全项目（13 crate + 前端）做系统性代码审查，分 8 个 commit 修复，测试 215 → 234 全绿。
+
+**修复的确定性 bug（Commit 1）**：
+- `now_iso()` 误返回 Unix 秒数（应为 rfc3339），与 RoundSummary.created_at 格式统一
+- 子 Agent 模块匹配失效：`applicable_roles.contains` 精确比较导致 `Subagent("*")` 通配符永远匹配不上具体角色，字数控制等模块不生效
+- Meta Agent 双重 propose patch：handler 内与外层各 propose 一次，产生重复 patch
+- 前端 switch-variant 按钮完全无效：ChatMessage emit 的事件 App.vue 未监听
+- `meta_chat` 传不存在的 conversation_id 静默创建空对话丢失历史
+- `meta_accept_patch` 把合并世界书写回最后一张卡 + is_global 硬编码 false
+
+**系统改进（Commit 2-7）**：
+- 新增 `app-agent/llm_parse.rs`，消除 4 处重复的 match_braces / 5 层兜底解析
+- 新增 `infra-util` crate：统一持久化原子性（`.tmp→rename`，替换 10 处裸写 + 4 处重复样板）+ 锁中毒恢复（88 处 `.lock().unwrap()` → `unwrap_or_else(|p| p.into_inner())`）
+- 中危逻辑：postprocess 加 `parse_succeeded` 区分解析 miss、story_task trigger 优先级、流式 usage（stream_options.include_usage）、SSE `data:` 空格兼容、LogBuffer 改 VecDeque、向量维度 warn、conversation invalidate
+- 高危防护：流式 90s 空闲超时、PNG 导入 100MB/64MB 上限、正则 1MB 输入上限（ReDoS）、EmbedConfig/LlmConnection Debug 打码 api_key
+- 删死代码：MemoryRecaller.llm 字段、mvu_import 空 tool_ctx；CharacterSummary 加 From 去重
+
+**前端（Commit 8）**：写作失败回滚用户消息、7 处空 catch 加 console.error、MetaPanel v-for 用稳定 id、CampaignPanel 不再启发式强转数字。
+
+**新增 crate**：`infra-util`（workspace 第 14 个成员）。
 
 ---
 
