@@ -274,27 +274,57 @@ async function startWriting(intent) {
   // 清除编剧流式消息占位（上次写作残留）
   messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
+  // 本地 push user 消息（即时反馈）
+  const userMsgId = `user-${Date.now()}`
+  messages.value.push({
+    id: userMsgId,
+    role: 'user',
+    role_label: '我',
+    active_variant: 0,
+    variants: [{
+      id: `uv-${Date.now()}`,
+      content: intent,
+      status: 'final',
+      provenance: null,
+    }],
+  })
+  scrollToBottom()
+
   try {
     const result = await apiStartWriting(intent, activeChar.value?.id, (event) => {
       handlePipelineEvent(event)
     })
 
-    // 后端已存开场白 + user 意图 + AI 成文，从后端拉取完整对话（单一事实源）
+    // 后端返回 { text, conversation_id, node_id }
+    // 后端已存开场白+user意图+AI成文（重启恢复用），这里只追加 AI 成文到本地消息
+    const text = result.text
+    const msgId = result.node_id || `msg-${Date.now()}`
     currentConversationId.value = result.conversation_id
-    const conv = await getConversation(result.conversation_id)
-    if (conv) applyConversation(conv)
-    // 清除编剧流式占位（applyConversation 已包含最终成文）
-    messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
+
+    // 替换编剧流式占位，或追加新消息
+    const streamingIdx = messages.value.findIndex((m) => m.id === 'editor-streaming')
+    if (streamingIdx >= 0) {
+      messages.value.splice(streamingIdx, 1)
+    }
+    messages.value.push({
+      id: msgId,
+      role: 'assistant',
+      role_label: activeChar.value?.name || 'AI',
+      active_variant: 0,
+      variants: [{
+        id: `v-${Date.now()}`,
+        content: text,
+        status: 'final',
+        provenance: null,
+      }],
+    })
 
     pipeline.state = 'done'
     pipeline.stateLabel = '已完成'
     scrollToBottom()
   } catch (err) {
-    // 失败：从后端拉取当前对话状态（可能只剩开场白 + user 意图）
-    if (currentConversationId.value) {
-      const conv = await getConversation(currentConversationId.value).catch(() => null)
-      if (conv) applyConversation(conv)
-    }
+    // 失败回滚：移除已 push 的用户消息（无对应 AI 回复，残留会误导重试）
+    messages.value = messages.value.filter((m) => m.id !== userMsgId)
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'error'
     pipeline.stateLabel = `失败: ${err}`
