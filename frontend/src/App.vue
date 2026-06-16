@@ -271,54 +271,31 @@ async function startWriting(intent) {
   pipeline.director = { status: 'idle', detail: '', output: '' }
   pipeline.subagents = []
   pipeline.editor = { status: 'idle', detail: '', output: '' }
-
-  // 先把用户意图加入消息列表（聊天界面应该看到自己发了什么）
-  const userMsgId = `user-${Date.now()}`
-  messages.value.push({
-    id: userMsgId,
-    role: 'user',
-    role_label: '我',
-    active_variant: 0,
-    variants: [{
-      id: `uv-${Date.now()}`,
-      content: intent,
-      status: 'final',
-      provenance: null,
-    }],
-  })
-  scrollToBottom()
+  // 清除编剧流式消息占位（上次写作残留）
+  messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
   try {
     const result = await apiStartWriting(intent, activeChar.value?.id, (event) => {
-      // 实时更新流水线状态
       handlePipelineEvent(event)
     })
 
-    // 后端返回 { text, conversation_id, node_id }
-    const text = result.text
-    const msgId = result.node_id || `msg-${Date.now()}`
+    // 后端已存开场白 + user 意图 + AI 成文，从后端拉取完整对话（单一事实源）
     currentConversationId.value = result.conversation_id
-
-    // 流水线完成，将成文追加到消息列表
-    messages.value.push({
-      id: msgId,
-      role: 'assistant',
-      role_label: activeChar.value?.name || 'AI',
-      active_variant: 0,
-      variants: [{
-        id: `v-${Date.now()}`,
-        content: text,
-        status: 'final',
-        provenance: null,
-      }],
-    })
+    const conv = await getConversation(result.conversation_id)
+    if (conv) applyConversation(conv)
+    // 清除编剧流式占位（applyConversation 已包含最终成文）
+    messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
     pipeline.state = 'done'
     pipeline.stateLabel = '已完成'
     scrollToBottom()
   } catch (err) {
-    // 失败回滚：移除已 push 的用户消息（无对应 AI 回复，残留会误导重试）
-    messages.value = messages.value.filter((m) => m.id !== userMsgId)
+    // 失败：从后端拉取当前对话状态（可能只剩开场白 + user 意图）
+    if (currentConversationId.value) {
+      const conv = await getConversation(currentConversationId.value).catch(() => null)
+      if (conv) applyConversation(conv)
+    }
+    messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'error'
     pipeline.stateLabel = `失败: ${err}`
   } finally {
@@ -353,6 +330,7 @@ async function handleReroll({ messageId, kind, hint }) {
   pipeline.director = { status: 'idle', detail: '', output: '' }
   pipeline.subagents = []
   pipeline.editor = { status: 'idle', detail: '', output: '' }
+  messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
   // 构造 targets
   let targets = []
@@ -557,17 +535,38 @@ function handlePipelineEvent(event) {
     case 'editor_started':
       pipeline.stateLabel = '编剧合并'
       pipeline.editor = { status: 'running', detail: '合并 · 润色 · 成文', output: '' }
+      // 在对话里插入编剧流式占位消息
+      messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
+      messages.value.push({
+        id: 'editor-streaming',
+        role: 'assistant',
+        role_label: activeChar.value?.name || 'AI',
+        active_variant: 0,
+        variants: [{
+          id: 'es-v1',
+          content: '',
+          status: 'draft',
+          provenance: null,
+        }],
+      })
       break
     case 'editor_progress':
-      // 累积编剧流式输出
+      // 累积编剧流式输出 → 同时更新 PipelinePanel 和对话消息
       if (pipeline.editor.status !== 'running') {
         pipeline.editor = { status: 'running', detail: '生成中', output: '' }
       }
       pipeline.editor.output += event.data.delta || ''
+      // 实时更新对话里的占位消息
+      const streamingMsg = messages.value.find((m) => m.id === 'editor-streaming')
+      if (streamingMsg) {
+        streamingMsg.variants[0].content = pipeline.editor.output
+      }
+      scrollToBottom()
       break
     case 'draft_ready':
       pipeline.editor = { status: 'done', detail: '成文完成' }
       pipeline.stateLabel = '已产出'
+      // 占位消息保留，startWriting 的 applyConversation 会用后端最终数据替换
       break
     case 'error':
       pipeline.stateLabel = `错误: ${event.data.message}`

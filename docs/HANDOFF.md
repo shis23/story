@@ -439,9 +439,11 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 现在: 后端 [开场白, user意图, AI成文]  ← truncate 删 AI 成文后还有开场白 + user 意图
 ```
 
-**注意**：开场白在前端本地也有一份（handleImport/handleSelectChar 的 `messages.value = [{first_mes}]`），用于导入后立刻显示。后端那份保证重启恢复 + 删除后不丢。两份内容相同，`applyConversation` 刷新时前端本地的会被后端的替换。
+**注意**：开场白在前端本地也有一份（handleImport/handleSelectChar 的 `messages.value = [{first_mes}]`），用于导入后立刻显示。后端那份保证重启恢复 + 删除后不丢。`startWriting` 成功后从后端 `applyConversation`（单一事实源），不再本地手动 push user/AI 消息，避免重复。
 
-**测试**：242 全绿（+3）。
+**编剧流式进对话**：`editor_progress` 事件同时更新 PipelinePanel 和对话里的 `editor-streaming` 占位消息，用户在对话区实时看到编剧生成过程。写作完成（`applyConversation`）后占位被后端最终数据替换。
+
+**测试**：242 全绿。
 
 ---
 
