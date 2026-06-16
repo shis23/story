@@ -120,9 +120,10 @@ async function toggleModule(category, moduleId) {
   selections['Editor'][category] = ids
 
   // 同步更新 Subagent("*") 的 Output 选择
+  // 注意：后端 AgentRole 序列化为扁平字符串，Subagent("*") → "Subagent:*"
   if (category === 'Output') {
-    if (!selections['Subagent("*")']) selections['Subagent("*")'] = {}
-    selections['Subagent("*")']['Output'] = [...ids]
+    if (!selections['Subagent:*']) selections['Subagent:*'] = {}
+    selections['Subagent:*']['Output'] = [...ids]
   }
 
   // 保存
@@ -144,6 +145,25 @@ async function toggleModuleEnabled(module) {
     await loadModules()
   } catch (e) {
     console.error('更新模块状态失败:', e)
+  }
+}
+
+// 保存当前选择为新命名预设
+async function saveAsNewProfile() {
+  if (!activeProfile.value) return
+  const name = window.prompt('新预设名称：', '我的预设')
+  if (!name) return
+  saving.value = true
+  try {
+    const profile = { ...activeProfile.value, id: `profile-${Date.now()}`, name }
+    await saveProfile(JSON.stringify(profile))
+    activeProfile.value = profile
+    await loadModules() // 刷新（新预设可能成为活跃）
+  } catch (e) {
+    console.error('保存预设失败:', e)
+    alert('保存预设失败: ' + e)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -235,7 +255,7 @@ defineExpose({ loadConnections })
 
     <!-- 保存预设 -->
     <button
-      @click="null"
+      @click="saveAsNewProfile"
       class="w-full mt-3 py-2 text-xs text-accent border border-dashed border-accent-border rounded-lg hover:bg-accent-soft"
     >
       💾 保存当前为新预设

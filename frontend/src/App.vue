@@ -14,7 +14,7 @@ import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -182,6 +182,12 @@ async function handleImport() {
     const { readFile } = await import('@tauri-apps/plugin-fs')
     const data = await readFile(filePath)
     const result = await importCharacter(data)
+
+    // 自动触发角色识别（写入 CampaignStore.cards.json，供 Campaign 面板使用）
+    // 失败不阻塞导入主流程：识别失败时 Campaign 面板可手动重试
+    extractCharacters(result.id).catch((e) => {
+      console.error('角色识别失败（不影响导入，可在 Campaign 面板重试）:', e)
+    })
 
     // 导入成功，设为当前活跃角色
     activeChar.value = result
@@ -421,15 +427,20 @@ async function handleAcceptVariant({ nodeId }) {
   }
 }
 
-// 软删除变体（→ Discarded）
+// 软删除变体（→ Discarded），删除后重新拉取对话刷新（单一事实源：
+// 后端 soft_delete 会自动切到最近非 Discarded variant，前端需同步）
 async function handleDeleteVariant({ nodeId }) {
   if (!currentConversationId.value) return
   try {
     await apiSoftDeleteVariant(currentConversationId.value, nodeId)
-    const msg = messages.value.find((m) => m.id === nodeId)
-    if (msg) {
-      const variant = msg.variants[msg.active_variant]
-      if (variant) variant.status = 'discarded'
+    const refreshed = await getConversation(currentConversationId.value)
+    if (refreshed) {
+      applyConversation(refreshed)
+      if (activeChar.value) {
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = activeChar.value.name
+        })
+      }
     }
   } catch (e) {
     console.error('删除失败:', e)

@@ -101,8 +101,9 @@ function acceptVariant() {
   emit('accept-variant', { nodeId: props.message.id })
 }
 
-// 软删除变体
+// 软删除变体（带确认）
 function deleteVariant() {
+  if (!window.confirm('确定删除当前版本？删除后可在历史中切回查看（软删除）。')) return
   emit('delete-variant', { nodeId: props.message.id })
 }
 
