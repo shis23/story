@@ -1,6 +1,6 @@
 # Agent 接口与提示词索引
 
-> 最后更新：2026-06-15
+> 最后更新：2026-06-16
 > 目的：**集中记录每个 Agent 的 system prompt、上下文拼装、输出解析的代码位置与修改方法**。
 > 改 prompt 时只看这一个文件，不用全仓库翻。
 >
@@ -12,17 +12,19 @@
 
 | 我想改… | 改这个文件 | 改哪个符号 |
 |---------|-----------|-----------|
-| 导演的系统提示词（角色定位/任务/输出格式） | `crates/app-pipeline/src/lib.rs` | `DIRECTOR_SYSTEM_PROMPT` 常量 |
-| 导演的「用户消息」（意图+角色列表+蓝灯注入+任务提醒+变量） | `crates/app-pipeline/src/lib.rs` | `build_director_user_msg()` 函数 |
-| 编剧的系统提示词 | `crates/app-pipeline/src/lib.rs` | `EDITOR_SYSTEM_PROMPT` 常量 |
-| 子 Agent 的系统提示词模板 | `crates/app-pipeline/src/lib.rs` | `SUBAGENT_SYSTEM_PROMPT_TEMPLATE` 常量（含 `{name}` 占位符） |
+| 导演的系统提示词（角色定位/任务/输出格式） | `crates/app-pipeline/src/lib.rs` | `DIRECTOR_SYSTEM_PROMPT` 常量（行 53，走 assemble_system_prompt 模块化） |
+| 导演的「用户消息」（意图+角色列表+对话历史+蓝灯注入+任务提醒） | `crates/app-pipeline/src/lib.rs` | `build_director_user_msg()` 函数（行 1073） |
+| 编剧的系统提示词 | `crates/app-pipeline/src/lib.rs` | `EDITOR_SYSTEM_PROMPT` 常量（行 71，走 assemble_system_prompt 模块化） |
+| 子 Agent 的系统提示词模板 | `crates/app-pipeline/src/lib.rs` | `SUBAGENT_SYSTEM_PROMPT_TEMPLATE` 常量（行 79，含 `{name}` 占位符） |
 | 子 Agent 的「专属上下文包」拼装（角色设定/场景/世界书/最近对话） | `crates/app-pipeline/src/lib.rs` 或 `crates/app-agent/src/runtime.rs` | `format_subagent_context()`（两处实现，见 §3.2） |
 | 导演/编剧/子 Agent 的工具集（能调什么工具） | `crates/app-agent/src/tools.rs` | `register_director_tools()` / `register_subagent_tools()` / `register_editor_tools()` |
-| 导演的工具调用最大轮次 / 默认模型 | `crates/app-pipeline/src/lib.rs` | `make_director_config()` / `make_editor_config()` |
-| 导演 Plan 的解析（JSON→Plan 结构） | `crates/app-pipeline/src/lib.rs` | `parse_plan_from_response()` + 5 层兜底 |
+| 导演的工具调用最大轮次 / 默认模型 | `crates/app-pipeline/src/lib.rs` | `make_director_config()`（行 1137）/ `make_editor_config()`（行 1158） |
+| 导演 Plan 的解析（JSON→Plan 结构） | `crates/app-pipeline/src/lib.rs` | `parse_plan_from_response()`（行 1187）+ 5 层兜底 |
 | **角色识别 Agent 的系统提示词 / config / 工具 / 输出解析** | `crates/app-agent/src/prompts/character_extractor.rs` + `crates/app-agent/src/character_extractor.rs` | `CHARACTER_EXTRACTOR_SYSTEM_PROMPT` / `make_character_extractor_config()` / `parse_character_definitions_from_response()`（5 层兜底，见 §6.2）|
 | 重 roll 时注入用户反馈（hint） | `crates/app-agent/src/runtime.rs` | `inject_hint_into_subagent()` / `inject_hint_into_editor()` |
 | 提示词「模块」（视角/文风/CoT/约束，三层预设体系） | `crates/domain/src/prompt_module.rs` | `assemble_system_prompt()` + `builtins::preset_modules()` |
+| **Meta Agent 的系统提示词 / 多轮对话框架 / 诊断工具 / Patch** | `crates/app-meta/src/prompts/meta_agent.rs` + `crates/app-meta/src/meta_conversation.rs` + `crates/app-meta/src/lib.rs` | `META_AGENT_SYSTEM_PROMPT`（行 28）/ `chat()`（行 146）/ `inspect_world_info` / `inspect_character` / `PatchStore`（见 §13） |
+| **Meta Agent 的 MVU 五合一分析 / ST 预设分类** | `crates/app-meta/src/mvu_import.rs` + `crates/app-meta/src/prompts/mvu_analyzer.rs` | `MVU_ANALYZER_SYSTEM_PROMPT`（行 27）/ `analyze_mvu_card()`（行 41）/ `classify_st_preset_with_llm()`（行 529）（见 §8.3） |
 | **角色/全局变量表的字段定义** | `crates/domain/src/variables.rs` | `default_character_variables()` 工厂 + `VariableField` 结构（见 §7） |
 | **变量的注入提示词模板** | `crates/domain/src/variables.rs` | `render_variables_for_injection()`（见 §7.5） |
 | **任务（伏笔/计划）的数据结构** | `crates/domain/src/story_task.rs` | `StoryTask` + `TaskTrigger`（见 §9） |
@@ -59,9 +61,19 @@
 └──────────────────────────────────────────────┘
 ```
 
-> ⚠️ **当前状态**：M1 阶段 Layer B/C/D **尚未接入流水线**（`make_director_config` / `make_editor_config` 直接用硬编码常量，没调 `assemble_system_prompt`）。
-> 也就是说**现在改 system prompt = 改 `*_SYSTEM_PROMPT` 常量**，最直接。
-> 等三层预设体系接入后，改 prompt 走「模块编辑」（不碰常量），但常量仍是 role_directive 的来源。
+> ✅ **当前状态（2026-06-16 核实）**：导演 / 编剧**已接入**模块系统。`make_director_config`（`lib.rs:1137`）和 `make_editor_config`（`lib.rs:1158`）都调 `assemble_system_prompt(role, role_directive, profile, modules, "")`，所有调用点（start_writing / regenerate 各路径）都传 `ctx.profile` + `ctx.modules`。
+>
+> **各 Agent 模块化状态**：
+> | Agent | 模块化？ | 说明 |
+> |-------|---------|------|
+> | 导演 | ✅ | 走 assemble_system_prompt，profile 选中的模块拼进 system |
+> | 编剧 | ✅ | 同上 |
+> | 子 Agent | ❌ | `spawn_subagents`（`runtime.rs:350`）用 `format!` 直接拼 `base_prompt + 角色名 + context_package + brief`，**不走** assemble_system_prompt。子 Agent 的模块化是缺口 |
+> | 角色识别 / 总结 / 后处理 / Meta | ❌ | 各 crate 独立 prompt 常量，不走三层预设体系 |
+>
+> **改 system prompt 的两条路**：
+> - 改**所有 Agent 共有的角色定位** → 改 `*_SYSTEM_PROMPT` 常量（role_directive，模块系统在其后拼接）
+> - 改**单个 Agent 的文风/视角/约束** → 走模块编辑（`prompt_module.rs::preset_modules()` / 高玩模式 UI 加模块绑 Profile），不碰常量
 
 ---
 
@@ -88,15 +100,18 @@
 
 ### 2.2 用户消息（导演拿到的上下文）
 
-**位置**：`crates/app-pipeline/src/lib.rs:908` 的 `build_director_user_msg(intent, ctx)` 函数
+**位置**：`crates/app-pipeline/src/lib.rs:1073` 的 `build_director_user_msg(intent, ctx)` 函数
 
-**拼装内容**（按顺序）：
-1. `用户的写作意图：{intent}`
-2. `可用角色：{角色名、角色名、...}`（从 `ctx.characters` 取）
-3. `【世界设定（常驻）】` 蓝灯条目列表（按 depth 降序排序，depth 小的排后面=更重视）
-4. `请分析意图并输出 Plan。`
+**拼装内容**（按 push 顺序）：
+1. `用户的写作意图：{intent}\n\n可用角色：{角色名、角色名、...}`（行 1081，角色名来自 `ctx.characters`）
+2. `【最近对话历史】`（行 1084-1090）← `ctx.recent_messages`，最近 20 条带角色标签（"用户: ..." / "AI: ..."）。**让导演知道故事讲到哪了**。regenerate 时排除被重 roll 的节点之后的消息。
+3. `【世界设定（常驻）】`（行 1092-1116）← 蓝灯条目（`LoreRoute::Constant | Both`），**按 depth 升序排**（depth 小的排后面=更受重视，对齐 ST 近因效应；depth 相同按 order）
+4. `【即将触发/正在推进的任务】`（行 1118-1130）← `render_tasks_for_injection(pending_tasks, turn, story_clock)`，**确定性查表零 LLM**：只注入 Pending/Active 且触发满足的任务（轮次/时钟/事件三种 trigger，OR 关系）
+5. 尾句 `请分析意图并输出 Plan。`（行 1132）
 
-**怎么改**：改这个函数体。比如要加「在场角色列表」「已建立的世界状态」「用户历史偏好」，都在这里 push。
+> ⚠️ **§22 cache 布局缺口**：当前蓝灯世界设定、任务、对话历史这些**性质不同**的内容全混在这条 user message 里。设计 §22 要求：蓝灯移进 system（稳定前缀），变量/时钟/任务压尾（volatile tail），`MessageLayout` 类型护栏已就绪但尚未接入此函数。详见 §10。
+
+**怎么改**：改这个函数体。比如要加「在场角色列表」「已建立的世界状态」「用户历史偏好」，都在这里 push。注意：每轮变化的内容（变量/时钟）应压尾，稳定内容（世界设定）后续应移进 system。
 
 ### 2.3 工具集
 
@@ -146,9 +161,16 @@
 输出纯表演，不要解释。
 ```
 
-`{name}` 在运行时被 `tools.rs` 的字符串替换替换成角色名（见 lib.rs:268/582/709 三处调用点）。
+> ⚠️ **子 Agent 不走模块系统**：与导演/编剧不同，子 Agent 的 system prompt 在 `spawn_subagents`（`crates/app-agent/src/runtime.rs:350`）里用 `format!` 现场拼装，**不调** `assemble_system_prompt`。拼装顺序：
+> ```
+> {base_system_prompt}        ← 传入的 SUBAGENT_SYSTEM_PROMPT_TEMPLATE（含 {name}，已被替换）
+> \n\n你是角色 {character_id}。
+> \n\n{format_context_package(task.context_package)}   ← 角色设定/场景/常驻lore/相关lore/最近对话
+> \n\n{task.brief}
+> ```
+> 子 Agent 的文风/约束模块化是缺口（设计 §22 要求 persona 进 system 稳定段，场景/任务压尾）。
 
-**怎么改**：直接改模板字符串。注意 `{name}` 占位符要保留。
+**怎么改**：改模板字符串改 `SUBAGENT_SYSTEM_PROMPT_TEMPLATE`；改拼装顺序改 `spawn_subagents`（runtime.rs:350）。注意 `{name}` 占位符要保留。
 
 ### 3.2 专属上下文包（子 Agent 的「用户消息」）
 
@@ -263,20 +285,26 @@
 
 **怎么改/加模块**：在 `preset_modules()` 里加 `PromptModule { ... }`，在 `default_profile()` 里把它绑到对应 Agent。
 
-### 5.4 接入流水线（TODO）
+### 5.4 接入流水线（✅ 已接入导演/编剧，子 Agent 缺口）
 
-**接入点**：`make_director_config()` / `make_editor_config()`（`lib.rs:949/960`）
+**接入点**：`make_director_config()` / `make_editor_config()`（`lib.rs:1137/1158`）
 
-当前这两个函数直接用硬编码常量。接入后改成：
+✅ 这两个函数都已调 `assemble_system_prompt`：
 ```rust
-let sys = assemble_system_prompt(
+let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
     &AgentRole::Director,
     DIRECTOR_SYSTEM_PROMPT,          // role_directive
-    profile,                          // PromptProfile（来自 AgentBinding）
-    &modules,                         // 所有可用模块
-    &tool_directives,                 // 工具说明
+    profile,                          // PromptProfile（来自 WritingContext.profile）
+    modules,                          // 所有可用模块（来自 WritingContext.modules）
+    "",                               // tool_directives（当前传空，工具说明另走 LLM 工具协议）
 );
 ```
+
+所有调用点（`start_writing` lib.rs:228/358、`regenerate` 各路径 lib.rs:619/824/973）都传 `ctx.profile.as_ref()` + `&ctx.modules`。`WritingContext.profile` / `.modules` 由 `tauri-app` 的 `fill_profile_context()`（tauri-app/src/lib.rs）从活跃 Profile + ModuleStore 填充。
+
+❌ **子 Agent 缺口**：`spawn_subagents`（runtime.rs:350）不走 assemble_system_prompt，见 §3.1。
+
+> **tool_directives 当前传空串**：工具说明不走 prompt 文本，而是走 LLM 的 function calling 协议（OpenAI tools 字段）或 XML/JSON 降级协议（text_tools.rs）。`assemble_system_prompt` 的 `tool_directives` 参数预留给「不支持工具协议的模型用文本说明工具」的场景，目前未启用。
 
 ---
 
@@ -784,7 +812,7 @@ struct CharacterKnowledgeEntry {
 
 ### 场景 E：「想全局换文风」
 
-改 `preset_modules()`（`prompt_module.rs:206`）里的「白描」模块内容，或新增一个模块绑到编剧。等三层预设接入流水线后，这步在前端 UI 点按钮即可。
+改 `preset_modules()`（`prompt_module.rs:206`）里的「白描」模块内容，或新增一个模块绑到编剧。导演/编剧已接入模块系统（§5.4），可在高玩模式 UI 点按钮切换（AgentConfigCard）。
 
 ### 场景 F：「想给角色加个变量字段（如『疲劳度』）」
 
@@ -796,3 +824,99 @@ struct CharacterKnowledgeEntry {
 1. 前端调 `create_task` 建任务，trigger 选 `StoryTime("第2年6月")` 或 `TurnReminder(30)`
 2. 系统每轮自动比对，到点注入导演 user message 末尾
 3. 完成后调 `complete_task`，或让后处理 Agent 标 LikelyCompleted 待你确认
+
+---
+
+## 13. Meta Agent（配置调试助手，独立于写作流水线）
+
+> ✅ **已实现（2026-06-16）**：诊断 + Patch 系统 + 多轮流式对话 + MVU 五合一分析 + ST 预设分类。对应设计 §9、§19.4。
+> **未实现**：插件生成（§9.2）、ST 预设→模块库闭环（§9.4）。
+>
+> **关键定位**：Meta Agent **不参与写作流水线**——不读 `current_cancel`、不碰 pipeline、不接触 API key 明文。自建 `AgentRuntime` + 每轮新建 `ToolRegistry`。安全约束：patch 必须用户点「采纳」才执行；API key 永不经过 Meta Agent。
+
+### 13.1 多轮对话框架（流式）
+
+**crate**：`crates/app-meta/src/meta_conversation.rs`
+
+| 符号 | 行号 | 职责 |
+|------|------|------|
+| `META_AGENT_SYSTEM_PROMPT` | `prompts/meta_agent.rs:28` | 角色定位：「StoryForge 配置调试助手，不参与写作流水线，帮诊断/整理预设/提议 Patch，不能直接修改，改动必须用户采纳」 |
+| `make_meta_agent_config()` | `prompts/meta_agent.rs:51` | AgentConfig（`AgentRole::Meta`，max_rounds: 8） |
+| `MetaSession` | `meta_conversation.rs` | 跨工具调用共享的诊断数据源：`character: Mutex<Option<Arc<Character>>>` + `world_info: Mutex<Option<Arc<WorldInfoBook>>>` + `patches: PatchStore` |
+| `MetaConversation` | `meta_conversation.rs` | 内存态对话（重启清空）：`messages: Vec<MetaMessage>` + `history_summary: Vec<String>`（逐轮摘要，保留最近 6 轮喂下一轮） |
+| `chat(...)` | `meta_conversation.rs:146` | 流式编排：make_meta_agent_config + build_meta_user_msg（拼 history_summary）+ register_meta_runtime_tools + `runtime.run_tool_loop_streaming(progress_tx, None)`。返回 `MetaTurn { agent_message, new_patch }` |
+
+**Tauri 命令**：`meta_start_conversation`（建对话）/ `meta_chat`（流式，推 `meta_progress` 事件）/ `meta_get_conversation`。
+
+> ⚠️ **两套 patch 存储**：`MetaSession.patches`（app-meta 内部）与 `AppState.meta_patches`（tauri 侧）是两份。`meta_chat` 结束把 session 新 patch 克隆进 AppState；`meta_accept_patch`/`meta_dismiss_patch` 只改 AppState.meta_patches，不反向同步回 session（session 是临时态，目前无害，但属潜在漂移点）。
+
+### 13.2 诊断工具集（只读）
+
+**位置**：`crates/app-meta/src/lib.rs` + `register_meta_runtime_tools`（meta_conversation.rs）
+
+| 工具 | 函数 | 做什么 |
+|------|------|--------|
+| `meta_inspect_world_info` | `inspect_world_info()`（lib.rs:95） | 检查蓝灯关键词冲突（两两交集）+ 孤立条目（绿灯无 keys）。返回 `WorldInfoReport` |
+| `meta_inspect_character` | `inspect_character()`（lib.rs:143） | 检查字段非空 + first_mes 占位符（"【首页】"）。返回 `CardReport` |
+| `meta_propose_patch` | session handler | **写**：`session.patches.propose(desc, actions)` 生成 Patch（不直接执行） |
+
+### 13.3 Patch 系统（提议-采纳两阶段）
+
+**位置**：`crates/app-meta/src/lib.rs`
+
+```
+LLM propose ──▶ PatchStore.propose（生成 uuid, applied=false）
+                   │  同步进 AppState.meta_patches（前端可见）
+                   ▼
+用户采纳 ──▶ meta_accept_patch 命令（tauri-app/src/lib.rs:2367）
+                   │  execute_patch（app-meta 纯函数，传 PatchContext）
+                   │  ① 改 tool_ctx 内存世界书
+                   │  ② 持久化 CharacterStore：全局条目写回所有卡 + 非全局按 keys 指纹匹配回原卡
+                   │  ③ patch.applied = true
+                   ▼
+用户忽略 ──▶ meta_dismiss_patch（retain 移除）
+```
+
+- **PatchAction**：`Create{target,data}` | `Update{target,field,value}` | `Delete{target}`。`target` 格式 `world_info[0]` / `character.personality`。当前只支持 `world_info` / `character` 两种 kind。
+- **历史 bug（2026-06-16 已修）**：曾把合并世界书写回最后一张卡 + `is_global` 硬编码 false。现 `is_global` 从 route 推导（Constant/Both=true）+ keys 匹配替代 content 匹配。
+
+### 13.4 MVU 五合一分析（手动触发，设计 §19.4）
+
+**位置**：`crates/app-meta/src/mvu_import.rs` + `prompts/mvu_analyzer.rs`
+
+| 符号 | 行号 | 职责 |
+|------|------|------|
+| `MVU_ANALYZER_SYSTEM_PROMPT` | `prompts/mvu_analyzer.rs:27` | 「卡内状态栏分析助手，做五合一分析产出 MvuTranslation」 |
+| `make_mvu_analyzer_config()` | `prompts/mvu_analyzer.rs:96` | AgentConfig（emit_mvu_translation 工具） |
+| `analyze_mvu_card(...)` | `mvu_import.rs:41` | 编排：①score_card_complexity 启发式打分（document./innerHTML/script 阈值）→ CardComplexityReport ②extract_mvu_schema_from_extensions（P1 字段级 schema）③纯数据短路（PureData 无字段 → pure_data_fallback 省 LLM）④LLM 五合一（run_tool_loop 非流式）⑤parse_mvu_translation_from_response（5 层兜底）⑥失败降级 pure_data_fallback |
+| `classify_st_preset_with_llm(...)` | `mvu_import.rs:529` | ST 预设逐条 LLM 分类（增强启发式 bridge）。system prompt：`ST_CLASSIFY_SYSTEM_PROMPT`（mvu_import.rs:655） |
+
+**五产物（MvuTranslation）**：`variable_schema` / `ui_bindings`（BindingDisplay: bar/text/tag/icon）/ `update_rules`（注入后处理 Agent）/ `interactions`（用户点击→动作）/ `fallback_fragments`（需 WebView 的片段）。`routing`：native/hybrid；LLM 标 native 却有 fallback_fragments 会自动纠正为 hybrid。
+
+**持久化**：`StoredMvuTranslation` → `data/mvu_translations.json`（按 source_character_id 去重）。
+
+> ⚠️ **共享 WebView 是桩**：`infra-plugin-host/src/mvu_runtime.rs` 的 `StubMvuRuntime` 全 NotImplemented，重 DOM 卡（缄默之秋1.4 类，document.×179）的 fallback_fragments 无法执行——已知限制。
+
+### 13.5 9 个 Meta/MVU Tauri 命令速查
+
+| 命令 | 作用 | 推事件？ |
+|------|------|---------|
+| `meta_start_conversation` | 新建 MetaConversation（uuid） | 否 |
+| `meta_chat` | 跑一轮流式对话（诊断/ST 分类/提议 Patch） | **是**（meta_progress） |
+| `meta_get_conversation` | 取对话历史 | 否 |
+| `meta_list_pending_patches` | 列待采纳 patch | 否 |
+| `meta_dismiss_patch` | 忽略 patch | 否 |
+| `meta_accept_patch` | 执行 patch（改世界书 + 写 CharacterStore） | 否 |
+| `meta_analyze_mvu_card` | MVU 五合一分析（手动触发） | 否 |
+| `meta_list_mvu_translations` / `meta_get_mvu_translation` | 查 MVU 翻译 | 否 |
+| `meta_classify_st_preset` | ST 预设 LLM 分类（不持久化） | 否 |
+
+### 13.6 怎么改 Meta Agent 的 prompt
+
+| 想改 | 改哪 |
+|------|------|
+| Meta 对话的角色定位/诊断行为 | `META_AGENT_SYSTEM_PROMPT`（`prompts/meta_agent.rs:28`） |
+| MVU 分析的判定逻辑/输出格式 | `MVU_ANALYZER_SYSTEM_PROMPT`（`prompts/mvu_analyzer.rs:27`）。改输出 schema 要同步改 `parse_mvu_translation_from_response` 的 5 层兜底 |
+| ST 预设分类规则 | `ST_CLASSIFY_SYSTEM_PROMPT`（`mvu_import.rs:655`） |
+| Patch 执行逻辑 | `execute_patch`（lib.rs，PatchContext 处理 Create/Update/Delete） |
+| 诊断检查项 | `inspect_world_info` / `inspect_character`（lib.rs） |
