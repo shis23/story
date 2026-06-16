@@ -158,7 +158,9 @@ tokio::spawn(async move {
 [Tauri 命令] start_writing (lib.rs:1215)
   │  1. snapshot_tool_ctx()           ── 读 tool_ctx 快照（导入的角色卡/世界书）
   │  2. conv_store.create(char_id)    ── 新建对话（写 conversations/<id>.json）
-  │  3. fill_profile_context()        ── 加载活跃 Profile + 启用模块
+  │  3. append_final_message(开场白)  ── 角色卡 first_mes → Assistant/Final node
+  │  4. append_user_message(user意图) ── 用户输入 → User/Final node
+  │  5. fill_profile_context()        ── 加载活跃 Profile + 启用模块
   │  4. fill_campaign_context()       ── 从活跃 Campaign 填 campaign_id/turn/tasks/story_clock
   │  5. 建 cancel watch channel，sender 存进 AppState.current_cancel
   │  6. spawn 事件转发任务（PipelineEvent → WritingEvent → Channel）
@@ -538,7 +540,7 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 | `plugin_get_variable` 权限 | 校验的是 `WriteVariables` 而非读权限 | 代码现状，文档已标注 |
 | **CharacterStore/CampaignStore 双数据源** | 导入只写 CharacterStore（扁平 Character），Campaign 面板读 CampaignStore（CharacterCard）需 extract_characters 转换；删卡现已级联但两套数据天然易不一致 | 🔴 高：应统一（废弃 CharacterStore 或后者作缓存层）；见 HANDOFF §3.11 |
 | tauri-api.js 参数名无校验 | 曾系统性出现 14 处 snake_case 参数名（Tauri v2 期望 camelCase）；手动修易漏 | 应加脚本静态检查 invoke 参数名 vs Rust 命令签名 |
-| start_writing 不存开场白/用户意图进对话 | 后端对话只有 AI 成文 node；删除成文（truncate）后对话空，前端靠回显 first_mes 兜底 | 语义不严谨：用户意图从未持久化；删除后回显的开场白与对话树脱节 |
+| ~~start_writing 不存开场白/用户意图进对话~~ | ✅ 已修复：start_writing 创建对话后先 append 开场白 + user 意图，对话结构变为 [开场白, user意图, AI成文] | — |
 | Campaign.fork 未暴露 | `Campaign::fork` domain 方法已实现（fork_from 记分叉点），但无 Tauri 命令 + 前端入口；「分支」按钮只弹提示 | 真「分支=开新档」能力未接通 |
 
 ---
@@ -554,4 +556,4 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 
 ---
 
-*最后同步：2026-06-16。本文基于代码实测（依赖图来自 Cargo.toml，命令映射来自 lib.rs 逐函数梳理，调用链来自 app-pipeline/runtime 逐行确认，持久化表来自各 store 源码）。代码演进后请同步本文。*
+*最后同步：2026-06-16（对话数据完整性修复）。本文基于代码实测（依赖图来自 Cargo.toml，命令映射来自 lib.rs 逐函数梳理，调用链来自 app-pipeline/runtime 逐行确认，持久化表来自各 store 源码）。代码演进后请同步本文。*

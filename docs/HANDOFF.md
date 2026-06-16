@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（P3 Meta Agent + MVU 分析）
+> 最后更新：2026-06-16（对话数据完整性修复 + user 消息重 roll）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
@@ -419,6 +419,29 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **新增 Tauri 命令**：`delete_message_from`（删除指定消息及其后所有，截断对话）。
 **新增 ConversationStore 方法**：`truncate_from`（+ 单测）、`replace_active_variant`、`is_last_assistant_node`（§3.10 C3 已加）。
 **新增 domain**：AgentRole 自定义 serde（扁平字符串 + 旧格式兼容，4 测试）。
+
+### 3.12 对话数据完整性修复 + user 消息重 roll（2026-06-16）
+
+**根因**：`start_writing` 只在 pipeline 内部 `append_ai_draft`（成文），user 意图从未进后端对话树。前端本地 push 的 user 消息是纯展示用，`applyConversation` 刷新时被覆盖。删除唯一 AI 成文 → 后端对话空 → 前端回显开场白兜底（治标不治本）。
+
+**修复**：
+
+| 改动 | 文件 | 内容 |
+|------|------|------|
+| 开场白 + user 意图存后端 | `tauri-app/lib.rs` start_writing | 创建对话后、调 pipeline 前，先 `append_final_message`（开场白，Assistant/Final）+ `append_user_message`（user 意图）。对话结构从 `[AI成文]` 变为 `[开场白, user意图, AI成文]` |
+| 删回显兜底 | `frontend/App.vue` handleDeleteVariant | 删掉 `if (!hadNodes && first_mes)` 兜底逻辑。改动后 truncate 不会让对话空（至少剩开场白 + user 意图） |
+| user 消息重 roll | `ChatMessage.vue` + `App.vue` | user 消息操作栏加「🔄 重roll」按钮 → `handleRerollUser` → 用同样 intent 重新调 `start_writing`（新建对话）。等效于「用同样指令重新写一遍」 |
+| ConversationStore 新方法 | `app-conversation/lib.rs` | `append_final_message(role, content)` — 通用 Final 状态消息追加（开场白等系统消息用） |
+
+**对话结构变化**：
+```
+之前: 后端 [AI成文]  ← 只有一个 node，truncate 后空
+现在: 后端 [开场白, user意图, AI成文]  ← truncate 删 AI 成文后还有开场白 + user 意图
+```
+
+**注意**：开场白在前端本地也有一份（handleImport/handleSelectChar 的 `messages.value = [{first_mes}]`），用于导入后立刻显示。后端那份保证重启恢复 + 删除后不丢。两份内容相同，`applyConversation` 刷新时前端本地的会被后端的替换。
+
+**测试**：242 全绿（+3）。
 
 ---
 

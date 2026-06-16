@@ -10,7 +10,7 @@ const props = defineProps({
   busy: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['reroll', 'switch-variant', 'edit-variant', 'accept-variant', 'delete-variant', 'add-variant'])
+const emit = defineEmits(['reroll', 'reroll-user', 'switch-variant', 'edit-variant', 'accept-variant', 'delete-variant', 'add-variant'])
 
 // 重 roll 菜单展开
 const showRerollMenu = ref(false)
@@ -117,6 +117,11 @@ function explainBranch() {
 
 const isUser = computed(() => props.message.role === 'user')
 
+// user 消息重 roll（用同样 intent 重新写作）
+function rerollUser() {
+  emit('reroll-user', { messageId: props.message.id })
+}
+
 </script>
 
 <template>
@@ -158,6 +163,12 @@ const isUser = computed(() => props.message.role === 'user')
         <button @click="cancelEdit" class="px-3 py-1 text-xs rounded-md hover:bg-bg">取消</button>
         <button @click="saveEdit" class="px-3 py-1 text-xs rounded-md bg-accent text-white hover:opacity-90">保存</button>
       </div>
+    </div>
+
+    <!-- 操作栏（user 消息：仅重 roll） -->
+    <div v-if="isUser" class="flex items-center gap-1 mt-2 text-xs text-ink-soft">
+      <button @click="rerollUser" :disabled="busy"
+        class="px-2.5 py-1 rounded-md hover:bg-bg disabled:opacity-40">🔄 重roll</button>
     </div>
 
     <!-- 操作栏（仅 AI 消息显示完整操作） -->

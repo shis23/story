@@ -181,6 +181,20 @@ impl ConversationStore {
 
     // ─── 对话操作（全部通过 with_conversation_mut 保证原子性）──────────────
 
+    /// 追加一条 Final 状态消息（开场白等系统消息，任意角色）
+    pub fn append_final_message(
+        &self,
+        conv_id: &Id,
+        role: Role,
+        content: String,
+    ) -> Result<Id, ConversationError> {
+        self.with_conversation_mut(conv_id, |conv| {
+            let node_id = conv.append_message(role, content);
+            conv.updated_at = Utc::now();
+            Ok(node_id)
+        })
+    }
+
     /// 追加用户消息
     pub fn append_user_message(
         &self,

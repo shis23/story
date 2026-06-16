@@ -1238,6 +1238,20 @@ async fn start_writing(
     let tool_snapshot = app.snapshot_tool_ctx();
     let conv = app.conv_store.create(character_id);
     let conversation_id = conv.id.clone();
+
+    // 存开场白 + user 意图进后端对话（保证 truncate 后不会丢数据）
+    // 1. 开场白（从角色卡读取，Final 状态 Assistant 消息）
+    if let Some(ch) = tool_snapshot.characters.first() {
+        if !ch.first_mes.is_empty() {
+            let _ = app.conv_store.append_final_message(
+                &conversation_id,
+                storyforge_domain::conversation::Role::Assistant,
+                ch.first_mes.clone(),
+            );
+        }
+    }
+    // 2. user 意图（Final 状态 User 消息）
+    let _ = app.conv_store.append_user_message(&conversation_id, intent.clone());
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),

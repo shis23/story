@@ -437,7 +437,6 @@ async function handleDeleteVariant({ nodeId }) {
     await apiDeleteMessageFrom(currentConversationId.value, nodeId)
     // 重新拉取对话刷新（truncate 后该消息及之后都消失）
     const refreshed = await getConversation(currentConversationId.value)
-    const hadNodes = refreshed && refreshed.nodes && refreshed.nodes.length > 0
     if (refreshed) {
       applyConversation(refreshed)
       if (activeChar.value) {
@@ -445,22 +444,6 @@ async function handleDeleteVariant({ nodeId }) {
           if (m.role === 'assistant') m.role_label = activeChar.value.name
         })
       }
-    }
-    // 删除后若对话空了（成文是唯一 node，被 truncate 删光），回显角色卡开场白，
-    // 回到「导入后未写作」的初始状态（start_writing 不存开场白进后端对话）。
-    if (!hadNodes && activeCharDetail.value?.first_mes) {
-      messages.value = [{
-        id: 'm1',
-        role: 'assistant',
-        role_label: activeCharDetail.value.name || 'AI',
-        active_variant: 0,
-        variants: [{
-          id: 'v1',
-          content: activeCharDetail.value.first_mes,
-          status: 'final',
-          provenance: null,
-        }],
-      }]
     }
     // 清流水线状态（删除 = 回到这条之前的状态，上次写作的导演/子Agent/编剧输出作废）
     pipeline.state = 'idle'
@@ -473,6 +456,16 @@ async function handleDeleteVariant({ nodeId }) {
     console.error('删除失败:', e)
     alert('删除失败: ' + e)
   }
+}
+
+// user 消息重 roll：用同样的 intent 重新写作（start_writing 会新建 conversation）
+async function handleRerollUser({ messageId }) {
+  if (isWriting.value) return
+  const userMsg = messages.value.find((m) => m.id === messageId)
+  if (!userMsg) return
+  const intent = userMsg.variants[userMsg.active_variant]?.content
+  if (!intent) return
+  await startWriting(intent)
 }
 
 // 添加新变体（分支）
@@ -708,6 +701,7 @@ function handlePipelineEvent(event) {
           :conversation-id="currentConversationId"
           :busy="isWriting"
   @reroll="handleReroll"
+  @reroll-user="handleRerollUser"
   @edit-variant="handleEditVariant"
   @accept-variant="handleAcceptVariant"
   @delete-variant="handleDeleteVariant"
