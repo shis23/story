@@ -4,10 +4,10 @@
 /// 设计来源：TT 的 AgentRuntimeService（max_rounds + drift recovery + watch 取消）。
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use storyforge_domain::agent::{AgentRole, ContextPackage, Performance, SubagentTask};
+use storyforge_domain::agent::{AgentRole, ContextPackage, Performance, PipelineEvent, SubagentTask};
 use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolSpec};
 use storyforge_infra_llm::LlmClient;
 
@@ -324,28 +324,28 @@ const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 /// 每个子 Agent clone 全局 `cancel`，主流水线取消时所有子 Agent 立即响应。
 /// 单独取消某个子 Agent（用户点"这个角色我不要了"）仍后续实现。
 /// 返回 Vec<Result<Performance, AgentError>>。
+///
+/// - **流式**：每个子 Agent 走 `run_tool_loop_streaming`，token 增量经 `event_tx`
+///   转发为 `PipelineEvent::SubagentProgress`（带 character_id + index），供前端实时显示。
+/// - **并发**：用 `Semaphore`（permits = `MAX_CONCURRENT_SUBAGENTS`）限流，
+///   超出的任务**排队等待**而非丢弃，最终全部跑完。结果按原始 index 对齐返回。
 pub async fn spawn_subagents(
     tasks: Vec<SubagentTask>,
     runtime: Arc<AgentRuntime>,
     director_config: &AgentConfig,
     base_system_prompt: &str,
     cancel: watch::Receiver<bool>,
+    event_tx: mpsc::UnboundedSender<PipelineEvent>,
 ) -> Vec<Result<Performance, AgentError>> {
-    let mut handles = Vec::new();
-
     let total = tasks.len();
-    let dropped_ids: Vec<String> = if total > MAX_CONCURRENT_SUBAGENTS {
-        tasks[MAX_CONCURRENT_SUBAGENTS..].iter().map(|t| t.character_id.clone()).collect()
-    } else {
-        vec![]
-    };
+    // Semaphore 限流：同时最多 MAX_CONCURRENT_SUBAGENTS 个子 Agent 跑，超出排队
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBAGENTS));
 
-    if !dropped_ids.is_empty() {
-        warn!(target: "app-agent", "子 Agent 数量 {} 超过并发上限 {}，以下任务被丢弃: {:?}",
-            total, MAX_CONCURRENT_SUBAGENTS, dropped_ids);
-    }
+    // (原始 index, JoinHandle) —— spawn 时记下 index，结果按 index 对齐
+    let mut handles: Vec<(usize, tokio::task::JoinHandle<Result<Performance, AgentError>>)> =
+        Vec::with_capacity(total);
 
-    for task in tasks.into_iter().take(MAX_CONCURRENT_SUBAGENTS) {
+    for (index, task) in tasks.into_iter().enumerate() {
         let runtime = runtime.clone();
         let system_prompt = format!(
             "{}\n\n你是角色 {}。\n\n{}\n\n{}",
@@ -360,22 +360,48 @@ pub async fn spawn_subagents(
 
         // 子 Agent clone 全局 cancel（主流水线取消时联动）
         let child_cancel = cancel.clone();
+        // 排队许可（spawn 内 acquire_owned，跑完随 _permit drop 自动释放）
+        let permit_sem = semaphore.clone();
+        // 流式转发：每个子 Agent 一对 channel，delta 包成 SubagentProgress 发到主 event_tx
+        let sub_event_tx = event_tx.clone();
 
         let config = AgentConfig {
             role: AgentRole::Subagent(character_id.clone()),
             system_prompt,
             max_tool_rounds: 10, // 子 Agent 轮次少
             model,
-            tools: vec![], // M1 子 Agent 无工具（纯表演）
+            tools: vec![], // 子 Agent 无工具（纯表演）
         };
 
-        // M1 子 Agent 无工具（纯表演），不注册工具
+        // 子 Agent 无工具（纯表演），不注册工具
         let registry = ToolRegistry::new();
 
         let handle = tokio::spawn(async move {
+            // 排队等许可（超出并发上限的任务在此 await，不会丢弃）
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .map_err(|e| AgentError::SubagentFailed(format!("Semaphore 已关闭: {e}")))?;
+
+            // per-subagent 流式 channel：runtime 把 delta 推到 sub_tx，
+            // 一个本地转发任务把它包成 SubagentProgress（带身份）发到主 event_tx
+            let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<String>();
+            let fwd_tx = sub_event_tx.clone();
+            let fwd_cid = character_id.clone();
+            tokio::spawn(async move {
+                while let Some(delta) = sub_rx.recv().await {
+                    let _ = fwd_tx.send(PipelineEvent::SubagentProgress {
+                        character_id: fwd_cid.clone(),
+                        index,
+                        delta,
+                    });
+                }
+            });
+
             let result = runtime
-                .run_tool_loop(&config, user_message, &registry, child_cancel)
+                .run_tool_loop_streaming(&config, user_message, &registry, child_cancel, sub_tx, None)
                 .await;
+            // sub_tx 在此 drop，转发任务收到 None 后自然结束
 
             match result {
                 Ok(resp) => Ok(Performance {
@@ -389,23 +415,16 @@ pub async fn spawn_subagents(
             }
         });
 
-        handles.push(handle);
+        handles.push((index, handle));
     }
 
-    // 等待所有子 Agent 完成
-    let mut results = Vec::new();
-    for handle in handles {
+    // 收集结果，按原始 index 对齐（handles 顺序即 index 升序，直接 push 即对齐）
+    let mut results = Vec::with_capacity(total);
+    for (_index, handle) in handles {
         match handle.await {
             Ok(result) => results.push(result),
             Err(e) => results.push(Err(AgentError::SubagentFailed(format!("子 Agent panic: {e}")))),
         }
-    }
-
-    // 被并发上限丢弃的任务，以错误结果返回（保持与原始任务列表的索引对齐）
-    for id in dropped_ids {
-        results.push(Err(AgentError::SubagentFailed(format!(
-            "子 Agent {id} 因超过并发上限 {} 被丢弃", MAX_CONCURRENT_SUBAGENTS
-        ))));
     }
 
     results
@@ -545,23 +564,82 @@ mod tests {
             &director_config,
             "你是角色",
             cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0, // 测试不消费事件
         )
         .await;
 
-        // 至少一个子 Agent 应被取消（返回 Cancelled 错误）
-        // 注：mock 的 chat（非流式）不查 cancel，只有 chat_stream 查。
-        // 这里 run_tool_loop 用 chat，所以取消检查发生在「每轮开始前」。
-        // 因为 max_tool_rounds=1 且第 1 轮前 cancel 可能还没置位，结果可能 Ok。
-        // 为确保测试稳定，直接断言：所有结果要么 Ok 要么 Cancelled，不 panic。
+        // 至少一个子 Agent 应被取消（返回取消类错误）
+        // 注：子 Agent 现走流式 chat_stream，cancel 命中 select! 后可能返回
+        // AgentError::Cancelled（每轮前检查）或 AgentError::LlmFailed(包装 LlmError::Cancelled)（流内取消）。
+        // 两种都是合法的取消表示，max_tool_rounds=1 且第 1 轮前 cancel 可能还没置位，结果也可能是 Ok。
         for r in &results {
             match r {
                 Ok(_) | Err(AgentError::Cancelled) => {}
+                Err(AgentError::Llm(msg)) if msg.to_string().contains("取消") => {}
                 Err(e) => panic!("意外的错误: {e}"),
             }
         }
         // 至少有结果返回
         assert!(!results.is_empty());
         drop(cancel_tx);
+    }
+
+    /// 验证超过并发上限的角色会排队而非丢弃（Semaphore 改造）
+    ///
+    /// 构造 6 个任务（> MAX_CONCURRENT_SUBAGENTS=4），旧逻辑会丢弃后 2 个返回 SubagentFailed。
+    /// 改用 Semaphore 后所有任务都应排队跑完，返回 6 个 Ok。
+    #[tokio::test]
+    async fn test_subagents_queue_beyond_concurrency_limit() {
+        let make_task = |cid: &str| SubagentTask {
+            character_id: cid.into(),
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: format!("角色{cid}"),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+        };
+        // 6 个任务，超过并发上限 4
+        let tasks: Vec<SubagentTask> = ["A", "B", "C", "D", "E", "F"]
+            .iter()
+            .map(|c| make_task(c))
+            .collect();
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "你是角色",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+        )
+        .await;
+
+        // 6 个任务全部完成，无丢弃（旧逻辑会是 4 Ok + 2 SubagentFailed）
+        assert_eq!(results.len(), 6, "应有 6 个结果（不丢弃超出任务）");
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "第 {i} 个子 Agent 应成功，实际: {:?}", r);
+        }
     }
 
     #[test]

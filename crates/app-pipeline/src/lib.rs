@@ -300,6 +300,7 @@ impl PipelineOrchestrator {
             &director_config,
             SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
             cancel.clone(),
+            event_tx.clone(),
         )
         .await;
 
@@ -682,6 +683,7 @@ impl PipelineOrchestrator {
                 &director_config,
                 SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
                 cancel.clone(),
+                event_tx.clone(),
             )
             .await;
 
@@ -829,9 +831,30 @@ impl PipelineOrchestrator {
                 // M1 子 Agent 无工具（纯表演）
                 let registry = ToolRegistry::new();
 
+                // 单子 Agent 流式：建 channel 转发 token 到 SubagentProgress（index:0）
+                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let pp_tx = event_tx.clone();
+                let pp_cid = target_id.clone();
+                tokio::spawn(async move {
+                    while let Some(delta) = sub_rx.recv().await {
+                        let _ = pp_tx.send(PipelineEvent::SubagentProgress {
+                            character_id: pp_cid.clone(),
+                            index: 0,
+                            delta,
+                        });
+                    }
+                });
+
                 match self
                     .runtime
-                    .run_tool_loop(&config, target_task.context_package.task.clone(), &registry, cancel.clone())
+                    .run_tool_loop_streaming(
+                        &config,
+                        target_task.context_package.task.clone(),
+                        &registry,
+                        cancel.clone(),
+                        sub_tx,
+                        None,
+                    )
                     .await
                 {
                     Ok(resp) => Ok(storyforge_domain::agent::Performance {
@@ -991,10 +1014,22 @@ impl PipelineOrchestrator {
             hint.map(String::from),
         );
 
-        // 写入对话树：作为同 node 的新 variant（分支，不删旧版）
-        if let Err(e) = self.conv_store
-            .add_variant(&req.conversation_id, &req.node_id, final_text.clone(), Some(provenance.clone()))
-        {
+        // 写入对话树：
+        // - 重 roll **最后一条** AI 消息 → 原地替换（旧 active 降级 Discarded，新 variant 设 active）
+        // - 重 roll **中间**消息 → 开分支（add_variant，保留旧版，原行为）
+        // 后端按 nodes.last() 实时判定，避免前端 isLast 标志脏数据。
+        let is_last_ai = self
+            .conv_store
+            .is_last_assistant_node(&req.conversation_id, &req.node_id)
+            .map_err(|e| self.abort_with(&event_tx, PipelineError::Conversation(e)))?;
+        let land = if is_last_ai {
+            self.conv_store
+                .replace_active_variant(&req.conversation_id, &req.node_id, final_text.clone(), Some(provenance.clone()))
+        } else {
+            self.conv_store
+                .add_variant(&req.conversation_id, &req.node_id, final_text.clone(), Some(provenance.clone()))
+        };
+        if let Err(e) = land {
             return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
         }
 

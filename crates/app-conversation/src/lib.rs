@@ -261,6 +261,68 @@ impl ConversationStore {
         })
     }
 
+    /// 重 roll 最后一条时：旧 active → Discarded，push 新 variant → active（原地替换语义）
+    ///
+    /// 与 `add_variant` 区别：add_variant 永远新增、保留旧 active 为 Final/Draft；
+    /// 本方法把旧 active 降级为 Discarded（软删除，可 switch 切回查看），再 push 新 variant。
+    /// 等价于「自动删旧的、留新的」，用于重 roll 对话**最后一条** AI 消息（避免无谓累积分支）。
+    /// 行为是 `soft_delete + add_variant` 的原子组合。
+    pub fn replace_active_variant(
+        &self,
+        conv_id: &Id,
+        node_id: &Id,
+        content: String,
+        provenance: Option<Provenance>,
+    ) -> Result<usize, ConversationError> {
+        self.with_conversation_mut(conv_id, |conv| {
+            let node = conv.find_node_mut(node_id).ok_or_else(|| {
+                ConversationError::NodeNotFound(node_id.to_string())
+            })?;
+
+            // 旧 active 降级为 Discarded（幂等：已 Discarded 再设不影响）
+            if let Some(old) = node.variants.get_mut(node.active_variant) {
+                old.status = VariantStatus::Discarded;
+            }
+
+            // push 新 variant（Draft），add_variant 内部会把 active_variant 指到末尾
+            let variant = MessageVariant {
+                id: Id::new(),
+                role: Role::Assistant,
+                content,
+                created_at: Utc::now(),
+                status: VariantStatus::Draft,
+                provenance,
+            };
+            node.add_variant(variant);
+            let new_index = node.active_variant;
+
+            conv.updated_at = Utc::now();
+            Ok(new_index)
+        })
+    }
+
+    /// 判定 node_id 是否为对话最后一条 Assistant 消息（用于重 roll 分支策略）
+    ///
+    /// 后端单一事实源：按当前 `nodes.last()` 实时判定，避免前端传 isLast 标志的脏数据。
+    /// 重 roll 后若用户又发新消息使原 node 不再最后，下次重 roll 它自动回退到开分支。
+    pub fn is_last_assistant_node(
+        &self,
+        conv_id: &Id,
+        node_id: &Id,
+    ) -> Result<bool, ConversationError> {
+        let conv = self.get(conv_id).ok_or_else(|| {
+            ConversationError::NotFound(conv_id.to_string())
+        })?;
+        match conv.nodes.last() {
+            Some(last) => Ok(last.id == *node_id
+                && last
+                    .active()
+                    .map(|v| v.role == Role::Assistant)
+                    .unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
     /// 切换变体（左右滑）
     pub fn switch_variant(
         &self,
@@ -580,5 +642,77 @@ mod tests {
         assert!(result.is_ok());
 
         let _ = store.delete(&conv.id);
+    }
+
+    /// 重 roll 最后一条：replace_active_variant 把旧 active 降级 Discarded + push 新 active
+    #[test]
+    fn test_replace_active_variant_demotes_old_and_promotes_new() {
+        let store = temp_store();
+        let conv = store.create(None);
+        // 首写一条 AI 草稿（带 provenance，便于后续可重 roll）
+        let node_id = store
+            .append_ai_draft(&conv.id, "初版成文".into(), Some(dummy_provenance()))
+            .unwrap();
+
+        // 原地替换（模拟重 roll 最后一条）
+        let new_index = store
+            .replace_active_variant(&conv.id, &node_id, "重 roll 版".into(), Some(dummy_provenance()))
+            .unwrap();
+
+        let updated = store.get(&conv.id).unwrap();
+        let node = updated.nodes.iter().find(|n| n.id == node_id).unwrap();
+        // 两个 variant，active 指向新版（index 1）
+        assert_eq!(node.variants.len(), 2);
+        assert_eq!(node.active_variant, new_index);
+        assert_eq!(node.active_variant, 1);
+        // 旧版（index 0）被降级为 Discarded
+        assert_eq!(node.variants[0].status, VariantStatus::Discarded);
+        assert_eq!(node.variants[0].content, "初版成文");
+        // 新版（index 1）是 Draft 且为当前内容
+        assert_eq!(node.variants[1].status, VariantStatus::Draft);
+        assert_eq!(node.variants[1].content, "重 roll 版");
+        assert_eq!(node.active_content(), "重 roll 版");
+
+        // 旧版仍可 switch 切回查看（软删除，未真删）
+        store.switch_variant(&conv.id, &node_id, 0).unwrap();
+        let updated = store.get(&conv.id).unwrap();
+        let node = updated.nodes.iter().find(|n| n.id == node_id).unwrap();
+        assert_eq!(node.active_variant, 0);
+        assert_eq!(node.active_content(), "初版成文");
+
+        let _ = store.delete(&conv.id);
+    }
+
+    /// is_last_assistant_node 判定：最后是 AI / 最后是 user / 空对话
+    #[test]
+    fn test_is_last_assistant_node_three_scenarios() {
+        let store = temp_store();
+        let conv = store.create(None);
+        // 空对话
+        assert!(!store.is_last_assistant_node(&conv.id, &conv.id).unwrap());
+
+        // AI 消息 → 是最后一条 Assistant
+        let ai_node = store
+            .append_ai_draft(&conv.id, "AI 成文".into(), Some(dummy_provenance()))
+            .unwrap();
+        assert!(store.is_last_assistant_node(&conv.id, &ai_node).unwrap());
+
+        // 再追加 user 消息 → ai_node 不再是最后一条 Assistant
+        let _user_node = store.append_user_message(&conv.id, "继续".into()).unwrap();
+        assert!(!store.is_last_assistant_node(&conv.id, &ai_node).unwrap());
+
+        let _ = store.delete(&conv.id);
+    }
+
+    /// 辅助：构造一个最小 Provenance（仅供本模块测试）
+    fn dummy_provenance() -> Provenance {
+        Provenance {
+            session_id: Id::new(),
+            plan: None,
+            subagent_results: vec![],
+            profile_id: None,
+            seed: 0,
+            last_hint: None,
+        }
     }
 }
