@@ -1219,6 +1219,7 @@ impl WritingEvent {
 async fn start_writing(
     intent: String,
     character_id: Option<String>,
+    conversation_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<serde_json::Value, String> {
@@ -1236,22 +1237,31 @@ async fn start_writing(
 
     // 构造写作上下文（从 tool_ctx 快照读取，导入的角色卡/世界书自动可见）
     let tool_snapshot = app.snapshot_tool_ctx();
-    let conv = app.conv_store.create(character_id);
-    let conversation_id = conv.id.clone();
 
-    // 存开场白 + user 意图进后端对话（保证 truncate 后不会丢数据）
-    // 1. 开场白（从角色卡读取，Final 状态 Assistant 消息）
-    if let Some(ch) = tool_snapshot.characters.first() {
-        if !ch.first_mes.is_empty() {
-            let _ = app.conv_store.append_final_message(
-                &conversation_id,
-                storyforge_domain::conversation::Role::Assistant,
-                ch.first_mes.clone(),
-            );
+    // 复用已有对话 或 新建对话
+    let conversation_id = if let Some(id_str) = conversation_id {
+        let id = Id::from_str(&id_str);
+        // 追加 user 意图到已有对话（开场白已在创建时存入）
+        let _ = app.conv_store.append_user_message(&id, intent.clone());
+        id
+    } else {
+        // 新建对话 + 存开场白 + 存 user 意图
+        let conv = app.conv_store.create(character_id);
+        let id = conv.id.clone();
+        // 开场白（从角色卡读取，Final 状态 Assistant 消息）
+        if let Some(ch) = tool_snapshot.characters.first() {
+            if !ch.first_mes.is_empty() {
+                let _ = app.conv_store.append_final_message(
+                    &id,
+                    storyforge_domain::conversation::Role::Assistant,
+                    ch.first_mes.clone(),
+                );
+            }
         }
-    }
-    // 2. user 意图（Final 状态 User 消息）
-    let _ = app.conv_store.append_user_message(&conversation_id, intent.clone());
+        // user 意图
+        let _ = app.conv_store.append_user_message(&id, intent.clone());
+        id
+    };
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),

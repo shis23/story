@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（对话数据完整性修复 + user 消息重 roll）
+> 最后更新：2026-06-16（start_writing 支持复用已有对话 + 完整对话链路图）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
@@ -444,6 +444,18 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **编剧流式进对话**：`editor_progress` 事件同时更新 PipelinePanel 和对话里的 `editor-streaming` 占位消息，用户在对话区实时看到编剧生成过程。写作完成（`applyConversation`）后占位被后端最终数据替换。
 
 **测试**：242 全绿。
+
+### 3.13 start_writing 支持复用已有对话（2026-06-16）
+
+**问题**：每次 `start_writing` 都 `conv_store.create()` 新建 conversation。多轮写作产生多个独立对话，导演看不到前几轮的历史，重 roll 也只在当前对话里操作。
+
+**修复**：`start_writing` 新增可选参数 `conversation_id`：
+- 有值 → 追加 user 意图到已有对话（不新建，不重复存开场白）
+- 无值 → 新建对话 + 存开场白 + 存 user 意图（原行为）
+
+前端 `startWriting` 调用时传 `currentConversationId.value`，实现多轮写作在同一个对话里累积。
+
+**同步新增**：`docs/CONVERSATION_FLOW.md` 完整对话链路图（基于代码实测，覆盖首次写作/重 roll/user重 roll/删除/对话树结构/事件流/取消机制）。
 
 ---
 

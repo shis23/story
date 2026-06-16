@@ -293,7 +293,7 @@ async function startWriting(intent) {
   try {
     const result = await apiStartWriting(intent, activeChar.value?.id, (event) => {
       handlePipelineEvent(event)
-    })
+    }, currentConversationId.value)
 
     // 后端返回 { text, conversation_id, node_id }
     // 后端已存开场白+user意图+AI成文（重启恢复用），这里只追加 AI 成文到本地消息

@@ -155,12 +155,12 @@ tokio::spawn(async move {
 前端 Composer.vue ──@start-writing──▶ App.vue.startWriting()
   │  调 tauri-api.startWriting(intent, characterId, onMessage)
   ▼
-[Tauri 命令] start_writing (lib.rs:1215)
+[Tauri 命令] start_writing (lib.rs:1219)
   │  1. snapshot_tool_ctx()           ── 读 tool_ctx 快照（导入的角色卡/世界书）
-  │  2. conv_store.create(char_id)    ── 新建对话（写 conversations/<id>.json）
-  │  3. append_final_message(开场白)  ── 角色卡 first_mes → Assistant/Final node
-  │  4. append_user_message(user意图) ── 用户输入 → User/Final node
-  │  5. fill_profile_context()        ── 加载活跃 Profile + 启用模块
+  │  2. conversation_id?
+  │     ├─ Some → 复用已有对话（append_user_message 追加 user 意图）
+  │     └─ None → 新建对话 + append_final_message(开场白) + append_user_message(意图)
+  │  3. fill_profile_context()        ── 加载活跃 Profile + 启用模块
   │  4. fill_campaign_context()       ── 从活跃 Campaign 填 campaign_id/turn/tasks/story_clock
   │  5. 建 cancel watch channel，sender 存进 AppState.current_cancel
   │  6. spawn 事件转发任务（PipelineEvent → WritingEvent → Channel）

@@ -337,9 +337,10 @@ export async function testConnection(req) {
  * @param {string} intent - 用户写作意图
  * @param {string|null} characterId - 关联角色卡 ID
  * @param {function} onEvent - 事件回调 (event: {event_type, data}) => void
+ * @param {string|null} conversationId - 已有对话 ID（追加到已有对话；null = 新建）
  * @returns {Promise<{text: string, conversation_id: string, node_id: string}>} 写作结果（含对话/节点 ID 供重 roll）
  */
-export async function startWriting(intent, characterId, onEvent) {
+export async function startWriting(intent, characterId, onEvent, conversationId) {
   if (isTauri()) {
     const { Channel } = await import('@tauri-apps/api/core')
     const channel = new Channel()
@@ -349,6 +350,7 @@ export async function startWriting(intent, characterId, onEvent) {
     return await invoke('start_writing', {
       intent,
       characterId: characterId || null,
+      conversationId: conversationId || null,
       onEvent: channel,
     })
   }
