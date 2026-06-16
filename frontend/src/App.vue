@@ -485,9 +485,9 @@ async function handleDeleteVariant({ nodeId }) {
 }
 
 // user 消息重 roll：找到下一条 AI 消息，用 user 的 intent 作为 hint 调 regenerate
+// 如果 AI 消息已被删除，直接用 intent 重新写作（追加到当前对话）
 async function handleRerollUser({ messageId }) {
   if (isWriting.value) return
-  if (!currentConversationId.value) return
   const userMsg = messages.value.find((m) => m.id === messageId)
   if (!userMsg) return
   const intent = userMsg.variants[userMsg.active_variant]?.content
@@ -495,8 +495,9 @@ async function handleRerollUser({ messageId }) {
   // 找到紧随其后的 AI 消息（regenerate 的目标）
   const userIndex = messages.value.findIndex((m) => m.id === messageId)
   const aiMsg = messages.value.slice(userIndex + 1).find((m) => m.role === 'assistant')
+  // 没有 AI 消息（已被删除）→ 直接用 intent 重新写作
   if (!aiMsg) {
-    alert('没有对应的 AI 消息可以重 roll')
+    await startWriting(intent)
     return
   }
 
