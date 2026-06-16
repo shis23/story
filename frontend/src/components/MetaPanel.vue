@@ -64,11 +64,26 @@ async function handleSend() {
   await scrollToBottom()
 
   try {
-    const result = await metaChat(conversationId.value, text)
+    // 流式：先 push 一条空的 agent 消息，token 增量累积进去
+    const agentId = `meta-agent-${Date.now()}`
+    messages.value.push({ id: agentId, role: 'agent', content: '' })
+    await scrollToBottom()
+
+    const result = await metaChat(conversationId.value, text, (delta) => {
+      const msg = messages.value.find((m) => m.id === agentId)
+      if (msg) {
+        msg.content += delta
+        scrollToBottom()
+      }
+    })
+
+    // 用最终聚合结果校正（流式累积可能因工具调用产生中间文本）
     if (result.agent_message) {
-      // 后端 agent_message 可能无 id，补一个保证 v-for key 稳定
-      const msg = result.agent_message
-      messages.value.push({ id: msg.id || `meta-agent-${Date.now()}`, ...msg })
+      const msg = messages.value.find((m) => m.id === agentId)
+      if (msg) {
+        const finalContent = result.agent_message.content
+        if (finalContent) msg.content = finalContent
+      }
     }
     if (result.new_patch) {
       await refreshPatches()

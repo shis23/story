@@ -730,9 +730,23 @@ export async function metaStartConversation() {
 }
 
 /** 跑一轮 Meta 对话 */
-export async function metaChat(conversationId, userInput) {
+/**
+ * 跑一轮 Meta 对话（流式）
+ * @param {string} conversationId
+ * @param {string} userInput
+ * @param {(delta: string) => void} [onProgress] token 增量回调
+ */
+export async function metaChat(conversationId, userInput, onProgress) {
   if (isTauri()) {
-    return await invoke('meta_chat', { conversationId, userInput })
+    const { Channel } = await import('@tauri-apps/api/core')
+    const channel = new Channel()
+    channel.onmessage = (event) => {
+      // event: { event_type: 'meta_progress', data: { delta } }
+      if (onProgress && event?.event_type === 'meta_progress') {
+        onProgress(event.data?.delta ?? '')
+      }
+    }
+    return await invoke('meta_chat', { conversationId, userInput, onEvent: channel })
   }
   return {
     conversation_id: conversationId,

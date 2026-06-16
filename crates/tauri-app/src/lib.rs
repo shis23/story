@@ -2271,6 +2271,26 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
 
 // ─── Meta Agent 命令 ──────────────────────────────────────────────────────
 
+/// Meta 对话流式事件（Tauri Channel 用）
+///
+/// 复用 WritingEvent 的扁平模式。目前只有 token 增量一种事件；
+/// 命令的最终聚合结果（agent_message/messages/new_patch）仍由命令返回值携带。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaStreamEvent {
+    pub event_type: String,
+    pub data: serde_json::Value,
+}
+
+impl MetaStreamEvent {
+    /// token 增量事件
+    pub fn progress(delta: String) -> Self {
+        Self {
+            event_type: "meta_progress".into(),
+            data: serde_json::json!({ "delta": delta }),
+        }
+    }
+}
+
 /// 接受并执行 Patch（修改世界书条目或角色字段）
 #[tauri::command]
 fn meta_accept_patch(
@@ -2412,6 +2432,7 @@ async fn meta_chat(
     conversation_id: String,
     user_input: String,
     state: tauri::State<'_, Arc<AppState>>,
+    on_event: tauri::ipc::Channel<MetaStreamEvent>,
 ) -> Result<serde_json::Value, String> {
     let app = state.inner().clone();
     sync_meta_session_from_tool_ctx(&state);
@@ -2430,6 +2451,17 @@ async fn meta_chat(
     let tool_ctx = app.snapshot_tool_ctx();
     let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_ctx);
 
+    // 流式转发：meta_chat 内部把 token delta 推到 progress_tx，
+    // 一个转发任务把它包成 MetaStreamEvent 推给前端 Channel
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+    let on_event_clone = on_event.clone();
+    tokio::spawn(async move {
+        while let Some(delta) = progress_rx.recv().await {
+            let _ = on_event_clone.send(MetaStreamEvent::progress(delta));
+        }
+    });
+
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let turn = storyforge_app_meta::meta_chat(
         &runtime,
@@ -2437,6 +2469,7 @@ async fn meta_chat(
         app.meta_session.clone(),
         &user_input,
         cancel_rx,
+        progress_tx,
     )
     .await
     .map_err(|e| format!("{e}"))?;

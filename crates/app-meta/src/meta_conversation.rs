@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::info;
 
 use storyforge_app_agent::runtime::AgentRuntime;
@@ -137,15 +137,19 @@ pub struct MetaTurn {
 /// 内部：
 /// 1. 用 history_summary + 用户输入拼成 user_msg
 /// 2. 注册诊断工具（handler 挂接 MetaSession）
-/// 3. 跑 run_tool_loop
+/// 3. 跑 run_tool_loop_streaming（流式，token 经 progress_tx 推给上层）
 /// 4. 把回复 + 工具结果结构化进 MetaMessage
 /// 5. 更新 history_summary
+///
+/// `progress_tx`：流式 token 增量推送通道。Meta Agent 的工具执行（propose_patch 等）
+/// 副作用在 run_tool_loop_streaming 内完成，与非流式一致。
 pub async fn chat(
     runtime: &AgentRuntime,
     conversation: &mut MetaConversation,
     session: Arc<MetaSession>,
     user_input: &str,
     cancel: watch::Receiver<bool>,
+    progress_tx: mpsc::UnboundedSender<String>,
 ) -> Result<MetaTurn, crate::MetaError> {
     // 记录用户消息
     conversation.messages.push(MetaMessage::User {
@@ -161,7 +165,7 @@ pub async fn chat(
     info!(target: "meta-conversation", "Meta 对话：用户输入 {} 字", user_input.len());
 
     let resp = runtime
-        .run_tool_loop(&config, user_msg, &registry, cancel)
+        .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
         .await
         .map_err(|e| crate::MetaError::ExecutionFailed(format!("Meta Agent 运行失败: {e}")))?;
 
@@ -436,6 +440,7 @@ mod tests {
             session,
             "看看世界书",
             cancel,
+            mpsc::unbounded_channel::<String>().0, // 测试不消费流式 token
         )
         .await
         .unwrap();
