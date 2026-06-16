@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 
-use storyforge_infra_llm::{Embedder, LlmClient};
+use storyforge_infra_llm::Embedder;
 use storyforge_infra_vector::{VectorHit, VectorStore};
 
 use crate::archiver::MemoryError;
@@ -37,7 +37,6 @@ impl From<VectorHit> for MemoryHit {
 
 /// 记忆召回器
 pub struct MemoryRecaller {
-    llm: Arc<dyn LlmClient>,
     embedder: Arc<Embedder>,
     vector_store: Arc<dyn VectorStore>,
     /// 最低相似度阈值
@@ -45,13 +44,8 @@ pub struct MemoryRecaller {
 }
 
 impl MemoryRecaller {
-    pub fn new(
-        llm: Arc<dyn LlmClient>,
-        embedder: Arc<Embedder>,
-        vector_store: Arc<dyn VectorStore>,
-    ) -> Self {
+    pub fn new(embedder: Arc<Embedder>, vector_store: Arc<dyn VectorStore>) -> Self {
         Self {
-            llm,
             embedder,
             vector_store,
             min_score: 0.45, // 设计 §7.3 默认值

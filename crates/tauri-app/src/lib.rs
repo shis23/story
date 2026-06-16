@@ -411,6 +411,23 @@ pub struct CharacterSummary {
     pub imported_at: String,
 }
 
+/// 统一 StoredCharacter → CharacterSummary 映射（消除重复，R-5）
+impl From<storage::StoredCharacter> for CharacterSummary {
+    fn from(stored: storage::StoredCharacter) -> Self {
+        Self {
+            id: stored.id,
+            name: stored.info.name,
+            description: stored.info.description,
+            tags: stored.info.tags,
+            creator: stored.info.creator,
+            spec_version: stored.info.spec_version,
+            world_info_count: stored.info.world_info_count,
+            has_renderable_assets: stored.info.has_renderable_assets,
+            imported_at: stored.imported_at,
+        }
+    }
+}
+
 // ─── M0 角色卡命令（保留）──────────────────────────────────────────────────
 
 #[tauri::command]
@@ -483,17 +500,7 @@ fn list_characters() -> Vec<CharacterSummary> {
     get_store()
         .list()
         .into_iter()
-        .map(|stored| CharacterSummary {
-            id: stored.id,
-            name: stored.info.name,
-            description: stored.info.description,
-            tags: stored.info.tags,
-            creator: stored.info.creator,
-            spec_version: stored.info.spec_version,
-            world_info_count: stored.info.world_info_count,
-            has_renderable_assets: stored.info.has_renderable_assets,
-            imported_at: stored.imported_at,
-        })
+        .map(CharacterSummary::from)
         .collect()
 }
 
@@ -962,17 +969,7 @@ fn set_plugin_enabled(id: String, enabled: bool, state: tauri::State<'_, Arc<App
 fn plugin_list_characters(plugin_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<CharacterSummary>, String> {
     use storyforge_infra_plugin_host::Permission;
     state.plugin_registry.ensure_permission(&plugin_id, &Permission::ReadCharacters).map_err(|e| format!("{e}"))?;
-    Ok(get_store().list().into_iter().map(|stored| CharacterSummary {
-        id: stored.id,
-        name: stored.info.name,
-        description: stored.info.description,
-        tags: stored.info.tags,
-        creator: stored.info.creator,
-        spec_version: stored.info.spec_version,
-        world_info_count: stored.info.world_info_count,
-        has_renderable_assets: stored.info.has_renderable_assets,
-        imported_at: stored.imported_at,
-    }).collect())
+    Ok(get_store().list().into_iter().map(CharacterSummary::from).collect())
 }
 
 #[tauri::command]

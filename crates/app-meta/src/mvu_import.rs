@@ -9,14 +9,12 @@
 //!
 //! 同时提供 ST 预设 LLM 分类（[`classify_st_preset_with_llm`]），增强现有纯启发式 bridge。
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use storyforge_app_agent::runtime::AgentRuntime;
-use storyforge_app_agent::tools::{ToolContext, ToolRegistry};
+use storyforge_app_agent::tools::ToolRegistry;
 
 use crate::prompts::{
     build_mvu_analyzer_user_msg, make_mvu_analyzer_config, register_mvu_tools,
@@ -70,15 +68,6 @@ pub async fn analyze_mvu_card(
 
     let mut registry = ToolRegistry::new();
     register_mvu_tools(&mut registry);
-
-    // 空 tool_ctx（MVU 分析不需要查世界书/角色）
-    let tool_ctx = Arc::new(ToolContext {
-        characters: vec![],
-        world_info: None,
-        vector_store: None,
-        archived_summaries: vec![],
-    });
-    let _ = tool_ctx; // 占位，run_tool_loop 实际用 registry 内的 handler
 
     let resp = match runtime
         .run_tool_loop(&config, user_msg, &registry, cancel)
