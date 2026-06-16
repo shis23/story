@@ -310,6 +310,7 @@ Layer 3: Vector Index（向量检索池）→ 余弦相似度搜索
 | [HANDOFF.md](docs/HANDOFF.md) | 项目交接文档（当前状态 + 后续计划 + 决策时点） |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构总览（crate 依赖图 + 一次写作调用链 + 持久化总表 + 命令映射，与代码同步） |
 | [AGENT_INTERFACES.md](docs/AGENT_INTERFACES.md) | Agent 接口索引（所有 prompt/上下文/输出解析位置，改 prompt 只看这文件） |
+| [CONVERSATION_FLOW.md](docs/CONVERSATION_FLOW.md) | 完整对话链路图（首次写作/重 roll/user重 roll/删除/会话选择/对话树/事件流/取消机制） |
 
 ---
 

@@ -10,30 +10,33 @@
 用户在 Composer.vue 输入意图，点发送
     │
     ▼
-App.vue.startWriting(intent)                          ← frontend/src/App.vue:259
-    │  1. 本地 push user 消息到 messages.value（即时反馈）
-    │  2. 调 tauri-api.startWriting(intent, characterId, onEvent)
+App.vue.startWriting(intent, skipLocalPush=false)     ← frontend/src/App.vue:277
+    │  1. 本地 push user 消息到 messages.value（即时反馈，skipLocalPush=true 时跳过）
+    │  2. 调 tauri-api.startWriting(intent, characterId, onEvent, conversationId)
+    │     conversationId = currentConversationId.value（null = 首次，有值 = 追加到已有对话）
     │
     ▼
 [Tauri 命令] start_writing                            ← tauri-app/src/lib.rs:1219
+    │  参数: intent, character_id?, conversation_id?, state, on_event
     │
     │  ① snapshot_tool_ctx()                           ← 读 ToolContext 快照
-    │     └─ characters: Vec<Character>                ← 导入的角色卡（name/description/personality/first_mes/...）
-    │     └─ world_info: Option<WorldInfoBook>         ← 世界书（所有条目，含蓝灯/绿灯路由）
+    │     └─ characters: Vec<Character>                ← 导入的角色卡
+    │     └─ world_info: Option<WorldInfoBook>         ← 世界书
     │
-    │  ② conv_store.create(character_id)               ← 新建对话（写 conversations/<id>.json）
+    │  ② conversation_id?
+    │     ├─ Some(id) → 复用已有对话
+    │     │   └─ append_user_message(intent)           ← 只追加 user 意图（开场白已在创建时存入）
+    │     └─ None → 新建对话
+    │         ├─ conv_store.create(character_id)
+    │         ├─ append_final_message(Assistant, first_mes)  ← 开场白
+    │         └─ append_user_message(intent)                  ← user 意图
     │
-    │  ③ append_final_message(Assistant, first_mes)    ← 开场白存入后端（Final 状态）
-    │  ④ append_user_message(intent)                   ← user 意图存入后端（Final 状态）
-    │     此时后端对话: [开场白, user意图]
-    │
-    │  ⑤ 构造 WritingContext:
-    │     ├─ characters         ← 从 tool_snapshot
-    │     ├─ world_info         ← 从 tool_snapshot
-    │     ├─ conversation_id    ← 新建的对话 ID
-    │     ├─ profile + modules  ← fill_profile_context() 加载活跃 Profile + 启用模块
-    │     └─ campaign_id / turn / pending_tasks / story_clock
-    │         ← fill_campaign_context() 从活跃 Campaign 加载
+    │  ③ 构造 WritingContext:
+    │     ├─ characters, world_info, conversation_id
+    │     ├─ profile + modules  ← fill_profile_context()
+    │     ├─ campaign_id / turn / pending_tasks / story_clock ← fill_campaign_context()
+    │     └─ recent_messages ← conv_store.recent_messages_with_role(id, 20, None)
+    │         最近 20 条带角色标签的对话（"用户: xxx" / "AI: xxx"）
     │
     │  ⑥ 建 cancel watch channel，sender 存 AppState.current_cancel
     │  ⑦ spawn 事件转发任务（PipelineEvent → WritingEvent → Channel → 前端）
@@ -75,6 +78,10 @@ PipelineOrchestrator.start_writing(intent, ctx)       ← app-pipeline/src/lib.r
     │     │  ┌─────────────────────────────────────────────────────┐
     │     │  │ "用户的写作意图：{intent}\n\n"                       │
     │     │  │ "可用角色：{char_names}\n\n"                         │
+    │     │  │                                                     │
+    │     │  │ "【最近对话历史】"              ← 新增               │
+    │     │  │ "用户: 第1条消息\n"                                  │
+    │     │  │ "AI: 第2条消息\n"                                    │
     │     │  │                                                     │
     │     │  │ "【世界设定（常驻）】"                                │
     │     │  │ "- {keys}：{content}"    ← 蓝灯 Constant/Both 条目  │
@@ -187,6 +194,10 @@ PipelineOrchestrator.start_writing(intent, ctx)       ← app-pipeline/src/lib.r
     │     │ "### {character_id}\n{full_text}\n\n---\n\n"        │
     │     │ "### {character_id}\n{full_text}\n\n---\n\n"        │
     │     │ "请合并成连贯成文。"                                  │
+    │     │                                                     │
+    │     │ "【最近对话历史】"              ← 新增               │
+    │     │ "用户: 第1条消息\n"                                  │
+    │     │ "AI: 第2条消息\n"                                    │
     │     └─────────────────────────────────────────────────────┘
     │
     │  runtime.run_tool_loop_streaming(                  ← 无工具，直接输出成文
@@ -272,9 +283,12 @@ App.vue.handleReroll({messageId, kind, hint})          ← frontend/src/App.vue:
     │  调 apiRegenerate({conversationId, nodeId, targets, hint}, onEvent)
     │
     ▼
-[Tauri 命令] regenerate(req)                           ← tauri-app/src/lib.rs:1547
+[Tauri 命令] regenerate(req)                           ← tauri-app/src/lib.rs:1559
     │  解析 targets → Vec<PartialRollTarget>
-    │  构造 WritingContext（同 start_writing）
+    │  构造 WritingContext:
+    │     └─ recent_messages ← conv_store.recent_messages_with_role(id, 20, Some(&node_id))
+    │         before_node_id = 目标节点 → 排除该节点及之后的消息
+    │         避免导演看到被重 roll 的旧 AI 回复
     │
     ▼
 PipelineOrchestrator.regenerate(req, ctx)              ← app-pipeline/src/lib.rs:539
@@ -326,23 +340,29 @@ PipelineOrchestrator.regenerate(req, ctx)              ← app-pipeline/src/lib.
 用户点 user 消息的「🔄 重roll」
     │
     ▼
-App.vue.handleRerollUser({messageId})                  ← frontend/src/App.vue:470
+App.vue.handleRerollUser({messageId})                  ← frontend/src/App.vue:488
     │  1. 找到这条 user 消息的 content → intent
     │  2. 找到紧随其后的 AI 消息 → aiMsg
-    │  3. 调 apiRegenerate({
-    │       conversationId: 当前对话 ID,
-    │       nodeId: aiMsg.id,          ← 目标是 AI 消息（有 provenance）
-    │       targets: [],                ← 整体重 roll
-    │       hint: intent,               ← user 的意图作为 hint 注入导演+编剧
-    │     }, onEvent)
     │
-    ▼
-后端走 regenerate 路径 A（整体重 roll）
-    │  导演 user_message = 旧 plan.scene_brief + inject_hint(intent)
-    │  子 Agent 全部重跑
-    │  编剧重跑（注入 hint = user intent）
+    │  有 AI 消息 → 调 regenerate（重 roll）
+    │  ├─ apiRegenerate({
+    │  │    conversationId: 当前对话 ID,
+    │  │    nodeId: aiMsg.id,          ← 目标是 AI 消息（有 provenance）
+    │  │    targets: [],                ← 整体重 roll
+    │  │    hint: intent,               ← user 的意图作为 hint
+    │  │  }, onEvent)
+    │  └─ 后端走 regenerate 路径 A（整体重 roll）
+    │     ├─ 导演 user_message = 旧 plan.scene_brief + inject_hint(intent)
+    │     ├─ recent_messages 排除目标 AI 消息及之后（before_node_id = aiMsg.id）
+    │     ├─ 子 Agent 全部重跑
+    │     └─ 编剧重跑（注入 hint = user intent）
     │
-    │  结果：替换原 AI 消息为新版本
+    │  无 AI 消息（已被删除）→ 调 startWriting（重新写作）
+    │  └─ startWriting(intent, skipLocalPush=true)
+    │     ├─ skipLocalPush=true → 不本地 push user 消息（已在列表中）
+    │     └─ 追加到当前对话（conversation_id = currentConversationId）
+    │
+    │  结果：替换原 AI 消息 或 新增 AI 消息
     │
     ▼
 前端：重拉对话 → [开场白, u1, a1, u2, a2, u3, new_a3]
@@ -372,7 +392,39 @@ App.vue.handleDeleteVariant({nodeId})                  ← frontend/src/App.vue:
 
 ---
 
-## 5. 对话树结构
+## 5. 会话历史选择界面
+
+```
+启动 App
+    │
+    ▼
+onMounted → loadConversationHistory()                  ← frontend/src/App.vue:82
+    │  listConversations() → conversationHistory.value
+    │  showHistory.value = true
+    │
+    ▼
+显示会话历史列表                                        ← frontend/src/App.vue:800
+    │  遍历 conversationHistory
+    │  每项显示: 会话 {id前8位} · {message_count} 条消息 · {updated_at}
+    │
+    │  用户操作：
+    │  ├─ 点击会话 → openConversation(conv)
+    │  │   ├─ getConversation(id) → applyConversation(conv)
+    │  │   ├─ currentConversationId = conv.id
+    │  │   ├─ showHistory = false
+    │  │   └─ 加载关联角色卡
+    │  │
+    │  ├─ 「新对话」→ startNewConversation()
+    │  │   ├─ messages = []
+    │  │   ├─ currentConversationId = null
+    │  │   └─ showHistory = false
+    │  │
+    │  └─ 📜 按钮 → showHistory = true（返回历史列表）
+```
+
+---
+
+## 6. 对话树结构
 
 ```
 Conversation { nodes: Vec<MessageNode> }
@@ -404,29 +456,32 @@ Provenance {
 
 ---
 
-## 6. 前端消息 vs 后端对话
+## 7. 前端消息 vs 后端对话
 
 ```
 前端 messages.value（本地状态）:
   ├─ 导入时本地 push 开场白
-  ├─ startWriting 本地 push user 消息
-  ├─ startWriting 本地 push AI 成文
-  └─ applyConversation 整体替换为后端数据
+  ├─ startWriting 本地 push user 消息（skipLocalPush=false 时）
+  ├─ editor_progress 更新 editor-streaming 占位
+  ├─ startWriting 完成后 push AI 成文
+  └─ applyConversation 整体替换为后端数据（打开会话/重 roll 刷新时）
 
 后端对话（持久化）:
-  ├─ start_writing 时 append 开场白 (Assistant/Final)
-  ├─ start_writing 时 append user 意图 (User/Final)
-  ├─ pipeline 完成后 append AI 成文 (Assistant/Draft)
-  └─ regenerate 时 replace/add variant
+  ├─ start_writing 新建时: append 开场白 + user 意图 (Final)
+  ├─ start_writing 复用时: 只 append user 意图 (Final)
+  ├─ pipeline 完成后: append AI 成文 (Draft)
+  ├─ regenerate 时: replace_active_variant（最后一条）或 add_variant（中间）
+  └─ delete_message_from 时: truncate_from（删除该条及之后所有）
 
-重启恢复:
-  └─ onMounted → listConversations → getConversation → applyConversation
-     └─ 从后端加载完整对话（开场白 + user意图 + AI成文）
+会话历史:
+  ├─ listConversations → 返回摘要（id, message_count, updated_at）
+  ├─ openConversation → getConversation → applyConversation
+  └─ startNewConversation → 清空 messages, currentConversationId = null
 ```
 
 ---
 
-## 7. 事件流（Channel）
+## 8. 事件流（Channel）
 
 ```
 start_writing / regenerate 通过 Channel 推送事件到前端：
@@ -455,7 +510,7 @@ started
 
 ---
 
-## 8. 取消机制
+## 9. 取消机制
 
 ```
 前端 cancelWriting()
@@ -474,4 +529,4 @@ watch channel 广播：
 
 ---
 
-*基于代码实测，2026-06-16。*
+*基于代码实测，2026-06-16。87 个 Tauri 命令，83 个 tauri-api 导出函数，15 个前端组件，242 个测试。*

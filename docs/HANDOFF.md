@@ -1,12 +1,12 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（对话历史注入导演/编剧 + 会话历史选择界面）
+> 最后更新：2026-06-16（对话完整性修复 + 对话历史注入 + 会话选择界面）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
-> **流式改造已完成（2026-06-16）**：子 Agent + meta_chat 全流式（token 实时推前端）+ 子 Agent 并发改 Semaphore 排队（超额不再丢弃）+ 重 roll 最后一条改原地替换（中间消息仍开分支）。详见 §3.10。
-> **UI 修复轮完成（2026-06-16）**：AgentRole serde round-trip + 14 处 Campaign 命令参数名 camelCase + 导入自动识别 + 删卡级联 + 删除语义重做（truncate + 清流水线 + 回显开场白）+ 分支按钮改提示。详见 §3.11。ARCHITECTURE.md 已同步更新。
-> 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
+> **流式改造已完成（2026-06-16）**：子 Agent + meta_chat 全流式 + 编剧流式进对话。详见 §3.10。
+> **对话完整性修复完成（2026-06-16）**：开场白 + user 意图存后端 + start_writing 支持复用对话 + 对话历史注入导演/编剧 + user 消息重 roll + 会话历史选择界面。详见 §3.12-§3.15。
+> 前端主流程完整（会话历史选择 → 导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
 > **前端 Campaign UI 已完成（2026-06-15）**：tauri-api.js 补全 21 个 P1/P2 API 函数 + CampaignPanel.vue 新组件（3 tab：角色卡/游玩档/档详情，含变量编辑/知识/任务/摘要面板）+ AppHeader 加 Campaign 按钮 + App.vue 集成（activeCampaign 状态 + 事件绑定），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
 > **写作链路已全通**：真实 LLM 流式调用（导演+编剧 token 实时推送）+ Plan 解析多层兜底（手写括号配平）+ 子 Agent 产出展示，
@@ -420,7 +420,7 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **新增 ConversationStore 方法**：`truncate_from`（+ 单测）、`replace_active_variant`、`is_last_assistant_node`（§3.10 C3 已加）。
 **新增 domain**：AgentRole 自定义 serde（扁平字符串 + 旧格式兼容，4 测试）。
 
-### 3.12 对话数据完整性修复 + user 消息重 roll（2026-06-16）
+### 3.12 对话数据完整性修复（2026-06-16）
 
 **根因**：`start_writing` 只在 pipeline 内部 `append_ai_draft`（成文），user 意图从未进后端对话树。前端本地 push 的 user 消息是纯展示用，`applyConversation` 刷新时被覆盖。删除唯一 AI 成文 → 后端对话空 → 前端回显开场白兜底（治标不治本）。
 
@@ -430,8 +430,8 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 |------|------|------|
 | 开场白 + user 意图存后端 | `tauri-app/lib.rs` start_writing | 创建对话后、调 pipeline 前，先 `append_final_message`（开场白，Assistant/Final）+ `append_user_message`（user 意图）。对话结构从 `[AI成文]` 变为 `[开场白, user意图, AI成文]` |
 | 删回显兜底 | `frontend/App.vue` handleDeleteVariant | 删掉 `if (!hadNodes && first_mes)` 兜底逻辑。改动后 truncate 不会让对话空（至少剩开场白 + user 意图） |
-| user 消息重 roll | `ChatMessage.vue` + `App.vue` | user 消息操作栏加「🔄 重roll」按钮 → `handleRerollUser` → 用同样 intent 重新调 `start_writing`（新建对话）。等效于「用同样指令重新写一遍」 |
 | ConversationStore 新方法 | `app-conversation/lib.rs` | `append_final_message(role, content)` — 通用 Final 状态消息追加（开场白等系统消息用） |
+| 编剧流式进对话 | `frontend/App.vue` | `editor_progress` 事件同时更新 PipelinePanel 和对话里的 `editor-streaming` 占位消息，写作完成后替换为最终成文 |
 
 **对话结构变化**：
 ```
@@ -439,25 +439,21 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 现在: 后端 [开场白, user意图, AI成文]  ← truncate 删 AI 成文后还有开场白 + user 意图
 ```
 
-**注意**：开场白在前端本地也有一份（handleImport/handleSelectChar 的 `messages.value = [{first_mes}]`），用于导入后立刻显示。后端那份保证重启恢复 + 删除后不丢。`startWriting` 成功后从后端 `applyConversation`（单一事实源），不再本地手动 push user/AI 消息，避免重复。
-
-**编剧流式进对话**：`editor_progress` 事件同时更新 PipelinePanel 和对话里的 `editor-streaming` 占位消息，用户在对话区实时看到编剧生成过程。写作完成（`applyConversation`）后占位被后端最终数据替换。
-
 **测试**：242 全绿。
 
 ### 3.13 start_writing 支持复用已有对话（2026-06-16）
 
 **问题**：每次 `start_writing` 都 `conv_store.create()` 新建 conversation。多轮写作产生多个独立对话，导演看不到前几轮的历史，重 roll 也只在当前对话里操作。
 
-**修复**：`start_writing` 新增可选参数 `conversation_id`：
-- 有值 → 追加 user 意图到已有对话（不新建，不重复存开场白）
-- 无值 → 新建对话 + 存开场白 + 存 user 意图（原行为）
+**修复**：`start_writing` 新增可选参数 `conversation_id: Option<String>`：
+- `Some(id)` → 追加 user 意图到已有对话（不新建，不重复存开场白）
+- `None` → 新建对话 + 存开场白 + 存 user 意图（原行为）
 
-前端 `startWriting` 调用时传 `currentConversationId.value`，实现多轮写作在同一个对话里累积。
+前端 `startWriting(intent, characterId, onEvent, conversationId)` 透传 `currentConversationId.value`。首次写 conversation_id 为 null（新建），后续写传已有 ID（追加）。
 
-**同步新增**：`docs/CONVERSATION_FLOW.md` 完整对话链路图（基于代码实测，覆盖首次写作/重 roll/user重 roll/删除/对话树结构/事件流/取消机制）。
+**同步新增**：`docs/CONVERSATION_FLOW.md` 完整对话链路图。
 
-### 3.14 对话历史注入 Agent 上下文 + 会话历史选择界面（2026-06-16）
+### 3.14 对话历史注入 Agent 上下文（2026-06-16）
 
 **问题**：导演/编剧看不到之前的对话历史。`build_director_user_msg` 只注入 intent + 角色名 + 蓝灯世界书 + 任务，编剧只看当前轮子 Agent 产出。多轮写作时导演说「上文为空」，编剧风格断裂。
 
@@ -466,12 +462,13 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 | 改动 | 文件 | 内容 |
 |------|------|------|
 | WritingContext 加 recent_messages | `app-pipeline/lib.rs` | 新字段 `recent_messages: Vec<String>`，最近 20 条带角色标签的对话 |
-| Conversation 加 recent_messages_with_role | `domain/conversation.rs` | 返回 `"用户: {content}"` / `"AI: {content}"` 格式 |
+| Conversation 加 recent_messages_with_role | `domain/conversation.rs` | 返回 `"用户: {content}"` / `"AI: {content}"` 格式，支持 `before_node_id` 参数排除目标节点及之后的消息 |
 | ConversationStore 加 recent_messages_with_role | `app-conversation/lib.rs` | 透传到 Conversation |
-| tauri-app 加载历史 | `tauri-app/lib.rs` | start_writing 和 regenerate 构造 ctx 时调 `conv_store.recent_messages_with_role` |
-| 导演注入历史 | `app-pipeline/lib.rs` | `build_director_user_msg` 末尾加「最近对话历史」段落 |
-| 编剧注入历史 | `app-pipeline/lib.rs` | start_writing 和 `run_editor_and_commit` 的 editor_user_msg 加「最近对话历史」段落 |
-| 会话历史选择界面 | `frontend/App.vue` | 启动时显示会话历史列表，点进一个会话加载上下文，📜 按钮返回历史 |
+| tauri-app 加载历史 | `tauri-app/lib.rs` | `start_writing`：传 `None`（不排除）；`regenerate`：传 `Some(&node_id)`（排除被重 roll 的消息） |
+| 导演注入历史 | `app-pipeline/lib.rs` | `build_director_user_msg` 加「最近对话历史」段落（在 intent 和角色名之后、世界书之前） |
+| 编剧注入历史 | `app-pipeline/lib.rs` | `start_writing` 和 `run_editor_and_commit` 的 editor_user_msg 加「最近对话历史」段落 |
+
+**重 roll 上下文排除**：`regenerate` 时 `recent_messages_with_role` 传 `before_node_id = Some(target_node_id)`，只返回目标节点之前的消息。避免导演看到被重 roll 的旧 AI 回复而困惑。
 
 **注入的上下文（每个 Agent 看到的）**：
 
@@ -482,7 +479,6 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
   最近对话历史：           ← 新增
     用户: 第1条消息
     AI: 第2条消息
-    ...
   世界设定（常驻）：...
   叙事任务/伏笔：...
 
@@ -500,10 +496,22 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
   最近对话历史：           ← 新增
     用户: 第1条消息
     AI: 第2条消息
-    ...
 ```
 
 **测试**：242 全绿。
+
+### 3.15 user 消息重 roll + 会话历史选择界面（2026-06-16）
+
+**user 消息重 roll**：`ChatMessage.vue` user 消息操作栏加「🔄 重roll」按钮 → `handleRerollUser`：
+- 有 AI 消息 → 调 `regenerate`（空 targets = 整体重跑，hint = user 意图）
+- 无 AI 消息（已删除）→ 调 `startWriting(intent, skipLocalPush=true)` 重新写作
+- `startWriting` 加 `skipLocalPush` 参数：true 时跳过本地 user 消息 push（避免重复）
+
+**会话历史选择界面**：启动时显示会话历史列表（不自动加载最近对话）：
+- 会话列表用 `summary.message_count`（非 nodes.length）
+- 点击会话 → `openConversation` 加载（`applyConversation` + 关联角色卡）
+- 「新对话」按钮 → 清空消息，`currentConversationId = null`
+- 顶栏 📜 按钮 → 返回历史列表
 
 ---
 

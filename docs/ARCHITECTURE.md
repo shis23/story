@@ -2,7 +2,7 @@
 
 > 本文档描述**代码实现层面**的架构，与代码同步。需求决策看 [INTENT.md](INTENT.md)，设计方案看 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)，改 prompt 看 [AGENT_INTERFACES.md](AGENT_INTERFACES.md)，进度状态看 [HANDOFF.md](HANDOFF.md)。
 >
-> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；89 个 Tauri 命令；测试数见 HANDOFF.md。
+> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；87 个 Tauri 命令；242 个测试。
 
 ---
 
@@ -540,7 +540,8 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 | `plugin_get_variable` 权限 | 校验的是 `WriteVariables` 而非读权限 | 代码现状，文档已标注 |
 | **CharacterStore/CampaignStore 双数据源** | 导入只写 CharacterStore（扁平 Character），Campaign 面板读 CampaignStore（CharacterCard）需 extract_characters 转换；删卡现已级联但两套数据天然易不一致 | 🔴 高：应统一（废弃 CharacterStore 或后者作缓存层）；见 HANDOFF §3.11 |
 | tauri-api.js 参数名无校验 | 曾系统性出现 14 处 snake_case 参数名（Tauri v2 期望 camelCase）；手动修易漏 | 应加脚本静态检查 invoke 参数名 vs Rust 命令签名 |
-| ~~start_writing 不存开场白/用户意图进对话~~ | ✅ 已修复：start_writing 创建对话后先 append 开场白 + user 意图，对话结构变为 [开场白, user意图, AI成文] | — |
+| ~~start_writing 不存开场白/用户意图进对话~~ | ✅ 已修复：start_writing 创建对话后先 append 开场白 + user 意图 | — |
+| ~~对话历史未注入 Agent~~ | ✅ 已修复：WritingContext.recent_messages 注入导演和编剧，重 roll 时排除目标节点 | — |
 | Campaign.fork 未暴露 | `Campaign::fork` domain 方法已实现（fork_from 记分叉点），但无 Tauri 命令 + 前端入口；「分支」按钮只弹提示 | 真「分支=开新档」能力未接通 |
 
 ---
