@@ -143,11 +143,12 @@ async function toggleInstance(inst) {
 
 async function handleVariableChange(instanceId, key, value) {
   try {
-    // 尝试解析为数字/布尔
+    // 仅解析布尔字面量；数字/字符串保持原样，由后端 schema 决定类型。
+    // 历史 bug：启发式 Number(value) 会把纯数字字符串（如电话号 "13800001111"）
+    // 强转 Number 丢失前导零/精度，或把 "0x1F"/"1e3" 这种字面量悄悄转换。
     let parsed = value
     if (value === 'true') parsed = true
     else if (value === 'false') parsed = false
-    else if (!isNaN(value) && value.trim() !== '') parsed = Number(value)
 
     await setCharacterVariable(selectedCampaignId.value, instanceId, key, parsed)
     // 刷新变量

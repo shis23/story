@@ -40,7 +40,10 @@ async function loadSidebarPlugins() {
   try {
     const all = await listPlugins()
     sidebarPlugins.value = (all || []).filter(p => p.enabled && p.ui_slots?.includes('SidebarPanel'))
-  } catch {}
+  } catch (e) {
+    console.error('加载侧栏插件失败:', e)
+    logAppendFrontend('error', `loadSidebarPlugins: ${e}`).catch(() => {})
+  }
 }
 
 // 流水线状态
@@ -77,10 +80,10 @@ const agentConfigRef = ref(null)
 
 // 获取版本 + 加载活跃连接 + 恢复最近对话 + 拦截 console
 onMounted(async () => {
-  try { appVersion.value = await getVersion() } catch {}
+  try { appVersion.value = await getVersion() } catch (e) { console.error('getVersion:', e) }
   await refreshActiveConnection()
   await loadRecentConversation()
-  try { activeCampaign.value = await getActiveCampaign() } catch {}
+  try { activeCampaign.value = await getActiveCampaign() } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()
 })
@@ -143,7 +146,7 @@ async function loadRecentConversation() {
             if (m.role === 'assistant') m.role_label = char.name
           })
         }
-      } catch {}
+      } catch (e) { console.error('加载关联角色卡失败:', e) }
     }
   } catch (e) {
     console.error('恢复对话失败:', e)
@@ -257,8 +260,9 @@ async function startWriting(intent) {
   pipeline.editor = { status: 'idle', detail: '', output: '' }
 
   // 先把用户意图加入消息列表（聊天界面应该看到自己发了什么）
+  const userMsgId = `user-${Date.now()}`
   messages.value.push({
-    id: `user-${Date.now()}`,
+    id: userMsgId,
     role: 'user',
     role_label: '我',
     active_variant: 0,
@@ -300,6 +304,8 @@ async function startWriting(intent) {
     pipeline.stateLabel = '已完成'
     scrollToBottom()
   } catch (err) {
+    // 失败回滚：移除已 push 的用户消息（无对应 AI 回复，残留会误导重试）
+    messages.value = messages.value.filter((m) => m.id !== userMsgId)
     pipeline.state = 'error'
     pipeline.stateLabel = `失败: ${err}`
   } finally {

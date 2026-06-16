@@ -37,19 +37,19 @@ onMounted(async () => {
   // 加载角色卡（给 MVU 分析按钮用）
   try {
     characters.value = await listCharacters()
-  } catch {}
+  } catch (e) { console.error('加载角色卡失败:', e) }
 })
 
 async function refreshPatches() {
   try {
     pendingPatches.value = await metaListPendingPatches()
-  } catch {}
+  } catch (e) { console.error('加载待采纳 Patch 失败:', e) }
 }
 
 async function refreshMvuList() {
   try {
     mvuTranslations.value = await metaListMvuTranslations()
-  } catch {}
+  } catch (e) { console.error('加载 MVU 列表失败:', e) }
 }
 
 // ─── 对话 ───
@@ -58,15 +58,17 @@ async function handleSend() {
   if (!text || loading.value) return
   loading.value = true
   error.value = ''
-  // 先把用户输入加进消息列表（即时反馈）
-  messages.value.push({ role: 'user', content: text })
+  // 先把用户输入加进消息列表（即时反馈）。用稳定 id 作 v-for key，避免 index 复用错位
+  messages.value.push({ id: `meta-user-${Date.now()}`, role: 'user', content: text })
   userInput.value = ''
   await scrollToBottom()
 
   try {
     const result = await metaChat(conversationId.value, text)
     if (result.agent_message) {
-      messages.value.push(result.agent_message)
+      // 后端 agent_message 可能无 id，补一个保证 v-for key 稳定
+      const msg = result.agent_message
+      messages.value.push({ id: msg.id || `meta-agent-${Date.now()}`, ...msg })
     }
     if (result.new_patch) {
       await refreshPatches()
@@ -202,7 +204,7 @@ function routingText(routing) {
             </div>
 
             <div
-              v-for="(msg, i) in messages" :key="i"
+              v-for="msg in messages" :key="msg.id"
               class="flex"
               :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
             >

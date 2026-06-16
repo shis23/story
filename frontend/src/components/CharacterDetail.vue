@@ -39,8 +39,9 @@ onMounted(async () => {
   // 尝试加载此卡的 MVU 翻译（用户在 Meta 面板手动分析过才有）
   try {
     mvuTranslation.value = await metaGetMvuTranslation(props.character.id)
-  } catch {
-    // 无翻译或非 Tauri 环境，静默跳过（状态栏不显示）
+  } catch (e) {
+    // 无翻译或非 Tauri 环境，静默跳过（状态栏不显示），仅记录便于排查
+    console.error('加载 MVU 翻译失败（可能未分析过）:', e)
   }
 })
 
