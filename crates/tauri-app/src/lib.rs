@@ -2076,6 +2076,21 @@ fn soft_delete_variant(
         .map_err(|e| format!("{e}"))
 }
 
+/// Tauri command: 删除指定消息及其后所有消息（截断对话 = 撤销从这条开始的写作）
+#[tauri::command]
+fn delete_message_from(
+    conversation_id: String,
+    node_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let conv_id = Id::from_str(&conversation_id);
+    let nid = Id::from_str(&node_id);
+    state
+        .conv_store
+        .truncate_from(&conv_id, &nid)
+        .map_err(|e| format!("{e}"))
+}
+
 /// 添加新变体（分支/swipe）
 #[tauri::command]
 fn add_variant(
@@ -3363,6 +3378,7 @@ pub fn run() {
             edit_variant,
             accept_variant,
             soft_delete_variant,
+    delete_message_from,
             add_variant,
             switch_variant,
             // M1 日志命令

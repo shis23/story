@@ -385,6 +385,27 @@ impl ConversationStore {
         })
     }
 
+    /// 删除指定 node 及其之后所有 node（截断对话）
+    ///
+    /// 语义：删除某条 AI 成文 = 撤销从这条开始的写作（含其后的所有消息）。
+    /// 如果 node_id 不存在则报错；node_id 是首个被删的（保留它之前的所有消息）。
+    pub fn truncate_from(
+        &self,
+        conv_id: &Id,
+        node_id: &Id,
+    ) -> Result<(), ConversationError> {
+        self.with_conversation_mut(conv_id, |conv| {
+            let pos = conv
+                .nodes
+                .iter()
+                .position(|n| &n.id == node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
+            conv.nodes.truncate(pos);
+            conv.updated_at = Utc::now();
+            Ok(())
+        })
+    }
+
     /// 获取最近 N 条消息（用于上下文窗口）
     pub fn recent_messages(&self, conv_id: &Id, n: usize) -> Vec<String> {
         self.get(conv_id)
@@ -593,6 +614,31 @@ mod tests {
             updated.find_node(&node_id).unwrap().active().unwrap().status,
             VariantStatus::Discarded
         );
+
+        let _ = store.delete(&conv.id);
+    }
+
+    /// truncate_from：删除指定 node 及其后所有，保留之前的
+    #[test]
+    fn test_truncate_from_remains_prior_nodes() {
+        let store = temp_store();
+        let conv = store.create(None);
+        // user1 → ai1 → ai2 → ai3
+        let _u1 = store.append_user_message(&conv.id, "意图1".into()).unwrap();
+        let ai1 = store.append_ai_draft(&conv.id, "成文1".into(), None).unwrap();
+        let _ai2 = store.append_ai_draft(&conv.id, "成文2".into(), None).unwrap();
+        let _ai3 = store.append_ai_draft(&conv.id, "成文3".into(), None).unwrap();
+
+        // 从 ai1 起截断（删 ai1/ai2/ai3，保留 u1）
+        store.truncate_from(&conv.id, &ai1).unwrap();
+
+        let updated = store.get(&conv.id).unwrap();
+        assert_eq!(updated.nodes.len(), 1, "应只保留 user1");
+        assert_eq!(updated.nodes[0].active_content(), "意图1");
+
+        // 截断不存在的 node 应报错
+        let bad = store.truncate_from(&conv.id, &Id::new());
+        assert!(bad.is_err());
 
         let _ = store.delete(&conv.id);
     }

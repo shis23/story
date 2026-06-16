@@ -447,6 +447,13 @@ export async function softDeleteVariant(conversationId, nodeId) {
   }
 }
 
+/** 删除指定消息及其后所有消息（截断对话 = 撤销从这条开始的写作） */
+export async function deleteMessageFrom(conversationId, nodeId) {
+  if (isTauri()) {
+    return await invoke('delete_message_from', { conversationId, nodeId })
+  }
+}
+
 /** 添加新变体（分支/swipe），返回新 variant 索引 */
 export async function addVariant(conversationId, nodeId, content, provenance) {
   if (isTauri()) {

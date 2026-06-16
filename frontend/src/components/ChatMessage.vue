@@ -101,9 +101,11 @@ function acceptVariant() {
   emit('accept-variant', { nodeId: props.message.id })
 }
 
-// 软删除变体（带确认）
-function deleteVariant() {
-  if (!window.confirm('确定删除当前版本？删除后可在历史中切回查看（软删除）。')) return
+// 软删除变体（带确认，用 Tauri 原生对话框——WebView 的 window.confirm 不会弹窗）
+async function deleteVariant() {
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask('确定删除这条消息？删除后该消息从对话移除。', { title: '删除确认', kind: 'warning' })
+  if (!ok) return
   emit('delete-variant', { nodeId: props.message.id })
 }
 

@@ -14,7 +14,7 @@ import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins, extractCharacters } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -430,12 +430,12 @@ async function handleAcceptVariant({ nodeId }) {
   }
 }
 
-// 软删除变体（→ Discarded），删除后重新拉取对话刷新（单一事实源：
-// 后端 soft_delete 会自动切到最近非 Discarded variant，前端需同步）
+// 删除消息 = 删该条及其后所有（撤销从这条开始的写作）+ 清流水线状态
 async function handleDeleteVariant({ nodeId }) {
   if (!currentConversationId.value) return
   try {
-    await apiSoftDeleteVariant(currentConversationId.value, nodeId)
+    await apiDeleteMessageFrom(currentConversationId.value, nodeId)
+    // 重新拉取对话刷新（truncate 后该消息及之后都消失）
     const refreshed = await getConversation(currentConversationId.value)
     if (refreshed) {
       applyConversation(refreshed)
@@ -445,8 +445,16 @@ async function handleDeleteVariant({ nodeId }) {
         })
       }
     }
+    // 清流水线状态（删除 = 回到这条之前的状态，上次写作的导演/子Agent/编剧输出作废）
+    pipeline.state = 'idle'
+    pipeline.stateLabel = ''
+    pipeline.director = { status: 'idle', detail: '', output: '' }
+    pipeline.subagents = []
+    pipeline.editor = { status: 'idle', detail: '', output: '' }
+    showPipeline.value = false
   } catch (e) {
     console.error('删除失败:', e)
+    alert('删除失败: ' + e)
   }
 }
 
