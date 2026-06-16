@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 use crate::agent::{Performance, Plan};
+use crate::llm::{ChatMessage, ChatRole};
 
 // ─── 对话树（对应设计 §3.7 MessageNode 树结构）────────────────────────────
 
@@ -266,29 +267,68 @@ impl Conversation {
     /// 格式："用户: {content}" 或 "AI: {content}"
     /// `before_node_id`：如果指定，只返回该节点之前的消息（不含该节点及其后的）
     pub fn recent_messages_with_role(&self, n: usize, before_node_id: Option<&Id>) -> Vec<String> {
-        // 确定截止位置
+        self.iter_recent_active(n, before_node_id)
+            .map(|v| {
+                let role_label = match v.role {
+                    Role::User => "用户",
+                    Role::Assistant => "AI",
+                };
+                format!("{}: {}", role_label, v.content)
+            })
+            .collect()
+    }
+
+    /// 获取最近 N 条消息作为真正的 ChatMessage 列表（§22 cache 友好布局用）
+    ///
+    /// 与 `recent_messages_with_role` 的区别：返回 `Vec<ChatMessage>` 而非 `Vec<String>`，
+    /// 每条消息的 role 映射为 `ChatRole::User/Assistant`，content 不加「用户:」前缀。
+    /// 这样历史能作为独立消息段进 LLM（而非塞进 user tail 文本），保证 system+history 前缀稳定，cache 命中。
+    ///
+    /// `before_node_id`：如果指定，只返回该节点之前的消息（regenerate 重 roll 时排除目标节点及之后）
+    pub fn recent_messages_as_chat(
+        &self,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> Vec<ChatMessage> {
+        self.iter_recent_active(n, before_node_id)
+            .map(|v| {
+                let role = match v.role {
+                    Role::User => ChatRole::User,
+                    Role::Assistant => ChatRole::Assistant,
+                };
+                ChatMessage {
+                    role,
+                    content: v.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }
+            })
+            .collect()
+    }
+
+    /// 共享迭代器：返回最近 N 条「活跃且非空非 Discarded」的变体（按时间正序）
+    ///
+    /// `recent_messages_with_role` 和 `recent_messages_as_chat` 都复用此逻辑，
+    /// 保证过滤规则（Discarded/空跳过）和截断规则（before_node_id）一致。
+    fn iter_recent_active(
+        &self,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> impl Iterator<Item = &MessageVariant> {
+        // 确定截止位置：before_node_id 指定时只取该节点之前（不含）
         let end_idx = if let Some(bid) = before_node_id {
-            self.nodes.iter().position(|n| &n.id == bid).unwrap_or(self.nodes.len())
+            self.nodes.iter().position(|node| &node.id == bid).unwrap_or(self.nodes.len())
         } else {
             self.nodes.len()
         };
+        // rev → take(n) → rev：取最近 N 条但保持正序
         self.nodes[..end_idx]
             .iter()
             .rev()
             .take(n)
             .rev()
-            .filter_map(|node| {
-                let v = node.active()?;
-                if v.status == VariantStatus::Discarded || v.content.is_empty() {
-                    return None;
-                }
-                let role_label = match v.role {
-                    Role::User => "用户",
-                    Role::Assistant => "AI",
-                };
-                Some(format!("{}: {}", role_label, v.content))
-            })
-            .collect()
+            .filter_map(|node| node.active())
+            .filter(|v| v.status != VariantStatus::Discarded && !v.content.is_empty())
     }
 
     /// 查找节点
@@ -301,3 +341,113 @@ impl Conversation {
         self.nodes.iter_mut().find(|n| &n.id == id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(role: Role, content: &str, status: VariantStatus) -> MessageVariant {
+        MessageVariant {
+            id: Id::new(),
+            role,
+            content: content.into(),
+            created_at: Utc::now(),
+            status,
+            provenance: None,
+        }
+    }
+
+    fn node(id: &str, v: MessageVariant) -> MessageNode {
+        MessageNode {
+            id: Id::from_str(id),
+            parent_id: None,
+            variants: vec![v],
+            active_variant: 0,
+        }
+    }
+
+    fn conv(nodes: Vec<MessageNode>) -> Conversation {
+        Conversation {
+            id: Id::from_str("c1"),
+            character_id: Some("char1".into()),
+            nodes,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_recent_messages_as_chat_maps_roles() {
+        let c = conv(vec![
+            node("n1", variant(Role::User, "写雨中告别", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "雨滴敲在屋檐…", VariantStatus::Final)),
+            node("n3", variant(Role::User, "继续", VariantStatus::Final)),
+        ]);
+        let msgs = c.recent_messages_as_chat(10, None);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, ChatRole::User);
+        assert_eq!(msgs[0].content, "写雨中告别");
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+        assert_eq!(msgs[2].role, ChatRole::User);
+    }
+
+    #[test]
+    fn test_recent_messages_as_chat_filters_discarded_and_empty() {
+        let c = conv(vec![
+            node("n1", variant(Role::User, "意图", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "", VariantStatus::Final)), // 空，跳过
+            node("n3", variant(Role::Assistant, "废弃稿", VariantStatus::Discarded)), // 软删，跳过
+            node("n4", variant(Role::Assistant, "成文", VariantStatus::Final)),
+        ]);
+        let msgs = c.recent_messages_as_chat(10, None);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "意图");
+        assert_eq!(msgs[1].content, "成文");
+    }
+
+    #[test]
+    fn test_recent_messages_as_chat_truncates_n() {
+        let c = conv(vec![
+            node("n1", variant(Role::User, "u1", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "a1", VariantStatus::Final)),
+            node("n3", variant(Role::User, "u2", VariantStatus::Final)),
+            node("n4", variant(Role::Assistant, "a2", VariantStatus::Final)),
+        ]);
+        // 只取最近 2 条，且保持正序
+        let msgs = c.recent_messages_as_chat(2, None);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "u2");
+        assert_eq!(msgs[1].content, "a2");
+    }
+
+    #[test]
+    fn test_recent_messages_as_chat_before_node_excludes_target_and_after() {
+        let c = conv(vec![
+            node("n1", variant(Role::User, "u1", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "a1", VariantStatus::Final)),
+            node("n3", variant(Role::User, "u2", VariantStatus::Final)), // 重 roll 目标
+            node("n4", variant(Role::Assistant, "a2", VariantStatus::Final)),
+        ]);
+        // before_node_id = n3：只返回 n1, n2（不含 n3 及之后）
+        let msgs = c.recent_messages_as_chat(10, Some(&Id::from_str("n3")));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "u1");
+        assert_eq!(msgs[1].content, "a1");
+    }
+
+    #[test]
+    fn test_recent_messages_as_chat_with_role_agree_on_filter() {
+        // 两个方法底层共享 iter_recent_active，过滤规则必须一致
+        let c = conv(vec![
+            node("n1", variant(Role::User, "意图", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "废弃", VariantStatus::Discarded)),
+            node("n3", variant(Role::Assistant, "成文", VariantStatus::Final)),
+        ]);
+        let as_chat = c.recent_messages_as_chat(10, None);
+        let with_role = c.recent_messages_with_role(10, None);
+        assert_eq!(as_chat.len(), with_role.len());
+        assert_eq!(as_chat[0].content, "意图");
+        assert!(with_role[0].contains("意图"));
+    }
+}
+

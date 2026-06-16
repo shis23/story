@@ -16,7 +16,7 @@ use storyforge_domain::Id;
 
 use storyforge_app_agent::{
     AgentConfig, AgentError, AgentRuntime, ToolContext, ToolRegistry, spawn_subagents,
-    inject_hint_into_editor, inject_hint_into_subagent,
+    EDITOR_HINT_MARKER, SUBAGENT_HINT_MARKER,
     tools::register_director_tools,
 };
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget, build_provenance};
@@ -225,12 +225,23 @@ impl PipelineOrchestrator {
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
-        let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
+        let director_config = make_director_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &build_director_system_extra(ctx),
+        );
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
 
-        // 构造导演的用户消息（含蓝灯常驻世界书条目，按 depth 排序）
-        let director_user_msg = build_director_user_msg(&intent, ctx);
+        // §22 cache 友好布局：system（role_directive + 模块 + 蓝灯）+ history（对话历史）+ tail（意图/角色/任务）
+        // 对话历史作为独立消息段（而非塞进 user 文本），保证 system+history 前缀稳定、cache 命中。
+        let history = self
+            .conv_store
+            .recent_messages_as_chat(&ctx.conversation_id, 20, None);
+        let director_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(director_config.system_prompt.clone())
+            .history(history)
+            .tail(|_| build_director_tail(&intent, ctx));
 
         // 流式：导演的输出 token 实时转成 DirectorProgress 事件
         let (director_prog_tx, mut director_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -243,9 +254,9 @@ impl PipelineOrchestrator {
 
         let director_resp = match self
             .runtime
-            .run_tool_loop_streaming(
+            .run_tool_loop_with_layout(
                 &director_config,
-                director_user_msg,
+                director_layout,
                 &director_registry,
                 cancel.clone(),
                 director_prog_tx,
@@ -364,17 +375,14 @@ impl PipelineOrchestrator {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        let mut editor_user_msg = format!(
-            "场景：{}\n\n子 Agent 表演：\n\n{}\n\n请合并成连贯成文。",
-            plan.scene_brief, performances_text
-        );
-        // 注入最近对话历史（让编剧保持风格和情节连贯）
-        if !ctx.recent_messages.is_empty() {
-            editor_user_msg.push_str("\n\n【最近对话历史】\n");
-            for line in &ctx.recent_messages {
-                editor_user_msg.push_str(&format!("{line}\n"));
-            }
-        }
+        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
+        let editor_history = self
+            .conv_store
+            .recent_messages_as_chat(&ctx.conversation_id, 20, None);
+        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(editor_config.system_prompt.clone())
+            .history(editor_history)
+            .tail(|_| build_editor_tail(&plan.scene_brief, &performances_text, None));
 
         // 流式：编剧的输出 token 实时转成 EditorProgress 事件
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -387,9 +395,9 @@ impl PipelineOrchestrator {
 
         let editor_resp = match self
             .runtime
-            .run_tool_loop_streaming(
+            .run_tool_loop_with_layout(
                 &editor_config,
-                editor_user_msg,
+                editor_layout,
                 &ToolRegistry::new(), // 编剧无工具，直接输出
                 cancel.clone(),
                 editor_prog_tx,
@@ -616,21 +624,38 @@ impl PipelineOrchestrator {
                 return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
             }
 
-            let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
+            let director_config = make_director_config(
+                ctx.profile.as_ref(),
+                &ctx.modules,
+                &build_director_system_extra(ctx),
+            );
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
 
-            // 导演 user 消息：拼接旧 Plan 的场景 + hint（含蓝灯常驻条目）
+            // 导演 intent：复用旧 Plan 的场景作 intent + 可选 hint
             let intent_text = provenance_old
                 .plan
                 .as_ref()
                 .map(|p| p.scene_brief.clone())
                 .unwrap_or_else(|| "重新创作".into());
-            let mut director_user_msg = build_director_user_msg(&intent_text, ctx);
-            if let Some(h) = &hint {
-                director_user_msg =
-                    inject_hint_into_editor(&director_user_msg, h);
-            }
+
+            // §22 cache 友好布局：history 排除重 roll 目标节点及之后
+            let director_history = self
+                .conv_store
+                .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
+            let director_layout = storyforge_domain::message_layout::MessageLayout::build()
+                .system(director_config.system_prompt.clone())
+                .history(director_history)
+                .tail(|_| {
+                    let mut t = build_director_tail(&intent_text, ctx);
+                    if let Some(h) = hint.as_deref() {
+                        let h = h.trim();
+                        if !h.is_empty() {
+                            t = t.push(format!("{EDITOR_HINT_MARKER}{h}"));
+                        }
+                    }
+                    t
+                });
 
             // 流式：导演输出实时推 DirectorProgress
             let (director_prog_tx, mut director_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -643,9 +668,9 @@ impl PipelineOrchestrator {
 
             let director_resp = match self
                 .runtime
-                .run_tool_loop_streaming(
+                .run_tool_loop_with_layout(
                     &director_config,
-                    director_user_msg,
+                    director_layout,
                     &director_registry,
                     cancel.clone(),
                     director_prog_tx,
@@ -739,7 +764,6 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
-                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -783,7 +807,6 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
-                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -821,21 +844,42 @@ impl PipelineOrchestrator {
             });
 
             // 重跑该子 Agent（单任务，注入 hint 到 system prompt）
-            let director_config = make_director_config(ctx.profile.as_ref(), &ctx.modules);
+            let director_config = make_director_config(
+                ctx.profile.as_ref(),
+                &ctx.modules,
+                &build_director_system_extra(ctx),
+            );
             let new_perf = {
-                let mut sys = format!(
-                    "{}\n\n你是角色 {}。\n\n{}\n\n{}",
+                // §22 cache 友好布局：persona + 常驻世界设定进 system，场景/相关设定/最近对话 + 任务 + hint 进 tail
+                let stable_system = format!(
+                    "{}\n\n你是角色 {}。\n\n{}",
                     SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
                     target_task.character_id,
-                    format_subagent_context(&target_task.context_package),
+                    format_subagent_context_stable(&target_task.context_package),
+                );
+                let volatile_text = format!(
+                    "{}\n\n{}",
+                    format_subagent_context_volatile(&target_task.context_package),
                     target_task.brief,
                 );
-                if let Some(h) = &hint {
-                    sys = inject_hint_into_subagent(&sys, h);
-                }
+                let hint_for_tail = hint.clone();
+                let sub_layout = storyforge_domain::message_layout::MessageLayout::build()
+                    .system(stable_system)
+                    .tail(|_| {
+                        let mut t = storyforge_domain::message_layout::VolatileTail::new()
+                            .push(target_task.context_package.task.clone())
+                            .push(volatile_text.trim_end().to_string());
+                        if let Some(h) = hint_for_tail.as_deref() {
+                            let h = h.trim();
+                            if !h.is_empty() {
+                                t = t.push(format!("{SUBAGENT_HINT_MARKER}{h}"));
+                            }
+                        }
+                        t
+                    });
                 let config = AgentConfig {
                     role: AgentRole::Subagent(target_id.clone()),
-                    system_prompt: sys,
+                    system_prompt: String::new(), // layout 版不使用此字段
                     max_tool_rounds: 10,
                     model: director_config.model.clone(),
                     tools: vec![],
@@ -859,9 +903,9 @@ impl PipelineOrchestrator {
 
                 match self
                     .runtime
-                    .run_tool_loop_streaming(
+                    .run_tool_loop_with_layout(
                         &config,
-                        target_task.context_package.task.clone(),
+                        sub_layout,
                         &registry,
                         cancel.clone(),
                         sub_tx,
@@ -931,7 +975,6 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
-                    &ctx.recent_messages,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -946,7 +989,8 @@ impl PipelineOrchestrator {
 
     /// 内部：跑编剧 + 写入对话树（新 variant），返回 (成文, Provenance)
     ///
-    /// 被 start_writing 和 regenerate 的各路径复用。`hint` 注入到编剧 user 消息。
+    /// 被 regenerate 的各路径复用。`hint` 注入到编剧 tail。
+    /// `before_node_id`：取对话历史时排除该节点及之后（重 roll 时排除目标消息）。
     async fn run_editor_and_commit(
         &mut self,
         plan: &Plan,
@@ -959,7 +1003,6 @@ impl PipelineOrchestrator {
         cancel: watch::Receiver<bool>,
         profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
         modules: &[storyforge_domain::prompt_module::PromptModule],
-        recent_messages: &[String],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -978,20 +1021,14 @@ impl PipelineOrchestrator {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        let mut editor_user_msg = format!(
-            "场景：{}\n\n子 Agent 表演：\n\n{}\n\n请合并成连贯成文。",
-            plan.scene_brief, performances_text
-        );
-        if let Some(h) = hint {
-            editor_user_msg = inject_hint_into_editor(&editor_user_msg, h);
-        }
-        // 注入最近对话历史（让编剧保持风格和情节连贯）
-        if !recent_messages.is_empty() {
-            editor_user_msg.push_str("\n\n【最近对话历史】\n");
-            for line in recent_messages {
-                editor_user_msg.push_str(&format!("{line}\n"));
-            }
-        }
+        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
+        let editor_history = self
+            .conv_store
+            .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
+        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(editor_config.system_prompt.clone())
+            .history(editor_history)
+            .tail(|_| build_editor_tail(&plan.scene_brief, &performances_text, hint));
 
         // 流式：编剧输出实时推 EditorProgress
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -1004,9 +1041,9 @@ impl PipelineOrchestrator {
 
         let editor_resp = match self
             .runtime
-            .run_tool_loop_streaming(
+            .run_tool_loop_with_layout(
                 &editor_config,
-                editor_user_msg,
+                editor_layout,
                 &ToolRegistry::new(),
                 cancel,
                 editor_prog_tx,
@@ -1066,11 +1103,52 @@ impl PipelineOrchestrator {
 
 // ─── 辅助函数 ──────────────────────────────────────────────────────────────
 
-/// 构造导演的用户消息：意图 + 可用角色 + 蓝灯常驻世界书（按 depth 排序）
+/// 构造导演 system 段的「稳定附加」部分：蓝灯常驻世界设定（§22 cache 友好布局）
 ///
-/// 蓝灯常驻条目（LoreRoute::Constant/Both）自动注入导演上下文，
-/// 按 depth 升序排列（depth 小的靠后=更受重视，对齐 ST 近因效应语义）。
-fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
+/// 这部分内容整个会话稳定（不随每轮变化），移进 system 段以最大化 cache 命中。
+/// 蓝灯常驻条目（LoreRoute::Constant/Both）按 depth 升序排列
+///（depth 小的靠后=更受重视，对齐 ST 近因效应语义）。
+fn build_director_system_extra(ctx: &WritingContext) -> String {
+    let Some(book) = &ctx.world_info else {
+        return String::new();
+    };
+    let mut constants: Vec<_> = book
+        .entries
+        .iter()
+        .filter(|e| {
+            e.route == storyforge_domain::world_info::LoreRoute::Constant
+                || e.route == storyforge_domain::world_info::LoreRoute::Both
+        })
+        .collect();
+    // depth 小的排后面（更重要）；depth 相同 order 小的排后面
+    constants.sort_by(|a, b| {
+        b.depth
+            .cmp(&a.depth)
+            .then_with(|| b.order.cmp(&a.order))
+    });
+
+    if constants.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("【世界设定（常驻）】\n");
+    for e in &constants {
+        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
+    }
+    out.push_str("\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）");
+    out
+}
+
+/// 构造导演的易变末尾（§22 volatile tail）：意图 + 可用角色 + 任务/伏笔
+///
+/// 这些内容每轮可能变化（意图变、任务触发变），压在 user tail 段，保证
+/// system + history 前缀稳定、cache 命中。
+fn build_director_tail(
+    intent: &str,
+    ctx: &WritingContext,
+) -> storyforge_domain::message_layout::VolatileTail {
+    use storyforge_domain::message_layout::VolatileTail;
+
     let char_names = ctx
         .characters
         .iter()
@@ -1078,45 +1156,10 @@ fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
         .collect::<Vec<_>>()
         .join("、");
 
-    let mut msg = format!("用户的写作意图：{intent}\n\n可用角色：{char_names}\n\n");
+    let mut tail = VolatileTail::new();
+    tail = tail.push(format!("用户的写作意图：{intent}\n\n可用角色：{char_names}"));
 
-    // 注入最近对话历史（让导演知道故事讲到哪了）
-    if !ctx.recent_messages.is_empty() {
-        msg.push_str("【最近对话历史】\n");
-        for line in &ctx.recent_messages {
-            msg.push_str(&format!("{line}\n"));
-        }
-        msg.push('\n');
-    }
-
-    // 蓝灯常驻条目注入（按 depth 升序，depth 相同按 order）
-    if let Some(book) = &ctx.world_info {
-        let mut constants: Vec<_> = book
-            .entries
-            .iter()
-            .filter(|e| {
-                e.route == storyforge_domain::world_info::LoreRoute::Constant
-                    || e.route == storyforge_domain::world_info::LoreRoute::Both
-            })
-            .collect();
-        // depth 小的排后面（更重要）；depth 相同 order 小的排后面
-        constants.sort_by(|a, b| {
-            b.depth
-                .cmp(&a.depth)
-                .then_with(|| b.order.cmp(&a.order))
-        });
-
-        if !constants.is_empty() {
-            msg.push_str("【世界设定（常驻）】\n");
-            for e in &constants {
-                msg.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
-            }
-            msg.push_str("\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）\n\n");
-        }
-    }
-
-    // 任务/伏笔注入（P2 新增，确定性查表，零 LLM）
-    // 只注入 Pending/Active 且触发条件满足（轮次/时钟/事件）的任务。
+    // 任务/伏笔注入（P2，确定性查表，零 LLM）：只注入 Pending/Active 且触发满足的任务
     if !ctx.pending_tasks.is_empty() {
         let task_block = storyforge_domain::story_task::render_tasks_for_injection(
             &ctx.pending_tasks,
@@ -1124,27 +1167,34 @@ fn build_director_user_msg(intent: &str, ctx: &WritingContext) -> String {
             &ctx.story_clock,
         );
         if !task_block.is_empty() {
-            msg.push_str(&task_block);
-            msg.push_str("\n（请在规划本场戏时考虑以上即将触发或正在推进的任务/伏笔。）\n\n");
+            tail = tail.push(format!(
+                "{task_block}\n（请在规划本场戏时考虑以上即将触发或正在推进的任务/伏笔。）"
+            ));
         }
     }
 
-    msg.push_str("请分析意图并输出 Plan。");
-    msg
+    tail = tail.push("请分析意图并输出 Plan。");
+    tail
 }
 
-/// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive）
+/// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive + 蓝灯进 system）
 fn make_director_config(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
     modules: &[storyforge_domain::prompt_module::PromptModule],
+    system_extra: &str,
 ) -> AgentConfig {
-    let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+    let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Director,
         DIRECTOR_SYSTEM_PROMPT,
         profile,
         modules,
         "",
     );
+    // 蓝灯世界设定拼进 system 末尾（稳定段，§22.4）
+    if !system_extra.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(system_extra);
+    }
     AgentConfig {
         role: AgentRole::Director,
         system_prompt,
@@ -1152,6 +1202,29 @@ fn make_director_config(
         model: "deepseek-chat".to_string(),
         tools: vec![],
     }
+}
+
+/// 构造编剧的易变末尾（§22 volatile tail）：场景 + 子产出 + 可选 hint
+///
+/// 编剧 system 段只有 role_directive + 模块（不含蓝灯，编剧不需要）。
+/// 场景简述和子 Agent 产出每场戏都变，压在 tail。
+fn build_editor_tail(
+    scene_brief: &str,
+    performances_text: &str,
+    hint: Option<&str>,
+) -> storyforge_domain::message_layout::VolatileTail {
+    use storyforge_domain::message_layout::VolatileTail;
+
+    let mut tail = VolatileTail::new().push(format!(
+        "场景：{scene_brief}\n\n子 Agent 表演：\n\n{performances_text}\n\n请合并成连贯成文。"
+    ));
+    if let Some(h) = hint {
+        let h = h.trim();
+        if !h.is_empty() {
+            tail = tail.push(format!("{}{}", EDITOR_HINT_MARKER, h));
+        }
+    }
+    tail
 }
 
 /// 构造编剧 Agent 配置（通过 assemble_system_prompt 增强 role_directive）
@@ -1352,14 +1425,13 @@ fn rand_seed() -> u64 {
         .as_nanos() as u64
 }
 
-/// 格式化 ContextPackage 为子 Agent 的上下文文本（重 roll 子 Agent 时用）
-fn format_subagent_context(pkg: &ContextPackage) -> String {
+/// 格式化 ContextPackage 的**稳定部分**（子 Agent system 段，§22，重 roll 子 Agent 时用）
+///
+/// 与 `app-agent/src/runtime.rs::format_context_stable` 保持同步（同算法，独立实现避免跨 crate 耦合）。
+fn format_subagent_context_stable(pkg: &ContextPackage) -> String {
     let mut out = String::new();
     if !pkg.character_brief.is_empty() {
         out.push_str(&format!("## 你的角色设定\n{}\n\n", pkg.character_brief));
-    }
-    if !pkg.scene_brief.is_empty() {
-        out.push_str(&format!("## 当前场景\n{}\n\n", pkg.scene_brief));
     }
     if !pkg.constant_lore.is_empty() {
         out.push_str("## 世界设定（常驻）\n");
@@ -1367,6 +1439,17 @@ fn format_subagent_context(pkg: &ContextPackage) -> String {
             out.push_str(&format!("- {}: {}\n", lore.keys.join(", "), lore.content));
         }
         out.push('\n');
+    }
+    out
+}
+
+/// 格式化 ContextPackage 的**易变部分**（子 Agent tail 段，§22，重 roll 子 Agent 时用）
+///
+/// 与 `app-agent/src/runtime.rs::format_context_volatile` 保持同步。
+fn format_subagent_context_volatile(pkg: &ContextPackage) -> String {
+    let mut out = String::new();
+    if !pkg.scene_brief.is_empty() {
+        out.push_str(&format!("## 当前场景\n{}\n\n", pkg.scene_brief));
     }
     if !pkg.relevant_lore.is_empty() {
         out.push_str("## 相关世界设定\n");
@@ -1817,9 +1900,10 @@ mod tests {
         );
     }
 
-    /// 有 campaign + 任务待注入 → build_director_user_msg 末尾含任务块
+    /// 有 campaign + 任务待注入 → build_director_tail 含任务块（§22：任务压在 volatile tail）
     #[test]
-    fn test_director_msg_includes_pending_tasks() {
+    fn test_director_tail_includes_pending_tasks() {
+        use storyforge_domain::message_layout::MessageLayout;
         use storyforge_domain::story_task::{StoryTask, TaskTrigger};
         let conv_store = {
             let dir = std::env::temp_dir().join(format!(
@@ -1839,11 +1923,114 @@ mod tests {
             0,
         )];
 
-        let msg = build_director_user_msg("写一场戏", &ctx);
+        // 构造完整 layout，取 tail（最后一条 user 消息）检查
+        let layout = MessageLayout::build()
+            .system("你是导演")
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
         assert!(
-            msg.contains("老王复仇"),
-            "导演消息应含待注入任务: {msg}"
+            tail_content.contains("老王复仇"),
+            "导演 tail 应含待注入任务: {tail_content}"
         );
-        assert!(msg.contains("即将触发"), "应有任务注入块标题");
+        assert!(tail_content.contains("即将触发"), "应有任务注入块标题");
+
+        // §22：任务应在 tail（易变段），不在 system（稳定段）
+        let system_content = msgs.first().unwrap().content.as_str();
+        assert!(!system_content.contains("老王复仇"), "任务不应进 system 段");
+    }
+
+    /// 蓝灯世界设定进 system（稳定段），不进 tail（§22.4）
+    #[test]
+    fn test_director_lore_in_system_not_tail() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_lore_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: Some(1),
+                keys: vec!["龙".into()],
+                secondary_keys: vec![],
+                content: "龙族设定详情".into(),
+                constant: true,
+                selective: false,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Constant,
+                extensions: serde_json::json!({}),
+            }],
+        });
+        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None).id);
+
+        let system_extra = build_director_system_extra(&ctx);
+        assert!(system_extra.contains("龙族设定详情"), "蓝灯应进 system_extra");
+
+        // tail 不应含蓝灯内容
+        let layout = MessageLayout::build()
+            .system(&system_extra)
+            .tail(|_| build_director_tail("写一场戏", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+        assert!(!tail_content.contains("龙族设定详情"), "蓝灯不应进 tail");
+    }
+
+    /// §22 cache 命中验证：两轮调用（不同 intent/turn）但相同蓝灯世界设定 →
+    /// system 段指纹一致（cache 命中），只有 tail 变。
+    #[test]
+    fn test_director_system_stable_across_rounds() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_cache_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: Some(1),
+                keys: vec!["龙".into()],
+                secondary_keys: vec![],
+                content: "稳定的世界设定".into(),
+                constant: true,
+                selective: false,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Constant,
+                extensions: serde_json::json!({}),
+            }],
+        });
+
+        // 第 1 轮：intent=A，turn=1
+        let mut ctx1 = WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+        ctx1.turn = 1;
+        let layout1 = MessageLayout::build()
+            .system(&build_director_system_extra(&ctx1))
+            .tail(|_| build_director_tail("意图A", &ctx1));
+
+        // 第 2 轮：intent=B（完全不同），turn=5
+        let mut ctx2 = WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+        ctx2.turn = 5;
+        let layout2 = MessageLayout::build()
+            .system(&build_director_system_extra(&ctx2))
+            .tail(|_| build_director_tail("完全不同的意图B", &ctx2));
+
+        // 两轮 system 指纹必须一致（蓝灯相同 → cache 命中）
+        assert_eq!(
+            layout1.prefix_fingerprint(),
+            layout2.prefix_fingerprint(),
+            "相同蓝灯 → system 指纹应一致（cache 友好）"
+        );
     }
 }

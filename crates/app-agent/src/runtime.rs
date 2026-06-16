@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use storyforge_domain::agent::{AgentRole, ContextPackage, Performance, PipelineEvent, SubagentTask};
 use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolSpec};
+use storyforge_domain::message_layout::MessageLayout;
 use storyforge_infra_llm::LlmClient;
 
 use crate::tools::{ToolContext, ToolRegistry};
@@ -293,6 +294,146 @@ impl AgentRuntime {
             config.role, max = config.max_tool_rounds);
         Err(AgentError::MaxRoundsExceeded)
     }
+
+    /// 流式工具循环（cache 友好布局版，§22 / D46）
+    ///
+    /// 与 `run_tool_loop_streaming` 逻辑相同，唯一区别：初始 messages 来自
+    /// `layout.into_messages()`（即 `[system, history..., tail]`），而非 `[system, user]`。
+    ///
+    /// 让导演/编剧/子 Agent 能把稳定内容（role_directive + 模块 + 蓝灯世界设定 +
+    /// 子 Agent persona）进 system 段、对话历史进 history 段（独立消息）、易变内容
+    /// （意图/变量/时钟/任务/场景）压尾，最大化 LLM KV cache 命中率。
+    ///
+    /// 工具调用轮次里追加的 assistant/tool_result 消息进 history 之后（末尾），
+    /// 不影响前缀稳定——前缀 system+history 跨轮 byte 一致即可 cache 命中。
+    ///
+    /// 注意：`config.system_prompt` 此处**不使用**（system 段已由 layout.stable_system
+    /// 提供，调用方应保证两者一致或 layout 优先）。保留 config 参数是为复用
+    /// max_tool_rounds/model/tools 等字段。
+    pub async fn run_tool_loop_with_layout(
+        &self,
+        config: &AgentConfig,
+        layout: MessageLayout,
+        tool_registry: &ToolRegistry,
+        cancel: watch::Receiver<bool>,
+        progress_tx: mpsc::UnboundedSender<String>,
+        completion_probe: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    ) -> Result<ChatResponse, AgentError> {
+        // 初始 messages = [system, history..., tail]（layout 已组装好三段）
+        let mut messages = layout.into_messages();
+        let rounds = config.max_tool_rounds;
+
+        for round in 1..=rounds {
+            if *cancel.borrow() {
+                info!(target: "app-agent", "{}[layout]: 第 {round} 轮前取消", config.role);
+                return Err(AgentError::Cancelled);
+            }
+
+            debug!(target: "app-agent", "{}[layout]: 第 {round}/{max} 轮",
+                config.role, max = rounds);
+
+            let req = ChatRequest {
+                messages: messages.clone(),
+                tools: if tool_registry.tool_specs().is_empty() {
+                    None
+                } else {
+                    Some(tool_registry.tool_specs())
+                },
+                params: Default::default(),
+                model: config.model.clone(),
+            };
+
+            // 流式调用：每个 delta_content 推给 progress_tx
+            let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<StreamChunk>();
+            let stream_fut = self.llm.chat_stream(&req, stream_tx, cancel.clone());
+            let forward_fut = async {
+                while let Some(chunk) = stream_rx.recv().await {
+                    if let Some(delta) = chunk.delta_content {
+                        let _ = progress_tx.send(delta);
+                    }
+                }
+            };
+            let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
+            let resp = resp_res.map_err(AgentError::Llm)?;
+
+            // 没有工具调用 = 模型直接输出文本（最终输出）
+            if resp.tool_calls.is_empty() {
+                if tool_registry.tool_specs().is_empty() {
+                    // 无可用工具 = 直接返回
+                    if resp.content.is_empty() && round >= rounds {
+                        return Err(AgentError::MaxRoundsExceeded);
+                    }
+                    if !resp.content.is_empty() {
+                        info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
+                            config.role, resp.content.len());
+                        return Ok(resp);
+                    }
+                    messages.push(ChatMessage::user("请输出内容。"));
+                    continue;
+                }
+
+                // drift recovery：有可用工具但模型没调
+                if !resp.content.is_empty() && round < rounds {
+                    if let Some(probe) = completion_probe {
+                        if probe(&resp.content) {
+                            info!(target: "app-agent", "{}[layout]: 第 {round} 轮探测到最终结果，提早终止", config.role);
+                            return Ok(resp);
+                        }
+                    }
+                    warn!(target: "app-agent", "{}[layout]: 第 {round} 轮未调工具，注入 reminder", config.role);
+                    messages.push(ChatMessage::assistant(&resp.content));
+                    messages.push(ChatMessage::user(
+                        "请继续使用工具完成任务。如果你已经完成，请直接输出最终结果。"
+                    ));
+                    continue;
+                }
+
+                if resp.content.is_empty() {
+                    warn!(target: "app-agent", "{}[layout]: 第 {round} 轮空响应", config.role);
+                    if round >= rounds {
+                        return Err(AgentError::MaxRoundsExceeded);
+                    }
+                    messages.push(ChatMessage::user("请输出内容或调用工具。"));
+                    continue;
+                }
+
+                info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
+                    config.role, resp.content.len());
+                return Ok(resp);
+            }
+
+            // 有工具调用 → 执行
+            debug!(target: "app-agent", "{}[layout]: 第 {round} 轮调用 {} 个工具",
+                config.role, resp.tool_calls.len());
+
+            messages.push(ChatMessage {
+                role: storyforge_domain::llm::ChatRole::Assistant,
+                content: resp.content.clone(),
+                tool_calls: Some(resp.tool_calls.clone()),
+                tool_call_id: None,
+            });
+
+            for tc in &resp.tool_calls {
+                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or(serde_json::json!({}));
+                let result = tool_registry
+                    .dispatch(&tc.function.name, args, self.tool_ctx.clone())
+                    .await;
+                let result_str = match result {
+                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+                    Err(e) => {
+                        warn!(target: "app-agent", "工具 {} 执行失败: {e}", tc.function.name);
+                        serde_json::json!({ "error": e.to_string() }).to_string()
+                    }
+                };
+                messages.push(ChatMessage::tool_result(&tc.id, &result_str));
+            }
+        }
+
+        error!(target: "app-agent", "{}[layout]: 超过最大轮次 {max}",
+            config.role, max = rounds);
+        Err(AgentError::MaxRoundsExceeded)
+    }
 }
 
 /// Agent 运行错误
@@ -347,16 +488,30 @@ pub async fn spawn_subagents(
 
     for (index, task) in tasks.into_iter().enumerate() {
         let runtime = runtime.clone();
-        let system_prompt = format!(
-            "{}\n\n你是角色 {}。\n\n{}\n\n{}",
+        let character_id = task.character_id.clone();
+        let model = director_config.model.clone(); // 子 Agent 用导演的模型（M1 简化）
+
+        // §22 cache 友好布局：子 Agent persona + 常驻世界设定进 system（整个 campaign 稳定），
+        // 场景 + 相关世界设定 + 最近对话 + 任务进 tail（每场戏变）。
+        // 子 Agent 是对话隔离容器，不看全局历史，故无 history 段。
+        let stable_system = format!(
+            "{}\n\n你是角色 {}。\n\n{}",
             base_system_prompt,
             task.character_id,
-            format_context_package(&task.context_package),
+            format_context_stable(&task.context_package),
+        );
+        let volatile_text = format!(
+            "{}\n\n{}",
+            format_context_volatile(&task.context_package),
             task.brief,
         );
-        let character_id = task.character_id.clone();
-        let user_message = task.context_package.task.clone();
-        let model = director_config.model.clone(); // 子 Agent 用导演的模型（M1 简化）
+        let layout = MessageLayout::build()
+            .system(stable_system)
+            .tail(|_| {
+                storyforge_domain::message_layout::VolatileTail::new()
+                    .push(task.context_package.task.clone())
+                    .push(volatile_text.trim_end().to_string())
+            });
 
         // 子 Agent clone 全局 cancel（主流水线取消时联动）
         let child_cancel = cancel.clone();
@@ -367,7 +522,7 @@ pub async fn spawn_subagents(
 
         let config = AgentConfig {
             role: AgentRole::Subagent(character_id.clone()),
-            system_prompt,
+            system_prompt: String::new(), // layout 版不使用此字段（system 由 layout 提供）
             max_tool_rounds: 10, // 子 Agent 轮次少
             model,
             tools: vec![], // 子 Agent 无工具（纯表演）
@@ -399,7 +554,7 @@ pub async fn spawn_subagents(
             });
 
             let result = runtime
-                .run_tool_loop_streaming(&config, user_message, &registry, child_cancel, sub_tx, None)
+                .run_tool_loop_with_layout(&config, layout, &registry, child_cancel, sub_tx, None)
                 .await;
             // sub_tx 在此 drop，转发任务收到 None 后自然结束
 
@@ -430,16 +585,15 @@ pub async fn spawn_subagents(
     results
 }
 
-/// 格式化 ContextPackage 为子 Agent 的上下文文本
-fn format_context_package(pkg: &ContextPackage) -> String {
+/// 格式化 ContextPackage 的**稳定部分**（进 system 段，整个 campaign 不变，§22）
+///
+/// 包含：角色设定（persona）+ 常驻世界设定（蓝灯）。
+/// 这些跨场戏稳定，进 system 段让 cache 命中。
+fn format_context_stable(pkg: &ContextPackage) -> String {
     let mut out = String::new();
 
     if !pkg.character_brief.is_empty() {
         out.push_str(&format!("## 你的角色设定\n{}\n\n", pkg.character_brief));
-    }
-
-    if !pkg.scene_brief.is_empty() {
-        out.push_str(&format!("## 当前场景\n{}\n\n", pkg.scene_brief));
     }
 
     if !pkg.constant_lore.is_empty() {
@@ -448,6 +602,20 @@ fn format_context_package(pkg: &ContextPackage) -> String {
             out.push_str(&format!("- {}: {}\n", lore.keys.join(", "), lore.content));
         }
         out.push('\n');
+    }
+
+    out
+}
+
+/// 格式化 ContextPackage 的**易变部分**（进 tail 段，每场戏变，§22）
+///
+/// 包含：当前场景 + 相关世界设定（绿灯检索）+ 最近对话窗口。
+/// 这些每场戏不同，压在 tail。
+fn format_context_volatile(pkg: &ContextPackage) -> String {
+    let mut out = String::new();
+
+    if !pkg.scene_brief.is_empty() {
+        out.push_str(&format!("## 当前场景\n{}\n\n", pkg.scene_brief));
     }
 
     if !pkg.relevant_lore.is_empty() {
@@ -665,4 +833,53 @@ mod tests {
         assert!(result.contains(EDITOR_HINT_MARKER));
         assert!(result.contains("节奏太快"));
     }
+
+    /// 验证 run_tool_loop_with_layout 能消费带 history 的 layout 并正常返回。
+    ///
+    /// layout 三段（system + history + tail）应被正确转成 messages 喂给 LLM。
+    /// 用 with_defaults mock（按 system 关键词"导演"匹配返回 Plan）。
+    #[tokio::test]
+    async fn test_run_tool_loop_with_layout_consumes_history() {
+        use storyforge_domain::message_layout::MessageLayout;
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+        });
+        let runtime = AgentRuntime::new(llm, tool_ctx);
+
+        // 构造带 history 的 layout（模拟多轮对话的导演调用）
+        let layout = MessageLayout::build()
+            .system("你是写作导演。输出 Plan。")
+            .history(vec![
+                ChatMessage::user("写一场雨中告别"),
+                ChatMessage::assistant("雨滴敲在屋檐…"),
+            ])
+            .tail(|t| t.push("继续下一场").push("角色：Seraphina"));
+
+        let config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(), // layout 版不使用此字段
+            max_tool_rounds: 3,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_tx, cancel) = watch::channel(false);
+        let (prog_tx, prog_rx) = mpsc::unbounded_channel::<String>();
+
+        let resp = runtime
+            .run_tool_loop_with_layout(&config, layout, &ToolRegistry::new(), cancel, prog_tx, None)
+            .await
+            .expect("layout 版应正常返回");
+
+        // mock 按关键词"导演"匹配，返回 Plan JSON（非空）
+        assert!(!resp.content.is_empty(), "应有响应内容");
+
+        // 流式 progress 应有 token 推送（mock 的 stream=false 也会走 forward_fut）
+        drop(prog_rx); // 仅证明 channel 正常（mock 非流式时 progress 可能为空，不强制断言）
+    }
 }
+

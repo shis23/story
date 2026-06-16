@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use storyforge_domain::conversation::{
     Conversation, MessageVariant, Provenance, Role, SubagentSnapshot, VariantStatus,
 };
+use storyforge_domain::llm::ChatMessage;
 use storyforge_domain::Id;
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
@@ -434,6 +435,22 @@ impl ConversationStore {
     pub fn recent_messages_with_role(&self, conv_id: &Id, n: usize, before_node_id: Option<&Id>) -> Vec<String> {
         self.get(conv_id)
             .map(|c| c.recent_messages_with_role(n, before_node_id))
+            .unwrap_or_default()
+    }
+
+    /// 获取最近 N 条消息作为 ChatMessage 列表（§22 cache 友好布局用）
+    ///
+    /// 返回真正的 `[user, assistant, ...]` 消息（role 映射，content 无前缀），
+    /// 让历史作为独立消息段进 LLM，保证 system+history 前缀稳定、cache 命中。
+    /// `before_node_id`：regenerate 重 roll 时排除目标节点及之后。
+    pub fn recent_messages_as_chat(
+        &self,
+        conv_id: &Id,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> Vec<ChatMessage> {
+        self.get(conv_id)
+            .map(|c| c.recent_messages_as_chat(n, before_node_id))
             .unwrap_or_default()
     }
 
