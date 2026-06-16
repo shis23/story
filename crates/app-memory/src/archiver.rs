@@ -102,9 +102,14 @@ impl MemoryArchiver {
         let total_to_archive = batch_size * trigger_count;
         let total_to_archive = total_to_archive.min(recent_window.len());
 
-        info!(target: "app-memory", "触发归档：取出 {total_to_archive} 条消息");
+        info!(target: "app-memory", "触发归档：取出最早的 {total_to_archive} 条消息压缩为长期记忆");
 
-        // 取出待归档的消息（窗口尾部），clone 为 owned data 避免 lifetime 问题
+        // 取出窗口头部（最早）的消息归档。
+        // 设计语义：窗口溢出时，把最早的消息压缩成 ArchivedSummary 入向量池，
+        // 调用方随后从 recent_window 删除这段（按返回的 source_range）。
+        // 注意：本函数是纯函数（入参是快照），**不负责去重/幂等**——
+        // 调用方必须保证不会对同一段消息重复归档（如用 last_archived_index 水位标记或加锁），
+        // 否则向量池会出现重复 ArchivedSummary，召回时 score 被放大。
         let to_archive: Vec<(usize, String)> = recent_window
             .iter()
             .enumerate()

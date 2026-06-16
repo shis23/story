@@ -15,6 +15,8 @@ pub struct SseEventAccumulator {
     pub all_tool_calls: Vec<AccumulatedToolCall>,
     /// 最终的 finish_reason
     pub finish_reason: Option<String>,
+    /// 末 chunk 的 usage（需请求时设 stream_options.include_usage=true 才有）
+    pub usage: Option<storyforge_domain::llm::Usage>,
 }
 
 /// 累积中的工具调用（流式合并用，带 stream index）
@@ -37,6 +39,7 @@ impl SseEventAccumulator {
             full_content: String::new(),
             all_tool_calls: Vec::new(),
             finish_reason: None,
+            usage: None,
         }
     }
 
@@ -51,8 +54,12 @@ impl SseEventAccumulator {
             return self.dispatch(sender);
         }
 
-        // 解析 data: 字段
-        if let Some(rest) = strip_prefix(line, b"data: ") {
+        // 解析 data: 字段（SSE 规范：data: 后可带 0 或 1 个空格）
+        // 历史 bug：旧实现 strip_prefix(line, b"data: ") 要求严格 1 个空格，
+        // 部分代理/服务端发 data:{...} 紧贴格式会被静默丢弃 → 流式内容丢失。
+        if let Some(rest) = strip_prefix(line, b"data:") {
+            // strip 至多一个空格（SSE 规范允许 data:value 或 data: value）
+            let rest = if rest.first() == Some(&b' ') { &rest[1..] } else { rest };
             if !self.data.is_empty() {
                 self.data.push(b'\n');
             }
@@ -144,6 +151,15 @@ impl SseEventAccumulator {
             self.finish_reason = chunk_finish.clone();
         }
 
+        // 末 chunk 携带 usage（choices 通常为空）。需 stream_options.include_usage=true
+        if let Some(u) = &chunk.usage {
+            self.usage = Some(storyforge_domain::llm::Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            });
+        }
+
         // 推送 chunk（只带 content delta + finish_reason；
         // tool_call 增量已在上面累积，流结束后由调用者从 accumulator 取完整结果）
         let stream_chunk = StreamChunk {
@@ -168,6 +184,17 @@ pub(crate) mod openai_types {
     #[derive(Debug, Deserialize)]
     pub struct StreamDelta {
         pub choices: Vec<StreamChoice>,
+        /// 末 chunk（choices 为空）会带 usage，需请求时设 stream_options.include_usage=true
+        #[serde(default)]
+        pub usage: Option<StreamUsage>,
+    }
+
+    /// 流式 usage（结构与非流式一致，字段类型与 domain::Usage 对齐为 u32）
+    #[derive(Debug, Deserialize)]
+    pub struct StreamUsage {
+        pub prompt_tokens: u32,
+        pub completion_tokens: u32,
+        pub total_tokens: u32,
     }
 
     #[derive(Debug, Deserialize)]

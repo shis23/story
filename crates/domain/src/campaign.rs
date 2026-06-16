@@ -22,6 +22,11 @@ pub struct Campaign {
     pub created_at: String,
     #[serde(default)]
     pub variables: Vec<VariableValue>,
+    /// 故事时间（冗余缓存：真相源是 variables 里 key="story_clock" 的项）。
+    ///
+    /// 保留此顶层字段是为了向后兼容旧序列化数据 + 前端直接读取。set_variable("story_clock")
+    /// 会同步更新两者。注意：若外部直接构造/反序列化导致两者不一致，应以 variables 为准
+    /// （M-5 标注：理想做法是移除顶层字段统一到 variables，但会破坏序列化兼容，留待数据迁移专项）。
     #[serde(default = "default_story_clock")]
     pub story_clock: String,
 }

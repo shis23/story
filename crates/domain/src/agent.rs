@@ -281,6 +281,17 @@ pub struct PostProcessResult {
     /// 任务更新（新建伏笔 / 触发状态变化 / 完成检测置信度）
     #[serde(default)]
     pub task_updates: Vec<TaskUpdate>,
+    /// 5 层兜底解析是否成功（区分「LLM 正常返回但无更新」与「解析全 miss」）。
+    ///
+    /// 历史 bug：失败返回空 PostProcessResult，与"成功但无更新"无法区分，
+    /// 解析失败被静默吞掉。现标记 parse_succeeded=false 让上层可观测。
+    /// 旧数据反序列化时缺此字段，默认 true（假定历史数据是成功解析的）。
+    #[serde(default = "default_true")]
+    pub parse_succeeded: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 单条变量更新（角色级或全局级）

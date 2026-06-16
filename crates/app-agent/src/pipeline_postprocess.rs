@@ -107,8 +107,15 @@ pub async fn run_postprocess_pipeline(
         )
         .await
         {
+            Ok(r) if !r.parse_succeeded => {
+                warn!(
+                    target: "postprocess-pipeline",
+                    "后处理解析失败（5 层兜底全 miss，best-effort 跳过）"
+                );
+                None
+            }
             Ok(r) if r.is_empty() => {
-                info!(target: "postprocess-pipeline", "后处理返回空（无任何更新）");
+                info!(target: "postprocess-pipeline", "后处理返回空（LLM 正常返回但无更新）");
                 // 空 result 也算成功，返回 Some 让调用方知道「跑过了但没产出」
                 Some(r)
             }

@@ -4,7 +4,7 @@
 /// 统一收集到环形缓冲，ERROR + LLM 调用落盘，支持导出脱敏 bundle。
 pub mod interceptor;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -119,17 +119,17 @@ pub struct LogFilter {
 /// 每类日志的最大条数
 const MAX_ENTRIES_PER_KIND: usize = 2000;
 
-/// 环形缓冲
+/// 环形缓冲（VecDeque：push/pop_front 均为 O(1)；历史用 Vec 导致 remove(0) 是 O(n)）
 pub struct LogBuffer {
-    entries: HashMap<LogKind, Vec<LogEntry>>,
+    entries: HashMap<LogKind, VecDeque<LogEntry>>,
 }
 
 impl LogBuffer {
     pub fn new() -> Self {
         let mut entries = HashMap::new();
-        entries.insert(LogKind::Backend, Vec::new());
-        entries.insert(LogKind::LlmCall, Vec::new());
-        entries.insert(LogKind::FrontendPlugin, Vec::new());
+        entries.insert(LogKind::Backend, VecDeque::new());
+        entries.insert(LogKind::LlmCall, VecDeque::new());
+        entries.insert(LogKind::FrontendPlugin, VecDeque::new());
         Self { entries }
     }
 
@@ -137,9 +137,9 @@ impl LogBuffer {
     pub fn push(&mut self, entry: LogEntry) {
         if let Some(buf) = self.entries.get_mut(&entry.kind) {
             if buf.len() >= MAX_ENTRIES_PER_KIND {
-                buf.remove(0);
+                buf.pop_front(); // O(1)，旧实现 Vec::remove(0) 是 O(n)
             }
-            buf.push(entry);
+            buf.push_back(entry);
         }
     }
 

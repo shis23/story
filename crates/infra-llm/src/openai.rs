@@ -34,9 +34,13 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
 }
 
 /// 构建流式请求 JSON（stream=true）
+///
+/// 设置 stream_options.include_usage=true，让服务端在最后一个 chunk 返回真实 token 统计
+/// （OpenAI 标准协议）。历史版本注释"流式时无法精确获取 usage"是因为未设此项。
 pub fn build_stream_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut body = build_request_body(req);
     body["stream"] = serde_json::json!(true);
+    body["stream_options"] = serde_json::json!({ "include_usage": true });
     body
 }
 

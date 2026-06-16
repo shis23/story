@@ -135,6 +135,10 @@ impl StoryTask {
     /// - Event：语义判断，返回 None（调用方应查询后处理 Agent 的判断结果）
     /// - Manual：永远不自动触发 → Some(false)
     pub fn check_trigger(&self, current_turn: u32, story_clock: &str) -> TriggerCheck {
+        // 第一遍：扫描确定性触发器（Turn / StoryTime）。
+        // 必须先于 Event 判断，否则任务同时配了 [Event, TurnReminder{at_turn:1}]
+        // 且当前 turn=1 时，本应确定性 Satisfied 却因 Event 排前面而浪费一次 Agent 调用。
+        let mut has_event = false;
         for trigger in &self.triggers {
             match trigger {
                 TaskTrigger::TurnReminder { at_turn } => {
@@ -149,13 +153,16 @@ impl StoryTask {
                     }
                 }
                 TaskTrigger::Event { .. } => {
-                    // 语义判断由后处理 Agent 负责
-                    return TriggerCheck::NeedsAgentJudgment;
+                    has_event = true;
                 }
                 TaskTrigger::Manual => {
                     // 手动触发，不自动激活
                 }
             }
+        }
+        // 第二遍：没有确定性触发器命中，但存在 Event 触发器 → 需 Agent 语义判断
+        if has_event {
+            return TriggerCheck::NeedsAgentJudgment;
         }
         TriggerCheck::NotSatisfied
     }
@@ -312,6 +319,28 @@ mod tests {
             task.check_trigger(100, "第1天"),
             TriggerCheck::NeedsAgentJudgment
         );
+    }
+
+    /// 回归：确定性触发器（Turn/StoryTime）应优先于 Event，避免短路浪费 Agent 调用。
+    /// Bug M-4：旧实现遇 Event 立即 return NeedsAgentJudgment，
+    /// 任务配 [Event, TurnReminder{at_turn:1}] 且 turn=1 时本应 Satisfied 却返回 NeedsAgentJudgment。
+    #[test]
+    fn test_deterministic_trigger_takes_priority_over_event() {
+        // Event 在前 + TurnReminder{at_turn:1} 在后，当前 turn=1 应确定性 Satisfied
+        let task = StoryTask::user_planned(
+            Id::new(),
+            "混合",
+            "测试",
+            vec![
+                TaskTrigger::Event { description: "某事件".into() },
+                TaskTrigger::TurnReminder { at_turn: 1 },
+            ],
+            5,
+        );
+        assert_eq!(task.check_trigger(1, "第1天"), TriggerCheck::Satisfied);
+
+        // 都没命中时，有 Event 才返回 NeedsAgentJudgment
+        assert_eq!(task.check_trigger(0, "第99天"), TriggerCheck::NeedsAgentJudgment);
     }
 
     #[test]

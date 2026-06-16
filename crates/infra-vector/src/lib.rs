@@ -8,6 +8,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 use storyforge_domain::Id;
+use tracing::warn;
 
 // ─── 数据模型 ──────────────────────────────────────────────────────────────
 
@@ -224,7 +225,19 @@ impl VectorStore for BruteForceStore {
             .values()
             .filter(|r| filter.accepts(r))
             .filter_map(|r| {
-                let score = cosine_similarity(query, &r.vector)?;
+                let score = match cosine_similarity(query, &r.vector) {
+                    Some(s) => s,
+                    None => {
+                        // 历史 bug：维度不匹配静默跳过，用户无感知检索结果缺条且无法排查
+                        warn!(
+                            "向量维度不匹配，跳过记录 id={}（期望 {} 维，实际 {} 维）",
+                            r.id.as_str(),
+                            query.len(),
+                            r.vector.len()
+                        );
+                        return None;
+                    }
+                };
                 Some(VectorHit {
                     id: r.id.clone(),
                     content: r.content.clone(),

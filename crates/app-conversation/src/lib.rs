@@ -95,6 +95,16 @@ impl ConversationStore {
         self.loaded.store(true, Ordering::Release);
     }
 
+    /// 清空缓存并标记为未加载，下次访问时从磁盘重新加载。
+    ///
+    /// 用于测试或外部进程修改了 `data/conversations/` 后强制刷新内存缓存。
+    /// 历史 bug：loaded 一旦置 true 永不复位，外部修改磁盘后本进程缓存永远看不到。
+    pub fn invalidate(&self) {
+        let mut cache = self.lock_cache();
+        cache.clear();
+        self.loaded.store(false, Ordering::Release);
+    }
+
     /// 持久化对话到磁盘（原子写：.tmp → rename）
     fn persist(&self, conv: &Conversation) -> Result<(), ConversationError> {
         let path = self.dir.join(format!("{}.json", conv.id.as_str()));

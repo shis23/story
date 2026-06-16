@@ -1251,7 +1251,7 @@ async fn start_writing(
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
-    fill_campaign_context(&mut ctx);
+    fill_campaign_context(&mut ctx, &app);
 
     // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1273,24 +1273,20 @@ async fn start_writing(
     // ─── P2 后处理流水线（best-effort，不阻断成文返回）──────────────────────
     // 成文（DraftReady）后并行跑：剧情总结 + 后处理三合一。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
-    if result.is_ok() {
+    if let Ok((final_text, _, _)) = &result {
         // 从 session.plan 取在场角色 + 基础变量键
-        let (final_text, present_chars, var_keys) = match &result {
-            Ok((text, _, _)) => {
-                let chars: Vec<String> = pipeline
-                    .session()
-                    .and_then(|s| s.plan.as_ref())
-                    .map(|p| {
-                        p.subagent_tasks
-                            .iter()
-                            .map(|t| t.character_id.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (text.clone(), chars, default_variable_keys())
-            }
-            _ => unreachable!(),
-        };
+        let present_chars: Vec<String> = pipeline
+            .session()
+            .and_then(|s| s.plan.as_ref())
+            .map(|p| {
+                p.subagent_tasks
+                    .iter()
+                    .map(|t| t.character_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let final_text = final_text.clone();
+        let var_keys = default_variable_keys();
         // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
         let outcome = pipeline
@@ -1349,9 +1345,17 @@ fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
 /// 从活跃 Campaign 填充 WritingContext 的 P2 字段（campaign_id / turn / pending_tasks / story_clock）
 ///
 /// 无活跃 Campaign 时不动 ctx（campaign_id 保持 None → 后处理跳过）。
-fn fill_campaign_context(ctx: &mut WritingContext) {
-    let data_dir = get_app_data_dir();
-    let active_id = match load_active_campaign(&data_dir) {
+/// 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）。
+///
+/// 优先读内存 `state.active_campaign`，磁盘 `load_active_campaign` 仅作 fallback。
+/// 历史 bug：旧实现绕过内存直接读磁盘，若 `set_active_campaign` 先改内存后写盘
+/// 但写盘失败（非原子），会用旧/空 campaign。
+fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
+    let active_id = {
+        let guard = state.active_campaign.lock().unwrap_or_else(|p| p.into_inner());
+        guard.clone().or_else(|| load_active_campaign(&get_app_data_dir()))
+    };
+    let active_id = match active_id {
         Some(id) => id,
         None => return,
     };
@@ -1573,7 +1577,7 @@ async fn regenerate(
         modules: vec![],
     };
     fill_profile_context(&mut ctx, &app);
-    fill_campaign_context(&mut ctx);
+    fill_campaign_context(&mut ctx, &app);
 
     // cancel channel
     let (cancel_tx, cancel_rx) = watch::channel(false);

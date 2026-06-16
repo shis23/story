@@ -202,6 +202,7 @@ fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
         knowledge_updates,
         variable_updates,
         task_updates,
+        parse_succeeded: true,
     }
 }
 
@@ -221,13 +222,17 @@ pub fn parse_postprocess_from_response(resp: &ChatResponse) -> PostProcessResult
     // 层 2-5：从 content 提取 JSON
     let content = resp.content.trim();
     if !content.is_empty() {
-        if let Some(result) = parse_from_content(content) {
+        if let Some(mut result) = parse_from_content(content) {
+            result.parse_succeeded = true;
             return result;
         }
     }
 
     warn!(target: "postprocess", "5 层兜底全miss，返回空 result（best-effort）");
-    PostProcessResult::default()
+    PostProcessResult {
+        parse_succeeded: false,
+        ..Default::default()
+    }
 }
 
 fn parse_from_content(content: &str) -> Option<PostProcessResult> {

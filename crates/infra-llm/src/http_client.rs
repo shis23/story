@@ -10,7 +10,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmConnection, LlmError, StreamChunk, Usage};
+use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmConnection, LlmError, StreamChunk};
 
 use crate::sse::{forward_sse_events, SseEventAccumulator};
 use crate::text_tools::{inject_tool_prompt, parse_tool_calls_from_text};
@@ -265,7 +265,8 @@ impl crate::LlmClient for HttpLlmClient {
             final_tool_calls = parse_tool_calls_from_text(&final_content);
         }
 
-        let usage = Usage::default(); // 流式时无法精确获取 usage
+        // 流式 usage：末 chunk 携带（需 stream_options.include_usage=true，已在 openai.rs 设置）
+        let usage = accumulator.usage.unwrap_or_default();
 
         info!(target: "infra-llm", "chat_stream done: content_len={}, tool_calls={}", final_content.len(), final_tool_calls.len());
 
