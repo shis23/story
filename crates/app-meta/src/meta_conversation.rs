@@ -49,11 +49,11 @@ impl MetaSession {
     }
 
     pub fn set_character(&self, character: Arc<Character>) {
-        *self.character.lock().unwrap() = Some(character);
+        *self.character.lock().unwrap_or_else(|p| p.into_inner()) = Some(character);
     }
 
     pub fn set_world_info(&self, book: Arc<WorldInfoBook>) {
-        *self.world_info.lock().unwrap() = Some(book);
+        *self.world_info.lock().unwrap_or_else(|p| p.into_inner()) = Some(book);
     }
 }
 
@@ -176,13 +176,13 @@ pub async fn chat(
     for tc in &resp.tool_calls {
         match tc.function.name.as_str() {
             "meta_inspect_world_info" => {
-                if let Some(book) = session.world_info.lock().unwrap().clone() {
+                if let Some(book) = session.world_info.lock().unwrap_or_else(|p| p.into_inner()).clone() {
                     let report = inspect_world_info(&book);
                     tool_result = ToolResultDisplay::WorldInfoReport(report);
                 }
             }
             "meta_inspect_character" => {
-                if let Some(card) = session.character.lock().unwrap().clone() {
+                if let Some(card) = session.character.lock().unwrap_or_else(|p| p.into_inner()).clone() {
                     let report = inspect_character(&card);
                     tool_result = ToolResultDisplay::CardReport(report);
                 }
@@ -246,7 +246,7 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             move |_args, _ctx| {
                 let session = session.clone();
                 Box::pin(async move {
-                    let book = session.world_info.lock().unwrap().clone();
+                    let book = session.world_info.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     match book {
                         Some(b) => {
                             let report = inspect_world_info(&b);
@@ -279,7 +279,7 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             move |_args, _ctx| {
                 let session = session.clone();
                 Box::pin(async move {
-                    let card = session.character.lock().unwrap().clone();
+                    let card = session.character.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     match card {
                         Some(c) => {
                             let report = inspect_character(&c);
@@ -391,7 +391,7 @@ mod tests {
         let session = Arc::new(MetaSession::new());
         let book = make_world_info();
         session.set_world_info(book);
-        assert!(session.world_info.lock().unwrap().is_some());
+        assert!(session.world_info.lock().unwrap_or_else(|p| p.into_inner()).is_some());
     }
 
     #[test]

@@ -248,7 +248,7 @@ impl LogStore {
         // 需要落盘的：ERROR 级别 + LLM 调用
         let should_persist = entry.level == LogLevel::Error || entry.kind == LogKind::LlmCall;
 
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         buf.push(entry.clone());
         drop(buf);
 
@@ -259,19 +259,19 @@ impl LogStore {
 
     /// 查询日志
     pub fn query(&self, filter: &LogFilter) -> Vec<LogEntry> {
-        let buf = self.buffer.lock().unwrap();
+        let buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         buf.query(filter)
     }
 
     /// 获取单条 LLM 调用详情
     pub fn get_llm_call(&self, id: &Id) -> Option<LlmCallDetail> {
-        let buf = self.buffer.lock().unwrap();
+        let buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         buf.get_llm_call(id).and_then(|e| e.llm_detail.clone())
     }
 
     /// 清空
     pub fn clear(&self, kind: Option<LogKind>) {
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         buf.clear(kind);
     }
 

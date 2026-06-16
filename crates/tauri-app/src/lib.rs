@@ -170,7 +170,7 @@ impl AppState {
             let store = get_store();
             let stored_chars = store.list();
             if !stored_chars.is_empty() {
-                let mut ctx = tool_ctx.write().unwrap();
+                let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
                 for stored in &stored_chars {
                     ctx.characters.push(Arc::new(stored_info_to_character(stored)));
                 }
@@ -251,7 +251,7 @@ impl AppState {
 
     /// 取一份 tool_ctx 快照（clone 出 Arc<ToolContext>），供本次流水线使用
     pub fn snapshot_tool_ctx(&self) -> Arc<ToolContext> {
-        let ctx = self.tool_ctx.read().unwrap().clone();
+        let ctx = self.tool_ctx.read().unwrap_or_else(|p| p.into_inner()).clone();
         Arc::new(ctx)
     }
 
@@ -259,7 +259,7 @@ impl AppState {
     ///
     /// 正常路径前端会拦截（无连接时引导建连接），这里回退 mock 仅防崩。
     pub fn active_llm_or_mock(&self) -> Arc<dyn LlmClient> {
-        let guard = self.active_llm.lock().unwrap();
+        let guard = self.active_llm.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(client) = guard.as_ref() {
             client.clone()
         } else {
@@ -269,7 +269,7 @@ impl AppState {
 
     /// 当前活跃连接 ID
     pub fn active_conn_id(&self) -> Option<String> {
-        self.active_conn_id.lock().unwrap().clone()
+        self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 设置活跃连接（构造 client 并缓存，挂 LlmInterceptor 记录每次调用）
@@ -291,15 +291,15 @@ impl AppState {
             ),
         );
 
-        *self.active_llm.lock().unwrap() = Some(intercepted);
-        *self.active_conn_id.lock().unwrap() = Some(id.to_string());
+        *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = Some(intercepted);
+        *self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.to_string());
         Ok(())
     }
 
     /// 清除活跃连接（删除时调用）
     pub fn clear_active_connection(&self) {
-        *self.active_llm.lock().unwrap() = None;
-        *self.active_conn_id.lock().unwrap() = None;
+        *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store）
@@ -425,7 +425,7 @@ fn import_character(
 
     // 同步到 tool_ctx：角色卡 + 世界书（覆盖为当前角色的，符合"当前角色"语义）
     {
-        let mut ctx = state.tool_ctx.write().unwrap();
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         // 避免重复导入同一张卡导致 characters 列表膨胀
         ctx.characters
             .retain(|c| c.name != character.name);
@@ -517,7 +517,7 @@ fn delete_character(
     }
     // 同步从 tool_ctx 移除
     if let Some(name) = name {
-        let mut ctx = state.tool_ctx.write().unwrap();
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         ctx.characters.retain(|c| c.name != name);
         // 如果移除的是当前世界书来源角色，清空 world_info
         // （简单处理：characters 空了就清 world_info）
@@ -549,7 +549,7 @@ fn update_world_info_route(
     // 同步更新 tool_ctx 中的世界书路由
     if let Some(stored) = get_store().get(&character_id) {
         if stored.info.world_info_entries.get(entry_index).is_some() {
-            let mut ctx = state.tool_ctx.write().unwrap();
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
             if let Some(ref world_info) = ctx.world_info {
                 let mut new_book = (**world_info).clone();
                 if let Some(entry) = new_book.entries.get_mut(entry_index) {
@@ -695,7 +695,7 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
         }
     }
 
-    let mut ctx = state.tool_ctx.write().unwrap();
+    let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     if entries.is_empty() {
         ctx.world_info = None;
     } else {
@@ -1256,7 +1256,7 @@ async fn start_writing(
     // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
     let (cancel_tx, cancel_rx) = watch::channel(false);
     {
-        let mut slot = app.current_cancel.lock().unwrap();
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = slot.take() {
             // 上一次写作未正常清理，先取消它
             let _ = existing.send(true);
@@ -1313,7 +1313,7 @@ async fn start_writing(
 
     // 清理 cancel sender
     {
-        let mut slot = app.current_cancel.lock().unwrap();
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
         *slot = None;
     }
 
@@ -1473,7 +1473,7 @@ fn find_instance_by_name_or_id(
 /// 触发 AppState.current_cancel 的 sender，导演/子Agent/编剧全部中止。
 #[tauri::command]
 fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
-    let slot = state.current_cancel.lock().unwrap();
+    let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(tx) = slot.as_ref() {
         let _ = tx.send(true);
         Ok(true)
@@ -1578,7 +1578,7 @@ async fn regenerate(
     // cancel channel
     let (cancel_tx, cancel_rx) = watch::channel(false);
     {
-        let mut slot = app.current_cancel.lock().unwrap();
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = slot.take() {
             let _ = existing.send(true);
         }
@@ -1622,7 +1622,7 @@ async fn regenerate(
     }
 
     {
-        let mut slot = app.current_cancel.lock().unwrap();
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
         *slot = None;
     }
 
@@ -2126,7 +2126,7 @@ fn configure_embedder(
     };
     let data_dir = get_app_data_dir();
     save_embed_config(&data_dir, &config);
-    *state.embed_config.write().unwrap() = Some(config);
+    *state.embed_config.write().unwrap_or_else(|p| p.into_inner()) = Some(config);
     Ok(())
 }
 
@@ -2135,7 +2135,7 @@ fn configure_embedder(
 fn get_embed_config(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Option<serde_json::Value> {
-    state.embed_config.read().unwrap().as_ref().map(|c| {
+    state.embed_config.read().unwrap_or_else(|p| p.into_inner()).as_ref().map(|c| {
         serde_json::json!({
             "endpoint": c.endpoint,
             "model": c.model,
@@ -2237,7 +2237,7 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
     );
 
     // 检查嵌入配置
-    let config = match state.embed_config.read().unwrap().clone() {
+    let config = match state.embed_config.read().unwrap_or_else(|p| p.into_inner()).clone() {
         Some(c) => c,
         None => {
             tracing::debug!("未配置嵌入 API，跳过自动归档");
@@ -2278,7 +2278,7 @@ fn meta_accept_patch(
 ) -> Result<(), String> {
     // 从 PatchStore 取出 patch
     let patch = {
-        let patches = state.meta_patches.read().unwrap();
+        let patches = state.meta_patches.read().unwrap_or_else(|p| p.into_inner());
         patches
             .iter()
             .find(|p| p.id == patch_id)
@@ -2288,7 +2288,7 @@ fn meta_accept_patch(
 
     // 执行 patch：clone 世界书 → 修改 → 写回
     {
-        let mut ctx = state.tool_ctx.write().unwrap();
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         if let Some(ref world_info) = ctx.world_info {
             let mut entries_json: Vec<serde_json::Value> = world_info
                 .entries
@@ -2326,7 +2326,7 @@ fn meta_accept_patch(
     // 历史 bug：曾用 `all_stored.last()` 把整个合并视图（全局+多卡 merge）
     // 全部写回最后一张卡，并把 is_global 硬编码 false，导致数据污染与全局标记丢失。
     {
-        let ctx = state.tool_ctx.read().unwrap();
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         if let Some(ref world_info) = ctx.world_info {
             // 合并视图里的条目，保留 is_global（取自 route + 原卡标记）
             let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
@@ -2382,7 +2382,7 @@ fn meta_accept_patch(
 
 /// 把当前活跃角色卡 + 世界书同步进 MetaSession（每次 meta 操作前调）
 fn sync_meta_session_from_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
-    let ctx = state.tool_ctx.read().unwrap();
+    let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
     if let Some(card) = ctx.characters.last() {
         state.meta_session.set_character(card.clone());
     }
@@ -2418,7 +2418,7 @@ async fn meta_chat(
     // 取出对话；不存在则返回错误（而非静默创建空对话，避免用户感觉"历史突然清空"）。
     // 新对话应由 meta_start_conversation 命令显式建立。
     let mut conv = {
-        let mut convs = app.meta_conversations.lock().unwrap();
+        let mut convs = app.meta_conversations.lock().unwrap_or_else(|p| p.into_inner());
         convs.remove(&conversation_id).ok_or_else(|| {
             format!("Meta 对话不存在: {conversation_id}（请先调用 meta_start_conversation 创建）")
         })?
@@ -2442,7 +2442,7 @@ async fn meta_chat(
 
     // 把新提议的 patch 同步进 AppState.meta_patches（前端可用 meta_accept_patch 采纳）
     if let Some(patch) = &turn.new_patch {
-        let mut patches = app.meta_patches.write().unwrap();
+        let mut patches = app.meta_patches.write().unwrap_or_else(|p| p.into_inner());
         if !patches.iter().any(|p| p.id == patch.id) {
             patches.push(patch.clone());
         }
@@ -2470,7 +2470,7 @@ fn meta_get_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Option<serde_json::Value> {
-    let convs = state.meta_conversations.lock().unwrap();
+    let convs = state.meta_conversations.lock().unwrap_or_else(|p| p.into_inner());
     convs.get(&conversation_id).map(|conv| {
         serde_json::to_value(conv).unwrap_or(serde_json::Value::Null)
     })
@@ -2497,7 +2497,7 @@ fn meta_dismiss_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let mut patches = state.meta_patches.write().unwrap();
+    let mut patches = state.meta_patches.write().unwrap_or_else(|p| p.into_inner());
     patches.retain(|p| p.id != patch_id);
     Ok(())
 }
@@ -2537,7 +2537,7 @@ async fn meta_analyze_mvu_card(
 
     // 取原 Character
     let character = {
-        let ctx = state.tool_ctx.read().unwrap();
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         ctx.characters
             .iter()
             .find(|c| c.id.as_str() == source_character_id)
@@ -2779,7 +2779,7 @@ async fn extract_characters(
 
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
     let character = {
-        let ctx = state.tool_ctx.read().unwrap();
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         ctx.characters
             .iter()
             .find(|c| c.id.as_str() == source_character_id)
@@ -2943,14 +2943,14 @@ fn set_active_campaign(
     {
         return Err(format!("找不到 campaign id={id}"));
     }
-    *state.active_campaign.lock().unwrap() = Some(campaign_id.clone());
+    *state.active_campaign.lock().unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
     save_active_campaign(&get_app_data_dir(), Some(&campaign_id));
     Ok(())
 }
 
 #[tauri::command]
 fn get_active_campaign(state: tauri::State<'_, Arc<AppState>>) -> Option<CampaignSummaryDto> {
-    let id = state.active_campaign.lock().unwrap().clone()?;
+    let id = state.active_campaign.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
     let store = get_campaign_store();
     let c = store.get_campaign(&id)?;
     let mut dto = CampaignSummaryDto::from(&c);
@@ -3462,7 +3462,7 @@ mod tests {
         // 模拟 import_character 的写入逻辑：手动构造一个 Character
         let char = Arc::new(make_test_character("TestHero"));
         {
-            let mut ctx = state.tool_ctx.write().unwrap();
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
             ctx.characters.push(char);
         }
 
@@ -3505,20 +3505,20 @@ mod tests {
 
         // 初始无运行中的写作
         {
-            let slot = state.current_cancel.lock().unwrap();
+            let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
             assert!(slot.is_none());
         }
 
         // 模拟 start_writing 设置 cancel sender
         let (tx, mut rx) = watch::channel(false);
         {
-            let mut slot = state.current_cancel.lock().unwrap();
+            let mut slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
             *slot = Some(tx);
         }
 
         // 触发取消
         {
-            let slot = state.current_cancel.lock().unwrap();
+            let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
             let tx = slot.as_ref().unwrap();
             let _ = tx.send(true);
         }
@@ -3526,7 +3526,7 @@ mod tests {
 
         // 清理
         {
-            let mut slot = state.current_cancel.lock().unwrap();
+            let mut slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
             *slot = None;
         }
     }

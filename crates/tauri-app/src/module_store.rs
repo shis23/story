@@ -134,8 +134,8 @@ impl ModuleStore {
 
     /// 列出所有模块（内置 + 自定义），附带 enabled 状态
     pub fn list_all(&self) -> Vec<(PromptModule, bool)> {
-        let disabled = self.disabled.lock().unwrap();
-        let custom = self.custom.lock().unwrap();
+        let disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
+        let custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         let mut result = Vec::new();
 
         for m in &self.builtins {
@@ -151,7 +151,7 @@ impl ModuleStore {
 
     /// 添加自定义模块
     pub fn add(&self, module: PromptModule) {
-        let mut custom = self.custom.lock().unwrap();
+        let mut custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         custom.push(module);
         drop(custom);
         self.persist_custom();
@@ -161,7 +161,7 @@ impl ModuleStore {
     pub fn update(&self, id: &str, content: Option<&str>, enabled: Option<bool>) -> bool {
         // 处理 enabled 状态
         if let Some(enabled) = enabled {
-            let mut disabled = self.disabled.lock().unwrap();
+            let mut disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
             if enabled {
                 disabled.retain(|d| d != id);
             } else if !disabled.contains(&id.to_string()) {
@@ -173,7 +173,7 @@ impl ModuleStore {
 
         // 处理内容更新（仅自定义模块）
         if let Some(content) = content {
-            let mut custom = self.custom.lock().unwrap();
+            let mut custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(m) = custom.iter_mut().find(|m| m.id.to_string() == id) {
                 m.content = content.to_string();
                 drop(custom);
@@ -188,7 +188,7 @@ impl ModuleStore {
 
     /// 删除自定义模块
     pub fn delete(&self, id: &str) -> bool {
-        let mut custom = self.custom.lock().unwrap();
+        let mut custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         let before = custom.len();
         custom.retain(|m| m.id.to_string() != id);
         if custom.len() < before {
@@ -202,14 +202,14 @@ impl ModuleStore {
 
     /// 获取单个模块
     pub fn get(&self, id: &str) -> Option<(PromptModule, bool)> {
-        let disabled = self.disabled.lock().unwrap();
+        let disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
         let enabled = !disabled.contains(&id.to_string());
 
         if let Some(m) = self.builtins.iter().find(|m| m.id.to_string() == id) {
             return Some((m.clone(), enabled));
         }
 
-        let custom = self.custom.lock().unwrap();
+        let custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         custom
             .iter()
             .find(|m| m.id.to_string() == id)
@@ -217,14 +217,14 @@ impl ModuleStore {
     }
 
     fn persist_custom(&self) {
-        let custom = self.custom.lock().unwrap();
+        let custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = storyforge_infra_util::atomic_write_json(&self.custom_path, &*custom) {
             tracing::error!("持久化自定义模块失败: {e}");
         }
     }
 
     fn persist_disabled(&self) {
-        let disabled = self.disabled.lock().unwrap();
+        let disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = storyforge_infra_util::atomic_write_json(&self.disabled_path, &*disabled) {
             tracing::error!("持久化禁用模块列表失败: {e}");
         }
@@ -273,8 +273,8 @@ impl ProfileStore {
 
     /// 列出所有 Profile
     pub fn list(&self) -> Vec<ProfileSummaryDto> {
-        let profiles = self.profiles.lock().unwrap();
-        let active_id = self.active_id.lock().unwrap();
+        let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
+        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
         profiles
             .iter()
             .map(|p| {
@@ -286,8 +286,8 @@ impl ProfileStore {
 
     /// 获取当前活跃 Profile（如果没有用户选的，返回内置默认）
     pub fn get_active(&self) -> Option<PromptProfile> {
-        let active_id = self.active_id.lock().unwrap();
-        let profiles = self.profiles.lock().unwrap();
+        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
+        let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
 
         if let Some(ref aid) = *active_id {
             if let Some(p) = profiles.iter().find(|p| &p.id.to_string() == aid) {
@@ -304,8 +304,8 @@ impl ProfileStore {
 
     /// 获取指定 Profile
     pub fn get(&self, id: &str) -> Option<PromptProfileDto> {
-        let profiles = self.profiles.lock().unwrap();
-        let active_id = self.active_id.lock().unwrap();
+        let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
+        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
         profiles
             .iter()
             .find(|p| p.id.to_string() == id)
@@ -314,7 +314,7 @@ impl ProfileStore {
 
     /// 保存/更新 Profile
     pub fn save(&self, profile: PromptProfile) {
-        let mut profiles = self.profiles.lock().unwrap();
+        let mut profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = profiles.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
         } else {
@@ -327,7 +327,7 @@ impl ProfileStore {
     /// 设置活跃 Profile
     pub fn set_active(&self, id: &str) {
         let json = {
-            let mut active_id = self.active_id.lock().unwrap();
+            let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             *active_id = Some(id.to_string());
             serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())
         };
@@ -338,14 +338,14 @@ impl ProfileStore {
 
     /// 删除 Profile
     pub fn delete(&self, id: &str) -> bool {
-        let mut profiles = self.profiles.lock().unwrap();
+        let mut profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         let before = profiles.len();
         profiles.retain(|p| p.id.to_string() != id);
         if profiles.len() < before {
             drop(profiles);
             self.persist();
             // 如果删的是活跃 Profile，清除活跃标记
-            let mut active_id = self.active_id.lock().unwrap();
+            let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             if active_id.as_deref() == Some(id) {
                 *active_id = None;
                 drop(active_id);
@@ -363,7 +363,7 @@ impl ProfileStore {
 
     /// 确保至少有一个默认 Profile（启动时调用）
     pub fn ensure_default(&self) {
-        let profiles = self.profiles.lock().unwrap();
+        let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         let has_any = !profiles.is_empty();
         drop(profiles);
         if !has_any {
@@ -374,7 +374,7 @@ impl ProfileStore {
     }
 
     fn persist(&self) {
-        let profiles = self.profiles.lock().unwrap();
+        let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles)
         {
             tracing::error!("持久化 Profile 失败: {e}");

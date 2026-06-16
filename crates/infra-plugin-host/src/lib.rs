@@ -121,7 +121,7 @@ impl PluginRegistry {
 
     /// 安装插件
     pub fn install(&self, manifest: PluginManifest) -> Result<(), PluginError> {
-        let mut plugins = self.plugins.write().unwrap();
+        let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
 
         // 检查是否已安装
         if plugins.contains_key(&manifest.id) {
@@ -142,7 +142,7 @@ impl PluginRegistry {
 
     /// 卸载插件
     pub fn uninstall(&self, id: &str) -> Result<(), PluginError> {
-        let mut plugins = self.plugins.write().unwrap();
+        let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
         plugins.remove(id).ok_or_else(|| PluginError::NotFound(id.into()))?;
         drop(plugins);
         self.persist();
@@ -151,7 +151,7 @@ impl PluginRegistry {
 
     /// 启用/禁用插件
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), PluginError> {
-        let mut plugins = self.plugins.write().unwrap();
+        let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
         let plugin = plugins.get_mut(id).ok_or_else(|| PluginError::NotFound(id.into()))?;
         plugin.enabled = enabled;
         drop(plugins);
@@ -161,12 +161,12 @@ impl PluginRegistry {
 
     /// 获取插件
     pub fn get(&self, id: &str) -> Option<InstalledPlugin> {
-        self.plugins.read().unwrap().get(id).cloned()
+        self.plugins.read().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
     }
 
     /// 列出所有插件
     pub fn list(&self) -> Vec<InstalledPlugin> {
-        self.plugins.read().unwrap().values().cloned().collect()
+        self.plugins.read().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
     }
 
     /// 列出已启用的插件
@@ -182,7 +182,7 @@ impl PluginRegistry {
 
     /// 校验权限（后端二次校验，对应设计 §8.2）
     pub fn ensure_permission(&self, plugin_id: &str, permission: &Permission) -> Result<(), PluginError> {
-        let plugins = self.plugins.read().unwrap();
+        let plugins = self.plugins.read().unwrap_or_else(|p| p.into_inner());
         let plugin = plugins.get(plugin_id).ok_or_else(|| PluginError::NotFound(plugin_id.into()))?;
 
         if !plugin.enabled {
@@ -212,7 +212,7 @@ impl PluginRegistry {
 
     fn persist(&self) {
         if let Some(path) = &self.persist_path {
-            let plugins = self.plugins.read().unwrap();
+            let plugins = self.plugins.read().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = storyforge_infra_util::atomic_write_json(path, &*plugins) {
                 tracing::error!("持久化插件数据失败（历史 bug：静默吞错误会导致重启丢数据）: {e}");
             }

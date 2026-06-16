@@ -195,7 +195,7 @@ impl PatchStore {
             created_at: chrono::Utc::now(),
             applied: false,
         };
-        let mut patches = self.patches.write().unwrap();
+        let mut patches = self.patches.write().unwrap_or_else(|p| p.into_inner());
         patches.push(patch.clone());
         patch
     }
@@ -204,7 +204,7 @@ impl PatchStore {
     pub fn pending(&self) -> Vec<Patch> {
         self.patches
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|p| !p.applied)
             .cloned()
@@ -213,7 +213,7 @@ impl PatchStore {
 
     /// 标记 Patch 为已采纳
     pub fn accept(&self, id: &str) -> Result<(), MetaError> {
-        let mut patches = self.patches.write().unwrap();
+        let mut patches = self.patches.write().unwrap_or_else(|p| p.into_inner());
         let patch = patches
             .iter_mut()
             .find(|p| p.id == id)
@@ -224,7 +224,7 @@ impl PatchStore {
 
     /// 忽略 Patch
     pub fn dismiss(&self, id: &str) -> Result<(), MetaError> {
-        let mut patches = self.patches.write().unwrap();
+        let mut patches = self.patches.write().unwrap_or_else(|p| p.into_inner());
         patches.retain(|p| p.id != id);
         Ok(())
     }

@@ -45,7 +45,7 @@ impl CharacterStore {
             imported_at: now,
         };
 
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         chars.push(stored.clone());
         self.persist(&chars);
         stored
@@ -53,17 +53,17 @@ impl CharacterStore {
 
     /// 列出所有角色卡（元数据）
     pub fn list(&self) -> Vec<StoredCharacter> {
-        self.inner.lock().unwrap().clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 获取单个角色卡
     pub fn get(&self, id: &str) -> Option<StoredCharacter> {
-        self.inner.lock().unwrap().iter().find(|c| c.id == id).cloned()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|c| c.id == id).cloned()
     }
 
     /// 删除角色卡
     pub fn delete(&self, id: &str) -> bool {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = chars.len();
         chars.retain(|c| c.id != id);
         if chars.len() < before {
@@ -81,7 +81,7 @@ impl CharacterStore {
         entry_index: usize,
         new_route: &str,
     ) -> Result<(), String> {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()
             .find(|c| c.id == id)
@@ -110,7 +110,7 @@ impl CharacterStore {
         depth: i32,
         order: i32,
     ) -> Result<(), String> {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()
             .find(|c| c.id == id)
@@ -144,7 +144,7 @@ impl CharacterStore {
         constant: bool,
         is_global: bool,
     ) -> Result<usize, String> {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()
             .find(|c| c.id == id)
@@ -175,7 +175,7 @@ impl CharacterStore {
         id: &str,
         entry_index: usize,
     ) -> Result<(), String> {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()
             .find(|c| c.id == id)
@@ -197,7 +197,7 @@ impl CharacterStore {
         id: &str,
         entries: Vec<crate::WorldInfoEntryInfo>,
     ) -> Result<(), String> {
-        let mut chars = self.inner.lock().unwrap();
+        let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()
             .find(|c| c.id == id)

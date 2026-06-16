@@ -203,7 +203,7 @@ impl BruteForceStore {
 
 impl VectorStore for BruteForceStore {
     fn upsert(&self, record: VectorRecord) -> Result<(), VectorError> {
-        let mut records = self.records.write().unwrap();
+        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         records.insert(record.id.clone(), record);
         self.persist_records(&records)?;
         Ok(())
@@ -219,7 +219,7 @@ impl VectorStore for BruteForceStore {
         top_k: usize,
         filter: &MetadataFilter,
     ) -> Result<Vec<VectorHit>, VectorError> {
-        let records = self.records.read().unwrap();
+        let records = self.records.read().unwrap_or_else(|p| p.into_inner());
         let mut scored: Vec<VectorHit> = records
             .values()
             .filter(|r| filter.accepts(r))
@@ -252,7 +252,7 @@ impl VectorStore for BruteForceStore {
         limit: usize,
         filter: &MetadataFilter,
     ) -> Result<Vec<VectorHit>, VectorError> {
-        let records = self.records.read().unwrap();
+        let records = self.records.read().unwrap_or_else(|p| p.into_inner());
         let keywords_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
 
         let mut hits: Vec<VectorHit> = records
@@ -279,14 +279,14 @@ impl VectorStore for BruteForceStore {
     }
 
     fn delete(&self, id: &Id) -> Result<(), VectorError> {
-        let mut records = self.records.write().unwrap();
+        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         records.remove(id);
         self.persist_records(&records)?;
         Ok(())
     }
 
     fn delete_by_campaign(&self, campaign_id: &Id) -> Result<usize, VectorError> {
-        let mut records = self.records.write().unwrap();
+        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         let target = serde_json::Value::String(campaign_id.to_string());
         let before = records.len();
         records.retain(|_, r| r.metadata.get("campaign_id") != Some(&target));
@@ -296,7 +296,7 @@ impl VectorStore for BruteForceStore {
     }
 
     fn count(&self) -> usize {
-        self.records.read().unwrap().len()
+        self.records.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 

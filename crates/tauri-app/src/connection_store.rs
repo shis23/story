@@ -54,7 +54,7 @@ impl ConnectionStore {
 
     /// 保存连接（新建或更新）
     pub fn save(&self, connection: LlmConnection) -> StoredConnection {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         // 若已存在同 id，更新；否则新增
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -85,7 +85,7 @@ impl ConnectionStore {
 
     /// 列出所有连接
     pub fn list(&self) -> Vec<StoredConnection> {
-        self.inner.lock().unwrap().connections.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).connections.clone()
     }
 
     /// 获取单个连接
@@ -101,7 +101,7 @@ impl ConnectionStore {
 
     /// 删除连接（若是活跃的，同时清除 active_id）
     pub fn delete(&self, id: &str) -> bool {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = file.connections.len();
         file.connections.retain(|c| c.id != id);
         if file.connections.len() < before {
@@ -119,14 +119,14 @@ impl ConnectionStore {
     /// 获取当前活跃连接 ID
     #[allow(dead_code)]
     pub fn active_id(&self) -> Option<String> {
-        self.inner.lock().unwrap().active_id.clone()
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).active_id.clone()
     }
 
     /// 设置活跃连接 ID（会校验该 id 存在，并更新 last_used_at）
     ///
     /// 返回对应的 LlmConnection（供调用方构造 client）。
     pub fn set_active(&self, id: &str) -> Option<LlmConnection> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let stored = file.connections.iter_mut().find(|c| c.id == id)?;
         stored.last_used_at =
             Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
@@ -138,7 +138,7 @@ impl ConnectionStore {
 
     /// 获取活跃连接（若 active_id 存在且对应连接存在）
     pub fn active_connection(&self) -> Option<LlmConnection> {
-        let file = self.inner.lock().unwrap();
+        let file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let active_id = file.active_id.as_ref()?;
         file.connections
             .iter()
