@@ -466,14 +466,59 @@ async function handleDeleteVariant({ nodeId }) {
   }
 }
 
-// user 消息重 roll：用同样的 intent 重新写作（start_writing 会新建 conversation）
+// user 消息重 roll：找到下一条 AI 消息，用 user 的 intent 作为 hint 调 regenerate
 async function handleRerollUser({ messageId }) {
   if (isWriting.value) return
+  if (!currentConversationId.value) return
   const userMsg = messages.value.find((m) => m.id === messageId)
   if (!userMsg) return
   const intent = userMsg.variants[userMsg.active_variant]?.content
   if (!intent) return
-  await startWriting(intent)
+  // 找到紧随其后的 AI 消息（regenerate 的目标）
+  const userIndex = messages.value.findIndex((m) => m.id === messageId)
+  const aiMsg = messages.value.slice(userIndex + 1).find((m) => m.role === 'assistant')
+  if (!aiMsg) {
+    alert('没有对应的 AI 消息可以重 roll')
+    return
+  }
+
+  showPipeline.value = true
+  isWriting.value = true
+  pipeline.state = 'running'
+  pipeline.stateLabel = '重 roll（整体）'
+  pipeline.director = { status: 'idle', detail: '', output: '' }
+  pipeline.subagents = []
+  pipeline.editor = { status: 'idle', detail: '', output: '' }
+  messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
+
+  try {
+    await apiRegenerate({
+      conversationId: currentConversationId.value,
+      nodeId: aiMsg.id,
+      targets: [],       // 空 = 整体重 roll
+      hint: intent,       // user 的意图作为 hint 注入导演+编剧
+    }, (event) => handlePipelineEvent(event))
+
+    // 重拉对话刷新（regenerate 替换了 AI 消息的 variant）
+    const refreshed = await getConversation(currentConversationId.value)
+    if (refreshed) {
+      applyConversation(refreshed)
+      if (activeChar.value) {
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = activeChar.value.name
+        })
+      }
+    }
+    messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
+    pipeline.state = 'done'
+    pipeline.stateLabel = '重 roll 完成'
+    scrollToBottom()
+  } catch (err) {
+    pipeline.state = 'error'
+    pipeline.stateLabel = `重 roll 失败: ${err}`
+  } finally {
+    isWriting.value = false
+  }
 }
 
 // 添加新变体（分支）
