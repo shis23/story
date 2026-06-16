@@ -107,9 +107,10 @@ function deleteVariant() {
   emit('delete-variant', { nodeId: props.message.id })
 }
 
-// 添加新变体（分支）
-function addVariant() {
-  emit('add-variant', { nodeId: props.message.id })
+// 分支：设计上分支 = 开新 Campaign 档（Campaign.fork_from 记录分叉点）。
+// 当前未暴露 fork Tauri 命令，先提示用户在 Campaign 面板操作，避免误触导致消息消失。
+function explainBranch() {
+  window.alert('分支功能 = 从当前剧情另开一个新档（Campaign）。\n\n请在「Campaign 面板」中对当前游玩档使用「分叉」操作，选择从这里开始新的故事线。\n\n（该功能的后端 Campaign.fork 已实现，前端入口开发中）')
 }
 
 const isUser = computed(() => props.message.role === 'user')
@@ -199,7 +200,7 @@ const isUser = computed(() => props.message.role === 'user')
       </div>
 
       <button @click="deleteVariant" class="px-2.5 py-1 rounded-md hover:bg-bg">🗑 删除</button>
-      <button @click="addVariant" class="px-2.5 py-1 rounded-md hover:bg-bg">📑 分支</button>
+      <button @click="explainBranch" class="px-2.5 py-1 rounded-md hover:bg-bg">📑 分支</button>
 
       <!-- 高玩模式额外信息 -->
       <span v-if="currentVariant.provenance" class="ml-auto text-[11px] text-ink-soft/70">

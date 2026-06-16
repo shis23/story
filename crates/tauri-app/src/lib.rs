@@ -2814,10 +2814,25 @@ async fn extract_characters(
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
     let character = {
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
-        ctx.characters
+        // 1. 直接按 Character.id 查（前端 extractCharacters 传卡本身 id 时命中）
+        let direct = ctx
+            .characters
             .iter()
             .find(|c| c.id.as_str() == source_character_id)
-            .map(|c| (*c).clone())
+            .map(|c| (*c).clone());
+        match direct {
+            Some(c) => Some(c),
+            None => {
+                // 2. 回退：前端可能传了存储 id（import_character 返回的 StoredCharacter.id，
+                //    与 Character.id 无关）。用存储 id 查 CharacterStore 拿到 name，再按 name 查 tool_ctx。
+                get_store().get(&source_character_id).and_then(|stored| {
+                    ctx.characters
+                        .iter()
+                        .find(|c| c.name == stored.info.name)
+                        .map(|c| (*c).clone())
+                })
+            }
+        }
     }
     .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的角色卡"))?;
 

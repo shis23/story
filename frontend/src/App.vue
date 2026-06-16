@@ -102,24 +102,27 @@ function setupConsoleForwarding() {
 }
 
 // 把后端 Conversation 应用到前端 messages（设 id + 转换 nodes → messages）
-// 复用点：恢复对话、重 roll 后刷新（单一事实源，避免前端臆测 variant 数组）
+// 复用点：恢复对话、重 roll 后刷新、删除后刷新（单一事实源，避免前端臆测 variant 数组）
 function applyConversation(conv) {
   currentConversationId.value = conv.id
-  messages.value = conv.nodes.map((node) => {
-    const active = node.variants[node.active_variant] || node.variants[0]
-    return {
-      id: node.id,
-      role: active.role === 'User' ? 'user' : 'assistant',
-      role_label: active.role === 'User' ? '我' : 'AI',
-      active_variant: node.active_variant,
-      variants: node.variants.map((v) => ({
-        id: v.id,
-        content: v.content,
-        status: v.status === 'Final' ? 'final' : v.status === 'Discarded' ? 'discarded' : 'draft',
-        provenance: v.provenance,
-      })),
-    }
-  })
+  messages.value = conv.nodes
+    // 隐藏「所有 variant 都 Discarded」的 node（删除后该消息整体消失）
+    .filter((node) => node.variants.some((v) => v.status !== 'Discarded'))
+    .map((node) => {
+      const active = node.variants[node.active_variant] || node.variants[0]
+      return {
+        id: node.id,
+        role: active.role === 'User' ? 'user' : 'assistant',
+        role_label: active.role === 'User' ? '我' : 'AI',
+        active_variant: node.active_variant,
+        variants: node.variants.map((v) => ({
+          id: v.id,
+          content: v.content,
+          status: v.status === 'Final' ? 'final' : v.status === 'Discarded' ? 'discarded' : 'draft',
+          provenance: v.provenance,
+        })),
+      }
+    })
 }
 
 // 从后端恢复最近一次对话
