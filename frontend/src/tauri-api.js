@@ -312,7 +312,7 @@ export async function setActiveConnection(id) {
 
 /**
  * 测试连接连通性
- * @param {Object} req - { baseUrl, apiKey, model, toolMode }
+ * @param {Object} req - { baseUrl, apiKey, model, protocol, toolMode }
  * @returns {Promise<{success: boolean, message: string, latencyMs?: number}>}
  */
 export async function testConnection(req) {
@@ -322,6 +322,7 @@ export async function testConnection(req) {
         base_url: req.baseUrl,
         api_key: req.apiKey,
         model: req.model,
+        protocol: req.protocol,
         tool_mode: req.toolMode,
       },
     })

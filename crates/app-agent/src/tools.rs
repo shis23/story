@@ -311,6 +311,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
 }
 
 /// 注册子 Agent 的工具（只读，受限）
+#[allow(dead_code)]
 pub fn register_subagent_tools(registry: &mut ToolRegistry) {
     // get_character: 子 Agent 只能查自己（上层通过 ContextPackage 控制）
     registry.register(
@@ -349,6 +350,7 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
 }
 
 /// 注册编剧 Agent 的工具
+#[allow(dead_code)]
 pub fn register_editor_tools(registry: &mut ToolRegistry) {
     // compose: 编剧输出成文（实际上编剧直接输出文本，不需要真正调工具）
     // 这个工具是为了让编剧可以声明"我完成了"

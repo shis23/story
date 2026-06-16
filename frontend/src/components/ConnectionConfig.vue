@@ -128,6 +128,7 @@ async function handleTest() {
       baseUrl: form.baseUrl,
       apiKey: form.apiKey,
       model: form.model,
+      protocol: form.protocol,
       toolMode: form.toolMode,
     })
   } catch (e) {
@@ -174,7 +175,9 @@ async function handleSave() {
 }
 
 async function handleDelete(id) {
-  if (!confirm('确定删除此连接？')) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask('确定删除此连接？', { title: '删除确认', kind: 'warning' })
+  if (!ok) return
   try {
     await deleteConnection(id)
     await loadConnections()

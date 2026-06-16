@@ -164,14 +164,16 @@ impl MemoryArchiver {
         for summary in &mut summaries {
             match self.embedder.embed(&summary.content).await {
                 Ok(vector) => {
-                    let _ = self.vector_store.upsert(VectorRecord {
+                    if let Err(e) = self.vector_store.upsert(VectorRecord {
                         id: summary.id.clone(),
                         content: summary.content.clone(),
                         vector: vector.clone(),
                         keywords: summary.keywords.clone(),
                         kind: VectorKind::ArchivedSummary,
                         metadata: std::collections::HashMap::new(),
-                    });
+                    }) {
+                        warn!(target: "app-memory", "总结 {} 入向量库失败: {e}", summary.id);
+                    }
                     summary.vector = Some(vector);
                     info!(target: "app-memory", "总结 {} 已嵌入并入库", summary.id);
                 }

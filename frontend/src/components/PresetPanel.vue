@@ -38,7 +38,9 @@ async function togglePreset(preset) {
 }
 
 async function handleDelete(preset) {
-  if (!confirm(`确定删除预设「${preset.name}」？`)) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask(`确定删除预设「${preset.name}」？`, { title: '删除确认', kind: 'warning' })
+  if (!ok) return
   try {
     await deletePreset(preset.id)
     if (expandedId.value === preset.id) {

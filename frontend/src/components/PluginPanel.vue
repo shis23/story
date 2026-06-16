@@ -149,7 +149,9 @@ async function doInstall() {
 }
 
 async function doUninstall(plugin) {
-  if (!confirm(`确定卸载插件「${plugin.name}」？`)) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask(`确定卸载插件「${plugin.name}」？`, { title: '卸载确认', kind: 'warning' })
+  if (!ok) return
   try {
     await uninstallPlugin(plugin.id)
     await loadPlugins()

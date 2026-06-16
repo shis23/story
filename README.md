@@ -2,7 +2,7 @@
 
 > AI 多 Agent 协作写作 App —— 抛弃单 prompt 注入，改用多 Agent 显式编排联合写文。
 
-**平台**：Android（主力） / 桌面端（开发调试）  
+**平台**：Android（主力） / 桌面端（开发调试）
 **状态**：M1 核心功能完成，M2 记忆系统接入中，Android 构建链路已打通
 
 ---
@@ -78,11 +78,11 @@ storyforge/
 │   ├── app-pipeline/                   # 写作流水线编排（状态机）
 │   ├── app-memory/                     # 记忆系统（归档器+召回器）
 │   ├── app-meta/                       # Meta Agent（诊断+Patch）
-│   └── tauri-app/                      # Tauri 入口（88 个命令）
+│   └── tauri-app/                      # Tauri 入口（87 个命令）
 └── frontend/                           # Vue 3 前端
     └── src/
         ├── App.vue                     # 主应用
-        ├── tauri-api.js                # Tauri IPC 桥（88 个命令）
+        ├── tauri-api.js                # Tauri IPC 桥（87 个命令）
         └── components/
             ├── ChatMessage.vue         # 对话消息（编辑/采纳/删除/分支/重roll）
             ├── PipelinePanel.vue       # 流水线状态面板
@@ -120,7 +120,7 @@ cd crates/tauri-app && cargo tauri dev
 ```bash
 cd storyforge
 
-# 全 workspace 测试（87 个）
+# 全 workspace 测试（242 个）
 cargo test --workspace
 
 # 单 crate 测试
@@ -162,7 +162,7 @@ ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 
 ---
 
-## 88 个 Tauri 命令
+## 87 个 Tauri 命令
 
 <details>
 <summary>点击展开完整列表</summary>
@@ -308,9 +308,8 @@ Layer 3: Vector Index（向量检索池）→ 余弦相似度搜索
 | [INTENT.md](docs/INTENT.md) | 需求决策文档（48 条决策，D1-D48） |
 | [TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md) | 技术方案设计（23 章，含角色隔离/Campaign/MVU/叙事计划/cache 布局/变量体系） |
 | [HANDOFF.md](docs/HANDOFF.md) | 项目交接文档（当前状态 + 后续计划 + 决策时点） |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构总览（crate 依赖图 + 一次写作调用链 + 持久化总表 + 命令映射，与代码同步） |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码架构总览（crate 依赖图 + 一次写作调用链 + 持久化总表 + 命令映射 + 完整对话链路图，与代码同步） |
 | [AGENT_INTERFACES.md](docs/AGENT_INTERFACES.md) | Agent 接口索引（所有 prompt/上下文/输出解析位置，改 prompt 只看这文件） |
-| [CONVERSATION_FLOW.md](docs/CONVERSATION_FLOW.md) | 完整对话链路图（首次写作/重 roll/user重 roll/删除/会话选择/对话树/事件流/取消机制） |
 
 ---
 

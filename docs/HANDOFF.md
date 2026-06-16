@@ -1,6 +1,6 @@
 # StoryForge 项目交接文档
 
-> 最后更新：2026-06-16（对话完整性修复 + 对话历史注入 + 会话选择界面）
+> 最后更新：2026-06-16（文档整合：精简重复章节，合并 CONVERSATION_FLOW 到 ARCHITECTURE）
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
@@ -17,24 +17,6 @@
 > **P2 后处理流水线已完成（2026-06-15）**：后处理 Agent + 剧情总结 Agent + 并行编排 + CampaignStore 扩展 + 流水线接入 + 任务注入导演 + 6 个 Tauri 命令 + 前端事件桥接 + **前端知识/任务/摘要面板已接入**，
 > **git 仓库已绑定**：`https://git.2529985.xyz/ss/story.git`（main 分支），
 > 剩余工作见 §7 后续计划。
-
----
-
-## 1. 项目概述
-
-**StoryForge** 是一个**仅安卓**的 AI 多 Agent 协作写作 App。
-
-**核心理念**：抛弃 SillyTavern「单 prompt + 提示词注入」范式，改用**多 Agent 显式编排**联合写文。
-
-**技术栈**：
-- 后端：Rust + Tauri v2
-- 前端：Vue 3 + Vite + Tailwind v4
-- 包管理：Cargo（Rust）+ npm（前端）
-- 框架：Tauri v2（移动端 + 桌面端）
-
-**参考项目**：
-- SillyTavern（ST）：上游原版，Web 应用
-- TauriTavern（TT）：ST 的 Tauri 移植，借鉴其 DDD 架构思路
 
 ---
 
@@ -56,7 +38,7 @@
 **Workspace 结构**：
 ```
 storyforge/
-├── Cargo.toml                          # workspace 定义（13 个 crate 成员）
+├── Cargo.toml                          # workspace 定义（14 个 crate 成员）
 ├── crates/
 │   ├── domain/                         # 纯领域模型（无 IO）
 │   │   ├── character.rs                # 角色卡（ST V2/V3 兼容）
@@ -166,7 +148,7 @@ storyforge/
   - `abandon_task` — 放弃任务
   - `list_round_summaries` — 列本轮剧情摘要（按 campaign_id 筛选，按 turn 升序，200-500 字/条）
 
-**测试**：234/234 单元测试通过（含 P3 新增：domain mvu_translation 11 个 + app-meta 24 个含 MVU 五合一/ST 分类/Meta 对话 + infra-plugin-host mvu_runtime 2 个 + tauri-app campaign_store MVU 持久化 2 个；代码审查修复新增 19 个：domain prompt_module 通配符匹配 2 + story_task trigger 优先级 1 + infra-util 4 + llm_parse 10 + infra-regex ReDoS 1 + postprocess parse_succeeded 1）。
+**测试**：242/242 单元测试通过（含 P3 新增：domain mvu_translation 11 个 + app-meta 24 个含 MVU 五合一/ST 分类/Meta 对话 + infra-plugin-host mvu_runtime 2 个 + tauri-app campaign_store MVU 持久化 2 个；代码审查修复新增 19 个：domain prompt_module 通配符匹配 2 + story_task trigger 优先级 1 + infra-util 4 + llm_parse 10 + infra-regex ReDoS 1 + postprocess parse_succeeded 1）。
 
 ### 2.3 前端（M0 完成）
 
@@ -190,7 +172,7 @@ storyforge/
 - **前端日志上报**（console.log/warn/error 自动转发到后端 LogStore，高玩模式日志面板可查）
 - Agent 配置卡片（高玩模式）
 - LLM 连接管理弹层（创建/删除/切换/测试连通）
-- **前端 IPC 桥**（79 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
+- **前端 IPC 桥**（87 个 Tauri 命令全覆盖，含记忆系统 + Meta Agent + 世界书 CRUD + 模型列表）
 - **ST 风格 markdown 渲染**（`*动作*`→斜体、`**粗体**`、换行，覆盖对话消息和开场白，先 HTML 转义防 XSS）
 - **用户意图消息**（写作时自动把用户输入加入消息列表，消息流：开场白→意图→成文）
 - **消息列表滚动**（`h-screen flex flex-col` 布局 + `flex-1 overflow-y-auto`，新消息/成文后自动滚动到底）
@@ -347,7 +329,7 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 
 ### 3.9 代码审查修复（2026-06-16）
 
-对全项目（13 crate + 前端）做系统性代码审查，分 8 个 commit 修复，测试 215 → 234 全绿。
+对全项目（14 crate + 前端）做系统性代码审查，分 8 个 commit 修复，测试 215 → 234 全绿。
 
 **修复的确定性 bug（Commit 1）**：
 - `now_iso()` 误返回 Unix 秒数（应为 rfc3339），与 RoundSummary.created_at 格式统一
@@ -513,6 +495,27 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 - 「新对话」按钮 → 清空消息，`currentConversationId = null`
 - 顶栏 📜 按钮 → 返回历史列表
 
+### 3.16 全项目审查修复（2026-06-16）
+
+3 轮独立审查（22 个 agent）发现 97 个问题，已修复 7 Critical + 11 High + 11 Medium = 29 项。
+
+**Critical 修复（7 项）**：
+
+| 问题 | 文件 | 修复 |
+|------|------|------|
+| CampaignStore 无并发保护 | campaign_store.rs | 加 `Mutex<CampaignCache>` 内存缓存 |
+| meta_accept_patch 世界书数据损坏 | lib.rs | is_global 从 route 推导 + keys 匹配替代 content 匹配 |
+| atomic_write 临时文件碰撞 | infra-util/lib.rs | `format!("{}.tmp")` + 回退成功返回 Ok |
+| PluginHost XSS 注入 | PluginHost.vue | DOMPurify 消毒 slotHtml + entry_html |
+| confirm/alert 失效 | 6 个组件 | 全部改用 `@tauri-apps/plugin-dialog` |
+| JSON 解析失败静默丢失数据 | 5 个 Store | .tmp 备份回退 |
+
+**High 修复（11 项）**：7 处裸 unwrap 改 recover、testConnection 补 protocol、create_task 格式对齐、Embedder 返回 Result、PluginRegistry recover、ConversationStore ensure_loaded、let _ 改 warn、regenerate 发 Committed 事件。
+
+**Medium 修复（11 项）**：向量库级联删、upsert 错误日志、constant_lore 解析、稀疏数组预填充、Composer 禁用、log 大小限制、StoryTime 大小写、空消息过滤。
+
+详见 [FINAL-AUDIT-REPORT.md](FINAL-AUDIT-REPORT.md)。
+
 ---
 
 ## 4. 当前环境状态
@@ -567,83 +570,6 @@ cd crates/tauri-app/gen/android
 
 # APK 位置
 crates/tauri-app/gen/android/app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
-```
-
----
-
-## 5. 如何运行
-
-### 5.1 桌面端开发
-
-```bash
-cd C:\Users\Predator\ZCodeProject\storyforge
-
-# 启动前端 dev server（端口 1420）
-cd frontend && npm run dev
-
-# 另一个终端：启动 Tauri 桌面端
-cd crates/tauri-app && cargo tauri dev
-```
-
-### 5.2 构建前端
-
-```bash
-cd C:\Users\Predator\ZCodeProject\storyforge\frontend
-npm run build
-```
-
-### 5.3 运行测试
-
-```bash
-cd C:\Users\Predator\ZCodeProject\storyforge
-
-# 全 workspace 测试（168 个）
-cargo test --workspace
-
-# 单 crate 测试
-cargo test -p storyforge-infra-import
-cargo test -p storyforge-infra-llm
-cargo test -p storyforge-app-logging
-cargo test -p storyforge-app-conversation
-```
-
-### 5.4 检查角色卡结构
-
-```bash
-cd C:\Users\Predator\ZCodeProject\storyforge
-# 将卡文件放到项目根目录，命名为 test-card.png
-cargo run -p storyforge-infra-import --example inspect_card
-```
-
-### 5.5 Android 构建（已配置完成）
-
-```bash
-cd C:\Users\Predator\ZCodeProject\storyforge\crates\tauri-app
-
-# 环境变量（每次新终端需设置）
-export ANDROID_HOME="C:/Users/Predator/android-sdk"
-export JAVA_HOME="C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot"
-
-# 初始化（已完成）
-cargo tauri android init
-
-# Rust 交叉编译
-cargo tauri android build --target x86_64
-
-# 手动复制 .so（Windows 符号链接问题）
-cp target/x86_64-linux-android/release/libstoryforge_lib.so \
-   crates/tauri-app/gen/android/app/src/main/jniLibs/x86_64/
-
-# Gradle 打包 APK
-cd crates/tauri-app/gen/android
-./gradlew assembleX86_64Debug -x rustBuildX86_64Debug
-
-# APK 位置
-ls app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
-
-# 安装到模拟器
-C:\Users\Predator\android-sdk\platform-tools\adb.exe install -r \
-  app/build/outputs/apk/x86_64/debug/app-x86_64-debug.apk
 ```
 
 ---
@@ -1127,51 +1053,6 @@ default_Seraphina.png
 **位置**：ST settings.json → `extension_settings.LittleWhiteBox`
 
 **已启用的功能**：storyOutline / storySummary / enaPlanner / variablesCore / fourthWall / novelDraw
-
----
-
-## 11. 设计理念总结
-
-### 核心范式转变
-
-**ST**：预设/世界书 → 提示词注入 → 单 prompt → 模型生成
-**我们**：预设/世界书 → Agent 资料源 → 多 Agent 编排 → 工具调用
-
-### 五条设计原则
-
-1. **Agent 原生，非注入原生** — 所有资料都是 Agent 的工具调用对象
-2. **后端编排，前端展示** — 多 Agent 并行在 Rust 后端，前端只渲染
-3. **数据兼容，运行不兼容** — 能导入 ST 数据，不运行 ST 插件
-4. **双视图渐进披露** — 普通视图简洁，高玩视图全暴露
-5. **插件用自有 API** — 自建运行时，不模拟 ST
-
-### 独有能力
-
-- **部分重 roll**：只重跑某子 Agent，省 60% token（ST 做不到）
-- **专属上下文包**：导演为每个子 Agent 构造不污染的上下文
-- **世界书路由可调**：每条目可独立设置常驻/向量池/两者/禁用
-- **Meta Agent**：对话式配置助手，可读 ST 预设自动整理
-
----
-
-## 12. 联系与资源
-
-**项目路径**：`C:\Users\Predator\ZCodeProject\storyforge`
-
-**git 仓库**：`https://git.2529985.xyz/ss/story.git`（main 分支，Gitea）
-- git 身份：`ss` / `ss@git.2529985.xyz`
-- `.gitignore` 已配置：排除 `target/` / `node_modules/` / `dist/` / `data/`（含 API key）/ 测试卡 PNG / 临时文件
-- 日常提交：`git add` → `git commit` → `git push`
-
-**原型路径**：`C:\Users\Predator\ZCodeProject\storyforge-prototype`（纯前端 UI 原型，无 Tauri 依赖，`npm run dev` 独立预览）
-
-**VPS 文档**：`C:\Users\Predator\Desktop\vps\VPS现状文档.md`
-
-**参考项目**：
-- SillyTavern: https://github.com/SillyTavern/SillyTavern
-- TauriTavern: https://github.com/Darkatse/TauriTavern
-- 小白X: https://github.com/RT15548/LittleWhiteBox
-- 酒馆助手: https://github.com/n0vi028/JS-Slash-Runner
 
 ---
 

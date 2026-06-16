@@ -169,6 +169,8 @@ impl ConversationStore {
 
     /// 删除对话
     pub fn delete(&self, id: &Id) -> Result<(), ConversationError> {
+        self.ensure_loaded();
+
         let path = self.dir.join(format!("{}.json", id.as_str()));
         if path.exists() {
             std::fs::remove_file(&path)?;

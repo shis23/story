@@ -139,6 +139,9 @@ pub trait VectorStore: Send + Sync {
     /// 按 campaign 删除所有记录（删档时清理）
     fn delete_by_campaign(&self, campaign_id: &Id) -> Result<usize, VectorError>;
 
+    /// 按 character 删除所有记录（删卡时级联清理，M-2）
+    fn delete_by_character(&self, character_id: &Id) -> Result<usize, VectorError>;
+
     /// 记录总数
     fn count(&self) -> usize;
 }
@@ -179,10 +182,20 @@ impl BruteForceStore {
     /// 带持久化的构造
     pub fn with_persistence(path: PathBuf) -> Self {
         let records = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::warn!("向量库 JSON 解析失败({e})，尝试 .tmp 备份");
+                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!("向量库 JSON 无可用备份，返回空");
+                            HashMap::new()
+                        })
+                }),
+                Err(_) => HashMap::new(),
+            }
         } else {
             HashMap::new()
         };
@@ -303,6 +316,16 @@ impl VectorStore for BruteForceStore {
         let target = serde_json::Value::String(campaign_id.to_string());
         let before = records.len();
         records.retain(|_, r| r.metadata.get("campaign_id") != Some(&target));
+        let removed = before - records.len();
+        self.persist_records(&records)?;
+        Ok(removed)
+    }
+
+    fn delete_by_character(&self, character_id: &Id) -> Result<usize, VectorError> {
+        let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
+        let target = serde_json::Value::String(character_id.to_string());
+        let before = records.len();
+        records.retain(|_, r| r.metadata.get("character_id") != Some(&target));
         let removed = before - records.len();
         self.persist_records(&records)?;
         Ok(removed)

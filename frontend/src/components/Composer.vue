@@ -2,12 +2,16 @@
 import { ref } from 'vue'
 import { sampleIntent } from '../mock.js'
 
+const props = defineProps({
+  disabled: { type: Boolean, default: false },
+})
+
 const emit = defineEmits(['start-writing'])
 
 const intent = ref('')
 
 function submit() {
-  if (!intent.value.trim()) return
+  if (!intent.value.trim() || props.disabled) return
   emit('start-writing', intent.value)
   intent.value = ''
 }
@@ -19,17 +23,18 @@ function submit() {
     <div class="flex items-end gap-2 bg-bg rounded-2xl border border-line px-3 py-2 focus-within:border-accent transition-colors">
       <textarea
         v-model="intent"
-        :placeholder="sampleIntent"
+        :placeholder="disabled ? '写作中…' : sampleIntent"
+        :disabled="disabled"
         rows="1"
-        class="flex-1 bg-transparent resize-none outline-none text-[15px] text-ink placeholder:text-ink-soft/50 max-h-32"
+        class="flex-1 bg-transparent resize-none outline-none text-[15px] text-ink placeholder:text-ink-soft/50 max-h-32 disabled:opacity-50"
         @keydown.enter.exact.prevent="submit"
         @input="$event.target.style.height='auto'; $event.target.style.height=$event.target.scrollHeight+'px'"
       ></textarea>
       <button
         @click="submit"
-        :disabled="!intent.trim()"
+        :disabled="!intent.trim() || disabled"
         class="shrink-0 w-9 h-9 rounded-full flex items-center justify-center transition-all"
-        :class="intent.trim()
+        :class="intent.trim() && !disabled
           ? 'bg-accent text-white hover:opacity-90'
           : 'bg-bg text-ink-soft'"
       >

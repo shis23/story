@@ -41,8 +41,21 @@ impl ConnectionStore {
     pub fn new(app_data_dir: &PathBuf) -> Self {
         let path = app_data_dir.join("connections.json");
         let file = if path.exists() {
-            let data = std::fs::read_to_string(&path).unwrap_or_default();
-            serde_json::from_str(&data).unwrap_or_default()
+            match std::fs::read_to_string(&path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    // 主文件损坏，尝试 .tmp 备份
+                    tracing::warn!("连接配置 JSON 解析失败({e})，尝试 .tmp 备份");
+                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!("连接配置 JSON 无可用备份，返回默认");
+                            ConnectionsFile::default()
+                        })
+                }),
+                Err(_) => ConnectionsFile::default(),
+            }
         } else {
             ConnectionsFile::default()
         };

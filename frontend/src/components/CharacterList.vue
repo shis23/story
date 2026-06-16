@@ -35,7 +35,9 @@ async function handleSelect(char) {
 
 async function handleDelete(char, event) {
   event.stopPropagation()
-  if (!confirm(`确定删除「${char.name}」？`)) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask(`确定删除「${char.name}」？`, { title: '删除确认', kind: 'warning' })
+  if (!ok) return
   try {
     await deleteCharacter(char.id)
     await refresh()

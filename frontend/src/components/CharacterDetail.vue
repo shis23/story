@@ -101,7 +101,9 @@ async function saveEdit(i) {
 }
 
 async function handleDelete(i) {
-  if (!confirm('确定删除此世界书条目？')) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask('确定删除此世界书条目？', { title: '删除确认', kind: 'warning' })
+  if (!ok) return
   try {
     await deleteWorldInfoEntry(props.character.id, i)
     emit('delete-entry', { index: i })

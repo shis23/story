@@ -8,7 +8,7 @@
 //!   整个命令层瘫痪（参照 `app-conversation` 的 `lock_cache` 范式）。
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LockResult, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::Serialize;
@@ -23,12 +23,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp_path = path.with_extension("json.tmp");
+    // 用完整路径拼接 .tmp 后缀，避免 with_extension 在多扩展名文件上碰撞
+    // （例如 data.json 和 data.json.bak 都会变成 data.tmp）
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
     std::fs::write(&tmp_path, bytes)?;
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         tracing::error!("rename 失败，回退直接写: {e}");
-        let _ = std::fs::write(path, bytes);
-        return Err(e);
+        // 回退直接写：成功时返回 Ok（降级但不丢数据），失败时返回 Err
+        return std::fs::write(path, bytes);
     }
     Ok(())
 }

@@ -105,10 +105,20 @@ impl PluginRegistry {
     /// 带持久化的构造
     pub fn with_persistence(path: std::path::PathBuf) -> Self {
         let plugins = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::warn!("插件注册表 JSON 解析失败({e})，尝试 .tmp 备份");
+                    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!("插件注册表 JSON 无可用备份，返回空");
+                            HashMap::new()
+                        })
+                }),
+                Err(_) => HashMap::new(),
+            }
         } else {
             HashMap::new()
         };
@@ -173,7 +183,7 @@ impl PluginRegistry {
     pub fn list_enabled(&self) -> Vec<InstalledPlugin> {
         self.plugins
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .filter(|p| p.enabled)
             .cloned()
@@ -203,7 +213,7 @@ impl PluginRegistry {
     pub fn plugins_for_slot(&self, slot: &UiSlot) -> Vec<InstalledPlugin> {
         self.plugins
             .read()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
             .filter(|p| p.enabled && p.manifest.ui_slots.contains(slot))
             .cloned()

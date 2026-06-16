@@ -598,6 +598,10 @@ function handlePipelineEvent(event) {
         detail: `规划完成 · 分配 ${event.data.subagent_count} 个角色`,
         output: pipeline.director.output, // 保留已累积的输出
       }
+      // 预填充 subagents 数组（避免稀疏数组导致 Vue 响应式失效，M-15）
+      pipeline.subagents = Array.from({ length: event.data.subagent_count }, () => ({
+        id: '', name: '', emoji: '🎭', status: 'pending', progress: 0
+      }))
       pipeline.stateLabel = '子 Agent 并行表演'
       break
     case 'subagent_started':
@@ -862,7 +866,7 @@ function handlePipelineEvent(event) {
     </div>
 
     <!-- 底部输入栏 -->
-    <Composer @start-writing="startWriting" />
+    <Composer @start-writing="startWriting" :disabled="isWriting" />
 
     <!-- 版本号 -->
     <div class="text-center text-[10px] text-ink-soft/40 pb-1">v{{ appVersion }}</div>

@@ -147,8 +147,8 @@ impl StoryTask {
                     }
                 }
                 TaskTrigger::StoryTime { target } => {
-                    // 简化：字符串相等即触发。实际可比对自然语言时间，留给后处理 Agent 辅助。
-                    if story_clock == target {
+                    // 大小写不敏感比较（M-30），并去除首尾空白
+                    if story_clock.trim().eq_ignore_ascii_case(target.trim()) {
                         return TriggerCheck::Satisfied;
                     }
                 }

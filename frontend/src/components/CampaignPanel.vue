@@ -166,7 +166,7 @@ const newTaskDesc = ref('')
 async function handleCreateTask() {
   if (!newTaskTitle.value.trim()) return
   try {
-    await createTask(selectedCampaignId.value, newTaskTitle.value.trim(), newTaskDesc.value.trim(), ['Manual'])
+    await createTask(selectedCampaignId.value, newTaskTitle.value.trim(), newTaskDesc.value.trim(), [{ kind: 'manual' }])
     newTaskTitle.value = ''
     newTaskDesc.value = ''
     showNewTask.value = false
@@ -182,7 +182,9 @@ async function handleCompleteTask(taskId) {
 }
 
 async function handleAbandonTask(taskId) {
-  if (!confirm('确定放弃该任务？')) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask('确定放弃该任务？', { title: '放弃确认', kind: 'warning' })
+  if (!ok) return
   await abandonTask(taskId)
   tasks.value = await listTasks(selectedCampaignId.value)
 }

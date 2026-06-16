@@ -15,6 +15,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import DOMPurify from 'dompurify'
 import { generateBridgeScript, createHostHandler, MSG_MOUNT } from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -33,10 +34,12 @@ const iframeRef = ref(null)
 const slotHtml = ref('')
 let handler = null
 
-// 构建 srcdoc：bridge script + 插件 HTML
+// 构建 srcdoc：bridge script + 插件 HTML（entry_html 已由 iframe sandbox 隔离，
+// 但仍做消毒防止沙箱逃逸场景）
 const iframeSrc = computed(() => {
   if (!props.plugin?.manifest?.entry_html && !props.plugin?.entry_html) return ''
-  const entryHtml = props.plugin?.manifest?.entry_html || props.plugin?.entry_html || ''
+  const rawHtml = props.plugin?.manifest?.entry_html || props.plugin?.entry_html || ''
+  const entryHtml = DOMPurify.sanitize(rawHtml)
   const bridgeScript = generateBridgeScript(props.plugin.id)
   return `<!DOCTYPE html><html><head>${bridgeScript}</head><body>${entryHtml}</body></html>`
 })
@@ -58,7 +61,8 @@ function onWindowMessage(event) {
 
   // 插件 UI 挂载请求
   if (data?.type === MSG_MOUNT && data.pluginId === props.plugin.id) {
-    slotHtml.value = data.html || ''
+    // 消毒插件 HTML，防止 XSS 注入宿主 DOM
+    slotHtml.value = DOMPurify.sanitize(data.html || '')
     emit('slot-mount', { pluginId: data.pluginId, slot: data.slot, html: data.html })
   }
 

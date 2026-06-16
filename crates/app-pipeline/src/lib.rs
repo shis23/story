@@ -1054,7 +1054,7 @@ impl PipelineOrchestrator {
             return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
         }
 
-        self.state = PipelineState::Review;
+        self.state = PipelineState::Committed;
         let _ = event_tx.send(PipelineEvent::StateChanged {
             state: self.state.clone(),
         });
@@ -1310,7 +1310,26 @@ fn parse_context_package(v: &serde_json::Value) -> ContextPackage {
                     .collect()
             })
             .unwrap_or_default(),
-        constant_lore: vec![],
+        constant_lore: v
+            .get("constant_lore")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| LoreEntryLight {
+                        keys: e
+                            .get("keys")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default(),
+                        content: e
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         recent_window: v
             .get("recent_window")
             .and_then(|v| v.as_array())

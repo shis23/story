@@ -44,15 +44,15 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    pub fn new(config: EmbedConfig) -> Self {
-        Self {
+    pub fn new(config: EmbedConfig) -> Result<Self, LlmError> {
+        Ok(Self {
             client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
             .build()
-            .expect("构建 embedder reqwest client 失败"),
+            .map_err(|e| LlmError::Internal(format!("构建 embedder reqwest client 失败: {e}")))?,
             config,
-        }
+        })
     }
 
     /// 获取单个文本的嵌入向量

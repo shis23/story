@@ -2,7 +2,7 @@
 
 > 本文档描述**代码实现层面**的架构，与代码同步。需求决策看 [INTENT.md](INTENT.md)，设计方案看 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)，改 prompt 看 [AGENT_INTERFACES.md](AGENT_INTERFACES.md)，进度状态看 [HANDOFF.md](HANDOFF.md)。
 >
-> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；87 个 Tauri 命令；242 个测试。
+> 体量参考：Rust 14 crate + 前端，约 84 个源文件 / 2.4 万行；87 个 Tauri 命令；242 个测试。含完整对话链路图（§8）。
 
 ---
 
@@ -79,7 +79,7 @@
 
 ## 2. tauri-app：命令层与状态中枢
 
-`crates/tauri-app/src/lib.rs`（3303 行）是整个 App 的组装层。它持有两类全局状态：
+`crates/tauri-app/src/lib.rs`（3754 行）是整个 App 的组装层。它持有两类全局状态：
 
 ### 2.1 两类全局状态
 
@@ -531,7 +531,7 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 
 | 项 | 现状 | 影响 |
 |----|------|------|
-| regenerate 不进 Committed | 三路径终态停 Review | `self.session` 不刷新；语义上「重 roll 的结果」与「首写」落盘状态不同 |
+| ~~regenerate 不进 Committed~~ | ✅ 已修复：run_editor_and_commit 终态改为 Committed | — |
 | 子 Agent 并发从「丢弃」改「排队」 | Semaphore(MAX=4) 限流，超额任务全部排队跑完 | 行为变更：角色很多时总耗时变长（曾确认接受）；不再有 SubagentFailed 占位 |
 | `infra-regex` 未接入 | 代码就位但无 app/tauri 依赖 | 正则脚本能力未生效（预设里的 regex_scripts 仅存储不执行） |
 | API key 明文 | connections.json / embed.json 明文存 | 桌面开发期可接受，Android 需 infra-secrets + Keystore |
@@ -546,7 +546,196 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 
 ---
 
-## 8. 如何读这份代码（建议路径）
+## 8. 完整对话链路图（原 CONVERSATION_FLOW.md）
+
+> 基于代码实测，非猜测。每个环节标注了源文件位置。§3 从代码视角描述调用链，本节从用户操作视角描述完整流程。
+
+### 8.1 首次写作（start_writing）
+
+```
+用户在 Composer.vue 输入意图，点发送
+    │
+    ▼
+App.vue.startWriting(intent, skipLocalPush=false)     ← frontend/src/App.vue:277
+    │  1. 本地 push user 消息到 messages.value（即时反馈，skipLocalPush=true 时跳过）
+    │  2. 调 tauri-api.startWriting(intent, characterId, onEvent, conversationId)
+    │     conversationId = currentConversationId.value（null = 首次，有值 = 追加到已有对话）
+    │
+    ▼
+[Tauri 命令] start_writing                            ← tauri-app/src/lib.rs:1219
+    │  参数: intent, character_id?, conversation_id?, state, on_event
+    │
+    │  ① snapshot_tool_ctx()                           ← 读 ToolContext 快照
+    │     └─ characters: Vec<Character>                ← 导入的角色卡
+    │     └─ world_info: Option<WorldInfoBook>         ← 世界书
+    │
+    │  ② conversation_id?
+    │     ├─ Some(id) → 复用已有对话
+    │     │   └─ append_user_message(intent)           ← 只追加 user 意图（开场白已在创建时存入）
+    │     └─ None → 新建对话
+    │         ├─ conv_store.create(character_id)
+    │         ├─ append_final_message(Assistant, first_mes)  ← 开场白
+    │         └─ append_user_message(intent)                  ← user 意图
+    │
+    │  ③ 构造 WritingContext:
+    │     ├─ characters, world_info, conversation_id
+    │     ├─ profile + modules  ← fill_profile_context()
+    │     ├─ campaign_id / turn / pending_tasks / story_clock ← fill_campaign_context()
+    │     └─ recent_messages ← conv_store.recent_messages_with_role(id, 20, None)
+    │         最近 20 条带角色标签的对话（"用户: xxx" / "AI: xxx"）
+    │
+    │  ⑥ 建 cancel watch channel，sender 存 AppState.current_cancel
+    │  ⑦ spawn 事件转发任务（PipelineEvent → WritingEvent → Channel → 前端）
+    │
+    ▼
+PipelineOrchestrator.start_writing(intent, ctx)       ← app-pipeline/src/lib.rs:193
+    │
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  阶段 1：导演 Agent（Directing）                                ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    │
+    │  build_director_user_msg(intent, ctx)             ← 拼接：意图 + 角色 + 对话历史 + 蓝灯常驻 + 任务
+    │  runtime.run_tool_loop_streaming(导演工具: search_world_info / get_character / emit_plan)
+    │  parse_plan_from_response(resp)                   ← 5 层兜底解析
+    │  输出 Plan { scene_brief, subagent_tasks: [{character_id, brief}] }
+    │
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  阶段 2：子 Agent 并行（Delegating）                            ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    │
+    │  spawn_subagents(tasks, runtime, ...)              ← Semaphore(MAX=4) 排队
+    │  每个子 Agent：纯表演（无工具），流式 token → SubagentProgress 事件
+    │  全部失败才 abort；单个失败继续不中断
+    │
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  阶段 3：编剧 Agent（Editing）                                  ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    │
+    │  编剧 user_message = 场景 + 子 Agent 表演 + 对话历史
+    │  runtime.run_tool_loop_streaming（无工具，直接输出成文）
+    │  输出 final_text（Markdown）
+    │
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  阶段 4：写入对话树（Review → Committed）                       ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    │
+    │  build_provenance(session_id, plan, performances, seed)
+    │  conv_store.append_ai_draft(conversation_id, final_text, provenance)
+    │  此时后端对话: [开场白, user意图, AI成文(Draft)]
+    │
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  阶段 5：后处理流水线（有 Campaign 才跑）                        ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    │
+    │  run_postprocess() → tokio::join! 并发：
+    │  ├─ run_summarizer()    ── 本轮摘要 200-500 字
+    │  └─ run_postprocess()   ── 知识/变量/任务三合一
+    │  persist_postprocess_outcome() → 写 CampaignStore 4 个文件
+```
+
+### 8.2 重 roll（assistant 消息）
+
+```
+用户点 AI 消息的「🔄 重roll」菜单
+    │  菜单选项：整体重 roll / 只重编剧 / 只重某子 Agent / 可附 hint
+    ▼
+PipelineOrchestrator.regenerate(req, ctx)              ← app-pipeline/src/lib.rs:539
+    │  ① validate_partial_roll 校验合法性
+    │  ② 读旧 variant 的 Provenance
+    │  ③ 按 targets 分流：
+    │     路径 A（整体）：导演+子+编剧全重跑
+    │     路径 B（只编剧）：复用旧 plan + 旧子产出，编剧重跑
+    │     路径 C（只某子）：仅目标子 Agent 重跑 + 编剧合并新旧
+    │  ④ run_editor_and_commit() → 写入对话树：
+    │     ├─ 最后一条 AI → replace_active_variant（原地替换）
+    │     └─ 中间 AI → add_variant（开分支，保留旧版）
+    ▼
+前端：重拉对话 applyConversation → 刷新 UI
+```
+
+### 8.3 user 消息重 roll
+
+```
+用户点 user 消息的「🔄 重roll」
+    │  有 AI 消息 → 调 regenerate（整体重 roll，hint = user 意图）
+    │  无 AI 消息（已删除）→ 调 startWriting（重新写作，skipLocalPush=true）
+    ▼
+前端：重拉对话 → [开场白, u1, a1, u2, a2, u3, new_a3]
+```
+
+### 8.4 删除消息（truncate 语义）
+
+```
+用户点消息的「🗑 删除」
+    ▼
+[Tauri] delete_message_from → conv_store.truncate_from(conv_id, node_id)
+    │  删除指定 node 及其后所有 node，保留之前的
+    ▼
+前端：重拉对话 → 清流水线状态
+```
+
+### 8.5 会话历史选择界面
+
+```
+启动 App → loadConversationHistory() → 显示会话列表
+    │  点击会话 → openConversation → applyConversation
+    │  「新对话」→ 清空 messages, currentConversationId = null
+    │  📜 按钮 → 返回历史列表
+```
+
+### 8.6 对话树数据结构
+
+```
+Conversation { nodes: Vec<MessageNode> }
+MessageNode { id, parent_id, variants: Vec<MessageVariant>, active_variant }
+MessageVariant { id, role(User|Assistant), content, status(Draft|Final|Discarded), provenance }
+Provenance { session_id, plan, subagent_results, profile_id, seed, last_hint }
+```
+
+### 8.7 前端消息 vs 后端对话
+
+```
+前端 messages.value（本地状态）:
+  ├─ 导入时本地 push 开场白
+  ├─ startWriting 本地 push user 消息
+  ├─ editor_progress 更新 editor-streaming 占位
+  ├─ startWriting 完成后 push AI 成文
+  └─ applyConversation 整体替换为后端数据（打开会话/重 roll 刷新时）
+
+后端对话（持久化）:
+  ├─ start_writing 新建时: append 开场白 + user 意图 (Final)
+  ├─ pipeline 完成后: append AI 成文 (Draft)
+  ├─ regenerate 时: replace_active_variant（最后一条）或 add_variant（中间）
+  └─ delete_message_from 时: truncate_from（删除该条及之后所有）
+```
+
+### 8.8 事件流（Channel）
+
+```
+start_writing / regenerate 通过 Channel 推送事件到前端：
+
+started → state_changed(Directing) → director_started → director_progress×N → director_done
+→ state_changed(Delegating) → subagent_started×N → subagent_progress×N → subagent_done×N
+→ state_changed(Editing) → editor_started → editor_progress×N → draft_ready
+→ state_changed(Review) → state_changed(Committed)
+
+后处理：postprocess_started → summary_done → postprocess_done
+```
+
+### 8.9 取消机制
+
+```
+前端 cancelWriting() → Tauri cancel_writing → sender.send(true)
+    watch channel 广播：
+    ├─ 导演 run_tool_loop_streaming（select! 与 chat_stream 竞速）
+    ├─ 子 Agent×N（每轮前检查）
+    ├─ 编剧（同上）
+    └─ 后处理 run_summarizer / run_postprocess
+```
+
+---
+
+## 9. 如何读这份代码（建议路径）
 
 1. **从 `domain/` 开始**：`agent.rs`（状态机+事件）/ `character.rs`（树形模型）/ `conversation.rs`（对话树）是理解一切的基石，且无 IO 干扰。
 2. **看 `app-pipeline/src/lib.rs`**：1492 行，一次写作的完整编排都在这。结合本文 §3 对照读。
@@ -557,4 +746,4 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 
 ---
 
-*最后同步：2026-06-16（对话数据完整性修复）。本文基于代码实测（依赖图来自 Cargo.toml，命令映射来自 lib.rs 逐函数梳理，调用链来自 app-pipeline/runtime 逐行确认，持久化表来自各 store 源码）。代码演进后请同步本文。*
+*最后同步：2026-06-16（全项目审查修复）。本文基于代码实测（依赖图来自 Cargo.toml，命令映射来自 lib.rs 逐函数梳理，调用链来自 app-pipeline/runtime 逐行确认，持久化表来自各 store 源码）。代码演进后请同步本文。*

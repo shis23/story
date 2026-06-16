@@ -253,7 +253,7 @@ impl Conversation {
             .rev()
             .filter_map(|node| {
                 let v = node.active()?;
-                if v.status == VariantStatus::Discarded {
+                if v.status == VariantStatus::Discarded || v.content.is_empty() {
                     None
                 } else {
                     Some(v.content.clone())
@@ -279,7 +279,7 @@ impl Conversation {
             .rev()
             .filter_map(|node| {
                 let v = node.active()?;
-                if v.status == VariantStatus::Discarded {
+                if v.status == VariantStatus::Discarded || v.content.is_empty() {
                     return None;
                 }
                 let role_label = match v.role {

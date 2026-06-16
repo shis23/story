@@ -22,8 +22,20 @@ impl PresetStore {
     pub fn new(app_data_dir: &PathBuf) -> Self {
         let path = app_data_dir.join("presets.json");
         let presets = if path.exists() {
-            let data = std::fs::read_to_string(&path).unwrap_or_default();
-            serde_json::from_str(&data).unwrap_or_default()
+            match std::fs::read_to_string(&path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::warn!("预设 JSON 解析失败({e})，尝试 .tmp 备份");
+                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!("预设 JSON 无可用备份，返回空");
+                            Vec::new()
+                        })
+                }),
+                Err(_) => Vec::new(),
+            }
         } else {
             Vec::new()
         };

@@ -538,6 +538,10 @@ fn delete_character(
     if let Some(stored_card) = get_campaign_store().get_card_by_source(&cid) {
         get_campaign_store().delete_card(&stored_card.card.id);
     }
+    // 级联删除：清理向量库中该角色相关的记录（M-2）
+    if let Err(e) = state.vector_store.delete_by_character(&cid) {
+        tracing::warn!("清理角色向量记录失败: {e}");
+    }
     Ok(())
 }
 
@@ -666,7 +670,7 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
     let active_names: Vec<String> = state
         .tool_ctx
         .read()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .characters
         .iter()
         .map(|c| c.name.clone())
@@ -1242,7 +1246,9 @@ async fn start_writing(
     let conversation_id = if let Some(id_str) = conversation_id {
         let id = Id::from_str(&id_str);
         // 追加 user 意图到已有对话（开场白已在创建时存入）
-        let _ = app.conv_store.append_user_message(&id, intent.clone());
+        if let Err(e) = app.conv_store.append_user_message(&id, intent.clone()) {
+            tracing::warn!("追加 user 消息失败: {e}");
+        }
         id
     } else {
         // 新建对话 + 存开场白 + 存 user 意图
@@ -1251,15 +1257,19 @@ async fn start_writing(
         // 开场白（从角色卡读取，Final 状态 Assistant 消息）
         if let Some(ch) = tool_snapshot.characters.first() {
             if !ch.first_mes.is_empty() {
-                let _ = app.conv_store.append_final_message(
+                if let Err(e) = app.conv_store.append_final_message(
                     &id,
                     storyforge_domain::conversation::Role::Assistant,
                     ch.first_mes.clone(),
-                );
+                ) {
+                    tracing::warn!("追加开场白失败: {e}");
+                }
             }
         }
         // user 意图
-        let _ = app.conv_store.append_user_message(&id, intent.clone());
+        if let Err(e) = app.conv_store.append_user_message(&id, intent.clone()) {
+            tracing::warn!("追加 user 消息失败: {e}");
+        }
         id
     };
     let mut ctx = WritingContext {
@@ -2026,12 +2036,20 @@ fn log_export_bundle(
 }
 
 /// 前端日志上报（console.log/warn/error 转发到后端 LogStore）
+///
+/// 单条消息上限 4KB（M-21），防止恶意/异常前端灌爆 LogStore。
 #[tauri::command]
 fn log_append_frontend(
     level: String,
     message: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) {
+    const MAX_LOG_MSG_LEN: usize = 4096;
+    let message = if message.len() > MAX_LOG_MSG_LEN {
+        format!("{}...(截断)", &message[..MAX_LOG_MSG_LEN])
+    } else {
+        message
+    };
     let log_level = match level.as_str() {
         "debug" => LogLevel::Debug,
         "info" => LogLevel::Info,
@@ -2222,14 +2240,14 @@ async fn archive_conversation(
     let config = state
         .embed_config
         .read()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .clone()
         .ok_or("未配置嵌入 API，请先在设置中配置")?;
 
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
 
-    let embedder = Arc::new(storyforge_infra_llm::Embedder::new(config));
+    let embedder = Arc::new(storyforge_infra_llm::Embedder::new(config).map_err(|e| format!("{e}"))?);
     let archiver = storyforge_app_memory::MemoryArchiver::new(
         llm,
         embedder,
@@ -2295,7 +2313,13 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
 
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
-    let embedder = Arc::new(storyforge_infra_llm::Embedder::new(config));
+    let embedder = match storyforge_infra_llm::Embedder::new(config) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            tracing::warn!("构建 Embedder 失败，跳过自动归档: {e}");
+            return;
+        }
+    };
     let archiver = storyforge_app_memory::MemoryArchiver::new(
         llm,
         embedder,
@@ -2396,38 +2420,48 @@ fn meta_accept_patch(
     {
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         if let Some(ref world_info) = ctx.world_info {
-            // 合并视图里的条目，保留 is_global（取自 route + 原卡标记）
+            // 从合并视图提取全局条目（Constant/Both = 全局），保留原始 is_global
             let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
                 .entries
                 .iter()
+                .filter(|e| {
+                    matches!(
+                        e.route,
+                        storyforge_domain::world_info::LoreRoute::Constant
+                            | storyforge_domain::world_info::LoreRoute::Both
+                    )
+                })
                 .map(|e| crate::WorldInfoEntryInfo {
                     keys: e.keys.clone(),
                     content: e.content.clone(),
                     constant: e.constant,
                     route: format!("{:?}", e.route),
-                    is_global: true, // 合并视图里全局条目的真相
+                    is_global: true,
                     depth: e.depth,
                     order: e.order,
                 })
                 .collect();
-            // patch 修改的非全局条目（以 content 为指纹匹配回原卡）
-            let nonglobal_contents: std::collections::HashSet<String> = world_info
-                .entries
+            // 全局条目的 keys 集合（用于从各卡原有条目中排除已合并的全局条目，
+            // 防止各卡私有条目中的旧全局条目残留）
+            let global_keys_set: std::collections::HashSet<String> = global_entries
                 .iter()
-                .map(|e| e.content.clone())
+                .map(|e| e.keys.join(","))
                 .collect();
 
             let all_stored = get_store().list();
             for stored in &all_stored {
-                // 该卡保留：原有非全局条目（未被 patch 删除的） + 所有全局条目
-                let preserved_nonglobal: Vec<crate::WorldInfoEntryInfo> = stored
+                // 保留该卡的私有条目（is_global=false），并排除 keys 与全局条目重复的
+                // （这些已由全局条目覆盖，避免重复）
+                let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
                     .info
                     .world_info_entries
                     .iter()
-                    .filter(|e| !e.is_global && nonglobal_contents.contains(&e.content))
+                    .filter(|e| {
+                        !e.is_global && !global_keys_set.contains(&e.keys.join(","))
+                    })
                     .cloned()
                     .collect();
-                let mut new_entries = preserved_nonglobal;
+                let mut new_entries = preserved_private;
                 new_entries.extend(global_entries.clone());
                 let _ = get_store().update_world_info_entries_bulk(&stored.id, new_entries);
             }
@@ -2438,7 +2472,7 @@ fn meta_accept_patch(
     state
         .meta_patches
         .write()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter_mut()
         .find(|p| p.id == patch_id)
         .map(|p| p.applied = true);
@@ -2468,7 +2502,7 @@ fn meta_start_conversation(state: tauri::State<'_, Arc<AppState>>) -> String {
     state
         .meta_conversations
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(id.clone(), conv);
     id
 }
@@ -2534,7 +2568,7 @@ async fn meta_chat(
     let messages = serde_json::to_value(&conv.messages).unwrap_or(serde_json::Value::Null);
     app.meta_conversations
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(conv_id.clone(), conv);
 
     Ok(serde_json::json!({
@@ -2565,7 +2599,7 @@ fn meta_list_pending_patches(
     state
         .meta_patches
         .read()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|p| !p.applied)
         .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
