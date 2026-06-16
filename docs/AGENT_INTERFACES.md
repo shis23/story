@@ -13,7 +13,7 @@
 | 我想改… | 改这个文件 | 改哪个符号 |
 |---------|-----------|-----------|
 | 导演的系统提示词（角色定位/任务/输出格式） | `crates/app-pipeline/src/lib.rs` | `DIRECTOR_SYSTEM_PROMPT` 常量（行 53，走 assemble_system_prompt 模块化） |
-| 导演的「用户消息」（意图+角色列表+对话历史+蓝灯注入+任务提醒） | `crates/app-pipeline/src/lib.rs` | `build_director_user_msg()` 函数（行 1073） |
+| 导演的「消息结构」（§22 三段：system 蓝灯 + history + tail 意图/任务） | `crates/app-pipeline/src/lib.rs` | `build_director_system_extra()`（蓝灯进 system，行 1111）+ `build_director_tail()`（意图/任务进 tail，行 1146） |
 | 编剧的系统提示词 | `crates/app-pipeline/src/lib.rs` | `EDITOR_SYSTEM_PROMPT` 常量（行 71，走 assemble_system_prompt 模块化） |
 | 子 Agent 的系统提示词模板 | `crates/app-pipeline/src/lib.rs` | `SUBAGENT_SYSTEM_PROMPT_TEMPLATE` 常量（行 79，含 `{name}` 占位符） |
 | 子 Agent 的「专属上下文包」拼装（角色设定/场景/世界书/最近对话） | `crates/app-pipeline/src/lib.rs` 或 `crates/app-agent/src/runtime.rs` | `format_subagent_context()`（两处实现，见 §3.2） |
@@ -28,13 +28,13 @@
 | **角色/全局变量表的字段定义** | `crates/domain/src/variables.rs` | `default_character_variables()` 工厂 + `VariableField` 结构（见 §7） |
 | **变量的注入提示词模板** | `crates/domain/src/variables.rs` | `render_variables_for_injection()`（见 §7.5） |
 | **任务（伏笔/计划）的数据结构** | `crates/domain/src/story_task.rs` | `StoryTask` + `TaskTrigger`（见 §9） |
-| **任务注入导演提示词的位置** | `crates/app-pipeline/src/lib.rs` | `build_director_user_msg()` 末尾追加（见 §9.4） |
+| **任务注入导演提示词的位置** | `crates/app-pipeline/src/lib.rs` | `build_director_tail()` 末尾追加（见 §9.4） |
 | **剧情总结 Agent 的系统提示词 / config / 用户消息** | `crates/app-agent/src/prompts/summarizer.rs` + `crates/app-agent/src/summarizer.rs` | `SUMMARIZER_SYSTEM_PROMPT` / `make_summarizer_config()` / `run_summarizer()`（见 §6.3） |
 | **后处理 Agent 的系统提示词 / config / 用户消息 / 输出解析** | `crates/app-agent/src/prompts/postprocess.rs` + `crates/app-agent/src/postprocess.rs` | `POSTPROCESS_SYSTEM_PROMPT` / `make_postprocess_config()` / `run_postprocess()` / `parse_postprocess_from_response()`（5 层兜底，见 §6.4） |
 | **后处理并行编排（总结 + 后处理并发）** | `crates/app-agent/src/pipeline_postprocess.rs` | `run_postprocess_pipeline()` → tokio::join!（见 §6.4） |
 | **后处理结果持久化（知识/变量/任务/摘要落盘）** | `crates/tauri-app/src/lib.rs` | `persist_postprocess_outcome()` + `fill_campaign_context()` |
 | **task/knowledge/summary 的 Tauri 命令** | `crates/tauri-app/src/lib.rs` | `list_character_knowledge` / `list_tasks` / `create_task` / `complete_task` / `abandon_task` / `list_round_summaries`（见 §9.5） |
-| **cache 友好消息布局（三段分离）** | `crates/domain/src/message_layout.rs` | `MessageLayout` + builder（见 §10） |
+| **cache 友好消息布局（§22 已落地，三段分离）** | `crates/domain/src/message_layout.rs` + `crates/app-agent/src/runtime.rs` | `MessageLayout` + `run_tool_loop_with_layout()`（行 313，消费 layout）（见 §10） |
 
 ---
 
@@ -98,20 +98,32 @@
 
 **怎么改**：直接编辑常量字符串。注意输出格式段（JSON 示例）改了要同步改 `parse_plan_from_response`（§2.4）。
 
-### 2.2 用户消息（导演拿到的上下文）
+### 2.2 消息结构（§22 cache 友好三段布局，已落地）
 
-**位置**：`crates/app-pipeline/src/lib.rs:1073` 的 `build_director_user_msg(intent, ctx)` 函数
+导演的 LLM 调用走 `run_tool_loop_with_layout`（`app-agent/runtime.rs:313`），消息分三段，由 `MessageLayout` 组装（`domain/message_layout.rs`）：
 
-**拼装内容**（按 push 顺序）：
-1. `用户的写作意图：{intent}\n\n可用角色：{角色名、角色名、...}`（行 1081，角色名来自 `ctx.characters`）
-2. `【最近对话历史】`（行 1084-1090）← `ctx.recent_messages`，最近 20 条带角色标签（"用户: ..." / "AI: ..."）。**让导演知道故事讲到哪了**。regenerate 时排除被重 roll 的节点之后的消息。
-3. `【世界设定（常驻）】`（行 1092-1116）← 蓝灯条目（`LoreRoute::Constant | Both`），**按 depth 升序排**（depth 小的排后面=更受重视，对齐 ST 近因效应；depth 相同按 order）
-4. `【即将触发/正在推进的任务】`（行 1118-1130）← `render_tasks_for_injection(pending_tasks, turn, story_clock)`，**确定性查表零 LLM**：只注入 Pending/Active 且触发满足的任务（轮次/时钟/事件三种 trigger，OR 关系）
-5. 尾句 `请分析意图并输出 Plan。`（行 1132）
+**[1] system 段（稳定，整个会话不变，cache 全命中）**：
+- `make_director_config`（`lib.rs:1181`）构造：`assemble_system_prompt(role_directive + 模块)` + **蓝灯世界设定**（`build_director_system_extra`，`lib.rs:1111`，蓝灯条目按 depth 升序，depth 小的排后=更重视）
+- 蓝灯移进 system 是 §22 的关键——它整个会话稳定，进 system 段让前缀稳定、cache 命中
 
-> ⚠️ **§22 cache 布局缺口**：当前蓝灯世界设定、任务、对话历史这些**性质不同**的内容全混在这条 user message 里。设计 §22 要求：蓝灯移进 system（稳定前缀），变量/时钟/任务压尾（volatile tail），`MessageLayout` 类型护栏已就绪但尚未接入此函数。详见 §10。
+**[2] history 段（稳定前缀，逐轮 append）**：
+- `conv_store.recent_messages_as_chat(conv_id, 20, before_node_id)`（`lib.rs` 调用处）返回真正的 `[user, assistant, ...]` 消息列表（role 映射，content 无前缀）
+- regenerate 时 `before_node_id = Some(node_id)` 排除重 roll 目标及之后
 
-**怎么改**：改这个函数体。比如要加「在场角色列表」「已建立的世界状态」「用户历史偏好」，都在这里 push。注意：每轮变化的内容（变量/时钟）应压尾，稳定内容（世界设定）后续应移进 system。
+**[3] tail 段（易变，每轮新建，用完即弃）** — `build_director_tail`（`lib.rs:1146`）：
+1. `用户的写作意图：{intent}\n\n可用角色：{角色名}`（角色名来自 `ctx.characters`）
+2. `render_tasks_for_injection(pending_tasks, turn, story_clock)` — 任务/伏笔（确定性查表零 LLM，只注入 Pending/Active 且触发满足的）
+3. 尾句 `请分析意图并输出 Plan。`
+
+> ✅ **§22 已落地（2026-06-16）**：蓝灯进 system、对话历史进独立 history 段、意图/任务进 tail。`prefix_fingerprint` 测试验证「两轮不同 intent/turn 但相同蓝灯 → system 指纹一致」（cache 命中）。
+>
+> ⚠️ **变量注入尚未接入**（§23.5 缺口）：`render_variables_for_injection()` 已就绪但未被 `build_director_tail` 调用。当前变量不进任何 prompt。待角色体系接通后补（见 `docs/PLAN-CHARACTER-UNIFICATION.md` 阶段 3）。
+
+**怎么改**：
+- 改**角色定位/输出格式** → `DIRECTOR_SYSTEM_PROMPT` 常量
+- 改**蓝灯注入** → `build_director_system_extra`
+- 改**易变内容**（意图/任务/变量）→ `build_director_tail`
+- 加新的易变内容 → push 进 `build_director_tail` 的 VolatileTail（别进 system/history）
 
 ### 2.3 工具集
 
@@ -140,10 +152,11 @@
 
 ### 2.5 运行配置
 
-**位置**：`crates/app-pipeline/src/lib.rs:949` 的 `make_director_config()`
+**位置**：`crates/app-pipeline/src/lib.rs:1181` 的 `make_director_config()`
 
 - `max_tool_rounds: 15`（导演最多调 15 轮工具，超过报错）
 - `model: "deepseek-chat"`（默认模型，运行时从活跃连接覆盖）
+- 接收 `system_extra`（蓝灯世界设定）参数，拼进 system_prompt 末尾（§22）
 
 **怎么改**：改这里的常量，或接入 AgentBinding 让用户配。
 
@@ -151,43 +164,45 @@
 
 ## 3. 子 Agent（Subagent，N 个并行）
 
-### 3.1 系统提示词模板
+### 3.1 消息结构（§22 cache 友好布局，已落地）
 
-**位置**：`crates/app-pipeline/src/lib.rs:79` 的 `SUBAGENT_SYSTEM_PROMPT_TEMPLATE` 常量
+子 Agent 走 `run_tool_loop_with_layout`（`runtime.rs:313`），消息分两段（无 history 段——子 Agent 是对话隔离容器，不看全局对话）：
 
+**[1] system 段（整个 campaign 稳定，cache 全命中）** — 在 `spawn_subagents`（`runtime.rs:473`）拼装：
 ```
-你是角色 {name}。根据导演给你的任务和专属上下文，演出你这个角色
-在这场戏的行为/对白/心理。只演你自己，不要替别人说话。
-输出纯表演，不要解释。
+{SUBAGENT_SYSTEM_PROMPT_TEMPLATE}
+\n\n你是角色 {character_id}。
+\n\n{format_context_stable(task.context_package)}   ← 角色设定(persona) + 常驻世界设定
 ```
+- `format_context_stable`（`runtime.rs:592`）：`character_brief`（persona）+ `constant_lore`（蓝灯）
+- persona 进 system 是 §22 的最大 cache 收益点——同一角色跨场戏 system 段 byte 一致
 
-> ⚠️ **子 Agent 不走模块系统**：与导演/编剧不同，子 Agent 的 system prompt 在 `spawn_subagents`（`crates/app-agent/src/runtime.rs:350`）里用 `format!` 现场拼装，**不调** `assemble_system_prompt`。拼装顺序：
-> ```
-> {base_system_prompt}        ← 传入的 SUBAGENT_SYSTEM_PROMPT_TEMPLATE（含 {name}，已被替换）
-> \n\n你是角色 {character_id}。
-> \n\n{format_context_package(task.context_package)}   ← 角色设定/场景/常驻lore/相关lore/最近对话
-> \n\n{task.brief}
-> ```
-> 子 Agent 的文风/约束模块化是缺口（设计 §22 要求 persona 进 system 稳定段，场景/任务压尾）。
+**[2] tail 段（每场戏变，用完即弃）**：
+```
+{task.context_package.task}   ← 导演分配的具体任务
+\n\n{format_context_volatile(task.context_package)}   ← 场景/相关设定/最近对话
+\n\n{task.brief}
+```
+- `format_context_volatile`（`runtime.rs:614`）：`scene_brief` + `relevant_lore`（绿灯）+ `recent_window`
 
-**怎么改**：改模板字符串改 `SUBAGENT_SYSTEM_PROMPT_TEMPLATE`；改拼装顺序改 `spawn_subagents`（runtime.rs:350）。注意 `{name}` 占位符要保留。
+> ✅ **§22 已落地（2026-06-16）**：persona + 常驻世界设定进 system（稳定），场景/相关设定/任务进 tail（易变）。子 Agent system 跨场戏稳定，cache 命中率最高。
+>
+> ⚠️ **子 Agent 不走模块系统**：与导演/编剧不同，子 Agent system 在 `spawn_subagents` 用 `format!` 拼装，不调 `assemble_system_prompt`。文风/约束模块化仍是缺口。
+>
+> ⚠️ **信息隔离未落地**（§16 缺口）：当前子 Agent tail 的「最近对话」是共享 `recent_window`，**未按角色过滤**（角色不该看到不在场时发生的事）。待角色体系接通后补（见 `docs/PLAN-CHARACTER-UNIFICATION.md` 阶段 4）。
 
-### 3.2 专属上下文包（子 Agent 的「用户消息」）
+**怎么改**：改模板字符串改 `SUBAGENT_SYSTEM_PROMPT_TEMPLATE`（`lib.rs:79`）；改稳定/易变拆分改 `format_context_stable`/`format_context_volatile`（`runtime.rs:592/614`）。
 
-⚠️ **关键设计**：子 Agent 是**上下文隔离容器**。它只能看到导演构造的 `ContextPackage`，看不到其他子 Agent 的产出、看不到全局对话树。这是「人设保持 + 信息隔离」的基础。
+### 3.2 专属上下文包（ContextPackage）
 
-**拼装函数有两份实现**（功能相同，保持同步）：
-- `crates/app-pipeline/src/lib.rs:1228` 的 `format_subagent_context()`
-- `crates/app-agent/src/runtime.rs:415` 的 `format_context_package()`
+⚠️ **关键设计**：子 Agent 是**上下文隔离容器**。它只能看到导演构造的 `ContextPackage`，看不到其他子 Agent 的产出、看不到全局对话树。
 
-**拼装内容**（按顺序，每段带 `##` 标题）：
-1. `## 你的角色设定` ← `ContextPackage.character_brief`
-2. `## 当前场景` ← `ContextPackage.scene_brief`
-3. `## 世界设定（常驻）` ← `ContextPackage.constant_lore`（蓝灯）
-4. `## 相关世界设定` ← `ContextPackage.relevant_lore`（绿灯/向量检索）
-5. `## 最近对话` ← `ContextPackage.recent_window`（共享滑动窗口）
+**ContextPackage 结构定义**：`crates/domain/src/agent.rs`（含 character_brief/scene_brief/constant_lore/relevant_lore/recent_window/task 字段）
 
-**ContextPackage 结构定义**：`crates/domain/src/agent.rs:51`
+**格式化函数（拆成稳定/易变两份，§22）**：
+- `app-agent/runtime.rs:592` `format_context_stable()` — character_brief + constant_lore（进 system）
+- `app-agent/runtime.rs:614` `format_context_volatile()` — scene_brief + relevant_lore + recent_window（进 tail）
+- `app-pipeline/lib.rs:1431` `format_subagent_context_stable()` / `:1449` `format_subagent_context_volatile()` — 重 roll 单子 Agent 路径用的同步拷贝（同算法独立实现，避免跨 crate 耦合）
 
 **怎么改**：
 - 要加「该角色已知信息」字段 → 改 `ContextPackage` struct + 两个 `format_*` 函数
@@ -203,11 +218,11 @@
 
 ### 3.4 重 roll 时注入 hint
 
-**位置**：`crates/app-agent/src/runtime.rs:462` 的 `inject_hint_into_subagent(system_prompt, hint)`
+**位置**：重 roll 单子 Agent 时，hint 以 `【导演反馈】{hint}` 标记追加到 tail 末尾（`app-pipeline/lib.rs` 路径 C 的 spawn 闭包内，用 `SUBAGENT_HINT_MARKER`）。
 
-把用户反馈（「上次演得太僵硬」）以 `【导演反馈】{hint}` 标记追加到 system prompt 末尾。
+把用户反馈（「上次演得太僵硬」）告知该角色上次哪里演得不对。
 
-**怎么改**：改 `SUBAGENT_HINT_MARKER` 常量（`runtime.rs:456`）或注入逻辑。
+**怎么改**：改 `SUBAGENT_HINT_MARKER` 常量（`runtime.rs:616`）或注入逻辑。
 
 ---
 
@@ -227,21 +242,31 @@
 
 **怎么改**：直接改常量。
 
-### 4.2 输入（编剧拿到的上下文）
+### 4.2 消息结构（§22 cache 友好布局，已落地）
 
-**位置**：编剧的用户消息在 `run_editor_and_commit()`（`lib.rs:807`）里拼装，包含所有子 Agent 的产出文本。
+编剧走 `run_tool_loop_with_layout`，消息分三段：
 
-**怎么改**：改 `run_editor_and_commit` 函数体。
+**[1] system 段（稳定）**：`make_editor_config`（`lib.rs:1231`）→ `assemble_system_prompt(EDITOR_SYSTEM_PROMPT + 模块)`。编剧 system 不含蓝灯（编剧不需要世界设定）。
+
+**[2] history 段**：`conv_store.recent_messages_as_chat(conv_id, 20, before_node_id)`（regenerate 时排除目标节点）
+
+**[3] tail 段** — `build_editor_tail`（`lib.rs:1211`）：
+1. `场景：{scene_brief}\n\n子 Agent 表演：\n\n{performances_text}\n\n请合并成连贯成文。`
+2. 可选 hint：`【上次问题】{hint}`（`EDITOR_HINT_MARKER`）
+
+> ✅ §22 已落地：编剧 system（role_directive + 模块）+ history（独立消息段）+ tail（场景/子产出/hint）。
+
+**怎么改**：改 tail 内容改 `build_editor_tail`；改 system 改 `EDITOR_SYSTEM_PROMPT` 或模块。
 
 ### 4.3 工具集
 
-**位置**：`crates/app-agent/src/tools.rs:352` 的 `register_editor_tools(&mut ToolRegistry)`
+**位置**：`crates/app-agent/src/tools.rs` 的 `register_editor_tools(&mut ToolRegistry)`
 
 **怎么改**：同 §2.3。
 
 ### 4.4 运行配置
 
-**位置**：`crates/app-pipeline/src/lib.rs:960` 的 `make_editor_config()`
+**位置**：`crates/app-pipeline/src/lib.rs:1231` 的 `make_editor_config()`
 
 - `max_tool_rounds: 5`（编剧很少调工具，5 轮够）
 - `model: "deepseek-chat"`
@@ -681,6 +706,8 @@ struct TaskUpdate {
 
 ## 10. cache 友好消息布局接口（MessageLayout）
 
+> ✅ **§22 已落地（2026-06-16）**：导演/编剧/子 Agent 全部走 `run_tool_loop_with_layout`（`app-agent/runtime.rs:313`），消费 `MessageLayout`。蓝灯世界设定进 system、对话历史进独立 history 段、意图/任务/场景进 tail。
+>
 > LLM 的 KV cache 按前缀字节匹配。稳定前缀命中 cache 省钱省延迟，易变内容必须压尾。
 > MessageLayout 是类型层护栏：编译期强制三段分离，禁止易变内容污染前缀。
 

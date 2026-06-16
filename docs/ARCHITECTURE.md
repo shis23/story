@@ -167,17 +167,19 @@ tokio::spawn(async move {
   ▼
 PipelineOrchestrator.start_writing (app-pipeline/lib.rs:193)
   │
-  ├─【Directing】make_director_config + register_director_tools
-  │     ▼ runtime.run_tool_loop_streaming()  ── app-agent/runtime.rs:171
+  ├─【Directing】make_director_config（含蓝灯进 system）+ register_director_tools
+  │     ▼ 构造 MessageLayout（system=directive+模块+蓝灯 / history=recent_messages_as_chat / tail=意图+任务）
+  │     ▼ runtime.run_tool_loop_with_layout()  ── app-agent/runtime.rs:313（§22 cache 友好）
   │        │   tokio::select! { llm.chat_stream | cancel.wait_for }
   │        │   流式 token ──DirectorProgress 事件──▶ 前端
   │        │   completion_probe：content 已含合法 Plan JSON 则提早终止
   │     ▼ parse_plan_from_response()  ── 5 层兜底（见 §3.3）
   │     DirectorDone 事件
   │
-  ├─【Delegating】spawn_subagents (app-agent/runtime.rs:332)
+  ├─【Delegating】spawn_subagents (app-agent/runtime.rs:473)
   │     │   并发上限 MAX_CONCURRENT_SUBAGENTS=4，用 Semaphore 限流（超额任务排队，全部跑完）
-  │     │   每个子 Agent tokio::spawn，clone cancel，流式 run_tool_loop_streaming
+  │     │   每个子 Agent tokio::spawn，clone cancel，流式 run_tool_loop_with_layout
+  │     │   子 Agent layout：system=persona+常驻设定（整个 campaign 稳定）/ tail=场景+相关设定+任务
   │     │   子 Agent 无工具（空 ToolRegistry），max_rounds=10
   │     │   每个 spawn 闭包内建 per-subagent channel，token delta 包成
   │     │   SubagentProgress（带 character_id + index）转发到主 event_tx
@@ -185,7 +187,8 @@ PipelineOrchestrator.start_writing (app-pipeline/lib.rs:193)
   │     全部失败才 abort；单个失败继续不中断
   │
   ├─【Editing】make_editor_config（max_rounds=5）
-  │     ▼ runtime.run_tool_loop_streaming()（空 ToolRegistry，无 probe）
+  │     ▼ 构造 MessageLayout（system=directive+模块 / history / tail=场景+子产出）
+  │     ▼ runtime.run_tool_loop_with_layout()（空 ToolRegistry，无 probe）
   │        流式 token ──EditorProgress 事件──▶ 前端
   │     DraftReady { text } 事件
   │
@@ -594,8 +597,11 @@ PipelineOrchestrator.start_writing(intent, ctx)       ← app-pipeline/src/lib.r
     ║  阶段 1：导演 Agent（Directing）                                ║
     ╚══════════════════════════════════════════════════════════════════╝
     │
-    │  build_director_user_msg(intent, ctx)             ← 拼接：意图 + 角色 + 对话历史 + 蓝灯常驻 + 任务
-    │  runtime.run_tool_loop_streaming(导演工具: search_world_info / get_character / emit_plan)
+    │  构造 MessageLayout（§22 三段）：
+    │    system = make_director_config（directive + 模块 + 蓝灯世界设定）
+    │    history = conv_store.recent_messages_as_chat（独立消息段，非文本）
+    │    tail = build_director_tail（意图 + 角色名 + 任务）
+    │  runtime.run_tool_loop_with_layout(导演工具: search_world_info / get_character / emit_plan)
     │  parse_plan_from_response(resp)                   ← 5 层兜底解析
     │  输出 Plan { scene_brief, subagent_tasks: [{character_id, brief}] }
     │

@@ -15,6 +15,7 @@
 > **P0 数据模型层已完成（2026-06-15）**：domain 新增 5 模块（variables/campaign/character_knowledge/story_task/message_layout）+ character 树形模型 + infra-vector 标签过滤，
 > **P1 角色识别 + Campaign 闭环已完成（2026-06-15）**：角色识别 Agent + Campaign 开档后端闭环 + 14 个 Tauri 命令 + **前端 Campaign UI 已接入**，
 > **P2 后处理流水线已完成（2026-06-15）**：后处理 Agent + 剧情总结 Agent + 并行编排 + CampaignStore 扩展 + 流水线接入 + 任务注入导演 + 6 个 Tauri 命令 + 前端事件桥接 + **前端知识/任务/摘要面板已接入**，
+> **§22 cache 友好消息布局已完成（2026-06-16）**：导演/编剧/子 Agent 全部走 MessageLayout 三段分离（system 稳定 + history 独立消息段 + tail 易变），蓝灯进 system、persona 进 system。详见 §3.17。测试 250 全绿。
 > **git 仓库已绑定**：`https://git.2529985.xyz/ss/story.git`（main 分支），
 > 剩余工作见 §7 后续计划。
 
@@ -515,6 +516,34 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **Medium 修复（11 项）**：向量库级联删、upsert 错误日志、constant_lore 解析、稀疏数组预填充、Composer 禁用、log 大小限制、StoryTime 大小写、空消息过滤。
 
 详见 [FINAL-AUDIT-REPORT.md](FINAL-AUDIT-REPORT.md)。
+
+### 3.17 §22 cache 友好消息布局落地（2026-06-16）
+
+落地 D46：把易变内容（意图/任务/场景）从 user tail 分离压尾、稳定内容（蓝灯世界设定/角色 persona）进 system 段、对话历史变成真正的独立消息段。让 LLM KV cache 命中率最大化。详见 [PLAN-CHARACTER-UNIFICATION.md](PLAN-CHARACTER-UNIFICATION.md) 前置说明 + AGENT_INTERFACES §10。
+
+**改动**（纯后端，4 文件 +717/-146）：
+
+| 改动 | 文件 | 内容 |
+|------|------|------|
+| 历史转消息 | `domain/conversation.rs` | 新增 `recent_messages_as_chat()` 返回 `Vec<ChatMessage>`（role 映射，独立消息段），抽 `iter_recent_active` 共享迭代器 |
+| 透传 | `app-conversation/lib.rs` | 透传 `recent_messages_as_chat` |
+| layout 版 runtime | `app-agent/runtime.rs` | 新增 `run_tool_loop_with_layout()`（消费 MessageLayout，不破坏原方法）；`spawn_subagents` 子 Agent persona+常驻设定进 system（整个 campaign 稳定），场景/相关设定/任务进 tail；`format_context_package` 拆 stable/volatile |
+| 导演+编剧迁移 | `app-pipeline/lib.rs` | `build_director_user_msg` 拆成 `build_director_system_extra`（蓝灯进 system）+ `build_director_tail`（意图/任务进 tail）；`make_director_config` 加蓝灯参数；start_writing/regenerate 各路径全部走 layout；`build_editor_tail` 抽取；路径 C 单子 Agent 重 roll 同步迁移 |
+
+**关键设计**：
+- `run_tool_loop_with_layout` 与原 `run_tool_loop_streaming` 并存——meta_chat/角色识别/总结/后处理继续用原方法（不关心跨轮 cache），只有导演/编剧/子 Agent 迁移
+- 子 Agent persona 进 system 是最大 cache 收益点（同一角色跨场戏 system 段 byte 一致）
+- history 从 `Vec<String>`（"用户: xxx"）变成真正的 `Vec<ChatMessage>`（独立消息段）
+
+**遗留缺口**（待角色体系接通后补）：
+- **变量注入未接入**（§23.5）：`render_variables_for_injection()` 已就绪但 `build_director_tail` 未调用，当前变量不进任何 prompt
+- **子 Agent 信息隔离未落地**（§16）：tail 的「最近对话」仍是共享 recent_window，未按角色过滤
+
+**测试**：242 → 250 全绿（+8：domain conversation 5、app-agent layout 1、app-pipeline 3 含 prefix_fingerprint cache 命中验证）。
+
+### 3.18 角色体系接通计划（2026-06-16）
+
+详见 [PLAN-CHARACTER-UNIFICATION.md](PLAN-CHARACTER-UNIFICATION.md)。当前最大架构债：CharacterStore（扁平 Character）/ CampaignStore（CharacterInstance/Definition）双数据源，写作流水线零引用后者。计划分 5 阶段打通，一并落地变量注入、子 Agent 信息隔离、临场角色。待执行。
 
 ---
 
