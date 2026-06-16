@@ -4,6 +4,7 @@
 > 本文档记录项目当前状态、已完成工作、架构决策和后续计划。
 >
 > **当前状态**：后端功能完整（写作流水线 + 连接管理 + 记忆系统 + 日志采集 + 对话操作 + Patch 执行 + **后处理流水线** + **Meta Agent + MVU 分析**），
+> **流式改造已完成（2026-06-16）**：子 Agent + meta_chat 全流式（token 实时推前端）+ 子 Agent 并发改 Semaphore 排队（超额不再丢弃）+ 重 roll 最后一条改原地替换（中间消息仍开分支）。详见 §3.10。ARCHITECTURE.md 已同步更新（含新增 §3.7 Meta Agent 子系统专章）。
 > 前端主流程完整（导入卡 → 配连接 → 写作 → 编辑/采纳/删除/分支 → 重 roll → 重启恢复），
 > **前端 Campaign UI 已完成（2026-06-15）**：tauri-api.js 补全 21 个 P1/P2 API 函数 + CampaignPanel.vue 新组件（3 tab：角色卡/游玩档/档详情，含变量编辑/知识/任务/摘要面板）+ AppHeader 加 Campaign 按钮 + App.vue 集成（activeCampaign 状态 + 事件绑定），
 > **桌面端已可运行验证**（`cargo tauri dev`，前端 dev server 1420 + Rust 后端，无需 Android 模拟器），
@@ -365,6 +366,29 @@ ST: Message { swipes: ["v1","v2","v3"], swipe_id: 1 }  ← 线性，分支是独
 **前端（Commit 8）**：写作失败回滚用户消息、7 处空 catch 加 console.error、MetaPanel v-for 用稳定 id、CampaignPanel 不再启发式强转数字。
 
 **新增 crate**：`infra-util`（workspace 第 14 个成员）。
+
+### 3.10 流式改造 + 重 roll 分支逻辑（2026-06-16）
+
+三个改动，4 个 commit（见 git log `1aa396c`→`87ab578`）。
+
+**C1 子 Agent 流式 + Semaphore 排队**（commit `52e6ced`）：
+- 子 Agent 从非流式 `run_tool_loop` 改为流式 `run_tool_loop_streaming`，token 经 `SubagentProgress`（带 character_id + index）实时推前端。激活了 domain 层定义但从未发送的事件（曾经的「死代码」，见 ARCHITECTURE §7 旧债务已删除）。
+- 并发上限 `MAX_CONCURRENT_SUBAGENTS=4` 从 `take(4)` 截断丢弃改为 `Semaphore` 排队——超额任务全部跑完，不再有 `SubagentFailed` 占位。行为变更：角色很多时总耗时变长（用户确认接受）。
+- `spawn_subagents` 加 `event_tx` 参数；每个子 Agent per-channel 转发 delta；regenerate 路径 C 单子 Agent 同步改流式。
+- 新增测试 `test_subagents_queue_beyond_concurrency_limit`（6 角色全跑完）。
+
+**C2 meta_chat 流式**（commit `046bf84`）：
+- Meta Agent 多轮对话改流式，token 实时显示。`app_meta::chat` 加 `progress_tx` 参数；tauri `meta_chat` 命令加 `on_event: Channel<MetaStreamEvent>` + 转发任务；前端 MetaPanel.vue 流式累积 token 到回复气泡，最终聚合结果校正。
+- MVU 分析 / ST 分类 / 角色识别**未改**（一次性任务，同步返回可接受，用户选择）。
+
+**C3 重 roll 最后一条「原地替换」**（commit `52e6ced` 后端 + `87ab578` 前端）：
+- 重 roll **最后一条 AI 消息** → 不再开分支：`replace_active_variant`（旧 active→Discarded + push 新 active，软删除可 switch 切回）。
+- 重 roll **中间消息** → 维持 `add_variant`（开分支，原行为）。
+- 后端按 `nodes.last()` 实时判定（`is_last_assistant_node`，单一事实源，避免前端 isLast 脏数据）。前端 handleReroll 改「重拉对话刷新」UI（抽取 `applyConversation` 复用）。
+
+**测试**：234 → 239 全绿（+5 新：1 Semaphore 排队 + 2 replace/is_last + 既有回归全过）。
+
+**文档**：commit `1aa396c` 新增 `docs/ARCHITECTURE.md`（代码架构总览）；本轮同步修正 ARCHITECTURE.md 被 C1/C3 推翻的描述（子 Agent 非流式/丢弃/SubagentProgress 死代码/add_variant 等），并新增 §3.7 Meta Agent 子系统专章（Session/Patch/meta_chat 流式/MVU 五合一）。
 
 ---
 

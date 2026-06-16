@@ -173,11 +173,13 @@ PipelineOrchestrator.start_writing (app-pipeline/lib.rs:193)
   │     ▼ parse_plan_from_response()  ── 5 层兜底（见 §3.3）
   │     DirectorDone 事件
   │
-  ├─【Delegating】spawn_subagents (app-agent/runtime.rs:327)
-  │     │   并发上限 MAX_CONCURRENT_SUBAGENTS=4，超额任务直接丢弃（非排队）
-  │     │   每个子 Agent tokio::spawn，clone cancel，非流式 run_tool_loop
+  ├─【Delegating】spawn_subagents (app-agent/runtime.rs:332)
+  │     │   并发上限 MAX_CONCURRENT_SUBAGENTS=4，用 Semaphore 限流（超额任务排队，全部跑完）
+  │     │   每个子 Agent tokio::spawn，clone cancel，流式 run_tool_loop_streaming
   │     │   子 Agent 无工具（空 ToolRegistry），max_rounds=10
-  │     ▼ SubagentStarted×N → SubagentDone×N（带 full_text）/ SubagentCancelled×N
+  │     │   每个 spawn 闭包内建 per-subagent channel，token delta 包成
+  │     │   SubagentProgress（带 character_id + index）转发到主 event_tx
+  │     ▼ SubagentStarted×N → SubagentProgress×N（流式 token）→ SubagentDone×N（带 full_text）/ SubagentCancelled×N
   │     全部失败才 abort；单个失败继续不中断
   │
   ├─【Editing】make_editor_config（max_rounds=5）
@@ -236,7 +238,7 @@ LLM 输出不稳定，所以解析层层降级。这套模式在角色识别/后
          一个 Sender ──clone──▶ 多个 Receiver：
             ├─ 导演 run_tool_loop_streaming  （select! 与 chat_stream 竞速）
             ├─ 编剧 run_tool_loop_streaming  （同上）
-            ├─ 子 Agent×N run_tool_loop      （每轮前 + LLM 调用竞速）
+            ├─ 子 Agent×N run_tool_loop_streaming（每轮前 + LLM 调用竞速；token 经 SubagentProgress 推前端）
             └─ 后处理 run_summarizer / run_postprocess（各 clone 一份）
 ```
 
@@ -248,6 +250,7 @@ LLM 输出不稳定，所以解析层层降级。这套模式在角色识别/后
 started → state_changed(Directing) → director_started →
 director_progress×N（流式）→ director_done →
 state_changed(Delegating) → subagent_started×N →
+  subagent_progress×N（流式 token，每个子 Agent 独立）→
   subagent_done/subagent_cancelled×N →
 state_changed(Editing) → editor_started → editor_progress×N →
 draft_ready → state_changed(Review) → state_changed(Committed)
@@ -255,7 +258,7 @@ draft_ready → state_changed(Review) → state_changed(Committed)
 
 后处理阶段额外：`postprocess_started → summary_done → postprocess_done`（或 `postprocess_failed`）。
 
-> ⚠️ **死代码警告**：`PipelineEvent::SubagentProgress` 在 domain 层有定义，但 `spawn_subagents` 走非流式 `run_tool_loop`，**首写和重 roll 都不会 emit**。前端 `App.vue:475` 有对应 case 但永不触发。
+> 子 Agent 流式：`SubagentProgress` 现在由 `spawn_subagents` 内每个子 Agent 的 per-subagent channel 转发生成（带 character_id + index），前端 PipelinePanel 实时显示各角色 token。regenerate 路径 C（只重某子 Agent）同样流式。
 
 ### 3.6 regenerate 的三条路径（app-pipeline/lib.rs:538）
 
@@ -263,15 +266,129 @@ draft_ready → state_changed(Review) → state_changed(Committed)
 
 | 路径 | 触发条件 | 导演 | 子 Agent | 编剧 | 复用什么 | 落盘方式 |
 |------|---------|------|---------|------|---------|---------|
-| A 整体重 roll | targets 空/含 Director | ✅重跑 | ✅全重跑 | ✅ | 旧 scene_brief 作 intent | `add_variant`（新分支） |
-| B 只重编剧 | targets 全是 Editor | ❌ | ❌ | ✅ | 旧 plan + 旧全部子产出 | `add_variant` |
-| C 只重某子 | targets 含某 Subagent(id) | ❌ | ✅仅目标 | ✅ | 旧 plan + 其他角色旧产出 | `add_variant` |
+| A 整体重 roll | targets 空/含 Director | ✅重跑 | ✅全重跑 | ✅ | 旧 scene_brief 作 intent | 见下方分叉规则 |
+| B 只重编剧 | targets 全是 Editor | ❌ | ❌ | ✅ | 旧 plan + 旧全部子产出 | 见下方分叉规则 |
+| C 只重某子 | targets 含某 Subagent(id) | ❌ | ✅仅目标（流式） | ✅ | 旧 plan + 其他角色旧产出 | 见下方分叉规则 |
+
+**落库分叉规则**（app-pipeline/lib.rs regenerate 末尾，regenerate 唯一落库点）：
+- 重 roll **最后一条 AI 消息**（`is_last_assistant_node` 判定 `nodes.last()` 是 Assistant 且 id 匹配）→ `replace_active_variant`：旧 active 降级 Discarded + push 新 active（原地替换，避免分支累积，旧版可 switch 切回查看）
+- 重 roll **中间消息** → `add_variant`：开分支保留旧版（原行为）
+- 后端按 `nodes.last()` 实时判定（单一事实源），重 roll 后若又发新消息使原 node 不再最后，下次重 roll 它自动回退到开分支。
 
 **关键差异**：
-- 重 roll 用 `add_variant`（在同 node 加新 variant，分支保留旧版），首写用 `append_ai_draft`（新 node）。
+- 首写用 `append_ai_draft`（新 node），重 roll 在既有 node 上 replace 或 add_variant。
 - hint 注入：A 注入导演 user + 编剧 user；B/C 只注入编剧 user；C 额外注入目标子 Agent 的 system prompt。
 - 重 roll **不更新** `self.session`，**不进 Committed**（停在 Review）。
 - 设计约束（已在 validate_partial_roll 落地）：**拒绝「只重导演却保留旧子产出」**——Plan 变了旧子产出不匹配，后端拦截。
+
+### 3.7 Meta Agent 子系统（独立于写作流水线）
+
+Meta Agent 是一个**配置调试助手**，与写作流水线完全解耦：不读 `current_cancel`、不碰 pipeline、不接触 API key，自建 `AgentRuntime` + 每轮新建 `ToolRegistry`。它的能力分三块：诊断对话、Patch 提议-采纳、MVU 五合一分析。
+
+#### 数据模型与状态
+
+```
+AppState（tauri-app/lib.rs:128）
+├── meta_session: Arc<MetaSession>          # 跨工具调用共享的诊断数据源
+│   ├── character: Mutex<Option<Arc<Character>>>
+│   ├── world_info: Mutex<Option<Arc<WorldInfoBook>>>
+│   └── patches: PatchStore { patches: RwLock<Vec<Patch>> }
+├── meta_conversations: Mutex<HashMap<String, MetaConversation>>  # 内存态，重启清空
+└── meta_patches: Arc<RwLock<Vec<Patch>>>   # 前端可见的待采纳 patch（独立于 session.patches）
+```
+
+> ⚠️ **两套 patch 存储**：`MetaSession.patches`（app-meta 内部）与 `AppState.meta_patches`（tauri 侧）是两份。`meta_chat` 结束会把 session 新 patch 克隆进 AppState。`meta_accept_patch`/`meta_dismiss_patch` 只改 AppState.meta_patches，**不反向同步回 session**——目前无害（session 是临时态），但属潜在漂移点。
+
+- `MetaConversation`：`messages: Vec<MetaMessage>` + `history_summary: Vec<String>`（手动截断的逐轮摘要，每轮 `"用户：{200字}\n助手：{300字}"`，保留最近 6 轮，喂下一轮 LLM）。
+- `MetaMessage`：`User{content}` | `Agent{content, tool_result: Option<ToolResultDisplay>}`。
+
+#### meta_chat 调用链（流式）
+
+```
+前端 MetaPanel.vue handleSend
+  │  先 push 空 agent 消息占位（流式累积用）
+  ▼ metaChat(convId, text, onDelta)
+[Tauri] meta_chat (lib.rs:2431)
+  │  1. sync_meta_session_from_tool_ctx（把 tool_ctx 最后一张卡 + 世界书同步进 MetaSession）
+  │  2. 取出对话（不存在则报错，不静默创建）
+  │  3. 建 mpsc channel + spawn 转发任务：progress_tx 的 delta → MetaStreamEvent::progress → 前端 Channel
+  ▼
+app_meta::chat (meta_conversation.rs:146)
+  │  make_meta_agent_config（role=Meta, max_rounds=8）+ build_meta_user_msg（拼 history_summary）
+  │  register_meta_runtime_tools（挂接 inspect/propose 工具，handler 读写 MetaSession）
+  ▼ runtime.run_tool_loop_streaming(..., progress_tx, None)
+  │     流式 token ──meta_progress 事件──▶ 前端累积到回复气泡
+  │     工具副作用在循环内由 handler 完成（meta_propose_patch → session.patches.propose）
+  ▼ 返回 MetaTurn { agent_message, new_patch }
+  │  新 patch 同步进 AppState.meta_patches；对话存回 meta_conversations
+  ▼ 命令返回 { conversation_id, agent_message, messages, new_patch }
+前端：用 agent_message.content 校正气泡（流式累积可能有中间文本）；new_patch 存在则 refreshPatches
+```
+
+**关键**：增量走 Channel（`meta_progress`），最终态走命令返回值——与 `start_writing` 的 `{text, conversation_id, node_id}` 模式一致。
+
+#### Meta Agent 工具集（register_meta_runtime_tools，meta_conversation.rs:240）
+
+| 工具 | handler 做什么 | 返回 |
+|------|--------------|------|
+| `meta_inspect_world_info` | 读 session.world_info，检查蓝灯关键词冲突 + 孤立条目 | `WorldInfoReport` |
+| `meta_inspect_character` | 读 session.character，检查字段非空 + first_mes 占位符 | `CardReport` |
+| `meta_propose_patch` | **写**：`session.patches.propose(desc, actions)` | `{patch_id, ...}` |
+| `meta_classify_st_preset` | 占位 handler（未挂接）；实际 ST 分类走独立命令 | — |
+
+#### Patch 系统（提议-采纳两阶段）
+
+```
+LLM propose ──▶ PatchStore.propose（生成 uuid, applied=false）
+                   │  同步进 AppState.meta_patches（前端可见）
+                   ▼
+用户采纳 ──▶ meta_accept_patch 命令（lib.rs:2296）
+                   │  execute_patch（app-meta 纯函数，传 PatchContext）
+                   │  ① 改 tool_ctx 内存世界书
+                   │  ② 持久化 CharacterStore：全局条目写回所有卡 + 非全局按 content 指纹匹配回原卡
+                   │  ③ patch.applied = true
+                   ▼
+用户忽略 ──▶ meta_dismiss_patch（retain 移除）
+```
+
+- `PatchAction`：`Create{target,data}` | `Update{target,field,value}` | `Delete{target}`。`target` 格式 `world_info[0]` / `character.personality`。`execute_patch` 当前只支持 `world_info` / `character` 两种 kind。
+- 历史 bug（已修）：曾把合并世界书写回最后一张卡 + `is_global` 硬编码 false，导致污染。
+
+#### MVU 五合一分析（mvu_import.rs:41）
+
+手动触发（D44：用户在 MetaPanel 点「分析状态栏」才跑，不自动）：
+
+```
+meta_analyze_mvu_card 命令
+  ▼
+analyze_mvu_card 编排：
+  1. score_card_complexity（纯 Rust 启发式，基于 document./innerHTML/script 等阈值）
+     → CardComplexityReport { classification: Heavy | RuleDriven | PureData }
+  2. extract_mvu_schema_from_extensions（P1 字段级 schema）
+  3. 纯数据短路：PureData && 无字段 → pure_data_fallback，省 LLM 调用
+  4. LLM 五合一（run_tool_loop 非流式，emit_mvu_translation 工具）
+  5. parse_mvu_translation_from_response（5 层兜底，同 §6.2 模式）
+  6. 失败降级 → pure_data_fallback（不报错不阻塞）
+  ▼ 持久化 StoredMvuTranslation → data/mvu_translations.json（按 source_character_id 去重）
+```
+
+**MvuTranslation 5 产物**：`variable_schema`（变量定义）/ `ui_bindings`（UI 元素→变量，BindingDisplay: bar/text/tag/icon）/ `update_rules`（注入后处理 Agent）/ `interactions`（用户点击→动作）/ `fallback_fragments`（需 WebView 的片段）。`routing`：native（原生协议层足够）/ hybrid（需共享 WebView）；LLM 标 native 却有 fallback_fragments 会自动纠正为 hybrid。
+
+**注**：共享 WebView 真实 JS 执行仍是桩（`StubMvuRuntime` 全 NotImplemented），重 DOM 卡（缄默之秋1.4 类）的 fallback_fragments 无法执行——这是已知限制（见 §8 债务表）。
+
+#### 9 个 Meta/MVU 命令速查
+
+| 命令 | 作用 | 推事件？ |
+|------|------|---------|
+| `meta_start_conversation` | 新建 MetaConversation（uuid） | 否 |
+| `meta_chat` | 跑一轮流式对话 | **是**（meta_progress） |
+| `meta_get_conversation` | 取对话历史 | 否 |
+| `meta_list_pending_patches` | 列待采纳 patch | 否 |
+| `meta_dismiss_patch` | 忽略 patch | 否 |
+| `meta_accept_patch` | 执行 patch（改世界书 + 写 CharacterStore） | 否 |
+| `meta_analyze_mvu_card` | MVU 五合一分析（手动触发） | 否 |
+| `meta_list_mvu_translations` / `meta_get_mvu_translation` | 查 MVU 翻译 | 否 |
+| `meta_classify_st_preset` | ST 预设 LLM 分类（不持久化） | 否 |
 
 ---
 
@@ -403,8 +520,8 @@ LLM 输出 JSON 经常不规范（包了自然语言、用围栏代码块、字�
 
 | 项 | 现状 | 影响 |
 |----|------|------|
-| `SubagentProgress` 死代码 | domain 定义了，runtime 走非流式不 emit | 前端 case 永不触发，无害但误导 |
 | regenerate 不进 Committed | 三路径终态停 Review | `self.session` 不刷新；语义上「重 roll 的结果」与「首写」落盘状态不同 |
+| 子 Agent 并发从「丢弃」改「排队」 | Semaphore(MAX=4) 限流，超额任务全部排队跑完 | 行为变更：角色很多时总耗时变长（曾确认接受）；不再有 SubagentFailed 占位 |
 | `infra-regex` 未接入 | 代码就位但无 app/tauri 依赖 | 正则脚本能力未生效（预设里的 regex_scripts 仅存储不执行） |
 | API key 明文 | connections.json / embed.json 明文存 | 桌面开发期可接受，Android 需 infra-secrets + Keystore |
 | `match_braces` 2 处重复 | `llm_parse.rs:21`（公用）+ `character_extractor.rs:252`（自写） | 算法一致，可合并；非刻意设计 |
