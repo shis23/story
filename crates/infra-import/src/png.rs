@@ -32,6 +32,16 @@ pub fn parse_png(data: &[u8]) -> Result<Vec<PngChunk>, ImportError> {
             data[pos + 3],
         ]) as usize;
 
+        // H-7 防护：单 chunk 大小上限（64MB）。恶意 PNG 可声明超大 tEXt 块吃光内存
+        const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+        if length > MAX_CHUNK_SIZE {
+            return Err(ImportError::PngError(format!(
+                "PNG 块过大（{} 字节，上限 {} 字节），可能为恶意文件",
+                length,
+                MAX_CHUNK_SIZE
+            )));
+        }
+
         // 读取类型
         let chunk_type = [
             data[pos + 4],

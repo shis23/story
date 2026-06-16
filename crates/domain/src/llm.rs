@@ -5,7 +5,10 @@ use crate::Id;
 // ─── 连接配置（对应设计 §5 LlmConnection，M1 简化版）──────────────────
 
 /// LLM 连接配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// H-4：手写 Debug 打码 api_key（Serialize 保留，存盘需要 key）。
+/// 展示给前端用 LlmConnectionSummary（已剥离 key）。
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConnection {
     pub id: Id,
     pub name: String,
@@ -16,6 +19,21 @@ pub struct LlmConnection {
     pub protocol: LlmProtocol,
     pub params: SamplingParams,
     pub tool_mode: ToolMode,
+}
+
+impl std::fmt::Debug for LlmConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConnection")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .field("protocol", &self.protocol)
+            .field("params", &self.params)
+            .field("tool_mode", &self.tool_mode)
+            .finish()
+    }
 }
 
 /// LLM 协议

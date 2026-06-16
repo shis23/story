@@ -1,16 +1,16 @@
-/// 正则引擎（对应设计 §4.3 D12）
+/// Regex engine (design section 4.3 D12).
 ///
-/// 封装 regress crate，提供 ST regex_scripts 的执行能力。
-/// 正则作用域：
-/// - Input: 用户输入 → 导演 Agent 前应用
-/// - Output: 编剧成文后应用
-/// - 子 Agent 内部不跑正则
+/// Wraps the regress crate to execute ST regex_scripts.
+/// Scope:
+/// - Input: applied before the director agent
+/// - Output: applied after the writer finalizes
+/// - sub-agents do not run regex
 use serde::{Deserialize, Serialize};
 use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
-// ─── 正则执行器 ────────────────────────────────────────────────────────────
+// --- regex executor --------------------------------------------------------
 
-/// 正则执行错误
+/// Regex execution error
 #[derive(Debug, thiserror::Error)]
 pub enum RegexError {
     #[error("正则编译失败: {0}")]
@@ -20,7 +20,7 @@ pub enum RegexError {
     Replace(String),
 }
 
-/// 执行正则脚本列表（按顺序应用，跳过禁用的）
+/// Apply a list of regex scripts in order (skipping disabled ones)
 pub fn apply_regex_scripts(
     text: &str,
     scripts: &[RegexScript],
@@ -42,23 +42,35 @@ pub fn apply_regex_scripts(
     Ok(result)
 }
 
-/// 执行单个正则脚本
+/// Apply a single regex script.
+///
+/// H-8 ReDoS mitigation: regress is a backtracking engine; regexes imported from ST
+/// presets can be catastrophic (e.g. `^(a+)+$`). We cap input length to bound the
+/// worst-case backtracking cost (which scales with input length).
 fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, RegexError> {
-    // 编译正则（regress 是 ECMAScript 引擎）
-    // 应用 flags（如 gm），regress 会解析 i/m/s/u/v，忽略不支持的 g
+    const MAX_REGEX_INPUT_LEN: usize = 1024 * 1024; // 1MB
+    if text.len() > MAX_REGEX_INPUT_LEN {
+        return Err(RegexError::Compile(format!(
+            "regex input too long: {} bytes (max {}), possible ReDoS",
+            text.len(),
+            MAX_REGEX_INPUT_LEN
+        )));
+    }
+    // Compile (regress is an ECMAScript engine).
+    // Apply flags (e.g. gm); regress parses i/m/s/u/v and ignores unsupported g.
     let re = regress::Regex::with_flags(&script.find_regex, script.flags.as_str()).map_err(|e| {
         RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
     })?;
 
-    // 全局替换（regress 的 replace_all 行为）
+    // Global replace (regress replace_all semantics)
     let result = re.replace_all(text, script.replace_string.as_str());
 
     Ok(result.to_string())
 }
 
-// ─── 输入/输出正则分类 ──────────────────────────────────────────────────────
+// --- input/output regex split ----------------------------------------------
 
-/// 从 ST 预设的 regex_scripts 中分离输入/输出正则
+/// Split ST regex_scripts into input/output scripts
 pub fn split_by_placement(scripts: &[RegexScript]) -> (Vec<&RegexScript>, Vec<&RegexScript>) {
     let mut input = Vec::new();
     let mut output = Vec::new();
@@ -76,7 +88,7 @@ pub fn split_by_placement(scripts: &[RegexScript]) -> (Vec<&RegexScript>, Vec<&R
     (input, output)
 }
 
-/// 获取正则脚本摘要（前端展示用）
+/// Build a script summary for frontend display
 pub fn script_summary(script: &RegexScript) -> ScriptSummary {
     ScriptSummary {
         id: script.id.clone(),
@@ -124,7 +136,6 @@ mod tests {
 
         let input = "你好你好你好，这是一段测试文本。";
         let result = apply_regex_scripts(input, &scripts, RegexPlacement::Input).unwrap();
-        // 输入正则应该生效
         assert!(result.len() <= input.len());
     }
 
@@ -145,7 +156,7 @@ mod tests {
         script.disabled = true;
 
         let result = apply_regex_scripts("测试文本", &[script], RegexPlacement::Input).unwrap();
-        assert_eq!(result, "测试文本"); // 未修改
+        assert_eq!(result, "测试文本");
     }
 
     #[test]
@@ -155,7 +166,7 @@ mod tests {
         ];
 
         let result = apply_regex_scripts("测试文本", &scripts, RegexPlacement::Input).unwrap();
-        assert_eq!(result, "测试文本"); // Input 阶段不应用 Output 正则
+        assert_eq!(result, "测试文本");
     }
 
     #[test]
@@ -178,6 +189,17 @@ mod tests {
         ];
 
         let result = apply_regex_scripts("test", &scripts, RegexPlacement::Input);
+        assert!(result.is_err());
+    }
+
+    /// H-8: oversize input must be rejected to bound ReDoS backtracking cost.
+    #[test]
+    fn test_oversize_input_rejected() {
+        let scripts = vec![
+            make_script("大输入", r"a", "b", RegexPlacement::Input),
+        ];
+        let huge = "a".repeat(2 * 1024 * 1024); // 2MB > 1MB limit
+        let result = apply_regex_scripts(&huge, &scripts, RegexPlacement::Input);
         assert!(result.is_err());
     }
 }

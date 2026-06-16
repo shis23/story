@@ -206,6 +206,11 @@ impl crate::LlmClient for HttpLlmClient {
         let mut accumulator = SseEventAccumulator::new();
         let mut cancel = cancel;
 
+        // H-5 流式空闲超时：正常流式 chunk 间隔远小于此（通常 <5s），
+        // 仅当服务端建连后挂起不发数据（网络黑洞/代理挂起）才触发，判定死流。
+        const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+        let mut last_chunk_at = std::time::Instant::now();
+
         // 进入循环前先检查初始取消状态（changed() 只在值变化后才触发）
         if *cancel.borrow() {
             warn!(target: "infra-llm", "stream cancelled before start");
@@ -213,6 +218,8 @@ impl crate::LlmClient for HttpLlmClient {
         }
 
         loop {
+            // 计算到下次空闲超时的剩余时间
+            let next_deadline = last_chunk_at + STREAM_IDLE_TIMEOUT;
             tokio::select! {
                 // 取消信号
                 _ = cancel.changed() => {
@@ -221,8 +228,15 @@ impl crate::LlmClient for HttpLlmClient {
                         return Err(LlmError::Cancelled);
                     }
                 }
+                // 空闲超时：90s 无 chunk 判死流，防止连接永久泄漏
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)), if next_deadline > std::time::Instant::now() => {
+                    warn!(target: "infra-llm", "stream 空闲超时（{}s 无数据），判定死流", STREAM_IDLE_TIMEOUT.as_secs());
+                    return Err(LlmError::Http(format!("流式空闲超时（{}s 无 chunk）", STREAM_IDLE_TIMEOUT.as_secs())));
+                }
                 // 下一个 chunk
                 chunk = stream.next() => {
+                    // 收到任何 chunk（含网络分片）即重置空闲计时
+                    last_chunk_at = std::time::Instant::now();
                     match chunk {
                         Some(Ok(bytes)) => {
                             forward_sse_events(&bytes, &mut buffer, &mut accumulator, &tx)

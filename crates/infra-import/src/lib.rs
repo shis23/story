@@ -25,8 +25,19 @@ pub enum ImportError {
     UnsupportedFormat(String),
 }
 
+/// 导入文件大小上限（100MB）。恶意/误操作的超大文件会耗尽内存。
+pub const MAX_IMPORT_SIZE: usize = 100 * 1024 * 1024;
+
 /// 从文件字节导入角色卡（自动判断 PNG / JSON）
 pub fn import_character(data: &[u8]) -> Result<Character, ImportError> {
+    // H-7 防护：限制总大小，避免超大 JSON/PNG 耗尽内存
+    if data.len() > MAX_IMPORT_SIZE {
+        return Err(ImportError::PngError(format!(
+            "文件过大（{} 字节，上限 {} 字节）",
+            data.len(),
+            MAX_IMPORT_SIZE
+        )));
+    }
     if is_png(data) {
         import_character_from_png(data)
     } else {

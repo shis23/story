@@ -10,16 +10,29 @@ use storyforge_domain::llm::LlmError;
 // ─── 嵌入配置 ──────────────────────────────────────────────────────────────
 
 /// 嵌入配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// H-4：手写 Debug 打码 api_key，避免 #[derive(Debug)] 在 tracing/dbg! 时泄漏 key
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EmbedConfig {
     /// API 端点（如 https://api.openai.com/v1/embeddings）
     pub endpoint: String,
-    /// API key
+    /// API key（Debug 时打码为 ***）
     pub api_key: String,
     /// 模型名（如 text-embedding-3-small / bge-large-zh）
     pub model: String,
     /// 向量维度
     pub dim: usize,
+}
+
+impl std::fmt::Debug for EmbedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedConfig")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .field("dim", &self.dim)
+            .finish()
+    }
 }
 
 // ─── 嵌入客户端 ────────────────────────────────────────────────────────────
