@@ -1,4 +1,4 @@
-﻿mod campaign_store;
+mod campaign_store;
 mod connection_store;
 mod module_store;
 mod preset_store;
@@ -242,6 +242,11 @@ impl AppState {
         let agent_profile_config_store =
             Arc::new(module_store::AgentProfileConfigStore::new(&data_dir));
 
+        let mut meta_session = storyforge_app_meta::MetaSession::new();
+        meta_session.set_explainer(Arc::new(ConvGenerationExplainer {
+            conv_store: conv_store.clone(),
+        }));
+
         Self {
             mock_llm,
             conv_store,
@@ -259,7 +264,7 @@ impl AppState {
             module_store,
             profile_store,
             agent_profile_config_store,
-            meta_session: Arc::new(storyforge_app_meta::MetaSession::new()),
+            meta_session: Arc::new(meta_session),
             meta_conversations: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -2939,6 +2944,34 @@ fn meta_accept_patch(
 
 // ─── P3：Meta Agent 多轮对话 / MVU 五合一分析 / ST 预设 LLM 分类 ────────────
 
+/// GenerationExplainer 的 tauri-app 实现：从 ConversationStore 查 Provenance
+/// 并调 `explain_generation`，让 Meta 多轮对话的 inspect_generation 工具
+/// 能引用真实生成溯源（而非 app-meta 层的 None 占位）。
+///
+/// 实现 app-meta 的 GenerationExplainer trait，注入到 MetaSession。
+/// 持有 Arc<ConversationStore>（与 AppState.conv_store 共享同一份）。
+/// 查不到对话/节点/变体/溯源时返回 None，由工具层转成错误信息，不 panic。
+struct ConvGenerationExplainer {
+    conv_store: Arc<storyforge_app_conversation::ConversationStore>,
+}
+
+impl storyforge_app_meta::meta_conversation::GenerationExplainer for ConvGenerationExplainer {
+    fn explain(
+        &self,
+        conversation_id: &str,
+        node_id: &str,
+    ) -> Option<storyforge_app_meta::GenerationExplanation> {
+        let conv_id = Id::from_str(conversation_id);
+        let nid = Id::from_str(node_id);
+
+        let conv = self.conv_store.get(&conv_id)?;
+        let node = conv.find_node(&nid)?;
+        let variant = node.active()?;
+        let provenance = variant.provenance.as_ref()?;
+        Some(storyforge_app_meta::explain_generation(provenance))
+    }
+}
+
 /// 把当前活跃角色卡 + 世界书同步进 MetaSession（每次 meta 操作前调）
 fn sync_meta_session_from_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
     let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
@@ -4566,6 +4599,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use storyforge_domain::character::Character;
+    #[test]
+    fn test_meta_session_explainer_is_injected() {
+        let state = AppState::new();
+        assert!(
+            state.meta_session.explainer.is_some(),
+            "meta_session.explainer should be injected (not None) for inspect_generation"
+        );
+    }
+
 
     /// 验证 tool_ctx 的 RwLock + snapshot 机制：写入后快照能读到
     /// （这是 import_character 同步 tool_ctx 的核心机制）
