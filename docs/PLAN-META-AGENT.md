@@ -1,6 +1,6 @@
 # 计划：Meta Agent 维护层
 
-> 状态：待执行
+> 状态：阶段 1 已起步（后端检查 + Tauri command，前端未接）
 > 前置：优先完成 `PLAN-CAMPAIGN-MAINLINE.md` 至少阶段 5。
 
 ## 目标
@@ -33,35 +33,47 @@
 
 目标：先让 Meta 能读取 Campaign 健康状态，不做修复。
 
+**状态：后端已起步（2026-06-17），前端未接。**
+
 改动文件：
 
-- `crates/domain/src`：新增 health DTO 可选
-- `crates/app-meta/src`：新增 health 分析函数
-- `crates/tauri-app/src/lib.rs`：新增或扩展 meta command
-- `frontend/src/components/MetaPanel.vue`：展示只读报告
+- `crates/app-meta/src/health_check.rs`：新增 health check 模块（确定性检查，零 LLM）
+- `crates/app-meta/src/lib.rs`：注册模块 + 重导出
+- `crates/tauri-app/src/lib.rs`：新增 `meta_health_check` Tauri command
 
-检查项：
+已实现的检查项：
 
-- active campaign 是否存在。
-- campaign 是否有 instance。
-- instance 是否能找到 definition。
-- 是否存在同名 instance。
-- variables schema 与 variables value 是否缺字段。
-- knowledge 是否引用不存在的 instance。
-- task 是否引用不存在的 campaign。
-- summary turn 是否连续。
-- MVU translation 是否存在但未合并 schema。
+- ✅ **孤立 instance**：`instance.definition_id` 指向不存在的 definition（Error）
+- ✅ **未解析的知识引用**：`knowledge.character_id` 找不到对应 instance（Warning）
+- ✅ **孤儿任务引用**：`task.related_characters` 引用了不存在的 instance（Warning）
+- ✅ **变量 schema 不一致**：非临时 instance 的变量键集与 definition.variable_schema 不匹配（Warning）
+
+待实现（后续）：
+
+- active campaign 是否存在（command 层已做基本检查，但非 health issue 输出）
+- 是否存在同名 instance
+- summary turn 是否连续
+- MVU translation 是否存在但未合并 schema
+- 前端 MetaPanel 展示
+
+关键数据结构（确认自 `campaign_store.rs` + domain types）：
+
+- `CharacterInstance.definition_id: Option<Id>` → 指向 `CharacterDefinition.id`
+- `CharacterKnowledgeEntry.character_id: Id` → 指向 `CharacterInstance.id`
+- `StoryTask.related_characters: Vec<Id>` → 指向 `CharacterInstance.id`
+- `CharacterCard.character_definitions: Vec<CharacterDefinition>` → 通过 `Campaign.card_id` 关联
+- `CharacterInstance.is_temporary` → 跳过 schema 一致性检查
 
 验证：
 
 ```bash
-cargo test -p storyforge-app-meta
-cargo test -p storyforge
+cargo test -p storyforge-app-meta   # 40 tests, 0 failed
+cargo test -p storyforge --lib      # 43 tests, 0 failed
 ```
 
 验收：
 
-- MetaPanel 能显示 Campaign health 列表。
+- `meta_health_check(campaign_id)` Tauri command 可调用，返回 `Vec<HealthIssue>`。
 - 该阶段不产生任何写入。
 
 ## 阶段 2：解释本轮生成

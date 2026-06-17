@@ -3076,6 +3076,45 @@ fn meta_dismiss_patch(
     Ok(())
 }
 
+/// Tauri command: Campaign 健康检查（确定性数据校验，零 LLM）
+///
+/// 扫描指定 Campaign 的数据，找出孤立 instance、未解析的知识引用、孤儿任务引用、
+/// 变量 schema 不一致等问题。返回问题列表，空列表 = 健康。
+#[tauri::command]
+fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, String> {
+    let store = get_campaign_store();
+    let cid = Id::from_str(&campaign_id);
+
+    // 确认 campaign 存在
+    let campaign = store
+        .get_campaign(&cid)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+
+    // 获取关联的 card → definitions
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .map(|c| c.card.character_definitions)
+        .unwrap_or_default();
+
+    let instances = store.list_instances(&cid);
+    let knowledge = store.list_knowledge(&cid);
+    let tasks = store.list_tasks(&cid);
+
+    let snapshot = storyforge_app_meta::CampaignHealthSnapshot {
+        instances: &instances,
+        definitions: &definitions,
+        knowledge: &knowledge,
+        tasks: &tasks,
+    };
+
+    let issues = storyforge_app_meta::check_campaign_health(&snapshot);
+
+    Ok(issues
+        .into_iter()
+        .map(|i| serde_json::to_value(i).unwrap_or(serde_json::Value::Null))
+        .collect())
+}
+
 /// MVU 翻译的精简 DTO（前端列表用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MvuTranslationSummaryDto {
@@ -3942,6 +3981,7 @@ pub fn run() {
             meta_list_mvu_translations,
             meta_get_mvu_translation,
             meta_classify_st_preset,
+            meta_health_check,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
