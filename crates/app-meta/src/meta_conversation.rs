@@ -22,9 +22,17 @@ use storyforge_app_agent::AgentConfig;
 
 use crate::prompts::meta_agent::{build_meta_user_msg, make_meta_agent_config};
 use crate::{
-    CardReport, Patch, PatchAction, PatchStore, WorldInfoReport, inspect_character,
-    inspect_world_info,
+    CardReport, GenerationExplanation, Patch, PatchAction, PatchStore, WorldInfoReport,
+    inspect_character, inspect_world_info,
 };
+
+/// 生成溯源数据源（由 tauri-app 层注入，避免 app-meta 依赖 tauri-app）
+///
+/// tauri-app 层实现此 trait，从 conv_store 查 Provenance 并调 `explain_generation`。
+/// MetaSession 存 `Option<Arc<dyn GenerationExplainer>>`，None 表示未配置。
+pub trait GenerationExplainer: Send + Sync {
+    fn explain(&self, conversation_id: &str, node_id: &str) -> Option<GenerationExplanation>;
+}
 
 /// Meta Agent 会话状态（跨工具调用共享）
 ///
@@ -37,6 +45,8 @@ pub struct MetaSession {
     pub world_info: Mutex<Option<Arc<WorldInfoBook>>>,
     /// Patch 存储（提议的 Patch 进这里，用户采纳才执行）
     pub patches: PatchStore,
+    /// 生成溯源数据源（由 tauri-app 层注入，None = 未配置）
+    pub explainer: Option<Arc<dyn GenerationExplainer>>,
 }
 
 impl MetaSession {
@@ -45,6 +55,7 @@ impl MetaSession {
             character: Mutex::new(None),
             world_info: Mutex::new(None),
             patches: PatchStore::new(),
+            explainer: None,
         }
     }
 
@@ -54,6 +65,10 @@ impl MetaSession {
 
     pub fn set_world_info(&self, book: Arc<WorldInfoBook>) {
         *self.world_info.lock().unwrap_or_else(|p| p.into_inner()) = Some(book);
+    }
+
+    pub fn set_explainer(&mut self, explainer: Arc<dyn GenerationExplainer>) {
+        self.explainer = Some(explainer);
     }
 }
 
@@ -365,12 +380,99 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             }
         },
     );
+
+    // inspect_generation
+    registry.register(
+        ToolSpec::function(
+            "inspect_generation",
+            "解释某条消息的生成溯源。返回该轮的场景简述、各子 Agent 的角色/任务/输出摘要、最后的编剧提示、所用 Agent Profile 和随机种子。当用户问「为什么这么写」「这轮是怎么生成的」时调用。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "对话 ID"},
+                    "node_id": {"type": "string", "description": "消息节点 ID"}
+                },
+                "required": ["conversation_id", "node_id"]
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let conversation_id = args
+                        .get("conversation_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let node_id = args
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    match &session.explainer {
+                        Some(explainer) => {
+                            match explainer.explain(conversation_id, node_id) {
+                                Some(explanation) => Ok(serde_json::json!({
+                                    "explanation": explanation
+                                })),
+                                None => Ok(serde_json::json!({
+                                    "error": "找不到该消息的生成溯源（可能无 provenance）"
+                                })),
+                            }
+                        }
+                        None => Ok(serde_json::json!({
+                            "error": "未配置溯源数据源（GenerationExplainer 未注入）"
+                        })),
+                    }
+                })
+            }
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::explain::{GenerationExplanation, SubagentExplain};
     use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+
+    /// 测试用 mock GenerationExplainer
+    struct MockExplainer {
+        explanation: Option<GenerationExplanation>,
+    }
+
+    impl MockExplainer {
+        fn with_explanation(explanation: GenerationExplanation) -> Self {
+            Self {
+                explanation: Some(explanation),
+            }
+        }
+
+        fn returning_none() -> Self {
+            Self { explanation: None }
+        }
+    }
+
+    impl GenerationExplainer for MockExplainer {
+        fn explain(&self, _conversation_id: &str, _node_id: &str) -> Option<GenerationExplanation> {
+            self.explanation.clone()
+        }
+    }
+
+    fn make_test_explanation() -> GenerationExplanation {
+        GenerationExplanation {
+            scene_brief: Some("雨夜告别场景".into()),
+            subagents: vec![SubagentExplain {
+                character_id: "alice".into(),
+                display_name: "Alice".into(),
+                task_brief: Some("扮演 Alice，表达离别的不舍".into()),
+                output_preview: "Alice 望着窗外的雨。".into(),
+                fallback_reason: None,
+            }],
+            last_hint: None,
+            profile_id: Some("default".into()),
+            seed: 42,
+        }
+    }
 
     fn make_world_info() -> Arc<WorldInfoBook> {
         Arc::new(WorldInfoBook {
@@ -492,22 +594,8 @@ mod tests {
         assert_eq!(conv.history_summary.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_chat_patch_proposal_recorded_in_session() {
-        use storyforge_app_agent::runtime::AgentRuntime;
-        use storyforge_app_agent::tools::ToolContext;
-        use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
-
-        // Mock：返回带 meta_propose_patch 工具调用的响应（单轮，工具循环会执行后退出）
-        // 但 MockLlmClient 无状态会重复返回同样工具调用 → 死循环。
-        // 改为：直接测试 propose 走 PatchStore，不经过完整 chat（chat 的工具循环对 mock 不友好）
-        let _mock = MockLlmClient::new(vec![MockScript {
-            match_keyword: "配置调试助手".into(),
-            response_content: "我提议一个修复。".into(),
-            tool_calls: vec![],
-            stream: false,
-        }]);
-
+    #[test]
+    fn test_chat_patch_proposal_recorded_in_session() {
         // 直接测 PatchStore propose（chat 的工具循环逻辑单测见上面）
         let session = Arc::new(MetaSession::new());
         let patch = session.patches.propose(
@@ -521,5 +609,130 @@ mod tests {
         assert!(!patch.applied);
         assert_eq!(session.patches.pending().len(), 1);
         assert_eq!(patch.actions.len(), 1);
+    }
+
+    // ─── GenerationExplainer / inspect_generation 测试 ────────────────────
+
+    #[test]
+    fn test_inspect_generation_tool_registered() {
+        let session = Arc::new(MetaSession::new());
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session);
+
+        let specs = registry.tool_specs();
+        let has_inspect = specs.iter().any(|s| s.function.name == "inspect_generation");
+        assert!(has_inspect, "inspect_generation 工具应已注册");
+    }
+
+    #[tokio::test]
+    async fn test_inspect_generation_explainer_returns_explanation() {
+        let explanation = make_test_explanation();
+        let mock_explainer = Arc::new(MockExplainer::with_explanation(explanation));
+
+        let mut session = MetaSession::new();
+        session.set_explainer(mock_explainer);
+        let session = Arc::new(session);
+
+        // 直接调用 handler 逻辑（通过注册 + 调用）
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "conversation_id": "conv-1",
+            "node_id": "node-1"
+        });
+        let tool_ctx = Arc::new(storyforge_app_agent::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let result = registry
+            .dispatch("inspect_generation", args, tool_ctx)
+            .await
+            .unwrap();
+        assert!(
+            result.get("explanation").is_some(),
+            "应返回 explanation 字段"
+        );
+        assert_eq!(
+            result["explanation"]["scene_brief"].as_str(),
+            Some("雨夜告别场景")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspect_generation_explainer_returns_none() {
+        let mock_explainer = Arc::new(MockExplainer::returning_none());
+
+        let mut session = MetaSession::new();
+        session.set_explainer(mock_explainer);
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "conversation_id": "conv-1",
+            "node_id": "node-missing"
+        });
+        let tool_ctx = Arc::new(storyforge_app_agent::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let result = registry
+            .dispatch("inspect_generation", args, tool_ctx)
+            .await
+            .unwrap();
+        let error = result["error"].as_str().unwrap();
+        assert!(
+            error.contains("找不到"),
+            "应返回'找不到'错误，实际: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspect_generation_no_explainer_configured() {
+        let session = Arc::new(MetaSession::new()); // explainer = None
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "conversation_id": "conv-1",
+            "node_id": "node-1"
+        });
+        let tool_ctx = Arc::new(storyforge_app_agent::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let result = registry
+            .dispatch("inspect_generation", args, tool_ctx)
+            .await
+            .unwrap();
+        let error = result["error"].as_str().unwrap();
+        assert!(
+            error.contains("未配置"),
+            "应返回'未配置'错误，实际: {error}"
+        );
+    }
+
+    #[test]
+    fn test_meta_session_default_explainer_is_none() {
+        let session = MetaSession::new();
+        assert!(
+            session.explainer.is_none(),
+            "默认 MetaSession 的 explainer 应为 None"
+        );
     }
 }
