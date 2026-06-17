@@ -1653,9 +1653,10 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     ctx.pending_tasks = store.list_tasks(&active_id);
 
     // 阶段 2：组装 CampaignRuntimeContext 快照
-    // 加载 instances、card definitions、knowledge，构建纯 domain 快照
+    // 加载 instances、card definitions、knowledge、tasks，构建纯 domain 快照
     let instances = store.list_instances(&active_id);
     let knowledge = store.list_knowledge(&active_id);
+    let tasks = store.list_tasks(&active_id);
 
     // 从 card 的 character_definitions 构建 definitions_by_id
     let definitions_by_id: std::collections::HashMap<
@@ -1677,6 +1678,7 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
         instances,
         definitions_by_id,
         knowledge,
+        tasks,
         turn: ctx.turn,
     });
 
@@ -5178,6 +5180,7 @@ mod tests {
             instances: vec![],
             definitions_by_id: std::collections::HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 
@@ -5250,6 +5253,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id,
             knowledge: vec![knowledge],
+            tasks: vec![],
             turn: 3,
         });
 
@@ -5290,6 +5294,7 @@ mod tests {
             instances: vec![],
             definitions_by_id: std::collections::HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 99,
         });
         {

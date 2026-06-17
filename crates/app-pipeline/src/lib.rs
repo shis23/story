@@ -2498,6 +2498,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 
@@ -2568,6 +2569,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id: std::collections::HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 
@@ -2591,6 +2593,7 @@ mod tests {
             instances: vec![],
             definitions_by_id: std::collections::HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 
@@ -2655,6 +2658,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 
@@ -2743,6 +2747,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         });
 

@@ -14,6 +14,7 @@ use crate::Id;
 use crate::campaign::{Campaign, CharacterInstance};
 use crate::character::CharacterDefinition;
 use crate::character_knowledge::CharacterKnowledgeEntry;
+use crate::story_task::StoryTask;
 
 /// Read-only snapshot of a Campaign's runtime state.
 ///
@@ -26,6 +27,8 @@ pub struct CampaignRuntimeContext {
     pub instances: Vec<CharacterInstance>,
     pub definitions_by_id: HashMap<Id, CharacterDefinition>,
     pub knowledge: Vec<CharacterKnowledgeEntry>,
+    /// Campaign 的任务列表（Phase 3 阶段 4：供 Meta inspect_tasks / propose_campaign_patch 读取）
+    pub tasks: Vec<StoryTask>,
     pub turn: u32,
 }
 
@@ -124,6 +127,7 @@ impl CampaignRuntimeContext {
             instances: new_instances,
             definitions_by_id: self.definitions_by_id.clone(),
             knowledge: self.knowledge.clone(),
+            tasks: self.tasks.clone(),
             turn: self.turn,
         };
         (new_ctx, new_temps)
@@ -192,6 +196,7 @@ mod tests {
             instances: vec![inst_lin, inst_chen, inst_ghost],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         }
     }
@@ -224,6 +229,7 @@ mod tests {
             instances: vec![inst_a, inst_b],
             definitions_by_id: HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         };
 
@@ -268,6 +274,7 @@ mod tests {
             instances: vec![inst],
             definitions_by_id: HashMap::new(),
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         };
         let inst = ctx.find_instance_by_id_or_name("inst-x").unwrap();
@@ -331,6 +338,7 @@ mod tests {
             instances: vec![inst],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         };
         let inst = ctx.find_instance_by_id_or_name("inst-1").unwrap();
@@ -372,6 +380,7 @@ mod tests {
             instances: vec![inst_lin, inst_chen],
             definitions_by_id: HashMap::new(),
             knowledge,
+            tasks: vec![],
             turn: 3,
         };
 

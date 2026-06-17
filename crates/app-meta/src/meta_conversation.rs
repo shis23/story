@@ -21,8 +21,7 @@ use storyforge_domain::world_info::WorldInfoBook;
 use storyforge_app_agent::AgentConfig;
 
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
-use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
-use storyforge_domain::story_task::TaskStatus;
+use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 
 use crate::prompts::meta_agent::{build_meta_user_msg, make_meta_agent_config};
 use crate::typed_patch::{PreviewInput, TypedPatch, build_patch_from_action};
@@ -680,12 +679,29 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
                         .unwrap_or("pending");
                     let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
                     match rt.as_ref() {
-                        Some(_ctx) => {
-                            // CampaignRuntimeContext 没有 tasks 字段；
-                            // 任务通过 CampaignStore 管理，这里返回提示
+                        Some(ctx) => {
+                            // 过滤：pending 返回 Pending/Active（可注入的），all 返回全部
+                            let tasks: Vec<&storyforge_domain::story_task::StoryTask> = match status_filter {
+                                "all" => ctx.tasks.iter().collect(),
+                                _ => ctx.tasks.iter().filter(|t| t.status.is_injectable()).collect(),
+                            };
+                            let summary: Vec<serde_json::Value> = tasks
+                                .iter()
+                                .map(|t| {
+                                    serde_json::json!({
+                                        "id": t.id.to_string(),
+                                        "title": t.title,
+                                        "description": t.description,
+                                        "status": t.status,
+                                        "created_turn": t.created_turn,
+                                        "related_characters": t.related_characters.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                                    })
+                                })
+                                .collect();
                             Ok(serde_json::json!({
-                                "note": "任务通过 CampaignStore 管理，请使用 meta_propose_campaign_repairs 或直接查询 CampaignStore",
+                                "count": summary.len(),
                                 "status_filter": status_filter,
+                                "tasks": summary,
                             }))
                         }
                         None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
@@ -750,7 +766,7 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
                         instances: &ctx.instances,
                         definitions: &definitions,
                         knowledge: &ctx.knowledge,
-                        tasks: &[], // CampaignRuntimeContext 没有 tasks
+                        tasks: &ctx.tasks,
                         campaign: Some(&ctx.campaign),
                     };
 
@@ -1138,6 +1154,13 @@ mod tests {
             "看到了龙",
             1,
         )];
+        let tasks = vec![storyforge_domain::story_task::StoryTask::user_planned(
+            Id::from_str("camp-1"),
+            "复仇",
+            "老王复仇",
+            vec![storyforge_domain::story_task::TaskTrigger::TurnReminder { at_turn: 10 }],
+            1,
+        )];
         let mut defs = HashMap::new();
         defs.insert(def.id.clone(), def);
 
@@ -1146,6 +1169,7 @@ mod tests {
             instances: vec![inst],
             definitions_by_id: defs,
             knowledge,
+            tasks,
             turn: 3,
         })
     }
@@ -1328,6 +1352,86 @@ mod tests {
         // session.typed_patches 不应增长
         let typed = session.typed_patches.lock().unwrap();
         assert_eq!(typed.len(), 0);
+    }
+
+    // ─── inspect_tasks 真实返回测试（修复数据源缺口后） ───────────────────
+
+    #[tokio::test]
+    async fn test_inspect_tasks_returns_real_tasks_pending() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        // 默认 pending：helper 里的 task 是 Pending（user_planned 初始状态），可注入
+        let result = registry
+            .dispatch("inspect_tasks", serde_json::json!({}), make_tool_ctx())
+            .await
+            .unwrap();
+        assert_eq!(result["count"].as_u64(), Some(1), "pending 应返回 1 条任务");
+        assert_eq!(result["tasks"][0]["title"].as_str(), Some("复仇"));
+        assert!(
+            result.get("note").is_none(),
+            "不应再返回 note 提示（已接真实数据源）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspect_tasks_all_filter() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch(
+                "inspect_tasks",
+                serde_json::json!({"status": "all"}),
+                make_tool_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["count"].as_u64(), Some(1), "all 也应返回 1 条");
+    }
+
+    // ─── propose_campaign_patch: UpdateTaskStatus 提议成功（修复数据源缺口后） ─
+
+    #[tokio::test]
+    async fn test_propose_campaign_patch_update_task_status() {
+        let rt = make_test_campaign_runtime();
+        // helper 里 task 是 user_planned 生成，id 是随机的，取出来用
+        let task_id = rt.tasks[0].id.to_string();
+        let session = MetaSession::new();
+        session.set_campaign_runtime(rt);
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "description": "完成任务",
+            "action": {
+                "kind": "update_task_status",
+                "task_id": task_id,
+                "new_status": "completed"
+            }
+        });
+        let result = registry
+            .dispatch("propose_campaign_patch", args, make_tool_ctx())
+            .await
+            .unwrap();
+        assert!(
+            result.get("patch_id").is_some(),
+            "UpdateTaskStatus 应提议成功，实际: {result}"
+        );
+
+        // session.typed_patches 应增长 1
+        let typed = session.typed_patches.lock().unwrap();
+        assert_eq!(typed.len(), 1);
     }
 
     // ─── MetaTurn.new_typed_patches drain 测试 ─────────────────────────────

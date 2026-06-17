@@ -557,6 +557,7 @@ mod tests {
             instances: vec![instance],
             definitions_by_id,
             knowledge: vec![],
+            tasks: vec![],
             turn: 1,
         })
     }

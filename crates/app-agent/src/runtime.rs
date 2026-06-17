@@ -1210,6 +1210,7 @@ mod tests {
             instances: vec![inst_lin, inst_chen],
             definitions_by_id,
             knowledge,
+            tasks: vec![],
             turn: 1,
         })
     }
