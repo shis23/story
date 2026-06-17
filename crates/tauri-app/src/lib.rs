@@ -1,4 +1,4 @@
-mod campaign_store;
+﻿mod campaign_store;
 mod connection_store;
 mod module_store;
 mod preset_store;
@@ -3341,16 +3341,20 @@ fn meta_accept_typed_patch(
 
     // 4. 纯函数预演（clone 可变快照）
     {
+        // A 的 PreviewInputMut 字段为 &mut Vec<...>，需 clone 到本地变量再借。
+        let mut inst_clone = instances.clone();
+        let mut def_clone = definitions.clone();
+        let mut know_clone = knowledge.clone();
+        let mut task_clone = tasks.clone();
         let mut snap = storyforge_app_meta::PreviewInputMut {
-            instances: instances.clone(),
-            definitions: definitions.clone(),
-            knowledge: knowledge.clone(),
-            tasks: tasks.clone(),
+            instances: &mut inst_clone,
+            definitions: &mut def_clone,
+            knowledge: &mut know_clone,
+            tasks: &mut task_clone,
         };
         storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
             .map_err(|e| format!("纯函数预演失败: {e}"))?;
     }
-
     // 5. 真正写盘
     for (idx, action) in patch.actions.iter().enumerate() {
         let result = apply_typed_action(store, &cid, action);
@@ -3382,7 +3386,7 @@ fn apply_typed_action(
     match action {
         TypedPatchAction::SyncInstanceVariables {
             instance_id,
-            definition_id: _,
+            definition_id,
             add_keys,
             remove_keys,
         } => {
@@ -3390,11 +3394,35 @@ fn apply_typed_action(
                 .get_instance(campaign_id, instance_id)
                 .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
 
-            // 添加缺失 key（从 definition 的 variable_schema 取 default）
+            // 与 A 的 apply_to_snapshot 纯函数保持一致：从 definition.variable_schema
+            // 取 add_keys 的 default 值，而非硬编码 null。否则 accept 前的纯函数预演
+            // （显示 schema 默认值）与真正写盘（写 null）结果不一致。
+            // 查找路径：campaign -> card_id -> card.character_definitions -> 按 definition_id 匹配
+            let schema_defaults: std::collections::HashMap<String, serde_json::Value> = (|| {
+                let campaign = store.get_campaign(campaign_id)?;
+                let stored = store.get_card(&campaign.card_id)?;
+                let def = stored
+                    .card
+                    .character_definitions
+                    .iter()
+                    .find(|d| &d.id == definition_id)?;
+                Some(
+                    def.variable_schema
+                        .iter()
+                        .map(|f| (f.key.clone(), f.default.clone()))
+                        .collect(),
+                )
+            })()
+            .unwrap_or_default();
+
+            // 添加缺失 key（用 schema default，缺失 schema 时回退 null）
             for key in add_keys {
                 if instance.get_variable(key).is_none() {
-                    // 用空 JSON null 作为 fallback（无 schema 时）
-                    instance.set_variable(key, serde_json::Value::Null, 0);
+                    let default_val = schema_defaults
+                        .get(key)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    instance.set_variable(key, default_val, 0);
                 }
             }
 
