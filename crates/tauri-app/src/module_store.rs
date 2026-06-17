@@ -411,7 +411,7 @@ impl AgentProfileConfigStore {
         let configs_path = app_data_dir.join("agent_profile_configs.json");
         let active_path = app_data_dir.join("active_agent_profile_config.json");
 
-        let configs: Vec<AgentProfileConfig> = if configs_path.exists() {
+        let mut configs: Vec<AgentProfileConfig> = if configs_path.exists() {
             std::fs::read_to_string(&configs_path)
                 .ok()
                 .and_then(|data| serde_json::from_str(&data).ok())
@@ -419,6 +419,9 @@ impl AgentProfileConfigStore {
         } else {
             Vec::new()
         };
+        for config in &mut configs {
+            config.sanitize();
+        }
 
         let active_id: Option<String> = if active_path.exists() {
             std::fs::read_to_string(&active_path)
@@ -489,7 +492,8 @@ impl AgentProfileConfigStore {
     /// 保存/更新配置
     ///
     /// 内置默认配置不允许覆盖。
-    pub fn save(&self, config: AgentProfileConfig) -> Result<(), String> {
+    pub fn save(&self, mut config: AgentProfileConfig) -> Result<(), String> {
+        config.sanitize();
         if config.id.to_string() == BUILTIN_DEFAULT_AGENT_PROFILE_ID {
             // 检查是否已存在内置默认
             let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
@@ -580,10 +584,46 @@ impl AgentProfileConfigStore {
 
     fn persist_configs(&self) {
         let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) =
-            storyforge_infra_util::atomic_write_json(&self.configs_path, &*configs)
-        {
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.configs_path, &*configs) {
             tracing::error!("持久化 Agent Profile Config 失败: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_profile_config_store_tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_agent_profile_store_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_sanitizes_zero_concurrency_from_disk() {
+        let dir = temp_dir();
+        let legacy_configs = serde_json::json!([
+            {
+                "id": "legacy-zero",
+                "name": "Legacy Zero",
+                "max_concurrent_subagents": 0
+            }
+        ]);
+        std::fs::write(
+            dir.join("agent_profile_configs.json"),
+            legacy_configs.to_string(),
+        )
+        .unwrap();
+
+        let store = AgentProfileConfigStore::new(&dir);
+        let cfg = store.get("legacy-zero").unwrap();
+        assert_eq!(cfg.max_concurrent_subagents, 1);
+        assert_eq!(cfg.effective_max_concurrent_subagents(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

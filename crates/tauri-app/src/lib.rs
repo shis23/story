@@ -1251,8 +1251,10 @@ fn save_agent_profile_config(
     config_json: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let config: storyforge_domain::agent_profile_config::AgentProfileConfig =
-        serde_json::from_str(&config_json).map_err(|e| format!("Agent Profile Config 解析失败: {e}"))?;
+    let mut config: storyforge_domain::agent_profile_config::AgentProfileConfig =
+        serde_json::from_str(&config_json)
+            .map_err(|e| format!("Agent Profile Config 解析失败: {e}"))?;
+    config.sanitize();
     state.agent_profile_config_store.save(config)
 }
 
@@ -4740,11 +4742,7 @@ mod tests {
         persist_temporary_instances_to(&store, &ctx, &temps);
 
         let instances = store.list_instances(&campaign.id);
-        assert_eq!(
-            instances.len(),
-            1,
-            "同名不应重复落盘"
-        );
+        assert_eq!(instances.len(), 1, "同名不应重复落盘");
         assert_eq!(instances[0].id, existing.id, "应保留原始实例 id");
 
         let _ = std::fs::remove_dir_all(&dir);

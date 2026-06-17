@@ -459,10 +459,7 @@ mod tests {
             Some("mysterious stranger".into())
         );
         assert!(instance.behavior_override.is_none());
-        assert_eq!(
-            instance.resolved_persona(None),
-            Some("mysterious stranger")
-        );
+        assert_eq!(instance.resolved_persona(None), Some("mysterious stranger"));
     }
 
     #[test]
@@ -493,12 +490,7 @@ mod tests {
 
     #[test]
     fn temporary_with_overrides_none_equivalent_to_temporary() {
-        let a = CharacterInstance::temporary_with_overrides(
-            Id::new(),
-            "Test",
-            None,
-            None,
-        );
+        let a = CharacterInstance::temporary_with_overrides(Id::new(), "Test", None, None);
         let b = CharacterInstance::temporary(Id::new(), "Test");
         // Both should have the same field values (except id which is random)
         assert_eq!(a.name, b.name);

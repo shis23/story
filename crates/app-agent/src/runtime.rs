@@ -475,8 +475,8 @@ pub enum AgentError {
 
 // ─── 委派（对应设计 §3.4 并发模型）─────────────────────────────────────────
 
-/// 并发上限
-const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+/// 默认子 Agent 并发上限。
+pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 /// 委派子 Agent（tokio::spawn + watch 取消，借鉴 TT）
 ///
@@ -486,7 +486,7 @@ const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 ///
 /// - **流式**：每个子 Agent 走 `run_tool_loop_streaming`，token 增量经 `event_tx`
 ///   转发为 `PipelineEvent::SubagentProgress`（带 character_id + index），供前端实时显示。
-/// - **并发**：用 `Semaphore`（permits = `MAX_CONCURRENT_SUBAGENTS`）限流，
+/// - **并发**：用 `Semaphore` 限流，默认上限为 `DEFAULT_MAX_CONCURRENT_SUBAGENTS`，
 ///   超出的任务**排队等待**而非丢弃，最终全部跑完。结果按原始 index 对齐返回。
 pub async fn spawn_subagents(
     tasks: Vec<SubagentTask>,
@@ -500,6 +500,8 @@ pub async fn spawn_subagents(
     agent_profile_config: Option<&storyforge_domain::agent_profile_config::AgentProfileConfig>,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
+    // Semaphore(0) would make every task wait forever; treat invalid input as serial execution.
+    let max_concurrent_subagents = max_concurrent_subagents.max(1);
     // Semaphore 限流：同时最多 max_concurrent_subagents 个子 Agent 跑，超出排队
     let semaphore = Arc::new(Semaphore::new(max_concurrent_subagents));
 
@@ -514,9 +516,8 @@ pub async fn spawn_subagents(
         let character_id = task.character_id.clone();
 
         // 从 AgentProfileConfig 查找该子 Agent 的覆盖配置
-        let subagent_run_config = agent_profile_config.map(|apc| {
-            apc.run_config_for(&AgentRole::Subagent(character_id.clone()))
-        });
+        let subagent_run_config = agent_profile_config
+            .map(|apc| apc.run_config_for(&AgentRole::Subagent(character_id.clone())));
         let model = subagent_run_config
             .and_then(|rc| rc.model_override.clone())
             .unwrap_or_else(|| director_config.model.clone()); // 子 Agent 默认用导演的模型
@@ -813,7 +814,7 @@ pub fn inject_hint_into_editor(user_message: &str, hint: &str) -> String {
 mod tests {
     use super::*;
     use storyforge_domain::agent::LoreEntryLight;
-    use storyforge_infra_llm::mock_client::MockLlmClient;
+    use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
 
     /// 验证全局取消会中止所有子 Agent
     #[tokio::test]
@@ -846,7 +847,12 @@ mod tests {
             },
         ];
 
-        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "角色".into(),
+            response_content: "ok".into(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
         let tool_ctx = Arc::new(ToolContext {
             characters: vec![],
             world_info: None,
@@ -963,6 +969,86 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             assert!(r.is_ok(), "第 {i} 个子 Agent 应成功，实际: {:?}", r);
         }
+    }
+
+    /// 配置层传入 0 时，运行时应退化为串行执行，而不是 Semaphore(0) 挂死。
+    #[tokio::test]
+    async fn test_subagents_zero_concurrency_is_serial() {
+        let tasks = vec![SubagentTask {
+            character_id: "A".into(),
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: "角色A".into(),
+                scene_brief: "场景".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出你的部分".into(),
+            },
+        }];
+
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+        };
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut agent_configs = std::collections::HashMap::new();
+        agent_configs.insert(
+            AgentRole::Subagent("*".into()),
+            storyforge_domain::agent_profile_config::AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: Some(1),
+                tool_whitelist: None,
+            },
+        );
+        let profile = storyforge_domain::agent_profile_config::AgentProfileConfig::new(
+            Id::from_str("zero-concurrency-test"),
+            "zero concurrency test".into(),
+            String::new(),
+            agent_configs,
+            1,
+            true,
+            true,
+            storyforge_domain::prompt_module::ProfileSource::UserCreated,
+            1,
+        );
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            spawn_subagents(
+                tasks,
+                runtime,
+                &director_config,
+                "你是角色",
+                cancel_rx,
+                mpsc::unbounded_channel::<PipelineEvent>().0,
+                None,
+                0,
+                Some(&profile),
+            ),
+        )
+        .await
+        .expect("zero concurrency should not hang");
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_ok(),
+            "subagent should complete serially: {:?}",
+            results[0]
+        );
     }
 
     #[test]
@@ -1450,8 +1536,7 @@ mod tests {
     async fn test_spawn_subagents_with_temporary_instance() {
         let cr = make_campaign_runtime();
         // 为 "Ghost" 创建临时 instance
-        let (cr_with_temp, temps) =
-            cr.with_temporaries_for(&[("Ghost".into(), None, None)]);
+        let (cr_with_temp, temps) = cr.with_temporaries_for(&[("Ghost".into(), None, None)]);
         assert_eq!(temps.len(), 1);
         let cr = Arc::new(cr_with_temp);
 
@@ -1508,8 +1593,7 @@ mod tests {
     #[test]
     fn test_temporary_instance_system_prompt_no_persona() {
         let cr = make_campaign_runtime();
-        let (cr_with_temp, _) =
-            cr.with_temporaries_for(&[("Ghost".into(), None, None)]);
+        let (cr_with_temp, _) = cr.with_temporaries_for(&[("Ghost".into(), None, None)]);
         let cr = Arc::new(cr_with_temp);
         let inst = cr.find_instance_by_id_or_name("Ghost").unwrap();
 

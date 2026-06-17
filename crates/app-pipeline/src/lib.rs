@@ -8,17 +8,18 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use storyforge_domain::Id;
-use storyforge_domain::agent_profile_config::AgentProfileConfig;
-use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::agent::{
     AgentRole, ContextPackage, Draft, LoreEntryLight, PipelineEvent, PipelineState, Plan,
     SubagentTask, WritingSession,
 };
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
+use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::conversation::Provenance;
 
 use storyforge_app_agent::{
-    AgentConfig, AgentError, AgentRuntime, EDITOR_HINT_MARKER, SUBAGENT_HINT_MARKER, ToolContext,
-    ToolRegistry, spawn_subagents, tools::register_director_tools,
+    AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
+    SUBAGENT_HINT_MARKER, ToolContext, ToolRegistry, spawn_subagents,
+    tools::register_director_tools,
 };
 use storyforge_app_conversation::{
     ConversationStore, PartialRollTarget, build_provenance_with_campaign,
@@ -364,8 +365,8 @@ impl PipelineOrchestrator {
         let max_concurrent = ctx
             .agent_profile_config
             .as_ref()
-            .map(|c| c.max_concurrent_subagents)
-            .unwrap_or(4);
+            .map(|c| c.effective_max_concurrent_subagents())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -429,7 +430,11 @@ impl PipelineOrchestrator {
         });
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config(ctx.profile.as_ref(), &ctx.modules, ctx.agent_profile_config.as_ref());
+        let editor_config = make_editor_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            ctx.agent_profile_config.as_ref(),
+        );
 
         // 构造编剧的用户消息（子 Agent 产出）
         let performances_text: String = performances
@@ -813,8 +818,8 @@ impl PipelineOrchestrator {
             let max_concurrent = ctx
                 .agent_profile_config
                 .as_ref()
-                .map(|c| c.max_concurrent_subagents)
-                .unwrap_or(4);
+                .map(|c| c.effective_max_concurrent_subagents())
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),

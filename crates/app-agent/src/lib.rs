@@ -22,7 +22,7 @@ pub use prompts::character_extractor::{
     make_character_extractor_config, register_character_extractor_tools,
 };
 pub use runtime::{
-    AgentConfig, AgentError, AgentRuntime, EDITOR_HINT_MARKER, SUBAGENT_HINT_MARKER,
-    inject_hint_into_editor, inject_hint_into_subagent, spawn_subagents,
+    AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
+    SUBAGENT_HINT_MARKER, inject_hint_into_editor, inject_hint_into_subagent, spawn_subagents,
 };
 pub use tools::{ToolContext, ToolError, ToolRegistry};

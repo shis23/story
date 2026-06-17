@@ -125,10 +125,9 @@ pub fn default_agent_profile_config() -> AgentProfileConfig {
     AgentProfileConfig {
         id: Id::from_str("builtin-default-agent-v1"),
         name: "默认 Agent 配置".into(),
-        description: "与当前硬编码行为一致的默认配置".into(),
-        prompt_profile_id: Id::from_str("builtin-default-v1"),
+        description: "与当前硬编码行为一致的默认配置。导演 15 轮，编剧 5 轮，子 Agent 10 轮，并发 4。".into(),
         agent_configs: HashMap::new(), // 空 = 全部使用默认值
-        max_concurrent_subagents: 3,
+        max_concurrent_subagents: 4,
         enable_postprocess: true,
         enable_summarizer: true,
         source: ProfileSource::BuiltIn,
@@ -231,7 +230,7 @@ cargo test -p storyforge
 
 目标：Pipeline 按 AgentProfileConfig 参数运行 Agent，而不是硬编码常量。
 
-**已实现**：Director/Editor/Subagent 的 `model_override` 和 `max_tool_rounds` 覆盖、`max_concurrent_subagents` 并发控制。
+**已实现**：Director/Editor/Subagent 的 `model_override` 和 `max_tool_rounds` 覆盖、`max_concurrent_subagents` 并发控制。并发值为 `0` 时会按 `1` 处理，避免子 Agent 调度挂死。
 **未实现**：`enable_postprocess` / `enable_summarizer` 运行时控制（存储已支持，运行时未消费）、`tool_whitelist` 运行时过滤。
 
 改动文件：

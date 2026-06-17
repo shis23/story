@@ -489,52 +489,34 @@ mod tests {
     #[test]
     fn with_temporaries_passes_persona_override() {
         let ctx = make_context();
-        let specs: Vec<(String, Option<String>, Option<String>)> = vec![(
-            "NewChar".into(),
-            Some("mysterious stranger".into()),
-            None,
-        )];
+        let specs: Vec<(String, Option<String>, Option<String>)> =
+            vec![("NewChar".into(), Some("mysterious stranger".into()), None)];
         let (new_ctx, temps) = ctx.with_temporaries_for(&specs);
 
         assert_eq!(temps.len(), 1);
         let temp = &temps[0];
         assert_eq!(temp.name, "NewChar");
-        assert_eq!(
-            temp.persona_override,
-            Some("mysterious stranger".into())
-        );
+        assert_eq!(temp.persona_override, Some("mysterious stranger".into()));
         assert!(temp.behavior_override.is_none());
 
         // Also findable in the new context
         let found = new_ctx.find_instance_by_id_or_name("NewChar").unwrap();
         assert_eq!(found.id, temp.id);
-        assert_eq!(
-            found.resolved_persona(None),
-            Some("mysterious stranger")
-        );
+        assert_eq!(found.resolved_persona(None), Some("mysterious stranger"));
     }
 
     #[test]
     fn with_temporaries_passes_behavior_override() {
         let ctx = make_context();
-        let specs: Vec<(String, Option<String>, Option<String>)> = vec![(
-            "Guard".into(),
-            None,
-            Some("block the passage".into()),
-        )];
+        let specs: Vec<(String, Option<String>, Option<String>)> =
+            vec![("Guard".into(), None, Some("block the passage".into()))];
         let (new_ctx, temps) = ctx.with_temporaries_for(&specs);
 
         assert_eq!(temps.len(), 1);
-        assert_eq!(
-            temps[0].behavior_override,
-            Some("block the passage".into())
-        );
+        assert_eq!(temps[0].behavior_override, Some("block the passage".into()));
 
         let found = new_ctx.find_instance_by_id_or_name("Guard").unwrap();
-        assert_eq!(
-            found.resolved_behavior(None),
-            Some("block the passage")
-        );
+        assert_eq!(found.resolved_behavior(None), Some("block the passage"));
     }
 
     #[test]
@@ -548,13 +530,7 @@ mod tests {
         let (_new_ctx, temps) = ctx.with_temporaries_for(&specs);
 
         assert_eq!(temps.len(), 1);
-        assert_eq!(
-            temps[0].persona_override,
-            Some("friendly merchant".into())
-        );
-        assert_eq!(
-            temps[0].behavior_override,
-            Some("offer fair prices".into())
-        );
+        assert_eq!(temps[0].persona_override, Some("friendly merchant".into()));
+        assert_eq!(temps[0].behavior_override, Some("offer fair prices".into()));
     }
 }

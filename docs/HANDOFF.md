@@ -64,7 +64,7 @@ docs/archive/2026-06-16-pre-rewrite/
 
 `docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md` 已归档为角色体系历史计划；当前执行入口以 `docs/PLAN-CAMPAIGN-MAINLINE.md` 为准。后续再按 `PLAN-META-AGENT.md`、`PLAN-FRONTEND-WORKBENCH.md`、`PLAN-PLUGIN-MVU.md`、`PLAN-ANDROID.md` 推进外围能力。
 
-`docs/PLAN-AGENT-PROFILE.md` 阶段 1-3 已实现（backend）：domain DTO + Tauri store/commands + pipeline 消费 model/rounds/concurrency 覆盖。阶段 4（UI 编辑器）未实现。`enable_postprocess` / `enable_summarizer` / `tool_whitelist` 存储已支持但运行时未消费。
+`docs/PLAN-AGENT-PROFILE.md` 阶段 1-3 已实现（backend）：domain DTO + Tauri store/commands + pipeline 消费 model/rounds/concurrency 覆盖。`max_concurrent_subagents = 0` 会按 `1` 执行，避免子 Agent 调度挂死。阶段 4（UI 编辑器）未实现。`enable_postprocess` / `enable_summarizer` / `tool_whitelist` 存储已支持但运行时未消费。
 
 上述专项计划完成后，不要直接开新功能。继续执行 `docs/PLAN-POST-MAINLINE.md`，完成端到端验收、回归评测、数据安全、性能成本、发布包和下一阶段战略决策。
 

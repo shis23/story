@@ -69,7 +69,7 @@
 - `crates/domain/src/agent_profile_config.rs` **已实现**：`AgentRunConfig`（model_override/max_tool_rounds/tool_whitelist）+ `AgentProfileConfig`（agent_configs/max_concurrent_subagents/enable_postprocess/enable_summarizer/source/config_version）+ 内置默认 `builtin-default-agent-v1`。支持 Subagent 通配符回退。serde 兼容旧/部分 JSON。
 - `crates/tauri-app/src/module_store.rs::AgentProfileConfigStore` **已实现**：JSON 文件 CRUD（`agent_profile_configs.json` + `active_agent_profile_config.json`），内置默认始终可用不可删除。
 - `crates/tauri-app/src/lib.rs` **已实现**：6 个 Tauri commands（list/get/get_active/save/delete/set_active agent_profile_configs）。`fill_agent_profile_context` 加载活跃配置到 `WritingContext`。
-- `crates/app-pipeline/src/lib.rs::WritingContext` **已扩展**：`agent_profile_config: Option<AgentProfileConfig>`。`make_director_config` / `make_editor_config` 从 profile 读取 model_override 和 max_tool_rounds。`spawn_subagents` 接收 max_concurrent_subagents 和 agent_profile_config。
+- `crates/app-pipeline/src/lib.rs::WritingContext` **已扩展**：`agent_profile_config: Option<AgentProfileConfig>`。`make_director_config` / `make_editor_config` 从 profile 读取 model_override 和 max_tool_rounds。`spawn_subagents` 接收 max_concurrent_subagents 和 agent_profile_config；并发配置为 `0` 时通过 `effective_max_concurrent_subagents()` 按 `1` 执行，避免调度挂死。
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **已扩展**：接受 `max_concurrent_subagents` 和 `agent_profile_config` 参数，子 Agent 按 profile 覆盖 model 和 max_tool_rounds。
 - `frontend/src/tauri-api.js` **已实现**：6 个 wrapper（listAgentProfileConfigs/getAgentProfileConfig/getActiveAgentProfileConfig/saveAgentProfileConfig/deleteAgentProfileConfig/setActiveAgentProfileConfig）。
 - `enable_postprocess` / `enable_summarizer` **存储已支持，运行时未消费**。

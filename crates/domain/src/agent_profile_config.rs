@@ -105,22 +105,61 @@ pub const BUILTIN_DEFAULT_AGENT_PROFILE_ID: &str = "builtin-default-agent-v1";
 /// - enable_postprocess = true
 /// - enable_summarizer = true
 pub fn default_agent_profile_config() -> AgentProfileConfig {
-    AgentProfileConfig {
-        id: Id::from_str(BUILTIN_DEFAULT_AGENT_PROFILE_ID),
-        name: "默认 Agent 配置".into(),
-        description: "与当前硬编码行为一致的默认配置。导演 15 轮，编剧 5 轮，子 Agent 10 轮，并发 4。".into(),
-        agent_configs: HashMap::new(),
-        max_concurrent_subagents: default_max_concurrent_subagents(),
-        enable_postprocess: true,
-        enable_summarizer: true,
-        source: ProfileSource::BuiltIn,
-        config_version: 1,
-    }
+    AgentProfileConfig::new(
+        Id::from_str(BUILTIN_DEFAULT_AGENT_PROFILE_ID),
+        "默认 Agent 配置".into(),
+        "与当前硬编码行为一致的默认配置。导演 15 轮，编剧 5 轮，子 Agent 10 轮，并发 4。".into(),
+        HashMap::new(),
+        default_max_concurrent_subagents(),
+        true,
+        true,
+        ProfileSource::BuiltIn,
+        1,
+    )
 }
 
 // ─── 查询 helpers ─────────────────────────────────────────────────────
 
 impl AgentProfileConfig {
+    /// 构造函数，保证 `max_concurrent_subagents >= 1`（避免 Semaphore(0) 死锁）。
+    pub fn new(
+        id: Id,
+        name: String,
+        description: String,
+        agent_configs: HashMap<AgentRole, AgentRunConfig>,
+        max_concurrent_subagents: usize,
+        enable_postprocess: bool,
+        enable_summarizer: bool,
+        source: ProfileSource,
+        config_version: u32,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            agent_configs,
+            max_concurrent_subagents: max_concurrent_subagents.max(1),
+            enable_postprocess,
+            enable_summarizer,
+            source,
+            config_version,
+        }
+    }
+
+    /// 返回运行时可安全使用的子 Agent 并发数。
+    ///
+    /// `0` 会让 `Semaphore` 永远不给 permit，因此按串行执行处理为 `1`。
+    pub fn effective_max_concurrent_subagents(&self) -> usize {
+        self.max_concurrent_subagents.max(1)
+    }
+
+    /// 修正反序列化后可能不合法的字段（如 `max_concurrent_subagents = 0`）。
+    ///
+    /// 从 JSON 反序列化的配置应调用此方法，避免 Semaphore(0) 死锁。
+    pub fn sanitize(&mut self) {
+        self.max_concurrent_subagents = self.effective_max_concurrent_subagents();
+    }
+
     /// 查找某个角色的运行配置。支持 Subagent 通配符回退：
     /// 先查精确的 `Subagent(id)`，找不到则回退到 `Subagent("*")`。
     pub fn run_config_for(&self, role: &AgentRole) -> &AgentRunConfig {
@@ -331,17 +370,17 @@ mod tests {
                 tool_whitelist: Some(vec!["get_character".into()]),
             },
         );
-        let cfg = AgentProfileConfig {
-            id: Id::from_str("custom-1"),
-            name: "自定义配置".into(),
-            description: "测试".into(),
+        let cfg = AgentProfileConfig::new(
+            Id::from_str("custom-1"),
+            "自定义配置".into(),
+            "测试".into(),
             agent_configs,
-            max_concurrent_subagents: 2,
-            enable_postprocess: true,
-            enable_summarizer: false,
-            source: ProfileSource::UserCreated,
-            config_version: 1,
-        };
+            2,
+            true,
+            false,
+            ProfileSource::UserCreated,
+            1,
+        );
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let back: AgentProfileConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "自定义配置");
@@ -353,13 +392,32 @@ mod tests {
     }
 
     #[test]
-    fn validation_max_concurrent_subagents_bounds() {
-        // 0 不合理但不 panic（运行时会退化为串行）
-        let mut cfg = default_agent_profile_config();
-        cfg.max_concurrent_subagents = 0;
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: AgentProfileConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.max_concurrent_subagents, 0);
+    fn validation_max_concurrent_subagents_clamped_via_new() {
+        // 通过 new() 构造时 0 被 clamp 到 1（避免 Semaphore(0) 死锁）
+        let cfg = AgentProfileConfig::new(
+            Id::from_str("clamp-test"),
+            "test".into(),
+            String::new(),
+            HashMap::new(),
+            0, // 故意传 0
+            true,
+            true,
+            ProfileSource::UserCreated,
+            1,
+        );
+        assert_eq!(cfg.max_concurrent_subagents, 1);
+        assert_eq!(cfg.effective_max_concurrent_subagents(), 1);
+    }
+
+    #[test]
+    fn effective_max_concurrent_subagents_clamps_deserialized_zero() {
+        let json = r#"{"id":"x","name":"y","max_concurrent_subagents":0}"#;
+        let mut cfg: AgentProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_concurrent_subagents, 0);
+        assert_eq!(cfg.effective_max_concurrent_subagents(), 1);
+
+        cfg.sanitize();
+        assert_eq!(cfg.max_concurrent_subagents, 1);
     }
 
     #[test]
