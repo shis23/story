@@ -173,6 +173,8 @@ cargo test -p storyforge
 
 ## 阶段 4：Campaign-aware Meta Tools
 
+**状态：已完成**（2026-06-18）
+
 目标：Meta 工具读取 CampaignRuntimeContext，而不是只读扁平角色卡。
 
 改动文件：
@@ -180,21 +182,46 @@ cargo test -p storyforge
 - `crates/app-meta/src/meta_conversation.rs`
 - `crates/app-meta/src/prompts/meta_agent.rs`
 - `crates/tauri-app/src/lib.rs`
+- `crates/domain/src/campaign_runtime.rs`（补 tasks 字段）
+- `crates/app-meta/src/typed_patch.rs`（4 新变体）
 
-工具建议：
+已实现工具（注册在 `register_meta_runtime_tools`）：
 
-- `inspect_campaign`
-- `inspect_instance`
-- `inspect_variables`
-- `inspect_knowledge`
-- `inspect_tasks`
-- `inspect_generation`
-- `propose_campaign_patch`
+- ✅ `inspect_campaign`：Campaign 概览（实例数/知识数/任务数/变量）
+- ✅ `inspect_instance`：按 id 或 name 查实例（persona/behavior/变量）
+- ✅ `inspect_variables`：scope=campaign 或 scope=instance
+- ✅ `inspect_knowledge`：全部或按实例过滤
+- ✅ `inspect_tasks`：pending（is_injectable 过滤）或 all
+- ✅ `inspect_generation`：生成溯源（阶段 2 已做）
+- ✅ `propose_campaign_patch`：提议类型化修复，走已有 preview/accept 闭环
+
+`propose_campaign_patch` 落地路径：扩展 `TypedPatchAction` 4 新变体
+（`UpdateCampaignVariable` / `UpdateInstanceVariable` / `AddKnowledge` /
+`UpdateTaskStatus`），`build_patch_from_action` 纯函数构造，`source_issue_category`
+固定为 `"agent_proposed"`。Agent 提议 → `session.typed_patches` → `meta_chat`
+drain 到 `AppState.typed_patches` → 前端 `meta_preview_typed_patch` /
+`meta_accept_typed_patch` 闭环。
+
+审查修复（`9c50dbc`）：执行 agent 初版 `inspect_tasks` 返回 note 提示而非真实
+数据、`UpdateTaskStatus` 因 `input.tasks` 为空必然失败。根因
+`CampaignRuntimeContext` 缺 tasks 字段。补字段后生产代码填 `store.list_tasks`，
+两工具接通真实数据源。
 
 验收：
 
-- Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
-- 无 active Campaign 时明确提示只能做导入卡/世界书层面的诊断。
+- ✅ Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
+- ✅ 无 active Campaign 时明确提示「当前没有 active Campaign」。
+- ✅ `propose_campaign_patch` 的 action 必须先 inspect 拿真实 target id（target
+  不存在返回 error，不存入 session）。
+
+验证：
+
+```bash
+cargo test -p storyforge-app-meta   # 101 tests, 0 failed
+cargo test -p storyforge-domain     # 136 tests, 0 failed
+cargo test -p storyforge --lib      # 51 tests, 0 failed
+cargo check --workspace             # 0 error
+```
 
 ## 阶段 5：MVU 接入 Meta 修复流
 

@@ -57,22 +57,26 @@
 
 ## Phase 3: Meta Agent 维护层
 
+**状态：已完成**（2026-06-18，PLAN-META-AGENT 阶段 1-5 全部实现）
+
 目标：把 Meta Agent 做成 Campaign 可解释性和修复入口。
 
 任务：
 
-- 增加 Campaign health check。
-- 增加“解释本轮生成”视图：intent、Plan、Subagent 输入输出、Editor 输出、Postprocess 结果。
-- Meta patch 类型化：变量修复、知识修复、角色合并、prompt module 修改。
-- patch 需要 preview、accept、dismiss。
-- MVU 分析结果接入 variable schema。
-- 统一 tool 注册中心：每个 agent 的可用工具从「各角色硬编码注册组」改为「全局注册 + 按角色配置选配 + 默认列表」，支撑运行时动态增删工具。
+- ~~增加 Campaign health check。~~ ✅ 阶段 1：`health_check.rs` + `meta_health_check` + MetaPanel 体检按钮，4 类 issue
+- ~~增加“解释本轮生成”视图。~~ ✅ 阶段 2：`explain.rs` + `meta_explain_generation` + `inspect_generation` 工具
+- ~~Meta patch 类型化。~~ ✅ 阶段 3：`typed_patch.rs`（8 action：4 health-issue + 4 agent-proposed）+ preview/accept/dismiss 闭环
+- ~~patch 需要 preview、accept、dismiss。~~ ✅ 阶段 3：4 个 Tauri 命令闭环
+- ~~MVU 分析结果接入 variable schema。~~ ✅ 阶段 5：`mvu_apply.rs` + `meta_preview_mvu_apply`/`meta_apply_mvu_schema`
+- ~~统一 tool 注册中心。~~ ✅ 第四轮 E：`tool_center.rs` + 按角色选配
+- ~~Campaign-aware Meta Tools。~~ ✅ 阶段 4：6 工具（inspect_campaign/instance/variables/knowledge/tasks + propose_campaign_patch）
 
 验收：
 
-- 用户能问“为什么这轮这样写”，系统能引用真实 provenance。
-- 用户能看到数据问题列表并接受修复。
-- Meta patch 不直接越权改数据。
+- ✅ 用户能问“为什么这轮这样写”，系统能引用真实 provenance。
+- ✅ 用户能看到数据问题列表并接受修复。
+- ✅ Meta patch 不直接越权改数据（propose → preview → accept 才写盘）。
+- ✅ Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
 
 详细计划见 `docs/PLAN-META-AGENT.md`。统一 tool 注册中心见 `docs/PLAN-TOOL-REGISTRY.md`。
 
