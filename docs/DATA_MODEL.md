@@ -111,23 +111,55 @@ RoundSummary
 
 `StoryTask` 表示导演可注入的伏笔和任务，触发条件包括轮次、故事时间、关键词等。任务不应直接变成正文，而是作为 Director tail 的结构化输入。
 
-## 推荐运行时快照
+## CampaignRuntimeContext（阶段 2 已实现）
 
-后续应新增纯应用层 DTO：
+~~后续应新增纯应用层 DTO~~ **已实现**：`crates/domain/src/campaign_runtime.rs` 定义纯域快照 `CampaignRuntimeContext`，由 Tauri 层从 `CampaignStore` 组装，传入 `app-pipeline` / `app-agent`。`app-agent` 工具只读此快照，不直接持有 `CampaignStore`。
+
+当前字段：
 
 ```text
 CampaignRuntimeContext
-  campaign
-  card
-  definitions
-  instances
-  campaign_variables
-  character_variables
-  knowledge
-  pending_tasks
-  summaries
-  world_info
-  recent_messages
+  campaign: Campaign
+  instances: Vec<CharacterInstance>
+  definitions_by_id: HashMap<Id, CharacterDefinition>
+  knowledge: Vec<CharacterKnowledgeEntry>
+  turn: u32
 ```
 
-它应由 Tauri 层从 store 组装，然后传给 `app-pipeline`。`app-agent` 工具只能读这个快照，不能直接持有 `CampaignStore`。
+辅助方法：`find_instance_by_id_or_name`、`definition_for_instance`、`resolved_persona_for`、`resolved_behavior_for`、`with_temporaries_for`（阶段 6：为未匹配角色创建临时 instance）。
+
+注：早期文档列出了 `card`、`campaign_variables`、`character_variables`、`pending_tasks`、`summaries`、`world_info`、`recent_messages` 等字段。实际实现中这些数据分别通过 `WritingContext` 的独立字段（`campaign_id`、`turn`、`pending_tasks`、`story_clock`、`world_info`、`recent_messages`）和 `Campaign.variables` / `CharacterInstance.variables` 承载，未全部合并进 `CampaignRuntimeContext`。
+
+## AgentProfileConfig（已实现）
+
+`crates/domain/src/agent_profile_config.rs` 定义两个核心结构：
+
+### AgentRunConfig
+
+单个 Agent 角色的运行时配置覆盖（全 `Option`，`None` = 使用默认值）：
+
+- `model_override: Option<String>` — 模型覆盖
+- `max_tool_rounds: Option<u32>` — 最大工具轮次
+- `tool_whitelist: Option<Vec<String>>` — 工具白名单（`None` = 默认工具集，`Some([])` = 禁用全部，`Some(list)` = 只允许列表中的）
+
+### AgentProfileConfig
+
+完整配置（持久化用）：
+
+- `id: Id`
+- `name: String`
+- `description: String`
+- `agent_configs: HashMap<AgentRole, AgentRunConfig>` — 每个角色的运行参数覆盖
+- `max_concurrent_subagents: usize` — 子 Agent 最大并发数（构造时 clamp 到 ≥1）
+- `enable_postprocess: bool` — 是否启用后处理
+- `enable_summarizer: bool` — 是否启用剧情总结
+- `source: ProfileSource` — 来源（BuiltIn / UserCreated）
+- `config_version: u32` — 版本号
+
+内置默认 ID：`builtin-default-agent-v1`，始终可用、不可删除。
+
+辅助方法：`effective_max_concurrent_subagents()`（clamp 0→1）、`sanitize()`（修正反序列化后非法字段）、`run_config_for(role)`（支持 Subagent 通配符回退）、`is_builtin()`。
+
+### ProfileConfigError
+
+当前 domain 层**未定义** `ProfileConfigError` 类型。配置校验在 Tauri 层通过 `sanitize()` 和构造函数的 clamp 逻辑处理，不使用独立错误枚举。

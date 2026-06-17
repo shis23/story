@@ -146,25 +146,51 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 
 不建议让 Meta Agent 直接参与常规写作，否则会和 Director/Editor 职责混淆。
 
+## AgentProfileConfig 运行时消费
+
+`AgentProfileConfig`（定义在 `crates/domain/src/agent_profile_config.rs`）控制 Agent 运行时参数，已在写作链路完整消费：
+
+- Director/Editor 的 `make_*_config` 从 profile 读取 `model_override` 和 `max_tool_rounds`，覆盖硬编码默认值。
+- `spawn_subagents` 接收 `max_concurrent_subagents` 和 `agent_profile_config`；子 Agent 按 profile 覆盖 model 和 max_tool_rounds。
+- `tool_whitelist` 在 Director/Subagent/PostProcessor 注册工具后通过 `filter_registry_by_whitelist` 过滤（`None` = 默认工具集，`Some([])` = 禁用全部，`Some(list)` = 只保留列表中的；未知工具名记 warning 后忽略，不 panic）。被禁用的工具 dispatch 返回 `ToolError::NotFound`，whitelist 不可绕过。
+- `enable_postprocess` / `enable_summarizer` 控制后处理：`false` 时跳过对应 LLM 调用；两者都 `false` 时发 `PostProcessSkipped`（非 `PostProcessFailed`）；无 config 时全开（向后兼容）。
+
+## 工具注册表
+
+各 Agent 角色的工具在 `crates/app-agent/src/tools.rs` 和 `crates/app-agent/src/prompts/` 中注册：
+
+| Agent | 工具 | 注册函数 |
+| --- | --- | --- |
+| Director | `search_world_info`, `get_character`, `emit_plan`, `search_vectors`, `get_recent_summary` | `register_director_tools` |
+| Subagent | `get_character`（信息隔离：有 `current_character_instance_id` 时只返回自己的 instance） | `register_subagent_tools` |
+| Editor | `compose` | `register_editor_tools` |
+| Postprocess | `emit_postprocess`（声明产出，handler 原样返回 args） | `register_postprocess_tools` |
+| CharacterExtractor | `emit_characters`（声明产出，handler 原样返回 args） | `register_character_extractor_tools` |
+
+`ToolRegistry::retain(Option<&[String]>)` 按白名单保留工具，过滤后 `tool_specs()`（发给 LLM）与 `dispatch` 同步收窄。
+
 ## 流式事件
 
-写作和重 roll 通过 `PipelineEvent` 推给前端，主要阶段：
+写作和重 roll 通过 `PipelineEvent` 推给前端（定义在 `crates/domain/src/agent.rs`），完整变体：
 
-- `Started`
-- `StateChanged`
+- `Started { session_id }`
+- `StateChanged { state }`（PipelineState：Generating / Editing / Review / Committed / Aborted）
 - `DirectorStarted`
-- `DirectorProgress`
-- `DirectorDone`
-- `SubagentStarted`
-- `SubagentProgress`
-- `SubagentDone`
+- `DirectorProgress { delta }`
+- `DirectorDone { scene_brief, subagent_count }`
+- `SubagentStarted { character_id, index, total }`
+- `SubagentProgress { character_id, index, delta }`
+- `SubagentDone { character_id, index, full_text }`
+- `SubagentCancelled { character_id, index }`
 - `EditorStarted`
-- `EditorProgress`
-- `DraftReady`
+- `EditorProgress { delta }`
+- `DraftReady { text }`
 - `PostProcessStarted`
-- `PostProcessDone`
-- `SummaryDone`
-- `Committed`
-- `Error`
+- `PostProcessDone { knowledge_count, variable_count, task_count }`
+- `PostProcessFailed { reason }`（best-effort，不阻断成文）
+- `PostProcessSkipped { reason }`（AgentProfileConfig 关闭 postprocess/summarizer 时发出，区别于真失败）
+- `SummaryDone { char_count }`
+- `Committed { session_id, variant_id }`
+- `Error { message }`
 
 前端应把这些事件视为流水线观察信号，不应把临时事件当成持久状态真相源。
