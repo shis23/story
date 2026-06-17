@@ -109,6 +109,52 @@ impl ToolRegistry {
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
+
+    /// 按白名单保留已注册的工具。
+    ///
+    /// 语义（与 `AgentRunConfig::tool_whitelist` 一致）：
+    /// - `None`：不改动（使用当前已注册的全部默认工具）。
+    /// - `Some([])`：清空所有工具（禁用全部工具）。
+    /// - `Some(names)`：只保留 `names` 中存在的工具；`names` 里未注册的名称不 panic，
+    ///   由调用方决定是否记录 warning（见 `filter_registry_by_whitelist`）。
+    ///
+    /// 过滤后 `tool_specs()`（发给 LLM 的 tools 数组）和 `dispatch` 同步收窄，
+    /// 被禁用的工具若被调用会返回 `ToolError::NotFound`，不会绕过 whitelist。
+    pub fn retain(&mut self, whitelist: Option<&[String]>) {
+        match whitelist {
+            None => {}
+            Some(names) => {
+                self.tools.retain(|k, _| names.iter().any(|n| n == k));
+            }
+        }
+    }
+}
+
+/// 按 `AgentRunConfig::tool_whitelist` 过滤 registry。
+///
+/// - `None`：不动（默认工具集）。
+/// - `Some([])`：清空全部工具。
+/// - `Some(list)`：只保留 list 中已注册的工具；list 里未注册的名称记 warning 后忽略，
+///   不 panic（满足「未知工具名不能 panic」的要求）。
+///
+/// `role_label` 仅用于日志，便于排查是哪个角色配了不存在的工具。
+pub fn filter_registry_by_whitelist(
+    registry: &mut ToolRegistry,
+    whitelist: Option<&[String]>,
+    role_label: &str,
+) {
+    if let Some(names) = whitelist {
+        // 先校验：列出白名单里不存在于 registry 的名称，记 warning
+        for n in names {
+            if !registry.has(n) {
+                tracing::warn!(
+                    target: "app-agent",
+                    "{role_label}: tool_whitelist 引用了未注册的工具 '{n}'，忽略"
+                );
+            }
+        }
+        registry.retain(Some(names));
+    }
 }
 
 // ─── 预置工具实现 ──────────────────────────────────────────────────────────
@@ -722,5 +768,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["name"], "Seraphina");
+    }
+
+    // ── tool_whitelist：ToolRegistry::retain / filter_registry_by_whitelist ──
+
+    fn registry_with_director_tools() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        registry
+    }
+
+    /// None = 不动，保留所有默认工具
+    #[test]
+    fn retain_none_keeps_all_tools() {
+        let registry = registry_with_director_tools();
+        let before = registry.tool_specs().len();
+        let mut r = registry;
+        r.retain(None);
+        assert_eq!(r.tool_specs().len(), before, "None 不应改动工具集");
+    }
+
+    /// Some([]) = 清空全部工具
+    #[tokio::test]
+    async fn retain_empty_vec_clears_all_tools() {
+        let mut registry = registry_with_director_tools();
+        registry.retain(Some(&[]));
+        assert!(registry.tool_specs().is_empty(), "Some([]) 应清空所有工具");
+        // dispatch 被禁用的工具应返回 NotFound，不绕过 whitelist
+        let res = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({}),
+                Arc::new(ToolContext {
+                    characters: vec![],
+                    world_info: None,
+                    vector_store: None,
+                    archived_summaries: vec![],
+                    campaign_runtime: None,
+                    current_character_instance_id: None,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(ToolError::NotFound(_))),
+            "被禁用的工具 dispatch 应返回 NotFound，实际: {res:?}"
+        );
+    }
+
+    /// Some(list) = 只保留列表中的工具
+    #[test]
+    fn retain_partial_list_keeps_only_listed() {
+        let mut registry = registry_with_director_tools();
+        let whitelist = vec!["get_character".to_string(), "emit_plan".to_string()];
+        registry.retain(Some(&whitelist));
+        let names: Vec<String> = registry
+            .tool_specs()
+            .iter()
+            .map(|s| s.function.name.clone())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"get_character".to_string()));
+        assert!(names.contains(&"emit_plan".to_string()));
+        // 不在白名单的工具已被移除
+        assert!(!registry.has("search_world_info"));
+    }
+
+    /// 白名单里的未知工具名不能 panic，被忽略
+    #[test]
+    fn filter_unknown_tool_name_does_not_panic() {
+        let mut registry = registry_with_director_tools();
+        let whitelist = vec![
+            "get_character".to_string(),
+            "this_tool_does_not_exist".to_string(),
+        ];
+        // 不应 panic
+        filter_registry_by_whitelist(&mut registry, Some(&whitelist), "test-role");
+        // 已注册的保留，未注册的被忽略
+        assert!(registry.has("get_character"));
+        assert_eq!(registry.tool_specs().len(), 1);
+    }
+
+    /// filter_registry_by_whitelist(None) 不改动
+    #[test]
+    fn filter_none_is_noop() {
+        let registry = registry_with_director_tools();
+        let before = registry.tool_specs().len();
+        let mut r = registry;
+        filter_registry_by_whitelist(&mut r, None, "test-role");
+        assert_eq!(r.tool_specs().len(), before);
     }
 }

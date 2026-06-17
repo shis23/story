@@ -524,6 +524,8 @@ pub async fn spawn_subagents(
         let subagent_max_rounds = subagent_run_config
             .and_then(|rc| rc.max_tool_rounds)
             .unwrap_or(10);
+        // 子 Agent tool_whitelist（None=默认 get_character，Some=过滤/清空）
+        let subagent_whitelist = subagent_run_config.and_then(|rc| rc.tool_whitelist.clone());
 
         // ── 阶段 4：Campaign 模式下按 character_id 匹配 instance ──
         let matched_instance = campaign_runtime
@@ -594,6 +596,12 @@ pub async fn spawn_subagents(
         // 注册子 Agent 工具（get_character 限制为当前 instance）
         let mut registry = ToolRegistry::new();
         crate::tools::register_subagent_tools(&mut registry);
+        // 应用子 Agent tool_whitelist（None=默认，Some=过滤/清空）
+        crate::tools::filter_registry_by_whitelist(
+            &mut registry,
+            subagent_whitelist.as_deref(),
+            &format!("Subagent({character_id})"),
+        );
 
         let handle = tokio::spawn(async move {
             // 排队等许可（超出并发上限的任务在此 await，不会丢弃）

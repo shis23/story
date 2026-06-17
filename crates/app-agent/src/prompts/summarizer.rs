@@ -6,6 +6,7 @@
 //! 改 prompt 只改本文件的常量。
 
 use storyforge_domain::agent::AgentRole;
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 
 use crate::AgentConfig;
 
@@ -32,12 +33,21 @@ pub const SUMMARIZER_SYSTEM_PROMPT: &str = r#"你是本轮剧情总结助手（r
 只输出最终摘要正文，不要标题、不要解释、不要 markdown 格式标记。直接开始写摘要。"#;
 
 /// 构造剧情总结 Agent 的运行配置
-pub fn make_summarizer_config() -> AgentConfig {
+///
+/// 若提供 `agent_profile_config`，从中读取 Summarizer 的 `model_override` 和
+/// `max_tool_rounds` 覆盖硬编码默认值（无 config = 当前硬编码值，向后兼容）。
+pub fn make_summarizer_config(agent_profile_config: Option<&AgentProfileConfig>) -> AgentConfig {
+    let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
+        let run = apc.run_config_for(&AgentRole::Summarizer);
+        (run.model_override.clone(), run.max_tool_rounds)
+    } else {
+        (None, None)
+    };
     AgentConfig {
         role: AgentRole::Summarizer,
         system_prompt: SUMMARIZER_SYSTEM_PROMPT.to_string(),
-        max_tool_rounds: 3,
-        model: "deepseek-chat".to_string(),
+        max_tool_rounds: rounds_override.unwrap_or(3),
+        model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
     }
 }
@@ -60,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_config_has_correct_role() {
-        let cfg = make_summarizer_config();
+        let cfg = make_summarizer_config(None);
         assert_eq!(cfg.role, AgentRole::Summarizer);
         assert!(cfg.max_tool_rounds <= 5);
     }

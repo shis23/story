@@ -291,6 +291,8 @@ pub enum PipelineEvent {
     },
     /// 后处理失败（best-effort，不阻断成文）
     PostProcessFailed { reason: String },
+    /// 后处理被 AgentProfileConfig 关闭跳过（区别于失败：明确是配置关闭，非 LLM 出错）
+    PostProcessSkipped { reason: String },
     /// 本轮剧情总结完成
     SummaryDone { char_count: usize },
     /// 完成（已写入树）

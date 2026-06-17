@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use storyforge_domain::agent::PostProcessResult;
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 
 use crate::postprocess::{PostProcessError, run_postprocess};
 use crate::runtime::AgentRuntime;
@@ -24,9 +25,9 @@ use crate::summarizer::{SummarizerError, run_summarizer};
 /// 调用方拿到结果后自行决定是否落盘 CampaignStore。
 #[derive(Debug, Default)]
 pub struct PostProcessOutcome {
-    /// 本轮剧情摘要（总结 Agent 成功则有；失败为 None）
+    /// 本轮剧情摘要（总结 Agent 成功则有；失败或被 `enable_summarizer=false` 关闭为 None）
     pub summary: Option<String>,
-    /// 后处理三件套（后处理 Agent 成功且有产出则有；失败为 None）
+    /// 后处理三件套（后处理 Agent 成功且有产出则有；失败或被 `enable_postprocess=false` 关闭为 None）
     pub post_process: Option<PostProcessResult>,
 }
 
@@ -34,6 +35,13 @@ pub struct PostProcessOutcome {
 ///
 /// 入参 `runtime` 用引用即可——两个子任务共享同一个 runtime（内部 Arc 包装了 LLM client），
 /// 子任务的 future 自己 move 进 tokio::spawn。
+///
+/// 开关语义（来自 `AgentProfileConfig`）：
+/// - `enable_summarizer=false`：不调 summarizer LLM，`outcome.summary` 为 None。
+/// - `enable_postprocess=false`：不调 postprocess LLM，`outcome.post_process` 为 None。
+/// - 两者都 false：安静跳过，两个 future 都不发 LLM 请求。
+///
+/// `agent_profile_config`（可选）同时覆盖两个 Agent 的 model/rounds 和 PostProcessor 的 tool_whitelist。
 ///
 /// 取消语义：传入的 `cancel` 被 clone 两份分别交给两个子任务，主流水线取消时联动。
 pub async fn run_postprocess_pipeline(
@@ -45,6 +53,9 @@ pub async fn run_postprocess_pipeline(
     turn: u32,
     story_clock: &str,
     cancel: watch::Receiver<bool>,
+    enable_postprocess: bool,
+    enable_summarizer: bool,
+    agent_profile_config: Option<&AgentProfileConfig>,
 ) -> PostProcessOutcome {
     // 各 clone 一份 cancel 给两个子任务
     let cancel_summary = cancel.clone();
@@ -67,12 +78,17 @@ pub async fn run_postprocess_pipeline(
     // 用 tokio::try_join 不合适（任一 Err 会短路，违背「互不影响」），改用 join! + 内部 catch。
 
     let summary_fut = async {
+        if !enable_summarizer {
+            info!(target: "postprocess-pipeline", "剧情总结已被 AgentProfileConfig 关闭，跳过");
+            return None;
+        }
         match run_summarizer(
             runtime,
             &final_for_summary,
             &scene_for_summary,
             turn,
             cancel_summary,
+            agent_profile_config,
         )
         .await
         {
@@ -96,6 +112,10 @@ pub async fn run_postprocess_pipeline(
     };
 
     let postproc_fut = async {
+        if !enable_postprocess {
+            info!(target: "postprocess-pipeline", "后处理已被 AgentProfileConfig 关闭，跳过");
+            return None;
+        }
         match run_postprocess(
             runtime,
             &final_for_postproc,
@@ -104,6 +124,7 @@ pub async fn run_postprocess_pipeline(
             turn,
             &clock_for_postproc,
             cancel_postproc,
+            agent_profile_config,
         )
         .await
         {
@@ -182,6 +203,9 @@ mod tests {
             1,
             "第1天",
             rx,
+            true,
+            true,
+            None,
         )
         .await;
 
@@ -215,11 +239,94 @@ mod tests {
             1,
             "第1天",
             rx,
+            true,
+            true,
+            None,
         )
         .await;
 
         // 取消时 best-effort：两个都失败 → 都为 None
         assert!(outcome.summary.is_none(), "取消后总结应为 None");
         assert!(outcome.post_process.is_none(), "取消后后处理应为 None");
+    }
+
+    // ── enable_postprocess / enable_summarizer 开关测试 ──
+
+    #[tokio::test]
+    async fn test_pipeline_summarizer_disabled_skips_llm() {
+        let runtime = make_runtime();
+        let (_tx, rx) = watch::channel(false);
+
+        let outcome = run_postprocess_pipeline(
+            &runtime,
+            "成文",
+            "场景",
+            &["角色A".into()],
+            &["hp".into()],
+            1,
+            "第1天",
+            rx,
+            true,  // postprocess 开
+            false, // summarizer 关
+            None,
+        )
+        .await;
+
+        assert!(outcome.summary.is_none(), "summarizer 关闭应返回 None");
+        assert!(outcome.post_process.is_some(), "postprocess 开启应正常产出");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_postprocess_disabled_skips_llm() {
+        let runtime = make_runtime();
+        let (_tx, rx) = watch::channel(false);
+
+        let outcome = run_postprocess_pipeline(
+            &runtime,
+            "成文",
+            "场景",
+            &["角色A".into()],
+            &["hp".into()],
+            1,
+            "第1天",
+            rx,
+            false, // postprocess 关
+            true,  // summarizer 开
+            None,
+        )
+        .await;
+
+        assert!(
+            outcome.post_process.is_none(),
+            "postprocess 关闭应返回 None"
+        );
+        assert!(outcome.summary.is_some(), "summarizer 开启应正常产出");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_both_disabled_returns_all_none() {
+        let runtime = make_runtime();
+        let (_tx, rx) = watch::channel(false);
+
+        let outcome = run_postprocess_pipeline(
+            &runtime,
+            "成文",
+            "场景",
+            &["角色A".into()],
+            &["hp".into()],
+            1,
+            "第1天",
+            rx,
+            false,
+            false,
+            None,
+        )
+        .await;
+
+        assert!(outcome.summary.is_none(), "summarizer 关闭应返回 None");
+        assert!(
+            outcome.post_process.is_none(),
+            "postprocess 关闭应返回 None"
+        );
     }
 }

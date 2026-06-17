@@ -1383,6 +1383,10 @@ impl WritingEvent {
                 "postprocess_failed".into(),
                 serde_json::json!({ "reason": reason }),
             ),
+            PipelineEvent::PostProcessSkipped { reason } => (
+                "postprocess_skipped".into(),
+                serde_json::json!({ "reason": reason }),
+            ),
             PipelineEvent::SummaryDone { char_count } => (
                 "summary_done".into(),
                 serde_json::json!({ "char_count": char_count }),

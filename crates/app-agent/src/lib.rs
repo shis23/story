@@ -25,4 +25,4 @@ pub use runtime::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
     SUBAGENT_HINT_MARKER, inject_hint_into_editor, inject_hint_into_subagent, spawn_subagents,
 };
-pub use tools::{ToolContext, ToolError, ToolRegistry};
+pub use tools::{ToolContext, ToolError, ToolRegistry, filter_registry_by_whitelist};

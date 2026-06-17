@@ -6,6 +6,7 @@
 //! 改 prompt 只改本文件的常量；改输出格式同步改 `postprocess::parse_*`。
 
 use storyforge_domain::agent::AgentRole;
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 
 use crate::AgentConfig;
 use crate::tools::ToolRegistry;
@@ -70,12 +71,21 @@ pub const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是后处理助手（postproce
 【重要】抽取范围严格限制在「提供的在场角色列表」内，不要给不在场的角色抽知识。"#;
 
 /// 构造后处理 Agent 的运行配置
-pub fn make_postprocess_config() -> AgentConfig {
+///
+/// 若提供 `agent_profile_config`，从中读取 PostProcessor 的 `model_override` 和
+/// `max_tool_rounds` 覆盖硬编码默认值（无 config = 当前硬编码值，向后兼容）。
+pub fn make_postprocess_config(agent_profile_config: Option<&AgentProfileConfig>) -> AgentConfig {
+    let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
+        let run = apc.run_config_for(&AgentRole::PostProcessor);
+        (run.model_override.clone(), run.max_tool_rounds)
+    } else {
+        (None, None)
+    };
     AgentConfig {
         role: AgentRole::PostProcessor,
         system_prompt: POSTPROCESS_SYSTEM_PROMPT.to_string(),
-        max_tool_rounds: 5,
-        model: "deepseek-chat".to_string(),
+        max_tool_rounds: rounds_override.unwrap_or(5),
+        model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
     }
 }
@@ -180,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_config_has_correct_role() {
-        let cfg = make_postprocess_config();
+        let cfg = make_postprocess_config(None);
         assert_eq!(cfg.role, AgentRole::PostProcessor);
     }
 

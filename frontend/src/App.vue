@@ -5,6 +5,7 @@ import ChatMessage from './components/ChatMessage.vue'
 import Composer from './components/Composer.vue'
 import PipelinePanel from './components/PipelinePanel.vue'
 import AgentConfigCard from './components/AgentConfigCard.vue'
+import AgentProfileManager from './components/AgentProfileManager.vue'
 import CharacterDetail from './components/CharacterDetail.vue'
 import CharacterList from './components/CharacterList.vue'
 import LogPanel from './components/LogPanel.vue'
@@ -795,6 +796,9 @@ function handlePipelineEvent(event) {
         ref="agentConfigRef"
         @open-connection-config="showConnConfig = true"
       />
+
+      <!-- 高玩模式：Agent Profile 运行参数配置（模型/工具白名单/后处理开关） -->
+      <AgentProfileManager v-if="powerMode" />
 
       <!-- 高玩模式：日志面板 -->
       <div v-if="powerMode" class="mx-4 mt-3">

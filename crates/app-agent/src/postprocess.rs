@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use storyforge_domain::Id;
 use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
@@ -20,7 +21,7 @@ use crate::prompts::{
     build_postprocess_user_msg, make_postprocess_config, register_postprocess_tools,
 };
 use crate::runtime::AgentRuntime;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, filter_registry_by_whitelist};
 use crate::{AgentConfig, AgentError};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,9 @@ pub enum PostProcessError {
 }
 
 /// 跑后处理 Agent，产出三件套
+///
+/// `agent_profile_config`（可选）用于覆盖 PostProcessor 的 model/rounds 并过滤 tool_whitelist。
+/// 传 None = 当前硬编码默认值，向后兼容。
 pub async fn run_postprocess(
     runtime: &AgentRuntime,
     final_text: &str,
@@ -38,8 +42,9 @@ pub async fn run_postprocess(
     turn: u32,
     story_clock: &str,
     cancel: watch::Receiver<bool>,
+    agent_profile_config: Option<&AgentProfileConfig>,
 ) -> Result<PostProcessResult, PostProcessError> {
-    let config: AgentConfig = make_postprocess_config();
+    let config: AgentConfig = make_postprocess_config(agent_profile_config);
     let user_msg = build_postprocess_user_msg(
         final_text,
         present_characters,
@@ -50,6 +55,15 @@ pub async fn run_postprocess(
 
     let mut registry = ToolRegistry::new();
     register_postprocess_tools(&mut registry);
+    // 应用 PostProcessor tool_whitelist（None=默认，Some=过滤/清空）
+    let wl = agent_profile_config
+        .map(|apc| {
+            apc.run_config_for(&storyforge_domain::agent::AgentRole::PostProcessor)
+                .tool_whitelist
+                .as_deref()
+        })
+        .flatten();
+    filter_registry_by_whitelist(&mut registry, wl, "PostProcessor");
 
     info!(target: "postprocess", "开始后处理（在场 {} 角色）", present_characters.len());
 

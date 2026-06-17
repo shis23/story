@@ -18,7 +18,7 @@ use storyforge_domain::conversation::Provenance;
 
 use storyforge_app_agent::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
-    SUBAGENT_HINT_MARKER, ToolContext, ToolRegistry, spawn_subagents,
+    SUBAGENT_HINT_MARKER, ToolContext, ToolRegistry, filter_registry_by_whitelist, spawn_subagents,
     tools::register_director_tools,
 };
 use storyforge_app_conversation::{
@@ -259,6 +259,14 @@ impl PipelineOrchestrator {
         );
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
+        // 应用 AgentProfileConfig 的 tool_whitelist（None=默认全部，Some=只保留指定工具）
+        if let Some(apc) = ctx.agent_profile_config.as_ref() {
+            let wl = apc
+                .run_config_for(&AgentRole::Director)
+                .tool_whitelist
+                .as_deref();
+            filter_registry_by_whitelist(&mut director_registry, wl, "Director");
+        }
 
         // §22 cache 友好布局：system（role_directive + 模块 + 蓝灯）+ history（对话历史）+ tail（意图/角色/任务）
         // 对话历史作为独立消息段（而非塞进 user 文本），保证 system+history 前缀稳定、cache 命中。
@@ -559,10 +567,28 @@ impl PipelineOrchestrator {
     ) -> Option<storyforge_app_agent::PostProcessOutcome> {
         let campaign_id = ctx.campaign_id.clone()?;
 
+        // 从 AgentProfileConfig 读取开关和配置覆盖（无 config = 全开 + 硬编码默认，向后兼容）
+        let (enable_postprocess, enable_summarizer) = ctx
+            .agent_profile_config
+            .as_ref()
+            .map(|c| (c.enable_postprocess, c.enable_summarizer))
+            .unwrap_or((true, true));
+
+        // 两者都关：安静跳过，不发 PostProcessStarted，只发明确的 Skipped，不当失败处理
+        if !enable_postprocess && !enable_summarizer {
+            info!(target: "app-pipeline", "后处理被 AgentProfileConfig 全部关闭，跳过（campaign={campaign_id}）");
+            let _ = event_tx.send(PipelineEvent::PostProcessSkipped {
+                reason: "enable_postprocess=false 且 enable_summarizer=false（已按配置跳过）"
+                    .into(),
+            });
+            return None;
+        }
+
         let _ = event_tx.send(PipelineEvent::PostProcessStarted);
         info!(
             target: "app-pipeline",
-            "后处理流水线启动: campaign={campaign_id} turn={}", ctx.turn
+            "后处理流水线启动: campaign={campaign_id} turn={} postprocess={} summarizer={}",
+            ctx.turn, enable_postprocess, enable_summarizer
         );
 
         let outcome = storyforge_app_agent::run_postprocess_pipeline(
@@ -574,17 +600,22 @@ impl PipelineOrchestrator {
             ctx.turn,
             &ctx.story_clock,
             cancel,
+            enable_postprocess,
+            enable_summarizer,
+            ctx.agent_profile_config.as_ref(),
         )
         .await;
 
-        // 摘要完成事件
-        if let Some(s) = &outcome.summary {
-            let _ = event_tx.send(PipelineEvent::SummaryDone {
-                char_count: s.chars().count(),
-            });
+        // 摘要完成事件：仅在 summarizer 开启且有产出时发
+        if enable_summarizer {
+            if let Some(s) = &outcome.summary {
+                let _ = event_tx.send(PipelineEvent::SummaryDone {
+                    char_count: s.chars().count(),
+                });
+            }
         }
 
-        // 后处理完成/失败事件
+        // 后处理完成/失败/跳过事件
         match &outcome.post_process {
             Some(r) => {
                 let _ = event_tx.send(PipelineEvent::PostProcessDone {
@@ -594,9 +625,17 @@ impl PipelineOrchestrator {
                 });
             }
             None => {
-                let _ = event_tx.send(PipelineEvent::PostProcessFailed {
-                    reason: "后处理 Agent 调用失败或被取消（best-effort，不阻断成文）".into(),
-                });
+                if enable_postprocess {
+                    // 开了但失败（best-effort）：发 Failed
+                    let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                        reason: "后处理 Agent 调用失败或被取消（best-effort，不阻断成文）".into(),
+                    });
+                } else {
+                    // 明确关闭：发 Skipped，不发误导性的 Failed
+                    let _ = event_tx.send(PipelineEvent::PostProcessSkipped {
+                        reason: "enable_postprocess=false（已按配置跳过后处理 Agent）".into(),
+                    });
+                }
             }
         }
 
@@ -705,6 +744,14 @@ impl PipelineOrchestrator {
             );
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
+            // 应用 AgentProfileConfig 的 tool_whitelist（None=默认全部，Some=只保留指定工具）
+            if let Some(apc) = ctx.agent_profile_config.as_ref() {
+                let wl = apc
+                    .run_config_for(&AgentRole::Director)
+                    .tool_whitelist
+                    .as_deref();
+                filter_registry_by_whitelist(&mut director_registry, wl, "Director");
+            }
 
             // 导演 intent：复用旧 Plan 的场景作 intent + 可选 hint
             let intent_text = provenance_old
@@ -2159,6 +2206,74 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, PipelineEvent::SummaryDone { .. })),
             "应有 SummaryDone"
+        );
+    }
+
+    /// AgentProfileConfig 把 enable_postprocess/enable_summarizer 都关 → 不调 LLM，
+    /// 不发 PostProcessStarted，发 PostProcessSkipped，不发误导性的 PostProcessFailed。
+    #[tokio::test]
+    async fn test_postprocess_both_disabled_emits_skipped_not_failed() {
+        use std::collections::HashMap;
+        use storyforge_domain::agent_profile_config::AgentProfileConfig;
+        use storyforge_domain::prompt_module::ProfileSource;
+
+        let (orch, conv_store) = make_orchestrator();
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.campaign_id = Some(Id::new());
+        ctx.agent_profile_config = Some(AgentProfileConfig::new(
+            Id::from_str("both-disabled-test"),
+            "test".into(),
+            String::new(),
+            HashMap::new(),
+            4,
+            false, // enable_postprocess
+            false, // enable_summarizer
+            ProfileSource::UserCreated,
+            1,
+        ));
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        let outcome = orch
+            .run_postprocess(
+                "成文",
+                "场景",
+                &["林医生".into()],
+                &["hp".into()],
+                &ctx,
+                &event_tx,
+                cancel,
+            )
+            .await;
+
+        // 两者都关 → 安静跳过（注意：run_postprocess 的 None 语义是「无 campaign 或全关跳过」）
+        assert!(outcome.is_none(), "两者都关应返回 None");
+
+        let mut events = vec![];
+        while let Ok(e) = event_rx.try_recv() {
+            events.push(e);
+        }
+        // 不应发 PostProcessStarted
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessStarted)),
+            "全关时不应发 PostProcessStarted"
+        );
+        // 不应发 PostProcessFailed（区别于真失败）
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessFailed { .. })),
+            "全关时不应发 PostProcessFailed（应发 Skipped）"
+        );
+        // 应发 PostProcessSkipped
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::PostProcessSkipped { .. })),
+            "全关时应发 PostProcessSkipped，实际事件: {events:?}"
         );
     }
 

@@ -89,9 +89,11 @@ Respect these facts unless the current task explicitly changes them:
 - `fill_agent_profile_context` loads active config into `WritingContext`.
 - Director/Editor `make_*_config` apply `model_override` and `max_tool_rounds` from profile. No config = current hardcoded defaults.
 - `spawn_subagents` accepts `max_concurrent_subagents` and `agent_profile_config` parameters. Subagent model/rounds are overridden per-profile.
-- `enable_postprocess` / `enable_summarizer` are stored but NOT consumed at runtime in this pass.
-- `tool_whitelist` is stored but NOT filtered at runtime in this pass.
+- `tool_whitelist` is consumed at runtime via `ToolRegistry::retain` / `filter_registry_by_whitelist`. Director/Subagent/PostProcessor registries are filtered after tool registration (None=default tools, Some([])=disable all, Some(list)=allow only listed; unknown tool names are warned and ignored, never panic). Dispatching a removed tool returns `ToolError::NotFound` — whitelist cannot be bypassed.
+- `enable_postprocess` / `enable_summarizer` are consumed at runtime: `run_postprocess_pipeline` takes both flags and skips the corresponding LLM call (returning `None`) when false; `PipelineOrchestrator::run_postprocess` reads them from the profile. When both are off it emits `PipelineEvent::PostProcessSkipped` (not `PostProcessFailed`), so a deliberate disable is not mistaken for an error.
+- `PostProcessSkipped { reason }` is a `PipelineEvent` variant (serde-compatible) emitted when postprocess/summarizer is disabled by config; Tauri serializes it as `postprocess_skipped`.
 - Frontend API wrappers in `frontend/src/tauri-api.js`: `listAgentProfileConfigs`, `getAgentProfileConfig`, `getActiveAgentProfileConfig`, `saveAgentProfileConfig`, `deleteAgentProfileConfig`, `setActiveAgentProfileConfig`.
+- Frontend management UI in `frontend/src/components/AgentProfileManager.vue` (mounted under power mode, after `AgentConfigCard`): list/switch/duplicate/delete/edit/save profiles, including per-role `model_override` / `max_tool_rounds` / `tool_whitelist` (comma-separated) for Director/Editor/Subagent:*/Summarizer/PostProcessor, plus `max_concurrent_subagents` / `enable_postprocess` / `enable_summarizer`. Built-in default is read-only and not deletable; custom profiles are deletable. (Note: `AgentConfigCard.vue` is the *PromptProfile module selector*, a separate system — not the AgentProfileConfig editor.)
 
 ## Execution Process
 

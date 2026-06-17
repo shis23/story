@@ -6,6 +6,7 @@
 use tokio::sync::watch;
 use tracing::info;
 
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::llm::ChatResponse;
 
 use crate::prompts::{build_summarizer_user_msg, make_summarizer_config};
@@ -20,14 +21,18 @@ pub enum SummarizerError {
 }
 
 /// 跑剧情总结 Agent，返回摘要文本
+///
+/// `agent_profile_config`（可选）用于覆盖 Summarizer 的 model/rounds。
+/// 传 None = 当前硬编码默认值，向后兼容。Summarizer 无工具，tool_whitelist 不适用。
 pub async fn run_summarizer(
     runtime: &AgentRuntime,
     final_text: &str,
     scene_brief: &str,
     turn: u32,
     cancel: watch::Receiver<bool>,
+    agent_profile_config: Option<&AgentProfileConfig>,
 ) -> Result<String, SummarizerError> {
-    let config: AgentConfig = make_summarizer_config();
+    let config: AgentConfig = make_summarizer_config(agent_profile_config);
     let user_msg = build_summarizer_user_msg(final_text, scene_brief, turn);
     let registry = ToolRegistry::new(); // 总结 Agent 无工具，纯输出文本
 
@@ -70,7 +75,7 @@ mod tests {
         let runtime = AgentRuntime::new(client, ctx);
         let (_tx, rx) = tokio::sync::watch::channel(false);
 
-        let summary = run_summarizer(&runtime, "测试成文", "测试场景", 1, rx)
+        let summary = run_summarizer(&runtime, "测试成文", "测试场景", 1, rx, None)
             .await
             .unwrap();
         assert!(!summary.is_empty());

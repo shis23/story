@@ -69,12 +69,16 @@
 - `crates/domain/src/agent_profile_config.rs` **已实现**：`AgentRunConfig`（model_override/max_tool_rounds/tool_whitelist）+ `AgentProfileConfig`（agent_configs/max_concurrent_subagents/enable_postprocess/enable_summarizer/source/config_version）+ 内置默认 `builtin-default-agent-v1`。支持 Subagent 通配符回退。serde 兼容旧/部分 JSON。
 - `crates/tauri-app/src/module_store.rs::AgentProfileConfigStore` **已实现**：JSON 文件 CRUD（`agent_profile_configs.json` + `active_agent_profile_config.json`），内置默认始终可用不可删除。
 - `crates/tauri-app/src/lib.rs` **已实现**：6 个 Tauri commands（list/get/get_active/save/delete/set_active agent_profile_configs）。`fill_agent_profile_context` 加载活跃配置到 `WritingContext`。
-- `crates/app-pipeline/src/lib.rs::WritingContext` **已扩展**：`agent_profile_config: Option<AgentProfileConfig>`。`make_director_config` / `make_editor_config` 从 profile 读取 model_override 和 max_tool_rounds。`spawn_subagents` 接收 max_concurrent_subagents 和 agent_profile_config；并发配置为 `0` 时通过 `effective_max_concurrent_subagents()` 按 `1` 执行，避免调度挂死。
-- `crates/app-agent/src/runtime.rs::spawn_subagents` **已扩展**：接受 `max_concurrent_subagents` 和 `agent_profile_config` 参数，子 Agent 按 profile 覆盖 model 和 max_tool_rounds。
+- `crates/app-pipeline/src/lib.rs::WritingContext` **已扩展**：`agent_profile_config: Option<AgentProfileConfig>`。`make_director_config` / `make_editor_config` 从 profile 读取 model_override 和 max_tool_rounds。`spawn_subagents` 接收 max_concurrent_subagents 和 agent_profile_config；并发配置为 `0` 时通过 `effective_max_concurrent_subagents()` 按 `1` 执行，避免调度挂死。Director 注册工具后用 `filter_registry_by_whitelist` 按 profile 过滤 tool_whitelist。
+- `crates/app-agent/src/runtime.rs::spawn_subagents` **已扩展**：接受 `max_concurrent_subagents` 和 `agent_profile_config` 参数，子 Agent 按 profile 覆盖 model 和 max_tool_rounds；每个子 Agent 的 registry 按 profile `tool_whitelist` 过滤。
+- `crates/app-agent/src/tools.rs` **已扩展**：`ToolRegistry::retain(Option<&[String]>)` 按白名单保留工具（None=不动，Some([])=清空，Some(list)=只保留列表）；公共 helper `filter_registry_by_whitelist` 对未知工具名记 warning 后忽略、不 panic。过滤后 `tool_specs()`（发给 LLM）与 `dispatch` 同步收窄，被禁用的工具 dispatch 返回 `ToolError::NotFound`，不可绕过 whitelist。
+- `crates/app-agent/src/pipeline_postprocess.rs::run_postprocess_pipeline` **已扩展**：新增 `enable_postprocess` / `enable_summarizer` / `agent_profile_config` 参数；某开关 false 时跳过对应 LLM 调用、对应字段为 None；两者都 false 时两个子 future 都不发请求（安静跳过）。
+- `crates/app-agent/src/postprocess.rs::run_postprocess` / `summarizer.rs::run_summarizer` / `prompts/{postprocess,summarizer}.rs::make_*_config` **已扩展**：接收 `Option<&AgentProfileConfig>`，PostProcessor/Summarizer 的 model/rounds 按 profile 覆盖；PostProcessor 注册后按 profile `tool_whitelist` 过滤。
+- `crates/app-pipeline/src/lib.rs::run_postprocess` **已扩展**：从 profile 读 `enable_postprocess`/`enable_summarizer` 传给 `run_postprocess_pipeline`；两者都关时不发 `PostProcessStarted`、改发新的 `PipelineEvent::PostProcessSkipped`（区别于真失败的 `PostProcessFailed`）；单关 summarizer 时不发 `SummaryDone`；无 config 时全开（向后兼容）。
+- `crates/domain/src/agent.rs::PipelineEvent` **新增** `PostProcessSkipped { reason }` 变体（serde 兼容），Tauri 序列化为 `postprocess_skipped`。
 - `frontend/src/tauri-api.js` **已实现**：6 个 wrapper（listAgentProfileConfigs/getAgentProfileConfig/getActiveAgentProfileConfig/saveAgentProfileConfig/deleteAgentProfileConfig/setActiveAgentProfileConfig）。
-- `enable_postprocess` / `enable_summarizer` **存储已支持，运行时未消费**。
-- `tool_whitelist` **存储已支持，运行时未过滤**。
-- 前端 UI 编辑器**未实现**。
+- `frontend/src/components/AgentProfileManager.vue` **已实现**：power 模式下的 AgentProfileConfig 管理 UI（列在 `AgentConfigCard` 之后）。支持列/切活跃/复制/删除/编辑/保存；可编辑 name/description/max_concurrent_subagents/enable_postprocess/enable_summarizer 以及 Director/Editor/Subagent:*/Summarizer/PostProcessor 各自的 model_override/max_tool_rounds/tool_whitelist（逗号分隔）。内置默认只读不可删除。注意：`AgentConfigCard.vue` 是 PromptProfile 模块选择器（另一套体系），不是 AgentProfileConfig 编辑器。
+- `enable_postprocess` / `enable_summarizer` / `tool_whitelist` **均已运行时消费**（不再是「存储但未消费」）。
 
 因此 `ARCHITECTURE-AUDIT.md` 和 `PLAN-CAMPAIGN-MAINLINE.md` 的主线判断与代码一致。
 

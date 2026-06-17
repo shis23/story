@@ -1,6 +1,6 @@
 # 计划：可配置 Agent Profile 体系
 
-> 状态：阶段 1-3 已实现（backend），阶段 4 未实现（UI）
+> 状态：阶段 1-4 已实现（backend 闭环 + 前端 UI），阶段 5（校验/迁移/导入导出）未实现
 > 目标读者：可交给小模型按阶段执行
 > 关联：`docs/AGENT_INTERFACES.md`、`crates/domain/src/prompt_module.rs`、`crates/domain/src/agent.rs`、`crates/domain/src/agent_profile_config.rs`
 
@@ -226,32 +226,28 @@ cargo test -p storyforge
 - CRUD 命令可正常调用。
 - 内置默认配置在首次启动时自动创建。
 
-### 阶段 3：Pipeline / Runtime 消费 Profile ✅（部分）
+### 阶段 3：Pipeline / Runtime 消费 Profile ✅
 
 目标：Pipeline 按 AgentProfileConfig 参数运行 Agent，而不是硬编码常量。
 
-**已实现**：Director/Editor/Subagent 的 `model_override` 和 `max_tool_rounds` 覆盖、`max_concurrent_subagents` 并发控制。并发值为 `0` 时会按 `1` 处理，避免子 Agent 调度挂死。
-**未实现**：`enable_postprocess` / `enable_summarizer` 运行时控制（存储已支持，运行时未消费）、`tool_whitelist` 运行时过滤。
+**已实现**（全部闭环）：
+- Director/Editor/Subagent 的 `model_override` 和 `max_tool_rounds` 覆盖（pipeline `make_*_config` + `spawn_subagents`）。
+- `max_concurrent_subagents` 并发控制；并发值为 `0` 时按 `1` 处理，避免子 Agent 调度挂死。
+- `tool_whitelist` 运行时过滤：`ToolRegistry::retain(Option<&[String]>)` + 公共 helper `filter_registry_by_whitelist`。Director / Subagent / PostProcessor 注册工具后按 profile 过滤。语义：`None`=默认全部，`Some([])`=禁用全部，`Some(list)`=只允许列表工具；未知工具名记 warning 后忽略、不 panic；被禁用的工具 `dispatch` 返回 `ToolError::NotFound`，不可绕过 whitelist。
+- `enable_postprocess` / `enable_summarizer` 运行时控制：`run_postprocess_pipeline` 新增两开关参数，false 时跳过对应 LLM 调用、对应字段为 None；`PipelineOrchestrator::run_postprocess` 从 profile 读取。两者都关时发 `PipelineEvent::PostProcessSkipped`（而非误导性的 `PostProcessFailed`）；单关 summarizer 时不发 `SummaryDone`；无 config 时全开（向后兼容）。
+- PostProcessor / Summarizer 的 `model_override` / `max_tool_rounds` 也按 profile 覆盖（`make_postprocess_config` / `make_summarizer_config` 新增 `Option<&AgentProfileConfig>` 参数）。
+- domain 新增 `PipelineEvent::PostProcessSkipped { reason }`（serde 兼容，Tauri 序列化为 `postprocess_skipped`）。
 
-改动文件：
+**未实现**：无。阶段 3 已完整闭环。
 
-- `crates/app-pipeline/src/lib.rs`
-- `crates/app-agent/src/runtime.rs`
-- `crates/app-agent/src/prompts/*.rs`
-- `crates/tauri-app/src/lib.rs`（fill_campaign_context 或 fill_profile_context 扩展）
+改动文件（已落地）：
 
-任务：
-
-1. `WritingContext` 增加 `agent_profile_config: Option<AgentProfileConfig>`。
-2. `fill_profile_context` 或 `fill_campaign_context` 加载 active AgentProfileConfig 写入 ctx。
-3. Pipeline 构造 AgentProfile 时：
-   - 从 AgentProfileConfig.agent_configs 读取该角色的 `AgentRunConfig`。
-   - `model_override` 覆盖连接默认模型。
-   - `max_tool_rounds` 覆盖硬编码值。
-   - `tool_whitelist` 过滤注册工具。
-4. `spawn_subagents` 使用 `max_concurrent_subagents` 控制并发。
-5. Postprocess / Summarizer 的启用由 config 控制。
-6. 无 config 时 fallback 到当前硬编码默认值。
+- `crates/domain/src/agent.rs`（新增 `PostProcessSkipped`）
+- `crates/app-agent/src/tools.rs`（`retain` + `filter_registry_by_whitelist`）
+- `crates/app-agent/src/runtime.rs`（子 Agent whitelist 过滤）
+- `crates/app-agent/src/{postprocess.rs,summarizer.rs,pipeline_postprocess.rs}`（开关 + profile 参数）
+- `crates/app-agent/src/prompts/{postprocess.rs,summarizer.rs}`（`make_*_config` 接 profile）
+- `crates/app-pipeline/src/lib.rs`（Director whitelist + run_postprocess 开关/事件）
 
 验证：
 
@@ -263,24 +259,32 @@ cargo test --workspace
 
 验收：
 
-- 有 config 时参数被覆盖。
-- 无 config 时行为与当前完全一致。
+- 有 config 时参数被覆盖；whitelist 过滤生效；开关关闭时对应 LLM 不被调用、发明确事件。
+- 无 config 时行为与改造前完全一致。
 
-### 阶段 4：前端 Profile 管理 UI ❌（未实现）
+### 阶段 4：前端 Profile 管理 UI ✅
 
-目标：用户可以在前端查看、创建、编辑、导入/导出 AgentProfileConfig。
+目标：用户可以在前端查看、创建、编辑 AgentProfileConfig。
 
-改动文件：
+改动文件（已落地）：
 
-- `frontend/src/components/`（新建或扩展 Profile 管理组件）
-- `frontend/src/tauri-api.js`
+- `frontend/src/components/AgentProfileManager.vue`（新增组件）
+- `frontend/src/App.vue`（power 模式下挂载，列在 `AgentConfigCard` 之后）
+- `frontend/src/tauri-api.js`（6 个 wrapper 已存在，无需改动）
 
-任务：
+已实现功能：
 
-1. 列表页：显示所有 AgentProfileConfig，标记当前活跃。
-2. 详情页：编辑 name、description、每个 Agent 角色的 AgentRunConfig。
-3. 导入/导出：JSON 文件导入导出。
-4. 内置默认配置不可删除，但可以复制为基础创建新配置。
+1. 列出所有 AgentProfileConfig（标记 active / built-in）。
+2. 切换 active profile（`setActiveAgentProfileConfig`）。
+3. 复制 built-in default（或任意 profile）为 custom（生成新 id，`saveAgentProfileConfig`）。
+4. 编辑 custom profile：
+   - name / description
+   - max_concurrent_subagents
+   - enable_postprocess / enable_summarizer
+   - 各 role（Director / Editor / Subagent:* / Summarizer / PostProcessor）的 model_override / max_tool_rounds
+   - Director / Subagent:* / PostProcessor 的 tool_whitelist（逗号分隔输入；留空=默认全部，保存时不填任何值=禁用全部）
+5. 保存（清洗空值后 JSON 提交）、删除（built-in 禁用删除按钮）。
+6. 内置默认只读、不可覆盖；custom 可删。
 
 验证：
 
@@ -290,9 +294,11 @@ cd frontend && npm run build
 
 验收：
 
-- 可创建自定义配置并切换。
-- 导入/导出 JSON 正常。
-- 内置默认配置始终可用。
+- 可创建/切换/编辑/保存/删除自定义配置。
+- 内置默认始终可用、只读。
+- 不破坏现有 power 模式（PromptProfile 模块选择器 `AgentConfigCard` 不受影响）。
+
+**未实现（可选扩展）**：JSON 文件导入/导出（非本轮最低要求）。
 
 ### 阶段 5：校验、版本迁移、文档
 
