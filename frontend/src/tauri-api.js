@@ -875,6 +875,56 @@ export async function metaHealthCheck(campaignId) {
   return []
 }
 
+// ─── 类型化 Patch（第三轮：修复建议闭环）────────────────────────────────────
+
+/** 为 Campaign 的 health issues 生成修复方案 */
+export async function metaProposeCampaignRepairs(campaignId) {
+  if (isTauri()) {
+    return await invoke('meta_propose_campaign_repairs', { campaignId })
+  }
+  return []
+}
+
+/** 列出所有已生成的类型化 patch */
+export async function metaListTypedPatches() {
+  if (isTauri()) {
+    return await invoke('meta_list_typed_patches')
+  }
+  return []
+}
+
+/** 预览一条 patch（含 stale 检测 + diff） */
+export async function metaPreviewTypedPatch(patchId, campaignId) {
+  if (isTauri()) {
+    return await invoke('meta_preview_typed_patch', { patchId, campaignId })
+  }
+  return { stale: false, patch: null, diff: [] }
+}
+
+/** 接受一条 patch（写入 CampaignStore） */
+export async function metaAcceptTypedPatch(patchId, campaignId) {
+  if (isTauri()) {
+    return await invoke('meta_accept_typed_patch', { patchId, campaignId })
+  }
+}
+
+/** 忽略一条 patch */
+export async function metaDismissTypedPatch(patchId) {
+  if (isTauri()) {
+    return await invoke('meta_dismiss_typed_patch', { patchId })
+  }
+}
+
+// ─── 生成溯源（命令已存在于后端）─────────────────────────────────────────────
+
+/** 解释某条消息的生成溯源 */
+export async function metaExplainGeneration(conversationId, nodeId) {
+  if (isTauri()) {
+    return await invoke('meta_explain_generation', { conversationId, nodeId })
+  }
+  return null
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {
