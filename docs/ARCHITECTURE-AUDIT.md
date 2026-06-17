@@ -41,7 +41,7 @@ frontend/App.vue startWriting()
   -> tauri-app::start_writing
        snapshot_tool_ctx()
        WritingContext { characters, world_info, campaign_id: None, ... }
-       fill_profile_context()
+       fill_agent_profile_context()
        fill_campaign_context()
           阶段 2 已扩展：清空旧 runtime → 加载 campaign/instances/definitions/knowledge → 组装 CampaignRuntimeContext 快照 → 写入 ctx.campaign_runtime + tool_ctx
        PipelineOrchestrator::start_writing()
@@ -73,6 +73,21 @@ frontend/App.vue startWriting()
 - `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配角色创建临时 instance（支持 persona/behavior override），返回 instance 列表供调用者持久化；同批重复 unmatched character 会去重。
 - `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮临时 instance，Tauri 层 getter 读取后落盘；`start_writing` / `regenerate` 开始时清空旧 pending，避免状态污染。
 - `crates/tauri-app/src/lib.rs::persist_temporary_instances_to` **阶段 6 已完成**：只在 pipeline `Ok` 路径、postprocess 前把临时 instance 写入 CampaignStore；会跳过同名重复、同批重复和 `campaign_id` 不匹配的临时 instance，落盘后 postprocess 知识/变量写回不再被跳过。
+
+### AgentProfileConfig 运行时闭环（已完成）
+
+AgentProfileConfig 已从"存储但未消费"推进到完整运行时闭环：
+
+- **Domain DTO**：`crates/domain/src/agent_profile_config.rs` 定义 `AgentRunConfig`（`model_override` / `max_tool_rounds` / `tool_whitelist`，全 `Option`）和 `AgentProfileConfig`（`agent_configs: HashMap<AgentRole, AgentRunConfig>` / `max_concurrent_subagents` / `enable_postprocess` / `enable_summarizer` / `source` / `config_version`）。内置默认 `builtin-default-agent-v1` 始终可用、不可删除。`effective_max_concurrent_subagents()` 把 `0` clamp 到 `1` 避免 Semaphore 死锁。`run_config_for` 支持 Subagent 通配符回退（先精确 `Subagent(id)`，再 `Subagent("*")`）。
+- **Tauri 层持久化**：`crates/tauri-app/src/module_store.rs::AgentProfileConfigStore` 持久化到 `agent_profile_configs.json` + `active_agent_profile_config.json`。6 个 Tauri command：`list_agent_profile_configs` / `get_agent_profile_config` / `get_active_agent_profile_config` / `save_agent_profile_config` / `delete_agent_profile_config` / `set_active_agent_profile_config`。`fill_agent_profile_context` 在 `start_writing` / `regenerate` 时加载活跃配置到 `WritingContext.agent_profile_config`。
+- **运行时消费**：
+  - Director/Editor `make_*_config` 从 profile 读取 `model_override` 和 `max_tool_rounds`；无 config 时保持当前硬编码默认值。
+  - `spawn_subagents` 接收 `max_concurrent_subagents` 和 `agent_profile_config`；子 Agent 按 profile 覆盖 model 和 max_tool_rounds；每个子 Agent 的 registry 按 profile `tool_whitelist` 过滤。
+  - `tool_whitelist` 通过 `ToolRegistry::retain` / `filter_registry_by_whitelist` 在 Director/Subagent/PostProcessor 注册工具后过滤（`None` = 默认工具集，`Some([])` = 禁用全部，`Some(list)` = 只保留列表中的；未知工具名记 warning 后忽略，不 panic）。被禁用的工具 dispatch 返回 `ToolError::NotFound`，whitelist 不可绕过。
+  - `run_postprocess_pipeline` 接收 `enable_postprocess` / `enable_summarizer` 参数；某开关 `false` 时跳过对应 LLM 调用（返回 `None`）；两者都 `false` 时 `run_postprocess` 不发 `PostProcessStarted`，改发 `PipelineEvent::PostProcessSkipped { reason }`（区别于真失败的 `PostProcessFailed`）；单关 summarizer 时不发 `SummaryDone`；无 config 时全开（向后兼容）。
+- **新 PipelineEvent 变体**：`crates/domain/src/agent.rs` 新增 `PostProcessSkipped { reason: String }`（serde 兼容），Tauri 序列化为 `postprocess_skipped`。
+- **前端管理 UI**：`frontend/src/components/AgentProfileManager.vue`（power 模式下，位于 `AgentConfigCard` 之后）支持列/切活跃/复制/删除/编辑/保存。可编辑 name/description/max_concurrent_subagents/enable_postprocess/enable_summarizer 以及 Director/Editor/Subagent:*/Summarizer/PostProcessor 各自的 model_override/max_tool_rounds/tool_whitelist（逗号分隔）。内置默认只读不可删除。注意：`AgentConfigCard.vue` 是 PromptProfile 模块选择器（另一套体系），不是 AgentProfileConfig 编辑器。
+- **前端 API**：`frontend/src/tauri-api.js` 已实现 6 个 wrapper（`listAgentProfileConfigs` / `getAgentProfileConfig` / `getActiveAgentProfileConfig` / `saveAgentProfileConfig` / `deleteAgentProfileConfig` / `setActiveAgentProfileConfig`）。
 
 ## 是否要大修
 

@@ -4,18 +4,20 @@
 
 ## Phase 1: Campaign 写作主线统一
 
+**状态：已完成**（PLAN-CAMPAIGN-MAINLINE 阶段 1-6，2026-06-17）
+
 目标：写作链路不再以扁平 `Character` 为主，而是以 Campaign + CharacterInstance 为主。
 
 任务：
 
-- 实现 `CharacterInstance` persona/behavior fallback 到 `CharacterDefinition`。
-- 新增 `CampaignRuntimeContext` 纯快照。
-- Tauri 层从 `CampaignStore` 组装快照，传入 pipeline。
-- Director 可见角色列表改为 CharacterInstance。
-- `Plan` 内部字段改为 `character_instance_id`。
-- Subagent 输入改为 instance + definition + 可见知识 + 变量。
-- Postprocess 输出落盘前做名字到 ID 的归一化。
-- 修复删除角色时 Campaign 相关对象的清理/保护策略。
+- ~~实现 `CharacterInstance` persona/behavior fallback 到 `CharacterDefinition`。~~ ✅ 阶段 1
+- ~~新增 `CampaignRuntimeContext` 纯快照。~~ ✅ 阶段 2
+- ~~Tauri 层从 `CampaignStore` 组装快照，传入 pipeline。~~ ✅ 阶段 2
+- ~~Director 可见角色列表改为 CharacterInstance。~~ ✅ 阶段 3
+- ~~`Plan` 内部字段改为 `character_instance_id`。~~ ✅ 阶段 3
+- ~~Subagent 输入改为 instance + definition + 可见知识 + 变量。~~ ✅ 阶段 4
+- ~~Postprocess 输出落盘前做名字到 ID 的归一化。~~ ✅ 阶段 5
+- ~~修复删除角色时 Campaign 相关对象的清理/保护策略。~~ ✅ 阶段 5
 
 验收：
 
@@ -30,16 +32,18 @@
 
 ## Phase 2: 信息隔离和状态闭环
 
+**状态：已完成**（PLAN-CAMPAIGN-MAINLINE 阶段 3-6，2026-06-17）
+
 目标：让角色真正只知道自己该知道的内容，并让变量/任务影响下一轮写作。
 
 任务：
 
-- 定义角色可见知识规则。
-- Postprocess 知识写入绑定 instance。
-- Director tail 注入 pending tasks、story clock、关键 Campaign 变量。
-- Subagent tail 注入角色变量和该角色可见知识。
-- Editor provenance 记录采用/裁剪/冲突处理。
-- 增加数据一致性检查测试。
+- ~~定义角色可见知识规则。~~ ✅ 阶段 4：`spawn_subagents` 按 instance 注入 knowledge（信息隔离）
+- ~~Postprocess 知识写入绑定 instance。~~ ✅ 阶段 5：`persist_postprocess_outcome` 解析到 persisted `CharacterInstance.id`
+- ~~Director tail 注入 pending tasks、story clock、关键 Campaign 变量。~~ ✅ 阶段 3：`build_director_tail` 注入 campaign 全局变量和 pending tasks
+- ~~Subagent tail 注入角色变量和该角色可见知识。~~ ✅ 阶段 4：`build_campaign_subagent_volatile` 注入 instance variables 和 knowledge
+- ~~Editor provenance 记录采用/裁剪/冲突处理。~~ ✅ 阶段 5：`SubagentSnapshot` 扩展 `character_instance_id`/`display_name`/`fallback_reason`；`build_provenance_with_campaign` 从 CampaignRuntimeContext 填充（注：详细的采用/裁剪/冲突解决记录为后续增强）
+- ~~增加数据一致性检查测试。~~ ✅ 阶段 5：`persist_postprocess_outcome` 含 present_chars 校验、campaign_id 校验
 
 验收：
 
