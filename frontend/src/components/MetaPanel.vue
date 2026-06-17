@@ -5,7 +5,7 @@ import {
   metaAcceptPatch, metaDismissPatch,
   metaAnalyzeMvuCard, metaListMvuTranslations,
   listCharacters, metaHealthCheck,
-  metaProposeCampaignRepairs, metaPreviewTypedPatch,
+  metaProposeCampaignRepairs, metaListTypedPatches, metaPreviewTypedPatch,
   metaAcceptTypedPatch, metaDismissTypedPatch,
   metaExplainGeneration,
 } from '../tauri-api.js'
@@ -110,6 +110,10 @@ async function handleSend() {
     if (result.new_patch) {
       await refreshPatches()
     }
+    if (result.new_typed_patches && result.new_typed_patches.length > 0) {
+      // Agent 提议了 typed patch，刷新列表让用户看到
+      await refreshTypedPatches()
+    }
     await scrollToBottom()
   } catch (e) {
     error.value = '对话失败: ' + e
@@ -198,6 +202,25 @@ async function handleProposeRepairs() {
     error.value = '生成修复方案失败: ' + e
   } finally {
     patchesLoading.value = false
+  }
+}
+
+async function refreshTypedPatches() {
+  try {
+    const patches = await metaListTypedPatches()
+    typedPatches.value = patches || []
+    // 对每条 patch 跑 preview，标记 stale
+    if (props.activeCampaign?.id) {
+      for (const p of typedPatches.value) {
+        try {
+          const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
+          p._stale = prev?.stale || false
+        } catch (e) { p._stale = false }
+      }
+    }
+  } catch (e) {
+    // 静默失败，不影响主流程
+    console.warn('刷新 typed patches 失败:', e)
   }
 }
 

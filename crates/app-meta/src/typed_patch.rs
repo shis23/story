@@ -6,10 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 use storyforge_domain::Id;
-use storyforge_domain::campaign::CharacterInstance;
+use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::CharacterDefinition;
-use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
-use storyforge_domain::story_task::StoryTask;
+use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
+use storyforge_domain::story_task::{StoryTask, TaskStatus};
 
 use crate::HealthIssue;
 
@@ -39,6 +39,28 @@ pub enum TypedPatchAction {
     RepointInstanceDefinition {
         instance_id: Id,
         new_definition_id: Option<Id>,
+    },
+    /// 改 Campaign 级变量（如 story_clock）
+    UpdateCampaignVariable {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// 改某 instance 的变量（如 hp）
+    UpdateInstanceVariable {
+        instance_id: Id,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// 给 instance 加一条知识
+    AddKnowledge {
+        character_id: Id,
+        knowledge_text: String,
+        source: KnowledgeSource,
+    },
+    /// 改任务状态
+    UpdateTaskStatus {
+        task_id: Id,
+        new_status: TaskStatus,
     },
 }
 
@@ -80,6 +102,7 @@ pub struct PreviewInput<'a> {
     pub definitions: &'a [CharacterDefinition],
     pub knowledge: &'a [CharacterKnowledgeEntry],
     pub tasks: &'a [StoryTask],
+    pub campaign: Option<&'a Campaign>,
 }
 
 /// apply_to_snapshot 的可变快照
@@ -88,6 +111,8 @@ pub struct PreviewInputMut<'a> {
     pub definitions: &'a mut Vec<CharacterDefinition>,
     pub knowledge: &'a mut Vec<CharacterKnowledgeEntry>,
     pub tasks: &'a mut Vec<StoryTask>,
+    pub campaign: Option<&'a mut Campaign>,
+    pub turn: u32,
 }
 
 // ─── 错误类型 ────────────────────────────────────────────────────────────────
@@ -129,6 +154,16 @@ pub fn is_patch_stale(patch: &TypedPatch, input: &PreviewInput) -> bool {
         }
         TypedPatchAction::SyncInstanceVariables { instance_id, .. } => {
             !input.instances.iter().any(|i| &i.id == instance_id)
+        }
+        TypedPatchAction::UpdateCampaignVariable { .. } => input.campaign.is_none(),
+        TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
+            !input.instances.iter().any(|i| &i.id == instance_id)
+        }
+        TypedPatchAction::AddKnowledge { character_id, .. } => {
+            !input.instances.iter().any(|i| &i.id == character_id)
+        }
+        TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
+            !input.tasks.iter().any(|t| &t.id == task_id)
         }
     })
 }
@@ -466,6 +501,65 @@ fn apply_action(
             }
             Ok(())
         }
+        TypedPatchAction::UpdateCampaignVariable { key, value } => {
+            let campaign = snapshot
+                .campaign
+                .as_deref_mut()
+                .ok_or_else(|| TypedPatchError::TargetMissing("campaign (none)".into()))?;
+            campaign.set_variable(key, value.clone(), snapshot.turn);
+            Ok(())
+        }
+        TypedPatchAction::UpdateInstanceVariable {
+            instance_id,
+            key,
+            value,
+        } => {
+            let inst = snapshot
+                .instances
+                .iter_mut()
+                .find(|i| &i.id == instance_id)
+                .ok_or_else(|| {
+                    TypedPatchError::TargetMissing(format!("instance {}", instance_id))
+                })?;
+            inst.set_variable(key, value.clone(), snapshot.turn);
+            Ok(())
+        }
+        TypedPatchAction::AddKnowledge {
+            character_id,
+            knowledge_text,
+            source,
+        } => {
+            let campaign_id = snapshot
+                .campaign
+                .as_ref()
+                .map(|c| c.id.clone())
+                .unwrap_or_else(|| Id::from_str("unknown"));
+            let entry = CharacterKnowledgeEntry {
+                id: Id::new(),
+                campaign_id,
+                character_id: character_id.clone(),
+                knowledge_text: knowledge_text.clone(),
+                source: source.clone(),
+                source_character_id: None,
+                turn_number: snapshot.turn,
+                event_id: None,
+                pinned: false,
+            };
+            snapshot.knowledge.push(entry);
+            Ok(())
+        }
+        TypedPatchAction::UpdateTaskStatus {
+            task_id,
+            new_status,
+        } => {
+            let task = snapshot
+                .tasks
+                .iter_mut()
+                .find(|t| &t.id == task_id)
+                .ok_or_else(|| TypedPatchError::TargetMissing(format!("task {}", task_id)))?;
+            task.status = new_status.clone();
+            Ok(())
+        }
     }
 }
 
@@ -475,6 +569,144 @@ fn truncate(s: &str, max_chars: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", chars[..max_chars].iter().collect::<String>())
+    }
+}
+
+/// 从 Agent 提议的 action 构造 TypedPatch（含 target 校验 + diff 构造）。
+///
+/// 与 `build_patch_for_issue` 不同：本函数由 `propose_campaign_patch` 工具调用，
+/// `source_issue_category` 固定为 `"agent_proposed"`。
+pub fn build_patch_from_action(
+    description: String,
+    action: TypedPatchAction,
+    input: &PreviewInput,
+) -> Result<TypedPatch, TypedPatchError> {
+    // 校验 target 存在
+    match &action {
+        TypedPatchAction::UpdateCampaignVariable { .. } => {
+            if input.campaign.is_none() {
+                return Err(TypedPatchError::TargetMissing("campaign (none)".into()));
+            }
+        }
+        TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
+            if !input.instances.iter().any(|i| &i.id == instance_id) {
+                return Err(TypedPatchError::TargetMissing(format!(
+                    "instance {}",
+                    instance_id
+                )));
+            }
+        }
+        TypedPatchAction::AddKnowledge { character_id, .. } => {
+            if !input.instances.iter().any(|i| &i.id == character_id) {
+                return Err(TypedPatchError::TargetMissing(format!(
+                    "instance {}",
+                    character_id
+                )));
+            }
+        }
+        TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
+            if !input.tasks.iter().any(|t| &t.id == task_id) {
+                return Err(TypedPatchError::TargetMissing(format!(
+                    "task {}",
+                    task_id
+                )));
+            }
+        }
+        // health-issue-driven 变体不通过 build_patch_from_action 构造
+        _ => {
+            return Err(TypedPatchError::TargetMissing(
+                "不支持的 action 类型（请用 build_patch_for_issue）".into(),
+            ));
+        }
+    }
+
+    // 构造 diff
+    let diff = build_diff_for_action(&action, input);
+
+    // 确定 affected_id
+    let affected_id = match &action {
+        TypedPatchAction::UpdateCampaignVariable { key, .. } => Some(key.clone()),
+        TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
+            Some(instance_id.to_string())
+        }
+        TypedPatchAction::AddKnowledge { character_id, .. } => Some(character_id.to_string()),
+        TypedPatchAction::UpdateTaskStatus { task_id, .. } => Some(task_id.to_string()),
+        _ => None,
+    };
+
+    Ok(TypedPatch {
+        id: uuid::Uuid::new_v4().to_string(),
+        description,
+        source_issue_category: "agent_proposed".into(),
+        affected_id,
+        actions: vec![action],
+        diff,
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    })
+}
+
+/// 为单个 action 构造 diff entries（纯函数，只读 input）。
+fn build_diff_for_action(action: &TypedPatchAction, input: &PreviewInput) -> Vec<FieldDiff> {
+    match action {
+        TypedPatchAction::UpdateCampaignVariable { key, value } => {
+            let before = input
+                .campaign
+                .and_then(|c| c.get_variable(key))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            vec![FieldDiff {
+                path: format!("campaign.variables[{key}]"),
+                before,
+                after: value.clone(),
+            }]
+        }
+        TypedPatchAction::UpdateInstanceVariable {
+            instance_id,
+            key,
+            value,
+        } => {
+            let before = input
+                .instances
+                .iter()
+                .find(|i| &i.id == instance_id)
+                .and_then(|i| i.get_variable(key))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            vec![FieldDiff {
+                path: format!("instance[{instance_id}].variables[{key}]"),
+                before,
+                after: value.clone(),
+            }]
+        }
+        TypedPatchAction::AddKnowledge {
+            character_id,
+            knowledge_text,
+            ..
+        } => {
+            vec![FieldDiff {
+                path: format!("knowledge (new for {character_id})"),
+                before: serde_json::Value::Null,
+                after: serde_json::json!({"knowledge_text": knowledge_text}),
+            }]
+        }
+        TypedPatchAction::UpdateTaskStatus {
+            task_id,
+            new_status,
+        } => {
+            let before = input
+                .tasks
+                .iter()
+                .find(|t| &t.id == task_id)
+                .map(|t| serde_json::to_value(&t.status).unwrap_or(serde_json::Value::Null))
+                .unwrap_or(serde_json::Value::Null);
+            vec![FieldDiff {
+                path: format!("task[{task_id}].status"),
+                before,
+                after: serde_json::to_value(new_status).unwrap_or(serde_json::Value::Null),
+            }]
+        }
+        _ => vec![],
     }
 }
 
@@ -540,6 +772,7 @@ mod tests {
             definitions: &[def_real],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
 
         let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
@@ -589,6 +822,7 @@ mod tests {
             definitions: &[],
             knowledge: &[entry.clone()],
             tasks: &[],
+            campaign: None,
         };
 
         let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
@@ -634,6 +868,7 @@ mod tests {
             definitions: &[],
             knowledge: &[],
             tasks: &[task.clone()],
+            campaign: None,
         };
 
         let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
@@ -698,6 +933,7 @@ mod tests {
             definitions: &[def],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
 
         let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
@@ -739,6 +975,7 @@ mod tests {
             definitions: &[],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
         assert!(build_patch_for_issue(&issue, &input).is_none());
     }
@@ -760,6 +997,7 @@ mod tests {
             definitions: &[make_def("def-1")],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
         let patch = build_patch_for_issue(&issue, &input).unwrap();
         assert!(!is_patch_stale(&patch, &input));
@@ -780,6 +1018,7 @@ mod tests {
             definitions: &[make_def("def-1")],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
         let patch = build_patch_for_issue(&issue, &input_with).unwrap();
 
@@ -789,6 +1028,7 @@ mod tests {
             definitions: &[make_def("def-1")],
             knowledge: &[],
             tasks: &[],
+            campaign: None,
         };
         assert!(is_patch_stale(&patch, &input_without));
     }
@@ -837,6 +1077,8 @@ mod tests {
             definitions: &mut defs,
             knowledge: &mut knowledge,
             tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -898,6 +1140,8 @@ mod tests {
             definitions: &mut defs,
             knowledge: &mut knowledge,
             tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -946,6 +1190,8 @@ mod tests {
             definitions: &mut defs,
             knowledge: &mut knowledge,
             tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -984,6 +1230,8 @@ mod tests {
             definitions: &mut defs,
             knowledge: &mut knowledge,
             tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
         };
 
         apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
@@ -1019,6 +1267,8 @@ mod tests {
             definitions: &mut defs,
             knowledge: &mut knowledge,
             tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
         };
 
         let result = apply_to_snapshot(&patch, &mut snapshot);
@@ -1029,5 +1279,413 @@ mod tests {
             }
             _ => panic!("expected TargetMissing"),
         }
+    }
+
+    // ── build_patch_from_action: UpdateCampaignVariable ─────────────────
+
+    #[test]
+    fn test_build_patch_from_action_update_campaign_variable() {
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: Some(&campaign),
+        };
+
+        let action = TypedPatchAction::UpdateCampaignVariable {
+            key: "story_clock".into(),
+            value: serde_json::json!("Night 5"),
+        };
+        let patch = build_patch_from_action("改故事时间".into(), action, &input).unwrap();
+        assert_eq!(patch.source_issue_category, "agent_proposed");
+        assert_eq!(patch.status, TypedPatchStatus::Pending);
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "campaign.variables[story_clock]");
+    }
+
+    #[test]
+    fn test_build_patch_from_action_update_campaign_variable_no_campaign() {
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::UpdateCampaignVariable {
+            key: "story_clock".into(),
+            value: serde_json::json!("Night 5"),
+        };
+        let result = build_patch_from_action("改故事时间".into(), action, &input);
+        assert!(result.is_err());
+    }
+
+    // ── build_patch_from_action: UpdateInstanceVariable ─────────────────
+
+    #[test]
+    fn test_build_patch_from_action_update_instance_variable() {
+        let inst = make_instance("inst-1", Some("def-1"));
+        let input = PreviewInput {
+            instances: &[inst],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::UpdateInstanceVariable {
+            instance_id: Id::from_str("inst-1"),
+            key: "hp".into(),
+            value: serde_json::json!(80),
+        };
+        let patch = build_patch_from_action("改 HP".into(), action, &input).unwrap();
+        assert_eq!(patch.source_issue_category, "agent_proposed");
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "instance[inst-1].variables[hp]");
+    }
+
+    #[test]
+    fn test_build_patch_from_action_update_instance_variable_missing() {
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::UpdateInstanceVariable {
+            instance_id: Id::from_str("nonexistent"),
+            key: "hp".into(),
+            value: serde_json::json!(80),
+        };
+        let result = build_patch_from_action("改 HP".into(), action, &input);
+        assert!(result.is_err());
+    }
+
+    // ── build_patch_from_action: AddKnowledge ───────────────────────────
+
+    #[test]
+    fn test_build_patch_from_action_add_knowledge() {
+        let inst = make_instance("inst-1", Some("def-1"));
+        let input = PreviewInput {
+            instances: &[inst],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::AddKnowledge {
+            character_id: Id::from_str("inst-1"),
+            knowledge_text: "看到了龙".into(),
+            source: KnowledgeSource::Witnessed,
+        };
+        let patch = build_patch_from_action("加知识".into(), action, &input).unwrap();
+        assert_eq!(patch.source_issue_category, "agent_proposed");
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "knowledge (new for inst-1)");
+    }
+
+    #[test]
+    fn test_build_patch_from_action_add_knowledge_missing_character() {
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::AddKnowledge {
+            character_id: Id::from_str("nonexistent"),
+            knowledge_text: "看到了龙".into(),
+            source: KnowledgeSource::Witnessed,
+        };
+        let result = build_patch_from_action("加知识".into(), action, &input);
+        assert!(result.is_err());
+    }
+
+    // ── build_patch_from_action: UpdateTaskStatus ───────────────────────
+
+    #[test]
+    fn test_build_patch_from_action_update_task_status() {
+        let task = StoryTask::user_planned(
+            Id::from_str("camp-1"),
+            "复仇",
+            "老王复仇",
+            vec![TaskTrigger::TurnReminder { at_turn: 10 }],
+            1,
+        );
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[task],
+            campaign: None,
+        };
+        let action = TypedPatchAction::UpdateTaskStatus {
+            task_id: Id::from_str(&input.tasks[0].id.to_string()),
+            new_status: TaskStatus::Completed,
+        };
+        let patch = build_patch_from_action("完成任务".into(), action, &input).unwrap();
+        assert_eq!(patch.source_issue_category, "agent_proposed");
+        assert_eq!(patch.diff.len(), 1);
+        assert!(patch.diff[0].path.starts_with("task["));
+    }
+
+    #[test]
+    fn test_build_patch_from_action_update_task_status_missing() {
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        let action = TypedPatchAction::UpdateTaskStatus {
+            task_id: Id::from_str("nonexistent"),
+            new_status: TaskStatus::Completed,
+        };
+        let result = build_patch_from_action("完成任务".into(), action, &input);
+        assert!(result.is_err());
+    }
+
+    // ── apply_to_snapshot: UpdateCampaignVariable ───────────────────────
+
+    #[test]
+    fn test_apply_update_campaign_variable() {
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+            campaign: Some(&mut campaign),
+            turn: 3,
+        };
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("story_clock".into()),
+            actions: vec![TypedPatchAction::UpdateCampaignVariable {
+                key: "story_clock".into(),
+                value: serde_json::json!("Night 5"),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+        assert_eq!(campaign.story_clock, "Night 5");
+        assert_eq!(
+            campaign.get_variable("story_clock"),
+            Some(&serde_json::json!("Night 5"))
+        );
+    }
+
+    // ── apply_to_snapshot: UpdateInstanceVariable ───────────────────────
+
+    #[test]
+    fn test_apply_update_instance_variable() {
+        let mut inst = make_instance("inst-1", Some("def-1"));
+        let mut instances = vec![inst];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+            campaign: None,
+            turn: 3,
+        };
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("inst-1".into()),
+            actions: vec![TypedPatchAction::UpdateInstanceVariable {
+                instance_id: Id::from_str("inst-1"),
+                key: "hp".into(),
+                value: serde_json::json!(80),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+        let updated = &snapshot.instances[0];
+        assert_eq!(updated.get_variable("hp"), Some(&serde_json::json!(80)));
+    }
+
+    // ── apply_to_snapshot: AddKnowledge ─────────────────────────────────
+
+    #[test]
+    fn test_apply_add_knowledge() {
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试");
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+            campaign: Some(&mut campaign),
+            turn: 5,
+        };
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("char-1".into()),
+            actions: vec![TypedPatchAction::AddKnowledge {
+                character_id: Id::from_str("char-1"),
+                knowledge_text: "看到了龙".into(),
+                source: KnowledgeSource::Witnessed,
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+        assert_eq!(snapshot.knowledge.len(), 1);
+        assert_eq!(snapshot.knowledge[0].knowledge_text, "看到了龙");
+        assert_eq!(snapshot.knowledge[0].character_id.as_str(), "char-1");
+        assert_eq!(snapshot.knowledge[0].source, KnowledgeSource::Witnessed);
+        assert_eq!(snapshot.knowledge[0].turn_number, 5);
+    }
+
+    // ── apply_to_snapshot: UpdateTaskStatus ─────────────────────────────
+
+    #[test]
+    fn test_apply_update_task_status() {
+        let mut task = StoryTask::user_planned(
+            Id::from_str("camp-1"),
+            "复仇",
+            "老王复仇",
+            vec![TaskTrigger::TurnReminder { at_turn: 10 }],
+            1,
+        );
+        let task_id = task.id.clone();
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![task];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+            campaign: None,
+            turn: 0,
+        };
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some(task_id.to_string()),
+            actions: vec![TypedPatchAction::UpdateTaskStatus {
+                task_id: task_id.clone(),
+                new_status: TaskStatus::Completed,
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+        assert_eq!(snapshot.tasks[0].status, TaskStatus::Completed);
+    }
+
+    // ── is_patch_stale: new variants ────────────────────────────────────
+
+    #[test]
+    fn test_is_patch_stale_update_campaign_variable_no_campaign() {
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("story_clock".into()),
+            actions: vec![TypedPatchAction::UpdateCampaignVariable {
+                key: "story_clock".into(),
+                value: serde_json::json!("Night 5"),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        assert!(is_patch_stale(&patch, &input));
+    }
+
+    #[test]
+    fn test_is_patch_stale_update_instance_variable_target_removed() {
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("inst-1".into()),
+            actions: vec![TypedPatchAction::UpdateInstanceVariable {
+                instance_id: Id::from_str("inst-1"),
+                key: "hp".into(),
+                value: serde_json::json!(80),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        assert!(is_patch_stale(&patch, &input));
+    }
+
+    #[test]
+    fn test_is_patch_stale_update_task_status_target_removed() {
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: Some("task-1".into()),
+            actions: vec![TypedPatchAction::UpdateTaskStatus {
+                task_id: Id::from_str("task-1"),
+                new_status: TaskStatus::Completed,
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+            campaign: None,
+        };
+        assert!(is_patch_stale(&patch, &input));
     }
 }

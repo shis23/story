@@ -2981,6 +2981,13 @@ fn sync_meta_session_from_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
     if let Some(book) = &ctx.world_info {
         state.meta_session.set_world_info(book.clone());
     }
+    // 同步 campaign runtime 快照
+    if let Some(rt) = &ctx.campaign_runtime {
+        state.meta_session.set_campaign_runtime(rt.clone());
+    } else {
+        // 无 active campaign 时清空，避免读到过期快照
+        *state.meta_session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// Tauri command: 开始一个新的 Meta 对话（返回 conversation_id）
@@ -3055,6 +3062,16 @@ async fn meta_chat(
         }
     }
 
+    // 把新提议的 typed patch 同步进 AppState.typed_patches
+    if !turn.new_typed_patches.is_empty() {
+        let mut typed = app.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        for tp in &turn.new_typed_patches {
+            if !typed.iter().any(|p| p.id == tp.id) {
+                typed.push(tp.clone());
+            }
+        }
+    }
+
     // 存回对话
     let conv_id = conv.id.clone();
     let messages = serde_json::to_value(&conv.messages).unwrap_or(serde_json::Value::Null);
@@ -3068,6 +3085,7 @@ async fn meta_chat(
         "agent_message": turn.agent_message,
         "messages": messages,
         "new_patch": turn.new_patch,
+        "new_typed_patches": turn.new_typed_patches,
     }))
 }
 
@@ -3191,7 +3209,7 @@ fn meta_explain_generation(
 /// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
 fn build_preview_input<'a>(
     _store: &'static campaign_store::CampaignStore,
-    _campaign: &'a storyforge_domain::campaign::Campaign,
+    campaign: &'a storyforge_domain::campaign::Campaign,
     instances: &'a [storyforge_domain::campaign::CharacterInstance],
     definitions: &'a Vec<storyforge_domain::character::CharacterDefinition>,
     knowledge: &'a [storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
@@ -3202,6 +3220,7 @@ fn build_preview_input<'a>(
         definitions,
         knowledge,
         tasks,
+        campaign: Some(campaign),
     }
 }
 
@@ -3302,6 +3321,7 @@ fn meta_preview_typed_patch(
         definitions: &definitions,
         knowledge: &knowledge,
         tasks: &tasks,
+        campaign: Some(&campaign),
     };
 
     if storyforge_app_meta::is_patch_stale(patch, &input) {
@@ -3362,6 +3382,7 @@ fn meta_accept_typed_patch(
         definitions: &definitions,
         knowledge: &knowledge,
         tasks: &tasks,
+        campaign: Some(&campaign),
     };
 
     // 3. stale 检查
@@ -3380,11 +3401,14 @@ fn meta_accept_typed_patch(
         let mut def_clone = definitions.clone();
         let mut know_clone = knowledge.clone();
         let mut task_clone = tasks.clone();
+        let mut camp_clone = campaign.clone();
         let mut snap = storyforge_app_meta::PreviewInputMut {
             instances: &mut inst_clone,
             definitions: &mut def_clone,
             knowledge: &mut know_clone,
             tasks: &mut task_clone,
+            campaign: Some(&mut camp_clone),
+            turn: 0, // preview 不持久化，turn 值不影响验证
         };
         storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
             .map_err(|e| format!("纯函数预演失败: {e}"))?;
@@ -3497,6 +3521,56 @@ fn apply_typed_action(
 
             instance.definition_id = new_definition_id.clone();
             store.update_instance(instance);
+            Ok(())
+        }
+        TypedPatchAction::UpdateCampaignVariable { key, value } => {
+            let mut campaign = store
+                .get_campaign(campaign_id)
+                .ok_or_else(|| format!("Campaign 不存在: {}", campaign_id.as_str()))?;
+            campaign.set_variable(key, value.clone(), 0);
+            store.update_campaign(campaign);
+            Ok(())
+        }
+        TypedPatchAction::UpdateInstanceVariable {
+            instance_id,
+            key,
+            value,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+            instance.set_variable(key, value.clone(), 0);
+            store.update_instance(instance);
+            Ok(())
+        }
+        TypedPatchAction::AddKnowledge {
+            character_id,
+            knowledge_text,
+            source,
+        } => {
+            let entry = storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+                id: Id::new(),
+                campaign_id: campaign_id.clone(),
+                character_id: character_id.clone(),
+                knowledge_text: knowledge_text.clone(),
+                source: source.clone(),
+                source_character_id: None,
+                turn_number: 0,
+                event_id: None,
+                pinned: false,
+            };
+            store.add_knowledge(vec![entry]);
+            Ok(())
+        }
+        TypedPatchAction::UpdateTaskStatus {
+            task_id,
+            new_status,
+        } => {
+            let mut task = store
+                .get_task(task_id)
+                .ok_or_else(|| format!("Task 不存在: {}", task_id.as_str()))?;
+            task.status = new_status.clone();
+            store.update_task(task);
             Ok(())
         }
     }
@@ -4606,6 +4680,11 @@ mod tests {
             state.meta_session.explainer.is_some(),
             "meta_session.explainer should be injected (not None) for inspect_generation"
         );
+        // campaign_runtime 默认为 None（无 active campaign）
+        assert!(
+            state.meta_session.campaign_runtime.lock().unwrap().is_none(),
+            "meta_session.campaign_runtime should be None when no active campaign"
+        );
     }
 
 
@@ -5566,6 +5645,7 @@ mod tests {
             definitions: &definitions,
             knowledge: &knowledge,
             tasks: &tasks,
+            campaign: Some(&campaign),
         };
 
         let mut patches = Vec::new();
@@ -5768,6 +5848,7 @@ mod tests {
             definitions: &definitions,
             knowledge: &knowledge,
             tasks: &tasks,
+            campaign: Some(&campaign),
         };
 
         // is_patch_stale 应返回 true（target instance 不在快照中）

@@ -20,7 +20,12 @@ use storyforge_domain::world_info::WorldInfoBook;
 
 use storyforge_app_agent::AgentConfig;
 
+use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
+use storyforge_domain::story_task::TaskStatus;
+
 use crate::prompts::meta_agent::{build_meta_user_msg, make_meta_agent_config};
+use crate::typed_patch::{PreviewInput, TypedPatch, build_patch_from_action};
 use crate::{
     CardReport, GenerationExplanation, Patch, PatchAction, PatchStore, WorldInfoReport,
     inspect_character, inspect_world_info,
@@ -47,6 +52,10 @@ pub struct MetaSession {
     pub patches: PatchStore,
     /// 生成溯源数据源（由 tauri-app 层注入，None = 未配置）
     pub explainer: Option<Arc<dyn GenerationExplainer>>,
+    /// active Campaign 运行时快照（inspect_* 工具读它，None = 无 active campaign）
+    pub campaign_runtime: Mutex<Option<Arc<CampaignRuntimeContext>>>,
+    /// Agent 通过 propose_campaign_patch 工具提议的 typed patch（chat 返回后 drain 到 AppState）
+    pub typed_patches: Mutex<Vec<TypedPatch>>,
 }
 
 impl MetaSession {
@@ -56,6 +65,8 @@ impl MetaSession {
             world_info: Mutex::new(None),
             patches: PatchStore::new(),
             explainer: None,
+            campaign_runtime: Mutex::new(None),
+            typed_patches: Mutex::new(Vec::new()),
         }
     }
 
@@ -69,6 +80,10 @@ impl MetaSession {
 
     pub fn set_explainer(&mut self, explainer: Arc<dyn GenerationExplainer>) {
         self.explainer = Some(explainer);
+    }
+
+    pub fn set_campaign_runtime(&self, ctx: Arc<CampaignRuntimeContext>) {
+        *self.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx);
     }
 }
 
@@ -145,6 +160,8 @@ pub struct MetaTurn {
     pub agent_message: MetaMessage,
     /// 本轮新增的 pending patch（如果有）
     pub new_patch: Option<Patch>,
+    /// 本轮 Agent 通过 propose_campaign_patch 提议的 typed patch
+    pub new_typed_patches: Vec<TypedPatch>,
 }
 
 /// 跑一轮 Meta 对话（用户输入 → Agent 回复）
@@ -178,6 +195,13 @@ pub async fn chat(
     register_meta_runtime_tools(&mut registry, session.clone());
 
     info!(target: "meta-conversation", "Meta 对话：用户输入 {} 字", user_input.len());
+
+    // 记录进入前 typed_patches 长度，以便 drain 本轮新增
+    let typed_patches_before = session
+        .typed_patches
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .len();
 
     let resp = runtime
         .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
@@ -253,9 +277,19 @@ pub async fn chat(
 
     conversation.messages.push(agent_message.clone());
 
+    // drain 本轮新增的 typed patches
+    let new_typed_patches = {
+        let mut typed = session
+            .typed_patches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        typed.drain(typed_patches_before..).collect::<Vec<_>>()
+    };
+
     Ok(MetaTurn {
         agent_message,
         new_patch,
+        new_typed_patches,
     })
 }
 
@@ -427,6 +461,325 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             }
         },
     );
+
+    // ─── Campaign-aware 工具 ────────────────────────────────────────────────
+
+    // inspect_campaign
+    registry.register(
+        ToolSpec::function(
+            "inspect_campaign",
+            "查看当前 active Campaign 概览：实例数/知识数/任务数/变量。",
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        {
+            let session = session.clone();
+            move |_args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    match rt.as_ref() {
+                        Some(ctx) => {
+                            Ok(serde_json::json!({
+                                "campaign_id": ctx.campaign.id.to_string(),
+                                "name": ctx.campaign.name,
+                                "turn": ctx.turn,
+                                "instance_count": ctx.instances.len(),
+                                "knowledge_count": ctx.knowledge.len(),
+                                "campaign_variables": ctx.campaign.variables,
+                            }))
+                        }
+                        None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    }
+                })
+            }
+        },
+    );
+
+    // inspect_instance
+    registry.register(
+        ToolSpec::function(
+            "inspect_instance",
+            "查看某角色实例详情：persona/behavior/变量。传 instance_id 或 name。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "instance_id_or_name": {"type": "string", "description": "实例 ID 或名称"}
+                },
+                "required": ["instance_id_or_name"]
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let id_or_name = args
+                        .get("instance_id_or_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    match rt.as_ref() {
+                        Some(ctx) => {
+                            match ctx.find_instance_by_id_or_name(id_or_name) {
+                                Some(inst) => {
+                                    let def = ctx.definition_for_instance(inst);
+                                    let persona = ctx.resolved_persona_for(inst);
+                                    let behavior = ctx.resolved_behavior_for(inst);
+                                    Ok(serde_json::json!({
+                                        "id": inst.id.to_string(),
+                                        "name": inst.name,
+                                        "definition_id": inst.definition_id.as_ref().map(|d| d.to_string()),
+                                        "is_temporary": inst.is_temporary,
+                                        "resolved_persona": persona,
+                                        "resolved_behavior": behavior,
+                                        "variables": inst.variables,
+                                    }))
+                                }
+                                None => Ok(serde_json::json!({"error": format!("找不到实例: {}", id_or_name)})),
+                            }
+                        }
+                        None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    }
+                })
+            }
+        },
+    );
+
+    // inspect_variables
+    registry.register(
+        ToolSpec::function(
+            "inspect_variables",
+            "查看变量：scope=campaign 返回 Campaign 级变量，scope=instance 返回某实例变量。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["campaign", "instance"]},
+                    "instance_id_or_name": {"type": "string", "description": "scope=instance 时必填"}
+                },
+                "required": ["scope"]
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("campaign");
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    match rt.as_ref() {
+                        Some(ctx) => {
+                            match scope {
+                                "campaign" => {
+                                    Ok(serde_json::json!({
+                                        "scope": "campaign",
+                                        "variables": ctx.campaign.variables,
+                                    }))
+                                }
+                                "instance" => {
+                                    let id_or_name = args
+                                        .get("instance_id_or_name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    match ctx.find_instance_by_id_or_name(id_or_name) {
+                                        Some(inst) => {
+                                            Ok(serde_json::json!({
+                                                "scope": "instance",
+                                                "instance_id": inst.id.to_string(),
+                                                "instance_name": inst.name,
+                                                "variables": inst.variables,
+                                            }))
+                                        }
+                                        None => Ok(serde_json::json!({"error": format!("找不到实例: {}", id_or_name)})),
+                                    }
+                                }
+                                _ => Ok(serde_json::json!({"error": format!("未知 scope: {}（应为 campaign 或 instance)", scope)})),
+                            }
+                        }
+                        None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    }
+                })
+            }
+        },
+    );
+
+    // inspect_knowledge
+    registry.register(
+        ToolSpec::function(
+            "inspect_knowledge",
+            "查看角色可见知识。无参返回全部，有 instance_id_or_name 则过滤。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "instance_id_or_name": {"type": "string", "description": "可选：按实例过滤"}
+                }
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    match rt.as_ref() {
+                        Some(ctx) => {
+                            let id_or_name = args
+                                .get("instance_id_or_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let entries: Vec<&CharacterKnowledgeEntry> = if id_or_name.is_empty() {
+                                ctx.knowledge.iter().collect()
+                            } else {
+                                match ctx.find_instance_by_id_or_name(id_or_name) {
+                                    Some(inst) => ctx.knowledge_for_instance(inst),
+                                    None => return Ok(serde_json::json!({"error": format!("找不到实例: {}", id_or_name)})),
+                                }
+                            };
+                            let summary: Vec<serde_json::Value> = entries
+                                .iter()
+                                .map(|k| {
+                                    serde_json::json!({
+                                        "id": k.id.to_string(),
+                                        "character_id": k.character_id.to_string(),
+                                        "knowledge_text": truncate_str(&k.knowledge_text, 80),
+                                        "source": k.source,
+                                    })
+                                })
+                                .collect();
+                            Ok(serde_json::json!({
+                                "count": summary.len(),
+                                "knowledge": summary,
+                            }))
+                        }
+                        None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    }
+                })
+            }
+        },
+    );
+
+    // inspect_tasks
+    registry.register(
+        ToolSpec::function(
+            "inspect_tasks",
+            "查看任务列表。status=pending（默认）返回待办，status=all 返回全部。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["pending", "all"], "default": "pending"}
+                }
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let status_filter = args
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending");
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    match rt.as_ref() {
+                        Some(_ctx) => {
+                            // CampaignRuntimeContext 没有 tasks 字段；
+                            // 任务通过 CampaignStore 管理，这里返回提示
+                            Ok(serde_json::json!({
+                                "note": "任务通过 CampaignStore 管理，请使用 meta_propose_campaign_repairs 或直接查询 CampaignStore",
+                                "status_filter": status_filter,
+                            }))
+                        }
+                        None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    }
+                })
+            }
+        },
+    );
+
+    // propose_campaign_patch
+    registry.register(
+        ToolSpec::function(
+            "propose_campaign_patch",
+            "提议一个类型化 Campaign 修复（变量/知识/任务状态）。用户预览后才写盘。action 必须包含正确 target id（先 inspect 拿到真实 id）。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "修复描述"},
+                    "action": {
+                        "type": "object",
+                        "description": "TypedPatchAction JSON（kind + 参数）",
+                        "properties": {
+                            "kind": {"type": "string"}
+                        },
+                        "required": ["kind"]
+                    }
+                },
+                "required": ["description", "action"]
+            }),
+        ),
+        {
+            let session = session.clone();
+            move |args, _ctx| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let description = args
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("无描述")
+                        .to_string();
+                    let action_val = args
+                        .get("action")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let action: crate::typed_patch::TypedPatchAction =
+                        serde_json::from_value(action_val).map_err(|e| {
+                            storyforge_app_agent::tools::ToolError::BadArgs(format!(
+                                "action 解析失败: {e}"
+                            ))
+                        })?;
+
+                    // 从 campaign_runtime 快照构建 PreviewInput
+                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    let ctx = match rt.as_ref() {
+                        Some(ctx) => ctx,
+                        None => return Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
+                    };
+
+                    let definitions: Vec<_> = ctx.definitions_by_id.values().cloned().collect();
+                    let input = PreviewInput {
+                        instances: &ctx.instances,
+                        definitions: &definitions,
+                        knowledge: &ctx.knowledge,
+                        tasks: &[], // CampaignRuntimeContext 没有 tasks
+                        campaign: Some(&ctx.campaign),
+                    };
+
+                    match build_patch_from_action(description, action, &input) {
+                        Ok(patch) => {
+                            let patch_id = patch.id.clone();
+                            let desc = patch.description.clone();
+                            session.typed_patches.lock().unwrap_or_else(|p| p.into_inner()).push(patch);
+                            Ok(serde_json::json!({
+                                "patch_id": patch_id,
+                                "description": desc,
+                                "status": "已提议，等待用户预览/接受"
+                            }))
+                        }
+                        Err(e) => Ok(serde_json::json!({"error": format!("{e}")})),
+                    }
+                })
+            }
+        },
+    );
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", chars[..max_chars].iter().collect::<String>())
+    }
 }
 
 #[cfg(test)]
@@ -734,5 +1087,277 @@ mod tests {
             session.explainer.is_none(),
             "默认 MetaSession 的 explainer 应为 None"
         );
+    }
+
+    // ─── Campaign 工具注册测试 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_campaign_tools_registered() {
+        let session = Arc::new(MetaSession::new());
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session);
+
+        let specs = registry.tool_specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
+        assert!(names.contains(&"inspect_campaign"), "inspect_campaign 应已注册");
+        assert!(names.contains(&"inspect_instance"), "inspect_instance 应已注册");
+        assert!(names.contains(&"inspect_variables"), "inspect_variables 应已注册");
+        assert!(names.contains(&"inspect_knowledge"), "inspect_knowledge 应已注册");
+        assert!(names.contains(&"inspect_tasks"), "inspect_tasks 应已注册");
+        assert!(names.contains(&"propose_campaign_patch"), "propose_campaign_patch 应已注册");
+    }
+
+    // ─── Campaign handler 测试 helpers ─────────────────────────────────────
+
+    use storyforge_domain::campaign::{Campaign, CharacterInstance};
+    use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
+    use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+    use storyforge_domain::variables::{self, VariableValue};
+    use std::collections::HashMap;
+
+    fn make_test_campaign_runtime() -> Arc<CampaignRuntimeContext> {
+        use storyforge_domain::Id;
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
+        let def = CharacterDefinition {
+            id: Id::from_str("def-1"),
+            card_id: Id::from_str("card-1"),
+            name: "Alice".into(),
+            persona_prompt: "勇敢的冒险者".into(),
+            behavior_rules: "不要放弃".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: variables::default_character_variables(),
+        };
+        let inst = CharacterInstance::from_definition(Id::from_str("camp-1"), &def);
+        let knowledge = vec![CharacterKnowledgeEntry::witnessed(
+            Id::from_str("camp-1"),
+            inst.id.clone(),
+            "看到了龙",
+            1,
+        )];
+        let mut defs = HashMap::new();
+        defs.insert(def.id.clone(), def);
+
+        Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![inst],
+            definitions_by_id: defs,
+            knowledge,
+            turn: 3,
+        })
+    }
+
+    fn make_tool_ctx() -> Arc<storyforge_app_agent::tools::ToolContext> {
+        Arc::new(storyforge_app_agent::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        })
+    }
+
+    // ─── inspect_campaign 测试 ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_inspect_campaign_handler_returns_overview() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch("inspect_campaign", serde_json::json!({}), make_tool_ctx())
+            .await
+            .unwrap();
+        assert!(result.get("campaign_id").is_some(), "应返回 campaign_id");
+        assert_eq!(result["name"].as_str(), Some("测试 Campaign"));
+        assert_eq!(result["turn"].as_u64(), Some(3));
+        assert_eq!(result["instance_count"].as_u64(), Some(1));
+        assert_eq!(result["knowledge_count"].as_u64(), Some(1));
+        assert!(result.get("campaign_variables").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_inspect_campaign_handler_no_campaign() {
+        let session = Arc::new(MetaSession::new());
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch("inspect_campaign", serde_json::json!({}), make_tool_ctx())
+            .await
+            .unwrap();
+        assert!(
+            result.get("error").is_some(),
+            "无 campaign 时应返回 error"
+        );
+    }
+
+    // ─── inspect_instance 测试 ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_inspect_instance_by_id() {
+        let rt = make_test_campaign_runtime();
+        let inst_id = rt.instances[0].id.to_string();
+        let session = MetaSession::new();
+        session.set_campaign_runtime(rt);
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch(
+                "inspect_instance",
+                serde_json::json!({"instance_id_or_name": inst_id}),
+                make_tool_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["name"].as_str(), Some("Alice"));
+        assert_eq!(result["is_temporary"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_inspect_instance_by_name() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch(
+                "inspect_instance",
+                serde_json::json!({"instance_id_or_name": "Alice"}),
+                make_tool_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["name"].as_str(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn test_inspect_instance_not_found() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let result = registry
+            .dispatch(
+                "inspect_instance",
+                serde_json::json!({"instance_id_or_name": "不存在"}),
+                make_tool_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(result.get("error").is_some(), "找不到实例应返回 error");
+    }
+
+    // ─── propose_campaign_patch 测试 ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_propose_campaign_patch_valid_action() {
+        let rt = make_test_campaign_runtime();
+        let inst_id = rt.instances[0].id.to_string();
+        let session = MetaSession::new();
+        session.set_campaign_runtime(rt);
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "description": "修改 HP",
+            "action": {
+                "kind": "update_instance_variable",
+                "instance_id": inst_id,
+                "key": "hp",
+                "value": 80
+            }
+        });
+        let result = registry
+            .dispatch("propose_campaign_patch", args, make_tool_ctx())
+            .await
+            .unwrap();
+        assert!(result.get("patch_id").is_some(), "应返回 patch_id");
+        assert_eq!(result["status"].as_str(), Some("已提议，等待用户预览/接受"));
+
+        // session.typed_patches 应增长 1
+        let typed = session.typed_patches.lock().unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].source_issue_category, "agent_proposed");
+    }
+
+    #[tokio::test]
+    async fn test_propose_campaign_patch_target_missing() {
+        let session = MetaSession::new();
+        session.set_campaign_runtime(make_test_campaign_runtime());
+        let session = Arc::new(session);
+
+        let mut registry = storyforge_app_agent::tools::ToolRegistry::new();
+        register_meta_runtime_tools(&mut registry, session.clone());
+
+        let args = serde_json::json!({
+            "description": "修改不存在的实例",
+            "action": {
+                "kind": "update_instance_variable",
+                "instance_id": "nonexistent",
+                "key": "hp",
+                "value": 80
+            }
+        });
+        let result = registry
+            .dispatch("propose_campaign_patch", args, make_tool_ctx())
+            .await
+            .unwrap();
+        assert!(result.get("error").is_some(), "target 缺失应返回 error");
+
+        // session.typed_patches 不应增长
+        let typed = session.typed_patches.lock().unwrap();
+        assert_eq!(typed.len(), 0);
+    }
+
+    // ─── MetaTurn.new_typed_patches drain 测试 ─────────────────────────────
+
+    #[test]
+    fn test_meta_turn_drains_typed_patches() {
+        // 模拟：进入前有 0 条，工具 handler 添加 1 条，drain 后 new_typed_patches 非空
+        let session = Arc::new(MetaSession::new());
+        let typed_before = session.typed_patches.lock().unwrap().len();
+
+        // 模拟工具 handler 添加 patch
+        session.typed_patches.lock().unwrap().push(TypedPatch {
+            id: "test-1".into(),
+            description: "测试".into(),
+            source_issue_category: "agent_proposed".into(),
+            affected_id: None,
+            actions: vec![],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: crate::typed_patch::TypedPatchStatus::Pending,
+        });
+
+        let new_typed = {
+            let mut typed = session.typed_patches.lock().unwrap();
+            typed.drain(typed_before..).collect::<Vec<_>>()
+        };
+
+        assert_eq!(new_typed.len(), 1);
+        assert_eq!(new_typed[0].id, "test-1");
+        // session.typed_patches 应被 drain 清空
+        assert_eq!(session.typed_patches.lock().unwrap().len(), 0);
     }
 }

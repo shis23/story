@@ -29,7 +29,8 @@ pub use mvu_import::{
 };
 pub use typed_patch::{
     FieldDiff, PreviewInput, PreviewInputMut, TypedPatch, TypedPatchAction, TypedPatchError,
-    TypedPatchStatus, apply_to_snapshot, build_patch_for_issue, is_patch_stale,
+    TypedPatchStatus, apply_to_snapshot, build_patch_for_issue, build_patch_from_action,
+    is_patch_stale,
 };
 pub use mvu_apply::{
     MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview,

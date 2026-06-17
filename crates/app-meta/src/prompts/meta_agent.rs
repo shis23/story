@@ -38,6 +38,18 @@ pub const META_AGENT_SYSTEM_PROMPT: &str = r#"你是 StoryForge 的配置调试�
 - 回答用中文，简洁，先给结论再给依据
 - 提议 Patch 时，描述要清楚改什么、为什么改
 
+【Campaign 诊断（需 active Campaign）】
+当用户问及当前 Campaign 的实例、变量、知识、任务时，调用：
+- inspect_campaign：Campaign 概览（实例数/任务数/变量）
+- inspect_instance：查某角色的实例详情（persona/behavior/变量）
+- inspect_variables：查 Campaign 级或角色级变量
+- inspect_knowledge：查角色可见知识
+- inspect_tasks：查待办任务
+- propose_campaign_patch：提议类型化修复（变量/知识/任务状态），用户预览后才写盘
+
+无 active Campaign 时，明确告诉用户「当前没有 active Campaign，只能做角色卡/世界书层面诊断」。
+propose_campaign_patch 的 action 必须包含正确 target id（先 inspect 拿到真实 id 再提议）。
+
 【安全约束】
 - 你不能直接修改任何配置，只能提议 Patch
 - 不接触 API key、不调写作流水线
@@ -129,6 +141,105 @@ pub fn register_meta_tools(registry: &mut ToolRegistry) {
                     "classifications": {"type": "array"}
                 },
                 "required": ["classifications"]
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // ─── Campaign-aware 占位 spec（与 register_meta_runtime_tools 对齐）────
+
+    // inspect_campaign
+    registry.register(
+        ToolSpec::function(
+            "inspect_campaign",
+            "查看当前 active Campaign 概览：实例数/知识数/任务数/变量。",
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // inspect_instance
+    registry.register(
+        ToolSpec::function(
+            "inspect_instance",
+            "查看某角色实例详情：persona/behavior/变量。传 instance_id 或 name。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "instance_id_or_name": {"type": "string", "description": "实例 ID 或名称"}
+                },
+                "required": ["instance_id_or_name"]
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // inspect_variables
+    registry.register(
+        ToolSpec::function(
+            "inspect_variables",
+            "查看变量：scope=campaign 返回 Campaign 级变量，scope=instance 返回某实例变量。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["campaign", "instance"]},
+                    "instance_id_or_name": {"type": "string", "description": "scope=instance 时必填"}
+                },
+                "required": ["scope"]
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // inspect_knowledge
+    registry.register(
+        ToolSpec::function(
+            "inspect_knowledge",
+            "查看角色可见知识。无参返回全部，有 instance_id_or_name 则过滤。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "instance_id_or_name": {"type": "string", "description": "可选：按实例过滤"}
+                }
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // inspect_tasks
+    registry.register(
+        ToolSpec::function(
+            "inspect_tasks",
+            "查看任务列表。status=pending（默认）返回待办，status=all 返回全部。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["pending", "all"], "default": "pending"}
+                }
+            }),
+        ),
+        |args, _ctx| Box::pin(async move { Ok(args) }),
+    );
+
+    // propose_campaign_patch
+    registry.register(
+        ToolSpec::function(
+            "propose_campaign_patch",
+            "提议一个类型化 Campaign 修复（变量/知识/任务状态）。用户预览后才写盘。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "修复描述"},
+                    "action": {
+                        "type": "object",
+                        "description": "TypedPatchAction JSON（kind + 参数）",
+                        "properties": {
+                            "kind": {"type": "string"}
+                        },
+                        "required": ["kind"]
+                    }
+                },
+                "required": ["description", "action"]
             }),
         ),
         |args, _ctx| Box::pin(async move { Ok(args) }),
