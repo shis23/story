@@ -69,7 +69,7 @@ Respect these facts unless the current task explicitly changes them:
 - `CharacterInstance::temporary_with_overrides(campaign_id, name, persona_override, behavior_override)` creates a temporary instance with optional overrides (阶段 6).
 - `PipelineOrchestrator::pending_temporary_instances` stores temporaries created during the current turn; `start_writing` / `regenerate` clear stale pending data at the start, and Tauri reads via getter and persists before postprocess (阶段 6).
 - `persist_temporary_instances_to(store, ctx, temporaries)` writes temporary instances to CampaignStore only after the pipeline returns `Ok`, with existing-name dedup, same-batch dedup, and campaign_id mismatch guards (阶段 6).
-- `request_ad_hoc_character` tool is NOT implemented; unmatched character_id flow handles ad-hoc characters automatically.
+- `request_ad_hoc_character` tool is NOT implemented and was evaluated as unnecessary; unmatched character_id flow + `context_package.character_brief` as persona_override fully covers the ad-hoc character use case (see `docs/PLAN-CAMPAIGN-MAINLINE.md` Phase 6 evaluation).
 - `ToolContext` has `current_character_instance_id: Option<Id>` (阶段 4). Used by subagent `get_character` for information isolation.
 - `spawn_subagents` receives `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` (阶段 4). Matches instances, injects resolved persona/behavior/knowledge/variables.
 - `SubagentSnapshot` has `character_instance_id`, `display_name`, `fallback_reason` (阶段 5).

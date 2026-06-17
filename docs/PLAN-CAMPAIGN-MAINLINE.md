@@ -1,6 +1,6 @@
 # 计划：Campaign 写作主线
 
-> 状态：阶段 5 已补齐（2026-06-17），Postprocess ID 归一 + Provenance 收尾 + present_chars 校验 + task campaign 校验 + delete_character 级联修复；阶段 6 已完成落盘闭环（临时 instance 持久化 + postprocess 写回 + 去重），request_ad_hoc_character 工具未实现
+> 状态：阶段 5 已补齐（2026-06-17），Postprocess ID 归一 + Provenance 收尾 + present_chars 校验 + task campaign 校验 + delete_character 级联修复；阶段 6 已完成落盘闭环（临时 instance 持久化 + postprocess 写回 + 去重）；经评估，request_ad_hoc_character 工具不必实现（unmatched 兜底已覆盖，见阶段 6 说明）
 > 目标读者：可交给小模型按阶段执行
 > 关联：`docs/ARCHITECTURE-AUDIT.md`；归档背景：`docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`
 
@@ -46,7 +46,7 @@
 - `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮创建的临时 instance，Tauri 层通过 getter 读取后落盘；`start_writing` / `regenerate` 开始时会清空旧 pending，避免失败或重试污染下一轮。
 - `crates/app-pipeline/src/lib.rs::start_writing` / `regenerate` **阶段 6 已完成**：从 Director 的 `context_package.character_brief` 提取 persona 注入临时 instance，存储到 `pending_temporary_instances`。
 - `crates/tauri-app/src/lib.rs::persist_temporary_instances_to` **阶段 6 已完成**：只在 pipeline 返回 `Ok` 后、postprocess 之前把临时 instance 写入 CampaignStore；会跳过同 campaign 已存在同名 instance、同批重复临时 instance，以及 `campaign_id` 不匹配的临时 instance。落盘后 postprocess 知识/变量写回不再被跳过。
-- `request_ad_hoc_character` 工具**未实现**：当前用 unmatched character_id 自动触发，Director 的 character_brief 作为 persona 注入，不需要额外工具。
+- `request_ad_hoc_character` 工具**经评估不必实现**：当前 unmatched character_id 自动触发 + `context_package.character_brief` 作为 persona 注入已完整覆盖 Director 主动声明新角色的需求（见阶段 6 评估说明）。
 
 ## 阶段 0：基线保护
 
@@ -284,7 +284,7 @@ cargo test --workspace
 - 写作输出能改变下一轮 Campaign 上下文。
 - postprocess 不再靠裸名字盲写。
 
-## 阶段 6：临场角色（D34，单独阶段）（已完成落盘闭环，request_ad_hoc_character 未实现）
+## 阶段 6：临场角色（D34，单独阶段）（已完成落盘闭环，request_ad_hoc_character 经评估不必实现）
 
 目标：用户在游玩中提到新角色时，导演能提出临场角色创建请求，由 Tauri 层落盘为 `CharacterInstance::temporary`，下一轮写作可见。
 
@@ -297,7 +297,7 @@ cargo test --workspace
 - 已实现：去重和防串档逻辑——同一 campaign 内已存在同名 instance 时跳过创建，同一批次同名临时 instance 只写一次，`campaign_id` 不匹配的临时 instance 不写入。
 - 已实现：临时 instance 落盘后，`persist_postprocess_outcome` 的知识/变量写回能通过 `find_instance_by_name_or_id` 找到它们，不再被跳过。
 - 已实现：Director 的 `context_package.character_brief` 自动作为临时 instance 的 `persona_override` 注入。
-- 未实现：导演工具 `request_ad_hoc_character`（当前用 unmatched character_id 自动触发，不需要额外工具）。
+- **经评估不必实现**：导演工具 `request_ad_hoc_character`。现有机制已完整覆盖：Director 在 `emit_plan` 中使用任意 `character_id`，pipeline 的 `with_temporaries_for` 自动为未匹配 ID 创建临时 instance，`context_package.character_brief` 作为 `persona_override` 注入，Tauri 层在 pipeline 成功后落盘。单独做工具需 Director 先调用再 emit_plan，增加一轮 LLM 交互，且需在 Director tool loop 中处理跨工具产出依赖——当前架构不支持。见下方评估说明。
 - 已实现：前端展示临场角色（`is_temporary` 标记 + 临时 badge）和升格为常驻的 UI 流程（`CampaignPanel.vue` 中 `handlePromoteTemporary` 调用 `promoteTemporaryInstance`，带确认对话框、loading 状态、detail 刷新）。
 
 改动文件：
@@ -308,9 +308,23 @@ cargo test --workspace
 - `crates/app-agent/src/runtime.rs`：测试适配新签名
 - `crates/tauri-app/src/lib.rs`：+`persist_temporary_instances_to` helper，`start_writing`/`regenerate` 调用点集成
 
-关于 `request_ad_hoc_character` 的说明：
+关于 `request_ad_hoc_character` 的评估结论（2026-06-17）：
 
-当前 Director 工具循环中，Director 通过 `emit_plan` 输出 `subagent_tasks`，`character_id` 可以是任意字符串。`with_temporaries_for` 已经能为未匹配的 character_id 创建临时 instance。如果单独做 `request_ad_hoc_character` 工具，需要 Director 先调用此工具再 emit_plan，增加一轮 LLM 交互，且需要在 Director 的 tool loop 中特殊处理产出顺序——当前架构不支持"工具产出影响 emit_plan 的输入"这种跨工具依赖。用现有 unmatched character_id + persona 来自 context_package 的方式，零额外 LLM 开销，且不改 Director 工具循环。
+**判定：不必实现。** 现有 unmatched character_id 兜底机制已完整覆盖该工具的设计目标。
+
+代码证据（关键路径）：
+1. `app-pipeline/src/lib.rs:348-358`：从 `plan.subagent_tasks` 提取 `(character_id, character_brief as persona, None)` 构建 `char_specs`。
+2. `domain/campaign_runtime.rs:94-130`：`with_temporaries_for(&char_specs)` 为未匹配 ID 创建 `CharacterInstance::temporary_with_overrides`，persona/behavior override 来自 specs。
+3. `app-agent/src/runtime.rs:530-538`：`spawn_subagents` 通过 `find_instance_by_id_or_name` 匹配临时 instance，进入 Campaign 子 Agent 路径。
+4. `app-agent/src/runtime.rs:666-686`：`build_campaign_subagent_system` 使用 `cr.resolved_persona_for(inst)` 获取 persona（override 优先于 definition），构造 system prompt。
+5. `tauri-app/src/lib.rs:1523`：pipeline 成功后通过 `pending_temporary_instances()` 读取临时 instance，调用 `persist_temporary_instances_to` 落盘。
+
+等价性分析：
+- `request_ad_hoc_character` 的设计目标是让 Director 主动声明新角色（带 persona）。
+- 现有路径：Director 在 `emit_plan` 的 `subagent_tasks` 中使用任意 `character_id` + `context_package.character_brief`（persona）→ pipeline 自动创建临时 instance → subagent 获得 persona → Tauri 落盘。
+- 两条路径功能等价，现有路径零额外 LLM 开销，且不需修改 Director 工具循环的跨工具产出依赖。
+
+如果单独做 `request_ad_hoc_character` 工具，需要 Director 先调用此工具再 emit_plan，增加一轮 LLM 交互，且需要在 Director 的 tool loop 中特殊处理产出顺序——当前架构不支持"工具产出影响 emit_plan 的输入"这种跨工具依赖。用现有 unmatched character_id + persona 来自 context_package 的方式，零额外 LLM 开销，且不改 Director 工具循环。
 
 ## 回滚策略
 
