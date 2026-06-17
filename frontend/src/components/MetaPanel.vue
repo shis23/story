@@ -5,10 +5,14 @@ import {
   metaAcceptPatch, metaDismissPatch,
   metaAnalyzeMvuCard, metaListMvuTranslations,
   listCharacters, metaHealthCheck,
+  metaProposeCampaignRepairs, metaPreviewTypedPatch,
+  metaAcceptTypedPatch, metaDismissTypedPatch,
+  metaExplainGeneration,
 } from '../tauri-api.js'
 
 const props = defineProps({
   activeCampaign: { type: Object, default: null },
+  lastConversationNode: { type: Object, default: null }, // { conversation_id, node_id } — 生成溯源入口
 })
 
 const emit = defineEmits(['close'])
@@ -33,6 +37,15 @@ const characters = ref([])
 const healthIssues = ref([]) // HealthIssue[]
 const healthLoading = ref(false)
 const healthRan = ref(false) // 区分「未检查」和「检查后无问题」
+
+// ─── 类型化修复建议（第三轮） ───
+const typedPatches = ref([]) // TypedPatch[]
+const patchesLoading = ref(false)
+const expandedTypedPatchId = ref(null) // 展开的 typed patch id
+
+// ─── 生成溯源 ───
+const explainLoading = ref(false)
+const explainResult = ref(null) // GenerationExplanation
 
 onMounted(async () => {
   // 初始化对话
@@ -166,6 +179,66 @@ async function handleHealthCheck() {
   }
 }
 
+// ─── 类型化修复建议 ───
+async function handleProposeRepairs() {
+  if (!props.activeCampaign?.id) return
+  patchesLoading.value = true
+  error.value = ''
+  try {
+    const patches = await metaProposeCampaignRepairs(props.activeCampaign.id)
+    typedPatches.value = patches || []
+    // 对每条 patch 跑 preview，标记 stale
+    for (const p of typedPatches.value) {
+      try {
+        const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
+        p._stale = prev?.stale || false
+      } catch (e) { p._stale = false }
+    }
+  } catch (e) {
+    error.value = '生成修复方案失败: ' + e
+  } finally {
+    patchesLoading.value = false
+  }
+}
+
+async function handleAcceptTypedPatch(patchId) {
+  try {
+    await metaAcceptTypedPatch(patchId, props.activeCampaign.id)
+    typedPatches.value = typedPatches.value.filter(p => p.id !== patchId)
+    // 刷新体检（让用户看到问题减少）
+    await handleHealthCheck()
+  } catch (e) {
+    error.value = '接受修复失败: ' + e
+  }
+}
+
+async function handleDismissTypedPatch(patchId) {
+  try {
+    await metaDismissTypedPatch(patchId)
+    typedPatches.value = typedPatches.value.filter(p => p.id !== patchId)
+  } catch (e) {
+    error.value = '忽略修复失败: ' + e
+  }
+}
+
+// ─── 生成溯源 ───
+async function handleExplainGeneration() {
+  if (!props.lastConversationNode) return
+  explainLoading.value = true
+  explainResult.value = null
+  error.value = ''
+  try {
+    explainResult.value = await metaExplainGeneration(
+      props.lastConversationNode.conversation_id,
+      props.lastConversationNode.node_id
+    )
+  } catch (e) {
+    error.value = '生成溯源失败: ' + e
+  } finally {
+    explainLoading.value = false
+  }
+}
+
 // 工具：判断消息是否有结构化工具结果
 function hasToolResult(msg) {
   return msg.tool_result && msg.tool_result.kind && msg.tool_result.kind !== 'none'
@@ -188,6 +261,14 @@ function routingText(routing) {
   if (routing.Native || routing.kind === 'native') return '原生'
   const reason = routing.webview_reason || (routing.Hybrid && routing.Hybrid.webview_reason) || ''
   return `混合（${reason}）`
+}
+
+// 工具：格式化 diff 值（serde_json::Value）
+function formatDiffValue(val) {
+  if (val === null || val === undefined) return '（无）'
+  if (typeof val === 'string') return val
+  if (typeof val === 'object') return JSON.stringify(val, null, 2)
+  return String(val)
 }
 </script>
 
@@ -400,6 +481,115 @@ function routingText(routing) {
               </div>
             </div>
           </div>
+
+          <!-- 🔧 修复建议（第三轮：类型化 Patch 闭环） -->
+          <div>
+            <div class="text-xs font-medium text-ink mb-2">🔧 修复建议</div>
+            <button
+              v-if="healthRan && healthIssues.length > 0"
+              @click="handleProposeRepairs"
+              :disabled="patchesLoading || !activeCampaign"
+              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+            >
+              {{ patchesLoading ? '生成中…' : '生成修复方案' }}
+            </button>
+            <div v-if="!healthRan || healthIssues.length === 0" class="text-[10px] text-ink-soft">
+              先运行体检，有问题时可生成修复方案
+            </div>
+            <div v-else-if="typedPatches.length === 0 && !patchesLoading" class="text-[10px] text-ink-soft">
+              点击上方按钮生成修复方案
+            </div>
+            <div v-else class="space-y-2">
+              <div
+                v-for="patch in typedPatches" :key="patch.id"
+                class="bg-surface rounded-lg border p-2 text-[10px]"
+                :class="patch._stale ? 'border-warn/30 opacity-70' : 'border-line'"
+              >
+                <div class="flex items-center gap-1 mb-1">
+                  <span class="px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-accent/15 text-accent">
+                    {{ patch.source_issue_category }}
+                  </span>
+                  <span v-if="patch._stale" class="text-warn text-[9px]">⚠️ 已过期</span>
+                </div>
+                <div class="text-ink font-medium mb-1">{{ patch.description }}</div>
+                <div v-if="patch.affected_id" class="text-ink-soft mb-1 break-all">ID: {{ patch.affected_id }}</div>
+                <!-- 展开/折叠 diff -->
+                <button
+                  @click="expandedTypedPatchId = expandedTypedPatchId === patch.id ? null : patch.id"
+                  class="text-ink-soft underline"
+                >{{ expandedTypedPatchId === patch.id ? '收起 diff' : '查看 diff' }}</button>
+                <div v-if="expandedTypedPatchId === patch.id && patch.diff && patch.diff.length > 0" class="mt-1.5 space-y-1">
+                  <div
+                    v-for="(d, di) in patch.diff" :key="di"
+                    class="bg-bg rounded px-1.5 py-1 border border-line/50"
+                  >
+                    <div class="text-ink-soft font-medium mb-0.5">{{ d.path }}</div>
+                    <div class="flex gap-1 items-start">
+                      <div class="flex-1 min-w-0">
+                        <div class="text-[9px] text-ink-soft mb-0.5">Before</div>
+                        <pre class="text-[9px] overflow-x-auto text-error/70 whitespace-pre-wrap break-all">{{ formatDiffValue(d.before) }}</pre>
+                      </div>
+                      <div class="text-ink-soft shrink-0 px-0.5">→</div>
+                      <div class="flex-1 min-w-0">
+                        <div class="text-[9px] text-ink-soft mb-0.5">After</div>
+                        <pre class="text-[9px] overflow-x-auto text-ok/70 whitespace-pre-wrap break-all">{{ formatDiffValue(d.after) }}</pre>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <!-- 操作按钮 -->
+                <div class="flex gap-1 mt-2">
+                  <button
+                    @click="handleAcceptTypedPatch(patch.id)"
+                    :disabled="patch._stale"
+                    class="flex-1 py-1 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >接受</button>
+                  <button
+                    @click="handleDismissTypedPatch(patch.id)"
+                    class="flex-1 py-1 rounded text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20"
+                  >忽略</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 🔍 生成溯源（prop 就绪即可用） -->
+          <div v-if="lastConversationNode">
+            <div class="text-xs font-medium text-ink mb-2">🔍 生成溯源</div>
+            <button
+              @click="handleExplainGeneration"
+              :disabled="explainLoading"
+              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+            >
+              {{ explainLoading ? '查询中…' : '解释上一条生成' }}
+            </button>
+            <div v-if="explainResult" class="bg-surface rounded-lg border border-line p-2 text-[10px] space-y-1">
+              <div v-if="explainResult.scene_brief" class="text-ink">
+                <span class="text-ink-soft">场景：</span>{{ explainResult.scene_brief }}
+              </div>
+              <div v-if="explainResult.profile_id" class="text-ink-soft">
+                Profile: {{ explainResult.profile_id }}
+              </div>
+              <div v-if="explainResult.seed !== undefined && explainResult.seed !== null" class="text-ink-soft">
+                Seed: {{ explainResult.seed }}
+              </div>
+              <div v-if="explainResult.last_hint" class="text-ink-soft">
+                Hint: {{ explainResult.last_hint }}
+              </div>
+              <div v-if="explainResult.subagents && explainResult.subagents.length > 0">
+                <div class="font-medium text-ink mt-1 mb-0.5">子 Agent</div>
+                <div
+                  v-for="(sa, si) in explainResult.subagents" :key="si"
+                  class="bg-bg rounded px-1.5 py-1 mb-1 border border-line/50"
+                >
+                  <div class="text-ink font-medium">{{ sa.display_name || 'Agent ' + (si + 1) }}</div>
+                  <div v-if="sa.task_brief" class="text-ink-soft">{{ sa.task_brief }}</div>
+                  <div v-if="sa.output_preview" class="text-ink-soft mt-0.5 line-clamp-3">{{ sa.output_preview }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
 
