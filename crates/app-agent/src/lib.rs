@@ -1,4 +1,5 @@
 pub mod llm_parse;
+pub mod tool_center;
 /// Agent 运行时（对应设计 §3.2 + §3.4）
 ///
 /// 核心能力：
@@ -26,3 +27,4 @@ pub use runtime::{
     SUBAGENT_HINT_MARKER, inject_hint_into_editor, inject_hint_into_subagent, spawn_subagents,
 };
 pub use tools::{ToolContext, ToolError, ToolRegistry, filter_registry_by_whitelist};
+pub use tool_center::{ToolCenter, ToolScope, ToolSummary, role_matches};
