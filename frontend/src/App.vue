@@ -54,6 +54,7 @@ const pipeline = reactive({
   director: { status: 'idle', detail: '', output: '' },
   subagents: [],
   editor: { status: 'idle', detail: '', output: '' },
+  postprocess: { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' },
 })
 
 // 消息列表容器 ref（自动滚动用）
@@ -290,6 +291,7 @@ async function startWriting(intent, skipLocalPush = false) {
   pipeline.director = { status: 'idle', detail: '', output: '' }
   pipeline.subagents = []
   pipeline.editor = { status: 'idle', detail: '', output: '' }
+  pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
   // 清除编剧流式消息占位（上次写作残留）
   messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
@@ -384,6 +386,7 @@ async function handleReroll({ messageId, kind, hint }) {
   pipeline.director = { status: 'idle', detail: '', output: '' }
   pipeline.subagents = []
   pipeline.editor = { status: 'idle', detail: '', output: '' }
+  pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
   messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
   // 构造 targets
@@ -483,6 +486,7 @@ async function handleDeleteVariant({ nodeId }) {
     pipeline.director = { status: 'idle', detail: '', output: '' }
     pipeline.subagents = []
     pipeline.editor = { status: 'idle', detail: '', output: '' }
+    pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
     showPipeline.value = false
   } catch (e) {
     console.error('删除失败:', e)
@@ -514,6 +518,7 @@ async function handleRerollUser({ messageId }) {
   pipeline.director = { status: 'idle', detail: '', output: '' }
   pipeline.subagents = []
   pipeline.editor = { status: 'idle', detail: '', output: '' }
+  pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
   messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
 
   try {
@@ -671,6 +676,31 @@ function handlePipelineEvent(event) {
       pipeline.editor = { status: 'done', detail: '成文完成' }
       pipeline.stateLabel = '已产出'
       // 占位消息保留，startWriting 的 applyConversation 会用后端最终数据替换
+      break
+    case 'postprocess_started':
+      pipeline.postprocess = { status: 'running', detail: '提取知识 · 更新变量 · 检测任务', knowledge: 0, variable: 0, task: 0, reason: '' }
+      break
+    case 'postprocess_done':
+      pipeline.postprocess = {
+        status: 'done',
+        detail: `知识 ${event.data.knowledge_count || 0} · 变量 ${event.data.variable_count || 0} · 任务 ${event.data.task_count || 0}`,
+        knowledge: event.data.knowledge_count || 0,
+        variable: event.data.variable_count || 0,
+        task: event.data.task_count || 0,
+        reason: '',
+      }
+      break
+    case 'postprocess_failed':
+      pipeline.postprocess = { status: 'error', detail: '后处理失败', knowledge: 0, variable: 0, task: 0, reason: event.data.reason || '' }
+      break
+    case 'postprocess_skipped':
+      pipeline.postprocess = { status: 'done', detail: '已跳过', knowledge: 0, variable: 0, task: 0, reason: event.data.reason || '' }
+      break
+    case 'summary_done':
+      // 摘要是后处理子步骤，记到 postprocess detail
+      if (pipeline.postprocess.status === 'running') {
+        pipeline.postprocess.detail = `摘要 ${event.data.char_count || 0} 字 · 提取中`
+      }
       break
     case 'error':
       pipeline.stateLabel = `错误: ${event.data.message}`

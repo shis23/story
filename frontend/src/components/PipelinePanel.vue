@@ -1,23 +1,41 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 
 defineProps({
-  pipeline: { type: Object, required: true }, // { state, director, subagents, editor }
+  pipeline: { type: Object, required: true },
 })
 
 // 状态 → 颜色/图标
 const statusMeta = {
   done: { dot: 'bg-ok', text: 'text-ok', label: '完成' },
-  running: { dot: 'bg-running', text: 'text-running', label: '生成中' },
+  running: { dot: 'bg-running', text: 'text-running', label: '运行中' },
   waiting: { dot: 'bg-wait', text: 'text-wait', label: '等待' },
+  pending: { dot: 'bg-wait', text: 'text-wait', label: '等待' },
+  cancelled: { dot: 'bg-warn', text: 'text-warn', label: '已取消' },
+  error: { dot: 'bg-err', text: 'text-err', label: '失败' },
   idle: { dot: 'bg-ink-soft/40', text: 'text-ink-soft', label: '' },
 }
 
 function meta(s) { return statusMeta[s] || statusMeta.idle }
 
-// 导演/编剧输出折叠状态
-const showDirectorOutput = ref(true)
-const showEditorOutput = ref(true)
+// ─── 折叠状态 ──────────────────────────────────────────────────────────
+const expandedDirector = ref(true)
+const expandedSubagents = ref(true)
+const expandedEditor = ref(true)
+const expandedPostprocess = ref(true)
+
+// 子 Agent 展开状态（用 Set 追踪展开的 index）
+const expandedSubagentIndices = ref(new Set())
+function toggleSubagentExpand(index) {
+  if (expandedSubagentIndices.value.has(index)) {
+    expandedSubagentIndices.value.delete(index)
+  } else {
+    expandedSubagentIndices.value.add(index)
+  }
+}
+function isSubagentExpanded(index) {
+  return expandedSubagentIndices.value.has(index)
+}
 </script>
 
 <template>
@@ -29,90 +47,159 @@ const showEditorOutput = ref(true)
       <span class="text-xs text-ink-soft ml-auto">{{ pipeline.stateLabel }}</span>
     </div>
 
-    <div class="px-4 py-3 space-y-3">
-      <!-- 导演 -->
-      <div>
-        <div class="flex items-center gap-2.5">
+    <div class="px-4 py-3 space-y-1">
+      <!-- ═══ 导演段 ═══ -->
+      <div class="rounded-lg overflow-hidden">
+        <button
+          class="w-full flex items-center gap-2.5 px-2 py-2 hover:bg-line/30 rounded-lg transition-colors"
+          @click="expandedDirector = !expandedDirector"
+        >
+          <span class="text-[10px] text-ink-soft/60 w-3 text-center">{{ expandedDirector ? '▾' : '▸' }}</span>
           <span class="text-base">🎬</span>
-          <div class="flex-1">
+          <div class="flex-1 text-left min-w-0">
             <div class="text-sm font-medium">导演</div>
-            <div class="text-xs text-ink-soft">{{ pipeline.director.detail }}</div>
+            <div class="text-xs text-ink-soft truncate">{{ pipeline.director.detail }}</div>
           </div>
-          <div class="flex items-center gap-1.5" :class="meta(pipeline.director.status).text">
-            <div class="w-1.5 h-1.5 rounded-full" :class="[meta(pipeline.director.status).dot, pipeline.director.status==='running' ? 'animate-pulse' : '']"></div>
+          <div class="flex items-center gap-1.5 shrink-0" :class="meta(pipeline.director.status).text">
+            <div class="w-1.5 h-1.5 rounded-full" :class="[meta(pipeline.director.status).dot, pipeline.director.status === 'running' ? 'animate-pulse' : '']"></div>
             <span class="text-xs">{{ meta(pipeline.director.status).label }}</span>
           </div>
-        </div>
-        <!-- 导演实时输出 -->
-        <div v-if="pipeline.director.output" class="mt-1.5 ml-7">
-          <button
-            @click="showDirectorOutput = !showDirectorOutput"
-            class="text-[10px] text-ink-soft hover:text-ink"
-          >{{ showDirectorOutput ? '▾ 隐藏输出' : '▸ 查看输出' }}</button>
-          <pre
-            v-if="showDirectorOutput"
-            class="mt-1 p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed"
-          >{{ pipeline.director.output }}</pre>
+        </button>
+        <div v-if="expandedDirector && pipeline.director.output" class="px-2 pb-2 ml-8">
+          <pre class="p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border border-line/50">{{ pipeline.director.output }}</pre>
         </div>
       </div>
 
-      <!-- 子 Agent（并行） -->
-      <div class="pl-6 border-l-2 border-dashed border-line space-y-2">
-        <div class="text-[11px] text-ink-soft -ml-6 mb-1">子 Agent · 并行</div>
-        <div v-for="sub in pipeline.subagents" :key="sub.id">
-          <div class="flex items-center gap-2.5">
-            <span class="text-sm">{{ sub.emoji }}</span>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm truncate">{{ sub.name }}</div>
-              <!-- 流式进度条 -->
-              <div v-if="sub.status === 'running'" class="h-1 bg-bg rounded-full mt-1 overflow-hidden">
-                <div class="h-full bg-running rounded-full transition-all duration-500" :style="{ width: sub.progress + '%' }"></div>
-              </div>
-            </div>
-            <div class="flex items-center gap-1.5 shrink-0" :class="meta(sub.status).text">
-              <div class="w-1.5 h-1.5 rounded-full" :class="[meta(sub.status).dot, sub.status==='running' ? 'animate-pulse' : '']"></div>
-              <span class="text-xs">{{ meta(sub.status).label }}{{ sub.status === 'running' ? ' ' + sub.progress + '%' : '' }}</span>
+      <!-- 连接线 -->
+      <div class="ml-4 h-3 border-l-2 border-dashed border-line"></div>
+
+      <!-- ═══ 子 Agent 段 ═══ -->
+      <div class="rounded-lg overflow-hidden">
+        <button
+          class="w-full flex items-center gap-2.5 px-2 py-2 hover:bg-line/30 rounded-lg transition-colors"
+          @click="expandedSubagents = !expandedSubagents"
+        >
+          <span class="text-[10px] text-ink-soft/60 w-3 text-center">{{ expandedSubagents ? '▾' : '▸' }}</span>
+          <span class="text-base">🎭</span>
+          <div class="flex-1 text-left min-w-0">
+            <div class="text-sm font-medium">子 Agent · 并行</div>
+            <div class="text-xs text-ink-soft">
+              <template v-if="pipeline.subagents.length === 0">等待分配</template>
+              <template v-else>{{ pipeline.subagents.filter(s => s.status === 'done').length }} / {{ pipeline.subagents.length }} 完成</template>
             </div>
           </div>
-          <!-- 子 Agent 产出文本（完成后展示，可折叠） -->
-          <div v-if="sub.output" class="mt-1">
+          <div class="flex items-center gap-1.5 shrink-0">
+            <template v-for="(sub, i) in pipeline.subagents" :key="i">
+              <div class="w-1.5 h-1.5 rounded-full" :class="meta(sub.status).dot"></div>
+            </template>
+          </div>
+        </button>
+
+        <div v-if="expandedSubagents && pipeline.subagents.length > 0" class="px-2 pb-2 ml-8 space-y-1">
+          <div
+            v-for="(sub, i) in pipeline.subagents"
+            :key="i"
+            class="rounded-lg border border-line/50 overflow-hidden"
+          >
+            <!-- 子 Agent 标题行 -->
             <button
-              @click="sub._expanded = !sub._expanded"
-              class="text-[10px] text-ink-soft hover:text-ink"
-            >{{ sub._expanded ? '▾ 隐藏表演' : '▸ 查看表演' }}</button>
-            <pre
-              v-if="sub._expanded"
-              class="mt-1 p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed"
-            >{{ sub.output }}</pre>
+              class="w-full flex items-center gap-2 px-2 py-1.5 hover:bg-line/20 transition-colors"
+              @click="toggleSubagentExpand(i)"
+            >
+              <span class="text-[10px] text-ink-soft/60 w-3 text-center">{{ isSubagentExpanded(i) ? '▾' : '▸' }}</span>
+              <span class="text-sm">{{ sub.emoji }}</span>
+              <div class="flex-1 text-left min-w-0">
+                <div class="text-xs font-medium truncate">{{ sub.name || sub.id || '角色 ' + (i + 1) }}</div>
+                <!-- 运行中时显示进度条 -->
+                <div v-if="sub.status === 'running'" class="h-1 bg-bg rounded-full mt-1 overflow-hidden">
+                  <div class="h-full bg-running rounded-full transition-all duration-500" :style="{ width: sub.progress + '%' }"></div>
+                </div>
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0" :class="meta(sub.status).text">
+                <div class="w-1.5 h-1.5 rounded-full" :class="[meta(sub.status).dot, sub.status === 'running' ? 'animate-pulse' : '']"></div>
+                <span class="text-[11px]">{{ meta(sub.status).label }}{{ sub.status === 'running' ? ' ' + sub.progress + '%' : '' }}</span>
+              </div>
+            </button>
+            <!-- 子 Agent 展开输出 -->
+            <div v-if="isSubagentExpanded(i) && sub.output" class="px-2 pb-2">
+              <pre class="p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border border-line/50">{{ sub.output }}</pre>
+            </div>
+            <div v-else-if="isSubagentExpanded(i) && !sub.output && sub.status !== 'running'" class="px-2 pb-2">
+              <div class="text-[11px] text-ink-soft/50 italic px-2">暂无输出</div>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- 编剧 -->
-      <div>
-        <div class="flex items-center gap-2.5">
+      <!-- 连接线 -->
+      <div class="ml-4 h-3 border-l-2 border-dashed border-line"></div>
+
+      <!-- ═══ 编剧段 ═══ -->
+      <div class="rounded-lg overflow-hidden">
+        <button
+          class="w-full flex items-center gap-2.5 px-2 py-2 hover:bg-line/30 rounded-lg transition-colors"
+          @click="expandedEditor = !expandedEditor"
+        >
+          <span class="text-[10px] text-ink-soft/60 w-3 text-center">{{ expandedEditor ? '▾' : '▸' }}</span>
           <span class="text-base">✍️</span>
-          <div class="flex-1">
+          <div class="flex-1 text-left min-w-0">
             <div class="text-sm font-medium">编剧</div>
-            <div class="text-xs text-ink-soft">{{ pipeline.editor.detail }}</div>
+            <div class="text-xs text-ink-soft truncate">{{ pipeline.editor.detail }}</div>
           </div>
-          <div class="flex items-center gap-1.5" :class="meta(pipeline.editor.status).text">
-            <div class="w-1.5 h-1.5 rounded-full" :class="[meta(pipeline.editor.status).dot, pipeline.editor.status==='running' ? 'animate-pulse' : '']"></div>
+          <div class="flex items-center gap-1.5 shrink-0" :class="meta(pipeline.editor.status).text">
+            <div class="w-1.5 h-1.5 rounded-full" :class="[meta(pipeline.editor.status).dot, pipeline.editor.status === 'running' ? 'animate-pulse' : '']"></div>
             <span class="text-xs">{{ meta(pipeline.editor.status).label }}</span>
           </div>
-        </div>
-        <!-- 编剧实时输出 -->
-        <div v-if="pipeline.editor.output" class="mt-1.5 ml-7">
-          <button
-            @click="showEditorOutput = !showEditorOutput"
-            class="text-[10px] text-ink-soft hover:text-ink"
-          >{{ showEditorOutput ? '▾ 隐藏成文' : '▸ 查看成文' }}</button>
-          <pre
-            v-if="showEditorOutput"
-            class="mt-1 p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed"
-          >{{ pipeline.editor.output }}</pre>
+        </button>
+        <div v-if="expandedEditor && pipeline.editor.output" class="px-2 pb-2 ml-8">
+          <pre class="p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed border border-line/50">{{ pipeline.editor.output }}</pre>
         </div>
       </div>
+
+      <!-- ═══ 后处理段（仅在有数据时显示） ═══ -->
+      <template v-if="pipeline.postprocess && pipeline.postprocess.status !== 'idle'">
+        <!-- 连接线 -->
+        <div class="ml-4 h-3 border-l-2 border-dashed border-line"></div>
+
+        <div class="rounded-lg overflow-hidden">
+          <button
+            class="w-full flex items-center gap-2.5 px-2 py-2 hover:bg-line/30 rounded-lg transition-colors"
+            @click="expandedPostprocess = !expandedPostprocess"
+          >
+            <span class="text-[10px] text-ink-soft/60 w-3 text-center">{{ expandedPostprocess ? '▾' : '▸' }}</span>
+            <span class="text-base">📦</span>
+            <div class="flex-1 text-left min-w-0">
+              <div class="text-sm font-medium">后处理</div>
+              <div class="text-xs text-ink-soft truncate">{{ pipeline.postprocess.detail }}</div>
+            </div>
+            <div class="flex items-center gap-1.5 shrink-0" :class="meta(pipeline.postprocess.status).text">
+              <div class="w-1.5 h-1.5 rounded-full" :class="[meta(pipeline.postprocess.status).dot, pipeline.postprocess.status === 'running' ? 'animate-pulse' : '']"></div>
+              <span class="text-xs">{{ meta(pipeline.postprocess.status).label }}</span>
+            </div>
+          </button>
+          <div v-if="expandedPostprocess" class="px-2 pb-2 ml-8">
+            <!-- 成功：显示三项计数 -->
+            <div v-if="pipeline.postprocess.status === 'done' && !pipeline.postprocess.reason" class="flex gap-3 text-xs">
+              <span class="px-2 py-0.5 bg-accent-soft/50 rounded text-accent">知识 {{ pipeline.postprocess.knowledge }}</span>
+              <span class="px-2 py-0.5 bg-accent-soft/50 rounded text-accent">变量 {{ pipeline.postprocess.variable }}</span>
+              <span class="px-2 py-0.5 bg-accent-soft/50 rounded text-accent">任务 {{ pipeline.postprocess.task }}</span>
+            </div>
+            <!-- 跳过/失败：显示 reason -->
+            <div v-else-if="pipeline.postprocess.reason" class="text-[11px] text-ink-soft bg-bg rounded-lg p-2 border border-line/50">
+              <span class="text-ink-soft/60">原因：</span>{{ pipeline.postprocess.reason }}
+            </div>
+            <!-- 运行中 -->
+            <div v-else-if="pipeline.postprocess.status === 'running'" class="text-[11px] text-ink-soft/50 italic">
+              处理中…
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 底部 extra slot（停止按钮等） -->
+    <div v-if="$slots.extra" class="px-4 pb-3">
+      <slot name="extra" />
     </div>
   </div>
 </template>

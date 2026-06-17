@@ -105,7 +105,7 @@
 - CampaignPanel 不再是一个超长单文件。
 - 移动端每个 tab 可独立滚动。
 
-## 阶段 4：Pipeline trace 使用 instance display name
+## 阶段 4：Pipeline trace 使用 instance display name（已起步）
 
 前置：
 
