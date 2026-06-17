@@ -12,7 +12,7 @@
 - `CampaignStore` 位于 `tauri-app`，下层 `app-agent` / `app-pipeline` 不应直接依赖它。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
 - Meta、MVU、Android、前端计划多数是基于已有雏形的后续计划，不是当前已完成能力。
-- 临场角色后端已完成落盘闭环：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端展示和“升格为常驻”UI 仍是未来工作。
+- 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。
 
 文档可以继续作为后续执行依据，但执行前应注意本文列出的“规划性内容”和“缺口”。
 
