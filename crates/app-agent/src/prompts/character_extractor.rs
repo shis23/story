@@ -8,8 +8,8 @@
 use storyforge_domain::agent::AgentRole;
 use storyforge_domain::character::Character;
 
-use crate::tools::ToolRegistry;
 use crate::AgentConfig;
+use crate::tools::ToolRegistry;
 
 /// 角色识别 Agent 系统提示词（含 JSON 输出格式示例）
 ///
@@ -153,9 +153,7 @@ pub fn register_character_extractor_tools(registry: &mut ToolRegistry) {
                 "required": ["characters"]
             }),
         ),
-        |args, _ctx| {
-            Box::pin(async move { Ok(args) })
-        },
+        |args, _ctx| Box::pin(async move { Ok(args) }),
     );
 }
 

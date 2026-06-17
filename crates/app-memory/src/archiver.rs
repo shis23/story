@@ -235,7 +235,8 @@ async fn archive_batch(
 ///
 /// 对 CJK 文本使用 bigram 分词，对拉丁文本使用整词。
 fn extract_keywords(text: &str) -> Vec<String> {
-    let mut word_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut word_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // 按空白和标点（含 CJK 标点）分段
     for segment in text.split(|c: char| c.is_whitespace() || is_punctuation(c)) {

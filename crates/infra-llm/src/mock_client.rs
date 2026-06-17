@@ -59,7 +59,10 @@ impl MockLlmClient {
 
 #[async_trait]
 impl crate::LlmClient for MockLlmClient {
-    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, storyforge_domain::llm::LlmError> {
+    async fn chat(
+        &self,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, storyforge_domain::llm::LlmError> {
         let script = self.find_script(req);
 
         let (content, tool_calls) = if let Some(s) = script {
@@ -94,9 +97,7 @@ impl crate::LlmClient for MockLlmClient {
         let content = script
             .map(|s| s.response_content.clone())
             .unwrap_or_else(|| "（Mock 默认响应）".to_string());
-        let tool_calls = script
-            .map(|s| s.tool_calls.clone())
-            .unwrap_or_default();
+        let tool_calls = script.map(|s| s.tool_calls.clone()).unwrap_or_default();
         let do_stream = script.map(|s| s.stream).unwrap_or(true);
 
         if do_stream {
@@ -122,7 +123,11 @@ impl crate::LlmClient for MockLlmClient {
 
         // 发送最终 chunk
         let _ = tx.send(StreamChunk {
-            delta_content: if do_stream { None } else { Some(content.clone()) },
+            delta_content: if do_stream {
+                None
+            } else {
+                Some(content.clone())
+            },
             delta_tool_calls: if tool_calls.is_empty() {
                 None
             } else {

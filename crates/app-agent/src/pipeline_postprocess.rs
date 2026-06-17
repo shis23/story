@@ -150,8 +150,8 @@ pub async fn run_postprocess_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::tools::ToolContext;
+    use std::sync::Arc;
     use storyforge_infra_llm::LlmClient;
     use storyforge_infra_llm::mock_client::MockLlmClient;
 
@@ -187,10 +187,7 @@ mod tests {
 
         // mock 脚本两个 Agent 都应产出（summary 非空，postprocess 非空）
         assert!(outcome.summary.is_some(), "mock 总结应成功");
-        assert!(
-            outcome.post_process.is_some(),
-            "mock 后处理应成功"
-        );
+        assert!(outcome.post_process.is_some(), "mock 后处理应成功");
         if let Some(pp) = &outcome.post_process {
             // mock 后处理脚本产出至少一条更新（知识/变量/任务任一）
             assert!(

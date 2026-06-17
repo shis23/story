@@ -23,11 +23,7 @@ pub struct LlmInterceptor {
 }
 
 impl LlmInterceptor {
-    pub fn new(
-        inner: Arc<dyn LlmClient>,
-        store: Arc<LogStore>,
-        connection_name: String,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn LlmClient>, store: Arc<LogStore>, connection_name: String) -> Self {
         Self {
             inner,
             store,
@@ -43,8 +39,8 @@ impl LlmInterceptor {
         error: Option<&str>,
         latency_ms: u64,
     ) -> LogEntry {
-        let request_payload = serde_json::to_string(&req.messages)
-            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_payload =
+            serde_json::to_string(&req.messages).unwrap_or_else(|_| "<serialization error>".into());
 
         let (response_text, prompt_tokens, completion_tokens) = if let Some(r) = resp {
             (

@@ -5,11 +5,11 @@ mod preset_store;
 mod storage;
 
 use chrono::Utc;
+use connection_store::ConnectionStore;
+use preset_store::PresetStore;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use connection_store::ConnectionStore;
-use preset_store::PresetStore;
 use storage::CharacterStore;
 use tokio::sync::watch;
 
@@ -17,14 +17,16 @@ use storyforge_app_agent::ToolContext;
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
+use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+use storyforge_domain::llm::{
+    LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
+};
 use storyforge_domain::prompt_module::PromptProfile;
-use storyforge_domain::llm::{LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode};
-use storyforge_domain::Id;
 use storyforge_infra_llm::LlmClient;
-use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
 use storyforge_infra_plugin_host::PluginRegistry;
+use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -141,7 +143,8 @@ pub struct AppState {
     /// Meta Agent 会话（诊断工具的数据源 + PatchStore，P3 新增）
     pub meta_session: Arc<storyforge_app_meta::MetaSession>,
     /// Meta 对话历史（conversation_id → MetaConversation，内存态，重启清空，P3 新增）
-    pub meta_conversations: Mutex<std::collections::HashMap<String, storyforge_app_meta::MetaConversation>>,
+    pub meta_conversations:
+        Mutex<std::collections::HashMap<String, storyforge_app_meta::MetaConversation>>,
 }
 
 impl AppState {
@@ -175,7 +178,8 @@ impl AppState {
             if !stored_chars.is_empty() {
                 let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
                 for stored in &stored_chars {
-                    ctx.characters.push(Arc::new(stored_info_to_character(stored)));
+                    ctx.characters
+                        .push(Arc::new(stored_info_to_character(stored)));
                 }
                 // 最后一张作为当前角色，其条目全收；其他卡只收 is_global
                 if let Some(last) = stored_chars.last() {
@@ -203,13 +207,12 @@ impl AppState {
             if let Some(conn) = conn_store.active_connection() {
                 match storyforge_infra_llm::create_client(&conn) {
                     Ok(client) => {
-                        let intercepted: Arc<dyn LlmClient> = Arc::new(
-                            storyforge_app_logging::interceptor::LlmInterceptor::new(
+                        let intercepted: Arc<dyn LlmClient> =
+                            Arc::new(storyforge_app_logging::interceptor::LlmInterceptor::new(
                                 Arc::from(client),
                                 log_store.clone(),
                                 conn.name.clone(),
-                            ),
-                        );
+                            ));
                         (Some(intercepted), Some(conn.id.as_str().to_string()))
                     }
                     Err(e) => {
@@ -254,7 +257,11 @@ impl AppState {
 
     /// 取一份 tool_ctx 快照（clone 出 Arc<ToolContext>），供本次流水线使用
     pub fn snapshot_tool_ctx(&self) -> Arc<ToolContext> {
-        let ctx = self.tool_ctx.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let ctx = self
+            .tool_ctx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         Arc::new(ctx)
     }
 
@@ -272,7 +279,10 @@ impl AppState {
 
     /// 当前活跃连接 ID
     pub fn active_conn_id(&self) -> Option<String> {
-        self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.active_conn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// 设置活跃连接（构造 client 并缓存，挂 LlmInterceptor 记录每次调用）
@@ -282,27 +292,32 @@ impl AppState {
             .set_active(id)
             .ok_or_else(|| format!("连接不存在: {id}"))?;
 
-        let client =
-            storyforge_infra_llm::create_client(&conn).map_err(|e| format!("构造客户端失败: {e}"))?;
+        let client = storyforge_infra_llm::create_client(&conn)
+            .map_err(|e| format!("构造客户端失败: {e}"))?;
 
         // 包装 LlmInterceptor：每次 LLM 调用自动记录 payload/响应/token/延迟到 LogStore
-        let intercepted: Arc<dyn LlmClient> = Arc::new(
-            storyforge_app_logging::interceptor::LlmInterceptor::new(
+        let intercepted: Arc<dyn LlmClient> =
+            Arc::new(storyforge_app_logging::interceptor::LlmInterceptor::new(
                 Arc::from(client),
                 self.log_store.clone(),
                 conn.name.clone(),
-            ),
-        );
+            ));
 
         *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = Some(intercepted);
-        *self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.to_string());
+        *self
+            .active_conn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(id.to_string());
         Ok(())
     }
 
     /// 清除活跃连接（删除时调用）
     pub fn clear_active_connection(&self) {
         *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        *self.active_conn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .active_conn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store）
@@ -319,6 +334,8 @@ impl AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CharacterInfo {
+    #[serde(default)]
+    pub source_character_id: Option<String>,
     pub name: String,
     pub description: String,
     pub personality: String,
@@ -380,6 +397,7 @@ impl From<&storyforge_domain::character::Character> for CharacterInfo {
             .unwrap_or_default();
 
         Self {
+            source_character_id: Some(c.id.as_str().to_string()),
             name: c.name.clone(),
             description: c.description.clone(),
             personality: c.personality.clone(),
@@ -438,8 +456,8 @@ fn import_character(
     data: Vec<u8>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CharacterSummary, String> {
-    let character = storyforge_infra_import::import_character(&data)
-        .map_err(|e| format!("导入失败: {e}"))?;
+    let character =
+        storyforge_infra_import::import_character(&data).map_err(|e| format!("导入失败: {e}"))?;
     let info = CharacterInfo::from(&character);
     let stored = get_store().save(info);
 
@@ -447,17 +465,16 @@ fn import_character(
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         // 避免重复导入同一张卡导致 characters 列表膨胀
-        ctx.characters
-            .retain(|c| c.name != character.name);
+        ctx.characters.retain(|c| c.name != character.name);
         // 提取世界书（内嵌的优先）
-        let world_info = character
-            .embedded_world_info
-            .clone();
+        let world_info = character.embedded_world_info.clone();
         ctx.characters.push(Arc::new(character));
         if let Some(wi) = world_info {
             // 先清理该角色之前导入的绿灯世界书条目（防重复累积）
             {
-                let all_keywords: Vec<String> = wi.entries.iter()
+                let all_keywords: Vec<String> = wi
+                    .entries
+                    .iter()
                     .flat_map(|e| e.keys.iter().cloned())
                     .collect();
                 if !all_keywords.is_empty() {
@@ -515,13 +532,46 @@ fn get_character(id: String) -> Result<CharacterInfo, String> {
         .ok_or_else(|| format!("角色卡不存在: {id}"))
 }
 
+fn delete_character_cascade_source_ids(
+    stored_id: &str,
+    stored_name: Option<&str>,
+    stored_source_character_id: Option<&str>,
+    characters: &[Arc<storyforge_domain::character::Character>],
+) -> Vec<Id> {
+    let mut ids = vec![Id::from_str(stored_id)];
+    if let Some(source_id) = stored_source_character_id {
+        let source_id = Id::from_str(source_id);
+        if !ids.iter().any(|id| id == &source_id) {
+            ids.push(source_id);
+        }
+    }
+    if let Some(name) = stored_name {
+        if let Some(character) = characters.iter().find(|c| c.name == name) {
+            if !ids.iter().any(|id| id == &character.id) {
+                ids.push(character.id.clone());
+            }
+        }
+    }
+    ids
+}
+
 #[tauri::command]
-fn delete_character(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+fn delete_character(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     // 先取出 name（用于同步 tool_ctx）
-    let name = get_store().get(&id).map(|s| s.info.name);
+    let stored = get_store().get(&id);
+    let name = stored.as_ref().map(|s| s.info.name.clone());
+    let stored_source_character_id = stored
+        .as_ref()
+        .and_then(|s| s.info.source_character_id.as_deref());
+    let source_ids = {
+        let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        delete_character_cascade_source_ids(
+            &id,
+            name.as_deref(),
+            stored_source_character_id,
+            &ctx.characters,
+        )
+    };
     if !get_store().delete(&id) {
         return Err(format!("角色卡不存在: {id}"));
     }
@@ -536,14 +586,24 @@ fn delete_character(
         }
     }
     // 级联删除：该卡的 MVU 翻译 + CampaignStore 的 CharacterCard（含其所有 Campaign）
-    let cid = Id::from_str(id.clone());
-    get_campaign_store().delete_mvu(&cid);
-    if let Some(stored_card) = get_campaign_store().get_card_by_source(&cid) {
-        get_campaign_store().delete_card(&stored_card.card.id);
+    //
+    // 注意 id 语义：delete_character 的 `id` 是 StoredCharacter.id（存储层 UUID），
+    // 而 CharacterCard.source_character_id 是 Character.id（domain 层 UUID，导入时生成）。
+    // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
+    // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
+    for source_id in &source_ids {
+        get_campaign_store().delete_mvu(source_id);
+        // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
+        if let Some(stored_card) = get_campaign_store().get_card_by_source(source_id) {
+            // 桥接：通过角色名找到 Character.id，再查 card
+            get_campaign_store().delete_card(&stored_card.card.id);
+        }
     }
     // 级联删除：清理向量库中该角色相关的记录（M-2）
-    if let Err(e) = state.vector_store.delete_by_character(&cid) {
-        tracing::warn!("清理角色向量记录失败: {e}");
+    for source_id in &source_ids {
+        if let Err(e) = state.vector_store.delete_by_character(source_id) {
+            tracing::warn!("清理角色向量记录失败: {e}");
+        }
     }
     Ok(())
 }
@@ -559,7 +619,11 @@ fn update_world_info_route(
     // 验证路由值合法
     match route.as_str() {
         "Constant" | "Selective" | "Both" | "Disabled" => {}
-        other => return Err(format!("无效路由: {other}，应为 Constant/Selective/Both/Disabled")),
+        other => {
+            return Err(format!(
+                "无效路由: {other}，应为 Constant/Selective/Both/Disabled"
+            ));
+        }
     }
 
     get_store().update_world_info_route(&character_id, entry_index, &route)?;
@@ -626,7 +690,13 @@ fn add_world_info_entry(
     is_global: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    let new_index = get_store().add_world_info_entry(&character_id, keys.clone(), content.clone(), constant, is_global.unwrap_or(false))?;
+    let new_index = get_store().add_world_info_entry(
+        &character_id,
+        keys.clone(),
+        content.clone(),
+        constant,
+        is_global.unwrap_or(false),
+    )?;
 
     // 同步 tool_ctx（含全局条目 merge）+ 绿灯条目入向量库
     rebuild_world_info_in_tool_ctx(&state);
@@ -727,8 +797,8 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
 
 #[tauri::command]
 fn import_preset(data: Vec<u8>) -> Result<String, String> {
-    let preset = storyforge_infra_import::import_preset(&data)
-        .map_err(|e| format!("导入失败: {e}"))?;
+    let preset =
+        storyforge_infra_import::import_preset(&data).map_err(|e| format!("导入失败: {e}"))?;
     let preset_id = get_preset_store().save(preset.clone());
     Ok(format!(
         "预设 '{}' (id: {}) 导入成功，含 {} 条提示词、{} 条正则",
@@ -862,7 +932,9 @@ fn update_preset_prompt(
     if get_preset_store().update_prompt(&preset_id, prompt_index, content.as_deref(), enabled) {
         Ok(())
     } else {
-        Err(format!("找不到预设 {preset_id} 的第 {prompt_index} 条 prompt"))
+        Err(format!(
+            "找不到预设 {preset_id} 的第 {prompt_index} 条 prompt"
+        ))
     }
 }
 
@@ -885,10 +957,14 @@ fn import_preset_as_modules(
     preset_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    use storyforge_domain::prompt_module::{ModuleCategory, ModuleSource, Exclusivity, PromptModule};
     use storyforge_domain::agent::AgentRole;
+    use storyforge_domain::prompt_module::{
+        Exclusivity, ModuleCategory, ModuleSource, PromptModule,
+    };
 
-    let stored = get_preset_store().get(&preset_id).ok_or_else(|| format!("找不到预设 {preset_id}"))?;
+    let stored = get_preset_store()
+        .get(&preset_id)
+        .ok_or_else(|| format!("找不到预设 {preset_id}"))?;
     let mut count = 0;
 
     for prompt in &stored.preset.prompts {
@@ -943,8 +1019,18 @@ fn plugin_to_dto(p: &storyforge_infra_plugin_host::InstalledPlugin) -> Installed
         id: p.manifest.id.clone(),
         name: p.manifest.name.clone(),
         version: p.manifest.version.clone(),
-        permissions: p.manifest.permissions.iter().map(|perm| format!("{perm:?}")).collect(),
-        ui_slots: p.manifest.ui_slots.iter().map(|slot| format!("{slot:?}")).collect(),
+        permissions: p
+            .manifest
+            .permissions
+            .iter()
+            .map(|perm| format!("{perm:?}"))
+            .collect(),
+        ui_slots: p
+            .manifest
+            .ui_slots
+            .iter()
+            .map(|slot| format!("{slot:?}"))
+            .collect(),
         description: p.manifest.description.clone(),
         author: p.manifest.author.clone(),
         enabled: p.enabled,
@@ -954,56 +1040,117 @@ fn plugin_to_dto(p: &storyforge_infra_plugin_host::InstalledPlugin) -> Installed
 
 #[tauri::command]
 fn list_plugins(state: tauri::State<'_, Arc<AppState>>) -> Vec<InstalledPluginDto> {
-    state.plugin_registry.list().iter().map(|p| plugin_to_dto(p)).collect()
+    state
+        .plugin_registry
+        .list()
+        .iter()
+        .map(|p| plugin_to_dto(p))
+        .collect()
 }
 
 #[tauri::command]
-fn install_plugin(manifest_json: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn install_plugin(
+    manifest_json: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     let manifest: storyforge_infra_plugin_host::PluginManifest =
         serde_json::from_str(&manifest_json).map_err(|e| format!("manifest 解析失败: {e}"))?;
-    state.plugin_registry.install(manifest).map_err(|e| format!("{e}"))
+    state
+        .plugin_registry
+        .install(manifest)
+        .map_err(|e| format!("{e}"))
 }
 
 #[tauri::command]
 fn uninstall_plugin(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.plugin_registry.uninstall(&id).map_err(|e| format!("{e}"))
+    state
+        .plugin_registry
+        .uninstall(&id)
+        .map_err(|e| format!("{e}"))
 }
 
 #[tauri::command]
-fn set_plugin_enabled(id: String, enabled: bool, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.plugin_registry.set_enabled(&id, enabled).map_err(|e| format!("{e}"))
+fn set_plugin_enabled(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .plugin_registry
+        .set_enabled(&id, enabled)
+        .map_err(|e| format!("{e}"))
 }
 
 // ─── M4 插件 API 命令（带权限二次校验）──────────────────────────────────────
 
 #[tauri::command]
-fn plugin_list_characters(plugin_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<CharacterSummary>, String> {
+fn plugin_list_characters(
+    plugin_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<CharacterSummary>, String> {
     use storyforge_infra_plugin_host::Permission;
-    state.plugin_registry.ensure_permission(&plugin_id, &Permission::ReadCharacters).map_err(|e| format!("{e}"))?;
-    Ok(get_store().list().into_iter().map(CharacterSummary::from).collect())
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::ReadCharacters)
+        .map_err(|e| format!("{e}"))?;
+    Ok(get_store()
+        .list()
+        .into_iter()
+        .map(CharacterSummary::from)
+        .collect())
 }
 
 #[tauri::command]
-fn plugin_read_character(plugin_id: String, character_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<CharacterInfo, String> {
+fn plugin_read_character(
+    plugin_id: String,
+    character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CharacterInfo, String> {
     use storyforge_infra_plugin_host::Permission;
-    state.plugin_registry.ensure_permission(&plugin_id, &Permission::ReadCharacters).map_err(|e| format!("{e}"))?;
-    get_store().get(&character_id).map(|s| s.info).ok_or_else(|| format!("角色卡不存在: {character_id}"))
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::ReadCharacters)
+        .map_err(|e| format!("{e}"))?;
+    get_store()
+        .get(&character_id)
+        .map(|s| s.info)
+        .ok_or_else(|| format!("角色卡不存在: {character_id}"))
 }
 
 #[tauri::command]
-fn plugin_get_variable(plugin_id: String, campaign_id: String, instance_id: String, key: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+fn plugin_get_variable(
+    plugin_id: String,
+    campaign_id: String,
+    instance_id: String,
+    key: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
     use storyforge_infra_plugin_host::Permission;
-    state.plugin_registry.ensure_permission(&plugin_id, &Permission::WriteVariables).map_err(|e| format!("{e}"))?;
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::WriteVariables)
+        .map_err(|e| format!("{e}"))?;
     let store = get_campaign_store();
-    store.get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
+    store
+        .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .map(|i| i.variables)
         .ok_or_else(|| format!("找不到实例 {instance_id}"))
 }
 
 #[tauri::command]
-fn plugin_set_variable(plugin_id: String, campaign_id: String, instance_id: String, key: String, value: serde_json::Value, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn plugin_set_variable(
+    plugin_id: String,
+    campaign_id: String,
+    instance_id: String,
+    key: String,
+    value: serde_json::Value,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     use storyforge_infra_plugin_host::Permission;
-    state.plugin_registry.ensure_permission(&plugin_id, &Permission::WriteVariables).map_err(|e| format!("{e}"))?;
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::WriteVariables)
+        .map_err(|e| format!("{e}"))?;
     let store = get_campaign_store();
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
@@ -1032,10 +1179,7 @@ fn update_module(
     enabled: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    if state
-        .module_store
-        .update(&id, content.as_deref(), enabled)
-    {
+    if state.module_store.update(&id, content.as_deref(), enabled) {
         Ok(())
     } else {
         Err("内置模块不能修改内容".into())
@@ -1094,10 +1238,7 @@ impl WritingEvent {
                 "started".into(),
                 serde_json::json!({ "session_id": session_id }),
             ),
-            PipelineEvent::DirectorStarted => (
-                "director_started".into(),
-                serde_json::json!({}),
-            ),
+            PipelineEvent::DirectorStarted => ("director_started".into(), serde_json::json!({})),
             PipelineEvent::DirectorProgress { delta } => (
                 "director_progress".into(),
                 serde_json::json!({ "delta": delta }),
@@ -1158,22 +1299,17 @@ impl WritingEvent {
                     "index": index,
                 }),
             ),
-            PipelineEvent::EditorStarted => (
-                "editor_started".into(),
-                serde_json::json!({}),
-            ),
+            PipelineEvent::EditorStarted => ("editor_started".into(), serde_json::json!({})),
             PipelineEvent::EditorProgress { delta } => (
                 "editor_progress".into(),
                 serde_json::json!({ "delta": delta }),
             ),
-            PipelineEvent::DraftReady { text } => (
-                "draft_ready".into(),
-                serde_json::json!({ "text": text }),
-            ),
-            PipelineEvent::PostProcessStarted => (
-                "postprocess_started".into(),
-                serde_json::json!({}),
-            ),
+            PipelineEvent::DraftReady { text } => {
+                ("draft_ready".into(), serde_json::json!({ "text": text }))
+            }
+            PipelineEvent::PostProcessStarted => {
+                ("postprocess_started".into(), serde_json::json!({}))
+            }
             PipelineEvent::PostProcessDone {
                 knowledge_count,
                 variable_count,
@@ -1204,10 +1340,9 @@ impl WritingEvent {
                     "variant_id": variant_id,
                 }),
             ),
-            PipelineEvent::Error { message } => (
-                "error".into(),
-                serde_json::json!({ "message": message }),
-            ),
+            PipelineEvent::Error { message } => {
+                ("error".into(), serde_json::json!({ "message": message }))
+            }
             PipelineEvent::StateChanged { state } => (
                 "state_changed".into(),
                 serde_json::json!({ "state": format!("{:?}", state) }),
@@ -1286,7 +1421,9 @@ async fn start_writing(
         profile: None,
         modules: vec![],
         // 加载最近 20 条对话历史（带角色标签，注入导演/编剧上下文）
-        recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20, None),
+        recent_messages: app
+            .conv_store
+            .recent_messages_with_role(&conversation_id, 20, None),
         campaign_runtime: None,
     };
     // 从模块/Profile 存储加载预设配置
@@ -1315,6 +1452,13 @@ async fn start_writing(
     // 成文（DraftReady）后并行跑：剧情总结 + 后处理三合一。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
     if let Ok((final_text, _, _)) = &result {
+        // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前，确保知识/变量写回能找到它们）
+        persist_temporary_instances_to(
+            get_campaign_store(),
+            &ctx,
+            pipeline.pending_temporary_instances(),
+        );
+
         // 从 session.plan 取在场角色 + 基础变量键
         let present_chars: Vec<String> = pipeline
             .session()
@@ -1401,8 +1545,13 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     }
 
     let active_id = {
-        let guard = state.active_campaign.lock().unwrap_or_else(|p| p.into_inner());
-        guard.clone().or_else(|| load_active_campaign(&get_app_data_dir()))
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard
+            .clone()
+            .or_else(|| load_active_campaign(&get_app_data_dir()))
     };
     let active_id = match active_id {
         Some(id) => id,
@@ -1428,17 +1577,19 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     let knowledge = store.list_knowledge(&active_id);
 
     // 从 card 的 character_definitions 构建 definitions_by_id
-    let definitions_by_id: std::collections::HashMap<Id, storyforge_domain::character::CharacterDefinition> =
-        if let Some(stored_card) = store.get_card(&camp.card_id) {
-            stored_card
-                .card
-                .character_definitions
-                .into_iter()
-                .map(|def| (def.id.clone(), def))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+    let definitions_by_id: std::collections::HashMap<
+        Id,
+        storyforge_domain::character::CharacterDefinition,
+    > = if let Some(stored_card) = store.get_card(&camp.card_id) {
+        stored_card
+            .card
+            .character_definitions
+            .into_iter()
+            .map(|def| (def.id.clone(), def))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let runtime = Arc::new(CampaignRuntimeContext {
         campaign: camp,
@@ -1466,6 +1617,57 @@ fn default_variable_keys() -> Vec<String> {
         .collect()
 }
 
+/// Phase 6：把本轮创建的临时 instance 落盘到 CampaignStore。
+///
+/// 去重逻辑：同一 campaign 内已存在同名 instance 时跳过。
+/// 落盘后，下一轮 `fill_campaign_context` 能读到这些 instance。
+fn persist_temporary_instances_to(
+    store: &campaign_store::CampaignStore,
+    ctx: &WritingContext,
+    temporaries: &[storyforge_domain::campaign::CharacterInstance],
+) {
+    let camp_id = match &ctx.campaign_id {
+        Some(id) => id,
+        None => return,
+    };
+    if temporaries.is_empty() {
+        return;
+    }
+    let existing = store.list_instances(camp_id);
+    let mut known_names: std::collections::HashSet<String> =
+        existing.into_iter().map(|i| i.name).collect();
+
+    let mut persisted_count = 0;
+    for temp in temporaries {
+        if temp.campaign_id != *camp_id {
+            tracing::warn!(
+                "跳过 campaign 不匹配的临时 instance '{}'（instance campaign: {}, current campaign: {}）",
+                temp.name,
+                temp.campaign_id,
+                camp_id
+            );
+            continue;
+        }
+        if !known_names.insert(temp.name.clone()) {
+            tracing::info!(
+                "跳过已存在的同名临时 instance '{}'（campaign {}）",
+                temp.name,
+                camp_id
+            );
+            continue;
+        }
+        store.add_instance(temp.clone());
+        persisted_count += 1;
+    }
+    if persisted_count > 0 {
+        tracing::info!(
+            "已落盘 {} 个临时 instance 到 campaign {}",
+            persisted_count,
+            camp_id
+        );
+    }
+}
+
 /// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
 fn persist_postprocess_outcome(
     ctx: &WritingContext,
@@ -1490,11 +1692,36 @@ fn persist_postprocess_outcome(
 
     // 后处理三合一
     if let Some(pp) = &outcome.post_process {
+        // 构建 present_chars 的 Id 集合（用于校验写入目标）
+        let present_ids: std::collections::HashSet<String> =
+            present_chars.iter().map(|s| s.clone()).collect();
+
         // 知识：update → entry（assign campaign_id + turn）
+        // 只写入 present_chars 中的角色知识（信息隔离：不出场角色不应被后处理写入知识）
         let knowledge_entries: Vec<_> = pp
             .knowledge_updates
             .iter()
-            .map(|u| u.clone().into_entry(camp_id.clone(), ctx.turn))
+            .filter_map(|u| {
+                if present_ids.is_empty() {
+                    // 无 present_chars 约束时全部写入（向后兼容）
+                    normalize_knowledge_update_for_postprocess(
+                        store,
+                        camp_id,
+                        u,
+                        ctx.turn,
+                        &present_ids,
+                    )
+                } else {
+                    // 按 id 或 name 匹配 present_chars
+                    normalize_knowledge_update_for_postprocess(
+                        store,
+                        camp_id,
+                        u,
+                        ctx.turn,
+                        &present_ids,
+                    )
+                }
+            })
             .collect();
         if !knowledge_entries.is_empty() {
             store.add_knowledge(knowledge_entries);
@@ -1505,12 +1732,21 @@ fn persist_postprocess_outcome(
             if let Some(inst_id) = &vu.instance_id {
                 // instance_id 可能是角色名（后处理 Agent 按名字输出），尝试匹配 campaign 内 instance
                 if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
-                    let mut inst = inst;
-                    inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
-                    store.update_instance(inst);
+                    // 校验：该 instance 是否在 present_chars 中
+                    let is_present = is_postprocess_instance_present(&inst, inst_id, &present_ids);
+                    if is_present {
+                        let mut inst = inst;
+                        inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
+                        store.update_instance(inst);
+                    } else {
+                        tracing::warn!(
+                            "跳过非在场角色 '{}' 的变量写入（present_chars 校验）",
+                            inst.name
+                        );
+                    }
                 }
             } else {
-                // 全局 Campaign 变量
+                // 全局 Campaign 变量（无 instance_id，不受 present_chars 约束）
                 if let Some(mut camp) = store.get_campaign(camp_id) {
                     camp.set_variable(&vu.key, vu.value.clone(), ctx.turn);
                     store.update_campaign(camp);
@@ -1521,12 +1757,14 @@ fn persist_postprocess_outcome(
         // 任务更新：新建 / 状态变化
         for tu in &pp.task_updates {
             if let Some(tid) = &tu.task_id {
-                if let Some(mut task) = store.get_task(tid) {
-                    task.status = tu.new_status.clone();
-                    store.update_task(task);
+                if let Some(task) = store.get_task(tid) {
+                    if let Some(task) =
+                        normalize_task_update_for_postprocess(camp_id, task, tu.new_status.clone())
+                    {
+                        store.update_task(task);
+                    }
                 }
             } else if let Some(spec) = &tu.new_task {
-                // present_chars 里的角色名转 Id（这里简化：后处理 Agent 给的角色 id 直接用）
                 let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
                     camp_id.clone(),
                     spec.title.clone(),
@@ -1538,10 +1776,86 @@ fn persist_postprocess_outcome(
             }
         }
     }
-    let _ = present_chars; // 目前用于知识更新的字符匹配已通过 instance_id 路径处理
+}
+
+fn normalize_task_update_for_postprocess(
+    camp_id: &Id,
+    mut task: storyforge_domain::story_task::StoryTask,
+    new_status: storyforge_domain::story_task::TaskStatus,
+) -> Option<storyforge_domain::story_task::StoryTask> {
+    if task.campaign_id != *camp_id {
+        tracing::warn!(
+            "跳过非当前 Campaign 任务 '{}' 的状态更新（task campaign: {}, current campaign: {}）",
+            task.id,
+            task.campaign_id,
+            camp_id
+        );
+        return None;
+    }
+
+    task.status = new_status;
+    Some(task)
 }
 
 /// 按名字或 Id 查 campaign 内的 CharacterInstance（后处理 Agent 输出的是角色名，需翻译成 instance）
+fn normalize_knowledge_update_for_postprocess(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+    turn: u32,
+    present_ids: &std::collections::HashSet<String>,
+) -> Option<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    let target = match find_instance_by_name_or_id(store, camp_id, &update.character_id) {
+        Some(inst) => inst,
+        None => {
+            tracing::warn!(
+                "跳过无法解析到 Campaign instance 的知识写入目标: {}",
+                update.character_id
+            );
+            return None;
+        }
+    };
+
+    if !is_postprocess_instance_present(&target, &update.character_id, present_ids) {
+        tracing::warn!(
+            "跳过非在场角色 '{}' 的知识写入（present_chars 校验）",
+            target.name
+        );
+        return None;
+    }
+
+    let source_character_id = update
+        .source_character_id
+        .as_ref()
+        .and_then(|source_id| find_instance_by_name_or_id(store, camp_id, source_id))
+        .map(|source| source.id);
+
+    Some(
+        storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+            id: Id::new(),
+            campaign_id: camp_id.clone(),
+            character_id: target.id,
+            knowledge_text: update.knowledge_text.clone(),
+            source: update.source.clone(),
+            source_character_id,
+            turn_number: turn,
+            event_id: None,
+            pinned: update.pinned,
+        },
+    )
+}
+
+fn is_postprocess_instance_present(
+    inst: &storyforge_domain::campaign::CharacterInstance,
+    raw_id: &Id,
+    present_ids: &std::collections::HashSet<String>,
+) -> bool {
+    present_ids.is_empty()
+        || present_ids.contains(raw_id.as_str())
+        || present_ids.contains(inst.id.as_str())
+        || present_ids.contains(&inst.name)
+}
+
 fn find_instance_by_name_or_id(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
@@ -1553,7 +1867,9 @@ fn find_instance_by_name_or_id(
         return Some(i.clone());
     }
     // 再按 instance.name 匹配（后处理 Agent 给的是角色名）
-    instances.into_iter().find(|i| i.name.as_str() == name_or_id.as_str())
+    instances
+        .into_iter()
+        .find(|i| i.name.as_str() == name_or_id.as_str())
 }
 
 /// Tauri command: 取消当前运行的写作流水线
@@ -1561,7 +1877,10 @@ fn find_instance_by_name_or_id(
 /// 触发 AppState.current_cancel 的 sender，导演/子Agent/编剧全部中止。
 #[tauri::command]
 fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
-    let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = state
+        .current_cancel
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if let Some(tx) = slot.as_ref() {
         let _ = tx.send(true);
         Ok(true)
@@ -1660,7 +1979,11 @@ async fn regenerate(
         profile: None,
         modules: vec![],
         // 重 roll 时排除目标节点及其后的消息（避免导演看到被重 roll 的旧内容）
-        recent_messages: app.conv_store.recent_messages_with_role(&conversation_id, 20, Some(&node_id)),
+        recent_messages: app.conv_store.recent_messages_with_role(
+            &conversation_id,
+            20,
+            Some(&node_id),
+        ),
         campaign_runtime: None,
     };
     fill_profile_context(&mut ctx, &app);
@@ -1677,10 +2000,19 @@ async fn regenerate(
     }
 
     let mut pipeline = app.new_pipeline();
-    let result = pipeline.regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx).await;
+    let result = pipeline
+        .regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx)
+        .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
     if let Ok((text, _)) = &result {
+        // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前）
+        persist_temporary_instances_to(
+            get_campaign_store(),
+            &ctx,
+            pipeline.pending_temporary_instances(),
+        );
+
         let (final_text, present_chars, var_keys) = (
             text.clone(),
             pipeline
@@ -1814,8 +2146,7 @@ fn create_connection(
 
     // 预先验证：构造 client 看是否成功（base_url 格式等）
     // 注意：不实际发请求，只验证能构造出 client
-    storyforge_infra_llm::create_client(&conn)
-        .map_err(|e| format!("连接配置无效: {e}"))?;
+    storyforge_infra_llm::create_client(&conn).map_err(|e| format!("连接配置无效: {e}"))?;
 
     let was_empty = get_conn_store().list().is_empty();
     get_conn_store().save(conn);
@@ -1830,10 +2161,7 @@ fn create_connection(
 
 /// 删除连接（若为活跃的，同时清除活跃状态）
 #[tauri::command]
-fn delete_connection(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+fn delete_connection(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
     if !get_conn_store().delete(&id) {
         return Err(format!("连接不存在: {id}"));
@@ -1890,8 +2218,8 @@ async fn test_connection(req: TestConnectionDto) -> Result<TestConnectionResult,
         tool_mode,
     };
 
-    let client = storyforge_infra_llm::create_client(&conn)
-        .map_err(|e| format!("构造客户端失败: {e}"))?;
+    let client =
+        storyforge_infra_llm::create_client(&conn).map_err(|e| format!("构造客户端失败: {e}"))?;
 
     let start = std::time::Instant::now();
     let chat_req = storyforge_domain::llm::ChatRequest {
@@ -2022,10 +2350,7 @@ pub struct LogFilterDto {
 }
 
 #[tauri::command]
-fn log_query(
-    filter: LogFilterDto,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Vec<LogEntryDto> {
+fn log_query(filter: LogFilterDto, state: tauri::State<'_, Arc<AppState>>) -> Vec<LogEntryDto> {
     let log_filter = LogFilter {
         kind: filter.kind.as_deref().and_then(|k| match k {
             "backend" => Some(LogKind::Backend),
@@ -2080,18 +2405,17 @@ fn log_export_bundle(
         redact_content,
         ..Default::default()
     };
-    Ok(storyforge_app_logging::export_bundle(&state.log_store, &opts))
+    Ok(storyforge_app_logging::export_bundle(
+        &state.log_store,
+        &opts,
+    ))
 }
 
 /// 前端日志上报（console.log/warn/error 转发到后端 LogStore）
 ///
 /// 单条消息上限 4KB（M-21），防止恶意/异常前端灌爆 LogStore。
 #[tauri::command]
-fn log_append_frontend(
-    level: String,
-    message: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) {
+fn log_append_frontend(level: String, message: String, state: tauri::State<'_, Arc<AppState>>) {
     const MAX_LOG_MSG_LEN: usize = 4096;
     let message = if message.len() > MAX_LOG_MSG_LEN {
         format!("{}...(截断)", &message[..MAX_LOG_MSG_LEN])
@@ -2240,23 +2564,29 @@ fn configure_embedder(
     };
     let data_dir = get_app_data_dir();
     save_embed_config(&data_dir, &config);
-    *state.embed_config.write().unwrap_or_else(|p| p.into_inner()) = Some(config);
+    *state
+        .embed_config
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = Some(config);
     Ok(())
 }
 
 /// 获取当前嵌入配置（不含 key）
 #[tauri::command]
-fn get_embed_config(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Option<serde_json::Value> {
-    state.embed_config.read().unwrap_or_else(|p| p.into_inner()).as_ref().map(|c| {
-        serde_json::json!({
-            "endpoint": c.endpoint,
-            "model": c.model,
-            "dim": c.dim,
-            "has_key": !c.api_key.is_empty(),
+fn get_embed_config(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json::Value> {
+    state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|c| {
+            serde_json::json!({
+                "endpoint": c.endpoint,
+                "model": c.model,
+                "dim": c.dim,
+                "has_key": !c.api_key.is_empty(),
+            })
         })
-    })
 }
 
 /// 手动触发对话归档（将近期消息压缩为远记忆摘要并入库）
@@ -2295,7 +2625,8 @@ async fn archive_conversation(
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
 
-    let embedder = Arc::new(storyforge_infra_llm::Embedder::new(config).map_err(|e| format!("{e}"))?);
+    let embedder =
+        Arc::new(storyforge_infra_llm::Embedder::new(config).map_err(|e| format!("{e}"))?);
     let archiver = storyforge_app_memory::MemoryArchiver::new(
         llm,
         embedder,
@@ -2351,7 +2682,12 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
     );
 
     // 检查嵌入配置
-    let config = match state.embed_config.read().unwrap_or_else(|p| p.into_inner()).clone() {
+    let config = match state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
         Some(c) => c,
         None => {
             tracing::debug!("未配置嵌入 API，跳过自动归档");
@@ -2445,11 +2781,10 @@ fn meta_accept_patch(
                 .map_err(|e| format!("{e}"))?;
 
             // 反序列化回 WorldInfoEntry 并替换
-            let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> =
-                entries_json
-                    .into_iter()
-                    .filter_map(|v| serde_json::from_value(v).ok())
-                    .collect();
+            let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
 
             let mut new_book = (**world_info).clone();
             new_book.entries = new_entries;
@@ -2491,10 +2826,8 @@ fn meta_accept_patch(
                 .collect();
             // 全局条目的 keys 集合（用于从各卡原有条目中排除已合并的全局条目，
             // 防止各卡私有条目中的旧全局条目残留）
-            let global_keys_set: std::collections::HashSet<String> = global_entries
-                .iter()
-                .map(|e| e.keys.join(","))
-                .collect();
+            let global_keys_set: std::collections::HashSet<String> =
+                global_entries.iter().map(|e| e.keys.join(",")).collect();
 
             let all_stored = get_store().list();
             for stored in &all_stored {
@@ -2504,9 +2837,7 @@ fn meta_accept_patch(
                     .info
                     .world_info_entries
                     .iter()
-                    .filter(|e| {
-                        !e.is_global && !global_keys_set.contains(&e.keys.join(","))
-                    })
+                    .filter(|e| !e.is_global && !global_keys_set.contains(&e.keys.join(",")))
                     .cloned()
                     .collect();
                 let mut new_entries = preserved_private;
@@ -2569,7 +2900,10 @@ async fn meta_chat(
     // 取出对话；不存在则返回错误（而非静默创建空对话，避免用户感觉"历史突然清空"）。
     // 新对话应由 meta_start_conversation 命令显式建立。
     let mut conv = {
-        let mut convs = app.meta_conversations.lock().unwrap_or_else(|p| p.into_inner());
+        let mut convs = app
+            .meta_conversations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         convs.remove(&conversation_id).ok_or_else(|| {
             format!("Meta 对话不存在: {conversation_id}（请先调用 meta_start_conversation 创建）")
         })?
@@ -2582,8 +2916,7 @@ async fn meta_chat(
 
     // 流式转发：meta_chat 内部把 token delta 推到 progress_tx，
     // 一个转发任务把它包成 MetaStreamEvent 推给前端 Channel
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let on_event_clone = on_event.clone();
     tokio::spawn(async move {
         while let Some(delta) = progress_rx.recv().await {
@@ -2633,17 +2966,18 @@ fn meta_get_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Option<serde_json::Value> {
-    let convs = state.meta_conversations.lock().unwrap_or_else(|p| p.into_inner());
-    convs.get(&conversation_id).map(|conv| {
-        serde_json::to_value(conv).unwrap_or(serde_json::Value::Null)
-    })
+    let convs = state
+        .meta_conversations
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    convs
+        .get(&conversation_id)
+        .map(|conv| serde_json::to_value(conv).unwrap_or(serde_json::Value::Null))
 }
 
 /// Tauri command: 列所有待采纳的 Meta Patch
 #[tauri::command]
-fn meta_list_pending_patches(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Vec<serde_json::Value> {
+fn meta_list_pending_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
     state
         .meta_patches
         .read()
@@ -2660,7 +2994,10 @@ fn meta_dismiss_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let mut patches = state.meta_patches.write().unwrap_or_else(|p| p.into_inner());
+    let mut patches = state
+        .meta_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
     patches.retain(|p| p.id != patch_id);
     Ok(())
 }
@@ -2766,9 +3103,7 @@ fn meta_list_mvu_translations() -> Vec<MvuTranslationSummaryDto> {
 
 /// Tauri command: 查某角色卡的 MVU 翻译详情（前端渲染状态栏用）
 #[tauri::command]
-fn meta_get_mvu_translation(
-    source_character_id: String,
-) -> Option<MvuTranslationDetailDto> {
+fn meta_get_mvu_translation(source_character_id: String) -> Option<MvuTranslationDetailDto> {
     let store = get_campaign_store();
     let id = Id::from_str(source_character_id);
     store.get_mvu(&id).map(|m| MvuTranslationDetailDto {
@@ -3006,8 +3341,7 @@ async fn extract_characters(
     };
 
     // 建卡 + 回填 card_id
-    let mut card =
-        storyforge_domain::character::CharacterCard::from_character(&character);
+    let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
     let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
     card.character_definitions = definitions;
     let stored = store.save_card(card);
@@ -3048,20 +3382,16 @@ fn get_card(id: String) -> Result<CardDetailDto, String> {
 
 /// 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化
 #[tauri::command]
-fn create_campaign(
-    card_id: String,
-    name: String,
-) -> Result<CampaignSummaryDto, String> {
-    use storyforge_domain::character::RoleType;
+fn create_campaign(card_id: String, name: String) -> Result<CampaignSummaryDto, String> {
     use storyforge_domain::campaign::CharacterInstance;
+    use storyforge_domain::character::RoleType;
 
     let store = get_campaign_store();
     let stored = store
         .get_card(&Id::from_str(&card_id))
         .ok_or_else(|| format!("找不到 card id={card_id}"))?;
 
-    let campaign =
-        storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
+    let campaign = storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
     store.save_campaign(campaign.clone());
 
     // 实例化所有 protagonist/supporting 定义
@@ -3109,26 +3439,27 @@ fn get_campaign(id: String) -> Result<CampaignSummaryDto, String> {
 }
 
 #[tauri::command]
-fn set_active_campaign(
-    id: String,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+fn set_active_campaign(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     let campaign_id = Id::from_str(&id);
     // 校验存在
-    if get_campaign_store()
-        .get_campaign(&campaign_id)
-        .is_none()
-    {
+    if get_campaign_store().get_campaign(&campaign_id).is_none() {
         return Err(format!("找不到 campaign id={id}"));
     }
-    *state.active_campaign.lock().unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
+    *state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
     save_active_campaign(&get_app_data_dir(), Some(&campaign_id));
     Ok(())
 }
 
 #[tauri::command]
 fn get_active_campaign(state: tauri::State<'_, Arc<AppState>>) -> Option<CampaignSummaryDto> {
-    let id = state.active_campaign.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+    let id = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()?;
     let store = get_campaign_store();
     let c = store.get_campaign(&id)?;
     let mut dto = CampaignSummaryDto::from(&c);
@@ -3213,10 +3544,7 @@ fn set_campaign_variable(
 
 /// 把临场角色升级为常驻（仅翻 is_temporary flag）
 #[tauri::command]
-fn promote_temporary_instance(
-    campaign_id: String,
-    instance_id: String,
-) -> Result<(), String> {
+fn promote_temporary_instance(campaign_id: String, instance_id: String) -> Result<(), String> {
     let store = get_campaign_store();
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
@@ -3323,10 +3651,7 @@ impl From<&storyforge_domain::story_task::StoryTask> for StoryTaskDto {
 
 /// 列出某 campaign 的所有任务（可按状态筛：pending/active/likely_completed/completed/abandoned）
 #[tauri::command]
-fn list_tasks(
-    campaign_id: String,
-    status_filter: Option<String>,
-) -> Vec<StoryTaskDto> {
+fn list_tasks(campaign_id: String, status_filter: Option<String>) -> Vec<StoryTaskDto> {
     let store = get_campaign_store();
     let camp = Id::from_str(&campaign_id);
     let mut tasks = store.list_tasks(&camp);
@@ -3334,7 +3659,8 @@ fn list_tasks(
         tasks.retain(|t| {
             let s = serde_json::to_string(&t.status).unwrap_or_default();
             // TaskStatus 序列化为 "pending"/"active"/{"likely_completed":...}/"completed"/"abandoned"
-            s.starts_with(&format!("\"{filter}")) || s.starts_with('{') && filter == "likely_completed"
+            s.starts_with(&format!("\"{filter}"))
+                || s.starts_with('{') && filter == "likely_completed"
         });
     }
     tasks.iter().map(StoryTaskDto::from).collect()
@@ -3492,7 +3818,7 @@ pub fn run() {
             edit_variant,
             accept_variant,
             soft_delete_variant,
-    delete_message_from,
+            delete_message_from,
             add_variant,
             switch_variant,
             // M1 日志命令
@@ -3548,9 +3874,17 @@ pub fn run() {
 /// 注：CharacterInfo 是导入时的 DTO，丢了 mes_example/embedded_world_info/raw_card_json
 /// 等完整字段。启动恢复只填导演工具用得到的字段（name/description/personality/
 /// scenario/first_mes/system_prompt），其余留空。
-fn stored_info_to_character(stored: &storage::StoredCharacter) -> storyforge_domain::character::Character {
+fn stored_info_to_character(
+    stored: &storage::StoredCharacter,
+) -> storyforge_domain::character::Character {
     storyforge_domain::character::Character {
-        id: Id::from_str(&stored.id),
+        id: Id::from_str(
+            stored
+                .info
+                .source_character_id
+                .as_deref()
+                .unwrap_or(&stored.id),
+        ),
         name: stored.info.name.clone(),
         description: stored.info.description.clone(),
         personality: stored.info.personality.clone(),
@@ -3624,7 +3958,6 @@ fn collect_world_info_for_active(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use storyforge_app_agent::ToolContext;
     use storyforge_domain::character::Character;
 
     /// 验证 tool_ctx 的 RwLock + snapshot 机制：写入后快照能读到
@@ -3679,25 +4012,304 @@ mod tests {
 
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）
     #[test]
+    fn test_delete_character_source_ids_include_domain_character_id() {
+        let mut character = make_test_character("Lin");
+        character.id = Id::from_str("domain-lin");
+
+        let source_ids = delete_character_cascade_source_ids(
+            "stored-lin",
+            Some("Lin"),
+            None,
+            &[Arc::new(character)],
+        );
+
+        assert_eq!(
+            source_ids,
+            vec![Id::from_str("stored-lin"), Id::from_str("domain-lin")]
+        );
+    }
+
+    #[test]
+    fn test_delete_character_source_ids_deduplicate_stored_id() {
+        let mut character = make_test_character("Lin");
+        character.id = Id::from_str("same-id");
+
+        let source_ids = delete_character_cascade_source_ids(
+            "same-id",
+            Some("Lin"),
+            None,
+            &[Arc::new(character)],
+        );
+
+        assert_eq!(source_ids, vec![Id::from_str("same-id")]);
+    }
+
+    #[test]
+    fn test_delete_character_source_ids_include_persisted_source_character_id() {
+        let source_ids =
+            delete_character_cascade_source_ids("stored-lin", Some("Lin"), Some("source-lin"), &[]);
+
+        assert_eq!(
+            source_ids,
+            vec![Id::from_str("stored-lin"), Id::from_str("source-lin")]
+        );
+    }
+
+    #[test]
+    fn test_stored_info_to_character_uses_persisted_source_character_id() {
+        let mut character = make_test_character("Lin");
+        character.id = Id::from_str("source-lin");
+        let stored = storage::StoredCharacter {
+            id: "stored-lin".into(),
+            info: CharacterInfo::from(&character),
+            imported_at: "now".into(),
+        };
+
+        let restored = stored_info_to_character(&stored);
+
+        assert_eq!(restored.id, Id::from_str("source-lin"));
+        assert_eq!(restored.name, "Lin");
+    }
+
+    #[test]
+    fn test_postprocess_task_update_skips_other_campaign() {
+        use storyforge_domain::story_task::{StoryTask, TaskStatus};
+
+        let task = StoryTask::user_planned(
+            Id::from_str("campaign-b"),
+            "Find the archive",
+            "Unrelated campaign task",
+            vec![],
+            1,
+        );
+
+        let updated = normalize_task_update_for_postprocess(
+            &Id::from_str("campaign-a"),
+            task,
+            TaskStatus::Completed,
+        );
+
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn test_postprocess_task_update_allows_current_campaign() {
+        use storyforge_domain::story_task::{StoryTask, TaskStatus};
+
+        let task = StoryTask::user_planned(
+            Id::from_str("campaign-a"),
+            "Find the archive",
+            "Current campaign task",
+            vec![],
+            1,
+        );
+
+        let updated = normalize_task_update_for_postprocess(
+            &Id::from_str("campaign-a"),
+            task,
+            TaskStatus::Completed,
+        )
+        .expect("same campaign task should update");
+
+        assert_eq!(updated.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn test_postprocess_knowledge_name_normalizes_to_instance_id() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_knowledge_norm_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+        let mut instance = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        instance.id = Id::from_str("inst-lin");
+        store.add_instance(instance);
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Lin"),
+            knowledge_text: "Lin found the key".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            pinned: false,
+        };
+        let present_ids = HashSet::from([String::from("inst-lin")]);
+
+        let entry = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            7,
+            &present_ids,
+        )
+        .expect("name target should resolve to campaign instance");
+
+        assert_eq!(entry.character_id, Id::from_str("inst-lin"));
+        assert_eq!(entry.knowledge_text, "Lin found the key");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_postprocess_knowledge_skips_non_present_instance() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_knowledge_present_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
+        chen.id = Id::from_str("inst-chen");
+        store.add_instance(lin);
+        store.add_instance(chen);
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Chen"),
+            knowledge_text: "Chen saw the key".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            pinned: false,
+        };
+        let present_ids = HashSet::from([String::from("inst-lin")]);
+
+        let entry = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            7,
+            &present_ids,
+        );
+
+        assert!(entry.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_postprocess_knowledge_normalizes_source_character_id() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_knowledge_source_norm_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
+        chen.id = Id::from_str("inst-chen");
+        store.add_instance(lin);
+        store.add_instance(chen);
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Lin"),
+            knowledge_text: "Chen told Lin about the key".into(),
+            source: KnowledgeSource::ToldByOther,
+            source_character_id: Some(Id::from_str("Chen")),
+            pinned: false,
+        };
+        let present_ids = HashSet::from([String::from("Lin")]);
+
+        let entry = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            7,
+            &present_ids,
+        )
+        .expect("target should resolve");
+
+        assert_eq!(entry.character_id, Id::from_str("inst-lin"));
+        assert_eq!(entry.source_character_id, Some(Id::from_str("inst-chen")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_postprocess_knowledge_skips_unpersisted_temporary_name() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_knowledge_temp_skip_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Ghost"),
+            knowledge_text: "Ghost appeared briefly".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            pinned: false,
+        };
+        let present_ids = HashSet::from([String::from("Ghost")]);
+
+        let entry = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            7,
+            &present_ids,
+        );
+
+        assert!(entry.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_current_cancel_slot() {
         let state = AppState::new();
 
         // 初始无运行中的写作
         {
-            let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             assert!(slot.is_none());
         }
 
         // 模拟 start_writing 设置 cancel sender
-        let (tx, mut rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(false);
         {
-            let mut slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             *slot = Some(tx);
         }
 
         // 触发取消
         {
-            let slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let tx = slot.as_ref().unwrap();
             let _ = tx.send(true);
         }
@@ -3705,7 +4317,10 @@ mod tests {
 
         // 清理
         {
-            let mut slot = state.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             *slot = None;
         }
     }
@@ -3739,7 +4354,10 @@ mod tests {
     #[test]
     fn test_parse_tool_mode() {
         assert_eq!(parse_tool_mode("native").unwrap(), ToolMode::Native);
-        assert_eq!(parse_tool_mode("text_fallback").unwrap(), ToolMode::TextFallback);
+        assert_eq!(
+            parse_tool_mode("text_fallback").unwrap(),
+            ToolMode::TextFallback
+        );
         assert!(parse_tool_mode("unknown").is_err());
     }
 
@@ -3759,7 +4377,10 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         });
         assert_eq!(state.vector_store.count(), initial + 1);
-        let hits = state.vector_store.search_by_keywords(&["测试".into()], 10).unwrap();
+        let hits = state
+            .vector_store
+            .search_by_keywords(&["测试".into()], 10)
+            .unwrap();
         assert!(hits.iter().any(|h| h.content == "测试内容"));
 
         // 清理测试记录
@@ -3807,7 +4428,10 @@ mod tests {
     fn test_campaign_runtime_none_by_default() {
         let state = AppState::new();
         let snap = state.snapshot_tool_ctx();
-        assert!(snap.campaign_runtime.is_none(), "初始状态 campaign_runtime 应为 None");
+        assert!(
+            snap.campaign_runtime.is_none(),
+            "初始状态 campaign_runtime 应为 None"
+        );
     }
 
     /// 写入 CampaignRuntimeContext 后，快照应能读到
@@ -3837,7 +4461,10 @@ mod tests {
 
         // 快照应能读到
         let snap = state.snapshot_tool_ctx();
-        assert!(snap.campaign_runtime.is_some(), "写入后 campaign_runtime 不应为 None");
+        assert!(
+            snap.campaign_runtime.is_some(),
+            "写入后 campaign_runtime 不应为 None"
+        );
         let rt = snap.campaign_runtime.as_ref().unwrap();
         assert_eq!(rt.turn, 1);
         assert!(rt.instances.is_empty());
@@ -3944,17 +4571,267 @@ mod tests {
 
         // 确认写入成功
         let snap_before = state.snapshot_tool_ctx();
-        assert!(snap_before.campaign_runtime.is_some(), "预置 stale runtime 应成功");
+        assert!(
+            snap_before.campaign_runtime.is_some(),
+            "预置 stale runtime 应成功"
+        );
 
         // 调用 fill_campaign_context（无 active campaign → early return，但 runtime 应被清空）
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         fill_campaign_context(&mut ctx, &state);
 
         // 验证：WritingContext 的 runtime 应为 None
-        assert!(ctx.campaign_runtime.is_none(), "无 active campaign 时 ctx.campaign_runtime 应被清空");
+        assert!(
+            ctx.campaign_runtime.is_none(),
+            "无 active campaign 时 ctx.campaign_runtime 应被清空"
+        );
 
         // 验证：tool_ctx 的 runtime 也应被清空
         let snap_after = state.snapshot_tool_ctx();
-        assert!(snap_after.campaign_runtime.is_none(), "无 active campaign 时 tool_ctx.campaign_runtime 应被清空");
+        assert!(
+            snap_after.campaign_runtime.is_none(),
+            "无 active campaign 时 tool_ctx.campaign_runtime 应被清空"
+        );
+    }
+
+    // ─── Phase 6：临时 instance 落盘测试 ─────────────────────────────────────
+
+    /// persist_temporary_instances：新实例能落盘，下一轮 list_instances 可读回
+    #[test]
+    fn test_persist_temporary_instances_new() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_temp_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_id = Some(campaign.id.clone());
+
+        let temps = vec![
+            CharacterInstance::temporary(campaign.id.clone(), "Ghost"),
+            CharacterInstance::temporary_with_overrides(
+                campaign.id.clone(),
+                "Guard",
+                Some("stern guard".into()),
+                Some("block the way".into()),
+            ),
+        ];
+
+        persist_temporary_instances_to(&store, &ctx, &temps);
+
+        let instances = store.list_instances(&campaign.id);
+        assert_eq!(instances.len(), 2, "应有 2 个落盘实例");
+
+        let ghost = instances.iter().find(|i| i.name == "Ghost").unwrap();
+        assert!(ghost.is_temporary);
+        assert!(ghost.persona_override.is_none());
+
+        let guard = instances.iter().find(|i| i.name == "Guard").unwrap();
+        assert!(guard.is_temporary);
+        assert_eq!(guard.persona_override, Some("stern guard".into()));
+        assert_eq!(guard.behavior_override, Some("block the way".into()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist_temporary_instances：同名实例不重复落盘（去重）
+    #[test]
+    fn test_persist_temporary_instances_dedup_by_name() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_dedup_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        // 先手动落盘一个 "Ghost"
+        let existing = CharacterInstance::temporary(campaign.id.clone(), "Ghost");
+        store.add_instance(existing.clone());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_id = Some(campaign.id.clone());
+
+        // 再尝试落盘同名临时 instance
+        let temps = vec![CharacterInstance::temporary(campaign.id.clone(), "Ghost")];
+        persist_temporary_instances_to(&store, &ctx, &temps);
+
+        let instances = store.list_instances(&campaign.id);
+        assert_eq!(
+            instances.len(),
+            1,
+            "同名不应重复落盘"
+        );
+        assert_eq!(instances[0].id, existing.id, "应保留原始实例 id");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist_temporary_instances：同一批次内的同名临时实例也不重复落盘
+    #[test]
+    fn test_persist_temporary_instances_dedup_within_batch() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_batch_dedup_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_id = Some(campaign.id.clone());
+
+        let temps = vec![
+            CharacterInstance::temporary(campaign.id.clone(), "Ghost"),
+            CharacterInstance::temporary_with_overrides(
+                campaign.id.clone(),
+                "Ghost",
+                Some("duplicate brief".into()),
+                None,
+            ),
+        ];
+        persist_temporary_instances_to(&store, &ctx, &temps);
+
+        let instances = store.list_instances(&campaign.id);
+        assert_eq!(instances.len(), 1, "同批同名不应重复落盘");
+        assert_eq!(instances[0].name, "Ghost");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist_temporary_instances：拒绝写入不属于当前 Campaign 的临时实例
+    #[test]
+    fn test_persist_temporary_instances_skips_wrong_campaign() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_wrong_campaign_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        let other_campaign = Campaign::new(Id::from_str("card-2"), "other");
+        store.save_campaign(campaign.clone());
+        store.save_campaign(other_campaign.clone());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_id = Some(campaign.id.clone());
+
+        let temps = vec![CharacterInstance::temporary(
+            other_campaign.id.clone(),
+            "WrongCampaignGhost",
+        )];
+        persist_temporary_instances_to(&store, &ctx, &temps);
+
+        assert!(store.list_instances(&campaign.id).is_empty());
+        assert!(store.list_instances(&other_campaign.id).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist_temporary_instances：无 campaign 时 no-op
+    #[test]
+    fn test_persist_temporary_instances_no_campaign() {
+        use storyforge_domain::campaign::CharacterInstance;
+
+        let ctx = WritingContext::legacy(vec![], None, Id::new());
+        // campaign_id = None → 应直接返回，不 panic
+        let temps = vec![CharacterInstance::temporary(Id::new(), "Ghost")];
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_no_camp_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        persist_temporary_instances_to(&store, &ctx, &temps);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// persist_temporary_instances：空列表 no-op
+    #[test]
+    fn test_persist_temporary_instances_empty_list() {
+        use storyforge_domain::campaign::Campaign;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_persist_empty_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_id = Some(campaign.id.clone());
+
+        persist_temporary_instances_to(&store, &ctx, &[]);
+
+        let instances = store.list_instances(&campaign.id);
+        assert!(instances.is_empty(), "空列表不应写入任何实例");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 6 集成：临时 instance 落盘后，postprocess 的知识写回能找到它
+    #[test]
+    fn test_postprocess_writes_knowledge_for_persisted_temporary() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_pp_temp_knowledge_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        // 模拟 persist_temporary_instances：落盘一个临时 instance
+        let mut ghost = CharacterInstance::temporary(campaign.id.clone(), "Ghost");
+        ghost.persona_override = Some("mysterious figure".into());
+        store.add_instance(ghost.clone());
+
+        // postprocess 尝试写入 Ghost 的知识（之前会因为找不到 persisted instance 而跳过）
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Ghost"),
+            knowledge_text: "Ghost appeared in the fog".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            pinned: false,
+        };
+        let present_ids = HashSet::from([String::from("Ghost")]);
+
+        let entry = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            1,
+            &present_ids,
+        );
+
+        assert!(
+            entry.is_some(),
+            "已落盘的临时 instance 应能被 postprocess 解析"
+        );
+        let entry = entry.unwrap();
+        assert_eq!(entry.character_id, ghost.id);
+        assert_eq!(entry.knowledge_text, "Ghost appeared in the fog");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -273,7 +273,11 @@ pub struct FunctionSpec {
 }
 
 impl ToolSpec {
-    pub fn function(name: impl Into<String>, desc: impl Into<String>, params: serde_json::Value) -> Self {
+    pub fn function(
+        name: impl Into<String>,
+        desc: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Self {
         Self {
             tool_type: "function".into(),
             function: FunctionSpec {
@@ -371,7 +375,12 @@ mod tests {
 
         // 所有内置模板都用 OpenAi 协议（M1 只实现这个）
         for t in &templates {
-            assert_eq!(t.protocol, LlmProtocol::OpenAi, "模板 {} 应为 OpenAi 协议", t.id);
+            assert_eq!(
+                t.protocol,
+                LlmProtocol::OpenAi,
+                "模板 {} 应为 OpenAi 协议",
+                t.id
+            );
         }
 
         // 含 custom 兜底模板

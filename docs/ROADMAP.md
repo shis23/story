@@ -27,7 +27,6 @@
 详细计划见：
 
 - `docs/PLAN-CAMPAIGN-MAINLINE.md`
-- `docs/PLAN-CHARACTER-UNIFICATION.md`
 
 ## Phase 2: 信息隔离和状态闭环
 
@@ -51,7 +50,6 @@
 详细计划见：
 
 - `docs/PLAN-CAMPAIGN-MAINLINE.md` 的阶段 5-6。
-- `docs/PLAN-CHARACTER-UNIFICATION.md` 的阶段 4-5。
 
 ## Phase 3: Meta Agent 维护层
 

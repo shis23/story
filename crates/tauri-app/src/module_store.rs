@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use storyforge_domain::prompt_module::{
-    ModuleCategory, ModuleSource, PromptModule, PromptProfile, ProfileSource,
-};
 use storyforge_domain::Id;
+use storyforge_domain::prompt_module::{
+    ModuleCategory, ModuleSource, ProfileSource, PromptModule, PromptProfile,
+};
 
 // ─── DTO（前端友好的序列化结构）──────────────────────────────────────────────
 
@@ -34,7 +34,8 @@ pub struct ProfileSummaryDto {
 pub struct PromptProfileDto {
     pub id: String,
     pub name: String,
-    pub selections: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    pub selections:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
     pub overrides: std::collections::HashMap<String, Option<String>>,
     pub source: String,
 }
@@ -47,7 +48,11 @@ pub fn module_to_dto(m: &PromptModule, enabled: bool) -> PromptModuleDto {
         content: m.content.clone(),
         exclusivity: format!("{:?}", m.exclusivity),
         source: format!("{:?}", m.source),
-        applicable_roles: m.applicable_roles.iter().map(|r| format!("{r:?}")).collect(),
+        applicable_roles: m
+            .applicable_roles
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect(),
         tags: m.tags.clone(),
         enabled,
     }
@@ -59,7 +64,10 @@ pub fn profile_to_dto(p: &PromptProfile, _is_active: bool) -> PromptProfileDto {
         let role_key = format!("{role:?}");
         let mut cat_map = std::collections::HashMap::new();
         for (cat, ids) in cats {
-            cat_map.insert(format!("{cat:?}"), ids.iter().map(|id| id.to_string()).collect());
+            cat_map.insert(
+                format!("{cat:?}"),
+                ids.iter().map(|id| id.to_string()).collect(),
+            );
         }
         selections.insert(role_key, cat_map);
     }
@@ -375,8 +383,7 @@ impl ProfileStore {
 
     fn persist(&self) {
         let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles)
-        {
+        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles) {
             tracing::error!("持久化 Profile 失败: {e}");
         }
     }

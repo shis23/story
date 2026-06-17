@@ -14,13 +14,13 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::CharacterCard;
 use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 use storyforge_domain::mvu_translation::MvuTranslation;
 use storyforge_domain::story_task::StoryTask;
-use storyforge_domain::Id;
 
 // ─── CharacterCard 存储 ────────────────────────────────────────────────────
 
@@ -136,11 +136,7 @@ impl CampaignStore {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Some(idx) = cache
-            .cards
-            .iter()
-            .position(|c| c.card.id == stored.card.id)
-        {
+        if let Some(idx) = cache.cards.iter().position(|c| c.card.id == stored.card.id) {
             cache.cards[idx] = stored.clone();
             persist(&self.cards_path, &cache.cards);
             Some(stored)
@@ -184,9 +180,7 @@ impl CampaignStore {
             persist(&self.summaries_path, &cache.summaries);
             // 级联删除：该卡的 MVU 翻译
             for source_id in &source_ids {
-                cache
-                    .mvu
-                    .retain(|m| m.source_character_id != *source_id);
+                cache.mvu.retain(|m| m.source_character_id != *source_id);
             }
             persist(&self.mvu_path, &cache.mvu);
         }
@@ -224,11 +218,7 @@ impl CampaignStore {
 
     pub fn update_campaign(&self, campaign: Campaign) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = cache
-            .campaigns
-            .iter()
-            .position(|c| c.id == campaign.id)
-        {
+        if let Some(idx) = cache.campaigns.iter().position(|c| c.id == campaign.id) {
             cache.campaigns[idx] = campaign;
             persist(&self.campaigns_path, &cache.campaigns);
         }
@@ -271,11 +261,7 @@ impl CampaignStore {
             .collect()
     }
 
-    pub fn get_instance(
-        &self,
-        campaign_id: &Id,
-        instance_id: &Id,
-    ) -> Option<CharacterInstance> {
+    pub fn get_instance(&self, campaign_id: &Id, instance_id: &Id) -> Option<CharacterInstance> {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache
             .instances
@@ -293,11 +279,7 @@ impl CampaignStore {
 
     pub fn update_instance(&self, instance: CharacterInstance) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = cache
-            .instances
-            .iter()
-            .position(|i| i.id == instance.id)
-        {
+        if let Some(idx) = cache.instances.iter().position(|i| i.id == instance.id) {
             cache.instances[idx] = instance;
             persist(&self.instances_path, &cache.instances);
         }
@@ -483,10 +465,7 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
             Err(e) => {
                 // 主文件损坏，尝试读 .tmp 备份（atomic_write 先写 .tmp 再 rename，
                 // 崩溃时 .tmp 可能保存了最新数据）
-                tracing::warn!(
-                    "加载 {} 失败({e})，尝试 .tmp 备份",
-                    path.display()
-                );
+                tracing::warn!("加载 {} 失败({e})，尝试 .tmp 备份", path.display());
                 let tmp_path = std::path::PathBuf::from(format!("{}.tmp", path.display()));
                 if let Ok(tmp_s) = std::fs::read_to_string(&tmp_path) {
                     if let Ok(data) = serde_json::from_str(&tmp_s) {
@@ -598,7 +577,10 @@ mod tests {
         let _ = camp_id;
         store.save_campaign(camp.clone());
 
-        let inst = CharacterInstance::from_definition(camp.id.clone(), &make_card().character_definitions[0]);
+        let inst = CharacterInstance::from_definition(
+            camp.id.clone(),
+            &make_card().character_definitions[0],
+        );
         store.add_instance(inst.clone());
 
         assert_eq!(store.list_campaigns().len(), 1);
@@ -630,8 +612,10 @@ mod tests {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
         let camp = Campaign::new(Id::from_str("card-1"), "x".to_string());
-        let mut inst =
-            CharacterInstance::from_definition(camp.id.clone(), &make_card().character_definitions[0]);
+        let mut inst = CharacterInstance::from_definition(
+            camp.id.clone(),
+            &make_card().character_definitions[0],
+        );
         store.save_campaign(camp.clone());
         store.add_instance(inst.clone());
 
@@ -653,25 +637,20 @@ mod tests {
         let store = CampaignStore::new(&dir);
         let camp_id = Id::from_str("camp-k");
         let char_id = Id::from_str("char-1");
-        let e1 = CharacterKnowledgeEntry::witnessed(
-            camp_id.clone(),
-            char_id.clone(),
-            "看到尸体",
-            1,
-        );
-        let e2 = CharacterKnowledgeEntry::backstory(
-            camp_id.clone(),
-            char_id.clone(),
-            "我是外科医生",
-        );
+        let e1 =
+            CharacterKnowledgeEntry::witnessed(camp_id.clone(), char_id.clone(), "看到尸体", 1);
+        let e2 =
+            CharacterKnowledgeEntry::backstory(camp_id.clone(), char_id.clone(), "我是外科医生");
         store.add_knowledge(vec![e1.clone(), e2.clone()]);
 
         assert_eq!(store.list_knowledge(&camp_id).len(), 2);
         assert_eq!(store.list_knowledge_of(&camp_id, &char_id).len(), 2);
         // 另一角色查不到
-        assert!(store
-            .list_knowledge_of(&camp_id, &Id::from_str("char-other"))
-            .is_empty());
+        assert!(
+            store
+                .list_knowledge_of(&camp_id, &Id::from_str("char-other"))
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -790,7 +769,9 @@ mod tests {
         StoredMvuTranslation {
             source_character_id: Id::from_str(source_id),
             character_name: name.into(),
-            translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(vec![]),
+            translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(
+                vec![],
+            ),
             analyzed_at: "2026-06-16T00:00:00Z".into(),
         }
     }
@@ -810,7 +791,10 @@ mod tests {
         assert_eq!(store.list_all_mvu().len(), 2);
         assert!(store.get_mvu(&Id::from_str("src-1")).is_some());
         assert_eq!(
-            store.get_mvu(&Id::from_str("src-1")).unwrap().character_name,
+            store
+                .get_mvu(&Id::from_str("src-1"))
+                .unwrap()
+                .character_name,
             "测试卡A"
         );
 
@@ -818,7 +802,10 @@ mod tests {
         store.save_mvu(make_mvu("src-1", "测试卡A-改"));
         assert_eq!(store.list_all_mvu().len(), 2);
         assert_eq!(
-            store.get_mvu(&Id::from_str("src-1")).unwrap().character_name,
+            store
+                .get_mvu(&Id::from_str("src-1"))
+                .unwrap()
+                .character_name,
             "测试卡A-改"
         );
 

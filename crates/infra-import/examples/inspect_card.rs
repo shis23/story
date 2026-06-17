@@ -1,5 +1,5 @@
-use storyforge_infra_import::import_character;
 use std::fs;
+use storyforge_infra_import::import_character;
 
 fn main() {
     let data = fs::read("test-card.png").expect("读取失败");
@@ -29,11 +29,21 @@ fn main() {
         println!("绿灯(selective): {}", selectives.len());
         println!("\n--- 蓝灯条目（前10条）---");
         for (i, e) in constants.iter().take(10).enumerate() {
-            println!("  [{}] keys={:?} content={}", i, e.keys, truncate(&e.content, 120));
+            println!(
+                "  [{}] keys={:?} content={}",
+                i,
+                e.keys,
+                truncate(&e.content, 120)
+            );
         }
         println!("\n--- 绿灯条目（前10条）---");
         for (i, e) in selectives.iter().take(10).enumerate() {
-            println!("  [{}] keys={:?} content={}", i, e.keys, truncate(&e.content, 120));
+            println!(
+                "  [{}] keys={:?} content={}",
+                i,
+                e.keys,
+                truncate(&e.content, 120)
+            );
         }
     } else {
         println!("无内嵌世界书");
@@ -49,7 +59,10 @@ fn main() {
             println!("  {}: {}", key, preview);
         }
     } else {
-        println!("extensions 不是 object: {}", truncate(&serde_json::to_string(ext).unwrap_or_default(), 200));
+        println!(
+            "extensions 不是 object: {}",
+            truncate(&serde_json::to_string(ext).unwrap_or_default(), 200)
+        );
     }
 }
 

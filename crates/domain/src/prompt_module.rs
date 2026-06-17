@@ -90,7 +90,8 @@ pub struct PromptProfile {
     pub name: String,
     /// 每个 Agent 角色选定哪些模块（按 category 组织）
     /// key = AgentRole，value = { category -> Vec<module_id> }
-    pub selections: std::collections::HashMap<AgentRole, std::collections::HashMap<ModuleCategory, Vec<Id>>>,
+    pub selections:
+        std::collections::HashMap<AgentRole, std::collections::HashMap<ModuleCategory, Vec<Id>>>,
     /// 自定义覆盖（用户直接改某 Agent 的提示词，不走模块）
     pub overrides: std::collections::HashMap<AgentRole, Option<String>>,
     pub source: ProfileSource,
@@ -172,7 +173,10 @@ pub fn assemble_system_prompt(
         for cat in &category_order {
             let ids = profile.selected_ids(role, cat);
             for mid in ids {
-                if let Some(m) = modules.iter().find(|m| &m.id == mid && role_applicable(&m.applicable_roles, role)) {
+                if let Some(m) = modules
+                    .iter()
+                    .find(|m| &m.id == mid && role_applicable(&m.applicable_roles, role))
+                {
                     parts.push(m.content.clone());
                 }
             }
@@ -228,10 +232,7 @@ pub mod builtins {
 
     /// 编剧 + 子 Agent
     fn editor_and_subagent() -> Vec<AgentRole> {
-        vec![
-            AgentRole::Editor,
-            AgentRole::Subagent("*".into()),
-        ]
+        vec![AgentRole::Editor, AgentRole::Subagent("*".into())]
     }
 
     /// 预置模块列表（5 个核心模块）
@@ -376,7 +377,8 @@ pub mod builtins {
             assert_eq!(director_cot.len(), 1);
 
             // 编剧应有 视角 + 文风 + 质量 + 输出
-            let editor_persp = profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Perspective);
+            let editor_persp =
+                profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Perspective);
             assert_eq!(editor_persp.len(), 1);
             let editor_style = profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Style);
             assert_eq!(editor_style.len(), 1);
@@ -386,7 +388,8 @@ pub mod builtins {
             assert_eq!(editor_output.len(), 1);
 
             // 子 Agent 应有 输出
-            let sub_output = profile.selected_ids(&AgentRole::Subagent("*".into()), &ModuleCategory::Output);
+            let sub_output =
+                profile.selected_ids(&AgentRole::Subagent("*".into()), &ModuleCategory::Output);
             assert_eq!(sub_output.len(), 1);
         }
 
@@ -403,10 +406,10 @@ pub mod builtins {
             );
 
             assert!(assembled.contains("你是编剧"));
-            assert!(assembled.contains("第三人称叙事"));  // 模块 content，非 name
-            assert!(assembled.contains("白描"));           // 模块 content 中含"白描"
-            assert!(assembled.contains("杀八股"));         // 模块 content 中含"杀八股"
-            assert!(assembled.contains("目标字数"));       // 字数控制模块的 content
+            assert!(assembled.contains("第三人称叙事")); // 模块 content，非 name
+            assert!(assembled.contains("白描")); // 模块 content 中含"白描"
+            assert!(assembled.contains("杀八股")); // 模块 content 中含"杀八股"
+            assert!(assembled.contains("目标字数")); // 字数控制模块的 content
             assert!(assembled.contains("工具说明"));
         }
 
@@ -414,7 +417,10 @@ pub mod builtins {
         fn test_replace_template_vars() {
             let text = "你是 {{char}}，正在和 {{user}} 对话。{{charIfNotUser}} 会回应。";
             let result = replace_template_vars(text, "Seraphina", "玩家");
-            assert_eq!(result, "你是 Seraphina，正在和 玩家 对话。Seraphina 会回应。");
+            assert_eq!(
+                result,
+                "你是 Seraphina，正在和 玩家 对话。Seraphina 会回应。"
+            );
         }
 
         #[test]
@@ -428,8 +434,14 @@ pub mod builtins {
         fn test_role_applicable_subagent_wildcard() {
             // 模块声明 applicable_roles 含 Subagent("*")，应匹配任意 Subagent(id)
             let wildcard = vec![AgentRole::Subagent("*".into())];
-            assert!(super::role_applicable(&wildcard, &AgentRole::Subagent("林医生".into())));
-            assert!(super::role_applicable(&wildcard, &AgentRole::Subagent("any".into())));
+            assert!(super::role_applicable(
+                &wildcard,
+                &AgentRole::Subagent("林医生".into())
+            ));
+            assert!(super::role_applicable(
+                &wildcard,
+                &AgentRole::Subagent("any".into())
+            ));
             // 精确匹配
             let exact = vec![AgentRole::Director];
             assert!(super::role_applicable(&exact, &AgentRole::Director));
@@ -476,8 +488,10 @@ pub mod builtins {
                 &[module],
                 "",
             );
-            assert!(out.contains("[子Agent专属约束]"),
-                "子Agent 应命中 Subagent(\"*\") 通配符模块，实际: {out}");
+            assert!(
+                out.contains("[子Agent专属约束]"),
+                "子Agent 应命中 Subagent(\"*\") 通配符模块，实际: {out}"
+            );
         }
     }
 }

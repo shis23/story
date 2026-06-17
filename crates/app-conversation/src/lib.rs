@@ -9,11 +9,11 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use storyforge_domain::Id;
 use storyforge_domain::conversation::{
     Conversation, MessageVariant, Provenance, Role, SubagentSnapshot, VariantStatus,
 };
 use storyforge_domain::llm::ChatMessage;
-use storyforge_domain::Id;
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -63,7 +63,9 @@ impl ConversationStore {
 
     /// 获取缓存锁，恢复被毒化的 mutex 而非 panic
     fn lock_cache(&self) -> MutexGuard<'_, Vec<Conversation>> {
-        self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 确保从磁盘加载所有对话
@@ -226,15 +228,11 @@ impl ConversationStore {
     }
 
     /// 采纳当前 AI 变体（Draft → Final）
-    pub fn accept_variant(
-        &self,
-        conv_id: &Id,
-        node_id: &Id,
-    ) -> Result<(), ConversationError> {
+    pub fn accept_variant(&self, conv_id: &Id, node_id: &Id) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             if let Some(variant) = node.active_mut() {
                 if variant.status == VariantStatus::Discarded {
@@ -257,9 +255,9 @@ impl ConversationStore {
         provenance: Option<Provenance>,
     ) -> Result<usize, ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             let variant = MessageVariant {
                 id: Id::new(),
@@ -292,9 +290,9 @@ impl ConversationStore {
         provenance: Option<Provenance>,
     ) -> Result<usize, ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             // 旧 active 降级为 Discarded（幂等：已 Discarded 再设不影响）
             if let Some(old) = node.variants.get_mut(node.active_variant) {
@@ -327,9 +325,9 @@ impl ConversationStore {
         conv_id: &Id,
         node_id: &Id,
     ) -> Result<bool, ConversationError> {
-        let conv = self.get(conv_id).ok_or_else(|| {
-            ConversationError::NotFound(conv_id.to_string())
-        })?;
+        let conv = self
+            .get(conv_id)
+            .ok_or_else(|| ConversationError::NotFound(conv_id.to_string()))?;
         match conv.nodes.last() {
             Some(last) => Ok(last.id == *node_id
                 && last
@@ -348,13 +346,12 @@ impl ConversationStore {
         index: usize,
     ) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
-            node.switch_variant(index).map_err(|e| {
-                ConversationError::VariantIndexOutOfBounds(e)
-            })?;
+            node.switch_variant(index)
+                .map_err(|e| ConversationError::VariantIndexOutOfBounds(e))?;
 
             conv.updated_at = Utc::now();
             Ok(())
@@ -369,13 +366,12 @@ impl ConversationStore {
         new_content: String,
     ) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
-            node.edit_active(new_content).map_err(|e| {
-                ConversationError::NodeNotFound(e)
-            })?;
+            node.edit_active(new_content)
+                .map_err(|e| ConversationError::NodeNotFound(e))?;
 
             conv.updated_at = Utc::now();
             Ok(())
@@ -383,19 +379,14 @@ impl ConversationStore {
     }
 
     /// 软删除当前变体（→ Discarded）
-    pub fn soft_delete_variant(
-        &self,
-        conv_id: &Id,
-        node_id: &Id,
-    ) -> Result<(), ConversationError> {
+    pub fn soft_delete_variant(&self, conv_id: &Id, node_id: &Id) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
-            let node = conv.find_node_mut(node_id).ok_or_else(|| {
-                ConversationError::NodeNotFound(node_id.to_string())
-            })?;
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
-            node.soft_delete_active().map_err(|e| {
-                ConversationError::NodeNotFound(e)
-            })?;
+            node.soft_delete_active()
+                .map_err(|e| ConversationError::NodeNotFound(e))?;
 
             conv.updated_at = Utc::now();
             Ok(())
@@ -406,11 +397,7 @@ impl ConversationStore {
     ///
     /// 语义：删除某条 AI 成文 = 撤销从这条开始的写作（含其后的所有消息）。
     /// 如果 node_id 不存在则报错；node_id 是首个被删的（保留它之前的所有消息）。
-    pub fn truncate_from(
-        &self,
-        conv_id: &Id,
-        node_id: &Id,
-    ) -> Result<(), ConversationError> {
+    pub fn truncate_from(&self, conv_id: &Id, node_id: &Id) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
             let pos = conv
                 .nodes
@@ -432,7 +419,12 @@ impl ConversationStore {
 
     /// 获取最近 N 条消息（带角色标签，用于注入 Agent 上下文）
     /// `before_node_id`：如果指定，只返回该节点之前的消息（重 roll 时排除目标消息）
-    pub fn recent_messages_with_role(&self, conv_id: &Id, n: usize, before_node_id: Option<&Id>) -> Vec<String> {
+    pub fn recent_messages_with_role(
+        &self,
+        conv_id: &Id,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> Vec<String> {
         self.get(conv_id)
             .map(|c| c.recent_messages_with_role(n, before_node_id))
             .unwrap_or_default()
@@ -469,25 +461,29 @@ impl ConversationStore {
         node_id: &Id,
         targets: &[PartialRollTarget],
     ) -> Result<(), ConversationError> {
-        let conv = self.get(conv_id).ok_or_else(|| {
-            ConversationError::NotFound(conv_id.to_string())
-        })?;
+        let conv = self
+            .get(conv_id)
+            .ok_or_else(|| ConversationError::NotFound(conv_id.to_string()))?;
 
-        let node = conv.find_node(node_id).ok_or_else(|| {
-            ConversationError::NodeNotFound(node_id.to_string())
-        })?;
+        let node = conv
+            .find_node(node_id)
+            .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
-        let variant = node.active().ok_or_else(|| {
-            ConversationError::NodeNotFound("无变体".into())
-        })?;
+        let variant = node
+            .active()
+            .ok_or_else(|| ConversationError::NodeNotFound("无变体".into()))?;
 
         let provenance = variant.provenance.as_ref().ok_or_else(|| {
             ConversationError::PartialRollViolation("该变体无溯源信息，无法部分重 roll".into())
         })?;
 
         // 检查约束：不能只重导演却保留旧子产出
-        let rerun_director = targets.iter().any(|t| matches!(t, PartialRollTarget::Director));
-        let keep_subagents = !targets.iter().any(|t| matches!(t, PartialRollTarget::Subagent(_)));
+        let rerun_director = targets
+            .iter()
+            .any(|t| matches!(t, PartialRollTarget::Director));
+        let keep_subagents = !targets
+            .iter()
+            .any(|t| matches!(t, PartialRollTarget::Subagent(_)));
 
         if rerun_director && keep_subagents && !provenance.subagent_results.is_empty() {
             return Err(ConversationError::PartialRollViolation(
@@ -536,7 +532,61 @@ pub fn build_provenance(
     Provenance {
         session_id,
         plan,
-        subagent_results: subagent_results.iter().map(SubagentSnapshot::from).collect(),
+        subagent_results: subagent_results
+            .iter()
+            .map(SubagentSnapshot::from)
+            .collect(),
+        profile_id,
+        seed,
+        last_hint,
+    }
+}
+
+/// 从写作会话结果构造 Provenance（Campaign 模式，阶段 5 新增）
+///
+/// 与 `build_provenance` 相同，但额外从 `CampaignRuntimeContext` 中提取
+/// 每个子 Agent 的 `character_instance_id`、`display_name` 和 `fallback_reason`。
+///
+/// 匹配逻辑：按 `Performance.character_id` 优先匹配 instance.id，再匹配 instance.name。
+pub fn build_provenance_with_campaign(
+    session_id: Id,
+    plan: Option<storyforge_domain::agent::Plan>,
+    subagent_results: &[storyforge_domain::agent::Performance],
+    profile_id: Option<Id>,
+    seed: u64,
+    last_hint: Option<String>,
+    campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+) -> Provenance {
+    let subagent_snapshots: Vec<SubagentSnapshot> = subagent_results
+        .iter()
+        .map(|perf| {
+            let mut snap = SubagentSnapshot::from(perf);
+            if let Some(cr) = campaign_runtime {
+                if let Some(inst) = cr.find_instance_by_id_or_name(&perf.character_id) {
+                    snap.character_instance_id = Some(inst.id.to_string());
+                    snap.display_name = Some(inst.name.clone());
+                    // 如果 character_id 不是 instance.id，说明走了 name fallback
+                    if perf.character_id != inst.id.as_str() {
+                        snap.fallback_reason = Some(format!(
+                            "matched by name '{}' to instance id '{}'",
+                            perf.character_id, inst.id
+                        ));
+                    }
+                } else {
+                    snap.fallback_reason = Some(format!(
+                        "instance not found for '{}', fell back to context_package",
+                        perf.character_id
+                    ));
+                }
+            }
+            snap
+        })
+        .collect();
+
+    Provenance {
+        session_id,
+        plan,
+        subagent_results: subagent_snapshots,
         profile_id,
         seed,
         last_hint,
@@ -548,7 +598,8 @@ mod tests {
     use super::*;
 
     fn temp_store() -> ConversationStore {
-        let dir = std::env::temp_dir().join(format!("storyforge_test_conv_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge_test_conv_{}", uuid::Uuid::new_v4()));
         ConversationStore::new(dir)
     }
 
@@ -570,14 +621,21 @@ mod tests {
         let store = temp_store();
         let conv = store.create(None);
 
-        store.append_user_message(&conv.id, "写一场戏".into()).unwrap();
-        store.append_ai_draft(&conv.id, "成文内容...".into(), None).unwrap();
+        store
+            .append_user_message(&conv.id, "写一场戏".into())
+            .unwrap();
+        store
+            .append_ai_draft(&conv.id, "成文内容...".into(), None)
+            .unwrap();
 
         let updated = store.get(&conv.id).unwrap();
         assert_eq!(updated.nodes.len(), 2);
         assert_eq!(updated.nodes[0].active_content(), "写一场戏");
         assert_eq!(updated.nodes[1].active_content(), "成文内容...");
-        assert_eq!(updated.nodes[1].active().unwrap().status, VariantStatus::Draft);
+        assert_eq!(
+            updated.nodes[1].active().unwrap().status,
+            VariantStatus::Draft
+        );
 
         let _ = store.delete(&conv.id);
     }
@@ -586,7 +644,9 @@ mod tests {
     fn test_accept_variant() {
         let store = temp_store();
         let conv = store.create(None);
-        let node_id = store.append_ai_draft(&conv.id, "草稿".into(), None).unwrap();
+        let node_id = store
+            .append_ai_draft(&conv.id, "草稿".into(), None)
+            .unwrap();
 
         store.accept_variant(&conv.id, &node_id).unwrap();
 
@@ -601,7 +661,9 @@ mod tests {
     fn test_cannot_accept_discarded_variant() {
         let store = temp_store();
         let conv = store.create(None);
-        let node_id = store.append_ai_draft(&conv.id, "草稿".into(), None).unwrap();
+        let node_id = store
+            .append_ai_draft(&conv.id, "草稿".into(), None)
+            .unwrap();
 
         // 先软删除变体
         store.soft_delete_variant(&conv.id, &node_id).unwrap();
@@ -617,10 +679,14 @@ mod tests {
     fn test_swipe_and_switch() {
         let store = temp_store();
         let conv = store.create(None);
-        let node_id = store.append_ai_draft(&conv.id, "版本1".into(), None).unwrap();
+        let node_id = store
+            .append_ai_draft(&conv.id, "版本1".into(), None)
+            .unwrap();
 
         // 添加新变体
-        let new_idx = store.add_variant(&conv.id, &node_id, "版本2".into(), None).unwrap();
+        let new_idx = store
+            .add_variant(&conv.id, &node_id, "版本2".into(), None)
+            .unwrap();
         assert_eq!(new_idx, 1);
 
         let updated = store.get(&conv.id).unwrap();
@@ -641,18 +707,30 @@ mod tests {
     fn test_edit_and_soft_delete() {
         let store = temp_store();
         let conv = store.create(None);
-        let node_id = store.append_ai_draft(&conv.id, "原始内容".into(), None).unwrap();
+        let node_id = store
+            .append_ai_draft(&conv.id, "原始内容".into(), None)
+            .unwrap();
 
         // 编辑
-        store.edit_variant(&conv.id, &node_id, "修改后内容".into()).unwrap();
+        store
+            .edit_variant(&conv.id, &node_id, "修改后内容".into())
+            .unwrap();
         let updated = store.get(&conv.id).unwrap();
-        assert_eq!(updated.find_node(&node_id).unwrap().active_content(), "修改后内容");
+        assert_eq!(
+            updated.find_node(&node_id).unwrap().active_content(),
+            "修改后内容"
+        );
 
         // 软删除
         store.soft_delete_variant(&conv.id, &node_id).unwrap();
         let updated = store.get(&conv.id).unwrap();
         assert_eq!(
-            updated.find_node(&node_id).unwrap().active().unwrap().status,
+            updated
+                .find_node(&node_id)
+                .unwrap()
+                .active()
+                .unwrap()
+                .status,
             VariantStatus::Discarded
         );
 
@@ -666,9 +744,15 @@ mod tests {
         let conv = store.create(None);
         // user1 → ai1 → ai2 → ai3
         let _u1 = store.append_user_message(&conv.id, "意图1".into()).unwrap();
-        let ai1 = store.append_ai_draft(&conv.id, "成文1".into(), None).unwrap();
-        let _ai2 = store.append_ai_draft(&conv.id, "成文2".into(), None).unwrap();
-        let _ai3 = store.append_ai_draft(&conv.id, "成文3".into(), None).unwrap();
+        let ai1 = store
+            .append_ai_draft(&conv.id, "成文1".into(), None)
+            .unwrap();
+        let _ai2 = store
+            .append_ai_draft(&conv.id, "成文2".into(), None)
+            .unwrap();
+        let _ai3 = store
+            .append_ai_draft(&conv.id, "成文3".into(), None)
+            .unwrap();
 
         // 从 ai1 起截断（删 ai1/ai2/ai3，保留 u1）
         store.truncate_from(&conv.id, &ai1).unwrap();
@@ -688,14 +772,12 @@ mod tests {
     fn test_partial_roll_validation() {
         let store = temp_store();
         let conv = store.create(None);
-        let node_id = store.append_ai_draft(&conv.id, "成文".into(), None).unwrap();
+        let node_id = store
+            .append_ai_draft(&conv.id, "成文".into(), None)
+            .unwrap();
 
         // 无 Provenance → 应报错
-        let result = store.validate_partial_roll(
-            &conv.id,
-            &node_id,
-            &[PartialRollTarget::Editor],
-        );
+        let result = store.validate_partial_roll(&conv.id, &node_id, &[PartialRollTarget::Editor]);
         assert!(result.is_err());
 
         // 有 Provenance 但尝试只重导演却保留旧子产出 → 应报错
@@ -705,13 +787,18 @@ mod tests {
             subagent_results: vec![SubagentSnapshot {
                 character_id: "A".into(),
                 full_text: "旧表演".into(),
+                character_instance_id: None,
+                display_name: None,
+                fallback_reason: None,
             }],
             profile_id: None,
             seed: 42,
             last_hint: None,
         };
         // 先加一个带 Provenance 的变体
-        store.add_variant(&conv.id, &node_id, "带溯源的版本".into(), Some(provenance)).unwrap();
+        store
+            .add_variant(&conv.id, &node_id, "带溯源的版本".into(), Some(provenance))
+            .unwrap();
 
         let result = store.validate_partial_roll(
             &conv.id,
@@ -721,11 +808,7 @@ mod tests {
         assert!(result.is_err());
 
         // 只重编剧 → 应成功
-        let result = store.validate_partial_roll(
-            &conv.id,
-            &node_id,
-            &[PartialRollTarget::Editor],
-        );
+        let result = store.validate_partial_roll(&conv.id, &node_id, &[PartialRollTarget::Editor]);
         assert!(result.is_ok());
 
         let _ = store.delete(&conv.id);
@@ -743,7 +826,12 @@ mod tests {
 
         // 原地替换（模拟重 roll 最后一条）
         let new_index = store
-            .replace_active_variant(&conv.id, &node_id, "重 roll 版".into(), Some(dummy_provenance()))
+            .replace_active_variant(
+                &conv.id,
+                &node_id,
+                "重 roll 版".into(),
+                Some(dummy_provenance()),
+            )
             .unwrap();
 
         let updated = store.get(&conv.id).unwrap();

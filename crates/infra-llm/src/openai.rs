@@ -77,9 +77,7 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse, String> 
         .and_then(|v| v.as_array())
         .ok_or("响应缺少 choices 数组")?;
 
-    let first = choices
-        .first()
-        .ok_or("choices 为空")?;
+    let first = choices.first().ok_or("choices 为空")?;
 
     let message = first.get("message").ok_or("choice 缺少 message")?;
 

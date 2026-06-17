@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::character::RenderableAssets;
-use crate::variables::{merge_schema, VariableField};
+use crate::variables::{VariableField, merge_schema};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Part 1：MvuTranslation（Meta Agent 五合一产物）
@@ -88,18 +88,11 @@ pub struct InteractionMapping {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionAction {
     /// 改变量（value_expr 是表达式/字面量描述，交给前端/后处理解释）
-    ModifyVariable {
-        key: String,
-        value_expr: String,
-    },
+    ModifyVariable { key: String, value_expr: String },
     /// 触发下一轮写作（hint 注入导演）
-    TriggerNextTurn {
-        hint: String,
-    },
+    TriggerNextTurn { hint: String },
     /// 多个动作组合
-    Multi {
-        actions: Vec<InteractionAction>,
-    },
+    Multi { actions: Vec<InteractionAction> },
     /// 翻译不了的 JS 片段，运行时执行（本次留桩不执行）
     RunOriginalJs {
         js_snippet: String,
@@ -161,14 +154,18 @@ impl MvuTranslation {
             self.analysis_confidence * 100.0,
             match &self.routing {
                 MvuRouting::Native => "原生".into(),
-                MvuRouting::Hybrid { webview_reason } => format!("混合（需 WebView：{}）", webview_reason),
+                MvuRouting::Hybrid { webview_reason } =>
+                    format!("混合（需 WebView：{}）", webview_reason),
             }
         ));
         out.push_str(&format!("  变量字段: {} 个\n", self.variable_schema.len()));
         out.push_str(&format!("  UI 绑定: {} 个\n", self.ui_bindings.len()));
         out.push_str(&format!("  更新规则: {} 条\n", self.update_rules.len()));
         out.push_str(&format!("  交互映射: {} 个\n", self.interactions.len()));
-        out.push_str(&format!("  兜底 JS 片段: {} 个\n", self.fallback_fragments.len()));
+        out.push_str(&format!(
+            "  兜底 JS 片段: {} 个\n",
+            self.fallback_fragments.len()
+        ));
         if !self.notes.is_empty() {
             out.push_str("  备注:\n");
             for n in &self.notes {
@@ -183,7 +180,9 @@ impl MvuTranslation {
         if self.update_rules.is_empty() {
             return String::new();
         }
-        let mut out = String::from("【状态栏更新规则（来自卡的 MVU 翻译，请按规则调 update_variable 工具）】\n");
+        let mut out = String::from(
+            "【状态栏更新规则（来自卡的 MVU 翻译，请按规则调 update_variable 工具）】\n",
+        );
         for (i, rule) in self.update_rules.iter().enumerate() {
             out.push_str(&format!("{}. {}\n", i + 1, rule));
         }
@@ -261,8 +260,10 @@ pub fn score_card_complexity(
     let script_blocks = count_script_blocks(&html_blob, &js_blob);
     let script_bytes = js_blob.len();
     let placeholder_calls = count_occurrences(&js_blob, "{{");
-    let mvu_set_calls = count_occurrences(&js_blob, "_.set") + count_occurrences(&js_blob, "setLocalVar");
-    let mvu_get_calls = count_occurrences(&js_blob, "_.get") + count_occurrences(&js_blob, "getLocalVar");
+    let mvu_set_calls =
+        count_occurrences(&js_blob, "_.set") + count_occurrences(&js_blob, "setLocalVar");
+    let mvu_get_calls =
+        count_occurrences(&js_blob, "_.get") + count_occurrences(&js_blob, "getLocalVar");
     let jq_calls = count_occurrences(&js_blob, "$(");
 
     let mut counts = HashMap::new();
@@ -277,19 +278,26 @@ pub fn score_card_complexity(
     counts.insert("jq_calls".into(), jq_calls);
 
     // 分类判定
-    let dom_heavy = document_calls >= THRESHOLD_DOCUMENT_HEAVY
-        || innerhtml_calls >= THRESHOLD_INNERHTML_HEAVY;
+    let dom_heavy =
+        document_calls >= THRESHOLD_DOCUMENT_HEAVY || innerhtml_calls >= THRESHOLD_INNERHTML_HEAVY;
     let script_heavy = script_bytes >= THRESHOLD_SCRIPT_BYTES_HEAVY;
 
     let (classification, reasoning) = if dom_heavy || script_heavy {
         let reasons = [
-            (document_calls >= THRESHOLD_DOCUMENT_HEAVY, format!("document.×{}", document_calls)),
-            (innerhtml_calls >= THRESHOLD_INNERHTML_HEAVY, format!("innerHTML×{}", innerhtml_calls)),
+            (
+                document_calls >= THRESHOLD_DOCUMENT_HEAVY,
+                format!("document.×{}", document_calls),
+            ),
+            (
+                innerhtml_calls >= THRESHOLD_INNERHTML_HEAVY,
+                format!("innerHTML×{}", innerhtml_calls),
+            ),
             (script_heavy, format!("script {} 字节", script_bytes)),
         ];
-        let hit: Vec<String> = reasons.into_iter().filter_map(|(hit, msg)| {
-            if hit { Some(msg) } else { None }
-        }).collect();
+        let hit: Vec<String> = reasons
+            .into_iter()
+            .filter_map(|(hit, msg)| if hit { Some(msg) } else { None })
+            .collect();
         (
             CardComplexity::Heavy,
             format!("重 DOM（{}），需共享 WebView 兜底", hit.join(" / ")),
@@ -297,8 +305,10 @@ pub fn score_card_complexity(
     } else if script_bytes > 0 || mvu_set_calls > 0 || mvu_get_calls > 0 {
         (
             CardComplexity::RuleDriven,
-            format!("有简单变量脚本（{} 字节 / _.set×{} / _.get×{}），可翻译为 tool-call",
-                    script_bytes, mvu_set_calls, mvu_get_calls),
+            format!(
+                "有简单变量脚本（{} 字节 / _.set×{} / _.get×{}），可翻译为 tool-call",
+                script_bytes, mvu_set_calls, mvu_get_calls
+            ),
         )
     } else {
         (
@@ -327,7 +337,11 @@ fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::V
         }
     }
     // depth_prompt 可能内嵌 script
-    if let Some(dp) = extensions.get("depth_prompt").and_then(|v| v.get("prompt")).and_then(|v| v.as_str()) {
+    if let Some(dp) = extensions
+        .get("depth_prompt")
+        .and_then(|v| v.get("prompt"))
+        .and_then(|v| v.as_str())
+    {
         blob.push_str(dp);
         blob.push('\n');
     }
@@ -343,7 +357,9 @@ fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::V
 
 /// 计数 needle 在 haystack 里出现的次数（非重叠，字节级，够用）
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() { return 0; }
+    if needle.is_empty() {
+        return 0;
+    }
     let n = needle.len();
     let bytes = haystack.as_bytes();
     let needle_b = needle.as_bytes();
@@ -375,19 +391,17 @@ fn count_script_blocks(html: &str, js_blob: &str) -> usize {
 mod tests {
     use super::*;
     use crate::character::RenderableAssets;
-    use crate::variables::{default_character_variables, VariableField, VariableType};
+    use crate::variables::{VariableField, VariableType, default_character_variables};
 
     fn sample_variable_schema() -> Vec<VariableField> {
-        vec![
-            VariableField {
-                key: "hp".into(),
-                label: "生命值".into(),
-                value_type: VariableType::Int,
-                default: serde_json::json!(100),
-                description: None,
-                group: Some("状态".into()),
-            },
-        ]
+        vec![VariableField {
+            key: "hp".into(),
+            label: "生命值".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(100),
+            description: None,
+            group: Some("状态".into()),
+        }]
     }
 
     // ── MvuTranslation 结构/序列化 ──────────────────────────────────────
@@ -414,7 +428,9 @@ mod tests {
                 js_snippet: "playAnim()".into(),
                 reason: "DOM 动画无法翻译".into(),
             }],
-            routing: MvuRouting::Hybrid { webview_reason: "战斗动画".into() },
+            routing: MvuRouting::Hybrid {
+                webview_reason: "战斗动画".into(),
+            },
             analysis_confidence: 0.8,
             notes: vec!["低置信：战斗逻辑".into()],
         };
@@ -425,7 +441,12 @@ mod tests {
         assert_eq!(back.update_rules.len(), 1);
         assert_eq!(back.interactions.len(), 1);
         assert_eq!(back.fallback_fragments.len(), 1);
-        assert_eq!(back.routing, MvuRouting::Hybrid { webview_reason: "战斗动画".into() });
+        assert_eq!(
+            back.routing,
+            MvuRouting::Hybrid {
+                webview_reason: "战斗动画".into()
+            }
+        );
         assert!((back.analysis_confidence - 0.8).abs() < 1e-9);
     }
 
@@ -435,10 +456,16 @@ mod tests {
             BindingDisplay::Bar { max: 50.5 },
             BindingDisplay::Text,
             BindingDisplay::Tag,
-            BindingDisplay::Icon { mapping: HashMap::from([("happy".into(), "😀".into())]) },
+            BindingDisplay::Icon {
+                mapping: HashMap::from([("happy".into(), "😀".into())]),
+            },
         ];
         for v in variants {
-            let b = UiBinding { element: "e".into(), variable_key: "k".into(), display: v.clone() };
+            let b = UiBinding {
+                element: "e".into(),
+                variable_key: "k".into(),
+                display: v.clone(),
+            };
             let json = serde_json::to_string(&b).unwrap();
             let back: UiBinding = serde_json::from_str(&json).unwrap();
             assert_eq!(back.display, v);
@@ -448,13 +475,24 @@ mod tests {
     #[test]
     fn test_interaction_action_variants_serde() {
         let variants = vec![
-            InteractionAction::ModifyVariable { key: "hp".into(), value_expr: "10".into() },
-            InteractionAction::TriggerNextTurn { hint: "继续战斗".into() },
+            InteractionAction::ModifyVariable {
+                key: "hp".into(),
+                value_expr: "10".into(),
+            },
+            InteractionAction::TriggerNextTurn {
+                hint: "继续战斗".into(),
+            },
             InteractionAction::Multi { actions: vec![] },
-            InteractionAction::RunOriginalJs { js_snippet: "x()".into(), description: "动画".into() },
+            InteractionAction::RunOriginalJs {
+                js_snippet: "x()".into(),
+                description: "动画".into(),
+            },
         ];
         for v in variants {
-            let m = InteractionMapping { element_label: "b".into(), actions: vec![v.clone()] };
+            let m = InteractionMapping {
+                element_label: "b".into(),
+                actions: vec![v.clone()],
+            };
             let json = serde_json::to_string(&m).unwrap();
             let back: InteractionMapping = serde_json::from_str(&json).unwrap();
             assert_eq!(back.actions.len(), 1);
@@ -558,7 +596,12 @@ mod tests {
         }
         let report = score_card_complexity(Some(&assets_with_js(&js)), &serde_json::json!({}));
         assert_eq!(report.classification, CardComplexity::Heavy);
-        assert_eq!(report.suggested_routing, MvuRouting::Hybrid { webview_reason: "卡含大量 DOM 操作 JS，部分元素需共享 WebView 执行".into() });
+        assert_eq!(
+            report.suggested_routing,
+            MvuRouting::Hybrid {
+                webview_reason: "卡含大量 DOM 操作 JS，部分元素需共享 WebView 执行".into()
+            }
+        );
         assert!(*report.counts.get("document_calls").unwrap() >= 30);
     }
 

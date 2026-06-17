@@ -16,17 +16,17 @@ use tracing::{info, warn};
 use storyforge_app_agent::runtime::AgentRuntime;
 use storyforge_app_agent::tools::ToolRegistry;
 
-use crate::prompts::{
-    build_mvu_analyzer_user_msg, make_mvu_analyzer_config, register_mvu_tools,
-};
+use crate::prompts::{build_mvu_analyzer_user_msg, make_mvu_analyzer_config, register_mvu_tools};
 use storyforge_domain::character::Character;
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::mvu_translation::{
-    score_card_complexity, BindingDisplay, CardComplexityReport, FallbackFragment,
-    InteractionAction, InteractionMapping, MvuRouting, MvuTranslation, UiBinding,
+    BindingDisplay, CardComplexityReport, FallbackFragment, InteractionAction, InteractionMapping,
+    MvuRouting, MvuTranslation, UiBinding, score_card_complexity,
 };
 use storyforge_domain::preset::Preset;
-use storyforge_domain::variables::{extract_mvu_schema_from_extensions, VariableField, VariableType};
+use storyforge_domain::variables::{
+    VariableField, VariableType, extract_mvu_schema_from_extensions,
+};
 
 use crate::MetaError;
 
@@ -44,7 +44,8 @@ pub async fn analyze_mvu_card(
     cancel: watch::Receiver<bool>,
 ) -> Result<MvuTranslation, MetaError> {
     // 1. 启发式打分（纯 Rust，无 LLM）
-    let complexity = score_card_complexity(character.renderable_assets.as_ref(), &character.extensions);
+    let complexity =
+        score_card_complexity(character.renderable_assets.as_ref(), &character.extensions);
     // 2. P1 已探测的字段 schema（让 LLM 复用/扩展）
     let field_schema = extract_mvu_schema_from_extensions(&character.extensions);
 
@@ -55,8 +56,10 @@ pub async fn analyze_mvu_card(
     );
 
     // 3. 纯数据卡短路：无 JS 且无 extensions 数据，直接降级，省 LLM 调用
-    if matches!(complexity.classification, storyforge_domain::mvu_translation::CardComplexity::PureData)
-        && field_schema.is_empty()
+    if matches!(
+        complexity.classification,
+        storyforge_domain::mvu_translation::CardComplexity::PureData
+    ) && field_schema.is_empty()
     {
         info!(target: "mvu-import", "卡「{}」无 JS 无 MVU 数据，跳过 LLM 分析", character.name);
         return Ok(MvuTranslation::pure_data_fallback(vec![]));
@@ -296,7 +299,10 @@ impl MvuTranslationRaw {
         let variable_schema = if self.variable_schema.is_empty() {
             field_schema.to_vec()
         } else {
-            self.variable_schema.into_iter().map(|r| r.into_field()).collect()
+            self.variable_schema
+                .into_iter()
+                .map(|r| r.into_field())
+                .collect()
         };
 
         let ui_bindings: Vec<UiBinding> = self
@@ -343,7 +349,8 @@ impl MvuTranslationRaw {
                 if has_fallback {
                     // 自相矛盾：说 native 却有 fallback，纠正为 hybrid
                     MvuRouting::Hybrid {
-                        webview_reason: "存在 fallback_fragments 但 routing 标 native，已纠正".into(),
+                        webview_reason: "存在 fallback_fragments 但 routing 标 native，已纠正"
+                            .into(),
                     }
                 } else {
                     MvuRouting::Native
@@ -409,10 +416,7 @@ fn parse_display(val: &serde_json::Value) -> BindingDisplay {
         .to_lowercase();
     match kind.as_str() {
         "bar" => {
-            let max = val
-                .get("max")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(100.0);
+            let max = val.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
             BindingDisplay::Bar { max }
         }
         "tag" => BindingDisplay::Tag,
@@ -630,7 +634,8 @@ impl StPresetClassificationDto {
         let pending_count = items.iter().filter(|i| i.category == "pending").count();
 
         // 汇总 Agent 建议
-        let mut agent_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut agent_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for it in &items {
             *agent_counts.entry(it.suggested_agent.clone()).or_default() += 1;
         }
@@ -709,7 +714,10 @@ fn build_st_classify_user_msg(preset: &Preset) -> String {
     parts.push(s);
 
     if !preset.regex_scripts.is_empty() {
-        parts.push(format!("（预设还含 {} 个正则脚本，本次不分类）", preset.regex_scripts.len()));
+        parts.push(format!(
+            "（预设还含 {} 个正则脚本，本次不分类）",
+            preset.regex_scripts.len()
+        ));
     }
 
     parts.push("请按指定 JSON 格式输出每条 prompt 的分类。".into());
@@ -723,9 +731,9 @@ fn build_st_classify_user_msg(preset: &Preset) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storyforge_domain::Source;
     use storyforge_domain::character::RenderableAssets;
     use storyforge_domain::llm::{ChatResponse, ToolCall};
-    use storyforge_domain::Source;
 
     fn sample_mvu_json() -> &'static str {
         r#"{
@@ -774,7 +782,12 @@ mod tests {
         let t = parse_mvu_translation_from_response(&resp, &[]).unwrap();
         assert_eq!(t.ui_bindings.len(), 2);
         assert_eq!(t.fallback_fragments.len(), 1);
-        assert_eq!(t.routing, MvuRouting::Hybrid { webview_reason: "战斗动画".into() });
+        assert_eq!(
+            t.routing,
+            MvuRouting::Hybrid {
+                webview_reason: "战斗动画".into()
+            }
+        );
         assert!((t.analysis_confidence - 0.8).abs() < 1e-9);
     }
 
@@ -880,12 +893,13 @@ mod tests {
         use storyforge_app_agent::tools::ToolContext;
         use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
 
-        let mock: std::sync::Arc<MockLlmClient> = std::sync::Arc::new(MockLlmClient::new(vec![MockScript {
-            match_keyword: "卡内状态栏分析".into(),
-            response_content: sample_mvu_json().into(),
-            tool_calls: vec![],
-            stream: false,
-        }]));
+        let mock: std::sync::Arc<MockLlmClient> =
+            std::sync::Arc::new(MockLlmClient::new(vec![MockScript {
+                match_keyword: "卡内状态栏分析".into(),
+                response_content: sample_mvu_json().into(),
+                tool_calls: vec![],
+                stream: false,
+            }]));
 
         let tool_ctx = std::sync::Arc::new(ToolContext {
             characters: vec![],

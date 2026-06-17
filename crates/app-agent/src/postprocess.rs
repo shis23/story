@@ -10,9 +10,9 @@
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use storyforge_domain::Id;
 use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
-use storyforge_domain::Id;
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
@@ -360,16 +360,25 @@ mod tests {
 
     #[test]
     fn test_parse_source_classes() {
-        assert!(matches!(parse_source("witnessed"), KnowledgeSource::Witnessed));
-        assert!(matches!(parse_source("told_by_other"), KnowledgeSource::ToldByOther));
-        assert!(matches!(parse_source("inferred"), KnowledgeSource::Inferred));
+        assert!(matches!(
+            parse_source("witnessed"),
+            KnowledgeSource::Witnessed
+        ));
+        assert!(matches!(
+            parse_source("told_by_other"),
+            KnowledgeSource::ToldByOther
+        ));
+        assert!(matches!(
+            parse_source("inferred"),
+            KnowledgeSource::Inferred
+        ));
     }
 
     #[tokio::test]
     async fn test_end_to_end_with_mock_llm() {
+        use storyforge_domain::llm::ChatMessage;
         use storyforge_infra_llm::LlmClient;
         use storyforge_infra_llm::mock_client::MockLlmClient;
-        use storyforge_domain::llm::ChatMessage;
 
         let client = MockLlmClient::with_defaults();
         let req = storyforge_domain::llm::ChatRequest {

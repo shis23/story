@@ -8,13 +8,11 @@ pub mod postprocess;
 pub mod summarizer;
 
 pub use character_extractor::{
-    build_character_extractor_user_msg, make_character_extractor_config,
-    register_character_extractor_tools, CHARACTER_EXTRACTOR_SYSTEM_PROMPT,
+    CHARACTER_EXTRACTOR_SYSTEM_PROMPT, build_character_extractor_user_msg,
+    make_character_extractor_config, register_character_extractor_tools,
 };
 pub use postprocess::{
-    build_postprocess_user_msg, make_postprocess_config, register_postprocess_tools,
-    POSTPROCESS_SYSTEM_PROMPT,
+    POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, make_postprocess_config,
+    register_postprocess_tools,
 };
-pub use summarizer::{
-    build_summarizer_user_msg, make_summarizer_config, SUMMARIZER_SYSTEM_PROMPT,
-};
+pub use summarizer::{SUMMARIZER_SYSTEM_PROMPT, build_summarizer_user_msg, make_summarizer_config};

@@ -14,8 +14,8 @@ use storyforge_domain::llm::ToolSpec;
 use storyforge_domain::mvu_translation::CardComplexityReport;
 use storyforge_domain::variables::VariableField;
 
-use storyforge_app_agent::tools::ToolRegistry;
 use storyforge_app_agent::AgentConfig;
+use storyforge_app_agent::tools::ToolRegistry;
 
 /// MVU 五合一分析 Agent 系统提示词（含 JSON 输出格式示例）
 ///
@@ -147,13 +147,22 @@ pub fn build_mvu_analyzer_user_msg(
     // 卡的 HTML/JS/CSS 全文（核心分析对象）
     if let Some(assets) = &card.renderable_assets {
         if let Some(html) = &assets.html {
-            parts.push(format!("【卡 HTML 全文】\n{}", truncate_for_prompt(html, 40000)));
+            parts.push(format!(
+                "【卡 HTML 全文】\n{}",
+                truncate_for_prompt(html, 40000)
+            ));
         }
         if let Some(css) = &assets.css {
-            parts.push(format!("【卡 CSS 全文】\n{}", truncate_for_prompt(css, 8000)));
+            parts.push(format!(
+                "【卡 CSS 全文】\n{}",
+                truncate_for_prompt(css, 8000)
+            ));
         }
         if let Some(js) = &assets.js {
-            parts.push(format!("【卡 JS 全文】\n{}", truncate_for_prompt(js, 60000)));
+            parts.push(format!(
+                "【卡 JS 全文】\n{}",
+                truncate_for_prompt(js, 60000)
+            ));
         }
     } else {
         parts.push("（卡无 renderable_assets，只有 extensions 里的字段级 MVU 数据）".into());
@@ -166,7 +175,10 @@ pub fn build_mvu_analyzer_user_msg(
         truncate_for_prompt(&ext_str, 8000)
     ));
 
-    parts.push("请按指定 JSON 格式输出 MvuTranslation（调用 emit_mvu_translation 或直接输出 JSON）。".into());
+    parts.push(
+        "请按指定 JSON 格式输出 MvuTranslation（调用 emit_mvu_translation 或直接输出 JSON）。"
+            .into(),
+    );
 
     parts.join("\n\n")
 }
@@ -219,8 +231,8 @@ fn truncate_for_prompt(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storyforge_domain::character::RenderableAssets;
     use storyforge_domain::Source;
+    use storyforge_domain::character::RenderableAssets;
 
     fn make_card() -> Character {
         Character {

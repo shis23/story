@@ -123,7 +123,11 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<Vec<VectorHit>, VectorError>;
 
     /// 按关键词过滤候选
-    fn search_by_keywords(&self, keywords: &[String], limit: usize) -> Result<Vec<VectorHit>, VectorError>;
+    fn search_by_keywords(
+        &self,
+        keywords: &[String],
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, VectorError>;
 
     /// 按关键词过滤候选，带标签过滤
     fn search_by_keywords_filtered(
@@ -263,12 +267,20 @@ impl VectorStore for BruteForceStore {
             .collect();
 
         // 按分数降序排序
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         Ok(scored)
     }
 
-    fn search_by_keywords(&self, keywords: &[String], limit: usize) -> Result<Vec<VectorHit>, VectorError> {
+    fn search_by_keywords(
+        &self,
+        keywords: &[String],
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, VectorError> {
         self.search_by_keywords_filtered(keywords, limit, &MetadataFilter::default())
     }
 
@@ -373,8 +385,12 @@ mod tests {
     #[test]
     fn test_brute_force_upsert_and_count() {
         let store = BruteForceStore::new();
-        store.upsert(make_record("r1", "内容1", vec!["关键词"])).unwrap();
-        store.upsert(make_record("r2", "内容2", vec!["其他"])).unwrap();
+        store
+            .upsert(make_record("r1", "内容1", vec!["关键词"]))
+            .unwrap();
+        store
+            .upsert(make_record("r2", "内容2", vec!["其他"]))
+            .unwrap();
         assert_eq!(store.count(), 2);
     }
 
@@ -382,14 +398,16 @@ mod tests {
     fn test_brute_force_search_by_vector() {
         let store = BruteForceStore::new();
         store.upsert(make_record("r1", "相似", vec![])).unwrap();
-        store.upsert(VectorRecord {
-            id: Id::from_str("r2"),
-            content: "不同".into(),
-            vector: vec![0.0, 1.0, 0.0], // 正交
-            keywords: vec![],
-            kind: VectorKind::ArchivedSummary,
-            metadata: HashMap::new(),
-        }).unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("r2"),
+                content: "不同".into(),
+                vector: vec![0.0, 1.0, 0.0], // 正交
+                keywords: vec![],
+                kind: VectorKind::ArchivedSummary,
+                metadata: HashMap::new(),
+            })
+            .unwrap();
 
         let hits = store.search_by_vector(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.len(), 1);
@@ -400,8 +418,12 @@ mod tests {
     #[test]
     fn test_brute_force_search_by_keywords() {
         let store = BruteForceStore::new();
-        store.upsert(make_record("r1", "龙的故事", vec!["龙", "冒险"])).unwrap();
-        store.upsert(make_record("r2", "城市生活", vec!["城市", "日常"])).unwrap();
+        store
+            .upsert(make_record("r1", "龙的故事", vec!["龙", "冒险"]))
+            .unwrap();
+        store
+            .upsert(make_record("r2", "城市生活", vec!["城市", "日常"]))
+            .unwrap();
 
         let hits = store.search_by_keywords(&["龙".into()], 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -434,14 +456,17 @@ mod tests {
 
     #[test]
     fn test_persistence() {
-        let dir = std::env::temp_dir().join(format!("storyforge_test_vec_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge_test_vec_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vectors.json");
 
         // 写入
         {
             let store = BruteForceStore::with_persistence(path.clone());
-            store.upsert(make_record("r1", "持久化测试", vec!["test"])).unwrap();
+            store
+                .upsert(make_record("r1", "持久化测试", vec!["test"]))
+                .unwrap();
         }
 
         // 重新加载

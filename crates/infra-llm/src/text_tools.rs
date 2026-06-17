@@ -8,8 +8,9 @@ use std::sync::LazyLock;
 use storyforge_domain::llm::{ChatMessage, FunctionCall, ToolCall, ToolSpec};
 
 /// 编译一次的正则（避免每次调用重新编译）
-static RE_XML: LazyLock<regress::Regex> =
-    LazyLock::new(|| regress::Regex::new(r"<tool_call>([\s\S]*?)</tool_call>").expect("正则编译失败"));
+static RE_XML: LazyLock<regress::Regex> = LazyLock::new(|| {
+    regress::Regex::new(r"<tool_call>([\s\S]*?)</tool_call>").expect("正则编译失败")
+});
 static RE_JSON: LazyLock<regress::Regex> =
     LazyLock::new(|| regress::Regex::new(r"```json([\s\S]*?)```").expect("正则编译失败"));
 
@@ -33,7 +34,8 @@ pub fn inject_tool_prompt(messages: &mut [ChatMessage], tools: &[ToolSpec]) {
 
 /// 格式化工具定义为自然语言描述（给模型看的）
 fn format_tool_descriptions(tools: &[ToolSpec]) -> String {
-    let mut out = String::from("## 可用工具\n\n你可以调用以下工具。调用时请严格使用 <tool_call> 格式：\n\n");
+    let mut out =
+        String::from("## 可用工具\n\n你可以调用以下工具。调用时请严格使用 <tool_call> 格式：\n\n");
 
     for tool in tools {
         out.push_str(&format!("### {}\n", tool.function.name));
@@ -60,7 +62,9 @@ fn format_tool_descriptions(tools: &[ToolSpec]) -> String {
     }
 
     out.push_str("## 调用格式\n\n当你需要调用工具时，请输出以下格式（不要输出其他内容）：\n\n");
-    out.push_str("<tool_call>\n{\"name\": \"工具名\", \"arguments\": {参数JSON}}\n</tool_call>\n\n");
+    out.push_str(
+        "<tool_call>\n{\"name\": \"工具名\", \"arguments\": {参数JSON}}\n</tool_call>\n\n",
+    );
     out.push_str("可以一次调用多个工具：\n\n");
     out.push_str("<tool_call>\n{\"name\": \"工具1\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"工具2\", \"arguments\": {}}\n</tool_call>\n");
 

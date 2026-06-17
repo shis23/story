@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use storyforge_domain::agent::AgentRole;
 use storyforge_domain::Id;
+use storyforge_domain::agent::AgentRole;
 
 // ─── 数据模型（对应设计 §12.3）─────────────────────────────────────────────
 
@@ -217,10 +217,7 @@ impl LogBuffer {
 
     /// 获取各类日志条数
     pub fn counts(&self) -> HashMap<LogKind, usize> {
-        self.entries
-            .iter()
-            .map(|(k, v)| (*k, v.len()))
-            .collect()
+        self.entries.iter().map(|(k, v)| (*k, v.len())).collect()
     }
 }
 
@@ -327,10 +324,7 @@ pub struct ExportOptions {
 }
 
 /// 导出 bundle（返回 JSON，前端打包为 ZIP）
-pub fn export_bundle(
-    store: &LogStore,
-    opts: &ExportOptions,
-) -> serde_json::Value {
+pub fn export_bundle(store: &LogStore, opts: &ExportOptions) -> serde_json::Value {
     let backend_logs = store.query(&LogFilter {
         kind: Some(LogKind::Backend),
         limit: Some(2000),
@@ -470,9 +464,9 @@ impl tracing::field::Visit for MessageVisitor {
 /// - 写入 LogStore（前端日志面板可查，ERROR + LLM 调用落盘）
 /// - 同时输出到 stderr（开发调试用）
 pub fn init_tracing(store: Arc<LogStore>) {
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
 
     // 全局过滤：info 及以上（可被 RUST_LOG 环境变量覆盖）
     let filter = EnvFilter::from_default_env().add_directive("info".parse().unwrap());
@@ -535,7 +529,11 @@ mod tests {
     fn test_buffer_lru_eviction() {
         let mut buf = LogBuffer::new();
         for i in 0..2005 {
-            buf.push(make_entry(LogKind::Backend, LogLevel::Info, &format!("msg{i}")));
+            buf.push(make_entry(
+                LogKind::Backend,
+                LogLevel::Info,
+                &format!("msg{i}"),
+            ));
         }
         let all = buf.query(&LogFilter {
             kind: Some(LogKind::Backend),

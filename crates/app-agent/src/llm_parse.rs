@@ -125,10 +125,7 @@ pub fn try_each_braces<T>(content: &str, accept: impl Fn(&str) -> Option<T>) -> 
 ///     }
 /// }
 /// ```
-pub fn parse_from_content<T>(
-    content: &str,
-    parse: impl Fn(&str) -> Option<T>,
-) -> Option<T> {
+pub fn parse_from_content<T>(content: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
     // 层 2：整个 content 是 JSON
     if let Some(t) = parse(content) {
         return Some(t);

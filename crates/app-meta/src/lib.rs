@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 
 // 重新导出常用类型（向后兼容现有 tauri-app 引用）
 pub use meta_conversation::{
-    chat as meta_chat, MetaConversation, MetaMessage, MetaSession, MetaTurn, ToolResultDisplay,
+    MetaConversation, MetaMessage, MetaSession, MetaTurn, ToolResultDisplay, chat as meta_chat,
 };
 pub use mvu_import::{
-    analyze_mvu_card, classify_st_preset_with_llm, score_card as score_card_complexity,
-    AgentSuggestion, PromptClassification, StPresetClassification,
+    AgentSuggestion, PromptClassification, StPresetClassification, analyze_mvu_card,
+    classify_st_preset_with_llm, score_card as score_card_complexity,
 };
 
 // ─── 诊断报告 ──────────────────────────────────────────────────────────────
@@ -72,9 +72,16 @@ pub struct CardReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PatchAction {
     /// 创建新条目
-    Create { target: String, data: serde_json::Value },
+    Create {
+        target: String,
+        data: serde_json::Value,
+    },
     /// 更新现有条目
-    Update { target: String, field: String, value: serde_json::Value },
+    Update {
+        target: String,
+        field: String,
+        value: serde_json::Value,
+    },
     /// 删除条目
     Delete { target: String },
 }
@@ -92,9 +99,7 @@ pub struct Patch {
 // ─── Meta Agent 诊断工具 ───────────────────────────────────────────────────
 
 /// 诊断世界书：检查冲突和孤立条目
-pub fn inspect_world_info(
-    book: &storyforge_domain::world_info::WorldInfoBook,
-) -> WorldInfoReport {
+pub fn inspect_world_info(book: &storyforge_domain::world_info::WorldInfoBook) -> WorldInfoReport {
     let mut conflicts = Vec::new();
 
     // 检查关键词重叠冲突
@@ -279,10 +284,7 @@ enum TargetRef {
 }
 
 /// 执行单个 PatchAction
-fn execute_action(
-    action: &PatchAction,
-    ctx: &mut PatchContext,
-) -> Result<(), MetaError> {
+fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), MetaError> {
     match action {
         PatchAction::Create { target, data } => {
             let (kind, target_ref) = parse_target(target)?;
@@ -295,7 +297,11 @@ fn execute_action(
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持创建 {kind}"))),
             }
         }
-        PatchAction::Update { target, field, value } => {
+        PatchAction::Update {
+            target,
+            field,
+            value,
+        } => {
             let (kind, target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
@@ -339,10 +345,7 @@ fn execute_action(
 }
 
 /// 执行 Patch 的所有 actions
-pub fn execute_patch(
-    patch: &Patch,
-    ctx: &mut PatchContext,
-) -> Result<(), MetaError> {
+pub fn execute_patch(patch: &Patch, ctx: &mut PatchContext) -> Result<(), MetaError> {
     for action in &patch.actions {
         execute_action(action, ctx)?;
     }
@@ -367,7 +370,11 @@ mod tests {
             position: 0,
             depth: 2,
             order: 100,
-            route: if constant { LoreRoute::Constant } else { LoreRoute::Selective },
+            route: if constant {
+                LoreRoute::Constant
+            } else {
+                LoreRoute::Selective
+            },
             extensions: serde_json::json!({}),
         }
     }

@@ -25,30 +25,20 @@ pub fn parse_png(data: &[u8]) -> Result<Vec<PngChunk>, ImportError> {
 
     while pos + 8 <= data.len() {
         // 读取长度（大端序）
-        let length = u32::from_be_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]) as usize;
+        let length =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
 
         // H-7 防护：单 chunk 大小上限（64MB）。恶意 PNG 可声明超大 tEXt 块吃光内存
         const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024;
         if length > MAX_CHUNK_SIZE {
             return Err(ImportError::PngError(format!(
                 "PNG 块过大（{} 字节，上限 {} 字节），可能为恶意文件",
-                length,
-                MAX_CHUNK_SIZE
+                length, MAX_CHUNK_SIZE
             )));
         }
 
         // 读取类型
-        let chunk_type = [
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ];
+        let chunk_type = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
 
         // 检查剩余数据是否足够
         let total_chunk_size = 4 + 4 + length + 4; // length + type + data + crc

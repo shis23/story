@@ -59,9 +59,7 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
     let chara_text = chunks
         .iter()
         .find_map(|c| match c {
-            png::PngChunk::Text { keyword, text }
-                if keyword.eq_ignore_ascii_case("chara") =>
-            {
+            png::PngChunk::Text { keyword, text } if keyword.eq_ignore_ascii_case("chara") => {
                 Some(text.as_str())
             }
             _ => None,
@@ -69,10 +67,8 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
         .ok_or(ImportError::NoCharacterData)?;
 
     // Base64 解码 → JSON 解析
-    let json_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        chara_text,
-    )?;
+    let json_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)?;
 
     let card: StCharacterCard = serde_json::from_slice(&json_bytes)?;
     Ok(Character::from_st_card(card))
@@ -158,12 +154,18 @@ mod tests {
         let entry0 = &book.entries[0];
         assert_eq!(entry0.keys, vec!["未来", "都市"]);
         assert_eq!(entry0.constant, true);
-        assert_eq!(entry0.route, storyforge_domain::world_info::LoreRoute::Constant);
+        assert_eq!(
+            entry0.route,
+            storyforge_domain::world_info::LoreRoute::Constant
+        );
 
         let entry1 = &book.entries[1];
         assert_eq!(entry1.keys, vec!["战斗", "危险"]);
         assert_eq!(entry1.selective, true);
-        assert_eq!(entry1.route, storyforge_domain::world_info::LoreRoute::Selective);
+        assert_eq!(
+            entry1.route,
+            storyforge_domain::world_info::LoreRoute::Selective
+        );
     }
 
     #[test]
@@ -246,9 +248,15 @@ mod tests {
 
         // 验证正则脚本
         assert_eq!(preset.regex_scripts[0].script_name, "去复述");
-        assert_eq!(preset.regex_scripts[0].placement, storyforge_domain::preset::RegexPlacement::Input);
+        assert_eq!(
+            preset.regex_scripts[0].placement,
+            storyforge_domain::preset::RegexPlacement::Input
+        );
         assert_eq!(preset.regex_scripts[1].script_name, "格式清理");
-        assert_eq!(preset.regex_scripts[1].placement, storyforge_domain::preset::RegexPlacement::Output);
+        assert_eq!(
+            preset.regex_scripts[1].placement,
+            storyforge_domain::preset::RegexPlacement::Output
+        );
 
         // 验证过滤
         assert_eq!(preset.input_regex_scripts().len(), 1);

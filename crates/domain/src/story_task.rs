@@ -273,14 +273,8 @@ mod tests {
             vec![TaskTrigger::TurnReminder { at_turn: 30 }],
             5,
         );
-        assert_eq!(
-            task.check_trigger(29, "第1天"),
-            TriggerCheck::NotSatisfied
-        );
-        assert_eq!(
-            task.check_trigger(30, "第1天"),
-            TriggerCheck::Satisfied
-        );
+        assert_eq!(task.check_trigger(29, "第1天"), TriggerCheck::NotSatisfied);
+        assert_eq!(task.check_trigger(30, "第1天"), TriggerCheck::Satisfied);
     }
 
     #[test]
@@ -298,10 +292,7 @@ mod tests {
             task.check_trigger(100, "第2年5月"),
             TriggerCheck::NotSatisfied
         );
-        assert_eq!(
-            task.check_trigger(100, "第2年6月"),
-            TriggerCheck::Satisfied
-        );
+        assert_eq!(task.check_trigger(100, "第2年6月"), TriggerCheck::Satisfied);
     }
 
     #[test]
@@ -332,7 +323,9 @@ mod tests {
             "混合",
             "测试",
             vec![
-                TaskTrigger::Event { description: "某事件".into() },
+                TaskTrigger::Event {
+                    description: "某事件".into(),
+                },
                 TaskTrigger::TurnReminder { at_turn: 1 },
             ],
             5,
@@ -340,18 +333,16 @@ mod tests {
         assert_eq!(task.check_trigger(1, "第1天"), TriggerCheck::Satisfied);
 
         // 都没命中时，有 Event 才返回 NeedsAgentJudgment
-        assert_eq!(task.check_trigger(0, "第99天"), TriggerCheck::NeedsAgentJudgment);
+        assert_eq!(
+            task.check_trigger(0, "第99天"),
+            TriggerCheck::NeedsAgentJudgment
+        );
     }
 
     #[test]
     fn test_manual_never_auto_triggers() {
-        let task = StoryTask::user_planned(
-            Id::new(),
-            "手动",
-            "手动任务",
-            vec![TaskTrigger::Manual],
-            5,
-        );
+        let task =
+            StoryTask::user_planned(Id::new(), "手动", "手动任务", vec![TaskTrigger::Manual], 5);
         assert_eq!(
             task.check_trigger(1000, "任何时候"),
             TriggerCheck::NotSatisfied

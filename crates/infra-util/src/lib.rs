@@ -42,9 +42,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 ///
 /// `T: ?Sized` 允许传 `&[U]`、`&str`、`&HashMap<..>` 等动态大小类型。
 pub fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> io::Result<()> {
-    let json = serde_json::to_vec_pretty(value).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("序列化失败: {e}"))
-    })?;
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("序列化失败: {e}")))?;
     atomic_write(path, &json)
 }
 

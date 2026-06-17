@@ -135,23 +135,33 @@ impl CharacterInstance {
             name: definition.name.clone(),
             persona_override: None,
             behavior_override: None,
-            variables: crate::variables::init_values_from_schema(
-                &definition.variable_schema,
-                0,
-            ),
+            variables: crate::variables::init_values_from_schema(&definition.variable_schema, 0),
             is_temporary: false,
         }
     }
 
     pub fn temporary(campaign_id: Id, name: impl Into<String>) -> Self {
+        Self::temporary_with_overrides(campaign_id, name, None, None)
+    }
+
+    /// 创建临时 instance，可选传入 persona/behavior override。
+    ///
+    /// Phase 6: Director 的 `context_package.character_brief` 可作为 persona_override
+    /// 注入，使临时角色在当轮子 Agent 和落盘后都有可用的 persona。
+    pub fn temporary_with_overrides(
+        campaign_id: Id,
+        name: impl Into<String>,
+        persona_override: Option<String>,
+        behavior_override: Option<String>,
+    ) -> Self {
         let name = name.into();
         Self {
             id: Id::new(),
             campaign_id,
             definition_id: None,
             name,
-            persona_override: None,
-            behavior_override: None,
+            persona_override,
+            behavior_override,
             variables: crate::variables::init_values_from_schema(
                 &crate::variables::default_character_variables(),
                 0,
@@ -430,5 +440,71 @@ mod tests {
             instance.resolved_behavior(Some(&def)),
             Some("save first, ask later")
         );
+    }
+
+    // --- Phase 6: temporary_with_overrides ---
+
+    #[test]
+    fn temporary_with_overrides_sets_persona() {
+        let instance = CharacterInstance::temporary_with_overrides(
+            Id::new(),
+            "AdHoc",
+            Some("mysterious stranger".into()),
+            None,
+        );
+        assert!(instance.is_temporary);
+        assert_eq!(instance.name, "AdHoc");
+        assert_eq!(
+            instance.persona_override,
+            Some("mysterious stranger".into())
+        );
+        assert!(instance.behavior_override.is_none());
+        assert_eq!(
+            instance.resolved_persona(None),
+            Some("mysterious stranger")
+        );
+    }
+
+    #[test]
+    fn temporary_with_overrides_sets_behavior() {
+        let instance = CharacterInstance::temporary_with_overrides(
+            Id::new(),
+            "Guard",
+            None,
+            Some("block the way".into()),
+        );
+        assert!(instance.is_temporary);
+        assert!(instance.persona_override.is_none());
+        assert_eq!(instance.behavior_override, Some("block the way".into()));
+        assert_eq!(instance.resolved_behavior(None), Some("block the way"));
+    }
+
+    #[test]
+    fn temporary_with_overrides_sets_both() {
+        let instance = CharacterInstance::temporary_with_overrides(
+            Id::new(),
+            "NPC",
+            Some("friendly shopkeeper".into()),
+            Some("offer discounts".into()),
+        );
+        assert_eq!(instance.resolved_persona(None), Some("friendly shopkeeper"));
+        assert_eq!(instance.resolved_behavior(None), Some("offer discounts"));
+    }
+
+    #[test]
+    fn temporary_with_overrides_none_equivalent_to_temporary() {
+        let a = CharacterInstance::temporary_with_overrides(
+            Id::new(),
+            "Test",
+            None,
+            None,
+        );
+        let b = CharacterInstance::temporary(Id::new(), "Test");
+        // Both should have the same field values (except id which is random)
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.is_temporary, b.is_temporary);
+        assert_eq!(a.persona_override, b.persona_override);
+        assert_eq!(a.behavior_override, b.behavior_override);
+        assert_eq!(a.definition_id, b.definition_id);
     }
 }

@@ -195,11 +195,7 @@ mod tests {
     fn test_tail_joins_parts() {
         let layout = MessageLayout::build()
             .system("sys")
-            .tail(|t| {
-                t.push("第一段")
-                    .push("第二段")
-                    .push("第三段")
-            });
+            .tail(|t| t.push("第一段").push("第二段").push("第三段"));
         let msgs = layout.into_messages();
         let tail = msgs.last().unwrap();
         assert_eq!(tail.content, "第一段\n\n第二段\n\n第三段");
@@ -235,12 +231,8 @@ mod tests {
 
     #[test]
     fn test_prefix_fingerprint_changes_when_system_differs() {
-        let a = MessageLayout::build()
-            .system("系统A")
-            .tail(|t| t);
-        let b = MessageLayout::build()
-            .system("系统B")
-            .tail(|t| t);
+        let a = MessageLayout::build().system("系统A").tail(|t| t);
+        let b = MessageLayout::build().system("系统B").tail(|t| t);
         assert_ne!(a.prefix_fingerprint(), b.prefix_fingerprint());
     }
 

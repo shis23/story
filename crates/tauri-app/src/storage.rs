@@ -71,7 +71,12 @@ impl CharacterStore {
 
     /// 获取单个角色卡
     pub fn get(&self, id: &str) -> Option<StoredCharacter> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|c| c.id == id).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
     }
 
     /// 删除角色卡
@@ -183,11 +188,7 @@ impl CharacterStore {
     }
 
     /// 删除世界书条目
-    pub fn delete_world_info_entry(
-        &self,
-        id: &str,
-        entry_index: usize,
-    ) -> Result<(), String> {
+    pub fn delete_world_info_entry(&self, id: &str, entry_index: usize) -> Result<(), String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let char = chars
             .iter_mut()

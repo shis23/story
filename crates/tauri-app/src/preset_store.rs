@@ -67,7 +67,12 @@ impl PresetStore {
 
     /// 获取单个预设详情
     pub fn get(&self, id: &str) -> Option<StoredPreset> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|p| p.id == id).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
     }
 
     /// 删除预设
@@ -84,7 +89,13 @@ impl PresetStore {
     }
 
     /// 更新单条 prompt 的内容和/或启用状态
-    pub fn update_prompt(&self, preset_id: &str, prompt_index: usize, content: Option<&str>, enabled: Option<bool>) -> bool {
+    pub fn update_prompt(
+        &self,
+        preset_id: &str,
+        prompt_index: usize,
+        content: Option<&str>,
+        enabled: Option<bool>,
+    ) -> bool {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
             if let Some(prompt) = stored.preset.prompts.get_mut(prompt_index) {
@@ -102,7 +113,12 @@ impl PresetStore {
     }
 
     /// 更新单条 regex 的禁用状态
-    pub fn update_regex(&self, preset_id: &str, regex_index: usize, disabled: Option<bool>) -> bool {
+    pub fn update_regex(
+        &self,
+        preset_id: &str,
+        regex_index: usize,
+        disabled: Option<bool>,
+    ) -> bool {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
             if let Some(regex) = stored.preset.regex_scripts.get_mut(regex_index) {

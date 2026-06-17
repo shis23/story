@@ -1,8 +1,8 @@
 # 计划：Campaign 写作主线
 
-> 状态：阶段 4 已完成（2026-06-16），Subagent persona 来自 Campaign 实例 + 信息隔离已落地；阶段 5（Postprocess ID 归一）待执行
+> 状态：阶段 5 已补齐（2026-06-17），Postprocess ID 归一 + Provenance 收尾 + present_chars 校验 + task campaign 校验 + delete_character 级联修复；阶段 6 已完成落盘闭环（临时 instance 持久化 + postprocess 写回 + 去重），request_ad_hoc_character 工具未实现
 > 目标读者：可交给小模型按阶段执行
-> 关联：`docs/ARCHITECTURE-AUDIT.md`、`docs/PLAN-CHARACTER-UNIFICATION.md`
+> 关联：`docs/ARCHITECTURE-AUDIT.md`；归档背景：`docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`
 
 ## 目标
 
@@ -33,8 +33,20 @@
 - `crates/app-agent/src/tools.rs::ToolContext` 阶段 2 已新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
 - `crates/app-agent/src/tools.rs` 导演 `get_character` **阶段 3 已改造**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到时 fallback 到旧扁平 Character。
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance，使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`），注册子 Agent 工具。未匹配时 fallback 到旧 context_package。无 campaign_runtime 时走旧路径。
+- `crates/app-agent/src/runtime.rs::build_campaign_subagent_system` **阶段 4 cleanup 新增**：纯函数，构造 Campaign 模式子 Agent 的 system prompt。测试可直接断言 prompt 内容。
+- `crates/app-agent/src/runtime.rs::build_campaign_subagent_volatile` **阶段 4 cleanup 新增**：纯函数，构造 Campaign 模式子 Agent 的 volatile tail 文本。测试可直接断言 knowledge 隔离和 variables 注入。
 - `crates/app-agent/src/tools.rs::register_subagent_tools` **阶段 4 已改造**：子 Agent get_character 有 `current_character_instance_id` 时只返回自己的 instance 数据，不泄露其他角色。无时退回旧扁平 Character。
-- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` 已能写 CampaignStore，但 ID 归一和 `present_chars` 使用不完整。
+- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入会先把角色名或 id 解析成已持久化的 `CharacterInstance.id`，`present_chars` 真正用于校验知识和变量写入（不出场角色不写入），task 状态更新会校验 task 属于当前 campaign。阶段 6：临时 instance 在 postprocess 前已落盘，其知识/变量写回不再被跳过。
+- `crates/domain/src/conversation.rs::SubagentSnapshot` **阶段 5 已扩展**：新增 `character_instance_id`、`display_name`、`fallback_reason` 字段（`Option`，serde 兼容旧数据）。
+- `crates/app-conversation/src/lib.rs::build_provenance_with_campaign` **阶段 5 新增**：接收 `CampaignRuntimeContext`，从 Performance 中提取 instance 信息填充 SubagentSnapshot。
+- `crates/tauri-app/src/lib.rs::CharacterInfo` **阶段 5 已扩展**：新导入卡会保存 `source_character_id: Option<String>`，启动恢复时用它保留 domain `Character.id`；旧数据没有该字段时 fallback 到 `StoredCharacter.id`。
+- `crates/tauri-app/src/lib.rs::delete_character` **阶段 5 已修复**：级联删除时同时尝试 `StoredCharacter.id`、持久化 `source_character_id`、同会话 `tool_ctx` 中按角色名找到的 domain `Character.id`。
+- `crates/domain/src/campaign.rs::CharacterInstance::temporary_with_overrides` **阶段 6 已完成**：创建临时 instance 时可传入 persona/behavior override。
+- `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配的 character_id 创建临时 `CharacterInstance`（支持 persona/behavior override），返回 `Vec<CharacterInstance>` 供调用者持久化；同一批次内重复 unmatched character 会去重。
+- `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮创建的临时 instance，Tauri 层通过 getter 读取后落盘；`start_writing` / `regenerate` 开始时会清空旧 pending，避免失败或重试污染下一轮。
+- `crates/app-pipeline/src/lib.rs::start_writing` / `regenerate` **阶段 6 已完成**：从 Director 的 `context_package.character_brief` 提取 persona 注入临时 instance，存储到 `pending_temporary_instances`。
+- `crates/tauri-app/src/lib.rs::persist_temporary_instances_to` **阶段 6 已完成**：只在 pipeline 返回 `Ok` 后、postprocess 之前把临时 instance 写入 CampaignStore；会跳过同 campaign 已存在同名 instance、同批重复临时 instance，以及 `campaign_id` 不匹配的临时 instance。落盘后 postprocess 知识/变量写回不再被跳过。
+- `request_ad_hoc_character` 工具**未实现**：当前用 unmatched character_id 自动触发，Director 的 character_brief 作为 persona 注入，不需要额外工具。
 
 ## 阶段 0：基线保护
 
@@ -196,7 +208,7 @@ cargo test --workspace
    - 有 runtime 且能匹配 instance：system 使用 resolved persona/behavior。
    - tail 注入 scene、该 instance 可见 knowledge、该 instance variables、任务 brief。
    - 查不到 instance：warn 并 fallback 到旧 `context_package`。
-4. Provenance 记录：
+4. ~~Provenance 记录~~ **（未完成，归入阶段 5）**：
    - subagent 使用的 `character_instance_id`
    - display name
    - fallback reason，如有。
@@ -215,14 +227,25 @@ cargo test --workspace
 - 同名角色通过 instance id 不混淆。
 - reroll 仍能定位对应子 Agent。
 
-## 阶段 5：Postprocess ID 归一和写回收尾
+## 阶段 5：Postprocess ID 归一、Provenance 收尾和写回收尾
 
-目标：写回 CampaignStore 前，把名字、旧 character id、instance id 统一成 `CharacterInstance.id`。
+目标：写回 CampaignStore 前，把名字、旧 character id、instance id 统一成 `CharacterInstance.id`。Provenance 记录 instance 级信息。
+
+当前实现状态（2026-06-17）：
+
+- 已实现：知识写入按 instance id/name 解析到已持久化 `CharacterInstance.id`；解析失败或不在 `present_chars` 时跳过。
+- 已实现：变量写入按 instance id/name 查 persisted instance；不在 `present_chars` 时跳过。
+- 已实现：task 状态更新会校验 `task.campaign_id == 当前 campaign_id`，避免跨档误写。
+- 已实现：Provenance 记录 `character_instance_id`、`display_name`、`fallback_reason`。
+- 已实现：`delete_character` 级联清理会使用持久化 `source_character_id`，并兼容旧数据和同会话 `tool_ctx`。
+- 未实现：persona/behavior override 的后处理写回；当前 `PostProcessResult` 没有这类字段。
 
 改动文件：
 
 - `crates/tauri-app/src/lib.rs`
 - `crates/domain/src/agent.rs` 如需细化 DTO
+- `crates/domain/src/conversation.rs` SubagentSnapshot 扩展
+- `crates/app-conversation/src/lib.rs` build_provenance 扩展
 - `crates/app-agent/src/prompts/postprocess.rs` 如需调整输出约束
 
 任务：
@@ -238,6 +261,9 @@ cargo test --workspace
    - task status 更新必须校验 task 属于当前 campaign。
 5. 真正使用 `present_chars`：
    - 至少用于 postprocess 提示和落盘校验。
+6. Provenance 收尾：
+   - SubagentSnapshot 扩展：`character_instance_id`、`display_name`、`fallback_reason`。
+   - build_provenance 接收 CampaignRuntimeContext，从 Performance 中提取 instance 信息。
 
 验证：
 
@@ -258,21 +284,33 @@ cargo test --workspace
 - 写作输出能改变下一轮 Campaign 上下文。
 - postprocess 不再靠裸名字盲写。
 
-## 阶段 6：临场角色（D34，单独阶段）（中）
+## 阶段 6：临场角色（D34，单独阶段）（已完成落盘闭环，request_ad_hoc_character 未实现）
 
 目标：用户在游玩中提到新角色时，导演能提出临场角色创建请求，由 Tauri 层落盘为 `CharacterInstance::temporary`，下一轮写作可见。
 
+当前实现状态（2026-06-17 落盘闭环完成）：
+
+- 已实现：`CampaignRuntimeContext::with_temporaries_for` 会为 director plan 中未匹配的 character_id 创建临时 instance，支持 persona/behavior override；同一批次内重复 unmatched character 会去重。
+- 已实现：`CharacterInstance::temporary_with_overrides` 构造器，可传入 persona/behavior override。
+- 已实现：`PipelineOrchestrator.pending_temporary_instances` 字段 + getter，`start_writing` / `regenerate` 在创建临时 instance 后存储到此字段，并在每轮开始时清空旧 pending。
+- 已实现：Tauri 层 `persist_temporary_instances_to` helper，只在 pipeline 返回 `Ok` 后、`start_writing` / `regenerate` 的 postprocess 之前调用，把临时 instance 写入 `CampaignStore`。
+- 已实现：去重和防串档逻辑——同一 campaign 内已存在同名 instance 时跳过创建，同一批次同名临时 instance 只写一次，`campaign_id` 不匹配的临时 instance 不写入。
+- 已实现：临时 instance 落盘后，`persist_postprocess_outcome` 的知识/变量写回能通过 `find_instance_by_name_or_id` 找到它们，不再被跳过。
+- 已实现：Director 的 `context_package.character_brief` 自动作为临时 instance 的 `persona_override` 注入。
+- 未实现：导演工具 `request_ad_hoc_character`（当前用 unmatched character_id 自动触发，不需要额外工具）。
+- 未实现：前端展示临场角色、升格为常驻的 UI 流程（`promote_temporary_instance` Tauri command 已存在）。
+
 改动文件：
 
-- `crates/app-agent/src/tools.rs`
-- `crates/tauri-app/src/lib.rs`
-- `crates/domain/src/campaign.rs`
+- `crates/domain/src/campaign.rs`：+`temporary_with_overrides` 方法
+- `crates/domain/src/campaign_runtime.rs`：`with_temporaries_for` 签名扩展为 `&[(String, Option<String>, Option<String>)]`，返回 `Vec<CharacterInstance>`
+- `crates/app-pipeline/src/lib.rs`：+`pending_temporary_instances` 字段/getter，`start_writing`/`regenerate` 构建 character specs 并存储 temps
+- `crates/app-agent/src/runtime.rs`：测试适配新签名
+- `crates/tauri-app/src/lib.rs`：+`persist_temporary_instances_to` helper，`start_writing`/`regenerate` 调用点集成
 
-任务：
+关于 `request_ad_hoc_character` 的说明：
 
-1. 导演工具新增 `request_ad_hoc_character`：只返回结构化请求，不直接写 `CampaignStore`。
-2. Tauri 层落盘：`CharacterInstance::temporary` + override 写入。
-3. 升格路径：保留 `promote_to_permanent`。
+当前 Director 工具循环中，Director 通过 `emit_plan` 输出 `subagent_tasks`，`character_id` 可以是任意字符串。`with_temporaries_for` 已经能为未匹配的 character_id 创建临时 instance。如果单独做 `request_ad_hoc_character` 工具，需要 Director 先调用此工具再 emit_plan，增加一轮 LLM 交互，且需要在 Director 的 tool loop 中特殊处理产出顺序——当前架构不支持"工具产出影响 emit_plan 的输入"这种跨工具依赖。用现有 unmatched character_id + persona 来自 context_package 的方式，零额外 LLM 开销，且不改 Director 工具循环。
 
 ## 回滚策略
 
@@ -302,10 +340,13 @@ cargo test --workspace
 | 4 | `app-agent/runtime.rs` | spawn_subagents 签名加 CampaignRuntimeContext，persona 走实例，信息隔离 |
 | 4 | `app-pipeline/lib.rs` | spawn_subagents 调用点传 campaign_runtime |
 | 4 | `app-agent/tools.rs` | 子 Agent get_character 限制为当前 instance |
-| 5 | `tauri-app/lib.rs` | persist_postprocess_outcome 做 ID 归一化；present_chars 启用；delete_character id 修复 |
+| 5 | `tauri-app/lib.rs` | persist_postprocess_outcome 做 ID 归一化；present_chars 启用；task campaign 校验；CharacterInfo.source_character_id；delete_character id 修复 |
 | 5 | `app-agent/prompts/postprocess.rs` | 明确输出可用角色名，但后端会解析成 instance id |
-| 6 | `app-agent/tools.rs` | +request_ad_hoc_character 工具（只返回请求，不落盘） |
-| 6 | `tauri-app/lib.rs` | 接收 pending ad-hoc 请求并写入 CampaignStore |
+| 6 | `domain/campaign.rs` | +`temporary_with_overrides` 构造器（支持 persona/behavior override） |
+| 6 | `domain/campaign_runtime.rs` | `with_temporaries_for` 签名扩展，返回 `Vec<CharacterInstance>`，支持 override 注入 |
+| 6 | `app-pipeline/lib.rs` | +`pending_temporary_instances` 字段/getter，`start_writing`/`regenerate` 构建 specs 并存储 temps |
+| 6 | `app-agent/runtime.rs` | 测试适配 `with_temporaries_for` 新签名 |
+| 6 | `tauri-app/lib.rs` | +`persist_temporary_instances_to` helper，`start_writing`/`regenerate` 集成（postprocess 前落盘） |
 
 ## 工作量评估
 

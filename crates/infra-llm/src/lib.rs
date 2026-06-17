@@ -56,8 +56,8 @@ pub fn create_client(
 pub async fn fetch_models(
     conn: &storyforge_domain::llm::LlmConnection,
 ) -> Result<Vec<String>, String> {
-    let client = http_client::HttpLlmClient::new(conn)
-        .map_err(|e| format!("构造客户端失败: {e}"))?;
+    let client =
+        http_client::HttpLlmClient::new(conn).map_err(|e| format!("构造客户端失败: {e}"))?;
     client
         .fetch_models(&conn.base_url)
         .await

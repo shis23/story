@@ -7,19 +7,21 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
+use storyforge_domain::Id;
+use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::agent::{
-    AgentRole, ContextPackage, Draft, LoreEntryLight, PipelineEvent,
-    PipelineState, Plan, SubagentTask, WritingSession,
+    AgentRole, ContextPackage, Draft, LoreEntryLight, PipelineEvent, PipelineState, Plan,
+    SubagentTask, WritingSession,
 };
 use storyforge_domain::conversation::Provenance;
-use storyforge_domain::Id;
 
 use storyforge_app_agent::{
-    AgentConfig, AgentError, AgentRuntime, ToolContext, ToolRegistry, spawn_subagents,
-    EDITOR_HINT_MARKER, SUBAGENT_HINT_MARKER,
-    tools::register_director_tools,
+    AgentConfig, AgentError, AgentRuntime, EDITOR_HINT_MARKER, SUBAGENT_HINT_MARKER, ToolContext,
+    ToolRegistry, spawn_subagents, tools::register_director_tools,
 };
-use storyforge_app_conversation::{ConversationStore, PartialRollTarget, build_provenance};
+use storyforge_app_conversation::{
+    ConversationStore, PartialRollTarget, build_provenance_with_campaign,
+};
 use storyforge_infra_llm::LlmClient;
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
@@ -155,6 +157,8 @@ pub struct PipelineOrchestrator {
     state: PipelineState,
     /// 最近一次会话
     session: Option<WritingSession>,
+    /// Phase 6: 本轮创建的临时 instance（供 Tauri 层落盘）
+    pending_temporary_instances: Vec<CharacterInstance>,
 }
 
 impl PipelineOrchestrator {
@@ -169,6 +173,7 @@ impl PipelineOrchestrator {
             conv_store,
             state: PipelineState::Idle,
             session: None,
+            pending_temporary_instances: Vec::new(),
         }
     }
 
@@ -180,6 +185,11 @@ impl PipelineOrchestrator {
     /// 获取最近会话
     pub fn session(&self) -> Option<&WritingSession> {
         self.session.as_ref()
+    }
+
+    /// Phase 6: 获取本轮创建的临时 instance（供 Tauri 层落盘到 CampaignStore）
+    pub fn pending_temporary_instances(&self) -> &[CharacterInstance] {
+        &self.pending_temporary_instances
     }
 
     /// 标记流水线为中止状态并推送事件
@@ -209,6 +219,7 @@ impl PipelineOrchestrator {
     ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
         let session_id = Id::new();
         let seed = rand_seed();
+        self.pending_temporary_instances.clear();
 
         info!(target: "app-pipeline", "流水线启动: session={session_id}");
 
@@ -229,7 +240,9 @@ impl PipelineOrchestrator {
         // 兼容 Campaign 主线：campaign_runtime.instances 非空也可通过
         if !has_available_characters(ctx) {
             let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
-            let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: msg.into(),
+            });
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
@@ -316,6 +329,33 @@ impl PipelineOrchestrator {
             });
         }
 
+        // Phase 6：为未匹配的角色创建临时 instance（临场角色）
+        // 从 Director 的 context_package.character_brief 提取 persona 作为 override
+        let char_specs: Vec<(String, Option<String>, Option<String>)> = plan
+            .subagent_tasks
+            .iter()
+            .map(|t| {
+                let persona = if t.context_package.character_brief.is_empty() {
+                    None
+                } else {
+                    Some(t.context_package.character_brief.clone())
+                };
+                (t.character_id.clone(), persona, None)
+            })
+            .collect();
+        let effective_runtime = if let Some(cr) = &ctx.campaign_runtime {
+            let (updated, temps) = cr.with_temporaries_for(&char_specs);
+            if !temps.is_empty() {
+                info!(target: "app-pipeline", "创建 {} 个临时 instance: {:?}",
+                    temps.len(), temps.iter().map(|t| t.id.as_str()).collect::<Vec<_>>());
+            }
+            self.pending_temporary_instances = temps;
+            Some(Arc::new(updated))
+        } else {
+            ctx.campaign_runtime.clone()
+        };
+
+        let effective_runtime_for_prov = effective_runtime.clone();
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -323,7 +363,7 @@ impl PipelineOrchestrator {
             SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
             cancel.clone(),
             event_tx.clone(),
-            ctx.campaign_runtime.clone(),
+            effective_runtime,
         )
         .await;
 
@@ -358,7 +398,9 @@ impl PipelineOrchestrator {
         if performances.is_empty() && !plan.subagent_tasks.is_empty() {
             let msg = "所有子 Agent 均失败，无法生成成文";
             error!(target: "app-pipeline", "{msg}");
-            let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: msg.into(),
+            });
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
@@ -385,9 +427,9 @@ impl PipelineOrchestrator {
             .join("\n\n---\n\n");
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
-        let editor_history = self
-            .conv_store
-            .recent_messages_as_chat(&ctx.conversation_id, 20, None);
+        let editor_history =
+            self.conv_store
+                .recent_messages_as_chat(&ctx.conversation_id, 20, None);
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
@@ -432,20 +474,22 @@ impl PipelineOrchestrator {
         // ─── 阶段 4：写入对话树 ─────────────────────────────────────────
         self.state = PipelineState::Review;
 
-        let provenance = build_provenance(
+        let provenance = build_provenance_with_campaign(
             session_id.clone(),
             Some(plan.clone()),
             &performances,
             None, // profile_id
             seed,
             None, // last_hint（首次写作无 hint）
+            effective_runtime_for_prov.as_deref(),
         );
 
         // 写入对话树
-        let node_id = match self
-            .conv_store
-            .append_ai_draft(&ctx.conversation_id, final_text.clone(), Some(provenance.clone()))
-        {
+        let node_id = match self.conv_store.append_ai_draft(
+            &ctx.conversation_id,
+            final_text.clone(),
+            Some(provenance.clone()),
+        ) {
             Ok(id) => id,
             Err(e) => return Err(self.abort_with(&event_tx, PipelineError::Conversation(e))),
         };
@@ -573,6 +617,7 @@ impl PipelineOrchestrator {
         let hint = req.hint.clone();
         let session_id = Id::new();
         let seed = req.seed.unwrap_or_else(rand_seed);
+        self.pending_temporary_instances.clear();
 
         info!(target: "app-pipeline", "重 roll 启动: session={session_id}, targets={:?}, hint={}",
             req.targets, hint.as_deref().unwrap_or("(无)"));
@@ -629,7 +674,9 @@ impl PipelineOrchestrator {
             // 前置校验：没有可用角色时提前返回友好错误（同 start_writing，兼容 Campaign）
             if !has_available_characters(ctx) {
                 let msg = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
-                let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
+                let _ = event_tx.send(PipelineEvent::Error {
+                    message: msg.into(),
+                });
                 return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
             }
 
@@ -649,9 +696,11 @@ impl PipelineOrchestrator {
                 .unwrap_or_else(|| "重新创作".into());
 
             // §22 cache 友好布局：history 排除重 roll 目标节点及之后
-            let director_history = self
-                .conv_store
-                .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
+            let director_history = self.conv_store.recent_messages_as_chat(
+                &req.conversation_id,
+                20,
+                Some(&req.node_id),
+            );
             let director_layout = storyforge_domain::message_layout::MessageLayout::build()
                 .system(director_config.system_prompt.clone())
                 .history(director_history)
@@ -721,6 +770,33 @@ impl PipelineOrchestrator {
                 });
             }
 
+            // Phase 6：为未匹配的角色创建临时 instance（临场角色）
+            // 从 Director 的 context_package.character_brief 提取 persona 作为 override
+            let char_specs: Vec<(String, Option<String>, Option<String>)> = plan
+                .subagent_tasks
+                .iter()
+                .map(|t| {
+                    let persona = if t.context_package.character_brief.is_empty() {
+                        None
+                    } else {
+                        Some(t.context_package.character_brief.clone())
+                    };
+                    (t.character_id.clone(), persona, None)
+                })
+                .collect();
+            let effective_runtime = if let Some(cr) = &ctx.campaign_runtime {
+                let (updated, temps) = cr.with_temporaries_for(&char_specs);
+                if !temps.is_empty() {
+                    info!(target: "app-pipeline", "创建 {} 个临时 instance（重 roll）: {:?}",
+                        temps.len(), temps.iter().map(|t| t.id.as_str()).collect::<Vec<_>>());
+                }
+                self.pending_temporary_instances = temps;
+                Some(Arc::new(updated))
+            } else {
+                ctx.campaign_runtime.clone()
+            };
+
+            let effective_runtime_for_prov = effective_runtime.clone();
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -728,7 +804,7 @@ impl PipelineOrchestrator {
                 SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
                 cancel.clone(),
                 event_tx.clone(),
-                ctx.campaign_runtime.clone(),
+                effective_runtime,
             )
             .await;
 
@@ -736,11 +812,11 @@ impl PipelineOrchestrator {
             for (i, result) in subagent_results.into_iter().enumerate() {
                 match result {
                     Ok(perf) => {
-                    let _ = event_tx.send(PipelineEvent::SubagentDone {
-                        character_id: perf.character_id.clone(),
-                        index: i,
-                        full_text: perf.full_text.clone(),
-                    });
+                        let _ = event_tx.send(PipelineEvent::SubagentDone {
+                            character_id: perf.character_id.clone(),
+                            index: i,
+                            full_text: perf.full_text.clone(),
+                        });
                         performances.push(perf);
                     }
                     Err(e) => {
@@ -757,7 +833,9 @@ impl PipelineOrchestrator {
             if performances.is_empty() && !plan.subagent_tasks.is_empty() {
                 let msg = "所有子 Agent 均失败，无法生成成文";
                 error!(target: "app-pipeline", "{msg}");
-                let _ = event_tx.send(PipelineEvent::Error { message: msg.into() });
+                let _ = event_tx.send(PipelineEvent::Error {
+                    message: msg.into(),
+                });
                 return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
             }
 
@@ -774,6 +852,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    effective_runtime_for_prov.as_deref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -817,6 +896,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    ctx.campaign_runtime.as_deref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -837,9 +917,7 @@ impl PipelineOrchestrator {
                 .iter()
                 .find(|t| t.character_id == target_id)
                 .ok_or_else(|| {
-                    PipelineError::Regenerate(format!(
-                        "目标子 Agent '{target_id}' 不在旧 Plan 中"
-                    ))
+                    PipelineError::Regenerate(format!("目标子 Agent '{target_id}' 不在旧 Plan 中"))
                 })?
                 .clone();
 
@@ -985,6 +1063,7 @@ impl PipelineOrchestrator {
                     cancel,
                     ctx.profile.as_ref(),
                     &ctx.modules,
+                    ctx.campaign_runtime.as_deref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1013,6 +1092,7 @@ impl PipelineOrchestrator {
         cancel: watch::Receiver<bool>,
         profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
         modules: &[storyforge_domain::prompt_module::PromptModule],
+        campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1032,9 +1112,9 @@ impl PipelineOrchestrator {
             .join("\n\n---\n\n");
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
-        let editor_history = self
-            .conv_store
-            .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
+        let editor_history =
+            self.conv_store
+                .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
@@ -1073,13 +1153,14 @@ impl PipelineOrchestrator {
             text: final_text.clone(),
         });
 
-        let provenance = build_provenance(
+        let provenance = build_provenance_with_campaign(
             session_id.clone(),
             Some(plan.clone()),
             performances,
             None,
             seed,
             hint.map(String::from),
+            campaign_runtime,
         );
 
         // 写入对话树：
@@ -1091,11 +1172,19 @@ impl PipelineOrchestrator {
             .is_last_assistant_node(&req.conversation_id, &req.node_id)
             .map_err(|e| self.abort_with(&event_tx, PipelineError::Conversation(e)))?;
         let land = if is_last_ai {
-            self.conv_store
-                .replace_active_variant(&req.conversation_id, &req.node_id, final_text.clone(), Some(provenance.clone()))
+            self.conv_store.replace_active_variant(
+                &req.conversation_id,
+                &req.node_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            )
         } else {
-            self.conv_store
-                .add_variant(&req.conversation_id, &req.node_id, final_text.clone(), Some(provenance.clone()))
+            self.conv_store.add_variant(
+                &req.conversation_id,
+                &req.node_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            )
         };
         if let Err(e) = land {
             return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
@@ -1131,11 +1220,7 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
         })
         .collect();
     // depth 小的排后面（更重要）；depth 相同 order 小的排后面
-    constants.sort_by(|a, b| {
-        b.depth
-            .cmp(&a.depth)
-            .then_with(|| b.order.cmp(&a.order))
-    });
+    constants.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| b.order.cmp(&a.order)));
 
     if constants.is_empty() {
         return String::new();
@@ -1145,7 +1230,9 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
     for e in &constants {
         out.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
     }
-    out.push_str("\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）");
+    out.push_str(
+        "\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）",
+    );
     out
 }
 
@@ -1193,7 +1280,11 @@ fn build_director_tail(
             };
             lines.push(format!(
                 "- {}（{}）[{}] {}{}",
-                inst.name, inst.id.as_str(), role_str, persona_summary, var_part
+                inst.name,
+                inst.id.as_str(),
+                role_str,
+                persona_summary,
+                var_part
             ));
         }
         lines.join("\n")
@@ -1215,7 +1306,9 @@ fn build_director_tail(
             "用户的写作意图：{intent}\n\n可用角色（Campaign 实例）：\n{char_block}"
         ));
     } else {
-        tail = tail.push(format!("用户的写作意图：{intent}\n\n可用角色：{char_block}"));
+        tail = tail.push(format!(
+            "用户的写作意图：{intent}\n\n可用角色：{char_block}"
+        ));
     }
 
     // 阶段 3：Campaign 全局变量注入（story_clock/weather/world_state 等，压在 volatile tail）
@@ -1355,7 +1448,9 @@ fn make_editor_config(
 /// 3. ```json ... ``` 代码块
 /// 4. ``` ... ``` 代码块（无 json 标签）
 /// 5. 大括号提取：从 content 中贪心抓最大的 {...} 块
-fn parse_plan_from_response(resp: &storyforge_domain::llm::ChatResponse) -> Result<Plan, PipelineError> {
+fn parse_plan_from_response(
+    resp: &storyforge_domain::llm::ChatResponse,
+) -> Result<Plan, PipelineError> {
     let parse = |v: &serde_json::Value| -> Option<Plan> {
         serde_json::from_value::<serde_json::Value>(v.clone())
             .ok()
@@ -1375,7 +1470,8 @@ fn parse_plan_from_response(resp: &storyforge_domain::llm::ChatResponse) -> Resu
                 .ok()
                 .and_then(|val| parse_plan_json(&val).ok())
         };
-        if let Some(plan) = storyforge_app_agent::llm_parse::parse_from_content(content, parse_text) {
+        if let Some(plan) = storyforge_app_agent::llm_parse::parse_from_content(content, parse_text)
+        {
             return Ok(plan);
         }
     }
@@ -1470,7 +1566,11 @@ fn parse_context_package(v: &serde_json::Value) -> ContextPackage {
                         keys: e
                             .get("keys")
                             .and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                         content: e
                             .get("content")
@@ -1490,7 +1590,11 @@ fn parse_context_package(v: &serde_json::Value) -> ContextPackage {
                         keys: e
                             .get("keys")
                             .and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                         content: e
                             .get("content")
@@ -1504,7 +1608,11 @@ fn parse_context_package(v: &serde_json::Value) -> ContextPackage {
         recent_window: v
             .get("recent_window")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         task: v
             .get("task")
@@ -1570,9 +1678,9 @@ fn format_subagent_context_volatile(pkg: &ContextPackage) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use storyforge_infra_llm::mock_client::MockLlmClient;
-    use storyforge_domain::character::Character;
     use storyforge_domain::Source;
+    use storyforge_domain::character::Character;
+    use storyforge_infra_llm::mock_client::MockLlmClient;
 
     /// 构造最小 mock 角色卡（满足 characters 非空校验）
     fn mock_character(name: &str) -> Arc<Character> {
@@ -1604,10 +1712,8 @@ mod tests {
     async fn test_full_pipeline_with_mock() {
         // 构造 mock LLM client
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
-        let conv_dir = std::env::temp_dir().join(format!(
-            "storyforge_test_pipeline_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let conv_dir =
+            std::env::temp_dir().join(format!("storyforge_test_pipeline_{}", uuid::Uuid::new_v4()));
         let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
 
         let tool_ctx = Arc::new(ToolContext {
@@ -1670,10 +1776,22 @@ mod tests {
 
         // 验证关键事件都出现了
         assert!(event_types.contains(&"started".into()), "应有 started 事件");
-        assert!(event_types.contains(&"director_started".into()), "应有 director_started");
-        assert!(event_types.contains(&"director_done".into()), "应有 director_done");
-        assert!(event_types.contains(&"editor_started".into()), "应有 editor_started");
-        assert!(event_types.contains(&"draft_ready".into()), "应有 draft_ready");
+        assert!(
+            event_types.contains(&"director_started".into()),
+            "应有 director_started"
+        );
+        assert!(
+            event_types.contains(&"director_done".into()),
+            "应有 director_done"
+        );
+        assert!(
+            event_types.contains(&"editor_started".into()),
+            "应有 editor_started"
+        );
+        assert!(
+            event_types.contains(&"draft_ready".into()),
+            "应有 draft_ready"
+        );
 
         // 验证对话树中有 AI 成文
         let conv = conv_store.get(&ctx.conversation_id).unwrap();
@@ -1696,15 +1814,13 @@ mod tests {
     async fn setup_with_first_draft() -> (
         PipelineOrchestrator,
         Arc<ConversationStore>,
-        Id, // conversation_id
-        Id, // node_id
+        Id,      // conversation_id
+        Id,      // node_id
         PathBuf, // conv_dir（清理用）
     ) {
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
-        let conv_dir = std::env::temp_dir().join(format!(
-            "storyforge_test_regen_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let conv_dir =
+            std::env::temp_dir().join(format!("storyforge_test_regen_{}", uuid::Uuid::new_v4()));
         let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
         let tool_ctx = Arc::new(ToolContext {
             characters: vec![],
@@ -1717,13 +1833,9 @@ mod tests {
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
 
         let conv = conv_store.create(None);
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            conv.id.clone(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv.id.clone());
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
+        let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
         let (text, node_id, _prov) = orchestrator
             .start_writing("写一场戏".into(), &ctx, event_tx, cancel_rx)
             .await
@@ -1751,14 +1863,12 @@ mod tests {
             hint: Some("节奏太快".into()),
             seed: None,
         };
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            conv_id.clone(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
-        let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
+        let result = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await;
 
         assert!(result.is_ok(), "重 roll 编剧应成功: {:?}", result.err());
         let (text, provenance) = result.unwrap();
@@ -1792,14 +1902,12 @@ mod tests {
             hint: Some("角色 B 语气太冷".into()),
             seed: Some(42),
         };
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            conv_id.clone(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
-        let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
+        let result = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await;
 
         assert!(result.is_ok(), "整体重 roll 应成功: {:?}", result.err());
         let (_text, provenance) = result.unwrap();
@@ -1827,19 +1935,20 @@ mod tests {
             hint: None,
             seed: None,
         };
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            conv_id.clone(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
-        let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
+        let result = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await;
 
         assert!(result.is_err(), "只重导演却留旧子产出应被拒绝");
         match result.unwrap_err() {
             PipelineError::Regenerate(msg) => {
-                assert!(msg.contains("不匹配") || msg.contains("保留"), "错误信息应说明原因: {msg}");
+                assert!(
+                    msg.contains("不匹配") || msg.contains("保留"),
+                    "错误信息应说明原因: {msg}"
+                );
             }
             other => panic!("应是 Regenerate 错误，实际: {other:?}"),
         }
@@ -1871,16 +1980,18 @@ mod tests {
             hint: Some("语气太冷".into()),
             seed: None,
         };
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            conv_id.clone(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
-        let (_cancel_tx, cancel_rx) = watch::channel(false);  // sender 保活，避免误触发取消
-        let result = orchestrator.regenerate(req, &ctx, event_tx, cancel_rx).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
+        let result = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await;
 
-        assert!(result.is_ok(), "重 roll 子 Agent 应成功: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "重 roll 子 Agent 应成功: {:?}",
+            result.err()
+        );
         let (_text, provenance) = result.unwrap();
         assert_eq!(provenance.last_hint.as_deref(), Some("语气太冷"));
 
@@ -1896,10 +2007,7 @@ mod tests {
 
     fn make_orchestrator() -> (PipelineOrchestrator, Arc<ConversationStore>) {
         let llm = Arc::new(MockLlmClient::with_defaults()) as Arc<dyn LlmClient>;
-        let conv_dir = std::env::temp_dir().join(format!(
-            "sf_postproc_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let conv_dir = std::env::temp_dir().join(format!("sf_postproc_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&conv_dir).unwrap();
         let conv_store = Arc::new(ConversationStore::new(conv_dir));
         let tool_ctx = Arc::new(ToolContext {
@@ -1940,11 +2048,7 @@ mod tests {
     #[tokio::test]
     async fn test_postprocess_runs_with_campaign() {
         let (orch, conv_store) = make_orchestrator();
-        let mut ctx = WritingContext::legacy(
-            vec![],
-            None,
-            conv_store.create(None).id,
-        );
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
         ctx.campaign_id = Some(Id::new());
         ctx.turn = 3;
         ctx.story_clock = "第2天".into();
@@ -2010,10 +2114,7 @@ mod tests {
         use storyforge_domain::message_layout::MessageLayout;
         use storyforge_domain::story_task::{StoryTask, TaskTrigger};
         let conv_store = {
-            let dir = std::env::temp_dir().join(format!(
-                "sf_task_msg_{}",
-                uuid::Uuid::new_v4()
-            ));
+            let dir = std::env::temp_dir().join(format!("sf_task_msg_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             Arc::new(ConversationStore::new(dir))
         };
@@ -2048,7 +2149,9 @@ mod tests {
     #[test]
     fn test_director_lore_in_system_not_tail() {
         use storyforge_domain::message_layout::MessageLayout;
-        use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
         let conv_store = {
             let dir = std::env::temp_dir().join(format!("sf_lore_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
@@ -2075,7 +2178,10 @@ mod tests {
         let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None).id);
 
         let system_extra = build_director_system_extra(&ctx);
-        assert!(system_extra.contains("龙族设定详情"), "蓝灯应进 system_extra");
+        assert!(
+            system_extra.contains("龙族设定详情"),
+            "蓝灯应进 system_extra"
+        );
 
         // tail 不应含蓝灯内容
         let layout = MessageLayout::build()
@@ -2091,7 +2197,9 @@ mod tests {
     #[test]
     fn test_director_system_stable_across_rounds() {
         use storyforge_domain::message_layout::MessageLayout;
-        use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
         let conv_store = {
             let dir = std::env::temp_dir().join(format!("sf_cache_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
@@ -2117,14 +2225,16 @@ mod tests {
         });
 
         // 第 1 轮：intent=A，turn=1
-        let mut ctx1 = WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+        let mut ctx1 =
+            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
         ctx1.turn = 1;
         let layout1 = MessageLayout::build()
             .system(&build_director_system_extra(&ctx1))
             .tail(|_| build_director_tail("意图A", &ctx1));
 
         // 第 2 轮：intent=B（完全不同），turn=5
-        let mut ctx2 = WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+        let mut ctx2 =
+            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
         ctx2.turn = 5;
         let layout2 = MessageLayout::build()
             .system(&build_director_system_extra(&ctx2))
@@ -2161,10 +2271,16 @@ mod tests {
         let msgs = layout.into_messages();
         let tail_content = msgs.last().unwrap().content.as_str();
 
-        assert!(tail_content.contains("Seraphina"), "应含角色名: {tail_content}");
+        assert!(
+            tail_content.contains("Seraphina"),
+            "应含角色名: {tail_content}"
+        );
         assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
         // 无 campaign_runtime 时不应出现 instance_id 格式
-        assert!(!tail_content.contains("Campaign 实例"), "不应出现 Campaign 实例标题: {tail_content}");
+        assert!(
+            !tail_content.contains("Campaign 实例"),
+            "不应出现 Campaign 实例标题: {tail_content}"
+        );
     }
 
     /// 有 campaign_runtime 时，build_director_tail 从 instances 渲染（含 id/role/persona）
@@ -2225,11 +2341,23 @@ mod tests {
         let msgs = layout.into_messages();
         let tail_content = msgs.last().unwrap().content.as_str();
 
-        assert!(tail_content.contains("Campaign 实例"), "应出现 Campaign 实例标题: {tail_content}");
-        assert!(tail_content.contains("inst-lin"), "应含 instance id: {tail_content}");
+        assert!(
+            tail_content.contains("Campaign 实例"),
+            "应出现 Campaign 实例标题: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("inst-lin"),
+            "应含 instance id: {tail_content}"
+        );
         assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
-        assert!(tail_content.contains("Protagonist"), "应含 role_type: {tail_content}");
-        assert!(tail_content.contains("calm surgeon"), "应含 persona 摘要: {tail_content}");
+        assert!(
+            tail_content.contains("Protagonist"),
+            "应含 role_type: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("calm surgeon"),
+            "应含 persona 摘要: {tail_content}"
+        );
     }
 
     // ─── 阶段 3 cleanup：has_available_characters + UTF-8 截断 + variables 注入 ──
@@ -2237,11 +2365,7 @@ mod tests {
     /// has_available_characters：旧路径 - characters 非空 → true
     #[test]
     fn test_has_available_characters_flat_true() {
-        let ctx = WritingContext::legacy(
-            vec![mock_character("Seraphina")],
-            None,
-            Id::new(),
-        );
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, Id::new());
         assert!(has_available_characters(&ctx));
     }
 
@@ -2280,7 +2404,10 @@ mod tests {
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_runtime = Some(runtime);
-        assert!(has_available_characters(&ctx), "Campaign instances 非空应通过");
+        assert!(
+            has_available_characters(&ctx),
+            "Campaign instances 非空应通过"
+        );
     }
 
     /// has_available_characters：Campaign 路径 - instances 空 → false
@@ -2300,7 +2427,10 @@ mod tests {
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_runtime = Some(runtime);
-        assert!(!has_available_characters(&ctx), "Campaign instances 空应不通过");
+        assert!(
+            !has_available_characters(&ctx),
+            "Campaign instances 空应不通过"
+        );
     }
 
     /// 中文 persona 超过 80 字符时 build_director_tail 不 panic
@@ -2321,7 +2451,10 @@ mod tests {
 
         // 构造一个超过 80 个中文字符的 persona
         let long_persona = "她是一位经验丰富的外科医生，性格冷静理性，面对紧急情况总能保持镇定。她相信医学的力量，但也深知生命的脆弱。在手术台上她是最可靠的搭档，在生活中她是最值得信赖的朋友。".to_string();
-        assert!(long_persona.chars().count() > 80, "测试前提：persona 超过 80 字符");
+        assert!(
+            long_persona.chars().count() > 80,
+            "测试前提：persona 超过 80 字符"
+        );
 
         let campaign = Campaign::new(Id::from_str("card-1"), "test");
         let def = CharacterDefinition {
@@ -2368,9 +2501,15 @@ mod tests {
 
         // 验证截断后包含省略号和部分中文
         assert!(tail_content.contains("…"), "应有省略号截断: {tail_content}");
-        assert!(tail_content.contains("林医生"), "应含角色名: {tail_content}");
+        assert!(
+            tail_content.contains("林医生"),
+            "应含角色名: {tail_content}"
+        );
         // 验证不会包含完整 persona（因为被截断了）
-        assert!(!tail_content.contains(&long_persona), "不应包含完整 persona");
+        assert!(
+            !tail_content.contains(&long_persona),
+            "不应包含完整 persona"
+        );
     }
 
     /// 有 campaign_runtime 时 director tail 包含 instance variables
@@ -2381,7 +2520,7 @@ mod tests {
         use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
         use storyforge_domain::character::{CharacterDefinition, RoleType};
         use storyforge_domain::message_layout::MessageLayout;
-        use storyforge_domain::variables::{default_character_variables, VariableValue};
+        use storyforge_domain::variables::{VariableValue, default_character_variables};
 
         let conv_store = {
             let dir = std::env::temp_dir().join(format!("sf_vars_{}", uuid::Uuid::new_v4()));
@@ -2447,9 +2586,18 @@ mod tests {
         let msgs = layout.into_messages();
         let tail_content = msgs.last().unwrap().content.as_str();
 
-        assert!(tail_content.contains("hp:80"), "应含 hp 变量: {tail_content}");
-        assert!(tail_content.contains("state:受伤"), "应含 state 变量: {tail_content}");
-        assert!(tail_content.contains("location:急诊室"), "应含 location 变量: {tail_content}");
+        assert!(
+            tail_content.contains("hp:80"),
+            "应含 hp 变量: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("state:受伤"),
+            "应含 state 变量: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("location:急诊室"),
+            "应含 location 变量: {tail_content}"
+        );
     }
 
     /// 无 campaign_runtime 时旧扁平角色列表仍然可用
@@ -2473,9 +2621,15 @@ mod tests {
         let msgs = layout.into_messages();
         let tail_content = msgs.last().unwrap().content.as_str();
 
-        assert!(tail_content.contains("Seraphina"), "应含角色名: {tail_content}");
+        assert!(
+            tail_content.contains("Seraphina"),
+            "应含角色名: {tail_content}"
+        );
         assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
-        assert!(!tail_content.contains("Campaign 实例"), "不应出现 Campaign 实例标题");
+        assert!(
+            !tail_content.contains("Campaign 实例"),
+            "不应出现 Campaign 实例标题"
+        );
         assert!(!tail_content.contains("hp:"), "旧路径不应含变量摘要");
     }
 

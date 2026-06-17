@@ -7,8 +7,8 @@
 
 use storyforge_domain::agent::AgentRole;
 
-use crate::tools::ToolRegistry;
 use crate::AgentConfig;
+use crate::tools::ToolRegistry;
 
 /// 后处理 Agent 系统提示词（含 JSON 输出格式示例）
 ///
@@ -94,7 +94,9 @@ pub fn build_postprocess_user_msg(
     story_clock: &str,
 ) -> String {
     let mut parts = Vec::new();
-    parts.push(format!("【当前轮次】第 {turn} 轮（故事时间：{story_clock}）"));
+    parts.push(format!(
+        "【当前轮次】第 {turn} 轮（故事时间：{story_clock}）"
+    ));
     parts.push(format!(
         "【在场角色】{}",
         if present_characters.is_empty() {

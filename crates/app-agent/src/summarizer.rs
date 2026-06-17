@@ -57,7 +57,8 @@ mod tests {
         use storyforge_infra_llm::LlmClient;
         use storyforge_infra_llm::mock_client::MockLlmClient;
 
-        let client = std::sync::Arc::new(MockLlmClient::with_defaults()) as std::sync::Arc<dyn LlmClient>;
+        let client =
+            std::sync::Arc::new(MockLlmClient::with_defaults()) as std::sync::Arc<dyn LlmClient>;
         let ctx = std::sync::Arc::new(ToolContext {
             characters: vec![],
             world_info: None,

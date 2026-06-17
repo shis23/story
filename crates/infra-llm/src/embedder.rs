@@ -47,10 +47,12 @@ impl Embedder {
     pub fn new(config: EmbedConfig) -> Result<Self, LlmError> {
         Ok(Self {
             client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| LlmError::Internal(format!("构建 embedder reqwest client 失败: {e}")))?,
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(60))
+                .build()
+                .map_err(|e| {
+                    LlmError::Internal(format!("构建 embedder reqwest client 失败: {e}"))
+                })?,
             config,
         })
     }
@@ -58,9 +60,9 @@ impl Embedder {
     /// 获取单个文本的嵌入向量
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
         let resp = self.embed_batch(&[text]).await?;
-        resp.into_iter().next().ok_or_else(|| {
-            LlmError::Internal("嵌入 API 返回空结果".into())
-        })
+        resp.into_iter()
+            .next()
+            .ok_or_else(|| LlmError::Internal("嵌入 API 返回空结果".into()))
     }
 
     /// 批量获取嵌入向量

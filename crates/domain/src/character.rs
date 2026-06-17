@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Source};
 use crate::world_info::WorldInfoBook;
+use crate::{Id, Source};
 
 /// 角色卡（内部表示，对齐 ST V3 spec 但重组为领域模型）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,10 +172,7 @@ impl Character {
     /// 检查是否有可渲染的前端资产（HTML/JS/CSS）
     pub fn has_renderable_assets(&self) -> bool {
         self.renderable_assets.is_some()
-            || self
-                .extensions
-                .get("assets")
-                .is_some_and(|v| !v.is_null())
+            || self.extensions.get("assets").is_some_and(|v| !v.is_null())
     }
 
     /// 从 ST 卡 JSON 解析为领域模型
@@ -248,7 +245,7 @@ fn extract_renderable_assets(data: &StCharacterData) -> Option<RenderableAssets>
 // CharacterDefinition 是「模板」（卡级，全局共享），CharacterInstance 是「实例」（会话级）。
 // 角色识别 Agent 导入时产出 Vec<CharacterDefinition>。
 
-use crate::variables::{merge_schema, VariableField};
+use crate::variables::{VariableField, merge_schema};
 
 /// 角色卡本体（一卡多角色的容器）
 ///
@@ -335,10 +332,7 @@ impl CharacterDefinition {
     ///
     /// 把整张卡当作单一主角色，persona 取 description+personality，
     /// behavior 留空，backstory 空（导演/玩家后续可补），变量 schema 用基础表合并 MVU 探测结果。
-    pub fn fallback_from_character(
-        character: &Character,
-        mvu_schema: &[VariableField],
-    ) -> Self {
+    pub fn fallback_from_character(character: &Character, mvu_schema: &[VariableField]) -> Self {
         let persona = format!(
             "{}\n\n性格：{}",
             character.description.trim(),
@@ -347,10 +341,8 @@ impl CharacterDefinition {
         .trim()
         .to_string();
 
-        let merged_schema = merge_schema(
-            &crate::variables::default_character_variables(),
-            mvu_schema,
-        );
+        let merged_schema =
+            merge_schema(&crate::variables::default_character_variables(), mvu_schema);
 
         Self {
             id: Id::new(),

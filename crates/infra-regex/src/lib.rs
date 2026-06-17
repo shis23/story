@@ -58,9 +58,10 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
     }
     // Compile (regress is an ECMAScript engine).
     // Apply flags (e.g. gm); regress parses i/m/s/u/v and ignores unsupported g.
-    let re = regress::Regex::with_flags(&script.find_regex, script.flags.as_str()).map_err(|e| {
-        RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
-    })?;
+    let re =
+        regress::Regex::with_flags(&script.find_regex, script.flags.as_str()).map_err(|e| {
+            RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
+        })?;
 
     // Global replace (regress replace_all semantics)
     let result = re.replace_all(text, script.replace_string.as_str());
@@ -114,7 +115,12 @@ pub struct ScriptSummary {
 mod tests {
     use super::*;
 
-    fn make_script(name: &str, find: &str, replace: &str, placement: RegexPlacement) -> RegexScript {
+    fn make_script(
+        name: &str,
+        find: &str,
+        replace: &str,
+        placement: RegexPlacement,
+    ) -> RegexScript {
         RegexScript {
             id: format!("test-{name}"),
             script_name: name.into(),
@@ -141,9 +147,12 @@ mod tests {
 
     #[test]
     fn test_apply_output_regex() {
-        let scripts = vec![
-            make_script("格式清理", r"\n{3,}", "\n\n", RegexPlacement::Output),
-        ];
+        let scripts = vec![make_script(
+            "格式清理",
+            r"\n{3,}",
+            "\n\n",
+            RegexPlacement::Output,
+        )];
 
         let input = "段落1\n\n\n\n\n段落2";
         let result = apply_regex_scripts(input, &scripts, RegexPlacement::Output).unwrap();
@@ -161,9 +170,12 @@ mod tests {
 
     #[test]
     fn test_skip_wrong_placement() {
-        let scripts = vec![
-            make_script("输出正则", r"测试", "PASS", RegexPlacement::Output),
-        ];
+        let scripts = vec![make_script(
+            "输出正则",
+            r"测试",
+            "PASS",
+            RegexPlacement::Output,
+        )];
 
         let result = apply_regex_scripts("测试文本", &scripts, RegexPlacement::Input).unwrap();
         assert_eq!(result, "测试文本");
@@ -184,9 +196,12 @@ mod tests {
 
     #[test]
     fn test_invalid_regex() {
-        let scripts = vec![
-            make_script("坏正则", r"[invalid", "x", RegexPlacement::Input),
-        ];
+        let scripts = vec![make_script(
+            "坏正则",
+            r"[invalid",
+            "x",
+            RegexPlacement::Input,
+        )];
 
         let result = apply_regex_scripts("test", &scripts, RegexPlacement::Input);
         assert!(result.is_err());
@@ -195,9 +210,7 @@ mod tests {
     /// H-8: oversize input must be rejected to bound ReDoS backtracking cost.
     #[test]
     fn test_oversize_input_rejected() {
-        let scripts = vec![
-            make_script("大输入", r"a", "b", RegexPlacement::Input),
-        ];
+        let scripts = vec![make_script("大输入", r"a", "b", RegexPlacement::Input)];
         let huge = "a".repeat(2 * 1024 * 1024); // 2MB > 1MB limit
         let result = apply_regex_scripts(&huge, &scripts, RegexPlacement::Input);
         assert!(result.is_err());

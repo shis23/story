@@ -11,10 +11,10 @@
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use storyforge_domain::character::{Character, CharacterDefinition};
 use storyforge_domain::Id;
+use storyforge_domain::character::{Character, CharacterDefinition};
 use storyforge_domain::llm::ChatResponse;
-use storyforge_domain::variables::{default_character_variables, merge_schema, VariableField};
+use storyforge_domain::variables::{VariableField, default_character_variables, merge_schema};
 
 use crate::prompts::{
     build_character_extractor_user_msg, make_character_extractor_config,
@@ -179,7 +179,8 @@ fn parse_definitions_from_content(content: &str) -> Option<Vec<CharacterDefiniti
     // 层 3：```json 代码块
     if let Some(extracted) = try_extract_codeblock(content, "json") {
         if let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted) {
-            let parsed: Vec<CharacterDefinition> = defs.into_iter().map(dto_to_definition).collect();
+            let parsed: Vec<CharacterDefinition> =
+                defs.into_iter().map(dto_to_definition).collect();
             if !parsed.is_empty() {
                 return Some(parsed);
             }
@@ -189,7 +190,8 @@ fn parse_definitions_from_content(content: &str) -> Option<Vec<CharacterDefiniti
     // 层 4：裸代码块
     if let Some(extracted) = try_extract_codeblock(content, "") {
         if let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted) {
-            let parsed: Vec<CharacterDefinition> = defs.into_iter().map(dto_to_definition).collect();
+            let parsed: Vec<CharacterDefinition> =
+                defs.into_iter().map(dto_to_definition).collect();
             if !parsed.is_empty() {
                 return Some(parsed);
             }
@@ -240,11 +242,7 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
         }
     }
 
-    if defs.is_empty() {
-        None
-    } else {
-        Some(defs)
-    }
+    if defs.is_empty() { None } else { Some(defs) }
 }
 
 /// 从 pos 位置的 `{` 开始，找配平的 `}` byte index（处理字符串转义）—— 委托公共模块
@@ -368,10 +366,7 @@ pub mod tests {
 
     #[test]
     fn test_attach_definitions_sets_card_id() {
-        let mut def = CharacterDefinition::fallback_from_character(
-            &make_dummy_character(),
-            &[],
-        );
+        let mut def = CharacterDefinition::fallback_from_character(&make_dummy_character(), &[]);
         def.card_id = Id::from_str("__pending__");
         let card_id = Id::from_str("card-xyz");
         let defs = attach_definitions_to_card(vec![def], &card_id);
@@ -406,9 +401,9 @@ pub mod tests {
     /// 端到端：MockLlmClient 跑识别 Agent 闭环
     #[tokio::test]
     async fn test_extract_characters_with_mock_llm() {
+        use storyforge_domain::llm::ChatMessage;
         use storyforge_infra_llm::LlmClient;
         use storyforge_infra_llm::mock_client::MockLlmClient;
-        use storyforge_domain::llm::ChatMessage;
 
         // MockLlmClient 的识别脚本匹配 "卡内角色识别"
         // 验证它能命中

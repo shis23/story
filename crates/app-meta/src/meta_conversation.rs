@@ -22,8 +22,8 @@ use storyforge_app_agent::AgentConfig;
 
 use crate::prompts::meta_agent::{build_meta_user_msg, make_meta_agent_config};
 use crate::{
-    inspect_character, inspect_world_info, CardReport, Patch, PatchAction, PatchStore,
-    WorldInfoReport,
+    CardReport, Patch, PatchAction, PatchStore, WorldInfoReport, inspect_character,
+    inspect_world_info,
 };
 
 /// Meta Agent 会话状态（跨工具调用共享）
@@ -180,13 +180,23 @@ pub async fn chat(
     for tc in &resp.tool_calls {
         match tc.function.name.as_str() {
             "meta_inspect_world_info" => {
-                if let Some(book) = session.world_info.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                if let Some(book) = session
+                    .world_info
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
                     let report = inspect_world_info(&book);
                     tool_result = ToolResultDisplay::WorldInfoReport(report);
                 }
             }
             "meta_inspect_character" => {
-                if let Some(card) = session.character.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                if let Some(card) = session
+                    .character
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
                     let report = inspect_character(&card);
                     tool_result = ToolResultDisplay::CardReport(report);
                 }
@@ -283,7 +293,11 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             move |_args, _ctx| {
                 let session = session.clone();
                 Box::pin(async move {
-                    let card = session.character.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let card = session
+                        .character
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
                     match card {
                         Some(c) => {
                             let report = inspect_character(&c);
@@ -330,10 +344,16 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
                         .and_then(|v| v.as_str())
                         .unwrap_or("无描述")
                         .to_string();
-                    let actions_val = args.get("actions").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-                    let actions: Vec<PatchAction> = serde_json::from_value(actions_val).map_err(|e| {
-                        storyforge_app_agent::tools::ToolError::BadArgs(format!("actions 解析失败: {e}"))
-                    })?;
+                    let actions_val = args
+                        .get("actions")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Array(vec![]));
+                    let actions: Vec<PatchAction> =
+                        serde_json::from_value(actions_val).map_err(|e| {
+                            storyforge_app_agent::tools::ToolError::BadArgs(format!(
+                                "actions 解析失败: {e}"
+                            ))
+                        })?;
                     let patch = session.patches.propose(description, actions);
                     Ok(serde_json::json!({
                         "patch_id": patch.id,
@@ -395,7 +415,13 @@ mod tests {
         let session = Arc::new(MetaSession::new());
         let book = make_world_info();
         session.set_world_info(book);
-        assert!(session.world_info.lock().unwrap_or_else(|p| p.into_inner()).is_some());
+        assert!(
+            session
+                .world_info
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+        );
     }
 
     #[test]
@@ -415,7 +441,8 @@ mod tests {
         // Mock：匹配 "配置调试助手"，返回纯文本（不带工具调用，避免工具循环死循环）
         let mock = Arc::new(MockLlmClient::new(vec![MockScript {
             match_keyword: "配置调试助手".into(),
-            response_content: "我先看看当前配置。世界书共有 2 条蓝灯条目，其中 1 处关键词冲突。".into(),
+            response_content: "我先看看当前配置。世界书共有 2 条蓝灯条目，其中 1 处关键词冲突。"
+                .into(),
             tool_calls: vec![],
             stream: false,
         }]));
@@ -449,7 +476,10 @@ mod tests {
 
         // 纯文本回复，无工具结果
         let _ = match &turn.agent_message {
-            MetaMessage::Agent { content, tool_result } => {
+            MetaMessage::Agent {
+                content,
+                tool_result,
+            } => {
                 assert!(content.contains("世界书"));
                 assert!(tool_result.is_none()); // 无工具调用
             }

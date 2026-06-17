@@ -64,11 +64,7 @@ impl MemoryRecaller {
     /// 1. LLM 生成检索关键词
     /// 2. 向量相似度召回
     /// 3. minScore 过滤
-    pub async fn recall(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> Result<Vec<MemoryHit>, MemoryError> {
+    pub async fn recall(&self, query: &str, top_k: usize) -> Result<Vec<MemoryHit>, MemoryError> {
         info!(target: "app-memory", "召回请求: query={query}, top_k={top_k}");
 
         // Step 1: 向量相似度召回

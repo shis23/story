@@ -60,6 +60,15 @@ pub struct Provenance {
 pub struct SubagentSnapshot {
     pub character_id: String,
     pub full_text: String,
+    /// Campaign 模式下绑定的 instance id（阶段 5 新增）。None = 旧路径或未匹配。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_instance_id: Option<String>,
+    /// 显示名（阶段 5 新增）。Campaign 模式下为 instance.name，旧路径为 character_id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// fallback 原因（阶段 5 新增）。如 "instance not found, fell back to context_package"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 impl From<&Performance> for SubagentSnapshot {
@@ -67,6 +76,9 @@ impl From<&Performance> for SubagentSnapshot {
         Self {
             character_id: p.character_id.clone(),
             full_text: p.full_text.clone(),
+            character_instance_id: None,
+            display_name: None,
+            fallback_reason: None,
         }
     }
 }
@@ -96,9 +108,7 @@ impl MessageNode {
 
     /// 获取当前激活变体的内容（空字符串兜底）
     pub fn active_content(&self) -> &str {
-        self.active()
-            .map(|v| v.content.as_str())
-            .unwrap_or("")
+        self.active().map(|v| v.content.as_str()).unwrap_or("")
     }
 
     /// 切换版本
@@ -126,9 +136,7 @@ impl MessageNode {
     /// 如果所有变体都被 Discarded，仍然返回 Ok（删除本身已成功）。
     pub fn soft_delete_active(&mut self) -> Result<(), String> {
         {
-            let v = self
-                .active_mut()
-                .ok_or("当前节点无变体")?;
+            let v = self.active_mut().ok_or("当前节点无变体")?;
             v.status = VariantStatus::Discarded;
         }
         // 尝试切换到最近的非 Discarded 变体，找不到也没关系
@@ -149,8 +157,12 @@ impl MessageNode {
                 vec![current]
             } else {
                 let mut c = Vec::with_capacity(2);
-                if current + offset < len { c.push(current + offset); }
-                if offset <= current { c.push(current - offset); }
+                if current + offset < len {
+                    c.push(current + offset);
+                }
+                if offset <= current {
+                    c.push(current - offset);
+                }
                 c
             };
             for &idx in &candidates {
@@ -165,9 +177,7 @@ impl MessageNode {
 
     /// 编辑当前变体内容
     pub fn edit_active(&mut self, new_content: String) -> Result<(), String> {
-        let v = self
-            .active_mut()
-            .ok_or("当前节点无变体")?;
+        let v = self.active_mut().ok_or("当前节点无变体")?;
         v.content = new_content;
         Ok(())
     }
@@ -317,7 +327,10 @@ impl Conversation {
     ) -> impl Iterator<Item = &MessageVariant> {
         // 确定截止位置：before_node_id 指定时只取该节点之前（不含）
         let end_idx = if let Some(bid) = before_node_id {
-            self.nodes.iter().position(|node| &node.id == bid).unwrap_or(self.nodes.len())
+            self.nodes
+                .iter()
+                .position(|node| &node.id == bid)
+                .unwrap_or(self.nodes.len())
         } else {
             self.nodes.len()
         };
@@ -379,8 +392,14 @@ mod tests {
     #[test]
     fn test_recent_messages_as_chat_maps_roles() {
         let c = conv(vec![
-            node("n1", variant(Role::User, "写雨中告别", VariantStatus::Final)),
-            node("n2", variant(Role::Assistant, "雨滴敲在屋檐…", VariantStatus::Final)),
+            node(
+                "n1",
+                variant(Role::User, "写雨中告别", VariantStatus::Final),
+            ),
+            node(
+                "n2",
+                variant(Role::Assistant, "雨滴敲在屋檐…", VariantStatus::Final),
+            ),
             node("n3", variant(Role::User, "继续", VariantStatus::Final)),
         ]);
         let msgs = c.recent_messages_as_chat(10, None);
@@ -396,7 +415,10 @@ mod tests {
         let c = conv(vec![
             node("n1", variant(Role::User, "意图", VariantStatus::Final)),
             node("n2", variant(Role::Assistant, "", VariantStatus::Final)), // 空，跳过
-            node("n3", variant(Role::Assistant, "废弃稿", VariantStatus::Discarded)), // 软删，跳过
+            node(
+                "n3",
+                variant(Role::Assistant, "废弃稿", VariantStatus::Discarded),
+            ), // 软删，跳过
             node("n4", variant(Role::Assistant, "成文", VariantStatus::Final)),
         ]);
         let msgs = c.recent_messages_as_chat(10, None);
@@ -440,7 +462,10 @@ mod tests {
         // 两个方法底层共享 iter_recent_active，过滤规则必须一致
         let c = conv(vec![
             node("n1", variant(Role::User, "意图", VariantStatus::Final)),
-            node("n2", variant(Role::Assistant, "废弃", VariantStatus::Discarded)),
+            node(
+                "n2",
+                variant(Role::Assistant, "废弃", VariantStatus::Discarded),
+            ),
             node("n3", variant(Role::Assistant, "成文", VariantStatus::Final)),
         ]);
         let as_chat = c.recent_messages_as_chat(10, None);
@@ -450,4 +475,3 @@ mod tests {
         assert!(with_role[0].contains("意图"));
     }
 }
-

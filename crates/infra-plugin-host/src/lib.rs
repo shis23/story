@@ -153,7 +153,9 @@ impl PluginRegistry {
     /// 卸载插件
     pub fn uninstall(&self, id: &str) -> Result<(), PluginError> {
         let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
-        plugins.remove(id).ok_or_else(|| PluginError::NotFound(id.into()))?;
+        plugins
+            .remove(id)
+            .ok_or_else(|| PluginError::NotFound(id.into()))?;
         drop(plugins);
         self.persist();
         Ok(())
@@ -162,7 +164,9 @@ impl PluginRegistry {
     /// 启用/禁用插件
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), PluginError> {
         let mut plugins = self.plugins.write().unwrap_or_else(|p| p.into_inner());
-        let plugin = plugins.get_mut(id).ok_or_else(|| PluginError::NotFound(id.into()))?;
+        let plugin = plugins
+            .get_mut(id)
+            .ok_or_else(|| PluginError::NotFound(id.into()))?;
         plugin.enabled = enabled;
         drop(plugins);
         self.persist();
@@ -171,12 +175,21 @@ impl PluginRegistry {
 
     /// 获取插件
     pub fn get(&self, id: &str) -> Option<InstalledPlugin> {
-        self.plugins.read().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
+        self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
     }
 
     /// 列出所有插件
     pub fn list(&self) -> Vec<InstalledPlugin> {
-        self.plugins.read().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
+        self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 列出已启用的插件
@@ -191,9 +204,15 @@ impl PluginRegistry {
     }
 
     /// 校验权限（后端二次校验，对应设计 §8.2）
-    pub fn ensure_permission(&self, plugin_id: &str, permission: &Permission) -> Result<(), PluginError> {
+    pub fn ensure_permission(
+        &self,
+        plugin_id: &str,
+        permission: &Permission,
+    ) -> Result<(), PluginError> {
         let plugins = self.plugins.read().unwrap_or_else(|p| p.into_inner());
-        let plugin = plugins.get(plugin_id).ok_or_else(|| PluginError::NotFound(plugin_id.into()))?;
+        let plugin = plugins
+            .get(plugin_id)
+            .ok_or_else(|| PluginError::NotFound(plugin_id.into()))?;
 
         if !plugin.enabled {
             return Err(PluginError::Disabled(plugin_id.into()));
@@ -261,17 +280,57 @@ pub enum PluginError {
 /// ST 扩展 API 到 StoryForge API 的映射关系
 /// 用于 Meta Agent 插件生成（M5）
 pub const ST_API_MAPPING: &[(&str, &str, &str)] = &[
-    ("SillyTavern.getContext()", "storyforge.character.getCurrent() + storyforge.worldInfo.search()", "拆分成多个细粒度 API"),
-    ("getContext().characters", "storyforge.character.list() / .get(id)", ""),
-    ("getContext().chat", "storyforge.memory.getRecent()", "走记忆系统"),
-    ("eventTypes.MESSAGE_RECEIVED", "storyforge.events.on('message.finalized', cb)", "事件名重定义"),
-    ("eventTypes.GENERATION_STARTED", "storyforge.events.on('pipeline.state_changed', cb)", ""),
-    ("setLocalVar(key, val)", "storyforge.variables.set(key, val)", "需 WriteVariables 权限"),
+    (
+        "SillyTavern.getContext()",
+        "storyforge.character.getCurrent() + storyforge.worldInfo.search()",
+        "拆分成多个细粒度 API",
+    ),
+    (
+        "getContext().characters",
+        "storyforge.character.list() / .get(id)",
+        "",
+    ),
+    (
+        "getContext().chat",
+        "storyforge.memory.getRecent()",
+        "走记忆系统",
+    ),
+    (
+        "eventTypes.MESSAGE_RECEIVED",
+        "storyforge.events.on('message.finalized', cb)",
+        "事件名重定义",
+    ),
+    (
+        "eventTypes.GENERATION_STARTED",
+        "storyforge.events.on('pipeline.state_changed', cb)",
+        "",
+    ),
+    (
+        "setLocalVar(key, val)",
+        "storyforge.variables.set(key, val)",
+        "需 WriteVariables 权限",
+    ),
     ("getLocalVar(key)", "storyforge.variables.get(key)", ""),
-    ("replaceVariables(msg)", "（不暴露，变量替换由后端统一做）", ""),
-    ("triggerSlash('/genraw ...')", "storyforge.llm.generate(prompt)", "需 CallLlm 权限"),
-    ("$('#chat').append(html)", "storyforge.ui.mountToSlot('message_decorator', el)", "DOM → UI slot"),
-    ("extension_settings[myExt]", "storyforge.storage.get/set", "持久化"),
+    (
+        "replaceVariables(msg)",
+        "（不暴露，变量替换由后端统一做）",
+        "",
+    ),
+    (
+        "triggerSlash('/genraw ...')",
+        "storyforge.llm.generate(prompt)",
+        "需 CallLlm 权限",
+    ),
+    (
+        "$('#chat').append(html)",
+        "storyforge.ui.mountToSlot('message_decorator', el)",
+        "DOM → UI slot",
+    ),
+    (
+        "extension_settings[myExt]",
+        "storyforge.storage.get/set",
+        "持久化",
+    ),
 ];
 
 #[cfg(test)]
@@ -296,7 +355,9 @@ mod tests {
     fn test_install_and_list() {
         let registry = PluginRegistry::new();
         registry.install(make_manifest("p1", vec![])).unwrap();
-        registry.install(make_manifest("p2", vec![Permission::ReadCharacters])).unwrap();
+        registry
+            .install(make_manifest("p2", vec![Permission::ReadCharacters]))
+            .unwrap();
 
         let list = registry.list();
         assert_eq!(list.len(), 2);
@@ -333,19 +394,31 @@ mod tests {
     #[test]
     fn test_permission_check() {
         let registry = PluginRegistry::new();
-        registry.install(make_manifest("p1", vec![Permission::ReadCharacters])).unwrap();
+        registry
+            .install(make_manifest("p1", vec![Permission::ReadCharacters]))
+            .unwrap();
 
         // 有权限
-        assert!(registry.ensure_permission("p1", &Permission::ReadCharacters).is_ok());
+        assert!(
+            registry
+                .ensure_permission("p1", &Permission::ReadCharacters)
+                .is_ok()
+        );
 
         // 无权限
-        assert!(registry.ensure_permission("p1", &Permission::WriteVariables).is_err());
+        assert!(
+            registry
+                .ensure_permission("p1", &Permission::WriteVariables)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_permission_check_disabled_plugin() {
         let registry = PluginRegistry::new();
-        registry.install(make_manifest("p1", vec![Permission::ReadCharacters])).unwrap();
+        registry
+            .install(make_manifest("p1", vec![Permission::ReadCharacters]))
+            .unwrap();
         registry.set_enabled("p1", false).unwrap();
 
         let result = registry.ensure_permission("p1", &Permission::ReadCharacters);
@@ -372,6 +445,10 @@ mod tests {
     #[test]
     fn test_st_api_mapping_exists() {
         assert!(!ST_API_MAPPING.is_empty());
-        assert!(ST_API_MAPPING.iter().all(|(st, sf, _)| !st.is_empty() && !sf.is_empty()));
+        assert!(
+            ST_API_MAPPING
+                .iter()
+                .all(|(st, sf, _)| !st.is_empty() && !sf.is_empty())
+        );
     }
 }

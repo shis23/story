@@ -89,12 +89,7 @@ pub fn default_character_variables() -> Vec<VariableField> {
         VariableField::string("state", "状态", "正常", "状态"),
         VariableField::string("location", "位置", "", "状态"),
         VariableField::string("mood", "情绪", "平静", "状态"),
-        VariableField::string(
-            "relationship_to_player",
-            "与玩家关系",
-            "陌生",
-            "关系",
-        ),
+        VariableField::string("relationship_to_player", "与玩家关系", "陌生", "关系"),
         VariableField::json(
             "inventory",
             "物品",
@@ -221,20 +216,14 @@ fn parse_variable_objects(map: &serde_json::Map<String, serde_json::Value>) -> V
                         .and_then(|v| v.as_str())
                         .unwrap_or(key)
                         .to_string();
-                    let type_str = o
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("string");
+                    let type_str = o.get("type").and_then(|v| v.as_str()).unwrap_or("string");
                     let default = o.get("default").cloned().unwrap_or(serde_json::Value::Null);
                     let value_type = parse_type(type_str, &default);
                     let description = o
                         .get("description")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let group = o
-                        .get("group")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    let group = o.get("group").and_then(|v| v.as_str()).map(String::from);
                     Some(VariableField {
                         key: key.clone(),
                         label,
@@ -317,7 +306,11 @@ pub fn render_variables_for_injection(
         let mut shown = std::collections::HashSet::new();
         for key in &priority {
             if let Some(v) = campaign_vars.iter().find(|v| v.key == *key) {
-                out.push_str(&format!("{}：{}\n", pretty_label(key), value_to_str(&v.value)));
+                out.push_str(&format!(
+                    "{}：{}\n",
+                    pretty_label(key),
+                    value_to_str(&v.value)
+                ));
                 shown.insert(*key);
             }
         }
@@ -334,10 +327,18 @@ pub fn render_variables_for_injection(
     if !characters.is_empty() {
         out.push_str("【在场角色状态】\n");
         for (name, vars) in characters {
-            let hp = get_var(vars, "hp").map(value_to_str).unwrap_or_else(|| "-".into());
-            let state = get_var(vars, "state").map(value_to_str).unwrap_or_else(|| "-".into());
-            let loc = get_var(vars, "location").map(value_to_str).unwrap_or_else(|| "-".into());
-            let mood = get_var(vars, "mood").map(value_to_str).unwrap_or_else(|| "-".into());
+            let hp = get_var(vars, "hp")
+                .map(value_to_str)
+                .unwrap_or_else(|| "-".into());
+            let state = get_var(vars, "state")
+                .map(value_to_str)
+                .unwrap_or_else(|| "-".into());
+            let loc = get_var(vars, "location")
+                .map(value_to_str)
+                .unwrap_or_else(|| "-".into());
+            let mood = get_var(vars, "mood")
+                .map(value_to_str)
+                .unwrap_or_else(|| "-".into());
             out.push_str(&format!(
                 "{name}：生命 {hp} / 状态 {state} / 位置 {loc} / 情绪 {mood}\n"
             ));

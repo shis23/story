@@ -38,7 +38,6 @@ docs/archive/2026-06-16-pre-rewrite/
 - `docs/DATA_MODEL.md`
 - `docs/AGENT_INTERFACES.md`
 - `docs/ROADMAP.md`
-- `docs/PLAN-CHARACTER-UNIFICATION.md`
 - `docs/PLAN-CAMPAIGN-MAINLINE.md`
 - `docs/PLAN-META-AGENT.md`
 - `docs/PLAN-FRONTEND-WORKBENCH.md`
@@ -61,7 +60,7 @@ docs/archive/2026-06-16-pre-rewrite/
 6. Subagent 上下文改为 instance + definition + variables + visible knowledge。
 7. Postprocess 落盘前做名字到 ID 归一化。
 
-`docs/PLAN-CHARACTER-UNIFICATION.md` 保留为角色体系专项计划；后续再按 `PLAN-META-AGENT.md`、`PLAN-FRONTEND-WORKBENCH.md`、`PLAN-PLUGIN-MVU.md`、`PLAN-ANDROID.md` 推进外围能力。
+`docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md` 已归档为角色体系历史计划；当前执行入口以 `docs/PLAN-CAMPAIGN-MAINLINE.md` 为准。后续再按 `PLAN-META-AGENT.md`、`PLAN-FRONTEND-WORKBENCH.md`、`PLAN-PLUGIN-MVU.md`、`PLAN-ANDROID.md` 推进外围能力。
 
 上述专项计划完成后，不要直接开新功能。继续执行 `docs/PLAN-POST-MAINLINE.md`，完成端到端验收、回归评测、数据安全、性能成本、发布包和下一阶段战略决策。
 

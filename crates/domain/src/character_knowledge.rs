@@ -58,11 +58,7 @@ pub struct CharacterKnowledgeEntry {
 
 impl CharacterKnowledgeEntry {
     /// 创建 backstory 知识（自动 pin，turn=0）
-    pub fn backstory(
-        campaign_id: Id,
-        character_id: Id,
-        text: impl Into<String>,
-    ) -> Self {
+    pub fn backstory(campaign_id: Id, character_id: Id, text: impl Into<String>) -> Self {
         Self {
             id: Id::new(),
             campaign_id,
@@ -118,12 +114,7 @@ impl CharacterKnowledgeEntry {
     }
 
     /// 创建 inferred 知识
-    pub fn inferred(
-        campaign_id: Id,
-        character_id: Id,
-        text: impl Into<String>,
-        turn: u32,
-    ) -> Self {
+    pub fn inferred(campaign_id: Id, character_id: Id, text: impl Into<String>, turn: u32) -> Self {
         Self {
             id: Id::new(),
             campaign_id,
@@ -161,11 +152,7 @@ pub struct CharacterKnowledgeUpdate {
 
 impl CharacterKnowledgeUpdate {
     /// 转成持久化的 entry（分配 id + 补 campaign_id + turn）
-    pub fn into_entry(
-        self,
-        campaign_id: Id,
-        turn: u32,
-    ) -> CharacterKnowledgeEntry {
+    pub fn into_entry(self, campaign_id: Id, turn: u32) -> CharacterKnowledgeEntry {
         CharacterKnowledgeEntry {
             id: Id::new(),
             campaign_id,
@@ -202,7 +189,11 @@ pub fn render_knowledge_for_injection(
     }
 
     let mut out = String::new();
-    let title = if pinned_only { "你始终记得的事" } else { "你近期知道的事" };
+    let title = if pinned_only {
+        "你始终记得的事"
+    } else {
+        "你近期知道的事"
+    };
     out.push_str(&format!("【{title}】\n"));
     for e in &filtered {
         let source_tag = match e.source {
@@ -224,11 +215,7 @@ mod tests {
 
     #[test]
     fn test_backstory_entry_auto_pinned() {
-        let entry = CharacterKnowledgeEntry::backstory(
-            Id::new(),
-            Id::new(),
-            "我是外科医生",
-        );
+        let entry = CharacterKnowledgeEntry::backstory(Id::new(), Id::new(), "我是外科医生");
         assert_eq!(entry.source, KnowledgeSource::Backstory);
         assert_eq!(entry.turn_number, 0);
         assert!(entry.pinned); // backstory 默认 pin
@@ -236,12 +223,7 @@ mod tests {
 
     #[test]
     fn test_witnessed_not_pinned() {
-        let entry = CharacterKnowledgeEntry::witnessed(
-            Id::new(),
-            Id::new(),
-            "发生了爆炸",
-            5,
-        );
+        let entry = CharacterKnowledgeEntry::witnessed(Id::new(), Id::new(), "发生了爆炸", 5);
         assert_eq!(entry.source, KnowledgeSource::Witnessed);
         assert!(!entry.pinned);
         assert_eq!(entry.turn_number, 5);
@@ -307,12 +289,7 @@ mod tests {
 
     #[test]
     fn test_set_pinned() {
-        let mut entry = CharacterKnowledgeEntry::witnessed(
-            Id::new(),
-            Id::new(),
-            "重大揭示",
-            3,
-        );
+        let mut entry = CharacterKnowledgeEntry::witnessed(Id::new(), Id::new(), "重大揭示", 3);
         assert!(!entry.pinned);
         entry.set_pinned(true); // 升级为重大信息
         assert!(entry.pinned);

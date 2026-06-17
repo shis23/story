@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmConnection, LlmError, StreamChunk};
 
-use crate::sse::{forward_sse_events, SseEventAccumulator};
+use crate::sse::{SseEventAccumulator, forward_sse_events};
 use crate::text_tools::{inject_tool_prompt, parse_tool_calls_from_text};
 
 /// HTTP LLM 客户端（OpenAI 兼容协议）

@@ -1,6 +1,7 @@
 # 计划：Campaign 角色体系统一
 
-> **状态**：阶段 4 已完成（2026-06-16），Subagent persona 来自 Campaign 实例 + 信息隔离已落地；阶段 5（Postprocess ID 归一）待执行
+> **归档说明**：本文件已于 2026-06-17 归档为历史执行记录；当前执行入口见 `docs/PLAN-CAMPAIGN-MAINLINE.md`。阶段 6 的剩余工作以主线计划为准。
+> **状态**：阶段 5 已补齐（2026-06-17），Postprocess ID 归一 + Provenance 收尾 + present_chars 校验 + task campaign 校验 + delete_character 级联修复；阶段 6 仅 runtime-only 部分完成，临场角色落盘与跨轮可见仍待实现
 > **关联文档**：`README.md`、`docs/ARCHITECTURE.md`、`docs/DATA_MODEL.md`、`docs/AGENT_INTERFACES.md`、`docs/ROADMAP.md`
 > **前置事实**：`MessageLayout` 三段分离已存在，子 Agent 已支持稳定 system 段和易变 tail 段。
 >
@@ -35,10 +36,10 @@
 
 | 数据源 | 存储 | 类型 | 管什么 | 谁用 |
 |--------|------|------|--------|------|
-| **CharacterStore** | `data/characters.json` | 扁平 `Character`（单角色卡） | 导入的原始卡（name/description/personality/first_mes/world_info） | 写作流水线（tool_ctx.characters）、世界书 CRUD、前端角色列表 |
-| **CampaignStore** | `data/cards.json` 等 7 文件 | `CharacterCard`（含 `CharacterDefinition[]`）+ `CharacterInstance` | 角色识别后的多角色树 + 开档实例（带 variables/persona_override） | Campaign 面板、后处理流水线（变量更新） |
+| **CharacterStore** | `data/characters.json` | 扁平 `Character`（单角色卡） | 导入的原始卡（name/description/personality/first_mes/world_info） | 未开 Campaign 写作 fallback、世界书 CRUD、前端角色列表 |
+| **CampaignStore** | `data/cards.json` 等 7 文件 | `CharacterCard`（含 `CharacterDefinition[]`）+ `CharacterInstance` | 角色识别后的多角色树 + 开档实例（带 variables/persona_override） | 开 Campaign 写作主链路、Campaign 面板、后处理写回 |
 
-**写作流水线只读扁平 Character，完全零引用 CharacterInstance/CharacterDefinition**。证据：`app-pipeline` crate 全文 grep `CharacterInstance|CharacterDefinition|CharacterCard` 零命中。
+历史断点是：写作流水线只读扁平 `Character`，开档产生的 `CharacterInstance` 没进入 Agent 主链路。**阶段 2-5 已修复主链路**：开 Campaign 时通过 `CampaignRuntimeContext` 快照下传 instances / definitions / knowledge；未开 Campaign 时仍退回扁平 `Character`。
 
 ### 1.2 数据流向（当前）
 
@@ -49,9 +50,11 @@
                 ↓（用户点「开档」）
            create_campaign → CampaignStore（CharacterInstance × N）
                 ↓（用户点「写作」）
-           start_writing → WritingContext.characters = tool_ctx.characters（扁平！）
-                                   ↑
-                       断点：开档产生的 Instance 完全没进写作上下文
+           start_writing → fill_campaign_context
+                → CampaignRuntimeContext（campaign / instances / definitions / knowledge / turn）
+                → WritingContext.campaign_runtime + ToolContext.campaign_runtime
+                → Director / Subagent / Postprocess / Provenance 优先使用 CharacterInstance.id
+                → 未开 Campaign 时 fallback 到 WritingContext.characters
 ```
 
 ### 1.3 关键断点清单（14 处，按数据流顺序）
@@ -66,18 +69,18 @@
 | 6 | `app-pipeline/lib.rs:1146-1178` `build_director_tail` | ~~只把 name 拼成字符串~~ **阶段 3 已修复**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断；无时退回旧逻辑 | ~~导演看不到 persona/variables/role_type~~ |
 | 7 | `app-agent/tools.rs:31-41` `ToolContext` | ~~只有 `characters: Vec<Arc<Character>>`~~ **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` | ~~无 instances/definitions 字段~~ |
 | 8 | `app-agent/tools.rs:148-183` 导演 `get_character` | ~~读扁平 Character 字段~~ **阶段 3 第一小步已修复**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到 fallback 到旧扁平 Character | ~~返回的不是 instance/definition 设定~~ |
-| 9 | `tauri-app/lib.rs` 多处同步 tool_ctx（173/445/453/527/567/713） | 只同步扁平 Character | 开档/实例化时不同步 instances 进 tool_ctx |
-| 10 | `app-agent/runtime.rs:473-480` `spawn_subagents` 签名 | 无 CampaignStore/instances 入参 | 无法按 character_id 查 instance |
-| 11 | `app-agent/runtime.rs:491,497-507` 子 Agent 派发 | character_id 仅作字面量，persona 靠导演生成的 context_package | 不读 instance 的 persona/variables |
-| 12 | `app-pipeline/lib.rs:1326-1337` `parse_context_package` | context_package 由导演 LLM 产出（缺省空） | 角色设定来源是 LLM 而非实例化数据 |
-| 13 | `tauri-app/lib.rs:1423-1495` `persist_postprocess_outcome` | 只更新 instance.variables | persona/behavior 无写回路径 |
-| 14 | `tauri-app/lib.rs:1482-1494` `present_chars` | `let _ = present_chars;` 丢弃 | 名义预留未用 |
+| 9 | `tauri-app/lib.rs` 多处同步 tool_ctx | **阶段 2 已修复核心链路**：`fill_campaign_context` 同步 `tool_ctx.campaign_runtime`；扁平 `characters` 仍作为未开 Campaign fallback | 不再要求把 instances 拷进 `tool_ctx.characters` |
+| 10 | `app-agent/runtime.rs` `spawn_subagents` 签名 | **阶段 4 已修复**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` | 可按 character_id 查 instance |
+| 11 | `app-agent/runtime.rs` 子 Agent 派发 | **阶段 4 已修复**：Campaign 模式按 instance 注入 resolved persona/behavior/knowledge/variables；未匹配时 fallback 到旧 context_package | 不再主要依赖导演生成角色设定 |
+| 12 | `app-pipeline/lib.rs` `parse_context_package` | 旧 context_package 仍保留为 fallback；Campaign 模式优先使用 runtime instance 设定 | 不是主设定来源 |
+| 13 | `tauri-app/lib.rs` `persist_postprocess_outcome` | **阶段 5 已修复主写回链路**：知识/变量写入会解析到 persisted `CharacterInstance.id`，task 状态更新校验 campaign；persona/behavior override 写回仍未实现 | 不再裸写名字；人设调整仍无后处理落盘字段 |
+| 14 | `tauri-app/lib.rs` `present_chars` | **阶段 5 已修复**：用于知识/变量写入落盘校验 | 未在场角色不写入知识/变量 |
 
-**最关键的三个断点**（改这几处能打通主链路）：~~**#4**（fill_campaign_context 不填实例）~~ **阶段 2 已修复**、~~**#7+#9**（ToolContext 无 instances 且开档不同步）~~ **阶段 2 已修复**、**#10+#11**（spawn_subagents 拿不到实例、persona 靠 LLM 生成，阶段 4 改造）。
+**最关键的三个断点**已经打通：~~**#4**（fill_campaign_context 不填实例）~~ **阶段 2 已修复**、~~**#7+#9**（ToolContext 无 runtime 快照且开档不同步）~~ **阶段 2 已修复**、~~**#10+#11**（spawn_subagents 拿不到实例、persona 靠 LLM 生成）~~ **阶段 4 已修复**。剩余主要缺口是临场角色落盘/跨轮可见、前端 Campaign-first 工作台、persona/behavior 后处理写回。
 
 ### 1.4 附带 bug（改造时顺手修）
 
-**delete_character 的 id 语义错配**（`tauri-app/lib.rs:536`）：把 `StoredCharacter.id`（UUID）直接当 `source_character_id` 去 `get_card_by_source`，但建卡时 `source_character_id = character.id`（领域 Id），两者不是同一个值 → 级联删 CampaignStore 卡可能匹配不上。
+**delete_character 的 id 语义错配**（`tauri-app/lib.rs`）：把 `StoredCharacter.id`（UUID）直接当 `source_character_id` 去 `get_card_by_source`，但建卡时 `source_character_id = character.id`（领域 Id），两者不是同一个值。**阶段 5 已修复**：新导入卡在 `CharacterInfo.source_character_id` 保存领域 id；删除时同时尝试 `StoredCharacter.id`、持久化 `source_character_id`、同会话 `tool_ctx` domain id。
 
 ---
 
@@ -264,6 +267,15 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 
 **目标**：主链路完成后，保证后处理写回、知识写入、删卡级联都使用正确身份，消除断点 #13、#14，并修复附带 bug。
 
+**当前实现状态（2026-06-17）**：
+
+- 已实现：知识写入把角色名/id 解析成 persisted `CharacterInstance.id`，无法解析或不在 `present_chars` 时跳过。
+- 已实现：变量写入按 instance id/name 查 persisted instance，不在 `present_chars` 时跳过。
+- 已实现：task 状态更新校验 `task.campaign_id == 当前 campaign_id`，避免跨档误写。
+- 已实现：Provenance 记录 instance 级字段。
+- 已实现：`CharacterInfo.source_character_id` 持久化新导入卡的 domain `Character.id`；`delete_character` 用它修复级联删除，旧数据 fallback 到 `StoredCharacter.id` 和同会话 `tool_ctx`。
+- 未实现：persona_override / behavior_override 的后处理写回；当前后处理输出结构没有这两个字段。
+
 **改动**：
 
 1. **`persist_postprocess_outcome`**（断点 #13）：落盘前统一解析角色身份。
@@ -276,10 +288,10 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
    - 传给后处理 Agent 作为「在场角色」约束。
    - 同时在落盘前转换为 instance id 集合，供任务/知识更新校验使用。
 
-3. **delete_character id 错配修复**（附带 bug，`lib.rs:536`）：
-   - 先读取 `StoredCharacter.info.id`（领域 `Character.id`）。
-   - 用领域 id 调 `get_card_by_source` / `delete_mvu` / 向量清理。
-   - 不再把 `StoredCharacter.id`（存储 UUID）当 `source_character_id`。
+3. **delete_character id 错配修复**（附带 bug）：
+   - 新导入卡在 `CharacterInfo.source_character_id` 保存领域 `Character.id`。
+   - 删除时同时尝试 `StoredCharacter.id`、持久化 `source_character_id`、同会话 `tool_ctx` domain id。
+   - 不再只把 `StoredCharacter.id`（存储 UUID）当 `source_character_id`。
 
 4. **测试**：
    - 后处理输出角色名能正确写入对应 instance id 的 knowledge / variables。
@@ -290,9 +302,18 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 
 ---
 
-### 阶段 6：临场角色（D34，单独阶段）（中）
+### 阶段 6：临场角色（D34，单独阶段）（部分完成：runtime-only）
 
 **目标**：用户在游玩中提到新角色时，导演能提出临场角色创建请求，由 Tauri 层落盘为 `CharacterInstance::temporary`，下一轮写作可见。
+
+**当前实现状态（2026-06-17）**：
+
+- 已实现：`CampaignRuntimeContext::with_temporaries_for` 为 director plan 中未匹配的 character_id 创建 runtime-only 临时 instance。
+- 已实现：`start_writing` / `regenerate` 在 `spawn_subagents` 前使用更新后的 runtime，让临时 instance 参与当轮子 Agent 和 Provenance。
+- 未实现：导演工具 `request_ad_hoc_character`。
+- 未实现：Tauri 层写入 `CampaignStore`。
+- 未实现：临场角色下一轮可见、前端展示、升格常驻的完整闭环。
+- 当前限制：runtime-only 临时角色不会被 `persist_postprocess_outcome` 写入 knowledge/variables，因为它们没有 persisted instance id。
 
 **改动**：
 
@@ -315,7 +336,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
    - 临场角色没有 definition 时，resolved persona 使用 override；没有 override 时退回 context_package。
    - promote_to_permanent 不破坏变量和知识。
 
-**验证**：全 workspace 测试 + 手动验证（开档 → 写作 → 引入临场角色 → 下一轮可见）。
+**验证**：当前 runtime-only 部分用 workspace 测试覆盖；完整临场角色仍需后续手动验证（开档 → 写作 → 引入临场角色 → Tauri 落盘 → 下一轮可见）。
 
 ---
 
@@ -348,7 +369,7 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
    - 子 Agent system 含实例 persona（非空 context_package）
    - 子 Agent tail 只含自己的 character_knowledge
    - 后处理更新变量 → 下一轮写作 tail 反映新变量
-3. **临场角色**：写作中提到新角色 → 下一轮该角色可见、有 persona
+3. **临场角色（剩余验收）**：写作中提到新角色 → Tauri 落盘为 temporary instance → 下一轮该角色可见、有 persona（当前仅 runtime-only，尚未满足）
 4. **删卡级联**：删除角色卡 → CampaignStore 的 card/campaign/instance 全部级联删（验证 id 匹配修复）
 
 ### 5.3 性能验证（可选）
@@ -369,11 +390,12 @@ spawn_subagents：按 task.character_id(instance_id) 查 instance →
 | 3 | `app-agent/tools.rs` | get_character（导演+子Agent）开档返回实例设定 |
 | 4 | `app-agent/runtime.rs` | spawn_subagents 签名加 CampaignRuntimeContext，persona 走实例，信息隔离 |
 | 4 | `app-pipeline/lib.rs` | spawn_subagents 调用点传 campaign_runtime；build_provenance 记 instance_id |
-| 5 | `tauri-app/lib.rs` | persist_postprocess_outcome 做 ID 归一化；present_chars 启用；delete_character id 修复 |
+| 5 | `tauri-app/lib.rs` | persist_postprocess_outcome 做 ID 归一化；present_chars 启用；task campaign 校验；CharacterInfo.source_character_id；delete_character id 修复 |
 | 5 | `app-agent/prompts/postprocess.rs` | 明确输出可用角色名，但后端会解析成 instance id |
-| 6 | `app-agent/tools.rs` | +request_ad_hoc_character 工具（只返回请求，不落盘） |
-| 6 | `tauri-app/lib.rs` | 接收 pending ad-hoc 请求并写入 CampaignStore |
-| 6 | `domain/campaign.rs` | （可能）CharacterInstance 加临场角色辅助方法 |
+| 6 | `domain/campaign_runtime.rs` | 已完成 runtime-only `with_temporaries_for` |
+| 6 | `app-pipeline/lib.rs` | 已部分完成：spawn_subagents 前使用 runtime-only 临时 instance |
+| 6 | `app-agent/tools.rs` | 待完成：+request_ad_hoc_character 工具（只返回请求，不落盘） |
+| 6 | `tauri-app/lib.rs` | 待完成：接收 pending ad-hoc 请求并写入 CampaignStore |
 
 **不改**：前端（纯后端改造，命令签名兼容）、domain 的 CharacterDefinition/CharacterCard 结构（已就绪）、MessageLayout（阶段 0 已完成）。
 

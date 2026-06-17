@@ -73,11 +73,7 @@ impl ConnectionStore {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let conn_id = connection.id.as_str().to_string();
 
-        if let Some(existing) = file
-            .connections
-            .iter_mut()
-            .find(|c| c.id == conn_id)
-        {
+        if let Some(existing) = file.connections.iter_mut().find(|c| c.id == conn_id) {
             existing.connection = connection.clone();
             existing.last_used_at = Some(now.clone());
             let updated = existing.clone();
@@ -98,7 +94,11 @@ impl ConnectionStore {
 
     /// 列出所有连接
     pub fn list(&self) -> Vec<StoredConnection> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).connections.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .connections
+            .clone()
     }
 
     /// 获取单个连接
@@ -132,7 +132,11 @@ impl ConnectionStore {
     /// 获取当前活跃连接 ID
     #[allow(dead_code)]
     pub fn active_id(&self) -> Option<String> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).active_id.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_id
+            .clone()
     }
 
     /// 设置活跃连接 ID（会校验该 id 存在，并更新 last_used_at）
@@ -141,8 +145,7 @@ impl ConnectionStore {
     pub fn set_active(&self, id: &str) -> Option<LlmConnection> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let stored = file.connections.iter_mut().find(|c| c.id == id)?;
-        stored.last_used_at =
-            Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        stored.last_used_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
         let conn = stored.connection.clone();
         file.active_id = Some(id.to_string());
         self.persist(&file);
@@ -185,10 +188,8 @@ mod tests {
     }
 
     fn temp_store() -> ConnectionStore {
-        let dir = std::env::temp_dir().join(format!(
-            "storyforge_test_conn_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge_test_conn_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         ConnectionStore::new(&dir)
     }

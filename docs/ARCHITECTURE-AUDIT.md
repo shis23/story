@@ -1,13 +1,15 @@
 # StoryForge 架构审计
 
-> 状态：2026-06-16 调研版
-> 范围：只评估现有架构与后续重构顺序，不包含代码改动。
+> 状态：2026-06-17 更新版
+> 范围：评估现有架构与后续重构顺序，并记录 Campaign 主线 Phase 1-6 已落地后的当前限制。
 
 ## 结论
 
 现有代码不需要推倒重写，但需要一次中等规模的主链路重构。
 
-最大问题不是模块拆分错误，而是“运行时权威数据源”分裂：`CampaignStore` 已经有 Campaign、CharacterInstance、变量、知识、任务、摘要、MVU 分析结果，但写作入口和 Agent 流水线仍主要读取扁平 `CharacterStore` / `ToolContext.characters`。继续在外围堆 Meta、插件、Android UI，会让这些功能都围绕旧链路打补丁，后面返工会更大。
+最大问题不是模块拆分错误，而是“运行时权威数据源”分裂。这个问题已经通过 `CampaignRuntimeContext` 在写作主链路上修到 Phase 6：开 Campaign 时 Director、Subagent、Postprocess、Provenance 已优先消费 Campaign instances；临场角色会在成功写作结果的 postprocess 前落盘；未开 Campaign 时继续 fallback 到扁平 `CharacterStore` / `ToolContext.characters`。
+
+剩余的大缺口是产品闭环而不是 crate 分层：前端仍围绕 active character，临场角色后端已可落盘和跨轮读取，但前端尚未展示临时角色，也没有接入“升格为常驻”操作；Meta/插件/Android 还不应继续绕旧链路扩展。
 
 推荐方向：
 
@@ -48,8 +50,10 @@ frontend/App.vue startWriting()
           spawn_subagents(plan.subagent_tasks)
           Editor 合并
           run_postprocess()
+       阶段 6：pipeline Ok 后、postprocess 持久化前，Tauri 持久化本轮 pending temporary instances
        persist_postprocess_outcome()
           写 summary / knowledge / variables / tasks
+          阶段 5 已改造：knowledge/variables 解析到 persisted instance id，present_chars 校验，task campaign 校验
 ```
 
 关键断点：
@@ -61,7 +65,14 @@ frontend/App.vue startWriting()
 - `crates/app-agent/src/tools.rs::ToolContext` **阶段 2 已修复**：新增 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。
 - `crates/app-agent/src/tools.rs` 导演 `get_character` **阶段 3 已改造**：有 `campaign_runtime` 时优先查实例（返回 id/definition/persona/behavior/variables），查不到 fallback 到旧扁平 Character。
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime`，按 character_id 匹配 instance，用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，每个子 Agent 有独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到 context_package。
-- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` 会写 CampaignStore，但变量/知识 ID 归一仍偏弱，`present_chars` 未真正使用。
+- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入先解析到 persisted `CharacterInstance.id`，`present_chars` 真正用于校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过；task 状态更新校验 task 属于当前 campaign。
+- `crates/domain/src/conversation.rs::SubagentSnapshot` **阶段 5 已扩展**：新增 `character_instance_id`、`display_name`、`fallback_reason`。
+- `crates/tauri-app/src/lib.rs::CharacterInfo` **阶段 5 已扩展**：新导入卡保存 `source_character_id`，启动恢复时保留 domain `Character.id`。
+- `crates/tauri-app/src/lib.rs::delete_character` **阶段 5 已修复**：级联删除时同时尝试 `StoredCharacter.id`、持久化 `source_character_id`、同会话 `tool_ctx` domain id。
+- `crates/domain/src/campaign.rs::CharacterInstance::temporary_with_overrides` **阶段 6 已完成**：创建临时 instance 时可传入 persona/behavior override。
+- `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配角色创建临时 instance（支持 persona/behavior override），返回 instance 列表供调用者持久化；同批重复 unmatched character 会去重。
+- `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮临时 instance，Tauri 层 getter 读取后落盘；`start_writing` / `regenerate` 开始时清空旧 pending，避免状态污染。
+- `crates/tauri-app/src/lib.rs::persist_temporary_instances_to` **阶段 6 已完成**：只在 pipeline `Ok` 路径、postprocess 前把临时 instance 写入 CampaignStore；会跳过同名重复、同批重复和 `campaign_id` 不匹配的临时 instance，落盘后 postprocess 知识/变量写回不再被跳过。
 
 ## 是否要大修
 
@@ -138,4 +149,3 @@ Postprocess 会写 summary、knowledge、variables、tasks，但写作阶段没�
 - 除非计划明确要求，不允许跨 crate 做顺手重构。
 - 代码阶段必须跑计划指定测试；跑不了要写明原因。
 - 改动完成后更新相关文档中的状态，不要改 archive。
-

@@ -76,7 +76,7 @@ Tauri
 - 名字只用于 UI 展示和 LLM 输入输出，进入持久化前必须解析为 ID。
 - 临场角色由请求显式创建 temporary instance，不应由后处理凭空造落盘角色。
 
-详细落地计划见 `docs/PLAN-CHARACTER-UNIFICATION.md`。
+当前执行计划见 `docs/PLAN-CAMPAIGN-MAINLINE.md`；角色统一历史计划已归档到 `docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`。
 
 ## Tauri 命令
 

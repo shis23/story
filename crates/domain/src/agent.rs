@@ -248,9 +248,7 @@ pub enum PipelineEvent {
     /// 导演开始
     DirectorStarted,
     /// 导演流式进度（思维链/输出的文字片段）
-    DirectorProgress {
-        delta: String,
-    },
+    DirectorProgress { delta: String },
     /// 导演完成，产出 Plan
     DirectorDone {
         scene_brief: String,
@@ -276,20 +274,13 @@ pub enum PipelineEvent {
         full_text: String,
     },
     /// 子 Agent 取消
-    SubagentCancelled {
-        character_id: String,
-        index: usize,
-    },
+    SubagentCancelled { character_id: String, index: usize },
     /// 编剧开始
     EditorStarted,
     /// 编剧流式进度
-    EditorProgress {
-        delta: String,
-    },
+    EditorProgress { delta: String },
     /// 成文就绪
-    DraftReady {
-        text: String,
-    },
+    DraftReady { text: String },
     /// 后处理流水线启动（总结 + 后处理并行）
     PostProcessStarted,
     /// 后处理完成（三件套产出计数）
@@ -299,26 +290,18 @@ pub enum PipelineEvent {
         task_count: usize,
     },
     /// 后处理失败（best-effort，不阻断成文）
-    PostProcessFailed {
-        reason: String,
-    },
+    PostProcessFailed { reason: String },
     /// 本轮剧情总结完成
-    SummaryDone {
-        char_count: usize,
-    },
+    SummaryDone { char_count: usize },
     /// 完成（已写入树）
     Committed {
         session_id: String,
         variant_id: String,
     },
     /// 错误
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// 状态变化通知
-    StateChanged {
-        state: PipelineState,
-    },
+    StateChanged { state: PipelineState },
 }
 
 #[cfg(test)]
@@ -361,8 +344,7 @@ mod tests {
         map.insert(AgentRole::Editor, 3);
 
         let json = serde_json::to_string(&map).unwrap();
-        let back: std::collections::HashMap<AgentRole, i32> =
-            serde_json::from_str(&json).unwrap();
+        let back: std::collections::HashMap<AgentRole, i32> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(back.get(&AgentRole::Subagent("*".into())), Some(&2));
     }

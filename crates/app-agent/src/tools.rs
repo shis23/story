@@ -49,7 +49,10 @@ pub struct ToolContext {
 }
 
 /// 工具处理器（异步函数 trait）
-pub type ToolHandler = dyn Fn(Value, Arc<ToolContext>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, ToolError>> + Send>>
+pub type ToolHandler = dyn Fn(
+        Value,
+        Arc<ToolContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, ToolError>> + Send>>
     + Send
     + Sync;
 
@@ -69,10 +72,14 @@ impl ToolRegistry {
     pub fn register(
         &mut self,
         spec: ToolSpec,
-        handler: impl Fn(Value, Arc<ToolContext>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, ToolError>> + Send>>
-            + Send
-            + Sync
-            + 'static,
+        handler: impl Fn(
+            Value,
+            Arc<ToolContext>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Value, ToolError>> + Send>,
+        > + Send
+        + Sync
+        + 'static,
     ) {
         let name = spec.function.name.clone();
         self.tools.insert(name, (Arc::new(handler), spec));
@@ -270,14 +277,12 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ToolError::BadArgs("缺少 query 参数".into()))?;
-                let top_k = args
-                    .get("top_k")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
-                let store = ctx.vector_store.as_ref().ok_or_else(|| {
-                    ToolError::Internal("向量存储未配置".into())
-                })?;
+                let store = ctx
+                    .vector_store
+                    .as_ref()
+                    .ok_or_else(|| ToolError::Internal("向量存储未配置".into()))?;
 
                 // 关键词搜索（M2 阶段先用关键词，后续接嵌入向量搜索）
                 let keywords: Vec<String> = query
@@ -286,9 +291,9 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .map(String::from)
                     .collect();
 
-                let hits = store.search_by_keywords(&keywords, top_k).map_err(|e| {
-                    ToolError::Internal(format!("向量搜索失败: {e}"))
-                })?;
+                let hits = store
+                    .search_by_keywords(&keywords, top_k)
+                    .map_err(|e| ToolError::Internal(format!("向量搜索失败: {e}")))?;
 
                 let results: Vec<serde_json::Value> = hits
                     .into_iter()
@@ -325,10 +330,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
         ),
         |args, ctx| {
             Box::pin(async move {
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
                 let summaries: Vec<&str> = ctx
                     .archived_summaries
@@ -441,11 +443,7 @@ pub fn register_editor_tools(registry: &mut ToolRegistry) {
                 "required": ["text"]
             }),
         ),
-        |args, _ctx| {
-            Box::pin(async move {
-                Ok(args)
-            })
-        },
+        |args, _ctx| Box::pin(async move { Ok(args) }),
     );
 }
 
@@ -534,11 +532,7 @@ mod tests {
         register_director_tools(&mut registry);
 
         let result = registry
-            .dispatch(
-                "get_character",
-                serde_json::json!({"name": "Lin"}),
-                ctx,
-            )
+            .dispatch("get_character", serde_json::json!({"name": "Lin"}), ctx)
             .await
             .unwrap();
 
@@ -549,7 +543,12 @@ mod tests {
         assert_eq!(result["persona"], "calm surgeon");
         assert_eq!(result["behavior"], "save first");
         assert_eq!(result["is_temporary"], false);
-        assert!(result["role_type"].as_str().unwrap().contains("Protagonist"));
+        assert!(
+            result["role_type"]
+                .as_str()
+                .unwrap()
+                .contains("Protagonist")
+        );
     }
 
     /// 阶段 3：有 campaign_runtime 但查不到实例时，fallback 到扁平 Character
@@ -627,11 +626,7 @@ mod tests {
         register_director_tools(&mut registry);
 
         let result = registry
-            .dispatch(
-                "get_character",
-                serde_json::json!({"name": "Ghost"}),
-                ctx,
-            )
+            .dispatch("get_character", serde_json::json!({"name": "Ghost"}), ctx)
             .await;
 
         assert!(result.is_err(), "不存在的角色应返回错误");
@@ -686,7 +681,11 @@ mod tests {
 
         // 查自己的名字 → 成功
         let result = registry
-            .dispatch("get_character", serde_json::json!({"name": "Lin"}), ctx.clone())
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Lin"}),
+                ctx.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(result["source"], "campaign_instance");
@@ -715,7 +714,11 @@ mod tests {
         register_subagent_tools(&mut registry);
 
         let result = registry
-            .dispatch("get_character", serde_json::json!({"name": "Seraphina"}), ctx)
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Seraphina"}),
+                ctx,
+            )
             .await
             .unwrap();
         assert_eq!(result["name"], "Seraphina");

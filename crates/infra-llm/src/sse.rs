@@ -59,7 +59,11 @@ impl SseEventAccumulator {
         // 部分代理/服务端发 data:{...} 紧贴格式会被静默丢弃 → 流式内容丢失。
         if let Some(rest) = strip_prefix(line, b"data:") {
             // strip 至多一个空格（SSE 规范允许 data:value 或 data: value）
-            let rest = if rest.first() == Some(&b' ') { &rest[1..] } else { rest };
+            let rest = if rest.first() == Some(&b' ') {
+                &rest[1..]
+            } else {
+                rest
+            };
             if !self.data.is_empty() {
                 self.data.push(b'\n');
             }
@@ -101,24 +105,24 @@ impl SseEventAccumulator {
         }
 
         // 解析 JSON → StreamChunk
-        let chunk: openai_types::StreamDelta =
-            serde_json::from_str(&text)
-                .map_err(|e| LlmError::StreamParse(format!("JSON 解析失败: {e}; data={text}")))?;
+        let chunk: openai_types::StreamDelta = serde_json::from_str(&text)
+            .map_err(|e| LlmError::StreamParse(format!("JSON 解析失败: {e}; data={text}")))?;
 
         let delta = chunk.choices.first().map(|c| &c.delta);
 
         let delta_content = delta.and_then(|d| d.content.clone());
-        let chunk_finish = chunk
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason.clone());
+        let chunk_finish = chunk.choices.first().and_then(|c| c.finish_reason.clone());
 
         // 累积完整文本内容
         if let Some(ref text) = delta_content {
             self.full_content.push_str(text);
         }
         // 累积工具调用（按 index 合并增量：第一个 chunk 给 id/name，后续给 arguments 片段）
-        if let Some(calls) = chunk.choices.first().and_then(|c| c.delta.tool_calls.as_ref()) {
+        if let Some(calls) = chunk
+            .choices
+            .first()
+            .and_then(|c| c.delta.tool_calls.as_ref())
+        {
             for call in calls {
                 // 按 index 找已存在的条目（流式合并的关键）
                 if let Some(existing) = self
@@ -314,7 +318,8 @@ mod tests {
 
         // SSE 规范：多个 data: 行用 \n 累积。这里测试完整的单行 data: 被正确解析。
         let json = r#"{"choices":[{"delta":{"content":"test"},"finish_reason":null}]}"#;
-        acc.on_line(format!("data: {json}").as_bytes(), &tx).unwrap();
+        acc.on_line(format!("data: {json}").as_bytes(), &tx)
+            .unwrap();
         acc.on_line(b"", &tx).unwrap();
 
         let chunk = rx.try_recv().unwrap();
