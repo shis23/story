@@ -88,6 +88,8 @@ docs                       当前架构、数据模型、Agent 契约和路线�
 - [Agent 接口](docs/AGENT_INTERFACES.md)
 - [Campaign 主线计划](docs/PLAN-CAMPAIGN-MAINLINE.md)
 - [Campaign 角色统一计划（归档）](docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md)
+- [Agent Profile 计划](docs/PLAN-AGENT-PROFILE.md)
+- [角色识别增强计划](docs/PLAN-CHARACTER-EXTRACTION.md)
 - [Meta Agent 计划](docs/PLAN-META-AGENT.md)
 - [前端工作台计划](docs/PLAN-FRONTEND-WORKBENCH.md)
 - [Android 计划](docs/PLAN-ANDROID.md)

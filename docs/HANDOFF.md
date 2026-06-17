@@ -44,6 +44,8 @@ docs/archive/2026-06-16-pre-rewrite/
 - `docs/PLAN-ANDROID.md`
 - `docs/PLAN-PLUGIN-MVU.md`
 - `docs/PLAN-POST-MAINLINE.md`
+- `docs/PLAN-AGENT-PROFILE.md`
+- `docs/PLAN-CHARACTER-EXTRACTION.md`
 - `docs/HANDOFF.md`
 
 ## 下一步建议

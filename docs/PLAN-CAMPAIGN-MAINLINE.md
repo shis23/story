@@ -298,7 +298,7 @@ cargo test --workspace
 - 已实现：临时 instance 落盘后，`persist_postprocess_outcome` 的知识/变量写回能通过 `find_instance_by_name_or_id` 找到它们，不再被跳过。
 - 已实现：Director 的 `context_package.character_brief` 自动作为临时 instance 的 `persona_override` 注入。
 - 未实现：导演工具 `request_ad_hoc_character`（当前用 unmatched character_id 自动触发，不需要额外工具）。
-- 未实现：前端展示临场角色、升格为常驻的 UI 流程（`promote_temporary_instance` Tauri command 已存在）。
+- 已实现：前端展示临场角色（`is_temporary` 标记 + 临时 badge）和升格为常驻的 UI 流程（`CampaignPanel.vue` 中 `handlePromoteTemporary` 调用 `promoteTemporaryInstance`，带确认对话框、loading 状态、detail 刷新）。
 
 改动文件：
 

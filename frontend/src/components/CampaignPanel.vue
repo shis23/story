@@ -4,6 +4,7 @@ import {
   listCards, getCard, extractCharacters,
   listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
   listInstances, getCharacterVariables, setCharacterVariable,
+  promoteTemporaryInstance,
   listCharacterKnowledge, listTasks, createTask, completeTask, abandonTask,
   listRoundSummaries
 } from '../tauri-api.js'
@@ -37,6 +38,7 @@ const tasks = ref([])
 const summaries = ref([])
 const expandedInstanceId = ref(null)
 const instanceVariables = ref([])
+const promotingInstanceId = ref(null) // 正在升格的临时 instance ID
 
 // ─── 初始化 ───
 onMounted(async () => {
@@ -155,6 +157,22 @@ async function handleVariableChange(instanceId, key, value) {
     instanceVariables.value = await getCharacterVariables(selectedCampaignId.value, instanceId)
   } catch (e) {
     alert('设置变量失败: ' + e)
+  }
+}
+
+async function handlePromoteTemporary(inst) {
+  if (!selectedCampaignId.value) return
+  const { ask } = await import('@tauri-apps/plugin-dialog')
+  const ok = await ask(`确定将「${inst.name || inst.character_name}」升格为常驻角色？`, { title: '升格确认', kind: 'info' })
+  if (!ok) return
+  promotingInstanceId.value = inst.id
+  try {
+    await promoteTemporaryInstance(selectedCampaignId.value, inst.id)
+    await refreshDetail()
+  } catch (e) {
+    alert('升格失败: ' + e)
+  } finally {
+    promotingInstanceId.value = null
   }
 }
 
@@ -412,13 +430,22 @@ function knowledgeSourceText(source) {
                   @click="toggleInstance(inst)"
                 >
                   <div class="flex-1 min-w-0">
-                    <div class="text-sm font-medium text-ink truncate">{{ inst.name || inst.character_name }}</div>
+                    <div class="text-sm font-medium text-ink truncate">
+                      {{ inst.name || inst.character_name }}
+                      <span v-if="inst.is_temporary" class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-warn/10 text-warn">临时</span>
+                    </div>
                     <div class="text-xs text-ink-soft">
                       {{ inst.role_type || '' }}
                       <span v-if="inst.is_active" class="text-ok ml-1">● 存活</span>
                       <span v-else class="text-ink-soft ml-1">○ 离场</span>
                     </div>
                   </div>
+                  <button
+                    v-if="inst.is_temporary"
+                    @click.stop="handlePromoteTemporary(inst)"
+                    :disabled="promotingInstanceId === inst.id"
+                    class="px-2 py-1 rounded-full text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
+                  >{{ promotingInstanceId === inst.id ? '升格中…' : '升格为常驻' }}</button>
                   <span class="text-ink-soft text-xs">{{ expandedInstanceId === inst.id ? '▲' : '▼' }}</span>
                 </div>
 
