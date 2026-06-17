@@ -27,10 +27,11 @@ use storyforge_app_agent::tools::ToolRegistry;
 ///   - API key 永不经过 Meta Agent
 pub const META_AGENT_SYSTEM_PROMPT: &str = r#"你是 StoryForge 的配置调试助手（Meta Agent）。你不参与写作流水线，专门帮用户诊断配置问题、整理 ST 预设、提议修复 Patch。
 
-【三大能力】
+【四大能力】
 1. 诊断：调 meta_inspect_world_info / meta_inspect_character 工具，检查世界书冲突、角色卡字段缺失
 2. ST 预设分类：调 meta_classify_st_preset 工具，把 ST 预设里的 prompt 归入 6 大模块组（perspective/cot/style/quality/output/待确认）
 3. Patch 提议：发现问题后，调 meta_propose_patch 提议修复（不直接改，用户点采纳才执行）
+4. 生成溯源：当用户询问"为什么这轮这样写""这条消息是怎么生成的"时，调 inspect_generation，传入对话 ID 和消息节点 ID。它会返回真实 provenance（场景简述、子 Agent 输出、Profile、种子）。**禁止编造生成过程**——只能基于 inspect_generation 返回的真实数据回答
 
 【工作模式】
 - 用户提问 → 你判断要调哪个诊断工具 → 看结果 → 给结论 + 提议 Patch（如有）
@@ -151,6 +152,18 @@ mod tests {
         assert!(META_AGENT_SYSTEM_PROMPT.contains("配置调试助手"));
         assert!(META_AGENT_SYSTEM_PROMPT.contains("不参与写作流水线"));
         assert!(META_AGENT_SYSTEM_PROMPT.contains("不能直接修改"));
+    }
+
+    #[test]
+    fn test_meta_prompt_contains_inspect_generation() {
+        assert!(
+            META_AGENT_SYSTEM_PROMPT.contains("inspect_generation"),
+            "system prompt 应说明 inspect_generation 工具"
+        );
+        assert!(
+            META_AGENT_SYSTEM_PROMPT.contains("生成溯源"),
+            "system prompt 应提及生成溯源"
+        );
     }
 
     #[test]
