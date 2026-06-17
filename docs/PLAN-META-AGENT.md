@@ -78,40 +78,53 @@ cargo test -p storyforge --lib      # 43 tests, 0 failed
 
 ## 阶段 2：解释本轮生成
 
+**状态：后端已起步（2026-06-17），前端未接。**
+
 目标：用真实 provenance 解释一轮输出。
 
 改动文件：
 
-- `crates/domain/src/agent.rs`
-- `crates/app-conversation`
-- `crates/app-meta/src`
-- `crates/tauri-app/src/lib.rs`
-- `frontend/src/components/MetaPanel.vue` 或 `PipelinePanel.vue`
+- `crates/app-meta/src/explain.rs`：新增确定性解释模块（零 LLM，纯数据拼接）
+- `crates/app-meta/src/lib.rs`：注册模块 + 重导出
+- `crates/tauri-app/src/lib.rs`：新增 `meta_explain_generation` Tauri command
+- `frontend/src/components/MetaPanel.vue` 或 `PipelinePanel.vue`（待接）
 
-任务：
+已实现：
 
-1. 确认 Provenance 里有：
-   - user intent
-   - Director plan
-   - subagent identity
-   - subagent output 摘要或引用
-   - editor output 引用
-   - postprocess result 摘要
-2. 增加 `meta_explain_generation(conversation_id, node_id)`。
-3. Meta 回答时必须引用真实字段，不能凭空解释。
-4. 前端从消息或 Pipeline trace 打开解释。
+- ✅ `GenerationExplanation` 结构体：scene_brief / subagents / last_hint / profile_id / seed
+- ✅ `SubagentExplain` 结构体：character_id / display_name / task_brief / output_preview / fallback_reason
+- ✅ `explain_generation(provenance: &Provenance) -> GenerationExplanation` 纯函数
+- ✅ `meta_explain_generation(conversation_id, node_id)` Tauri command
+
+Provenance 真实字段（确认自 `crates/domain/src/conversation.rs`）：
+
+- `session_id: Id`
+- `plan: Option<Plan>`（Plan 有 `scene_brief: String` + `subagent_tasks: Vec<SubagentTask>`）
+- `subagent_results: Vec<SubagentSnapshot>`（有 `character_id`, `full_text`, `display_name`, `fallback_reason`）
+- `profile_id: Option<Id>`
+- `seed: u64`
+- `last_hint: Option<String>`
+
+Provenance 没有的字段（标 None）：
+
+- 无 postprocess 计数/摘要 → 无法提供
+- 无 editor_hint → 无法提供
+
+任务（剩余）：
+
+1. 前端从消息或 Pipeline trace 打开解释。
+2. Meta 回答”为什么这么写”时调用 `meta_explain_generation` 引用真实字段。
 
 验证：
 
 ```bash
-cargo test -p storyforge-app-conversation
-cargo test -p storyforge-app-meta
-cargo test -p storyforge
+cargo test -p storyforge-app-meta   # 47 tests, 0 failed
+cargo test --workspace --exclude storyforge  # all pass
 ```
 
 验收：
 
-- 用户问“为什么这么写”时，回答包含真实 plan/subagent/provenance 引用。
+- 用户问”为什么这么写”时，后端可返回真实 plan/subagent/provenance 引用。
 - 没有 provenance 时返回明确缺失原因。
 
 ## 阶段 3：Typed Patch Preview

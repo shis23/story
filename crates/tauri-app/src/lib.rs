@@ -3115,6 +3115,40 @@ fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, Stri
         .collect())
 }
 
+/// Tauri command: 解释某条消息的生成溯源（确定性，零 LLM）
+///
+/// 从指定对话节点的 active variant 的 Provenance 提取可读解释。
+/// 返回 `GenerationExplanation` 结构体，前端可直接渲染。
+#[tauri::command]
+fn meta_explain_generation(
+    conversation_id: String,
+    node_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let conv_id = Id::from_str(&conversation_id);
+    let nid = Id::from_str(&node_id);
+
+    let conv = state
+        .conv_store
+        .get(&conv_id)
+        .ok_or_else(|| format!("对话不存在: {conversation_id}"))?;
+
+    let node = conv
+        .find_node(&nid)
+        .ok_or_else(|| format!("消息节点不存在: {node_id}"))?;
+
+    let variant = node.active().ok_or("该节点无可用变体")?;
+
+    let provenance = variant
+        .provenance
+        .as_ref()
+        .ok_or("该消息没有生成溯源信息（可能是用户手动输入）")?;
+
+    let explanation = storyforge_app_meta::explain_generation(provenance);
+
+    serde_json::to_value(&explanation).map_err(|e| format!("序列化失败: {e}"))
+}
+
 /// MVU 翻译的精简 DTO（前端列表用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MvuTranslationSummaryDto {
@@ -3982,6 +4016,7 @@ pub fn run() {
             meta_get_mvu_translation,
             meta_classify_st_preset,
             meta_health_check,
+            meta_explain_generation,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
