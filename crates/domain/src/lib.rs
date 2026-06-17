@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_profile_config;
 pub mod campaign;
 pub mod campaign_runtime;
 pub mod character;

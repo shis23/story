@@ -140,6 +140,8 @@ pub struct AppState {
     pub module_store: Arc<module_store::ModuleStore>,
     /// Profile 存储（预设配置 + 活跃 Profile）
     pub profile_store: Arc<module_store::ProfileStore>,
+    /// Agent Profile 配置存储（Agent 运行时参数覆盖 + 活跃配置）
+    pub agent_profile_config_store: Arc<module_store::AgentProfileConfigStore>,
     /// Meta Agent 会话（诊断工具的数据源 + PatchStore，P3 新增）
     pub meta_session: Arc<storyforge_app_meta::MetaSession>,
     /// Meta 对话历史（conversation_id → MetaConversation，内存态，重启清空，P3 新增）
@@ -234,6 +236,8 @@ impl AppState {
         let module_store = Arc::new(module_store::ModuleStore::new(&data_dir));
         let profile_store = Arc::new(module_store::ProfileStore::new(&data_dir));
         profile_store.ensure_default();
+        let agent_profile_config_store =
+            Arc::new(module_store::AgentProfileConfigStore::new(&data_dir));
 
         Self {
             mock_llm,
@@ -250,6 +254,7 @@ impl AppState {
             plugin_registry,
             module_store,
             profile_store,
+            agent_profile_config_store,
             meta_session: Arc::new(storyforge_app_meta::MetaSession::new()),
             meta_conversations: Mutex::new(std::collections::HashMap::new()),
         }
@@ -1217,6 +1222,56 @@ fn set_active_profile(id: String, state: tauri::State<'_, Arc<AppState>>) {
     state.profile_store.set_active(&id);
 }
 
+// ─── Agent Profile Config 命令 ─────────────────────────────────────────────
+
+#[tauri::command]
+fn list_agent_profile_configs(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Vec<storyforge_domain::agent_profile_config::AgentProfileConfigSummaryDto> {
+    state.agent_profile_config_store.list()
+}
+
+#[tauri::command]
+fn get_agent_profile_config(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<storyforge_domain::agent_profile_config::AgentProfileConfig> {
+    state.agent_profile_config_store.get(&id)
+}
+
+#[tauri::command]
+fn get_active_agent_profile_config(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> storyforge_domain::agent_profile_config::AgentProfileConfig {
+    state.agent_profile_config_store.get_active()
+}
+
+#[tauri::command]
+fn save_agent_profile_config(
+    config_json: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let config: storyforge_domain::agent_profile_config::AgentProfileConfig =
+        serde_json::from_str(&config_json).map_err(|e| format!("Agent Profile Config 解析失败: {e}"))?;
+    state.agent_profile_config_store.save(config)
+}
+
+#[tauri::command]
+fn delete_agent_profile_config(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    state.agent_profile_config_store.delete(&id)
+}
+
+#[tauri::command]
+fn set_active_agent_profile_config(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state.agent_profile_config_store.set_active(&id)
+}
+
 #[tauri::command]
 fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1425,9 +1480,12 @@ async fn start_writing(
             .conv_store
             .recent_messages_with_role(&conversation_id, 20, None),
         campaign_runtime: None,
+        agent_profile_config: None,
     };
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
+    // 从活跃 Agent Profile Config 加载运行时配置覆盖
+    fill_agent_profile_context(&mut ctx, &app);
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
     fill_campaign_context(&mut ctx, &app);
 
@@ -1525,6 +1583,14 @@ fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
         ctx.profile = Some(profile);
         ctx.modules = modules;
     }
+}
+
+/// 从活跃 Agent Profile Config 加载运行时配置覆盖到 WritingContext
+///
+/// 无活跃配置时不动 ctx（agent_profile_config 保持 None → 流水线用硬编码默认值）。
+fn fill_agent_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
+    let config = state.agent_profile_config_store.get_active();
+    ctx.agent_profile_config = Some(config);
 }
 
 /// 从活跃 Campaign 填充 WritingContext 的 P2 字段（campaign_id / turn / pending_tasks / story_clock）
@@ -1985,8 +2051,10 @@ async fn regenerate(
             Some(&node_id),
         ),
         campaign_runtime: None,
+        agent_profile_config: None,
     };
     fill_profile_context(&mut ctx, &app);
+    fill_agent_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx, &app);
 
     // cancel channel
@@ -3796,6 +3864,12 @@ pub fn run() {
             get_active_profile,
             save_profile,
             set_active_profile,
+            list_agent_profile_configs,
+            get_agent_profile_config,
+            get_active_agent_profile_config,
+            save_agent_profile_config,
+            delete_agent_profile_config,
+            set_active_agent_profile_config,
             get_version,
             // LLM 连接管理命令
             list_connection_templates,

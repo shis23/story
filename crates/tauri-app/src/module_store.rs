@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use storyforge_domain::Id;
+use storyforge_domain::agent_profile_config::{
+    AgentProfileConfig, AgentProfileConfigSummaryDto, BUILTIN_DEFAULT_AGENT_PROFILE_ID,
+    default_agent_profile_config,
+};
 use storyforge_domain::prompt_module::{
     ModuleCategory, ModuleSource, ProfileSource, PromptModule, PromptProfile,
 };
@@ -385,6 +389,201 @@ impl ProfileStore {
         let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles) {
             tracing::error!("持久化 Profile 失败: {e}");
+        }
+    }
+}
+
+// ─── AgentProfileConfigStore（Agent Profile 配置存储）────────────────────────
+
+/// Agent Profile 配置存储
+///
+/// 管理用户的 Agent 运行时配置（模型覆盖、轮次、并发等）。
+/// 内置默认配置始终可用，不可删除。
+pub struct AgentProfileConfigStore {
+    configs: Mutex<Vec<AgentProfileConfig>>,
+    active_id: Mutex<Option<String>>,
+    configs_path: PathBuf,
+    active_path: PathBuf,
+}
+
+impl AgentProfileConfigStore {
+    pub fn new(app_data_dir: &PathBuf) -> Self {
+        let configs_path = app_data_dir.join("agent_profile_configs.json");
+        let active_path = app_data_dir.join("active_agent_profile_config.json");
+
+        let configs: Vec<AgentProfileConfig> = if configs_path.exists() {
+            std::fs::read_to_string(&configs_path)
+                .ok()
+                .and_then(|data| serde_json::from_str(&data).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let active_id: Option<String> = if active_path.exists() {
+            std::fs::read_to_string(&active_path)
+                .ok()
+                .and_then(|data| serde_json::from_str(&data).ok())
+        } else {
+            None
+        };
+
+        let store = Self {
+            configs: Mutex::new(configs),
+            active_id: Mutex::new(active_id),
+            configs_path,
+            active_path,
+        };
+        // 确保内置默认始终存在
+        store.ensure_builtin_default();
+        store
+    }
+
+    /// 列出所有配置（摘要 DTO）
+    pub fn list(&self) -> Vec<AgentProfileConfigSummaryDto> {
+        let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
+        configs
+            .iter()
+            .map(|c| {
+                let is_active = active_id.as_deref() == Some(&c.id.to_string());
+                AgentProfileConfigSummaryDto {
+                    id: c.id.to_string(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    source: format!("{:?}", c.source),
+                    is_active,
+                    max_concurrent_subagents: c.max_concurrent_subagents,
+                    enable_postprocess: c.enable_postprocess,
+                    enable_summarizer: c.enable_summarizer,
+                }
+            })
+            .collect()
+    }
+
+    /// 获取指定配置（完整 DTO）
+    pub fn get(&self, id: &str) -> Option<AgentProfileConfig> {
+        let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        configs.iter().find(|c| c.id.to_string() == id).cloned()
+    }
+
+    /// 获取当前活跃配置（如果没有用户选的，返回内置默认）
+    pub fn get_active(&self) -> AgentProfileConfig {
+        let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
+        let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some(ref aid) = *active_id {
+            if let Some(c) = configs.iter().find(|c| &c.id.to_string() == aid) {
+                return c.clone();
+            }
+        }
+
+        // 回退：找内置默认
+        configs
+            .iter()
+            .find(|c| c.is_builtin())
+            .cloned()
+            .unwrap_or_else(default_agent_profile_config)
+    }
+
+    /// 保存/更新配置
+    ///
+    /// 内置默认配置不允许覆盖。
+    pub fn save(&self, config: AgentProfileConfig) -> Result<(), String> {
+        if config.id.to_string() == BUILTIN_DEFAULT_AGENT_PROFILE_ID {
+            // 检查是否已存在内置默认
+            let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+            let exists = configs
+                .iter()
+                .any(|c| c.id.to_string() == BUILTIN_DEFAULT_AGENT_PROFILE_ID);
+            drop(configs);
+            if exists {
+                return Err("内置默认配置不可覆盖".into());
+            }
+        }
+        let mut configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = configs
+            .iter_mut()
+            .find(|c| c.id.to_string() == config.id.to_string())
+        {
+            *existing = config;
+        } else {
+            configs.push(config);
+        }
+        drop(configs);
+        self.persist_configs();
+        Ok(())
+    }
+
+    /// 设置活跃配置
+    pub fn set_active(&self, id: &str) -> Result<(), String> {
+        // 验证配置存在
+        {
+            let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+            if !configs.iter().any(|c| c.id.to_string() == id) {
+                return Err(format!("配置 {id} 不存在"));
+            }
+        }
+        let json = {
+            let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
+            *active_id = Some(id.to_string());
+            serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())
+        };
+        if let Err(e) = storyforge_infra_util::atomic_write_json_str(&self.active_path, &json) {
+            tracing::error!("持久化活跃 Agent Profile Config 失败: {e}");
+        }
+        Ok(())
+    }
+
+    /// 删除配置
+    ///
+    /// 内置默认配置不可删除。
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
+        if id == BUILTIN_DEFAULT_AGENT_PROFILE_ID {
+            return Err("内置默认配置不可删除".into());
+        }
+        let mut configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        let before = configs.len();
+        configs.retain(|c| c.id.to_string() != id);
+        if configs.len() < before {
+            drop(configs);
+            self.persist_configs();
+            // 如果删的是活跃配置，清除活跃标记（下次 get_active 回退到内置默认）
+            let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
+            if active_id.as_deref() == Some(id) {
+                *active_id = None;
+                drop(active_id);
+                if let Err(e) =
+                    storyforge_infra_util::atomic_write_json_str(&self.active_path, "null")
+                {
+                    tracing::error!("清除活跃 Agent Profile Config 失败: {e}");
+                }
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 确保内置默认配置存在（启动时调用）
+    fn ensure_builtin_default(&self) {
+        let mut configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        let has_builtin = configs
+            .iter()
+            .any(|c| c.id.to_string() == BUILTIN_DEFAULT_AGENT_PROFILE_ID);
+        if !has_builtin {
+            configs.push(default_agent_profile_config());
+            drop(configs);
+            self.persist_configs();
+        }
+    }
+
+    fn persist_configs(&self) {
+        let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) =
+            storyforge_infra_util::atomic_write_json(&self.configs_path, &*configs)
+        {
+            tracing::error!("持久化 Agent Profile Config 失败: {e}");
         }
     }
 }

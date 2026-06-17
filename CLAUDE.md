@@ -78,6 +78,19 @@ Respect these facts unless the current task explicitly changes them:
 - `CharacterInfo` stores `source_character_id: Option<String>` for new imports so restart recovery can preserve the domain `Character.id`; old data falls back to `StoredCharacter.id`.
 - `delete_character` cascades over `StoredCharacter.id`, persisted `source_character_id`, and same-session `tool_ctx` domain ids for Campaign/MVU/vector cleanup (阶段 5).
 - `app-agent` must not depend on `tauri-app`.
+- `AgentProfileConfig` in `crates/domain/src/agent_profile_config.rs` is a pure domain DTO for configurable agent runtime parameters.
+- `AgentRunConfig` has `model_override`, `max_tool_rounds`, `tool_whitelist` (all `Option`). Supports Subagent wildcard fallback.
+- `AgentProfileConfig` has `agent_configs: HashMap<AgentRole, AgentRunConfig>`, `max_concurrent_subagents`, `enable_postprocess`, `enable_summarizer`, `source`, `config_version`.
+- Built-in default profile ID is `builtin-default-agent-v1`, always available, not deletable.
+- `AgentProfileConfigStore` in `crates/tauri-app/src/module_store.rs` persists to `agent_profile_configs.json` + `active_agent_profile_config.json`.
+- Tauri commands: `list_agent_profile_configs`, `get_agent_profile_config`, `get_active_agent_profile_config`, `save_agent_profile_config`, `delete_agent_profile_config`, `set_active_agent_profile_config`.
+- `WritingContext` has `agent_profile_config: Option<AgentProfileConfig>`. `legacy()` sets it to `None`.
+- `fill_agent_profile_context` loads active config into `WritingContext`.
+- Director/Editor `make_*_config` apply `model_override` and `max_tool_rounds` from profile. No config = current hardcoded defaults.
+- `spawn_subagents` accepts `max_concurrent_subagents` and `agent_profile_config` parameters. Subagent model/rounds are overridden per-profile.
+- `enable_postprocess` / `enable_summarizer` are stored but NOT consumed at runtime in this pass.
+- `tool_whitelist` is stored but NOT filtered at runtime in this pass.
+- Frontend API wrappers in `frontend/src/tauri-api.js`: `listAgentProfileConfigs`, `getAgentProfileConfig`, `getActiveAgentProfileConfig`, `saveAgentProfileConfig`, `deleteAgentProfileConfig`, `setActiveAgentProfileConfig`.
 
 ## Execution Process
 

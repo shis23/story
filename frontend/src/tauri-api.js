@@ -184,6 +184,53 @@ export async function setActiveProfile(id) {
   }
 }
 
+// ─── Agent Profile Config 命令 ─────────────────────────────────────────────
+
+/** 列出所有 Agent Profile 配置（摘要） */
+export async function listAgentProfileConfigs() {
+  if (isTauri()) {
+    return await invoke('list_agent_profile_configs')
+  }
+  return []
+}
+
+/** 获取指定 Agent Profile 配置（完整） */
+export async function getAgentProfileConfig(id) {
+  if (isTauri()) {
+    return await invoke('get_agent_profile_config', { id })
+  }
+  return null
+}
+
+/** 获取当前活跃 Agent Profile 配置 */
+export async function getActiveAgentProfileConfig() {
+  if (isTauri()) {
+    return await invoke('get_active_agent_profile_config')
+  }
+  return null
+}
+
+/** 保存/更新 Agent Profile 配置 */
+export async function saveAgentProfileConfig(configJson) {
+  if (isTauri()) {
+    return await invoke('save_agent_profile_config', { configJson })
+  }
+}
+
+/** 删除 Agent Profile 配置（内置默认不可删除） */
+export async function deleteAgentProfileConfig(id) {
+  if (isTauri()) {
+    return await invoke('delete_agent_profile_config', { id })
+  }
+}
+
+/** 设置活跃 Agent Profile 配置 */
+export async function setActiveAgentProfileConfig(id) {
+  if (isTauri()) {
+    return await invoke('set_active_agent_profile_config', { id })
+  }
+}
+
 /**
  * 获取版本号
  */

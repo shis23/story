@@ -496,10 +496,12 @@ pub async fn spawn_subagents(
     cancel: watch::Receiver<bool>,
     event_tx: mpsc::UnboundedSender<PipelineEvent>,
     campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
+    max_concurrent_subagents: usize,
+    agent_profile_config: Option<&storyforge_domain::agent_profile_config::AgentProfileConfig>,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
-    // Semaphore 限流：同时最多 MAX_CONCURRENT_SUBAGENTS 个子 Agent 跑，超出排队
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBAGENTS));
+    // Semaphore 限流：同时最多 max_concurrent_subagents 个子 Agent 跑，超出排队
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_subagents));
 
     // (原始 index, JoinHandle) —— spawn 时记下 index，结果按 index 对齐
     let mut handles: Vec<(
@@ -510,7 +512,17 @@ pub async fn spawn_subagents(
     for (index, task) in tasks.into_iter().enumerate() {
         let runtime = runtime.clone();
         let character_id = task.character_id.clone();
-        let model = director_config.model.clone(); // 子 Agent 用导演的模型（M1 简化）
+
+        // 从 AgentProfileConfig 查找该子 Agent 的覆盖配置
+        let subagent_run_config = agent_profile_config.map(|apc| {
+            apc.run_config_for(&AgentRole::Subagent(character_id.clone()))
+        });
+        let model = subagent_run_config
+            .and_then(|rc| rc.model_override.clone())
+            .unwrap_or_else(|| director_config.model.clone()); // 子 Agent 默认用导演的模型
+        let subagent_max_rounds = subagent_run_config
+            .and_then(|rc| rc.max_tool_rounds)
+            .unwrap_or(10);
 
         // ── 阶段 4：Campaign 模式下按 character_id 匹配 instance ──
         let matched_instance = campaign_runtime
@@ -563,7 +575,7 @@ pub async fn spawn_subagents(
         let config = AgentConfig {
             role: AgentRole::Subagent(character_id.clone()),
             system_prompt: String::new(), // layout 版不使用此字段（system 由 layout 提供）
-            max_tool_rounds: 10,          // 子 Agent 轮次少
+            max_tool_rounds: subagent_max_rounds,
             model,
             tools: vec![], // 子 Agent 工具由 registry 提供
         };
@@ -869,6 +881,8 @@ mod tests {
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0, // 测试不消费事件
             None,                                         // 无 Campaign runtime（旧路径测试）
+            4,
+            None,
         )
         .await;
 
@@ -939,6 +953,8 @@ mod tests {
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None, // 无 Campaign runtime（旧路径测试）
+            4,
+            None,
         )
         .await;
 
@@ -1148,6 +1164,8 @@ mod tests {
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
             Some(cr),
+            4,
+            None,
         )
         .await;
 
@@ -1199,6 +1217,8 @@ mod tests {
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
             Some(cr),
+            4,
+            None,
         )
         .await;
 
@@ -1248,6 +1268,8 @@ mod tests {
             "你是角色",
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
+            None,
+            4,
             None,
         )
         .await;
@@ -1473,6 +1495,8 @@ mod tests {
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
             Some(cr),
+            4,
+            None,
         )
         .await;
 
@@ -1553,6 +1577,8 @@ mod tests {
             "你是角色",
             cancel_rx,
             mpsc::unbounded_channel::<PipelineEvent>().0,
+            None,
+            4,
             None,
         )
         .await;

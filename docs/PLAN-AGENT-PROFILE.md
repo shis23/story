@@ -1,8 +1,8 @@
 # 计划：可配置 Agent Profile 体系
 
-> 状态：计划（未实现）
+> 状态：阶段 1-3 已实现（backend），阶段 4 未实现（UI）
 > 目标读者：可交给小模型按阶段执行
-> 关联：`docs/AGENT_INTERFACES.md`、`crates/domain/src/prompt_module.rs`、`crates/domain/src/agent.rs`
+> 关联：`docs/AGENT_INTERFACES.md`、`crates/domain/src/prompt_module.rs`、`crates/domain/src/agent.rs`、`crates/domain/src/agent_profile_config.rs`
 
 ## 目标
 
@@ -153,7 +153,7 @@ fn set_active_agent_profile_config(id: &Id) -> Result<(), String>;
 
 ## 执行阶段
 
-### 阶段 0：审计基线
+### 阶段 0：审计基线 ✅
 
 目标：确认当前硬编码点和现有 Profile 体系的边界。
 
@@ -171,7 +171,7 @@ fn set_active_agent_profile_config(id: &Id) -> Result<(), String>;
 - 有一份硬编码点清单。
 - 不产生代码改动。
 
-### 阶段 1：Domain DTO + 序列化默认值
+### 阶段 1：Domain DTO + 序列化默认值 ✅
 
 目标：定义 `AgentRunConfig` 和 `AgentProfileConfig`，确保能 serde round-trip。
 
@@ -198,7 +198,7 @@ cargo test -p storyforge-domain
 - 结构体可 serde round-trip。
 - 空 JSON 反序列化得到合理默认值。
 
-### 阶段 2：Store + Tauri Commands
+### 阶段 2：Store + Tauri Commands ✅
 
 目标：持久化 AgentProfileConfig，提供 CRUD Tauri commands。
 
@@ -227,9 +227,12 @@ cargo test -p storyforge
 - CRUD 命令可正常调用。
 - 内置默认配置在首次启动时自动创建。
 
-### 阶段 3：Pipeline / Runtime 消费 Profile
+### 阶段 3：Pipeline / Runtime 消费 Profile ✅（部分）
 
 目标：Pipeline 按 AgentProfileConfig 参数运行 Agent，而不是硬编码常量。
+
+**已实现**：Director/Editor/Subagent 的 `model_override` 和 `max_tool_rounds` 覆盖、`max_concurrent_subagents` 并发控制。
+**未实现**：`enable_postprocess` / `enable_summarizer` 运行时控制（存储已支持，运行时未消费）、`tool_whitelist` 运行时过滤。
 
 改动文件：
 
@@ -264,7 +267,7 @@ cargo test --workspace
 - 有 config 时参数被覆盖。
 - 无 config 时行为与当前完全一致。
 
-### 阶段 4：前端 Profile 管理 UI
+### 阶段 4：前端 Profile 管理 UI ❌（未实现）
 
 目标：用户可以在前端查看、创建、编辑、导入/导出 AgentProfileConfig。
 

@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use storyforge_domain::Id;
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::agent::{
     AgentRole, ContextPackage, Draft, LoreEntryLight, PipelineEvent, PipelineState, Plan,
@@ -124,6 +125,8 @@ pub struct WritingContext {
     pub recent_messages: Vec<String>,
     /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
     pub campaign_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
+    /// Agent Profile 配置（可选）。None = 使用硬编码默认值。
+    pub agent_profile_config: Option<AgentProfileConfig>,
 }
 
 impl WritingContext {
@@ -145,6 +148,7 @@ impl WritingContext {
             modules: vec![],
             recent_messages: vec![],
             campaign_runtime: None,
+            agent_profile_config: None,
         }
     }
 }
@@ -250,6 +254,7 @@ impl PipelineOrchestrator {
             ctx.profile.as_ref(),
             &ctx.modules,
             &build_director_system_extra(ctx),
+            ctx.agent_profile_config.as_ref(),
         );
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
@@ -356,6 +361,11 @@ impl PipelineOrchestrator {
         };
 
         let effective_runtime_for_prov = effective_runtime.clone();
+        let max_concurrent = ctx
+            .agent_profile_config
+            .as_ref()
+            .map(|c| c.max_concurrent_subagents)
+            .unwrap_or(4);
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -364,6 +374,8 @@ impl PipelineOrchestrator {
             cancel.clone(),
             event_tx.clone(),
             effective_runtime,
+            max_concurrent,
+            ctx.agent_profile_config.as_ref(),
         )
         .await;
 
@@ -417,7 +429,7 @@ impl PipelineOrchestrator {
         });
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config(ctx.profile.as_ref(), &ctx.modules);
+        let editor_config = make_editor_config(ctx.profile.as_ref(), &ctx.modules, ctx.agent_profile_config.as_ref());
 
         // 构造编剧的用户消息（子 Agent 产出）
         let performances_text: String = performances
@@ -684,6 +696,7 @@ impl PipelineOrchestrator {
                 ctx.profile.as_ref(),
                 &ctx.modules,
                 &build_director_system_extra(ctx),
+                ctx.agent_profile_config.as_ref(),
             );
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
@@ -797,6 +810,11 @@ impl PipelineOrchestrator {
             };
 
             let effective_runtime_for_prov = effective_runtime.clone();
+            let max_concurrent = ctx
+                .agent_profile_config
+                .as_ref()
+                .map(|c| c.max_concurrent_subagents)
+                .unwrap_or(4);
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -805,6 +823,8 @@ impl PipelineOrchestrator {
                 cancel.clone(),
                 event_tx.clone(),
                 effective_runtime,
+                max_concurrent,
+                ctx.agent_profile_config.as_ref(),
             )
             .await;
 
@@ -853,6 +873,7 @@ impl PipelineOrchestrator {
                     ctx.profile.as_ref(),
                     &ctx.modules,
                     effective_runtime_for_prov.as_deref(),
+                    ctx.agent_profile_config.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -897,6 +918,7 @@ impl PipelineOrchestrator {
                     ctx.profile.as_ref(),
                     &ctx.modules,
                     ctx.campaign_runtime.as_deref(),
+                    ctx.agent_profile_config.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -936,6 +958,7 @@ impl PipelineOrchestrator {
                 ctx.profile.as_ref(),
                 &ctx.modules,
                 &build_director_system_extra(ctx),
+                ctx.agent_profile_config.as_ref(),
             );
             let new_perf = {
                 // §22 cache 友好布局：persona + 常驻世界设定进 system，场景/相关设定/最近对话 + 任务 + hint 进 tail
@@ -1064,6 +1087,7 @@ impl PipelineOrchestrator {
                     ctx.profile.as_ref(),
                     &ctx.modules,
                     ctx.campaign_runtime.as_deref(),
+                    ctx.agent_profile_config.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1093,6 +1117,7 @@ impl PipelineOrchestrator {
         profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
         modules: &[storyforge_domain::prompt_module::PromptModule],
         campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
+        agent_profile_config: Option<&AgentProfileConfig>,
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1103,7 +1128,7 @@ impl PipelineOrchestrator {
         self.state = PipelineState::Editing;
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config(profile, modules);
+        let editor_config = make_editor_config(profile, modules, agent_profile_config);
 
         let performances_text: String = performances
             .iter()
@@ -1369,10 +1394,13 @@ fn format_instance_variables(variables: &[storyforge_domain::variables::Variable
 }
 
 /// 构造导演 Agent 配置（通过 assemble_system_prompt 增强 role_directive + 蓝灯进 system）
+///
+/// 如果提供了 `agent_profile_config`，从中读取 Director 的 `model_override` 和 `max_tool_rounds` 覆盖默认值。
 fn make_director_config(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
     modules: &[storyforge_domain::prompt_module::PromptModule],
     system_extra: &str,
+    agent_profile_config: Option<&AgentProfileConfig>,
 ) -> AgentConfig {
     let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Director,
@@ -1386,11 +1414,20 @@ fn make_director_config(
         system_prompt.push_str("\n\n");
         system_prompt.push_str(system_extra);
     }
+
+    // 从 AgentProfileConfig 读取覆盖
+    let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
+        let run = apc.run_config_for(&AgentRole::Director);
+        (run.model_override.clone(), run.max_tool_rounds)
+    } else {
+        (None, None)
+    };
+
     AgentConfig {
         role: AgentRole::Director,
         system_prompt,
-        max_tool_rounds: 15,
-        model: "deepseek-chat".to_string(),
+        max_tool_rounds: rounds_override.unwrap_or(15),
+        model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
     }
 }
@@ -1419,9 +1456,12 @@ fn build_editor_tail(
 }
 
 /// 构造编剧 Agent 配置（通过 assemble_system_prompt 增强 role_directive）
+///
+/// 如果提供了 `agent_profile_config`，从中读取 Editor 的 `model_override` 和 `max_tool_rounds` 覆盖默认值。
 fn make_editor_config(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
     modules: &[storyforge_domain::prompt_module::PromptModule],
+    agent_profile_config: Option<&AgentProfileConfig>,
 ) -> AgentConfig {
     let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Editor,
@@ -1430,11 +1470,20 @@ fn make_editor_config(
         modules,
         "",
     );
+
+    // 从 AgentProfileConfig 读取覆盖
+    let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
+        let run = apc.run_config_for(&AgentRole::Editor);
+        (run.model_override.clone(), run.max_tool_rounds)
+    } else {
+        (None, None)
+    };
+
     AgentConfig {
         role: AgentRole::Editor,
         system_prompt,
-        max_tool_rounds: 5,
-        model: "deepseek-chat".to_string(),
+        max_tool_rounds: rounds_override.unwrap_or(5),
+        model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
     }
 }
