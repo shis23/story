@@ -94,6 +94,12 @@ Respect these facts unless the current task explicitly changes them:
 - `PostProcessSkipped { reason }` is a `PipelineEvent` variant (serde-compatible) emitted when postprocess/summarizer is disabled by config; Tauri serializes it as `postprocess_skipped`.
 - Frontend API wrappers in `frontend/src/tauri-api.js`: `listAgentProfileConfigs`, `getAgentProfileConfig`, `getActiveAgentProfileConfig`, `saveAgentProfileConfig`, `deleteAgentProfileConfig`, `setActiveAgentProfileConfig`.
 - Frontend management UI in `frontend/src/components/AgentProfileManager.vue` (mounted under power mode, after `AgentConfigCard`): list/switch/duplicate/delete/edit/save profiles, including per-role `model_override` / `max_tool_rounds` / `tool_whitelist` (comma-separated) for Director/Editor/Subagent:*/Summarizer/PostProcessor, plus `max_concurrent_subagents` / `enable_postprocess` / `enable_summarizer`. Built-in default is read-only and not deletable; custom profiles are deletable. (Note: `AgentConfigCard.vue` is the *PromptProfile module selector*, a separate system — not the AgentProfileConfig editor.)
+- `ProfileConfigError` in `crates/domain/src/agent_profile_config.rs` (thiserror): `EmptyName`, `MaxToolRoundsOutOfRange { role: String, value: u32 }`, `InvalidMaxConcurrent { value: usize }`.
+- `AgentProfileConfig::validate()` checks: name non-empty, `max_tool_rounds` in `[1,100]` when present, `max_concurrent_subagents >= 1`. Does NOT validate `tool_whitelist` tool names (runtime handles unknown names with warning+ignore).
+- `AgentProfileConfig::migrate_to(target: u32) -> bool`: v1→v1 is no-op (returns false); unknown versions update `config_version` but preserve data (forward-compatible). Migration skeleton for future versions.
+- `AgentProfileConfigStore::save()` calls `config.validate()` before persisting; returns `Err(reason)` on validation failure.
+- `AgentProfileConfigStore::new()` and `get()` call `migrate_to(1)` on loaded configs.
+- No `temperature` field added to `AgentRunConfig`; temperature is controlled at the connection level, not per-agent profile.
 
 ## Execution Process
 
