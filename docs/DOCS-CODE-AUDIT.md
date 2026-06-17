@@ -85,6 +85,25 @@
 
 本次已修正 `PLAN-CAMPAIGN-MAINLINE.md`：`resolved_backstory` / `resolved_variable_schema` 不应被写成当前实例天然字段，建议作为 `CampaignRuntimeContext` helper，除非先显式新增 instance override 字段。
 
+### 角色识别（Character Extraction）
+
+已核对文件：
+
+- `crates/app-agent/src/character_extractor.rs`
+- `crates/app-agent/src/prompts/character_extractor.rs`
+
+代码事实：
+
+- `extract_characters(runtime, character, mvu_schema, cancel)` 已实现：调 `AgentRuntime::run_tool_loop` 跑识别 Agent，产出 `Vec<CharacterDefinition>`。
+- `parse_character_definitions_from_response(resp)` 已实现：5 层兜底解析（emit_characters 工具调用 / 整体 JSON / ```json 代码块 / 裸代码块 / 手写括号配平）。
+- `attach_definitions_to_card(definitions, card_id)` 已实现：回填 card_id。
+- `CHARACTER_EXTRACTOR_SYSTEM_PROMPT`、`make_character_extractor_config()`（max_tool_rounds: 8）、`build_character_extractor_user_msg()`、`register_character_extractor_tools()`（emit_characters 工具）均在 `prompts/character_extractor.rs`。
+- MVU schema 合并：`merge_schema(&default_character_variables(), mvu_schema)` 在识别完成后回填。
+- 角色类型解析支持英文（protagonist/supporting/extra）和中文（主角/临场/龙套）。
+- 11 个测试全部通过（含 MockLlmClient 端到端闭环）。
+
+详细计划见 `docs/PLAN-CHARACTER-EXTRACTION.md`。
+
 ### Meta Agent 和 MVU
 
 已核对文件：
@@ -104,7 +123,26 @@
 - `mvu_import::analyze_mvu_card` 会产出 `MvuTranslation`，解析失败时走 `pure_data_fallback`。
 - `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations。
 
-因此 `PLAN-META-AGENT.md` 和 `PLAN-PLUGIN-MVU.md` 的“当前事实”基本准确；其中 health check、generation explanation、typed patch preview、schema apply、runtime fallback 是后续计划，不是当前已完成能力。
+因此 `PLAN-META-AGENT.md` 和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check、generation explanation、typed patch preview、schema apply、runtime fallback 是后续计划，不是当前已完成能力。
+
+### 角色识别（Character Extraction）
+
+已核对文件：
+
+- `crates/app-agent/src/character_extractor.rs`
+- `crates/app-agent/src/prompts/character_extractor.rs`
+
+代码事实：
+
+- `extract_characters(runtime, character, mvu_schema, cancel)` 已实现：调 `AgentRuntime::run_tool_loop` 跑识别 Agent，产出 `Vec<CharacterDefinition>`。
+- `parse_character_definitions_from_response(resp)` 已实现：5 层兜底解析（emit_characters 工具调用 / 整体 JSON / ```json 代码块 / 裸代码块 / 手写括号配平）。
+- `attach_definitions_to_card(definitions, card_id)` 已实现：回填 card_id。
+- `CHARACTER_EXTRACTOR_SYSTEM_PROMPT`、`make_character_extractor_config()`（max_tool_rounds: 8）、`build_character_extractor_user_msg()`、`register_character_extractor_tools()`（emit_characters 工具）均在 `prompts/character_extractor.rs`。
+- MVU schema 合并：`merge_schema(&default_character_variables(), mvu_schema)` 在识别完成后回填。
+- 角色类型解析支持英文（protagonist/supporting/extra）和中文（主角/临场/龙套）。
+- 11 个测试全部通过（含 MockLlmClient 端到端闭环）。
+
+详细计划见 `docs/PLAN-CHARACTER-EXTRACTION.md`。
 
 ### 前端工作台
 
@@ -157,7 +195,7 @@
 
 ## 仍需补齐的文档缺口
 
-### 1. ST 导入/导出专项计划缺失
+### 1. ST 导入/导出专项计划 — 已补充（计划阶段）
 
 `ROADMAP.md` Phase 5 包含：
 
@@ -166,7 +204,7 @@
 - StoryForge Campaign 导出格式。
 - 是否支持导出回 ST 卡或 Lorebook。
 
-当前没有对应 `PLAN-ST-IMPORT-EXPORT.md`。这是后续文档层面的最大缺口。
+`docs/PLAN-ST-IMPORT-EXPORT.md` 已创建（2026-06-17），覆盖上述各项。当前为计划阶段，未实现。
 
 ### 2. Release checklist 和 user guide 只是未来产物
 
@@ -186,7 +224,7 @@
 - `meta_preview_mvu_schema`
 - `propose_apply_mvu_schema`
 - `startCampaignWriting`
-- `PLAN-ST-IMPORT-EXPORT.md`
+- ~~`PLAN-ST-IMPORT-EXPORT.md`~~ **已补充**（2026-06-17）：`docs/PLAN-ST-IMPORT-EXPORT.md` 已创建，覆盖 ST V2/V3 保真、extensions 保留、识别 fallback、Campaign 导出格式、ST 回导评估。当前为计划阶段。
 
 执行时应按计划新增或替换，不要在当前代码中搜索不到就判定任务失败。
 
