@@ -12,6 +12,7 @@ pub mod health_check;
 pub mod meta_conversation;
 pub mod mvu_import;
 pub mod prompts;
+pub mod typed_patch;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,10 @@ pub use meta_conversation::{
 pub use mvu_import::{
     AgentSuggestion, PromptClassification, StPresetClassification, analyze_mvu_card,
     classify_st_preset_with_llm, score_card as score_card_complexity,
+};
+pub use typed_patch::{
+    FieldDiff, PreviewInput, PreviewInputMut, TypedPatch, TypedPatchAction, TypedPatchError,
+    TypedPatchStatus, apply_to_snapshot, build_patch_for_issue, is_patch_stale,
 };
 
 // ─── 诊断报告 ──────────────────────────────────────────────────────────────
