@@ -162,4 +162,10 @@ CampaignRuntimeContext
 
 ### ProfileConfigError
 
-当前 domain 层**未定义** `ProfileConfigError` 类型。配置校验在 Tauri 层通过 `sanitize()` 和构造函数的 clamp 逻辑处理，不使用独立错误枚举。
+`crates/domain/src/agent_profile_config.rs` 定义了 `ProfileConfigError` 枚举（阶段 5 新增），由 `AgentProfileConfig::validate()` 返回：
+
+- `EmptyName` — 名称为空或纯空白
+- `MaxToolRoundsOutOfRange { role, value }` — 某角色的 `max_tool_rounds` 超出 `[1, 100]`
+- `InvalidMaxConcurrent { value }` — `max_concurrent_subagents` 小于 1
+
+`AgentProfileConfig::migrate_to(target)` 提供版本迁移入口（当前仅 v1，no-op；未知版本不报错并更新 `config_version`）。`AgentProfileConfigStore::save` 保存前调 `validate()`，`new`/`get`/`get_active`/`set_active` 加载时调 `migrate_to(1)`。
