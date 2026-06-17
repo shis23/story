@@ -146,7 +146,7 @@
 
 任务：
 
-1. MetaPanel 顶部展示 active Campaign health summary。
+1. MetaPanel 侧栏展示 Campaign health summary。✅（`tauri-api.js` 新增 `metaHealthCheck`；MetaPanel 侧栏加"Campaign 体检"区块，运行体检按钮 + issue 列表，Error/Warning 分组排序，空结果显示"未发现问题"）
 2. 从 health issue 一键生成 Meta 对话上下文。
 3. patch preview 在侧栏展示 diff。
 4. accept 后刷新 CampaignPanel 对应 tab。

@@ -937,6 +937,7 @@ function handlePipelineEvent(event) {
     <!-- Meta 配置助手弹层（P3 新增） -->
     <MetaPanel
       v-if="showMetaPanel"
+      :active-campaign="activeCampaign"
       @close="showMetaPanel = false"
     />
 

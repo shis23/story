@@ -867,6 +867,14 @@ export async function metaClassifyStPreset(presetId) {
   return null
 }
 
+/** Campaign 健康检查（确定性数据校验，零 LLM） */
+export async function metaHealthCheck(campaignId) {
+  if (isTauri()) {
+    return await invoke('meta_health_check', { campaignId })
+  }
+  return []
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {

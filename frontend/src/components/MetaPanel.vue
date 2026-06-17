@@ -4,8 +4,12 @@ import {
   metaStartConversation, metaChat, metaListPendingPatches,
   metaAcceptPatch, metaDismissPatch,
   metaAnalyzeMvuCard, metaListMvuTranslations,
-  listCharacters,
+  listCharacters, metaHealthCheck,
 } from '../tauri-api.js'
+
+const props = defineProps({
+  activeCampaign: { type: Object, default: null },
+})
 
 const emit = defineEmits(['close'])
 
@@ -24,6 +28,11 @@ const messagesEl = ref(null)
 
 // 角色卡列表（用于 MVU 分析选择）
 const characters = ref([])
+
+// ─── Campaign 健康检查 ───
+const healthIssues = ref([]) // HealthIssue[]
+const healthLoading = ref(false)
+const healthRan = ref(false) // 区分「未检查」和「检查后无问题」
 
 onMounted(async () => {
   // 初始化对话
@@ -134,6 +143,26 @@ async function handleAnalyzeMvu(cardId) {
     error.value = 'MVU 分析失败: ' + e
   } finally {
     analyzingCardId.value = null
+  }
+}
+
+// ─── Campaign 健康检查 ───
+async function handleHealthCheck() {
+  if (!props.activeCampaign?.id) return
+  healthLoading.value = true
+  error.value = ''
+  try {
+    const result = await metaHealthCheck(props.activeCampaign.id)
+    // Error 排前面，Warning 排后面
+    healthIssues.value = (result || []).sort((a, b) => {
+      if (a.severity === b.severity) return 0
+      return a.severity === 'error' ? -1 : 1
+    })
+    healthRan.value = true
+  } catch (e) {
+    error.value = '体检失败: ' + e
+  } finally {
+    healthLoading.value = false
   }
 }
 
@@ -333,6 +362,42 @@ function routingText(routing) {
                 {{ routingText(m.routing) }} · {{ m.ui_binding_count }} 绑定 · {{ m.fallback_count }} 兜底
               </div>
               <div class="text-[10px] text-ink-soft mt-0.5">置信度 {{ Math.round(m.analysis_confidence * 100) }}%</div>
+            </div>
+          </div>
+
+          <!-- Campaign 健康检查 -->
+          <div>
+            <div class="text-xs font-medium text-ink mb-2">🩺 Campaign 体检</div>
+            <button
+              @click="handleHealthCheck"
+              :disabled="healthLoading || !activeCampaign"
+              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+            >
+              {{ healthLoading ? '检查中…' : '运行体检' }}
+            </button>
+            <div v-if="!activeCampaign" class="text-[10px] text-ink-soft">无活跃 Campaign</div>
+            <div v-else-if="!healthRan" class="text-[10px] text-ink-soft">点击上方按钮检查数据完整性</div>
+            <div v-else-if="healthIssues.length === 0" class="text-[10px] text-ok">✓ 未发现问题</div>
+            <div v-else class="space-y-1.5">
+              <div
+                v-for="(issue, i) in healthIssues" :key="i"
+                class="rounded-lg border p-2 text-[10px]"
+                :class="issue.severity === 'error'
+                  ? 'border-error/30 bg-error/5'
+                  : 'border-warn/30 bg-warn/5'"
+              >
+                <div class="flex items-center gap-1 mb-0.5">
+                  <span
+                    class="px-1.5 py-0.5 rounded-full text-[9px] font-medium"
+                    :class="issue.severity === 'error'
+                      ? 'bg-error/15 text-error'
+                      : 'bg-warn/15 text-warn'"
+                  >{{ issue.severity === 'error' ? 'Error' : 'Warning' }}</span>
+                  <span class="text-ink-soft">{{ issue.category }}</span>
+                </div>
+                <div class="text-ink">{{ issue.message }}</div>
+                <div v-if="issue.affected_id" class="text-ink-soft mt-0.5 break-all">ID: {{ issue.affected_id }}</div>
+              </div>
             </div>
           </div>
         </div>
