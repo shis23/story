@@ -14,6 +14,7 @@ use storage::CharacterStore;
 use tokio::sync::watch;
 
 use storyforge_app_agent::ToolContext;
+use storyforge_app_meta::{MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview};
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
@@ -3596,6 +3597,115 @@ fn meta_get_mvu_translation(source_character_id: String) -> Option<MvuTranslatio
     })
 }
 
+/// Tauri command: 预览 MVU schema 合并结果（每个 definition 一条预览）
+#[tauri::command]
+fn meta_preview_mvu_apply(
+    source_character_id: String,
+) -> Result<Vec<MvuApplyPreview>, String> {
+    let store = get_campaign_store();
+    let id = Id::from_str(&source_character_id);
+    let mvu = store
+        .get_mvu(&id)
+        .ok_or_else(|| MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string())?;
+
+    // 通过 source_character_id 找到 card
+    let stored_card = store
+        .get_card_by_source(&id)
+        .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?;
+
+    let previews: Vec<MvuApplyPreview> = stored_card
+        .card
+        .character_definitions
+        .iter()
+        .map(|def| {
+            compute_apply_preview(
+                &def.variable_schema,
+                &mvu.translation.variable_schema,
+                def.id.as_str(),
+                &def.name,
+                &source_character_id,
+            )
+        })
+        .collect();
+
+    Ok(previews)
+}
+
+/// Tauri command: 把 MVU schema 合并应用到指定 definition（写盘）
+///
+/// 必须先 compute_apply_preview，无变化则拒绝写盘。
+#[tauri::command]
+fn meta_apply_mvu_schema(
+    source_character_id: String,
+    definition_id: String,
+) -> Result<(), String> {
+    let store = get_campaign_store();
+    let src_id = Id::from_str(&source_character_id);
+    let def_id = Id::from_str(&definition_id);
+
+    let mvu = store
+        .get_mvu(&src_id)
+        .ok_or_else(|| MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string())?;
+
+    let stored_card = store
+        .get_card_by_source(&src_id)
+        .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?;
+
+    // 找到目标 definition
+    let def = stored_card
+        .card
+        .character_definitions
+        .iter()
+        .find(|d| d.id == def_id)
+        .ok_or_else(|| MvuApplyError::DefinitionNotFound(definition_id.clone()).to_string())?;
+
+    // 先计算预览，确认有变化
+    let preview = compute_apply_preview(
+        &def.variable_schema,
+        &mvu.translation.variable_schema,
+        def.id.as_str(),
+        &def.name,
+        &source_character_id,
+    );
+    if !preview.has_changes {
+        return Err(MvuApplyError::NoChanges.to_string());
+    }
+
+    // 写盘：clone card → 改对应 definition → update_card
+    let mut card = stored_card.card.clone();
+    if let Some(target_def) = card.character_definitions.iter_mut().find(|d| d.id == def_id) {
+        apply_schema_to_definition(target_def, preview.merged_schema.clone());
+    }
+    store.update_card(card.clone());
+
+    // Best-effort：对已存在的 instances 补齐新变量
+    for instance in store.list_instances(&card.id) {
+        if instance.definition_id.as_ref() != Some(&def_id) {
+            continue;
+        }
+        let mut updated = instance.clone();
+        let new_fields: Vec<_> = preview
+            .added_fields
+            .iter()
+            .filter(|f| !updated.variables.iter().any(|v| v.key == f.key))
+            .collect();
+        if new_fields.is_empty() {
+            continue;
+        }
+        for field in new_fields {
+            use storyforge_domain::variables::VariableValue;
+            updated.variables.push(VariableValue::new(
+                field.key.clone(),
+                field.default.clone(),
+                0,
+            ));
+        }
+        store.update_instance(updated);
+    }
+
+    Ok(())
+}
+
 /// Tauri command: 手动触发 ST 预设 LLM 分类（增强现有纯启发式 bridge）
 ///
 /// 失败时返回 Err，前端降级到现有 import_preset_as_modules。
@@ -4348,6 +4458,8 @@ pub fn run() {
             meta_analyze_mvu_card,
             meta_list_mvu_translations,
             meta_get_mvu_translation,
+            meta_preview_mvu_apply,
+            meta_apply_mvu_schema,
             meta_classify_st_preset,
             meta_health_check,
             meta_explain_generation,
