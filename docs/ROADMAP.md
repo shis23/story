@@ -66,6 +66,7 @@
 - Meta patch 类型化：变量修复、知识修复、角色合并、prompt module 修改。
 - patch 需要 preview、accept、dismiss。
 - MVU 分析结果接入 variable schema。
+- 统一 tool 注册中心：每个 agent 的可用工具从「各角色硬编码注册组」改为「全局注册 + 按角色配置选配 + 默认列表」，支撑运行时动态增删工具。
 
 验收：
 
@@ -73,7 +74,7 @@
 - 用户能看到数据问题列表并接受修复。
 - Meta patch 不直接越权改数据。
 
-详细计划见 `docs/PLAN-META-AGENT.md`。
+详细计划见 `docs/PLAN-META-AGENT.md`。统一 tool 注册中心见 `docs/PLAN-TOOL-REGISTRY.md`。
 
 ## Phase 4: 前端工作台重构
 

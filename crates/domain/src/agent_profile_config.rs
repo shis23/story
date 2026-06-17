@@ -55,8 +55,14 @@ pub struct AgentRunConfig {
 
     /// 工具白名单（None = 使用默认工具集，Some(vec![]) = 禁用所有工具，Some(list) = 只允许列表中的工具）
     ///
-    /// 注意：当前版本存储并验证此字段，但不做过滤运行时工具。
-    /// 运行时过滤将在后续版本实现。
+    /// 运行时过滤已生效：`ToolRegistry::retain(Option<&[String]>)` +
+    /// `filter_registry_by_whitelist` 在 Director / Subagent / PostProcessor 注册工具
+    /// 后按此字段过滤。未知名记 warning 后忽略、不 panic；被禁用的工具 `dispatch` 返回
+    /// `ToolError::NotFound`，不可绕过。校验层（`validate()`）不校验工具名，避免重复。
+    ///
+    /// 当前限制：白名单只能在「该角色已注册的工具集」内选（各角色调各自的
+    /// `register_*_tools`，工具集互不可见）。跨角色统一选配见
+    /// `docs/PLAN-TOOL-REGISTRY.md`（待实现）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_whitelist: Option<Vec<String>>,
 }

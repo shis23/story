@@ -70,24 +70,24 @@
 
 ```rust
 /// 单个 Agent 角色的运行时配置覆盖
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentRunConfig {
     /// 模型覆盖（None = 使用连接默认模型）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
-    /// 温度覆盖
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// 最大工具轮次
+    /// 最大工具轮次（None = 使用角色默认值）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_rounds: Option<u32>,
-    /// 工具白名单（None = 使用默认工具集，Some = 只允许列表中的工具）
+    /// 工具白名单（None = 默认全部，Some([])=禁用全部，Some(list)=只允许列表工具）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_whitelist: Option<Vec<String>>,
-    /// 是否启用流式输出（某些场景可能需要关闭）
-    #[serde(default = "default_true")]
-    pub stream: bool,
+    // 注：未实现 temperature / stream 字段。温度由连接配置控制，见阶段 5 说明。
 }
+```
+
+> 与设计草案的差异：原草案含 `temperature: Option<f32>` 和 `stream: bool`，
+> 阶段 5 决定**不加**——温度由连接配置统一控制，Profile 层无需重复；`stream` 亦无实际需求。
+> 实际结构见 `crates/domain/src/agent_profile_config.rs`。
 
 /// 完整的 Agent Profile 配置（持久化用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
