@@ -683,10 +683,10 @@ function handlePipelineEvent(event) {
     case 'postprocess_done':
       pipeline.postprocess = {
         status: 'done',
-        detail: `知识 ${event.data.knowledge || 0} · 变量 ${event.data.variable || 0} · 任务 ${event.data.task || 0}`,
-        knowledge: event.data.knowledge || 0,
-        variable: event.data.variable || 0,
-        task: event.data.task || 0,
+        detail: `知识 ${event.data.knowledge_count || 0} · 变量 ${event.data.variable_count || 0} · 任务 ${event.data.task_count || 0}`,
+        knowledge: event.data.knowledge_count || 0,
+        variable: event.data.variable_count || 0,
+        task: event.data.task_count || 0,
         reason: '',
       }
       break
