@@ -421,6 +421,7 @@ impl AgentProfileConfigStore {
         };
         for config in &mut configs {
             config.sanitize();
+            config.migrate_to(1);
         }
 
         let active_id: Option<String> = if active_path.exists() {
@@ -467,7 +468,14 @@ impl AgentProfileConfigStore {
     /// 获取指定配置（完整 DTO）
     pub fn get(&self, id: &str) -> Option<AgentProfileConfig> {
         let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
-        configs.iter().find(|c| c.id.to_string() == id).cloned()
+        configs
+            .iter()
+            .find(|c| c.id.to_string() == id)
+            .cloned()
+            .map(|mut c| {
+                c.migrate_to(1);
+                c
+            })
     }
 
     /// 获取当前活跃配置（如果没有用户选的，返回内置默认）
@@ -477,22 +485,27 @@ impl AgentProfileConfigStore {
 
         if let Some(ref aid) = *active_id {
             if let Some(c) = configs.iter().find(|c| &c.id.to_string() == aid) {
-                return c.clone();
+                let mut c = c.clone();
+                c.migrate_to(1);
+                return c;
             }
         }
 
         // 回退：找内置默认
-        configs
+        let mut c = configs
             .iter()
             .find(|c| c.is_builtin())
             .cloned()
-            .unwrap_or_else(default_agent_profile_config)
+            .unwrap_or_else(default_agent_profile_config);
+        c.migrate_to(1);
+        c
     }
 
     /// 保存/更新配置
     ///
     /// 内置默认配置不允许覆盖。
     pub fn save(&self, mut config: AgentProfileConfig) -> Result<(), String> {
+        config.validate().map_err(|e| e.to_string())?;
         config.sanitize();
         if config.id.to_string() == BUILTIN_DEFAULT_AGENT_PROFILE_ID {
             // 检查是否已存在内置默认
@@ -601,6 +614,36 @@ mod agent_profile_config_store_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_empty_name() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+        let mut cfg = storyforge_domain::agent_profile_config::default_agent_profile_config();
+        cfg.id = storyforge_domain::Id::from_str("custom-invalid");
+        cfg.name = "".into();
+        cfg.source = storyforge_domain::prompt_module::ProfileSource::UserCreated;
+        let result = store.save(cfg);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("配置名称不能为空"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_zero_concurrent() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+        let mut cfg = storyforge_domain::agent_profile_config::default_agent_profile_config();
+        cfg.id = storyforge_domain::Id::from_str("custom-invalid2");
+        cfg.source = storyforge_domain::prompt_module::ProfileSource::UserCreated;
+        cfg.max_concurrent_subagents = 0;
+        let result = store.save(cfg);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_concurrent_subagents"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

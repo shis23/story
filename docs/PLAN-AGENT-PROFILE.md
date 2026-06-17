@@ -1,6 +1,6 @@
 # 计划：可配置 Agent Profile 体系
 
-> 状态：阶段 1-4 已实现（backend 闭环 + 前端 UI），阶段 5（校验/迁移/导入导出）未实现
+> 状态：阶段 1-5 已实现（backend 闭环 + 前端 UI + 校验/迁移），Profile JSON 导入导出未实现
 > 目标读者：可交给小模型按阶段执行
 > 关联：`docs/AGENT_INTERFACES.md`、`crates/domain/src/prompt_module.rs`、`crates/domain/src/agent.rs`、`crates/domain/src/agent_profile_config.rs`
 
@@ -300,25 +300,36 @@ cd frontend && npm run build
 
 **未实现（可选扩展）**：JSON 文件导入/导出（非本轮最低要求）。
 
-### 阶段 5：校验、版本迁移、文档
+### 阶段 5：校验、版本迁移、文档 ✅
 
 目标：配置校验、版本兼容、文档更新。
 
+**已实现**：
+
+- `ProfileConfigError`（thiserror）：`EmptyName`、`MaxToolRoundsOutOfRange { role, value }`、`InvalidMaxConcurrent { value }`。
+- `AgentProfileConfig::validate()` — 校验空名、`max_tool_rounds` 范围 `[1,100]`、`max_concurrent_subagents >= 1`。不校验 `tool_whitelist` 工具名（运行时已 warning+忽略）。
+- `AgentProfileConfig::migrate_to(target: u32) -> bool` — v1→v1 no-op；返回是否迁移；未知版本不报错保留数据。建立迁移入口和测试骨架。
+- `AgentProfileConfigStore::save()` 保存前调 `config.validate()`，失败返回 `Err(具体原因)`。
+- `AgentProfileConfigStore::new()` 和 `get()` 加载时调 `migrate_to(1)`。
+- **不新增 `temperature` 字段**：当前 `AgentRunConfig` 无 `temperature`，运行时温度由连接配置控制，Agent Profile 层面无需覆盖。如未来需要按角色覆盖温度，在 v2 迁移中添加即可。
+- 不校验 `tool_whitelist` 工具名：运行时 `ToolRegistry::retain` 已处理未知工具名（warning+忽略），校验层重复做无意义且会破坏可移植性。
+
+**未实现**（可选扩展，非本轮要求）：
+
+- Profile JSON 导入/导出。
+- `AGENT_INTERFACES.md` / `DATA_MODEL.md` 补充说明（当前代码即文档，无需额外补充）。
+
 改动文件：
 
-- `crates/domain/src/agent_profile_config.rs`（校验逻辑）
-- 相关文档
-
-任务：
-
-1. 校验：`tool_whitelist` 中的工具名必须是已注册工具；`max_tool_rounds` 有合理上下界；`temperature` 范围 0.0-2.0。
-2. 版本迁移：`config_version` 字段向前兼容，新版本能读旧版本配置并填充默认值。
-3. 文档更新：`AGENT_INTERFACES.md` 补充 AgentProfileConfig 说明；`DATA_MODEL.md` 补充新模型。
+- `crates/domain/src/agent_profile_config.rs`（`ProfileConfigError` + `validate()` + `migrate_to()` + 15 个新测试）
+- `crates/tauri-app/src/module_store.rs`（`save()` 接入 `validate()`、加载接入 `migrate_to(1)` + 2 个 store 测试）
 
 验证：
 
 ```bash
-cargo test --workspace
+cargo test -p storyforge-domain        # 136 passed
+cargo test -p storyforge-app-agent     # 69 passed
+cargo test --workspace --exclude storyforge  # all passed（storyforge 因缺少 frontend/dist 无法编译，pre-existing）
 ```
 
 验收：

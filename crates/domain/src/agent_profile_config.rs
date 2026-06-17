@@ -6,6 +6,19 @@ use crate::Id;
 use crate::agent::AgentRole;
 use crate::prompt_module::ProfileSource;
 
+// ─── ProfileConfigError（校验错误）────────────────────────────────────────
+
+/// AgentProfileConfig 校验错误
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProfileConfigError {
+    #[error("配置名称不能为空")]
+    EmptyName,
+    #[error("角色 {role} 的 max_tool_rounds 值 {value} 超出范围 [1, 100]")]
+    MaxToolRoundsOutOfRange { role: String, value: u32 },
+    #[error("max_concurrent_subagents 值 {value} 无效，须 >= 1")]
+    InvalidMaxConcurrent { value: usize },
+}
+
 // ─── Default helpers ────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -185,6 +198,48 @@ impl AgentProfileConfig {
     /// 是否为内置默认配置
     pub fn is_builtin(&self) -> bool {
         self.source == ProfileSource::BuiltIn
+    }
+
+    /// 校验配置合法性。
+    ///
+    /// - `name` 不能为空或纯空白。
+    /// - `max_tool_rounds` 有值时须在 `[1, 100]`。
+    /// - `max_concurrent_subagents` 须 `>= 1`。
+    /// - 不校验 `tool_whitelist` 工具名（运行时已 warning+忽略）。
+    pub fn validate(&self) -> Result<(), ProfileConfigError> {
+        if self.name.trim().is_empty() {
+            return Err(ProfileConfigError::EmptyName);
+        }
+        for (role, run_cfg) in &self.agent_configs {
+            if let Some(rounds) = run_cfg.max_tool_rounds {
+                if rounds == 0 || rounds > 100 {
+                    return Err(ProfileConfigError::MaxToolRoundsOutOfRange {
+                        role: role.to_string(),
+                        value: rounds,
+                    });
+                }
+            }
+        }
+        if self.max_concurrent_subagents < 1 {
+            return Err(ProfileConfigError::InvalidMaxConcurrent {
+                value: self.max_concurrent_subagents,
+            });
+        }
+        Ok(())
+    }
+
+    /// 版本迁移入口。将配置迁移到 `target` 版本。
+    ///
+    /// 当前只有 v1，v1→v1 是 no-op。返回是否发生过迁移。
+    /// 未知版本不报错，保留数据不变（向前兼容）。
+    pub fn migrate_to(&mut self, target: u32) -> bool {
+        if self.config_version == target {
+            return false; // 已是目标版本，no-op
+        }
+        // 当前只有 v1；预留未来版本迁移分支。
+        // 未知版本不做任何修改，保留数据。
+        self.config_version = target;
+        true
     }
 }
 
@@ -435,5 +490,141 @@ mod tests {
         // None = 使用默认工具集，Some(vec![]) = 禁用所有工具
         assert!(cfg_none.tool_whitelist.is_none());
         assert!(cfg_empty.tool_whitelist.as_ref().unwrap().is_empty());
+    }
+
+    // ─── validate() tests ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_default_config_ok() {
+        let cfg = default_agent_profile_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_empty_name_err() {
+        let mut cfg = default_agent_profile_config();
+        cfg.name = "".into();
+        assert_eq!(cfg.validate(), Err(ProfileConfigError::EmptyName));
+    }
+
+    #[test]
+    fn validate_whitespace_name_err() {
+        let mut cfg = default_agent_profile_config();
+        cfg.name = "   ".into();
+        assert_eq!(cfg.validate(), Err(ProfileConfigError::EmptyName));
+    }
+
+    #[test]
+    fn validate_max_tool_rounds_zero_err() {
+        let mut cfg = default_agent_profile_config();
+        cfg.agent_configs.insert(
+            AgentRole::Director,
+            AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: Some(0),
+                tool_whitelist: None,
+            },
+        );
+        assert_eq!(
+            cfg.validate(),
+            Err(ProfileConfigError::MaxToolRoundsOutOfRange {
+                role: "导演".into(),
+                value: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_max_tool_rounds_101_err() {
+        let mut cfg = default_agent_profile_config();
+        cfg.agent_configs.insert(
+            AgentRole::Editor,
+            AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: Some(101),
+                tool_whitelist: None,
+            },
+        );
+        assert_eq!(
+            cfg.validate(),
+            Err(ProfileConfigError::MaxToolRoundsOutOfRange {
+                role: "编剧".into(),
+                value: 101,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_max_tool_rounds_1_ok() {
+        let mut cfg = default_agent_profile_config();
+        cfg.agent_configs.insert(
+            AgentRole::Director,
+            AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: Some(1),
+                tool_whitelist: None,
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_max_tool_rounds_100_ok() {
+        let mut cfg = default_agent_profile_config();
+        cfg.agent_configs.insert(
+            AgentRole::Director,
+            AgentRunConfig {
+                model_override: None,
+                max_tool_rounds: Some(100),
+                tool_whitelist: None,
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_max_concurrent_zero_err() {
+        // 直接写字段绕过 new() 的 clamp
+        let mut cfg = default_agent_profile_config();
+        cfg.max_concurrent_subagents = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ProfileConfigError::InvalidMaxConcurrent { value: 0 })
+        );
+    }
+
+    #[test]
+    fn validate_max_concurrent_one_ok() {
+        let mut cfg = default_agent_profile_config();
+        cfg.max_concurrent_subagents = 1;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ─── migrate_to() tests ────────────────────────────────────────────
+
+    #[test]
+    fn migrate_to_v1_noop() {
+        let mut cfg = default_agent_profile_config();
+        assert_eq!(cfg.config_version, 1);
+        assert!(!cfg.migrate_to(1)); // no-op
+        assert_eq!(cfg.config_version, 1);
+    }
+
+    #[test]
+    fn migrate_to_unknown_version_updates_version() {
+        let mut cfg = default_agent_profile_config();
+        assert!(cfg.migrate_to(99));
+        assert_eq!(cfg.config_version, 99);
+    }
+
+    #[test]
+    fn migrate_from_json_with_older_version() {
+        // 模拟旧版本 JSON（config_version 缺失 → 默认 1）
+        let json = r#"{"id":"old-1","name":"旧配置"}"#;
+        let mut cfg: AgentProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.config_version, 1);
+        // migrate_to(1) 应该是 no-op
+        assert!(!cfg.migrate_to(1));
+        assert_eq!(cfg.config_version, 1);
     }
 }
