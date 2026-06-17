@@ -172,8 +172,54 @@ cargo test --workspace                 # 阶段 2 回归
 cd frontend && npm run build           # 阶段 3
 ```
 
+## 附：Agent 动态增删 —— 明确不做（留作未来可能）
+
+本计划只让 **tool** 动态选配。**agent（写作流水线的角色）不做动态增删**，这是经过审计的有意决定，不是遗漏。把结论固化在此，避免以后反复纠结。
+
+### 为什么 tool 能做、agent 不能做
+
+两者耦合深度差一个数量级：
+
+| | tool | agent |
+|---|---|---|
+| 注册 | 各角色 `register_*_tools`，可统一成 ToolCenter | `AgentRole` 是编译期枚举（7 个变体，`agent.rs:18`） |
+| 增删 | 统一注册中心后可运行时选配 | 加 agent 要改枚举 + 重编译 |
+| 顺序 | 无顺序，按白名单取用 | 流水线是写死状态机，阶段顺序硬编码 |
+| 用户可配 | 开/关哪些工具 | 仅开关 PostProcessor/Summarizer、调参数 |
+
+### 审计到的结构性阻碍（代码证据）
+
+1. **`AgentRole` 是编译期枚举**（`crates/domain/src/agent.rs:18`）：
+   `Director / Subagent(String) / Editor / Meta / CharacterExtractor / Summarizer / PostProcessor`。运行时不可扩展，加新 agent 类型必须改枚举 + 重编译。
+
+2. **流水线阶段顺序硬编码**（`app-pipeline/src/lib.rs:218` `start_writing`）：
+   ```
+   阶段1 Director(必经) → 阶段2 Subagents(Director 的 Plan 动态决定数量) 
+   → 阶段3 Editor(必经) → 阶段4 PostProcessor + Summarizer(可开关，并行)
+   ```
+   Director 和 Editor 是硬编码必经阶段，中间插不进别的 agent；每个阶段的输入/输出类型（`Plan` / `Vec<Performance>` / `Draft`）一对一咬死。
+
+3. **Subagent 的「动态」是假动态**：Director 的 Plan 决定 spawn 几个 Subagent，但它们全是同一 `Subagent` 角色类型，不是动态新增 agent 类型。
+
+4. **配置层只能调参数 / 开关，不能增删阶段**（`agent_profile_config.rs`）：
+   `enable_postprocess`/`enable_summarizer` 只能关掉两个固定可选阶段；没有任何字段能新增 agent 类型或重排顺序。
+
+### 判断：现阶段不该做
+
+- 写作流水线的固定结构是 StoryForge 的核心设计（设计 §3.2），每一环的输入输出都为这套流程精心设计。改成「可插拔 agent 链」等于重写流水线，ROI 极低。
+- 动态 agent 链是「插件系统」级别工程（agent 接口契约 + 输入输出适配 + 执行编排 + 失败回滚 + 配置 schema），属 Phase 7 之后，现在碰会把刚稳定的主线搞乱。
+
+### 现实能做到的边界
+
+- **✅ 已有**：开/关 PostProcessor、Summarizer；给任意角色调模型/工具/轮次/并发。
+- **✅ 可做（低成本，需求驱动）**：加新**固定** agent 类型（如 Critic 批评家）——改枚举 + 状态机加一段，一次性的、可控的，不是动态系统。需求来了再改。
+- **⏸️ 留作未来**：运行时用户自定义 agent 类型 + 可插拔流水线。等主线完全稳定、有明确的「用户确实想造新 agent」需求时再评估。
+
+> 若未来确实要做，应单独立 `docs/PLAN-DYNAMIC-AGENTS.md`，并先回答：用户场景是什么？固定阶段加一段满足不了吗？只有当「固定加阶段」频繁满足不了需求时，才值得投资动态系统。
+
 ## 与其他计划的关系
 
 - 前置：`PLAN-AGENT-PROFILE.md`（AgentRunConfig.tool_whitelist 字段已就绪，本计划给它提供「可选池」）。
 - 并行：可与 `PLAN-META-AGENT.md`（app-meta）并行，文件不重叠。
-- 明确不做：运行时新增工具 / 沙箱脚本工具（见「非目标」）。
+- 明确不做（tool 侧）：运行时新增工具 / 沙箱脚本工具（见「非目标」）。
+- 明确不做（agent 侧）：agent 动态增删（见上方「附」节，留作未来可能）。
