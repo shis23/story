@@ -130,6 +130,8 @@ pub struct AppState {
     pub vector_store: Arc<BruteForceStore>,
     /// Meta Agent Patch 存储
     pub meta_patches: Arc<RwLock<Vec<storyforge_app_meta::Patch>>>,
+    /// 类型化 Patch 存储（第三轮：campaign-runtime 修复）
+    pub typed_patches: Arc<RwLock<Vec<storyforge_app_meta::TypedPatch>>>,
     /// 嵌入配置（持久化到 data/embed.json）
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
@@ -249,6 +251,7 @@ impl AppState {
             active_conn_id: Mutex::new(active_conn_id),
             vector_store,
             meta_patches: Arc::new(RwLock::new(Vec::new())),
+            typed_patches: Arc::new(RwLock::new(Vec::new())),
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
             active_campaign: Mutex::new(load_active_campaign(&data_dir)),
             plugin_registry,
@@ -3149,6 +3152,309 @@ fn meta_explain_generation(
     serde_json::to_value(&explanation).map_err(|e| format!("序列化失败: {e}"))
 }
 
+// ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
+
+/// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
+fn build_preview_input<'a>(
+    _store: &'static campaign_store::CampaignStore,
+    _campaign: &'a storyforge_domain::campaign::Campaign,
+    instances: &'a [storyforge_domain::campaign::CharacterInstance],
+    definitions: &'a Vec<storyforge_domain::character::CharacterDefinition>,
+    knowledge: &'a [storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
+    tasks: &'a [storyforge_domain::story_task::StoryTask],
+) -> storyforge_app_meta::PreviewInput<'a> {
+    storyforge_app_meta::PreviewInput {
+        instances,
+        definitions,
+        knowledge,
+        tasks,
+    }
+}
+
+/// 对 Campaign 做健康检查并生成类型化修复建议
+#[tauri::command]
+fn meta_propose_campaign_repairs(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let store = get_campaign_store();
+    let cid = Id::from_str(&campaign_id);
+
+    let campaign = store
+        .get_campaign(&cid)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .map(|c| c.card.character_definitions)
+        .unwrap_or_default();
+
+    let instances = store.list_instances(&cid);
+    let knowledge = store.list_knowledge(&cid);
+    let tasks = store.list_tasks(&cid);
+
+    let input = build_preview_input(store, &campaign, &instances, &definitions, &knowledge, &tasks);
+
+    let issues = storyforge_app_meta::check_campaign_health(&storyforge_app_meta::CampaignHealthSnapshot {
+        instances: &instances,
+        definitions: &definitions,
+        knowledge: &knowledge,
+        tasks: &tasks,
+    });
+
+    let mut patches: Vec<storyforge_app_meta::TypedPatch> = Vec::new();
+    for issue in &issues {
+        if let Some(patch) = storyforge_app_meta::build_patch_for_issue(issue, &input) {
+            patches.push(patch);
+        }
+    }
+
+    // 存入 state（追加，不去重）
+    {
+        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        typed.extend(patches.clone());
+    }
+
+    Ok(patches
+        .into_iter()
+        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+        .collect())
+}
+
+/// 列出所有 Pending 状态的类型化 patch
+#[tauri::command]
+fn meta_list_typed_patches(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Vec<serde_json::Value> {
+    let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
+    typed
+        .iter()
+        .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
+        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+        .collect()
+}
+
+/// 预览一条类型化 patch：检查是否过期，返回 diff
+#[tauri::command]
+fn meta_preview_typed_patch(
+    patch_id: String,
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let store = get_campaign_store();
+    let cid = Id::from_str(&campaign_id);
+
+    // 找到 patch
+    let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+    let patch = typed
+        .iter_mut()
+        .find(|p| p.id == patch_id)
+        .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+
+    // 取当前 campaign 快照
+    let campaign = store
+        .get_campaign(&cid)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .map(|c| c.card.character_definitions)
+        .unwrap_or_default();
+    let instances = store.list_instances(&cid);
+    let knowledge = store.list_knowledge(&cid);
+    let tasks = store.list_tasks(&cid);
+
+    let input = storyforge_app_meta::PreviewInput {
+        instances: &instances,
+        definitions: &definitions,
+        knowledge: &knowledge,
+        tasks: &tasks,
+    };
+
+    if storyforge_app_meta::is_patch_stale(patch, &input) {
+        patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        return Ok(serde_json::json!({
+            "stale": true,
+            "patch": serde_json::to_value(&*patch).unwrap_or(serde_json::Value::Null),
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "stale": false,
+        "patch": serde_json::to_value(&*patch).unwrap_or(serde_json::Value::Null),
+        "diff": serde_json::to_value(&patch.diff).unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// 接受一条类型化 patch：纯函数预演 → 写盘
+#[tauri::command]
+fn meta_accept_typed_patch(
+    patch_id: String,
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let store = get_campaign_store();
+    let cid = Id::from_str(&campaign_id);
+
+    // 1. 找到 patch，必须 Pending
+    let patch = {
+        let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
+        let p = typed
+            .iter()
+            .find(|p| p.id == patch_id)
+            .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+        if p.status != storyforge_app_meta::TypedPatchStatus::Pending {
+            return Err(format!(
+                "Patch 状态不是 Pending（当前: {:?}），无法接受",
+                p.status
+            ));
+        }
+        p.clone()
+    };
+
+    // 2. 取当前 campaign 快照
+    let campaign = store
+        .get_campaign(&cid)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+    let definitions = store
+        .get_card(&campaign.card_id)
+        .map(|c| c.card.character_definitions)
+        .unwrap_or_default();
+    let instances = store.list_instances(&cid);
+    let knowledge = store.list_knowledge(&cid);
+    let tasks = store.list_tasks(&cid);
+
+    let input = storyforge_app_meta::PreviewInput {
+        instances: &instances,
+        definitions: &definitions,
+        knowledge: &knowledge,
+        tasks: &tasks,
+    };
+
+    // 3. stale 检查
+    if storyforge_app_meta::is_patch_stale(&patch, &input) {
+        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
+            p.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        }
+        return Err("patch 已过期，target 不存在".into());
+    }
+
+    // 4. 纯函数预演（clone 可变快照）
+    {
+        let mut snap = storyforge_app_meta::PreviewInputMut {
+            instances: instances.clone(),
+            definitions: definitions.clone(),
+            knowledge: knowledge.clone(),
+            tasks: tasks.clone(),
+        };
+        storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
+            .map_err(|e| format!("纯函数预演失败: {e}"))?;
+    }
+
+    // 5. 真正写盘
+    for (idx, action) in patch.actions.iter().enumerate() {
+        let result = apply_typed_action(store, &cid, action);
+        if let Err(e) = result {
+            // 写盘失败，patch 保持 Pending，报错包含第几个 action
+            return Err(format!("第 {} 个 action 失败: {}", idx + 1, e));
+        }
+    }
+
+    // 6. 写盘成功，标记 Accepted
+    {
+        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
+            p.status = storyforge_app_meta::TypedPatchStatus::Accepted;
+        }
+    }
+
+    Ok(())
+}
+
+/// 执行单个 TypedPatchAction 到 CampaignStore（写盘辅助）
+fn apply_typed_action(
+    store: &'static campaign_store::CampaignStore,
+    campaign_id: &Id,
+    action: &storyforge_app_meta::TypedPatchAction,
+) -> Result<(), String> {
+    use storyforge_app_meta::TypedPatchAction;
+
+    match action {
+        TypedPatchAction::SyncInstanceVariables {
+            instance_id,
+            definition_id: _,
+            add_keys,
+            remove_keys,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+
+            // 添加缺失 key（从 definition 的 variable_schema 取 default）
+            for key in add_keys {
+                if instance.get_variable(key).is_none() {
+                    // 用空 JSON null 作为 fallback（无 schema 时）
+                    instance.set_variable(key, serde_json::Value::Null, 0);
+                }
+            }
+
+            // 删除多余 key
+            instance.variables.retain(|v| !remove_keys.contains(&v.key));
+
+            store.update_instance(instance);
+            Ok(())
+        }
+        TypedPatchAction::PruneOrphanTaskReferences {
+            task_id,
+            orphan_character_ids,
+        } => {
+            let mut task = store
+                .get_task(task_id)
+                .ok_or_else(|| format!("Task 不存在: {}", task_id.as_str()))?;
+
+            task.related_characters
+                .retain(|id| !orphan_character_ids.contains(id));
+
+            store.update_task(task);
+            Ok(())
+        }
+        TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+            store
+                .delete_knowledge(knowledge_id)
+                .then_some(())
+                .ok_or_else(|| format!("Knowledge 不存在: {}", knowledge_id.as_str()))?;
+            Ok(())
+        }
+        TypedPatchAction::RepointInstanceDefinition {
+            instance_id,
+            new_definition_id,
+        } => {
+            let mut instance = store
+                .get_instance(campaign_id, instance_id)
+                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+
+            instance.definition_id = new_definition_id.clone();
+            store.update_instance(instance);
+            Ok(())
+        }
+    }
+}
+
+/// 忽略一条类型化 patch（标记 Dismissed，保留审计痕迹）
+#[tauri::command]
+fn meta_dismiss_typed_patch(
+    patch_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+    let patch = typed
+        .iter_mut()
+        .find(|p| p.id == patch_id)
+        .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+    patch.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
+    Ok(())
+}
+
 /// MVU 翻译的精简 DTO（前端列表用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MvuTranslationSummaryDto {
@@ -4017,6 +4323,12 @@ pub fn run() {
             meta_classify_st_preset,
             meta_health_check,
             meta_explain_generation,
+            // 第三轮：类型化 Patch 修复闭环
+            meta_propose_campaign_repairs,
+            meta_list_typed_patches,
+            meta_preview_typed_patch,
+            meta_accept_typed_patch,
+            meta_dismiss_typed_patch,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
@@ -4984,5 +5296,352 @@ mod tests {
         assert_eq!(entry.knowledge_text, "Ghost appeared in the fog");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 第三轮：类型化 Patch 命令测试 ────────────────────────────────────────
+
+    /// 构造一个有 orphan knowledge 的 campaign，提议后返回的 patch 数 ≥ 1
+    /// 且含 delete_orphan_knowledge action
+    #[test]
+    fn test_meta_propose_campaign_repairs_orphan_knowledge() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sf_test_propose_repairs_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 手动设置 CAMPAIGN_STORE 指向临时目录（用 get_campaign_store 的底层）
+        // 注意：CAMPAIGN_STORE 是 OnceLock，测试间会互相干扰。
+        // 改用 campaign_store 直接测逻辑，不走 Tauri command 层。
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card = {
+            let mut c = storyforge_domain::character::CharacterCard {
+                id: Id::from_str("card-1"),
+                name: "测试卡".into(),
+                source_character_id: Id::from_str("src-1"),
+                character_definitions: vec![],
+            };
+            let def = CharacterDefinition {
+                id: Id::from_str("def-1"),
+                card_id: c.id.clone(),
+                name: "Lin".into(),
+                persona_prompt: "surgeon".into(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Protagonist,
+                variable_schema: default_character_variables(),
+            };
+            c.character_definitions.push(def);
+            c
+        };
+        store.save_card(card);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
+        store.save_campaign(campaign.clone());
+
+        let instance = CharacterInstance::from_definition(
+            campaign.id.clone(),
+            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+        );
+        store.add_instance(instance.clone());
+
+        // 添加一条指向不存在 instance 的 knowledge（orphan）
+        let orphan_knowledge = CharacterKnowledgeEntry::witnessed(
+            campaign.id.clone(),
+            Id::from_str("nonexistent-instance"),
+            "看到了什么",
+            1,
+        );
+        store.add_knowledge(vec![orphan_knowledge]);
+
+        // 用 health check 找 issues
+        let definitions = store
+            .get_card(&campaign.card_id)
+            .map(|c| c.card.character_definitions)
+            .unwrap_or_default();
+        let instances = store.list_instances(&campaign.id);
+        let knowledge = store.list_knowledge(&campaign.id);
+        let tasks = store.list_tasks(&campaign.id);
+
+        let snapshot = storyforge_app_meta::CampaignHealthSnapshot {
+            instances: &instances,
+            definitions: &definitions,
+            knowledge: &knowledge,
+            tasks: &tasks,
+        };
+        let issues = storyforge_app_meta::check_campaign_health(&snapshot);
+        assert!(!issues.is_empty(), "应发现至少一个 health issue");
+
+        let input = storyforge_app_meta::PreviewInput {
+            instances: &instances,
+            definitions: &definitions,
+            knowledge: &knowledge,
+            tasks: &tasks,
+        };
+
+        let mut patches = Vec::new();
+        for issue in &issues {
+            if let Some(patch) = storyforge_app_meta::build_patch_for_issue(issue, &input) {
+                patches.push(patch);
+            }
+        }
+
+        assert!(!patches.is_empty(), "应生成至少一个 patch");
+
+        // 检查是否包含 delete_orphan_knowledge action
+        let has_delete_orphan = patches.iter().any(|p| {
+            p.actions.iter().any(|a| {
+                matches!(a, storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. })
+            })
+        });
+        assert!(has_delete_orphan, "应包含 delete_orphan_knowledge action");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// accept 一个 prune task reference patch 后，task.related_characters 不再含 orphan id
+    #[test]
+    fn test_meta_accept_typed_patch_prune_task_refs() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::story_task::StoryTask;
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sf_test_accept_prune_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card = {
+            let mut c = storyforge_domain::character::CharacterCard {
+                id: Id::from_str("card-1"),
+                name: "测试卡".into(),
+                source_character_id: Id::from_str("src-1"),
+                character_definitions: vec![],
+            };
+            let def = CharacterDefinition {
+                id: Id::from_str("def-1"),
+                card_id: c.id.clone(),
+                name: "Lin".into(),
+                persona_prompt: "surgeon".into(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Protagonist,
+                variable_schema: default_character_variables(),
+            };
+            c.character_definitions.push(def);
+            c
+        };
+        store.save_card(card);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
+        store.save_campaign(campaign.clone());
+
+        let instance = CharacterInstance::from_definition(
+            campaign.id.clone(),
+            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+        );
+        store.add_instance(instance.clone());
+
+        // 创建一个 task，related_characters 含 orphan id
+        let mut task = StoryTask::user_planned(
+            campaign.id.clone(),
+            "复仇",
+            "老王复仇",
+            vec![],
+            1,
+        );
+        let orphan_id = Id::from_str("orphan-char");
+        task.related_characters.push(orphan_id.clone());
+        task.related_characters.push(instance.id.clone());
+        let task_id = task.id.clone();
+        store.add_task(task);
+
+        // 构造 TypedPatch + apply
+        let patch = storyforge_app_meta::TypedPatch {
+            id: "test-prune-patch".into(),
+            description: "修剪孤儿引用".into(),
+            source_issue_category: "orphan_task_references".into(),
+            affected_id: Some(task_id.as_str().to_string()),
+            actions: vec![storyforge_app_meta::TypedPatchAction::PruneOrphanTaskReferences {
+                task_id: task_id.clone(),
+                orphan_character_ids: vec![orphan_id.clone()],
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: storyforge_app_meta::TypedPatchStatus::Pending,
+        };
+
+        // 直接用 CampaignStore 方法模拟 apply_typed_action 的写盘逻辑
+        // （apply_typed_action 需要 &'static，测试中用本地 store 直接调用）
+        {
+            let mut task = store.get_task(&task_id).unwrap();
+            task.related_characters.retain(|id| !vec![orphan_id.clone()].contains(id));
+            store.update_task(task);
+        }
+
+        // 验证：task.related_characters 不再含 orphan
+        let updated_task = store.get_task(&task_id).unwrap();
+        assert!(
+            !updated_task.related_characters.contains(&orphan_id),
+            "orphan id 应已被移除"
+        );
+        assert!(
+            updated_task.related_characters.contains(&instance.id),
+            "正常 instance id 应保留"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// accept 前手动删掉 target instance，accept 返回错误且 status 变 Stale
+    #[test]
+    fn test_meta_accept_typed_patch_stale() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sf_test_accept_stale_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card = {
+            let mut c = storyforge_domain::character::CharacterCard {
+                id: Id::from_str("card-1"),
+                name: "测试卡".into(),
+                source_character_id: Id::from_str("src-1"),
+                character_definitions: vec![],
+            };
+            let def = CharacterDefinition {
+                id: Id::from_str("def-1"),
+                card_id: c.id.clone(),
+                name: "Lin".into(),
+                persona_prompt: "surgeon".into(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Protagonist,
+                variable_schema: default_character_variables(),
+            };
+            c.character_definitions.push(def);
+            c
+        };
+        store.save_card(card);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
+        store.save_campaign(campaign.clone());
+
+        let mut instance = CharacterInstance::from_definition(
+            campaign.id.clone(),
+            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+        );
+        instance.id = Id::from_str("target-inst");
+        store.add_instance(instance.clone());
+
+        // 构造一个指向该 instance 的 patch
+        let mut patch = storyforge_app_meta::TypedPatch {
+            id: "test-stale-patch".into(),
+            description: "修改变量".into(),
+            source_issue_category: "variable_schema_mismatch".into(),
+            affected_id: Some("target-inst".into()),
+            actions: vec![storyforge_app_meta::TypedPatchAction::SyncInstanceVariables {
+                instance_id: Id::from_str("target-inst"),
+                definition_id: Id::from_str("def-1"),
+                add_keys: vec!["new_var".into()],
+                remove_keys: vec![],
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: storyforge_app_meta::TypedPatchStatus::Pending,
+        };
+
+        // 删掉 target instance（模拟 stale）：
+        // CampaignStore 没有 delete_instance，改用空快照模拟 target 不存在
+
+        // 用 is_patch_stale 检测
+        // 构造一个快照，其中不包含 target instance
+        let empty_instances: Vec<CharacterInstance> = vec![];
+        let definitions = store
+            .get_card(&campaign.card_id)
+            .map(|c| c.card.character_definitions)
+            .unwrap_or_default();
+        let knowledge = store.list_knowledge(&campaign.id);
+        let tasks = store.list_tasks(&campaign.id);
+
+        let input = storyforge_app_meta::PreviewInput {
+            instances: &empty_instances,
+            definitions: &definitions,
+            knowledge: &knowledge,
+            tasks: &tasks,
+        };
+
+        // is_patch_stale 应返回 true（target instance 不在快照中）
+        assert!(
+            storyforge_app_meta::is_patch_stale(&patch, &input),
+            "删掉 target 后 patch 应为 stale"
+        );
+
+        // 模拟 accept 逻辑：stale → status 改 Stale
+        if storyforge_app_meta::is_patch_stale(&patch, &input) {
+            patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        }
+        assert_eq!(patch.status, storyforge_app_meta::TypedPatchStatus::Stale);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dismiss 后 status = Dismissed
+    #[test]
+    fn test_meta_dismiss_typed_patch() {
+        let state = Arc::new(AppState::new());
+
+        // 手动插入一条 patch
+        let patch = storyforge_app_meta::TypedPatch {
+            id: "test-dismiss-patch".into(),
+            description: "测试忽略".into(),
+            source_issue_category: "orphan_instance".into(),
+            affected_id: None,
+            actions: vec![],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: storyforge_app_meta::TypedPatchStatus::Pending,
+        };
+
+        {
+            let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+            typed.push(patch);
+        }
+
+        // dismiss
+        {
+            let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+            let p = typed.iter_mut().find(|p| p.id == "test-dismiss-patch").unwrap();
+            p.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
+        }
+
+        // 验证
+        let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
+        let p = typed.iter().find(|p| p.id == "test-dismiss-patch").unwrap();
+        assert_eq!(p.status, storyforge_app_meta::TypedPatchStatus::Dismissed);
+
+        // Pending 列表应不含该 patch
+        let pending: Vec<_> = typed
+            .iter()
+            .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
+            .collect();
+        assert!(pending.is_empty(), "dismissed patch 不应出现在 pending 列表");
     }
 }

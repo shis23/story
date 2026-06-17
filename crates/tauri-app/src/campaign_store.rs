@@ -328,6 +328,18 @@ impl CampaignStore {
         persist(&self.knowledge_path, &cache.knowledge);
     }
 
+    /// 删除单条知识条目（按 id），返回是否找到并删除
+    pub fn delete_knowledge(&self, knowledge_id: &Id) -> bool {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let before = cache.knowledge.len();
+        cache.knowledge.retain(|k| k.id != *knowledge_id);
+        let changed = cache.knowledge.len() != before;
+        if changed {
+            persist(&self.knowledge_path, &cache.knowledge);
+        }
+        changed
+    }
+
     // ─── StoryTask CRUD（P2 新增）──────────────────────────────────────────
 
     pub fn list_all_tasks(&self) -> Vec<StoryTask> {
@@ -651,6 +663,34 @@ mod tests {
                 .list_knowledge_of(&camp_id, &Id::from_str("char-other"))
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_delete_knowledge() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let camp_id = Id::from_str("camp-dk");
+        let char_id = Id::from_str("char-1");
+        let e1 =
+            CharacterKnowledgeEntry::witnessed(camp_id.clone(), char_id.clone(), "看到尸体", 1);
+        let e2 =
+            CharacterKnowledgeEntry::backstory(camp_id.clone(), char_id.clone(), "我是外科医生");
+        let e1_id = e1.id.clone();
+        store.add_knowledge(vec![e1, e2]);
+        assert_eq!(store.list_knowledge(&camp_id).len(), 2);
+
+        // 删除 e1
+        assert!(store.delete_knowledge(&e1_id));
+        assert_eq!(store.list_knowledge(&camp_id).len(), 1);
+
+        // 再删返回 false
+        assert!(!store.delete_knowledge(&e1_id));
+
+        // 持久化验证
+        let store2 = CampaignStore::new(&dir);
+        assert_eq!(store2.list_knowledge(&camp_id).len(), 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
