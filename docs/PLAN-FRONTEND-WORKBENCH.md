@@ -1,6 +1,6 @@
 # 计划：前端 Campaign 工作台
 
-> 状态：待执行
+> 状态：部分起步（阶段 1 首屏聚焦已完成）
 > 前置：`PLAN-CAMPAIGN-MAINLINE.md` 至少完成后端 Campaign 快照和 instance id 主线。
 
 ## 目标
@@ -23,7 +23,7 @@
 - `PipelinePanel.vue` 展示 subagent 事件，但 subagent 名称来自后端 `character_id` 字符串。
 - `MetaPanel.vue` 是独立弹层，尚未与 Campaign health/trace 深度打通。
 
-## 阶段 1：首屏显示 active Campaign 状态
+## 阶段 1：首屏显示 active Campaign 状态（已起步）
 
 改动文件：
 
