@@ -7,6 +7,7 @@
 //! - ST 预设 LLM 分类（[`mvu_import::classify_st_preset_with_llm`]）
 //! - 多轮对话框架（[`meta_conversation`]，对应设计 §9.1）
 
+pub mod health_check;
 pub mod meta_conversation;
 pub mod mvu_import;
 pub mod prompts;
@@ -14,6 +15,7 @@ pub mod prompts;
 use serde::{Deserialize, Serialize};
 
 // 重新导出常用类型（向后兼容现有 tauri-app 引用）
+pub use health_check::{CampaignHealthSnapshot, HealthIssue, IssueSeverity, check_campaign_health};
 pub use meta_conversation::{
     MetaConversation, MetaMessage, MetaSession, MetaTurn, ToolResultDisplay, chat as meta_chat,
 };
