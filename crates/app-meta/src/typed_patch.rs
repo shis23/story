@@ -1,0 +1,1033 @@
+//! 类型化修复 Patch DTO + 纯函数 diff/preview/apply
+//!
+//! 对应 PLAN-META-AGENT.md 阶段 3「Typed Patch Preview」。
+//! 四种 `TypedPatchAction` 变体分别覆盖 health check 发现的四类问题。
+//! 所有函数均为纯函数，不读写 store 或全局状态。
+
+use serde::{Deserialize, Serialize};
+use storyforge_domain::Id;
+use storyforge_domain::campaign::CharacterInstance;
+use storyforge_domain::character::CharacterDefinition;
+use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+use storyforge_domain::story_task::StoryTask;
+
+use crate::HealthIssue;
+
+// ─── DTO 类型 ────────────────────────────────────────────────────────────────
+
+/// 类型化修复操作（每个变体 = 一种 health issue 的修复）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypedPatchAction {
+    /// 修变量 schema 不一致：为 instance 补齐缺失字段 / 删除多余字段
+    SyncInstanceVariables {
+        instance_id: Id,
+        definition_id: Id,
+        add_keys: Vec<String>,
+        remove_keys: Vec<String>,
+    },
+    /// 修孤儿任务引用：从 task.related_characters 移除不存在的 id
+    PruneOrphanTaskReferences {
+        task_id: Id,
+        orphan_character_ids: Vec<Id>,
+    },
+    /// 修未解析知识引用：删除指向不存在 instance 的知识条目
+    DeleteOrphanKnowledge {
+        knowledge_id: Id,
+    },
+    /// 修孤立 instance：把 definition_id 改成现存 definition（或清空为临时角色）
+    RepointInstanceDefinition {
+        instance_id: Id,
+        new_definition_id: Option<Id>,
+    },
+}
+
+/// 单个字段变更（diff 用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldDiff {
+    pub path: String,
+    pub before: serde_json::Value,
+    pub after: serde_json::Value,
+}
+
+/// 一条修复建议（可含多个 action）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedPatch {
+    pub id: String,
+    pub description: String,
+    pub source_issue_category: String,
+    pub affected_id: Option<String>,
+    pub actions: Vec<TypedPatchAction>,
+    pub diff: Vec<FieldDiff>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub status: TypedPatchStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedPatchStatus {
+    Pending,
+    Accepted,
+    Dismissed,
+    Stale,
+}
+
+// ─── Preview 输入（不可变 / 可变）────────────────────────────────────────────
+
+/// preview 的输入快照（纯数据切片，不含 store 引用）
+pub struct PreviewInput<'a> {
+    pub instances: &'a [CharacterInstance],
+    pub definitions: &'a [CharacterDefinition],
+    pub knowledge: &'a [CharacterKnowledgeEntry],
+    pub tasks: &'a [StoryTask],
+}
+
+/// apply_to_snapshot 的可变快照
+pub struct PreviewInputMut<'a> {
+    pub instances: &'a mut Vec<CharacterInstance>,
+    pub definitions: &'a mut Vec<CharacterDefinition>,
+    pub knowledge: &'a mut Vec<CharacterKnowledgeEntry>,
+    pub tasks: &'a mut Vec<StoryTask>,
+}
+
+// ─── 错误类型 ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum TypedPatchError {
+    #[error("patch target 不存在: {0}")]
+    TargetMissing(String),
+    #[error("patch 已过期")]
+    Stale,
+}
+
+// ─── 纯函数实现 ──────────────────────────────────────────────────────────────
+
+/// 从一个 health issue 构造对应的修复 patch（preview 在构造时一并算好 diff）。
+/// 无法修复的 issue（如未实现的 category）返回 None。
+pub fn build_patch_for_issue(issue: &HealthIssue, input: &PreviewInput) -> Option<TypedPatch> {
+    match issue.category.as_str() {
+        "orphan_instance" => build_orphan_instance_patch(issue, input),
+        "unresolved_knowledge" => build_unresolved_knowledge_patch(issue, input),
+        "orphan_task_reference" => build_orphan_task_reference_patch(issue, input),
+        "variable_schema_mismatch" => build_variable_schema_mismatch_patch(issue, input),
+        _ => None,
+    }
+}
+
+/// 检查 patch 是否过期：target id 是否仍存在于快照中。
+/// 返回 true = 过期（不应接受）。
+pub fn is_patch_stale(patch: &TypedPatch, input: &PreviewInput) -> bool {
+    patch.actions.iter().any(|action| match action {
+        TypedPatchAction::RepointInstanceDefinition { instance_id, .. } => {
+            !input.instances.iter().any(|i| &i.id == instance_id)
+        }
+        TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+            !input.knowledge.iter().any(|k| &k.id == knowledge_id)
+        }
+        TypedPatchAction::PruneOrphanTaskReferences { task_id, .. } => {
+            !input.tasks.iter().any(|t| &t.id == task_id)
+        }
+        TypedPatchAction::SyncInstanceVariables { instance_id, .. } => {
+            !input.instances.iter().any(|i| &i.id == instance_id)
+        }
+    })
+}
+
+/// 把 patch 的 actions 应用到一份可变快照副本上（纯函数，验证语义正确用）。
+pub fn apply_to_snapshot(
+    patch: &TypedPatch,
+    snapshot: &mut PreviewInputMut,
+) -> Result<(), TypedPatchError> {
+    for action in &patch.actions {
+        apply_action(action, snapshot)?;
+    }
+    Ok(())
+}
+
+// ─── 内部 helpers ────────────────────────────────────────────────────────────
+
+fn build_orphan_instance_patch(issue: &HealthIssue, input: &PreviewInput) -> Option<TypedPatch> {
+    let affected_id = issue.affected_id.as_deref()?;
+    let inst = input
+        .instances
+        .iter()
+        .find(|i| i.id.as_str() == affected_id)?;
+
+    let name = inst.name.clone();
+    let old_def_id = inst.definition_id.clone();
+
+    let actions = vec![TypedPatchAction::RepointInstanceDefinition {
+        instance_id: inst.id.clone(),
+        new_definition_id: None,
+    }];
+
+    let diff = vec![FieldDiff {
+        path: "definition_id".into(),
+        before: old_def_id
+            .as_ref()
+            .map(|id| serde_json::Value::String(id.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        after: serde_json::Value::Null,
+    }];
+
+    Some(TypedPatch {
+        id: uuid::Uuid::new_v4().to_string(),
+        description: format!("将孤立实例 {name} 的 definition_id 清空（降为临时角色）"),
+        source_issue_category: "orphan_instance".into(),
+        affected_id: Some(affected_id.into()),
+        actions,
+        diff,
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    })
+}
+
+fn build_unresolved_knowledge_patch(
+    issue: &HealthIssue,
+    input: &PreviewInput,
+) -> Option<TypedPatch> {
+    let affected_id = issue.affected_id.as_deref()?;
+    let entry = input
+        .knowledge
+        .iter()
+        .find(|k| k.id.as_str() == affected_id)?;
+
+    let truncated = truncate(&entry.knowledge_text, 40);
+
+    let actions = vec![TypedPatchAction::DeleteOrphanKnowledge {
+        knowledge_id: entry.id.clone(),
+    }];
+
+    let before_val = serde_json::to_value(entry).unwrap_or(serde_json::Value::Null);
+
+    let diff = vec![FieldDiff {
+        path: format!("knowledge[{}]", entry.id),
+        before: before_val,
+        after: serde_json::Value::Null,
+    }];
+
+    Some(TypedPatch {
+        id: uuid::Uuid::new_v4().to_string(),
+        description: format!("删除未解析的知识条目「{truncated}」"),
+        source_issue_category: "unresolved_knowledge".into(),
+        affected_id: Some(affected_id.into()),
+        actions,
+        diff,
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    })
+}
+
+fn build_orphan_task_reference_patch(
+    issue: &HealthIssue,
+    input: &PreviewInput,
+) -> Option<TypedPatch> {
+    let affected_id = issue.affected_id.as_deref()?;
+    let task = input
+        .tasks
+        .iter()
+        .find(|t| t.id.as_str() == affected_id)?;
+
+    let instance_ids: std::collections::HashSet<&Id> =
+        input.instances.iter().map(|i| &i.id).collect();
+
+    let orphan_ids: Vec<Id> = task
+        .related_characters
+        .iter()
+        .filter(|cid| !instance_ids.contains(cid))
+        .cloned()
+        .collect();
+
+    if orphan_ids.is_empty() {
+        return None;
+    }
+
+    let filtered: Vec<Id> = task
+        .related_characters
+        .iter()
+        .filter(|cid| instance_ids.contains(cid))
+        .cloned()
+        .collect();
+
+    let actions = vec![TypedPatchAction::PruneOrphanTaskReferences {
+        task_id: task.id.clone(),
+        orphan_character_ids: orphan_ids,
+    }];
+
+    let before_vec: Vec<serde_json::Value> = task
+        .related_characters
+        .iter()
+        .map(|id| serde_json::Value::String(id.to_string()))
+        .collect();
+    let after_vec: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|id| serde_json::Value::String(id.to_string()))
+        .collect();
+
+    let diff = vec![FieldDiff {
+        path: "related_characters".into(),
+        before: serde_json::Value::Array(before_vec),
+        after: serde_json::Value::Array(after_vec),
+    }];
+
+    Some(TypedPatch {
+        id: uuid::Uuid::new_v4().to_string(),
+        description: format!("从任务「{}」移除孤儿角色引用", task.title),
+        source_issue_category: "orphan_task_reference".into(),
+        affected_id: Some(affected_id.into()),
+        actions,
+        diff,
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    })
+}
+
+fn build_variable_schema_mismatch_patch(
+    issue: &HealthIssue,
+    input: &PreviewInput,
+) -> Option<TypedPatch> {
+    let affected_id = issue.affected_id.as_deref()?;
+    let inst = input
+        .instances
+        .iter()
+        .find(|i| i.id.as_str() == affected_id)?;
+
+    let def_id = inst.definition_id.as_ref()?;
+    let def = input.definitions.iter().find(|d| &d.id == def_id)?;
+
+    let schema_keys: std::collections::HashSet<&str> =
+        def.variable_schema.iter().map(|f| f.key.as_str()).collect();
+    let instance_keys: std::collections::HashSet<&str> =
+        inst.variables.iter().map(|v| v.key.as_str()).collect();
+
+    let add_keys: Vec<String> = schema_keys
+        .difference(&instance_keys)
+        .map(|s| s.to_string())
+        .collect();
+    let remove_keys: Vec<String> = instance_keys
+        .difference(&schema_keys)
+        .map(|s| s.to_string())
+        .collect();
+
+    if add_keys.is_empty() && remove_keys.is_empty() {
+        return None;
+    }
+
+    // Build diff entries
+    let mut diff = Vec::new();
+
+    // For add_keys: get default from schema
+    for key in &add_keys {
+        let default_val = def
+            .variable_schema
+            .iter()
+            .find(|f| f.key == *key)
+            .map(|f| f.default.clone())
+            .unwrap_or(serde_json::Value::Null);
+        diff.push(FieldDiff {
+            path: format!("variables[{key}]"),
+            before: serde_json::Value::Null,
+            after: default_val,
+        });
+    }
+
+    // For remove_keys: get current value from instance
+    for key in &remove_keys {
+        let old_val = inst
+            .variables
+            .iter()
+            .find(|v| v.key == *key)
+            .map(|v| v.value.clone())
+            .unwrap_or(serde_json::Value::Null);
+        diff.push(FieldDiff {
+            path: format!("variables[{key}]"),
+            before: old_val,
+            after: serde_json::Value::Null,
+        });
+    }
+
+    let actions = vec![TypedPatchAction::SyncInstanceVariables {
+        instance_id: inst.id.clone(),
+        definition_id: def_id.clone(),
+        add_keys: add_keys.clone(),
+        remove_keys: remove_keys.clone(),
+    }];
+
+    Some(TypedPatch {
+        id: uuid::Uuid::new_v4().to_string(),
+        description: format!(
+            "同步实例「{}」的变量 schema（补 {} 个、删 {} 个字段）",
+            inst.name,
+            add_keys.len(),
+            remove_keys.len()
+        ),
+        source_issue_category: "variable_schema_mismatch".into(),
+        affected_id: Some(affected_id.into()),
+        actions,
+        diff,
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    })
+}
+
+fn apply_action(
+    action: &TypedPatchAction,
+    snapshot: &mut PreviewInputMut,
+) -> Result<(), TypedPatchError> {
+    match action {
+        TypedPatchAction::SyncInstanceVariables {
+            instance_id,
+            definition_id,
+            add_keys,
+            remove_keys,
+        } => {
+            let inst = snapshot
+                .instances
+                .iter_mut()
+                .find(|i| &i.id == instance_id)
+                .ok_or_else(|| {
+                    TypedPatchError::TargetMissing(format!("instance {}", instance_id))
+                })?;
+
+            // Look up the definition to get defaults for add_keys
+            let def_defaults: Vec<(String, serde_json::Value)> = snapshot
+                .definitions
+                .iter()
+                .find(|d| &d.id == definition_id)
+                .map(|def| {
+                    add_keys
+                        .iter()
+                        .filter_map(|key| {
+                            def.variable_schema
+                                .iter()
+                                .find(|f| f.key == *key)
+                                .map(|f| (key.clone(), f.default.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Add missing keys using schema defaults
+            for (key, default_val) in def_defaults {
+                if !inst.variables.iter().any(|v| v.key == key) {
+                    inst.variables.push(storyforge_domain::variables::VariableValue {
+                        key,
+                        value: default_val,
+                        last_updated_turn: 0,
+                    });
+                }
+            }
+
+            // Remove extra keys
+            inst.variables.retain(|v| !remove_keys.contains(&v.key));
+
+            Ok(())
+        }
+        TypedPatchAction::PruneOrphanTaskReferences {
+            task_id,
+            orphan_character_ids,
+        } => {
+            let task = snapshot
+                .tasks
+                .iter_mut()
+                .find(|t| &t.id == task_id)
+                .ok_or_else(|| TypedPatchError::TargetMissing(format!("task {}", task_id)))?;
+
+            task.related_characters
+                .retain(|cid| !orphan_character_ids.contains(cid));
+            Ok(())
+        }
+        TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+            let original_len = snapshot.knowledge.len();
+            snapshot.knowledge.retain(|k| &k.id != knowledge_id);
+            if snapshot.knowledge.len() == original_len {
+                return Err(TypedPatchError::TargetMissing(format!(
+                    "knowledge {}",
+                    knowledge_id
+                )));
+            }
+            Ok(())
+        }
+        TypedPatchAction::RepointInstanceDefinition {
+            instance_id,
+            new_definition_id,
+        } => {
+            let inst = snapshot
+                .instances
+                .iter_mut()
+                .find(|i| &i.id == instance_id)
+                .ok_or_else(|| {
+                    TypedPatchError::TargetMissing(format!("instance {}", instance_id))
+                })?;
+
+            inst.definition_id = new_definition_id.clone();
+            if new_definition_id.is_none() {
+                inst.is_temporary = true;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", chars[..max_chars].iter().collect::<String>())
+    }
+}
+
+// ─── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::campaign::CharacterInstance;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
+    use storyforge_domain::story_task::{StoryTask, TaskTrigger};
+    use storyforge_domain::variables::{self, VariableField, VariableType, VariableValue};
+
+    fn make_def(id: &str) -> CharacterDefinition {
+        CharacterDefinition {
+            id: Id::from_str(id),
+            card_id: Id::from_str("card-1"),
+            name: format!("角色-{id}"),
+            persona_prompt: "测试".into(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: variables::default_character_variables(),
+        }
+    }
+
+    fn make_def_with_custom_schema(id: &str, extra_fields: Vec<VariableField>) -> CharacterDefinition {
+        let mut def = make_def(id);
+        def.variable_schema.extend(extra_fields);
+        def
+    }
+
+    fn make_instance(inst_id: &str, def_id: Option<&str>) -> CharacterInstance {
+        if let Some(d) = def_id {
+            let def = make_def(d);
+            let mut inst = CharacterInstance::from_definition(Id::from_str("camp-1"), &def);
+            inst.id = Id::from_str(inst_id);
+            inst
+        } else {
+            let mut inst = CharacterInstance::temporary(Id::from_str("camp-1"), "临时角色");
+            inst.id = Id::from_str(inst_id);
+            inst
+        }
+    }
+
+    // ── build_patch_for_issue: orphan_instance ────────────────────────────
+
+    #[test]
+    fn test_build_orphan_instance_patch() {
+        let inst = make_instance("inst-1", Some("def-ghost"));
+        let def_real = make_def("def-real");
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Error,
+            category: "orphan_instance".into(),
+            message: "孤立实例".into(),
+            affected_id: Some("inst-1".into()),
+        };
+
+        let input = PreviewInput {
+            instances: &[inst.clone()],
+            definitions: &[def_real],
+            knowledge: &[],
+            tasks: &[],
+        };
+
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert_eq!(patch.source_issue_category, "orphan_instance");
+        assert_eq!(patch.actions.len(), 1);
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "definition_id");
+        assert_eq!(
+            patch.diff[0].before,
+            serde_json::Value::String("def-ghost".into())
+        );
+        assert_eq!(patch.diff[0].after, serde_json::Value::Null);
+        assert_eq!(patch.status, TypedPatchStatus::Pending);
+
+        match &patch.actions[0] {
+            TypedPatchAction::RepointInstanceDefinition {
+                instance_id,
+                new_definition_id,
+            } => {
+                assert_eq!(instance_id.as_str(), "inst-1");
+                assert!(new_definition_id.is_none());
+            }
+            _ => panic!("expected RepointInstanceDefinition"),
+        }
+    }
+
+    // ── build_patch_for_issue: unresolved_knowledge ───────────────────────
+
+    #[test]
+    fn test_build_unresolved_knowledge_patch() {
+        let entry = CharacterKnowledgeEntry::witnessed(
+            Id::from_str("camp-1"),
+            Id::from_str("ghost-char"),
+            "看到了一些奇怪的事情发生在古老的城堡里",
+            1,
+        );
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Warning,
+            category: "unresolved_knowledge".into(),
+            message: "未解析知识".into(),
+            affected_id: Some(entry.id.to_string()),
+        };
+
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[entry.clone()],
+            tasks: &[],
+        };
+
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert_eq!(patch.source_issue_category, "unresolved_knowledge");
+        assert_eq!(patch.actions.len(), 1);
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].after, serde_json::Value::Null);
+        // before should be the serialized entry
+        assert!(patch.diff[0].before.is_object());
+
+        match &patch.actions[0] {
+            TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+                assert_eq!(knowledge_id, &entry.id);
+            }
+            _ => panic!("expected DeleteOrphanKnowledge"),
+        }
+    }
+
+    // ── build_patch_for_issue: orphan_task_reference ──────────────────────
+
+    #[test]
+    fn test_build_orphan_task_reference_patch() {
+        let inst = make_instance("inst-1", Some("def-1"));
+
+        let mut task = StoryTask::user_planned(
+            Id::from_str("camp-1"),
+            "复仇",
+            "老王复仇",
+            vec![TaskTrigger::TurnReminder { at_turn: 10 }],
+            1,
+        );
+        task.related_characters = vec![Id::from_str("inst-1"), Id::from_str("inst-ghost")];
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Warning,
+            category: "orphan_task_reference".into(),
+            message: "孤儿任务引用".into(),
+            affected_id: Some(task.id.to_string()),
+        };
+
+        let input = PreviewInput {
+            instances: &[inst],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[task.clone()],
+        };
+
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert_eq!(patch.source_issue_category, "orphan_task_reference");
+        assert_eq!(patch.actions.len(), 1);
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "related_characters");
+
+        // before should have 2 entries, after should have 1 (only inst-1 remains)
+        if let serde_json::Value::Array(before) = &patch.diff[0].before {
+            assert_eq!(before.len(), 2);
+        } else {
+            panic!("expected array");
+        }
+        if let serde_json::Value::Array(after) = &patch.diff[0].after {
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0], serde_json::Value::String("inst-1".into()));
+        } else {
+            panic!("expected array");
+        }
+
+        match &patch.actions[0] {
+            TypedPatchAction::PruneOrphanTaskReferences {
+                task_id,
+                orphan_character_ids,
+            } => {
+                assert_eq!(task_id, &task.id);
+                assert_eq!(orphan_character_ids.len(), 1);
+                assert_eq!(orphan_character_ids[0].as_str(), "inst-ghost");
+            }
+            _ => panic!("expected PruneOrphanTaskReferences"),
+        }
+    }
+
+    // ── build_patch_for_issue: variable_schema_mismatch ───────────────────
+
+    #[test]
+    fn test_build_variable_schema_mismatch_patch() {
+        let extra = VariableField {
+            key: "custom_var".into(),
+            label: "自定义变量".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(0),
+            description: None,
+            group: Some("状态".into()),
+        };
+        let def = make_def_with_custom_schema("def-1", vec![extra]);
+        let mut inst = CharacterInstance::from_definition(Id::from_str("camp-1"), &def);
+        inst.id = Id::from_str("inst-1");
+        // Remove custom_var from instance to create mismatch
+        inst.variables.retain(|v| v.key != "custom_var");
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Warning,
+            category: "variable_schema_mismatch".into(),
+            message: "变量不一致".into(),
+            affected_id: Some("inst-1".into()),
+        };
+
+        let input = PreviewInput {
+            instances: &[inst.clone()],
+            definitions: &[def],
+            knowledge: &[],
+            tasks: &[],
+        };
+
+        let patch = build_patch_for_issue(&issue, &input).expect("should build patch");
+        assert_eq!(patch.source_issue_category, "variable_schema_mismatch");
+        assert_eq!(patch.actions.len(), 1);
+        // diff should have 1 entry for the missing custom_var
+        assert_eq!(patch.diff.len(), 1);
+        assert_eq!(patch.diff[0].path, "variables[custom_var]");
+        assert_eq!(patch.diff[0].before, serde_json::Value::Null);
+        assert_eq!(patch.diff[0].after, serde_json::json!(0));
+
+        match &patch.actions[0] {
+            TypedPatchAction::SyncInstanceVariables {
+                instance_id,
+                add_keys,
+                remove_keys,
+                ..
+            } => {
+                assert_eq!(instance_id.as_str(), "inst-1");
+                assert!(add_keys.contains(&"custom_var".into()));
+                assert!(remove_keys.is_empty());
+            }
+            _ => panic!("expected SyncInstanceVariables"),
+        }
+    }
+
+    // ── build_patch_for_issue: unknown category → None ────────────────────
+
+    #[test]
+    fn test_build_patch_unknown_category_returns_none() {
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Warning,
+            category: "some_future_category".into(),
+            message: "未知类型".into(),
+            affected_id: None,
+        };
+        let input = PreviewInput {
+            instances: &[],
+            definitions: &[],
+            knowledge: &[],
+            tasks: &[],
+        };
+        assert!(build_patch_for_issue(&issue, &input).is_none());
+    }
+
+    // ── is_patch_stale ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_patch_stale_target_exists() {
+        let inst = make_instance("inst-1", Some("def-1"));
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Error,
+            category: "orphan_instance".into(),
+            message: "孤立".into(),
+            affected_id: Some("inst-1".into()),
+        };
+        let input = PreviewInput {
+            instances: &[inst],
+            definitions: &[make_def("def-1")],
+            knowledge: &[],
+            tasks: &[],
+        };
+        let patch = build_patch_for_issue(&issue, &input).unwrap();
+        assert!(!is_patch_stale(&patch, &input));
+    }
+
+    #[test]
+    fn test_is_patch_stale_target_removed() {
+        let inst = make_instance("inst-1", Some("def-ghost"));
+
+        let issue = HealthIssue {
+            severity: crate::IssueSeverity::Error,
+            category: "orphan_instance".into(),
+            message: "孤立".into(),
+            affected_id: Some("inst-1".into()),
+        };
+        let input_with = PreviewInput {
+            instances: &[inst.clone()],
+            definitions: &[make_def("def-1")],
+            knowledge: &[],
+            tasks: &[],
+        };
+        let patch = build_patch_for_issue(&issue, &input_with).unwrap();
+
+        // Now the instance is removed from the snapshot
+        let input_without = PreviewInput {
+            instances: &[],
+            definitions: &[make_def("def-1")],
+            knowledge: &[],
+            tasks: &[],
+        };
+        assert!(is_patch_stale(&patch, &input_without));
+    }
+
+    // ── apply_to_snapshot: SyncInstanceVariables ──────────────────────────
+
+    #[test]
+    fn test_apply_sync_instance_variables() {
+        let extra = VariableField {
+            key: "custom_var".into(),
+            label: "自定义变量".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(42),
+            description: None,
+            group: Some("状态".into()),
+        };
+        let def = make_def_with_custom_schema("def-1", vec![extra]);
+        let mut inst = CharacterInstance::from_definition(Id::from_str("camp-1"), &def);
+        inst.id = Id::from_str("inst-1");
+        // Remove custom_var, and add an extra key "obsolete"
+        inst.variables.retain(|v| v.key != "custom_var");
+        inst.variables.push(VariableValue::new("obsolete", serde_json::json!("old"), 0));
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "variable_schema_mismatch".into(),
+            affected_id: Some("inst-1".into()),
+            actions: vec![TypedPatchAction::SyncInstanceVariables {
+                instance_id: Id::from_str("inst-1"),
+                definition_id: Id::from_str("def-1"),
+                add_keys: vec!["custom_var".into()],
+                remove_keys: vec!["obsolete".into()],
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        let mut instances = vec![inst];
+        let mut defs = vec![def];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+
+        let updated = &snapshot.instances[0];
+        // custom_var should be added with default value 42
+        let cv = updated.variables.iter().find(|v| v.key == "custom_var");
+        assert!(cv.is_some(), "custom_var should be added");
+        assert_eq!(cv.unwrap().value, serde_json::json!(42));
+        // obsolete should be removed
+        assert!(
+            !updated.variables.iter().any(|v| v.key == "obsolete"),
+            "obsolete should be removed"
+        );
+        // hp should still exist (other variables untouched)
+        assert!(
+            updated.variables.iter().any(|v| v.key == "hp"),
+            "hp should remain"
+        );
+    }
+
+    // ── apply_to_snapshot: PruneOrphanTaskReferences ──────────────────────
+
+    #[test]
+    fn test_apply_prune_orphan_task_references() {
+        let mut task = StoryTask::user_planned(
+            Id::from_str("camp-1"),
+            "复仇",
+            "老王复仇",
+            vec![TaskTrigger::TurnReminder { at_turn: 10 }],
+            1,
+        );
+        task.related_characters = vec![
+            Id::from_str("inst-valid"),
+            Id::from_str("inst-orphan-1"),
+            Id::from_str("inst-orphan-2"),
+        ];
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "orphan_task_reference".into(),
+            affected_id: Some(task.id.to_string()),
+            actions: vec![TypedPatchAction::PruneOrphanTaskReferences {
+                task_id: task.id.clone(),
+                orphan_character_ids: vec![Id::from_str("inst-orphan-1"), Id::from_str("inst-orphan-2")],
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![task];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+
+        let updated = &snapshot.tasks[0];
+        assert_eq!(updated.related_characters.len(), 1);
+        assert_eq!(updated.related_characters[0].as_str(), "inst-valid");
+    }
+
+    // ── apply_to_snapshot: DeleteOrphanKnowledge ──────────────────────────
+
+    #[test]
+    fn test_apply_delete_orphan_knowledge() {
+        let entry_keep = CharacterKnowledgeEntry::witnessed(
+            Id::from_str("camp-1"),
+            Id::from_str("char-1"),
+            "保留的知识",
+            1,
+        );
+        let entry_delete = CharacterKnowledgeEntry::witnessed(
+            Id::from_str("camp-1"),
+            Id::from_str("ghost"),
+            "要删的知识",
+            1,
+        );
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "unresolved_knowledge".into(),
+            affected_id: Some(entry_delete.id.to_string()),
+            actions: vec![TypedPatchAction::DeleteOrphanKnowledge {
+                knowledge_id: entry_delete.id.clone(),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![entry_keep.clone(), entry_delete];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+
+        assert_eq!(snapshot.knowledge.len(), 1);
+        assert_eq!(snapshot.knowledge[0].id, entry_keep.id);
+    }
+
+    // ── apply_to_snapshot: RepointInstanceDefinition ──────────────────────
+
+    #[test]
+    fn test_apply_repoint_instance_definition() {
+        let inst = make_instance("inst-1", Some("def-ghost"));
+        assert_eq!(inst.definition_id.as_ref().unwrap().as_str(), "def-ghost");
+
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "orphan_instance".into(),
+            affected_id: Some("inst-1".into()),
+            actions: vec![TypedPatchAction::RepointInstanceDefinition {
+                instance_id: Id::from_str("inst-1"),
+                new_definition_id: None,
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        let mut instances = vec![inst];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+        };
+
+        apply_to_snapshot(&patch, &mut snapshot).expect("apply should succeed");
+
+        let updated = &snapshot.instances[0];
+        assert!(updated.definition_id.is_none());
+        assert!(updated.is_temporary);
+    }
+
+    // ── apply_to_snapshot: target missing → TargetMissing ─────────────────
+
+    #[test]
+    fn test_apply_target_missing_returns_error() {
+        let patch = TypedPatch {
+            id: "test".into(),
+            description: "test".into(),
+            source_issue_category: "unresolved_knowledge".into(),
+            affected_id: Some("nonexistent".into()),
+            actions: vec![TypedPatchAction::DeleteOrphanKnowledge {
+                knowledge_id: Id::from_str("nonexistent"),
+            }],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: TypedPatchStatus::Pending,
+        };
+
+        let mut instances = vec![];
+        let mut defs = vec![];
+        let mut knowledge = vec![];
+        let mut tasks = vec![];
+        let mut snapshot = PreviewInputMut {
+            instances: &mut instances,
+            definitions: &mut defs,
+            knowledge: &mut knowledge,
+            tasks: &mut tasks,
+        };
+
+        let result = apply_to_snapshot(&patch, &mut snapshot);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TypedPatchError::TargetMissing(msg) => {
+                assert!(msg.contains("nonexistent"));
+            }
+            _ => panic!("expected TargetMissing"),
+        }
+    }
+}
