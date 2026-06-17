@@ -76,6 +76,8 @@ const currentConversationId = ref(null)
 // 会话历史列表
 const conversationHistory = ref([])
 const showHistory = ref(true)
+// 有 active campaign 时首屏显示 campaign 概览（而非会话历史）
+const activeCampaignOverview = ref(true)
 // 连接配置弹层
 const showConnConfig = ref(false)
 // 当前活跃连接（顶栏显示用）
@@ -724,9 +726,9 @@ function handlePipelineEvent(event) {
     >
       <template #actions>
         <button v-if="!showHistory"
-          @click="showHistory = true"
+          @click="showHistory = true; activeCampaignOverview = true"
           class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
-          title="返回会话历史"
+          title="返回首页"
         >
           📜
         </button>
@@ -835,10 +837,39 @@ function handlePipelineEvent(event) {
         <LogPanel />
       </div>
 
-      <!-- 会话历史列表（启动时显示） -->
-      <div v-if="showHistory" class="flex-1 overflow-y-auto p-4">
+      <!-- Campaign 概览（有 active campaign 时首屏优先显示） -->
+      <div v-if="showHistory && activeCampaign && activeCampaignOverview" class="flex-1 overflow-y-auto p-4">
+        <div class="mb-4">
+          <h2 class="text-lg font-semibold text-ink">📜 {{ activeCampaign.name }}</h2>
+          <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mt-1">故事时间：{{ activeCampaign.story_clock }}</p>
+          <p v-if="activeCampaign.created_at" class="text-xs text-ink-soft">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
+        </div>
+        <div class="flex gap-2 mb-6">
+          <button @click="showCampaignPanel = true"
+            class="px-4 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90">
+            进入 Campaign 面板
+          </button>
+          <button @click="startNewConversation"
+            class="px-4 py-2 rounded-lg bg-line text-ink text-sm hover:bg-line/80">
+            ✚ 新对话
+          </button>
+        </div>
+        <div v-if="conversationHistory.length > 0">
+          <button @click="activeCampaignOverview = false"
+            class="text-sm text-ink-soft hover:text-ink mb-3 flex items-center gap-1">
+            📋 查看会话历史 ({{ conversationHistory.length }})
+          </button>
+        </div>
+      </div>
+
+      <!-- 会话历史列表（无 active campaign 或用户主动切换时显示） -->
+      <div v-else-if="showHistory" class="flex-1 overflow-y-auto p-4">
         <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold text-ink">会话历史</h2>
+          <h2 class="text-lg font-semibold text-ink">
+            <button v-if="activeCampaign" @click="activeCampaignOverview = true"
+              class="mr-2 text-ink-soft hover:text-ink" title="返回 Campaign 概览">←</button>
+            会话历史
+          </h2>
           <button @click="startNewConversation"
             class="px-3 py-1.5 text-sm rounded-lg bg-accent text-white hover:opacity-90">
             ✚ 新对话
