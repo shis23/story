@@ -138,9 +138,9 @@
 - `MetaSession`、`PatchStore`、Meta runtime tools 存在。
 - `meta_accept_patch`、`meta_analyze_mvu_card`、`meta_list_mvu_translations` 等 Tauri commands 存在。
 - `mvu_import::analyze_mvu_card` 会产出 `MvuTranslation`，解析失败时走 `pure_data_fallback`。
-- `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations。
+- `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations、Campaign health check（侧栏"Campaign 体检"区块，调 `meta_health_check` Tauri command）。
 
-因此 `PLAN-META-AGENT.md` 和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check、generation explanation、typed patch preview、schema apply、runtime fallback 是后续计划，不是当前已完成能力。
+因此 `PLAN-META-AGENT.md` 和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check（后端 + 前端 MetaPanel 展示）已完成，generation explanation、typed patch preview、schema apply、runtime fallback 是后续计划。
 
 ### 前端工作台
 

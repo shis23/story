@@ -54,7 +54,7 @@
 - 是否存在同名 instance
 - summary turn 是否连续
 - MVU translation 是否存在但未合并 schema
-- 前端 MetaPanel 展示
+- 前端 MetaPanel 展示 ✅（已实现：侧栏"Campaign 体检"区块，运行体检按钮 + issue 列表 + severity 分组）
 
 关键数据结构（确认自 `campaign_store.rs` + domain types）：
 
