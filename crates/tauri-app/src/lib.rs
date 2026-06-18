@@ -69,6 +69,9 @@ fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     })
 }
 
+/// W10: 全局 MVU JS runtime（setup 时初始化，new_pipeline 时注入 PipelineOrchestrator）
+static MVU_RUNTIME: OnceLock<Arc<WebViewMvuRuntime>> = OnceLock::new();
+
 fn get_app_data_dir() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -336,13 +339,16 @@ impl AppState {
             .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
-    /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store）
+    /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store + MVU runtime）
     pub fn new_pipeline(&self) -> PipelineOrchestrator {
         let llm = self.active_llm_or_mock();
         let mut tool_ctx = (*self.snapshot_tool_ctx()).clone();
         // 注入向量存储（search_vectors 工具用）
         tool_ctx.vector_store = Some(self.vector_store.clone());
-        PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx))
+        // W10: 注入 MVU JS runtime（None = setup 未运行或 WebView 不可用，降级）
+        let mvu_rt: Option<Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>> =
+            MVU_RUNTIME.get().cloned().map(|r| r as Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>);
+        PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), mvu_rt)
     }
 }
 
@@ -1549,6 +1555,8 @@ async fn start_writing(
         let var_keys = default_variable_keys();
         // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
+        // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
+        let mvu_fragments = collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
         let outcome = pipeline
             .run_postprocess(
                 &final_text,
@@ -1558,6 +1566,7 @@ async fn start_writing(
                 &ctx,
                 &event_tx,
                 pp_cancel_rx,
+                &mvu_fragments,
             )
             .await;
         // 落盘到 CampaignStore（有 outcome 才落盘）
@@ -1766,6 +1775,74 @@ fn persist_temporary_instances_to(
             camp_id
         );
     }
+}
+
+/// W10: 为在场角色收集 MVU fallback 片段（供 run_postprocess 执行 JS）
+///
+/// 查找链：present_chars → CampaignRuntimeContext.instances → definition_id →
+/// CampaignStore.cards → source_character_id → MvuTranslation.fallback_fragments
+fn collect_mvu_fallback_fragments(
+    ctx: &WritingContext,
+    store: &campaign_store::CampaignStore,
+    present_chars: &[String],
+) -> Vec<storyforge_domain::mvu_translation::FallbackFragment> {
+    let runtime = match &ctx.campaign_runtime {
+        Some(rt) => rt,
+        None => return vec![],
+    };
+
+    // definition_id → source_character_id（从 CampaignStore cards 构建查找表）
+    let def_to_source: std::collections::HashMap<Id, Id> = store
+        .list_cards()
+        .iter()
+        .flat_map(|sc| {
+            let src = sc.card.source_character_id.clone();
+            sc.card
+                .character_definitions
+                .iter()
+                .map(move |d| (d.id.clone(), src.clone()))
+        })
+        .collect();
+
+    let mut fragments = Vec::new();
+    for char_id_str in present_chars {
+        let char_id = Id::from_str(char_id_str);
+        // 在 present_characters 中匹配 instance（by id or name）
+        let inst = runtime
+            .instances
+            .iter()
+            .find(|i| i.id == char_id || i.name == *char_id_str);
+        let inst = match inst {
+            Some(i) => i,
+            None => continue,
+        };
+        let def_id = match &inst.definition_id {
+            Some(d) => d,
+            None => continue,
+        };
+        let source_id = match def_to_source.get(def_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(stored) = store.get_mvu(source_id) {
+            let non_empty: Vec<_> = stored
+                .translation
+                .fallback_fragments
+                .into_iter()
+                .filter(|f| !f.js_snippet.is_empty())
+                .collect();
+            if !non_empty.is_empty() {
+                tracing::info!(
+                    target: "tauri-app",
+                    "[MVU] 角色 '{}' 有 {} 个 fallback 片段",
+                    inst.name,
+                    non_empty.len()
+                );
+                fragments.extend(non_empty);
+            }
+        }
+    }
+    fragments
 }
 
 /// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
@@ -2268,6 +2345,8 @@ async fn regenerate(
             default_variable_keys(),
         );
         let (_pp_tx, pp_rx) = watch::channel(false);
+        // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
+        let mvu_fragments = collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
         let outcome = pipeline
             .run_postprocess(
                 &final_text,
@@ -2277,6 +2356,7 @@ async fn regenerate(
                 &ctx,
                 &event_tx,
                 pp_rx,
+                &mvu_fragments,
             )
             .await;
         if let Some(outcome) = outcome {
@@ -4896,7 +4976,9 @@ pub fn run() {
                 app.handle().clone(),
                 mvu_pending.clone(),
             );
-            app.manage(Arc::new(mvu_rt));
+            // W10: 存入全局 OnceLock，供 new_pipeline 注入到 PipelineOrchestrator
+            let _ = MVU_RUNTIME.set(Arc::new(mvu_rt));
+            app.manage(MVU_RUNTIME.get().unwrap().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

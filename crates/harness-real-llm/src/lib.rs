@@ -128,7 +128,7 @@ impl HarnessEnv {
         let llm = self.llm.clone();
         let mut tool_ctx = (*self.tool_ctx.read().unwrap_or_else(|p| p.into_inner())).clone();
         tool_ctx.vector_store = Some(self.vector_store.clone());
-        PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx))
+        PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), None)
     }
 
     /// 当前活跃 Campaign id。
