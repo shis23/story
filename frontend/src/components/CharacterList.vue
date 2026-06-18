@@ -52,8 +52,8 @@ async function handleDelete(char, event) {
 </script>
 
 <template>
-  <div class="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm flex items-center justify-center p-2" @click.self="emit('close')">
-    <div class="bg-surface w-full max-w-md max-h-[80vh] rounded-2xl overflow-hidden flex flex-col">
+  <div class="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center" @click.self="emit('close')">
+    <div class="bg-surface w-full max-w-md max-h-[85vh] sm:max-h-[80vh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-line flex flex-col">
       <!-- 顶栏 -->
       <div class="px-4 py-3 border-b border-line flex items-center gap-2 shrink-0">
         <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>

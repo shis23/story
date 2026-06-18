@@ -18,11 +18,11 @@ const statusMeta = {
 
 function meta(s) { return statusMeta[s] || statusMeta.idle }
 
-// ─── 折叠状态 ──────────────────────────────────────────────────────────
-const expandedDirector = ref(true)
+// ─── 折叠状态（默认折叠，移动端避免长文本撑开） ──────────────────────────
+const expandedDirector = ref(false)
 const expandedSubagents = ref(true)
-const expandedEditor = ref(true)
-const expandedPostprocess = ref(true)
+const expandedEditor = ref(false)
+const expandedPostprocess = ref(false)
 
 // 子 Agent 展开状态（用 Set 追踪展开的 index）
 const expandedSubagentIndices = ref(new Set())
@@ -120,12 +120,15 @@ function isSubagentExpanded(index) {
                 <span class="text-[11px]">{{ meta(sub.status).label }}{{ sub.status === 'running' ? ' ' + sub.progress + '%' : '' }}</span>
               </div>
             </button>
-            <!-- 子 Agent 展开输出 -->
-            <div v-if="isSubagentExpanded(i) && sub.output" class="px-2 pb-2">
-              <pre class="p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border border-line/50">{{ sub.output }}</pre>
-            </div>
-            <div v-else-if="isSubagentExpanded(i) && !sub.output && sub.status !== 'running'" class="px-2 pb-2">
-              <div class="text-[11px] text-ink-soft/50 italic px-2">暂无输出</div>
+            <!-- 子 Agent 展开详情 -->
+            <div v-if="isSubagentExpanded(i)" class="px-2 pb-2 space-y-1">
+              <!-- 实例 ID（当 name 与 id 不同时显示） -->
+              <div v-if="sub.id && sub.name && sub.id !== sub.name" class="text-[10px] text-ink-soft/50 px-2">
+                ID: {{ sub.id }}
+              </div>
+              <!-- 输出 -->
+              <pre v-if="sub.output" class="p-2 bg-bg rounded-lg text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed border border-line/50">{{ sub.output }}</pre>
+              <div v-else-if="sub.status !== 'running'" class="text-[11px] text-ink-soft/50 italic px-2">暂无输出</div>
             </div>
           </div>
         </div>
