@@ -57,7 +57,8 @@
 - ✅ I1 对抗性探针实跑通过（`deepseek-v4-flash`）：对抗 prompt 成功诱导 LLM 尝试越权查询 `get_character("Chen")`，被 P0 拦下返回 NotFound，成文拿不出真秘密——隔离在 LLM 行为层端到端生效。
 - ✅ P3：知识写回门禁按 `KnowledgeSource` 分流——`Witnessed`/`Inferred` 受在场约束，`ToldByOther`/`Backstory` 放行（跨在场告知/开局知识）。空集不再 hack 式全放行。
 - ✅ P4：同名 instance 时 name 匹配路失效逼 id，消除同名写串。
-- ⏳ 知识传播引擎（身份组广播/传话链/秘密封口）单独立项 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`，作为 Phase 2 增强项。
+- ✅ 知识传播引擎方向 1+3（2026-06-19）：显式广播（`BroadcastTarget::All/Group` 分发到多角色）+ 定向告知强化（postprocess 输出告知目标，读侧带告知者名字）。广播/告知不再依赖空集 hack。
+- ⏳ 知识传播引擎方向 2/4/5（身份组广播/传话链/秘密封口）待立项，见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
 
 详细计划见：
 
@@ -91,24 +92,24 @@
 
 ## Phase 4: 前端工作台重构
 
-**状态：进行中**（阶段 1/2/5 完成、3/4/6 未开始；约 45%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：基本完成**（阶段 1/2/3/4/5/6 全部完成；约 95%，2026-06-19 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：让前端围绕 Campaign 工作流，而不是围绕零散面板。
 
 任务：
 
-- 首屏聚焦 active campaign。
-- 写作入口绑定 active campaign。
-- Campaign 面板拆成角色实例、变量、知识、任务、摘要标签页。
-- PipelinePanel 做成可检查的 Agent trace。
-- MetaPanel 和 Campaign health check 打通。
-- 对移动端布局做一次专项整理。
+- ~~首屏聚焦 active campaign。~~ ✅ 阶段 1
+- ~~写作入口绑定 active campaign。~~ ✅ 阶段 2：`writingMode` 三态（campaign/legacy/none），Campaign 模式传 null characterId
+- ~~Campaign 面板拆成角色实例、变量、知识、任务、摘要标签页。~~ ✅ 阶段 3：拆成 4 个独立 tab 组件 + 变量类型化显示 + 修复知识/摘要字段名静默 bug
+- ~~PipelinePanel 做成可检查的 Agent trace。~~ ✅ 阶段 4：subagent trace 用 instance display name，reroll 用稳定 id
+- ~~MetaPanel 和 Campaign health check 打通。~~ ✅ 阶段 5
+- ~~对移动端布局做一次专项整理。~~ ✅ 阶段 6：Pipeline 默认折叠、CharacterList 底部 sheet
 
 验收：
 
-- 新用户导入卡 -> 创建 Campaign -> 写第一轮的路径清晰。
-- 调试用户能看到每个 Agent 的输入输出摘要。
-- 移动端不依赖桌面宽屏才能操作主流程。
+- ✅ 新用户导入卡 -> 创建 Campaign -> 写第一轮的路径清晰（阶段 1/2）。
+- ✅ 调试用户能看到每个 Agent 的输入输出摘要（阶段 4 trace 用 display name）。
+- ✅ 移动端不依赖桌面宽屏才能操作主流程（阶段 6）。
 
 详细计划见 `docs/PLAN-FRONTEND-WORKBENCH.md`。
 
