@@ -4,6 +4,8 @@ import { useTheme } from '../useTheme.js'
 defineProps({
   powerMode: { type: Boolean, default: false },
   activeCharName: { type: String, default: null },
+  activeCampaignName: { type: String, default: null },
+  writingMode: { type: String, default: 'none' }, // 'campaign' | 'legacy' | 'none'
 })
 const emit = defineEmits(['toggle-power', 'open-campaign', 'open-meta'])
 const { theme, toggle: toggleTheme } = useTheme()
@@ -12,14 +14,21 @@ const { theme, toggle: toggleTheme } = useTheme()
 <template>
   <header class="sticky top-0 z-20 backdrop-blur-md bg-surface/80 border-b border-line">
     <div class="px-4 py-3 flex items-center gap-2">
-      <!-- 角色头像与名字 -->
+      <!-- 角色/Campaign 头像与名字 -->
       <div class="flex items-center gap-3 flex-1 min-w-0">
-        <div class="w-10 h-10 rounded-full bg-accent-soft flex items-center justify-center text-xl shrink-0">
-          {{ activeCharName ? activeCharName.charAt(0) : currentCharacter.avatar }}
+        <div class="w-10 h-10 rounded-full flex items-center justify-center text-xl shrink-0"
+          :class="writingMode === 'campaign' ? 'bg-green-500/20' : 'bg-accent-soft'">
+          {{ writingMode === 'campaign' ? '🎪' : (activeCharName ? activeCharName.charAt(0) : currentCharacter.avatar) }}
         </div>
         <div class="min-w-0">
-          <div class="font-medium text-ink truncate">{{ activeCharName || currentCharacter.name }}</div>
-          <div class="text-xs text-ink-soft truncate">{{ activeCharName ? '已选择' : currentCharacter.tagline }}</div>
+          <div class="font-medium text-ink truncate">
+            {{ writingMode === 'campaign' ? activeCampaignName : (activeCharName || currentCharacter.name) }}
+          </div>
+          <div class="text-xs text-ink-soft truncate">
+            <template v-if="writingMode === 'campaign'">Campaign 写作</template>
+            <template v-else-if="writingMode === 'legacy'">已选择 · 兼容模式</template>
+            <template v-else>{{ currentCharacter.tagline }}</template>
+          </div>
         </div>
       </div>
 

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import AppHeader from './components/AppHeader.vue'
 import ChatMessage from './components/ChatMessage.vue'
 import Composer from './components/Composer.vue'
@@ -67,6 +67,19 @@ function scrollToBottom() {
       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
     }
   })
+}
+
+// 写作模式：campaign = Campaign 写作，legacy = ST 单卡兼容，none = 无法写作
+const writingMode = computed(() => {
+  if (activeCampaign.value) return 'campaign'
+  if (activeChar.value) return 'legacy'
+  return 'none'
+})
+
+// 获取 AI 消息的 role_label（Campaign 模式用 Campaign 名，legacy 用角色名）
+function getAssistantRoleLabel() {
+  if (writingMode.value === 'campaign') return activeCampaign.value?.name || 'AI'
+  return activeChar.value?.name || 'AI'
 }
 
 // 是否有流水线运行中（用于禁用重 roll / 显示停止按钮）
@@ -284,6 +297,11 @@ async function startWriting(intent, skipLocalPush = false) {
     showConnConfig.value = true
     return
   }
+  // 三态检查：有 Campaign → Campaign 写作；无 Campaign 有角色 → legacy；都没有 → 阻止
+  if (writingMode.value === 'none') {
+    alert('请先导入角色卡或打开一个 Campaign，再开始写作。')
+    return
+  }
   // 防止并发写入
   if (isWriting.value) return
   showPipeline.value = true
@@ -317,7 +335,10 @@ async function startWriting(intent, skipLocalPush = false) {
   }
 
   try {
-    const result = await apiStartWriting(intent, activeChar.value?.id, (event) => {
+    // Campaign 模式不传 characterId（后端从 active campaign 装配 runtime）；
+    // legacy 模式传 activeChar.id 保持旧命令兼容
+    const charIdForWriting = writingMode.value === 'campaign' ? null : activeChar.value?.id
+    const result = await apiStartWriting(intent, charIdForWriting, (event) => {
       handlePipelineEvent(event)
     }, currentConversationId.value)
 
@@ -335,7 +356,9 @@ async function startWriting(intent, skipLocalPush = false) {
     messages.value.push({
       id: msgId,
       role: 'assistant',
-      role_label: activeChar.value?.name || 'AI',
+      role_label: writingMode.value === 'campaign'
+        ? (activeCampaign.value?.name || 'AI')
+        : (activeChar.value?.name || 'AI'),
       active_variant: 0,
       variants: [{
         id: `v-${Date.now()}`,
@@ -414,12 +437,10 @@ async function handleReroll({ messageId, kind, hint }) {
     const refreshed = await getConversation(currentConversationId.value)
     if (refreshed) {
       applyConversation(refreshed)
-      // 保留用户当前的角色卡 role_label 覆盖（applyConversation 重置为 AI/我）
-      if (activeChar.value) {
-        messages.value.forEach((m) => {
-          if (m.role === 'assistant') m.role_label = activeChar.value.name
-        })
-      }
+      // 保留 role_label 覆盖（applyConversation 重置为 AI/我）
+      messages.value.forEach((m) => {
+        if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+      })
     }
 
     pipeline.state = 'done'
@@ -476,11 +497,9 @@ async function handleDeleteVariant({ nodeId }) {
     const refreshed = await getConversation(currentConversationId.value)
     if (refreshed) {
       applyConversation(refreshed)
-      if (activeChar.value) {
-        messages.value.forEach((m) => {
-          if (m.role === 'assistant') m.role_label = activeChar.value.name
-        })
-      }
+      messages.value.forEach((m) => {
+        if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+      })
     }
     // 清流水线状态（删除 = 回到这条之前的状态，上次写作的导演/子Agent/编剧输出作废）
     pipeline.state = 'idle'
@@ -535,11 +554,9 @@ async function handleRerollUser({ messageId }) {
     const refreshed = await getConversation(currentConversationId.value)
     if (refreshed) {
       applyConversation(refreshed)
-      if (activeChar.value) {
-        messages.value.forEach((m) => {
-          if (m.role === 'assistant') m.role_label = activeChar.value.name
-        })
-      }
+      messages.value.forEach((m) => {
+        if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+      })
     }
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'done'
@@ -651,7 +668,9 @@ function handlePipelineEvent(event) {
       messages.value.push({
         id: 'editor-streaming',
         role: 'assistant',
-        role_label: activeChar.value?.name || 'AI',
+        role_label: writingMode.value === 'campaign'
+          ? (activeCampaign.value?.name || 'AI')
+          : (activeChar.value?.name || 'AI'),
         active_variant: 0,
         variants: [{
           id: 'es-v1',
@@ -720,6 +739,8 @@ function handlePipelineEvent(event) {
     <AppHeader
       :power-mode="powerMode"
       :active-char-name="activeChar?.name"
+      :active-campaign-name="activeCampaign?.name"
+      :writing-mode="writingMode"
       @toggle-power="powerMode = !powerMode"
       @open-campaign="showCampaignPanel = true"
       @open-meta="showMetaPanel = true"
@@ -776,9 +797,30 @@ function handlePipelineEvent(event) {
 
     <!-- 主滚动区 -->
     <main class="flex-1 overflow-y-auto">
-      <!-- 当前角色卡（可点击查看详情） -->
+      <!-- Campaign 模式指示（有 active Campaign 时显示） -->
       <div
-        v-if="activeChar"
+        v-if="writingMode === 'campaign'"
+        @click="showCampaignPanel = true"
+        class="mx-4 mt-3 p-3 bg-green-500/10 rounded-xl border border-green-500/30 cursor-pointer hover:bg-green-500/15 transition-colors"
+      >
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-full bg-green-500 text-white flex items-center justify-center text-sm shrink-0">
+            🎪
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium text-green-700 truncate">{{ activeCampaign.name }}</div>
+            <div class="text-[11px] text-green-600/70">
+              Campaign 写作模式
+              <span v-if="activeCampaign.story_clock"> · {{ activeCampaign.story_clock }}</span>
+            </div>
+          </div>
+          <span class="text-xs text-green-600/50">管理 →</span>
+        </div>
+      </div>
+
+      <!-- Legacy 兼容模式（无 Campaign 但有角色卡） -->
+      <div
+        v-else-if="writingMode === 'legacy'"
         @click="showCharDetail = true"
         class="mx-4 mt-3 p-3 bg-accent-soft/50 rounded-xl border border-accent-border cursor-pointer hover:bg-accent-soft transition-colors"
       >
@@ -787,7 +829,10 @@ function handlePipelineEvent(event) {
             {{ activeChar.name?.charAt(0) || '?' }}
           </div>
           <div class="flex-1 min-w-0">
-            <div class="text-sm font-medium text-accent truncate">{{ activeChar.name }}</div>
+            <div class="text-sm font-medium text-accent truncate">
+              {{ activeChar.name }}
+              <span class="ml-1.5 inline-block px-1.5 py-0.5 text-[10px] rounded bg-warn/15 text-warn align-middle">兼容模式</span>
+            </div>
             <div class="text-[11px] text-ink-soft">
               ST {{ activeChar.spec_version }} · {{ activeChar.world_info_count }} 条世界书
               <span v-if="activeChar.has_renderable_assets"> · 🎨</span>
@@ -797,10 +842,10 @@ function handlePipelineEvent(event) {
         </div>
       </div>
 
-      <!-- 未选择角色时的提示 -->
+      <!-- 未选择角色也没有 Campaign 时的提示 -->
       <div v-else class="mx-4 mt-3 p-4 bg-bg rounded-xl border border-dashed border-line text-center">
-        <div class="text-ink-soft text-sm">还没有选择角色卡</div>
-        <div class="text-xs text-ink-soft/60 mt-1">点 📥 导入或 📋 选择</div>
+        <div class="text-ink-soft text-sm">还没有选择角色卡或打开 Campaign</div>
+        <div class="text-xs text-ink-soft/60 mt-1">点 📥 导入角色卡，或 🎪 创建 Campaign</div>
       </div>
 
       <!-- 导入错误 -->
@@ -931,7 +976,11 @@ function handlePipelineEvent(event) {
     </div>
 
     <!-- 底部输入栏 -->
-    <Composer @start-writing="startWriting" :disabled="isWriting" />
+    <Composer
+      @start-writing="startWriting"
+      :disabled="isWriting || writingMode === 'none'"
+      :placeholder="writingMode === 'none' ? '请先导入角色卡或打开 Campaign…' : ''"
+    />
 
     <!-- 版本号 -->
     <div class="text-center text-[10px] text-ink-soft/40 pb-1">v{{ appVersion }}</div>

@@ -4,6 +4,7 @@ import { sampleIntent } from '../mock.js'
 
 const props = defineProps({
   disabled: { type: Boolean, default: false },
+  placeholder: { type: String, default: '' },
 })
 
 const emit = defineEmits(['start-writing'])
@@ -23,7 +24,7 @@ function submit() {
     <div class="flex items-end gap-2 bg-bg rounded-2xl border border-line px-3 py-2 focus-within:border-accent transition-colors">
       <textarea
         v-model="intent"
-        :placeholder="disabled ? '写作中…' : sampleIntent"
+        :placeholder="placeholder || (disabled ? '写作中…' : sampleIntent)"
         :disabled="disabled"
         rows="1"
         class="flex-1 bg-transparent resize-none outline-none text-[15px] text-ink placeholder:text-ink-soft/50 max-h-32 disabled:opacity-50"
