@@ -3355,13 +3355,17 @@ dependencies = [
 name = "storyforge-infra-plugin-host"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
  "storyforge-domain",
  "storyforge-infra-util",
+ "tauri",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

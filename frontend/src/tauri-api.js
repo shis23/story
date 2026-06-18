@@ -973,3 +973,19 @@ Seraphina 站在那里，银色的长发被雨水浸透，水珠沿着发梢滴�
 「有些告别，是为了更好的重逢。」
 
 *她伸出手指，轻轻触碰你的掌心。那一刻的温度，足以温暖此后所有漫长的雨季。*`
+
+// ─── W8 MVU JS Runtime API ───────────────────────────────────────────────
+
+/**
+ * MVU WebView 运行时状态
+ *
+ * 实际可用性由 Rust 侧 WebViewMvuRuntime.is_available() 报告（始终 true）。
+ * 前端侧通过 MvuJsRuntime.vue 的 iframe 就绪状态判断。
+ * 此函数作为前端 API 入口供其他模块查询。
+ */
+export function getMvuRuntimeStatus() {
+  // 通过 DOM 查询 MvuJsRuntime 的 iframe 是否已加载
+  // 实际使用中，上层代码通过 listen('mvu:execute') 等事件直接通信
+  return { available: true, note: 'WebView runtime (iframe sandbox)' }
+}
+

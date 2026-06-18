@@ -27,7 +27,9 @@ use storyforge_domain::llm::{
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
+use storyforge_infra_plugin_host::mvu_runtime::{WebViewMvuRuntime, MvuExecuteResponse};
 use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
+use tauri::Manager;
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -4610,6 +4612,53 @@ fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
         .collect()
 }
 
+// ─── W8 MVU JS Runtime 命令 ─────────────────────────────────────────────
+
+/// MVU pending 请求 map 类型（由 WebViewMvuRuntime 管理，command handler 通过 Tauri state 访问）
+type MvuPendingMap = Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<MvuExecuteResponse>>>>;
+
+/// 前端确认 unload 完成
+#[tauri::command]
+async fn mvu_unload_ack() -> Result<(), String> {
+    tracing::debug!("[MVU] unload ack received");
+    Ok(())
+}
+
+/// 前端确认 load assets 完成
+#[tauri::command]
+async fn mvu_load_ack(error: Option<String>) -> Result<(), String> {
+    if let Some(err) = error {
+        tracing::warn!("[MVU] load assets error: {err}");
+    } else {
+        tracing::debug!("[MVU] load ack received");
+    }
+    Ok(())
+}
+
+/// 前端回传 execute 结果（完成 WebViewMvuRuntime 的 pending oneshot）
+#[tauri::command]
+async fn mvu_execute_result(
+    pending: tauri::State<'_, MvuPendingMap>,
+    request_id: String,
+    variable_updates: std::collections::HashMap<String, serde_json::Value>,
+    side_effects: Vec<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    let response = MvuExecuteResponse {
+        request_id: request_id.clone(),
+        variable_updates,
+        side_effects,
+        error,
+    };
+    let mut map = pending.lock().await;
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send(response);
+    } else {
+        tracing::warn!("[MVU] mvu_execute_result: unknown request_id {request_id}");
+    }
+    Ok(())
+}
+
 // ─── Tauri app 入口 ────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -4617,10 +4666,23 @@ pub fn run() {
     let app_state = Arc::new(AppState::new());
     storyforge_app_logging::init_tracing(app_state.log_store.clone());
 
+    // W8 MVU JS Runtime：共享 pending map
+    let mvu_pending: MvuPendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
+        .manage(mvu_pending.clone())
+        .setup(move |app| {
+            // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
+            let mvu_rt = WebViewMvuRuntime::with_shared_pending(
+                app.handle().clone(),
+                mvu_pending.clone(),
+            );
+            app.manage(Arc::new(mvu_rt));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // M0 角色卡命令
             import_character,
@@ -4737,6 +4799,10 @@ pub fn run() {
             meta_preview_typed_patch,
             meta_accept_typed_patch,
             meta_dismiss_typed_patch,
+            // W8 MVU JS Runtime 命令
+            mvu_unload_ack,
+            mvu_load_ack,
+            mvu_execute_result,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
