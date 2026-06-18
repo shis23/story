@@ -10,9 +10,11 @@
 |---|---|---|---|---|
 | F1 | LLM model 名透传断链——连接配的 model 被忽略 | 🔴 High | Bug（影响所有用户） | **已修**（`HttpLlmClient.effective_model` + wrapper 已删） |
 | F2 | 角色识别 Agent 输出解析降级（emit_characters 5 层兜底全 miss） | 🟠 Medium | Bug（runtime/loop） | **已修**（terminal_tools 终止机制 + 真实 LLM 验证） |
+| F3 | MVU apply backfill loop 死代码（card.id 当 campaign_id） | 🔴 High | Bug（生产死代码） | **已修**（`list_all_instances` + definition_id 过滤） |
 | P0 | 子 agent get_character 绑定-unresolvable 读侧泄漏 | 🟠 Medium | Bug（defense-in-depth） | **已修 + B0 钉测** |
-| P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟡 Low | 设计取舍 | **已加 warn 日志**（行为不变，可观测性提升） |
-| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **已加 debug 日志**（id 优先 + name 匹配时 warn） |
+| P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟠 Medium | **设计缺陷**（门禁按"在场"一刀切所有来源） | **重定位**：非"收紧/保留"取舍，根因是门禁不区分知识来源。最小修复=按 `KnowledgeSource` 分流（见 §P3）。完整"知识传播引擎"单独立项 `PLAN-KNOWLEDGE-PROPAGATION.md` |
+| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **待修**（方案A：同名时 name 路失效逼 id） |
+| T3 | `t3_regenerate_all` 吞错误致测试假绿 | 🟡 Low | 测试质量 | **已修**（`regenerate_with_retry` 只对 `Llm` 重试 + 严格断言） |
 | 验证 | 知识边界读侧隔离（volatile tail / get_character / temp instance） | ✅ | 验证通过 | 4/4 钉测绿 |
 
 ## 🔴 F1：LLM model 名透传断链
@@ -82,6 +84,24 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 - 真实 LLM T1 验证：`extract_characters Ok: 1 definitions (正常解析路径)`，Seraphina 卡正确识别，`tool_calls[0].name == "emit_characters"`。
 - `cargo test --workspace` 全绿，0 回归。
 
+## 🔴 F3：MVU apply backfill loop 死代码（已修）
+
+**现象**：`meta_apply_mvu_schema`（`tauri-app/src/lib.rs` `meta_apply_mvu_schema` 命令体）写完 card definition 后，本应对已存在的角色实例补齐 MVU 新增变量，但该 backfill loop **在生产环境永不执行**——是死代码。
+
+**根因**：backfill loop 用 `store.list_instances(&card.id)`，而 `CampaignStore::list_instances(campaign_id)` 按 `instance.campaign_id == *campaign_id` 过滤（campaign_store.rs:254-262）。传入的 `card.id` 是 **card_id**，instance 的 `campaign_id` 字段永远不等于任何 `card.id` → 过滤恒为空 → loop 体永不执行。
+
+**影响**：用户在前端应用 MVU 合并 schema 后，card definition 更新了，但**已存在的角色实例不会自动补齐新变量**（`VariableValue`）。后果是实例与新 schema 不一致——后续读写实例变量会缺字段。这是审计标的"dead UI surface"背后的真实 bug。
+
+**复现**：任何"已有实例的卡 → analyze MVU → apply schema"流程，实例 variables 不增长。
+
+**harness 假绿陷阱**：Round 2 的 C7 测试 `c7_mvu_apply_backfill`（c_command_layer.rs）**用正确的 `campaign_id`** 复刻了 loop 结构，测试绿——但它测的是生产永远走不到的路径，掩盖了这个 bug。
+
+**修复（c0456aa）**：
+- `lib.rs` backfill loop 改用 `store.list_all_instances()`（全量）+ 保留 `definition_id` 过滤条件（instance 与 definition 的关联本就该按 definition_id，一张卡的 definition 可被多个 campaign 引用，全部都该 backfill）。
+- 同步 `c7_mvu_apply_backfill` 测试复刻新生产路径（`list_all_instances`），消除假绿。
+- 加注释钉死历史 bug，防回退。
+- `cargo test --workspace` 全绿，0 回归。
+
 ## 🟠 P0：子 agent get_character 绑定-unresolvable 读侧泄漏（已修）
 
 **现象**：子 agent 的 `current_character_instance_id=Some` 且 `campaign_runtime=Some`，但绑定 id 在 `runtime.instances` 中找不到时，旧实现 fallthrough 到未隔离的扁平 `ctx.characters` 搜索，泄漏其他角色数据。
@@ -94,16 +114,39 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 
 **钉测**：`test_subagent_get_character_bound_but_unresolvable_does_not_leak`（`app-agent/src/tools.rs`）。**80 个 app-agent 测试全绿，0 回归**。
 
-## 🟡 P3：postprocess 写回空集逃生口
+## 🟠 P3：postprocess 写回门禁用"在场"一刀切所有知识来源（重定位）
 
-**现象**：`is_postprocess_instance_present`（`tauri-app/src/lib.rs:1946`）在 `present_ids.is_empty()` 时返回 `true`——所有 instance 的知识/变量写回都通过，无在场校验。这是"向后兼容"逃生口。
+**原定性**（Round 1）：空集逃生口，`present_ids.is_empty() → 全放行`，标为"收紧/保留"取舍。
 
-**影响**：postprocess 在 Director 的 plan 为空（`present_chars` 空）时，可写任意角色知识/变量，无在场约束。
+**重定位**（2026-06-18，经用户场景质询推翻"收紧"建议）：这不是取舍问题，是**门禁用了错误的判据**。`is_postprocess_instance_present`（`tauri-app/src/lib.rs:1947`）对**所有来源**的知识写入都套"在场"约束，但知识来源不同，传播规则本就该不同：
 
-**当前行为钉测**：`b3_empty_present_chars_escape_hatch_current_behavior`（绿，记录当前放行行为）。
-**期望行为占位**：`b3_empty_present_chars_should_reject_when_tightened`（`#[ignore]`，收紧后翻转）。
+| `KnowledgeSource` | 该不该受"在场"约束 | 理由 |
+|---|---|---|
+| `Witnessed`（亲眼所见） | **该** | 不在场不可能亲眼见 |
+| `Inferred`（推断） | **该** | 推断基于自己已知，不跨人 |
+| `ToldByOther`（被告知） | **不该** | 告知本就是跨在场传播（写信/密语/传话） |
+| `Backstory`（背景） | **不该** | 开局就有，与在场无关 |
 
-**未改业务行为**——空集逃生口有向后兼容理由，待用户拍板是否收紧为"空集也拒绝"。若收紧，改 `is_postprocess_instance_present` 的 `present_ids.is_empty()` 分支即可。
+（数据模型见 `domain/src/character_knowledge.rs:17` `KnowledgeSource` 枚举，`ToldByOther` 已记 `source_character_id`。）
+
+**用户场景质询（推翻"收紧"的关键）**：
+- **世界公告/广播**：N 个角色都该知道，与在场无关。现状靠空集逃生口 hack 全放行——收紧会杀掉这个唯一能跑通的路径。
+- **身份组传播**：所有守卫/贵族该知道。`Character.group` / `role_type` 字段已存在，门禁和写入都不读它。
+- **定向告知/写信**：A 明确告诉不在场的 B。`ToldByOther` 数据模型已支持，但门禁把不在场的 B 拦掉，B 永远收不到信。
+
+**根因**：门禁对 `ToldByOther`/`Backstory` 走"在场"判定 = 用错误判据。空集逃生口是这套错误判据的**症状补丁**，不是病根。
+
+**最小正确修复（P3，worktree w3-p3p4 执行）**：门禁按 `KnowledgeSource` 分流，不收紧不保留：
+- `present_ids` 空 + `Witnessed`/`Inferred` → **拒绝**（真 bug：没人在场不可能有见证/推断）
+- `present_ids` 空 + `ToldByOther`/`Backstory` → **放行**（告知面向不在场的人，合理）
+- `present_ids` 非空 → 现有 id 路判定（+ P4 同名收紧）
+
+此修复让广播/告知天然成立，**不再依赖空集 hack**，且不需新数据模型——只改门禁 + postprocess 把来源传进来。
+
+**完整"知识传播引擎"单独立项**：身份组广播、传话链（A→B→C）、秘密封口（禁止传播）是更大的功能，超 P3 范围。详见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`（本 worktree 新增），纳入 ROADMAP 作为 Phase 2 隔离增强项。
+
+**当前行为钉测**：`b3_empty_present_chars_escape_hatch_current_behavior`（绿，记录当前全放行）。
+**期望行为占位**：`b3_empty_present_chars_should_reject_when_tightened`（`#[ignore]`）—— 分流落地后此测试需重写为"按来源分流"断言，而非简单翻转。
 
 ## 🟡 P4：postprocess 写回 name/id 三路匹配别名风险
 
@@ -111,7 +154,7 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 
 **钉测**：`b4_present_chars_name_id_matching`（绿，正常 name/id 匹配）+ `b4_name_collision_both_pass`（绿，记录同名歧义行为）。
 
-**未改**——name 匹配是 postprocess Agent 按名字输出的既有契约。建议：postprocess 输出统一用 instance_id 而非 name，或同名时强制 id 路匹配。待定。
+**待修（方案A，worktree w3-p3p4 执行）**：保留 name 兜底（不让 postprocess 瘫痪——它按名字输出是既有契约），但在**同名场景**强制走 id：检测到 Campaign 内存在同名 instance 时，name 路失效，逼上游/Director 用 instance_id。比"全删 name 路"（方案B，需改 postprocess 输出链路）更小、更安全。
 
 ## ✅ 验证通过：知识边界读侧隔离
 
@@ -122,7 +165,7 @@ harness 用合成 2 角色 campaign（Lin + Chen，各有私有知识）钉了�
 - **临时 instance 隔离**：temp instance 子 agent 查常驻 Lin → NotFound；temp 的 volatile tail 不含常驻角色私有知识。
 - **无绑定不误触发 P0 硬失败**：`current_character_instance_id=None`（Director/Editor 语义）时不触发 P0 的"绑定-unresolvable"硬失败。
 
-**未覆盖（需真实 LLM 对抗性探针）**：子 agent 在对抗性 prompt 诱导下（"你记得 Chen 告诉你的秘密"）是否仍攻不破隔离。读侧 wiring 已证正确，LLM 行为层探针（I1）待写——这是确定性测试无法覆盖的，需真实 LLM 跑。
+**未覆盖（需真实 LLM 对抗性探针）**：子 agent 在对抗性 prompt 诱导下（"你记得 Chen 告诉你的秘密"）是否仍攻不破隔离。读侧 wiring 已证正确，LLM 行为层探针（I1）**已写**（`tests/i1_adversarial.rs`，`#[ignore]`）但**未实跑**——这是确定性测试无法覆盖的，需真实 LLM 跑（见 worktree w2-i1）。
 
 ## harness 产物
 
@@ -171,3 +214,21 @@ LLM_BASE_URL='...' LLM_API_KEY='...' LLM_MODEL='...' \
 - **T2 实跑**：3 轮 append 全部通过（deepseek-v4-flash，459s）。
 - **T3 实跑**：`regenerate_all` + `regenerate_editor_only` 通过；`regenerate_director_only` 修正为期望拒绝（业务约束：Plan 变了旧子产出不匹配）。
 - `cargo test --workspace` 全绿，0 回归。
+
+### Round 2 审计与补修（2026-06-18，commit 36eccaf + c0456aa）
+
+Round 2 执行后逐条核实代码，发现 1 个真 bug 和 1 个被削弱的测试，已修：
+
+- **F3 backfill 死代码**（见 §F3）：C7 测试用正确 `campaign_id` 复刻 loop → 假绿，掩盖了生产 `lib.rs` 误用 `card.id` 的死代码。改 `list_all_instances()` + definition_id 过滤，同步测试复刻新路径。
+- **T3 `regenerate_all` 吞错误**：Round 2 用 `match` 吞所有 `Err` 跳过断言 → 真 bug 也判绿。改 `regenerate_with_retry`（只对 `PipelineError::Llm` 瞬态错误重试 3 次，业务错误立即 panic）+ 严格断言。`editor_only` 同步用 helper。
+- **director_only 翻断言核实为正确**：审计确认 `validate_partial_roll`（app-conversation:488）确有"不能只重导演却保留旧子产出"约束，原 Round 1 `is_ok()` 才错（`#[ignore]` 从没真跑过）。仅修正过时注释。
+- **F2 terminal_tools 核实为正确**：`AgentConfig.terminal_tools` + 双路检查 + 单测 + character_extractor 接线均核实，根因诊断比 handoff 的 A/B 框架更准。
+
+## 待办（worktree 拆分，2026-06-18）
+
+| Worktree | 分支 | 任务 | 状态 |
+|---|---|---|---|
+| W1 | `w1-docs` | 本文档收尾 + 新增 `PLAN-KNOWLEDGE-PROPAGATION.md` | 进行中 |
+| W2 | `w2-i1` | I1 真实 LLM 实跑（需 API key） | 待 API key |
+| W3 | `w3-p3p4` | P3 按 `KnowledgeSource` 分流 + P4 方案A 同名收紧 | 待执行 |
+| W4 | `w4-frontend` | Phase 4 前端工作台重构（独立长期线） | 待执行 |
