@@ -3819,8 +3819,14 @@ fn meta_apply_mvu_schema(
     }
     store.update_card(card.clone());
 
-    // Best-effort：对已存在的 instances 补齐新变量
-    for instance in store.list_instances(&card.id) {
+    // Best-effort：对已存在的 instances 补齐新变量。
+    // 注意：instance 与 definition 的关联是 definition_id，与 campaign 无关——
+    // 一张卡的某个 definition 可能被多个 campaign 引用，全部都该 backfill。
+    // 因此这里用 list_all_instances() 全量遍历，再按 definition_id 过滤。
+    // （历史 bug：曾用 list_instances(&card.id)，把 card.id 当 campaign_id 传，
+    // 而 list_instances 按 campaign_id 过滤 → instance.campaign_id 永不等于
+    // card.id → loop 体永不执行 → 生产 backfill 是死代码。）
+    for instance in store.list_all_instances() {
         if instance.definition_id.as_ref() != Some(&def_id) {
             continue;
         }

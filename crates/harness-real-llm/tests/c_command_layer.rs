@@ -751,8 +751,11 @@ fn c7_mvu_apply_backfill() {
         c
     });
 
-    // ─── 复刻 backfill loop（lib.rs:3822-3845）──────────────────────────
-    for instance in store.list_instances(&campaign_id) {
+    // ─── 复刻 backfill loop（lib.rs meta_apply_mvu_schema）─────────────
+    // 生产用 list_all_instances() 全量遍历 + definition_id 过滤（一张卡的
+    // definition 可被多个 campaign 引用，全部都该 backfill；详见 lib.rs 注释）。
+    // 测试同步复刻，确保验证的路径 = 生产实际走的路径。
+    for instance in store.list_all_instances() {
         if instance.definition_id.as_ref() != Some(&def_id) {
             continue;
         }
