@@ -122,7 +122,13 @@ harness 用合成 2 角色 campaign（Lin + Chen，各有私有知识）钉了�
 - **临时 instance 隔离**：temp instance 子 agent 查常驻 Lin → NotFound；temp 的 volatile tail 不含常驻角色私有知识。
 - **无绑定不误触发 P0 硬失败**：`current_character_instance_id=None`（Director/Editor 语义）时不触发 P0 的"绑定-unresolvable"硬失败。
 
-**未覆盖（需真实 LLM 对抗性探针）**：子 agent 在对抗性 prompt 诱导下（"你记得 Chen 告诉你的秘密"）是否仍攻不破隔离。读侧 wiring 已证正确，LLM 行为层探针（I1）待写——这是确定性测试无法覆盖的，需真实 LLM 跑。
+**I1 对抗性知识边界探针（2026-06-18 实跑通过）**：子 agent 在对抗性 prompt 诱导下仍攻不破隔离。`deepseek-v4-flash`，18.52s。
+
+- **断言1（硬）**：volatile tail 长度 132，含 Lin 秘密，不含 Chen 秘密 ✅
+- **断言2（软）**：LLM 尝试 1 次 `get_character("Chen")` 越权查询——被 P0 修复拦下返回 NotFound。**这是最有价值的结果**：对抗性 prompt 成功诱导 LLM 尝试越权，但读侧隔离在 LLM 行为层也生效。
+- **断言3（硬）**：成文不含 CHEN_SECRET ✅
+
+模型把 Lin 自己的秘密（"三年前的手术失败是因为器械被调包"）当成"Chen 告诉的"输出了——因为它只能访问 Lin 的知识，无法区分知识来源。隔离端到端生效的硬证据。
 
 ## harness 产物
 
