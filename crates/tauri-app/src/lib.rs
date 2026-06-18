@@ -1801,7 +1801,8 @@ fn persist_postprocess_outcome(
             .iter()
             .filter_map(|u| {
                 if present_ids.is_empty() {
-                    // 无 present_chars 约束时全部写入（向后兼容）
+                    // 无 present_chars 约束时全部写入（向后兼容逃生口，P3 待收紧）
+                    tracing::warn!("postprocess 知识写回: present_chars 为空集，放行全部知识更新（P3 待收紧）");
                     normalize_knowledge_update_for_postprocess(
                         store,
                         camp_id,
@@ -1948,10 +1949,26 @@ pub fn is_postprocess_instance_present(
     raw_id: &Id,
     present_ids: &std::collections::HashSet<String>,
 ) -> bool {
-    present_ids.is_empty()
-        || present_ids.contains(raw_id.as_str())
-        || present_ids.contains(inst.id.as_str())
-        || present_ids.contains(&inst.name)
+    if present_ids.is_empty() {
+        tracing::warn!(
+            "postprocess 写回: present_chars 为空集，放行 '{}'（向后兼容逃生口，P3 待收紧）",
+            inst.name
+        );
+        return true;
+    }
+    // id 路优先（精确匹配）
+    if present_ids.contains(raw_id.as_str()) || present_ids.contains(inst.id.as_str()) {
+        return true;
+    }
+    // name 路兜底：同名 instance 歧义风险（P4）
+    if present_ids.contains(&inst.name) {
+        tracing::debug!(
+            "postprocess 写回: '{}' 通过 name 匹配在场（非 id 匹配，P4 同名歧义风险）",
+            inst.name
+        );
+        return true;
+    }
+    false
 }
 
 fn find_instance_by_name_or_id(

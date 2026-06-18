@@ -112,6 +112,19 @@ impl HttpLlmClient {
         self
     }
 
+    /// 确定实际使用的模型名
+    ///
+    /// 若 `req.model` 为空或等于占位默认值，则回退到连接配置的 `self.model`；
+    /// 否则保留 `req.model`（来自 AgentProfileConfig 的用户 override）。
+    fn effective_model<'a>(&'a self, req_model: &'a str) -> &'a str {
+        const PLACEHOLDER_MODELS: &[&str] = &["deepseek-chat", "mock"];
+        if req_model.is_empty() || PLACEHOLDER_MODELS.contains(&req_model) {
+            &self.model
+        } else {
+            req_model
+        }
+    }
+
     /// 构建 Authorization header
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key)
@@ -122,6 +135,8 @@ impl HttpLlmClient {
 impl crate::LlmClient for HttpLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let mut req = req.clone();
+        // model 回退：连接配置的 model 优先于占位默认值
+        req.model = self.effective_model(&req.model).to_string();
         // text_tools 降级：注入工具提示到 system prompt，移除 tools 字段
         if self.text_fallback {
             if let Some(tools) = &req.tools {
@@ -173,6 +188,8 @@ impl crate::LlmClient for HttpLlmClient {
         cancel: watch::Receiver<bool>,
     ) -> Result<ChatResponse, LlmError> {
         let mut req = req.clone();
+        // model 回退：连接配置的 model 优先于占位默认值
+        req.model = self.effective_model(&req.model).to_string();
         if self.text_fallback {
             if let Some(tools) = &req.tools {
                 inject_tool_prompt(&mut req.messages, tools);
@@ -359,4 +376,57 @@ fn extract_error_message(body: &str) -> String {
         }
     }
     body.chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
+    use storyforge_domain::Id;
+
+    fn make_client(model: &str) -> HttpLlmClient {
+        let conn = LlmConnection {
+            id: Id::from_str("test-conn"),
+            name: "test".into(),
+            base_url: "http://localhost/v1/chat/completions".into(),
+            api_key: "sk-test".into(),
+            model: model.into(),
+            protocol: LlmProtocol::OpenAi,
+            params: SamplingParams::default(),
+            tool_mode: ToolMode::Native,
+        };
+        HttpLlmClient::new(&conn).unwrap()
+    }
+
+    #[test]
+    fn effective_model_placeholder_deepseek_chat_falls_back() {
+        let client = make_client("deepseek-v4-flash");
+        assert_eq!(client.effective_model("deepseek-chat"), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn effective_model_placeholder_mock_falls_back() {
+        let client = make_client("gpt-4o");
+        assert_eq!(client.effective_model("mock"), "gpt-4o");
+    }
+
+    #[test]
+    fn effective_model_empty_falls_back() {
+        let client = make_client("deepseek-v4-flash");
+        assert_eq!(client.effective_model(""), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn effective_model_non_placeholder_preserved() {
+        let client = make_client("deepseek-v4-flash");
+        // AgentProfileConfig override — non-placeholder should be preserved
+        assert_eq!(client.effective_model("gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn effective_model_same_as_connection_preserved() {
+        let client = make_client("deepseek-v4-flash");
+        // req.model == self.model, not a placeholder — preserved as-is
+        assert_eq!(client.effective_model("deepseek-v4-flash"), "deepseek-v4-flash");
+    }
 }

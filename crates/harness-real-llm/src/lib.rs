@@ -273,12 +273,8 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
 
 /// 在 `#[ignore]` 测试里调用：若拿不到真实凭证则早返（不 fail），否则构造真实 client。
 ///
-/// 返回的 client 经 `ModelPinningLlmClient` 包装：强制把每个 ChatRequest 的 model
-/// 改成连接配置的 model。这绕开项目既有的"model 透传 bug"——pipeline 各 agent config
-/// 硬编码 `deepseek-chat` 默认值（app-pipeline lib.rs:1482/1538、app-agent prompts
-/// postprocess.rs:88/summarizer.rs:50/character_extractor.rs:63），HttpLlmClient.chat()
-/// 用 req.model 而非 self.model，导致连接里配的 model 名被忽略。该 bug 已记入
-/// HARNESS-FINDINGS，wrapper 是 harness 跑通的临时手段，业务侧修复见 findings。
+/// F1 修好后，`HttpLlmClient.chat()`/`chat_stream()` 已正确回退到连接配置的 model，
+/// 不再需要 `ModelPinningLlmClient` wrapper。
 pub fn require_real_llm() -> Arc<dyn LlmClient> {
     let conn = resolve_llm_connection().expect(
         "未配置真实 LLM 凭证：设 LLM_BASE_URL/LLM_API_KEY/LLM_MODEL 或 data/connections.json",
@@ -286,41 +282,7 @@ pub fn require_real_llm() -> Arc<dyn LlmClient> {
     let client = storyforge_infra_llm::create_client(&conn)
         .map_err(|e| format!("构造 LLM client 失败: {e}"))
         .expect("LLM client 构造失败");
-    Arc::new(ModelPinningLlmClient {
-        inner: Arc::from(client),
-        model: conn.model.clone(),
-    })
-}
-
-/// 强制把每个 ChatRequest 的 model 钉成连接配置的 model。
-///
-/// 见 `require_real_llm` 的说明：绕开 model 透传 bug。
-struct ModelPinningLlmClient {
-    inner: Arc<dyn LlmClient>,
-    model: String,
-}
-
-#[async_trait::async_trait]
-impl LlmClient for ModelPinningLlmClient {
-    async fn chat(
-        &self,
-        req: &storyforge_domain::llm::ChatRequest,
-    ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError> {
-        let mut req = req.clone();
-        req.model = self.model.clone();
-        self.inner.chat(&req).await
-    }
-
-    async fn chat_stream(
-        &self,
-        req: &storyforge_domain::llm::ChatRequest,
-        tx: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError> {
-        let mut req = req.clone();
-        req.model = self.model.clone();
-        self.inner.chat_stream(&req, tx, cancel).await
-    }
+    Arc::from(client)
 }
 
 /// 与线上 `get_app_data_dir` 同语义（exe 同级 data/），仅回退路径用。

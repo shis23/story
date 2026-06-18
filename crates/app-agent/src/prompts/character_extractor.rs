@@ -32,7 +32,13 @@ pub const CHARACTER_EXTRACTOR_SYSTEM_PROMPT: &str = r#"你是卡内角色识别�
 - 宁少勿错：把握不准是不是独立角色，就归并到主角设定里，不要硬拆
 
 【输出格式】
-调用 emit_characters 工具，或直接输出 JSON 数组（不要多余解释）：
+你必须二选一输出（不要同时做）：
+- 方式 A：调用 emit_characters 工具，把角色数组放在 arguments.characters 里
+- 方式 B：直接输出 JSON 数组（不要任何前后文字、不要解释、不要"任务已完成"之类的总结）
+
+⚠️ 重要：不要输出"已通过工具输出"之类的自然语言——如果你没触发 emit_characters 工具调用，就必须把 JSON 数组直接放在回复正文里。两者都没有 = 任务失败。
+
+示例（方式 B，直接输出 JSON 数组，前后无文字）：
 [
   {
     "name": "林医生",

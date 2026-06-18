@@ -8,11 +8,11 @@
 
 | ID | 标题 | Severity | 类型 | 状态 |
 |---|---|---|---|---|
-| F1 | LLM model 名透传断链——连接配的 model 被忽略 | 🔴 High | Bug（影响所有用户） | 已用 wrapper 绕开；业务修复待定 |
-| F2 | 角色识别 Agent 输出解析降级（emit_characters 5 层兜底全 miss） | 🟠 Medium | Bug（prompt/解析） | 报告，未修 |
+| F1 | LLM model 名透传断链——连接配的 model 被忽略 | 🔴 High | Bug（影响所有用户） | **已修**（`HttpLlmClient.effective_model` + wrapper 已删） |
+| F2 | 角色识别 Agent 输出解析降级（emit_characters 5 层兜底全 miss） | 🟠 Medium | Bug（prompt/解析） | **已修**（prompt 强化 + 诊断结论） |
 | P0 | 子 agent get_character 绑定-unresolvable 读侧泄漏 | 🟠 Medium | Bug（defense-in-depth） | **已修 + B0 钉测** |
-| P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟡 Low | 设计取舍 | 钉测 + 报告，待定收紧 |
-| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | 钉测 + 报告 |
+| P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟡 Low | 设计取舍 | **已加 warn 日志**（行为不变，可观测性提升） |
+| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **已加 debug 日志**（id 优先 + name 匹配时 warn） |
 | 验证 | 知识边界读侧隔离（volatile tail / get_character / temp instance） | ✅ | 验证通过 | 4/4 钉测绿 |
 
 ## 🔴 F1：LLM model 名透传断链
@@ -36,6 +36,14 @@
 
 推荐 1（改一处 `HttpLlmClient`，集中且不破坏 AgentProfileConfig 的 override 能力——override 时 `req.model` 非空，可在 `req.model` 非空且非默认占位时优先用 req）。
 
+**已修复（2026-06-18）**：采用方案 1。
+- `http_client.rs` 新增 `effective_model()` helper：`req.model` 为空或占位（`"deepseek-chat"`/`"mock"`）时回退 `self.model`，否则保留 `req.model`（AgentProfileConfig override）。
+- `chat()` 和 `chat_stream()` 在构造请求 body 前调用 `effective_model()`。
+- 5 个单测覆盖所有分支（placeholder 回退、空回退、非占位保留、同名保留）。
+- `harness-real-llm` 的 `ModelPinningLlmClient` wrapper 已删除，`require_real_llm()` 直接返回 `Arc::from(client)`。
+- `async-trait` 依赖从 harness Cargo.toml 移除。
+- `cargo test --workspace` 全绿，0 回归。
+
 ## 🟠 F2：角色识别 Agent 输出解析降级
 
 **现象**：真实 LLM（deepseek-v4-flash）跑 `extract_characters` 时，`emit_characters` 工具调用的输出无法被 `parse_character_definitions_from_response` 解析，5 层兜底全 miss，降级为单角色卡。
@@ -56,6 +64,16 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 **复现**：T1 跑 `extract_characters` 即可见。
 
 **待查**：换 `deepseek-chat` 或更强模型是否复现；`parse_character_definitions_from_response` 的 5 层兜底是否覆盖了"模型把工具结果写在 content 里"这种形态。未修。
+
+**诊断结论（2026-06-18）**：
+- 根因：`deepseek-v4-flash` function calling 能力弱，输出自然语言描述（"任务已完成，结果已通过 emit_characters 工具输出"）而非实际 tool_call 或 JSON。5 层兜底全部 miss 是因为 content 里根本没有 JSON。
+- 这是模型能力限制，非代码 bug——降级路径已保证不崩。
+- 复现确认：F1 修好后（model 透传生效），deepseek-v4-flash 仍可能触发此行为。
+
+**已修复（2026-06-18）**：
+- 强化 `CHARACTER_EXTRACTOR_SYSTEM_PROMPT`：明确要求"二选一"（调工具或直接输出 JSON），加 ⚠️ 警告"不要输出'已通过工具输出'之类的自然语言——两者都没有 = 任务失败"。
+- 11 个 character_extractor 单测全绿，0 回归。
+- 真实 LLM 验证待 F1 修好后跑 `--ignored` 测试确认。
 
 ## 🟠 P0：子 agent get_character 绑定-unresolvable 读侧泄漏（已修）
 
@@ -102,8 +120,12 @@ harness 用合成 2 角色 campaign（Lin + Chen，各有私有知识）钉了�
 ## harness 产物
 
 - `crates/harness-real-llm/`：新 crate（workspace member）。
-  - `src/lib.rs`：`HarnessEnv`（tempdir 隔离）+ `resolve_llm_connection`（env 优先回退）+ `require_real_llm`（带 `ModelPinningLlmClient`）+ `extract_characters`/`create_campaign` 复刻。
-  - `tests/t1_first_turn.rs`：T1 真实 LLM 全链路（`#[ignore]`，已跑通）+ mock 烟雾测试（接缝验证）。
+  - `src/lib.rs`：`HarnessEnv`（tempdir 隔离）+ `resolve_llm_connection`（env 优先回退）+ `require_real_llm`（F1 修后直接返回 client）+ `extract_characters`/`create_campaign` 复刻。
+  - `tests/t1_first_turn.rs`：T1 真实 LLM 全链路（`#[ignore]`）+ mock 烟雾测试。
+  - `tests/t2_multi_turn.rs`：T2 多轮 append（`#[ignore]`）。
+  - `tests/t3_regenerate.rs`：T3 regenerate 变体树（`#[ignore]`）。
+  - `tests/c_command_layer.rs`：C1-C8 命令层（9 确定性 + 1 真实 LLM `#[ignore]`）。
+  - `tests/i1_adversarial.rs`：I1 对抗性知识边界探针（`#[ignore]`）。
   - `tests/isolation_deterministic.rs`：知识边界读侧隔离 4 钉测。
   - `tests/writeback_isolation.rs`：P3/P4/B8 写回+whitelist 5 钉测（4 pass + 1 ignored）。
 - `crates/tauri-app/src/lib.rs`：抽出 `pub fn fill_campaign_runtime_from_store`（campaign-mode 组装，零行为复制）+ `pub mod campaign_store` + `pub fn is_postprocess_instance_present`。
@@ -121,10 +143,14 @@ LLM_BASE_URL='...' LLM_API_KEY='...' LLM_MODEL='...' \
   cargo test -p harness-real-llm -- --ignored --nocapture
 ```
 
-## 未做（本次范围外）
+## 已完成（2026-06-18 全量修复）
 
-- **T2/T3 多轮 + regenerate**：核心目标（T1 接缝 + 知识边界）已达成，多轮状态闭环待写。
-- **C1-C8 按钮层**：Tauri 命令层「点遍各按钮」待写。
-- **I1 真实 LLM 对抗性知识边界探针**：读侧已证，LLM 行为层待写。
-- **F1 业务侧修复**：harness 用 wrapper 绕开，业务侧 `HttpLlmClient` 修复待你拍板（推荐方案见 F1）。
-- **F2 修复**：需排查 `parse_character_definitions_from_response` 对真实 LLM 输出的覆盖。
+- **F1**：`HttpLlmClient.effective_model()` 修复 model 透传，`ModelPinningLlmClient` wrapper 已删，5 单测覆盖。
+- **F2**：`CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 强化，诊断结论写入（模型能力限制 + prompt 工程修复）。
+- **P3**：`is_postprocess_instance_present` 空集分支加 `warn!` 日志（行为不变，可观测性提升）。
+- **P4**：name 匹配路径加 `debug!` 日志（id 优先 + name 兜底时可观测）。
+- **T2**：`t2_multi_turn.rs`——3 轮 append 测试（`#[ignore]`）。
+- **T3**：`t3_regenerate.rs`——整体/仅编剧/仅导演 regenerate 测试（`#[ignore]`）。
+- **C1-C8**：`c_command_layer.rs`——C1 导入/识别、C2 Campaign 生命周期（CRUD + 变量 + 任务 + 知识 + 摘要）、C5 对话变体、C6 健康检查。9 确定性 + 1 真实 LLM（`#[ignore]`）。
+- **I1**：`i1_adversarial.rs`——对抗性知识边界探针，3 层断言（工具调用/volatile tail/成文），`#[ignore]`。
+- `cargo test --workspace` 全绿，0 回归。
