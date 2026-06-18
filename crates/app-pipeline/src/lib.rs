@@ -15,6 +15,7 @@ use storyforge_domain::agent::{
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::conversation::Provenance;
+use storyforge_domain::mvu_translation::FallbackFragment;
 
 use storyforge_app_agent::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
@@ -25,6 +26,7 @@ use storyforge_app_conversation::{
     ConversationStore, PartialRollTarget, build_provenance_with_campaign,
 };
 use storyforge_infra_llm::LlmClient;
+use storyforge_infra_plugin_host::mvu_runtime::MvuRuntime;
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -164,6 +166,8 @@ pub struct PipelineOrchestrator {
     session: Option<WritingSession>,
     /// Phase 6: 本轮创建的临时 instance（供 Tauri 层落盘）
     pending_temporary_instances: Vec<CharacterInstance>,
+    /// MVU JS fallback 运行时（None=不支持 JS fallback，降级）
+    mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
 }
 
 impl PipelineOrchestrator {
@@ -171,6 +175,7 @@ impl PipelineOrchestrator {
         llm: Arc<dyn LlmClient>,
         conv_store: Arc<ConversationStore>,
         tool_ctx: Arc<ToolContext>,
+        mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
     ) -> Self {
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         Self {
@@ -179,6 +184,7 @@ impl PipelineOrchestrator {
             state: PipelineState::Idle,
             session: None,
             pending_temporary_instances: Vec::new(),
+            mvu_runtime,
         }
     }
 
@@ -548,11 +554,15 @@ impl PipelineOrchestrator {
     /// 编剧成文（DraftReady）后并行跑：
     /// - 剧情总结 Agent：产出本轮摘要
     /// - 后处理 Agent：三合一产出角色知识 + 变量更新 + 任务更新
+    /// - **W10**：JS fallback 片段执行（`fallback_fragments` 非空 + `mvu_runtime` 可用时）
     ///
     /// **best-effort + 向后兼容**：
     /// - `ctx.campaign_id` 为 None 时跳过（旧用法无 campaign），返回 None
     /// - 任一 Agent 失败不影响另一个，失败只 warn 不阻断
     /// - 推 PostProcessStarted / PostProcessDone / PostProcessFailed / SummaryDone 事件
+    ///
+    /// `fallback_fragments`：由调用方（tauri-app）从 CampaignStore 查 MvuTranslation 后
+    /// 拆出的 JS 片段。pipeline 不依赖 CampaignStore，只接收已拆好的片段。
     ///
     /// 返回 `Option<PostProcessOutcome>`：None 表示跳过，Some 表示跑过（产出可能为空）。
     pub async fn run_postprocess(
@@ -564,6 +574,7 @@ impl PipelineOrchestrator {
         ctx: &WritingContext,
         event_tx: &mpsc::UnboundedSender<PipelineEvent>,
         cancel: watch::Receiver<bool>,
+        fallback_fragments: &[FallbackFragment],
     ) -> Option<storyforge_app_agent::PostProcessOutcome> {
         let campaign_id = ctx.campaign_id.clone()?;
 
@@ -591,7 +602,7 @@ impl PipelineOrchestrator {
             ctx.turn, enable_postprocess, enable_summarizer
         );
 
-        let outcome = storyforge_app_agent::run_postprocess_pipeline(
+        let mut outcome = storyforge_app_agent::run_postprocess_pipeline(
             &self.runtime,
             final_text,
             scene_brief,
@@ -605,6 +616,85 @@ impl PipelineOrchestrator {
             ctx.agent_profile_config.as_ref(),
         )
         .await;
+
+        // ─── W10: JS fallback 执行 ─────────────────────────────────────────
+        // 在正常 postprocess 之后执行。结果走现有 variable_updates 落盘路径（经 preview/patch）。
+        // JS 失败只 warn，不影响主写作。
+        if !fallback_fragments.is_empty() {
+            match &self.mvu_runtime {
+                Some(rt) if rt.is_available() => {
+                    // 构造当前变量快照：campaign 内所有 CharacterInstance 的 variables + campaign 变量
+                    let current_variables = build_current_variables(ctx);
+
+                    for frag in fallback_fragments {
+                        if frag.js_snippet.is_empty() {
+                            continue;
+                        }
+                        info!(
+                            target: "app-pipeline",
+                            "[MVU JS] 执行 fallback 片段: desc='{}' snippet_len={}",
+                            frag.description,
+                            frag.js_snippet.len()
+                        );
+                        match rt.execute_fragment(&frag.js_snippet, &current_variables).await {
+                            Ok(exec_result) => {
+                                // side_effects 只记录日志（暂不自动执行）
+                                for se in &exec_result.side_effects {
+                                    info!(
+                                        target: "app-pipeline",
+                                        "[MVU JS] side_effect: {se}"
+                                    );
+                                }
+                                // variable_updates 追加到 outcome（走现有落盘路径）
+                                let js_var_count = exec_result.variable_updates.len();
+                                if js_var_count > 0 {
+                                    let pp = outcome.post_process.get_or_insert_with(Default::default);
+                                    for (key, value) in exec_result.variable_updates {
+                                        pp.variable_updates.push(
+                                            storyforge_domain::agent::VariableUpdate {
+                                                instance_id: None, // JS 产出默认为 campaign 级变量
+                                                key,
+                                                value,
+                                            },
+                                        );
+                                    }
+                                    info!(
+                                        target: "app-pipeline",
+                                        "[MVU JS] 追加 {js_var_count} 条变量更新到后处理产出"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // JS 失败：warn + 跳过，不影响主写作（红线）
+                                tracing::warn!(
+                                    target: "app-pipeline",
+                                    "[MVU JS] fallback 片段执行失败（跳过，不影响主写作）: desc='{}' err={e}",
+                                    frag.description
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    // runtime 存在但不可用（WebView 未初始化等）
+                    tracing::warn!(
+                        target: "app-pipeline",
+                        "[MVU JS] 有 {} 个 fallback 片段但 runtime 不可用，跳过 JS 执行",
+                        fallback_fragments.len()
+                    );
+                }
+                None => {
+                    // mvu_runtime 为 None（降级：harness/无 WebView 环境）
+                    if !fallback_fragments.is_empty() {
+                        info!(
+                            target: "app-pipeline",
+                            "[MVU JS] mvu_runtime=None，{} 个 fallback 片段跳过（降级）",
+                            fallback_fragments.len()
+                        );
+                    }
+                }
+            }
+        }
 
         // 摘要完成事件：仅在 summarizer 开启且有产出时发
         if enable_summarizer {
@@ -1326,6 +1416,22 @@ fn has_available_characters(ctx: &WritingContext) -> bool {
     }
 }
 
+/// 构造 MVU JS 执行所需的当前变量快照
+///
+/// 从 CampaignRuntimeContext 的所有 CharacterInstance.variables 收集，
+/// key 格式保持 VariableValue.key 原样。无 campaign_runtime 时返回空 map。
+fn build_current_variables(ctx: &WritingContext) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut vars = std::collections::HashMap::new();
+    if let Some(runtime) = &ctx.campaign_runtime {
+        for inst in &runtime.instances {
+            for vv in &inst.variables {
+                vars.insert(vv.key.clone(), vv.value.clone());
+            }
+        }
+    }
+    vars
+}
+
 /// 构造导演的易变末尾（§22 volatile tail）：意图 + 可用角色 + 任务/伏笔
 ///
 /// 这些内容每轮可能变化（意图变、任务触发变），压在 user tail 段，保证
@@ -1829,7 +1935,7 @@ mod tests {
             current_character_instance_id: None,
         });
 
-        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
 
         let ctx = WritingContext::legacy(
             vec![mock_character("Seraphina")],
@@ -1934,7 +2040,7 @@ mod tests {
             campaign_runtime: None,
             current_character_instance_id: None,
         });
-        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
 
         let conv = conv_store.create(None);
         let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv.id.clone());
@@ -2122,7 +2228,7 @@ mod tests {
             campaign_runtime: None,
             current_character_instance_id: None,
         });
-        let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx);
+        let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
         (orch, conv_store)
     }
 
@@ -2143,6 +2249,7 @@ mod tests {
                 &ctx,
                 &event_tx,
                 cancel,
+                &[],
             )
             .await;
         assert!(outcome.is_none(), "无 campaign 应跳过后处理");
@@ -2169,6 +2276,7 @@ mod tests {
                 &ctx,
                 &event_tx,
                 cancel,
+                &[],
             )
             .await;
 
@@ -2247,6 +2355,7 @@ mod tests {
                 &ctx,
                 &event_tx,
                 cancel,
+                &[],
             )
             .await;
 
@@ -2820,5 +2929,114 @@ mod tests {
         assert_eq!(truncate_chars("你好世界", 3), "你好世…");
         assert_eq!(truncate_chars("你好世界", 4), "你好世界");
         assert_eq!(truncate_chars("你好世界", 10), "你好世界");
+    }
+
+    /// W10: mvu_runtime=None + 空 fragments → run_postprocess 无 campaign 时返回 None（正常跳过）
+    #[tokio::test]
+    async fn test_postprocess_no_campaign_skips_even_with_fragments() {
+        let (orch, _conv_store) = make_orchestrator();
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_mvu1_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        // 传非空 fragments + mvu_runtime=None → 无 campaign 时直接返回 None，不碰 JS 路径
+        let fragments = vec![FallbackFragment {
+            description: "test".into(),
+            js_snippet: "_.set('hp', 1);".into(),
+            reason: "test".into(),
+        }];
+        let outcome = orch
+            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &fragments)
+            .await;
+        assert!(outcome.is_none(), "无 campaign 应跳过后处理（不管 fragments）");
+    }
+
+    /// W10: mvu_runtime=None + 空 fragments → 无 campaign 时安静跳过（无额外日志噪声）
+    #[tokio::test]
+    async fn test_postprocess_empty_fragments_noop() {
+        let (orch, _conv_store) = make_orchestrator();
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_mvu2_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        let outcome = orch
+            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &[])
+            .await;
+        assert!(outcome.is_none(), "空 fragments + 无 campaign → 跳过");
+    }
+
+    /// W10: build_current_variables 在无 campaign_runtime 时返回空 map
+    #[test]
+    fn test_build_current_variables_no_campaign() {
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_mvu3_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let vars = build_current_variables(&ctx);
+        assert!(vars.is_empty(), "无 campaign_runtime 时变量快照应为空");
+    }
+
+    /// W10: build_current_variables 从 campaign instances 收集变量
+    #[test]
+    fn test_build_current_variables_with_instances() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::character::RoleType;
+        use storyforge_domain::variables::VariableValue;
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_mvu4_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+
+        let card_id = Id::new();
+        let def = storyforge_domain::character::CharacterDefinition {
+            id: Id::new(),
+            card_id: card_id.clone(),
+            name: "TestChar".into(),
+            persona_prompt: "".into(),
+            behavior_rules: "".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+        let mut inst = CharacterInstance::from_definition(Id::new(), &def);
+        inst.variables = vec![
+            VariableValue::new("hp", serde_json::json!(80), 1),
+            VariableValue::new("state", serde_json::json!("calm"), 1),
+        ];
+
+        let campaign = Campaign::new(card_id, "test-camp");
+        let runtime = Arc::new(
+            storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                campaign,
+                instances: vec![inst],
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 1,
+            },
+        );
+
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        ctx.campaign_runtime = Some(runtime);
+
+        let vars = build_current_variables(&ctx);
+        assert_eq!(vars.len(), 2, "应收集到 2 个变量");
+        assert_eq!(vars.get("hp").unwrap(), &serde_json::json!(80));
+        assert_eq!(vars.get("state").unwrap(), &serde_json::json!("calm"));
     }
 }
