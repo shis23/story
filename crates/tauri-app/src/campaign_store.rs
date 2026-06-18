@@ -528,6 +528,7 @@ mod tests {
             name: "测试卡".into(),
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![],
+            raw_card_json: serde_json::Value::Null,
         };
         let def = CharacterDefinition {
             id: Id::from_str("def-1"),

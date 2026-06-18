@@ -925,6 +925,35 @@ export async function metaExplainGeneration(conversationId, nodeId) {
   return null
 }
 
+// ─── W7 导出命令 ─────────────────────────────────────────────────────────────
+
+/** 导出单个角色卡为 ST PNG（含 tEXt "chara" 块） */
+export async function exportStCardPng(characterId) {
+  if (isTauri()) {
+    return await invoke('export_st_card_png', { characterId })
+  }
+  return null
+}
+
+/**
+ * 导出 Campaign 全部角色为 ST PNG + 共享 lorebook
+ * 返回 { cards: [{filename, data}], lorebook_json }
+ */
+export async function exportCampaignStCards(campaignId) {
+  if (isTauri()) {
+    return await invoke('export_campaign_st_cards', { campaignId })
+  }
+  return { cards: [], lorebook_json: '{}' }
+}
+
+/** 导出 StoryForge Campaign 完整 JSON Bundle */
+export async function exportCampaignBundle(campaignId) {
+  if (isTauri()) {
+    return await invoke('export_campaign_bundle', { campaignId })
+  }
+  return null
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {

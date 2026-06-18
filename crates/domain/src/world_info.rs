@@ -104,6 +104,13 @@ impl WorldInfoBook {
         }
     }
 
+    /// 导出为 ST 世界书结构（reverse of `from_st`）
+    pub fn to_st_book(&self) -> crate::character::StWorldInfoBook {
+        crate::character::StWorldInfoBook {
+            entries: self.entries.iter().map(|e| e.to_st_entry()).collect(),
+        }
+    }
+
     /// 获取所有蓝灯（常驻）条目
     pub fn constant_entries(&self) -> Vec<&WorldInfoEntry> {
         self.entries
@@ -163,6 +170,33 @@ impl WorldInfoEntry {
             order: st.order.unwrap_or(100),
             route,
             extensions: st.extensions,
+        }
+    }
+
+    /// 导出为 ST 条目（reverse of `from_st`）
+    pub fn to_st_entry(&self) -> StWorldInfoEntry {
+        use serde_json::Value;
+        StWorldInfoEntry {
+            id: self.st_id,
+            keys: self.keys.clone(),
+            secondary_keys: if self.secondary_keys.is_empty() {
+                None
+            } else {
+                Some(self.secondary_keys.clone())
+            },
+            content: Some(self.content.clone()),
+            constant: self.constant,
+            selective: self.selective,
+            selective_logic: Some(match self.selective_logic {
+                SelectiveLogic::And => 0,
+                SelectiveLogic::Or => 1,
+                SelectiveLogic::Not => 2,
+            }),
+            position: Some(Value::Number(self.position.into())),
+            disable: Some(self.disabled),
+            order: Some(self.order),
+            depth: Some(self.depth),
+            extensions: self.extensions.clone(),
         }
     }
 }

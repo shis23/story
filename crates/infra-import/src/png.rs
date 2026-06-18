@@ -1,4 +1,5 @@
 use crate::ImportError;
+use storyforge_domain::character::{StCharacterCard, StCharacterData};
 
 /// PNG 签名（8 字节）
 pub const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -100,6 +101,137 @@ fn parse_text_chunk(data: &[u8]) -> Option<(String, String)> {
     Some((keyword, text))
 }
 
+// ─── PNG 导出 ───────────────────────────────────────────────────────────────
+
+/// 生成 1×1 灰度占位 PNG（底图缺失时用）
+///
+/// 手工构建，无第三方 png crate 依赖。
+/// 结构：签名 + IHDR(1x1 grayscale) + IDAT(zlib stored block, 2 bytes) + IEND。
+pub fn build_placeholder_png() -> Vec<u8> {
+    let mut png = Vec::with_capacity(128);
+
+    // PNG 签名
+    png.extend_from_slice(&PNG_SIGNATURE);
+
+    // IHDR：1×1, grayscale (bit_depth=8, color_type=0)
+    let ihdr_data: [u8; 13] = [
+        0, 0, 0, 1, // width = 1
+        0, 0, 0, 1, // height = 1
+        8, // bit depth = 8
+        0, // color type = grayscale
+        0, // compression
+        0, // filter
+        0, // interlace
+    ];
+    write_chunk(&mut png, b"IHDR", &ihdr_data);
+
+    // IDAT：zlib-wrapped deflate stored block for 2 bytes (filter=0, pixel=0x80)
+    // zlib header (0x78, 0x01) + stored block header (0x01, 0x02, 0x00, 0xFD, 0xFF) +
+    // data (0x00, 0x80) + adler32 (0x00, 0x81, 0x00, 0x81)
+    let idat_data: [u8; 13] = [
+        0x78, 0x01, // zlib header (CM=8, CINFO=7, no dict, level 0)
+        0x01, // deflate stored block (BFINAL=1, BTYPE=00)
+        0x02, 0x00, // LEN = 2
+        0xFD, 0xFF, // NLEN = ~2
+        0x00, 0x80, // data: filter=None, pixel=128 (gray)
+        0x00, 0x81, 0x00, 0x81, // adler32 of [0x00, 0x80]
+    ];
+    write_chunk(&mut png, b"IDAT", &idat_data);
+
+    // IEND
+    write_chunk(&mut png, b"IEND", &[]);
+
+    png
+}
+
+/// 构建 tEXt 块字节（keyword\0text）
+fn build_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(keyword.len() + 1 + text.len());
+    data.extend_from_slice(keyword.as_bytes());
+    data.push(0); // null separator
+    data.extend_from_slice(text.as_bytes());
+    data
+}
+
+/// 写一个 PNG 块：length(4) + type(4) + data + crc(4)
+fn write_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    let length = data.len() as u32;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let crc_input: Vec<u8> = chunk_type.iter().chain(data.iter()).copied().collect();
+    let crc = crc32fast::hash(&crc_input);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// 将 ST 角色卡写入 PNG（tEXt "chara" 块 + 底图）
+///
+/// - `card`：要导出的 ST 角色卡结构
+/// - `base_image`：底图 PNG 字节。若为 None 或无效，用占位纯色图。
+///
+/// 返回完整的 PNG 文件字节。
+pub fn write_st_card_png(
+    card: &StCharacterCard,
+    base_image: Option<&[u8]>,
+) -> Result<Vec<u8>, ImportError> {
+    // 序列化 card → JSON → base64
+    let json_bytes = serde_json::to_vec(card)?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json_bytes);
+
+    // 底图：优先调用方提供的，缺则占位
+    let base = match base_image {
+        Some(data) if data.len() >= 8 && data[..8] == PNG_SIGNATURE => data,
+        _ => &build_placeholder_png(),
+    };
+
+    // 从底图提取：签名 + IHDR（到第一个非 IHDR 块之前）
+    // 策略：复制签名和所有非 IEND 块，在 IEND 之前插入 tEXt
+    let mut out = Vec::with_capacity(base.len() + b64.len() + 128);
+    out.extend_from_slice(&base[..8]); // 签名
+
+    // 遍历底图的块
+    let mut pos = 8usize;
+    let mut inserted = false;
+    while pos + 8 <= base.len() {
+        let length =
+            u32::from_be_bytes([base[pos], base[pos + 1], base[pos + 2], base[pos + 3]]) as usize;
+        let chunk_type = [base[pos + 4], base[pos + 5], base[pos + 6], base[pos + 7]];
+        let total = 4 + 4 + length + 4; // length + type + data + crc
+        if pos + total > base.len() {
+            break; // 数据不完整，截断
+        }
+
+        // 在 IEND 之前插入 tEXt
+        if &chunk_type == b"IEND" && !inserted {
+            let text_data = build_text_chunk("chara", &b64);
+            write_chunk(&mut out, b"tEXt", &text_data);
+            inserted = true;
+        }
+
+        // 复制原始块
+        out.extend_from_slice(&base[pos..pos + total]);
+        pos += total;
+
+        if &chunk_type == b"IEND" {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
+/// 将 StCharacterData 包装为 StCharacterCard（导出辅助）
+pub fn make_st_card(
+    data: StCharacterData,
+    spec_version: &str,
+) -> StCharacterCard {
+    StCharacterCard {
+        spec: Some("chara_card_v2".into()),
+        spec_version: Some(spec_version.into()),
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +252,98 @@ mod tests {
         let (keyword, text) = parse_text_chunk(data).unwrap();
         assert_eq!(keyword, "chara");
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn test_build_placeholder_png_is_valid() {
+        let png = build_placeholder_png();
+        assert!(png.len() >= 8);
+        assert_eq!(png[..8], PNG_SIGNATURE);
+        // 可以被 parse_png 解析
+        let chunks = parse_png(&png).expect("占位 PNG 应可解析");
+        // 应有 IHDR, IDAT, IEND（至少 3 个块）
+        assert!(chunks.len() >= 3);
+    }
+
+    #[test]
+    fn test_write_st_card_png_round_trip() {
+        use storyforge_domain::character::StCharacterData;
+
+        let data = StCharacterData {
+            name: "测试角色".into(),
+            description: "用于测试".into(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec!["test".into()],
+            creator: "StoryForge".into(),
+            character_version: "1.0".into(),
+            alternate_greetings: vec![],
+            extensions: serde_json::json!({}),
+            character_book: None,
+        };
+        let card = make_st_card(data, "3.0");
+
+        // 写入 PNG（无底图，用占位图）
+        let png_bytes = write_st_card_png(&card, None).expect("write_png 失败");
+
+        // 验证：能被 parse_png 解析
+        let chunks = parse_png(&png_bytes).expect("导出 PNG 应可解析");
+
+        // 找 tEXt "chara" 块
+        let chara_text = chunks
+            .iter()
+            .find_map(|c| match c {
+                PngChunk::Text { keyword, text } if keyword == "chara" => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("应有 chara tEXt 块");
+
+        // base64 decode → JSON → StCharacterCard
+        let json_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)
+                .expect("base64 解码失败");
+        let exported_card: StCharacterCard =
+            serde_json::from_slice(&json_bytes).expect("JSON 解析失败");
+
+        assert_eq!(exported_card.data.name, "测试角色");
+        assert_eq!(exported_card.data.description, "用于测试");
+        assert_eq!(exported_card.data.tags, vec!["test"]);
+        assert_eq!(exported_card.spec_version, Some("3.0".into()));
+    }
+
+    #[test]
+    fn test_write_st_card_png_with_base_image() {
+        use storyforge_domain::character::StCharacterData;
+
+        let data = StCharacterData {
+            name: "带底图".into(),
+            description: String::new(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            extensions: serde_json::json!({}),
+            character_book: None,
+        };
+        let card = make_st_card(data, "2.0");
+        let base = build_placeholder_png();
+
+        let png_bytes = write_st_card_png(&card, Some(&base)).expect("write_png 失败");
+        let chunks = parse_png(&png_bytes).expect("解析失败");
+        let has_chara = chunks.iter().any(|c| match c {
+            PngChunk::Text { keyword, .. } if keyword == "chara" => true,
+            _ => false,
+        });
+        assert!(has_chara, "应有 chara tEXt 块");
     }
 }

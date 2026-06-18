@@ -213,6 +213,132 @@ impl Character {
     }
 }
 
+/// 从 Character + 可选 CharacterDefinition 构建 StCharacterData（导出用）
+///
+/// 策略：优先 raw_card_json round-trip 保底（不丢 ST 扩展字段），
+/// 然后用 Character/Definition 的字段覆盖核心字段。
+///
+/// `character_book` 由调用方传入（共享 lorebook 或内嵌世界书）。
+pub fn to_st_data(
+    character: &Character,
+    definition: Option<&CharacterDefinition>,
+    character_book: Option<StWorldInfoBook>,
+) -> StCharacterData {
+    // 从 raw_card_json 反序列化为 base，保留扩展字段
+    let mut data: StCharacterData = if !character.raw_card_json.is_null() {
+        serde_json::from_value(character.raw_card_json.clone()).unwrap_or_else(|_| {
+            empty_st_data(&character.name)
+        })
+    } else {
+        empty_st_data(&character.name)
+    };
+
+    // 用 Character 字段覆盖核心字段（保证最新）
+    data.name = character.name.clone();
+    data.description = character.description.clone();
+    data.personality = character.personality.clone();
+    data.scenario = character.scenario.clone();
+    data.first_mes = character.first_mes.clone();
+    data.mes_example = character.mes_example.clone();
+    data.system_prompt = character.system_prompt.clone();
+    data.post_history_instructions = character.post_history_instructions.clone();
+    data.tags = character.tags.clone();
+    data.creator = character.creator.clone();
+    data.character_version = character.character_version.clone();
+    data.alternate_greetings = character.alternate_greetings.clone();
+
+    // Definition 覆盖：persona + behavior 拼合进 description（如有）
+    if let Some(def) = definition {
+        if !def.persona_prompt.is_empty() || !def.behavior_rules.is_empty() {
+            let mut parts = Vec::new();
+            if !def.persona_prompt.is_empty() {
+                parts.push(def.persona_prompt.clone());
+            }
+            if !def.behavior_rules.is_empty() {
+                parts.push(format!("行为规则：{}", def.behavior_rules));
+            }
+            // 用 definition 的 persona/behavior 丰富 description
+            let def_desc = parts.join("\n\n");
+            if data.description.is_empty() {
+                data.description = def_desc;
+            } else {
+                data.description = format!("{}\n\n{}", data.description, def_desc);
+            }
+        }
+    }
+
+    // 世界书
+    data.character_book = character_book;
+
+    // extensions：保留 raw_card_json 的
+    if !character.extensions.is_null() {
+        data.extensions = character.extensions.clone();
+    }
+
+    data
+}
+
+/// 从 CharacterCard + CharacterDefinition 构建 StCharacterData（Campaign 导出路径）
+///
+/// 用于无法直接拿到原始 Character 对象的场景（只有 CampaignStore 中的 Card）。
+/// 优先用 card.raw_card_json round-trip，definition 字段覆盖核心字段。
+pub fn to_st_data_from_card(
+    card: &CharacterCard,
+    definition: &CharacterDefinition,
+    character_book: Option<StWorldInfoBook>,
+) -> StCharacterData {
+    let mut data: StCharacterData = if !card.raw_card_json.is_null() {
+        serde_json::from_value(card.raw_card_json.clone()).unwrap_or_else(|_| {
+            empty_st_data(&definition.name)
+        })
+    } else {
+        empty_st_data(&definition.name)
+    };
+
+    // Definition 字段覆盖
+    data.name = definition.name.clone();
+    if !definition.persona_prompt.is_empty() || !definition.behavior_rules.is_empty() {
+        let mut parts = Vec::new();
+        if !definition.persona_prompt.is_empty() {
+            parts.push(definition.persona_prompt.clone());
+        }
+        if !definition.behavior_rules.is_empty() {
+            parts.push(format!("行为规则：{}", definition.behavior_rules));
+        }
+        let def_desc = parts.join("\n\n");
+        if data.description.is_empty() {
+            data.description = def_desc;
+        } else {
+            data.description = format!("{}\n\n{}", data.description, def_desc);
+        }
+    }
+
+    // 世界书
+    data.character_book = character_book;
+
+    data
+}
+
+/// 构建空的 StCharacterData（fallback）
+pub fn empty_st_data(name: &str) -> StCharacterData {
+    StCharacterData {
+        name: name.to_string(),
+        description: String::new(),
+        personality: String::new(),
+        scenario: String::new(),
+        first_mes: String::new(),
+        mes_example: String::new(),
+        system_prompt: String::new(),
+        post_history_instructions: String::new(),
+        tags: vec![],
+        creator: String::new(),
+        character_version: String::new(),
+        alternate_greetings: vec![],
+        extensions: serde_json::json!({}),
+        character_book: None,
+    }
+}
+
 /// 从 ST extensions 中提取可渲染资产
 fn extract_renderable_assets(data: &StCharacterData) -> Option<RenderableAssets> {
     // ST 的 assets 存在 extensions.assets 或 extensions.character_assets
@@ -261,6 +387,11 @@ pub struct CharacterCard {
     pub source_character_id: Id,
     /// 卡内角色定义（角色识别 Agent 产出）
     pub character_definitions: Vec<CharacterDefinition>,
+    /// 原始 ST 卡 data 字段的 JSON（导出时 round-trip 保底，不丢扩展字段）
+    ///
+    /// 新数据由导入流程填入；旧数据缺失时 serde 默认 `Value::Null`（向后兼容）。
+    #[serde(default)]
+    pub raw_card_json: serde_json::Value,
 }
 
 /// 卡内角色定义（模板，卡级全局共享）
@@ -318,6 +449,7 @@ impl CharacterCard {
             name: character.name.clone(),
             source_character_id: character.id.clone(),
             character_definitions: vec![],
+            raw_card_json: character.raw_card_json.clone(),
         }
     }
 
@@ -430,6 +562,7 @@ mod multi_character_tests {
                     variable_schema: vec![],
                 },
             ],
+            raw_card_json: serde_json::Value::Null,
         };
         assert!(card.find_definition("林医生").is_some());
         assert!(card.find_definition("陈警官").is_some());
@@ -500,5 +633,143 @@ mod multi_character_tests {
         let def = CharacterDefinition::fallback_from_character(&ch, &mvu);
         assert!(def.variable_schema.iter().any(|f| f.key == "hp"));
         assert!(def.variable_schema.iter().any(|f| f.key == "fatigue"));
+    }
+
+    // ─── to_st_data round-trip 测试 ──────────────────────────────────────────
+
+    #[test]
+    fn test_to_st_data_round_trip_preserves_fields() {
+        let card_json = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "测试角色",
+                "description": "一个用于测试的角色",
+                "personality": "冷静、理性",
+                "scenario": "在未来都市中",
+                "first_mes": "你好，我是测试角色。",
+                "mes_example": "",
+                "system_prompt": "你是一个测试角色。",
+                "post_history_instructions": "",
+                "tags": ["test", "demo"],
+                "creator": "StoryForge",
+                "character_version": "1.0",
+                "alternate_greetings": ["嗨！", "欢迎。"],
+                "extensions": {"custom_key": "custom_value"},
+                "character_book": {
+                    "entries": [{
+                        "id": 1,
+                        "keys": ["未来"],
+                        "content": "未来都市知识",
+                        "constant": true,
+                        "position": 0
+                    }]
+                }
+            }
+        });
+        let card: StCharacterCard = serde_json::from_value(card_json).unwrap();
+        let character = Character::from_st_card(card);
+
+        // to_st_data round-trip（不带 definition）
+        let exported = to_st_data(&character, None, None);
+
+        assert_eq!(exported.name, "测试角色");
+        assert_eq!(exported.description, "一个用于测试的角色");
+        assert_eq!(exported.personality, "冷静、理性");
+        assert_eq!(exported.first_mes, "你好，我是测试角色。");
+        assert_eq!(exported.tags, vec!["test", "demo"]);
+        assert_eq!(exported.creator, "StoryForge");
+        assert_eq!(exported.alternate_greetings, vec!["嗨！", "欢迎。"]);
+        // extensions round-trip
+        assert_eq!(exported.extensions["custom_key"], "custom_value");
+    }
+
+    #[test]
+    fn test_to_st_data_with_definition_enriches_description() {
+        let character = Character {
+            id: Id::from_str("src-1"),
+            name: "林医生".into(),
+            description: "一位外科医生。".into(),
+            personality: "冷静".into(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::json!({}),
+            renderable_assets: None,
+            source: Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::Value::Null,
+        };
+        let def = CharacterDefinition {
+            id: Id::from_str("d1"),
+            card_id: Id::from_str("c1"),
+            name: "林医生".into(),
+            persona_prompt: "温柔的外科医生".into(),
+            behavior_rules: "先救人后问话".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+
+        let exported = to_st_data(&character, Some(&def), None);
+        assert_eq!(exported.name, "林医生");
+        // description 应包含原始 + definition 的 persona/behavior
+        assert!(exported.description.contains("一位外科医生。"));
+        assert!(exported.description.contains("温柔的外科医生"));
+        assert!(exported.description.contains("先救人后问话"));
+    }
+
+    #[test]
+    fn test_to_st_data_with_character_book() {
+        let character = Character {
+            id: Id::from_str("src-1"),
+            name: "test".into(),
+            description: String::new(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: String::new(),
+            character_version: String::new(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::json!({}),
+            renderable_assets: None,
+            source: Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::Value::Null,
+        };
+        let book = StWorldInfoBook {
+            entries: vec![StWorldInfoEntry {
+                id: Some(1),
+                keys: vec!["测试".into()],
+                secondary_keys: None,
+                content: Some("测试知识".into()),
+                constant: true,
+                selective: false,
+                selective_logic: None,
+                position: Some(serde_json::json!(0)),
+                disable: None,
+                order: None,
+                depth: None,
+                extensions: serde_json::json!({}),
+            }],
+        };
+        let exported = to_st_data(&character, None, Some(book));
+        assert!(exported.character_book.is_some());
+        let cb = exported.character_book.unwrap();
+        assert_eq!(cb.entries.len(), 1);
+        assert_eq!(cb.entries[0].keys, vec!["测试"]);
     }
 }

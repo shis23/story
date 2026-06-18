@@ -2,7 +2,8 @@
 import { ref, onMounted } from 'vue'
 import {
   listCards, getCard, extractCharacters,
-  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign
+  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
+  exportCampaignStCards, exportCampaignBundle
 } from '../tauri-api.js'
 import CampaignInstancesTab from './CampaignInstancesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
@@ -39,6 +40,10 @@ const instancesTabRef = ref(null)
 const knowledgeTabRef = ref(null)
 const tasksTabRef = ref(null)
 const summariesTabRef = ref(null)
+
+// ─── 导出状态 ───
+const exporting = ref(false)
+const exportStatus = ref('')
 
 // ─── 初始化 ───
 onMounted(async () => {
@@ -130,6 +135,80 @@ function refreshActiveDetailTab() {
   const tabRef = refMap[detailSubTab.value]
   if (tabRef.value?.refresh) {
     tabRef.value.refresh()
+  }
+}
+
+// ─── 导出操作 ───
+
+async function saveFileViaDialog(filename, data, mimeType = 'application/octet-stream') {
+  try {
+    const { save } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await save({
+      defaultPath: filename,
+      filters: [{ name: 'Files', extensions: [filename.split('.').pop() || '*'] }],
+    })
+    if (filePath) {
+      const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
+      await writeBinaryFile(filePath, data)
+      return true
+    }
+    return false
+  } catch (e) {
+    console.error('保存文件失败:', e)
+    throw e
+  }
+}
+
+async function handleExportStCards() {
+  if (!selectedCampaignId.value) return
+  exporting.value = true
+  exportStatus.value = '正在导出 ST 卡…'
+  try {
+    const result = await exportCampaignStCards(selectedCampaignId.value)
+    if (!result || !result.cards || result.cards.length === 0) {
+      exportStatus.value = '无可导出的角色'
+      return
+    }
+
+    // 逐个保存 PNG 文件
+    let saved = 0
+    for (const card of result.cards) {
+      const ok = await saveFileViaDialog(card.filename, new Uint8Array(card.data))
+      if (ok) saved++
+    }
+
+    // 保存共享 lorebook
+    if (result.lorebook_json && result.lorebook_json !== '{}') {
+      const lorebookData = new TextEncoder().encode(result.lorebook_json)
+      const ok = await saveFileViaDialog('lorebook.json', lorebookData)
+      if (ok) saved++
+    }
+
+    exportStatus.value = `已保存 ${saved} 个文件`
+  } catch (e) {
+    exportStatus.value = '导出失败: ' + e
+  } finally {
+    exporting.value = false
+  }
+}
+
+async function handleExportBundle() {
+  if (!selectedCampaignId.value) return
+  exporting.value = true
+  exportStatus.value = '正在导出 Bundle…'
+  try {
+    const json = await exportCampaignBundle(selectedCampaignId.value)
+    if (!json) {
+      exportStatus.value = '导出失败：无数据'
+      return
+    }
+    const data = new TextEncoder().encode(json)
+    const ok = await saveFileViaDialog('campaign-bundle.json', data)
+    exportStatus.value = ok ? 'Bundle 导出完成' : '已取消'
+  } catch (e) {
+    exportStatus.value = '导出失败: ' + e
+  } finally {
+    exporting.value = false
   }
 }
 </script>
@@ -306,6 +385,28 @@ function refreshActiveDetailTab() {
           </div>
 
           <template v-else>
+            <!-- 导出按钮组 -->
+            <div class="bg-surface rounded-xl border border-line p-3 mb-3 space-y-2">
+              <div class="text-xs font-medium text-ink mb-1">导出</div>
+              <div class="flex gap-2">
+                <button
+                  @click="handleExportStCards()"
+                  :disabled="exporting"
+                  class="flex-1 py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50"
+                >
+                  {{ exporting ? '导出中…' : 'ST 卡 PNG' }}
+                </button>
+                <button
+                  @click="handleExportBundle()"
+                  :disabled="exporting"
+                  class="flex-1 py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50"
+                >
+                  {{ exporting ? '导出中…' : 'JSON Bundle' }}
+                </button>
+              </div>
+              <div v-if="exportStatus" class="text-xs text-ink-soft">{{ exportStatus }}</div>
+            </div>
+
             <!-- 刷新按钮 -->
             <div class="flex justify-end mb-1">
               <button @click="refreshActiveDetailTab()" class="px-2.5 py-1 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line">刷新</button>
