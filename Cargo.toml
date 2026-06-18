@@ -15,6 +15,7 @@ members = [
     "crates/app-memory",
     "crates/app-meta",
     "crates/tauri-app",
+    "crates/harness-real-llm",
 ]
 
 [workspace.package]

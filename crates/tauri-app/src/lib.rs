@@ -1,4 +1,4 @@
-mod campaign_store;
+pub mod campaign_store;
 mod connection_store;
 mod module_store;
 mod preset_store;
@@ -1639,24 +1639,39 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
         None => return,
     };
     let store = get_campaign_store();
+    fill_campaign_runtime_from_store(ctx, &state.tool_ctx, store, &active_id);
+}
 
-    let camp = match store.get_campaign(&active_id) {
+/// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
+///
+/// 抽自 `fill_campaign_context`，供外部 harness 用独立 tempdir `CampaignStore` 复刻真实
+/// campaign-mode 组装逻辑（无需 AppState / 全局 store / Tauri runtime）。行为与线上路径一致。
+///
+/// 调用前应已清空 `ctx.campaign_runtime` 与 `tool_ctx.campaign_runtime`（防 stale）。
+/// 若 store 中找不到该 campaign，直接返回（无 campaign 模式）。
+pub fn fill_campaign_runtime_from_store(
+    ctx: &mut WritingContext,
+    tool_ctx: &Arc<RwLock<ToolContext>>,
+    store: &campaign_store::CampaignStore,
+    active_id: &Id,
+) {
+    let camp = match store.get_campaign(active_id) {
         Some(c) => c,
         None => return,
     };
     ctx.campaign_id = Some(active_id.clone());
     ctx.story_clock = camp.story_clock.clone();
     // turn = 已有 round_summaries 数 + 1（下一轮）
-    let existing_turns = store.list_summaries(&active_id).len() as u32;
+    let existing_turns = store.list_summaries(active_id).len() as u32;
     ctx.turn = existing_turns + 1;
     // pending_tasks：该 Campaign 下所有任务（build_director_user_msg 内部按触发条件过滤）
-    ctx.pending_tasks = store.list_tasks(&active_id);
+    ctx.pending_tasks = store.list_tasks(active_id);
 
     // 阶段 2：组装 CampaignRuntimeContext 快照
     // 加载 instances、card definitions、knowledge、tasks，构建纯 domain 快照
-    let instances = store.list_instances(&active_id);
-    let knowledge = store.list_knowledge(&active_id);
-    let tasks = store.list_tasks(&active_id);
+    let instances = store.list_instances(active_id);
+    let knowledge = store.list_knowledge(active_id);
+    let tasks = store.list_tasks(active_id);
 
     // 从 card 的 character_definitions 构建 definitions_by_id
     let definitions_by_id: std::collections::HashMap<
@@ -1687,7 +1702,7 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
 
     // 同步到 ToolContext（快照，非 store 引用）
     {
-        let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         tool_guard.campaign_runtime = Some(runtime);
     }
 }
@@ -1928,7 +1943,7 @@ fn normalize_knowledge_update_for_postprocess(
     )
 }
 
-fn is_postprocess_instance_present(
+pub fn is_postprocess_instance_present(
     inst: &storyforge_domain::campaign::CharacterInstance,
     raw_id: &Id,
     present_ids: &std::collections::HashSet<String>,

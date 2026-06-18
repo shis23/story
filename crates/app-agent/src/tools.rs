@@ -451,6 +451,17 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                                     format!("子 Agent 只能查询自己的角色信息，不能查询 '{name}'")
                                 ));
                             }
+                        } else {
+                            // P0 修复：已绑定 instance_id + 有 campaign_runtime，但绑定 id 在
+                            // runtime.instances 中找不到（stale / mismatched id）。旧实现会 fallthrough
+                            // 到下方未隔离的扁平 Character 搜索，导致信息泄漏。正常流程不可达
+                            // （spawn_subagents 用同一批 runtime 做匹配与 tool ctx），属
+                            // defense-in-depth 洞，此处硬失败以符合隔离意图。
+                            return Err(ToolError::NotFound(
+                                format!(
+                                    "子 Agent 绑定的 instance_id '{instance_id}' 在当前 Campaign runtime 中找不到，拒绝降级到扁平角色查询以防信息泄漏"
+                                )
+                            ));
                         }
                     }
                 }
@@ -769,6 +780,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["name"], "Seraphina");
+    }
+
+    /// P0 回归：子 Agent 已绑定 current_character_instance_id 且有 campaign_runtime，
+    /// 但绑定 id 在 runtime.instances 中找不到（stale/mismatched）时，必须硬失败 NotFound，
+    /// 不得 fallthrough 到未隔离的扁平 Character 搜索。
+    ///
+    /// 正常流程不可达（spawn_subagents 用同一批 runtime 做匹配与 tool ctx），本测试钉
+    /// defense-in-depth 不变量。修复前会泄漏扁平 ctx.characters 的角色数据。
+    #[tokio::test]
+    async fn test_subagent_get_character_bound_but_unresolvable_does_not_leak() {
+        let runtime = make_campaign_runtime_with_lin(); // 含 inst-lin
+        // 故意构造一个不在 runtime 中的 instance_id，并把一个扁平 Character 塞进 ctx.characters
+        let ctx = Arc::new(ToolContext {
+            characters: vec![make_flat_character("Seraphina")],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: Some(Id::from_str("inst-nonexistent")),
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_subagent_tools(&mut registry);
+
+        // 查扁平 Character 的名字 —— 修复前会泄漏 Seraphina 数据，修复后必须 NotFound
+        let result = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "Seraphina"}),
+                ctx,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "绑定但 unresolvable 的 instance_id 不应降级到扁平角色查询（信息泄漏）"
+        );
+        let err = result.unwrap_err();
+        match err {
+            ToolError::NotFound(_) => {}
+            other => panic!("期望 NotFound，实际: {other:?}"),
+        }
     }
 
     // ── tool_whitelist：ToolRegistry::retain / filter_registry_by_whitelist ──
