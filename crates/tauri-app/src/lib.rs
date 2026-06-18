@@ -1794,32 +1794,34 @@ fn persist_postprocess_outcome(
         let present_ids: std::collections::HashSet<String> =
             present_chars.iter().map(|s| s.clone()).collect();
 
+        // P4：算 name_collisions——campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效逼 id
+        let name_collisions: std::collections::HashSet<String> = {
+            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for inst in store.list_instances(camp_id) {
+                *name_counts.entry(inst.name).or_insert(0) += 1;
+            }
+            name_counts.into_iter()
+                .filter(|(_, count)| *count >= 2)
+                .map(|(name, _)| name)
+                .collect()
+        };
+
         // 知识：update → entry（assign campaign_id + turn）
         // 只写入 present_chars 中的角色知识（信息隔离：不出场角色不应被后处理写入知识）
         let knowledge_entries: Vec<_> = pp
             .knowledge_updates
             .iter()
             .filter_map(|u| {
-                if present_ids.is_empty() {
-                    // 无 present_chars 约束时全部写入（向后兼容逃生口，P3 待收紧）
-                    tracing::warn!("postprocess 知识写回: present_chars 为空集，放行全部知识更新（P3 待收紧）");
-                    normalize_knowledge_update_for_postprocess(
-                        store,
-                        camp_id,
-                        u,
-                        ctx.turn,
-                        &present_ids,
-                    )
-                } else {
-                    // 按 id 或 name 匹配 present_chars
-                    normalize_knowledge_update_for_postprocess(
-                        store,
-                        camp_id,
-                        u,
-                        ctx.turn,
-                        &present_ids,
-                    )
-                }
+                // P3: normalize 内部按 source 分流（ToldByOther/Backstory 不查在场）
+                // P4: name_collisions 同名时 name 路失效
+                normalize_knowledge_update_for_postprocess(
+                    store,
+                    camp_id,
+                    u,
+                    ctx.turn,
+                    &present_ids,
+                    &name_collisions,
+                )
             })
             .collect();
         if !knowledge_entries.is_empty() {
@@ -1831,8 +1833,8 @@ fn persist_postprocess_outcome(
             if let Some(inst_id) = &vu.instance_id {
                 // instance_id 可能是角色名（后处理 Agent 按名字输出），尝试匹配 campaign 内 instance
                 if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
-                    // 校验：该 instance 是否在 present_chars 中
-                    let is_present = is_postprocess_instance_present(&inst, inst_id, &present_ids);
+                    // 校验：该 instance 是否在 present_chars 中（P4: 同名时 name 路失效）
+                    let is_present = is_postprocess_instance_present(&inst, inst_id, &present_ids, &name_collisions);
                     if is_present {
                         let mut inst = inst;
                         inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
@@ -1897,12 +1899,15 @@ fn normalize_task_update_for_postprocess(
 }
 
 /// 按名字或 Id 查 campaign 内的 CharacterInstance（后处理 Agent 输出的是角色名，需翻译成 instance）
-fn normalize_knowledge_update_for_postprocess(
+/// P3：内部按 KnowledgeSource 分流——ToldByOther/Backstory 不查在场直接放行，Witnessed/Inferred 才查在场。
+/// P4：同名收紧——name_collisions 传入 campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效。
+pub fn normalize_knowledge_update_for_postprocess(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
     update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
     turn: u32,
     present_ids: &std::collections::HashSet<String>,
+    name_collisions: &std::collections::HashSet<String>,
 ) -> Option<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
     let target = match find_instance_by_name_or_id(store, camp_id, &update.character_id) {
         Some(inst) => inst,
@@ -1915,12 +1920,24 @@ fn normalize_knowledge_update_for_postprocess(
         }
     };
 
-    if !is_postprocess_instance_present(&target, &update.character_id, present_ids) {
-        tracing::warn!(
-            "跳过非在场角色 '{}' 的知识写入（present_chars 校验）",
-            target.name
-        );
-        return None;
+    // P3 分流：ToldByOther/Backstory 不受在场约束（跨在场告知 + 开局已有），
+    // Witnessed/Inferred 才查在场。
+    let knowledge_exempt_from_presence = matches!(
+        update.source,
+        storyforge_domain::character_knowledge::KnowledgeSource::ToldByOther
+            | storyforge_domain::character_knowledge::KnowledgeSource::Backstory
+    );
+    if !knowledge_exempt_from_presence {
+        // 知识路径收紧：空集时 Witnessed/Inferred 也拒绝（无人在场不可能见证/推断）
+        // 注意：is_postprocess_instance_present 的空集放行仍服务变量路径，此处绕过它。
+        if present_ids.is_empty() || !is_postprocess_instance_present(&target, &update.character_id, present_ids, name_collisions) {
+            tracing::warn!(
+                "跳过非在场角色 '{}' 的知识写入（source={:?}，present_chars 校验）",
+                target.name,
+                update.source
+            );
+            return None;
+        }
     }
 
     let source_character_id = update
@@ -1948,10 +1965,11 @@ pub fn is_postprocess_instance_present(
     inst: &storyforge_domain::campaign::CharacterInstance,
     raw_id: &Id,
     present_ids: &std::collections::HashSet<String>,
+    name_collisions: &std::collections::HashSet<String>,
 ) -> bool {
     if present_ids.is_empty() {
         tracing::warn!(
-            "postprocess 写回: present_chars 为空集，放行 '{}'（向后兼容逃生口，P3 待收紧）",
+            "postprocess 写回: present_chars 为空集，放行 '{}'（向后兼容逃生口，变量路径仍依赖）",
             inst.name
         );
         return true;
@@ -1960,10 +1978,10 @@ pub fn is_postprocess_instance_present(
     if present_ids.contains(raw_id.as_str()) || present_ids.contains(inst.id.as_str()) {
         return true;
     }
-    // name 路兜底：同名 instance 歧义风险（P4）
-    if present_ids.contains(&inst.name) {
+    // name 路兜底：P4 同名收紧——campaign 内存在同名 instance 时 name 路失效，逼 id
+    if present_ids.contains(&inst.name) && !name_collisions.contains(&inst.name) {
         tracing::debug!(
-            "postprocess 写回: '{}' 通过 name 匹配在场（非 id 匹配，P4 同名歧义风险）",
+            "postprocess 写回: '{}' 通过 name 匹配在场（非 id 匹配）",
             inst.name
         );
         return true;
@@ -4915,6 +4933,7 @@ mod tests {
             &update,
             7,
             &present_ids,
+            &HashSet::new(),
         )
         .expect("name target should resolve to campaign instance");
 
@@ -4960,6 +4979,7 @@ mod tests {
             &update,
             7,
             &present_ids,
+            &HashSet::new(),
         );
 
         assert!(entry.is_none());
@@ -5003,6 +5023,7 @@ mod tests {
             &update,
             7,
             &present_ids,
+            &HashSet::new(),
         )
         .expect("target should resolve");
 
@@ -5042,6 +5063,7 @@ mod tests {
             &update,
             7,
             &present_ids,
+            &HashSet::new(),
         );
 
         assert!(entry.is_none());
@@ -5589,6 +5611,7 @@ mod tests {
             &update,
             1,
             &present_ids,
+            &HashSet::new(),
         );
 
         assert!(
