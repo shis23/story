@@ -1,13 +1,13 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   listCards, getCard, extractCharacters,
-  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
-  listInstances, getCharacterVariables, setCharacterVariable,
-  promoteTemporaryInstance,
-  listCharacterKnowledge, listTasks, createTask, completeTask, abandonTask,
-  listRoundSummaries
+  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign
 } from '../tauri-api.js'
+import CampaignInstancesTab from './CampaignInstancesTab.vue'
+import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
+import CampaignTasksTab from './CampaignTasksTab.vue'
+import CampaignSummariesTab from './CampaignSummariesTab.vue'
 
 const emit = defineEmits(['close', 'campaign-changed'])
 
@@ -17,7 +17,7 @@ const activeTab = ref('cards') // 'cards' | 'campaigns' | 'detail'
 // ─── Cards 状态 ───
 const cards = ref([])
 const loadingCards = ref(false)
-const extractingCardId = ref(null) // 正在识别的卡 ID
+const extractingCardId = ref(null)
 const expandedCardId = ref(null)
 const cardDetail = ref(null)
 
@@ -32,13 +32,13 @@ const creatingCampaign = ref(false)
 
 // ─── Detail 状态 ───
 const selectedCampaignId = ref(null)
-const instances = ref([])
-const knowledge = ref([])
-const tasks = ref([])
-const summaries = ref([])
-const expandedInstanceId = ref(null)
-const instanceVariables = ref([])
-const promotingInstanceId = ref(null) // 正在升格的临时 instance ID
+const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'tasks' | 'summaries'
+
+// ─── 子组件 template refs ───
+const instancesTabRef = ref(null)
+const knowledgeTabRef = ref(null)
+const tasksTabRef = ref(null)
+const summariesTabRef = ref(null)
 
 // ─── 初始化 ───
 onMounted(async () => {
@@ -61,7 +61,6 @@ async function handleExtract(card) {
   try {
     const result = await extractCharacters(card.source_character_id)
     await refreshCards()
-    // 自动展开刚识别的卡
     expandedCardId.value = result.id
     cardDetail.value = await getCard(result.id)
   } catch (e) {
@@ -100,7 +99,6 @@ async function handleCreateCampaign() {
     newCampaignName.value = ''
     showNewCampaign.value = false
     await refreshCampaigns()
-    // 自动设为活跃
     await handleSetActive(result.id)
   } catch (e) {
     alert('创建失败: ' + e)
@@ -118,113 +116,21 @@ async function handleSetActive(campaignId) {
 async function openCampaignDetail(campaignId) {
   selectedCampaignId.value = campaignId
   activeTab.value = 'detail'
-  await refreshDetail()
+  // 子组件各自 onMounted 加载，不需要 refreshDetail 全拉
 }
 
-// ─── Detail 操作 ───
-const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'tasks' | 'summaries'
-
-async function refreshDetail() {
-  if (!selectedCampaignId.value) return
-  const cid = selectedCampaignId.value
-  instances.value = await listInstances(cid)
-  knowledge.value = await listCharacterKnowledge(cid)
-  tasks.value = await listTasks(cid)
-  summaries.value = await listRoundSummaries(cid)
-}
-
-async function toggleInstance(inst) {
-  if (expandedInstanceId.value === inst.id) {
-    expandedInstanceId.value = null
-    instanceVariables.value = []
-  } else {
-    expandedInstanceId.value = inst.id
-    instanceVariables.value = await getCharacterVariables(selectedCampaignId.value, inst.id)
+// ─── 刷新当前活跃的 detail 子 tab ───
+function refreshActiveDetailTab() {
+  const refMap = {
+    instances: instancesTabRef,
+    knowledge: knowledgeTabRef,
+    tasks: tasksTabRef,
+    summaries: summariesTabRef,
   }
-}
-
-async function handleVariableChange(instanceId, key, value) {
-  try {
-    // 仅解析布尔字面量；数字/字符串保持原样，由后端 schema 决定类型。
-    // 历史 bug：启发式 Number(value) 会把纯数字字符串（如电话号 "13800001111"）
-    // 强转 Number 丢失前导零/精度，或把 "0x1F"/"1e3" 这种字面量悄悄转换。
-    let parsed = value
-    if (value === 'true') parsed = true
-    else if (value === 'false') parsed = false
-
-    await setCharacterVariable(selectedCampaignId.value, instanceId, key, parsed)
-    // 刷新变量
-    instanceVariables.value = await getCharacterVariables(selectedCampaignId.value, instanceId)
-  } catch (e) {
-    alert('设置变量失败: ' + e)
+  const tabRef = refMap[detailSubTab.value]
+  if (tabRef.value?.refresh) {
+    tabRef.value.refresh()
   }
-}
-
-async function handlePromoteTemporary(inst) {
-  if (!selectedCampaignId.value) return
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask(`确定将「${inst.name || inst.character_name}」升格为常驻角色？`, { title: '升格确认', kind: 'info' })
-  if (!ok) return
-  promotingInstanceId.value = inst.id
-  try {
-    await promoteTemporaryInstance(selectedCampaignId.value, inst.id)
-    await refreshDetail()
-  } catch (e) {
-    alert('升格失败: ' + e)
-  } finally {
-    promotingInstanceId.value = null
-  }
-}
-
-// ─── 任务操作 ───
-const showNewTask = ref(false)
-const newTaskTitle = ref('')
-const newTaskDesc = ref('')
-
-async function handleCreateTask() {
-  if (!newTaskTitle.value.trim()) return
-  try {
-    await createTask(selectedCampaignId.value, newTaskTitle.value.trim(), newTaskDesc.value.trim(), [{ kind: 'manual' }])
-    newTaskTitle.value = ''
-    newTaskDesc.value = ''
-    showNewTask.value = false
-    tasks.value = await listTasks(selectedCampaignId.value)
-  } catch (e) {
-    alert('创建任务失败: ' + e)
-  }
-}
-
-async function handleCompleteTask(taskId) {
-  await completeTask(taskId)
-  tasks.value = await listTasks(selectedCampaignId.value)
-}
-
-async function handleAbandonTask(taskId) {
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask('确定放弃该任务？', { title: '放弃确认', kind: 'warning' })
-  if (!ok) return
-  await abandonTask(taskId)
-  tasks.value = await listTasks(selectedCampaignId.value)
-}
-
-function taskStatusText(status) {
-  if (typeof status === 'string') return status
-  if (status?.likely_completed != null) return `likely (${Math.round(status.likely_completed * 100)}%)`
-  return JSON.stringify(status)
-}
-
-function taskStatusClass(status) {
-  const s = typeof status === 'string' ? status : ''
-  if (s === 'pending') return 'bg-wait/10 text-wait'
-  if (s === 'active') return 'bg-running/10 text-running'
-  if (s === 'completed') return 'bg-ok/10 text-ok'
-  if (s === 'abandoned') return 'bg-ink-soft/10 text-ink-soft'
-  return 'bg-warn/10 text-warn'
-}
-
-function knowledgeSourceText(source) {
-  const map = { witnessed: '👁 亲眼', told_by_other: '💬 被告知', inferred: '🔮 推断', backstory: '📖 背景' }
-  return map[source] || source
 }
 </script>
 
@@ -402,7 +308,7 @@ function knowledgeSourceText(source) {
           <template v-else>
             <!-- 刷新按钮 -->
             <div class="flex justify-end mb-1">
-              <button @click="refreshDetail()" class="px-2.5 py-1 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line">刷新</button>
+              <button @click="refreshActiveDetailTab()" class="px-2.5 py-1 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line">刷新</button>
             </div>
 
             <!-- 子 Tab 切换条 -->
@@ -417,165 +323,32 @@ function knowledgeSourceText(source) {
             </div>
 
             <!-- ▸ 子 Tab: 角色实例 -->
-            <div v-if="detailSubTab === 'instances'">
-              <div v-if="instances.length === 0" class="text-center text-ink-soft text-sm py-8">暂无角色实例</div>
-
-              <div
-                v-for="inst in instances" :key="inst.id"
-                class="bg-surface rounded-xl border border-line overflow-hidden mb-2"
-              >
-                <!-- 实例头部 -->
-                <div
-                  class="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-bg transition-colors"
-                  @click="toggleInstance(inst)"
-                >
-                  <div class="flex-1 min-w-0">
-                    <div class="text-sm font-medium text-ink truncate">
-                      {{ inst.name || inst.character_name }}
-                      <span v-if="inst.is_temporary" class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-warn/10 text-warn">临时</span>
-                    </div>
-                    <div class="text-xs text-ink-soft">
-                      {{ inst.role_type || '' }}
-                      <span v-if="inst.is_active" class="text-ok ml-1">● 存活</span>
-                      <span v-else class="text-ink-soft ml-1">○ 离场</span>
-                    </div>
-                  </div>
-                  <button
-                    v-if="inst.is_temporary"
-                    @click.stop="handlePromoteTemporary(inst)"
-                    :disabled="promotingInstanceId === inst.id"
-                    class="px-2 py-1 rounded-full text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
-                  >{{ promotingInstanceId === inst.id ? '升格中…' : '升格为常驻' }}</button>
-                  <span class="text-ink-soft text-xs">{{ expandedInstanceId === inst.id ? '▲' : '▼' }}</span>
-                </div>
-
-                <!-- 实例展开：变量编辑 -->
-                <div v-if="expandedInstanceId === inst.id" class="border-t border-line px-3 py-2 space-y-2">
-                  <div class="text-xs font-medium text-ink-soft mb-1">变量</div>
-                  <div v-if="instanceVariables.length === 0" class="text-xs text-ink-soft">暂无变量</div>
-                  <div
-                    v-for="v in instanceVariables" :key="v.key"
-                    class="flex items-center gap-2"
-                  >
-                    <span class="text-xs text-ink-soft w-24 truncate shrink-0" :title="v.key">{{ v.key }}</span>
-                    <input
-                      :value="typeof v.value === 'object' ? JSON.stringify(v.value) : String(v.value)"
-                      @change="handleVariableChange(inst.id, v.key, $event.target.value)"
-                      class="flex-1 px-2 py-1 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent"
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
+            <CampaignInstancesTab
+              v-if="detailSubTab === 'instances'"
+              ref="instancesTabRef"
+              :campaign-id="selectedCampaignId"
+            />
 
             <!-- ▸ 子 Tab: 知识 -->
-            <div v-if="detailSubTab === 'knowledge'">
-              <div v-if="knowledge.length === 0" class="text-center text-ink-soft text-sm py-8">暂无知识</div>
-
-              <template v-else>
-                <div v-for="src in ['witnessed','told_by_other','inferred','backstory']" :key="src">
-                  <div v-if="knowledge.filter(k => k.source === src).length > 0" class="mb-3">
-                    <div class="text-xs font-medium text-ink-soft mb-1.5">{{ knowledgeSourceText(src) }}</div>
-                    <div
-                      v-for="k in knowledge.filter(k => k.source === src)" :key="k.id"
-                      class="bg-surface rounded-xl border border-line px-3 py-2 mb-1.5"
-                    >
-                      <div class="text-xs text-ink">{{ k.content }}</div>
-                      <div v-if="k.character_name" class="text-[10px] text-ink-soft mt-1">— {{ k.character_name }}</div>
-                    </div>
-                  </div>
-                </div>
-              </template>
-            </div>
+            <CampaignKnowledgeTab
+              v-if="detailSubTab === 'knowledge'"
+              ref="knowledgeTabRef"
+              :campaign-id="selectedCampaignId"
+            />
 
             <!-- ▸ 子 Tab: 任务 -->
-            <div v-if="detailSubTab === 'tasks'">
-              <!-- 新建任务表单 -->
-              <div v-if="showNewTask" class="bg-surface rounded-xl border border-line p-3 space-y-2 mb-3">
-                <div class="text-xs font-medium text-ink">新建任务</div>
-                <input
-                  v-model="newTaskTitle"
-                  placeholder="任务标题"
-                  class="w-full px-3 py-2 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
-                  @keyup.enter="handleCreateTask"
-                />
-                <textarea
-                  v-model="newTaskDesc"
-                  placeholder="任务描述（可选）"
-                  rows="2"
-                  class="w-full px-3 py-2 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent resize-none"
-                ></textarea>
-                <div class="flex gap-2">
-                  <button @click="showNewTask = false" class="flex-1 py-1.5 rounded-lg text-xs bg-bg text-ink-soft">取消</button>
-                  <button
-                    @click="handleCreateTask"
-                    :disabled="!newTaskTitle.trim()"
-                    class="flex-1 py-1.5 rounded-lg text-xs font-medium bg-accent text-white disabled:opacity-50"
-                  >创建</button>
-                </div>
-              </div>
-
-              <div v-if="tasks.length === 0 && !showNewTask" class="text-center py-8">
-                <div class="text-ink-soft text-sm mb-3">暂无任务</div>
-                <button @click="showNewTask = true" class="px-4 py-2 rounded-lg text-xs font-medium bg-accent text-white">新建任务</button>
-              </div>
-
-              <!-- 任务列表 -->
-              <div
-                v-for="task in tasks" :key="task.id"
-                class="bg-surface rounded-xl border border-line px-3 py-2.5 mb-2"
-              >
-                <div class="flex items-start gap-2">
-                  <div class="flex-1 min-w-0">
-                    <div class="text-sm font-medium text-ink">{{ task.title }}</div>
-                    <div v-if="task.description" class="text-xs text-ink-soft mt-0.5 line-clamp-2">{{ task.description }}</div>
-                    <div class="flex items-center gap-2 mt-1.5">
-                      <span class="px-1.5 py-0.5 rounded text-[10px]" :class="taskStatusClass(task.status)">
-                        {{ taskStatusText(task.status) }}
-                      </span>
-                      <span v-if="task.source_tags?.length" class="text-[10px] text-ink-soft">
-                        {{ task.source_tags.join(', ') }}
-                      </span>
-                    </div>
-                  </div>
-                  <div class="flex flex-col gap-1 shrink-0">
-                    <button
-                      v-if="task.status !== 'completed' && task.status?.likely_completed == null"
-                      @click="handleCompleteTask(task.id)"
-                      class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20"
-                    >完成</button>
-                    <button
-                      v-if="task.status !== 'completed' && task.status !== 'abandoned'"
-                      @click="handleAbandonTask(task.id)"
-                      class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20"
-                    >放弃</button>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 有任务时仍可新建 -->
-              <button
-                v-if="tasks.length > 0 && !showNewTask"
-                @click="showNewTask = true"
-                class="w-full py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line"
-              >+ 新建任务</button>
-            </div>
+            <CampaignTasksTab
+              v-if="detailSubTab === 'tasks'"
+              ref="tasksTabRef"
+              :campaign-id="selectedCampaignId"
+            />
 
             <!-- ▸ 子 Tab: 摘要 -->
-            <div v-if="detailSubTab === 'summaries'">
-              <div v-if="summaries.length === 0" class="text-center text-ink-soft text-sm py-8">暂无摘要</div>
-
-              <div
-                v-for="s in summaries" :key="s.id"
-                class="bg-surface rounded-xl border border-line px-3 py-2.5 mb-2"
-              >
-                <div class="flex items-center gap-2 mb-1">
-                  <span class="text-xs font-medium text-ink">第 {{ s.round_number }} 轮</span>
-                  <span v-if="s.created_at" class="text-[10px] text-ink-soft">{{ s.created_at }}</span>
-                </div>
-                <div class="text-xs text-ink-soft leading-relaxed">{{ s.summary }}</div>
-              </div>
-            </div>
+            <CampaignSummariesTab
+              v-if="detailSubTab === 'summaries'"
+              ref="summariesTabRef"
+              :campaign-id="selectedCampaignId"
+            />
           </template>
         </template>
       </div>

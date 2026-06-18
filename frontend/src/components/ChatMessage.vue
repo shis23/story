@@ -35,7 +35,12 @@ const variantCount = computed(() => props.message.variants.length)
 const subagentRoles = computed(() => {
   const prov = currentVariant.value?.provenance
   if (!prov?.subagent_results) return []
-  return prov.subagent_results.map((s) => s.character_id).filter(Boolean)
+  return prov.subagent_results
+    .filter(s => s.character_id)
+    .map(s => ({
+      id: s.character_id,        // 稳定 ID，用于 reroll target
+      label: s.display_name || s.character_id,  // 显示名
+    }))
 })
 
 function switchVariant(delta) {
@@ -199,11 +204,11 @@ function rerollUser() {
             <div class="border-t border-line my-1"></div>
             <button
               v-for="role in subagentRoles"
-              :key="role"
-              @click="pickReroll('subagent:' + role)"
+              :key="role.id"
+              @click="pickReroll('subagent:' + role.id)"
               class="w-full text-left px-3 py-2 text-accent hover:bg-accent-soft"
             >
-              ⭐ 只重跑 · {{ role }}（子Agent）
+              ⭐ 只重跑 · {{ role.label }}（子Agent）
             </button>
             <div class="px-3 py-1.5 text-[11px] text-ink-soft">省 60% token</div>
           </template>

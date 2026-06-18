@@ -15,7 +15,7 @@ import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listPlugins, extractCharacters } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -31,6 +31,23 @@ const showCharList = ref(false)
 const showCampaignPanel = ref(false)
 const showMetaPanel = ref(false)
 const activeCampaign = ref(null)
+
+// ─── 实例名映射（instance_id → display_name，供 Pipeline trace 显示） ───
+const instanceNameMap = ref({})
+async function loadInstanceNameMap() {
+  if (!activeCampaign.value) { instanceNameMap.value = {}; return }
+  try {
+    const insts = await listInstances(activeCampaign.value.id)
+    const map = {}
+    for (const inst of insts) {
+      if (inst.id) map[inst.id] = inst.name || inst.character_name || ''
+    }
+    instanceNameMap.value = map
+  } catch (e) {
+    console.error('加载实例名映射失败:', e)
+  }
+}
+
 const showPresetPanel = ref(false)
 const showPluginPanel = ref(false)
 const sidebarPlugins = ref([])
@@ -103,7 +120,10 @@ onMounted(async () => {
   try { appVersion.value = await getVersion() } catch (e) { console.error('getVersion:', e) }
   await refreshActiveConnection()
   await loadConversationHistory()
-  try { activeCampaign.value = await getActiveCampaign() } catch (e) { console.error('getActiveCampaign:', e) }
+  try {
+    activeCampaign.value = await getActiveCampaign()
+    await loadInstanceNameMap()
+  } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()
 })
@@ -370,6 +390,7 @@ async function startWriting(intent, skipLocalPush = false) {
 
     pipeline.state = 'done'
     pipeline.stateLabel = '已完成'
+    loadInstanceNameMap() // 刷新实例名映射（可能新增临时实例）
     scrollToBottom()
   } catch (err) {
     // 失败回滚：移除已 push 的用户消息（无对应 AI 回复，残留会误导重试）
@@ -445,6 +466,7 @@ async function handleReroll({ messageId, kind, hint }) {
 
     pipeline.state = 'done'
     pipeline.stateLabel = '重 roll 完成'
+    loadInstanceNameMap()
     // result 含最终成文，但 UI 已由 refreshed 驱动，无需单独消费
     void result
   } catch (err) {
@@ -561,6 +583,7 @@ async function handleRerollUser({ messageId }) {
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'done'
     pipeline.stateLabel = '重 roll 完成'
+    loadInstanceNameMap()
     scrollToBottom()
   } catch (err) {
     pipeline.state = 'error'
@@ -632,7 +655,7 @@ function handlePipelineEvent(event) {
     case 'subagent_started':
       pipeline.subagents[event.data.index] = {
         id: event.data.character_id,
-        name: event.data.character_id,
+        name: instanceNameMap.value[event.data.character_id] || event.data.character_id,
         emoji: event.data.emoji || '🎭',
         status: 'running',
         progress: 0,
@@ -1011,7 +1034,7 @@ function handlePipelineEvent(event) {
     <CampaignPanel
       v-if="showCampaignPanel"
       @close="showCampaignPanel = false"
-      @campaign-changed="(c) => activeCampaign = c"
+      @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }"
     />
 
     <!-- Meta 配置助手弹层（P3 新增） -->
