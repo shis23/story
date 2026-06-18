@@ -51,9 +51,18 @@
 - A 角色私有知识不会泄漏给 B 角色。
 - 任务触发能被 Director 稳定看到。
 
+**隔离加固（2026-06-18，harness 收尾）**：
+
+- ✅ P0：子 agent get_character 绑定-unresolvable 读侧泄漏已修 + 钉测。
+- ✅ I1 对抗性探针实跑通过（`deepseek-v4-flash`）：对抗 prompt 成功诱导 LLM 尝试越权查询 `get_character("Chen")`，被 P0 拦下返回 NotFound，成文拿不出真秘密——隔离在 LLM 行为层端到端生效。
+- ✅ P3：知识写回门禁按 `KnowledgeSource` 分流——`Witnessed`/`Inferred` 受在场约束，`ToldByOther`/`Backstory` 放行（跨在场告知/开局知识）。空集不再 hack 式全放行。
+- ✅ P4：同名 instance 时 name 匹配路失效逼 id，消除同名写串。
+- ⏳ 知识传播引擎（身份组广播/传话链/秘密封口）单独立项 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`，作为 Phase 2 增强项。
+
 详细计划见：
 
 - `docs/PLAN-CAMPAIGN-MAINLINE.md` 的阶段 5-6。
+- 隔离加固详情见 `docs/HARNESS-FINDINGS-2026-06-18.md`。
 
 ## Phase 3: Meta Agent 维护层
 
@@ -82,7 +91,7 @@
 
 ## Phase 4: 前端工作台重构
 
-**状态：进行中**（阶段 1/3/4 部分起步、5 基本完成、2/6 未开始；约 30%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：进行中**（阶段 1/2/5 完成、3/4/6 未开始；约 45%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：让前端围绕 Campaign 工作流，而不是围绕零散面板。
 

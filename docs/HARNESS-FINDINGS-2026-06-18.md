@@ -230,11 +230,13 @@ Round 2 执行后逐条核实代码，发现 1 个真 bug 和 1 个被削弱的�
 - **director_only 翻断言核实为正确**：审计确认 `validate_partial_roll`（app-conversation:488）确有"不能只重导演却保留旧子产出"约束，原 Round 1 `is_ok()` 才错（`#[ignore]` 从没真跑过）。仅修正过时注释。
 - **F2 terminal_tools 核实为正确**：`AgentConfig.terminal_tools` + 双路检查 + 单测 + character_extractor 接线均核实，根因诊断比 handoff 的 A/B 框架更准。
 
-## 待办（worktree 拆分，2026-06-18）
+## 待办（worktree 拆分，2026-06-18）—— 全部完成并合并
 
 | Worktree | 分支 | 任务 | 状态 |
 |---|---|---|---|
-| W1 | `w1-docs` | 本文档收尾 + 新增 `PLAN-KNOWLEDGE-PROPAGATION.md` | 进行中 |
-| W2 | `w2-i1` | I1 真实 LLM 实跑（需 API key） | 待 API key |
-| W3 | `w3-p3p4` | P3 按 `KnowledgeSource` 分流 + P4 方案A 同名收紧 | 待执行 |
-| W4 | `w4-frontend` | Phase 4 前端工作台重构（独立长期线） | 待执行 |
+| W1 | `w1-docs` | 本文档收尾 + 新增 `PLAN-KNOWLEDGE-PROPAGATION.md` | ✅ 合并 |
+| W2 | `w2-i1` | I1 真实 LLM 实跑（情况A 通过，18.52s） | ✅ 合并 |
+| W3 | `w3-p3p4` | P3 按 `KnowledgeSource` 分流 + P4 方案A 同名收紧 | ✅ 合并 |
+| W4 | `w4-frontend` | Phase 4 阶段 2 写作入口绑定 active Campaign | ✅ 合并（阶段 3/4/6 待续） |
+
+四条均在 worktree 独立完成、审计核实、合并回 main（`08e47ff`），合并后 `cargo test --workspace` 全绿 0 回归。
