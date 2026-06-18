@@ -4610,6 +4610,222 @@ fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
         .collect()
 }
 
+// ─── 导出命令（W7: ST 卡 PNG + 共享 Lorebook + JSON Bundle）─────────────────
+
+/// 导出的文件 DTO（文件名 + 字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedFile {
+    pub filename: String,
+    pub data: Vec<u8>,
+}
+
+/// Campaign 导出结果 DTO（多角色 PNG + 共享 lorebook）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignExportResult {
+    /// 每个角色的 ST 卡 PNG
+    pub cards: Vec<ExportedFile>,
+    /// 共享 lorebook JSON（ST 格式，可独立保存）
+    pub lorebook_json: String,
+}
+
+/// StoryForge JSON Bundle 格式版本
+const BUNDLE_FORMAT_VERSION: u32 = 1;
+
+/// StoryForge Campaign 完整 JSON Bundle
+#[derive(Debug, Serialize, Deserialize)]
+struct CampaignBundle {
+    format_version: u32,
+    exported_at: String,
+    campaign: storyforge_domain::campaign::Campaign,
+    instances: Vec<storyforge_domain::campaign::CharacterInstance>,
+    /// key = definition_id
+    definitions: Vec<storyforge_domain::character::CharacterDefinition>,
+    knowledge: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>,
+    tasks: Vec<storyforge_domain::story_task::StoryTask>,
+    summaries: Vec<storyforge_domain::agent::RoundSummary>,
+}
+
+/// 导出单个角色卡为 ST PNG
+///
+/// 从 CharacterStore 取原始 Character（含 raw_card_json），
+/// 用 to_st_data 构建 StCharacterData，再写入 PNG。
+#[tauri::command]
+fn export_st_card_png(character_id: String) -> Result<Vec<u8>, String> {
+    let stored = get_store()
+        .get(&character_id)
+        .ok_or_else(|| format!("角色卡不存在: {character_id}"))?;
+
+    // 从 CharacterStore 恢复 Character（精简版，但够 to_st_data 用）
+    let character = stored_info_to_character(&stored);
+
+    // 构建 ST 数据（用内嵌世界书作为 character_book）
+    let book = character
+        .embedded_world_info
+        .as_ref()
+        .map(|b| b.to_st_book());
+    let st_data = storyforge_domain::character::to_st_data(&character, None, book);
+    let card = storyforge_infra_import::png::make_st_card(st_data, &character.spec_version);
+
+    storyforge_infra_import::png::write_st_card_png(&card, None)
+        .map_err(|e| format!("PNG 导出失败: {e}"))
+}
+
+/// 导出 Campaign 全部角色为 ST PNG + 共享 lorebook
+///
+/// 策略（用户已定）：每角色一张 PNG + 共享 lorebook。
+/// 共享知识/世界书转 ST lorebook 格式。
+#[tauri::command]
+fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult, String> {
+    let store = get_campaign_store();
+    let camp_id = Id::from_str(&campaign_id);
+
+    let campaign = store
+        .get_campaign(&camp_id)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+
+    let stored_card = store
+        .get_card(&campaign.card_id)
+        .ok_or_else(|| format!("Campaign 关联的卡不存在: {}", campaign.card_id))?;
+
+    let instances = store.list_instances(&camp_id);
+    if instances.is_empty() {
+        return Err("Campaign 无角色实例，无法导出".into());
+    }
+
+    // 构建共享 lorebook（Campaign 级知识 → ST WorldInfoBook）
+    let shared_knowledge = store.list_knowledge(&camp_id);
+    let shared_lorebook = knowledge_to_st_book(&shared_knowledge);
+    let shared_lorebook_json =
+        serde_json::to_string_pretty(&shared_lorebook).unwrap_or_else(|_| "{}".into());
+
+    // 尝试从 CharacterStore 获取原始 Character（用于 raw_card_json）
+    let original_character = get_store()
+        .get(&stored_card.card.source_character_id.as_str())
+        .map(|s| stored_info_to_character(&s));
+
+    let mut cards = Vec::new();
+    for inst in &instances {
+        // 找到对应的 definition
+        let definition = inst
+            .definition_id
+            .as_ref()
+            .and_then(|did| stored_card.card.character_definitions.iter().find(|d| d.id == *did));
+
+        let (st_data, spec_version) = if let (Some(character), Some(def)) = (&original_character, definition) {
+            // 有原始 Character → 用 to_st_data（round-trip 保底）
+            let book = character
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.to_st_book());
+            let data = storyforge_domain::character::to_st_data(character, Some(def), book);
+            (data, character.spec_version.clone())
+        } else if let Some(def) = definition {
+            // 只有 Card + Definition → 用 to_st_data_from_card
+            let data = storyforge_domain::character::to_st_data_from_card(
+                &stored_card.card,
+                def,
+                None,
+            );
+            (data, "3.0".into())
+        } else {
+            // 临时角色（无 definition）→ 用 instance 名字构建最小卡
+            let data = storyforge_domain::character::empty_st_data(&inst.name);
+            (data, "3.0".into())
+        };
+
+        let card = storyforge_infra_import::png::make_st_card(st_data, &spec_version);
+        let png_bytes = storyforge_infra_import::png::write_st_card_png(&card, None)
+            .map_err(|e| format!("PNG 导出失败 ({}): {e}", inst.name))?;
+
+        let filename = sanitize_filename(&format!("{}.png", inst.name));
+        cards.push(ExportedFile {
+            filename,
+            data: png_bytes,
+        });
+    }
+
+    Ok(CampaignExportResult {
+        cards,
+        lorebook_json: shared_lorebook_json,
+    })
+}
+
+/// 导出 StoryForge Campaign 完整 JSON Bundle
+///
+/// 包含 Campaign 元数据 + Instances + Definitions + Knowledge + Tasks + Summaries。
+#[tauri::command]
+fn export_campaign_bundle(campaign_id: String) -> Result<String, String> {
+    let store = get_campaign_store();
+    let camp_id = Id::from_str(&campaign_id);
+
+    let campaign = store
+        .get_campaign(&camp_id)
+        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+
+    let stored_card = store.get_card(&campaign.card_id);
+    let instances = store.list_instances(&camp_id);
+    let definitions: Vec<_> = stored_card
+        .as_ref()
+        .map(|c| c.card.character_definitions.clone())
+        .unwrap_or_default();
+    let knowledge = store.list_knowledge(&camp_id);
+    let tasks = store.list_tasks(&camp_id);
+    let summaries = store.list_summaries(&camp_id);
+
+    let bundle = CampaignBundle {
+        format_version: BUNDLE_FORMAT_VERSION,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        campaign,
+        instances,
+        definitions,
+        knowledge,
+        tasks,
+        summaries,
+    };
+
+    serde_json::to_string_pretty(&bundle).map_err(|e| format!("Bundle 序列化失败: {e}"))
+}
+
+/// 把 CharacterKnowledgeEntry 列表转为 ST WorldInfoBook（导出用）
+fn knowledge_to_st_book(
+    entries: &[storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
+) -> storyforge_domain::character::StWorldInfoBook {
+    use storyforge_domain::character::{StWorldInfoBook, StWorldInfoEntry};
+
+    let st_entries: Vec<StWorldInfoEntry> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| StWorldInfoEntry {
+            id: Some(i as i32 + 1),
+            keys: vec![e.knowledge_text.chars().take(20).collect()],
+            secondary_keys: None,
+            content: Some(e.knowledge_text.clone()),
+            constant: e.pinned,     // pinned → 蓝灯（常驻）
+            selective: !e.pinned,   // 非 pinned → 绿灯（选择性）
+            selective_logic: None,
+            position: Some(serde_json::json!(0)),
+            disable: None,
+            order: Some(100),
+            depth: Some(2),
+            extensions: serde_json::json!({}),
+        })
+        .collect();
+
+    StWorldInfoBook {
+        entries: st_entries,
+    }
+}
+
+/// 文件名清理（去除不合法字符）
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c => c,
+        })
+        .collect()
+}
+
 // ─── Tauri app 入口 ────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -4737,6 +4953,10 @@ pub fn run() {
             meta_preview_typed_patch,
             meta_accept_typed_patch,
             meta_dismiss_typed_patch,
+            // W7 导出命令
+            export_st_card_png,
+            export_campaign_st_cards,
+            export_campaign_bundle,
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
@@ -5297,6 +5517,7 @@ mod tests {
             name: "test card".into(),
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![def_guard, def_merchant, def_leader],
+            raw_card_json: serde_json::Value::Null,
         };
         store.save_card(card);
 
@@ -5973,6 +6194,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                raw_card_json: serde_json::Value::Null,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),
@@ -6075,6 +6297,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                raw_card_json: serde_json::Value::Null,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),
@@ -6172,6 +6395,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                raw_card_json: serde_json::Value::Null,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),
