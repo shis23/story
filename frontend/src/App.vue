@@ -32,6 +32,7 @@ const showCharList = ref(false)
 const showCampaignPanel = ref(false)
 const showMetaPanel = ref(false)
 const activeCampaign = ref(null)
+const campaignPanelRef = ref(null) // template ref for CampaignPanel refresh
 
 // ─── 实例名映射（instance_id → display_name，供 Pipeline trace 显示） ───
 const instanceNameMap = ref({})
@@ -46,6 +47,13 @@ async function loadInstanceNameMap() {
     instanceNameMap.value = map
   } catch (e) {
     console.error('加载实例名映射失败:', e)
+  }
+}
+
+// ─── MVU Apply 成功后刷新 Campaign 变量 tab ───
+function handleMvuApplied() {
+  if (campaignPanelRef.value?.refreshActiveDetailTab) {
+    campaignPanelRef.value.refreshActiveDetailTab()
   }
 }
 
@@ -1034,6 +1042,7 @@ function handlePipelineEvent(event) {
     <!-- Campaign 管理弹层 -->
     <CampaignPanel
       v-if="showCampaignPanel"
+      ref="campaignPanelRef"
       @close="showCampaignPanel = false"
       @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }"
     />
@@ -1043,6 +1052,7 @@ function handlePipelineEvent(event) {
       v-if="showMetaPanel"
       :active-campaign="activeCampaign"
       @close="showMetaPanel = false"
+      @mvu-applied="handleMvuApplied"
     />
 
     <!-- 预设管理弹层 -->

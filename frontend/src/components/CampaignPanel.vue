@@ -211,6 +211,9 @@ async function handleExportBundle() {
     exporting.value = false
   }
 }
+
+// ─── 暴露 refresh 给父组件（MetaPanel apply 后触发刷新） ───
+defineExpose({ refreshActiveDetailTab })
 </script>
 
 <template>

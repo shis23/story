@@ -859,6 +859,21 @@ export async function metaGetMvuTranslation(sourceCharacterId) {
   return null
 }
 
+/** 预览 MVU schema 合并结果（每个 definition 一条 preview） */
+export async function metaPreviewMvuApply(sourceCharacterId) {
+  if (isTauri()) {
+    return await invoke('meta_preview_mvu_apply', { sourceCharacterId })
+  }
+  return []
+}
+
+/** 应用 MVU schema 到指定 definition（写盘 + backfill instance） */
+export async function metaApplyMvuSchema(sourceCharacterId, definitionId) {
+  if (isTauri()) {
+    return await invoke('meta_apply_mvu_schema', { sourceCharacterId, definitionId })
+  }
+}
+
 /** 手动触发 ST 预设 LLM 分类 */
 export async function metaClassifyStPreset(presetId) {
   if (isTauri()) {
