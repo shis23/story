@@ -1808,12 +1808,14 @@ fn persist_postprocess_outcome(
 
         // 知识：update → entry（assign campaign_id + turn）
         // 只写入 present_chars 中的角色知识（信息隔离：不出场角色不应被后处理写入知识）
+        // W6：broadcast 非空时一条 update 可能分发为多条 entry（flat_map）
         let knowledge_entries: Vec<_> = pp
             .knowledge_updates
             .iter()
-            .filter_map(|u| {
+            .flat_map(|u| {
                 // P3: normalize 内部按 source 分流（ToldByOther/Backstory 不查在场）
                 // P4: name_collisions 同名时 name 路失效
+                // W6: broadcast 时分发到多个 target
                 normalize_knowledge_update_for_postprocess(
                     store,
                     camp_id,
@@ -1901,6 +1903,7 @@ fn normalize_task_update_for_postprocess(
 /// 按名字或 Id 查 campaign 内的 CharacterInstance（后处理 Agent 输出的是角色名，需翻译成 instance）
 /// P3：内部按 KnowledgeSource 分流——ToldByOther/Backstory 不查在场直接放行，Witnessed/Inferred 才查在场。
 /// P4：同名收紧——name_collisions 传入 campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效。
+/// W6 方向 1：broadcast 非空时分发给多个 target（All=全体, Group=身份组），返回 Vec。
 pub fn normalize_knowledge_update_for_postprocess(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
@@ -1908,7 +1911,13 @@ pub fn normalize_knowledge_update_for_postprocess(
     turn: u32,
     present_ids: &std::collections::HashSet<String>,
     name_collisions: &std::collections::HashSet<String>,
-) -> Option<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    // 方向 1：广播分发——broadcast 非空时遍历 instances，每个生成一条 ToldByOther
+    if let Some(ref broadcast) = update.broadcast {
+        return dispatch_broadcast(store, camp_id, update, turn, broadcast);
+    }
+
+    // 非广播：单角色逻辑（原有 P3/P4 流程）
     let target = match find_instance_by_name_or_id(store, camp_id, &update.character_id) {
         Some(inst) => inst,
         None => {
@@ -1916,7 +1925,7 @@ pub fn normalize_knowledge_update_for_postprocess(
                 "跳过无法解析到 Campaign instance 的知识写入目标: {}",
                 update.character_id
             );
-            return None;
+            return vec![];
         }
     };
 
@@ -1936,7 +1945,7 @@ pub fn normalize_knowledge_update_for_postprocess(
                 target.name,
                 update.source
             );
-            return None;
+            return vec![];
         }
     }
 
@@ -1946,19 +1955,113 @@ pub fn normalize_knowledge_update_for_postprocess(
         .and_then(|source_id| find_instance_by_name_or_id(store, camp_id, source_id))
         .map(|source| source.id);
 
-    Some(
-        storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
-            id: Id::new(),
-            campaign_id: camp_id.clone(),
-            character_id: target.id,
-            knowledge_text: update.knowledge_text.clone(),
-            source: update.source.clone(),
-            source_character_id,
-            turn_number: turn,
-            event_id: None,
-            pinned: update.pinned,
-        },
-    )
+    vec![storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+        id: Id::new(),
+        campaign_id: camp_id.clone(),
+        character_id: target.id,
+        knowledge_text: update.knowledge_text.clone(),
+        source: update.source.clone(),
+        source_character_id,
+        turn_number: turn,
+        event_id: None,
+        pinned: update.pinned,
+    }]
+}
+
+/// 方向 1：广播分发——根据 BroadcastTarget 遍历 campaign 内 instance，各生成一条 ToldByOther。
+///
+/// - `All`：campaign 内所有 instance（排除广播发起者自身）
+/// - `Group(g)`：definition.group == g 的 instance（通过 definition_id 反查 CharacterDefinition）
+///
+/// 广播条目的 source 统一为 `ToldByOther`，source_character_id 记广播发起者（若有）。
+fn dispatch_broadcast(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+    turn: u32,
+    broadcast: &storyforge_domain::character_knowledge::BroadcastTarget,
+) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    use storyforge_domain::character_knowledge::BroadcastTarget;
+
+    // 解析广播发起者（source_character_id）的 persisted id，用于排除自身 + 记录来源
+    let broadcaster_inst = update
+        .source_character_id
+        .as_ref()
+        .and_then(|sid| find_instance_by_name_or_id(store, camp_id, sid));
+    let broadcaster_id = broadcaster_inst.as_ref().map(|i| i.id.clone());
+    let source_character_id = broadcaster_id.clone();
+
+    let all_instances = store.list_instances(camp_id);
+
+    let targets: Vec<_> = match broadcast {
+        BroadcastTarget::All => all_instances
+            .into_iter()
+            // 排除广播发起者自身（不应该给自己发广播知识）
+            .filter(|inst| Some(&inst.id) != broadcaster_id.as_ref())
+            .collect(),
+        BroadcastTarget::Group(group) => all_instances
+            .into_iter()
+            .filter(|inst| {
+                // 排除广播发起者自身
+                if Some(&inst.id) == broadcaster_id.as_ref() {
+                    return false;
+                }
+                // 通过 definition_id 反查 definition.group
+                instance_matches_group(store, inst, group)
+            })
+            .collect(),
+    };
+
+    if targets.is_empty() {
+        tracing::warn!(
+            "广播分发: broadcast={:?} 无匹配 instance（campaign={}）",
+            broadcast,
+            camp_id
+        );
+    }
+
+    targets
+        .into_iter()
+        .map(|inst| {
+            storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+                id: Id::new(),
+                campaign_id: camp_id.clone(),
+                character_id: inst.id,
+                knowledge_text: update.knowledge_text.clone(),
+                // 广播统一为 ToldByOther（被告知/公告）
+                source: storyforge_domain::character_knowledge::KnowledgeSource::ToldByOther,
+                source_character_id: source_character_id.clone(),
+                turn_number: turn,
+                event_id: None,
+                pinned: update.pinned,
+            }
+        })
+        .collect()
+}
+
+/// 判断 instance 的 CharacterDefinition.group 是否匹配目标组名。
+/// 通过 instance.definition_id → 遍历所有 card 的 character_definitions 找匹配。
+fn instance_matches_group(
+    store: &campaign_store::CampaignStore,
+    inst: &storyforge_domain::campaign::CharacterInstance,
+    target_group: &str,
+) -> bool {
+    let def_id = match &inst.definition_id {
+        Some(id) => id,
+        None => return false, // 无 definition_id（临时角色）→ 不匹配
+    };
+    // 遍历所有 card，找 definition_id 匹配的 definition
+    for stored_card in store.list_cards() {
+        if let Some(def) = stored_card
+            .card
+            .character_definitions
+            .iter()
+            .find(|d| d.id == *def_id)
+        {
+            return def.group.as_deref() == Some(target_group);
+        }
+    }
+    false
 }
 
 pub fn is_postprocess_instance_present(
@@ -4924,19 +5027,20 @@ mod tests {
             source: KnowledgeSource::Witnessed,
             source_character_id: None,
             pinned: false,
+            broadcast: None,
         };
         let present_ids = HashSet::from([String::from("inst-lin")]);
 
-        let entry = normalize_knowledge_update_for_postprocess(
+        let entries = normalize_knowledge_update_for_postprocess(
             &store,
             &campaign.id,
             &update,
             7,
             &present_ids,
             &HashSet::new(),
-        )
-        .expect("name target should resolve to campaign instance");
-
+        );
+        assert_eq!(entries.len(), 1, "name target should resolve to campaign instance");
+        let entry = &entries[0];
         assert_eq!(entry.character_id, Id::from_str("inst-lin"));
         assert_eq!(entry.knowledge_text, "Lin found the key");
 
@@ -4970,6 +5074,7 @@ mod tests {
             source: KnowledgeSource::Witnessed,
             source_character_id: None,
             pinned: false,
+            broadcast: None,
         };
         let present_ids = HashSet::from([String::from("inst-lin")]);
 
@@ -4982,7 +5087,7 @@ mod tests {
             &HashSet::new(),
         );
 
-        assert!(entry.is_none());
+        assert!(entry.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5014,19 +5119,20 @@ mod tests {
             source: KnowledgeSource::ToldByOther,
             source_character_id: Some(Id::from_str("Chen")),
             pinned: false,
+            broadcast: None,
         };
         let present_ids = HashSet::from([String::from("Lin")]);
 
-        let entry = normalize_knowledge_update_for_postprocess(
+        let entries = normalize_knowledge_update_for_postprocess(
             &store,
             &campaign.id,
             &update,
             7,
             &present_ids,
             &HashSet::new(),
-        )
-        .expect("target should resolve");
-
+        );
+        assert_eq!(entries.len(), 1, "target should resolve");
+        let entry = &entries[0];
         assert_eq!(entry.character_id, Id::from_str("inst-lin"));
         assert_eq!(entry.source_character_id, Some(Id::from_str("inst-chen")));
 
@@ -5054,6 +5160,7 @@ mod tests {
             source: KnowledgeSource::Witnessed,
             source_character_id: None,
             pinned: false,
+            broadcast: None,
         };
         let present_ids = HashSet::from([String::from("Ghost")]);
 
@@ -5066,7 +5173,218 @@ mod tests {
             &HashSet::new(),
         );
 
-        assert!(entry.is_none());
+        assert!(entry.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── W6 方向 1：广播分发测试 ───────────────────────────────────────────
+
+    #[test]
+    fn test_broadcast_all_distributes_to_all_instances() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource,
+        };
+
+        let dir = std::env::temp_dir().join(format!("sf_broadcast_all_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        // 创建 3 个 instance
+        let mut a = CharacterInstance::temporary(campaign.id.clone(), "A");
+        a.id = Id::from_str("inst-a");
+        let mut b = CharacterInstance::temporary(campaign.id.clone(), "B");
+        b.id = Id::from_str("inst-b");
+        let mut c = CharacterInstance::temporary(campaign.id.clone(), "C");
+        c.id = Id::from_str("inst-c");
+        store.add_instance(a);
+        store.add_instance(b);
+        store.add_instance(c);
+
+        // 广播发起者是 A（source_character_id=A），broadcast=All
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("A"),
+            knowledge_text: "全城戒严公告".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: Some(Id::from_str("A")),
+            pinned: false,
+            broadcast: Some(BroadcastTarget::All),
+        };
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            1,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        // 应分发给 B 和 C（排除发起者 A 自身）
+        assert_eq!(entries.len(), 2, "broadcast All 应分发给除发起者外的所有 instance");
+        let target_ids: Vec<_> = entries.iter().map(|e| e.character_id.clone()).collect();
+        assert!(target_ids.contains(&Id::from_str("inst-b")));
+        assert!(target_ids.contains(&Id::from_str("inst-c")));
+        assert!(!target_ids.contains(&Id::from_str("inst-a")), "不应分发给发起者自身");
+
+        // 每条都是 ToldByOther，source_character_id = A
+        for entry in &entries {
+            assert_eq!(entry.source, KnowledgeSource::ToldByOther);
+            assert_eq!(entry.source_character_id, Some(Id::from_str("inst-a")));
+            assert_eq!(entry.knowledge_text, "全城戒严公告");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_broadcast_group_distributes_to_matching_group() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{
+            CharacterCard, CharacterDefinition, RoleType,
+        };
+        use storyforge_domain::character_knowledge::{
+            BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource,
+        };
+
+        let dir = std::env::temp_dir().join(format!("sf_broadcast_group_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        // 创建 card + definitions（有 group 和无 group）
+        let def_guard = CharacterDefinition {
+            id: Id::from_str("def-guard"),
+            card_id: Id::from_str("card-1"),
+            name: "Guard".into(),
+            persona_prompt: "guard".into(),
+            behavior_rules: "guard".into(),
+            base_backstory: vec![],
+            group: Some("守卫".to_string()),
+            role_type: RoleType::Supporting,
+            variable_schema: vec![],
+        };
+        let def_merchant = CharacterDefinition {
+            id: Id::from_str("def-merchant"),
+            card_id: Id::from_str("card-1"),
+            name: "Merchant".into(),
+            persona_prompt: "merchant".into(),
+            behavior_rules: "merchant".into(),
+            base_backstory: vec![],
+            group: Some("商人".to_string()),
+            role_type: RoleType::Supporting,
+            variable_schema: vec![],
+        };
+        let def_leader = CharacterDefinition {
+            id: Id::from_str("def-leader"),
+            card_id: Id::from_str("card-1"),
+            name: "Leader".into(),
+            persona_prompt: "leader".into(),
+            behavior_rules: "leader".into(),
+            base_backstory: vec![],
+            group: None, // 无 group
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+        let card = CharacterCard {
+            id: Id::from_str("card-1"),
+            name: "test card".into(),
+            source_character_id: Id::from_str("src-1"),
+            character_definitions: vec![def_guard, def_merchant, def_leader],
+        };
+        store.save_card(card);
+
+        // 创建 instances（link to definitions）
+        let mut inst_guard = CharacterInstance::temporary(campaign.id.clone(), "Guard");
+        inst_guard.id = Id::from_str("inst-guard");
+        inst_guard.definition_id = Some(Id::from_str("def-guard"));
+        let mut inst_merchant = CharacterInstance::temporary(campaign.id.clone(), "Merchant");
+        inst_merchant.id = Id::from_str("inst-merchant");
+        inst_merchant.definition_id = Some(Id::from_str("def-merchant"));
+        let mut inst_leader = CharacterInstance::temporary(campaign.id.clone(), "Leader");
+        inst_leader.id = Id::from_str("inst-leader");
+        inst_leader.definition_id = Some(Id::from_str("def-leader"));
+        store.add_instance(inst_guard);
+        store.add_instance(inst_merchant);
+        store.add_instance(inst_leader);
+
+        // 广播给"守卫"组
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Leader"),
+            knowledge_text: "守卫集合命令".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: Some(Id::from_str("Leader")),
+            pinned: false,
+            broadcast: Some(BroadcastTarget::Group("守卫".to_string())),
+        };
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            1,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        // 只有 Guard（group=守卫）收到，Merchant（group=商人）和 Leader（group=None，且是发起者）不收
+        assert_eq!(entries.len(), 1, "broadcast Group('守卫') 应只分发给守卫组");
+        assert_eq!(entries[0].character_id, Id::from_str("inst-guard"));
+        assert_eq!(entries[0].source, KnowledgeSource::ToldByOther);
+        assert_eq!(entries[0].source_character_id, Some(Id::from_str("inst-leader")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_broadcast_none_single_character_unaffected() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+
+        let dir = std::env::temp_dir().join(format!("sf_broadcast_none_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone());
+
+        let mut a = CharacterInstance::temporary(campaign.id.clone(), "A");
+        a.id = Id::from_str("inst-a");
+        let mut b = CharacterInstance::temporary(campaign.id.clone(), "B");
+        b.id = Id::from_str("inst-b");
+        store.add_instance(a);
+        store.add_instance(b);
+
+        // broadcast=None → 单角色定向，走原有 P3 逻辑
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("A"),
+            knowledge_text: "A 看到了什么".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            pinned: false,
+            broadcast: None,
+        };
+        let present_ids = HashSet::from([String::from("inst-a")]);
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            1,
+            &present_ids,
+            &HashSet::new(),
+        );
+
+        // 单角色：只有 A 收到
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].character_id, Id::from_str("inst-a"));
+        assert_eq!(entries[0].source, KnowledgeSource::Witnessed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5602,6 +5920,7 @@ mod tests {
             source: KnowledgeSource::Witnessed,
             source_character_id: None,
             pinned: false,
+            broadcast: None,
         };
         let present_ids = HashSet::from([String::from("Ghost")]);
 
@@ -5614,11 +5933,12 @@ mod tests {
             &HashSet::new(),
         );
 
-        assert!(
-            entry.is_some(),
+        assert_eq!(
+            entry.len(),
+            1,
             "已落盘的临时 instance 应能被 postprocess 解析"
         );
-        let entry = entry.unwrap();
+        let entry = &entry[0];
         assert_eq!(entry.character_id, ghost.id);
         assert_eq!(entry.knowledge_text, "Ghost appeared in the fog");
 

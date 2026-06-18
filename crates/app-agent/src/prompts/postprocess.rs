@@ -24,6 +24,19 @@ pub const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是后处理助手（postproce
 - 不要给 backstory（背景设定只在导入时建立，不在这里）
 信息用该角色第一人称视角表述（"我看到了……" / "X 告诉我……"）。只抽「新的」信息，已有的不重复。如果某角色这轮没获知新信息，就不要给它写条目。
 
+【定向告知规则】
+told_by_other 时，character_id 是**被告知者**（谁收到了信息），source_character_id 是**告知者**（谁说的）。
+告知可以面向不在场的角色（写信、传话、留信息、派人通知），系统会放行。
+示例："林医生写信告诉陈警官地下室有尸体" → character_id=陈警官, source_character_id=林医生, source=told_by_other。
+
+【广播规则】
+如果成文里有**公开宣告或世界级事件**（公告、爆炸、天气突变、全城警报等所有角色都该知道的事），
+在 knowledge_updates 里输出一条带 broadcast 字段的条目：
+- broadcast: "all" 表示广播给 Campaign 内所有角色（character_id 填公告发起者或任意角色名，系统会忽略并分发给所有人）
+- broadcast: "组名"（如"守卫"）表示广播给该身份组的所有角色
+- 普通在场角色知识不需要 broadcast 字段（不填或 null = 单角色定向）
+示例：城主宣告戒严 → { "character_id": "城主", "knowledge_text": "城主宣告全城戒严", "source": "witnessed", "broadcast": "all" }
+
 【任务二：变量更新】
 根据成文里发生的事，更新角色变量（hp/state/location/mood 等）或全局变量（story_clock/weather/world_state）。只输出真正发生了变化的字段。全局变量（无 instance_id）用于 story_clock 推进、天气变化、大势扭转等。
 
@@ -42,6 +55,21 @@ pub const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是后处理助手（postproce
       "source": "witnessed",
       "source_character_id": null,
       "pinned": false
+    },
+    {
+      "character_id": "陈警官",
+      "knowledge_text": "林医生告诉我地下室有尸体",
+      "source": "told_by_other",
+      "source_character_id": "林医生",
+      "pinned": false
+    },
+    {
+      "character_id": "城主",
+      "knowledge_text": "城主宣告全城戒严",
+      "source": "witnessed",
+      "source_character_id": null,
+      "pinned": false,
+      "broadcast": "all"
     }
   ],
   "variable_updates": [
@@ -66,9 +94,11 @@ pub const POSTPROCESS_SYSTEM_PROMPT: &str = r#"你是后处理助手（postproce
 - character_id / instance_id / source_character_id：传角色名（不是 ID），系统会解析匹配
 - source 取值：witnessed / told_by_other / inferred（小写）
 - new_status 取值：pending / active / likely_completed / completed / abandoned（小写）
+- broadcast：可选，"all"=广播全体，"组名"=广播该身份组，不填=单角色定向
 - 如果某一项没有更新，输出空数组
 
-【重要】抽取范围严格限制在「提供的在场角色列表」内，不要给不在场的角色抽知识。"#;
+【重要】抽取范围严格限制在「提供的在场角色列表」内，不要给不在场的角色抽知识。
+例外：told_by_other 的被告知者可以不在场（写信/传话/留信息）；broadcast 条目会被系统分发给目标角色。"#;
 
 /// 构造后处理 Agent 的运行配置
 ///
@@ -142,7 +172,8 @@ pub fn register_postprocess_tools(registry: &mut ToolRegistry) {
                                 "knowledge_text": {"type": "string"},
                                 "source": {"type": "string", "enum": ["witnessed", "told_by_other", "inferred"]},
                                 "source_character_id": {"type": "string"},
-                                "pinned": {"type": "boolean"}
+                                "pinned": {"type": "boolean"},
+                                "broadcast": {"type": "string", "description": "广播目标: 'all'=全体, '组名'=身份组, 不填=单角色"}
                             },
                             "required": ["character_id", "knowledge_text", "source"]
                         }

@@ -50,11 +50,12 @@ fn b3_empty_witnessed_is_rejected() {
         source: KnowledgeSource::Witnessed,
         source_character_id: None,
         pinned: false,
+        broadcast: None,
     };
     let empty: HashSet<String> = HashSet::new();
 
-    let entry = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
-    assert!(entry.is_none(), "空集 + Witnessed 应被 P3 分流拒绝");
+    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
+    assert!(entries.is_empty(), "空集 + Witnessed 应被 P3 分流拒绝");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -77,11 +78,12 @@ fn b3_empty_told_by_other_passes() {
         source: KnowledgeSource::ToldByOther,
         source_character_id: None,
         pinned: false,
+        broadcast: None,
     };
     let empty: HashSet<String> = HashSet::new();
 
-    let entry = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
-    assert!(entry.is_some(), "空集 + ToldByOther 应放行（P3 分流：不受在场约束）");
+    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
+    assert_eq!(entries.len(), 1, "空集 + ToldByOther 应放行（P3 分流：不受在场约束）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -104,12 +106,13 @@ fn b3_told_by_other_bypasses_presence() {
         source: KnowledgeSource::ToldByOther,
         source_character_id: None,
         pinned: false,
+        broadcast: None,
     };
     // present 含 "Chen"，不含 Lin
     let present = HashSet::from([String::from("Chen")]);
 
-    let entry = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
-    assert!(entry.is_some(), "ToldByOther 应绕过在场检查（跨在场告知）");
+    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    assert_eq!(entries.len(), 1, "ToldByOther 应绕过在场检查（跨在场告知）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -132,11 +135,12 @@ fn b3_backstory_bypasses_presence() {
         source: KnowledgeSource::Backstory,
         source_character_id: None,
         pinned: false,
+        broadcast: None,
     };
     let present = HashSet::from([String::from("Chen")]);
 
-    let entry = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
-    assert!(entry.is_some(), "Backstory 应绕过在场检查（开局已有）");
+    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    assert_eq!(entries.len(), 1, "Backstory 应绕过在场检查（开局已有）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -159,12 +163,13 @@ fn b3_witnessed_respects_presence() {
         source: KnowledgeSource::Witnessed,
         source_character_id: None,
         pinned: false,
+        broadcast: None,
     };
     // present 只含 Lin，不含 Chen
     let present = HashSet::from([String::from("Lin")]);
 
-    let entry = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
-    assert!(entry.is_none(), "Witnessed 且不在场应被拒绝（P3 分流）");
+    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    assert!(entries.is_empty(), "Witnessed 且不在场应被拒绝（P3 分流）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

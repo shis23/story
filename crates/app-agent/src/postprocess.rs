@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use storyforge_domain::Id;
 use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
-use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+use storyforge_domain::character_knowledge::{BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource};
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
@@ -104,6 +104,9 @@ struct KnowledgeUpdateDto {
     source_character_id: Option<String>,
     #[serde(default)]
     pinned: bool,
+    /// 广播目标："all" = 全体; 其他字符串 = 身份组名; null/缺失 = 不广播
+    #[serde(default)]
+    broadcast: Option<String>,
 }
 fn default_source() -> String {
     "witnessed".to_string()
@@ -170,6 +173,11 @@ fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
             source: parse_source(&k.source),
             source_character_id: k.source_character_id.map(|s| Id::from_str(&s)),
             pinned: k.pinned,
+            broadcast: k.broadcast.and_then(|s| match s.as_str() {
+                "all" => Some(BroadcastTarget::All),
+                "" => None,
+                group => Some(BroadcastTarget::Group(group.to_string())),
+            }),
         })
         .collect();
 
