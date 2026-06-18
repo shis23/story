@@ -15,6 +15,7 @@ import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
 import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
+import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
@@ -1055,5 +1056,8 @@ function handlePipelineEvent(event) {
       v-if="showPluginPanel"
       @close="showPluginPanel = false; loadSidebarPlugins()"
     />
+
+    <!-- W8 MVU JS Runtime 容器（隐藏，iframe 沙箱执行 JS fallback） -->
+    <MvuJsRuntime />
   </div>
 </template>

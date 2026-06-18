@@ -53,7 +53,7 @@ storyforge-infra-llm = { path = "crates/infra-llm" }
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 futures = "0.3"
-tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
