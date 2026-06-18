@@ -245,6 +245,7 @@ async fn i1_adversarial_knowledge_boundary() {
         max_tool_rounds: 4,
         model: "deepseek-v4-flash".into(),
         tools: vec![],
+        terminal_tools: vec![],
     };
 
     let (_cancel_tx, cancel_rx) = watch::channel(false);

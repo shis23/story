@@ -68,6 +68,7 @@ pub fn make_character_extractor_config() -> AgentConfig {
         max_tool_rounds: 8,
         model: "deepseek-chat".to_string(),
         tools: vec![],
+        terminal_tools: vec!["emit_characters".into()],
     }
 }
 

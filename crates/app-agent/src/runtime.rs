@@ -27,6 +27,9 @@ pub struct AgentConfig {
     pub max_tool_rounds: u32,
     pub model: String,
     pub tools: Vec<ToolSpec>,
+    /// 终止工具列表：调用后立即返回响应（不等模型输出最终文本）。
+    /// 用于 emit_characters 等"声明任务完成"的工具。
+    pub terminal_tools: Vec<String>,
 }
 
 /// Agent 运行时
@@ -170,6 +173,15 @@ impl AgentRuntime {
 
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
+
+            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
+            if !config.terminal_tools.is_empty()
+                && resp.tool_calls.iter().any(|tc| config.terminal_tools.contains(&tc.function.name))
+            {
+                info!(target: "app-agent", "{}: 第 {round} 轮调用了终止工具，立即返回",
+                    config.role);
+                return Ok(resp);
+            }
         }
 
         error!(target: "app-agent", "{}: 超过最大轮次 {max}",
@@ -305,6 +317,15 @@ impl AgentRuntime {
                     }
                 };
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
+            }
+
+            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
+            if !config.terminal_tools.is_empty()
+                && resp.tool_calls.iter().any(|tc| config.terminal_tools.contains(&tc.function.name))
+            {
+                info!(target: "app-agent", "{}[stream]: 第 {round} 轮调用了终止工具，立即返回",
+                    config.role);
+                return Ok(resp);
             }
         }
 
@@ -581,6 +602,7 @@ pub async fn spawn_subagents(
             max_tool_rounds: subagent_max_rounds,
             model,
             tools: vec![], // 子 Agent 工具由 registry 提供
+            terminal_tools: vec![],
         };
 
         // 阶段 4：为每个子 Agent 构造独立的 ToolContext，绑定 current_character_instance_id
@@ -876,6 +898,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
 
         // 预先置为取消的 watch channel
@@ -956,6 +979,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1011,6 +1035,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut agent_configs = std::collections::HashMap::new();
@@ -1117,6 +1142,7 @@ mod tests {
             max_tool_rounds: 3,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_tx, cancel) = watch::channel(false);
         let (prog_tx, prog_rx) = mpsc::unbounded_channel::<String>();
@@ -1248,6 +1274,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1301,6 +1328,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1353,6 +1381,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1578,6 +1607,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1660,6 +1690,7 @@ mod tests {
             max_tool_rounds: 1,
             model: "mock".into(),
             tools: vec![],
+            terminal_tools: vec![],
         };
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1678,5 +1709,61 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "旧路径应成功: {:?}", results[0]);
+    }
+
+    /// 终止工具测试：调用 terminal_tools 内的工具后，run_tool_loop 立即返回
+    #[tokio::test]
+    async fn test_terminal_tool_stops_loop() {
+        use storyforge_domain::llm::{FunctionCall, ToolCall, ToolSpec};
+        use storyforge_infra_llm::mock_client::MockLlmClient;
+
+        // Mock：第 1 轮调用 emit_characters 工具
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "识别".into(),
+            response_content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_characters".into(),
+                    arguments: r#"{"characters":[{"name":"A","persona_prompt":"pa"}]}"#.into(),
+                },
+            }],
+            stream: false,
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+        let runtime = AgentRuntime::new(llm, tool_ctx);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            ToolSpec::function("emit_characters", "输出角色", serde_json::json!({})),
+            |args, _ctx| Box::pin(async move { Ok(args) }),
+        );
+
+        let config = AgentConfig {
+            role: AgentRole::CharacterExtractor,
+            system_prompt: "你是卡内角色识别助手".into(),
+            max_tool_rounds: 8,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec!["emit_characters".into()],
+        };
+
+        let (_tx, cancel) = watch::channel(false);
+        let resp = runtime
+            .run_tool_loop(&config, "识别角色".into(), &registry, cancel)
+            .await
+            .expect("应成功返回");
+
+        // 应在第 1 轮就返回（终止工具触发），不应超限
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].function.name, "emit_characters");
     }
 }

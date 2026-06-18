@@ -87,6 +87,7 @@ pub fn make_postprocess_config(agent_profile_config: Option<&AgentProfileConfig>
         max_tool_rounds: rounds_override.unwrap_or(5),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
+        terminal_tools: vec![],
     }
 }
 

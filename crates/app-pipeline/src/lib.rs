@@ -1046,6 +1046,7 @@ impl PipelineOrchestrator {
                     max_tool_rounds: 10,
                     model: director_config.model.clone(),
                     tools: vec![],
+                    terminal_tools: vec![],
                 };
                 // M1 子 Agent 无工具（纯表演）
                 let registry = ToolRegistry::new();
@@ -1481,6 +1482,7 @@ fn make_director_config(
         max_tool_rounds: rounds_override.unwrap_or(15),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
+        terminal_tools: vec![],
     }
 }
 
@@ -1537,6 +1539,7 @@ fn make_editor_config(
         max_tool_rounds: rounds_override.unwrap_or(5),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
+        terminal_tools: vec![],
     }
 }
 

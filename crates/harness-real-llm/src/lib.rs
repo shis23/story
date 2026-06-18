@@ -165,9 +165,12 @@ impl HarnessEnv {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let definitions = match run_extract(&runtime, &character, &mvu_schema, cancel_rx).await {
-            Ok(defs) => defs,
+            Ok(defs) => {
+                eprintln!("[F2 DIAG] extract_characters Ok: {} definitions (正常解析路径)", defs.len());
+                defs
+            }
             Err(e) => {
-                eprintln!("角色识别失败，降级单角色: {e}");
+                eprintln!("[F2 DIAG] extract_characters Err: {e} → 降级单角色 (fallback_from_character)");
                 vec![CharacterDefinition::fallback_from_character(&character, &mvu_schema)]
             }
         };

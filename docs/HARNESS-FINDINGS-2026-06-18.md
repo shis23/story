@@ -9,7 +9,7 @@
 | ID | 标题 | Severity | 类型 | 状态 |
 |---|---|---|---|---|
 | F1 | LLM model 名透传断链——连接配的 model 被忽略 | 🔴 High | Bug（影响所有用户） | **已修**（`HttpLlmClient.effective_model` + wrapper 已删） |
-| F2 | 角色识别 Agent 输出解析降级（emit_characters 5 层兜底全 miss） | 🟠 Medium | Bug（prompt/解析） | **已修**（prompt 强化 + 诊断结论） |
+| F2 | 角色识别 Agent 输出解析降级（emit_characters 5 层兜底全 miss） | 🟠 Medium | Bug（runtime/loop） | **已修**（terminal_tools 终止机制 + 真实 LLM 验证） |
 | P0 | 子 agent get_character 绑定-unresolvable 读侧泄漏 | 🟠 Medium | Bug（defense-in-depth） | **已修 + B0 钉测** |
 | P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟡 Low | 设计取舍 | **已加 warn 日志**（行为不变，可观测性提升） |
 | P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **已加 debug 日志**（id 优先 + name 匹配时 warn） |
@@ -65,15 +65,22 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 
 **待查**：换 `deepseek-chat` 或更强模型是否复现；`parse_character_definitions_from_response` 的 5 层兜底是否覆盖了"模型把工具结果写在 content 里"这种形态。未修。
 
-**诊断结论（2026-06-18）**：
+**诊断结论（2026-06-18 Round 1 初诊）**：
 - 根因：`deepseek-v4-flash` function calling 能力弱，输出自然语言描述（"任务已完成，结果已通过 emit_characters 工具输出"）而非实际 tool_call 或 JSON。5 层兜底全部 miss 是因为 content 里根本没有 JSON。
 - 这是模型能力限制，非代码 bug——降级路径已保证不崩。
-- 复现确认：F1 修好后（model 透传生效），deepseek-v4-flash 仍可能触发此行为。
 
-**已修复（2026-06-18）**：
-- 强化 `CHARACTER_EXTRACTOR_SYSTEM_PROMPT`：明确要求"二选一"（调工具或直接输出 JSON），加 ⚠️ 警告"不要输出'已通过工具输出'之类的自然语言——两者都没有 = 任务失败"。
-- 11 个 character_extractor 单测全绿，0 回归。
-- 真实 LLM 验证待 F1 修好后跑 `--ignored` 测试确认。
+**Round 2 深修诊断（2026-06-18）**：
+- 抓 T1 raw response 后发现：**模型确实调了 `emit_characters` 工具**（tool_calls 非空，content 为空），Round 1 诊断有误。
+- 真正根因：`run_tool_loop` 没有"终止工具"概念——模型调用 `emit_characters` 后，工具执行成功，但 loop 继续到下一轮。模型在每轮都调 `emit_characters`，8 轮耗尽 → `MaxRoundsExceeded`。
+- 这不是模型能力问题，是 **runtime 缺少终止工具机制**。
+
+**已修复（2026-06-18 Round 2）**：
+- `AgentConfig` 新增 `terminal_tools: Vec<String>` 字段。
+- `run_tool_loop` / `run_tool_loop_streaming` 执行工具后检查：若调用了 `terminal_tools` 内的工具，立即返回响应（不等模型输出最终文本）。
+- `make_character_extractor_config` 设置 `terminal_tools: vec!["emit_characters"]`。
+- 新增单测 `test_terminal_tool_stops_loop` 验证终止机制。
+- 真实 LLM T1 验证：`extract_characters Ok: 1 definitions (正常解析路径)`，Seraphina 卡正确识别，`tool_calls[0].name == "emit_characters"`。
+- `cargo test --workspace` 全绿，0 回归。
 
 ## 🟠 P0：子 agent get_character 绑定-unresolvable 读侧泄漏（已修）
 
@@ -143,14 +150,24 @@ LLM_BASE_URL='...' LLM_API_KEY='...' LLM_MODEL='...' \
   cargo test -p harness-real-llm -- --ignored --nocapture
 ```
 
-## 已完成（2026-06-18 全量修复）
+## 已完成
+
+### Round 1（2026-06-18）
 
 - **F1**：`HttpLlmClient.effective_model()` 修复 model 透传，`ModelPinningLlmClient` wrapper 已删，5 单测覆盖。
-- **F2**：`CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 强化，诊断结论写入（模型能力限制 + prompt 工程修复）。
+- **F2**：`CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 强化（治标）。
 - **P3**：`is_postprocess_instance_present` 空集分支加 `warn!` 日志（行为不变，可观测性提升）。
 - **P4**：name 匹配路径加 `debug!` 日志（id 优先 + name 兜底时可观测）。
 - **T2**：`t2_multi_turn.rs`——3 轮 append 测试（`#[ignore]`）。
 - **T3**：`t3_regenerate.rs`——整体/仅编剧/仅导演 regenerate 测试（`#[ignore]`）。
 - **C1-C8**：`c_command_layer.rs`——C1 导入/识别、C2 Campaign 生命周期（CRUD + 变量 + 任务 + 知识 + 摘要）、C5 对话变体、C6 健康检查。9 确定性 + 1 真实 LLM（`#[ignore]`）。
 - **I1**：`i1_adversarial.rs`——对抗性知识边界探针，3 层断言（工具调用/volatile tail/成文），`#[ignore]`。
+
+### Round 2（2026-06-18）
+
+- **F2 深修**：`AgentConfig.terminal_tools` + `run_tool_loop` 终止工具检查。根因不是 5 层兜底 miss，而是 loop 缺终止机制。真实 LLM T1 验证通过。
+- **C6 Meta 对话**（4 测试）：`c6_meta_chat_real_llm`（`#[ignore]`）、`c6_patch_store_lifecycle`（确定性）、`c6_typed_patch_preview_apply`（确定性）、`c6_explain_generation`（确定性）。4 pass + 1 ignored。
+- **C7 MVU 流**（3 测试）：`c7_mvu_analyze_real_llm`（`#[ignore]`）、`c7_mvu_translation_crud`（确定性）、`c7_mvu_apply_backfill`（确定性，复刻 backfill loop）。2 pass + 1 ignored。
+- **T2 实跑**：3 轮 append 全部通过（deepseek-v4-flash，459s）。
+- **T3 实跑**：`regenerate_all` + `regenerate_editor_only` 通过；`regenerate_director_only` 修正为期望拒绝（业务约束：Plan 变了旧子产出不匹配）。
 - `cargo test --workspace` 全绿，0 回归。

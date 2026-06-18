@@ -68,6 +68,7 @@ pub fn make_meta_agent_config() -> AgentConfig {
         max_tool_rounds: 8,
         model: "deepseek-chat".to_string(),
         tools: vec![],
+        terminal_tools: vec![],
     }
 }
 
