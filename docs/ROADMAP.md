@@ -115,28 +115,32 @@
 
 ## Phase 5: ST 兼容和导入/导出
 
-**状态：部分起步**（MVU 分析/预览/渲染 + ST 导入保真已落地；apply 前端接线、JS fallback、导出未开始；约 40%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：大部分完成**（MVU 分析/预览/渲染 + ST 导入保真 + Campaign 导出已落地；JS runtime 基础设施就绪待接通 + MVU apply 前端接线待补；约 75%，2026-06-19 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：保持 SillyTavern 卡兼容，同时不被 ST 数据形态限制内部架构。
 
 任务：
 
-- 明确 ST V2/V3 导入保真范围。
-- 保留 raw JSON 和 extensions。
-- 多角色识别失败时稳定 fallback。
-- 设计 StoryForge Campaign 导出格式。
-- 评估是否支持导出回 ST 卡或 Lorebook。
+- ~~明确 ST V2/V3 导入保真范围。~~ ✅ V2/V3 兼容
+- ~~保留 raw JSON 和 extensions。~~ ✅ `raw_card_json` + `extensions` 保留
+- ~~多角色识别失败时稳定 fallback。~~ ✅ `fallback_from_character`
+- ~~设计 StoryForge Campaign 导出格式。~~ ✅ JSON bundle（`format_version`）
+- ~~评估是否支持导出回 ST 卡或 Lorebook。~~ ✅ ST 卡 PNG（tEXt 写入）+ 多角色共享 lorebook
+- ⏳ MVU apply 前端接线：后端 `meta_preview_mvu_apply`/`meta_apply_mvu_schema` 命令已有，前端 API 未接。
+- ⏳ JS Fallback WebView Runtime：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。
 
 验收：
 
-- 常见 ST 卡能导入。
-- 不认识的 extensions 不丢。
-- StoryForge 内部多角色 Campaign 不强行退化为单角色卡。
+- ✅ 常见 ST 卡能导入。
+- ✅ 不认识的 extensions 不丢（`raw_card_json` 保底）。
+- ✅ StoryForge 内部多角色 Campaign 不强行退化为单角色卡。
+- ✅ Campaign 可导出为 ST 卡 PNG + 共享 lorebook + StoryForge JSON bundle。
 
 详细计划：
 
 - `docs/PLAN-PLUGIN-MVU.md` 覆盖 MVU 状态栏、schema preview 和 JS fallback。
-- ST V2/V3 导入保真、StoryForge Campaign 导出、是否导出回 ST/Lorebook 仍缺独立执行计划；进入本阶段前应补 `docs/PLAN-ST-IMPORT-EXPORT.md`。
+- `docs/PLAN-ST-IMPORT-EXPORT.md` 覆盖 ST 导入保真 + Campaign 导出（T4/T5 已实现）。
+- 剩余：MVU apply 前端接线、JS runtime 接通写作流程（见上述任务 ⏳）。
 
 ## Phase 6: Android 打磨
 
