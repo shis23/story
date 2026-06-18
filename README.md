@@ -96,6 +96,6 @@ docs                       当前架构、数据模型、Agent 契约和路线�
 - [插件与 MVU 计划](docs/PLAN-PLUGIN-MVU.md)
 - [主线完成后的收口与发布准备](docs/PLAN-POST-MAINLINE.md)
 - [路线图](docs/ROADMAP.md)
-- [交接说明](docs/HANDOFF.md)
+- [交接说明（已归档）](docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md)
 
 旧版文档已归档到 [docs/archive/2026-06-16-pre-rewrite](docs/archive/2026-06-16-pre-rewrite)。

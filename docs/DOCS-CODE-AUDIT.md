@@ -1,7 +1,7 @@
 # 文档与代码对齐审计
 
-> 状态：2026-06-17
-> 范围：核对 README、ROADMAP、HANDOFF、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
+> 状态：2026-06-18（含 Phase 4/5/6 阶段级核对）
+> 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
 > 本次只审计和修正文档，不改业务代码。
 
 ## 结论
@@ -180,6 +180,74 @@
 - `MainActivity.kt` 调用 `enableEdgeToEdge()`。
 
 因此 `PLAN-ANDROID.md` 的当前事实准确。
+
+## Phase 4/5/6 阶段级状态核对（2026-06-18）
+
+> 本节按各 PLAN 的阶段拆分核对真实代码状态，补充上方"Campaign 写作主链路"等已核对事实未覆盖的阶段级粒度。整体完成度：Phase 4 ~30%、Phase 5 ~40%、Phase 6 ~5%。
+
+### Phase 4：前端工作台（~30%）
+
+前端栈：Vue 3 + Vite + Tailwind v4 + Tauri 2，代码在 `frontend/src/`。
+
+| 阶段 | 计划目标 | 真实状态 | 证据路径 |
+|---|---|---|---|
+| 1 首屏聚焦 active campaign | AppHeader 显示 campaign 名/轮次/实例数，无 campaign 时给 CTA | 部分 | `frontend/src/components/AppHeader.vue` 仍只显示 `activeCharName`；campaign 概览渲染在 `App.vue` history view 而非 header |
+| 2 写作入口绑定 active campaign | 区分 campaign 写作 vs 旧 activeChar 路径 | 未开始 | `App.vue` 仍调 `startWriting(intent, activeChar.id, …)`；`tauri-api.js` 无 `startCampaignWriting`；pre-flight 只查 `activeConnection` |
+| 3 CampaignPanel 拆工作台 tabs | 拆成独立 `Campaign*Tab.vue` | 部分 | 无 `Campaign*Tab.vue`；`CampaignPanel.vue`（584 行单文件）用组件内 tab（cards/campaigns/detail + detailSubTab instances/knowledge/tasks/summaries） |
+| 4 Pipeline trace 用 instance 展示名 | 保留 `instance_id`、显示名 + role_type、按 stable id reroll | 部分（计划高估"已起步"） | `PipelinePanel.vue` 显示 `sub.name ?? sub.id`；无 `instance_id`/`role_type`/stable-id reroll |
+| 5 MetaPanel Campaign health | 健康摘要、一键 context、patch diff、accept 刷新 tabs | 基本完成（task 1+3+patch accept） | `MetaPanel.vue`：`metaHealthCheck`、sorted `healthIssues`、typed-patch diff preview、accept/dismiss；缺口：accept 后未 `$emit` 刷新 CampaignPanel tabs（task 4 缺）、task 2 仅经 `metaProposeCampaignRepairs` |
+| 6 移动端布局 | 响应式 sheet、固定输入、无溢出 | 未开始 | `frontend/src/style.css` 仅主题 token，零 `@media`/断点 |
+
+计划外已建（built-but-not-in-plan）：
+
+- 临时 instance 升格 UI：`CampaignPanel.vue` "升格为常驻角色"（带确认/loading/detail 刷新），`promoteTemporaryInstance` 取自 `tauri-api.js`。
+- role_type 徽章（Protagonist/Supporting/Extra）+ "识别角色" extract 入口，在 `CampaignPanel.vue`。
+
+计划高估点：阶段 4 标"已起步"但承重件（instance_id 留存、role_type、stable-id reroll）均缺；阶段 1 标"首屏聚焦已完成"但 AppHeader 本身未更新。
+
+### Phase 5：MVU + ST 导入/导出（~40%）
+
+缩写在项目中的含义：**MVU** = SillyTavern 角色卡扩展，提供声明式状态栏/变量 schema（`ui_bindings`/`variable_schema`）；**ST** = SillyTavern（角色卡 V2/V3 + PNG `chara` block）。
+
+| 阶段 | 计划目标 | 真实状态 | 证据路径 |
+|---|---|---|---|
+| MVU-1 | 冻结通用插件扩张、划边界 | 已实现（文档层定边界） | `docs/PLAN-PLUGIN-MVU.md` |
+| MVU-2 | MVU Translation → variable schema diff 预览 | 部分 | 预览逻辑 `MvuApplyPreview`/`compute_apply_preview` 存在；无独立 `meta_preview_mvu_schema` 命令、无前端 diff UI |
+| MVU-3 | 把 MVU schema patch apply 进 Campaign | 部分（后端有、前端未接） | `meta_apply_mvu_schema` 已注册并算 preview+apply；`tauri-api.js` 无 `metaApplyMvuSchema` |
+| MVU-4 | 原生状态栏从 Campaign 变量渲染 | 已实现 | `MvuStatusBar.vue` 渲染 bar/text/tag/icon；用于 `CharacterDetail.vue`（未进 `CampaignPanel`） |
+| MVU-5 | 混合 JS fallback runtime（QuickJS/WebView） | 未开始 | `StubMvuRuntime` 仍返回 `NotImplemented`、`is_available=false` |
+| MVU-6 | 插件权限/安全分层 | 部分 | `Permission` enum + `ensure_permission` 存在；未覆盖全部 5 计划层（无 `network_access` toggle 证据） |
+| ST-T1 | 定 ST V2/V3 导入保真范围 | 部分 | `from_st_card()` 覆盖所列字段；部分 checkbox 未结 |
+| ST-T2 | raw_json + extensions 保留策略 | 已实现（保留） | 两者以 `serde_json::Value` 保留；设计 Q 未结 |
+| ST-T3 | 多角色识别 fallback | 部分 | `character_extractor` + `fallback_from_character` 存在；tauri-app fallback/用户提示/rerun 未确认 |
+| ST-T4 | StoryForge Campaign 导出格式设计 | 未开始 | 无 export 代码（`export_campaign`/`to_st_card` 0 hits；`app-logging::export_bundle` 仅日志） |
+| ST-T5 | 评估导出回 ST 卡/Lorebook | 未开始 | 评估 checkbox 全空 |
+
+### Phase 6：Android（~5%）
+
+| 阶段 | 计划目标 | 真实状态 | 证据路径 |
+|---|---|---|---|
+| AND-1 | 构建链基线（验 `cargo tauri android build`） | 未开始 | 仅 Tauri 自动生成脚手架 `crates/tauri-app/gen/android/`，无构建记录 |
+| AND-2 | Android 系统选择器文件导入路径 | 未开始 | 无 Android 专属 import 改动 |
+| AND-3 | 本地数据目录 + 迁移/schema 版本 | 未开始 | 无 debug data-dir 命令、无 schema/version 字段 |
+| AND-4 | 长任务/流式/取消在移动端 | 未开始 | 无 Android 生命周期处理 |
+| AND-5 | 移动端排障/诊断导出 | 未开始 | `app-logging::export_bundle` 仅日志；无 Android share-sheet/诊断包 |
+| AND-6 | capability 权限收敛 | 未开始 | `capabilities/default.json` 仍粗（`core:default`/`fs:default`/`dialog:default`） |
+
+注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`），但是 Tauri v2 未改动的自动生成脚手架——`MainActivity.kt` 仅调 `enableEdgeToEdge()`，与 `PLAN-ANDROID.md`"当前事实"一致。PLAN-ANDROID 各阶段均未执行。
+
+### 下一阶段建议
+
+继续 Phase 4，优先级：
+
+1. **阶段 2 写作入口绑定 active campaign**（关键路径）——后端 `start_writing`/`fill_campaign_context` 已消费 `CampaignRuntimeContext`，前端仍走旧入口、无 `startCampaignWriting`、pre-flight 不查 campaign。补 campaign-first 入口 + 预检，打通"导入卡→建 Campaign→写第一轮"验收。
+2. **阶段 1 首屏聚焦**——AppHeader 补 campaign/轮次/实例数。
+3. **阶段 4 Pipeline trace**——补 instance_id/role_type/stable-id reroll（计划高估，需诚实补齐）。
+4. **阶段 3 CampaignPanel 拆 Tab**——维护性重构，紧迫度低。
+5. **阶段 5 MetaPanel accept 后刷新 tabs**——小补丁，顺手。
+6. **阶段 6 移动端布局**——推迟到 Phase 6 启动前（Phase 6 依赖它）。
+
+理由：campaign 驱动写作端到端可用前不算打通，阶段 2 是缺失一环；Phase 6 依赖移动端布局，现启动过早；Phase 5 导出有价值但独立、紧迫度低于主写作流。
 
 ## 已修正文档问题
 

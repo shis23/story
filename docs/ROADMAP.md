@@ -78,9 +78,11 @@
 - ✅ Meta patch 不直接越权改数据（propose → preview → accept 才写盘）。
 - ✅ Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
 
-详细计划见 `docs/PLAN-META-AGENT.md`。统一 tool 注册中心见 `docs/PLAN-TOOL-REGISTRY.md`。
+详细计划见 `docs/PLAN-META-AGENT.md`。统一 tool 注册中心见 `docs/archive/2026-06-18-phase3-meta-tasks/PLAN-TOOL-REGISTRY.md`（已实现并归档）。
 
 ## Phase 4: 前端工作台重构
+
+**状态：进行中**（阶段 1/3/4 部分起步、5 基本完成、2/6 未开始；约 30%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：让前端围绕 Campaign 工作流，而不是围绕零散面板。
 
@@ -102,6 +104,8 @@
 详细计划见 `docs/PLAN-FRONTEND-WORKBENCH.md`。
 
 ## Phase 5: ST 兼容和导入/导出
+
+**状态：部分起步**（MVU 分析/预览/渲染 + ST 导入保真已落地；apply 前端接线、JS fallback、导出未开始；约 40%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：保持 SillyTavern 卡兼容，同时不被 ST 数据形态限制内部架构。
 
@@ -125,6 +129,8 @@
 - ST V2/V3 导入保真、StoryForge Campaign 导出、是否导出回 ST/Lorebook 仍缺独立执行计划；进入本阶段前应补 `docs/PLAN-ST-IMPORT-EXPORT.md`。
 
 ## Phase 6: Android 打磨
+
+**状态：未开始**（仅 Tauri 自动生成脚手架；约 5%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
 
 目标：把桌面调试能力收束为移动端可用体验。
 

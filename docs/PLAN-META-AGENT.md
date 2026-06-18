@@ -1,6 +1,6 @@
 # 计划：Meta Agent 维护层
 
-> 状态：阶段 1 已起步（后端检查 + Tauri command，前端未接）
+> 状态：阶段 1–5 已完成（2026-06-18，详见 ROADMAP Phase 3）
 > 前置：优先完成 `PLAN-CAMPAIGN-MAINLINE.md` 至少阶段 5。
 
 ## 目标

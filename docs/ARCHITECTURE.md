@@ -50,7 +50,7 @@ crates/infra-*
 - Director 工具 `get_character` 从扁平 `Character` 查角色。
 - `SubagentTask.character_id` 实际仍可能是角色名字符串。
 - Campaign 后处理已接入，但 Campaign 还不是写作输入的真相源。
-- **阶段 2 已完成**：`WritingContext`/`ToolContext` 已有 `campaign_runtime` 字段，`fill_campaign_context` 已组装快照，但 Director/Subagent 尚未消费它（阶段 3/4）。
+- **阶段 2 已完成**：`WritingContext`/`ToolContext` 已有 `campaign_runtime` 字段，`fill_campaign_context` 已组装快照。**阶段 3/4 已完成**：Director/Subagent 已通过 `CampaignRuntimeContext` 消费 instances/definitions/knowledge/variables（详见 `DOCS-CODE-AUDIT.md` 的 Campaign 写作主链路核对）。
 
 ## Campaign 目标流
 

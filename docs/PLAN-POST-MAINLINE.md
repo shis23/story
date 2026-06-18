@@ -41,7 +41,7 @@
 改动文件：
 
 - `docs/RELEASE-CHECKLIST.md`（新增）
-- `docs/HANDOFF.md`
+- `docs/HANDOFF.md`（2026-06-16 旧版已归档至 `docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md`；本阶段需重新生成）
 - 如需要，新增 `fixtures/` 或 `tests/fixtures/` 下的样例卡说明。
 
 任务：
