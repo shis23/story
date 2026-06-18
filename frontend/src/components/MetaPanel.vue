@@ -4,6 +4,7 @@ import {
   metaStartConversation, metaChat, metaListPendingPatches,
   metaAcceptPatch, metaDismissPatch,
   metaAnalyzeMvuCard, metaListMvuTranslations,
+  metaPreviewMvuApply, metaApplyMvuSchema,
   listCharacters, metaHealthCheck,
   metaProposeCampaignRepairs, metaListTypedPatches, metaPreviewTypedPatch,
   metaAcceptTypedPatch, metaDismissTypedPatch,
@@ -15,7 +16,7 @@ const props = defineProps({
   lastConversationNode: { type: Object, default: null }, // { conversation_id, node_id } — 生成溯源入口
 })
 
-const emit = defineEmits(['close'])
+const emit = defineEmits(['close', 'mvu-applied'])
 
 // ─── 状态 ───
 const conversationId = ref(null)
@@ -46,6 +47,12 @@ const expandedTypedPatchId = ref(null) // 展开的 typed patch id
 // ─── 生成溯源 ───
 const explainLoading = ref(false)
 const explainResult = ref(null) // GenerationExplanation
+
+// ─── MVU Apply 流程 ───
+const applyPreviewLoading = ref(false)
+const applyPreviews = ref([]) // MvuApplyPreview[]
+const applyPreviewSource = ref(null) // { id, name } — 正在预览的 source character
+const applyingDefId = ref(null) // 正在 apply 的 definition_id
 
 onMounted(async () => {
   // 初始化对话
@@ -161,6 +168,53 @@ async function handleAnalyzeMvu(cardId) {
   } finally {
     analyzingCardId.value = null
   }
+}
+
+// ─── MVU Apply 预览 ───
+async function handlePreviewMvuApply(sourceId, sourceName) {
+  applyPreviewLoading.value = true
+  applyPreviews.value = []
+  applyPreviewSource.value = { id: sourceId, name: sourceName }
+  error.value = ''
+  try {
+    const previews = await metaPreviewMvuApply(sourceId)
+    applyPreviews.value = previews || []
+  } catch (e) {
+    error.value = 'MVU apply 预览失败: ' + e
+    applyPreviewSource.value = null
+  } finally {
+    applyPreviewLoading.value = false
+  }
+}
+
+// ─── MVU Apply 执行 ───
+async function handleApplyMvuSchema(definitionId) {
+  if (!applyPreviewSource.value) return
+  applyingDefId.value = definitionId
+  error.value = ''
+  try {
+    await metaApplyMvuSchema(applyPreviewSource.value.id, definitionId)
+    // 从预览列表中移除已应用的 definition
+    applyPreviews.value = applyPreviews.value.filter(p => p.definition_id !== definitionId)
+    // 通知父组件刷新 Campaign 变量
+    emit('mvu-applied')
+  } catch (e) {
+    error.value = '应用 schema 失败: ' + e
+  } finally {
+    applyingDefId.value = null
+  }
+}
+
+function closeApplyPreview() {
+  applyPreviews.value = []
+  applyPreviewSource.value = null
+}
+
+// 工具：格式化 VariableField 摘要
+function fieldSummary(field) {
+  const type = field.value_type ? (typeof field.value_type === 'string' ? field.value_type : JSON.stringify(field.value_type)) : '?'
+  const def = field.default !== undefined && field.default !== null ? JSON.stringify(field.default) : ''
+  return `${field.key} (${field.label}) — ${type}${def ? ' = ' + def : ''}`
 }
 
 // ─── Campaign 健康检查 ───
@@ -466,6 +520,11 @@ function formatDiffValue(val) {
                 {{ routingText(m.routing) }} · {{ m.ui_binding_count }} 绑定 · {{ m.fallback_count }} 兜底
               </div>
               <div class="text-[10px] text-ink-soft mt-0.5">置信度 {{ Math.round(m.analysis_confidence * 100) }}%</div>
+              <button
+                @click="handlePreviewMvuApply(m.source_character_id, m.character_name)"
+                :disabled="applyPreviewLoading"
+                class="mt-1.5 w-full py-1 rounded text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40"
+              >{{ applyPreviewLoading && applyPreviewSource?.id === m.source_character_id ? '加载中…' : '应用 Schema' }}</button>
             </div>
           </div>
 
@@ -693,6 +752,70 @@ function formatDiffValue(val) {
                 v-for="(n, i) in activeMvuDetail.translation.notes" :key="i"
                 class="text-ink-soft text-[10px]"
               >• {{ n }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- MVU Apply 预览浮层 -->
+      <div
+        v-if="applyPreviewSource"
+        class="absolute inset-0 z-30 bg-black/40 flex items-center justify-center p-4"
+        @click.self="closeApplyPreview"
+      >
+        <div class="bg-bg rounded-2xl border border-line max-w-lg w-full max-h-[85vh] overflow-y-auto p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="font-medium text-ink text-sm">📦 {{ applyPreviewSource.name }} · Schema 合并预览</div>
+            <button @click="closeApplyPreview" class="text-ink-soft text-sm">✕</button>
+          </div>
+
+          <div v-if="applyPreviewLoading" class="text-center text-ink-soft text-sm py-6">加载预览中…</div>
+          <div v-else-if="applyPreviews.length === 0" class="text-center text-ink-soft text-sm py-6">无可用 definition</div>
+          <div v-else class="space-y-3">
+            <div
+              v-for="p in applyPreviews" :key="p.definition_id"
+              class="bg-surface rounded-lg border border-line p-3 text-xs"
+              :class="p.has_changes ? '' : 'opacity-50'"
+            >
+              <!-- header -->
+              <div class="flex items-center justify-between mb-2">
+                <div class="font-medium text-ink">
+                  {{ p.character_name }}
+                  <span class="text-ink-soft font-normal ml-1 text-[10px]">({{ p.definition_id.slice(0, 8) }}…)</span>
+                </div>
+                <span v-if="p.has_changes" class="px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-accent/15 text-accent">有变更</span>
+                <span v-else class="px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-ok/15 text-ok">无变化</span>
+              </div>
+
+              <!-- diff 详情 -->
+              <div v-if="p.has_changes" class="space-y-1.5 mb-2">
+                <!-- 新增字段 -->
+                <div v-if="p.added_fields.length > 0">
+                  <div class="text-accent font-medium mb-0.5">+ 新增 {{ p.added_fields.length }} 个字段</div>
+                  <div v-for="(f, i) in p.added_fields" :key="'a'+i" class="bg-bg rounded px-1.5 py-0.5 border border-line/50 text-[10px] text-ink-soft">
+                    {{ fieldSummary(f) }}
+                  </div>
+                </div>
+                <!-- 覆盖字段 -->
+                <div v-if="p.overwritten_fields.length > 0">
+                  <div class="text-warn font-medium mb-0.5">↻ 覆盖 {{ p.overwritten_fields.length }} 个字段</div>
+                  <div v-for="(f, i) in p.overwritten_fields" :key="'o'+i" class="bg-bg rounded px-1.5 py-0.5 border border-line/50 text-[10px] text-ink-soft">
+                    {{ fieldSummary(f) }}
+                  </div>
+                </div>
+              </div>
+              <div class="text-ink-soft text-[10px]">
+                合并后共 {{ p.merged_schema.length }} 个字段 · {{ p.unchanged_count }} 个不变
+              </div>
+
+              <!-- 操作按钮 -->
+              <div class="flex justify-end mt-2">
+                <button
+                  @click="handleApplyMvuSchema(p.definition_id)"
+                  :disabled="!p.has_changes || applyingDefId === p.definition_id"
+                  class="px-3 py-1 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                >{{ applyingDefId === p.definition_id ? '应用中…' : '应用' }}</button>
+              </div>
             </div>
           </div>
         </div>
