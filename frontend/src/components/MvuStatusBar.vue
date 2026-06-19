@@ -49,7 +49,7 @@ function barPercent(binding) {
 function barColor(percent) {
   if (percent > 50) return 'bg-ok'
   if (percent > 25) return 'bg-warn'
-  return 'bg-error'
+  return 'bg-err'
 }
 
 // icon 映射查找
@@ -78,7 +78,7 @@ function iconFor(binding) {
       >
         <!-- bar：进度条 -->
         <template v-if="b.display?.kind === 'bar'">
-          <span class="text-ink-soft w-16 shrink-0 truncate" :title="b.variable_key">{{ b.variable_key }}</span>
+          <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate" :title="b.variable_key">{{ b.variable_key }}</span>
           <div class="flex-1 h-2 bg-bg rounded-full overflow-hidden">
             <div
               class="h-full transition-all rounded-full"
@@ -93,13 +93,13 @@ function iconFor(binding) {
 
         <!-- text：纯文本 -->
         <template v-else-if="b.display?.kind === 'text'">
-          <span class="text-ink-soft w-16 shrink-0 truncate">{{ b.variable_key }}</span>
+          <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
           <span class="text-ink flex-1 truncate">{{ getValue(b.variable_key) ?? '—' }}</span>
         </template>
 
         <!-- tag：标签 -->
         <template v-else-if="b.display?.kind === 'tag'">
-          <span class="text-ink-soft w-16 shrink-0 truncate">{{ b.variable_key }}</span>
+          <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
           <span class="px-1.5 py-0.5 rounded-full bg-accent-soft text-accent text-[10px]">
             {{ getValue(b.variable_key) ?? '—' }}
           </span>
@@ -107,13 +107,13 @@ function iconFor(binding) {
 
         <!-- icon：图标映射 -->
         <template v-else-if="b.display?.kind === 'icon'">
-          <span class="text-ink-soft w-16 shrink-0 truncate">{{ b.variable_key }}</span>
+          <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
           <span class="text-base">{{ iconFor(b) }}</span>
         </template>
 
         <!-- 兜底（未知 display） -->
         <template v-else>
-          <span class="text-ink-soft w-16 shrink-0 truncate">{{ b.variable_key }}</span>
+          <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
           <span class="text-ink flex-1 truncate">{{ getValue(b.variable_key) ?? '—' }}</span>
         </template>
       </div>

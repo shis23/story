@@ -1,5 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { confirmDialog, alertDialog } from './base/BaseDialog.js'
+import BaseOverlay from './base/BaseOverlay.vue'
 import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex, importPresetAsModules } from '../tauri-api.js'
 
 const emit = defineEmits(['close'])
@@ -38,8 +40,7 @@ async function togglePreset(preset) {
 }
 
 async function handleDelete(preset) {
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask(`确定删除预设「${preset.name}」？`, { title: '删除确认', kind: 'warning' })
+  const ok = await confirmDialog(`确定删除预设「${preset.name}」？`, { title: '删除确认' })
   if (!ok) return
   try {
     await deletePreset(preset.id)
@@ -49,7 +50,7 @@ async function handleDelete(preset) {
     }
     await refresh()
   } catch (e) {
-    alert('删除失败: ' + e)
+    await alertDialog('删除失败: ' + e)
   }
 }
 
@@ -74,7 +75,7 @@ async function saveEditPrompt(index) {
     editingPrompt.value = null
     editContent.value = ''
   } catch (e) {
-    alert('保存失败: ' + e)
+    await alertDialog('保存失败: ' + e)
   } finally {
     saving.value = false
   }
@@ -87,7 +88,7 @@ async function togglePromptEnabled(index) {
     await updatePresetPrompt(expandedId.value, index, null, !prompt.enabled)
     prompt.enabled = !prompt.enabled
   } catch (e) {
-    alert('操作失败: ' + e)
+    await alertDialog('操作失败: ' + e)
   } finally {
     saving.value = false
   }
@@ -100,7 +101,7 @@ async function toggleRegexDisabled(index) {
     await updatePresetRegex(expandedId.value, index, !regex.disabled)
     regex.disabled = !regex.disabled
   } catch (e) {
-    alert('操作失败: ' + e)
+    await alertDialog('操作失败: ' + e)
   } finally {
     saving.value = false
   }
@@ -109,9 +110,9 @@ async function toggleRegexDisabled(index) {
 async function handleImportAsModules(preset) {
   try {
     const count = await importPresetAsModules(preset.id)
-    alert(`已导入 ${count} 条提示词为模块，可在导演 Agent 配置中选择使用`)
+    await alertDialog(`已导入 ${count} 条提示词为模块，可在导演 Agent 配置中选择使用`)
   } catch (e) {
-    alert('导入失败: ' + e)
+    await alertDialog('导入失败: ' + e)
   }
 }
 
@@ -123,154 +124,147 @@ function roleBadgeClass(role) {
 </script>
 
 <template>
-  <div class="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center" @click.self="emit('close')">
-    <div class="bg-bg w-full max-w-lg max-h-[90vh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-line flex flex-col">
+  <BaseOverlay :model-value="true" title="预设管理" size="md" position="left" @close="emit('close')">
+    <template #header-extra>
+      <span v-if="saving" class="text-xs text-accent">保存中…</span>
+    </template>
 
-      <!-- 顶栏 -->
-      <div class="sticky top-0 z-10 bg-bg border-b border-line px-4 py-3 flex items-center justify-between shrink-0">
-        <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>
-        <span class="font-medium text-ink text-sm">预设管理</span>
-        <span v-if="saving" class="text-xs text-accent">保存中…</span>
-        <div v-else class="w-12"></div>
+    <!-- 内容区 -->
+    <div class="p-4 space-y-3">
+      <div v-if="loading" class="text-center text-ink-soft text-sm py-8">加载中…</div>
+
+      <div v-else-if="presets.length === 0" class="text-center text-ink-soft text-sm py-8">
+        还没有预设，请先导入
       </div>
 
-      <!-- 内容区 -->
-      <div class="flex-1 overflow-y-auto p-4 space-y-3">
-        <div v-if="loading" class="text-center text-ink-soft text-sm py-8">加载中…</div>
-
-        <div v-else-if="presets.length === 0" class="text-center text-ink-soft text-sm py-8">
-          还没有预设，请先导入
+      <div
+        v-for="p in presets"
+        :key="p.id"
+        class="bg-surface rounded-xl border border-line overflow-hidden"
+      >
+        <!-- 预设头部 -->
+        <div
+          class="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-bg transition-colors"
+          @click="togglePreset(p)"
+        >
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium text-ink truncate">{{ p.name }}</div>
+            <div class="text-xs text-ink-soft">
+              {{ p.prompt_count }} 条提示词 · {{ p.regex_count }} 条正则
+            </div>
+          </div>
+          <button
+            @click.stop="handleImportAsModules(p)"
+            class="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-accent/70 hover:bg-accent/10 transition-colors"
+            title="导入为模块（可在导演配置中选择）"
+          >📦</button>
+          <button
+            @click.stop="handleDelete(p)"
+            class="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-err/70 hover:bg-err/10 transition-colors"
+            title="删除"
+          >🗑</button>
+          <span class="text-ink-soft text-xs shrink-0">{{ expandedId === p.id ? '▲' : '▼' }}</span>
         </div>
 
-        <div
-          v-for="p in presets"
-          :key="p.id"
-          class="bg-surface rounded-xl border border-line overflow-hidden"
-        >
-          <!-- 预设头部 -->
-          <div
-            class="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-bg transition-colors"
-            @click="togglePreset(p)"
-          >
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium text-ink truncate">{{ p.name }}</div>
-              <div class="text-xs text-ink-soft">
-                {{ p.prompt_count }} 条提示词 · {{ p.regex_count }} 条正则
-              </div>
-            </div>
+        <!-- 展开详情 -->
+        <div v-if="expandedId === p.id && detail" class="border-t border-line">
+          <!-- 子 tab -->
+          <div class="flex border-b border-line">
             <button
-              @click.stop="handleImportAsModules(p)"
-              class="shrink-0 text-xs px-1.5 py-0.5 rounded text-accent/70 hover:bg-accent/10"
-              title="导入为模块（可在导演配置中选择）"
-            >📦</button>
+              @click="detailTab = 'prompts'"
+              class="flex-1 min-h-[44px] text-xs font-medium transition-colors"
+              :class="detailTab === 'prompts' ? 'text-accent border-b-2 border-accent' : 'text-ink-soft'"
+            >提示词 ({{ detail.prompts.length }})</button>
             <button
-              @click.stop="handleDelete(p)"
-              class="shrink-0 text-xs px-1.5 py-0.5 rounded text-err/70 hover:bg-err/10"
-              title="删除"
-            >🗑</button>
-            <span class="text-ink-soft text-xs shrink-0">{{ expandedId === p.id ? '▲' : '▼' }}</span>
+              @click="detailTab = 'regex'"
+              class="flex-1 min-h-[44px] text-xs font-medium transition-colors"
+              :class="detailTab === 'regex' ? 'text-accent border-b-2 border-accent' : 'text-ink-soft'"
+            >正则 ({{ detail.regex_scripts.length }})</button>
           </div>
 
-          <!-- 展开详情 -->
-          <div v-if="expandedId === p.id && detail" class="border-t border-line">
-            <!-- 子 tab -->
-            <div class="flex border-b border-line">
-              <button
-                @click="detailTab = 'prompts'"
-                class="flex-1 py-2 text-xs font-medium transition-colors"
-                :class="detailTab === 'prompts' ? 'text-accent border-b-2 border-accent' : 'text-ink-soft'"
-              >提示词 ({{ detail.prompts.length }})</button>
-              <button
-                @click="detailTab = 'regex'"
-                class="flex-1 py-2 text-xs font-medium transition-colors"
-                :class="detailTab === 'regex' ? 'text-accent border-b-2 border-accent' : 'text-ink-soft'"
-              >正则 ({{ detail.regex_scripts.length }})</button>
-            </div>
+          <div class="px-3 py-2 space-y-2">
+            <!-- 提示词列表（可编辑） -->
+            <template v-if="detailTab === 'prompts'">
+              <div
+                v-for="(prompt, i) in detail.prompts"
+                :key="i"
+                class="bg-bg rounded-lg px-3 py-2 text-xs"
+                :class="{ 'opacity-50': !prompt.enabled || prompt.marker }"
+              >
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="px-1.5 py-0.5 rounded text-[10px]" :class="roleBadgeClass(prompt.role)">{{ prompt.role }}</span>
+                  <span class="font-medium text-ink truncate">{{ prompt.name || prompt.identifier }}</span>
+                  <span v-if="prompt.marker" class="text-[10px] text-ink-soft">marker</span>
+                  <span v-if="prompt.is_system_prompt" class="text-[10px] text-accent">系统提示词</span>
 
-            <div class="px-3 py-2 space-y-2 max-h-60 overflow-y-auto">
-              <!-- 提示词列表（可编辑） -->
-              <template v-if="detailTab === 'prompts'">
-                <div
-                  v-for="(prompt, i) in detail.prompts"
-                  :key="i"
-                  class="bg-bg rounded-lg px-3 py-2 text-xs"
-                  :class="{ 'opacity-50': !prompt.enabled || prompt.marker }"
-                >
-                  <div class="flex items-center gap-2 mb-1">
-                    <span class="px-1.5 py-0.5 rounded text-[10px]" :class="roleBadgeClass(prompt.role)">{{ prompt.role }}</span>
-                    <span class="font-medium text-ink truncate">{{ prompt.name || prompt.identifier }}</span>
-                    <span v-if="prompt.marker" class="text-[10px] text-ink-soft">marker</span>
-                    <span v-if="prompt.is_system_prompt" class="text-[10px] text-accent">系统提示词</span>
-
-                    <!-- 操作按钮 -->
-                    <div class="ml-auto flex gap-1 shrink-0">
-                      <button
-                        @click="togglePromptEnabled(i)"
-                        class="px-1.5 py-0.5 rounded text-[10px]"
-                        :class="prompt.enabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
-                        :title="prompt.enabled ? '点击禁用' : '点击启用'"
-                      >{{ prompt.enabled ? '✓' : '✕' }}</button>
-                      <button
-                        v-if="!prompt.marker"
-                        @click="startEditPrompt(i)"
-                        class="px-1.5 py-0.5 rounded text-[10px] bg-line text-ink-soft hover:bg-accent/10 hover:text-accent"
-                        title="编辑内容"
-                      >✎</button>
-                    </div>
-                  </div>
-
-                  <!-- 编辑模式 -->
-                  <div v-if="editingPrompt === i" class="mt-2">
-                    <textarea
-                      v-model="editContent"
-                      class="w-full h-24 text-xs font-mono p-2 rounded border border-line bg-surface resize-none focus:border-accent focus:outline-none"
-                    />
-                    <div class="flex justify-end gap-1.5 mt-1.5">
-                      <button @click="cancelEdit" class="px-2 py-1 text-[10px] rounded bg-line text-ink-soft hover:bg-bg">取消</button>
-                      <button @click="saveEditPrompt(i)" class="px-2 py-1 text-[10px] rounded bg-accent text-white hover:bg-accent/80">保存</button>
-                    </div>
-                  </div>
-
-                  <!-- 查看模式 -->
-                  <div v-else class="text-ink-soft whitespace-pre-wrap line-clamp-4">{{ prompt.content }}</div>
-                </div>
-                <div v-if="detail.prompts.length === 0" class="text-xs text-ink-soft text-center py-4">无提示词</div>
-              </template>
-
-              <!-- 正则列表（可启停） -->
-              <template v-if="detailTab === 'regex'">
-                <div
-                  v-for="(r, i) in detail.regex_scripts"
-                  :key="r.id"
-                  class="bg-bg rounded-lg px-3 py-2 text-xs"
-                  :class="{ 'opacity-50': r.disabled }"
-                >
-                  <div class="flex items-center gap-2 mb-1">
-                    <span class="font-medium text-ink truncate">{{ r.script_name || r.id }}</span>
-                    <span class="px-1.5 py-0.5 rounded text-[10px]"
-                      :class="r.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'"
-                    >{{ r.placement === 'input' ? '输入' : '输出' }}</span>
-                    <span v-if="r.disabled" class="text-[10px] text-warn">禁用</span>
-
-                    <!-- 启停按钮 -->
+                  <!-- 操作按钮 -->
+                  <div class="ml-auto flex gap-1 shrink-0">
                     <button
-                      @click="toggleRegexDisabled(i)"
-                      class="ml-auto px-1.5 py-0.5 rounded text-[10px] shrink-0"
-                      :class="!r.disabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
-                      :title="r.disabled ? '点击启用' : '点击禁用'"
-                    >{{ !r.disabled ? '✓' : '✕' }}</button>
-                  </div>
-                  <div class="text-ink-soft font-mono text-[11px] break-all">
-                    <div>匹配: {{ r.find_regex }}</div>
-                    <div>替换: {{ r.replace_string }}</div>
+                      @click="togglePromptEnabled(i)"
+                      class="min-h-[36px] px-2.5 rounded text-[10px]"
+                      :class="prompt.enabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
+                      :title="prompt.enabled ? '点击禁用' : '点击启用'"
+                    >{{ prompt.enabled ? '✓' : '✕' }}</button>
+                    <button
+                      v-if="!prompt.marker"
+                      @click="startEditPrompt(i)"
+                      class="min-h-[36px] px-2.5 rounded text-[10px] bg-line text-ink-soft hover:bg-accent/10 hover:text-accent transition-colors"
+                      title="编辑内容"
+                    >✎</button>
                   </div>
                 </div>
-                <div v-if="detail.regex_scripts.length === 0" class="text-xs text-ink-soft text-center py-4">无正则脚本</div>
-              </template>
-            </div>
+
+                <!-- 编辑模式 -->
+                <div v-if="editingPrompt === i" class="mt-2">
+                  <textarea
+                    v-model="editContent"
+                    class="w-full h-24 text-xs font-mono p-2 rounded border border-line bg-surface resize-none focus:border-accent focus:outline-none"
+                  />
+                  <div class="flex justify-end gap-1.5 mt-1.5">
+                    <button @click="cancelEdit" class="min-h-[36px] px-3 text-[10px] rounded bg-line text-ink-soft hover:bg-bg transition-colors">取消</button>
+                    <button @click="saveEditPrompt(i)" class="min-h-[36px] px-3 text-[10px] rounded bg-accent text-white hover:bg-accent/80 transition-colors">保存</button>
+                  </div>
+                </div>
+
+                <!-- 查看模式 -->
+                <div v-else class="text-ink-soft whitespace-pre-wrap line-clamp-4">{{ prompt.content }}</div>
+              </div>
+              <div v-if="detail.prompts.length === 0" class="text-xs text-ink-soft text-center py-4">无提示词</div>
+            </template>
+
+            <!-- 正则列表（可启停） -->
+            <template v-if="detailTab === 'regex'">
+              <div
+                v-for="(r, i) in detail.regex_scripts"
+                :key="r.id"
+                class="bg-bg rounded-lg px-3 py-2 text-xs"
+                :class="{ 'opacity-50': r.disabled }"
+              >
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="font-medium text-ink truncate">{{ r.script_name || r.id }}</span>
+                  <span class="px-1.5 py-0.5 rounded text-[10px]"
+                    :class="r.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'"
+                  >{{ r.placement === 'input' ? '输入' : '输出' }}</span>
+                  <span v-if="r.disabled" class="text-[10px] text-warn">禁用</span>
+
+                  <!-- 启停按钮 -->
+                  <button
+                    @click="toggleRegexDisabled(i)"
+                    class="ml-auto min-h-[36px] px-2.5 rounded text-[10px] shrink-0"
+                    :class="!r.disabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
+                    :title="r.disabled ? '点击启用' : '点击禁用'"
+                  >{{ !r.disabled ? '✓' : '✕' }}</button>
+                </div>
+                <div class="text-ink-soft font-mono text-[11px] break-all">
+                  <div>匹配: {{ r.find_regex }}</div>
+                  <div>替换: {{ r.replace_string }}</div>
+                </div>
+              </div>
+              <div v-if="detail.regex_scripts.length === 0" class="text-xs text-ink-soft text-center py-4">无正则脚本</div>
+            </template>
           </div>
         </div>
       </div>
     </div>
-  </div>
+  </BaseOverlay>
 </template>

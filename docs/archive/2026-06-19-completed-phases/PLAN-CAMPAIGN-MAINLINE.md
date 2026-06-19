@@ -1,8 +1,6 @@
 # 计划：Campaign 写作主线
 
-> 状态：阶段 5 已补齐（2026-06-17），Postprocess ID 归一 + Provenance 收尾 + present_chars 校验 + task campaign 校验 + delete_character 级联修复；阶段 6 已完成落盘闭环（临时 instance 持久化 + postprocess 写回 + 去重）；经评估，request_ad_hoc_character 工具不必实现（unmatched 兜底已覆盖，见阶段 6 说明）
-> 目标读者：可交给小模型按阶段执行
-> 关联：`docs/ARCHITECTURE-AUDIT.md`；归档背景：`docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`
+> **归档说明**：本文件已于 2026-06-19 归档为历史执行记录。所有 6 个阶段（Phase 1/2）均已实现并合并到 main。后续执行入口见 `docs/ROADMAP.md` Phase 1/2。归档位置：`docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`。
 
 ## 目标
 

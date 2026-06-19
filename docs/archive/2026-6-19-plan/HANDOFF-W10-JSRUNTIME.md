@@ -1,5 +1,6 @@
 # W10 执行手册：JS Runtime 接通写作流程
 
+> 状态：已合并到 main（commit ce3d0bd, 6b6fdba, 2026-06-19）
 > 交接对象：Claude Code（在 worktree `storyforge-w10-jsruntime` 分支 `w10-jsruntime` 工作）
 > 前置必读：`docs/PLAN-PLUGIN-MVU.md` 阶段 5、`crates/infra-plugin-host/src/mvu_runtime.rs`、`docs/HANDOFF-W8-JSRUNTIME.md`（W8 实现 runtime）
 > 工作目录：`C:\Users\Predator\ZCodeProject\storyforge-w10-jsruntime`

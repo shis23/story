@@ -647,8 +647,13 @@ pub async fn spawn_subagents(
                 }
             });
 
+            // 子 Agent 的完成探测：输出达到一定长度即视为完成（表演内容就是产出，
+            // 不需要像导演那样必须调工具）。避免 drift recovery 把已完成的输出拖到 max rounds。
+            let sub_probe: &(dyn Fn(&str) -> bool + Send + Sync) = &|content: &str| {
+                content.chars().count() >= 50
+            };
             let result = sub_runtime
-                .run_tool_loop_with_layout(&config, layout, &registry, child_cancel, sub_tx, None)
+                .run_tool_loop_with_layout(&config, layout, &registry, child_cancel, sub_tx, Some(sub_probe))
                 .await;
             // sub_tx 在此 drop，转发任务收到 None 后自然结束
 

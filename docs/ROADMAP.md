@@ -28,7 +28,7 @@
 
 详细计划见：
 
-- `docs/PLAN-CAMPAIGN-MAINLINE.md`
+- `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）
 
 ## Phase 2: 信息隔离和状态闭环
 
@@ -62,7 +62,7 @@
 
 详细计划见：
 
-- `docs/PLAN-CAMPAIGN-MAINLINE.md` 的阶段 5-6。
+- `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档） 的阶段 5-6。
 - 隔离加固详情见 `docs/HARNESS-FINDINGS-2026-06-18.md`。
 
 ## Phase 3: Meta Agent 维护层
@@ -88,11 +88,11 @@
 - ✅ Meta patch 不直接越权改数据（propose → preview → accept 才写盘）。
 - ✅ Meta 对 active Campaign 的回答不再只基于 `tool_ctx.characters`。
 
-详细计划见 `docs/PLAN-META-AGENT.md`。统一 tool 注册中心见 `docs/archive/2026-06-18-phase3-meta-tasks/PLAN-TOOL-REGISTRY.md`（已实现并归档）。
+详细计划见 `docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md`（已归档）。统一 tool 注册中心见 `docs/archive/2026-06-18-phase3-meta-tasks/PLAN-TOOL-REGISTRY.md`（已实现并归档）。
 
 ## Phase 4: 前端工作台重构
 
-**状态：基本完成**（阶段 1/2/3/4/5/6 全部完成；约 95%，2026-06-19 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：已完成**（阶段 1/2/3/4/5/6 全部完成；2026-06-19 W9/W10 落地后全链路验收通过）
 
 目标：让前端围绕 Campaign 工作流，而不是围绕零散面板。
 
@@ -102,7 +102,7 @@
 - ~~写作入口绑定 active campaign。~~ ✅ 阶段 2：`writingMode` 三态（campaign/legacy/none），Campaign 模式传 null characterId
 - ~~Campaign 面板拆成角色实例、变量、知识、任务、摘要标签页。~~ ✅ 阶段 3：拆成 4 个独立 tab 组件 + 变量类型化显示 + 修复知识/摘要字段名静默 bug
 - ~~PipelinePanel 做成可检查的 Agent trace。~~ ✅ 阶段 4：subagent trace 用 instance display name，reroll 用稳定 id
-- ~~MetaPanel 和 Campaign health check 打通。~~ ✅ 阶段 5
+- ~~MetaPanel 和 Campaign health check 打通。~~ ✅ 阶段 5：W9 补完 MetaPanel accept 后变量 tab 刷新
 - ~~对移动端布局做一次专项整理。~~ ✅ 阶段 6：Pipeline 默认折叠、CharacterList 底部 sheet
 
 验收：
@@ -111,11 +111,11 @@
 - ✅ 调试用户能看到每个 Agent 的输入输出摘要（阶段 4 trace 用 display name）。
 - ✅ 移动端不依赖桌面宽屏才能操作主流程（阶段 6）。
 
-详细计划见 `docs/PLAN-FRONTEND-WORKBENCH.md`。
+详细计划见 `docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`（已归档）。
 
 ## Phase 5: ST 兼容和导入/导出
 
-**状态：大部分完成**（MVU 分析/预览/渲染 + ST 导入保真 + Campaign 导出已落地；JS runtime 基础设施就绪待接通 + MVU apply 前端接线待补；约 75%，2026-06-19 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：已完成**（MVU 分析/预览/渲染 + ST 导入保真 + Campaign 导出 + MVU apply 前端接线 + JS runtime 接通写作流程；2026-06-19 W9/W10 落地后全链路打通）
 
 目标：保持 SillyTavern 卡兼容，同时不被 ST 数据形态限制内部架构。
 
@@ -126,8 +126,8 @@
 - ~~多角色识别失败时稳定 fallback。~~ ✅ `fallback_from_character`
 - ~~设计 StoryForge Campaign 导出格式。~~ ✅ JSON bundle（`format_version`）
 - ~~评估是否支持导出回 ST 卡或 Lorebook。~~ ✅ ST 卡 PNG（tEXt 写入）+ 多角色共享 lorebook
-- ⏳ MVU apply 前端接线：后端 `meta_preview_mvu_apply`/`meta_apply_mvu_schema` 命令已有，前端 API 未接。
-- ⏳ JS Fallback WebView Runtime：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。
+- ~~MVU apply 前端接线：后端 `meta_preview_mvu_apply`/`meta_apply_mvu_schema` 命令已有，前端 API 未接。~~ ✅ W9 已实现：tauri-api.js 补 API + MetaPanel 加 preview diff + 确认 apply + 变量 tab 刷新
+- ~~JS Fallback WebView Runtime 接通写作流程：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。~~ ✅ W10 已实现：DI 注入 + postprocess 调 execute_fragment，harness 传 None 降级
 
 验收：
 
@@ -140,7 +140,11 @@
 
 - `docs/PLAN-PLUGIN-MVU.md` 覆盖 MVU 状态栏、schema preview 和 JS fallback。
 - `docs/PLAN-ST-IMPORT-EXPORT.md` 覆盖 ST 导入保真 + Campaign 导出（T4/T5 已实现）。
-- 剩余：MVU apply 前端接线、JS runtime 接通写作流程（见上述任务 ⏳）。
+
+已知限制（非阻塞）：
+
+- **JS 变量归口**：`execute_fragment` 产出的 `variable_updates` 统一写入 campaign 级变量（`instance_id=None`）。若需按角色归属，后续需细化 key 前缀解析或扩展 `MvuExecResult` 携带 `instance_id`。
+- **JSR shim 覆盖度**：`WebViewMvuRuntime` 的 JSR/ST API shim 基于常用子集实现，依赖冷门 API 的重 DOM 卡将降级为跳过 JS 执行（`tracing::warn!` + `is_available()=false` 回退），不影响主写作。
 
 ## Phase 6: Android 打磨
 

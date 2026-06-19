@@ -1,5 +1,6 @@
 # W9 执行手册：MVU Apply 前端接线
 
+> 状态：已合并到 main（commit 1794266, fd9780f, 2026-06-19）
 > 交接对象：Claude Code（在 worktree `storyforge-w9-mvuapply` 分支 `w9-mvuapply` 工作）
 > 前置必读：`docs/PLAN-PLUGIN-MVU.md` 阶段 2/3、`docs/HARNESS-FINDINGS-2026-06-18.md` §F3
 > 工作目录：`C:\Users\Predator\ZCodeProject\storyforge-w9-mvuapply`

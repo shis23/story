@@ -131,11 +131,11 @@ impl ConversationStore {
         Ok(result)
     }
 
-    /// 创建新对话
-    pub fn create(&self, character_id: Option<String>) -> Conversation {
+    /// 创建新对话（可绑定 Campaign）
+    pub fn create(&self, character_id: Option<String>, campaign_id: Option<Id>) -> Conversation {
         self.ensure_loaded();
 
-        let conv = Conversation::new(character_id);
+        let conv = Conversation::new(character_id, campaign_id);
         if let Err(e) = self.persist(&conv) {
             tracing::error!("持久化新对话失败: {e}");
         }
@@ -145,7 +145,7 @@ impl ConversationStore {
         conv
     }
 
-    /// 获取对话列表（摘要）
+    /// 获取对话列表（摘要，card_name 由 Tauri 层联查填充）
     pub fn list(&self) -> Vec<ConversationSummary> {
         self.ensure_loaded();
 
@@ -155,11 +155,20 @@ impl ConversationStore {
             .map(|c| ConversationSummary {
                 id: c.id.clone(),
                 character_id: c.character_id.clone(),
+                campaign_id: c.campaign_id.clone(),
+                card_name: None, // Tauri 层联查角色卡名后填充
                 message_count: c.nodes.len(),
                 created_at: c.created_at,
                 updated_at: c.updated_at,
             })
             .collect()
+    }
+
+    /// 按 Campaign ID 查对话（一 Campaign 一对话）
+    pub fn find_by_campaign(&self, campaign_id: &Id) -> Option<Conversation> {
+        self.ensure_loaded();
+        let cache = self.lock_cache();
+        cache.iter().find(|c| c.campaign_id.as_ref() == Some(campaign_id)).cloned()
     }
 
     /// 获取对话详情
@@ -500,6 +509,12 @@ impl ConversationStore {
 pub struct ConversationSummary {
     pub id: Id,
     pub character_id: Option<String>,
+    /// 关联的 Campaign ID（一 Campaign 一对话）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<Id>,
+    /// 关联角色卡名（前端列表显示用，由 Tauri 层联查填充）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_name: Option<String>,
     pub message_count: usize,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
@@ -606,7 +621,7 @@ mod tests {
     #[test]
     fn test_create_and_list() {
         let store = temp_store();
-        let conv = store.create(Some("Seraphina".into()));
+        let conv = store.create(Some("Seraphina".into()), None);
 
         let list = store.list();
         assert_eq!(list.len(), 1);
@@ -619,7 +634,7 @@ mod tests {
     #[test]
     fn test_append_messages() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
 
         store
             .append_user_message(&conv.id, "写一场戏".into())
@@ -643,7 +658,7 @@ mod tests {
     #[test]
     fn test_accept_variant() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         let node_id = store
             .append_ai_draft(&conv.id, "草稿".into(), None)
             .unwrap();
@@ -660,7 +675,7 @@ mod tests {
     #[test]
     fn test_cannot_accept_discarded_variant() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         let node_id = store
             .append_ai_draft(&conv.id, "草稿".into(), None)
             .unwrap();
@@ -678,7 +693,7 @@ mod tests {
     #[test]
     fn test_swipe_and_switch() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         let node_id = store
             .append_ai_draft(&conv.id, "版本1".into(), None)
             .unwrap();
@@ -706,7 +721,7 @@ mod tests {
     #[test]
     fn test_edit_and_soft_delete() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         let node_id = store
             .append_ai_draft(&conv.id, "原始内容".into(), None)
             .unwrap();
@@ -741,7 +756,7 @@ mod tests {
     #[test]
     fn test_truncate_from_remains_prior_nodes() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         // user1 → ai1 → ai2 → ai3
         let _u1 = store.append_user_message(&conv.id, "意图1".into()).unwrap();
         let ai1 = store
@@ -771,7 +786,7 @@ mod tests {
     #[test]
     fn test_partial_roll_validation() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         let node_id = store
             .append_ai_draft(&conv.id, "成文".into(), None)
             .unwrap();
@@ -818,7 +833,7 @@ mod tests {
     #[test]
     fn test_replace_active_variant_demotes_old_and_promotes_new() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         // 首写一条 AI 草稿（带 provenance，便于后续可重 roll）
         let node_id = store
             .append_ai_draft(&conv.id, "初版成文".into(), Some(dummy_provenance()))
@@ -862,7 +877,7 @@ mod tests {
     #[test]
     fn test_is_last_assistant_node_three_scenarios() {
         let store = temp_store();
-        let conv = store.create(None);
+        let conv = store.create(None, None);
         // 空对话
         assert!(!store.is_last_assistant_node(&conv.id, &conv.id).unwrap());
 

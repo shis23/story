@@ -8,6 +8,12 @@ import {
   deleteAgentProfileConfig,
   setActiveAgentProfileConfig,
 } from '../tauri-api.js'
+import { promptDialog, confirmDialog } from './base/BaseDialog.js'
+
+defineProps({
+  // 嵌入调试抽屉时去掉外层卡片
+  embedded: { type: Boolean, default: false },
+})
 
 // ─── 可配置角色（与后端 AgentRole 序列化字符串对齐）──────────────────────
 // Subagent 用通配符 "*" 覆盖所有子 Agent（后端 run_config_for 支持 Subagent:* 回退）
@@ -85,7 +91,7 @@ async function duplicate(id) {
   try {
     const src = await getAgentProfileConfig(id)
     if (!src) return
-    const name = window.prompt('新配置名称：', `${src.name} 副本`)
+    const name = await promptDialog('新配置名称：', `${src.name} 副本`, { title: '复制配置' })
     if (!name) return
     const newConfig = {
       ...src,
@@ -109,7 +115,7 @@ async function removeProfile(id) {
     errorMsg.value = '内置默认配置不可删除'
     return
   }
-  if (!window.confirm('确认删除该配置？')) return
+  if (!await confirmDialog('确认删除该配置？', { title: '删除确认' })) return
   saving.value = true
   try {
     await deleteAgentProfileConfig(id)
@@ -242,7 +248,7 @@ function readonly() {
 </script>
 
 <template>
-  <div class="mx-4 mt-3 bg-surface rounded-2xl border border-line p-4">
+  <div :class="embedded ? '' : 'mx-4 mt-3 bg-surface rounded-2xl border border-line p-4'">
     <!-- 标题栏 -->
     <div class="flex items-center gap-2 mb-2">
       <span class="text-base">🧩</span>

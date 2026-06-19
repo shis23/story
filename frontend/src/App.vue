@@ -1,22 +1,21 @@
 <script setup>
 import { ref, reactive, computed, onMounted, nextTick } from 'vue'
-import AppHeader from './components/AppHeader.vue'
+import AppSidebar from './components/AppSidebar.vue'
+import BaseOverlay from './components/base/BaseOverlay.vue'
 import ChatMessage from './components/ChatMessage.vue'
 import Composer from './components/Composer.vue'
-import PipelinePanel from './components/PipelinePanel.vue'
-import AgentConfigCard from './components/AgentConfigCard.vue'
-import AgentProfileManager from './components/AgentProfileManager.vue'
+import StreamingMessage from './components/StreamingMessage.vue'
+import DebugDrawer from './components/DebugDrawer.vue'
 import CharacterDetail from './components/CharacterDetail.vue'
 import CharacterList from './components/CharacterList.vue'
-import LogPanel from './components/LogPanel.vue'
 import ConnectionConfig from './components/ConnectionConfig.vue'
 import CampaignPanel from './components/CampaignPanel.vue'
 import PresetPanel from './components/PresetPanel.vue'
 import PluginPanel from './components/PluginPanel.vue'
-import PluginHost from './components/PluginHost.vue'
 import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, getConversation, logAppendFrontend, getActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
+import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, createCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -59,6 +58,43 @@ function handleMvuApplied() {
 
 const showPresetPanel = ref(false)
 const showPluginPanel = ref(false)
+const showDebugDrawer = ref(false) // 移动端调试抽屉（桌面常驻无需此开关）
+const showSidebar = ref(false) // 移动端左导航抽屉
+
+// 中间栏视图：'write' 写作 | 'history' 会话历史 | 'overview' Campaign 概览
+// 由 showHistory/activeCampaignOverview 派生，统一成 currentView 供左导航高亮
+const currentView = computed(() => {
+  if (showHistory.value && activeCampaign.value && activeCampaignOverview.value) return 'overview'
+  if (showHistory.value) return 'history'
+  return 'write'
+})
+
+// 中间栏标题
+const pageTitle = computed(() => {
+  if (currentView.value === 'overview') return activeCampaign.value?.name || 'Campaign'
+  if (currentView.value === 'history') return '会话历史'
+  if (writingMode.value === 'campaign') return activeCampaign.value?.name || 'Campaign 写作'
+  if (writingMode.value === 'legacy') return activeChar.value?.name || '写作'
+  return 'StoryForge'
+})
+
+// 流式消息的角色标签
+const streamingRoleLabel = computed(() =>
+  writingMode.value === 'campaign'
+    ? (activeCampaign.value?.name || 'AI')
+    : (activeChar.value?.name || 'AI')
+)
+
+function viewHistory() { showHistory.value = true; activeCampaignOverview.value = false }
+function viewOverview() { showHistory.value = true; activeCampaignOverview.value = true }
+function viewWrite() { showHistory.value = false }
+
+// 高玩开关 = 模态总闸：开启时进入专业调试模态（桌面右栏自动出现，移动端弹抽屉）
+function onTogglePower() {
+  powerMode.value = !powerMode.value
+  if (powerMode.value) showDebugDrawer.value = true
+}
+
 const sidebarPlugins = ref([])
 const showSidebarPlugins = ref(false)
 
@@ -121,8 +157,9 @@ const activeCampaignOverview = ref(true)
 const showConnConfig = ref(false)
 // 当前活跃连接（顶栏显示用）
 const activeConnection = ref(null)
-// AgentConfigCard 引用（连接变更后刷新）
-const agentConfigRef = ref(null)
+// AgentConfigCard 引用（连接变更后刷新）—— 现由 DebugDrawer 持有，转发调用
+const debugDrawerRef = ref(null)
+const agentConfigRef = computed(() => debugDrawerRef.value)
 
 // 获取版本 + 加载会话历史列表 + 拦截 console
 onMounted(async () => {
@@ -189,17 +226,48 @@ async function loadConversationHistory() {
   }
 }
 
+// 删除会话记录
+async function handleDeleteConversation(conv, event) {
+  if (event) event.stopPropagation()
+  const ok = await confirmDialog(`确定删除该会话？会话 ${conv.id?.slice(0, 8)} 的所有消息将被清除。`, { title: '删除确认' })
+  if (!ok) return
+  try {
+    await deleteConversation(conv.id)
+    // 若删的是当前会话，清空当前对话
+    if (conv.id === currentConversationId.value) {
+      messages.value = []
+      currentConversationId.value = null
+    }
+    await loadConversationHistory()
+  } catch (e) {
+    console.error('删除会话失败:', e)
+    await alertDialog('删除会话失败: ' + e)
+  }
+}
+
 // 打开一个会话
 async function openConversation(convSummary) {
   try {
     const conv = await getConversation(convSummary.id)
-    if (!conv || !conv.nodes || conv.nodes.length === 0) return
+    if (!conv) return
 
     applyConversation(conv)
     currentConversationId.value = convSummary.id
     showHistory.value = false
 
-    if (conv.character_id) {
+    // 一 Campaign 一对话：切到该会话的 Campaign
+    if (convSummary.campaign_id) {
+      try {
+        await setActiveCampaign(convSummary.campaign_id)
+        activeCampaign.value = await getActiveCampaign()
+        await loadInstanceNameMap()
+        // role_label 用 Campaign 名
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = activeCampaign.value?.name || 'AI'
+        })
+      } catch (e) { console.error('切换 Campaign 失败:', e) }
+    } else if (conv.character_id) {
+      // legacy 会话（无 Campaign 绑定）：加载关联角色卡
       try {
         const chars = await import('./tauri-api.js').then(m => m.listCharacters())
         const char = chars.find((c) => c.id === conv.character_id)
@@ -222,6 +290,69 @@ function startNewConversation() {
   messages.value = []
   currentConversationId.value = null
   showHistory.value = false
+  // 加载角色卡开场白（legacy 模式有 activeCharDetail.first_mes 时）
+  if (activeCharDetail.value?.first_mes) {
+    messages.value = [{
+      id: 'm1',
+      role: 'assistant',
+      role_label: activeCharDetail.value.name || (writingMode.value === 'campaign' ? activeCampaign.value?.name : activeChar.value?.name) || 'AI',
+      active_variant: 0,
+      variants: [{
+        id: 'v1',
+        content: activeCharDetail.value.first_mes,
+        status: 'final',
+        provenance: null,
+      }],
+    }]
+  }
+}
+
+// ─── 新建 Campaign（一 Campaign 一对话：建 Campaign 自动建对话+开场白） ───
+const showNewCampaignForm = ref(false)
+const newCampaignCards = ref([])
+const newCampaignCardId = ref(null)
+const newCampaignName = ref('')
+const creatingCampaign = ref(false)
+
+async function openNewCampaignDialog() {
+  showNewCampaignForm.value = true
+  newCampaignName.value = ''
+  try {
+    newCampaignCards.value = await listCards()
+    // 默认选第一张已识别的卡
+    const firstExtracted = newCampaignCards.value.find(c => c.extracted) || newCampaignCards.value[0]
+    newCampaignCardId.value = firstExtracted?.id || null
+  } catch (e) { console.error('加载角色卡列表失败:', e) }
+}
+
+async function handleCreateCampaign() {
+  if (!newCampaignCardId.value || !newCampaignName.value.trim()) return
+  creatingCampaign.value = true
+  try {
+    const result = await createCampaign(newCampaignCardId.value, newCampaignName.value.trim())
+    await setActiveCampaign(result.id)
+    activeCampaign.value = await getActiveCampaign()
+    await loadInstanceNameMap()
+    showNewCampaignForm.value = false
+    // 加载该 Campaign 绑定的对话（create_campaign 已自动建+开场白）
+    if (result.conversation_id) {
+      const conv = await getConversation(result.conversation_id)
+      if (conv) {
+        applyConversation(conv)
+        // role_label 用 Campaign 名
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = activeCampaign.value?.name || 'AI'
+        })
+      }
+    }
+    showHistory.value = false // 切到写作视图
+    await loadConversationHistory()
+  } catch (e) {
+    console.error('创建 Campaign 失败:', e)
+    await alertDialog('创建 Campaign 失败: ' + e)
+  } finally {
+    creatingCampaign.value = false
+  }
 }
 
 // 刷新活跃连接状态（连接配置变更后调用）
@@ -328,7 +459,7 @@ async function startWriting(intent, skipLocalPush = false) {
   }
   // 三态检查：有 Campaign → Campaign 写作；无 Campaign 有角色 → legacy；都没有 → 阻止
   if (writingMode.value === 'none') {
-    alert('请先导入角色卡或打开一个 Campaign，再开始写作。')
+    await alertDialog('请先导入角色卡或打开一个 Campaign，再开始写作。')
     return
   }
   // 防止并发写入
@@ -399,6 +530,7 @@ async function startWriting(intent, skipLocalPush = false) {
 
     pipeline.state = 'done'
     pipeline.stateLabel = '已完成'
+    showPipeline.value = false // 写作完成，收起 StreamingMessage（成文消息已 push）
     loadInstanceNameMap() // 刷新实例名映射（可能新增临时实例）
     scrollToBottom()
   } catch (err) {
@@ -430,7 +562,7 @@ async function handleReroll({ messageId, kind, hint }) {
   const msg = messages.value.find((m) => m.id === messageId)
   if (!msg) return
   if (!currentConversationId.value) {
-    alert('无对话上下文，无法重 roll')
+    await alertDialog('无对话上下文，无法重 roll')
     return
   }
 
@@ -475,6 +607,7 @@ async function handleReroll({ messageId, kind, hint }) {
 
     pipeline.state = 'done'
     pipeline.stateLabel = '重 roll 完成'
+    showPipeline.value = false // 收起 StreamingMessage
     loadInstanceNameMap()
     // result 含最终成文，但 UI 已由 refreshed 驱动，无需单独消费
     void result
@@ -542,7 +675,7 @@ async function handleDeleteVariant({ nodeId }) {
     showPipeline.value = false
   } catch (e) {
     console.error('删除失败:', e)
-    alert('删除失败: ' + e)
+    await alertDialog('删除失败: ' + e)
   }
 }
 
@@ -592,6 +725,7 @@ async function handleRerollUser({ messageId }) {
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'done'
     pipeline.stateLabel = '重 roll 完成'
+    showPipeline.value = false // 收起 StreamingMessage
     loadInstanceNameMap()
     scrollToBottom()
   } catch (err) {
@@ -695,40 +829,20 @@ function handlePipelineEvent(event) {
     case 'editor_started':
       pipeline.stateLabel = '编剧合并'
       pipeline.editor = { status: 'running', detail: '合并 · 润色 · 成文', output: '' }
-      // 在对话里插入编剧流式占位消息
-      messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
-      messages.value.push({
-        id: 'editor-streaming',
-        role: 'assistant',
-        role_label: writingMode.value === 'campaign'
-          ? (activeCampaign.value?.name || 'AI')
-          : (activeChar.value?.name || 'AI'),
-        active_variant: 0,
-        variants: [{
-          id: 'es-v1',
-          content: '',
-          status: 'draft',
-          provenance: null,
-        }],
-      })
+      // Editor 逐字流式由 StreamingMessage 读 pipeline.editor.output 渲染，不再插占位消息
       break
     case 'editor_progress':
-      // 累积编剧流式输出 → 同时更新 PipelinePanel 和对话消息
+      // 累积编剧流式输出到 pipeline（StreamingMessage 实时渲染）
       if (pipeline.editor.status !== 'running') {
         pipeline.editor = { status: 'running', detail: '生成中', output: '' }
       }
       pipeline.editor.output += event.data.delta || ''
-      // 实时更新对话里的占位消息
-      const streamingMsg = messages.value.find((m) => m.id === 'editor-streaming')
-      if (streamingMsg) {
-        streamingMsg.variants[0].content = pipeline.editor.output
-      }
       scrollToBottom()
       break
     case 'draft_ready':
       pipeline.editor = { status: 'done', detail: '成文完成' }
       pipeline.stateLabel = '已产出'
-      // 占位消息保留，startWriting 的 applyConversation 会用后端最终数据替换
+      // 成文由 applyConversation 推入正式消息；StreamingMessage 随 showPipeline=false 消失
       break
     case 'postprocess_started':
       pipeline.postprocess = { status: 'running', detail: '提取知识 · 更新变量 · 检测任务', knowledge: 0, variable: 0, task: 0, reason: '' }
@@ -766,308 +880,215 @@ function handlePipelineEvent(event) {
 </script>
 
 <template>
-  <div class="max-w-2xl mx-auto h-screen bg-bg flex flex-col" style="max-width: 480px;">
-    <!-- 顶栏 -->
-    <AppHeader
-      :power-mode="powerMode"
-      :active-char-name="activeChar?.name"
-      :active-campaign-name="activeCampaign?.name"
-      :writing-mode="writingMode"
-      @toggle-power="powerMode = !powerMode"
-      @open-campaign="showCampaignPanel = true"
-      @open-meta="showMetaPanel = true"
-    >
-      <template #actions>
-        <button v-if="!showHistory"
-          @click="showHistory = true; activeCampaignOverview = true"
-          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
-          title="返回首页"
-        >
-          📜
-        </button>
-        <button
-          @click="showConnConfig = true"
-          class="px-2.5 py-1.5 rounded-full text-xs font-medium transition-all shrink-0 flex items-center gap-1"
-          :class="activeConnection
-            ? 'bg-green-500/10 text-green-700 hover:bg-green-500/20'
-            : 'bg-warn/10 text-warn hover:bg-warn/20'"
-          :title="activeConnection ? `活跃连接：${activeConnection.name}` : '未配置连接'"
-        >
-          {{ activeConnection ? '⚡' : '⚠️' }}
-          <span v-if="activeConnection" class="hidden xs:inline">{{ activeConnection.model }}</span>
-          <span v-else class="hidden xs:inline">配置</span>
-        </button>
-        <button
-          @click="showCharList = true"
-          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
-          title="角色卡列表"
-        >
-          📋
-        </button>
-        <button
-          @click="showPresetPanel = true"
-          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
-          title="预设管理"
-        >
-          📑
-        </button>
-        <button
-          @click="showPluginPanel = true"
-          class="px-2.5 py-1.5 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line transition-all shrink-0"
-          title="插件管理"
-        >
-          🔌
-        </button>
-        <button
-          @click="handleImport"
-          class="px-3 py-1.5 rounded-full text-xs font-medium bg-accent-soft text-accent hover:bg-accent hover:text-white transition-all shrink-0"
-        >
-          📥 导入
-        </button>
-      </template>
-    </AppHeader>
+  <div class="h-screen flex flex-col bg-bg overflow-hidden">
+    <!-- 三栏主体（左右栏改弹出，中间占满） -->
+    <div class="flex-1 flex min-h-0">
 
-    <!-- 主滚动区 -->
-    <main class="flex-1 overflow-y-auto">
-      <!-- Campaign 模式指示（有 active Campaign 时显示） -->
-      <div
-        v-if="writingMode === 'campaign'"
-        @click="showCampaignPanel = true"
-        class="mx-4 mt-3 p-3 bg-green-500/10 rounded-xl border border-green-500/30 cursor-pointer hover:bg-green-500/15 transition-colors"
-      >
-        <div class="flex items-center gap-2">
-          <div class="w-8 h-8 rounded-full bg-green-500 text-white flex items-center justify-center text-sm shrink-0">
-            🎪
-          </div>
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-medium text-green-700 truncate">{{ activeCampaign.name }}</div>
-            <div class="text-[11px] text-green-600/70">
-              Campaign 写作模式
-              <span v-if="activeCampaign.story_clock"> · {{ activeCampaign.story_clock }}</span>
-            </div>
-          </div>
-          <span class="text-xs text-green-600/50">管理 →</span>
-        </div>
-      </div>
-
-      <!-- Legacy 兼容模式（无 Campaign 但有角色卡） -->
-      <div
-        v-else-if="writingMode === 'legacy'"
-        @click="showCharDetail = true"
-        class="mx-4 mt-3 p-3 bg-accent-soft/50 rounded-xl border border-accent-border cursor-pointer hover:bg-accent-soft transition-colors"
-      >
-        <div class="flex items-center gap-2">
-          <div class="w-8 h-8 rounded-full bg-accent text-white flex items-center justify-center text-sm shrink-0">
-            {{ activeChar.name?.charAt(0) || '?' }}
-          </div>
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-medium text-accent truncate">
-              {{ activeChar.name }}
-              <span class="ml-1.5 inline-block px-1.5 py-0.5 text-[10px] rounded bg-warn/15 text-warn align-middle">兼容模式</span>
-            </div>
-            <div class="text-[11px] text-ink-soft">
-              ST {{ activeChar.spec_version }} · {{ activeChar.world_info_count }} 条世界书
-              <span v-if="activeChar.has_renderable_assets"> · 🎨</span>
-            </div>
-          </div>
-          <span class="text-xs text-ink-soft/60">详情 →</span>
-        </div>
-      </div>
-
-      <!-- 未选择角色也没有 Campaign 时的提示 -->
-      <div v-else class="mx-4 mt-3 p-4 bg-bg rounded-xl border border-dashed border-line text-center">
-        <div class="text-ink-soft text-sm">还没有选择角色卡或打开 Campaign</div>
-        <div class="text-xs text-ink-soft/60 mt-1">点 📥 导入角色卡，或 🎪 创建 Campaign</div>
-      </div>
-
-      <!-- 导入错误 -->
-      <div v-if="importError" class="mx-4 mt-3 p-3 bg-err/10 rounded-xl border border-err/30">
-        <div class="text-sm text-err">❌ 导入失败</div>
-        <div class="text-xs text-ink-soft mt-1">{{ importError }}</div>
-      </div>
-
-      <!-- 流水线面板 -->
-      <PipelinePanel v-if="showPipeline" :pipeline="pipeline">
-        <template #extra>
+      <!-- ═══ 中写作区（占满） ═══ -->
+      <main class="flex-1 flex flex-col min-w-0">
+        <!-- 顶栏：左☰ + 标题 + 状态 + 右🛠（玻璃） -->
+        <header class="glass shrink-0 h-14 flex items-center gap-2 px-3 border-b border-line">
           <button
-            v-if="isWriting"
-            @click="cancelWriting"
-            class="mt-2 w-full px-3 py-1.5 text-xs rounded-lg bg-err/10 text-err border border-err/30 hover:bg-err/20"
+            class="w-11 h-11 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
+            @click="showSidebar = true"
+            aria-label="菜单"
           >
-            ⏹ 停止生成
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
           </button>
-        </template>
-      </PipelinePanel>
 
-      <!-- 高玩模式：Agent 配置卡片 -->
-      <AgentConfigCard
-        v-if="powerMode"
-        ref="agentConfigRef"
-        @open-connection-config="showConnConfig = true"
-      />
-
-      <!-- 高玩模式：Agent Profile 运行参数配置（模型/工具白名单/后处理开关） -->
-      <AgentProfileManager v-if="powerMode" />
-
-      <!-- 高玩模式：日志面板 -->
-      <div v-if="powerMode" class="mx-4 mt-3">
-        <LogPanel />
-      </div>
-
-      <!-- Campaign 概览（有 active campaign 时首屏优先显示） -->
-      <div v-if="showHistory && activeCampaign && activeCampaignOverview" class="flex-1 overflow-y-auto p-4">
-        <div class="mb-4">
-          <h2 class="text-lg font-semibold text-ink">📜 {{ activeCampaign.name }}</h2>
-          <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mt-1">故事时间：{{ activeCampaign.story_clock }}</p>
-          <p v-if="activeCampaign.created_at" class="text-xs text-ink-soft">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
-        </div>
-        <div class="flex gap-2 mb-6">
-          <button @click="showCampaignPanel = true"
-            class="px-4 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:opacity-90">
-            进入 Campaign 面板
-          </button>
-          <button @click="startNewConversation"
-            class="px-4 py-2 rounded-lg bg-line text-ink text-sm hover:bg-line/80">
-            ✚ 新对话
-          </button>
-        </div>
-        <div v-if="conversationHistory.length > 0">
-          <button @click="activeCampaignOverview = false"
-            class="text-sm text-ink-soft hover:text-ink mb-3 flex items-center gap-1">
-            📋 查看会话历史 ({{ conversationHistory.length }})
-          </button>
-        </div>
-      </div>
-
-      <!-- 会话历史列表（无 active campaign 或用户主动切换时显示） -->
-      <div v-else-if="showHistory" class="flex-1 overflow-y-auto p-4">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold text-ink">
-            <button v-if="activeCampaign" @click="activeCampaignOverview = true"
-              class="mr-2 text-ink-soft hover:text-ink" title="返回 Campaign 概览">←</button>
-            会话历史
-          </h2>
-          <button @click="startNewConversation"
-            class="px-3 py-1.5 text-sm rounded-lg bg-accent text-white hover:opacity-90">
-            ✚ 新对话
-          </button>
-        </div>
-        <div v-if="conversationHistory.length === 0" class="text-center text-ink-soft py-12">
-          暂无会话。导入角色卡后开始写作。
-        </div>
-        <div v-for="conv in conversationHistory" :key="conv.id"
-          @click="openConversation(conv)"
-          class="p-3 rounded-lg border border-line hover:bg-accent-soft cursor-pointer mb-2 transition-colors">
-          <div class="text-sm text-ink font-medium truncate">
-            会话 {{ conv.id?.slice(0, 8) }}
+          <div class="flex-1 min-w-0 text-center">
+            <div class="font-semibold text-ink truncate text-sm">{{ pageTitle }}</div>
+            <div class="text-[11px] text-ink-soft truncate">
+              <template v-if="isWriting">写作中…</template>
+              <template v-else-if="writingMode === 'campaign'">Campaign · {{ activeCampaign?.story_clock || '第 1 轮' }}</template>
+              <template v-else-if="writingMode === 'legacy'">兼容模式</template>
+              <template v-else>导入角色卡或打开 Campaign</template>
+            </div>
           </div>
-          <div class="text-xs text-ink-soft mt-1">
-            {{ conv.message_count || 0 }} 条消息 · {{ new Date(conv.updated_at).toLocaleString() }}
+
+          <!-- 写作中状态点 -->
+          <div v-if="isWriting" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-accent-soft">
+            <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse"></span>
+            <span class="text-[11px] text-accent font-medium">生成中</span>
+          </div>
+
+          <!-- 调试入口（🛠 总显示） -->
+          <button
+            class="w-11 h-11 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
+            @click="showDebugDrawer = true"
+            aria-label="调试"
+          >🛠</button>
+        </header>
+
+        <!-- 消息流 / 视图（滚动区） -->
+        <div class="flex-1 overflow-y-auto">
+          <!-- 导入错误条 -->
+          <div v-if="importError" class="mx-auto max-w-2xl px-4 pt-3">
+            <div class="p-3 rounded-xl bg-err/10 border border-err/30 text-sm text-err">❌ 导入失败 <span class="text-ink-soft text-xs block mt-1">{{ importError }}</span></div>
+          </div>
+
+          <!-- 写作进行时：停止键在 Composer 发送槽位，过程流式在消息列表末尾 StreamingMessage -->
+
+          <!-- ══ 视图：Campaign 概览 ══ -->
+          <div v-if="currentView === 'overview'" class="mx-auto max-w-2xl px-4 py-6">
+            <h2 class="text-xl font-bold text-ink mb-1">📜 {{ activeCampaign.name }}</h2>
+            <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mb-1">故事时间：{{ activeCampaign.story_clock }}</p>
+            <p v-if="activeCampaign.created_at" class="text-xs text-ink-soft mb-5">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
+            <div class="flex flex-wrap gap-2 mb-6">
+              <button @click="showCampaignPanel = true" class="min-h-[44px] px-4 rounded-lg bg-accent text-white text-sm font-medium shadow-glow-accent hover:opacity-90 transition-opacity">进入 Campaign 面板</button>
+              <button @click="openNewCampaignDialog" class="min-h-[44px] px-4 rounded-lg bg-surface-2 text-ink text-sm hover:bg-line transition-colors">✚ 新建 Campaign</button>
+              <button @click="viewHistory" class="min-h-[44px] px-4 rounded-lg bg-surface-2 text-ink-soft text-sm hover:bg-line transition-colors">📋 会话历史 ({{ conversationHistory.length }})</button>
+            </div>
+          </div>
+
+          <!-- ══ 视图：会话历史 ══ -->
+          <div v-else-if="currentView === 'history'" class="mx-auto max-w-2xl px-4 py-6">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="text-xl font-bold text-ink">会话历史</h2>
+              <button @click="openNewCampaignDialog" class="min-h-[44px] px-4 rounded-lg bg-accent text-white text-sm shadow-glow-accent hover:opacity-90 transition-opacity">✚ 新建 Campaign</button>
+            </div>
+            <div v-if="conversationHistory.length === 0" class="text-center text-ink-soft py-16 text-sm">暂无会话。点「新建 Campaign」开始第一局故事。</div>
+            <div v-else class="space-y-2 sf-stagger">
+              <div
+                v-for="(conv, i) in conversationHistory" :key="conv.id"
+                :style="{ '--i': i }"
+                @click="openConversation(conv)"
+                class="p-3.5 rounded-xl bg-surface shadow-card hover:shadow-rise hover:-translate-y-px cursor-pointer transition-all duration-200 flex items-center gap-2"
+              >
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm text-ink font-medium truncate">{{ conv.card_name || '未知角色卡' }}</div>
+                  <div class="text-xs text-ink-soft mt-1">{{ conv.message_count || 0 }} 条消息 · 创建于 {{ new Date(conv.created_at).toLocaleString() }}</div>
+                </div>
+                <button
+                  @click="handleDeleteConversation(conv, $event)"
+                  class="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-ink-faint hover:text-err hover:bg-err/10 transition-colors"
+                  title="删除会话"
+                  aria-label="删除会话"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- ══ 视图：写作（消息列表，阅读器化） ══ -->
+          <div v-else ref="messagesContainer" class="mx-auto max-w-2xl px-4 sm:px-6">
+            <div v-if="messages.length === 0" class="text-center text-ink-faint py-20">
+              <div class="text-4xl mb-3 opacity-40">✦</div>
+              <div class="text-sm">描述你要写的场景，开始第一轮</div>
+            </div>
+            <ChatMessage
+              v-for="m in messages"
+              :key="m.id"
+              :message="m"
+              :conversation-id="currentConversationId"
+              :busy="isWriting"
+              @reroll="handleReroll"
+              @reroll-user="handleRerollUser"
+              @edit-variant="handleEditVariant"
+              @accept-variant="handleAcceptVariant"
+              @delete-variant="handleDeleteVariant"
+              @add-variant="handleAddVariant"
+              @switch-variant="handleSwitchVariant"
+            />
+            <!-- 写作进行时：过程流式（Director/子Agent折叠 + Editor逐字），全在最后一条消息 -->
+            <StreamingMessage
+              v-if="showPipeline"
+              :pipeline="pipeline"
+              :role-label="streamingRoleLabel"
+            />
+            <div class="h-4"></div>
           </div>
         </div>
-      </div>
 
-      <!-- 对话消息列表 -->
-      <div v-else ref="messagesContainer" class="flex-1 divide-y divide-line/50 overflow-y-auto">
-        <ChatMessage
-          v-for="m in messages"
-          :key="m.id"
-          :message="m"
-          :conversation-id="currentConversationId"
-          :busy="isWriting"
-  @reroll="handleReroll"
-  @reroll-user="handleRerollUser"
-  @edit-variant="handleEditVariant"
-  @accept-variant="handleAcceptVariant"
-  @delete-variant="handleDeleteVariant"
-  @add-variant="handleAddVariant"
-  @switch-variant="handleSwitchVariant"
-/>
-      </div>
-
-      <div class="h-4"></div>
-    </main>
-
-    <!-- 插件侧栏面板 -->
-    <div v-if="sidebarPlugins.length > 0" class="border-t border-line/50">
-      <button
-        @click="showSidebarPlugins = !showSidebarPlugins"
-        class="w-full px-4 py-1.5 text-xs text-ink-soft hover:bg-line/30 flex items-center gap-1"
-      >
-        <span class="transition-transform" :class="showSidebarPlugins ? 'rotate-90' : ''">▸</span>
-        🧩 插件面板 ({{ sidebarPlugins.length }})
-      </button>
-      <div v-if="showSidebarPlugins" class="px-4 pb-2 space-y-2">
-        <PluginHost
-          v-for="p in sidebarPlugins"
-          :key="p.id"
-          :plugin="p"
-          height="150px"
+        <!-- Composer（底部玻璃；写作中发送键变停止键） -->
+        <Composer
+          @start-writing="startWriting"
+          @cancel="cancelWriting"
+          :writing="isWriting"
+          :disabled="writingMode === 'none'"
+          :placeholder="writingMode === 'none' ? '请先导入角色卡或打开 Campaign…' : ''"
         />
-      </div>
+      </main>
+
     </div>
 
-    <!-- 底部输入栏 -->
-    <Composer
-      @start-writing="startWriting"
-      :disabled="isWriting || writingMode === 'none'"
-      :placeholder="writingMode === 'none' ? '请先导入角色卡或打开 Campaign…' : ''"
-    />
+    <!-- ═══ 左导航抽屉（顶栏☰触发，左侧滑出） ═══ -->
+    <BaseOverlay :model-value="showSidebar" size="sm" position="left" :show-header="false" :body-scroll="false" @update:model-value="showSidebar = $event" @close="showSidebar = false">
+      <AppSidebar
+        mobile
+        :power-mode="powerMode"
+        :writing-mode="writingMode"
+        :active-campaign-name="activeCampaign?.name"
+        :active-char-name="activeChar?.name"
+        :active-connection="activeConnection"
+        :view="currentView"
+        :conversation-count="conversationHistory.length"
+        @open-campaign="showCampaignPanel = true"
+        @open-char-list="showCharList = true"
+        @open-preset="showPresetPanel = true"
+        @open-plugin="showPluginPanel = true"
+        @open-conn="showConnConfig = true"
+        @open-meta="showMetaPanel = true"
+        @import="handleImport"
+        @new-campaign="openNewCampaignDialog"
+        @view-history="viewHistory"
+        @view-overview="viewOverview"
+        @toggle-power="onTogglePower"
+        @close="showSidebar = false"
+      />
+    </BaseOverlay>
 
-    <!-- 版本号 -->
-    <div class="text-center text-[10px] text-ink-soft/40 pb-1">v{{ appVersion }}</div>
+    <!-- ═══ 右调试抽屉（顶栏🛠触发，右侧滑出） ═══ -->
+    <BaseOverlay :model-value="showDebugDrawer" size="md" position="right" :show-header="false" :body-scroll="false" @update:model-value="showDebugDrawer = $event" @close="showDebugDrawer = false">
+      <DebugDrawer
+        mobile
+        :sidebar-plugins="sidebarPlugins"
+        @open-connection-config="showConnConfig = true"
+        @close="showDebugDrawer = false"
+      />
+    </BaseOverlay>
 
-    <!-- 角色详情弹层 -->
-    <CharacterDetail
-      v-if="showCharDetail && activeCharDetail"
-      :character="activeCharDetail"
-      @close="showCharDetail = false"
-    />
+    <!-- ═══ 弹层（不变） ═══ -->
+    <CharacterDetail v-if="showCharDetail && activeCharDetail" :character="activeCharDetail" @close="showCharDetail = false" />
+    <CharacterList v-if="showCharList" :active-id="activeChar?.id" @select="handleSelectChar" @close="showCharList = false; showSidebar = true" />
+    <ConnectionConfig v-if="showConnConfig" @close="showConnConfig = false; showSidebar = true" @changed="refreshActiveConnection" />
+    <CampaignPanel v-if="showCampaignPanel" ref="campaignPanelRef" @close="showCampaignPanel = false; showSidebar = true" @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }" />
+    <MetaPanel v-if="showMetaPanel" :active-campaign="activeCampaign" @close="showMetaPanel = false; showSidebar = true" @mvu-applied="handleMvuApplied" />
+    <PresetPanel v-if="showPresetPanel" @close="showPresetPanel = false; showSidebar = true" />
+    <PluginPanel v-if="showPluginPanel" @close="showPluginPanel = false; showSidebar = true; loadSidebarPlugins()" />
 
-    <!-- 角色列表弹层 -->
-    <CharacterList
-      v-if="showCharList"
-      :active-id="activeChar?.id"
-      @select="handleSelectChar"
-      @close="showCharList = false"
-    />
+    <!-- ═══ 新建 Campaign 表单（选卡+起名，建完自动开对话） ═══ -->
+    <BaseOverlay :model-value="showNewCampaignForm" title="新建 Campaign" size="sm" position="center" @update:model-value="showNewCampaignForm = $event" @close="showNewCampaignForm = false">
+      <div class="p-4 space-y-4">
+        <div v-if="newCampaignCards.length === 0" class="text-center text-ink-soft text-sm py-6">
+          还没有已导入的角色卡<br>
+          <span class="text-xs text-ink-faint">先点「导入」添加角色卡并识别角色</span>
+        </div>
+        <template v-else>
+          <div>
+            <label class="text-xs text-ink-soft mb-1.5 block">选择角色卡</label>
+            <select v-model="newCampaignCardId" class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent">
+              <option v-for="c in newCampaignCards" :key="c.id" :value="c.id">{{ c.name }}{{ c.extracted ? '' : '（未识别）' }}</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs text-ink-soft mb-1.5 block">Campaign 名称</label>
+            <input v-model="newCampaignName" placeholder="如：第一周目" @keyup.enter="handleCreateCampaign"
+              class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent" />
+          </div>
+          <div class="flex gap-2 pt-1">
+            <button @click="showNewCampaignForm = false" class="flex-1 min-h-[44px] rounded-lg text-sm bg-surface-2 text-ink-soft hover:bg-line transition-colors">取消</button>
+            <button @click="handleCreateCampaign" :disabled="!newCampaignCardId || !newCampaignName.trim() || creatingCampaign"
+              class="flex-1 min-h-[44px] rounded-lg text-sm bg-accent text-white shadow-glow-accent hover:opacity-90 disabled:opacity-40 transition-opacity">
+              {{ creatingCampaign ? '创建中…' : '创建并开始' }}
+            </button>
+          </div>
+        </template>
+      </div>
+    </BaseOverlay>
 
-    <!-- LLM 连接配置弹层 -->
-    <ConnectionConfig
-      v-if="showConnConfig"
-      @close="showConnConfig = false"
-      @changed="refreshActiveConnection"
-    />
-
-    <!-- Campaign 管理弹层 -->
-    <CampaignPanel
-      v-if="showCampaignPanel"
-      ref="campaignPanelRef"
-      @close="showCampaignPanel = false"
-      @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }"
-    />
-
-    <!-- Meta 配置助手弹层（P3 新增） -->
-    <MetaPanel
-      v-if="showMetaPanel"
-      :active-campaign="activeCampaign"
-      @close="showMetaPanel = false"
-      @mvu-applied="handleMvuApplied"
-    />
-
-    <!-- 预设管理弹层 -->
-    <PresetPanel
-      v-if="showPresetPanel"
-      @close="showPresetPanel = false"
-    />
-
-    <!-- 插件管理弹层 -->
-    <PluginPanel
-      v-if="showPluginPanel"
-      @close="showPluginPanel = false; loadSidebarPlugins()"
-    />
-
-    <!-- W8 MVU JS Runtime 容器（隐藏，iframe 沙箱执行 JS fallback） -->
+    <!-- W8 MVU JS Runtime 容器（隐藏） -->
     <MvuJsRuntime />
   </div>
 </template>

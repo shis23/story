@@ -57,7 +57,7 @@ async fn setup_first_draft(
     let campaign_id = env.create_campaign(&card, "t3-campaign");
     eprintln!("Campaign 已激活: {campaign_id}");
 
-    let conversation_id = env.conv_store.create(None).id;
+    let conversation_id = env.conv_store.create(None, None).id;
     let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx = env.fill_campaign_context(ctx);
 

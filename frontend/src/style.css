@@ -1,50 +1,91 @@
 @import 'tailwindcss';
 
-/* StoryForge 原型主题 —— 简洁清新
-   设计语言：浅底 + 柔和紫调强调色 + 大留白 + 圆角
-   参考审美：Notion / Linear / Vercel 那种"克制的精致"，不是 ST 的"塞满面板"
-*/
+/* @fontsource 本地字体（离线一致） */
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
+@import '@fontsource/noto-serif-sc/400.css';
+@import '@fontsource/noto-serif-sc/600.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
 
-@import 'tailwindcss';
-
-/* 暗色模式：由 <html class="dark"> 触发（手动切换，不跟随系统，便于记住选择） */
+/* 暗色模式：由 <html class="dark"> 触发。默认深色（现代质感基调）。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  /* 强调色：柔紫（带一点墨感，不轻浮） */
-  --color-accent: #7c6aef;
-  --color-accent-soft: #f0edff;
-  --color-accent-border: #d9d2ff;
+  /* 断点：xs 窄屏起步 */
+  --breakpoint-xs: 30rem;
 
-  /* 状态色（流水线用） */
-  --color-ok: #22c55e;
-  --color-running: #3b82f6;
-  --color-wait: #94a3b8;
-  --color-warn: #f59e0b;
-  --color-err: #ef4444;
+  /* ── 深色基调（默认）：中性深灰带一丝冷紫，非纯黑 ── */
+  --color-bg: #0a0a0f;
+  --color-surface: #131319;
+  --color-surface-2: #1b1b23;
+  --color-line: #26262f;
 
-  /* 中性色阶（亮色） */
-  --color-ink: #1a1a2e;       /* 主文字 */
-  --color-ink-soft: #6b7280;  /* 次文字 */
-  --color-line: #ececf1;      /* 分割线 */
-  --color-surface: #ffffff;   /* 卡片底 */
-  --color-bg: #fafafb;        /* 页面底 */
+  /* 文字 */
+  --color-ink: #ececf1;
+  --color-ink-soft: #8a8a98;
+  --color-ink-faint: #55556a;
 
+  /* 强调：紫，配发光 */
+  --color-accent: #8b7cf6;
+  --color-accent-bright: #a594ff;
+  --color-accent-soft: rgba(139, 124, 246, 0.14);
+  --color-accent-border: rgba(139, 124, 246, 0.32);
+
+  /* 状态色（明度提一档，深底上发光感） */
+  --color-ok: #34d399;
+  --color-running: #60a5fa;
+  --color-wait: #71717f;
+  --color-warn: #fbbf24;
+  --color-err: #f87171;
+  /* 别名兜底（早期组件误用 text-error/bg-error） */
+  --color-error: #f87171;
+
+  /* 字体 */
   --font-sans: 'Inter', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  --font-serif: 'Noto Serif SC', 'Songti SC', Georgia, serif; /* 成文展示用衬线 */
+  --font-serif: 'Noto Serif SC', Georgia, 'Songti SC', serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
+
+  /* ── 发光阴影 token（shadow-* utility 命名空间） ── */
+  --shadow-glow-accent: 0 0 0 1px rgba(139, 124, 246, 0.35), 0 0 24px -4px rgba(139, 124, 246, 0.45);
+  --shadow-glow-ok: 0 0 0 1px rgba(52, 211, 153, 0.3), 0 0 20px -6px rgba(52, 211, 153, 0.5);
+  --shadow-glow-err: 0 0 0 1px rgba(248, 113, 113, 0.3), 0 0 20px -6px rgba(248, 113, 113, 0.5);
+  --shadow-float: 0 12px 40px -8px rgba(0, 0, 0, 0.55), 0 4px 12px -4px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-rise: 0 4px 16px -4px rgba(0, 0, 0, 0.5);
+
+  /* 统一缓动 */
+  --ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* 暗色模式覆盖：调暗中性色，强调色提亮以保证对比度 */
-.dark {
-  --color-accent: #9d8df5;
-  --color-accent-soft: #2a2440;
-  --color-accent-border: #3d3460;
+/* ── 浅色模式覆盖（可选切换） ── */
+:root:not(.dark) {
+  --color-bg: #f7f7f9;
+  --color-surface: #ffffff;
+  --color-surface-2: #f1f1f4;
+  --color-line: #e6e6ec;
 
-  --color-ink: #e8e8f0;
-  --color-ink-soft: #9ca3b8;
-  --color-line: #2a2a3a;
-  --color-surface: #1a1a26;
-  --color-bg: #12121c;
+  --color-ink: #18181b;
+  --color-ink-soft: #6b6b78;
+  --color-ink-faint: #a0a0ac;
+
+  --color-accent: #7c6aef;
+  --color-accent-bright: #6b58e0;
+  --color-accent-soft: rgba(124, 106, 239, 0.1);
+  --color-accent-border: rgba(124, 106, 239, 0.28);
+
+  --color-ok: #16a34a;
+  --color-running: #2563eb;
+  --color-wait: #94a3b8;
+  --color-warn: #d97706;
+  --color-err: #dc2626;
+  --color-error: #dc2626;
+
+  --shadow-glow-accent: 0 0 0 1px rgba(124, 106, 239, 0.3), 0 4px 16px -4px rgba(124, 106, 239, 0.35);
+  --shadow-float: 0 12px 40px -8px rgba(0, 0, 0, 0.18), 0 4px 12px -4px rgba(0, 0, 0, 0.1);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.6) inset, 0 1px 2px rgba(0, 0, 0, 0.05);
 }
 
 html, body, #app {
@@ -60,32 +101,70 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
 }
 
-/* 成文展示区用衬线，让小说内容有"书页感" */
+/* ── 文学正文：衬线，书页感 ── */
 .prose-fiction {
   font-family: var(--font-serif);
-  line-height: 1.85;
-  letter-spacing: 0.01em;
+  line-height: 1.9;
+  letter-spacing: 0.012em;
+}
+.prose-fiction em { font-style: italic; opacity: 0.82; }
+.prose-fiction strong { font-weight: 600; }
+
+/* ── 玻璃层工具类 ── */
+.glass {
+  background: color-mix(in srgb, var(--color-surface) 72%, transparent);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+}
+.glass-strong {
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
 }
 
-/* ST 风格：*动作* 斜体（叙事/动作），**粗体** 强调 */
-.prose-fiction em {
-  font-style: italic;
-  opacity: 0.85;
+/* ── 列表 stagger 进入（首次渲染错位淡入） ── */
+@keyframes sf-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.prose-fiction strong {
-  font-weight: 600;
-}
-
-/* 滚动条藏起来（移动 App 感） */
-::-webkit-scrollbar {
-  width: 0;
-  height: 0;
+.sf-stagger > * {
+  animation: sf-rise 0.32s var(--ease-soft) both;
+  animation-delay: calc(var(--i, 0) * 28ms);
 }
 
-/* 选中文本配色 */
+/* ── 焦点态：accent 发光环 ── */
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent-border);
+}
+
+/* ── 滚动条：细而克制（不再藏死，桌面可滚动反馈） ── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-ink-soft) 30%, transparent);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-ink-soft) 50%, transparent);
+  background-clip: padding-box;
+}
+
+/* 选中文本 */
 ::selection {
   background: var(--color-accent-soft);
   color: var(--color-ink);
+}
+
+/* 减少动效偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

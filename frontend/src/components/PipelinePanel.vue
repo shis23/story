@@ -39,10 +39,10 @@ function isSubagentExpanded(index) {
 </script>
 
 <template>
-  <div class="mx-4 my-3 bg-surface rounded-2xl border border-line overflow-hidden">
+  <div class="bg-surface rounded-2xl shadow-card overflow-hidden">
     <!-- 标题栏 -->
-    <div class="px-4 py-2.5 bg-accent-soft/50 flex items-center gap-2">
-      <div class="w-2 h-2 rounded-full" :class="pipeline.state === 'running' ? 'bg-running animate-pulse' : 'bg-ok'"></div>
+    <div class="px-4 py-2.5 bg-accent-soft/40 flex items-center gap-2">
+      <div class="w-2 h-2 rounded-full" :class="pipeline.state === 'running' ? 'bg-running animate-pulse shadow-glow-accent' : 'bg-ok'"></div>
       <span class="text-sm font-medium text-ink">写作流水线</span>
       <span class="text-xs text-ink-soft ml-auto">{{ pipeline.stateLabel }}</span>
     </div>

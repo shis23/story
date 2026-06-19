@@ -16,10 +16,12 @@ The product direction is Campaign-first:
 Before changing code, read these files in order:
 
 1. `docs/DOCS-CODE-AUDIT.md`
-2. `docs/PLAN-CAMPAIGN-MAINLINE.md`
+2. `docs/ROADMAP.md`
 3. `docs/ARCHITECTURE-AUDIT.md`
 4. `docs/AGENT_INTERFACES.md`
 5. `docs/DATA_MODEL.md`
+
+历史已归档计划（Phase 1-4 的详细执行记录）可在 `docs/archive/2026-06-19-completed-phases/` 中找到，不需要再次执行。
 
 Archived background, not an execution entrypoint: `docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`.
 
@@ -69,7 +71,7 @@ Respect these facts unless the current task explicitly changes them:
 - `CharacterInstance::temporary_with_overrides(campaign_id, name, persona_override, behavior_override)` creates a temporary instance with optional overrides (阶段 6).
 - `PipelineOrchestrator::pending_temporary_instances` stores temporaries created during the current turn; `start_writing` / `regenerate` clear stale pending data at the start, and Tauri reads via getter and persists before postprocess (阶段 6).
 - `persist_temporary_instances_to(store, ctx, temporaries)` writes temporary instances to CampaignStore only after the pipeline returns `Ok`, with existing-name dedup, same-batch dedup, and campaign_id mismatch guards (阶段 6).
-- `request_ad_hoc_character` tool is NOT implemented and was evaluated as unnecessary; unmatched character_id flow + `context_package.character_brief` as persona_override fully covers the ad-hoc character use case (see `docs/PLAN-CAMPAIGN-MAINLINE.md` Phase 6 evaluation).
+- `request_ad_hoc_character` tool is NOT implemented and was evaluated as unnecessary; unmatched character_id flow + `context_package.character_brief` as persona_override fully covers the ad-hoc character use case (see `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md` Phase 6 evaluation).
 - `ToolContext` has `current_character_instance_id: Option<Id>` (阶段 4). Used by subagent `get_character` for information isolation.
 - `spawn_subagents` receives `campaign_runtime: Option<Arc<CampaignRuntimeContext>>` (阶段 4). Matches instances, injects resolved persona/behavior/knowledge/variables.
 - `SubagentSnapshot` has `character_instance_id`, `display_name`, `fallback_reason` (阶段 5).

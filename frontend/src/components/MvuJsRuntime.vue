@@ -1,9 +1,11 @@
 <template>
-  <!-- 隐藏容器：JSR/ST JS 执行沙箱（iframe srcdoc） -->
+  <!-- 隐藏容器：JSR/ST JS 执行沙箱（iframe srcdoc）
+       sandbox 只开 allow-scripts（不开 allow-same-origin，避免沙箱逃逸反模式）。
+       shim 通过 postMessage 与父通信，不依赖 same-origin；卡脚本若越权访问 parent 将被跨 origin 阻止并降级。 -->
   <iframe
     ref="iframeRef"
     :srcdoc="iframeSrc"
-    sandbox="allow-scripts allow-same-origin"
+    sandbox="allow-scripts"
     style="position: absolute; width: 0; height: 0; border: none; opacity: 0; pointer-events: none;"
     @load="onIframeLoad"
   />
@@ -239,6 +241,9 @@ function handleUnload() {
   invoke('mvu_unload_ack').catch(() => {})
 }
 
+// 正在执行的 request_id → 超时定时器（兜底：卡脚本卡死时回传 error，避免 Rust 侧永久等待）
+const executeTimers = new Map()
+
 function handleExecute(payload) {
   if (!iframeReady.value) {
     invoke('mvu_execute_result', {
@@ -256,6 +261,20 @@ function handleExecute(payload) {
     fragment_js: payload.fragment_js,
     variables: payload.variables || {},
   })
+  // 超时兜底（默认 3000ms）
+  const timeoutMs = payload.timeout_ms || 3000
+  const timer = setTimeout(() => {
+    if (executeTimers.has(payload.request_id)) {
+      executeTimers.delete(payload.request_id)
+      invoke('mvu_execute_result', {
+        requestId: payload.request_id,
+        variableUpdates: {},
+        sideEffects: [],
+        error: `JS 执行超时（${timeoutMs}ms）`,
+      }).catch(err => console.error('[MVU] timeout result invoke failed:', err))
+    }
+  }, timeoutMs)
+  executeTimers.set(payload.request_id, timer)
 }
 
 // ─── iframe postMessage 监听 ────────────────────────────────────────────
@@ -282,6 +301,12 @@ function onWindowMessage(event) {
   }
 
   if (d.type === 'mvu:execute_result') {
+    // 收到结果，清掉超时定时器
+    const timer = executeTimers.get(d.request_id)
+    if (timer) {
+      clearTimeout(timer)
+      executeTimers.delete(d.request_id)
+    }
     invoke('mvu_execute_result', {
       requestId: d.request_id,
       variableUpdates: d.variable_updates || {},
@@ -308,6 +333,8 @@ onUnmounted(() => {
   window.removeEventListener('message', onWindowMessage)
   unlistenFns.forEach(fn => fn())
   unlistenFns = []
+  executeTimers.forEach(t => clearTimeout(t))
+  executeTimers.clear()
 })
 
 defineExpose({

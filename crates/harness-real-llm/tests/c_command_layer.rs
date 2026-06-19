@@ -268,7 +268,7 @@ fn c5_conversation_variants() {
     let env = HarnessEnv::new(llm);
 
     // create conversation
-    let conv = env.conv_store.create(None);
+    let conv = env.conv_store.create(None, None);
     let conv_id = conv.id.clone();
     assert!(env.conv_store.get(&conv_id).is_some());
 

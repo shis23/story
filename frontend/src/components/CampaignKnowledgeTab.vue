@@ -63,6 +63,17 @@ function knowledgeSourceText(source) {
   return map[source] || source
 }
 
+// ─── 实例过滤选项：从已有知识的 character_id 去重，避免要求用户手输 ID ───
+const instanceOptions = computed(() => {
+  const seen = new Map() // id -> 显示名（这里只有 id，截断显示）
+  for (const k of knowledge.value) {
+    if (k.character_id && !seen.has(k.character_id)) {
+      seen.set(k.character_id, k.character_id.slice(0, 8))
+    }
+  }
+  return [{ value: '', label: '全部实例' }, ...[...seen.entries()].map(([value, label]) => ({ value, label: '实例 ' + label }))]
+})
+
 // ─── 暴露 refresh 给父组件 ───
 defineExpose({ refresh: load })
 </script>
@@ -72,15 +83,16 @@ defineExpose({ refresh: load })
   <div class="flex gap-2 mb-3 flex-wrap">
     <select
       v-model="filterSource"
-      class="px-2 py-1 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
+      class="min-h-[44px] px-3 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
     >
       <option v-for="opt in sourceOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
     </select>
-    <input
+    <select
       v-model="filterInstanceId"
-      placeholder="按实例 ID 过滤…"
-      class="px-2 py-1 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent flex-1 min-w-0"
-    />
+      class="min-h-[44px] px-3 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent flex-1 min-w-0"
+    >
+      <option v-for="opt in instanceOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+    </select>
   </div>
 
   <div v-if="loading" class="text-center text-ink-soft text-sm py-8">加载中…</div>

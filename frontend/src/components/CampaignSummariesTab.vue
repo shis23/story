@@ -27,6 +27,16 @@ async function load() {
 
 onMounted(load)
 
+// ─── 时间格式化（与其他组件统一用 toLocaleString） ───
+function formatTime(ts) {
+  if (!ts) return ''
+  try {
+    return new Date(ts).toLocaleString('zh-CN')
+  } catch {
+    return String(ts)
+  }
+}
+
 // ─── 暴露 refresh 给父组件 ───
 defineExpose({ refresh: load })
 </script>
@@ -43,7 +53,7 @@ defineExpose({ refresh: load })
     >
       <div class="flex items-center gap-2 mb-1">
         <span class="text-xs font-medium text-ink">第 {{ s.turn }} 轮</span>
-        <span v-if="s.created_at" class="text-[10px] text-ink-soft">{{ s.created_at }}</span>
+        <span v-if="s.created_at" class="text-[10px] text-ink-soft">{{ formatTime(s.created_at) }}</span>
       </div>
       <div class="text-xs text-ink-soft leading-relaxed">{{ s.content }}</div>
     </div>

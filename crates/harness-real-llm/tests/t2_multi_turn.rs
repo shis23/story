@@ -85,7 +85,7 @@ async fn t2_multi_turn_appends() {
     let campaign_id = env.create_campaign(&card, "t2-campaign");
     eprintln!("Campaign 已激活: {campaign_id}");
 
-    let conversation_id = env.conv_store.create(None).id;
+    let conversation_id = env.conv_store.create(None, None).id;
 
     // ── 第 1 轮 ──
     let text1 = run_turn(&env, &conversation_id, "开场：角色登场").await;

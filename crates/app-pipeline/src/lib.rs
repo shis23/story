@@ -1940,7 +1940,7 @@ mod tests {
         let ctx = WritingContext::legacy(
             vec![mock_character("Seraphina")],
             None,
-            conv_store.create(None).id,
+            conv_store.create(None, None).id,
         );
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
@@ -2042,7 +2042,7 @@ mod tests {
         });
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
 
-        let conv = conv_store.create(None);
+        let conv = conv_store.create(None, None);
         let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv.id.clone());
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_cancel_tx, cancel_rx) = watch::channel(false); // sender 保活，避免误触发取消
@@ -2236,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn test_postprocess_skipped_without_campaign() {
         let (orch, conv_store) = make_orchestrator();
-        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_tx, cancel) = watch::channel(false);
 
@@ -2259,7 +2259,7 @@ mod tests {
     #[tokio::test]
     async fn test_postprocess_runs_with_campaign() {
         let (orch, conv_store) = make_orchestrator();
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_id = Some(Id::new());
         ctx.turn = 3;
         ctx.story_clock = "第2天".into();
@@ -2329,7 +2329,7 @@ mod tests {
         use storyforge_domain::prompt_module::ProfileSource;
 
         let (orch, conv_store) = make_orchestrator();
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_id = Some(Id::new());
         ctx.agent_profile_config = Some(AgentProfileConfig::new(
             Id::from_str("both-disabled-test"),
@@ -2399,7 +2399,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             Arc::new(ConversationStore::new(dir))
         };
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.turn = 10; // 故意设大，确保 TurnReminder(at_turn=1) 触发
         ctx.pending_tasks = vec![StoryTask::user_planned(
             Id::new(),
@@ -2456,7 +2456,7 @@ mod tests {
                 extensions: serde_json::json!({}),
             }],
         });
-        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None).id);
+        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
 
         let system_extra = build_director_system_extra(&ctx);
         assert!(
@@ -2507,7 +2507,7 @@ mod tests {
 
         // 第 1 轮：intent=A，turn=1
         let mut ctx1 =
-            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None, None).id);
         ctx1.turn = 1;
         let layout1 = MessageLayout::build()
             .system(&build_director_system_extra(&ctx1))
@@ -2515,7 +2515,7 @@ mod tests {
 
         // 第 2 轮：intent=B（完全不同），turn=5
         let mut ctx2 =
-            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None).id);
+            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None, None).id);
         ctx2.turn = 5;
         let layout2 = MessageLayout::build()
             .system(&build_director_system_extra(&ctx2))
@@ -2543,7 +2543,7 @@ mod tests {
         let ctx = WritingContext::legacy(
             vec![mock_character("Seraphina"), mock_character("Lin")],
             None,
-            conv_store.create(None).id,
+            conv_store.create(None, None).id,
         );
 
         let layout = MessageLayout::build()
@@ -2614,7 +2614,7 @@ mod tests {
             turn: 1,
         });
 
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_runtime = Some(runtime);
 
         let layout = MessageLayout::build()
@@ -2774,7 +2774,7 @@ mod tests {
             turn: 1,
         });
 
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_runtime = Some(runtime);
 
         // 这里之前会 panic（按字节截断中文），现在应安全
@@ -2863,7 +2863,7 @@ mod tests {
             turn: 1,
         });
 
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_runtime = Some(runtime);
 
         let layout = MessageLayout::build()
@@ -2898,7 +2898,7 @@ mod tests {
         let ctx = WritingContext::legacy(
             vec![mock_character("Seraphina"), mock_character("Lin")],
             None,
-            conv_store.create(None).id,
+            conv_store.create(None, None).id,
         );
 
         let layout = MessageLayout::build()
@@ -2940,7 +2940,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             Arc::new(ConversationStore::new(dir))
         };
-        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_tx, cancel) = watch::channel(false);
 
@@ -2965,7 +2965,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             Arc::new(ConversationStore::new(dir))
         };
-        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
         let (_tx, cancel) = watch::channel(false);
 
@@ -2983,7 +2983,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             Arc::new(ConversationStore::new(dir))
         };
-        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         let vars = build_current_variables(&ctx);
         assert!(vars.is_empty(), "无 campaign_runtime 时变量快照应为空");
     }
@@ -3031,7 +3031,7 @@ mod tests {
             },
         );
 
-        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None).id);
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_runtime = Some(runtime);
 
         let vars = build_current_variables(&ctx);

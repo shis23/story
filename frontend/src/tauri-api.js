@@ -464,6 +464,12 @@ export async function listConversations() {
   return []
 }
 
+export async function deleteConversation(conversationId) {
+  if (isTauri()) {
+    return await invoke('delete_conversation', { conversationId })
+  }
+}
+
 /**
  * 获取对话详情
  */
@@ -624,6 +630,12 @@ export async function getCard(id) {
     return await invoke('get_card', { id })
   }
   return null
+}
+
+export async function deleteCard(id) {
+  if (isTauri()) {
+    return await invoke('delete_card', { id })
+  }
 }
 
 /**

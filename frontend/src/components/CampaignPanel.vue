@@ -1,5 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { alertDialog } from './base/BaseDialog.js'
+import BaseOverlay from './base/BaseOverlay.vue'
 import {
   listCards, getCard, extractCharacters,
   listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
@@ -69,7 +71,7 @@ async function handleExtract(card) {
     expandedCardId.value = result.id
     cardDetail.value = await getCard(result.id)
   } catch (e) {
-    alert('角色识别失败: ' + e)
+    await alertDialog('角色识别失败: ' + e)
   } finally {
     extractingCardId.value = null
   }
@@ -106,7 +108,7 @@ async function handleCreateCampaign() {
     await refreshCampaigns()
     await handleSetActive(result.id)
   } catch (e) {
-    alert('创建失败: ' + e)
+    await alertDialog('创建失败: ' + e)
   } finally {
     creatingCampaign.value = false
   }
@@ -217,245 +219,236 @@ defineExpose({ refreshActiveDetailTab })
 </script>
 
 <template>
-  <!-- 弹层外壳 -->
-  <div class="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center" @click.self="emit('close')">
-    <div class="bg-bg w-full max-w-lg max-h-[90vh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-line flex flex-col">
-
-      <!-- 顶栏 -->
-      <div class="sticky top-0 z-10 bg-bg border-b border-line px-4 py-3 flex items-center justify-between shrink-0">
-        <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>
-        <span class="font-medium text-ink text-sm">Campaign 管理</span>
-        <div class="w-12"></div>
-      </div>
-
-      <!-- Tab 切换 -->
-      <div class="flex border-b border-line shrink-0">
+  <BaseOverlay :model-value="true" title="Campaign 管理" size="md" position="left" @close="emit('close')">
+    <!-- Tab 切换（sticky 在内容区顶部） -->
+    <div class="sticky top-0 z-10 bg-bg border-b border-line shrink-0">
+      <div class="flex">
         <button
           v-for="tab in [{key:'cards',label:'角色卡'},{key:'campaigns',label:'游玩档'},{key:'detail',label:'档详情'}]"
           :key="tab.key"
           @click="activeTab = tab.key"
-          class="flex-1 py-2.5 text-xs font-medium transition-colors"
+          class="flex-1 min-h-[44px] text-xs font-medium transition-colors"
           :class="activeTab === tab.key ? 'text-accent border-b-2 border-accent' : 'text-ink-soft'"
         >{{ tab.label }}</button>
       </div>
-
-      <!-- 内容区 -->
-      <div class="flex-1 overflow-y-auto p-4 space-y-3">
-
-        <!-- ═══ Tab 1: 角色卡 ═══ -->
-        <template v-if="activeTab === 'cards'">
-          <div v-if="loadingCards" class="text-center text-ink-soft text-sm py-8">加载中…</div>
-
-          <div v-else-if="cards.length === 0" class="text-center text-ink-soft text-sm py-8">
-            还没有角色卡，请先导入
-          </div>
-
-          <div v-for="card in cards" :key="card.id" class="bg-surface rounded-xl border border-line overflow-hidden">
-            <!-- 卡头部 -->
-            <div
-              class="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-bg transition-colors"
-              @click="toggleCard(card)"
-            >
-              <div class="flex-1 min-w-0">
-                <div class="text-sm font-medium text-ink truncate">{{ card.name }}</div>
-                <div class="text-xs text-ink-soft">
-                  {{ card.definition_count }} 个角色定义
-                  <span v-if="card.extracted" class="text-ok ml-1">✓ 已识别</span>
-                  <span v-else class="text-warn ml-1">未识别</span>
-                </div>
-              </div>
-              <button
-                v-if="!card.extracted"
-                @click.stop="handleExtract(card)"
-                :disabled="extractingCardId === card.source_character_id"
-                class="px-2.5 py-1 rounded-full text-xs font-medium bg-accent text-white disabled:opacity-50"
-              >
-                {{ extractingCardId === card.source_character_id ? '识别中…' : '识别角色' }}
-              </button>
-              <span class="text-ink-soft text-xs">{{ expandedCardId === card.id ? '▲' : '▼' }}</span>
-            </div>
-
-            <!-- 卡展开详情 -->
-            <div v-if="expandedCardId === card.id && cardDetail" class="border-t border-line px-3 py-2 space-y-2">
-              <div v-if="cardDetail.character_definitions.length === 0" class="text-xs text-ink-soft py-2">
-                暂无角色定义，请点击「识别角色」
-              </div>
-              <div
-                v-for="def in cardDetail.character_definitions"
-                :key="def.id"
-                class="bg-bg rounded-lg px-3 py-2 text-xs"
-              >
-                <div class="flex items-center gap-2 mb-1">
-                  <span class="font-medium text-ink">{{ def.name }}</span>
-                  <span class="px-1.5 py-0.5 rounded text-[10px]"
-                    :class="{
-                      'bg-accent/10 text-accent': def.role_type === 'Protagonist',
-                      'bg-ok/10 text-ok': def.role_type === 'Supporting',
-                      'bg-ink-soft/10 text-ink-soft': def.role_type === 'Extra',
-                    }"
-                  >{{ def.role_type }}</span>
-                  <span v-if="def.group" class="text-ink-soft">{{ def.group }}</span>
-                </div>
-                <div class="text-ink-soft line-clamp-2">{{ def.persona_prompt }}</div>
-              </div>
-
-              <!-- 开档按钮 -->
-              <div v-if="cardDetail.character_definitions.length > 0" class="pt-1">
-                <button
-                  @click="selectedCardId = card.id; activeTab = 'campaigns'; refreshCampaigns()"
-                  class="w-full py-2 rounded-lg text-xs font-medium bg-accent text-white"
-                >管理游玩档 →</button>
-              </div>
-            </div>
-          </div>
-        </template>
-
-        <!-- ═══ Tab 2: 游玩档 ═══ -->
-        <template v-if="activeTab === 'campaigns'">
-          <!-- 未选卡时提示选卡 -->
-          <div v-if="!selectedCardId" class="text-center text-ink-soft text-sm py-8">
-            请先在「角色卡」tab 选择一张卡
-          </div>
-
-          <template v-else>
-            <div v-if="loadingCampaigns" class="text-center text-ink-soft text-sm py-8">加载中…</div>
-
-            <div v-else-if="campaigns.length === 0 && !showNewCampaign" class="text-center py-8">
-              <div class="text-ink-soft text-sm mb-3">还没有游玩档</div>
-              <button @click="showNewCampaign = true" class="px-4 py-2 rounded-lg text-xs font-medium bg-accent text-white">
-                新建游玩档
-              </button>
-            </div>
-
-            <!-- 新建表单 -->
-            <div v-if="showNewCampaign" class="bg-surface rounded-xl border border-line p-3 space-y-2">
-              <div class="text-xs font-medium text-ink">新建游玩档</div>
-              <input
-                v-model="newCampaignName"
-                placeholder="输入档名（如：第一周目）"
-                class="w-full px-3 py-2 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
-                @keyup.enter="handleCreateCampaign"
-              />
-              <div class="flex gap-2">
-                <button @click="showNewCampaign = false" class="flex-1 py-1.5 rounded-lg text-xs bg-bg text-ink-soft">取消</button>
-                <button
-                  @click="handleCreateCampaign"
-                  :disabled="creatingCampaign || !newCampaignName.trim()"
-                  class="flex-1 py-1.5 rounded-lg text-xs font-medium bg-accent text-white disabled:opacity-50"
-                >{{ creatingCampaign ? '创建中…' : '创建' }}</button>
-              </div>
-            </div>
-
-            <!-- Campaign 列表 -->
-            <div
-              v-for="camp in campaigns"
-              :key="camp.id"
-              class="bg-surface rounded-xl border overflow-hidden cursor-pointer transition-colors"
-              :class="activeCampaign?.id === camp.id ? 'border-accent' : 'border-line hover:border-accent-border'"
-              @click="openCampaignDetail(camp.id)"
-            >
-              <div class="flex items-center gap-3 px-3 py-2.5">
-                <div class="flex-1 min-w-0">
-                  <div class="flex items-center gap-2">
-                    <span class="text-sm font-medium text-ink">{{ camp.name }}</span>
-                    <span v-if="activeCampaign?.id === camp.id" class="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent">活跃</span>
-                  </div>
-                  <div class="text-xs text-ink-soft">{{ camp.instance_count }} 个角色实例</div>
-                </div>
-                <button
-                  v-if="activeCampaign?.id !== camp.id"
-                  @click.stop="handleSetActive(camp.id)"
-                  class="px-2 py-1 rounded-full text-[10px] bg-bg text-ink-soft hover:bg-line"
-                >设为活跃</button>
-                <span class="text-ink-soft text-xs">→</span>
-              </div>
-            </div>
-
-            <!-- 新建按钮（有档时显示） -->
-            <button
-              v-if="campaigns.length > 0 && !showNewCampaign"
-              @click="showNewCampaign = true"
-              class="w-full py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line"
-            >+ 新建游玩档</button>
-          </template>
-        </template>
-
-        <!-- ═══ Tab 3: 档详情 ═══ -->
-        <template v-if="activeTab === 'detail'">
-          <!-- 未选档提示 -->
-          <div v-if="!selectedCampaignId" class="text-center text-ink-soft text-sm py-8">
-            请先在「游玩档」tab 点击一个档
-          </div>
-
-          <template v-else>
-            <!-- 导出按钮组 -->
-            <div class="bg-surface rounded-xl border border-line p-3 mb-3 space-y-2">
-              <div class="text-xs font-medium text-ink mb-1">导出</div>
-              <div class="flex gap-2">
-                <button
-                  @click="handleExportStCards()"
-                  :disabled="exporting"
-                  class="flex-1 py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50"
-                >
-                  {{ exporting ? '导出中…' : 'ST 卡 PNG' }}
-                </button>
-                <button
-                  @click="handleExportBundle()"
-                  :disabled="exporting"
-                  class="flex-1 py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50"
-                >
-                  {{ exporting ? '导出中…' : 'JSON Bundle' }}
-                </button>
-              </div>
-              <div v-if="exportStatus" class="text-xs text-ink-soft">{{ exportStatus }}</div>
-            </div>
-
-            <!-- 刷新按钮 -->
-            <div class="flex justify-end mb-1">
-              <button @click="refreshActiveDetailTab()" class="px-2.5 py-1 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line">刷新</button>
-            </div>
-
-            <!-- 子 Tab 切换条 -->
-            <div class="flex gap-1 bg-surface rounded-xl p-1 mb-3">
-              <button
-                v-for="st in [{key:'instances',label:'角色实例'},{key:'knowledge',label:'知识'},{key:'tasks',label:'任务'},{key:'summaries',label:'摘要'}]"
-                :key="st.key"
-                @click="detailSubTab = st.key"
-                class="flex-1 py-1.5 text-xs font-medium rounded-lg transition-colors"
-                :class="detailSubTab === st.key ? 'bg-bg text-accent shadow-sm' : 'text-ink-soft'"
-              >{{ st.label }}</button>
-            </div>
-
-            <!-- ▸ 子 Tab: 角色实例 -->
-            <CampaignInstancesTab
-              v-if="detailSubTab === 'instances'"
-              ref="instancesTabRef"
-              :campaign-id="selectedCampaignId"
-            />
-
-            <!-- ▸ 子 Tab: 知识 -->
-            <CampaignKnowledgeTab
-              v-if="detailSubTab === 'knowledge'"
-              ref="knowledgeTabRef"
-              :campaign-id="selectedCampaignId"
-            />
-
-            <!-- ▸ 子 Tab: 任务 -->
-            <CampaignTasksTab
-              v-if="detailSubTab === 'tasks'"
-              ref="tasksTabRef"
-              :campaign-id="selectedCampaignId"
-            />
-
-            <!-- ▸ 子 Tab: 摘要 -->
-            <CampaignSummariesTab
-              v-if="detailSubTab === 'summaries'"
-              ref="summariesTabRef"
-              :campaign-id="selectedCampaignId"
-            />
-          </template>
-        </template>
-      </div>
     </div>
-  </div>
+
+    <!-- 内容区 -->
+    <div class="p-4 space-y-3">
+
+      <!-- ═══ Tab 1: 角色卡 ═══ -->
+      <template v-if="activeTab === 'cards'">
+        <div v-if="loadingCards" class="text-center text-ink-soft text-sm py-8">加载中…</div>
+
+        <div v-else-if="cards.length === 0" class="text-center text-ink-soft text-sm py-8">
+          还没有角色卡，请先导入
+        </div>
+
+        <div v-for="card in cards" :key="card.id" class="bg-surface rounded-xl border border-line overflow-hidden">
+          <!-- 卡头部 -->
+          <div
+            class="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-bg transition-colors"
+            @click="toggleCard(card)"
+          >
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium text-ink truncate">{{ card.name }}</div>
+              <div class="text-xs text-ink-soft">
+                {{ card.definition_count }} 个角色定义
+                <span v-if="card.extracted" class="text-ok ml-1">✓ 已识别</span>
+                <span v-else class="text-warn ml-1">未识别</span>
+              </div>
+            </div>
+            <button
+              v-if="!card.extracted"
+              @click.stop="handleExtract(card)"
+              :disabled="extractingCardId === card.source_character_id"
+              class="min-h-[36px] px-3 rounded-full text-xs font-medium bg-accent text-white disabled:opacity-50 transition-colors"
+            >
+              {{ extractingCardId === card.source_character_id ? '识别中…' : '识别角色' }}
+            </button>
+            <span class="text-ink-soft text-xs">{{ expandedCardId === card.id ? '▲' : '▼' }}</span>
+          </div>
+
+          <!-- 卡展开详情 -->
+          <div v-if="expandedCardId === card.id && cardDetail" class="border-t border-line px-3 py-2 space-y-2">
+            <div v-if="cardDetail.character_definitions.length === 0" class="text-xs text-ink-soft py-2">
+              暂无角色定义，请点击「识别角色」
+            </div>
+            <div
+              v-for="def in cardDetail.character_definitions"
+              :key="def.id"
+              class="bg-bg rounded-lg px-3 py-2 text-xs"
+            >
+              <div class="flex items-center gap-2 mb-1">
+                <span class="font-medium text-ink">{{ def.name }}</span>
+                <span class="px-1.5 py-0.5 rounded text-[10px]"
+                  :class="{
+                    'bg-accent/10 text-accent': def.role_type === 'Protagonist',
+                    'bg-ok/10 text-ok': def.role_type === 'Supporting',
+                    'bg-ink-soft/10 text-ink-soft': def.role_type === 'Extra',
+                  }"
+                >{{ def.role_type }}</span>
+                <span v-if="def.group" class="text-ink-soft">{{ def.group }}</span>
+              </div>
+              <div class="text-ink-soft line-clamp-2">{{ def.persona_prompt }}</div>
+            </div>
+
+            <!-- 开档按钮 -->
+            <div v-if="cardDetail.character_definitions.length > 0" class="pt-1">
+              <button
+                @click="selectedCardId = card.id; activeTab = 'campaigns'; refreshCampaigns()"
+                class="w-full min-h-[44px] rounded-lg text-sm font-medium bg-accent text-white hover:opacity-90 transition-colors"
+              >管理游玩档 →</button>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- ═══ Tab 2: 游玩档 ═══ -->
+      <template v-if="activeTab === 'campaigns'">
+        <!-- 未选卡时提示选卡 -->
+        <div v-if="!selectedCardId" class="text-center text-ink-soft text-sm py-8">
+          请先在「角色卡」tab 选择一张卡
+        </div>
+
+        <template v-else>
+          <div v-if="loadingCampaigns" class="text-center text-ink-soft text-sm py-8">加载中…</div>
+
+          <div v-else-if="campaigns.length === 0 && !showNewCampaign" class="text-center py-8">
+            <div class="text-ink-soft text-sm mb-3">还没有游玩档</div>
+            <button @click="showNewCampaign = true" class="min-h-[44px] px-4 rounded-lg text-xs font-medium bg-accent text-white">
+              新建游玩档
+            </button>
+          </div>
+
+          <!-- 新建表单 -->
+          <div v-if="showNewCampaign" class="bg-surface rounded-xl border border-line p-3 space-y-2">
+            <div class="text-xs font-medium text-ink">新建游玩档</div>
+            <input
+              v-model="newCampaignName"
+              placeholder="输入档名（如：第一周目）"
+              class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
+              @keyup.enter="handleCreateCampaign"
+            />
+            <div class="flex gap-2">
+              <button @click="showNewCampaign = false" class="flex-1 min-h-[44px] rounded-lg text-sm bg-bg text-ink-soft">取消</button>
+              <button
+                @click="handleCreateCampaign"
+                :disabled="creatingCampaign || !newCampaignName.trim()"
+                class="flex-1 min-h-[44px] rounded-lg text-sm font-medium bg-accent text-white disabled:opacity-50"
+              >{{ creatingCampaign ? '创建中…' : '创建' }}</button>
+            </div>
+          </div>
+
+          <!-- Campaign 列表 -->
+          <div
+            v-for="camp in campaigns"
+            :key="camp.id"
+            class="bg-surface rounded-xl border overflow-hidden cursor-pointer transition-colors"
+            :class="activeCampaign?.id === camp.id ? 'border-accent' : 'border-line hover:border-accent-border'"
+            @click="openCampaignDetail(camp.id)"
+          >
+            <div class="flex items-center gap-3 px-3 py-2.5">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="text-sm font-medium text-ink">{{ camp.name }}</span>
+                  <span v-if="activeCampaign?.id === camp.id" class="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent">活跃</span>
+                </div>
+                <div class="text-xs text-ink-soft">{{ camp.instance_count }} 个角色实例</div>
+              </div>
+              <button
+                v-if="activeCampaign?.id !== camp.id"
+                @click.stop="handleSetActive(camp.id)"
+                class="min-h-[36px] px-3 rounded-full text-xs bg-bg text-ink-soft hover:bg-line transition-colors"
+              >设为活跃</button>
+              <span class="text-ink-soft text-xs">→</span>
+            </div>
+          </div>
+
+          <!-- 新建按钮（有档时显示） -->
+          <button
+            v-if="campaigns.length > 0 && !showNewCampaign"
+            @click="showNewCampaign = true"
+            class="w-full min-h-[44px] rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line transition-colors"
+          >+ 新建游玩档</button>
+        </template>
+      </template>
+
+      <!-- ═══ Tab 3: 档详情 ═══ -->
+      <template v-if="activeTab === 'detail'">
+        <!-- 未选档提示 -->
+        <div v-if="!selectedCampaignId" class="text-center text-ink-soft text-sm py-8">
+          请先在「游玩档」tab 点击一个档
+        </div>
+
+        <template v-else>
+          <!-- 导出按钮组 -->
+          <div class="bg-surface rounded-xl border border-line p-3 mb-3 space-y-2">
+            <div class="text-xs font-medium text-ink mb-1">导出</div>
+            <div class="flex gap-2">
+              <button
+                @click="handleExportStCards()"
+                :disabled="exporting"
+                class="flex-1 min-h-[44px] rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50 transition-colors"
+              >
+                {{ exporting ? '导出中…' : 'ST 卡 PNG' }}
+              </button>
+              <button
+                @click="handleExportBundle()"
+                :disabled="exporting"
+                class="flex-1 min-h-[44px] rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50 transition-colors"
+              >
+                {{ exporting ? '导出中…' : 'JSON Bundle' }}
+              </button>
+            </div>
+            <div v-if="exportStatus" class="text-xs text-ink-soft">{{ exportStatus }}</div>
+          </div>
+
+          <!-- 刷新按钮 -->
+          <div class="flex justify-end mb-1">
+            <button @click="refreshActiveDetailTab()" class="min-h-[36px] px-3 rounded-full text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line transition-colors">刷新</button>
+          </div>
+
+          <!-- 子 Tab 切换条 -->
+          <div class="flex gap-1 bg-surface rounded-xl p-1 mb-3">
+            <button
+              v-for="st in [{key:'instances',label:'角色实例'},{key:'knowledge',label:'知识'},{key:'tasks',label:'任务'},{key:'summaries',label:'摘要'}]"
+              :key="st.key"
+              @click="detailSubTab = st.key"
+              class="flex-1 min-h-[44px] text-xs font-medium rounded-lg transition-colors"
+              :class="detailSubTab === st.key ? 'bg-bg text-accent shadow-sm' : 'text-ink-soft'"
+            >{{ st.label }}</button>
+          </div>
+
+          <!-- ▸ 子 Tab: 角色实例 -->
+          <CampaignInstancesTab
+            v-if="detailSubTab === 'instances'"
+            ref="instancesTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+
+          <!-- ▸ 子 Tab: 知识 -->
+          <CampaignKnowledgeTab
+            v-if="detailSubTab === 'knowledge'"
+            ref="knowledgeTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+
+          <!-- ▸ 子 Tab: 任务 -->
+          <CampaignTasksTab
+            v-if="detailSubTab === 'tasks'"
+            ref="tasksTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+
+          <!-- ▸ 子 Tab: 摘要 -->
+          <CampaignSummariesTab
+            v-if="detailSubTab === 'summaries'"
+            ref="summariesTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+        </template>
+      </template>
+    </div>
+  </BaseOverlay>
 </template>

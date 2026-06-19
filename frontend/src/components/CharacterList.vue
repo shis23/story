@@ -1,13 +1,15 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { listCharacters, deleteCharacter, getCharacter } from '../tauri-api.js'
+import { listCards, getCard, deleteCard } from '../tauri-api.js'
+import { confirmDialog } from './base/BaseDialog.js'
+import BaseOverlay from './base/BaseOverlay.vue'
 
 const props = defineProps({
   activeId: { type: String, default: null },
 })
 const emit = defineEmits(['select', 'close'])
 
-const characters = ref([])
+const cards = ref([])
 const loading = ref(false)
 
 onMounted(async () => {
@@ -17,32 +19,50 @@ onMounted(async () => {
 async function refresh() {
   loading.value = true
   try {
-    characters.value = await listCharacters()
+    // 统一读 cards.json（CharacterCard，与 Campaign 管理同源）
+    cards.value = await listCards()
   } catch (e) {
-    console.error('加载角色列表失败:', e)
+    console.error('加载角色卡列表失败:', e)
   }
   loading.value = false
 }
 
-async function handleSelect(char) {
+async function handleSelect(card) {
   try {
-    const detail = await getCharacter(char.id)
-    emit('select', { ...char, ...detail })
+    const detail = await getCard(card.id)
+    // 适配为 CharacterDetail 可用的 character 对象
+    // CharacterCard 没有扁平字段（first_mes 等），从 character_definitions 拼基础信息
+    const mainDef = detail.character_definitions?.[0] || {}
+    emit('select', {
+      id: card.source_character_id, // 扁平 Character id（CharacterDetail 用）
+      name: card.name,
+      description: mainDef.persona_prompt || '',
+      personality: '',
+      scenario: '',
+      first_mes: '',
+      system_prompt: '',
+      spec_version: '',
+      tags: [],
+      world_info_count: 0,
+      world_info_entries: [],
+      has_renderable_assets: false,
+      creator: '',
+      _card: detail, // 保留完整 CharacterCard 详情供扩展
+    })
   } catch (e) {
-    console.error('获取角色详情失败:', e)
+    console.error('获取角色卡详情失败:', e)
   }
 }
 
-async function handleDelete(char, event) {
+async function handleDelete(card, event) {
   event.stopPropagation()
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask(`确定删除「${char.name}」？`, { title: '删除确认', kind: 'warning' })
+  const ok = await confirmDialog(`确定删除角色卡「${card.name}」？`, { title: '删除确认' })
   if (!ok) return
   try {
-    await deleteCharacter(char.id)
+    // 按 CharacterCard.id 删（级联删 campaign/instances/mvu）
+    await deleteCard(card.id)
     await refresh()
-    // 如果删除的是当前选中的，清空
-    if (char.id === props.activeId) {
+    if (card.id === props.activeId) {
       emit('select', null)
     }
   } catch (e) {
@@ -52,59 +72,47 @@ async function handleDelete(char, event) {
 </script>
 
 <template>
-  <div class="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center" @click.self="emit('close')">
-    <div class="bg-surface w-full max-w-md max-h-[85vh] sm:max-h-[80vh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-line flex flex-col">
-      <!-- 顶栏 -->
-      <div class="px-4 py-3 border-b border-line flex items-center gap-2 shrink-0">
-        <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>
-        <span class="flex-1 text-center font-medium text-ink">角色卡列表</span>
-        <span class="text-xs text-ink-soft">{{ characters.length }} 张</span>
-      </div>
+  <BaseOverlay :model-value="true" title="角色卡列表" size="sm" position="left" @close="emit('close')">
+    <template #header-extra>
+      <span class="text-xs text-ink-soft">{{ cards.length }} 张</span>
+    </template>
 
-      <!-- 列表 -->
-      <div class="flex-1 overflow-y-auto">
-        <div v-if="loading" class="p-8 text-center text-ink-soft text-sm">加载中...</div>
+    <div v-if="loading" class="p-8 text-center text-ink-soft text-sm">加载中…</div>
 
-        <div v-else-if="characters.length === 0" class="p-8 text-center text-ink-soft text-sm">
-          还没有导入角色卡<br>
-          <span class="text-xs mt-1 block">点顶栏 📥 导入开始</span>
+    <div v-else-if="cards.length === 0" class="p-8 text-center text-ink-soft text-sm">
+      还没有导入角色卡<br>
+      <span class="text-xs mt-1 block">点左导航「导入」开始</span>
+    </div>
+
+    <div v-else class="divide-y divide-line">
+      <div
+        v-for="card in cards"
+        :key="card.id"
+        @click="handleSelect(card)"
+        class="px-4 py-3 cursor-pointer hover:bg-accent-soft/50 transition-colors flex items-start gap-3"
+      >
+        <div class="w-10 h-10 rounded-full bg-surface-2 flex items-center justify-center text-lg shrink-0">
+          {{ card.name?.charAt(0) || '?' }}
         </div>
 
-        <div v-else class="divide-y divide-line">
-          <div
-            v-for="char in characters"
-            :key="char.id"
-            @click="handleSelect(char)"
-            class="px-4 py-3 cursor-pointer hover:bg-accent-soft/50 transition-colors flex items-start gap-3"
-            :class="char.id === activeId ? 'bg-accent-soft/50 border-l-2 border-accent' : ''"
-          >
-            <!-- 头像占位 -->
-            <div class="w-10 h-10 rounded-full bg-bg flex items-center justify-center text-lg shrink-0">
-              {{ char.name?.charAt(0) || '?' }}
-            </div>
-
-            <!-- 信息 -->
-            <div class="flex-1 min-w-0">
-              <div class="font-medium text-ink text-sm truncate">{{ char.name }}</div>
-              <div class="text-xs text-ink-soft truncate mt-0.5">{{ char.description }}</div>
-              <div class="flex items-center gap-2 mt-1">
-                <span class="text-[10px] text-ink-soft/70">ST {{ char.spec_version }}</span>
-                <span v-if="char.world_info_count > 0" class="text-[10px] text-ink-soft/70">📖 {{ char.world_info_count }}</span>
-                <span class="text-[10px] text-ink-soft/50 ml-auto">{{ char.imported_at }}</span>
-              </div>
-            </div>
-
-            <!-- 删除按钮 -->
-            <button
-              @click="handleDelete(char, $event)"
-              class="text-ink-soft/40 hover:text-err text-xs px-1 py-0.5 rounded shrink-0"
-              title="删除"
-            >
-              ✕
-            </button>
+        <div class="flex-1 min-w-0">
+          <div class="font-medium text-ink text-sm truncate">{{ card.name }}</div>
+          <div class="text-xs text-ink-soft mt-0.5">
+            {{ card.character_count }} 个角色定义
+            <span v-if="card.extracted" class="text-ok ml-1">✓ 已识别</span>
+            <span v-else class="text-warn ml-1">未识别</span>
           </div>
+          <div class="text-[10px] text-ink-faint mt-0.5">{{ card.imported_at }}</div>
         </div>
+
+        <button
+          @click="handleDelete(card, $event)"
+          class="w-9 h-9 flex items-center justify-center text-ink-faint hover:text-err hover:bg-err/10 rounded-lg shrink-0 transition-colors"
+          title="删除"
+        >
+          ✕
+        </button>
       </div>
     </div>
-  </div>
+  </BaseOverlay>
 </template>

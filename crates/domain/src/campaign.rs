@@ -22,6 +22,9 @@ pub struct Campaign {
     pub created_at: String,
     #[serde(default)]
     pub variables: Vec<VariableValue>,
+    /// 该 Campaign 绑定的唯一对话 ID（一 Campaign 一对话模型）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<Id>,
     /// 故事时间（冗余缓存：真相源是 variables 里 key="story_clock" 的项）。
     ///
     /// 保留此顶层字段是为了向后兼容旧序列化数据 + 前端直接读取。set_variable("story_clock")
@@ -48,6 +51,7 @@ impl Campaign {
                 &crate::variables::default_campaign_variables(),
                 0,
             ),
+            conversation_id: None,
             story_clock: default_story_clock(),
         }
     }
@@ -69,6 +73,7 @@ impl Campaign {
                 &crate::variables::default_campaign_variables(),
                 0,
             ),
+            conversation_id: None,
             story_clock: default_story_clock(),
         }
     }

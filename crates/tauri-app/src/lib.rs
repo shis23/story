@@ -1458,6 +1458,27 @@ async fn start_writing(
     // 构造写作上下文（从 tool_ctx 快照读取，导入的角色卡/世界书自动可见）
     let tool_snapshot = app.snapshot_tool_ctx();
 
+    // 一 Campaign 一对话：Campaign 模式下用 Campaign 绑定的 conversation_id，
+    // 覆盖前端传入的（前端可能在切档时传错或传 null）
+    let campaign_conv_id: Option<Id> = {
+        let active = app
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(cid) = active.as_ref() {
+            get_campaign_store()
+                .get_campaign(cid)
+                .and_then(|c| c.conversation_id.clone())
+        } else {
+            None
+        }
+    };
+    let conversation_id: Option<String> = if let Some(cid) = campaign_conv_id {
+        Some(cid.as_str().to_string())
+    } else {
+        conversation_id
+    };
+
     // 复用已有对话 或 新建对话
     let conversation_id = if let Some(id_str) = conversation_id {
         let id = Id::from_str(&id_str);
@@ -1467,8 +1488,8 @@ async fn start_writing(
         }
         id
     } else {
-        // 新建对话 + 存开场白 + 存 user 意图
-        let conv = app.conv_store.create(character_id);
+        // 新建对话 + 存开场白 + 存 user 意图（legacy 路径，无 Campaign 绑定）
+        let conv = app.conv_store.create(character_id, None);
         let id = conv.id.clone();
         // 开场白（从角色卡读取，Final 状态 Assistant 消息）
         if let Some(ch) = tool_snapshot.characters.first() {
@@ -2616,6 +2637,9 @@ fn parse_tool_mode(s: &str) -> Result<ToolMode, String> {
 pub struct ConversationSummaryDto {
     pub id: String,
     pub character_id: Option<String>,
+    pub campaign_id: Option<String>,
+    /// 关联角色卡名（前端列表显示用）
+    pub card_name: Option<String>,
     pub message_count: usize,
     pub created_at: String,
     pub updated_at: String,
@@ -2623,18 +2647,41 @@ pub struct ConversationSummaryDto {
 
 #[tauri::command]
 fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<ConversationSummaryDto> {
+    // 联查角色卡名：snapshot_tool_ctx.characters 是 domain Character（含 id + name）
+    let tool_ctx = state.snapshot_tool_ctx();
+    let chars = &tool_ctx.characters;
     state
         .conv_store
         .list()
         .into_iter()
-        .map(|c| ConversationSummaryDto {
-            id: c.id.to_string(),
-            character_id: c.character_id,
-            message_count: c.message_count,
-            created_at: c.created_at.to_rfc3339(),
-            updated_at: c.updated_at.to_rfc3339(),
+        .map(|c| {
+            let card_name = c.character_id.as_ref().and_then(|cid| {
+                chars.iter().find(|ch| ch.id.as_str() == cid).map(|ch| ch.name.clone())
+            });
+            ConversationSummaryDto {
+                id: c.id.to_string(),
+                character_id: c.character_id,
+                campaign_id: c.campaign_id.map(|id| id.to_string()),
+                card_name,
+                message_count: c.message_count,
+                created_at: c.created_at.to_rfc3339(),
+                updated_at: c.updated_at.to_rfc3339(),
+            }
         })
         .collect()
+}
+
+/// 删除整个会话（含文件 + 缓存）
+#[tauri::command]
+fn delete_conversation(
+    conversation_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let conv_id = Id::from_str(&conversation_id);
+    state
+        .conv_store
+        .delete(&conv_id)
+        .map_err(|e| format!("{e}"))
 }
 
 #[tauri::command]
@@ -4158,6 +4205,9 @@ pub struct CampaignSummaryDto {
     pub story_clock: String,
     pub instance_count: usize,
     pub fork_from: Option<(String, String)>,
+    /// 绑定的对话 ID（一 Campaign 一对话）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 impl From<&storyforge_domain::campaign::Campaign> for CampaignSummaryDto {
@@ -4173,6 +4223,7 @@ impl From<&storyforge_domain::campaign::Campaign> for CampaignSummaryDto {
                 .fork_from
                 .as_ref()
                 .map(|(cid, nid)| (cid.as_str().to_string(), nid.as_str().to_string())),
+            conversation_id: c.conversation_id.as_ref().map(|id| id.as_str().to_string()),
         }
     }
 }
@@ -4301,6 +4352,16 @@ fn list_cards() -> Vec<CardSummaryDto> {
         .collect()
 }
 
+/// 删除角色卡（按 CharacterCard.id，级联删 campaign/instances/mvu）
+#[tauri::command]
+fn delete_card(id: String) -> Result<(), String> {
+    let card_id = Id::from_str(&id);
+    if !get_campaign_store().delete_card(&card_id) {
+        return Err(format!("角色卡不存在: {id}"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_card(id: String) -> Result<CardDetailDto, String> {
     let stored = get_campaign_store()
@@ -4321,19 +4382,49 @@ fn get_card(id: String) -> Result<CardDetailDto, String> {
     })
 }
 
-/// 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化
+/// 开档：建 Campaign，把卡里所有 Protagonist/Supporting 定义实例化；
+/// 一 Campaign 一对话模型：同时自动建对话、存开场白、双向绑定 conversation_id
 #[tauri::command]
-fn create_campaign(card_id: String, name: String) -> Result<CampaignSummaryDto, String> {
+fn create_campaign(
+    card_id: String,
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CampaignSummaryDto, String> {
     use storyforge_domain::campaign::CharacterInstance;
     use storyforge_domain::character::RoleType;
+    use storyforge_domain::conversation::Role as ConvRole;
 
     let store = get_campaign_store();
     let stored = store
         .get_card(&Id::from_str(&card_id))
         .ok_or_else(|| format!("找不到 card id={card_id}"))?;
 
-    let campaign = storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
+    let mut campaign = storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
+
+    // 自动建对话并绑定到 Campaign
+    let conv = state
+        .conv_store
+        .create(Some(card_id.clone()), Some(campaign.id.clone()));
+    campaign.conversation_id = Some(conv.id.clone());
     store.save_campaign(campaign.clone());
+
+    // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character.first_mes）
+    let src_id_str = stored.card.source_character_id.as_str().to_string();
+    let first_mes = get_store()
+        .list()
+        .into_iter()
+        .find(|sc| sc.info.source_character_id.as_deref() == Some(src_id_str.as_str()))
+        .map(|sc| sc.info.first_mes.clone())
+        .unwrap_or_default();
+    if !first_mes.is_empty() {
+        if let Err(e) = state.conv_store.append_final_message(
+            &conv.id,
+            ConvRole::Assistant,
+            first_mes,
+        ) {
+            tracing::warn!("建 Campaign 时追加开场白失败: {e}");
+        }
+    }
 
     // 实例化所有 protagonist/supporting 定义
     let mut instance_count = 0;
@@ -5036,6 +5127,7 @@ pub fn run() {
             cancel_writing,
             // M1 对话命令
             list_conversations,
+            delete_conversation,
             get_conversation,
             // 重 roll 命令
             regenerate,
@@ -5058,6 +5150,7 @@ pub fn run() {
             extract_characters,
             list_cards,
             get_card,
+            delete_card,
             create_campaign,
             list_campaigns,
             get_campaign,

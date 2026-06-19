@@ -140,22 +140,18 @@ Postprocess 会写 summary、knowledge、variables、tasks，但写作阶段没�
 
 风险：继续做插件 UI 会变成“能装 manifest，但不能影响主体验”。
 
-## 推荐重构顺序
+## 已完成的重构顺序
 
-1. `PLAN-CAMPAIGN-MAINLINE.md`
-   - 先打通 CampaignRuntimeContext、实例身份、变量/知识注入、后处理 ID 归一。
+以下执行顺序 Plan 1-4 已全部实现并归档：
 
-2. `PLAN-FRONTEND-WORKBENCH.md`
-   - 后端主线稳定后，前端首屏和写作入口改成 Campaign-first。
+1. ✅ `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md` — CampaignRuntimeContext、实例身份、变量/知识注入、后处理 ID 归一（Phase 1/2）
+2. ✅ `docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md` — 前端首屏和写作入口改成 Campaign-first（Phase 4）
+3. ✅ `docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md` — 从配置助手升级为 Campaign 健康检查、解释、修复入口（Phase 3）
+4. ✅ `docs/PLAN-PLUGIN-MVU.md` — 变量 schema / 状态栏 / 兜底 runtime（Phase 5，MVU 部分已实现，插件权限分层部分未覆盖）
 
-3. `PLAN-META-AGENT.md`
-   - Meta 从“聊天式配置助手”升级为 Campaign 健康检查、解释、修复入口。
+后续待执行：
 
-4. `PLAN-PLUGIN-MVU.md`
-   - MVU 先接入变量 schema / 状态栏 / 兜底 runtime，再考虑通用插件。
-
-5. `PLAN-ANDROID.md`
-   - 以主流程验证为中心，处理文件导入、长文本流式、日志导出、权限和性能。
+5. `docs/PLAN-ANDROID.md` — 以主流程验证为中心，处理文件导入、长文本流式、日志导出、权限和性能。
 
 ## 给小模型执行的规则
 

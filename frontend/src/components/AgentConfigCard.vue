@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
+import { promptDialog, alertDialog } from './base/BaseDialog.js'
 import { listConnections, setActiveConnection as apiSetActive, listModules, getActiveProfile, saveProfile, updateModule } from '../tauri-api.js'
 
 const connections = ref([])
@@ -13,6 +14,10 @@ const loadingModules = ref(false)
 const saving = ref(false)
 
 const emit = defineEmits(['open-connection-config'])
+defineProps({
+  // 嵌入调试抽屉时去掉外层卡片（抽屉自身提供 surface + padding）
+  embedded: { type: Boolean, default: false },
+})
 
 onMounted(async () => {
   await loadConnections()
@@ -151,7 +156,7 @@ async function toggleModuleEnabled(module) {
 // 保存当前选择为新命名预设
 async function saveAsNewProfile() {
   if (!activeProfile.value) return
-  const name = window.prompt('新预设名称：', '我的预设')
+  const name = await promptDialog('新预设名称：', '我的预设', { title: '保存预设' })
   if (!name) return
   saving.value = true
   try {
@@ -161,7 +166,7 @@ async function saveAsNewProfile() {
     await loadModules() // 刷新（新预设可能成为活跃）
   } catch (e) {
     console.error('保存预设失败:', e)
-    alert('保存预设失败: ' + e)
+    await alertDialog('保存预设失败: ' + e)
   } finally {
     saving.value = false
   }
@@ -171,7 +176,7 @@ defineExpose({ loadConnections })
 </script>
 
 <template>
-  <div class="mx-4 my-3 bg-surface rounded-2xl border border-line p-4">
+  <div :class="embedded ? '' : 'mx-4 my-3 bg-surface rounded-2xl border border-line p-4'">
     <div class="flex items-center gap-2 mb-3">
       <span class="text-base">🎬</span>
       <span class="text-sm font-medium text-ink">导演 Agent</span>

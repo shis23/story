@@ -7,7 +7,7 @@
 - `docs/ARCHITECTURE.md`：代码架构、模块边界、写作流水线。
 - `docs/DATA_MODEL.md`：角色、Campaign、变量、知识、任务模型。
 - `docs/AGENT_INTERFACES.md`：Director、Subagent、Editor、Postprocess、Meta Agent 契约。
-- `docs/PLAN-CAMPAIGN-MAINLINE.md`：Campaign 写作主线当前执行计划。
+- `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）：Campaign 写作主线历史执行计划。
 - `docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md`：Campaign 角色统一历史实施记录（已归档）。
 - `docs/ROADMAP.md`：后续分阶段路线图。
 

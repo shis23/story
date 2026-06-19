@@ -1,7 +1,7 @@
 # ST 导入/导出计划（SillyTavern Import/Export）
 
-> 状态：计划（未实现）
-> 关联：`docs/ROADMAP.md` Phase 5、`docs/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
+> 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。
+> 关联：`docs/ROADMAP.md` Phase 5（已完成）、`docs/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
 
 ## 目标
 

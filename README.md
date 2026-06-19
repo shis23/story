@@ -81,21 +81,23 @@ docs                       当前架构、数据模型、Agent 契约和路线�
 
 ## 核心文档
 
+- [路线图](docs/ROADMAP.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [架构审计与重构建议](docs/ARCHITECTURE-AUDIT.md)
 - [文档与代码对齐审计](docs/DOCS-CODE-AUDIT.md)
 - [数据模型](docs/DATA_MODEL.md)
 - [Agent 接口](docs/AGENT_INTERFACES.md)
-- [Campaign 主线计划](docs/PLAN-CAMPAIGN-MAINLINE.md)
-- [Campaign 角色统一计划（归档）](docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md)
+- [Campaign 主线计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md)
+- [Meta Agent 计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md)
+- [前端工作台计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md)
+- [Campaign 角色统一计划（已归档）](docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md)
 - [Agent Profile 计划](docs/PLAN-AGENT-PROFILE.md)
 - [角色识别增强计划](docs/PLAN-CHARACTER-EXTRACTION.md)
-- [Meta Agent 计划](docs/PLAN-META-AGENT.md)
-- [前端工作台计划](docs/PLAN-FRONTEND-WORKBENCH.md)
+- [MVU/插件计划](docs/PLAN-PLUGIN-MVU.md)
+- [ST 导入/导出计划](docs/PLAN-ST-IMPORT-EXPORT.md)
+- [知识传播引擎](docs/PLAN-KNOWLEDGE-PROPAGATION.md)
 - [Android 计划](docs/PLAN-ANDROID.md)
-- [插件与 MVU 计划](docs/PLAN-PLUGIN-MVU.md)
 - [主线完成后的收口与发布准备](docs/PLAN-POST-MAINLINE.md)
-- [路线图](docs/ROADMAP.md)
 - [交接说明（已归档）](docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md)
 
 旧版文档已归档到 [docs/archive/2026-06-16-pre-rewrite](docs/archive/2026-06-16-pre-rewrite)。

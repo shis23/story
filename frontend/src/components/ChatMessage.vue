@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { formatContent } from '../utils/formatContent.js'
+import BaseDropdown from './base/BaseDropdown.vue'
 
 const props = defineProps({
   message: { type: Object, required: true },
@@ -114,12 +115,9 @@ async function deleteVariant() {
   emit('delete-variant', { nodeId: props.message.id })
 }
 
-// 分支：设计上分支 = 开新 Campaign 档（Campaign.fork_from 记录分叉点）。
-// 当前未暴露 fork Tauri 命令，先提示用户在 Campaign 面板操作，避免误触导致消息消失。
-async function explainBranch() {
-  const { message } = await import('@tauri-apps/plugin-dialog')
-  await message('分支功能 = 从当前剧情另开一个新档（Campaign）。\n\n请在「Campaign 面板」中对当前游玩档使用「分叉」操作，选择从这里开始新的故事线。\n\n（该功能的后端 Campaign.fork 已实现，前端入口开发中）', { title: '功能说明' })
-}
+// 分支功能（Campaign.fork）后端已实现，前端入口未就绪。
+// 原分支按钮只弹"开发中"提示，属死路交互，已移除避免误导。
+// 待 fork 前端入口落地后在此恢复 emit('branch', ...)。
 
 const isUser = computed(() => props.message.role === 'user')
 
@@ -131,104 +129,104 @@ function rerollUser() {
 </script>
 
 <template>
-  <div class="px-4 py-4" :class="isUser ? '' : ''">
-    <!-- 角色标签 -->
-    <div class="flex items-center gap-2 mb-2">
+  <div class="group px-4 sm:px-6 py-4 rounded-xl transition-colors duration-200 hover:bg-surface/40">
+    <!-- 角色标签行（阅读器化：标签轻量，靠留白区分轮次） -->
+    <div class="flex items-center gap-2 mb-3">
       <span class="text-xs font-medium px-2 py-0.5 rounded-md"
-        :class="isUser ? 'bg-bg text-ink-soft' : 'bg-accent-soft text-accent'">
+        :class="isUser ? 'text-ink-soft' : 'text-accent'">
         {{ message.role_label }}
       </span>
       <!-- 版本切换条（多于1个版本才显示） -->
       <div v-if="variantCount > 1" class="flex items-center gap-1 text-xs text-ink-soft">
-        <button @click="switchVariant(-1)" class="w-5 h-5 flex items-center justify-center rounded hover:bg-bg">‹</button>
+        <button @click="switchVariant(-1)" class="w-9 h-9 flex items-center justify-center rounded-md hover:bg-accent-soft transition-colors" aria-label="上一版本">‹</button>
         <span>{{ message.active_variant + 1 }}/{{ variantCount }}</span>
-        <button @click="switchVariant(1)" class="w-5 h-5 flex items-center justify-center rounded hover:bg-bg">›</button>
-        <!-- discarded 版本标记 -->
-        <span v-if="currentVariant.status === 'discarded'" class="text-warn">· 旧版</span>
+        <button @click="switchVariant(1)" class="w-9 h-9 flex items-center justify-center rounded-md hover:bg-accent-soft transition-colors" aria-label="下一版本">›</button>
+        <span v-if="currentVariant.status === 'discarded'" class="text-warn ml-1">· 旧版</span>
       </div>
     </div>
 
-    <!-- 消息正文（AI 用衬线，用户用无衬线） -->
+    <!-- 消息正文：去气泡阅读器化。
+         AI = 纯衬线文本块（无边框无底色，靠 prose-fiction + 留白），user = 弱化缩进块 -->
     <div v-if="!editing"
-      class="rounded-2xl px-4 py-3 text-[15px] leading-relaxed"
+      class="text-[15px] leading-loose"
       :class="isUser
-        ? 'bg-accent-soft text-ink rounded-tr-sm'
-        : 'bg-surface border border-line text-ink rounded-tl-sm prose-fiction'"
+        ? 'text-ink-soft pl-3 border-l-2 border-line'
+        : 'text-ink prose-fiction'"
     >
       <span v-html="formatContent(currentVariant.content)"></span>
     </div>
 
     <!-- 内联编辑模式 -->
-    <div v-else class="rounded-2xl border border-accent bg-surface px-4 py-3">
+    <div v-else class="rounded-xl border border-accent bg-surface px-4 py-3">
       <textarea
         v-model="editContent"
         rows="4"
         class="w-full text-[15px] leading-relaxed bg-transparent resize-none focus:outline-none"
       ></textarea>
       <div class="flex justify-end gap-2 mt-2">
-        <button @click="cancelEdit" class="px-3 py-1 text-xs rounded-md hover:bg-bg">取消</button>
-        <button @click="saveEdit" class="px-3 py-1 text-xs rounded-md bg-accent text-white hover:opacity-90">保存</button>
+        <button @click="cancelEdit" class="min-h-[44px] px-4 text-sm rounded-lg hover:bg-accent-soft transition-colors">取消</button>
+        <button @click="saveEdit" class="min-h-[44px] px-4 text-sm rounded-lg bg-accent text-white hover:opacity-90 transition-colors">保存</button>
       </div>
     </div>
 
-    <!-- 操作栏（user 消息：仅重 roll） -->
-    <div v-if="isUser" class="flex items-center gap-1 mt-2 text-xs text-ink-soft">
+    <!-- 操作栏（user 消息：编辑 + 重 roll） -->
+    <div v-if="isUser" class="flex items-center gap-2 mt-3 text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
+      <button @click="startEdit" :disabled="busy"
+        class="min-h-[44px] px-3 text-sm rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">✏️ 编辑</button>
       <button @click="rerollUser" :disabled="busy"
-        class="px-2.5 py-1 rounded-md hover:bg-bg disabled:opacity-40">🔄 重roll</button>
+        class="min-h-[44px] px-3 text-sm rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">🔄 重roll</button>
     </div>
 
-    <!-- 操作栏（仅 AI 消息显示完整操作） -->
-    <div v-if="!isUser" class="flex items-center gap-1 mt-2 text-xs text-ink-soft">
-      <button @click="startEdit" class="px-2.5 py-1 rounded-md hover:bg-bg">✏️ 编辑</button>
-      <button @click="acceptVariant" class="px-2.5 py-1 rounded-md hover:bg-bg"
-        :class="currentVariant.status === 'final' ? 'text-green-600' : ''">
+    <!-- 操作栏（仅 AI 消息显示完整操作；chrome 隐退：桌面 hover 浮现，移动端半显） -->
+    <div v-if="!isUser" class="flex flex-wrap items-center gap-2 mt-3 text-sm text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
+      <button @click="startEdit" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors">✏️ 编辑</button>
+      <button @click="acceptVariant" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors"
+        :class="currentVariant.status === 'final' ? 'text-ok' : ''">
         {{ currentVariant.status === 'final' ? '✅ 已采纳' : '☑️ 采纳' }}
       </button>
 
-      <!-- 重 roll（带下拉菜单，含部分重 roll） -->
-      <div class="relative">
-        <button
-          @click="showRerollMenu = !showRerollMenu"
-          :disabled="busy"
-          class="px-2.5 py-1 rounded-md hover:bg-bg disabled:opacity-40"
-        >
-          🔄 重roll ▾
-        </button>
-        <div
-          v-if="showRerollMenu && !busy"
-          class="absolute left-0 top-full mt-1 bg-surface border border-line rounded-xl shadow-lg py-1 min-w-[200px] z-10"
-        >
-          <button @click="pickReroll('all')" class="w-full text-left px-3 py-2 hover:bg-accent-soft">整体重 roll</button>
-          <button @click="pickReroll('editor')" class="w-full text-left px-3 py-2 hover:bg-accent-soft">只重跑 · 编剧</button>
+      <!-- 重 roll（BaseDropdown：click-outside + ESC 关闭） -->
+      <BaseDropdown v-model="showRerollMenu" align="left" :min-width="220">
+        <template #trigger>
+          <button
+            :disabled="busy"
+            class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors"
+          >
+            🔄 重roll ▾
+          </button>
+        </template>
+        <template #default="{ close }">
+          <button @click="close(); pickReroll('all')" class="w-full text-left min-h-[44px] px-3 hover:bg-accent-soft transition-colors">整体重 roll</button>
+          <button @click="close(); pickReroll('editor')" class="w-full text-left min-h-[44px] px-3 hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
           <template v-if="subagentRoles.length">
             <div class="border-t border-line my-1"></div>
             <button
               v-for="role in subagentRoles"
               :key="role.id"
-              @click="pickReroll('subagent:' + role.id)"
-              class="w-full text-left px-3 py-2 text-accent hover:bg-accent-soft"
+              @click="close(); pickReroll('subagent:' + role.id)"
+              class="w-full text-left min-h-[44px] px-3 text-accent hover:bg-accent-soft transition-colors"
             >
               ⭐ 只重跑 · {{ role.label }}（子Agent）
             </button>
             <div class="px-3 py-1.5 text-[11px] text-ink-soft">省 60% token</div>
           </template>
-          <div v-if="!subagentRoles.length" class="px-3 py-1.5 text-[11px] text-ink-soft/60">
+          <div v-if="!subagentRoles.length" class="px-3 py-2 text-[11px] text-ink-soft/60">
             无溯源信息，仅支持整体/编剧重 roll
           </div>
-        </div>
-      </div>
+        </template>
+      </BaseDropdown>
 
-      <button @click="deleteVariant" class="px-2.5 py-1 rounded-md hover:bg-bg">🗑 删除</button>
-      <button @click="explainBranch" class="px-2.5 py-1 rounded-md hover:bg-bg">📑 分支</button>
-
-      <!-- 高玩模式额外信息 -->
-      <span v-if="currentVariant.provenance" class="ml-auto text-[11px] text-ink-soft/70">
+      <!-- 高玩模式额外信息（seed） -->
+      <span v-if="currentVariant.provenance" class="text-[11px] text-ink-soft/70">
         seed {{ currentVariant.provenance.seed }}
       </span>
+
+      <!-- 危险操作单独右对齐，拉开间距防误触 -->
+      <button @click="deleteVariant" class="min-h-[44px] px-3 rounded-lg hover:bg-err/10 text-ink-soft hover:text-err transition-colors ml-auto">🗑 删除</button>
     </div>
 
     <!-- Hint 输入弹层 -->
-    <div v-if="showHintBox" class="mt-2 rounded-xl border border-accent/30 bg-accent-soft/40 p-3">
+    <div v-if="showHintBox" class="mt-3 rounded-xl border border-accent/30 bg-accent-soft/40 p-3">
       <div class="text-xs text-ink-soft mb-2">
         附加提示（可选）：告诉 Agent 上次哪里有问题
       </div>
@@ -239,8 +237,8 @@ function rerollUser() {
         class="w-full text-sm rounded-lg border border-line bg-bg px-3 py-2 resize-none focus:outline-none focus:border-accent"
       ></textarea>
       <div class="flex justify-end gap-2 mt-2">
-        <button @click="cancelHint" class="px-3 py-1 text-xs rounded-md hover:bg-bg">取消</button>
-        <button @click="confirmReroll" class="px-3 py-1 text-xs rounded-md bg-accent text-white hover:opacity-90">
+        <button @click="cancelHint" class="min-h-[44px] px-4 text-sm rounded-lg hover:bg-accent-soft transition-colors">取消</button>
+        <button @click="confirmReroll" class="min-h-[44px] px-4 text-sm rounded-lg bg-accent text-white hover:opacity-90 transition-colors">
           开始重 roll
         </button>
       </div>

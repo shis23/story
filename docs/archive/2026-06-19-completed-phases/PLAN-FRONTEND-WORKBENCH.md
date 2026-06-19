@@ -1,7 +1,6 @@
 # 计划：前端 Campaign 工作台
 
-> 状态：部分起步（阶段 1 首屏聚焦已完成）
-> 前置：`PLAN-CAMPAIGN-MAINLINE.md` 至少完成后端 Campaign 快照和 instance id 主线。
+> **归档说明**：本文件已于 2026-06-19 归档为历史执行记录。所有 6 个阶段（Phase 4）均已实现并合并到 main。后续执行入口见 `docs/ROADMAP.md` Phase 4。归档位置：`docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`。
 
 ## 目标
 

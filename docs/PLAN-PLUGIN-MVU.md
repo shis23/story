@@ -1,7 +1,7 @@
 # 计划：插件与 MVU 状态栏
 
-> 状态：待执行
-> 前置：Campaign 主线先稳定。MVU 可以做分析和 schema 接入，但通用插件平台延后。
+> 状态：已基本实现（2026-06-19，MVU 状态栏/变量 schema/JS fallback/apply 前端均已落地；插件权限分层 MVU-6 部分未覆盖）。
+> 前置：Campaign 主线已稳定。
 
 ## 目标
 

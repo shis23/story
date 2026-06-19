@@ -1,5 +1,7 @@
 <script setup>
 import { ref, reactive, onMounted, computed } from 'vue'
+import { confirmDialog } from './base/BaseDialog.js'
+import BaseOverlay from './base/BaseOverlay.vue'
 import {
   listConnectionTemplates,
   listConnections,
@@ -16,6 +18,7 @@ const emit = defineEmits(['close', 'changed'])
 const templates = ref([])
 // 已配置连接
 const connections = ref([])
+const loading = ref(true) // 初始加载模板+连接
 
 // 表单状态
 const form = reactive({
@@ -81,6 +84,7 @@ async function handleFetchModels() {
 
 onMounted(async () => {
   await Promise.all([loadTemplates(), loadConnections()])
+  loading.value = false
 })
 
 async function loadTemplates() {
@@ -175,8 +179,7 @@ async function handleSave() {
 }
 
 async function handleDelete(id) {
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask('确定删除此连接？', { title: '删除确认', kind: 'warning' })
+  const ok = await confirmDialog('确定删除此连接？', { title: '删除确认' })
   if (!ok) return
   try {
     await deleteConnection(id)
@@ -199,187 +202,181 @@ async function handleSetActive(id) {
 </script>
 
 <template>
-  <!-- 遮罩 -->
-  <div class="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center" @click.self="emit('close')">
-    <div class="bg-bg w-full max-w-md max-h-[90vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl border border-line">
-      <!-- 头部 -->
-      <div class="sticky top-0 bg-bg border-b border-line px-4 py-3 flex items-center justify-between">
-        <span class="text-sm font-medium text-ink">LLM 连接配置</span>
-        <button @click="emit('close')" class="text-ink-soft hover:text-ink">✕</button>
+  <BaseOverlay :model-value="true" title="LLM 连接配置" size="sm" position="left" @close="emit('close')">
+    <!-- 初始加载骨架 -->
+    <div v-if="loading" class="p-8 text-center text-ink-soft text-sm">加载中…</div>
+
+    <div v-else class="p-4 space-y-5">
+      <!-- 已配置连接列表 -->
+      <div v-if="connections.length" class="space-y-2">
+        <div class="text-xs text-ink-soft">已配置</div>
+        <div
+          v-for="c in connections"
+          :key="c.id"
+          class="flex items-center gap-2 p-2.5 rounded-lg border"
+          :class="c.active ? 'border-accent bg-accent-soft/40' : 'border-line bg-surface'"
+        >
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-ink truncate">{{ c.name }}</div>
+            <div class="text-[11px] text-ink-soft truncate">{{ c.model }}</div>
+          </div>
+          <button
+            v-if="!c.active"
+            @click="handleSetActive(c.id)"
+            class="min-h-[36px] px-3 text-xs rounded-md bg-bg text-ink-soft hover:bg-line transition-colors"
+          >设为活跃</button>
+          <span v-else class="text-[11px] text-accent">● 活跃</span>
+          <button
+            @click="handleDelete(c.id)"
+            class="min-h-[36px] px-3 text-xs rounded-md text-err/70 hover:bg-err/10 transition-colors"
+          >删除</button>
+        </div>
       </div>
 
-      <div class="p-4 space-y-5">
-        <!-- 已配置连接列表 -->
-        <div v-if="connections.length" class="space-y-2">
-          <div class="text-xs text-ink-soft">已配置</div>
-          <div
-            v-for="c in connections"
-            :key="c.id"
-            class="flex items-center gap-2 p-2.5 rounded-lg border"
-            :class="c.active ? 'border-accent bg-accent-soft/40' : 'border-line bg-surface'"
-          >
-            <div class="flex-1 min-w-0">
-              <div class="text-sm text-ink truncate">{{ c.name }}</div>
-              <div class="text-[11px] text-ink-soft truncate">{{ c.model }}</div>
-            </div>
+      <div v-else class="p-3 rounded-lg border border-dashed border-line text-center text-xs text-ink-soft">
+        还没有配置连接，新建一个开始写作
+      </div>
+
+      <!-- 分隔 -->
+      <div class="border-t border-line"></div>
+
+      <!-- 新建连接表单 -->
+      <div class="space-y-3">
+        <div class="text-xs text-ink-soft">新建连接</div>
+
+        <!-- 模板选择 -->
+        <div>
+          <div class="text-[11px] text-ink-soft mb-1.5">从模板选择</div>
+          <div class="flex flex-wrap gap-1.5">
             <button
-              v-if="!c.active"
-              @click="handleSetActive(c.id)"
-              class="px-2 py-1 text-[11px] rounded-md bg-bg text-ink-soft hover:bg-line"
-            >设为活跃</button>
-            <span v-else class="text-[11px] text-accent">● 活跃</span>
-            <button
-              @click="handleDelete(c.id)"
-              class="px-2 py-1 text-[11px] rounded-md text-err/70 hover:bg-err/10"
-            >删除</button>
+              v-for="t in templates"
+              :key="t.id"
+              @click="selectTemplate(t)"
+              class="min-h-[36px] px-3 rounded-full text-xs transition-all"
+              :class="form.templateId === t.id
+                ? 'bg-accent text-white'
+                : 'bg-bg text-ink-soft hover:bg-line'"
+            >{{ t.name }}</button>
           </div>
         </div>
 
-        <div v-else class="p-3 rounded-lg border border-dashed border-line text-center text-xs text-ink-soft">
-          还没有配置连接，新建一个开始写作
+        <!-- 名称 -->
+        <div>
+          <label class="text-[11px] text-ink-soft">名称</label>
+          <input
+            v-model="form.name"
+            placeholder="如：我的 DeepSeek"
+            class="w-full mt-1 min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent"
+          />
         </div>
 
-        <!-- 分隔 -->
-        <div class="border-t border-line"></div>
+        <!-- base_url -->
+        <div>
+          <label class="text-[11px] text-ink-soft">Base URL</label>
+          <input
+            v-model="form.baseUrl"
+            placeholder="https://api.deepseek.com"
+            class="w-full mt-1 min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
+          />
+        </div>
 
-        <!-- 新建连接表单 -->
-        <div class="space-y-3">
-          <div class="text-xs text-ink-soft">新建连接</div>
-
-          <!-- 模板选择 -->
-          <div>
-            <div class="text-[11px] text-ink-soft mb-1.5">从模板选择</div>
-            <div class="flex flex-wrap gap-1.5">
-              <button
-                v-for="t in templates"
-                :key="t.id"
-                @click="selectTemplate(t)"
-                class="px-2.5 py-1 rounded-full text-xs transition-all"
-                :class="form.templateId === t.id
-                  ? 'bg-accent text-white'
-                  : 'bg-bg text-ink-soft hover:bg-line'"
-              >{{ t.name }}</button>
-            </div>
-          </div>
-
-          <!-- 名称 -->
-          <div>
-            <label class="text-[11px] text-ink-soft">名称</label>
+        <!-- model（datalist：可选可输入 + 拉取按钮）-->
+        <div>
+          <label class="text-[11px] text-ink-soft">模型</label>
+          <div class="flex gap-1.5 mt-1">
             <input
-              v-model="form.name"
-              placeholder="如：我的 DeepSeek"
-              class="w-full mt-1 px-3 py-2 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent"
+              v-model="form.model"
+              list="model-options-list"
+              placeholder="模型名（可手输或下拉选）"
+              class="flex-1 min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
             />
+            <datalist id="model-options-list">
+              <option v-for="m in modelOptions" :key="m" :value="m" />
+            </datalist>
+            <button
+              @click="handleFetchModels"
+              :disabled="fetchingModels"
+              class="shrink-0 min-h-[44px] px-3 text-xs rounded-lg border border-line text-ink-soft hover:bg-line disabled:opacity-50"
+              :title="'从 ' + form.baseUrl + ' 拉取模型列表'"
+            >{{ fetchingModels ? '⏳' : '🔍' }}</button>
           </div>
+          <div v-if="fetchedModels.length" class="text-[10px] text-ink-soft/70 mt-1">
+            已拉取 {{ fetchedModels.length }} 个模型
+          </div>
+        </div>
 
-          <!-- base_url -->
-          <div>
-            <label class="text-[11px] text-ink-soft">Base URL</label>
+        <!-- api_key -->
+        <div>
+          <label class="text-[11px] text-ink-soft">API Key</label>
+          <div class="relative mt-1">
             <input
-              v-model="form.baseUrl"
-              placeholder="https://api.deepseek.com"
-              class="w-full mt-1 px-3 py-2 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
+              v-model="form.apiKey"
+              :type="showKey ? 'text' : 'password'"
+              placeholder="sk-..."
+              class="w-full min-h-[44px] px-3 pr-12 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
             />
-          </div>
-
-          <!-- model（datalist：可选可输入 + 拉取按钮）-->
-          <div>
-            <label class="text-[11px] text-ink-soft">模型</label>
-            <div class="flex gap-1.5 mt-1">
-              <input
-                v-model="form.model"
-                list="model-options-list"
-                placeholder="模型名（可手输或下拉选）"
-                class="flex-1 px-3 py-2 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
-              />
-              <datalist id="model-options-list">
-                <option v-for="m in modelOptions" :key="m" :value="m" />
-              </datalist>
-              <button
-                @click="handleFetchModels"
-                :disabled="fetchingModels"
-                class="shrink-0 px-2.5 py-2 text-xs rounded-lg border border-line text-ink-soft hover:bg-line disabled:opacity-50"
-                :title="'从 ' + form.baseUrl + ' 拉取模型列表'"
-              >{{ fetchingModels ? '⏳' : '🔍' }}</button>
-            </div>
-            <div v-if="fetchedModels.length" class="text-[10px] text-ink-soft/70 mt-1">
-              已拉取 {{ fetchedModels.length }} 个模型
-            </div>
-          </div>
-
-          <!-- api_key -->
-          <div>
-            <label class="text-[11px] text-ink-soft">API Key</label>
-            <div class="relative mt-1">
-              <input
-                v-model="form.apiKey"
-                :type="showKey ? 'text' : 'password'"
-                placeholder="sk-..."
-                class="w-full px-3 py-2 pr-10 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent font-mono"
-              />
-              <button
-                @click="showKey = !showKey"
-                class="absolute right-2 top-1/2 -translate-y-1/2 text-ink-soft text-xs"
-              >{{ showKey ? '🙈' : '👁' }}</button>
-            </div>
-            <div v-if="selectedTemplate?.get_key_hint" class="text-[10px] text-ink-soft/70 mt-1">
-              {{ selectedTemplate.get_key_hint }}
-            </div>
-          </div>
-
-          <!-- 高级（采样参数） -->
-          <div>
             <button
-              @click="showAdvanced = !showAdvanced"
-              class="text-[11px] text-accent"
-            >{{ showAdvanced ? '▾ 收起采样参数' : '▸ 展开采样参数' }}</button>
-            <div v-if="showAdvanced" class="mt-2 grid grid-cols-3 gap-2">
-              <div>
-                <label class="text-[10px] text-ink-soft">temperature</label>
-                <input v-model.number="form.temperature" type="number" step="0.1"
-                  class="w-full px-2 py-1 text-xs rounded border border-line bg-surface" />
-              </div>
-              <div>
-                <label class="text-[10px] text-ink-soft">top_p</label>
-                <input v-model.number="form.topP" type="number" step="0.05"
-                  class="w-full px-2 py-1 text-xs rounded border border-line bg-surface" />
-              </div>
-              <div>
-                <label class="text-[10px] text-ink-soft">max_tokens</label>
-                <input v-model.number="form.maxTokens" type="number" step="256"
-                  class="w-full px-2 py-1 text-xs rounded border border-line bg-surface" />
-              </div>
+              @click="showKey = !showKey"
+              class="absolute right-1 top-1/2 -translate-y-1/2 w-10 h-10 flex items-center justify-center rounded-lg text-ink-soft hover:bg-bg"
+            >{{ showKey ? '🙈' : '👁' }}</button>
+          </div>
+          <div v-if="selectedTemplate?.get_key_hint" class="text-[10px] text-ink-soft/70 mt-1">
+            {{ selectedTemplate.get_key_hint }}
+          </div>
+        </div>
+
+        <!-- 高级（采样参数） -->
+        <div>
+          <button
+            @click="showAdvanced = !showAdvanced"
+            class="min-h-[44px] text-xs text-accent"
+          >{{ showAdvanced ? '▾ 收起采样参数' : '▸ 展开采样参数' }}</button>
+          <div v-if="showAdvanced" class="mt-2 grid grid-cols-3 gap-2">
+            <div>
+              <label class="text-[10px] text-ink-soft">temperature</label>
+              <input v-model.number="form.temperature" type="number" step="0.1"
+                class="w-full min-h-[44px] px-2 text-xs rounded border border-line bg-surface" />
+            </div>
+            <div>
+              <label class="text-[10px] text-ink-soft">top_p</label>
+              <input v-model.number="form.topP" type="number" step="0.05"
+                class="w-full min-h-[44px] px-2 text-xs rounded border border-line bg-surface" />
+            </div>
+            <div>
+              <label class="text-[10px] text-ink-soft">max_tokens</label>
+              <input v-model.number="form.maxTokens" type="number" step="256"
+                class="w-full min-h-[44px] px-2 text-xs rounded border border-line bg-surface" />
             </div>
           </div>
+        </div>
 
-          <!-- 错误 -->
-          <div v-if="error" class="p-2 rounded-lg bg-err/10 text-err text-xs">{{ error }}</div>
+        <!-- 错误 -->
+        <div v-if="error" class="p-2 rounded-lg bg-err/10 text-err text-xs">{{ error }}</div>
 
-          <!-- 测试结果 -->
-          <div
-            v-if="testResult"
-            class="p-2 rounded-lg text-xs"
-            :class="testResult.success ? 'bg-green-500/10 text-green-700' : 'bg-err/10 text-err'"
-          >
-            {{ testResult.success ? '✓' : '✗' }} {{ testResult.message }}
-            <span v-if="testResult.latencyMs" class="text-ink-soft">· {{ testResult.latencyMs }}ms</span>
-          </div>
+        <!-- 测试结果 -->
+        <div
+          v-if="testResult"
+          class="p-2 rounded-lg text-xs"
+          :class="testResult.success ? 'bg-ok/10 text-ok' : 'bg-err/10 text-err'"
+        >
+          {{ testResult.success ? '✓' : '✗' }} {{ testResult.message }}
+          <span v-if="testResult.latencyMs" class="text-ink-soft">· {{ testResult.latencyMs }}ms</span>
+        </div>
 
-          <!-- 操作按钮 -->
-          <div class="flex gap-2 pt-1">
-            <button
-              @click="handleTest"
-              :disabled="testing"
-              class="flex-1 py-2 text-xs rounded-lg border border-line text-ink hover:bg-bg disabled:opacity-50"
-            >{{ testing ? '测试中…' : '🔌 测试连接' }}</button>
-            <button
-              @click="handleSave"
-              :disabled="saving"
-              class="flex-1 py-2 text-xs rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
-            >{{ saving ? '保存中…' : '💾 保存' }}</button>
-          </div>
+        <!-- 操作按钮 -->
+        <div class="flex gap-2 pt-1">
+          <button
+            @click="handleTest"
+            :disabled="testing"
+            class="flex-1 min-h-[44px] text-sm rounded-lg border border-line text-ink hover:bg-bg disabled:opacity-50 transition-colors"
+          >{{ testing ? '测试中…' : '🔌 测试连接' }}</button>
+          <button
+            @click="handleSave"
+            :disabled="saving"
+            class="flex-1 min-h-[44px] text-sm rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50 transition-colors"
+          >{{ saving ? '保存中…' : '💾 保存' }}</button>
         </div>
       </div>
     </div>
-  </div>
+  </BaseOverlay>
 </template>

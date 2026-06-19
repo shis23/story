@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import {
   listInstances, getCharacterVariables, setCharacterVariable,
   promoteTemporaryInstance
@@ -76,14 +77,13 @@ async function handleVariableChange(instanceId, key, value, varType) {
     await setCharacterVariable(props.campaignId, instanceId, key, parsed)
     instanceVariables.value = await getCharacterVariables(props.campaignId, instanceId)
   } catch (e) {
-    alert('设置变量失败: ' + e)
+    await alertDialog('设置变量失败: ' + e)
   }
 }
 
 // ─── 升格临时实例 ───
 async function handlePromoteTemporary(inst) {
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask(`确定将「${inst.name || inst.character_name}」升格为常驻角色？`, { title: '升格确认', kind: 'info' })
+  const ok = await confirmDialog(`确定将「${inst.name || inst.character_name}」升格为常驻角色？`, { title: '升格确认', kind: 'info' })
   if (!ok) return
   promotingInstanceId.value = inst.id
   try {
@@ -91,7 +91,7 @@ async function handlePromoteTemporary(inst) {
     await load()
     emit('refresh')
   } catch (e) {
-    alert('升格失败: ' + e)
+    await alertDialog('升格失败: ' + e)
   } finally {
     promotingInstanceId.value = null
   }
@@ -140,7 +140,7 @@ defineExpose({ refresh: load })
           v-if="inst.is_temporary"
           @click.stop="handlePromoteTemporary(inst)"
           :disabled="promotingInstanceId === inst.id"
-          class="px-2 py-1 rounded-full text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
+          class="min-h-[36px] px-3 rounded-full text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50 transition-colors"
         >{{ promotingInstanceId === inst.id ? '升格中…' : '升格为常驻' }}</button>
         <span class="text-ink-soft text-xs">{{ expandedInstanceId === inst.id ? '▲' : '▼' }}</span>
       </div>
@@ -175,7 +175,7 @@ defineExpose({ refresh: load })
               :value="v.value"
               :step="inferVarType(v.value) === 'float' ? '0.01' : '1'"
               @change="handleVariableChange(inst.id, v.key, $event.target.value, inferVarType(v.value))"
-              class="flex-1 px-2 py-1 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent"
+              class="flex-1 min-h-[36px] px-2 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent"
             />
           </template>
 
@@ -185,7 +185,7 @@ defineExpose({ refresh: load })
               :value="formatJson(v.value)"
               @change="handleVariableChange(inst.id, v.key, $event.target.value, 'json')"
               rows="3"
-              class="flex-1 px-2 py-1 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent resize-none font-mono"
+              class="flex-1 px-2 py-1.5 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent resize-none font-mono"
             ></textarea>
           </template>
 
@@ -195,7 +195,7 @@ defineExpose({ refresh: load })
               type="text"
               :value="String(v.value)"
               @change="handleVariableChange(inst.id, v.key, $event.target.value, 'string')"
-              class="flex-1 px-2 py-1 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent"
+              class="flex-1 min-h-[36px] px-2 text-xs rounded border border-line bg-bg focus:outline-none focus:border-accent"
             />
           </template>
         </div>

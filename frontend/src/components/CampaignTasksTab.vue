@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import { listTasks, createTask, completeTask, abandonTask } from '../tauri-api.js'
 
 const props = defineProps({
@@ -52,7 +53,7 @@ async function handleCreateTask() {
     await load()
     emit('refresh')
   } catch (e) {
-    alert('创建任务失败: ' + e)
+    await alertDialog('创建任务失败: ' + e)
   }
 }
 
@@ -62,27 +63,26 @@ async function handleCompleteTask(taskId) {
     await load()
     emit('refresh')
   } catch (e) {
-    alert('完成任务失败: ' + e)
+    await alertDialog('完成任务失败: ' + e)
   }
 }
 
 async function handleAbandonTask(taskId) {
-  const { ask } = await import('@tauri-apps/plugin-dialog')
-  const ok = await ask('确定放弃该任务？', { title: '放弃确认', kind: 'warning' })
+  const ok = await confirmDialog('确定放弃该任务？', { title: '放弃确认' })
   if (!ok) return
   try {
     await abandonTask(taskId)
     await load()
     emit('refresh')
   } catch (e) {
-    alert('放弃任务失败: ' + e)
+    await alertDialog('放弃任务失败: ' + e)
   }
 }
 
 // ─── 状态显示 ───
 function taskStatusText(status) {
   if (typeof status === 'string') return status
-  if (status?.likely_completed != null) return `likely (${Math.round(status.likely_completed * 100)}%)`
+  if (status?.likely_completed != null) return `可能完成 (${Math.round(status.likely_completed * 100)}%)`
   return JSON.stringify(status)
 }
 
@@ -113,7 +113,7 @@ defineExpose({ refresh: load })
     <select
       v-model="statusFilter"
       @change="onFilterChange"
-      class="px-2 py-1 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
+      class="min-h-[44px] px-3 text-xs rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
     >
       <option v-for="opt in statusOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
     </select>
@@ -125,7 +125,7 @@ defineExpose({ refresh: load })
     <input
       v-model="newTaskTitle"
       placeholder="任务标题"
-      class="w-full px-3 py-2 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
+      class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
       @keyup.enter="handleCreateTask"
     />
     <textarea
@@ -135,11 +135,11 @@ defineExpose({ refresh: load })
       class="w-full px-3 py-2 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent resize-none"
     ></textarea>
     <div class="flex gap-2">
-      <button @click="showNewTask = false" class="flex-1 py-1.5 rounded-lg text-xs bg-bg text-ink-soft">取消</button>
+      <button @click="showNewTask = false" class="flex-1 min-h-[44px] rounded-lg text-xs bg-bg text-ink-soft hover:bg-line transition-colors">取消</button>
       <button
         @click="handleCreateTask"
         :disabled="!newTaskTitle.trim()"
-        class="flex-1 py-1.5 rounded-lg text-xs font-medium bg-accent text-white disabled:opacity-50"
+        class="flex-1 min-h-[44px] rounded-lg text-xs font-medium bg-accent text-white disabled:opacity-50 transition-colors"
       >创建</button>
     </div>
   </div>
@@ -148,7 +148,7 @@ defineExpose({ refresh: load })
   <div v-else-if="error" class="text-center text-warn text-sm py-8">加载失败: {{ error }}</div>
   <div v-else-if="tasks.length === 0 && !showNewTask" class="text-center py-8">
     <div class="text-ink-soft text-sm mb-3">暂无任务</div>
-    <button @click="showNewTask = true" class="px-4 py-2 rounded-lg text-xs font-medium bg-accent text-white">新建任务</button>
+    <button @click="showNewTask = true" class="min-h-[44px] px-4 rounded-lg text-xs font-medium bg-accent text-white hover:opacity-90 transition-colors">新建任务</button>
   </div>
 
   <template v-else>
@@ -173,12 +173,12 @@ defineExpose({ refresh: load })
           <button
             v-if="task.status !== 'completed' && task.status?.likely_completed == null"
             @click="handleCompleteTask(task.id)"
-            class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20"
+            class="min-h-[36px] px-3 rounded-full text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 transition-colors"
           >完成</button>
           <button
             v-if="task.status !== 'completed' && task.status !== 'abandoned'"
             @click="handleAbandonTask(task.id)"
-            class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20"
+            class="min-h-[36px] px-3 rounded-full text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20 transition-colors"
           >放弃</button>
         </div>
       </div>
@@ -188,7 +188,7 @@ defineExpose({ refresh: load })
     <button
       v-if="!showNewTask"
       @click="showNewTask = true"
-      class="w-full py-2 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line"
+      class="w-full min-h-[44px] rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line transition-colors"
     >+ 新建任务</button>
   </template>
 </template>

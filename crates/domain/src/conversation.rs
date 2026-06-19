@@ -191,6 +191,9 @@ pub struct Conversation {
     pub id: Id,
     /// 关联的角色卡 ID
     pub character_id: Option<String>,
+    /// 关联的 Campaign ID（一 Campaign 一对话模型：每个对话归属一个 Campaign）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<Id>,
     /// 消息列表（按时间顺序，但可通过 parent_id 支持分支）
     pub nodes: Vec<MessageNode>,
     pub created_at: DateTime<Utc>,
@@ -198,11 +201,12 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    pub fn new(character_id: Option<String>) -> Self {
+    pub fn new(character_id: Option<String>, campaign_id: Option<Id>) -> Self {
         let now = Utc::now();
         Self {
             id: Id::new(),
             character_id,
+            campaign_id,
             nodes: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -383,6 +387,7 @@ mod tests {
         Conversation {
             id: Id::from_str("c1"),
             character_id: Some("char1".into()),
+            campaign_id: None,
             nodes,
             created_at: Utc::now(),
             updated_at: Utc::now(),

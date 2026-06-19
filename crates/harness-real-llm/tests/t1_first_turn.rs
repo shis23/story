@@ -75,7 +75,7 @@ async fn t1_first_turn_campaign_writing() {
     eprintln!("Campaign 已激活: {campaign_id}");
 
     // 4. 组装 campaign-mode 上下文
-    let conversation_id = env.conv_store.create(None).id;
+    let conversation_id = env.conv_store.create(None, None).id;
     let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx = env.fill_campaign_context(ctx);
     assert!(
@@ -185,7 +185,7 @@ fn harness_seam_smoke_with_mock() {
     let campaign_id = env.create_campaign(&card, "smoke-campaign");
     assert_eq!(env.active_campaign_id(), Some(campaign_id.clone()));
 
-    let conv_id = env.conv_store.create(None).id;
+    let conv_id = env.conv_store.create(None, None).id;
     let ctx = WritingContext::legacy(vec![], None, conv_id);
     let ctx = env.fill_campaign_context(ctx);
     assert_eq!(ctx.campaign_id, Some(campaign_id));

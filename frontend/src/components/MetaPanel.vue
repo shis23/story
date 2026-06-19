@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, nextTick, computed } from 'vue'
+import BaseOverlay from './base/BaseOverlay.vue'
 import {
   metaStartConversation, metaChat, metaListPendingPatches,
   metaAcceptPatch, metaDismissPatch,
@@ -351,15 +352,7 @@ function formatDiffValue(val) {
 
 <template>
   <!-- 弹层外壳 -->
-  <div class="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center" @click.self="emit('close')">
-    <div class="bg-bg w-full max-w-2xl max-h-[90vh] overflow-hidden rounded-t-2xl sm:rounded-2xl border border-line flex flex-col">
-
-      <!-- 顶栏 -->
-      <div class="sticky top-0 z-10 bg-bg border-b border-line px-4 py-3 flex items-center justify-between shrink-0">
-        <button @click="emit('close')" class="text-ink-soft hover:text-ink text-sm">← 返回</button>
-        <span class="font-medium text-ink text-sm">🔧 Meta 配置助手</span>
-        <div class="w-12"></div>
-      </div>
+  <BaseOverlay :model-value="true" title="🔧 Meta 配置助手" size="lg" position="left" :body-scroll="false" @close="emit('close')">
 
       <!-- 工具栏（快速操作） -->
       <div class="border-b border-line px-4 py-2 flex items-center gap-2 shrink-0 overflow-x-auto bg-surface/50">
@@ -368,7 +361,7 @@ function formatDiffValue(val) {
         <!-- MVU 分析下拉 -->
         <div class="relative shrink-0">
           <details class="group">
-            <summary class="cursor-pointer px-2.5 py-1 rounded-full text-xs bg-accent-soft text-accent list-none">
+            <summary class="cursor-pointer min-h-[36px] px-3 rounded-full text-xs bg-accent-soft text-accent list-none flex items-center">
               📊 分析状态栏 (MVU)
             </summary>
             <div class="absolute top-full left-0 mt-1 bg-bg border border-line rounded-lg shadow-lg p-2 min-w-[200px] max-h-60 overflow-y-auto z-20">
@@ -377,7 +370,7 @@ function formatDiffValue(val) {
                 v-for="c in characters" :key="c.id"
                 @click="handleAnalyzeMvu(c.id)"
                 :disabled="analyzingCardId === c.id"
-                class="w-full text-left px-2 py-1.5 rounded text-xs hover:bg-surface disabled:opacity-50 truncate"
+                class="w-full text-left min-h-[36px] px-2 rounded text-xs hover:bg-surface disabled:opacity-50 truncate"
               >
                 {{ analyzingCardId === c.id ? '⏳ ' : '' }}{{ c.name }}
               </button>
@@ -390,14 +383,14 @@ function formatDiffValue(val) {
           {{ pendingPatches.length }} 个 Patch 待采纳
         </span>
 
-        <span v-if="error" class="text-xs text-error shrink-0 ml-auto">{{ error }}</span>
+        <span v-if="error" class="text-xs text-err shrink-0 ml-auto">{{ error }}</span>
       </div>
 
       <!-- 主体：左右分栏 -->
-      <div class="flex-1 flex overflow-hidden">
+      <div class="flex-1 flex min-h-0">
 
         <!-- 左：聊天区 -->
-        <div class="flex-1 flex flex-col overflow-hidden">
+        <div class="flex-1 flex flex-col min-h-0">
           <!-- 消息流 -->
           <div ref="messagesEl" class="flex-1 overflow-y-auto p-4 space-y-3">
             <div v-if="messages.length === 0" class="text-center text-ink-soft text-sm py-8">
@@ -464,13 +457,13 @@ function formatDiffValue(val) {
                 v-model="userInput"
                 @keyup.enter="handleSend"
                 placeholder="问 Meta 助手…（如：看看世界书有没有冲突）"
-                class="flex-1 px-3 py-2 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent"
+                class="flex-1 min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent"
                 :disabled="loading"
               />
               <button
                 @click="handleSend"
                 :disabled="loading || !userInput.trim()"
-                class="px-4 py-2 rounded-lg text-sm font-medium bg-accent text-white disabled:opacity-50"
+                class="min-h-[44px] px-4 rounded-lg text-sm font-medium bg-accent text-white disabled:opacity-50 transition-colors"
               >发送</button>
             </div>
           </div>
@@ -497,11 +490,11 @@ function formatDiffValue(val) {
               <div class="flex gap-1 mt-2">
                 <button
                   @click="handleAcceptPatch(patch.id)"
-                  class="flex-1 py-1 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20"
+                  class="flex-1 min-h-[36px] rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 transition-colors"
                 >采纳</button>
                 <button
                   @click="handleDismissPatch(patch.id)"
-                  class="flex-1 py-1 rounded text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20"
+                  class="flex-1 min-h-[36px] rounded text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20 transition-colors"
                 >忽略</button>
               </div>
             </div>
@@ -523,7 +516,7 @@ function formatDiffValue(val) {
               <button
                 @click="handlePreviewMvuApply(m.source_character_id, m.character_name)"
                 :disabled="applyPreviewLoading"
-                class="mt-1.5 w-full py-1 rounded text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40"
+                class="mt-1.5 w-full min-h-[36px] rounded text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 transition-colors"
               >{{ applyPreviewLoading && applyPreviewSource?.id === m.source_character_id ? '加载中…' : '应用 Schema' }}</button>
             </div>
           </div>
@@ -534,7 +527,7 @@ function formatDiffValue(val) {
             <button
               @click="handleHealthCheck"
               :disabled="healthLoading || !activeCampaign"
-              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+              class="w-full min-h-[36px] rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2 transition-colors"
             >
               {{ healthLoading ? '检查中…' : '运行体检' }}
             </button>
@@ -546,14 +539,14 @@ function formatDiffValue(val) {
                 v-for="(issue, i) in healthIssues" :key="i"
                 class="rounded-lg border p-2 text-[10px]"
                 :class="issue.severity === 'error'
-                  ? 'border-error/30 bg-error/5'
+                  ? 'border-err/30 bg-err/5'
                   : 'border-warn/30 bg-warn/5'"
               >
                 <div class="flex items-center gap-1 mb-0.5">
                   <span
                     class="px-1.5 py-0.5 rounded-full text-[9px] font-medium"
                     :class="issue.severity === 'error'
-                      ? 'bg-error/15 text-error'
+                      ? 'bg-err/15 text-err'
                       : 'bg-warn/15 text-warn'"
                   >{{ issue.severity === 'error' ? 'Error' : 'Warning' }}</span>
                   <span class="text-ink-soft">{{ issue.category }}</span>
@@ -571,7 +564,7 @@ function formatDiffValue(val) {
               v-if="healthRan && healthIssues.length > 0"
               @click="handleProposeRepairs"
               :disabled="patchesLoading || !activeCampaign"
-              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+              class="w-full min-h-[36px] rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2 transition-colors"
             >
               {{ patchesLoading ? '生成中…' : '生成修复方案' }}
             </button>
@@ -609,7 +602,7 @@ function formatDiffValue(val) {
                     <div class="flex gap-1 items-start">
                       <div class="flex-1 min-w-0">
                         <div class="text-[9px] text-ink-soft mb-0.5">Before</div>
-                        <pre class="text-[9px] overflow-x-auto text-error/70 whitespace-pre-wrap break-all">{{ formatDiffValue(d.before) }}</pre>
+                        <pre class="text-[9px] overflow-x-auto text-err/70 whitespace-pre-wrap break-all">{{ formatDiffValue(d.before) }}</pre>
                       </div>
                       <div class="text-ink-soft shrink-0 px-0.5">→</div>
                       <div class="flex-1 min-w-0">
@@ -624,11 +617,11 @@ function formatDiffValue(val) {
                   <button
                     @click="handleAcceptTypedPatch(patch.id)"
                     :disabled="patch._stale"
-                    class="flex-1 py-1 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                    class="flex-1 min-h-[36px] rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   >接受</button>
                   <button
                     @click="handleDismissTypedPatch(patch.id)"
-                    class="flex-1 py-1 rounded text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20"
+                    class="flex-1 min-h-[36px] rounded text-[10px] font-medium bg-ink-soft/10 text-ink-soft hover:bg-ink-soft/20 transition-colors"
                   >忽略</button>
                 </div>
               </div>
@@ -641,7 +634,7 @@ function formatDiffValue(val) {
             <button
               @click="handleExplainGeneration"
               :disabled="explainLoading"
-              class="w-full py-1.5 rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2"
+              class="w-full min-h-[36px] rounded text-xs font-medium bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-40 mb-2 transition-colors"
             >
               {{ explainLoading ? '查询中…' : '解释上一条生成' }}
             </button>
@@ -676,18 +669,15 @@ function formatDiffValue(val) {
       </div>
 
       <!-- MVU 分析详情浮层 -->
-      <div
+      <BaseOverlay
         v-if="activeMvuDetail"
-        class="absolute inset-0 z-30 bg-black/40 flex items-center justify-center p-4"
-        @click.self="activeMvuDetail = null"
+        :model-value="true"
+        :title="activeMvuDetail.character_name + ' · MVU 分析结果'"
+        size="sm"
+        position="center"
+        @close="activeMvuDetail = null"
       >
-        <div class="bg-bg rounded-2xl border border-line max-w-md w-full max-h-[80vh] overflow-y-auto p-4">
-          <div class="flex items-center justify-between mb-3">
-            <div class="font-medium text-ink text-sm">{{ activeMvuDetail.character_name }} · MVU 分析结果</div>
-            <button @click="activeMvuDetail = null" class="text-ink-soft text-sm">✕</button>
-          </div>
-
-          <div class="space-y-2 text-xs">
+        <div class="p-4 space-y-2 text-xs">
             <!-- 路由 + 置信度 -->
             <div class="flex gap-2">
               <span class="px-2 py-0.5 rounded-full" :class="activeMvuDetail.translation.routing.kind === 'hybrid' ? 'bg-warn/10 text-warn' : 'bg-ok/10 text-ok'">
@@ -753,25 +743,21 @@ function formatDiffValue(val) {
                 class="text-ink-soft text-[10px]"
               >• {{ n }}</div>
             </div>
-          </div>
         </div>
-      </div>
+      </BaseOverlay>
 
       <!-- MVU Apply 预览浮层 -->
-      <div
+      <BaseOverlay
         v-if="applyPreviewSource"
-        class="absolute inset-0 z-30 bg-black/40 flex items-center justify-center p-4"
-        @click.self="closeApplyPreview"
+        :model-value="true"
+        :title="'📦 ' + applyPreviewSource.name + ' · Schema 合并预览'"
+        size="md"
+        position="center"
+        @close="closeApplyPreview"
       >
-        <div class="bg-bg rounded-2xl border border-line max-w-lg w-full max-h-[85vh] overflow-y-auto p-4">
-          <div class="flex items-center justify-between mb-3">
-            <div class="font-medium text-ink text-sm">📦 {{ applyPreviewSource.name }} · Schema 合并预览</div>
-            <button @click="closeApplyPreview" class="text-ink-soft text-sm">✕</button>
-          </div>
-
-          <div v-if="applyPreviewLoading" class="text-center text-ink-soft text-sm py-6">加载预览中…</div>
-          <div v-else-if="applyPreviews.length === 0" class="text-center text-ink-soft text-sm py-6">无可用 definition</div>
-          <div v-else class="space-y-3">
+          <div v-if="applyPreviewLoading" class="p-6 text-center text-ink-soft text-sm">加载预览中…</div>
+          <div v-else-if="applyPreviews.length === 0" class="p-6 text-center text-ink-soft text-sm">无可用 definition</div>
+          <div v-else class="p-4 space-y-3">
             <div
               v-for="p in applyPreviews" :key="p.definition_id"
               class="bg-surface rounded-lg border border-line p-3 text-xs"
@@ -813,14 +799,12 @@ function formatDiffValue(val) {
                 <button
                   @click="handleApplyMvuSchema(p.definition_id)"
                   :disabled="!p.has_changes || applyingDefId === p.definition_id"
-                  class="px-3 py-1 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                  class="min-h-[36px] px-3 rounded text-[10px] font-medium bg-ok/10 text-ok hover:bg-ok/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >{{ applyingDefId === p.definition_id ? '应用中…' : '应用' }}</button>
               </div>
             </div>
           </div>
-        </div>
-      </div>
+      </BaseOverlay>
 
-    </div>
-  </div>
+  </BaseOverlay>
 </template>

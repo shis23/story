@@ -1,7 +1,7 @@
 # 计划：主线完成后的收口与发布准备
 
 > 状态：待执行
-> 前置：`PLAN-CAMPAIGN-MAINLINE.md`、`PLAN-META-AGENT.md`、`PLAN-FRONTEND-WORKBENCH.md`、`PLAN-PLUGIN-MVU.md`、`PLAN-ANDROID.md` 的核心阶段已完成。
+> 前置：`docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`（已归档）、`docs/PLAN-PLUGIN-MVU.md`、`docs/PLAN-ANDROID.md` 的核心阶段已完成。
 > 目标读者：完成前序计划后，负责把项目从“功能打通”推进到“可验证、可发布、可继续迭代”的执行者。
 
 ## 目标
