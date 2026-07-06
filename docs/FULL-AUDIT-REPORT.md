@@ -145,7 +145,7 @@
 
 | ID | 文件 | 描述 |
 |----|------|------|
-| M-001 | `runtime.rs:160` | 畸形 tool-call 参数静默替换为 `{}`，不通知 LLM |
+| M-001 | `runtime.rs:160` | ✅ 已修复：畸形 tool-call 参数不会执行真实工具，runtime 直接把 `Invalid JSON arguments` 作为 tool result 反馈给 LLM |
 | M-002 | `character.rs:156` | `temporary_with_overrides` 无空名验证 |
 | M-003 | `conversation.rs:87` | `active_variant` 无越界验证，腐败数据导致静默失败 |
 | M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
@@ -231,7 +231,7 @@
 
 8. **H-006/H-007**: ✅ BaseOverlay/BaseDropdown ESC 监听器生命周期已统一并补测试（2026-07-07）
 9. **H-001**: Store persist 返回 Result
-10. **M-001**: tool-call 参数解析错误反馈给 LLM
+10. **M-001**: ✅ tool-call 参数解析错误已反馈给 LLM，且不再 dispatch 真实工具（2026-07-07）
 11. **M-005**: ✅ `postprocess_variable_keys()` 已合并实际 runtime schema/value keys（2026-07-07）
 12. **M-014**: Tab 组件添加 campaignId watch
 13. **H-009**: LLM 重试逻辑（指数退避）

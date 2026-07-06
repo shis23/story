@@ -12,12 +12,39 @@ use storyforge_domain::agent::{
 };
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{
-    ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolSpec,
+    ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolCall, ToolSpec,
 };
 use storyforge_domain::message_layout::MessageLayout;
 use storyforge_infra_llm::LlmClient;
 
 use crate::tools::{ToolContext, ToolRegistry};
+
+async fn execute_tool_call(
+    tc: &ToolCall,
+    tool_registry: &ToolRegistry,
+    tool_ctx: Arc<ToolContext>,
+) -> String {
+    let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
+            return serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
+                .to_string();
+        }
+    };
+
+    let result = tool_registry
+        .dispatch(&tc.function.name, args, tool_ctx)
+        .await;
+
+    match result {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+        Err(e) => {
+            warn!(target: "app-agent", "工具 {} 执行失败: {e}", tc.function.name);
+            serde_json::json!({ "error": e.to_string() }).to_string()
+        }
+    }
+}
 
 /// Agent 运行时配置
 #[derive(Debug, Clone)]
@@ -156,26 +183,7 @@ impl AgentRuntime {
 
             // 执行每个工具调用
             for tc in &resp.tool_calls {
-                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
-                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
-                    }
-                };
-
-                let result = tool_registry
-                    .dispatch(&tc.function.name, args, self.tool_ctx.clone())
-                    .await;
-
-                let result_str = match result {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
-                    Err(e) => {
-                        warn!(target: "app-agent", "工具 {} 执行失败: {e}", tc.function.name);
-                        serde_json::json!({ "error": e.to_string() }).to_string()
-                    }
-                };
-
+                let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
@@ -312,23 +320,7 @@ impl AgentRuntime {
             });
 
             for tc in &resp.tool_calls {
-                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
-                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
-                    }
-                };
-                let result = tool_registry
-                    .dispatch(&tc.function.name, args, self.tool_ctx.clone())
-                    .await;
-                let result_str = match result {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
-                    Err(e) => {
-                        warn!(target: "app-agent", "工具 {} 执行失败: {e}", tc.function.name);
-                        serde_json::json!({ "error": e.to_string() }).to_string()
-                    }
-                };
+                let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
@@ -469,23 +461,7 @@ impl AgentRuntime {
             });
 
             for tc in &resp.tool_calls {
-                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
-                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
-                    }
-                };
-                let result = tool_registry
-                    .dispatch(&tc.function.name, args, self.tool_ctx.clone())
-                    .await;
-                let result_str = match result {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
-                    Err(e) => {
-                        warn!(target: "app-agent", "工具 {} 执行失败: {e}", tc.function.name);
-                        serde_json::json!({ "error": e.to_string() }).to_string()
-                    }
-                };
+                let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
@@ -889,8 +865,63 @@ pub fn inject_hint_into_editor(user_message: &str, hint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use storyforge_domain::agent::LoreEntryLight;
+    use storyforge_domain::llm::{ChatRequest, ChatResponse, ChatRole, LlmError, StreamChunk};
     use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
+
+    struct SequentialLlmClient {
+        responses: Mutex<VecDeque<ChatResponse>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl SequentialLlmClient {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(vec![]),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn next_response(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.requests.lock().unwrap().push(req.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| LlmError::Internal("no scripted response".into()))
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for SequentialLlmClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.next_response(req)
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.next_response(req)?;
+            if !resp.content.is_empty() {
+                let _ = tx.send(StreamChunk {
+                    delta_content: Some(resp.content.clone()),
+                    delta_tool_calls: None,
+                    finish_reason: resp.finish_reason.clone(),
+                });
+            }
+            Ok(resp)
+        }
+    }
 
     /// 验证全局取消会中止所有子 Agent
     #[tokio::test]
@@ -1207,6 +1238,98 @@ mod tests {
 
         // 流式 progress 应有 token 推送（mock 的 stream=false 也会走 forward_fut）
         drop(prog_rx); // 仅证明 channel 正常（mock 非流式时 progress 可能为空，不强制断言）
+    }
+
+    /// M-001：畸形 tool-call 参数应反馈给 LLM，不应带着伪造参数执行真实工具。
+    #[tokio::test]
+    async fn test_malformed_tool_arguments_return_tool_error_without_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use storyforge_domain::llm::{FunctionCall, ToolCall, ToolSpec, Usage};
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "bad-args".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "probe_tool".into(),
+                        arguments: r#"{"name":"Lin""#.into(),
+                    },
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                }),
+            },
+            ChatResponse {
+                content: "fixed".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                }),
+            },
+        ]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let runtime = AgentRuntime::new(llm.clone(), tool_ctx);
+
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        let dispatch_count_for_tool = dispatch_count.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            ToolSpec::function("probe_tool", "probe", serde_json::json!({})),
+            move |_args, _ctx| {
+                let dispatch_count = dispatch_count_for_tool.clone();
+                Box::pin(async move {
+                    dispatch_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"ok": true}))
+                })
+            },
+        );
+
+        let config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: "system".into(),
+            max_tool_rounds: 2,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (_tx, cancel) = watch::channel(false);
+        let resp = runtime
+            .run_tool_loop(&config, "user".into(), &registry, cancel)
+            .await
+            .expect("second round should recover");
+
+        assert_eq!(resp.content, "fixed");
+        assert_eq!(
+            dispatch_count.load(Ordering::SeqCst),
+            0,
+            "malformed arguments must not dispatch the real tool"
+        );
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        let tool_error = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ChatRole::Tool)
+            .expect("bad arguments should be sent back as a tool result");
+        assert_eq!(tool_error.tool_call_id.as_deref(), Some("bad-args"));
+        assert!(tool_error.content.contains("Invalid JSON arguments"));
     }
 
     // ── 阶段 4：Campaign 模式 spawn_subagents 测试 ──
