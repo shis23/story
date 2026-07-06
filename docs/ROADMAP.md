@@ -57,8 +57,8 @@
 - ✅ I1 对抗性探针实跑通过（`deepseek-v4-flash`）：对抗 prompt 成功诱导 LLM 尝试越权查询 `get_character("Chen")`，被 P0 拦下返回 NotFound，成文拿不出真秘密——隔离在 LLM 行为层端到端生效。
 - ✅ P3：知识写回门禁按 `KnowledgeSource` 分流——`Witnessed`/`Inferred` 受在场约束，`ToldByOther`/`Backstory` 放行（跨在场告知/开局知识）。空集不再 hack 式全放行。
 - ✅ P4：同名 instance 时 name 匹配路失效逼 id，消除同名写串。
-- ✅ 知识传播引擎方向 1+3（2026-06-19）：显式广播（`BroadcastTarget::All/Group` 分发到多角色）+ 定向告知强化（postprocess 输出告知目标，读侧带告知者名字）。广播/告知不再依赖空集 hack。
-- ⏳ 知识传播引擎方向 2/4/5（身份组广播/传话链/秘密封口）待立项，见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
+- ✅ 知识传播引擎方向 1+2+3（2026-06-19）：显式全体广播（`BroadcastTarget::All`）、身份组广播（`BroadcastTarget::Group`）和定向告知强化（postprocess 输出告知目标，读侧带告知者名字）。广播/告知不再依赖空集 hack。
+- ⏳ 知识传播引擎方向 4/5（传话链/秘密封口）待立项，见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
 
 详细计划见：
 

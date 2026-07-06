@@ -135,6 +135,9 @@
    - 写作中断。
    - postprocess 失败。
    - app 重启后恢复 active Campaign。
+6. 技术债闸门：
+   - 对 `CampaignStore` 做一次长任务/连续写回压测，记录单 Mutex + JSON I/O 的锁持有时间和 UI 可感知卡顿。
+   - 若确认为发布阻塞，优先拆“内存态 + 后台批量 flush / 原子写”边界；不要在没有压测证据时整层重写。
 
 验收：
 
@@ -150,7 +153,8 @@
 
 - `crates/app-pipeline/src/lib.rs`
 - `crates/app-agent/src/runtime.rs`
-- `frontend/src/components/PipelinePanel.vue`
+- `frontend/src/components/StreamingMessage.vue`
+- `frontend/src/components/ChatMessage.vue`
 - `frontend/src/App.vue`
 - `docs/RELEASE-CHECKLIST.md`
 
@@ -167,7 +171,8 @@
    - 易变内容留在 tail。
 3. 长文本 UI 检查：
    - 流式输出不卡顿。
-   - PipelinePanel 不因 trace 过长卡死。
+   - `StreamingMessage.vue` 不因 trace/流式内容过长卡死。
+   - `ChatMessage.vue` provenance 和 reroll 控件在长 trace 下仍可用。
    - 移动端滚动正常。
 4. 成本保护：
    - Agent 最大轮次有上限。
@@ -178,6 +183,37 @@
 
 - 连续长会话不会明显退化到不可用。
 - 有一张记录表说明典型场景的延迟、调用次数和风险。
+
+## 阶段 4.5：架构技术债闸门
+
+目标：把已知分层债和存储债纳入发布前判断，避免它们在 Android/长任务场景里变成隐性阻塞。
+
+改动文件：
+
+- `crates/infra-plugin-host/src/mvu_runtime.rs`
+- `crates/infra-plugin-host/Cargo.toml`
+- `crates/tauri-app/src/lib.rs`
+- `crates/tauri-app/src/campaign_store.rs`
+- `docs/ARCHITECTURE-AUDIT.md`
+- `docs/RELEASE-CHECKLIST.md`
+
+任务：
+
+1. `infra-plugin-host` 分层债：
+   - 当前 `WebViewMvuRuntime` 直接持有 `tauri::AppHandle` 并使用 Tauri event，导致 infra crate 依赖 Tauri。
+   - 拆分目标是让 `infra-plugin-host` 保留 `MvuRuntime` trait、DTO 和纯错误类型，把 Tauri event 发送/等待逻辑放到 Tauri 层 adapter。
+   - 建议先引入小接口（如 `MvuEventPort` / `MvuRuntimePort`）承载 `emit`、pending request 和 ack，再移动实现；不要让 `app-pipeline` 或 `app-agent` 直接依赖 `tauri-app`。
+2. `CampaignStore` 存储债：
+   - 当前适合桌面开发和小数据量，但单 Mutex + JSON I/O 在 Android 和长会话里可能放大卡顿。
+   - 发布前先测锁持有时间、连续 postprocess 写回、导入大卡和 app 重启恢复；只有确认阻塞后再做后台 flush / 分文件索引 / schema 迁移。
+3. 文档同步：
+   - 每次完成技术债切片后同步 `ARCHITECTURE-AUDIT.md`、`DATA_MODEL.md`、`PLAN-POST-MAINLINE.md` 和 README 的代码事实。
+
+验收：
+
+- 技术债是否阻塞发布有明确证据，而不是凭感觉。
+- `infra-plugin-host` 的 Tauri 依赖要么已拆掉，要么在 release checklist 中标为发布前风险。
+- `CampaignStore` 的性能风险有可复现实验记录和处理结论。
 
 ## 阶段 5：发布包和用户入口
 

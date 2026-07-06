@@ -13,12 +13,12 @@ StoryForge 的主线是 Campaign：
 - Director Agent 规划场景，Subagent 按角色并行表演，Editor Agent 合并成文，Postprocess 将成文写回 Campaign 状态。
 - Meta Agent 是诊断、解释和修复层，不是另一个普通聊天入口。
 
-当前代码已经具备多角色 Campaign 模型和后处理雏形，但写作流水线仍主要读取扁平 `Character`。后续开发应先完成 Campaign 主线统一，再扩展外围功能。
+当前代码已经具备多角色 Campaign 主线、信息隔离、临时角色落盘和后处理写回闭环；未开启 Campaign 时仍保留扁平 `Character` 兼容路径。后续开发应继续围绕 Campaign 运行态做 Android、验收和知识传播增强。
 
 ## 技术栈
 
 - Rust workspace，14 个 crate。
-- Tauri v2，提供本地应用壳、文件导入和 87 个命令。
+- Tauri v2，提供本地应用壳、文件导入和 110 个命令（按 `#[tauri::command]` 标注统计）。
 - Vue 3 + Vite + Tailwind v4 前端。
 - OpenAI-compatible LLM API。
 - 本地 JSON 存储。

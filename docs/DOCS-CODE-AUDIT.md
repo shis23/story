@@ -1,6 +1,6 @@
 # 文档与代码对齐审计
 
-> 状态：2026-06-18（含 Phase 4/5/6 阶段级核对）
+> 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量同步）
 > 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
 > 本次只审计和修正文档，不改业务代码。
 
@@ -21,8 +21,8 @@
 ### Workspace 和命令数量
 
 - `Cargo.toml` 当前 workspace members 为 14 个 crate。
-- `crates/tauri-app/src/lib.rs` 的 `tauri::generate_handler!` 当前注册 87 个 Tauri command。
-- README 中“Rust workspace，14 个 crate”和“87 个命令”与当前代码一致。
+- `crates/tauri-app/src/lib.rs` 当前存在 110 个 `#[tauri::command]` 标注的 Tauri command。
+- README 中“Rust workspace，14 个 crate”和“110 个命令”与当前代码一致。
 
 ### Campaign 写作主链路
 
@@ -37,7 +37,7 @@
 
 代码事实：
 
-- `frontend/src/App.vue::startWriting` 仍调用 `apiStartWriting(intent, activeChar.value?.id, ..., currentConversationId.value)`。
+- `frontend/src/App.vue::startWriting` 会先计算 `charIdForWriting = writingMode.value === 'campaign' ? null : activeChar.value?.id`，Campaign 模式不再把 active character id 传入写作入口，兼容模式才沿用扁平 `Character`。
 - `frontend/src/tauri-api.js::startWriting` 调用 Tauri command `start_writing`。
 - `crates/tauri-app/src/lib.rs::start_writing` 存在，并从 `snapshot_tool_ctx()` 构造写作上下文。
 - `crates/tauri-app/src/lib.rs::fill_campaign_context` 填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`，**阶段 2 已扩展**：开头先清空旧 runtime 防 stale，然后从 CampaignStore 加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。
@@ -148,7 +148,8 @@
 
 - `frontend/src/App.vue`
 - `frontend/src/components/CampaignPanel.vue`
-- `frontend/src/components/PipelinePanel.vue`
+- `frontend/src/components/StreamingMessage.vue`
+- `frontend/src/components/ChatMessage.vue`
 - `frontend/src/components/MetaPanel.vue`
 - `frontend/src/components/MvuStatusBar.vue`
 - `frontend/src/components/CharacterDetail.vue`
@@ -157,8 +158,9 @@
 代码事实：
 
 - `App.vue` 已有 `activeCampaign`，mounted 时调用 `getActiveCampaign()`。
-- 主写作入口仍传 `activeChar.value?.id`。
+- 主写作入口按 `writingMode` 区分 Campaign / legacy：Campaign 模式传 `null` characterId，legacy 模式传 `activeChar.value?.id`。
 - `CampaignPanel.vue` 已有 Campaign、instances、variables、knowledge、tasks、summaries 相关入口。
+- `StreamingMessage.vue` 承接写作过程流式渲染；`ChatMessage.vue` 负责 provenance 展示与基于 stable id 的 reroll 入口。
 - `MvuStatusBar.vue` 已存在，并在 `CharacterDetail.vue` 中使用。
 
 因此 `PLAN-FRONTEND-WORKBENCH.md`（已归档）的主要判断成立。
@@ -194,7 +196,7 @@
 | 1 首屏聚焦 active campaign | AppHeader 显示 campaign 名/轮次/实例数，无 campaign 时给 CTA | 已实现 | `frontend/src/components/AppHeader.vue` 展示 campaign 名/轮次/实例数；无 campaign 时显示 CTA 按钮 |
 | 2 写作入口绑定 active campaign | 区分 campaign 写作 vs 旧 activeChar 路径 | 已实现 | `App.vue` 三态 writingMode（campaign/legacy/none）；Campaign 模式传 null characterId |
 | 3 CampaignPanel 拆工作台 tabs | 拆成独立 `Campaign*Tab.vue` | 已实现 | W5 拆为独立的 instances/knowledge/tasks/summaries tab 组件 |
-| 4 Pipeline trace 用 instance 展示名 | 保留 `instance_id`、显示名 + role_type、按 stable id reroll | 已实现 | `PipelinePanel.vue` 显示 subagent display name + instance_id; reroll 用稳定 id |
+| 4 Pipeline trace 用 instance 展示名 | 保留 `instance_id`、显示名 + role_type、按 stable id reroll | 已实现 | `StreamingMessage.vue` 承接过程流式展示；`ChatMessage.vue` provenance 使用 subagent display name / instance id，reroll 用稳定 id |
 | 5 MetaPanel Campaign health | 健康摘要、一键 context、patch diff、accept 刷新 tabs | 已实现 | W5 baseline + W9 补完 accept 后变量 tab 刷新 |
 | 6 移动端布局 | 响应式 sheet、固定输入、无溢出 | 已实现 | Pipeline 默认折叠、CharacterList 底部 sheet |
 
@@ -240,7 +242,7 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 
 1. **Phase 6 Android 打磨**——构建链验证、文件导入、长文本流式、移动端排障。Tauri 脚手架就绪，重点验证主流程在 Android 端可用。
 2. **Phase 7 收口/验收/发布准备**——端到端验收矩阵、回归测试固化、文档/发布准备。
-3. **知识传播引擎方向 2/4/5**（身份组广播/传话链/秘密封口）——待立项，见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
+3. **知识传播引擎方向 4/5**（传话链/秘密封口）——方向 1/2/3 已有 `BroadcastTarget::All/Group`、postprocess `broadcast` 解析和告知来源渲染；剩余待立项项见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
 
 ## 已修正文档问题
 

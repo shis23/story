@@ -1,6 +1,6 @@
 # 计划：知识传播引擎
 
-> 状态：草案（方向已定，细节待立项展开）
+> 状态：部分已实现（方向 1/2/3 已落地；方向 4/5 和更细可解释链路待立项）
 > 来源：P3 门禁重定位过程中，由用户场景质询推导出的完整设计问题。
 > 前置文档：`HARNESS-FINDINGS-2026-06-18.md` §P3、`INTENT.md` D30-D31/D39-D40
 > 归属：ROADMAP Phase 2（信息隔离）增强项
@@ -9,7 +9,7 @@
 
 P3（postprocess 写回门禁）原标为"空集逃生口收紧/保留"取舍。经用户场景质询（世界公告、身份组传播、写信）推翻"收紧"建议后发现：**门禁用"在场"一刀切所有知识来源是病根，空集逃生口只是症状补丁**。
 
-P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。但**身份组传播、传话链、秘密封口**是更大的功能，超 P3 范围，单独立本计划。
+P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。随后方向 1/2/3 已继续落地：显式广播、身份组广播和定向告知强化不再依赖空集 hack。**传话链、秘密封口和更细的“谁知道什么、从哪知道”的可解释链路**仍是更大的功能，继续保留在本计划里。
 
 ## 目标
 
@@ -23,50 +23,52 @@ P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3
 
 ## 现状摸底（已核实）
 
-**数据模型已有支撑**：
-- `KnowledgeSource` 四元分类（`domain/src/character_knowledge.rs:17`）：`Witnessed`/`ToldByOther`/`Inferred`/`Backstory`。`ToldByOther` 已记 `source_character_id`——**告知链可追溯**。
-- 角色身份字段已存在：`Character.group: Option<String>`、`CharacterDefinition.role_type`、`VariableField.group`。**身份组载体已就位**，只是知识传播层没用。
+**数据模型和写回链路已有支撑**：
+- `KnowledgeSource` 四元分类：`Witnessed`/`ToldByOther`/`Inferred`/`Backstory`。`ToldByOther` 已记 `source_character_id`——**告知来源可追溯**。
+- `BroadcastTarget::{All, Group(String)}` 已存在于 `crates/domain/src/character_knowledge.rs`，并由 postprocess DTO 的 `broadcast` 字段解析。
+- Tauri 写回层已在 `normalize_knowledge_update_for_postprocess` / `dispatch_broadcast` 中按 `BroadcastTarget::All` 或 `BroadcastTarget::Group` 分发知识。
+- 角色身份字段已存在：`CharacterDefinition.group: Option<String>`、`CharacterDefinition.role_type`、`VariableField.group`。身份组广播当前使用 `CharacterDefinition.group` 匹配 instance。
 - 变量层已有"全局/无归属"概念：postprocess prompt 明确"全局变量（无 instance_id）用于 story_clock/weather"。**世界级状态有家可归，世界级知识没有**——这是缺口。
 
-**门禁现状**（P3 修复后）：按来源分流，`ToldByOther`/`Backstory` 不受"在场"约束。
+**门禁现状**（P3 修复后）：按来源分流，`ToldByOther`/`Backstory` 不受"在场"约束；`broadcast` 非空时走显式分发，不再用空集表达广播。
 
 ## 场景清单（A-E）
 
 | ID | 场景 | 语义 | P3 分流后是否成立 | 本计划是否需补 |
 |---|---|---|---|---|
-| A | 世界公告/广播 | N 个角色都该知道，与在场无关 | ✅ 部分（空集 + ToldByOther 放行） | 补：显式广播语义，不靠空集 hack |
-| B | 身份组传播 | 所有守卫/贵族该知道 | ❌ | 补：按 `group` 广播写入 |
-| C | 定向告知/写信 | A 明确告诉不在场的 B | ✅（ToldByOther + source_character_id） | 补：postprocess 输出告知目标，门禁按目标放行 |
+| A | 世界公告/广播 | N 个角色都该知道，与在场无关 | ✅ 已实现 | 已补：`broadcast: "all"` → `BroadcastTarget::All` |
+| B | 身份组传播 | 所有守卫/贵族该知道 | ✅ 已实现 | 已补：`broadcast: "组名"` → `BroadcastTarget::Group`，按 `CharacterDefinition.group` 分发 |
+| C | 定向告知/写信 | A 明确告诉不在场的 B | ✅ 已实现 | 已补：postprocess 输出被告知者/告知者，读侧渲染来源名 |
 | D | 传话链 | A→B→C 跨轮传播 | 🟡 数据可追溯，无传播引擎 | 补：跨轮传播规则 |
 | E | 秘密封口 | 某事只有 A 知，禁止外传 | ❌ | 补：反向约束标记 |
 
-## 设计方向（草案，待立项细化）
+## 设计方向（当前状态 + 后续草案）
 
-### 方向 1：显式广播语义（场景 A）
+### 方向 1：显式广播语义（场景 A，已实现）
 
-放弃"空集 = 广播"的隐式约定。改为显式信号：
-- Director 在 `present_chars` 用哨兵 `"*"` 表示广播，或
-- postprocess 输出 `target: "broadcast"` 的知识更新。
+放弃"空集 = 广播"的隐式约定，改为 postprocess 输出 `broadcast: "all"`：
+- prompt 已明确 `broadcast: "all"` 表示广播给 Campaign 内所有角色。
+- `postprocess.rs` 将 `"all"` 解析为 `BroadcastTarget::All`。
+- 写回层分发给 Campaign 内所有 instance，并排除广播发起者自身。
 
-门禁逻辑：`"*" 在场或 target=broadcast → 全放行`；`present_chars 空 且无广播信号 → Witnessed/Inferred 拒绝`（真 bug）。
+仍需注意：全体广播当前会生成每个目标角色的 `ToldByOther` 知识，`source_character_id` 记录公告/广播发起者；若没有可解析发起者，则只保留知识本身。
 
-P3 分流已让 `ToldByOther`/`Backstory` 在空集时放行，方向 1 是把"广播"从隐式提升为显式，与 P3 互补。
+### 方向 2：身份组广播（场景 B，已实现）
 
-### 方向 2：身份组广播（场景 B）
+已通过 `BroadcastTarget::Group(String)` 落地：
+- postprocess 输出"所有守卫该知道 X"时填 `broadcast: "守卫"`。
+- `postprocess.rs` 将非空且非 `"all"` 的 `broadcast` 字符串解析为 `BroadcastTarget::Group(group)`。
+- 写入时按 `CharacterDefinition.group == group` 找出所有匹配 instance，各写一条 `ToldByOther`（source 记公告发起方）。
+- 门禁：`broadcast` 非空时按广播目标分发，不再查在场名单。
 
-扩展 `CharacterKnowledgeUpdate`，支持 `target_group: Option<String>`：
-- postprocess 输出"所有守卫该知道 X"时填 `target_group: Some("守卫")`。
-- 写入时按 `Character.group == target_group` 找出所有匹配 instance，各写一条 `ToldByOther`（source 记公告发起方）。
-- 门禁：`target_group` 非空时按组放行，不查在场名单。
+后续缺口：需要确认导入/角色识别阶段是否稳定填充 `CharacterDefinition.group`。若多数为 `None`，组广播能力存在但命中率会低。
 
-载体选 `Character.group`（最直接表达"这个角色属于哪伙"）。需确认：现有卡的 `group` 字段是否在用，还是多数为 None。若 None 居多，需在角色识别阶段补 group 推断。
+### 方向 3：定向告知强化（场景 C，已实现）
 
-### 方向 3：定向告知强化（场景 C）
-
-P3 分流后 `ToldByOther` 已能跨在场。本方向补 postprocess 输出端：
-- postprocess prompt 教会 LLM 输出"告知目标"（`target_character_id` 或 `target_name`），而非笼统的"某人知道了"。
-- 写入时若目标不在场，仍写（分流已放行），`source_character_id` 记告知发起方。
-- 读侧：子 Agent 注入时，`ToldByOther` 知识带"谁告诉的"上下文，便于 LLM 理解信息来源。
+P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输出端和读侧渲染：
+- postprocess prompt 明确 `character_id` 是被告知者，`source_character_id` 是告知者。
+- 写入时若目标不在场，`ToldByOther` 仍可写入，`source_character_id` 记告知发起方。
+- 读侧：`render_knowledge_for_injection` 会在有 name resolver 时渲染“被告知，来源：X”，便于 LLM 理解信息来源。
 
 ### 方向 4：传话链（场景 D，较大）
 
@@ -86,23 +88,23 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向补 postprocess 输出端�
 
 ## 落地优先级建议
 
-1. **方向 1 + 3**（显式广播 + 定向告知强化）：P3 分流的自然延伸，工作量小，覆盖场景 A/C，让现有数据模型充分发挥。建议与 P3 同期或紧随。
-2. **方向 2**（身份组广播）：中等，需扩 Update 结构 + 写入按组分发 + group 字段验证。覆盖场景 B。
-3. **方向 4**（传话链）：大，偏 LLM 行为，归 Phase 7 评测。
-4. **方向 5**（秘密封口）：风险高，最后做。
+1. **已完成：方向 1/2/3**（显式广播、身份组广播、定向告知强化）：现有代码已有 domain enum、postprocess prompt/schema/解析、Tauri 写回分发和读侧来源渲染。
+2. **下一步：可解释链路增强**：在 UI / debug / Meta 里更清楚展示“谁知道什么、从哪知道、哪轮知道、是否广播/组广播产生”。
+3. **方向 4**（传话链）：大，偏 LLM 行为，归 Phase 7 评测或单独 MVP。
+4. **方向 5**（秘密封口）：风险高，最后做；需要避免给用户虚假的安全感。
 
 ## 与 P3 的关系
 
 - P3（w3-p3p4）= 门禁按来源分流的**最小正确修复**，让广播/告知不再依赖空集 hack。是本计划的前置。
-- 本计划 = 在 P3 基础上补**显式广播语义 + 身份组 + 传话 + 封口**，把"传播"从隐式 hack 升级为显式机制。
-- P3 落地后，`b3_empty_present_chars_should_reject_when_tightened` 占位测试需重写为"按来源分流"断言，本计划的广播语义落地后再补"显式广播"测试。
+- 本计划 = 在 P3 基础上补**显式广播语义 + 身份组 + 传话 + 封口**，把"传播"从隐式 hack 升级为显式机制；其中前三项已落地，后两项仍待立项。
+- 显式广播测试已覆盖 domain serde、postprocess 解析和 Tauri 分发；后续测试重点转向传话链、秘密封口和解释链路。
 
 ## 开放问题（待立项时决策）
 
-1. `Character.group` 字段现状使用率？若多数 None，角色识别阶段是否补 group 推断？
-2. 广播哨兵用 `"*"` 还是新增 `present_chars: Option<Vec<String>>`（None=广播）？前者改动小，后者类型更安全。
-3. 传话链（方向4）是否纳入 MVP，还是明确推迟到 Phase 7？
-4. 秘密封口（方向5）是否值得做——LLM 约束可靠性存疑，可能给人虚假安全感。
+1. `CharacterDefinition.group` 字段现状填充率如何？若多数为 `None`，角色识别阶段是否补 group 推断？
+2. 传话链（方向 4）是否纳入 MVP，还是明确推迟到 Phase 7？
+3. 秘密封口（方向 5）是否值得做——LLM 约束可靠性存疑，可能给人虚假安全感。
+4. 可解释链路做到哪一层：仅 debug/Meta 可见，还是也进入正式 Campaign 知识 UI？
 
 ## 禁止改动
 

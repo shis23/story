@@ -13,7 +13,9 @@ use tracing::{info, warn};
 use storyforge_domain::Id;
 use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
-use storyforge_domain::character_knowledge::{BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource};
+use storyforge_domain::character_knowledge::{
+    BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource,
+};
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
@@ -394,6 +396,55 @@ mod tests {
             parse_source("inferred"),
             KnowledgeSource::Inferred
         ));
+    }
+
+    #[test]
+    fn test_parse_broadcast_all_from_json() {
+        let content = r#"{
+          "knowledge_updates": [
+            {
+              "character_id": "城主",
+              "knowledge_text": "城主宣告全城戒严",
+              "source": "witnessed",
+              "source_character_id": "城主",
+              "broadcast": "all"
+            }
+          ],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+
+        let resp = make_resp(content, vec![]);
+        let r = parse_postprocess_from_response(&resp);
+
+        assert_eq!(r.knowledge_updates.len(), 1);
+        assert_eq!(r.knowledge_updates[0].broadcast, Some(BroadcastTarget::All));
+    }
+
+    #[test]
+    fn test_parse_broadcast_group_from_json() {
+        let content = r#"{
+          "knowledge_updates": [
+            {
+              "character_id": "队长",
+              "knowledge_text": "所有守卫都收到戒严令",
+              "source": "told_by_other",
+              "source_character_id": "队长",
+              "broadcast": "守卫"
+            }
+          ],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+
+        let resp = make_resp(content, vec![]);
+        let r = parse_postprocess_from_response(&resp);
+
+        assert_eq!(r.knowledge_updates.len(), 1);
+        assert_eq!(
+            r.knowledge_updates[0].broadcast,
+            Some(BroadcastTarget::Group("守卫".to_string()))
+        );
     }
 
     #[tokio::test]
