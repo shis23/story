@@ -4959,32 +4959,74 @@ pub struct KnowledgeEntryDto {
     pub id: String,
     pub campaign_id: String,
     pub character_id: String,
+    pub character_name: Option<String>,
     pub knowledge_text: String,
     pub source: String,
     pub source_character_id: Option<String>,
+    pub source_character_name: Option<String>,
+    pub provenance_text: String,
     pub turn_number: u32,
     pub pinned: bool,
 }
 
-impl From<&storyforge_domain::character_knowledge::CharacterKnowledgeEntry> for KnowledgeEntryDto {
-    fn from(e: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry) -> Self {
-        use storyforge_domain::character_knowledge::KnowledgeSource;
-        let source = match e.source {
-            KnowledgeSource::Witnessed => "witnessed",
-            KnowledgeSource::ToldByOther => "told_by_other",
-            KnowledgeSource::Inferred => "inferred",
-            KnowledgeSource::Backstory => "backstory",
-        };
-        Self {
-            id: e.id.to_string(),
-            campaign_id: e.campaign_id.to_string(),
-            character_id: e.character_id.to_string(),
-            knowledge_text: e.knowledge_text.clone(),
-            source: source.into(),
-            source_character_id: e.source_character_id.as_ref().map(|i| i.to_string()),
-            turn_number: e.turn_number,
-            pinned: e.pinned,
+fn knowledge_source_code(source: &storyforge_domain::character_knowledge::KnowledgeSource) -> &str {
+    use storyforge_domain::character_knowledge::KnowledgeSource;
+    match source {
+        KnowledgeSource::Witnessed => "witnessed",
+        KnowledgeSource::ToldByOther => "told_by_other",
+        KnowledgeSource::Inferred => "inferred",
+        KnowledgeSource::Backstory => "backstory",
+    }
+}
+
+fn knowledge_provenance_text(
+    entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    instance_names: &std::collections::HashMap<Id, String>,
+) -> String {
+    use storyforge_domain::character_knowledge::KnowledgeSource;
+    let target = instance_names
+        .get(&entry.character_id)
+        .cloned()
+        .unwrap_or_else(|| entry.character_id.to_string());
+    match entry.source {
+        KnowledgeSource::Witnessed => format!("{target} 亲眼所见"),
+        KnowledgeSource::ToldByOther => {
+            let source = entry
+                .source_character_id
+                .as_ref()
+                .and_then(|id| instance_names.get(id))
+                .cloned()
+                .or_else(|| entry.source_character_id.as_ref().map(|id| id.to_string()));
+            match source {
+                Some(source) => format!("{target} 被 {source} 告知"),
+                None => format!("{target} 被告知"),
+            }
         }
+        KnowledgeSource::Inferred => format!("{target} 自行推断"),
+        KnowledgeSource::Backstory => format!("{target} 的背景知识"),
+    }
+}
+
+fn knowledge_entry_to_dto(
+    entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    instance_names: &std::collections::HashMap<Id, String>,
+) -> KnowledgeEntryDto {
+    KnowledgeEntryDto {
+        id: entry.id.to_string(),
+        campaign_id: entry.campaign_id.to_string(),
+        character_id: entry.character_id.to_string(),
+        character_name: instance_names.get(&entry.character_id).cloned(),
+        knowledge_text: entry.knowledge_text.clone(),
+        source: knowledge_source_code(&entry.source).into(),
+        source_character_id: entry.source_character_id.as_ref().map(|i| i.to_string()),
+        source_character_name: entry
+            .source_character_id
+            .as_ref()
+            .and_then(|id| instance_names.get(id))
+            .cloned(),
+        provenance_text: knowledge_provenance_text(entry, instance_names),
+        turn_number: entry.turn_number,
+        pinned: entry.pinned,
     }
 }
 
@@ -5003,7 +5045,15 @@ fn list_character_knowledge(
     } else {
         store.list_knowledge(&camp)
     };
-    entries.iter().map(KnowledgeEntryDto::from).collect()
+    let instance_names: std::collections::HashMap<Id, String> = store
+        .list_instances(&camp)
+        .into_iter()
+        .map(|inst| (inst.id, inst.name))
+        .collect();
+    entries
+        .iter()
+        .map(|entry| knowledge_entry_to_dto(entry, &instance_names))
+        .collect()
 }
 
 /// 任务 DTO（前端展示用）
@@ -6243,6 +6293,30 @@ mod tests {
         assert_eq!(entries[0].source, KnowledgeSource::Witnessed);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_knowledge_entry_dto_resolves_provenance_names() {
+        let campaign_id = Id::from_str("camp");
+        let lin_id = Id::from_str("inst-lin");
+        let chen_id = Id::from_str("inst-chen");
+        let entry = storyforge_domain::character_knowledge::CharacterKnowledgeEntry::told_by(
+            campaign_id,
+            lin_id.clone(),
+            "地下室有尸体",
+            chen_id.clone(),
+            3,
+        );
+        let names = std::collections::HashMap::from([
+            (lin_id, "林医生".to_string()),
+            (chen_id, "陈警官".to_string()),
+        ]);
+
+        let dto = knowledge_entry_to_dto(&entry, &names);
+
+        assert_eq!(dto.character_name.as_deref(), Some("林医生"));
+        assert_eq!(dto.source_character_name.as_deref(), Some("陈警官"));
+        assert_eq!(dto.provenance_text, "林医生 被 陈警官 告知");
     }
 
     #[test]

@@ -67,15 +67,27 @@ function knowledgeSourceText(source) {
   return map[source] || source
 }
 
+function shortId(id) {
+  return id ? id.slice(0, 8) : ''
+}
+
+function instanceLabel(k) {
+  return k.character_name || (k.character_id ? `实例 ${shortId(k.character_id)}` : '未知角色')
+}
+
+function sourceLabel(k) {
+  return k.source_character_name || (k.source_character_id ? `实例 ${shortId(k.source_character_id)}` : '')
+}
+
 // ─── 实例过滤选项：从已有知识的 character_id 去重，避免要求用户手输 ID ───
 const instanceOptions = computed(() => {
-  const seen = new Map() // id -> 显示名（这里只有 id，截断显示）
+  const seen = new Map()
   for (const k of knowledge.value) {
     if (k.character_id && !seen.has(k.character_id)) {
-      seen.set(k.character_id, k.character_id.slice(0, 8))
+      seen.set(k.character_id, k.character_name || shortId(k.character_id))
     }
   }
-  return [{ value: '', label: '全部实例' }, ...[...seen.entries()].map(([value, label]) => ({ value, label: '实例 ' + label }))]
+  return [{ value: '', label: '全部实例' }, ...[...seen.entries()].map(([value, label]) => ({ value, label }))]
 })
 
 // ─── 暴露 refresh 给父组件 ───
@@ -113,9 +125,13 @@ defineExpose({ refresh: load })
         class="bg-surface rounded-xl border border-line px-3 py-2 mb-1.5"
       >
         <div class="text-xs text-ink">{{ k.knowledge_text }}</div>
-        <div class="flex items-center gap-2 mt-1">
+        <div class="text-[10px] text-ink-soft mt-1">
+          {{ k.provenance_text || instanceLabel(k) }}
+        </div>
+        <div class="flex items-center gap-2 mt-1 flex-wrap">
           <span v-if="k.turn_number" class="text-[10px] text-ink-soft">轮次 {{ k.turn_number }}</span>
-          <span v-if="k.character_id" class="text-[10px] text-ink-soft">实例 {{ k.character_id.slice(0, 8) }}</span>
+          <span v-if="k.character_id" class="text-[10px] text-ink-soft">知道者 {{ instanceLabel(k) }}</span>
+          <span v-if="sourceLabel(k)" class="text-[10px] text-ink-soft">来源 {{ sourceLabel(k) }}</span>
           <span v-if="k.pinned" class="text-[10px] text-accent">📌 已固定</span>
         </div>
       </div>

@@ -1,6 +1,6 @@
 # 计划：知识传播引擎
 
-> 状态：部分已实现（方向 1/2/3 已落地；方向 4/5 和更细可解释链路待立项）
+> 状态：部分已实现（方向 1/2/3 + UI 可解释链路已落地；方向 4/5 待立项）
 > 来源：P3 门禁重定位过程中，由用户场景质询推导出的完整设计问题。
 > 前置文档：`HARNESS-FINDINGS-2026-06-18.md` §P3、`INTENT.md` D30-D31/D39-D40
 > 归属：ROADMAP Phase 2（信息隔离）增强项
@@ -9,7 +9,7 @@
 
 P3（postprocess 写回门禁）原标为"空集逃生口收紧/保留"取舍。经用户场景质询（世界公告、身份组传播、写信）推翻"收紧"建议后发现：**门禁用"在场"一刀切所有知识来源是病根，空集逃生口只是症状补丁**。
 
-P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。随后方向 1/2/3 已继续落地：显式广播、身份组广播和定向告知强化不再依赖空集 hack。**传话链、秘密封口和更细的“谁知道什么、从哪知道”的可解释链路**仍是更大的功能，继续保留在本计划里。
+P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。随后方向 1/2/3 已继续落地：显式广播、身份组广播和定向告知强化不再依赖空集 hack。2026-07-06 继续补了第一层可解释链路：`list_character_knowledge` 会返回知道者名称、来源名称和 provenance 文案，前端知识面板展示“谁知道、从哪知道、哪轮知道”。**传话链和秘密封口**仍是更大的功能，继续保留在本计划里。
 
 ## 目标
 
@@ -28,6 +28,7 @@ P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3
 - `BroadcastTarget::{All, Group(String)}` 已存在于 `crates/domain/src/character_knowledge.rs`，并由 postprocess DTO 的 `broadcast` 字段解析。
 - Tauri 写回层已在 `normalize_knowledge_update_for_postprocess` / `dispatch_broadcast` 中按 `BroadcastTarget::All` 或 `BroadcastTarget::Group` 分发知识。
 - 角色身份字段已存在：`CharacterDefinition.group: Option<String>`、`CharacterDefinition.role_type`、`VariableField.group`。身份组广播当前使用 `CharacterDefinition.group` 匹配 instance。
+- 可解释读侧已接入：`KnowledgeEntryDto` 现在包含 `character_name`、`source_character_name` 和 `provenance_text`，`CampaignKnowledgeTab.vue` 会优先展示角色名和来源链路，id 仅作为 fallback。
 - 变量层已有"全局/无归属"概念：postprocess prompt 明确"全局变量（无 instance_id）用于 story_clock/weather"。**世界级状态有家可归，世界级知识没有**——这是缺口。
 
 **门禁现状**（P3 修复后）：按来源分流，`ToldByOther`/`Backstory` 不受"在场"约束；`broadcast` 非空时走显式分发，不再用空集表达广播。
@@ -70,6 +71,13 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 - 写入时若目标不在场，`ToldByOther` 仍可写入，`source_character_id` 记告知发起方。
 - 读侧：`render_knowledge_for_injection` 会在有 name resolver 时渲染“被告知，来源：X”，便于 LLM 理解信息来源。
 
+### 方向 3.5：可解释链路（已实现第一层）
+
+目标是让用户和调试工具能直接看出“谁知道什么、从哪知道、哪轮知道”。
+- 后端：`list_character_knowledge` 构建 campaign 内 instance id → name 索引，并为每条知识补 `character_name`、`source_character_name`、`provenance_text`。
+- 前端：知识面板的实例筛选和条目展示优先使用角色名；`ToldByOther` 会展示来源角色。
+- 仍未覆盖：自动传话链判定、广播产生原因的独立字段、秘密封口策略。
+
 ### 方向 4：传话链（场景 D，较大）
 
 跨轮传播规则。例：A 告诉 B（轮 3），B 在轮 5 告诉 C。
@@ -89,7 +97,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 ## 落地优先级建议
 
 1. **已完成：方向 1/2/3**（显式广播、身份组广播、定向告知强化）：现有代码已有 domain enum、postprocess prompt/schema/解析、Tauri 写回分发和读侧来源渲染。
-2. **下一步：可解释链路增强**：在 UI / debug / Meta 里更清楚展示“谁知道什么、从哪知道、哪轮知道、是否广播/组广播产生”。
+2. **已完成第一层：可解释链路增强**：Campaign 知识 UI 可展示“谁知道什么、从哪知道、哪轮知道”；后续可继续扩到 Meta/debug 和广播产生原因。
 3. **方向 4**（传话链）：大，偏 LLM 行为，归 Phase 7 评测或单独 MVP。
 4. **方向 5**（秘密封口）：风险高，最后做；需要避免给用户虚假的安全感。
 
