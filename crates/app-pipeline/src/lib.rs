@@ -1247,14 +1247,19 @@ impl PipelineOrchestrator {
                 rerun_perfs.push(new_perf);
             }
 
+            let rerun_by_character: std::collections::HashMap<
+                String,
+                storyforge_domain::agent::Performance,
+            > = rerun_perfs
+                .into_iter()
+                .map(|perf| (perf.character_id.clone(), perf))
+                .collect();
+
             // 按原顺序重建 performances，替换所有重跑的目标子 Agent
             let mut performances: Vec<storyforge_domain::agent::Performance> = Vec::new();
-            let mut rerun_idx = 0;
             for snap in &provenance_old.subagent_results {
-                if rerun_subagents.contains(&snap.character_id) {
-                    // 找到这个 character 对应的 rerun_perfs 条目
-                    performances.push(rerun_perfs[rerun_idx].clone());
-                    rerun_idx += 1;
+                if let Some(perf) = rerun_by_character.get(&snap.character_id) {
+                    performances.push(perf.clone());
                 } else {
                     performances.push(storyforge_domain::agent::Performance {
                         character_id: snap.character_id.clone(),
@@ -2835,6 +2840,118 @@ mod tests {
     }
 
     // ─── P2 后处理流水线接入测试 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_regenerate_multiple_subagents_preserves_character_mapping() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![
+            MockScript {
+                match_keyword: "Alpha".into(),
+                response_content: "new-alpha".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: "Beta".into(),
+                response_content: "new-beta".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: EDITOR_SYSTEM_PROMPT.lines().next().unwrap().into(),
+                response_content: "edited multi target".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+        ]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_multi_regen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
+
+        let plan = Plan {
+            scene_brief: "three-character scene".into(),
+            subagent_tasks: ["Alpha", "Beta", "Gamma"]
+                .into_iter()
+                .map(|character_id| SubagentTask {
+                    character_id: character_id.into(),
+                    brief: format!("{character_id} task"),
+                    context_package: ContextPackage {
+                        character_brief: format!("{character_id} brief"),
+                        scene_brief: "three-character scene".into(),
+                        relevant_lore: vec![],
+                        constant_lore: vec![],
+                        recent_window: vec![],
+                        task: format!("{character_id} task"),
+                    },
+                })
+                .collect(),
+        };
+        let old_snapshot = |character_id: &str, full_text: &str| {
+            storyforge_domain::conversation::SubagentSnapshot {
+                character_id: character_id.into(),
+                full_text: full_text.into(),
+                character_instance_id: None,
+                display_name: None,
+                fallback_reason: None,
+            }
+        };
+        let provenance = Provenance {
+            session_id: Id::new(),
+            plan: Some(plan),
+            subagent_results: vec![
+                old_snapshot("Alpha", "old-alpha"),
+                old_snapshot("Beta", "old-beta"),
+                old_snapshot("Gamma", "old-gamma"),
+            ],
+            profile_id: None,
+            seed: 7,
+            last_hint: None,
+        };
+
+        let conv = conv_store.create(None, None);
+        let node_id = conv_store
+            .append_ai_draft(&conv.id, "old draft".into(), Some(provenance))
+            .unwrap();
+        let req = RegenerateRequest {
+            conversation_id: conv.id.clone(),
+            node_id: node_id.clone(),
+            targets: vec![
+                PartialRollTarget::Subagent("Beta".into()),
+                PartialRollTarget::Subagent("Alpha".into()),
+            ],
+            hint: None,
+            seed: None,
+        };
+        let ctx = WritingContext::legacy(vec![mock_character("Alpha")], None, conv.id.clone());
+        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (_text, provenance) = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await
+            .expect("multi-subagent regenerate should succeed");
+
+        let subagents = &provenance.subagent_results;
+        assert_eq!(subagents[0].character_id, "Alpha");
+        assert_eq!(subagents[0].full_text, "new-alpha");
+        assert_eq!(subagents[1].character_id, "Beta");
+        assert_eq!(subagents[1].full_text, "new-beta");
+        assert_eq!(subagents[2].character_id, "Gamma");
+        assert_eq!(subagents[2].full_text, "old-gamma");
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
 
     fn make_orchestrator() -> (PipelineOrchestrator, Arc<ConversationStore>) {
         let llm = Arc::new(MockLlmClient::with_defaults()) as Arc<dyn LlmClient>;

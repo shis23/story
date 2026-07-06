@@ -150,7 +150,7 @@
 | M-003 | `conversation.rs:87` | `active_variant` 无越界验证，腐败数据导致静默失败 |
 | M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
 | M-005 | `lib.rs:1576` | ✅ 已修复：`postprocess_variable_keys()` 从 CampaignRuntimeContext 合并默认角色/全局变量、当前 Campaign 变量、定义 schema 与实例变量 |
-| M-006 | `app-pipeline:1069` | 多个 Subagent regenerate targets 只重跑第一个 |
+| M-006 | `app-pipeline:1069` | ✅ 已修复：多个 Subagent regenerate targets 会全部重跑，并按 `character_id` 回填，避免 target 顺序打乱旧 provenance/plan 顺序 |
 | M-007 | `runtime.rs:448` | `run_tool_loop_with_layout` 缺少 terminal_tools 检查 |
 | M-008 | `campaign_runtime.rs:103` | 大小写敏感名匹配 — LLM 输出不一致产生重复 |
 | M-009 | `plugin-bridge.js:78` | `postMessage` 使用 `'*'` 原点 |
