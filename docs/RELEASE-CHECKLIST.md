@@ -68,7 +68,7 @@
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。
-- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、派生 HTML 片段安全渲染、`minDepth/maxDepth` 过滤和 World Info prompt 作用域已接入，但完整 PluginHost/JS 状态栏运行时仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏、Campaign 单实例/多实例明确作用域变量宏与 legacy/Campaign alternate greeting 切换已接入；写作/重 roll 的 `PipelineEvent` 与常见聊天宿主动作已桥到插件事件总线，iframe 侧已有 ST 风格 `eventSource`/`event_types` shim，ST 全量真实 event emit 与 prompt hooks 仍待补。
+- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、派生 HTML 片段安全渲染、`minDepth/maxDepth` 过滤、World Info prompt 作用域和 `<think>/<thinking>` Reasoning 块处理已接入，但 Slash 命令 hook 与完整 PluginHost/JS 状态栏运行时仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏、Campaign 单实例/多实例明确作用域变量宏与 legacy/Campaign alternate greeting 切换已接入；写作/重 roll 的 `PipelineEvent` 与常见聊天宿主动作已桥到插件事件总线，iframe 侧已有 ST 风格 `eventSource`/`event_types` shim，ST 全量真实 event emit 与 prompt hooks 仍待补。
 
 ## 4. 真实 LLM
 

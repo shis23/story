@@ -39,7 +39,10 @@ use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
-use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target_at_depth};
+use storyforge_infra_regex::{
+    RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
+    apply_regex_scripts_for_target_at_depth,
+};
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
 };
@@ -3507,14 +3510,23 @@ fn render_variant_display_content(
         return variant.content.clone();
     }
 
-    apply_regex_scripts_for_target_at_depth(
+    let reasoning_applied = apply_reasoning_regex_to_think_blocks_at_depth(
         &variant.content,
         display_scripts,
-        RegexPlacement::Output,
         RegexExecutionTarget::Display,
         depth,
     )
-    .unwrap_or_else(|e| {
+    .and_then(|text| {
+        apply_regex_scripts_for_target_at_depth(
+            &text,
+            display_scripts,
+            RegexPlacement::Output,
+            RegexExecutionTarget::Display,
+            depth,
+        )
+    });
+
+    reasoning_applied.unwrap_or_else(|e| {
         tracing::warn!("展示正则执行失败，使用原始消息内容: {e}");
         variant.content.clone()
     })
@@ -6526,6 +6538,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use storyforge_domain::character::Character;
+    use storyforge_domain::preset::{ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING};
 
     #[derive(Default)]
     struct MemorySecretStore {
@@ -6798,7 +6811,7 @@ mod tests {
             find_regex: id.to_string(),
             replace_string: String::new(),
             placement: storyforge_domain::preset::RegexPlacement::Output,
-            placement_codes: vec![2],
+            placement_codes: vec![ST_REGEX_PLACEMENT_AI_OUTPUT],
             source,
             disabled: false,
             flags: String::new(),
@@ -6846,6 +6859,36 @@ mod tests {
         assert_eq!(
             conversation.nodes[1].variants[0].content,
             "<data_block>hp=5</data_block> scene"
+        );
+    }
+
+    #[test]
+    fn test_conversation_display_dto_applies_markdown_only_reasoning_without_mutating_content() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("<think>raw chain</think> final raw".into(), None);
+
+        let mut script = test_regex_script("display-reasoning", RegexScriptSource::Preset);
+        script.find_regex = r"raw".into();
+        script.replace_string = "pretty".into();
+        script.placement = RegexPlacement::Reasoning;
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.markdown_only = Some(true);
+        script.flags = "g".into();
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let assistant_variant = &dto.nodes[0].variants[0];
+        assert_eq!(
+            assistant_variant.content,
+            "<think>raw chain</think> final raw"
+        );
+        assert_eq!(
+            assistant_variant.display_content,
+            "<think>pretty chain</think> final raw"
+        );
+        assert_eq!(
+            conversation.nodes[0].variants[0].content,
+            "<think>raw chain</think> final raw"
         );
     }
 

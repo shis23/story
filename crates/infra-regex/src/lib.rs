@@ -86,6 +86,25 @@ pub fn apply_regex_scripts_for_target_at_depth(
     Ok(result)
 }
 
+pub fn apply_reasoning_regex_to_think_blocks_at_depth(
+    text: &str,
+    scripts: &[RegexScript],
+    target: RegexExecutionTarget,
+    depth: usize,
+) -> Result<String, RegexError> {
+    apply_regex_to_tagged_blocks(
+        text,
+        scripts,
+        RegexPlacement::Reasoning,
+        target,
+        depth,
+        &[
+            ("think", "<think>", "</think>"),
+            ("thinking", "<thinking>", "</thinking>"),
+        ],
+    )
+}
+
 /// Apply a single regex script.
 ///
 /// H-8 ReDoS mitigation: regress is a backtracking engine; regexes imported from ST
@@ -115,6 +134,65 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
     };
 
     Ok(result.to_string())
+}
+
+fn apply_regex_to_tagged_blocks(
+    text: &str,
+    scripts: &[RegexScript],
+    placement: RegexPlacement,
+    target: RegexExecutionTarget,
+    depth: usize,
+    tags: &[(&str, &str, &str)],
+) -> Result<String, RegexError> {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some((open_start, _tag_name, open_tag, close_tag)) =
+        find_next_open_tag(text, cursor, tags)
+    {
+        let inner_start = open_start + open_tag.len();
+        let Some(close_start) = find_ascii_case_insensitive(text, close_tag, inner_start) else {
+            break;
+        };
+        let close_end = close_start + close_tag.len();
+
+        result.push_str(&text[cursor..inner_start]);
+        let inner = &text[inner_start..close_start];
+        result.push_str(&apply_regex_scripts_for_target_at_depth(
+            inner,
+            scripts,
+            placement.clone(),
+            target,
+            depth,
+        )?);
+        result.push_str(&text[close_start..close_end]);
+        cursor = close_end;
+    }
+
+    result.push_str(&text[cursor..]);
+    Ok(result)
+}
+
+fn find_next_open_tag<'a>(
+    text: &str,
+    start: usize,
+    tags: &'a [(&'a str, &'a str, &'a str)],
+) -> Option<(usize, &'a str, &'a str, &'a str)> {
+    tags.iter()
+        .filter_map(|(name, open, close)| {
+            find_ascii_case_insensitive(text, open, start).map(|idx| (idx, *name, *open, *close))
+        })
+        .min_by_key(|(idx, _, _, _)| *idx)
+}
+
+fn find_ascii_case_insensitive(text: &str, needle: &str, start: usize) -> Option<usize> {
+    if start >= text.len() {
+        return None;
+    }
+
+    let haystack = text[start..].to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    haystack.find(&needle).map(|idx| start + idx)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -441,6 +519,73 @@ mod tests {
 
         assert_eq!(input, "<reader-response>go north</reader-response>");
         assert_eq!(output, "go north");
+    }
+
+    #[test]
+    fn test_reasoning_regex_applies_only_inside_think_blocks() {
+        let mut script = make_script("reasoning", r"secret", "hidden", RegexPlacement::Reasoning);
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.flags = "g".into();
+
+        let result = apply_reasoning_regex_to_think_blocks_at_depth(
+            "before secret <think>secret plan</think> after secret",
+            &[script],
+            RegexExecutionTarget::Persisted,
+            0,
+        )
+        .expect("reasoning regex should compile");
+
+        assert_eq!(
+            result,
+            "before secret <think>hidden plan</think> after secret"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_regex_supports_markdown_only_display_target() {
+        let mut script = make_script(
+            "reasoning-display",
+            r"raw",
+            "pretty",
+            RegexPlacement::Reasoning,
+        );
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.markdown_only = Some(true);
+        script.flags = "g".into();
+
+        let persisted = apply_reasoning_regex_to_think_blocks_at_depth(
+            "<think>raw chain</think>",
+            &[script.clone()],
+            RegexExecutionTarget::Persisted,
+            0,
+        )
+        .expect("persisted reasoning regex should compile");
+        let display = apply_reasoning_regex_to_think_blocks_at_depth(
+            "<think>raw chain</think>",
+            &[script],
+            RegexExecutionTarget::Display,
+            0,
+        )
+        .expect("display reasoning regex should compile");
+
+        assert_eq!(persisted, "<think>raw chain</think>");
+        assert_eq!(display, "<think>pretty chain</think>");
+    }
+
+    #[test]
+    fn test_unclosed_think_block_is_left_unchanged() {
+        let mut script = make_script("reasoning", r"secret", "hidden", RegexPlacement::Reasoning);
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+
+        let result = apply_reasoning_regex_to_think_blocks_at_depth(
+            "before <think>secret",
+            &[script],
+            RegexExecutionTarget::Persisted,
+            0,
+        )
+        .expect("reasoning regex should compile");
+
+        assert_eq!(result, "before <think>secret");
     }
 
     #[test]

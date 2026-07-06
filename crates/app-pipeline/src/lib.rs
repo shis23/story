@@ -28,7 +28,10 @@ use storyforge_app_conversation::{
 };
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::mvu_runtime::MvuRuntime;
-use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target_at_depth};
+use storyforge_infra_regex::{
+    RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
+    apply_regex_scripts_for_target_at_depth,
+};
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -508,11 +511,7 @@ impl PipelineOrchestrator {
             }
         };
 
-        let final_text = match apply_context_regex(
-            &editor_resp.content,
-            &ctx.regex_scripts,
-            RegexPlacement::Output,
-        ) {
+        let final_text = match apply_editor_output_regex(&editor_resp.content, &ctx.regex_scripts) {
             Ok(text) => text,
             Err(e) => return Err(self.abort_with(&event_tx, e)),
         };
@@ -1378,11 +1377,7 @@ impl PipelineOrchestrator {
             }
         };
 
-        let final_text = match apply_context_regex(
-            &editor_resp.content,
-            regex_scripts,
-            RegexPlacement::Output,
-        ) {
+        let final_text = match apply_editor_output_regex(&editor_resp.content, regex_scripts) {
             Ok(text) => text,
             Err(e) => return Err(self.abort_with(&event_tx, e)),
         };
@@ -1458,6 +1453,18 @@ fn apply_context_regex(
     };
     apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
         .map_err(|e| PipelineError::Regex(e.to_string()))
+}
+
+fn apply_editor_output_regex(text: &str, scripts: &[RegexScript]) -> Result<String, PipelineError> {
+    let reasoning_applied = apply_reasoning_regex_to_think_blocks_at_depth(
+        text,
+        scripts,
+        RegexExecutionTarget::Persisted,
+        0,
+    )
+    .map_err(|e| PipelineError::Regex(e.to_string()))?;
+
+    apply_context_regex(&reasoning_applied, scripts, RegexPlacement::Output)
 }
 
 fn apply_world_info_regex(content: &str, ctx: &WritingContext) -> String {
@@ -2177,7 +2184,7 @@ mod tests {
         ST_REGEX_PLACEMENT_REASONING, ST_REGEX_PLACEMENT_SLASH_COMMAND,
         ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
     };
-    use storyforge_infra_llm::mock_client::MockLlmClient;
+    use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
 
     /// 构造最小 mock 角色卡（满足 characters 非空校验）
     fn mock_character(name: &str) -> Arc<Character> {
@@ -2391,6 +2398,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
 
+    #[tokio::test]
+    async fn test_reasoning_regex_applies_before_commit() {
+        let plan = serde_json::json!({
+            "scene_brief": "test scene",
+            "subagent_tasks": [{
+                "character_id": "Seraphina",
+                "brief": "perform",
+                "context_package": {
+                    "character_brief": "Seraphina",
+                    "scene_brief": "test scene",
+                    "relevant_lore": [],
+                    "constant_lore": [],
+                    "recent_window": [],
+                    "task": "perform"
+                }
+            }]
+        })
+        .to_string();
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![
+            MockScript {
+                match_keyword: DIRECTOR_SYSTEM_PROMPT.chars().take(8).collect(),
+                response_content: plan,
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: SUBAGENT_SYSTEM_PROMPT_TEMPLATE
+                    .split("{name}")
+                    .next()
+                    .unwrap()
+                    .to_string(),
+                response_content: "subagent performance".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: EDITOR_SYSTEM_PROMPT.chars().take(8).collect(),
+                response_content: "<think>secret plan</think> final secret".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+        ]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_reasoning_regex_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
+
+        let conv = conv_store.create(None, None);
+        let mut ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv.id);
+        let mut script = mock_regex_script(
+            "reasoning-redact",
+            r"secret",
+            "hidden",
+            RegexPlacement::Reasoning,
+        );
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.flags = "g".into();
+        ctx.regex_scripts = vec![script];
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, node_id, _provenance) = orchestrator
+            .start_writing("test intent".into(), &ctx, event_tx, cancel_rx)
+            .await
+            .expect("pipeline should commit reasoning-filtered draft");
+
+        assert_eq!(text, "<think>hidden plan</think> final secret");
+        let conv = conv_store.get(&ctx.conversation_id).unwrap();
+        let node = conv.find_node(&node_id).unwrap();
+        assert_eq!(
+            node.active().unwrap().content,
+            "<think>hidden plan</think> final secret"
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
     #[test]
     fn test_context_input_regex_uses_prompt_target() {
         let mut script = mock_regex_script(
@@ -2422,6 +2517,56 @@ mod tests {
             .expect("current ST user input placement should apply before prompting");
 
         assert_eq!(result, "<reader-response>go north</reader-response>");
+    }
+
+    #[test]
+    fn test_editor_output_regex_applies_reasoning_inside_think_blocks() {
+        let mut script = mock_regex_script(
+            "reasoning-redact",
+            r"secret",
+            "hidden",
+            RegexPlacement::Reasoning,
+        );
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        script.flags = "g".into();
+
+        let result = apply_editor_output_regex(
+            "before secret <think>secret plan</think> after secret",
+            &[script],
+        )
+        .expect("reasoning regex should apply before output commit");
+
+        assert_eq!(
+            result,
+            "before secret <think>hidden plan</think> after secret"
+        );
+    }
+
+    #[test]
+    fn test_editor_output_regex_runs_reasoning_before_output_regex() {
+        let mut reasoning = mock_regex_script(
+            "reasoning-first",
+            r"secret",
+            "hidden",
+            RegexPlacement::Reasoning,
+        );
+        reasoning.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+        reasoning.flags = "g".into();
+        let mut output = mock_regex_script(
+            "output-second",
+            r"hidden plan",
+            "visible summary",
+            RegexPlacement::Output,
+        );
+        output.placement_codes = vec![ST_REGEX_PLACEMENT_AI_OUTPUT];
+
+        let result = apply_editor_output_regex(
+            "<think>secret plan</think> final secret",
+            &[reasoning, output],
+        )
+        .expect("reasoning and output regex should compose");
+
+        assert_eq!(result, "<think>visible summary</think> final secret");
     }
 
     #[test]
