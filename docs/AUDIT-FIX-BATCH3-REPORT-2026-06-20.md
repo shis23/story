@@ -102,7 +102,7 @@
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：`WebViewMvuRuntime` 移动到 `tauri-app/src/mvu_webview_runtime.rs`，infra 只保留 trait/DTO/事件协议 |
 | H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁 + 增加并发写回回放；剩余同步 I/O/后台 flush 评估 |
 | H-014 | 同步 fs 阻塞异步运行时 | `fill_campaign_context` 需重构为 `spawn_blocking` 模式，涉及调用链变更 |
-| M-012 | lastConversationNode 从未传入 | 需设计 explain generation 完整流程 |
+| M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点，`MetaPanel` 生成溯源入口可见；`frontend/tests/conversation-nodes.test.mjs` 固化选择规则 |
 | M-021 | LogStore 并发写入可能交错 | 小 JSONL 文件实际风险极低 |
 | M-022 | unwrap_or(Null) ~12 处 | 与 H-010 共享 lib.rs，需逐一审查序列化失败场景 |
 | M-024 | patch 事务回滚 | 需设计快照/回滚机制 |

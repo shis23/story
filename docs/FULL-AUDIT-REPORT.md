@@ -154,7 +154,7 @@
 | M-009 | `plugin-bridge.js:78` | `postMessage` 使用 `'*'` 原点 |
 | M-010 | `Composer.vue:3` | `mock.js` 进入生产 bundle |
 | M-011 | `AgentProfileManager.vue:97` | `Date.now()` 生成 Profile ID 可能碰撞 |
-| M-012 | `MetaPanel.vue:17` | `lastConversationNode` 从未传入 — 生成功能解释特性死代码 |
+| M-012 | `MetaPanel.vue:17` | ✅ 2026-07-07 已修：`App.vue` 传入最后一条带 provenance 的 assistant 节点，生成溯源入口不再是死代码 |
 | M-013 | `CampaignInstancesTab.vue:184` | JSON 变量编辑发送字符串而非解析对象 |
 | M-014 | 多个 Tab 组件 | 无 campaignId watch — 切换 Campaign 时数据过期 |
 | M-015 | `BaseOverlay.vue:95` | body overflow 多实例冲突 — 一个关闭解锁所有 |

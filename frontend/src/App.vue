@@ -16,6 +16,7 @@ import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
+import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -201,6 +202,9 @@ function getAssistantRoleLabel() {
 const isWriting = ref(false)
 // 当前对话 ID（重 roll 需要）
 const currentConversationId = ref(null)
+const lastConversationNode = computed(() =>
+  findLastAssistantConversationNode(messages.value, currentConversationId.value)
+)
 const selectedGreetingIndex = ref(0)
 function buildGreetingOptionsFromDetail(detail) {
   if (!detail) return []
@@ -1294,7 +1298,7 @@ function handlePipelineEvent(event) {
     <CharacterList v-if="showCharList" :active-id="activeChar?.id" @select="handleSelectChar" @close="showCharList = false; showSidebar = true" />
     <ConnectionConfig v-if="showConnConfig" @close="showConnConfig = false; showSidebar = true" @changed="refreshActiveConnection" />
     <CampaignPanel v-if="showCampaignPanel" ref="campaignPanelRef" @close="showCampaignPanel = false; showSidebar = true" @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }" />
-    <MetaPanel v-if="showMetaPanel" :active-campaign="activeCampaign" @close="showMetaPanel = false; showSidebar = true" @mvu-applied="handleMvuApplied" />
+    <MetaPanel v-if="showMetaPanel" :active-campaign="activeCampaign" :last-conversation-node="lastConversationNode" @close="showMetaPanel = false; showSidebar = true" @mvu-applied="handleMvuApplied" />
     <PresetPanel v-if="showPresetPanel" @close="showPresetPanel = false; showSidebar = true" />
     <PluginPanel v-if="showPluginPanel" @close="showPluginPanel = false; showSidebar = true; loadSidebarPlugins()" />
 

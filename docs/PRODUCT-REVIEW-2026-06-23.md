@@ -206,7 +206,7 @@ Layer 1: Meta Agent 复刻
 | H-002 | API key 明文存储 | ✅ 已修复 | 🟡 需 Android 实机验证 | 2026-07-06 已接系统凭据库 + SecretRef；Windows Credential Manager 冒烟测试通过 |
 | H-013 | CampaignStore 集合级锁 + 同步 JSON I/O | 否 | 🟡 中 | S4（单 Mutex 已拆，剩余性能压测/后台 flush 待做） |
 | H-014 | 同步 fs 阻塞 tokio | 否 | 🟡 中 | S4 |
-| M-012 | lastConversationNode 未传入 | 🟡 影响 Meta | 否 | S3 后 |
+| M-012 | lastConversationNode 未传入 | ✅ 2026-07-07 已修：`App.vue` 只把最后一条带 provenance 的 assistant 节点传给 `MetaPanel`，`meta_explain_generation` 入口可见且有前端测试覆盖 | 否 | 已完成 |
 | M-024 | patch 事务回滚 | 🟡 影响 Meta | 否 | S3 后 |
 | M-022 | unwrap_or(Null) 12 处 | 否 | 否 | 可延后 |
 | M-021 | LogStore 并发写入 | 否 | 否 | 可延后 |

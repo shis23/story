@@ -150,9 +150,9 @@
 - `MetaSession`、`PatchStore`、Meta runtime tools 存在。
 - `meta_accept_patch`、`meta_analyze_mvu_card`、`meta_list_mvu_translations` 等 Tauri commands 存在。
 - `mvu_import::analyze_mvu_card` 会产出 `MvuTranslation`，解析失败时走 `pure_data_fallback`。
-- `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations、Campaign health check（侧栏"Campaign 体检"区块，调 `meta_health_check` Tauri command）。
+- `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations、Campaign health check（侧栏"Campaign 体检"区块，调 `meta_health_check` Tauri command），并在 `App.vue` 传入最后一条带 provenance 的 assistant 节点时展示“解释上一条生成”入口（调 `meta_explain_generation`）。
 
-因此 `PLAN-META-AGENT.md`（已归档）和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check（后端 + 前端 MetaPanel 展示）已完成，generation explanation、typed patch preview、schema apply、runtime fallback 是后续计划。
+因此 `PLAN-META-AGENT.md`（已归档）和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check、generation explanation、typed patch preview、schema apply 和 runtime fallback 的主路径已完成，后续重点是更广的真实卡/真实 LLM 验收与插件兼容层。
 
 ### 前端工作台
 
@@ -257,6 +257,8 @@
 
 2026-07-07 增量核对：前端插件事件总线已接入主写作链路。`App.vue::handlePipelineEvent` 会记录最近 100 条写作/重 roll `PipelineEvent`，透传给 `DebugDrawer` 与 `PluginHost`；`PluginHost` 在 iframe 未 ready 时会短暂排队并在加载后 flush；`plugin-bridge.js::mapPipelineEventToPluginEvents` 会发送 `pipeline.<event_type>`、原始事件名，以及 `GENERATION_STARTED`、`STREAM_TOKEN`、`GENERATION_ENDED`、`MESSAGE_RECEIVED` 等常用 ST 别名。2026-07-07 追加：`generateBridgeScript` 已给插件 iframe 注入 ST 风格 `event_types` / `eventTypes` 和 `eventSource.on/once/makeFirst/makeLast/removeListener/emit`，并与 `storyforge.events` 共用同一个监听器集合。2026-07-07 再追加：`App.vue` 已开始把主聊天宿主动作规范化进同一 feed，覆盖 `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_SENT/RECEIVED/UPDATED/DELETED/SWIPED`、`CHARACTER_LOADED`。2026-07-07 续补：iframe shim 已补 `eventSource.emitAndWait`；`eventSource.emit` / `storyforge.events.emit` 现在会按监听器顺序等待 async listener，便于后续 prompt hook 类插件异步改写 payload。剩余缺口是 ST 99 事件全集的真实触发点和 prompt 组装钩子。
 
+2026-07-07 追加核对：Meta 生成溯源前端入口已接线。`frontend/src/utils/conversationNodes.js::findLastAssistantConversationNode` 会从当前消息列表中选择最后一条带 active variant provenance 的 assistant 节点，忽略流式占位和无溯源开场白；`App.vue` 将该节点作为 `lastConversationNode` 传给 `MetaPanel`，因此 `meta_explain_generation` 不再是隐藏死入口。该规则由 `frontend/tests/conversation-nodes.test.mjs` 固化，并纳入 `npm test`。
+
 ### Phase 6：Android（~20%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |
@@ -315,7 +317,7 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 以下名称是推荐目标，不是当前代码事实：
 
 - ~~`CampaignRuntimeContext`~~ **阶段 2 已完成**：`crates/domain/src/campaign_runtime.rs` 包含 DTO + helpers，已接入 `WritingContext`/`ToolContext`，`fill_campaign_context` 已组装快照。
-- `meta_explain_generation`
+- ~~`meta_explain_generation`~~ **已完成并接入前端**：后端 command、Meta runtime `inspect_generation` 工具和 `MetaPanel` “解释上一条生成”入口均已可用；前端只对带 provenance 的 assistant 节点显示入口。
 - `meta_preview_mvu_schema`
 - `propose_apply_mvu_schema`
 - `startCampaignWriting`
