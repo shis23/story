@@ -83,18 +83,20 @@
 - **当前状态（2026-07-07）**: `BaseDropdown` 复用 `documentKeydownController`，打开态初始挂载也会注册 ESC，关闭/卸载都会清理。
 - **置信度**: R4 双盲 ✅✅
 
-### H-008: AppSidebar navItems 非响应式
+### H-008: ✅ AppSidebar navItems 非响应式已修复
 
 - **文件**: `frontend/src/components/AppSidebar.vue:36-55`
 - **问题**: `navItems` 是普通数组而非 `computed`。badge 计数、连接状态、Campaign 高亮在首次渲染后永远不更新。
 - **修复**: 改为 `computed(() => [...])`。
+- **当前状态**: `navItems` 已是 `computed(() => [...])`，依赖的连接状态、Campaign 计数和激活态会随响应式源更新。
 - **置信度**: R4 双盲 ✅✅
 
-### H-009: 无 LLM 重试逻辑
+### H-009: ✅ LLM 重试逻辑已修复
 
 - **文件**: `crates/app-agent/src/runtime.rs:104`
 - **问题**: 单次 500/超时/429 立即失败整个写作流程。`infra-llm` 已分类错误变体（RateLimited/ServerError/Timeout）但从未用于重试决策。
-- **修复**: 在 AgentRuntime 中添加指数退避重试。
+- **修复**: 新增 `RetryConfig`、`LlmError::is_retryable()` 与 `RetryingClient`，对 RateLimited/ServerError/Timeout 使用指数退避重试，并支持 `Retry-After` 与流式取消安全。
+- **当前状态**: `crates/infra-llm/src/retry.rs` 已导出 `with_retry`/`RetryingClient`，并覆盖成功重试、不可重试错误、重试耗尽和 Retry-After 解析测试。
 - **置信度**: R4 双盲 ✅✅
 
 ### H-010: Tauri 层丢失错误类型信息
@@ -151,20 +153,20 @@
 | M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
 | M-005 | `lib.rs:1576` | ✅ 已修复：`postprocess_variable_keys()` 从 CampaignRuntimeContext 合并默认角色/全局变量、当前 Campaign 变量、定义 schema 与实例变量 |
 | M-006 | `app-pipeline:1069` | ✅ 已修复：多个 Subagent regenerate targets 会全部重跑，并按 `character_id` 回填，避免 target 顺序打乱旧 provenance/plan 顺序 |
-| M-007 | `runtime.rs:448` | `run_tool_loop_with_layout` 缺少 terminal_tools 检查 |
-| M-008 | `campaign_runtime.rs:103` | 大小写敏感名匹配 — LLM 输出不一致产生重复 |
+| M-007 | `runtime.rs:448` | ✅ 已修复：`run_tool_loop_with_layout` 与其他循环一致，命中 `terminal_tools` 后立即返回 |
+| M-008 | `campaign_runtime.rs:103` | ✅ 已修复：`with_temporaries_for()` 使用 lowercase key 去重，避免大小写差异生成重复临时角色 |
 | M-009 | `plugin-bridge.js:78` | ✅ 已修复：插件侧 `postMessage` 使用注入的宿主 origin；宿主侧只处理当前 iframe source，响应优先回传请求 origin |
-| M-010 | `Composer.vue:3` | `mock.js` 进入生产 bundle |
-| M-011 | `AgentProfileManager.vue:97` | `Date.now()` 生成 Profile ID 可能碰撞 |
+| M-010 | `Composer.vue:3` | ✅ 已修复：`sampleIntent` 已内联为本地常量，不再导入 `mock.js` |
+| M-011 | `AgentProfileManager.vue:97` | ✅ 已修复：Profile ID 使用 `crypto.randomUUID()` 生成，避免 `Date.now()` 碰撞 |
 | M-012 | `MetaPanel.vue:17` | ✅ 2026-07-07 已修：`App.vue` 传入最后一条带 provenance 的 assistant 节点，生成溯源入口不再是死代码 |
-| M-013 | `CampaignInstancesTab.vue:184` | JSON 变量编辑发送字符串而非解析对象 |
-| M-014 | 多个 Tab 组件 | 无 campaignId watch — 切换 Campaign 时数据过期 |
-| M-015 | `BaseOverlay.vue:95` | body overflow 多实例冲突 — 一个关闭解锁所有 |
+| M-013 | `CampaignInstancesTab.vue:184` | ✅ 已修复：JSON 变量编辑会先 `JSON.parse()`，解析失败阻止保存并提示错误 |
+| M-014 | 多个 Tab 组件 | ✅ 已修复：Instances/Knowledge/Tasks/Summaries Tab 已监听 `campaignId` 变化并重新加载 |
+| M-015 | `BaseOverlay.vue:95` | ✅ 已修复：body overflow 使用模块级引用计数，多个 overlay 关闭顺序不再互相解锁 |
 | M-016 | `connection_store.rs:108` | 唯一原始 `.lock().unwrap()` — 毒锁崩溃 |
 | M-017 | `archiver.rs:223` | ✅ 已修复：归档器从调用方传入模型名，`archive_batch_uses_supplied_model` 固化不再硬编码 `"deepseek-chat"` |
 | M-018 | `embedder.rs:119` | ✅ 已修复：embedding 非数值 JSON 元素返回 `LlmError::Internal`，并由 `test_parse_embedding_non_numeric_element_errors` 覆盖 |
-| M-019 | `sse.rs:175` | 接收端断开后 SSE 继续处理完整流 |
-| M-020 | `lib.rs:287` | 日志写入 `writeln!` 结果被丢弃 |
+| M-019 | `sse.rs:175` | ✅ 已确认非问题：SSE 解析器由 `http_client.rs` 流循环驱动，调用点用 `tokio::select!` 监听取消并返回 `LlmError::Cancelled` |
+| M-020 | `lib.rs:287` | ✅ 已修复：日志写入 `writeln!` 失败会输出 stderr，不再静默丢弃 |
 | M-021 | `crates/app-logging/src/lib.rs` | ✅ 2026-07-07 已修复：LogStore JSONL 落盘使用专用互斥锁，并发回放测试验证完整行 |
 | M-022 | 多处 | ✅ 2026-07-07 已修复：用户可见 JSON 序列化失败返回结构化错误，不再伪造 null/default |
 | M-023 | `crates/tauri-app/src/lib.rs` | ✅ 2026-07-07 已加强：Patch 执行后 WorldInfoEntry 反序列化失败直接返回结构化错误，不再静默丢条目 |
@@ -223,18 +225,18 @@
 2. **M-016**: `connection_store.rs:108` `.unwrap()` → `.unwrap_or_else(|p| p.into_inner())`
 3. **H-004**: `character.rs:418` 添加 `#[serde(default)]`
 4. **L-002/L-003/L-004**: 删除 3 个死函数/类型
-5. **M-010**: `Composer.vue:3` 将 `sampleIntent` 内联为常量
-6. **H-008**: `AppSidebar.vue` navItems 改为 computed
+5. **M-010**: ✅ `Composer.vue:3` 已将 `sampleIntent` 内联为常量
+6. **H-008**: ✅ `AppSidebar.vue` navItems 已改为 computed
 7. **L-006**: 移除 19 个未使用 Cargo 依赖
 
 ### Medium Refactor（1-4 小时/项）
 
 8. **H-006/H-007**: ✅ BaseOverlay/BaseDropdown ESC 监听器生命周期已统一并补测试（2026-07-07）
-9. **H-001**: Store persist 返回 Result
+9. **H-001**: ✅ Store persist 已返回 Result 并向命令层传播错误
 10. **M-001**: ✅ tool-call 参数解析错误已反馈给 LLM，且不再 dispatch 真实工具（2026-07-07）
 11. **M-005**: ✅ `postprocess_variable_keys()` 已合并实际 runtime schema/value keys（2026-07-07）
-12. **M-014**: Tab 组件添加 campaignId watch
-13. **H-009**: LLM 重试逻辑（指数退避）
+12. **M-014**: ✅ Tab 组件已添加 campaignId watch
+13. **H-009**: ✅ LLM 重试逻辑（指数退避）已实现
 14. **M-024**: ✅ patch 执行已添加事务回滚（2026-07-07）
 
 ### Major Restructure（> 4 小时/项）
