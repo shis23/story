@@ -498,6 +498,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_persistence_recovers_from_tmp_when_main_json_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_vec_recover_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vectors.json");
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+
+        let record = make_record("r1", "备份恢复", vec!["backup"]);
+        let mut records = HashMap::new();
+        records.insert(record.id.clone(), record);
+        std::fs::write(&path, "{not valid json").unwrap();
+        std::fs::write(&tmp_path, serde_json::to_string(&records).unwrap()).unwrap();
+
+        let store = BruteForceStore::with_persistence(path.clone());
+
+        assert_eq!(store.count(), 1);
+        let hits = store.search_by_keywords(&["backup".into()], 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), "r1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persistence_copies_corrupt_main_json_when_no_backup_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_vec_corrupt_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vectors.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+
+        let store = BruteForceStore::with_persistence(path.clone());
+
+        assert_eq!(store.count(), 0);
+        assert!(path.with_extension("json.corrupt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn make_record_with_meta(
         id: &str,
         content: &str,
