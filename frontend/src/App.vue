@@ -95,6 +95,9 @@ function onTogglePower() {
 
 const sidebarPlugins = ref([])
 const showSidebarPlugins = ref(false)
+const pluginPipelineEvents = ref([])
+let pluginPipelineEventSeq = 0
+const MAX_PLUGIN_PIPELINE_EVENTS = 100
 
 // 加载侧栏插件
 async function loadSidebarPlugins() {
@@ -105,6 +108,17 @@ async function loadSidebarPlugins() {
     console.error('加载侧栏插件失败:', e)
     logAppendFrontend('error', `loadSidebarPlugins: ${e}`).catch(() => {})
   }
+}
+
+function broadcastPluginPipelineEvent(event) {
+  if (!event?.event_type) return
+
+  pluginPipelineEventSeq += 1
+  const nextEvents = [
+    ...pluginPipelineEvents.value,
+    { id: pluginPipelineEventSeq, event },
+  ]
+  pluginPipelineEvents.value = nextEvents.slice(-MAX_PLUGIN_PIPELINE_EVENTS)
 }
 
 // 流水线状态
@@ -841,6 +855,8 @@ async function handleSwitchVariant({ messageId, index }) {
 
 // 处理流水线事件（更新 UI）
 function handlePipelineEvent(event) {
+  broadcastPluginPipelineEvent(event)
+
   switch (event.event_type) {
     case 'director_started':
       pipeline.stateLabel = '导演规划中'
@@ -1128,6 +1144,7 @@ function handlePipelineEvent(event) {
       <DebugDrawer
         mobile
         :sidebar-plugins="sidebarPlugins"
+        :plugin-events="pluginPipelineEvents"
         @open-connection-config="showConnConfig = true"
         @close="showDebugDrawer = false"
       />

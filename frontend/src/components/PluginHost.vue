@@ -16,7 +16,13 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import DOMPurify from 'dompurify'
-import { generateBridgeScript, createHostHandler, MSG_MOUNT } from '../plugin-bridge.js'
+import {
+  generateBridgeScript,
+  createHostHandler,
+  MSG_EVENT,
+  MSG_MOUNT,
+  mapPipelineEventToPluginEvents,
+} from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
 
 const props = defineProps({
@@ -26,13 +32,19 @@ const props = defineProps({
   compact: { type: Boolean, default: false },
   /** 固定高度（默认自适应） */
   height: { type: String, default: '200px' },
+  /** App.vue 广播的流水线事件 feed */
+  pluginEvents: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['slot-mount', 'ready', 'error'])
 
 const iframeRef = ref(null)
 const slotHtml = ref('')
+const iframeReady = ref(false)
 let handler = null
+let lastPluginEventId = 0
+const pendingPluginEvents = []
+const MAX_PENDING_PLUGIN_EVENTS = 100
 
 // 构建 srcdoc：bridge script + 插件 HTML（entry_html 已由 iframe sandbox 隔离，
 // 但仍做消毒防止沙箱逃逸场景）
@@ -52,7 +64,63 @@ const iframeStyle = computed(() => ({
 }))
 
 function onIframeLoad() {
+  iframeReady.value = true
+  flushPendingPluginEvents()
   emit('ready', props.plugin.id)
+}
+
+function queuePluginEvent(pluginEvent) {
+  pendingPluginEvents.push(pluginEvent)
+  if (pendingPluginEvents.length > MAX_PENDING_PLUGIN_EVENTS) {
+    pendingPluginEvents.shift()
+  }
+}
+
+function postPluginEvent(pluginEvent) {
+  const target = iframeRef.value?.contentWindow
+  if (!iframeReady.value || !target) {
+    queuePluginEvent(pluginEvent)
+    return
+  }
+
+  target.postMessage({
+    type: MSG_EVENT,
+    event: pluginEvent.event,
+    data: pluginEvent.data,
+  }, '*')
+}
+
+function flushPendingPluginEvents() {
+  const target = iframeRef.value?.contentWindow
+  if (!iframeReady.value || !target) return
+
+  while (pendingPluginEvents.length > 0) {
+    const pluginEvent = pendingPluginEvents.shift()
+    target.postMessage({
+      type: MSG_EVENT,
+      event: pluginEvent.event,
+      data: pluginEvent.data,
+    }, '*')
+  }
+}
+
+function dispatchPipelineEventRecord(record) {
+  const pipelineEvent = record?.event || record
+  for (const pluginEvent of mapPipelineEventToPluginEvents(pipelineEvent)) {
+    postPluginEvent(pluginEvent)
+  }
+}
+
+function consumePluginEvents(events) {
+  for (const record of events || []) {
+    const eventId = Number(record?.id || 0)
+    if (eventId > 0 && eventId <= lastPluginEventId) continue
+
+    dispatchPipelineEventRecord(record)
+    if (eventId > lastPluginEventId) {
+      lastPluginEventId = eventId
+    }
+  }
 }
 
 // 处理来自 iframe 的消息
@@ -88,6 +156,8 @@ watch(() => props.plugin, (newPlugin) => {
     handler = createHostHandler(newPlugin, invoke)
   }
 })
+
+watch(() => props.pluginEvents, consumePluginEvents, { immediate: true })
 </script>
 
 <style scoped>

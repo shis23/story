@@ -12,6 +12,14 @@ export const MSG_RESPONSE = 'sf:api:response'
 export const MSG_EVENT = 'sf:api:event'
 export const MSG_MOUNT = 'sf:ui:mount'
 
+const ST_EVENT_ALIASES = {
+  started: ['GENERATION_STARTED'],
+  editor_progress: ['STREAM_TOKEN'],
+  draft_ready: ['GENERATION_ENDED'],
+  committed: ['MESSAGE_RECEIVED'],
+  error: ['GENERATION_STOPPED'],
+}
+
 // ─── 方法 → 权限 + Tauri 命令映射 ──────────────────────────────────────────
 
 export const API_METHODS = {
@@ -24,6 +32,57 @@ export const API_METHODS = {
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
   'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ prompt: p.prompt }) },
+}
+
+// ─── PipelineEvent → 插件事件映射 ─────────────────────────────────────────
+
+function createPluginEventPayload(pipelineEvent) {
+  const data = pipelineEvent?.data && typeof pipelineEvent.data === 'object'
+    ? pipelineEvent.data
+    : {}
+  const payload = {
+    ...data,
+    event_type: pipelineEvent.event_type,
+    data,
+    raw: pipelineEvent,
+  }
+
+  if (pipelineEvent.event_type === 'editor_progress') {
+    payload.token = data.delta || ''
+    payload.text = data.delta || ''
+  } else if (pipelineEvent.event_type === 'draft_ready') {
+    payload.text = data.text || ''
+  } else if (pipelineEvent.event_type === 'error') {
+    payload.message = data.message || ''
+  }
+
+  return payload
+}
+
+/**
+ * 将 Tauri WritingEvent 映射为插件可订阅事件。
+ *
+ * 同时发送 StoryForge 原生事件名（pipeline.xxx / xxx）和少量 ST 常用别名；
+ * ST 99 事件全集仍由后续兼容层继续补齐。
+ */
+export function mapPipelineEventToPluginEvents(pipelineEvent) {
+  if (!pipelineEvent?.event_type) return []
+
+  const payload = createPluginEventPayload(pipelineEvent)
+  const names = [
+    `pipeline.${pipelineEvent.event_type}`,
+    pipelineEvent.event_type,
+    ...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []),
+  ]
+  const seen = new Set()
+
+  return names
+    .filter((name) => {
+      if (seen.has(name)) return false
+      seen.add(name)
+      return true
+    })
+    .map((name) => ({ event: name, data: payload }))
 }
 
 // ─── 注入到 iframe 的 window.storyforge stub 脚本 ──────────────────────────

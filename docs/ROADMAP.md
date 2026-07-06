@@ -150,6 +150,7 @@
 - **Regex depth 过滤**：`minDepth/maxDepth` 已在执行器生效；当前轮 Input/Output 按 depth 0，消息展示按离末尾深度执行 display-only 正则。
 - **Regex World Info 作用域**：ST placement 3 已接到常驻/触发世界书注入和 `search_world_info` 工具返回；Slash/Reasoning 仍待接。
 - **Prompt Template 宏覆盖度**：legacy 单卡 system prompt 已执行确定性核心宏（角色卡字段、`<user>/<bot>`、本地 `setvar/addvar/getvar/trim/comment`）和基础动态宏（`date/time/datetime/weekday/isotime`、`random`、`roll`）；Campaign runtime 已可从当前快照读取 `getvar` 变量。单实例 Campaign 继续支持无前缀实例变量和 `{{char}}` / persona / behavior；多角色 Campaign 支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，且会保留歧义的 `{{char}}`、`{{description}}`、`<bot>` 等唯一角色宏不误替换。
+- **ST 事件总线覆盖度**：写作与重 roll 的主 `PipelineEvent` 已通过 `App.vue` → `DebugDrawer` → `PluginHost` → iframe 发送给插件，插件可订阅 `pipeline.<event_type>`、原始事件名，以及 `GENERATION_STARTED` / `STREAM_TOKEN` / `GENERATION_ENDED` / `MESSAGE_RECEIVED` 等常用别名；ST 99 事件全集和 prompt 组装钩子仍待补。
 
 ## Phase 6: Android 打磨
 

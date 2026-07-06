@@ -18,6 +18,8 @@ import PluginHost from './PluginHost.vue'
 const props = defineProps({
   /** 插件侧栏列表（来自 App.vue sidebarPlugins） */
   sidebarPlugins: { type: Array, default: () => [] },
+  /** 写作流水线事件 feed，透传给插件 iframe */
+  pluginEvents: { type: Array, default: () => [] },
   mobile: { type: Boolean, default: false },
 })
 const emit = defineEmits(['open-connection-config', 'close'])
@@ -91,6 +93,7 @@ defineExpose({
             v-for="p in sidebarPlugins"
             :key="p.id"
             :plugin="p"
+            :plugin-events="pluginEvents"
             height="160px"
           />
         </div>
