@@ -1,3 +1,4 @@
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -215,6 +216,12 @@ pub struct TemplateVarContext {
     pub character_version: String,
     pub tags: Vec<String>,
     pub variables: BTreeMap<String, String>,
+    /// Fixed clock for deterministic prompt-template rendering in tests or replays.
+    /// When absent, the renderer captures `Utc::now()` once per render call.
+    pub now: Option<DateTime<Utc>>,
+    /// Optional deterministic seed for `random` / `roll` macros.
+    /// When absent, a per-render seed is derived from system time.
+    pub random_seed: Option<u64>,
 }
 
 impl TemplateVarContext {
@@ -233,6 +240,8 @@ impl TemplateVarContext {
             character_version: character.character_version.clone(),
             tags: character.tags.clone(),
             variables: BTreeMap::new(),
+            now: None,
+            random_seed: None,
         }
     }
 }
@@ -241,6 +250,9 @@ impl TemplateVarContext {
 struct TemplateRenderState {
     variables: BTreeMap<String, String>,
     trim_output: bool,
+    now: DateTime<Utc>,
+    random_seed: u64,
+    random_counter: u64,
 }
 
 /// ST 风格占位符替换（设计 §7.5 prompt-template 功能）
@@ -254,6 +266,8 @@ struct TemplateRenderState {
 ///   `{{post_history_instructions}}` 等
 /// - 本地 ST 变量宏：`{{setvar::key::value}}`, `{{addvar::key::value}}`,
 ///   `{{getvar::key}}`, `{{trim}}`, `{{// comment}}`
+/// - 常用动态宏：`{{date}}`, `{{time}}`, `{{datetime}}`, `{{weekday}}`,
+///   `{{isotime}}`, `{{random::A::B}}`, `{{roll::2d6+1}}`
 ///
 /// 在组装 system prompt 后、发送给 LLM 前调用。
 pub fn replace_template_vars(text: &str, char_name: &str, user_name: &str) -> String {
@@ -269,6 +283,11 @@ pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarConte
     let mut state = TemplateRenderState {
         variables: context.variables.clone(),
         trim_output: false,
+        now: context.now.unwrap_or_else(Utc::now),
+        random_seed: context
+            .random_seed
+            .unwrap_or_else(default_template_random_seed),
+        random_counter: 0,
     };
     let mut rendered = String::with_capacity(text.len());
     let mut rest = text;
@@ -342,7 +361,23 @@ fn render_template_macro(
         return Some(state.variables.get(key.trim()).cloned().unwrap_or_default());
     }
 
-    render_field_macro(body, context)
+    if let Some(rest) = strip_ascii_case_prefix(body, "random::")
+        .or_else(|| strip_ascii_case_prefix(body, "pick::"))
+        .or_else(|| strip_ascii_case_prefix(body, "random:"))
+        .or_else(|| strip_ascii_case_prefix(body, "pick:"))
+    {
+        return render_random_macro(rest, context, state);
+    }
+
+    if let Some(rest) = strip_ascii_case_prefix(body, "roll::")
+        .or_else(|| strip_ascii_case_prefix(body, "dice::"))
+        .or_else(|| strip_ascii_case_prefix(body, "roll:"))
+        .or_else(|| strip_ascii_case_prefix(body, "dice:"))
+    {
+        return render_roll_macro(rest, state);
+    }
+
+    render_field_macro(body, context, state)
 }
 
 fn split_macro_key_value(rest: &str) -> Option<(&str, &str)> {
@@ -361,7 +396,11 @@ fn render_template_value(
     rendered
 }
 
-fn render_field_macro(body: &str, context: &TemplateVarContext) -> Option<String> {
+fn render_field_macro(
+    body: &str,
+    context: &TemplateVarContext,
+    state: &TemplateRenderState,
+) -> Option<String> {
     let key = body.trim().to_ascii_lowercase();
     let value = match key.as_str() {
         "char" | "charname" | "char_name" | "character" | "bot" => context.char_name.clone(),
@@ -383,9 +422,123 @@ fn render_field_macro(body: &str, context: &TemplateVarContext) -> Option<String
         "tags" => context.tags.join(", "),
         "newline" => "\n".to_string(),
         "noop" => String::new(),
+        "date" => state.now.format("%Y-%m-%d").to_string(),
+        "time" => format!("{:02}:{:02}", state.now.hour(), state.now.minute()),
+        "datetime" => state.now.format("%Y-%m-%d %H:%M").to_string(),
+        "isotime" | "iso8601" => state.now.to_rfc3339(),
+        "weekday" => weekday_name(state.now.weekday()).to_string(),
         _ => return None,
     };
     Some(value)
+}
+
+fn render_random_macro(
+    rest: &str,
+    context: &TemplateVarContext,
+    state: &mut TemplateRenderState,
+) -> Option<String> {
+    let options: Vec<&str> = if rest.contains("::") {
+        rest.split("::").collect::<Vec<_>>()
+    } else {
+        rest.split([',', '|']).collect::<Vec<_>>()
+    }
+    .into_iter()
+    .map(str::trim)
+    .filter(|option| !option.is_empty())
+    .collect();
+
+    if options.is_empty() {
+        return None;
+    }
+
+    let idx = (next_template_random(state, rest) as usize) % options.len();
+    Some(render_template_value(options[idx], context, state))
+}
+
+fn render_roll_macro(rest: &str, state: &mut TemplateRenderState) -> Option<String> {
+    let spec = rest.trim().replace(' ', "");
+    let (dice_spec, modifier) = split_roll_modifier(&spec)?;
+    let lower = dice_spec.to_ascii_lowercase();
+    let (count_str, sides_str) = lower.split_once('d')?;
+    let count = if count_str.is_empty() {
+        1
+    } else {
+        count_str.parse::<u32>().ok()?
+    };
+    let sides = sides_str.parse::<u32>().ok()?;
+    if count == 0 || count > 100 || sides == 0 || sides > 100_000 {
+        return None;
+    }
+
+    let mut total = modifier;
+    for roll_idx in 0..count {
+        let salt = format!("{spec}#{roll_idx}");
+        total += (next_template_random(state, &salt) % u64::from(sides) + 1) as i32;
+    }
+    Some(total.to_string())
+}
+
+fn split_roll_modifier(spec: &str) -> Option<(&str, i32)> {
+    if spec.is_empty() {
+        return None;
+    }
+
+    let mut modifier_idx = None;
+    for (idx, ch) in spec.char_indices().skip(1) {
+        if ch == '+' || ch == '-' {
+            modifier_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = modifier_idx {
+        let dice_spec = &spec[..idx];
+        let modifier = spec[idx..].parse::<i32>().ok()?;
+        Some((dice_spec, modifier))
+    } else {
+        Some((spec, 0))
+    }
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn weekday_name(weekday: chrono::Weekday) -> &'static str {
+    match weekday {
+        chrono::Weekday::Mon => "Monday",
+        chrono::Weekday::Tue => "Tuesday",
+        chrono::Weekday::Wed => "Wednesday",
+        chrono::Weekday::Thu => "Thursday",
+        chrono::Weekday::Fri => "Friday",
+        chrono::Weekday::Sat => "Saturday",
+        chrono::Weekday::Sun => "Sunday",
+    }
+}
+
+fn next_template_random(state: &mut TemplateRenderState, salt: &str) -> u64 {
+    state.random_counter = state.random_counter.wrapping_add(1);
+    let mut hash = state.random_seed ^ state.random_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for byte in salt.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01B3);
+        hash ^= hash >> 32;
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    hash ^ (hash >> 33)
+}
+
+fn default_template_random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ u64::from(std::process::id())
 }
 
 fn replace_angle_aliases(text: &str, context: &TemplateVarContext) -> String {
@@ -663,6 +816,58 @@ pub mod builtins {
             let result = replace_template_vars_with_context(text, &ctx);
 
             assert_eq!(result, "<utility>第一段第二段</utility>");
+        }
+
+        #[test]
+        fn test_replace_template_vars_supports_time_macros_with_fixed_clock() {
+            let ctx = TemplateVarContext {
+                now: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-07T09:08:05Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                ..Default::default()
+            };
+
+            let result = replace_template_vars_with_context(
+                "{{date}} {{time}} {{datetime}} {{weekday}} {{isotime}}",
+                &ctx,
+            );
+
+            assert_eq!(
+                result,
+                "2026-07-07 09:08 2026-07-07 09:08 Tuesday 2026-07-07T09:08:05+00:00"
+            );
+        }
+
+        #[test]
+        fn test_replace_template_vars_supports_random_and_roll_macros() {
+            let ctx = TemplateVarContext {
+                user_name: "玩家".into(),
+                random_seed: Some(42),
+                ..Default::default()
+            };
+
+            let first = replace_template_vars_with_context(
+                "{{random::红色::晴::<user>}}\n{{roll::2d6+1}}",
+                &ctx,
+            );
+            let second = replace_template_vars_with_context(
+                "{{random::红色::晴::<user>}}\n{{roll::2d6+1}}",
+                &ctx,
+            );
+
+            assert_eq!(first, second, "fixed random_seed should be deterministic");
+            let (choice, roll_text) = first.split_once('\n').unwrap();
+            assert!(
+                ["红色", "晴", "玩家"].contains(&choice),
+                "random choice should come from rendered options, got {choice}"
+            );
+            let roll: i32 = roll_text.parse().unwrap();
+            assert!(
+                (3..=13).contains(&roll),
+                "2d6+1 should stay within dice range, got {roll}"
+            );
         }
 
         #[test]
