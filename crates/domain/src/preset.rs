@@ -51,6 +51,8 @@ pub struct RegexScript {
     /// ST 原始 placement 数组，用于后续恢复 World Info/Slash/Reasoning 等作用域语义。
     #[serde(default)]
     pub placement_codes: Vec<i32>,
+    #[serde(default)]
+    pub source: RegexScriptSource,
     /// 是否禁用
     pub disabled: bool,
     /// ST 原始字段（flags 等）
@@ -73,6 +75,16 @@ pub enum RegexPlacement {
     Input,
     /// 输出正则：编剧成文后
     Output,
+}
+
+/// ST regex script source. Defaulting to Preset keeps older stored preset JSON compatible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegexScriptSource {
+    Global,
+    #[default]
+    Preset,
+    Scoped,
 }
 
 /// ST 预设 JSON 结构（用于反序列化导入）
@@ -201,6 +213,13 @@ impl Preset {
 
 /// 从 ST extensions 中提取正则脚本
 pub(crate) fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
+    extract_regex_scripts_with_source(extensions, RegexScriptSource::Preset)
+}
+
+pub(crate) fn extract_regex_scripts_with_source(
+    extensions: &serde_json::Value,
+    source: RegexScriptSource,
+) -> Vec<RegexScript> {
     let scripts = match extensions.get("regex_scripts") {
         Some(v) => v,
         None => return Vec::new(),
@@ -230,6 +249,7 @@ pub(crate) fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<Regex
                 replace_string: s.replace_string.unwrap_or_default(),
                 placement,
                 placement_codes,
+                source,
                 disabled: s.disabled,
                 flags: s.flags,
                 only_format_formatting: s.only_format_formatting,
@@ -243,4 +263,101 @@ pub(crate) fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<Regex
             }
         })
         .collect()
+}
+
+pub fn merge_regex_script_sources(
+    global: &[RegexScript],
+    preset: &[RegexScript],
+    scoped: &[RegexScript],
+) -> Vec<RegexScript> {
+    let mut merged = Vec::with_capacity(global.len() + preset.len() + scoped.len());
+    append_scripts_with_source(&mut merged, global, RegexScriptSource::Global);
+    append_scripts_with_source(&mut merged, preset, RegexScriptSource::Preset);
+    append_scripts_with_source(&mut merged, scoped, RegexScriptSource::Scoped);
+    merged
+}
+
+fn append_scripts_with_source(
+    merged: &mut Vec<RegexScript>,
+    scripts: &[RegexScript],
+    source: RegexScriptSource,
+) {
+    for script in scripts {
+        let mut script = script.clone();
+        script.source = source;
+        merged.push(script);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_script(id: &str, name: &str, source: RegexScriptSource) -> RegexScript {
+        RegexScript {
+            id: id.to_string(),
+            script_name: name.to_string(),
+            find_regex: name.to_string(),
+            replace_string: String::new(),
+            placement: RegexPlacement::Output,
+            placement_codes: vec![2],
+            source,
+            disabled: false,
+            flags: String::new(),
+            only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
+        }
+    }
+
+    #[test]
+    fn merge_regex_script_sources_preserves_st_priority_order_and_marks_source() {
+        let global = vec![make_script("g1", "global", RegexScriptSource::Preset)];
+        let preset = vec![make_script("p1", "preset", RegexScriptSource::Scoped)];
+        let scoped = vec![make_script("s1", "scoped", RegexScriptSource::Global)];
+
+        let merged = merge_regex_script_sources(&global, &preset, &scoped);
+
+        let ids: Vec<_> = merged.iter().map(|script| script.id.as_str()).collect();
+        assert_eq!(ids, vec!["g1", "p1", "s1"]);
+
+        let sources: Vec<_> = merged.iter().map(|script| script.source).collect();
+        assert_eq!(
+            sources,
+            vec![
+                RegexScriptSource::Global,
+                RegexScriptSource::Preset,
+                RegexScriptSource::Scoped,
+            ]
+        );
+    }
+
+    #[test]
+    fn regex_script_source_defaults_to_preset_for_old_stored_json() {
+        let script: RegexScript = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "script_name": "old stored script",
+            "find_regex": "a",
+            "replace_string": "b",
+            "placement": "Output",
+            "disabled": false,
+            "flags": "gm",
+            "only_format_formatting": null,
+            "markdown_only": null,
+            "prompt_only": null,
+            "run_on_edit": null,
+            "substitute_regex": null,
+            "trim_strings": [],
+            "min_depth": null,
+            "max_depth": null
+        }))
+        .expect("old regex script should deserialize");
+
+        assert_eq!(script.source, RegexScriptSource::Preset);
+    }
 }

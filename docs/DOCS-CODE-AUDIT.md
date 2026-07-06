@@ -234,9 +234,9 @@
 | ST-T4 | StoryForge Campaign 导出格式设计 | 已实现 | W7 `export_campaign` 命令 + JSON bundle（`format_version`）+ ST 卡 PNG tEXt 写入 + 共享 lorebook |
 | ST-T5 | 评估导出回 ST 卡/Lorebook | 已实现 | W7 评估 checkbox 已结；ST 卡 PNG + lorebook 导出已落地 |
 
-2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。当前仍只是导入保真；执行层仍按 `RegexPlacement::Input/Output` 简化过滤，Scoped/Global 正则来源合并未完成。
+2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。当前仍只是导入保真；执行层仍按 `RegexPlacement::Input/Output` 简化过滤，Global 正则来源读取未完成。
 
-2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；当前尚未把 Scoped/Preset/Global 来源合并进运行时执行链。
+2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。当前尚未把合并结果接进运行时执行链。
 
 ### Phase 6：Android（~20%）
 

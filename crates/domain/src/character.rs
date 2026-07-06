@@ -177,7 +177,10 @@ impl Character {
 
     /// Parses card-scoped ST regex scripts from `data.extensions.regex_scripts`.
     pub fn scoped_regex_scripts(&self) -> Vec<crate::preset::RegexScript> {
-        crate::preset::extract_regex_scripts(&self.extensions)
+        crate::preset::extract_regex_scripts_with_source(
+            &self.extensions,
+            crate::preset::RegexScriptSource::Scoped,
+        )
     }
 
     /// 从 ST 卡 JSON 解析为领域模型
@@ -720,6 +723,7 @@ mod multi_character_tests {
         assert_eq!(scripts[0].id, "scoped-1");
         assert_eq!(scripts[0].script_name, "Scoped output cleanup");
         assert_eq!(scripts[0].placement_codes, vec![2]);
+        assert_eq!(scripts[0].source, crate::preset::RegexScriptSource::Scoped);
         assert_eq!(scripts[0].placement, crate::preset::RegexPlacement::Output);
         assert_eq!(scripts[0].markdown_only, Some(true));
         assert_eq!(scripts[0].prompt_only, Some(false));

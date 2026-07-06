@@ -128,6 +128,7 @@ mod tests {
             replace_string: replace.into(),
             placement,
             placement_codes: vec![],
+            source: storyforge_domain::preset::RegexScriptSource::Preset,
             disabled: false,
             flags: "gm".into(),
             only_format_formatting: None,

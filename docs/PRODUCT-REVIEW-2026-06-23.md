@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取；运行时仍是二元 placement，Global/合并/执行未完成 | **7-11 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；运行时仍是二元 placement，Global/执行未完成 | **6-10 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
@@ -94,14 +94,14 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。但运行时执行仍按二元 `Input/Output` 简化枚举过滤，Preset/Scoped/Global 合并与多作用域语义仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。但运行时执行仍按二元 `Input/Output` 简化枚举过滤，Global 来源读取和多作用域语义仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
 | 来源 | 存哪 | 现状 | 缺失影响 |
 |---|---|---|---|
 | Preset 脚本 | 预设 `extensions.regex_scripts` | ✅ 读 | 预设导入/存储已接通 |
-| **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | 🟡 typed 读取 | `Character::scoped_regex_scripts()` 已可解析；尚未与 Preset/Global 合并执行 |
+| **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | 🟡 typed 读取 + 合并 helper | `Character::scoped_regex_scripts()` 已可解析；`merge_regex_script_sources()` 已可合并，运行时尚未调用 |
 | Global 脚本 | `settings.json` | ❌ 不读 | 全局正则丢失 |
 
 **7 个作用域（ST placement 数值）**：
@@ -134,12 +134,12 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 
 | 子项 | 工作量 |
 |---|---|
-| 来源合并（Global/Preset/Scoped + 优先级）| 2-3 天 |
+| 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Preset/Scoped 合并 helper 已完成；Global 配置读取待接 |
 | 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
 | 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |
 | placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真，运行时语义待接 |
-| **总计** | **7-11 天** |
+| **总计** | **6-10 天** |
 
 > sprest 插件（提取预设中的正则集中管理）本身是管理工具非运行时，不需兼容。但它揭示的"正则来源合并优先级"问题必须正确实现。
 
