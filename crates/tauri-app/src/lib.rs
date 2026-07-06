@@ -28,7 +28,7 @@ use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{
     LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
-use storyforge_domain::preset::RegexScript;
+use storyforge_domain::preset::{RegexScript, merge_regex_script_sources};
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
@@ -1020,6 +1020,7 @@ pub struct PresetSummaryDto {
     pub prompt_count: usize,
     pub regex_count: usize,
     pub imported_at: String,
+    pub active: bool,
 }
 
 /// 预设详情 DTO
@@ -1030,6 +1031,7 @@ pub struct PresetDetailDto {
     pub prompts: Vec<PresetPromptDto>,
     pub regex_scripts: Vec<RegexScriptDto>,
     pub imported_at: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1055,7 +1057,9 @@ pub struct RegexScriptDto {
 
 #[tauri::command]
 fn list_presets() -> Vec<PresetSummaryDto> {
-    get_preset_store()
+    let store = get_preset_store();
+    let active_id = store.active_id();
+    store
         .list()
         .iter()
         .map(|sp| PresetSummaryDto {
@@ -1064,13 +1068,16 @@ fn list_presets() -> Vec<PresetSummaryDto> {
             prompt_count: sp.preset.prompts.len(),
             regex_count: sp.preset.regex_scripts.len(),
             imported_at: sp.imported_at.clone(),
+            active: active_id.as_deref() == Some(sp.id.as_str()),
         })
         .collect()
 }
 
 #[tauri::command]
 fn get_preset(id: String) -> Result<PresetDetailDto, TauriCommandError> {
-    let sp = get_preset_store()
+    let store = get_preset_store();
+    let active_id = store.active_id();
+    let sp = store
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到预设 {id}")))?;
     Ok(PresetDetailDto {
@@ -1113,7 +1120,43 @@ fn get_preset(id: String) -> Result<PresetDetailDto, TauriCommandError> {
             })
             .collect(),
         imported_at: sp.imported_at.clone(),
+        active: active_id.as_deref() == Some(sp.id.as_str()),
     })
+}
+
+#[tauri::command]
+fn get_active_preset() -> Option<PresetSummaryDto> {
+    let sp = get_preset_store().active()?;
+    Some(PresetSummaryDto {
+        id: sp.id.clone(),
+        name: sp.preset.name.clone(),
+        prompt_count: sp.preset.prompts.len(),
+        regex_count: sp.preset.regex_scripts.len(),
+        imported_at: sp.imported_at.clone(),
+        active: true,
+    })
+}
+
+#[tauri::command]
+fn set_active_preset(id: Option<String>) -> Result<(), TauriCommandError> {
+    let store = get_preset_store();
+    match id {
+        Some(id) => {
+            if store
+                .set_active(&id)
+                .map_err(|e| TauriCommandError::storage(format!("storage write failed: {e}")))?
+            {
+                Ok(())
+            } else {
+                Err(TauriCommandError::not_found(format!(
+                    "preset not found: {id}"
+                )))
+            }
+        }
+        None => store
+            .clear_active()
+            .map_err(|e| TauriCommandError::storage(format!("storage write failed: {e}"))),
+    }
 }
 
 #[tauri::command]
@@ -1754,6 +1797,7 @@ async fn start_writing(
         campaign_runtime: None,
         agent_profile_config: None,
     };
+    fill_regex_context(&mut ctx, get_preset_store());
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
     // 从活跃 Agent Profile Config 加载运行时配置覆盖
@@ -1884,6 +1928,16 @@ fn collect_scoped_regex_scripts(
         })
         .map(|character| character.scoped_regex_scripts())
         .unwrap_or_default()
+}
+
+fn fill_regex_context(ctx: &mut WritingContext, preset_store: &PresetStore) {
+    let scoped_scripts = std::mem::take(&mut ctx.regex_scripts);
+    let preset_scripts = preset_store
+        .active()
+        .map(|stored| stored.preset.regex_scripts)
+        .unwrap_or_default();
+
+    ctx.regex_scripts = merge_regex_script_sources(&[], &preset_scripts, &scoped_scripts);
 }
 
 fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
@@ -2750,6 +2804,7 @@ async fn regenerate(
         campaign_runtime: None,
         agent_profile_config: None,
     };
+    fill_regex_context(&mut ctx, get_preset_store());
     fill_profile_context(&mut ctx, &app);
     fill_agent_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx, &app);
@@ -3248,6 +3303,7 @@ fn diagnostic_context_for_data_dir(data_dir: &Path) -> serde_json::Value {
         "agent_profile_configs.json",
         "active_agent_profile_config.json",
         "presets.json",
+        "active_preset.json",
     ];
 
     let log_dir = data_dir.join("logs");
@@ -5923,6 +5979,8 @@ pub fn run() {
             import_preset,
             list_presets,
             get_preset,
+            get_active_preset,
+            set_active_preset,
             delete_preset,
             update_preset_prompt,
             update_preset_regex,
@@ -6239,6 +6297,7 @@ mod tests {
 
         assert!(json.contains("connections.json"));
         assert!(json.contains("embed.json"));
+        assert!(json.contains("active_preset.json"));
         assert!(json.contains("logs"));
         assert!(!json.contains("sk-live-secret"));
         assert!(!json.contains("embed-live-secret"));
@@ -6441,6 +6500,74 @@ mod tests {
         assert_eq!(scripts[0].id, "selected-regex");
         assert!(collect_scoped_regex_scripts(None, &characters).is_empty());
         assert!(collect_scoped_regex_scripts(Some("missing"), &characters).is_empty());
+    }
+
+    #[test]
+    fn test_fill_regex_context_merges_active_preset_before_scoped_scripts() {
+        use storyforge_domain::Source;
+        use storyforge_domain::preset::{Preset, RegexPlacement, RegexScript, RegexScriptSource};
+
+        fn script(id: &str, source: RegexScriptSource) -> RegexScript {
+            RegexScript {
+                id: id.to_string(),
+                script_name: id.to_string(),
+                find_regex: id.to_string(),
+                replace_string: String::new(),
+                placement: RegexPlacement::Output,
+                placement_codes: vec![2],
+                source,
+                disabled: false,
+                flags: String::new(),
+                only_format_formatting: None,
+                markdown_only: None,
+                prompt_only: None,
+                run_on_edit: None,
+                substitute_regex: None,
+                trim_strings: vec![],
+                min_depth: None,
+                max_depth: None,
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_fill_regex_context_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preset_store = preset_store::PresetStore::new(&dir);
+        let preset_id = preset_store
+            .save(Preset {
+                name: "runtime preset".into(),
+                prompts: vec![],
+                regex_scripts: vec![script("preset-regex", RegexScriptSource::Scoped)],
+                source: Source::ImportedFromST,
+            })
+            .unwrap();
+        assert!(preset_store.set_active(&preset_id).unwrap());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.regex_scripts = vec![script("scoped-regex", RegexScriptSource::Preset)];
+
+        fill_regex_context(&mut ctx, &preset_store);
+
+        let ids: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["preset-regex", "scoped-regex"]);
+
+        let sources: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec![RegexScriptSource::Preset, RegexScriptSource::Scoped]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

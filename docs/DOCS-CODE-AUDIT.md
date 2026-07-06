@@ -234,9 +234,9 @@
 | ST-T4 | StoryForge Campaign 导出格式设计 | 已实现 | W7 `export_campaign` 命令 + JSON bundle（`format_version`）+ ST 卡 PNG tEXt 写入 + 共享 lorebook |
 | ST-T5 | 评估导出回 ST 卡/Lorebook | 已实现 | W7 评估 checkbox 已结；ST 卡 PNG + lorebook 导出已落地 |
 
-2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。Preset 来源当前仍只是导入保真；执行层已能消费 `WritingContext.regex_scripts`，但 Preset/Global 运行时装配未完成。
+2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。`PresetStore` 已持久化 `active_preset.json` 并暴露 `get_active_preset` / `set_active_preset`；预设面板可设置/清除运行时预设。写作与重 roll 会把 active Preset 正则合并进 `WritingContext.regex_scripts`。Global 运行时装配仍未完成。
 
-2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。2026-07-06 增量：Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则注入 `WritingContext.regex_scripts`，并已通过 `CharacterInfo.extensions` 持久化卡内扩展，避免重启后丢失 scoped regex。Campaign 活动卡 Scoped 装配仍待补。
+2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。2026-07-06 增量：Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则注入 `WritingContext.regex_scripts`，并已通过 `CharacterInfo.extensions` 持久化卡内扩展，避免重启后丢失 scoped regex；active Preset 与 Scoped 会按 Preset → Scoped 顺序合并。Campaign 活动卡 Scoped 装配仍待补。
 
 2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。`crates/app-pipeline` 已接入正则执行器：首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘/返回前执行 Output 正则；当前仍未实现 ST 多作用域、prompt/display-only、depth 限制等完整运行时语义。
 
@@ -248,7 +248,7 @@
 | AND-2 | Android 系统选择器文件导入路径 | 未开始 | 无 Android 专属 import 改动 |
 | AND-3 | 本地数据目录 + 迁移/schema 版本 | 未开始 | 无 debug data-dir 命令、无 schema/version 字段 |
 | AND-4 | 长任务/流式/取消在移动端 | 未开始 | 无 Android 生命周期处理 |
-| AND-5 | 移动端排障/诊断导出 | 部分完成 | `log_export_bundle` 已附带 `diagnostic_context`（app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要），并有不泄露 `connections.json` / `embed.json` API key 的单测；Android share/save sheet 真机链路未验 |
+| AND-5 | 移动端排障/诊断导出 | 部分完成 | `log_export_bundle` 已附带 `diagnostic_context`（app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要，含 `active_preset.json`），并有不泄露 `connections.json` / `embed.json` API key 的单测；Android share/save sheet 真机链路未验 |
 | AND-6 | capability 权限收敛 | 已完成配置收窄，待真机导入/导出回归 | `capabilities/default.json` 已保留 `core:default`、dialog open/save/message/ask、fs read/write file；`crates/tauri-app/tests/capabilities.rs` 固化无 `fs:default`/`dialog:default`，并校验前端 dialog/fs helper 与 capability 匹配 |
 
 注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`）。2026-07-06 已验证 arm64-v8a debug/release 构建链路，但 `MainActivity.kt` 仍基本是 Tauri 自动生成脚手架，仅调 `enableEdgeToEdge()`；文件导入、数据目录、长任务和诊断导出仍未做真机验收。

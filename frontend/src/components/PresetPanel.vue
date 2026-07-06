@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
-import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex, importPresetAsModules } from '../tauri-api.js'
+import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex, importPresetAsModules, setActivePreset } from '../tauri-api.js'
 
 const emit = defineEmits(['close'])
 
@@ -116,6 +116,21 @@ async function handleImportAsModules(preset) {
   }
 }
 
+async function toggleActivePreset(preset) {
+  saving.value = true
+  try {
+    await setActivePreset(preset.active ? null : preset.id)
+    await refresh()
+    if (expandedId.value === preset.id) {
+      detail.value = await getPreset(preset.id)
+    }
+  } catch (e) {
+    await alertDialog('鎿嶄綔澶辫触: ' + e)
+  } finally {
+    saving.value = false
+  }
+}
+
 function roleBadgeClass(role) {
   if (role === 'system') return 'bg-accent/10 text-accent'
   if (role === 'user') return 'bg-ok/10 text-ok'
@@ -148,11 +163,25 @@ function roleBadgeClass(role) {
           @click="togglePreset(p)"
         >
           <div class="flex-1 min-w-0">
-            <div class="text-sm font-medium text-ink truncate">{{ p.name }}</div>
+            <div class="flex items-center gap-1.5 min-w-0">
+              <span class="text-sm font-medium text-ink truncate">{{ p.name }}</span>
+              <span v-if="p.active" class="shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-ok/10 text-ok">运行中</span>
+            </div>
             <div class="text-xs text-ink-soft">
               {{ p.prompt_count }} 条提示词 · {{ p.regex_count }} 条正则
             </div>
           </div>
+          <button
+            @click.stop="toggleActivePreset(p)"
+            class="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg transition-colors"
+            :class="p.active ? 'text-ok hover:bg-ok/10' : 'text-ink-soft hover:bg-bg'"
+            :title="p.active ? '停用运行时预设' : '设为运行时预设'"
+          >
+            <span
+              class="block w-2.5 h-2.5 rounded-full border"
+              :class="p.active ? 'bg-ok border-ok' : 'border-ink-soft'"
+            />
+          </button>
           <button
             @click.stop="handleImportAsModules(p)"
             class="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-accent/70 hover:bg-accent/10 transition-colors"

@@ -82,6 +82,21 @@ export async function getPreset(id) {
   return null
 }
 
+/** 获取当前活跃预设 */
+export async function getActivePreset() {
+  if (isTauri()) {
+    return await invoke('get_active_preset')
+  }
+  return null
+}
+
+/** 设置/清除当前活跃预设 */
+export async function setActivePreset(id) {
+  if (isTauri()) {
+    return await invoke('set_active_preset', { id: id || null })
+  }
+}
+
 /** 删除预设 */
 export async function deletePreset(id) {
   if (isTauri()) {
