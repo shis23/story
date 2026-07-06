@@ -26,6 +26,7 @@ chrono.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"

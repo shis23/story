@@ -108,11 +108,11 @@
 - **修复**: 返回错误而非空数据，提示用户数据损坏。
 - **置信度**: R4 双盲 ✅✅
 
-### H-012: infra-plugin-host 直接依赖 `tauri = "2"`
+### H-012: infra-plugin-host Tauri 依赖已解除（2026-07-06）
 
-- **文件**: `crates/infra-plugin-host/Cargo.toml:17`
-- **问题**: 基础设施层 crate 直接依赖 UI 框架。阻止在非 Tauri 环境（CLI、harness）中使用。
-- **修复**: 将 Tauri 依赖移入 tauri-app 或使用 trait 抽象。
+- **文件**: `crates/infra-plugin-host/Cargo.toml`, `crates/tauri-app/src/mvu_webview_runtime.rs`
+- **问题**: 基础设施层 crate 曾直接依赖 UI 框架。阻止在非 Tauri 环境（CLI、harness）中使用。
+- **修复**: 已将 `WebViewMvuRuntime` 移入 `tauri-app` adapter，`infra-plugin-host` 只保留 `MvuRuntime` trait/DTO/事件协议。
 - **置信度**: R5 单次确认
 
 ### H-013: CampaignStore 持锁做 7 次文件写入
@@ -239,6 +239,6 @@
 15. **H-014**: 全量同步 I/O 替换为异步
 16. **H-013**: CampaignStore 持久化从锁内移出
 17. **H-002**: API key 加密存储
-18. **H-012**: infra-plugin-host 移除直接 Tauri 依赖
+18. **H-012**: infra-plugin-host 移除直接 Tauri 依赖（已完成 2026-07-06）
 19. **R3 Top5**: CampaignRuntimeContext / ToolContext 大对象改为 Arc 共享
 20. 测试覆盖：app-pipeline、storage、app-memory 补测试

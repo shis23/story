@@ -2,6 +2,7 @@ pub mod campaign_store;
 mod connection_store;
 pub mod error;
 mod module_store;
+mod mvu_webview_runtime;
 mod preset_store;
 mod storage;
 
@@ -30,11 +31,12 @@ use storyforge_domain::llm::{
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
-use storyforge_infra_plugin_host::mvu_runtime::{MvuExecuteResponse, WebViewMvuRuntime};
+use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
 use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
 use tauri::Manager;
 
 use crate::error::TauriCommandError;
+use crate::mvu_webview_runtime::{MvuPendingMap, WebViewMvuRuntime, new_mvu_pending_map};
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -5426,13 +5428,6 @@ fn sanitize_filename(name: &str) -> String {
 
 // ─── W8 MVU JS Runtime 命令 ─────────────────────────────────────────────
 
-/// MVU pending 请求 map 类型（由 WebViewMvuRuntime 管理，command handler 通过 Tauri state 访问）
-type MvuPendingMap = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<MvuExecuteResponse>>,
-    >,
->;
-
 /// 前端确认 unload 完成
 #[tauri::command]
 async fn mvu_unload_ack() -> Result<(), TauriCommandError> {
@@ -5483,8 +5478,7 @@ pub fn run() {
     storyforge_app_logging::init_tracing(app_state.log_store.clone());
 
     // W8 MVU JS Runtime：共享 pending map
-    let mvu_pending: MvuPendingMap =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mvu_pending: MvuPendingMap = new_mvu_pending_map();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())

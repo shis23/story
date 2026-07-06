@@ -147,7 +147,7 @@
 | H-009 | 无 LLM 重试逻辑 | 需设计退避策略和配置化 |
 | H-010 | Tauri 命令错误扁平化为 String | 需定义前端错误处理体系 |
 | H-011 | 损坏 JSON 静默返回空 | 需设计用户通知/恢复 UI |
-| H-012 | infra-plugin-host 依赖 tauri | 需 trait 抽象重构 |
+| H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：Tauri/WebView adapter 移至 `tauri-app/src/mvu_webview_runtime.rs` |
 | H-013 | CampaignStore 持锁做 7 次写入 | 需 clone-then-write 重构 |
 | H-014 | 同步 fs 阻塞异步运行时 | 需全量 store 接口变更 |
 | M-003 | active_variant 无边界检查 | 需设计数据修复策略 |

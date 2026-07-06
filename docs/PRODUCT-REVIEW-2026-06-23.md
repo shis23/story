@@ -90,7 +90,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 5 | 事件总线接线 | 前端有，后端未桥接 | 2-3 天 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | Constant 已注入 | 补关键词扫描 + 绿灯激活，2-3 天 |
-| 8 | H-012 trait 抽象 | `WebViewMvuRuntime` 硬依赖 tauri | 抽 `MvuEventPort` trait，3-5 天 |
+| 8 | H-012 trait 抽象 | ✅ 已完成：`infra-plugin-host` 不再依赖 tauri | Tauri/WebView adapter 已移动到 `tauri-app/src/mvu_webview_runtime.rs` |
 
 ### 2.3.1 正则系统（独立工作项 R）
 
@@ -201,7 +201,7 @@ Layer 1: Meta Agent 复刻
 
 | ID | 问题 | 阻碍 ST 兼容? | 阻碍 Android? | 时机 |
 |---|---|---|---|---|
-| H-012 | infra-plugin-host 依赖 tauri | 🔴 是 | 🔴 是 | S3 先还 |
+| H-012 | infra-plugin-host 依赖 tauri | ✅ 已修复 | ✅ 已修复 | 2026-07-06 已拆 adapter |
 | H-002 | API key 明文存储 | 否 | 🔴 是 | S4 |
 | H-013 | CampaignStore 单 Mutex + 同步 JSON I/O | 否 | 🟡 中 | S4（写入错误传播已完成，性能压测/拆分待做） |
 | H-014 | 同步 fs 阻塞 tokio | 否 | 🟡 中 | S4 |
@@ -267,7 +267,7 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 - 写 Silver checklist
 - 用 3 张不同题材状态卡跑通
 - Prompt 组装事件暴露（缺口 6）
-- H-012 trait 抽象（缺口 8）
+- H-012 trait 抽象（缺口 8，已于 2026-07-06 完成）
 - **门 2**：部分失败则补缺口，不进 Android
 
 #### S4：Android 前置债务（5-7 天）
@@ -423,7 +423,7 @@ skill: mvu-card-translation
 | CharacterInstance（信息隔离）| `crates/domain/src/campaign.rs` | 122-232 |
 | assemble_system_prompt | `crates/domain/src/prompt_module.rs` | 153-196 |
 | MvuTranslation（原生/兜底路由）| `crates/domain/src/mvu_translation.rs` | 28-125 |
-| WebViewMvuRuntime | `crates/infra-plugin-host/src/mvu_runtime.rs` | 全文 |
+| WebViewMvuRuntime | `crates/tauri-app/src/mvu_webview_runtime.rs` | 全文 |
 | 插件 API（window.storyforge）| `frontend/src/plugin-bridge.js` | 35-131 |
 | PluginHost（iframe 沙箱）| `frontend/src/components/PluginHost.vue` | 全文 |
 | MvuStatusBar（原生渲染）| `frontend/src/components/MvuStatusBar.vue` | 全文 |

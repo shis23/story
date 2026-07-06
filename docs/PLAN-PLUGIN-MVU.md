@@ -17,7 +17,7 @@
 ## 当前事实
 
 - `crates/infra-plugin-host/src/lib.rs` 已有 `PluginManifest`、`PluginRegistry`、权限、安装/启用/卸载能力。
-- `crates/infra-plugin-host/src/mvu_runtime.rs` 定义了 `MvuRuntime` trait，但 `StubMvuRuntime` 全部返回 `NotImplemented`。
+- `crates/infra-plugin-host/src/mvu_runtime.rs` 定义纯 `MvuRuntime` trait/DTO/事件协议；`StubMvuRuntime` 保留为 harness/降级实现，Tauri/WebView 可用实现位于 `crates/tauri-app/src/mvu_webview_runtime.rs`。
 - `crates/app-meta/src/mvu_import.rs` 已能分析 MVU 卡，产出 `MvuTranslation`。
 - `crates/tauri-app/src/lib.rs::meta_analyze_mvu_card` 会保存 `StoredMvuTranslation`。
 - `frontend/src/components/MetaPanel.vue` 能触发 MVU 分析和查看 translation。
@@ -144,7 +144,7 @@ cargo test -p storyforge
 
 - `crates/infra-plugin-host/src/mvu_runtime.rs`
 - `crates/tauri-app/src/lib.rs`
-- 可能新增 runtime adapter 文件
+- `crates/tauri-app/src/mvu_webview_runtime.rs`
 
 候选实现：
 
@@ -160,7 +160,7 @@ cargo test -p storyforge
 
 验收：
 
-- `StubMvuRuntime` 可替换为一个可用实现。
+- `StubMvuRuntime` 已可由 Tauri 层 `WebViewMvuRuntime` adapter 替换。
 - JS fallback 失败不影响主写作。
 - 错误可显示在 Meta/MVU 面板。
 
@@ -191,4 +191,3 @@ cargo test -p storyforge
 - 禁止执行任意远程 JS。
 - 禁止绕过 Meta patch preview 修改变量。
 - 禁止为了少数复杂 ST 卡牺牲 native/pure data 路径。
-

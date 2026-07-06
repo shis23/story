@@ -127,7 +127,7 @@
 - ~~设计 StoryForge Campaign 导出格式。~~ ✅ JSON bundle（`format_version`）
 - ~~评估是否支持导出回 ST 卡或 Lorebook。~~ ✅ ST 卡 PNG（tEXt 写入）+ 多角色共享 lorebook
 - ~~MVU apply 前端接线：后端 `meta_preview_mvu_apply`/`meta_apply_mvu_schema` 命令已有，前端 API 未接。~~ ✅ W9 已实现：tauri-api.js 补 API + MetaPanel 加 preview diff + 确认 apply + 变量 tab 刷新
-- ~~JS Fallback WebView Runtime 接通写作流程：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。~~ ✅ W10 已实现：DI 注入 + postprocess 调 execute_fragment，harness 传 None 降级
+- ~~JS Fallback WebView Runtime 接通写作流程：`WebViewMvuRuntime` + JSR/ST API 常用子集 shim 已实现（W8），trait 异步化完成，但 postprocess/pipeline 尚未调用 `execute_fragment`——runtime 未接进写作流程。~~ ✅ W10 已实现：DI 注入 + postprocess 调 execute_fragment，harness 传 None 降级；2026-07-06 已将 WebView/Tauri adapter 从 `infra-plugin-host` 拆到 `tauri-app/src/mvu_webview_runtime.rs`
 
 验收：
 
@@ -144,7 +144,7 @@
 已知限制（非阻塞）：
 
 - **JS 变量归口**：`execute_fragment` 产出的 `variable_updates` 统一写入 campaign 级变量（`instance_id=None`）。若需按角色归属，后续需细化 key 前缀解析或扩展 `MvuExecResult` 携带 `instance_id`。
-- **JSR shim 覆盖度**：`WebViewMvuRuntime` 的 JSR/ST API shim 基于常用子集实现，依赖冷门 API 的重 DOM 卡将降级为跳过 JS 执行（`tracing::warn!` + `is_available()=false` 回退），不影响主写作。
+- **JSR shim 覆盖度**：`WebViewMvuRuntime` 的 JSR/ST API shim 基于常用子集实现，依赖冷门 API 的重 DOM 卡可能降级为跳过 JS 更新（`tracing::warn!` + 执行失败/超时回退），不影响主写作。
 
 ## Phase 6: Android 打磨
 

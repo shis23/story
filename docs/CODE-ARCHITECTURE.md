@@ -37,7 +37,7 @@
 - DAG 无环 ✅
 
 **已知违规**：
-- `infra-plugin-host` 直接依赖 `tauri = "2"`（应移至 tauri-app）
+- 无当前分层违规；`infra-plugin-host` 的 Tauri/WebView runtime 已移至 `tauri-app/src/mvu_webview_runtime.rs`。
 
 ---
 
@@ -94,7 +94,7 @@ Conversation (1) ──< MessageNode (N) ──< MessageVariant (N)
 | `CONN_STORE` | `OnceLock<ConnectionStore>` | `lib.rs:45` | ~10 读/写 | 同上 |
 | `PRESET_STORE` | `OnceLock<PresetStore>` | `lib.rs:54` | ~8 读/写 | 低 |
 | `CAMPAIGN_STORE` | `OnceLock<CampaignStore>` | `lib.rs:63` | 50+ 读/写 | **中高** — 写入已返回 `Result`，但仍是单 Mutex + 同步 JSON I/O |
-| `MVU_RUNTIME` | `OnceLock<Arc<WebViewMvuRuntime>>` | `lib.rs:73` | 1 读 | 无 |
+| `MVU_RUNTIME` | `OnceLock<Arc<WebViewMvuRuntime>>` | `lib.rs` + `mvu_webview_runtime.rs` | 1 读 | 无 |
 | `tool_ctx` | `Arc<RwLock<ToolContext>>` | `lib.rs:128` | 20+ 读, 8+ 写 | **高** — 写频繁 |
 | `current_cancel` | `Mutex<Option<Sender>>` | `lib.rs:130` | 2 写, 1 读 | 低 |
 | `active_llm` | `Mutex<Option<LlmClient>>` | `lib.rs:132` | 2 写, ~20 读 | 低 |

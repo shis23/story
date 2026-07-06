@@ -194,6 +194,7 @@
 - `crates/infra-plugin-host/src/mvu_runtime.rs`
 - `crates/infra-plugin-host/Cargo.toml`
 - `crates/tauri-app/src/lib.rs`
+- `crates/tauri-app/src/mvu_webview_runtime.rs`
 - `crates/tauri-app/src/campaign_store.rs`
 - `docs/ARCHITECTURE-AUDIT.md`
 - `docs/RELEASE-CHECKLIST.md`
@@ -201,9 +202,9 @@
 任务：
 
 1. `infra-plugin-host` 分层债：
-   - 当前 `WebViewMvuRuntime` 直接持有 `tauri::AppHandle` 并使用 Tauri event，导致 infra crate 依赖 Tauri。
-   - 拆分目标是让 `infra-plugin-host` 保留 `MvuRuntime` trait、DTO 和纯错误类型，把 Tauri event 发送/等待逻辑放到 Tauri 层 adapter。
-   - 建议先引入小接口（如 `MvuEventPort` / `MvuRuntimePort`）承载 `emit`、pending request 和 ack，再移动实现；不要让 `app-pipeline` 或 `app-agent` 直接依赖 `tauri-app`。
+   - 已拆分：`infra-plugin-host` 只保留 `MvuRuntime` trait、DTO、事件名和纯错误类型，`Cargo.toml` 不再依赖 Tauri。
+   - `WebViewMvuRuntime` 已移动到 `crates/tauri-app/src/mvu_webview_runtime.rs`，由 Tauri 层持有 `tauri::AppHandle`、emit event 并等待 pending oneshot。
+   - `app-pipeline` / `app-agent` 仍只依赖 infra trait，不直接依赖 `tauri-app`。
 2. `CampaignStore` 存储债：
    - 当前适合桌面开发和小数据量；写入错误已可见，但单 Mutex + 同步 JSON I/O 在 Android 和长会话里仍可能放大卡顿。
    - 发布前先测锁持有时间、连续 postprocess 写回、导入大卡和 app 重启恢复；只有确认阻塞后再做后台 flush / 分文件索引 / schema 迁移。
@@ -213,7 +214,7 @@
 验收：
 
 - 技术债是否阻塞发布有明确证据，而不是凭感觉。
-- `infra-plugin-host` 的 Tauri 依赖要么已拆掉，要么在 release checklist 中标为发布前风险。
+- `infra-plugin-host` 的 Tauri 依赖已拆掉；release checklist 仅保留 WebView MVU 真实卡回归风险。
 - `CampaignStore` 的性能风险有可复现实验记录和处理结论。
 
 ## 阶段 5：发布包和用户入口

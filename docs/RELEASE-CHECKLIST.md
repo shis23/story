@@ -91,7 +91,7 @@ Android 候选版本需验证：
 
 当前仍需排队：
 
-- `infra-plugin-host` 仍直接依赖 Tauri，需要 adapter 分层。
+- `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 仍是单 Mutex + 同步 JSON I/O，需要压测后判断是否拆后台 flush。
 - API key 明文存储仍需 keyring/系统安全存储方案。
 - 真实卡 Gold 档兼容尚未完成验收。

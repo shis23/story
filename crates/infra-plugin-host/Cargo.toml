@@ -12,6 +12,6 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true
-uuid.workspace = true
-tauri = { version = "2", features = [] }

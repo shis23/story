@@ -219,7 +219,7 @@
 | MVU-2 | MVU Translation → variable schema diff 预览 | 已实现 | 预览逻辑 `MvuApplyPreview`/`compute_apply_preview` 存在；`meta_preview_mvu_apply` 命令 + 前端 `metaPreviewMvuApply` 已接 |
 | MVU-3 | 把 MVU schema patch apply 进 Campaign | 已实现 | `meta_apply_mvu_schema` 注册并算 preview+apply；W9 前接通 `tauri-api.js` + MetaPanel diff 展示 + 确认 apply |
 | MVU-4 | 原生状态栏从 Campaign 变量渲染 | 已实现 | `MvuStatusBar.vue` 渲染 bar/text/tag/icon；用于 `CharacterDetail.vue`（未进 `CampaignPanel`） |
-| MVU-5 | 混合 JS fallback runtime（WebView） | 已实现 | W8 `WebViewMvuRuntime` + JSR/ST shim；W10 DI 注入 pipeline 并在 postprocess 调 `execute_fragment`；harness 传 None 降级 |
+| MVU-5 | 混合 JS fallback runtime（WebView） | 已实现 | `infra-plugin-host` 保留纯 `MvuRuntime`/DTO/事件协议，Tauri/WebView adapter 在 `tauri-app/src/mvu_webview_runtime.rs`；W10 DI 注入 pipeline 并在 postprocess 调 `execute_fragment`；harness 传 None 降级 |
 | MVU-6 | 插件权限/安全分层 | 部分 | `Permission` enum + `ensure_permission` 存在；未覆盖全部 5 计划层（无 `network_access` toggle 证据） |
 | ST-T1 | 定 ST V2/V3 导入保真范围 | 部分 | `from_st_card()` 覆盖所列字段；部分 checkbox 未结 |
 | ST-T2 | raw_json + extensions 保留策略 | 已实现（保留） | 两者以 `serde_json::Value` 保留；设计 Q 未结 |
