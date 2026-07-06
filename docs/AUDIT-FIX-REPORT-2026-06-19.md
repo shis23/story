@@ -142,7 +142,7 @@
 | ID | 问题 | 推迟原因 |
 |----|------|----------|
 | H-001 | Store persist 吞掉写入错误 | ~30 个调用点签名变更 |
-| H-002 | API key 明文存储 | 需 OS 密钥链集成 |
+| H-002 | API key 明文存储 | ✅ 2026-07-06 已完成：`connections.json`/`embed.json` 仅保存 SecretRef，真实 key 走系统凭据库；Android 实机仍需验证 |
 | H-003 | data_dir 用 exe 路径 | 需数据迁移策略 |
 | H-009 | 无 LLM 重试逻辑 | 需设计退避策略和配置化 |
 | H-010 | Tauri 命令错误扁平化为 String | 需定义前端错误处理体系 |

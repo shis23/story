@@ -43,6 +43,7 @@
 - **文件**: `crates/tauri-app/src/connection_store.rs:42`, `crates/tauri-app/src/lib.rs:95`
 - **问题**: LLM 和 Embedding API key 以明文 JSON 存储在 `data/connections.json` 和 `data/embed.json`。代码有 TODO 注释承认此问题。
 - **修复**: 使用 OS 密钥链（Windows Credential Manager / macOS Keychain）。
+- **当前状态（2026-07-06）**: 已新增 `storyforge-infra-util::secret_store`，通过 `keyring` 写入系统凭据库；`connections.json` 和 `embed.json` 只保存 `storyforge-secret:v1:*` 引用。旧明文文件在加载时迁移，运行时再解析回真实 key；真实 LLM harness 已支持从 SecretRef 解析 active 连接。
 - **置信度**: R1 双盲 ✅✅
 
 ### H-003: `data_dir` 基于可执行文件路径而非 OS 标准目录

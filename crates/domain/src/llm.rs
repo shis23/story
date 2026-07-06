@@ -6,14 +6,14 @@ use crate::Id;
 
 /// LLM 连接配置
 ///
-/// H-4：手写 Debug 打码 api_key（Serialize 保留，存盘需要 key）。
+/// H-4：手写 Debug 打码 api_key。
 /// 展示给前端用 LlmConnectionSummary（已剥离 key）。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConnection {
     pub id: Id,
     pub name: String,
     pub base_url: String,
-    /// API key 明文（M1 桌面开发用；Android 阶段改为 SecretRef）
+    /// 运行时为真实 API key；持久化时可为 SecretRef，由上层 store 解析。
     pub api_key: String,
     pub model: String,
     pub protocol: LlmProtocol,

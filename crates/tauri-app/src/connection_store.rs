@@ -1,17 +1,21 @@
-/// LLM 连接存储（JSON 文件持久化）
+/// LLM 连接存储（JSON 文件持久化 + 系统凭据库存 key）
 ///
 /// 存储位置：data/connections.json
 /// 结构：{ active_id: Option<String>, connections: Vec<StoredConnection> }
 ///
-/// 注意：API key 当前明文存储（桌面开发阶段）。
-/// Android 阶段需改为 Keystore + SecretRef（设计 §5）。
+/// 注意：`connection.api_key` 在磁盘上只保存 SecretRef；运行时读取时会解析为真实 key。
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use storyforge_domain::llm::LlmConnection;
+use storyforge_infra_util::secret_store::{
+    SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
+};
 
-/// 已存储的连接（含 api_key）
+const LLM_SECRET_KIND: &str = "llm-connection";
+
+/// 已存储的连接；磁盘上的 `connection.api_key` 是 SecretRef。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredConnection {
     pub id: String,
@@ -33,12 +37,17 @@ pub struct ConnectionsFile {
 /// 连接存储
 pub struct ConnectionStore {
     path: PathBuf,
+    secret_store: Arc<dyn SecretStore>,
     inner: Mutex<ConnectionsFile>,
 }
 
 impl ConnectionStore {
     /// 初始化（从文件加载或新建）
     pub fn new(app_data_dir: &Path) -> Self {
+        Self::new_with_secret_store(app_data_dir, Arc::new(SystemSecretStore::default()))
+    }
+
+    pub fn new_with_secret_store(app_data_dir: &Path, secret_store: Arc<dyn SecretStore>) -> Self {
         let path = app_data_dir.join("connections.json");
         let file = if path.exists() {
             match std::fs::read_to_string(&path) {
@@ -60,10 +69,15 @@ impl ConnectionStore {
         } else {
             ConnectionsFile::default()
         };
-        Self {
+        let store = Self {
             path,
+            secret_store,
             inner: Mutex::new(file),
+        };
+        if let Err(e) = store.migrate_plaintext_api_keys() {
+            tracing::warn!("迁移连接 API key 到系统凭据库失败，保留旧文件: {e}");
         }
+        store
     }
 
     /// 保存连接（新建或更新）
@@ -73,9 +87,11 @@ impl ConnectionStore {
         // 若已存在同 id，更新；否则新增
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let conn_id = connection.id.as_str().to_string();
+        let mut stored_connection = connection.clone();
+        stored_connection.api_key = self.secure_api_key(&conn_id, &connection.api_key)?;
 
         if let Some(existing) = file.connections.iter_mut().find(|c| c.id == conn_id) {
-            existing.connection = connection.clone();
+            existing.connection = stored_connection.clone();
             existing.last_used_at = Some(now.clone());
             let updated = existing.clone();
             self.persist(&file)?;
@@ -84,7 +100,7 @@ impl ConnectionStore {
 
         let stored = StoredConnection {
             id: conn_id,
-            connection,
+            connection: stored_connection,
             created_at: now,
             last_used_at: None,
         };
@@ -117,13 +133,28 @@ impl ConnectionStore {
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = file.connections.len();
-        file.connections.retain(|c| c.id != id);
+        let mut removed_secret_refs = Vec::new();
+        file.connections.retain(|c| {
+            if c.id == id {
+                if is_secret_ref(&c.connection.api_key) {
+                    removed_secret_refs.push(c.connection.api_key.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
         if file.connections.len() < before {
             // 若删除的是活跃连接，清除 active_id
             if file.active_id.as_deref() == Some(id) {
                 file.active_id = None;
             }
             self.persist(&file)?;
+            for secret_ref in removed_secret_refs {
+                if let Err(e) = self.secret_store.delete_secret(&secret_ref) {
+                    tracing::warn!("删除连接 SecretRef 失败 {secret_ref}: {e}");
+                }
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -145,12 +176,16 @@ impl ConnectionStore {
     /// 返回对应的 LlmConnection（供调用方构造 client）。
     pub fn set_active(&self, id: &str) -> Result<Option<LlmConnection>, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let stored = match file.connections.iter_mut().find(|c| c.id == id) {
-            Some(s) => s,
-            None => return Ok(None),
+        let conn = {
+            let stored = match file.connections.iter_mut().find(|c| c.id == id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let conn = self.resolve_connection(&stored.connection)?;
+            stored.last_used_at =
+                Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            conn
         };
-        stored.last_used_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        let conn = stored.connection.clone();
         file.active_id = Some(id.to_string());
         self.persist(&file)?;
         Ok(Some(conn))
@@ -160,10 +195,50 @@ impl ConnectionStore {
     pub fn active_connection(&self) -> Option<LlmConnection> {
         let file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let active_id = file.active_id.as_ref()?;
-        file.connections
+        let conn = file
+            .connections
             .iter()
             .find(|c| &c.id == active_id)
-            .map(|c| c.connection.clone())
+            .map(|c| c.connection.clone())?;
+        match self.resolve_connection(&conn) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::warn!("读取活跃连接 SecretRef 失败: {e}");
+                None
+            }
+        }
+    }
+
+    fn migrate_plaintext_api_keys(&self) -> Result<(), String> {
+        let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut changed = false;
+        for stored in &mut file.connections {
+            let api_key = stored.connection.api_key.clone();
+            if api_key.is_empty() || is_secret_ref(&api_key) {
+                continue;
+            }
+            stored.connection.api_key = self.secure_api_key(&stored.id, &api_key)?;
+            changed = true;
+        }
+        if changed {
+            self.persist(&file)?;
+        }
+        Ok(())
+    }
+
+    fn secure_api_key(&self, conn_id: &str, api_key: &str) -> Result<String, String> {
+        if api_key.is_empty() || is_secret_ref(api_key) {
+            return Ok(api_key.to_string());
+        }
+        let secret_ref = make_secret_ref(LLM_SECRET_KIND, conn_id);
+        self.secret_store.put_secret(&secret_ref, api_key)?;
+        Ok(secret_ref)
+    }
+
+    fn resolve_connection(&self, connection: &LlmConnection) -> Result<LlmConnection, String> {
+        let mut conn = connection.clone();
+        conn.api_key = resolve_secret_value(&conn.api_key, self.secret_store.as_ref())?;
+        Ok(conn)
     }
 
     fn persist(&self, file: &ConnectionsFile) -> Result<(), String> {
@@ -178,7 +253,39 @@ impl ConnectionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
+
+    #[derive(Default)]
+    struct MemorySecretStore {
+        secrets: Mutex<HashMap<String, String>>,
+        deleted: Mutex<Vec<String>>,
+    }
+
+    impl SecretStore for MemorySecretStore {
+        fn put_secret(&self, secret_ref: &str, secret: &str) -> Result<(), String> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(secret_ref.to_string(), secret.to_string());
+            Ok(())
+        }
+
+        fn get_secret(&self, secret_ref: &str) -> Result<String, String> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .get(secret_ref)
+                .cloned()
+                .ok_or_else(|| format!("missing secret {secret_ref}"))
+        }
+
+        fn delete_secret(&self, secret_ref: &str) -> Result<(), String> {
+            self.secrets.lock().unwrap().remove(secret_ref);
+            self.deleted.lock().unwrap().push(secret_ref.to_string());
+            Ok(())
+        }
+    }
 
     fn make_conn(name: &str) -> LlmConnection {
         LlmConnection {
@@ -194,10 +301,19 @@ mod tests {
     }
 
     fn temp_store() -> ConnectionStore {
+        temp_store_with_secret_store().0
+    }
+
+    fn temp_store_with_secret_store() -> (ConnectionStore, Arc<MemorySecretStore>, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("storyforge_test_conn_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        ConnectionStore::new(&dir)
+        let secret_store = Arc::new(MemorySecretStore::default());
+        (
+            ConnectionStore::new_with_secret_store(&dir, secret_store.clone()),
+            secret_store,
+            dir,
+        )
     }
 
     #[test]
@@ -242,17 +358,102 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
 
         {
-            let store = ConnectionStore::new(&dir);
+            let store = ConnectionStore::new_with_secret_store(&dir, secret_store.clone());
             store.save(make_conn("persist-1")).unwrap();
             store.set_active("persist-1").unwrap();
         }
 
         // 新实例从同一文件加载
-        let store2 = ConnectionStore::new(&dir);
+        let store2 = ConnectionStore::new_with_secret_store(&dir, secret_store);
         assert_eq!(store2.list().len(), 1);
         assert_eq!(store2.active_id().as_deref(), Some("persist-1"));
+        assert_eq!(
+            store2.active_connection().unwrap().api_key,
+            "sk-test",
+            "运行时应能从 SecretRef 解析真实 key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_stores_secret_ref_not_plaintext() {
+        let (store, secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("deepseek-secure")).unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(!raw.contains("sk-test"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let stored = store.get("deepseek-secure").unwrap();
+        assert!(is_secret_ref(&stored.connection.api_key));
+        assert_eq!(
+            secret_store
+                .get_secret(&stored.connection.api_key)
+                .expect("secret stored"),
+            "sk-test"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_active_resolves_secret_ref() {
+        let (store, _secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("deepseek-active")).unwrap();
+
+        let conn = store.set_active("deepseek-active").unwrap().unwrap();
+        assert_eq!(conn.api_key, "sk-test");
+        assert_eq!(store.active_connection().unwrap().api_key, "sk-test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_migrates_plaintext_api_key_to_secret_ref() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_migrate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stored = StoredConnection {
+            id: "legacy".into(),
+            connection: make_conn("legacy"),
+            created_at: "2026-07-06 00:00:00".into(),
+            last_used_at: None,
+        };
+        let file = ConnectionsFile {
+            active_id: Some("legacy".into()),
+            connections: vec![stored],
+        };
+        storyforge_infra_util::atomic_write_json(&dir.join("connections.json"), &file).unwrap();
+
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(!raw.contains("sk-test"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+        assert_eq!(store.active_connection().unwrap().api_key, "sk-test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_removes_secret_ref() {
+        let (store, secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("delete-me")).unwrap();
+        let secret_ref = store.get("delete-me").unwrap().connection.api_key;
+
+        assert!(store.delete("delete-me").unwrap());
+        assert!(secret_store.get_secret(&secret_ref).is_err());
+        assert_eq!(
+            secret_store.deleted.lock().unwrap().as_slice(),
+            &[secret_ref]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

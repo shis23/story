@@ -7,6 +7,8 @@
 //! - `recover_lock`：恢复被毒化的 `Mutex`/`RwLock`，避免单次 panic 级联成
 //!   整个命令层瘫痪（参照 `app-conversation` 的 `lock_cache` 范式）。
 
+pub mod secret_store;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{LockResult, MutexGuard, RwLockReadGuard, RwLockWriteGuard};

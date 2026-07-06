@@ -16,7 +16,7 @@ use storyforge_domain::llm::LlmError;
 pub struct EmbedConfig {
     /// API 端点（如 https://api.openai.com/v1/embeddings）
     pub endpoint: String,
-    /// API key（Debug 时打码为 ***）
+    /// 运行时为真实 API key；持久化时可为 SecretRef（Debug 时打码为 ***）。
     pub api_key: String,
     /// 模型名（如 text-embedding-3-small / bge-large-zh）
     pub model: String,

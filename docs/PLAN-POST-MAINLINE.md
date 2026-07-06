@@ -237,12 +237,13 @@
 1. 桌面端：
    - 验证 dev 与 release build。
    - 明确配置文件位置。
-   - 明确 LLM API key 配置方式。
+   - 明确 LLM API key 配置方式：连接和 embedder 配置文件只保存 `storyforge-secret:v1:*`，真实 key 由 `keyring` 写入系统凭据库；发布前需抽样确认旧明文文件会自动迁移。
 2. Android：
    - 验证 debug/release 构建链路。
    - 确认签名策略。
    - 验证文件导入权限。
    - 验证日志/排障 bundle 导出。
+   - 验证 Android keyring backend 可写、可读、可迁移、可删除。
 3. 首次使用流程：
    - 导入角色卡。
    - 创建 Campaign。

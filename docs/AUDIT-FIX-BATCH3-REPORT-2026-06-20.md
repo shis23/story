@@ -98,7 +98,7 @@
 
 | ID | 问题 | 推迟原因 |
 |----|------|----------|
-| H-002 | API key 明文存储 | 需添加 `keyring` crate 依赖 + OS 密钥链集成 + 数据迁移策略 |
+| H-002 | API key 明文存储 | ✅ 2026-07-06 已完成：新增 `keyring`/系统凭据库存储 + SecretRef 落盘 + 旧明文迁移；Android 目标环境仍需实机验证 |
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：`WebViewMvuRuntime` 移动到 `tauri-app/src/mvu_webview_runtime.rs`，infra 只保留 trait/DTO/事件协议 |
 | H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁 + 增加并发写回回放；剩余同步 I/O/后台 flush 评估 |
 | H-014 | 同步 fs 阻塞异步运行时 | `fill_campaign_context` 需重构为 `spawn_blocking` 模式，涉及调用链变更 |

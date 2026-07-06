@@ -23,12 +23,14 @@
 - `cargo test --workspace`：通过；真实 LLM 用例按预期 ignore。
 - `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
 - CampaignStore 压测：Git Bash 用 `SF_STORE_PRESSURE_WRITES=500 cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture`；PowerShell 用 `$env:SF_STORE_PRESSURE_WRITES='500'; cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture; Remove-Item Env:SF_STORE_PRESSURE_WRITES`。通过；本机 4 集合并发写入 500 次/集合，总耗时约 2.9s，p95 为 knowledge 6.6ms / tasks 7.4ms / summaries 6.8ms / mvu 8.5ms，max 约 28ms。
+- API key 安全存储相关单测：`cargo test -p storyforge-infra-util`、`cargo test -p storyforge --lib connection_store`、`cargo test -p storyforge --lib test_embed_config` 通过；覆盖新写入 SecretRef、旧明文迁移、运行时解析和删除清理。
 
 本轮质量修复：
 
 - `AppState` 支持测试临时数据目录，避免读取本机真实角色和 active Campaign。
 - `fill_campaign_context`、`configure_embedder`、`set_active_campaign` 改用 `state.data_dir`。
 - `CampaignStore` 写入结果不再静默忽略：Tauri 命令返回 `storage` 错误，postprocess 后台写回记录 warning。
+- LLM 连接和 embedder 的 API key 已改为系统凭据库存储；`connections.json` / `embed.json` 只保存 `storyforge-secret:v1:*` 引用，并兼容旧明文文件自动迁移。
 - harness 和 tauri-app 测试 fixture 写入用 `unwrap()` 显式暴露失败。
 - Rust workspace/all-targets clippy warning 已清理；保留的高参数公共流程入口只在函数处加局部 allow，避免把 API 重构混入质量闸门切片。
 
@@ -90,6 +92,7 @@ Android 候选版本需验证：
 - 坏卡导入失败不破坏已有数据。
 - 写作中断不会留下错误 active state。
 - `CampaignStore` 写入失败能被 UI 或日志观察到。
+- `connections.json`、`embed.json` 不应出现真实 API key；发布候选需抽样确认仅包含 SecretRef。
 - private/封口知识不会通过 postprocess 的告知或广播写入被继续传播；失败/阻断应在日志中可见。
 - 传话链当前依赖文本匹配；发布说明不要把它描述成完整语义级追踪。
 - 数据迁移失败不覆盖旧目录。
@@ -101,6 +104,6 @@ Android 候选版本需验证：
 
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
-- API key 明文存储仍需 keyring/系统安全存储方案。
+- API key 明文存储已接入 `keyring`/系统凭据库；发布前仍需在目标 Windows/macOS/Linux/Android 环境分别验证凭据写入、读取、迁移和删除。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

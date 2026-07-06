@@ -261,8 +261,8 @@ AgentProfileManager → save_agent_profile_config Tauri 命令
 | 文件 | 格式 | 存储位置 | 读写频率 |
 |------|------|----------|----------|
 | `characters.json` | `Vec<StoredCharacter>` | data/ | 导入时写，启动读 |
-| `connections.json` | `ConnectionsFile { connections, active_id }` | data/ | 配置时写，每次 LLM 调用读 |
-| `embed.json` | `EmbedConfig` | data/ | 配置时写，嵌入时读 |
+| `connections.json` | `ConnectionsFile { connections, active_id }`，API key 字段为 SecretRef | data/ + 系统凭据库 | 配置时写，启动/切换连接时读 |
+| `embed.json` | `EmbedConfig`，API key 字段为 SecretRef | data/ + 系统凭据库 | 配置时写，嵌入时读 |
 | `presets.json` | `Vec<StoredPreset>` | data/ | 管理时写，启动读 |
 | `modules.json` | `Vec<PromptModule>` | data/ | 管理时写，写作时读 |
 | `active_profile.json` | `ActiveProfile { id }` | data/ | 切换时写，写作时读 |

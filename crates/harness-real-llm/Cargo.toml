@@ -9,6 +9,7 @@ publish = false
 storyforge-domain.workspace = true
 storyforge-infra-import.workspace = true
 storyforge-infra-llm.workspace = true
+storyforge-infra-util.workspace = true
 storyforge-infra-vector.workspace = true
 storyforge-app-agent.workspace = true
 storyforge-app-conversation.workspace = true

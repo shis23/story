@@ -32,6 +32,9 @@ use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
+use storyforge_infra_util::secret_store::{
+    SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
+};
 use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
 use tauri::Manager;
 
@@ -41,6 +44,8 @@ use crate::mvu_webview_runtime::{MvuPendingMap, WebViewMvuRuntime, new_mvu_pendi
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
 static STORE: OnceLock<CharacterStore> = OnceLock::new();
+const EMBED_SECRET_KIND: &str = "embedder";
+const EMBED_SECRET_ID: &str = "default";
 
 fn get_store() -> &'static CharacterStore {
     STORE.get_or_init(|| {
@@ -176,20 +181,66 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 fn load_embed_config(data_dir: &Path) -> Option<storyforge_infra_llm::EmbedConfig> {
+    let secret_store = SystemSecretStore::default();
+    load_embed_config_with_secret_store(data_dir, &secret_store)
+}
+
+fn load_embed_config_with_secret_store(
+    data_dir: &Path,
+    secret_store: &dyn SecretStore,
+) -> Option<storyforge_infra_llm::EmbedConfig> {
     let path = data_dir.join("embed.json");
     if path.exists() {
         let data = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&data).ok()
+        let mut config: storyforge_infra_llm::EmbedConfig = serde_json::from_str(&data).ok()?;
+        if is_secret_ref(&config.api_key) {
+            config.api_key = match resolve_secret_value(&config.api_key, secret_store) {
+                Ok(api_key) => api_key,
+                Err(e) => {
+                    tracing::warn!("读取嵌入 API SecretRef 失败: {e}");
+                    return None;
+                }
+            };
+        } else if !config.api_key.is_empty()
+            && let Err(e) = persist_embed_config_secret_ref(data_dir, &config, secret_store)
+        {
+            tracing::warn!("迁移嵌入 API key 到系统凭据库失败，保留旧文件: {e}");
+        }
+        Some(config)
     } else {
         None
     }
 }
 
-fn save_embed_config(data_dir: &Path, config: &storyforge_infra_llm::EmbedConfig) {
+fn save_embed_config(
+    data_dir: &Path,
+    config: &storyforge_infra_llm::EmbedConfig,
+) -> Result<(), String> {
+    let secret_store = SystemSecretStore::default();
+    persist_embed_config_secret_ref(data_dir, config, &secret_store)
+}
+
+fn persist_embed_config_secret_ref(
+    data_dir: &Path,
+    config: &storyforge_infra_llm::EmbedConfig,
+    secret_store: &dyn SecretStore,
+) -> Result<(), String> {
     let path = data_dir.join("embed.json");
-    if let Err(e) = storyforge_infra_util::atomic_write_json(&path, config) {
-        tracing::error!("保存嵌入配置失败: {e}");
+    let mut stored = config.clone();
+    let secret_ref = make_secret_ref(EMBED_SECRET_KIND, EMBED_SECRET_ID);
+    if stored.api_key.is_empty() {
+        if let Err(e) = secret_store.delete_secret(&secret_ref) {
+            tracing::warn!("删除嵌入 API SecretRef 失败: {e}");
+        }
+    } else if !is_secret_ref(&stored.api_key) {
+        secret_store.put_secret(&secret_ref, &stored.api_key)?;
+        stored.api_key = secret_ref;
     }
+    storyforge_infra_util::atomic_write_json(&path, &stored).map_err(|e| {
+        let msg = format!("保存嵌入配置失败: {e}");
+        tracing::error!("{msg}");
+        msg
+    })
 }
 
 fn load_active_campaign(data_dir: &Path) -> Option<Id> {
@@ -233,7 +284,7 @@ pub struct AppState {
     pub meta_patches: Arc<RwLock<Vec<storyforge_app_meta::Patch>>>,
     /// 类型化 Patch 存储（第三轮：campaign-runtime 修复）
     pub typed_patches: Arc<RwLock<Vec<storyforge_app_meta::TypedPatch>>>,
-    /// 嵌入配置（持久化到 data/embed.json）
+    /// 嵌入配置（metadata 持久化到 data/embed.json，API key 走 SecretRef）
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
     pub active_campaign: Mutex<Option<Id>>,
@@ -2803,7 +2854,7 @@ fn create_connection(
         id: Id::new(),
         name: req.name,
         base_url: req.base_url,
-        api_key: req.api_key, // TODO: Android 阶段改为 Keystore + SecretRef
+        api_key: req.api_key,
         model: req.model,
         protocol,
         params: SamplingParams {
@@ -3275,7 +3326,8 @@ fn configure_embedder(
         model,
         dim,
     };
-    save_embed_config(&state.data_dir, &config);
+    save_embed_config(&state.data_dir, &config)
+        .map_err(|e| TauriCommandError::storage(format!("嵌入配置写入失败: {e}")))?;
     *state
         .embed_config
         .write()
@@ -5936,8 +5988,92 @@ fn collect_world_info_for_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use storyforge_domain::character::Character;
+
+    #[derive(Default)]
+    struct MemorySecretStore {
+        secrets: Mutex<HashMap<String, String>>,
+        deleted: Mutex<Vec<String>>,
+    }
+
+    impl SecretStore for MemorySecretStore {
+        fn put_secret(&self, secret_ref: &str, secret: &str) -> Result<(), String> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(secret_ref.to_string(), secret.to_string());
+            Ok(())
+        }
+
+        fn get_secret(&self, secret_ref: &str) -> Result<String, String> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .get(secret_ref)
+                .cloned()
+                .ok_or_else(|| format!("missing secret {secret_ref}"))
+        }
+
+        fn delete_secret(&self, secret_ref: &str) -> Result<(), String> {
+            self.secrets.lock().unwrap().remove(secret_ref);
+            self.deleted.lock().unwrap().push(secret_ref.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_embed_config_stores_secret_ref_not_plaintext() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_embed_secure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = MemorySecretStore::default();
+        let config = storyforge_infra_llm::EmbedConfig {
+            endpoint: "https://api.example.com/v1/embeddings".into(),
+            api_key: "embed-secret".into(),
+            model: "embed-model".into(),
+            dim: 3,
+        };
+
+        persist_embed_config_secret_ref(&dir, &config, &secret_store).unwrap();
+        let raw = std::fs::read_to_string(dir.join("embed.json")).unwrap();
+        assert!(!raw.contains("embed-secret"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let loaded = load_embed_config_with_secret_store(&dir, &secret_store).unwrap();
+        assert_eq!(loaded.api_key, "embed-secret");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_embed_config_load_migrates_plaintext_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_embed_migrate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = MemorySecretStore::default();
+        let config = storyforge_infra_llm::EmbedConfig {
+            endpoint: "https://api.example.com/v1/embeddings".into(),
+            api_key: "legacy-embed-secret".into(),
+            model: "embed-model".into(),
+            dim: 3,
+        };
+        storyforge_infra_util::atomic_write_json(&dir.join("embed.json"), &config).unwrap();
+
+        let loaded = load_embed_config_with_secret_store(&dir, &secret_store).unwrap();
+        assert_eq!(loaded.api_key, "legacy-embed-secret");
+        let raw = std::fs::read_to_string(dir.join("embed.json")).unwrap();
+        assert!(!raw.contains("legacy-embed-secret"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_meta_session_explainer_is_injected() {
         let state = AppState::new_for_test();

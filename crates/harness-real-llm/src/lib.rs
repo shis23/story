@@ -286,8 +286,13 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
         .get("connection")
         .or(Some(conn))
         .ok_or_else(|| "connection 字段缺失".to_string())?;
-    serde_json::from_value::<LlmConnection>(conn_obj.clone())
-        .map_err(|e| format!("反序列化 LlmConnection 失败: {e}"))
+    let mut conn = serde_json::from_value::<LlmConnection>(conn_obj.clone())
+        .map_err(|e| format!("反序列化 LlmConnection 失败: {e}"))?;
+    let secret_store = storyforge_infra_util::secret_store::SystemSecretStore::default();
+    conn.api_key =
+        storyforge_infra_util::secret_store::resolve_secret_value(&conn.api_key, &secret_store)
+            .map_err(|e| format!("解析 connections.json SecretRef 失败: {e}"))?;
+    Ok(conn)
 }
 
 /// 在 `#[ignore]` 测试里调用：若拿不到真实凭证则早返（不 fail），否则构造真实 client。
