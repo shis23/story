@@ -59,7 +59,7 @@
 - ✅ P4：同名 instance 时 name 匹配路失效逼 id，消除同名写串。
 - ✅ 知识传播引擎方向 1+2+3（2026-06-19）：显式全体广播（`BroadcastTarget::All`）、身份组广播（`BroadcastTarget::Group`）和定向告知强化（postprocess 输出告知目标，读侧带告知者名字）。广播/告知不再依赖空集 hack。
 - ✅ 知识传播引擎方向 5 MVP（2026-07-06）：`PropagationPolicy::Private`、postprocess `propagation` 解析、private+broadcast 拒绝和来源私有知识阻断已落地；仍需真实 LLM 对抗评测。
-- ⏳ 知识传播引擎方向 4（传话链）待立项，见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
+- ✅ 知识传播引擎方向 4 MVP（2026-07-06）：`ToldByOther`/广播写入会用 `source_knowledge_id` 链接来源角色已有匹配知识，知识面板展示 A→B→C 传话链；仍需真实 LLM 行为评测和语义匹配增强。
 
 详细计划见：
 

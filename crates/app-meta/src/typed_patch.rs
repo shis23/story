@@ -534,6 +534,7 @@ fn apply_action(
                 knowledge_text: knowledge_text.clone(),
                 source: source.clone(),
                 source_character_id: None,
+                source_knowledge_id: None,
                 turn_number: snapshot.turn,
                 event_id: None,
                 pinned: false,

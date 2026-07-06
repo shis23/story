@@ -61,6 +61,9 @@ pub struct CharacterKnowledgeEntry {
     /// 如果是被告知（ToldByOther），记录谁告诉的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_character_id: Option<Id>,
+    /// 如果该知识来自另一条已持久化知识，记录上游知识条目，形成 A→B→C 的传话链。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_knowledge_id: Option<Id>,
     /// 第几轮知道的（backstory = 0）
     pub turn_number: u32,
     /// 关联的全局事件（可为空）
@@ -88,6 +91,7 @@ impl CharacterKnowledgeEntry {
             knowledge_text: text.into(),
             source: KnowledgeSource::Backstory,
             source_character_id: None,
+            source_knowledge_id: None,
             turn_number: 0,
             event_id: None,
             pinned: true, // backstory 默认 pin
@@ -109,6 +113,7 @@ impl CharacterKnowledgeEntry {
             knowledge_text: text.into(),
             source: KnowledgeSource::Witnessed,
             source_character_id: None,
+            source_knowledge_id: None,
             turn_number: turn,
             event_id: None,
             pinned: false,
@@ -131,6 +136,7 @@ impl CharacterKnowledgeEntry {
             knowledge_text: text.into(),
             source: KnowledgeSource::ToldByOther,
             source_character_id: Some(told_by),
+            source_knowledge_id: None,
             turn_number: turn,
             event_id: None,
             pinned: false,
@@ -147,6 +153,7 @@ impl CharacterKnowledgeEntry {
             knowledge_text: text.into(),
             source: KnowledgeSource::Inferred,
             source_character_id: None,
+            source_knowledge_id: None,
             turn_number: turn,
             event_id: None,
             pinned: false,
@@ -212,6 +219,7 @@ impl CharacterKnowledgeUpdate {
             knowledge_text: self.knowledge_text,
             source: self.source,
             source_character_id: self.source_character_id,
+            source_knowledge_id: None,
             turn_number: turn,
             event_id: None,
             pinned: self.pinned,
@@ -366,6 +374,7 @@ mod tests {
         assert_eq!(entry.turn_number, 8);
         assert!(entry.pinned);
         assert!(entry.source_character_id.is_some());
+        assert!(entry.source_knowledge_id.is_none());
     }
 
     #[test]
@@ -390,6 +399,7 @@ mod tests {
             knowledge_text: "地下室有尸体".into(),
             source: KnowledgeSource::ToldByOther,
             source_character_id: Some(source_id.clone()),
+            source_knowledge_id: None,
             turn_number: 3,
             event_id: None,
             pinned: false,
@@ -420,6 +430,7 @@ mod tests {
             knowledge_text: "地下室有尸体".into(),
             source: KnowledgeSource::ToldByOther,
             source_character_id: Some(Id::new()),
+            source_knowledge_id: None,
             turn_number: 3,
             event_id: None,
             pinned: false,

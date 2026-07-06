@@ -253,6 +253,7 @@ fn c2_knowledge_crud() {
         knowledge_text: "角色有一个秘密".into(),
         source: KnowledgeSource::Backstory,
         source_character_id: None,
+        source_knowledge_id: None,
         turn_number: 0,
         event_id: None,
         pinned: false,

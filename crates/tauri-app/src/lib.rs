@@ -2278,6 +2278,8 @@ pub fn normalize_knowledge_update_for_postprocess(
         .as_ref()
         .and_then(|source_id| find_instance_by_name_or_id(store, camp_id, source_id))
         .map(|source| source.id);
+    let source_knowledge_id =
+        matching_source_knowledge_for_update(store, camp_id, update).map(|entry| entry.id);
 
     vec![
         storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
@@ -2287,6 +2289,7 @@ pub fn normalize_knowledge_update_for_postprocess(
             knowledge_text: update.knowledge_text.clone(),
             source: update.source.clone(),
             source_character_id,
+            source_knowledge_id,
             turn_number: turn,
             event_id: None,
             pinned: update.pinned,
@@ -2317,6 +2320,8 @@ fn dispatch_broadcast(
         .and_then(|sid| find_instance_by_name_or_id(store, camp_id, sid));
     let broadcaster_id = broadcaster_inst.as_ref().map(|i| i.id.clone());
     let source_character_id = broadcaster_id.clone();
+    let source_knowledge_id =
+        matching_source_knowledge_for_update(store, camp_id, update).map(|entry| entry.id);
 
     let all_instances = store.list_instances(camp_id);
 
@@ -2358,6 +2363,7 @@ fn dispatch_broadcast(
                 // 广播统一为 ToldByOther（被告知/公告）
                 source: storyforge_domain::character_knowledge::KnowledgeSource::ToldByOther,
                 source_character_id: source_character_id.clone(),
+                source_knowledge_id: source_knowledge_id.clone(),
                 turn_number: turn,
                 event_id: None,
                 pinned: update.pinned,
@@ -2365,6 +2371,33 @@ fn dispatch_broadcast(
             }
         })
         .collect()
+}
+
+fn matching_source_knowledge_for_update(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+) -> Option<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    use storyforge_domain::character_knowledge::KnowledgeSource;
+
+    let is_relay =
+        update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
+    if !is_relay {
+        return None;
+    }
+
+    let source_id = update.source_character_id.as_ref()?;
+    let source = find_instance_by_name_or_id(store, camp_id, source_id)?;
+
+    store
+        .list_knowledge_of(camp_id, &source.id)
+        .into_iter()
+        .filter(|entry| knowledge_text_matches(&entry.knowledge_text, &update.knowledge_text))
+        .max_by(|a, b| {
+            a.turn_number
+                .cmp(&b.turn_number)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        })
 }
 
 fn should_block_source_knowledge_propagation(
@@ -4236,6 +4269,7 @@ fn apply_typed_action(
                 knowledge_text: knowledge_text.clone(),
                 source: source.clone(),
                 source_character_id: None,
+                source_knowledge_id: None,
                 turn_number: 0,
                 event_id: None,
                 pinned: false,
@@ -5061,6 +5095,8 @@ pub struct KnowledgeEntryDto {
     pub source: String,
     pub source_character_id: Option<String>,
     pub source_character_name: Option<String>,
+    pub source_knowledge_id: Option<String>,
+    pub relay_chain_text: Option<String>,
     pub provenance_text: String,
     pub turn_number: u32,
     pub pinned: bool,
@@ -5111,6 +5147,62 @@ fn knowledge_provenance_text(
     }
 }
 
+fn knowledge_actor_label(
+    entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    instance_names: &std::collections::HashMap<Id, String>,
+) -> String {
+    instance_names
+        .get(&entry.character_id)
+        .cloned()
+        .unwrap_or_else(|| entry.character_id.to_string())
+}
+
+fn knowledge_relay_chain_text(
+    entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    instance_names: &std::collections::HashMap<Id, String>,
+    knowledge_by_id: &std::collections::HashMap<
+        Id,
+        &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    >,
+) -> Option<String> {
+    let mut chain = vec![entry];
+    let mut current = entry;
+    let mut seen = std::collections::HashSet::from([entry.id.clone()]);
+
+    while let Some(parent_id) = &current.source_knowledge_id {
+        if !seen.insert(parent_id.clone()) {
+            break;
+        }
+        let Some(parent) = knowledge_by_id.get(parent_id).copied() else {
+            break;
+        };
+        chain.push(parent);
+        current = parent;
+        if chain.len() >= 8 {
+            break;
+        }
+    }
+
+    if chain.len() < 2 {
+        return None;
+    }
+
+    chain.reverse();
+    Some(
+        chain
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}（轮 {}）",
+                    knowledge_actor_label(entry, instance_names),
+                    entry.turn_number
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" → "),
+    )
+}
+
 fn propagation_policy_code(
     policy: &storyforge_domain::character_knowledge::PropagationPolicy,
 ) -> String {
@@ -5125,6 +5217,10 @@ fn propagation_policy_code(
 fn knowledge_entry_to_dto(
     entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
     instance_names: &std::collections::HashMap<Id, String>,
+    knowledge_by_id: &std::collections::HashMap<
+        Id,
+        &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+    >,
 ) -> KnowledgeEntryDto {
     KnowledgeEntryDto {
         id: entry.id.to_string(),
@@ -5139,6 +5235,8 @@ fn knowledge_entry_to_dto(
             .as_ref()
             .and_then(|id| instance_names.get(id))
             .cloned(),
+        source_knowledge_id: entry.source_knowledge_id.as_ref().map(|id| id.to_string()),
+        relay_chain_text: knowledge_relay_chain_text(entry, instance_names, knowledge_by_id),
         provenance_text: knowledge_provenance_text(entry, instance_names),
         turn_number: entry.turn_number,
         pinned: entry.pinned,
@@ -5156,19 +5254,28 @@ fn list_character_knowledge(
 ) -> Vec<KnowledgeEntryDto> {
     let store = get_campaign_store();
     let camp = Id::from_str(&campaign_id);
-    let entries = if let Some(cid) = character_id {
-        store.list_knowledge_of(&camp, &Id::from_str(&cid))
+    let all_entries = store.list_knowledge(&camp);
+    let entries: Vec<_> = if let Some(cid) = character_id {
+        let cid = Id::from_str(&cid);
+        all_entries
+            .iter()
+            .filter(|entry| entry.character_id == cid)
+            .collect()
     } else {
-        store.list_knowledge(&camp)
+        all_entries.iter().collect()
     };
     let instance_names: std::collections::HashMap<Id, String> = store
         .list_instances(&camp)
         .into_iter()
         .map(|inst| (inst.id, inst.name))
         .collect();
-    entries
+    let knowledge_by_id: std::collections::HashMap<Id, _> = all_entries
         .iter()
-        .map(|entry| knowledge_entry_to_dto(entry, &instance_names))
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    entries
+        .into_iter()
+        .map(|entry| knowledge_entry_to_dto(entry, &instance_names, &knowledge_by_id))
         .collect()
 }
 
@@ -6515,6 +6622,75 @@ mod tests {
     }
 
     #[test]
+    fn test_told_by_other_links_matching_source_knowledge() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeEntry, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let dir = std::env::temp_dir().join(format!("sf_relay_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "relay-test");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut a = CharacterInstance::temporary(campaign.id.clone(), "A");
+        a.id = Id::from_str("inst-a");
+        let mut b = CharacterInstance::temporary(campaign.id.clone(), "B");
+        b.id = Id::from_str("inst-b");
+        let mut c = CharacterInstance::temporary(campaign.id.clone(), "C");
+        c.id = Id::from_str("inst-c");
+        store.add_instance(a).unwrap();
+        store.add_instance(b).unwrap();
+        store.add_instance(c).unwrap();
+
+        let a_entry = CharacterKnowledgeEntry::witnessed(
+            campaign.id.clone(),
+            Id::from_str("inst-a"),
+            "地下室有尸体",
+            1,
+        );
+        let mut b_entry = CharacterKnowledgeEntry::told_by(
+            campaign.id.clone(),
+            Id::from_str("inst-b"),
+            "地下室有尸体",
+            Id::from_str("inst-a"),
+            2,
+        );
+        b_entry.source_knowledge_id = Some(a_entry.id.clone());
+        store.add_knowledge(vec![a_entry, b_entry.clone()]).unwrap();
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("C"),
+            knowledge_text: "地下室有尸体".into(),
+            source: KnowledgeSource::ToldByOther,
+            source_character_id: Some(Id::from_str("B")),
+            pinned: false,
+            broadcast: None,
+            propagation: PropagationPolicy::Open,
+        };
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            3,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].character_id, Id::from_str("inst-c"));
+        assert_eq!(
+            entries[0].source_knowledge_id,
+            Some(b_entry.id.clone()),
+            "C 的知识应链接到 B 持有的上游知识"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_knowledge_entry_dto_resolves_provenance_names() {
         let campaign_id = Id::from_str("camp");
         let lin_id = Id::from_str("inst-lin");
@@ -6530,13 +6706,71 @@ mod tests {
             (lin_id, "林医生".to_string()),
             (chen_id, "陈警官".to_string()),
         ]);
+        let knowledge_by_id = std::collections::HashMap::from([(entry.id.clone(), &entry)]);
 
-        let dto = knowledge_entry_to_dto(&entry, &names);
+        let dto = knowledge_entry_to_dto(&entry, &names, &knowledge_by_id);
 
         assert_eq!(dto.character_name.as_deref(), Some("林医生"));
         assert_eq!(dto.source_character_name.as_deref(), Some("陈警官"));
+        assert!(dto.source_knowledge_id.is_none());
+        assert!(dto.relay_chain_text.is_none());
         assert_eq!(dto.provenance_text, "林医生 被 陈警官 告知");
         assert_eq!(dto.propagation, "open");
+    }
+
+    #[test]
+    fn test_knowledge_entry_dto_renders_relay_chain() {
+        use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+
+        let campaign_id = Id::from_str("camp");
+        let a_id = Id::from_str("inst-a");
+        let b_id = Id::from_str("inst-b");
+        let c_id = Id::from_str("inst-c");
+
+        let a_entry = CharacterKnowledgeEntry::witnessed(
+            campaign_id.clone(),
+            a_id.clone(),
+            "地下室有尸体",
+            1,
+        );
+        let mut b_entry = CharacterKnowledgeEntry::told_by(
+            campaign_id.clone(),
+            b_id.clone(),
+            "地下室有尸体",
+            a_id.clone(),
+            2,
+        );
+        b_entry.source_knowledge_id = Some(a_entry.id.clone());
+        let mut c_entry = CharacterKnowledgeEntry::told_by(
+            campaign_id,
+            c_id.clone(),
+            "地下室有尸体",
+            b_id.clone(),
+            3,
+        );
+        c_entry.source_knowledge_id = Some(b_entry.id.clone());
+
+        let names = std::collections::HashMap::from([
+            (a_id, "A".to_string()),
+            (b_id, "B".to_string()),
+            (c_id, "C".to_string()),
+        ]);
+        let knowledge_by_id = std::collections::HashMap::from([
+            (a_entry.id.clone(), &a_entry),
+            (b_entry.id.clone(), &b_entry),
+            (c_entry.id.clone(), &c_entry),
+        ]);
+
+        let dto = knowledge_entry_to_dto(&c_entry, &names, &knowledge_by_id);
+
+        assert_eq!(
+            dto.source_knowledge_id.as_deref(),
+            Some(b_entry.id.as_str())
+        );
+        assert_eq!(
+            dto.relay_chain_text.as_deref(),
+            Some("A（轮 1） → B（轮 2） → C（轮 3）")
+        );
     }
 
     #[test]

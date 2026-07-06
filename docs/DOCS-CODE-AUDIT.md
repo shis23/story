@@ -56,7 +56,8 @@
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **已补齐写入错误处理**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失。
-- `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”。
+- `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`source_knowledge_id`、`relay_chain_text`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”，并在有上游知识时展示 A→B→C 传话链。
+- `crates/domain/src/character_knowledge.rs::CharacterKnowledgeEntry::source_knowledge_id` **已补传话链 MVP**：Tauri 写回层会在 `ToldByOther`/广播写入时匹配来源角色已有知识并链接上游条目。该能力是文本匹配级链路，完整语义传播仍需真实 LLM 行为评测。
 - `crates/domain/src/character_knowledge.rs::PropagationPolicy` **已补秘密封口 MVP**：postprocess 可输出 `propagation: "private"`；Tauri 写回层会阻断匹配私有来源知识的告知/广播；前端知识面板展示封口标记。该能力是文本匹配级门禁，完整语义可靠性仍需真实 LLM 对抗评测。
 - `crates/domain/src/conversation.rs::SubagentSnapshot` **阶段 5 已扩展**：新增 `character_instance_id: Option<String>`、`display_name: Option<String>`、`fallback_reason: Option<String>`（serde 兼容旧数据）。
 - `crates/app-conversation/src/lib.rs::build_provenance_with_campaign` **阶段 5 新增**：接收 `CampaignRuntimeContext`，从 Performance 中提取 instance 信息填充 SubagentSnapshot。旧 `build_provenance` 保留向后兼容。
@@ -249,7 +250,7 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 
 1. **Phase 6 Android 打磨**——构建链验证、文件导入、长文本流式、移动端排障。Tauri 脚手架就绪，重点验证主流程在 Android 端可用。
 2. **Phase 7 收口/验收/发布准备**——端到端验收矩阵、回归测试固化、文档/发布准备。
-3. **知识传播引擎方向 4**（传话链）——方向 1/2/3 已有 `BroadcastTarget::All/Group`、postprocess `broadcast` 解析和告知来源渲染；方向 5 封口 MVP 已落地但需真实 LLM 对抗评测；剩余待立项项见 `docs/PLAN-KNOWLEDGE-PROPAGATION.md`。
+3. **知识传播真实 LLM 评测**——方向 1/2/3/4/5 均已有 MVP；下一步应补广播、传话链、封口绕写的真实 LLM 行为评测，尤其验证文本匹配门禁/链路在改写表达时的边界。
 
 ## 已修正文档问题
 

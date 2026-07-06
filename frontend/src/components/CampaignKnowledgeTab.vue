@@ -85,6 +85,10 @@ function propagationText(k) {
   return ''
 }
 
+function relayChainText(k) {
+  return k.relay_chain_text || (k.source_knowledge_id ? `上游 ${shortId(k.source_knowledge_id)}` : '')
+}
+
 // ─── 实例过滤选项：从已有知识的 character_id 去重，避免要求用户手输 ID ───
 const instanceOptions = computed(() => {
   const seen = new Map()
@@ -138,6 +142,7 @@ defineExpose({ refresh: load })
           <span v-if="k.turn_number" class="text-[10px] text-ink-soft">轮次 {{ k.turn_number }}</span>
           <span v-if="k.character_id" class="text-[10px] text-ink-soft">知道者 {{ instanceLabel(k) }}</span>
           <span v-if="sourceLabel(k)" class="text-[10px] text-ink-soft">来源 {{ sourceLabel(k) }}</span>
+          <span v-if="relayChainText(k)" class="text-[10px] text-ink-soft">链路 {{ relayChainText(k) }}</span>
           <span v-if="k.pinned" class="text-[10px] text-accent">📌 已固定</span>
           <span v-if="propagationText(k)" class="text-[10px] text-warn">{{ propagationText(k) }}</span>
         </div>
