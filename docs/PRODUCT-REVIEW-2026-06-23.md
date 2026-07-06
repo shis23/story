@@ -94,7 +94,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可从 ST settings JSON 导入 Global 正则到 `global_regex_scripts.json`，写作与重 roll 会按 Global → Preset → Scoped 顺序注入；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展；Campaign 写作会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行；`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设。当前仍按二元 `Input/Output` 简化枚举过滤，多作用域语义、prompt/display/depth 限制仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可从 ST settings JSON 导入 Global 正则到 `global_regex_scripts.json`，预设面板已可导入、查看、启停、清空 Global 正则，写作与重 roll 会按 Global → Preset → Scoped 顺序注入；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展；Campaign 写作会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行；`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设。当前仍按二元 `Input/Output` 简化枚举过滤，多作用域语义、prompt/display/depth 限制仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
@@ -102,7 +102,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 |---|---|---|---|
 | Preset 脚本 | 预设 `extensions.regex_scripts` | 🟡 active Preset 已执行 Input/Output | 预设导入/存储已接通，运行时启用状态持久化在 `active_preset.json` |
 | **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | 🟡 legacy 选中卡 + Campaign 活动卡已执行 Input/Output | `Character::scoped_regex_scripts()` 和 `CharacterCard::scoped_regex_scripts()` 已可解析；Tauri legacy 写作从选中卡收集，Campaign 写作从 active Campaign 卡收集，并注入 `WritingContext.regex_scripts` |
-| Global 脚本 | `settings.json` → `global_regex_scripts.json` | 🟡 已可导入并执行 Input/Output | Tauri 命令可从 ST settings JSON 抽取 `regex_scripts`，运行时按 Global → Preset → Scoped 合并；尚无专用 UI |
+| Global 脚本 | `settings.json` → `global_regex_scripts.json` | 🟡 已可导入并执行 Input/Output | Tauri 命令可从 ST settings JSON 抽取 `regex_scripts`，运行时按 Global → Preset → Scoped 合并；预设面板已提供导入、查看、启停、清空 UI |
 
 **7 个作用域（ST placement 数值）**：
 
@@ -134,7 +134,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 
 | 子项 | 工作量 |
 |---|---|
-| 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Global/Preset/Scoped 合并 helper 与运行时已接；Global 已有 settings JSON 导入命令，专用 UI 待接 |
+| 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Global/Preset/Scoped 合并 helper 与运行时已接；Global 已有 settings JSON 导入命令和预设面板 UI |
 | 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
 | 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |

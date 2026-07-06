@@ -2,27 +2,59 @@
 import { ref, onMounted } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
-import { listPresets, getPreset, deletePreset, updatePresetPrompt, updatePresetRegex, importPresetAsModules, setActivePreset } from '../tauri-api.js'
+import {
+  listPresets,
+  getPreset,
+  deletePreset,
+  updatePresetPrompt,
+  updatePresetRegex,
+  importPresetAsModules,
+  setActivePreset,
+  listGlobalRegexScripts,
+  importGlobalRegexSettings,
+  clearGlobalRegexScripts,
+  updateGlobalRegex,
+} from '../tauri-api.js'
 
 const emit = defineEmits(['close'])
 
 const presets = ref([])
+const globalRegexScripts = ref([])
 const loading = ref(false)
+const loadingGlobalRegex = ref(false)
 const expandedId = ref(null)
 const detail = ref(null)
 const detailTab = ref('prompts') // 'prompts' | 'regex'
+const globalRegexExpanded = ref(true)
 const editingPrompt = ref(null) // 正在编辑的 prompt index
 const editContent = ref('')
 const saving = ref(false)
+const importingGlobalRegex = ref(false)
 
 onMounted(() => { refresh() })
 
 async function refresh() {
   loading.value = true
+  loadingGlobalRegex.value = true
   try {
-    presets.value = await listPresets()
+    const [presetList, globalRegexList] = await Promise.all([
+      listPresets(),
+      listGlobalRegexScripts(),
+    ])
+    presets.value = presetList
+    globalRegexScripts.value = globalRegexList
   } finally {
     loading.value = false
+    loadingGlobalRegex.value = false
+  }
+}
+
+async function refreshGlobalRegexScripts() {
+  loadingGlobalRegex.value = true
+  try {
+    globalRegexScripts.value = await listGlobalRegexScripts()
+  } finally {
+    loadingGlobalRegex.value = false
   }
 }
 
@@ -107,6 +139,61 @@ async function toggleRegexDisabled(index) {
   }
 }
 
+async function importGlobalRegexFromSettings() {
+  importingGlobalRegex.value = true
+  saving.value = true
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await open({
+      multiple: false,
+      filters: [{ name: 'ST settings JSON', extensions: ['json'] }],
+    })
+    if (!filePath) return
+
+    const { readTextFile } = await import('@tauri-apps/plugin-fs')
+    const settingsJson = await readTextFile(filePath)
+    const count = await importGlobalRegexSettings(settingsJson)
+    await refreshGlobalRegexScripts()
+    await alertDialog(`已导入 ${count} 条全局正则`)
+  } catch (e) {
+    await alertDialog('导入全局正则失败: ' + e)
+  } finally {
+    importingGlobalRegex.value = false
+    saving.value = false
+  }
+}
+
+async function clearGlobalRegex() {
+  if (globalRegexScripts.value.length === 0) return
+  const ok = await confirmDialog('确定清空全局正则？', { title: '清空确认' })
+  if (!ok) return
+
+  saving.value = true
+  try {
+    await clearGlobalRegexScripts()
+    globalRegexScripts.value = []
+  } catch (e) {
+    await alertDialog('清空全局正则失败: ' + e)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function toggleGlobalRegexDisabled(index) {
+  const regex = globalRegexScripts.value[index]
+  if (!regex) return
+
+  saving.value = true
+  try {
+    await updateGlobalRegex(index, !regex.disabled)
+    regex.disabled = !regex.disabled
+  } catch (e) {
+    await alertDialog('操作全局正则失败: ' + e)
+  } finally {
+    saving.value = false
+  }
+}
+
 async function handleImportAsModules(preset) {
   try {
     const count = await importPresetAsModules(preset.id)
@@ -136,6 +223,14 @@ function roleBadgeClass(role) {
   if (role === 'user') return 'bg-ok/10 text-ok'
   return 'bg-ink-soft/10 text-ink-soft'
 }
+
+function regexPlacementLabel(regex) {
+  return regex.placement === 'input' ? '输入' : '输出'
+}
+
+function regexPlacementClass(regex) {
+  return regex.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'
+}
 </script>
 
 <template>
@@ -146,6 +241,71 @@ function roleBadgeClass(role) {
 
     <!-- 内容区 -->
     <div class="p-4 space-y-3">
+      <section class="bg-surface rounded-lg border border-line overflow-hidden">
+        <div class="flex items-center gap-2 px-3 py-2.5">
+          <button
+            @click="globalRegexExpanded = !globalRegexExpanded"
+            class="flex-1 min-w-0 text-left"
+          >
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-sm font-medium text-ink truncate">全局正则</span>
+              <span class="shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent">
+                {{ globalRegexScripts.length }}
+              </span>
+            </div>
+          </button>
+          <button
+            @click="importGlobalRegexFromSettings"
+            :disabled="importingGlobalRegex || saving"
+            class="shrink-0 min-h-[36px] px-3 rounded-lg text-xs font-medium bg-accent text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="导入 ST settings JSON"
+          >
+            {{ importingGlobalRegex ? '导入中' : '导入' }}
+          </button>
+          <button
+            @click="clearGlobalRegex"
+            :disabled="globalRegexScripts.length === 0 || saving"
+            class="shrink-0 min-h-[36px] px-3 rounded-lg text-xs font-medium bg-err/10 text-err hover:bg-err/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="清空全局正则"
+          >
+            清空
+          </button>
+          <span class="text-ink-soft text-xs shrink-0">{{ globalRegexExpanded ? '▲' : '▼' }}</span>
+        </div>
+
+        <div v-if="globalRegexExpanded" class="border-t border-line px-3 py-2 space-y-2">
+          <div v-if="loadingGlobalRegex" class="text-xs text-ink-soft text-center py-4">加载中...</div>
+          <div v-else-if="globalRegexScripts.length === 0" class="text-xs text-ink-soft text-center py-4">无全局正则</div>
+          <template v-else>
+            <div
+              v-for="(r, i) in globalRegexScripts"
+              :key="r.id || i"
+              class="bg-bg rounded-lg px-3 py-2 text-xs"
+              :class="{ 'opacity-50': r.disabled }"
+            >
+              <div class="flex items-center gap-2 mb-1">
+                <span class="font-medium text-ink truncate">{{ r.script_name || r.id }}</span>
+                <span class="px-1.5 py-0.5 rounded text-[10px]" :class="regexPlacementClass(r)">
+                  {{ regexPlacementLabel(r) }}
+                </span>
+                <span v-if="r.disabled" class="text-[10px] text-warn">禁用</span>
+                <button
+                  @click="toggleGlobalRegexDisabled(i)"
+                  class="ml-auto min-h-[36px] px-2.5 rounded text-[10px] shrink-0"
+                  :class="!r.disabled ? 'bg-ok/10 text-ok' : 'bg-warn/10 text-warn'"
+                  :title="r.disabled ? '启用' : '停用'"
+                >
+                  {{ r.disabled ? '启用' : '停用' }}
+                </button>
+              </div>
+              <div class="text-ink-soft font-mono text-[11px] break-all">
+                <div>匹配: {{ r.find_regex }}</div>
+                <div>替换: {{ r.replace_string }}</div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
       <div v-if="loading" class="text-center text-ink-soft text-sm py-8">加载中…</div>
 
       <div v-else-if="presets.length === 0" class="text-center text-ink-soft text-sm py-8">
