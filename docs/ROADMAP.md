@@ -146,7 +146,7 @@
 
 - **JS 变量归口**：`execute_fragment` 产出的 `variable_updates` 统一写入 campaign 级变量（`instance_id=None`）。若需按角色归属，后续需细化 key 前缀解析或扩展 `MvuExecResult` 携带 `instance_id`。
 - **JSR shim 覆盖度**：`WebViewMvuRuntime` 的 JSR/ST API shim 基于常用子集实现，依赖冷门 API 的重 DOM 卡可能降级为跳过 JS 更新（`tracing::warn!` + 执行失败/超时回退），不影响主写作。
-- **Regex display-only 渲染**：`infra-regex` 已区分 Prompt/Persisted/Display 目标，`promptOnly` 不再改显示/存储、`markdownOnly` 不再污染 prompt/持久化；Display 目标已接到消息展示 DTO 与前端渲染层，PluginHost/HTML 渲染仍待接。
+- **Regex display-only 渲染**：`infra-regex` 已区分 Prompt/Persisted/Display 目标，`promptOnly` 不再改显示/存储、`markdownOnly` 不再污染 prompt/持久化；Display 目标已接到消息展示 DTO、前端文本渲染层和派生 HTML 片段安全渲染。完整 PluginHost/JS 状态栏运行时仍待接。
 - **Regex depth 过滤**：`minDepth/maxDepth` 已在执行器生效；当前轮 Input/Output 按 depth 0，消息展示按离末尾深度执行 display-only 正则。
 - **Regex World Info 作用域**：ST placement 3 已接到常驻/触发世界书注入和 `search_world_info` 工具返回；Slash/Reasoning 仍待接。
 - **Prompt Template 宏覆盖度**：legacy 单卡 system prompt 已执行确定性核心宏（角色卡字段、`<user>/<bot>`、本地 `setvar/addvar/getvar/trim/comment`）和基础动态宏（`date/time/datetime/weekday/isotime`、`random`、`roll`）；Campaign runtime 已可从当前快照读取 `getvar` 变量。单实例 Campaign 继续支持无前缀实例变量和 `{{char}}` / persona / behavior；多角色 Campaign 支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，且会保留歧义的 `{{char}}`、`{{description}}`、`<bot>` 等唯一角色宏不误替换。

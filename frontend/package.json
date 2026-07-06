@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test tests/plugin-bridge.test.mjs",
+    "test": "node --test tests/plugin-bridge.test.mjs tests/render-content.test.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
-import { formatContent } from '../utils/formatContent.js'
 import BaseDropdown from './base/BaseDropdown.vue'
+import RichContent from './RichContent.vue'
 
 const props = defineProps({
   message: { type: Object, required: true },
@@ -32,6 +32,8 @@ const currentVariant = computed(() => {
 const currentDisplayContent = computed(() => {
   return currentVariant.value?.display_content ?? currentVariant.value?.content ?? ''
 })
+
+const currentSourceContent = computed(() => currentVariant.value?.content ?? '')
 
 const variantCount = computed(() => props.message.variants.length)
 
@@ -155,7 +157,7 @@ function rerollUser() {
         ? 'text-ink-soft pl-3 border-l-2 border-line'
         : 'text-ink prose-fiction'"
     >
-      <span v-html="formatContent(currentDisplayContent)"></span>
+      <RichContent :content="currentDisplayContent" :source-content="currentSourceContent" />
     </div>
 
     <!-- 内联编辑模式 -->
