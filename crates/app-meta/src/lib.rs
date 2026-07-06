@@ -362,9 +362,34 @@ fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), Me
 
 /// 执行 Patch 的所有 actions
 pub fn execute_patch(patch: &Patch, ctx: &mut PatchContext) -> Result<(), MetaError> {
-    for action in &patch.actions {
-        execute_action(action, ctx)?;
+    let mut working_world_info_entries = ctx.world_info_entries.as_deref().cloned();
+    let mut working_character_fields = ctx.character_fields.as_deref().cloned();
+
+    {
+        let mut working_ctx = PatchContext {
+            world_info_entries: working_world_info_entries.as_mut(),
+            character_fields: working_character_fields.as_mut(),
+        };
+
+        for action in &patch.actions {
+            execute_action(action, &mut working_ctx)?;
+        }
     }
+
+    if let (Some(entries), Some(working_entries)) = (
+        ctx.world_info_entries.as_deref_mut(),
+        working_world_info_entries,
+    ) {
+        *entries = working_entries;
+    }
+
+    if let (Some(fields), Some(working_fields)) = (
+        ctx.character_fields.as_deref_mut(),
+        working_character_fields,
+    ) {
+        *fields = working_fields;
+    }
+
     Ok(())
 }
 
@@ -445,5 +470,87 @@ mod tests {
         let patch = store.propose("要忽略的 Patch".into(), vec![]);
         store.dismiss(&patch.id).unwrap();
         assert_eq!(store.pending().len(), 0);
+    }
+
+    #[test]
+    fn test_execute_patch_rolls_back_when_later_action_fails() {
+        let mut world_info_entries = vec![serde_json::json!({
+            "content": "old lore",
+            "keys": ["old"],
+        })];
+        let mut character_fields = serde_json::json!({
+            "personality": "calm",
+        });
+        let patch = Patch {
+            id: "patch-rollback".into(),
+            description: "rollback on failure".into(),
+            actions: vec![
+                PatchAction::Update {
+                    target: "character".into(),
+                    field: "personality".into(),
+                    value: serde_json::json!("reckless"),
+                },
+                PatchAction::Create {
+                    target: "unsupported".into(),
+                    data: serde_json::json!({ "content": "should fail" }),
+                },
+            ],
+            created_at: chrono::Utc::now(),
+            applied: false,
+        };
+
+        let mut ctx = PatchContext {
+            world_info_entries: Some(&mut world_info_entries),
+            character_fields: Some(&mut character_fields),
+        };
+
+        let err = execute_patch(&patch, &mut ctx).unwrap_err();
+
+        assert!(matches!(err, MetaError::ExecutionFailed(_)));
+        assert_eq!(character_fields["personality"], "calm");
+        assert_eq!(world_info_entries.len(), 1);
+        assert_eq!(world_info_entries[0]["content"], "old lore");
+    }
+
+    #[test]
+    fn test_execute_patch_commits_all_actions_when_successful() {
+        let mut world_info_entries = vec![serde_json::json!({
+            "content": "old lore",
+            "keys": ["old"],
+        })];
+        let mut character_fields = serde_json::json!({
+            "personality": "calm",
+        });
+        let patch = Patch {
+            id: "patch-success".into(),
+            description: "commit successful patch".into(),
+            actions: vec![
+                PatchAction::Update {
+                    target: "character".into(),
+                    field: "personality".into(),
+                    value: serde_json::json!("reckless"),
+                },
+                PatchAction::Create {
+                    target: "world_info".into(),
+                    data: serde_json::json!({
+                        "content": "new lore",
+                        "keys": ["new"],
+                    }),
+                },
+            ],
+            created_at: chrono::Utc::now(),
+            applied: false,
+        };
+
+        let mut ctx = PatchContext {
+            world_info_entries: Some(&mut world_info_entries),
+            character_fields: Some(&mut character_fields),
+        };
+
+        execute_patch(&patch, &mut ctx).unwrap();
+
+        assert_eq!(character_fields["personality"], "reckless");
+        assert_eq!(world_info_entries.len(), 2);
+        assert_eq!(world_info_entries[1]["content"], "new lore");
     }
 }

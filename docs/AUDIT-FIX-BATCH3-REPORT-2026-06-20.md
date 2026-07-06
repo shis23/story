@@ -105,7 +105,7 @@
 | M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点，`MetaPanel` 生成溯源入口可见；`frontend/tests/conversation-nodes.test.mjs` 固化选择规则 |
 | M-021 | LogStore 并发写入可能交错 | 小 JSONL 文件实际风险极低 |
 | M-022 | unwrap_or(Null) ~12 处 | 与 H-010 共享 lib.rs，需逐一审查序列化失败场景 |
-| M-024 | patch 事务回滚 | 需设计快照/回滚机制 |
+| M-024 | patch 事务回滚 | ✅ 2026-07-07 已完成：`execute_patch` 改为工作副本事务执行，全部 action 成功后才写回 context，失败时原数据保持不变；新增 rollback/commit 单元测试 |
 
 ---
 
@@ -129,6 +129,7 @@
 | `crates/infra-vector/src/lib.rs` | H-011: corrupt JSON 备份 |
 | `crates/infra-plugin-host/src/lib.rs` | H-011: corrupt JSON 备份 |
 | `crates/app-agent/src/tools.rs` | L-003: 删除死函数 |
+| `crates/app-meta/src/lib.rs` | M-024: `execute_patch` 事务执行 + rollback/commit 测试 |
 
 ### 新增文件（2 个）
 
@@ -147,6 +148,10 @@ cargo test --workspace
 
 npm run build
   ✓ built in 4.67s
+
+2026-07-07 增量验证:
+cargo test -p storyforge-app-meta
+  103 passed, 0 failed
 ```
 
 ## 执行效率
@@ -173,5 +178,5 @@ npm run build
 
 1. **H-014 + H-013 剩余项**（性能基础）— 同步 I/O 异步化、CampaignStore 后台 flush 评估；H-013 集合级锁已完成
 2. **H-002**（安全合规）— API key 加密
-3. **M-022 + M-024**（健壮性）— 序列化日志 + patch 回滚
+3. **M-022**（健壮性）— 序列化日志；M-024 patch 回滚已于 2026-07-07 完成
 4. **H-012**（架构）— plugin-host tauri 依赖解耦（已完成 2026-07-06）

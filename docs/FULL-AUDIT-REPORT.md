@@ -166,7 +166,7 @@
 | M-021 | `lib.rs:244` | LogStore 并发写文件可能交错字节（Windows） |
 | M-022 | 多处 | `to_value().unwrap_or(Null)` 12 处 — 序列化失败返回 null 给前端 |
 | M-023 | `lib.rs:3153` | Patch 执行后 WorldInfoEntry 反序列化失败条目静默丢弃 |
-| M-024 | `lib.rs:3147` | `execute_patch` 失败时不回滚已执行动作 |
+| M-024 | `crates/app-meta/src/lib.rs` | ✅ 2026-07-07 已修复：`execute_patch` 使用工作副本事务执行，失败时不回写已执行动作 |
 | M-025 | `app-meta Cargo.toml` | 死依赖 `infra-plugin-host`（从未 import） |
 | M-026 | `BaseOverlay.vue:102` | 缺少 `role="dialog"` / `aria-modal` — 无障碍缺陷 |
 | M-027 | `AgentConfigCard.vue:36` | `activeConnName` 是普通函数而非 computed |
@@ -233,7 +233,7 @@
 11. **M-005**: `default_variable_keys()` 合并实际 schema
 12. **M-014**: Tab 组件添加 campaignId watch
 13. **H-009**: LLM 重试逻辑（指数退避）
-14. **M-024**: patch 执行添加事务回滚
+14. **M-024**: ✅ patch 执行已添加事务回滚（2026-07-07）
 
 ### Major Restructure（> 4 小时/项）
 

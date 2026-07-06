@@ -151,6 +151,7 @@
 - `meta_accept_patch`、`meta_analyze_mvu_card`、`meta_list_mvu_translations` 等 Tauri commands 存在。
 - `mvu_import::analyze_mvu_card` 会产出 `MvuTranslation`，解析失败时走 `pure_data_fallback`。
 - `frontend/src/components/MetaPanel.vue` 已展示 Meta 聊天、tool result、pending patches、MVU translations、Campaign health check（侧栏"Campaign 体检"区块，调 `meta_health_check` Tauri command），并在 `App.vue` 传入最后一条带 provenance 的 assistant 节点时展示“解释上一条生成”入口（调 `meta_explain_generation`）。
+- 旧 Meta patch 的 `execute_patch` 已在 2026-07-07 改为事务式工作副本执行：全部 action 成功才写回 `PatchContext`，失败时保留原 world info / character fields。
 
 因此 `PLAN-META-AGENT.md`（已归档）和 `PLAN-PLUGIN-MVU.md` 的”当前事实”基本准确；其中 health check、generation explanation、typed patch preview、schema apply 和 runtime fallback 的主路径已完成，后续重点是更广的真实卡/真实 LLM 验收与插件兼容层。
 
