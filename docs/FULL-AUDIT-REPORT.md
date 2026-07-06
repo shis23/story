@@ -31,7 +31,7 @@
 
 ## High（15 条）
 
-### H-001: 所有 Store 的 `persist()` 吞掉磁盘写入错误
+### H-001: ✅ 所有 Store 的 `persist()` 吞掉磁盘写入错误已修复
 
 - **文件**: `crates/tauri-app/src/campaign_store.rs:499`, `crates/tauri-app/src/storage.rs:228`, `crates/tauri-app/src/connection_store.rs:166`, `crates/tauri-app/src/preset_store.rs`
 - **问题**: `CampaignStore::save_campaign`, `add_instance`, `add_knowledge` 等所有 CRUD 方法返回 `()`。`persist()` 调用 `atomic_write_json` 失败时只记录日志，不传播错误。磁盘满或权限错误时用户以为保存成功，实际数据丢失。
@@ -39,7 +39,7 @@
 - **当前状态（2026-07-06）**: `CampaignStore`、`CharacterStore`、`ConnectionStore` 等写入路径已改为返回 `Result`；主要 Tauri 命令会返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning。`CampaignStore` 单 Mutex 已拆为集合级锁；剩余风险转为同步 I/O 性能问题，见 H-013/H-014。
 - **置信度**: R4 双盲 ✅✅ + R6 验证确认
 
-### H-002: API key 明文存储
+### H-002: ✅ API key 明文存储已修复
 
 - **文件**: `crates/tauri-app/src/connection_store.rs:42`, `crates/tauri-app/src/lib.rs:95`
 - **问题**: LLM 和 Embedding API key 以明文 JSON 存储在 `data/connections.json` 和 `data/embed.json`。代码有 TODO 注释承认此问题。
@@ -47,7 +47,7 @@
 - **当前状态（2026-07-06）**: 已新增 `storyforge-infra-util::secret_store`，通过 `keyring` 写入系统凭据库；`connections.json` 和 `embed.json` 只保存 `storyforge-secret:v1:*` 引用。旧明文文件在加载时迁移，运行时再解析回真实 key；真实 LLM harness 已支持从 SecretRef 解析 active 连接。Windows Credential Manager 写/读/删已用 ignored 冒烟测试实跑通过；Android arm64 后端已编译通过，真机写读删仍待验证。
 - **置信度**: R1 双盲 ✅✅
 
-### H-003: `data_dir` 基于可执行文件路径而非 OS 标准目录
+### H-003: ✅ `data_dir` 基于可执行文件路径而非 OS 标准目录已修复
 
 - **文件**: `crates/tauri-app/src/lib.rs:75-83`
 - **问题**: `get_app_data_dir()` 使用 `exe_dir.join("data")` 而非 `%APPDATA%`。共享安装位置下数据可能被其他用户读取。
@@ -63,11 +63,12 @@
 - **当前状态**: `role_type` 已有 `#[serde(default)]`，`test_role_type_default_is_supporting` 覆盖旧数据兼容。
 - **置信度**: R2 双盲 ✅✅ + R6 验证确认
 
-### H-005: `ToolContext.campaign_runtime` 不含临时 instance
+### H-005: ✅ `ToolContext.campaign_runtime` 不含临时 instance 已修复
 
 - **文件**: `crates/app-pipeline/src/lib.rs:366` + `crates/app-agent/src/runtime.rs:610`
 - **问题**: `effective_runtime`（含临时角色）未传播到子 Agent 的 ToolContext。子 Agent 的 `get_character` 工具对临时角色返回 NotFound。
 - **修复**: 将 effective_runtime 写入子 Agent 的 ToolContext。
+- **当前状态**: `PipelineOrchestrator` 会把 `with_temporaries_for()` 生成的 `effective_runtime` 传入 `spawn_subagents()`；子 Agent 独立 `ToolContext` 设置 `campaign_runtime` 和 `current_character_instance_id`，`test_spawn_subagents_with_temporary_instance` 覆盖临时角色路径。
 - **置信度**: R2 双盲 ✅✅
 
 ### H-006: ✅ BaseOverlay ESC 监听器泄漏已修复
@@ -101,21 +102,23 @@
 - **当前状态**: `crates/infra-llm/src/retry.rs` 已导出 `with_retry`/`RetryingClient`，并覆盖成功重试、不可重试错误、重试耗尽和 Retry-After 解析测试。
 - **置信度**: R4 双盲 ✅✅
 
-### H-010: Tauri 层丢失错误类型信息
+### H-010: ✅ Tauri 层丢失错误类型信息已修复
 
 - **文件**: `crates/tauri-app/src/lib.rs`（所有 `Result<_, String>` Tauri 命令）
 - **问题**: 所有类型化错误被 flatten 为 `format!("写作失败: {e}")`。前端无法区分可重试/不可重试错误。
 - **修复**: 定义结构化错误 DTO 返回前端。
+- **当前状态**: `crates/tauri-app/src/error.rs` 已定义 `TauriCommandError`，使用 `serde(tag = "type")` 返回结构化错误，并覆盖 LLM/Agent/Pipeline/Storage/Validation/NotFound/Cancelled 等转换测试。
 - **置信度**: R4 双盲 ✅✅
 
-### H-011: 损坏 JSON 文件静默返回空数据
+### H-011: ✅ 损坏 JSON 文件静默返回空数据已修复
 
 - **文件**: `storage.rs:28`, `preset_store.rs:26`, `connection_store.rs:45`, `infra-vector:190`, `infra-plugin-host:109`, `module_store.rs:417`
 - **问题**: 主文件 + 备份文件都损坏时静默返回空 Vec/HashMap。所有用户数据丢失无提示。
 - **修复**: 返回错误而非空数据，提示用户数据损坏。
+- **当前状态**: 相关 store 的 JSON 加载路径会记录错误并保存 `.json.corrupt` 备份；向量库路径另有 `.tmp` 恢复与 `.corrupt` 备份回归测试。
 - **置信度**: R4 双盲 ✅✅
 
-### H-012: infra-plugin-host Tauri 依赖已解除（2026-07-06）
+### H-012: ✅ infra-plugin-host Tauri 依赖已解除（2026-07-06）
 
 - **文件**: `crates/infra-plugin-host/Cargo.toml`, `crates/tauri-app/src/mvu_webview_runtime.rs`
 - **问题**: 基础设施层 crate 曾直接依赖 UI 框架。阻止在非 Tauri 环境（CLI、harness）中使用。
@@ -246,7 +249,7 @@
 
 15. **H-014**: 全量同步 I/O 替换为异步（写作/重 roll Campaign 快照读取、临时 instance 落盘、postprocess 写回、accept variant 写盘、configure embedder 写盘、归档消息读取已先行 `spawn_blocking`）
 16. **H-013 剩余项**: CampaignStore 后台 flush / 异步写入评估（集合级锁、快照读取 offload、临时 instance 落盘 offload、postprocess 写回 offload 已完成）
-17. **H-002**: API key 加密存储
+17. **H-002**: ✅ API key 加密存储已完成（Android 真机 keyring 仍需发布前验证）
 18. **H-012**: infra-plugin-host 移除直接 Tauri 依赖（已完成 2026-07-06）
 19. **R3 Top5**: CampaignRuntimeContext / ToolContext 大对象改为 Arc 共享
 20. 测试覆盖：app-pipeline、storage、app-memory 补测试
