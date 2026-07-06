@@ -5509,6 +5509,87 @@ fn create_campaign(
     Ok(dto)
 }
 
+fn fork_campaign_in_store(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    source_campaign_id: Id,
+    fork_node_id: Id,
+    name: String,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(TauriCommandError::validation("fork campaign name is empty"));
+    }
+
+    let source = store.get_campaign(&source_campaign_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!("campaign not found: {source_campaign_id}"))
+    })?;
+    if store.get_card(&source.card_id).is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "card not found: {}",
+            source.card_id
+        )));
+    }
+
+    let source_conversation_id = source
+        .conversation_id
+        .clone()
+        .or_else(|| conv_store.find_by_campaign(&source.id).map(|c| c.id))
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!(
+                "source campaign has no conversation: {}",
+                source.id
+            ))
+        })?;
+
+    let mut campaign = storyforge_domain::campaign::Campaign::fork(
+        source.card_id.clone(),
+        name.to_string(),
+        source.id.clone(),
+        fork_node_id.clone(),
+    );
+    campaign.variables = source.variables.clone();
+    campaign.story_clock = source.story_clock.clone();
+
+    let forked_conversation =
+        conv_store.fork_at(&source_conversation_id, campaign.id.clone(), &fork_node_id)?;
+    campaign.conversation_id = Some(forked_conversation.id);
+
+    store
+        .save_campaign(campaign.clone())
+        .map_err(|e| TauriCommandError::storage(format!("save fork campaign failed: {e}")))?;
+
+    let mut instance_count = 0;
+    for mut instance in store.list_instances(&source.id) {
+        instance.id = Id::new();
+        instance.campaign_id = campaign.id.clone();
+        store
+            .add_instance(instance)
+            .map_err(|e| TauriCommandError::storage(format!("copy fork instance failed: {e}")))?;
+        instance_count += 1;
+    }
+
+    let mut dto = CampaignSummaryDto::from(&campaign);
+    dto.instance_count = instance_count;
+    Ok(dto)
+}
+
+#[tauri::command]
+fn fork_campaign(
+    source_campaign_id: String,
+    fork_node_id: String,
+    name: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
+    fork_campaign_in_store(
+        get_campaign_store(),
+        &state.conv_store,
+        Id::from_str(&source_campaign_id),
+        Id::from_str(&fork_node_id),
+        name,
+    )
+}
+
 #[tauri::command]
 fn list_campaigns(card_id: Option<String>) -> Vec<CampaignSummaryDto> {
     let store = get_campaign_store();
@@ -6394,6 +6475,7 @@ pub fn run() {
             get_card,
             delete_card,
             create_campaign,
+            fork_campaign,
             list_campaigns,
             get_campaign,
             set_active_campaign,
@@ -6934,6 +7016,111 @@ mod tests {
     }
 
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）
+    #[test]
+    fn test_fork_campaign_in_store_records_source_and_clones_snapshot() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_campaign_fork_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("conversations")).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let mut card = CharacterCard {
+            id: Id::from_str("card-1"),
+            name: "Test Card".into(),
+            source_character_id: Id::from_str("source-card-1"),
+            character_definitions: vec![],
+            raw_card_json: serde_json::Value::Null,
+        };
+        let definition = CharacterDefinition {
+            id: Id::from_str("def-lin"),
+            card_id: card.id.clone(),
+            name: "Lin".into(),
+            persona_prompt: "calm surgeon".into(),
+            behavior_rules: "save first".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: default_character_variables(),
+        };
+        card.character_definitions.push(definition.clone());
+        store.save_card(card).unwrap();
+
+        let mut source_campaign = Campaign::new(Id::from_str("card-1"), "source run");
+        source_campaign.set_variable("story_clock", serde_json::json!("Day 7"), 3);
+        let source_conversation =
+            conv_store.create(Some("card-1".into()), Some(source_campaign.id.clone()));
+        let user_node = conv_store
+            .append_user_message(&source_conversation.id, "first user".into())
+            .unwrap();
+        let fork_node = conv_store
+            .append_ai_draft(&source_conversation.id, "branch point".into(), None)
+            .unwrap();
+        let _later = conv_store
+            .append_user_message(&source_conversation.id, "later user".into())
+            .unwrap();
+        source_campaign.conversation_id = Some(source_conversation.id.clone());
+        store.save_campaign(source_campaign.clone()).unwrap();
+
+        let mut source_instance =
+            CharacterInstance::from_definition(source_campaign.id.clone(), &definition);
+        source_instance.id = Id::from_str("source-inst");
+        source_instance.set_variable("hp", serde_json::json!(42), 9);
+        store.add_instance(source_instance.clone()).unwrap();
+
+        let dto = fork_campaign_in_store(
+            &store,
+            &conv_store,
+            source_campaign.id.clone(),
+            fork_node.clone(),
+            "forked run".into(),
+        )
+        .unwrap();
+
+        let fork_campaign = store.get_campaign(&Id::from_str(&dto.id)).unwrap();
+        assert_eq!(
+            fork_campaign.fork_from,
+            Some((source_campaign.id.clone(), fork_node.clone()))
+        );
+        assert_eq!(fork_campaign.card_id, source_campaign.card_id);
+        assert_eq!(fork_campaign.current_story_clock(), "Day 7");
+        assert_ne!(
+            fork_campaign.conversation_id,
+            source_campaign.conversation_id
+        );
+
+        let fork_conversation = conv_store
+            .get(fork_campaign.conversation_id.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(
+            fork_conversation.campaign_id,
+            Some(fork_campaign.id.clone())
+        );
+        assert_eq!(fork_conversation.nodes.len(), 2);
+        assert_eq!(fork_conversation.nodes[0].id, user_node);
+        assert_eq!(fork_conversation.nodes[1].id, fork_node);
+
+        let source_instances = store.list_instances(&source_campaign.id);
+        assert_eq!(source_instances.len(), 1);
+        assert_eq!(source_instances[0].id, Id::from_str("source-inst"));
+
+        let fork_instances = store.list_instances(&fork_campaign.id);
+        assert_eq!(fork_instances.len(), 1);
+        assert_ne!(fork_instances[0].id, source_instance.id);
+        assert_eq!(fork_instances[0].name, "Lin");
+        assert_eq!(
+            fork_instances[0].get_variable("hp"),
+            Some(&serde_json::json!(42))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_delete_character_source_ids_include_domain_character_id() {
         let mut character = make_test_character("Lin");

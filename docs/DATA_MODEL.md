@@ -78,6 +78,15 @@ RoundSummary
 
 `story_clock` 当前同时存在于顶层字段和 variables 中。代码注释已经说明：兼容旧数据时保留顶层字段，但语义上应以 variables 为准，未来可通过数据迁移统一。
 
+### Campaign fork
+
+`Campaign.fork_from` records `(source_campaign_id, fork_node_id)`. The Tauri
+`fork_campaign` command creates a new Campaign from that source, copies the
+source Campaign variables and `story_clock`, clones the source
+`CharacterInstance` snapshot with fresh instance ids, and creates a new
+conversation copied through the fork node. The source Campaign and source
+conversation remain unchanged.
+
 ## CharacterInstance
 
 `CharacterInstance` 是 Campaign 内的运行时角色：

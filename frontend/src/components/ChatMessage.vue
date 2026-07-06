@@ -9,9 +9,10 @@ const props = defineProps({
   conversationId: { type: String, default: null },
   /** 是否有流水线正在运行（运行中禁用重 roll） */
   busy: { type: Boolean, default: false },
+  canBranch: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['reroll', 'reroll-user', 'switch-variant', 'edit-variant', 'accept-variant', 'delete-variant', 'add-variant'])
+const emit = defineEmits(['reroll', 'reroll-user', 'switch-variant', 'edit-variant', 'accept-variant', 'delete-variant', 'add-variant', 'branch'])
 
 // 重 roll 菜单展开
 const showRerollMenu = ref(false)
@@ -120,8 +121,9 @@ async function deleteVariant() {
 }
 
 // 分支功能（Campaign.fork）后端已实现，前端入口未就绪。
-// 原分支按钮只弹"开发中"提示，属死路交互，已移除避免误导。
-// 待 fork 前端入口落地后在此恢复 emit('branch', ...)。
+function branchMessage() {
+  emit('branch', { nodeId: props.message.id })
+}
 
 const isUser = computed(() => props.message.role === 'user')
 
@@ -190,6 +192,9 @@ function rerollUser() {
       </button>
 
       <!-- 重 roll（BaseDropdown：click-outside + ESC 关闭） -->
+      <button v-if="canBranch" @click="branchMessage" :disabled="busy"
+        class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">分支</button>
+
       <BaseDropdown v-model="showRerollMenu" align="left" :min-width="220">
         <template #trigger>
           <button

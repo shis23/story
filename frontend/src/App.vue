@@ -14,7 +14,7 @@ import PluginPanel from './components/PluginPanel.vue'
 import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 
 const powerMode = ref(false)
@@ -900,6 +900,56 @@ async function handleRerollUser({ messageId }) {
 }
 
 // 添加新变体（分支）
+function makeForkCampaignName() {
+  const baseName = activeCampaign.value?.name || 'Campaign'
+  const stamp = new Date().toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  return `${baseName} 分支 ${stamp}`
+}
+
+async function handleBranch({ nodeId }) {
+  if (isWriting.value) return
+  if (!activeCampaign.value || !currentConversationId.value) {
+    await alertDialog('请先打开 Campaign 对话，再创建分支。')
+    return
+  }
+
+  try {
+    const result = await forkCampaign(activeCampaign.value.id, nodeId, makeForkCampaignName())
+    await setActiveCampaign(result.id)
+    activeCampaign.value = await getActiveCampaign()
+    await loadInstanceNameMap()
+
+    if (result.conversation_id) {
+      const conv = await getConversation(result.conversation_id)
+      if (conv) {
+        applyConversation(conv)
+        messages.value.forEach((m) => {
+          if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+        })
+      }
+    }
+
+    showHistory.value = false
+    activeCampaignOverview.value = false
+    await loadConversationHistory()
+    broadcastPluginEvent(ST_EVENT_TYPES.CHAT_LOADED, chatEventPayload({
+      reason: 'campaign_forked',
+      campaignId: result.id,
+      conversationId: result.conversation_id || currentConversationId.value,
+      forkNodeId: nodeId,
+      sourceCampaignId: result.fork_from?.[0] || null,
+    }))
+  } catch (e) {
+    console.error('创建分支失败:', e)
+    await alertDialog('创建分支失败: ' + e)
+  }
+}
+
 async function handleAddVariant({ nodeId }) {
   if (!currentConversationId.value) return
   try {
@@ -1171,11 +1221,13 @@ function handlePipelineEvent(event) {
               :message="m"
               :conversation-id="currentConversationId"
               :busy="isWriting"
+              :can-branch="writingMode === 'campaign' && !!activeCampaign && !!currentConversationId"
               @reroll="handleReroll"
               @reroll-user="handleRerollUser"
               @edit-variant="handleEditVariant"
               @accept-variant="handleAcceptVariant"
               @delete-variant="handleDeleteVariant"
+              @branch="handleBranch"
               @add-variant="handleAddVariant"
               @switch-variant="handleSwitchVariant"
             />

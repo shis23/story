@@ -174,6 +174,38 @@ impl ConversationStore {
     }
 
     /// 获取对话详情
+    pub fn fork_at(
+        &self,
+        source_conv_id: &Id,
+        campaign_id: Id,
+        fork_node_id: &Id,
+    ) -> Result<Conversation, ConversationError> {
+        self.ensure_loaded();
+
+        let forked = {
+            let cache = self.lock_cache();
+            let source = cache
+                .iter()
+                .find(|c| &c.id == source_conv_id)
+                .ok_or_else(|| ConversationError::NotFound(source_conv_id.to_string()))?;
+            let fork_idx = source
+                .nodes
+                .iter()
+                .position(|node| &node.id == fork_node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(fork_node_id.to_string()))?;
+
+            let mut forked = Conversation::new(source.character_id.clone(), Some(campaign_id));
+            forked.nodes = source.nodes[..=fork_idx].to_vec();
+            forked.updated_at = Utc::now();
+            forked
+        };
+
+        self.persist(&forked)?;
+        let mut cache = self.lock_cache();
+        cache.push(forked.clone());
+        Ok(forked)
+    }
+
     pub fn get(&self, id: &Id) -> Option<Conversation> {
         self.ensure_loaded();
 
@@ -718,6 +750,46 @@ mod tests {
         assert_eq!(node.active_content(), "版本1");
 
         let _ = store.delete(&conv.id);
+    }
+
+    #[test]
+    fn test_fork_at_copies_prefix_to_new_campaign_conversation() {
+        let store = temp_store();
+        let source_campaign_id = Id::from_str("source-campaign");
+        let fork_campaign_id = Id::from_str("fork-campaign");
+        let conv = store.create(Some("card-1".into()), Some(source_campaign_id));
+        let first = store
+            .append_user_message(&conv.id, "first user".into())
+            .unwrap();
+        let branch_point = store
+            .append_ai_draft(&conv.id, "branch point".into(), None)
+            .unwrap();
+        let _later = store
+            .append_user_message(&conv.id, "later user".into())
+            .unwrap();
+
+        let forked = store
+            .fork_at(&conv.id, fork_campaign_id.clone(), &branch_point)
+            .unwrap();
+
+        assert_ne!(forked.id, conv.id);
+        assert_eq!(forked.character_id, Some("card-1".into()));
+        assert_eq!(forked.campaign_id, Some(fork_campaign_id));
+        assert_eq!(forked.nodes.len(), 2);
+        assert_eq!(forked.nodes[0].id, first);
+        assert_eq!(forked.nodes[1].id, branch_point);
+        assert_eq!(forked.nodes[1].active_content(), "branch point");
+
+        let persisted = store.get(&forked.id).unwrap();
+        assert_eq!(persisted.nodes.len(), 2);
+        assert!(
+            store
+                .fork_at(&conv.id, Id::from_str("bad-campaign"), &Id::new())
+                .is_err()
+        );
+
+        let _ = store.delete(&conv.id);
+        let _ = store.delete(&forked.id);
     }
 
     #[test]

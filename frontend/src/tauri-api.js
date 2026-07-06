@@ -699,6 +699,20 @@ export async function createCampaign(cardId, name, openingMessage = null) {
 }
 
 /** 列出 Campaign（可按 card_id 过滤） */
+export async function forkCampaign(sourceCampaignId, forkNodeId, name) {
+  if (isTauri()) {
+    return await invoke('fork_campaign', { sourceCampaignId, forkNodeId, name })
+  }
+  return {
+    id: `mock-fork-${Date.now()}`,
+    card_id: 'mock-card-1',
+    name,
+    fork_from: [sourceCampaignId, forkNodeId],
+    instance_count: 1,
+    conversation_id: 'mock-conversation-1',
+  }
+}
+
 export async function listCampaigns(cardId = null) {
   if (isTauri()) {
     return await invoke('list_campaigns', { cardId })
