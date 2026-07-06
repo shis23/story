@@ -197,6 +197,7 @@ cargo tauri android build
 
 - 导入、写作、导出诊断包仍可用。
 - capability 文件中没有无理由的全量文件系统访问；`cargo test -p storyforge --test capabilities` 固化该约束。
+- 前端 `@tauri-apps/plugin-dialog` / `@tauri-apps/plugin-fs` 文件 helper 与 capability 权限匹配；新增 helper 时必须同步最小权限。
 
 ## 禁止改动
 
