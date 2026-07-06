@@ -202,7 +202,7 @@ Layer 1: Meta Agent 复刻
 | ID | 问题 | 阻碍 ST 兼容? | 阻碍 Android? | 时机 |
 |---|---|---|---|---|
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 已修复 | ✅ 已修复 | 2026-07-06 已拆 adapter |
-| H-002 | API key 明文存储 | ✅ 已修复 | 🟡 需实机验证 | 2026-07-06 已接系统凭据库 + SecretRef |
+| H-002 | API key 明文存储 | ✅ 已修复 | 🟡 需 Android 实机验证 | 2026-07-06 已接系统凭据库 + SecretRef；Windows Credential Manager 冒烟测试通过 |
 | H-013 | CampaignStore 集合级锁 + 同步 JSON I/O | 否 | 🟡 中 | S4（单 Mutex 已拆，剩余性能压测/后台 flush 待做） |
 | H-014 | 同步 fs 阻塞 tokio | 否 | 🟡 中 | S4 |
 | M-012 | lastConversationNode 未传入 | 🟡 影响 Meta | 否 | S3 后 |

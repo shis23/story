@@ -6,6 +6,8 @@
 pub const SECRET_REF_PREFIX: &str = "storyforge-secret:v1:";
 pub const DEFAULT_SECRET_SERVICE: &str = "StoryForge";
 
+use std::sync::OnceLock;
+
 pub trait SecretStore: Send + Sync {
     fn put_secret(&self, secret_ref: &str, secret: &str) -> Result<(), String>;
     fn get_secret(&self, secret_ref: &str) -> Result<String, String>;
@@ -36,9 +38,64 @@ impl SystemSecretStore {
         if !is_secret_ref(secret_ref) {
             return Err(format!("无效 SecretRef: {secret_ref}"));
         }
+        ensure_native_store()?;
         keyring::Entry::new(&self.service, secret_ref)
             .map_err(|e| format!("打开系统凭据项失败: {e}"))
     }
+}
+
+fn ensure_native_store() -> Result<(), String> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(init_native_store).clone()
+}
+
+#[cfg(target_os = "windows")]
+fn init_native_store() -> Result<(), String> {
+    let store = windows_native_keyring_store::Store::new()
+        .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn init_native_store() -> Result<(), String> {
+    let store = android_native_keyring_store::Store::new()
+        .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn init_native_store() -> Result<(), String> {
+    let store = apple_native_keyring_store::keychain::Store::new()
+        .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+fn init_native_store() -> Result<(), String> {
+    let store = zbus_secret_service_keyring_store::Store::new()
+        .map_err(|e| format!("初始化系统凭据库失败: {e}"))?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    )
+)))]
+fn init_native_store() -> Result<(), String> {
+    Err("当前平台没有配置系统凭据库后端".into())
 }
 
 impl SecretStore for SystemSecretStore {
@@ -91,5 +148,31 @@ mod tests {
         assert_eq!(secret_ref, "storyforge-secret:v1:llm-connection:abc");
         assert!(is_secret_ref(&secret_ref));
         assert!(!is_secret_ref("sk-plain"));
+    }
+
+    #[test]
+    #[ignore = "writes a throwaway secret to the OS credential store"]
+    fn system_keyring_write_read_delete_roundtrip() {
+        let store = SystemSecretStore::new(format!("StoryForgeTest-{}", unique_id()));
+        let secret_ref = make_secret_ref("keyring-smoke", &unique_id());
+        let secret = format!("test-secret-{}", unique_id());
+
+        store.delete_secret(&secret_ref).unwrap();
+        store.put_secret(&secret_ref, &secret).unwrap();
+        assert_eq!(store.get_secret(&secret_ref).unwrap(), secret);
+        store.delete_secret(&secret_ref).unwrap();
+        assert!(store.get_secret(&secret_ref).is_err());
+    }
+
+    fn unique_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     }
 }

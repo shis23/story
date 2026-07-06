@@ -3904,10 +3904,15 @@ dependencies = [
 name = "storyforge-infra-util"
 version = "0.1.0"
 dependencies = [
+ "android-native-keyring-store",
+ "apple-native-keyring-store",
  "keyring",
+ "keyring-core",
  "serde",
  "serde_json",
  "tracing",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
