@@ -241,7 +241,7 @@
 
 2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。`crates/app-pipeline` 已接入正则执行器：首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘/返回前执行 Output 正则。Input/Output 过滤已优先尊重 ST 原始 `placement_codes`，`[0,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；World Info/Slash/Reasoning 等非 Input/Output 执行点、prompt/display-only、depth 限制等完整运行时语义仍未实现。
 
-2026-07-06 增量核对：`CharacterInfo` 已保留 `alternate_greetings` 并在启动恢复到 domain `Character` 时保留该字段；legacy 单卡新会话前端已提供默认/备选开场切换，`start_writing` 可接收并校验来自当前角色卡的 `opening_message`，新建 conversation 时会持久化选中的开场。Campaign 新建开场仍沿用默认 `first_mes`，后续需单独设计 Campaign 级选择入口。
+2026-07-06 增量核对：`CharacterInfo` 已保留 `alternate_greetings` 并在启动恢复到 domain `Character` 时保留该字段；legacy 单卡新会话前端已提供默认/备选开场切换，`start_writing` 可接收并校验来自当前角色卡的 `opening_message`，新建 conversation 时会持久化选中的开场。Campaign 新建游玩档也已接入默认/备选开场选择：`get_card` 会暴露源角色卡 greetings，`create_campaign` 接收并校验所选 `opening_message`，再写入新建 Campaign conversation。
 
 ### Phase 6：Android（~20%）
 

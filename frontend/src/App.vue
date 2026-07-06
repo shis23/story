@@ -14,7 +14,7 @@ import PluginPanel from './components/PluginPanel.vue'
 import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, createCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -147,8 +147,7 @@ const isWriting = ref(false)
 // 当前对话 ID（重 roll 需要）
 const currentConversationId = ref(null)
 const selectedGreetingIndex = ref(0)
-const greetingOptions = computed(() => {
-  const detail = activeCharDetail.value
+function buildGreetingOptionsFromDetail(detail) {
   if (!detail) return []
 
   const options = []
@@ -165,7 +164,8 @@ const greetingOptions = computed(() => {
     addOption(`备选 ${index + 1}`, content)
   })
   return options
-})
+}
+const greetingOptions = computed(() => buildGreetingOptionsFromDetail(activeCharDetail.value))
 const selectedGreeting = computed(() => greetingOptions.value[selectedGreetingIndex.value] || null)
 const canChooseGreeting = computed(() =>
   writingMode.value === 'legacy'
@@ -358,17 +358,42 @@ function startNewConversation() {
 const showNewCampaignForm = ref(false)
 const newCampaignCards = ref([])
 const newCampaignCardId = ref(null)
+const newCampaignCardDetail = ref(null)
 const newCampaignName = ref('')
+const newCampaignGreetingIndex = ref(0)
 const creatingCampaign = ref(false)
+const newCampaignGreetingOptions = computed(() => buildGreetingOptionsFromDetail(newCampaignCardDetail.value))
+const selectedNewCampaignGreeting = computed(() => newCampaignGreetingOptions.value[newCampaignGreetingIndex.value] || null)
+
+function normalizeNewCampaignGreetingSelection() {
+  if (newCampaignGreetingIndex.value >= newCampaignGreetingOptions.value.length) {
+    newCampaignGreetingIndex.value = 0
+  }
+}
+
+async function loadNewCampaignCardDetail() {
+  newCampaignCardDetail.value = null
+  newCampaignGreetingIndex.value = 0
+  if (!newCampaignCardId.value) return
+  try {
+    newCampaignCardDetail.value = await getCard(newCampaignCardId.value)
+    normalizeNewCampaignGreetingSelection()
+  } catch (e) {
+    console.error('加载 Campaign 开场白失败:', e)
+  }
+}
 
 async function openNewCampaignDialog() {
   showNewCampaignForm.value = true
   newCampaignName.value = ''
+  newCampaignCardDetail.value = null
+  newCampaignGreetingIndex.value = 0
   try {
     newCampaignCards.value = await listCards()
     // 默认选第一张已识别的卡
     const firstExtracted = newCampaignCards.value.find(c => c.extracted) || newCampaignCards.value[0]
     newCampaignCardId.value = firstExtracted?.id || null
+    await loadNewCampaignCardDetail()
   } catch (e) { console.error('加载角色卡列表失败:', e) }
 }
 
@@ -376,7 +401,11 @@ async function handleCreateCampaign() {
   if (!newCampaignCardId.value || !newCampaignName.value.trim()) return
   creatingCampaign.value = true
   try {
-    const result = await createCampaign(newCampaignCardId.value, newCampaignName.value.trim())
+    const result = await createCampaign(
+      newCampaignCardId.value,
+      newCampaignName.value.trim(),
+      selectedNewCampaignGreeting.value?.content || null,
+    )
     await setActiveCampaign(result.id)
     activeCampaign.value = await getActiveCampaign()
     await loadInstanceNameMap()
@@ -1111,8 +1140,14 @@ function handlePipelineEvent(event) {
         <template v-else>
           <div>
             <label class="text-xs text-ink-soft mb-1.5 block">选择角色卡</label>
-            <select v-model="newCampaignCardId" class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent">
+            <select v-model="newCampaignCardId" @change="loadNewCampaignCardDetail" class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent">
               <option v-for="c in newCampaignCards" :key="c.id" :value="c.id">{{ c.name }}{{ c.extracted ? '' : '（未识别）' }}</option>
+            </select>
+          </div>
+          <div v-if="newCampaignGreetingOptions.length > 1">
+            <label class="text-xs text-ink-soft mb-1.5 block">开场白</label>
+            <select v-model="newCampaignGreetingIndex" class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent">
+              <option v-for="(option, i) in newCampaignGreetingOptions" :key="i" :value="i">{{ option.label }}</option>
             </select>
           </div>
           <div>

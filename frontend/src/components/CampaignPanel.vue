@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { alertDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
 import {
@@ -26,12 +26,47 @@ const cardDetail = ref(null)
 
 // ─── Campaigns 状态 ───
 const selectedCardId = ref(null)
+const selectedCampaignCardDetail = ref(null)
 const campaigns = ref([])
 const loadingCampaigns = ref(false)
 const activeCampaign = ref(null)
 const showNewCampaign = ref(false)
 const newCampaignName = ref('')
+const newCampaignGreetingIndex = ref(0)
 const creatingCampaign = ref(false)
+
+function buildGreetingOptionsFromDetail(detail) {
+  if (!detail) return []
+  const options = []
+  const seen = new Set()
+  const addOption = (label, content) => {
+    if (!content || !content.trim() || seen.has(content)) return
+    seen.add(content)
+    options.push({ label, content })
+  }
+  addOption('默认', detail.first_mes)
+  ;(detail.alternate_greetings || []).forEach((content, index) => {
+    addOption(`备选 ${index + 1}`, content)
+  })
+  return options
+}
+
+const newCampaignGreetingOptions = computed(() => buildGreetingOptionsFromDetail(selectedCampaignCardDetail.value))
+const selectedNewCampaignGreeting = computed(() => newCampaignGreetingOptions.value[newCampaignGreetingIndex.value] || null)
+
+function normalizeNewCampaignGreetingSelection() {
+  if (newCampaignGreetingIndex.value >= newCampaignGreetingOptions.value.length) {
+    newCampaignGreetingIndex.value = 0
+  }
+}
+
+async function loadSelectedCampaignCardDetail() {
+  selectedCampaignCardDetail.value = null
+  newCampaignGreetingIndex.value = 0
+  if (!selectedCardId.value) return
+  selectedCampaignCardDetail.value = await getCard(selectedCardId.value)
+  normalizeNewCampaignGreetingSelection()
+}
 
 // ─── Detail 状态 ───
 const selectedCampaignId = ref(null)
@@ -98,12 +133,33 @@ async function refreshCampaigns() {
   }
 }
 
+async function openCampaignsForCard(card) {
+  selectedCardId.value = card.id
+  activeTab.value = 'campaigns'
+  showNewCampaign.value = false
+  await loadSelectedCampaignCardDetail()
+  await refreshCampaigns()
+}
+
+async function openNewCampaignForm() {
+  showNewCampaign.value = true
+  newCampaignGreetingIndex.value = 0
+  if (selectedCardId.value && !selectedCampaignCardDetail.value) {
+    await loadSelectedCampaignCardDetail()
+  }
+}
+
 async function handleCreateCampaign() {
   if (!newCampaignName.value.trim() || !selectedCardId.value) return
   creatingCampaign.value = true
   try {
-    const result = await createCampaign(selectedCardId.value, newCampaignName.value.trim())
+    const result = await createCampaign(
+      selectedCardId.value,
+      newCampaignName.value.trim(),
+      selectedNewCampaignGreeting.value?.content || null,
+    )
     newCampaignName.value = ''
+    newCampaignGreetingIndex.value = 0
     showNewCampaign.value = false
     await refreshCampaigns()
     await handleSetActive(result.id)
@@ -296,7 +352,7 @@ defineExpose({ refreshActiveDetailTab })
             <!-- 开档按钮 -->
             <div v-if="cardDetail.character_definitions.length > 0" class="pt-1">
               <button
-                @click="selectedCardId = card.id; activeTab = 'campaigns'; refreshCampaigns()"
+                @click="openCampaignsForCard(card)"
                 class="w-full min-h-[44px] rounded-lg text-sm font-medium bg-accent text-white hover:opacity-90 transition-colors"
               >管理游玩档 →</button>
             </div>
@@ -316,7 +372,7 @@ defineExpose({ refreshActiveDetailTab })
 
           <div v-else-if="campaigns.length === 0 && !showNewCampaign" class="text-center py-8">
             <div class="text-ink-soft text-sm mb-3">还没有游玩档</div>
-            <button @click="showNewCampaign = true" class="min-h-[44px] px-4 rounded-lg text-xs font-medium bg-accent text-white">
+            <button @click="openNewCampaignForm" class="min-h-[44px] px-4 rounded-lg text-xs font-medium bg-accent text-white">
               新建游玩档
             </button>
           </div>
@@ -324,6 +380,15 @@ defineExpose({ refreshActiveDetailTab })
           <!-- 新建表单 -->
           <div v-if="showNewCampaign" class="bg-surface rounded-xl border border-line p-3 space-y-2">
             <div class="text-xs font-medium text-ink">新建游玩档</div>
+            <div v-if="newCampaignGreetingOptions.length > 1">
+              <label class="text-xs text-ink-soft mb-1 block">开场白</label>
+              <select
+                v-model="newCampaignGreetingIndex"
+                class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-bg focus:outline-none focus:border-accent"
+              >
+                <option v-for="(option, i) in newCampaignGreetingOptions" :key="i" :value="i">{{ option.label }}</option>
+              </select>
+            </div>
             <input
               v-model="newCampaignName"
               placeholder="输入档名（如：第一周目）"
@@ -368,7 +433,7 @@ defineExpose({ refreshActiveDetailTab })
           <!-- 新建按钮（有档时显示） -->
           <button
             v-if="campaigns.length > 0 && !showNewCampaign"
-            @click="showNewCampaign = true"
+            @click="openNewCampaignForm"
             class="w-full min-h-[44px] rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-dashed border-line transition-colors"
           >+ 新建游玩档</button>
         </template>

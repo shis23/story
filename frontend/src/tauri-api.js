@@ -689,10 +689,11 @@ export async function deleteCard(id) {
  * 开档：建 Campaign，实例化所有 Protagonist/Supporting 角色
  * @param {string} cardId - CharacterCard ID
  * @param {string} name - 档名
+ * @param {string|null} openingMessage - 新建 Campaign 对话时使用的角色卡开场白
  */
-export async function createCampaign(cardId, name) {
+export async function createCampaign(cardId, name, openingMessage = null) {
   if (isTauri()) {
-    return await invoke('create_campaign', { cardId, name })
+    return await invoke('create_campaign', { cardId, name, openingMessage: openingMessage || null })
   }
   return { id: 'mock-campaign-1', card_id: cardId, name, instance_count: 1 }
 }

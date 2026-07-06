@@ -1966,13 +1966,47 @@ fn resolve_legacy_opening_message(
     requested: Option<String>,
 ) -> Option<String> {
     let character = character?;
+    resolve_opening_message_from_parts(
+        &character.first_mes,
+        &character.alternate_greetings,
+        requested,
+        "legacy",
+    )
+}
+
+fn resolve_campaign_opening_message(
+    source_character_id: &Id,
+    requested: Option<String>,
+) -> Option<String> {
+    let stored = stored_character_for_source_id(source_character_id)?;
+    resolve_opening_message_from_parts(
+        &stored.info.first_mes,
+        &stored.info.alternate_greetings,
+        requested,
+        "campaign",
+    )
+}
+
+fn stored_character_for_source_id(source_character_id: &Id) -> Option<storage::StoredCharacter> {
+    let source = source_character_id.as_str();
+    get_store()
+        .list()
+        .into_iter()
+        .find(|sc| sc.info.source_character_id.as_deref() == Some(source) || sc.id == source)
+}
+
+fn resolve_opening_message_from_parts(
+    first_mes: &str,
+    alternate_greetings: &[String],
+    requested: Option<String>,
+    source_label: &str,
+) -> Option<String> {
     let mut choices = Vec::new();
-    if !character.first_mes.trim().is_empty() {
-        choices.push(character.first_mes.clone());
+    if !first_mes.trim().is_empty() {
+        choices.push(first_mes.to_string());
     }
     choices.extend(
-        character
-            .alternate_greetings
+        alternate_greetings
             .iter()
             .filter(|greeting| !greeting.trim().is_empty())
             .cloned(),
@@ -1983,7 +2017,9 @@ fn resolve_legacy_opening_message(
         if choices.iter().any(|choice| choice == &message) {
             return Some(message);
         }
-        tracing::warn!("Ignoring opening_message that is not present on the active character");
+        tracing::warn!(
+            "Ignoring {source_label} opening_message that is not present on the source character"
+        );
     }
 
     choices.into_iter().next()
@@ -4997,6 +5033,8 @@ pub struct CardDetailDto {
     pub id: String,
     pub name: String,
     pub source_character_id: String,
+    pub first_mes: String,
+    pub alternate_greetings: Vec<String>,
     pub character_definitions: Vec<CharacterDefinitionDto>,
     pub imported_at: String,
     /// 识别是否成功（false = 走降级路径，单角色 Protagonist）
@@ -5207,10 +5245,19 @@ fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
     let stored = get_campaign_store()
         .get_card(&Id::from_str(&id))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={id}")))?;
+    let source_character = stored_character_for_source_id(&stored.card.source_character_id);
     Ok(CardDetailDto {
         id: stored.card.id.as_str().to_string(),
         name: stored.card.name.clone(),
         source_character_id: stored.card.source_character_id.as_str().to_string(),
+        first_mes: source_character
+            .as_ref()
+            .map(|sc| sc.info.first_mes.clone())
+            .unwrap_or_default(),
+        alternate_greetings: source_character
+            .as_ref()
+            .map(|sc| sc.info.alternate_greetings.clone())
+            .unwrap_or_default(),
         character_definitions: stored
             .card
             .character_definitions
@@ -5228,6 +5275,7 @@ fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
 fn create_campaign(
     card_id: String,
     name: String,
+    opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
     use storyforge_domain::campaign::CharacterInstance;
@@ -5250,19 +5298,13 @@ fn create_campaign(
         .save_campaign(campaign.clone())
         .map_err(|e| format!("存储写入失败: {e}"))?;
 
-    // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character.first_mes）
-    let src_id_str = stored.card.source_character_id.as_str().to_string();
-    let first_mes = get_store()
-        .list()
-        .into_iter()
-        .find(|sc| sc.info.source_character_id.as_deref() == Some(src_id_str.as_str()))
-        .map(|sc| sc.info.first_mes.clone())
-        .unwrap_or_default();
-    if !first_mes.is_empty()
+    // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character greeting）
+    if let Some(opening) =
+        resolve_campaign_opening_message(&stored.card.source_character_id, opening_message)
         && let Err(e) =
             state
                 .conv_store
-                .append_final_message(&conv.id, ConvRole::Assistant, first_mes)
+                .append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         tracing::warn!("建 Campaign 时追加开场白失败: {e}");
     }
@@ -6540,6 +6582,38 @@ mod tests {
         assert_eq!(
             resolve_legacy_opening_message(Some(&character), Some("   ".into())),
             Some("default opening".into())
+        );
+    }
+
+    #[test]
+    fn resolve_opening_message_from_parts_supports_campaign_greetings() {
+        let alternates = vec!["alternate one".to_string(), "alternate two".to_string()];
+
+        assert_eq!(
+            resolve_opening_message_from_parts(
+                "default opening",
+                &alternates,
+                Some("alternate two".into()),
+                "campaign"
+            ),
+            Some("alternate two".into())
+        );
+        assert_eq!(
+            resolve_opening_message_from_parts(
+                "default opening",
+                &alternates,
+                Some("not from this card".into()),
+                "campaign"
+            ),
+            Some("default opening".into())
+        );
+        assert_eq!(
+            resolve_opening_message_from_parts("", &alternates, None, "campaign"),
+            Some("alternate one".into())
+        );
+        assert_eq!(
+            resolve_opening_message_from_parts("", &[], Some("missing".into()), "campaign"),
+            None
         );
     }
 
