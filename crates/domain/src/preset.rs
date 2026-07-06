@@ -198,7 +198,7 @@ impl Preset {
     pub fn input_regex_scripts(&self) -> Vec<&RegexScript> {
         self.regex_scripts
             .iter()
-            .filter(|r| !r.disabled && r.placement == RegexPlacement::Input)
+            .filter(|r| !r.disabled && regex_script_applies_to_placement(r, RegexPlacement::Input))
             .collect()
     }
 
@@ -206,8 +206,19 @@ impl Preset {
     pub fn output_regex_scripts(&self) -> Vec<&RegexScript> {
         self.regex_scripts
             .iter()
-            .filter(|r| !r.disabled && r.placement == RegexPlacement::Output)
+            .filter(|r| !r.disabled && regex_script_applies_to_placement(r, RegexPlacement::Output))
             .collect()
+    }
+}
+
+fn regex_script_applies_to_placement(script: &RegexScript, placement: RegexPlacement) -> bool {
+    if script.placement_codes.is_empty() {
+        return script.placement == placement;
+    }
+
+    match placement {
+        RegexPlacement::Input => script.placement_codes.contains(&0),
+        RegexPlacement::Output => script.placement_codes.contains(&2),
     }
 }
 
@@ -233,8 +244,8 @@ pub(crate) fn extract_regex_scripts_with_source(
     arr.iter()
         .filter_map(|v| serde_json::from_value::<StRegexScript>(v.clone()).ok())
         .map(|s| {
-            // ST placement: [0] = 位置（0=主输入, 1=世界书, 2=输出）, [1] = 编辑器
-            // 我们简化：0 → Input, 2 → Output, 其他 → Input
+            // ST placement: [0] = main input, [2] = output. Other execution
+            // points are preserved in placement_codes until their hooks exist.
             let placement = if s.placement.first() == Some(&2) {
                 RegexPlacement::Output
             } else {
@@ -335,6 +346,42 @@ mod tests {
                 RegexScriptSource::Scoped,
             ]
         );
+    }
+
+    #[test]
+    fn preset_regex_helpers_respect_st_placement_codes() {
+        let mut both = make_script("both", "both", RegexScriptSource::Preset);
+        both.placement = RegexPlacement::Input;
+        both.placement_codes = vec![0, 2];
+
+        let mut world_info = make_script("world", "world", RegexScriptSource::Preset);
+        world_info.placement = RegexPlacement::Input;
+        world_info.placement_codes = vec![1];
+
+        let mut legacy_input = make_script("legacy", "legacy", RegexScriptSource::Preset);
+        legacy_input.placement = RegexPlacement::Input;
+        legacy_input.placement_codes = vec![];
+
+        let preset = Preset {
+            name: "test".to_string(),
+            prompts: vec![],
+            regex_scripts: vec![both, world_info, legacy_input],
+            source: Source::Native,
+        };
+
+        let input_ids: Vec<_> = preset
+            .input_regex_scripts()
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+        let output_ids: Vec<_> = preset
+            .output_regex_scripts()
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+
+        assert_eq!(input_ids, vec!["both", "legacy"]);
+        assert_eq!(output_ids, vec!["both"]);
     }
 
     #[test]

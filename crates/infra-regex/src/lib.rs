@@ -32,7 +32,7 @@ pub fn apply_regex_scripts(
         if script.disabled {
             continue;
         }
-        if script.placement != placement {
+        if !script_applies_to_placement(script, &placement) {
             continue;
         }
 
@@ -132,6 +132,17 @@ fn merge_flags(inline_flags: &str, field_flags: &str) -> String {
     merged
 }
 
+fn script_applies_to_placement(script: &RegexScript, placement: &RegexPlacement) -> bool {
+    if script.placement_codes.is_empty() {
+        return script.placement == *placement;
+    }
+
+    match placement {
+        RegexPlacement::Input => script.placement_codes.contains(&0),
+        RegexPlacement::Output => script.placement_codes.contains(&2),
+    }
+}
+
 // --- input/output regex split ----------------------------------------------
 
 /// Split ST regex_scripts into input/output scripts
@@ -143,9 +154,11 @@ pub fn split_by_placement(scripts: &[RegexScript]) -> (Vec<&RegexScript>, Vec<&R
         if script.disabled {
             continue;
         }
-        match script.placement {
-            RegexPlacement::Input => input.push(script),
-            RegexPlacement::Output => output.push(script),
+        if script_applies_to_placement(script, &RegexPlacement::Input) {
+            input.push(script);
+        }
+        if script_applies_to_placement(script, &RegexPlacement::Output) {
+            output.push(script);
         }
     }
 
@@ -283,16 +296,41 @@ mod tests {
     }
 
     #[test]
+    fn test_st_multi_placement_codes_apply_to_input_and_output() {
+        let mut script = make_script("both", r"foo", "bar", RegexPlacement::Input);
+        script.placement_codes = vec![0, 2];
+
+        let input = apply_regex_scripts("foo", &[script.clone()], RegexPlacement::Input).unwrap();
+        let output = apply_regex_scripts("foo", &[script], RegexPlacement::Output).unwrap();
+
+        assert_eq!(input, "bar");
+        assert_eq!(output, "bar");
+    }
+
+    #[test]
+    fn test_unsupported_st_placement_code_does_not_fall_back_to_input() {
+        let mut script = make_script("world-info", r"foo", "bar", RegexPlacement::Input);
+        script.placement_codes = vec![1];
+
+        let result = apply_regex_scripts("foo", &[script], RegexPlacement::Input).unwrap();
+
+        assert_eq!(result, "foo");
+    }
+
+    #[test]
     fn test_split_by_placement() {
+        let mut both = make_script("both", r"x", "y", RegexPlacement::Input);
+        both.placement_codes = vec![0, 2];
         let scripts = vec![
             make_script("输入1", r"a", "b", RegexPlacement::Input),
             make_script("输出1", r"c", "d", RegexPlacement::Output),
             make_script("输入2", r"e", "f", RegexPlacement::Input),
+            both,
         ];
 
         let (input, output) = split_by_placement(&scripts);
-        assert_eq!(input.len(), 2);
-        assert_eq!(output.len(), 1);
+        assert_eq!(input.len(), 3);
+        assert_eq!(output.len(), 2);
     }
 
     #[test]

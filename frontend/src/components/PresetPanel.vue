@@ -225,10 +225,27 @@ function roleBadgeClass(role) {
 }
 
 function regexPlacementLabel(regex) {
-  return regex.placement === 'input' ? '输入' : '输出'
+  const codes = Array.isArray(regex.placement_codes) ? regex.placement_codes : []
+  if (codes.length === 0) return regex.placement === 'input' ? '输入' : '输出'
+
+  const labels = codes.map((code) => {
+    if (code === 0) return '输入'
+    if (code === 2) return '输出'
+    return `#${code}`
+  })
+  return [...new Set(labels)].join('/')
 }
 
 function regexPlacementClass(regex) {
+  const codes = Array.isArray(regex.placement_codes) ? regex.placement_codes : []
+  if (codes.length > 0) {
+    const hasInput = codes.includes(0)
+    const hasOutput = codes.includes(2)
+    if (hasInput && hasOutput) return 'bg-accent/10 text-accent'
+    if (hasInput) return 'bg-running/10 text-running'
+    if (hasOutput) return 'bg-ok/10 text-ok'
+    return 'bg-warn/10 text-warn'
+  }
   return regex.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'
 }
 </script>
@@ -431,9 +448,9 @@ function regexPlacementClass(regex) {
               >
                 <div class="flex items-center gap-2 mb-1">
                   <span class="font-medium text-ink truncate">{{ r.script_name || r.id }}</span>
-                  <span class="px-1.5 py-0.5 rounded text-[10px]"
-                    :class="r.placement === 'input' ? 'bg-running/10 text-running' : 'bg-ok/10 text-ok'"
-                  >{{ r.placement === 'input' ? '输入' : '输出' }}</span>
+                  <span class="px-1.5 py-0.5 rounded text-[10px]" :class="regexPlacementClass(r)">
+                    {{ regexPlacementLabel(r) }}
+                  </span>
                   <span v-if="r.disabled" class="text-[10px] text-warn">禁用</span>
 
                   <!-- 启停按钮 -->

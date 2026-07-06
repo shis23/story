@@ -1062,6 +1062,7 @@ pub struct RegexScriptDto {
     pub find_regex: String,
     pub replace_string: String,
     pub placement: String,
+    pub placement_codes: Vec<i32>,
     pub disabled: bool,
 }
 
@@ -1076,6 +1077,7 @@ fn regex_script_dto(r: &RegexScript) -> RegexScriptDto {
             storyforge_domain::preset::RegexPlacement::Output => "output",
         }
         .to_string(),
+        placement_codes: r.placement_codes.clone(),
         disabled: r.disabled,
     }
 }
