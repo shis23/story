@@ -43,7 +43,7 @@
 - `frontend/src/App.vue::startWriting` 会先计算 `charIdForWriting = writingMode.value === 'campaign' ? null : activeChar.value?.id`，Campaign 模式不再把 active character id 传入写作入口，兼容模式才沿用扁平 `Character`。
 - `frontend/src/tauri-api.js::startWriting` 调用 Tauri command `start_writing`。
 - `crates/tauri-app/src/lib.rs::start_writing` 存在，并从 `snapshot_tool_ctx()` 构造写作上下文。
-- `crates/tauri-app/src/lib.rs::fill_campaign_context` 填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`，**阶段 2 已扩展**：开头先清空旧 runtime 防 stale，然后从 CampaignStore 加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。
+- `crates/tauri-app/src/lib.rs::fill_campaign_context_async` 填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`，**阶段 2 已扩展**：开头先清空旧 runtime 防 stale，然后在 `spawn_blocking` 中从 active Campaign / CampaignStore 加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 快照，回到 async 主线写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。同步版 `fill_campaign_runtime_from_store` 仍作为 harness/测试入口保留。
 - `crates/tauri-app/src/lib.rs::AppState` **已持有 `data_dir`**：生产启动仍使用 OS 标准数据目录；测试可通过 `new_for_test()` 使用临时目录，避免本机真实角色/active Campaign 污染单元测试。
 - `crates/app-pipeline/src/lib.rs::WritingContext` **阶段 2 已新增** `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。字段列表为 `characters/world_info/conversation_id/campaign_id/turn/pending_tasks/story_clock/profile/modules/recent_messages/campaign_runtime`。
 - `crates/app-pipeline/src/lib.rs::build_director_tail` **阶段 3 已改造**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断（`truncate_chars` 按 char 而非 byte）；无时退回旧的扁平 Character 名称列表。pending tasks 注入不变。2026-07-06 增量：会调用 `WorldInfoBook::triggered_selective_entries(intent)`，将本轮写作意图命中的 Selective/Both 世界书条目注入 volatile tail，保持 Constant/Both 常驻设定仍在 system。
@@ -57,7 +57,7 @@
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **已补齐写入错误处理**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失。
-- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。桌面小/中等数据量暂不阻塞，Android/真实长会话仍需复测。
+- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。2026-07-07 已先把写作/重 roll 的 Campaign 快照读取移入 `spawn_blocking`，降低 async Tauri 命令上的同步读阻塞；桌面小/中等数据量暂不阻塞，Android/真实长会话和同步写入后台 flush 仍需复测。
 - `storyforge-infra-util::secret_store` + `crates/tauri-app/src/connection_store.rs` **已补 API key SecretRef 存储**：LLM 连接和 embedder key 通过 `keyring` 写入系统凭据库，`connections.json` / `embed.json` 只保留 `storyforge-secret:v1:*`；旧明文文件加载时迁移，真实 LLM harness 可解析 SecretRef。2026-07-06 已补平台 native store 显式初始化，Windows Credential Manager 写/读/删冒烟测试通过；`infra-util` Android arm64 交叉编译通过，Android 真机 keyring 仍待验证。
 - `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`source_knowledge_id`、`relay_chain_text`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”，并在有上游知识时展示 A→B→C 传话链。
 - `crates/domain/src/character_knowledge.rs::CharacterKnowledgeEntry::source_knowledge_id` **已补传话链 MVP**：Tauri 写回层会在 `ToldByOther`/广播写入时匹配来源角色已有知识并链接上游条目。该能力是文本匹配级链路，完整语义传播仍需真实 LLM 行为评测。
@@ -319,7 +319,7 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 
 以下名称是推荐目标，不是当前代码事实：
 
-- ~~`CampaignRuntimeContext`~~ **阶段 2 已完成**：`crates/domain/src/campaign_runtime.rs` 包含 DTO + helpers，已接入 `WritingContext`/`ToolContext`，`fill_campaign_context` 已组装快照。
+- ~~`CampaignRuntimeContext`~~ **阶段 2 已完成**：`crates/domain/src/campaign_runtime.rs` 包含 DTO + helpers，已接入 `WritingContext`/`ToolContext`，`fill_campaign_context_async` 已在写作/重 roll 入口异步组装快照。
 - ~~`meta_explain_generation`~~ **已完成并接入前端**：后端 command、Meta runtime `inspect_generation` 工具和 `MetaPanel` “解释上一条生成”入口均已可用；前端只对带 provenance 的 assistant 节点显示入口。
 - `meta_preview_mvu_schema`
 - `propose_apply_mvu_schema`

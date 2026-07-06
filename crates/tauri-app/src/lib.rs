@@ -1889,7 +1889,7 @@ async fn start_writing(
     // 从活跃 Agent Profile Config 加载运行时配置覆盖
     fill_agent_profile_context(&mut ctx, &app);
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
-    fill_campaign_context(&mut ctx, &app);
+    fill_campaign_context_async(&mut ctx, &app).await?;
 
     // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -2147,14 +2147,9 @@ fn fill_agent_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
 /// 优先读内存 `state.active_campaign`，磁盘 `load_active_campaign` 仅作 fallback。
 /// 历史 bug：旧实现绕过内存直接读磁盘，若 `set_active_campaign` 先改内存后写盘
 /// 但写盘失败（非原子），会用旧/空 campaign。
+#[cfg(test)]
 fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
-    // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留
-    // （如果后续 early return，至少不会有上一轮的脏快照）
-    ctx.campaign_runtime = None;
-    {
-        let mut tool_guard = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-        tool_guard.campaign_runtime = None;
-    }
+    clear_campaign_runtime(ctx, &state.tool_ctx);
 
     let active_id = {
         let guard = state
@@ -2171,6 +2166,115 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
     };
     let store = get_campaign_store();
     fill_campaign_runtime_from_store(ctx, &state.tool_ctx, store, &active_id);
+}
+
+async fn fill_campaign_context_async(
+    ctx: &mut WritingContext,
+    state: &Arc<AppState>,
+) -> Result<(), TauriCommandError> {
+    clear_campaign_runtime(ctx, &state.tool_ctx);
+
+    let memory_active_id = {
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+    let data_dir = state.data_dir.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let active_id = memory_active_id.or_else(|| load_active_campaign(&data_dir))?;
+        load_campaign_context_snapshot(get_campaign_store(), &active_id)
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("加载 Campaign 快照任务失败: {e}")))?;
+
+    if let Some(snapshot) = snapshot {
+        apply_campaign_context_snapshot(ctx, &state.tool_ctx, snapshot);
+    }
+    Ok(())
+}
+
+fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolContext>>) {
+    // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留。
+    ctx.campaign_runtime = None;
+    let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+    tool_guard.campaign_runtime = None;
+}
+
+struct CampaignContextSnapshot {
+    active_id: Id,
+    story_clock: String,
+    turn: u32,
+    pending_tasks: Vec<storyforge_domain::story_task::StoryTask>,
+    scoped_regex_scripts: Vec<RegexScript>,
+    runtime: Arc<CampaignRuntimeContext>,
+}
+
+fn load_campaign_context_snapshot(
+    store: &campaign_store::CampaignStore,
+    active_id: &Id,
+) -> Option<CampaignContextSnapshot> {
+    let camp = store.get_campaign(active_id)?;
+    let story_clock = camp.story_clock.clone();
+    let existing_turns = store.list_summaries(active_id).len() as u32;
+    let turn = existing_turns + 1;
+    let tasks = store.list_tasks(active_id);
+    let instances = store.list_instances(active_id);
+    let knowledge = store.list_knowledge(active_id);
+
+    let stored_card = store.get_card(&camp.card_id);
+    let scoped_regex_scripts = stored_card
+        .as_ref()
+        .map(|stored| stored.card.scoped_regex_scripts())
+        .unwrap_or_default();
+    let definitions_by_id: std::collections::HashMap<
+        Id,
+        storyforge_domain::character::CharacterDefinition,
+    > = stored_card
+        .map(|stored| {
+            stored
+                .card
+                .character_definitions
+                .into_iter()
+                .map(|def| (def.id.clone(), def))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let runtime = Arc::new(CampaignRuntimeContext {
+        campaign: camp,
+        instances,
+        definitions_by_id,
+        knowledge,
+        tasks: tasks.clone(),
+        turn,
+    });
+
+    Some(CampaignContextSnapshot {
+        active_id: active_id.clone(),
+        story_clock,
+        turn,
+        pending_tasks: tasks,
+        scoped_regex_scripts,
+        runtime,
+    })
+}
+
+fn apply_campaign_context_snapshot(
+    ctx: &mut WritingContext,
+    tool_ctx: &Arc<RwLock<ToolContext>>,
+    snapshot: CampaignContextSnapshot,
+) {
+    ctx.campaign_id = Some(snapshot.active_id);
+    ctx.story_clock = snapshot.story_clock;
+    ctx.turn = snapshot.turn;
+    ctx.pending_tasks = snapshot.pending_tasks;
+    append_missing_campaign_scoped_regex_scripts(ctx, snapshot.scoped_regex_scripts);
+    ctx.campaign_runtime = Some(snapshot.runtime.clone());
+
+    let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+    tool_guard.campaign_runtime = Some(snapshot.runtime);
 }
 
 /// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
@@ -3005,7 +3109,7 @@ async fn regenerate(
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
     fill_agent_profile_context(&mut ctx, &app);
-    fill_campaign_context(&mut ctx, &app);
+    fill_campaign_context_async(&mut ctx, &app).await?;
 
     // cancel channel
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -8784,6 +8888,88 @@ mod tests {
     }
 
     // ─── 第三轮：类型化 Patch 命令测试 ────────────────────────────────────────
+
+    /// Campaign context snapshots apply the same runtime view to writing and tools.
+    #[test]
+    fn test_campaign_context_snapshot_applies_runtime_to_contexts() {
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
+        use storyforge_domain::story_task::{StoryTask, TaskTrigger};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_campaign_snapshot_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let mut campaign = Campaign::new(Id::from_str("card-1"), "run");
+        campaign.story_clock = "Day 3".into();
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let instance = CharacterInstance::temporary(campaign.id.clone(), "Ghost");
+        store.add_instance(instance.clone()).unwrap();
+        store
+            .add_knowledge(vec![CharacterKnowledgeEntry::witnessed(
+                campaign.id.clone(),
+                instance.id.clone(),
+                "Ghost saw the gate",
+                1,
+            )])
+            .unwrap();
+        store
+            .add_task(StoryTask::user_planned(
+                campaign.id.clone(),
+                "Open the gate",
+                "The gate must open later",
+                vec![TaskTrigger::TurnReminder { at_turn: 2 }],
+                1,
+            ))
+            .unwrap();
+        store
+            .add_summary(RoundSummary::new(
+                campaign.id.clone(),
+                Id::new(),
+                1,
+                "A previous turn happened".into(),
+            ))
+            .unwrap();
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        let tool_ctx = Arc::new(RwLock::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        }));
+
+        let snapshot = load_campaign_context_snapshot(&store, &campaign.id).unwrap();
+        apply_campaign_context_snapshot(&mut ctx, &tool_ctx, snapshot);
+
+        assert_eq!(ctx.campaign_id, Some(campaign.id.clone()));
+        assert_eq!(ctx.story_clock, "Day 3");
+        assert_eq!(ctx.turn, 2);
+        assert_eq!(ctx.pending_tasks.len(), 1);
+        let runtime = ctx.campaign_runtime.as_ref().unwrap();
+        assert_eq!(runtime.instances.len(), 1);
+        assert_eq!(runtime.knowledge.len(), 1);
+        assert_eq!(runtime.tasks.len(), 1);
+        assert_eq!(runtime.turn, 2);
+
+        let tool_runtime = tool_ctx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .campaign_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(tool_runtime.campaign.id, campaign.id);
+        assert_eq!(tool_runtime.instances[0].id, instance.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 构造一个有 orphan knowledge 的 campaign，提议后返回的 patch 数 ≥ 1
     /// 且含 delete_orphan_knowledge action
