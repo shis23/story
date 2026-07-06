@@ -537,6 +537,7 @@ fn apply_action(
                 turn_number: snapshot.turn,
                 event_id: None,
                 pinned: false,
+                propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
             };
             snapshot.knowledge.push(entry);
             Ok(())

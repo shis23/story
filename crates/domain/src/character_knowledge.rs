@@ -25,6 +25,25 @@ pub enum KnowledgeSource {
     Backstory,
 }
 
+/// 知识传播策略。
+///
+/// `Open` 保持既有行为；`Private` 表示该知识只给拥有者注入，并阻止后处理写回层继续传播；
+/// `GroupRestricted` 预留给后续更细的身份组封口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationPolicy {
+    #[default]
+    Open,
+    Private,
+    GroupRestricted(String),
+}
+
+impl PropagationPolicy {
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
 // ─── 知识条目 ──────────────────────────────────────────────────────────────
 
 /// 一条角色可见信息（"这个角色知道什么"）
@@ -54,6 +73,9 @@ pub struct CharacterKnowledgeEntry {
     /// pin 总量有上限，超了挤掉最老的，防止 system 膨胀。
     #[serde(default)]
     pub pinned: bool,
+    /// 传播策略。默认 open，兼容旧 knowledge.json。
+    #[serde(default, skip_serializing_if = "PropagationPolicy::is_open")]
+    pub propagation: PropagationPolicy,
 }
 
 impl CharacterKnowledgeEntry {
@@ -69,6 +91,7 @@ impl CharacterKnowledgeEntry {
             turn_number: 0,
             event_id: None,
             pinned: true, // backstory 默认 pin
+            propagation: PropagationPolicy::Open,
         }
     }
 
@@ -89,6 +112,7 @@ impl CharacterKnowledgeEntry {
             turn_number: turn,
             event_id: None,
             pinned: false,
+            propagation: PropagationPolicy::Open,
         }
     }
 
@@ -110,6 +134,7 @@ impl CharacterKnowledgeEntry {
             turn_number: turn,
             event_id: None,
             pinned: false,
+            propagation: PropagationPolicy::Open,
         }
     }
 
@@ -125,12 +150,17 @@ impl CharacterKnowledgeEntry {
             turn_number: turn,
             event_id: None,
             pinned: false,
+            propagation: PropagationPolicy::Open,
         }
     }
 
     /// pin / unpin（标记为重大信息或取消）
     pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
+    }
+
+    pub fn set_propagation(&mut self, propagation: PropagationPolicy) {
+        self.propagation = propagation;
     }
 }
 
@@ -167,6 +197,9 @@ pub struct CharacterKnowledgeUpdate {
     /// `#[serde(default)]` 保证既有数据/测试不传此字段时反序列化为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broadcast: Option<BroadcastTarget>,
+    /// 传播策略。默认 open，只有成文明确提示"秘密/禁止外传"时由 postprocess 标 private。
+    #[serde(default, skip_serializing_if = "PropagationPolicy::is_open")]
+    pub propagation: PropagationPolicy,
 }
 
 impl CharacterKnowledgeUpdate {
@@ -182,6 +215,7 @@ impl CharacterKnowledgeUpdate {
             turn_number: turn,
             event_id: None,
             pinned: self.pinned,
+            propagation: self.propagation,
         }
     }
 }
@@ -239,7 +273,15 @@ pub fn render_knowledge_for_injection(
             KnowledgeSource::Inferred => "（推断）".to_string(),
             KnowledgeSource::Backstory => "（背景）".to_string(),
         };
-        out.push_str(&format!("- {}{source_tag}\n", e.knowledge_text));
+        let propagation_tag = match &e.propagation {
+            PropagationPolicy::Open => String::new(),
+            PropagationPolicy::Private => "（秘密，禁止外传）".to_string(),
+            PropagationPolicy::GroupRestricted(group) => format!("（限制传播：仅{group}）"),
+        };
+        out.push_str(&format!(
+            "- {}{source_tag}{propagation_tag}\n",
+            e.knowledge_text
+        ));
     }
     out
 }
@@ -317,6 +359,7 @@ mod tests {
             source_character_id: Some(Id::new()),
             pinned: true, // 重大揭示，pin
             broadcast: None,
+            propagation: PropagationPolicy::Open,
         };
         let entry = update.into_entry(Id::new(), 8);
         assert_eq!(entry.character_id, char_id);
@@ -350,6 +393,7 @@ mod tests {
             turn_number: 3,
             event_id: None,
             pinned: false,
+            propagation: PropagationPolicy::Open,
         }];
 
         // 有 resolver 时，显示告知者名字
@@ -379,12 +423,26 @@ mod tests {
             turn_number: 3,
             event_id: None,
             pinned: false,
+            propagation: PropagationPolicy::Open,
         }];
 
         // 无 resolver 时，退化为旧行为
         let text = render_knowledge_for_injection(&entries, false, 10, None);
         assert!(text.contains("（被告知）"));
         assert!(!text.contains("来源："));
+    }
+
+    #[test]
+    fn test_render_private_policy_marks_secret() {
+        let campaign = Id::new();
+        let char_id = Id::new();
+        let mut entry =
+            CharacterKnowledgeEntry::witnessed(campaign, char_id, "保险柜密码是 0427", 4);
+        entry.propagation = PropagationPolicy::Private;
+
+        let text = render_knowledge_for_injection(&[entry], false, 10, None);
+        assert!(text.contains("保险柜密码是 0427"));
+        assert!(text.contains("禁止外传"));
     }
 
     // ─── W6 方向 1：BroadcastTarget serde 兼容 ─────────────────────────────
@@ -418,6 +476,7 @@ mod tests {
         }"#;
         let update: CharacterKnowledgeUpdate = serde_json::from_str(json).unwrap();
         assert!(update.broadcast.is_none());
+        assert_eq!(update.propagation, PropagationPolicy::Open);
     }
 
     #[test]
@@ -448,5 +507,21 @@ mod tests {
             update.broadcast,
             Some(BroadcastTarget::Group("守卫".to_string()))
         );
+    }
+
+    #[test]
+    fn test_knowledge_update_serde_with_private_propagation() {
+        let json = r#"{
+            "character_id": "char-1",
+            "knowledge_text": "保险柜密码是 0427",
+            "source": "witnessed",
+            "pinned": false,
+            "propagation": "private"
+        }"#;
+        let update: CharacterKnowledgeUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(update.propagation, PropagationPolicy::Private);
+
+        let entry = update.into_entry(Id::from_str("camp-1"), 3);
+        assert_eq!(entry.propagation, PropagationPolicy::Private);
     }
 }

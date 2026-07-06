@@ -87,6 +87,7 @@ Android 候选版本需验证：
 - 坏卡导入失败不破坏已有数据。
 - 写作中断不会留下错误 active state。
 - `CampaignStore` 写入失败能被 UI 或日志观察到。
+- private/封口知识不会通过 postprocess 的告知或广播写入被继续传播；失败/阻断应在日志中可见。
 - 数据迁移失败不覆盖旧目录。
 - 排障 bundle 包含足够日志，且不泄露 API key。
 
@@ -97,4 +98,5 @@ Android 候选版本需验证：
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；同步 JSON I/O 仍需压测后判断是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储仍需 keyring/系统安全存储方案。
+- 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

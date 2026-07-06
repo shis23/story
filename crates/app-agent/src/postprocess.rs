@@ -14,7 +14,7 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::character_knowledge::{
-    BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource,
+    BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
 };
 use storyforge_domain::llm::ChatResponse;
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
@@ -108,6 +108,9 @@ struct KnowledgeUpdateDto {
     /// 广播目标："all" = 全体; 其他字符串 = 身份组名; null/缺失 = 不广播
     #[serde(default)]
     broadcast: Option<String>,
+    /// 传播策略："open" = 默认; "private"/"secret"/"sealed" = 禁止外传
+    #[serde(default)]
+    propagation: Option<String>,
 }
 fn default_source() -> String {
     "witnessed".to_string()
@@ -164,6 +167,25 @@ fn parse_status(s: &str) -> TaskStatus {
     }
 }
 
+fn parse_propagation(s: Option<&str>) -> PropagationPolicy {
+    let Some(raw) = s else {
+        return PropagationPolicy::Open;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PropagationPolicy::Open;
+    }
+    match trimmed.to_lowercase().as_str() {
+        "open" => PropagationPolicy::Open,
+        "private" | "secret" | "sealed" | "no_share" | "no-share" | "禁止外传" | "秘密"
+        | "封口" => PropagationPolicy::Private,
+        lower if lower.starts_with("group:") => {
+            PropagationPolicy::GroupRestricted(trimmed[6..].trim().to_string())
+        }
+        _ => PropagationPolicy::Open,
+    }
+}
+
 fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
     let knowledge_updates = dto
         .knowledge_updates
@@ -179,6 +201,7 @@ fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
                 "" => None,
                 group => Some(BroadcastTarget::Group(group.to_string())),
             }),
+            propagation: parse_propagation(k.propagation.as_deref()),
         })
         .collect();
 
@@ -442,6 +465,33 @@ mod tests {
         assert_eq!(
             r.knowledge_updates[0].broadcast,
             Some(BroadcastTarget::Group("守卫".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_private_propagation_from_json() {
+        use storyforge_domain::character_knowledge::PropagationPolicy;
+
+        let content = r#"{
+          "knowledge_updates": [
+            {
+              "character_id": "林医生",
+              "knowledge_text": "保险柜密码是 0427",
+              "source": "witnessed",
+              "propagation": "private"
+            }
+          ],
+          "variable_updates": [],
+          "task_updates": []
+        }"#;
+
+        let resp = make_resp(content, vec![]);
+        let r = parse_postprocess_from_response(&resp);
+
+        assert_eq!(r.knowledge_updates.len(), 1);
+        assert_eq!(
+            r.knowledge_updates[0].propagation,
+            PropagationPolicy::Private
         );
     }
 

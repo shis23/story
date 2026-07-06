@@ -256,6 +256,7 @@ fn c2_knowledge_crud() {
         turn_number: 0,
         event_id: None,
         pinned: false,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     env.campaign_store.add_knowledge(vec![entry]).unwrap();
 

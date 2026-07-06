@@ -2212,6 +2212,19 @@ pub fn normalize_knowledge_update_for_postprocess(
     present_ids: &std::collections::HashSet<String>,
     name_collisions: &std::collections::HashSet<String>,
 ) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    use storyforge_domain::character_knowledge::PropagationPolicy;
+
+    if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
+        tracing::warn!("跳过 private 知识的广播写入：{}", update.knowledge_text);
+        return vec![];
+    }
+
+    if update.broadcast.is_some()
+        && should_block_source_knowledge_propagation(store, camp_id, update, None)
+    {
+        return vec![];
+    }
+
     // 方向 1：广播分发——broadcast 非空时遍历 instances，每个生成一条 ToldByOther
     if let Some(ref broadcast) = update.broadcast {
         return dispatch_broadcast(store, camp_id, update, turn, broadcast);
@@ -2228,6 +2241,10 @@ pub fn normalize_knowledge_update_for_postprocess(
             return vec![];
         }
     };
+
+    if should_block_source_knowledge_propagation(store, camp_id, update, Some(&target)) {
+        return vec![];
+    }
 
     // P3 分流：ToldByOther/Backstory 不受在场约束（跨在场告知 + 开局已有），
     // Witnessed/Inferred 才查在场。
@@ -2273,6 +2290,7 @@ pub fn normalize_knowledge_update_for_postprocess(
             turn_number: turn,
             event_id: None,
             pinned: update.pinned,
+            propagation: update.propagation.clone(),
         },
     ]
 }
@@ -2343,9 +2361,82 @@ fn dispatch_broadcast(
                 turn_number: turn,
                 event_id: None,
                 pinned: update.pinned,
+                propagation: update.propagation.clone(),
             }
         })
         .collect()
+}
+
+fn should_block_source_knowledge_propagation(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+    target: Option<&storyforge_domain::campaign::CharacterInstance>,
+) -> bool {
+    use storyforge_domain::character_knowledge::{
+        BroadcastTarget, KnowledgeSource, PropagationPolicy,
+    };
+
+    let is_propagating =
+        update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
+    if !is_propagating {
+        return false;
+    }
+
+    let Some(source_id) = &update.source_character_id else {
+        return false;
+    };
+    let Some(source) = find_instance_by_name_or_id(store, camp_id, source_id) else {
+        return false;
+    };
+
+    let source_entries = store.list_knowledge_of(camp_id, &source.id);
+    for entry in source_entries {
+        if !knowledge_text_matches(&entry.knowledge_text, &update.knowledge_text) {
+            continue;
+        }
+
+        let blocked = match &entry.propagation {
+            PropagationPolicy::Open => false,
+            PropagationPolicy::Private => true,
+            PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
+                (Some(BroadcastTarget::Group(target_group)), _) => target_group != group,
+                (Some(BroadcastTarget::All), _) => true,
+                (None, Some(target_inst)) => !instance_matches_group(store, target_inst, group),
+                (None, None) => true,
+            },
+        };
+
+        if blocked {
+            tracing::warn!(
+                "阻止知识传播：source={} policy={:?} text={}",
+                source.name,
+                entry.propagation,
+                update.knowledge_text
+            );
+            return true;
+        }
+    }
+
+    false
+}
+
+fn knowledge_text_matches(restricted: &str, candidate: &str) -> bool {
+    let restricted = normalize_knowledge_text(restricted);
+    let candidate = normalize_knowledge_text(candidate);
+    if restricted.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    if restricted == candidate {
+        return true;
+    }
+
+    let min_len = restricted.chars().count().min(candidate.chars().count());
+    min_len >= 8 && (restricted.contains(&candidate) || candidate.contains(&restricted))
+}
+
+fn normalize_knowledge_text(text: &str) -> String {
+    text.split_whitespace().collect::<String>().to_lowercase()
 }
 
 /// 判断 instance 的 CharacterDefinition.group 是否匹配目标组名。
@@ -4148,6 +4239,7 @@ fn apply_typed_action(
                 turn_number: 0,
                 event_id: None,
                 pinned: false,
+                propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
             };
             store
                 .add_knowledge(vec![entry])
@@ -4972,6 +5064,7 @@ pub struct KnowledgeEntryDto {
     pub provenance_text: String,
     pub turn_number: u32,
     pub pinned: bool,
+    pub propagation: String,
 }
 
 fn knowledge_source_code(source: &storyforge_domain::character_knowledge::KnowledgeSource) -> &str {
@@ -4988,12 +5081,12 @@ fn knowledge_provenance_text(
     entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
     instance_names: &std::collections::HashMap<Id, String>,
 ) -> String {
-    use storyforge_domain::character_knowledge::KnowledgeSource;
+    use storyforge_domain::character_knowledge::{KnowledgeSource, PropagationPolicy};
     let target = instance_names
         .get(&entry.character_id)
         .cloned()
         .unwrap_or_else(|| entry.character_id.to_string());
-    match entry.source {
+    let base = match entry.source {
         KnowledgeSource::Witnessed => format!("{target} 亲眼所见"),
         KnowledgeSource::ToldByOther => {
             let source = entry
@@ -5009,6 +5102,23 @@ fn knowledge_provenance_text(
         }
         KnowledgeSource::Inferred => format!("{target} 自行推断"),
         KnowledgeSource::Backstory => format!("{target} 的背景知识"),
+    };
+
+    match &entry.propagation {
+        PropagationPolicy::Open => base,
+        PropagationPolicy::Private => format!("{base}（秘密，禁止外传）"),
+        PropagationPolicy::GroupRestricted(group) => format!("{base}（限制传播：仅{group}）"),
+    }
+}
+
+fn propagation_policy_code(
+    policy: &storyforge_domain::character_knowledge::PropagationPolicy,
+) -> String {
+    use storyforge_domain::character_knowledge::PropagationPolicy;
+    match policy {
+        PropagationPolicy::Open => "open".into(),
+        PropagationPolicy::Private => "private".into(),
+        PropagationPolicy::GroupRestricted(group) => format!("group:{group}"),
     }
 }
 
@@ -5032,6 +5142,7 @@ fn knowledge_entry_to_dto(
         provenance_text: knowledge_provenance_text(entry, instance_names),
         turn_number: entry.turn_number,
         pinned: entry.pinned,
+        propagation: propagation_policy_code(&entry.propagation),
     }
 }
 
@@ -5918,6 +6029,7 @@ mod tests {
             source_character_id: None,
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("inst-lin")]);
 
@@ -5969,6 +6081,7 @@ mod tests {
             source_character_id: None,
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("inst-lin")]);
 
@@ -6014,6 +6127,7 @@ mod tests {
             source_character_id: Some(Id::from_str("Chen")),
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("Lin")]);
 
@@ -6055,6 +6169,7 @@ mod tests {
             source_character_id: None,
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("Ghost")]);
 
@@ -6107,6 +6222,7 @@ mod tests {
             source_character_id: Some(Id::from_str("A")),
             pinned: false,
             broadcast: Some(BroadcastTarget::All),
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
 
         let entries = normalize_knowledge_update_for_postprocess(
@@ -6222,6 +6338,7 @@ mod tests {
             source_character_id: Some(Id::from_str("Leader")),
             pinned: false,
             broadcast: Some(BroadcastTarget::Group("守卫".to_string())),
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
 
         let entries = normalize_knowledge_update_for_postprocess(
@@ -6272,6 +6389,7 @@ mod tests {
             source_character_id: None,
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("inst-a")]);
 
@@ -6289,6 +6407,110 @@ mod tests {
         assert_eq!(entries[0].character_id, Id::from_str("inst-a"));
         assert_eq!(entries[0].source, KnowledgeSource::Witnessed);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_private_source_knowledge_blocks_told_by_other_propagation() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeEntry, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let dir = std::env::temp_dir().join(format!("sf_private_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "private-test");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
+        chen.id = Id::from_str("inst-chen");
+        store.add_instance(lin).unwrap();
+        store.add_instance(chen).unwrap();
+
+        let mut private_entry = CharacterKnowledgeEntry::witnessed(
+            campaign.id.clone(),
+            Id::from_str("inst-lin"),
+            "保险柜密码是 0427",
+            1,
+        );
+        private_entry.propagation = PropagationPolicy::Private;
+        store.add_knowledge(vec![private_entry]).unwrap();
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Chen"),
+            knowledge_text: "保险柜密码是 0427".into(),
+            source: KnowledgeSource::ToldByOther,
+            source_character_id: Some(Id::from_str("Lin")),
+            pinned: false,
+            broadcast: None,
+            propagation: PropagationPolicy::Open,
+        };
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            2,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert!(
+            entries.is_empty(),
+            "private source knowledge must not propagate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_private_knowledge_update_cannot_broadcast() {
+        use std::collections::HashSet;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("sf_private_broadcast_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-1"), "private-broadcast-test");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
+        chen.id = Id::from_str("inst-chen");
+        store.add_instance(lin).unwrap();
+        store.add_instance(chen).unwrap();
+
+        let update = CharacterKnowledgeUpdate {
+            character_id: Id::from_str("Lin"),
+            knowledge_text: "保险柜密码是 0427".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: Some(Id::from_str("Lin")),
+            pinned: false,
+            broadcast: Some(BroadcastTarget::All),
+            propagation: PropagationPolicy::Private,
+        };
+
+        let entries = normalize_knowledge_update_for_postprocess(
+            &store,
+            &campaign.id,
+            &update,
+            2,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert!(
+            entries.is_empty(),
+            "private knowledge must not be broadcast"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6314,6 +6536,7 @@ mod tests {
         assert_eq!(dto.character_name.as_deref(), Some("林医生"));
         assert_eq!(dto.source_character_name.as_deref(), Some("陈警官"));
         assert_eq!(dto.provenance_text, "林医生 被 陈警官 告知");
+        assert_eq!(dto.propagation, "open");
     }
 
     #[test]
@@ -6848,6 +7071,7 @@ mod tests {
             source_character_id: None,
             pinned: false,
             broadcast: None,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
         let present_ids = HashSet::from([String::from("Ghost")]);
 

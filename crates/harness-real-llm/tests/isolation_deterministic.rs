@@ -91,6 +91,7 @@ fn make_two_char_runtime() -> (
             turn_number: 1,
             event_id: None,
             pinned: false,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         },
         CharacterKnowledgeEntry {
             id: Id::from_str("k-chen-1"),
@@ -102,6 +103,7 @@ fn make_two_char_runtime() -> (
             turn_number: 1,
             event_id: None,
             pinned: false,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         },
     ];
 

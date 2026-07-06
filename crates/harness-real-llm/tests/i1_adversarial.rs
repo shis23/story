@@ -147,6 +147,7 @@ fn make_two_char_runtime() -> (CampaignRuntimeContext, Id, Id, CharacterInstance
         turn_number: 0,
         event_id: None,
         pinned: true,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     let chen_knowledge = CharacterKnowledgeEntry {
         id: Id::new(),
@@ -158,6 +159,7 @@ fn make_two_char_runtime() -> (CampaignRuntimeContext, Id, Id, CharacterInstance
         turn_number: 0,
         event_id: None,
         pinned: true,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
 
     let runtime = CampaignRuntimeContext {

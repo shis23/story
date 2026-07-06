@@ -51,6 +51,7 @@ fn b3_empty_witnessed_is_rejected() {
         source_character_id: None,
         pinned: false,
         broadcast: None,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     let empty: HashSet<String> = HashSet::new();
 
@@ -86,6 +87,7 @@ fn b3_empty_told_by_other_passes() {
         source_character_id: None,
         pinned: false,
         broadcast: None,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     let empty: HashSet<String> = HashSet::new();
 
@@ -125,6 +127,7 @@ fn b3_told_by_other_bypasses_presence() {
         source_character_id: None,
         pinned: false,
         broadcast: None,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     // present 含 "Chen"，不含 Lin
     let present = HashSet::from([String::from("Chen")]);
@@ -161,6 +164,7 @@ fn b3_backstory_bypasses_presence() {
         source_character_id: None,
         pinned: false,
         broadcast: None,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     let present = HashSet::from([String::from("Chen")]);
 
@@ -196,6 +200,7 @@ fn b3_witnessed_respects_presence() {
         source_character_id: None,
         pinned: false,
         broadcast: None,
+        propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
     };
     // present 只含 Lin，不含 Chen
     let present = HashSet::from([String::from("Lin")]);

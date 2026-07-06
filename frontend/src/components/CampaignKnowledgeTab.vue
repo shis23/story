@@ -79,6 +79,12 @@ function sourceLabel(k) {
   return k.source_character_name || (k.source_character_id ? `实例 ${shortId(k.source_character_id)}` : '')
 }
 
+function propagationText(k) {
+  if (k.propagation === 'private') return '🔒 封口'
+  if (k.propagation?.startsWith?.('group:')) return `限制 ${k.propagation.slice(6)}`
+  return ''
+}
+
 // ─── 实例过滤选项：从已有知识的 character_id 去重，避免要求用户手输 ID ───
 const instanceOptions = computed(() => {
   const seen = new Map()
@@ -133,6 +139,7 @@ defineExpose({ refresh: load })
           <span v-if="k.character_id" class="text-[10px] text-ink-soft">知道者 {{ instanceLabel(k) }}</span>
           <span v-if="sourceLabel(k)" class="text-[10px] text-ink-soft">来源 {{ sourceLabel(k) }}</span>
           <span v-if="k.pinned" class="text-[10px] text-accent">📌 已固定</span>
+          <span v-if="propagationText(k)" class="text-[10px] text-warn">{{ propagationText(k) }}</span>
         </div>
       </div>
     </div>

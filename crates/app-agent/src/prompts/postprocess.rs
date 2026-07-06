@@ -37,6 +37,11 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 - 普通在场角色知识不需要 broadcast 字段（不填或 null = 单角色定向）
 示例：城主宣告戒严 → { "character_id": "城主", "knowledge_text": "城主宣告全城戒严", "source": "witnessed", "broadcast": "all" }
 
+【秘密/封口规则】
+如果成文明确说明某条信息是秘密、保密、只有某人知道、不得外传，给该知识条目加：
+- propagation: "private"
+不要为 private 知识同时输出 broadcast；如果后续成文里有人试图传播这条 private 知识，系统写回层会做门禁。
+
 【任务二：变量更新】
 根据成文里发生的事，更新角色变量（hp/state/location/mood 等）或全局变量（story_clock/weather/world_state）。只输出真正发生了变化的字段。全局变量（无 instance_id）用于 story_clock 推进、天气变化、大势扭转等。
 
@@ -54,14 +59,16 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
       "knowledge_text": "我看到陈警官在地下室发现了那具尸体",
       "source": "witnessed",
       "source_character_id": null,
-      "pinned": false
+      "pinned": false,
+      "propagation": "open"
     },
     {
       "character_id": "陈警官",
       "knowledge_text": "林医生告诉我地下室有尸体",
       "source": "told_by_other",
       "source_character_id": "林医生",
-      "pinned": false
+      "pinned": false,
+      "propagation": "open"
     },
     {
       "character_id": "城主",
@@ -69,7 +76,8 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
       "source": "witnessed",
       "source_character_id": null,
       "pinned": false,
-      "broadcast": "all"
+      "broadcast": "all",
+      "propagation": "open"
     }
   ],
   "variable_updates": [
@@ -95,10 +103,11 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 - source 取值：witnessed / told_by_other / inferred（小写）
 - new_status 取值：pending / active / likely_completed / completed / abandoned（小写）
 - broadcast：可选，"all"=广播全体，"组名"=广播该身份组，不填=单角色定向
+- propagation：可选，"open"=可正常传播，"private"=秘密/禁止外传；不填按 open
 - 如果某一项没有更新，输出空数组
 
 【重要】抽取范围严格限制在「提供的在场角色列表」内，不要给不在场的角色抽知识。
-例外：told_by_other 的被告知者可以不在场（写信/传话/留信息）；broadcast 条目会被系统分发给目标角色。"#;
+例外：told_by_other 的被告知者可以不在场（写信/传话/留信息）；broadcast 条目会被系统分发给目标角色；private 知识不得广播或外传。"#;
 
 /// 构造后处理 Agent 的运行配置
 ///
@@ -173,7 +182,8 @@ pub fn register_postprocess_tools(registry: &mut ToolRegistry) {
                                 "source": {"type": "string", "enum": ["witnessed", "told_by_other", "inferred"]},
                                 "source_character_id": {"type": "string"},
                                 "pinned": {"type": "boolean"},
-                                "broadcast": {"type": "string", "description": "广播目标: 'all'=全体, '组名'=身份组, 不填=单角色"}
+                                "broadcast": {"type": "string", "description": "广播目标: 'all'=全体, '组名'=身份组, 不填=单角色"},
+                                "propagation": {"type": "string", "enum": ["open", "private"], "description": "传播策略: open=可传播, private=秘密/禁止外传"}
                             },
                             "required": ["character_id", "knowledge_text", "source"]
                         }

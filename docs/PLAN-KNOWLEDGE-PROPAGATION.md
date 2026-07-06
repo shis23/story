@@ -1,6 +1,6 @@
 # 计划：知识传播引擎
 
-> 状态：部分已实现（方向 1/2/3 + UI 可解释链路已落地；方向 4/5 待立项）
+> 状态：部分已实现（方向 1/2/3 + UI 可解释链路 + 方向 5 秘密封口 MVP 已落地；方向 4 传话链待立项）
 > 来源：P3 门禁重定位过程中，由用户场景质询推导出的完整设计问题。
 > 前置文档：`HARNESS-FINDINGS-2026-06-18.md` §P3、`INTENT.md` D30-D31/D39-D40
 > 归属：ROADMAP Phase 2（信息隔离）增强项
@@ -9,7 +9,7 @@
 
 P3（postprocess 写回门禁）原标为"空集逃生口收紧/保留"取舍。经用户场景质询（世界公告、身份组传播、写信）推翻"收紧"建议后发现：**门禁用"在场"一刀切所有知识来源是病根，空集逃生口只是症状补丁**。
 
-P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。随后方向 1/2/3 已继续落地：显式广播、身份组广播和定向告知强化不再依赖空集 hack。2026-07-06 继续补了第一层可解释链路：`list_character_knowledge` 会返回知道者名称、来源名称和 provenance 文案，前端知识面板展示“谁知道、从哪知道、哪轮知道”。**传话链和秘密封口**仍是更大的功能，继续保留在本计划里。
+P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3p4` 落地，能让广播/告知天然成立。随后方向 1/2/3 已继续落地：显式广播、身份组广播和定向告知强化不再依赖空集 hack。2026-07-06 继续补了第一层可解释链路：`list_character_knowledge` 会返回知道者名称、来源名称和 provenance 文案，前端知识面板展示“谁知道、从哪知道、哪轮知道”。同日补了**秘密封口 MVP**：知识条目带 `PropagationPolicy`，postprocess 可输出 `propagation: "private"`，写回层会阻断匹配私有来源知识的告知/广播。**传话链**仍是较大的后续功能。
 
 ## 目标
 
@@ -41,7 +41,7 @@ P3 的最小修复（门禁按 `KnowledgeSource` 分流）已在 worktree `w3-p3
 | B | 身份组传播 | 所有守卫/贵族该知道 | ✅ 已实现 | 已补：`broadcast: "组名"` → `BroadcastTarget::Group`，按 `CharacterDefinition.group` 分发 |
 | C | 定向告知/写信 | A 明确告诉不在场的 B | ✅ 已实现 | 已补：postprocess 输出被告知者/告知者，读侧渲染来源名 |
 | D | 传话链 | A→B→C 跨轮传播 | 🟡 数据可追溯，无传播引擎 | 补：跨轮传播规则 |
-| E | 秘密封口 | 某事只有 A 知，禁止外传 | ❌ | 补：反向约束标记 |
+| E | 秘密封口 | 某事只有 A 知，禁止外传 | ✅ MVP 已实现 | `PropagationPolicy::Private` + postprocess `propagation` + 写回门禁 |
 
 ## 设计方向（当前状态 + 后续草案）
 
@@ -76,7 +76,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 目标是让用户和调试工具能直接看出“谁知道什么、从哪知道、哪轮知道”。
 - 后端：`list_character_knowledge` 构建 campaign 内 instance id → name 索引，并为每条知识补 `character_name`、`source_character_name`、`provenance_text`。
 - 前端：知识面板的实例筛选和条目展示优先使用角色名；`ToldByOther` 会展示来源角色。
-- 仍未覆盖：自动传话链判定、广播产生原因的独立字段、秘密封口策略。
+- 仍未覆盖：自动传话链判定、广播产生原因的独立字段、封口策略的真实 LLM 对抗评测。
 
 ### 方向 4：传话链（场景 D，较大）
 
@@ -86,32 +86,33 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 - 难点：postprocess 如何判断"B 此时愿意/能够传话"——这是 LLM 行为层，需 prompt 引导 + 可能的约束（B 是否在场、B 与 C 关系）。
 - 本方向偏 LLM 行为，确定性测试难覆盖，归 Phase 7 LLM 评测。
 
-### 方向 5：秘密封口（场景 E）
+### 方向 5：秘密封口（场景 E，MVP 已实现）
 
 反向约束：标记某知识为"私有，禁止传播"。
-- `CharacterKnowledgeEntry` 加 `propagation: PropagationPolicy` 枚举（`Open`/`Private`/`GroupRestricted`）。
-- postprocess 抽取时，若成文里有人试图传播 `Private` 知识，应拒绝写入新告知。
-- 难点：postprocess LLM 需理解"这条是秘密"——可能需在知识文本里带标记，或 pin 时标注。
-- 本方向风险高（依赖 LLM 遵守约束），建议晚做。
+- `CharacterKnowledgeEntry` / `CharacterKnowledgeUpdate` 已加 `propagation: PropagationPolicy` 枚举（`Open`/`Private`/`GroupRestricted`，旧数据默认 `Open`）。
+- postprocess prompt/schema/解析已支持 `propagation: "private"`；private 知识不得与 `broadcast` 同时写入。
+- 写回层会在 `ToldByOther` 或 `broadcast` 写入前检查来源角色已有知识：若发现匹配的 `Private` 文本，拒绝生成新告知/广播条目。
+- 子 Agent 知识注入和 Campaign 知识面板会显示封口标记。
+- 限制：当前是文本匹配级门禁，不是完整语义安全边界；需要真实 LLM 对抗样例继续验证，避免给用户虚假的安全感。
 
 ## 落地优先级建议
 
 1. **已完成：方向 1/2/3**（显式广播、身份组广播、定向告知强化）：现有代码已有 domain enum、postprocess prompt/schema/解析、Tauri 写回分发和读侧来源渲染。
 2. **已完成第一层：可解释链路增强**：Campaign 知识 UI 可展示“谁知道什么、从哪知道、哪轮知道”；后续可继续扩到 Meta/debug 和广播产生原因。
-3. **方向 4**（传话链）：大，偏 LLM 行为，归 Phase 7 评测或单独 MVP。
-4. **方向 5**（秘密封口）：风险高，最后做；需要避免给用户虚假的安全感。
+3. **已完成 MVP：方向 5**（秘密封口）：已有数据标记、postprocess 解析、写回门禁和 UI 标记；后续重点是真实 LLM 对抗评测与更精细匹配。
+4. **方向 4**（传话链）：大，偏 LLM 行为，归 Phase 7 评测或单独 MVP。
 
 ## 与 P3 的关系
 
 - P3（w3-p3p4）= 门禁按来源分流的**最小正确修复**，让广播/告知不再依赖空集 hack。是本计划的前置。
-- 本计划 = 在 P3 基础上补**显式广播语义 + 身份组 + 传话 + 封口**，把"传播"从隐式 hack 升级为显式机制；其中前三项已落地，后两项仍待立项。
-- 显式广播测试已覆盖 domain serde、postprocess 解析和 Tauri 分发；后续测试重点转向传话链、秘密封口和解释链路。
+- 本计划 = 在 P3 基础上补**显式广播语义 + 身份组 + 传话 + 封口**，把"传播"从隐式 hack 升级为显式机制；目前显式广播、身份组、定向告知、第一层解释链路和封口 MVP 已落地，传话链仍待立项。
+- 显式广播测试已覆盖 domain serde、postprocess 解析和 Tauri 分发；封口测试已覆盖 domain serde/渲染、postprocess 解析、private+broadcast 拒绝和来源私有知识阻断。
 
 ## 开放问题（待立项时决策）
 
 1. `CharacterDefinition.group` 字段现状填充率如何？若多数为 `None`，角色识别阶段是否补 group 推断？
 2. 传话链（方向 4）是否纳入 MVP，还是明确推迟到 Phase 7？
-3. 秘密封口（方向 5）是否值得做——LLM 约束可靠性存疑，可能给人虚假安全感。
+3. 秘密封口是否继续扩展到语义相似匹配、显式知识引用 id、Meta 调试解释和真实 LLM 对抗评测？
 4. 可解释链路做到哪一层：仅 debug/Meta 可见，还是也进入正式 Campaign 知识 UI？
 
 ## 禁止改动
