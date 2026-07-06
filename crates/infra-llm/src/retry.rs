@@ -69,7 +69,7 @@ impl LlmClient for RetryingClient {
 
                 // RateLimited 优先尊重 Retry-After
                 let wait = Self::parse_retry_after(err_ref)
-                    .map(|s| std::time::Duration::from_secs(s))
+                    .map(std::time::Duration::from_secs)
                     .unwrap_or_else(|| self.backoff_duration(attempt - 1));
 
                 warn!(
@@ -109,7 +109,7 @@ impl LlmClient for RetryingClient {
             if attempt > 0 {
                 let err_ref = last_error.as_ref().unwrap();
                 let wait = Self::parse_retry_after(err_ref)
-                    .map(|s| std::time::Duration::from_secs(s))
+                    .map(std::time::Duration::from_secs)
                     .unwrap_or_else(|| self.backoff_duration(attempt - 1));
 
                 warn!(

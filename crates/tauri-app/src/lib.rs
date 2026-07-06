@@ -10,7 +10,7 @@ use chrono::Utc;
 use connection_store::ConnectionStore;
 use preset_store::PresetStore;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use storage::CharacterStore;
 use tokio::sync::watch;
@@ -175,7 +175,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
-fn load_embed_config(data_dir: &PathBuf) -> Option<storyforge_infra_llm::EmbedConfig> {
+fn load_embed_config(data_dir: &Path) -> Option<storyforge_infra_llm::EmbedConfig> {
     let path = data_dir.join("embed.json");
     if path.exists() {
         let data = std::fs::read_to_string(&path).ok()?;
@@ -185,14 +185,14 @@ fn load_embed_config(data_dir: &PathBuf) -> Option<storyforge_infra_llm::EmbedCo
     }
 }
 
-fn save_embed_config(data_dir: &PathBuf, config: &storyforge_infra_llm::EmbedConfig) {
+fn save_embed_config(data_dir: &Path, config: &storyforge_infra_llm::EmbedConfig) {
     let path = data_dir.join("embed.json");
     if let Err(e) = storyforge_infra_util::atomic_write_json(&path, config) {
         tracing::error!("保存嵌入配置失败: {e}");
     }
 }
 
-fn load_active_campaign(data_dir: &PathBuf) -> Option<Id> {
+fn load_active_campaign(data_dir: &Path) -> Option<Id> {
     let path = data_dir.join("active_campaign.json");
     let s = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
@@ -201,7 +201,7 @@ fn load_active_campaign(data_dir: &PathBuf) -> Option<Id> {
         .map(Id::from_str)
 }
 
-fn save_active_campaign(data_dir: &PathBuf, id: Option<&Id>) {
+fn save_active_campaign(data_dir: &Path, id: Option<&Id>) {
     let path = data_dir.join("active_campaign.json");
     let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
     if let Err(e) = storyforge_infra_util::atomic_write_json(&path, &v) {
@@ -250,6 +250,12 @@ pub struct AppState {
     /// Meta 对话历史（conversation_id → MetaConversation，内存态，重启清空，P3 新增）
     pub meta_conversations:
         Mutex<std::collections::HashMap<String, storyforge_app_meta::MetaConversation>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppState {
@@ -420,8 +426,7 @@ impl AppState {
             .set_active(id)?
             .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id}")))?;
 
-        let client =
-            storyforge_infra_llm::create_client(&conn).map_err(|e| TauriCommandError::from(e))?;
+        let client = storyforge_infra_llm::create_client(&conn).map_err(TauriCommandError::from)?;
 
         // 包装 LlmInterceptor：每次 LLM 调用自动记录 payload/响应/token/延迟到 LogStore
         let intercepted: Arc<dyn LlmClient> =
@@ -613,11 +618,11 @@ fn import_character(
                     .iter()
                     .flat_map(|e| e.keys.iter().cloned())
                     .collect();
-                if !all_keywords.is_empty() {
-                    if let Ok(hits) = state.vector_store.search_by_keywords(&all_keywords, 1000) {
-                        for hit in hits.into_iter().filter(|h| h.kind == VectorKind::WorldInfo) {
-                            let _ = state.vector_store.delete(&hit.id);
-                        }
+                if !all_keywords.is_empty()
+                    && let Ok(hits) = state.vector_store.search_by_keywords(&all_keywords, 1000)
+                {
+                    for hit in hits.into_iter().filter(|h| h.kind == VectorKind::WorldInfo) {
+                        let _ = state.vector_store.delete(&hit.id);
                     }
                 }
             }
@@ -681,12 +686,11 @@ fn delete_character_cascade_source_ids(
             ids.push(source_id);
         }
     }
-    if let Some(name) = stored_name {
-        if let Some(character) = characters.iter().find(|c| c.name == name) {
-            if !ids.iter().any(|id| id == &character.id) {
-                ids.push(character.id.clone());
-            }
-        }
+    if let Some(name) = stored_name
+        && let Some(character) = characters.iter().find(|c| c.name == name)
+        && !ids.iter().any(|id| id == &character.id)
+    {
+        ids.push(character.id.clone());
     }
     ids
 }
@@ -771,22 +775,22 @@ fn update_world_info_route(
     get_store().update_world_info_route(&character_id, entry_index, &route)?;
 
     // 同步更新 tool_ctx 中的世界书路由
-    if let Some(stored) = get_store().get(&character_id) {
-        if stored.info.world_info_entries.get(entry_index).is_some() {
-            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-            if let Some(ref world_info) = ctx.world_info {
-                let mut new_book = (**world_info).clone();
-                if let Some(entry) = new_book.entries.get_mut(entry_index) {
-                    entry.route = match route.as_str() {
-                        "Constant" => storyforge_domain::world_info::LoreRoute::Constant,
-                        "Selective" => storyforge_domain::world_info::LoreRoute::Selective,
-                        "Both" => storyforge_domain::world_info::LoreRoute::Both,
-                        "Disabled" => storyforge_domain::world_info::LoreRoute::Disabled,
-                        _ => unreachable!(),
-                    };
-                }
-                ctx.world_info = Some(Arc::new(new_book));
+    if let Some(stored) = get_store().get(&character_id)
+        && stored.info.world_info_entries.get(entry_index).is_some()
+    {
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref world_info) = ctx.world_info {
+            let mut new_book = (**world_info).clone();
+            if let Some(entry) = new_book.entries.get_mut(entry_index) {
+                entry.route = match route.as_str() {
+                    "Constant" => storyforge_domain::world_info::LoreRoute::Constant,
+                    "Selective" => storyforge_domain::world_info::LoreRoute::Selective,
+                    "Both" => storyforge_domain::world_info::LoreRoute::Both,
+                    "Disabled" => storyforge_domain::world_info::LoreRoute::Disabled,
+                    _ => unreachable!(),
+                };
             }
+            ctx.world_info = Some(Arc::new(new_book));
         }
     }
 
@@ -795,6 +799,7 @@ fn update_world_info_route(
 
 /// 更新世界书条目的 keys/content/constant/is_global/depth/order
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn update_world_info_entry(
     character_id: String,
     entry_index: usize,
@@ -1201,7 +1206,7 @@ fn list_plugins(state: tauri::State<'_, Arc<AppState>>) -> Vec<InstalledPluginDt
         .plugin_registry
         .list()
         .iter()
-        .map(|p| plugin_to_dto(p))
+        .map(plugin_to_dto)
         .collect()
 }
 
@@ -1656,16 +1661,15 @@ async fn start_writing(
         let conv = app.conv_store.create(character_id, None);
         let id = conv.id.clone();
         // 开场白（从角色卡读取，Final 状态 Assistant 消息）
-        if let Some(ch) = tool_snapshot.characters.first() {
-            if !ch.first_mes.is_empty() {
-                if let Err(e) = app.conv_store.append_final_message(
-                    &id,
-                    storyforge_domain::conversation::Role::Assistant,
-                    ch.first_mes.clone(),
-                ) {
-                    tracing::warn!("追加开场白失败: {e}");
-                }
-            }
+        if let Some(ch) = tool_snapshot.characters.first()
+            && !ch.first_mes.is_empty()
+            && let Err(e) = app.conv_store.append_final_message(
+                &id,
+                storyforge_domain::conversation::Role::Assistant,
+                ch.first_mes.clone(),
+            )
+        {
+            tracing::warn!("追加开场白失败: {e}");
         }
         // user 意图
         if let Err(e) = app.conv_store.append_user_message(&id, intent.clone()) {
@@ -1737,13 +1741,13 @@ async fn start_writing(
         // Also include custom variable_schema keys from character definitions
         if let Some(campaign_id) = &ctx.campaign_id {
             let store = get_campaign_store();
-            if let Some(campaign) = store.get_campaign(campaign_id) {
-                if let Some(stored_card) = store.get_card(&campaign.card_id) {
-                    for def in &stored_card.card.character_definitions {
-                        for field in &def.variable_schema {
-                            if !var_keys.contains(&field.key) {
-                                var_keys.push(field.key.clone());
-                            }
+            if let Some(campaign) = store.get_campaign(campaign_id)
+                && let Some(stored_card) = store.get_card(&campaign.card_id)
+            {
+                for def in &stored_card.card.character_definitions {
+                    for field in &def.variable_schema {
+                        if !var_keys.contains(&field.key) {
+                            var_keys.push(field.key.clone());
                         }
                     }
                 }
@@ -2058,22 +2062,22 @@ fn persist_postprocess_outcome(
     let store = get_campaign_store();
 
     // 本轮摘要
-    if let Some(summary) = &outcome.summary {
-        if let Err(e) = store.add_summary(storyforge_domain::agent::RoundSummary::new(
+    if let Some(summary) = &outcome.summary
+        && let Err(e) = store.add_summary(storyforge_domain::agent::RoundSummary::new(
             camp_id.clone(),
             ctx.conversation_id.clone(),
             ctx.turn,
             summary.clone(),
-        )) {
-            tracing::warn!("保存本轮摘要失败: {e}");
-        }
+        ))
+    {
+        tracing::warn!("保存本轮摘要失败: {e}");
     }
 
     // 后处理三合一
     if let Some(pp) = &outcome.post_process {
         // 构建 present_chars 的 Id 集合（用于校验写入目标）
         let present_ids: std::collections::HashSet<String> =
-            present_chars.iter().map(|s| s.clone()).collect();
+            present_chars.iter().cloned().collect();
 
         // P4：算 name_collisions——campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效逼 id
         let name_collisions: std::collections::HashSet<String> = {
@@ -2109,10 +2113,10 @@ fn persist_postprocess_outcome(
                 )
             })
             .collect();
-        if !knowledge_entries.is_empty() {
-            if let Err(e) = store.add_knowledge(knowledge_entries) {
-                tracing::warn!("保存后处理知识失败: {e}");
-            }
+        if !knowledge_entries.is_empty()
+            && let Err(e) = store.add_knowledge(knowledge_entries)
+        {
+            tracing::warn!("保存后处理知识失败: {e}");
         }
 
         // 变量更新：角色级（按 name 匹配 instance）/ 全局级（无 instance_id）
@@ -2154,14 +2158,12 @@ fn persist_postprocess_outcome(
         // 任务更新：新建 / 状态变化
         for tu in &pp.task_updates {
             if let Some(tid) = &tu.task_id {
-                if let Some(task) = store.get_task(tid) {
-                    if let Some(task) =
+                if let Some(task) = store.get_task(tid)
+                    && let Some(task) =
                         normalize_task_update_for_postprocess(camp_id, task, tu.new_status.clone())
-                    {
-                        if let Err(e) = store.update_task(task) {
-                            tracing::warn!("保存后处理任务状态失败: {e}");
-                        }
-                    }
+                    && let Err(e) = store.update_task(task)
+                {
+                    tracing::warn!("保存后处理任务状态失败: {e}");
                 }
             } else if let Some(spec) = &tu.new_task {
                 let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
@@ -3453,13 +3455,15 @@ fn meta_accept_patch(
     }
 
     // 标记为已执行
-    state
+    if let Some(p) = state
         .meta_patches
         .write()
         .unwrap_or_else(|p| p.into_inner())
         .iter_mut()
         .find(|p| p.id == patch_id)
-        .map(|p| p.applied = true);
+    {
+        p.applied = true;
+    }
 
     Ok(())
 }
@@ -4761,14 +4765,13 @@ fn create_campaign(
         .find(|sc| sc.info.source_character_id.as_deref() == Some(src_id_str.as_str()))
         .map(|sc| sc.info.first_mes.clone())
         .unwrap_or_default();
-    if !first_mes.is_empty() {
-        if let Err(e) =
+    if !first_mes.is_empty()
+        && let Err(e) =
             state
                 .conv_store
                 .append_final_message(&conv.id, ConvRole::Assistant, first_mes)
-        {
-            tracing::warn!("建 Campaign 时追加开场白失败: {e}");
-        }
+    {
+        tracing::warn!("建 Campaign 时追加开场白失败: {e}");
     }
 
     // 实例化所有 protagonist/supporting 定义
@@ -5295,7 +5298,7 @@ fn export_campaign_st_cards(
 
     // 尝试从 CharacterStore 获取原始 Character（用于 raw_card_json）
     let original_character = get_store()
-        .get(&stored_card.card.source_character_id.as_str())
+        .get(stored_card.card.source_character_id.as_str())
         .map(|s| stored_info_to_character(&s));
 
     let mut cards = Vec::new();
@@ -7064,7 +7067,7 @@ mod tests {
         {
             let mut task = store.get_task(&task_id).unwrap();
             task.related_characters
-                .retain(|id| !vec![orphan_id.clone()].contains(id));
+                .retain(|id| ![orphan_id.clone()].contains(id));
             store.update_task(task).unwrap();
         }
 

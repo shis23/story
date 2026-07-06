@@ -179,12 +179,10 @@ pub fn extract_mvu_schema_from_extensions(extensions: &serde_json::Value) -> Vec
     ];
 
     for path in candidates {
-        if let Some(obj) = pick_nested(extensions, path) {
-            if let serde_json::Value::Object(map) = obj {
-                let fields = parse_variable_objects(&map);
-                if !fields.is_empty() {
-                    return fields;
-                }
+        if let Some(serde_json::Value::Object(map)) = pick_nested(extensions, path) {
+            let fields = parse_variable_objects(map);
+            if !fields.is_empty() {
+                return fields;
             }
         }
     }
@@ -207,53 +205,50 @@ fn pick_nested<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_
 /// - 完整对象：`"hp": {"label": "生命值", "type": "int", "default": 100}`
 fn parse_variable_objects(map: &serde_json::Map<String, serde_json::Value>) -> Vec<VariableField> {
     map.iter()
-        .filter_map(|(key, val)| {
-            let field = match val {
-                // 完整字段定义对象
-                serde_json::Value::Object(o) => {
-                    let label = o
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(key)
-                        .to_string();
-                    let type_str = o.get("type").and_then(|v| v.as_str()).unwrap_or("string");
-                    let default = o.get("default").cloned().unwrap_or(serde_json::Value::Null);
-                    let value_type = parse_type(type_str, &default);
-                    let description = o
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let group = o.get("group").and_then(|v| v.as_str()).map(String::from);
-                    Some(VariableField {
-                        key: key.clone(),
-                        label,
-                        value_type,
-                        default,
-                        description,
-                        group,
-                    })
-                }
-                // 标量值（直接当默认值）
-                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(VariableField {
+        .filter_map(|(key, val)| match val {
+            // 完整字段定义对象
+            serde_json::Value::Object(o) => {
+                let label = o
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(key)
+                    .to_string();
+                let type_str = o.get("type").and_then(|v| v.as_str()).unwrap_or("string");
+                let default = o.get("default").cloned().unwrap_or(serde_json::Value::Null);
+                let value_type = parse_type(type_str, &default);
+                let description = o
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let group = o.get("group").and_then(|v| v.as_str()).map(String::from);
+                Some(VariableField {
                     key: key.clone(),
-                    label: key.clone(),
-                    value_type: infer_scalar_type(val),
-                    default: val.clone(),
-                    description: None,
-                    group: None,
-                }),
-                serde_json::Value::String(s) => Some(VariableField {
-                    key: key.clone(),
-                    label: key.clone(),
-                    value_type: VariableType::String,
-                    default: serde_json::Value::String(s.clone()),
-                    description: None,
-                    group: None,
-                }),
-                // null / array / 其他形态跳过（保守，宁缺勿错）
-                _ => None,
-            };
-            field
+                    label,
+                    value_type,
+                    default,
+                    description,
+                    group,
+                })
+            }
+            // 标量值（直接当默认值）
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(VariableField {
+                key: key.clone(),
+                label: key.clone(),
+                value_type: infer_scalar_type(val),
+                default: val.clone(),
+                description: None,
+                group: None,
+            }),
+            serde_json::Value::String(s) => Some(VariableField {
+                key: key.clone(),
+                label: key.clone(),
+                value_type: VariableType::String,
+                default: serde_json::Value::String(s.clone()),
+                description: None,
+                group: None,
+            }),
+            // null / array / 其他形态跳过（保守，宁缺勿错）
+            _ => None,
         })
         .collect()
 }

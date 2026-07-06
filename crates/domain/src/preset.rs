@@ -191,7 +191,7 @@ fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
         .map(|s| {
             // ST placement: [0] = 位置（0=主输入, 1=世界书, 2=输出）, [1] = 编辑器
             // 我们简化：0 → Input, 2 → Output, 其他 → Input
-            let placement = if s.placement.get(0) == Some(&2) {
+            let placement = if s.placement.first() == Some(&2) {
                 RegexPlacement::Output
             } else {
                 RegexPlacement::Input

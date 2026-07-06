@@ -64,18 +64,13 @@ impl Default for SamplingParams {
 }
 
 /// 工具协议模式
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolMode {
     /// 原生 function calling（OpenAI 兼容 API 的 tools 字段）
+    #[default]
     Native,
     /// XML/JSON 降级（提示词注入工具说明，模型输出 XML/JSON 指令）
     TextFallback,
-}
-
-impl Default for ToolMode {
-    fn default() -> Self {
-        Self::Native
-    }
 }
 
 // ─── 连接模板（对应设计 §5 ConnectionTemplate）──────────────────────────

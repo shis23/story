@@ -24,10 +24,10 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     }
 
     // 工具定义
-    if let Some(tools) = &req.tools {
-        if !tools.is_empty() {
-            body["tools"] = serde_json::json!(tools);
-        }
+    if let Some(tools) = &req.tools
+        && !tools.is_empty()
+    {
+        body["tools"] = serde_json::json!(tools);
     }
 
     body

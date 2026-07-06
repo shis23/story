@@ -138,11 +138,11 @@ impl crate::LlmClient for HttpLlmClient {
         // model 回退：连接配置的 model 优先于占位默认值
         req.model = self.effective_model(&req.model).to_string();
         // text_tools 降级：注入工具提示到 system prompt，移除 tools 字段
-        if self.text_fallback {
-            if let Some(tools) = &req.tools {
-                inject_tool_prompt(&mut req.messages, tools);
-                req.tools = None;
-            }
+        if self.text_fallback
+            && let Some(tools) = &req.tools
+        {
+            inject_tool_prompt(&mut req.messages, tools);
+            req.tools = None;
         }
 
         let body = crate::openai::build_request_body(&req);
@@ -190,11 +190,11 @@ impl crate::LlmClient for HttpLlmClient {
         let mut req = req.clone();
         // model 回退：连接配置的 model 优先于占位默认值
         req.model = self.effective_model(&req.model).to_string();
-        if self.text_fallback {
-            if let Some(tools) = &req.tools {
-                inject_tool_prompt(&mut req.messages, tools);
-                req.tools = None;
-            }
+        if self.text_fallback
+            && let Some(tools) = &req.tools
+        {
+            inject_tool_prompt(&mut req.messages, tools);
+            req.tools = None;
         }
 
         let body = crate::openai::build_stream_request_body(&req);

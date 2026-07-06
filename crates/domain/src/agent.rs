@@ -52,16 +52,14 @@ impl<'de> Deserialize<'de> for AgentRole {
         let s = String::deserialize(deserializer)?;
         match s.split_once(':') {
             // 新格式："Subagent:*" → Subagent("*")
-            Some((variant, payload)) if variant == "Subagent" => {
-                Ok(AgentRole::Subagent(payload.to_string()))
-            }
+            Some(("Subagent", payload)) => Ok(AgentRole::Subagent(payload.to_string())),
             _ => {
                 // 兼容旧格式：serde 默认对元组变体生成的 "Subagent(\"*\")" / `Subagent("xxx")`
                 // 用正则太重，手写解析：匹配 Subagent("...")
-                if let Some(rest) = s.strip_prefix("Subagent(\"") {
-                    if let Some(id) = rest.strip_suffix("\")") {
-                        return Ok(AgentRole::Subagent(id.to_string()));
-                    }
+                if let Some(rest) = s.strip_prefix("Subagent(\"")
+                    && let Some(id) = rest.strip_suffix("\")")
+                {
+                    return Ok(AgentRole::Subagent(id.to_string()));
                 }
                 AgentRole::from_str(&s).ok_or_else(|| {
                     serde::de::Error::custom(format!("unknown AgentRole variant: {s}"))

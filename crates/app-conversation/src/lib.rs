@@ -85,12 +85,11 @@ impl ConversationStore {
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(conv) = serde_json::from_str::<Conversation>(&data) {
-                            cache.push(conv);
-                        }
-                    }
+                if path.extension().map(|e| e == "json").unwrap_or(false)
+                    && let Ok(data) = std::fs::read_to_string(&path)
+                    && let Ok(conv) = serde_json::from_str::<Conversation>(&data)
+                {
+                    cache.push(conv);
                 }
             }
         }
@@ -363,7 +362,7 @@ impl ConversationStore {
                 .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             node.switch_variant(index)
-                .map_err(|e| ConversationError::VariantIndexOutOfBounds(e))?;
+                .map_err(ConversationError::VariantIndexOutOfBounds)?;
 
             conv.updated_at = Utc::now();
             Ok(())
@@ -383,7 +382,7 @@ impl ConversationStore {
                 .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             node.edit_active(new_content)
-                .map_err(|e| ConversationError::NodeNotFound(e))?;
+                .map_err(ConversationError::NodeNotFound)?;
 
             conv.updated_at = Utc::now();
             Ok(())
@@ -398,7 +397,7 @@ impl ConversationStore {
                 .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
 
             node.soft_delete_active()
-                .map_err(|e| ConversationError::NodeNotFound(e))?;
+                .map_err(ConversationError::NodeNotFound)?;
 
             conv.updated_at = Utc::now();
             Ok(())

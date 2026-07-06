@@ -950,7 +950,7 @@ mod tests {
         .unwrap();
 
         // 纯文本回复，无工具结果
-        let _ = match &turn.agent_message {
+        match &turn.agent_message {
             MetaMessage::Agent {
                 content,
                 tool_result,
@@ -959,7 +959,7 @@ mod tests {
                 assert!(tool_result.is_none()); // 无工具调用
             }
             _ => panic!("应该是 Agent 消息"),
-        };
+        }
 
         // 对话历史应该有 2 条（用户 + Agent）
         assert_eq!(conv.messages.len(), 2);

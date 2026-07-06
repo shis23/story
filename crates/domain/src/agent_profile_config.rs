@@ -141,6 +141,7 @@ pub fn default_agent_profile_config() -> AgentProfileConfig {
 
 impl AgentProfileConfig {
     /// 构造函数，保证 `max_concurrent_subagents >= 1`（避免 Semaphore(0) 死锁）。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Id,
         name: String,
@@ -217,13 +218,13 @@ impl AgentProfileConfig {
             return Err(ProfileConfigError::EmptyName);
         }
         for (role, run_cfg) in &self.agent_configs {
-            if let Some(rounds) = run_cfg.max_tool_rounds {
-                if rounds == 0 || rounds > 100 {
-                    return Err(ProfileConfigError::MaxToolRoundsOutOfRange {
-                        role: role.to_string(),
-                        value: rounds,
-                    });
-                }
+            if let Some(rounds) = run_cfg.max_tool_rounds
+                && (rounds == 0 || rounds > 100)
+            {
+                return Err(ProfileConfigError::MaxToolRoundsOutOfRange {
+                    role: role.to_string(),
+                    value: rounds,
+                });
             }
         }
         if self.max_concurrent_subagents < 1 {

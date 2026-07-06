@@ -1,12 +1,13 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-06 初版。自动化基线已跑通；真实卡、真实 LLM、Android 和打包结果仍需逐项记录。
+> 状态：2026-07-06 初版。自动化基线与 workspace clippy 闸门已纳入；真实卡、真实 LLM、Android 和打包结果仍需逐项记录。
 
 ## 0. 发布闸门
 
 任何候选版本必须满足：
 
-- `cargo test --workspace` 通过，且没有新增 warning。
+- `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace` 通过。
 - `cd frontend && npm run build` 通过。
 - release notes 明确列出仍需人工验证或降级的能力。
 - 用户数据目录、迁移、备份和排障路径已验证。
@@ -16,10 +17,11 @@
 
 2026-07-06 已验证：
 
-- `cargo test -p storyforge --lib`：64 passed / 0 failed。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过，作为 Rust warning-free 闸门。
+- `cargo test -p storyforge --lib`：通过。
 - `cargo test -p harness-real-llm`：确定性测试通过；真实 LLM 用例因缺少凭证被 ignore。
 - `cargo test --workspace`：通过；真实 LLM 用例按预期 ignore。
-- `frontend npm run build`：此前已通过；本轮未改前端后仍需在最终候选提交前重跑一次。
+- `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
 
 本轮质量修复：
 
@@ -27,6 +29,7 @@
 - `fill_campaign_context`、`configure_embedder`、`set_active_campaign` 改用 `state.data_dir`。
 - `CampaignStore` 写入结果不再静默忽略：Tauri 命令返回 `storage` 错误，postprocess 后台写回记录 warning。
 - harness 和 tauri-app 测试 fixture 写入用 `unwrap()` 显式暴露失败。
+- Rust workspace/all-targets clippy warning 已清理；保留的高参数公共流程入口只在函数处加局部 allow，避免把 API 重构混入质量闸门切片。
 
 ## 2. Bronze 主流程
 

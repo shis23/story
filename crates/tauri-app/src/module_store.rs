@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use storyforge_domain::agent_profile_config::{
@@ -110,7 +110,7 @@ pub struct ModuleStore {
 }
 
 impl ModuleStore {
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let custom_path = app_data_dir.join("custom_modules.json");
         let disabled_path = app_data_dir.join("disabled_modules.json");
 
@@ -283,7 +283,7 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let profiles_path = app_data_dir.join("profiles.json");
         let active_path = app_data_dir.join("active_profile.json");
 
@@ -354,10 +354,10 @@ impl ProfileStore {
         let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
         let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
 
-        if let Some(ref aid) = *active_id {
-            if let Some(p) = profiles.iter().find(|p| &p.id.to_string() == aid) {
-                return Some(p.clone());
-            }
+        if let Some(ref aid) = *active_id
+            && let Some(p) = profiles.iter().find(|p| &p.id.to_string() == aid)
+        {
+            return Some(p.clone());
         }
 
         // 回退：找内置默认
@@ -466,7 +466,7 @@ pub struct AgentProfileConfigStore {
 }
 
 impl AgentProfileConfigStore {
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let configs_path = app_data_dir.join("agent_profile_configs.json");
         let active_path = app_data_dir.join("active_agent_profile_config.json");
 
@@ -557,12 +557,12 @@ impl AgentProfileConfigStore {
         let active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
         let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
 
-        if let Some(ref aid) = *active_id {
-            if let Some(c) = configs.iter().find(|c| &c.id.to_string() == aid) {
-                let mut c = c.clone();
-                c.migrate_to(1);
-                return c;
-            }
+        if let Some(ref aid) = *active_id
+            && let Some(c) = configs.iter().find(|c| &c.id.to_string() == aid)
+        {
+            let mut c = c.clone();
+            c.migrate_to(1);
+            return c;
         }
 
         // 回退：找内置默认

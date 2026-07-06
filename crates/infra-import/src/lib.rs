@@ -153,7 +153,7 @@ mod tests {
 
         let entry0 = &book.entries[0];
         assert_eq!(entry0.keys, vec!["未来", "都市"]);
-        assert_eq!(entry0.constant, true);
+        assert!(entry0.constant);
         assert_eq!(
             entry0.route,
             storyforge_domain::world_info::LoreRoute::Constant
@@ -161,7 +161,7 @@ mod tests {
 
         let entry1 = &book.entries[1];
         assert_eq!(entry1.keys, vec!["战斗", "危险"]);
-        assert_eq!(entry1.selective, true);
+        assert!(entry1.selective);
         assert_eq!(
             entry1.route,
             storyforge_domain::world_info::LoreRoute::Selective

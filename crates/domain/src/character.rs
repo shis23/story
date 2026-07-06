@@ -247,22 +247,22 @@ pub fn to_st_data(
     data.alternate_greetings = character.alternate_greetings.clone();
 
     // Definition 覆盖：persona + behavior 拼合进 description（如有）
-    if let Some(def) = definition {
-        if !def.persona_prompt.is_empty() || !def.behavior_rules.is_empty() {
-            let mut parts = Vec::new();
-            if !def.persona_prompt.is_empty() {
-                parts.push(def.persona_prompt.clone());
-            }
-            if !def.behavior_rules.is_empty() {
-                parts.push(format!("行为规则：{}", def.behavior_rules));
-            }
-            // 用 definition 的 persona/behavior 丰富 description
-            let def_desc = parts.join("\n\n");
-            if data.description.is_empty() {
-                data.description = def_desc;
-            } else {
-                data.description = format!("{}\n\n{}", data.description, def_desc);
-            }
+    if let Some(def) = definition
+        && (!def.persona_prompt.is_empty() || !def.behavior_rules.is_empty())
+    {
+        let mut parts = Vec::new();
+        if !def.persona_prompt.is_empty() {
+            parts.push(def.persona_prompt.clone());
+        }
+        if !def.behavior_rules.is_empty() {
+            parts.push(format!("行为规则：{}", def.behavior_rules));
+        }
+        // 用 definition 的 persona/behavior 丰富 description
+        let def_desc = parts.join("\n\n");
+        if data.description.is_empty() {
+            data.description = def_desc;
+        } else {
+            data.description = format!("{}\n\n{}", data.description, def_desc);
         }
     }
 
@@ -423,21 +423,16 @@ pub struct CharacterDefinition {
 }
 
 /// 角色类型（决定是否常驻、是否进向量库）
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoleType {
     /// 主角（常驻，进向量库）
     Protagonist,
     /// 配角（常驻，进向量库）
+    #[default]
     Supporting,
     /// 临场基准（龙套默认类型，不进向量库；可升级）
     Extra,
-}
-
-impl Default for RoleType {
-    fn default() -> Self {
-        Self::Supporting
-    }
 }
 
 impl CharacterCard {

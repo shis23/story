@@ -6,7 +6,7 @@
 /// 注意：API key 当前明文存储（桌面开发阶段）。
 /// Android 阶段需改为 Keystore + SecretRef（设计 §5）。
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use storyforge_domain::llm::LlmConnection;
@@ -38,7 +38,7 @@ pub struct ConnectionStore {
 
 impl ConnectionStore {
     /// 初始化（从文件加载或新建）
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("connections.json");
         let file = if path.exists() {
             match std::fs::read_to_string(&path) {

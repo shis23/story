@@ -816,7 +816,7 @@ fn make_minimal_card(name: &str) -> CharacterCard {
     use storyforge_domain::Source;
     use storyforge_domain::character::Character;
     let ch = Character {
-        id: Id::from_str(&format!("{name}-src")),
+        id: Id::from_str(format!("{name}-src")),
         name: name.into(),
         description: "测试角色".into(),
         personality: "冷静".into(),

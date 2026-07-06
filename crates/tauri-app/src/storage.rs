@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::CharacterInfo;
@@ -21,7 +21,7 @@ pub struct CharacterStore {
 
 impl CharacterStore {
     /// 初始化存储（从文件加载或新建）
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("characters.json");
         let characters = if path.exists() {
             match std::fs::read_to_string(&path) {
@@ -118,6 +118,7 @@ impl CharacterStore {
     }
 
     /// 更新世界书条目的 keys / content / constant / is_global / depth / order
+    #[allow(clippy::too_many_arguments)]
     pub fn update_world_info_entry(
         &self,
         id: &str,

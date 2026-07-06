@@ -103,19 +103,19 @@ pub fn build_character_extractor_user_msg(character: &Character) -> String {
     }
 
     // 世界书条目全文（识别 NPC 的主要来源）
-    if let Some(book) = &character.embedded_world_info {
-        if !book.entries.is_empty() {
-            let mut wi = String::from("【世界书条目】\n");
-            for (i, entry) in book.entries.iter().enumerate() {
-                wi.push_str(&format!(
-                    "--- 条目 {}（keys: {}）---\n{}\n",
-                    i + 1,
-                    entry.keys.join(", "),
-                    entry.content
-                ));
-            }
-            parts.push(wi);
+    if let Some(book) = &character.embedded_world_info
+        && !book.entries.is_empty()
+    {
+        let mut wi = String::from("【世界书条目】\n");
+        for (i, entry) in book.entries.iter().enumerate() {
+            wi.push_str(&format!(
+                "--- 条目 {}（keys: {}）---\n{}\n",
+                i + 1,
+                entry.keys.join(", "),
+                entry.content
+            ));
         }
+        parts.push(wi);
     }
 
     parts.push("请识别这张卡里的所有角色并按指定 JSON 格式输出。".to_string());

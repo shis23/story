@@ -131,16 +131,16 @@ pub fn parse_from_content<T>(content: &str, parse: impl Fn(&str) -> Option<T>) -
         return Some(t);
     }
     // 层 3：```json 代码块
-    if let Some(extracted) = extract_codeblock(content, "json") {
-        if let Some(t) = parse(&extracted) {
-            return Some(t);
-        }
+    if let Some(extracted) = extract_codeblock(content, "json")
+        && let Some(t) = parse(&extracted)
+    {
+        return Some(t);
     }
     // 层 4：裸代码块
-    if let Some(extracted) = extract_codeblock(content, "") {
-        if let Some(t) = parse(&extracted) {
-            return Some(t);
-        }
+    if let Some(extracted) = extract_codeblock(content, "")
+        && let Some(t) = parse(&extracted)
+    {
+        return Some(t);
     }
     // 层 5：括号配平（逐个 `{` 尝试，调用方解析每个候选）
     try_each_braces(content, |candidate| parse(candidate))
@@ -156,12 +156,11 @@ pub fn from_tool_call<T>(
     parse: impl Fn(&serde_json::Value) -> Option<T>,
 ) -> Option<T> {
     for tc in &resp.tool_calls {
-        if tc.function.name == tool_name {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                if let Some(t) = parse(&args) {
-                    return Some(t);
-                }
-            }
+        if tc.function.name == tool_name
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            && let Some(t) = parse(&args)
+        {
+            return Some(t);
         }
     }
     None

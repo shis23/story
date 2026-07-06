@@ -177,6 +177,12 @@ impl SseEventAccumulator {
     }
 }
 
+impl Default for SseEventAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// OpenAI SSE 流式响应的 JSON 结构（仅用于解析 data: 字段）
 ///
 /// 注意：流式协议里 tool_call 是**增量**的——第一个 chunk 才有 id/name，

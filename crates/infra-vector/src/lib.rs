@@ -231,6 +231,12 @@ impl BruteForceStore {
     }
 }
 
+impl Default for BruteForceStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VectorStore for BruteForceStore {
     fn upsert(&self, record: VectorRecord) -> Result<(), VectorError> {
         let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
@@ -463,7 +469,7 @@ mod tests {
 
         let d = vec![1.0, 1.0, 0.0];
         let score = cosine_similarity(&a, &d).unwrap();
-        assert!((score - 0.7071).abs() < 0.01); // cos(45°) ≈ 0.7071
+        assert!((score - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
     }
 
     #[test]

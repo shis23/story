@@ -562,6 +562,7 @@ impl PipelineOrchestrator {
     /// 拆出的 JS 片段。pipeline 不依赖 CampaignStore，只接收已拆好的片段。
     ///
     /// 返回 `Option<PostProcessOutcome>`：None 表示跳过，Some 表示跑过（产出可能为空）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_postprocess(
         &self,
         final_text: &str,
@@ -698,12 +699,10 @@ impl PipelineOrchestrator {
         }
 
         // 摘要完成事件：仅在 summarizer 开启且有产出时发
-        if enable_summarizer {
-            if let Some(s) = &outcome.summary {
-                let _ = event_tx.send(PipelineEvent::SummaryDone {
-                    char_count: s.chars().count(),
-                });
-            }
+        if enable_summarizer && let Some(s) = &outcome.summary {
+            let _ = event_tx.send(PipelineEvent::SummaryDone {
+                char_count: s.chars().count(),
+            });
         }
 
         // 后处理完成/失败/跳过事件
@@ -1213,7 +1212,7 @@ impl PipelineOrchestrator {
             let mut performances: Vec<storyforge_domain::agent::Performance> = Vec::new();
             let mut rerun_idx = 0;
             for snap in &provenance_old.subagent_results {
-                if rerun_subagents.iter().any(|id| *id == snap.character_id) {
+                if rerun_subagents.contains(&snap.character_id) {
                     // 找到这个 character 对应的 rerun_perfs 条目
                     performances.push(rerun_perfs[rerun_idx].clone());
                     rerun_idx += 1;
@@ -1264,6 +1263,7 @@ impl PipelineOrchestrator {
     ///
     /// 被 regenerate 的各路径复用。`hint` 注入到编剧 tail。
     /// `before_node_id`：取对话历史时排除该节点及之后（重 roll 时排除目标消息）。
+    #[allow(clippy::too_many_arguments)]
     async fn run_editor_and_commit(
         &mut self,
         plan: &Plan,
@@ -1492,13 +1492,11 @@ fn build_director_tail(
         }
         lines.join("\n")
     } else {
-        let char_names = ctx
-            .characters
+        ctx.characters
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
-            .join("、");
-        char_names
+            .join("、")
     };
 
     let mut tail = VolatileTail::new();
@@ -1687,7 +1685,7 @@ fn parse_plan_from_response(
     };
 
     // ① tool_calls 中的 emit_plan（层 1）
-    if let Some(plan) = storyforge_app_agent::llm_parse::from_tool_call(resp, "emit_plan", &parse) {
+    if let Some(plan) = storyforge_app_agent::llm_parse::from_tool_call(resp, "emit_plan", parse) {
         return Ok(plan);
     }
 
@@ -2529,7 +2527,7 @@ mod tests {
             WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None, None).id);
         ctx1.turn = 1;
         let layout1 = MessageLayout::build()
-            .system(&build_director_system_extra(&ctx1))
+            .system(build_director_system_extra(&ctx1))
             .tail(|_| build_director_tail("意图A", &ctx1));
 
         // 第 2 轮：intent=B（完全不同），turn=5
@@ -2537,7 +2535,7 @@ mod tests {
             WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None, None).id);
         ctx2.turn = 5;
         let layout2 = MessageLayout::build()
-            .system(&build_director_system_extra(&ctx2))
+            .system(build_director_system_extra(&ctx2))
             .tail(|_| build_director_tail("完全不同的意图B", &ctx2));
 
         // 两轮 system 指纹必须一致（蓝灯相同 → cache 命中）

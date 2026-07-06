@@ -23,7 +23,7 @@ use storyforge_app_agent::tools::ToolRegistry;
 ///   - BindingDisplay 用 `tag="kind"` + snake_case variants
 ///   - InteractionAction 用 `tag="kind"` + snake_case variants
 ///   - MvuRouting 用 `tag="kind"` + lowercase variants
-/// 解析时 `parse_mvu_translation_from_response` 按这些结构反序列化。
+///     解析时 `parse_mvu_translation_from_response` 按这些结构反序列化。
 pub const MVU_ANALYZER_SYSTEM_PROMPT: &str = r#"你是卡内状态栏分析助手（MVU five-in-one analyzer）。给你一张带前端脚本的角色卡（HTML/CSS/JS 全文）+ 启发式打分报告 + 已探测的变量字段，你的任务是做"五合一分析"，产出 MvuTranslation。
 
 【核心认知（重要）】

@@ -122,21 +122,20 @@ pub fn parse_mvu_translation_from_response(
 ) -> Result<MvuTranslation, String> {
     // 层 1：emit_mvu_translation 工具调用
     for tc in &resp.tool_calls {
-        if tc.function.name == "emit_mvu_translation" {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
-                    return Ok(t);
-                }
-            }
+        if tc.function.name == "emit_mvu_translation"
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            && let Ok(t) = parse_mvu_from_value(&val, field_schema)
+        {
+            return Ok(t);
         }
     }
 
     // 层 2-5：从 content 提取 JSON 对象
     let content = resp.content.trim();
-    if !content.is_empty() {
-        if let Some(t) = parse_mvu_from_content(content, field_schema) {
-            return Ok(t);
-        }
+    if !content.is_empty()
+        && let Some(t) = parse_mvu_from_content(content, field_schema)
+    {
+        return Ok(t);
     }
 
     Err(format!(
@@ -147,28 +146,26 @@ pub fn parse_mvu_translation_from_response(
 
 fn parse_mvu_from_content(content: &str, field_schema: &[VariableField]) -> Option<MvuTranslation> {
     // 层 2：整个 content 是 JSON 对象
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
-            return Some(t);
-        }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+        && let Ok(t) = parse_mvu_from_value(&val, field_schema)
+    {
+        return Some(t);
     }
 
     // 层 3：```json 代码块
-    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "json") {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
-            if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
-                return Some(t);
-            }
-        }
+    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "json")
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted)
+        && let Ok(t) = parse_mvu_from_value(&val, field_schema)
+    {
+        return Some(t);
     }
 
     // 层 4：裸代码块
-    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "") {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted) {
-            if let Ok(t) = parse_mvu_from_value(&val, field_schema) {
-                return Some(t);
-            }
-        }
+    if let Some(extracted) = storyforge_app_agent::llm_parse::extract_codeblock(content, "")
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&extracted)
+        && let Ok(t) = parse_mvu_from_value(&val, field_schema)
+    {
+        return Some(t);
     }
 
     // 层 5：括号配平（委托公共模块，逐个 `{` 尝试，比"只试第一个"更健壮）
@@ -192,10 +189,10 @@ fn parse_mvu_from_value(
     // 注意：必须在直接反序列化之前判断，因为 MvuTranslationRaw 所有字段都有 default，
     // 直接解析 {result:{...}} 会得到一个"合法但全空"的结构，吞掉真正的内容。
     for wrapper in ["result", "mvu_translation", "translation", "data"] {
-        if let Some(inner) = val.get(wrapper) {
-            if let Ok(t) = serde_json::from_value::<MvuTranslationRaw>(inner.clone()) {
-                return Ok(t.into_translation(field_schema));
-            }
+        if let Some(inner) = val.get(wrapper)
+            && let Ok(t) = serde_json::from_value::<MvuTranslationRaw>(inner.clone())
+        {
+            return Ok(t.into_translation(field_schema));
         }
     }
 
@@ -322,7 +319,7 @@ impl MvuTranslationRaw {
             .filter(|m| !m.element_label.is_empty())
             .map(|m| InteractionMapping {
                 element_label: m.element_label,
-                actions: m.actions.iter().map(|a| parse_action(a)).collect(),
+                actions: m.actions.iter().map(parse_action).collect(),
             })
             .collect();
 

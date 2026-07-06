@@ -36,6 +36,7 @@ pub enum PostProcessError {
 ///
 /// `agent_profile_config`（可选）用于覆盖 PostProcessor 的 model/rounds 并过滤 tool_whitelist。
 /// 传 None = 当前硬编码默认值，向后兼容。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_postprocess(
     runtime: &AgentRuntime,
     final_text: &str,
@@ -58,13 +59,11 @@ pub async fn run_postprocess(
     let mut registry = ToolRegistry::new();
     register_postprocess_tools(&mut registry);
     // 应用 PostProcessor tool_whitelist（None=默认，Some=过滤/清空）
-    let wl = agent_profile_config
-        .map(|apc| {
-            apc.run_config_for(&storyforge_domain::agent::AgentRole::PostProcessor)
-                .tool_whitelist
-                .as_deref()
-        })
-        .flatten();
+    let wl = agent_profile_config.and_then(|apc| {
+        apc.run_config_for(&storyforge_domain::agent::AgentRole::PostProcessor)
+            .tool_whitelist
+            .as_deref()
+    });
     filter_registry_by_whitelist(&mut registry, wl, "PostProcessor");
 
     info!(target: "postprocess", "开始后处理（在场 {} 角色）", present_characters.len());
@@ -234,22 +233,21 @@ fn dto_to_result(dto: PostProcessDto) -> PostProcessResult {
 pub fn parse_postprocess_from_response(resp: &ChatResponse) -> PostProcessResult {
     // 层 1：emit_postprocess 工具调用
     for tc in &resp.tool_calls {
-        if tc.function.name == "emit_postprocess" {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                if let Ok(dto) = serde_json::from_value::<PostProcessDto>(args) {
-                    return dto_to_result(dto);
-                }
-            }
+        if tc.function.name == "emit_postprocess"
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            && let Ok(dto) = serde_json::from_value::<PostProcessDto>(args)
+        {
+            return dto_to_result(dto);
         }
     }
 
     // 层 2-5：从 content 提取 JSON
     let content = resp.content.trim();
-    if !content.is_empty() {
-        if let Some(mut result) = parse_from_content(content) {
-            result.parse_succeeded = true;
-            return result;
-        }
+    if !content.is_empty()
+        && let Some(mut result) = parse_from_content(content)
+    {
+        result.parse_succeeded = true;
+        return result;
     }
 
     warn!(target: "postprocess", "5 层兜底全miss，返回空 result（best-effort）");
@@ -265,22 +263,22 @@ fn parse_from_content(content: &str) -> Option<PostProcessResult> {
         return Some(dto_to_result(dto));
     }
     // 层 3：```json 块
-    if let Some(extracted) = extract_codeblock(content, "json") {
-        if let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted) {
-            return Some(dto_to_result(dto));
-        }
+    if let Some(extracted) = extract_codeblock(content, "json")
+        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted)
+    {
+        return Some(dto_to_result(dto));
     }
     // 层 4：裸代码块
-    if let Some(extracted) = extract_codeblock(content, "") {
-        if let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted) {
-            return Some(dto_to_result(dto));
-        }
+    if let Some(extracted) = extract_codeblock(content, "")
+        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&extracted)
+    {
+        return Some(dto_to_result(dto));
     }
     // 层 5：手写括号配平（找第一个 {...}）
-    if let Some(json_str) = extract_first_braces(content) {
-        if let Ok(dto) = serde_json::from_str::<PostProcessDto>(&json_str) {
-            return Some(dto_to_result(dto));
-        }
+    if let Some(json_str) = extract_first_braces(content)
+        && let Ok(dto) = serde_json::from_str::<PostProcessDto>(&json_str)
+    {
+        return Some(dto_to_result(dto));
     }
     None
 }

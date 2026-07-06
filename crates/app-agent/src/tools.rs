@@ -130,6 +130,12 @@ impl ToolRegistry {
     }
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 按 `AgentRunConfig::tool_whitelist` 过滤 registry。
 ///
 /// - `None`：不动（默认工具集）。
@@ -228,28 +234,28 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .ok_or_else(|| ToolError::BadArgs("缺少 name 参数".into()))?;
 
                 // 阶段 3：优先从 campaign_runtime 查实例
-                if let Some(runtime) = &ctx.campaign_runtime {
-                    if let Some(inst) = runtime.find_instance_by_id_or_name(name) {
-                        let def = runtime.definition_for_instance(inst);
-                        let persona = runtime.resolved_persona_for(inst);
-                        let behavior = runtime.resolved_behavior_for(inst);
-                        let role_type = def.map(|d| format!("{:?}", d.role_type));
-                        let backstory = def.map(|d| d.base_backstory.clone());
+                if let Some(runtime) = &ctx.campaign_runtime
+                    && let Some(inst) = runtime.find_instance_by_id_or_name(name)
+                {
+                    let def = runtime.definition_for_instance(inst);
+                    let persona = runtime.resolved_persona_for(inst);
+                    let behavior = runtime.resolved_behavior_for(inst);
+                    let role_type = def.map(|d| format!("{:?}", d.role_type));
+                    let backstory = def.map(|d| d.base_backstory.clone());
 
-                        return Ok(serde_json::json!({
-                            "id": inst.id.as_str(),
-                            "instance_id": inst.id.as_str(),
-                            "name": inst.name,
-                            "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
-                            "role_type": role_type,
-                            "persona": persona,
-                            "behavior": behavior,
-                            "backstory": backstory,
-                            "variables": inst.variables,
-                            "is_temporary": inst.is_temporary,
-                            "source": "campaign_instance",
-                        }));
-                    }
+                    return Ok(serde_json::json!({
+                        "id": inst.id.as_str(),
+                        "instance_id": inst.id.as_str(),
+                        "name": inst.name,
+                        "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
+                        "role_type": role_type,
+                        "persona": persona,
+                        "behavior": behavior,
+                        "backstory": backstory,
+                        "variables": inst.variables,
+                        "is_temporary": inst.is_temporary,
+                        "source": "campaign_instance",
+                    }));
                 }
 
                 // fallback：旧的扁平 Character 逻辑
@@ -421,8 +427,9 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                     .ok_or_else(|| ToolError::BadArgs("缺少 name 参数".into()))?;
 
                 // 阶段 4：如果有 current_character_instance_id，只返回该 instance 的数据
-                if let Some(ref instance_id) = ctx.current_character_instance_id {
-                    if let Some(ref runtime) = ctx.campaign_runtime {
+                if let Some(ref instance_id) = ctx.current_character_instance_id
+                    && let Some(ref runtime) = ctx.campaign_runtime
+                {
                         // 只允许查自己的 instance
                         if let Some(inst) = runtime.instances.iter().find(|i| &i.id == instance_id) {
                             let def = runtime.definition_for_instance(inst);
@@ -463,7 +470,6 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
                                 )
                             ));
                         }
-                    }
                 }
 
                 // fallback：旧的扁平 Character 逻辑（无 Campaign 时）

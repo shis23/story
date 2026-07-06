@@ -1,8 +1,8 @@
 # 文档与代码对齐审计
 
-> 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量、存储错误处理和测试隔离同步）
+> 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量、存储错误处理、测试隔离和 workspace clippy 闸门同步）
 > 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
-> 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、集合级锁拆分、release checklist 初版。
+> 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、集合级锁拆分、workspace/all-targets clippy 清理、release checklist 初版。
 
 ## 结论
 
@@ -12,6 +12,7 @@
 - `CampaignStore` 位于 `tauri-app`，下层 `app-agent` / `app-pipeline` 不应直接依赖它。
 - `CampaignStore` 写入 API 已返回 `Result`；Tauri 命令路径会向前端返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning 而不中断当前写作。
 - `CampaignStore` 已从单个全局缓存 Mutex 拆为 cards/campaigns/instances/knowledge/tasks/summaries/mvu 集合级锁；新增并发写回回放测试覆盖跨集合写入后重载一致性。
+- Rust workspace 当前纳入 `cargo clippy --workspace --all-targets -- -D warnings` 闸门；少量高参数公共流程入口保留局部 allow，后续若重构 API 应单独立项而不是混入 warning 清理。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
 - Meta、MVU、Android、前端计划多数是基于已有雏形的后续计划，不是当前已完成能力。
 - 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。

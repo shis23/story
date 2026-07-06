@@ -250,6 +250,12 @@ impl PluginRegistry {
     }
 }
 
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]

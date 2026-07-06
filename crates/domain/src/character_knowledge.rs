@@ -188,6 +188,8 @@ impl CharacterKnowledgeUpdate {
 
 // ─── 注入子 Agent 上下文时的渲染（确定性查表，零 LLM）────────────────────
 
+type KnowledgeNameResolver<'a> = dyn Fn(&Id) -> Option<String> + 'a;
+
 /// 把某角色的知识渲染成文本，拼进子 Agent 上下文
 ///
 /// `pinned_only = true` 时只渲染 pinned 知识（进 system 稳定层）；
@@ -200,7 +202,7 @@ pub fn render_knowledge_for_injection(
     entries: &[CharacterKnowledgeEntry],
     pinned_only: bool,
     max_count: usize,
-    name_resolver: Option<&dyn Fn(&Id) -> Option<String>>,
+    name_resolver: Option<&KnowledgeNameResolver<'_>>,
 ) -> String {
     let filtered: Vec<_> = entries
         .iter()

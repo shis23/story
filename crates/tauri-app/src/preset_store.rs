@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use storyforge_domain::preset::Preset;
@@ -19,7 +19,7 @@ pub struct PresetStore {
 }
 
 impl PresetStore {
-    pub fn new(app_data_dir: &PathBuf) -> Self {
+    pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("presets.json");
         let presets = if path.exists() {
             match std::fs::read_to_string(&path) {
@@ -98,17 +98,17 @@ impl PresetStore {
         enabled: Option<bool>,
     ) -> Result<bool, String> {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
-            if let Some(prompt) = stored.preset.prompts.get_mut(prompt_index) {
-                if let Some(c) = content {
-                    prompt.content = c.to_string();
-                }
-                if let Some(e) = enabled {
-                    prompt.enabled = e;
-                }
-                self.persist(&presets)?;
-                return Ok(true);
+        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id)
+            && let Some(prompt) = stored.preset.prompts.get_mut(prompt_index)
+        {
+            if let Some(c) = content {
+                prompt.content = c.to_string();
             }
+            if let Some(e) = enabled {
+                prompt.enabled = e;
+            }
+            self.persist(&presets)?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -121,14 +121,14 @@ impl PresetStore {
         disabled: Option<bool>,
     ) -> Result<bool, String> {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
-            if let Some(regex) = stored.preset.regex_scripts.get_mut(regex_index) {
-                if let Some(d) = disabled {
-                    regex.disabled = d;
-                }
-                self.persist(&presets)?;
-                return Ok(true);
+        if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id)
+            && let Some(regex) = stored.preset.regex_scripts.get_mut(regex_index)
+        {
+            if let Some(d) = disabled {
+                regex.disabled = d;
             }
+            self.persist(&presets)?;
+            return Ok(true);
         }
         Ok(false)
     }

@@ -275,7 +275,7 @@ fn extract_keywords(text: &str) -> Vec<String> {
 
     // 按频率排序，取前 10 个
     let mut words: Vec<(String, usize)> = word_counts.into_iter().collect();
-    words.sort_by(|a, b| b.1.cmp(&a.1));
+    words.sort_by_key(|word| std::cmp::Reverse(word.1));
     words.into_iter().take(10).map(|(w, _)| w).collect()
 }
 

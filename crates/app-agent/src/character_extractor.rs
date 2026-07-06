@@ -137,27 +137,25 @@ pub fn parse_character_definitions_from_response(
 ) -> Result<Vec<CharacterDefinition>, ExtractError> {
     // 层 1：emit_characters 工具调用（arguments 是 JSON 字符串）
     for tc in &resp.tool_calls {
-        if tc.function.name == "emit_characters" {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                if let Some(arr) = args.get("characters") {
-                    if let Ok(defs) = serde_json::from_value::<Vec<CharacterDefDto>>(arr.clone()) {
-                        let parsed: Vec<CharacterDefinition> =
-                            defs.into_iter().map(dto_to_definition).collect();
-                        if !parsed.is_empty() {
-                            return Ok(parsed);
-                        }
-                    }
-                }
+        if tc.function.name == "emit_characters"
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            && let Some(arr) = args.get("characters")
+            && let Ok(defs) = serde_json::from_value::<Vec<CharacterDefDto>>(arr.clone())
+        {
+            let parsed: Vec<CharacterDefinition> =
+                defs.into_iter().map(dto_to_definition).collect();
+            if !parsed.is_empty() {
+                return Ok(parsed);
             }
         }
     }
 
     // 层 2-5：从 content 提取 JSON 数组
     let content = resp.content.trim();
-    if !content.is_empty() {
-        if let Some(defs) = parse_definitions_from_content(content) {
-            return Ok(defs);
-        }
+    if !content.is_empty()
+        && let Some(defs) = parse_definitions_from_content(content)
+    {
+        return Ok(defs);
     }
 
     Err(ExtractError::Parse(format!(
@@ -177,24 +175,22 @@ fn parse_definitions_from_content(content: &str) -> Option<Vec<CharacterDefiniti
     }
 
     // 层 3：```json 代码块
-    if let Some(extracted) = try_extract_codeblock(content, "json") {
-        if let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted) {
-            let parsed: Vec<CharacterDefinition> =
-                defs.into_iter().map(dto_to_definition).collect();
-            if !parsed.is_empty() {
-                return Some(parsed);
-            }
+    if let Some(extracted) = try_extract_codeblock(content, "json")
+        && let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted)
+    {
+        let parsed: Vec<CharacterDefinition> = defs.into_iter().map(dto_to_definition).collect();
+        if !parsed.is_empty() {
+            return Some(parsed);
         }
     }
 
     // 层 4：裸代码块
-    if let Some(extracted) = try_extract_codeblock(content, "") {
-        if let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted) {
-            let parsed: Vec<CharacterDefinition> =
-                defs.into_iter().map(dto_to_definition).collect();
-            if !parsed.is_empty() {
-                return Some(parsed);
-            }
+    if let Some(extracted) = try_extract_codeblock(content, "")
+        && let Ok(defs) = serde_json::from_str::<Vec<CharacterDefDto>>(&extracted)
+    {
+        let parsed: Vec<CharacterDefinition> = defs.into_iter().map(dto_to_definition).collect();
+        if !parsed.is_empty() {
+            return Some(parsed);
         }
     }
 
@@ -250,6 +246,10 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
 fn match_braces(content: &str, pos: usize) -> Option<usize> {
     crate::llm_parse::match_braces(content, pos)
 }
+
+// 抑制未用警告：attach_definitions_to_card / merge_schema 等是公开 API
+#[allow(unused_imports)]
+use crate::AgentRuntime as _AgentRuntimeReexport;
 
 // ─── 测试 ─────────────────────────────────────────────────────────────────
 
@@ -335,9 +335,9 @@ pub mod tests {
     #[test]
     fn test_parse_layer5_braces_among_text() {
         // 中文文字夹杂的 JSON 数组（整体非法 JSON，但逐对象合法）
-        let content = format!(
-            "好的，识别如下：[{{\"name\":\"A\",\"persona_prompt\":\"pa\"}},{{\"name\":\"B\",\"persona_prompt\":\"pb\"}}] 完成"
-        );
+        let content =
+            "好的，识别如下：[{\"name\":\"A\",\"persona_prompt\":\"pa\"},{\"name\":\"B\",\"persona_prompt\":\"pb\"}] 完成"
+                .to_string();
         let resp = make_resp(&content, vec![]);
         let defs = parse_character_definitions_from_response(&resp).unwrap();
         assert_eq!(defs.len(), 2);
@@ -423,7 +423,3 @@ pub mod tests {
         assert!(!defs.is_empty());
     }
 }
-
-// 抑制未用警告：attach_definitions_to_card / merge_schema 等是公开 API
-#[allow(unused_imports)]
-use crate::AgentRuntime as _AgentRuntimeReexport;

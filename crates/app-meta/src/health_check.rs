@@ -59,19 +59,19 @@ fn check_orphan_instances(issues: &mut Vec<HealthIssue>, snapshot: &CampaignHeal
         snapshot.definitions.iter().map(|d| &d.id).collect();
 
     for inst in snapshot.instances {
-        if let Some(ref def_id) = inst.definition_id {
-            if !def_ids.contains(def_id) {
-                issues.push(HealthIssue {
-                    severity: IssueSeverity::Error,
-                    category: "orphan_instance".into(),
-                    message: format!(
-                        "角色实例「{}」的 definition_id 指向不存在的角色定义 ({})",
-                        inst.name,
-                        def_id.as_str()
-                    ),
-                    affected_id: Some(inst.id.to_string()),
-                });
-            }
+        if let Some(ref def_id) = inst.definition_id
+            && !def_ids.contains(def_id)
+        {
+            issues.push(HealthIssue {
+                severity: IssueSeverity::Error,
+                category: "orphan_instance".into(),
+                message: format!(
+                    "角色实例「{}」的 definition_id 指向不存在的角色定义 ({})",
+                    inst.name,
+                    def_id.as_str()
+                ),
+                affected_id: Some(inst.id.to_string()),
+            });
         }
     }
 }
@@ -133,38 +133,38 @@ fn check_variable_schema_mismatch(
         if inst.is_temporary {
             continue;
         }
-        if let Some(ref def_id) = inst.definition_id {
-            if let Some(def) = def_map.get(def_id) {
-                if def.variable_schema.is_empty() {
-                    continue;
-                }
-                let schema_keys: std::collections::HashSet<&str> =
-                    def.variable_schema.iter().map(|f| f.key.as_str()).collect();
-                let instance_keys: std::collections::HashSet<&str> =
-                    inst.variables.iter().map(|v| v.key.as_str()).collect();
+        if let Some(ref def_id) = inst.definition_id
+            && let Some(def) = def_map.get(def_id)
+        {
+            if def.variable_schema.is_empty() {
+                continue;
+            }
+            let schema_keys: std::collections::HashSet<&str> =
+                def.variable_schema.iter().map(|f| f.key.as_str()).collect();
+            let instance_keys: std::collections::HashSet<&str> =
+                inst.variables.iter().map(|v| v.key.as_str()).collect();
 
-                let missing: Vec<&str> = schema_keys.difference(&instance_keys).copied().collect();
-                let extra: Vec<&str> = instance_keys.difference(&schema_keys).copied().collect();
+            let missing: Vec<&str> = schema_keys.difference(&instance_keys).copied().collect();
+            let extra: Vec<&str> = instance_keys.difference(&schema_keys).copied().collect();
 
-                if !missing.is_empty() || !extra.is_empty() {
-                    let mut detail = String::new();
-                    if !missing.is_empty() {
-                        detail.push_str(&format!("缺失: {:?} ", missing));
-                    }
-                    if !extra.is_empty() {
-                        detail.push_str(&format!("多余: {:?}", extra));
-                    }
-                    issues.push(HealthIssue {
-                        severity: IssueSeverity::Warning,
-                        category: "variable_schema_mismatch".into(),
-                        message: format!(
-                            "角色实例「{}」的变量与定义 schema 不一致 ({})",
-                            inst.name,
-                            detail.trim()
-                        ),
-                        affected_id: Some(inst.id.to_string()),
-                    });
+            if !missing.is_empty() || !extra.is_empty() {
+                let mut detail = String::new();
+                if !missing.is_empty() {
+                    detail.push_str(&format!("缺失: {:?} ", missing));
                 }
+                if !extra.is_empty() {
+                    detail.push_str(&format!("多余: {:?}", extra));
+                }
+                issues.push(HealthIssue {
+                    severity: IssueSeverity::Warning,
+                    category: "variable_schema_mismatch".into(),
+                    message: format!(
+                        "角色实例「{}」的变量与定义 schema 不一致 ({})",
+                        inst.name,
+                        detail.trim()
+                    ),
+                    affected_id: Some(inst.id.to_string()),
+                });
             }
         }
     }
@@ -219,7 +219,7 @@ mod tests {
     }
 
     fn make_instance(inst_id: &str, def_id: Option<&str>) -> CharacterInstance {
-        let def = def_id.map(|d| make_def(d));
+        let def = def_id.map(make_def);
         if let Some(ref d) = def {
             let mut inst = CharacterInstance::from_definition(Id::from_str("camp-1"), d);
             // override id for deterministic tests

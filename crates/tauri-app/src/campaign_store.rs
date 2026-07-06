@@ -11,7 +11,7 @@
 //!
 //! 与现有 CharacterStore（扁平 Character）并存，向后兼容。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use storyforge_domain::Id;
@@ -58,7 +58,7 @@ pub struct CampaignStore {
 }
 
 impl CampaignStore {
-    pub fn new(data_dir: &PathBuf) -> Self {
+    pub fn new(data_dir: &Path) -> Self {
         let cards_path = data_dir.join("cards.json");
         let campaigns_path = data_dir.join("campaigns.json");
         let instances_path = data_dir.join("instances.json");
@@ -481,23 +481,23 @@ impl CampaignStore {
 
 // ─── 持久化辅助 ─────────────────────────────────────────────────────────────
 
-fn load_or_default<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
+fn load_or_default<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     if !path.exists() {
         return vec![];
     }
     match std::fs::read_to_string(path) {
         Ok(s) => match serde_json::from_str(&s) {
-            Ok(data) => return data,
+            Ok(data) => data,
             Err(e) => {
                 // 主文件损坏，尝试读 .tmp 备份（atomic_write 先写 .tmp 再 rename，
                 // 崩溃时 .tmp 可能保存了最新数据）
                 tracing::warn!("加载 {} 失败({e})，尝试 .tmp 备份", path.display());
                 let tmp_path = std::path::PathBuf::from(format!("{}.tmp", path.display()));
-                if let Ok(tmp_s) = std::fs::read_to_string(&tmp_path) {
-                    if let Ok(data) = serde_json::from_str(&tmp_s) {
-                        tracing::info!("从 .tmp 备份恢复成功: {}", tmp_path.display());
-                        return data;
-                    }
+                if let Ok(tmp_s) = std::fs::read_to_string(&tmp_path)
+                    && let Ok(data) = serde_json::from_str(&tmp_s)
+                {
+                    tracing::info!("从 .tmp 备份恢复成功: {}", tmp_path.display());
+                    return data;
                 }
                 tracing::error!(
                     "加载 {} 失败且无可用备份，返回空（下次保存将覆盖！）",
@@ -510,7 +510,7 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
     }
 }
 
-fn persist<T: serde::Serialize>(path: &PathBuf, data: &[T]) -> Result<(), String> {
+fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
     storyforge_infra_util::atomic_write_json(path, data).map_err(|e| {
         let msg = format!("持久化失败 {}: {e}", path.display());
         tracing::error!("{msg}");
@@ -567,7 +567,7 @@ mod tests {
         let store = CampaignStore::new(&dir);
         let card = make_card();
         let stored = store.save_card(card.clone()).unwrap();
-        assert!(stored.imported_at.len() > 0);
+        assert!(!stored.imported_at.is_empty());
 
         let got = store.get_card(&Id::from_str("card-1")).unwrap();
         assert_eq!(got.card.name, "测试卡");

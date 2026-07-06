@@ -198,6 +198,12 @@ pub struct PatchStore {
     patches: std::sync::RwLock<Vec<Patch>>,
 }
 
+impl Default for PatchStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PatchStore {
     pub fn new() -> Self {
         Self {
@@ -318,21 +324,19 @@ fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), Me
             let (kind, target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
-                    if let Some(TargetRef::Index(idx)) = target_ref {
-                        if let Some(ref mut entries) = ctx.world_info_entries {
-                            if let Some(entry) = entries.get_mut(idx) {
-                                if let Some(obj) = entry.as_object_mut() {
-                                    obj.insert(field.clone(), value.clone());
-                                }
-                            }
-                        }
+                    if let Some(TargetRef::Index(idx)) = target_ref
+                        && let Some(ref mut entries) = ctx.world_info_entries
+                        && let Some(entry) = entries.get_mut(idx)
+                        && let Some(obj) = entry.as_object_mut()
+                    {
+                        obj.insert(field.clone(), value.clone());
                     }
                 }
                 "character" => {
-                    if let Some(ref mut char_json) = ctx.character_fields {
-                        if let Some(obj) = char_json.as_object_mut() {
-                            obj.insert(field.clone(), value.clone());
-                        }
+                    if let Some(ref mut char_json) = ctx.character_fields
+                        && let Some(obj) = char_json.as_object_mut()
+                    {
+                        obj.insert(field.clone(), value.clone());
                     }
                 }
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持更新 {kind}"))),
@@ -342,12 +346,11 @@ fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), Me
             let (kind, target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
-                    if let Some(TargetRef::Index(idx)) = target_ref {
-                        if let Some(ref mut entries) = ctx.world_info_entries {
-                            if idx < entries.len() {
-                                entries.remove(idx);
-                            }
-                        }
+                    if let Some(TargetRef::Index(idx)) = target_ref
+                        && let Some(ref mut entries) = ctx.world_info_entries
+                        && idx < entries.len()
+                    {
+                        entries.remove(idx);
                     }
                 }
                 _ => return Err(MetaError::ExecutionFailed(format!("不支持删除 {kind}"))),

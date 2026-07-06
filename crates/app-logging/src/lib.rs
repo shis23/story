@@ -124,6 +124,12 @@ pub struct LogBuffer {
     entries: HashMap<LogKind, VecDeque<LogEntry>>,
 }
 
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogBuffer {
     pub fn new() -> Self {
         let mut entries = HashMap::new();
@@ -157,35 +163,35 @@ impl LogBuffer {
             if let Some(buf) = self.entries.get(&kind) {
                 for entry in buf.iter().rev() {
                     // 级别过滤
-                    if let Some(min_level) = filter.level {
-                        if entry.level < min_level {
-                            continue;
-                        }
+                    if let Some(min_level) = filter.level
+                        && entry.level < min_level
+                    {
+                        continue;
                     }
                     // 时间过滤
-                    if let Some(since) = filter.since {
-                        if entry.timestamp < since {
-                            continue;
-                        }
+                    if let Some(since) = filter.since
+                        && entry.timestamp < since
+                    {
+                        continue;
                     }
-                    if let Some(until) = filter.until {
-                        if entry.timestamp > until {
-                            continue;
-                        }
+                    if let Some(until) = filter.until
+                        && entry.timestamp > until
+                    {
+                        continue;
                     }
                     // 关键词过滤
-                    if let Some(ref kw) = filter.keyword {
-                        if !entry.message.contains(kw.as_str()) {
-                            continue;
-                        }
+                    if let Some(ref kw) = filter.keyword
+                        && !entry.message.contains(kw.as_str())
+                    {
+                        continue;
                     }
                     results.push(entry.clone());
 
                     // 限制
-                    if let Some(limit) = filter.limit {
-                        if results.len() >= limit {
-                            return results;
-                        }
+                    if let Some(limit) = filter.limit
+                        && results.len() >= limit
+                    {
+                        return results;
                     }
                 }
             }
@@ -283,10 +289,9 @@ impl LogStore {
                 .create(true)
                 .append(true)
                 .open(&file_path)
+                && let Err(e) = writeln!(f, "{json}")
             {
-                if let Err(e) = writeln!(f, "{json}") {
-                    eprintln!("Failed to write log entry: {e}");
-                }
+                eprintln!("Failed to write log entry: {e}");
             }
         }
     }
@@ -300,11 +305,10 @@ impl LogStore {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     // 文件名格式：YYYY-MM-DD.jsonl
-                    if name.ends_with(".jsonl") {
-                        let date_part = &name[..name.len() - 6];
-                        if date_part < cutoff_str.as_str() {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
+                    if let Some(date_part) = name.strip_suffix(".jsonl")
+                        && date_part < cutoff_str.as_str()
+                    {
+                        let _ = std::fs::remove_file(entry.path());
                     }
                 }
             }

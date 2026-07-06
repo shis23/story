@@ -1,6 +1,6 @@
 # 计划：主线完成后的收口与发布准备
 
-> 状态：进行中（2026-07-06 已建立自动化验证基线和 release checklist 初版）
+> 状态：进行中（2026-07-06 已建立自动化验证基线、workspace clippy 闸门和 release checklist 初版）
 > 前置：`docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`（已归档）、`docs/PLAN-PLUGIN-MVU.md`、`docs/PLAN-ANDROID.md` 的核心阶段已完成。
 > 目标读者：完成前序计划后，负责把项目从“功能打通”推进到“可验证、可发布、可继续迭代”的执行者。
 
@@ -96,6 +96,8 @@
    - Editor 是否保留角色差异。
    - Postprocess 是否避免凭空创建永久事实。
 4. 记录每项评测的可接受波动范围。
+5. 质量闸门：
+   - `cargo clippy --workspace --all-targets -- -D warnings` 纳入候选版本检查；新增 warning 应优先在当前切片消化。
 
 验收：
 

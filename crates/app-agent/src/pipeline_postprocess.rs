@@ -44,6 +44,7 @@ pub struct PostProcessOutcome {
 /// `agent_profile_config`（可选）同时覆盖两个 Agent 的 model/rounds 和 PostProcessor 的 tool_whitelist。
 ///
 /// 取消语义：传入的 `cancel` 被 clone 两份分别交给两个子任务，主流水线取消时联动。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_postprocess_pipeline(
     runtime: &AgentRuntime,
     final_text: &str,

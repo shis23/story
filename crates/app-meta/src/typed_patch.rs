@@ -761,7 +761,7 @@ mod tests {
         };
 
         let input = PreviewInput {
-            instances: &[inst.clone()],
+            instances: std::slice::from_ref(&inst),
             definitions: &[def_real],
             knowledge: &[],
             tasks: &[],
@@ -813,7 +813,7 @@ mod tests {
         let input = PreviewInput {
             instances: &[],
             definitions: &[],
-            knowledge: &[entry.clone()],
+            knowledge: std::slice::from_ref(&entry),
             tasks: &[],
             campaign: None,
         };
@@ -922,7 +922,7 @@ mod tests {
         };
 
         let input = PreviewInput {
-            instances: &[inst.clone()],
+            instances: std::slice::from_ref(&inst),
             definitions: &[def],
             knowledge: &[],
             tasks: &[],
@@ -1007,7 +1007,7 @@ mod tests {
             affected_id: Some("inst-1".into()),
         };
         let input_with = PreviewInput {
-            instances: &[inst.clone()],
+            instances: std::slice::from_ref(&inst),
             definitions: &[make_def("def-1")],
             knowledge: &[],
             tasks: &[],
@@ -1420,7 +1420,7 @@ mod tests {
             campaign: None,
         };
         let action = TypedPatchAction::UpdateTaskStatus {
-            task_id: Id::from_str(&input.tasks[0].id.to_string()),
+            task_id: Id::from_str(input.tasks[0].id.to_string()),
             new_status: TaskStatus::Completed,
         };
         let patch = build_patch_from_action("完成任务".into(), action, &input).unwrap();

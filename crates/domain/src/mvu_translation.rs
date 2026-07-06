@@ -330,11 +330,11 @@ pub fn score_card_complexity(
 /// 把 assets.js + extensions 里可能的 JS 源拼到一起（粗略，给打分用）
 fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::Value) -> String {
     let mut blob = String::new();
-    if let Some(a) = assets {
-        if let Some(js) = &a.js {
-            blob.push_str(js);
-            blob.push('\n');
-        }
+    if let Some(a) = assets
+        && let Some(js) = &a.js
+    {
+        blob.push_str(js);
+        blob.push('\n');
     }
     // depth_prompt 可能内嵌 script
     if let Some(dp) = extensions
@@ -346,11 +346,11 @@ fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::V
         blob.push('\n');
     }
     // mvu 插件可能内嵌 script 字段
-    if let Some(mvu) = extensions.get("mvu") {
-        if let Some(script) = mvu.get("script").and_then(|v| v.as_str()) {
-            blob.push_str(script);
-            blob.push('\n');
-        }
+    if let Some(mvu) = extensions.get("mvu")
+        && let Some(script) = mvu.get("script").and_then(|v| v.as_str())
+    {
+        blob.push_str(script);
+        blob.push('\n');
     }
     blob
 }

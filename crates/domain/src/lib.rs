@@ -26,6 +26,7 @@ impl Id {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: impl Into<String>) -> Self {
         Self(s.into())
     }

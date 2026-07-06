@@ -52,17 +52,12 @@ pub enum LoreRoute {
 }
 
 /// ST 选择逻辑
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectiveLogic {
+    #[default]
     And,
     Or,
     Not,
-}
-
-impl Default for SelectiveLogic {
-    fn default() -> Self {
-        Self::And
-    }
 }
 
 impl From<i32> for SelectiveLogic {

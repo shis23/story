@@ -337,10 +337,9 @@ mod tests {
 
         let png_bytes = write_st_card_png(&card, Some(&base)).expect("write_png 失败");
         let chunks = parse_png(&png_bytes).expect("解析失败");
-        let has_chara = chunks.iter().any(|c| match c {
-            PngChunk::Text { keyword, .. } if keyword == "chara" => true,
-            _ => false,
-        });
+        let has_chara = chunks
+            .iter()
+            .any(|c| matches!(c, PngChunk::Text { keyword, .. } if keyword == "chara"));
         assert!(has_chara, "应有 chara tEXt 块");
     }
 }

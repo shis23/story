@@ -103,18 +103,18 @@ impl PromptProfile {
     /// 支持通配符：当 role 是 Subagent(id) 且找不到精确匹配时，
     /// 自动回退到 Subagent("*") 的配置。
     pub fn selected_ids(&self, role: &AgentRole, category: &ModuleCategory) -> &[Id] {
-        if let Some(cats) = self.selections.get(role) {
-            if let Some(ids) = cats.get(category) {
-                return ids.as_slice();
-            }
+        if let Some(cats) = self.selections.get(role)
+            && let Some(ids) = cats.get(category)
+        {
+            return ids.as_slice();
         }
         // 回退：Subagent(id) → Subagent("*")
         if let AgentRole::Subagent(_) = role {
             let wildcard = AgentRole::Subagent("*".into());
-            if let Some(cats) = self.selections.get(&wildcard) {
-                if let Some(ids) = cats.get(category) {
-                    return ids.as_slice();
-                }
+            if let Some(cats) = self.selections.get(&wildcard)
+                && let Some(ids) = cats.get(category)
+            {
+                return ids.as_slice();
             }
         }
         &[]

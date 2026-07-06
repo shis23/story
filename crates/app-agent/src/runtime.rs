@@ -110,7 +110,7 @@ impl AgentRuntime {
                 // drift recovery：如果还有工具可用，提醒模型使用工具
                 if !resp.content.is_empty()
                     && round < config.max_tool_rounds
-                    && tool_registry.tool_specs().len() > 0
+                    && !tool_registry.tool_specs().is_empty()
                 {
                     // 检查是否是最终输出（没有工具定义时直接返回）
                     if req.tools.is_none() {
@@ -272,11 +272,11 @@ impl AgentRuntime {
                 if !resp.content.is_empty() && round < config.max_tool_rounds {
                     // 提早终止：如果 content 已是"最终结果"（探测回调返回 true），立即返回，
                     // 不再注入 reminder（避免把已完成的输出逼进死循环）。
-                    if let Some(probe) = completion_probe {
-                        if probe(&resp.content) {
-                            info!(target: "app-agent", "{}[stream]: 第 {round} 轮探测到最终结果，提早终止", config.role);
-                            return Ok(resp);
-                        }
+                    if let Some(probe) = completion_probe
+                        && probe(&resp.content)
+                    {
+                        info!(target: "app-agent", "{}[stream]: 第 {round} 轮探测到最终结果，提早终止", config.role);
+                        return Ok(resp);
                     }
                     warn!(target: "app-agent", "{}[stream]: 第 {round} 轮未调工具，注入 reminder", config.role);
                     messages.push(ChatMessage::assistant(&resp.content));
@@ -429,11 +429,11 @@ impl AgentRuntime {
 
                 // drift recovery：有可用工具但模型没调
                 if !resp.content.is_empty() && round < rounds {
-                    if let Some(probe) = completion_probe {
-                        if probe(&resp.content) {
-                            info!(target: "app-agent", "{}[layout]: 第 {round} 轮探测到最终结果，提早终止", config.role);
-                            return Ok(resp);
-                        }
+                    if let Some(probe) = completion_probe
+                        && probe(&resp.content)
+                    {
+                        info!(target: "app-agent", "{}[layout]: 第 {round} 轮探测到最终结果，提早终止", config.role);
+                        return Ok(resp);
                     }
                     warn!(target: "app-agent", "{}[layout]: 第 {round} 轮未调工具，注入 reminder", config.role);
                     messages.push(ChatMessage::assistant(&resp.content));
@@ -542,6 +542,7 @@ pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 ///   转发为 `PipelineEvent::SubagentProgress`（带 character_id + index），供前端实时显示。
 /// - **并发**：用 `Semaphore` 限流，默认上限为 `DEFAULT_MAX_CONCURRENT_SUBAGENTS`，
 ///   超出的任务**排队等待**而非丢弃，最终全部跑完。结果按原始 index 对齐返回。
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_subagents(
     tasks: Vec<SubagentTask>,
     runtime: Arc<AgentRuntime>,
