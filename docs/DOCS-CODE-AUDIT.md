@@ -70,7 +70,7 @@
 - `crates/tauri-app/src/lib.rs::delete_character` **阶段 5 已修复**：级联删除时同时尝试 `StoredCharacter.id`、持久化 `source_character_id`、同会话 `tool_ctx` domain id，避免旧代码只用 StoredCharacter.id 查 card 导致静默失败。
 - `crates/app-agent/src/runtime.rs::build_campaign_subagent_system` / `build_campaign_subagent_volatile` **阶段 4 cleanup 新增**：纯函数，测试可直接断言 prompt 内容（persona/behavior/knowledge 隔离/variables）。
 - `crates/domain/src/campaign.rs::CharacterInstance::temporary_with_overrides` **阶段 6 已完成**：创建临时 instance 时可传入 persona/behavior override。
-- `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配的 character_id 创建临时 CharacterInstance（`is_temporary=true`，支持 persona/behavior override），返回更新后的 context 和临时 instance 列表供调用者持久化；同一批次内重复 unmatched character 会去重。
+- `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配的 character_id 创建临时 CharacterInstance（`is_temporary=true`，支持 persona/behavior override），返回更新后的 context 和临时 instance 列表供调用者持久化；同一批次内重复 unmatched character 会去重，空白 unmatched character_id 会被跳过。
 - `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮创建的临时 instance，Tauri 层通过 getter 读取后落盘；`start_writing` / `regenerate` 开始时会清空旧 pending，避免失败或重试污染下一轮。
 - `crates/app-pipeline/src/lib.rs::start_writing` / `regenerate` **阶段 6 已完成**：从 Director 的 `context_package.character_brief` 提取 persona 注入临时 instance，存储到 `pending_temporary_instances`。
 - `crates/tauri-app/src/lib.rs::persist_temporary_instances_async` **阶段 6 已完成并 offload**：只在 pipeline 返回 `Ok` 后、postprocess 之前把临时 instance 写入 CampaignStore；会跳过同 campaign 已存在同名 instance、同批重复临时 instance，以及 `campaign_id` 不匹配的临时 instance。落盘通过 `spawn_blocking` 执行并在继续 postprocess 前 await，保证知识/变量写回不再被跳过。

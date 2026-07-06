@@ -107,6 +107,11 @@ impl CampaignRuntimeContext {
             .collect();
 
         for (cid, persona, behavior) in character_specs {
+            let cid = cid.trim();
+            if cid.is_empty() {
+                continue;
+            }
+
             // Skip if already matched (IDs are case-insensitive UUIDs; names are lowercased)
             if !seen.insert(cid.to_lowercase()) {
                 continue;
@@ -114,7 +119,7 @@ impl CampaignRuntimeContext {
             // Create temporary instance with optional overrides
             let temp = CharacterInstance::temporary_with_overrides(
                 self.campaign.id.clone(),
-                cid.as_str(),
+                cid,
                 persona.clone(),
                 behavior.clone(),
             );
@@ -459,6 +464,26 @@ mod tests {
                 .filter(|inst| inst.name == "Wanderer")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn with_temporaries_skips_blank_unmatched_specs() {
+        let ctx = make_context();
+        let specs: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("".into(), None, None),
+            ("   ".into(), Some("blank brief".into()), None),
+            ("NamelessWitness".into(), None, None),
+        ];
+        let (new_ctx, temps) = ctx.with_temporaries_for(&specs);
+
+        assert_eq!(temps.len(), 1);
+        assert_eq!(temps[0].name, "NamelessWitness");
+        assert!(
+            new_ctx
+                .instances
+                .iter()
+                .all(|inst| inst.name != "Unknown Character")
         );
     }
 

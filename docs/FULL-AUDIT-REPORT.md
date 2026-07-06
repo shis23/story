@@ -146,7 +146,7 @@
 | ID | 文件 | 描述 |
 |----|------|------|
 | M-001 | `runtime.rs:160` | ✅ 已修复：畸形 tool-call 参数不会执行真实工具，runtime 直接把 `Invalid JSON arguments` 作为 tool result 反馈给 LLM |
-| M-002 | `character.rs:156` | `temporary_with_overrides` 无空名验证 |
+| M-002 | `campaign_runtime.rs:103` | ✅ 已修复：`with_temporaries_for()` 会跳过空白 unmatched character_id，避免通过 `temporary_with_overrides` 生成 `Unknown Character` 临时角色 |
 | M-003 | `conversation.rs:87` | `active_variant` 无越界验证，腐败数据导致静默失败 |
 | M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
 | M-005 | `lib.rs:1576` | ✅ 已修复：`postprocess_variable_keys()` 从 CampaignRuntimeContext 合并默认角色/全局变量、当前 Campaign 变量、定义 schema 与实例变量 |
