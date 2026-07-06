@@ -188,7 +188,7 @@
 代码事实：
 
 - Tauri v2 配置文件存在。
-- capability 当前包含 `core:default`、`fs:default`、`dialog:default`。
+- capability 当前包含 `core:default`、`dialog:allow-open`、`dialog:allow-save`、`dialog:allow-message`、`dialog:allow-ask`、`fs:allow-read-file`、`fs:allow-write-file`；已移除粗粒度 `fs:default` / `dialog:default`。
 - Android Manifest 包含 `INTERNET`、`MainActivity`、`FileProvider`。
 - `MainActivity.kt` 调用 `enableEdgeToEdge()`。
 
@@ -243,7 +243,7 @@
 | AND-3 | 本地数据目录 + 迁移/schema 版本 | 未开始 | 无 debug data-dir 命令、无 schema/version 字段 |
 | AND-4 | 长任务/流式/取消在移动端 | 未开始 | 无 Android 生命周期处理 |
 | AND-5 | 移动端排障/诊断导出 | 部分完成 | `log_export_bundle` 已附带 `diagnostic_context`（app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要），并有不泄露 `connections.json` / `embed.json` API key 的单测；Android share/save sheet 真机链路未验 |
-| AND-6 | capability 权限收敛 | 未开始 | `capabilities/default.json` 仍粗（`core:default`/`fs:default`/`dialog:default`） |
+| AND-6 | capability 权限收敛 | 已完成配置收窄，待真机导入/导出回归 | `capabilities/default.json` 已保留 `core:default`、dialog open/save/message/ask、fs read/write file；`crates/tauri-app/tests/capabilities.rs` 固化无 `fs:default`/`dialog:default` |
 
 注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`）。2026-07-06 已验证 arm64-v8a debug/release 构建链路，但 `MainActivity.kt` 仍基本是 Tauri 自动生成脚手架，仅调 `enableEdgeToEdge()`；文件导入、数据目录、长任务和诊断导出仍未做真机验收。
 

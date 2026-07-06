@@ -1,6 +1,6 @@
 # 计划：Android 可用性打磨
 
-> 状态：已启动；阶段 1 构建链路已形成主流 Android ABI 基线。
+> 状态：已启动；阶段 1 构建链路已形成主流 Android ABI 基线，阶段 6 capability 配置已收窄（真机导入/导出仍待回归）。
 > 前置：Campaign 主流程在桌面端可稳定完成。
 
 ## 目标
@@ -16,7 +16,7 @@
 ## 当前事实
 
 - Tauri v2 配置在 `crates/tauri-app/tauri.conf.json`。
-- capabilities 在 `crates/tauri-app/capabilities/default.json`，当前权限较粗：`core:default`、`fs:default`、`dialog:default`。
+- capabilities 在 `crates/tauri-app/capabilities/default.json`，当前已收窄为 `core:default`、dialog open/save/message/ask、fs read/write file；Android 真机文件导入/导出仍需回归验证。
 - Android 生成工程存在于 `crates/tauri-app/gen/android`。
 - `AndroidManifest.xml` 只有 `INTERNET`、FileProvider、MainActivity。
 - `MainActivity.kt` 只调用 `enableEdgeToEdge()`。
@@ -189,14 +189,14 @@ cargo tauri android build
 任务：
 
 1. 盘点实际使用的 Tauri plugins。
-2. 将 `fs:default` 收窄为 app data/log/import/export 所需范围。
-3. dialog 权限只保留 open/save 所需能力。
+2. `fs:default` 已收窄为 `fs:allow-read-file` / `fs:allow-write-file`；后续真机验证如需 app data/log 专项 scope，再单独补最小范围。
+3. dialog 权限已只保留 open/save/message/ask 所需能力。
 4. Android 专属权限只在必要时加入 manifest。
 
 验收：
 
 - 导入、写作、导出诊断包仍可用。
-- capability 文件中没有无理由的全量文件系统访问。
+- capability 文件中没有无理由的全量文件系统访问；`cargo test -p storyforge --test capabilities` 固化该约束。
 
 ## 禁止改动
 

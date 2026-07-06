@@ -24,6 +24,7 @@
 - `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
 - CampaignStore 压测：Git Bash 用 `SF_STORE_PRESSURE_WRITES=500 cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture`；PowerShell 用 `$env:SF_STORE_PRESSURE_WRITES='500'; cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture; Remove-Item Env:SF_STORE_PRESSURE_WRITES`。通过；本机 4 集合并发写入 500 次/集合，总耗时约 2.9s，p95 为 knowledge 6.6ms / tasks 7.4ms / summaries 6.8ms / mvu 8.5ms，max 约 28ms。
 - API key 安全存储相关测试：`cargo test -p storyforge-infra-util`、`cargo test -p storyforge --lib connection_store`、`cargo test -p storyforge --lib test_embed_config` 通过；覆盖新写入 SecretRef、旧明文迁移、运行时解析和删除清理。Windows Credential Manager 冒烟测试 `cargo test -p storyforge-infra-util system_keyring_write_read_delete_roundtrip -- --ignored --nocapture` 通过；`cargo check -p storyforge-infra-util --target aarch64-linux-android` 通过，Android 后端仍需真机写读删。
+- Tauri capability 权限收敛测试：`cargo test -p storyforge --test capabilities` 通过；`default.json` 已移除 `fs:default` / `dialog:default`，仅保留 dialog open/save/message/ask 与 fs read/write file。Android 真机导入/导出路径仍需手工回归。
 - Android 构建链路：主流真机 ABI `aarch64/arm64-v8a` 已通过 `cargo tauri android build --debug --target aarch64 --ci --split-per-abi --apk`（`app-arm64-debug.apk`，约 237 MB）和 `cargo tauri android build --target aarch64 --ci --split-per-abi --apk`（`app-arm64-release-unsigned.apk`，约 39 MB）。此前 x86_64 emulator/universal debug/release 也已通过；armv7/i686 不作为当前发布主线。仍有 Tauri/Gradle/Kotlin deprecation warning、插件 consumer proguard warning 和 macOS `.app` bundle id warning，暂不阻塞本轮 Android 构建基线。
 - 排障 bundle 诊断上下文：`cargo test -p storyforge --lib test_diagnostic_context_summarizes_stores_without_secret_values` 通过；`log_export_bundle` 会附带 app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要，且不会读取或导出 `connections.json` / `embed.json` 内的 API key。
 
@@ -85,7 +86,7 @@
 Android 候选版本需验证：
 
 - arm64-v8a debug/release 构建链路通过；x86_64 仅作为 emulator/历史基线，armv7/i686 暂不构建以控制磁盘占用。真机安装仍需验证。
-- 文件导入权限和路径可用。
+- 文件导入权限和路径可用；当前 capability 已收窄，仍需 Android 真机确认系统选择器授权后的 PNG/JSON 读取链路。
 - 数据目录可写、可迁移、可备份。
 - 长文本流式显示不卡死。
 - WebView 生命周期恢复正常。
