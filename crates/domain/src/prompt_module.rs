@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::Id;
 use crate::agent::AgentRole;
@@ -195,18 +196,208 @@ pub fn assemble_system_prompt(
     parts.join("\n\n---\n\n")
 }
 
+/// Prompt-template/ST style macro context.
+///
+/// This intentionally keeps values owned so callers can build a context from a
+/// card, campaign snapshot, or test fixture without lifetime plumbing.
+#[derive(Debug, Clone, Default)]
+pub struct TemplateVarContext {
+    pub char_name: String,
+    pub user_name: String,
+    pub description: String,
+    pub personality: String,
+    pub scenario: String,
+    pub first_mes: String,
+    pub mes_example: String,
+    pub system_prompt: String,
+    pub post_history_instructions: String,
+    pub creator: String,
+    pub character_version: String,
+    pub tags: Vec<String>,
+    pub variables: BTreeMap<String, String>,
+}
+
+impl TemplateVarContext {
+    pub fn from_character(character: &crate::character::Character, user_name: &str) -> Self {
+        Self {
+            char_name: character.name.clone(),
+            user_name: user_name.to_string(),
+            description: character.description.clone(),
+            personality: character.personality.clone(),
+            scenario: character.scenario.clone(),
+            first_mes: character.first_mes.clone(),
+            mes_example: character.mes_example.clone(),
+            system_prompt: character.system_prompt.clone(),
+            post_history_instructions: character.post_history_instructions.clone(),
+            creator: character.creator.clone(),
+            character_version: character.character_version.clone(),
+            tags: character.tags.clone(),
+            variables: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TemplateRenderState {
+    variables: BTreeMap<String, String>,
+    trim_output: bool,
+}
+
 /// ST 风格占位符替换（设计 §7.5 prompt-template 功能）
 ///
 /// 支持的占位符：
 /// - `{{char}}` → 角色名
 /// - `{{user}}` → 用户名（默认 "玩家"）
 /// - `{{charIfNotUser}}` → 如果不是用户则显示角色名（简化为 char）
+/// - 常用角色卡字段：`{{description}}`, `{{personality}}`, `{{scenario}}`,
+///   `{{first_mes}}`, `{{mes_example}}`, `{{system_prompt}}`,
+///   `{{post_history_instructions}}` 等
+/// - 本地 ST 变量宏：`{{setvar::key::value}}`, `{{addvar::key::value}}`,
+///   `{{getvar::key}}`, `{{trim}}`, `{{// comment}}`
 ///
 /// 在组装 system prompt 后、发送给 LLM 前调用。
 pub fn replace_template_vars(text: &str, char_name: &str, user_name: &str) -> String {
-    text.replace("{{char}}", char_name)
-        .replace("{{user}}", user_name)
-        .replace("{{charIfNotUser}}", char_name)
+    let ctx = TemplateVarContext {
+        char_name: char_name.to_string(),
+        user_name: user_name.to_string(),
+        ..Default::default()
+    };
+    replace_template_vars_with_context(text, &ctx)
+}
+
+pub fn replace_template_vars_with_context(text: &str, context: &TemplateVarContext) -> String {
+    let mut state = TemplateRenderState {
+        variables: context.variables.clone(),
+        trim_output: false,
+    };
+    let mut rendered = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find("{{") {
+        let (before, after_start) = rest.split_at(start);
+        rendered.push_str(before);
+        let macro_body_start = &after_start[2..];
+        if let Some(end) = macro_body_start.find("}}") {
+            let (body, after_body) = macro_body_start.split_at(end);
+            match render_template_macro(body.trim(), context, &mut state) {
+                Some(value) => rendered.push_str(&value),
+                None => {
+                    rendered.push_str("{{");
+                    rendered.push_str(body);
+                    rendered.push_str("}}");
+                }
+            }
+            rest = &after_body[2..];
+        } else {
+            rendered.push_str(after_start);
+            rest = "";
+        }
+    }
+
+    rendered.push_str(rest);
+    let rendered = replace_angle_aliases(&rendered, context);
+    if state.trim_output {
+        rendered.trim().to_string()
+    } else {
+        rendered
+    }
+}
+
+fn render_template_macro(
+    body: &str,
+    context: &TemplateVarContext,
+    state: &mut TemplateRenderState,
+) -> Option<String> {
+    if body.is_empty() {
+        return Some(String::new());
+    }
+    if body == "trim" {
+        state.trim_output = true;
+        return Some(String::new());
+    }
+    if body.starts_with("//") {
+        return Some(String::new());
+    }
+
+    if let Some(rest) = body.strip_prefix("setvar::") {
+        let (key, value) = split_macro_key_value(rest)?;
+        let value = render_template_value(value, context, state);
+        state.variables.insert(key.trim().to_string(), value);
+        return Some(String::new());
+    }
+    if let Some(rest) = body.strip_prefix("addvar::") {
+        let (key, value) = split_macro_key_value(rest)?;
+        let value = render_template_value(value, context, state);
+        state
+            .variables
+            .entry(key.trim().to_string())
+            .or_default()
+            .push_str(&value);
+        return Some(String::new());
+    }
+    if let Some(key) = body
+        .strip_prefix("getvar::")
+        .or_else(|| body.strip_prefix("getglobalvar::"))
+    {
+        return Some(state.variables.get(key.trim()).cloned().unwrap_or_default());
+    }
+
+    render_field_macro(body, context)
+}
+
+fn split_macro_key_value(rest: &str) -> Option<(&str, &str)> {
+    rest.split_once("::")
+}
+
+fn render_template_value(
+    value: &str,
+    context: &TemplateVarContext,
+    state: &TemplateRenderState,
+) -> String {
+    let mut rendered = replace_angle_aliases(value, context);
+    for (key, value) in &state.variables {
+        rendered = rendered.replace(&format!("{{{{getvar::{key}}}}}"), value);
+    }
+    rendered
+}
+
+fn render_field_macro(body: &str, context: &TemplateVarContext) -> Option<String> {
+    let key = body.trim().to_ascii_lowercase();
+    let value = match key.as_str() {
+        "char" | "charname" | "char_name" | "character" | "bot" => context.char_name.clone(),
+        "user" | "username" | "user_name" => context.user_name.clone(),
+        "charifnotuser" | "char_if_not_user" => context.char_name.clone(),
+        "description" | "char_description" | "character_description" => context.description.clone(),
+        "personality" | "persona" => context.personality.clone(),
+        "scenario" => context.scenario.clone(),
+        "first_mes" | "first_message" | "firstmsg" | "greeting" => context.first_mes.clone(),
+        "mes_example" | "example_dialogue" | "example_messages" | "examples" => {
+            context.mes_example.clone()
+        }
+        "system_prompt" | "system" => context.system_prompt.clone(),
+        "post_history_instructions" | "post_history" | "post_history_instruction" => {
+            context.post_history_instructions.clone()
+        }
+        "creator" => context.creator.clone(),
+        "character_version" | "char_version" | "version" => context.character_version.clone(),
+        "tags" => context.tags.join(", "),
+        "newline" => "\n".to_string(),
+        "noop" => String::new(),
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn replace_angle_aliases(text: &str, context: &TemplateVarContext) -> String {
+    text.replace("<USER>", &context.user_name)
+        .replace("<User>", &context.user_name)
+        .replace("<user>", &context.user_name)
+        .replace("<BOT>", &context.char_name)
+        .replace("<Bot>", &context.char_name)
+        .replace("<bot>", &context.char_name)
+        .replace("<CHAR>", &context.char_name)
+        .replace("<Char>", &context.char_name)
+        .replace("<char>", &context.char_name)
 }
 
 // ─── 预置模块（M1 内置 5 个核心模块）──────────────────────────────────────
@@ -428,6 +619,56 @@ pub mod builtins {
             let text = "没有占位符的普通文本";
             let result = replace_template_vars(text, "Seraphina", "玩家");
             assert_eq!(result, "没有占位符的普通文本");
+        }
+
+        #[test]
+        fn test_replace_template_vars_with_card_fields_and_aliases() {
+            let ctx = TemplateVarContext {
+                char_name: "Seraphina".into(),
+                user_name: "玩家".into(),
+                description: "银发旅人".into(),
+                personality: "温柔而敏锐".into(),
+                scenario: "雨夜驿站".into(),
+                first_mes: "欢迎回来。".into(),
+                mes_example: "<START>\n{{char}}: 你好".into(),
+                system_prompt: "保持诗意".into(),
+                post_history_instructions: "延续上一轮气氛".into(),
+                creator: "tester".into(),
+                character_version: "1.2.3".into(),
+                tags: vec!["fantasy".into(), "slow-burn".into()],
+                ..Default::default()
+            };
+
+            let text = "{{char}}/{{Char}}/{{user}}/{{User}}/<BOT>/<user>\n{{description}}\n{{personality}}\n{{scenario}}\n{{first_mes}}\n{{first_message}}\n{{mes_example}}\n{{system_prompt}}\n{{post_history_instructions}}\n{{creator}}\n{{character_version}}\n{{tags}}";
+            let result = replace_template_vars_with_context(text, &ctx);
+
+            assert!(result.contains("Seraphina/Seraphina/玩家/玩家/Seraphina/玩家"));
+            assert!(result.contains("银发旅人"));
+            assert!(result.contains("温柔而敏锐"));
+            assert!(result.contains("雨夜驿站"));
+            assert!(result.contains("欢迎回来。"));
+            assert!(result.contains("<START>"));
+            assert!(result.contains("保持诗意"));
+            assert!(result.contains("延续上一轮气氛"));
+            assert!(result.contains("tester"));
+            assert!(result.contains("1.2.3"));
+            assert!(result.contains("fantasy, slow-burn"));
+        }
+
+        #[test]
+        fn test_replace_template_vars_supports_st_state_macros() {
+            let ctx = TemplateVarContext::default();
+            let text = "{{// comment should disappear }}\n{{setvar::prefix::<utility>}}{{addvar::body::第一段}}{{addvar::body::第二段}}{{setvar::suffix::</utility>}}\n{{trim}}{{getvar::prefix}}{{getvar::body}}{{getvar::suffix}}{{trim}}";
+
+            let result = replace_template_vars_with_context(text, &ctx);
+
+            assert_eq!(result, "<utility>第一段第二段</utility>");
+        }
+
+        #[test]
+        fn test_replace_template_vars_preserves_unknown_macros() {
+            let result = replace_template_vars("{{unknown::macro}} {{char}}", "Seraphina", "玩家");
+            assert_eq!(result, "{{unknown::macro}} Seraphina");
         }
 
         #[test]

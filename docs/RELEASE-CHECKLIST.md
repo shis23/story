@@ -68,7 +68,7 @@
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。
-- regex / 宏 / HTML 路径的降级结果已记录；legacy 单卡与 Campaign 新建游玩档的 alternate greeting 切换已接入。
+- regex / HTML 路径的降级结果已记录；legacy 单卡 prompt-template 确定性宏与 legacy/Campaign alternate greeting 切换已接入。
 
 ## 4. 真实 LLM
 

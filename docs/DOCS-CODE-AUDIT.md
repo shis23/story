@@ -243,6 +243,8 @@
 
 2026-07-06 增量核对：`CharacterInfo` 已保留 `alternate_greetings` 并在启动恢复到 domain `Character` 时保留该字段；legacy 单卡新会话前端已提供默认/备选开场切换，`start_writing` 可接收并校验来自当前角色卡的 `opening_message`，新建 conversation 时会持久化选中的开场。Campaign 新建游玩档也已接入默认/备选开场选择：`get_card` 会暴露源角色卡 greetings，`create_campaign` 接收并校验所选 `opening_message`，再写入新建 Campaign conversation。
 
+2026-07-06 增量核对：`crates/domain/src/prompt_module.rs` 的 ST prompt-template 宏已从 `{{char}}/{{user}}/{{charIfNotUser}}` 扩展到确定性核心子集：角色卡字段（description/personality/scenario/first_mes/mes_example/system_prompt/post_history_instructions 等）、`<user>/<bot>/<char>` 别名、本地 `setvar/addvar/getvar/getglobalvar/trim/comment` 顺序宏。`app-pipeline` 在 legacy 单卡（无 Campaign runtime 且仅 1 张扁平角色卡）组装 Director/Editor system prompt 时会执行该渲染；Campaign 或多扁平角色上下文没有唯一 `{{char}}`，会跳过宏渲染以避免误替换。动态时间/随机/roll、跨轮持久变量和 Campaign 变量级宏仍属后续兼容范围。
+
 ### Phase 6：Android（~20%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |

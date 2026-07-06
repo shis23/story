@@ -267,12 +267,14 @@ impl PipelineOrchestrator {
                 Ok(text) => text,
                 Err(e) => return Err(self.abort_with(&event_tx, e)),
             };
+        let template_context = prompt_template_context_for_writing(ctx);
 
         let director_config = make_director_config(
             ctx.profile.as_ref(),
             &ctx.modules,
             &build_director_system_extra(ctx),
             ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
         );
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
@@ -459,6 +461,7 @@ impl PipelineOrchestrator {
             ctx.profile.as_ref(),
             &ctx.modules,
             ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
         );
 
         // 构造编剧的用户消息（子 Agent 产出）
@@ -834,6 +837,8 @@ impl PipelineOrchestrator {
             })
             .collect();
 
+        let template_context = prompt_template_context_for_writing(ctx);
+
         // ─── 路径 A：整体重 roll（含 Director 或 targets 为空）──────────────
         if rerun_director || req.targets.is_empty() {
             self.state = PipelineState::Directing;
@@ -856,6 +861,7 @@ impl PipelineOrchestrator {
                 &ctx.modules,
                 &build_director_system_extra(ctx),
                 ctx.agent_profile_config.as_ref(),
+                template_context.as_ref(),
             );
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
@@ -1050,6 +1056,7 @@ impl PipelineOrchestrator {
                     effective_runtime_for_prov.as_deref(),
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
+                    template_context.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1096,6 +1103,7 @@ impl PipelineOrchestrator {
                     ctx.campaign_runtime.as_deref(),
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
+                    template_context.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1113,6 +1121,7 @@ impl PipelineOrchestrator {
                 &ctx.modules,
                 &build_director_system_extra(ctx),
                 ctx.agent_profile_config.as_ref(),
+                template_context.as_ref(),
             );
 
             self.state = PipelineState::Delegating;
@@ -1279,6 +1288,7 @@ impl PipelineOrchestrator {
                     ctx.campaign_runtime.as_deref(),
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
+                    template_context.as_ref(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1311,6 +1321,7 @@ impl PipelineOrchestrator {
         campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
         agent_profile_config: Option<&AgentProfileConfig>,
         regex_scripts: &[RegexScript],
+        template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1321,7 +1332,8 @@ impl PipelineOrchestrator {
         self.state = PipelineState::Editing;
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config = make_editor_config(profile, modules, agent_profile_config);
+        let editor_config =
+            make_editor_config(profile, modules, agent_profile_config, template_context);
 
         let performances_text: String = performances
             .iter()
@@ -1494,6 +1506,20 @@ fn has_available_characters(ctx: &WritingContext) -> bool {
     }
 }
 
+fn prompt_template_context_for_writing(
+    ctx: &WritingContext,
+) -> Option<storyforge_domain::prompt_module::TemplateVarContext> {
+    if ctx.campaign_runtime.is_some() || ctx.characters.len() != 1 {
+        return None;
+    }
+    ctx.characters.first().map(|character| {
+        storyforge_domain::prompt_module::TemplateVarContext::from_character(
+            character.as_ref(),
+            "玩家",
+        )
+    })
+}
+
 /// 构造 MVU JS 执行所需的当前变量快照
 ///
 /// 从 CampaignRuntimeContext 的所有 CharacterInstance.variables 收集，
@@ -1643,6 +1669,7 @@ fn make_director_config(
     modules: &[storyforge_domain::prompt_module::PromptModule],
     system_extra: &str,
     agent_profile_config: Option<&AgentProfileConfig>,
+    template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
 ) -> AgentConfig {
     let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Director,
@@ -1655,6 +1682,12 @@ fn make_director_config(
     if !system_extra.is_empty() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(system_extra);
+    }
+    if let Some(template_context) = template_context {
+        system_prompt = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            &system_prompt,
+            template_context,
+        );
     }
 
     // 从 AgentProfileConfig 读取覆盖
@@ -1705,14 +1738,21 @@ fn make_editor_config(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
     modules: &[storyforge_domain::prompt_module::PromptModule],
     agent_profile_config: Option<&AgentProfileConfig>,
+    template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
 ) -> AgentConfig {
-    let system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+    let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Editor,
         EDITOR_SYSTEM_PROMPT,
         profile,
         modules,
         "",
     );
+    if let Some(template_context) = template_context {
+        system_prompt = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            &system_prompt,
+            template_context,
+        );
+    }
 
     // 从 AgentProfileConfig 读取覆盖
     let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
@@ -3231,6 +3271,83 @@ mod tests {
             "不应出现 Campaign 实例标题"
         );
         assert!(!tail_content.contains("hp:"), "旧路径不应含变量摘要");
+    }
+
+    #[test]
+    fn test_prompt_template_context_uses_single_legacy_character() {
+        let mut character = (*mock_character("Seraphina")).clone();
+        character.scenario = "雨夜驿站".into();
+        let ctx = WritingContext::legacy(vec![Arc::new(character)], None, Id::new());
+        let template = prompt_template_context_for_writing(&ctx).expect("legacy single card");
+
+        let module_id = Id::from_str("template-module");
+        let module = storyforge_domain::prompt_module::PromptModule {
+            id: module_id.clone(),
+            name: "ST template".into(),
+            category: storyforge_domain::prompt_module::ModuleCategory::Quality,
+            content: "角色 {{char}} 在 {{scenario}} 与 <user> 对话".into(),
+            exclusivity: storyforge_domain::prompt_module::Exclusivity::Multiple,
+            source: storyforge_domain::prompt_module::ModuleSource::ImportedFromST,
+            applicable_roles: vec![AgentRole::Director],
+            tags: vec![],
+        };
+        let mut selections = std::collections::HashMap::new();
+        let mut cats = std::collections::HashMap::new();
+        cats.insert(
+            storyforge_domain::prompt_module::ModuleCategory::Quality,
+            vec![module_id],
+        );
+        selections.insert(AgentRole::Director, cats);
+        let profile = storyforge_domain::prompt_module::PromptProfile {
+            id: Id::from_str("template-profile"),
+            name: "Template Profile".into(),
+            selections,
+            overrides: std::collections::HashMap::new(),
+            source: storyforge_domain::prompt_module::ProfileSource::ImportedFromST,
+        };
+
+        let config = make_director_config(Some(&profile), &[module], "", None, Some(&template));
+
+        assert!(
+            config
+                .system_prompt
+                .contains("角色 Seraphina 在 雨夜驿站 与 玩家 对话")
+        );
+        assert!(!config.system_prompt.contains("{{char}}"));
+    }
+
+    #[test]
+    fn test_prompt_template_context_skips_ambiguous_character_contexts() {
+        let multi = WritingContext::legacy(
+            vec![mock_character("Seraphina"), mock_character("Lin")],
+            None,
+            Id::new(),
+        );
+        assert!(prompt_template_context_for_writing(&multi).is_none());
+
+        let mut campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
+        let mut instance =
+            storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        instance.is_temporary = false;
+        let runtime = Arc::new(
+            storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                campaign: {
+                    campaign.name = "第一周目".into();
+                    campaign
+                },
+                instances: vec![instance],
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 0,
+            },
+        );
+        let mut campaign_ctx =
+            WritingContext::legacy(vec![mock_character("Legacy")], None, Id::new());
+        campaign_ctx.campaign_runtime = Some(runtime);
+
+        assert!(prompt_template_context_for_writing(&campaign_ctx).is_none());
     }
 
     /// truncate_chars 基本功能验证
