@@ -1444,14 +1444,7 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
     let Some(book) = &ctx.world_info else {
         return String::new();
     };
-    let mut constants: Vec<_> = book
-        .entries
-        .iter()
-        .filter(|e| {
-            e.route == storyforge_domain::world_info::LoreRoute::Constant
-                || e.route == storyforge_domain::world_info::LoreRoute::Both
-        })
-        .collect();
+    let mut constants = book.constant_entries();
     // depth 小的排后面（更重要）；depth 相同 order 小的排后面
     constants.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| b.order.cmp(&a.order)));
 
@@ -1466,6 +1459,26 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
     out.push_str(
         "\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）",
     );
+    out
+}
+
+fn build_triggered_selective_lore(intent: &str, ctx: &WritingContext) -> String {
+    let Some(book) = &ctx.world_info else {
+        return String::new();
+    };
+    let mut entries = book.triggered_selective_entries(intent);
+    // depth 小的排后面（更重要）；depth 相同 order 小的排后面
+    entries.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| b.order.cmp(&a.order)));
+
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("【世界设定（关键词触发）】\n");
+    for e in &entries {
+        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
+    }
+    out.push_str("\n（以上设定由本轮写作意图关键词触发，请优先参考。）");
     out
 }
 
@@ -1558,6 +1571,11 @@ fn build_director_tail(
         tail = tail.push(format!(
             "用户的写作意图：{intent}\n\n可用角色：{char_block}"
         ));
+    }
+
+    let selective_lore = build_triggered_selective_lore(intent, ctx);
+    if !selective_lore.is_empty() {
+        tail = tail.push(selective_lore);
     }
 
     // 阶段 3：Campaign 全局变量注入（story_clock/weather/world_state 等，压在 volatile tail）
@@ -2703,6 +2721,126 @@ mod tests {
             layout2.prefix_fingerprint(),
             "相同蓝灯 → system 指纹应一致（cache 友好）"
         );
+    }
+
+    #[test]
+    fn test_director_tail_injects_triggered_selective_world_info() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![
+                WorldInfoEntry {
+                    st_id: None,
+                    keys: vec!["always".into()],
+                    secondary_keys: vec![],
+                    content: "CONSTANT_SYSTEM_LORE".into(),
+                    constant: true,
+                    selective: false,
+                    selective_logic: SelectiveLogic::And,
+                    disabled: false,
+                    position: 0,
+                    depth: 2,
+                    order: 100,
+                    route: LoreRoute::Constant,
+                    extensions: serde_json::json!({}),
+                },
+                WorldInfoEntry {
+                    st_id: None,
+                    keys: vec!["moon vault".into()],
+                    secondary_keys: vec![],
+                    content: "LUNAR_VAULT_LORE".into(),
+                    constant: false,
+                    selective: true,
+                    selective_logic: SelectiveLogic::And,
+                    disabled: false,
+                    position: 0,
+                    depth: 4,
+                    order: 200,
+                    route: LoreRoute::Selective,
+                    extensions: serde_json::json!({}),
+                },
+                WorldInfoEntry {
+                    st_id: None,
+                    keys: vec!["sun gate".into()],
+                    secondary_keys: vec![],
+                    content: "SUN_GATE_LORE".into(),
+                    constant: false,
+                    selective: true,
+                    selective_logic: SelectiveLogic::And,
+                    disabled: false,
+                    position: 0,
+                    depth: 4,
+                    order: 100,
+                    route: LoreRoute::Selective,
+                    extensions: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_selective_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
+
+        let system_extra = build_director_system_extra(&ctx);
+        let layout = MessageLayout::build()
+            .system(system_extra.clone())
+            .tail(|_| build_director_tail("open the moon vault", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(system_extra.contains("CONSTANT_SYSTEM_LORE"));
+        assert!(!system_extra.contains("LUNAR_VAULT_LORE"));
+        assert!(tail_content.contains("LUNAR_VAULT_LORE"));
+        assert!(!tail_content.contains("SUN_GATE_LORE"));
+    }
+
+    #[test]
+    fn test_director_tail_omits_untriggered_selective_world_info() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: None,
+                keys: vec!["moon vault".into()],
+                secondary_keys: vec![],
+                content: "LUNAR_VAULT_LORE".into(),
+                constant: false,
+                selective: true,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Selective,
+                extensions: serde_json::json!({}),
+            }],
+        });
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_selective_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
+
+        let layout = MessageLayout::build()
+            .system(build_director_system_extra(&ctx))
+            .tail(|_| build_director_tail("write a quiet market scene", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(!tail_content.contains("LUNAR_VAULT_LORE"));
     }
 
     // ─── 阶段 3：Director tail 消费 campaign_runtime 测试 ────────────────────

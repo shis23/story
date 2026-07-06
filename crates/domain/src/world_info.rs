@@ -81,6 +81,42 @@ impl WorldInfoEntry {
             LoreRoute::Disabled
         }
     }
+
+    pub fn matches_query(&self, query: &str) -> bool {
+        if self.disabled {
+            return false;
+        }
+
+        let query_lower = query.to_lowercase();
+        let primary_matches = any_key_matches(&query_lower, &self.keys);
+        let secondary_matches = any_key_matches(&query_lower, &self.secondary_keys);
+        let has_secondary = self.secondary_keys.iter().any(|k| !k.trim().is_empty());
+
+        if !has_secondary {
+            return primary_matches;
+        }
+
+        match self.selective_logic {
+            SelectiveLogic::And => primary_matches && secondary_matches,
+            SelectiveLogic::Or => primary_matches || secondary_matches,
+            SelectiveLogic::Not => primary_matches && !secondary_matches,
+        }
+    }
+
+    fn is_constant_route(&self) -> bool {
+        !self.disabled && matches!(self.route, LoreRoute::Constant | LoreRoute::Both)
+    }
+
+    fn is_selective_route(&self) -> bool {
+        !self.disabled && matches!(self.route, LoreRoute::Selective | LoreRoute::Both)
+    }
+}
+
+fn any_key_matches(query_lower: &str, keys: &[String]) -> bool {
+    keys.iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .any(|k| query_lower.contains(&k.to_lowercase()))
 }
 
 impl WorldInfoBook {
@@ -110,7 +146,7 @@ impl WorldInfoBook {
     pub fn constant_entries(&self) -> Vec<&WorldInfoEntry> {
         self.entries
             .iter()
-            .filter(|e| e.route == LoreRoute::Constant || e.route == LoreRoute::Both)
+            .filter(|e| e.is_constant_route())
             .collect()
     }
 
@@ -118,21 +154,20 @@ impl WorldInfoBook {
     pub fn selective_entries(&self) -> Vec<&WorldInfoEntry> {
         self.entries
             .iter()
-            .filter(|e| e.route == LoreRoute::Selective || e.route == LoreRoute::Both)
+            .filter(|e| e.is_selective_route())
+            .collect()
+    }
+
+    pub fn triggered_selective_entries(&self, query: &str) -> Vec<&WorldInfoEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.is_selective_route() && e.matches_query(query))
             .collect()
     }
 
     /// 按关键词匹配条目（非向量的简单匹配，M1 用）
     pub fn search_by_keywords(&self, query: &str) -> Vec<&WorldInfoEntry> {
-        let query_lower = query.to_lowercase();
-        self.entries
-            .iter()
-            .filter(|e| {
-                e.keys
-                    .iter()
-                    .any(|k| query_lower.contains(&k.to_lowercase()))
-            })
-            .collect()
+        self.triggered_selective_entries(query)
     }
 }
 
@@ -193,5 +228,194 @@ impl WorldInfoEntry {
             depth: Some(self.depth),
             extensions: self.extensions.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        content: &str,
+        route: LoreRoute,
+        keys: &[&str],
+        secondary_keys: &[&str],
+        selective_logic: SelectiveLogic,
+        disabled: bool,
+    ) -> WorldInfoEntry {
+        WorldInfoEntry {
+            st_id: None,
+            keys: keys.iter().map(|s| (*s).to_string()).collect(),
+            secondary_keys: secondary_keys.iter().map(|s| (*s).to_string()).collect(),
+            content: content.to_string(),
+            constant: matches!(route, LoreRoute::Constant | LoreRoute::Both),
+            selective: matches!(route, LoreRoute::Selective | LoreRoute::Both),
+            selective_logic,
+            disabled,
+            position: 0,
+            depth: 2,
+            order: 100,
+            route,
+            extensions: serde_json::json!({}),
+        }
+    }
+
+    fn book(entries: Vec<WorldInfoEntry>) -> WorldInfoBook {
+        WorldInfoBook {
+            entries,
+            source: crate::Source::Native,
+        }
+    }
+
+    fn contents(entries: Vec<&WorldInfoEntry>) -> Vec<&str> {
+        entries.into_iter().map(|e| e.content.as_str()).collect()
+    }
+
+    #[test]
+    fn triggered_selective_entries_honor_secondary_logic() {
+        let lore = book(vec![
+            entry(
+                "and lore",
+                LoreRoute::Selective,
+                &["vault"],
+                &["moon"],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "or lore",
+                LoreRoute::Selective,
+                &["river"],
+                &["ferry"],
+                SelectiveLogic::Or,
+                false,
+            ),
+            entry(
+                "not lore",
+                LoreRoute::Selective,
+                &["crown"],
+                &["decoy"],
+                SelectiveLogic::Not,
+                false,
+            ),
+        ]);
+
+        assert_eq!(
+            contents(lore.triggered_selective_entries("the vault opens under the moon")),
+            vec!["and lore"]
+        );
+        assert!(
+            contents(lore.triggered_selective_entries("the vault opens")).is_empty(),
+            "AND requires a primary key and a secondary key"
+        );
+        assert_eq!(
+            contents(lore.triggered_selective_entries("the ferry waits")),
+            vec!["or lore"],
+            "OR may trigger from a secondary key"
+        );
+        assert_eq!(
+            contents(lore.triggered_selective_entries("the crown is hidden")),
+            vec!["not lore"]
+        );
+        assert!(
+            contents(lore.triggered_selective_entries("the crown has a decoy")).is_empty(),
+            "NOT blocks when a secondary key is present"
+        );
+    }
+
+    #[test]
+    fn triggered_selective_entries_skip_disabled_and_constant_only_routes() {
+        let lore = book(vec![
+            entry(
+                "constant lore",
+                LoreRoute::Constant,
+                &["castle"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "selective lore",
+                LoreRoute::Selective,
+                &["forest"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "both lore",
+                LoreRoute::Both,
+                &["harbor"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "disabled route lore",
+                LoreRoute::Disabled,
+                &["dungeon"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "disabled flag lore",
+                LoreRoute::Selective,
+                &["crypt"],
+                &[],
+                SelectiveLogic::And,
+                true,
+            ),
+            entry(
+                "empty key lore",
+                LoreRoute::Selective,
+                &[""],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+        ]);
+
+        assert_eq!(
+            contents(
+                lore.triggered_selective_entries("castle forest harbor dungeon crypt anything")
+            ),
+            vec!["selective lore", "both lore"]
+        );
+    }
+
+    #[test]
+    fn search_by_keywords_uses_selective_trigger_rules() {
+        let lore = book(vec![
+            entry(
+                "constant lore",
+                LoreRoute::Constant,
+                &["castle"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "selective lore",
+                LoreRoute::Selective,
+                &["forest"],
+                &[],
+                SelectiveLogic::And,
+                false,
+            ),
+            entry(
+                "blocked lore",
+                LoreRoute::Selective,
+                &["crown"],
+                &["decoy"],
+                SelectiveLogic::Not,
+                false,
+            ),
+        ]);
+
+        assert_eq!(
+            contents(lore.search_by_keywords("castle forest crown decoy")),
+            vec!["selective lore"]
+        );
     }
 }

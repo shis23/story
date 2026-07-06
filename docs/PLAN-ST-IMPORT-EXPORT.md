@@ -38,7 +38,7 @@
 - **`extensions`**：完整保留在 `Character.extensions` 字段（`serde_json::Value`）。
 - **`raw_card_json`**：`from_st_card()` 时将 `StCharacterData` 序列化为 `raw_card_json`，保留原始字段。
 - **`spec_version`**：V2 默认 "2.0"，V3 从 `spec_version` 字段读取。
-- **内嵌世界书**：`character_book` → `WorldInfoBook::from_st()`，保留 entries、keys、content、position、order、selective/constant 路由。
+- **内嵌世界书**：`character_book` → `WorldInfoBook::from_st()`，保留 entries、keys、secondary_keys、content、position、order、selective/constant 路由。Constant/Both 条目进入 Director system；Selective/Both 条目会按本轮 intent 做确定性关键词触发并进入 Director tail，`search_world_info` 工具复用同一套触发规则。
 - **可渲染资产**：从 `extensions.assets` 或 `extensions.character_assets` 提取。
 
 ### 角色识别现状

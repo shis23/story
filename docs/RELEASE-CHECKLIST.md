@@ -64,6 +64,7 @@
 至少跑一张复杂 ST/MVU 卡：
 
 - PNG/JSON 导入正确，世界书、开场白、标签等字段不丢。
+- 世界书 Constant/Both 设定能稳定进入 Director system；Selective/Both 设定能按本轮意图关键词触发进入 Director tail，未命中条目不注入。
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。

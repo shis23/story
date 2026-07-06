@@ -808,6 +808,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_search_world_info_returns_only_selective_matches() {
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        fn entry(content: &str, route: LoreRoute, keys: &[&str]) -> WorldInfoEntry {
+            WorldInfoEntry {
+                st_id: None,
+                keys: keys.iter().map(|s| (*s).to_string()).collect(),
+                secondary_keys: vec![],
+                content: content.to_string(),
+                constant: matches!(route, LoreRoute::Constant | LoreRoute::Both),
+                selective: matches!(route, LoreRoute::Selective | LoreRoute::Both),
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route,
+                extensions: serde_json::json!({}),
+            }
+        }
+
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: Some(Arc::new(WorldInfoBook {
+                source: storyforge_domain::Source::Native,
+                entries: vec![
+                    entry("constant lore", LoreRoute::Constant, &["castle"]),
+                    entry("selective lore", LoreRoute::Selective, &["forest"]),
+                    entry("both lore", LoreRoute::Both, &["harbor"]),
+                    entry("disabled route lore", LoreRoute::Disabled, &["dungeon"]),
+                ],
+            })),
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+
+        let result = registry
+            .dispatch(
+                "search_world_info",
+                serde_json::json!({"query": "castle forest harbor dungeon"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["results_count"], 2);
+        let contents: Vec<&str> = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(contents, vec!["selective lore", "both lore"]);
+    }
+
     // ── tool_whitelist：ToolRegistry::retain / filter_registry_by_whitelist ──
 
     fn registry_with_director_tools() -> ToolRegistry {

@@ -68,7 +68,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 |---|---|---|
 | PNG tEXt chara 提取 | ✅ 已消费 | `infra-import/png.rs` |
 | V2/V3 卡字段 | ✅ 已消费 | `character.rs` |
-| character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具；Selective 触发待补 |
+| character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具 + Director tail 确定性 Selective 关键词触发；ST depth/position 细语义仍有限 |
 | extensions 整体保留 | 🟡 已保留 | `extensions: serde_json::Value` round-trip，不消费 |
 | regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output |
 | alternate_greetings | 🟡 Legacy 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话可在前端切换默认/备选开场并持久化到 conversation；Campaign 新建开场仍待设计 |
@@ -89,7 +89,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话已可切换并持久化；Campaign 新建开场仍待设计 | 0.5-1 天 |
 | 5 | 事件总线接线 | 前端有，后端未桥接 | 2-3 天 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
-| 7 | 世界书 Selective 触发 | Constant 已注入 | 补关键词扫描 + 绿灯激活，2-3 天 |
+| 7 | 世界书 Selective 触发 | ✅ 已接入确定性关键词扫描 | Director tail 注入命中绿灯/Both；secondary AND/OR/NOT 已覆盖，ST depth/position 细语义继续归入后续兼容 |
 | 8 | H-012 trait 抽象 | ✅ 已完成：`infra-plugin-host` 不再依赖 tauri | Tauri/WebView adapter 已移动到 `tauri-app/src/mvu_webview_runtime.rs` |
 
 ### 2.3.1 正则系统（独立工作项 R）
