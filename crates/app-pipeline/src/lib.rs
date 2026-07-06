@@ -1452,9 +1452,23 @@ fn apply_context_regex(
     let target = match placement {
         RegexPlacement::Input => RegexExecutionTarget::Prompt,
         RegexPlacement::Output => RegexExecutionTarget::Persisted,
+        RegexPlacement::WorldInfo => RegexExecutionTarget::Prompt,
     };
     apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
         .map_err(|e| PipelineError::Regex(e.to_string()))
+}
+
+fn apply_world_info_regex(content: &str, ctx: &WritingContext) -> String {
+    if ctx.regex_scripts.is_empty() {
+        return content.to_string();
+    }
+
+    apply_context_regex(content, &ctx.regex_scripts, RegexPlacement::WorldInfo).unwrap_or_else(
+        |e| {
+            tracing::warn!("世界书正则执行失败，使用原始世界书内容: {e}");
+            content.to_string()
+        },
+    )
 }
 
 fn build_director_system_extra(ctx: &WritingContext) -> String {
@@ -1471,7 +1485,8 @@ fn build_director_system_extra(ctx: &WritingContext) -> String {
 
     let mut out = String::from("【世界设定（常驻）】\n");
     for e in &constants {
-        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
+        let content = apply_world_info_regex(&e.content, ctx);
+        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), content));
     }
     out.push_str(
         "\n（以上常驻设定始终生效。绿灯条目可通过 search_world_info / search_vectors 工具检索。）",
@@ -1493,7 +1508,8 @@ fn build_triggered_selective_lore(intent: &str, ctx: &WritingContext) -> String 
 
     let mut out = String::from("【世界设定（关键词触发）】\n");
     for e in &entries {
-        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), e.content));
+        let content = apply_world_info_regex(&e.content, ctx);
+        out.push_str(&format!("- {}：{}\n", e.keys.join(", "), content));
     }
     out.push_str("\n（以上设定由本轮写作意图关键词触发，请优先参考。）");
     out
@@ -2056,6 +2072,7 @@ mod tests {
         let placement_codes = match placement {
             RegexPlacement::Input => vec![0],
             RegexPlacement::Output => vec![2],
+            RegexPlacement::WorldInfo => vec![3],
         };
         RegexScript {
             id: format!("test-{name}"),
@@ -2094,6 +2111,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
@@ -2198,6 +2216,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
@@ -2298,6 +2317,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
 
@@ -2522,6 +2542,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
         (orch, conv_store)
@@ -2768,6 +2789,51 @@ mod tests {
         assert!(!tail_content.contains("龙族设定详情"), "蓝灯不应进 tail");
     }
 
+    #[test]
+    fn test_director_system_applies_world_info_regex_without_mutating_book() {
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: Some(1),
+                keys: vec!["dragon".into()],
+                secondary_keys: vec![],
+                content: "Dragon note: {{DRAGON}}".into(),
+                constant: true,
+                selective: false,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Constant,
+                extensions: serde_json::json!({}),
+            }],
+        });
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_lore_regex_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let mut ctx =
+            WritingContext::legacy(vec![], Some(book.clone()), conv_store.create(None, None).id);
+        ctx.regex_scripts = vec![mock_regex_script(
+            "world-info-format",
+            r"\{\{DRAGON\}\}",
+            "Aurelion",
+            RegexPlacement::WorldInfo,
+        )];
+
+        let system_extra = build_director_system_extra(&ctx);
+
+        assert!(system_extra.contains("Dragon note: Aurelion"));
+        assert!(!system_extra.contains("{{DRAGON}}"));
+        assert_eq!(book.entries[0].content, "Dragon note: {{DRAGON}}");
+    }
+
     /// §22 cache 命中验证：两轮调用（不同 intent/turn）但相同蓝灯世界设定 →
     /// system 段指纹一致（cache 命中），只有 tail 变。
     #[test]
@@ -2900,6 +2966,55 @@ mod tests {
         assert!(!system_extra.contains("LUNAR_VAULT_LORE"));
         assert!(tail_content.contains("LUNAR_VAULT_LORE"));
         assert!(!tail_content.contains("SUN_GATE_LORE"));
+    }
+
+    #[test]
+    fn test_director_tail_applies_world_info_regex_to_triggered_selective_lore() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: None,
+                keys: vec!["moon vault".into()],
+                secondary_keys: vec![],
+                content: "Triggered: {{VAULT}}".into(),
+                constant: false,
+                selective: true,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 4,
+                order: 100,
+                route: LoreRoute::Selective,
+                extensions: serde_json::json!({}),
+            }],
+        });
+        let conv_store = {
+            let dir =
+                std::env::temp_dir().join(format!("sf_selective_regex_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let mut ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
+        ctx.regex_scripts = vec![mock_regex_script(
+            "world-info-format",
+            r"\{\{VAULT\}\}",
+            "Lunar Vault",
+            RegexPlacement::WorldInfo,
+        )];
+
+        let layout = MessageLayout::build()
+            .system(build_director_system_extra(&ctx))
+            .tail(|_| build_director_tail("open the moon vault", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(tail_content.contains("Triggered: Lunar Vault"));
+        assert!(!tail_content.contains("{{VAULT}}"));
     }
 
     #[test]

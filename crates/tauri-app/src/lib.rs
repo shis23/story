@@ -350,6 +350,7 @@ impl AppState {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         }));
 
         // 启动恢复：从 CharacterStore 把已导入的角色卡 + 世界书同步进 tool_ctx
@@ -523,10 +524,15 @@ impl AppState {
 
     /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store + MVU runtime）
     pub fn new_pipeline(&self) -> PipelineOrchestrator {
+        self.new_pipeline_with_regex(&[])
+    }
+
+    pub fn new_pipeline_with_regex(&self, regex_scripts: &[RegexScript]) -> PipelineOrchestrator {
         let llm = self.active_llm_or_mock();
         let mut tool_ctx = (*self.snapshot_tool_ctx()).clone();
         // 注入向量存储（search_vectors 工具用）
         tool_ctx.vector_store = Some(self.vector_store.clone());
+        tool_ctx.regex_scripts = regex_scripts.to_vec();
         // W10: 注入 MVU JS runtime（None = setup 未运行或 WebView 不可用，降级）
         let mvu_rt: Option<
             Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>,
@@ -1084,6 +1090,7 @@ fn regex_script_dto(r: &RegexScript) -> RegexScriptDto {
         placement: match r.placement {
             storyforge_domain::preset::RegexPlacement::Input => "input",
             storyforge_domain::preset::RegexPlacement::Output => "output",
+            storyforge_domain::preset::RegexPlacement::WorldInfo => "world_info",
         }
         .to_string(),
         placement_codes: r.placement_codes.clone(),
@@ -1883,7 +1890,7 @@ async fn start_writing(
     }
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
-    let mut pipeline = app.new_pipeline();
+    let mut pipeline = app.new_pipeline_with_regex(&ctx.regex_scripts);
     let result = pipeline
         .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
         .await;
@@ -2997,7 +3004,7 @@ async fn regenerate(
         *slot = Some(cancel_tx);
     }
 
-    let mut pipeline = app.new_pipeline();
+    let mut pipeline = app.new_pipeline_with_regex(&ctx.regex_scripts);
     let result = pipeline
         .regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx)
         .await;
@@ -7183,6 +7190,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         }));
 
         fill_campaign_runtime_from_store(&mut ctx, &tool_ctx, &campaign_store, &campaign.id);

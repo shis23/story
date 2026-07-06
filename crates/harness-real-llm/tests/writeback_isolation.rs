@@ -414,6 +414,7 @@ async fn b8_subagent_whitelist_cannot_add_unregistered_tool() {
         archived_summaries: vec![],
         campaign_runtime: None,
         current_character_instance_id: None,
+        regex_scripts: vec![],
     });
     let r = registry
         .dispatch("search_world_info", serde_json::json!({}), ctx)

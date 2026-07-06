@@ -906,6 +906,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = AgentRuntime::new(mock, tool_ctx);
 
@@ -957,6 +958,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = AgentRuntime::new(mock, tool_ctx);
 

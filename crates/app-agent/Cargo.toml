@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 storyforge-domain = { path = "../domain" }
 storyforge-infra-llm = { path = "../infra-llm" }
+storyforge-infra-regex = { path = "../infra-regex" }
 storyforge-infra-vector = { path = "../infra-vector" }
 serde.workspace = true
 serde_json.workspace = true

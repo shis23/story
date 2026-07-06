@@ -3742,6 +3742,7 @@ dependencies = [
  "serde_json",
  "storyforge-domain",
  "storyforge-infra-llm",
+ "storyforge-infra-regex",
  "storyforge-infra-vector",
  "thiserror 2.0.18",
  "tokio",

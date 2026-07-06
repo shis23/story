@@ -141,6 +141,7 @@ async fn i2_unbound_subagent_does_not_hard_fail() {
         archived_summaries: vec![],
         campaign_runtime: Some(runtime),
         current_character_instance_id: None,
+        regex_scripts: vec![],
     });
     let mut registry = ToolRegistry::new();
     register_subagent_tools(&mut registry);
@@ -214,6 +215,7 @@ async fn get_character_cross_instance_denied() {
         archived_summaries: vec![],
         campaign_runtime: Some(runtime),
         current_character_instance_id: Some(Id::from_str("inst-lin")),
+        regex_scripts: vec![],
     });
     let mut registry = ToolRegistry::new();
     register_subagent_tools(&mut registry);
@@ -256,6 +258,7 @@ async fn get_character_cross_instance_denied() {
                 archived_summaries: vec![],
                 campaign_runtime: Some(make_two_char_runtime().0),
                 current_character_instance_id: Some(Id::from_str("inst-lin")),
+                regex_scripts: vec![],
             }),
         )
         .await
@@ -283,6 +286,7 @@ async fn temporary_instance_isolation() {
         archived_summaries: vec![],
         campaign_runtime: Some(cr2.clone()),
         current_character_instance_id: Some(temp_id),
+        regex_scripts: vec![],
     });
     let mut registry = ToolRegistry::new();
     register_subagent_tools(&mut registry);

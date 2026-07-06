@@ -237,6 +237,7 @@ async fn i1_adversarial_knowledge_boundary() {
         archived_summaries: vec![],
         campaign_runtime: Some(runtime.clone()),
         current_character_instance_id: Some(lin_inst_id.clone()),
+        regex_scripts: vec![],
     });
 
     let runtime_agent = AgentRuntime::new(recording_llm.clone(), tool_ctx);

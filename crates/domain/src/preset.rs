@@ -75,6 +75,8 @@ pub enum RegexPlacement {
     Input,
     /// 输出正则：编剧成文后
     Output,
+    /// 世界书正则：世界书条目注入 prompt 前
+    WorldInfo,
 }
 
 /// ST regex script source. Defaulting to Preset keeps older stored preset JSON compatible.
@@ -219,6 +221,7 @@ fn regex_script_applies_to_placement(script: &RegexScript, placement: RegexPlace
     match placement {
         RegexPlacement::Input => script.placement_codes.contains(&0),
         RegexPlacement::Output => script.placement_codes.contains(&2),
+        RegexPlacement::WorldInfo => script.placement_codes.contains(&3),
     }
 }
 
@@ -246,10 +249,10 @@ pub(crate) fn extract_regex_scripts_with_source(
         .map(|s| {
             // ST placement: [0] = main input, [2] = output. Other execution
             // points are preserved in placement_codes until their hooks exist.
-            let placement = if s.placement.first() == Some(&2) {
-                RegexPlacement::Output
-            } else {
-                RegexPlacement::Input
+            let placement = match s.placement.first() {
+                Some(2) => RegexPlacement::Output,
+                Some(3) => RegexPlacement::WorldInfo,
+                _ => RegexPlacement::Input,
             };
             let placement_codes = s.placement;
 
@@ -382,6 +385,30 @@ mod tests {
 
         assert_eq!(input_ids, vec!["both", "legacy"]);
         assert_eq!(output_ids, vec!["both"]);
+    }
+
+    #[test]
+    fn preset_import_maps_world_info_regex_placement() {
+        let preset = Preset::from_st(StPreset {
+            name: Some("World regex".into()),
+            prompts: vec![],
+            extensions: serde_json::json!({
+                "regex_scripts": [{
+                    "id": "wi",
+                    "scriptName": "world-info",
+                    "findRegex": "foo",
+                    "replaceString": "bar",
+                    "placement": [3],
+                    "disabled": false,
+                    "flags": "gm"
+                }]
+            }),
+        });
+
+        assert_eq!(preset.regex_scripts.len(), 1);
+        assert_eq!(preset.regex_scripts[0].placement, RegexPlacement::WorldInfo);
+        assert!(preset.input_regex_scripts().is_empty());
+        assert!(preset.output_regex_scripts().is_empty());
     }
 
     #[test]

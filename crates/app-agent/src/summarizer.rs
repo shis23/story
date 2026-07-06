@@ -71,6 +71,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = AgentRuntime::new(client, ctx);
         let (_tx, rx) = tokio::sync::watch::channel(false);

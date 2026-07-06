@@ -181,6 +181,7 @@ fn script_applies_to_placement(script: &RegexScript, placement: &RegexPlacement)
     match placement {
         RegexPlacement::Input => script.placement_codes.contains(&0),
         RegexPlacement::Output => script.placement_codes.contains(&2),
+        RegexPlacement::WorldInfo => script.placement_codes.contains(&3),
     }
 }
 
@@ -514,6 +515,32 @@ mod tests {
         let result = apply_regex_scripts("foo", &[script], RegexPlacement::Input).unwrap();
 
         assert_eq!(result, "foo");
+    }
+
+    #[test]
+    fn test_world_info_placement_code_applies_only_to_world_info_target() {
+        let mut script = make_script("world-info", r"foo", "bar", RegexPlacement::Input);
+        script.placement_codes = vec![3];
+
+        let input = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script.clone()],
+            RegexPlacement::Input,
+            RegexExecutionTarget::Prompt,
+            0,
+        )
+        .unwrap();
+        let world_info = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script],
+            RegexPlacement::WorldInfo,
+            RegexExecutionTarget::Prompt,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(input, "foo");
+        assert_eq!(world_info, "bar");
     }
 
     #[test]

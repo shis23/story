@@ -374,6 +374,7 @@ async fn c6_meta_chat_real_llm() {
         archived_summaries: vec![],
         campaign_runtime: None,
         current_character_instance_id: None,
+        regex_scripts: vec![],
     });
     let runtime = AgentRuntime::new(llm, tool_ctx);
 
@@ -595,6 +596,7 @@ async fn c7_mvu_analyze_real_llm() {
         archived_summaries: vec![],
         campaign_runtime: None,
         current_character_instance_id: None,
+        regex_scripts: vec![],
     });
     let runtime = AgentRuntime::new(llm, tool_ctx);
 

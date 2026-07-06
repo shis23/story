@@ -14,7 +14,9 @@ use storyforge_domain::Id;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::Character;
 use storyforge_domain::llm::ToolSpec;
+use storyforge_domain::preset::{RegexPlacement, RegexScript};
 use storyforge_domain::world_info::WorldInfoBook;
+use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target_at_depth};
 
 /// 工具执行错误
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +48,8 @@ pub struct ToolContext {
     /// 用于子 Agent get_character 工具：只返回自己的 instance 数据，不泄露其他角色。
     /// 导演/编剧/无 Campaign 时为 None。
     pub current_character_instance_id: Option<Id>,
+    /// 本轮合并后的 ST regex scripts。工具返回 prompt 内容前可复用。
+    pub regex_scripts: Vec<RegexScript>,
 }
 
 /// 工具处理器（异步函数 trait）
@@ -191,9 +195,10 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     book.search_by_keywords(query)
                         .into_iter()
                         .map(|e| {
+                            let content = render_world_info_tool_content(&e.content, &ctx);
                             serde_json::json!({
                                 "keys": e.keys,
-                                "content": e.content,
+                                "content": content,
                                 "route": format!("{:?}", e.route),
                             })
                         })
@@ -401,6 +406,24 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
     );
 }
 
+fn render_world_info_tool_content(content: &str, ctx: &ToolContext) -> String {
+    if ctx.regex_scripts.is_empty() {
+        return content.to_string();
+    }
+
+    apply_regex_scripts_for_target_at_depth(
+        content,
+        &ctx.regex_scripts,
+        RegexPlacement::WorldInfo,
+        RegexExecutionTarget::Prompt,
+        0,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!("世界书工具正则执行失败，使用原始世界书内容: {e}");
+        content.to_string()
+    })
+}
+
 /// 注册子 Agent 的工具（只读，受限）
 ///
 /// 阶段 4 改造：有 `current_character_instance_id` 时，get_character 只返回
@@ -569,6 +592,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -605,6 +629,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -633,6 +658,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -663,6 +689,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -717,6 +744,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(cr),
             current_character_instance_id: Some(Id::from_str("inst-lin")),
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -751,6 +779,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -784,6 +813,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: Some(Id::from_str("inst-nonexistent")),
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -847,6 +877,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
 
         let mut registry = ToolRegistry::new();
@@ -869,6 +900,73 @@ mod tests {
             .map(|r| r["content"].as_str().unwrap())
             .collect();
         assert_eq!(contents, vec!["selective lore", "both lore"]);
+    }
+
+    #[tokio::test]
+    async fn test_search_world_info_applies_world_info_regex() {
+        use storyforge_domain::preset::{RegexPlacement, RegexScript, RegexScriptSource};
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: Some(Arc::new(WorldInfoBook {
+                source: storyforge_domain::Source::Native,
+                entries: vec![WorldInfoEntry {
+                    st_id: None,
+                    keys: vec!["moon".into()],
+                    secondary_keys: vec![],
+                    content: "Tool lore: {{MOON}}".into(),
+                    constant: false,
+                    selective: true,
+                    selective_logic: SelectiveLogic::And,
+                    disabled: false,
+                    position: 0,
+                    depth: 2,
+                    order: 100,
+                    route: LoreRoute::Selective,
+                    extensions: serde_json::json!({}),
+                }],
+            })),
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![RegexScript {
+                id: "world-info-format".into(),
+                script_name: "world-info-format".into(),
+                find_regex: r"\{\{MOON\}\}".into(),
+                replace_string: "Lunar Vault".into(),
+                placement: RegexPlacement::WorldInfo,
+                placement_codes: vec![3],
+                source: RegexScriptSource::Preset,
+                disabled: false,
+                flags: "gm".into(),
+                only_format_formatting: None,
+                markdown_only: None,
+                prompt_only: None,
+                run_on_edit: None,
+                substitute_regex: None,
+                trim_strings: vec![],
+                min_depth: None,
+                max_depth: None,
+            }],
+        });
+
+        let result = registry
+            .dispatch(
+                "search_world_info",
+                serde_json::json!({"query":"moon"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["results_count"], 1);
+        assert_eq!(result["results"][0]["content"], "Tool lore: Lunar Vault");
     }
 
     // ── tool_whitelist：ToolRegistry::retain / filter_registry_by_whitelist ──
@@ -907,6 +1005,7 @@ mod tests {
                     archived_summaries: vec![],
                     campaign_runtime: None,
                     current_character_instance_id: None,
+                    regex_scripts: vec![],
                 }),
             )
             .await;

@@ -186,6 +186,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         Arc::new(AgentRuntime::new(client, ctx))
     }

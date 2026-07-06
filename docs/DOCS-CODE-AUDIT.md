@@ -239,11 +239,13 @@
 
 2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。2026-07-06 增量：Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则注入 `WritingContext.regex_scripts`，并已通过 `CharacterInfo.extensions` 持久化卡内扩展，避免重启后丢失 scoped regex；active Preset 与 Scoped 会按 Preset → Scoped 顺序合并。2026-07-06 追加：`CharacterCard::scoped_regex_scripts()` 会从 Campaign 卡的 `raw_card_json.extensions.regex_scripts` 解析卡内 Scoped 正则；`fill_campaign_runtime_from_store()` 在组装 active Campaign 快照时会追加这些脚本，并跳过同 ID 的既有 Scoped 脚本，避免 legacy/Campaign 双路径重复执行。
 
-2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。`crates/app-pipeline` 已接入正则执行器：首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘/返回前执行 Output 正则。Input/Output 过滤已优先尊重 ST 原始 `placement_codes`，`[0,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；World Info/Slash/Reasoning 等非 Input/Output 执行点、PluginHost/HTML 渲染等完整运行时语义仍未实现。
+2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。`crates/app-pipeline` 已接入正则执行器：首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘/返回前执行 Output 正则。Input/Output 过滤已优先尊重 ST 原始 `placement_codes`，`[0,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；Slash/Reasoning 等非 Input/Output/World Info 执行点、PluginHost/HTML 渲染等完整运行时语义仍未实现。
 
 2026-07-07 增量核对：`storyforge-infra-regex` 新增 `RegexExecutionTarget::{Prompt,Persisted,Display}` 与 `apply_regex_scripts_for_target`。`promptOnly=true` 的脚本只在 Prompt 目标执行；`markdownOnly=true` 的脚本只在 Display 目标执行，不再污染提示词或持久化文本。`app-pipeline` 的 Input 正则显式走 Prompt 目标，Output 落盘/返回前正则走 Persisted 目标；Tauri `get_conversation` 已返回派生 `display_content`，前端消息展示使用 `display_content`、编辑仍使用原始 `content`。PluginHost/HTML 渲染通道尚未接线。
 
-2026-07-07 增量核对：`storyforge-infra-regex` 的执行器已支持 `minDepth/maxDepth` 包含式范围过滤。`app-pipeline` 当前生成/重 roll 的 Input/Output 按 ST depth 0 执行；Tauri `get_conversation` 生成 `display_content` 时按消息节点离末尾的深度执行 display-only 正则，因此老消息不会被只针对最近 N 条的脚本误替换。prompt 历史批量重写、World Info/Slash/Reasoning 专用执行点仍未接线。
+2026-07-07 增量核对：`storyforge-infra-regex` 的执行器已支持 `minDepth/maxDepth` 包含式范围过滤。`app-pipeline` 当前生成/重 roll 的 Input/Output 按 ST depth 0 执行；Tauri `get_conversation` 生成 `display_content` 时按消息节点离末尾的深度执行 display-only 正则，因此老消息不会被只针对最近 N 条的脚本误替换。prompt 历史批量重写、Slash/Reasoning 专用执行点仍未接线。
+
+2026-07-07 增量核对：ST placement 3 已映射到 `RegexPlacement::WorldInfo`，Preset/Scoped/Global 的 World Info 正则会在世界书内容进入 prompt 前执行。覆盖点包括 `build_director_system_extra` 的 Constant/Both 常驻世界书、`build_triggered_selective_lore` 的 Selective/Both 关键词触发世界书，以及 Director 工具 `search_world_info` 返回内容；执行结果只用于 prompt，不写回 `WorldInfoBook` 存储。
 
 2026-07-06 增量核对：`CharacterInfo` 已保留 `alternate_greetings` 并在启动恢复到 domain `Character` 时保留该字段；legacy 单卡新会话前端已提供默认/备选开场切换，`start_writing` 可接收并校验来自当前角色卡的 `opening_message`，新建 conversation 时会持久化选中的开场。Campaign 新建游玩档也已接入默认/备选开场选择：`get_card` 会暴露源角色卡 greetings，`create_campaign` 接收并校验所选 `opening_message`，再写入新建 Campaign conversation。
 

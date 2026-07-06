@@ -58,6 +58,7 @@ impl HarnessEnv {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         }));
         let vector_store = Arc::new(BruteForceStore::with_persistence(
             data_dir.join("vectors.json"),

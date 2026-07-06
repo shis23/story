@@ -936,6 +936,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1017,6 +1018,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1073,6 +1075,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1170,6 +1173,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = AgentRuntime::new(llm, tool_ctx);
 
@@ -1312,6 +1316,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(cr.clone()),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1366,6 +1371,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(cr.clone()),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1419,6 +1425,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1645,6 +1652,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: Some(cr.clone()),
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1728,6 +1736,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
         let director_config = AgentConfig {
@@ -1784,6 +1793,7 @@ mod tests {
             archived_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
+            regex_scripts: vec![],
         });
         let runtime = AgentRuntime::new(llm, tool_ctx);
 
