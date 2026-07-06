@@ -118,6 +118,36 @@ export async function updatePresetRegex(presetId, regexIndex, disabled) {
   }
 }
 
+/** 列出全局正则脚本 */
+export async function listGlobalRegexScripts() {
+  if (isTauri()) {
+    return await invoke('list_global_regex_scripts')
+  }
+  return []
+}
+
+/** 从 ST settings JSON 导入全局正则脚本 */
+export async function importGlobalRegexSettings(settingsJson) {
+  if (isTauri()) {
+    return await invoke('import_global_regex_settings', { settingsJson })
+  }
+  return 0
+}
+
+/** 清空全局正则脚本 */
+export async function clearGlobalRegexScripts() {
+  if (isTauri()) {
+    return await invoke('clear_global_regex_scripts')
+  }
+}
+
+/** 更新全局正则禁用状态 */
+export async function updateGlobalRegex(regexIndex, disabled) {
+  if (isTauri()) {
+    return await invoke('update_global_regex', { regexIndex, disabled })
+  }
+}
+
 /** 将 ST 预设的 prompts 转换为模块（返回转换数量） */
 export async function importPresetAsModules(presetId) {
   if (isTauri()) {

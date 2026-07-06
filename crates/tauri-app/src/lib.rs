@@ -1,6 +1,7 @@
 pub mod campaign_store;
 mod connection_store;
 pub mod error;
+mod global_regex_store;
 mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
@@ -70,6 +71,15 @@ fn get_preset_store() -> &'static PresetStore {
     PRESET_STORE.get_or_init(|| {
         let data_dir = get_app_data_dir();
         PresetStore::new(&data_dir)
+    })
+}
+
+static GLOBAL_REGEX_STORE: OnceLock<global_regex_store::GlobalRegexStore> = OnceLock::new();
+
+fn get_global_regex_store() -> &'static global_regex_store::GlobalRegexStore {
+    GLOBAL_REGEX_STORE.get_or_init(|| {
+        let data_dir = get_app_data_dir();
+        global_regex_store::GlobalRegexStore::new(&data_dir)
     })
 }
 
@@ -1055,6 +1065,21 @@ pub struct RegexScriptDto {
     pub disabled: bool,
 }
 
+fn regex_script_dto(r: &RegexScript) -> RegexScriptDto {
+    RegexScriptDto {
+        id: r.id.clone(),
+        script_name: r.script_name.clone(),
+        find_regex: r.find_regex.clone(),
+        replace_string: r.replace_string.clone(),
+        placement: match r.placement {
+            storyforge_domain::preset::RegexPlacement::Input => "input",
+            storyforge_domain::preset::RegexPlacement::Output => "output",
+        }
+        .to_string(),
+        disabled: r.disabled,
+    }
+}
+
 #[tauri::command]
 fn list_presets() -> Vec<PresetSummaryDto> {
     let store = get_preset_store();
@@ -1106,18 +1131,7 @@ fn get_preset(id: String) -> Result<PresetDetailDto, TauriCommandError> {
             .preset
             .regex_scripts
             .iter()
-            .map(|r| RegexScriptDto {
-                id: r.id.clone(),
-                script_name: r.script_name.clone(),
-                find_regex: r.find_regex.clone(),
-                replace_string: r.replace_string.clone(),
-                placement: match r.placement {
-                    storyforge_domain::preset::RegexPlacement::Input => "input",
-                    storyforge_domain::preset::RegexPlacement::Output => "output",
-                }
-                .to_string(),
-                disabled: r.disabled,
-            })
+            .map(regex_script_dto)
             .collect(),
         imported_at: sp.imported_at.clone(),
         active: active_id.as_deref() == Some(sp.id.as_str()),
@@ -1204,6 +1218,46 @@ fn update_preset_regex(
     } else {
         Err(TauriCommandError::not_found(format!(
             "找不到预设 {preset_id} 的第 {regex_index} 条正则"
+        )))
+    }
+}
+
+#[tauri::command]
+fn list_global_regex_scripts() -> Vec<RegexScriptDto> {
+    get_global_regex_store()
+        .list()
+        .iter()
+        .map(regex_script_dto)
+        .collect()
+}
+
+#[tauri::command]
+fn import_global_regex_settings(settings_json: String) -> Result<usize, TauriCommandError> {
+    get_global_regex_store()
+        .import_from_settings_json(&settings_json)
+        .map_err(|e| TauriCommandError::storage(format!("global regex import failed: {e}")))
+}
+
+#[tauri::command]
+fn clear_global_regex_scripts() -> Result<(), TauriCommandError> {
+    get_global_regex_store()
+        .clear()
+        .map_err(|e| TauriCommandError::storage(format!("global regex clear failed: {e}")))
+}
+
+#[tauri::command]
+fn update_global_regex(
+    regex_index: usize,
+    disabled: Option<bool>,
+) -> Result<(), TauriCommandError> {
+    if get_global_regex_store()
+        .update_regex(regex_index, disabled)
+        .map_err(|e| TauriCommandError::storage(format!("global regex update failed: {e}")))?
+    {
+        Ok(())
+    } else {
+        Err(TauriCommandError::not_found(format!(
+            "global regex not found at index {regex_index}"
         )))
     }
 }
@@ -1797,7 +1851,7 @@ async fn start_writing(
         campaign_runtime: None,
         agent_profile_config: None,
     };
-    fill_regex_context(&mut ctx, get_preset_store());
+    fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
     // 从活跃 Agent Profile Config 加载运行时配置覆盖
@@ -1930,14 +1984,20 @@ fn collect_scoped_regex_scripts(
         .unwrap_or_default()
 }
 
-fn fill_regex_context(ctx: &mut WritingContext, preset_store: &PresetStore) {
+fn fill_regex_context(
+    ctx: &mut WritingContext,
+    preset_store: &PresetStore,
+    global_regex_store: &global_regex_store::GlobalRegexStore,
+) {
     let scoped_scripts = std::mem::take(&mut ctx.regex_scripts);
+    let global_scripts = global_regex_store.list();
     let preset_scripts = preset_store
         .active()
         .map(|stored| stored.preset.regex_scripts)
         .unwrap_or_default();
 
-    ctx.regex_scripts = merge_regex_script_sources(&[], &preset_scripts, &scoped_scripts);
+    ctx.regex_scripts =
+        merge_regex_script_sources(&global_scripts, &preset_scripts, &scoped_scripts);
 }
 
 fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
@@ -2827,7 +2887,7 @@ async fn regenerate(
         campaign_runtime: None,
         agent_profile_config: None,
     };
-    fill_regex_context(&mut ctx, get_preset_store());
+    fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
     fill_agent_profile_context(&mut ctx, &app);
     fill_campaign_context(&mut ctx, &app);
@@ -3327,6 +3387,7 @@ fn diagnostic_context_for_data_dir(data_dir: &Path) -> serde_json::Value {
         "active_agent_profile_config.json",
         "presets.json",
         "active_preset.json",
+        "global_regex_scripts.json",
     ];
 
     let log_dir = data_dir.join("logs");
@@ -6007,6 +6068,10 @@ pub fn run() {
             delete_preset,
             update_preset_prompt,
             update_preset_regex,
+            list_global_regex_scripts,
+            import_global_regex_settings,
+            clear_global_regex_scripts,
+            update_global_regex,
             import_preset_as_modules,
             // M4 插件命令
             list_plugins,
@@ -6321,6 +6386,7 @@ mod tests {
         assert!(json.contains("connections.json"));
         assert!(json.contains("embed.json"));
         assert!(json.contains("active_preset.json"));
+        assert!(json.contains("global_regex_scripts.json"));
         assert!(json.contains("logs"));
         assert!(!json.contains("sk-live-secret"));
         assert!(!json.contains("embed-live-secret"));
@@ -6574,7 +6640,8 @@ mod tests {
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.regex_scripts = vec![test_regex_script("scoped-regex", RegexScriptSource::Preset)];
 
-        fill_regex_context(&mut ctx, &preset_store);
+        let global_store = global_regex_store::GlobalRegexStore::new(&dir);
+        fill_regex_context(&mut ctx, &preset_store, &global_store);
 
         let ids: Vec<_> = ctx
             .regex_scripts
@@ -6591,6 +6658,65 @@ mod tests {
         assert_eq!(
             sources,
             vec![RegexScriptSource::Preset, RegexScriptSource::Scoped]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fill_regex_context_merges_global_before_active_preset_and_scoped() {
+        use storyforge_domain::Source;
+        use storyforge_domain::preset::{Preset, RegexScriptSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_global_regex_context_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let global_store = global_regex_store::GlobalRegexStore::new(&dir);
+        global_store
+            .replace_all(vec![test_regex_script(
+                "global-regex",
+                RegexScriptSource::Scoped,
+            )])
+            .unwrap();
+
+        let preset_store = preset_store::PresetStore::new(&dir);
+        let preset_id = preset_store
+            .save(Preset {
+                name: "runtime preset".into(),
+                prompts: vec![],
+                regex_scripts: vec![test_regex_script("preset-regex", RegexScriptSource::Scoped)],
+                source: Source::ImportedFromST,
+            })
+            .unwrap();
+        assert!(preset_store.set_active(&preset_id).unwrap());
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.regex_scripts = vec![test_regex_script("scoped-regex", RegexScriptSource::Preset)];
+
+        fill_regex_context(&mut ctx, &preset_store, &global_store);
+
+        let ids: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["global-regex", "preset-regex", "scoped-regex"]);
+
+        let sources: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                RegexScriptSource::Global,
+                RegexScriptSource::Preset,
+                RegexScriptSource::Scoped
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6650,7 +6776,14 @@ mod tests {
             "legacy-scoped-regex",
             RegexScriptSource::Preset,
         )];
-        fill_regex_context(&mut ctx, &preset_store);
+        let global_store = global_regex_store::GlobalRegexStore::new(&dir);
+        global_store
+            .replace_all(vec![test_regex_script(
+                "global-regex",
+                RegexScriptSource::Scoped,
+            )])
+            .unwrap();
+        fill_regex_context(&mut ctx, &preset_store, &global_store);
         let tool_ctx = Arc::new(RwLock::new(ToolContext {
             characters: vec![],
             world_info: None,
@@ -6670,6 +6803,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "global-regex",
                 "preset-regex",
                 "legacy-scoped-regex",
                 "campaign-scoped-regex"
@@ -6684,6 +6818,7 @@ mod tests {
         assert_eq!(
             sources,
             vec![
+                RegexScriptSource::Global,
                 RegexScriptSource::Preset,
                 RegexScriptSource::Scoped,
                 RegexScriptSource::Scoped

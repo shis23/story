@@ -113,7 +113,7 @@ App.vue::startWriting(intent)
   → tauri-api.js::startWriting (Tauri IPC)
   → lib.rs::start_writing (Tauri command)
     → snapshot_tool_ctx() — 读 tool_ctx RwLock
-    → fill_regex_context() — 合并 active Preset + legacy 选中卡 Scoped regex_scripts
+    → fill_regex_context() — 合并 Global + active Preset + legacy 选中卡 Scoped regex_scripts
     → fill_profile_context() — 读 profile_store/module_store
     → fill_agent_profile_context() — 读 agent_profile_config_store
     → fill_campaign_context()
