@@ -28,6 +28,7 @@ use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{
     LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
+use storyforge_domain::preset::RegexScript;
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
@@ -535,6 +536,8 @@ pub struct CharacterInfo {
     pub tags: Vec<String>,
     pub creator: String,
     pub spec_version: String,
+    #[serde(default)]
+    pub extensions: serde_json::Value,
     pub has_world_info: bool,
     pub has_renderable_assets: bool,
     pub world_info_count: usize,
@@ -597,6 +600,7 @@ impl From<&storyforge_domain::character::Character> for CharacterInfo {
             tags: c.tags.clone(),
             creator: c.creator.clone(),
             spec_version: c.spec_version.clone(),
+            extensions: c.extensions.clone(),
             has_world_info: c.embedded_world_info.is_some(),
             has_renderable_assets: c.renderable_assets.is_some(),
             world_info_count: c
@@ -1709,7 +1713,7 @@ async fn start_writing(
         id
     } else {
         // 新建对话 + 存开场白 + 存 user 意图（legacy 路径，无 Campaign 绑定）
-        let conv = app.conv_store.create(character_id, None);
+        let conv = app.conv_store.create(character_id.clone(), None);
         let id = conv.id.clone();
         // 开场白（从角色卡读取，Final 状态 Assistant 消息）
         if let Some(ch) = tool_snapshot.characters.first()
@@ -1728,6 +1732,11 @@ async fn start_writing(
         }
         id
     };
+    let regex_character_id = character_id.clone().or_else(|| {
+        app.conv_store
+            .get(&conversation_id)
+            .and_then(|c| c.character_id)
+    });
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
@@ -1738,6 +1747,10 @@ async fn start_writing(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
+        regex_scripts: collect_scoped_regex_scripts(
+            regex_character_id.as_deref(),
+            &tool_snapshot.characters,
+        ),
         campaign_runtime: None,
         agent_profile_config: None,
     };
@@ -1847,6 +1860,32 @@ async fn start_writing(
 /// 从模块/Profile 存储加载预设配置到 WritingContext
 ///
 /// 无 Profile 时不动 ctx（profile 保持 None → 流水线用硬编码常量兜底）。
+fn collect_scoped_regex_scripts(
+    character_id: Option<&str>,
+    characters: &[Arc<storyforge_domain::character::Character>],
+) -> Vec<RegexScript> {
+    let Some(character_id) = character_id else {
+        return Vec::new();
+    };
+
+    let stored = get_store().get(character_id);
+    let source_id = stored
+        .as_ref()
+        .and_then(|stored| stored.info.source_character_id.as_deref())
+        .unwrap_or(character_id);
+    let stored_name = stored.as_ref().map(|stored| stored.info.name.as_str());
+
+    characters
+        .iter()
+        .find(|character| {
+            character.id.as_str() == source_id
+                || character.id.as_str() == character_id
+                || stored_name.is_some_and(|name| character.name == name)
+        })
+        .map(|character| character.scoped_regex_scripts())
+        .unwrap_or_default()
+}
+
 fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
     // 加载活跃 Profile
     if let Some(profile) = state.profile_store.get_active() {
@@ -2690,6 +2729,10 @@ async fn regenerate(
 
     // tool_ctx 快照（保持与 start_writing 一致）
     let tool_snapshot = app.snapshot_tool_ctx();
+    let regex_character_id = app
+        .conv_store
+        .get(&conversation_id)
+        .and_then(|conversation| conversation.character_id);
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
@@ -2700,6 +2743,10 @@ async fn regenerate(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
+        regex_scripts: collect_scoped_regex_scripts(
+            regex_character_id.as_deref(),
+            &tool_snapshot.characters,
+        ),
         campaign_runtime: None,
         agent_profile_config: None,
     };
@@ -6024,7 +6071,7 @@ fn stored_info_to_character(
         character_version: String::new(),
         alternate_greetings: vec![],
         embedded_world_info: None,
-        extensions: serde_json::json!({}),
+        extensions: stored.info.extensions.clone(),
         renderable_assets: None,
         source: storyforge_domain::Source::Native,
         spec_version: stored.info.spec_version.clone(),
@@ -6328,6 +6375,72 @@ mod tests {
 
         assert_eq!(restored.id, Id::from_str("source-lin"));
         assert_eq!(restored.name, "Lin");
+    }
+
+    #[test]
+    fn test_stored_info_to_character_preserves_extensions_for_scoped_regex() {
+        let mut character = make_test_character("Regex Card");
+        character.id = Id::from_str("source-regex");
+        character.extensions = serde_json::json!({
+            "regex_scripts": [
+                {
+                    "id": "scoped-output",
+                    "scriptName": "Scoped output",
+                    "findRegex": "foo",
+                    "replaceString": "bar",
+                    "placement": [2],
+                    "disabled": false
+                }
+            ]
+        });
+        let stored = storage::StoredCharacter {
+            id: "stored-regex".into(),
+            info: CharacterInfo::from(&character),
+            imported_at: "now".into(),
+        };
+
+        let restored = stored_info_to_character(&stored);
+        let scripts = restored.scoped_regex_scripts();
+
+        assert_eq!(restored.extensions, character.extensions);
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "scoped-output");
+    }
+
+    #[test]
+    fn test_collect_scoped_regex_scripts_is_limited_to_selected_character() {
+        let mut selected = make_test_character("Selected");
+        selected.id = Id::from_str("source-selected");
+        selected.extensions = serde_json::json!({
+            "regex_scripts": [{
+                "id": "selected-regex",
+                "scriptName": "Selected regex",
+                "findRegex": "foo",
+                "replaceString": "bar",
+                "placement": [2],
+                "disabled": false
+            }]
+        });
+        let mut other = make_test_character("Other");
+        other.id = Id::from_str("source-other");
+        other.extensions = serde_json::json!({
+            "regex_scripts": [{
+                "id": "other-regex",
+                "scriptName": "Other regex",
+                "findRegex": "baz",
+                "replaceString": "qux",
+                "placement": [2],
+                "disabled": false
+            }]
+        });
+        let characters = vec![Arc::new(selected), Arc::new(other)];
+
+        let scripts = collect_scoped_regex_scripts(Some("source-selected"), &characters);
+
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "selected-regex");
+        assert!(collect_scoped_regex_scripts(None, &characters).is_empty());
+        assert!(collect_scoped_regex_scripts(Some("missing"), &characters).is_empty());
     }
 
     #[test]

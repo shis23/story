@@ -16,6 +16,7 @@ use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::conversation::Provenance;
 use storyforge_domain::mvu_translation::FallbackFragment;
+use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
 use storyforge_app_agent::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
@@ -27,6 +28,7 @@ use storyforge_app_conversation::{
 };
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::mvu_runtime::MvuRuntime;
+use storyforge_infra_regex::apply_regex_scripts;
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -43,6 +45,9 @@ pub enum PipelineError {
 
     #[error("Plan 解析失败: {0}")]
     PlanParse(String),
+
+    #[error("正则执行失败: {0}")]
+    Regex(String),
 
     #[error("重 roll 失败: {0}")]
     Regenerate(String),
@@ -124,6 +129,8 @@ pub struct WritingContext {
     pub profile: Option<storyforge_domain::prompt_module::PromptProfile>,
     /// 可用模块列表（Profile 引用的模块定义）
     pub modules: Vec<storyforge_domain::prompt_module::PromptModule>,
+    /// ST regex scripts collected for this writing run.
+    pub regex_scripts: Vec<RegexScript>,
     /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
     pub campaign_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
     /// Agent Profile 配置（可选）。None = 使用硬编码默认值。
@@ -147,6 +154,7 @@ impl WritingContext {
             story_clock: String::new(),
             profile: None,
             modules: vec![],
+            regex_scripts: vec![],
             campaign_runtime: None,
             agent_profile_config: None,
         }
@@ -254,6 +262,12 @@ impl PipelineOrchestrator {
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
+        let director_intent =
+            match apply_context_regex(&intent, &ctx.regex_scripts, RegexPlacement::Input) {
+                Ok(text) => text,
+                Err(e) => return Err(self.abort_with(&event_tx, e)),
+            };
+
         let director_config = make_director_config(
             ctx.profile.as_ref(),
             &ctx.modules,
@@ -279,7 +293,7 @@ impl PipelineOrchestrator {
         let director_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(director_config.system_prompt.clone())
             .history(history)
-            .tail(|_| build_director_tail(&intent, ctx));
+            .tail(|_| build_director_tail(&director_intent, ctx));
 
         // 流式：导演的输出 token 实时转成 DirectorProgress 事件
         let (director_prog_tx, mut director_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -491,7 +505,14 @@ impl PipelineOrchestrator {
             }
         };
 
-        let final_text = editor_resp.content;
+        let final_text = match apply_context_regex(
+            &editor_resp.content,
+            &ctx.regex_scripts,
+            RegexPlacement::Output,
+        ) {
+            Ok(text) => text,
+            Err(e) => return Err(self.abort_with(&event_tx, e)),
+        };
 
         let _ = event_tx.send(PipelineEvent::DraftReady {
             text: final_text.clone(),
@@ -853,6 +874,14 @@ impl PipelineOrchestrator {
                 .as_ref()
                 .map(|p| p.scene_brief.clone())
                 .unwrap_or_else(|| "重新创作".into());
+            let director_intent = match apply_context_regex(
+                &intent_text,
+                &ctx.regex_scripts,
+                RegexPlacement::Input,
+            ) {
+                Ok(text) => text,
+                Err(e) => return Err(self.abort_with(&event_tx, e)),
+            };
 
             // §22 cache 友好布局：history 排除重 roll 目标节点及之后
             let director_history = self.conv_store.recent_messages_as_chat(
@@ -864,7 +893,7 @@ impl PipelineOrchestrator {
                 .system(director_config.system_prompt.clone())
                 .history(director_history)
                 .tail(|_| {
-                    let mut t = build_director_tail(&intent_text, ctx);
+                    let mut t = build_director_tail(&director_intent, ctx);
                     if let Some(h) = hint.as_deref() {
                         let h = h.trim();
                         if !h.is_empty() {
@@ -1020,6 +1049,7 @@ impl PipelineOrchestrator {
                     &ctx.modules,
                     effective_runtime_for_prov.as_deref(),
                     ctx.agent_profile_config.as_ref(),
+                    &ctx.regex_scripts,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1065,6 +1095,7 @@ impl PipelineOrchestrator {
                     &ctx.modules,
                     ctx.campaign_runtime.as_deref(),
                     ctx.agent_profile_config.as_ref(),
+                    &ctx.regex_scripts,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1247,6 +1278,7 @@ impl PipelineOrchestrator {
                     &ctx.modules,
                     ctx.campaign_runtime.as_deref(),
                     ctx.agent_profile_config.as_ref(),
+                    &ctx.regex_scripts,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1278,6 +1310,7 @@ impl PipelineOrchestrator {
         modules: &[storyforge_domain::prompt_module::PromptModule],
         campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
         agent_profile_config: Option<&AgentProfileConfig>,
+        regex_scripts: &[RegexScript],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1333,7 +1366,14 @@ impl PipelineOrchestrator {
             }
         };
 
-        let final_text = editor_resp.content;
+        let final_text = match apply_context_regex(
+            &editor_resp.content,
+            regex_scripts,
+            RegexPlacement::Output,
+        ) {
+            Ok(text) => text,
+            Err(e) => return Err(self.abort_with(&event_tx, e)),
+        };
         let _ = event_tx.send(PipelineEvent::DraftReady {
             text: final_text.clone(),
         });
@@ -1392,6 +1432,14 @@ impl PipelineOrchestrator {
 /// 这部分内容整个会话稳定（不随每轮变化），移进 system 段以最大化 cache 命中。
 /// 蓝灯常驻条目（LoreRoute::Constant/Both）按 depth 升序排列
 ///（depth 小的靠后=更受重视，对齐 ST 近因效应语义）。
+fn apply_context_regex(
+    text: &str,
+    scripts: &[RegexScript],
+    placement: RegexPlacement,
+) -> Result<String, PipelineError> {
+    apply_regex_scripts(text, scripts, placement).map_err(|e| PipelineError::Regex(e.to_string()))
+}
+
 fn build_director_system_extra(ctx: &WritingContext) -> String {
     let Some(book) = &ctx.world_info else {
         return String::new();
@@ -1907,6 +1955,7 @@ mod tests {
     use std::path::PathBuf;
     use storyforge_domain::Source;
     use storyforge_domain::character::Character;
+    use storyforge_domain::preset::{RegexPlacement, RegexScript, RegexScriptSource};
     use storyforge_infra_llm::mock_client::MockLlmClient;
 
     /// 构造最小 mock 角色卡（满足 characters 非空校验）
@@ -1932,6 +1981,34 @@ mod tests {
             spec_version: "3.0".into(),
             raw_card_json: serde_json::json!({}),
         })
+    }
+
+    /// 构造最小 mock regex script（测试流水线执行顺序用）
+    fn mock_regex_script(
+        name: &str,
+        find_regex: &str,
+        replace_string: &str,
+        placement: RegexPlacement,
+    ) -> RegexScript {
+        RegexScript {
+            id: format!("test-{name}"),
+            script_name: name.to_string(),
+            find_regex: find_regex.to_string(),
+            replace_string: replace_string.to_string(),
+            placement,
+            placement_codes: vec![2],
+            source: RegexScriptSource::Scoped,
+            disabled: false,
+            flags: String::new(),
+            only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
+        }
     }
 
     /// 集成测试：用 MockLlmClient 跑完整 Director → Subagent → Editor 闭环
@@ -2038,6 +2115,52 @@ mod tests {
     }
 
     /// 辅助：构造一个带 mock 的 orchestrator + 对话，并先跑一次 start_writing
+    #[tokio::test]
+    async fn test_output_regex_applies_before_commit() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_output_regex_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        });
+
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
+        let mut ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conv_store.create(None, None).id,
+        );
+        ctx.regex_scripts = vec![mock_regex_script(
+            "replace-all-output",
+            r"[\s\S]+",
+            "REGEX_FILTERED_DRAFT",
+            RegexPlacement::Output,
+        )];
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (text, node_id, _provenance) = orchestrator
+            .start_writing("write a scene".into(), &ctx, event_tx, cancel_rx)
+            .await
+            .expect("pipeline should succeed with output regex");
+
+        assert_eq!(text, "REGEX_FILTERED_DRAFT");
+        let conv = conv_store.get(&ctx.conversation_id).unwrap();
+        let node = conv.find_node(&node_id).unwrap();
+        assert_eq!(node.active().unwrap().content, "REGEX_FILTERED_DRAFT");
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
     async fn setup_with_first_draft() -> (
         PipelineOrchestrator,
         Arc<ConversationStore>,
@@ -2109,6 +2232,42 @@ mod tests {
         assert_eq!(node_after.variants.len(), variants_before + 1);
         // active 切到新 variant
         assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_output_regex_applies_before_variant() {
+        let (mut orchestrator, conv_store, conv_id, node_id, conv_dir) =
+            setup_with_first_draft().await;
+
+        let req = RegenerateRequest {
+            conversation_id: conv_id.clone(),
+            node_id: node_id.clone(),
+            targets: vec![PartialRollTarget::Editor],
+            hint: None,
+            seed: None,
+        };
+        let mut ctx =
+            WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
+        ctx.regex_scripts = vec![mock_regex_script(
+            "replace-regenerated-output",
+            r"[\s\S]+",
+            "REGEX_FILTERED_REGEN",
+            RegexPlacement::Output,
+        )];
+        let (event_tx, _rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, _provenance) = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await
+            .expect("regenerate should succeed with output regex");
+
+        assert_eq!(text, "REGEX_FILTERED_REGEN");
+        let conv_after = conv_store.get(&conv_id).unwrap();
+        let node_after = conv_after.find_node(&node_id).unwrap();
+        assert_eq!(node_after.active().unwrap().content, "REGEX_FILTERED_REGEN");
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }

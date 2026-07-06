@@ -70,7 +70,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | V2/V3 卡字段 | ✅ 已消费 | `character.rs` |
 | character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具；Selective 触发待补 |
 | extensions 整体保留 | 🟡 已保留 | `extensions: serde_json::Value` round-trip，不消费 |
-| regex_scripts | 🟡 已建模 | `infra-regex` + `preset.regex_scripts`，流水线接入待确认 |
+| regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；legacy 选中角色卡 Scoped 脚本已跑 Input/Output |
 | alternate_greetings | 🟡 已建模 | domain 有，前端无切换 UI |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；执行器已支持 `/pattern/flags`；Global/运行时接线未完成 | **5-9 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output；Preset/Global 运行时装配和多作用域仍未完成 | **4-8 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
@@ -94,14 +94,14 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。但运行时执行仍按二元 `Input/Output` 简化枚举过滤，Global 来源读取和多作用域语义仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展。当前仍按二元 `Input/Output` 简化枚举过滤，Preset/Global 运行时装配、多作用域语义、prompt/display/depth 限制仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
 | 来源 | 存哪 | 现状 | 缺失影响 |
 |---|---|---|---|
 | Preset 脚本 | 预设 `extensions.regex_scripts` | ✅ 读 | 预设导入/存储已接通 |
-| **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | 🟡 typed 读取 + 合并 helper | `Character::scoped_regex_scripts()` 已可解析；`merge_regex_script_sources()` 已可合并，运行时尚未调用 |
+| **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | 🟡 legacy 选中卡已执行 Input/Output | `Character::scoped_regex_scripts()` 已可解析；Tauri legacy 写作从选中卡收集并注入 `WritingContext.regex_scripts`；Campaign 活动卡装配待补 |
 | Global 脚本 | `settings.json` | ❌ 不读 | 全局正则丢失 |
 
 **7 个作用域（ST placement 数值）**：
@@ -134,13 +134,13 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 
 | 子项 | 工作量 |
 |---|---|
-| 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Preset/Scoped 合并 helper 已完成；Global 配置读取待接 |
+| 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Preset/Scoped 合并 helper 已完成；legacy Scoped 运行时已接；Preset/Global 配置读取与运行时装配待接 |
 | 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
 | 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |
 | placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真，运行时语义待接 |
 | ST regex literal 解析（`/pattern/flags`）| ✅ 已完成执行器兼容 |
-| **总计** | **5-9 天** |
+| **总计** | **4-8 天** |
 
 > sprest 插件（提取预设中的正则集中管理）本身是管理工具非运行时，不需兼容。但它揭示的"正则来源合并优先级"问题必须正确实现。
 

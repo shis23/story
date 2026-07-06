@@ -122,6 +122,10 @@ impl From<storyforge_app_pipeline::PipelineError> for TauriCommandError {
                 message: msg,
                 retryable: false,
             },
+            storyforge_app_pipeline::PipelineError::Regex(msg) => Self::Pipeline {
+                message: msg,
+                retryable: false,
+            },
             storyforge_app_pipeline::PipelineError::Regenerate(msg) => Self::Pipeline {
                 message: msg,
                 retryable: true,
@@ -327,5 +331,15 @@ mod tests {
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["type"], "pipeline");
         assert_eq!(json["retryable"], true);
+    }
+
+    #[test]
+    fn pipeline_regex_error_is_not_retryable() {
+        let pipeline_err = storyforge_app_pipeline::PipelineError::Regex("bad regex".into());
+        let err = TauriCommandError::from(pipeline_err);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["type"], "pipeline");
+        assert_eq!(json["message"], "bad regex");
+        assert_eq!(json["retryable"], false);
     }
 }

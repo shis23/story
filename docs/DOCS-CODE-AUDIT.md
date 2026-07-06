@@ -234,11 +234,11 @@
 | ST-T4 | StoryForge Campaign 导出格式设计 | 已实现 | W7 `export_campaign` 命令 + JSON bundle（`format_version`）+ ST 卡 PNG tEXt 写入 + 共享 lorebook |
 | ST-T5 | 评估导出回 ST 卡/Lorebook | 已实现 | W7 评估 checkbox 已结；ST 卡 PNG + lorebook 导出已落地 |
 
-2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。当前仍只是导入保真；执行层仍按 `RegexPlacement::Input/Output` 简化过滤，Global 正则来源读取未完成。
+2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。Preset 来源当前仍只是导入保真；执行层已能消费 `WritingContext.regex_scripts`，但 Preset/Global 运行时装配未完成。
 
-2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。当前尚未把合并结果接进运行时执行链。
+2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。2026-07-06 增量：Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则注入 `WritingContext.regex_scripts`，并已通过 `CharacterInfo.extensions` 持久化卡内扩展，避免重启后丢失 scoped regex。Campaign 活动卡 Scoped 装配仍待补。
 
-2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。当前仍未把正则执行器接进写作流水线。
+2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。`crates/app-pipeline` 已接入正则执行器：首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘/返回前执行 Output 正则；当前仍未实现 ST 多作用域、prompt/display-only、depth 限制等完整运行时语义。
 
 ### Phase 6：Android（~20%）
 

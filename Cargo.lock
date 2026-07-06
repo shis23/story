@@ -3827,6 +3827,7 @@ dependencies = [
  "storyforge-domain",
  "storyforge-infra-llm",
  "storyforge-infra-plugin-host",
+ "storyforge-infra-regex",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
