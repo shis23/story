@@ -147,7 +147,7 @@
 | M-002 | `character.rs:156` | `temporary_with_overrides` 无空名验证 |
 | M-003 | `conversation.rs:87` | `active_variant` 无越界验证，腐败数据导致静默失败 |
 | M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
-| M-005 | `lib.rs:1576` | `default_variable_keys()` 硬编码 — 遗漏自定义 variable_schema |
+| M-005 | `lib.rs:1576` | ✅ 已修复：`postprocess_variable_keys()` 从 CampaignRuntimeContext 合并默认角色/全局变量、当前 Campaign 变量、定义 schema 与实例变量 |
 | M-006 | `app-pipeline:1069` | 多个 Subagent regenerate targets 只重跑第一个 |
 | M-007 | `runtime.rs:448` | `run_tool_loop_with_layout` 缺少 terminal_tools 检查 |
 | M-008 | `campaign_runtime.rs:103` | 大小写敏感名匹配 — LLM 输出不一致产生重复 |
@@ -230,7 +230,7 @@
 8. **H-006/H-007**: BaseOverlay/BaseDropdown ESC 监听器泄漏修复
 9. **H-001**: Store persist 返回 Result
 10. **M-001**: tool-call 参数解析错误反馈给 LLM
-11. **M-005**: `default_variable_keys()` 合并实际 schema
+11. **M-005**: ✅ `postprocess_variable_keys()` 已合并实际 runtime schema/value keys（2026-07-07）
 12. **M-014**: Tab 组件添加 campaignId watch
 13. **H-009**: LLM 重试逻辑（指数退避）
 14. **M-024**: ✅ patch 执行已添加事务回滚（2026-07-07）

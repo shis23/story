@@ -1920,22 +1920,7 @@ async fn start_writing(
             })
             .unwrap_or_default();
         let final_text = final_text.clone();
-        let mut var_keys = default_variable_keys();
-        // Also include custom variable_schema keys from character definitions
-        if let Some(campaign_id) = &ctx.campaign_id {
-            let store = get_campaign_store();
-            if let Some(campaign) = store.get_campaign(campaign_id)
-                && let Some(stored_card) = store.get_card(&campaign.card_id)
-            {
-                for def in &stored_card.card.character_definitions {
-                    for field in &def.variable_schema {
-                        if !var_keys.contains(&field.key) {
-                            var_keys.push(field.key.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let var_keys = postprocess_variable_keys(&ctx);
         // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
@@ -2360,6 +2345,51 @@ fn default_variable_keys() -> Vec<String> {
         .iter()
         .map(|f| f.key.clone())
         .collect()
+}
+
+/// 后处理可更新变量键。
+///
+/// 基础表提供常用角色/全局变量；CampaignRuntimeContext 提供当前卡自定义 schema、
+/// 已存在 Campaign 变量和 instance 变量，覆盖 MVU/initvar 与高玩自定义字段。
+fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_key = |key: &str| {
+        if seen.insert(key.to_string()) {
+            keys.push(key.to_string());
+        }
+    };
+
+    for key in default_variable_keys() {
+        push_key(&key);
+    }
+    for field in storyforge_domain::variables::default_campaign_variables() {
+        push_key(&field.key);
+    }
+
+    let Some(runtime) = &ctx.campaign_runtime else {
+        return keys;
+    };
+
+    for variable in &runtime.campaign.variables {
+        push_key(&variable.key);
+    }
+
+    let mut definitions: Vec<_> = runtime.definitions_by_id.values().collect();
+    definitions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    for definition in definitions {
+        for field in &definition.variable_schema {
+            push_key(&field.key);
+        }
+    }
+
+    for instance in &runtime.instances {
+        for variable in &instance.variables {
+            push_key(&variable.key);
+        }
+    }
+
+    keys
 }
 
 #[derive(Debug, Clone)]
@@ -3212,7 +3242,7 @@ async fn regenerate(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            default_variable_keys(),
+            postprocess_variable_keys(&ctx),
         );
         let (_pp_tx, pp_rx) = watch::channel(false);
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
@@ -8180,6 +8210,80 @@ mod tests {
             && task.created_turn == 3));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_postprocess_variable_keys_include_runtime_custom_schema_and_values() {
+        use std::collections::HashMap;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::variables::{
+            VariableField, VariableType, VariableValue, default_character_variables,
+        };
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        let mut campaign = Campaign::new(Id::from_str("card-keys"), "Key Campaign");
+        campaign.variables.push(VariableValue::new(
+            "alarm_level",
+            serde_json::json!("red"),
+            2,
+        ));
+
+        let mut schema = default_character_variables();
+        schema.push(VariableField {
+            key: "stress".into(),
+            label: "Stress".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(0),
+            description: None,
+            group: Some("state".into()),
+        });
+        let definition = CharacterDefinition {
+            id: Id::from_str("def-keys"),
+            card_id: Id::from_str("card-keys"),
+            name: "Lin".into(),
+            persona_prompt: String::new(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: schema,
+        };
+        let mut instance = CharacterInstance::from_definition(campaign.id.clone(), &definition);
+        instance.variables.push(VariableValue::new(
+            "temporary_flag",
+            serde_json::json!(true),
+            2,
+        ));
+        let mut definitions_by_id = HashMap::new();
+        definitions_by_id.insert(definition.id.clone(), definition);
+
+        ctx.campaign_runtime = Some(Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id,
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 2,
+        }));
+
+        let keys = postprocess_variable_keys(&ctx);
+
+        for expected in [
+            "hp",
+            "story_clock",
+            "weather",
+            "stress",
+            "alarm_level",
+            "temporary_flag",
+        ] {
+            assert!(
+                keys.contains(&expected.to_string()),
+                "missing key {expected}"
+            );
+        }
+        assert_eq!(keys.iter().filter(|key| key.as_str() == "hp").count(), 1);
     }
 
     // ─── W6 方向 1：广播分发测试 ───────────────────────────────────────────

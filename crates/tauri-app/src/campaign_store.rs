@@ -528,11 +528,9 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "sf-campaign-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "sf-campaign-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
