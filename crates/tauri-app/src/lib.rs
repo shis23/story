@@ -3952,16 +3952,25 @@ async fn accept_variant(
 ) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
-    state
-        .conv_store
-        .accept_variant(&conv_id, &nid)
+    accept_variant_async(state.inner().clone(), conv_id, nid).await
+}
+
+async fn accept_variant_async(
+    state: Arc<AppState>,
+    conv_id: Id,
+    node_id: Id,
+) -> Result<(), TauriCommandError> {
+    let conv_store = state.conv_store.clone();
+    let archive_conv_id = conv_id.clone();
+    tokio::task::spawn_blocking(move || conv_store.accept_variant(&conv_id, &node_id))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("采纳变体任务失败: {e}")))?
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
     // 自动归档检查（后台异步，不阻塞响应）
-    let state_clone = state.inner().clone();
-    let conv_id_clone = conv_id.clone();
+    let state_clone = state.clone();
     tokio::spawn(async move {
-        auto_archive_if_needed(&state_clone, &conv_id_clone).await;
+        auto_archive_if_needed(&state_clone, &archive_conv_id).await;
     });
 
     Ok(())
@@ -6995,6 +7004,40 @@ mod tests {
         let snap1 = state.snapshot_tool_ctx();
         assert_eq!(snap1.characters.len(), 1);
         assert_eq!(snap1.characters[0].name, "TestHero");
+    }
+
+    #[tokio::test]
+    async fn test_accept_variant_async_persists_final_variant() {
+        let state = Arc::new(AppState::new_for_test());
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        let node_id = state
+            .conv_store
+            .append_ai_draft(&conversation.id, "draft text".into(), None)
+            .unwrap();
+
+        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone())
+            .await
+            .unwrap();
+
+        let updated = state.conv_store.get(&conversation.id).unwrap();
+        let node = updated
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .unwrap();
+        assert_eq!(node.active().unwrap().status, VariantStatus::Final);
+
+        let reloaded = ConversationStore::new(state.data_dir.join("conversations"));
+        let persisted = reloaded.get(&conversation.id).unwrap();
+        let persisted_node = persisted
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .unwrap();
+        assert_eq!(
+            persisted_node.active().unwrap().status,
+            VariantStatus::Final
+        );
     }
 
     /// 构造测试用 Character（domain Character 无 Default）

@@ -101,7 +101,7 @@
 | H-002 | API key 明文存储 | ✅ 2026-07-06 已完成：新增 `keyring`/系统凭据库存储 + SecretRef 落盘 + 旧明文迁移；Windows Credential Manager 冒烟测试通过；Android 目标环境仍需实机验证 |
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：`WebViewMvuRuntime` 移动到 `tauri-app/src/mvu_webview_runtime.rs`，infra 只保留 trait/DTO/事件协议 |
 | H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁 + 增加并发写回回放；2026-07-07 写作/重 roll Campaign 快照读取、临时 instance 落盘、postprocess summary/knowledge/variable/task 写回已 `spawn_blocking`；剩余同步写入/后台 flush 评估 |
-| H-014 | 同步 fs 阻塞异步运行时 | 🟡 2026-07-07 已完成三个切片：`start_writing` / `regenerate` 通过 `fill_campaign_context_async` 在 `spawn_blocking` 中加载 active Campaign 与 CampaignRuntimeContext 快照；成功写作/重 roll 后的临时 instance 落盘通过 `persist_temporary_instances_async` offload；postprocess 写回通过 `persist_postprocess_outcome_async` offload。其他 store 同步写入仍待分批 |
+| H-014 | 同步 fs 阻塞异步运行时 | 🟡 2026-07-07 已完成四个切片：`start_writing` / `regenerate` 通过 `fill_campaign_context_async` 在 `spawn_blocking` 中加载 active Campaign 与 CampaignRuntimeContext 快照；成功写作/重 roll 后的临时 instance 落盘通过 `persist_temporary_instances_async` offload；postprocess 写回通过 `persist_postprocess_outcome_async` offload；`accept_variant` 的 `ConversationStore` 写盘通过 `accept_variant_async` offload。其他 store 同步写入仍待分批 |
 | M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点，`MetaPanel` 生成溯源入口可见；`frontend/tests/conversation-nodes.test.mjs` 固化选择规则 |
 | M-021 | LogStore 并发写入可能交错 | ✅ 2026-07-07 已完成：`LogStore` 增加 JSONL 落盘专用互斥锁，并发回放测试验证完整 JSON 行不丢不重 |
 | M-022 | unwrap_or(Null) ~12 处 | ✅ 2026-07-07 已完成：Tauri/日志导出用户可见 JSON 序列化失败改为结构化错误；内部固定结构不再静默回退为 Null/default |
@@ -188,7 +188,7 @@ cargo test -p storyforge-app-logging
 
 ## 剩余工作优先级
 
-1. **H-014 + H-013 剩余项**（性能基础）— 写作/重 roll Campaign 快照读取、临时 instance 落盘与 postprocess 写回已 offload；继续评估其他同步写入异步化与 CampaignStore 后台 flush
+1. **H-014 + H-013 剩余项**（性能基础）— 写作/重 roll Campaign 快照读取、临时 instance 落盘、postprocess 写回与 accept variant 写盘已 offload；继续评估其他同步写入异步化与 CampaignStore 后台 flush
 2. **H-002**（安全合规）— API key 加密
 3. **发布前压测** — LogStore/CampaignStore 长会话写入压力；M-021/M-022/M-024 已于 2026-07-07 完成
 4. **H-012**（架构）— plugin-host tauri 依赖解耦（已完成 2026-07-06）
