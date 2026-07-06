@@ -28,7 +28,7 @@ use storyforge_app_conversation::{
 };
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::mvu_runtime::MvuRuntime;
-use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target};
+use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target_at_depth};
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -1453,7 +1453,7 @@ fn apply_context_regex(
         RegexPlacement::Input => RegexExecutionTarget::Prompt,
         RegexPlacement::Output => RegexExecutionTarget::Persisted,
     };
-    apply_regex_scripts_for_target(text, scripts, placement, target)
+    apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
         .map_err(|e| PipelineError::Regex(e.to_string()))
 }
 
@@ -2262,6 +2262,22 @@ mod tests {
         .expect("display-only output regex should be skipped for persisted target");
 
         assert_eq!(result, "<data_block>hp=5</data_block>");
+    }
+
+    #[test]
+    fn test_context_regex_treats_current_message_as_depth_zero() {
+        let mut script = mock_regex_script(
+            "older-only-output",
+            r"draft",
+            "rewritten",
+            RegexPlacement::Output,
+        );
+        script.min_depth = Some(1);
+
+        let result = apply_context_regex("draft", &[script], RegexPlacement::Output)
+            .expect("current output regex should execute with depth zero");
+
+        assert_eq!(result, "draft");
     }
 
     async fn setup_with_first_draft() -> (

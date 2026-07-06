@@ -39,7 +39,7 @@ use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
-use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target};
+use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target_at_depth};
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
 };
@@ -3437,7 +3437,11 @@ fn conversation_display_dto(
         nodes: conversation
             .nodes
             .iter()
-            .map(|node| message_node_display_dto(node, &display_scripts))
+            .enumerate()
+            .map(|(index, node)| {
+                let depth = conversation.nodes.len().saturating_sub(index + 1);
+                message_node_display_dto(node, &display_scripts, depth)
+            })
             .collect(),
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
@@ -3447,6 +3451,7 @@ fn conversation_display_dto(
 fn message_node_display_dto(
     node: &MessageNode,
     display_scripts: &[RegexScript],
+    depth: usize,
 ) -> MessageNodeDisplayDto {
     MessageNodeDisplayDto {
         id: node.id.clone(),
@@ -3454,7 +3459,7 @@ fn message_node_display_dto(
         variants: node
             .variants
             .iter()
-            .map(|variant| message_variant_display_dto(variant, display_scripts))
+            .map(|variant| message_variant_display_dto(variant, display_scripts, depth))
             .collect(),
         active_variant: node.active_variant,
     }
@@ -3463,12 +3468,13 @@ fn message_node_display_dto(
 fn message_variant_display_dto(
     variant: &MessageVariant,
     display_scripts: &[RegexScript],
+    depth: usize,
 ) -> MessageVariantDisplayDto {
     MessageVariantDisplayDto {
         id: variant.id.clone(),
         role: variant.role.clone(),
         content: variant.content.clone(),
-        display_content: render_variant_display_content(variant, display_scripts),
+        display_content: render_variant_display_content(variant, display_scripts, depth),
         created_at: variant.created_at,
         status: variant.status.clone(),
         provenance: variant.provenance.clone(),
@@ -3486,16 +3492,18 @@ fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<RegexScript>
 fn render_variant_display_content(
     variant: &MessageVariant,
     display_scripts: &[RegexScript],
+    depth: usize,
 ) -> String {
     if variant.role != ConversationRole::Assistant || display_scripts.is_empty() {
         return variant.content.clone();
     }
 
-    apply_regex_scripts_for_target(
+    apply_regex_scripts_for_target_at_depth(
         &variant.content,
         display_scripts,
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
+        depth,
     )
     .unwrap_or_else(|e| {
         tracing::warn!("展示正则执行失败，使用原始消息内容: {e}");
@@ -6846,6 +6854,31 @@ mod tests {
         let variant = &dto.nodes[0].variants[0];
         assert_eq!(variant.content, "persisted bar");
         assert_eq!(variant.display_content, "persisted bar");
+    }
+
+    #[test]
+    fn test_conversation_display_dto_respects_display_regex_depth() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("<status>old</status>".into(), None);
+        conversation.append_message(
+            storyforge_domain::conversation::Role::User,
+            "continue".into(),
+        );
+        conversation.append_ai_draft("<status>new</status>".into(), None);
+
+        let mut script = test_regex_script("recent-status", RegexScriptSource::Preset);
+        script.find_regex = r"<status>(.*?)</status>".into();
+        script.replace_string = "[$1]".into();
+        script.markdown_only = Some(true);
+        script.min_depth = Some(0);
+        script.max_depth = Some(1);
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let old_variant = &dto.nodes[0].variants[0];
+        let new_variant = &dto.nodes[2].variants[0];
+        assert_eq!(old_variant.display_content, "<status>old</status>");
+        assert_eq!(new_variant.display_content, "[new]");
     }
 
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）

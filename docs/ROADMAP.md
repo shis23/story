@@ -147,6 +147,7 @@
 - **JS 变量归口**：`execute_fragment` 产出的 `variable_updates` 统一写入 campaign 级变量（`instance_id=None`）。若需按角色归属，后续需细化 key 前缀解析或扩展 `MvuExecResult` 携带 `instance_id`。
 - **JSR shim 覆盖度**：`WebViewMvuRuntime` 的 JSR/ST API shim 基于常用子集实现，依赖冷门 API 的重 DOM 卡可能降级为跳过 JS 更新（`tracing::warn!` + 执行失败/超时回退），不影响主写作。
 - **Regex display-only 渲染**：`infra-regex` 已区分 Prompt/Persisted/Display 目标，`promptOnly` 不再改显示/存储、`markdownOnly` 不再污染 prompt/持久化；Display 目标已接到消息展示 DTO 与前端渲染层，PluginHost/HTML 渲染仍待接。
+- **Regex depth 过滤**：`minDepth/maxDepth` 已在执行器生效；当前轮 Input/Output 按 depth 0，消息展示按离末尾深度执行 display-only 正则。
 - **Prompt Template 宏覆盖度**：legacy 单卡 system prompt 已执行确定性核心宏（角色卡字段、`<user>/<bot>`、本地 `setvar/addvar/getvar/trim/comment`）；Campaign 多角色下没有唯一 `{{char}}` 时会跳过渲染。动态时间、随机、roll 和跨轮/Campaign 变量宏仍是后续兼容项。
 
 ## Phase 6: Android 打磨

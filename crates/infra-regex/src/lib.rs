@@ -47,6 +47,20 @@ pub fn apply_regex_scripts_for_target(
     placement: RegexPlacement,
     target: RegexExecutionTarget,
 ) -> Result<String, RegexError> {
+    apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
+}
+
+/// Apply regex scripts for a concrete execution target and chat depth.
+///
+/// ST depth is counted from the newest chat message: depth 0 is the current /
+/// latest message, depth 1 is one message older, and so on.
+pub fn apply_regex_scripts_for_target_at_depth(
+    text: &str,
+    scripts: &[RegexScript],
+    placement: RegexPlacement,
+    target: RegexExecutionTarget,
+    depth: usize,
+) -> Result<String, RegexError> {
     let mut result = text.to_string();
 
     for script in scripts {
@@ -57,6 +71,9 @@ pub fn apply_regex_scripts_for_target(
             continue;
         }
         if !script_applies_to_target(script, target) {
+            continue;
+        }
+        if !script_applies_to_depth(script, depth) {
             continue;
         }
 
@@ -174,6 +191,30 @@ fn script_applies_to_target(script: &RegexScript, target: RegexExecutionTarget) 
     if script.markdown_only.unwrap_or(false) {
         return target == RegexExecutionTarget::Display;
     }
+    true
+}
+
+fn script_applies_to_depth(script: &RegexScript, depth: usize) -> bool {
+    let depth = i32::try_from(depth).unwrap_or(i32::MAX);
+    let min = script.min_depth.filter(|value| *value >= 0);
+    let max = script.max_depth.filter(|value| *value >= 0);
+
+    if let (Some(min), Some(max)) = (min, max)
+        && max < min
+    {
+        return false;
+    }
+    if let Some(min) = min
+        && depth < min
+    {
+        return false;
+    }
+    if let Some(max) = max
+        && depth > max
+    {
+        return false;
+    }
+
     true
 }
 
@@ -400,6 +441,69 @@ mod tests {
         assert_eq!(display, "STATUS");
         assert_eq!(prompt, "<data_block>hp=5</data_block>");
         assert_eq!(persisted, "<data_block>hp=5</data_block>");
+    }
+
+    #[test]
+    fn test_depth_limited_script_applies_only_inside_inclusive_range() {
+        let mut script = make_script("depth-limited", r"foo", "bar", RegexPlacement::Output);
+        script.min_depth = Some(1);
+        script.max_depth = Some(2);
+
+        let recent = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script.clone()],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+            0,
+        )
+        .unwrap();
+        let min = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script.clone()],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+            1,
+        )
+        .unwrap();
+        let max = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script.clone()],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+            2,
+        )
+        .unwrap();
+        let older = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(recent, "foo");
+        assert_eq!(min, "bar");
+        assert_eq!(max, "bar");
+        assert_eq!(older, "foo");
+    }
+
+    #[test]
+    fn test_negative_depth_bounds_are_unlimited() {
+        let mut script = make_script("unlimited-depth", r"foo", "bar", RegexPlacement::Output);
+        script.min_depth = Some(-1);
+        script.max_depth = Some(-1);
+
+        let result = apply_regex_scripts_for_target_at_depth(
+            "foo",
+            &[script],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+            99,
+        )
+        .unwrap();
+
+        assert_eq!(result, "bar");
     }
 
     #[test]
