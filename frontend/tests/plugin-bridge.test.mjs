@@ -1,6 +1,43 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mapPipelineEventToPluginEvents } from '../src/plugin-bridge.js'
+import vm from 'node:vm'
+import {
+  generateBridgeScript,
+  mapPipelineEventToPluginEvents,
+  ST_EVENT_TYPES,
+} from '../src/plugin-bridge.js'
+
+function createBridgeSandbox(pluginId = 'plugin-a') {
+  const listeners = {}
+  const postedMessages = []
+  const storage = new Map()
+  const window = {
+    addEventListener: (name, callback) => {
+      listeners[name] = callback
+    },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
+    console,
+  }
+  const sandbox = {
+    window,
+    parent: {
+      postMessage: (message) => postedMessages.push(message),
+    },
+    localStorage: window.localStorage,
+    console,
+  }
+  sandbox.globalThis = sandbox
+
+  const script = generateBridgeScript(pluginId)
+    .replace(/^<script>\n?/, '')
+    .replace(/\n?<\/script>$/, '')
+  vm.runInNewContext(script, sandbox)
+
+  return { window, listeners, postedMessages }
+}
 
 test('maps pipeline events to native plugin event names', () => {
   const rawEvent = { event_type: 'director_started', data: {} }
@@ -53,4 +90,64 @@ test('adds STREAM_TOKEN alias with token payload for editor deltas', () => {
 test('ignores malformed pipeline events', () => {
   assert.deepEqual(mapPipelineEventToPluginEvents(null), [])
   assert.deepEqual(mapPipelineEventToPluginEvents({ data: {} }), [])
+})
+
+test('injects SillyTavern event type aliases into plugin iframe', () => {
+  const { window } = createBridgeSandbox()
+
+  assert.equal(ST_EVENT_TYPES.GENERATION_STARTED, 'GENERATION_STARTED')
+  assert.equal(window.event_types.GENERATION_STARTED, 'GENERATION_STARTED')
+  assert.equal(window.eventTypes.MESSAGE_RECEIVED, 'MESSAGE_RECEIVED')
+  assert.equal(window.eventSource.on, window.storyforge.events.on)
+})
+
+test('dispatches host events through storyforge.events and ST eventSource', () => {
+  const { window, listeners } = createBridgeSandbox()
+  const calls = []
+
+  window.storyforge.events.on('GENERATION_STARTED', (payload) => calls.push(['storyforge', payload.session_id]))
+  window.eventSource.on(window.event_types.GENERATION_STARTED, (payload) => calls.push(['st', payload.session_id]))
+
+  listeners.message({
+    data: {
+      type: 'sf:api:event',
+      event: 'GENERATION_STARTED',
+      data: { session_id: 's1' },
+    },
+  })
+
+  assert.deepEqual(calls, [
+    ['storyforge', 's1'],
+    ['st', 's1'],
+  ])
+})
+
+test('supports ST once, makeFirst, makeLast, removeListener, and local emit', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+  const first = () => calls.push('first')
+  const middle = () => calls.push('middle')
+  const removed = () => calls.push('removed')
+  const last = () => calls.push('last')
+  const once = () => calls.push('once')
+
+  window.eventSource.on('CHAT_CHANGED', middle)
+  window.eventSource.on('CHAT_CHANGED', removed)
+  window.eventSource.makeFirst('CHAT_CHANGED', first)
+  window.eventSource.makeLast('CHAT_CHANGED', last)
+  window.eventSource.once('CHAT_CHANGED', once)
+  window.eventSource.removeListener('CHAT_CHANGED', removed)
+
+  window.eventSource.emit('CHAT_CHANGED', { id: 1 })
+  window.eventSource.emit('CHAT_CHANGED', { id: 2 })
+
+  assert.deepEqual(calls, [
+    'first',
+    'middle',
+    'last',
+    'once',
+    'first',
+    'middle',
+    'last',
+  ])
 })

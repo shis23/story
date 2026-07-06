@@ -12,6 +12,39 @@ export const MSG_RESPONSE = 'sf:api:response'
 export const MSG_EVENT = 'sf:api:event'
 export const MSG_MOUNT = 'sf:ui:mount'
 
+export const ST_EVENT_TYPES = Object.freeze({
+  APP_READY: 'APP_READY',
+  CHAT_CHANGED: 'CHAT_CHANGED',
+  CHAT_LOADED: 'CHAT_LOADED',
+  MESSAGE_RECEIVED: 'MESSAGE_RECEIVED',
+  MESSAGE_SENT: 'MESSAGE_SENT',
+  MESSAGE_UPDATED: 'MESSAGE_UPDATED',
+  MESSAGE_DELETED: 'MESSAGE_DELETED',
+  MESSAGE_SWIPED: 'MESSAGE_SWIPED',
+  GENERATION_STARTED: 'GENERATION_STARTED',
+  GENERATION_STOPPED: 'GENERATION_STOPPED',
+  GENERATION_ENDED: 'GENERATION_ENDED',
+  STREAM_TOKEN: 'STREAM_TOKEN',
+  CHARACTER_LOADED: 'CHARACTER_LOADED',
+  CHARACTER_MESSAGE_RENDERED: 'CHARACTER_MESSAGE_RENDERED',
+  USER_MESSAGE_RENDERED: 'USER_MESSAGE_RENDERED',
+  WORLDINFO_SETTINGS_UPDATED: 'WORLDINFO_SETTINGS_UPDATED',
+  WORLDINFO_UPDATED: 'WORLDINFO_UPDATED',
+  WORLDINFO_FORCE_ACTIVATE: 'WORLDINFO_FORCE_ACTIVATE',
+  GENERATE_BEFORE_COMBINE_PROMPTS: 'GENERATE_BEFORE_COMBINE_PROMPTS',
+  GENERATE_AFTER_COMBINE_PROMPTS: 'GENERATE_AFTER_COMBINE_PROMPTS',
+  CHAT_COMPLETION_PROMPT_READY: 'CHAT_COMPLETION_PROMPT_READY',
+  TOOL_CALLS_PERFORMED: 'TOOL_CALLS_PERFORMED',
+  TOOL_CALLS_RENDERED: 'TOOL_CALLS_RENDERED',
+  GROUP_UPDATED: 'GROUP_UPDATED',
+  GROUP_MEMBER_DRAFTED: 'GROUP_MEMBER_DRAFTED',
+  GROUP_WRAPPER_FINISHED: 'GROUP_WRAPPER_FINISHED',
+  SETTINGS_LOADED: 'SETTINGS_LOADED',
+  SETTINGS_UPDATED: 'SETTINGS_UPDATED',
+  EXTENSION_SETTINGS_LOADED: 'EXTENSION_SETTINGS_LOADED',
+  EXTENSIONS_FIRST_LOAD: 'EXTENSIONS_FIRST_LOAD',
+})
+
 const ST_EVENT_ALIASES = {
   started: ['GENERATION_STARTED'],
   editor_progress: ['STREAM_TOKEN'],
@@ -96,6 +129,64 @@ export function generateBridgeScript(pluginId) {
 (function() {
   let _reqId = 0;
   const _callbacks = {};
+  const _eventTypes = ${JSON.stringify(ST_EVENT_TYPES)};
+  const _eventListeners = {};
+
+  function _listenerList(eventName) {
+    if (!_eventListeners[eventName]) {
+      _eventListeners[eventName] = [];
+    }
+    return _eventListeners[eventName];
+  }
+
+  function _off(eventName, callback) {
+    const listeners = _eventListeners[eventName];
+    if (!listeners) return;
+    const index = listeners.indexOf(callback);
+    if (index >= 0) listeners.splice(index, 1);
+  }
+
+  function _on(eventName, callback) {
+    if (typeof callback !== 'function') return function() {};
+    _listenerList(eventName).push(callback);
+    return function() { _off(eventName, callback); };
+  }
+
+  function _once(eventName, callback) {
+    if (typeof callback !== 'function') return function() {};
+    function wrapped() {
+      _off(eventName, wrapped);
+      callback.apply(null, arguments);
+    }
+    return _on(eventName, wrapped);
+  }
+
+  function _makeFirst(eventName, callback) {
+    if (typeof callback !== 'function') return function() {};
+    _off(eventName, callback);
+    _listenerList(eventName).unshift(callback);
+    return function() { _off(eventName, callback); };
+  }
+
+  function _makeLast(eventName, callback) {
+    if (typeof callback !== 'function') return function() {};
+    _off(eventName, callback);
+    _listenerList(eventName).push(callback);
+    return function() { _off(eventName, callback); };
+  }
+
+  function _dispatch(eventName) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const listeners = (_eventListeners[eventName] || []).slice();
+    listeners.forEach(function(fn) {
+      try { fn.apply(null, args); } catch(err) { console.error(err); }
+    });
+  }
+
+  function _emit(eventName) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    _dispatch.apply(null, [eventName].concat(args));
+  }
 
   window.storyforge = {
     pluginId: ${JSON.stringify(pluginId)},
@@ -139,14 +230,27 @@ export function generateBridgeScript(pluginId) {
     },
 
     events: {
-      _listeners: {},
-      on: (eventName, callback) => {
-        if (!window.storyforge.events._listeners[eventName]) {
-          window.storyforge.events._listeners[eventName] = [];
-        }
-        window.storyforge.events._listeners[eventName].push(callback);
-      },
+      _listeners: _eventListeners,
+      on: _on,
+      once: _once,
+      off: _off,
+      removeListener: _off,
+      makeFirst: _makeFirst,
+      makeLast: _makeLast,
+      emit: _emit,
     },
+  };
+
+  window.event_types = _eventTypes;
+  window.eventTypes = _eventTypes;
+  window.eventSource = {
+    on: _on,
+    once: _once,
+    makeFirst: _makeFirst,
+    makeLast: _makeLast,
+    removeListener: _off,
+    off: _off,
+    emit: _emit,
   };
 
   function _call(method, params) {
@@ -178,8 +282,7 @@ export function generateBridgeScript(pluginId) {
     }
     // 事件分发
     if (e.data && e.data.type === '${MSG_EVENT}') {
-      const listeners = window.storyforge.events._listeners[e.data.event] || [];
-      listeners.forEach(fn => { try { fn(e.data.data); } catch(err) { console.error(err); } });
+      _dispatch(e.data.event, e.data.data);
     }
   });
 

@@ -15,7 +15,7 @@ StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略
 
 **关键修正**（通读代码后纠正的早期判断）：
 - ❌ 早期判断"前端无插件接口" → ✅ 实际 `plugin-bridge.js` 已有完整的 `window.storyforge` API（权限/存储/UI槽/事件）
-- ❌ 早期判断"无事件总线" → ✅ 实际前端已有事件分发；2026-07-07 已把主生成链 `PipelineEvent` 桥到插件 iframe，缺的是 ST 全量事件与 prompt hooks
+- ❌ 早期判断"无事件总线" → ✅ 实际前端已有事件分发；2026-07-07 已把主生成链 `PipelineEvent` 桥到插件 iframe，并注入 ST 风格 `eventSource`/`event_types` shim；缺的是 ST 全量事件真实 emit 与 prompt hooks
 - ❌ 早期判断"prompt 组装是哲学冲突" → ✅ 实际 `assemble_system_prompt` 已是结构化注入系统，只是未 emit
 - ❌ 早期判断"原生渲染不可行" → 部分修正：状态栏原生可行（已有 `MvuStatusBar.vue`），复杂 DOM 应用走 iframe 兜底
 
@@ -75,7 +75,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
 | ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；Campaign 变量可从当前快照读取，单实例保留无前缀兼容，多角色支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，并保留歧义唯一角色宏 |
-| ST 事件总线 | 🟡 主链已接 | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；ST 99 事件全集与 prompt 组装钩子仍未全量兼容 |
+| ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法；ST 99 事件全集真实 emit 与 prompt 组装钩子仍未全量兼容 |
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
 | 插件 API（window.storyforge）| ✅ 已有 | 8 方法 + 权限 + UI 槽 + 事件 |
 
@@ -87,7 +87,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；Campaign 变量宏已接当前快照，单实例保留旧兼容，多角色已有明确 scope 读取；剩余主要是更冷门 ST 宏和 PluginHost/HTML 路径联动 | 0.5-1 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
-| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe；剩余是 ST 全量 event_types、prompt 组装钩子和更多宿主动作 emit | 核心已完成，兼容层待补 |
+| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe，并提供 ST 风格 `eventSource`/`event_types` 前端 shim；剩余是 ST 全量事件的真实触发点、prompt 组装钩子和更多宿主动作 emit | 核心已完成，兼容层待补 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | ✅ 已接入确定性关键词扫描 | Director tail 注入命中绿灯/Both；secondary AND/OR/NOT 已覆盖，ST depth/position 细语义继续归入后续兼容 |
 | 8 | H-012 trait 抽象 | ✅ 已完成：`infra-plugin-host` 不再依赖 tauri | Tauri/WebView adapter 已移动到 `tauri-app/src/mvu_webview_runtime.rs` |
