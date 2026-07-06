@@ -163,7 +163,7 @@ test('dispatches host events through storyforge.events and ST eventSource', () =
   ])
 })
 
-test('supports ST once, makeFirst, makeLast, removeListener, and local emit', () => {
+test('supports ST once, makeFirst, makeLast, removeListener, and local emit', async () => {
   const { window } = createBridgeSandbox()
   const calls = []
   const first = () => calls.push('first')
@@ -179,8 +179,8 @@ test('supports ST once, makeFirst, makeLast, removeListener, and local emit', ()
   window.eventSource.once('CHAT_CHANGED', once)
   window.eventSource.removeListener('CHAT_CHANGED', removed)
 
-  window.eventSource.emit('CHAT_CHANGED', { id: 1 })
-  window.eventSource.emit('CHAT_CHANGED', { id: 2 })
+  await window.eventSource.emit('CHAT_CHANGED', { id: 1 })
+  await window.eventSource.emit('CHAT_CHANGED', { id: 2 })
 
   assert.deepEqual(calls, [
     'first',
@@ -191,4 +191,39 @@ test('supports ST once, makeFirst, makeLast, removeListener, and local emit', ()
     'middle',
     'last',
   ])
+})
+
+test('awaits async listeners during ST emit in listener order', async () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', async () => {
+    calls.push('first-start')
+    await Promise.resolve()
+    calls.push('first-end')
+  })
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', () => {
+    calls.push('second')
+  })
+
+  await window.eventSource.emit('CHAT_COMPLETION_PROMPT_READY', { prompt: 'draft' })
+
+  assert.deepEqual(calls, ['first-start', 'first-end', 'second'])
+})
+
+test('supports ST emitAndWait with listener mutation', () => {
+  const { window } = createBridgeSandbox()
+  const payload = { prompt: 'base' }
+
+  window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', (eventPayload) => {
+    eventPayload.prompt += ' + first'
+  })
+  window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', (eventPayload) => {
+    eventPayload.prompt += ' + second'
+  })
+
+  const result = window.eventSource.emitAndWait('GENERATE_BEFORE_COMBINE_PROMPTS', payload)
+
+  assert.equal(payload.prompt, 'base + first + second')
+  assert.equal(result, undefined)
 })

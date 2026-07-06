@@ -179,7 +179,7 @@ export function generateBridgeScript(pluginId) {
     if (typeof callback !== 'function') return function() {};
     function wrapped() {
       _off(eventName, wrapped);
-      callback.apply(null, arguments);
+      return callback.apply(null, arguments);
     }
     return _on(eventName, wrapped);
   }
@@ -206,9 +206,24 @@ export function generateBridgeScript(pluginId) {
     });
   }
 
-  function _emit(eventName) {
+  async function _emit(eventName) {
     const args = Array.prototype.slice.call(arguments, 1);
-    _dispatch.apply(null, [eventName].concat(args));
+    const listeners = (_eventListeners[eventName] || []).slice();
+    for (let i = 0; i < listeners.length; i++) {
+      try {
+        await listeners[i].apply(null, args);
+      } catch(err) {
+        console.error(err);
+      }
+    }
+  }
+
+  function _emitAndWait(eventName) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const listeners = (_eventListeners[eventName] || []).slice();
+    listeners.forEach(function(fn) {
+      fn.apply(null, args);
+    });
   }
 
   window.storyforge = {
@@ -261,6 +276,7 @@ export function generateBridgeScript(pluginId) {
       makeFirst: _makeFirst,
       makeLast: _makeLast,
       emit: _emit,
+      emitAndWait: _emitAndWait,
     },
   };
 
@@ -274,6 +290,7 @@ export function generateBridgeScript(pluginId) {
     removeListener: _off,
     off: _off,
     emit: _emit,
+    emitAndWait: _emitAndWait,
   };
 
   function _call(method, params) {
