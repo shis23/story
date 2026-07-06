@@ -159,7 +159,7 @@
 | M-014 | 多个 Tab 组件 | 无 campaignId watch — 切换 Campaign 时数据过期 |
 | M-015 | `BaseOverlay.vue:95` | body overflow 多实例冲突 — 一个关闭解锁所有 |
 | M-016 | `connection_store.rs:108` | 唯一原始 `.lock().unwrap()` — 毒锁崩溃 |
-| M-017 | `archiver.rs:223` | 硬编码 "deepseek-chat" 模型名 |
+| M-017 | `archiver.rs:223` | ✅ 已修复：归档器从调用方传入模型名，`archive_batch_uses_supplied_model` 固化不再硬编码 `"deepseek-chat"` |
 | M-018 | `embedder.rs:119` | 非数值 JSON 静默转为 0.0 — 损坏 embedding |
 | M-019 | `sse.rs:175` | 接收端断开后 SSE 继续处理完整流 |
 | M-020 | `lib.rs:287` | 日志写入 `writeln!` 结果被丢弃 |

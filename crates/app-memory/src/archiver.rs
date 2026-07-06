@@ -310,6 +310,37 @@ pub enum MemoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmError, StreamChunk};
+    use storyforge_infra_llm::LlmClient;
+    use tokio::sync::{mpsc, watch};
+
+    struct RecordingLlm {
+        seen_model: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for RecordingLlm {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            *self.seen_model.lock().unwrap() = Some(req.model.clone());
+            Ok(ChatResponse {
+                content: "archived memory summary".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            _tx: mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            self.chat(req).await
+        }
+    }
 
     #[test]
     fn test_extract_keywords() {
@@ -326,5 +357,28 @@ mod tests {
         let config = ArchiveConfig::default();
         assert_eq!(config.threshold, 50);
         assert_eq!(config.max_concurrency, 3);
+    }
+
+    #[tokio::test]
+    async fn archive_batch_uses_supplied_model() {
+        let seen_model = Arc::new(Mutex::new(None));
+        let llm = RecordingLlm {
+            seen_model: seen_model.clone(),
+        };
+
+        let (summary, _) = archive_batch(
+            &llm,
+            &["first older message", "second older message"],
+            512,
+            "custom-archive-model",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary, "archived memory summary");
+        assert_eq!(
+            seen_model.lock().unwrap().as_deref(),
+            Some("custom-archive-model")
+        );
     }
 }
