@@ -2,7 +2,7 @@
 
 > 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量、存储错误处理和测试隔离同步）
 > 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
-> 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、release checklist 初版。
+> 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、集合级锁拆分、release checklist 初版。
 
 ## 结论
 
@@ -11,6 +11,7 @@
 - Campaign 数据模型已经存在；开 Campaign 时写作流水线已通过 `CampaignRuntimeContext` 消费 instances / definitions / knowledge，未开 Campaign 时继续 fallback 到扁平 `Character`。
 - `CampaignStore` 位于 `tauri-app`，下层 `app-agent` / `app-pipeline` 不应直接依赖它。
 - `CampaignStore` 写入 API 已返回 `Result`；Tauri 命令路径会向前端返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning 而不中断当前写作。
+- `CampaignStore` 已从单个全局缓存 Mutex 拆为 cards/campaigns/instances/knowledge/tasks/summaries/mvu 集合级锁；新增并发写回回放测试覆盖跨集合写入后重载一致性。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
 - Meta、MVU、Android、前端计划多数是基于已有雏形的后续计划，不是当前已完成能力。
 - 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。

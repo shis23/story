@@ -100,7 +100,7 @@
 |----|------|----------|
 | H-002 | API key 明文存储 | 需添加 `keyring` crate 依赖 + OS 密钥链集成 + 数据迁移策略 |
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：`WebViewMvuRuntime` 移动到 `tauri-app/src/mvu_webview_runtime.rs`，infra 只保留 trait/DTO/事件协议 |
-| H-013 | CampaignStore 持锁做 7 次写入 | 需 clone-then-write 重构 + 审计所有持锁路径 |
+| H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁 + 增加并发写回回放；剩余同步 I/O/后台 flush 评估 |
 | H-014 | 同步 fs 阻塞异步运行时 | `fill_campaign_context` 需重构为 `spawn_blocking` 模式，涉及调用链变更 |
 | M-012 | lastConversationNode 从未传入 | 需设计 explain generation 完整流程 |
 | M-021 | LogStore 并发写入可能交错 | 小 JSONL 文件实际风险极低 |
@@ -171,7 +171,7 @@ npm run build
 
 ## 剩余工作优先级
 
-1. **H-013 + H-014**（性能基础）— CampaignStore 锁优化 + 异步 I/O
+1. **H-014 + H-013 剩余项**（性能基础）— 同步 I/O 异步化、CampaignStore 后台 flush 评估；H-013 集合级锁已完成
 2. **H-002**（安全合规）— API key 加密
 3. **M-022 + M-024**（健壮性）— 序列化日志 + patch 回滚
 4. **H-012**（架构）— plugin-host tauri 依赖解耦（已完成 2026-07-06）

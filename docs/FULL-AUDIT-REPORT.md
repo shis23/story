@@ -35,7 +35,7 @@
 - **文件**: `crates/tauri-app/src/campaign_store.rs:499`, `crates/tauri-app/src/storage.rs:228`, `crates/tauri-app/src/connection_store.rs:166`, `crates/tauri-app/src/preset_store.rs`
 - **问题**: `CampaignStore::save_campaign`, `add_instance`, `add_knowledge` 等所有 CRUD 方法返回 `()`。`persist()` 调用 `atomic_write_json` 失败时只记录日志，不传播错误。磁盘满或权限错误时用户以为保存成功，实际数据丢失。
 - **修复**: 使 `persist()` 返回 `Result`，调用者传播错误。
-- **当前状态（2026-07-06）**: `CampaignStore`、`CharacterStore`、`ConnectionStore` 等写入路径已改为返回 `Result`；主要 Tauri 命令会返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning。剩余风险转为性能/锁持有时间问题，见 H-013/H-014。
+- **当前状态（2026-07-06）**: `CampaignStore`、`CharacterStore`、`ConnectionStore` 等写入路径已改为返回 `Result`；主要 Tauri 命令会返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning。`CampaignStore` 单 Mutex 已拆为集合级锁；剩余风险转为同步 I/O 性能问题，见 H-013/H-014。
 - **置信度**: R4 双盲 ✅✅ + R6 验证确认
 
 ### H-002: API key 明文存储
@@ -115,12 +115,12 @@
 - **修复**: 已将 `WebViewMvuRuntime` 移入 `tauri-app` adapter，`infra-plugin-host` 只保留 `MvuRuntime` trait/DTO/事件协议。
 - **置信度**: R5 单次确认
 
-### H-013: CampaignStore 持锁做 7 次文件写入
+### H-013: CampaignStore 曾持锁做 7 次文件写入（部分修复 2026-07-06）
 
 - **文件**: `crates/tauri-app/src/campaign_store.rs:148-186`
-- **问题**: `delete_card` 在 Mutex 锁内顺序执行 7 次 `persist()` 文件写入。所有并发读者被阻塞数百毫秒。
-- **修复**: 先 clone 数据，释放锁，再写入。
-- **置信度**: R3 双盲 ✅✅ + R5 确认
+- **问题**: `delete_card` 过去在单个 Mutex 锁内顺序执行 7 次 `persist()` 文件写入，所有并发读者会被阻塞。当前已拆为集合级锁，普通跨集合读写不再共享同一把锁；级联删除仍会按固定顺序持有受影响集合锁并同步写盘。
+- **修复**: 已完成集合级锁拆分，并增加并发写回回放测试覆盖跨集合写入后重载一致性。剩余工作是压测同步 JSON I/O，并评估后台 flush / `spawn_blocking`。
+- **置信度**: R5 单次确认 + 并发回放测试
 
 ### H-014: 同步 `std::fs` 调用阻塞 tokio 异步运行时
 
@@ -237,7 +237,7 @@
 ### Major Restructure（> 4 小时/项）
 
 15. **H-014**: 全量同步 I/O 替换为异步
-16. **H-013**: CampaignStore 持久化从锁内移出
+16. **H-013 剩余项**: CampaignStore 后台 flush / 异步 I/O 评估（集合级锁已完成）
 17. **H-002**: API key 加密存储
 18. **H-012**: infra-plugin-host 移除直接 Tauri 依赖（已完成 2026-07-06）
 19. **R3 Top5**: CampaignRuntimeContext / ToolContext 大对象改为 Arc 共享

@@ -203,7 +203,7 @@ Layer 1: Meta Agent 复刻
 |---|---|---|---|---|
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 已修复 | ✅ 已修复 | 2026-07-06 已拆 adapter |
 | H-002 | API key 明文存储 | 否 | 🔴 是 | S4 |
-| H-013 | CampaignStore 单 Mutex + 同步 JSON I/O | 否 | 🟡 中 | S4（写入错误传播已完成，性能压测/拆分待做） |
+| H-013 | CampaignStore 集合级锁 + 同步 JSON I/O | 否 | 🟡 中 | S4（单 Mutex 已拆，剩余性能压测/后台 flush 待做） |
 | H-014 | 同步 fs 阻塞 tokio | 否 | 🟡 中 | S4 |
 | M-012 | lastConversationNode 未传入 | 🟡 影响 Meta | 否 | S3 后 |
 | M-024 | patch 事务回滚 | 🟡 影响 Meta | 否 | S3 后 |
@@ -272,7 +272,7 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 
 #### S4：Android 前置债务（5-7 天）
 - H-002 API key → keyring
-- H-013 CampaignStore 写入性能压测；必要时 clone-then-write / 后台 flush
+- H-013 CampaignStore 写入性能压测；集合级锁已完成，必要时继续做后台 flush / `spawn_blocking`
 - H-014 同步 fs → spawn_blocking
 - **完成定义**：4 项技术债关闭，test 全绿
 

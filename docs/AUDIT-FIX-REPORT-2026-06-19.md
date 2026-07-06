@@ -148,7 +148,7 @@
 | H-010 | Tauri 命令错误扁平化为 String | 需定义前端错误处理体系 |
 | H-011 | 损坏 JSON 静默返回空 | 需设计用户通知/恢复 UI |
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 2026-07-06 已完成：Tauri/WebView adapter 移至 `tauri-app/src/mvu_webview_runtime.rs` |
-| H-013 | CampaignStore 持锁做 7 次写入 | 需 clone-then-write 重构 |
+| H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁；剩余同步 I/O/后台 flush 评估 |
 | H-014 | 同步 fs 阻塞异步运行时 | 需全量 store 接口变更 |
 | M-003 | active_variant 无边界检查 | 需设计数据修复策略 |
 | M-009 | postMessage 用 '*' origin | Tauri 内无跨域风险 |
@@ -228,4 +228,4 @@ npm run build
 2. **H-001（Store persist 返回 Result）** — 数据安全基础
 3. **H-011（损坏 JSON 不静默返回空）** — 配合 H-001 一起做
 4. **H-002（API key 加密）** — 安全合规
-5. **H-013 + H-014（锁优化 + 异步 I/O）** — 性能基础
+5. **H-014 + H-013 剩余项（异步 I/O + 后台 flush）** — 性能基础；H-013 集合级锁已完成

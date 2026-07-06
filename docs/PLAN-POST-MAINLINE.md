@@ -137,7 +137,7 @@
    - app 重启后恢复 active Campaign。
 6. 技术债闸门：
    - `CampaignStore` 写入错误已改为 `Result` 并在 Tauri 命令路径传播；postprocess 后台写回失败会记录 warning。
-   - 仍需对 `CampaignStore` 做一次长任务/连续写回压测，记录单 Mutex + JSON I/O 的锁持有时间和 UI 可感知卡顿。
+   - `CampaignStore` 已从单 Mutex 拆为集合级锁；仍需做长任务/连续写回压测，记录同步 JSON I/O 的锁持有时间和 UI 可感知卡顿。
    - 若确认为发布阻塞，优先拆“内存态 + 后台批量 flush / 原子写”边界；不要在没有压测证据时整层重写。
 
 验收：
@@ -206,8 +206,8 @@
    - `WebViewMvuRuntime` 已移动到 `crates/tauri-app/src/mvu_webview_runtime.rs`，由 Tauri 层持有 `tauri::AppHandle`、emit event 并等待 pending oneshot。
    - `app-pipeline` / `app-agent` 仍只依赖 infra trait，不直接依赖 `tauri-app`。
 2. `CampaignStore` 存储债：
-   - 当前适合桌面开发和小数据量；写入错误已可见，但单 Mutex + 同步 JSON I/O 在 Android 和长会话里仍可能放大卡顿。
-   - 发布前先测锁持有时间、连续 postprocess 写回、导入大卡和 app 重启恢复；只有确认阻塞后再做后台 flush / 分文件索引 / schema 迁移。
+   - 当前适合桌面开发和小数据量；写入错误已可见，单 Mutex 已拆为集合级锁，但同步 JSON I/O 在 Android 和长会话里仍可能放大卡顿。
+   - 发布前先测集合锁持有时间、连续 postprocess 写回、导入大卡和 app 重启恢复；只有确认阻塞后再做后台 flush / 分文件索引 / schema 迁移。
 3. 文档同步：
    - 每次完成技术债切片后同步 `ARCHITECTURE-AUDIT.md`、`DATA_MODEL.md`、`PLAN-POST-MAINLINE.md` 和 README 的代码事实。
 
@@ -215,7 +215,7 @@
 
 - 技术债是否阻塞发布有明确证据，而不是凭感觉。
 - `infra-plugin-host` 的 Tauri 依赖已拆掉；release checklist 仅保留 WebView MVU 真实卡回归风险。
-- `CampaignStore` 的性能风险有可复现实验记录和处理结论。
+- `CampaignStore` 的同步 I/O 性能风险有可复现实验记录和处理结论。
 
 ## 阶段 5：发布包和用户入口
 

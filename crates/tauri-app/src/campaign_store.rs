@@ -39,17 +39,6 @@ pub struct StoredMvuTranslation {
     pub analyzed_at: String,
 }
 
-/// 内存缓存（所有 7 个数据类型的集合，由单个 Mutex 保护）
-struct CampaignCache {
-    cards: Vec<StoredCard>,
-    campaigns: Vec<Campaign>,
-    instances: Vec<CharacterInstance>,
-    knowledge: Vec<CharacterKnowledgeEntry>,
-    tasks: Vec<StoryTask>,
-    summaries: Vec<RoundSummary>,
-    mvu: Vec<StoredMvuTranslation>,
-}
-
 pub struct CampaignStore {
     cards_path: PathBuf,
     campaigns_path: PathBuf,
@@ -58,8 +47,14 @@ pub struct CampaignStore {
     tasks_path: PathBuf,
     summaries_path: PathBuf,
     mvu_path: PathBuf,
-    /// 内存缓存，保护并发读写（与 CharacterStore/ConnectionStore 模式一致）
-    cache: Mutex<CampaignCache>,
+    /// 集合级缓存锁。写盘仍在对应集合锁内串行，避免锁外旧快照覆盖新快照。
+    cards: Mutex<Vec<StoredCard>>,
+    campaigns: Mutex<Vec<Campaign>>,
+    instances: Mutex<Vec<CharacterInstance>>,
+    knowledge: Mutex<Vec<CharacterKnowledgeEntry>>,
+    tasks: Mutex<Vec<StoryTask>>,
+    summaries: Mutex<Vec<RoundSummary>>,
+    mvu: Mutex<Vec<StoredMvuTranslation>>,
 }
 
 impl CampaignStore {
@@ -72,17 +67,14 @@ impl CampaignStore {
         let summaries_path = data_dir.join("round_summaries.json");
         let mvu_path = data_dir.join("mvu_translations.json");
 
-        let cache = CampaignCache {
-            cards: load_or_default(&cards_path),
-            campaigns: load_or_default(&campaigns_path),
-            instances: load_or_default(&instances_path),
-            knowledge: load_or_default(&knowledge_path),
-            tasks: load_or_default(&tasks_path),
-            summaries: load_or_default(&summaries_path),
-            mvu: load_or_default(&mvu_path),
-        };
-
         Self {
+            cards: Mutex::new(load_or_default(&cards_path)),
+            campaigns: Mutex::new(load_or_default(&campaigns_path)),
+            instances: Mutex::new(load_or_default(&instances_path)),
+            knowledge: Mutex::new(load_or_default(&knowledge_path)),
+            tasks: Mutex::new(load_or_default(&tasks_path)),
+            summaries: Mutex::new(load_or_default(&summaries_path)),
+            mvu: Mutex::new(load_or_default(&mvu_path)),
             cards_path,
             campaigns_path,
             instances_path,
@@ -90,55 +82,55 @@ impl CampaignStore {
             tasks_path,
             summaries_path,
             mvu_path,
-            cache: Mutex::new(cache),
         }
     }
 
     // ─── CharacterCard CRUD ───────────────────────────────────────────────
 
     pub fn list_cards(&self) -> Vec<StoredCard> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.cards.clone()
+        self.cards.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn get_card(&self, id: &Id) -> Option<StoredCard> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.cards.iter().find(|c| c.card.id == *id).cloned()
+        self.cards
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|c| c.card.id == *id)
+            .cloned()
     }
 
     pub fn get_card_by_source(&self, source_character_id: &Id) -> Option<StoredCard> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .cards
+        self.cards
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .find(|c| c.card.source_character_id == *source_character_id)
             .cloned()
     }
 
     pub fn save_card(&self, card: CharacterCard) -> Result<StoredCard, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         // 同 source_character_id 去重（重跑识别时覆盖）
-        cache
-            .cards
-            .retain(|c| c.card.source_character_id != card.source_character_id);
+        cards.retain(|c| c.card.source_character_id != card.source_character_id);
         let stored = StoredCard {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
-        cache.cards.push(stored.clone());
-        persist(&self.cards_path, &cache.cards)?;
+        cards.push(stored.clone());
+        persist(&self.cards_path, &cards)?;
         Ok(stored)
     }
 
     pub fn update_card(&self, card: CharacterCard) -> Result<Option<StoredCard>, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let stored = StoredCard {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Some(idx) = cache.cards.iter().position(|c| c.card.id == stored.card.id) {
-            cache.cards[idx] = stored.clone();
-            persist(&self.cards_path, &cache.cards)?;
+        if let Some(idx) = cards.iter().position(|c| c.card.id == stored.card.id) {
+            cards[idx] = stored.clone();
+            persist(&self.cards_path, &cards)?;
             Ok(Some(stored))
         } else {
             Ok(None)
@@ -146,43 +138,48 @@ impl CampaignStore {
     }
 
     pub fn delete_card(&self, id: &Id) -> Result<bool, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let before = cache.cards.len();
+        let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
+
+        let before = cards.len();
         // 先记下要删的卡的 source_character_id（用于级联删 MVU 翻译）
-        let source_ids: Vec<Id> = cache
-            .cards
+        let source_ids: Vec<Id> = cards
             .iter()
             .filter(|c| c.card.id == *id)
             .map(|c| c.card.source_character_id.clone())
             .collect();
-        cache.cards.retain(|c| c.card.id != *id);
-        let changed = cache.cards.len() != before;
+        cards.retain(|c| c.card.id != *id);
+        let changed = cards.len() != before;
         if changed {
-            persist(&self.cards_path, &cache.cards)?;
+            persist(&self.cards_path, &cards)?;
             // 级联删除：该卡的 campaign + instances
-            let camp_ids: Vec<Id> = cache
-                .campaigns
+            let camp_ids: Vec<Id> = campaigns
                 .iter()
                 .filter(|c| c.card_id == *id)
                 .map(|c| c.id.clone())
                 .collect();
             for camp_id in &camp_ids {
-                cache.campaigns.retain(|c| c.id != *camp_id);
-                cache.instances.retain(|i| i.campaign_id != *camp_id);
-                cache.knowledge.retain(|k| k.campaign_id != *camp_id);
-                cache.tasks.retain(|t| t.campaign_id != *camp_id);
-                cache.summaries.retain(|s| s.campaign_id != *camp_id);
+                campaigns.retain(|c| c.id != *camp_id);
+                instances.retain(|i| i.campaign_id != *camp_id);
+                knowledge.retain(|k| k.campaign_id != *camp_id);
+                tasks.retain(|t| t.campaign_id != *camp_id);
+                summaries.retain(|s| s.campaign_id != *camp_id);
             }
-            persist(&self.campaigns_path, &cache.campaigns)?;
-            persist(&self.instances_path, &cache.instances)?;
-            persist(&self.knowledge_path, &cache.knowledge)?;
-            persist(&self.tasks_path, &cache.tasks)?;
-            persist(&self.summaries_path, &cache.summaries)?;
+            persist(&self.campaigns_path, &campaigns)?;
+            persist(&self.instances_path, &instances)?;
+            persist(&self.knowledge_path, &knowledge)?;
+            persist(&self.tasks_path, &tasks)?;
+            persist(&self.summaries_path, &summaries)?;
             // 级联删除：该卡的 MVU 翻译
             for source_id in &source_ids {
-                cache.mvu.retain(|m| m.source_character_id != *source_id);
+                mvu.retain(|m| m.source_character_id != *source_id);
             }
-            persist(&self.mvu_path, &cache.mvu)?;
+            persist(&self.mvu_path, &mvu)?;
         }
         Ok(changed)
     }
@@ -190,14 +187,16 @@ impl CampaignStore {
     // ─── Campaign CRUD ────────────────────────────────────────────────────
 
     pub fn list_campaigns(&self) -> Vec<Campaign> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.campaigns.clone()
+        self.campaigns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn list_campaigns_of_card(&self, card_id: &Id) -> Vec<Campaign> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .campaigns
+        self.campaigns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|c| c.card_id == *card_id)
             .cloned()
@@ -205,42 +204,51 @@ impl CampaignStore {
     }
 
     pub fn get_campaign(&self, id: &Id) -> Option<Campaign> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.campaigns.iter().find(|c| c.id == *id).cloned()
+        self.campaigns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|c| c.id == *id)
+            .cloned()
     }
 
     pub fn save_campaign(&self, campaign: Campaign) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.campaigns.retain(|c| c.id != campaign.id);
-        cache.campaigns.push(campaign);
-        persist(&self.campaigns_path, &cache.campaigns)
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        campaigns.retain(|c| c.id != campaign.id);
+        campaigns.push(campaign);
+        persist(&self.campaigns_path, &campaigns)
     }
 
     pub fn update_campaign(&self, campaign: Campaign) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = cache.campaigns.iter().position(|c| c.id == campaign.id) {
-            cache.campaigns[idx] = campaign;
-            persist(&self.campaigns_path, &cache.campaigns)?;
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = campaigns.iter().position(|c| c.id == campaign.id) {
+            campaigns[idx] = campaign;
+            persist(&self.campaigns_path, &campaigns)?;
         }
         Ok(())
     }
 
     pub fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let before = cache.campaigns.len();
-        cache.campaigns.retain(|c| c.id != *id);
-        let changed = cache.campaigns.len() != before;
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+
+        let before = campaigns.len();
+        campaigns.retain(|c| c.id != *id);
+        let changed = campaigns.len() != before;
         if changed {
-            persist(&self.campaigns_path, &cache.campaigns)?;
+            persist(&self.campaigns_path, &campaigns)?;
             // 级联删除 instances + knowledge + tasks + round_summaries
-            cache.instances.retain(|i| i.campaign_id != *id);
-            persist(&self.instances_path, &cache.instances)?;
-            cache.knowledge.retain(|k| k.campaign_id != *id);
-            persist(&self.knowledge_path, &cache.knowledge)?;
-            cache.tasks.retain(|t| t.campaign_id != *id);
-            persist(&self.tasks_path, &cache.tasks)?;
-            cache.summaries.retain(|s| s.campaign_id != *id);
-            persist(&self.summaries_path, &cache.summaries)?;
+            instances.retain(|i| i.campaign_id != *id);
+            persist(&self.instances_path, &instances)?;
+            knowledge.retain(|k| k.campaign_id != *id);
+            persist(&self.knowledge_path, &knowledge)?;
+            tasks.retain(|t| t.campaign_id != *id);
+            persist(&self.tasks_path, &tasks)?;
+            summaries.retain(|s| s.campaign_id != *id);
+            persist(&self.summaries_path, &summaries)?;
         }
         Ok(changed)
     }
@@ -248,14 +256,16 @@ impl CampaignStore {
     // ─── CharacterInstance CRUD ───────────────────────────────────────────
 
     pub fn list_all_instances(&self) -> Vec<CharacterInstance> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.instances.clone()
+        self.instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn list_instances(&self, campaign_id: &Id) -> Vec<CharacterInstance> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .instances
+        self.instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|i| i.campaign_id == *campaign_id)
             .cloned()
@@ -263,26 +273,26 @@ impl CampaignStore {
     }
 
     pub fn get_instance(&self, campaign_id: &Id, instance_id: &Id) -> Option<CharacterInstance> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .instances
+        self.instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .find(|i| i.campaign_id == *campaign_id && i.id == *instance_id)
             .cloned()
     }
 
     pub fn add_instance(&self, instance: CharacterInstance) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.instances.retain(|i| i.id != instance.id);
-        cache.instances.push(instance);
-        persist(&self.instances_path, &cache.instances)
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        instances.retain(|i| i.id != instance.id);
+        instances.push(instance);
+        persist(&self.instances_path, &instances)
     }
 
     pub fn update_instance(&self, instance: CharacterInstance) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = cache.instances.iter().position(|i| i.id == instance.id) {
-            cache.instances[idx] = instance;
-            persist(&self.instances_path, &cache.instances)?;
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = instances.iter().position(|i| i.id == instance.id) {
+            instances[idx] = instance;
+            persist(&self.instances_path, &instances)?;
         }
         Ok(())
     }
@@ -290,15 +300,17 @@ impl CampaignStore {
     // ─── CharacterKnowledge CRUD（P2 新增）─────────────────────────────────
 
     pub fn list_all_knowledge(&self) -> Vec<CharacterKnowledgeEntry> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.knowledge.clone()
+        self.knowledge
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// 查某 campaign 下所有角色的知识条目
     pub fn list_knowledge(&self, campaign_id: &Id) -> Vec<CharacterKnowledgeEntry> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .knowledge
+        self.knowledge
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|k| k.campaign_id == *campaign_id)
             .cloned()
@@ -311,9 +323,9 @@ impl CampaignStore {
         campaign_id: &Id,
         character_id: &Id,
     ) -> Vec<CharacterKnowledgeEntry> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .knowledge
+        self.knowledge
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|k| k.campaign_id == *campaign_id && k.character_id == *character_id)
             .cloned()
@@ -325,19 +337,19 @@ impl CampaignStore {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.knowledge.extend(entries);
-        persist(&self.knowledge_path, &cache.knowledge)
+        let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
+        knowledge.extend(entries);
+        persist(&self.knowledge_path, &knowledge)
     }
 
     /// 删除单条知识条目（按 id），返回是否找到并删除
     pub fn delete_knowledge(&self, knowledge_id: &Id) -> Result<bool, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let before = cache.knowledge.len();
-        cache.knowledge.retain(|k| k.id != *knowledge_id);
-        let changed = cache.knowledge.len() != before;
+        let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
+        let before = knowledge.len();
+        knowledge.retain(|k| k.id != *knowledge_id);
+        let changed = knowledge.len() != before;
         if changed {
-            persist(&self.knowledge_path, &cache.knowledge)?;
+            persist(&self.knowledge_path, &knowledge)?;
         }
         Ok(changed)
     }
@@ -345,15 +357,14 @@ impl CampaignStore {
     // ─── StoryTask CRUD（P2 新增）──────────────────────────────────────────
 
     pub fn list_all_tasks(&self) -> Vec<StoryTask> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.tasks.clone()
+        self.tasks.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 查某 campaign 下所有任务（按 status 筛选：传 None 返回全部）
     pub fn list_tasks(&self, campaign_id: &Id) -> Vec<StoryTask> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .tasks
+        self.tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|t| t.campaign_id == *campaign_id)
             .cloned()
@@ -361,36 +372,40 @@ impl CampaignStore {
     }
 
     pub fn get_task(&self, task_id: &Id) -> Option<StoryTask> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.tasks.iter().find(|t| t.id == *task_id).cloned()
+        self.tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|t| t.id == *task_id)
+            .cloned()
     }
 
     /// 新建任务（用户规划或后处理抽取）
     pub fn add_task(&self, task: StoryTask) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.tasks.retain(|t| t.id != task.id);
-        cache.tasks.push(task);
-        persist(&self.tasks_path, &cache.tasks)
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        tasks.retain(|t| t.id != task.id);
+        tasks.push(task);
+        persist(&self.tasks_path, &tasks)
     }
 
     /// 更新任务（状态变化 / 注入记录 / 标完成）
     pub fn update_task(&self, task: StoryTask) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = cache.tasks.iter().position(|t| t.id == task.id) {
-            cache.tasks[idx] = task;
-            persist(&self.tasks_path, &cache.tasks)?;
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = tasks.iter().position(|t| t.id == task.id) {
+            tasks[idx] = task;
+            persist(&self.tasks_path, &tasks)?;
         }
         Ok(())
     }
 
     /// 删除任务
     pub fn delete_task(&self, task_id: &Id) -> Result<bool, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let before = cache.tasks.len();
-        cache.tasks.retain(|t| t.id != *task_id);
-        let changed = cache.tasks.len() != before;
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        let before = tasks.len();
+        tasks.retain(|t| t.id != *task_id);
+        let changed = tasks.len() != before;
         if changed {
-            persist(&self.tasks_path, &cache.tasks)?;
+            persist(&self.tasks_path, &tasks)?;
         }
         Ok(changed)
     }
@@ -398,15 +413,18 @@ impl CampaignStore {
     // ─── RoundSummary CRUD（P2 新增）───────────────────────────────────────
 
     pub fn list_all_summaries(&self) -> Vec<RoundSummary> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.summaries.clone()
+        self.summaries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// 查某 campaign 的所有本轮摘要（按 turn 升序）
     pub fn list_summaries(&self, campaign_id: &Id) -> Vec<RoundSummary> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out: Vec<_> = cache
+        let mut out: Vec<_> = self
             .summaries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|s| s.campaign_id == *campaign_id)
             .cloned()
@@ -417,27 +435,24 @@ impl CampaignStore {
 
     /// 追加一条本轮摘要（剧情总结 Agent 产出后调用）
     pub fn add_summary(&self, summary: RoundSummary) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .summaries
-            .retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
-        cache.summaries.push(summary);
-        persist(&self.summaries_path, &cache.summaries)
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        summaries.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
+        summaries.push(summary);
+        persist(&self.summaries_path, &summaries)
     }
 
     // ─── MVU 翻译存储（P3 新增）──────────────────────────────────────────
 
     /// 列所有 MVU 翻译
     pub fn list_all_mvu(&self) -> Vec<StoredMvuTranslation> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.mvu.clone()
+        self.mvu.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 查某角色卡的 MVU 翻译
     pub fn get_mvu(&self, source_character_id: &Id) -> Option<StoredMvuTranslation> {
-        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .mvu
+        self.mvu
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .find(|m| m.source_character_id == *source_character_id)
             .cloned()
@@ -445,24 +460,20 @@ impl CampaignStore {
 
     /// 保存/覆盖某角色卡的 MVU 翻译（按 source_character_id 去重）
     pub fn save_mvu(&self, stored: StoredMvuTranslation) -> Result<(), String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .mvu
-            .retain(|m| m.source_character_id != stored.source_character_id);
-        cache.mvu.push(stored);
-        persist(&self.mvu_path, &cache.mvu)
+        let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
+        mvu.retain(|m| m.source_character_id != stored.source_character_id);
+        mvu.push(stored);
+        persist(&self.mvu_path, &mvu)
     }
 
     /// 删某角色卡的 MVU 翻译（删卡时级联）
     pub fn delete_mvu(&self, source_character_id: &Id) -> Result<bool, String> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let before = cache.mvu.len();
-        cache
-            .mvu
-            .retain(|m| m.source_character_id != *source_character_id);
-        let changed = cache.mvu.len() != before;
+        let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
+        let before = mvu.len();
+        mvu.retain(|m| m.source_character_id != *source_character_id);
+        let changed = mvu.len() != before;
         if changed {
-            persist(&self.mvu_path, &cache.mvu)?;
+            persist(&self.mvu_path, &mvu)?;
         }
         Ok(changed)
     }
@@ -819,6 +830,119 @@ mod tests {
         assert!(store.list_knowledge(&camp_id).is_empty());
         assert!(store.list_tasks(&camp_id).is_empty());
         assert!(store.list_summaries(&camp_id).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_parallel_collection_writes_round_trip() {
+        let dir = temp_dir();
+        let store = std::sync::Arc::new(CampaignStore::new(&dir));
+        store.save_card(make_card()).unwrap();
+        let camp = Campaign::new(Id::from_str("card-1"), "parallel");
+        let camp_id = camp.id.clone();
+        store.save_campaign(camp).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+
+        {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..20 {
+                    store
+                        .add_knowledge(vec![CharacterKnowledgeEntry::witnessed(
+                            camp_id.clone(),
+                            Id::from_str("inst-parallel"),
+                            format!("knowledge-{i}"),
+                            i + 1,
+                        )])
+                        .unwrap();
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..20 {
+                    store
+                        .add_task(StoryTask::user_planned(
+                            camp_id.clone(),
+                            format!("task-{i}"),
+                            "parallel task",
+                            vec![],
+                            i + 1,
+                        ))
+                        .unwrap();
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..20 {
+                    store
+                        .add_summary(RoundSummary::new(
+                            camp_id.clone(),
+                            Id::from_str("conv-parallel"),
+                            i + 1,
+                            format!("summary-{i}"),
+                        ))
+                        .unwrap();
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..20 {
+                    store
+                        .save_mvu(make_mvu(&format!("src-parallel-{i}"), "parallel"))
+                        .unwrap();
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    let _ = store.list_cards();
+                    let _ = store.list_campaigns();
+                    let _ = store.list_knowledge(&camp_id);
+                    let _ = store.list_tasks(&camp_id);
+                    let _ = store.list_summaries(&camp_id);
+                    let _ = store.list_all_mvu();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let reloaded = CampaignStore::new(&dir);
+        assert_eq!(reloaded.list_knowledge(&camp_id).len(), 20);
+        assert_eq!(reloaded.list_tasks(&camp_id).len(), 20);
+        assert_eq!(reloaded.list_summaries(&camp_id).len(), 20);
+        assert_eq!(reloaded.list_all_mvu().len(), 20);
 
         std::fs::remove_dir_all(&dir).ok();
     }
