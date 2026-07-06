@@ -153,7 +153,7 @@
 | M-003 | active_variant 无边界检查 | 需设计数据修复策略 |
 | M-009 | postMessage 用 '*' origin | Tauri 内无跨域风险 |
 | M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点 |
-| M-021 | LogStore 并发写入可能交错 | 小 JSONL 实际风险极低 |
+| M-021 | LogStore 并发写入可能交错 | ✅ 2026-07-07 已完成：JSONL 落盘互斥锁 + 并发完整性测试 |
 | M-022 | unwrap_or(Null) ~12 处 | ✅ 2026-07-07 已完成：用户可见 JSON 序列化失败改为结构化错误 |
 | M-024 | patch 无事务回滚 | ✅ 2026-07-07 已完成：`execute_patch` 工作副本事务执行，失败不回写 |
 

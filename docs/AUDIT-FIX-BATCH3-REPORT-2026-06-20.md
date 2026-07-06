@@ -103,7 +103,7 @@
 | H-013 | CampaignStore 持锁做 7 次写入 | ✅ 2026-07-06 已拆集合级锁 + 增加并发写回回放；剩余同步 I/O/后台 flush 评估 |
 | H-014 | 同步 fs 阻塞异步运行时 | `fill_campaign_context` 需重构为 `spawn_blocking` 模式，涉及调用链变更 |
 | M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点，`MetaPanel` 生成溯源入口可见；`frontend/tests/conversation-nodes.test.mjs` 固化选择规则 |
-| M-021 | LogStore 并发写入可能交错 | 小 JSONL 文件实际风险极低 |
+| M-021 | LogStore 并发写入可能交错 | ✅ 2026-07-07 已完成：`LogStore` 增加 JSONL 落盘专用互斥锁，并发回放测试验证完整 JSON 行不丢不重 |
 | M-022 | unwrap_or(Null) ~12 处 | ✅ 2026-07-07 已完成：Tauri/日志导出用户可见 JSON 序列化失败改为结构化错误；内部固定结构不再静默回退为 Null/default |
 | M-024 | patch 事务回滚 | ✅ 2026-07-07 已完成：`execute_patch` 改为工作副本事务执行，全部 action 成功后才写回 context，失败时原数据保持不变；新增 rollback/commit 单元测试 |
 
@@ -130,7 +130,7 @@
 | `crates/infra-plugin-host/src/lib.rs` | H-011: corrupt JSON 备份 |
 | `crates/app-agent/src/tools.rs` | L-003: 删除死函数 |
 | `crates/app-meta/src/lib.rs` | M-024: `execute_patch` 事务执行 + rollback/commit 测试 |
-| `crates/app-logging/src/lib.rs` | M-022: 日志导出序列化失败返回错误 |
+| `crates/app-logging/src/lib.rs` | M-021: JSONL 落盘互斥锁 + 并发完整性测试；M-022: 日志导出序列化失败返回错误 |
 | `crates/app-meta/src/typed_patch.rs` | M-022: typed patch diff 固定结构序列化不再静默回退 |
 | `crates/domain/src/character.rs` | M-022: ST raw card JSON 序列化不再静默回退 |
 | `crates/infra-llm/src/openai.rs` | M-022: chat role 序列化不再静默回退 |
@@ -160,6 +160,10 @@ cargo test -p storyforge-app-meta
 2026-07-07 M-022/M-023 增量验证:
 cargo test -p storyforge-domain -p storyforge-infra-llm -p storyforge-app-meta -p storyforge-app-logging -p storyforge --lib
   411 passed, 0 failed, 1 ignored
+
+2026-07-07 M-021 增量验证:
+cargo test -p storyforge-app-logging
+  5 passed, 0 failed
 ```
 
 ## 执行效率
@@ -186,5 +190,5 @@ cargo test -p storyforge-domain -p storyforge-infra-llm -p storyforge-app-meta -
 
 1. **H-014 + H-013 剩余项**（性能基础）— 同步 I/O 异步化、CampaignStore 后台 flush 评估；H-013 集合级锁已完成
 2. **H-002**（安全合规）— API key 加密
-3. **M-021**（健壮性）— LogStore 并发写文件风险；M-022/M-024 已于 2026-07-07 完成
+3. **发布前压测** — LogStore/CampaignStore 长会话写入压力；M-021/M-022/M-024 已于 2026-07-07 完成
 4. **H-012**（架构）— plugin-host tauri 依赖解耦（已完成 2026-07-06）

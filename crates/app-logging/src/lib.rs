@@ -232,6 +232,7 @@ impl LogBuffer {
 /// 日志存储（环形缓冲 + 落盘）
 pub struct LogStore {
     buffer: Mutex<LogBuffer>,
+    persist_lock: Mutex<()>,
     /// 日志文件目录（落盘用）
     log_dir: PathBuf,
 }
@@ -242,6 +243,7 @@ impl LogStore {
         std::fs::create_dir_all(&log_dir).ok();
         Self {
             buffer: Mutex::new(LogBuffer::new()),
+            persist_lock: Mutex::new(()),
             log_dir,
         }
     }
@@ -282,6 +284,7 @@ impl LogStore {
     fn persist_entry(&self, entry: &LogEntry) {
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
         let file_path = self.log_dir.join(format!("{date}.jsonl"));
+        let _persist_guard = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
 
         if let Ok(json) = serde_json::to_string(entry) {
             use std::io::Write;
@@ -497,6 +500,8 @@ pub fn init_tracing(store: Arc<LogStore>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
 
     fn make_entry(kind: LogKind, level: LogLevel, msg: &str) -> LogEntry {
         LogEntry {
@@ -589,6 +594,63 @@ mod tests {
         assert_eq!(bundle["counts"]["llm"], 1);
 
         // 清理
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_log_store_concurrent_persist_writes_complete_jsonl_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_log_concurrent_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(LogStore::new(dir.clone()));
+        let threads = 12;
+        let per_thread = 40;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|thread_id| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..per_thread {
+                        let mut entry = make_entry(
+                            LogKind::LlmCall,
+                            LogLevel::Info,
+                            &format!("thread-{thread_id}-entry-{i}"),
+                        );
+                        entry.fields.insert(
+                            "payload".into(),
+                            serde_json::Value::String("x".repeat(8192)),
+                        );
+                        store.push(entry);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let log_path = dir.join(format!("{date}.jsonl"));
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(lines.len(), threads * per_thread);
+
+        let messages: HashSet<String> = lines
+            .iter()
+            .map(|line| {
+                let entry: LogEntry = serde_json::from_str(line).unwrap();
+                entry.message
+            })
+            .collect();
+        assert_eq!(messages.len(), threads * per_thread);
+        assert!(messages.contains("thread-0-entry-0"));
+        assert!(messages.contains(&format!("thread-{}-entry-{}", threads - 1, per_thread - 1)));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

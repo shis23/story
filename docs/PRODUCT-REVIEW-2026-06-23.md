@@ -209,7 +209,7 @@ Layer 1: Meta Agent 复刻
 | M-012 | lastConversationNode 未传入 | ✅ 2026-07-07 已修：`App.vue` 只把最后一条带 provenance 的 assistant 节点传给 `MetaPanel`，`meta_explain_generation` 入口可见且有前端测试覆盖 | 否 | 已完成 |
 | M-024 | patch 事务回滚 | ✅ 2026-07-07 已修：旧 Meta `execute_patch` 使用工作副本执行，失败不写回，成功一次性提交，并有 rollback/commit 测试覆盖 | 否 | 已完成 |
 | M-022 | unwrap_or(Null) 12 处 | ✅ 2026-07-07 已修：用户可见 JSON 序列化失败改为结构化错误，固定内部结构不再静默回退为 null/default | 否 | 已完成 |
-| M-021 | LogStore 并发写入 | 否 | 否 | 可延后 |
+| M-021 | LogStore 并发写入 | ✅ 2026-07-07 已修：JSONL 落盘加专用互斥锁，并发测试覆盖完整行/条数/去重 | 否 | 已完成 |
 
 ### 3.4 兼容目标分档（可验证版）
 

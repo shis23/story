@@ -163,7 +163,7 @@
 | M-018 | `embedder.rs:119` | 非数值 JSON 静默转为 0.0 — 损坏 embedding |
 | M-019 | `sse.rs:175` | 接收端断开后 SSE 继续处理完整流 |
 | M-020 | `lib.rs:287` | 日志写入 `writeln!` 结果被丢弃 |
-| M-021 | `lib.rs:244` | LogStore 并发写文件可能交错字节（Windows） |
+| M-021 | `crates/app-logging/src/lib.rs` | ✅ 2026-07-07 已修复：LogStore JSONL 落盘使用专用互斥锁，并发回放测试验证完整行 |
 | M-022 | 多处 | ✅ 2026-07-07 已修复：用户可见 JSON 序列化失败返回结构化错误，不再伪造 null/default |
 | M-023 | `crates/tauri-app/src/lib.rs` | ✅ 2026-07-07 已加强：Patch 执行后 WorldInfoEntry 反序列化失败直接返回结构化错误，不再静默丢条目 |
 | M-024 | `crates/app-meta/src/lib.rs` | ✅ 2026-07-07 已修复：`execute_patch` 使用工作副本事务执行，失败时不回写已执行动作 |
