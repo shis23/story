@@ -127,9 +127,17 @@ mod tests {
             find_regex: find.into(),
             replace_string: replace.into(),
             placement,
+            placement_codes: vec![],
             disabled: false,
             flags: "gm".into(),
             only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
         }
     }
 

@@ -200,7 +200,7 @@ impl Preset {
 }
 
 /// 从 ST extensions 中提取正则脚本
-fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
+pub(crate) fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
     let scripts = match extensions.get("regex_scripts") {
         Some(v) => v,
         None => return Vec::new(),

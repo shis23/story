@@ -19,7 +19,7 @@
 - 不做 ST 聊天记录导入。
 - 不做 ST 插件系统兼容。
 
-> 2026-07-06 更新：Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据（原始 `placement` 数组、`markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth`）。这只是保真改进，运行时仍只按现有 Input/Output 简化枚举过滤；卡内 Scoped 正则、Global 正则合并和多作用域执行仍属于后续 ST 运行时兼容工作。
+> 2026-07-06 更新：Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据（原始 `placement` 数组、`markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth`）；角色卡 `data.extensions.regex_scripts` 也可通过 `Character::scoped_regex_scripts()` typed 读取。这只是导入保真改进，运行时仍只按现有 Input/Output 简化枚举过滤；Preset/Scoped/Global 来源合并和多作用域执行仍属于后续 ST 运行时兼容工作。
 
 ## 当前事实
 

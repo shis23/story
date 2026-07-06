@@ -236,6 +236,8 @@
 
 2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。当前仍只是导入保真；执行层仍按 `RegexPlacement::Input/Output` 简化过滤，Scoped/Global 正则来源合并未完成。
 
+2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；当前尚未把 Scoped/Preset/Global 来源合并进运行时执行链。
+
 ### Phase 6：Android（~20%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |

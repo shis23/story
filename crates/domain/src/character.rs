@@ -175,6 +175,11 @@ impl Character {
             || self.extensions.get("assets").is_some_and(|v| !v.is_null())
     }
 
+    /// Parses card-scoped ST regex scripts from `data.extensions.regex_scripts`.
+    pub fn scoped_regex_scripts(&self) -> Vec<crate::preset::RegexScript> {
+        crate::preset::extract_regex_scripts(&self.extensions)
+    }
+
     /// 从 ST 卡 JSON 解析为领域模型
     pub fn from_st_card(card: StCharacterCard) -> Self {
         let raw_json = serde_json::to_value(&card.data).unwrap_or_default();
@@ -676,6 +681,54 @@ mod multi_character_tests {
         assert_eq!(exported.alternate_greetings, vec!["嗨！", "欢迎。"]);
         // extensions round-trip
         assert_eq!(exported.extensions["custom_key"], "custom_value");
+    }
+
+    #[test]
+    fn test_from_st_card_exposes_scoped_regex_scripts() {
+        let card_json = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Scoped Regex Card",
+                "extensions": {
+                    "regex_scripts": [
+                        {
+                            "id": "scoped-1",
+                            "scriptName": "Scoped output cleanup",
+                            "findRegex": "<data_block>[\\s\\S]*?</data_block>",
+                            "replaceString": "<status>$0</status>",
+                            "placement": [2],
+                            "disabled": false,
+                            "markdownOnly": true,
+                            "promptOnly": false,
+                            "runOnEdit": true,
+                            "substituteRegex": 0,
+                            "trimStrings": ["```"],
+                            "minDepth": null,
+                            "maxDepth": 4
+                        }
+                    ]
+                }
+            }
+        });
+
+        let card: StCharacterCard = serde_json::from_value(card_json).unwrap();
+        let character = Character::from_st_card(card);
+        let scripts = character.scoped_regex_scripts();
+
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "scoped-1");
+        assert_eq!(scripts[0].script_name, "Scoped output cleanup");
+        assert_eq!(scripts[0].placement_codes, vec![2]);
+        assert_eq!(scripts[0].placement, crate::preset::RegexPlacement::Output);
+        assert_eq!(scripts[0].markdown_only, Some(true));
+        assert_eq!(scripts[0].prompt_only, Some(false));
+        assert_eq!(scripts[0].run_on_edit, Some(true));
+        assert_eq!(scripts[0].substitute_regex, Some(0));
+        assert_eq!(scripts[0].trim_strings, vec!["```"]);
+        assert_eq!(scripts[0].min_depth, None);
+        assert_eq!(scripts[0].max_depth, Some(4));
+        assert!(character.extensions.get("regex_scripts").is_some());
     }
 
     #[test]
