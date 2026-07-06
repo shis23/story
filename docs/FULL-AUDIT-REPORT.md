@@ -186,18 +186,18 @@
 
 | ID | 文件 | 描述 |
 |----|------|------|
-| L-001 | `connection_store.rs:133` | `active_id()` 死代码 |
-| L-002 | `character_extractor.rs:249` | `match_braces()` wrapper 死代码 |
-| L-003 | `tools.rs:487` | `register_editor_tools()` 零调用者 |
-| L-004 | `harness-real-llm:301` | `RuntimeCtx` type alias 零引用 |
+| L-001 | `connection_store.rs:133` | ✅ 已修复：删除 `ConnectionStore::active_id()` 死 API，测试改用 `active_connection()` 验证行为 |
+| L-002 | `character_extractor.rs:249` | ✅ 已修复：删除 `match_braces()` wrapper，调用点直接使用 `llm_parse::match_braces` |
+| L-003 | `tools.rs:487` | ✅ 已修复：`register_editor_tools()` 已删除 |
+| L-004 | `harness-real-llm:301` | ✅ 已修复：删除零引用 `RuntimeCtx` type alias |
 | L-005 | `infra-util:61` | `recover_*()` 生产代码零调用 — 80+ 处内联替代 |
 | L-006 | 多个 Cargo.toml | 19 个未使用 Cargo 依赖 |
 | L-007 | `app-pipeline:128` | `WritingContext.recent_messages` 死字段 |
-| L-008 | `PipelinePanel.vue` | 整个组件死代码（209 行） |
-| L-009 | `App.vue:1053` | `showCharDetail` 永远不设为 true |
-| L-010 | `useTheme.js:26` | watcher 累积泄漏 |
-| L-011 | `ChatMessage.vue:23` | `rerolling` ref 设置但从未读取 |
-| L-012 | 多处 | v-for 使用 index 作 key |
+| L-008 | `PipelinePanel.vue` | ✅ 已修复：死组件文件已删除 |
+| L-009 | `App.vue:1053` | ✅ 已修复：`showCharDetail` 已移除 |
+| L-010 | `useTheme.js:26` | ✅ 已修复：theme watcher 在模块作用域注册一次，不随 `useTheme()` 调用累积 |
+| L-011 | `ChatMessage.vue:23` | ✅ 已修复：`rerolling` 未读 ref 已移除 |
+| L-012 | 多处 | ✅ 已修复：当前前端未发现 `v-for` 使用 index/idx/i 作 key |
 | L-013 | 多处 | 硬编码中文字符串无 i18n |
 
 ---
@@ -226,7 +226,7 @@
 1. **C-001**: ✅ `infra-vector:340` 已从 `"character_id"` 改为 `"owner_character_id"`
 2. **M-016**: ✅ `connection_store.rs` 生产路径已使用 `.unwrap_or_else(|p| p.into_inner())`
 3. **H-004**: ✅ `character.rs:418` 已添加 `#[serde(default)]`
-4. **L-002/L-003/L-004**: 删除 3 个死函数/类型
+4. **L-001/L-002/L-003/L-004**: ✅ 死函数/类型/API 已删除或确认移除
 5. **M-010**: ✅ `Composer.vue:3` 已将 `sampleIntent` 内联为常量
 6. **H-008**: ✅ `AppSidebar.vue` navItems 已改为 computed
 7. **L-006**: 移除 19 个未使用 Cargo 依赖

@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use storyforge_app_conversation::ConversationStore;
 use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
 use storyforge_domain::Id;
-use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::Character;
 use storyforge_domain::llm::{LlmConnection, LlmProtocol, SamplingParams, ToolMode};
 use storyforge_infra_llm::LlmClient;
@@ -318,7 +317,3 @@ fn exe_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     exe_dir.join("data")
 }
-
-// 供子模块复用：暴露 CampaignRuntimeContext 别名，避免重复 import。
-#[allow(dead_code)]
-type RuntimeCtx = CampaignRuntimeContext;

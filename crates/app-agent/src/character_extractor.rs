@@ -241,12 +241,6 @@ fn try_extract_bracket_array(content: &str) -> Option<Vec<CharacterDefinition>> 
     if defs.is_empty() { None } else { Some(defs) }
 }
 
-/// 从 pos 位置的 `{` 开始，找配平的 `}` byte index（处理字符串转义）—— 委托公共模块
-#[allow(dead_code)]
-fn match_braces(content: &str, pos: usize) -> Option<usize> {
-    crate::llm_parse::match_braces(content, pos)
-}
-
 // 抑制未用警告：attach_definitions_to_card / merge_schema 等是公开 API
 #[allow(unused_imports)]
 use crate::AgentRuntime as _AgentRuntimeReexport;

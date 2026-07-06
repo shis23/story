@@ -161,16 +161,6 @@ impl ConnectionStore {
         }
     }
 
-    /// 获取当前活跃连接 ID
-    #[allow(dead_code)]
-    pub fn active_id(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .active_id
-            .clone()
-    }
-
     /// 设置活跃连接 ID（会校验该 id 存在，并更新 last_used_at）
     ///
     /// 返回对应的 LlmConnection（供调用方构造 client）。
@@ -332,22 +322,20 @@ mod tests {
     }
 
     #[test]
-    fn test_active_id_set_and_clear() {
+    fn test_active_connection_set_and_clear() {
         let store = temp_store();
         store.save(make_conn("c1")).unwrap();
         store.save(make_conn("c2")).unwrap();
 
-        assert!(store.active_id().is_none());
+        assert!(store.active_connection().is_none());
 
         // 设 c1 为活跃
         let conn = store.set_active("c1").unwrap();
         assert!(conn.is_some());
-        assert_eq!(store.active_id().as_deref(), Some("c1"));
-        assert!(store.active_connection().is_some());
+        assert_eq!(store.active_connection().unwrap().id.as_str(), "c1");
 
         // 删除活跃的 c1，active_id 应清除
         assert!(store.delete("c1").unwrap());
-        assert!(store.active_id().is_none());
         assert!(store.active_connection().is_none());
     }
 
@@ -369,7 +357,6 @@ mod tests {
         // 新实例从同一文件加载
         let store2 = ConnectionStore::new_with_secret_store(&dir, secret_store);
         assert_eq!(store2.list().len(), 1);
-        assert_eq!(store2.active_id().as_deref(), Some("persist-1"));
         assert_eq!(
             store2.active_connection().unwrap().api_key,
             "sk-test",
