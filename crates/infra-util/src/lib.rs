@@ -1,17 +1,15 @@
-//! 基础设施工具：原子持久化 + 锁中毒恢复。
+//! 基础设施工具：原子持久化 + SecretRef 存储。
 //!
 //! 本 crate 汇总了原本在各 store / runtime 中逐字重复的横切逻辑：
 //! - `atomic_write` / `atomic_write_json`：先写 `.tmp` 再 `rename`，崩溃时
 //!   不会损坏目标文件（历史 bug：多处裸 `fs::write` 崩溃后 `from_str` 失败，
 //!   被 `unwrap_or_default()` 静默清空用户数据）。
-//! - `recover_lock`：恢复被毒化的 `Mutex`/`RwLock`，避免单次 panic 级联成
-//!   整个命令层瘫痪（参照 `app-conversation` 的 `lock_cache` 范式）。
+//! - `secret_store`：把 API key 写入系统凭据库，持久化文件只保存 SecretRef。
 
 pub mod secret_store;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{LockResult, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::Serialize;
 
@@ -54,26 +52,6 @@ pub fn atomic_write_json_str(path: &Path, json: &str) -> io::Result<()> {
     atomic_write(path, json.as_bytes())
 }
 
-/// 恢复被毒化的 `Mutex` guard，而非 panic。
-///
-/// 历史问题：项目里 80+ 处 `.lock().unwrap()`，一旦某次持锁代码 panic
-/// 导致锁中毒，所有后续 `.unwrap()` 都会 panic，级联成整个命令层瘫痪。
-/// 本函数忽略 poison（取中毒 guard 的内部数据继续用），参照
-/// `app-conversation::ConversationStore::lock_cache` 的范式。
-pub fn recover_mutex<T>(r: LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
-    r.unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// 恢复被毒化的 `RwLock` 写 guard。
-pub fn recover_write<T>(r: LockResult<RwLockWriteGuard<'_, T>>) -> RwLockWriteGuard<'_, T> {
-    r.unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// 恢复被毒化的 `RwLock` 读 guard。
-pub fn recover_read<T>(r: LockResult<RwLockReadGuard<'_, T>>) -> RwLockReadGuard<'_, T> {
-    r.unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,22 +91,6 @@ mod tests {
         assert!(read.contains("\"a\": 1"));
         assert!(read.contains("\"b\""));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn recover_mutex_ignores_poison() {
-        let m = std::sync::Mutex::new(5);
-        // 故意毒化：drop 持有 guard 时模拟 panic
-        {
-            let guard = m.lock().unwrap();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _g = guard;
-                panic!("poison test");
-            }));
-        }
-        // 锁已中毒，普通 unwrap 会 panic；recover_mutex 应返回 guard
-        let guard = recover_mutex(m.lock());
-        assert_eq!(*guard, 5);
     }
 
     /// 简单的唯一 id 生成（测试用，避免引入 uuid 依赖到 infra-util）。

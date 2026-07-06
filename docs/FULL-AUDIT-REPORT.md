@@ -190,9 +190,9 @@
 | L-002 | `character_extractor.rs:249` | ✅ 已修复：删除 `match_braces()` wrapper，调用点直接使用 `llm_parse::match_braces` |
 | L-003 | `tools.rs:487` | ✅ 已修复：`register_editor_tools()` 已删除 |
 | L-004 | `harness-real-llm:301` | ✅ 已修复：删除零引用 `RuntimeCtx` type alias |
-| L-005 | `infra-util:61` | `recover_*()` 生产代码零调用 — 80+ 处内联替代 |
+| L-005 | `infra-util:61` | ✅ 已修复：删除零生产调用的 `recover_*()` 公共函数，保留各调用点就地 poison recovery |
 | L-006 | 多个 Cargo.toml | 19 个未使用 Cargo 依赖 |
-| L-007 | `app-pipeline:128` | `WritingContext.recent_messages` 死字段 |
+| L-007 | `app-pipeline:128` | ✅ 已修复：`WritingContext.recent_messages` 字段已移除，历史消息由 `ConversationStore::recent_messages_as_chat()` 按需读取 |
 | L-008 | `PipelinePanel.vue` | ✅ 已修复：死组件文件已删除 |
 | L-009 | `App.vue:1053` | ✅ 已修复：`showCharDetail` 已移除 |
 | L-010 | `useTheme.js:26` | ✅ 已修复：theme watcher 在模块作用域注册一次，不随 `useTheme()` 调用累积 |

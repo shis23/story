@@ -137,7 +137,7 @@ CampaignRuntimeContext
 
 辅助方法：`find_instance_by_id_or_name`、`definition_for_instance`、`resolved_persona_for`、`resolved_behavior_for`、`with_temporaries_for`（阶段 6：为未匹配角色创建临时 instance）。
 
-注：早期文档列出了 `card`、`campaign_variables`、`character_variables`、`pending_tasks`、`summaries`、`world_info`、`recent_messages` 等字段。实际实现中这些数据分别通过 `WritingContext` 的独立字段（`campaign_id`、`turn`、`pending_tasks`、`story_clock`、`world_info`、`recent_messages`）和 `Campaign.variables` / `CharacterInstance.variables` 承载，未全部合并进 `CampaignRuntimeContext`。
+注：早期文档列出了 `card`、`campaign_variables`、`character_variables`、`pending_tasks`、`summaries`、`world_info`、`recent_messages` 等字段。实际实现中这些数据分别通过 `WritingContext` 的独立字段（`campaign_id`、`turn`、`pending_tasks`、`story_clock`、`world_info`）、按需读取的 `ConversationStore::recent_messages_as_chat()`，以及 `Campaign.variables` / `CharacterInstance.variables` 承载，未全部合并进 `CampaignRuntimeContext`。
 
 ## AgentProfileConfig（已实现）
 
