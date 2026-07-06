@@ -542,6 +542,8 @@ pub struct CharacterInfo {
     pub personality: String,
     pub scenario: String,
     pub first_mes: String,
+    #[serde(default)]
+    pub alternate_greetings: Vec<String>,
     pub system_prompt: String,
     pub tags: Vec<String>,
     pub creator: String,
@@ -606,6 +608,7 @@ impl From<&storyforge_domain::character::Character> for CharacterInfo {
             personality: c.personality.clone(),
             scenario: c.scenario.clone(),
             first_mes: c.first_mes.clone(),
+            alternate_greetings: c.alternate_greetings.clone(),
             system_prompt: c.system_prompt.clone(),
             tags: c.tags.clone(),
             creator: c.creator.clone(),
@@ -1763,6 +1766,7 @@ async fn start_writing(
     intent: String,
     character_id: Option<String>,
     conversation_id: Option<String>,
+    opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<serde_json::Value, TauriCommandError> {
@@ -1814,13 +1818,13 @@ async fn start_writing(
         // 新建对话 + 存开场白 + 存 user 意图（legacy 路径，无 Campaign 绑定）
         let conv = app.conv_store.create(character_id.clone(), None);
         let id = conv.id.clone();
-        // 开场白（从角色卡读取，Final 状态 Assistant 消息）
-        if let Some(ch) = tool_snapshot.characters.first()
-            && !ch.first_mes.is_empty()
+        // 开场白（从角色卡读取，Final 状态 Assistant 消息；前端可从 alternate_greetings 中选择）
+        if let Some(opening) =
+            resolve_legacy_opening_message(tool_snapshot.characters.first(), opening_message)
             && let Err(e) = app.conv_store.append_final_message(
                 &id,
                 storyforge_domain::conversation::Role::Assistant,
-                ch.first_mes.clone(),
+                opening,
             )
         {
             tracing::warn!("追加开场白失败: {e}");
@@ -1955,6 +1959,34 @@ async fn start_writing(
         })),
         Err(e) => Err(TauriCommandError::from(format!("写作失败: {e}"))),
     }
+}
+
+fn resolve_legacy_opening_message(
+    character: Option<&Arc<storyforge_domain::character::Character>>,
+    requested: Option<String>,
+) -> Option<String> {
+    let character = character?;
+    let mut choices = Vec::new();
+    if !character.first_mes.trim().is_empty() {
+        choices.push(character.first_mes.clone());
+    }
+    choices.extend(
+        character
+            .alternate_greetings
+            .iter()
+            .filter(|greeting| !greeting.trim().is_empty())
+            .cloned(),
+    );
+
+    let requested = requested.filter(|message| !message.trim().is_empty());
+    if let Some(message) = requested {
+        if choices.iter().any(|choice| choice == &message) {
+            return Some(message);
+        }
+        tracing::warn!("Ignoring opening_message that is not present on the active character");
+    }
+
+    choices.into_iter().next()
 }
 
 /// 从模块/Profile 存储加载预设配置到 WritingContext
@@ -6194,7 +6226,7 @@ pub fn run() {
 ///
 /// 注：CharacterInfo 是导入时的 DTO，丢了 mes_example/embedded_world_info/raw_card_json
 /// 等完整字段。启动恢复只填导演工具用得到的字段（name/description/personality/
-/// scenario/first_mes/system_prompt），其余留空。
+/// scenario/first_mes/alternate_greetings/system_prompt），其余留空。
 fn stored_info_to_character(
     stored: &storage::StoredCharacter,
 ) -> storyforge_domain::character::Character {
@@ -6217,7 +6249,7 @@ fn stored_info_to_character(
         tags: stored.info.tags.clone(),
         creator: stored.info.creator.clone(),
         character_version: String::new(),
-        alternate_greetings: vec![],
+        alternate_greetings: stored.info.alternate_greetings.clone(),
         embedded_world_info: None,
         extensions: stored.info.extensions.clone(),
         renderable_assets: None,
@@ -6464,6 +6496,51 @@ mod tests {
             spec_version: "3.0".into(),
             raw_card_json: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn character_info_and_restore_preserve_alternate_greetings() {
+        let mut character = make_test_character("Greeter");
+        character.first_mes = "default opening".into();
+        character.alternate_greetings = vec!["alternate one".into(), "alternate two".into()];
+
+        let info = CharacterInfo::from(&character);
+        assert_eq!(
+            info.alternate_greetings,
+            vec!["alternate one".to_string(), "alternate two".to_string()]
+        );
+
+        let stored = storage::StoredCharacter {
+            id: "stored-greeter".into(),
+            info,
+            imported_at: "now".into(),
+        };
+        let restored = stored_info_to_character(&stored);
+        assert_eq!(
+            restored.alternate_greetings,
+            vec!["alternate one".to_string(), "alternate two".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_legacy_opening_message_accepts_only_card_greetings() {
+        let mut character = make_test_character("Greeter");
+        character.first_mes = "default opening".into();
+        character.alternate_greetings = vec!["alternate one".into(), "alternate two".into()];
+        let character = Arc::new(character);
+
+        assert_eq!(
+            resolve_legacy_opening_message(Some(&character), Some("alternate two".into())),
+            Some("alternate two".into())
+        );
+        assert_eq!(
+            resolve_legacy_opening_message(Some(&character), Some("not from this card".into())),
+            Some("default opening".into())
+        );
+        assert_eq!(
+            resolve_legacy_opening_message(Some(&character), Some("   ".into())),
+            Some("default opening".into())
+        );
     }
 
     fn test_regex_script(

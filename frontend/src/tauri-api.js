@@ -431,9 +431,10 @@ export async function testConnection(req) {
  * @param {string|null} characterId - 关联角色卡 ID
  * @param {function} onEvent - 事件回调 (event: {event_type, data}) => void
  * @param {string|null} conversationId - 已有对话 ID（追加到已有对话；null = 新建）
+ * @param {string|null} openingMessage - 新建 legacy 对话时使用的角色卡开场白
  * @returns {Promise<{text: string, conversation_id: string, node_id: string}>} 写作结果（含对话/节点 ID 供重 roll）
  */
-export async function startWriting(intent, characterId, onEvent, conversationId) {
+export async function startWriting(intent, characterId, onEvent, conversationId, openingMessage) {
   if (isTauri()) {
     const { Channel } = await import('@tauri-apps/api/core')
     const channel = new Channel()
@@ -444,6 +445,7 @@ export async function startWriting(intent, characterId, onEvent, conversationId)
       intent,
       characterId: characterId || null,
       conversationId: conversationId || null,
+      openingMessage: openingMessage || null,
       onEvent: channel,
     })
   }

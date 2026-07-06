@@ -67,7 +67,7 @@
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。
-- regex / 宏 / HTML / greeting 路径的降级结果已记录。
+- regex / 宏 / HTML / Campaign greeting 路径的降级结果已记录；legacy 单卡 alternate greeting 切换已接入。
 
 ## 4. 真实 LLM
 

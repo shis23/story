@@ -71,7 +71,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具；Selective 触发待补 |
 | extensions 整体保留 | 🟡 已保留 | `extensions: serde_json::Value` round-trip，不消费 |
 | regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output |
-| alternate_greetings | 🟡 已建模 | domain 有，前端无切换 UI |
+| alternate_greetings | 🟡 Legacy 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话可在前端切换默认/备选开场并持久化到 conversation；Campaign 新建开场仍待设计 |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
 | ST 宏 `${getvar}` | ❓ 子集 | JSR shim，覆盖率未验证 |
@@ -86,7 +86,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output，且 Input/Output 已尊重 ST `placement_codes`；World Info/Slash/Reasoning 等执行点仍未完成 | **4-8 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
-| 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
+| 4 | alternate_greeting 切换 UI | legacy 单卡新会话已可切换并持久化；Campaign 新建开场仍待设计 | 0.5-1 天 |
 | 5 | 事件总线接线 | 前端有，后端未桥接 | 2-3 天 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | Constant 已注入 | 补关键词扫描 + 绿灯激活，2-3 天 |

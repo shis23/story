@@ -68,7 +68,7 @@
 **待确认**：
 
 - [ ] `extensions` 中哪些子字段有 StoryForge 语义（如 MVU `stat_data`）？当前只有 `assets`/`character_assets` 被提取。
-- [ ] `alternate_greetings` 在 Campaign 写作中如何使用？当前只存储不消费。
+- [ ] `alternate_greetings` 在 Campaign 写作中如何使用？当前 legacy 单卡新会话已可切换并消费；Campaign 新建开场仍只用默认 `first_mes`。
 - [ ] ST 的 `group_only`、`post_history_instructions` 等边缘字段是否需要特殊处理？
 
 ### T2: raw JSON 和 extensions 保留策略

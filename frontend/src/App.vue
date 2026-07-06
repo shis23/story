@@ -146,6 +146,32 @@ function getAssistantRoleLabel() {
 const isWriting = ref(false)
 // 当前对话 ID（重 roll 需要）
 const currentConversationId = ref(null)
+const selectedGreetingIndex = ref(0)
+const greetingOptions = computed(() => {
+  const detail = activeCharDetail.value
+  if (!detail) return []
+
+  const options = []
+  const seen = new Set()
+  const addOption = (label, content) => {
+    if (!content || !content.trim() || seen.has(content)) return
+    seen.add(content)
+    options.push({ label, content })
+  }
+
+  addOption('默认', detail.first_mes)
+  const alternates = detail.alternate_greetings || []
+  alternates.forEach((content, index) => {
+    addOption(`备选 ${index + 1}`, content)
+  })
+  return options
+})
+const selectedGreeting = computed(() => greetingOptions.value[selectedGreetingIndex.value] || null)
+const canChooseGreeting = computed(() =>
+  writingMode.value === 'legacy'
+  && !currentConversationId.value
+  && greetingOptions.value.length > 1
+)
 // 会话历史列表
 const conversationHistory = ref([])
 const showHistory = ref(true)
@@ -158,6 +184,43 @@ const activeConnection = ref(null)
 // AgentConfigCard 引用（连接变更后刷新）—— 现由 DebugDrawer 持有，转发调用
 const debugDrawerRef = ref(null)
 const agentConfigRef = computed(() => debugDrawerRef.value)
+
+function normalizeGreetingSelection() {
+  if (selectedGreetingIndex.value >= greetingOptions.value.length) {
+    selectedGreetingIndex.value = 0
+  }
+}
+
+function buildOpeningMessage(content) {
+  return {
+    id: 'm1',
+    role: 'assistant',
+    role_label: activeCharDetail.value?.name || getAssistantRoleLabel(),
+    active_variant: 0,
+    variants: [{
+      id: 'v1',
+      content,
+      status: 'final',
+      provenance: null,
+    }],
+  }
+}
+
+function applySelectedOpeningMessage() {
+  normalizeGreetingSelection()
+  if (writingMode.value !== 'legacy') {
+    messages.value = []
+    return
+  }
+  const content = selectedGreeting.value?.content
+  messages.value = content ? [buildOpeningMessage(content)] : []
+  scrollToBottom()
+}
+
+function selectGreeting(index) {
+  selectedGreetingIndex.value = index
+  applySelectedOpeningMessage()
+}
 
 // 获取版本 + 加载会话历史列表 + 拦截 console
 onMounted(async () => {
@@ -288,21 +351,7 @@ function startNewConversation() {
   messages.value = []
   currentConversationId.value = null
   showHistory.value = false
-  // 加载角色卡开场白（legacy 模式有 activeCharDetail.first_mes 时）
-  if (activeCharDetail.value?.first_mes) {
-    messages.value = [{
-      id: 'm1',
-      role: 'assistant',
-      role_label: activeCharDetail.value.name || (writingMode.value === 'campaign' ? activeCampaign.value?.name : activeChar.value?.name) || 'AI',
-      active_variant: 0,
-      variants: [{
-        id: 'v1',
-        content: activeCharDetail.value.first_mes,
-        status: 'final',
-        provenance: null,
-      }],
-    }]
-  }
+  applySelectedOpeningMessage()
 }
 
 // ─── 新建 Campaign（一 Campaign 一对话：建 Campaign 自动建对话+开场白） ───
@@ -387,24 +436,12 @@ async function handleImport() {
 
     // 导入成功，设为当前活跃角色
     activeChar.value = result
+    currentConversationId.value = null
     // 加载详情
     await loadCharDetail(result.id)
 
     // 用角色的开场白替换消息列表
-    if (activeCharDetail.value?.first_mes) {
-      messages.value = [{
-        id: 'm1',
-        role: 'assistant',
-        role_label: activeCharDetail.value.name,
-        active_variant: 0,
-        variants: [{
-          id: 'v1',
-          content: activeCharDetail.value.first_mes,
-          status: 'final',
-          provenance: null,
-        }],
-      }]
-    }
+    applySelectedOpeningMessage()
   } catch (err) {
     importError.value = String(err)
   }
@@ -414,6 +451,8 @@ async function handleImport() {
 async function loadCharDetail(id) {
   try {
     activeCharDetail.value = await getCharacter(id)
+    selectedGreetingIndex.value = 0
+    normalizeGreetingSelection()
   } catch (e) {
     console.error('加载详情失败:', e)
   }
@@ -426,26 +465,16 @@ async function handleSelectChar(char) {
     activeChar.value = null
     activeCharDetail.value = null
     messages.value = []
+    currentConversationId.value = null
+    selectedGreetingIndex.value = 0
     return
   }
   activeChar.value = char
+  currentConversationId.value = null
   await loadCharDetail(char.id)
 
   // 用角色的开场白替换消息列表
-  if (activeCharDetail.value?.first_mes) {
-    messages.value = [{
-      id: 'm1',
-      role: 'assistant',
-      role_label: activeCharDetail.value.name,
-      active_variant: 0,
-      variants: [{
-        id: 'v1',
-        content: activeCharDetail.value.first_mes,
-        status: 'final',
-        provenance: null,
-      }],
-    }]
-  }
+  applySelectedOpeningMessage()
 }
 
 // 写作流水线（调用后端真实流水线，通过 Channel 接收事件）
@@ -496,9 +525,12 @@ async function startWriting(intent, skipLocalPush = false) {
     // Campaign 模式不传 characterId（后端从 active campaign 装配 runtime）；
     // legacy 模式传 activeChar.id 保持旧命令兼容
     const charIdForWriting = writingMode.value === 'campaign' ? null : activeChar.value?.id
+    const openingMessage = writingMode.value === 'legacy' && !currentConversationId.value
+      ? selectedGreeting.value?.content || null
+      : null
     const result = await apiStartWriting(intent, charIdForWriting, (event) => {
       handlePipelineEvent(event)
-    }, currentConversationId.value)
+    }, currentConversationId.value, openingMessage)
 
     // 后端返回 { text, conversation_id, node_id }
     // 后端已存开场白+user意图+AI成文（重启恢复用），这里只追加 AI 成文到本地消息
@@ -971,6 +1003,20 @@ function handlePipelineEvent(event) {
 
           <!-- ══ 视图：写作（消息列表，阅读器化） ══ -->
           <div v-else ref="messagesContainer" class="mx-auto max-w-2xl px-4 sm:px-6">
+            <div v-if="canChooseGreeting" class="pt-3 pb-2">
+              <div class="flex items-center gap-2 overflow-x-auto">
+                <span class="shrink-0 text-xs text-ink-soft">开场</span>
+                <button
+                  v-for="(option, i) in greetingOptions"
+                  :key="option.label"
+                  @click="selectGreeting(i)"
+                  class="shrink-0 min-h-[36px] px-3 rounded-lg text-xs font-medium border transition-colors"
+                  :class="selectedGreetingIndex === i ? 'bg-accent text-white border-accent shadow-glow-accent' : 'bg-surface text-ink-soft border-line hover:border-accent hover:text-accent'"
+                >
+                  {{ option.label }}
+                </button>
+              </div>
+            </div>
             <div v-if="messages.length === 0" class="text-center text-ink-faint py-20">
               <div class="text-4xl mb-3 opacity-40">✦</div>
               <div class="text-sm">描述你要写的场景，开始第一轮</div>
