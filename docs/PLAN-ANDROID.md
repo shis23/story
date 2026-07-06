@@ -1,6 +1,6 @@
 # 计划：Android 可用性打磨
 
-> 状态：待执行
+> 状态：已启动；阶段 1 构建链路已形成主流 Android ABI 基线。
 > 前置：Campaign 主流程在桌面端可稳定完成。
 
 ## 目标
@@ -53,13 +53,16 @@ cargo tauri android build
 
 - `cargo tauri android build --debug --target x86_64 --ci`：通过，生成 `app-universal-debug.apk`（约 249 MB）和 `app-universal-debug.aab`（约 84 MB）。
 - `cargo tauri android build --target x86_64 --ci`：通过，生成 `app-universal-release-unsigned.apk`（约 41 MB）和 `app-universal-release.aab`（约 27 MB）。
+- `cargo tauri android build --debug --target aarch64 --ci --split-per-abi --apk`：通过，生成主流真机 ABI `app-arm64-debug.apk`（约 237 MB）。
+- `cargo tauri android build --target aarch64 --ci --split-per-abi --apk`：通过，生成主流真机 ABI `app-arm64-release-unsigned.apk`（约 39 MB）。
 - 初次失败原因已修复：Rust 动态库缺少 Tauri mobile runtime symbols，已在 `crates/tauri-app/src/lib.rs::run` 加 `#[cfg_attr(mobile, tauri::mobile_entry_point)]`。
-- 仍需记录：Tauri/Kotlin/Gradle deprecation warning、插件 consumer proguard 文件缺失 warning、macOS `.app` bundle id warning；当前不阻塞 x86_64 Android 构建。
+- 2026-07-06 曾尝试多 ABI debug 构建，但 C 盘空间压力较大；当前发布验证只保留主流 `aarch64/arm64-v8a` 路线，armv7/i686 暂不作为发布目标。
+- 仍需记录：Tauri/Kotlin/Gradle deprecation warning、插件 consumer proguard 文件缺失 warning、macOS `.app` bundle id warning；当前不阻塞 arm64 Android 构建。
 
 验收：
 
 - 形成 Android 构建记录。
-- x86_64 debug/release 构建已通过；多 ABI、签名策略和真机安装仍属后续阶段。
+- arm64-v8a debug/release 构建已通过；签名策略和真机安装仍属后续阶段。
 
 ## 阶段 2：文件导入路径验证
 

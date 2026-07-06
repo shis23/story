@@ -149,7 +149,7 @@
 
 ## Phase 6: Android 打磨
 
-**状态：未开始**（仅 Tauri 自动生成脚手架；约 5%，2026-06-18 核对，详见 `DOCS-CODE-AUDIT.md`）
+**状态：已启动**（约 20%，2026-07-06 已完成 arm64-v8a debug/release 构建基线；详见 `DOCS-CODE-AUDIT.md` 和 `PLAN-ANDROID.md`）
 
 目标：把桌面调试能力收束为移动端可用体验。
 
