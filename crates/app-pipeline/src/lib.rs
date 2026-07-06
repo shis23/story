@@ -28,7 +28,7 @@ use storyforge_app_conversation::{
 };
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::mvu_runtime::MvuRuntime;
-use storyforge_infra_regex::apply_regex_scripts;
+use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target};
 
 // ─── 错误类型 ──────────────────────────────────────────────────────────────
 
@@ -1449,7 +1449,12 @@ fn apply_context_regex(
     scripts: &[RegexScript],
     placement: RegexPlacement,
 ) -> Result<String, PipelineError> {
-    apply_regex_scripts(text, scripts, placement).map_err(|e| PipelineError::Regex(e.to_string()))
+    let target = match placement {
+        RegexPlacement::Input => RegexExecutionTarget::Prompt,
+        RegexPlacement::Output => RegexExecutionTarget::Persisted,
+    };
+    apply_regex_scripts_for_target(text, scripts, placement, target)
+        .map_err(|e| PipelineError::Regex(e.to_string()))
 }
 
 fn build_director_system_extra(ctx: &WritingContext) -> String {
@@ -2048,13 +2053,17 @@ mod tests {
         replace_string: &str,
         placement: RegexPlacement,
     ) -> RegexScript {
+        let placement_codes = match placement {
+            RegexPlacement::Input => vec![0],
+            RegexPlacement::Output => vec![2],
+        };
         RegexScript {
             id: format!("test-{name}"),
             script_name: name.to_string(),
             find_regex: find_regex.to_string(),
             replace_string: replace_string.to_string(),
             placement,
-            placement_codes: vec![2],
+            placement_codes,
             source: RegexScriptSource::Scoped,
             disabled: false,
             flags: String::new(),
@@ -2217,6 +2226,42 @@ mod tests {
         assert_eq!(node.active().unwrap().content, "REGEX_FILTERED_DRAFT");
 
         let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[test]
+    fn test_context_input_regex_uses_prompt_target() {
+        let mut script = mock_regex_script(
+            "prompt-only-input",
+            r"raw intent",
+            "rewritten intent",
+            RegexPlacement::Input,
+        );
+        script.prompt_only = Some(true);
+
+        let result = apply_context_regex("raw intent", &[script], RegexPlacement::Input)
+            .expect("prompt-only input regex should apply to prompt target");
+
+        assert_eq!(result, "rewritten intent");
+    }
+
+    #[test]
+    fn test_context_output_regex_uses_persisted_target() {
+        let mut script = mock_regex_script(
+            "display-only-output",
+            r"<data_block>.*</data_block>",
+            "DISPLAY",
+            RegexPlacement::Output,
+        );
+        script.markdown_only = Some(true);
+
+        let result = apply_context_regex(
+            "<data_block>hp=5</data_block>",
+            &[script],
+            RegexPlacement::Output,
+        )
+        .expect("display-only output regex should be skipped for persisted target");
+
+        assert_eq!(result, "<data_block>hp=5</data_block>");
     }
 
     async fn setup_with_first_draft() -> (

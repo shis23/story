@@ -10,6 +10,13 @@ use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
 // --- regex executor --------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexExecutionTarget {
+    Prompt,
+    Persisted,
+    Display,
+}
+
 /// Regex execution error
 #[derive(Debug, thiserror::Error)]
 pub enum RegexError {
@@ -26,6 +33,20 @@ pub fn apply_regex_scripts(
     scripts: &[RegexScript],
     placement: RegexPlacement,
 ) -> Result<String, RegexError> {
+    apply_regex_scripts_for_target(text, scripts, placement, RegexExecutionTarget::Persisted)
+}
+
+/// Apply regex scripts for a concrete execution target.
+///
+/// ST exposes ephemerality switches such as `promptOnly` and `markdownOnly`.
+/// StoryForge currently has prompt and persisted storage paths; display-only
+/// rendering can call this with `Display` once a renderer hook exists.
+pub fn apply_regex_scripts_for_target(
+    text: &str,
+    scripts: &[RegexScript],
+    placement: RegexPlacement,
+    target: RegexExecutionTarget,
+) -> Result<String, RegexError> {
     let mut result = text.to_string();
 
     for script in scripts {
@@ -33,6 +54,9 @@ pub fn apply_regex_scripts(
             continue;
         }
         if !script_applies_to_placement(script, &placement) {
+            continue;
+        }
+        if !script_applies_to_target(script, target) {
             continue;
         }
 
@@ -141,6 +165,16 @@ fn script_applies_to_placement(script: &RegexScript, placement: &RegexPlacement)
         RegexPlacement::Input => script.placement_codes.contains(&0),
         RegexPlacement::Output => script.placement_codes.contains(&2),
     }
+}
+
+fn script_applies_to_target(script: &RegexScript, target: RegexExecutionTarget) -> bool {
+    if script.prompt_only.unwrap_or(false) {
+        return target == RegexExecutionTarget::Prompt;
+    }
+    if script.markdown_only.unwrap_or(false) {
+        return target == RegexExecutionTarget::Display;
+    }
+    true
 }
 
 // --- input/output regex split ----------------------------------------------
@@ -305,6 +339,67 @@ mod tests {
 
         assert_eq!(input, "bar");
         assert_eq!(output, "bar");
+    }
+
+    #[test]
+    fn test_prompt_only_script_applies_only_to_prompt_target() {
+        let mut script = make_script("prompt-only", r"secret", "hint", RegexPlacement::Input);
+        script.prompt_only = Some(true);
+
+        let prompt = apply_regex_scripts_for_target(
+            "secret",
+            &[script.clone()],
+            RegexPlacement::Input,
+            RegexExecutionTarget::Prompt,
+        )
+        .unwrap();
+        let persisted = apply_regex_scripts_for_target(
+            "secret",
+            &[script],
+            RegexPlacement::Input,
+            RegexExecutionTarget::Persisted,
+        )
+        .unwrap();
+
+        assert_eq!(prompt, "hint");
+        assert_eq!(persisted, "secret");
+    }
+
+    #[test]
+    fn test_markdown_only_script_does_not_mutate_prompt_or_persisted_text() {
+        let mut script = make_script(
+            "display-only",
+            r"<data_block>.*</data_block>",
+            "STATUS",
+            RegexPlacement::Output,
+        );
+        script.markdown_only = Some(true);
+
+        let display = apply_regex_scripts_for_target(
+            "<data_block>hp=5</data_block>",
+            &[script.clone()],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Display,
+        )
+        .unwrap();
+        let prompt = apply_regex_scripts_for_target(
+            "<data_block>hp=5</data_block>",
+            &[script.clone()],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Prompt,
+        )
+        .unwrap();
+        let persisted = apply_regex_scripts_for_target(
+            "<data_block>hp=5</data_block>",
+            &[script],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Persisted,
+        )
+        .unwrap();
+
+        assert_eq!(display, "STATUS");
+        assert_eq!(prompt, "<data_block>hp=5</data_block>");
+        assert_eq!(persisted, "<data_block>hp=5</data_block>");
     }
 
     #[test]
