@@ -21,7 +21,7 @@ import {
   createHostHandler,
   MSG_EVENT,
   MSG_MOUNT,
-  mapPipelineEventToPluginEvents,
+  mapPluginEventRecordToPluginEvents,
 } from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -32,7 +32,7 @@ const props = defineProps({
   compact: { type: Boolean, default: false },
   /** 固定高度（默认自适应） */
   height: { type: String, default: '200px' },
-  /** App.vue 广播的流水线事件 feed */
+  /** App.vue 广播的流水线/宿主事件 feed */
   pluginEvents: { type: Array, default: () => [] },
 })
 
@@ -104,9 +104,8 @@ function flushPendingPluginEvents() {
   }
 }
 
-function dispatchPipelineEventRecord(record) {
-  const pipelineEvent = record?.event || record
-  for (const pluginEvent of mapPipelineEventToPluginEvents(pipelineEvent)) {
+function dispatchPluginEventRecord(record) {
+  for (const pluginEvent of mapPluginEventRecordToPluginEvents(record)) {
     postPluginEvent(pluginEvent)
   }
 }
@@ -116,7 +115,7 @@ function consumePluginEvents(events) {
     const eventId = Number(record?.id || 0)
     if (eventId > 0 && eventId <= lastPluginEventId) continue
 
-    dispatchPipelineEventRecord(record)
+    dispatchPluginEventRecord(record)
     if (eventId > lastPluginEventId) {
       lastPluginEventId = eventId
     }

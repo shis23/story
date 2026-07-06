@@ -15,6 +15,7 @@ import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
+import { ST_EVENT_TYPES } from './plugin-bridge.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -110,15 +111,55 @@ async function loadSidebarPlugins() {
   }
 }
 
-function broadcastPluginPipelineEvent(event) {
-  if (!event?.event_type) return
-
+function pushPluginEventRecord(record) {
   pluginPipelineEventSeq += 1
   const nextEvents = [
     ...pluginPipelineEvents.value,
-    { id: pluginPipelineEventSeq, event },
+    { id: pluginPipelineEventSeq, ...record },
   ]
   pluginPipelineEvents.value = nextEvents.slice(-MAX_PLUGIN_PIPELINE_EVENTS)
+}
+
+function broadcastPluginPipelineEvent(event) {
+  if (!event?.event_type) return
+  pushPluginEventRecord({ event })
+}
+
+function broadcastPluginEvent(event, data = {}) {
+  if (!event) return
+  pushPluginEventRecord({ event, data })
+}
+
+function activeVariantForMessage(message) {
+  return message?.variants?.[message.active_variant] || message?.variants?.[0] || null
+}
+
+function chatEventPayload(extra = {}) {
+  return {
+    conversationId: currentConversationId.value,
+    messageCount: messages.value.length,
+    writingMode: writingMode.value,
+    campaignId: activeCampaign.value?.id || null,
+    characterId: activeChar.value?.id || null,
+    ...extra,
+  }
+}
+
+function messageEventPayload(messageId, extra = {}) {
+  const message = messages.value.find((m) => m.id === messageId)
+  const variant = activeVariantForMessage(message)
+  return chatEventPayload({
+    messageId,
+    role: message?.role || null,
+    variantId: variant?.id || null,
+    content: variant?.content || '',
+    displayContent: variant?.display_content || variant?.content || '',
+    ...extra,
+  })
+}
+
+function broadcastChatChanged(reason, extra = {}) {
+  broadcastPluginEvent(ST_EVENT_TYPES.CHAT_CHANGED, chatEventPayload({ reason, ...extra }))
 }
 
 // 流水线状态
@@ -225,10 +266,12 @@ function applySelectedOpeningMessage() {
   normalizeGreetingSelection()
   if (writingMode.value !== 'legacy') {
     messages.value = []
+    broadcastChatChanged('opening_message_cleared')
     return
   }
   const content = selectedGreeting.value?.content
   messages.value = content ? [buildOpeningMessage(content)] : []
+  broadcastChatChanged('opening_message_selected', { greetingIndex: selectedGreetingIndex.value })
   scrollToBottom()
 }
 
@@ -248,6 +291,7 @@ onMounted(async () => {
   } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()
+  broadcastPluginEvent(ST_EVENT_TYPES.APP_READY, chatEventPayload({ version: appVersion.value }))
 })
 
 // 拦截 console.log/warn/error，转发到后端 LogStore
@@ -286,6 +330,7 @@ function applyConversation(conv) {
         })),
       }
     })
+  broadcastChatChanged('conversation_applied', { conversationId: conv.id })
 }
 
 // 加载会话历史列表
@@ -314,6 +359,7 @@ async function handleDeleteConversation(conv, event) {
     if (conv.id === currentConversationId.value) {
       messages.value = []
       currentConversationId.value = null
+      broadcastChatChanged('conversation_deleted', { conversationId: conv.id })
     }
     await loadConversationHistory()
   } catch (e) {
@@ -357,6 +403,11 @@ async function openConversation(convSummary) {
         }
       } catch (e) { console.error('加载关联角色卡失败:', e) }
     }
+    broadcastPluginEvent(ST_EVENT_TYPES.CHAT_LOADED, chatEventPayload({
+      conversationId: currentConversationId.value,
+      campaignId: convSummary.campaign_id || null,
+      characterId: conv.character_id || null,
+    }))
   } catch (e) {
     console.error('打开对话失败:', e)
   }
@@ -368,6 +419,7 @@ function startNewConversation() {
   currentConversationId.value = null
   showHistory.value = false
   applySelectedOpeningMessage()
+  broadcastPluginEvent(ST_EVENT_TYPES.CHAT_LOADED, chatEventPayload({ reason: 'new_conversation' }))
 }
 
 // ─── 新建 Campaign（一 Campaign 一对话：建 Campaign 自动建对话+开场白） ───
@@ -435,6 +487,11 @@ async function handleCreateCampaign() {
         messages.value.forEach((m) => {
           if (m.role === 'assistant') m.role_label = activeCampaign.value?.name || 'AI'
         })
+        broadcastPluginEvent(ST_EVENT_TYPES.CHAT_LOADED, chatEventPayload({
+          reason: 'campaign_created',
+          conversationId: result.conversation_id,
+          campaignId: result.id,
+        }))
       }
     }
     showHistory.value = false // 切到写作视图
@@ -484,6 +541,10 @@ async function handleImport() {
     currentConversationId.value = null
     // 加载详情
     await loadCharDetail(result.id)
+    broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
+      characterId: result.id,
+      name: result.name,
+    })
 
     // 用角色的开场白替换消息列表
     applySelectedOpeningMessage()
@@ -512,11 +573,16 @@ async function handleSelectChar(char) {
     messages.value = []
     currentConversationId.value = null
     selectedGreetingIndex.value = 0
+    broadcastChatChanged('character_cleared')
     return
   }
   activeChar.value = char
   currentConversationId.value = null
   await loadCharDetail(char.id)
+  broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
+    characterId: char.id,
+    name: char.name,
+  })
 
   // 用角色的开场白替换消息列表
   applySelectedOpeningMessage()
@@ -564,6 +630,7 @@ async function startWriting(intent, skipLocalPush = false) {
         provenance: null,
       }],
     })
+    broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_SENT, messageEventPayload(userMsgId, { content: intent }))
     scrollToBottom()
   }
 
@@ -594,6 +661,10 @@ async function startWriting(intent, skipLocalPush = false) {
       messages.value.forEach((m) => {
         if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(msgId, {
+        reason: 'writing_complete',
+        content: text,
+      }))
     } else {
       messages.value.push({
         id: msgId,
@@ -608,6 +679,10 @@ async function startWriting(intent, skipLocalPush = false) {
           provenance: null,
         }],
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(msgId, {
+        reason: 'writing_complete',
+        content: text,
+      }))
     }
 
     pipeline.state = 'done'
@@ -685,6 +760,7 @@ async function handleReroll({ messageId, kind, hint }) {
       messages.value.forEach((m) => {
         if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(messageId, { reason: 'reroll', kind }))
     }
 
     pipeline.state = 'done'
@@ -714,6 +790,7 @@ async function handleEditVariant({ nodeId, newContent }) {
       messages.value.forEach((m) => {
         if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(nodeId, { reason: 'edit' }))
     }
   } catch (e) {
     console.error('编辑失败:', e)
@@ -729,6 +806,7 @@ async function handleAcceptVariant({ nodeId }) {
     if (msg) {
       const variant = msg.variants[msg.active_variant]
       if (variant) variant.status = 'final'
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(nodeId, { reason: 'accept_variant' }))
     }
   } catch (e) {
     console.error('采纳失败:', e)
@@ -747,6 +825,7 @@ async function handleDeleteVariant({ nodeId }) {
       messages.value.forEach((m) => {
         if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_DELETED, chatEventPayload({ messageId: nodeId }))
     }
     // 清流水线状态（删除 = 回到这条之前的状态，上次写作的导演/子Agent/编剧输出作废）
     pipeline.state = 'idle'
@@ -804,6 +883,7 @@ async function handleRerollUser({ messageId }) {
       messages.value.forEach((m) => {
         if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
       })
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(aiMsg.id, { reason: 'reroll_user' }))
     }
     messages.value = messages.value.filter((m) => m.id !== 'editor-streaming')
     pipeline.state = 'done'
@@ -834,6 +914,10 @@ async function handleAddVariant({ nodeId }) {
         provenance: null,
       })
       msg.active_variant = newIndex
+      broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_SWIPED, messageEventPayload(nodeId, {
+        reason: 'add_variant',
+        index: newIndex,
+      }))
     }
   } catch (e) {
     console.error('分支失败:', e)
@@ -848,6 +932,10 @@ async function handleSwitchVariant({ messageId, index }) {
   try {
     await apiSwitchVariant(currentConversationId.value, messageId, index)
     msg.active_variant = index
+    broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_SWIPED, messageEventPayload(messageId, {
+      reason: 'switch_variant',
+      index,
+    }))
   } catch (e) {
     console.error('切换变体失败:', e)
   }

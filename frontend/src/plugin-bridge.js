@@ -118,6 +118,29 @@ export function mapPipelineEventToPluginEvents(pipelineEvent) {
     .map((name) => ({ event: name, data: payload }))
 }
 
+function mapGenericPluginEvent(eventName, data) {
+  if (!eventName) return []
+  return [{ event: eventName, data: data && typeof data === 'object' ? data : {} }]
+}
+
+/**
+ * 将 App.vue 事件 feed 中的一条记录规范化为 PluginHost 可发送的事件数组。
+ * 支持历史的 PipelineEvent 记录，也支持 `CHAT_CHANGED` 等宿主通用事件。
+ */
+export function mapPluginEventRecordToPluginEvents(record) {
+  if (!record) return []
+  if (record.event_type) return mapPipelineEventToPluginEvents(record)
+
+  const event = record.event
+  if (event?.event_type) return mapPipelineEventToPluginEvents(event)
+  if (typeof event === 'string') return mapGenericPluginEvent(event, record.data)
+  if (typeof record.name === 'string') return mapGenericPluginEvent(record.name, record.data)
+  if (typeof event?.name === 'string') return mapGenericPluginEvent(event.name, event.data ?? record.data)
+  if (typeof event?.event === 'string') return mapGenericPluginEvent(event.event, event.data ?? record.data)
+
+  return []
+}
+
 // ─── 注入到 iframe 的 window.storyforge stub 脚本 ──────────────────────────
 
 /**

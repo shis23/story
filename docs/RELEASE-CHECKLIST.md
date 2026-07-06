@@ -68,7 +68,7 @@
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。
-- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、`minDepth/maxDepth` 过滤和 World Info prompt 作用域已接入，但 PluginHost/HTML 渲染仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏、Campaign 单实例/多实例明确作用域变量宏与 legacy/Campaign alternate greeting 切换已接入；写作/重 roll 的 `PipelineEvent` 已桥到插件事件总线，iframe 侧已有 ST 风格 `eventSource`/`event_types` shim，ST 全量真实 event emit 与 prompt hooks 仍待补。
+- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、`minDepth/maxDepth` 过滤和 World Info prompt 作用域已接入，但 PluginHost/HTML 渲染仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏、Campaign 单实例/多实例明确作用域变量宏与 legacy/Campaign alternate greeting 切换已接入；写作/重 roll 的 `PipelineEvent` 与常见聊天宿主动作已桥到插件事件总线，iframe 侧已有 ST 风格 `eventSource`/`event_types` shim，ST 全量真实 event emit 与 prompt hooks 仍待补。
 
 ## 4. 真实 LLM
 
@@ -111,5 +111,6 @@ Android 候选版本需验证：
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
+- 插件事件总线已覆盖主生成链和常见聊天宿主动作，但还不是 ST 99 事件全集；发布说明应避免承诺 prompt 组装钩子和冷门事件已全量兼容。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

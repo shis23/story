@@ -4,6 +4,7 @@ import vm from 'node:vm'
 import {
   generateBridgeScript,
   mapPipelineEventToPluginEvents,
+  mapPluginEventRecordToPluginEvents,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
 
@@ -90,6 +91,46 @@ test('adds STREAM_TOKEN alias with token payload for editor deltas', () => {
 test('ignores malformed pipeline events', () => {
   assert.deepEqual(mapPipelineEventToPluginEvents(null), [])
   assert.deepEqual(mapPipelineEventToPluginEvents({ data: {} }), [])
+})
+
+test('maps generic host plugin event records without losing payload', () => {
+  const record = {
+    id: 42,
+    event: 'CHAT_CHANGED',
+    data: { conversationId: 'c1', reason: 'loaded' },
+  }
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record), [{
+    event: 'CHAT_CHANGED',
+    data: { conversationId: 'c1', reason: 'loaded' },
+  }])
+})
+
+test('maps nested generic host plugin event records', () => {
+  const record = {
+    id: 43,
+    event: {
+      name: 'MESSAGE_UPDATED',
+      data: { messageId: 'm1' },
+    },
+  }
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record), [{
+    event: 'MESSAGE_UPDATED',
+    data: { messageId: 'm1' },
+  }])
+})
+
+test('keeps existing pipeline event record mapping', () => {
+  const record = {
+    id: 44,
+    event: { event_type: 'committed', data: { variant_id: 'v1' } },
+  }
+
+  assert.deepEqual(
+    mapPluginEventRecordToPluginEvents(record).map((event) => event.event),
+    ['pipeline.committed', 'committed', 'MESSAGE_RECEIVED'],
+  )
 })
 
 test('injects SillyTavern event type aliases into plugin iframe', () => {
