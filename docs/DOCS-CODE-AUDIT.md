@@ -59,6 +59,7 @@
 - `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`source_knowledge_id`、`relay_chain_text`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”，并在有上游知识时展示 A→B→C 传话链。
 - `crates/domain/src/character_knowledge.rs::CharacterKnowledgeEntry::source_knowledge_id` **已补传话链 MVP**：Tauri 写回层会在 `ToldByOther`/广播写入时匹配来源角色已有知识并链接上游条目。该能力是文本匹配级链路，完整语义传播仍需真实 LLM 行为评测。
 - `crates/domain/src/character_knowledge.rs::PropagationPolicy` **已补秘密封口 MVP**：postprocess 可输出 `propagation: "private"`；Tauri 写回层会阻断匹配私有来源知识的告知/广播；前端知识面板展示封口标记。该能力是文本匹配级门禁，完整语义可靠性仍需真实 LLM 对抗评测。
+- `crates/harness-real-llm/tests/knowledge_propagation_real_llm.rs` **已补发布前 ignored 评测**：真实 PostProcessor 抽取定向告知、身份组广播、private 封口后，再走线上 normalize 写回验证传话链和封口阻断。普通测试不联网；发布前用 `cargo test -p harness-real-llm knowledge_propagation -- --ignored --nocapture` 手动运行。
 - `crates/domain/src/conversation.rs::SubagentSnapshot` **阶段 5 已扩展**：新增 `character_instance_id: Option<String>`、`display_name: Option<String>`、`fallback_reason: Option<String>`（serde 兼容旧数据）。
 - `crates/app-conversation/src/lib.rs::build_provenance_with_campaign` **阶段 5 新增**：接收 `CampaignRuntimeContext`，从 Performance 中提取 instance 信息填充 SubagentSnapshot。旧 `build_provenance` 保留向后兼容。
 - `crates/tauri-app/src/lib.rs::CharacterInfo` **阶段 5 已扩展**：新导入卡保存 `source_character_id: Option<String>`，启动恢复时可保留 domain `Character.id`；旧数据 fallback 到 `StoredCharacter.id`。

@@ -273,10 +273,11 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
         .and_then(|x| x.as_array())
         .and_then(|arr| {
             arr.iter().find(|c| {
-                c.get("id")
-                    .and_then(|x| x.get("id"))
-                    .and_then(|x| x.as_str())
-                    == Some(active_id)
+                c.get("id").and_then(|x| x.as_str()) == Some(active_id)
+                    || c.get("id")
+                        .and_then(|x| x.get("id"))
+                        .and_then(|x| x.as_str())
+                        == Some(active_id)
             })
         })
         .ok_or_else(|| format!("connections.json 找不到 active_id={active_id}"))?;

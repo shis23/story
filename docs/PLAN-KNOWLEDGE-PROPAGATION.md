@@ -76,7 +76,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 目标是让用户和调试工具能直接看出“谁知道什么、从哪知道、哪轮知道”。
 - 后端：`list_character_knowledge` 构建 campaign 内 instance id → name 索引，并为每条知识补 `character_name`、`source_character_name`、`provenance_text`。
 - 前端：知识面板的实例筛选和条目展示优先使用角色名；`ToldByOther` 会展示来源角色。
-- 仍未覆盖：广播产生原因的独立字段、封口策略的真实 LLM 对抗评测。
+- 仍未覆盖：广播产生原因的独立字段；真实 LLM 评测已补 ignored harness，尚待发布前用实际连接跑通并记录结果。
 
 ### 方向 4：传话链（场景 D，MVP 已实现）
 
@@ -85,7 +85,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 - Tauri 写回层会查 B 当前已有知识；若文本归一化后匹配，则把新条目的 `source_knowledge_id` 指向 B 的那条上游知识。
 - 若 B 的上游知识本身来自 A，读侧会沿 `source_knowledge_id` 递归渲染为 `A（轮 1） → B（轮 3） → C（轮 5）`。
 - 广播写入同样会尝试链接广播发起者已有的匹配知识；没有匹配时保持旧行为，仅记录 `source_character_id`。
-- 限制：当前是文本匹配级链路，不做语义相似判定，也不让引擎替 LLM 判断“B 是否愿意/能够传话”。这部分仍需真实 LLM 对抗/行为评测。
+- 限制：当前是文本匹配级链路，不做语义相似判定，也不让引擎替 LLM 判断“B 是否愿意/能够传话”。`harness-real-llm` 已补 ignored 评测入口，发布前需用真实连接跑通并记录结果。
 
 ### 方向 5：秘密封口（场景 E，MVP 已实现）
 
@@ -94,7 +94,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 - postprocess prompt/schema/解析已支持 `propagation: "private"`；private 知识不得与 `broadcast` 同时写入。
 - 写回层会在 `ToldByOther` 或 `broadcast` 写入前检查来源角色已有知识：若发现匹配的 `Private` 文本，拒绝生成新告知/广播条目。
 - 子 Agent 知识注入和 Campaign 知识面板会显示封口标记。
-- 限制：当前是文本匹配级门禁，不是完整语义安全边界；需要真实 LLM 对抗样例继续验证，避免给用户虚假的安全感。
+- 限制：当前是文本匹配级门禁，不是完整语义安全边界；`knowledge_propagation` ignored 评测会检查 private 抽取与写回阻断，但仍需更多改写/绕写样例扩充。
 
 ## 落地优先级建议
 
@@ -107,7 +107,7 @@ P3 分流后 `ToldByOther` 已能跨在场。本方向已补齐 postprocess 输�
 
 - P3（w3-p3p4）= 门禁按来源分流的**最小正确修复**，让广播/告知不再依赖空集 hack。是本计划的前置。
 - 本计划 = 在 P3 基础上补**显式广播语义 + 身份组 + 传话 + 封口**，把"传播"从隐式 hack 升级为显式机制；目前显式广播、身份组、定向告知、第一层解释链路、传话链 MVP 和封口 MVP 均已落地。
-- 显式广播测试已覆盖 domain serde、postprocess 解析和 Tauri 分发；封口测试已覆盖 domain serde/渲染、postprocess 解析、private+broadcast 拒绝和来源私有知识阻断；传话链测试已覆盖 ToldByOther 链接上游知识和 DTO 链路渲染。
+- 显式广播测试已覆盖 domain serde、postprocess 解析和 Tauri 分发；封口测试已覆盖 domain serde/渲染、postprocess 解析、private+broadcast 拒绝和来源私有知识阻断；传话链测试已覆盖 ToldByOther 链接上游知识和 DTO 链路渲染；真实 LLM 发布评测入口为 `cargo test -p harness-real-llm knowledge_propagation -- --ignored --nocapture`。
 
 ## 开放问题（待立项时决策）
 

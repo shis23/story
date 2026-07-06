@@ -19,7 +19,7 @@
 
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过，作为 Rust warning-free 闸门。
 - `cargo test -p storyforge --lib`：通过。
-- `cargo test -p harness-real-llm`：确定性测试通过；真实 LLM 用例因缺少凭证被 ignore。
+- `cargo test -p harness-real-llm`：确定性测试通过；真实 LLM 用例默认 ignore。
 - `cargo test --workspace`：通过；真实 LLM 用例按预期 ignore。
 - `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
 
@@ -68,6 +68,7 @@
 - 角色识别：至少 1 张复杂卡，产出 definitions。
 - Campaign 写作 T1/T2/T3：首轮、多轮、重 roll。
 - 知识隔离对抗：角色不能读到未授权信息。
+- 知识传播对抗：运行 `cargo test -p harness-real-llm knowledge_propagation -- --ignored --nocapture`，确认真实 PostProcessor 能抽出定向告知、身份组广播和 private 封口，并通过写回层链路/门禁断言。
 - postprocess：知识、变量、任务、摘要至少各命中一次。
 
 记录模型、endpoint、耗时、失败重试和成本估算。
