@@ -167,12 +167,12 @@
 | M-022 | 多处 | ✅ 2026-07-07 已修复：用户可见 JSON 序列化失败返回结构化错误，不再伪造 null/default |
 | M-023 | `crates/tauri-app/src/lib.rs` | ✅ 2026-07-07 已加强：Patch 执行后 WorldInfoEntry 反序列化失败直接返回结构化错误，不再静默丢条目 |
 | M-024 | `crates/app-meta/src/lib.rs` | ✅ 2026-07-07 已修复：`execute_patch` 使用工作副本事务执行，失败时不回写已执行动作 |
-| M-025 | `app-meta Cargo.toml` | 死依赖 `infra-plugin-host`（从未 import） |
-| M-026 | `BaseOverlay.vue:102` | 缺少 `role="dialog"` / `aria-modal` — 无障碍缺陷 |
-| M-027 | `AgentConfigCard.vue:36` | `activeConnName` 是普通函数而非 computed |
-| M-028 | `PluginHost.vue:86` | Deep watch on plugin object — 不必要的重建 |
-| M-029 | `MetaPanel.vue:250` | Sequential await for patch staleness — 应用 Promise.all |
-| M-030 | `App.vue:934` | `activeCampaign.name` 无 optional chaining — 可能 null 崩溃 |
+| M-025 | `app-meta Cargo.toml` | ✅ 已修复：`storyforge-app-meta` 不再依赖 `infra-plugin-host` |
+| M-026 | `BaseOverlay.vue:102` | ✅ 已修复：外层弹层补充 `role="dialog"` / `aria-modal` |
+| M-027 | `AgentConfigCard.vue:36` | ✅ 已修复：`activeConnName` 使用 `computed()` |
+| M-028 | `PluginHost.vue:86` | ✅ 已修复：移除插件对象 deep watch，避免不必要重建 |
+| M-029 | `MetaPanel.vue:250` | ✅ 已修复：typed patch stale preview 使用 `Promise.all` 并发检查 |
+| M-030 | `App.vue:934` | ✅ 2026-07-07 已修复：Campaign 名称/概览字段使用可选链保护 |
 
 ---
 

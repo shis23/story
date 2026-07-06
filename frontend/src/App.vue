@@ -1160,8 +1160,8 @@ function handlePipelineEvent(event) {
           <!-- ══ 视图：Campaign 概览 ══ -->
           <div v-if="currentView === 'overview'" class="mx-auto max-w-2xl px-4 py-6">
             <h2 class="text-xl font-bold text-ink mb-1">📜 {{ activeCampaign?.name }}</h2>
-            <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mb-1">故事时间：{{ activeCampaign?.story_clock }}</p>
-            <p v-if="activeCampaign.created_at" class="text-xs text-ink-soft mb-5">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
+            <p v-if="activeCampaign?.story_clock" class="text-xs text-ink-soft mb-1">故事时间：{{ activeCampaign.story_clock }}</p>
+            <p v-if="activeCampaign?.created_at" class="text-xs text-ink-soft mb-5">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
             <div class="flex flex-wrap gap-2 mb-6">
               <button @click="showCampaignPanel = true" class="min-h-[44px] px-4 rounded-lg bg-accent text-white text-sm font-medium shadow-glow-accent hover:opacity-90 transition-opacity">进入 Campaign 面板</button>
               <button @click="openNewCampaignDialog" class="min-h-[44px] px-4 rounded-lg bg-surface-2 text-ink text-sm hover:bg-line transition-colors">✚ 新建 Campaign</button>
