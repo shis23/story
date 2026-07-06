@@ -947,6 +947,177 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    #[ignore = "发布前手动压测同步 JSON I/O：cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture"]
+    fn pressure_sync_json_io_across_collections() {
+        let writes_per_collection = std::env::var("SF_STORE_PRESSURE_WRITES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(120);
+
+        let dir = temp_dir();
+        let store = std::sync::Arc::new(CampaignStore::new(&dir));
+        store.save_card(make_card()).unwrap();
+        let camp = Campaign::new(Id::from_str("card-1"), "pressure");
+        let camp_id = camp.id.clone();
+        store.save_campaign(camp).unwrap();
+
+        let timings: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u128)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let total_start = std::time::Instant::now();
+        let mut handles = Vec::new();
+
+        {
+            let store = store.clone();
+            let timings = timings.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..writes_per_collection {
+                    let start = std::time::Instant::now();
+                    store
+                        .add_knowledge(vec![CharacterKnowledgeEntry::witnessed(
+                            camp_id.clone(),
+                            Id::from_str("inst-pressure"),
+                            format!("pressure knowledge {i}"),
+                            i + 1,
+                        )])
+                        .unwrap();
+                    record_store_timing(&timings, "knowledge", start.elapsed());
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let timings = timings.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..writes_per_collection {
+                    let start = std::time::Instant::now();
+                    store
+                        .add_task(StoryTask::user_planned(
+                            camp_id.clone(),
+                            format!("pressure task {i}"),
+                            "pressure task",
+                            vec![],
+                            i + 1,
+                        ))
+                        .unwrap();
+                    record_store_timing(&timings, "tasks", start.elapsed());
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let timings = timings.clone();
+            let barrier = barrier.clone();
+            let camp_id = camp_id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..writes_per_collection {
+                    let start = std::time::Instant::now();
+                    store
+                        .add_summary(RoundSummary::new(
+                            camp_id.clone(),
+                            Id::from_str("conv-pressure"),
+                            i + 1,
+                            format!("pressure summary {i}"),
+                        ))
+                        .unwrap();
+                    record_store_timing(&timings, "summaries", start.elapsed());
+                }
+            }));
+        }
+
+        {
+            let store = store.clone();
+            let timings = timings.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..writes_per_collection {
+                    let start = std::time::Instant::now();
+                    store
+                        .save_mvu(make_mvu(&format!("src-pressure-{i}"), "pressure"))
+                        .unwrap();
+                    record_store_timing(&timings, "mvu", start.elapsed());
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let elapsed_ms = total_start.elapsed().as_millis();
+        let reloaded = CampaignStore::new(&dir);
+        assert_eq!(
+            reloaded.list_knowledge(&camp_id).len(),
+            writes_per_collection as usize
+        );
+        assert_eq!(
+            reloaded.list_tasks(&camp_id).len(),
+            writes_per_collection as usize
+        );
+        assert_eq!(
+            reloaded.list_summaries(&camp_id).len(),
+            writes_per_collection as usize
+        );
+        assert_eq!(
+            reloaded.list_all_mvu().len(),
+            writes_per_collection as usize
+        );
+
+        let timings = timings.lock().unwrap_or_else(|p| p.into_inner());
+        eprintln!(
+            "CampaignStore pressure: writes_per_collection={writes_per_collection}, total_elapsed_ms={elapsed_ms}"
+        );
+        for label in ["knowledge", "tasks", "summaries", "mvu"] {
+            let samples: Vec<u128> = timings
+                .iter()
+                .filter_map(|(sample_label, micros)| (*sample_label == label).then_some(*micros))
+                .collect();
+            eprintln!("{}", format_store_timing(label, &samples));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn record_store_timing(
+        timings: &std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u128)>>>,
+        label: &'static str,
+        elapsed: std::time::Duration,
+    ) {
+        timings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((label, elapsed.as_micros()));
+    }
+
+    fn format_store_timing(label: &str, samples: &[u128]) -> String {
+        if samples.is_empty() {
+            return format!("{label}: no samples");
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        let p95 = sorted[(sorted.len() - 1) * 95 / 100];
+        let max = sorted[sorted.len() - 1];
+        format!(
+            "{label}: samples={} p50={}us p95={}us max={}us",
+            sorted.len(),
+            p50,
+            p95,
+            max
+        )
+    }
+
     fn make_mvu(source_id: &str, name: &str) -> StoredMvuTranslation {
         StoredMvuTranslation {
             source_character_id: Id::from_str(source_id),

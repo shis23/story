@@ -22,6 +22,7 @@
 - `cargo test -p harness-real-llm`：确定性测试通过；真实 LLM 用例默认 ignore。
 - `cargo test --workspace`：通过；真实 LLM 用例按预期 ignore。
 - `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
+- CampaignStore 压测：Git Bash 用 `SF_STORE_PRESSURE_WRITES=500 cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture`；PowerShell 用 `$env:SF_STORE_PRESSURE_WRITES='500'; cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture; Remove-Item Env:SF_STORE_PRESSURE_WRITES`。通过；本机 4 集合并发写入 500 次/集合，总耗时约 2.9s，p95 为 knowledge 6.6ms / tasks 7.4ms / summaries 6.8ms / mvu 8.5ms，max 约 28ms。
 
 本轮质量修复：
 
@@ -99,7 +100,7 @@ Android 候选版本需验证：
 当前仍需排队：
 
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
-- `CampaignStore` 已从单 Mutex 拆为集合级锁；同步 JSON I/O 仍需压测后判断是否拆后台 flush / `spawn_blocking`。
+- `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储仍需 keyring/系统安全存储方案。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。
