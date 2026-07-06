@@ -68,7 +68,7 @@
 - MVU schema preview 正确区分新增、覆盖、无变化字段。
 - 状态栏原生渲染可展示关键变量。
 - fallback fragments 有清晰提示，不导致写作崩溃。
-- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、`minDepth/maxDepth` 过滤和 World Info prompt 作用域已接入，但 PluginHost/HTML 渲染仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏与 legacy/Campaign alternate greeting 切换已接入。
+- regex / HTML 路径的降级结果已记录；regex 的 `promptOnly`/`markdownOnly` 已避免污染错误目标，消息列表 display-only UI 渲染、`minDepth/maxDepth` 过滤和 World Info prompt 作用域已接入，但 PluginHost/HTML 渲染仍待接；legacy 单卡 prompt-template 核心字段宏、本地变量宏、基础动态宏、单实例 Campaign 变量宏与 legacy/Campaign alternate greeting 切换已接入。
 
 ## 4. 真实 LLM
 

@@ -1530,7 +1530,11 @@ fn has_available_characters(ctx: &WritingContext) -> bool {
 fn prompt_template_context_for_writing(
     ctx: &WritingContext,
 ) -> Option<storyforge_domain::prompt_module::TemplateVarContext> {
-    if ctx.campaign_runtime.is_some() || ctx.characters.len() != 1 {
+    if let Some(runtime) = &ctx.campaign_runtime {
+        return prompt_template_context_from_campaign_runtime(runtime);
+    }
+
+    if ctx.characters.len() != 1 {
         return None;
     }
     ctx.characters.first().map(|character| {
@@ -1539,6 +1543,82 @@ fn prompt_template_context_for_writing(
             "玩家",
         )
     })
+}
+
+fn prompt_template_context_from_campaign_runtime(
+    runtime: &storyforge_domain::campaign_runtime::CampaignRuntimeContext,
+) -> Option<storyforge_domain::prompt_module::TemplateVarContext> {
+    if runtime.instances.len() != 1 {
+        return None;
+    }
+
+    let instance = runtime.instances.first()?;
+    let definition = runtime.definition_for_instance(instance);
+    let mut variables = std::collections::BTreeMap::new();
+    variables.insert(
+        "campaign.id".into(),
+        runtime.campaign.id.as_str().to_string(),
+    );
+    variables.insert("campaign.name".into(), runtime.campaign.name.clone());
+    variables.insert("turn".into(), runtime.turn.to_string());
+    for variable in &runtime.campaign.variables {
+        insert_template_variable(&mut variables, &variable.key, &variable.value);
+        insert_template_variable(
+            &mut variables,
+            &format!("campaign.{}", variable.key),
+            &variable.value,
+        );
+    }
+
+    variables.insert("instance.id".into(), instance.id.as_str().to_string());
+    variables.insert("instance.name".into(), instance.name.clone());
+    for variable in &instance.variables {
+        insert_template_variable(&mut variables, &variable.key, &variable.value);
+        insert_template_variable(
+            &mut variables,
+            &format!("instance.{}", variable.key),
+            &variable.value,
+        );
+    }
+
+    Some(storyforge_domain::prompt_module::TemplateVarContext {
+        char_name: instance.name.clone(),
+        user_name: "玩家".into(),
+        description: runtime
+            .resolved_persona_for(instance)
+            .map(str::to_string)
+            .unwrap_or_default(),
+        personality: runtime
+            .resolved_behavior_for(instance)
+            .map(str::to_string)
+            .unwrap_or_default(),
+        tags: definition
+            .and_then(|d| d.group.clone())
+            .into_iter()
+            .collect(),
+        variables,
+        ..Default::default()
+    })
+}
+
+fn insert_template_variable(
+    variables: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    variables.insert(key.to_string(), template_variable_value(value));
+}
+
+fn template_variable_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_default()
+        }
+    }
 }
 
 /// 构造 MVU JS 执行所需的当前变量快照
@@ -3493,6 +3573,48 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_template_context_uses_single_campaign_instance_variables() {
+        use storyforge_domain::campaign::CharacterInstance;
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::variables::VariableValue;
+
+        let mut campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
+        campaign.set_variable("story_clock", serde_json::json!("Day 9 夜"), 3);
+        campaign.set_variable("weather", serde_json::json!("雨"), 3);
+
+        let mut instance = CharacterInstance::temporary(campaign.id.clone(), "林医生");
+        instance.is_temporary = false;
+        instance.persona_override = Some("谨慎的外科医生".into());
+        instance.variables = vec![
+            VariableValue::new("hp", serde_json::json!(72), 3),
+            VariableValue::new("location", serde_json::json!("旧医院"), 3),
+        ];
+
+        let runtime = Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![instance],
+            definitions_by_id: std::collections::HashMap::new(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 3,
+        });
+        let mut ctx = WritingContext::legacy(vec![mock_character("Legacy")], None, Id::new());
+        ctx.campaign_runtime = Some(runtime);
+
+        let template = prompt_template_context_for_writing(&ctx).expect("single campaign instance");
+        let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "{{char}} {{description}} hp={{getvar::hp}} loc={{getvar::location}} clock={{getvar::story_clock}} weather={{getvar::campaign.weather}}",
+            &template,
+        );
+
+        assert_eq!(
+            rendered,
+            "林医生 谨慎的外科医生 hp=72 loc=旧医院 clock=Day 9 夜 weather=雨"
+        );
+    }
+
+    #[test]
     fn test_prompt_template_context_skips_ambiguous_character_contexts() {
         let multi = WritingContext::legacy(
             vec![mock_character("Seraphina"), mock_character("Lin")],
@@ -3503,16 +3625,19 @@ mod tests {
 
         let mut campaign =
             storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
-        let mut instance =
+        let mut lin =
             storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "Lin");
-        instance.is_temporary = false;
+        lin.is_temporary = false;
+        let mut mei =
+            storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "Mei");
+        mei.is_temporary = false;
         let runtime = Arc::new(
             storyforge_domain::campaign_runtime::CampaignRuntimeContext {
                 campaign: {
                     campaign.name = "第一周目".into();
                     campaign
                 },
-                instances: vec![instance],
+                instances: vec![lin, mei],
                 definitions_by_id: std::collections::HashMap::new(),
                 knowledge: vec![],
                 tasks: vec![],

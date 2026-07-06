@@ -149,7 +149,7 @@
 - **Regex display-only 渲染**：`infra-regex` 已区分 Prompt/Persisted/Display 目标，`promptOnly` 不再改显示/存储、`markdownOnly` 不再污染 prompt/持久化；Display 目标已接到消息展示 DTO 与前端渲染层，PluginHost/HTML 渲染仍待接。
 - **Regex depth 过滤**：`minDepth/maxDepth` 已在执行器生效；当前轮 Input/Output 按 depth 0，消息展示按离末尾深度执行 display-only 正则。
 - **Regex World Info 作用域**：ST placement 3 已接到常驻/触发世界书注入和 `search_world_info` 工具返回；Slash/Reasoning 仍待接。
-- **Prompt Template 宏覆盖度**：legacy 单卡 system prompt 已执行确定性核心宏（角色卡字段、`<user>/<bot>`、本地 `setvar/addvar/getvar/trim/comment`）和基础动态宏（`date/time/datetime/weekday/isotime`、`random`、`roll`）；Campaign 多角色下没有唯一 `{{char}}` 时会跳过渲染。跨轮持久变量和 Campaign 变量级宏仍是后续兼容项。
+- **Prompt Template 宏覆盖度**：legacy 单卡 system prompt 已执行确定性核心宏（角色卡字段、`<user>/<bot>`、本地 `setvar/addvar/getvar/trim/comment`）和基础动态宏（`date/time/datetime/weekday/isotime`、`random`、`roll`）；单实例 Campaign 已可从当前 runtime 快照读取 `getvar` 变量（Campaign/instance + `campaign.*`/`instance.*` 命名空间）。Campaign 多角色下没有唯一 `{{char}}` 时会跳过渲染，多角色变量作用域仍是后续兼容项。
 
 ## Phase 6: Android 打磨
 
