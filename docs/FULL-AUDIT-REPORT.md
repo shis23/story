@@ -17,13 +17,14 @@
 
 ## Critical（1 条）
 
-### C-001: `delete_by_character` 使用错误的元数据键 — 角色知识删除完全失效
+### C-001: ✅ `delete_by_character` 使用错误的元数据键已修复
 
 - **文件**: `crates/infra-vector/src/lib.rs:340`
-- **代码**: `records.retain(|_, r| r.metadata.get("character_id") != Some(&target));`
+- **历史代码**: `records.retain(|_, r| r.metadata.get("character_id") != Some(&target));`
 - **问题**: 所有插入代码使用 `"owner_character_id"` 作为元数据键（见 `MetadataFilter::for_character` 第 81 行），但 `delete_by_character` 查询 `"character_id"`。键名不匹配导致此函数永远不会删除任何记录。角色知识清理完全失效。
 - **影响**: 删除角色时，其向量知识条目永远残留，占用空间且可能在搜索中返回已删除角色的数据。
 - **修复**: 改为 `"owner_character_id"`，并补充单元测试。
+- **当前状态**: `delete_by_character()` 已查询 `"owner_character_id"`，`test_delete_by_character` 覆盖按角色删除行为。
 - **置信度**: R6 双盲一致确认 ✅✅
 
 ---
@@ -54,11 +55,12 @@
 - **当前状态（2026-07-06）**: 生产路径已使用 OS 标准数据目录并保留旧目录迁移；`AppState::new_for_test()` 使用临时目录，避免单元测试读取真实用户数据。
 - **置信度**: R1 双盲 ✅✅
 
-### H-004: `CharacterDefinition.role_type` 缺少 `#[serde(default)]`
+### H-004: ✅ `CharacterDefinition.role_type` 缺少 `#[serde(default)]` 已修复
 
 - **文件**: `crates/domain/src/character.rs:418`
 - **问题**: 旧 JSON 数据缺少 `role_type` 字段时反序列化会失败，而非回退到默认值 `Supporting`。
 - **修复**: 添加 `#[serde(default)]`。
+- **当前状态**: `role_type` 已有 `#[serde(default)]`，`test_role_type_default_is_supporting` 覆盖旧数据兼容。
 - **置信度**: R2 双盲 ✅✅ + R6 验证确认
 
 ### H-005: `ToolContext.campaign_runtime` 不含临时 instance
@@ -149,8 +151,8 @@
 |----|------|------|
 | M-001 | `runtime.rs:160` | ✅ 已修复：畸形 tool-call 参数不会执行真实工具，runtime 直接把 `Invalid JSON arguments` 作为 tool result 反馈给 LLM |
 | M-002 | `campaign_runtime.rs:103` | ✅ 已修复：`with_temporaries_for()` 会跳过空白 unmatched character_id，避免通过 `temporary_with_overrides` 生成 `Unknown Character` 临时角色 |
-| M-003 | `conversation.rs:87` | `active_variant` 无越界验证，腐败数据导致静默失败 |
-| M-004 | `campaign.rs:88` | `story_clock` 顶层字段与 variables 数组去同步 |
+| M-003 | `conversation.rs:87` | ✅ 已修复：`MessageNode` 手写反序列化会钳制越界 `active_variant`，并补回归测试 |
+| M-004 | `campaign.rs:88` | ✅ 已修复：`Campaign::set_variable("story_clock", ...)` 同步顶层字段，`current_story_clock()` 以变量为权威并兼容旧数据 |
 | M-005 | `lib.rs:1576` | ✅ 已修复：`postprocess_variable_keys()` 从 CampaignRuntimeContext 合并默认角色/全局变量、当前 Campaign 变量、定义 schema 与实例变量 |
 | M-006 | `app-pipeline:1069` | ✅ 已修复：多个 Subagent regenerate targets 会全部重跑，并按 `character_id` 回填，避免 target 顺序打乱旧 provenance/plan 顺序 |
 | M-007 | `runtime.rs:448` | ✅ 已修复：`run_tool_loop_with_layout` 与其他循环一致，命中 `terminal_tools` 后立即返回 |
@@ -162,7 +164,7 @@
 | M-013 | `CampaignInstancesTab.vue:184` | ✅ 已修复：JSON 变量编辑会先 `JSON.parse()`，解析失败阻止保存并提示错误 |
 | M-014 | 多个 Tab 组件 | ✅ 已修复：Instances/Knowledge/Tasks/Summaries Tab 已监听 `campaignId` 变化并重新加载 |
 | M-015 | `BaseOverlay.vue:95` | ✅ 已修复：body overflow 使用模块级引用计数，多个 overlay 关闭顺序不再互相解锁 |
-| M-016 | `connection_store.rs:108` | 唯一原始 `.lock().unwrap()` — 毒锁崩溃 |
+| M-016 | `connection_store.rs:108` | ✅ 已修复：`ConnectionStore` 生产路径使用 `.unwrap_or_else(|p| p.into_inner())` 恢复毒锁 |
 | M-017 | `archiver.rs:223` | ✅ 已修复：归档器从调用方传入模型名，`archive_batch_uses_supplied_model` 固化不再硬编码 `"deepseek-chat"` |
 | M-018 | `embedder.rs:119` | ✅ 已修复：embedding 非数值 JSON 元素返回 `LlmError::Internal`，并由 `test_parse_embedding_non_numeric_element_errors` 覆盖 |
 | M-019 | `sse.rs:175` | ✅ 已确认非问题：SSE 解析器由 `http_client.rs` 流循环驱动，调用点用 `tokio::select!` 监听取消并返回 `LlmError::Cancelled` |
@@ -221,9 +223,9 @@
 
 ### Quick Fix（< 30 分钟/项）
 
-1. **C-001**: `infra-vector:340` `"character_id"` → `"owner_character_id"`
-2. **M-016**: `connection_store.rs:108` `.unwrap()` → `.unwrap_or_else(|p| p.into_inner())`
-3. **H-004**: `character.rs:418` 添加 `#[serde(default)]`
+1. **C-001**: ✅ `infra-vector:340` 已从 `"character_id"` 改为 `"owner_character_id"`
+2. **M-016**: ✅ `connection_store.rs` 生产路径已使用 `.unwrap_or_else(|p| p.into_inner())`
+3. **H-004**: ✅ `character.rs:418` 已添加 `#[serde(default)]`
 4. **L-002/L-003/L-004**: 删除 3 个死函数/类型
 5. **M-010**: ✅ `Composer.vue:3` 已将 `sampleIntent` 内联为常量
 6. **H-008**: ✅ `AppSidebar.vue` navItems 已改为 computed

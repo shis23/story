@@ -431,6 +431,38 @@ mod tests {
     }
 
     #[test]
+    fn test_message_node_deserialize_clamps_out_of_bounds_active_variant() {
+        let json = serde_json::json!({
+            "id": "n1",
+            "parent_id": null,
+            "variants": [
+                {
+                    "id": "v1",
+                    "role": "Assistant",
+                    "content": "旧稿",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "Draft",
+                    "provenance": null
+                },
+                {
+                    "id": "v2",
+                    "role": "Assistant",
+                    "content": "最终稿",
+                    "created_at": "2026-01-01T00:01:00Z",
+                    "status": "Final",
+                    "provenance": null
+                }
+            ],
+            "active_variant": 99
+        });
+
+        let node: MessageNode = serde_json::from_value(json).unwrap();
+
+        assert_eq!(node.active_variant, 1);
+        assert_eq!(node.active_content(), "最终稿");
+    }
+
+    #[test]
     fn test_recent_messages_as_chat_maps_roles() {
         let c = conv(vec![
             node(
