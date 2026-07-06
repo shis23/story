@@ -240,14 +240,6 @@ fn load_embed_config_with_secret_store(
     }
 }
 
-fn save_embed_config(
-    data_dir: &Path,
-    config: &storyforge_infra_llm::EmbedConfig,
-) -> Result<(), String> {
-    let secret_store = SystemSecretStore::default();
-    persist_embed_config_secret_ref(data_dir, config, &secret_store)
-}
-
 fn persist_embed_config_secret_ref(
     data_dir: &Path,
     config: &storyforge_infra_llm::EmbedConfig,
@@ -4042,7 +4034,7 @@ fn switch_variant(
 
 /// 配置嵌入 API
 #[tauri::command]
-fn configure_embedder(
+async fn configure_embedder(
     endpoint: String,
     api_key: String,
     model: String,
@@ -4055,8 +4047,35 @@ fn configure_embedder(
         model,
         dim,
     };
-    save_embed_config(&state.data_dir, &config)
-        .map_err(|e| TauriCommandError::storage(format!("嵌入配置写入失败: {e}")))?;
+    configure_embedder_async(state.inner().clone(), config).await
+}
+
+async fn configure_embedder_async(
+    state: Arc<AppState>,
+    config: storyforge_infra_llm::EmbedConfig,
+) -> Result<(), TauriCommandError> {
+    configure_embedder_with_secret_store_async(
+        state,
+        config,
+        Arc::new(SystemSecretStore::default()) as Arc<dyn SecretStore>,
+    )
+    .await
+}
+
+async fn configure_embedder_with_secret_store_async(
+    state: Arc<AppState>,
+    config: storyforge_infra_llm::EmbedConfig,
+    secret_store: Arc<dyn SecretStore>,
+) -> Result<(), TauriCommandError> {
+    let data_dir = state.data_dir.clone();
+    let config_for_write = config.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_embed_config_secret_ref(&data_dir, &config_for_write, secret_store.as_ref())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("嵌入配置持久化任务失败: {e}")))?
+    .map_err(|e| TauriCommandError::storage(format!("嵌入配置写入失败: {e}")))?;
+
     *state
         .embed_config
         .write()
@@ -6928,6 +6947,45 @@ mod tests {
         assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_configure_embedder_async_persists_secret_ref_and_updates_state() {
+        let state = Arc::new(AppState::new_for_test());
+        let secret_store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
+        let config = storyforge_infra_llm::EmbedConfig {
+            endpoint: "https://api.example.com/v1/embeddings".into(),
+            api_key: "embed-async-secret".into(),
+            model: "embed-model".into(),
+            dim: 3,
+        };
+
+        configure_embedder_with_secret_store_async(
+            state.clone(),
+            config.clone(),
+            secret_store.clone(),
+        )
+        .await
+        .unwrap();
+
+        let raw = std::fs::read_to_string(state.data_dir.join("embed.json")).unwrap();
+        assert!(!raw.contains("embed-async-secret"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let loaded =
+            load_embed_config_with_secret_store(&state.data_dir, secret_store.as_ref()).unwrap();
+        assert_eq!(loaded.api_key, "embed-async-secret");
+
+        let in_memory = state
+            .embed_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap();
+        assert_eq!(in_memory.endpoint, config.endpoint);
+        assert_eq!(in_memory.api_key, "embed-async-secret");
+        assert_eq!(in_memory.model, config.model);
+        assert_eq!(in_memory.dim, config.dim);
     }
 
     #[test]
