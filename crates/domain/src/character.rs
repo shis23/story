@@ -455,6 +455,17 @@ impl CharacterCard {
         }
     }
 
+    /// Parses card-scoped ST regex scripts from raw `data.extensions.regex_scripts`.
+    pub fn scoped_regex_scripts(&self) -> Vec<crate::preset::RegexScript> {
+        let Some(extensions) = self.raw_card_json.get("extensions") else {
+            return Vec::new();
+        };
+        crate::preset::extract_regex_scripts_with_source(
+            extensions,
+            crate::preset::RegexScriptSource::Scoped,
+        )
+    }
+
     /// 按名字找角色定义
     pub fn find_definition(&self, name: &str) -> Option<&CharacterDefinition> {
         self.character_definitions.iter().find(|d| d.name == name)
@@ -733,6 +744,38 @@ mod multi_character_tests {
         assert_eq!(scripts[0].min_depth, None);
         assert_eq!(scripts[0].max_depth, Some(4));
         assert!(character.extensions.get("regex_scripts").is_some());
+    }
+
+    #[test]
+    fn test_character_card_exposes_scoped_regex_scripts_from_raw_st_data() {
+        let card = CharacterCard {
+            id: Id::from_str("card-campaign"),
+            name: "Campaign Card".into(),
+            source_character_id: Id::from_str("source-campaign"),
+            character_definitions: vec![],
+            raw_card_json: serde_json::json!({
+                "name": "Campaign Card",
+                "extensions": {
+                    "regex_scripts": [
+                        {
+                            "id": "campaign-scoped",
+                            "scriptName": "Campaign scoped output",
+                            "findRegex": "foo",
+                            "replaceString": "bar",
+                            "placement": [2],
+                            "disabled": false
+                        }
+                    ]
+                }
+            }),
+        };
+
+        let scripts = card.scoped_regex_scripts();
+
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "campaign-scoped");
+        assert_eq!(scripts[0].source, crate::preset::RegexScriptSource::Scoped);
+        assert_eq!(scripts[0].placement, crate::preset::RegexPlacement::Output);
     }
 
     #[test]

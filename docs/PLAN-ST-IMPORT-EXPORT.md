@@ -19,7 +19,7 @@
 - 不做 ST 聊天记录导入。
 - 不做 ST 插件系统兼容。
 
-> 2026-07-06 更新：Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据（原始 `placement` 数组、`markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth`）；角色卡 `data.extensions.regex_scripts` 也可通过 `Character::scoped_regex_scripts()` typed 读取。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 执行器已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`。2026-07-06 增量：`WritingContext.regex_scripts` 已接入流水线，首写和重 roll 会执行 Input/Output 正则；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，且 `CharacterInfo.extensions` 已持久化卡内扩展以支持重启后恢复。2026-07-06 追加：`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设，写作与重 roll 会按 Preset → Scoped 顺序合并 active Preset 正则。当前运行时仍只按现有 Input/Output 简化枚举过滤；Global 装配、Campaign 活动卡 Scoped 装配和多作用域执行仍属于后续 ST 运行时兼容工作。
+> 2026-07-06 更新：Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据（原始 `placement` 数组、`markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth`）；角色卡 `data.extensions.regex_scripts` 也可通过 `Character::scoped_regex_scripts()` typed 读取。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 执行器已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`。2026-07-06 增量：`WritingContext.regex_scripts` 已接入流水线，首写和重 roll 会执行 Input/Output 正则；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，且 `CharacterInfo.extensions` 已持久化卡内扩展以支持重启后恢复。2026-07-06 追加：`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设，写作与重 roll 会按 Preset → Scoped 顺序合并 active Preset 正则；Campaign 模式会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行。当前运行时仍只按现有 Input/Output 简化枚举过滤；Global 装配和多作用域执行仍属于后续 ST 运行时兼容工作。
 
 ## 当前事实
 

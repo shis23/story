@@ -28,7 +28,7 @@ use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{
     LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
-use storyforge_domain::preset::{RegexScript, merge_regex_script_sources};
+use storyforge_domain::preset::{RegexScript, RegexScriptSource, merge_regex_script_sources};
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
@@ -2029,11 +2029,16 @@ pub fn fill_campaign_runtime_from_store(
     let knowledge = store.list_knowledge(active_id);
     let tasks = store.list_tasks(active_id);
 
+    let stored_card = store.get_card(&camp.card_id);
+    if let Some(stored_card) = &stored_card {
+        append_missing_campaign_scoped_regex_scripts(ctx, stored_card.card.scoped_regex_scripts());
+    }
+
     // 从 card 的 character_definitions 构建 definitions_by_id
     let definitions_by_id: std::collections::HashMap<
         Id,
         storyforge_domain::character::CharacterDefinition,
-    > = if let Some(stored_card) = store.get_card(&camp.card_id) {
+    > = if let Some(stored_card) = stored_card {
         stored_card
             .card
             .character_definitions
@@ -2060,6 +2065,24 @@ pub fn fill_campaign_runtime_from_store(
     {
         let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         tool_guard.campaign_runtime = Some(runtime);
+    }
+}
+
+fn append_missing_campaign_scoped_regex_scripts(
+    ctx: &mut WritingContext,
+    scripts: Vec<RegexScript>,
+) {
+    let mut existing_scoped_ids: std::collections::HashSet<String> = ctx
+        .regex_scripts
+        .iter()
+        .filter(|script| script.source == RegexScriptSource::Scoped)
+        .map(|script| script.id.clone())
+        .collect();
+
+    for script in scripts {
+        if existing_scoped_ids.insert(script.id.clone()) {
+            ctx.regex_scripts.push(script);
+        }
     }
 }
 
@@ -6375,6 +6398,31 @@ mod tests {
         }
     }
 
+    fn test_regex_script(
+        id: &str,
+        source: RegexScriptSource,
+    ) -> storyforge_domain::preset::RegexScript {
+        storyforge_domain::preset::RegexScript {
+            id: id.to_string(),
+            script_name: id.to_string(),
+            find_regex: id.to_string(),
+            replace_string: String::new(),
+            placement: storyforge_domain::preset::RegexPlacement::Output,
+            placement_codes: vec![2],
+            source,
+            disabled: false,
+            flags: String::new(),
+            only_format_formatting: None,
+            markdown_only: None,
+            prompt_only: None,
+            run_on_edit: None,
+            substitute_regex: None,
+            trim_strings: vec![],
+            min_depth: None,
+            max_depth: None,
+        }
+    }
+
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）
     #[test]
     fn test_delete_character_source_ids_include_domain_character_id() {
@@ -6505,29 +6553,7 @@ mod tests {
     #[test]
     fn test_fill_regex_context_merges_active_preset_before_scoped_scripts() {
         use storyforge_domain::Source;
-        use storyforge_domain::preset::{Preset, RegexPlacement, RegexScript, RegexScriptSource};
-
-        fn script(id: &str, source: RegexScriptSource) -> RegexScript {
-            RegexScript {
-                id: id.to_string(),
-                script_name: id.to_string(),
-                find_regex: id.to_string(),
-                replace_string: String::new(),
-                placement: RegexPlacement::Output,
-                placement_codes: vec![2],
-                source,
-                disabled: false,
-                flags: String::new(),
-                only_format_formatting: None,
-                markdown_only: None,
-                prompt_only: None,
-                run_on_edit: None,
-                substitute_regex: None,
-                trim_strings: vec![],
-                min_depth: None,
-                max_depth: None,
-            }
-        }
+        use storyforge_domain::preset::{Preset, RegexScriptSource};
 
         let dir = std::env::temp_dir().join(format!(
             "storyforge_test_fill_regex_context_{}",
@@ -6539,14 +6565,14 @@ mod tests {
             .save(Preset {
                 name: "runtime preset".into(),
                 prompts: vec![],
-                regex_scripts: vec![script("preset-regex", RegexScriptSource::Scoped)],
+                regex_scripts: vec![test_regex_script("preset-regex", RegexScriptSource::Scoped)],
                 source: Source::ImportedFromST,
             })
             .unwrap();
         assert!(preset_store.set_active(&preset_id).unwrap());
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
-        ctx.regex_scripts = vec![script("scoped-regex", RegexScriptSource::Preset)];
+        ctx.regex_scripts = vec![test_regex_script("scoped-regex", RegexScriptSource::Preset)];
 
         fill_regex_context(&mut ctx, &preset_store);
 
@@ -6568,6 +6594,124 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fill_campaign_runtime_adds_active_card_scoped_regex_after_preset() {
+        use storyforge_app_agent::tools::ToolContext;
+        use storyforge_domain::Source;
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::character::CharacterCard;
+        use storyforge_domain::preset::{Preset, RegexScriptSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_campaign_scoped_regex_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let preset_store = preset_store::PresetStore::new(&dir);
+        let preset_id = preset_store
+            .save(Preset {
+                name: "runtime preset".into(),
+                prompts: vec![],
+                regex_scripts: vec![test_regex_script("preset-regex", RegexScriptSource::Scoped)],
+                source: Source::ImportedFromST,
+            })
+            .unwrap();
+        assert!(preset_store.set_active(&preset_id).unwrap());
+
+        let campaign_store = campaign_store::CampaignStore::new(&dir);
+        let card = CharacterCard {
+            id: Id::from_str("card-campaign"),
+            name: "Campaign Card".into(),
+            source_character_id: Id::from_str("source-campaign"),
+            character_definitions: vec![],
+            raw_card_json: serde_json::json!({
+                "name": "Campaign Card",
+                "extensions": {
+                    "regex_scripts": [{
+                        "id": "campaign-scoped-regex",
+                        "scriptName": "Campaign scoped regex",
+                        "findRegex": "foo",
+                        "replaceString": "bar",
+                        "placement": [2],
+                        "disabled": false
+                    }]
+                }
+            }),
+        };
+        campaign_store.save_card(card.clone()).unwrap();
+        let campaign = Campaign::new(card.id.clone(), "Campaign runtime");
+        campaign_store.save_campaign(campaign.clone()).unwrap();
+
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.regex_scripts = vec![test_regex_script(
+            "legacy-scoped-regex",
+            RegexScriptSource::Preset,
+        )];
+        fill_regex_context(&mut ctx, &preset_store);
+        let tool_ctx = Arc::new(RwLock::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+        }));
+
+        fill_campaign_runtime_from_store(&mut ctx, &tool_ctx, &campaign_store, &campaign.id);
+
+        let ids: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "preset-regex",
+                "legacy-scoped-regex",
+                "campaign-scoped-regex"
+            ]
+        );
+
+        let sources: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                RegexScriptSource::Preset,
+                RegexScriptSource::Scoped,
+                RegexScriptSource::Scoped
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_campaign_scoped_regex_skips_existing_scoped_id() {
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.regex_scripts = vec![test_regex_script("same-scoped", RegexScriptSource::Scoped)];
+
+        append_missing_campaign_scoped_regex_scripts(
+            &mut ctx,
+            vec![
+                test_regex_script("same-scoped", RegexScriptSource::Scoped),
+                test_regex_script("new-scoped", RegexScriptSource::Scoped),
+            ],
+        );
+
+        let ids: Vec<_> = ctx
+            .regex_scripts
+            .iter()
+            .map(|script| script.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["same-scoped", "new-scoped"]);
     }
 
     #[test]

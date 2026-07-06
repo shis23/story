@@ -99,14 +99,7 @@ fn frontend_file_dialog_usage_has_matching_capabilities() {
     }
 
     for unsupported in [
-        "readDir",
-        "mkdir",
-        "exists",
-        "remove",
-        "rename",
-        "copyFile",
-        "stat",
-        "lstat",
+        "readDir", "mkdir", "exists", "remove", "rename", "copyFile", "stat", "lstat",
     ] {
         assert!(
             !frontend_imports_helper(&frontend, "@tauri-apps/plugin-fs", unsupported),
