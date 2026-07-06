@@ -201,7 +201,7 @@ pub fn assemble_system_prompt(
 ///
 /// This intentionally keeps values owned so callers can build a context from a
 /// card, campaign snapshot, or test fixture without lifetime plumbing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TemplateVarContext {
     pub char_name: String,
     pub user_name: String,
@@ -216,12 +216,41 @@ pub struct TemplateVarContext {
     pub character_version: String,
     pub tags: Vec<String>,
     pub variables: BTreeMap<String, String>,
+    /// Whether macros that imply one active character (`{{char}}`,
+    /// `{{description}}`, `<bot>`, etc.) should be rendered.
+    ///
+    /// Multi-instance Campaign prompts can still render scoped variables while
+    /// preserving ambiguous character-card macros for later compatibility layers.
+    pub render_character_macros: bool,
     /// Fixed clock for deterministic prompt-template rendering in tests or replays.
     /// When absent, the renderer captures `Utc::now()` once per render call.
     pub now: Option<DateTime<Utc>>,
     /// Optional deterministic seed for `random` / `roll` macros.
     /// When absent, a per-render seed is derived from system time.
     pub random_seed: Option<u64>,
+}
+
+impl Default for TemplateVarContext {
+    fn default() -> Self {
+        Self {
+            char_name: String::new(),
+            user_name: String::new(),
+            description: String::new(),
+            personality: String::new(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            creator: String::new(),
+            character_version: String::new(),
+            tags: Vec::new(),
+            variables: BTreeMap::new(),
+            render_character_macros: true,
+            now: None,
+            random_seed: None,
+        }
+    }
 }
 
 impl TemplateVarContext {
@@ -240,6 +269,7 @@ impl TemplateVarContext {
             character_version: character.character_version.clone(),
             tags: character.tags.clone(),
             variables: BTreeMap::new(),
+            render_character_macros: true,
             now: None,
             random_seed: None,
         }
@@ -402,6 +432,9 @@ fn render_field_macro(
     state: &TemplateRenderState,
 ) -> Option<String> {
     let key = body.trim().to_ascii_lowercase();
+    if !context.render_character_macros && is_character_field_macro(&key) {
+        return None;
+    }
     let value = match key.as_str() {
         "char" | "charname" | "char_name" | "character" | "bot" => context.char_name.clone(),
         "user" | "username" | "user_name" => context.user_name.clone(),
@@ -430,6 +463,43 @@ fn render_field_macro(
         _ => return None,
     };
     Some(value)
+}
+
+fn is_character_field_macro(key: &str) -> bool {
+    matches!(
+        key,
+        "char"
+            | "charname"
+            | "char_name"
+            | "character"
+            | "bot"
+            | "charifnotuser"
+            | "char_if_not_user"
+            | "description"
+            | "char_description"
+            | "character_description"
+            | "personality"
+            | "persona"
+            | "scenario"
+            | "first_mes"
+            | "first_message"
+            | "firstmsg"
+            | "greeting"
+            | "mes_example"
+            | "example_dialogue"
+            | "example_messages"
+            | "examples"
+            | "system_prompt"
+            | "system"
+            | "post_history_instructions"
+            | "post_history"
+            | "post_history_instruction"
+            | "creator"
+            | "character_version"
+            | "char_version"
+            | "version"
+            | "tags"
+    )
 }
 
 fn render_random_macro(
@@ -542,9 +612,16 @@ fn default_template_random_seed() -> u64 {
 }
 
 fn replace_angle_aliases(text: &str, context: &TemplateVarContext) -> String {
-    text.replace("<USER>", &context.user_name)
+    let rendered = text
+        .replace("<USER>", &context.user_name)
         .replace("<User>", &context.user_name)
-        .replace("<user>", &context.user_name)
+        .replace("<user>", &context.user_name);
+
+    if !context.render_character_macros {
+        return rendered;
+    }
+
+    rendered
         .replace("<BOT>", &context.char_name)
         .replace("<Bot>", &context.char_name)
         .replace("<bot>", &context.char_name)

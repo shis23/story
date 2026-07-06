@@ -74,7 +74,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | alternate_greetings | 🟡 Legacy/Campaign 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话与 Campaign 新建游玩档均可在前端切换默认/备选开场，后端会校验开场来自源角色卡并持久化到 conversation |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
-| ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；单实例 Campaign 已可读取当前快照变量，多角色 Campaign 变量作用域仍待扩展 |
+| ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；Campaign 变量可从当前快照读取，单实例保留无前缀兼容，多角色支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，并保留歧义唯一角色宏 |
 | ST 事件总线 | 🟡 前端有 | `plugin-bridge.js` 有 `events.on`，后端 `PipelineEvent` 未桥接 |
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
 | 插件 API（window.storyforge）| ✅ 已有 | 8 方法 + 权限 + UI 槽 + 事件 |
@@ -84,7 +84,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
 | R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output/World Info，且已尊重 ST `placement_codes`；`promptOnly` 已只进提示词路径，`markdownOnly` 不再污染持久化文本；消息列表 display-only UI 渲染已接；`minDepth/maxDepth` 已在当前轮 Input/Output 与消息展示路径生效；Slash/Reasoning 与 PluginHost/HTML 渲染仍未完成 | **1-3 天** |
-| 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；单实例 Campaign 变量宏已接当前快照；多角色 Campaign 变量作用域仍待补 | 1-2 天 |
+| 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；Campaign 变量宏已接当前快照，单实例保留旧兼容，多角色已有明确 scope 读取；剩余主要是更冷门 ST 宏和 PluginHost/HTML 路径联动 | 0.5-1 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
 | 5 | 事件总线接线 | 前端有，后端未桥接 | 2-3 天 |

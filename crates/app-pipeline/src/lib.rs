@@ -1548,12 +1548,6 @@ fn prompt_template_context_for_writing(
 fn prompt_template_context_from_campaign_runtime(
     runtime: &storyforge_domain::campaign_runtime::CampaignRuntimeContext,
 ) -> Option<storyforge_domain::prompt_module::TemplateVarContext> {
-    if runtime.instances.len() != 1 {
-        return None;
-    }
-
-    let instance = runtime.instances.first()?;
-    let definition = runtime.definition_for_instance(instance);
     let mut variables = std::collections::BTreeMap::new();
     variables.insert(
         "campaign.id".into(),
@@ -1570,6 +1564,45 @@ fn prompt_template_context_from_campaign_runtime(
         );
     }
 
+    let mut instance_name_counts = std::collections::BTreeMap::<String, usize>::new();
+    for instance in &runtime.instances {
+        *instance_name_counts
+            .entry(instance.name.clone())
+            .or_default() += 1;
+    }
+
+    for instance in &runtime.instances {
+        insert_instance_template_scope(
+            &mut variables,
+            runtime,
+            instance,
+            &format!("instance.{}", instance.id.as_str()),
+        );
+
+        if instance_name_counts.get(&instance.name) == Some(&1) {
+            insert_instance_template_scope(
+                &mut variables,
+                runtime,
+                instance,
+                &format!("instance.{}", instance.name),
+            );
+        }
+    }
+
+    let Some(instance) = runtime
+        .instances
+        .first()
+        .filter(|_| runtime.instances.len() == 1)
+    else {
+        return Some(storyforge_domain::prompt_module::TemplateVarContext {
+            user_name: "玩家".into(),
+            variables,
+            render_character_macros: false,
+            ..Default::default()
+        });
+    };
+
+    let definition = runtime.definition_for_instance(instance);
     variables.insert("instance.id".into(), instance.id.as_str().to_string());
     variables.insert("instance.name".into(), instance.name.clone());
     for variable in &instance.variables {
@@ -1599,6 +1632,29 @@ fn prompt_template_context_from_campaign_runtime(
         variables,
         ..Default::default()
     })
+}
+
+fn insert_instance_template_scope(
+    variables: &mut std::collections::BTreeMap<String, String>,
+    runtime: &storyforge_domain::campaign_runtime::CampaignRuntimeContext,
+    instance: &CharacterInstance,
+    scope: &str,
+) {
+    variables.insert(format!("{scope}.id"), instance.id.as_str().to_string());
+    variables.insert(format!("{scope}.name"), instance.name.clone());
+    if let Some(persona) = runtime.resolved_persona_for(instance) {
+        variables.insert(format!("{scope}.description"), persona.to_string());
+    }
+    if let Some(behavior) = runtime.resolved_behavior_for(instance) {
+        variables.insert(format!("{scope}.personality"), behavior.to_string());
+    }
+    for variable in &instance.variables {
+        insert_template_variable(
+            variables,
+            &format!("{scope}.{}", variable.key),
+            &variable.value,
+        );
+    }
 }
 
 fn insert_template_variable(
@@ -3625,12 +3681,25 @@ mod tests {
 
         let mut campaign =
             storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
+        campaign.set_variable("weather", serde_json::json!("雨"), 2);
         let mut lin =
             storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
         lin.is_temporary = false;
+        lin.variables = vec![storyforge_domain::variables::VariableValue::new(
+            "hp",
+            serde_json::json!(71),
+            2,
+        )];
         let mut mei =
             storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "Mei");
+        mei.id = Id::from_str("inst-mei");
         mei.is_temporary = false;
+        mei.variables = vec![storyforge_domain::variables::VariableValue::new(
+            "location",
+            serde_json::json!("天台"),
+            2,
+        )];
         let runtime = Arc::new(
             storyforge_domain::campaign_runtime::CampaignRuntimeContext {
                 campaign: {
@@ -3648,7 +3717,62 @@ mod tests {
             WritingContext::legacy(vec![mock_character("Legacy")], None, Id::new());
         campaign_ctx.campaign_runtime = Some(runtime);
 
-        assert!(prompt_template_context_for_writing(&campaign_ctx).is_none());
+        let template = prompt_template_context_for_writing(&campaign_ctx)
+            .expect("multi-instance campaign should still expose scoped variables");
+        let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "{{char}} {{description}} <bot> user=<user> campaign={{getvar::campaign.name}} weather={{getvar::weather}} lin={{getvar::instance.inst-lin.name}} hp={{getvar::instance.inst-lin.hp}} mei_loc={{getvar::instance.Mei.location}}",
+            &template,
+        );
+
+        assert_eq!(
+            rendered,
+            "{{char}} {{description}} <bot> user=玩家 campaign=第一周目 weather=雨 lin=Lin hp=71 mei_loc=天台"
+        );
+    }
+
+    #[test]
+    fn test_prompt_template_context_uses_id_scope_for_duplicate_instance_names() {
+        let campaign = storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "同名档");
+        let mut first =
+            storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "影");
+        first.id = Id::from_str("inst-shadow-a");
+        first.is_temporary = false;
+        first.variables = vec![storyforge_domain::variables::VariableValue::new(
+            "stance",
+            serde_json::json!("guard"),
+            1,
+        )];
+        let mut second =
+            storyforge_domain::campaign::CharacterInstance::temporary(campaign.id.clone(), "影");
+        second.id = Id::from_str("inst-shadow-b");
+        second.is_temporary = false;
+        second.variables = vec![storyforge_domain::variables::VariableValue::new(
+            "stance",
+            serde_json::json!("attack"),
+            1,
+        )];
+
+        let runtime = Arc::new(
+            storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                campaign,
+                instances: vec![first, second],
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 1,
+            },
+        );
+        let mut ctx = WritingContext::legacy(vec![], None, Id::new());
+        ctx.campaign_runtime = Some(runtime);
+
+        let template = prompt_template_context_for_writing(&ctx)
+            .expect("duplicate-name campaign should expose id-scoped variables");
+        let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "a={{getvar::instance.inst-shadow-a.stance}} b={{getvar::instance.inst-shadow-b.stance}} by_name={{getvar::instance.影.stance}}",
+            &template,
+        );
+
+        assert_eq!(rendered, "a=guard b=attack by_name=");
     }
 
     /// truncate_chars 基本功能验证
