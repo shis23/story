@@ -1452,7 +1452,9 @@ fn apply_context_regex(
     let target = match placement {
         RegexPlacement::Input => RegexExecutionTarget::Prompt,
         RegexPlacement::Output => RegexExecutionTarget::Persisted,
+        RegexPlacement::SlashCommand => RegexExecutionTarget::Prompt,
         RegexPlacement::WorldInfo => RegexExecutionTarget::Prompt,
+        RegexPlacement::Reasoning => RegexExecutionTarget::Prompt,
     };
     apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
         .map_err(|e| PipelineError::Regex(e.to_string()))
@@ -2170,7 +2172,11 @@ mod tests {
     use std::path::PathBuf;
     use storyforge_domain::Source;
     use storyforge_domain::character::Character;
-    use storyforge_domain::preset::{RegexPlacement, RegexScript, RegexScriptSource};
+    use storyforge_domain::preset::{
+        RegexPlacement, RegexScript, RegexScriptSource, ST_REGEX_PLACEMENT_AI_OUTPUT,
+        ST_REGEX_PLACEMENT_REASONING, ST_REGEX_PLACEMENT_SLASH_COMMAND,
+        ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
+    };
     use storyforge_infra_llm::mock_client::MockLlmClient;
 
     /// 构造最小 mock 角色卡（满足 characters 非空校验）
@@ -2206,9 +2212,11 @@ mod tests {
         placement: RegexPlacement,
     ) -> RegexScript {
         let placement_codes = match placement {
-            RegexPlacement::Input => vec![0],
-            RegexPlacement::Output => vec![2],
-            RegexPlacement::WorldInfo => vec![3],
+            RegexPlacement::Input => vec![ST_REGEX_PLACEMENT_USER_INPUT],
+            RegexPlacement::Output => vec![ST_REGEX_PLACEMENT_AI_OUTPUT],
+            RegexPlacement::SlashCommand => vec![ST_REGEX_PLACEMENT_SLASH_COMMAND],
+            RegexPlacement::WorldInfo => vec![ST_REGEX_PLACEMENT_WORLD_INFO],
+            RegexPlacement::Reasoning => vec![ST_REGEX_PLACEMENT_REASONING],
         };
         RegexScript {
             id: format!("test-{name}"),
@@ -2397,6 +2405,23 @@ mod tests {
             .expect("prompt-only input regex should apply to prompt target");
 
         assert_eq!(result, "rewritten intent");
+    }
+
+    #[test]
+    fn test_context_input_regex_uses_current_st_user_input_code() {
+        let mut script = mock_regex_script(
+            "reader-input-wrapper",
+            r"(.*)",
+            "<reader-response>$1</reader-response>",
+            RegexPlacement::Input,
+        );
+        script.prompt_only = Some(true);
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT];
+
+        let result = apply_context_regex("go north", &[script], RegexPlacement::Input)
+            .expect("current ST user input placement should apply before prompting");
+
+        assert_eq!(result, "<reader-response>go north</reader-response>");
     }
 
     #[test]

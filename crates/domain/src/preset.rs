@@ -46,9 +46,9 @@ pub struct RegexScript {
     pub script_name: String,
     pub find_regex: String,
     pub replace_string: String,
-    /// 作用域（D12：输入正则 vs 输出正则）
+    /// 作用域（ST regex placement）。
     pub placement: RegexPlacement,
-    /// ST 原始 placement 数组，用于后续恢复 World Info/Slash/Reasoning 等作用域语义。
+    /// ST 原始 placement 数组，用于恢复 User Input/Slash/World Info/Reasoning 等作用域语义。
     #[serde(default)]
     pub placement_codes: Vec<i32>,
     #[serde(default)]
@@ -68,15 +68,30 @@ pub struct RegexScript {
     pub max_depth: Option<i32>,
 }
 
-/// 正则作用域（D12）
+/// Current SillyTavern regex placement codes.
+///
+/// `0` is a deprecated markdown display placement in ST and is kept only as
+/// import metadata; StoryForge does not execute it as a runtime hook.
+pub const ST_REGEX_PLACEMENT_MARKDOWN_DISPLAY: i32 = 0;
+pub const ST_REGEX_PLACEMENT_USER_INPUT: i32 = 1;
+pub const ST_REGEX_PLACEMENT_AI_OUTPUT: i32 = 2;
+pub const ST_REGEX_PLACEMENT_SLASH_COMMAND: i32 = 3;
+pub const ST_REGEX_PLACEMENT_WORLD_INFO: i32 = 5;
+pub const ST_REGEX_PLACEMENT_REASONING: i32 = 6;
+
+/// 正则作用域（ST regex placement）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegexPlacement {
     /// 输入正则：用户→导演前
     Input,
     /// 输出正则：编剧成文后
     Output,
+    /// Slash command 正则：斜杠命令值处理
+    SlashCommand,
     /// 世界书正则：世界书条目注入 prompt 前
     WorldInfo,
+    /// Reasoning 正则：推理内容块处理
+    Reasoning,
 }
 
 /// ST regex script source. Defaulting to Preset keeps older stored preset JSON compatible.
@@ -219,9 +234,21 @@ fn regex_script_applies_to_placement(script: &RegexScript, placement: RegexPlace
     }
 
     match placement {
-        RegexPlacement::Input => script.placement_codes.contains(&0),
-        RegexPlacement::Output => script.placement_codes.contains(&2),
-        RegexPlacement::WorldInfo => script.placement_codes.contains(&3),
+        RegexPlacement::Input => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_USER_INPUT),
+        RegexPlacement::Output => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_AI_OUTPUT),
+        RegexPlacement::SlashCommand => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_SLASH_COMMAND),
+        RegexPlacement::WorldInfo => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_WORLD_INFO),
+        RegexPlacement::Reasoning => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_REASONING),
     }
 }
 
@@ -247,11 +274,14 @@ pub(crate) fn extract_regex_scripts_with_source(
     arr.iter()
         .filter_map(|v| serde_json::from_value::<StRegexScript>(v.clone()).ok())
         .map(|s| {
-            // ST placement: [0] = main input, [2] = output. Other execution
-            // points are preserved in placement_codes until their hooks exist.
+            // ST placement: [1] = user input, [2] = AI output, [3] = slash
+            // command, [5] = world info, [6] = reasoning. Other/deprecated
+            // execution points stay preserved in placement_codes.
             let placement = match s.placement.first() {
-                Some(2) => RegexPlacement::Output,
-                Some(3) => RegexPlacement::WorldInfo,
+                Some(&ST_REGEX_PLACEMENT_AI_OUTPUT) => RegexPlacement::Output,
+                Some(&ST_REGEX_PLACEMENT_SLASH_COMMAND) => RegexPlacement::SlashCommand,
+                Some(&ST_REGEX_PLACEMENT_WORLD_INFO) => RegexPlacement::WorldInfo,
+                Some(&ST_REGEX_PLACEMENT_REASONING) => RegexPlacement::Reasoning,
                 _ => RegexPlacement::Input,
             };
             let placement_codes = s.placement;
@@ -355,11 +385,11 @@ mod tests {
     fn preset_regex_helpers_respect_st_placement_codes() {
         let mut both = make_script("both", "both", RegexScriptSource::Preset);
         both.placement = RegexPlacement::Input;
-        both.placement_codes = vec![0, 2];
+        both.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_AI_OUTPUT];
 
-        let mut world_info = make_script("world", "world", RegexScriptSource::Preset);
-        world_info.placement = RegexPlacement::Input;
-        world_info.placement_codes = vec![1];
+        let mut slash = make_script("slash", "slash", RegexScriptSource::Preset);
+        slash.placement = RegexPlacement::SlashCommand;
+        slash.placement_codes = vec![ST_REGEX_PLACEMENT_SLASH_COMMAND];
 
         let mut legacy_input = make_script("legacy", "legacy", RegexScriptSource::Preset);
         legacy_input.placement = RegexPlacement::Input;
@@ -368,7 +398,7 @@ mod tests {
         let preset = Preset {
             name: "test".to_string(),
             prompts: vec![],
-            regex_scripts: vec![both, world_info, legacy_input],
+            regex_scripts: vec![both, slash, legacy_input],
             source: Source::Native,
         };
 
@@ -388,26 +418,61 @@ mod tests {
     }
 
     #[test]
-    fn preset_import_maps_world_info_regex_placement() {
+    fn preset_import_maps_current_st_regex_placements() {
         let preset = Preset::from_st(StPreset {
-            name: Some("World regex".into()),
+            name: Some("Current placement regex".into()),
             prompts: vec![],
             extensions: serde_json::json!({
-                "regex_scripts": [{
-                    "id": "wi",
-                    "scriptName": "world-info",
-                    "findRegex": "foo",
-                    "replaceString": "bar",
-                    "placement": [3],
-                    "disabled": false,
-                    "flags": "gm"
-                }]
+                "regex_scripts": [
+                    {
+                        "id": "input",
+                        "scriptName": "user input",
+                        "findRegex": "foo",
+                        "replaceString": "bar",
+                        "placement": [1],
+                        "disabled": false,
+                        "flags": "gm"
+                    },
+                    {
+                        "id": "slash",
+                        "scriptName": "slash command",
+                        "findRegex": "foo",
+                        "replaceString": "bar",
+                        "placement": [3],
+                        "disabled": false,
+                        "flags": "gm"
+                    },
+                    {
+                        "id": "wi",
+                        "scriptName": "world-info",
+                        "findRegex": "foo",
+                        "replaceString": "bar",
+                        "placement": [5],
+                        "disabled": false,
+                        "flags": "gm"
+                    },
+                    {
+                        "id": "reasoning",
+                        "scriptName": "reasoning",
+                        "findRegex": "foo",
+                        "replaceString": "bar",
+                        "placement": [6],
+                        "disabled": false,
+                        "flags": "gm"
+                    }
+                ]
             }),
         });
 
-        assert_eq!(preset.regex_scripts.len(), 1);
-        assert_eq!(preset.regex_scripts[0].placement, RegexPlacement::WorldInfo);
-        assert!(preset.input_regex_scripts().is_empty());
+        assert_eq!(preset.regex_scripts.len(), 4);
+        assert_eq!(preset.regex_scripts[0].placement, RegexPlacement::Input);
+        assert_eq!(
+            preset.regex_scripts[1].placement,
+            RegexPlacement::SlashCommand
+        );
+        assert_eq!(preset.regex_scripts[2].placement, RegexPlacement::WorldInfo);
+        assert_eq!(preset.regex_scripts[3].placement, RegexPlacement::Reasoning);
+        assert_eq!(preset.input_regex_scripts().len(), 1);
         assert!(preset.output_regex_scripts().is_empty());
     }
 

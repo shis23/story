@@ -6,7 +6,10 @@
 /// - Output: applied after the writer finalizes
 /// - sub-agents do not run regex
 use serde::{Deserialize, Serialize};
-use storyforge_domain::preset::{RegexPlacement, RegexScript};
+use storyforge_domain::preset::{
+    RegexPlacement, RegexScript, ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING,
+    ST_REGEX_PLACEMENT_SLASH_COMMAND, ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_WORLD_INFO,
+};
 
 // --- regex executor --------------------------------------------------------
 
@@ -105,8 +108,11 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
             RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
         })?;
 
-    // Global replace (regress replace_all semantics)
-    let result = re.replace_all(text, script.replace_string.as_str());
+    let result = if regex_spec.flags.contains('g') {
+        re.replace_all(text, script.replace_string.as_str())
+    } else {
+        re.replace(text, script.replace_string.as_str())
+    };
 
     Ok(result.to_string())
 }
@@ -179,9 +185,21 @@ fn script_applies_to_placement(script: &RegexScript, placement: &RegexPlacement)
     }
 
     match placement {
-        RegexPlacement::Input => script.placement_codes.contains(&0),
-        RegexPlacement::Output => script.placement_codes.contains(&2),
-        RegexPlacement::WorldInfo => script.placement_codes.contains(&3),
+        RegexPlacement::Input => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_USER_INPUT),
+        RegexPlacement::Output => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_AI_OUTPUT),
+        RegexPlacement::SlashCommand => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_SLASH_COMMAND),
+        RegexPlacement::WorldInfo => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_WORLD_INFO),
+        RegexPlacement::Reasoning => script
+            .placement_codes
+            .contains(&ST_REGEX_PLACEMENT_REASONING),
     }
 }
 
@@ -342,6 +360,17 @@ mod tests {
     }
 
     #[test]
+    fn test_non_global_regex_replaces_only_first_match() {
+        let mut script = make_script("single", r"foo", "bar", RegexPlacement::Output);
+        script.flags.clear();
+
+        let result = apply_regex_scripts("foo foo", &[script], RegexPlacement::Output)
+            .expect("non-global regex should compile");
+
+        assert_eq!(result, "bar foo");
+    }
+
+    #[test]
     fn test_parse_st_regex_literal_preserves_escaped_slash_and_merges_flags() {
         let spec = parse_st_regex_spec(r"/https:\/\/example\.com/gi", "im");
 
@@ -374,13 +403,44 @@ mod tests {
     #[test]
     fn test_st_multi_placement_codes_apply_to_input_and_output() {
         let mut script = make_script("both", r"foo", "bar", RegexPlacement::Input);
-        script.placement_codes = vec![0, 2];
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_AI_OUTPUT];
 
         let input = apply_regex_scripts("foo", &[script.clone()], RegexPlacement::Input).unwrap();
         let output = apply_regex_scripts("foo", &[script], RegexPlacement::Output).unwrap();
 
         assert_eq!(input, "bar");
         assert_eq!(output, "bar");
+    }
+
+    #[test]
+    fn test_current_st_user_input_placement_code_applies_to_input() {
+        let mut script = make_script(
+            "user-input",
+            r"/(.*)/s",
+            "<reader-response>$1</reader-response>",
+            RegexPlacement::Input,
+        );
+        script.flags.clear();
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT];
+        script.prompt_only = Some(true);
+
+        let input = apply_regex_scripts_for_target(
+            "go north",
+            &[script.clone()],
+            RegexPlacement::Input,
+            RegexExecutionTarget::Prompt,
+        )
+        .unwrap();
+        let output = apply_regex_scripts_for_target(
+            "go north",
+            &[script],
+            RegexPlacement::Output,
+            RegexExecutionTarget::Prompt,
+        )
+        .unwrap();
+
+        assert_eq!(input, "<reader-response>go north</reader-response>");
+        assert_eq!(output, "go north");
     }
 
     #[test]
@@ -508,9 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_st_placement_code_does_not_fall_back_to_input() {
-        let mut script = make_script("world-info", r"foo", "bar", RegexPlacement::Input);
-        script.placement_codes = vec![1];
+    fn test_slash_command_placement_code_does_not_fall_back_to_input() {
+        let mut script = make_script("slash", r"foo", "bar", RegexPlacement::SlashCommand);
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_SLASH_COMMAND];
 
         let result = apply_regex_scripts("foo", &[script], RegexPlacement::Input).unwrap();
 
@@ -520,7 +580,7 @@ mod tests {
     #[test]
     fn test_world_info_placement_code_applies_only_to_world_info_target() {
         let mut script = make_script("world-info", r"foo", "bar", RegexPlacement::Input);
-        script.placement_codes = vec![3];
+        script.placement_codes = vec![ST_REGEX_PLACEMENT_WORLD_INFO];
 
         let input = apply_regex_scripts_for_target_at_depth(
             "foo",
@@ -544,9 +604,32 @@ mod tests {
     }
 
     #[test]
+    fn test_slash_and_reasoning_placement_codes_are_distinct_targets() {
+        let mut slash = make_script("slash", r"foo", "slash", RegexPlacement::SlashCommand);
+        slash.placement_codes = vec![ST_REGEX_PLACEMENT_SLASH_COMMAND];
+        let mut reasoning = make_script("reasoning", r"foo", "reason", RegexPlacement::Reasoning);
+        reasoning.placement_codes = vec![ST_REGEX_PLACEMENT_REASONING];
+
+        let scripts = vec![slash.clone(), reasoning.clone()];
+
+        assert_eq!(
+            apply_regex_scripts("foo", &scripts, RegexPlacement::SlashCommand).unwrap(),
+            "slash"
+        );
+        assert_eq!(
+            apply_regex_scripts("foo", &scripts, RegexPlacement::Reasoning).unwrap(),
+            "reason"
+        );
+        assert_eq!(
+            apply_regex_scripts("foo", &scripts, RegexPlacement::WorldInfo).unwrap(),
+            "foo"
+        );
+    }
+
+    #[test]
     fn test_split_by_placement() {
         let mut both = make_script("both", r"x", "y", RegexPlacement::Input);
-        both.placement_codes = vec![0, 2];
+        both.placement_codes = vec![ST_REGEX_PLACEMENT_USER_INPUT, ST_REGEX_PLACEMENT_AI_OUTPUT];
         let scripts = vec![
             make_script("输入1", r"a", "b", RegexPlacement::Input),
             make_script("输出1", r"c", "d", RegexPlacement::Output),

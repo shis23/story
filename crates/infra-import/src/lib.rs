@@ -223,7 +223,7 @@ mod tests {
                         "scriptName": "去复述",
                         "findRegex": "^(.{0,20}).*\\1",
                         "replaceString": "$1",
-                        "placement": [0],
+                        "placement": [1],
                         "disabled": false,
                         "flags": "gm"
                     },

@@ -904,7 +904,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_world_info_applies_world_info_regex() {
-        use storyforge_domain::preset::{RegexPlacement, RegexScript, RegexScriptSource};
+        use storyforge_domain::preset::{
+            RegexPlacement, RegexScript, RegexScriptSource, ST_REGEX_PLACEMENT_WORLD_INFO,
+        };
         use storyforge_domain::world_info::{
             LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
         };
@@ -941,7 +943,7 @@ mod tests {
                 find_regex: r"\{\{MOON\}\}".into(),
                 replace_string: "Lunar Vault".into(),
                 placement: RegexPlacement::WorldInfo,
-                placement_codes: vec![3],
+                placement_codes: vec![ST_REGEX_PLACEMENT_WORLD_INFO],
                 source: RegexScriptSource::Preset,
                 disabled: false,
                 flags: "gm".into(),

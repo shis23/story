@@ -13,7 +13,7 @@
 | F3 | MVU apply backfill loop 死代码（card.id 当 campaign_id） | 🔴 High | Bug（生产死代码） | **已修**（`list_all_instances` + definition_id 过滤） |
 | P0 | 子 agent get_character 绑定-unresolvable 读侧泄漏 | 🟠 Medium | Bug（defense-in-depth） | **已修 + B0 钉测** |
 | P3 | postprocess 写回空集逃生口（present_chars 空⇒全过） | 🟠 Medium | **设计缺陷**（门禁按"在场"一刀切所有来源） | **重定位**：非"收紧/保留"取舍，根因是门禁不区分知识来源。最小修复=按 `KnowledgeSource` 分流（见 §P3）。完整"知识传播引擎"单独立项 `PLAN-KNOWLEDGE-PROPAGATION.md` |
-| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **待修**（方案A：同名时 name 路失效逼 id） |
+| P4 | postprocess 写回 name/id 三路匹配别名风险 | 🟡 Low | 设计取舍 | **已修**（方案A：同名时 name 路失效逼 id） |
 | T3 | `t3_regenerate_all` 吞错误致测试假绿 | 🟡 Low | 测试质量 | **已修**（`regenerate_with_retry` 只对 `Llm` 重试 + 严格断言） |
 | 验证 | 知识边界读侧隔离（volatile tail / get_character / temp instance） | ✅ | 验证通过 | 4/4 钉测绿 |
 
@@ -152,9 +152,9 @@ LLM 输出的是自然语言总结（"任务已完成，结果已通过 emit_cha
 
 **现象**：`is_postprocess_instance_present` 用三路匹配：`raw_id` / `inst.id` / `inst.name` 任一在 `present_ids` 即算在场。若两个 instance 同名，present 含该 name 时两者都通过——name 匹配无法区分。
 
-**钉测**：`b4_present_chars_name_id_matching`（绿，正常 name/id 匹配）+ `b4_name_collision_both_pass`（绿，记录同名歧义行为）。
+**钉测**：`b4_present_chars_name_id_matching`（绿，正常 name/id 匹配）+ `b4_name_collision_only_id_path_works` / `b4_name_collision_id_path_still_works`（绿，同名时 name 路失效，只有 id 命中者通过）。
 
-**待修（方案A，worktree w3-p3p4 执行）**：保留 name 兜底（不让 postprocess 瘫痪——它按名字输出是既有契约），但在**同名场景**强制走 id：检测到 Campaign 内存在同名 instance 时，name 路失效，逼上游/Director 用 instance_id。比"全删 name 路"（方案B，需改 postprocess 输出链路）更小、更安全。
+**已修（方案A，worktree w3-p3p4 合并）**：保留 name 兜底（不让 postprocess 瘫痪——它按名字输出是既有契约），但在**同名场景**强制走 id：`persist_postprocess_outcome` 会预先计算 Campaign 内出现 ≥2 次的 `name_collisions`，传给 `is_postprocess_instance_present`；命中同名集合时 name 路失效，逼上游/Director 用 instance_id。比"全删 name 路"（方案B，需改 postprocess 输出链路）更小、更安全。
 
 ## ✅ 验证通过：知识边界读侧隔离
 
@@ -206,7 +206,7 @@ LLM_BASE_URL='...' LLM_API_KEY='...' LLM_MODEL='...' \
 - **F1**：`HttpLlmClient.effective_model()` 修复 model 透传，`ModelPinningLlmClient` wrapper 已删，5 单测覆盖。
 - **F2**：`CHARACTER_EXTRACTOR_SYSTEM_PROMPT` 强化（治标）。
 - **P3**：`is_postprocess_instance_present` 空集分支加 `warn!` 日志（行为不变，可观测性提升）。
-- **P4**：name 匹配路径加 `debug!` 日志（id 优先 + name 兜底时可观测）。
+- **P4**：方案A 已落地：同名 instance 时 name 匹配路失效逼 id；测试覆盖正常 name/id、同名 name 拒绝、同名 id 命中。
 - **T2**：`t2_multi_turn.rs`——3 轮 append 测试（`#[ignore]`）。
 - **T3**：`t3_regenerate.rs`——整体/仅编剧/仅导演 regenerate 测试（`#[ignore]`）。
 - **C1-C8**：`c_command_layer.rs`——C1 导入/识别、C2 Campaign 生命周期（CRUD + 变量 + 任务 + 知识 + 摘要）、C5 对话变体、C6 健康检查。9 确定性 + 1 真实 LLM（`#[ignore]`）。

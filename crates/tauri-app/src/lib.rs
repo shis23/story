@@ -1090,7 +1090,9 @@ fn regex_script_dto(r: &RegexScript) -> RegexScriptDto {
         placement: match r.placement {
             storyforge_domain::preset::RegexPlacement::Input => "input",
             storyforge_domain::preset::RegexPlacement::Output => "output",
+            storyforge_domain::preset::RegexPlacement::SlashCommand => "slash_command",
             storyforge_domain::preset::RegexPlacement::WorldInfo => "world_info",
+            storyforge_domain::preset::RegexPlacement::Reasoning => "reasoning",
         }
         .to_string(),
         placement_codes: r.placement_codes.clone(),
