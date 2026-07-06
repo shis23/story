@@ -162,7 +162,7 @@
 | M-015 | `BaseOverlay.vue:95` | body overflow 多实例冲突 — 一个关闭解锁所有 |
 | M-016 | `connection_store.rs:108` | 唯一原始 `.lock().unwrap()` — 毒锁崩溃 |
 | M-017 | `archiver.rs:223` | ✅ 已修复：归档器从调用方传入模型名，`archive_batch_uses_supplied_model` 固化不再硬编码 `"deepseek-chat"` |
-| M-018 | `embedder.rs:119` | 非数值 JSON 静默转为 0.0 — 损坏 embedding |
+| M-018 | `embedder.rs:119` | ✅ 已修复：embedding 非数值 JSON 元素返回 `LlmError::Internal`，并由 `test_parse_embedding_non_numeric_element_errors` 覆盖 |
 | M-019 | `sse.rs:175` | 接收端断开后 SSE 继续处理完整流 |
 | M-020 | `lib.rs:287` | 日志写入 `writeln!` 结果被丢弃 |
 | M-021 | `crates/app-logging/src/lib.rs` | ✅ 2026-07-07 已修复：LogStore JSONL 落盘使用专用互斥锁，并发回放测试验证完整行 |
