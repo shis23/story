@@ -234,18 +234,18 @@
 | ST-T4 | StoryForge Campaign 导出格式设计 | 已实现 | W7 `export_campaign` 命令 + JSON bundle（`format_version`）+ ST 卡 PNG tEXt 写入 + 共享 lorebook |
 | ST-T5 | 评估导出回 ST 卡/Lorebook | 已实现 | W7 评估 checkbox 已结；ST 卡 PNG + lorebook 导出已落地 |
 
-### Phase 6：Android（~5%）
+### Phase 6：Android（~15%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |
 |---|---|---|---|
-| AND-1 | 构建链基线（验 `cargo tauri android build`） | 未开始 | 仅 Tauri 自动生成脚手架 `crates/tauri-app/gen/android/`，无构建记录 |
+| AND-1 | 构建链基线（验 `cargo tauri android build`） | 部分完成 | 2026-07-06 已通过 `cargo tauri android build --debug --target x86_64 --ci` 和 `cargo tauri android build --target x86_64 --ci`；`lib.rs::run` 已补 `tauri::mobile_entry_point`。多 ABI、签名和真机安装未验 |
 | AND-2 | Android 系统选择器文件导入路径 | 未开始 | 无 Android 专属 import 改动 |
 | AND-3 | 本地数据目录 + 迁移/schema 版本 | 未开始 | 无 debug data-dir 命令、无 schema/version 字段 |
 | AND-4 | 长任务/流式/取消在移动端 | 未开始 | 无 Android 生命周期处理 |
 | AND-5 | 移动端排障/诊断导出 | 未开始 | `app-logging::export_bundle` 仅日志；无 Android share-sheet/诊断包 |
 | AND-6 | capability 权限收敛 | 未开始 | `capabilities/default.json` 仍粗（`core:default`/`fs:default`/`dialog:default`） |
 
-注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`），但是 Tauri v2 未改动的自动生成脚手架——`MainActivity.kt` 仅调 `enableEdgeToEdge()`，与 `PLAN-ANDROID.md`"当前事实"一致。PLAN-ANDROID 各阶段均未执行。
+注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`）。2026-07-06 已验证 x86_64 debug/release 构建链路，但 `MainActivity.kt` 仍基本是 Tauri 自动生成脚手架，仅调 `enableEdgeToEdge()`；文件导入、数据目录、长任务和诊断导出仍未做真机验收。
 
 ### 下一阶段建议
 

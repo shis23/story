@@ -49,10 +49,17 @@ cd crates/tauri-app
 cargo tauri android build
 ```
 
+当前记录（2026-07-06，Windows 11 / JDK 17 / NDK 27.2.12479018）：
+
+- `cargo tauri android build --debug --target x86_64 --ci`：通过，生成 `app-universal-debug.apk`（约 249 MB）和 `app-universal-debug.aab`（约 84 MB）。
+- `cargo tauri android build --target x86_64 --ci`：通过，生成 `app-universal-release-unsigned.apk`（约 41 MB）和 `app-universal-release.aab`（约 27 MB）。
+- 初次失败原因已修复：Rust 动态库缺少 Tauri mobile runtime symbols，已在 `crates/tauri-app/src/lib.rs::run` 加 `#[cfg_attr(mobile, tauri::mobile_entry_point)]`。
+- 仍需记录：Tauri/Kotlin/Gradle deprecation warning、插件 consumer proguard 文件缺失 warning、macOS `.app` bundle id warning；当前不阻塞 x86_64 Android 构建。
+
 验收：
 
 - 形成 Android 构建记录。
-- 如果失败，分类为环境问题、Tauri 配置问题、Rust 交叉编译问题、前端构建问题。
+- x86_64 debug/release 构建已通过；多 ABI、签名策略和真机安装仍属后续阶段。
 
 ## 阶段 2：文件导入路径验证
 
@@ -188,4 +195,3 @@ cargo tauri android build
 - 禁止把 API key 写入诊断包。
 - 禁止为了 Android 临时绕过 Tauri capability。
 - 禁止在移动端引入和桌面不同的数据模型。
-

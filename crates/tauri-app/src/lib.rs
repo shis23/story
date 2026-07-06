@@ -5745,6 +5745,7 @@ async fn mvu_execute_result(
 
 // ─── Tauri app 入口 ────────────────────────────────────────────────────────
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 先构造 AppState（含 log_store），再初始化 tracing 接入 LogStore
     let app_state = Arc::new(AppState::new());
