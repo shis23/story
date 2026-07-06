@@ -1966,7 +1966,7 @@ async fn start_writing(
             .await;
         // 落盘到 CampaignStore（有 outcome 才落盘）
         if let Some(outcome) = outcome {
-            persist_postprocess_outcome(&ctx, &outcome, &present_chars);
+            persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
         }
         let _ = pp_cancel_tx; // 保活（其实不需要，写作已完，这里只是避免 unused）
     }
@@ -2495,24 +2495,61 @@ fn collect_mvu_fallback_fragments(
     fragments
 }
 
-/// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
-fn persist_postprocess_outcome(
+#[derive(Debug, Clone)]
+struct PostprocessPersistContext {
+    campaign_id: Id,
+    conversation_id: Id,
+    turn: u32,
+}
+
+impl PostprocessPersistContext {
+    fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
+        Some(Self {
+            campaign_id: ctx.campaign_id.clone()?,
+            conversation_id: ctx.conversation_id.clone(),
+            turn: ctx.turn,
+        })
+    }
+}
+
+async fn persist_postprocess_outcome_async(
     ctx: &WritingContext,
+    outcome: storyforge_app_agent::PostProcessOutcome,
+    present_chars: Vec<String>,
+) {
+    let Some(persist_ctx) = PostprocessPersistContext::from_writing_context(ctx) else {
+        return;
+    };
+
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        persist_postprocess_outcome_to_store(
+            get_campaign_store(),
+            &persist_ctx,
+            &outcome,
+            &present_chars,
+        );
+    })
+    .await
+    {
+        tracing::warn!("保存后处理结果的阻塞任务失败: {e}");
+    }
+}
+
+/// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
+fn persist_postprocess_outcome_to_store(
+    store: &campaign_store::CampaignStore,
+    persist_ctx: &PostprocessPersistContext,
     outcome: &storyforge_app_agent::PostProcessOutcome,
     present_chars: &[String],
 ) {
-    let camp_id = match &ctx.campaign_id {
-        Some(id) => id,
-        None => return,
-    };
-    let store = get_campaign_store();
+    let camp_id = &persist_ctx.campaign_id;
 
     // 本轮摘要
     if let Some(summary) = &outcome.summary
         && let Err(e) = store.add_summary(storyforge_domain::agent::RoundSummary::new(
             camp_id.clone(),
-            ctx.conversation_id.clone(),
-            ctx.turn,
+            persist_ctx.conversation_id.clone(),
+            persist_ctx.turn,
             summary.clone(),
         ))
     {
@@ -2553,7 +2590,7 @@ fn persist_postprocess_outcome(
                     store,
                     camp_id,
                     u,
-                    ctx.turn,
+                    persist_ctx.turn,
                     &present_ids,
                     &name_collisions,
                 )
@@ -2579,7 +2616,7 @@ fn persist_postprocess_outcome(
                     );
                     if is_present {
                         let mut inst = inst;
-                        inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
+                        inst.set_variable(&vu.key, vu.value.clone(), persist_ctx.turn);
                         if let Err(e) = store.update_instance(inst) {
                             tracing::warn!("保存后处理角色变量失败: {e}");
                         }
@@ -2593,7 +2630,7 @@ fn persist_postprocess_outcome(
             } else {
                 // 全局 Campaign 变量（无 instance_id，不受 present_chars 约束）
                 if let Some(mut camp) = store.get_campaign(camp_id) {
-                    camp.set_variable(&vu.key, vu.value.clone(), ctx.turn);
+                    camp.set_variable(&vu.key, vu.value.clone(), persist_ctx.turn);
                     if let Err(e) = store.update_campaign(camp) {
                         tracing::warn!("保存后处理 Campaign 变量失败: {e}");
                     }
@@ -2617,7 +2654,7 @@ fn persist_postprocess_outcome(
                     spec.title.clone(),
                     spec.description.clone(),
                     spec.triggers.clone(),
-                    ctx.turn,
+                    persist_ctx.turn,
                 );
                 if let Err(e) = store.add_task(new_task) {
                     tracing::warn!("保存后处理新任务失败: {e}");
@@ -3166,7 +3203,7 @@ async fn regenerate(
             )
             .await;
         if let Some(outcome) = outcome {
-            persist_postprocess_outcome(&ctx, &outcome, &present_chars);
+            persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
         }
     }
 
@@ -7847,6 +7884,130 @@ mod tests {
         );
 
         assert!(entry.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_postprocess_persistence_helper_writes_all_campaign_outputs() {
+        use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+        use storyforge_domain::story_task::{
+            NewTaskSpec, StoryTask, TaskStatus, TaskTrigger, TaskUpdate,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_postprocess_persist_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        store.add_instance(lin.clone()).unwrap();
+
+        let existing_task = StoryTask::user_planned(
+            campaign.id.clone(),
+            "Find key",
+            "Find the hidden key",
+            vec![TaskTrigger::Manual],
+            1,
+        );
+        let existing_task_id = existing_task.id.clone();
+        store.add_task(existing_task).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: campaign.id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 3,
+        };
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: Some("Lin found a clue.".into()),
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("Lin"),
+                    knowledge_text: "The key is under the mat.".into(),
+                    source: KnowledgeSource::Witnessed,
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: None,
+                    propagation: PropagationPolicy::Open,
+                }],
+                variable_updates: vec![
+                    VariableUpdate {
+                        instance_id: Some(Id::from_str("Lin")),
+                        key: "hp".into(),
+                        value: serde_json::json!(7),
+                    },
+                    VariableUpdate {
+                        instance_id: None,
+                        key: "story_clock".into(),
+                        value: serde_json::json!("Day 2"),
+                    },
+                ],
+                task_updates: vec![
+                    TaskUpdate {
+                        task_id: Some(existing_task_id.clone()),
+                        new_status: TaskStatus::Completed,
+                        new_task: None,
+                    },
+                    TaskUpdate {
+                        task_id: None,
+                        new_status: TaskStatus::Pending,
+                        new_task: Some(NewTaskSpec {
+                            title: "Follow the clue".into(),
+                            description: "Trace where the key leads.".into(),
+                            triggers: vec![TaskTrigger::Manual],
+                            related_characters: vec![lin.id.clone()],
+                        }),
+                    },
+                ],
+                parse_succeeded: true,
+            }),
+        };
+
+        persist_postprocess_outcome_to_store(
+            &store,
+            &persist_ctx,
+            &outcome,
+            &[String::from("Lin")],
+        );
+
+        let summaries = store.list_summaries(&campaign.id);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].conversation_id, Id::from_str("conv-1"));
+        assert_eq!(summaries[0].turn, 3);
+        assert_eq!(summaries[0].content, "Lin found a clue.");
+
+        let knowledge = store.list_knowledge(&campaign.id);
+        assert_eq!(knowledge.len(), 1);
+        assert_eq!(knowledge[0].character_id, lin.id);
+        assert_eq!(knowledge[0].turn_number, 3);
+        assert_eq!(knowledge[0].knowledge_text, "The key is under the mat.");
+
+        let updated_lin = store
+            .get_instance(&campaign.id, &Id::from_str("inst-lin"))
+            .unwrap();
+        let hp = updated_lin.get_variable("hp").unwrap();
+        assert_eq!(hp, &serde_json::json!(7));
+
+        let updated_campaign = store.get_campaign(&campaign.id).unwrap();
+        assert_eq!(updated_campaign.current_story_clock(), "Day 2");
+
+        let updated_task = store.get_task(&existing_task_id).unwrap();
+        assert!(matches!(updated_task.status, TaskStatus::Completed));
+
+        let tasks = store.list_tasks(&campaign.id);
+        assert!(tasks.iter().any(|task| task.title == "Follow the clue"
+            && task.description == "Trace where the key leads."
+            && task.created_turn == 3));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

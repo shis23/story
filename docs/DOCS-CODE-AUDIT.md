@@ -10,7 +10,7 @@
 
 - Campaign 数据模型已经存在；开 Campaign 时写作流水线已通过 `CampaignRuntimeContext` 消费 instances / definitions / knowledge，未开 Campaign 时继续 fallback 到扁平 `Character`。
 - `CampaignStore` 位于 `tauri-app`，下层 `app-agent` / `app-pipeline` 不应直接依赖它。
-- `CampaignStore` 写入 API 已返回 `Result`；Tauri 命令路径会向前端返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning 而不中断当前写作。
+- `CampaignStore` 写入 API 已返回 `Result`；Tauri 命令路径会向前端返回结构化 `storage` 错误，postprocess 后台写回已通过 `persist_postprocess_outcome_async` 移入 `spawn_blocking`，失败会记录 warning 而不中断当前写作。
 - `CampaignStore` 已从单个全局缓存 Mutex 拆为 cards/campaigns/instances/knowledge/tasks/summaries/mvu 集合级锁；新增并发写回回放测试覆盖跨集合写入后重载一致性。
 - Rust workspace 当前纳入 `cargo clippy --workspace --all-targets -- -D warnings` 闸门；少量高参数公共流程入口保留局部 allow，后续若重构 API 应单独立项而不是混入 warning 清理。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
@@ -55,9 +55,9 @@
 - `crates/app-agent/src/tools.rs` 子 Agent `get_character` **阶段 4 已改造**：有 `current_character_instance_id` 时只返回该 instance 的数据，不允许查其他角色（信息隔离）。无时退回旧扁平 Character。
 - `crates/app-agent/src/tools.rs::ToolContext` **阶段 4 新增** `current_character_instance_id: Option<Id>`：子 Agent 绑定的 instance id，用于 get_character 信息隔离。导演/编剧/无 Campaign 时为 None。
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
-- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
-- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **已补齐写入错误处理**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失。
-- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。2026-07-07 已先把写作/重 roll 的 Campaign 快照读取移入 `spawn_blocking`，降低 async Tauri 命令上的同步读阻塞；桌面小/中等数据量暂不阻塞，Android/真实长会话和同步写入后台 flush 仍需复测。
+- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome_to_store` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
+- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome_async` **已补齐写入错误处理并 offload**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失；成功写作/重 roll 后的 postprocess 写回会在 `spawn_blocking` 中调用可测同步核心。
+- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。2026-07-07 已先把写作/重 roll 的 Campaign 快照读取移入 `spawn_blocking`，并把 postprocess summary/knowledge/variable/task 写回移入 `persist_postprocess_outcome_async`，降低 async Tauri 命令上的同步读写阻塞；桌面小/中等数据量暂不阻塞，Android/真实长会话、临时 instance 落盘、其他同步写入和后台 flush 仍需复测。
 - `storyforge-infra-util::secret_store` + `crates/tauri-app/src/connection_store.rs` **已补 API key SecretRef 存储**：LLM 连接和 embedder key 通过 `keyring` 写入系统凭据库，`connections.json` / `embed.json` 只保留 `storyforge-secret:v1:*`；旧明文文件加载时迁移，真实 LLM harness 可解析 SecretRef。2026-07-06 已补平台 native store 显式初始化，Windows Credential Manager 写/读/删冒烟测试通过；`infra-util` Android arm64 交叉编译通过，Android 真机 keyring 仍待验证。
 - `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`source_knowledge_id`、`relay_chain_text`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”，并在有上游知识时展示 A→B→C 传话链。
 - `crates/domain/src/character_knowledge.rs::CharacterKnowledgeEntry::source_knowledge_id` **已补传话链 MVP**：Tauri 写回层会在 `ToldByOther`/广播写入时匹配来源角色已有知识并链接上游条目。该能力是文本匹配级链路，完整语义传播仍需真实 LLM 行为评测。
