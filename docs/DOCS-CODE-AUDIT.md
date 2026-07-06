@@ -238,6 +238,8 @@
 
 2026-07-06 增量核对：角色卡 Scoped `data.extensions.regex_scripts` 可通过 `Character::scoped_regex_scripts()` typed 读取，复用 Preset 正则解析与元数据保真逻辑；`RegexScriptSource` 和 `merge_regex_script_sources()` 已按 Global → Preset → Scoped 顺序合并并标记来源。当前尚未把合并结果接进运行时执行链。
 
+2026-07-06 增量核对：`storyforge-infra-regex` 已支持 ST 常见 slash-delimited `findRegex`（如 `/^foo/gm`），执行前会提取 pattern、合并 inline flags 与 `flags` 字段，并保持 raw pattern + `flags` 字段的旧行为。当前仍未把正则执行器接进写作流水线。
+
 ### Phase 6：Android（~20%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |

@@ -56,10 +56,11 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
             MAX_REGEX_INPUT_LEN
         )));
     }
+    let regex_spec = parse_st_regex_spec(&script.find_regex, &script.flags);
     // Compile (regress is an ECMAScript engine).
     // Apply flags (e.g. gm); regress parses i/m/s/u/v and ignores unsupported g.
-    let re =
-        regress::Regex::with_flags(&script.find_regex, script.flags.as_str()).map_err(|e| {
+    let re = regress::Regex::with_flags(regex_spec.pattern.as_str(), regex_spec.flags.as_str())
+        .map_err(|e| {
             RegexError::Compile(format!("正则 '{}' 编译失败: {}", script.script_name, e))
         })?;
 
@@ -67,6 +68,68 @@ fn apply_single_script(text: &str, script: &RegexScript) -> Result<String, Regex
     let result = re.replace_all(text, script.replace_string.as_str());
 
     Ok(result.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RegexSpec {
+    pattern: String,
+    flags: String,
+}
+
+fn parse_st_regex_spec(find_regex: &str, flags: &str) -> RegexSpec {
+    if let Some((pattern, inline_flags)) = split_st_regex_literal(find_regex) {
+        return RegexSpec {
+            pattern,
+            flags: merge_flags(&inline_flags, flags),
+        };
+    }
+
+    RegexSpec {
+        pattern: find_regex.to_string(),
+        flags: flags.to_string(),
+    }
+}
+
+fn split_st_regex_literal(find_regex: &str) -> Option<(String, String)> {
+    if !find_regex.starts_with('/') {
+        return None;
+    }
+
+    let mut escaped = false;
+    let mut in_class = false;
+
+    for (idx, ch) in find_regex.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => {
+                let flags = &find_regex[idx + ch.len_utf8()..];
+                if !flags.chars().all(|c| c.is_ascii_alphabetic()) {
+                    return None;
+                }
+                return Some((find_regex[1..idx].to_string(), flags.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn merge_flags(inline_flags: &str, field_flags: &str) -> String {
+    let mut merged = String::new();
+    for flag in inline_flags.chars().chain(field_flags.chars()) {
+        if !merged.contains(flag) {
+            merged.push(flag);
+        }
+    }
+    merged
 }
 
 // --- input/output regex split ----------------------------------------------
@@ -166,6 +229,35 @@ mod tests {
         let input = "段落1\n\n\n\n\n段落2";
         let result = apply_regex_scripts(input, &scripts, RegexPlacement::Output).unwrap();
         assert_eq!(result, "段落1\n\n段落2");
+    }
+
+    #[test]
+    fn test_apply_slash_delimited_st_regex_uses_inline_flags() {
+        let mut script = make_script("st-literal", r"/^foo/gm", "bar", RegexPlacement::Output);
+        script.flags.clear();
+
+        let result = apply_regex_scripts("foo\nnope\nfoo", &[script], RegexPlacement::Output)
+            .expect("slash-delimited ST regex should compile");
+
+        assert_eq!(result, "bar\nnope\nbar");
+    }
+
+    #[test]
+    fn test_apply_raw_regex_still_uses_flags_field() {
+        let script = make_script("raw", r"^foo", "bar", RegexPlacement::Output);
+
+        let result = apply_regex_scripts("foo\nnope\nfoo", &[script], RegexPlacement::Output)
+            .expect("raw regex should compile");
+
+        assert_eq!(result, "bar\nnope\nbar");
+    }
+
+    #[test]
+    fn test_parse_st_regex_literal_preserves_escaped_slash_and_merges_flags() {
+        let spec = parse_st_regex_spec(r"/https:\/\/example\.com/gi", "im");
+
+        assert_eq!(spec.pattern, r"https:\/\/example\.com");
+        assert_eq!(spec.flags, "gim");
     }
 
     #[test]

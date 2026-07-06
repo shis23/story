@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；运行时仍是二元 placement，Global/执行未完成 | **6-10 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；执行器已支持 `/pattern/flags`；Global/运行时接线未完成 | **5-9 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
@@ -94,7 +94,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。但运行时执行仍按二元 `Input/Output` 简化枚举过滤，Global 来源读取和多作用域语义仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。但运行时执行仍按二元 `Input/Output` 简化枚举过滤，Global 来源读取和多作用域语义仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
@@ -139,7 +139,8 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 | 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |
 | placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真，运行时语义待接 |
-| **总计** | **6-10 天** |
+| ST regex literal 解析（`/pattern/flags`）| ✅ 已完成执行器兼容 |
+| **总计** | **5-9 天** |
 
 > sprest 插件（提取预设中的正则集中管理）本身是管理工具非运行时，不需兼容。但它揭示的"正则来源合并优先级"问题必须正确实现。
 
