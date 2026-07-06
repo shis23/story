@@ -1913,11 +1913,8 @@ async fn start_writing(
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
     if let Ok((final_text, _, _)) = &result {
         // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前，确保知识/变量写回能找到它们）
-        persist_temporary_instances_to(
-            get_campaign_store(),
-            &ctx,
-            pipeline.pending_temporary_instances(),
-        );
+        persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
+            .await;
 
         // 从 session.plan 取在场角色 + 基础变量键
         let present_chars: Vec<String> = pipeline
@@ -2373,22 +2370,64 @@ fn default_variable_keys() -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct TemporaryInstancesPersistContext {
+    campaign_id: Id,
+}
+
+impl TemporaryInstancesPersistContext {
+    fn from_writing_context(ctx: &WritingContext) -> Option<Self> {
+        Some(Self {
+            campaign_id: ctx.campaign_id.clone()?,
+        })
+    }
+}
+
 /// Phase 6：把本轮创建的临时 instance 落盘到 CampaignStore。
 ///
 /// 去重逻辑：同一 campaign 内已存在同名 instance 时跳过。
-/// 落盘后，下一轮 `fill_campaign_context` 能读到这些 instance。
+/// 落盘后，下一轮 `fill_campaign_context_async` 能读到这些 instance。
+async fn persist_temporary_instances_async(
+    ctx: &WritingContext,
+    temporaries: Vec<storyforge_domain::campaign::CharacterInstance>,
+) {
+    if temporaries.is_empty() {
+        return;
+    }
+    let Some(persist_ctx) = TemporaryInstancesPersistContext::from_writing_context(ctx) else {
+        return;
+    };
+
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        persist_temporary_instances_to_store(get_campaign_store(), &persist_ctx, &temporaries);
+    })
+    .await
+    {
+        tracing::warn!("落盘临时 instance 的阻塞任务失败: {e}");
+    }
+}
+
+#[cfg(test)]
 fn persist_temporary_instances_to(
     store: &campaign_store::CampaignStore,
     ctx: &WritingContext,
     temporaries: &[storyforge_domain::campaign::CharacterInstance],
 ) {
-    let camp_id = match &ctx.campaign_id {
-        Some(id) => id,
-        None => return,
+    let Some(persist_ctx) = TemporaryInstancesPersistContext::from_writing_context(ctx) else {
+        return;
     };
+    persist_temporary_instances_to_store(store, &persist_ctx, temporaries);
+}
+
+fn persist_temporary_instances_to_store(
+    store: &campaign_store::CampaignStore,
+    persist_ctx: &TemporaryInstancesPersistContext,
+    temporaries: &[storyforge_domain::campaign::CharacterInstance],
+) {
     if temporaries.is_empty() {
         return;
     }
+    let camp_id = &persist_ctx.campaign_id;
     let existing = store.list_instances(camp_id);
     let mut known_names: std::collections::HashSet<String> =
         existing.into_iter().map(|i| i.name).collect();
@@ -3166,11 +3205,8 @@ async fn regenerate(
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
     if let Ok((text, _)) = &result {
         // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前）
-        persist_temporary_instances_to(
-            get_campaign_store(),
-            &ctx,
-            pipeline.pending_temporary_instances(),
-        );
+        persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
+            .await;
 
         let (final_text, present_chars, var_keys) = (
             text.clone(),
@@ -8825,6 +8861,7 @@ mod tests {
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
+        let persist_ctx = TemporaryInstancesPersistContext::from_writing_context(&ctx).unwrap();
 
         let temps = vec![
             CharacterInstance::temporary(campaign.id.clone(), "Ghost"),
@@ -8836,7 +8873,7 @@ mod tests {
             ),
         ];
 
-        persist_temporary_instances_to(&store, &ctx, &temps);
+        persist_temporary_instances_to_store(&store, &persist_ctx, &temps);
 
         let instances = store.list_instances(&campaign.id);
         assert_eq!(instances.len(), 2, "应有 2 个落盘实例");

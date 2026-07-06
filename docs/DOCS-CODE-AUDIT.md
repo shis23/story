@@ -15,7 +15,7 @@
 - Rust workspace 当前纳入 `cargo clippy --workspace --all-targets -- -D warnings` 闸门；少量高参数公共流程入口保留局部 allow，后续若重构 API 应单独立项而不是混入 warning 清理。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
 - Meta、MVU、Android、前端计划多数是基于已有雏形的后续计划，不是当前已完成能力。
-- 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。
+- 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前通过 `persist_temporary_instances_async` 写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。
 
 文档可以继续作为后续执行依据，但执行前应注意本文列出的“规划性内容”和“缺口”。
 
@@ -57,7 +57,7 @@
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome_to_store` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome_async` **已补齐写入错误处理并 offload**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失；成功写作/重 roll 后的 postprocess 写回会在 `spawn_blocking` 中调用可测同步核心。
-- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。2026-07-07 已先把写作/重 roll 的 Campaign 快照读取移入 `spawn_blocking`，并把 postprocess summary/knowledge/variable/task 写回移入 `persist_postprocess_outcome_async`，降低 async Tauri 命令上的同步读写阻塞；桌面小/中等数据量暂不阻塞，Android/真实长会话、临时 instance 落盘、其他同步写入和后台 flush 仍需复测。
+- `crates/tauri-app/src/campaign_store.rs::pressure_sync_json_io_across_collections` **已补同步 JSON I/O ignored 压测**：4 集合并发写入并记录 p50/p95/max；本机 500 次/集合通过，p95 < 9ms、max 约 28ms。2026-07-07 已先把写作/重 roll 的 Campaign 快照读取移入 `spawn_blocking`，并把临时 instance 落盘移入 `persist_temporary_instances_async`、postprocess summary/knowledge/variable/task 写回移入 `persist_postprocess_outcome_async`，降低 async Tauri 命令上的同步读写阻塞；桌面小/中等数据量暂不阻塞，Android/真实长会话、其他同步写入和后台 flush 仍需复测。
 - `storyforge-infra-util::secret_store` + `crates/tauri-app/src/connection_store.rs` **已补 API key SecretRef 存储**：LLM 连接和 embedder key 通过 `keyring` 写入系统凭据库，`connections.json` / `embed.json` 只保留 `storyforge-secret:v1:*`；旧明文文件加载时迁移，真实 LLM harness 可解析 SecretRef。2026-07-06 已补平台 native store 显式初始化，Windows Credential Manager 写/读/删冒烟测试通过；`infra-util` Android arm64 交叉编译通过，Android 真机 keyring 仍待验证。
 - `crates/tauri-app/src/lib.rs::list_character_knowledge` **已补可解释链路 DTO**：返回 `character_name`、`source_character_name`、`source_knowledge_id`、`relay_chain_text`、`provenance_text`；前端知识面板会展示“谁知道、从哪知道、哪轮知道”，并在有上游知识时展示 A→B→C 传话链。
 - `crates/domain/src/character_knowledge.rs::CharacterKnowledgeEntry::source_knowledge_id` **已补传话链 MVP**：Tauri 写回层会在 `ToldByOther`/广播写入时匹配来源角色已有知识并链接上游条目。该能力是文本匹配级链路，完整语义传播仍需真实 LLM 行为评测。
@@ -72,7 +72,7 @@
 - `crates/domain/src/campaign_runtime.rs::CampaignRuntimeContext::with_temporaries_for` **阶段 6 已完成**：为未匹配的 character_id 创建临时 CharacterInstance（`is_temporary=true`，支持 persona/behavior override），返回更新后的 context 和临时 instance 列表供调用者持久化；同一批次内重复 unmatched character 会去重。
 - `crates/app-pipeline/src/lib.rs::PipelineOrchestrator::pending_temporary_instances` **阶段 6 已完成**：存储本轮创建的临时 instance，Tauri 层通过 getter 读取后落盘；`start_writing` / `regenerate` 开始时会清空旧 pending，避免失败或重试污染下一轮。
 - `crates/app-pipeline/src/lib.rs::start_writing` / `regenerate` **阶段 6 已完成**：从 Director 的 `context_package.character_brief` 提取 persona 注入临时 instance，存储到 `pending_temporary_instances`。
-- `crates/tauri-app/src/lib.rs::persist_temporary_instances_to` **阶段 6 已完成**：只在 pipeline 返回 `Ok` 后、postprocess 之前把临时 instance 写入 CampaignStore；会跳过同 campaign 已存在同名 instance、同批重复临时 instance，以及 `campaign_id` 不匹配的临时 instance。落盘后 postprocess 知识/变量写回不再被跳过。
+- `crates/tauri-app/src/lib.rs::persist_temporary_instances_async` **阶段 6 已完成并 offload**：只在 pipeline 返回 `Ok` 后、postprocess 之前把临时 instance 写入 CampaignStore；会跳过同 campaign 已存在同名 instance、同批重复临时 instance，以及 `campaign_id` 不匹配的临时 instance。落盘通过 `spawn_blocking` 执行并在继续 postprocess 前 await，保证知识/变量写回不再被跳过。
 - `request_ad_hoc_character` 工具**未实现**：当前用 unmatched character_id 自动触发，Director 的 character_brief 作为 persona 注入。
 - `frontend/src/components/CampaignPanel.vue` **临时 instance UI 已实现**：展示 `is_temporary` 标记，提供升格为常驻按钮（带确认对话框、loading 状态、detail 刷新），`promoteTemporaryInstance` 从 `tauri-api.js` 导入。
 
