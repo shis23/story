@@ -50,7 +50,8 @@ impl ConnectionStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("连接配置 JSON 无可用备份，返回默认");
+                            tracing::error!("连接配置 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
                             ConnectionsFile::default()
                         })
                 }),
@@ -66,7 +67,7 @@ impl ConnectionStore {
     }
 
     /// 保存连接（新建或更新）
-    pub fn save(&self, connection: LlmConnection) -> StoredConnection {
+    pub fn save(&self, connection: LlmConnection) -> Result<StoredConnection, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         // 若已存在同 id，更新；否则新增
@@ -77,8 +78,8 @@ impl ConnectionStore {
             existing.connection = connection.clone();
             existing.last_used_at = Some(now.clone());
             let updated = existing.clone();
-            self.persist(&file);
-            return updated;
+            self.persist(&file)?;
+            return Ok(updated);
         }
 
         let stored = StoredConnection {
@@ -88,8 +89,8 @@ impl ConnectionStore {
             last_used_at: None,
         };
         file.connections.push(stored.clone());
-        self.persist(&file);
-        stored
+        self.persist(&file)?;
+        Ok(stored)
     }
 
     /// 列出所有连接
@@ -105,7 +106,7 @@ impl ConnectionStore {
     pub fn get(&self, id: &str) -> Option<StoredConnection> {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .connections
             .iter()
             .find(|c| c.id == id)
@@ -113,7 +114,7 @@ impl ConnectionStore {
     }
 
     /// 删除连接（若是活跃的，同时清除 active_id）
-    pub fn delete(&self, id: &str) -> bool {
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = file.connections.len();
         file.connections.retain(|c| c.id != id);
@@ -122,10 +123,10 @@ impl ConnectionStore {
             if file.active_id.as_deref() == Some(id) {
                 file.active_id = None;
             }
-            self.persist(&file);
-            true
+            self.persist(&file)?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -142,14 +143,17 @@ impl ConnectionStore {
     /// 设置活跃连接 ID（会校验该 id 存在，并更新 last_used_at）
     ///
     /// 返回对应的 LlmConnection（供调用方构造 client）。
-    pub fn set_active(&self, id: &str) -> Option<LlmConnection> {
+    pub fn set_active(&self, id: &str) -> Result<Option<LlmConnection>, String> {
         let mut file = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let stored = file.connections.iter_mut().find(|c| c.id == id)?;
+        let stored = match file.connections.iter_mut().find(|c| c.id == id) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         stored.last_used_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
         let conn = stored.connection.clone();
         file.active_id = Some(id.to_string());
-        self.persist(&file);
-        Some(conn)
+        self.persist(&file)?;
+        Ok(Some(conn))
     }
 
     /// 获取活跃连接（若 active_id 存在且对应连接存在）
@@ -162,10 +166,12 @@ impl ConnectionStore {
             .map(|c| c.connection.clone())
     }
 
-    fn persist(&self, file: &ConnectionsFile) {
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.path, file) {
-            tracing::error!("持久化连接配置失败: {e}");
-        }
+    fn persist(&self, file: &ConnectionsFile) -> Result<(), String> {
+        storyforge_infra_util::atomic_write_json(&self.path, file).map_err(|e| {
+            let msg = format!("持久化连接配置失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }
 
@@ -197,34 +203,34 @@ mod tests {
     #[test]
     fn test_save_list_delete() {
         let store = temp_store();
-        store.save(make_conn("deepseek-1"));
-        store.save(make_conn("deepseek-2"));
+        store.save(make_conn("deepseek-1")).unwrap();
+        store.save(make_conn("deepseek-2")).unwrap();
 
         assert_eq!(store.list().len(), 2);
         assert!(store.get("deepseek-1").is_some());
         assert!(store.get("nonexistent").is_none());
 
-        assert!(store.delete("deepseek-1"));
+        assert!(store.delete("deepseek-1").unwrap());
         assert_eq!(store.list().len(), 1);
-        assert!(!store.delete("nonexistent"));
+        assert!(!store.delete("nonexistent").unwrap());
     }
 
     #[test]
     fn test_active_id_set_and_clear() {
         let store = temp_store();
-        store.save(make_conn("c1"));
-        store.save(make_conn("c2"));
+        store.save(make_conn("c1")).unwrap();
+        store.save(make_conn("c2")).unwrap();
 
         assert!(store.active_id().is_none());
 
         // 设 c1 为活跃
-        let conn = store.set_active("c1");
+        let conn = store.set_active("c1").unwrap();
         assert!(conn.is_some());
         assert_eq!(store.active_id().as_deref(), Some("c1"));
         assert!(store.active_connection().is_some());
 
         // 删除活跃的 c1，active_id 应清除
-        assert!(store.delete("c1"));
+        assert!(store.delete("c1").unwrap());
         assert!(store.active_id().is_none());
         assert!(store.active_connection().is_none());
     }
@@ -239,8 +245,8 @@ mod tests {
 
         {
             let store = ConnectionStore::new(&dir);
-            store.save(make_conn("persist-1"));
-            store.set_active("persist-1");
+            store.save(make_conn("persist-1")).unwrap();
+            store.set_active("persist-1").unwrap();
         }
 
         // 新实例从同一文件加载

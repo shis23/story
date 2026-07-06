@@ -284,7 +284,9 @@ impl LogStore {
                 .append(true)
                 .open(&file_path)
             {
-                let _ = writeln!(f, "{json}");
+                if let Err(e) = writeln!(f, "{json}") {
+                    eprintln!("Failed to write log entry: {e}");
+                }
             }
         }
     }

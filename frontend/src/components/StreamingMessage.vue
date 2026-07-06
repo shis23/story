@@ -80,12 +80,12 @@ const activeSubagents = computed(() => subagents.value.filter(s => s && s.status
       >
         <span>🎭 子 Agent · {{ activeSubagents.filter(s => s.status === 'done').length }}/{{ activeSubagents.length }}</span>
         <span class="ml-auto flex items-center gap-1">
-          <span v-for="(s, i) in activeSubagents" :key="i" class="w-1.5 h-1.5 rounded-full" :class="statusDot(s.status)"></span>
+          <span v-for="(s, i) in activeSubagents" :key="s.id || i" class="w-1.5 h-1.5 rounded-full" :class="statusDot(s.status)"></span>
         </span>
         <span class="text-[10px]">{{ expandedSubagents ? '▾' : '▸' }}</span>
       </button>
       <div v-if="expandedSubagents" class="px-3 pb-2 space-y-1.5">
-        <div v-for="(s, i) in activeSubagents" :key="i" class="rounded-md bg-surface-2/60 overflow-hidden">
+        <div v-for="(s, i) in activeSubagents" :key="s.id || i" class="rounded-md bg-surface-2/60 overflow-hidden">
           <button
             @click="toggleSubagent(i)"
             class="w-full flex items-center gap-2 px-2.5 min-h-[36px] text-xs hover:bg-surface-2 transition-colors"

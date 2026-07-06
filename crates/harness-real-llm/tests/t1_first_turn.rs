@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::character::CharacterCard;
-use storyforge_infra_llm::mock_client::MockLlmClient;
 use storyforge_infra_llm::LlmClient;
+use storyforge_infra_llm::mock_client::MockLlmClient;
 use tokio::sync::{mpsc, watch};
 
 use harness_real_llm::{HarnessEnv, require_real_llm};
@@ -22,7 +22,9 @@ use harness_real_llm::{HarnessEnv, require_real_llm};
 fn find_fixture(name: &str) -> std::path::PathBuf {
     let env_key = format!(
         "STORYFORGE_FIXTURE_{}",
-        name.trim_end_matches(".png").to_uppercase().replace('-', "_")
+        name.trim_end_matches(".png")
+            .to_uppercase()
+            .replace('-', "_")
     );
     if let Ok(p) = std::env::var(&env_key) {
         let p = std::path::PathBuf::from(p);
@@ -53,11 +55,10 @@ async fn t1_first_turn_campaign_writing() {
 
     // 1. 导入 seraphina 卡（仓库根的 fixture）
     let card_path = find_fixture("test-card-seraphina.png");
-    let bytes = std::fs::read(&card_path).unwrap_or_else(|e| {
-        panic!("读不到 fixture {}: {e}", card_path.display())
-    });
-    let character = storyforge_infra_import::import_character(&bytes)
-        .expect("导入 seraphina 卡失败");
+    let bytes = std::fs::read(&card_path)
+        .unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", card_path.display()));
+    let character =
+        storyforge_infra_import::import_character(&bytes).expect("导入 seraphina 卡失败");
     let source_id = character.id.clone();
     env.inject_character(character);
     eprintln!("导入成功，source id = {source_id}");
@@ -82,10 +83,7 @@ async fn t1_first_turn_campaign_writing() {
         ctx.campaign_id.is_some(),
         "fill_campaign_context 后 campaign_id 应非 None"
     );
-    assert!(
-        ctx.campaign_runtime.is_some(),
-        "campaign_runtime 应已组装"
-    );
+    assert!(ctx.campaign_runtime.is_some(), "campaign_runtime 应已组装");
     eprintln!(
         "上下文就绪：turn={}，instances={}",
         ctx.turn,
@@ -105,7 +103,11 @@ async fn t1_first_turn_campaign_writing() {
         .start_writing("开场：角色登场".into(), &ctx, event_tx, cancel_rx)
         .await;
     let (text, _node_id, provenance) = result.expect("start_writing 失败");
-    eprintln!("成文长度 {} 字，provenance={}", text.len(), provenance.is_some());
+    eprintln!(
+        "成文长度 {} 字，provenance={}",
+        text.len(),
+        provenance.is_some()
+    );
 
     // 6. 断言成文非空
     assert!(!text.trim().is_empty(), "成文不应为空");
@@ -135,10 +137,7 @@ async fn t1_first_turn_campaign_writing() {
     assert!(event_names.contains(&"draft_ready"), "缺 draft_ready");
 
     // 8. 断言会话落盘
-    let conv = env
-        .conv_store
-        .get(&conversation_id)
-        .expect("会话应已落盘");
+    let conv = env.conv_store.get(&conversation_id).expect("会话应已落盘");
     assert!(!conv.nodes.is_empty(), "对话树不应为空");
     eprintln!("T1 通过：{} 个节点落盘", conv.nodes.len());
 
@@ -153,8 +152,8 @@ fn harness_seam_smoke_with_mock() {
     let env = HarnessEnv::new(llm);
 
     // 手工建最小 Character + 用 fallback_from_character 产 1 个 protagonist 定义
-    use storyforge_domain::character::{Character, CharacterDefinition};
     use storyforge_domain::Source;
+    use storyforge_domain::character::{Character, CharacterDefinition};
     let ch = Character {
         id: storyforge_domain::Id::from_str("smoke-src"),
         name: "smoke-protagonist".into(),
@@ -179,7 +178,7 @@ fn harness_seam_smoke_with_mock() {
     let mut card = CharacterCard::from_character(&ch);
     let def = CharacterDefinition::fallback_from_character(&ch, &[]);
     card.character_definitions = vec![def];
-    let stored = env.campaign_store.save_card(card);
+    let stored = env.campaign_store.save_card(card).unwrap();
     let card = stored.card;
 
     let campaign_id = env.create_campaign(&card, "smoke-campaign");

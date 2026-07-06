@@ -168,7 +168,10 @@ impl ConversationStore {
     pub fn find_by_campaign(&self, campaign_id: &Id) -> Option<Conversation> {
         self.ensure_loaded();
         let cache = self.lock_cache();
-        cache.iter().find(|c| c.campaign_id.as_ref() == Some(campaign_id)).cloned()
+        cache
+            .iter()
+            .find(|c| c.campaign_id.as_ref() == Some(campaign_id))
+            .cloned()
     }
 
     /// 获取对话详情

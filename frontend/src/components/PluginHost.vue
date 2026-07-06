@@ -87,7 +87,7 @@ watch(() => props.plugin, (newPlugin) => {
   if (newPlugin) {
     handler = createHostHandler(newPlugin, invoke)
   }
-}, { deep: true })
+})
 </script>
 
 <style scoped>

@@ -93,7 +93,7 @@ Conversation (1) ──< MessageNode (N) ──< MessageVariant (N)
 | `STORE` | `OnceLock<CharacterStore>` | `lib.rs:36` | ~20 读/写 | 测试并行干扰 |
 | `CONN_STORE` | `OnceLock<ConnectionStore>` | `lib.rs:45` | ~10 读/写 | 同上 |
 | `PRESET_STORE` | `OnceLock<PresetStore>` | `lib.rs:54` | ~8 读/写 | 低 |
-| `CAMPAIGN_STORE` | `OnceLock<CampaignStore>` | `lib.rs:63` | 50+ 读/写 | **高** — 持锁做 I/O |
+| `CAMPAIGN_STORE` | `OnceLock<CampaignStore>` | `lib.rs:63` | 50+ 读/写 | **中高** — 写入已返回 `Result`，但仍是单 Mutex + 同步 JSON I/O |
 | `MVU_RUNTIME` | `OnceLock<Arc<WebViewMvuRuntime>>` | `lib.rs:73` | 1 读 | 无 |
 | `tool_ctx` | `Arc<RwLock<ToolContext>>` | `lib.rs:128` | 20+ 读, 8+ 写 | **高** — 写频繁 |
 | `current_cancel` | `Mutex<Option<Sender>>` | `lib.rs:130` | 2 写, 1 读 | 低 |
@@ -148,7 +148,7 @@ App.vue::startWriting(intent)
 CampaignPanel → create_campaign Tauri 命令
   → CampaignStore.get_card(card_id) — 验证卡存在
   → Campaign::new(card_id, name)
-  → CampaignStore.save_campaign() — 持久化（返回 () 无错误传播）
+  → CampaignStore.save_campaign() — 持久化（返回 Result，Tauri 命令向前端传播 storage 错误）
   → conv_store.create() — 创建关联对话
   → 为每个 CharacterDefinition 创建 CharacterInstance
   → CampaignStore.add_instance() × N

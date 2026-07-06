@@ -32,9 +32,7 @@ pub enum TypedPatchAction {
         orphan_character_ids: Vec<Id>,
     },
     /// 修未解析知识引用：删除指向不存在 instance 的知识条目
-    DeleteOrphanKnowledge {
-        knowledge_id: Id,
-    },
+    DeleteOrphanKnowledge { knowledge_id: Id },
     /// 修孤立 instance：把 definition_id 改成现存 definition（或清空为临时角色）
     RepointInstanceDefinition {
         instance_id: Id,
@@ -58,10 +56,7 @@ pub enum TypedPatchAction {
         source: KnowledgeSource,
     },
     /// 改任务状态
-    UpdateTaskStatus {
-        task_id: Id,
-        new_status: TaskStatus,
-    },
+    UpdateTaskStatus { task_id: Id, new_status: TaskStatus },
 }
 
 /// 单个字段变更（diff 用）
@@ -258,10 +253,7 @@ fn build_orphan_task_reference_patch(
     input: &PreviewInput,
 ) -> Option<TypedPatch> {
     let affected_id = issue.affected_id.as_deref()?;
-    let task = input
-        .tasks
-        .iter()
-        .find(|t| t.id.as_str() == affected_id)?;
+    let task = input.tasks.iter().find(|t| t.id.as_str() == affected_id)?;
 
     let instance_ids: std::collections::HashSet<&Id> =
         input.instances.iter().map(|i| &i.id).collect();
@@ -445,11 +437,12 @@ fn apply_action(
             // Add missing keys using schema defaults
             for (key, default_val) in def_defaults {
                 if !inst.variables.iter().any(|v| v.key == key) {
-                    inst.variables.push(storyforge_domain::variables::VariableValue {
-                        key,
-                        value: default_val,
-                        last_updated_turn: 0,
-                    });
+                    inst.variables
+                        .push(storyforge_domain::variables::VariableValue {
+                            key,
+                            value: default_val,
+                            last_updated_turn: 0,
+                        });
                 }
             }
 
@@ -606,10 +599,7 @@ pub fn build_patch_from_action(
         }
         TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
             if !input.tasks.iter().any(|t| &t.id == task_id) {
-                return Err(TypedPatchError::TargetMissing(format!(
-                    "task {}",
-                    task_id
-                )));
+                return Err(TypedPatchError::TargetMissing(format!("task {}", task_id)));
             }
         }
         // health-issue-driven 变体不通过 build_patch_from_action 构造
@@ -734,7 +724,10 @@ mod tests {
         }
     }
 
-    fn make_def_with_custom_schema(id: &str, extra_fields: Vec<VariableField>) -> CharacterDefinition {
+    fn make_def_with_custom_schema(
+        id: &str,
+        extra_fields: Vec<VariableField>,
+    ) -> CharacterDefinition {
         let mut def = make_def(id);
         def.variable_schema.extend(extra_fields);
         def
@@ -1050,7 +1043,8 @@ mod tests {
         inst.id = Id::from_str("inst-1");
         // Remove custom_var, and add an extra key "obsolete"
         inst.variables.retain(|v| v.key != "custom_var");
-        inst.variables.push(VariableValue::new("obsolete", serde_json::json!("old"), 0));
+        inst.variables
+            .push(VariableValue::new("obsolete", serde_json::json!("old"), 0));
 
         let patch = TypedPatch {
             id: "test".into(),
@@ -1124,7 +1118,10 @@ mod tests {
             affected_id: Some(task.id.to_string()),
             actions: vec![TypedPatchAction::PruneOrphanTaskReferences {
                 task_id: task.id.clone(),
-                orphan_character_ids: vec![Id::from_str("inst-orphan-1"), Id::from_str("inst-orphan-2")],
+                orphan_character_ids: vec![
+                    Id::from_str("inst-orphan-1"),
+                    Id::from_str("inst-orphan-2"),
+                ],
             }],
             diff: vec![],
             created_at: chrono::Utc::now(),
@@ -1285,7 +1282,7 @@ mod tests {
 
     #[test]
     fn test_build_patch_from_action_update_campaign_variable() {
-        let mut campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
+        let campaign = Campaign::new(Id::from_str("card-1"), "测试 Campaign");
         let input = PreviewInput {
             instances: &[],
             definitions: &[],
@@ -1493,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_apply_update_instance_variable() {
-        let mut inst = make_instance("inst-1", Some("def-1"));
+        let inst = make_instance("inst-1", Some("def-1"));
         let mut instances = vec![inst];
         let mut defs = vec![];
         let mut knowledge = vec![];
@@ -1572,7 +1569,7 @@ mod tests {
 
     #[test]
     fn test_apply_update_task_status() {
-        let mut task = StoryTask::user_planned(
+        let task = StoryTask::user_planned(
             Id::from_str("camp-1"),
             "复仇",
             "老王复仇",

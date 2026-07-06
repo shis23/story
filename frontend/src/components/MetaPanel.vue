@@ -247,12 +247,12 @@ async function handleProposeRepairs() {
     const patches = await metaProposeCampaignRepairs(props.activeCampaign.id)
     typedPatches.value = patches || []
     // 对每条 patch 跑 preview，标记 stale
-    for (const p of typedPatches.value) {
+    await Promise.all(typedPatches.value.map(async (p) => {
       try {
         const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
         p._stale = prev?.stale || false
       } catch (e) { p._stale = false }
-    }
+    }))
   } catch (e) {
     error.value = '生成修复方案失败: ' + e
   } finally {
@@ -266,12 +266,12 @@ async function refreshTypedPatches() {
     typedPatches.value = patches || []
     // 对每条 patch 跑 preview，标记 stale
     if (props.activeCampaign?.id) {
-      for (const p of typedPatches.value) {
+      await Promise.all(typedPatches.value.map(async (p) => {
         try {
           const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
           p._stale = prev?.stale || false
         } catch (e) { p._stale = false }
-      }
+      }))
     }
   } catch (e) {
     // 静默失败，不影响主流程
@@ -536,7 +536,7 @@ function formatDiffValue(val) {
             <div v-else-if="healthIssues.length === 0" class="text-[10px] text-ok">✓ 未发现问题</div>
             <div v-else class="space-y-1.5">
               <div
-                v-for="(issue, i) in healthIssues" :key="i"
+                v-for="(issue, i) in healthIssues" :key="issue.category + '-' + i"
                 class="rounded-lg border p-2 text-[10px]"
                 :class="issue.severity === 'error'
                   ? 'border-err/30 bg-err/5'

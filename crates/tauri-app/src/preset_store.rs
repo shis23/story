@@ -30,7 +30,8 @@ impl PresetStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("预设 JSON 无可用备份，返回空");
+                            tracing::error!("预设 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
                             Vec::new()
                         })
                 }),
@@ -46,7 +47,7 @@ impl PresetStore {
     }
 
     /// 保存预设（导入时调用），返回 id
-    pub fn save(&self, preset: Preset) -> String {
+    pub fn save(&self, preset: Preset) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let stored = StoredPreset {
@@ -56,8 +57,8 @@ impl PresetStore {
         };
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         presets.push(stored);
-        self.persist(&presets);
-        id
+        self.persist(&presets)?;
+        Ok(id)
     }
 
     /// 列出所有预设（元数据）
@@ -76,15 +77,15 @@ impl PresetStore {
     }
 
     /// 删除预设
-    pub fn delete(&self, id: &str) -> bool {
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = presets.len();
         presets.retain(|p| p.id != id);
         if presets.len() < before {
-            self.persist(&presets);
-            true
+            self.persist(&presets)?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -95,7 +96,7 @@ impl PresetStore {
         prompt_index: usize,
         content: Option<&str>,
         enabled: Option<bool>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
             if let Some(prompt) = stored.preset.prompts.get_mut(prompt_index) {
@@ -105,11 +106,11 @@ impl PresetStore {
                 if let Some(e) = enabled {
                     prompt.enabled = e;
                 }
-                self.persist(&presets);
-                return true;
+                self.persist(&presets)?;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// 更新单条 regex 的禁用状态
@@ -118,23 +119,25 @@ impl PresetStore {
         preset_id: &str,
         regex_index: usize,
         disabled: Option<bool>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let mut presets = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(stored) = presets.iter_mut().find(|p| p.id == preset_id) {
             if let Some(regex) = stored.preset.regex_scripts.get_mut(regex_index) {
                 if let Some(d) = disabled {
                     regex.disabled = d;
                 }
-                self.persist(&presets);
-                return true;
+                self.persist(&presets)?;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
-    fn persist(&self, presets: &[StoredPreset]) {
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.path, presets) {
-            tracing::error!("持久化预设失败: {e}");
-        }
+    fn persist(&self, presets: &[StoredPreset]) -> Result<(), String> {
+        storyforge_infra_util::atomic_write_json(&self.path, presets).map_err(|e| {
+            let msg = format!("持久化预设失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }

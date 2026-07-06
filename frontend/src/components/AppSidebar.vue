@@ -9,6 +9,7 @@
  * 承载所有管理入口（Campaign/角色卡/预设/插件/连接/Meta/导入）+ 写作导航（新建对话/会话历史）+ 底部主题/高玩开关。
  * 顶栏不再堆按钮，所有入口收归此处。
  */
+import { computed } from 'vue'
 import { useTheme } from '../useTheme.js'
 
 const props = defineProps({
@@ -33,7 +34,7 @@ const emit = defineEmits([
 
 const { theme, toggle: toggleTheme } = useTheme()
 
-const navItems = [
+const navItems = computed(() => [
   // 写作组
   { group: '写作', items: [
     { key: 'new', label: '新建 Campaign', icon: '✚', emit: 'new-campaign' },
@@ -52,7 +53,7 @@ const navItems = [
     { key: 'plugin', label: '插件', icon: '🔌', emit: 'open-plugin' },
     { key: 'meta', label: 'Meta 助手', icon: '🔧', emit: 'open-meta' },
   ]},
-]
+])
 
 function onItemClick(item) {
   emit(item.emit)

@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
+use storyforge_domain::Id;
 use storyforge_domain::character::{CharacterCard, CharacterDefinition};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
 use storyforge_domain::story_task::{StoryTask, TaskSource, TaskStatus};
-use storyforge_domain::Id;
-use storyforge_infra_llm::mock_client::MockLlmClient;
 use storyforge_infra_llm::LlmClient;
+use storyforge_infra_llm::mock_client::MockLlmClient;
 
 use harness_real_llm::HarnessEnv;
 
@@ -22,8 +22,8 @@ fn c1_import_and_list_characters() {
     let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
     let env = HarnessEnv::new(llm);
 
-    use storyforge_domain::character::Character;
     use storyforge_domain::Source;
+    use storyforge_domain::character::Character;
     let ch = Character {
         id: Id::from_str("c1-src"),
         name: "C1-TestChar".into(),
@@ -60,19 +60,24 @@ async fn c1_extract_characters_real_llm() {
     let env = HarnessEnv::new(llm);
 
     let card_path = find_fixture("test-card-seraphina.png");
-    let bytes = std::fs::read(&card_path).unwrap_or_else(|e| {
-        panic!("读不到 fixture {}: {e}", card_path.display())
-    });
+    let bytes = std::fs::read(&card_path)
+        .unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", card_path.display()));
     let character = storyforge_infra_import::import_character(&bytes).expect("导入失败");
     let source_id = character.id.clone();
     env.inject_character(character);
 
     let card = env.extract_characters(source_id.as_str()).await;
-    assert!(!card.character_definitions.is_empty(), "应识别出至少 1 个角色");
+    assert!(
+        !card.character_definitions.is_empty(),
+        "应识别出至少 1 个角色"
+    );
 
     // list_cards
     let cards = env.campaign_store.list_cards();
-    assert!(cards.iter().any(|c| c.card.id == card.id), "list_cards 应含此卡");
+    assert!(
+        cards.iter().any(|c| c.card.id == card.id),
+        "list_cards 应含此卡"
+    );
 
     // get_card
     let got = env.campaign_store.get_card(&card.id);
@@ -90,7 +95,7 @@ fn c2_campaign_lifecycle() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-campaign");
 
     assert_eq!(env.active_campaign_id(), Some(campaign_id.clone()));
@@ -123,19 +128,25 @@ fn c2_character_variables() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-var-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-var-campaign");
     let instances = env.campaign_store.list_instances(&campaign_id);
     let inst_id = instances[0].id.clone();
 
     // set_variable (key, serde_json::Value, turn)
     {
-        let mut inst = env.campaign_store.get_instance(&campaign_id, &inst_id).unwrap();
+        let mut inst = env
+            .campaign_store
+            .get_instance(&campaign_id, &inst_id)
+            .unwrap();
         inst.set_variable("mood", serde_json::json!("calm"), 1);
-        env.campaign_store.update_instance(inst);
+        env.campaign_store.update_instance(inst).unwrap();
     }
 
-    let inst = env.campaign_store.get_instance(&campaign_id, &inst_id).unwrap();
+    let inst = env
+        .campaign_store
+        .get_instance(&campaign_id, &inst_id)
+        .unwrap();
     let mood = inst.get_variable("mood");
     assert!(mood.is_some(), "mood 变量应已设置");
     assert_eq!(mood.unwrap(), &serde_json::json!("calm"));
@@ -150,13 +161,13 @@ fn c2_campaign_variables() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-camp-var-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-camp-var");
 
     {
         let mut camp = env.campaign_store.get_campaign(&campaign_id).unwrap();
         camp.set_variable("weather", serde_json::json!("rainy"), 1);
-        env.campaign_store.update_campaign(camp);
+        env.campaign_store.update_campaign(camp).unwrap();
     }
 
     let camp = env.campaign_store.get_campaign(&campaign_id).unwrap();
@@ -174,7 +185,7 @@ fn c2_task_lifecycle() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-task-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-task");
 
     let task = StoryTask {
@@ -189,7 +200,7 @@ fn c2_task_lifecycle() {
         source: TaskSource::UserPlanned,
         injected_turns: vec![],
     };
-    env.campaign_store.add_task(task.clone());
+    env.campaign_store.add_task(task.clone()).unwrap();
 
     let tasks = env.campaign_store.list_tasks(&campaign_id);
     assert_eq!(tasks.len(), 1);
@@ -199,7 +210,7 @@ fn c2_task_lifecycle() {
     // update task status
     let mut updated = tasks[0].clone();
     updated.status = TaskStatus::Completed;
-    env.campaign_store.update_task(updated);
+    env.campaign_store.update_task(updated).unwrap();
 
     let tasks = env.campaign_store.list_tasks(&campaign_id);
     assert!(matches!(tasks[0].status, TaskStatus::Completed));
@@ -214,7 +225,7 @@ fn c2_list_summaries_empty() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-sum-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-sum");
 
     let summaries = env.campaign_store.list_summaries(&campaign_id);
@@ -230,7 +241,7 @@ fn c2_knowledge_crud() {
     let env = HarnessEnv::new(llm);
 
     let card = make_minimal_card("c2-know-card");
-    env.campaign_store.save_card(card.clone());
+    env.campaign_store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "c2-know");
     let instances = env.campaign_store.list_instances(&campaign_id);
     let inst_id = instances[0].id.clone();
@@ -246,7 +257,7 @@ fn c2_knowledge_crud() {
         event_id: None,
         pinned: false,
     };
-    env.campaign_store.add_knowledge(vec![entry]);
+    env.campaign_store.add_knowledge(vec![entry]).unwrap();
 
     let knowledge = env.campaign_store.list_knowledge(&campaign_id);
     assert_eq!(knowledge.len(), 1);
@@ -273,7 +284,10 @@ fn c5_conversation_variants() {
     assert!(env.conv_store.get(&conv_id).is_some());
 
     // append a user message + ai draft to create nodes
-    let _user_node_id = env.conv_store.append_user_message(&conv_id, "你好".into()).unwrap();
+    let _user_node_id = env
+        .conv_store
+        .append_user_message(&conv_id, "你好".into())
+        .unwrap();
     let ai_node_id = env
         .conv_store
         .append_ai_draft(&conv_id, "第一版回复".into(), None)
@@ -298,7 +312,9 @@ fn c5_conversation_variants() {
     assert_eq!(node.variants.len(), 2);
 
     // switch_variant
-    env.conv_store.switch_variant(&conv_id, &ai_node_id, 0).unwrap();
+    env.conv_store
+        .switch_variant(&conv_id, &ai_node_id, 0)
+        .unwrap();
     let conv = env.conv_store.get(&conv_id).unwrap();
     let node = conv.find_node(&ai_node_id).unwrap();
     assert_eq!(node.active_variant, 0);
@@ -389,8 +405,8 @@ async fn c6_meta_chat_real_llm() {
 /// C6：PatchStore 生命周期（确定性）
 #[test]
 fn c6_patch_store_lifecycle() {
-    use storyforge_app_meta::PatchStore;
     use storyforge_app_meta::PatchAction;
+    use storyforge_app_meta::PatchStore;
 
     let store = PatchStore::new();
 
@@ -435,9 +451,9 @@ fn c6_typed_patch_preview_apply() {
         HealthIssue, IssueSeverity, PreviewInput, PreviewInputMut, TypedPatchStatus,
         apply_to_snapshot, build_patch_for_issue, is_patch_stale,
     };
-    use storyforge_domain::character::{CharacterDefinition, RoleType};
-    use storyforge_domain::campaign::CharacterInstance;
     use storyforge_domain::Id;
+    use storyforge_domain::campaign::CharacterInstance;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
     use storyforge_domain::variables::default_character_variables;
 
     // 构造一个 orphan_instance 场景：instance 指向不存在的 definition
@@ -516,8 +532,8 @@ fn c6_typed_patch_preview_apply() {
 fn c6_explain_generation() {
     use storyforge_app_meta::explain_generation;
     use storyforge_domain::Id;
-    use storyforge_domain::conversation::{Provenance, SubagentSnapshot};
     use storyforge_domain::agent::{ContextPackage, Plan, SubagentTask};
+    use storyforge_domain::conversation::{Provenance, SubagentSnapshot};
 
     let provenance = Provenance {
         session_id: Id::from_str("session-1"),
@@ -566,8 +582,7 @@ async fn c7_mvu_analyze_real_llm() {
     use storyforge_app_agent::runtime::AgentRuntime;
     use storyforge_app_agent::tools::ToolContext;
     use storyforge_app_meta::analyze_mvu_card;
-    use storyforge_domain::Source;
-    use storyforge_domain::character::Character;
+
     use storyforge_domain::mvu_translation::MvuRouting;
 
     let llm = harness_real_llm::require_real_llm();
@@ -583,9 +598,8 @@ async fn c7_mvu_analyze_real_llm() {
 
     // 用 seraphina 卡（有 JS extensions，应走 Hybrid 或至少不 panic）
     let card_path = find_fixture("test-card-seraphina.png");
-    let bytes = std::fs::read(&card_path).unwrap_or_else(|e| {
-        panic!("读不到 fixture {}: {e}", card_path.display())
-    });
+    let bytes = std::fs::read(&card_path)
+        .unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", card_path.display()));
     let character = storyforge_infra_import::import_character(&bytes).expect("导入失败");
 
     let (_tx, cancel) = tokio::sync::watch::channel(false);
@@ -635,12 +649,14 @@ fn c7_mvu_translation_crud() {
     let src_id = Id::from_str("mvu-src-1");
 
     // save
-    store.save_mvu(storyforge_tauri_app::campaign_store::StoredMvuTranslation {
-        source_character_id: src_id.clone(),
-        character_name: "Seraphina".into(),
-        translation: translation.clone(),
-        analyzed_at: "2026-06-18T00:00:00Z".into(),
-    });
+    store
+        .save_mvu(storyforge_tauri_app::campaign_store::StoredMvuTranslation {
+            source_character_id: src_id.clone(),
+            character_name: "Seraphina".into(),
+            translation: translation.clone(),
+            analyzed_at: "2026-06-18T00:00:00Z".into(),
+        })
+        .unwrap();
 
     // get
     let got = store.get_mvu(&src_id).expect("应能取回");
@@ -652,20 +668,18 @@ fn c7_mvu_translation_crud() {
     assert_eq!(store.list_all_mvu().len(), 1);
 
     // delete
-    assert!(store.delete_mvu(&src_id));
+    assert!(store.delete_mvu(&src_id).unwrap());
     assert!(store.get_mvu(&src_id).is_none());
-    assert!(!store.delete_mvu(&src_id)); // 再删返回 false
+    assert!(!store.delete_mvu(&src_id).unwrap()); // 再删返回 false
 }
 
 /// C7：MVU apply + backfill（确定性，复刻 lib.rs:3822-3845 backfill loop）
 #[test]
 fn c7_mvu_apply_backfill() {
     use storyforge_app_meta::{apply_schema_to_definition, compute_apply_preview};
-    use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
     use storyforge_domain::character::{CharacterDefinition, RoleType};
-    use storyforge_domain::variables::{
-        VariableField, VariableType, VariableValue, default_character_variables,
-    };
+    use storyforge_domain::variables::{VariableField, VariableType, VariableValue};
 
     let env = HarnessEnv::new(Arc::new(MockLlmClient::with_defaults()));
     let store = &env.campaign_store;
@@ -697,7 +711,7 @@ fn c7_mvu_apply_backfill() {
         c.character_definitions = vec![def.clone()];
         c
     };
-    store.save_card(card.clone());
+    store.save_card(card.clone()).unwrap();
     let campaign_id = env.create_campaign(&card, "bf-campaign");
 
     // 确认 instance 已创建，definition_id 指向 def
@@ -745,11 +759,13 @@ fn c7_mvu_apply_backfill() {
         def.variable_schema.iter().any(|f| f.key == "mp"),
         "definition schema 应含 mp"
     );
-    store.update_card({
-        let mut c = card.clone();
-        c.character_definitions = vec![def.clone()];
-        c
-    });
+    store
+        .update_card({
+            let mut c = card.clone();
+            c.character_definitions = vec![def.clone()];
+            c
+        })
+        .unwrap();
 
     // ─── 复刻 backfill loop（lib.rs meta_apply_mvu_schema）─────────────
     // 生产用 list_all_instances() 全量遍历 + definition_id 过滤（一张卡的
@@ -775,11 +791,15 @@ fn c7_mvu_apply_backfill() {
                 0,
             ));
         }
-        store.update_instance(updated);
+        store.update_instance(updated).unwrap();
     }
 
     // ─── 断言 ──────────────────────────────────────────────────────────
-    let inst = store.list_instances(&campaign_id).into_iter().next().unwrap();
+    let inst = store
+        .list_instances(&campaign_id)
+        .into_iter()
+        .next()
+        .unwrap();
     let mp = inst.get_variable("mp");
     assert!(mp.is_some(), "instance 应含新增的 mp 变量");
     assert_eq!(mp.unwrap(), &serde_json::json!(50), "mp default 应为 50");
@@ -793,8 +813,8 @@ fn c7_mvu_apply_backfill() {
 // ─── 辅助函数 ──────────────────────────────────────────────────────────────
 
 fn make_minimal_card(name: &str) -> CharacterCard {
-    use storyforge_domain::character::Character;
     use storyforge_domain::Source;
+    use storyforge_domain::character::Character;
     let ch = Character {
         id: Id::from_str(&format!("{name}-src")),
         name: name.into(),
@@ -825,7 +845,9 @@ fn make_minimal_card(name: &str) -> CharacterCard {
 fn find_fixture(name: &str) -> std::path::PathBuf {
     let env_key = format!(
         "STORYFORGE_FIXTURE_{}",
-        name.trim_end_matches(".png").to_uppercase().replace('-', "_")
+        name.trim_end_matches(".png")
+            .to_uppercase()
+            .replace('-', "_")
     );
     if let Ok(p) = std::env::var(&env_key) {
         let p = std::path::PathBuf::from(p);

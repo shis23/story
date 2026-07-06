@@ -6,7 +6,6 @@ import ChatMessage from './components/ChatMessage.vue'
 import Composer from './components/Composer.vue'
 import StreamingMessage from './components/StreamingMessage.vue'
 import DebugDrawer from './components/DebugDrawer.vue'
-import CharacterDetail from './components/CharacterDetail.vue'
 import CharacterList from './components/CharacterList.vue'
 import ConnectionConfig from './components/ConnectionConfig.vue'
 import CampaignPanel from './components/CampaignPanel.vue'
@@ -26,7 +25,6 @@ const appVersion = ref('...')
 const activeChar = ref(null)
 const activeCharDetail = ref(null)
 const importError = ref('')
-const showCharDetail = ref(false)
 const showCharList = ref(false)
 const showCampaignPanel = ref(false)
 const showMetaPanel = ref(false)
@@ -931,8 +929,8 @@ function handlePipelineEvent(event) {
 
           <!-- ══ 视图：Campaign 概览 ══ -->
           <div v-if="currentView === 'overview'" class="mx-auto max-w-2xl px-4 py-6">
-            <h2 class="text-xl font-bold text-ink mb-1">📜 {{ activeCampaign.name }}</h2>
-            <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mb-1">故事时间：{{ activeCampaign.story_clock }}</p>
+            <h2 class="text-xl font-bold text-ink mb-1">📜 {{ activeCampaign?.name }}</h2>
+            <p v-if="activeCampaign.story_clock" class="text-xs text-ink-soft mb-1">故事时间：{{ activeCampaign?.story_clock }}</p>
             <p v-if="activeCampaign.created_at" class="text-xs text-ink-soft mb-5">创建于 {{ new Date(activeCampaign.created_at).toLocaleDateString() }}</p>
             <div class="flex flex-wrap gap-2 mb-6">
               <button @click="showCampaignPanel = true" class="min-h-[44px] px-4 rounded-lg bg-accent text-white text-sm font-medium shadow-glow-accent hover:opacity-90 transition-opacity">进入 Campaign 面板</button>
@@ -1050,7 +1048,6 @@ function handlePipelineEvent(event) {
     </BaseOverlay>
 
     <!-- ═══ 弹层（不变） ═══ -->
-    <CharacterDetail v-if="showCharDetail && activeCharDetail" :character="activeCharDetail" @close="showCharDetail = false" />
     <CharacterList v-if="showCharList" :active-id="activeChar?.id" @select="handleSelectChar" @close="showCharList = false; showSidebar = true" />
     <ConnectionConfig v-if="showConnConfig" @close="showConnConfig = false; showSidebar = true" @changed="refreshActiveConnection" />
     <CampaignPanel v-if="showCampaignPanel" ref="campaignPanelRef" @close="showCampaignPanel = false; showSidebar = true" @campaign-changed="(c) => { activeCampaign = c; loadInstanceNameMap() }" />

@@ -1,6 +1,9 @@
 <script setup>
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, onUnmounted } from 'vue'
 import { useClickOutside } from './useClickOutside.js'
+
+// Module-level counter for body overflow to avoid multi-instance conflict
+let overflowCount = 0
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -78,23 +81,44 @@ useClickOutside(contentRef, () => {
   if (props.closeOnMask) close()
 }, { enabled: props.modelValue })
 
-// ESC 关闭
+// ESC 关闭 — handler stored at component scope to avoid leaks
+let escHandler = null
+
 watch(() => props.modelValue, (v) => {
-  if (!v) return
-  if (!props.closeOnEsc) return
-  const onKey = (e) => {
+  // Always clean up previous listener first
+  if (escHandler) {
+    document.removeEventListener('keydown', escHandler, true)
+    escHandler = null
+  }
+  if (!v || !props.closeOnEsc) return
+  escHandler = (e) => {
     if (e.key === 'Escape') {
       close()
-      document.removeEventListener('keydown', onKey, true)
     }
   }
-  document.addEventListener('keydown', onKey, true)
+  document.addEventListener('keydown', escHandler, true)
 })
 
-// 弹层打开时锁 body 滚动，避免背景滚动穿透
+onUnmounted(() => {
+  if (escHandler) {
+    document.removeEventListener('keydown', escHandler, true)
+    escHandler = null
+  }
+})
+
+// 弹层打开时锁 body 滚动，避免背景滚动穿透（multi-instance safe）
 watch(() => props.modelValue, (v) => {
   if (typeof document === 'undefined') return
-  document.body.style.overflow = v ? 'hidden' : ''
+  if (v) {
+    overflowCount++
+    document.body.style.overflow = 'hidden'
+  } else {
+    overflowCount--
+    if (overflowCount <= 0) {
+      overflowCount = 0
+      document.body.style.overflow = ''
+    }
+  }
 })
 </script>
 
@@ -103,6 +127,9 @@ watch(() => props.modelValue, (v) => {
     <Transition :name="transitionName">
       <div
         v-if="modelValue"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="title || 'Dialog'"
         class="fixed inset-0 z-50 flex justify-center bg-black/40 backdrop-blur-sm"
         :class="[positionClass, isSide ? '' : 'p-0 sm:p-4']"
         @click.self="onMaskClick"

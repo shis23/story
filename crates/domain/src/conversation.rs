@@ -5,6 +5,41 @@ use crate::Id;
 use crate::agent::{Performance, Plan};
 use crate::llm::{ChatMessage, ChatRole};
 
+/// 反序列化时将 active_variant 钳制到有效范围，避免越界。
+/// serde 不支持跨字段校验，故手动 impl Deserialize。
+impl<'de> Deserialize<'de> for MessageNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            id: Id,
+            parent_id: Option<Id>,
+            variants: Vec<MessageVariant>,
+            active_variant: usize,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let clamped = if raw.variants.is_empty() {
+            0
+        } else {
+            raw.active_variant.min(raw.variants.len() - 1)
+        };
+        if clamped != raw.active_variant {
+            eprintln!(
+                "WARN: MessageNode {} active_variant {} out of bounds (variants len={}), clamped to {}",
+                raw.id,
+                raw.active_variant,
+                raw.variants.len(),
+                clamped
+            );
+        }
+        Ok(MessageNode {
+            id: raw.id,
+            parent_id: raw.parent_id,
+            variants: raw.variants,
+            active_variant: clamped,
+        })
+    }
+}
+
 // ─── 对话树（对应设计 §3.7 MessageNode 树结构）────────────────────────────
 
 /// 角色
@@ -84,7 +119,8 @@ impl From<&Performance> for SubagentSnapshot {
 }
 
 /// 消息节点（一个位置可有多个版本，对应设计 §3.7.1 MessageNode）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Deserialize 为手动实现，反序列化时钳制 active_variant 到有效范围。
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageNode {
     pub id: Id,
     /// 父消息（首条为 None）

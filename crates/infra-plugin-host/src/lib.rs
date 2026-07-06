@@ -113,7 +113,8 @@ impl PluginRegistry {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("插件注册表 JSON 无可用备份，返回空");
+                            tracing::error!("插件注册表 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
                             HashMap::new()
                         })
                 }),

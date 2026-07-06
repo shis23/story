@@ -116,8 +116,15 @@ fn parse_embedding_response(
 
         let vec: Vec<f32> = embedding
             .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_f64()
+                    .ok_or_else(|| {
+                        LlmError::Internal(format!("嵌入元素 [{i}] 不是有效数值: {:?}", v))
+                    })
+                    .map(|n| n as f32)
+            })
+            .collect::<Result<Vec<_>, LlmError>>()?;
 
         if vec.len() != expected_dim {
             return Err(LlmError::Internal(format!(
@@ -178,5 +185,19 @@ mod tests {
         let config = default_embed_config("test-key".into());
         assert_eq!(config.model, "BAAI/bge-large-zh-v1.5");
         assert_eq!(config.dim, 1024);
+    }
+
+    #[test]
+    fn test_parse_embedding_non_numeric_element_errors() {
+        let json = serde_json::json!({
+            "data": [
+                { "embedding": [0.1, "bad", 0.3], "index": 0 }
+            ]
+        });
+
+        let result = parse_embedding_response(&json, 3);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("不是有效数值"));
     }
 }

@@ -17,16 +17,16 @@ function applyTheme(t) {
 // 初始化时立即应用（与 index.html 内联脚本呼应，双保险）
 applyTheme(theme.value)
 
+// 注册一次 watcher，避免每次 useTheme() 调用重复注册
+watch(theme, (t) => {
+  applyTheme(t)
+  localStorage.setItem(STORAGE_KEY, t)
+})
+
 export function useTheme() {
   function toggle() {
     theme.value = theme.value === 'dark' ? 'light' : 'dark'
   }
-
-  // 监听变化：写 DOM + 存 localStorage
-  watch(theme, (t) => {
-    applyTheme(t)
-    localStorage.setItem(STORAGE_KEY, t)
-  })
 
   return { theme, toggle }
 }

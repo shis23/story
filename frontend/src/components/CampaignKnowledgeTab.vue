@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { listCharacterKnowledge } from '../tauri-api.js'
 
 const props = defineProps({
@@ -28,6 +28,10 @@ async function load() {
 }
 
 onMounted(load)
+
+watch(() => props.campaignId, () => {
+  if (props.campaignId) load()
+})
 
 // ─── 过滤后的知识列表 ───
 const filteredKnowledge = computed(() => {

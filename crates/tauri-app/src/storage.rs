@@ -33,7 +33,8 @@ impl CharacterStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("角色卡 JSON 无可用备份，返回空");
+                            tracing::error!("角色卡 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
                             Vec::new()
                         })
                 }),
@@ -49,7 +50,7 @@ impl CharacterStore {
     }
 
     /// 保存角色卡（导入时调用）
-    pub fn save(&self, info: CharacterInfo) -> StoredCharacter {
+    pub fn save(&self, info: CharacterInfo) -> Result<StoredCharacter, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let stored = StoredCharacter {
@@ -60,8 +61,8 @@ impl CharacterStore {
 
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         chars.push(stored.clone());
-        self.persist(&chars);
-        stored
+        self.persist(&chars)?;
+        Ok(stored)
     }
 
     /// 列出所有角色卡（元数据）
@@ -80,15 +81,15 @@ impl CharacterStore {
     }
 
     /// 删除角色卡
-    pub fn delete(&self, id: &str) -> bool {
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut chars = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = chars.len();
         chars.retain(|c| c.id != id);
         if chars.len() < before {
-            self.persist(&chars);
-            true
+            self.persist(&chars)?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -112,7 +113,7 @@ impl CharacterStore {
             .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
 
         entry.route = new_route.to_string();
-        self.persist(&chars);
+        self.persist(&chars)?;
         Ok(())
     }
 
@@ -149,7 +150,7 @@ impl CharacterStore {
         // 同步更新计数
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars);
+        self.persist(&chars)?;
         Ok(())
     }
 
@@ -183,7 +184,7 @@ impl CharacterStore {
         let new_index = char.info.world_info_entries.len() - 1;
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = true;
-        self.persist(&chars);
+        self.persist(&chars)?;
         Ok(new_index)
     }
 
@@ -201,7 +202,7 @@ impl CharacterStore {
         char.info.world_info_entries.remove(entry_index);
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars);
+        self.persist(&chars)?;
         Ok(())
     }
 
@@ -220,14 +221,16 @@ impl CharacterStore {
         char.info.world_info_entries = entries;
         char.info.world_info_count = char.info.world_info_entries.len();
         char.info.has_world_info = !char.info.world_info_entries.is_empty();
-        self.persist(&chars);
+        self.persist(&chars)?;
         Ok(())
     }
 
     /// 持久化到文件（原子写入：委托 infra-util）
-    fn persist(&self, chars: &[StoredCharacter]) {
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.path, chars) {
-            tracing::error!("持久化角色卡失败: {e}");
-        }
+    fn persist(&self, chars: &[StoredCharacter]) -> Result<(), String> {
+        storyforge_infra_util::atomic_write_json(&self.path, chars).map_err(|e| {
+            let msg = format!("持久化角色卡失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }

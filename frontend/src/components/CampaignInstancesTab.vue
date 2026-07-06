@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import {
   listInstances, getCharacterVariables, setCharacterVariable,
@@ -36,6 +36,10 @@ async function load() {
 
 onMounted(load)
 
+watch(() => props.campaignId, () => {
+  if (props.campaignId) load()
+})
+
 // ─── 展开/收起实例变量 ───
 async function toggleInstance(inst) {
   if (expandedInstanceId.value === inst.id) {
@@ -71,8 +75,16 @@ async function handleVariableChange(instanceId, key, value, varType) {
     } else if (varType === 'float') {
       parsed = parseFloat(value)
       if (isNaN(parsed)) parsed = value
+    } else if (varType === 'json') {
+      try {
+        parsed = JSON.parse(value)
+      } catch {
+        parsed = value  // fallback to raw string if invalid JSON
+      }
+    } else {
+      // string 保持原样
+      parsed = value
     }
-    // string / json 保持原样
 
     await setCharacterVariable(props.campaignId, instanceId, key, parsed)
     instanceVariables.value = await getCharacterVariables(props.campaignId, instanceId)

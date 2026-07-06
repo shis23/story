@@ -483,27 +483,6 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) {
     );
 }
 
-/// 注册编剧 Agent 的工具
-#[allow(dead_code)]
-pub fn register_editor_tools(registry: &mut ToolRegistry) {
-    // compose: 编剧输出成文（实际上编剧直接输出文本，不需要真正调工具）
-    // 这个工具是为了让编剧可以声明"我完成了"
-    registry.register(
-        ToolSpec::function(
-            "compose",
-            "输出最终成文。调用此工具表示合并完成。",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "最终成文（Markdown）"}
-                },
-                "required": ["text"]
-            }),
-        ),
-        |args, _ctx| Box::pin(async move { Ok(args) }),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

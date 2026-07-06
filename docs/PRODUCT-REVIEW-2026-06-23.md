@@ -11,7 +11,7 @@
 
 StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡，而当前 ST 兼容停在"格式兼容"，"运行时兼容"基本未接通。产品价值尚未被真实卡验证过。
 
-本报告给出：①修正后的产品定位 ②三档验收基准（Bronze/Silver/Gold）③ST 运行时兼容的 6 个缺口 + ST 兼容层方案 ④重排后的 7 个 Sprint 路线（含 Android 主线）。
+本报告给出：①修正后的产品定位 ②三档验收基准（Bronze/Silver/Gold）③ST 运行时兼容的 7 个缺口 + 正则系统独立工作项 + ST 兼容层方案 ④重排后的 7 个 Sprint 路线（含 Android 主线）。
 
 **关键修正**（通读代码后纠正的早期判断）：
 - ❌ 早期判断"前端无插件接口" → ✅ 实际 `plugin-bridge.js` 已有完整的 `window.storyforge` API（权限/存储/UI槽/事件）
@@ -79,11 +79,11 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
 | 插件 API（window.storyforge）| ✅ 已有 | 8 方法 + 权限 + UI 槽 + 事件 |
 
-### 2.3 Silver/Gold 跑不通的 8 个缺口
+### 2.3 Silver/Gold 跑不通的缺口（7 个 + 正则系统独立工作项）
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| 1 | regex_scripts 接流水线 | 未在 pipeline 调用 | 2-3 天 |
+| R | **正则系统（独立工作项，见 §2.3.1）** | 仅读 Preset 来源 + 二元 placement | **9-13 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
@@ -91,6 +91,57 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | Constant 已注入 | 补关键词扫描 + 绿灯激活，2-3 天 |
 | 8 | H-012 trait 抽象 | `WebViewMvuRuntime` 硬依赖 tauri | 抽 `MvuEventPort` trait，3-5 天 |
+
+### 2.3.1 正则系统（独立工作项 R）
+
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：当前 `RegexScript`（`preset.rs:44`）只在**预设导入路径**调用 `extract_regex_scripts`，**只读 Preset 来源**，且 `placement: Vec<i32>` 被映射成二元枚举（丢信息）。
+
+**三个来源（ST 合并优先级：Global → Preset → Scoped）**：
+
+| 来源 | 存哪 | 现状 | 缺失影响 |
+|---|---|---|---|
+| Preset 脚本 | 预设 `extensions.regex_scripts` | ✅ 读 | 唯一接通的 |
+| **Scoped 脚本（卡内）** | 角色卡 `data.extensions.regex_scripts` | ❌ 不读 | **缄默之秋 9 个正则全在此，导入后不执行** |
+| Global 脚本 | `settings.json` | ❌ 不读 | 全局正则丢失 |
+
+**7 个作用域（ST placement 数值）**：
+
+| ST 作用域 | 值 | 现状枚举 | 缺失影响 |
+|---|---|---|---|
+| User Input | 0 | ✅ Input | |
+| AI Response | 2 | ✅ Output | |
+| Slash Commands | 1 | ❌ | 斜杠命令值不处理 |
+| **World Info** | 3 | ❌ | **世界书条目注入前格式错乱** |
+| Reasoning | 4 | ❌ | 推理模型内容块不处理 |
+
+**瞬时性（Ephemerality，3 种持久化模式）**：
+
+| 模式 | 行为 | 现状 | 缺失影响 |
+|---|---|---|---|
+| 默认 | 改写存储（不可逆）| ❌ | |
+| Only Display | 只改显示不改存储 | ❌ | **MVU状态栏美化无法正常工作** |
+| Alter Prompt | 只改 prompt 不改显示 | ❌ | |
+
+**缄默之秋的正则实际用途**（需正确支持）：
+- 开局造人（Output，替换标记 → HTML 表单）
+- MVU状态栏（Output + Display-only，`<data_block>` → 美化状态栏，**存储必须保留原 `<data_block>` 否则反解析失败**）
+- 思维链美化（Output，美化 `<think>` 块）
+- 杀八股词（Output，过滤"让我们一起""值得注意的是"等套话）
+- 文内选项（Output，渲染下一轮提示词的选项按钮）
+- 思考隐藏 / 变量更新美化 / 界面占位符等
+
+**拆分工作量**：
+
+| 子项 | 工作量 |
+|---|---|
+| 来源合并（Global/Preset/Scoped + 优先级）| 2-3 天 |
+| 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
+| 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
+| Depth 限制（只作用最近 N 条）| 1-2 天 |
+| placement 字段重做（恢复 `Vec<i32>` 语义）| 1 天 |
+| **总计** | **9-13 天** |
+
+> sprest 插件（提取预设中的正则集中管理）本身是管理工具非运行时，不需兼容。但它揭示的"正则来源合并优先级"问题必须正确实现。
 
 ### 2.4 原生渲染路线（Native/Hybrid 分层）
 
@@ -152,7 +203,7 @@ Layer 1: Meta Agent 复刻
 |---|---|---|---|---|
 | H-012 | infra-plugin-host 依赖 tauri | 🔴 是 | 🔴 是 | S3 先还 |
 | H-002 | API key 明文存储 | 否 | 🔴 是 | S4 |
-| H-013 | CampaignStore 持锁 7 次写入 | 否 | 🟡 中 | S4 |
+| H-013 | CampaignStore 单 Mutex + 同步 JSON I/O | 否 | 🟡 中 | S4（写入错误传播已完成，性能压测/拆分待做） |
 | H-014 | 同步 fs 阻塞 tokio | 否 | 🟡 中 | S4 |
 | M-012 | lastConversationNode 未传入 | 🟡 影响 Meta | 否 | S3 后 |
 | M-024 | patch 事务回滚 | 🟡 影响 Meta | 否 | S3 后 |
@@ -221,7 +272,7 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 
 #### S4：Android 前置债务（5-7 天）
 - H-002 API key → keyring
-- H-013 CampaignStore clone-then-write
+- H-013 CampaignStore 写入性能压测；必要时 clone-then-write / 后台 flush
 - H-014 同步 fs → spawn_blocking
 - **完成定义**：4 项技术债关闭，test 全绿
 

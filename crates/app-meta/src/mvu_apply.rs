@@ -38,10 +38,7 @@ pub enum MvuApplyError {
 ///
 /// VariableField 未 derive PartialEq，手动比较关键语义字段。
 fn field_semantic_eq(a: &VariableField, b: &VariableField) -> bool {
-    a.key == b.key
-        && a.label == b.label
-        && a.value_type == b.value_type
-        && a.default == b.default
+    a.key == b.key && a.label == b.label && a.value_type == b.value_type && a.default == b.default
 }
 
 /// 计算合并预览（纯函数，不写盘）。
@@ -185,9 +182,9 @@ mod tests {
             field("atk", "攻击力", 10),
         ];
         let mvu = vec![
-            field("hp", "HP", 100),     // label 不同 → overwritten
-            field("mp", "魔法值", 30),   // 完全相同 → unchanged
-            field("def", "防御力", 5),   // 新增 → added
+            field("hp", "HP", 100),    // label 不同 → overwritten
+            field("mp", "魔法值", 30), // 完全相同 → unchanged
+            field("def", "防御力", 5), // 新增 → added
         ];
 
         let preview = compute_apply_preview(&current, &mvu, "def-1", "角色A", "src-1");
@@ -245,10 +242,7 @@ mod tests {
             variable_schema: vec![field("hp", "生命值", 100)],
         };
 
-        let merged = vec![
-            field("hp", "生命值", 200),
-            field("mp", "魔法值", 50),
-        ];
+        let merged = vec![field("hp", "生命值", 200), field("mp", "魔法值", 50)];
         apply_schema_to_definition(&mut def, merged);
 
         assert_eq!(def.variable_schema.len(), 2);

@@ -66,17 +66,9 @@ impl ToolCenter {
             summaries: HashMap::new(),
         };
         // 通用只读工具（scope = All）
-        c.reg(
-            "search_world_info",
-            "按关键词搜索世界书",
-            ToolScope::All,
-        );
+        c.reg("search_world_info", "按关键词搜索世界书", ToolScope::All);
         c.reg("search_vectors", "向量记忆搜索", ToolScope::All);
-        c.reg(
-            "get_recent_summary",
-            "获取远记忆摘要",
-            ToolScope::All,
-        );
+        c.reg("get_recent_summary", "获取远记忆摘要", ToolScope::All);
         // Director 专属
         c.reg(
             "get_character",
@@ -186,12 +178,29 @@ mod tests {
         let c = center();
         let names = c.default_tool_names_for(&AgentRole::Director);
         // 3 个 All + 2 个 Director-only = 5
-        assert!(names.contains(&"search_world_info".into()), "missing search_world_info");
-        assert!(names.contains(&"search_vectors".into()), "missing search_vectors");
-        assert!(names.contains(&"get_recent_summary".into()), "missing get_recent_summary");
-        assert!(names.contains(&"get_character".into()), "missing get_character");
+        assert!(
+            names.contains(&"search_world_info".into()),
+            "missing search_world_info"
+        );
+        assert!(
+            names.contains(&"search_vectors".into()),
+            "missing search_vectors"
+        );
+        assert!(
+            names.contains(&"get_recent_summary".into()),
+            "missing get_recent_summary"
+        );
+        assert!(
+            names.contains(&"get_character".into()),
+            "missing get_character"
+        );
         assert!(names.contains(&"emit_plan".into()), "missing emit_plan");
-        assert_eq!(names.len(), 5, "Director should have 5 tools, got {}", names.len());
+        assert_eq!(
+            names.len(),
+            5,
+            "Director should have 5 tools, got {}",
+            names.len()
+        );
     }
 
     #[test]
@@ -200,8 +209,16 @@ mod tests {
         let names = c.default_tool_names_for(&AgentRole::Subagent("inst-xyz".into()));
         // 3 All + 1 subagent.get_character = 4
         assert!(names.contains(&"search_world_info".into()));
-        assert!(names.contains(&"subagent.get_character".into()), "subagent should have subagent.get_character");
-        assert_eq!(names.len(), 4, "Subagent(id) should have 4 tools, got {}", names.len());
+        assert!(
+            names.contains(&"subagent.get_character".into()),
+            "subagent should have subagent.get_character"
+        );
+        assert_eq!(
+            names.len(),
+            4,
+            "Subagent(id) should have 4 tools, got {}",
+            names.len()
+        );
     }
 
     #[test]
@@ -216,18 +233,34 @@ mod tests {
     fn editor_default_tools_include_compose() {
         let c = center();
         let names = c.default_tool_names_for(&AgentRole::Editor);
-        assert!(names.contains(&"compose".into()), "Editor should have compose");
+        assert!(
+            names.contains(&"compose".into()),
+            "Editor should have compose"
+        );
         // 3 All + 1 Editor = 4
-        assert_eq!(names.len(), 4, "Editor should have 4 tools, got {}", names.len());
+        assert_eq!(
+            names.len(),
+            4,
+            "Editor should have 4 tools, got {}",
+            names.len()
+        );
     }
 
     #[test]
     fn postprocessor_default_tools_include_emit_postprocess() {
         let c = center();
         let names = c.default_tool_names_for(&AgentRole::PostProcessor);
-        assert!(names.contains(&"emit_postprocess".into()), "PostProcessor should have emit_postprocess");
+        assert!(
+            names.contains(&"emit_postprocess".into()),
+            "PostProcessor should have emit_postprocess"
+        );
         // 3 All + 1 PostProcessor = 4
-        assert_eq!(names.len(), 4, "PostProcessor should have 4 tools, got {}", names.len());
+        assert_eq!(
+            names.len(),
+            4,
+            "PostProcessor should have 4 tools, got {}",
+            names.len()
+        );
     }
 
     #[test]
@@ -236,8 +269,14 @@ mod tests {
         let director_names = c.default_tool_names_for(&AgentRole::Director);
         let subagent_names = c.default_tool_names_for(&AgentRole::Subagent("id".into()));
         for name in &["search_world_info", "search_vectors", "get_recent_summary"] {
-            assert!(director_names.contains(&name.to_string()), "Director missing {name}");
-            assert!(subagent_names.contains(&name.to_string()), "Subagent missing {name}");
+            assert!(
+                director_names.contains(&name.to_string()),
+                "Director missing {name}"
+            );
+            assert!(
+                subagent_names.contains(&name.to_string()),
+                "Subagent missing {name}"
+            );
         }
     }
 

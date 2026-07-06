@@ -103,12 +103,12 @@ impl CampaignRuntimeContext {
         let mut seen: std::collections::HashSet<String> = self
             .instances
             .iter()
-            .flat_map(|inst| [inst.id.as_str().to_string(), inst.name.clone()])
+            .flat_map(|inst| [inst.id.as_str().to_string(), inst.name.to_lowercase()])
             .collect();
 
         for (cid, persona, behavior) in character_specs {
-            // Skip if already matched
-            if !seen.insert(cid.clone()) {
+            // Skip if already matched (IDs are case-insensitive UUIDs; names are lowercased)
+            if !seen.insert(cid.to_lowercase()) {
                 continue;
             }
             // Create temporary instance with optional overrides

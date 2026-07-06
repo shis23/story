@@ -115,7 +115,7 @@ impl CampaignStore {
             .cloned()
     }
 
-    pub fn save_card(&self, card: CharacterCard) -> StoredCard {
+    pub fn save_card(&self, card: CharacterCard) -> Result<StoredCard, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         // 同 source_character_id 去重（重跑识别时覆盖）
         cache
@@ -126,11 +126,11 @@ impl CampaignStore {
             imported_at: chrono::Utc::now().to_rfc3339(),
         };
         cache.cards.push(stored.clone());
-        persist(&self.cards_path, &cache.cards);
-        stored
+        persist(&self.cards_path, &cache.cards)?;
+        Ok(stored)
     }
 
-    pub fn update_card(&self, card: CharacterCard) -> Option<StoredCard> {
+    pub fn update_card(&self, card: CharacterCard) -> Result<Option<StoredCard>, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let stored = StoredCard {
             card,
@@ -138,14 +138,14 @@ impl CampaignStore {
         };
         if let Some(idx) = cache.cards.iter().position(|c| c.card.id == stored.card.id) {
             cache.cards[idx] = stored.clone();
-            persist(&self.cards_path, &cache.cards);
-            Some(stored)
+            persist(&self.cards_path, &cache.cards)?;
+            Ok(Some(stored))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    pub fn delete_card(&self, id: &Id) -> bool {
+    pub fn delete_card(&self, id: &Id) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let before = cache.cards.len();
         // 先记下要删的卡的 source_character_id（用于级联删 MVU 翻译）
@@ -158,7 +158,7 @@ impl CampaignStore {
         cache.cards.retain(|c| c.card.id != *id);
         let changed = cache.cards.len() != before;
         if changed {
-            persist(&self.cards_path, &cache.cards);
+            persist(&self.cards_path, &cache.cards)?;
             // 级联删除：该卡的 campaign + instances
             let camp_ids: Vec<Id> = cache
                 .campaigns
@@ -173,18 +173,18 @@ impl CampaignStore {
                 cache.tasks.retain(|t| t.campaign_id != *camp_id);
                 cache.summaries.retain(|s| s.campaign_id != *camp_id);
             }
-            persist(&self.campaigns_path, &cache.campaigns);
-            persist(&self.instances_path, &cache.instances);
-            persist(&self.knowledge_path, &cache.knowledge);
-            persist(&self.tasks_path, &cache.tasks);
-            persist(&self.summaries_path, &cache.summaries);
+            persist(&self.campaigns_path, &cache.campaigns)?;
+            persist(&self.instances_path, &cache.instances)?;
+            persist(&self.knowledge_path, &cache.knowledge)?;
+            persist(&self.tasks_path, &cache.tasks)?;
+            persist(&self.summaries_path, &cache.summaries)?;
             // 级联删除：该卡的 MVU 翻译
             for source_id in &source_ids {
                 cache.mvu.retain(|m| m.source_character_id != *source_id);
             }
-            persist(&self.mvu_path, &cache.mvu);
+            persist(&self.mvu_path, &cache.mvu)?;
         }
-        changed
+        Ok(changed)
     }
 
     // ─── Campaign CRUD ────────────────────────────────────────────────────
@@ -209,39 +209,40 @@ impl CampaignStore {
         cache.campaigns.iter().find(|c| c.id == *id).cloned()
     }
 
-    pub fn save_campaign(&self, campaign: Campaign) {
+    pub fn save_campaign(&self, campaign: Campaign) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.campaigns.retain(|c| c.id != campaign.id);
         cache.campaigns.push(campaign);
-        persist(&self.campaigns_path, &cache.campaigns);
+        persist(&self.campaigns_path, &cache.campaigns)
     }
 
-    pub fn update_campaign(&self, campaign: Campaign) {
+    pub fn update_campaign(&self, campaign: Campaign) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = cache.campaigns.iter().position(|c| c.id == campaign.id) {
             cache.campaigns[idx] = campaign;
-            persist(&self.campaigns_path, &cache.campaigns);
+            persist(&self.campaigns_path, &cache.campaigns)?;
         }
+        Ok(())
     }
 
-    pub fn delete_campaign(&self, id: &Id) -> bool {
+    pub fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let before = cache.campaigns.len();
         cache.campaigns.retain(|c| c.id != *id);
         let changed = cache.campaigns.len() != before;
         if changed {
-            persist(&self.campaigns_path, &cache.campaigns);
+            persist(&self.campaigns_path, &cache.campaigns)?;
             // 级联删除 instances + knowledge + tasks + round_summaries
             cache.instances.retain(|i| i.campaign_id != *id);
-            persist(&self.instances_path, &cache.instances);
+            persist(&self.instances_path, &cache.instances)?;
             cache.knowledge.retain(|k| k.campaign_id != *id);
-            persist(&self.knowledge_path, &cache.knowledge);
+            persist(&self.knowledge_path, &cache.knowledge)?;
             cache.tasks.retain(|t| t.campaign_id != *id);
-            persist(&self.tasks_path, &cache.tasks);
+            persist(&self.tasks_path, &cache.tasks)?;
             cache.summaries.retain(|s| s.campaign_id != *id);
-            persist(&self.summaries_path, &cache.summaries);
+            persist(&self.summaries_path, &cache.summaries)?;
         }
-        changed
+        Ok(changed)
     }
 
     // ─── CharacterInstance CRUD ───────────────────────────────────────────
@@ -270,19 +271,20 @@ impl CampaignStore {
             .cloned()
     }
 
-    pub fn add_instance(&self, instance: CharacterInstance) {
+    pub fn add_instance(&self, instance: CharacterInstance) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.instances.retain(|i| i.id != instance.id);
         cache.instances.push(instance);
-        persist(&self.instances_path, &cache.instances);
+        persist(&self.instances_path, &cache.instances)
     }
 
-    pub fn update_instance(&self, instance: CharacterInstance) {
+    pub fn update_instance(&self, instance: CharacterInstance) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = cache.instances.iter().position(|i| i.id == instance.id) {
             cache.instances[idx] = instance;
-            persist(&self.instances_path, &cache.instances);
+            persist(&self.instances_path, &cache.instances)?;
         }
+        Ok(())
     }
 
     // ─── CharacterKnowledge CRUD（P2 新增）─────────────────────────────────
@@ -319,25 +321,25 @@ impl CampaignStore {
     }
 
     /// 批量追加知识条目（后处理 Agent 产出后调用）
-    pub fn add_knowledge(&self, entries: Vec<CharacterKnowledgeEntry>) {
+    pub fn add_knowledge(&self, entries: Vec<CharacterKnowledgeEntry>) -> Result<(), String> {
         if entries.is_empty() {
-            return;
+            return Ok(());
         }
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.knowledge.extend(entries);
-        persist(&self.knowledge_path, &cache.knowledge);
+        persist(&self.knowledge_path, &cache.knowledge)
     }
 
     /// 删除单条知识条目（按 id），返回是否找到并删除
-    pub fn delete_knowledge(&self, knowledge_id: &Id) -> bool {
+    pub fn delete_knowledge(&self, knowledge_id: &Id) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let before = cache.knowledge.len();
         cache.knowledge.retain(|k| k.id != *knowledge_id);
         let changed = cache.knowledge.len() != before;
         if changed {
-            persist(&self.knowledge_path, &cache.knowledge);
+            persist(&self.knowledge_path, &cache.knowledge)?;
         }
-        changed
+        Ok(changed)
     }
 
     // ─── StoryTask CRUD（P2 新增）──────────────────────────────────────────
@@ -364,32 +366,33 @@ impl CampaignStore {
     }
 
     /// 新建任务（用户规划或后处理抽取）
-    pub fn add_task(&self, task: StoryTask) {
+    pub fn add_task(&self, task: StoryTask) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.tasks.retain(|t| t.id != task.id);
         cache.tasks.push(task);
-        persist(&self.tasks_path, &cache.tasks);
+        persist(&self.tasks_path, &cache.tasks)
     }
 
     /// 更新任务（状态变化 / 注入记录 / 标完成）
-    pub fn update_task(&self, task: StoryTask) {
+    pub fn update_task(&self, task: StoryTask) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = cache.tasks.iter().position(|t| t.id == task.id) {
             cache.tasks[idx] = task;
-            persist(&self.tasks_path, &cache.tasks);
+            persist(&self.tasks_path, &cache.tasks)?;
         }
+        Ok(())
     }
 
     /// 删除任务
-    pub fn delete_task(&self, task_id: &Id) -> bool {
+    pub fn delete_task(&self, task_id: &Id) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let before = cache.tasks.len();
         cache.tasks.retain(|t| t.id != *task_id);
         let changed = cache.tasks.len() != before;
         if changed {
-            persist(&self.tasks_path, &cache.tasks);
+            persist(&self.tasks_path, &cache.tasks)?;
         }
-        changed
+        Ok(changed)
     }
 
     // ─── RoundSummary CRUD（P2 新增）───────────────────────────────────────
@@ -413,13 +416,13 @@ impl CampaignStore {
     }
 
     /// 追加一条本轮摘要（剧情总结 Agent 产出后调用）
-    pub fn add_summary(&self, summary: RoundSummary) {
+    pub fn add_summary(&self, summary: RoundSummary) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache
             .summaries
             .retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
         cache.summaries.push(summary);
-        persist(&self.summaries_path, &cache.summaries);
+        persist(&self.summaries_path, &cache.summaries)
     }
 
     // ─── MVU 翻译存储（P3 新增）──────────────────────────────────────────
@@ -441,17 +444,17 @@ impl CampaignStore {
     }
 
     /// 保存/覆盖某角色卡的 MVU 翻译（按 source_character_id 去重）
-    pub fn save_mvu(&self, stored: StoredMvuTranslation) {
+    pub fn save_mvu(&self, stored: StoredMvuTranslation) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache
             .mvu
             .retain(|m| m.source_character_id != stored.source_character_id);
         cache.mvu.push(stored);
-        persist(&self.mvu_path, &cache.mvu);
+        persist(&self.mvu_path, &cache.mvu)
     }
 
     /// 删某角色卡的 MVU 翻译（删卡时级联）
-    pub fn delete_mvu(&self, source_character_id: &Id) -> bool {
+    pub fn delete_mvu(&self, source_character_id: &Id) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let before = cache.mvu.len();
         cache
@@ -459,9 +462,9 @@ impl CampaignStore {
             .retain(|m| m.source_character_id != *source_character_id);
         let changed = cache.mvu.len() != before;
         if changed {
-            persist(&self.mvu_path, &cache.mvu);
+            persist(&self.mvu_path, &cache.mvu)?;
         }
-        changed
+        Ok(changed)
     }
 }
 
@@ -496,10 +499,12 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Vec<T> {
     }
 }
 
-fn persist<T: serde::Serialize>(path: &PathBuf, data: &[T]) {
-    if let Err(e) = storyforge_infra_util::atomic_write_json(path, data) {
-        tracing::error!("持久化失败 {}: {e}", path.display());
-    }
+fn persist<T: serde::Serialize>(path: &PathBuf, data: &[T]) -> Result<(), String> {
+    storyforge_infra_util::atomic_write_json(path, data).map_err(|e| {
+        let msg = format!("持久化失败 {}: {e}", path.display());
+        tracing::error!("{msg}");
+        msg
+    })
 }
 
 // ─── 测试 ─────────────────────────────────────────────────────────────────
@@ -550,7 +555,7 @@ mod tests {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
         let card = make_card();
-        let stored = store.save_card(card.clone());
+        let stored = store.save_card(card.clone()).unwrap();
         assert!(stored.imported_at.len() > 0);
 
         let got = store.get_card(&Id::from_str("card-1")).unwrap();
@@ -568,10 +573,10 @@ mod tests {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
         let mut card = make_card();
-        store.save_card(card.clone());
+        store.save_card(card.clone()).unwrap();
         // 重跑（同名新 id），应覆盖而非累积
         card.id = Id::from_str("card-2");
-        store.save_card(card);
+        store.save_card(card).unwrap();
         assert_eq!(store.list_cards().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -582,25 +587,25 @@ mod tests {
         let store = CampaignStore::new(&dir);
 
         // 建 card
-        store.save_card(make_card());
+        store.save_card(make_card()).unwrap();
 
         // 建 campaign + instances
         let camp_id = Id::from_str("camp-1");
         let camp = Campaign::new(Id::from_str("card-1"), "新档".to_string());
         let _ = camp_id;
-        store.save_campaign(camp.clone());
+        store.save_campaign(camp.clone()).unwrap();
 
         let inst = CharacterInstance::from_definition(
             camp.id.clone(),
             &make_card().character_definitions[0],
         );
-        store.add_instance(inst.clone());
+        store.add_instance(inst.clone()).unwrap();
 
         assert_eq!(store.list_campaigns().len(), 1);
         assert_eq!(store.list_instances(&camp.id).len(), 1);
 
         // 删 card 级联删 campaign + instances
-        assert!(store.delete_card(&Id::from_str("card-1")));
+        assert!(store.delete_card(&Id::from_str("card-1")).unwrap());
         assert_eq!(store.list_campaigns().len(), 0);
         assert_eq!(store.list_all_instances().len(), 0);
 
@@ -612,7 +617,7 @@ mod tests {
         let dir = temp_dir();
         {
             let store = CampaignStore::new(&dir);
-            store.save_card(make_card());
+            store.save_card(make_card()).unwrap();
         }
         // 新 store 实例从同一目录加载
         let store2 = CampaignStore::new(&dir);
@@ -629,11 +634,11 @@ mod tests {
             camp.id.clone(),
             &make_card().character_definitions[0],
         );
-        store.save_campaign(camp.clone());
-        store.add_instance(inst.clone());
+        store.save_campaign(camp.clone()).unwrap();
+        store.add_instance(inst.clone()).unwrap();
 
         inst.set_variable("hp", serde_json::json!(50), 3);
-        store.update_instance(inst.clone());
+        store.update_instance(inst.clone()).unwrap();
 
         let got = store.get_instance(&inst.campaign_id, &inst.id).unwrap();
         let hp = got.get_variable("hp").unwrap();
@@ -654,7 +659,7 @@ mod tests {
             CharacterKnowledgeEntry::witnessed(camp_id.clone(), char_id.clone(), "看到尸体", 1);
         let e2 =
             CharacterKnowledgeEntry::backstory(camp_id.clone(), char_id.clone(), "我是外科医生");
-        store.add_knowledge(vec![e1.clone(), e2.clone()]);
+        store.add_knowledge(vec![e1.clone(), e2.clone()]).unwrap();
 
         assert_eq!(store.list_knowledge(&camp_id).len(), 2);
         assert_eq!(store.list_knowledge_of(&camp_id, &char_id).len(), 2);
@@ -678,15 +683,15 @@ mod tests {
         let e2 =
             CharacterKnowledgeEntry::backstory(camp_id.clone(), char_id.clone(), "我是外科医生");
         let e1_id = e1.id.clone();
-        store.add_knowledge(vec![e1, e2]);
+        store.add_knowledge(vec![e1, e2]).unwrap();
         assert_eq!(store.list_knowledge(&camp_id).len(), 2);
 
         // 删除 e1
-        assert!(store.delete_knowledge(&e1_id));
+        assert!(store.delete_knowledge(&e1_id).unwrap());
         assert_eq!(store.list_knowledge(&camp_id).len(), 1);
 
         // 再删返回 false
-        assert!(!store.delete_knowledge(&e1_id));
+        assert!(!store.delete_knowledge(&e1_id).unwrap());
 
         // 持久化验证
         let store2 = CampaignStore::new(&dir);
@@ -708,20 +713,20 @@ mod tests {
             1,
         );
         let task_id = task.id.clone();
-        store.add_task(task);
+        store.add_task(task).unwrap();
         assert_eq!(store.list_tasks(&camp_id).len(), 1);
 
         // 更新：标完成
         let mut got = store.get_task(&task_id).unwrap();
         got.complete();
-        store.update_task(got);
+        store.update_task(got).unwrap();
         assert_eq!(
             store.get_task(&task_id).unwrap().status,
             storyforge_domain::story_task::TaskStatus::Completed
         );
 
         // 删除
-        assert!(store.delete_task(&task_id));
+        assert!(store.delete_task(&task_id).unwrap());
         assert!(store.get_task(&task_id).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -733,25 +738,31 @@ mod tests {
         let camp_id = Id::from_str("camp-s");
         let conv = Id::from_str("conv-1");
 
-        store.add_summary(RoundSummary::new(
-            camp_id.clone(),
-            conv.clone(),
-            2,
-            "第二轮".into(),
-        ));
-        store.add_summary(RoundSummary::new(
-            camp_id.clone(),
-            conv.clone(),
-            1,
-            "第一轮".into(),
-        ));
+        store
+            .add_summary(RoundSummary::new(
+                camp_id.clone(),
+                conv.clone(),
+                2,
+                "第二轮".into(),
+            ))
+            .unwrap();
+        store
+            .add_summary(RoundSummary::new(
+                camp_id.clone(),
+                conv.clone(),
+                1,
+                "第一轮".into(),
+            ))
+            .unwrap();
         // 同 turn 覆盖
-        store.add_summary(RoundSummary::new(
-            camp_id.clone(),
-            conv.clone(),
-            1,
-            "第一轮（重写）".into(),
-        ));
+        store
+            .add_summary(RoundSummary::new(
+                camp_id.clone(),
+                conv.clone(),
+                1,
+                "第一轮（重写）".into(),
+            ))
+            .unwrap();
 
         let list = store.list_summaries(&camp_id);
         assert_eq!(list.len(), 2); // turn 1 和 turn 2
@@ -765,40 +776,46 @@ mod tests {
     fn test_campaign_delete_cascades_to_p2_collections() {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
-        store.save_card(make_card()); // 保证 card-1 存在
+        store.save_card(make_card()).unwrap(); // 保证 card-1 存在
 
         // 建 campaign（Campaign::new 内部分配 id）
         let camp = Campaign::new(Id::from_str("card-1"), "cascade");
         let camp_id = camp.id.clone();
-        store.save_campaign(camp);
+        store.save_campaign(camp).unwrap();
 
         // 塞三类 P2 数据
-        store.add_knowledge(vec![CharacterKnowledgeEntry::witnessed(
-            camp_id.clone(),
-            Id::from_str("c1"),
-            "x",
-            1,
-        )]);
-        store.add_task(StoryTask::user_planned(
-            camp_id.clone(),
-            "t",
-            "d",
-            vec![],
-            1,
-        ));
-        store.add_summary(RoundSummary::new(
-            camp_id.clone(),
-            Id::from_str("conv"),
-            1,
-            "s".into(),
-        ));
+        store
+            .add_knowledge(vec![CharacterKnowledgeEntry::witnessed(
+                camp_id.clone(),
+                Id::from_str("c1"),
+                "x",
+                1,
+            )])
+            .unwrap();
+        store
+            .add_task(StoryTask::user_planned(
+                camp_id.clone(),
+                "t",
+                "d",
+                vec![],
+                1,
+            ))
+            .unwrap();
+        store
+            .add_summary(RoundSummary::new(
+                camp_id.clone(),
+                Id::from_str("conv"),
+                1,
+                "s".into(),
+            ))
+            .unwrap();
 
         assert_eq!(store.list_knowledge(&camp_id).len(), 1);
         assert_eq!(store.list_tasks(&camp_id).len(), 1);
         assert_eq!(store.list_summaries(&camp_id).len(), 1);
 
         // 删 campaign 级联清掉三类
-        assert!(store.delete_campaign(&camp_id));
+        assert!(store.delete_campaign(&camp_id).unwrap());
         assert!(store.list_knowledge(&camp_id).is_empty());
         assert!(store.list_tasks(&camp_id).is_empty());
         assert!(store.list_summaries(&camp_id).is_empty());
@@ -827,8 +844,8 @@ mod tests {
         assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
 
         // 存
-        store.save_mvu(make_mvu("src-1", "测试卡A"));
-        store.save_mvu(make_mvu("src-2", "测试卡B"));
+        store.save_mvu(make_mvu("src-1", "测试卡A")).unwrap();
+        store.save_mvu(make_mvu("src-2", "测试卡B")).unwrap();
         assert_eq!(store.list_all_mvu().len(), 2);
         assert!(store.get_mvu(&Id::from_str("src-1")).is_some());
         assert_eq!(
@@ -840,7 +857,7 @@ mod tests {
         );
 
         // 覆盖（同 source_character_id 去重）
-        store.save_mvu(make_mvu("src-1", "测试卡A-改"));
+        store.save_mvu(make_mvu("src-1", "测试卡A-改")).unwrap();
         assert_eq!(store.list_all_mvu().len(), 2);
         assert_eq!(
             store
@@ -851,11 +868,11 @@ mod tests {
         );
 
         // 删
-        assert!(store.delete_mvu(&Id::from_str("src-1")));
+        assert!(store.delete_mvu(&Id::from_str("src-1")).unwrap());
         assert_eq!(store.list_all_mvu().len(), 1);
         assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
         // 再删返回 false
-        assert!(!store.delete_mvu(&Id::from_str("src-1")));
+        assert!(!store.delete_mvu(&Id::from_str("src-1")).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -864,13 +881,13 @@ mod tests {
     fn test_mvu_cascade_delete_on_card_delete() {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
-        store.save_card(make_card()); // card-1, source src-1
-        store.save_mvu(make_mvu("src-1", "测试卡"));
+        store.save_card(make_card()).unwrap(); // card-1, source src-1
+        store.save_mvu(make_mvu("src-1", "测试卡")).unwrap();
 
         assert!(store.get_mvu(&Id::from_str("src-1")).is_some());
 
         // 删卡 → MVU 级联清掉
-        assert!(store.delete_card(&Id::from_str("card-1")));
+        assert!(store.delete_card(&Id::from_str("card-1")).unwrap());
         assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
 
         std::fs::remove_dir_all(&dir).ok();

@@ -23,6 +23,9 @@ pub use health_check::{CampaignHealthSnapshot, HealthIssue, IssueSeverity, check
 pub use meta_conversation::{
     MetaConversation, MetaMessage, MetaSession, MetaTurn, ToolResultDisplay, chat as meta_chat,
 };
+pub use mvu_apply::{
+    MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview,
+};
 pub use mvu_import::{
     AgentSuggestion, PromptClassification, StPresetClassification, analyze_mvu_card,
     classify_st_preset_with_llm, score_card as score_card_complexity,
@@ -31,9 +34,6 @@ pub use typed_patch::{
     FieldDiff, PreviewInput, PreviewInputMut, TypedPatch, TypedPatchAction, TypedPatchError,
     TypedPatchStatus, apply_to_snapshot, build_patch_for_issue, build_patch_from_action,
     is_patch_stale,
-};
-pub use mvu_apply::{
-    MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview,
 };
 
 // ─── 诊断报告 ──────────────────────────────────────────────────────────────
@@ -285,8 +285,7 @@ fn parse_target(target: &str) -> Result<(&str, Option<TargetRef>), MetaError> {
         Ok((kind, Some(TargetRef::Index(idx))))
     } else if let Some(dot) = target.find('.') {
         let kind = &target[..dot];
-        let field = &target[dot + 1..];
-        Ok((kind, Some(TargetRef::Field(field.to_string()))))
+        Ok((kind, Some(TargetRef::Field)))
     } else {
         Ok((target, None))
     }
@@ -294,14 +293,14 @@ fn parse_target(target: &str) -> Result<(&str, Option<TargetRef>), MetaError> {
 
 enum TargetRef {
     Index(usize),
-    Field(String),
+    Field,
 }
 
 /// 执行单个 PatchAction
 fn execute_action(action: &PatchAction, ctx: &mut PatchContext) -> Result<(), MetaError> {
     match action {
         PatchAction::Create { target, data } => {
-            let (kind, target_ref) = parse_target(target)?;
+            let (kind, _target_ref) = parse_target(target)?;
             match kind {
                 "world_info" => {
                     if let Some(ref mut entries) = ctx.world_info_entries {

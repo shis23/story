@@ -18,19 +18,17 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use storyforge_app_conversation::ConversationStore;
 use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
+use storyforge_domain::Id;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::Character;
-use storyforge_domain::llm::{
-    LlmConnection, LlmProtocol, SamplingParams, ToolMode,
-};
-use storyforge_domain::Id;
+use storyforge_domain::llm::{LlmConnection, LlmProtocol, SamplingParams, ToolMode};
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_vector::BruteForceStore;
 
 // 从 tauri-app crate 复用线上 campaign-mode 组装逻辑（零行为复制）。
+use storyforge_app_agent::ToolContext;
 use storyforge_tauri_app::campaign_store::CampaignStore;
 use storyforge_tauri_app::fill_campaign_runtime_from_store;
-use storyforge_app_agent::ToolContext;
 
 /// 一次性环境：全部 tempdir，进程隔离，不污染真实 `data/`。
 pub struct HarnessEnv {
@@ -47,10 +45,8 @@ pub struct HarnessEnv {
 impl HarnessEnv {
     /// 新建隔离环境。`llm` 由调用方提供（真实或 mock）。
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        let data_dir = std::env::temp_dir().join(format!(
-            "storyforge_harness_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let data_dir =
+            std::env::temp_dir().join(format!("storyforge_harness_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("创建 tempdir 失败");
 
         let campaign_store = Arc::new(CampaignStore::new(&data_dir));
@@ -138,8 +134,13 @@ impl HarnessEnv {
 
     /// 复刻线上 `extract_characters`（tauri-app lib.rs:3970）：跑识别 Agent 建
     /// CharacterCard。失败时降级建单角色卡（与线上同行为）。
-    pub async fn extract_characters(&self, source_character_id: &str) -> storyforge_domain::character::CharacterCard {
-        use storyforge_app_agent::{AgentRuntime, attach_definitions_to_card, extract_characters as run_extract};
+    pub async fn extract_characters(
+        &self,
+        source_character_id: &str,
+    ) -> storyforge_domain::character::CharacterCard {
+        use storyforge_app_agent::{
+            AgentRuntime, attach_definitions_to_card, extract_characters as run_extract,
+        };
         use storyforge_domain::character::{CharacterCard, CharacterDefinition};
         use storyforge_domain::variables::extract_mvu_schema_from_extensions;
 
@@ -158,27 +159,37 @@ impl HarnessEnv {
         }
 
         let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
-        let tool_ctx_snapshot = Arc::new(
-            (*self.tool_ctx.read().unwrap_or_else(|p| p.into_inner())).clone(),
-        );
+        let tool_ctx_snapshot =
+            Arc::new((*self.tool_ctx.read().unwrap_or_else(|p| p.into_inner())).clone());
         let runtime = AgentRuntime::new(self.llm.clone(), tool_ctx_snapshot);
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let definitions = match run_extract(&runtime, &character, &mvu_schema, cancel_rx).await {
             Ok(defs) => {
-                eprintln!("[F2 DIAG] extract_characters Ok: {} definitions (正常解析路径)", defs.len());
+                eprintln!(
+                    "[F2 DIAG] extract_characters Ok: {} definitions (正常解析路径)",
+                    defs.len()
+                );
                 defs
             }
             Err(e) => {
-                eprintln!("[F2 DIAG] extract_characters Err: {e} → 降级单角色 (fallback_from_character)");
-                vec![CharacterDefinition::fallback_from_character(&character, &mvu_schema)]
+                eprintln!(
+                    "[F2 DIAG] extract_characters Err: {e} → 降级单角色 (fallback_from_character)"
+                );
+                vec![CharacterDefinition::fallback_from_character(
+                    &character,
+                    &mvu_schema,
+                )]
             }
         };
 
         let mut card = CharacterCard::from_character(&character);
         let definitions = attach_definitions_to_card(definitions, &card.id);
         card.character_definitions = definitions;
-        let stored = self.campaign_store.save_card(card);
+        let stored = self
+            .campaign_store
+            .save_card(card)
+            .expect("save_card failed");
         stored.card
     }
 
@@ -194,13 +205,17 @@ impl HarnessEnv {
 
         let campaign = Campaign::new(card.id.clone(), name.to_string());
         let campaign_id = campaign.id.clone();
-        self.campaign_store.save_campaign(campaign);
+        self.campaign_store
+            .save_campaign(campaign)
+            .expect("save_campaign failed");
 
         let mut count = 0;
         for def in &card.character_definitions {
             if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
                 let inst = CharacterInstance::from_definition(campaign_id.clone(), def);
-                self.campaign_store.add_instance(inst);
+                self.campaign_store
+                    .add_instance(inst)
+                    .expect("add_instance failed");
                 count += 1;
             }
         }
@@ -245,8 +260,8 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
             path.display()
         ));
     }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("解析 connections.json 失败: {e}"))?;
     let active_id = v

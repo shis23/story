@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 storyforge-domain = { path = "../domain" }
 storyforge-infra-llm = { path = "../infra-llm" }
-storyforge-infra-plugin-host = { path = "../infra-plugin-host" }
 storyforge-app-agent = { path = "../app-agent" }
 serde.workspace = true
 serde_json.workspace = true

@@ -66,6 +66,8 @@ pub struct MemoryArchiver {
     embedder: Arc<Embedder>,
     vector_store: Arc<dyn VectorStore>,
     config: ArchiveConfig,
+    /// Model name used for LLM summarization during archive.
+    model: String,
 }
 
 impl MemoryArchiver {
@@ -74,12 +76,14 @@ impl MemoryArchiver {
         embedder: Arc<Embedder>,
         vector_store: Arc<dyn VectorStore>,
         config: ArchiveConfig,
+        model: String,
     ) -> Self {
         Self {
             llm,
             embedder,
             vector_store,
             config,
+            model,
         }
     }
 
@@ -130,11 +134,12 @@ impl MemoryArchiver {
             .map(|(batch_idx, batch)| {
                 let llm = self.llm.clone();
                 let config = self.config.clone();
+                let model = self.model.clone();
                 async move {
                     let messages: Vec<&str> = batch.iter().map(|(_, m)| m.as_str()).collect();
                     let start_idx = batch.first().map(|(i, _)| *i).unwrap_or(0);
                     let end_idx = batch.last().map(|(i, _)| *i).unwrap_or(0);
-                    match archive_batch(&*llm, &messages, config.summary_max_chars).await {
+                    match archive_batch(&*llm, &messages, config.summary_max_chars, &model).await {
                         Ok((content, keywords)) => Ok(ArchivedSummary {
                             id: Id::new(),
                             content,
@@ -197,6 +202,7 @@ async fn archive_batch(
     llm: &dyn LlmClient,
     messages: &[&str],
     max_chars: usize,
+    model: &str,
 ) -> Result<(String, Vec<String>), MemoryError> {
     let messages_text = messages.join("\n---\n");
 
@@ -220,7 +226,7 @@ async fn archive_batch(
             max_tokens: Some(max_chars as u32 / 2), // 粗略估算
             ..Default::default()
         },
-        model: "deepseek-chat".into(), // 后续从配置读取
+        model: model.to_string(),
     };
 
     let resp = llm.chat(&req).await.map_err(MemoryError::Llm)?;

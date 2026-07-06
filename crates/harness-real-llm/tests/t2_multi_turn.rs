@@ -19,7 +19,9 @@ use harness_real_llm::{HarnessEnv, require_real_llm};
 fn find_fixture(name: &str) -> std::path::PathBuf {
     let env_key = format!(
         "STORYFORGE_FIXTURE_{}",
-        name.trim_end_matches(".png").to_uppercase().replace('-', "_")
+        name.trim_end_matches(".png")
+            .to_uppercase()
+            .replace('-', "_")
     );
     if let Ok(p) = std::env::var(&env_key) {
         let p = std::path::PathBuf::from(p);
@@ -73,11 +75,10 @@ async fn t2_multi_turn_appends() {
 
     // ── 导入 + 识别 + 建 Campaign（同 T1）──
     let card_path = find_fixture("test-card-seraphina.png");
-    let bytes = std::fs::read(&card_path).unwrap_or_else(|e| {
-        panic!("读不到 fixture {}: {e}", card_path.display())
-    });
-    let character = storyforge_infra_import::import_character(&bytes)
-        .expect("导入 seraphina 卡失败");
+    let bytes = std::fs::read(&card_path)
+        .unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", card_path.display()));
+    let character =
+        storyforge_infra_import::import_character(&bytes).expect("导入 seraphina 卡失败");
     let source_id = character.id.clone();
     env.inject_character(character);
 
@@ -89,7 +90,10 @@ async fn t2_multi_turn_appends() {
 
     // ── 第 1 轮 ──
     let text1 = run_turn(&env, &conversation_id, "开场：角色登场").await;
-    assert!(!text1.trim().is_empty(), "第 1 轮成文不应为空（首轮必须成功）");
+    assert!(
+        !text1.trim().is_empty(),
+        "第 1 轮成文不应为空（首轮必须成功）"
+    );
     eprintln!("第 1 轮成文: {} 字", text1.len());
 
     // 验证 turn = 1（无历史摘要）
@@ -111,10 +115,7 @@ async fn t2_multi_turn_appends() {
     }
 
     // ── 验证会话落盘 ──
-    let conv = env
-        .conv_store
-        .get(&conversation_id)
-        .expect("会话应已落盘");
+    let conv = env.conv_store.get(&conversation_id).expect("会话应已落盘");
     assert!(
         conv.nodes.len() >= 2,
         "对话树应有 ≥2 个节点（前 2 轮成功），实际 {}",

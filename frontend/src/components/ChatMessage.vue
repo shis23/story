@@ -20,7 +20,6 @@ const showHintBox = ref(false)
 // 待执行的重 roll 目标（kind 字符串）
 const pendingRerollKind = ref('')
 const hintInput = ref('')
-const rerolling = ref(false)
 
 // 内联编辑状态
 const editing = ref(false)
@@ -70,7 +69,6 @@ function confirmReroll() {
     kind, // 'all' | 'editor' | 'subagent:<角色名>'
     hint,
   })
-  rerolling.value = true
 }
 
 function cancelHint() {

@@ -3286,7 +3286,6 @@ dependencies = [
  "storyforge-app-agent",
  "storyforge-domain",
  "storyforge-infra-llm",
- "storyforge-infra-plugin-host",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

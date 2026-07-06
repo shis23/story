@@ -226,9 +226,8 @@ pub fn to_st_data(
 ) -> StCharacterData {
     // 从 raw_card_json 反序列化为 base，保留扩展字段
     let mut data: StCharacterData = if !character.raw_card_json.is_null() {
-        serde_json::from_value(character.raw_card_json.clone()).unwrap_or_else(|_| {
-            empty_st_data(&character.name)
-        })
+        serde_json::from_value(character.raw_card_json.clone())
+            .unwrap_or_else(|_| empty_st_data(&character.name))
     } else {
         empty_st_data(&character.name)
     };
@@ -288,9 +287,8 @@ pub fn to_st_data_from_card(
     character_book: Option<StWorldInfoBook>,
 ) -> StCharacterData {
     let mut data: StCharacterData = if !card.raw_card_json.is_null() {
-        serde_json::from_value(card.raw_card_json.clone()).unwrap_or_else(|_| {
-            empty_st_data(&definition.name)
-        })
+        serde_json::from_value(card.raw_card_json.clone())
+            .unwrap_or_else(|_| empty_st_data(&definition.name))
     } else {
         empty_st_data(&definition.name)
     };
@@ -415,6 +413,7 @@ pub struct CharacterDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 角色类型（常驻/配角/临场基准，D35）
+    #[serde(default)]
     pub role_type: RoleType,
     /// 变量 schema（基础表 + 卡 MVU initvar 扩展）
     ///

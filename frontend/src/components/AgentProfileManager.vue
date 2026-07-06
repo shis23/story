@@ -95,7 +95,7 @@ async function duplicate(id) {
     if (!name) return
     const newConfig = {
       ...src,
-      id: `profile-${Date.now()}`,
+      id: `profile-${crypto.randomUUID()}`,
       name,
       description: src.description || '',
       source: 'UserCreated',

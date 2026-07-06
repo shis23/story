@@ -194,11 +194,23 @@ impl BruteForceStore {
                         .ok()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_else(|| {
-                            tracing::error!("向量库 JSON 无可用备份，返回空");
+                            tracing::error!("向量库 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
                             HashMap::new()
                         })
                 }),
-                Err(_) => HashMap::new(),
+                Err(e) => {
+                    warn!("向量库文件读取失败({e})，尝试 .tmp 备份");
+                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                    std::fs::read_to_string(&tmp)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| {
+                            tracing::error!("向量库文件读取失败且无可用备份，文件: {}, IO 错误: {}. 已保存 .corrupt 备份", path.display(), e);
+                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
+                            HashMap::new()
+                        })
+                }
             }
         } else {
             HashMap::new()
@@ -337,7 +349,7 @@ impl VectorStore for BruteForceStore {
         let mut records = self.records.write().unwrap_or_else(|p| p.into_inner());
         let target = serde_json::Value::String(character_id.to_string());
         let before = records.len();
-        records.retain(|_, r| r.metadata.get("character_id") != Some(&target));
+        records.retain(|_, r| r.metadata.get("owner_character_id") != Some(&target));
         let removed = before - records.len();
         self.persist_records(&records)?;
         Ok(removed)
@@ -620,5 +632,51 @@ mod tests {
             .search_by_vector_filtered(&[1.0, 0.0, 0.0], 10, &filter)
             .unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_by_character() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(make_record_with_meta(
+                "k1",
+                "林医生的知识",
+                vec![],
+                "char-lin",
+                "camp-1",
+            ))
+            .unwrap();
+        store
+            .upsert(make_record_with_meta(
+                "k2",
+                "陈警官的知识",
+                vec![],
+                "char-chen",
+                "camp-1",
+            ))
+            .unwrap();
+        store
+            .upsert(make_record_with_meta(
+                "k3",
+                "林医生的另一条",
+                vec![],
+                "char-lin",
+                "camp-2",
+            ))
+            .unwrap();
+
+        assert_eq!(store.count(), 3);
+        let removed = store
+            .delete_by_character(&Id::from_str("char-lin"))
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.count(), 1);
+        // 只剩陈警官的
+        let filter = MetadataFilter::new().for_character(&Id::from_str("char-chen"));
+        let hits = store
+            .search_by_vector_filtered(&[1.0, 0.0, 0.0], 10, &filter)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), "k2");
     }
 }

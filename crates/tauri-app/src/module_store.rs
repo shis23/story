@@ -2,14 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use storyforge_domain::Id;
 use storyforge_domain::agent_profile_config::{
     AgentProfileConfig, AgentProfileConfigSummaryDto, BUILTIN_DEFAULT_AGENT_PROFILE_ID,
     default_agent_profile_config,
 };
-use storyforge_domain::prompt_module::{
-    ModuleCategory, ModuleSource, ProfileSource, PromptModule, PromptProfile,
-};
+use storyforge_domain::prompt_module::{ProfileSource, PromptModule, PromptProfile};
 
 // ─── DTO（前端友好的序列化结构）──────────────────────────────────────────────
 
@@ -118,19 +115,42 @@ impl ModuleStore {
         let disabled_path = app_data_dir.join("disabled_modules.json");
 
         let custom: Vec<PromptModule> = if custom_path.exists() {
-            std::fs::read_to_string(&custom_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&custom_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!(
+                        "自定义模块 JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                        custom_path.display(),
+                        e
+                    );
+                    let _ = std::fs::copy(&custom_path, custom_path.with_extension("json.corrupt"));
+                    Vec::new()
+                }),
+                Err(e) => {
+                    tracing::warn!("自定义模块文件读取失败({e})，返回空");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
 
         let disabled: Vec<String> = if disabled_path.exists() {
-            std::fs::read_to_string(&disabled_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&disabled_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!(
+                        "禁用模块列表 JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                        disabled_path.display(),
+                        e
+                    );
+                    let _ =
+                        std::fs::copy(&disabled_path, disabled_path.with_extension("json.corrupt"));
+                    Vec::new()
+                }),
+                Err(e) => {
+                    tracing::warn!("禁用模块列表文件读取失败({e})，返回空");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -162,15 +182,20 @@ impl ModuleStore {
     }
 
     /// 添加自定义模块
-    pub fn add(&self, module: PromptModule) {
+    pub fn add(&self, module: PromptModule) -> Result<(), String> {
         let mut custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         custom.push(module);
         drop(custom);
-        self.persist_custom();
+        self.persist_custom()
     }
 
     /// 更新模块内容（仅自定义模块可改内容；内置模块只能改 enabled）
-    pub fn update(&self, id: &str, content: Option<&str>, enabled: Option<bool>) -> bool {
+    pub fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<bool, String> {
         // 处理 enabled 状态
         if let Some(enabled) = enabled {
             let mut disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
@@ -180,7 +205,7 @@ impl ModuleStore {
                 disabled.push(id.to_string());
             }
             drop(disabled);
-            self.persist_disabled();
+            self.persist_disabled()?;
         }
 
         // 处理内容更新（仅自定义模块）
@@ -189,26 +214,26 @@ impl ModuleStore {
             if let Some(m) = custom.iter_mut().find(|m| m.id.to_string() == id) {
                 m.content = content.to_string();
                 drop(custom);
-                self.persist_custom();
-                return true;
+                self.persist_custom()?;
+                return Ok(true);
             }
-            return false; // 内置模块不能改内容
+            return Ok(false); // 内置模块不能改内容
         }
 
-        true
+        Ok(true)
     }
 
     /// 删除自定义模块
-    pub fn delete(&self, id: &str) -> bool {
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
         let before = custom.len();
         custom.retain(|m| m.id.to_string() != id);
         if custom.len() < before {
             drop(custom);
-            self.persist_custom();
-            true
+            self.persist_custom()?;
+            Ok(true)
         } else {
-            false // 内置模块不能删
+            Ok(false) // 内置模块不能删
         }
     }
 
@@ -228,18 +253,22 @@ impl ModuleStore {
             .map(|m| (m.clone(), enabled))
     }
 
-    fn persist_custom(&self) {
+    fn persist_custom(&self) -> Result<(), String> {
         let custom = self.custom.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.custom_path, &*custom) {
-            tracing::error!("持久化自定义模块失败: {e}");
-        }
+        storyforge_infra_util::atomic_write_json(&self.custom_path, &*custom).map_err(|e| {
+            let msg = format!("持久化自定义模块失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 
-    fn persist_disabled(&self) {
+    fn persist_disabled(&self) -> Result<(), String> {
         let disabled = self.disabled.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.disabled_path, &*disabled) {
-            tracing::error!("持久化禁用模块列表失败: {e}");
-        }
+        storyforge_infra_util::atomic_write_json(&self.disabled_path, &*disabled).map_err(|e| {
+            let msg = format!("持久化禁用模块列表失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }
 
@@ -259,18 +288,42 @@ impl ProfileStore {
         let active_path = app_data_dir.join("active_profile.json");
 
         let profiles: Vec<PromptProfile> = if profiles_path.exists() {
-            std::fs::read_to_string(&profiles_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&profiles_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!(
+                        "Profile 列表 JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                        profiles_path.display(),
+                        e
+                    );
+                    let _ =
+                        std::fs::copy(&profiles_path, profiles_path.with_extension("json.corrupt"));
+                    Vec::new()
+                }),
+                Err(e) => {
+                    tracing::warn!("Profile 列表文件读取失败({e})，返回空");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
 
         let active_id: Option<String> = if active_path.exists() {
-            std::fs::read_to_string(&active_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
+            match std::fs::read_to_string(&active_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!(
+                        "活跃 Profile JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                        active_path.display(),
+                        e
+                    );
+                    let _ = std::fs::copy(&active_path, active_path.with_extension("json.corrupt"));
+                    None
+                }),
+                Err(e) => {
+                    tracing::warn!("活跃 Profile 文件读取失败({e})，返回 None");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -325,7 +378,7 @@ impl ProfileStore {
     }
 
     /// 保存/更新 Profile
-    pub fn save(&self, profile: PromptProfile) {
+    pub fn save(&self, profile: PromptProfile) -> Result<(), String> {
         let mut profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = profiles.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
@@ -333,43 +386,47 @@ impl ProfileStore {
             profiles.push(profile);
         }
         drop(profiles);
-        self.persist();
+        self.persist()
     }
 
     /// 设置活跃 Profile
-    pub fn set_active(&self, id: &str) {
+    pub fn set_active(&self, id: &str) -> Result<(), String> {
         let json = {
             let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             *active_id = Some(id.to_string());
             serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())
         };
-        if let Err(e) = storyforge_infra_util::atomic_write_json_str(&self.active_path, &json) {
-            tracing::error!("持久化活跃 Profile 失败: {e}");
-        }
+        storyforge_infra_util::atomic_write_json_str(&self.active_path, &json).map_err(|e| {
+            let msg = format!("持久化活跃 Profile 失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 
     /// 删除 Profile
-    pub fn delete(&self, id: &str) -> bool {
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
         let mut profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
         let before = profiles.len();
         profiles.retain(|p| p.id.to_string() != id);
         if profiles.len() < before {
             drop(profiles);
-            self.persist();
+            self.persist()?;
             // 如果删的是活跃 Profile，清除活跃标记
             let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             if active_id.as_deref() == Some(id) {
                 *active_id = None;
                 drop(active_id);
-                if let Err(e) =
-                    storyforge_infra_util::atomic_write_json_str(&self.active_path, "null")
-                {
-                    tracing::error!("清除活跃 Profile 失败: {e}");
-                }
+                storyforge_infra_util::atomic_write_json_str(&self.active_path, "null").map_err(
+                    |e| {
+                        let msg = format!("清除活跃 Profile 失败: {e}");
+                        tracing::error!("{msg}");
+                        msg
+                    },
+                )?;
             }
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -381,15 +438,17 @@ impl ProfileStore {
         if !has_any {
             let (default_profile, _) =
                 storyforge_domain::prompt_module::builtins::default_profile();
-            self.save(default_profile);
+            let _ = self.save(default_profile);
         }
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> Result<(), String> {
         let profiles = self.profiles.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles) {
-            tracing::error!("持久化 Profile 失败: {e}");
-        }
+        storyforge_infra_util::atomic_write_json(&self.profiles_path, &*profiles).map_err(|e| {
+            let msg = format!("持久化 Profile 失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }
 
@@ -412,10 +471,17 @@ impl AgentProfileConfigStore {
         let active_path = app_data_dir.join("active_agent_profile_config.json");
 
         let mut configs: Vec<AgentProfileConfig> = if configs_path.exists() {
-            std::fs::read_to_string(&configs_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&configs_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!("Agent Profile Config 列表 JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份", configs_path.display(), e);
+                    let _ = std::fs::copy(&configs_path, configs_path.with_extension("json.corrupt"));
+                    Vec::new()
+                }),
+                Err(e) => {
+                    tracing::warn!("Agent Profile Config 列表文件读取失败({e})，返回空");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -425,9 +491,17 @@ impl AgentProfileConfigStore {
         }
 
         let active_id: Option<String> = if active_path.exists() {
-            std::fs::read_to_string(&active_path)
-                .ok()
-                .and_then(|data| serde_json::from_str(&data).ok())
+            match std::fs::read_to_string(&active_path) {
+                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                    tracing::error!("活跃 Agent Profile Config JSON 解析失败，文件: {}, 错误: {}. 已保存 .corrupt 备份", active_path.display(), e);
+                    let _ = std::fs::copy(&active_path, active_path.with_extension("json.corrupt"));
+                    None
+                }),
+                Err(e) => {
+                    tracing::warn!("活跃 Agent Profile Config 文件读取失败({e})，返回 None");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -528,8 +602,7 @@ impl AgentProfileConfigStore {
             configs.push(config);
         }
         drop(configs);
-        self.persist_configs();
-        Ok(())
+        self.persist_configs()
     }
 
     /// 设置活跃配置
@@ -546,10 +619,11 @@ impl AgentProfileConfigStore {
             *active_id = Some(id.to_string());
             serde_json::to_string(&*active_id).unwrap_or_else(|_| "null".into())
         };
-        if let Err(e) = storyforge_infra_util::atomic_write_json_str(&self.active_path, &json) {
-            tracing::error!("持久化活跃 Agent Profile Config 失败: {e}");
-        }
-        Ok(())
+        storyforge_infra_util::atomic_write_json_str(&self.active_path, &json).map_err(|e| {
+            let msg = format!("持久化活跃 Agent Profile Config 失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 
     /// 删除配置
@@ -564,17 +638,19 @@ impl AgentProfileConfigStore {
         configs.retain(|c| c.id.to_string() != id);
         if configs.len() < before {
             drop(configs);
-            self.persist_configs();
+            self.persist_configs()?;
             // 如果删的是活跃配置，清除活跃标记（下次 get_active 回退到内置默认）
             let mut active_id = self.active_id.lock().unwrap_or_else(|p| p.into_inner());
             if active_id.as_deref() == Some(id) {
                 *active_id = None;
                 drop(active_id);
-                if let Err(e) =
-                    storyforge_infra_util::atomic_write_json_str(&self.active_path, "null")
-                {
-                    tracing::error!("清除活跃 Agent Profile Config 失败: {e}");
-                }
+                storyforge_infra_util::atomic_write_json_str(&self.active_path, "null").map_err(
+                    |e| {
+                        let msg = format!("清除活跃 Agent Profile Config 失败: {e}");
+                        tracing::error!("{msg}");
+                        msg
+                    },
+                )?;
             }
             Ok(true)
         } else {
@@ -591,15 +667,17 @@ impl AgentProfileConfigStore {
         if !has_builtin {
             configs.push(default_agent_profile_config());
             drop(configs);
-            self.persist_configs();
+            let _ = self.persist_configs();
         }
     }
 
-    fn persist_configs(&self) {
+    fn persist_configs(&self) -> Result<(), String> {
         let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(e) = storyforge_infra_util::atomic_write_json(&self.configs_path, &*configs) {
-            tracing::error!("持久化 Agent Profile Config 失败: {e}");
-        }
+        storyforge_infra_util::atomic_write_json(&self.configs_path, &*configs).map_err(|e| {
+            let msg = format!("持久化 Agent Profile Config 失败: {e}");
+            tracing::error!("{msg}");
+            msg
+        })
     }
 }
 

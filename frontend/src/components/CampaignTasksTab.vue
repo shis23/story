@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import { listTasks, createTask, completeTask, abandonTask } from '../tauri-api.js'
 
@@ -36,6 +36,10 @@ async function load() {
 }
 
 onMounted(load)
+
+watch(() => props.campaignId, () => {
+  if (props.campaignId) load()
+})
 
 // ─── 过滤切换时重新加载 ───
 function onFilterChange() {

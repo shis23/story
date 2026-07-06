@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use storyforge_app_conversation::PartialRollTarget;
 use storyforge_app_pipeline::{RegenerateRequest, WritingContext};
-use storyforge_infra_llm::LlmClient;
 use storyforge_domain::Id;
+use storyforge_infra_llm::LlmClient;
 use tokio::sync::{mpsc, watch};
 
 use harness_real_llm::{HarnessEnv, require_real_llm};
@@ -19,7 +19,9 @@ use harness_real_llm::{HarnessEnv, require_real_llm};
 fn find_fixture(name: &str) -> std::path::PathBuf {
     let env_key = format!(
         "STORYFORGE_FIXTURE_{}",
-        name.trim_end_matches(".png").to_uppercase().replace('-', "_")
+        name.trim_end_matches(".png")
+            .to_uppercase()
+            .replace('-', "_")
     );
     if let Ok(p) = std::env::var(&env_key) {
         let p = std::path::PathBuf::from(p);
@@ -41,15 +43,12 @@ fn find_fixture(name: &str) -> std::path::PathBuf {
 }
 
 /// 跑首轮写作，返回 (conversation_id, node_id, env)。
-async fn setup_first_draft(
-    env: &HarnessEnv,
-) -> (Id, Id) {
+async fn setup_first_draft(env: &HarnessEnv) -> (Id, Id) {
     let card_path = find_fixture("test-card-seraphina.png");
-    let bytes = std::fs::read(&card_path).unwrap_or_else(|e| {
-        panic!("读不到 fixture {}: {e}", card_path.display())
-    });
-    let character = storyforge_infra_import::import_character(&bytes)
-        .expect("导入 seraphina 卡失败");
+    let bytes = std::fs::read(&card_path)
+        .unwrap_or_else(|e| panic!("读不到 fixture {}: {e}", card_path.display()));
+    let character =
+        storyforge_infra_import::import_character(&bytes).expect("导入 seraphina 卡失败");
     let source_id = character.id.clone();
     env.inject_character(character);
 
@@ -232,7 +231,11 @@ async fn t3_regenerate_director_only() {
 
     let result = pipeline.regenerate(req, &ctx, event_tx, cancel_rx).await;
     // 只重跑导演但保留旧子产出 = 业务约束拒绝（Plan 变了旧子产出不匹配）
-    assert!(result.is_err(), "director-only regenerate 应被拒绝（Plan 变了旧子产出不匹配）: {:?}", result);
+    assert!(
+        result.is_err(),
+        "director-only regenerate 应被拒绝（Plan 变了旧子产出不匹配）: {:?}",
+        result
+    );
 
     env.cleanup();
 }

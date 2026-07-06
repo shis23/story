@@ -246,21 +246,19 @@ impl MvuRuntime for WebViewMvuRuntime {
             .map_err(|e| MvuRuntimeError::ChannelError(format!("emit failed: {e}")))?;
 
         // 等待前端回传结果（带超时）
-        let response = tokio::time::timeout(
-            std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
-            rx,
-        )
-        .await
-        .map_err(|_| {
-            // 超时清理 pending
-            let pending = self.pending.clone();
-            let rid = request_id.clone();
-            tokio::spawn(async move {
-                pending.lock().await.remove(&rid);
-            });
-            MvuRuntimeError::Timeout(format!("{DEFAULT_TIMEOUT_MS}ms"))
-        })?
-        .map_err(|e| MvuRuntimeError::ChannelError(format!("oneshot recv: {e}")))?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS), rx)
+                .await
+                .map_err(|_| {
+                    // 超时清理 pending
+                    let pending = self.pending.clone();
+                    let rid = request_id.clone();
+                    tokio::spawn(async move {
+                        pending.lock().await.remove(&rid);
+                    });
+                    MvuRuntimeError::Timeout(format!("{DEFAULT_TIMEOUT_MS}ms"))
+                })?
+                .map_err(|e| MvuRuntimeError::ChannelError(format!("oneshot recv: {e}")))?;
 
         // 检查前端报告的 JS 错误
         if let Some(err) = &response.error {

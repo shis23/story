@@ -156,8 +156,13 @@ impl AgentRuntime {
 
             // 执行每个工具调用
             for tc in &resp.tool_calls {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
+                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
+                    }
+                };
 
                 let result = tool_registry
                     .dispatch(&tc.function.name, args, self.tool_ctx.clone())
@@ -176,7 +181,10 @@ impl AgentRuntime {
 
             // 终止工具检查：调用后立即返回（不等模型输出最终文本）
             if !config.terminal_tools.is_empty()
-                && resp.tool_calls.iter().any(|tc| config.terminal_tools.contains(&tc.function.name))
+                && resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
             {
                 info!(target: "app-agent", "{}: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
@@ -304,8 +312,13 @@ impl AgentRuntime {
             });
 
             for tc in &resp.tool_calls {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
+                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
+                    }
+                };
                 let result = tool_registry
                     .dispatch(&tc.function.name, args, self.tool_ctx.clone())
                     .await;
@@ -321,7 +334,10 @@ impl AgentRuntime {
 
             // 终止工具检查：调用后立即返回（不等模型输出最终文本）
             if !config.terminal_tools.is_empty()
-                && resp.tool_calls.iter().any(|tc| config.terminal_tools.contains(&tc.function.name))
+                && resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
             {
                 info!(target: "app-agent", "{}[stream]: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
@@ -453,8 +469,13 @@ impl AgentRuntime {
             });
 
             for tc in &resp.tool_calls {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(target: "app-agent", "Malformed tool-call arguments for {}: {e}", tc.function.name);
+                        serde_json::json!({ "error": format!("Invalid JSON arguments: {e}") })
+                    }
+                };
                 let result = tool_registry
                     .dispatch(&tc.function.name, args, self.tool_ctx.clone())
                     .await;
@@ -466,6 +487,18 @@ impl AgentRuntime {
                     }
                 };
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
+            }
+
+            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
+            if !config.terminal_tools.is_empty()
+                && resp
+                    .tool_calls
+                    .iter()
+                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
+            {
+                info!(target: "app-agent", "{}[layout]: 第 {round} 轮调用了终止工具，立即返回",
+                    config.role);
+                return Ok(resp);
             }
         }
 
@@ -611,6 +644,7 @@ pub async fn spawn_subagents(
             let base = runtime.tool_ctx();
             let mut ctx = (*base).clone();
             ctx.current_character_instance_id = instance_id_for_ctx.clone();
+            ctx.campaign_runtime = campaign_runtime.clone();
             Arc::new(ctx)
         };
         let sub_runtime = Arc::new(AgentRuntime::new(runtime.llm(), sub_tool_ctx));
@@ -649,11 +683,17 @@ pub async fn spawn_subagents(
 
             // 子 Agent 的完成探测：输出达到一定长度即视为完成（表演内容就是产出，
             // 不需要像导演那样必须调工具）。避免 drift recovery 把已完成的输出拖到 max rounds。
-            let sub_probe: &(dyn Fn(&str) -> bool + Send + Sync) = &|content: &str| {
-                content.chars().count() >= 50
-            };
+            let sub_probe: &(dyn Fn(&str) -> bool + Send + Sync) =
+                &|content: &str| content.chars().count() >= 50;
             let result = sub_runtime
-                .run_tool_loop_with_layout(&config, layout, &registry, child_cancel, sub_tx, Some(sub_probe))
+                .run_tool_loop_with_layout(
+                    &config,
+                    layout,
+                    &registry,
+                    child_cancel,
+                    sub_tx,
+                    Some(sub_probe),
+                )
                 .await;
             // sub_tx 在此 drop，转发任务收到 None 后自然结束
 

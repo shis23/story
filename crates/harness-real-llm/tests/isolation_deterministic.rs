@@ -13,23 +13,25 @@
 
 use std::sync::Arc;
 
-use storyforge_app_agent::tools::{register_subagent_tools, ToolRegistry};
-use storyforge_app_agent::runtime::build_campaign_subagent_volatile;
 use storyforge_app_agent::ToolContext;
 use storyforge_app_agent::ToolError;
+use storyforge_app_agent::runtime::build_campaign_subagent_volatile;
+use storyforge_app_agent::tools::{ToolRegistry, register_subagent_tools};
+use storyforge_domain::Id;
 use storyforge_domain::agent::{ContextPackage, SubagentTask};
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::character::{CharacterDefinition, RoleType};
-use storyforge_domain::character_knowledge::{
-    CharacterKnowledgeEntry, KnowledgeSource,
-};
-use storyforge_domain::Id;
+use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
 use storyforge_domain::variables::default_character_variables;
 
 /// 构造合成 2 角色 campaign runtime：Lin（主角）+ Chen（主角），各有私有知识。
 /// Lin 知道 "Lin 的秘密 A"，Chen 知道 "Chen 的秘密 B"——互不应见。
-fn make_two_char_runtime() -> (Arc<CampaignRuntimeContext>, CharacterInstance, CharacterInstance) {
+fn make_two_char_runtime() -> (
+    Arc<CampaignRuntimeContext>,
+    CharacterInstance,
+    CharacterInstance,
+) {
     let campaign = Campaign::new(Id::from_str("card-1"), "isolation-campaign");
     let campaign_id = campaign.id.clone();
 
@@ -168,7 +170,10 @@ fn volatile_tail_knowledge_isolation_between_instances() {
     };
 
     let lin_tail = build_campaign_subagent_volatile(&task, &cr, &inst_lin);
-    let chen_task = SubagentTask { character_id: "Chen".into(), ..task.clone() };
+    let chen_task = SubagentTask {
+        character_id: "Chen".into(),
+        ..task.clone()
+    };
     let chen_tail = build_campaign_subagent_volatile(&chen_task, &cr, &inst_chen);
 
     // Lin 只见自己的秘密
@@ -211,7 +216,11 @@ async fn get_character_cross_instance_denied() {
 
     // 查 Chen 的名字
     let r1 = registry
-        .dispatch("get_character", serde_json::json!({"name": "Chen"}), ctx.clone())
+        .dispatch(
+            "get_character",
+            serde_json::json!({"name": "Chen"}),
+            ctx.clone(),
+        )
         .await;
     assert!(r1.is_err(), "Lin 子 agent 不应能查 Chen（按名）");
 

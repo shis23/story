@@ -6,12 +6,12 @@
 
 use std::collections::HashSet;
 
-use storyforge_app_agent::tools::{register_subagent_tools, ToolRegistry};
 use storyforge_app_agent::ToolContext;
 use storyforge_app_agent::ToolError;
+use storyforge_app_agent::tools::{ToolRegistry, register_subagent_tools};
+use storyforge_domain::Id;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
-use storyforge_domain::Id;
 use storyforge_tauri_app::campaign_store;
 use storyforge_tauri_app::is_postprocess_instance_present;
 use storyforge_tauri_app::normalize_knowledge_update_for_postprocess;
@@ -39,10 +39,10 @@ fn b3_empty_witnessed_is_rejected() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let campaign = Campaign::new(Id::from_str("card-1"), "run");
-    store.save_campaign(campaign.clone());
+    store.save_campaign(campaign.clone()).unwrap();
     let mut inst = CharacterInstance::temporary(campaign.id.clone(), "缺席角色");
     inst.id = Id::from_str("inst-absent");
-    store.add_instance(inst);
+    store.add_instance(inst).unwrap();
 
     let update = CharacterKnowledgeUpdate {
         character_id: Id::from_str("缺席角色"),
@@ -54,7 +54,14 @@ fn b3_empty_witnessed_is_rejected() {
     };
     let empty: HashSet<String> = HashSet::new();
 
-    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
+    let entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &update,
+        1,
+        &empty,
+        &HashSet::new(),
+    );
     assert!(entries.is_empty(), "空集 + Witnessed 应被 P3 分流拒绝");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -67,10 +74,10 @@ fn b3_empty_told_by_other_passes() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let campaign = Campaign::new(Id::from_str("card-1"), "run");
-    store.save_campaign(campaign.clone());
+    store.save_campaign(campaign.clone()).unwrap();
     let mut inst = CharacterInstance::temporary(campaign.id.clone(), "缺席角色");
     inst.id = Id::from_str("inst-absent");
-    store.add_instance(inst);
+    store.add_instance(inst).unwrap();
 
     let update = CharacterKnowledgeUpdate {
         character_id: Id::from_str("缺席角色"),
@@ -82,8 +89,19 @@ fn b3_empty_told_by_other_passes() {
     };
     let empty: HashSet<String> = HashSet::new();
 
-    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &empty, &HashSet::new());
-    assert_eq!(entries.len(), 1, "空集 + ToldByOther 应放行（P3 分流：不受在场约束）");
+    let entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &update,
+        1,
+        &empty,
+        &HashSet::new(),
+    );
+    assert_eq!(
+        entries.len(),
+        1,
+        "空集 + ToldByOther 应放行（P3 分流：不受在场约束）"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -95,10 +113,10 @@ fn b3_told_by_other_bypasses_presence() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let campaign = Campaign::new(Id::from_str("card-1"), "run");
-    store.save_campaign(campaign.clone());
+    store.save_campaign(campaign.clone()).unwrap();
     let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
     lin.id = Id::from_str("inst-lin");
-    store.add_instance(lin);
+    store.add_instance(lin).unwrap();
 
     let update = CharacterKnowledgeUpdate {
         character_id: Id::from_str("Lin"),
@@ -111,7 +129,14 @@ fn b3_told_by_other_bypasses_presence() {
     // present 含 "Chen"，不含 Lin
     let present = HashSet::from([String::from("Chen")]);
 
-    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    let entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &update,
+        1,
+        &present,
+        &HashSet::new(),
+    );
     assert_eq!(entries.len(), 1, "ToldByOther 应绕过在场检查（跨在场告知）");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -124,10 +149,10 @@ fn b3_backstory_bypasses_presence() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let campaign = Campaign::new(Id::from_str("card-1"), "run");
-    store.save_campaign(campaign.clone());
+    store.save_campaign(campaign.clone()).unwrap();
     let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
     lin.id = Id::from_str("inst-lin");
-    store.add_instance(lin);
+    store.add_instance(lin).unwrap();
 
     let update = CharacterKnowledgeUpdate {
         character_id: Id::from_str("Lin"),
@@ -139,7 +164,14 @@ fn b3_backstory_bypasses_presence() {
     };
     let present = HashSet::from([String::from("Chen")]);
 
-    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    let entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &update,
+        1,
+        &present,
+        &HashSet::new(),
+    );
     assert_eq!(entries.len(), 1, "Backstory 应绕过在场检查（开局已有）");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -152,10 +184,10 @@ fn b3_witnessed_respects_presence() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = campaign_store::CampaignStore::new(&dir);
     let campaign = Campaign::new(Id::from_str("card-1"), "run");
-    store.save_campaign(campaign.clone());
+    store.save_campaign(campaign.clone()).unwrap();
     let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
     chen.id = Id::from_str("inst-chen");
-    store.add_instance(chen);
+    store.add_instance(chen).unwrap();
 
     let update = CharacterKnowledgeUpdate {
         character_id: Id::from_str("Chen"),
@@ -168,7 +200,14 @@ fn b3_witnessed_respects_presence() {
     // present 只含 Lin，不含 Chen
     let present = HashSet::from([String::from("Lin")]);
 
-    let entries = normalize_knowledge_update_for_postprocess(&store, &campaign.id, &update, 1, &present, &HashSet::new());
+    let entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &update,
+        1,
+        &present,
+        &HashSet::new(),
+    );
     assert!(entries.is_empty(), "Witnessed 且不在场应被拒绝（P3 分流）");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -203,19 +242,34 @@ fn b4_present_chars_name_id_matching() {
 
     // Chen（缺席）写回 ⇒ 拒
     assert!(
-        !is_postprocess_instance_present(&inst_chen, &Id::from_str("inst-chen"), &present, &HashSet::new()),
+        !is_postprocess_instance_present(
+            &inst_chen,
+            &Id::from_str("inst-chen"),
+            &present,
+            &HashSet::new()
+        ),
         "Chen 不在场，写回应被拒"
     );
     // Lin 按 name 在场 ⇒ 通过（无同名冲突时 name 路有效）
     assert!(
-        is_postprocess_instance_present(&inst_lin, &Id::from_str("inst-lin"), &present, &HashSet::new()),
+        is_postprocess_instance_present(
+            &inst_lin,
+            &Id::from_str("inst-lin"),
+            &present,
+            &HashSet::new()
+        ),
         "Lin 按 name 在场，写回应通过"
     );
     // present 改为 inst.id 形式 ⇒ 也通过（id 路匹配）
     let mut present_by_id: HashSet<String> = HashSet::new();
     present_by_id.insert("inst-lin".into());
     assert!(
-        is_postprocess_instance_present(&inst_lin, &Id::from_str("inst-lin"), &present_by_id, &HashSet::new()),
+        is_postprocess_instance_present(
+            &inst_lin,
+            &Id::from_str("inst-lin"),
+            &present_by_id,
+            &HashSet::new()
+        ),
         "present 含 inst.id 时，id 路匹配应通过"
     );
 }
@@ -251,11 +305,21 @@ fn b4_name_collision_only_id_path_works() {
 
     // 两个同名 instance 都因 name 路失效被拒（id 不在 present 中）
     assert!(
-        !is_postprocess_instance_present(&inst_a, &Id::from_str("inst-a"), &present, &name_collisions),
+        !is_postprocess_instance_present(
+            &inst_a,
+            &Id::from_str("inst-a"),
+            &present,
+            &name_collisions
+        ),
         "同名时 name 路失效，inst-a 的 id 不在 present 中应被拒"
     );
     assert!(
-        !is_postprocess_instance_present(&inst_b, &Id::from_str("inst-b"), &present, &name_collisions),
+        !is_postprocess_instance_present(
+            &inst_b,
+            &Id::from_str("inst-b"),
+            &present,
+            &name_collisions
+        ),
         "同名时 name 路失效，inst-b 的 id 不在 present 中应被拒"
     );
 }
@@ -289,12 +353,22 @@ fn b4_name_collision_id_path_still_works() {
 
     // inst-a 的 id 在 present 中 → 通过（id 路不受 name_collisions 影响）
     assert!(
-        is_postprocess_instance_present(&inst_a, &Id::from_str("inst-a"), &present, &name_collisions),
+        is_postprocess_instance_present(
+            &inst_a,
+            &Id::from_str("inst-a"),
+            &present,
+            &name_collisions
+        ),
         "inst-a 的 id 在 present 中，id 路应通过"
     );
     // inst-b 的 id 不在 present 中 → 拒（name 路因 name_collisions 失效）
     assert!(
-        !is_postprocess_instance_present(&inst_b, &Id::from_str("inst-b"), &present, &name_collisions),
+        !is_postprocess_instance_present(
+            &inst_b,
+            &Id::from_str("inst-b"),
+            &present,
+            &name_collisions
+        ),
         "inst-b 的 id 不在 present 中，同名时 name 路失效应被拒"
     );
 }
@@ -316,10 +390,8 @@ async fn b8_subagent_whitelist_cannot_add_unregistered_tool() {
     );
 
     // whitelist 尝试加 search_world_info（Director 工具，subagent 未注册）
-    let whitelist: Option<&[String]> = Some(&[
-        "search_world_info".to_string(),
-        "get_character".to_string(),
-    ]);
+    let whitelist: Option<&[String]> =
+        Some(&["search_world_info".to_string(), "get_character".to_string()]);
     filter_registry_by_whitelist(&mut registry, whitelist, "subagent");
 
     // 结果：get_character 保留，search_world_info 因未注册被忽略

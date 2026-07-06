@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
-import { sampleIntent } from '../mock.js'
+
+const sampleIntent = '写一段紧张的追逐戏，让侦探在雨夜的巷子里追上嫌疑人'
 
 const props = defineProps({
   /** 写作进行中：发送键变停止键，输入禁用 */

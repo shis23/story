@@ -356,6 +356,43 @@ pub enum LlmError {
     Internal(String),
 }
 
+impl LlmError {
+    /// 判断此错误是否值得重试（速率限制 / 服务端错误 / 超时）
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited(_) | Self::ServerError(_) | Self::Timeout
+        )
+    }
+}
+
+/// LLM 调用重试配置
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// 最大重试次数（不含首次调用；0 = 不重试）
+    pub max_retries: u32,
+    /// 初始退避时间（毫秒），每次翻倍：base, 2*base, 4*base ...
+    pub base_backoff_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_backoff_ms: 1000,
+        }
+    }
+}
+
+impl RetryConfig {
+    pub fn new(max_retries: u32, base_backoff_ms: u64) -> Self {
+        Self {
+            max_retries,
+            base_backoff_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +427,64 @@ mod tests {
     #[test]
     fn test_tool_mode_default() {
         assert_eq!(ToolMode::default(), ToolMode::Native);
+    }
+
+    #[test]
+    fn is_retryable_rate_limited() {
+        assert!(LlmError::RateLimited("slow down".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_server_error() {
+        assert!(LlmError::ServerError("502 bad gateway".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_timeout() {
+        assert!(LlmError::Timeout.is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_auth() {
+        assert!(!LlmError::Auth("401".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_bad_request() {
+        assert!(!LlmError::BadRequest("invalid".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_cancelled() {
+        assert!(!LlmError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_stream_parse() {
+        assert!(!LlmError::StreamParse("bad json".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_http() {
+        assert!(!LlmError::Http("connect failed".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_internal() {
+        assert!(!LlmError::Internal("bug".into()).is_retryable());
+    }
+
+    #[test]
+    fn retry_config_default() {
+        let cfg = RetryConfig::default();
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.base_backoff_ms, 1000);
+    }
+
+    #[test]
+    fn retry_config_custom() {
+        let cfg = RetryConfig::new(5, 500);
+        assert_eq!(cfg.max_retries, 5);
+        assert_eq!(cfg.base_backoff_ms, 500);
     }
 }

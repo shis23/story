@@ -82,7 +82,10 @@ impl MetaSession {
     }
 
     pub fn set_campaign_runtime(&self, ctx: Arc<CampaignRuntimeContext>) {
-        *self.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx);
+        *self
+            .campaign_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(ctx);
     }
 }
 
@@ -475,18 +478,19 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
             move |_args, _ctx| {
                 let session = session.clone();
                 Box::pin(async move {
-                    let rt = session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    let rt = session
+                        .campaign_runtime
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
                     match rt.as_ref() {
-                        Some(ctx) => {
-                            Ok(serde_json::json!({
-                                "campaign_id": ctx.campaign.id.to_string(),
-                                "name": ctx.campaign.name,
-                                "turn": ctx.turn,
-                                "instance_count": ctx.instances.len(),
-                                "knowledge_count": ctx.knowledge.len(),
-                                "campaign_variables": ctx.campaign.variables,
-                            }))
-                        }
+                        Some(ctx) => Ok(serde_json::json!({
+                            "campaign_id": ctx.campaign.id.to_string(),
+                            "name": ctx.campaign.name,
+                            "turn": ctx.turn,
+                            "instance_count": ctx.instances.len(),
+                            "knowledge_count": ctx.knowledge.len(),
+                            "campaign_variables": ctx.campaign.variables,
+                        })),
                         None => Ok(serde_json::json!({"error": "当前没有 active Campaign"})),
                     }
                 })
@@ -521,7 +525,7 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
                         Some(ctx) => {
                             match ctx.find_instance_by_id_or_name(id_or_name) {
                                 Some(inst) => {
-                                    let def = ctx.definition_for_instance(inst);
+                                    let _def = ctx.definition_for_instance(inst);
                                     let persona = ctx.resolved_persona_for(inst);
                                     let behavior = ctx.resolved_behavior_for(inst);
                                     Ok(serde_json::json!({
@@ -989,7 +993,9 @@ mod tests {
         register_meta_runtime_tools(&mut registry, session);
 
         let specs = registry.tool_specs();
-        let has_inspect = specs.iter().any(|s| s.function.name == "inspect_generation");
+        let has_inspect = specs
+            .iter()
+            .any(|s| s.function.name == "inspect_generation");
         assert!(has_inspect, "inspect_generation 工具应已注册");
     }
 
@@ -1115,22 +1121,37 @@ mod tests {
 
         let specs = registry.tool_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
-        assert!(names.contains(&"inspect_campaign"), "inspect_campaign 应已注册");
-        assert!(names.contains(&"inspect_instance"), "inspect_instance 应已注册");
-        assert!(names.contains(&"inspect_variables"), "inspect_variables 应已注册");
-        assert!(names.contains(&"inspect_knowledge"), "inspect_knowledge 应已注册");
+        assert!(
+            names.contains(&"inspect_campaign"),
+            "inspect_campaign 应已注册"
+        );
+        assert!(
+            names.contains(&"inspect_instance"),
+            "inspect_instance 应已注册"
+        );
+        assert!(
+            names.contains(&"inspect_variables"),
+            "inspect_variables 应已注册"
+        );
+        assert!(
+            names.contains(&"inspect_knowledge"),
+            "inspect_knowledge 应已注册"
+        );
         assert!(names.contains(&"inspect_tasks"), "inspect_tasks 应已注册");
-        assert!(names.contains(&"propose_campaign_patch"), "propose_campaign_patch 应已注册");
+        assert!(
+            names.contains(&"propose_campaign_patch"),
+            "propose_campaign_patch 应已注册"
+        );
     }
 
     // ─── Campaign handler 测试 helpers ─────────────────────────────────────
 
+    use std::collections::HashMap;
     use storyforge_domain::campaign::{Campaign, CharacterInstance};
     use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
     use storyforge_domain::character::{CharacterDefinition, RoleType};
     use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
-    use storyforge_domain::variables::{self, VariableValue};
-    use std::collections::HashMap;
+    use storyforge_domain::variables::{self};
 
     fn make_test_campaign_runtime() -> Arc<CampaignRuntimeContext> {
         use storyforge_domain::Id;
@@ -1219,10 +1240,7 @@ mod tests {
             .dispatch("inspect_campaign", serde_json::json!({}), make_tool_ctx())
             .await
             .unwrap();
-        assert!(
-            result.get("error").is_some(),
-            "无 campaign 时应返回 error"
-        );
+        assert!(result.get("error").is_some(), "无 campaign 时应返回 error");
     }
 
     // ─── inspect_instance 测试 ────────────────────────────────────────────

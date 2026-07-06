@@ -98,6 +98,7 @@ docs                       当前架构、数据模型、Agent 契约和路线�
 - [知识传播引擎](docs/PLAN-KNOWLEDGE-PROPAGATION.md)
 - [Android 计划](docs/PLAN-ANDROID.md)
 - [主线完成后的收口与发布准备](docs/PLAN-POST-MAINLINE.md)
+- [发布检查清单](docs/RELEASE-CHECKLIST.md)
 - [交接说明（已归档）](docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md)
 
 旧版文档已归档到 [docs/archive/2026-06-16-pre-rewrite](docs/archive/2026-06-16-pre-rewrite)。

@@ -33,10 +33,10 @@ async function loadConnections() {
   }
 }
 
-const activeConnName = () => {
+const activeConnName = computed(() => {
   const c = connections.value.find((x) => x.id === activeConnId.value)
   return c ? c.name : '未选择'
-}
+})
 
 async function selectConn(id) {
   showConnList.value = false
@@ -160,7 +160,7 @@ async function saveAsNewProfile() {
   if (!name) return
   saving.value = true
   try {
-    const profile = { ...activeProfile.value, id: `profile-${Date.now()}`, name }
+    const profile = { ...activeProfile.value, id: `profile-${crypto.randomUUID()}`, name }
     await saveProfile(JSON.stringify(profile))
     activeProfile.value = profile
     await loadModules() // 刷新（新预设可能成为活跃）
@@ -239,7 +239,7 @@ defineExpose({ loadConnections })
           @click="showConnList = !showConnList"
           class="w-full flex items-center justify-between px-3 py-2 bg-bg rounded-lg text-sm hover:bg-line"
         >
-          <span :class="activeConnId ? 'text-ink' : 'text-ink-soft'">{{ activeConnName() }}</span>
+          <span :class="activeConnId ? 'text-ink' : 'text-ink-soft'">{{ activeConnName }}</span>
           <span class="text-xs text-ink-soft">▾</span>
         </button>
         <div v-if="showConnList" class="absolute left-0 right-0 top-full mt-1 bg-surface border border-line rounded-lg shadow-lg py-1 z-10">

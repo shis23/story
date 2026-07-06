@@ -442,6 +442,9 @@ mod tests {
             "broadcast": {"group": "守卫"}
         }"#;
         let update: CharacterKnowledgeUpdate = serde_json::from_str(json_group).unwrap();
-        assert_eq!(update.broadcast, Some(BroadcastTarget::Group("守卫".to_string())));
+        assert_eq!(
+            update.broadcast,
+            Some(BroadcastTarget::Group("守卫".to_string()))
+        );
     }
 }

@@ -25,11 +25,9 @@ pub struct Campaign {
     /// 该 Campaign 绑定的唯一对话 ID（一 Campaign 一对话模型）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<Id>,
-    /// 故事时间（冗余缓存：真相源是 variables 里 key="story_clock" 的项）。
-    ///
-    /// 保留此顶层字段是为了向后兼容旧序列化数据 + 前端直接读取。set_variable("story_clock")
-    /// 会同步更新两者。注意：若外部直接构造/反序列化导致两者不一致，应以 variables 为准
-    /// （M-5 标注：理想做法是移除顶层字段统一到 variables，但会破坏序列化兼容，留待数据迁移专项）。
+    /// @deprecated -- use `get_variable("story_clock")` or `current_story_clock()` instead.
+    /// Kept for backward compat (serialized by `set_variable`).
+    /// Ideal: remove in data migration; this is the truth-source of the `variables` entry.
     #[serde(default = "default_story_clock")]
     pub story_clock: String,
 }
@@ -83,6 +81,16 @@ impl Campaign {
             .iter()
             .find(|v| v.key == key)
             .map(|v| &v.value)
+    }
+
+    /// Authoritative story clock: reads from `variables` first, falls back to
+    /// the top-level `story_clock` field for old data that was never migrated.
+    pub fn current_story_clock(&self) -> &str {
+        self.variables
+            .iter()
+            .find(|v| v.key == "story_clock")
+            .and_then(|v| v.value.as_str())
+            .unwrap_or(&self.story_clock)
     }
 
     pub fn set_variable(&mut self, key: &str, value: serde_json::Value, turn: u32) {
@@ -160,6 +168,11 @@ impl CharacterInstance {
         behavior_override: Option<String>,
     ) -> Self {
         let name = name.into();
+        let name = if name.trim().is_empty() {
+            "Unknown Character".to_string()
+        } else {
+            name.trim().to_string()
+        };
         Self {
             id: Id::new(),
             campaign_id,
@@ -277,6 +290,25 @@ mod tests {
             campaign.get_variable("custom_var"),
             Some(&serde_json::json!(42))
         );
+    }
+
+    #[test]
+    fn test_current_story_clock_reads_from_variables() {
+        let mut campaign = Campaign::new(Id::new(), "test");
+        // Default from variable_schema is "第1天"
+        assert_eq!(campaign.current_story_clock(), "第1天");
+        campaign.set_variable("story_clock", serde_json::json!("Day 100"), 3);
+        assert_eq!(campaign.current_story_clock(), "Day 100");
+    }
+
+    #[test]
+    fn test_current_story_clock_falls_back_to_field() {
+        // Simulate old data where story_clock field is set but variables entry is missing
+        let mut campaign = Campaign::new(Id::new(), "test");
+        // Manually remove the story_clock variable to simulate desync
+        campaign.variables.retain(|v| v.key != "story_clock");
+        // Top-level field still has old value
+        assert_eq!(campaign.current_story_clock(), "Day 1");
     }
 
     #[test]

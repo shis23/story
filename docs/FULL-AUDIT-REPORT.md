@@ -35,6 +35,7 @@
 - **文件**: `crates/tauri-app/src/campaign_store.rs:499`, `crates/tauri-app/src/storage.rs:228`, `crates/tauri-app/src/connection_store.rs:166`, `crates/tauri-app/src/preset_store.rs`
 - **问题**: `CampaignStore::save_campaign`, `add_instance`, `add_knowledge` 等所有 CRUD 方法返回 `()`。`persist()` 调用 `atomic_write_json` 失败时只记录日志，不传播错误。磁盘满或权限错误时用户以为保存成功，实际数据丢失。
 - **修复**: 使 `persist()` 返回 `Result`，调用者传播错误。
+- **当前状态（2026-07-06）**: `CampaignStore`、`CharacterStore`、`ConnectionStore` 等写入路径已改为返回 `Result`；主要 Tauri 命令会返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning。剩余风险转为性能/锁持有时间问题，见 H-013/H-014。
 - **置信度**: R4 双盲 ✅✅ + R6 验证确认
 
 ### H-002: API key 明文存储
@@ -49,6 +50,7 @@
 - **文件**: `crates/tauri-app/src/lib.rs:75-83`
 - **问题**: `get_app_data_dir()` 使用 `exe_dir.join("data")` 而非 `%APPDATA%`。共享安装位置下数据可能被其他用户读取。
 - **修复**: 使用 Tauri 的 `app_data_dir`。
+- **当前状态（2026-07-06）**: 生产路径已使用 OS 标准数据目录并保留旧目录迁移；`AppState::new_for_test()` 使用临时目录，避免单元测试读取真实用户数据。
 - **置信度**: R1 双盲 ✅✅
 
 ### H-004: `CharacterDefinition.role_type` 缺少 `#[serde(default)]`

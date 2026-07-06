@@ -381,8 +381,8 @@ fn extract_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
     use storyforge_domain::Id;
+    use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
 
     fn make_client(model: &str) -> HttpLlmClient {
         let conn = LlmConnection {
@@ -427,6 +427,9 @@ mod tests {
     fn effective_model_same_as_connection_preserved() {
         let client = make_client("deepseek-v4-flash");
         // req.model == self.model, not a placeholder — preserved as-is
-        assert_eq!(client.effective_model("deepseek-v4-flash"), "deepseek-v4-flash");
+        assert_eq!(
+            client.effective_model("deepseek-v4-flash"),
+            "deepseek-v4-flash"
+        );
     }
 }

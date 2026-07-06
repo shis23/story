@@ -1,5 +1,6 @@
 pub mod campaign_store;
 mod connection_store;
+pub mod error;
 mod module_store;
 mod preset_store;
 mod storage;
@@ -14,9 +15,11 @@ use storage::CharacterStore;
 use tokio::sync::watch;
 
 use storyforge_app_agent::ToolContext;
-use storyforge_app_meta::{MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview};
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
+use storyforge_app_meta::{
+    MvuApplyError, MvuApplyPreview, apply_schema_to_definition, compute_apply_preview,
+};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
@@ -27,9 +30,11 @@ use storyforge_domain::llm::{
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
-use storyforge_infra_plugin_host::mvu_runtime::{WebViewMvuRuntime, MvuExecuteResponse};
+use storyforge_infra_plugin_host::mvu_runtime::{MvuExecuteResponse, WebViewMvuRuntime};
 use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord, VectorStore};
 use tauri::Manager;
+
+use crate::error::TauriCommandError;
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -72,14 +77,100 @@ fn get_campaign_store() -> &'static campaign_store::CampaignStore {
 /// W10: 全局 MVU JS runtime（setup 时初始化，new_pipeline 时注入 PipelineOrchestrator）
 static MVU_RUNTIME: OnceLock<Arc<WebViewMvuRuntime>> = OnceLock::new();
 
+/// 获取应用数据目录，优先使用 OS 标准位置（H-003 修复）。
+/// Windows: %APPDATA%/StoryForge
+/// macOS/Linux: $HOME/.local/share/storyforge
+/// 回退: exe_dir/data（兼容旧安装）
 fn get_app_data_dir() -> PathBuf {
-    let exe_dir = std::env::current_exe()
+    let os_dir = if cfg!(target_os = "windows") {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|appdata| PathBuf::from(appdata).join("StoryForge"))
+    } else if cfg!(target_os = "macos") {
+        std::env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join("Library/Application Support/StoryForge"))
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| PathBuf::from(home).join(".local/share"))
+            })
+            .map(|p| p.join("storyforge"))
+    };
+
+    let data_dir = os_dir.unwrap_or_else(|| {
+        // 回退到 exe 目录（旧行为）
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("data")
+    });
+
+    std::fs::create_dir_all(&data_dir).ok();
+
+    // 数据迁移：如果旧位置有数据且新位置为空，复制过去
+    migrate_from_exe_dir_if_needed(&data_dir);
+
+    data_dir
+}
+
+/// 从旧的 exe_dir/data 迁移到新的 OS 标准目录（仅当新目录为空时）
+fn migrate_from_exe_dir_if_needed(new_dir: &PathBuf) {
+    let old_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let data_dir = exe_dir.join("data");
-    std::fs::create_dir_all(&data_dir).ok();
-    data_dir
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data");
+
+    if old_dir == *new_dir || !old_dir.exists() {
+        return;
+    }
+
+    // 检查新目录是否为空（忽略已迁移的数据）
+    let new_has_data = new_dir.join("characters.json").exists()
+        || new_dir.join("connections.json").exists()
+        || new_dir.join("campaigns").exists();
+
+    if new_has_data {
+        return; // 新目录已有数据，不需要迁移
+    }
+
+    tracing::info!(
+        "正在从旧数据目录迁移: {} → {}",
+        old_dir.display(),
+        new_dir.display()
+    );
+    if let Ok(entries) = std::fs::read_dir(&old_dir) {
+        for entry in entries.flatten() {
+            let dest = new_dir.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir_recursive(&entry.path(), &dest);
+            } else if let Err(e) = std::fs::copy(entry.path(), &dest) {
+                tracing::warn!("迁移文件失败 {}: {e}", entry.path().display());
+            }
+        }
+        tracing::info!("数据迁移完成");
+    }
+}
+
+/// 递归复制目录
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).ok();
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let dest = dst.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir_recursive(&entry.path(), &dest);
+            } else {
+                let _ = std::fs::copy(entry.path(), &dest);
+            }
+        }
+    }
 }
 
 fn load_embed_config(data_dir: &PathBuf) -> Option<storyforge_infra_llm::EmbedConfig> {
@@ -120,6 +211,8 @@ fn save_active_campaign(data_dir: &PathBuf, id: Option<&Id>) {
 
 /// 应用全局状态
 pub struct AppState {
+    /// App data directory used by stateful stores owned by this process.
+    data_dir: PathBuf,
     /// Mock LLM 客户端（fallback，无配置连接时用）
     pub mock_llm: Arc<dyn LlmClient>,
     pub conv_store: Arc<ConversationStore>,
@@ -159,7 +252,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let data_dir = get_app_data_dir();
+        Self::new_with_data_dir(get_app_data_dir())
+    }
+
+    fn new_with_data_dir(data_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&data_dir).ok();
         let conv_dir = data_dir.join("conversations");
         let log_dir = data_dir.join("logs");
 
@@ -183,7 +280,7 @@ impl AppState {
         // （否则每次重启 dev，tool_ctx 都是空的，写作时报"没有可用角色卡"）
         // 世界书：最后一张卡的条目 + 所有其他卡的 is_global 条目（全局共享）
         {
-            let store = get_store();
+            let store = CharacterStore::new(&data_dir);
             let stored_chars = store.list();
             if !stored_chars.is_empty() {
                 let mut ctx = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -213,7 +310,7 @@ impl AppState {
 
         // 尝试从已持久化的连接恢复活跃 client（挂 LlmInterceptor 记录调用）
         let (active_llm, active_conn_id) = {
-            let conn_store = get_conn_store();
+            let conn_store = connection_store::ConnectionStore::new(&data_dir);
             if let Some(conn) = conn_store.active_connection() {
                 match storyforge_infra_llm::create_client(&conn) {
                     Ok(client) => {
@@ -253,6 +350,7 @@ impl AppState {
         }));
 
         Self {
+            data_dir: data_dir.clone(),
             mock_llm,
             conv_store,
             log_store,
@@ -272,6 +370,15 @@ impl AppState {
             meta_session: Arc::new(meta_session),
             meta_conversations: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        let data_dir = std::env::temp_dir().join(format!(
+            "storyforge-app-state-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Self::new_with_data_dir(data_dir)
     }
 
     /// 取一份 tool_ctx 快照（clone 出 Arc<ToolContext>），供本次流水线使用
@@ -305,14 +412,14 @@ impl AppState {
     }
 
     /// 设置活跃连接（构造 client 并缓存，挂 LlmInterceptor 记录每次调用）
-    pub fn set_active_connection(&self, id: &str) -> Result<(), String> {
+    pub fn set_active_connection(&self, id: &str) -> Result<(), TauriCommandError> {
         let conn_store = get_conn_store();
         let conn = conn_store
-            .set_active(id)
-            .ok_or_else(|| format!("连接不存在: {id}"))?;
+            .set_active(id)?
+            .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id}")))?;
 
-        let client = storyforge_infra_llm::create_client(&conn)
-            .map_err(|e| format!("构造客户端失败: {e}"))?;
+        let client =
+            storyforge_infra_llm::create_client(&conn).map_err(|e| TauriCommandError::from(e))?;
 
         // 包装 LlmInterceptor：每次 LLM 调用自动记录 payload/响应/token/延迟到 LogStore
         let intercepted: Arc<dyn LlmClient> =
@@ -346,8 +453,11 @@ impl AppState {
         // 注入向量存储（search_vectors 工具用）
         tool_ctx.vector_store = Some(self.vector_store.clone());
         // W10: 注入 MVU JS runtime（None = setup 未运行或 WebView 不可用，降级）
-        let mvu_rt: Option<Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>> =
-            MVU_RUNTIME.get().cloned().map(|r| r as Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>);
+        let mvu_rt: Option<
+            Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>,
+        > = MVU_RUNTIME.get().cloned().map(|r| {
+            r as Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>
+        });
         PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), mvu_rt)
     }
 }
@@ -477,11 +587,13 @@ impl From<storage::StoredCharacter> for CharacterSummary {
 fn import_character(
     data: Vec<u8>,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<CharacterSummary, String> {
+) -> Result<CharacterSummary, TauriCommandError> {
     let character =
-        storyforge_infra_import::import_character(&data).map_err(|e| format!("导入失败: {e}"))?;
+        storyforge_infra_import::import_character(&data).map_err(TauriCommandError::from)?;
     let info = CharacterInfo::from(&character);
-    let stored = get_store().save(info);
+    let stored = get_store()
+        .save(info)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // 同步到 tool_ctx：角色卡 + 世界书（覆盖为当前角色的，符合"当前角色"语义）
     {
@@ -547,11 +659,11 @@ fn list_characters() -> Vec<CharacterSummary> {
 }
 
 #[tauri::command]
-fn get_character(id: String) -> Result<CharacterInfo, String> {
+fn get_character(id: String) -> Result<CharacterInfo, TauriCommandError> {
     get_store()
         .get(&id)
         .map(|stored| stored.info)
-        .ok_or_else(|| format!("角色卡不存在: {id}"))
+        .ok_or_else(|| TauriCommandError::from(format!("角色卡不存在: {id}")))
 }
 
 fn delete_character_cascade_source_ids(
@@ -578,7 +690,10 @@ fn delete_character_cascade_source_ids(
 }
 
 #[tauri::command]
-fn delete_character(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn delete_character(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
     // 先取出 name（用于同步 tool_ctx）
     let stored = get_store().get(&id);
     let name = stored.as_ref().map(|s| s.info.name.clone());
@@ -594,8 +709,11 @@ fn delete_character(id: String, state: tauri::State<'_, Arc<AppState>>) -> Resul
             &ctx.characters,
         )
     };
-    if !get_store().delete(&id) {
-        return Err(format!("角色卡不存在: {id}"));
+    if !get_store()
+        .delete(&id)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
+        return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
     }
     // 同步从 tool_ctx 移除
     if let Some(name) = name {
@@ -614,11 +732,11 @@ fn delete_character(id: String, state: tauri::State<'_, Arc<AppState>>) -> Resul
     // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
     // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
     for source_id in &source_ids {
-        get_campaign_store().delete_mvu(source_id);
+        let _ = get_campaign_store().delete_mvu(source_id);
         // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
         if let Some(stored_card) = get_campaign_store().get_card_by_source(source_id) {
             // 桥接：通过角色名找到 Character.id，再查 card
-            get_campaign_store().delete_card(&stored_card.card.id);
+            let _ = get_campaign_store().delete_card(&stored_card.card.id);
         }
     }
     // 级联删除：清理向量库中该角色相关的记录（M-2）
@@ -637,14 +755,14 @@ fn update_world_info_route(
     entry_index: usize,
     route: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     // 验证路由值合法
     match route.as_str() {
         "Constant" | "Selective" | "Both" | "Disabled" => {}
         other => {
-            return Err(format!(
+            return Err(TauriCommandError::from(format!(
                 "无效路由: {other}，应为 Constant/Selective/Both/Disabled"
-            ));
+            )));
         }
     }
 
@@ -685,7 +803,7 @@ fn update_world_info_entry(
     depth: i32,
     order: i32,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     get_store().update_world_info_entry(
         &character_id,
         entry_index,
@@ -711,7 +829,7 @@ fn add_world_info_entry(
     constant: bool,
     is_global: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<usize, String> {
+) -> Result<usize, TauriCommandError> {
     let new_index = get_store().add_world_info_entry(
         &character_id,
         keys.clone(),
@@ -742,7 +860,7 @@ fn delete_world_info_entry(
     character_id: String,
     entry_index: usize,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     get_store().delete_world_info_entry(&character_id, entry_index)?;
     rebuild_world_info_in_tool_ctx(&state);
     Ok(())
@@ -818,10 +936,11 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
 }
 
 #[tauri::command]
-fn import_preset(data: Vec<u8>) -> Result<String, String> {
-    let preset =
-        storyforge_infra_import::import_preset(&data).map_err(|e| format!("导入失败: {e}"))?;
-    let preset_id = get_preset_store().save(preset.clone());
+fn import_preset(data: Vec<u8>) -> Result<String, TauriCommandError> {
+    let preset = storyforge_infra_import::import_preset(&data).map_err(TauriCommandError::from)?;
+    let preset_id = get_preset_store()
+        .save(preset.clone())
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
     Ok(format!(
         "预设 '{}' (id: {}) 导入成功，含 {} 条提示词、{} 条正则",
         preset.name,
@@ -888,10 +1007,10 @@ fn list_presets() -> Vec<PresetSummaryDto> {
 }
 
 #[tauri::command]
-fn get_preset(id: String) -> Result<PresetDetailDto, String> {
+fn get_preset(id: String) -> Result<PresetDetailDto, TauriCommandError> {
     let sp = get_preset_store()
         .get(&id)
-        .ok_or_else(|| format!("找不到预设 {id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到预设 {id}")))?;
     Ok(PresetDetailDto {
         id: sp.id.clone(),
         name: sp.preset.name.clone(),
@@ -936,11 +1055,14 @@ fn get_preset(id: String) -> Result<PresetDetailDto, String> {
 }
 
 #[tauri::command]
-fn delete_preset(id: String) -> Result<(), String> {
-    if get_preset_store().delete(&id) {
+fn delete_preset(id: String) -> Result<(), TauriCommandError> {
+    if get_preset_store()
+        .delete(&id)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
         Ok(())
     } else {
-        Err(format!("找不到预设 {id}"))
+        Err(TauriCommandError::not_found(format!("找不到预设 {id}")))
     }
 }
 
@@ -950,13 +1072,16 @@ fn update_preset_prompt(
     prompt_index: usize,
     content: Option<String>,
     enabled: Option<bool>,
-) -> Result<(), String> {
-    if get_preset_store().update_prompt(&preset_id, prompt_index, content.as_deref(), enabled) {
+) -> Result<(), TauriCommandError> {
+    if get_preset_store()
+        .update_prompt(&preset_id, prompt_index, content.as_deref(), enabled)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
         Ok(())
     } else {
-        Err(format!(
+        Err(TauriCommandError::not_found(format!(
             "找不到预设 {preset_id} 的第 {prompt_index} 条 prompt"
-        ))
+        )))
     }
 }
 
@@ -965,11 +1090,16 @@ fn update_preset_regex(
     preset_id: String,
     regex_index: usize,
     disabled: Option<bool>,
-) -> Result<(), String> {
-    if get_preset_store().update_regex(&preset_id, regex_index, disabled) {
+) -> Result<(), TauriCommandError> {
+    if get_preset_store()
+        .update_regex(&preset_id, regex_index, disabled)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
         Ok(())
     } else {
-        Err(format!("找不到预设 {preset_id} 的第 {regex_index} 条正则"))
+        Err(TauriCommandError::not_found(format!(
+            "找不到预设 {preset_id} 的第 {regex_index} 条正则"
+        )))
     }
 }
 
@@ -978,7 +1108,7 @@ fn update_preset_regex(
 fn import_preset_as_modules(
     preset_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<usize, String> {
+) -> Result<usize, TauriCommandError> {
     use storyforge_domain::agent::AgentRole;
     use storyforge_domain::prompt_module::{
         Exclusivity, ModuleCategory, ModuleSource, PromptModule,
@@ -986,7 +1116,7 @@ fn import_preset_as_modules(
 
     let stored = get_preset_store()
         .get(&preset_id)
-        .ok_or_else(|| format!("找不到预设 {preset_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到预设 {preset_id}")))?;
     let mut count = 0;
 
     for prompt in &stored.preset.prompts {
@@ -1014,7 +1144,10 @@ fn import_preset_as_modules(
             tags: vec!["ST导入".into(), stored.preset.name.clone()],
         };
 
-        state.module_store.add(module);
+        state
+            .module_store
+            .add(module)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
         count += 1;
     }
 
@@ -1074,21 +1207,25 @@ fn list_plugins(state: tauri::State<'_, Arc<AppState>>) -> Vec<InstalledPluginDt
 fn install_plugin(
     manifest_json: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let manifest: storyforge_infra_plugin_host::PluginManifest =
-        serde_json::from_str(&manifest_json).map_err(|e| format!("manifest 解析失败: {e}"))?;
+        serde_json::from_str(&manifest_json)
+            .map_err(|e| TauriCommandError::validation(format!("manifest 解析失败: {e}")))?;
     state
         .plugin_registry
         .install(manifest)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 #[tauri::command]
-fn uninstall_plugin(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn uninstall_plugin(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
     state
         .plugin_registry
         .uninstall(&id)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 #[tauri::command]
@@ -1096,11 +1233,11 @@ fn set_plugin_enabled(
     id: String,
     enabled: bool,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     state
         .plugin_registry
         .set_enabled(&id, enabled)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 // ─── M4 插件 API 命令（带权限二次校验）──────────────────────────────────────
@@ -1109,12 +1246,12 @@ fn set_plugin_enabled(
 fn plugin_list_characters(
     plugin_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<CharacterSummary>, String> {
+) -> Result<Vec<CharacterSummary>, TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
     state
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     Ok(get_store()
         .list()
         .into_iter()
@@ -1127,16 +1264,16 @@ fn plugin_read_character(
     plugin_id: String,
     character_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<CharacterInfo, String> {
+) -> Result<CharacterInfo, TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
     state
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::ReadCharacters)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     get_store()
         .get(&character_id)
         .map(|s| s.info)
-        .ok_or_else(|| format!("角色卡不存在: {character_id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
 }
 
 #[tauri::command]
@@ -1144,19 +1281,19 @@ fn plugin_get_variable(
     plugin_id: String,
     campaign_id: String,
     instance_id: String,
-    key: String,
+    _key: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
     state
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::WriteVariables)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     let store = get_campaign_store();
     store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .map(|i| i.variables)
-        .ok_or_else(|| format!("找不到实例 {instance_id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))
 }
 
 #[tauri::command]
@@ -1167,18 +1304,20 @@ fn plugin_set_variable(
     key: String,
     value: serde_json::Value,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
     state
         .plugin_registry
         .ensure_permission(&plugin_id, &Permission::WriteVariables)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
     let store = get_campaign_store();
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .ok_or_else(|| format!("找不到实例 {instance_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到实例 {instance_id}")))?;
     inst.set_variable(&key, value, 0);
-    store.update_instance(inst);
+    store
+        .update_instance(inst)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
     Ok(())
 }
 
@@ -1200,8 +1339,12 @@ fn update_module(
     content: Option<String>,
     enabled: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    if state.module_store.update(&id, content.as_deref(), enabled) {
+) -> Result<(), TauriCommandError> {
+    if state
+        .module_store
+        .update(&id, content.as_deref(), enabled)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
         Ok(())
     } else {
         Err("内置模块不能修改内容".into())
@@ -1227,16 +1370,25 @@ fn get_active_profile(
 fn save_profile(
     profile_json: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    let profile: PromptProfile =
-        serde_json::from_str(&profile_json).map_err(|e| format!("Profile 解析失败: {e}"))?;
-    state.profile_store.save(profile);
+) -> Result<(), TauriCommandError> {
+    let profile: PromptProfile = serde_json::from_str(&profile_json)
+        .map_err(|e| TauriCommandError::validation(format!("Profile 解析失败: {e}")))?;
+    state
+        .profile_store
+        .save(profile)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
     Ok(())
 }
 
 #[tauri::command]
-fn set_active_profile(id: String, state: tauri::State<'_, Arc<AppState>>) {
-    state.profile_store.set_active(&id);
+fn set_active_profile(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    state
+        .profile_store
+        .set_active(&id)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
 }
 
 // ─── Agent Profile Config 命令 ─────────────────────────────────────────────
@@ -1267,28 +1419,38 @@ fn get_active_agent_profile_config(
 fn save_agent_profile_config(
     config_json: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let mut config: storyforge_domain::agent_profile_config::AgentProfileConfig =
-        serde_json::from_str(&config_json)
-            .map_err(|e| format!("Agent Profile Config 解析失败: {e}"))?;
+        serde_json::from_str(&config_json).map_err(|e| {
+            TauriCommandError::validation(format!("Agent Profile Config 解析失败: {e}"))
+        })?;
     config.sanitize();
-    state.agent_profile_config_store.save(config)
+    state
+        .agent_profile_config_store
+        .save(config)
+        .map_err(TauriCommandError::from)
 }
 
 #[tauri::command]
 fn delete_agent_profile_config(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
-    state.agent_profile_config_store.delete(&id)
+) -> Result<bool, TauriCommandError> {
+    state
+        .agent_profile_config_store
+        .delete(&id)
+        .map_err(TauriCommandError::from)
 }
 
 #[tauri::command]
 fn set_active_agent_profile_config(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    state.agent_profile_config_store.set_active(&id)
+) -> Result<(), TauriCommandError> {
+    state
+        .agent_profile_config_store
+        .set_active(&id)
+        .map_err(TauriCommandError::from)
 }
 
 #[tauri::command]
@@ -1442,7 +1604,7 @@ async fn start_writing(
     conversation_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let app = state.inner().clone();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
 
@@ -1519,10 +1681,6 @@ async fn start_writing(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
-        // 加载最近 20 条对话历史（带角色标签，注入导演/编剧上下文）
-        recent_messages: app
-            .conv_store
-            .recent_messages_with_role(&conversation_id, 20, None),
         campaign_runtime: None,
         agent_profile_config: None,
     };
@@ -1573,11 +1731,27 @@ async fn start_writing(
             })
             .unwrap_or_default();
         let final_text = final_text.clone();
-        let var_keys = default_variable_keys();
+        let mut var_keys = default_variable_keys();
+        // Also include custom variable_schema keys from character definitions
+        if let Some(campaign_id) = &ctx.campaign_id {
+            let store = get_campaign_store();
+            if let Some(campaign) = store.get_campaign(campaign_id) {
+                if let Some(stored_card) = store.get_card(&campaign.card_id) {
+                    for def in &stored_card.card.character_definitions {
+                        for field in &def.variable_schema {
+                            if !var_keys.contains(&field.key) {
+                                var_keys.push(field.key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
-        let mvu_fragments = collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+        let mvu_fragments =
+            collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
         let outcome = pipeline
             .run_postprocess(
                 &final_text,
@@ -1609,7 +1783,7 @@ async fn start_writing(
             "conversation_id": conversation_id.to_string(),
             "node_id": node_id.to_string(),
         })),
-        Err(e) => Err(format!("写作失败: {e}")),
+        Err(e) => Err(TauriCommandError::from(format!("写作失败: {e}"))),
     }
 }
 
@@ -1664,7 +1838,7 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
             .unwrap_or_else(|p| p.into_inner());
         guard
             .clone()
-            .or_else(|| load_active_campaign(&get_app_data_dir()))
+            .or_else(|| load_active_campaign(&state.data_dir))
     };
     let active_id = match active_id {
         Some(id) => id,
@@ -1786,8 +1960,11 @@ fn persist_temporary_instances_to(
             );
             continue;
         }
-        store.add_instance(temp.clone());
-        persisted_count += 1;
+        if let Err(e) = store.add_instance(temp.clone()) {
+            tracing::error!("落盘临时 instance '{}' 失败: {e}", temp.name);
+        } else {
+            persisted_count += 1;
+        }
     }
     if persisted_count > 0 {
         tracing::info!(
@@ -1880,12 +2057,14 @@ fn persist_postprocess_outcome(
 
     // 本轮摘要
     if let Some(summary) = &outcome.summary {
-        store.add_summary(storyforge_domain::agent::RoundSummary::new(
+        if let Err(e) = store.add_summary(storyforge_domain::agent::RoundSummary::new(
             camp_id.clone(),
             ctx.conversation_id.clone(),
             ctx.turn,
             summary.clone(),
-        ));
+        )) {
+            tracing::warn!("保存本轮摘要失败: {e}");
+        }
     }
 
     // 后处理三合一
@@ -1896,11 +2075,13 @@ fn persist_postprocess_outcome(
 
         // P4：算 name_collisions——campaign 内出现 ≥2 次的 name 集合，同名时 name 路失效逼 id
         let name_collisions: std::collections::HashSet<String> = {
-            let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut name_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for inst in store.list_instances(camp_id) {
                 *name_counts.entry(inst.name).or_insert(0) += 1;
             }
-            name_counts.into_iter()
+            name_counts
+                .into_iter()
                 .filter(|(_, count)| *count >= 2)
                 .map(|(name, _)| name)
                 .collect()
@@ -1927,7 +2108,9 @@ fn persist_postprocess_outcome(
             })
             .collect();
         if !knowledge_entries.is_empty() {
-            store.add_knowledge(knowledge_entries);
+            if let Err(e) = store.add_knowledge(knowledge_entries) {
+                tracing::warn!("保存后处理知识失败: {e}");
+            }
         }
 
         // 变量更新：角色级（按 name 匹配 instance）/ 全局级（无 instance_id）
@@ -1936,11 +2119,18 @@ fn persist_postprocess_outcome(
                 // instance_id 可能是角色名（后处理 Agent 按名字输出），尝试匹配 campaign 内 instance
                 if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
                     // 校验：该 instance 是否在 present_chars 中（P4: 同名时 name 路失效）
-                    let is_present = is_postprocess_instance_present(&inst, inst_id, &present_ids, &name_collisions);
+                    let is_present = is_postprocess_instance_present(
+                        &inst,
+                        inst_id,
+                        &present_ids,
+                        &name_collisions,
+                    );
                     if is_present {
                         let mut inst = inst;
                         inst.set_variable(&vu.key, vu.value.clone(), ctx.turn);
-                        store.update_instance(inst);
+                        if let Err(e) = store.update_instance(inst) {
+                            tracing::warn!("保存后处理角色变量失败: {e}");
+                        }
                     } else {
                         tracing::warn!(
                             "跳过非在场角色 '{}' 的变量写入（present_chars 校验）",
@@ -1952,7 +2142,9 @@ fn persist_postprocess_outcome(
                 // 全局 Campaign 变量（无 instance_id，不受 present_chars 约束）
                 if let Some(mut camp) = store.get_campaign(camp_id) {
                     camp.set_variable(&vu.key, vu.value.clone(), ctx.turn);
-                    store.update_campaign(camp);
+                    if let Err(e) = store.update_campaign(camp) {
+                        tracing::warn!("保存后处理 Campaign 变量失败: {e}");
+                    }
                 }
             }
         }
@@ -1964,7 +2156,9 @@ fn persist_postprocess_outcome(
                     if let Some(task) =
                         normalize_task_update_for_postprocess(camp_id, task, tu.new_status.clone())
                     {
-                        store.update_task(task);
+                        if let Err(e) = store.update_task(task) {
+                            tracing::warn!("保存后处理任务状态失败: {e}");
+                        }
                     }
                 }
             } else if let Some(spec) = &tu.new_task {
@@ -1975,7 +2169,9 @@ fn persist_postprocess_outcome(
                     spec.triggers.clone(),
                     ctx.turn,
                 );
-                store.add_task(new_task);
+                if let Err(e) = store.add_task(new_task) {
+                    tracing::warn!("保存后处理新任务失败: {e}");
+                }
             }
         }
     }
@@ -2039,7 +2235,14 @@ pub fn normalize_knowledge_update_for_postprocess(
     if !knowledge_exempt_from_presence {
         // 知识路径收紧：空集时 Witnessed/Inferred 也拒绝（无人在场不可能见证/推断）
         // 注意：is_postprocess_instance_present 的空集放行仍服务变量路径，此处绕过它。
-        if present_ids.is_empty() || !is_postprocess_instance_present(&target, &update.character_id, present_ids, name_collisions) {
+        if present_ids.is_empty()
+            || !is_postprocess_instance_present(
+                &target,
+                &update.character_id,
+                present_ids,
+                name_collisions,
+            )
+        {
             tracing::warn!(
                 "跳过非在场角色 '{}' 的知识写入（source={:?}，present_chars 校验）",
                 target.name,
@@ -2055,17 +2258,19 @@ pub fn normalize_knowledge_update_for_postprocess(
         .and_then(|source_id| find_instance_by_name_or_id(store, camp_id, source_id))
         .map(|source| source.id);
 
-    vec![storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
-        id: Id::new(),
-        campaign_id: camp_id.clone(),
-        character_id: target.id,
-        knowledge_text: update.knowledge_text.clone(),
-        source: update.source.clone(),
-        source_character_id,
-        turn_number: turn,
-        event_id: None,
-        pinned: update.pinned,
-    }]
+    vec![
+        storyforge_domain::character_knowledge::CharacterKnowledgeEntry {
+            id: Id::new(),
+            campaign_id: camp_id.clone(),
+            character_id: target.id,
+            knowledge_text: update.knowledge_text.clone(),
+            source: update.source.clone(),
+            source_character_id,
+            turn_number: turn,
+            event_id: None,
+            pinned: update.pinned,
+        },
+    ]
 }
 
 /// 方向 1：广播分发——根据 BroadcastTarget 遍历 campaign 内 instance，各生成一条 ToldByOther。
@@ -2212,7 +2417,7 @@ fn find_instance_by_name_or_id(
 ///
 /// 触发 AppState.current_cancel 的 sender，导演/子Agent/编剧全部中止。
 #[tauri::command]
-fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
+fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, TauriCommandError> {
     let slot = state
         .current_cancel
         .lock()
@@ -2248,7 +2453,7 @@ pub struct RegenerateRequestDto {
 }
 
 /// 把 DTO 的 target 字符串解析为 PartialRollTarget
-fn parse_target_dto(target: &RegenerateTargetDto) -> Result<PartialRollTarget, String> {
+fn parse_target_dto(target: &RegenerateTargetDto) -> Result<PartialRollTarget, TauriCommandError> {
     match target.kind.as_str() {
         "director" => Ok(PartialRollTarget::Director),
         "editor" => Ok(PartialRollTarget::Editor),
@@ -2260,7 +2465,9 @@ fn parse_target_dto(target: &RegenerateTargetDto) -> Result<PartialRollTarget, S
                 Ok(PartialRollTarget::Subagent(id.to_string()))
             }
         }
-        other => Err(format!("未知重 roll 目标: {other}")),
+        other => Err(TauriCommandError::validation(format!(
+            "未知重 roll 目标: {other}"
+        ))),
     }
 }
 
@@ -2272,7 +2479,7 @@ async fn regenerate(
     req: RegenerateRequestDto,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
-) -> Result<String, String> {
+) -> Result<String, TauriCommandError> {
     let app = state.inner().clone();
 
     // 解析 targets
@@ -2314,12 +2521,6 @@ async fn regenerate(
         story_clock: String::new(),
         profile: None,
         modules: vec![],
-        // 重 roll 时排除目标节点及其后的消息（避免导演看到被重 roll 的旧内容）
-        recent_messages: app.conv_store.recent_messages_with_role(
-            &conversation_id,
-            20,
-            Some(&node_id),
-        ),
         campaign_runtime: None,
         agent_profile_config: None,
     };
@@ -2367,7 +2568,8 @@ async fn regenerate(
         );
         let (_pp_tx, pp_rx) = watch::channel(false);
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
-        let mvu_fragments = collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+        let mvu_fragments =
+            collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
         let outcome = pipeline
             .run_postprocess(
                 &final_text,
@@ -2392,7 +2594,7 @@ async fn regenerate(
 
     match result {
         Ok((text, _provenance)) => Ok(text),
-        Err(e) => Err(format!("重 roll 失败: {e}")),
+        Err(e) => Err(TauriCommandError::from(format!("重 roll 失败: {e}"))),
     }
 }
 
@@ -2465,7 +2667,7 @@ pub struct CreateConnectionDto {
 fn create_connection(
     req: CreateConnectionDto,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<String, String> {
+) -> Result<String, TauriCommandError> {
     let protocol = parse_protocol(&req.protocol)?;
     let tool_mode = parse_tool_mode(&req.tool_mode)?;
 
@@ -2487,10 +2689,13 @@ fn create_connection(
 
     // 预先验证：构造 client 看是否成功（base_url 格式等）
     // 注意：不实际发请求，只验证能构造出 client
-    storyforge_infra_llm::create_client(&conn).map_err(|e| format!("连接配置无效: {e}"))?;
+    storyforge_infra_llm::create_client(&conn)
+        .map_err(|e| TauriCommandError::llm(format!("连接配置无效: {e}"), false))?;
 
     let was_empty = get_conn_store().list().is_empty();
-    get_conn_store().save(conn);
+    get_conn_store()
+        .save(conn)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // 首个连接自动设为活跃
     if was_empty {
@@ -2502,10 +2707,16 @@ fn create_connection(
 
 /// 删除连接（若为活跃的，同时清除活跃状态）
 #[tauri::command]
-fn delete_connection(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn delete_connection(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
     let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
-    if !get_conn_store().delete(&id) {
-        return Err(format!("连接不存在: {id}"));
+    if !get_conn_store()
+        .delete(&id)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
+        return Err(TauriCommandError::not_found(format!("连接不存在: {id}")));
     }
     if was_active {
         state.clear_active_connection();
@@ -2518,7 +2729,7 @@ fn delete_connection(id: String, state: tauri::State<'_, Arc<AppState>>) -> Resu
 async fn set_active_connection(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     state.set_active_connection(&id)
 }
 
@@ -2542,7 +2753,9 @@ pub struct TestConnectionResult {
 
 /// 测试连接连通性（发一个最小 ping 请求）
 #[tauri::command]
-async fn test_connection(req: TestConnectionDto) -> Result<TestConnectionResult, String> {
+async fn test_connection(
+    req: TestConnectionDto,
+) -> Result<TestConnectionResult, TauriCommandError> {
     let tool_mode = parse_tool_mode(&req.tool_mode)?;
     let protocol = parse_protocol(&req.protocol)?;
     let conn = LlmConnection {
@@ -2559,8 +2772,8 @@ async fn test_connection(req: TestConnectionDto) -> Result<TestConnectionResult,
         tool_mode,
     };
 
-    let client =
-        storyforge_infra_llm::create_client(&conn).map_err(|e| format!("构造客户端失败: {e}"))?;
+    let client = storyforge_infra_llm::create_client(&conn)
+        .map_err(|e| TauriCommandError::llm(format!("构造客户端失败: {e}"), false))?;
 
     let start = std::time::Instant::now();
     let chat_req = storyforge_domain::llm::ChatRequest {
@@ -2591,7 +2804,7 @@ async fn test_connection(req: TestConnectionDto) -> Result<TestConnectionResult,
 ///
 /// 用临时连接配置调用，不持久化。失败时返回空数组（前端走模板兜底）。
 #[tauri::command]
-async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, TauriCommandError> {
     let conn = LlmConnection {
         id: Id::new(),
         name: "models-probe".into(),
@@ -2612,22 +2825,24 @@ async fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, S
 }
 
 /// 把协议字符串解析为 LlmProtocol
-fn parse_protocol(s: &str) -> Result<LlmProtocol, String> {
+fn parse_protocol(s: &str) -> Result<LlmProtocol, TauriCommandError> {
     match s {
         "openai" => Ok(LlmProtocol::OpenAi),
         "anthropic" => Ok(LlmProtocol::Anthropic),
         "gemini" => Ok(LlmProtocol::Gemini),
         s if s.starts_with("custom:") => Ok(LlmProtocol::Custom(s[7..].to_string())),
-        other => Err(format!("未知协议: {other}")),
+        other => Err(TauriCommandError::validation(format!("未知协议: {other}"))),
     }
 }
 
 /// 把 tool_mode 字符串解析为 ToolMode
-fn parse_tool_mode(s: &str) -> Result<ToolMode, String> {
+fn parse_tool_mode(s: &str) -> Result<ToolMode, TauriCommandError> {
     match s {
         "native" => Ok(ToolMode::Native),
         "text_fallback" => Ok(ToolMode::TextFallback),
-        other => Err(format!("未知工具模式: {other}")),
+        other => Err(TauriCommandError::validation(format!(
+            "未知工具模式: {other}"
+        ))),
     }
 }
 
@@ -2656,7 +2871,10 @@ fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<Conversatio
         .into_iter()
         .map(|c| {
             let card_name = c.character_id.as_ref().and_then(|cid| {
-                chars.iter().find(|ch| ch.id.as_str() == cid).map(|ch| ch.name.clone())
+                chars
+                    .iter()
+                    .find(|ch| ch.id.as_str() == cid)
+                    .map(|ch| ch.name.clone())
             });
             ConversationSummaryDto {
                 id: c.id.to_string(),
@@ -2676,25 +2894,25 @@ fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<Conversatio
 fn delete_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     state
         .conv_store
         .delete(&conv_id)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 #[tauri::command]
 fn get_conversation(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let conv_id = storyforge_domain::Id::from_str(&id);
     state
         .conv_store
         .get(&conv_id)
         .map(|c| serde_json::to_value(&c).unwrap_or_default())
-        .ok_or_else(|| format!("对话不存在: {id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {id}")))
 }
 
 // ─── M1 日志命令 ───────────────────────────────────────────────────────────
@@ -2767,7 +2985,7 @@ fn log_clear(kind: Option<String>, state: tauri::State<'_, Arc<AppState>>) {
 fn log_export_bundle(
     redact_content: bool,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let opts = ExportOptions {
         redact_content,
         ..Default::default()
@@ -2817,13 +3035,13 @@ fn edit_variant(
     node_id: String,
     new_content: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .edit_variant(&conv_id, &nid, new_content)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 /// 采纳当前变体（Draft → Final），并自动检查是否需要归档
@@ -2832,13 +3050,13 @@ async fn accept_variant(
     conversation_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .accept_variant(&conv_id, &nid)
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
     // 自动归档检查（后台异步，不阻塞响应）
     let state_clone = state.inner().clone();
@@ -2856,13 +3074,13 @@ fn soft_delete_variant(
     conversation_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .soft_delete_variant(&conv_id, &nid)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 /// Tauri command: 删除指定消息及其后所有消息（截断对话 = 撤销从这条开始的写作）
@@ -2871,13 +3089,13 @@ fn delete_message_from(
     conversation_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .truncate_from(&conv_id, &nid)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 /// 添加新变体（分支/swipe）
@@ -2887,13 +3105,13 @@ fn add_variant(
     node_id: String,
     content: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<usize, String> {
+) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .add_variant(&conv_id, &nid, content, None)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 /// 切换变体（左右滑）
@@ -2903,13 +3121,13 @@ fn switch_variant(
     node_id: String,
     index: usize,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
     state
         .conv_store
         .switch_variant(&conv_id, &nid, index)
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| TauriCommandError::internal(e.to_string()))
 }
 
 // ─── M2 记忆系统命令 ─────────────────────────────────────────────────────
@@ -2922,15 +3140,14 @@ fn configure_embedder(
     model: String,
     dim: usize,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let config = storyforge_infra_llm::EmbedConfig {
         endpoint,
         api_key,
         model,
         dim,
     };
-    let data_dir = get_app_data_dir();
-    save_embed_config(&data_dir, &config);
+    save_embed_config(&state.data_dir, &config);
     *state
         .embed_config
         .write()
@@ -2961,12 +3178,12 @@ fn get_embed_config(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json
 async fn archive_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<usize, String> {
+) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let conv = state
         .conv_store
         .get(&conv_id)
-        .ok_or_else(|| format!("对话不存在: {conversation_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {conversation_id}")))?;
 
     // 取所有非 Discarded 消息
     let messages: Vec<String> = conv
@@ -2992,19 +3209,26 @@ async fn archive_conversation(
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
 
-    let embedder =
-        Arc::new(storyforge_infra_llm::Embedder::new(config).map_err(|e| format!("{e}"))?);
+    let embedder = Arc::new(
+        storyforge_infra_llm::Embedder::new(config)
+            .map_err(|e| TauriCommandError::internal(e.to_string()))?,
+    );
+    let model = get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "deepseek-chat".into());
     let archiver = storyforge_app_memory::MemoryArchiver::new(
         llm,
         embedder,
         vector_store,
         storyforge_app_memory::ArchiveConfig::default(),
+        model,
     );
 
     let summaries = archiver
         .maybe_archive(&messages)
         .await
-        .map_err(|e| format!("归档失败: {e}"))?;
+        .map_err(|e| TauriCommandError::internal(format!("归档失败: {e}")))?;
 
     Ok(summaries.len())
 }
@@ -3071,11 +3295,16 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
             return;
         }
     };
+    let model = get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "deepseek-chat".into());
     let archiver = storyforge_app_memory::MemoryArchiver::new(
         llm,
         embedder,
         vector_store,
         storyforge_app_memory::ArchiveConfig::default(),
+        model,
     );
 
     match archiver.maybe_archive(&messages).await {
@@ -3118,7 +3347,7 @@ impl MetaStreamEvent {
 fn meta_accept_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     // 从 PatchStore 取出 patch
     let patch = {
         let patches = state.meta_patches.read().unwrap_or_else(|p| p.into_inner());
@@ -3126,7 +3355,7 @@ fn meta_accept_patch(
             .iter()
             .find(|p| p.id == patch_id)
             .cloned()
-            .ok_or_else(|| format!("Patch 不存在: {patch_id}"))?
+            .ok_or_else(|| TauriCommandError::not_found(format!("Patch 不存在: {patch_id}")))?
     };
 
     // 执行 patch：clone 世界书 → 修改 → 写回
@@ -3145,12 +3374,19 @@ fn meta_accept_patch(
             };
 
             storyforge_app_meta::execute_patch(&patch, &mut patch_ctx)
-                .map_err(|e| format!("{e}"))?;
+                .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
             // 反序列化回 WorldInfoEntry 并替换
             let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
                 .into_iter()
-                .filter_map(|v| serde_json::from_value(v).ok())
+                .filter_map(|v| {
+                    serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "Patch entry failed to deserialize as WorldInfoEntry: {e}, value: {v}"
+                        );
+                        None
+                    })
+                })
                 .collect();
 
             let mut new_book = (**world_info).clone();
@@ -3270,7 +3506,11 @@ fn sync_meta_session_from_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
         state.meta_session.set_campaign_runtime(rt.clone());
     } else {
         // 无 active campaign 时清空，避免读到过期快照
-        *state.meta_session.campaign_runtime.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *state
+            .meta_session
+            .campaign_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -3295,7 +3535,7 @@ async fn meta_chat(
     user_input: String,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<MetaStreamEvent>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let app = state.inner().clone();
     sync_meta_session_from_tool_ctx(&state);
 
@@ -3336,7 +3576,7 @@ async fn meta_chat(
         progress_tx,
     )
     .await
-    .map_err(|e| format!("{e}"))?;
+    .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
     // 把新提议的 patch 同步进 AppState.meta_patches（前端可用 meta_accept_patch 采纳）
     if let Some(patch) = &turn.new_patch {
@@ -3406,7 +3646,7 @@ fn meta_list_pending_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serd
 fn meta_dismiss_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let mut patches = state
         .meta_patches
         .write()
@@ -3420,14 +3660,14 @@ fn meta_dismiss_patch(
 /// 扫描指定 Campaign 的数据，找出孤立 instance、未解析的知识引用、孤儿任务引用、
 /// 变量 schema 不一致等问题。返回问题列表，空列表 = 健康。
 #[tauri::command]
-fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, String> {
+fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let store = get_campaign_store();
     let cid = Id::from_str(&campaign_id);
 
     // 确认 campaign 存在
     let campaign = store
         .get_campaign(&cid)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
 
     // 获取关联的 card → definitions
     let definitions = store
@@ -3463,18 +3703,18 @@ fn meta_explain_generation(
     conversation_id: String,
     node_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
 
     let conv = state
         .conv_store
         .get(&conv_id)
-        .ok_or_else(|| format!("对话不存在: {conversation_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {conversation_id}")))?;
 
     let node = conv
         .find_node(&nid)
-        .ok_or_else(|| format!("消息节点不存在: {node_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("消息节点不存在: {node_id}")))?;
 
     let variant = node.active().ok_or("该节点无可用变体")?;
 
@@ -3485,7 +3725,8 @@ fn meta_explain_generation(
 
     let explanation = storyforge_app_meta::explain_generation(provenance);
 
-    serde_json::to_value(&explanation).map_err(|e| format!("序列化失败: {e}"))
+    serde_json::to_value(&explanation)
+        .map_err(|e| TauriCommandError::internal(format!("序列化失败: {e}")))
 }
 
 // ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
@@ -3513,13 +3754,13 @@ fn build_preview_input<'a>(
 fn meta_propose_campaign_repairs(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let store = get_campaign_store();
     let cid = Id::from_str(&campaign_id);
 
     let campaign = store
         .get_campaign(&cid)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
 
     let definitions = store
         .get_card(&campaign.card_id)
@@ -3530,14 +3771,22 @@ fn meta_propose_campaign_repairs(
     let knowledge = store.list_knowledge(&cid);
     let tasks = store.list_tasks(&cid);
 
-    let input = build_preview_input(store, &campaign, &instances, &definitions, &knowledge, &tasks);
+    let input = build_preview_input(
+        store,
+        &campaign,
+        &instances,
+        &definitions,
+        &knowledge,
+        &tasks,
+    );
 
-    let issues = storyforge_app_meta::check_campaign_health(&storyforge_app_meta::CampaignHealthSnapshot {
-        instances: &instances,
-        definitions: &definitions,
-        knowledge: &knowledge,
-        tasks: &tasks,
-    });
+    let issues =
+        storyforge_app_meta::check_campaign_health(&storyforge_app_meta::CampaignHealthSnapshot {
+            instances: &instances,
+            definitions: &definitions,
+            knowledge: &knowledge,
+            tasks: &tasks,
+        });
 
     let mut patches: Vec<storyforge_app_meta::TypedPatch> = Vec::new();
     for issue in &issues {
@@ -3548,7 +3797,10 @@ fn meta_propose_campaign_repairs(
 
     // 存入 state（追加，不去重）
     {
-        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         typed.extend(patches.clone());
     }
 
@@ -3560,10 +3812,11 @@ fn meta_propose_campaign_repairs(
 
 /// 列出所有 Pending 状态的类型化 patch
 #[tauri::command]
-fn meta_list_typed_patches(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Vec<serde_json::Value> {
-    let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
+fn meta_list_typed_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+    let typed = state
+        .typed_patches
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     typed
         .iter()
         .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
@@ -3577,21 +3830,24 @@ fn meta_preview_typed_patch(
     patch_id: String,
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     let store = get_campaign_store();
     let cid = Id::from_str(&campaign_id);
 
     // 找到 patch
-    let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
     let patch = typed
         .iter_mut()
         .find(|p| p.id == patch_id)
-        .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
 
     // 取当前 campaign 快照
     let campaign = store
         .get_campaign(&cid)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
     let definitions = store
         .get_card(&campaign.card_id)
         .map(|c| c.card.character_definitions)
@@ -3629,22 +3885,24 @@ fn meta_accept_typed_patch(
     patch_id: String,
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let cid = Id::from_str(&campaign_id);
 
     // 1. 找到 patch，必须 Pending
     let patch = {
-        let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
-        let p = typed
-            .iter()
-            .find(|p| p.id == patch_id)
-            .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let p = typed.iter().find(|p| p.id == patch_id).ok_or_else(|| {
+            TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}"))
+        })?;
         if p.status != storyforge_app_meta::TypedPatchStatus::Pending {
-            return Err(format!(
+            return Err(TauriCommandError::validation(format!(
                 "Patch 状态不是 Pending（当前: {:?}），无法接受",
                 p.status
-            ));
+            )));
         }
         p.clone()
     };
@@ -3652,7 +3910,7 @@ fn meta_accept_typed_patch(
     // 2. 取当前 campaign 快照
     let campaign = store
         .get_campaign(&cid)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
     let definitions = store
         .get_card(&campaign.card_id)
         .map(|c| c.card.character_definitions)
@@ -3671,7 +3929,10 @@ fn meta_accept_typed_patch(
 
     // 3. stale 检查
     if storyforge_app_meta::is_patch_stale(&patch, &input) {
-        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
             p.status = storyforge_app_meta::TypedPatchStatus::Stale;
         }
@@ -3695,20 +3956,27 @@ fn meta_accept_typed_patch(
             turn: 0, // preview 不持久化，turn 值不影响验证
         };
         storyforge_app_meta::apply_to_snapshot(&patch, &mut snap)
-            .map_err(|e| format!("纯函数预演失败: {e}"))?;
+            .map_err(|e| TauriCommandError::pipeline(format!("纯函数预演失败: {e}"), false))?;
     }
     // 5. 真正写盘
     for (idx, action) in patch.actions.iter().enumerate() {
         let result = apply_typed_action(store, &cid, action);
         if let Err(e) = result {
             // 写盘失败，patch 保持 Pending，报错包含第几个 action
-            return Err(format!("第 {} 个 action 失败: {}", idx + 1, e));
+            return Err(TauriCommandError::storage(format!(
+                "第 {} 个 action 失败: {}",
+                idx + 1,
+                e
+            )));
         }
     }
 
     // 6. 写盘成功，标记 Accepted
     {
-        let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+        let mut typed = state
+            .typed_patches
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
             p.status = storyforge_app_meta::TypedPatchStatus::Accepted;
         }
@@ -3722,7 +3990,7 @@ fn apply_typed_action(
     store: &'static campaign_store::CampaignStore,
     campaign_id: &Id,
     action: &storyforge_app_meta::TypedPatchAction,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     use storyforge_app_meta::TypedPatchAction;
 
     match action {
@@ -3734,7 +4002,12 @@ fn apply_typed_action(
         } => {
             let mut instance = store
                 .get_instance(campaign_id, instance_id)
-                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
 
             // 与 A 的 apply_to_snapshot 纯函数保持一致：从 definition.variable_schema
             // 取 add_keys 的 default 值，而非硬编码 null。否则 accept 前的纯函数预演
@@ -3754,7 +4027,8 @@ fn apply_typed_action(
                         .map(|f| (f.key.clone(), f.default.clone()))
                         .collect(),
                 )
-            })()
+            })(
+            )
             .unwrap_or_default();
 
             // 添加缺失 key（用 schema default，缺失 schema 时回退 null）
@@ -3771,28 +4045,38 @@ fn apply_typed_action(
             // 删除多余 key
             instance.variables.retain(|v| !remove_keys.contains(&v.key));
 
-            store.update_instance(instance);
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::PruneOrphanTaskReferences {
             task_id,
             orphan_character_ids,
         } => {
-            let mut task = store
-                .get_task(task_id)
-                .ok_or_else(|| format!("Task 不存在: {}", task_id.as_str()))?;
+            let mut task = store.get_task(task_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str()))
+            })?;
 
             task.related_characters
                 .retain(|id| !orphan_character_ids.contains(id));
 
-            store.update_task(task);
+            store
+                .update_task(task)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
             store
                 .delete_knowledge(knowledge_id)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
                 .then_some(())
-                .ok_or_else(|| format!("Knowledge 不存在: {}", knowledge_id.as_str()))?;
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Knowledge 不存在: {}",
+                        knowledge_id.as_str()
+                    ))
+                })?;
             Ok(())
         }
         TypedPatchAction::RepointInstanceDefinition {
@@ -3801,18 +4085,27 @@ fn apply_typed_action(
         } => {
             let mut instance = store
                 .get_instance(campaign_id, instance_id)
-                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
 
             instance.definition_id = new_definition_id.clone();
-            store.update_instance(instance);
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::UpdateCampaignVariable { key, value } => {
-            let mut campaign = store
-                .get_campaign(campaign_id)
-                .ok_or_else(|| format!("Campaign 不存在: {}", campaign_id.as_str()))?;
+            let mut campaign = store.get_campaign(campaign_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Campaign 不存在: {}", campaign_id.as_str()))
+            })?;
             campaign.set_variable(key, value.clone(), 0);
-            store.update_campaign(campaign);
+            store
+                .update_campaign(campaign)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::UpdateInstanceVariable {
@@ -3822,9 +4115,16 @@ fn apply_typed_action(
         } => {
             let mut instance = store
                 .get_instance(campaign_id, instance_id)
-                .ok_or_else(|| format!("Instance 不存在: {}", instance_id.as_str()))?;
+                .ok_or_else(|| {
+                    TauriCommandError::not_found(format!(
+                        "Instance 不存在: {}",
+                        instance_id.as_str()
+                    ))
+                })?;
             instance.set_variable(key, value.clone(), 0);
-            store.update_instance(instance);
+            store
+                .update_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::AddKnowledge {
@@ -3843,18 +4143,22 @@ fn apply_typed_action(
                 event_id: None,
                 pinned: false,
             };
-            store.add_knowledge(vec![entry]);
+            store
+                .add_knowledge(vec![entry])
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
         TypedPatchAction::UpdateTaskStatus {
             task_id,
             new_status,
         } => {
-            let mut task = store
-                .get_task(task_id)
-                .ok_or_else(|| format!("Task 不存在: {}", task_id.as_str()))?;
+            let mut task = store.get_task(task_id).ok_or_else(|| {
+                TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str()))
+            })?;
             task.status = new_status.clone();
-            store.update_task(task);
+            store
+                .update_task(task)
+                .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
             Ok(())
         }
     }
@@ -3865,12 +4169,15 @@ fn apply_typed_action(
 fn meta_dismiss_typed_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+) -> Result<(), TauriCommandError> {
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
     let patch = typed
         .iter_mut()
         .find(|p| p.id == patch_id)
-        .ok_or_else(|| format!("类型化 Patch 不存在: {patch_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("类型化 Patch 不存在: {patch_id}")))?;
     patch.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
     Ok(())
 }
@@ -3905,7 +4212,7 @@ pub struct MvuTranslationDetailDto {
 async fn meta_analyze_mvu_card(
     source_character_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<MvuTranslationDetailDto, String> {
+) -> Result<MvuTranslationDetailDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
     // 取原 Character
@@ -3916,7 +4223,7 @@ async fn meta_analyze_mvu_card(
             .find(|c| c.id.as_str() == source_character_id)
             .map(|c| (*c).clone())
     }
-    .ok_or_else(|| format!("找不到角色卡 {source_character_id}"))?;
+    .ok_or_else(|| TauriCommandError::not_found(format!("找不到角色卡 {source_character_id}")))?;
 
     // 启发式打分（纯 Rust，先跑，给 LLM 当判据）
     let complexity = storyforge_app_meta::score_card_complexity(&character);
@@ -3935,7 +4242,7 @@ async fn meta_analyze_mvu_card(
 
     let translation = storyforge_app_meta::analyze_mvu_card(&runtime, &character, cancel_rx)
         .await
-        .map_err(|e| format!("MVU 分析失败: {e}"))?;
+        .map_err(|e| TauriCommandError::validation(format!("MVU 分析失败: {e}")))?;
 
     // 持久化到 CampaignStore
     let store = get_campaign_store();
@@ -3945,7 +4252,9 @@ async fn meta_analyze_mvu_card(
         translation: translation.clone(),
         analyzed_at: chrono::Utc::now().to_rfc3339(),
     };
-    store.save_mvu(stored);
+    store
+        .save_mvu(stored)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     Ok(MvuTranslationDetailDto {
         source_character_id: character.id.as_str().to_string(),
@@ -3992,17 +4301,21 @@ fn meta_get_mvu_translation(source_character_id: String) -> Option<MvuTranslatio
 #[tauri::command]
 fn meta_preview_mvu_apply(
     source_character_id: String,
-) -> Result<Vec<MvuApplyPreview>, String> {
+) -> Result<Vec<MvuApplyPreview>, TauriCommandError> {
     let store = get_campaign_store();
     let id = Id::from_str(&source_character_id);
-    let mvu = store
-        .get_mvu(&id)
-        .ok_or_else(|| MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string())?;
+    let mvu = store.get_mvu(&id).ok_or_else(|| {
+        TauriCommandError::not_found(
+            MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string(),
+        )
+    })?;
 
     // 通过 source_character_id 找到 card
-    let stored_card = store
-        .get_card_by_source(&id)
-        .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?;
+    let stored_card = store.get_card_by_source(&id).ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 source_character_id={source_character_id} 的 card"
+        ))
+    })?;
 
     let previews: Vec<MvuApplyPreview> = stored_card
         .card
@@ -4029,18 +4342,22 @@ fn meta_preview_mvu_apply(
 fn meta_apply_mvu_schema(
     source_character_id: String,
     definition_id: String,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let src_id = Id::from_str(&source_character_id);
     let def_id = Id::from_str(&definition_id);
 
-    let mvu = store
-        .get_mvu(&src_id)
-        .ok_or_else(|| MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string())?;
+    let mvu = store.get_mvu(&src_id).ok_or_else(|| {
+        TauriCommandError::not_found(
+            MvuApplyError::TranslationNotFound(source_character_id.clone()).to_string(),
+        )
+    })?;
 
-    let stored_card = store
-        .get_card_by_source(&src_id)
-        .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的 card"))?;
+    let stored_card = store.get_card_by_source(&src_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 source_character_id={source_character_id} 的 card"
+        ))
+    })?;
 
     // 找到目标 definition
     let def = stored_card
@@ -4048,7 +4365,11 @@ fn meta_apply_mvu_schema(
         .character_definitions
         .iter()
         .find(|d| d.id == def_id)
-        .ok_or_else(|| MvuApplyError::DefinitionNotFound(definition_id.clone()).to_string())?;
+        .ok_or_else(|| {
+            TauriCommandError::not_found(
+                MvuApplyError::DefinitionNotFound(definition_id.clone()).to_string(),
+            )
+        })?;
 
     // 先计算预览，确认有变化
     let preview = compute_apply_preview(
@@ -4059,15 +4380,23 @@ fn meta_apply_mvu_schema(
         &source_character_id,
     );
     if !preview.has_changes {
-        return Err(MvuApplyError::NoChanges.to_string());
+        return Err(TauriCommandError::validation(
+            MvuApplyError::NoChanges.to_string(),
+        ));
     }
 
     // 写盘：clone card → 改对应 definition → update_card
     let mut card = stored_card.card.clone();
-    if let Some(target_def) = card.character_definitions.iter_mut().find(|d| d.id == def_id) {
+    if let Some(target_def) = card
+        .character_definitions
+        .iter_mut()
+        .find(|d| d.id == def_id)
+    {
         apply_schema_to_definition(target_def, preview.merged_schema.clone());
     }
-    store.update_card(card.clone());
+    store
+        .update_card(card.clone())
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // Best-effort：对已存在的 instances 补齐新变量。
     // 注意：instance 与 definition 的关联是 definition_id，与 campaign 无关——
@@ -4097,7 +4426,9 @@ fn meta_apply_mvu_schema(
                 0,
             ));
         }
-        store.update_instance(updated);
+        store
+            .update_instance(updated)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
     }
 
     Ok(())
@@ -4110,12 +4441,12 @@ fn meta_apply_mvu_schema(
 async fn meta_classify_st_preset(
     preset_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
     let stored = get_preset_store()
         .get(&preset_id)
-        .ok_or_else(|| format!("预设不存在: {preset_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("预设不存在: {preset_id}")))?;
 
     let llm = state.active_llm_or_mock();
     let tool_ctx = state.snapshot_tool_ctx();
@@ -4125,9 +4456,10 @@ async fn meta_classify_st_preset(
     let classification =
         storyforge_app_meta::classify_st_preset_with_llm(&runtime, &stored.preset, cancel_rx)
             .await
-            .map_err(|e| format!("ST 分类失败: {e}"))?;
+            .map_err(|e| TauriCommandError::validation(format!("ST 分类失败: {e}")))?;
 
-    serde_json::to_value(&classification).map_err(|e| format!("序列化失败: {e}"))
+    serde_json::to_value(&classification)
+        .map_err(|e| TauriCommandError::internal(format!("序列化失败: {e}")))
 }
 
 // ─── P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量 ──────────────
@@ -4262,7 +4594,7 @@ impl From<&storyforge_domain::campaign::CharacterInstance> for CharacterInstance
 async fn extract_characters(
     source_character_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<CardSummaryDto, String> {
+) -> Result<CardSummaryDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
     use storyforge_domain::character::CharacterDefinition;
     use storyforge_domain::variables::extract_mvu_schema_from_extensions;
@@ -4290,7 +4622,11 @@ async fn extract_characters(
             }
         }
     }
-    .ok_or_else(|| format!("找不到 source_character_id={source_character_id} 的角色卡"))?;
+    .ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 source_character_id={source_character_id} 的角色卡"
+        ))
+    })?;
 
     // 已存在则直接返回
     let store = get_campaign_store();
@@ -4336,7 +4672,9 @@ async fn extract_characters(
     let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
     let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
     card.character_definitions = definitions;
-    let stored = store.save_card(card);
+    let stored = store
+        .save_card(card)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     let mut dto = CardSummaryDto::from(&stored);
     dto.extracted = extracted;
@@ -4354,19 +4692,22 @@ fn list_cards() -> Vec<CardSummaryDto> {
 
 /// 删除角色卡（按 CharacterCard.id，级联删 campaign/instances/mvu）
 #[tauri::command]
-fn delete_card(id: String) -> Result<(), String> {
+fn delete_card(id: String) -> Result<(), TauriCommandError> {
     let card_id = Id::from_str(&id);
-    if !get_campaign_store().delete_card(&card_id) {
-        return Err(format!("角色卡不存在: {id}"));
+    if !get_campaign_store()
+        .delete_card(&card_id)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
+    {
+        return Err(TauriCommandError::not_found(format!("角色卡不存在: {id}")));
     }
     Ok(())
 }
 
 #[tauri::command]
-fn get_card(id: String) -> Result<CardDetailDto, String> {
+fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
     let stored = get_campaign_store()
         .get_card(&Id::from_str(&id))
-        .ok_or_else(|| format!("找不到 card id={id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={id}")))?;
     Ok(CardDetailDto {
         id: stored.card.id.as_str().to_string(),
         name: stored.card.name.clone(),
@@ -4389,7 +4730,7 @@ fn create_campaign(
     card_id: String,
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<CampaignSummaryDto, String> {
+) -> Result<CampaignSummaryDto, TauriCommandError> {
     use storyforge_domain::campaign::CharacterInstance;
     use storyforge_domain::character::RoleType;
     use storyforge_domain::conversation::Role as ConvRole;
@@ -4397,7 +4738,7 @@ fn create_campaign(
     let store = get_campaign_store();
     let stored = store
         .get_card(&Id::from_str(&card_id))
-        .ok_or_else(|| format!("找不到 card id={card_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={card_id}")))?;
 
     let mut campaign = storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
 
@@ -4406,7 +4747,9 @@ fn create_campaign(
         .conv_store
         .create(Some(card_id.clone()), Some(campaign.id.clone()));
     campaign.conversation_id = Some(conv.id.clone());
-    store.save_campaign(campaign.clone());
+    store
+        .save_campaign(campaign.clone())
+        .map_err(|e| format!("存储写入失败: {e}"))?;
 
     // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character.first_mes）
     let src_id_str = stored.card.source_character_id.as_str().to_string();
@@ -4417,11 +4760,11 @@ fn create_campaign(
         .map(|sc| sc.info.first_mes.clone())
         .unwrap_or_default();
     if !first_mes.is_empty() {
-        if let Err(e) = state.conv_store.append_final_message(
-            &conv.id,
-            ConvRole::Assistant,
-            first_mes,
-        ) {
+        if let Err(e) =
+            state
+                .conv_store
+                .append_final_message(&conv.id, ConvRole::Assistant, first_mes)
+        {
             tracing::warn!("建 Campaign 时追加开场白失败: {e}");
         }
     }
@@ -4431,7 +4774,9 @@ fn create_campaign(
     for def in &stored.card.character_definitions {
         if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
             let inst = CharacterInstance::from_definition(campaign.id.clone(), def);
-            store.add_instance(inst);
+            store
+                .add_instance(inst)
+                .map_err(|e| format!("存储写入失败: {e}"))?;
             instance_count += 1;
         }
     }
@@ -4460,28 +4805,33 @@ fn list_campaigns(card_id: Option<String>) -> Vec<CampaignSummaryDto> {
 }
 
 #[tauri::command]
-fn get_campaign(id: String) -> Result<CampaignSummaryDto, String> {
+fn get_campaign(id: String) -> Result<CampaignSummaryDto, TauriCommandError> {
     let store = get_campaign_store();
     let c = store
         .get_campaign(&Id::from_str(&id))
-        .ok_or_else(|| format!("找不到 campaign id={id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={id}")))?;
     let mut dto = CampaignSummaryDto::from(&c);
     dto.instance_count = store.list_instances(&c.id).len();
     Ok(dto)
 }
 
 #[tauri::command]
-fn set_active_campaign(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+fn set_active_campaign(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
     // 校验存在
     if get_campaign_store().get_campaign(&campaign_id).is_none() {
-        return Err(format!("找不到 campaign id={id}"));
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign id={id}"
+        )));
     }
     *state
         .active_campaign
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
-    save_active_campaign(&get_app_data_dir(), Some(&campaign_id));
+    save_active_campaign(&state.data_dir, Some(&campaign_id));
     Ok(())
 }
 
@@ -4509,11 +4859,14 @@ fn list_instances(campaign_id: String) -> Vec<CharacterInstanceDto> {
 }
 
 #[tauri::command]
-fn get_instance(campaign_id: String, instance_id: String) -> Result<CharacterInstanceDto, String> {
+fn get_instance(
+    campaign_id: String,
+    instance_id: String,
+) -> Result<CharacterInstanceDto, TauriCommandError> {
     get_campaign_store()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .map(|i| CharacterInstanceDto::from(&i))
-        .ok_or_else(|| format!("找不到 instance {instance_id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))
 }
 
 /// 查角色实例的当前变量值
@@ -4521,11 +4874,11 @@ fn get_instance(campaign_id: String, instance_id: String) -> Result<CharacterIns
 fn get_character_variables(
     campaign_id: String,
     instance_id: String,
-) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
     get_campaign_store()
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
         .map(|i| i.variables)
-        .ok_or_else(|| format!("找不到 instance {instance_id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))
 }
 
 /// 手动改角色实例变量值（调试/纠错用，turn 用 0 占位）
@@ -4536,13 +4889,15 @@ fn set_character_variable(
     key: String,
     value: serde_json::Value,
     turn: Option<u32>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .ok_or_else(|| format!("找不到 instance {instance_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
     inst.set_variable(&key, value, turn.unwrap_or(0));
-    store.update_instance(inst);
+    store
+        .update_instance(inst)
+        .map_err(|e| TauriCommandError::storage(format!("更新角色变量失败: {e}")))?;
     Ok(())
 }
 
@@ -4550,11 +4905,11 @@ fn set_character_variable(
 #[tauri::command]
 fn get_campaign_variables(
     campaign_id: String,
-) -> Result<Vec<storyforge_domain::variables::VariableValue>, String> {
+) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
     get_campaign_store()
         .get_campaign(&Id::from_str(&campaign_id))
         .map(|c| c.variables)
-        .ok_or_else(|| format!("找不到 campaign {campaign_id}"))
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))
 }
 
 /// 改 Campaign 全局变量
@@ -4564,28 +4919,35 @@ fn set_campaign_variable(
     key: String,
     value: serde_json::Value,
     turn: Option<u32>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let mut camp = store
         .get_campaign(&Id::from_str(&campaign_id))
-        .ok_or_else(|| format!("找不到 campaign {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
     camp.set_variable(&key, value, turn.unwrap_or(0));
-    store.update_campaign(camp);
+    store
+        .update_campaign(camp)
+        .map_err(|e| TauriCommandError::storage(format!("更新 Campaign 变量失败: {e}")))?;
     Ok(())
 }
 
 /// 把临场角色升级为常驻（仅翻 is_temporary flag）
 #[tauri::command]
-fn promote_temporary_instance(campaign_id: String, instance_id: String) -> Result<(), String> {
+fn promote_temporary_instance(
+    campaign_id: String,
+    instance_id: String,
+) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let mut inst = store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .ok_or_else(|| format!("找不到 instance {instance_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))?;
     if !inst.is_temporary {
         return Err("该角色已是常驻".into());
     }
     inst.promote_to_permanent();
-    store.update_instance(inst);
+    store
+        .update_instance(inst)
+        .map_err(|e| TauriCommandError::storage(format!("升级临时角色失败: {e}")))?;
     Ok(())
 }
 
@@ -4706,7 +5068,7 @@ fn create_task(
     description: String,
     triggers: Vec<storyforge_domain::story_task::TaskTrigger>,
     created_turn: Option<u32>,
-) -> Result<String, String> {
+) -> Result<String, TauriCommandError> {
     if title.trim().is_empty() {
         return Err("任务标题不能为空".into());
     }
@@ -4719,31 +5081,37 @@ fn create_task(
         created_turn.unwrap_or(0),
     );
     let id = task.id.to_string();
-    store.add_task(task);
+    store
+        .add_task(task)
+        .map_err(|e| TauriCommandError::storage(format!("创建任务失败: {e}")))?;
     Ok(id)
 }
 
 /// 标记任务完成（用户确认）
 #[tauri::command]
-fn complete_task(task_id: String) -> Result<(), String> {
+fn complete_task(task_id: String) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let mut task = store
         .get_task(&Id::from_str(&task_id))
-        .ok_or_else(|| format!("找不到任务 {task_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     task.complete();
-    store.update_task(task);
+    store
+        .update_task(task)
+        .map_err(|e| TauriCommandError::storage(format!("完成任务失败: {e}")))?;
     Ok(())
 }
 
 /// 放弃任务
 #[tauri::command]
-fn abandon_task(task_id: String) -> Result<(), String> {
+fn abandon_task(task_id: String) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
     let mut task = store
         .get_task(&Id::from_str(&task_id))
-        .ok_or_else(|| format!("找不到任务 {task_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到任务 {task_id}")))?;
     task.abandon();
-    store.update_task(task);
+    store
+        .update_task(task)
+        .map_err(|e| TauriCommandError::storage(format!("放弃任务失败: {e}")))?;
     Ok(())
 }
 
@@ -4823,10 +5191,10 @@ struct CampaignBundle {
 /// 从 CharacterStore 取原始 Character（含 raw_card_json），
 /// 用 to_st_data 构建 StCharacterData，再写入 PNG。
 #[tauri::command]
-fn export_st_card_png(character_id: String) -> Result<Vec<u8>, String> {
+fn export_st_card_png(character_id: String) -> Result<Vec<u8>, TauriCommandError> {
     let stored = get_store()
         .get(&character_id)
-        .ok_or_else(|| format!("角色卡不存在: {character_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
 
     // 从 CharacterStore 恢复 Character（精简版，但够 to_st_data 用）
     let character = stored_info_to_character(&stored);
@@ -4840,7 +5208,7 @@ fn export_st_card_png(character_id: String) -> Result<Vec<u8>, String> {
     let card = storyforge_infra_import::png::make_st_card(st_data, &character.spec_version);
 
     storyforge_infra_import::png::write_st_card_png(&card, None)
-        .map_err(|e| format!("PNG 导出失败: {e}"))
+        .map_err(|e| TauriCommandError::internal(format!("PNG 导出失败: {e}")))
 }
 
 /// 导出 Campaign 全部角色为 ST PNG + 共享 lorebook
@@ -4848,17 +5216,19 @@ fn export_st_card_png(character_id: String) -> Result<Vec<u8>, String> {
 /// 策略（用户已定）：每角色一张 PNG + 共享 lorebook。
 /// 共享知识/世界书转 ST lorebook 格式。
 #[tauri::command]
-fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult, String> {
+fn export_campaign_st_cards(
+    campaign_id: String,
+) -> Result<CampaignExportResult, TauriCommandError> {
     let store = get_campaign_store();
     let camp_id = Id::from_str(&campaign_id);
 
     let campaign = store
         .get_campaign(&camp_id)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
 
-    let stored_card = store
-        .get_card(&campaign.card_id)
-        .ok_or_else(|| format!("Campaign 关联的卡不存在: {}", campaign.card_id))?;
+    let stored_card = store.get_card(&campaign.card_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!("Campaign 关联的卡不存在: {}", campaign.card_id))
+    })?;
 
     let instances = store.list_instances(&camp_id);
     if instances.is_empty() {
@@ -4879,12 +5249,17 @@ fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult,
     let mut cards = Vec::new();
     for inst in &instances {
         // 找到对应的 definition
-        let definition = inst
-            .definition_id
-            .as_ref()
-            .and_then(|did| stored_card.card.character_definitions.iter().find(|d| d.id == *did));
+        let definition = inst.definition_id.as_ref().and_then(|did| {
+            stored_card
+                .card
+                .character_definitions
+                .iter()
+                .find(|d| d.id == *did)
+        });
 
-        let (st_data, spec_version) = if let (Some(character), Some(def)) = (&original_character, definition) {
+        let (st_data, spec_version) = if let (Some(character), Some(def)) =
+            (&original_character, definition)
+        {
             // 有原始 Character → 用 to_st_data（round-trip 保底）
             let book = character
                 .embedded_world_info
@@ -4894,11 +5269,8 @@ fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult,
             (data, character.spec_version.clone())
         } else if let Some(def) = definition {
             // 只有 Card + Definition → 用 to_st_data_from_card
-            let data = storyforge_domain::character::to_st_data_from_card(
-                &stored_card.card,
-                def,
-                None,
-            );
+            let data =
+                storyforge_domain::character::to_st_data_from_card(&stored_card.card, def, None);
             (data, "3.0".into())
         } else {
             // 临时角色（无 definition）→ 用 instance 名字构建最小卡
@@ -4907,8 +5279,10 @@ fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult,
         };
 
         let card = storyforge_infra_import::png::make_st_card(st_data, &spec_version);
-        let png_bytes = storyforge_infra_import::png::write_st_card_png(&card, None)
-            .map_err(|e| format!("PNG 导出失败 ({}): {e}", inst.name))?;
+        let png_bytes =
+            storyforge_infra_import::png::write_st_card_png(&card, None).map_err(|e| {
+                TauriCommandError::internal(format!("PNG 导出失败 ({}): {e}", inst.name))
+            })?;
 
         let filename = sanitize_filename(&format!("{}.png", inst.name));
         cards.push(ExportedFile {
@@ -4927,13 +5301,13 @@ fn export_campaign_st_cards(campaign_id: String) -> Result<CampaignExportResult,
 ///
 /// 包含 Campaign 元数据 + Instances + Definitions + Knowledge + Tasks + Summaries。
 #[tauri::command]
-fn export_campaign_bundle(campaign_id: String) -> Result<String, String> {
+fn export_campaign_bundle(campaign_id: String) -> Result<String, TauriCommandError> {
     let store = get_campaign_store();
     let camp_id = Id::from_str(&campaign_id);
 
     let campaign = store
         .get_campaign(&camp_id)
-        .ok_or_else(|| format!("Campaign 不存在: {campaign_id}"))?;
+        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
 
     let stored_card = store.get_card(&campaign.card_id);
     let instances = store.list_instances(&camp_id);
@@ -4956,7 +5330,8 @@ fn export_campaign_bundle(campaign_id: String) -> Result<String, String> {
         summaries,
     };
 
-    serde_json::to_string_pretty(&bundle).map_err(|e| format!("Bundle 序列化失败: {e}"))
+    serde_json::to_string_pretty(&bundle)
+        .map_err(|e| TauriCommandError::internal(format!("Bundle 序列化失败: {e}")))
 }
 
 /// 把 CharacterKnowledgeEntry 列表转为 ST WorldInfoBook（导出用）
@@ -4973,8 +5348,8 @@ fn knowledge_to_st_book(
             keys: vec![e.knowledge_text.chars().take(20).collect()],
             secondary_keys: None,
             content: Some(e.knowledge_text.clone()),
-            constant: e.pinned,     // pinned → 蓝灯（常驻）
-            selective: !e.pinned,   // 非 pinned → 绿灯（选择性）
+            constant: e.pinned,   // pinned → 蓝灯（常驻）
+            selective: !e.pinned, // 非 pinned → 绿灯（选择性）
             selective_logic: None,
             position: Some(serde_json::json!(0)),
             disable: None,
@@ -5002,18 +5377,22 @@ fn sanitize_filename(name: &str) -> String {
 // ─── W8 MVU JS Runtime 命令 ─────────────────────────────────────────────
 
 /// MVU pending 请求 map 类型（由 WebViewMvuRuntime 管理，command handler 通过 Tauri state 访问）
-type MvuPendingMap = Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<MvuExecuteResponse>>>>;
+type MvuPendingMap = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<MvuExecuteResponse>>,
+    >,
+>;
 
 /// 前端确认 unload 完成
 #[tauri::command]
-async fn mvu_unload_ack() -> Result<(), String> {
+async fn mvu_unload_ack() -> Result<(), TauriCommandError> {
     tracing::debug!("[MVU] unload ack received");
     Ok(())
 }
 
 /// 前端确认 load assets 完成
 #[tauri::command]
-async fn mvu_load_ack(error: Option<String>) -> Result<(), String> {
+async fn mvu_load_ack(error: Option<String>) -> Result<(), TauriCommandError> {
     if let Some(err) = error {
         tracing::warn!("[MVU] load assets error: {err}");
     } else {
@@ -5030,7 +5409,7 @@ async fn mvu_execute_result(
     variable_updates: std::collections::HashMap<String, serde_json::Value>,
     side_effects: Vec<String>,
     error: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), TauriCommandError> {
     let response = MvuExecuteResponse {
         request_id: request_id.clone(),
         variable_updates,
@@ -5054,7 +5433,8 @@ pub fn run() {
     storyforge_app_logging::init_tracing(app_state.log_store.clone());
 
     // W8 MVU JS Runtime：共享 pending map
-    let mvu_pending: MvuPendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mvu_pending: MvuPendingMap =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -5063,10 +5443,8 @@ pub fn run() {
         .manage(mvu_pending.clone())
         .setup(move |app| {
             // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
-            let mvu_rt = WebViewMvuRuntime::with_shared_pending(
-                app.handle().clone(),
-                mvu_pending.clone(),
-            );
+            let mvu_rt =
+                WebViewMvuRuntime::with_shared_pending(app.handle().clone(), mvu_pending.clone());
             // W10: 存入全局 OnceLock，供 new_pipeline 注入到 PipelineOrchestrator
             let _ = MVU_RUNTIME.set(Arc::new(mvu_rt));
             app.manage(MVU_RUNTIME.get().unwrap().clone());
@@ -5297,24 +5675,28 @@ mod tests {
     use storyforge_domain::character::Character;
     #[test]
     fn test_meta_session_explainer_is_injected() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
         assert!(
             state.meta_session.explainer.is_some(),
             "meta_session.explainer should be injected (not None) for inspect_generation"
         );
         // campaign_runtime 默认为 None（无 active campaign）
         assert!(
-            state.meta_session.campaign_runtime.lock().unwrap().is_none(),
+            state
+                .meta_session
+                .campaign_runtime
+                .lock()
+                .unwrap()
+                .is_none(),
             "meta_session.campaign_runtime should be None when no active campaign"
         );
     }
-
 
     /// 验证 tool_ctx 的 RwLock + snapshot 机制：写入后快照能读到
     /// （这是 import_character 同步 tool_ctx 的核心机制）
     #[test]
     fn test_tool_ctx_snapshot_sees_writes() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
 
         // 初始为空
         let snap0 = state.snapshot_tool_ctx();
@@ -5477,10 +5859,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
         let mut instance = CharacterInstance::temporary(campaign.id.clone(), "Lin");
         instance.id = Id::from_str("inst-lin");
-        store.add_instance(instance);
+        store.add_instance(instance).unwrap();
 
         let update = CharacterKnowledgeUpdate {
             character_id: Id::from_str("Lin"),
@@ -5500,7 +5882,11 @@ mod tests {
             &present_ids,
             &HashSet::new(),
         );
-        assert_eq!(entries.len(), 1, "name target should resolve to campaign instance");
+        assert_eq!(
+            entries.len(),
+            1,
+            "name target should resolve to campaign instance"
+        );
         let entry = &entries[0];
         assert_eq!(entry.character_id, Id::from_str("inst-lin"));
         assert_eq!(entry.knowledge_text, "Lin found the key");
@@ -5521,13 +5907,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
         let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
         lin.id = Id::from_str("inst-lin");
         let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
         chen.id = Id::from_str("inst-chen");
-        store.add_instance(lin);
-        store.add_instance(chen);
+        store.add_instance(lin).unwrap();
+        store.add_instance(chen).unwrap();
 
         let update = CharacterKnowledgeUpdate {
             character_id: Id::from_str("Chen"),
@@ -5566,13 +5952,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
         let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
         lin.id = Id::from_str("inst-lin");
         let mut chen = CharacterInstance::temporary(campaign.id.clone(), "Chen");
         chen.id = Id::from_str("inst-chen");
-        store.add_instance(lin);
-        store.add_instance(chen);
+        store.add_instance(lin).unwrap();
+        store.add_instance(chen).unwrap();
 
         let update = CharacterKnowledgeUpdate {
             character_id: Id::from_str("Lin"),
@@ -5613,7 +5999,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let update = CharacterKnowledgeUpdate {
             character_id: Id::from_str("Ghost"),
@@ -5653,7 +6039,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         // 创建 3 个 instance
         let mut a = CharacterInstance::temporary(campaign.id.clone(), "A");
@@ -5662,9 +6048,9 @@ mod tests {
         b.id = Id::from_str("inst-b");
         let mut c = CharacterInstance::temporary(campaign.id.clone(), "C");
         c.id = Id::from_str("inst-c");
-        store.add_instance(a);
-        store.add_instance(b);
-        store.add_instance(c);
+        store.add_instance(a).unwrap();
+        store.add_instance(b).unwrap();
+        store.add_instance(c).unwrap();
 
         // 广播发起者是 A（source_character_id=A），broadcast=All
         let update = CharacterKnowledgeUpdate {
@@ -5686,11 +6072,18 @@ mod tests {
         );
 
         // 应分发给 B 和 C（排除发起者 A 自身）
-        assert_eq!(entries.len(), 2, "broadcast All 应分发给除发起者外的所有 instance");
+        assert_eq!(
+            entries.len(),
+            2,
+            "broadcast All 应分发给除发起者外的所有 instance"
+        );
         let target_ids: Vec<_> = entries.iter().map(|e| e.character_id.clone()).collect();
         assert!(target_ids.contains(&Id::from_str("inst-b")));
         assert!(target_ids.contains(&Id::from_str("inst-c")));
-        assert!(!target_ids.contains(&Id::from_str("inst-a")), "不应分发给发起者自身");
+        assert!(
+            !target_ids.contains(&Id::from_str("inst-a")),
+            "不应分发给发起者自身"
+        );
 
         // 每条都是 ToldByOther，source_character_id = A
         for entry in &entries {
@@ -5706,9 +6099,7 @@ mod tests {
     fn test_broadcast_group_distributes_to_matching_group() {
         use std::collections::HashSet;
         use storyforge_domain::campaign::{Campaign, CharacterInstance};
-        use storyforge_domain::character::{
-            CharacterCard, CharacterDefinition, RoleType,
-        };
+        use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
         use storyforge_domain::character_knowledge::{
             BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource,
         };
@@ -5717,7 +6108,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         // 创建 card + definitions（有 group 和无 group）
         let def_guard = CharacterDefinition {
@@ -5760,7 +6151,7 @@ mod tests {
             character_definitions: vec![def_guard, def_merchant, def_leader],
             raw_card_json: serde_json::Value::Null,
         };
-        store.save_card(card);
+        store.save_card(card).unwrap();
 
         // 创建 instances（link to definitions）
         let mut inst_guard = CharacterInstance::temporary(campaign.id.clone(), "Guard");
@@ -5772,9 +6163,9 @@ mod tests {
         let mut inst_leader = CharacterInstance::temporary(campaign.id.clone(), "Leader");
         inst_leader.id = Id::from_str("inst-leader");
         inst_leader.definition_id = Some(Id::from_str("def-leader"));
-        store.add_instance(inst_guard);
-        store.add_instance(inst_merchant);
-        store.add_instance(inst_leader);
+        store.add_instance(inst_guard).unwrap();
+        store.add_instance(inst_merchant).unwrap();
+        store.add_instance(inst_leader).unwrap();
 
         // 广播给"守卫"组
         let update = CharacterKnowledgeUpdate {
@@ -5799,7 +6190,10 @@ mod tests {
         assert_eq!(entries.len(), 1, "broadcast Group('守卫') 应只分发给守卫组");
         assert_eq!(entries[0].character_id, Id::from_str("inst-guard"));
         assert_eq!(entries[0].source, KnowledgeSource::ToldByOther);
-        assert_eq!(entries[0].source_character_id, Some(Id::from_str("inst-leader")));
+        assert_eq!(
+            entries[0].source_character_id,
+            Some(Id::from_str("inst-leader"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5814,14 +6208,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let mut a = CharacterInstance::temporary(campaign.id.clone(), "A");
         a.id = Id::from_str("inst-a");
         let mut b = CharacterInstance::temporary(campaign.id.clone(), "B");
         b.id = Id::from_str("inst-b");
-        store.add_instance(a);
-        store.add_instance(b);
+        store.add_instance(a).unwrap();
+        store.add_instance(b).unwrap();
 
         // broadcast=None → 单角色定向，走原有 P3 逻辑
         let update = CharacterKnowledgeUpdate {
@@ -5853,7 +6247,7 @@ mod tests {
 
     #[test]
     fn test_current_cancel_slot() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
 
         // 初始无运行中的写作
         {
@@ -5898,7 +6292,7 @@ mod tests {
     /// 验证 active_llm_or_mock：无活跃连接时回退 mock（关键 fallback 行为）
     #[test]
     fn test_active_llm_fallback_to_mock() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
         // 测试环境通常无活跃连接（除非 data/connections.json 恰好有）
         // 这里测 clear 后回退 mock
         state.clear_active_connection();
@@ -5934,7 +6328,7 @@ mod tests {
     /// 验证 AppState 的 vector_store 字段初始化正常（可读写）
     #[test]
     fn test_vector_store_initialized() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
         let initial = state.vector_store.count();
 
         // 写入一条测试记录，验证可检索
@@ -5996,7 +6390,7 @@ mod tests {
     /// 初始状态下 tool_ctx 的 campaign_runtime 应为 None（未开 Campaign）
     #[test]
     fn test_campaign_runtime_none_by_default() {
-        let state = AppState::new();
+        let state = AppState::new_for_test();
         let snap = state.snapshot_tool_ctx();
         assert!(
             snap.campaign_runtime.is_none(),
@@ -6011,7 +6405,7 @@ mod tests {
         use storyforge_domain::campaign::Campaign;
         use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 
-        let state = AppState::new();
+        let state = AppState::new_for_test();
 
         // 构造一个最小的 CampaignRuntimeContext
         let campaign = Campaign::new(Id::from_str("test-card"), "test-run");
@@ -6052,7 +6446,7 @@ mod tests {
         use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
         use storyforge_domain::variables::default_character_variables;
 
-        let state = AppState::new();
+        let state = AppState::new_for_test();
 
         let campaign = Campaign::new(Id::from_str("card-1"), "full-test");
 
@@ -6125,7 +6519,7 @@ mod tests {
         use storyforge_domain::campaign::Campaign;
         use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 
-        let state = AppState::new();
+        let state = AppState::new_for_test();
 
         // 模拟上一轮残留：手动写入一个 runtime
         let campaign = Campaign::new(Id::from_str("stale-card"), "stale-run");
@@ -6181,7 +6575,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
@@ -6225,11 +6619,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         // 先手动落盘一个 "Ghost"
         let existing = CharacterInstance::temporary(campaign.id.clone(), "Ghost");
-        store.add_instance(existing.clone());
+        store.add_instance(existing.clone()).unwrap();
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
@@ -6257,7 +6651,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
@@ -6293,8 +6687,8 @@ mod tests {
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
         let other_campaign = Campaign::new(Id::from_str("card-2"), "other");
-        store.save_campaign(campaign.clone());
-        store.save_campaign(other_campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
+        store.save_campaign(other_campaign.clone()).unwrap();
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
@@ -6341,7 +6735,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_id = Some(campaign.id.clone());
@@ -6368,12 +6762,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
         let campaign = Campaign::new(Id::from_str("card-1"), "run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         // 模拟 persist_temporary_instances：落盘一个临时 instance
         let mut ghost = CharacterInstance::temporary(campaign.id.clone(), "Ghost");
         ghost.persona_override = Some("mysterious figure".into());
-        store.add_instance(ghost.clone());
+        store.add_instance(ghost.clone()).unwrap();
 
         // postprocess 尝试写入 Ghost 的知识（之前会因为找不到 persisted instance 而跳过）
         let update = CharacterKnowledgeUpdate {
@@ -6418,10 +6812,8 @@ mod tests {
         use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
         use storyforge_domain::variables::default_character_variables;
 
-        let dir = std::env::temp_dir().join(format!(
-            "sf_test_propose_repairs_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sf_test_propose_repairs_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // 手动设置 CAMPAIGN_STORE 指向临时目录（用 get_campaign_store 的底层）
@@ -6451,16 +6843,20 @@ mod tests {
             c.character_definitions.push(def);
             c
         };
-        store.save_card(card);
+        store.save_card(card).unwrap();
 
         let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let instance = CharacterInstance::from_definition(
             campaign.id.clone(),
-            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+            &store
+                .get_card(&Id::from_str("card-1"))
+                .unwrap()
+                .card
+                .character_definitions[0],
         );
-        store.add_instance(instance.clone());
+        store.add_instance(instance.clone()).unwrap();
 
         // 添加一条指向不存在 instance 的 knowledge（orphan）
         let orphan_knowledge = CharacterKnowledgeEntry::witnessed(
@@ -6469,7 +6865,7 @@ mod tests {
             "看到了什么",
             1,
         );
-        store.add_knowledge(vec![orphan_knowledge]);
+        store.add_knowledge(vec![orphan_knowledge]).unwrap();
 
         // 用 health check 找 issues
         let definitions = store
@@ -6509,7 +6905,10 @@ mod tests {
         // 检查是否包含 delete_orphan_knowledge action
         let has_delete_orphan = patches.iter().any(|p| {
             p.actions.iter().any(|a| {
-                matches!(a, storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. })
+                matches!(
+                    a,
+                    storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. }
+                )
             })
         });
         assert!(has_delete_orphan, "应包含 delete_orphan_knowledge action");
@@ -6525,10 +6924,8 @@ mod tests {
         use storyforge_domain::story_task::StoryTask;
         use storyforge_domain::variables::default_character_variables;
 
-        let dir = std::env::temp_dir().join(format!(
-            "sf_test_accept_prune_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sf_test_accept_prune_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
 
@@ -6554,41 +6951,41 @@ mod tests {
             c.character_definitions.push(def);
             c
         };
-        store.save_card(card);
+        store.save_card(card).unwrap();
 
         let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let instance = CharacterInstance::from_definition(
             campaign.id.clone(),
-            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+            &store
+                .get_card(&Id::from_str("card-1"))
+                .unwrap()
+                .card
+                .character_definitions[0],
         );
-        store.add_instance(instance.clone());
+        store.add_instance(instance.clone()).unwrap();
 
         // 创建一个 task，related_characters 含 orphan id
-        let mut task = StoryTask::user_planned(
-            campaign.id.clone(),
-            "复仇",
-            "老王复仇",
-            vec![],
-            1,
-        );
+        let mut task = StoryTask::user_planned(campaign.id.clone(), "复仇", "老王复仇", vec![], 1);
         let orphan_id = Id::from_str("orphan-char");
         task.related_characters.push(orphan_id.clone());
         task.related_characters.push(instance.id.clone());
         let task_id = task.id.clone();
-        store.add_task(task);
+        store.add_task(task).unwrap();
 
         // 构造 TypedPatch + apply
-        let patch = storyforge_app_meta::TypedPatch {
+        let _patch = storyforge_app_meta::TypedPatch {
             id: "test-prune-patch".into(),
             description: "修剪孤儿引用".into(),
             source_issue_category: "orphan_task_references".into(),
             affected_id: Some(task_id.as_str().to_string()),
-            actions: vec![storyforge_app_meta::TypedPatchAction::PruneOrphanTaskReferences {
-                task_id: task_id.clone(),
-                orphan_character_ids: vec![orphan_id.clone()],
-            }],
+            actions: vec![
+                storyforge_app_meta::TypedPatchAction::PruneOrphanTaskReferences {
+                    task_id: task_id.clone(),
+                    orphan_character_ids: vec![orphan_id.clone()],
+                },
+            ],
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: storyforge_app_meta::TypedPatchStatus::Pending,
@@ -6598,8 +6995,9 @@ mod tests {
         // （apply_typed_action 需要 &'static，测试中用本地 store 直接调用）
         {
             let mut task = store.get_task(&task_id).unwrap();
-            task.related_characters.retain(|id| !vec![orphan_id.clone()].contains(id));
-            store.update_task(task);
+            task.related_characters
+                .retain(|id| !vec![orphan_id.clone()].contains(id));
+            store.update_task(task).unwrap();
         }
 
         // 验证：task.related_characters 不再含 orphan
@@ -6623,10 +7021,8 @@ mod tests {
         use storyforge_domain::character::{CharacterDefinition, RoleType};
         use storyforge_domain::variables::default_character_variables;
 
-        let dir = std::env::temp_dir().join(format!(
-            "sf_test_accept_stale_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sf_test_accept_stale_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
 
@@ -6652,17 +7048,21 @@ mod tests {
             c.character_definitions.push(def);
             c
         };
-        store.save_card(card);
+        store.save_card(card).unwrap();
 
         let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
-        store.save_campaign(campaign.clone());
+        store.save_campaign(campaign.clone()).unwrap();
 
         let mut instance = CharacterInstance::from_definition(
             campaign.id.clone(),
-            &store.get_card(&Id::from_str("card-1")).unwrap().card.character_definitions[0],
+            &store
+                .get_card(&Id::from_str("card-1"))
+                .unwrap()
+                .card
+                .character_definitions[0],
         );
         instance.id = Id::from_str("target-inst");
-        store.add_instance(instance.clone());
+        store.add_instance(instance.clone()).unwrap();
 
         // 构造一个指向该 instance 的 patch
         let mut patch = storyforge_app_meta::TypedPatch {
@@ -6670,12 +7070,14 @@ mod tests {
             description: "修改变量".into(),
             source_issue_category: "variable_schema_mismatch".into(),
             affected_id: Some("target-inst".into()),
-            actions: vec![storyforge_app_meta::TypedPatchAction::SyncInstanceVariables {
-                instance_id: Id::from_str("target-inst"),
-                definition_id: Id::from_str("def-1"),
-                add_keys: vec!["new_var".into()],
-                remove_keys: vec![],
-            }],
+            actions: vec![
+                storyforge_app_meta::TypedPatchAction::SyncInstanceVariables {
+                    instance_id: Id::from_str("target-inst"),
+                    definition_id: Id::from_str("def-1"),
+                    add_keys: vec!["new_var".into()],
+                    remove_keys: vec![],
+                },
+            ],
             diff: vec![],
             created_at: chrono::Utc::now(),
             status: storyforge_app_meta::TypedPatchStatus::Pending,
@@ -6720,7 +7122,7 @@ mod tests {
     /// dismiss 后 status = Dismissed
     #[test]
     fn test_meta_dismiss_typed_patch() {
-        let state = Arc::new(AppState::new());
+        let state = Arc::new(AppState::new_for_test());
 
         // 手动插入一条 patch
         let patch = storyforge_app_meta::TypedPatch {
@@ -6735,19 +7137,31 @@ mod tests {
         };
 
         {
-            let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
+            let mut typed = state
+                .typed_patches
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
             typed.push(patch);
         }
 
         // dismiss
         {
-            let mut typed = state.typed_patches.write().unwrap_or_else(|p| p.into_inner());
-            let p = typed.iter_mut().find(|p| p.id == "test-dismiss-patch").unwrap();
+            let mut typed = state
+                .typed_patches
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let p = typed
+                .iter_mut()
+                .find(|p| p.id == "test-dismiss-patch")
+                .unwrap();
             p.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
         }
 
         // 验证
-        let typed = state.typed_patches.read().unwrap_or_else(|p| p.into_inner());
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let p = typed.iter().find(|p| p.id == "test-dismiss-patch").unwrap();
         assert_eq!(p.status, storyforge_app_meta::TypedPatchStatus::Dismissed);
 
@@ -6756,6 +7170,9 @@ mod tests {
             .iter()
             .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
             .collect();
-        assert!(pending.is_empty(), "dismissed patch 不应出现在 pending 列表");
+        assert!(
+            pending.is_empty(),
+            "dismissed patch 不应出现在 pending 列表"
+        );
     }
 }

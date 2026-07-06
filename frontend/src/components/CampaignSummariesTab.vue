@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { listRoundSummaries } from '../tauri-api.js'
 
 const props = defineProps({
@@ -26,6 +26,10 @@ async function load() {
 }
 
 onMounted(load)
+
+watch(() => props.campaignId, () => {
+  if (props.campaignId) load()
+})
 
 // ─── 时间格式化（与其他组件统一用 toLocaleString） ───
 function formatTime(ts) {

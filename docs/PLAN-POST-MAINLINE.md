@@ -1,6 +1,6 @@
 # 计划：主线完成后的收口与发布准备
 
-> 状态：待执行
+> 状态：进行中（2026-07-06 已建立自动化验证基线和 release checklist 初版）
 > 前置：`docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md`（已归档）、`docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md`（已归档）、`docs/PLAN-PLUGIN-MVU.md`、`docs/PLAN-ANDROID.md` 的核心阶段已完成。
 > 目标读者：完成前序计划后，负责把项目从“功能打通”推进到“可验证、可发布、可继续迭代”的执行者。
 
@@ -40,7 +40,7 @@
 
 改动文件：
 
-- `docs/RELEASE-CHECKLIST.md`（新增）
+- `docs/RELEASE-CHECKLIST.md`（已新增初版，持续补充真实卡/Android 手工结果）
 - `docs/HANDOFF.md`（2026-06-16 旧版已归档至 `docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md`；本阶段需重新生成）
 - 如需要，新增 `fixtures/` 或 `tests/fixtures/` 下的样例卡说明。
 
@@ -136,7 +136,8 @@
    - postprocess 失败。
    - app 重启后恢复 active Campaign。
 6. 技术债闸门：
-   - 对 `CampaignStore` 做一次长任务/连续写回压测，记录单 Mutex + JSON I/O 的锁持有时间和 UI 可感知卡顿。
+   - `CampaignStore` 写入错误已改为 `Result` 并在 Tauri 命令路径传播；postprocess 后台写回失败会记录 warning。
+   - 仍需对 `CampaignStore` 做一次长任务/连续写回压测，记录单 Mutex + JSON I/O 的锁持有时间和 UI 可感知卡顿。
    - 若确认为发布阻塞，优先拆“内存态 + 后台批量 flush / 原子写”边界；不要在没有压测证据时整层重写。
 
 验收：
@@ -204,7 +205,7 @@
    - 拆分目标是让 `infra-plugin-host` 保留 `MvuRuntime` trait、DTO 和纯错误类型，把 Tauri event 发送/等待逻辑放到 Tauri 层 adapter。
    - 建议先引入小接口（如 `MvuEventPort` / `MvuRuntimePort`）承载 `emit`、pending request 和 ack，再移动实现；不要让 `app-pipeline` 或 `app-agent` 直接依赖 `tauri-app`。
 2. `CampaignStore` 存储债：
-   - 当前适合桌面开发和小数据量，但单 Mutex + JSON I/O 在 Android 和长会话里可能放大卡顿。
+   - 当前适合桌面开发和小数据量；写入错误已可见，但单 Mutex + 同步 JSON I/O 在 Android 和长会话里仍可能放大卡顿。
    - 发布前先测锁持有时间、连续 postprocess 写回、导入大卡和 app 重启恢复；只有确认阻塞后再做后台 flush / 分文件索引 / schema 迁移。
 3. 文档同步：
    - 每次完成技术债切片后同步 `ARCHITECTURE-AUDIT.md`、`DATA_MODEL.md`、`PLAN-POST-MAINLINE.md` 和 README 的代码事实。

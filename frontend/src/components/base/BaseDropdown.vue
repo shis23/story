@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, onUnmounted } from 'vue'
 import { useClickOutside } from './useClickOutside.js'
 
 const props = defineProps({
@@ -26,16 +26,28 @@ function toggle() {
   open.value = !open.value
 }
 
-// ESC 关闭
+// ESC 关闭 — handler stored at component scope to avoid leaks
+let escHandler = null
+
 watch(open, (v) => {
+  if (escHandler) {
+    document.removeEventListener('keydown', escHandler, true)
+    escHandler = null
+  }
   if (!v) return
-  const onKey = (e) => {
+  escHandler = (e) => {
     if (e.key === 'Escape') {
       open.value = false
-      document.removeEventListener('keydown', onKey, true)
     }
   }
-  document.addEventListener('keydown', onKey, true)
+  document.addEventListener('keydown', escHandler, true)
+})
+
+onUnmounted(() => {
+  if (escHandler) {
+    document.removeEventListener('keydown', escHandler, true)
+    escHandler = null
+  }
 })
 
 defineExpose({ close: () => { open.value = false } })

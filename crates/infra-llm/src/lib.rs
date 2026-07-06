@@ -2,11 +2,14 @@ pub mod embedder;
 pub mod http_client;
 pub mod mock_client;
 pub mod openai;
+pub mod retry;
 pub mod sse;
 pub mod text_tools;
 
 // 重新导出嵌入客户端
 pub use embedder::{EmbedConfig, Embedder, default_embed_config};
+pub use retry::{RetryingClient, with_retry};
+pub use storyforge_domain::llm::RetryConfig;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};

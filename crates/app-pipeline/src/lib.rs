@@ -124,8 +124,6 @@ pub struct WritingContext {
     pub profile: Option<storyforge_domain::prompt_module::PromptProfile>,
     /// 可用模块列表（Profile 引用的模块定义）
     pub modules: Vec<storyforge_domain::prompt_module::PromptModule>,
-    /// 最近 N 轮对话（用户意图 + AI 成文，用于注入导演/子Agent/编剧上下文）
-    pub recent_messages: Vec<String>,
     /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
     pub campaign_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
     /// Agent Profile 配置（可选）。None = 使用硬编码默认值。
@@ -149,7 +147,6 @@ impl WritingContext {
             story_clock: String::new(),
             profile: None,
             modules: vec![],
-            recent_messages: vec![],
             campaign_runtime: None,
             agent_profile_config: None,
         }
@@ -636,7 +633,10 @@ impl PipelineOrchestrator {
                             frag.description,
                             frag.js_snippet.len()
                         );
-                        match rt.execute_fragment(&frag.js_snippet, &current_variables).await {
+                        match rt
+                            .execute_fragment(&frag.js_snippet, &current_variables)
+                            .await
+                        {
                             Ok(exec_result) => {
                                 // side_effects 只记录日志（暂不自动执行）
                                 for se in &exec_result.side_effects {
@@ -648,7 +648,8 @@ impl PipelineOrchestrator {
                                 // variable_updates 追加到 outcome（走现有落盘路径）
                                 let js_var_count = exec_result.variable_updates.len();
                                 if js_var_count > 0 {
-                                    let pp = outcome.post_process.get_or_insert_with(Default::default);
+                                    let pp =
+                                        outcome.post_process.get_or_insert_with(Default::default);
                                     for (key, value) in exec_result.variable_updates {
                                         pp.variable_updates.push(
                                             storyforge_domain::agent::VariableUpdate {
@@ -801,13 +802,17 @@ impl PipelineOrchestrator {
                 .targets
                 .iter()
                 .all(|t| matches!(t, PartialRollTarget::Editor));
-        let rerun_subagent = req.targets.iter().find_map(|t| {
-            if let PartialRollTarget::Subagent(id) = t {
-                Some(id.clone())
-            } else {
-                None
-            }
-        });
+        let rerun_subagents: Vec<String> = req
+            .targets
+            .iter()
+            .filter_map(|t| {
+                if let PartialRollTarget::Subagent(id) = t {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // ─── 路径 A：整体重 roll（含 Director 或 targets 为空）──────────────
         if rerun_director || req.targets.is_empty() {
@@ -1067,139 +1072,151 @@ impl PipelineOrchestrator {
         }
 
         // ─── 路径 C：只重某子 Agent ────────────────────────────────────────
-        if let Some(target_id) = rerun_subagent {
+        if !rerun_subagents.is_empty() {
             let plan = provenance_old
                 .plan
                 .clone()
                 .ok_or_else(|| PipelineError::Regenerate("旧 Provenance 无 Plan".into()))?;
 
-            // 复用旧子产出，仅替换目标角色
-            let mut performances: Vec<storyforge_domain::agent::Performance> = Vec::new();
-            // 找到目标角色在 plan 里的 task
-            let target_task = plan
-                .subagent_tasks
-                .iter()
-                .find(|t| t.character_id == target_id)
-                .ok_or_else(|| {
-                    PipelineError::Regenerate(format!("目标子 Agent '{target_id}' 不在旧 Plan 中"))
-                })?
-                .clone();
-
-            self.state = PipelineState::Delegating;
-            let _ = event_tx.send(PipelineEvent::StateChanged {
-                state: self.state.clone(),
-            });
-            let _ = event_tx.send(PipelineEvent::SubagentStarted {
-                character_id: target_id.clone(),
-                index: 0,
-                total: 1,
-            });
-
-            // 重跑该子 Agent（单任务，注入 hint 到 system prompt）
             let director_config = make_director_config(
                 ctx.profile.as_ref(),
                 &ctx.modules,
                 &build_director_system_extra(ctx),
                 ctx.agent_profile_config.as_ref(),
             );
-            let new_perf = {
-                // §22 cache 友好布局：persona + 常驻世界设定进 system，场景/相关设定/最近对话 + 任务 + hint 进 tail
-                let stable_system = format!(
-                    "{}\n\n你是角色 {}。\n\n{}",
-                    SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
-                    target_task.character_id,
-                    format_subagent_context_stable(&target_task.context_package),
-                );
-                let volatile_text = format!(
-                    "{}\n\n{}",
-                    format_subagent_context_volatile(&target_task.context_package),
-                    target_task.brief,
-                );
-                let hint_for_tail = hint.clone();
-                let sub_layout = storyforge_domain::message_layout::MessageLayout::build()
-                    .system(stable_system)
-                    .tail(|_| {
-                        let mut t = storyforge_domain::message_layout::VolatileTail::new()
-                            .push(target_task.context_package.task.clone())
-                            .push(volatile_text.trim_end().to_string());
-                        if let Some(h) = hint_for_tail.as_deref() {
-                            let h = h.trim();
-                            if !h.is_empty() {
-                                t = t.push(format!("{SUBAGENT_HINT_MARKER}{h}"));
-                            }
-                        }
-                        t
-                    });
-                let config = AgentConfig {
-                    role: AgentRole::Subagent(target_id.clone()),
-                    system_prompt: String::new(), // layout 版不使用此字段
-                    max_tool_rounds: 10,
-                    model: director_config.model.clone(),
-                    tools: vec![],
-                    terminal_tools: vec![],
-                };
-                // M1 子 Agent 无工具（纯表演）
-                let registry = ToolRegistry::new();
 
-                // 单子 Agent 流式：建 channel 转发 token 到 SubagentProgress（index:0）
-                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                let pp_tx = event_tx.clone();
-                let pp_cid = target_id.clone();
-                tokio::spawn(async move {
-                    while let Some(delta) = sub_rx.recv().await {
-                        let _ = pp_tx.send(PipelineEvent::SubagentProgress {
-                            character_id: pp_cid.clone(),
-                            index: 0,
-                            delta,
-                        });
-                    }
+            self.state = PipelineState::Delegating;
+            let _ = event_tx.send(PipelineEvent::StateChanged {
+                state: self.state.clone(),
+            });
+
+            // 逐个重跑目标子 Agent
+            let mut rerun_perfs: Vec<storyforge_domain::agent::Performance> = Vec::new();
+            for (idx, target_id) in rerun_subagents.iter().enumerate() {
+                // 找到目标角色在 plan 里的 task
+                let target_task = plan
+                    .subagent_tasks
+                    .iter()
+                    .find(|t| t.character_id == *target_id)
+                    .ok_or_else(|| {
+                        PipelineError::Regenerate(format!(
+                            "目标子 Agent '{target_id}' 不在旧 Plan 中"
+                        ))
+                    })?
+                    .clone();
+
+                let _ = event_tx.send(PipelineEvent::SubagentStarted {
+                    character_id: target_id.clone(),
+                    index: idx,
+                    total: rerun_subagents.len(),
                 });
 
-                match self
-                    .runtime
-                    .run_tool_loop_with_layout(
-                        &config,
-                        sub_layout,
-                        &registry,
-                        cancel.clone(),
-                        sub_tx,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(resp) => Ok(storyforge_domain::agent::Performance {
-                        character_id: target_id.clone(),
-                        narrative: String::new(),
-                        dialogue: String::new(),
-                        inner_thoughts: String::new(),
-                        full_text: resp.content,
-                    }),
-                    Err(e) => Err(e),
-                }
-            };
+                // 重跑该子 Agent（单任务，注入 hint 到 system prompt）
+                let new_perf = {
+                    // §22 cache 友好布局：persona + 常驻世界设定进 system，场景/相关设定/最近对话 + 任务 + hint 进 tail
+                    let stable_system = format!(
+                        "{}\n\n你是角色 {}。\n\n{}",
+                        SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
+                        target_task.character_id,
+                        format_subagent_context_stable(&target_task.context_package),
+                    );
+                    let volatile_text = format!(
+                        "{}\n\n{}",
+                        format_subagent_context_volatile(&target_task.context_package),
+                        target_task.brief,
+                    );
+                    let hint_for_tail = hint.clone();
+                    let sub_layout = storyforge_domain::message_layout::MessageLayout::build()
+                        .system(stable_system)
+                        .tail(|_| {
+                            let mut t = storyforge_domain::message_layout::VolatileTail::new()
+                                .push(target_task.context_package.task.clone())
+                                .push(volatile_text.trim_end().to_string());
+                            if let Some(h) = hint_for_tail.as_deref() {
+                                let h = h.trim();
+                                if !h.is_empty() {
+                                    t = t.push(format!("{SUBAGENT_HINT_MARKER}{h}"));
+                                }
+                            }
+                            t
+                        });
+                    let config = AgentConfig {
+                        role: AgentRole::Subagent(target_id.clone()),
+                        system_prompt: String::new(), // layout 版不使用此字段
+                        max_tool_rounds: 10,
+                        model: director_config.model.clone(),
+                        tools: vec![],
+                        terminal_tools: vec![],
+                    };
+                    // M1 子 Agent 无工具（纯表演）
+                    let registry = ToolRegistry::new();
 
-            let new_perf = match new_perf {
-                Ok(perf) => {
-                    let _ = event_tx.send(PipelineEvent::SubagentDone {
-                        character_id: perf.character_id.clone(),
-                        index: 0,
-                        full_text: perf.full_text.clone(),
+                    // 单子 Agent 流式：建 channel 转发 token 到 SubagentProgress
+                    let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let pp_tx = event_tx.clone();
+                    let pp_cid = target_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(delta) = sub_rx.recv().await {
+                            let _ = pp_tx.send(PipelineEvent::SubagentProgress {
+                                character_id: pp_cid.clone(),
+                                index: idx,
+                                delta,
+                            });
+                        }
                     });
-                    perf
-                }
-                Err(e) => {
-                    let _ = event_tx.send(PipelineEvent::SubagentCancelled {
-                        character_id: target_id.clone(),
-                        index: 0,
-                    });
-                    return Err(self.abort_with(&event_tx, PipelineError::Agent(e)));
-                }
-            };
 
-            // 按原顺序重建 performances，仅替换目标子 Agent
+                    match self
+                        .runtime
+                        .run_tool_loop_with_layout(
+                            &config,
+                            sub_layout,
+                            &registry,
+                            cancel.clone(),
+                            sub_tx,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(resp) => Ok(storyforge_domain::agent::Performance {
+                            character_id: target_id.clone(),
+                            narrative: String::new(),
+                            dialogue: String::new(),
+                            inner_thoughts: String::new(),
+                            full_text: resp.content,
+                        }),
+                        Err(e) => Err(e),
+                    }
+                };
+
+                let new_perf = match new_perf {
+                    Ok(perf) => {
+                        let _ = event_tx.send(PipelineEvent::SubagentDone {
+                            character_id: perf.character_id.clone(),
+                            index: idx,
+                            full_text: perf.full_text.clone(),
+                        });
+                        perf
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PipelineEvent::SubagentCancelled {
+                            character_id: target_id.clone(),
+                            index: idx,
+                        });
+                        return Err(self.abort_with(&event_tx, PipelineError::Agent(e)));
+                    }
+                };
+
+                rerun_perfs.push(new_perf);
+            }
+
+            // 按原顺序重建 performances，替换所有重跑的目标子 Agent
+            let mut performances: Vec<storyforge_domain::agent::Performance> = Vec::new();
+            let mut rerun_idx = 0;
             for snap in &provenance_old.subagent_results {
-                if snap.character_id == target_id {
-                    performances.push(new_perf.clone());
+                if rerun_subagents.iter().any(|id| *id == snap.character_id) {
+                    // 找到这个 character 对应的 rerun_perfs 条目
+                    performances.push(rerun_perfs[rerun_idx].clone());
+                    rerun_idx += 1;
                 } else {
                     performances.push(storyforge_domain::agent::Performance {
                         character_id: snap.character_id.clone(),
@@ -1420,7 +1437,9 @@ fn has_available_characters(ctx: &WritingContext) -> bool {
 ///
 /// 从 CampaignRuntimeContext 的所有 CharacterInstance.variables 收集，
 /// key 格式保持 VariableValue.key 原样。无 campaign_runtime 时返回空 map。
-fn build_current_variables(ctx: &WritingContext) -> std::collections::HashMap<String, serde_json::Value> {
+fn build_current_variables(
+    ctx: &WritingContext,
+) -> std::collections::HashMap<String, serde_json::Value> {
     let mut vars = std::collections::HashMap::new();
     if let Some(runtime) = &ctx.campaign_runtime {
         for inst in &runtime.instances {
@@ -2953,7 +2972,10 @@ mod tests {
         let outcome = orch
             .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &fragments)
             .await;
-        assert!(outcome.is_none(), "无 campaign 应跳过后处理（不管 fragments）");
+        assert!(
+            outcome.is_none(),
+            "无 campaign 应跳过后处理（不管 fragments）"
+        );
     }
 
     /// W10: mvu_runtime=None + 空 fragments → 无 campaign 时安静跳过（无额外日志噪声）

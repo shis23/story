@@ -221,10 +221,7 @@ pub fn write_st_card_png(
 }
 
 /// 将 StCharacterData 包装为 StCharacterCard（导出辅助）
-pub fn make_st_card(
-    data: StCharacterData,
-    spec_version: &str,
-) -> StCharacterCard {
+pub fn make_st_card(data: StCharacterData, spec_version: &str) -> StCharacterCard {
     StCharacterCard {
         spec: Some("chara_card_v2".into()),
         spec_version: Some(spec_version.into()),

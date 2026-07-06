@@ -1,8 +1,8 @@
 # 文档与代码对齐审计
 
-> 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量同步）
+> 状态：2026-07-06（含 Phase 4/5/6 阶段级核对 + 知识传播增量、存储错误处理和测试隔离同步）
 > 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
-> 本次只审计和修正文档，不改业务代码。
+> 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、release checklist 初版。
 
 ## 结论
 
@@ -10,6 +10,7 @@
 
 - Campaign 数据模型已经存在；开 Campaign 时写作流水线已通过 `CampaignRuntimeContext` 消费 instances / definitions / knowledge，未开 Campaign 时继续 fallback 到扁平 `Character`。
 - `CampaignStore` 位于 `tauri-app`，下层 `app-agent` / `app-pipeline` 不应直接依赖它。
+- `CampaignStore` 写入 API 已返回 `Result`；Tauri 命令路径会向前端返回结构化 `storage` 错误，postprocess 后台写回失败会记录 warning 而不中断当前写作。
 - 通过纯 domain DTO `CampaignRuntimeContext` 下传 Campaign 运行态，是符合当前 crate 分层的改造路径。
 - Meta、MVU、Android、前端计划多数是基于已有雏形的后续计划，不是当前已完成能力。
 - 临场角色已完成后端落盘闭环和前端升格入口：临时 instance 会在成功写作结果的 postprocess 前写入 CampaignStore，并可被下一轮读取；前端会展示 `is_temporary` 标记，并提供“升格为常驻”按钮。
@@ -41,6 +42,7 @@
 - `frontend/src/tauri-api.js::startWriting` 调用 Tauri command `start_writing`。
 - `crates/tauri-app/src/lib.rs::start_writing` 存在，并从 `snapshot_tool_ctx()` 构造写作上下文。
 - `crates/tauri-app/src/lib.rs::fill_campaign_context` 填充 `campaign_id`、`turn`、`pending_tasks`、`story_clock`，**阶段 2 已扩展**：开头先清空旧 runtime 防 stale，然后从 CampaignStore 加载 instances、definitions、knowledge，组装 `Arc<CampaignRuntimeContext>` 写入 `ctx.campaign_runtime` 并同步到 `tool_ctx`。
+- `crates/tauri-app/src/lib.rs::AppState` **已持有 `data_dir`**：生产启动仍使用 OS 标准数据目录；测试可通过 `new_for_test()` 使用临时目录，避免本机真实角色/active Campaign 污染单元测试。
 - `crates/app-pipeline/src/lib.rs::WritingContext` **阶段 2 已新增** `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`。字段列表为 `characters/world_info/conversation_id/campaign_id/turn/pending_tasks/story_clock/profile/modules/recent_messages/campaign_runtime`。
 - `crates/app-pipeline/src/lib.rs::build_director_tail` **阶段 3 已改造**：有 `campaign_runtime` 时从 instances 渲染（含 id/role_type/persona 摘要 + instance variables），campaign 全局变量注入 volatile tail，UTF-8 安全截断（`truncate_chars` 按 char 而非 byte）；无时退回旧的扁平 Character 名称列表。pending tasks 注入不变。
 - `crates/app-pipeline/src/lib.rs::has_available_characters` **阶段 3 新增**：兼容 Campaign（instances 非空）和旧路径（characters 非空），`start_writing` 和 `regenerate` 共用。错误文案兼容两条路径。
@@ -51,6 +53,7 @@
 - `crates/app-agent/src/tools.rs::ToolContext` **阶段 4 新增** `current_character_instance_id: Option<Id>`：子 Agent 绑定的 instance id，用于 get_character 信息隔离。导演/编剧/无 Campaign 时为 None。
 - `crates/app-agent/src/runtime.rs::spawn_subagents` **阶段 4 已改造**：接收 `campaign_runtime: Option<Arc<CampaignRuntimeContext>>`，按 character_id 匹配 instance（id 优先，name 兜底），使用 resolved persona/behavior 构造 system，注入该 instance 的 knowledge（信息隔离）和 variables，为每个子 Agent 构造独立 ToolContext（绑定 `current_character_instance_id`）。未匹配时 fallback 到旧 context_package 并 warn。无 campaign_runtime 时走旧路径。
 - `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **阶段 5 已改造**：知识/变量写入先解析到已持久化 `CharacterInstance.id`，`present_chars` 真正用于落盘校验；不出场角色的知识不写入，非在场 instance 的变量写入被跳过并 warn；task 状态更新会校验 task 属于当前 campaign。
+- `crates/tauri-app/src/lib.rs::persist_postprocess_outcome` **已补齐写入错误处理**：summary/knowledge/变量/task 写回失败会记录 warning，不再静默丢失。
 - `crates/domain/src/conversation.rs::SubagentSnapshot` **阶段 5 已扩展**：新增 `character_instance_id: Option<String>`、`display_name: Option<String>`、`fallback_reason: Option<String>`（serde 兼容旧数据）。
 - `crates/app-conversation/src/lib.rs::build_provenance_with_campaign` **阶段 5 新增**：接收 `CampaignRuntimeContext`，从 Performance 中提取 instance 信息填充 SubagentSnapshot。旧 `build_provenance` 保留向后兼容。
 - `crates/tauri-app/src/lib.rs::CharacterInfo` **阶段 5 已扩展**：新导入卡保存 `source_character_id: Option<String>`，启动恢复时可保留 domain `Character.id`；旧数据 fallback 到 `StoredCharacter.id`。
