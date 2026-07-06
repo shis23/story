@@ -29,6 +29,10 @@ const currentVariant = computed(() => {
   return props.message.variants[props.message.active_variant]
 })
 
+const currentDisplayContent = computed(() => {
+  return currentVariant.value?.display_content ?? currentVariant.value?.content ?? ''
+})
+
 const variantCount = computed(() => props.message.variants.length)
 
 // 从 Provenance 提取可重 roll 的子 Agent 角色名列表
@@ -151,7 +155,7 @@ function rerollUser() {
         ? 'text-ink-soft pl-3 border-l-2 border-line'
         : 'text-ink prose-fiction'"
     >
-      <span v-html="formatContent(currentVariant.content)"></span>
+      <span v-html="formatContent(currentDisplayContent)"></span>
     </div>
 
     <!-- 内联编辑模式 -->

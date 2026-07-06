@@ -26,14 +26,20 @@ use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingCo
 use storyforge_domain::Id;
 use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+use storyforge_domain::conversation::{
+    Conversation, MessageNode, MessageVariant, Provenance, Role as ConversationRole, VariantStatus,
+};
 use storyforge_domain::llm::{
     LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
-use storyforge_domain::preset::{RegexScript, RegexScriptSource, merge_regex_script_sources};
+use storyforge_domain::preset::{
+    RegexPlacement, RegexScript, RegexScriptSource, merge_regex_script_sources,
+};
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
+use storyforge_infra_regex::{RegexExecutionTarget, apply_regex_scripts_for_target};
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
 };
@@ -2054,20 +2060,39 @@ fn collect_scoped_regex_scripts(
         .unwrap_or_default()
 }
 
-fn fill_regex_context(
-    ctx: &mut WritingContext,
+fn collect_campaign_scoped_regex_scripts(
+    campaign_id: &Id,
+    store: &campaign_store::CampaignStore,
+) -> Vec<RegexScript> {
+    store
+        .get_campaign(campaign_id)
+        .and_then(|campaign| store.get_card(&campaign.card_id))
+        .map(|stored_card| stored_card.card.scoped_regex_scripts())
+        .unwrap_or_default()
+}
+
+fn merge_runtime_regex_scripts(
+    scoped_scripts: Vec<RegexScript>,
     preset_store: &PresetStore,
     global_regex_store: &global_regex_store::GlobalRegexStore,
-) {
-    let scoped_scripts = std::mem::take(&mut ctx.regex_scripts);
+) -> Vec<RegexScript> {
     let global_scripts = global_regex_store.list();
     let preset_scripts = preset_store
         .active()
         .map(|stored| stored.preset.regex_scripts)
         .unwrap_or_default();
 
+    merge_regex_script_sources(&global_scripts, &preset_scripts, &scoped_scripts)
+}
+
+fn fill_regex_context(
+    ctx: &mut WritingContext,
+    preset_store: &PresetStore,
+    global_regex_store: &global_regex_store::GlobalRegexStore,
+) {
+    let scoped_scripts = std::mem::take(&mut ctx.regex_scripts);
     ctx.regex_scripts =
-        merge_regex_script_sources(&global_scripts, &preset_scripts, &scoped_scripts);
+        merge_runtime_regex_scripts(scoped_scripts, preset_store, global_regex_store);
 }
 
 fn fill_profile_context(ctx: &mut WritingContext, state: &Arc<AppState>) {
@@ -3342,11 +3367,140 @@ fn get_conversation(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let conv_id = storyforge_domain::Id::from_str(&id);
-    state
+    let conversation = state
         .conv_store
         .get(&conv_id)
-        .map(|c| serde_json::to_value(&c).unwrap_or_default())
-        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {id}")))
+        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {id}")))?;
+    let regex_scripts = collect_conversation_regex_scripts(&conversation, state.inner().as_ref());
+    Ok(
+        serde_json::to_value(conversation_display_dto(&conversation, &regex_scripts))
+            .unwrap_or_default(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConversationDisplayDto {
+    id: Id,
+    character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    campaign_id: Option<Id>,
+    nodes: Vec<MessageNodeDisplayDto>,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MessageNodeDisplayDto {
+    id: Id,
+    parent_id: Option<Id>,
+    variants: Vec<MessageVariantDisplayDto>,
+    active_variant: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MessageVariantDisplayDto {
+    id: Id,
+    role: ConversationRole,
+    content: String,
+    display_content: String,
+    created_at: chrono::DateTime<Utc>,
+    status: VariantStatus,
+    provenance: Option<Provenance>,
+}
+
+fn collect_conversation_regex_scripts(
+    conversation: &Conversation,
+    state: &AppState,
+) -> Vec<RegexScript> {
+    let scoped_scripts = if let Some(campaign_id) = &conversation.campaign_id {
+        collect_campaign_scoped_regex_scripts(campaign_id, get_campaign_store())
+    } else {
+        let tool_snapshot = state.snapshot_tool_ctx();
+        collect_scoped_regex_scripts(
+            conversation.character_id.as_deref(),
+            &tool_snapshot.characters,
+        )
+    };
+
+    merge_runtime_regex_scripts(scoped_scripts, get_preset_store(), get_global_regex_store())
+}
+
+fn conversation_display_dto(
+    conversation: &Conversation,
+    regex_scripts: &[RegexScript],
+) -> ConversationDisplayDto {
+    let display_scripts = display_only_regex_scripts(regex_scripts);
+    ConversationDisplayDto {
+        id: conversation.id.clone(),
+        character_id: conversation.character_id.clone(),
+        campaign_id: conversation.campaign_id.clone(),
+        nodes: conversation
+            .nodes
+            .iter()
+            .map(|node| message_node_display_dto(node, &display_scripts))
+            .collect(),
+        created_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+    }
+}
+
+fn message_node_display_dto(
+    node: &MessageNode,
+    display_scripts: &[RegexScript],
+) -> MessageNodeDisplayDto {
+    MessageNodeDisplayDto {
+        id: node.id.clone(),
+        parent_id: node.parent_id.clone(),
+        variants: node
+            .variants
+            .iter()
+            .map(|variant| message_variant_display_dto(variant, display_scripts))
+            .collect(),
+        active_variant: node.active_variant,
+    }
+}
+
+fn message_variant_display_dto(
+    variant: &MessageVariant,
+    display_scripts: &[RegexScript],
+) -> MessageVariantDisplayDto {
+    MessageVariantDisplayDto {
+        id: variant.id.clone(),
+        role: variant.role.clone(),
+        content: variant.content.clone(),
+        display_content: render_variant_display_content(variant, display_scripts),
+        created_at: variant.created_at,
+        status: variant.status.clone(),
+        provenance: variant.provenance.clone(),
+    }
+}
+
+fn display_only_regex_scripts(regex_scripts: &[RegexScript]) -> Vec<RegexScript> {
+    regex_scripts
+        .iter()
+        .filter(|script| script.markdown_only.unwrap_or(false))
+        .cloned()
+        .collect()
+}
+
+fn render_variant_display_content(
+    variant: &MessageVariant,
+    display_scripts: &[RegexScript],
+) -> String {
+    if variant.role != ConversationRole::Assistant || display_scripts.is_empty() {
+        return variant.content.clone();
+    }
+
+    apply_regex_scripts_for_target(
+        &variant.content,
+        display_scripts,
+        RegexPlacement::Output,
+        RegexExecutionTarget::Display,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!("展示正则执行失败，使用原始消息内容: {e}");
+        variant.content.clone()
+    })
 }
 
 // ─── M1 日志命令 ───────────────────────────────────────────────────────────
@@ -6640,6 +6794,58 @@ mod tests {
             min_depth: None,
             max_depth: None,
         }
+    }
+
+    #[test]
+    fn test_conversation_display_dto_applies_markdown_only_output_without_mutating_content() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_message(
+            storyforge_domain::conversation::Role::User,
+            "<data_block>user</data_block>".into(),
+        );
+        conversation.append_ai_draft("<data_block>hp=5</data_block> scene".into(), None);
+
+        let mut script = test_regex_script("display-hp", RegexScriptSource::Preset);
+        script.find_regex = r"<data_block>hp=5</data_block>".into();
+        script.replace_string = "[HP:5]".into();
+        script.markdown_only = Some(true);
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let user_variant = &dto.nodes[0].variants[0];
+        assert_eq!(user_variant.content, "<data_block>user</data_block>");
+        assert_eq!(
+            user_variant.display_content,
+            "<data_block>user</data_block>"
+        );
+
+        let assistant_variant = &dto.nodes[1].variants[0];
+        assert_eq!(
+            assistant_variant.content,
+            "<data_block>hp=5</data_block> scene"
+        );
+        assert_eq!(assistant_variant.display_content, "[HP:5] scene");
+
+        assert_eq!(
+            conversation.nodes[1].variants[0].content,
+            "<data_block>hp=5</data_block> scene"
+        );
+    }
+
+    #[test]
+    fn test_conversation_display_dto_does_not_reapply_persisted_output_regex() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft("persisted bar".into(), None);
+
+        let mut script = test_regex_script("persisted-output", RegexScriptSource::Preset);
+        script.find_regex = "bar".into();
+        script.replace_string = "baz".into();
+
+        let dto = conversation_display_dto(&conversation, &[script]);
+
+        let variant = &dto.nodes[0].variants[0];
+        assert_eq!(variant.content, "persisted bar");
+        assert_eq!(variant.display_content, "persisted bar");
     }
 
     /// 验证 current_cancel 的存取（cancel_writing 命令的核心机制）

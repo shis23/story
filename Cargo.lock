@@ -3721,6 +3721,7 @@ dependencies = [
  "storyforge-infra-import",
  "storyforge-infra-llm",
  "storyforge-infra-plugin-host",
+ "storyforge-infra-regex",
  "storyforge-infra-util",
  "storyforge-infra-vector",
  "tauri",

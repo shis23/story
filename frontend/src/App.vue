@@ -200,6 +200,7 @@ function buildOpeningMessage(content) {
     variants: [{
       id: 'v1',
       content,
+      display_content: content,
       status: 'final',
       provenance: null,
     }],
@@ -265,6 +266,7 @@ function applyConversation(conv) {
         variants: node.variants.map((v) => ({
           id: v.id,
           content: v.content,
+          display_content: v.display_content ?? v.content,
           status: v.status === 'Final' ? 'final' : v.status === 'Discarded' ? 'discarded' : 'draft',
           provenance: v.provenance,
         })),
@@ -543,6 +545,7 @@ async function startWriting(intent, skipLocalPush = false) {
       variants: [{
         id: `uv-${Date.now()}`,
         content: intent,
+        display_content: intent,
         status: 'final',
         provenance: null,
       }],
@@ -561,31 +564,37 @@ async function startWriting(intent, skipLocalPush = false) {
       handlePipelineEvent(event)
     }, currentConversationId.value, openingMessage)
 
-    // 后端返回 { text, conversation_id, node_id }
-    // 后端已存开场白+user意图+AI成文（重启恢复用），这里只追加 AI 成文到本地消息
+    // 后端已存开场白、user 意图和 AI 成文；重拉会话以拿到展示态 regex 内容。
     const text = result.text
     const msgId = result.node_id || `msg-${Date.now()}`
     currentConversationId.value = result.conversation_id
 
-    // 替换编剧流式占位，或追加新消息
+    // 替换编剧流式占位。
     const streamingIdx = messages.value.findIndex((m) => m.id === 'editor-streaming')
     if (streamingIdx >= 0) {
       messages.value.splice(streamingIdx, 1)
     }
-    messages.value.push({
-      id: msgId,
-      role: 'assistant',
-      role_label: writingMode.value === 'campaign'
-        ? (activeCampaign.value?.name || 'AI')
-        : (activeChar.value?.name || 'AI'),
-      active_variant: 0,
-      variants: [{
-        id: `v-${Date.now()}`,
-        content: text,
-        status: 'final',
-        provenance: null,
-      }],
-    })
+    const refreshed = await getConversation(currentConversationId.value)
+    if (refreshed) {
+      applyConversation(refreshed)
+      messages.value.forEach((m) => {
+        if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+      })
+    } else {
+      messages.value.push({
+        id: msgId,
+        role: 'assistant',
+        role_label: getAssistantRoleLabel(),
+        active_variant: 0,
+        variants: [{
+          id: `v-${Date.now()}`,
+          content: text,
+          display_content: text,
+          status: 'final',
+          provenance: null,
+        }],
+      })
+    }
 
     pipeline.state = 'done'
     pipeline.stateLabel = '已完成'
@@ -685,11 +694,12 @@ async function handleEditVariant({ nodeId, newContent }) {
   if (!currentConversationId.value) return
   try {
     await apiEditVariant(currentConversationId.value, nodeId, newContent)
-    // 同步更新本地消息
-    const msg = messages.value.find((m) => m.id === nodeId)
-    if (msg) {
-      const variant = msg.variants[msg.active_variant]
-      if (variant) variant.content = newContent
+    const refreshed = await getConversation(currentConversationId.value)
+    if (refreshed) {
+      applyConversation(refreshed)
+      messages.value.forEach((m) => {
+        if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
+      })
     }
   } catch (e) {
     console.error('编辑失败:', e)
@@ -805,6 +815,7 @@ async function handleAddVariant({ nodeId }) {
       msg.variants.push({
         id: `v-${Date.now()}`,
         content: '',
+        display_content: '',
         status: 'draft',
         provenance: null,
       })

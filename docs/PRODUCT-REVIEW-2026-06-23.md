@@ -70,7 +70,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | V2/V3 卡字段 | ✅ 已消费 | `character.rs` |
 | character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具 + Director tail 确定性 Selective 关键词触发；ST depth/position 细语义仍有限 |
 | extensions 整体保留 | 🟡 已保留 | `extensions: serde_json::Value` round-trip，不消费 |
-| regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output；`promptOnly`/`markdownOnly` 已按 prompt/display/persisted 目标做基础分流，display-only 展示渲染仍待接 |
+| regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output；`promptOnly`/`markdownOnly` 已按 prompt/display/persisted 目标分流，消息列表 display-only 展示已接入，PluginHost/HTML 渲染仍待接 |
 | alternate_greetings | 🟡 Legacy/Campaign 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话与 Campaign 新建游玩档均可在前端切换默认/备选开场，后端会校验开场来自源角色卡并持久化到 conversation |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output，且 Input/Output 已尊重 ST `placement_codes`；`promptOnly` 已只进提示词路径，`markdownOnly` 不再污染持久化文本；World Info/Slash/Reasoning 和 display-only UI 渲染仍未完成 | **3-6 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output，且 Input/Output 已尊重 ST `placement_codes`；`promptOnly` 已只进提示词路径，`markdownOnly` 不再污染持久化文本；消息列表 display-only UI 渲染已接，World Info/Slash/Reasoning 与 PluginHost/HTML 渲染仍未完成 | **2-5 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到确定性核心子集并接入 legacy 单卡 prompt；动态时间/随机/roll、跨轮/Campaign 变量宏仍待补 | 2-4 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
@@ -94,7 +94,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可从 ST settings JSON 导入 Global 正则到 `global_regex_scripts.json`，预设面板已可导入、查看、启停、清空 Global 正则，写作与重 roll 会按 Global → Preset → Scoped 顺序注入；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展；Campaign 写作会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行；`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设。当前 Input/Output 执行已优先尊重 ST 原始 `placement_codes`（0=Input，2=Output），`[0,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流，流水线 Input 走 Prompt、Output 落盘走 Persisted，`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；World Info/Slash/Reasoning 等非 Input/Output 执行点、display-only UI 渲染和 depth 限制仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可从 ST settings JSON 导入 Global 正则到 `global_regex_scripts.json`，预设面板已可导入、查看、启停、清空 Global 正则，写作与重 roll 会按 Global → Preset → Scoped 顺序注入；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展；Campaign 写作会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行；`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设。当前 Input/Output 执行已优先尊重 ST 原始 `placement_codes`（0=Input，2=Output），`[0,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流，流水线 Input 走 Prompt、Output 落盘走 Persisted，`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；消息列表展示已通过 `display_content` DTO 接入 Display 目标，编辑和持久化仍保留原始 `content`；World Info/Slash/Reasoning 等非 Input/Output 执行点、PluginHost/HTML 渲染和 depth 限制仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
@@ -119,7 +119,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 | 模式 | 行为 | 现状 | 缺失影响 |
 |---|---|---|---|
 | 默认 | 改写存储（不可逆）| ✅ Input/Output 持久化路径已执行 | |
-| Only Display | 只改显示不改存储 | 🟡 执行器已有 Display 目标，且 `markdownOnly` 不再改 prompt/存储；UI 展示通道待接 | **MVU状态栏美化尚未自动显示，但不会破坏原 `<data_block>` 存储** |
+| Only Display | 只改显示不改存储 | 🟡 执行器已有 Display 目标，且 `markdownOnly` 不再改 prompt/存储；消息列表 UI 展示通道已接，PluginHost/HTML 渲染待接 | **文本/Markdown 展示替换可派生显示且不会破坏原 `<data_block>` 存储；完整 HTML 状态栏仍待 PluginHost 线** |
 | Alter Prompt | 只改 prompt 不改显示 | 🟡 `promptOnly` 已只进 Prompt 目标；Output prompt 历史专用通道仍待设计 | |
 
 **缄默之秋的正则实际用途**（需正确支持）：
@@ -136,7 +136,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 |---|---|
 | 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Global/Preset/Scoped 合并 helper 与运行时已接；Global 已有 settings JSON 导入命令和预设面板 UI |
 | 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
-| 瞬时性（Display-only/Prompt-only/Both）| 🟡 Prompt/Persisted/Display 目标分流已接入；display-only UI 渲染仍需 1-2 天 |
+| 瞬时性（Display-only/Prompt-only/Both）| 🟡 Prompt/Persisted/Display 目标分流已接入；消息列表 display-only UI 渲染已接，PluginHost/HTML 仍需 1-2 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |
 | placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真，运行时语义待接 |
 | ST regex literal 解析（`/pattern/flags`）| ✅ 已完成执行器兼容 |

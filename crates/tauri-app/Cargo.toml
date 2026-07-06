@@ -12,6 +12,7 @@ storyforge-domain.workspace = true
 storyforge-infra-util.workspace = true
 storyforge-infra-import.workspace = true
 storyforge-infra-llm.workspace = true
+storyforge-infra-regex.workspace = true
 storyforge-app-logging.workspace = true
 storyforge-app-agent.workspace = true
 storyforge-app-conversation.workspace = true
