@@ -4108,24 +4108,7 @@ async fn archive_conversation(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
-    let conv = state
-        .conv_store
-        .get(&conv_id)
-        .ok_or_else(|| TauriCommandError::not_found(format!("对话不存在: {conversation_id}")))?;
-
-    // 取所有非 Discarded 消息
-    let messages: Vec<String> = conv
-        .nodes
-        .iter()
-        .filter_map(|node| {
-            let v = node.active()?;
-            if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
-                None
-            } else {
-                Some(v.content.clone())
-            }
-        })
-        .collect();
+    let messages = archivable_messages_async(state.conv_store.clone(), conv_id).await?;
 
     let config = state
         .embed_config
@@ -4161,6 +4144,37 @@ async fn archive_conversation(
     Ok(summaries.len())
 }
 
+fn archivable_messages_from_conversation(conv: &Conversation) -> Vec<String> {
+    conv.nodes
+        .iter()
+        .filter_map(|node| {
+            let v = node.active()?;
+            if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
+                None
+            } else {
+                Some(v.content.clone())
+            }
+        })
+        .collect()
+}
+
+async fn archivable_messages_async(
+    conv_store: Arc<ConversationStore>,
+    conv_id: Id,
+) -> Result<Vec<String>, TauriCommandError> {
+    tokio::task::spawn_blocking(move || {
+        conv_store
+            .get(&conv_id)
+            .map(|conv| archivable_messages_from_conversation(&conv))
+            .ok_or_else(|| {
+                storyforge_app_conversation::ConversationError::NotFound(conv_id.to_string())
+            })
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("读取归档消息任务失败: {e}")))?
+    .map_err(TauriCommandError::from)
+}
+
 // ─── 自动归档辅助 ──────────────────────────────────────────────────────────
 
 /// 检查对话消息数是否超过归档阈值，超过则在后台触发归档
@@ -4171,22 +4185,13 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
     const ARCHIVE_THRESHOLD: usize = 50;
 
     // 取对话，数非 Discarded 消息
-    let messages: Vec<String> = {
-        let conv = match state.conv_store.get(conv_id) {
-            Some(c) => c,
-            None => return,
-        };
-        conv.nodes
-            .iter()
-            .filter_map(|node| {
-                let v = node.active()?;
-                if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
-                    None
-                } else {
-                    Some(v.content.clone())
-                }
-            })
-            .collect()
+    let messages = match archivable_messages_async(state.conv_store.clone(), conv_id.clone()).await
+    {
+        Ok(messages) => messages,
+        Err(e) => {
+            tracing::debug!("读取自动归档消息失败，跳过: {e}");
+            return;
+        }
     };
 
     if messages.len() < ARCHIVE_THRESHOLD {
@@ -7096,6 +7101,34 @@ mod tests {
             persisted_node.active().unwrap().status,
             VariantStatus::Final
         );
+    }
+
+    #[tokio::test]
+    async fn test_archivable_messages_async_filters_discarded_variants() {
+        let state = Arc::new(AppState::new_for_test());
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        state
+            .conv_store
+            .append_user_message(&conversation.id, "user intent".into())
+            .unwrap();
+        let discarded_node_id = state
+            .conv_store
+            .append_ai_draft(&conversation.id, "discarded draft".into(), None)
+            .unwrap();
+        state
+            .conv_store
+            .soft_delete_variant(&conversation.id, &discarded_node_id)
+            .unwrap();
+        state
+            .conv_store
+            .append_ai_draft(&conversation.id, "kept draft".into(), None)
+            .unwrap();
+
+        let messages = archivable_messages_async(state.conv_store.clone(), conversation.id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(messages, vec!["user intent", "kept draft"]);
     }
 
     /// 构造测试用 Character（domain Character 无 Default）

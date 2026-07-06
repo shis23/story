@@ -127,7 +127,7 @@
 
 - **文件**: `crates/tauri-app/src/lib.rs`, `campaign_store.rs` 全部 persist
 - **问题**: async Tauri 命令过去会直接调用同步 `fill_campaign_context` 读取 active Campaign 与 CampaignStore 快照。在慢磁盘上可能导致 UI 卡顿；其他 store 写入路径仍是同步 JSON I/O。
-- **当前状态（2026-07-07）**: `start_writing` / `regenerate` 已改用 `fill_campaign_context_async`，在清空旧 runtime 后通过 `tokio::task::spawn_blocking` 加载 active Campaign 与 CampaignRuntimeContext 快照，再回到 async 主线写入 `WritingContext` / `ToolContext`。成功写作/重 roll 后的临时 instance 落盘已通过 `persist_temporary_instances_async` offload，随后再跑 postprocess，保证知识/变量写回仍能看到临时角色；postprocess summary/knowledge/variable/task 写回也已通过 `persist_postprocess_outcome_async` offload 到 blocking pool；`accept_variant` 采纳对话变体的 `ConversationStore` 写盘已通过 `accept_variant_async` offload，保留自动归档触发顺序；`configure_embedder` 已改为 async Tauri command，并把 `embed.json` / SecretRef 持久化移入 `configure_embedder_async` 的 `spawn_blocking`。新增 `test_campaign_context_snapshot_applies_runtime_to_contexts`、`test_postprocess_persistence_helper_writes_all_campaign_outputs`、`test_accept_variant_async_persists_final_variant`、`test_configure_embedder_async_persists_secret_ref_and_updates_state` 与临时 instance 回归测试覆盖关键行为。剩余为其他 store 写入与后台 flush 评估。
+- **当前状态（2026-07-07）**: `start_writing` / `regenerate` 已改用 `fill_campaign_context_async`，在清空旧 runtime 后通过 `tokio::task::spawn_blocking` 加载 active Campaign 与 CampaignRuntimeContext 快照，再回到 async 主线写入 `WritingContext` / `ToolContext`。成功写作/重 roll 后的临时 instance 落盘已通过 `persist_temporary_instances_async` offload，随后再跑 postprocess，保证知识/变量写回仍能看到临时角色；postprocess summary/knowledge/variable/task 写回也已通过 `persist_postprocess_outcome_async` offload 到 blocking pool；`accept_variant` 采纳对话变体的 `ConversationStore` 写盘已通过 `accept_variant_async` offload，保留自动归档触发顺序；`configure_embedder` 已改为 async Tauri command，并把 `embed.json` / SecretRef 持久化移入 `configure_embedder_async` 的 `spawn_blocking`；手动/自动归档读取对话消息已共用 `archivable_messages_async`，在 blocking pool 中读取 `ConversationStore` 并过滤 Discarded 变体。新增 `test_campaign_context_snapshot_applies_runtime_to_contexts`、`test_postprocess_persistence_helper_writes_all_campaign_outputs`、`test_accept_variant_async_persists_final_variant`、`test_configure_embedder_async_persists_secret_ref_and_updates_state`、`test_archivable_messages_async_filters_discarded_variants` 与临时 instance 回归测试覆盖关键行为。剩余为其他 store 写入与后台 flush 评估。
 - **置信度**: R5 单次确认
 
 ### H-015: 向量存储加载 IO 错误静默返回空数据
@@ -237,7 +237,7 @@
 
 ### Major Restructure（> 4 小时/项）
 
-15. **H-014**: 全量同步 I/O 替换为异步（写作/重 roll Campaign 快照读取、临时 instance 落盘、postprocess 写回、accept variant 写盘、configure embedder 写盘已先行 `spawn_blocking`）
+15. **H-014**: 全量同步 I/O 替换为异步（写作/重 roll Campaign 快照读取、临时 instance 落盘、postprocess 写回、accept variant 写盘、configure embedder 写盘、归档消息读取已先行 `spawn_blocking`）
 16. **H-013 剩余项**: CampaignStore 后台 flush / 异步写入评估（集合级锁、快照读取 offload、临时 instance 落盘 offload、postprocess 写回 offload 已完成）
 17. **H-002**: API key 加密存储
 18. **H-012**: infra-plugin-host 移除直接 Tauri 依赖（已完成 2026-07-06）
