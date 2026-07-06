@@ -234,6 +234,8 @@
 | ST-T4 | StoryForge Campaign 导出格式设计 | 已实现 | W7 `export_campaign` 命令 + JSON bundle（`format_version`）+ ST 卡 PNG tEXt 写入 + 共享 lorebook |
 | ST-T5 | 评估导出回 ST 卡/Lorebook | 已实现 | W7 评估 checkbox 已结；ST 卡 PNG + lorebook 导出已落地 |
 
+2026-07-06 增量核对：`Preset::from_st()` 的 Preset `extensions.regex_scripts` 导入已保留 ST 正则元数据，包括原始 `placement_codes`、`markdown_only`、`prompt_only`、`run_on_edit`、`substitute_regex`、`trim_strings`、`min_depth`、`max_depth`。当前仍只是导入保真；执行层仍按 `RegexPlacement::Input/Output` 简化过滤，Scoped/Global 正则来源合并未完成。
+
 ### Phase 6：Android（~20%）
 
 | 阶段 | 计划目标 | 真实状态 | 证据路径 |

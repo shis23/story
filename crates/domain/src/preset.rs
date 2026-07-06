@@ -48,11 +48,22 @@ pub struct RegexScript {
     pub replace_string: String,
     /// 作用域（D12：输入正则 vs 输出正则）
     pub placement: RegexPlacement,
+    /// ST 原始 placement 数组，用于后续恢复 World Info/Slash/Reasoning 等作用域语义。
+    #[serde(default)]
+    pub placement_codes: Vec<i32>,
     /// 是否禁用
     pub disabled: bool,
     /// ST 原始字段（flags 等）
     pub flags: String,
     pub only_format_formatting: Option<bool>,
+    pub markdown_only: Option<bool>,
+    pub prompt_only: Option<bool>,
+    pub run_on_edit: Option<bool>,
+    pub substitute_regex: Option<i32>,
+    #[serde(default)]
+    pub trim_strings: Vec<String>,
+    pub min_depth: Option<i32>,
+    pub max_depth: Option<i32>,
 }
 
 /// 正则作用域（D12）
@@ -110,6 +121,20 @@ pub struct StRegexScript {
     pub flags: String,
     #[serde(rename = "onlyFormatFormatting")]
     pub only_format_formatting: Option<bool>,
+    #[serde(rename = "markdownOnly")]
+    pub markdown_only: Option<bool>,
+    #[serde(rename = "promptOnly")]
+    pub prompt_only: Option<bool>,
+    #[serde(rename = "runOnEdit")]
+    pub run_on_edit: Option<bool>,
+    #[serde(rename = "substituteRegex")]
+    pub substitute_regex: Option<i32>,
+    #[serde(default, rename = "trimStrings")]
+    pub trim_strings: Vec<String>,
+    #[serde(rename = "minDepth")]
+    pub min_depth: Option<i32>,
+    #[serde(rename = "maxDepth")]
+    pub max_depth: Option<i32>,
 }
 
 impl Preset {
@@ -196,6 +221,7 @@ fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
             } else {
                 RegexPlacement::Input
             };
+            let placement_codes = s.placement;
 
             RegexScript {
                 id: s.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -203,9 +229,17 @@ fn extract_regex_scripts(extensions: &serde_json::Value) -> Vec<RegexScript> {
                 find_regex: s.find_regex.unwrap_or_default(),
                 replace_string: s.replace_string.unwrap_or_default(),
                 placement,
+                placement_codes,
                 disabled: s.disabled,
                 flags: s.flags,
                 only_format_formatting: s.only_format_formatting,
+                markdown_only: s.markdown_only,
+                prompt_only: s.prompt_only,
+                run_on_edit: s.run_on_edit,
+                substitute_regex: s.substitute_regex,
+                trim_strings: s.trim_strings,
+                min_depth: s.min_depth,
+                max_depth: s.max_depth,
             }
         })
         .collect()

@@ -262,4 +262,73 @@ mod tests {
         assert_eq!(preset.input_regex_scripts().len(), 1);
         assert_eq!(preset.output_regex_scripts().len(), 1);
     }
+
+    #[test]
+    fn test_import_preset_preserves_st_regex_metadata() {
+        let json = serde_json::json!({
+            "name": "Regex Metadata Preset",
+            "prompts": [],
+            "extensions": {
+                "regex_scripts": [
+                    {
+                        "id": "meta-1",
+                        "scriptName": "Display-only output cleanup",
+                        "findRegex": "/^[ \\t]+/gm",
+                        "replaceString": "",
+                        "placement": [2, 1],
+                        "disabled": false,
+                        "flags": "",
+                        "markdownOnly": true,
+                        "promptOnly": false,
+                        "runOnEdit": true,
+                        "substituteRegex": 0,
+                        "trimStrings": ["`", "```"],
+                        "minDepth": null,
+                        "maxDepth": 3
+                    },
+                    {
+                        "id": "meta-2",
+                        "scriptName": "Prompt-only input wrapper",
+                        "findRegex": "{{input}}",
+                        "replaceString": "<input>$0</input>",
+                        "placement": [1],
+                        "disabled": true,
+                        "promptOnly": true,
+                        "runOnEdit": false,
+                        "substituteRegex": 1,
+                        "trimStrings": [],
+                        "minDepth": 0,
+                        "maxDepth": 0
+                    }
+                ]
+            }
+        });
+
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let preset = import_preset(&bytes).expect("preset should parse");
+
+        assert_eq!(preset.regex_scripts.len(), 2);
+
+        let output = &preset.regex_scripts[0];
+        assert_eq!(output.placement_codes, vec![2, 1]);
+        assert_eq!(
+            output.placement,
+            storyforge_domain::preset::RegexPlacement::Output
+        );
+        assert_eq!(output.markdown_only, Some(true));
+        assert_eq!(output.prompt_only, Some(false));
+        assert_eq!(output.run_on_edit, Some(true));
+        assert_eq!(output.substitute_regex, Some(0));
+        assert_eq!(output.trim_strings, vec!["`", "```"]);
+        assert_eq!(output.min_depth, None);
+        assert_eq!(output.max_depth, Some(3));
+
+        let prompt_only = &preset.regex_scripts[1];
+        assert_eq!(prompt_only.placement_codes, vec![1]);
+        assert_eq!(prompt_only.prompt_only, Some(true));
+        assert_eq!(prompt_only.run_on_edit, Some(false));
+        assert_eq!(prompt_only.substitute_regex, Some(1));
+        assert_eq!(prompt_only.min_depth, Some(0));
+        assert_eq!(prompt_only.max_depth, Some(0));
+    }
 }

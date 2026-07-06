@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | 仅读 Preset 来源 + 二元 placement | **9-13 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Preset 来源已保留 ST 元数据；运行时仍是二元 placement，Scoped/Global 未合并 | **8-12 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 仅 3 个 | 3-5 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | domain 有，前端无 | 1-2 天 |
@@ -94,7 +94,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：当前 `RegexScript`（`preset.rs:44`）只在**预设导入路径**调用 `extract_regex_scripts`，**只读 Preset 来源**，且 `placement: Vec<i32>` 被映射成二元枚举（丢信息）。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：当前 `RegexScript` 只在**预设导入路径**调用 `extract_regex_scripts`，**只读 Preset 来源**。2026-07-06 已补一层导入保真：原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据；但运行时执行仍按二元 `Input/Output` 简化枚举过滤，多作用域语义仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
@@ -138,8 +138,8 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 | 作用域扩展（加 World Info/Slash/Reasoning）| 3-4 天 |
 | 瞬时性（Display-only/Prompt-only/Both）| 2-3 天 |
 | Depth 限制（只作用最近 N 条）| 1-2 天 |
-| placement 字段重做（恢复 `Vec<i32>` 语义）| 1 天 |
-| **总计** | **9-13 天** |
+| placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真，运行时语义待接 |
+| **总计** | **8-12 天** |
 
 > sprest 插件（提取预设中的正则集中管理）本身是管理工具非运行时，不需兼容。但它揭示的"正则来源合并优先级"问题必须正确实现。
 
