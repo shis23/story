@@ -45,6 +45,10 @@ let handler = null
 let lastPluginEventId = 0
 const pendingPluginEvents = []
 const MAX_PENDING_PLUGIN_EVENTS = 100
+const HOST_ORIGIN = window.location?.origin || '*'
+// Sandboxed srcdoc iframes have an opaque origin, so host-to-plugin delivery
+// must use '*'. Source checks below keep inbound messages scoped to this iframe.
+const PLUGIN_IFRAME_TARGET_ORIGIN = '*'
 
 // 构建 srcdoc：bridge script + 插件 HTML（entry_html 已由 iframe sandbox 隔离，
 // 但仍做消毒防止沙箱逃逸场景）
@@ -52,7 +56,7 @@ const iframeSrc = computed(() => {
   if (!props.plugin?.manifest?.entry_html && !props.plugin?.entry_html) return ''
   const rawHtml = props.plugin?.manifest?.entry_html || props.plugin?.entry_html || ''
   const entryHtml = DOMPurify.sanitize(rawHtml)
-  const bridgeScript = generateBridgeScript(props.plugin.id)
+  const bridgeScript = generateBridgeScript(props.plugin.id, HOST_ORIGIN)
   return `<!DOCTYPE html><html><head>${bridgeScript}</head><body>${entryHtml}</body></html>`
 })
 
@@ -87,7 +91,7 @@ function postPluginEvent(pluginEvent) {
     type: MSG_EVENT,
     event: pluginEvent.event,
     data: pluginEvent.data,
-  }, '*')
+  }, PLUGIN_IFRAME_TARGET_ORIGIN)
 }
 
 function flushPendingPluginEvents() {
@@ -100,7 +104,7 @@ function flushPendingPluginEvents() {
       type: MSG_EVENT,
       event: pluginEvent.event,
       data: pluginEvent.data,
-    }, '*')
+    }, PLUGIN_IFRAME_TARGET_ORIGIN)
   }
 }
 
@@ -122,8 +126,14 @@ function consumePluginEvents(events) {
   }
 }
 
+function isTrustedPluginSource(event) {
+  return !!iframeRef.value?.contentWindow && event.source === iframeRef.value.contentWindow
+}
+
 // 处理来自 iframe 的消息
 function onWindowMessage(event) {
+  if (!isTrustedPluginSource(event)) return
+
   const data = event.data
 
   // 插件 UI 挂载请求
@@ -140,7 +150,7 @@ function onWindowMessage(event) {
 }
 
 onMounted(() => {
-  handler = createHostHandler(props.plugin, invoke)
+  handler = createHostHandler(props.plugin, invoke, { isTrustedSource: isTrustedPluginSource })
   window.addEventListener('message', onWindowMessage)
 })
 
@@ -152,7 +162,7 @@ onUnmounted(() => {
 // 插件变化时重建 handler
 watch(() => props.plugin, (newPlugin) => {
   if (newPlugin) {
-    handler = createHostHandler(newPlugin, invoke)
+    handler = createHostHandler(newPlugin, invoke, { isTrustedSource: isTrustedPluginSource })
   }
 })
 

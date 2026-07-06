@@ -153,7 +153,7 @@
 | M-006 | `app-pipeline:1069` | ✅ 已修复：多个 Subagent regenerate targets 会全部重跑，并按 `character_id` 回填，避免 target 顺序打乱旧 provenance/plan 顺序 |
 | M-007 | `runtime.rs:448` | `run_tool_loop_with_layout` 缺少 terminal_tools 检查 |
 | M-008 | `campaign_runtime.rs:103` | 大小写敏感名匹配 — LLM 输出不一致产生重复 |
-| M-009 | `plugin-bridge.js:78` | `postMessage` 使用 `'*'` 原点 |
+| M-009 | `plugin-bridge.js:78` | ✅ 已修复：插件侧 `postMessage` 使用注入的宿主 origin；宿主侧只处理当前 iframe source，响应优先回传请求 origin |
 | M-010 | `Composer.vue:3` | `mock.js` 进入生产 bundle |
 | M-011 | `AgentProfileManager.vue:97` | `Date.now()` 生成 Profile ID 可能碰撞 |
 | M-012 | `MetaPanel.vue:17` | ✅ 2026-07-07 已修：`App.vue` 传入最后一条带 provenance 的 assistant 节点，生成溯源入口不再是死代码 |

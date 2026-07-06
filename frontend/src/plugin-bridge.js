@@ -147,13 +147,35 @@ export function mapPluginEventRecordToPluginEvents(record) {
  * 生成注入到 iframe srcdoc 前部的 <script> 内容
  * 创建 window.storyforge 对象，所有 API 调用通过 postMessage 发送给宿主
  */
-export function generateBridgeScript(pluginId) {
+function defaultHostOrigin() {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin
+  }
+  return '*'
+}
+
+function normalizeTargetOrigin(origin) {
+  return typeof origin === 'string' && origin.trim() ? origin.trim() : '*'
+}
+
+function responseTargetOrigin(event) {
+  const origin = event?.origin
+  return origin && origin !== 'null' ? origin : '*'
+}
+
+function postResponse(event, payload) {
+  event.source?.postMessage(payload, responseTargetOrigin(event))
+}
+
+export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin()) {
+  const targetOrigin = normalizeTargetOrigin(hostOrigin)
   return `<script>
 (function() {
   let _reqId = 0;
   const _callbacks = {};
   const _eventTypes = ${JSON.stringify(ST_EVENT_TYPES)};
   const _eventListeners = {};
+  const _hostOrigin = ${JSON.stringify(targetOrigin)};
 
   function _listenerList(eventName) {
     if (!_eventListeners[eventName]) {
@@ -263,7 +285,7 @@ export function generateBridgeScript(pluginId) {
 
     ui: {
       mountToSlot: (slotName, html) => {
-        parent.postMessage({ type: '${MSG_MOUNT}', pluginId: ${JSON.stringify(pluginId)}, slot: slotName, html: html }, '*');
+        parent.postMessage({ type: '${MSG_MOUNT}', pluginId: ${JSON.stringify(pluginId)}, slot: slotName, html: html }, _hostOrigin);
       },
     },
 
@@ -303,7 +325,7 @@ export function generateBridgeScript(pluginId) {
         id: id,
         method: method,
         params: params,
-      }, '*');
+      }, _hostOrigin);
     });
   }
 
@@ -327,7 +349,7 @@ export function generateBridgeScript(pluginId) {
   });
 
   // 通知宿主 iframe 已加载
-  parent.postMessage({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} }, '*');
+  parent.postMessage({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} }, _hostOrigin);
 })();
 <\/script>`
 }
@@ -340,52 +362,55 @@ export function generateBridgeScript(pluginId) {
  * @param {Function} invoke - Tauri invoke 函数
  * @returns {Function} message handler
  */
-export function createHostHandler(plugin, invoke) {
+export function createHostHandler(plugin, invoke, options = {}) {
+  const isTrustedSource = options.isTrustedSource || (() => true)
   // 插件本地 storage（宿主侧维护，避免 iframe localStorage 被清除）
   const pluginStorage = {}
 
   return async function handleMessage(event) {
+    if (!isTrustedSource(event)) return
+
     const data = event.data
     if (!data || data.type !== MSG_REQUEST || data.pluginId !== plugin.id) return
 
     const method = API_METHODS[data.method]
     if (!method) {
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         error: `未知方法: ${data.method}`,
-      }, '*')
+      })
       return
     }
 
     // storage 不走后端
     if (data.method === 'storage.get') {
       const key = data.params?.key
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         result: pluginStorage[key] ?? null,
-      }, '*')
+      })
       return
     }
     if (data.method === 'storage.set') {
       const { key, value } = data.params || {}
       pluginStorage[key] = value
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         result: true,
-      }, '*')
+      })
       return
     }
 
     // 权限校验
     if (method.permission && !plugin.permissions?.includes(method.permission)) {
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         error: `权限不足: 需要 ${method.permission}`,
-      }, '*')
+      })
       return
     }
 
@@ -393,17 +418,17 @@ export function createHostHandler(plugin, invoke) {
     try {
       const params = method.params ? method.params(data.params) : {}
       const result = await invoke(method.command, params)
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         result: result,
-      }, '*')
+      })
     } catch (err) {
-      event.source?.postMessage({
+      postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
         error: String(err),
-      }, '*')
+      })
     }
   }
 }

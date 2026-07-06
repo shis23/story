@@ -2,13 +2,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import {
+  createHostHandler,
   generateBridgeScript,
   mapPipelineEventToPluginEvents,
   mapPluginEventRecordToPluginEvents,
+  MSG_REQUEST,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
 
-function createBridgeSandbox(pluginId = 'plugin-a') {
+function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyforge.local') {
   const listeners = {}
   const postedMessages = []
   const storage = new Map()
@@ -25,20 +27,77 @@ function createBridgeSandbox(pluginId = 'plugin-a') {
   const sandbox = {
     window,
     parent: {
-      postMessage: (message) => postedMessages.push(message),
+      postMessage: (message, targetOrigin) => postedMessages.push({ message, targetOrigin }),
     },
     localStorage: window.localStorage,
     console,
   }
   sandbox.globalThis = sandbox
 
-  const script = generateBridgeScript(pluginId)
+  const script = generateBridgeScript(pluginId, hostOrigin)
     .replace(/^<script>\n?/, '')
     .replace(/\n?<\/script>$/, '')
   vm.runInNewContext(script, sandbox)
 
   return { window, listeners, postedMessages }
 }
+
+test('bridge posts plugin messages to the configured host origin', () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ready')
+  assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
+
+  window.storyforge.ui.mountToSlot('sidebar', '<b>hello</b>')
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ui:mount')
+  assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
+
+  window.storyforge.character.list()
+  assert.equal(postedMessages.at(-1).message.type, MSG_REQUEST)
+  assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
+})
+
+test('host handler ignores untrusted sources and replies to request origin', async () => {
+  const plugin = { id: 'plugin-a', permissions: ['ReadCharacters'] }
+  const trustedSource = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const otherSource = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  let invokeCount = 0
+  const handler = createHostHandler(
+    plugin,
+    async () => {
+      invokeCount += 1
+      return ['Seraphina']
+    },
+    { isTrustedSource: (event) => event.source === trustedSource },
+  )
+
+  const request = {
+    type: MSG_REQUEST,
+    pluginId: 'plugin-a',
+    id: 'req-1',
+    method: 'character.list',
+    params: {},
+  }
+  await handler({ data: request, source: otherSource, origin: 'https://evil.example' })
+  assert.equal(invokeCount, 0)
+  assert.equal(otherSource.posted.length, 0)
+
+  await handler({ data: request, source: trustedSource, origin: 'https://plugin.example' })
+  assert.equal(invokeCount, 1)
+  assert.equal(trustedSource.posted.length, 1)
+  assert.equal(trustedSource.posted[0].targetOrigin, 'https://plugin.example')
+  assert.deepEqual(trustedSource.posted[0].message.result, ['Seraphina'])
+})
 
 test('maps pipeline events to native plugin event names', () => {
   const rawEvent = { event_type: 'director_started', data: {} }
