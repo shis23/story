@@ -68,17 +68,19 @@
 - **修复**: 将 effective_runtime 写入子 Agent 的 ToolContext。
 - **置信度**: R2 双盲 ✅✅
 
-### H-006: BaseOverlay ESC 监听器泄漏
+### H-006: ✅ BaseOverlay ESC 监听器泄漏已修复
 
 - **文件**: `frontend/src/components/base/BaseOverlay.vue:82-92`
 - **问题**: 每次打开 overlay 添加 keydown 监听器，非 Escape 方式关闭时监听器永远不被移除。N 次开关后按一次 Escape 触发 N 次 close()。
 - **修复**: 在 modelValue 变为 false 时也移除监听器。
+- **当前状态（2026-07-07）**: 已抽出 `documentKeydownController` 统一管理 document keydown listener；`BaseOverlay` 使用 `immediate` watcher 覆盖初始打开态，并在关闭/卸载时释放监听器。新增 `frontend/tests/base-keydown.test.mjs` 覆盖重复 enable 不累积、disable/dispose 移除、非 Escape 不触发。
 - **置信度**: R4 双盲 ✅✅
 
-### H-007: BaseDropdown ESC 监听器同样的泄漏
+### H-007: ✅ BaseDropdown ESC 监听器同样的泄漏已修复
 
 - **文件**: `frontend/src/components/base/BaseDropdown.vue:30-39`
 - **修复**: 同 H-006。
+- **当前状态（2026-07-07）**: `BaseDropdown` 复用 `documentKeydownController`，打开态初始挂载也会注册 ESC，关闭/卸载都会清理。
 - **置信度**: R4 双盲 ✅✅
 
 ### H-008: AppSidebar navItems 非响应式
@@ -227,7 +229,7 @@
 
 ### Medium Refactor（1-4 小时/项）
 
-8. **H-006/H-007**: BaseOverlay/BaseDropdown ESC 监听器泄漏修复
+8. **H-006/H-007**: ✅ BaseOverlay/BaseDropdown ESC 监听器生命周期已统一并补测试（2026-07-07）
 9. **H-001**: Store persist 返回 Result
 10. **M-001**: tool-call 参数解析错误反馈给 LLM
 11. **M-005**: ✅ `postprocess_variable_keys()` 已合并实际 runtime schema/value keys（2026-07-07）

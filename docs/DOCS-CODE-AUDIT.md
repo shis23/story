@@ -77,6 +77,7 @@
 - `crates/tauri-app/src/lib.rs::configure_embedder_async` **已 offload**：`configure_embedder` 改为 async Tauri command，`embed.json` 与 SecretRef 持久化通过可注入 secret store 的 blocking helper 执行，成功后才更新 `AppState.embed_config`；`test_configure_embedder_async_persists_secret_ref_and_updates_state` 覆盖磁盘 SecretRef、密钥恢复和内存配置更新。
 - `crates/tauri-app/src/lib.rs::archivable_messages_async` **已 offload**：手动 `archive_conversation` 与自动归档检查共用该 helper，在 `spawn_blocking` 中读取 `ConversationStore` 并过滤 Discarded 变体；`test_archivable_messages_async_filters_discarded_variants` 覆盖归档消息快照不会包含已丢弃变体。
 - `crates/tauri-app/src/lib.rs::postprocess_variable_keys` **已补实际变量 schema/value key 收集**：PostProcessor 变量提示不再只喂默认角色 key；写作/重 roll 共用 runtime 快照里的默认全局变量、当前 Campaign 变量、角色定义 `variable_schema` 与 instance 现有变量，避免 MVU/initvar 和高玩自定义字段漏给后处理 Agent。
+- `frontend/src/components/base/documentKeydownController.js` **已统一 ESC 监听生命周期**：`BaseOverlay` / `BaseDropdown` 共用 document keydown controller，重复 enable 不累积 listener，关闭或卸载会释放；`BaseOverlay` 同时用 `immediate` watcher 覆盖初始打开态，并在卸载时释放 body overflow lock。`frontend/tests/base-keydown.test.mjs` 已纳入 `npm test`。
 - `request_ad_hoc_character` 工具**未实现**：当前用 unmatched character_id 自动触发，Director 的 character_brief 作为 persona 注入。
 - `frontend/src/components/CampaignPanel.vue` **临时 instance UI 已实现**：展示 `is_temporary` 标记，提供升格为常驻按钮（带确认对话框、loading 状态、detail 刷新），`promoteTemporaryInstance` 从 `tauri-api.js` 导入。
 

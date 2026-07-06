@@ -1,5 +1,6 @@
 <script setup>
 import { ref, watch, onUnmounted } from 'vue'
+import { createDocumentKeydownController } from './documentKeydownController.js'
 import { useClickOutside } from './useClickOutside.js'
 
 const props = defineProps({
@@ -26,28 +27,25 @@ function toggle() {
   open.value = !open.value
 }
 
-// ESC 关闭 — handler stored at component scope to avoid leaks
-let escHandler = null
-
-watch(open, (v) => {
-  if (escHandler) {
-    document.removeEventListener('keydown', escHandler, true)
-    escHandler = null
-  }
-  if (!v) return
-  escHandler = (e) => {
-    if (e.key === 'Escape') {
-      open.value = false
-    }
-  }
-  document.addEventListener('keydown', escHandler, true)
+// ESC 关闭 — shared controller keeps listener lifecycle leak-free
+const escController = createDocumentKeydownController({
+  onKey: () => { open.value = false },
 })
 
+watch(
+  open,
+  (isOpen) => {
+    if (isOpen) {
+      escController.enable()
+    } else {
+      escController.disable()
+    }
+  },
+  { immediate: true },
+)
+
 onUnmounted(() => {
-  if (escHandler) {
-    document.removeEventListener('keydown', escHandler, true)
-    escHandler = null
-  }
+  escController.dispose()
 })
 
 defineExpose({ close: () => { open.value = false } })

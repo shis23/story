@@ -1,5 +1,6 @@
 <script setup>
 import { ref, watch, computed, onUnmounted } from 'vue'
+import { createDocumentKeydownController } from './documentKeydownController.js'
 import { useClickOutside } from './useClickOutside.js'
 
 // Module-level counter for body overflow to avoid multi-instance conflict
@@ -81,45 +82,57 @@ useClickOutside(contentRef, () => {
   if (props.closeOnMask) close()
 }, { enabled: props.modelValue })
 
-// ESC 关闭 — handler stored at component scope to avoid leaks
-let escHandler = null
+// ESC 关闭 — shared controller keeps listener lifecycle leak-free
+const escController = createDocumentKeydownController({ onKey: close })
 
-watch(() => props.modelValue, (v) => {
-  // Always clean up previous listener first
-  if (escHandler) {
-    document.removeEventListener('keydown', escHandler, true)
-    escHandler = null
-  }
-  if (!v || !props.closeOnEsc) return
-  escHandler = (e) => {
-    if (e.key === 'Escape') {
-      close()
+watch(
+  () => [props.modelValue, props.closeOnEsc],
+  ([isOpen, closeOnEsc]) => {
+    if (isOpen && closeOnEsc) {
+      escController.enable()
+    } else {
+      escController.disable()
     }
+  },
+  { immediate: true },
+)
+
+let bodyLocked = false
+
+function lockBodyOverflow() {
+  if (bodyLocked || typeof document === 'undefined') return
+  overflowCount++
+  bodyLocked = true
+  document.body.style.overflow = 'hidden'
+}
+
+function unlockBodyOverflow() {
+  if (!bodyLocked || typeof document === 'undefined') return
+  overflowCount--
+  bodyLocked = false
+  if (overflowCount <= 0) {
+    overflowCount = 0
+    document.body.style.overflow = ''
   }
-  document.addEventListener('keydown', escHandler, true)
-})
+}
 
 onUnmounted(() => {
-  if (escHandler) {
-    document.removeEventListener('keydown', escHandler, true)
-    escHandler = null
-  }
+  escController.dispose()
+  unlockBodyOverflow()
 })
 
 // 弹层打开时锁 body 滚动，避免背景滚动穿透（multi-instance safe）
-watch(() => props.modelValue, (v) => {
-  if (typeof document === 'undefined') return
-  if (v) {
-    overflowCount++
-    document.body.style.overflow = 'hidden'
-  } else {
-    overflowCount--
-    if (overflowCount <= 0) {
-      overflowCount = 0
-      document.body.style.overflow = ''
+watch(
+  () => props.modelValue,
+  (isOpen) => {
+    if (isOpen) {
+      lockBodyOverflow()
+    } else {
+      unlockBodyOverflow()
     }
-  }
-})
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
