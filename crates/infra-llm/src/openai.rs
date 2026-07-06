@@ -50,7 +50,7 @@ fn build_messages(messages: &[ChatMessage]) -> serde_json::Value {
         .iter()
         .map(|m| {
             let mut obj = serde_json::json!({
-                "role": serde_json::to_value(&m.role).unwrap_or_default(),
+                "role": serde_json::to_value(&m.role).expect("chat role should serialize to JSON"),
                 "content": m.content,
             });
 

@@ -329,8 +329,12 @@ pub struct ExportOptions {
     pub redact_connection: bool,
 }
 
+fn log_entry_to_value(entry: &LogEntry) -> Result<serde_json::Value, String> {
+    serde_json::to_value(entry).map_err(|e| format!("日志条目序列化失败: {e}"))
+}
+
 /// 导出 bundle（返回 JSON，前端打包为 ZIP）
-pub fn export_bundle(store: &LogStore, opts: &ExportOptions) -> serde_json::Value {
+pub fn export_bundle(store: &LogStore, opts: &ExportOptions) -> Result<serde_json::Value, String> {
     let backend_logs = store.query(&LogFilter {
         kind: Some(LogKind::Backend),
         limit: Some(2000),
@@ -355,24 +359,26 @@ pub fn export_bundle(store: &LogStore, opts: &ExportOptions) -> serde_json::Valu
         .map(|entry| {
             if opts.redact_content {
                 if let Some(ref detail) = entry.llm_detail {
-                    let redacted = detail.redact();
-                    serde_json::json!({
+                    Ok({
+                        let redacted = detail.redact();
+                        serde_json::json!({
                         "id": entry.id,
                         "timestamp": entry.timestamp,
                         "level": entry.level,
                         "message": entry.message,
                         "llm_detail": redacted,
+                        })
                     })
                 } else {
-                    serde_json::to_value(entry).unwrap_or_default()
+                    log_entry_to_value(entry)
                 }
             } else {
-                serde_json::to_value(entry).unwrap_or_default()
+                log_entry_to_value(entry)
             }
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "exported_at": Utc::now().to_rfc3339(),
         "system_info": {
             "os": std::env::consts::OS,
@@ -387,7 +393,7 @@ pub fn export_bundle(store: &LogStore, opts: &ExportOptions) -> serde_json::Valu
             "llm": llm_logs.len(),
             "frontend": frontend_logs.len(),
         },
-    })
+    }))
 }
 
 // ─── tracing → LogStore 桥接 ───────────────────────────────────────────────
@@ -578,7 +584,7 @@ mod tests {
         store.push(make_entry(LogKind::Backend, LogLevel::Info, "backend msg"));
         store.push(make_entry(LogKind::LlmCall, LogLevel::Info, "llm call"));
 
-        let bundle = export_bundle(&store, &ExportOptions::default());
+        let bundle = export_bundle(&store, &ExportOptions::default()).unwrap();
         assert_eq!(bundle["counts"]["backend"], 1);
         assert_eq!(bundle["counts"]["llm"], 1);
 

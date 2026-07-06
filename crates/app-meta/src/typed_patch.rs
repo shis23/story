@@ -228,7 +228,8 @@ fn build_unresolved_knowledge_patch(
         knowledge_id: entry.id.clone(),
     }];
 
-    let before_val = serde_json::to_value(entry).unwrap_or(serde_json::Value::Null);
+    let before_val =
+        serde_json::to_value(entry).expect("knowledge entry should serialize for typed patch diff");
 
     let diff = vec![FieldDiff {
         path: format!("knowledge[{}]", entry.id),
@@ -690,12 +691,16 @@ fn build_diff_for_action(action: &TypedPatchAction, input: &PreviewInput) -> Vec
                 .tasks
                 .iter()
                 .find(|t| &t.id == task_id)
-                .map(|t| serde_json::to_value(&t.status).unwrap_or(serde_json::Value::Null))
+                .map(|t| {
+                    serde_json::to_value(&t.status)
+                        .expect("task status should serialize for typed patch diff")
+                })
                 .unwrap_or(serde_json::Value::Null);
             vec![FieldDiff {
                 path: format!("task[{task_id}].status"),
                 before,
-                after: serde_json::to_value(new_status).unwrap_or(serde_json::Value::Null),
+                after: serde_json::to_value(new_status)
+                    .expect("task status should serialize for typed patch diff"),
             }]
         }
         _ => vec![],

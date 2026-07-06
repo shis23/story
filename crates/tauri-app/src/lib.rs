@@ -101,6 +101,14 @@ fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     })
 }
 
+fn to_json_value<T: Serialize + ?Sized>(
+    value: &T,
+    label: &str,
+) -> Result<serde_json::Value, TauriCommandError> {
+    serde_json::to_value(value)
+        .map_err(|e| TauriCommandError::internal(format!("{label} 序列化失败: {e}")))
+}
+
 /// W10: 全局 MVU JS runtime（setup 时初始化，new_pipeline 时注入 PipelineOrchestrator）
 static MVU_RUNTIME: OnceLock<Arc<WebViewMvuRuntime>> = OnceLock::new();
 
@@ -3607,7 +3615,8 @@ fn log_export_bundle(
         redact_content,
         ..Default::default()
     };
-    let mut bundle = storyforge_app_logging::export_bundle(&state.log_store, &opts);
+    let mut bundle = storyforge_app_logging::export_bundle(&state.log_store, &opts)
+        .map_err(TauriCommandError::internal)?;
     if let Some(obj) = bundle.as_object_mut() {
         obj.insert(
             "diagnostic_context".into(),
@@ -4079,8 +4088,8 @@ fn meta_accept_patch(
             let mut entries_json: Vec<serde_json::Value> = world_info
                 .entries
                 .iter()
-                .map(|e| serde_json::to_value(e).unwrap_or_default())
-                .collect();
+                .map(|e| to_json_value(e, "world info entry"))
+                .collect::<Result<_, _>>()?;
 
             let mut patch_ctx = storyforge_app_meta::PatchContext {
                 world_info_entries: Some(&mut entries_json),
@@ -4093,15 +4102,14 @@ fn meta_accept_patch(
             // 反序列化回 WorldInfoEntry 并替换
             let new_entries: Vec<storyforge_domain::world_info::WorldInfoEntry> = entries_json
                 .into_iter()
-                .filter_map(|v| {
-                    serde_json::from_value(v.clone()).unwrap_or_else(|e| {
-                        tracing::warn!(
+                .map(|v| {
+                    serde_json::from_value(v.clone()).map_err(|e| {
+                        TauriCommandError::internal(format!(
                             "Patch entry failed to deserialize as WorldInfoEntry: {e}, value: {v}"
-                        );
-                        None
+                        ))
                     })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
 
             let mut new_book = (**world_info).clone();
             new_book.entries = new_entries;
@@ -4314,7 +4322,7 @@ async fn meta_chat(
 
     // 存回对话
     let conv_id = conv.id.clone();
-    let messages = serde_json::to_value(&conv.messages).unwrap_or(serde_json::Value::Null);
+    let messages = to_json_value(&conv.messages, "meta conversation messages")?;
     app.meta_conversations
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4334,26 +4342,29 @@ async fn meta_chat(
 fn meta_get_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, TauriCommandError> {
     let convs = state
         .meta_conversations
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     convs
         .get(&conversation_id)
-        .map(|conv| serde_json::to_value(conv).unwrap_or(serde_json::Value::Null))
+        .map(|conv| to_json_value(conv, "meta conversation"))
+        .transpose()
 }
 
 /// Tauri command: 列所有待采纳的 Meta Patch
 #[tauri::command]
-fn meta_list_pending_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+fn meta_list_pending_patches(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     state
         .meta_patches
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|p| !p.applied)
-        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+        .map(|p| to_json_value(p, "pending meta patch"))
         .collect()
 }
 
@@ -4404,10 +4415,10 @@ fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, Taur
 
     let issues = storyforge_app_meta::check_campaign_health(&snapshot);
 
-    Ok(issues
+    issues
         .into_iter()
-        .map(|i| serde_json::to_value(i).unwrap_or(serde_json::Value::Null))
-        .collect())
+        .map(|i| to_json_value(&i, "campaign health issue"))
+        .collect()
 }
 
 /// Tauri command: 解释某条消息的生成溯源（确定性，零 LLM）
@@ -4441,8 +4452,7 @@ fn meta_explain_generation(
 
     let explanation = storyforge_app_meta::explain_generation(provenance);
 
-    serde_json::to_value(&explanation)
-        .map_err(|e| TauriCommandError::internal(format!("序列化失败: {e}")))
+    to_json_value(&explanation, "generation explanation")
 }
 
 // ─── 类型化 Patch 命令（第三轮：campaign-runtime 修复闭环）───────────────────
@@ -4520,15 +4530,17 @@ fn meta_propose_campaign_repairs(
         typed.extend(patches.clone());
     }
 
-    Ok(patches
+    patches
         .into_iter()
-        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
-        .collect())
+        .map(|p| to_json_value(&p, "typed patch proposal"))
+        .collect()
 }
 
 /// 列出所有 Pending 状态的类型化 patch
 #[tauri::command]
-fn meta_list_typed_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+fn meta_list_typed_patches(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let typed = state
         .typed_patches
         .read()
@@ -4536,7 +4548,7 @@ fn meta_list_typed_patches(state: tauri::State<'_, Arc<AppState>>) -> Vec<serde_
     typed
         .iter()
         .filter(|p| p.status == storyforge_app_meta::TypedPatchStatus::Pending)
-        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+        .map(|p| to_json_value(p, "typed patch"))
         .collect()
 }
 
@@ -4582,16 +4594,19 @@ fn meta_preview_typed_patch(
 
     if storyforge_app_meta::is_patch_stale(patch, &input) {
         patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
+        let patch_json = to_json_value(&*patch, "typed patch preview")?;
         return Ok(serde_json::json!({
             "stale": true,
-            "patch": serde_json::to_value(&*patch).unwrap_or(serde_json::Value::Null),
+            "patch": patch_json,
         }));
     }
 
+    let patch_json = to_json_value(&*patch, "typed patch preview")?;
+    let diff_json = to_json_value(&patch.diff, "typed patch diff")?;
     Ok(serde_json::json!({
         "stale": false,
-        "patch": serde_json::to_value(&*patch).unwrap_or(serde_json::Value::Null),
-        "diff": serde_json::to_value(&patch.diff).unwrap_or(serde_json::Value::Null),
+        "patch": patch_json,
+        "diff": diff_json,
     }))
 }
 
@@ -4945,7 +4960,7 @@ async fn meta_analyze_mvu_card(
 
     // 启发式打分（纯 Rust，先跑，给 LLM 当判据）
     let complexity = storyforge_app_meta::score_card_complexity(&character);
-    let complexity_json = serde_json::to_value(&complexity).unwrap_or(serde_json::Value::Null);
+    let complexity_json = to_json_value(&complexity, "MVU complexity")?;
     tracing::info!(
         "卡「{}」MVU 启发式分类: {:?}",
         character.name,
@@ -6617,10 +6632,35 @@ fn collect_world_info_for_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::Error as _;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use storyforge_domain::character::Character;
     use storyforge_domain::preset::{ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING};
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("forced serialization failure"))
+        }
+    }
+
+    #[test]
+    fn test_to_json_value_returns_structured_error_on_serialization_failure() {
+        let err = to_json_value(&FailingSerialize, "failing dto").unwrap_err();
+
+        match err {
+            TauriCommandError::Internal { message } => {
+                assert!(message.contains("failing dto"));
+                assert!(message.contains("forced serialization failure"));
+            }
+            other => panic!("expected internal serialization error, got {other:?}"),
+        }
+    }
 
     #[derive(Default)]
     struct MemorySecretStore {

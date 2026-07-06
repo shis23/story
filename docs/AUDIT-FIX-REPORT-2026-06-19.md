@@ -78,7 +78,7 @@
 | ID | 问题 | 修复 | 测试 |
 |----|------|------|------|
 | **M-016** | `connection_store::get` 唯一裸 `.lock().unwrap()`，毒锁崩溃 | 改为 `.unwrap_or_else(\|p\| p.into_inner())` | ✅ 159 pass |
-| **M-023** | patch 执行静默丢弃反序列化失败条目 | 加 `tracing::warn!` 记录失败条目 | ✅ 同上 |
+| **M-023** | patch 执行静默丢弃反序列化失败条目 | 加 `tracing::warn!` 记录失败条目；2026-07-07 进一步改为结构化错误返回，不再丢条目 | ✅ 同上 |
 | **M-020** | `writeln!` 结果丢弃，日志写入错误无感知 | 改为 `if let Err(e)` 输出到 stderr | ✅ 同上 |
 | **M-025** | `app-meta` 死依赖 `infra-plugin-host` | 从 Cargo.toml 删除 | ✅ 同上 |
 
@@ -154,7 +154,7 @@
 | M-009 | postMessage 用 '*' origin | Tauri 内无跨域风险 |
 | M-012 | lastConversationNode 从未传入 | ✅ 2026-07-07 已完成：`App.vue` 传入最后一条带 provenance 的 assistant 节点 |
 | M-021 | LogStore 并发写入可能交错 | 小 JSONL 实际风险极低 |
-| M-022 | unwrap_or(Null) ~12 处 | 需逐一处理 |
+| M-022 | unwrap_or(Null) ~12 处 | ✅ 2026-07-07 已完成：用户可见 JSON 序列化失败改为结构化错误 |
 | M-024 | patch 无事务回滚 | ✅ 2026-07-07 已完成：`execute_patch` 工作副本事务执行，失败不回写 |
 
 ---

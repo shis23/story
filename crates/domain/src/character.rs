@@ -185,7 +185,8 @@ impl Character {
 
     /// 从 ST 卡 JSON 解析为领域模型
     pub fn from_st_card(card: StCharacterCard) -> Self {
-        let raw_json = serde_json::to_value(&card.data).unwrap_or_default();
+        let raw_json =
+            serde_json::to_value(&card.data).expect("ST character data should serialize to JSON");
         let spec_version = card.spec_version.unwrap_or_else(|| "2.0".into());
 
         // 提取可渲染资产
