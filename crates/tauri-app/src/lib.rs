@@ -3169,10 +3169,104 @@ fn log_export_bundle(
         redact_content,
         ..Default::default()
     };
-    Ok(storyforge_app_logging::export_bundle(
-        &state.log_store,
-        &opts,
-    ))
+    let mut bundle = storyforge_app_logging::export_bundle(&state.log_store, &opts);
+    if let Some(obj) = bundle.as_object_mut() {
+        obj.insert(
+            "diagnostic_context".into(),
+            diagnostic_context_for_data_dir(&state.data_dir),
+        );
+    }
+    Ok(bundle)
+}
+
+fn diagnostic_context_for_data_dir(data_dir: &Path) -> serde_json::Value {
+    const STORE_FILES: &[&str] = &[
+        "connections.json",
+        "embed.json",
+        "active_campaign.json",
+        "characters.json",
+        "cards.json",
+        "campaigns.json",
+        "instances.json",
+        "knowledge.json",
+        "tasks.json",
+        "round_summaries.json",
+        "mvu_translations.json",
+        "vectors.json",
+        "plugins.json",
+        "custom_modules.json",
+        "disabled_modules.json",
+        "profiles.json",
+        "active_profile.json",
+        "agent_profile_configs.json",
+        "active_agent_profile_config.json",
+        "presets.json",
+    ];
+
+    let log_dir = data_dir.join("logs");
+    let conversation_dir = data_dir.join("conversations");
+    let store_files: Vec<serde_json::Value> = STORE_FILES
+        .iter()
+        .map(|name| summarize_file(data_dir.join(name), name))
+        .collect();
+
+    serde_json::json!({
+        "schema_version": 1,
+        "app": {
+            "name": "StoryForge",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "platform": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "paths": {
+            "data_dir": data_dir.display().to_string(),
+            "log_dir": log_dir.display().to_string(),
+            "conversation_dir": conversation_dir.display().to_string(),
+        },
+        "directories": [
+            summarize_dir(&log_dir, "logs"),
+            summarize_dir(&conversation_dir, "conversations"),
+        ],
+        "store_files": store_files,
+    })
+}
+
+fn summarize_file(path: PathBuf, name: &str) -> serde_json::Value {
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => serde_json::json!({
+            "name": name,
+            "exists": true,
+            "bytes": metadata.len(),
+            "has_bytes": metadata.len() > 0,
+        }),
+        Ok(metadata) => serde_json::json!({
+            "name": name,
+            "exists": true,
+            "bytes": metadata.len(),
+            "has_bytes": metadata.len() > 0,
+            "kind": if metadata.is_dir() { "directory" } else { "other" },
+        }),
+        Err(_) => serde_json::json!({
+            "name": name,
+            "exists": false,
+            "bytes": 0,
+            "has_bytes": false,
+        }),
+    }
+}
+
+fn summarize_dir(path: &Path, name: &str) -> serde_json::Value {
+    let (exists, entries) = match std::fs::read_dir(path) {
+        Ok(read_dir) => (true, read_dir.filter_map(Result::ok).count()),
+        Err(_) => (path.exists(), 0),
+    };
+    serde_json::json!({
+        "name": name,
+        "exists": exists,
+        "entries": entries,
+    })
 }
 
 /// 前端日志上报（console.log/warn/error 转发到后端 LogStore）
@@ -6071,6 +6165,37 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("embed.json")).unwrap();
         assert!(!raw.contains("legacy-embed-secret"));
         assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_diagnostic_context_summarizes_stores_without_secret_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_diag_context_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        storyforge_infra_util::atomic_write_json_str(
+            &dir.join("connections.json"),
+            r#"{"items":[{"api_key":"sk-live-secret"}]}"#,
+        )
+        .unwrap();
+        storyforge_infra_util::atomic_write_json_str(
+            &dir.join("embed.json"),
+            r#"{"api_key":"embed-live-secret"}"#,
+        )
+        .unwrap();
+
+        let context = diagnostic_context_for_data_dir(&dir);
+        let json = serde_json::to_string(&context).unwrap();
+
+        assert!(json.contains("connections.json"));
+        assert!(json.contains("embed.json"));
+        assert!(json.contains("logs"));
+        assert!(!json.contains("sk-live-secret"));
+        assert!(!json.contains("embed-live-secret"));
+        assert_eq!(context["store_files"][0]["has_bytes"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

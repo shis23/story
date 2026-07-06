@@ -242,7 +242,7 @@
 | AND-2 | Android 系统选择器文件导入路径 | 未开始 | 无 Android 专属 import 改动 |
 | AND-3 | 本地数据目录 + 迁移/schema 版本 | 未开始 | 无 debug data-dir 命令、无 schema/version 字段 |
 | AND-4 | 长任务/流式/取消在移动端 | 未开始 | 无 Android 生命周期处理 |
-| AND-5 | 移动端排障/诊断导出 | 未开始 | `app-logging::export_bundle` 仅日志；无 Android share-sheet/诊断包 |
+| AND-5 | 移动端排障/诊断导出 | 部分完成 | `log_export_bundle` 已附带 `diagnostic_context`（app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要），并有不泄露 `connections.json` / `embed.json` API key 的单测；Android share/save sheet 真机链路未验 |
 | AND-6 | capability 权限收敛 | 未开始 | `capabilities/default.json` 仍粗（`core:default`/`fs:default`/`dialog:default`） |
 
 注：Android 代码确实存在（`crates/tauri-app/gen/android/`，含 `MainActivity.kt`、`build.gradle.kts`）。2026-07-06 已验证 arm64-v8a debug/release 构建链路，但 `MainActivity.kt` 仍基本是 Tauri 自动生成脚手架，仅调 `enableEdgeToEdge()`；文件导入、数据目录、长任务和诊断导出仍未做真机验收。

@@ -144,7 +144,7 @@
 
 验收：
 
-- 用户能导出完整排障 bundle。
+- 用户能导出完整排障 bundle；当前 `log_export_bundle` 已包含日志和诊断上下文摘要，Android 系统分享/保存链路仍需真机验证。
 - 升级/迁移失败不会破坏原始数据。
 - Android 和桌面端的数据目录策略写入文档。
 
@@ -242,7 +242,7 @@
    - 验证 debug/release 构建链路。
    - 确认签名策略。
    - 验证文件导入权限。
-   - 验证日志/排障 bundle 导出。
+   - 验证日志/排障 bundle 导出；当前桌面命令已包含诊断上下文摘要，Android 真机 save/share sheet 未验。
    - 验证 Android keyring backend 可写、可读、可迁移、可删除。
 3. 首次使用流程：
    - 导入角色卡。

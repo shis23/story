@@ -171,6 +171,12 @@ cargo tauri android build
 - 用户能从 Android 发出诊断包。
 - 包内不包含 LLM API key。
 
+当前记录（2026-07-06）：
+
+- `log_export_bundle` 已从纯日志扩展为日志 + `diagnostic_context`：包含 app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要。
+- 已补单测 `test_diagnostic_context_summarizes_stores_without_secret_values`，确认诊断上下文不会读取或导出 `connections.json` / `embed.json` 中的 API key。
+- 仍需真机验证：Android 系统 save/share sheet 是否能顺利导出该 JSON。
+
 ## 阶段 6：权限收敛
 
 目标：把 capability 从粗放权限收敛到最小可用权限。

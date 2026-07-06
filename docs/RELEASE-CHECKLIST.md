@@ -25,6 +25,7 @@
 - CampaignStore 压测：Git Bash 用 `SF_STORE_PRESSURE_WRITES=500 cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture`；PowerShell 用 `$env:SF_STORE_PRESSURE_WRITES='500'; cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture; Remove-Item Env:SF_STORE_PRESSURE_WRITES`。通过；本机 4 集合并发写入 500 次/集合，总耗时约 2.9s，p95 为 knowledge 6.6ms / tasks 7.4ms / summaries 6.8ms / mvu 8.5ms，max 约 28ms。
 - API key 安全存储相关测试：`cargo test -p storyforge-infra-util`、`cargo test -p storyforge --lib connection_store`、`cargo test -p storyforge --lib test_embed_config` 通过；覆盖新写入 SecretRef、旧明文迁移、运行时解析和删除清理。Windows Credential Manager 冒烟测试 `cargo test -p storyforge-infra-util system_keyring_write_read_delete_roundtrip -- --ignored --nocapture` 通过；`cargo check -p storyforge-infra-util --target aarch64-linux-android` 通过，Android 后端仍需真机写读删。
 - Android 构建链路：主流真机 ABI `aarch64/arm64-v8a` 已通过 `cargo tauri android build --debug --target aarch64 --ci --split-per-abi --apk`（`app-arm64-debug.apk`，约 237 MB）和 `cargo tauri android build --target aarch64 --ci --split-per-abi --apk`（`app-arm64-release-unsigned.apk`，约 39 MB）。此前 x86_64 emulator/universal debug/release 也已通过；armv7/i686 不作为当前发布主线。仍有 Tauri/Gradle/Kotlin deprecation warning、插件 consumer proguard warning 和 macOS `.app` bundle id warning，暂不阻塞本轮 Android 构建基线。
+- 排障 bundle 诊断上下文：`cargo test -p storyforge --lib test_diagnostic_context_summarizes_stores_without_secret_values` 通过；`log_export_bundle` 会附带 app/platform、data/log/conversation 路径、关键 store 文件存在性与大小摘要，且不会读取或导出 `connections.json` / `embed.json` 内的 API key。
 
 本轮质量修复：
 
@@ -99,7 +100,7 @@ Android 候选版本需验证：
 - private/封口知识不会通过 postprocess 的告知或广播写入被继续传播；失败/阻断应在日志中可见。
 - 传话链当前依赖文本匹配；发布说明不要把它描述成完整语义级追踪。
 - 数据迁移失败不覆盖旧目录。
-- 排障 bundle 包含足够日志，且不泄露 API key。
+- 排障 bundle 包含日志和诊断上下文摘要，且不泄露 API key；Android 系统分享/保存链路仍需真机验证。
 
 ## 7. 发布遗留风险
 
