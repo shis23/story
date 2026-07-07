@@ -58,6 +58,39 @@ const ST_EVENT_ALIASES = {
   error: ['GENERATION_STOPPED'],
 }
 
+const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
+
+function hostPluginStorageKey(pluginId, key) {
+  return `sf_host_plugin_storage_${pluginId}_${key}`
+}
+
+function readHostPluginStorage(pluginId, key) {
+  const storageKey = hostPluginStorageKey(pluginId, key)
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.localStorage) {
+      const raw = globalThis.localStorage.getItem(storageKey)
+      return raw === null ? null : JSON.parse(raw)
+    }
+  } catch {
+    // Fall back to process-local storage below.
+  }
+  return HOST_PLUGIN_STORAGE_FALLBACK.has(storageKey)
+    ? HOST_PLUGIN_STORAGE_FALLBACK.get(storageKey)
+    : null
+}
+
+function writeHostPluginStorage(pluginId, key, value) {
+  const storageKey = hostPluginStorageKey(pluginId, key)
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.localStorage) {
+      globalThis.localStorage.setItem(storageKey, JSON.stringify(value))
+    }
+  } catch {
+    // Keep the fallback map updated even when host localStorage is unavailable.
+  }
+  HOST_PLUGIN_STORAGE_FALLBACK.set(storageKey, value)
+}
+
 // ─── 方法 → 权限 + Tauri 命令映射 ──────────────────────────────────────────
 
 export const API_METHODS = {
@@ -272,11 +305,15 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   };
 
   function _postToHost(message) {
-    if (typeof parent === 'undefined' || !parent || typeof parent.postMessage !== 'function') {
+    if (!_canPostToHost()) {
       return false;
     }
     parent.postMessage(message, _hostOrigin);
     return true;
+  }
+
+  function _canPostToHost() {
+    return typeof parent !== 'undefined' && parent && typeof parent.postMessage === 'function';
   }
 
   function _listenerList(eventName) {
@@ -579,9 +616,28 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return 'sf_plugin_' + ${JSON.stringify(pluginId)} + '_variables_' + _stableJson(scope);
   }
 
+  function _safeLocalStorageGet(key) {
+    try {
+      if (typeof localStorage === 'undefined') return null;
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  function _safeLocalStorageSet(key, value) {
+    try {
+      if (typeof localStorage === 'undefined') return false;
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function _readSelectorVariables(selector) {
     try {
-      const parsed = JSON.parse(localStorage.getItem(_variableSelectorKey(selector)) || '{}');
+      const parsed = JSON.parse(_safeLocalStorageGet(_variableSelectorKey(selector)) || '{}');
       return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch {
       return {};
@@ -590,7 +646,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _writeSelectorVariables(selector, variables) {
     const next = variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {};
-    localStorage.setItem(_variableSelectorKey(selector), JSON.stringify(next));
+    _safeLocalStorageSet(_variableSelectorKey(selector), JSON.stringify(next));
     return next;
   }
 
@@ -669,6 +725,111 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return normalized;
   }
 
+  function _toMessageIndex(value) {
+    if (Number.isInteger(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed)) return parsed;
+    }
+    return null;
+  }
+
+  function _messageIndexFromPayload(payload) {
+    const source = payload && typeof payload === 'object' ? payload : {};
+    return _toMessageIndex(
+      source.message_id
+      ?? source.message_index
+      ?? source.messageIndex
+      ?? source.message?.message_id
+      ?? source.message?.message_index
+      ?? source.message?.messageIndex
+    );
+  }
+
+  function _hostMessageIdFromPayload(payload) {
+    const source = payload && typeof payload === 'object' ? payload : {};
+    const value = source.messageId ?? source.message_id ?? source.id ?? source.message?.id ?? source.message?.message_id;
+    return value === undefined || value === null ? null : String(value);
+  }
+
+  function _findChatMessageIndex(payload) {
+    const numericIndex = _messageIndexFromPayload(payload);
+    if (numericIndex !== null) return numericIndex;
+    const hostId = _hostMessageIdFromPayload(payload);
+    if (!hostId) return null;
+    const found = _chat.findIndex(function(message) {
+      if (!message || typeof message !== 'object') return false;
+      return String(message.host_message_id ?? message.id ?? '') === hostId;
+    });
+    return found >= 0 ? found : null;
+  }
+
+  function _roleName(role) {
+    return role === 'user' ? 'User' : 'Assistant';
+  }
+
+  function _messageFromEventPayload(payload, fallbackIndex) {
+    const source = payload && typeof payload === 'object' ? payload : {};
+    const nested = source.message && typeof source.message === 'object' ? source.message : {};
+    const message = Object.assign({}, nested, source);
+    delete message.message;
+    const index = fallbackIndex;
+    const role = message.role || (message.is_user ? 'user' : 'assistant');
+    const text = message.mes ?? message.content ?? message.displayContent ?? message.display_content ?? message.text ?? message.message ?? '';
+    message.message_id = index;
+    message.id = message.id ?? index;
+    message.role = role;
+    message.name = message.name || _roleName(role);
+    message.is_user = message.is_user ?? role === 'user';
+    message.mes = text;
+    message.message = text;
+    if (source.messageId !== undefined) message.host_message_id = source.messageId;
+    if (source.variantId !== undefined) message.variant_id = source.variantId;
+    return message;
+  }
+
+  function _reindexChatFrom(start) {
+    for (let i = Math.max(0, start || 0); i < _chat.length; i++) {
+      if (_chat[i] && typeof _chat[i] === 'object') {
+        _chat[i].message_id = i;
+      }
+    }
+  }
+
+  function _upsertChatMessage(payload) {
+    const index = _findChatMessageIndex(payload) ?? _messageIndexFromPayload(payload) ?? _chat.length;
+    const current = _chat[index] && typeof _chat[index] === 'object' ? _chat[index] : {};
+    _chat[index] = Object.assign({}, current, _messageFromEventPayload(payload, index));
+    return _chat[index];
+  }
+
+  function _deleteChatMessage(payload) {
+    const index = _findChatMessageIndex(payload);
+    if (index === null || index < 0 || index >= _chat.length) return false;
+    _chat.splice(index);
+    return true;
+  }
+
+  function _syncChatFromHostEvent(eventName, payload) {
+    if (eventName === _eventTypes.MESSAGE_SENT || eventName === _eventTypes.MESSAGE_RECEIVED) {
+      _upsertChatMessage(payload);
+      return;
+    }
+    if (eventName === _eventTypes.MESSAGE_UPDATED || eventName === _eventTypes.MESSAGE_SWIPED) {
+      const index = _findChatMessageIndex(payload);
+      if (index === null) {
+        _upsertChatMessage(payload);
+        return;
+      }
+      const current = _chat[index] && typeof _chat[index] === 'object' ? _chat[index] : {};
+      _chat[index] = Object.assign({}, current, _messageFromEventPayload(payload, index));
+      return;
+    }
+    if (eventName === _eventTypes.MESSAGE_DELETED) {
+      _deleteChatMessage(payload);
+    }
+  }
+
   function _getLastMessageId() {
     return _chat.length - 1;
   }
@@ -734,6 +895,82 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _unregisterMacro(name) {
     delete _macros[name];
+  }
+
+  function _extensionSettingsKey() {
+    return 'sf_plugin_' + ${JSON.stringify(pluginId)} + '_extension_settings';
+  }
+
+  function _readExtensionSettings() {
+    try {
+      const parsed = JSON.parse(_safeLocalStorageGet(_extensionSettingsKey()) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function _writeExtensionSettings() {
+    return _safeLocalStorageSet(_extensionSettingsKey(), JSON.stringify(window.extension_settings || {}));
+  }
+
+  function _saveSettingsDebounced() {
+    _writeExtensionSettings();
+    if (_canPostToHost()) {
+      _call('storage.set', { key: 'extension_settings', value: window.extension_settings || {} })
+        .catch(function(err) { console.error('[StoryForge plugin] saveSettingsDebounced failed', err); });
+    }
+    _emit(_eventTypes.SETTINGS_UPDATED, { extension_settings: window.extension_settings });
+    return true;
+  }
+
+  function _loadExtensionSettingsFromHost() {
+    if (!_canPostToHost()) {
+      _emit(_eventTypes.EXTENSION_SETTINGS_LOADED, { extension_settings: window.extension_settings });
+      return;
+    }
+    _call('storage.get', { key: 'extension_settings' })
+      .then(function(saved) {
+        if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+          Object.assign(window.extension_settings, saved);
+          window.extension_settings.storyforge = window.extension_settings.storyforge || {};
+          window.extension_settings.storyforge.statusBar = window.extension_settings.storyforge.statusBar || {};
+          window.extension_settings.storyforge.status_bar = window.extension_settings.storyforge.statusBar;
+          _writeExtensionSettings();
+        }
+        return _emit(_eventTypes.EXTENSION_SETTINGS_LOADED, { extension_settings: window.extension_settings });
+      })
+      .catch(function() {
+        _emit(_eventTypes.EXTENSION_SETTINGS_LOADED, { extension_settings: window.extension_settings });
+      });
+  }
+
+  function _storageKey(key) {
+    return 'sf_plugin_' + ${JSON.stringify(pluginId)} + '_' + key;
+  }
+
+  function _storageGet(key) {
+    const raw = _safeLocalStorageGet(_storageKey(key));
+    if (raw !== null) {
+      try { return JSON.parse(raw); }
+      catch { return null; }
+    }
+    if (!_canPostToHost()) return null;
+    _call('storage.get', { key: key }).then(function(value) {
+      if (value !== null && value !== undefined) {
+        _safeLocalStorageSet(_storageKey(key), JSON.stringify(value));
+      }
+      return value ?? null;
+    }).catch(function() { return null; });
+    return null;
+  }
+
+  function _storageSet(key, value) {
+    const cached = _safeLocalStorageSet(_storageKey(key), JSON.stringify(value));
+    if (!_canPostToHost()) return cached;
+    const pending = _call('storage.set', { key: key, value: value })
+      .catch(function(err) { console.error('[StoryForge plugin] storage.set failed', err); });
+    return cached ? true : pending;
   }
 
   function _getContext() {
@@ -886,13 +1123,8 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     },
 
     storage: {
-      get: (key) => {
-        try { return JSON.parse(localStorage.getItem('sf_plugin_' + ${JSON.stringify(pluginId)} + '_' + key)); }
-        catch { return null; }
-      },
-      set: (key, value) => {
-        localStorage.setItem('sf_plugin_' + ${JSON.stringify(pluginId)} + '_' + key, JSON.stringify(value));
-      },
+      get: _storageGet,
+      set: _storageSet,
     },
 
     llm: {
@@ -929,7 +1161,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     },
   };
 
-  window.extension_settings = window.extension_settings || {};
+  window.extension_settings = window.extension_settings || _readExtensionSettings();
   window.extension_settings.storyforge = window.extension_settings.storyforge || {};
   window.extension_settings.storyforge.statusBar = window.extension_settings.storyforge.statusBar || {};
   window.extension_settings.storyforge.status_bar = window.extension_settings.storyforge.statusBar;
@@ -1002,7 +1234,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.getContext = window.getContext || window.TavernHelper.getContext;
   window.registerMacro = window.registerMacro || window.TavernHelper.registerMacro;
   window.unregisterMacro = window.unregisterMacro || window.TavernHelper.unregisterMacro;
-  window.saveSettingsDebounced = window.saveSettingsDebounced || function() {};
+  window.saveSettingsDebounced = window.saveSettingsDebounced || _saveSettingsDebounced;
   window.toastr = window.toastr || (function() {
     const calls = [];
     function record(level) {
@@ -1064,6 +1296,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     }
     // 事件分发
     if (e.data && e.data.type === '${MSG_EVENT}') {
+      _syncChatFromHostEvent(e.data.event, e.data.data);
       _dispatch(e.data.event, e.data.data);
     }
     if (e.data && e.data.type === '${MSG_HOOK_REQUEST}' && e.data.pluginId === ${JSON.stringify(pluginId)}) {
@@ -1091,7 +1324,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     }
   });
 
-  // 通知宿主 iframe 已加载
+  _loadExtensionSettingsFromHost();
   _postToHost({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} });
 })();
 <\/script>`
@@ -1108,7 +1341,6 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 export function createHostHandler(plugin, invoke, options = {}) {
   const isTrustedSource = options.isTrustedSource || (() => true)
   // 插件本地 storage（宿主侧维护，避免 iframe localStorage 被清除）
-  const pluginStorage = {}
 
   return async function handleMessage(event) {
     if (!isTrustedSource(event)) return
@@ -1132,13 +1364,13 @@ export function createHostHandler(plugin, invoke, options = {}) {
       postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
-        result: pluginStorage[key] ?? null,
+        result: readHostPluginStorage(plugin.id, key),
       })
       return
     }
     if (data.method === 'storage.set') {
       const { key, value } = data.params || {}
-      pluginStorage[key] = value
+      writeHostPluginStorage(plugin.id, key, value)
       postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,

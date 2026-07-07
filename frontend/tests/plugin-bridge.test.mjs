@@ -9,25 +9,32 @@ import {
   canReadMemory,
   mapPipelineEventToPluginEvents,
   mapPluginEventRecordToPluginEvents,
+  MSG_EVENT,
   MSG_HOOK_REQUEST,
   MSG_HOOK_RESPONSE,
   MSG_REQUEST,
+  MSG_RESPONSE,
   PROMPT_HOOK_PERMISSION,
   READ_MEMORY_PERMISSION,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
 
-function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyforge.local') {
+function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyforge.local', storage = new Map(), options = {}) {
   const listeners = {}
   const postedMessages = []
-  const storage = new Map()
   const window = {
     addEventListener: (name, callback) => {
       listeners[name] = callback
     },
     localStorage: {
-      getItem: (key) => storage.get(key) ?? null,
-      setItem: (key, value) => storage.set(key, String(value)),
+      getItem: (key) => {
+        if (options.localStorageThrows) throw new Error('SecurityError')
+        return storage.get(key) ?? null
+      },
+      setItem: (key, value) => {
+        if (options.localStorageThrows) throw new Error('SecurityError')
+        storage.set(key, String(value))
+      },
     },
     console,
   }
@@ -54,7 +61,7 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     })
   }
 
-  return { window, listeners, postedMessages, postHostMessage }
+  return { window, listeners, postedMessages, postHostMessage, storage }
 }
 
 function plain(value) {
@@ -225,6 +232,46 @@ test('host handler supports plugin storage set/get without backend invoke', asyn
   assert.equal(source.posted[0].message.result, true)
   assert.deepEqual(source.posted[1].message.result, { statusbar: true })
   assert.equal(source.posted[1].targetOrigin, 'https://plugin.example')
+})
+
+test('host handler keeps plugin storage across handler recreation', async () => {
+  const plugin = { id: 'plugin-persistent-storage', permissions: [] }
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+
+  const firstHandler = createHostHandler(plugin, async () => null)
+  await firstHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: plugin.id,
+      id: 'set-persistent',
+      method: 'storage.set',
+      params: { key: 'extension_settings', value: { my_plugin: { enabled: true } } },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  const secondHandler = createHostHandler(plugin, async () => null)
+  await secondHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: plugin.id,
+      id: 'get-persistent',
+      method: 'storage.get',
+      params: { key: 'extension_settings' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(source.posted.at(-1).message.result, {
+    my_plugin: { enabled: true },
+  })
 })
 
 test('host handler routes plugin APIs through plugin-scoped backend commands', async () => {
@@ -576,6 +623,89 @@ test('dispatches host events through storyforge.events and ST eventSource', () =
   assert.deepEqual(calls, [
     ['storyforge', 's1'],
     ['st', 's1'],
+  ])
+})
+
+test('syncs host message events into SillyTavern chat before plugin listeners run', async () => {
+  const { window, postHostMessage } = createBridgeSandbox()
+  const calls = []
+
+  window.eventSource.on('MESSAGE_RECEIVED', () => {
+    calls.push([
+      window.SillyTavern.chat.length,
+      window.SillyTavern.chat.at(-1).mes,
+    ])
+  })
+
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_SENT',
+    data: { messageId: 'node-user', role: 'user', content: 'hello' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'old reply', displayContent: '<p>old reply</p>' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_UPDATED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'new reply', reason: 'edit' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_SWIPED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'swiped reply', index: 1 },
+  })
+
+  assert.deepEqual(calls, [[2, 'old reply']])
+  assert.deepEqual(plain(window.getChatMessages()), [
+    {
+      messageId: 'node-user',
+      role: 'user',
+      content: 'hello',
+      host_message_id: 'node-user',
+      message_id: 0,
+      id: 0,
+      name: 'User',
+      is_user: true,
+      mes: 'hello',
+      message: 'hello',
+    },
+    {
+      messageId: 'node-ai',
+      role: 'assistant',
+      content: 'swiped reply',
+      displayContent: '<p>old reply</p>',
+      reason: 'edit',
+      index: 1,
+      host_message_id: 'node-ai',
+      message_id: 1,
+      id: 1,
+      name: 'Assistant',
+      is_user: false,
+      mes: 'swiped reply',
+      message: 'swiped reply',
+    },
+  ])
+
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'node-tail', role: 'assistant', content: 'tail reply' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_DELETED',
+    data: { messageId: 'node-ai' },
+  })
+
+  assert.deepEqual(plain(window.SillyTavern.chat.map((message) => ({
+    message_id: message.message_id,
+    host_message_id: message.host_message_id,
+    mes: message.mes,
+  }))), [
+    { message_id: 0, host_message_id: 'node-user', mes: 'hello' },
   ])
 })
 
@@ -1327,5 +1457,67 @@ test('normalizes slash placement and status bar mount fallbacks', () => {
   assert.equal(
     window.extension_settings.storyforge.status_bar,
     window.extension_settings.storyforge.statusBar,
+  )
+})
+
+test('persists extension_settings through host storage when iframe localStorage is unavailable', async () => {
+  const first = createBridgeSandbox('plugin-a', 'https://host.example', new Map(), { localStorageThrows: true })
+  const events = []
+
+  first.postHostMessage({
+    type: MSG_RESPONSE,
+    id: '1',
+    result: null,
+  })
+  await flushPromises()
+
+  first.window.eventSource.on('SETTINGS_UPDATED', (payload) => {
+    events.push(payload.extension_settings.my_plugin.enabled)
+  })
+  first.window.extension_settings.my_plugin = { enabled: true, mode: 'status-bar' }
+
+  assert.equal(first.window.saveSettingsDebounced(), true)
+  await flushPromises()
+  assert.deepEqual(events, [true])
+  const saveRequest = first.postedMessages.find((entry) => (
+    entry.message.type === MSG_REQUEST
+    && entry.message.method === 'storage.set'
+    && entry.message.params.key === 'extension_settings'
+  ))
+  assert.ok(saveRequest)
+  assert.deepEqual(plain(saveRequest.message.params.value.my_plugin), {
+    enabled: true,
+    mode: 'status-bar',
+  })
+
+  const second = createBridgeSandbox('plugin-a', 'https://host.example', new Map(), { localStorageThrows: true })
+  const loaded = []
+  second.window.eventSource.on('EXTENSION_SETTINGS_LOADED', (payload) => {
+    loaded.push(payload.extension_settings.my_plugin?.mode)
+  })
+  second.postHostMessage({
+    type: MSG_RESPONSE,
+    id: '1',
+    result: {
+      my_plugin: {
+        enabled: true,
+        mode: 'status-bar',
+      },
+    },
+  })
+  await flushPromises()
+
+  assert.deepEqual(plain(second.window.extension_settings.my_plugin), {
+    enabled: true,
+    mode: 'status-bar',
+  })
+  assert.deepEqual(loaded, ['status-bar'])
+  assert.equal(
+    second.window.SillyTavern.extension_settings,
+    second.window.extension_settings,
+  )
+  assert.equal(
+    second.window.SillyTavern.getContext().extension_settings,
+    second.window.extension_settings,
   )
 })
