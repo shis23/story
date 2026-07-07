@@ -2,6 +2,8 @@
 
 > 状态：2026-07-07 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用“理论通过”替代。
 
+> 自动化入口：`powershell -ExecutionPolicy Bypass -File scripts/verify-release.ps1`
+
 ## 0. 发布闸门
 
 任何候选版本必须满足：
