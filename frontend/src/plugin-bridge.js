@@ -345,6 +345,27 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     status_bar: 'statusbar',
     statusBar: 'statusbar',
   };
+  const _popupTypes = {
+    TEXT: 1,
+    CONFIRM: 2,
+    INPUT: 3,
+    DISPLAY: 4,
+    CROP: 5,
+  };
+  const _popupResults = {
+    AFFIRMATIVE: 1,
+    NEGATIVE: 0,
+    CANCELLED: null,
+    CUSTOM1: 1001,
+    CUSTOM2: 1002,
+    CUSTOM3: 1003,
+    CUSTOM4: 1004,
+    CUSTOM5: 1005,
+    CUSTOM6: 1006,
+    CUSTOM7: 1007,
+    CUSTOM8: 1008,
+    CUSTOM9: 1009,
+  };
 
   function _postToHost(message) {
     if (!_canPostToHost()) {
@@ -956,7 +977,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _callGenericPopup(html, type, defaultValue) {
     if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
-    if (String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
+    if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
     return Promise.resolve('');
   }
 
@@ -1151,18 +1172,8 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       chat: _chat,
       name1: 'User',
       name2: 'Assistant',
-      POPUP_TYPE: {
-        INPUT: 'input',
-        CONFIRM: 'confirm',
-        TEXT: 'text',
-        DISPLAY: 'display',
-      },
-      POPUP_RESULT: {
-        AFFIRMATIVE: 1,
-        NEGATIVE: 0,
-        CANCELLED: null,
-        CUSTOM1: 2,
-      },
+      POPUP_TYPE: Object.assign({}, _popupTypes),
+      POPUP_RESULT: Object.assign({}, _popupResults),
       characters: window.characters || [],
       groups: window.groups || [],
       chat_metadata: window.chat_metadata || {},
@@ -1299,12 +1310,8 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.SillyTavern.event_types = window.SillyTavern.event_types || _eventTypes;
   window.SillyTavern.eventTypes = window.SillyTavern.eventTypes || _eventTypes;
   window.SillyTavern.tavern_events = window.SillyTavern.tavern_events || _eventTypes;
-  window.SillyTavern.POPUP_RESULT = window.SillyTavern.POPUP_RESULT || {
-    AFFIRMATIVE: 1,
-    NEGATIVE: 0,
-    CANCELLED: null,
-    CUSTOM1: 2,
-  };
+  window.SillyTavern.POPUP_TYPE = Object.assign(window.SillyTavern.POPUP_TYPE || {}, _popupTypes);
+  window.SillyTavern.POPUP_RESULT = Object.assign(window.SillyTavern.POPUP_RESULT || {}, _popupResults);
   window.SillyTavern.characters = window.SillyTavern.characters || window.characters;
   window.SillyTavern.groups = window.SillyTavern.groups || window.groups;
   window.SillyTavern.chat_metadata = window.SillyTavern.chat_metadata || window.chat_metadata;

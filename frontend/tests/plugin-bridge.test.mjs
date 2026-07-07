@@ -38,6 +38,9 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     },
     console,
   }
+  if (options.window && typeof options.window === 'object') {
+    Object.assign(window, options.window)
+  }
   const sandbox = {
     window,
     parent: {
@@ -1499,6 +1502,8 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(window.SillyTavern.POPUP_RESULT.AFFIRMATIVE, 1)
   assert.equal(window.SillyTavern.POPUP_RESULT.NEGATIVE, 0)
   assert.equal(window.SillyTavern.POPUP_RESULT.CANCELLED, null)
+  assert.equal(window.SillyTavern.POPUP_RESULT.CUSTOM1, 1001)
+  assert.equal(window.SillyTavern.POPUP_TYPE.CONFIRM, 2)
   assert.equal(window.SillyTavern.characters, window.characters)
   assert.equal(window.SillyTavern.groups, window.groups)
   assert.equal(window.SillyTavern.chat_metadata, window.chat_metadata)
@@ -1541,6 +1546,7 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(await window.SillyTavern.saveChat(), true)
   assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
+  assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', 2), null)
   assert.deepEqual(plain(window.SillyTavern.getRequestHeaders()), { 'Content-Type': 'application/json' })
 
   const macro = () => 'macro-value'
@@ -1559,6 +1565,29 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   window.toastr.clear()
   assert.equal(window.toastr._calls.length, 0)
   assert.equal(postedMessages.length, readyMessageCount)
+})
+
+test('backfills ST popup constants on preexisting partial SillyTavern globals', async () => {
+  const { window } = createBridgeSandbox('plugin-a', 'https://host.example', new Map(), {
+    window: {
+      SillyTavern: {
+        chat: [],
+        POPUP_TYPE: { INPUT: 3 },
+        POPUP_RESULT: {
+          AFFIRMATIVE: 1,
+          CUSTOM1: 2,
+        },
+      },
+    },
+  })
+
+  assert.equal(window.SillyTavern.POPUP_TYPE.TEXT, 1)
+  assert.equal(window.SillyTavern.POPUP_TYPE.CONFIRM, 2)
+  assert.equal(window.SillyTavern.POPUP_TYPE.INPUT, 3)
+  assert.equal(window.SillyTavern.POPUP_RESULT.CANCELLED, null)
+  assert.equal(window.SillyTavern.POPUP_RESULT.CUSTOM1, 1001)
+  assert.equal(window.SillyTavern.POPUP_RESULT.CUSTOM9, 1009)
+  assert.equal(await window.SillyTavern.callGenericPopup('confirm?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
 })
 
 test('chains TavernHelper eventEmitAndWait returned payloads in listener order', async () => {
