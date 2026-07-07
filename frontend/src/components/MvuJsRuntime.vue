@@ -39,6 +39,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { getTrustedMvuRuntimeMessage } from '../mvu-runtime-bridge.js'
 
 const iframeRef = ref(null)
 const iframeReady = ref(false)
@@ -280,8 +281,8 @@ function handleExecute(payload) {
 // ─── iframe postMessage 监听 ────────────────────────────────────────────
 
 function onWindowMessage(event) {
-  const d = event.data
-  if (!d || !d.type) return
+  const d = getTrustedMvuRuntimeMessage(event, iframeRef.value?.contentWindow)
+  if (!d) return
 
   if (d.type === 'mvu:ready') {
     iframeReady.value = true
