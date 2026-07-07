@@ -12,13 +12,15 @@ function loadPluginHostSlotHelpers() {
     .replaceAll('export const ', 'const ')
     .replaceAll('export function ', 'function ')
 
-  const sandbox = {}
+  const sandbox = { setTimeout, clearTimeout }
   vm.runInNewContext(`${moduleCode}
 Object.assign(globalThis, {
   applyPluginSlotMount,
   getPluginSlotEntries,
   normalizePluginHostSlot,
+  waitForPluginHostReady,
   PLUGIN_HOST_DEFAULT_SLOT,
+  PLUGIN_HOST_HOOK_READY_TIMEOUT_MS,
 })`, sandbox)
 
   return sandbox
@@ -28,7 +30,9 @@ const {
   applyPluginSlotMount,
   getPluginSlotEntries,
   normalizePluginHostSlot,
+  waitForPluginHostReady,
   PLUGIN_HOST_DEFAULT_SLOT,
+  PLUGIN_HOST_HOOK_READY_TIMEOUT_MS,
 } = loadPluginHostSlotHelpers()
 
 function plain(value) {
@@ -78,4 +82,56 @@ test('normalizes blank slots to default and renders non-empty entries only', () 
     { slot: PLUGIN_HOST_DEFAULT_SLOT, html: '<main>General</main>' },
     { slot: 'sidebar', html: '<aside>Notes</aside>' },
   ])
+})
+
+test('waits briefly for plugin hook host readiness before falling back', async () => {
+  let ready = false
+  let notifyReady = null
+  const promise = waitForPluginHostReady(
+    () => ready,
+    (resolve) => {
+      notifyReady = resolve
+      return () => {
+        notifyReady = null
+      }
+    },
+    PLUGIN_HOST_HOOK_READY_TIMEOUT_MS,
+  )
+
+  ready = true
+  notifyReady()
+
+  assert.equal(await promise, true)
+  assert.equal(notifyReady, null)
+})
+
+test('falls back when plugin hook host never becomes ready', async () => {
+  const result = await waitForPluginHostReady(
+    () => false,
+    () => () => {},
+    0,
+  )
+
+  assert.equal(result, false)
+})
+
+test('honors explicit cancellation while waiting for plugin hook host readiness', async () => {
+  let ready = false
+  let cancelWait = null
+  const promise = waitForPluginHostReady(
+    () => ready,
+    (resolve) => {
+      cancelWait = resolve
+      return () => {
+        cancelWait = null
+      }
+    },
+    PLUGIN_HOST_HOOK_READY_TIMEOUT_MS,
+  )
+
+  ready = true
+  cancelWait(false)
+
+  assert.equal(await promise, false)
+  assert.equal(cancelWait, null)
 })

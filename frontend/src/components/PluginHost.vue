@@ -21,6 +21,7 @@
 
 <script>
 export const PLUGIN_HOST_DEFAULT_SLOT = 'default'
+export const PLUGIN_HOST_HOOK_READY_TIMEOUT_MS = 1000
 
 export function normalizePluginHostSlot(slot) {
   const normalized = typeof slot === 'string' ? slot.trim() : ''
@@ -45,6 +46,26 @@ export function getPluginSlotEntries(slots) {
   return Object.entries(slots || {})
     .filter(([, html]) => typeof html === 'string' && html.length > 0)
     .map(([slot, html]) => ({ slot, html }))
+}
+
+export function waitForPluginHostReady(isReady, subscribe, timeoutMs = PLUGIN_HOST_HOOK_READY_TIMEOUT_MS) {
+  if (isReady()) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    let settled = false
+    let unsubscribe = () => {}
+
+    const finish = (ready) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      unsubscribe()
+      resolve(ready)
+    }
+
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    unsubscribe = subscribe((ready) => finish(typeof ready === 'boolean' ? ready : !!isReady()))
+  })
 }
 </script>
 
@@ -82,6 +103,7 @@ let handler = null
 let hookBridge = null
 let lastPluginEventId = 0
 const pendingPluginEvents = []
+const pendingReadyResolvers = []
 const MAX_PENDING_PLUGIN_EVENTS = 100
 const HOST_ORIGIN = window.location?.origin || '*'
 // Sandboxed srcdoc iframes have an opaque origin, so host-to-plugin delivery
@@ -108,7 +130,25 @@ const iframeStyle = computed(() => ({
 function onIframeLoad() {
   iframeReady.value = true
   flushPendingPluginEvents()
+  resolvePendingReadyWaiters(true)
   emit('ready', props.plugin.id)
+}
+
+function resolvePendingReadyWaiters(ready) {
+  while (pendingReadyResolvers.length > 0) {
+    const resolve = pendingReadyResolvers.shift()
+    resolve(ready)
+  }
+}
+
+function subscribeIframeReady(resolve) {
+  pendingReadyResolvers.push(resolve)
+  return () => {
+    const index = pendingReadyResolvers.indexOf(resolve)
+    if (index >= 0) {
+      pendingReadyResolvers.splice(index, 1)
+    }
+  }
 }
 
 function queuePluginEvent(pluginEvent) {
@@ -169,7 +209,15 @@ function isTrustedPluginSource(event) {
 }
 
 async function emitPluginEventAndWait(event, data = {}) {
-  if (!hookBridge || !iframeReady.value) return data
+  if (!hookBridge) return data
+
+  const ready = await waitForPluginHostReady(
+    () => iframeReady.value && !!iframeRef.value?.contentWindow,
+    subscribeIframeReady,
+  )
+  if (!ready) return data
+  if (!hookBridge) return data
+
   return await hookBridge.emitAndWait(event, data)
 }
 
@@ -216,6 +264,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('message', onWindowMessage)
+  resolvePendingReadyWaiters(false)
   hookBridge?.dispose()
   handler = null
   hookBridge = null
