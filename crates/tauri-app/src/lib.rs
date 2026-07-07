@@ -8439,8 +8439,7 @@ mod tests {
             redact_content: true,
             ..Default::default()
         };
-        let mut bundle =
-            storyforge_app_logging::export_bundle(&state.log_store, &opts).unwrap();
+        let mut bundle = storyforge_app_logging::export_bundle(&state.log_store, &opts).unwrap();
         bundle.as_object_mut().unwrap().insert(
             "diagnostic_context".into(),
             diagnostic_context_for_data_dir(&data_dir),
@@ -8458,7 +8457,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(bundle["counts"]["backend"], 1);
-        assert_eq!(bundle["backend_logs"][0]["message"], "diagnostic export marker");
+        assert_eq!(
+            bundle["backend_logs"][0]["message"],
+            "diagnostic export marker"
+        );
         assert_eq!(connection_summary["exists"], true);
         assert_eq!(connection_summary["has_bytes"], true);
         assert_eq!(embed_summary["exists"], true);
