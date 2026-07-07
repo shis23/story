@@ -10,7 +10,10 @@
 export const MSG_REQUEST = 'sf:api:request'
 export const MSG_RESPONSE = 'sf:api:response'
 export const MSG_EVENT = 'sf:api:event'
+export const MSG_HOOK_REQUEST = 'sf:hook:request'
+export const MSG_HOOK_RESPONSE = 'sf:hook:response'
 export const MSG_MOUNT = 'sf:ui:mount'
+export const DEFAULT_PLUGIN_HOOK_TIMEOUT_MS = 5000
 
 export const ST_EVENT_TYPES = Object.freeze({
   APP_READY: 'APP_READY',
@@ -618,8 +621,15 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     });
   }
 
+  function _isTrustedHostMessage(e) {
+    if (e.source !== parent) return false;
+    if (_hostOrigin !== '*' && e.origin && e.origin !== _hostOrigin) return false;
+    return true;
+  }
+
   // 监听宿主的响应
   window.addEventListener('message', function(e) {
+    if (!_isTrustedHostMessage(e)) return;
     if (e.data && e.data.type === '${MSG_RESPONSE}') {
       const cb = _callbacks[e.data.id];
       if (cb) {
@@ -634,6 +644,29 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     // 事件分发
     if (e.data && e.data.type === '${MSG_EVENT}') {
       _dispatch(e.data.event, e.data.data);
+    }
+    if (e.data && e.data.type === '${MSG_HOOK_REQUEST}' && e.data.pluginId === ${JSON.stringify(pluginId)}) {
+      const hookPayload = e.data.data;
+      Promise.resolve()
+        .then(function() {
+          return _emitAndWait(e.data.event, hookPayload);
+        })
+        .then(function() {
+          parent.postMessage({
+            type: '${MSG_HOOK_RESPONSE}',
+            pluginId: ${JSON.stringify(pluginId)},
+            id: e.data.id,
+            result: hookPayload,
+          }, _hostOrigin);
+        })
+        .catch(function(err) {
+          parent.postMessage({
+            type: '${MSG_HOOK_RESPONSE}',
+            pluginId: ${JSON.stringify(pluginId)},
+            id: e.data.id,
+            error: String(err && err.message ? err.message : err),
+          }, _hostOrigin);
+        });
     }
   });
 
@@ -719,5 +752,81 @@ export function createHostHandler(plugin, invoke, options = {}) {
         error: String(err),
       })
     }
+  }
+}
+
+export function createPluginHookBridge(plugin, options = {}) {
+  const pluginId = plugin?.id
+  const getTarget = typeof options.getTarget === 'function' ? options.getTarget : () => null
+  const isTrustedSource = options.isTrustedSource || (() => true)
+  const targetOrigin = normalizeTargetOrigin(options.targetOrigin)
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, options.timeoutMs)
+    : DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  const onError = typeof options.onError === 'function' ? options.onError : () => {}
+  let nextHookId = 0
+  const pending = new Map()
+
+  function settle(id, resolver) {
+    const entry = pending.get(id)
+    if (!entry) return false
+    pending.delete(id)
+    clearTimeout(entry.timer)
+    resolver(entry)
+    return true
+  }
+
+  function fallback(entry, reason) {
+    if (reason) onError(reason)
+    entry.resolve(entry.fallback)
+  }
+
+  function handleMessage(event) {
+    if (!isTrustedSource(event)) return false
+
+    const data = event.data
+    if (!data || data.type !== MSG_HOOK_RESPONSE || data.pluginId !== pluginId) return false
+
+    return settle(data.id, (entry) => {
+      if (data.error) {
+        fallback(entry, new Error(data.error))
+      } else {
+        entry.resolve(data.result)
+      }
+    })
+  }
+
+  function emitAndWait(eventName, payload = {}) {
+    const target = getTarget()
+    if (!pluginId || !target || typeof target.postMessage !== 'function') {
+      return Promise.resolve(payload)
+    }
+
+    const id = String(++nextHookId)
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        settle(id, (entry) => fallback(entry, new Error(`Plugin hook timed out: ${eventName}`)))
+      }, timeoutMs)
+      pending.set(id, { resolve, fallback: payload, timer })
+      target.postMessage({
+        type: MSG_HOOK_REQUEST,
+        pluginId,
+        id,
+        event: eventName,
+        data: payload,
+      }, targetOrigin)
+    })
+  }
+
+  function dispose() {
+    for (const [id] of pending) {
+      settle(id, (entry) => fallback(entry, null))
+    }
+  }
+
+  return {
+    emitAndWait,
+    handleMessage,
+    dispose,
   }
 }

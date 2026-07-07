@@ -116,7 +116,7 @@ Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embed
 
 需要明确降级或尚未承诺的范围：
 
-- 不承诺 ST 99 事件全集、全部 prompt hooks 或冷门事件全量兼容；后端已具备最终 LLM messages 的异步 hook 接缝，但前端插件触发、跨 iframe 回传和多插件合并仍在接线中。
+- 不承诺 ST 99 事件全集、全部 prompt hooks 或冷门事件全量兼容；后端已具备最终 LLM messages 的异步 hook 接缝，前端已为 enabled 插件提供常驻隐藏 `PluginHost` hook host，支持 host→iframe 可等待 hook 请求/响应，并会在写作前触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 改写写作入参；全量 ST 事件和最终 LLM messages 级合并仍在接线中。
 - Regex Slash placement 3 的最小 `/` 前缀 hook 已接入；插件桥已提供常用 Slash 命令注册/触发 fallback，并能解析基础 raw/named/unnamed 参数。
 - PluginHost 已支持 per-slot 斜杠/状态栏挂载；复杂 JS 状态栏仍需真实卡回归，JS 失败时应以降级提示和原生状态展示为准。
 - JSR/ST/TavernHelper API shim 只覆盖常用子集，依赖冷门 API、pipe 语义或完整 prompt hooks 的重 DOM 卡可能跳过 JS 更新。

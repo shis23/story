@@ -3,9 +3,12 @@ import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import {
   createHostHandler,
+  createPluginHookBridge,
   generateBridgeScript,
   mapPipelineEventToPluginEvents,
   mapPluginEventRecordToPluginEvents,
+  MSG_HOOK_REQUEST,
+  MSG_HOOK_RESPONSE,
   MSG_REQUEST,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
@@ -39,11 +42,23 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     .replace(/\n?<\/script>$/, '')
   vm.runInNewContext(script, sandbox)
 
-  return { window, listeners, postedMessages }
+  function postHostMessage(data) {
+    listeners.message({
+      data,
+      source: sandbox.parent,
+      origin: hostOrigin,
+    })
+  }
+
+  return { window, listeners, postedMessages, postHostMessage }
 }
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value))
+}
+
+function flushPromises() {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 test('bridge posts plugin messages to the configured host origin', () => {
@@ -249,18 +264,16 @@ test('injects SillyTavern event type aliases into plugin iframe', () => {
 })
 
 test('dispatches host events through storyforge.events and ST eventSource', () => {
-  const { window, listeners } = createBridgeSandbox()
+  const { window, postHostMessage } = createBridgeSandbox()
   const calls = []
 
   window.storyforge.events.on('GENERATION_STARTED', (payload) => calls.push(['storyforge', payload.session_id]))
   window.eventSource.on(window.event_types.GENERATION_STARTED, (payload) => calls.push(['st', payload.session_id]))
 
-  listeners.message({
-    data: {
-      type: 'sf:api:event',
-      event: 'GENERATION_STARTED',
-      data: { session_id: 's1' },
-    },
+  postHostMessage({
+    type: 'sf:api:event',
+    event: 'GENERATION_STARTED',
+    data: { session_id: 's1' },
   })
 
   assert.deepEqual(calls, [
@@ -338,6 +351,172 @@ test('supports ST emitAndWait with listener mutation', async () => {
   assert.equal(payload.prompt, 'base + first + second')
   assert.deepEqual(calls, ['first-start', 'first-end', 'second'])
   assert.equal(result, undefined)
+})
+
+test('responds to host hook requests after async ST listener mutation', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const payload = {
+    intent: 'base',
+    messages: [{ role: 'user', content: 'hello' }],
+  }
+
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', async (eventPayload) => {
+    await Promise.resolve()
+    eventPayload.messages.push({ role: 'system', content: 'hooked' })
+  })
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => {
+    eventPayload.intent += ' + plugin'
+  })
+
+  postHostMessage({
+    type: MSG_HOOK_REQUEST,
+    pluginId: 'plugin-a',
+    id: 'hook-1',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    data: payload,
+  })
+  await flushPromises()
+
+  const response = postedMessages.at(-1)
+  assert.equal(response.targetOrigin, 'https://host.example')
+  assert.equal(response.message.type, MSG_HOOK_RESPONSE)
+  assert.equal(response.message.pluginId, 'plugin-a')
+  assert.equal(response.message.id, 'hook-1')
+  assert.deepEqual(plain(response.message.result), {
+    intent: 'base + plugin',
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'system', content: 'hooked' },
+    ],
+  })
+})
+
+test('ignores hook requests that do not come from the host parent', async () => {
+  const { window, listeners, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => {
+    eventPayload.prompt = 'mutated'
+  })
+
+  listeners.message({
+    source: { postMessage() {} },
+    origin: 'https://host.example',
+    data: {
+      type: MSG_HOOK_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'hook-evil',
+      event: 'CHAT_COMPLETION_PROMPT_READY',
+      data: { prompt: 'base' },
+    },
+  })
+  await flushPromises()
+
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ready')
+})
+
+test('reports hook listener errors back to the host', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', () => {
+    throw new Error('hook failed')
+  })
+
+  postHostMessage({
+    type: MSG_HOOK_REQUEST,
+    pluginId: 'plugin-a',
+    id: 'hook-err',
+    event: 'GENERATE_BEFORE_COMBINE_PROMPTS',
+    data: { prompt: 'base' },
+  })
+  await flushPromises()
+
+  const response = postedMessages.at(-1).message
+  assert.equal(response.type, MSG_HOOK_RESPONSE)
+  assert.equal(response.id, 'hook-err')
+  assert.match(response.error, /hook failed/)
+})
+
+test('host hook bridge resolves only trusted matching hook responses', async () => {
+  const target = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const hookBridge = createPluginHookBridge(
+    { id: 'plugin-a' },
+    {
+      getTarget: () => target,
+      isTrustedSource: (event) => event.source === target,
+      targetOrigin: '*',
+      timeoutMs: 1000,
+    },
+  )
+
+  const payload = { prompt: 'base' }
+  const promise = hookBridge.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+  const request = target.posted.at(-1).message
+  assert.equal(target.posted.at(-1).targetOrigin, '*')
+  assert.equal(request.type, MSG_HOOK_REQUEST)
+  assert.equal(request.pluginId, 'plugin-a')
+
+  assert.equal(hookBridge.handleMessage({
+    source: { postMessage() {} },
+    data: {
+      type: MSG_HOOK_RESPONSE,
+      pluginId: 'plugin-a',
+      id: request.id,
+      result: { prompt: 'evil' },
+    },
+  }), false)
+
+  assert.equal(hookBridge.handleMessage({
+    source: target,
+    data: {
+      type: MSG_HOOK_RESPONSE,
+      pluginId: 'plugin-a',
+      id: request.id,
+      result: { prompt: 'trusted' },
+    },
+  }), true)
+
+  assert.deepEqual(await promise, { prompt: 'trusted' })
+})
+
+test('host hook bridge falls back to original payload on plugin hook errors', async () => {
+  const errors = []
+  const target = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const hookBridge = createPluginHookBridge(
+    { id: 'plugin-a' },
+    {
+      getTarget: () => target,
+      isTrustedSource: (event) => event.source === target,
+      timeoutMs: 1000,
+      onError: (error) => errors.push(error.message),
+    },
+  )
+
+  const payload = { prompt: 'base' }
+  const promise = hookBridge.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+  const request = target.posted.at(-1).message
+
+  hookBridge.handleMessage({
+    source: target,
+    data: {
+      type: MSG_HOOK_RESPONSE,
+      pluginId: 'plugin-a',
+      id: request.id,
+      error: 'hook failed',
+    },
+  })
+
+  assert.equal(await promise, payload)
+  assert.deepEqual(errors, ['hook failed'])
 })
 
 test('provides ST slash command registration and trigger fallbacks', () => {

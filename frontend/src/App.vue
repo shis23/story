@@ -6,6 +6,7 @@ import ChatMessage from './components/ChatMessage.vue'
 import Composer from './components/Composer.vue'
 import StreamingMessage from './components/StreamingMessage.vue'
 import DebugDrawer from './components/DebugDrawer.vue'
+import PluginHost from './components/PluginHost.vue'
 import CharacterList from './components/CharacterList.vue'
 import ConnectionConfig from './components/ConnectionConfig.vue'
 import CampaignPanel from './components/CampaignPanel.vue'
@@ -98,7 +99,9 @@ function onTogglePower() {
 }
 
 const sidebarPlugins = ref([])
+const hookPlugins = ref([])
 const showSidebarPlugins = ref(false)
+const hookPluginSlots = ref({})
 const pluginPipelineEvents = ref([])
 let pluginPipelineEventSeq = 0
 const MAX_PLUGIN_PIPELINE_EVENTS = 100
@@ -107,10 +110,46 @@ const MAX_PLUGIN_PIPELINE_EVENTS = 100
 async function loadSidebarPlugins() {
   try {
     const all = await listPlugins()
-    sidebarPlugins.value = (all || []).filter(p => p.enabled && p.ui_slots?.includes('SidebarPanel'))
+    const enabled = (all || []).filter(p => p.enabled)
+    const enabledIds = new Set(enabled.map(p => p.id))
+    hookPluginSlots.value = Object.fromEntries(
+      Object.entries(hookPluginSlots.value).filter(([pluginId]) => enabledIds.has(pluginId)),
+    )
+    hookPlugins.value = enabled
+    sidebarPlugins.value = enabled.filter(p => p.ui_slots?.includes('SidebarPanel'))
   } catch (e) {
     console.error('加载侧栏插件失败:', e)
     logAppendFrontend('error', `loadSidebarPlugins: ${e}`).catch(() => {})
+  }
+}
+
+const hookPluginHostRefs = new Map()
+
+function setHookPluginHostRef(pluginId, el) {
+  if (!pluginId) return
+  if (el) {
+    hookPluginHostRefs.set(pluginId, el)
+  } else {
+    hookPluginHostRefs.delete(pluginId)
+  }
+}
+
+function onHookPluginSlotMount(mount) {
+  const pluginId = mount?.pluginId
+  const slot = mount?.slot
+  if (!pluginId || !slot) return
+
+  const html = typeof mount.html === 'string' ? mount.html : ''
+  const pluginSlots = { ...(hookPluginSlots.value[pluginId] || {}) }
+  if (html) {
+    pluginSlots[slot] = html
+  } else {
+    delete pluginSlots[slot]
+  }
+
+  hookPluginSlots.value = {
+    ...hookPluginSlots.value,
+    [pluginId]: pluginSlots,
   }
 }
 
@@ -159,6 +198,41 @@ function messageEventPayload(messageId, extra = {}) {
     displayContent: variant?.display_content || variant?.content || '',
     ...extra,
   })
+}
+
+async function emitPluginEventAndWait(event, data = {}) {
+  let payload = data
+  for (const plugin of hookPlugins.value || []) {
+    const host = hookPluginHostRefs.get(plugin.id)
+    if (host?.emitPluginEventAndWait) {
+      payload = await host.emitPluginEventAndWait(event, payload)
+    }
+  }
+  return payload
+}
+
+async function runPromptHookEvents(intent) {
+  let payload = {
+    intent,
+    prompt: intent,
+    messages: messages.value.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: activeVariantForMessage(message)?.content || '',
+      displayContent: activeVariantForMessage(message)?.display_content || activeVariantForMessage(message)?.content || '',
+    })),
+    ...chatEventPayload(),
+  }
+
+  payload = await emitPluginEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload)
+  payload = await emitPluginEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload)
+
+  const hookedIntent = typeof payload?.intent === 'string'
+    ? payload.intent
+    : typeof payload?.prompt === 'string'
+      ? payload.prompt
+      : intent
+  return hookedIntent
 }
 
 function broadcastChatChanged(reason, extra = {}) {
@@ -626,10 +700,11 @@ async function startWriting(intent, skipLocalPush = false) {
     // Campaign 模式不传 characterId（后端从 active campaign 装配 runtime）；
     // legacy 模式传 activeChar.id 保持旧命令兼容
     const charIdForWriting = writingMode.value === 'campaign' ? null : activeChar.value?.id
+    const hookedIntent = await runPromptHookEvents(intent)
     const openingMessage = writingMode.value === 'legacy' && !currentConversationId.value
       ? selectedGreeting.value?.content || null
       : null
-    const result = await apiStartWriting(intent, charIdForWriting, (event) => {
+    const result = await apiStartWriting(hookedIntent, charIdForWriting, (event) => {
       handlePipelineEvent(event)
     }, currentConversationId.value, openingMessage)
 
@@ -1270,9 +1345,11 @@ function handlePipelineEvent(event) {
     <!-- ═══ 右调试抽屉（顶栏🛠触发，右侧滑出） ═══ -->
     <BaseOverlay :model-value="showDebugDrawer" size="md" position="right" :show-header="false" :body-scroll="false" @update:model-value="showDebugDrawer = $event" @close="showDebugDrawer = false">
       <DebugDrawer
+        ref="debugDrawerRef"
         mobile
         :sidebar-plugins="sidebarPlugins"
         :plugin-events="pluginPipelineEvents"
+        :plugin-slots="hookPluginSlots"
         @open-connection-config="showConnConfig = true"
         @close="showDebugDrawer = false"
       />
@@ -1324,5 +1401,17 @@ function handlePipelineEvent(event) {
 
     <!-- W8 MVU JS Runtime 容器（隐藏） -->
     <MvuJsRuntime />
+    <div class="hidden" aria-hidden="true">
+      <PluginHost
+        v-for="p in hookPlugins"
+        :key="`hook-${p.id}`"
+        :ref="(el) => setHookPluginHostRef(p.id, el)"
+        :plugin="p"
+        :plugin-events="pluginPipelineEvents"
+        compact
+        height="0px"
+        @slot-mount="onHookPluginSlotMount"
+      />
+    </div>
   </div>
 </template>

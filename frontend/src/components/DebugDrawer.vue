@@ -13,13 +13,14 @@ import { ref } from 'vue'
 import AgentConfigCard from './AgentConfigCard.vue'
 import AgentProfileManager from './AgentProfileManager.vue'
 import LogPanel from './LogPanel.vue'
-import PluginHost from './PluginHost.vue'
 
 const props = defineProps({
   /** 插件侧栏列表（来自 App.vue sidebarPlugins） */
   sidebarPlugins: { type: Array, default: () => [] },
   /** 写作流水线事件 feed，透传给插件 iframe */
   pluginEvents: { type: Array, default: () => [] },
+  /** App 常驻插件 host 转发出的 slot HTML */
+  pluginSlots: { type: Object, default: () => ({}) },
   mobile: { type: Boolean, default: false },
 })
 const emit = defineEmits(['open-connection-config', 'close'])
@@ -33,6 +34,12 @@ const tabs = [
   { key: 'log', label: '日志', icon: '📋' },
   { key: 'plugins', label: '插件', icon: '🧩' },
 ]
+
+function getForwardedPluginSlots(pluginId) {
+  return Object.entries(props.pluginSlots?.[pluginId] || {})
+    .filter(([, html]) => typeof html === 'string' && html.length > 0)
+    .map(([slot, html]) => ({ slot, html }))
+}
 
 // 暴露 AgentConfigCard ref，供父组件连接变更后刷新
 defineExpose({
@@ -88,16 +95,35 @@ defineExpose({
           无侧栏插件<br>
           <span class="text-[10px]">在「插件」管理中启用声明 SidebarPanel 的插件</span>
         </div>
-        <div v-else class="space-y-2">
-          <PluginHost
+        <div v-else class="space-y-3">
+          <section
             v-for="p in sidebarPlugins"
             :key="p.id"
-            :plugin="p"
-            :plugin-events="pluginEvents"
-            height="160px"
-          />
+            class="space-y-2"
+          >
+            <div
+              v-for="entry in getForwardedPluginSlots(p.id)"
+              :key="`${p.id}-${entry.slot}`"
+              v-html="entry.html"
+              class="plugin-slot-content"
+              :data-plugin-id="p.id"
+              :data-plugin-slot="entry.slot"
+            />
+            <div
+              v-if="getForwardedPluginSlots(p.id).length === 0"
+              class="text-center text-ink-faint text-xs py-4 border border-line rounded-lg bg-surface"
+            >
+              {{ p.manifest?.name || p.id }}
+            </div>
+          </section>
         </div>
       </div>
     </div>
   </aside>
 </template>
+
+<style scoped>
+.plugin-slot-content {
+  overflow: hidden;
+}
+</style>

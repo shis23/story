@@ -54,6 +54,7 @@ import DOMPurify from 'dompurify'
 import {
   generateBridgeScript,
   createHostHandler,
+  createPluginHookBridge,
   MSG_EVENT,
   MSG_MOUNT,
   mapPluginEventRecordToPluginEvents,
@@ -78,6 +79,7 @@ const slotHtmlBySlot = ref({})
 const slotEntries = computed(() => getPluginSlotEntries(slotHtmlBySlot.value))
 const iframeReady = ref(false)
 let handler = null
+let hookBridge = null
 let lastPluginEventId = 0
 const pendingPluginEvents = []
 const MAX_PENDING_PLUGIN_EVENTS = 100
@@ -166,6 +168,11 @@ function isTrustedPluginSource(event) {
   return !!iframeRef.value?.contentWindow && event.source === iframeRef.value.contentWindow
 }
 
+async function emitPluginEventAndWait(event, data = {}) {
+  if (!hookBridge || !iframeReady.value) return data
+  return await hookBridge.emitAndWait(event, data)
+}
+
 // 处理来自 iframe 的消息
 function onWindowMessage(event) {
   if (!isTrustedPluginSource(event)) return
@@ -176,11 +183,16 @@ function onWindowMessage(event) {
   if (data?.type === MSG_MOUNT && data.pluginId === props.plugin.id) {
     // 消毒插件 HTML，防止 XSS 注入宿主 DOM
     const html = DOMPurify.sanitize(data.html || '')
+    const slot = normalizePluginHostSlot(data.slot)
     slotHtmlBySlot.value = applyPluginSlotMount(slotHtmlBySlot.value, {
-      slot: data.slot,
+      slot,
       html,
     })
-    emit('slot-mount', { pluginId: data.pluginId, slot: data.slot, html: data.html })
+    emit('slot-mount', { pluginId: data.pluginId, slot, html })
+  }
+
+  if (hookBridge?.handleMessage(event)) {
+    return
   }
 
   // API 请求由 handler 处理
@@ -191,22 +203,45 @@ function onWindowMessage(event) {
 
 onMounted(() => {
   handler = createHostHandler(props.plugin, invoke, { isTrustedSource: isTrustedPluginSource })
+  hookBridge = createPluginHookBridge(props.plugin, {
+    getTarget: () => iframeRef.value?.contentWindow,
+    isTrustedSource: isTrustedPluginSource,
+    targetOrigin: PLUGIN_IFRAME_TARGET_ORIGIN,
+    onError: (error) => {
+      emit('error', { pluginId: props.plugin.id, error: String(error?.message || error) })
+    },
+  })
   window.addEventListener('message', onWindowMessage)
 })
 
 onUnmounted(() => {
   window.removeEventListener('message', onWindowMessage)
+  hookBridge?.dispose()
   handler = null
+  hookBridge = null
 })
 
 // 插件变化时重建 handler
 watch(() => props.plugin, (newPlugin) => {
   if (newPlugin) {
     handler = createHostHandler(newPlugin, invoke, { isTrustedSource: isTrustedPluginSource })
+    hookBridge?.dispose()
+    hookBridge = createPluginHookBridge(newPlugin, {
+      getTarget: () => iframeRef.value?.contentWindow,
+      isTrustedSource: isTrustedPluginSource,
+      targetOrigin: PLUGIN_IFRAME_TARGET_ORIGIN,
+      onError: (error) => {
+        emit('error', { pluginId: newPlugin.id, error: String(error?.message || error) })
+      },
+    })
   }
 })
 
 watch(() => props.pluginEvents, consumePluginEvents, { immediate: true })
+
+defineExpose({
+  emitPluginEventAndWait,
+})
 </script>
 
 <style scoped>
