@@ -1,6 +1,6 @@
 # 计划：可配置 Agent Profile 体系
 
-> 状态：阶段 1-5 已实现（backend 闭环 + 前端 UI + 校验/迁移），Profile JSON 导入导出未实现
+> 状态：阶段 1-5 已实现（backend 闭环 + 前端 UI + 校验/迁移），Profile JSON 导入导出已实现
 > 目标读者：可交给小模型按阶段执行
 > 关联：`docs/AGENT_INTERFACES.md`、`crates/domain/src/prompt_module.rs`、`crates/domain/src/agent.rs`、`crates/domain/src/agent_profile_config.rs`
 
@@ -298,7 +298,7 @@ cd frontend && npm run build
 - 内置默认始终可用、只读。
 - 不破坏现有 power 模式（PromptProfile 模块选择器 `AgentConfigCard` 不受影响）。
 
-**未实现（可选扩展）**：JSON 文件导入/导出（非本轮最低要求）。
+**已实现（可选扩展）**：JSON 文件导入/导出。
 
 ### 阶段 5：校验、版本迁移、文档 ✅
 
@@ -310,13 +310,14 @@ cd frontend && npm run build
 - `AgentProfileConfig::validate()` — 校验空名、`max_tool_rounds` 范围 `[1,100]`、`max_concurrent_subagents >= 1`。不校验 `tool_whitelist` 工具名（运行时已 warning+忽略）。
 - `AgentProfileConfig::migrate_to(target: u32) -> bool` — v1→v1 no-op；返回是否迁移；未知版本不报错保留数据。建立迁移入口和测试骨架。
 - `AgentProfileConfigStore::save()` 保存前调 `config.validate()`，失败返回 `Err(具体原因)`。
+- `AgentProfileConfigStore::export_json()` / `import_json()` — pretty JSON 导出；导入时校验、迁移、强制转为 `UserCreated`，并在 ID 冲突或内置默认 ID 时生成新的 `profile-*`，避免覆盖已有配置。
+- Tauri 命令与前端 `AgentProfileManager` 已接入 JSON 文件导入/导出。
 - `AgentProfileConfigStore::new()` 和 `get()` 加载时调 `migrate_to(1)`。
 - **不新增 `temperature` 字段**：当前 `AgentRunConfig` 无 `temperature`，运行时温度由连接配置控制，Agent Profile 层面无需覆盖。如未来需要按角色覆盖温度，在 v2 迁移中添加即可。
 - 不校验 `tool_whitelist` 工具名：运行时 `ToolRegistry::retain` 已处理未知工具名（warning+忽略），校验层重复做无意义且会破坏可移植性。
 
 **未实现**（可选扩展，非本轮要求）：
 
-- Profile JSON 导入/导出。
 - `AGENT_INTERFACES.md` / `DATA_MODEL.md` 补充说明（当前代码即文档，无需额外补充）。
 
 改动文件：

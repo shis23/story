@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use storyforge_domain::Id;
 use storyforge_domain::agent_profile_config::{
     AgentProfileConfig, AgentProfileConfigSummaryDto, BUILTIN_DEFAULT_AGENT_PROFILE_ID,
     default_agent_profile_config,
@@ -658,6 +659,40 @@ impl AgentProfileConfigStore {
         }
     }
 
+    /// 导出配置为 pretty JSON。
+    pub fn export_json(&self, id: &str) -> Result<String, String> {
+        let config = self.get(id).ok_or_else(|| format!("配置 {id} 不存在"))?;
+        serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("序列化 Agent Profile Config 失败: {e}"))
+    }
+
+    /// 从 JSON 导入配置。
+    ///
+    /// 导入永远生成用户配置：内置来源会转成 UserCreated；如果 ID 与现有配置冲突
+    /// 或试图覆盖内置默认，则生成新的 profile-* ID，避免导入文件意外覆盖现有配置。
+    pub fn import_json(&self, config_json: &str) -> Result<AgentProfileConfig, String> {
+        let mut config: AgentProfileConfig = serde_json::from_str(config_json)
+            .map_err(|e| format!("Agent Profile Config JSON 解析失败: {e}"))?;
+        config.sanitize();
+        config.migrate_to(1);
+        config.validate().map_err(|e| e.to_string())?;
+        config.source = ProfileSource::UserCreated;
+
+        let original_id = config.id.to_string();
+        let id_conflicts = {
+            let configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
+            original_id == BUILTIN_DEFAULT_AGENT_PROFILE_ID
+                || configs.iter().any(|c| c.id.to_string() == original_id)
+        };
+        if id_conflicts {
+            config.id = Id::from_str(format!("profile-{}", uuid::Uuid::new_v4()));
+        }
+
+        let saved = config.clone();
+        self.save(config)?;
+        Ok(saved)
+    }
+
     /// 确保内置默认配置存在（启动时调用）
     fn ensure_builtin_default(&self) {
         let mut configs = self.configs.lock().unwrap_or_else(|p| p.into_inner());
@@ -744,6 +779,113 @@ mod agent_profile_config_store_tests {
         let cfg = store.get("legacy-zero").unwrap();
         assert_eq!(cfg.max_concurrent_subagents, 1);
         assert_eq!(cfg.effective_max_concurrent_subagents(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_json_returns_pretty_config() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+        let mut cfg = storyforge_domain::agent_profile_config::default_agent_profile_config();
+        cfg.id = storyforge_domain::Id::from_str("custom-export");
+        cfg.name = "Export Me".into();
+        cfg.source = storyforge_domain::prompt_module::ProfileSource::UserCreated;
+        store.save(cfg).unwrap();
+
+        let json = store.export_json("custom-export").unwrap();
+        let exported: AgentProfileConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(json.contains('\n'));
+        assert_eq!(exported.id.as_str(), "custom-export");
+        assert_eq!(exported.name, "Export Me");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_json_saves_user_config_without_overwriting_existing_id() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+        let mut existing = storyforge_domain::agent_profile_config::default_agent_profile_config();
+        existing.id = storyforge_domain::Id::from_str("custom-existing");
+        existing.name = "Existing".into();
+        existing.source = storyforge_domain::prompt_module::ProfileSource::UserCreated;
+        store.save(existing).unwrap();
+
+        let imported_json = serde_json::json!({
+            "id": "custom-existing",
+            "name": "Imported",
+            "description": "from file",
+            "max_concurrent_subagents": 2,
+            "enable_postprocess": true,
+            "enable_summarizer": false,
+            "source": "BuiltIn",
+            "config_version": 1
+        });
+        let imported = store.import_json(&imported_json.to_string()).unwrap();
+
+        assert_ne!(imported.id.as_str(), "custom-existing");
+        assert!(imported.id.as_str().starts_with("profile-"));
+        assert_eq!(
+            imported.source,
+            storyforge_domain::prompt_module::ProfileSource::UserCreated
+        );
+        assert_eq!(store.get("custom-existing").unwrap().name, "Existing");
+        assert_eq!(store.get(imported.id.as_str()).unwrap().name, "Imported");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_json_reassigns_builtin_default_id() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+
+        let imported_json = serde_json::json!({
+            "id": BUILTIN_DEFAULT_AGENT_PROFILE_ID,
+            "name": "Imported Default",
+            "description": "should become user config",
+            "max_concurrent_subagents": 2,
+            "enable_postprocess": true,
+            "enable_summarizer": true,
+            "source": "BuiltIn",
+            "config_version": 1
+        });
+        let imported = store.import_json(&imported_json.to_string()).unwrap();
+
+        assert_ne!(imported.id.as_str(), BUILTIN_DEFAULT_AGENT_PROFILE_ID);
+        assert!(imported.id.as_str().starts_with("profile-"));
+        assert_eq!(
+            imported.source,
+            storyforge_domain::prompt_module::ProfileSource::UserCreated
+        );
+        assert_eq!(
+            store.get(BUILTIN_DEFAULT_AGENT_PROFILE_ID).unwrap().source,
+            storyforge_domain::prompt_module::ProfileSource::BuiltIn
+        );
+        assert_eq!(
+            store.get(imported.id.as_str()).unwrap().name,
+            "Imported Default"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_json_rejects_invalid_profile() {
+        let dir = temp_dir();
+        let store = AgentProfileConfigStore::new(&dir);
+        let invalid_json = serde_json::json!({
+            "id": "bad-import",
+            "name": " ",
+            "max_concurrent_subagents": 1
+        });
+
+        let err = store.import_json(&invalid_json.to_string()).unwrap_err();
+
+        assert!(err.contains("配置名称不能为空"));
+        assert!(store.get("bad-import").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

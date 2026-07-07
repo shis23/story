@@ -262,6 +262,22 @@ export async function saveAgentProfileConfig(configJson) {
   }
 }
 
+/** 导出 Agent Profile 配置为 JSON 字符串 */
+export async function exportAgentProfileConfig(id) {
+  if (isTauri()) {
+    return await invoke('export_agent_profile_config', { id })
+  }
+  return ''
+}
+
+/** 从 JSON 字符串导入 Agent Profile 配置 */
+export async function importAgentProfileConfig(configJson) {
+  if (isTauri()) {
+    return await invoke('import_agent_profile_config', { configJson })
+  }
+  return null
+}
+
 /** 删除 Agent Profile 配置（内置默认不可删除） */
 export async function deleteAgentProfileConfig(id) {
   if (isTauri()) {

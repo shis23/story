@@ -1614,6 +1614,28 @@ fn save_agent_profile_config(
 }
 
 #[tauri::command]
+fn export_agent_profile_config(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<String, TauriCommandError> {
+    state
+        .agent_profile_config_store
+        .export_json(&id)
+        .map_err(TauriCommandError::from)
+}
+
+#[tauri::command]
+fn import_agent_profile_config(
+    config_json: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<storyforge_domain::agent_profile_config::AgentProfileConfig, TauriCommandError> {
+    state
+        .agent_profile_config_store
+        .import_json(&config_json)
+        .map_err(TauriCommandError::from)
+}
+
+#[tauri::command]
 fn delete_agent_profile_config(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
@@ -6688,6 +6710,8 @@ pub fn run() {
             get_agent_profile_config,
             get_active_agent_profile_config,
             save_agent_profile_config,
+            export_agent_profile_config,
+            import_agent_profile_config,
             delete_agent_profile_config,
             set_active_agent_profile_config,
             get_version,

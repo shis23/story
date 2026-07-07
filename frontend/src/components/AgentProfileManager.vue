@@ -5,6 +5,8 @@ import {
   getAgentProfileConfig,
   getActiveAgentProfileConfig,
   saveAgentProfileConfig,
+  exportAgentProfileConfig,
+  importAgentProfileConfig,
   deleteAgentProfileConfig,
   setActiveAgentProfileConfig,
 } from '../tauri-api.js'
@@ -150,6 +152,61 @@ async function save() {
   }
 }
 
+async function exportProfile() {
+  if (!editing.value) return
+  saving.value = true
+  errorMsg.value = ''
+  try {
+    const json = await exportAgentProfileConfig(editing.value.id)
+    const safeName = safeFileName(editing.value.name || editing.value.id)
+    const { save: saveDialog } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await saveDialog({
+      defaultPath: `${safeName}.agent-profile.json`,
+      filters: [{ name: 'Agent Profile JSON', extensions: ['json'] }],
+    })
+    if (!filePath) return
+
+    const { writeBinaryFile } = await import('@tauri-apps/plugin-fs')
+    await writeBinaryFile(filePath, new TextEncoder().encode(json))
+  } catch (e) {
+    errorMsg.value = '导出失败: ' + e
+  } finally {
+    saving.value = false
+  }
+}
+
+async function importProfile() {
+  saving.value = true
+  errorMsg.value = ''
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await open({
+      multiple: false,
+      filters: [{ name: 'Agent Profile JSON', extensions: ['json'] }],
+    })
+    if (!filePath) return
+
+    const { readTextFile } = await import('@tauri-apps/plugin-fs')
+    const configJson = await readTextFile(filePath)
+    const imported = await importAgentProfileConfig(configJson)
+    await refresh()
+    if (imported?.id) {
+      editing.value = await getAgentProfileConfig(imported.id)
+    }
+  } catch (e) {
+    errorMsg.value = '导入失败: ' + e
+  } finally {
+    saving.value = false
+  }
+}
+
+function safeFileName(name) {
+  return String(name)
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .trim()
+    .slice(0, 80) || 'agent-profile'
+}
+
 function isBuiltinId(id) {
   return id === 'builtin-default-agent-v1'
 }
@@ -262,6 +319,14 @@ function readonly() {
     <div v-if="errorMsg" class="mb-2 text-xs text-err">{{ errorMsg }}</div>
 
     <div v-show="expanded">
+      <div class="flex justify-end mb-2">
+        <button
+          @click="importProfile"
+          :disabled="saving"
+          class="px-2.5 py-1.5 text-xs rounded-lg border border-line text-ink-soft hover:text-ink hover:bg-line/30 disabled:opacity-50"
+        >导入 JSON</button>
+      </div>
+
       <!-- 列表 + 活跃切换 -->
       <div v-if="loading" class="text-center text-ink-soft text-xs py-2">加载中…</div>
       <div v-else class="space-y-1 mb-3">
@@ -422,6 +487,11 @@ function readonly() {
             @click="duplicate(editing.id)"
             class="flex-1 py-1.5 text-xs rounded-lg border border-dashed border-accent-border text-accent hover:bg-accent-soft"
           >📋 复制为新配置</button>
+          <button
+            @click="exportProfile"
+            :disabled="saving"
+            class="flex-1 py-1.5 text-xs rounded-lg border border-line text-ink-soft hover:text-ink hover:bg-line/30 disabled:opacity-50"
+          >导出 JSON</button>
         </div>
       </div>
     </div>
