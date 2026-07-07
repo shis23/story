@@ -16,7 +16,7 @@ use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::character_knowledge::{
     BroadcastTarget, CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
 };
-use storyforge_domain::llm::ChatResponse;
+use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse};
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
 use crate::prompts::{
@@ -68,11 +68,21 @@ pub async fn run_postprocess(
 
     info!(target: "postprocess", "开始后处理（在场 {} 角色）", present_characters.len());
 
+    let fallback_user_msg = user_msg.clone();
+    let fallback_cancel = cancel.clone();
     let resp = runtime
         .run_tool_loop(&config, user_msg, &registry, cancel)
         .await?;
 
     let result = parse_postprocess_from_response(&resp);
+    let result = if result.parse_succeeded && !result.is_empty() {
+        result
+    } else {
+        run_direct_json_fallback(runtime, &config, &fallback_user_msg, fallback_cancel)
+            .await
+            .map_err(PostProcessError::Agent)?
+            .unwrap_or(result)
+    };
     info!(
         target: "postprocess",
         "后处理完成：知识 {} / 变量 {} / 任务 {}",
@@ -81,6 +91,70 @@ pub async fn run_postprocess(
         result.task_updates.len()
     );
     Ok(result)
+}
+
+async fn run_direct_json_fallback(
+    runtime: &AgentRuntime,
+    base_config: &AgentConfig,
+    base_user_msg: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<Option<PostProcessResult>, AgentError> {
+    warn!(
+        target: "postprocess",
+        "emit_postprocess/JSON parse missed or returned empty; retrying postprocess once without tools"
+    );
+
+    if *cancel.borrow() {
+        return Err(AgentError::Cancelled);
+    }
+
+    let user_msg = format!(
+        "{base_user_msg}\n\nReturn exactly one JSON object with keys knowledge_updates, variable_updates, and task_updates. Do not include markdown, code fences, prose, or tool calls."
+    );
+    let req = ChatRequest {
+        messages: vec![
+            ChatMessage::system(&base_config.system_prompt),
+            ChatMessage::user(&user_msg),
+        ],
+        tools: None,
+        params: Default::default(),
+        model: base_config.model.clone(),
+    };
+    let llm = runtime.llm();
+    let cancel_fut = {
+        let mut cancel = cancel.clone();
+        async move {
+            let _ = cancel.wait_for(|&c| c).await;
+        }
+    };
+
+    let resp = tokio::select! {
+        result = llm.chat(&req) => result.map_err(AgentError::Llm),
+        _ = cancel_fut => Err(AgentError::Cancelled),
+    };
+
+    match resp {
+        Ok(resp) => {
+            let result = parse_postprocess_from_response(&resp);
+            if result.parse_succeeded {
+                Ok(Some(result))
+            } else {
+                warn!(
+                    target: "postprocess",
+                    "direct JSON postprocess fallback also missed; keeping empty best-effort result"
+                );
+                Ok(None)
+            }
+        }
+        Err(AgentError::Cancelled) => Err(AgentError::Cancelled),
+        Err(err) => {
+            warn!(
+                target: "postprocess",
+                "direct JSON postprocess fallback failed: {err}"
+            );
+            Ok(None)
+        }
+    }
 }
 
 // ─── 5 层兜底解析 ─────────────────────────────────────────────────────────
@@ -320,7 +394,14 @@ fn extract_first_braces(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storyforge_domain::llm::{ChatResponse, FunctionCall, ToolCall, Usage};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use storyforge_domain::llm::{
+        ChatRequest, ChatResponse, FunctionCall, LlmError, StreamChunk, ToolCall, Usage,
+    };
+    use tokio::sync::Notify;
 
     fn make_resp(content: &str, tool_calls: Vec<ToolCall>) -> ChatResponse {
         ChatResponse {
@@ -349,6 +430,18 @@ mod tests {
           ]
         }"#
         .to_string()
+    }
+
+    fn empty_tool_context() -> Arc<crate::tools::ToolContext> {
+        Arc::new(crate::tools::ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        })
     }
 
     #[test]
@@ -515,5 +608,270 @@ mod tests {
         let r = parse_postprocess_from_response(&resp);
         // mock 脚本应产出非空结果
         assert!(!r.is_empty(), "mock 后处理脚本应产出非空结果");
+    }
+
+    struct ToolDriftThenJsonClient {
+        calls: Arc<AtomicUsize>,
+        fallback_json: String,
+    }
+
+    #[async_trait]
+    impl storyforge_infra_llm::LlmClient for ToolDriftThenJsonClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                return Ok(make_resp(
+                    "I have analyzed it, but this is not JSON.",
+                    vec![],
+                ));
+            }
+            Ok(make_resp(&self.fallback_json, vec![]))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.chat(req).await?;
+            let _ = tx.send(StreamChunk {
+                delta_content: Some(resp.content.clone()),
+                delta_tool_calls: None,
+                finish_reason: resp.finish_reason.clone(),
+            });
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_postprocess_retries_direct_json_when_tool_path_drifts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(ToolDriftThenJsonClient {
+            calls: calls.clone(),
+            fallback_json: sample_json(),
+        });
+        let runtime = AgentRuntime::new(llm, empty_tool_context());
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        let result = run_postprocess(
+            &runtime,
+            "林医生告诉陈警官地下室有尸体。",
+            &["林医生".into(), "陈警官".into()],
+            &["story_clock".into()],
+            7,
+            "第 7 轮",
+            cancel,
+            None,
+        )
+        .await
+        .expect("postprocess should recover via direct JSON fallback");
+
+        assert!(result.parse_succeeded);
+        assert_eq!(result.knowledge_updates.len(), 1);
+        assert!(
+            calls.load(Ordering::SeqCst) > 1,
+            "first tool path should miss before direct JSON fallback runs"
+        );
+    }
+
+    struct EmptyJsonThenUsefulJsonClient {
+        calls: Arc<AtomicUsize>,
+        fallback_json: String,
+    }
+
+    #[async_trait]
+    impl storyforge_infra_llm::LlmClient for EmptyJsonThenUsefulJsonClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                return Ok(make_resp(
+                    r#"{"knowledge_updates":[],"variable_updates":[],"task_updates":[]}"#,
+                    vec![],
+                ));
+            }
+            Ok(make_resp(&self.fallback_json, vec![]))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.chat(req).await?;
+            let _ = tx.send(StreamChunk {
+                delta_content: Some(resp.content.clone()),
+                delta_tool_calls: None,
+                finish_reason: resp.finish_reason.clone(),
+            });
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_postprocess_retries_direct_json_when_tool_path_returns_empty_json() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(EmptyJsonThenUsefulJsonClient {
+            calls: calls.clone(),
+            fallback_json: sample_json(),
+        });
+        let runtime = AgentRuntime::new(llm, empty_tool_context());
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        let result = run_postprocess(
+            &runtime,
+            "林医生告诉陈警官地下室有尸体。",
+            &["林医生".into(), "陈警官".into()],
+            &["story_clock".into()],
+            7,
+            "第 7 轮",
+            cancel,
+            None,
+        )
+        .await
+        .expect("postprocess should recover when primary tool path returns an empty JSON result");
+
+        assert!(result.parse_succeeded);
+        assert_eq!(result.knowledge_updates.len(), 1);
+        assert!(
+            calls.load(Ordering::SeqCst) > 1,
+            "valid-but-empty primary JSON should trigger direct JSON fallback"
+        );
+    }
+
+    struct CancelBeforeFallbackClient {
+        calls: Arc<AtomicUsize>,
+        cancel_tx: watch::Sender<bool>,
+    }
+
+    #[async_trait]
+    impl storyforge_infra_llm::LlmClient for CancelBeforeFallbackClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                let _ = self.cancel_tx.send(true);
+                return Ok(make_resp("not json", vec![]));
+            }
+            Ok(make_resp(&sample_json(), vec![]))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.chat(req).await?;
+            let _ = tx.send(StreamChunk {
+                delta_content: Some(resp.content.clone()),
+                delta_tool_calls: None,
+                finish_reason: resp.finish_reason.clone(),
+            });
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_postprocess_respects_cancel_before_direct_json_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (cancel_tx, cancel) = watch::channel(false);
+        let llm = Arc::new(CancelBeforeFallbackClient {
+            calls: calls.clone(),
+            cancel_tx,
+        });
+        let runtime = AgentRuntime::new(llm, empty_tool_context());
+
+        let result = run_postprocess(
+            &runtime,
+            "林医生告诉陈警官地下室有尸体。",
+            &["林医生".into(), "陈警官".into()],
+            &["story_clock".into()],
+            7,
+            "第 7 轮",
+            cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PostProcessError::Agent(AgentError::Cancelled))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fallback LLM call should not start after cancellation"
+        );
+    }
+
+    struct PendingFallbackClient {
+        calls: Arc<AtomicUsize>,
+        fallback_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl storyforge_infra_llm::LlmClient for PendingFallbackClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                return Ok(make_resp("not json", vec![]));
+            }
+            self.fallback_started.notify_one();
+            std::future::pending::<Result<ChatResponse, LlmError>>().await
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.chat(req).await?;
+            let _ = tx.send(StreamChunk {
+                delta_content: Some(resp.content.clone()),
+                delta_tool_calls: None,
+                finish_reason: resp.finish_reason.clone(),
+            });
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_postprocess_respects_cancel_during_direct_json_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_started = Arc::new(Notify::new());
+        let (cancel_tx, cancel) = watch::channel(false);
+        let llm = Arc::new(PendingFallbackClient {
+            calls: calls.clone(),
+            fallback_started: fallback_started.clone(),
+        });
+        let handle = tokio::spawn(async move {
+            let runtime = AgentRuntime::new(llm, empty_tool_context());
+            run_postprocess(
+                &runtime,
+                "林医生告诉陈警官地下室有尸体。",
+                &["林医生".into(), "陈警官".into()],
+                &["story_clock".into()],
+                7,
+                "第 7 轮",
+                cancel,
+                None,
+            )
+            .await
+        });
+
+        fallback_started.notified().await;
+        cancel_tx.send(true).unwrap();
+        let result = handle.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(PostProcessError::Agent(AgentError::Cancelled))
+        ));
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "primary miss and fallback call should both have been attempted"
+        );
     }
 }

@@ -7107,6 +7107,7 @@ fn knowledge_to_st_book(
 
     StWorldInfoBook {
         entries: st_entries,
+        extra: Default::default(),
     }
 }
 

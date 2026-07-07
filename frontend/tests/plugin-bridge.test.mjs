@@ -99,6 +99,49 @@ test('host handler ignores untrusted sources and replies to request origin', asy
   assert.deepEqual(trustedSource.posted[0].message.result, ['Seraphina'])
 })
 
+test('host handler supports plugin storage set/get without backend invoke', async () => {
+  const plugin = { id: 'plugin-a', permissions: [] }
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  let invokeCount = 0
+  const handler = createHostHandler(plugin, async () => {
+    invokeCount += 1
+    return null
+  })
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'set-1',
+      method: 'storage.set',
+      params: { key: 'layout', value: { statusbar: true } },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'get-1',
+      method: 'storage.get',
+      params: { key: 'layout' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.equal(invokeCount, 0)
+  assert.equal(source.posted[0].message.result, true)
+  assert.deepEqual(source.posted[1].message.result, { statusbar: true })
+  assert.equal(source.posted[1].targetOrigin, 'https://plugin.example')
+})
+
 test('maps pipeline events to native plugin event names', () => {
   const rawEvent = { event_type: 'director_started', data: {} }
   const events = mapPipelineEventToPluginEvents(rawEvent)
@@ -270,19 +313,77 @@ test('awaits async listeners during ST emit in listener order', async () => {
   assert.deepEqual(calls, ['first-start', 'first-end', 'second'])
 })
 
-test('supports ST emitAndWait with listener mutation', () => {
+test('supports ST emitAndWait with listener mutation', async () => {
   const { window } = createBridgeSandbox()
   const payload = { prompt: 'base' }
+  const calls = []
 
-  window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', (eventPayload) => {
+  window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', async (eventPayload) => {
+    calls.push('first-start')
+    await Promise.resolve()
     eventPayload.prompt += ' + first'
+    calls.push('first-end')
   })
   window.eventSource.on('GENERATE_BEFORE_COMBINE_PROMPTS', (eventPayload) => {
+    calls.push('second')
     eventPayload.prompt += ' + second'
   })
 
-  const result = window.eventSource.emitAndWait('GENERATE_BEFORE_COMBINE_PROMPTS', payload)
+  const result = await window.eventSource.emitAndWait('GENERATE_BEFORE_COMBINE_PROMPTS', payload)
 
   assert.equal(payload.prompt, 'base + first + second')
+  assert.deepEqual(calls, ['first-start', 'first-end', 'second'])
   assert.equal(result, undefined)
+})
+
+test('provides ST slash command registration and trigger fallbacks', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  const registered = window.registerSlashCommand(
+    'heal',
+    (args, context) => calls.push(['heal', args, context?.source]),
+    ['hp'],
+  )
+  const objectCommand = window.SlashCommand.fromProps({
+    name: 'inspect',
+    aliases: ['look'],
+    callback: (args) => calls.push(['inspect', args]),
+    helpString: 'inspect target',
+  })
+
+  window.SlashCommandParser.addCommandObject(objectCommand)
+  window.triggerSlash('hp', '10', { source: 'test' })
+  window.triggerSlashCommand('look', 'door')
+
+  assert.equal(registered.name, 'heal')
+  assert.deepEqual(Array.from(window.SlashCommandParser.commands, (command) => command.name), ['heal', 'inspect'])
+  assert.deepEqual(Array.from(window.storyforge.slashCommands.list(), (command) => command.helpString || ''), ['', 'inspect target'])
+  assert.deepEqual(calls, [
+    ['heal', '10', 'test'],
+    ['inspect', 'door'],
+  ])
+})
+
+test('normalizes slash placement and status bar mount fallbacks', () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  window.storyforge.ui.mountToSlot('slash_command', '<button>/heal</button>')
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ui:mount')
+  assert.equal(postedMessages.at(-1).message.slot, 'slash')
+  assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
+
+  window.storyforge.ui.mountToSlot('status_bar', '<div class="sf-status-bar">HP 5</div>')
+  assert.equal(postedMessages.at(-1).message.slot, 'statusbar')
+  assert.equal(postedMessages.at(-1).message.html, '<div class="sf-status-bar">HP 5</div>')
+
+  window.storyforge.statusBar.clear()
+  assert.equal(postedMessages.at(-1).message.slot, 'statusbar')
+  assert.equal(postedMessages.at(-1).message.html, '')
+
+  assert.equal(Object.keys(window.extension_settings.storyforge.statusBar).length, 0)
+  assert.equal(
+    window.extension_settings.storyforge.status_bar,
+    window.extension_settings.storyforge.statusBar,
+  )
 })

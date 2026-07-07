@@ -253,17 +253,13 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
     let api_key = std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty());
     let model = std::env::var("LLM_MODEL").ok().filter(|s| !s.is_empty());
 
-    if let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) {
-        return Ok(LlmConnection {
-            id: Id::new(),
-            name: "harness-env".into(),
-            base_url,
-            api_key,
-            model,
-            protocol: LlmProtocol::OpenAi,
-            params: SamplingParams::default(),
-            tool_mode: ToolMode::Native,
-        });
+    if let Some(conn) = resolve_env_llm_connection(
+        base_url,
+        api_key,
+        model,
+        std::env::var("LLM_TOOL_MODE").ok().as_deref(),
+    )? {
+        return Ok(conn);
     }
 
     // 回退：读 data/connections.json 的 active 连接
@@ -310,6 +306,43 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
     Ok(conn)
 }
 
+fn resolve_env_llm_connection(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    tool_mode_value: Option<&str>,
+) -> Result<Option<LlmConnection>, String> {
+    let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) else {
+        return Ok(None);
+    };
+
+    let tool_mode = parse_env_tool_mode(tool_mode_value)?;
+    Ok(Some(LlmConnection {
+        id: Id::new(),
+        name: "harness-env".into(),
+        base_url,
+        api_key,
+        model,
+        protocol: LlmProtocol::OpenAi,
+        params: SamplingParams::default(),
+        tool_mode,
+    }))
+}
+
+fn parse_env_tool_mode(value: Option<&str>) -> Result<ToolMode, String> {
+    let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(ToolMode::Native);
+    };
+
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "native" | "openai" | "tools" | "function_calling" => Ok(ToolMode::Native),
+        "text" | "fallback" | "textfallback" | "text_fallback" => Ok(ToolMode::TextFallback),
+        other => Err(format!(
+            "LLM_TOOL_MODE must be native or text_fallback, got {other}"
+        )),
+    }
+}
+
 /// 在 `#[ignore]` 测试里调用：若拿不到真实凭证则早返（不 fail），否则构造真实 client。
 ///
 /// F1 修好后，`HttpLlmClient.chat()`/`chat_stream()` 已正确回退到连接配置的 model，
@@ -331,4 +364,67 @@ fn exe_data_dir() -> PathBuf {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     exe_dir.join("data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_tool_mode_defaults_to_native() {
+        assert_eq!(parse_env_tool_mode(None).unwrap(), ToolMode::Native);
+        assert_eq!(parse_env_tool_mode(Some("")).unwrap(), ToolMode::Native);
+        assert_eq!(parse_env_tool_mode(Some("  ")).unwrap(), ToolMode::Native);
+    }
+
+    #[test]
+    fn env_tool_mode_accepts_native_aliases() {
+        assert_eq!(
+            parse_env_tool_mode(Some("native")).unwrap(),
+            ToolMode::Native
+        );
+        assert_eq!(
+            parse_env_tool_mode(Some("OpenAI")).unwrap(),
+            ToolMode::Native
+        );
+        assert_eq!(
+            parse_env_tool_mode(Some("function-calling")).unwrap(),
+            ToolMode::Native
+        );
+    }
+
+    #[test]
+    fn env_tool_mode_accepts_text_fallback_aliases() {
+        assert_eq!(
+            parse_env_tool_mode(Some("text_fallback")).unwrap(),
+            ToolMode::TextFallback
+        );
+        assert_eq!(
+            parse_env_tool_mode(Some("text-fallback")).unwrap(),
+            ToolMode::TextFallback
+        );
+        assert_eq!(
+            parse_env_tool_mode(Some("fallback")).unwrap(),
+            ToolMode::TextFallback
+        );
+    }
+
+    #[test]
+    fn env_tool_mode_rejects_unknown_values() {
+        let err = parse_env_tool_mode(Some("json_schema")).unwrap_err();
+        assert!(err.contains("LLM_TOOL_MODE"));
+    }
+
+    #[test]
+    fn env_tool_mode_is_ignored_when_env_credentials_are_incomplete() {
+        let conn = resolve_env_llm_connection(
+            Some("https://example.invalid/v1/chat/completions".into()),
+            None,
+            Some("model".into()),
+            Some("json_schema"),
+        )
+        .expect("incomplete env credentials should fall back without parsing tool mode");
+
+        assert!(conn.is_none());
+    }
 }

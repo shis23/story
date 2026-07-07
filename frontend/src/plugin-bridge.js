@@ -175,7 +175,14 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   const _callbacks = {};
   const _eventTypes = ${JSON.stringify(ST_EVENT_TYPES)};
   const _eventListeners = {};
+  const _slashCommands = [];
   const _hostOrigin = ${JSON.stringify(targetOrigin)};
+  const _uiSlotAliases = {
+    slash_command: 'slash',
+    status: 'statusbar',
+    status_bar: 'statusbar',
+    statusBar: 'statusbar',
+  };
 
   function _listenerList(eventName) {
     if (!_eventListeners[eventName]) {
@@ -243,9 +250,69 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   function _emitAndWait(eventName) {
     const args = Array.prototype.slice.call(arguments, 1);
     const listeners = (_eventListeners[eventName] || []).slice();
-    listeners.forEach(function(fn) {
-      fn.apply(null, args);
+    return listeners.reduce(function(chain, fn) {
+      return chain.then(function() {
+        return fn.apply(null, args);
+      });
+    }, Promise.resolve()).then(function() {});
+  }
+
+  function _normalizeUiSlot(slotName) {
+    return _uiSlotAliases[slotName] || slotName;
+  }
+
+  function _mountToSlot(slotName, html) {
+    parent.postMessage({
+      type: '${MSG_MOUNT}',
+      pluginId: ${JSON.stringify(pluginId)},
+      slot: _normalizeUiSlot(slotName),
+      html: html,
+    }, _hostOrigin);
+  }
+
+  function _normalizeSlashCommand(command, callback, aliases) {
+    if (typeof command === 'string') {
+      return {
+        name: command,
+        callback: typeof callback === 'function' ? callback : function() {},
+        aliases: Array.isArray(aliases) ? aliases : [],
+      };
+    }
+    if (command && typeof command === 'object') {
+      return {
+        name: command.name || command.command || '',
+        callback: typeof command.callback === 'function' ? command.callback : function() {},
+        aliases: Array.isArray(command.aliases) ? command.aliases : [],
+        helpString: command.helpString || command.help || '',
+        returns: command.returns,
+        namedArgumentList: command.namedArgumentList || [],
+        unnamedArgumentList: command.unnamedArgumentList || [],
+      };
+    }
+    return { name: '', callback: function() {}, aliases: [] };
+  }
+
+  function _registerSlashCommand(command, callback, aliases) {
+    const normalized = _normalizeSlashCommand(command, callback, aliases);
+    if (!normalized.name) return normalized;
+    const existingIndex = _slashCommands.findIndex(function(item) {
+      return item.name === normalized.name;
     });
+    if (existingIndex >= 0) {
+      _slashCommands.splice(existingIndex, 1, normalized);
+    } else {
+      _slashCommands.push(normalized);
+    }
+    return normalized;
+  }
+
+  function _triggerSlashCommand(name) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const command = _slashCommands.find(function(item) {
+      return item.name === name || item.aliases.indexOf(name) >= 0;
+    });
+    if (!command) return undefined;
+    return command.callback.apply(null, args);
   }
 
   window.storyforge = {
@@ -284,9 +351,9 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     },
 
     ui: {
-      mountToSlot: (slotName, html) => {
-        parent.postMessage({ type: '${MSG_MOUNT}', pluginId: ${JSON.stringify(pluginId)}, slot: slotName, html: html }, _hostOrigin);
-      },
+      mountToSlot: _mountToSlot,
+      setStatusBar: (html) => _mountToSlot('statusbar', html),
+      clearStatusBar: () => _mountToSlot('statusbar', ''),
     },
 
     events: {
@@ -300,7 +367,23 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       emit: _emit,
       emitAndWait: _emitAndWait,
     },
+
+    slashCommands: {
+      list: () => _slashCommands.slice(),
+      register: _registerSlashCommand,
+      trigger: _triggerSlashCommand,
+    },
+
+    statusBar: {
+      set: (html) => _mountToSlot('statusbar', html),
+      clear: () => _mountToSlot('statusbar', ''),
+    },
   };
+
+  window.extension_settings = window.extension_settings || {};
+  window.extension_settings.storyforge = window.extension_settings.storyforge || {};
+  window.extension_settings.storyforge.statusBar = window.extension_settings.storyforge.statusBar || {};
+  window.extension_settings.storyforge.status_bar = window.extension_settings.storyforge.statusBar;
 
   window.event_types = _eventTypes;
   window.eventTypes = _eventTypes;
@@ -314,6 +397,19 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     emit: _emit,
     emitAndWait: _emitAndWait,
   };
+  window.registerSlashCommand = _registerSlashCommand;
+  window.triggerSlashCommand = _triggerSlashCommand;
+  window.triggerSlash = _triggerSlashCommand;
+  window.triggerSlashTag = _triggerSlashCommand;
+  window.SlashCommand = window.SlashCommand || {
+    fromProps: function(props) { return props || {}; },
+  };
+  window.SlashCommandParser = window.SlashCommandParser || {};
+  window.SlashCommandParser.commands = _slashCommands;
+  window.SlashCommandParser.addCommandObject = function(command) {
+    return _registerSlashCommand(command);
+  };
+  window.saveSettingsDebounced = window.saveSettingsDebounced || function() {};
 
   function _call(method, params) {
     return new Promise((resolve, reject) => {

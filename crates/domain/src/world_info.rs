@@ -139,6 +139,7 @@ impl WorldInfoBook {
     pub fn to_st_book(&self) -> crate::character::StWorldInfoBook {
         crate::character::StWorldInfoBook {
             entries: self.entries.iter().map(|e| e.to_st_entry()).collect(),
+            extra: Default::default(),
         }
     }
 

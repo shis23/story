@@ -96,6 +96,8 @@ pub struct StCharacterData {
 pub struct StWorldInfoBook {
     #[serde(default)]
     pub entries: Vec<StWorldInfoEntry>,
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// ST 世界书条目（导入时用）
@@ -980,6 +982,7 @@ mod multi_character_tests {
                 depth: None,
                 extensions: serde_json::json!({}),
             }],
+            extra: Default::default(),
         };
         let exported = to_st_data(&character, None, Some(book));
         assert!(exported.character_book.is_some());

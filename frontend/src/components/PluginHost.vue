@@ -9,9 +9,44 @@
       :style="iframeStyle"
       @load="onIframeLoad"
     />
-    <div v-if="slotHtml" v-html="slotHtml" class="plugin-slot-content" />
+    <div
+      v-for="entry in slotEntries"
+      :key="entry.slot"
+      v-html="entry.html"
+      class="plugin-slot-content"
+      :data-plugin-slot="entry.slot"
+    />
   </div>
 </template>
+
+<script>
+export const PLUGIN_HOST_DEFAULT_SLOT = 'default'
+
+export function normalizePluginHostSlot(slot) {
+  const normalized = typeof slot === 'string' ? slot.trim() : ''
+  return normalized || PLUGIN_HOST_DEFAULT_SLOT
+}
+
+export function applyPluginSlotMount(currentSlots, mount) {
+  const slot = normalizePluginHostSlot(mount?.slot)
+  const html = typeof mount?.html === 'string' ? mount.html : ''
+  const nextSlots = { ...(currentSlots || {}) }
+
+  if (html) {
+    nextSlots[slot] = html
+  } else {
+    delete nextSlots[slot]
+  }
+
+  return nextSlots
+}
+
+export function getPluginSlotEntries(slots) {
+  return Object.entries(slots || {})
+    .filter(([, html]) => typeof html === 'string' && html.length > 0)
+    .map(([slot, html]) => ({ slot, html }))
+}
+</script>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
@@ -39,7 +74,8 @@ const props = defineProps({
 const emit = defineEmits(['slot-mount', 'ready', 'error'])
 
 const iframeRef = ref(null)
-const slotHtml = ref('')
+const slotHtmlBySlot = ref({})
+const slotEntries = computed(() => getPluginSlotEntries(slotHtmlBySlot.value))
 const iframeReady = ref(false)
 let handler = null
 let lastPluginEventId = 0
@@ -139,7 +175,11 @@ function onWindowMessage(event) {
   // 插件 UI 挂载请求
   if (data?.type === MSG_MOUNT && data.pluginId === props.plugin.id) {
     // 消毒插件 HTML，防止 XSS 注入宿主 DOM
-    slotHtml.value = DOMPurify.sanitize(data.html || '')
+    const html = DOMPurify.sanitize(data.html || '')
+    slotHtmlBySlot.value = applyPluginSlotMount(slotHtmlBySlot.value, {
+      slot: data.slot,
+      html,
+    })
     emit('slot-mount', { pluginId: data.pluginId, slot: data.slot, html: data.html })
   }
 

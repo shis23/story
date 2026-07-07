@@ -314,6 +314,131 @@ mod tests {
     }
 
     #[test]
+    fn test_write_st_card_png_preserves_v3_extensions_extra_and_book_payload() {
+        use std::collections::BTreeMap;
+        use storyforge_domain::character::{StCharacterData, StWorldInfoBook, StWorldInfoEntry};
+
+        let mut extra = BTreeMap::new();
+        extra.insert("group_only".into(), serde_json::json!(true));
+        extra.insert(
+            "creator_notes".into(),
+            serde_json::json!("unknown data-level ST field"),
+        );
+        extra.insert(
+            "custom_nested".into(),
+            serde_json::json!({"flag": "keep-me"}),
+        );
+        let mut book_extra = BTreeMap::new();
+        book_extra.insert("name".into(), serde_json::json!("PNG Opaque Book"));
+        book_extra.insert(
+            "description".into(),
+            serde_json::json!("book-level metadata should survive PNG export"),
+        );
+        book_extra.insert("scan_depth".into(), serde_json::json!(11));
+        book_extra.insert(
+            "extensions".into(),
+            serde_json::json!({"book_plugin": {"enabled": true}}),
+        );
+
+        let data = StCharacterData {
+            name: "V3 PNG Fidelity".into(),
+            description: "export should keep opaque ST fields".into(),
+            personality: "steady".into(),
+            scenario: "edge case lab".into(),
+            first_mes: "hello".into(),
+            mes_example: String::new(),
+            system_prompt: "system stays".into(),
+            post_history_instructions: "post stays".into(),
+            tags: vec!["compat".into(), "png".into()],
+            creator: "StoryForge".into(),
+            character_version: "7".into(),
+            alternate_greetings: vec!["alt 1".into(), "alt 2".into()],
+            extensions: serde_json::json!({
+                "unknown_plugin": {
+                    "state": 42,
+                    "nested": {"flag": true}
+                },
+                "assets": {
+                    "html": "<main>card</main>",
+                    "css": "main { color: red; }",
+                    "js": "window.card = true;"
+                }
+            }),
+            character_book: Some(StWorldInfoBook {
+                entries: vec![StWorldInfoEntry {
+                    id: Some(7),
+                    keys: vec!["primary".into()],
+                    secondary_keys: Some(vec!["secondary".into()]),
+                    content: Some("book entry".into()),
+                    constant: false,
+                    selective: true,
+                    selective_logic: Some(1),
+                    position: Some(serde_json::json!("after_char")),
+                    disable: Some(false),
+                    order: Some(13),
+                    depth: Some(5),
+                    extensions: serde_json::json!({"entry_extra": {"rank": 9}}),
+                }],
+                extra: book_extra,
+            }),
+            extra,
+        };
+        let card = make_st_card(data, "3.0");
+
+        let png_bytes = write_st_card_png(&card, None).expect("write_png should succeed");
+        let chunks = parse_png(&png_bytes).expect("exported PNG should parse");
+        let chara_text = chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                PngChunk::Text { keyword, text } if keyword == "chara" => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("exported PNG should contain chara text chunk");
+
+        let json_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)
+                .expect("chara payload should be base64");
+        let exported: StCharacterCard =
+            serde_json::from_slice(&json_bytes).expect("chara payload should be ST JSON");
+        let exported_json = serde_json::to_value(&exported.data).unwrap();
+
+        assert_eq!(exported.spec, Some("chara_card_v2".into()));
+        assert_eq!(exported.spec_version, Some("3.0".into()));
+        assert_eq!(exported.data.name, "V3 PNG Fidelity");
+        assert_eq!(exported.data.alternate_greetings, vec!["alt 1", "alt 2"]);
+        assert_eq!(exported.data.extensions["unknown_plugin"]["state"], 42);
+        assert_eq!(
+            exported.data.extensions["assets"]["js"],
+            "window.card = true;"
+        );
+        assert_eq!(exported_json["group_only"], true);
+        assert_eq!(
+            exported_json["creator_notes"],
+            "unknown data-level ST field"
+        );
+        assert_eq!(exported_json["custom_nested"]["flag"], "keep-me");
+
+        let book = exported
+            .data
+            .character_book
+            .expect("character_book should round-trip in chara payload");
+        assert_eq!(book.entries.len(), 1);
+        let entry = &book.entries[0];
+        assert_eq!(entry.id, Some(7));
+        assert_eq!(entry.secondary_keys, Some(vec!["secondary".into()]));
+        assert_eq!(entry.selective_logic, Some(1));
+        assert_eq!(entry.position, Some(serde_json::json!("after_char")));
+        assert_eq!(entry.extensions["entry_extra"]["rank"], 9);
+        assert_eq!(book.extra["name"], "PNG Opaque Book");
+        assert_eq!(
+            book.extra["description"],
+            "book-level metadata should survive PNG export"
+        );
+        assert_eq!(book.extra["scan_depth"], 11);
+        assert_eq!(book.extra["extensions"]["book_plugin"]["enabled"], true);
+    }
+
+    #[test]
     fn test_write_st_card_png_with_base_image() {
         use storyforge_domain::character::StCharacterData;
 
