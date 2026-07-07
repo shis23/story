@@ -80,6 +80,44 @@ test('bridge posts plugin messages to the configured host origin', () => {
   assert.equal(postedMessages.at(-1).targetOrigin, 'https://host.example')
 })
 
+test('bridge keeps local-only shims usable when host postMessage is unavailable', async () => {
+  const listeners = {}
+  const storage = new Map()
+  const window = {
+    addEventListener: (name, callback) => {
+      listeners[name] = callback
+    },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
+    console,
+  }
+  const sandbox = {
+    window,
+    parent: {},
+    localStorage: window.localStorage,
+    console,
+  }
+  sandbox.globalThis = sandbox
+
+  const script = generateBridgeScript('plugin-a', 'https://host.example')
+    .replace(/^<script>\n?/, '')
+    .replace(/\n?<\/script>$/, '')
+
+  assert.doesNotThrow(() => vm.runInNewContext(script, sandbox))
+  window.TavernHelper.storageSet('mode', { value: 'local' })
+  assert.deepEqual(plain(window.TavernHelper.storageGet('mode')), { value: 'local' })
+
+  window.SillyTavern.chat.push({ name: 'User', mes: 'hello' })
+  assert.equal(window.getChatMessages('0').length, 1)
+  assert.doesNotThrow(() => window.TavernHelper.setStatusBar('<b>offline</b>'))
+  await assert.rejects(
+    window.storyforge.character.list(),
+    /postMessage unavailable/,
+  )
+})
+
 test('host handler ignores untrusted sources and replies to request origin', async () => {
   const plugin = { id: 'plugin-a', permissions: ['ReadCharacters'] }
   const trustedSource = {
@@ -120,6 +158,30 @@ test('host handler ignores untrusted sources and replies to request origin', asy
   assert.equal(trustedSource.posted.length, 1)
   assert.equal(trustedSource.posted[0].targetOrigin, 'https://plugin.example')
   assert.deepEqual(trustedSource.posted[0].message.result, ['Seraphina'])
+})
+
+test('host handler keeps local-only storage isolated when source cannot receive replies', async () => {
+  const plugin = { id: 'plugin-a', permissions: [] }
+  const source = {}
+  let invokeCount = 0
+  const handler = createHostHandler(plugin, async () => {
+    invokeCount += 1
+    return null
+  })
+
+  await assert.doesNotReject(handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'set-1',
+      method: 'storage.set',
+      params: { key: 'layout', value: { statusbar: true } },
+    },
+    source,
+    origin: 'https://plugin.example',
+  }))
+
+  assert.equal(invokeCount, 0)
 })
 
 test('host handler supports plugin storage set/get without backend invoke', async () => {
@@ -1036,12 +1098,21 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(typeof window.SillyTavern.ToolManager.registerTool, 'function')
   assert.equal(typeof window.registerMacro, 'function')
   assert.equal(typeof window.unregisterMacro, 'function')
+  assert.equal(window.SillyTavern.getContext().eventSource, window.eventSource)
+  assert.equal(window.SillyTavern.getContext().event_types, window.event_types)
+  assert.equal(window.SillyTavern.getContext().eventTypes, window.eventTypes)
+  assert.equal(window.SillyTavern.getContext().TavernHelper, window.TavernHelper)
+  assert.equal(window.SillyTavern.getContext().saveSettingsDebounced, window.saveSettingsDebounced)
+  assert.deepEqual(plain(window.SillyTavern.getContext().chat_metadata), {})
+  assert.equal(typeof window.SillyTavern.getContext().getCurrentChatId, 'function')
 
   window.SillyTavern.chat.push({ name: 'User', mes: 'hello' })
   window.SillyTavern.chat.push({ name: 'Assistant', message: 'old reply' })
 
   assert.equal(window.getLastMessageId(), 1)
   assert.equal(window.getChatMessages('0').length, 1)
+  assert.equal(window.getChatMessages('01').length, 2)
+  assert.equal(window.getChatMessages('not-a-number').length, 2)
   assert.deepEqual(plain(window.getChatMessages(1)), [
     { name: 'User', mes: 'hello', message_id: 0, message: 'hello' },
     { name: 'Assistant', message: 'old reply', message_id: 1, mes: 'old reply' },

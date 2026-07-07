@@ -8222,14 +8222,19 @@ mod tests {
         assert_eq!(imported_instances.len(), expected_instance_count);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
-    fn test_real_complex_card_campaign_maps_stored_mvu_fallback_fragments() {
+    async fn test_real_complex_card_offline_mvu_plumbing_smoke() {
+        // This is an offline plumbing smoke. It uses the real complex PNG fixture
+        // for import/campaign wiring, but feeds a deterministic MVU tool response
+        // and a synthetic postprocess update so it can run without live LLM creds.
+        use storyforge_domain::agent::VariableUpdate;
         use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
         use storyforge_domain::character::{
             CharacterCard, CharacterDefinition, CharacterExtractionStatus,
         };
-        use storyforge_domain::mvu_translation::{FallbackFragment, MvuRouting, MvuTranslation};
+        use storyforge_domain::llm::{ChatResponse, FunctionCall, ToolCall};
+        use storyforge_domain::mvu_translation::MvuRouting;
 
         let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
             .map(std::path::PathBuf::from)
@@ -8244,7 +8249,7 @@ mod tests {
         let character =
             storyforge_infra_import::import_character(&bytes).expect("complex card should import");
 
-        let dir = TempDirGuard::new("storyforge_test_real_complex_mvu_fallback");
+        let dir = TempDirGuard::new("storyforge_test_real_complex_offline_mvu_plumbing");
         let store = campaign_store::CampaignStore::new(dir.path());
         let conv_store = ConversationStore::new(dir.path().join("conversations"));
 
@@ -8255,40 +8260,6 @@ mod tests {
         card.character_definitions = vec![definition];
 
         let stored = save_character_card_to_store(&store, card).unwrap();
-        // This smoke covers the mapping layer: a stored MVU translation for the
-        // real card's source character must be discoverable through campaign
-        // instances created from that card. It does not claim to run MVU analysis.
-        store
-            .save_mvu(campaign_store::StoredMvuTranslation {
-                source_character_id: character.id.clone(),
-                character_name: character.name.clone(),
-                translation: MvuTranslation {
-                    variable_schema: vec![],
-                    ui_bindings: vec![],
-                    update_rules: vec![],
-                    interactions: vec![],
-                    fallback_fragments: vec![
-                        FallbackFragment {
-                            description: "complex card fallback probe".into(),
-                            js_snippet: "variables.__complex_card_probe = true;".into(),
-                            reason: "real-card smoke probe".into(),
-                        },
-                        FallbackFragment {
-                            description: "empty fallback fragments are ignored".into(),
-                            js_snippet: String::new(),
-                            reason: "filter coverage".into(),
-                        },
-                    ],
-                    routing: MvuRouting::Hybrid {
-                        webview_reason: "real-card smoke probe".into(),
-                    },
-                    analysis_confidence: 1.0,
-                    notes: vec![],
-                },
-                analyzed_at: "2026-07-07T00:00:00Z".into(),
-            })
-            .unwrap();
-
         let campaign = create_campaign_in_store(
             &store,
             &conv_store,
@@ -8299,6 +8270,96 @@ mod tests {
         .unwrap();
 
         let campaign_id = Id::from_str(&campaign.id);
+        let initial_instances = store.list_instances(&campaign_id);
+        assert!(
+            initial_instances
+                .iter()
+                .all(|inst| inst.variables.is_empty()),
+            "campaign is intentionally created before MVU apply so instance variables must be backfilled"
+        );
+
+        let mvu_fixture_json = serde_json::json!({
+            "variable_schema": [
+                {"key": "hp", "label": "HP", "value_type": "int", "default": 100},
+                {"key": "mana", "label": "Mana", "value_type": "int", "default": 30}
+            ],
+            "ui_bindings": [
+                {"element": "hp_bar", "variable_key": "hp", "display": {"kind": "bar", "max": 100}},
+                {"element": "mana_text", "variable_key": "mana", "display": {"kind": "text"}}
+            ],
+            "update_rules": ["damage reduces hp"],
+            "interactions": [],
+            "fallback_fragments": [
+                {
+                    "description": "complex card fallback probe",
+                    "js_snippet": "variables.__complex_card_probe = true;",
+                    "reason": "offline MVU plumbing smoke"
+                },
+                {
+                    "description": "empty fallback fragments are ignored",
+                    "js_snippet": "",
+                    "reason": "filter coverage"
+                }
+            ],
+            "routing": {"kind": "hybrid", "webview_reason": "offline fixture contains JS fallback"},
+            "analysis_confidence": 0.92,
+            "notes": ["offline fixture: this smoke validates plumbing, not live LLM analysis"]
+        })
+        .to_string();
+        let llm = Arc::new(RecordingMockLlm::new(vec![ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "mvu-smoke-tool-call".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_mvu_translation".into(),
+                    arguments: mvu_fixture_json,
+                },
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![Arc::new(character.clone())],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let runtime = storyforge_app_agent::AgentRuntime::new(llm.clone(), tool_ctx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let translation = storyforge_app_meta::analyze_mvu_card(&runtime, &character, cancel_rx)
+            .await
+            .expect("offline MVU plumbing path should parse emit_mvu_translation");
+        assert_eq!(llm.requests().len(), 1);
+        assert!(matches!(translation.routing, MvuRouting::Hybrid { .. }));
+        assert_eq!(translation.fallback_fragments.len(), 2);
+        assert!(
+            translation
+                .variable_schema
+                .iter()
+                .any(|field| field.key == "mana")
+        );
+
+        save_mvu_translation_to_store(
+            &store,
+            campaign_store::StoredMvuTranslation {
+                source_character_id: character.id.clone(),
+                character_name: character.name.clone(),
+                translation,
+                analyzed_at: "2026-07-07T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        meta_apply_mvu_schema_in_store(
+            &store,
+            character.id.as_str().to_string(),
+            stored.card.character_definitions[0].id.as_str().to_string(),
+        )
+        .unwrap();
+
         let campaign = store
             .get_campaign(&campaign_id)
             .expect("campaign should exist");
@@ -8309,6 +8370,16 @@ mod tests {
             .id
             .as_str()
             .to_string();
+        let instance_after_apply = instances
+            .first()
+            .expect("campaign should create at least one instance");
+        assert!(
+            instance_after_apply
+                .variables
+                .iter()
+                .any(|value| value.key == "mana" && value.value == serde_json::json!(30)),
+            "MVU apply should backfill existing campaign instances"
+        );
         let ctx = WritingContext {
             characters: vec![],
             world_info: None,
@@ -8341,6 +8412,44 @@ mod tests {
 
         let fragments_by_name = collect_mvu_fallback_fragments(&ctx, &store, &[character.name]);
         assert_eq!(fragments_by_name.len(), 1);
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: campaign_id.clone(),
+            conversation_id: ctx.conversation_id.clone(),
+            turn: 2,
+        };
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: Some("offline MVU plumbing smoke summary".into()),
+            post_process: Some(storyforge_domain::agent::PostProcessResult {
+                knowledge_updates: vec![],
+                variable_updates: vec![VariableUpdate {
+                    instance_id: Some(Id::from_str(&present_instance_id)),
+                    key: "mana".into(),
+                    value: serde_json::json!(64),
+                }],
+                task_updates: vec![],
+                parse_succeeded: true,
+            }),
+        };
+        persist_postprocess_outcome_to_store(
+            &store,
+            &persist_ctx,
+            &outcome,
+            std::slice::from_ref(&present_instance_id),
+        );
+
+        let updated_instance = store
+            .list_instances(&campaign_id)
+            .into_iter()
+            .find(|inst| inst.id.as_str() == present_instance_id)
+            .expect("updated instance should still exist");
+        let mana = updated_instance
+            .variables
+            .iter()
+            .find(|value| value.key == "mana")
+            .expect("mana variable should exist after MVU apply");
+        assert_eq!(mana.value, serde_json::json!(64));
+        assert_eq!(mana.last_updated_turn, 2);
     }
 
     #[test]

@@ -221,7 +221,7 @@ async function emitPluginEventAndWait(event, data = {}) {
   return await hookBridge.emitAndWait(event, data)
 }
 
-// 处理来自 iframe 的消息
+// Handle messages from the plugin iframe.
 function onWindowMessage(event) {
   if (!isTrustedPluginSource(event)) return
 

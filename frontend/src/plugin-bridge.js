@@ -246,7 +246,9 @@ function responseTargetOrigin(event) {
 }
 
 function postResponse(event, payload) {
-  event.source?.postMessage(payload, responseTargetOrigin(event))
+  if (event?.source && typeof event.source.postMessage === 'function') {
+    event.source.postMessage(payload, responseTargetOrigin(event))
+  }
 }
 
 export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin()) {
@@ -268,6 +270,14 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     status_bar: 'statusbar',
     statusBar: 'statusbar',
   };
+
+  function _postToHost(message) {
+    if (typeof parent === 'undefined' || !parent || typeof parent.postMessage !== 'function') {
+      return false;
+    }
+    parent.postMessage(message, _hostOrigin);
+    return true;
+  }
 
   function _listenerList(eventName) {
     if (!_eventListeners[eventName]) {
@@ -355,12 +365,12 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _mountToSlot(slotName, html) {
-    parent.postMessage({
+    _postToHost({
       type: '${MSG_MOUNT}',
       pluginId: ${JSON.stringify(pluginId)},
       slot: _normalizeUiSlot(slotName),
       html: html,
-    }, _hostOrigin);
+    });
   }
 
   function _normalizeSlashCommand(command, callback, aliases) {
@@ -719,14 +729,28 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _getContext() {
+    const currentChatId = window.currentChatId || window.chatId || '';
     return {
       chat: _chat,
       name1: window.SillyTavern?.name1 || 'User',
       name2: window.SillyTavern?.name2 || 'Assistant',
-      characters: [],
-      groups: [],
+      characters: window.characters || [],
+      groups: window.groups || [],
+      this_chid: window.this_chid ?? null,
+      characterId: window.this_chid ?? null,
+      selected_group: window.selected_group ?? null,
+      groupId: window.selected_group ?? null,
+      chatId: currentChatId,
+      currentChatId: currentChatId,
+      getCurrentChatId: function() { return window.currentChatId || window.chatId || ''; },
+      chat_metadata: window.chat_metadata || {},
       extensionSettings: window.extension_settings,
       extension_settings: window.extension_settings,
+      eventSource: window.eventSource,
+      event_types: _eventTypes,
+      eventTypes: _eventTypes,
+      TavernHelper: window.TavernHelper,
+      saveSettingsDebounced: window.saveSettingsDebounced,
     };
   }
 
@@ -886,6 +910,9 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.extension_settings.storyforge = window.extension_settings.storyforge || {};
   window.extension_settings.storyforge.statusBar = window.extension_settings.storyforge.statusBar || {};
   window.extension_settings.storyforge.status_bar = window.extension_settings.storyforge.statusBar;
+  window.characters = window.characters || [];
+  window.groups = window.groups || [];
+  window.chat_metadata = window.chat_metadata || {};
 
   window.event_types = _eventTypes;
   window.eventTypes = _eventTypes;
@@ -941,13 +968,17 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return new Promise((resolve, reject) => {
       const id = String(++_reqId);
       _callbacks[id] = { resolve, reject };
-      parent.postMessage({
+      const posted = _postToHost({
         type: '${MSG_REQUEST}',
         pluginId: ${JSON.stringify(pluginId)},
         id: id,
         method: method,
         params: params,
-      }, _hostOrigin);
+      });
+      if (!posted) {
+        delete _callbacks[id];
+        reject(new Error('Host postMessage unavailable'));
+      }
     });
   }
 
@@ -982,26 +1013,26 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
           return _emitAndWait(e.data.event, hookPayload);
         })
         .then(function(result) {
-          parent.postMessage({
+          _postToHost({
             type: '${MSG_HOOK_RESPONSE}',
             pluginId: ${JSON.stringify(pluginId)},
             id: e.data.id,
             result: result === undefined ? hookPayload : result,
-          }, _hostOrigin);
+          });
         })
         .catch(function(err) {
-          parent.postMessage({
+          _postToHost({
             type: '${MSG_HOOK_RESPONSE}',
             pluginId: ${JSON.stringify(pluginId)},
             id: e.data.id,
             error: String(err && err.message ? err.message : err),
-          }, _hostOrigin);
+          });
         });
     }
   });
 
   // 通知宿主 iframe 已加载
-  parent.postMessage({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} }, _hostOrigin);
+  _postToHost({ type: 'sf:ready', pluginId: ${JSON.stringify(pluginId)} });
 })();
 <\/script>`
 }
