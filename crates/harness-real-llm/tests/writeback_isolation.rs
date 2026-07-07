@@ -11,7 +11,13 @@ use storyforge_app_agent::ToolError;
 use storyforge_app_agent::tools::{ToolRegistry, register_subagent_tools};
 use storyforge_domain::Id;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
-use storyforge_domain::character_knowledge::{CharacterKnowledgeUpdate, KnowledgeSource};
+use storyforge_domain::character::{
+    CharacterCard, CharacterDefinition, CharacterExtractionStatus, RoleType,
+};
+use storyforge_domain::character_knowledge::{
+    BroadcastTarget, CharacterKnowledgeEntry, CharacterKnowledgeUpdate, KnowledgeSource,
+    PropagationPolicy,
+};
 use storyforge_tauri_app::campaign_store;
 use storyforge_tauri_app::is_postprocess_instance_present;
 use storyforge_tauri_app::normalize_knowledge_update_for_postprocess;
@@ -376,6 +382,108 @@ fn b4_name_collision_id_path_still_works() {
         ),
         "inst-b 的 id 不在 present 中，同名时 name 路失效应被拒"
     );
+}
+
+/// P6：private 来源知识即使被后处理误抽成 open relay / group broadcast，也不能落盘。
+#[test]
+fn b6_private_source_blocks_name_collision_relay_and_group_broadcast() {
+    let dir = std::env::temp_dir().join(format!("sf_b6_private_source_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = campaign_store::CampaignStore::new(&dir);
+    let campaign = Campaign::new(Id::from_str("card-private"), "private-source");
+    store.save_campaign(campaign.clone()).unwrap();
+
+    let def_guard = CharacterDefinition {
+        id: Id::from_str("def-guard"),
+        card_id: Id::from_str("card-private"),
+        name: "Guard".into(),
+        persona_prompt: "guard".into(),
+        behavior_rules: "guard".into(),
+        base_backstory: vec![],
+        group: Some("守卫".to_string()),
+        role_type: RoleType::Supporting,
+        variable_schema: vec![],
+    };
+    let card = CharacterCard {
+        id: Id::from_str("card-private"),
+        name: "private-source-card".into(),
+        source_character_id: Id::from_str("source-private"),
+        character_definitions: vec![def_guard],
+        raw_card_json: serde_json::Value::Null,
+        extraction_status: CharacterExtractionStatus::Extracted,
+        extraction_message: None,
+    };
+    store.save_card(card).unwrap();
+
+    let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+    lin.id = Id::from_str("inst-lin");
+    let mut dup_a = CharacterInstance::temporary(campaign.id.clone(), "Dup");
+    dup_a.id = Id::from_str("inst-dup-a");
+    let mut dup_b = CharacterInstance::temporary(campaign.id.clone(), "Dup");
+    dup_b.id = Id::from_str("inst-dup-b");
+    let mut guard = CharacterInstance::temporary(campaign.id.clone(), "Guard");
+    guard.id = Id::from_str("inst-guard");
+    guard.definition_id = Some(Id::from_str("def-guard"));
+    store.add_instance(lin).unwrap();
+    store.add_instance(dup_a).unwrap();
+    store.add_instance(dup_b).unwrap();
+    store.add_instance(guard).unwrap();
+
+    let mut private_entry = CharacterKnowledgeEntry::witnessed(
+        campaign.id.clone(),
+        Id::from_str("inst-lin"),
+        "保险柜密码是 0427",
+        1,
+    );
+    private_entry.propagation = PropagationPolicy::Private;
+    store.add_knowledge(vec![private_entry]).unwrap();
+
+    let name_collisions = HashSet::from([String::from("Dup")]);
+    let relay_to_ambiguous_name = CharacterKnowledgeUpdate {
+        character_id: Id::from_str("Dup"),
+        knowledge_text: "保险柜密码是 0427".into(),
+        source: KnowledgeSource::ToldByOther,
+        source_character_id: Some(Id::from_str("inst-lin")),
+        pinned: false,
+        broadcast: None,
+        propagation: PropagationPolicy::Open,
+    };
+    let relay_entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &relay_to_ambiguous_name,
+        2,
+        &HashSet::new(),
+        &name_collisions,
+    );
+    assert!(
+        relay_entries.is_empty(),
+        "private 来源知识不能借 open relay 写入同名歧义目标"
+    );
+
+    let group_broadcast = CharacterKnowledgeUpdate {
+        character_id: Id::from_str("Lin"),
+        knowledge_text: "保险柜密码是 0427".into(),
+        source: KnowledgeSource::ToldByOther,
+        source_character_id: Some(Id::from_str("inst-lin")),
+        pinned: false,
+        broadcast: Some(BroadcastTarget::Group("守卫".to_string())),
+        propagation: PropagationPolicy::Open,
+    };
+    let broadcast_entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &group_broadcast,
+        2,
+        &HashSet::new(),
+        &HashSet::new(),
+    );
+    assert!(
+        broadcast_entries.is_empty(),
+        "private 来源知识不能借 group broadcast 分发给匹配身份组"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// P8 钉：subagent 的 tool_whitelist 加未注册工具名（如 search_world_info），
