@@ -94,7 +94,7 @@
 
 **当前事实**：`extract_characters()` 返回 `ExtractError::Parse` 时，调用方可 fallback 到 `CharacterDefinition::fallback_from_character()` 生成单角色定义。
 
-**待实现**：
+**已实现**：
 
 - [x] 确认 `tauri-app` 导入流程中 fallback 路径已接入。`extract_characters` 失败时会保存单角色 fallback definition，并持久化 `extraction_status = fallback`。
 - [x] fallback 时是否提示用户"识别失败，已按单角色处理"？后端 DTO 返回 `extraction_status` / `extraction_message`，前端卡片列表和详情会显示降级状态。
@@ -115,16 +115,16 @@
 
 **目标**：评估 StoryForge Campaign 能否导出为 ST 兼容格式。
 
-**评估方向**：
+**已实现/已定边界**：
 
-- [ ] 单角色 Campaign → ST 卡：可行，CharacterDefinition 字段可映射回 `StCharacterData`。
-- [ ] 多角色 Campaign → 多张 ST 卡 + 共享 Lorebook：需设计角色 → 卡的拆分规则和知识 → Lorebook 条目的映射。
-- [ ] 变量/任务 → ST 无对应概念，导出时必然丢失。需明确告知用户。
-- [ ] 是否做"导出为 ST 格式"功能，还是只做"导出为 StoryForge 专有格式 + 提供转换工具"？
+- [x] 单角色 Campaign → ST 卡：`export_st_card_png` 已以 `raw_card_json` round-trip 为保底写回 ST PNG。
+- [x] 多角色 Campaign → 多张 ST 卡 + 共享 Lorebook：`export_campaign_st_cards` 已按每角色一张 PNG + 共享 lorebook JSON 导出。
+- [x] 变量/任务 → ST 无对应概念，导出时必然丢失；发布说明和用户指南需持续保留降级边界。
+- [x] 当前选择：同时提供 StoryForge JSON Bundle（完整保真）和 ST 兼容导出（降级互通），不再等待独立转换工具。
 
 ## 验证
 
-- [ ] 常见 ST V2/V3 卡能导入且不丢关键字段。
+- [ ] 常见 ST V2/V3 卡能导入且不丢关键字段（发布候选仍需真实卡矩阵实跑）。
 - [x] 不认识的 extensions 不丢（`raw_card_json` 保底）；未知 ST `data` 顶层字段也会经 `extra` 保留。
 - [x] 多角色识别失败时 fallback 到单角色，不报错崩溃；`test_card_summary_treats_fallback_as_not_extracted` 覆盖 fallback 不被误报为成功识别，`test_prepare_character_extraction_*` 覆盖手动重跑安全边界。
 - [x] Campaign 导出 → 导入 round-trip ID 重写和引用一致性由 `import_campaign_bundle_rewrites_ids_and_references` 覆盖。

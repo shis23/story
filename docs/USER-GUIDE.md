@@ -24,8 +24,8 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 
 ## 3. 创建 Campaign
 
-1. 从已导入的角色或 definitions 创建 Campaign。
-2. 选择需要参与的角色实例。
+1. 从已导入的角色卡创建 Campaign。
+2. 选择角色卡；StoryForge 会自动把可用的 Protagonist/Supporting definitions 加入为 Campaign instances。
 3. 给 Campaign 设置可识别的名称。
 4. 将它设为 active Campaign。
 5. 打开 Campaign 面板，确认 instances、variables、knowledge、tasks、summaries 等标签页可见。
@@ -88,7 +88,7 @@ Campaign bundle 用于备份、迁移、排障或分享 StoryForge 内部 Campai
 
 需要明确降级或未完成的范围：
 
-- Slash 命令 hook 仍待补。
+- Regex Slash placement 3 的最小 `/` 前缀 hook 已接入；完整 Slash 命令注册、参数管道和 PluginHost/JS 斜杠运行时仍待补。
 - 完整 PluginHost/JS 状态栏运行时仍待补。
 - ST 99 事件全集和 prompt hooks 不能承诺全量兼容。
 - JSR/ST API shim 只覆盖常用子集，依赖冷门 API 的重 DOM 卡可能跳过 JS 更新。

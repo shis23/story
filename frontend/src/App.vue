@@ -17,6 +17,7 @@ import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
+import { campaignCardOptionSuffix, preferredCampaignCard } from './utils/campaignCardStatus.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -462,9 +463,9 @@ async function openNewCampaignDialog() {
   newCampaignGreetingIndex.value = 0
   try {
     newCampaignCards.value = await listCards()
-    // 默认选第一张已识别的卡
-    const firstExtracted = newCampaignCards.value.find(c => c.extracted) || newCampaignCards.value[0]
-    newCampaignCardId.value = firstExtracted?.id || null
+    // 默认优先选已完整识别的卡，其次选已有可用 definitions 的降级/历史卡。
+    const selectedCard = preferredCampaignCard(newCampaignCards.value)
+    newCampaignCardId.value = selectedCard?.id || null
     await loadNewCampaignCardDetail()
   } catch (e) { console.error('加载角色卡列表失败:', e) }
 }
@@ -1313,7 +1314,7 @@ function handlePipelineEvent(event) {
           <div>
             <label class="text-xs text-ink-soft mb-1.5 block">选择角色卡</label>
             <select v-model="newCampaignCardId" @change="loadNewCampaignCardDetail" class="w-full min-h-[44px] px-3 text-sm rounded-lg border border-line bg-surface focus:outline-none focus:border-accent">
-              <option v-for="c in newCampaignCards" :key="c.id" :value="c.id">{{ c.name }}{{ c.extracted ? '' : '（未识别）' }}</option>
+              <option v-for="c in newCampaignCards" :key="c.id" :value="c.id">{{ c.name }}{{ campaignCardOptionSuffix(c) }}</option>
             </select>
           </div>
           <div v-if="newCampaignGreetingOptions.length > 1">

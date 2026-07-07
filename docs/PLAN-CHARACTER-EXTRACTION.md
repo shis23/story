@@ -11,7 +11,7 @@
 ## 非目标
 
 - 不做运行时动态角色识别（识别只在导入时跑一次）。
-- 不做导出回 ST 卡格式（见 `PLAN-ST-IMPORT-EXPORT.md`）。
+- 不在角色识别计划内设计导出回 ST 的格式；ST 兼容导出由 `PLAN-ST-IMPORT-EXPORT.md` 跟踪。
 
 ## 当前事实（已实现）
 
@@ -61,9 +61,9 @@
 
 ### 当前缺口
 
-- **调用方集成验证**：`extract_characters` 在 `tauri-app` 导入流程中的调用点未在本次审计中完整验证（可能已接入，需确认 `tauri-app` 侧）。
+- **调用方集成验证**：已接入 `tauri-app` 导入流程；导入后会触发识别并把结果写入 CampaignStore，识别失败时保存 fallback definition。
 - **识别结果 review UI**：当前无 preview/accept 流程，LLM 直接产出定义，用户无法编辑或否决。
-- **重跑识别**：不支持对已导入卡重新跑识别（如用户对结果不满意）。
+- **重跑识别**：Campaign 面板已支持手动重跑；若卡已创建 Campaign，为避免断开既有 `definition_id` 引用，后端会拒绝重跑并提示重新导入新卡。
 
 ## 后续增强方向（未实现）
 
