@@ -11,6 +11,13 @@ import CampaignInstancesTab from './CampaignInstancesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
 import CampaignTasksTab from './CampaignTasksTab.vue'
 import CampaignSummariesTab from './CampaignSummariesTab.vue'
+import {
+  campaignCardDefinitionCount as definitionCount,
+  campaignCardExtractionLabel as extractionLabel,
+  campaignCardExtractionStatus as extractionStatus,
+  campaignCardIsFullyExtracted,
+  campaignCardShouldShowExtractButton as shouldShowExtractButton,
+} from '../utils/campaignCardStatus.js'
 
 const emit = defineEmits(['close', 'campaign-changed'])
 
@@ -100,24 +107,8 @@ async function refreshCards() {
   }
 }
 
-function definitionCount(card) {
-  return card?.definition_count ?? card?.character_count ?? 0
-}
-
-function extractionStatus(card) {
-  return card?.extraction_status || (card?.extracted ? 'extracted' : 'unknown')
-}
-
-function extractionLabel(card) {
-  const status = extractionStatus(card)
-  if (status === 'extracted') return '已识别'
-  if (status === 'fallback') return '识别失败，已按单角色处理'
-  if (definitionCount(card) > 0) return '历史状态未知'
-  return '未识别'
-}
-
 function extractionClass(card) {
-  return extractionStatus(card) === 'extracted' ? 'text-ok' : 'text-warn'
+  return campaignCardIsFullyExtracted(card) ? 'text-ok' : 'text-warn'
 }
 
 function extractButtonText(card) {
@@ -390,7 +381,7 @@ defineExpose({ refreshActiveDetailTab })
               </div>
             </div>
             <button
-              v-if="extractionStatus(card) !== 'extracted'"
+              v-if="shouldShowExtractButton(card)"
               @click.stop="handleExtract(card)"
               :disabled="extractingCardId === card.source_character_id"
               class="min-h-[36px] px-3 rounded-full text-xs font-medium bg-accent text-white disabled:opacity-50 transition-colors"

@@ -3,6 +3,11 @@ import { ref, onMounted } from 'vue'
 import { listCards, getCard, deleteCard } from '../tauri-api.js'
 import { confirmDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
+import {
+  campaignCardDefinitionCount as definitionCount,
+  campaignCardExtractionStatus as extractionStatus,
+  campaignCardIsFullyExtracted,
+} from '../utils/campaignCardStatus.js'
 
 const props = defineProps({
   activeId: { type: String, default: null },
@@ -70,24 +75,17 @@ async function handleDelete(card, event) {
   }
 }
 
-function definitionCount(card) {
-  return card?.definition_count ?? card?.character_count ?? 0
-}
-
-function extractionStatus(card) {
-  return card?.extraction_status || (card?.extracted ? 'extracted' : 'unknown')
-}
-
 function extractionLabel(card) {
   const status = extractionStatus(card)
-  if (status === 'extracted') return '已识别'
+  if (status === 'extracted' && definitionCount(card) > 0) return '已识别'
+  if (status === 'extracted') return '已识别但无角色定义'
   if (status === 'fallback') return '降级可用'
   if (definitionCount(card) > 0) return '历史状态未知'
   return '未识别'
 }
 
 function extractionClass(card) {
-  return extractionStatus(card) === 'extracted' ? 'text-ok' : 'text-warn'
+  return campaignCardIsFullyExtracted(card) ? 'text-ok' : 'text-warn'
 }
 </script>
 

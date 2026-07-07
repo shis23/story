@@ -5,6 +5,9 @@ import {
   campaignCardExtractionLabel,
   campaignCardOptionSuffix,
   campaignCardExtractionStatus,
+  campaignCardHasDefinitions,
+  campaignCardIsFullyExtracted,
+  campaignCardShouldShowExtractButton,
   preferredCampaignCard,
 } from '../src/utils/campaignCardStatus.js'
 
@@ -30,6 +33,23 @@ test('labels fallback and legacy usable cards without treating them as unrecogni
   assert.equal(campaignCardOptionSuffix({ extraction_status: 'fallback', definition_count: 1 }), '（识别失败，已按单角色处理）')
   assert.equal(campaignCardOptionSuffix({ extraction_status: 'unknown', definition_count: 1 }), '（历史状态未知）')
   assert.equal(campaignCardOptionSuffix({ extraction_status: 'unknown', definition_count: 0 }), '（未识别）')
+})
+
+test('distinguishes fully extracted cards from status-only extracted cards', () => {
+  const extractedWithDefinitions = { extraction_status: 'extracted', definition_count: 2 }
+  const extractedWithoutDefinitions = { extraction_status: 'extracted', definition_count: 0 }
+  const fallbackWithDefinitions = { extraction_status: 'fallback', definition_count: 1 }
+
+  assert.equal(campaignCardHasDefinitions(extractedWithDefinitions), true)
+  assert.equal(campaignCardHasDefinitions(extractedWithoutDefinitions), false)
+
+  assert.equal(campaignCardIsFullyExtracted(extractedWithDefinitions), true)
+  assert.equal(campaignCardIsFullyExtracted(extractedWithoutDefinitions), false)
+  assert.equal(campaignCardIsFullyExtracted(fallbackWithDefinitions), false)
+
+  assert.equal(campaignCardShouldShowExtractButton(extractedWithDefinitions), false)
+  assert.equal(campaignCardShouldShowExtractButton(extractedWithoutDefinitions), true)
+  assert.equal(campaignCardShouldShowExtractButton(fallbackWithDefinitions), true)
 })
 
 test('prefers extracted cards, then any card with usable definitions, then the first card', () => {
