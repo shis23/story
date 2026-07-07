@@ -1059,6 +1059,14 @@ export async function exportCampaignBundle(campaignId) {
   return null
 }
 
+/** 导入 StoryForge Campaign JSON Bundle */
+export async function importCampaignBundle(bundleJson) {
+  if (isTauri()) {
+    return await invoke('import_campaign_bundle', { bundleJson })
+  }
+  return null
+}
+
 // ─── Dev mock（无 Tauri 时的模拟流水线）────────────────────────────────────
 
 async function mockStartWriting(intent, onEvent) {

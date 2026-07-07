@@ -1,6 +1,6 @@
 # ST 导入/导出计划（SillyTavern Import/Export）
 
-> 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。
+> 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。2026-07-07 追加：StoryForge Campaign JSON Bundle 已支持导入 round-trip，导入时生成全新 card/campaign/instance/knowledge/task/summary ID 并重写引用，避免覆盖现有数据。
 > 关联：`docs/ROADMAP.md` Phase 5（已完成）、`docs/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
 
 ## 目标
@@ -55,9 +55,12 @@
 - V3：有 `spec_version: "3.0"`，`character_book` 结构化，`extensions` 含 assets。
 - 当前代码通过 `spec_version.unwrap_or("2.0")` 兼容两者。
 
-### 导出现状
+### 导入/导出现状
 
-- **无导出功能**。当前只能导入，不能导出 Campaign 或角色为 ST 格式或 StoryForge 专有格式。
+- `export_st_card_png(character_id)`：单角色卡导出为 ST PNG（含 tEXt `chara` 块）。
+- `export_campaign_st_cards(campaign_id)`：Campaign 导出为多张 ST PNG + 共享 lorebook JSON。
+- `export_campaign_bundle(campaign_id)`：StoryForge 专有 JSON Bundle v2，包含完整 `CharacterCard`、Campaign 元数据、CharacterInstances、Definitions、Knowledge、Tasks、Summaries。
+- `import_campaign_bundle(bundle_json)`：导入 StoryForge JSON Bundle；v2 使用 bundle 内的完整 `CharacterCard`，兼容 v1 只有 `definitions` 的旧 bundle；导入永远生成新 ID 并重写引用，不覆盖现有卡或游玩档。
 
 ## 任务
 
@@ -101,12 +104,12 @@
 
 **目标**：设计 Campaign 级别的导出格式，支持完整 Campaign 状态持久化或分享。
 
-**待设计**：
+**已实现**：
 
-- [ ] 导出范围：Campaign 元数据 + CharacterInstances + CharacterDefinitions + Knowledge + Variables + Tasks + Summaries？
-- [ ] 格式选择：JSON bundle？ZIP（含 JSON + 附件）？
-- [ ] 版本号和向前兼容策略。
-- [ ] 导入时如何处理 ID 冲突（同 Campaign 已存在）？
+- [x] 导出范围：完整 `CharacterCard` + Campaign 元数据 + CharacterInstances + CharacterDefinitions + Knowledge + Variables + Tasks + Summaries。
+- [x] 格式选择：JSON Bundle。当前前端保存为 `campaign-bundle.json`；多文件 ZIP 可作为后续包装层，不影响核心格式。
+- [x] 版本号和向前兼容策略：`format_version = 2`；导入兼容 v1（无完整 card，仅 definitions）。
+- [x] 导入 ID 冲突策略：所有导入对象生成全新 ID，并重写 definition、instance、knowledge chain、task related characters、summary conversation 引用；同时创建新的空 conversation 并绑定到导入 Campaign。
 
 ### T5: 评估导出回 ST 卡或 Lorebook
 
@@ -124,4 +127,4 @@
 - [ ] 常见 ST V2/V3 卡能导入且不丢关键字段。
 - [ ] 不认识的 extensions 不丢（`raw_card_json` 保底）。
 - [ ] 多角色识别失败时 fallback 到单角色，不报错崩溃。
-- [ ] Campaign 导出 → 导入 round-trip 数据一致（待 T4 完成后验证）。
+- [x] Campaign 导出 → 导入 round-trip ID 重写和引用一致性由 `import_campaign_bundle_rewrites_ids_and_references` 覆盖。

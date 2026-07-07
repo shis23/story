@@ -5,7 +5,7 @@ import BaseOverlay from './base/BaseOverlay.vue'
 import {
   listCards, getCard, extractCharacters,
   listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
-  exportCampaignStCards, exportCampaignBundle
+  exportCampaignStCards, exportCampaignBundle, importCampaignBundle
 } from '../tauri-api.js'
 import CampaignInstancesTab from './CampaignInstancesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
@@ -81,6 +81,8 @@ const summariesTabRef = ref(null)
 // ─── 导出状态 ───
 const exporting = ref(false)
 const exportStatus = ref('')
+const importingBundle = ref(false)
+const importStatus = ref('')
 
 // ─── 初始化 ───
 onMounted(async () => {
@@ -270,6 +272,45 @@ async function handleExportBundle() {
   }
 }
 
+async function handleImportBundle() {
+  importingBundle.value = true
+  importStatus.value = '正在导入 Bundle…'
+  exportStatus.value = ''
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const filePath = await open({
+      multiple: false,
+      filters: [{ name: 'StoryForge Campaign Bundle', extensions: ['json'] }],
+    })
+    if (!filePath) {
+      importStatus.value = '已取消'
+      return
+    }
+
+    const { readTextFile } = await import('@tauri-apps/plugin-fs')
+    const bundleJson = await readTextFile(filePath)
+    const result = await importCampaignBundle(bundleJson)
+    if (!result?.campaign_id || !result?.card_id) {
+      importStatus.value = '导入失败：无返回数据'
+      return
+    }
+
+    await refreshCards()
+    selectedCardId.value = result.card_id
+    await refreshCampaigns()
+    selectedCampaignId.value = result.campaign_id
+    await handleSetActive(result.campaign_id)
+    activeTab.value = 'detail'
+    const message = `导入完成：${result.instance_count} 个角色，${result.knowledge_count} 条知识`
+    importStatus.value = message
+    exportStatus.value = message
+  } catch (e) {
+    importStatus.value = '导入失败: ' + e
+  } finally {
+    importingBundle.value = false
+  }
+}
+
 // ─── 暴露 refresh 给父组件（MetaPanel apply 后触发刷新） ───
 defineExpose({ refreshActiveDetailTab })
 </script>
@@ -294,6 +335,15 @@ defineExpose({ refreshActiveDetailTab })
 
       <!-- ═══ Tab 1: 角色卡 ═══ -->
       <template v-if="activeTab === 'cards'">
+        <div class="flex items-center justify-end gap-2">
+          <button
+            @click="handleImportBundle"
+            :disabled="importingBundle"
+            class="min-h-[36px] px-3 rounded-lg text-xs font-medium bg-bg text-ink-soft hover:bg-line border border-line disabled:opacity-50 transition-colors"
+          >{{ importingBundle ? '导入中…' : '导入 Bundle' }}</button>
+        </div>
+        <div v-if="importStatus" class="text-xs text-ink-soft">{{ importStatus }}</div>
+
         <div v-if="loadingCards" class="text-center text-ink-soft text-sm py-8">加载中…</div>
 
         <div v-else-if="cards.length === 0" class="text-center text-ink-soft text-sm py-8">
