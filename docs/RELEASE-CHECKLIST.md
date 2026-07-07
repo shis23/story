@@ -28,7 +28,7 @@
 
 2026-07-07 已验证：
 
-- 候选提交 `ef7fe34` 执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。
+- 本轮待推送提交栈已执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 并通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。本行只记录自动化基线状态，不作为最终发布 SHA；最终候选 SHA 以 tag/release notes 记录为准。
 - 仍有既有 Vite dynamic/static import warning；本轮未新增同类阻塞，继续按分包风险记录，不视为发布闸门失败。
 
 2026-07-06 已验证：
