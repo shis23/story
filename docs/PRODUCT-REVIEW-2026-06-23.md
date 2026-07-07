@@ -9,7 +9,7 @@
 
 ## 0. 执行摘要
 
-StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡，而当前 ST 兼容停在"格式兼容"，"运行时兼容"基本未接通。产品价值尚未被真实卡验证过。
+StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡；当前 ST 兼容已从"格式兼容"推进到主链事件、Regex、常用 Slash、PluginHost slot/statusbar 与 TavernHelper 常用 alias shim，但完整 prompt hooks、冷门 Slash 参数/pipe 语义、ST 99 事件全集和真实卡回归仍是验收主风险。
 
 本报告给出：①修正后的产品定位 ②三档验收基准（Bronze/Silver/Gold）③ST 运行时兼容的 7 个缺口 + 正则系统独立工作项 + ST 兼容层方案 ④重排后的 7 个 Sprint 路线（含 Android 主线）。
 
@@ -73,7 +73,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output/World Info/Reasoning/Slash 最小路径；Reasoning 已作用于 `<think>` / `<thinking>` 推理块；Slash placement 3 已在 `/` 前缀用户/导演意图上先于 Input 正则执行；`promptOnly`/`markdownOnly` 已按 prompt/display/persisted 目标分流，消息列表 display-only 文本和派生 HTML 片段展示已接入；常用 Slash 注册/触发 shim 与 PluginHost per-slot 状态栏/斜杠挂载已接，ST 99 事件全集和 prompt 组装钩子仍不承诺全量兼容 |
 | alternate_greetings | 🟡 Legacy/Campaign 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话与 Campaign 新建游玩档均可在前端切换默认/备选开场，后端会校验开场来自源角色卡并持久化到 conversation |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
-| tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
+| tavern_helper 脚本 | 🟡 常用 shim 已接 | import 层仍只保留 raw extension；插件 iframe 已注入 `TavernHelper` / `tavernHelper` 常用 alias，覆盖 events、Slash、statusbar、slot、storage、variables、LLM generate 等转发；完整 38 方法、pipe 语义和真实插件回归仍待补 |
 | ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；Campaign 变量可从当前快照读取，单实例保留无前缀兼容，多角色支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，并保留歧义唯一角色宏 |
 | ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法，含顺序等待 async listener 的 `emit` 和同步 `emitAndWait`；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；ST 99 事件全集真实 emit 与 prompt 组装钩子仍未全量兼容 |
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
@@ -259,7 +259,7 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 - **完成定义**：缄默之秋端到端跑通（Silver 验收）
 
 #### S2.5：ST 兼容层（7-10 天，新增）
-- TavernHelper shim（38 方法转发到 window.storyforge）
+- TavernHelper shim（常用 alias 已接，完整 38 方法与真实插件回归继续排队）
 - CDN 白名单 + 用户授权 UI
 - iframe 允许 fetch + 网络代理
 - **完成定义**：命定之诗创意工坊基础可用
@@ -327,13 +327,13 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 2. 远程 CDN 脚本 → 白名单 + 用户授权
 3. iframe 沙箱执行 → 已有 PluginHost.vue
 
-**TavernHelper shim**（38 方法转发，非重实现）：
+**TavernHelper shim**（当前已接常用 alias；完整方法集仍是目标设计，非一次性重实现）：
 ```javascript
 globalThis.TavernHelper = {
   getVariables: (name) => window.storyforge.variables.get(campaignId, name),
   setVariables: (name, value) => window.storyforge.variables.set(campaignId, name, value),
   eventOn: (event, cb) => window.storyforge.events.on(event, cb),
-  // ...38 个方法，大部分是 1 行映射
+  // 完整方法集继续按真实插件回归补齐，大部分应是 1 行映射
 }
 ```
 

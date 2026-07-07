@@ -42,6 +42,10 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
   return { window, listeners, postedMessages }
 }
 
+function plain(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
 test('bridge posts plugin messages to the configured host origin', () => {
   const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
 
@@ -363,6 +367,106 @@ test('provides ST slash command registration and trigger fallbacks', () => {
     ['heal', '10', 'test'],
     ['inspect', 'door'],
   ])
+})
+
+test('parses slash invocation strings into raw, named, and unnamed args', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('heal', (rawArgs, context) => calls.push({
+    rawArgs,
+    namedArgs: context.namedArgs,
+    unnamedArgs: context.unnamedArgs,
+    source: context.source,
+    input: context.input,
+  }), ['hp'])
+
+  window.triggerSlash('/hp target=alice --amount 10 --critical "red zone" loose')
+
+  assert.deepEqual(plain(calls), [{
+    rawArgs: 'target=alice --amount 10 --critical "red zone" loose',
+    namedArgs: { target: 'alice', amount: '10', critical: 'red zone' },
+    unnamedArgs: ['loose'],
+    source: 'slash',
+    input: '/hp target=alice --amount 10 --critical "red zone" loose',
+  }])
+})
+
+test('keeps zero-argument slash command triggers unchanged', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('noop', function() {
+    calls.push(Array.prototype.slice.call(arguments))
+  })
+
+  window.triggerSlash('noop')
+
+  assert.deepEqual(calls, [[]])
+})
+
+test('provides TavernHelper aliases for common ST plugin APIs', async () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const calls = []
+
+  assert.equal(window.tavernHelper, window.TavernHelper)
+  assert.equal(typeof window.TavernHelper.eventOn, 'function')
+  assert.equal(typeof window.TavernHelper.registerSlashCommand, 'function')
+
+  window.TavernHelper.eventOn('CHAT_CHANGED', (payload) => calls.push(['event', payload.reason]))
+  await window.TavernHelper.eventEmit('CHAT_CHANGED', { reason: 'helper' })
+
+  window.TavernHelper.registerSlashCommand('mark', (rawArgs, context) => calls.push([
+    'slash',
+    rawArgs,
+    context.namedArgs.target,
+  ]))
+  window.TavernHelper.triggerSlash('/mark target=door note')
+
+  window.TavernHelper.setStatusBar('<b>ready</b>')
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ui:mount')
+  assert.equal(postedMessages.at(-1).message.slot, 'statusbar')
+  assert.equal(postedMessages.at(-1).message.html, '<b>ready</b>')
+
+  window.TavernHelper.storageSet('mode', { value: 'compat' })
+  assert.deepEqual(plain(window.TavernHelper.storageGet('mode')), { value: 'compat' })
+
+  const variablePromise = window.TavernHelper.getVariables('campaign-1', 'inst-1')
+  assert.equal(postedMessages.at(-1).message.type, MSG_REQUEST)
+  assert.equal(postedMessages.at(-1).message.method, 'variables.get')
+  assert.deepEqual(plain(postedMessages.at(-1).message.params), {
+    campaignId: 'campaign-1',
+    instanceId: 'inst-1',
+  })
+
+  assert.deepEqual(calls, [
+    ['event', 'helper'],
+    ['slash', 'target=door note', 'door'],
+  ])
+  assert.equal(typeof variablePromise.then, 'function')
+})
+
+test('supports selector-based TavernHelper variable helpers without backend calls', () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const selector = { type: 'message', message_id: 'latest' }
+
+  assert.equal(window.getVariables, window.TavernHelper.getVariables)
+  assert.equal(window.insertOrAssignVariables, window.TavernHelper.insertOrAssignVariables)
+
+  assert.deepEqual(plain(window.getVariables(selector)), {})
+  window.insertOrAssignVariables(selector, { hp: 10 })
+  window.updateVariablesWith({ message_id: 'latest', type: 'message' }, (vars) => ({
+    hp: vars.hp + 5,
+    mp: 3,
+  }))
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { hp: 15, mp: 3 })
+
+  window.replaceVariables(selector, { ready: true })
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { ready: true })
+
+  window.setVariable(selector, 'phase', 'intro')
+  assert.equal(window.getVariable(selector, 'phase'), 'intro')
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ready')
 })
 
 test('normalizes slash placement and status bar mount fallbacks', () => {

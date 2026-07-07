@@ -117,9 +117,9 @@ Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embed
 需要明确降级或尚未承诺的范围：
 
 - 不承诺 ST 99 事件全集、全部 prompt hooks 或冷门事件全量兼容。
-- Regex Slash placement 3 的最小 `/` 前缀 hook 已接入；不承诺完整 Slash 命令注册、参数管道和 PluginHost/JS 斜杠运行时。
-- 不承诺完整 PluginHost/JS 状态栏运行时；JS 失败时应以降级提示和原生状态展示为准。
-- JSR/ST API shim 只覆盖常用子集，依赖冷门 API 的重 DOM 卡可能跳过 JS 更新。
+- Regex Slash placement 3 的最小 `/` 前缀 hook 已接入；插件桥已提供常用 Slash 命令注册/触发 fallback，并能解析基础 raw/named/unnamed 参数。
+- PluginHost 已支持 per-slot 斜杠/状态栏挂载；复杂 JS 状态栏仍需真实卡回归，JS 失败时应以降级提示和原生状态展示为准。
+- JSR/ST/TavernHelper API shim 只覆盖常用子集，依赖冷门 API、pipe 语义或完整 prompt hooks 的重 DOM 卡可能跳过 JS 更新。
 - 传话链当前依赖文本匹配，不是完整语义级追踪。
 - private/封口知识是文本匹配级门禁，不等同完整安全边界；真实 LLM 对抗仍需发布候选实跑。
 

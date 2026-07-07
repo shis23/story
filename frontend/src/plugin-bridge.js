@@ -308,11 +308,195 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _triggerSlashCommand(name) {
     const args = Array.prototype.slice.call(arguments, 1);
+    const trimmedName = typeof name === 'string' ? name.trim() : '';
+    if (args.length === 0 && (trimmedName.charAt(0) === '/' || /\s/.test(trimmedName))) {
+      const parsed = _parseSlashInvocation(name);
+      if (parsed) {
+        return _triggerSlashCommand(parsed.name, parsed.args, parsed);
+      }
+    }
+
     const command = _slashCommands.find(function(item) {
       return item.name === name || item.aliases.indexOf(name) >= 0;
     });
     if (!command) return undefined;
     return command.callback.apply(null, args);
+  }
+
+  function _parseSlashTokens(rawArgs) {
+    const tokens = [];
+    String(rawArgs || '').replace(/"([^"]*)"|'([^']*)'|(\\S+)/g, function(_, dq, sq, bare) {
+      tokens.push(dq || sq || bare || '');
+      return '';
+    });
+    return tokens;
+  }
+
+  function _parseSlashArguments(rawArgs) {
+    const tokens = _parseSlashTokens(rawArgs);
+    const namedArgs = {};
+    const unnamedArgs = [];
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.indexOf('--') === 0 && token.length > 2) {
+        const body = token.slice(2);
+        const eqIndex = body.indexOf('=');
+        if (eqIndex >= 0) {
+          namedArgs[body.slice(0, eqIndex)] = body.slice(eqIndex + 1);
+        } else if (i + 1 < tokens.length && tokens[i + 1].indexOf('--') !== 0) {
+          namedArgs[body] = tokens[i + 1];
+          i += 1;
+        } else {
+          namedArgs[body] = true;
+        }
+      } else if (/^[A-Za-z_][A-Za-z0-9_.-]*=/.test(token)) {
+        const eqIndex = token.indexOf('=');
+        namedArgs[token.slice(0, eqIndex)] = token.slice(eqIndex + 1);
+      } else {
+        unnamedArgs.push(token);
+      }
+    }
+
+    return { namedArgs: namedArgs, unnamedArgs: unnamedArgs };
+  }
+
+  function _parseSlashInvocation(input) {
+    const trimmed = String(input || '').trim();
+    if (!trimmed) return null;
+    const withoutSlash = trimmed.charAt(0) === '/' ? trimmed.slice(1) : trimmed;
+    const match = withoutSlash.match(/^(\\S+)(?:\\s+([\\s\\S]*))?$/);
+    if (!match) return null;
+    const rawArgs = (match[2] || '').trim();
+    const parsedArgs = _parseSlashArguments(rawArgs);
+    return {
+      name: match[1],
+      args: rawArgs,
+      rawArgs: rawArgs,
+      namedArgs: parsedArgs.namedArgs,
+      unnamedArgs: parsedArgs.unnamedArgs,
+      source: 'slash',
+      input: input,
+    };
+  }
+
+  function _isVariableSelector(value) {
+    return value && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function _stableJson(value) {
+    if (!_isVariableSelector(value)) return JSON.stringify(value);
+    const keys = Object.keys(value).sort();
+    const normalized = {};
+    keys.forEach(function(key) { normalized[key] = value[key]; });
+    return JSON.stringify(normalized);
+  }
+
+  function _variableSelectorKey(selector) {
+    const scope = selector || { type: 'local' };
+    return 'sf_plugin_' + ${JSON.stringify(pluginId)} + '_variables_' + _stableJson(scope);
+  }
+
+  function _readSelectorVariables(selector) {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(_variableSelectorKey(selector)) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function _writeSelectorVariables(selector, variables) {
+    const next = variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {};
+    localStorage.setItem(_variableSelectorKey(selector), JSON.stringify(next));
+    return next;
+  }
+
+  function _getVariables(selectorOrCampaignId, instanceId) {
+    if (arguments.length <= 1 && (_isVariableSelector(selectorOrCampaignId) || selectorOrCampaignId == null)) {
+      return _readSelectorVariables(selectorOrCampaignId);
+    }
+    return window.storyforge.variables.get(selectorOrCampaignId, instanceId);
+  }
+
+  function _setVariables(selectorOrCampaignId, instanceIdOrVariables, key, value) {
+    if (_isVariableSelector(selectorOrCampaignId) && arguments.length <= 2) {
+      return _writeSelectorVariables(selectorOrCampaignId, instanceIdOrVariables);
+    }
+    return window.storyforge.variables.set(selectorOrCampaignId, instanceIdOrVariables, key, value);
+  }
+
+  function _getVariable(selectorOrCampaignId, instanceIdOrKey, maybeKey) {
+    if (_isVariableSelector(selectorOrCampaignId) || selectorOrCampaignId == null) {
+      const variables = _readSelectorVariables(selectorOrCampaignId);
+      return variables[instanceIdOrKey];
+    }
+    return window.storyforge.variables.get(selectorOrCampaignId, instanceIdOrKey).then(function(variables) {
+      const key = maybeKey;
+      if (Array.isArray(variables)) {
+        const found = variables.find(function(item) { return item && item.key === key; });
+        return found ? found.value : undefined;
+      }
+      return variables && typeof variables === 'object' ? variables[key] : undefined;
+    });
+  }
+
+  function _setVariable(selectorOrCampaignId, instanceIdOrKey, keyOrValue, maybeValue) {
+    if (_isVariableSelector(selectorOrCampaignId) || selectorOrCampaignId == null) {
+      const variables = _readSelectorVariables(selectorOrCampaignId);
+      variables[instanceIdOrKey] = keyOrValue;
+      return _writeSelectorVariables(selectorOrCampaignId, variables);
+    }
+    return window.storyforge.variables.set(selectorOrCampaignId, instanceIdOrKey, keyOrValue, maybeValue);
+  }
+
+  function _insertOrAssignVariables(selector, variables) {
+    const current = _readSelectorVariables(selector);
+    const patch = variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {};
+    return _writeSelectorVariables(selector, Object.assign({}, current, patch));
+  }
+
+  function _replaceVariables(selector, variables) {
+    return _writeSelectorVariables(selector, variables);
+  }
+
+  function _updateVariablesWith(selector, updater) {
+    const current = _readSelectorVariables(selector);
+    const next = typeof updater === 'function' ? updater(Object.assign({}, current)) : updater;
+    if (next && typeof next === 'object' && !Array.isArray(next)) {
+      return _writeSelectorVariables(selector, next);
+    }
+    return current;
+  }
+
+  function _createTavernHelper() {
+    return {
+      getCharacters: () => window.storyforge.character.list(),
+      getCharacter: (id) => window.storyforge.character.get(id),
+      searchWorldInfo: (characterId) => window.storyforge.worldInfo.search(characterId),
+      getRecentMessages: (conversationId) => window.storyforge.memory.getRecent(conversationId),
+      getVariables: _getVariables,
+      setVariables: _setVariables,
+      getVariable: _getVariable,
+      setVariable: _setVariable,
+      insertOrAssignVariables: _insertOrAssignVariables,
+      replaceVariables: _replaceVariables,
+      updateVariablesWith: _updateVariablesWith,
+      eventOn: (eventName, callback) => window.storyforge.events.on(eventName, callback),
+      eventOnce: (eventName, callback) => window.storyforge.events.once(eventName, callback),
+      eventOff: (eventName, callback) => window.storyforge.events.off(eventName, callback),
+      eventEmit: (eventName, payload) => window.storyforge.events.emit(eventName, payload),
+      eventEmitAndWait: (eventName, payload) => window.storyforge.events.emitAndWait(eventName, payload),
+      registerSlashCommand: _registerSlashCommand,
+      triggerSlash: _triggerSlashCommand,
+      triggerSlashCommand: _triggerSlashCommand,
+      setStatusBar: (html) => window.storyforge.statusBar.set(html),
+      clearStatusBar: () => window.storyforge.statusBar.clear(),
+      mountToSlot: (slot, html) => window.storyforge.ui.mountToSlot(slot, html),
+      storageGet: (key) => window.storyforge.storage.get(key),
+      storageSet: (key, value) => window.storyforge.storage.set(key, value),
+      generate: (prompt) => window.storyforge.llm.generate(prompt),
+    };
   }
 
   window.storyforge = {
@@ -409,6 +593,15 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.SlashCommandParser.addCommandObject = function(command) {
     return _registerSlashCommand(command);
   };
+  window.TavernHelper = window.TavernHelper || _createTavernHelper();
+  window.tavernHelper = window.TavernHelper;
+  window.getVariables = window.getVariables || window.TavernHelper.getVariables;
+  window.setVariables = window.setVariables || window.TavernHelper.setVariables;
+  window.getVariable = window.getVariable || window.TavernHelper.getVariable;
+  window.setVariable = window.setVariable || window.TavernHelper.setVariable;
+  window.insertOrAssignVariables = window.insertOrAssignVariables || window.TavernHelper.insertOrAssignVariables;
+  window.replaceVariables = window.replaceVariables || window.TavernHelper.replaceVariables;
+  window.updateVariablesWith = window.updateVariablesWith || window.TavernHelper.updateVariablesWith;
   window.saveSettingsDebounced = window.saveSettingsDebounced || function() {};
 
   function _call(method, params) {
