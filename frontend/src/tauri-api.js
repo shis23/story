@@ -478,6 +478,16 @@ export async function startWriting(intent, characterId, onEvent, conversationId,
  * 取消当前运行的写作流水线
  * @returns {Promise<boolean>} 是否有运行中的写作被取消
  */
+export async function pluginPromptHookResult(requestId, messages, error = null) {
+  if (isTauri()) {
+    return await invoke('plugin_prompt_hook_result', {
+      requestId,
+      messages: Array.isArray(messages) ? messages : null,
+      error: error || null,
+    })
+  }
+}
+
 export async function cancelWriting() {
   if (isTauri()) {
     return await invoke('cancel_writing')

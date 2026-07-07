@@ -32,6 +32,8 @@ pub enum Permission {
     WriteVariables,
     /// 提议变量更新，由宿主预览/确认后应用
     ProposeVariableUpdate,
+    /// 读取并改写最终发送给 LLM 的 prompt/messages
+    ModifyPrompt,
     /// 调用 LLM
     CallLlm,
     /// 网络请求
@@ -443,6 +445,34 @@ mod tests {
 
         let result = registry.ensure_permission("p1", &Permission::ReadCharacters);
         assert!(matches!(result, Err(PluginError::Disabled(_))));
+    }
+
+    #[test]
+    fn test_modify_prompt_permission_manifest_roundtrip() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "prompt-hook",
+            "name": "Prompt Hook",
+            "version": "1.0.0",
+            "permissions": ["ModifyPrompt"],
+            "entry_html": "<script></script>",
+            "ui_slots": [],
+            "event_subscriptions": ["CHAT_COMPLETION_PROMPT_READY"],
+            "description": null,
+            "author": null
+        }))
+        .unwrap();
+
+        let registry = PluginRegistry::new();
+        registry.install(manifest).unwrap();
+
+        registry
+            .ensure_permission("prompt-hook", &Permission::ModifyPrompt)
+            .unwrap();
+        assert!(
+            registry
+                .ensure_permission("prompt-hook", &Permission::ReadMemory)
+                .is_err()
+        );
     }
 
     #[test]

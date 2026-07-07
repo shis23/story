@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 use crate::character_knowledge::CharacterKnowledgeUpdate;
-use crate::llm::ToolSpec;
+use crate::llm::{ChatMessage, ToolSpec};
 use crate::story_task::TaskUpdate;
 use crate::world_info::WorldInfoEntry;
 
@@ -279,6 +279,14 @@ pub enum PipelineEvent {
     EditorProgress { delta: String },
     /// 成文就绪
     DraftReady { text: String },
+    /// 最终 LLM messages prompt hook 请求（前端插件可异步改写 messages）
+    PromptHookRequest {
+        request_id: String,
+        role: AgentRole,
+        round: u32,
+        model: String,
+        messages: Vec<ChatMessage>,
+    },
     /// 后处理流水线启动（总结 + 后处理并行）
     PostProcessStarted,
     /// 后处理完成（三件套产出计数）

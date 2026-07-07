@@ -88,7 +88,7 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持 enabled 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。ST 冷门 Slash 参数管道、ST 99 事件全集和最终 messages 级 prompt hooks 不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；ST 冷门 Slash 参数管道、ST 99 事件全集和 prompt hook 审计日志不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
@@ -143,7 +143,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
-- 插件事件总线已覆盖主生成链和常见聊天宿主动作，enabled 插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参；但还不是 ST 99 事件全集，也不是最终 messages 级 prompt hook 全量兼容，发布说明应避免过度承诺。
+- 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参，并可在最终 LLM request 前通过后端 `prompt_hook_request` / `plugin_prompt_hook_result` 链路改写 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 控制正文暴露；但还不是 ST 99 事件全集，prompt hook 审计日志与冷门语义仍应避免过度承诺。
 - 插件 API 桥已改为调用 `plugin_*` 专用后端命令并注入 `pluginId`，变量读取权限已从写权限中拆出；但变量写入仍保留 `WriteVariables` 直接兼容路径，完整 propose/preview 写入流仍需后续收口，发布说明不要把插件权限描述成完整第三方插件沙箱。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

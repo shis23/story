@@ -18,6 +18,7 @@ use storyforge_domain::conversation::Provenance;
 use storyforge_domain::mvu_translation::FallbackFragment;
 use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
+use storyforge_app_agent::runtime::PromptHook;
 use storyforge_app_agent::{
     AgentConfig, AgentError, AgentRuntime, DEFAULT_MAX_CONCURRENT_SUBAGENTS, EDITOR_HINT_MARKER,
     SUBAGENT_HINT_MARKER, ToolContext, ToolRegistry, filter_registry_by_whitelist, spawn_subagents,
@@ -186,6 +187,24 @@ impl PipelineOrchestrator {
         mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
     ) -> Self {
         let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        Self {
+            runtime,
+            conv_store,
+            state: PipelineState::Idle,
+            session: None,
+            pending_temporary_instances: Vec::new(),
+            mvu_runtime,
+        }
+    }
+
+    pub fn new_with_prompt_hook(
+        llm: Arc<dyn LlmClient>,
+        conv_store: Arc<ConversationStore>,
+        tool_ctx: Arc<ToolContext>,
+        mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
+        prompt_hook: PromptHook,
+    ) -> Self {
+        let runtime = Arc::new(AgentRuntime::with_prompt_hook(llm, tool_ctx, prompt_hook));
         Self {
             runtime,
             conv_store,

@@ -267,7 +267,7 @@
 
 2026-07-07 增量核对：前端插件事件总线已接入主写作链路。`App.vue::handlePipelineEvent` 会记录最近 100 条写作/重 roll `PipelineEvent`，透传给 `DebugDrawer` 与 `PluginHost`；`PluginHost` 在 iframe 未 ready 时会短暂排队并在加载后 flush；`plugin-bridge.js::mapPipelineEventToPluginEvents` 会发送 `pipeline.<event_type>`、原始事件名，以及 `GENERATION_STARTED`、`STREAM_TOKEN`、`GENERATION_ENDED`、`MESSAGE_RECEIVED` 等常用 ST 别名。2026-07-07 追加：`generateBridgeScript` 已给插件 iframe 注入 ST 风格 `event_types` / `eventTypes` 和 `eventSource.on/once/makeFirst/makeLast/removeListener/emit`，并与 `storyforge.events` 共用同一个监听器集合。2026-07-07 再追加：`App.vue` 已开始把主聊天宿主动作规范化进同一 feed，覆盖 `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_SENT/RECEIVED/UPDATED/DELETED/SWIPED`、`CHARACTER_LOADED`。2026-07-07 续补：iframe shim 已补 `eventSource.emitAndWait`；`eventSource.emit` / `storyforge.events.emit` 现在会按监听器顺序等待 async listener，便于后续 prompt hook 类插件异步改写 payload。2026-07-07 续补：插件 iframe bridge 的插件侧请求、挂载和 ready 消息会使用注入的宿主 origin；宿主侧只接受当前 iframe `contentWindow` 发来的消息，API 响应优先回传请求 `origin`，sandboxed opaque origin 场景才保留必要的 `*` 回退。2026-07-07 续补：iframe 已注入 `TavernHelper` / `tavernHelper` 常用 alias shim，转发 events、Slash、statusbar、slot、storage、variables 和 LLM generate 到 `window.storyforge`；Slash invocation 已覆盖基础 raw/named/unnamed 参数且保留零参数命令兼容，TavernHelper selector-based variable helpers 会在插件本地作用域读写，避免 `{type:'message'|'global'|'preset'}` selector 被误发后端；上述路径均有 VM 单测覆盖。剩余缺口是 ST 99 事件全集的真实触发点、prompt 组装钩子和完整 TavernHelper 方法全集。
 
-2026-07-07 续补核对：`storyforge-app-agent::AgentRuntime` 已新增异步 `PromptHook` 接缝，普通、streaming、`run_tool_loop_with_layout` 三条 LLM request 构造路径都会在创建 `ChatRequest` 前给 hook 改写本轮 `messages` 副本；子 Agent 独立 runtime 会继承同一 hook。新增单测用 `SequentialLlmClient` 捕获三条入口的最终 request，断言 hook 追加的 marker 确实进入 LLM messages；另覆盖 hook pending 时全局 cancel 可中断等待，避免后续接 iframe prompt hook 时卡住生成。2026-07-07 再续补：前端 `PluginHost` 已接 host-to-iframe hook request/response，`plugin-bridge.js` 覆盖可信 source、超时/错误回退和 iframe 内 async `eventSource.emitAndWait` mutation；`App.vue::runPromptHookEvents` 会在写作前按 enabled 插件顺序触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 并把最终 `intent`/`prompt` 写回本轮入参。当前仍未完成的是把这些前端 prompt hook 结果继续下沉到最终 LLM `messages` 级 hook、ST 99 事件全集真实触发点，以及完整 TavernHelper/Slash 冷门语义回归。
+2026-07-07 续补核对：`storyforge-app-agent::AgentRuntime` 已新增异步 `PromptHook` 接缝，普通、streaming、`run_tool_loop_with_layout` 三条 LLM request 构造路径都会在创建 `ChatRequest` 前给 hook 改写本轮 `messages` 副本；子 Agent 独立 runtime 会继承同一 hook。新增单测用 `SequentialLlmClient` 捕获三条入口的最终 request，断言 hook 追加的 marker 确实进入 LLM messages；另覆盖 hook pending 时全局 cancel 可中断等待，避免后续接 iframe prompt hook 时卡住生成。2026-07-07 再续补：前端 `PluginHost` 已接 host-to-iframe hook request/response，`plugin-bridge.js` 覆盖可信 source、超时/错误回退和 iframe 内 async `eventSource.emitAndWait` mutation；`App.vue::runPromptHookEvents` 会在写作前按声明 `ModifyPrompt` 权限的插件顺序触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 并把最终 `intent`/`prompt` 写回本轮入参。2026-07-07 三续补：`start_writing` / `regenerate` 现在会给 `PipelineOrchestrator` 注入前端 prompt hook，后端在最终 LLM request 前通过 `prompt_hook_request` 事件把真实 `messages` 发给常驻隐藏 `PluginHost`，前端按声明 `ModifyPrompt` 权限的插件顺序触发 `CHAT_COMPLETION_PROMPT_READY` 后通过 `plugin_prompt_hook_result` 回传；普通插件事件 feed 不再广播 `prompt_hook_request`，hook 返回值支持 immutable payload 串联，pending request 在取消/超时/错误时会清理；超时或插件错误 fail-open 回原 messages。当前仍未完成的是 ST 99 事件全集真实触发点、完整 TavernHelper/Slash 冷门语义和 prompt hook 审计日志细化。
 
 2026-07-07 真实复杂卡导入核对：`cargo run -p storyforge-infra-import --example inspect_card` 已用仓库根目录 `test-card.png`（命定之诗与黄昏之歌 v4.1）解析通过；该卡包含 441 条世界书、6 个 alternate greetings，并保留 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等 extensions。已补 `scripts/run-real-card-smoke.ps1` 和 ignored 回归 `test_real_complex_card_fixture_preserves_core_st_fields`，把上述导入保真核对固化为可复跑 smoke；此检查证明复杂卡 import/inspect 基线可跑，但不等同完整真实写作/插件运行时验收。
 
@@ -308,7 +308,7 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 
 ## 仍需补齐的文档缺口
 
-### 1. ST 导入/导出专项计划 — 已补充（计划阶段）
+### 1. ST 导入/导出专项计划 — 已补充（部分已实现）
 
 `ROADMAP.md` Phase 5 包含：
 
@@ -317,16 +317,16 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 - StoryForge Campaign 导出格式。
 - 是否支持导出回 ST 卡或 Lorebook。
 
-`docs/PLAN-ST-IMPORT-EXPORT.md` 已创建（2026-06-17），覆盖上述各项。当前为计划阶段，未实现。
+`docs/PLAN-ST-IMPORT-EXPORT.md` 已创建（2026-06-17），覆盖上述各项。当前已有 ST V2/V3 导入保真、extensions/raw JSON 保留、复杂真实卡 smoke、Campaign bundle 导入/导出测试等实现；完整 ST 回导和 Silver 真实卡矩阵仍需继续验收。
 
-### 2. Release checklist 和 user guide 只是未来产物
+### 2. Release checklist 和 user guide
 
 `PLAN-POST-MAINLINE.md` 提到：
 
 - `docs/RELEASE-CHECKLIST.md`
 - `docs/USER-GUIDE.md`
 
-这两个文件当前不存在，且在计划中标为新增/如需要新增。执行者不应把它们当成当前文档。
+这两个文件当前已存在，并记录 Bronze/Silver 验收口径。执行者应以当前文件内容为准，避免沿用旧“未来产物”判断。
 
 ### 3. 架构计划中的新类型尚未实现
 
@@ -334,8 +334,8 @@ Phase 4 和 Phase 5 已全部完成。推荐下一步：
 
 - ~~`CampaignRuntimeContext`~~ **阶段 2 已完成**：`crates/domain/src/campaign_runtime.rs` 包含 DTO + helpers，已接入 `WritingContext`/`ToolContext`，`fill_campaign_context_async` 已在写作/重 roll 入口异步组装快照。
 - ~~`meta_explain_generation`~~ **已完成并接入前端**：后端 command、Meta runtime `inspect_generation` 工具和 `MetaPanel` “解释上一条生成”入口均已可用；前端只对带 provenance 的 assistant 节点显示入口。
-- `meta_preview_mvu_schema`
-- `propose_apply_mvu_schema`
+- ~~`meta_preview_mvu_schema`~~ **已落到当前命名**：`meta_preview_mvu_apply`
+- ~~`propose_apply_mvu_schema`~~ **已落到当前命名**：`meta_apply_mvu_schema`
 - `startCampaignWriting`
 - ~~`PLAN-ST-IMPORT-EXPORT.md`~~ **已补充**（2026-06-17）：`docs/PLAN-ST-IMPORT-EXPORT.md` 已创建，覆盖 ST V2/V3 保真、extensions 保留、识别 fallback、Campaign 导出格式、ST 回导评估。当前为计划阶段。
 

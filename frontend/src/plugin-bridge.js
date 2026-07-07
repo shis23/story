@@ -14,6 +14,8 @@ export const MSG_HOOK_REQUEST = 'sf:hook:request'
 export const MSG_HOOK_RESPONSE = 'sf:hook:response'
 export const MSG_MOUNT = 'sf:ui:mount'
 export const DEFAULT_PLUGIN_HOOK_TIMEOUT_MS = 5000
+export const PROMPT_HOOK_PERMISSION = 'ModifyPrompt'
+export const READ_MEMORY_PERMISSION = 'ReadMemory'
 
 export const ST_EVENT_TYPES = Object.freeze({
   APP_READY: 'APP_READY',
@@ -80,26 +82,87 @@ function hasAnyPermission(plugin, permissions) {
   return permissions.some((permission) => plugin.permissions?.includes(permission))
 }
 
+export function canModifyPrompt(plugin) {
+  return hasAnyPermission(plugin, [PROMPT_HOOK_PERMISSION])
+}
+
+export function canReadMemory(plugin) {
+  return !plugin || hasAnyPermission(plugin, [READ_MEMORY_PERMISSION])
+}
+
+function pluginEventSubscriptions(plugin) {
+  const subscriptions = plugin?.event_subscriptions || plugin?.manifest?.event_subscriptions || []
+  return Array.isArray(subscriptions)
+    ? subscriptions.map((event) => String(event).trim()).filter(Boolean)
+    : []
+}
+
+function isSubscribedToPluginEvent(plugin, eventName) {
+  if (!plugin) return true
+  const subscriptions = pluginEventSubscriptions(plugin)
+  if (!subscriptions.length) return false
+  return subscriptions.includes('*') || subscriptions.includes(eventName)
+}
+
+const SENSITIVE_EVENT_FIELDS = new Set([
+  'content',
+  'displayContent',
+  'display_content',
+  'text',
+  'token',
+  'delta',
+  'messages',
+  'prompt',
+  'intent',
+  'raw',
+])
+
+function sanitizePluginEventData(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizePluginEventData(item))
+  }
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  const sanitized = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (SENSITIVE_EVENT_FIELDS.has(key)) continue
+    sanitized[key] = sanitizePluginEventData(child)
+  }
+  return sanitized
+}
+
+function eventPayloadOptions(plugin) {
+  return {
+    includeSensitive: !plugin || canReadMemory(plugin),
+  }
+}
+
 // ─── PipelineEvent → 插件事件映射 ─────────────────────────────────────────
 
-function createPluginEventPayload(pipelineEvent) {
+function createPluginEventPayload(pipelineEvent, options = {}) {
+  const includeSensitive = options.includeSensitive !== false
   const data = pipelineEvent?.data && typeof pipelineEvent.data === 'object'
     ? pipelineEvent.data
     : {}
+  const eventData = includeSensitive ? data : sanitizePluginEventData(data)
   const payload = {
-    ...data,
+    ...eventData,
     event_type: pipelineEvent.event_type,
-    data,
-    raw: pipelineEvent,
+    data: eventData,
+  }
+  if (includeSensitive) {
+    payload.raw = pipelineEvent
   }
 
-  if (pipelineEvent.event_type === 'editor_progress') {
-    payload.token = data.delta || ''
-    payload.text = data.delta || ''
-  } else if (pipelineEvent.event_type === 'draft_ready') {
-    payload.text = data.text || ''
+  if (includeSensitive && pipelineEvent.event_type === 'editor_progress') {
+    payload.token = eventData.delta || ''
+    payload.text = eventData.delta || ''
+  } else if (includeSensitive && pipelineEvent.event_type === 'draft_ready') {
+    payload.text = eventData.text || ''
   } else if (pipelineEvent.event_type === 'error') {
-    payload.message = data.message || ''
+    payload.message = eventData.message || ''
   }
 
   return payload
@@ -111,10 +174,11 @@ function createPluginEventPayload(pipelineEvent) {
  * 同时发送 StoryForge 原生事件名（pipeline.xxx / xxx）和少量 ST 常用别名；
  * ST 99 事件全集仍由后续兼容层继续补齐。
  */
-export function mapPipelineEventToPluginEvents(pipelineEvent) {
+export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
   if (!pipelineEvent?.event_type) return []
+  if (pipelineEvent.event_type === 'prompt_hook_request') return []
 
-  const payload = createPluginEventPayload(pipelineEvent)
+  const payload = createPluginEventPayload(pipelineEvent, eventPayloadOptions(plugin))
   const names = [
     `pipeline.${pipelineEvent.event_type}`,
     pipelineEvent.event_type,
@@ -126,30 +190,35 @@ export function mapPipelineEventToPluginEvents(pipelineEvent) {
     .filter((name) => {
       if (seen.has(name)) return false
       seen.add(name)
-      return true
+      return isSubscribedToPluginEvent(plugin, name)
     })
     .map((name) => ({ event: name, data: payload }))
 }
 
-function mapGenericPluginEvent(eventName, data) {
+function mapGenericPluginEvent(eventName, data, plugin = null) {
   if (!eventName) return []
-  return [{ event: eventName, data: data && typeof data === 'object' ? data : {} }]
+  if (!isSubscribedToPluginEvent(plugin, eventName)) return []
+  const payload = data && typeof data === 'object' ? data : {}
+  return [{
+    event: eventName,
+    data: canReadMemory(plugin) ? payload : sanitizePluginEventData(payload),
+  }]
 }
 
 /**
  * 将 App.vue 事件 feed 中的一条记录规范化为 PluginHost 可发送的事件数组。
  * 支持历史的 PipelineEvent 记录，也支持 `CHAT_CHANGED` 等宿主通用事件。
  */
-export function mapPluginEventRecordToPluginEvents(record) {
+export function mapPluginEventRecordToPluginEvents(record, plugin = null) {
   if (!record) return []
-  if (record.event_type) return mapPipelineEventToPluginEvents(record)
+  if (record.event_type) return mapPipelineEventToPluginEvents(record, plugin)
 
   const event = record.event
-  if (event?.event_type) return mapPipelineEventToPluginEvents(event)
-  if (typeof event === 'string') return mapGenericPluginEvent(event, record.data)
-  if (typeof record.name === 'string') return mapGenericPluginEvent(record.name, record.data)
-  if (typeof event?.name === 'string') return mapGenericPluginEvent(event.name, event.data ?? record.data)
-  if (typeof event?.event === 'string') return mapGenericPluginEvent(event.event, event.data ?? record.data)
+  if (event?.event_type) return mapPipelineEventToPluginEvents(event, plugin)
+  if (typeof event === 'string') return mapGenericPluginEvent(event, record.data, plugin)
+  if (typeof record.name === 'string') return mapGenericPluginEvent(record.name, record.data, plugin)
+  if (typeof event?.name === 'string') return mapGenericPluginEvent(event.name, event.data ?? record.data, plugin)
+  if (typeof event?.event === 'string') return mapGenericPluginEvent(event.event, event.data ?? record.data, plugin)
 
   return []
 }
@@ -263,11 +332,19 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   function _emitAndWait(eventName) {
     const args = Array.prototype.slice.call(arguments, 1);
     const listeners = (_eventListeners[eventName] || []).slice();
+    let currentArgs = args;
     return listeners.reduce(function(chain, fn) {
       return chain.then(function() {
-        return fn.apply(null, args);
+        return fn.apply(null, currentArgs);
+      }).then(function(result) {
+        if (result && typeof result === 'object') {
+          currentArgs = currentArgs.length <= 1
+            ? [result]
+            : [result].concat(currentArgs.slice(1));
+        }
+        return currentArgs[0];
       });
-    }, Promise.resolve()).then(function() {});
+    }, Promise.resolve()).then(function() { return currentArgs[0]; });
   }
 
   function _normalizeUiSlot(slotName) {
@@ -661,12 +738,12 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
         .then(function() {
           return _emitAndWait(e.data.event, hookPayload);
         })
-        .then(function() {
+        .then(function(result) {
           parent.postMessage({
             type: '${MSG_HOOK_RESPONSE}',
             pluginId: ${JSON.stringify(pluginId)},
             id: e.data.id,
-            result: hookPayload,
+            result: result === undefined ? hookPayload : result,
           }, _hostOrigin);
         })
         .catch(function(err) {

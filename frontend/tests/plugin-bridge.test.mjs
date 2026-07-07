@@ -5,11 +5,15 @@ import {
   createHostHandler,
   createPluginHookBridge,
   generateBridgeScript,
+  canModifyPrompt,
+  canReadMemory,
   mapPipelineEventToPluginEvents,
   mapPluginEventRecordToPluginEvents,
   MSG_HOOK_REQUEST,
   MSG_HOOK_RESPONSE,
   MSG_REQUEST,
+  PROMPT_HOOK_PERMISSION,
+  READ_MEMORY_PERMISSION,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
 
@@ -374,6 +378,73 @@ test('keeps existing pipeline event record mapping', () => {
   )
 })
 
+test('filters plugin events by declared subscriptions', () => {
+  const record = {
+    id: 45,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'm1', content: 'secret' },
+  }
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record, {
+    id: 'plugin-a',
+    event_subscriptions: [],
+    permissions: ['ReadMemory'],
+  }), [])
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record, {
+    id: 'plugin-a',
+    event_subscriptions: ['CHAT_CHANGED'],
+    permissions: ['ReadMemory'],
+  }), [])
+})
+
+test('redacts message content from subscribed plugins without ReadMemory', () => {
+  const record = {
+    id: 46,
+    event: 'MESSAGE_RECEIVED',
+    data: {
+      messageId: 'm1',
+      content: 'secret content',
+      displayContent: '<b>secret</b>',
+      nested: {
+        text: 'secret nested',
+        safe: 'metadata',
+      },
+    },
+  }
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record, {
+    id: 'plugin-a',
+    event_subscriptions: ['MESSAGE_RECEIVED'],
+    permissions: [],
+  }), [{
+    event: 'MESSAGE_RECEIVED',
+    data: {
+      messageId: 'm1',
+      nested: {
+        safe: 'metadata',
+      },
+    },
+  }])
+})
+
+test('preserves message content for subscribed plugins with ReadMemory', () => {
+  const record = {
+    id: 47,
+    event: { event_type: 'draft_ready', data: { text: 'final draft' } },
+  }
+
+  const events = mapPluginEventRecordToPluginEvents(record, {
+    id: 'plugin-a',
+    event_subscriptions: ['GENERATION_ENDED'],
+    permissions: ['ReadMemory'],
+  })
+
+  assert.deepEqual(events.map((event) => event.event), ['GENERATION_ENDED'])
+  assert.equal(events[0].data.text, 'final draft')
+  assert.equal(events[0].data.raw.event_type, 'draft_ready')
+})
+
 test('injects SillyTavern event type aliases into plugin iframe', () => {
   const { window } = createBridgeSandbox()
 
@@ -470,7 +541,25 @@ test('supports ST emitAndWait with listener mutation', async () => {
 
   assert.equal(payload.prompt, 'base + first + second')
   assert.deepEqual(calls, ['first-start', 'first-end', 'second'])
-  assert.equal(result, undefined)
+  assert.equal(result, payload)
+})
+
+test('supports ST emitAndWait with returned payload chaining', async () => {
+  const { window } = createBridgeSandbox()
+  const payload = { prompt: 'base' }
+
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', async (eventPayload) => {
+    await Promise.resolve()
+    return { ...eventPayload, prompt: `${eventPayload.prompt} + returned` }
+  })
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => {
+    return { ...eventPayload, prompt: `${eventPayload.prompt} + second` }
+  })
+
+  const result = await window.eventSource.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+
+  assert.equal(payload.prompt, 'base')
+  assert.deepEqual(plain(result), { prompt: 'base + returned + second' })
 })
 
 test('responds to host hook requests after async ST listener mutation', async () => {
@@ -509,6 +598,72 @@ test('responds to host hook requests after async ST listener mutation', async ()
       { role: 'system', content: 'hooked' },
     ],
   })
+})
+
+test('responds to host hook requests with returned payload chaining', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const payload = {
+    messages: [{ role: 'user', content: 'hello' }],
+  }
+
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', async (eventPayload) => {
+    await Promise.resolve()
+    return {
+      ...eventPayload,
+      messages: [
+        ...eventPayload.messages,
+        { role: 'system', content: 'first returned' },
+      ],
+    }
+  })
+  window.eventSource.on('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => ({
+    ...eventPayload,
+    messages: [
+      ...eventPayload.messages,
+      { role: 'system', content: 'second returned' },
+    ],
+  }))
+
+  postHostMessage({
+    type: MSG_HOOK_REQUEST,
+    pluginId: 'plugin-a',
+    id: 'hook-return',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    data: payload,
+  })
+  await flushPromises()
+
+  const response = postedMessages.at(-1)
+  assert.equal(response.message.type, MSG_HOOK_RESPONSE)
+  assert.deepEqual(plain(response.message.result), {
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'system', content: 'first returned' },
+      { role: 'system', content: 'second returned' },
+    ],
+  })
+  assert.deepEqual(payload.messages, [{ role: 'user', content: 'hello' }])
+})
+
+test('does not broadcast backend prompt hook requests through generic plugin events', () => {
+  const events = mapPluginEventRecordToPluginEvents({
+    event_type: 'prompt_hook_request',
+    data: {
+      request_id: 'hook-1',
+      messages: [{ role: 'system', content: 'secret prompt' }],
+    },
+  })
+
+  assert.deepEqual(events, [])
+})
+
+test('checks explicit ModifyPrompt permission for prompt hooks', () => {
+  assert.equal(PROMPT_HOOK_PERMISSION, 'ModifyPrompt')
+  assert.equal(READ_MEMORY_PERMISSION, 'ReadMemory')
+  assert.equal(canModifyPrompt({ permissions: ['ReadMemory'] }), false)
+  assert.equal(canModifyPrompt({ permissions: ['ReadMemory', 'ModifyPrompt'] }), true)
+  assert.equal(canReadMemory({ permissions: [] }), false)
+  assert.equal(canReadMemory({ permissions: ['ReadMemory'] }), true)
 })
 
 test('ignores hook requests that do not come from the host parent', async () => {

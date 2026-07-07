@@ -9,13 +9,13 @@
 
 ## 0. 执行摘要
 
-StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡；当前 ST 兼容已从"格式兼容"推进到主链事件、Regex、常用 Slash、PluginHost slot/statusbar、TavernHelper 常用 alias shim、enabled 插件的常驻前端可等待 prompt hook 与后端 LLM messages hook 接缝，但最终 messages 级完整 prompt hooks、冷门 Slash 参数/pipe 语义、ST 99 事件全集和真实卡回归仍是验收主风险。
+StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡；当前 ST 兼容已从"格式兼容"推进到主链事件、Regex、常用 Slash、PluginHost slot/statusbar、TavernHelper 常用 alias shim、声明 `ModifyPrompt` 插件的常驻前端可等待 prompt hook，并已把最终 messages 级 prompt hook 接到写作/重 roll 的 LLM request 前置链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；冷门 Slash 参数/pipe 语义、ST 99 事件全集、prompt hook 审计日志和真实卡回归仍是验收主风险。
 
 本报告给出：①修正后的产品定位 ②三档验收基准（Bronze/Silver/Gold）③ST 运行时兼容的 7 个缺口 + 正则系统独立工作项 + ST 兼容层方案 ④重排后的 7 个 Sprint 路线（含 Android 主线）。
 
 **关键修正**（通读代码后纠正的早期判断）：
 - ❌ 早期判断"前端无插件接口" → ✅ 实际 `plugin-bridge.js` 已有完整的 `window.storyforge` API（权限/存储/UI槽/事件）
-- ❌ 早期判断"无事件总线" → ✅ 实际前端已有事件分发；2026-07-07 已把主生成链 `PipelineEvent` 桥到插件 iframe，并注入 ST 风格 `eventSource`/`event_types` shim（含 async `emit` 与 `emitAndWait`）；2026-07-07 续补 host→iframe 可等待 hook request/response，并通过常驻隐藏 hook host 在写作前对 enabled 插件触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参；缺的是 ST 全量事件真实 emit 和最终 LLM messages 级 prompt hooks
+- ❌ 早期判断"无事件总线" → ✅ 实际前端已有事件分发；2026-07-07 已把主生成链 `PipelineEvent` 桥到插件 iframe，并注入 ST 风格 `eventSource`/`event_types` shim（含 async `emit` 与 `emitAndWait`）；2026-07-07 续补 host→iframe 可等待 hook request/response，并通过常驻隐藏 hook host 在写作前对声明 `ModifyPrompt` 的插件触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参；2026-07-07 再续补最终 LLM messages 级 prompt hook 的后端 request/前端 PluginHost/回传链路，普通事件 feed 按 `event_subscriptions` + `ReadMemory` 控制订阅和正文；缺的是 ST 全量事件真实 emit、冷门语义和审计日志
 - ❌ 早期判断"prompt 组装是哲学冲突" → ✅ 实际 `assemble_system_prompt` 已是结构化注入系统，只是未 emit
 - ❌ 早期判断"原生渲染不可行" → 部分修正：状态栏原生可行（已有 `MvuStatusBar.vue`），复杂 DOM 应用走 iframe 兜底
 
@@ -75,7 +75,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🟡 常用 shim 已接 | import 层仍只保留 raw extension；插件 iframe 已注入 `TavernHelper` / `tavernHelper` 常用 alias，覆盖 events、Slash、statusbar、slot、storage、variables、LLM generate 等转发；完整 38 方法、pipe 语义和真实插件回归仍待补 |
 | ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；Campaign 变量可从当前快照读取，单实例保留无前缀兼容，多角色支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，并保留歧义唯一角色宏 |
-| ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法，含顺序等待 async listener 的 `emit` 和 `emitAndWait`；`PluginHost` 已支持 host→iframe hook request/response、可信 source 校验、超时/错误降级和多插件顺序合并；App 已为 enabled 插件挂常驻隐藏 hook host，写作前会触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 以改写入参；后端 `AgentRuntime` 已有最终 LLM messages 异步 hook 接缝；ST 99 事件全集真实 emit 和最终 messages 级 prompt hook 端到端合并仍未全量兼容 |
+| ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法，含顺序等待 async listener 的 `emit` 和 `emitAndWait`，并支持 listener 返回新 payload 串联；`PluginHost` 已支持 host→iframe hook request/response、可信 source 校验、超时/错误降级和多插件顺序合并；普通事件 feed 已按 `event_subscriptions` 过滤，并在无 `ReadMemory` 时移除正文类字段；App 已为声明 `ModifyPrompt` 的插件挂常驻隐藏 hook host，写作前会触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 以改写入参；最终 LLM messages hook 已通过 `prompt_hook_request` / `plugin_prompt_hook_result` 接到写作和重 roll；ST 99 事件全集真实 emit、冷门 Slash/TavernHelper 语义和 prompt hook 审计日志仍未全量兼容 |
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
 | 插件 API（window.storyforge）| ✅ 已有 | 8 方法 + 权限 + UI 槽 + 事件 |
 
@@ -87,7 +87,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；Campaign 变量宏已接当前快照，单实例保留旧兼容，多角色已有明确 scope 读取；剩余主要是更冷门 ST 宏和 PluginHost/HTML 路径联动 | 0.5-1 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
-| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe，并提供 ST 风格 `eventSource`/`event_types` 前端 shim；`emit`/`emitAndWait` 语义已补到可支撑异步监听器和 prompt hook payload 改写；host→iframe hook request/response 已接，写作前已通过常驻隐藏 hook host 触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 到 enabled 插件并支持多插件顺序合并；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；后端最终 LLM messages hook 接缝已接；剩余是 ST 全量事件的真实触发点和最终 messages 级 prompt 组装钩子端到端接线 | 核心已完成，兼容层待补 |
+| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe，并提供 ST 风格 `eventSource`/`event_types` 前端 shim；`emit`/`emitAndWait` 语义已补到可支撑异步监听器、prompt hook payload 原地改写和返回新 payload 串联；host→iframe hook request/response 已接，写作前已通过常驻隐藏 hook host 触发 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 到声明 `ModifyPrompt` 的插件并支持多插件顺序合并；普通事件 feed 已按 `event_subscriptions` 过滤并按 `ReadMemory` 脱敏；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；后端最终 LLM messages hook 已端到端接入写作/重 roll；剩余是 ST 全量事件真实触发点、冷门语义和审计日志 | 核心已完成，兼容层待补 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | ✅ 已接入确定性关键词扫描 | Director tail 注入命中绿灯/Both；secondary AND/OR/NOT 已覆盖，ST depth/position 细语义继续归入后续兼容 |
 | 8 | H-012 trait 抽象 | ✅ 已完成：`infra-plugin-host` 不再依赖 tauri | Tauri/WebView adapter 已移动到 `tauri-app/src/mvu_webview_runtime.rs` |
@@ -96,7 +96,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ST 的正则脚本系统远比"Input/Output 两端替换"复杂。2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可导入 Global 正则，active Preset 和 legacy/Campaign Scoped 正则也已按顺序注入。
 
-2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流；`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；消息列表展示已通过 `display_content` DTO 接入 Display 目标，编辑和持久化仍保留原始 `content`；`ChatMessage` 已接入派生 HTML 片段安全渲染；`minDepth/maxDepth` 已进入执行器。World Info placement 5 已在世界书注入 prompt 前执行，Reasoning placement 6 已接到 AI 输出中的 `<think>` / `<thinking>` 推理块；Slash placement 3 已在用户/导演意图以 `/` 开头时运行，并会先于 Input 正则执行。2026-07-07 续补：插件桥已提供常用 Slash 命令注册/触发 fallback，`PluginHost` 已按 slot 隔离默认内容、slash、sidebar 和 statusbar 挂载，状态栏清空不会误清其他 slot；host→iframe 可等待 hook request/response 已接，写作前可让 enabled 插件通过常驻隐藏 hook host 改写入参；仍不承诺 ST 99 事件全集和最终 messages 级 prompt hooks 全量兼容。
+2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流；`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；消息列表展示已通过 `display_content` DTO 接入 Display 目标，编辑和持久化仍保留原始 `content`；`ChatMessage` 已接入派生 HTML 片段安全渲染；`minDepth/maxDepth` 已进入执行器。World Info placement 5 已在世界书注入 prompt 前执行，Reasoning placement 6 已接到 AI 输出中的 `<think>` / `<thinking>` 推理块；Slash placement 3 已在用户/导演意图以 `/` 开头时运行，并会先于 Input 正则执行。2026-07-07 续补：插件桥已提供常用 Slash 命令注册/触发 fallback，`PluginHost` 已按 slot 隔离默认内容、slash、sidebar 和 statusbar 挂载，状态栏清空不会误清其他 slot；host→iframe 可等待 hook request/response 已接，写作前可让声明 `ModifyPrompt` 的插件通过常驻隐藏 hook host 改写入参；最终 messages 级 prompt hook 也已接入后端 LLM request 前置链路；普通事件 feed 已按 `event_subscriptions`/`ReadMemory` 做最小暴露；仍不承诺 ST 99 事件全集、冷门 Slash/TavernHelper 语义和 prompt hook 审计日志全量兼容。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 

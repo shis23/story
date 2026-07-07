@@ -147,7 +147,7 @@ function flushPendingPluginEvents() {
 }
 
 function dispatchPluginEventRecord(record) {
-  for (const pluginEvent of mapPluginEventRecordToPluginEvents(record)) {
+  for (const pluginEvent of mapPluginEventRecordToPluginEvents(record, props.plugin)) {
     postPluginEvent(pluginEvent)
   }
 }

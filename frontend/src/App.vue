@@ -15,8 +15,8 @@ import PluginPanel from './components/PluginPanel.vue'
 import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
-import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
-import { ST_EVENT_TYPES } from './plugin-bridge.js'
+import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, pluginPromptHookResult, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
+import { ST_EVENT_TYPES, canModifyPrompt } from './plugin-bridge.js'
 import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
 import { campaignCardOptionSuffix, preferredCampaignCard } from './utils/campaignCardStatus.js'
 import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
@@ -211,6 +211,18 @@ async function emitPluginEventAndWait(event, data = {}) {
   return payload
 }
 
+async function emitPromptHookEventAndWait(event, data = {}) {
+  let payload = data
+  for (const plugin of hookPlugins.value || []) {
+    if (!canModifyPrompt(plugin)) continue
+    const host = hookPluginHostRefs.get(plugin.id)
+    if (host?.emitPluginEventAndWait) {
+      payload = await host.emitPluginEventAndWait(event, payload)
+    }
+  }
+  return payload
+}
+
 async function runPromptHookEvents(intent) {
   let payload = {
     intent,
@@ -224,8 +236,8 @@ async function runPromptHookEvents(intent) {
     ...chatEventPayload(),
   }
 
-  payload = await emitPluginEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload)
-  payload = await emitPluginEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload)
+  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload)
+  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload)
 
   const hookedIntent = typeof payload?.intent === 'string'
     ? payload.intent
@@ -233,6 +245,30 @@ async function runPromptHookEvents(intent) {
       ? payload.prompt
       : intent
   return hookedIntent
+}
+
+async function handlePromptHookRequest(data = {}) {
+  const requestId = data.request_id || data.requestId
+  const originalMessages = Array.isArray(data.messages) ? data.messages : []
+  if (!requestId) return
+
+  try {
+    const payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, {
+      ...chatEventPayload({
+        promptHookStage: 'llm_messages',
+        role: data.role || null,
+        round: data.round || 0,
+        model: data.model || '',
+      }),
+      messages: originalMessages,
+    })
+    const messagesForBackend = Array.isArray(payload?.messages)
+      ? payload.messages
+      : originalMessages
+    await pluginPromptHookResult(requestId, messagesForBackend, null)
+  } catch (err) {
+    await pluginPromptHookResult(requestId, originalMessages, err?.message || String(err))
+  }
 }
 
 function broadcastChatChanged(reason, extra = {}) {
@@ -1130,6 +1166,9 @@ function handlePipelineEvent(event) {
       pipeline.editor = { status: 'done', detail: '成文完成' }
       pipeline.stateLabel = '已产出'
       // 成文由 applyConversation 推入正式消息；StreamingMessage 随 showPipeline=false 消失
+      break
+    case 'prompt_hook_request':
+      handlePromptHookRequest(event.data)
       break
     case 'postprocess_started':
       pipeline.postprocess = { status: 'running', detail: '提取知识 · 更新变量 · 检测任务', knowledge: 0, variable: 0, task: 0, reason: '' }

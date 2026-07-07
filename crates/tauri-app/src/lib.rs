@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use storage::CharacterStore;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use storyforge_app_agent::ToolContext;
+use storyforge_app_agent::runtime::{PromptHook, PromptHookContext};
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_logging::{ExportOptions, LogFilter, LogKind, LogLevel, LogStore};
 use storyforge_app_meta::{
@@ -30,7 +31,7 @@ use storyforge_domain::conversation::{
     Conversation, MessageNode, MessageVariant, Provenance, Role as ConversationRole, VariantStatus,
 };
 use storyforge_domain::llm::{
-    LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
+    ChatMessage, LlmConnection, LlmConnectionSummary, LlmProtocol, SamplingParams, ToolMode,
 };
 use storyforge_domain::preset::{
     RegexPlacement, RegexScript, RegexScriptSource, merge_regex_script_sources,
@@ -51,6 +52,38 @@ use tauri::Manager;
 
 use crate::error::TauriCommandError;
 use crate::mvu_webview_runtime::{MvuPendingMap, WebViewMvuRuntime, new_mvu_pending_map};
+
+type PromptHookPendingMap =
+    Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<PromptHookReply>>>>;
+
+struct PromptHookPendingGuard {
+    request_id: String,
+    pending: PromptHookPendingMap,
+    active: bool,
+}
+
+impl PromptHookPendingGuard {
+    fn new(request_id: String, pending: PromptHookPendingMap) -> Self {
+        Self {
+            request_id,
+            pending,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PromptHookPendingGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&self.request_id);
+        }
+    }
+}
 
 // ─── 全局存储（保留 M0 兼容）──────────────────────────────────────────────
 
@@ -304,6 +337,8 @@ pub struct AppState {
     pub tool_ctx: Arc<RwLock<ToolContext>>,
     /// 当前运行的流水线 cancel sender（None = 无运行中的写作）
     pub current_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// 等待前端插件处理最终 LLM messages prompt hook 的请求。
+    prompt_hook_pending: PromptHookPendingMap,
     /// 当前活跃连接构造的 LLM client（None = 用 mock_llm）
     active_llm: Mutex<Option<Arc<dyn LlmClient>>>,
     /// 当前活跃连接的 ID（用于 get_active_connection 快速查询）
@@ -448,6 +483,7 @@ impl AppState {
             log_store,
             tool_ctx,
             current_cancel: Mutex::new(None),
+            prompt_hook_pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_llm: Mutex::new(active_llm),
             active_conn_id: Mutex::new(active_conn_id),
             active_connection_update: tokio::sync::Mutex::new(()),
@@ -551,6 +587,14 @@ impl AppState {
     }
 
     pub fn new_pipeline_with_regex(&self, regex_scripts: &[RegexScript]) -> PipelineOrchestrator {
+        self.new_pipeline_with_regex_and_prompt_hook(regex_scripts, None)
+    }
+
+    pub fn new_pipeline_with_regex_and_prompt_hook(
+        &self,
+        regex_scripts: &[RegexScript],
+        prompt_hook: Option<PromptHook>,
+    ) -> PipelineOrchestrator {
         let llm = self.active_llm_or_mock();
         let mut tool_ctx = (*self.snapshot_tool_ctx()).clone();
         // 注入向量存储（search_vectors 工具用）
@@ -562,7 +606,17 @@ impl AppState {
         > = MVU_RUNTIME.get().cloned().map(|r| {
             r as Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>
         });
-        PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), mvu_rt)
+        if let Some(prompt_hook) = prompt_hook {
+            PipelineOrchestrator::new_with_prompt_hook(
+                llm,
+                self.conv_store.clone(),
+                Arc::new(tool_ctx),
+                mvu_rt,
+                prompt_hook,
+            )
+        } else {
+            PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), mvu_rt)
+        }
     }
 }
 
@@ -1383,6 +1437,7 @@ struct InstalledPluginDto {
     version: String,
     permissions: Vec<String>,
     ui_slots: Vec<String>,
+    event_subscriptions: Vec<String>,
     description: Option<String>,
     author: Option<String>,
     enabled: bool,
@@ -1406,6 +1461,7 @@ fn plugin_to_dto(p: &storyforge_infra_plugin_host::InstalledPlugin) -> Installed
             .iter()
             .map(|slot| format!("{slot:?}"))
             .collect(),
+        event_subscriptions: p.manifest.event_subscriptions.clone(),
         description: p.manifest.description.clone(),
         author: p.manifest.author.clone(),
         enabled: p.enabled,
@@ -1822,6 +1878,22 @@ impl WritingEvent {
             PipelineEvent::DraftReady { text } => {
                 ("draft_ready".into(), serde_json::json!({ "text": text }))
             }
+            PipelineEvent::PromptHookRequest {
+                request_id,
+                role,
+                round,
+                model,
+                messages,
+            } => (
+                "prompt_hook_request".into(),
+                serde_json::json!({
+                    "request_id": request_id,
+                    "role": role,
+                    "round": round,
+                    "model": model,
+                    "messages": messages,
+                }),
+            ),
             PipelineEvent::PostProcessStarted => {
                 ("postprocess_started".into(), serde_json::json!({}))
             }
@@ -1876,6 +1948,88 @@ impl WritingEvent {
 ///
 /// cancel sender 存进 AppState.current_cancel，前端可调 cancel_writing 中止。
 /// 返回 { text, conversation_id, node_id } 供前端后续重 roll 定位。
+#[derive(Debug, Clone, Deserialize)]
+struct PromptHookReply {
+    #[serde(default)]
+    messages: Option<Vec<ChatMessage>>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn frontend_prompt_hook(
+    event_tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    pending: PromptHookPendingMap,
+) -> PromptHook {
+    Arc::new(move |ctx: PromptHookContext| {
+        let event_tx = event_tx.clone();
+        let pending = pending.clone();
+        Box::pin(async move {
+            let request_id = Id::new().as_str().to_string();
+            let original_messages = ctx.messages.clone();
+            let (tx, rx) = oneshot::channel();
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(request_id.clone(), tx);
+            let mut pending_guard =
+                PromptHookPendingGuard::new(request_id.clone(), pending.clone());
+
+            if event_tx
+                .send(PipelineEvent::PromptHookRequest {
+                    request_id: request_id.clone(),
+                    role: ctx.role,
+                    round: ctx.round,
+                    model: ctx.model,
+                    messages: ctx.messages,
+                })
+                .is_err()
+            {
+                return Ok(original_messages);
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_secs(8), rx).await {
+                Ok(Ok(reply)) => {
+                    pending_guard.disarm();
+                    if let Some(error) = reply.error {
+                        tracing::warn!(
+                            "frontend prompt hook returned error for {request_id}: {error}"
+                        );
+                    }
+                    Ok(reply.messages.unwrap_or(original_messages))
+                }
+                Ok(Err(_)) => {
+                    pending_guard.disarm();
+                    Ok(original_messages)
+                }
+                Err(_) => {
+                    tracing::warn!("frontend prompt hook timed out for {request_id}");
+                    Ok(original_messages)
+                }
+            }
+        })
+    })
+}
+
+#[tauri::command]
+async fn plugin_prompt_hook_result(
+    request_id: String,
+    messages: Option<Vec<ChatMessage>>,
+    error: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let sender = state
+        .prompt_hook_pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&request_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(PromptHookReply { messages, error });
+    } else {
+        tracing::warn!("plugin_prompt_hook_result: unknown request_id {request_id}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_writing(
     intent: String,
@@ -1953,7 +2107,9 @@ async fn start_writing(
     }
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
-    let mut pipeline = app.new_pipeline_with_regex(&ctx.regex_scripts);
+    let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
+    let mut pipeline =
+        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
         .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
         .await;
@@ -3367,7 +3523,9 @@ async fn regenerate(
         *slot = Some(cancel_tx);
     }
 
-    let mut pipeline = app.new_pipeline_with_regex(&ctx.regex_scripts);
+    let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
+    let mut pipeline =
+        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
         .regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx)
         .await;
@@ -7293,6 +7451,7 @@ pub fn run() {
             list_models,
             // M1 写作命令
             start_writing,
+            plugin_prompt_hook_result,
             cancel_writing,
             // M1 对话命令
             list_conversations,
@@ -7519,6 +7678,132 @@ mod tests {
             }
             other => panic!("expected internal serialization error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn frontend_prompt_hook_round_trips_messages_through_pending_reply() {
+        use storyforge_app_agent::runtime::PromptHookContext;
+        use storyforge_domain::agent::AgentRole;
+        use storyforge_domain::llm::ChatMessage;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let hook = frontend_prompt_hook(event_tx, pending.clone());
+        let original = vec![ChatMessage::user("before hook")];
+
+        let hook_task = tokio::spawn(hook(PromptHookContext {
+            role: AgentRole::Editor,
+            round: 1,
+            model: "test-model".into(),
+            messages: original.clone(),
+        }));
+
+        let event = event_rx.recv().await.expect("hook should emit request");
+        let request_id = match event {
+            PipelineEvent::PromptHookRequest {
+                request_id,
+                role,
+                round,
+                model,
+                messages,
+            } => {
+                assert_eq!(role, AgentRole::Editor);
+                assert_eq!(round, 1);
+                assert_eq!(model, "test-model");
+                assert_eq!(messages[0].content, "before hook");
+                request_id
+            }
+            other => panic!("expected prompt hook request, got {other:?}"),
+        };
+
+        let sender = pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&request_id)
+            .expect("pending reply sender should be registered");
+        sender
+            .send(PromptHookReply {
+                messages: Some(vec![
+                    ChatMessage::system("plugin system"),
+                    ChatMessage::user("after hook"),
+                ]),
+                error: None,
+            })
+            .unwrap();
+
+        let hooked = hook_task.await.unwrap().unwrap();
+        assert_eq!(hooked.len(), 2);
+        assert_eq!(hooked[0].content, "plugin system");
+        assert_eq!(hooked[1].content, "after hook");
+    }
+
+    #[tokio::test]
+    async fn frontend_prompt_hook_cleans_pending_request_when_cancelled() {
+        use storyforge_app_agent::runtime::PromptHookContext;
+        use storyforge_domain::agent::AgentRole;
+        use storyforge_domain::llm::ChatMessage;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let hook = frontend_prompt_hook(event_tx, pending.clone());
+
+        let hook_task = tokio::spawn(hook(PromptHookContext {
+            role: AgentRole::Editor,
+            round: 1,
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("before hook")],
+        }));
+
+        let event = event_rx.recv().await.expect("hook should emit request");
+        let request_id = match event {
+            PipelineEvent::PromptHookRequest { request_id, .. } => request_id,
+            other => panic!("expected prompt hook request, got {other:?}"),
+        };
+        assert!(
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&request_id)
+        );
+
+        hook_task.abort();
+        let _ = hook_task.await;
+
+        assert!(
+            !pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&request_id)
+        );
+    }
+
+    #[test]
+    fn plugin_dto_exposes_modify_prompt_permission_and_event_subscriptions() {
+        use storyforge_infra_plugin_host::{InstalledPlugin, Permission, PluginManifest, UiSlot};
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "prompt-hook".into(),
+                name: "Prompt Hook".into(),
+                version: "1.0.0".into(),
+                permissions: vec![Permission::ModifyPrompt],
+                entry_html: String::new(),
+                ui_slots: vec![UiSlot::SidebarPanel],
+                event_subscriptions: vec!["CHAT_COMPLETION_PROMPT_READY".into()],
+                description: None,
+                author: None,
+            },
+            installed_at: chrono::Utc::now(),
+            enabled: true,
+        };
+
+        let dto = plugin_to_dto(&plugin);
+
+        assert_eq!(dto.permissions, vec!["ModifyPrompt"]);
+        assert_eq!(
+            dto.event_subscriptions,
+            vec!["CHAT_COMPLETION_PROMPT_READY"]
+        );
     }
 
     #[test]
