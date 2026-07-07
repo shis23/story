@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
-use storyforge_domain::character::CharacterCard;
+use storyforge_domain::character::{CharacterCard, RoleType};
 use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 use storyforge_domain::mvu_translation::MvuTranslation;
 use storyforge_domain::story_task::StoryTask;
@@ -38,6 +38,9 @@ pub struct StoredMvuTranslation {
     pub translation: MvuTranslation,
     pub analyzed_at: String,
 }
+
+pub const FORCE_RERUN_BLOCKED_BY_CAMPAIGN: &str =
+    "这张角色卡已有游玩档，暂不支持重新识别；请先导入一份新卡再重跑识别。";
 
 pub struct CampaignStore {
     cards_path: PathBuf,
@@ -113,6 +116,38 @@ impl CampaignStore {
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         // 同 source_character_id 去重（重跑识别时覆盖）
         cards.retain(|c| c.card.source_character_id != card.source_character_id);
+        let stored = StoredCard {
+            card,
+            imported_at: chrono::Utc::now().to_rfc3339(),
+        };
+        cards.push(stored.clone());
+        persist(&self.cards_path, &cards)?;
+        Ok(stored)
+    }
+
+    pub fn save_card_if_no_campaigns(&self, card: CharacterCard) -> Result<StoredCard, String> {
+        let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
+        let campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+
+        let source_character_id = card.source_character_id.clone();
+        let mut replaced_card_ids = vec![card.id.clone()];
+        for existing in cards
+            .iter()
+            .filter(|c| c.card.source_character_id == source_character_id)
+        {
+            if !replaced_card_ids.contains(&existing.card.id) {
+                replaced_card_ids.push(existing.card.id.clone());
+            }
+        }
+
+        if campaigns
+            .iter()
+            .any(|campaign| replaced_card_ids.contains(&campaign.card_id))
+        {
+            return Err(FORCE_RERUN_BLOCKED_BY_CAMPAIGN.to_string());
+        }
+
+        cards.retain(|c| c.card.source_character_id != source_character_id);
         let stored = StoredCard {
             card,
             imported_at: chrono::Utc::now().to_rfc3339(),
@@ -217,6 +252,56 @@ impl CampaignStore {
         campaigns.retain(|c| c.id != campaign.id);
         campaigns.push(campaign);
         persist(&self.campaigns_path, &campaigns)
+    }
+
+    pub fn create_campaign_with_instances(
+        &self,
+        campaign: Campaign,
+    ) -> Result<(StoredCard, Campaign, usize), String> {
+        let cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
+        let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+
+        let stored = cards
+            .iter()
+            .find(|c| c.card.id == campaign.card_id)
+            .cloned()
+            .ok_or_else(|| format!("card not found: {}", campaign.card_id))?;
+
+        let mut next_campaigns = campaigns.clone();
+        next_campaigns.retain(|c| c.id != campaign.id);
+        next_campaigns.push(campaign.clone());
+
+        let mut next_instances = instances.clone();
+        let instance_len_before_retain = next_instances.len();
+        next_instances.retain(|i| i.campaign_id != campaign.id);
+        let removed_existing_instances = next_instances.len() != instance_len_before_retain;
+
+        let mut instance_count = 0;
+        for def in &stored.card.character_definitions {
+            if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
+                next_instances.push(CharacterInstance::from_definition(campaign.id.clone(), def));
+                instance_count += 1;
+            }
+        }
+        let instances_changed = removed_existing_instances || instance_count > 0;
+
+        if instances_changed {
+            persist(&self.instances_path, &next_instances)?;
+        }
+        if let Err(err) = persist(&self.campaigns_path, &next_campaigns) {
+            if instances_changed {
+                let _ = persist(&self.instances_path, &instances);
+            }
+            return Err(err);
+        }
+
+        if instances_changed {
+            *instances = next_instances;
+        }
+        *campaigns = next_campaigns;
+
+        Ok((stored, campaign, instance_count))
     }
 
     pub fn update_campaign(&self, campaign: Campaign) -> Result<(), String> {
@@ -621,6 +706,80 @@ mod tests {
         assert!(store.delete_card(&Id::from_str("card-1")).unwrap());
         assert_eq!(store.list_campaigns().len(), 0);
         assert_eq!(store.list_all_instances().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_guarded_card_save_refuses_campaign_on_replaced_source() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let mut card = make_card();
+        card.character_definitions[0].id = Id::from_str("old-def");
+        store.save_card(card.clone()).unwrap();
+
+        let camp = Campaign::new(card.id.clone(), "guarded");
+        store.save_campaign(camp).unwrap();
+
+        let mut rerun_card = card.clone();
+        rerun_card.id = Id::from_str("new-card-id");
+        rerun_card.character_definitions[0].id = Id::from_str("new-def");
+
+        let err = store.save_card_if_no_campaigns(rerun_card).unwrap_err();
+        assert_eq!(err, FORCE_RERUN_BLOCKED_BY_CAMPAIGN);
+
+        let stored = store.get_card(&card.id).unwrap();
+        assert_eq!(
+            stored.card.character_definitions[0].id,
+            Id::from_str("old-def")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_create_campaign_with_instances_uses_current_card_definitions() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let mut card = make_card();
+        card.character_definitions[0].id = Id::from_str("old-def");
+        store.save_card(card.clone()).unwrap();
+
+        let mut current_card = card.clone();
+        current_card.character_definitions[0].id = Id::from_str("current-def");
+        current_card.character_definitions[0].name = "Current".into();
+        store.save_card_if_no_campaigns(current_card).unwrap();
+
+        let campaign = Campaign::new(card.id.clone(), "current definitions");
+        let (_, campaign, instance_count) = store.create_campaign_with_instances(campaign).unwrap();
+
+        assert_eq!(instance_count, 1);
+        let instances = store.list_instances(&campaign.id);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances[0].definition_id.as_ref(),
+            Some(&Id::from_str("current-def"))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_create_campaign_with_instances_does_not_commit_memory_on_instance_persist_failure() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        store.save_card(make_card()).unwrap();
+        std::fs::create_dir_all(&store.instances_path).unwrap();
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "blocked instances");
+        let err = store.create_campaign_with_instances(campaign).unwrap_err();
+
+        assert!(
+            err.contains("instances.json"),
+            "expected instances persist failure, got {err}"
+        );
+        assert!(store.list_campaigns().is_empty());
+        assert!(store.list_all_instances().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

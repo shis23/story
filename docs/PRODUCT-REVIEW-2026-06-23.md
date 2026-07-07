@@ -70,7 +70,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | V2/V3 卡字段 | ✅ 已消费 | `character.rs` |
 | character_book 内嵌世界书 | 🟡 部分 | Constant 注入 + search_world_info 工具 + Director tail 确定性 Selective 关键词触发；ST depth/position 细语义仍有限 |
 | extensions 整体保留 | 🟡 已保留 | `extensions: serde_json::Value` round-trip，不消费 |
-| regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output/World Info/Reasoning；Reasoning 已作用于 `<think>` / `<thinking>` 推理块；`promptOnly`/`markdownOnly` 已按 prompt/display/persisted 目标分流，消息列表 display-only 文本和派生 HTML 片段展示已接入，Slash hook 与完整 PluginHost/JS 状态栏运行时仍待接 |
+| regex_scripts | 🟡 局部运行时接入 | `infra-regex` + `WritingContext.regex_scripts`；Global + active Preset + legacy 选中角色卡 Scoped + Campaign 活动卡 Scoped 脚本已跑 Input/Output/World Info/Reasoning/Slash 最小路径；Reasoning 已作用于 `<think>` / `<thinking>` 推理块；Slash placement 3 已在 `/` 前缀用户/导演意图上先于 Input 正则执行；`promptOnly`/`markdownOnly` 已按 prompt/display/persisted 目标分流，消息列表 display-only 文本和派生 HTML 片段展示已接入，完整 Slash 命令系统与 PluginHost/JS 状态栏运行时仍待接 |
 | alternate_greetings | 🟡 Legacy/Campaign 已接入 | domain/Tauri DTO 已保留；legacy 单卡新会话与 Campaign 新建游玩档均可在前端切换默认/备选开场，后端会校验开场来自源角色卡并持久化到 conversation |
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🔴 未消费 | import 层零命中 |
@@ -83,7 +83,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 | # | 缺口 | 现状 | 工作量 |
 |---|---|---|---|
-| R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output/World Info/Reasoning，且已按当前 ST `placement_codes`（1=User Input，2=AI Output，5=World Info，6=Reasoning）接入；Reasoning 会处理 AI 输出中的 `<think>` / `<thinking>` 块；`promptOnly` 已只进提示词路径，`markdownOnly` 不再污染持久化文本；消息列表 display-only 文本和派生 HTML 片段渲染已接；`minDepth/maxDepth` 已在当前轮 Input/Output 与消息展示路径生效；Slash 执行器目标已识别但真实命令 hook 与完整 PluginHost/JS 状态栏运行时仍未完成 | **1-2 天** |
+| R | **正则系统（独立工作项，见 §2.3.1）** | Global + Preset + Scoped 来源已可 typed 读取并可按 ST 顺序合并；Global settings JSON 导入命令、active Preset、legacy 选中卡和 Campaign 活动卡 Scoped 已进入运行时；执行器已支持 `/pattern/flags`；流水线已执行 `WritingContext.regex_scripts` 的 Input/Output/World Info/Reasoning/Slash 最小路径，且已按当前 ST `placement_codes`（1=User Input，2=AI Output，3=Slash Commands，5=World Info，6=Reasoning）接入；Slash placement 3 会在 `/` 前缀用户/导演意图上先于 Input 正则执行；Reasoning 会处理 AI 输出中的 `<think>` / `<thinking>` 块；`promptOnly` 已只进提示词路径，`markdownOnly` 不再污染持久化文本；消息列表 display-only 文本和派生 HTML 片段渲染已接；`minDepth/maxDepth` 已在当前轮 Input/Output 与消息展示路径生效；完整 Slash 命令注册/参数管道与 PluginHost/JS 状态栏运行时仍未完成 | **1 天** |
 | 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；Campaign 变量宏已接当前快照，单实例保留旧兼容，多角色已有明确 scope 读取；剩余主要是更冷门 ST 宏和 PluginHost/HTML 路径联动 | 0.5-1 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
@@ -94,7 +94,9 @@ StoryForge 的差异化（ST 架构上做不到的）：
 
 ### 2.3.1 正则系统（独立工作项 R）
 
-ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查发现严重缺口：2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。2026-07-06 增量：`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可从 ST settings JSON 导入 Global 正则到 `global_regex_scripts.json`，预设面板已可导入、查看、启停、清空 Global 正则，写作与重 roll 会按 Global → Preset → Scoped 顺序注入；Tauri legacy 写作会从本次选中的角色卡收集 Scoped 正则，并通过 `CharacterInfo.extensions` 持久化卡内扩展；Campaign 写作会从 active Campaign 的 `CharacterCard.raw_card_json.extensions.regex_scripts` 追加卡内 Scoped 正则，并跳过同 ID 的既有 Scoped 脚本以避免 legacy/Campaign 双路径重复执行；`PresetStore` 已持久化 `active_preset.json`，预设面板可设置/清除运行时预设。当前 Input/Output 执行已优先尊重当前 ST 原始 `placement_codes`（1=User Input，2=AI Output），`[1,2]` 会在两端执行，只有未保留原始数组的旧数据才回退到二元枚举；2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流，流水线 Input 走 Prompt、Output 落盘走 Persisted，`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；消息列表展示已通过 `display_content` DTO 接入 Display 目标，编辑和持久化仍保留原始 `content`；`ChatMessage` 已接入派生 HTML 片段安全渲染，只有 display-only 派生内容命中常见 HTML 标签时才走 DOMPurify，原始 `<data_block>` 仍转义显示；`minDepth/maxDepth` 已进入执行器，当前生成/重 roll 的 Input/Output 按 depth 0 执行，消息展示按离末尾的节点深度执行 Display 目标；2026-07-07 追加：当前 ST placement 5 已映射为 `RegexPlacement::WorldInfo`，常驻世界书、关键词触发世界书和 `search_world_info` 工具返回都会在注入 prompt 前执行 World Info 正则，且不改写原始世界书存储；Reasoning placement 6 已接到 AI 输出中的 `<think>` / `<thinking>` 推理块，持久化输出与 display-only 派生展示都会按目标分流执行；Slash placement 3 已被执行器识别，但真实斜杠命令输入 hook 和完整 PluginHost/JS 状态栏运行时仍未接通。
+ST 的正则脚本系统远比"Input/Output 两端替换"复杂。2026-07-06 已补导入保真，Global settings、Preset `extensions.regex_scripts` 和角色卡 Scoped `data.extensions.regex_scripts` 都可解析为 typed `RegexScript`；原始 `placement: Vec<i32>` 会保留为 `placement_codes`，并保留 `markdownOnly`、`promptOnly`、`runOnEdit`、`substituteRegex`、`trimStrings`、`minDepth`、`maxDepth` 等 ST 元数据。`merge_regex_script_sources()` 已可按 Global → Preset → Scoped 顺序合并并标记来源。`infra-regex` 已支持 ST 常见 `/pattern/flags` 形式的 `findRegex`，会合并 inline flags 和 `flags` 字段。`WritingContext.regex_scripts` 已接入 `app-pipeline`，首写和重 roll 会在导演前执行 Input 正则、编剧成文落盘前执行 Output 正则；Tauri 可导入 Global 正则，active Preset 和 legacy/Campaign Scoped 正则也已按顺序注入。
+
+2026-07-07 增量：执行器新增 Prompt/Persisted/Display 目标分流；`promptOnly` 只改提示词，`markdownOnly` 可在 Display 目标生效且不会污染提示词或持久化文本；消息列表展示已通过 `display_content` DTO 接入 Display 目标，编辑和持久化仍保留原始 `content`；`ChatMessage` 已接入派生 HTML 片段安全渲染；`minDepth/maxDepth` 已进入执行器。World Info placement 5 已在世界书注入 prompt 前执行，Reasoning placement 6 已接到 AI 输出中的 `<think>` / `<thinking>` 推理块；Slash placement 3 已在用户/导演意图以 `/` 开头时运行，并会先于 Input 正则执行。完整斜杠命令注册、参数管道和 PluginHost/JS 状态栏运行时仍未接通。
 
 **三个来源（ST 合并优先级：Global → Preset → Scoped）**：
 
@@ -110,7 +112,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 |---|---|---|---|
 | User Input | 1 | ✅ Input | |
 | AI Response | 2 | ✅ Output | |
-| Slash Commands | 3 | 🟡 枚举/执行器识别 | 斜杠命令触发 hook 仍未接线 |
+| Slash Commands | 3 | 🟡 最小输入 hook 已接 | `/` 前缀用户/导演意图会执行 Slash 正则；完整命令注册、参数管道和 JS runtime 仍未接线 |
 | **World Info** | 5 | ✅ Prompt | 世界书内容注入前格式化已接入，不改写原始条目 |
 | Reasoning | 6 | 🟡 `<think>` 块 hook | AI 输出落盘前和消息 `display_content` 派生展示都会处理 `<think>` / `<thinking>` 推理块 |
 
@@ -135,7 +137,7 @@ ST 的正则脚本系统远比"Input/Output 两端替换"复杂。代码核查�
 | 子项 | 工作量 |
 |---|---|
 | 来源合并（Global/Preset/Scoped + 优先级）| 🟡 Global/Preset/Scoped 合并 helper 与运行时已接；Global 已有 settings JSON 导入命令和预设面板 UI |
-| 作用域扩展（加 World Info/Slash/Reasoning）| 🟡 当前 ST placement 常量已对齐；User Input `[1]`、AI Output `[2]`、World Info `[5]`、Reasoning `[6]` 的 `<think>` / `<thinking>` 块已接入；Slash `[3]` 已被执行器识别但真实命令 hook 仍待补 |
+| 作用域扩展（加 World Info/Slash/Reasoning）| 🟡 当前 ST placement 常量已对齐；User Input `[1]`、AI Output `[2]`、Slash `[3]` 最小 `/` 前缀输入 hook、World Info `[5]`、Reasoning `[6]` 的 `<think>` / `<thinking>` 块已接入；完整 Slash 命令系统仍待补 |
 | 瞬时性（Display-only/Prompt-only/Both）| 🟡 Prompt/Persisted/Display 目标分流已接入；消息列表 display-only 文本和派生 HTML 片段渲染已接，完整 PluginHost/JS 状态栏仍需 1-2 天 |
 | Depth 限制（只作用最近 N 条）| 🟡 执行器已支持 `minDepth/maxDepth`；当前轮 Input/Output 按 depth 0，消息展示按离末尾深度执行；prompt 历史批量重写不是当前运行点 |
 | placement 字段保真（保留 `Vec<i32>` + ST 元数据）| ✅ 已完成导入保真；Input/Output/World Info 已有运行时语义 |

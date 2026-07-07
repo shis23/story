@@ -5763,7 +5763,7 @@ fn prepare_character_extraction_card(
         Some(existing) => {
             if !store.list_campaigns_of_card(&existing.card.id).is_empty() {
                 return Err(TauriCommandError::validation(
-                    "这张角色卡已有游玩档，暂不支持重新识别；请先导入一份新卡再重跑识别。",
+                    campaign_store::FORCE_RERUN_BLOCKED_BY_CAMPAIGN,
                 ));
             }
             Ok(CharacterExtractionDecision::Run(existing.card))
@@ -5877,13 +5877,13 @@ async fn extract_characters(
 
     // 已存在则直接返回
     let store = get_campaign_store();
-    let mut card =
-        match prepare_character_extraction_card(store, &character, force.unwrap_or(false))? {
-            CharacterExtractionDecision::ReturnExisting(existing) => {
-                return Ok(CardSummaryDto::from(&existing));
-            }
-            CharacterExtractionDecision::Run(card) => card,
-        };
+    let force = force.unwrap_or(false);
+    let mut card = match prepare_character_extraction_card(store, &character, force)? {
+        CharacterExtractionDecision::ReturnExisting(existing) => {
+            return Ok(CardSummaryDto::from(&existing));
+        }
+        CharacterExtractionDecision::Run(card) => card,
+    };
 
     // MVU schema 探测
     let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
@@ -5925,7 +5925,11 @@ async fn extract_characters(
     card.character_definitions = definitions;
     card.extraction_status = extraction_status;
     card.extraction_message = extraction_message;
-    let stored = save_character_card_async(store, card).await?;
+    let stored = if force {
+        save_character_card_force_rerun_async(store, card).await?
+    } else {
+        save_character_card_async(store, card).await?
+    };
 
     Ok(CardSummaryDto::from(&stored))
 }
@@ -5946,6 +5950,28 @@ fn save_character_card_to_store(
     store
         .save_card(card)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+}
+
+async fn save_character_card_force_rerun_async(
+    store: &'static campaign_store::CampaignStore,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    tokio::task::spawn_blocking(move || save_character_card_force_rerun_to_store(store, card))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
+}
+
+fn save_character_card_force_rerun_to_store(
+    store: &campaign_store::CampaignStore,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    store.save_card_if_no_campaigns(card).map_err(|e| {
+        if e == campaign_store::FORCE_RERUN_BLOCKED_BY_CAMPAIGN {
+            TauriCommandError::validation(e)
+        } else {
+            TauriCommandError::storage(format!("存储写入失败: {e}"))
+        }
+    })
 }
 
 #[tauri::command]
@@ -6033,25 +6059,32 @@ fn create_campaign(
     opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
-    use storyforge_domain::campaign::CharacterInstance;
-    use storyforge_domain::character::RoleType;
     use storyforge_domain::conversation::Role as ConvRole;
 
     let store = get_campaign_store();
-    let stored = store
-        .get_card(&Id::from_str(&card_id))
-        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={card_id}")))?;
+    let card_id_value = Id::from_str(&card_id);
+    if store.get_card(&card_id_value).is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 card id={card_id}"
+        )));
+    }
 
-    let mut campaign = storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), name);
+    let mut campaign = storyforge_domain::campaign::Campaign::new(card_id_value, name);
 
     // 自动建对话并绑定到 Campaign
     let conv = state
         .conv_store
         .create(Some(card_id.clone()), Some(campaign.id.clone()));
     campaign.conversation_id = Some(conv.id.clone());
-    store
-        .save_campaign(campaign.clone())
-        .map_err(|e| format!("存储写入失败: {e}"))?;
+    let (stored, campaign, instance_count) = match store.create_campaign_with_instances(campaign) {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(delete_err) = state.conv_store.delete(&conv.id) {
+                tracing::warn!("创建 Campaign 失败后清理对话失败: {delete_err}");
+            }
+            return Err(TauriCommandError::storage(format!("存储写入失败: {e}")));
+        }
+    };
 
     // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character greeting）
     if let Some(opening) =
@@ -6062,18 +6095,6 @@ fn create_campaign(
                 .append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         tracing::warn!("建 Campaign 时追加开场白失败: {e}");
-    }
-
-    // 实例化所有 protagonist/supporting 定义
-    let mut instance_count = 0;
-    for def in &stored.card.character_definitions {
-        if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
-            let inst = CharacterInstance::from_definition(campaign.id.clone(), def);
-            store
-                .add_instance(inst)
-                .map_err(|e| format!("存储写入失败: {e}"))?;
-            instance_count += 1;
-        }
     }
 
     let mut dto = CampaignSummaryDto::from(&campaign);
@@ -8061,6 +8082,84 @@ mod tests {
             }
             other => panic!("expected validation error, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_force_rerun_commit_rejects_campaign_created_after_prepare() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_extract_force_commit_guard_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let character = make_test_character("Race Guard Card");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.id = Id::from_str("race-card-id");
+        card.character_definitions
+            .push(make_test_character_definition(
+                &card.id,
+                "old-race-def",
+                "Old Race Def",
+            ));
+        store.save_card(card.clone()).unwrap();
+
+        let decision = prepare_character_extraction_card(&store, &character, true).unwrap();
+        let mut rerun_card = match decision {
+            CharacterExtractionDecision::Run(card) => card,
+            CharacterExtractionDecision::ReturnExisting(_) => {
+                panic!("force=true should rerun instead of returning existing card")
+            }
+        };
+        rerun_card.character_definitions.clear();
+        rerun_card
+            .character_definitions
+            .push(make_test_character_definition(
+                &rerun_card.id,
+                "new-race-def",
+                "New Race Def",
+            ));
+
+        let campaign =
+            storyforge_domain::campaign::Campaign::new(card.id.clone(), "created during rerun");
+        let (_, campaign, instance_count) = store.create_campaign_with_instances(campaign).unwrap();
+        assert_eq!(instance_count, 1);
+
+        let err = save_character_card_force_rerun_to_store(&store, rerun_card).unwrap_err();
+        match err {
+            TauriCommandError::Validation { message } => {
+                assert!(message.contains("已有游玩档"));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        let stored_after = store.get_card(&card.id).unwrap();
+        assert!(
+            stored_after
+                .card
+                .character_definitions
+                .iter()
+                .any(|def| def.id == Id::from_str("old-race-def"))
+        );
+        assert!(
+            !stored_after
+                .card
+                .character_definitions
+                .iter()
+                .any(|def| def.id == Id::from_str("new-race-def"))
+        );
+
+        let instances = store.list_instances(&campaign.id);
+        assert_eq!(instances.len(), 1);
+        let definition_id = instances[0].definition_id.as_ref().unwrap();
+        assert!(
+            stored_after
+                .card
+                .character_definitions
+                .iter()
+                .any(|def| &def.id == definition_id)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

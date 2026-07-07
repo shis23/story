@@ -265,11 +265,10 @@ impl PipelineOrchestrator {
             return Err(self.abort_with(&event_tx, PipelineError::InvalidState(msg.into())));
         }
 
-        let director_intent =
-            match apply_context_regex(&intent, &ctx.regex_scripts, RegexPlacement::Input) {
-                Ok(text) => text,
-                Err(e) => return Err(self.abort_with(&event_tx, e)),
-            };
+        let director_intent = match apply_director_intent_regex(&intent, &ctx.regex_scripts) {
+            Ok(text) => text,
+            Err(e) => return Err(self.abort_with(&event_tx, e)),
+        };
         let template_context = prompt_template_context_for_writing(ctx);
 
         let director_config = make_director_config(
@@ -879,14 +878,11 @@ impl PipelineOrchestrator {
                 .as_ref()
                 .map(|p| p.scene_brief.clone())
                 .unwrap_or_else(|| "重新创作".into());
-            let director_intent = match apply_context_regex(
-                &intent_text,
-                &ctx.regex_scripts,
-                RegexPlacement::Input,
-            ) {
-                Ok(text) => text,
-                Err(e) => return Err(self.abort_with(&event_tx, e)),
-            };
+            let director_intent =
+                match apply_director_intent_regex(&intent_text, &ctx.regex_scripts) {
+                    Ok(text) => text,
+                    Err(e) => return Err(self.abort_with(&event_tx, e)),
+                };
 
             // §22 cache 友好布局：history 排除重 roll 目标节点及之后
             let director_history = self.conv_store.recent_messages_as_chat(
@@ -1458,6 +1454,18 @@ fn apply_context_regex(
     };
     apply_regex_scripts_for_target_at_depth(text, scripts, placement, target, 0)
         .map_err(|e| PipelineError::Regex(e.to_string()))
+}
+
+fn apply_director_intent_regex(
+    text: &str,
+    scripts: &[RegexScript],
+) -> Result<String, PipelineError> {
+    let slash_applied = if text.starts_with('/') {
+        apply_context_regex(text, scripts, RegexPlacement::SlashCommand)?
+    } else {
+        text.to_string()
+    };
+    apply_context_regex(&slash_applied, scripts, RegexPlacement::Input)
 }
 
 fn apply_editor_output_regex(text: &str, scripts: &[RegexScript]) -> Result<String, PipelineError> {
@@ -2522,6 +2530,129 @@ mod tests {
             .expect("current ST user input placement should apply before prompting");
 
         assert_eq!(result, "<reader-response>go north</reader-response>");
+    }
+
+    #[test]
+    fn test_director_intent_slash_regex_applies_to_slash_input() {
+        let script = mock_regex_script(
+            "slash-roll",
+            r"^/roll$",
+            "ROLL_INTENT",
+            RegexPlacement::SlashCommand,
+        );
+
+        let result = apply_director_intent_regex("/roll", &[script])
+            .expect("slash command regex should apply to slash input");
+
+        assert_eq!(result, "ROLL_INTENT");
+    }
+
+    #[test]
+    fn test_director_intent_slash_regex_ignores_non_slash_input() {
+        let script = mock_regex_script(
+            "slash-roll",
+            r"^roll$",
+            "SHOULD_NOT_RUN",
+            RegexPlacement::SlashCommand,
+        );
+
+        let result = apply_director_intent_regex("roll", &[script])
+            .expect("non-slash input should skip slash command regex");
+
+        assert_eq!(result, "roll");
+    }
+
+    #[test]
+    fn test_director_intent_slash_regex_uses_prompt_target() {
+        let mut script = mock_regex_script(
+            "prompt-only-slash",
+            r"^/roll$",
+            "ROLL_INTENT",
+            RegexPlacement::SlashCommand,
+        );
+        script.prompt_only = Some(true);
+
+        let result = apply_director_intent_regex("/roll", &[script])
+            .expect("prompt-only slash regex should apply to prompt target");
+
+        assert_eq!(result, "ROLL_INTENT");
+    }
+
+    #[test]
+    fn test_director_intent_non_slash_skips_invalid_slash_regex() {
+        let script = mock_regex_script(
+            "invalid-slash",
+            "(",
+            "SHOULD_NOT_RUN",
+            RegexPlacement::SlashCommand,
+        );
+
+        let result = apply_director_intent_regex("roll", &[script])
+            .expect("non-slash input should not compile slash command regex");
+
+        assert_eq!(result, "roll");
+    }
+
+    #[test]
+    fn test_director_intent_non_slash_still_runs_input_regex() {
+        let input = mock_regex_script(
+            "reader-input-wrapper",
+            r"^hello$",
+            "<reader-response>hello</reader-response>",
+            RegexPlacement::Input,
+        );
+
+        let result = apply_director_intent_regex("hello", &[input])
+            .expect("non-slash input should still run input regex");
+
+        assert_eq!(result, "<reader-response>hello</reader-response>");
+    }
+
+    #[test]
+    fn test_director_intent_input_regex_does_not_reenter_slash_regex() {
+        let slash = mock_regex_script(
+            "slash-foo",
+            r"^/foo$",
+            "SHOULD_NOT_RUN",
+            RegexPlacement::SlashCommand,
+        );
+        let input = mock_regex_script("input-to-slash", r"^hello$", "/foo", RegexPlacement::Input);
+
+        let result = apply_director_intent_regex("hello", &[slash, input])
+            .expect("input regex result should not re-run slash command regex");
+
+        assert_eq!(result, "/foo");
+    }
+
+    #[test]
+    fn test_director_intent_slash_regex_requires_leading_slash() {
+        let script = mock_regex_script(
+            "slash-with-space",
+            r"^\s*/foo$",
+            "SHOULD_NOT_RUN",
+            RegexPlacement::SlashCommand,
+        );
+
+        let result = apply_director_intent_regex(" /foo", &[script])
+            .expect("leading whitespace should not trigger slash command regex");
+
+        assert_eq!(result, " /foo");
+    }
+
+    #[test]
+    fn test_director_intent_input_regex_runs_after_slash_regex() {
+        let slash = mock_regex_script("slash-foo", r"^/foo$", "foo", RegexPlacement::SlashCommand);
+        let input = mock_regex_script(
+            "reader-input-wrapper",
+            r"^foo$",
+            "<reader-response>foo</reader-response>",
+            RegexPlacement::Input,
+        );
+
+        let result = apply_director_intent_regex("/foo", &[slash, input])
+            .expect("input regex should run after slash command regex");
+
+        assert_eq!(result, "<reader-response>foo</reader-response>");
     }
 
     #[test]

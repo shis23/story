@@ -65,14 +65,14 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Slash 命令 hook、完整 PluginHost/JS 状态栏运行时、ST 99 事件全集和 prompt hooks 不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；完整 Slash 命令注册/参数管道、PluginHost/JS 状态栏运行时、ST 99 事件全集和 prompt hooks 不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON | 1. 导入卡。<br>2. 打开角色详情。<br>3. 创建 Campaign。<br>4. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出。 | 导入错误日志；导出的 Campaign bundle；角色详情截图。 | 待跑 |
 | S2 世界书注入 | 含 Constant、Selective、Both 世界书条目的卡；两条不同意图的用户输入 | 1. 写一轮命中关键词的输入。<br>2. 写一轮不命中关键词的输入。<br>3. 检查 Director system/tail 摘要。 | Constant/Both 稳定进入 Director system；Selective/Both 按关键词进入 Director tail；未命中条目不注入。 | pipeline trace；Director 输入摘要；app 日志。 | 待跑 |
 | S3 MVU schema 与状态栏 | 含 MVU 变量定义和状态栏片段的卡；可触发变量变化的一轮写作 | 1. 打开 MVU schema preview。<br>2. 检查新增、覆盖、无变化字段。<br>3. apply schema。<br>4. 写一轮并查看状态栏。 | preview 能区分新增/覆盖/无变化；apply 后变量 tab 刷新；状态栏原生渲染展示关键变量；JS 执行失败时有降级提示。 | Meta/MVU preview 截图；app 日志；Campaign bundle；JS fallback warning。 | 待跑 |
-| S4 Regex/HTML 降级 | 含 `promptOnly`、`markdownOnly`、display-only HTML、`minDepth/maxDepth` 和 reasoning 块的卡 | 1. 导入卡并写一轮。<br>2. 检查 prompt 注入、消息展示和持久化内容。<br>3. 记录任何降级提示。 | `promptOnly` 不污染显示/存储；`markdownOnly` 不污染 prompt/持久化；display-only HTML 安全渲染；depth 过滤和 `<think>/<thinking>` 处理符合当前实现；不支持路径有清晰提示。 | pipeline trace；消息截图；app 日志；降级记录。 | 待跑 |
+| S4 Regex/HTML 降级 | 含 `promptOnly`、`markdownOnly`、display-only HTML、`minDepth/maxDepth`、Slash placement 3 和 reasoning 块的卡 | 1. 导入卡并写一轮。<br>2. 用普通输入和 `/` 前缀输入分别触发写作。<br>3. 检查 prompt 注入、消息展示和持久化内容。<br>4. 记录任何降级提示。 | `promptOnly` 不污染显示/存储；`markdownOnly` 不污染 prompt/持久化；display-only HTML 安全渲染；depth 过滤和 `<think>/<thinking>` 处理符合当前实现；Slash placement 3 只作用于 `/` 前缀输入且随后继续执行 Input 正则；不支持路径有清晰提示。 | pipeline trace；消息截图；app 日志；降级记录。 | 待跑 |
 | S5 导出兼容 | S1-S4 生成的 Campaign；至少一条知识和一条变量 | 1. 导出 StoryForge JSON bundle。<br>2. 导出 ST 卡 PNG 或共享 lorebook（若入口可用）。<br>3. 重新导入导出物做冒烟检查。 | StoryForge 内部多角色 Campaign 不强行退化成单角色卡；导出物保留必要 Campaign 数据；ST 兼容导出说明降级边界。 | 导出 bundle；重新导入日志；导出文件名和大小记录。 | 待跑 |
 
 ## 5. 真实 LLM 验收矩阵

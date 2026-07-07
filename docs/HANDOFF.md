@@ -61,7 +61,7 @@ cargo tauri android build --target aarch64 --ci --split-per-abi --apk
 ## 交接注意事项
 
 - 不要把真实 API key 写入文档、日志摘要、issue、截图或示例配置；文档中只允许出现 `storyforge-secret:v1:*` 这类 SecretRef 形式。
-- 发布说明不要承诺完整 ST 99 事件全集、prompt hooks、Slash 命令 hook 或完整语义级安全边界。
+- 发布说明不要承诺完整 ST 99 事件全集、prompt hooks、完整 Slash 命令系统/PluginHost JS 斜杠运行时或完整语义级安全边界；当前只覆盖 Regex Slash placement 3 对 `/` 前缀写作意图的最小 hook。
 - 传话链和 private/封口能力当前仍要按“文本匹配级门禁 + 真实 LLM 对抗待验证”描述。
 - `CampaignStore` 桌面小/中等数据量暂不阻塞，但 Android、大卡导入和真实长会话必须实测后再决定是否推进后台 flush、分文件索引或 schema 迁移。
 - 归档文档保持只读；新的发布状态记录写入当前 docs。
