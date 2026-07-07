@@ -28,7 +28,12 @@ try {
   try {
     & cargo test -p storyforge-infra-import test_real_complex_card_fixture_preserves_core_st_fields -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) {
-      throw "real-card smoke failed with exit code $LASTEXITCODE"
+      throw "infra-import real-card smoke failed with exit code $LASTEXITCODE"
+    }
+
+    & cargo test -p storyforge test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle -- --ignored --nocapture
+    if ($LASTEXITCODE -ne 0) {
+      throw "tauri-app real-card campaign bundle smoke failed with exit code $LASTEXITCODE"
     }
   } finally {
     Pop-Location

@@ -7806,6 +7806,151 @@ mod tests {
         );
     }
 
+    fn assert_complex_card_raw_extensions(raw_card_json: &serde_json::Value) {
+        let extensions = raw_card_json
+            .get("extensions")
+            .and_then(|value| value.as_object())
+            .expect("raw ST card extensions should remain an object");
+
+        for key in ["regex_scripts", "tavern_helper", "xiaobaix-template"] {
+            assert!(extensions.contains_key(key), "missing extension key: {key}");
+        }
+    }
+
+    fn assert_complex_card_raw_world_book(raw_card_json: &serde_json::Value) {
+        let entries = raw_card_json
+            .get("character_book")
+            .and_then(|book| book.get("entries"))
+            .and_then(|entries| entries.as_array())
+            .expect("raw ST card character_book.entries should remain an array");
+
+        assert_eq!(entries.len(), 441);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("constant")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                })
+                .count(),
+            85
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("selective")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                })
+                .count(),
+            340
+        );
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4())))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+    fn test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle() {
+        use storyforge_domain::character::{
+            CharacterCard, CharacterDefinition, CharacterExtractionStatus,
+        };
+
+        let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("test-card.png")
+            });
+        let bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+        let character =
+            storyforge_infra_import::import_character(&bytes).expect("complex card should import");
+
+        assert_eq!(character.alternate_greetings.len(), 6);
+        assert_complex_card_raw_extensions(&character.raw_card_json);
+        assert_complex_card_raw_world_book(&character.raw_card_json);
+
+        let dir = TempDirGuard::new("storyforge_test_real_complex_bundle");
+        let store = campaign_store::CampaignStore::new(dir.path());
+        let conv_store = ConversationStore::new(dir.path().join("conversations"));
+
+        let mut card = CharacterCard::from_character(&character);
+        card.extraction_status = CharacterExtractionStatus::Extracted;
+        let mut definition = CharacterDefinition::fallback_from_character(&character, &[]);
+        definition.card_id = card.id.clone();
+        card.character_definitions = vec![definition];
+
+        let stored = save_character_card_to_store(&store, card).unwrap();
+        let campaign = create_campaign_in_store(
+            &store,
+            &conv_store,
+            stored.card.id.as_str().to_string(),
+            "Complex Fixture Campaign".into(),
+            None,
+        )
+        .unwrap();
+
+        let campaign_id = Id::from_str(&campaign.id);
+        let instances = store.list_instances(&campaign_id);
+        let expected_instance_count = instances.len();
+        assert!(
+            expected_instance_count > 0,
+            "campaign should create instances"
+        );
+
+        let bundle_json = export_campaign_bundle_from_store(&store, campaign_id).unwrap();
+        let bundle: CampaignBundle = serde_json::from_str(&bundle_json).unwrap();
+        let exported_card = bundle.card.as_ref().expect("bundle should include card");
+        let (_, exported_alternate_greetings) = raw_card_greetings(&exported_card.raw_card_json);
+
+        assert_complex_card_raw_extensions(&exported_card.raw_card_json);
+        assert_complex_card_raw_world_book(&exported_card.raw_card_json);
+        assert_eq!(exported_alternate_greetings.len(), 6);
+        assert_eq!(bundle.instances.len(), expected_instance_count);
+
+        let import_dir = TempDirGuard::new("storyforge_test_real_complex_bundle_import");
+        let import_store = campaign_store::CampaignStore::new(import_dir.path());
+        let import_conv_store = ConversationStore::new(import_dir.path().join("conversations"));
+        let result =
+            import_campaign_bundle_into_store(&import_store, &import_conv_store, bundle).unwrap();
+
+        assert_eq!(result.instance_count, expected_instance_count);
+        let imported_card = import_store
+            .get_card(&Id::from_str(&result.card_id))
+            .expect("imported bundle card should exist");
+        let (_, imported_alternate_greetings) =
+            raw_card_greetings(&imported_card.card.raw_card_json);
+        let imported_instances = import_store.list_instances(&Id::from_str(&result.campaign_id));
+
+        assert_complex_card_raw_extensions(&imported_card.card.raw_card_json);
+        assert_complex_card_raw_world_book(&imported_card.card.raw_card_json);
+        assert_eq!(imported_alternate_greetings.len(), 6);
+        assert_eq!(imported_instances.len(), expected_instance_count);
+    }
+
     #[test]
     fn export_campaign_bundle_includes_complete_campaign_state() {
         use storyforge_domain::agent::RoundSummary;

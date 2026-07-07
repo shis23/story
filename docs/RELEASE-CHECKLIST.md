@@ -4,7 +4,7 @@
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 > 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
-> 专项入口：真实复杂卡导入保真冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
+> 专项入口：真实复杂卡导入 + Campaign bundle roundtrip 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
 
 ## 0. 发布闸门
 
@@ -31,7 +31,7 @@
 
 - 本轮待推送提交栈已执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 并通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。本行只记录自动化基线状态，不作为最终发布 SHA；最终候选 SHA 以 tag/release notes 记录为准。
 - 仍有既有 Vite dynamic/static import warning；本轮未新增同类阻塞，继续按分包风险记录，不视为发布闸门失败。
-- 真实复杂卡导入保真专项 smoke 已补：`scripts/run-real-card-smoke.ps1` 默认读取仓库根目录 `test-card.png`，运行 ignored 回归 `test_real_complex_card_fixture_preserves_core_st_fields`，断言卡名、6 个 alternate greetings、441 条世界书、85 个常驻条目、340 个选择性条目，以及 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等关键 extensions 保留。该 smoke 覆盖 S1 的导入保真子项，不替代 UI 创建 Campaign 和导出 bundle 的人工/端到端验收。
+- 真实复杂卡导入 + Campaign bundle roundtrip 专项 smoke 已补：`scripts/run-real-card-smoke.ps1` 默认读取仓库根目录 `test-card.png`，运行 ignored 回归 `test_real_complex_card_fixture_preserves_core_st_fields` 和 `test_real_complex_card_fixture_can_create_campaign_and_roundtrip_bundle`。前者断言卡名、6 个 alternate greetings、441 条世界书、85 个常驻条目、340 个选择性条目，以及 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等关键 extensions 保留；后者把同一真实卡保存为 `CharacterCard`，创建 Campaign/instances，导出 StoryForge bundle，再导入新 store 并断言关键 extensions、6 个 alternate greetings 和 instances 仍保留。该 smoke 覆盖 S1 的自动导入与 bundle roundtrip 子项，不替代 UI 真实操作和真实写作验收。
 - 专项 smoke runner 已补：`scripts/run-real-llm-smoke.ps1` 统一执行 ignored 真实 LLM 套件并避免打印 API key；`scripts/run-android-smoke.ps1` 统一执行 frontend build、Tauri capability 测试和 Android arm64 host-side check，`-BuildApk` 时再要求 `ANDROID_HOME` / `NDK_HOME`。
 
 2026-07-06 已验证：
@@ -88,11 +88,11 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；ST 冷门 Slash 参数管道、ST 99 事件全集和 prompt hook 审计日志不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback、基础 invocation 解析和基础 pipe chaining，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；完整 ST 冷门 Slash 语义、ST 99 事件全集和 prompt hook 审计日志不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON；自动子项可用仓库根目录 `test-card.png` | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`。<br>2. 在 UI 导入卡。<br>3. 打开角色详情。<br>4. 创建 Campaign。<br>5. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出。 | 导入错误日志；导出的 Campaign bundle；角色详情截图；real-card smoke 输出。 | 自动导入保真已覆盖，UI/Campaign/bundle 待跑 |
+| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON；自动子项可用仓库根目录 `test-card.png` | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`。<br>2. 在 UI 导入卡。<br>3. 打开角色详情。<br>4. 创建 Campaign。<br>5. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出并可重新导入。 | 导入错误日志；导出的 Campaign bundle；角色详情截图；real-card smoke 输出。 | 自动导入保真 + Campaign/bundle roundtrip 已覆盖，UI 真实操作待跑 |
 | S2 世界书注入 | 含 Constant、Selective、Both 世界书条目的卡；两条不同意图的用户输入 | 1. 写一轮命中关键词的输入。<br>2. 写一轮不命中关键词的输入。<br>3. 检查 Director system/tail 摘要。 | Constant/Both 稳定进入 Director system；Selective/Both 按关键词进入 Director tail；未命中条目不注入。 | pipeline trace；Director 输入摘要；app 日志。 | 待跑 |
 | S3 MVU schema 与状态栏 | 含 MVU 变量定义和状态栏片段的卡；可触发变量变化的一轮写作 | 1. 打开 MVU schema preview。<br>2. 检查新增、覆盖、无变化字段。<br>3. apply schema。<br>4. 写一轮并查看状态栏。 | preview 能区分新增/覆盖/无变化；apply 后变量 tab 刷新；状态栏原生渲染展示关键变量；JS 执行失败时有降级提示。 | Meta/MVU preview 截图；app 日志；Campaign bundle；JS fallback warning。 | 待跑 |
 | S4 Regex/HTML 降级 | 含 `promptOnly`、`markdownOnly`、display-only HTML、`minDepth/maxDepth`、Slash placement 3 和 reasoning 块的卡 | 1. 导入卡并写一轮。<br>2. 用普通输入和 `/` 前缀输入分别触发写作。<br>3. 检查 prompt 注入、消息展示和持久化内容。<br>4. 记录任何降级提示。 | `promptOnly` 不污染显示/存储；`markdownOnly` 不污染 prompt/持久化；display-only HTML 安全渲染；depth 过滤和 `<think>/<thinking>` 处理符合当前实现；Slash placement 3 只作用于 `/` 前缀输入且随后继续执行 Input 正则；不支持路径有清晰提示。 | pipeline trace；消息截图；app 日志；降级记录。 | 待跑 |

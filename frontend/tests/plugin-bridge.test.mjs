@@ -846,6 +846,66 @@ test('parses slash invocation strings into raw, named, and unnamed args', () => 
   }])
 })
 
+test('pipes slash command results through pipeline segments', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('echo', (rawArgs, context) => {
+    calls.push(['echo', rawArgs, context.source, context.pipe ?? null])
+    return rawArgs.toUpperCase()
+  })
+  window.registerSlashCommand('wrap', (rawArgs, context) => {
+    calls.push(['wrap', rawArgs, context.source, context.pipe])
+    return `[${context.pipe}] ${rawArgs}`
+  })
+
+  const result = window.triggerSlash('/echo hi | wrap suffix')
+
+  assert.equal(result, '[HI] suffix')
+  assert.deepEqual(calls, [
+    ['echo', 'hi', 'slash', null],
+    ['wrap', 'suffix', 'slash', 'HI'],
+  ])
+})
+
+test('does not split slash pipes inside quoted arguments', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('echo', (rawArgs) => {
+    calls.push(rawArgs)
+    return rawArgs
+  })
+
+  const result = window.triggerSlash('/echo "left | right"')
+
+  assert.equal(result, '"left | right"')
+  assert.deepEqual(calls, ['"left | right"'])
+})
+
+test('awaits async slash command results before piping to the next segment', async () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('fetch', async (rawArgs) => {
+    calls.push(['fetch', rawArgs])
+    await flushPromises()
+    return 'async-value'
+  })
+  window.registerSlashCommand('use', (rawArgs, context) => {
+    calls.push(['use', rawArgs, context.pipe])
+    return `${context.pipe}:${rawArgs}`
+  })
+
+  const result = await window.triggerSlash('/fetch source | use target')
+
+  assert.equal(result, 'async-value:target')
+  assert.deepEqual(calls, [
+    ['fetch', 'source'],
+    ['use', 'target', 'async-value'],
+  ])
+})
+
 test('keeps zero-argument slash command triggers unchanged', () => {
   const { window } = createBridgeSandbox()
   const calls = []

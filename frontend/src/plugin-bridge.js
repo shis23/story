@@ -396,21 +396,74 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return normalized;
   }
 
-  function _triggerSlashCommand(name) {
-    const args = Array.prototype.slice.call(arguments, 1);
-    const trimmedName = typeof name === 'string' ? name.trim() : '';
-    if (args.length === 0 && (trimmedName.charAt(0) === '/' || /\s/.test(trimmedName))) {
-      const parsed = _parseSlashInvocation(name);
-      if (parsed) {
-        return _triggerSlashCommand(parsed.name, parsed.args, parsed);
-      }
-    }
-
+  function _invokeSlashCommand(name, args) {
     const command = _slashCommands.find(function(item) {
       return item.name === name || item.aliases.indexOf(name) >= 0;
     });
     if (!command) return undefined;
     return command.callback.apply(null, args);
+  }
+
+  function _isPromiseLike(value) {
+    return value && typeof value.then === 'function';
+  }
+
+  function _splitSlashPipeline(input) {
+    const segments = [];
+    let current = '';
+    let quote = '';
+    const text = String(input || '');
+    for (let i = 0; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if ((ch === '"' || ch === "'") && text.charAt(i - 1) !== '\\\\') {
+        quote = quote === ch ? '' : quote || ch;
+        current += ch;
+      } else if (ch === '|' && !quote) {
+        if (current.trim()) segments.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) segments.push(current.trim());
+    return segments;
+  }
+
+  function _executeSlashInvocation(input) {
+    const segments = _splitSlashPipeline(input);
+    let previousResult;
+    let chain = null;
+    function runSegment(index, resolvedPipe) {
+      const parsed = _parseSlashInvocation(segments[index]);
+      if (!parsed) return resolvedPipe;
+      if (index > 0) {
+        parsed.pipe = resolvedPipe;
+        parsed.previousResult = resolvedPipe;
+      }
+      return _invokeSlashCommand(parsed.name, [parsed.args, parsed]);
+    }
+    for (let i = 0; i < segments.length; i++) {
+      if (chain) {
+        chain = chain.then(function(resolvedPipe) {
+          return runSegment(i, resolvedPipe);
+        });
+      } else {
+        previousResult = runSegment(i, previousResult);
+        if (_isPromiseLike(previousResult)) {
+          chain = Promise.resolve(previousResult);
+        }
+      }
+    }
+    return chain || previousResult;
+  }
+
+  function _triggerSlashCommand(name) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    const trimmedName = typeof name === 'string' ? name.trim() : '';
+    if (args.length === 0 && (trimmedName.charAt(0) === '/' || /\\s|\\|/.test(trimmedName))) {
+      return _executeSlashInvocation(name);
+    }
+    return _invokeSlashCommand(trimmedName, args);
   }
 
   function _parseSlashTokens(rawArgs) {
