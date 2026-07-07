@@ -956,6 +956,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _callGenericPopup(html, type, defaultValue) {
     if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
+    if (String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
     return Promise.resolve('');
   }
 
@@ -1071,6 +1072,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       eventSource: window.eventSource,
       event_types: _eventTypes,
       eventTypes: _eventTypes,
+      tavern_events: _eventTypes,
       TavernHelper: window.TavernHelper,
       saveSettingsDebounced: window.saveSettingsDebounced,
     };
@@ -1159,6 +1161,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
         AFFIRMATIVE: 1,
         NEGATIVE: 0,
         CANCELLED: null,
+        CUSTOM1: 2,
       },
       characters: window.characters || [],
       groups: window.groups || [],
@@ -1170,6 +1173,9 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       getCurrentChatId: _getCurrentChatId,
       getCurrentMessageId: _getCurrentMessageId,
       getContext: _getContext,
+      event_types: _eventTypes,
+      eventTypes: _eventTypes,
+      tavern_events: _eventTypes,
       saveChat: _saveChat,
       callGenericPopup: _callGenericPopup,
       getRequestHeaders: _getRequestHeaders,
@@ -1250,6 +1256,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   window.event_types = _eventTypes;
   window.eventTypes = _eventTypes;
+  window.tavern_events = window.tavern_events || _eventTypes;
   window.eventSource = {
     on: _on,
     once: _once,
@@ -1289,10 +1296,14 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.SillyTavern.callGenericPopup = window.SillyTavern.callGenericPopup || _callGenericPopup;
   window.SillyTavern.getRequestHeaders = window.SillyTavern.getRequestHeaders || _getRequestHeaders;
   window.SillyTavern.getContext = window.SillyTavern.getContext || _getContext;
+  window.SillyTavern.event_types = window.SillyTavern.event_types || _eventTypes;
+  window.SillyTavern.eventTypes = window.SillyTavern.eventTypes || _eventTypes;
+  window.SillyTavern.tavern_events = window.SillyTavern.tavern_events || _eventTypes;
   window.SillyTavern.POPUP_RESULT = window.SillyTavern.POPUP_RESULT || {
     AFFIRMATIVE: 1,
     NEGATIVE: 0,
     CANCELLED: null,
+    CUSTOM1: 2,
   };
   window.SillyTavern.characters = window.SillyTavern.characters || window.characters;
   window.SillyTavern.groups = window.SillyTavern.groups || window.groups;

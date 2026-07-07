@@ -1509,10 +1509,13 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(window.SillyTavern.getContext().eventSource, window.eventSource)
   assert.equal(window.SillyTavern.getContext().event_types, window.event_types)
   assert.equal(window.SillyTavern.getContext().eventTypes, window.eventTypes)
+  assert.equal(window.SillyTavern.getContext().tavern_events, window.tavern_events)
   assert.equal(window.SillyTavern.getContext().TavernHelper, window.TavernHelper)
   assert.equal(window.SillyTavern.getContext().saveSettingsDebounced, window.saveSettingsDebounced)
   assert.deepEqual(plain(window.SillyTavern.getContext().chat_metadata), {})
   assert.equal(typeof window.SillyTavern.getContext().getCurrentChatId, 'function')
+  assert.equal(window.tavern_events.MESSAGE_RECEIVED, 'MESSAGE_RECEIVED')
+  assert.equal(window.SillyTavern.tavern_events.CHAT_CHANGED, 'CHAT_CHANGED')
 
   window.SillyTavern.chat.push({ name: 'User', mes: 'hello' })
   window.SillyTavern.chat.push({ name: 'Assistant', message: 'old reply' })
@@ -1537,6 +1540,7 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.deepEqual(plain(window.SillyTavern.chat[1].variables), { hp: 5 })
   assert.equal(await window.SillyTavern.saveChat(), true)
   assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
+  assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
   assert.deepEqual(plain(window.SillyTavern.getRequestHeaders()), { 'Content-Type': 'application/json' })
 
   const macro = () => 'macro-value'
