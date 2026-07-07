@@ -145,6 +145,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
 - 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参，并可在最终 LLM request 前通过后端 `prompt_hook_request` / `plugin_prompt_hook_result` 链路改写 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 控制正文暴露；但还不是 ST 99 事件全集，prompt hook 审计日志与冷门语义仍应避免过度承诺。
+- 2026-07-07 自动化补强：前端新增 `prompt-hooks.test.mjs` 固化 `ModifyPrompt` 插件顺序合并、非授权插件跳过、intent/prompt/messages fallback；`plugin-bridge.test.mjs` 继续覆盖 TavernHelper `eventEmitAndWait` payload 串联、prompt hook alias 和 ST 常见 selector 参数顺序。
 - 插件 API 桥已改为调用 `plugin_*` 专用后端命令并注入 `pluginId`，变量读取权限已从写权限中拆出；但变量写入仍保留 `WriteVariables` 直接兼容路径，完整 propose/preview 写入流仍需后续收口，发布说明不要把插件权限描述成完整第三方插件沙箱。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

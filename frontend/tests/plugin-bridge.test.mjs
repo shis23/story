@@ -960,6 +960,95 @@ test('provides TavernHelper aliases for common ST plugin APIs', async () => {
   assert.equal(typeof variablePromise.then, 'function')
 })
 
+test('chains TavernHelper eventEmitAndWait returned payloads in listener order', async () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+  const payload = { prompt: 'base', steps: [] }
+
+  window.TavernHelper.eventOn('CHAT_COMPLETION_PROMPT_READY', async (eventPayload) => {
+    calls.push(['first', eventPayload.prompt])
+    await Promise.resolve()
+    return {
+      ...eventPayload,
+      prompt: `${eventPayload.prompt} + first`,
+      steps: [...eventPayload.steps, 'first'],
+    }
+  })
+  window.TavernHelper.eventOn('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => {
+    calls.push(['second', eventPayload.prompt])
+    return {
+      ...eventPayload,
+      prompt: `${eventPayload.prompt} + second`,
+      steps: [...eventPayload.steps, 'second'],
+    }
+  })
+  window.TavernHelper.eventOn('CHAT_COMPLETION_PROMPT_READY', (eventPayload) => {
+    calls.push(['third', eventPayload.prompt])
+    eventPayload.steps.push('third')
+  })
+
+  const result = await window.TavernHelper.eventEmitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+
+  assert.deepEqual(calls, [
+    ['first', 'base'],
+    ['second', 'base + first'],
+    ['third', 'base + first + second'],
+  ])
+  assert.deepEqual(plain(result), {
+    prompt: 'base + first + second',
+    steps: ['first', 'second', 'third'],
+  })
+  assert.deepEqual(payload, { prompt: 'base', steps: [] })
+})
+
+test('supports TavernHelper prompt hook aliases for host hook requests', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  assert.equal(typeof window.TavernHelper.onGenerateBeforeCombinePrompts, 'function')
+  assert.equal(typeof window.TavernHelper.onChatCompletionPromptReady, 'function')
+  assert.equal(typeof window.TavernHelper.promptHooks.onChatCompletionPromptReady, 'function')
+
+  window.TavernHelper.onGenerateBeforeCombinePrompts((eventPayload) => ({
+    ...eventPayload,
+    prompt: `${eventPayload.prompt} + before`,
+  }))
+  window.TavernHelper.promptHooks.onChatCompletionPromptReady(async (eventPayload) => {
+    await Promise.resolve()
+    return {
+      ...eventPayload,
+      messages: [
+        ...eventPayload.messages,
+        { role: 'system', content: 'helper alias' },
+      ],
+    }
+  })
+
+  assert.deepEqual(
+    plain(await window.TavernHelper.eventEmitAndWait('GENERATE_BEFORE_COMBINE_PROMPTS', { prompt: 'base' })),
+    { prompt: 'base + before' },
+  )
+
+  postHostMessage({
+    type: MSG_HOOK_REQUEST,
+    pluginId: 'plugin-a',
+    id: 'helper-hook-alias',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    data: { messages: [{ role: 'user', content: 'hello' }] },
+  })
+  await flushPromises()
+
+  const response = postedMessages.at(-1)
+  assert.equal(response.targetOrigin, 'https://host.example')
+  assert.equal(response.message.type, MSG_HOOK_RESPONSE)
+  assert.equal(response.message.id, 'helper-hook-alias')
+  assert.deepEqual(plain(response.message.result), {
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'system', content: 'helper alias' },
+    ],
+  })
+})
+
 test('supports selector-based TavernHelper variable helpers without backend calls', () => {
   const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
   const selector = { type: 'message', message_id: 'latest' }
@@ -980,6 +1069,37 @@ test('supports selector-based TavernHelper variable helpers without backend call
 
   window.setVariable(selector, 'phase', 'intro')
   assert.equal(window.getVariable(selector, 'phase'), 'intro')
+  assert.equal(postedMessages.at(-1).message.type, 'sf:ready')
+})
+
+test('supports TavernHelper variable selector helpers with ST argument order', () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const selector = { type: 'message', message_id: 7 }
+
+  window.TavernHelper.setVariables({ type: 'state', hp: 10 }, selector)
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'state', hp: 10 })
+
+  window.insertOrAssignVariables({ type: 'patch', mp: 4 }, selector)
+  assert.deepEqual(plain(window.getVariables(selector)), { type: 'patch', hp: 10, mp: 4 })
+
+  window.updateVariablesWith((vars) => ({
+    hp: vars.hp + 5,
+    mp: vars.mp,
+    type: vars.type,
+    ready: true,
+  }), selector)
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'patch', hp: 15, mp: 4, ready: true })
+
+  window.replaceVariables({ type: 'done', done: true }, selector)
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'done', done: true })
+  window.TavernHelper.setVariables(selector, { type: 'local', hp: 2 })
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'local', hp: 2 })
+  window.insertOrAssignVariables(selector, { type: 'global', mp: 1 })
+  assert.deepEqual(plain(window.getVariables(selector)), { type: 'global', hp: 2, mp: 1 })
+  window.replaceVariables(selector, { type: 'message', done: true })
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'message', done: true })
+  window.TavernHelper.setVariables(selector, { type: 'local' })
+  assert.deepEqual(plain(window.TavernHelper.getVariables(selector)), { type: 'local' })
   assert.equal(postedMessages.at(-1).message.type, 'sf:ready')
 })
 

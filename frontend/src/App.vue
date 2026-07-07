@@ -16,10 +16,11 @@ import MetaPanel from './components/MetaPanel.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import { alertDialog, confirmDialog } from './components/base/BaseDialog.js'
 import { importCharacter, getCharacter, getVersion, startWriting as apiStartWriting, cancelWriting as apiCancelWriting, pluginPromptHookResult, regenerate as apiRegenerate, getActiveConnection, editVariant as apiEditVariant, acceptVariant as apiAcceptVariant, softDeleteVariant as apiSoftDeleteVariant, deleteMessageFrom as apiDeleteMessageFrom, addVariant as apiAddVariant, switchVariant as apiSwitchVariant, listConversations, deleteConversation, getConversation, logAppendFrontend, getActiveCampaign, listCards, getCard, createCampaign, forkCampaign, setActiveCampaign, listInstances, listPlugins, extractCharacters } from './tauri-api.js'
-import { ST_EVENT_TYPES, canModifyPrompt } from './plugin-bridge.js'
+import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
 import { campaignCardOptionSuffix, preferredCampaignCard } from './utils/campaignCardStatus.js'
 import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
+import { emitPromptHookEventAndWaitForPlugins, resolveHookedIntent, resolveHookedMessages } from './utils/promptHooks.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -212,15 +213,12 @@ async function emitPluginEventAndWait(event, data = {}) {
 }
 
 async function emitPromptHookEventAndWait(event, data = {}) {
-  let payload = data
-  for (const plugin of hookPlugins.value || []) {
-    if (!canModifyPrompt(plugin)) continue
-    const host = hookPluginHostRefs.get(plugin.id)
-    if (host?.emitPluginEventAndWait) {
-      payload = await host.emitPluginEventAndWait(event, payload)
-    }
-  }
-  return payload
+  return await emitPromptHookEventAndWaitForPlugins(
+    hookPlugins.value,
+    hookPluginHostRefs,
+    event,
+    data,
+  )
 }
 
 async function runPromptHookEvents(intent) {
@@ -239,12 +237,7 @@ async function runPromptHookEvents(intent) {
   payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload)
   payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload)
 
-  const hookedIntent = typeof payload?.intent === 'string'
-    ? payload.intent
-    : typeof payload?.prompt === 'string'
-      ? payload.prompt
-      : intent
-  return hookedIntent
+  return resolveHookedIntent(payload, intent)
 }
 
 async function handlePromptHookRequest(data = {}) {
@@ -262,9 +255,7 @@ async function handlePromptHookRequest(data = {}) {
       }),
       messages: originalMessages,
     })
-    const messagesForBackend = Array.isArray(payload?.messages)
-      ? payload.messages
-      : originalMessages
+    const messagesForBackend = resolveHookedMessages(payload, originalMessages)
     await pluginPromptHookResult(requestId, messagesForBackend, null)
   } catch (err) {
     await pluginPromptHookResult(requestId, originalMessages, err?.message || String(err))

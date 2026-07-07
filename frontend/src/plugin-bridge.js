@@ -527,6 +527,25 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return value && typeof value === 'object' && !Array.isArray(value);
   }
 
+  function _looksLikeVariableSelector(value) {
+    if (!_isVariableSelector(value) || typeof value.type !== 'string') return false;
+    const keys = Object.keys(value);
+    const hasOnlyKeys = function(allowed) {
+      return keys.every(function(key) { return allowed.includes(key); });
+    };
+
+    if (value.type === 'message') {
+      return hasOnlyKeys(['type', 'message_id', 'messageId']) && ('message_id' in value || 'messageId' in value);
+    }
+    if (value.type === 'preset') {
+      return hasOnlyKeys(['type', 'preset_id', 'presetId', 'name']);
+    }
+    if (['local', 'chat', 'global'].includes(value.type)) {
+      return hasOnlyKeys(['type']);
+    }
+    return false;
+  }
+
   function _stableJson(value) {
     if (!_isVariableSelector(value)) return JSON.stringify(value);
     const keys = Object.keys(value).sort();
@@ -563,8 +582,11 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _setVariables(selectorOrCampaignId, instanceIdOrVariables, key, value) {
-    if (_isVariableSelector(selectorOrCampaignId) && arguments.length <= 2) {
+    if (_looksLikeVariableSelector(selectorOrCampaignId) && arguments.length <= 2) {
       return _writeSelectorVariables(selectorOrCampaignId, instanceIdOrVariables);
+    }
+    if (_looksLikeVariableSelector(instanceIdOrVariables) && arguments.length <= 2) {
+      return _writeSelectorVariables(instanceIdOrVariables, selectorOrCampaignId);
     }
     return window.storyforge.variables.set(selectorOrCampaignId, instanceIdOrVariables, key, value);
   }
@@ -585,7 +607,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _setVariable(selectorOrCampaignId, instanceIdOrKey, keyOrValue, maybeValue) {
-    if (_isVariableSelector(selectorOrCampaignId) || selectorOrCampaignId == null) {
+    if (_looksLikeVariableSelector(selectorOrCampaignId) || selectorOrCampaignId == null) {
       const variables = _readSelectorVariables(selectorOrCampaignId);
       variables[instanceIdOrKey] = keyOrValue;
       return _writeSelectorVariables(selectorOrCampaignId, variables);
@@ -594,25 +616,33 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _insertOrAssignVariables(selector, variables) {
-    const current = _readSelectorVariables(selector);
-    const patch = variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {};
-    return _writeSelectorVariables(selector, Object.assign({}, current, patch));
+    const targetSelector = _looksLikeVariableSelector(selector) ? selector : variables;
+    const patchSource = _looksLikeVariableSelector(selector) ? variables : selector;
+    const current = _readSelectorVariables(targetSelector);
+    const patch = patchSource && typeof patchSource === 'object' && !Array.isArray(patchSource) ? patchSource : {};
+    return _writeSelectorVariables(targetSelector, Object.assign({}, current, patch));
   }
 
   function _replaceVariables(selector, variables) {
-    return _writeSelectorVariables(selector, variables);
+    const targetSelector = _looksLikeVariableSelector(selector) ? selector : variables;
+    const nextVariables = _looksLikeVariableSelector(selector) ? variables : selector;
+    return _writeSelectorVariables(targetSelector, nextVariables);
   }
 
   function _updateVariablesWith(selector, updater) {
-    const current = _readSelectorVariables(selector);
-    const next = typeof updater === 'function' ? updater(Object.assign({}, current)) : updater;
+    const targetSelector = _looksLikeVariableSelector(selector) ? selector : updater;
+    const updaterOrNext = _looksLikeVariableSelector(selector) ? updater : selector;
+    const current = _readSelectorVariables(targetSelector);
+    const next = typeof updaterOrNext === 'function' ? updaterOrNext(Object.assign({}, current)) : updaterOrNext;
     if (next && typeof next === 'object' && !Array.isArray(next)) {
-      return _writeSelectorVariables(selector, next);
+      return _writeSelectorVariables(targetSelector, next);
     }
     return current;
   }
 
   function _createTavernHelper() {
+    const onGenerateBeforeCombinePrompts = (callback) => window.storyforge.events.on(_eventTypes.GENERATE_BEFORE_COMBINE_PROMPTS, callback);
+    const onChatCompletionPromptReady = (callback) => window.storyforge.events.on(_eventTypes.CHAT_COMPLETION_PROMPT_READY, callback);
     return {
       getCharacters: () => window.storyforge.character.list(),
       getCharacter: (id) => window.storyforge.character.get(id),
@@ -630,6 +660,12 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       eventOff: (eventName, callback) => window.storyforge.events.off(eventName, callback),
       eventEmit: (eventName, payload) => window.storyforge.events.emit(eventName, payload),
       eventEmitAndWait: (eventName, payload) => window.storyforge.events.emitAndWait(eventName, payload),
+      onGenerateBeforeCombinePrompts,
+      onChatCompletionPromptReady,
+      promptHooks: {
+        onGenerateBeforeCombinePrompts,
+        onChatCompletionPromptReady,
+      },
       registerSlashCommand: _registerSlashCommand,
       triggerSlash: _triggerSlashCommand,
       triggerSlashCommand: _triggerSlashCommand,
