@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import BaseOverlay from './base/BaseOverlay.vue'
+import { regexPlacementClass, regexPlacementLabel } from '../utils/regexPlacement.js'
 import {
   listPresets,
   getPreset,
@@ -222,47 +223,6 @@ function roleBadgeClass(role) {
   if (role === 'system') return 'bg-accent/10 text-accent'
   if (role === 'user') return 'bg-ok/10 text-ok'
   return 'bg-ink-soft/10 text-ink-soft'
-}
-
-function regexPlacementLabel(regex) {
-  const codes = Array.isArray(regex.placement_codes) ? regex.placement_codes : []
-  if (codes.length === 0) {
-    if (regex.placement === 'input') return '输入'
-    if (regex.placement === 'output') return '输出'
-    if (regex.placement === 'slash_command') return 'Slash'
-    if (regex.placement === 'world_info') return '世界书'
-    if (regex.placement === 'reasoning') return 'Reasoning'
-    return regex.placement || '未知'
-  }
-
-  const labels = codes.map((code) => {
-    if (code === 0) return 'MD显示'
-    if (code === 1) return '输入'
-    if (code === 2) return '输出'
-    if (code === 3) return 'Slash'
-    if (code === 5) return '世界书'
-    if (code === 6) return 'Reasoning'
-    return `#${code}`
-  })
-  return [...new Set(labels)].join('/')
-}
-
-function regexPlacementClass(regex) {
-  const codes = Array.isArray(regex.placement_codes) ? regex.placement_codes : []
-  if (codes.length > 0) {
-    const hasInput = codes.includes(1)
-    const hasOutput = codes.includes(2)
-    const hasWorldInfo = codes.includes(5)
-    if (hasInput && hasOutput) return 'bg-accent/10 text-accent'
-    if (hasInput) return 'bg-running/10 text-running'
-    if (hasOutput) return 'bg-ok/10 text-ok'
-    if (hasWorldInfo) return 'bg-accent/10 text-accent'
-    return 'bg-warn/10 text-warn'
-  }
-  if (regex.placement === 'input') return 'bg-running/10 text-running'
-  if (regex.placement === 'output') return 'bg-ok/10 text-ok'
-  if (regex.placement === 'world_info') return 'bg-accent/10 text-accent'
-  return 'bg-warn/10 text-warn'
 }
 </script>
 

@@ -2,6 +2,7 @@
 import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
 import { listTasks, createTask, completeTask, abandonTask } from '../tauri-api.js'
+import { taskStatusClass, taskStatusText } from '../utils/taskStatus.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -81,22 +82,6 @@ async function handleAbandonTask(taskId) {
   } catch (e) {
     await alertDialog('放弃任务失败: ' + e)
   }
-}
-
-// ─── 状态显示 ───
-function taskStatusText(status) {
-  if (typeof status === 'string') return status
-  if (status?.likely_completed != null) return `可能完成 (${Math.round(status.likely_completed * 100)}%)`
-  return JSON.stringify(status)
-}
-
-function taskStatusClass(status) {
-  const s = typeof status === 'string' ? status : ''
-  if (s === 'pending') return 'bg-wait/10 text-wait'
-  if (s === 'active') return 'bg-running/10 text-running'
-  if (s === 'completed') return 'bg-ok/10 text-ok'
-  if (s === 'abandoned') return 'bg-ink-soft/10 text-ink-soft'
-  return 'bg-warn/10 text-warn'
 }
 
 const statusOptions = [
