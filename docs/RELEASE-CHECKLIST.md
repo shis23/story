@@ -26,6 +26,11 @@
 
 ## 1. 当前自动化基线
 
+2026-07-07 已验证：
+
+- 候选提交 `ef7fe34` 执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。
+- 仍有既有 Vite dynamic/static import warning；本轮未新增同类阻塞，继续按分包风险记录，不视为发布闸门失败。
+
 2026-07-06 已验证：
 
 - 发布脚本当前覆盖 `secret scan`、`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`frontend npm.cmd test`、`frontend npm.cmd run build` 六步；候选版本应以脚本输出为准记录当次结果。
