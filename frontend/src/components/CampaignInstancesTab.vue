@@ -1,11 +1,16 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from './base/BaseDialog.js'
+import MvuStatusBar from './MvuStatusBar.vue'
 import {
   listInstances, getCharacterVariables, setCharacterVariable,
-  promoteTemporaryInstance
+  promoteTemporaryInstance, getCampaign, getCard, metaGetMvuTranslation
 } from '../tauri-api.js'
 import { formatJsonValue as formatJson, inferVarType } from '../utils/campaignDisplay.js'
+import {
+  buildInstanceMvuStatusBarProps,
+  shouldApplyInstanceMvuLoad,
+} from '../utils/campaignMvuStatusBar.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -19,7 +24,9 @@ const loading = ref(false)
 const error = ref(null)
 const expandedInstanceId = ref(null)
 const instanceVariables = ref([])
+const instanceMvuStatusBar = ref(null)
 const promotingInstanceId = ref(null)
+let instanceDetailLoadToken = 0
 
 // ─── 加载 ───
 async function load() {
@@ -38,20 +45,75 @@ async function load() {
 onMounted(load)
 
 watch(() => props.campaignId, () => {
+  expandedInstanceId.value = null
+  instanceVariables.value = []
+  instanceMvuStatusBar.value = null
+  instanceDetailLoadToken += 1
   if (props.campaignId) load()
 })
+
+function isCurrentInstanceLoad(inst, token) {
+  return shouldApplyInstanceMvuLoad({
+    expandedInstanceId: expandedInstanceId.value,
+    instanceId: inst?.id,
+    token,
+    currentToken: instanceDetailLoadToken,
+  })
+}
+
+async function loadInstanceMvuStatusBar(inst, variables, token) {
+  instanceMvuStatusBar.value = null
+  if (!props.campaignId || !inst?.definition_id) return
+
+  try {
+    const campaign = await getCampaign(props.campaignId)
+    if (!campaign?.card_id) return
+
+    const card = await getCard(campaign.card_id)
+    if (!card?.source_character_id) return
+
+    const translationDetail = await metaGetMvuTranslation(card.source_character_id)
+    if (!isCurrentInstanceLoad(inst, token)) return
+
+    instanceMvuStatusBar.value = buildInstanceMvuStatusBarProps({
+      instance: inst,
+      card,
+      translationDetail,
+      variables,
+    })
+  } catch {
+    if (isCurrentInstanceLoad(inst, token)) {
+      instanceMvuStatusBar.value = null
+    }
+  }
+}
+
+async function refreshInstanceVariables(inst, token) {
+  const variables = await getCharacterVariables(props.campaignId, inst.id)
+  if (!isCurrentInstanceLoad(inst, token)) return
+  instanceVariables.value = variables
+  await loadInstanceMvuStatusBar(inst, variables, token)
+}
 
 // ─── 展开/收起实例变量 ───
 async function toggleInstance(inst) {
   if (expandedInstanceId.value === inst.id) {
     expandedInstanceId.value = null
     instanceVariables.value = []
+    instanceMvuStatusBar.value = null
+    instanceDetailLoadToken += 1
   } else {
+    const token = ++instanceDetailLoadToken
     expandedInstanceId.value = inst.id
+    instanceVariables.value = []
+    instanceMvuStatusBar.value = null
     try {
-      instanceVariables.value = await getCharacterVariables(props.campaignId, inst.id)
+      await refreshInstanceVariables(inst, token)
     } catch (e) {
-      instanceVariables.value = []
+      if (isCurrentInstanceLoad(inst, token)) {
+        instanceVariables.value = []
+        instanceMvuStatusBar.value = null
+      }
     }
   }
 }
@@ -80,7 +142,16 @@ async function handleVariableChange(instanceId, key, value, varType) {
     }
 
     await setCharacterVariable(props.campaignId, instanceId, key, parsed)
-    instanceVariables.value = await getCharacterVariables(props.campaignId, instanceId)
+    if (expandedInstanceId.value !== instanceId) return
+
+    const inst = instances.value.find((item) => item.id === instanceId)
+    if (inst) {
+      const token = ++instanceDetailLoadToken
+      await refreshInstanceVariables(inst, token)
+    } else {
+      instanceVariables.value = await getCharacterVariables(props.campaignId, instanceId)
+      instanceMvuStatusBar.value = null
+    }
   } catch (e) {
     await alertDialog('设置变量失败: ' + e)
   }
@@ -144,6 +215,12 @@ defineExpose({ refresh: load })
       <!-- 实例展开：变量编辑 -->
       <div v-if="expandedInstanceId === inst.id" class="border-t border-line px-3 py-2 space-y-2">
         <div class="text-xs font-medium text-ink-soft mb-1">变量</div>
+        <MvuStatusBar
+          v-if="instanceMvuStatusBar"
+          :ui-bindings="instanceMvuStatusBar.uiBindings"
+          :variables="instanceMvuStatusBar.variables"
+          :fallback-count="instanceMvuStatusBar.fallbackCount"
+        />
         <div v-if="instanceVariables.length === 0" class="text-xs text-ink-soft">暂无变量</div>
         <div
           v-for="v in instanceVariables" :key="v.key"
