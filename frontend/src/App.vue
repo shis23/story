@@ -18,6 +18,7 @@ import { importCharacter, getCharacter, getVersion, startWriting as apiStartWrit
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
 import { campaignCardOptionSuffix, preferredCampaignCard } from './utils/campaignCardStatus.js'
+import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -207,24 +208,6 @@ const lastConversationNode = computed(() =>
   findLastAssistantConversationNode(messages.value, currentConversationId.value)
 )
 const selectedGreetingIndex = ref(0)
-function buildGreetingOptionsFromDetail(detail) {
-  if (!detail) return []
-
-  const options = []
-  const seen = new Set()
-  const addOption = (label, content) => {
-    if (!content || !content.trim() || seen.has(content)) return
-    seen.add(content)
-    options.push({ label, content })
-  }
-
-  addOption('默认', detail.first_mes)
-  const alternates = detail.alternate_greetings || []
-  alternates.forEach((content, index) => {
-    addOption(`备选 ${index + 1}`, content)
-  })
-  return options
-}
 const greetingOptions = computed(() => buildGreetingOptionsFromDetail(activeCharDetail.value))
 const selectedGreeting = computed(() => greetingOptions.value[selectedGreetingIndex.value] || null)
 const canChooseGreeting = computed(() =>

@@ -18,6 +18,7 @@ import {
   campaignCardIsFullyExtracted,
   campaignCardShouldShowExtractButton as shouldShowExtractButton,
 } from '../utils/campaignCardStatus.js'
+import { buildGreetingOptionsFromDetail } from '../utils/campaignGreetingOptions.js'
 
 const emit = defineEmits(['close', 'campaign-changed'])
 
@@ -41,22 +42,6 @@ const showNewCampaign = ref(false)
 const newCampaignName = ref('')
 const newCampaignGreetingIndex = ref(0)
 const creatingCampaign = ref(false)
-
-function buildGreetingOptionsFromDetail(detail) {
-  if (!detail) return []
-  const options = []
-  const seen = new Set()
-  const addOption = (label, content) => {
-    if (!content || !content.trim() || seen.has(content)) return
-    seen.add(content)
-    options.push({ label, content })
-  }
-  addOption('默认', detail.first_mes)
-  ;(detail.alternate_greetings || []).forEach((content, index) => {
-    addOption(`备选 ${index + 1}`, content)
-  })
-  return options
-}
 
 const newCampaignGreetingOptions = computed(() => buildGreetingOptionsFromDetail(selectedCampaignCardDetail.value))
 const selectedNewCampaignGreeting = computed(() => newCampaignGreetingOptions.value[newCampaignGreetingIndex.value] || null)
