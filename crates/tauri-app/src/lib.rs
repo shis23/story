@@ -1857,59 +1857,20 @@ async fn start_writing(
 
     // 一 Campaign 一对话：Campaign 模式下用 Campaign 绑定的 conversation_id，
     // 覆盖前端传入的（前端可能在切档时传错或传 null）
-    let campaign_conv_id: Option<Id> = {
-        let active = app
-            .active_campaign
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(cid) = active.as_ref() {
-            get_campaign_store()
-                .get_campaign(cid)
-                .and_then(|c| c.conversation_id.clone())
-        } else {
-            None
-        }
-    };
-    let conversation_id: Option<String> = if let Some(cid) = campaign_conv_id {
-        Some(cid.as_str().to_string())
-    } else {
-        conversation_id
-    };
+    let legacy_opening_character = tool_snapshot.characters.first().cloned();
+    let start_target = prepare_start_conversation_async(
+        app.clone(),
+        get_campaign_store(),
+        conversation_id,
+        character_id.clone(),
+        legacy_opening_character,
+        opening_message,
+        intent.clone(),
+    )
+    .await?;
+    let conversation_id = start_target.conversation_id;
+    let regex_character_id = start_target.regex_character_id;
 
-    // 复用已有对话 或 新建对话
-    let conversation_id = if let Some(id_str) = conversation_id {
-        let id = Id::from_str(&id_str);
-        // 追加 user 意图到已有对话（开场白已在创建时存入）
-        if let Err(e) = app.conv_store.append_user_message(&id, intent.clone()) {
-            tracing::warn!("追加 user 消息失败: {e}");
-        }
-        id
-    } else {
-        // 新建对话 + 存开场白 + 存 user 意图（legacy 路径，无 Campaign 绑定）
-        let conv = app.conv_store.create(character_id.clone(), None);
-        let id = conv.id.clone();
-        // 开场白（从角色卡读取，Final 状态 Assistant 消息；前端可从 alternate_greetings 中选择）
-        if let Some(opening) =
-            resolve_legacy_opening_message(tool_snapshot.characters.first(), opening_message)
-            && let Err(e) = app.conv_store.append_final_message(
-                &id,
-                storyforge_domain::conversation::Role::Assistant,
-                opening,
-            )
-        {
-            tracing::warn!("追加开场白失败: {e}");
-        }
-        // user 意图
-        if let Err(e) = app.conv_store.append_user_message(&id, intent.clone()) {
-            tracing::warn!("追加 user 消息失败: {e}");
-        }
-        id
-    };
-    let regex_character_id = character_id.clone().or_else(|| {
-        app.conv_store
-            .get(&conversation_id)
-            .and_then(|c| c.character_id)
-    });
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
@@ -2010,6 +1971,96 @@ async fn start_writing(
             "node_id": node_id.to_string(),
         })),
         Err(e) => Err(TauriCommandError::from(format!("写作失败: {e}"))),
+    }
+}
+
+struct StartConversationTarget {
+    conversation_id: Id,
+    regex_character_id: Option<String>,
+}
+
+async fn prepare_start_conversation_async(
+    state: Arc<AppState>,
+    campaign_store: &'static campaign_store::CampaignStore,
+    requested_conversation_id: Option<String>,
+    character_id: Option<String>,
+    legacy_opening_character: Option<Arc<storyforge_domain::character::Character>>,
+    opening_message: Option<String>,
+    intent: String,
+) -> Result<StartConversationTarget, TauriCommandError> {
+    tokio::task::spawn_blocking(move || {
+        prepare_start_conversation(
+            state,
+            campaign_store,
+            requested_conversation_id,
+            character_id,
+            legacy_opening_character,
+            opening_message,
+            intent,
+        )
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("准备写作对话任务失败: {e}")))
+}
+
+fn prepare_start_conversation(
+    state: Arc<AppState>,
+    campaign_store: &campaign_store::CampaignStore,
+    requested_conversation_id: Option<String>,
+    character_id: Option<String>,
+    legacy_opening_character: Option<Arc<storyforge_domain::character::Character>>,
+    opening_message: Option<String>,
+    intent: String,
+) -> StartConversationTarget {
+    let campaign_conv_id: Option<Id> = {
+        let active = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        active
+            .as_ref()
+            .and_then(|cid| campaign_store.get_campaign(cid))
+            .and_then(|c| c.conversation_id.clone())
+    };
+    let conversation_id = campaign_conv_id
+        .map(|cid| cid.as_str().to_string())
+        .or(requested_conversation_id);
+
+    let conversation_id = if let Some(id_str) = conversation_id {
+        let id = Id::from_str(&id_str);
+        if let Err(e) = state.conv_store.append_user_message(&id, intent.clone()) {
+            tracing::warn!("追加 user 消息失败: {e}");
+        }
+        id
+    } else {
+        let conv = state.conv_store.create(character_id.clone(), None);
+        let id = conv.id.clone();
+        let legacy_opening =
+            resolve_legacy_opening_message(legacy_opening_character.as_ref(), opening_message);
+        if let Some(opening) = legacy_opening
+            && let Err(e) =
+                state
+                    .conv_store
+                    .append_final_message(&id, ConversationRole::Assistant, opening)
+        {
+            tracing::warn!("追加开场白失败: {e}");
+        }
+        if let Err(e) = state.conv_store.append_user_message(&id, intent.clone()) {
+            tracing::warn!("追加 user 消息失败: {e}");
+        }
+        id
+    };
+
+    let regex_character_id = character_id.or_else(|| {
+        state
+            .conv_store
+            .get(&conversation_id)
+            .and_then(|c| c.character_id)
+    });
+
+    StartConversationTarget {
+        conversation_id,
+        regex_character_id,
     }
 }
 
@@ -8083,6 +8134,135 @@ mod tests {
             .unwrap();
 
         assert_eq!(messages, vec!["user intent", "kept draft"]);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_start_conversation_async_persists_legacy_and_existing_paths() {
+        let state = Arc::new(AppState::new_for_test());
+        let campaign_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_start_conversation_campaign_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&campaign_dir).unwrap();
+        let campaign_store: &'static campaign_store::CampaignStore =
+            Box::leak(Box::new(campaign_store::CampaignStore::new(&campaign_dir)));
+        let mut legacy_character = make_test_character("Legacy Starter");
+        legacy_character.first_mes = "opening line".into();
+        let legacy_character = Arc::new(legacy_character);
+
+        let created = prepare_start_conversation_async(
+            state.clone(),
+            campaign_store,
+            None,
+            Some("char-legacy".into()),
+            Some(legacy_character),
+            None,
+            "write first scene".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.regex_character_id.as_deref(), Some("char-legacy"));
+        let created_conv = state.conv_store.get(&created.conversation_id).unwrap();
+        assert_eq!(created_conv.character_id.as_deref(), Some("char-legacy"));
+        assert_eq!(created_conv.nodes.len(), 2);
+        assert_eq!(
+            created_conv.nodes[0].active().unwrap().role,
+            ConversationRole::Assistant
+        );
+        assert_eq!(
+            created_conv.nodes[0].active().unwrap().status,
+            VariantStatus::Final
+        );
+        assert_eq!(created_conv.nodes[0].active_content(), "opening line");
+        assert_eq!(
+            created_conv.nodes[1].active().unwrap().role,
+            ConversationRole::User
+        );
+        assert_eq!(created_conv.nodes[1].active_content(), "write first scene");
+
+        let reloaded = ConversationStore::new(state.data_dir.join("conversations"));
+        let persisted = reloaded.get(&created.conversation_id).unwrap();
+        assert_eq!(persisted.nodes.len(), 2);
+        assert_eq!(persisted.nodes[0].active_content(), "opening line");
+        assert_eq!(persisted.nodes[1].active_content(), "write first scene");
+
+        let existing = state.conv_store.create(Some("char-existing".into()), None);
+        let mut ignored_character = make_test_character("Ignored Starter");
+        ignored_character.first_mes = "ignored opening".into();
+        let reused = prepare_start_conversation_async(
+            state.clone(),
+            campaign_store,
+            Some(existing.id.as_str().to_string()),
+            None,
+            Some(Arc::new(ignored_character)),
+            Some("ignored opening".into()),
+            "continue scene".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reused.conversation_id, existing.id);
+        assert_eq!(reused.regex_character_id.as_deref(), Some("char-existing"));
+        let reused_conv = state.conv_store.get(&existing.id).unwrap();
+        assert_eq!(reused_conv.nodes.len(), 1);
+        assert_eq!(
+            reused_conv.nodes[0].active().unwrap().role,
+            ConversationRole::User
+        );
+        assert_eq!(reused_conv.nodes[0].active_content(), "continue scene");
+
+        let mut active_campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str(&format!("card-{}", uuid::Uuid::new_v4())),
+            "Active Campaign",
+        );
+        let campaign_conv = state.conv_store.create(
+            Some("char-campaign".into()),
+            Some(active_campaign.id.clone()),
+        );
+        active_campaign.conversation_id = Some(campaign_conv.id.clone());
+        campaign_store
+            .save_campaign(active_campaign.clone())
+            .unwrap();
+        {
+            let mut active = state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *active = Some(active_campaign.id.clone());
+        }
+
+        let requested_conv = state.conv_store.create(Some("char-requested".into()), None);
+        let mut ignored_campaign_character = make_test_character("Campaign Ignored");
+        ignored_campaign_character.first_mes = "campaign ignored opening".into();
+        let campaign_target = prepare_start_conversation_async(
+            state.clone(),
+            campaign_store,
+            Some(requested_conv.id.as_str().to_string()),
+            None,
+            Some(Arc::new(ignored_campaign_character)),
+            Some("campaign ignored opening".into()),
+            "campaign intent".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(campaign_target.conversation_id, campaign_conv.id);
+        assert_eq!(
+            campaign_target.regex_character_id.as_deref(),
+            Some("char-campaign")
+        );
+        let campaign_conv = state.conv_store.get(&campaign_conv.id).unwrap();
+        assert_eq!(campaign_conv.nodes.len(), 1);
+        assert_eq!(
+            campaign_conv.nodes[0].active().unwrap().role,
+            ConversationRole::User
+        );
+        assert_eq!(campaign_conv.nodes[0].active_content(), "campaign intent");
+        let requested_conv = state.conv_store.get(&requested_conv.id).unwrap();
+        assert!(requested_conv.nodes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&campaign_dir);
     }
 
     /// 构造测试用 Character（domain Character 无 Default）
