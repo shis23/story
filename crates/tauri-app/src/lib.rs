@@ -8633,7 +8633,7 @@ mod tests {
         let ctx = WritingContext {
             characters: vec![],
             world_info: None,
-            conversation_id: campaign.conversation_id.clone().unwrap_or_else(Id::new),
+            conversation_id: campaign.conversation_id.clone().unwrap_or_default(),
             campaign_id: Some(campaign_id.clone()),
             turn: 1,
             pending_tasks: vec![],
@@ -8652,8 +8652,11 @@ mod tests {
             agent_profile_config: None,
         };
 
-        let fragments =
-            collect_mvu_fallback_fragments(&ctx, &store, &[present_instance_id.clone()]);
+        let fragments = collect_mvu_fallback_fragments(
+            &ctx,
+            &store,
+            std::slice::from_ref(&present_instance_id),
+        );
         assert_eq!(fragments.len(), 1);
         assert_eq!(
             fragments[0].js_snippet,
