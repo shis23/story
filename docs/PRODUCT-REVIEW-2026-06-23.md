@@ -9,7 +9,7 @@
 
 ## 0. 执行摘要
 
-StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡；当前 ST 兼容已从"格式兼容"推进到主链事件、Regex、常用 Slash、PluginHost slot/statusbar 与 TavernHelper 常用 alias shim，但完整 prompt hooks、冷门 Slash 参数/pipe 语义、ST 99 事件全集和真实卡回归仍是验收主风险。
+StoryForge 的**核心引擎能力几乎全部具备**，但存在一个**战略级愿景鸿沟**：目标用户使用的是"缄默之秋/命定之诗"这类现代化 ST 卡；当前 ST 兼容已从"格式兼容"推进到主链事件、Regex、常用 Slash、PluginHost slot/statusbar、TavernHelper 常用 alias shim 与后端 LLM messages hook 接缝，但完整 prompt hooks 端到端触发、冷门 Slash 参数/pipe 语义、ST 99 事件全集和真实卡回归仍是验收主风险。
 
 本报告给出：①修正后的产品定位 ②三档验收基准（Bronze/Silver/Gold）③ST 运行时兼容的 7 个缺口 + 正则系统独立工作项 + ST 兼容层方案 ④重排后的 7 个 Sprint 路线（含 Android 主线）。
 
@@ -75,7 +75,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | MVU bundle 执行 | 🟡 仅 postprocess | `WebViewMvuRuntime` |
 | tavern_helper 脚本 | 🟡 常用 shim 已接 | import 层仍只保留 raw extension；插件 iframe 已注入 `TavernHelper` / `tavernHelper` 常用 alias，覆盖 events、Slash、statusbar、slot、storage、variables、LLM generate 等转发；完整 38 方法、pipe 语义和真实插件回归仍待补 |
 | ST 宏 / Prompt Template | 🟡 核心子集已接入 | `prompt_module` 已支持 `{{char}}/{{user}}`、角色卡字段、`<user>/<bot>` 别名、`setvar/addvar/getvar/trim/comment` 本地顺序宏、基础时间宏、`random` 和 `roll`，并在 legacy 单卡 system prompt 组装时执行；Campaign 变量可从当前快照读取，单实例保留无前缀兼容，多角色支持 `campaign.*`、`instance.<instance_id>.*` 与唯一 `instance.<name>.*` 明确作用域，并保留歧义唯一角色宏 |
-| ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法，含顺序等待 async listener 的 `emit` 和同步 `emitAndWait`；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；ST 99 事件全集真实 emit 与 prompt 组装钩子仍未全量兼容 |
+| ST 事件总线 | 🟡 主链已接 + 前端 shim | `App.vue` 会把写作/重 roll 的 `PipelineEvent` feed 透传到 `DebugDrawer` / `PluginHost`，`plugin-bridge.js` 映射为 `pipeline.*`、原生事件名和少量 ST 常用别名；iframe 侧已提供 `event_types` / `eventTypes` 与 `eventSource` 常用方法，含顺序等待 async listener 的 `emit` 和同步 `emitAndWait`；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；后端 `AgentRuntime` 已有最终 LLM messages 异步 hook 接缝；ST 99 事件全集真实 emit、前端 host-to-iframe hook 回传与 prompt hook 端到端合并仍未全量兼容 |
 | iframe 沙箱 API | ✅ 已有 | `PluginHost.vue` + `plugin-bridge.js` 完整 |
 | 插件 API（window.storyforge）| ✅ 已有 | 8 方法 + 权限 + UI 槽 + 事件 |
 
@@ -87,7 +87,7 @@ StoryForge 的差异化（ST 架构上做不到的）：
 | 2 | ST 宏替换扩展到 ~30 个 | 已从 3 个扩到核心子集并接入 legacy 单卡 prompt；基础动态时间、随机、roll 已补；Campaign 变量宏已接当前快照，单实例保留旧兼容，多角色已有明确 scope 读取；剩余主要是更冷门 ST 宏和 PluginHost/HTML 路径联动 | 0.5-1 天 |
 | 3 | first_mes/regex HTML 送进 PluginHost 渲染 | PluginHost 已有 | 3-4 天 |
 | 4 | alternate_greeting 切换 UI | legacy 单卡新会话与 Campaign 新建游玩档已可切换并持久化；完整 HTML 开场渲染仍归入 PluginHost 兼容线 | 已完成核心路径 |
-| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe，并提供 ST 风格 `eventSource`/`event_types` 前端 shim；`emit`/`emitAndWait` 语义已补到可支撑异步监听器和 prompt hook payload 改写；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；剩余是 ST 全量事件的真实触发点和 prompt 组装钩子 | 核心已完成，兼容层待补 |
+| 5 | 事件总线接线 | ✅ 主生成链已桥接到插件 iframe，并提供 ST 风格 `eventSource`/`event_types` 前端 shim；`emit`/`emitAndWait` 语义已补到可支撑异步监听器和 prompt hook payload 改写；主聊天宿主动作已开始 emit `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_*`、`CHARACTER_LOADED`；后端最终 LLM messages hook 接缝已接；剩余是 ST 全量事件的真实触发点、前端 hook request/response 与 prompt 组装钩子端到端接线 | 核心已完成，兼容层待补 |
 | 6 | Prompt 组装事件暴露 | `assemble_system_prompt` 返回 String | 改返回 `Vec<PromptSegment>` + emit，2 天 |
 | 7 | 世界书 Selective 触发 | ✅ 已接入确定性关键词扫描 | Director tail 注入命中绿灯/Both；secondary AND/OR/NOT 已覆盖，ST depth/position 细语义继续归入后续兼容 |
 | 8 | H-012 trait 抽象 | ✅ 已完成：`infra-plugin-host` 不再依赖 tauri | Tauri/WebView adapter 已移动到 `tauri-app/src/mvu_webview_runtime.rs` |

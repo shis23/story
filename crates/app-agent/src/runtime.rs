@@ -2,6 +2,8 @@
 ///
 /// 核心函数 run_tool_loop()：循环调用 LLM + 执行工具，直到完成或超限。
 /// 设计来源：TT 的 AgentRuntimeService（max_rounds + drift recovery + watch 取消）。
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -59,15 +61,44 @@ pub struct AgentConfig {
     pub terminal_tools: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PromptHookContext {
+    pub role: AgentRole,
+    pub round: u32,
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+}
+
+pub type PromptHookResult = Result<Vec<ChatMessage>, AgentError>;
+pub type PromptHookFuture = Pin<Box<dyn Future<Output = PromptHookResult> + Send>>;
+pub type PromptHook = Arc<dyn Fn(PromptHookContext) -> PromptHookFuture + Send + Sync>;
+
 /// Agent 运行时
 pub struct AgentRuntime {
     llm: Arc<dyn LlmClient>,
     tool_ctx: Arc<ToolContext>,
+    prompt_hook: Option<PromptHook>,
 }
 
 impl AgentRuntime {
     pub fn new(llm: Arc<dyn LlmClient>, tool_ctx: Arc<ToolContext>) -> Self {
-        Self { llm, tool_ctx }
+        Self {
+            llm,
+            tool_ctx,
+            prompt_hook: None,
+        }
+    }
+
+    pub fn with_prompt_hook(
+        llm: Arc<dyn LlmClient>,
+        tool_ctx: Arc<ToolContext>,
+        prompt_hook: PromptHook,
+    ) -> Self {
+        Self {
+            llm,
+            tool_ctx,
+            prompt_hook: Some(prompt_hook),
+        }
     }
 
     /// 获取 LLM 客户端（供子 Agent 构造独立 runtime 时 clone）
@@ -78,6 +109,56 @@ impl AgentRuntime {
     /// 获取 ToolContext（供子 Agent 构造独立 runtime 时 clone 并修改）
     pub fn tool_ctx(&self) -> Arc<ToolContext> {
         self.tool_ctx.clone()
+    }
+
+    async fn apply_prompt_hook(
+        &self,
+        config: &AgentConfig,
+        round: u32,
+        messages: Vec<ChatMessage>,
+    ) -> Result<Vec<ChatMessage>, AgentError> {
+        if let Some(prompt_hook) = &self.prompt_hook {
+            prompt_hook(PromptHookContext {
+                role: config.role.clone(),
+                round,
+                model: config.model.clone(),
+                messages,
+            })
+            .await
+        } else {
+            Ok(messages)
+        }
+    }
+
+    async fn wait_until_cancelled(mut cancel: watch::Receiver<bool>) {
+        if *cancel.borrow() {
+            return;
+        }
+        loop {
+            if cancel.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            if *cancel.borrow() {
+                return;
+            }
+        }
+    }
+
+    async fn apply_prompt_hook_with_cancel(
+        &self,
+        config: &AgentConfig,
+        round: u32,
+        messages: Vec<ChatMessage>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Vec<ChatMessage>, AgentError> {
+        if self.prompt_hook.is_none() {
+            return Ok(messages);
+        }
+
+        tokio::select! {
+            result = self.apply_prompt_hook(config, round, messages) => result,
+            _ = Self::wait_until_cancelled(cancel) => Err(AgentError::Cancelled),
+        }
     }
 
     /// 运行工具循环（对应 TT 的 run_tool_loop）
@@ -109,8 +190,12 @@ impl AgentRuntime {
             debug!(target: "app-agent", "{}: 第 {round}/{max} 轮",
                 config.role, max = config.max_tool_rounds);
 
+            let request_messages = self
+                .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
+                .await?;
+
             let req = ChatRequest {
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: if tool_registry.tool_specs().is_empty() {
                     None
                 } else {
@@ -236,8 +321,12 @@ impl AgentRuntime {
             debug!(target: "app-agent", "{}[stream]: 第 {round}/{max} 轮",
                 config.role, max = config.max_tool_rounds);
 
+            let request_messages = self
+                .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
+                .await?;
+
             let req = ChatRequest {
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: if tool_registry.tool_specs().is_empty() {
                     None
                 } else {
@@ -379,8 +468,12 @@ impl AgentRuntime {
             debug!(target: "app-agent", "{}[layout]: 第 {round}/{max} 轮",
                 config.role, max = rounds);
 
+            let request_messages = self
+                .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
+                .await?;
+
             let req = ChatRequest {
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: if tool_registry.tool_specs().is_empty() {
                     None
                 } else {
@@ -624,7 +717,11 @@ pub async fn spawn_subagents(
             ctx.campaign_runtime = campaign_runtime.clone();
             Arc::new(ctx)
         };
-        let sub_runtime = Arc::new(AgentRuntime::new(runtime.llm(), sub_tool_ctx));
+        let sub_runtime = Arc::new(AgentRuntime {
+            llm: runtime.llm(),
+            tool_ctx: sub_tool_ctx,
+            prompt_hook: runtime.prompt_hook.clone(),
+        });
 
         // 注册子 Agent 工具（get_character 限制为当前 instance）
         let mut registry = ToolRegistry::new();
@@ -1238,6 +1335,324 @@ mod tests {
 
         // 流式 progress 应有 token 推送（mock 的 stream=false 也会走 forward_fut）
         drop(prog_rx); // 仅证明 channel 正常（mock 非流式时 progress 可能为空，不强制断言）
+    }
+
+    #[tokio::test]
+    async fn test_prompt_hook_mutates_layout_messages_before_llm_request() {
+        use storyforge_domain::llm::Usage;
+        use storyforge_domain::message_layout::MessageLayout;
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "hooked response".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let hook: PromptHook = Arc::new(|ctx: PromptHookContext| {
+            assert_eq!(ctx.role, AgentRole::Editor);
+            assert_eq!(ctx.round, 1);
+            assert_eq!(ctx.model, "mock");
+            Box::pin(async move {
+                let mut messages = ctx.messages;
+                messages[0].content.push_str("\nHOOKED_SYSTEM");
+                messages.push(ChatMessage::user("HOOKED_TAIL"));
+                Ok(messages)
+            })
+        });
+        let runtime = AgentRuntime::with_prompt_hook(llm.clone(), tool_ctx, hook);
+
+        let layout = MessageLayout::build()
+            .system("base system")
+            .tail(|t| t.push("base tail"));
+        let config = AgentConfig {
+            role: AgentRole::Editor,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (_tx, cancel) = watch::channel(false);
+        let (prog_tx, _prog_rx) = mpsc::unbounded_channel::<String>();
+
+        let resp = runtime
+            .run_tool_loop_with_layout(&config, layout, &ToolRegistry::new(), cancel, prog_tx, None)
+            .await
+            .expect("hooked layout run should succeed");
+
+        assert_eq!(resp.content, "hooked response");
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0].messages;
+        assert!(sent[0].content.contains("HOOKED_SYSTEM"));
+        assert!(sent.iter().any(|message| message.content == "HOOKED_TAIL"));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_hook_mutates_plain_run_messages_before_llm_request() {
+        use storyforge_domain::llm::Usage;
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "plain hooked response".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let hook: PromptHook = Arc::new(|ctx: PromptHookContext| {
+            Box::pin(async move {
+                let mut messages = ctx.messages;
+                messages[0].content.push_str("\nPLAIN_HOOKED_SYSTEM");
+                messages.push(ChatMessage::user("PLAIN_HOOKED_TAIL"));
+                Ok(messages)
+            })
+        });
+        let runtime = AgentRuntime::with_prompt_hook(llm.clone(), tool_ctx, hook);
+        let config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: "plain system".into(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (_tx, cancel) = watch::channel(false);
+
+        let resp = runtime
+            .run_tool_loop(&config, "plain user".into(), &ToolRegistry::new(), cancel)
+            .await
+            .expect("plain run should succeed");
+
+        assert_eq!(resp.content, "plain hooked response");
+        let sent = &llm.requests()[0].messages;
+        assert!(sent[0].content.contains("PLAIN_HOOKED_SYSTEM"));
+        assert!(
+            sent.iter()
+                .any(|message| message.content == "PLAIN_HOOKED_TAIL")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_hook_mutates_streaming_messages_before_llm_request() {
+        use storyforge_domain::llm::Usage;
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "stream hooked response".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let hook: PromptHook = Arc::new(|ctx: PromptHookContext| {
+            Box::pin(async move {
+                let mut messages = ctx.messages;
+                messages[0].content.push_str("\nSTREAM_HOOKED_SYSTEM");
+                messages.push(ChatMessage::user("STREAM_HOOKED_TAIL"));
+                Ok(messages)
+            })
+        });
+        let runtime = AgentRuntime::with_prompt_hook(llm.clone(), tool_ctx, hook);
+        let config = AgentConfig {
+            role: AgentRole::Editor,
+            system_prompt: "stream system".into(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (_tx, cancel) = watch::channel(false);
+        let (prog_tx, _prog_rx) = mpsc::unbounded_channel::<String>();
+
+        let resp = runtime
+            .run_tool_loop_streaming(
+                &config,
+                "stream user".into(),
+                &ToolRegistry::new(),
+                cancel,
+                prog_tx,
+                None,
+            )
+            .await
+            .expect("streaming run should succeed");
+
+        assert_eq!(resp.content, "stream hooked response");
+        let sent = &llm.requests()[0].messages;
+        assert!(sent[0].content.contains("STREAM_HOOKED_SYSTEM"));
+        assert!(
+            sent.iter()
+                .any(|message| message.content == "STREAM_HOOKED_TAIL")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_hook_wait_is_cancel_aware() {
+        use storyforge_domain::llm::Usage;
+        use storyforge_domain::message_layout::MessageLayout;
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "should not be called".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let hook: PromptHook = Arc::new(|_ctx: PromptHookContext| {
+            Box::pin(async move { std::future::pending::<PromptHookResult>().await })
+        });
+        let runtime = AgentRuntime::with_prompt_hook(llm.clone(), tool_ctx, hook);
+        let layout = MessageLayout::build()
+            .system("base system")
+            .tail(|t| t.push("base tail"));
+        let config = AgentConfig {
+            role: AgentRole::Editor,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let (cancel_tx, cancel) = watch::channel(false);
+        let (prog_tx, _prog_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.run_tool_loop_with_layout(
+                &config,
+                layout,
+                &ToolRegistry::new(),
+                cancel,
+                prog_tx,
+                None,
+            ),
+        )
+        .await
+        .expect("cancel should interrupt pending prompt hook");
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_subagents_inherits_prompt_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
+            content: "subagent ok with enough narrative content to satisfy completion probe".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }]));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = hook_calls.clone();
+        let hook: PromptHook = Arc::new(move |ctx: PromptHookContext| {
+            let hook_calls = hook_calls_for_hook.clone();
+            Box::pin(async move {
+                assert!(matches!(ctx.role, AgentRole::Subagent(_)));
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ctx.messages)
+            })
+        });
+        let runtime = Arc::new(AgentRuntime::with_prompt_hook(llm, tool_ctx, hook));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let tasks = vec![SubagentTask {
+            character_id: "A".into(),
+            brief: "act".into(),
+            context_package: ContextPackage {
+                character_brief: "Character A".into(),
+                scene_brief: "Scene".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "Act now".into(),
+            },
+        }];
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = spawn_subagents(
+            tasks,
+            runtime,
+            &director_config,
+            "base system",
+            cancel_rx,
+            mpsc::unbounded_channel::<PipelineEvent>().0,
+            None,
+            1,
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
     }
 
     /// M-001：畸形 tool-call 参数应反馈给 LLM，不应带着伪造参数执行真实工具。
