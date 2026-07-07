@@ -222,7 +222,15 @@ fn load_embed_config_with_secret_store(
     let path = data_dir.join("embed.json");
     if path.exists() {
         let data = std::fs::read_to_string(&path).ok()?;
-        let mut config: storyforge_infra_llm::EmbedConfig = serde_json::from_str(&data).ok()?;
+        let mut config: storyforge_infra_llm::EmbedConfig = match serde_json::from_str(&data) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!("嵌入配置 JSON 解析失败({e})，尝试 .tmp 备份");
+                let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                let tmp_data = std::fs::read_to_string(&tmp).ok()?;
+                serde_json::from_str(&tmp_data).ok()?
+            }
+        };
         if is_secret_ref(&config.api_key) {
             config.api_key = match resolve_secret_value(&config.api_key, secret_store) {
                 Ok(api_key) => api_key,
@@ -8311,6 +8319,43 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("embed.json")).unwrap();
         assert!(!raw.contains("legacy-embed-secret"));
         assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_embed_config_recovers_tmp_and_migrates_plaintext_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_embed_tmp_migrate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = MemorySecretStore::default();
+        let api_key = ["s", "k", "-embed-recovered-secret"].concat();
+        let config = storyforge_infra_llm::EmbedConfig {
+            endpoint: "https://api.example.com/v1/embeddings".into(),
+            api_key: api_key.clone(),
+            model: "embed-model".into(),
+            dim: 3,
+        };
+        let path = dir.join("embed.json");
+        std::fs::write(&path, "{ invalid").unwrap();
+        storyforge_infra_util::atomic_write_json(
+            &PathBuf::from(format!("{}.tmp", path.display())),
+            &config,
+        )
+        .unwrap();
+
+        let loaded = load_embed_config_with_secret_store(&dir, &secret_store).unwrap();
+        assert_eq!(loaded.api_key, api_key);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(&api_key));
+        assert!(!raw.contains("Authorization"));
+        assert!(!raw.contains("Bearer"));
+        assert!(!raw.contains("sk-"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+        assert!(!path.with_extension("json.corrupt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
