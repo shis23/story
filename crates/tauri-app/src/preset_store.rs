@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::storage::json_store;
 use storyforge_domain::preset::Preset;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,29 +23,17 @@ impl PresetStore {
     pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("presets.json");
         let active_path = app_data_dir.join("active_preset.json");
-        let presets = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                    tracing::warn!("preset JSON parse failed ({e}), trying .tmp backup");
-                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-                    std::fs::read_to_string(&tmp)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| {
-                            tracing::error!(
-                                "preset JSON and .tmp backup are corrupt, file: {}, error: {}. saved .corrupt backup",
-                                path.display(),
-                                e
-                            );
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            Vec::new()
-                        })
-                }),
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
+        let presets: Vec<StoredPreset> = json_store::load_json_with_tmp_backup_or_default(
+            &path,
+            |e| tracing::warn!("preset JSON parse failed ({e}), trying .tmp backup"),
+            |path, e| {
+                tracing::error!(
+                    "preset JSON and .tmp backup are corrupt, file: {}, error: {}. saved .corrupt backup",
+                    path.display(),
+                    e
+                )
+            },
+        );
         let active_id = if active_path.exists() {
             match std::fs::read_to_string(&active_path) {
                 Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {

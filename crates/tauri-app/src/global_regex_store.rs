@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::storage::json_store;
 use serde_json::Value;
 use storyforge_domain::preset::{Preset, RegexScript, RegexScriptSource, StPreset};
 
@@ -12,29 +13,17 @@ pub struct GlobalRegexStore {
 impl GlobalRegexStore {
     pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("global_regex_scripts.json");
-        let mut scripts = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                    tracing::warn!("global regex JSON parse failed ({e}), trying .tmp backup");
-                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-                    std::fs::read_to_string(&tmp)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| {
-                            tracing::error!(
-                                "global regex JSON and .tmp backup are corrupt, file: {}, error: {}. saved .corrupt backup",
-                                path.display(),
-                                e
-                            );
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            Vec::new()
-                        })
-                }),
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
+        let mut scripts: Vec<RegexScript> = json_store::load_json_with_tmp_backup_or_default(
+            &path,
+            |e| tracing::warn!("global regex JSON parse failed ({e}), trying .tmp backup"),
+            |path, e| {
+                tracing::error!(
+                    "global regex JSON and .tmp backup are corrupt, file: {}, error: {}. saved .corrupt backup",
+                    path.display(),
+                    e
+                )
+            },
+        );
         normalize_global_sources(&mut scripts);
 
         Self {

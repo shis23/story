@@ -4,6 +4,9 @@ use std::sync::Mutex;
 
 use crate::CharacterInfo;
 
+#[path = "json_store.rs"]
+pub(crate) mod json_store;
+
 /// 已存储的角色卡
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCharacter {
@@ -23,26 +26,17 @@ impl CharacterStore {
     /// 初始化存储（从文件加载或新建）
     pub fn new(app_data_dir: &Path) -> Self {
         let path = app_data_dir.join("characters.json");
-        let characters = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                    // 主文件损坏，尝试 .tmp 备份
-                    tracing::warn!("角色卡 JSON 解析失败({e})，尝试 .tmp 备份");
-                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-                    std::fs::read_to_string(&tmp)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| {
-                            tracing::error!("角色卡 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            Vec::new()
-                        })
-                }),
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
+        let characters: Vec<StoredCharacter> = json_store::load_json_with_tmp_backup_or_default(
+            &path,
+            |e| tracing::warn!("角色卡 JSON 解析失败({e})，尝试 .tmp 备份"),
+            |path, e| {
+                tracing::error!(
+                    "角色卡 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                    path.display(),
+                    e
+                )
+            },
+        );
         Self {
             path,
             inner: Mutex::new(characters),

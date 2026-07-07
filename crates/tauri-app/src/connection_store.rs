@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::storage::json_store;
 use storyforge_domain::llm::LlmConnection;
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
@@ -49,26 +50,17 @@ impl ConnectionStore {
 
     pub fn new_with_secret_store(app_data_dir: &Path, secret_store: Arc<dyn SecretStore>) -> Self {
         let path = app_data_dir.join("connections.json");
-        let file = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                    // 主文件损坏，尝试 .tmp 备份
-                    tracing::warn!("连接配置 JSON 解析失败({e})，尝试 .tmp 备份");
-                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-                    std::fs::read_to_string(&tmp)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| {
-                            tracing::error!("连接配置 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份", path.display(), e);
-                            let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
-                            ConnectionsFile::default()
-                        })
-                }),
-                Err(_) => ConnectionsFile::default(),
-            }
-        } else {
-            ConnectionsFile::default()
-        };
+        let file: ConnectionsFile = json_store::load_json_with_tmp_backup_or_default(
+            &path,
+            |e| tracing::warn!("连接配置 JSON 解析失败({e})，尝试 .tmp 备份"),
+            |path, e| {
+                tracing::error!(
+                    "连接配置 JSON 主文件和 .tmp 备份均损坏，文件: {}, 错误: {}. 已保存 .corrupt 备份",
+                    path.display(),
+                    e
+                )
+            },
+        );
         let store = Self {
             path,
             secret_store,
@@ -424,6 +416,44 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
         assert!(!raw.contains("sk-test"));
         assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+        assert_eq!(store.active_connection().unwrap().api_key, "sk-test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_recovers_tmp_and_migrates_plaintext_api_key_to_secret_ref() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_tmp_migrate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stored = StoredConnection {
+            id: "legacy-tmp".into(),
+            connection: make_conn("legacy-tmp"),
+            created_at: "2026-07-06 00:00:00".into(),
+            last_used_at: None,
+        };
+        let file = ConnectionsFile {
+            active_id: Some("legacy-tmp".into()),
+            connections: vec![stored],
+        };
+        let path = dir.join("connections.json");
+        std::fs::write(&path, "{ invalid").unwrap();
+        storyforge_infra_util::atomic_write_json(
+            &PathBuf::from(format!("{}.tmp", path.display())),
+            &file,
+        )
+        .unwrap();
+
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        let raw = std::fs::read_to_string(&path).unwrap();
+
+        assert!(!raw.contains("sk-test"));
+        assert!(raw.contains(storyforge_infra_util::secret_store::SECRET_REF_PREFIX));
+        assert!(!path.with_extension("json.corrupt").exists());
         assert_eq!(store.active_connection().unwrap().api_key, "sk-test");
 
         let _ = std::fs::remove_dir_all(&dir);
