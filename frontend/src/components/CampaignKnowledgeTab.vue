@@ -1,6 +1,14 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { listCharacterKnowledge } from '../tauri-api.js'
+import {
+  instanceLabel,
+  knowledgeSourceText,
+  propagationText,
+  relayChainText,
+  shortId,
+  sourceLabel,
+} from '../utils/campaignDisplay.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -61,33 +69,6 @@ const sourceOptions = [
   { value: 'inferred', label: '🔮 推断' },
   { value: 'backstory', label: '📖 背景' },
 ]
-
-function knowledgeSourceText(source) {
-  const map = { witnessed: '👁 亲眼', told_by_other: '💬 被告知', inferred: '🔮 推断', backstory: '📖 背景' }
-  return map[source] || source
-}
-
-function shortId(id) {
-  return id ? id.slice(0, 8) : ''
-}
-
-function instanceLabel(k) {
-  return k.character_name || (k.character_id ? `实例 ${shortId(k.character_id)}` : '未知角色')
-}
-
-function sourceLabel(k) {
-  return k.source_character_name || (k.source_character_id ? `实例 ${shortId(k.source_character_id)}` : '')
-}
-
-function propagationText(k) {
-  if (k.propagation === 'private') return '🔒 封口'
-  if (k.propagation?.startsWith?.('group:')) return `限制 ${k.propagation.slice(6)}`
-  return ''
-}
-
-function relayChainText(k) {
-  return k.relay_chain_text || (k.source_knowledge_id ? `上游 ${shortId(k.source_knowledge_id)}` : '')
-}
 
 // ─── 实例过滤选项：从已有知识的 character_id 去重，避免要求用户手输 ID ───
 const instanceOptions = computed(() => {

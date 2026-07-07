@@ -11,6 +11,7 @@ import {
   metaAcceptTypedPatch, metaDismissTypedPatch,
   metaExplainGeneration,
 } from '../tauri-api.js'
+import { formatDiffValue, routingText } from '../utils/campaignDisplay.js'
 
 const props = defineProps({
   activeCampaign: { type: Object, default: null },
@@ -333,21 +334,6 @@ function patchActionSummary(patch) {
   }).join('； ')
 }
 
-// 工具：routing 显示
-function routingText(routing) {
-  if (!routing) return ''
-  if (routing.Native || routing.kind === 'native') return '原生'
-  const reason = routing.webview_reason || (routing.Hybrid && routing.Hybrid.webview_reason) || ''
-  return `混合（${reason}）`
-}
-
-// 工具：格式化 diff 值（serde_json::Value）
-function formatDiffValue(val) {
-  if (val === null || val === undefined) return '（无）'
-  if (typeof val === 'string') return val
-  if (typeof val === 'object') return JSON.stringify(val, null, 2)
-  return String(val)
-}
 </script>
 
 <template>

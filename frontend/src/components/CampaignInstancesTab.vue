@@ -5,6 +5,7 @@ import {
   listInstances, getCharacterVariables, setCharacterVariable,
   promoteTemporaryInstance
 } from '../tauri-api.js'
+import { formatJsonValue as formatJson, inferVarType } from '../utils/campaignDisplay.js'
 
 const props = defineProps({
   campaignId: { type: String, required: true }
@@ -55,14 +56,6 @@ async function toggleInstance(inst) {
   }
 }
 
-// ─── 变量类型推断（从 JSON value 推断，不依赖后端 schema） ───
-function inferVarType(value) {
-  if (typeof value === 'boolean') return 'bool'
-  if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'float'
-  if (Array.isArray(value) || (typeof value === 'object' && value !== null)) return 'json'
-  return 'string'
-}
-
 // ─── 变量编辑 ───
 async function handleVariableChange(instanceId, key, value, varType) {
   try {
@@ -106,15 +99,6 @@ async function handlePromoteTemporary(inst) {
     await alertDialog('升格失败: ' + e)
   } finally {
     promotingInstanceId.value = null
-  }
-}
-
-// ─── JSON 格式化 ───
-function formatJson(value) {
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return String(value)
   }
 }
 
