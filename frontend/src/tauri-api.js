@@ -670,13 +670,26 @@ export async function metaAcceptPatch(patchId) {
  * 跑角色识别 Agent，为已导入的扁平 Character 建 CharacterCard
  * 失败时降级建单角色 Protagonist
  * @param {string} sourceCharacterId - 原角色卡 ID
- * @returns {Promise<{id, name, source_character_id, definition_count, extracted}>}
+ * @param {{force?: boolean}} options
+ * @returns {Promise<{id, name, source_character_id, definition_count, character_count, extracted, extraction_status, extraction_message}>}
  */
-export async function extractCharacters(sourceCharacterId) {
+export async function extractCharacters(sourceCharacterId, options = {}) {
   if (isTauri()) {
-    return await invoke('extract_characters', { sourceCharacterId })
+    return await invoke('extract_characters', {
+      sourceCharacterId,
+      force: !!options.force,
+    })
   }
-  return { id: 'mock-card-1', name: 'Mock Card', source_character_id: sourceCharacterId, definition_count: 1, extracted: false }
+  return {
+    id: 'mock-card-1',
+    name: 'Mock Card',
+    source_character_id: sourceCharacterId,
+    definition_count: 1,
+    character_count: 1,
+    extracted: false,
+    extraction_status: options.force ? 'fallback' : 'unknown',
+    extraction_message: options.force ? '识别失败，已按单角色处理，可重新识别。' : null,
+  }
 }
 
 /** 列出所有 CharacterCard */

@@ -5686,9 +5686,13 @@ pub struct CardDetailDto {
     pub first_mes: String,
     pub alternate_greetings: Vec<String>,
     pub character_definitions: Vec<CharacterDefinitionDto>,
+    pub definition_count: usize,
+    pub character_count: usize,
     pub imported_at: String,
-    /// 识别是否成功（false = 走降级路径，单角色 Protagonist）
+    /// 识别是否成功（false = 未识别/历史状态未知/降级 fallback）
     pub extracted: bool,
+    pub extraction_status: String,
+    pub extraction_message: Option<String>,
 }
 
 /// CharacterCard 列表项（轻量）
@@ -5697,21 +5701,76 @@ pub struct CardSummaryDto {
     pub id: String,
     pub name: String,
     pub source_character_id: String,
+    pub definition_count: usize,
     pub character_count: usize,
     pub imported_at: String,
     pub extracted: bool,
+    pub extraction_status: String,
+    pub extraction_message: Option<String>,
 }
 
 impl From<&campaign_store::StoredCard> for CardSummaryDto {
     fn from(s: &campaign_store::StoredCard) -> Self {
+        let definition_count = s.card.character_definitions.len();
         Self {
             id: s.card.id.as_str().to_string(),
             name: s.card.name.clone(),
             source_character_id: s.card.source_character_id.as_str().to_string(),
-            character_count: s.card.character_definitions.len(),
+            definition_count,
+            character_count: definition_count,
             imported_at: s.imported_at.clone(),
-            extracted: !s.card.character_definitions.is_empty(),
+            extracted: s.card.extraction_succeeded(),
+            extraction_status: s.card.extraction_status.as_str().to_string(),
+            extraction_message: card_extraction_message(&s.card),
         }
+    }
+}
+
+const FALLBACK_EXTRACTION_MESSAGE: &str = "识别失败，已按单角色处理，可重新识别。";
+
+fn card_extraction_message(card: &storyforge_domain::character::CharacterCard) -> Option<String> {
+    use storyforge_domain::character::CharacterExtractionStatus;
+
+    match card.extraction_status {
+        CharacterExtractionStatus::Extracted => card.extraction_message.clone(),
+        CharacterExtractionStatus::Fallback => Some(
+            card.extraction_message
+                .clone()
+                .unwrap_or_else(|| FALLBACK_EXTRACTION_MESSAGE.to_string()),
+        ),
+        CharacterExtractionStatus::Unknown if card.character_definitions.is_empty() => {
+            Some("尚未识别角色。".into())
+        }
+        CharacterExtractionStatus::Unknown => {
+            Some("历史角色定义缺少识别状态，可重新识别确认。".into())
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CharacterExtractionDecision {
+    ReturnExisting(campaign_store::StoredCard),
+    Run(storyforge_domain::character::CharacterCard),
+}
+
+fn prepare_character_extraction_card(
+    store: &campaign_store::CampaignStore,
+    character: &storyforge_domain::character::Character,
+    force: bool,
+) -> Result<CharacterExtractionDecision, TauriCommandError> {
+    match store.get_card_by_source(&character.id) {
+        Some(existing) if !force => Ok(CharacterExtractionDecision::ReturnExisting(existing)),
+        Some(existing) => {
+            if !store.list_campaigns_of_card(&existing.card.id).is_empty() {
+                return Err(TauriCommandError::validation(
+                    "这张角色卡已有游玩档，暂不支持重新识别；请先导入一份新卡再重跑识别。",
+                ));
+            }
+            Ok(CharacterExtractionDecision::Run(existing.card))
+        }
+        None => Ok(CharacterExtractionDecision::Run(
+            storyforge_domain::character::CharacterCard::from_character(character),
+        )),
     }
 }
 
@@ -5780,10 +5839,11 @@ impl From<&storyforge_domain::campaign::CharacterInstance> for CharacterInstance
 #[tauri::command]
 async fn extract_characters(
     source_character_id: String,
+    force: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardSummaryDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
-    use storyforge_domain::character::CharacterDefinition;
+    use storyforge_domain::character::{CharacterDefinition, CharacterExtractionStatus};
     use storyforge_domain::variables::extract_mvu_schema_from_extensions;
 
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
@@ -5817,9 +5877,13 @@ async fn extract_characters(
 
     // 已存在则直接返回
     let store = get_campaign_store();
-    if let Some(existing) = store.get_card_by_source(&character.id) {
-        return Ok(CardSummaryDto::from(&existing));
-    }
+    let mut card =
+        match prepare_character_extraction_card(store, &character, force.unwrap_or(false))? {
+            CharacterExtractionDecision::ReturnExisting(existing) => {
+                return Ok(CardSummaryDto::from(&existing));
+            }
+            CharacterExtractionDecision::Run(card) => card,
+        };
 
     // MVU schema 探测
     let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
@@ -5841,8 +5905,8 @@ async fn extract_characters(
         storyforge_app_agent::extract_characters(&runtime, &character, &mvu_schema, cancel_rx)
             .await;
 
-    let (definitions, extracted) = match definitions_result {
-        Ok(defs) => (defs, true),
+    let (definitions, extraction_status, extraction_message) = match definitions_result {
+        Ok(defs) => (defs, CharacterExtractionStatus::Extracted, None),
         Err(e) => {
             tracing::warn!("角色识别失败，降级建单角色: {e}");
             (
@@ -5850,20 +5914,20 @@ async fn extract_characters(
                     &character,
                     &mvu_schema,
                 )],
-                false,
+                CharacterExtractionStatus::Fallback,
+                Some(FALLBACK_EXTRACTION_MESSAGE.to_string()),
             )
         }
     };
 
     // 建卡 + 回填 card_id
-    let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
     let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
     card.character_definitions = definitions;
+    card.extraction_status = extraction_status;
+    card.extraction_message = extraction_message;
     let stored = save_character_card_async(store, card).await?;
 
-    let mut dto = CardSummaryDto::from(&stored);
-    dto.extracted = extracted;
-    Ok(dto)
+    Ok(CardSummaryDto::from(&stored))
 }
 
 async fn save_character_card_async(
@@ -5913,6 +5977,7 @@ fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={id}")))?;
     let source_character = stored_character_for_source_id(&stored.card.source_character_id);
     let (raw_first_mes, raw_alternate_greetings) = raw_card_greetings(&stored.card.raw_card_json);
+    let definition_count = stored.card.character_definitions.len();
     Ok(CardDetailDto {
         id: stored.card.id.as_str().to_string(),
         name: stored.card.name.clone(),
@@ -5931,8 +5996,12 @@ fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
             .iter()
             .map(CharacterDefinitionDto::from)
             .collect(),
+        definition_count,
+        character_count: definition_count,
         imported_at: stored.imported_at.clone(),
-        extracted: !stored.card.character_definitions.is_empty(),
+        extracted: stored.card.extraction_succeeded(),
+        extraction_status: stored.card.extraction_status.as_str().to_string(),
+        extraction_message: card_extraction_message(&stored.card),
     })
 }
 
@@ -6840,6 +6909,8 @@ fn import_campaign_bundle_into_store(
             source_character_id: new_source_character_id.clone(),
             character_definitions: bundle.definitions.clone(),
             raw_card_json: serde_json::Value::Null,
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
+            extraction_message: None,
         });
     let definitions = if card.character_definitions.is_empty() {
         bundle.definitions
@@ -7426,6 +7497,8 @@ mod tests {
                 "first_mes": "hello from raw",
                 "alternate_greetings": ["alt one", "alt two"]
             }),
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         let mut campaign = Campaign::new(old_card_id.clone(), "Bundle Campaign");
         campaign.id = old_campaign_id.clone();
@@ -7896,6 +7969,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_card_summary_treats_fallback_as_not_extracted() {
+        let character = make_test_character("Fallback Card");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.extraction_status = storyforge_domain::character::CharacterExtractionStatus::Fallback;
+        card.extraction_message = Some(FALLBACK_EXTRACTION_MESSAGE.into());
+        card.character_definitions
+            .push(make_test_character_definition(
+                &card.id,
+                "fallback-def",
+                "Fallback Hero",
+            ));
+
+        let stored = campaign_store::StoredCard {
+            card,
+            imported_at: "2026-07-07T00:00:00Z".into(),
+        };
+        let dto = CardSummaryDto::from(&stored);
+
+        assert!(!dto.extracted);
+        assert_eq!(dto.extraction_status, "fallback");
+        assert_eq!(dto.definition_count, 1);
+        assert_eq!(dto.character_count, 1);
+        assert_eq!(
+            dto.extraction_message.as_deref(),
+            Some(FALLBACK_EXTRACTION_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_prepare_character_extraction_force_preserves_existing_card_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_extract_force_preserves_id_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let character = make_test_character("Force Rerun Card");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.id = Id::from_str("existing-card-id");
+        card.extraction_status = storyforge_domain::character::CharacterExtractionStatus::Fallback;
+        card.character_definitions
+            .push(make_test_character_definition(
+                &card.id,
+                "old-fallback-def",
+                "Old Fallback",
+            ));
+        store.save_card(card).unwrap();
+
+        let decision = prepare_character_extraction_card(&store, &character, true).unwrap();
+
+        match decision {
+            CharacterExtractionDecision::Run(card) => {
+                assert_eq!(card.id, Id::from_str("existing-card-id"));
+                assert_eq!(
+                    card.extraction_status,
+                    storyforge_domain::character::CharacterExtractionStatus::Fallback
+                );
+            }
+            CharacterExtractionDecision::ReturnExisting(_) => {
+                panic!("force=true should rerun instead of returning existing card")
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prepare_character_extraction_refuses_force_when_campaign_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_extract_force_campaign_guard_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let character = make_test_character("Existing Campaign Card");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.id = Id::from_str("guarded-card-id");
+        card.extraction_status = storyforge_domain::character::CharacterExtractionStatus::Fallback;
+        let stored = store.save_card(card).unwrap();
+        let campaign =
+            storyforge_domain::campaign::Campaign::new(stored.card.id.clone(), "existing run");
+        store.save_campaign(campaign).unwrap();
+
+        let err = prepare_character_extraction_card(&store, &character, true).unwrap_err();
+
+        match err {
+            TauriCommandError::Validation { message } => {
+                assert!(message.contains("已有游玩档"));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_save_character_card_async_persists_and_replaces_source() {
         let dir = std::env::temp_dir().join(format!(
@@ -8331,7 +8500,7 @@ mod tests {
         assert_eq!(reused_conv.nodes[0].active_content(), "continue scene");
 
         let mut active_campaign = storyforge_domain::campaign::Campaign::new(
-            Id::from_str(&format!("card-{}", uuid::Uuid::new_v4())),
+            Id::from_str(format!("card-{}", uuid::Uuid::new_v4())),
             "Active Campaign",
         );
         let campaign_conv = state.conv_store.create(
@@ -8708,6 +8877,8 @@ mod tests {
             source_character_id: Id::from_str("source-card-1"),
             character_definitions: vec![],
             raw_card_json: serde_json::Value::Null,
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         let definition = CharacterDefinition {
             id: Id::from_str("def-lin"),
@@ -9069,6 +9240,8 @@ mod tests {
                     }]
                 }
             }),
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         campaign_store.save_card(card.clone()).unwrap();
         let campaign = Campaign::new(card.id.clone(), "Campaign runtime");
@@ -9752,6 +9925,8 @@ mod tests {
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![def_guard, def_merchant, def_leader],
             raw_card_json: serde_json::Value::Null,
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         store.save_card(card).unwrap();
 
@@ -10772,6 +10947,9 @@ mod tests {
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
                 raw_card_json: serde_json::Value::Null,
+                extraction_status:
+                    storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),
@@ -10880,6 +11058,9 @@ mod tests {
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
                 raw_card_json: serde_json::Value::Null,
+                extraction_status:
+                    storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),
@@ -10977,6 +11158,9 @@ mod tests {
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
                 raw_card_json: serde_json::Value::Null,
+                extraction_status:
+                    storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
             };
             let def = CharacterDefinition {
                 id: Id::from_str("def-1"),

@@ -16,7 +16,9 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::AgentRole;
 use storyforge_domain::agent_profile_config::{AgentRunConfig, default_agent_profile_config};
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
-use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+use storyforge_domain::character::{
+    CharacterCard, CharacterDefinition, CharacterExtractionStatus, RoleType,
+};
 use storyforge_domain::character_knowledge::{
     BroadcastTarget, CharacterKnowledgeEntry, CharacterKnowledgeUpdate, KnowledgeSource,
     PropagationPolicy,
@@ -119,6 +121,8 @@ fn make_campaign_store() -> (std::path::PathBuf, CampaignStore, Id) {
         source_character_id,
         character_definitions: definitions,
         raw_card_json: serde_json::Value::Null,
+        extraction_status: CharacterExtractionStatus::Extracted,
+        extraction_message: None,
     };
     store.save_card(card).unwrap();
 

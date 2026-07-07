@@ -141,7 +141,9 @@ impl HarnessEnv {
         use storyforge_app_agent::{
             AgentRuntime, attach_definitions_to_card, extract_characters as run_extract,
         };
-        use storyforge_domain::character::{CharacterCard, CharacterDefinition};
+        use storyforge_domain::character::{
+            CharacterCard, CharacterDefinition, CharacterExtractionStatus,
+        };
         use storyforge_domain::variables::extract_mvu_schema_from_extensions;
 
         let character = {
@@ -164,28 +166,41 @@ impl HarnessEnv {
         let runtime = AgentRuntime::new(self.llm.clone(), tool_ctx_snapshot);
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        let definitions = match run_extract(&runtime, &character, &mvu_schema, cancel_rx).await {
+        let (definitions, extraction_status, extraction_message) = match run_extract(
+            &runtime,
+            &character,
+            &mvu_schema,
+            cancel_rx,
+        )
+        .await
+        {
             Ok(defs) => {
                 eprintln!(
                     "[F2 DIAG] extract_characters Ok: {} definitions (正常解析路径)",
                     defs.len()
                 );
-                defs
+                (defs, CharacterExtractionStatus::Extracted, None)
             }
             Err(e) => {
                 eprintln!(
                     "[F2 DIAG] extract_characters Err: {e} → 降级单角色 (fallback_from_character)"
                 );
-                vec![CharacterDefinition::fallback_from_character(
-                    &character,
-                    &mvu_schema,
-                )]
+                (
+                    vec![CharacterDefinition::fallback_from_character(
+                        &character,
+                        &mvu_schema,
+                    )],
+                    CharacterExtractionStatus::Fallback,
+                    Some("识别失败，已按单角色处理，可重新识别。".into()),
+                )
             }
         };
 
         let mut card = CharacterCard::from_character(&character);
         let definitions = attach_definitions_to_card(definitions, &card.id);
         card.character_definitions = definitions;
+        card.extraction_status = extraction_status;
+        card.extraction_message = extraction_message;
         let stored = self
             .campaign_store
             .save_card(card)

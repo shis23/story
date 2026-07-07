@@ -392,6 +392,29 @@ fn extract_renderable_assets(data: &StCharacterData) -> Option<RenderableAssets>
 
 use crate::variables::{VariableField, merge_schema};
 
+/// Character extraction state for a multi-character card.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterExtractionStatus {
+    /// Legacy or not-yet-processed card. Old `cards.json` records deserialize here.
+    #[default]
+    Unknown,
+    /// The extractor successfully produced structured character definitions.
+    Extracted,
+    /// Extraction failed and the app created a single usable fallback definition.
+    Fallback,
+}
+
+impl CharacterExtractionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Extracted => "extracted",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// 角色卡本体（一卡多角色的容器）
 ///
 /// 导入 ST 卡后，角色识别 Agent 分析卡内容，产出卡内所有角色的 CharacterDefinition。
@@ -411,6 +434,13 @@ pub struct CharacterCard {
     /// 新数据由导入流程填入；旧数据缺失时 serde 默认 `Value::Null`（向后兼容）。
     #[serde(default)]
     pub raw_card_json: serde_json::Value,
+    /// Role extraction status. Missing legacy values remain `unknown` instead of
+    /// inferring success from fallback definitions.
+    #[serde(default)]
+    pub extraction_status: CharacterExtractionStatus,
+    /// User-safe extraction note shown in UI. Provider errors are logged, not persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_message: Option<String>,
 }
 
 /// 卡内角色定义（模板，卡级全局共享）
@@ -465,7 +495,13 @@ impl CharacterCard {
             source_character_id: character.id.clone(),
             character_definitions: vec![],
             raw_card_json: character.raw_card_json.clone(),
+            extraction_status: CharacterExtractionStatus::Unknown,
+            extraction_message: None,
         }
+    }
+
+    pub fn extraction_succeeded(&self) -> bool {
+        self.extraction_status == CharacterExtractionStatus::Extracted
     }
 
     /// Parses card-scoped ST regex scripts from raw `data.extensions.regex_scripts`.
@@ -551,6 +587,9 @@ mod multi_character_tests {
         let card = CharacterCard::from_character(&ch);
         assert_eq!(card.name, "测试卡");
         assert!(card.character_definitions.is_empty());
+        assert_eq!(card.extraction_status, CharacterExtractionStatus::Unknown);
+        assert!(!card.extraction_succeeded());
+        assert!(card.extraction_message.is_none());
     }
 
     #[test]
@@ -589,10 +628,39 @@ mod multi_character_tests {
                 },
             ],
             raw_card_json: serde_json::Value::Null,
+            extraction_status: CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         assert!(card.find_definition("林医生").is_some());
         assert!(card.find_definition("陈警官").is_some());
         assert!(card.find_definition("不存在").is_none());
+    }
+
+    #[test]
+    fn test_character_card_legacy_json_defaults_extraction_status_unknown() {
+        let legacy = serde_json::json!({
+            "id": "legacy-card",
+            "name": "Legacy Card",
+            "source_character_id": "legacy-source",
+            "character_definitions": [{
+                "id": "legacy-def",
+                "card_id": "legacy-card",
+                "name": "Legacy Hero",
+                "persona_prompt": "kept for compatibility",
+                "behavior_rules": "",
+                "base_backstory": [],
+                "role_type": "protagonist",
+                "variable_schema": []
+            }],
+            "raw_card_json": null
+        });
+
+        let card: CharacterCard = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(card.extraction_status, CharacterExtractionStatus::Unknown);
+        assert!(!card.extraction_succeeded());
+        assert_eq!(card.character_definitions.len(), 1);
+        assert!(card.extraction_message.is_none());
     }
 
     #[test]
@@ -819,6 +887,8 @@ mod multi_character_tests {
                     ]
                 }
             }),
+            extraction_status: CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
 
         let scripts = card.scoped_regex_scripts();

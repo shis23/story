@@ -100,10 +100,36 @@ async function refreshCards() {
   }
 }
 
+function definitionCount(card) {
+  return card?.definition_count ?? card?.character_count ?? 0
+}
+
+function extractionStatus(card) {
+  return card?.extraction_status || (card?.extracted ? 'extracted' : 'unknown')
+}
+
+function extractionLabel(card) {
+  const status = extractionStatus(card)
+  if (status === 'extracted') return '已识别'
+  if (status === 'fallback') return '识别失败，已按单角色处理'
+  if (definitionCount(card) > 0) return '历史状态未知'
+  return '未识别'
+}
+
+function extractionClass(card) {
+  return extractionStatus(card) === 'extracted' ? 'text-ok' : 'text-warn'
+}
+
+function extractButtonText(card) {
+  const status = extractionStatus(card)
+  if (extractingCardId.value === card.source_character_id) return '识别中…'
+  return status === 'unknown' && definitionCount(card) === 0 ? '识别角色' : '重新识别'
+}
+
 async function handleExtract(card) {
   extractingCardId.value = card.source_character_id
   try {
-    const result = await extractCharacters(card.source_character_id)
+    const result = await extractCharacters(card.source_character_id, { force: true })
     await refreshCards()
     expandedCardId.value = result.id
     cardDetail.value = await getCard(result.id)
@@ -359,24 +385,26 @@ defineExpose({ refreshActiveDetailTab })
             <div class="flex-1 min-w-0">
               <div class="text-sm font-medium text-ink truncate">{{ card.name }}</div>
               <div class="text-xs text-ink-soft">
-                {{ card.definition_count }} 个角色定义
-                <span v-if="card.extracted" class="text-ok ml-1">✓ 已识别</span>
-                <span v-else class="text-warn ml-1">未识别</span>
+                {{ definitionCount(card) }} 个角色定义
+                <span class="ml-1" :class="extractionClass(card)">{{ extractionLabel(card) }}</span>
               </div>
             </div>
             <button
-              v-if="!card.extracted"
+              v-if="extractionStatus(card) !== 'extracted'"
               @click.stop="handleExtract(card)"
               :disabled="extractingCardId === card.source_character_id"
               class="min-h-[36px] px-3 rounded-full text-xs font-medium bg-accent text-white disabled:opacity-50 transition-colors"
             >
-              {{ extractingCardId === card.source_character_id ? '识别中…' : '识别角色' }}
+              {{ extractButtonText(card) }}
             </button>
             <span class="text-ink-soft text-xs">{{ expandedCardId === card.id ? '▲' : '▼' }}</span>
           </div>
 
           <!-- 卡展开详情 -->
           <div v-if="expandedCardId === card.id && cardDetail" class="border-t border-line px-3 py-2 space-y-2">
+            <div v-if="cardDetail.extraction_message" class="text-xs text-warn bg-warn/10 rounded-lg px-3 py-2">
+              {{ cardDetail.extraction_message }}
+            </div>
             <div v-if="cardDetail.character_definitions.length === 0" class="text-xs text-ink-soft py-2">
               暂无角色定义，请点击「识别角色」
             </div>

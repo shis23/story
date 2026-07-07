@@ -523,7 +523,9 @@ fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+    use storyforge_domain::character::{
+        CharacterCard, CharacterDefinition, CharacterExtractionStatus, RoleType,
+    };
     use storyforge_domain::variables::default_character_variables;
 
     fn temp_dir() -> PathBuf {
@@ -543,6 +545,8 @@ mod tests {
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![],
             raw_card_json: serde_json::Value::Null,
+            extraction_status: CharacterExtractionStatus::Extracted,
+            extraction_message: None,
         };
         let def = CharacterDefinition {
             id: Id::from_str("def-1"),

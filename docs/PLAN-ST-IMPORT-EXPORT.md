@@ -96,9 +96,9 @@
 
 **待实现**：
 
-- [ ] 确认 `tauri-app` 导入流程中 fallback 路径已接入。
-- [ ] fallback 时是否提示用户"识别失败，已按单角色处理"？
-- [ ] 是否支持用户手动触发重跑识别？
+- [x] 确认 `tauri-app` 导入流程中 fallback 路径已接入。`extract_characters` 失败时会保存单角色 fallback definition，并持久化 `extraction_status = fallback`。
+- [x] fallback 时是否提示用户"识别失败，已按单角色处理"？后端 DTO 返回 `extraction_status` / `extraction_message`，前端卡片列表和详情会显示降级状态。
+- [x] 是否支持用户手动触发重跑识别？前端提供"重新识别"，调用 `extract_characters(force=true)`；若卡已创建 Campaign，为避免断开既有 `definition_id` 引用，后端会拒绝重跑并提示用户先导入新卡。
 
 ### T4: StoryForge Campaign 导出格式设计
 
@@ -126,5 +126,5 @@
 
 - [ ] 常见 ST V2/V3 卡能导入且不丢关键字段。
 - [x] 不认识的 extensions 不丢（`raw_card_json` 保底）；未知 ST `data` 顶层字段也会经 `extra` 保留。
-- [ ] 多角色识别失败时 fallback 到单角色，不报错崩溃。
+- [x] 多角色识别失败时 fallback 到单角色，不报错崩溃；`test_card_summary_treats_fallback_as_not_extracted` 覆盖 fallback 不被误报为成功识别，`test_prepare_character_extraction_*` 覆盖手动重跑安全边界。
 - [x] Campaign 导出 → 导入 round-trip ID 重写和引用一致性由 `import_campaign_bundle_rewrites_ids_and_references` 覆盖。

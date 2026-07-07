@@ -69,6 +69,26 @@ async function handleDelete(card, event) {
     console.error('删除失败:', e)
   }
 }
+
+function definitionCount(card) {
+  return card?.definition_count ?? card?.character_count ?? 0
+}
+
+function extractionStatus(card) {
+  return card?.extraction_status || (card?.extracted ? 'extracted' : 'unknown')
+}
+
+function extractionLabel(card) {
+  const status = extractionStatus(card)
+  if (status === 'extracted') return '已识别'
+  if (status === 'fallback') return '降级可用'
+  if (definitionCount(card) > 0) return '历史状态未知'
+  return '未识别'
+}
+
+function extractionClass(card) {
+  return extractionStatus(card) === 'extracted' ? 'text-ok' : 'text-warn'
+}
 </script>
 
 <template>
@@ -98,9 +118,8 @@ async function handleDelete(card, event) {
         <div class="flex-1 min-w-0">
           <div class="font-medium text-ink text-sm truncate">{{ card.name }}</div>
           <div class="text-xs text-ink-soft mt-0.5">
-            {{ card.character_count }} 个角色定义
-            <span v-if="card.extracted" class="text-ok ml-1">✓ 已识别</span>
-            <span v-else class="text-warn ml-1">未识别</span>
+            {{ definitionCount(card) }} 个角色定义
+            <span class="ml-1" :class="extractionClass(card)">{{ extractionLabel(card) }}</span>
           </div>
           <div class="text-[10px] text-ink-faint mt-0.5">{{ card.imported_at }}</div>
         </div>
