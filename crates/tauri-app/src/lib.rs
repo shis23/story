@@ -4602,18 +4602,38 @@ struct ConvGenerationExplainer {
 impl storyforge_app_meta::meta_conversation::GenerationExplainer for ConvGenerationExplainer {
     fn explain(
         &self,
-        conversation_id: &str,
-        node_id: &str,
-    ) -> Option<storyforge_app_meta::GenerationExplanation> {
-        let conv_id = Id::from_str(conversation_id);
-        let nid = Id::from_str(node_id);
-
-        let conv = self.conv_store.get(&conv_id)?;
-        let node = conv.find_node(&nid)?;
-        let variant = node.active()?;
-        let provenance = variant.provenance.as_ref()?;
-        Some(storyforge_app_meta::explain_generation(provenance))
+        conversation_id: String,
+        node_id: String,
+    ) -> storyforge_app_meta::meta_conversation::GenerationExplainFuture {
+        let conv_store = self.conv_store.clone();
+        Box::pin(async move {
+            match tokio::task::spawn_blocking(move || {
+                explain_generation_from_conversation_store(conv_store, conversation_id, node_id)
+            })
+            .await
+            {
+                Ok(explanation) => explanation,
+                Err(e) => {
+                    tracing::warn!("解释生成溯源任务失败: {e}");
+                    None
+                }
+            }
+        })
     }
+}
+
+fn explain_generation_from_conversation_store(
+    conv_store: Arc<ConversationStore>,
+    conversation_id: String,
+    node_id: String,
+) -> Option<storyforge_app_meta::GenerationExplanation> {
+    let conv_id = Id::from_str(&conversation_id);
+    let nid = Id::from_str(&node_id);
+    let conv = conv_store.get(&conv_id)?;
+    let node = conv.find_node(&nid)?;
+    let variant = node.active()?;
+    let provenance = variant.provenance.as_ref()?;
+    Some(storyforge_app_meta::explain_generation(provenance))
 }
 
 /// 把当前活跃角色卡 + 世界书同步进 MetaSession（每次 meta 操作前调）
@@ -8048,6 +8068,88 @@ mod tests {
                 .is_none(),
             "meta_session.campaign_runtime should be None when no active campaign"
         );
+    }
+
+    #[tokio::test]
+    async fn test_conv_generation_explainer_reads_provenance_async() {
+        let state = Arc::new(AppState::new_for_test());
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        let node_id = state
+            .conv_store
+            .append_ai_draft(
+                &conversation.id,
+                "draft text".into(),
+                Some(Provenance {
+                    session_id: Id::from_str("sess-1"),
+                    plan: None,
+                    subagent_results: vec![storyforge_domain::conversation::SubagentSnapshot {
+                        character_id: "alice".into(),
+                        full_text: "Alice output".into(),
+                        character_instance_id: None,
+                        display_name: Some("Alice".into()),
+                        fallback_reason: None,
+                    }],
+                    profile_id: Some(Id::from_str("profile-1")),
+                    seed: 7,
+                    last_hint: Some("try again".into()),
+                }),
+            )
+            .unwrap();
+        let explainer = ConvGenerationExplainer {
+            conv_store: state.conv_store.clone(),
+        };
+
+        let explanation =
+            <ConvGenerationExplainer as storyforge_app_meta::meta_conversation::GenerationExplainer>::explain(
+                &explainer,
+                conversation.id.as_str().to_string(),
+                node_id.as_str().to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(explanation.seed, 7);
+        assert_eq!(explanation.profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(explanation.last_hint.as_deref(), Some("try again"));
+        assert_eq!(explanation.subagents.len(), 1);
+        assert_eq!(explanation.subagents[0].character_id, "alice");
+        assert_eq!(explanation.subagents[0].display_name, "Alice");
+        assert_eq!(explanation.subagents[0].output_preview, "Alice output");
+
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_conv_generation_explainer_returns_none_for_missing_provenance_or_node() {
+        let state = Arc::new(AppState::new_for_test());
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        let node_without_provenance = state
+            .conv_store
+            .append_ai_draft(&conversation.id, "draft text".into(), None)
+            .unwrap();
+        let explainer = ConvGenerationExplainer {
+            conv_store: state.conv_store.clone(),
+        };
+
+        let without_provenance =
+            <ConvGenerationExplainer as storyforge_app_meta::meta_conversation::GenerationExplainer>::explain(
+                &explainer,
+                conversation.id.as_str().to_string(),
+                node_without_provenance.as_str().to_string(),
+            )
+            .await;
+        let missing_node =
+            <ConvGenerationExplainer as storyforge_app_meta::meta_conversation::GenerationExplainer>::explain(
+                &explainer,
+                conversation.id.as_str().to_string(),
+                Id::new().as_str().to_string(),
+            )
+            .await;
+
+        assert!(without_provenance.is_none());
+        assert!(missing_node.is_none());
+
+        let _ = std::fs::remove_dir_all(&state.data_dir);
     }
 
     /// 验证 tool_ctx 的 RwLock + snapshot 机制：写入后快照能读到

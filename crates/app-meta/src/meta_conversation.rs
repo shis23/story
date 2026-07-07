@@ -33,9 +33,13 @@ use crate::{
 /// 生成溯源数据源（由 tauri-app 层注入，避免 app-meta 依赖 tauri-app）
 ///
 /// tauri-app 层实现此 trait，从 conv_store 查 Provenance 并调 `explain_generation`。
+/// 返回 future，让实现方可以把同步 store I/O offload 到 blocking pool。
 /// MetaSession 存 `Option<Arc<dyn GenerationExplainer>>`，None 表示未配置。
+pub type GenerationExplainFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<GenerationExplanation>> + Send>>;
+
 pub trait GenerationExplainer: Send + Sync {
-    fn explain(&self, conversation_id: &str, node_id: &str) -> Option<GenerationExplanation>;
+    fn explain(&self, conversation_id: String, node_id: String) -> GenerationExplainFuture;
 }
 
 /// Meta Agent 会话状态（跨工具调用共享）
@@ -446,7 +450,10 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
                         .unwrap_or("");
                     match &session.explainer {
                         Some(explainer) => {
-                            match explainer.explain(conversation_id, node_id) {
+                            match explainer
+                                .explain(conversation_id.to_string(), node_id.to_string())
+                                .await
+                            {
                                 Some(explanation) => Ok(serde_json::json!({
                                     "explanation": explanation
                                 })),
@@ -826,8 +833,9 @@ mod tests {
     }
 
     impl GenerationExplainer for MockExplainer {
-        fn explain(&self, _conversation_id: &str, _node_id: &str) -> Option<GenerationExplanation> {
-            self.explanation.clone()
+        fn explain(&self, _conversation_id: String, _node_id: String) -> GenerationExplainFuture {
+            let explanation = self.explanation.clone();
+            Box::pin(async move { explanation })
         }
     }
 
