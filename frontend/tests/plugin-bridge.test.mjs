@@ -274,6 +274,66 @@ test('host handler keeps plugin storage across handler recreation', async () => 
   })
 })
 
+test('host handler keeps plugin storage isolated for ambiguous ids and keys', async () => {
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+
+  const fooHandler = createHostHandler({ id: 'foo', permissions: [] }, async () => null)
+  const fooBarHandler = createHostHandler({ id: 'foo_bar', permissions: [] }, async () => null)
+
+  await fooHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'foo',
+      id: 'set-foo',
+      method: 'storage.set',
+      params: { key: 'bar_extension_settings', value: { owner: 'foo' } },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await fooBarHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'foo_bar',
+      id: 'set-foo-bar',
+      method: 'storage.set',
+      params: { key: 'extension_settings', value: { owner: 'foo_bar' } },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await fooHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'foo',
+      id: 'get-foo',
+      method: 'storage.get',
+      params: { key: 'bar_extension_settings' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await fooBarHandler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'foo_bar',
+      id: 'get-foo-bar',
+      method: 'storage.get',
+      params: { key: 'extension_settings' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(source.posted.at(-2).message.result, { owner: 'foo' })
+  assert.deepEqual(source.posted.at(-1).message.result, { owner: 'foo_bar' })
+})
+
 test('host handler routes plugin APIs through plugin-scoped backend commands', async () => {
   const plugin = { id: 'plugin-a', permissions: ['ReadCharacters', 'ReadVariables', 'WriteVariables'] }
   const source = {

@@ -61,7 +61,11 @@ const ST_EVENT_ALIASES = {
 const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
 
 function hostPluginStorageKey(pluginId, key) {
-  return `sf_host_plugin_storage_${pluginId}_${key}`
+  return [
+    'sf_host_plugin_storage',
+    encodeURIComponent(String(pluginId)),
+    encodeURIComponent(String(key)),
+  ].join(':')
 }
 
 function readHostPluginStorage(pluginId, key) {
