@@ -18,6 +18,14 @@ import {
   cardReportFromToolResult,
   patchProposalFromToolResult,
 } from '../utils/metaToolResults.js'
+import {
+  acceptTypedPatchFlow,
+  dismissTypedPatchFlow,
+  explainGenerationFlow,
+  proposeRepairsFlow,
+  refreshTypedPatchesFlow,
+  sortHealthIssues,
+} from '../utils/metaPanelFlow.js'
 
 const props = defineProps({
   activeCampaign: { type: Object, default: null },
@@ -232,11 +240,7 @@ async function handleHealthCheck() {
   error.value = ''
   try {
     const result = await metaHealthCheck(props.activeCampaign.id)
-    // Error 排前面，Warning 排后面
-    healthIssues.value = (result || []).sort((a, b) => {
-      if (a.severity === b.severity) return 0
-      return a.severity === 'error' ? -1 : 1
-    })
+    healthIssues.value = sortHealthIssues(result)
     healthRan.value = true
   } catch (e) {
     error.value = '体检失败: ' + e
@@ -251,15 +255,11 @@ async function handleProposeRepairs() {
   patchesLoading.value = true
   error.value = ''
   try {
-    const patches = await metaProposeCampaignRepairs(props.activeCampaign.id)
-    typedPatches.value = patches || []
-    // 对每条 patch 跑 preview，标记 stale
-    await Promise.all(typedPatches.value.map(async (p) => {
-      try {
-        const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
-        p._stale = prev?.stale || false
-      } catch (e) { p._stale = false }
-    }))
+    typedPatches.value = await proposeRepairsFlow({
+      campaignId: props.activeCampaign.id,
+      proposeCampaignRepairs: metaProposeCampaignRepairs,
+      previewTypedPatch: metaPreviewTypedPatch,
+    })
   } catch (e) {
     error.value = '生成修复方案失败: ' + e
   } finally {
@@ -269,17 +269,11 @@ async function handleProposeRepairs() {
 
 async function refreshTypedPatches() {
   try {
-    const patches = await metaListTypedPatches()
-    typedPatches.value = patches || []
-    // 对每条 patch 跑 preview，标记 stale
-    if (props.activeCampaign?.id) {
-      await Promise.all(typedPatches.value.map(async (p) => {
-        try {
-          const prev = await metaPreviewTypedPatch(p.id, props.activeCampaign.id)
-          p._stale = prev?.stale || false
-        } catch (e) { p._stale = false }
-      }))
-    }
+    typedPatches.value = await refreshTypedPatchesFlow({
+      campaignId: props.activeCampaign?.id,
+      listTypedPatches: metaListTypedPatches,
+      previewTypedPatch: metaPreviewTypedPatch,
+    })
   } catch (e) {
     // 静默失败，不影响主流程
     console.warn('刷新 typed patches 失败:', e)
@@ -287,11 +281,26 @@ async function refreshTypedPatches() {
 }
 
 async function handleAcceptTypedPatch(patchId) {
+  error.value = ''
   try {
-    await metaAcceptTypedPatch(patchId, props.activeCampaign.id)
-    typedPatches.value = typedPatches.value.filter(p => p.id !== patchId)
-    // 刷新体检（让用户看到问题减少）
-    await handleHealthCheck()
+    const result = await acceptTypedPatchFlow({
+      campaignId: props.activeCampaign.id,
+      patchId,
+      patches: typedPatches.value,
+      acceptTypedPatch: metaAcceptTypedPatch,
+      refreshHealth: async () => {
+        const issues = await metaHealthCheck(props.activeCampaign.id)
+        return sortHealthIssues(issues)
+      },
+    })
+    typedPatches.value = result.patches
+    if (result.healthIssues) {
+      healthIssues.value = result.healthIssues
+      healthRan.value = true
+    }
+    if (result.healthError) {
+      error.value = '体检失败: ' + result.healthError
+    }
   } catch (e) {
     error.value = '接受修复失败: ' + e
   }
@@ -299,8 +308,11 @@ async function handleAcceptTypedPatch(patchId) {
 
 async function handleDismissTypedPatch(patchId) {
   try {
-    await metaDismissTypedPatch(patchId)
-    typedPatches.value = typedPatches.value.filter(p => p.id !== patchId)
+    typedPatches.value = await dismissTypedPatchFlow({
+      patchId,
+      patches: typedPatches.value,
+      dismissTypedPatch: metaDismissTypedPatch,
+    })
   } catch (e) {
     error.value = '忽略修复失败: ' + e
   }
@@ -313,10 +325,10 @@ async function handleExplainGeneration() {
   explainResult.value = null
   error.value = ''
   try {
-    explainResult.value = await metaExplainGeneration(
-      props.lastConversationNode.conversation_id,
-      props.lastConversationNode.node_id
-    )
+    explainResult.value = await explainGenerationFlow({
+      lastConversationNode: props.lastConversationNode,
+      explainGeneration: metaExplainGeneration,
+    })
   } catch (e) {
     error.value = '生成溯源失败: ' + e
   } finally {
