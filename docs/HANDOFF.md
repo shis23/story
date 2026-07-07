@@ -45,15 +45,18 @@ cargo test -p storyforge --lib test_embed_config
 
 真实 LLM 发布验收：
 
-```bash
-cargo test -p harness-real-llm knowledge_propagation -- --ignored --nocapture
+```powershell
+$env:LLM_BASE_URL = 'https://your-compatible-endpoint/v1/chat/completions'
+$env:LLM_API_KEY = 'use-a-real-key-from-your-shell-only'
+$env:LLM_MODEL = 'your-model'
+powershell -ExecutionPolicy Bypass -File scripts/run-real-llm-smoke.ps1 -Suite knowledge
 ```
 
 Android 构建基线：
 
-```bash
-cargo tauri android build --debug --target aarch64 --ci --split-per-abi --apk
-cargo tauri android build --target aarch64 --ci --split-per-abi --apk
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run-android-smoke.ps1
+powershell -ExecutionPolicy Bypass -File scripts/run-android-smoke.ps1 -BuildApk
 ```
 
 手工验收按 `docs/RELEASE-CHECKLIST.md` 执行。每一行都要记录候选版本、日期、平台、输入材料、执行人、结果、失败日志或排障 bundle。没有实跑的项目保持 `待跑` 或 `待真机`，不要提前改成通过。
@@ -69,7 +72,7 @@ cargo tauri android build --target aarch64 --ci --split-per-abi --apk
 ## 交接注意事项
 
 - 不要把真实 API key 写入文档、日志摘要、issue、截图或示例配置；文档中只允许出现 `storyforge-secret:v1:*` 这类 SecretRef 形式。
-- 发布说明不要承诺完整 ST 99 事件全集、prompt hooks、完整 Slash 命令系统/PluginHost JS 斜杠运行时或完整语义级安全边界；当前只覆盖 Regex Slash placement 3 对 `/` 前缀写作意图的最小 hook。
+- 发布说明不要承诺完整 ST 99 事件全集、prompt hooks、冷门 Slash 参数管道或完整语义级安全边界；当前覆盖 Regex Slash placement 3 对 `/` 前缀写作意图的最小 hook、常用 Slash 注册/触发 fallback，以及 PluginHost per-slot 状态栏/斜杠挂载。
 - 传话链和 private/封口能力当前仍要按“文本匹配级门禁 + 真实 LLM 对抗待验证”描述。
 - `CampaignStore` 桌面小/中等数据量暂不阻塞，但 Android、大卡导入和真实长会话必须实测后再决定是否推进后台 flush、分文件索引或 schema 迁移。
 - 归档文档保持只读；新的发布状态记录写入当前 docs。

@@ -4,6 +4,7 @@
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 > 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
+> 专项入口：真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
 
 ## 0. 发布闸门
 
@@ -30,6 +31,7 @@
 
 - 本轮待推送提交栈已执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 并通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。本行只记录自动化基线状态，不作为最终发布 SHA；最终候选 SHA 以 tag/release notes 记录为准。
 - 仍有既有 Vite dynamic/static import warning；本轮未新增同类阻塞，继续按分包风险记录，不视为发布闸门失败。
+- 专项 smoke runner 已补：`scripts/run-real-llm-smoke.ps1` 统一执行 ignored 真实 LLM 套件并避免打印 API key；`scripts/run-android-smoke.ps1` 统一执行 frontend build、Tauri capability 测试和 Android arm64 host-side check，`-BuildApk` 时再要求 `ANDROID_HOME` / `NDK_HOME`。
 
 2026-07-06 已验证：
 
@@ -85,7 +87,7 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；完整 Slash 命令注册/参数管道、PluginHost/JS 状态栏运行时、ST 99 事件全集和 prompt hooks 不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载。ST 冷门 Slash 参数管道、ST 99 事件全集和 prompt hooks 不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
@@ -105,7 +107,7 @@ Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基
 | L2 复杂卡角色识别 | 至少一张复杂真实卡；真实 LLM 连接 | 1. 导入卡。<br>2. 运行角色识别/抽取。<br>3. 创建 Campaign。 | 产出合理 definitions；抽取失败时 fallback 明确；Campaign 能创建并进入写作。 | app 日志；抽取结果摘要；原始卡文件名；Campaign bundle。 | 待跑 |
 | L3 T1/T2/T3 写作质量 | L2 的 Campaign；固定三轮用户输入；评分表 | 1. 写 T1/T2/T3。<br>2. 每轮记录首 token、总耗时、Agent 调用次数。<br>3. 对 Director、Subagent、Editor 输出人工评分。 | Director 选择正确角色；Subagent 只使用可见知识；Editor 保留角色差异；正文连续性可接受；成本和延迟在记录范围内。 | pipeline trace；评分表；app 日志；Campaign bundle。 | 待跑 |
 | L4 知识隔离对抗 | 含私有知识和未授权角色的 Campaign；对抗 prompt | 1. 写入或导入私有知识。<br>2. 用对抗 prompt 诱导未授权角色索取秘密。<br>3. 检查正文、trace 和知识写回。 | 未授权角色不能读出私有知识；失败/阻断在日志或 trace 中可见；不把文本匹配级门禁描述成完整语义安全。 | pipeline trace；app 日志；Campaign bundle；对抗 prompt 文本。 | 待跑 |
-| L5 知识传播对抗 | harness 真实 LLM 环境；支持 ignored 测试的连接配置 | 1. 运行 `cargo test -p harness-real-llm knowledge_propagation -- --ignored --nocapture`。<br>2. 保存输出摘要。<br>3. 对失败用例归因。 | 真实 PostProcessor 能抽出定向告知、身份组广播和 private 封口；写回层链路/门禁断言通过。 | 测试输出；harness 日志；失败时相关 fixture 名称。 | 待跑 |
+| L5 知识传播对抗 | harness 真实 LLM 环境；支持 ignored 测试的连接配置 | 1. 在当前 shell 设置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。<br>2. 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`。<br>3. 保存输出摘要。<br>4. 对失败用例归因。 | 真实 PostProcessor 能抽出定向告知、身份组广播和 private 封口；写回层链路/门禁断言通过；脚本输出不打印 API key。 | 测试输出；harness 日志；失败时相关 fixture 名称。 | 待跑 |
 | L6 Postprocess 覆盖 | L3 的三轮 Campaign；至少一轮明确包含事实、变量变化、任务变化和摘要点 | 1. 写作后等待 postprocess。<br>2. 检查 summaries、knowledge、variables、tasks。<br>3. 记录未命中的类别。 | 知识、变量、任务、摘要至少各命中一次；Postprocess 不凭空创建永久事实；失败重试不无限循环。 | app 日志；Campaign bundle；面板截图；成本记录。 | 待跑 |
 
 ## 6. Android 验收矩阵
@@ -114,7 +116,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| A1 构建与安装 | arm64-v8a debug APK；arm64-v8a release unsigned APK；一台 Android 真机 | 1. 构建或取得候选 APK。<br>2. 安装 debug APK。<br>3. 安装 release unsigned APK 或记录签名阻塞。<br>4. 首次启动。 | arm64-v8a debug/release 构建链路可复现；真机可安装或签名阻塞被明确记录；启动不崩溃。 | Gradle/Tauri 输出；设备型号和 Android 版本；adb logcat 摘要。 | 待真机 |
+| A1 构建与安装 | arm64-v8a debug APK；arm64-v8a release unsigned APK；一台 Android 真机 | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`。<br>2. 在已配置 `ANDROID_HOME` / `NDK_HOME` 的机器上运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1 -BuildApk`，或取得候选 APK。<br>3. 安装 debug APK。<br>4. 安装 release unsigned APK 或记录签名阻塞。<br>5. 首次启动。 | host-side smoke 可复现；arm64-v8a debug/release 构建链路可复现；真机可安装或签名阻塞被明确记录；启动不崩溃。 | smoke 输出；Gradle/Tauri 输出；设备型号和 Android 版本；adb logcat 摘要。 | 待真机 |
 | A2 文件导入权限 | 一张 ST PNG；一张 ST JSON；Android 系统文件选择器 | 1. 通过系统选择器导入 PNG。<br>2. 通过系统选择器导入 JSON。<br>3. 重启 app 后检查角色仍在。 | capability 收窄后文件读取仍可用；授权路径稳定；导入失败不破坏已有数据。 | adb logcat；app 日志；排障 bundle；失败文件名。 | 待真机 |
 | A3 移动端主流程 | A2 导入的角色；真实或测试 LLM 连接；移动网络/Wi-Fi | 1. 创建 Campaign。<br>2. 写第一轮。<br>3. 查看 Pipeline 和 Campaign 面板。<br>4. 写第二轮。 | Android 端能完成导入、创建 Campaign、写作、查看结果；移动布局不依赖桌面宽屏。 | adb logcat；app 日志；pipeline trace；屏幕录制或截图。 | 待真机 |
 | A4 导出和分享 | A3 的 Campaign；系统分享/保存入口 | 1. 导出排障 bundle。<br>2. 导出 Campaign bundle。<br>3. 用系统 save/share sheet 保存或分享。 | 导出文件可生成、可保存或分享；排障 bundle 包含诊断上下文摘要；不泄露真实 API key。 | 导出文件名和大小；adb logcat；系统分享失败截图。 | 待真机 |
