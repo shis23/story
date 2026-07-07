@@ -69,7 +69,7 @@ export const API_METHODS = {
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
-  'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ prompt: p.prompt }) },
+  'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ intent: p.intent ?? p.prompt ?? '' }) },
 }
 
 function requiredPermissions(method) {
@@ -403,8 +403,15 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     const command = _slashCommands.find(function(item) {
       return item.name === name || item.aliases.indexOf(name) >= 0;
     });
-    if (!command) return undefined;
+    if (!command) return _invokeBuiltinSlashCommand(name, args);
     return command.callback.apply(null, args);
+  }
+
+  function _invokeBuiltinSlashCommand(name, args) {
+    if (name === 'genraw') {
+      return window.storyforge.llm.generate(args && args.length ? args[0] : '');
+    }
+    return undefined;
   }
 
   function _isPromiseLike(value) {
@@ -842,7 +849,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     },
 
     llm: {
-      generate: (prompt) => _call('llm.generate', { prompt }),
+      generate: (prompt) => _call('llm.generate', prompt && typeof prompt === 'object' ? prompt : { prompt }),
     },
 
     ui: {

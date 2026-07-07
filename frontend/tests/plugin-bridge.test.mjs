@@ -244,6 +244,50 @@ test('host handler routes plugin APIs through plugin-scoped backend commands', a
   ])
 })
 
+test('host handler maps plugin LLM generation to start_writing intent', async () => {
+  const plugin = { id: 'plugin-a', permissions: ['CallLlm'] }
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const calls = []
+  const handler = createHostHandler(plugin, async (command, params) => {
+    calls.push({ command, params })
+    return { text: 'generated' }
+  })
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'llm-1',
+      method: 'llm.generate',
+      params: { prompt: 'raw prompt' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'llm-2',
+      method: 'llm.generate',
+      params: { intent: 'object intent' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(calls, [
+    { command: 'start_writing', params: { intent: 'raw prompt' } },
+    { command: 'start_writing', params: { intent: 'object intent' } },
+  ])
+  assert.equal(source.posted[0].message.result.text, 'generated')
+})
+
 test('host handler separates read and write variable permissions', async () => {
   const source = {
     posted: [],
@@ -917,6 +961,22 @@ test('keeps zero-argument slash command triggers unchanged', () => {
   window.triggerSlash('noop')
 
   assert.deepEqual(calls, [[]])
+})
+
+test('provides genraw slash fallback through LLM generation', () => {
+  const { window, postedMessages } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  assert.equal(window.SlashCommandParser.commands.length, 0)
+  assert.equal(window.storyforge.slashCommands.list().length, 0)
+
+  window.triggerSlash('/genraw write a short beat')
+  assert.equal(postedMessages.at(-1).message.type, MSG_REQUEST)
+  assert.equal(postedMessages.at(-1).message.method, 'llm.generate')
+  assert.deepEqual(plain(postedMessages.at(-1).message.params), { prompt: 'write a short beat' })
+
+  window.storyforge.llm.generate({ intent: 'object style intent' })
+  assert.equal(postedMessages.at(-1).message.method, 'llm.generate')
+  assert.deepEqual(plain(postedMessages.at(-1).message.params), { intent: 'object style intent' })
 })
 
 test('provides TavernHelper aliases for common ST plugin APIs', async () => {
