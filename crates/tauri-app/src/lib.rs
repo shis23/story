@@ -65,13 +65,15 @@ fn get_store() -> &'static CharacterStore {
     })
 }
 
-static CONN_STORE: OnceLock<ConnectionStore> = OnceLock::new();
+static CONN_STORE: OnceLock<Arc<ConnectionStore>> = OnceLock::new();
 
-fn get_conn_store() -> &'static ConnectionStore {
-    CONN_STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        ConnectionStore::new(&data_dir)
-    })
+fn get_conn_store() -> Arc<ConnectionStore> {
+    CONN_STORE
+        .get_or_init(|| {
+            let data_dir = get_app_data_dir();
+            Arc::new(ConnectionStore::new(&data_dir))
+        })
+        .clone()
 }
 
 static PRESET_STORE: OnceLock<PresetStore> = OnceLock::new();
@@ -298,6 +300,8 @@ pub struct AppState {
     active_llm: Mutex<Option<Arc<dyn LlmClient>>>,
     /// 当前活跃连接的 ID（用于 get_active_connection 快速查询）
     active_conn_id: Mutex<Option<String>>,
+    /// 序列化 async “设置活跃连接”中的写盘与内存 client 更新。
+    active_connection_update: tokio::sync::Mutex<()>,
     /// 向量存储（关键词搜索 + 后续向量搜索，持久化到 data/vectors.json）
     pub vector_store: Arc<BruteForceStore>,
     /// Meta Agent Patch 存储
@@ -438,6 +442,7 @@ impl AppState {
             current_cancel: Mutex::new(None),
             active_llm: Mutex::new(active_llm),
             active_conn_id: Mutex::new(active_conn_id),
+            active_connection_update: tokio::sync::Mutex::new(()),
             vector_store,
             meta_patches: Arc::new(RwLock::new(Vec::new())),
             typed_patches: Arc::new(RwLock::new(Vec::new())),
@@ -491,12 +496,12 @@ impl AppState {
             .clone()
     }
 
-    /// 设置活跃连接（构造 client 并缓存，挂 LlmInterceptor 记录每次调用）
-    pub fn set_active_connection(&self, id: &str) -> Result<(), TauriCommandError> {
-        let conn_store = get_conn_store();
-        let conn = conn_store
-            .set_active(id)?
-            .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id}")))?;
+    fn apply_active_connection(
+        &self,
+        id: &str,
+        conn: LlmConnection,
+    ) -> Result<(), TauriCommandError> {
+        let conn_name = conn.name.clone();
 
         let client = storyforge_infra_llm::create_client(&conn).map_err(TauriCommandError::from)?;
 
@@ -505,7 +510,7 @@ impl AppState {
             Arc::new(storyforge_app_logging::interceptor::LlmInterceptor::new(
                 Arc::from(client),
                 self.log_store.clone(),
-                conn.name.clone(),
+                conn_name,
             ));
 
         *self.active_llm.lock().unwrap_or_else(|p| p.into_inner()) = Some(intercepted);
@@ -514,6 +519,13 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(id.to_string());
         Ok(())
+    }
+
+    pub async fn set_active_connection_async(
+        self: Arc<Self>,
+        id: String,
+    ) -> Result<(), TauriCommandError> {
+        set_active_connection_with_store_async(self, get_conn_store(), id).await
     }
 
     /// 清除活跃连接（删除时调用）
@@ -3382,7 +3394,7 @@ pub struct CreateConnectionDto {
 ///
 /// 返回新连接的 id。若这是首个连接，自动设为活跃。
 #[tauri::command]
-fn create_connection(
+async fn create_connection(
     req: CreateConnectionDto,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<String, TauriCommandError> {
@@ -3403,43 +3415,22 @@ fn create_connection(
         },
         tool_mode,
     };
-    let conn_id = conn.id.as_str().to_string();
 
     // 预先验证：构造 client 看是否成功（base_url 格式等）
     // 注意：不实际发请求，只验证能构造出 client
     storyforge_infra_llm::create_client(&conn)
         .map_err(|e| TauriCommandError::llm(format!("连接配置无效: {e}"), false))?;
 
-    let was_empty = get_conn_store().list().is_empty();
-    get_conn_store()
-        .save(conn)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
-
-    // 首个连接自动设为活跃
-    if was_empty {
-        state.set_active_connection(&conn_id)?;
-    }
-
-    Ok(conn_id)
+    create_connection_with_store_async(state.inner().clone(), get_conn_store(), conn).await
 }
 
 /// 删除连接（若为活跃的，同时清除活跃状态）
 #[tauri::command]
-fn delete_connection(
+async fn delete_connection(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
-    if !get_conn_store()
-        .delete(&id)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?
-    {
-        return Err(TauriCommandError::not_found(format!("连接不存在: {id}")));
-    }
-    if was_active {
-        state.clear_active_connection();
-    }
-    Ok(())
+    delete_connection_with_store_async(state.inner().clone(), get_conn_store(), id).await
 }
 
 /// 设置活跃连接
@@ -3448,7 +3439,85 @@ async fn set_active_connection(
     id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    state.set_active_connection(&id)
+    state.inner().clone().set_active_connection_async(id).await
+}
+
+async fn set_active_connection_with_store_async(
+    state: Arc<AppState>,
+    conn_store: Arc<ConnectionStore>,
+    id: String,
+) -> Result<(), TauriCommandError> {
+    let _guard = state.active_connection_update.lock().await;
+    let id_for_io = id.clone();
+    let conn = tokio::task::spawn_blocking(move || {
+        conn_store
+            .set_active(&id_for_io)
+            .map_err(TauriCommandError::from)?
+            .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id_for_io}")))
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("设置活跃连接任务失败: {e}")))??;
+
+    // Keep in-memory active client aligned with the just-persisted active_id.
+    state.apply_active_connection(&id, conn)
+}
+
+async fn create_connection_with_store_async(
+    state: Arc<AppState>,
+    conn_store: Arc<ConnectionStore>,
+    conn: LlmConnection,
+) -> Result<String, TauriCommandError> {
+    let _guard = state.active_connection_update.lock().await;
+    let conn_id = conn.id.as_str().to_string();
+    let id_for_io = conn_id.clone();
+    let maybe_active = tokio::task::spawn_blocking(move || {
+        let was_empty = conn_store.list().is_empty();
+        conn_store
+            .save(conn)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+        if was_empty {
+            conn_store
+                .set_active(&id_for_io)
+                .map_err(TauriCommandError::from)?
+                .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id_for_io}")))
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("创建连接持久化任务失败: {e}")))??;
+
+    if let Some(active_conn) = maybe_active {
+        state.apply_active_connection(&conn_id, active_conn)?;
+    }
+
+    Ok(conn_id)
+}
+
+async fn delete_connection_with_store_async(
+    state: Arc<AppState>,
+    conn_store: Arc<ConnectionStore>,
+    id: String,
+) -> Result<(), TauriCommandError> {
+    let _guard = state.active_connection_update.lock().await;
+    let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
+    let id_for_io = id.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        conn_store
+            .delete(&id_for_io)
+            .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("删除连接持久化任务失败: {e}")))??;
+
+    if !deleted {
+        return Err(TauriCommandError::not_found(format!("连接不存在: {id}")));
+    }
+    if was_active {
+        state.clear_active_connection();
+    }
+    Ok(())
 }
 
 /// 测试连接请求 DTO（用临时配置测试，不持久化）
@@ -7439,6 +7508,204 @@ mod tests {
             self.deleted.lock().unwrap().push(secret_ref.to_string());
             Ok(())
         }
+    }
+
+    fn make_test_llm_connection(id: &str, api_key: &str) -> LlmConnection {
+        LlmConnection {
+            id: Id::from_str(id),
+            name: id.into(),
+            base_url: "https://api.example.com/v1/chat/completions".into(),
+            api_key: api_key.into(),
+            model: "test-model".into(),
+            protocol: LlmProtocol::OpenAi,
+            params: SamplingParams::default(),
+            tool_mode: ToolMode::Native,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_active_connection_async_persists_and_updates_state() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        store
+            .save(make_test_llm_connection(
+                "async-active",
+                "async-active-secret",
+            ))
+            .unwrap();
+
+        set_active_connection_with_store_async(state.clone(), store.clone(), "async-active".into())
+            .await
+            .unwrap();
+
+        assert_eq!(state.active_conn_id().as_deref(), Some("async-active"));
+        assert!(store.active_connection().is_some());
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(!raw.contains("async-active-secret"));
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["active_id"], "async-active");
+        assert!(stored["connections"][0]["last_used_at"].is_string());
+
+        let reloaded = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        assert_eq!(
+            reloaded.active_connection().unwrap().id.as_str(),
+            "async-active"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_set_active_connection_async_serializes_concurrent_updates() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_race_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        store
+            .save(make_test_llm_connection("async-a", "async-secret-a"))
+            .unwrap();
+        store
+            .save(make_test_llm_connection("async-b", "async-secret-b"))
+            .unwrap();
+
+        let queued_guard = state.active_connection_update.lock().await;
+        let task_a = tokio::spawn(set_active_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            "async-a".into(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let task_b = tokio::spawn(set_active_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            "async-b".into(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drop(queued_guard);
+
+        task_a.await.unwrap().unwrap();
+        task_b.await.unwrap().unwrap();
+
+        assert_eq!(state.active_conn_id().as_deref(), Some("async-b"));
+        assert_eq!(store.active_connection().unwrap().id.as_str(), "async-b");
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["active_id"], "async-b");
+
+        let reloaded = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        assert_eq!(reloaded.active_connection().unwrap().id.as_str(), "async-b");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_connection_async_auto_activates_first_connection() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_create_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        let conn = make_test_llm_connection("created-first", "created-first-secret");
+
+        let conn_id = create_connection_with_store_async(state.clone(), store.clone(), conn)
+            .await
+            .unwrap();
+
+        assert_eq!(conn_id, "created-first");
+        assert_eq!(state.active_conn_id().as_deref(), Some("created-first"));
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(!raw.contains("created-first-secret"));
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(stored["active_id"], "created-first");
+
+        let reloaded = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        assert_eq!(
+            reloaded.active_connection().unwrap().id.as_str(),
+            "created-first"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_delete_connection_async_serializes_with_set_active() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_delete_race_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        store
+            .save(make_test_llm_connection("async-a", "async-secret-a"))
+            .unwrap();
+        store
+            .save(make_test_llm_connection("async-b", "async-secret-b"))
+            .unwrap();
+
+        set_active_connection_with_store_async(state.clone(), store.clone(), "async-a".into())
+            .await
+            .unwrap();
+
+        let queued_guard = state.active_connection_update.lock().await;
+        let set_b = tokio::spawn(set_active_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            "async-b".into(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let delete_b = tokio::spawn(delete_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            "async-b".into(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drop(queued_guard);
+
+        set_b.await.unwrap().unwrap();
+        delete_b.await.unwrap().unwrap();
+
+        assert!(state.active_conn_id().is_none());
+        assert!(store.get("async-b").is_none());
+        assert!(store.active_connection().is_none());
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(stored["active_id"].is_null());
+
+        let reloaded = ConnectionStore::new_with_secret_store(&dir, secret_store);
+        assert!(reloaded.active_connection().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
