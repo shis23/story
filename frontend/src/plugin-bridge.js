@@ -68,8 +68,11 @@ function hostPluginStorageKey(pluginId, key) {
   ].join(':')
 }
 
-function readHostPluginStorage(pluginId, key) {
-  const storageKey = hostPluginStorageKey(pluginId, key)
+function legacyHostPluginStorageKey(pluginId, key) {
+  return `sf_host_plugin_storage_${pluginId}_${key}`
+}
+
+function readHostPluginStorageByKey(storageKey) {
   try {
     if (typeof globalThis !== 'undefined' && globalThis.localStorage) {
       const raw = globalThis.localStorage.getItem(storageKey)
@@ -81,6 +84,18 @@ function readHostPluginStorage(pluginId, key) {
   return HOST_PLUGIN_STORAGE_FALLBACK.has(storageKey)
     ? HOST_PLUGIN_STORAGE_FALLBACK.get(storageKey)
     : null
+}
+
+function readHostPluginStorage(pluginId, key) {
+  const storageKey = hostPluginStorageKey(pluginId, key)
+  const value = readHostPluginStorageByKey(storageKey)
+  if (value !== null) return value
+
+  const legacyValue = readHostPluginStorageByKey(legacyHostPluginStorageKey(pluginId, key))
+  if (legacyValue !== null) {
+    writeHostPluginStorage(pluginId, key, legacyValue)
+  }
+  return legacyValue
 }
 
 function writeHostPluginStorage(pluginId, key, value) {

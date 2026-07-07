@@ -334,6 +334,61 @@ test('host handler keeps plugin storage isolated for ambiguous ids and keys', as
   assert.deepEqual(source.posted.at(-1).message.result, { owner: 'foo_bar' })
 })
 
+test('host handler migrates legacy plugin storage keys on read', async () => {
+  const previousLocalStorage = globalThis.localStorage
+  const hadLocalStorage = Object.prototype.hasOwnProperty.call(globalThis, 'localStorage')
+  const storage = new Map()
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
+  })
+
+  try {
+    storage.set(
+      'sf_host_plugin_storage_legacy/plugin_extension_settings',
+      JSON.stringify({ enabled: true }),
+    )
+
+    const source = {
+      posted: [],
+      postMessage(message, targetOrigin) {
+        this.posted.push({ message, targetOrigin })
+      },
+    }
+    const handler = createHostHandler({ id: 'legacy/plugin', permissions: [] }, async () => null)
+
+    await handler({
+      data: {
+        type: MSG_REQUEST,
+        pluginId: 'legacy/plugin',
+        id: 'get-legacy',
+        method: 'storage.get',
+        params: { key: 'extension_settings' },
+      },
+      source,
+      origin: 'https://plugin.example',
+    })
+
+    assert.deepEqual(source.posted.at(-1).message.result, { enabled: true })
+    assert.equal(
+      storage.get('sf_host_plugin_storage:legacy%2Fplugin:extension_settings'),
+      JSON.stringify({ enabled: true }),
+    )
+  } finally {
+    if (hadLocalStorage) {
+      Object.defineProperty(globalThis, 'localStorage', {
+        configurable: true,
+        value: previousLocalStorage,
+      })
+    } else {
+      delete globalThis.localStorage
+    }
+  }
+})
+
 test('host handler routes plugin APIs through plugin-scoped backend commands', async () => {
   const plugin = { id: 'plugin-a', permissions: ['ReadCharacters', 'ReadVariables', 'WriteVariables'] }
   const source = {
