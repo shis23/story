@@ -11,6 +11,7 @@ import {
   setActiveAgentProfileConfig,
 } from '../tauri-api.js'
 import { promptDialog, confirmDialog } from './base/BaseDialog.js'
+import { cleanForSave, safeFileName } from '../utils/agentProfileConfig.js'
 
 defineProps({
   // 嵌入调试抽屉时去掉外层卡片
@@ -200,50 +201,11 @@ async function importProfile() {
   }
 }
 
-function safeFileName(name) {
-  return String(name)
-    .replace(/[\\/:*?"<>|]+/g, '-')
-    .trim()
-    .slice(0, 80) || 'agent-profile'
-}
-
 function isBuiltinId(id) {
   return id === 'builtin-default-agent-v1'
 }
 function isBuiltin(cfg) {
   return cfg && (cfg.source === 'BuiltIn' || isBuiltinId(cfg.id))
-}
-
-/// 保存前清洗：空串→null，移除完全空的角色条目
-function cleanForSave(cfg) {
-  const out = { ...cfg }
-  const cleanedConfigs = {}
-  for (const role of Object.keys(cfg.agent_configs || {})) {
-    const c = cfg.agent_configs[role]
-    const model = (c.model_override || '').trim()
-    const rounds = c.max_tool_rounds === '' || c.max_tool_rounds === null ? null : Number(c.max_tool_rounds)
-    const wl = parseWhitelist(c.tool_whitelistRaw)
-    // 全空则不存该角色（让后端用默认）
-    if (!model && rounds === null && wl === null) continue
-    cleanedConfigs[role] = {
-      model_override: model || null,
-      max_tool_rounds: rounds,
-      tool_whitelist: wl,
-    }
-  }
-  out.agent_configs = cleanedConfigs
-  out.max_concurrent_subagents = Number(out.max_concurrent_subagents) || 1
-  delete out.tool_whitelistRaw
-  return out
-}
-
-/// tool_whitelist 输入（逗号分隔字符串）→ Option<Vec<String>>
-function parseWhitelist(raw) {
-  if (raw === null || raw === undefined) return null
-  const s = String(raw).trim()
-  if (s === '') return [] // 空输入 = 禁用全部工具（Some([])）
-  const names = s.split(',').map((x) => x.trim()).filter(Boolean)
-  return names
 }
 
 /// 把后端 tool_whitelist 反向渲染成输入框可编辑的逗号分隔字符串
