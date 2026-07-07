@@ -1,6 +1,6 @@
 import { canModifyPrompt } from '../plugin-bridge.js'
 
-export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, event, data = {}) {
+export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, event, data = {}, options = {}) {
   let payload = data
 
   for (const plugin of plugins || []) {
@@ -8,7 +8,18 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
 
     const host = hostRefs?.get?.(plugin.id)
     if (host?.emitPluginEventAndWait) {
-      payload = await host.emitPluginEventAndWait(event, payload)
+      try {
+        const nextPayload = await host.emitPluginEventAndWait(event, payload)
+        if (nextPayload !== undefined) {
+          payload = nextPayload
+        }
+      } catch (error) {
+        try {
+          options?.onError?.(error, plugin)
+        } catch {
+          // Error reporting should not make prompt hooks fail closed.
+        }
+      }
     }
   }
 

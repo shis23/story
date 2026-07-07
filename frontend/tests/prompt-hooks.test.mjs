@@ -50,6 +50,72 @@ test('runs prompt hook plugins sequentially and skips plugins without ModifyProm
   assert.deepEqual(result, { prompt: 'base + first + second' })
 })
 
+test('prompt hooks fail open and continue when one plugin throws or returns undefined', async () => {
+  const errors = []
+  const plugins = [
+    { id: 'first', permissions: ['ModifyPrompt'] },
+    { id: 'throws', permissions: ['ModifyPrompt'] },
+    { id: 'undefined', permissions: ['ModifyPrompt'] },
+    { id: 'last', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['first', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: `${payload.prompt} + first` }
+      },
+    }],
+    ['throws', {
+      async emitPluginEventAndWait() {
+        throw new Error('hook failed')
+      },
+    }],
+    ['undefined', {
+      async emitPluginEventAndWait() {
+        return undefined
+      },
+    }],
+    ['last', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: `${payload.prompt} + last` }
+      },
+    }],
+  ])
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { onError: (error, plugin) => errors.push([plugin.id, error.message]) },
+  )
+
+  assert.deepEqual(result, { prompt: 'base + first + last' })
+  assert.deepEqual(errors, [['throws', 'hook failed']])
+})
+
+test('prompt hook error reporting is also fail open', async () => {
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    [{ id: 'throws', permissions: ['ModifyPrompt'] }, { id: 'last', permissions: ['ModifyPrompt'] }],
+    new Map([
+      ['throws', {
+        async emitPluginEventAndWait() {
+          throw new Error('hook failed')
+        },
+      }],
+      ['last', {
+        async emitPluginEventAndWait(event, payload) {
+          return { ...payload, prompt: `${payload.prompt} + last` }
+        },
+      }],
+    ]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { onError: () => { throw new Error('logger failed') } },
+  )
+
+  assert.deepEqual(result, { prompt: 'base + last' })
+})
+
 test('resolves hooked intent from intent first, then prompt, then fallback', () => {
   assert.equal(resolveHookedIntent({ intent: 'intent-hook', prompt: 'prompt-hook' }, 'base'), 'intent-hook')
   assert.equal(resolveHookedIntent({ prompt: 'prompt-hook' }, 'base'), 'prompt-hook')
