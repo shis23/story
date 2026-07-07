@@ -26,8 +26,12 @@ pub enum Permission {
     ReadWorldInfo,
     /// 读取记忆
     ReadMemory,
-    /// 读写变量
+    /// 读取变量
+    ReadVariables,
+    /// 直接写变量（兼容旧插件；新插件应优先走提议更新/预览）
     WriteVariables,
+    /// 提议变量更新，由宿主预览/确认后应用
+    ProposeVariableUpdate,
     /// 调用 LLM
     CallLlm,
     /// 网络请求
@@ -315,9 +319,13 @@ pub const ST_API_MAPPING: &[(&str, &str, &str)] = &[
     (
         "setLocalVar(key, val)",
         "storyforge.variables.set(key, val)",
-        "需 WriteVariables 权限",
+        "兼容路径需 WriteVariables；新插件应使用 ProposeVariableUpdate",
     ),
-    ("getLocalVar(key)", "storyforge.variables.get(key)", ""),
+    (
+        "getLocalVar(key)",
+        "storyforge.variables.get(key)",
+        "需 ReadVariables 权限",
+    ),
     (
         "replaceVariables(msg)",
         "（不暴露，变量替换由后端统一做）",
@@ -416,6 +424,11 @@ mod tests {
         assert!(
             registry
                 .ensure_permission("p1", &Permission::WriteVariables)
+                .is_err()
+        );
+        assert!(
+            registry
+                .ensure_permission("p1", &Permission::ReadVariables)
                 .is_err()
         );
     }

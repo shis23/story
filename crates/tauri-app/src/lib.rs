@@ -1497,18 +1497,55 @@ fn plugin_read_character(
 }
 
 #[tauri::command]
+fn plugin_read_world_info(
+    plugin_id: String,
+    character_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CharacterInfo, TauriCommandError> {
+    use storyforge_infra_plugin_host::Permission;
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::ReadWorldInfo)
+        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    get_store()
+        .get(&character_id)
+        .map(|s| s.info)
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
+}
+
+fn ensure_plugin_any_permission(
+    registry: &storyforge_infra_plugin_host::PluginRegistry,
+    plugin_id: &str,
+    permissions: &[storyforge_infra_plugin_host::Permission],
+) -> Result<(), TauriCommandError> {
+    let mut last_error = None;
+    for permission in permissions {
+        match registry.ensure_permission(plugin_id, permission) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(TauriCommandError::internal(
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "插件权限不足".to_string()),
+    ))
+}
+
+#[tauri::command]
 fn plugin_get_variable(
     plugin_id: String,
     campaign_id: String,
     instance_id: String,
-    _key: String,
+    _key: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<storyforge_domain::variables::VariableValue>, TauriCommandError> {
     use storyforge_infra_plugin_host::Permission;
-    state
-        .plugin_registry
-        .ensure_permission(&plugin_id, &Permission::WriteVariables)
-        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    ensure_plugin_any_permission(
+        &state.plugin_registry,
+        &plugin_id,
+        &[Permission::ReadVariables, Permission::WriteVariables],
+    )?;
     let store = get_campaign_store();
     store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
@@ -7221,6 +7258,7 @@ pub fn run() {
             set_plugin_enabled,
             plugin_list_characters,
             plugin_read_character,
+            plugin_read_world_info,
             plugin_get_variable,
             plugin_set_variable,
             // 预设/模块系统命令

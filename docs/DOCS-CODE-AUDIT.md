@@ -269,9 +269,11 @@
 
 2026-07-07 续补核对：`storyforge-app-agent::AgentRuntime` 已新增异步 `PromptHook` 接缝，普通、streaming、`run_tool_loop_with_layout` 三条 LLM request 构造路径都会在创建 `ChatRequest` 前给 hook 改写本轮 `messages` 副本；子 Agent 独立 runtime 会继承同一 hook。新增单测用 `SequentialLlmClient` 捕获三条入口的最终 request，断言 hook 追加的 marker 确实进入 LLM messages；另覆盖 hook pending 时全局 cancel 可中断等待，避免后续接 iframe prompt hook 时卡住生成。该接缝为后续 ST prompt hooks 提供后端落点；当前仍未完成的是前端 PluginHost host-to-iframe hook request/response、Tauri/前端跨层等待，以及按插件顺序合并 mutation。
 
-2026-07-07 真实复杂卡导入核对：`cargo run -p storyforge-infra-import --example inspect_card` 已用仓库根目录 `test-card.png`（命定之诗与黄昏之歌 v4.1）解析通过；该卡包含 441 条世界书、6 个 alternate greetings，并保留 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等 extensions。此检查证明复杂卡 import/inspect 基线可跑，但不等同完整真实写作/插件运行时验收。
+2026-07-07 真实复杂卡导入核对：`cargo run -p storyforge-infra-import --example inspect_card` 已用仓库根目录 `test-card.png`（命定之诗与黄昏之歌 v4.1）解析通过；该卡包含 441 条世界书、6 个 alternate greetings，并保留 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等 extensions。已补 `scripts/run-real-card-smoke.ps1` 和 ignored 回归 `test_real_complex_card_fixture_preserves_core_st_fields`，把上述导入保真核对固化为可复跑 smoke；此检查证明复杂卡 import/inspect 基线可跑，但不等同完整真实写作/插件运行时验收。
 
 2026-07-07 追加核对：Meta 生成溯源前端入口已接线。`frontend/src/utils/conversationNodes.js::findLastAssistantConversationNode` 会从当前消息列表中选择最后一条带 active variant provenance 的 assistant 节点，忽略流式占位和无溯源开场白；`App.vue` 将该节点作为 `lastConversationNode` 传给 `MetaPanel`，因此 `meta_explain_generation` 不再是隐藏死入口。该规则由 `frontend/tests/conversation-nodes.test.mjs` 固化，并纳入 `npm test`。
+
+2026-07-07 续补核对：插件 API 桥已把 `character.list`、`character.get`、`worldInfo.search`、`variables.get`、`variables.set` 从通用 Tauri 命令切到 `plugin_*` 专用命令，并自动注入 `pluginId`，避免 iframe 插件绕过后端 registry 二次校验。权限模型新增 `ReadVariables` 和 `ProposeVariableUpdate`；`variables.get` 允许 `ReadVariables` 或旧 `WriteVariables`，`variables.set` 仍要求 `WriteVariables`。前端 `plugin-bridge.test.mjs` 覆盖命令路由和读写权限拆分；后端仍保留直接写变量兼容路径，完整 propose/preview 写入流仍是后续安全收口项。
 
 ### Phase 6：Android（~20%）
 

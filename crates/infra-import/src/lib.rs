@@ -322,6 +322,198 @@ mod tests {
     }
 
     #[test]
+    fn test_complex_card_json_to_png_round_trip_preserves_compat_fields() {
+        let json = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Complex Gate Card",
+                "description": "release gate fixture",
+                "personality": "precise",
+                "scenario": "compatibility lab",
+                "first_mes": "Primary opening.",
+                "mes_example": "<START>\nExample dialog",
+                "system_prompt": "system prompt survives",
+                "post_history_instructions": "post history survives",
+                "tags": ["compat", "roundtrip"],
+                "creator": "StoryForge",
+                "character_version": "gate-1",
+                "alternate_greetings": ["Alt one.", "Alt two."],
+                "group_only": true,
+                "creator_notes": "unknown top-level data field survives",
+                "extensions": {
+                    "tavern_helper": {
+                        "scripts": [
+                            {"name": "status hook", "enabled": true}
+                        ]
+                    },
+                    "regex_scripts": [
+                        {
+                            "id": "gate-regex",
+                            "scriptName": "Gate regex",
+                            "findRegex": "/foo/g",
+                            "replaceString": "bar",
+                            "placement": [1, 2],
+                            "disabled": false,
+                            "promptOnly": true
+                        }
+                    ],
+                    "world": "Gate World",
+                    "unknown_plugin": {
+                        "nested": {"flag": "keep"}
+                    }
+                },
+                "character_book": {
+                    "entries": [
+                        {
+                            "id": 10,
+                            "keys": ["always"],
+                            "content": "Constant lore.",
+                            "constant": true,
+                            "position": "before_char",
+                            "order": 20
+                        },
+                        {
+                            "id": 11,
+                            "keys": ["trigger"],
+                            "secondary_keys": ["secondary"],
+                            "content": "Selective lore.",
+                            "selective": true,
+                            "selective_logic": 1,
+                            "position": "after_char",
+                            "order": 21,
+                            "depth": 4,
+                            "extensions": {
+                                "entry_extra": {"rank": 2}
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let imported =
+            import_character_from_json(&serde_json::to_vec(&json).unwrap()).expect("JSON imports");
+        let exported_data = storyforge_domain::character::to_st_data(
+            &imported,
+            None,
+            imported
+                .embedded_world_info
+                .as_ref()
+                .map(storyforge_domain::world_info::WorldInfoBook::to_st_book),
+        );
+        let st_card = png::make_st_card(exported_data, &imported.spec_version);
+        let png_bytes =
+            png::write_st_card_png(&st_card, None).expect("complex card should export as PNG");
+
+        let round_tripped = import_character(&png_bytes).expect("exported PNG should re-import");
+
+        assert_eq!(round_tripped.name, "Complex Gate Card");
+        assert_eq!(round_tripped.spec_version, "3.0");
+        assert_eq!(
+            round_tripped.alternate_greetings,
+            vec!["Alt one.", "Alt two."]
+        );
+        assert_eq!(round_tripped.raw_card_json["group_only"], true);
+        assert_eq!(
+            round_tripped.raw_card_json["creator_notes"],
+            "unknown top-level data field survives"
+        );
+        assert_eq!(round_tripped.extensions["world"], "Gate World");
+        assert_eq!(
+            round_tripped.extensions["tavern_helper"]["scripts"][0]["name"],
+            "status hook"
+        );
+        assert_eq!(
+            round_tripped.extensions["unknown_plugin"]["nested"]["flag"],
+            "keep"
+        );
+
+        let scripts = round_tripped.scoped_regex_scripts();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "gate-regex");
+        assert_eq!(scripts[0].placement_codes, vec![1, 2]);
+        assert_eq!(scripts[0].prompt_only, Some(true));
+
+        let book = round_tripped
+            .embedded_world_info
+            .as_ref()
+            .expect("world book should survive JSON -> PNG -> import");
+        assert_eq!(book.entries.len(), 2);
+        assert!(book.entries.iter().any(|entry| entry.constant));
+        let selective = book
+            .entries
+            .iter()
+            .find(|entry| entry.selective)
+            .expect("selective lore should survive");
+        assert_eq!(selective.keys, vec!["trigger"]);
+        assert_eq!(selective.secondary_keys, vec!["secondary"]);
+        assert_eq!(
+            selective.selective_logic,
+            storyforge_domain::world_info::SelectiveLogic::Or
+        );
+        assert_eq!(selective.depth, 4);
+        assert_eq!(selective.extensions["entry_extra"]["rank"], 2);
+    }
+
+    #[test]
+    #[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+    fn test_real_complex_card_fixture_preserves_core_st_fields() {
+        let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("test-card.png")
+            });
+        let bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+
+        let character = import_character(&bytes).expect("real complex card should import");
+
+        assert_eq!(character.name, "命定之诗与黄昏之歌v4.1");
+        assert_eq!(character.spec_version, "2.0");
+        assert_eq!(character.alternate_greetings.len(), 6);
+        assert!(character.raw_card_json.is_object());
+        assert!(character.raw_card_json.get("extensions").is_some());
+
+        let extensions = character
+            .extensions
+            .as_object()
+            .expect("extensions should remain an object");
+        for key in [
+            "depth_prompt",
+            "regex_scripts",
+            "tavern_helper",
+            "world",
+            "xiaobaix-template",
+        ] {
+            assert!(extensions.contains_key(key), "missing extension key: {key}");
+        }
+
+        let book = character
+            .embedded_world_info
+            .as_ref()
+            .expect("real complex card should include an embedded world book");
+        assert_eq!(book.entries.len(), 441);
+        assert_eq!(
+            book.entries.iter().filter(|entry| entry.constant).count(),
+            85
+        );
+        assert_eq!(
+            book.entries.iter().filter(|entry| entry.selective).count(),
+            340
+        );
+        assert!(
+            book.entries
+                .iter()
+                .any(|entry| entry.content.contains("命定系统")),
+            "expected imported world book to preserve 命定系统 content"
+        );
+    }
+
+    #[test]
     fn test_import_character_from_png_without_chara_returns_no_character_data() {
         let png = png::build_placeholder_png();
         let err = import_character_from_png(&png).expect_err("PNG without chara should fail");

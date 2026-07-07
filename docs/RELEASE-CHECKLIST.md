@@ -4,7 +4,7 @@
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 > 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
-> 专项入口：真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
+> 专项入口：真实复杂卡导入保真冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
 
 ## 0. 发布闸门
 
@@ -31,6 +31,7 @@
 
 - 本轮待推送提交栈已执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 并通过完整六步：secret scan、`cargo fmt --check`、workspace clippy、workspace tests、frontend `npm.cmd test`、frontend `npm.cmd run build`。本行只记录自动化基线状态，不作为最终发布 SHA；最终候选 SHA 以 tag/release notes 记录为准。
 - 仍有既有 Vite dynamic/static import warning；本轮未新增同类阻塞，继续按分包风险记录，不视为发布闸门失败。
+- 真实复杂卡导入保真专项 smoke 已补：`scripts/run-real-card-smoke.ps1` 默认读取仓库根目录 `test-card.png`，运行 ignored 回归 `test_real_complex_card_fixture_preserves_core_st_fields`，断言卡名、6 个 alternate greetings、441 条世界书、85 个常驻条目、340 个选择性条目，以及 `regex_scripts`、`tavern_helper`、`xiaobaix-template` 等关键 extensions 保留。该 smoke 覆盖 S1 的导入保真子项，不替代 UI 创建 Campaign 和导出 bundle 的人工/端到端验收。
 - 专项 smoke runner 已补：`scripts/run-real-llm-smoke.ps1` 统一执行 ignored 真实 LLM 套件并避免打印 API key；`scripts/run-android-smoke.ps1` 统一执行 frontend build、Tauri capability 测试和 Android arm64 host-side check，`-BuildApk` 时再要求 `ANDROID_HOME` / `NDK_HOME`。
 
 2026-07-06 已验证：
@@ -91,7 +92,7 @@ Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON | 1. 导入卡。<br>2. 打开角色详情。<br>3. 创建 Campaign。<br>4. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出。 | 导入错误日志；导出的 Campaign bundle；角色详情截图。 | 待跑 |
+| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON；自动子项可用仓库根目录 `test-card.png` | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`。<br>2. 在 UI 导入卡。<br>3. 打开角色详情。<br>4. 创建 Campaign。<br>5. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出。 | 导入错误日志；导出的 Campaign bundle；角色详情截图；real-card smoke 输出。 | 自动导入保真已覆盖，UI/Campaign/bundle 待跑 |
 | S2 世界书注入 | 含 Constant、Selective、Both 世界书条目的卡；两条不同意图的用户输入 | 1. 写一轮命中关键词的输入。<br>2. 写一轮不命中关键词的输入。<br>3. 检查 Director system/tail 摘要。 | Constant/Both 稳定进入 Director system；Selective/Both 按关键词进入 Director tail；未命中条目不注入。 | pipeline trace；Director 输入摘要；app 日志。 | 待跑 |
 | S3 MVU schema 与状态栏 | 含 MVU 变量定义和状态栏片段的卡；可触发变量变化的一轮写作 | 1. 打开 MVU schema preview。<br>2. 检查新增、覆盖、无变化字段。<br>3. apply schema。<br>4. 写一轮并查看状态栏。 | preview 能区分新增/覆盖/无变化；apply 后变量 tab 刷新；状态栏原生渲染展示关键变量；JS 执行失败时有降级提示。 | Meta/MVU preview 截图；app 日志；Campaign bundle；JS fallback warning。 | 待跑 |
 | S4 Regex/HTML 降级 | 含 `promptOnly`、`markdownOnly`、display-only HTML、`minDepth/maxDepth`、Slash placement 3 和 reasoning 块的卡 | 1. 导入卡并写一轮。<br>2. 用普通输入和 `/` 前缀输入分别触发写作。<br>3. 检查 prompt 注入、消息展示和持久化内容。<br>4. 记录任何降级提示。 | `promptOnly` 不污染显示/存储；`markdownOnly` 不污染 prompt/持久化；display-only HTML 安全渲染；depth 过滤和 `<think>/<thinking>` 处理符合当前实现；Slash placement 3 只作用于 `/` 前缀输入且随后继续执行 Input 正则；不支持路径有清晰提示。 | pipeline trace；消息截图；app 日志；降级记录。 | 待跑 |
@@ -143,5 +144,6 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
 - 插件事件总线已覆盖主生成链和常见聊天宿主动作，enabled 插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参；但还不是 ST 99 事件全集，也不是最终 messages 级 prompt hook 全量兼容，发布说明应避免过度承诺。
+- 插件 API 桥已改为调用 `plugin_*` 专用后端命令并注入 `pluginId`，变量读取权限已从写权限中拆出；但变量写入仍保留 `WriteVariables` 直接兼容路径，完整 propose/preview 写入流仍需后续收口，发布说明不要把插件权限描述成完整第三方插件沙箱。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
 - 真实卡 Gold 档兼容尚未完成验收。

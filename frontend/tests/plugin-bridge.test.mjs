@@ -161,6 +161,126 @@ test('host handler supports plugin storage set/get without backend invoke', asyn
   assert.equal(source.posted[1].targetOrigin, 'https://plugin.example')
 })
 
+test('host handler routes plugin APIs through plugin-scoped backend commands', async () => {
+  const plugin = { id: 'plugin-a', permissions: ['ReadCharacters', 'ReadVariables', 'WriteVariables'] }
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const calls = []
+  const handler = createHostHandler(plugin, async (command, params) => {
+    calls.push({ command, params })
+    return { ok: true }
+  })
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'list-1',
+      method: 'character.list',
+      params: {},
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'get-1',
+      method: 'character.get',
+      params: { id: 'char-1' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'vars-1',
+      method: 'variables.get',
+      params: { campaignId: 'camp-1', instanceId: 'inst-1' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'set-1',
+      method: 'variables.set',
+      params: { campaignId: 'camp-1', instanceId: 'inst-1', key: 'hp', value: 12 },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(calls, [
+    { command: 'plugin_list_characters', params: { pluginId: 'plugin-a' } },
+    { command: 'plugin_read_character', params: { pluginId: 'plugin-a', characterId: 'char-1' } },
+    {
+      command: 'plugin_get_variable',
+      params: { pluginId: 'plugin-a', campaignId: 'camp-1', instanceId: 'inst-1' },
+    },
+    {
+      command: 'plugin_set_variable',
+      params: {
+        pluginId: 'plugin-a',
+        campaignId: 'camp-1',
+        instanceId: 'inst-1',
+        key: 'hp',
+        value: 12,
+      },
+    },
+  ])
+})
+
+test('host handler separates read and write variable permissions', async () => {
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  let invokeCount = 0
+  const handler = createHostHandler({ id: 'plugin-a', permissions: ['ReadVariables'] }, async () => {
+    invokeCount += 1
+    return []
+  })
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'read-1',
+      method: 'variables.get',
+      params: { campaignId: 'camp-1', instanceId: 'inst-1' },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'write-1',
+      method: 'variables.set',
+      params: { campaignId: 'camp-1', instanceId: 'inst-1', key: 'hp', value: 12 },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.equal(invokeCount, 1)
+  assert.deepEqual(source.posted[0].message.result, [])
+  assert.match(source.posted[1].message.error, /WriteVariables/)
+})
+
 test('maps pipeline events to native plugin event names', () => {
   const rawEvent = { event_type: 'director_started', data: {} }
   const events = mapPipelineEventToPluginEvents(rawEvent)

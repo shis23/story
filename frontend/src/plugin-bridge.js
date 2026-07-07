@@ -59,15 +59,25 @@ const ST_EVENT_ALIASES = {
 // ─── 方法 → 权限 + Tauri 命令映射 ──────────────────────────────────────────
 
 export const API_METHODS = {
-  'character.list':   { permission: 'ReadCharacters',  command: 'list_characters' },
-  'character.get':    { permission: 'ReadCharacters',  command: 'get_character',     params: (p) => ({ id: p.id }) },
-  'worldInfo.search': { permission: 'ReadWorldInfo',   command: 'get_character',     params: (p) => ({ id: p.characterId }) },
+  'character.list':   { permission: 'ReadCharacters',  command: 'plugin_list_characters', params: (_p, pluginId) => ({ pluginId }) },
+  'character.get':    { permission: 'ReadCharacters',  command: 'plugin_read_character',  params: (p, pluginId) => ({ pluginId, characterId: p.id }) },
+  'worldInfo.search': { permission: 'ReadWorldInfo',   command: 'plugin_read_world_info', params: (p, pluginId) => ({ pluginId, characterId: p.characterId }) },
   'memory.getRecent': { permission: 'ReadMemory',      command: 'get_conversation',  params: (p) => ({ id: p.conversationId }) },
-  'variables.get':    { permission: 'WriteVariables',  command: 'get_character_variables', params: (p) => ({ campaignId: p.campaignId, instanceId: p.instanceId }) },
-  'variables.set':    { permission: 'WriteVariables',  command: 'set_character_variable', params: (p) => ({ campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
+  'variables.get':    { permissions: ['ReadVariables', 'WriteVariables'], command: 'plugin_get_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId }) },
+  'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
   'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ prompt: p.prompt }) },
+}
+
+function requiredPermissions(method) {
+  if (Array.isArray(method.permissions)) return method.permissions
+  return method.permission ? [method.permission] : []
+}
+
+function hasAnyPermission(plugin, permissions) {
+  if (!permissions.length) return true
+  return permissions.some((permission) => plugin.permissions?.includes(permission))
 }
 
 // ─── PipelineEvent → 插件事件映射 ─────────────────────────────────────────
@@ -727,18 +737,19 @@ export function createHostHandler(plugin, invoke, options = {}) {
     }
 
     // 权限校验
-    if (method.permission && !plugin.permissions?.includes(method.permission)) {
+    const permissions = requiredPermissions(method)
+    if (!hasAnyPermission(plugin, permissions)) {
       postResponse(event, {
         type: MSG_RESPONSE,
         id: data.id,
-        error: `权限不足: 需要 ${method.permission}`,
+        error: `权限不足: 需要 ${permissions.join(' 或 ')}`,
       })
       return
     }
 
     // 调用 Tauri 后端
     try {
-      const params = method.params ? method.params(data.params) : {}
+      const params = method.params ? method.params(data.params || {}, plugin.id) : {}
       const result = await invoke(method.command, params)
       postResponse(event, {
         type: MSG_RESPONSE,

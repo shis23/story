@@ -124,7 +124,7 @@
 
 ## 验证
 
-- [ ] 常见 ST V2/V3 卡能导入且不丢关键字段（发布候选仍需真实卡矩阵实跑）。
+- [ ] 常见 ST V2/V3 卡能导入且不丢关键字段（已补 `scripts/run-real-card-smoke.ps1` 覆盖仓库本地 `test-card.png` 的复杂卡导入保真；发布候选仍需真实卡矩阵和 UI/Campaign/bundle 链路实跑）。
 - [x] 不认识的 extensions 不丢（`raw_card_json` 保底）；未知 ST `data` 顶层字段也会经 `extra` 保留。
 - [x] 多角色识别失败时 fallback 到单角色，不报错崩溃；`test_card_summary_treats_fallback_as_not_extracted` 覆盖 fallback 不被误报为成功识别，`test_prepare_character_extraction_*` 覆盖手动重跑安全边界。
 - [x] Campaign 导出 → 导入 round-trip ID 重写和引用一致性由 `import_campaign_bundle_rewrites_ids_and_references` 覆盖。
