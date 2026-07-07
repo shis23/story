@@ -351,6 +351,8 @@ pub struct AppState {
     pub meta_patches: Arc<RwLock<Vec<storyforge_app_meta::Patch>>>,
     /// 类型化 Patch 存储（第三轮：campaign-runtime 修复）
     pub typed_patches: Arc<RwLock<Vec<storyforge_app_meta::TypedPatch>>>,
+    /// Serialize typed patch accept so preflight and writes cannot interleave.
+    typed_patch_accept_lock: Mutex<()>,
     /// 嵌入配置（metadata 持久化到 data/embed.json，API key 走 SecretRef）
     pub embed_config: Arc<RwLock<Option<storyforge_infra_llm::EmbedConfig>>>,
     /// 当前活跃 Campaign ID（持久化到 data/active_campaign.json）
@@ -490,6 +492,7 @@ impl AppState {
             vector_store,
             meta_patches: Arc::new(RwLock::new(Vec::new())),
             typed_patches: Arc::new(RwLock::new(Vec::new())),
+            typed_patch_accept_lock: Mutex::new(()),
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
             active_campaign: Mutex::new(load_active_campaign(&data_dir)),
             plugin_registry,
@@ -5162,19 +5165,69 @@ fn meta_propose_campaign_repairs_in_store(
         }
     }
 
-    // 存入 state（追加，不去重）
-    {
+    let visible_patches = {
         let mut typed = state
             .typed_patches
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        typed.extend(patches.clone());
-    }
+        let mut visible = Vec::new();
+        for patch in patches {
+            if let Some(existing) = typed
+                .iter_mut()
+                .find(|existing| is_same_pending_typed_patch(existing, &patch))
+            {
+                existing.description = patch.description.clone();
+                existing.diff = patch.diff.clone();
+                visible.push(existing.clone());
+            } else {
+                visible.push(patch.clone());
+                typed.push(patch);
+            }
+        }
+        visible
+    };
 
-    patches
+    visible_patches
         .into_iter()
         .map(|p| to_json_value(&p, "typed patch proposal"))
         .collect()
+}
+
+fn is_same_pending_typed_patch(
+    existing: &storyforge_app_meta::TypedPatch,
+    proposed: &storyforge_app_meta::TypedPatch,
+) -> bool {
+    existing.status == storyforge_app_meta::TypedPatchStatus::Pending
+        && existing.source_issue_category == proposed.source_issue_category
+        && existing.affected_id == proposed.affected_id
+        && canonical_typed_patch_actions_json(&existing.actions)
+            == canonical_typed_patch_actions_json(&proposed.actions)
+}
+
+fn canonical_typed_patch_actions_json(
+    actions: &[storyforge_app_meta::TypedPatchAction],
+) -> Option<serde_json::Value> {
+    use storyforge_app_meta::TypedPatchAction;
+
+    let mut canonical = actions.to_vec();
+    for action in &mut canonical {
+        match action {
+            TypedPatchAction::SyncInstanceVariables {
+                add_keys,
+                remove_keys,
+                ..
+            } => {
+                add_keys.sort();
+                remove_keys.sort();
+            }
+            TypedPatchAction::PruneOrphanTaskReferences {
+                orphan_character_ids,
+                ..
+            } => orphan_character_ids.sort_by(|a, b| a.as_str().cmp(b.as_str())),
+            _ => {}
+        }
+    }
+    serde_json::to_value(canonical).ok()
 }
 
 /// 列出所有 Pending 状态的类型化 patch
@@ -5276,6 +5329,10 @@ fn meta_accept_typed_patch_in_store(
     campaign_id: &str,
     state: &AppState,
 ) -> Result<(), TauriCommandError> {
+    let _accept_guard = state
+        .typed_patch_accept_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let cid = Id::from_str(campaign_id);
     // 1. 找到 patch，必须 Pending
     let patch = {
@@ -5327,6 +5384,18 @@ fn meta_accept_typed_patch_in_store(
         return Err("patch 已过期，target 不存在".into());
     }
 
+    if let Err(e) = validate_typed_patch_targets(
+        &patch,
+        &campaign,
+        &definitions,
+        &instances,
+        &knowledge,
+        &tasks,
+    ) {
+        mark_typed_patch_stale(state, patch_id);
+        return Err(e);
+    }
+
     // 4. 纯函数预演（clone 可变快照）
     {
         // A 的 PreviewInputMut 字段为 &mut Vec<...>，需 clone 到本地变量再借。
@@ -5371,6 +5440,145 @@ fn meta_accept_typed_patch_in_store(
     }
 
     Ok(())
+}
+
+fn mark_typed_patch_stale(state: &AppState, patch_id: &str) {
+    let mut typed = state
+        .typed_patches
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(p) = typed.iter_mut().find(|p| p.id == patch_id) {
+        p.status = storyforge_app_meta::TypedPatchStatus::Stale;
+    }
+}
+
+fn validate_typed_patch_targets(
+    patch: &storyforge_app_meta::TypedPatch,
+    campaign: &storyforge_domain::campaign::Campaign,
+    definitions: &[storyforge_domain::character::CharacterDefinition],
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    knowledge: &[storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
+    tasks: &[storyforge_domain::story_task::StoryTask],
+) -> Result<(), TauriCommandError> {
+    use storyforge_app_meta::TypedPatchAction;
+
+    for action in &patch.actions {
+        match action {
+            TypedPatchAction::SyncInstanceVariables {
+                instance_id,
+                definition_id,
+                add_keys,
+                ..
+            } => {
+                let instance = find_instance(instances, instance_id)?;
+                if instance.definition_id.as_ref() != Some(definition_id) {
+                    return Err(TauriCommandError::validation(format!(
+                        "Instance {} 已不再使用 definition {}",
+                        instance_id.as_str(),
+                        definition_id.as_str()
+                    )));
+                }
+                let definition = definitions
+                    .iter()
+                    .find(|d| &d.id == definition_id)
+                    .ok_or_else(|| {
+                        TauriCommandError::not_found(format!(
+                            "Definition 不存在: {}",
+                            definition_id.as_str()
+                        ))
+                    })?;
+                for key in add_keys {
+                    if !definition
+                        .variable_schema
+                        .iter()
+                        .any(|field| field.key == *key)
+                    {
+                        return Err(TauriCommandError::validation(format!(
+                            "Definition {} 缺少变量 schema: {}",
+                            definition_id.as_str(),
+                            key
+                        )));
+                    }
+                }
+            }
+            TypedPatchAction::PruneOrphanTaskReferences { task_id, .. }
+            | TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
+                ensure_task_exists(tasks, task_id)?;
+            }
+            TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+                if !knowledge.iter().any(|entry| &entry.id == knowledge_id) {
+                    return Err(TauriCommandError::not_found(format!(
+                        "Knowledge 不存在: {}",
+                        knowledge_id.as_str()
+                    )));
+                }
+            }
+            TypedPatchAction::RepointInstanceDefinition {
+                instance_id,
+                new_definition_id,
+            } => {
+                ensure_instance_exists(instances, instance_id)?;
+                if let Some(definition_id) = new_definition_id {
+                    ensure_definition_exists(definitions, definition_id)?;
+                }
+            }
+            TypedPatchAction::UpdateCampaignVariable { .. } => {
+                if campaign.id.as_str().is_empty() {
+                    return Err(TauriCommandError::not_found("Campaign 不存在"));
+                }
+            }
+            TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
+                ensure_instance_exists(instances, instance_id)?;
+            }
+            TypedPatchAction::AddKnowledge { character_id, .. } => {
+                ensure_instance_exists(instances, character_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_instance_exists(
+    instances: &[storyforge_domain::campaign::CharacterInstance],
+    instance_id: &Id,
+) -> Result<(), TauriCommandError> {
+    find_instance(instances, instance_id).map(|_| ())
+}
+
+fn find_instance<'a>(
+    instances: &'a [storyforge_domain::campaign::CharacterInstance],
+    instance_id: &Id,
+) -> Result<&'a storyforge_domain::campaign::CharacterInstance, TauriCommandError> {
+    instances
+        .iter()
+        .find(|instance| &instance.id == instance_id)
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("Instance 不存在: {}", instance_id.as_str()))
+        })
+}
+
+fn ensure_definition_exists(
+    definitions: &[storyforge_domain::character::CharacterDefinition],
+    definition_id: &Id,
+) -> Result<(), TauriCommandError> {
+    definitions
+        .iter()
+        .any(|definition| &definition.id == definition_id)
+        .then_some(())
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("Definition 不存在: {}", definition_id.as_str()))
+        })
+}
+
+fn ensure_task_exists(
+    tasks: &[storyforge_domain::story_task::StoryTask],
+    task_id: &Id,
+) -> Result<(), TauriCommandError> {
+    tasks
+        .iter()
+        .any(|task| &task.id == task_id)
+        .then_some(())
+        .ok_or_else(|| TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str())))
 }
 
 /// 执行单个 TypedPatchAction 到 CampaignStore（写盘辅助）
@@ -12739,20 +12947,36 @@ mod tests {
             !proposals.is_empty(),
             "command helper should return patches"
         );
+        {
+            let typed = state
+                .typed_patches
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                typed.iter().any(|p| {
+                    p.actions.iter().any(|a| {
+                        matches!(
+                            a,
+                            storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. }
+                        )
+                    })
+                }),
+                "command helper should persist a delete orphan knowledge patch"
+            );
+            assert_eq!(typed.len(), proposals.len());
+        }
+
+        let repeated =
+            meta_propose_campaign_repairs_in_store(&store, campaign.id.as_str(), &state).unwrap();
         let typed = state
             .typed_patches
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        assert!(
-            typed.iter().any(|p| {
-                p.actions.iter().any(|a| {
-                    matches!(
-                        a,
-                        storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. }
-                    )
-                })
-            }),
-            "command helper should persist a delete orphan knowledge patch"
+        assert_eq!(repeated.len(), proposals.len());
+        assert_eq!(
+            typed.len(),
+            proposals.len(),
+            "repeated repair proposal should return existing pending patches without duplicating them"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -12988,6 +13212,283 @@ mod tests {
         assert_eq!(patch.status, storyforge_app_meta::TypedPatchStatus::Stale);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_meta_accept_typed_patch_preflights_all_actions_before_writing() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir =
+            std::env::temp_dir().join(format!("sf_test_accept_preflight_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card = {
+            let mut c = storyforge_domain::character::CharacterCard {
+                id: Id::from_str("card-1"),
+                name: "测试卡".into(),
+                source_character_id: Id::from_str("src-1"),
+                character_definitions: vec![],
+                raw_card_json: serde_json::Value::Null,
+                extraction_status:
+                    storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
+            };
+            let def = CharacterDefinition {
+                id: Id::from_str("def-1"),
+                card_id: c.id.clone(),
+                name: "Lin".into(),
+                persona_prompt: "surgeon".into(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Protagonist,
+                variable_schema: default_character_variables(),
+            };
+            c.character_definitions.push(def);
+            c
+        };
+        store.save_card(card).unwrap();
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
+        store.save_campaign(campaign.clone()).unwrap();
+        let mut instance = CharacterInstance::from_definition(
+            campaign.id.clone(),
+            &store
+                .get_card(&Id::from_str("card-1"))
+                .unwrap()
+                .card
+                .character_definitions[0],
+        );
+        instance.id = Id::from_str("target-inst");
+        store.add_instance(instance).unwrap();
+
+        let state = AppState::new_for_test();
+        let patch = storyforge_app_meta::TypedPatch {
+            id: "test-preflight-patch".into(),
+            description: "先校验所有 action 再写盘".into(),
+            source_issue_category: "preflight".into(),
+            affected_id: Some(campaign.id.as_str().to_string()),
+            actions: vec![
+                storyforge_app_meta::TypedPatchAction::UpdateCampaignVariable {
+                    key: "preflight_marker".into(),
+                    value: serde_json::json!("should-not-write"),
+                },
+                storyforge_app_meta::TypedPatchAction::RepointInstanceDefinition {
+                    instance_id: Id::from_str("target-inst"),
+                    new_definition_id: Some(Id::from_str("missing-definition")),
+                },
+            ],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: storyforge_app_meta::TypedPatchStatus::Pending,
+        };
+        {
+            let mut typed = state
+                .typed_patches
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            typed.push(patch);
+        }
+
+        let err = meta_accept_typed_patch_in_store(
+            &store,
+            "test-preflight-patch",
+            campaign.id.as_str(),
+            &state,
+        )
+        .expect_err("invalid later action should fail before any write");
+        assert!(
+            err.to_string().contains("Definition 不存在"),
+            "unexpected error: {:?}",
+            err
+        );
+
+        let campaign_after = store.get_campaign(&campaign.id).unwrap();
+        assert_eq!(campaign_after.get_variable("preflight_marker"), None);
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            typed
+                .iter()
+                .find(|p| p.id == "test-preflight-patch")
+                .unwrap()
+                .status,
+            storyforge_app_meta::TypedPatchStatus::Stale
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_meta_accept_typed_patch_rejects_stale_definition_binding() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::variables::{VariableField, VariableType, VariableValue};
+
+        let dir =
+            std::env::temp_dir().join(format!("sf_test_accept_def_stale_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card = {
+            let mut c = storyforge_domain::character::CharacterCard {
+                id: Id::from_str("card-1"),
+                name: "测试卡".into(),
+                source_character_id: Id::from_str("src-1"),
+                character_definitions: vec![],
+                raw_card_json: serde_json::Value::Null,
+                extraction_status:
+                    storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
+            };
+            c.character_definitions.push(CharacterDefinition {
+                id: Id::from_str("def-1"),
+                card_id: c.id.clone(),
+                name: "Old".into(),
+                persona_prompt: String::new(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Protagonist,
+                variable_schema: vec![VariableField {
+                    key: "old_hp".into(),
+                    label: "Old HP".into(),
+                    value_type: VariableType::Int,
+                    default: serde_json::json!(10),
+                    description: None,
+                    group: None,
+                }],
+            });
+            c.character_definitions.push(CharacterDefinition {
+                id: Id::from_str("def-2"),
+                card_id: c.id.clone(),
+                name: "New".into(),
+                persona_prompt: String::new(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: None,
+                role_type: RoleType::Supporting,
+                variable_schema: vec![VariableField {
+                    key: "new_hp".into(),
+                    label: "New HP".into(),
+                    value_type: VariableType::Int,
+                    default: serde_json::json!(20),
+                    description: None,
+                    group: None,
+                }],
+            });
+            c
+        };
+        store.save_card(card).unwrap();
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-run");
+        store.save_campaign(campaign.clone()).unwrap();
+        let definitions = store
+            .get_card(&campaign.card_id)
+            .unwrap()
+            .card
+            .character_definitions;
+        let mut instance = CharacterInstance::from_definition(campaign.id.clone(), &definitions[1]);
+        instance.id = Id::from_str("target-inst");
+        instance.definition_id = Some(Id::from_str("def-2"));
+        instance.variables = vec![VariableValue::new("new_hp", serde_json::json!(20), 0)];
+        store.add_instance(instance).unwrap();
+
+        let state = AppState::new_for_test();
+        let patch = storyforge_app_meta::TypedPatch {
+            id: "test-stale-definition-patch".into(),
+            description: "旧定义变量同步".into(),
+            source_issue_category: "variable_schema_mismatch".into(),
+            affected_id: Some("target-inst".into()),
+            actions: vec![
+                storyforge_app_meta::TypedPatchAction::SyncInstanceVariables {
+                    instance_id: Id::from_str("target-inst"),
+                    definition_id: Id::from_str("def-1"),
+                    add_keys: vec!["old_hp".into()],
+                    remove_keys: vec!["new_hp".into()],
+                },
+            ],
+            diff: vec![],
+            created_at: chrono::Utc::now(),
+            status: storyforge_app_meta::TypedPatchStatus::Pending,
+        };
+        {
+            let mut typed = state
+                .typed_patches
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            typed.push(patch);
+        }
+
+        let err = meta_accept_typed_patch_in_store(
+            &store,
+            "test-stale-definition-patch",
+            campaign.id.as_str(),
+            &state,
+        )
+        .expect_err("definition mismatch should stale the patch before writing");
+        assert!(
+            err.to_string().contains("已不再使用 definition"),
+            "unexpected error: {:?}",
+            err
+        );
+
+        let updated = store
+            .get_instance(&campaign.id, &Id::from_str("target-inst"))
+            .unwrap();
+        assert!(updated.get_variable("new_hp").is_some());
+        assert!(updated.get_variable("old_hp").is_none());
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            typed
+                .iter()
+                .find(|p| p.id == "test-stale-definition-patch")
+                .unwrap()
+                .status,
+            storyforge_app_meta::TypedPatchStatus::Stale
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_typed_patch_pending_dedupe_canonicalizes_unordered_actions() {
+        let make_patch = |add_keys: Vec<&str>, remove_keys: Vec<&str>, orphan_ids: Vec<&str>| {
+            storyforge_app_meta::TypedPatch {
+                id: uuid::Uuid::new_v4().to_string(),
+                description: "dedupe".into(),
+                source_issue_category: "variable_schema_mismatch".into(),
+                affected_id: Some("target-inst".into()),
+                actions: vec![
+                    storyforge_app_meta::TypedPatchAction::SyncInstanceVariables {
+                        instance_id: Id::from_str("target-inst"),
+                        definition_id: Id::from_str("def-1"),
+                        add_keys: add_keys.into_iter().map(str::to_string).collect(),
+                        remove_keys: remove_keys.into_iter().map(str::to_string).collect(),
+                    },
+                    storyforge_app_meta::TypedPatchAction::PruneOrphanTaskReferences {
+                        task_id: Id::from_str("task-1"),
+                        orphan_character_ids: orphan_ids.into_iter().map(Id::from_str).collect(),
+                    },
+                ],
+                diff: vec![],
+                created_at: chrono::Utc::now(),
+                status: storyforge_app_meta::TypedPatchStatus::Pending,
+            }
+        };
+
+        let existing = make_patch(vec!["mana", "hp"], vec!["legacy"], vec!["b", "a"]);
+        let proposed = make_patch(vec!["hp", "mana"], vec!["legacy"], vec!["a", "b"]);
+
+        assert!(is_same_pending_typed_patch(&existing, &proposed));
     }
 
     /// dismiss 后 status = Dismissed
