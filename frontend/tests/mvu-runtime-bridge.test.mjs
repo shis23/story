@@ -1,6 +1,87 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import vm from 'node:vm'
 import { getTrustedMvuRuntimeMessage } from '../src/mvu-runtime-bridge.js'
+
+function extractRuntimeShimScript() {
+  const source = fs.readFileSync(new URL('../src/components/MvuJsRuntime.vue', import.meta.url), 'utf8')
+  const match = source.match(/const SHIM_SCRIPT = `([\s\S]*?)`;/)
+  assert.ok(match, 'MvuJsRuntime.vue should define SHIM_SCRIPT')
+  return match[1]
+}
+
+function createElement() {
+  return {
+    style: {},
+    children: [],
+    innerHTML: '',
+    textContent: '',
+    appendChild(child) {
+      this.children.push(child)
+      return child
+    },
+    querySelector() {
+      return null
+    },
+    querySelectorAll() {
+      return []
+    },
+    setAttribute(name, value) {
+      this[name] = value
+    },
+    getAttribute(name) {
+      return this[name] ?? ''
+    },
+  }
+}
+
+function createShimSandbox() {
+  const listeners = {}
+  const postedMessages = []
+  const document = {
+    body: { appendChild() {} },
+    head: { appendChild() {} },
+    createElement,
+    querySelector() {
+      return null
+    },
+    querySelectorAll() {
+      return []
+    },
+  }
+  const window = {
+    addEventListener(name, callback) {
+      listeners[name] = callback
+    },
+    setTimeout,
+    setInterval,
+    console,
+  }
+  const parent = {
+    postMessage(message, targetOrigin) {
+      postedMessages.push({ message, targetOrigin })
+    },
+  }
+  const sandbox = {
+    parent,
+    document,
+    console,
+    getComputedStyle: () => ({}),
+    setTimeout,
+    setInterval,
+    clearTimeout,
+    clearInterval,
+  }
+  Object.assign(sandbox, window)
+  sandbox.window = sandbox
+  vm.runInNewContext(extractRuntimeShimScript(), sandbox)
+  return { listeners, postedMessages, window: sandbox }
+}
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value))
+}
 
 test('accepts MVU runtime messages only from the owned iframe window', () => {
   const runtimeWindow = { postMessage() {} }
@@ -26,4 +107,104 @@ test('rejects MVU runtime messages before the iframe window is available', () =>
     getTrustedMvuRuntimeMessage({ source: {}, data: { type: 'mvu:ready' } }, null),
     null,
   )
+})
+
+test('MVU iframe shim captures direct variables assignments and _.set updates', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+  assert.equal(postedMessages.at(-1).message.type, 'mvu:ready')
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-variables',
+      variables: { hp: 80, mood: 'calm' },
+      fragment_js: [
+        'variables.hp = variables.hp - 39;',
+        'variables.mvu_probe = variables.hp;',
+        '_.set("mana", 7);',
+        'triggerSlashTag("probe");',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.equal(result.request_id, 'req-variables')
+  assert.deepEqual(plain(result.variable_updates), { hp: 41, mvu_probe: 41, mana: 7 })
+  assert.deepEqual(plain(result.side_effects), ['probe'])
+})
+
+test('MVU iframe shim reports final variable state when _.set and assignments touch the same key', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-final-state',
+      variables: { hp: 80, unchanged: 5 },
+      fragment_js: [
+        '_.set("hp", 41);',
+        'variables.hp = 42;',
+        '_.set("mana", 7);',
+        'variables.mana = 8;',
+        '_.set("unchanged", 1);',
+        'variables.unchanged = 5;',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.equal(result.request_id, 'req-final-state')
+  assert.deepEqual(plain(result.variable_updates), { hp: 42, mana: 8 })
+})
+
+test('MVU iframe shim does not expose runtime private bindings to user fragments', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-private-scope',
+      variables: {},
+      fragment_js: [
+        'variables.resType = typeof RES;',
+        'variables.rawTimerType = typeof _setTimeout;',
+        'variables.timerListType = typeof TM;',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.deepEqual(plain(result.variable_updates), {
+    resType: 'undefined',
+    rawTimerType: 'undefined',
+    timerListType: 'undefined',
+  })
+})
+
+test('MVU iframe shim keeps legacy non-strict script semantics without exposing private bindings', () => {
+  const { listeners, postedMessages, window } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-legacy-scope',
+      variables: {},
+      fragment_js: [
+        'legacyGlobalProbe = 12;',
+        'variables.topThisIsWindow = this === window;',
+        'variables.privateStillHidden = typeof RES;',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.equal(window.legacyGlobalProbe, 12)
+  assert.deepEqual(plain(result.variable_updates), {
+    topThisIsWindow: true,
+    privateStillHidden: 'undefined',
+  })
 })

@@ -150,6 +150,55 @@ window.fetch = function() { return Promise.reject(new Error('MVU: fetch disabled
 window.XMLHttpRequest = function() { throw new Error('MVU: XHR disabled'); };
 window.WebSocket = function() { throw new Error('MVU: WebSocket disabled'); };
 
+function runUserScript(source, vars, includeOnSlashTag) {
+  var body = [
+    'var variables = vars;',
+    'var __st_vars = vars;',
+    'var _ = api._;',
+    'var $ = api.$;',
+    'var triggerSlashTag = api.triggerSlashTag;',
+    'var triggerSlash = api.triggerSlash;',
+    'var getChatVariable = api.getChatVariable;',
+    'var setChatVariable = api.setChatVariable;',
+    includeOnSlashTag ? 'var onSlashTag = function(t){ triggerSlashTag(t); };' : '',
+    String(source || '')
+  ].join(String.fromCharCode(10));
+  var fn = new Function('vars', 'api', body);
+  return fn(vars, {
+    _: window._,
+    $: window.$,
+    triggerSlashTag: window.triggerSlashTag,
+    triggerSlash: window.triggerSlash,
+    getChatVariable: window.getChatVariable,
+    setChatVariable: window.setChatVariable
+  });
+}
+
+function snapshotVariables() {
+  var snap = {};
+  for (var k in V) {
+    try { snap[k] = JSON.stringify(V[k]); }
+    catch { snap[k] = String(V[k]); }
+  }
+  return snap;
+}
+
+function collectVariableUpdates(before) {
+  var merged = {};
+  for (var mk in V) {
+    var afterValue;
+    try { afterValue = JSON.stringify(V[mk]); }
+    catch { afterValue = String(V[mk]); }
+    if (before[mk] !== afterValue) merged[mk] = V[mk];
+  }
+  RES.forEach(function(r) {
+    if (!(r.key in merged) && before[r.key] === undefined) {
+      merged[r.key] = V[r.key];
+    }
+  });
+  return merged;
+}
+
 // === 消息通道 ===
 window.addEventListener('message', function(e) {
   var d = e.data;
@@ -165,8 +214,7 @@ window.addEventListener('message', function(e) {
       if (d.css) { var s = document.createElement('style'); s.textContent = d.css; document.head.appendChild(s); }
       C.innerHTML = d.html || '';
       if (d.js) {
-        var wrapped = '(function(vars) { var __st_vars = vars; var onSlashTag = function(t){triggerSlashTag(t); }; ' + d.js + ' })';
-        (0, eval)('(' + wrapped + ')(V)');
+        runUserScript(d.js, V, true);
       }
       parent.postMessage({ type: 'mvu:assets_loaded' }, '*');
     } catch(err) {
@@ -186,19 +234,16 @@ window.addEventListener('message', function(e) {
     var vars = d.variables || {};
     for (var vk in vars) V[vk] = vars[vk];
     RES = []; TAGS = [];
+    var before = snapshotVariables();
 
     try {
-      // 用 eval 在当前作用域执行，V/RES/TAGS/C/$ 等都可用
-      var execCode = '(function(vars) { var __st_vars = vars; ' + d.fragment_js + ' })';
-      (0, eval)('(' + execCode + ')(V)');
+      runUserScript(d.fragment_js, V, false);
     } catch (execErr) {
       console.error('[MVU] execute error:', execErr);
     }
     clearTimers();
 
-    // 合并 _.set 收集
-    var merged = {};
-    RES.forEach(function(r) { merged[r.key] = r.value; });
+    var merged = collectVariableUpdates(before);
     parent.postMessage({
       type: 'mvu:execute_result',
       request_id: rid,
