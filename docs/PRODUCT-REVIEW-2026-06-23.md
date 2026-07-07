@@ -205,7 +205,7 @@ Layer 1: Meta Agent 复刻
 | H-012 | infra-plugin-host 依赖 tauri | ✅ 已修复 | ✅ 已修复 | 2026-07-06 已拆 adapter |
 | H-002 | API key 明文存储 | ✅ 已修复 | 🟡 需 Android 实机验证 | 2026-07-06 已接系统凭据库 + SecretRef；Windows Credential Manager 冒烟测试通过 |
 | H-013 | CampaignStore 集合级锁 + 同步 JSON I/O | 🟡 部分完成 | 🟡 中 | S4（单 Mutex 已拆；写作/重 roll 快照读取、临时 instance 落盘、postprocess 写回已 `spawn_blocking`；剩余同步写入压测/后台 flush 待做） |
-| H-014 | 同步 fs 阻塞 tokio | 🟡 部分完成 | 🟡 中 | 2026-07-07 已把 `start_writing` / `regenerate` 的 Campaign 快照读取移入 `fill_campaign_context_async` + `spawn_blocking`，把 `start_writing` 对话准备/legacy 开场白/user intent 写入移入 `prepare_start_conversation_async`，把成功写作/重 roll 后的临时 instance 落盘移入 `persist_temporary_instances_async`，把 postprocess summary/knowledge/variable/task 写回移入 `persist_postprocess_outcome_async`，把对话变体采纳写盘移入 `accept_variant_async`，把嵌入配置写盘移入 `configure_embedder_async`，把归档消息读取移入 `archivable_messages_async`，并把连接 active-state 写盘、MVU 翻译保存、角色识别卡保存、inspect_generation 溯源读取移入 blocking pool；其他 store 同步 I/O 仍待分批 |
+| H-014 | 同步 fs 阻塞 tokio | 🟡 部分完成 | 🟡 中 | 2026-07-07 已把 `start_writing` / `regenerate` 的 Campaign 快照读取移入 `fill_campaign_context_async` + `spawn_blocking`，把 `start_writing` 对话准备/legacy 开场白/user intent 写入移入 `prepare_start_conversation_async`，把成功写作/重 roll 后的临时 instance 落盘移入 `persist_temporary_instances_async`，把 postprocess summary/knowledge/variable/task 写回移入 `persist_postprocess_outcome_async`，把对话变体采纳写盘移入 `accept_variant_async`，把嵌入配置写盘移入 `configure_embedder_async`，把归档消息读取移入 `archivable_messages_async`，并把连接 active-state 写盘、MVU 翻译保存、角色识别卡保存、inspect_generation 溯源读取、meta_classify_st_preset 预设读取移入 blocking pool；其他 store 同步 I/O 仍待分批 |
 | M-012 | lastConversationNode 未传入 | ✅ 2026-07-07 已修：`App.vue` 只把最后一条带 provenance 的 assistant 节点传给 `MetaPanel`，`meta_explain_generation` 入口可见且有前端测试覆盖 | 否 | 已完成 |
 | M-024 | patch 事务回滚 | ✅ 2026-07-07 已修：旧 Meta `execute_patch` 使用工作副本执行，失败不写回，成功一次性提交，并有 rollback/commit 测试覆盖 | 否 | 已完成 |
 | M-022 | unwrap_or(Null) 12 处 | ✅ 2026-07-07 已修：用户可见 JSON 序列化失败改为结构化错误，固定内部结构不再静默回退为 null/default | 否 | 已完成 |
@@ -274,7 +274,7 @@ Phase 7 ⬜ 收口         →   S3 验收矩阵前置 + S6 发布收口
 #### S4：Android 前置债务（5-7 天）
 - H-002 API key → keyring
 - H-013 CampaignStore 写入性能压测；集合级锁、写作快照读取 offload、临时 instance 落盘 offload、postprocess 写回 offload 已完成，必要时继续做后台 flush / 写入异步化
-- H-014 同步 fs → `spawn_blocking`（写作/重 roll Campaign 快照读取、start_writing 对话准备、临时 instance 落盘、postprocess 写回、accept variant 写盘、configure embedder 写盘、归档消息读取、连接 active-state 写盘、MVU 翻译保存、角色识别卡保存、inspect_generation 溯源读取已完成，其他 store 分批推进）
+- H-014 同步 fs → `spawn_blocking`（写作/重 roll Campaign 快照读取、start_writing 对话准备、临时 instance 落盘、postprocess 写回、accept variant 写盘、configure embedder 写盘、归档消息读取、连接 active-state 写盘、MVU 翻译保存、角色识别卡保存、inspect_generation 溯源读取、meta_classify_st_preset 预设读取已完成，其他 store 分批推进）
 - **完成定义**：4 项技术债关闭，test 全绿
 
 #### S5：Android 主体（10-15 天）

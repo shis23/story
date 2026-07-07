@@ -5613,9 +5613,7 @@ async fn meta_classify_st_preset(
 ) -> Result<serde_json::Value, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
-    let stored = get_preset_store()
-        .get(&preset_id)
-        .ok_or_else(|| TauriCommandError::not_found(format!("预设不存在: {preset_id}")))?;
+    let stored = load_preset_for_classification_async(get_preset_store(), preset_id).await?;
 
     let llm = state.active_llm_or_mock();
     let tool_ctx = state.snapshot_tool_ctx();
@@ -5629,6 +5627,24 @@ async fn meta_classify_st_preset(
 
     serde_json::to_value(&classification)
         .map_err(|e| TauriCommandError::internal(format!("序列化失败: {e}")))
+}
+
+async fn load_preset_for_classification_async(
+    store: &'static PresetStore,
+    preset_id: String,
+) -> Result<preset_store::StoredPreset, TauriCommandError> {
+    tokio::task::spawn_blocking(move || load_preset_for_classification(store, preset_id))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("读取预设任务失败: {e}")))?
+}
+
+fn load_preset_for_classification(
+    store: &PresetStore,
+    preset_id: String,
+) -> Result<preset_store::StoredPreset, TauriCommandError> {
+    store
+        .get(&preset_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("预设不存在: {preset_id}")))
 }
 
 // ─── P1：角色识别 / CharacterCard / Campaign / 角色实例 / 变量 ──────────────
@@ -9135,6 +9151,55 @@ mod tests {
             .map(|script| script.id.as_str())
             .collect();
         assert_eq!(ids, vec!["same-scoped", "new-scoped"]);
+    }
+
+    #[tokio::test]
+    async fn test_load_preset_for_classification_async_returns_preset() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_preset_classify_async_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: &'static PresetStore = Box::leak(Box::new(PresetStore::new(&dir)));
+        let preset_id = store
+            .save(storyforge_domain::preset::Preset {
+                name: "classify preset".into(),
+                prompts: vec![],
+                regex_scripts: vec![test_regex_script(
+                    "classify-regex",
+                    RegexScriptSource::Preset,
+                )],
+                source: storyforge_domain::Source::ImportedFromST,
+            })
+            .unwrap();
+
+        let stored = load_preset_for_classification_async(store, preset_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(stored.id, preset_id);
+        assert_eq!(stored.preset.name, "classify preset");
+        assert_eq!(stored.preset.regex_scripts[0].id, "classify-regex");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_load_preset_for_classification_async_missing_returns_not_found() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_preset_classify_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: &'static PresetStore = Box::leak(Box::new(PresetStore::new(&dir)));
+
+        let err = load_preset_for_classification_async(store, "missing-preset".into())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TauriCommandError::NotFound { .. }));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
