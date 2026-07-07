@@ -12,6 +12,12 @@ import {
   metaExplainGeneration,
 } from '../tauri-api.js'
 import { formatDiffValue, routingText } from '../utils/campaignDisplay.js'
+import {
+  hasMetaToolResult,
+  worldInfoReportFromToolResult,
+  cardReportFromToolResult,
+  patchProposalFromToolResult,
+} from '../utils/metaToolResults.js'
 
 const props = defineProps({
   activeCampaign: { type: Object, default: null },
@@ -320,7 +326,19 @@ async function handleExplainGeneration() {
 
 // 工具：判断消息是否有结构化工具结果
 function hasToolResult(msg) {
-  return msg.tool_result && msg.tool_result.kind && msg.tool_result.kind !== 'none'
+  return hasMetaToolResult(msg)
+}
+
+function worldInfoToolResult(msg) {
+  return worldInfoReportFromToolResult(msg?.tool_result)
+}
+
+function cardToolResult(msg) {
+  return cardReportFromToolResult(msg?.tool_result)
+}
+
+function patchProposalToolResult(msg) {
+  return patchProposalFromToolResult(msg?.tool_result)
 }
 
 // 工具：patch actions 摘要
@@ -400,30 +418,30 @@ function patchActionSummary(patch) {
                 <!-- 内嵌工具结果（诊断报告 / MVU 摘要） -->
                 <template v-if="hasToolResult(msg)">
                   <!-- 世界书诊断报告 -->
-                  <div v-if="msg.tool_result.WorldInfoReport" class="mt-2 pt-2 border-t border-line/50 text-xs space-y-1">
+                  <div v-if="worldInfoToolResult(msg)" class="mt-2 pt-2 border-t border-line/50 text-xs space-y-1">
                     <div class="font-medium text-ink">📊 世界书诊断</div>
                     <div class="text-ink-soft">
-                      共 {{ msg.tool_result.WorldInfoReport.total_entries }} 条 / 蓝灯 {{ msg.tool_result.WorldInfoReport.constant_count }} / 绿灯 {{ msg.tool_result.WorldInfoReport.selective_count }}
+                      共 {{ worldInfoToolResult(msg).total_entries }} 条 / 蓝灯 {{ worldInfoToolResult(msg).constant_count }} / 绿灯 {{ worldInfoToolResult(msg).selective_count }}
                     </div>
-                    <div v-if="msg.tool_result.WorldInfoReport.conflicts.length > 0" class="text-warn">
-                      ⚠ {{ msg.tool_result.WorldInfoReport.conflicts.length }} 处冲突
+                    <div v-if="worldInfoToolResult(msg).conflicts.length > 0" class="text-warn">
+                      ⚠ {{ worldInfoToolResult(msg).conflicts.length }} 处冲突
                     </div>
                   </div>
 
                   <!-- 角色卡诊断报告 -->
-                  <div v-else-if="msg.tool_result.CardReport" class="mt-2 pt-2 border-t border-line/50 text-xs space-y-1">
-                    <div class="font-medium text-ink">📋 角色卡「{{ msg.tool_result.CardReport.name }}」</div>
-                    <div v-if="msg.tool_result.CardReport.issues.length > 0" class="text-warn">
-                      ⚠ {{ msg.tool_result.CardReport.issues.length }} 个问题
+                  <div v-else-if="cardToolResult(msg)" class="mt-2 pt-2 border-t border-line/50 text-xs space-y-1">
+                    <div class="font-medium text-ink">📋 角色卡「{{ cardToolResult(msg).name }}」</div>
+                    <div v-if="cardToolResult(msg).issues.length > 0" class="text-warn">
+                      ⚠ {{ cardToolResult(msg).issues.length }} 个问题
                     </div>
                     <div v-else class="text-ok">✓ 未发现问题</div>
                   </div>
 
                   <!-- Patch 提议卡片 -->
-                  <div v-else-if="msg.tool_result.PatchProposed" class="mt-2 pt-2 border-t border-line/50 text-xs">
+                  <div v-else-if="patchProposalToolResult(msg)" class="mt-2 pt-2 border-t border-line/50 text-xs">
                     <div class="font-medium text-accent">📝 提议 Patch（待采纳）</div>
-                    <div class="text-ink-soft mt-0.5">{{ msg.tool_result.PatchProposed.description }}</div>
-                    <div class="text-ink-soft">{{ msg.tool_result.PatchProposed.action_count }} 个操作</div>
+                    <div class="text-ink-soft mt-0.5">{{ patchProposalToolResult(msg).description }}</div>
+                    <div class="text-ink-soft">{{ patchProposalToolResult(msg).action_count }} 个操作</div>
                   </div>
                 </template>
               </div>
