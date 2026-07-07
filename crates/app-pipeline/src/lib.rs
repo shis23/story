@@ -3121,6 +3121,86 @@ mod tests {
         (orch, conv_store)
     }
 
+    struct FakeMvuRuntime {
+        calls:
+            std::sync::Mutex<Vec<(String, std::collections::HashMap<String, serde_json::Value>)>>,
+        variable_updates: std::collections::HashMap<String, serde_json::Value>,
+    }
+
+    impl FakeMvuRuntime {
+        fn new(variable_updates: std::collections::HashMap<String, serde_json::Value>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                variable_updates,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, std::collections::HashMap<String, serde_json::Value>)> {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MvuRuntime for FakeMvuRuntime {
+        async fn execute_fragment(
+            &self,
+            fragment_js: &str,
+            current_variables: &std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<
+            storyforge_infra_plugin_host::mvu_runtime::MvuExecResult,
+            storyforge_infra_plugin_host::mvu_runtime::MvuRuntimeError,
+        > {
+            self.calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((fragment_js.to_string(), current_variables.clone()));
+            Ok(storyforge_infra_plugin_host::mvu_runtime::MvuExecResult {
+                variable_updates: self.variable_updates.clone(),
+                side_effects: vec!["fake-side-effect".into()],
+            })
+        }
+
+        async fn load_card_assets(
+            &self,
+            _html: Option<&str>,
+            _css: Option<&str>,
+            _js: Option<&str>,
+        ) -> Result<(), storyforge_infra_plugin_host::mvu_runtime::MvuRuntimeError> {
+            Ok(())
+        }
+
+        async fn unload_card(
+            &self,
+        ) -> Result<(), storyforge_infra_plugin_host::mvu_runtime::MvuRuntimeError> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn make_orchestrator_with_mvu_runtime(
+        mvu_runtime: Arc<dyn MvuRuntime + Send + Sync>,
+    ) -> (PipelineOrchestrator, Arc<ConversationStore>) {
+        let llm = Arc::new(MockLlmClient::with_defaults()) as Arc<dyn LlmClient>;
+        let conv_dir =
+            std::env::temp_dir().join(format!("sf_postproc_mvu_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let conv_store = Arc::new(ConversationStore::new(conv_dir));
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let orch = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, Some(mvu_runtime));
+        (orch, conv_store)
+    }
+
     /// 无 campaign（campaign_id=None）→ run_postprocess 返回 None（向后兼容，跳过后处理）
     #[tokio::test]
     async fn test_postprocess_skipped_without_campaign() {
@@ -3142,6 +3222,91 @@ mod tests {
             )
             .await;
         assert!(outcome.is_none(), "无 campaign 应跳过后处理");
+    }
+
+    #[tokio::test]
+    async fn test_postprocess_executes_mvu_fallback_fragments_into_variable_updates() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterDefinition, RoleType};
+        use storyforge_domain::variables::VariableValue;
+
+        let mut js_updates = std::collections::HashMap::new();
+        js_updates.insert("mvu_hp".into(), serde_json::json!(41));
+        let fake_runtime = Arc::new(FakeMvuRuntime::new(js_updates));
+        let (orch, conv_store) = make_orchestrator_with_mvu_runtime(
+            fake_runtime.clone() as Arc<dyn MvuRuntime + Send + Sync>
+        );
+
+        let card_id = Id::new();
+        let def = CharacterDefinition {
+            id: Id::new(),
+            card_id: card_id.clone(),
+            name: "Seraphina".into(),
+            persona_prompt: String::new(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        };
+        let mut inst = CharacterInstance::from_definition(Id::new(), &def);
+        inst.variables = vec![VariableValue::new("hp", serde_json::json!(80), 1)];
+
+        let campaign = Campaign::new(card_id, "MVU fallback test");
+        let campaign_id = campaign.id.clone();
+        let runtime = Arc::new(
+            storyforge_domain::campaign_runtime::CampaignRuntimeContext {
+                campaign,
+                instances: vec![inst],
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 1,
+            },
+        );
+        let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
+        ctx.campaign_id = Some(campaign_id);
+        ctx.campaign_runtime = Some(runtime);
+        ctx.turn = 1;
+
+        let fragments = vec![FallbackFragment {
+            description: "fake status math".into(),
+            js_snippet: "variables.mvu_hp = variables.hp - 39;".into(),
+            reason: "exercise runtime bridge".into(),
+        }];
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_tx, cancel) = watch::channel(false);
+
+        let outcome = orch
+            .run_postprocess(
+                "final text",
+                "scene",
+                &["Seraphina".into()],
+                &["hp".into()],
+                &ctx,
+                &event_tx,
+                cancel,
+                &fragments,
+            )
+            .await
+            .expect("campaign postprocess should run");
+
+        let calls = fake_runtime.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, fragments[0].js_snippet);
+        assert_eq!(calls[0].1.get("hp"), Some(&serde_json::json!(80)));
+
+        let pp = outcome
+            .post_process
+            .expect("MVU fallback updates should create postprocess output");
+        assert!(
+            pp.variable_updates
+                .iter()
+                .any(|update| update.instance_id.is_none()
+                    && update.key == "mvu_hp"
+                    && update.value == serde_json::json!(41)),
+            "MVU fallback variable update should be appended to postprocess outcome"
+        );
     }
 
     /// 有 campaign → run_postprocess 并行跑总结 + 后处理，返回 Some(outcome)，两件产出非空

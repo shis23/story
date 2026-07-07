@@ -8223,6 +8223,127 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local real ST card fixture; run scripts/run-real-card-smoke.ps1"]
+    fn test_real_complex_card_campaign_maps_stored_mvu_fallback_fragments() {
+        use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+        use storyforge_domain::character::{
+            CharacterCard, CharacterDefinition, CharacterExtractionStatus,
+        };
+        use storyforge_domain::mvu_translation::{FallbackFragment, MvuRouting, MvuTranslation};
+
+        let fixture_path = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("test-card.png")
+            });
+        let bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+        let character =
+            storyforge_infra_import::import_character(&bytes).expect("complex card should import");
+
+        let dir = TempDirGuard::new("storyforge_test_real_complex_mvu_fallback");
+        let store = campaign_store::CampaignStore::new(dir.path());
+        let conv_store = ConversationStore::new(dir.path().join("conversations"));
+
+        let mut card = CharacterCard::from_character(&character);
+        card.extraction_status = CharacterExtractionStatus::Extracted;
+        let mut definition = CharacterDefinition::fallback_from_character(&character, &[]);
+        definition.card_id = card.id.clone();
+        card.character_definitions = vec![definition];
+
+        let stored = save_character_card_to_store(&store, card).unwrap();
+        // This smoke covers the mapping layer: a stored MVU translation for the
+        // real card's source character must be discoverable through campaign
+        // instances created from that card. It does not claim to run MVU analysis.
+        store
+            .save_mvu(campaign_store::StoredMvuTranslation {
+                source_character_id: character.id.clone(),
+                character_name: character.name.clone(),
+                translation: MvuTranslation {
+                    variable_schema: vec![],
+                    ui_bindings: vec![],
+                    update_rules: vec![],
+                    interactions: vec![],
+                    fallback_fragments: vec![
+                        FallbackFragment {
+                            description: "complex card fallback probe".into(),
+                            js_snippet: "variables.__complex_card_probe = true;".into(),
+                            reason: "real-card smoke probe".into(),
+                        },
+                        FallbackFragment {
+                            description: "empty fallback fragments are ignored".into(),
+                            js_snippet: String::new(),
+                            reason: "filter coverage".into(),
+                        },
+                    ],
+                    routing: MvuRouting::Hybrid {
+                        webview_reason: "real-card smoke probe".into(),
+                    },
+                    analysis_confidence: 1.0,
+                    notes: vec![],
+                },
+                analyzed_at: "2026-07-07T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        let campaign = create_campaign_in_store(
+            &store,
+            &conv_store,
+            stored.card.id.as_str().to_string(),
+            "Complex Fixture MVU Fallback Campaign".into(),
+            None,
+        )
+        .unwrap();
+
+        let campaign_id = Id::from_str(&campaign.id);
+        let campaign = store
+            .get_campaign(&campaign_id)
+            .expect("campaign should exist");
+        let instances = store.list_instances(&campaign_id);
+        let present_instance_id = instances
+            .first()
+            .expect("campaign should create at least one instance")
+            .id
+            .as_str()
+            .to_string();
+        let ctx = WritingContext {
+            characters: vec![],
+            world_info: None,
+            conversation_id: campaign.conversation_id.clone().unwrap_or_else(Id::new),
+            campaign_id: Some(campaign_id.clone()),
+            turn: 1,
+            pending_tasks: vec![],
+            story_clock: String::new(),
+            profile: None,
+            modules: vec![],
+            regex_scripts: vec![],
+            campaign_runtime: Some(std::sync::Arc::new(CampaignRuntimeContext {
+                campaign,
+                instances,
+                definitions_by_id: std::collections::HashMap::new(),
+                knowledge: vec![],
+                tasks: vec![],
+                turn: 1,
+            })),
+            agent_profile_config: None,
+        };
+
+        let fragments =
+            collect_mvu_fallback_fragments(&ctx, &store, &[present_instance_id.clone()]);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(
+            fragments[0].js_snippet,
+            "variables.__complex_card_probe = true;"
+        );
+
+        let fragments_by_name = collect_mvu_fallback_fragments(&ctx, &store, &[character.name]);
+        assert_eq!(fragments_by_name.len(), 1);
+    }
+
+    #[test]
     fn export_campaign_bundle_includes_complete_campaign_state() {
         use storyforge_domain::agent::RoundSummary;
         use storyforge_domain::campaign::{Campaign, CharacterInstance};

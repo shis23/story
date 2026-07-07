@@ -35,6 +35,11 @@ try {
     if ($LASTEXITCODE -ne 0) {
       throw "tauri-app real-card campaign bundle smoke failed with exit code $LASTEXITCODE"
     }
+
+    & cargo test -p storyforge test_real_complex_card_campaign_maps_stored_mvu_fallback_fragments -- --ignored --nocapture
+    if ($LASTEXITCODE -ne 0) {
+      throw "tauri-app real-card stored MVU fallback mapping smoke failed with exit code $LASTEXITCODE"
+    }
   } finally {
     Pop-Location
   }
