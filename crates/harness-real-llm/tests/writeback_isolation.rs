@@ -429,57 +429,121 @@ fn b6_private_source_blocks_name_collision_relay_and_group_broadcast() {
     store.add_instance(dup_b).unwrap();
     store.add_instance(guard).unwrap();
 
+    let open_text = "巡逻路线是北门";
+    let private_text = "保险柜密码是 0427";
+    let open_entry = CharacterKnowledgeEntry::witnessed(
+        campaign.id.clone(),
+        Id::from_str("inst-lin"),
+        open_text,
+        1,
+    );
     let mut private_entry = CharacterKnowledgeEntry::witnessed(
         campaign.id.clone(),
         Id::from_str("inst-lin"),
-        "保险柜密码是 0427",
+        private_text,
         1,
     );
     private_entry.propagation = PropagationPolicy::Private;
-    store.add_knowledge(vec![private_entry]).unwrap();
+    store
+        .add_knowledge(vec![open_entry, private_entry])
+        .unwrap();
 
     let name_collisions = HashSet::from([String::from("Dup")]);
-    let relay_to_ambiguous_name = CharacterKnowledgeUpdate {
-        character_id: Id::from_str("Dup"),
-        knowledge_text: "保险柜密码是 0427".into(),
+    let open_relay_to_id = CharacterKnowledgeUpdate {
+        character_id: Id::from_str("inst-dup-a"),
+        knowledge_text: open_text.into(),
         source: KnowledgeSource::ToldByOther,
         source_character_id: Some(Id::from_str("inst-lin")),
         pinned: false,
         broadcast: None,
         propagation: PropagationPolicy::Open,
     };
-    let relay_entries = normalize_knowledge_update_for_postprocess(
+    let open_relay_entries = normalize_knowledge_update_for_postprocess(
         &store,
         &campaign.id,
-        &relay_to_ambiguous_name,
+        &open_relay_to_id,
+        2,
+        &HashSet::new(),
+        &name_collisions,
+    );
+    assert_eq!(open_relay_entries.len(), 1);
+    assert_eq!(
+        open_relay_entries[0].character_id,
+        Id::from_str("inst-dup-a")
+    );
+    assert!(
+        open_relay_entries[0].source_knowledge_id.is_some(),
+        "open 来源 relay 应能匹配上游知识，证明 fixture 路径有效"
+    );
+
+    let private_relay_to_id = CharacterKnowledgeUpdate {
+        character_id: Id::from_str("inst-dup-a"),
+        knowledge_text: private_text.into(),
+        source: KnowledgeSource::ToldByOther,
+        source_character_id: Some(Id::from_str("inst-lin")),
+        pinned: false,
+        broadcast: None,
+        propagation: PropagationPolicy::Open,
+    };
+    let private_relay_entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &private_relay_to_id,
         2,
         &HashSet::new(),
         &name_collisions,
     );
     assert!(
-        relay_entries.is_empty(),
-        "private 来源知识不能借 open relay 写入同名歧义目标"
+        private_relay_entries.is_empty(),
+        "private 来源知识不能借 explicit-id relay 绕过同名场景写入"
     );
 
-    let group_broadcast = CharacterKnowledgeUpdate {
+    let open_group_broadcast = CharacterKnowledgeUpdate {
         character_id: Id::from_str("Lin"),
-        knowledge_text: "保险柜密码是 0427".into(),
+        knowledge_text: open_text.into(),
         source: KnowledgeSource::ToldByOther,
         source_character_id: Some(Id::from_str("inst-lin")),
         pinned: false,
         broadcast: Some(BroadcastTarget::Group("守卫".to_string())),
         propagation: PropagationPolicy::Open,
     };
-    let broadcast_entries = normalize_knowledge_update_for_postprocess(
+    let open_broadcast_entries = normalize_knowledge_update_for_postprocess(
         &store,
         &campaign.id,
-        &group_broadcast,
+        &open_group_broadcast,
+        2,
+        &HashSet::new(),
+        &HashSet::new(),
+    );
+    assert_eq!(open_broadcast_entries.len(), 1);
+    assert_eq!(
+        open_broadcast_entries[0].character_id,
+        Id::from_str("inst-guard")
+    );
+    assert!(
+        open_broadcast_entries[0].source_knowledge_id.is_some(),
+        "open 来源 group broadcast 应能匹配上游知识，证明 group fixture 有效"
+    );
+
+    let private_group_broadcast = CharacterKnowledgeUpdate {
+        character_id: Id::from_str("Lin"),
+        knowledge_text: private_text.into(),
+        source: KnowledgeSource::ToldByOther,
+        source_character_id: Some(Id::from_str("inst-lin")),
+        pinned: false,
+        broadcast: Some(BroadcastTarget::Group("守卫".to_string())),
+        propagation: PropagationPolicy::Open,
+    };
+    let private_broadcast_entries = normalize_knowledge_update_for_postprocess(
+        &store,
+        &campaign.id,
+        &private_group_broadcast,
         2,
         &HashSet::new(),
         &HashSet::new(),
     );
     assert!(
-        broadcast_entries.is_empty(),
+        private_broadcast_entries.is_empty(),
         "private 来源知识不能借 group broadcast 分发给匹配身份组"
     );
 
