@@ -5093,7 +5093,7 @@ fn meta_explain_generation(
 
 /// 从 CampaignStore 组装 PreviewInput（类型化 patch 纯函数所需的快照）
 fn build_preview_input<'a>(
-    _store: &'static campaign_store::CampaignStore,
+    _store: &campaign_store::CampaignStore,
     campaign: &'a storyforge_domain::campaign::Campaign,
     instances: &'a [storyforge_domain::campaign::CharacterInstance],
     definitions: &'a Vec<storyforge_domain::character::CharacterDefinition>,
@@ -5116,8 +5116,15 @@ fn meta_propose_campaign_repairs(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
     let store = get_campaign_store();
-    let cid = Id::from_str(&campaign_id);
+    meta_propose_campaign_repairs_in_store(store, &campaign_id, state.inner().as_ref())
+}
 
+fn meta_propose_campaign_repairs_in_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
     let campaign = store
         .get_campaign(&cid)
         .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
@@ -5194,8 +5201,16 @@ fn meta_preview_typed_patch(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let store = get_campaign_store();
-    let cid = Id::from_str(&campaign_id);
+    meta_preview_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
+}
 
+fn meta_preview_typed_patch_in_store(
+    store: &campaign_store::CampaignStore,
+    patch_id: &str,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<serde_json::Value, TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
     // 找到 patch
     let mut typed = state
         .typed_patches
@@ -5252,8 +5267,16 @@ fn meta_accept_typed_patch(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
-    let cid = Id::from_str(&campaign_id);
+    meta_accept_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
+}
 
+fn meta_accept_typed_patch_in_store(
+    store: &campaign_store::CampaignStore,
+    patch_id: &str,
+    campaign_id: &str,
+    state: &AppState,
+) -> Result<(), TauriCommandError> {
+    let cid = Id::from_str(campaign_id);
     // 1. 找到 patch，必须 Pending
     let patch = {
         let typed = state
@@ -5352,7 +5375,7 @@ fn meta_accept_typed_patch(
 
 /// 执行单个 TypedPatchAction 到 CampaignStore（写盘辅助）
 fn apply_typed_action(
-    store: &'static campaign_store::CampaignStore,
+    store: &campaign_store::CampaignStore,
     campaign_id: &Id,
     action: &storyforge_app_meta::TypedPatchAction,
 ) -> Result<(), TauriCommandError> {
@@ -5536,6 +5559,13 @@ fn apply_typed_action(
 fn meta_dismiss_typed_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    meta_dismiss_typed_patch_in_state(&patch_id, state.inner().as_ref())
+}
+
+fn meta_dismiss_typed_patch_in_state(
+    patch_id: &str,
+    state: &AppState,
 ) -> Result<(), TauriCommandError> {
     let mut typed = state
         .typed_patches
@@ -12702,6 +12732,29 @@ mod tests {
         });
         assert!(has_delete_orphan, "应包含 delete_orphan_knowledge action");
 
+        let state = AppState::new_for_test();
+        let proposals =
+            meta_propose_campaign_repairs_in_store(&store, campaign.id.as_str(), &state).unwrap();
+        assert!(
+            !proposals.is_empty(),
+            "command helper should return patches"
+        );
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            typed.iter().any(|p| {
+                p.actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        storyforge_app_meta::TypedPatchAction::DeleteOrphanKnowledge { .. }
+                    )
+                })
+            }),
+            "command helper should persist a delete orphan knowledge patch"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12766,8 +12819,8 @@ mod tests {
         let task_id = task.id.clone();
         store.add_task(task).unwrap();
 
-        // 构造 TypedPatch + apply
-        let _patch = storyforge_app_meta::TypedPatch {
+        let state = AppState::new_for_test();
+        let patch = storyforge_app_meta::TypedPatch {
             id: "test-prune-patch".into(),
             description: "修剪孤儿引用".into(),
             source_issue_category: "orphan_task_references".into(),
@@ -12783,14 +12836,25 @@ mod tests {
             status: storyforge_app_meta::TypedPatchStatus::Pending,
         };
 
-        // 直接用 CampaignStore 方法模拟 apply_typed_action 的写盘逻辑
-        // （apply_typed_action 需要 &'static，测试中用本地 store 直接调用）
         {
-            let mut task = store.get_task(&task_id).unwrap();
-            task.related_characters
-                .retain(|id| ![orphan_id.clone()].contains(id));
-            store.update_task(task).unwrap();
+            let mut typed = state
+                .typed_patches
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            typed.push(patch);
         }
+
+        let preview = meta_preview_typed_patch_in_store(
+            &store,
+            "test-prune-patch",
+            campaign.id.as_str(),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(preview["stale"], serde_json::json!(false));
+
+        meta_accept_typed_patch_in_store(&store, "test-prune-patch", campaign.id.as_str(), &state)
+            .unwrap();
 
         // 验证：task.related_characters 不再含 orphan
         let updated_task = store.get_task(&task_id).unwrap();
@@ -12801,6 +12865,18 @@ mod tests {
         assert!(
             updated_task.related_characters.contains(&instance.id),
             "正常 instance id 应保留"
+        );
+        let typed = state
+            .typed_patches
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            typed
+                .iter()
+                .find(|p| p.id == "test-prune-patch")
+                .unwrap()
+                .status,
+            storyforge_app_meta::TypedPatchStatus::Accepted
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -12939,18 +13015,7 @@ mod tests {
             typed.push(patch);
         }
 
-        // dismiss
-        {
-            let mut typed = state
-                .typed_patches
-                .write()
-                .unwrap_or_else(|p| p.into_inner());
-            let p = typed
-                .iter_mut()
-                .find(|p| p.id == "test-dismiss-patch")
-                .unwrap();
-            p.status = storyforge_app_meta::TypedPatchStatus::Dismissed;
-        }
+        meta_dismiss_typed_patch_in_state("test-dismiss-patch", state.as_ref()).unwrap();
 
         // 验证
         let typed = state
