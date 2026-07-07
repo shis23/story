@@ -558,13 +558,25 @@ pub struct CharacterInfo {
     pub scenario: String,
     pub first_mes: String,
     #[serde(default)]
+    pub mes_example: String,
+    #[serde(default)]
+    pub post_history_instructions: String,
+    #[serde(default)]
     pub alternate_greetings: Vec<String>,
     pub system_prompt: String,
     pub tags: Vec<String>,
     pub creator: String,
+    #[serde(default)]
+    pub character_version: String,
     pub spec_version: String,
     #[serde(default)]
     pub extensions: serde_json::Value,
+    #[serde(default)]
+    pub embedded_world_info: Option<storyforge_domain::world_info::WorldInfoBook>,
+    #[serde(default)]
+    pub renderable_assets: Option<storyforge_domain::character::RenderableAssets>,
+    #[serde(default)]
+    pub raw_card_json: serde_json::Value,
     pub has_world_info: bool,
     pub has_renderable_assets: bool,
     pub world_info_count: usize,
@@ -623,12 +635,18 @@ impl From<&storyforge_domain::character::Character> for CharacterInfo {
             personality: c.personality.clone(),
             scenario: c.scenario.clone(),
             first_mes: c.first_mes.clone(),
+            mes_example: c.mes_example.clone(),
+            post_history_instructions: c.post_history_instructions.clone(),
             alternate_greetings: c.alternate_greetings.clone(),
             system_prompt: c.system_prompt.clone(),
             tags: c.tags.clone(),
             creator: c.creator.clone(),
+            character_version: c.character_version.clone(),
             spec_version: c.spec_version.clone(),
             extensions: c.extensions.clone(),
+            embedded_world_info: c.embedded_world_info.clone(),
+            renderable_assets: c.renderable_assets.clone(),
+            raw_card_json: c.raw_card_json.clone(),
             has_world_info: c.embedded_world_info.is_some(),
             has_renderable_assets: c.renderable_assets.is_some(),
             world_info_count: c
@@ -7016,14 +7034,19 @@ pub fn run() {
 
 // ─── 启动恢复辅助：StoredCharacter → domain Character / WorldInfoBook ──────────
 
-/// 从存储的 CharacterInfo 构造 domain Character（精简版，导演工具够用）
+/// 从存储的 CharacterInfo 构造 domain Character。
 ///
-/// 注：CharacterInfo 是导入时的 DTO，丢了 mes_example/embedded_world_info/raw_card_json
-/// 等完整字段。启动恢复只填导演工具用得到的字段（name/description/personality/
-/// scenario/first_mes/alternate_greetings/system_prompt），其余留空。
+/// 新版 CharacterInfo 会持久化 ST round-trip 所需字段；旧数据缺失时仍按展示 DTO
+/// 中的 world_info_entries 做近似恢复。
 fn stored_info_to_character(
     stored: &storage::StoredCharacter,
 ) -> storyforge_domain::character::Character {
+    let embedded_world_info = stored
+        .info
+        .embedded_world_info
+        .clone()
+        .or_else(|| world_info_book_from_entries(&stored.info.world_info_entries));
+
     storyforge_domain::character::Character {
         id: Id::from_str(
             stored
@@ -7037,20 +7060,63 @@ fn stored_info_to_character(
         personality: stored.info.personality.clone(),
         scenario: stored.info.scenario.clone(),
         first_mes: stored.info.first_mes.clone(),
-        mes_example: String::new(),
+        mes_example: stored.info.mes_example.clone(),
         system_prompt: stored.info.system_prompt.clone(),
-        post_history_instructions: String::new(),
+        post_history_instructions: stored.info.post_history_instructions.clone(),
         tags: stored.info.tags.clone(),
         creator: stored.info.creator.clone(),
-        character_version: String::new(),
+        character_version: stored.info.character_version.clone(),
         alternate_greetings: stored.info.alternate_greetings.clone(),
-        embedded_world_info: None,
+        embedded_world_info,
         extensions: stored.info.extensions.clone(),
-        renderable_assets: None,
+        renderable_assets: stored.info.renderable_assets.clone(),
         source: storyforge_domain::Source::Native,
         spec_version: stored.info.spec_version.clone(),
-        raw_card_json: serde_json::json!({}),
+        raw_card_json: stored.info.raw_card_json.clone(),
     }
+}
+
+fn world_info_entry_from_info(
+    e: &WorldInfoEntryInfo,
+) -> storyforge_domain::world_info::WorldInfoEntry {
+    use storyforge_domain::world_info::{LoreRoute, WorldInfoEntry};
+
+    let route = match e.route.as_str() {
+        "Constant" => LoreRoute::Constant,
+        "Selective" => LoreRoute::Selective,
+        "Both" => LoreRoute::Both,
+        "Disabled" => LoreRoute::Disabled,
+        _ => LoreRoute::Selective,
+    };
+
+    WorldInfoEntry {
+        st_id: None,
+        keys: e.keys.clone(),
+        secondary_keys: vec![],
+        content: e.content.clone(),
+        constant: e.constant,
+        selective: !e.constant,
+        selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+        disabled: false,
+        position: 0,
+        depth: e.depth,
+        order: e.order,
+        route,
+        extensions: serde_json::json!({}),
+    }
+}
+
+fn world_info_book_from_entries(
+    entries: &[WorldInfoEntryInfo],
+) -> Option<storyforge_domain::world_info::WorldInfoBook> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(storyforge_domain::world_info::WorldInfoBook {
+        entries: entries.iter().map(world_info_entry_from_info).collect(),
+        source: storyforge_domain::Source::Native,
+    })
 }
 
 /// 收集世界书条目：当前活跃角色的全部 + 其他角色的 is_global 条目
@@ -7061,37 +7127,16 @@ fn collect_world_info_for_active(
     all_chars: &[storage::StoredCharacter],
     active_name: &str,
 ) -> storyforge_domain::world_info::WorldInfoBook {
-    use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
+    use storyforge_domain::world_info::WorldInfoBook;
 
-    let mut entries: Vec<WorldInfoEntry> = Vec::new();
+    let mut entries = Vec::new();
     for stored in all_chars {
         let is_active = stored.info.name == active_name;
         for e in &stored.info.world_info_entries {
             if !is_active && !e.is_global {
                 continue;
             }
-            let route = match e.route.as_str() {
-                "Constant" => LoreRoute::Constant,
-                "Selective" => LoreRoute::Selective,
-                "Both" => LoreRoute::Both,
-                "Disabled" => LoreRoute::Disabled,
-                _ => LoreRoute::Selective,
-            };
-            entries.push(WorldInfoEntry {
-                st_id: None,
-                keys: e.keys.clone(),
-                secondary_keys: vec![],
-                content: e.content.clone(),
-                constant: e.constant,
-                selective: !e.constant,
-                selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
-                disabled: false,
-                position: 0,
-                depth: e.depth,
-                order: e.order,
-                route,
-                extensions: serde_json::json!({}),
-            });
+            entries.push(world_info_entry_from_info(e));
         }
     }
 
@@ -7672,6 +7717,75 @@ mod tests {
             restored.alternate_greetings,
             vec!["alternate one".to_string(), "alternate two".to_string()]
         );
+    }
+
+    #[test]
+    fn character_info_restore_preserves_st_round_trip_fields() {
+        use storyforge_domain::character::to_st_data;
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let mut character = make_test_character("RoundTrip");
+        character.description = "stored description".into();
+        character.mes_example = "<START>\n示例对话".into();
+        character.post_history_instructions = "历史后指令".into();
+        character.character_version = "2.1".into();
+        character.raw_card_json = serde_json::json!({
+            "name": "RoundTrip",
+            "description": "raw description",
+            "group_only": true,
+            "creator_notes": "keep this unknown field",
+            "extensions": {
+                "unknown_plugin": {"state": 7}
+            }
+        });
+        character.embedded_world_info = Some(WorldInfoBook {
+            source: storyforge_domain::Source::ImportedFromST,
+            entries: vec![WorldInfoEntry {
+                st_id: Some(9),
+                keys: vec!["钥匙".into()],
+                secondary_keys: vec!["门".into()],
+                content: "世界书内容".into(),
+                constant: true,
+                selective: false,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 3,
+                order: 12,
+                route: LoreRoute::Constant,
+                extensions: serde_json::json!({"entry_extra": true}),
+            }],
+        });
+
+        let stored = storage::StoredCharacter {
+            id: "stored-round-trip".into(),
+            info: CharacterInfo::from(&character),
+            imported_at: "now".into(),
+        };
+
+        let restored = stored_info_to_character(&stored);
+        let exported = to_st_data(
+            &restored,
+            None,
+            restored
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.to_st_book()),
+        );
+        let exported_json = serde_json::to_value(&exported).unwrap();
+
+        assert_eq!(restored.mes_example, "<START>\n示例对话");
+        assert_eq!(restored.post_history_instructions, "历史后指令");
+        assert_eq!(restored.character_version, "2.1");
+        assert_eq!(exported_json["group_only"], true);
+        assert_eq!(exported_json["creator_notes"], "keep this unknown field");
+        assert_eq!(exported_json["extensions"]["unknown_plugin"]["state"], 7);
+        assert_eq!(exported.mes_example, "<START>\n示例对话");
+        assert_eq!(exported.post_history_instructions, "历史后指令");
+        assert_eq!(exported.character_version, "2.1");
+        assert_eq!(exported.character_book.unwrap().entries[0].id, Some(9));
     }
 
     #[test]

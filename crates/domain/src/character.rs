@@ -86,6 +86,9 @@ pub struct StCharacterData {
     /// 内嵌世界书（ST 字段名 character_book）
     #[serde(default)]
     pub character_book: Option<StWorldInfoBook>,
+    /// ST data 顶层未知字段，作为 raw round-trip 保底保留。
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// ST 内嵌世界书结构（导入时用，转换后丢弃）
@@ -278,12 +281,20 @@ pub fn to_st_data(
     // 世界书
     data.character_book = character_book;
 
-    // extensions：保留 raw_card_json 的
-    if !character.extensions.is_null() {
+    // extensions：保留 raw_card_json 的；只有明确的非空运行时 extensions 才覆盖。
+    if is_non_empty_json(&character.extensions) {
         data.extensions = character.extensions.clone();
     }
 
     data
+}
+
+fn is_non_empty_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
 }
 
 /// 从 CharacterCard + CharacterDefinition 构建 StCharacterData（Campaign 导出路径）
@@ -343,6 +354,7 @@ pub fn empty_st_data(name: &str) -> StCharacterData {
         alternate_greetings: vec![],
         extensions: serde_json::json!({}),
         character_book: None,
+        extra: Default::default(),
     }
 }
 
@@ -696,6 +708,44 @@ mod multi_character_tests {
         assert_eq!(exported.alternate_greetings, vec!["嗨！", "欢迎。"]);
         // extensions round-trip
         assert_eq!(exported.extensions["custom_key"], "custom_value");
+    }
+
+    #[test]
+    fn test_st_data_unknown_fields_round_trip_through_raw_json() {
+        let card_json = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "边缘字段角色",
+                "description": "测试未知字段保真",
+                "group_only": true,
+                "creator_notes": "ST data 顶层未知字段",
+                "custom_nested": {
+                    "flag": "keep-me"
+                },
+                "extensions": {
+                    "unknown_plugin": {
+                        "state": 42
+                    }
+                }
+            }
+        });
+        let card: StCharacterCard = serde_json::from_value(card_json).unwrap();
+        let character = Character::from_st_card(card);
+
+        assert_eq!(character.raw_card_json["group_only"], true);
+        assert_eq!(
+            character.raw_card_json["creator_notes"],
+            "ST data 顶层未知字段"
+        );
+        assert_eq!(character.raw_card_json["custom_nested"]["flag"], "keep-me");
+
+        let exported = to_st_data(&character, None, None);
+        let exported_json = serde_json::to_value(exported).unwrap();
+        assert_eq!(exported_json["group_only"], true);
+        assert_eq!(exported_json["creator_notes"], "ST data 顶层未知字段");
+        assert_eq!(exported_json["custom_nested"]["flag"], "keep-me");
+        assert_eq!(exported_json["extensions"]["unknown_plugin"]["state"], 42);
     }
 
     #[test]

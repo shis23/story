@@ -281,6 +281,7 @@ mod tests {
             alternate_greetings: vec![],
             extensions: serde_json::json!({}),
             character_book: None,
+            extra: Default::default(),
         };
         let card = make_st_card(data, "3.0");
 
@@ -331,6 +332,7 @@ mod tests {
             alternate_greetings: vec![],
             extensions: serde_json::json!({}),
             character_book: None,
+            extra: Default::default(),
         };
         let card = make_st_card(data, "2.0");
         let base = build_placeholder_png();

@@ -1,6 +1,6 @@
 # ST 导入/导出计划（SillyTavern Import/Export）
 
-> 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。2026-07-07 追加：StoryForge Campaign JSON Bundle 已支持导入 round-trip，导入时生成全新 card/campaign/instance/knowledge/task/summary ID 并重写引用，避免覆盖现有数据。
+> 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。2026-07-07 追加：StoryForge Campaign JSON Bundle 已支持导入 round-trip，导入时生成全新 card/campaign/instance/knowledge/task/summary ID 并重写引用，避免覆盖现有数据。2026-07-07 续补：ST `data` 顶层未知字段（如 `group_only`、`creator_notes`）通过 flatten `extra` 保留到 `raw_card_json` 并参与回导 round-trip；单卡 CharacterStore 也已持久化 raw/mes_example/post_history_instructions/character_version/embedded_world_info，使 `export_st_card_png` 不再经过精简 DTO 丢保真字段。
 > 关联：`docs/ROADMAP.md` Phase 5（已完成）、`docs/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
 
 ## 目标
@@ -68,23 +68,23 @@
 
 **目标**：列出哪些字段必须保留、哪些可以降级、哪些明确不支持。
 
-**当前事实**：`Character::from_st_card()` 已覆盖 name/description/personality/scenario/first_mes/mes_example/system_prompt/post_history_instructions/tags/creator/character_version/alternate_greetings/extensions/raw_card_json/embedded_world_info/renderable_assets。
+**当前事实**：`Character::from_st_card()` 已覆盖 name/description/personality/scenario/first_mes/mes_example/system_prompt/post_history_instructions/tags/creator/character_version/alternate_greetings/extensions/raw_card_json/embedded_world_info/renderable_assets；未知 ST `data` 顶层字段会进入 `StCharacterData.extra`，并随 `raw_card_json` / `to_st_data()` 保留。
 
 **待确认**：
 
 - [ ] `extensions` 中哪些子字段有 StoryForge 语义（如 MVU `stat_data`）？当前只有 `assets`/`character_assets` 被提取。
 - [x] `alternate_greetings` 在 Campaign 写作中如何使用？当前 legacy 单卡新会话与 Campaign 新建游玩档均可切换并消费默认/备选开场，后端会拒绝不属于源角色卡的开场并回退到首个有效 greeting。
-- [ ] ST 的 `group_only`、`post_history_instructions` 等边缘字段是否需要特殊处理？
+- [x] ST 的 `group_only`、`post_history_instructions` 等边缘字段是否需要特殊处理？`post_history_instructions` 已是 typed 字段；`group_only` 等未知顶层字段按原样保留，不赋予 StoryForge 业务语义。
 
 ### T2: raw JSON 和 extensions 保留策略
 
 **目标**：明确 `raw_card_json` 和 `extensions` 的生命周期和用途。
 
-**当前事实**：两者都是 `serde_json::Value`，导入时写入，不做二次处理。
+**当前事实**：`extensions` 是 `serde_json::Value`，导入时写入，不做二次处理；`raw_card_json` 由 typed 字段 + `StCharacterData.extra` 组成，可作为导出回 ST 的保底数据。`CharacterInfo` 持久化层已保留 ST 回导需要的 raw/示例对话/后历史指令/版本/内嵌世界书字段，启动恢复和单卡 PNG 导出会使用这些完整字段。
 
 **待设计**：
 
-- [ ] `raw_card_json` 是否用于"导出回 ST"时的保底？如果是，需确保 round-trip 不丢字段。
+- [x] `raw_card_json` 是否用于"导出回 ST"时的保底？已用于 `to_st_data()` / `to_st_data_from_card()` 的 base；`test_st_data_unknown_fields_round_trip_through_raw_json` 覆盖未知顶层字段保真，`character_info_restore_preserves_st_round_trip_fields` 覆盖单卡存储恢复链路。
 - [ ] `extensions` 中的 MVU 数据是否需要在导入时解析为 typed 结构？当前由 `character_extractor` 的 `mvu_schema` 参数处理。
 - [ ] 大型 extensions（如 ST 插件数据）的存储成本评估。
 
@@ -125,6 +125,6 @@
 ## 验证
 
 - [ ] 常见 ST V2/V3 卡能导入且不丢关键字段。
-- [ ] 不认识的 extensions 不丢（`raw_card_json` 保底）。
+- [x] 不认识的 extensions 不丢（`raw_card_json` 保底）；未知 ST `data` 顶层字段也会经 `extra` 保留。
 - [ ] 多角色识别失败时 fallback 到单角色，不报错崩溃。
 - [x] Campaign 导出 → 导入 round-trip ID 重写和引用一致性由 `import_campaign_bundle_rewrites_ids_and_references` 覆盖。
