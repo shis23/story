@@ -235,4 +235,31 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn new_recovers_from_tmp_and_marks_scripts_global_without_corrupt_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_global_regex_tmp_recovery_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("global_regex_scripts.json");
+        std::fs::write(&path, "{ invalid").unwrap();
+        std::fs::write(
+            path.with_extension("json.tmp"),
+            serde_json::to_string(&vec![script("tmp-scoped", RegexScriptSource::Scoped)]).unwrap(),
+        )
+        .unwrap();
+
+        let store = GlobalRegexStore::new(&dir);
+        let scripts = store.list();
+
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].id, "tmp-scoped");
+        assert_eq!(scripts[0].source, RegexScriptSource::Global);
+        assert!(!path.with_extension("json.corrupt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
