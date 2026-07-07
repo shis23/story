@@ -1270,6 +1270,58 @@ test('provides ST slash command registration and trigger fallbacks', () => {
   ])
 })
 
+test('supports ST slash command unregister helpers and alias cleanup', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('heal', () => calls.push('heal'), ['hp'])
+  window.SlashCommandParser.addCommandObject({
+    name: 'inspect',
+    aliases: ['look'],
+    callback: () => calls.push('inspect'),
+    helpString: 'inspect target',
+  })
+  window.registerSlashCommand('rest', () => calls.push('rest'), ['sleep'])
+
+  assert.equal(window.unregisterSlashCommand('hp'), true)
+  assert.equal(window.triggerSlashCommand('heal'), undefined)
+  assert.equal(window.triggerSlashCommand('hp'), undefined)
+  assert.deepEqual(Array.from(window.SlashCommandParser.commands, (command) => command.name), ['inspect', 'rest'])
+
+  assert.equal(window.SlashCommandParser.removeCommandObject('look'), true)
+  assert.equal(window.storyforge.slashCommands.unregister('inspect'), false)
+  assert.equal(window.triggerSlashCommand('look'), undefined)
+  assert.equal(window.TavernHelper.unregisterSlashCommand('sleep'), true)
+  assert.equal(window.triggerSlashCommand('rest'), undefined)
+  assert.deepEqual(calls, [])
+  assert.deepEqual(Array.from(window.storyforge.slashCommands.list(), (command) => command.name), [])
+})
+
+test('prefers slash command primary names over aliases when unregistering collisions', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('heal', () => calls.push('heal'), ['hp'])
+  window.registerSlashCommand('hp', () => calls.push('hp-primary'))
+
+  window.triggerSlashCommand('hp')
+  window.triggerSlashCommand('heal')
+
+  assert.deepEqual(calls, ['hp-primary', 'heal'])
+  assert.deepEqual(plain(Array.from(window.storyforge.slashCommands.list(), (command) => ({
+    name: command.name,
+    aliases: command.aliases,
+  }))), [
+    { name: 'heal', aliases: [] },
+    { name: 'hp', aliases: [] },
+  ])
+
+  assert.equal(window.unregisterSlashCommand('hp'), true)
+  assert.equal(window.triggerSlashCommand('hp'), undefined)
+  window.triggerSlashCommand('heal')
+  assert.deepEqual(calls, ['hp-primary', 'heal', 'heal'])
+})
+
 test('parses slash invocation strings into raw, named, and unnamed args', () => {
   const { window } = createBridgeSandbox()
   const calls = []

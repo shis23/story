@@ -477,6 +477,23 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   function _registerSlashCommand(command, callback, aliases) {
     const normalized = _normalizeSlashCommand(command, callback, aliases);
     if (!normalized.name) return normalized;
+    const aliasSet = {};
+    normalized.aliases = (normalized.aliases || [])
+      .map(function(alias) { return String(alias || '').trim(); })
+      .filter(function(alias) {
+        if (!alias || alias === normalized.name || aliasSet[alias]) return false;
+        aliasSet[alias] = true;
+        return !_slashCommands.some(function(item) {
+          return item.name === alias && item.name !== normalized.name;
+        });
+      });
+    const reserved = [normalized.name].concat(normalized.aliases);
+    _slashCommands.forEach(function(item) {
+      if (!item || item.name === normalized.name || !Array.isArray(item.aliases)) return;
+      item.aliases = item.aliases.filter(function(alias) {
+        return reserved.indexOf(alias) < 0;
+      });
+    });
     const existingIndex = _slashCommands.findIndex(function(item) {
       return item.name === normalized.name;
     });
@@ -488,10 +505,28 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return normalized;
   }
 
-  function _invokeSlashCommand(name, args) {
-    const command = _slashCommands.find(function(item) {
-      return item.name === name || item.aliases.indexOf(name) >= 0;
+  function _findSlashCommandIndex(name) {
+    const commandName = String(name || '').trim();
+    if (!commandName) return -1;
+    const primaryIndex = _slashCommands.findIndex(function(item) {
+      return item.name === commandName;
     });
+    if (primaryIndex >= 0) return primaryIndex;
+    return _slashCommands.findIndex(function(item) {
+      return item.aliases.indexOf(commandName) >= 0;
+    });
+  }
+
+  function _unregisterSlashCommand(name) {
+    const index = _findSlashCommandIndex(name);
+    if (index < 0) return false;
+    _slashCommands.splice(index, 1);
+    return true;
+  }
+
+  function _invokeSlashCommand(name, args) {
+    const index = _findSlashCommandIndex(name);
+    const command = index >= 0 ? _slashCommands[index] : null;
     if (!command) return _invokeBuiltinSlashCommand(name, args);
     return command.callback.apply(null, args);
   }
@@ -1092,6 +1127,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
         onChatCompletionPromptReady,
       },
       registerSlashCommand: _registerSlashCommand,
+      unregisterSlashCommand: _unregisterSlashCommand,
       triggerSlash: _triggerSlashCommand,
       triggerSlashCommand: _triggerSlashCommand,
       setStatusBar: (html) => window.storyforge.statusBar.set(html),
@@ -1194,6 +1230,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     slashCommands: {
       list: () => _slashCommands.slice(),
       register: _registerSlashCommand,
+      unregister: _unregisterSlashCommand,
       trigger: _triggerSlashCommand,
     },
 
@@ -1224,6 +1261,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     emitAndWait: _emitAndWait,
   };
   window.registerSlashCommand = _registerSlashCommand;
+  window.unregisterSlashCommand = _unregisterSlashCommand;
   window.triggerSlashCommand = _triggerSlashCommand;
   window.triggerSlash = _triggerSlashCommand;
   window.triggerSlashTag = _triggerSlashCommand;
@@ -1236,6 +1274,12 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.SlashCommandParser.addCommandObject = function(command) {
     return _registerSlashCommand(command);
   };
+  window.SlashCommandParser.removeCommandObject = function(command) {
+    return _unregisterSlashCommand(command && typeof command === 'object'
+      ? (command.name || command.command)
+      : command);
+  };
+  window.SlashCommandParser.removeCommand = window.SlashCommandParser.removeCommandObject;
   window.TavernHelper = window.TavernHelper || _createTavernHelper();
   window.tavernHelper = window.TavernHelper;
   window.SillyTavern = window.SillyTavern || _createSillyTavern();
