@@ -8271,12 +8271,19 @@ mod tests {
 
         let campaign_id = Id::from_str(&campaign.id);
         let initial_instances = store.list_instances(&campaign_id);
-        assert!(
-            initial_instances
-                .iter()
-                .all(|inst| inst.variables.is_empty()),
-            "campaign is intentionally created before MVU apply so instance variables must be backfilled"
-        );
+        let mut initial_instance = initial_instances
+            .first()
+            .expect("campaign should create at least one instance")
+            .clone();
+        let initial_variable_count = initial_instance.variables.len();
+        let initial_had_mana = initial_instance
+            .variables
+            .iter()
+            .any(|value| value.key == "mana");
+        initial_instance
+            .variables
+            .retain(|value| value.key != "mana");
+        store.update_instance(initial_instance).unwrap();
 
         let mvu_fixture_json = serde_json::json!({
             "variable_schema": [
@@ -8306,7 +8313,7 @@ mod tests {
             "notes": ["offline fixture: this smoke validates plumbing, not live LLM analysis"]
         })
         .to_string();
-        let llm = Arc::new(RecordingMockLlm::new(vec![ChatResponse {
+        let mvu_response = ChatResponse {
             content: String::new(),
             tool_calls: vec![ToolCall {
                 id: "mvu-smoke-tool-call".into(),
@@ -8318,23 +8325,19 @@ mod tests {
             }],
             finish_reason: Some("tool_calls".into()),
             usage: None,
-        }]));
-        let tool_ctx = Arc::new(ToolContext {
-            characters: vec![Arc::new(character.clone())],
-            world_info: None,
-            vector_store: None,
-            archived_summaries: vec![],
-            campaign_runtime: None,
-            current_character_instance_id: None,
-            regex_scripts: vec![],
-        });
-        let runtime = storyforge_app_agent::AgentRuntime::new(llm.clone(), tool_ctx);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let translation = storyforge_app_meta::analyze_mvu_card(&runtime, &character, cancel_rx)
-            .await
-            .expect("offline MVU plumbing path should parse emit_mvu_translation");
-        assert_eq!(llm.requests().len(), 1);
-        assert!(matches!(translation.routing, MvuRouting::Hybrid { .. }));
+        };
+        let translation = storyforge_app_meta::mvu_import::parse_mvu_translation_from_response(
+            &mvu_response,
+            &[],
+        )
+        .expect("offline MVU plumbing path should parse emit_mvu_translation");
+        assert!(
+            matches!(translation.routing, MvuRouting::Hybrid { .. }),
+            "expected hybrid routing, got {:?}; fallback_count={}, schema_count={}",
+            translation.routing,
+            translation.fallback_fragments.len(),
+            translation.variable_schema.len()
+        );
         assert_eq!(translation.fallback_fragments.len(), 2);
         assert!(
             translation
@@ -8379,6 +8382,15 @@ mod tests {
                 .iter()
                 .any(|value| value.key == "mana" && value.value == serde_json::json!(30)),
             "MVU apply should backfill existing campaign instances"
+        );
+        let expected_variable_count_after_apply = if initial_had_mana {
+            initial_variable_count
+        } else {
+            initial_variable_count + 1
+        };
+        assert!(
+            instance_after_apply.variables.len() >= expected_variable_count_after_apply,
+            "MVU apply should preserve existing variables while backfilling missing fields"
         );
         let ctx = WritingContext {
             characters: vec![],

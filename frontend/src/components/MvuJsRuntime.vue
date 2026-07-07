@@ -71,6 +71,8 @@ window.setChatVariable = function(k, val) {
   V[k] = val;
   RES.push({ key: k, value: val });
 };
+window.getvar = window.getChatVariable;
+window.setvar = window.setChatVariable;
 
 // JSR _ 别名
 window._ = window._ || {};
@@ -113,15 +115,58 @@ function W(els) {
     if (v === undefined) return a.length ? a[0].getAttribute(n) : '';
     a.forEach(function(e) { e.setAttribute(n, v); }); return a;
   };
+  a.ready = function(fn) {
+    if (typeof fn === 'function') fn.call(document);
+    return a;
+  };
   return a;
 }
+function blockedJqRequest(kind, url) {
+  console.warn('[MVU] blocked jquery ' + kind + ':', String(url || ''));
+  var request = {
+    done: function() { return request; },
+    fail: function(fn) {
+      if (typeof fn === 'function') {
+        try { fn.call(null, null, 'error', null); }
+        catch (err) { console.error('[MVU] jquery ' + kind + ' fail callback error:', err); }
+      }
+      return request;
+    },
+    always: function(fn) {
+      if (typeof fn === 'function') {
+        try { fn.call(null, '', 'error', null); }
+        catch (err) { console.error('[MVU] jquery ' + kind + ' always callback error:', err); }
+      }
+      return request;
+    },
+    then: function(_resolve, reject) {
+      if (typeof reject === 'function') {
+        try { reject.call(null, null, 'error', null); }
+        catch (err) { console.error('[MVU] jquery ' + kind + ' reject callback error:', err); }
+      }
+      return request;
+    },
+    catch: function(fn) {
+      if (typeof fn === 'function') {
+        try { fn.call(null, null, 'error', null); }
+        catch (err) { console.error('[MVU] jquery ' + kind + ' catch callback error:', err); }
+      }
+      return request;
+    }
+  };
+  return request;
+}
 window.$ = function(s) {
+  if (typeof s === 'function') { s.call(document); return W([C]); }
+  if (s === document || s === window) return W([s]);
   if (typeof s === 'string') return W(C.querySelectorAll(s));
   if (s && s.nodeType) return W([s]);
   return W([]);
 };
 window.jQuery = window.$;
 window.$.find = function(s) { return window.$(s); };
+window.$.getScript = function(url) { return blockedJqRequest('getScript', url); };
+window.jQuery.getScript = window.$.getScript;
 
 // === 定时器（受控）===
 var TM = [];
@@ -169,6 +214,8 @@ function runUserScript(source, vars, includeOnSlashTag) {
     'var triggerSlash = api.triggerSlash;',
     'var getChatVariable = api.getChatVariable;',
     'var setChatVariable = api.setChatVariable;',
+    'var getvar = api.getvar;',
+    'var setvar = api.setvar;',
     includeOnSlashTag ? 'var onSlashTag = function(t){ triggerSlashTag(t); };' : '',
     String(source || '')
   ].join(String.fromCharCode(10));
@@ -179,7 +226,9 @@ function runUserScript(source, vars, includeOnSlashTag) {
     triggerSlashTag: window.triggerSlashTag,
     triggerSlash: window.triggerSlash,
     getChatVariable: window.getChatVariable,
-    setChatVariable: window.setChatVariable
+    setChatVariable: window.setChatVariable,
+    getvar: window.getvar,
+    setvar: window.setvar
   });
 }
 

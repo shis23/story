@@ -209,6 +209,126 @@ test('MVU iframe shim keeps legacy non-strict script semantics without exposing 
   })
 })
 
+test('MVU iframe shim supports TavernHelper-style setvar/getvar aliases', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-st-vars',
+      variables: { hp: 80, mood: 'calm' },
+      fragment_js: [
+        'setvar("hp", getvar("hp") - 15);',
+        'window.setvar("status.mood", window.getvar("mood", "neutral"));',
+        'variables.hpFromAlias = getvar("hp");',
+        'variables.defaultFromAlias = getvar("missing", "fallback");',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.equal(result.request_id, 'req-st-vars')
+  assert.deepEqual(plain(result.variable_updates), {
+    hp: 65,
+    'status.mood': 'calm',
+    hpFromAlias: 65,
+    defaultFromAlias: 'fallback',
+  })
+})
+
+test('MVU iframe shim preserves window globals created by status bar assets', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:load_assets',
+      html: '<main id="card"></main>',
+      js: [
+        'window.StatusBarCompat = window.StatusBarCompat || { renders: 0 };',
+        'window.StatusBarCompat.readMood = function() { return window.getvar("mood", "neutral"); };',
+        'window.StatusBarCompat.render = function() {',
+        '  this.renders += 1;',
+        '  window.setvar("lastRenderMood", this.readMood());',
+        '  return this.renders;',
+        '};',
+      ].join('\n'),
+    },
+  })
+
+  const loaded = postedMessages.at(-1).message
+  assert.equal(loaded.type, 'mvu:assets_loaded')
+  assert.equal(loaded.error, undefined)
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-window-status',
+      variables: { mood: 'focused' },
+      fragment_js: [
+        'variables.renderCount = window.StatusBarCompat.render();',
+        'variables.renderMood = window.getvar("lastRenderMood");',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.deepEqual(plain(result.variable_updates), {
+    lastRenderMood: 'focused',
+    renderCount: 1,
+    renderMood: 'focused',
+  })
+})
+
+test('MVU iframe shim runs jquery ready fallbacks and blocks remote script loads', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:load_assets',
+      html: '<main id="card"></main>',
+      js: [
+        '$(function() { setvar("readyShortcut", true); });',
+        '$(document).ready(function() { setvar("readyDocument", true); });',
+        '$.getScript("https://testingcf.jsdelivr.net/storyforge/status-bar.js")',
+        '  .fail(function() { setvar("remoteScriptBlocked", true); })',
+        '  .always(function(_data, status) { setvar("remoteScriptStatus", status); });',
+        'variables.assetsContinued = true;',
+      ].join('\n'),
+    },
+  })
+
+  const loaded = postedMessages.at(-1).message
+  assert.equal(loaded.type, 'mvu:assets_loaded')
+  assert.equal(loaded.error, undefined)
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-jquery-fallbacks',
+      variables: {},
+      fragment_js: [
+        'variables.readyShortcutSeen = getvar("readyShortcut");',
+        'variables.readyDocumentSeen = getvar("readyDocument");',
+        'variables.remoteScriptBlockedSeen = getvar("remoteScriptBlocked");',
+        'variables.remoteScriptStatusSeen = getvar("remoteScriptStatus");',
+        'variables.assetsContinuedSeen = variables.assetsContinued;',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.deepEqual(plain(result.variable_updates), {
+    readyShortcutSeen: true,
+    readyDocumentSeen: true,
+    remoteScriptBlockedSeen: true,
+    remoteScriptStatusSeen: 'error',
+    assetsContinuedSeen: true,
+  })
+})
+
 test('MVU iframe shim blocks remote jquery load without failing asset bootstrap', () => {
   const { listeners, postedMessages } = createShimSandbox()
 
