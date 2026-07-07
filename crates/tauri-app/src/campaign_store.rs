@@ -567,32 +567,21 @@ impl CampaignStore {
 // ─── 持久化辅助 ─────────────────────────────────────────────────────────────
 
 fn load_or_default<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
-    if !path.exists() {
-        return vec![];
-    }
-    match std::fs::read_to_string(path) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(data) => data,
-            Err(e) => {
-                // 主文件损坏，尝试读 .tmp 备份（atomic_write 先写 .tmp 再 rename，
-                // 崩溃时 .tmp 可能保存了最新数据）
-                tracing::warn!("加载 {} 失败({e})，尝试 .tmp 备份", path.display());
-                let tmp_path = std::path::PathBuf::from(format!("{}.tmp", path.display()));
-                if let Ok(tmp_s) = std::fs::read_to_string(&tmp_path)
-                    && let Ok(data) = serde_json::from_str(&tmp_s)
-                {
-                    tracing::info!("从 .tmp 备份恢复成功: {}", tmp_path.display());
-                    return data;
-                }
-                tracing::error!(
-                    "加载 {} 失败且无可用备份，返回空（下次保存将覆盖！）",
-                    path.display()
-                );
-                vec![]
-            }
+    crate::storage::json_store::load_json_with_tmp_backup_or_default(
+        path,
+        |error| {
+            tracing::warn!(
+                "Failed to load {}; trying .tmp backup: {error}",
+                path.display()
+            );
         },
-        Err(_) => vec![],
-    }
+        |path, error| {
+            tracing::error!(
+                "Failed to load {} and .tmp recovery was unavailable; copied .corrupt backup: {error}",
+                path.display()
+            );
+        },
+    )
 }
 
 fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
@@ -646,6 +635,49 @@ mod tests {
         };
         card.character_definitions.push(def);
         card
+    }
+
+    #[test]
+    fn test_campaigns_loads_tmp_backup_when_main_json_invalid() {
+        let dir = temp_dir();
+        let path = dir.join("campaigns.json");
+        let campaign = Campaign::new(Id::from_str("card-1"), "tmp recovery".to_string());
+        std::fs::write(&path, "{ invalid").unwrap();
+        std::fs::write(
+            path.with_extension("json.tmp"),
+            serde_json::to_string(&vec![campaign.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let store = CampaignStore::new(&dir);
+        let loaded = store.list_campaigns();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, campaign.id);
+        assert_eq!(loaded[0].card_id, campaign.card_id);
+        assert!(!path.with_extension("json.corrupt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_campaigns_copies_corrupt_backup_when_main_and_tmp_are_invalid() {
+        let dir = temp_dir();
+        let path = dir.join("campaigns.json");
+        let original = "{ invalid";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(path.with_extension("json.tmp"), "{ also invalid").unwrap();
+
+        let store = CampaignStore::new(&dir);
+
+        assert!(store.list_campaigns().is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap(),
+            original
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
