@@ -5772,13 +5772,29 @@ async fn extract_characters(
     let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
     let definitions = storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
     card.character_definitions = definitions;
-    let stored = store
-        .save_card(card)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    let stored = save_character_card_async(store, card).await?;
 
     let mut dto = CardSummaryDto::from(&stored);
     dto.extracted = extracted;
     Ok(dto)
+}
+
+async fn save_character_card_async(
+    store: &'static campaign_store::CampaignStore,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    tokio::task::spawn_blocking(move || save_character_card_to_store(store, card))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("保存角色卡任务失败: {e}")))?
+}
+
+fn save_character_card_to_store(
+    store: &campaign_store::CampaignStore,
+    card: storyforge_domain::character::CharacterCard,
+) -> Result<campaign_store::StoredCard, TauriCommandError> {
+    store
+        .save_card(card)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
 }
 
 #[tauri::command]
@@ -7771,6 +7787,72 @@ mod tests {
         let reloaded_stored = reloaded.get_mvu(&Id::from_str("src-mvu")).unwrap();
         assert_eq!(reloaded_stored.character_name, "MVU 更新");
         assert_eq!(reloaded_stored.analyzed_at, "2026-07-07T00:00:01Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_test_character_definition(
+        card_id: &Id,
+        id: &str,
+        name: &str,
+    ) -> storyforge_domain::character::CharacterDefinition {
+        storyforge_domain::character::CharacterDefinition {
+            id: Id::from_str(id),
+            card_id: card_id.clone(),
+            name: name.into(),
+            persona_prompt: format!("{name} persona"),
+            behavior_rules: format!("{name} behavior"),
+            base_backstory: vec!["backstory".into()],
+            group: None,
+            role_type: storyforge_domain::character::RoleType::Protagonist,
+            variable_schema: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_character_card_async_persists_and_replaces_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_card_async_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: &'static campaign_store::CampaignStore =
+            Box::leak(Box::new(campaign_store::CampaignStore::new(&dir)));
+
+        let character = make_test_character("Async Card Source");
+        let mut first = storyforge_domain::character::CharacterCard::from_character(&character);
+        first
+            .character_definitions
+            .push(make_test_character_definition(
+                &first.id,
+                "def-first",
+                "First",
+            ));
+        let mut second = storyforge_domain::character::CharacterCard::from_character(&character);
+        second.name = "Async Card Updated".into();
+        second
+            .character_definitions
+            .push(make_test_character_definition(
+                &second.id,
+                "def-second",
+                "Second",
+            ));
+
+        save_character_card_async(store, first).await.unwrap();
+        let stored = save_character_card_async(store, second).await.unwrap();
+
+        assert_eq!(stored.card.name, "Async Card Updated");
+        assert_eq!(stored.card.character_definitions.len(), 1);
+        assert_eq!(store.list_cards().len(), 1);
+        assert_eq!(
+            store.get_card_by_source(&character.id).unwrap().card.name,
+            "Async Card Updated"
+        );
+
+        let reloaded = campaign_store::CampaignStore::new(&dir);
+        let reloaded_card = reloaded.get_card_by_source(&character.id).unwrap();
+        assert_eq!(reloaded_card.card.name, "Async Card Updated");
+        assert_eq!(reloaded_card.card.character_definitions[0].name, "Second");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
