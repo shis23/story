@@ -54,8 +54,35 @@ const ST_EVENT_ALIASES = {
   started: ['GENERATION_STARTED'],
   editor_progress: ['STREAM_TOKEN'],
   draft_ready: ['GENERATION_ENDED'],
-  committed: ['MESSAGE_RECEIVED'],
+  committed: ['MESSAGE_RECEIVED', 'CHARACTER_MESSAGE_RENDERED', 'CHAT_CHANGED'],
   error: ['GENERATION_STOPPED'],
+}
+
+function uniqueEventNames(names) {
+  const seen = new Set()
+  return names.filter((name) => {
+    if (!name || seen.has(name)) return false
+    seen.add(name)
+    return true
+  })
+}
+
+function deriveSillyTavernHostEventNames(eventName, data = {}) {
+  const names = [eventName]
+  const role = data?.role
+  if (eventName === ST_EVENT_TYPES.MESSAGE_SENT) {
+    names.push(ST_EVENT_TYPES.USER_MESSAGE_RENDERED, ST_EVENT_TYPES.CHAT_CHANGED)
+  } else if (eventName === ST_EVENT_TYPES.MESSAGE_RECEIVED) {
+    names.push(ST_EVENT_TYPES.CHARACTER_MESSAGE_RENDERED, ST_EVENT_TYPES.CHAT_CHANGED)
+  } else if (eventName === ST_EVENT_TYPES.MESSAGE_UPDATED) {
+    names.push(role === 'user' ? ST_EVENT_TYPES.USER_MESSAGE_RENDERED : ST_EVENT_TYPES.CHARACTER_MESSAGE_RENDERED)
+    names.push(ST_EVENT_TYPES.CHAT_CHANGED)
+  } else if (eventName === ST_EVENT_TYPES.MESSAGE_SWIPED) {
+    names.push(ST_EVENT_TYPES.CHARACTER_MESSAGE_RENDERED, ST_EVENT_TYPES.CHAT_CHANGED)
+  } else if (eventName === ST_EVENT_TYPES.MESSAGE_DELETED || eventName === ST_EVENT_TYPES.CHAT_LOADED) {
+    names.push(ST_EVENT_TYPES.CHAT_CHANGED)
+  }
+  return uniqueEventNames(names)
 }
 
 const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
@@ -236,12 +263,9 @@ export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
     pipelineEvent.event_type,
     ...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []),
   ]
-  const seen = new Set()
 
-  return names
+  return uniqueEventNames(names)
     .filter((name) => {
-      if (seen.has(name)) return false
-      seen.add(name)
       return isSubscribedToPluginEvent(plugin, name)
     })
     .map((name) => ({ event: name, data: payload }))
@@ -249,12 +273,11 @@ export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
 
 function mapGenericPluginEvent(eventName, data, plugin = null) {
   if (!eventName) return []
-  if (!isSubscribedToPluginEvent(plugin, eventName)) return []
   const payload = data && typeof data === 'object' ? data : {}
-  return [{
-    event: eventName,
-    data: canReadMemory(plugin) ? payload : sanitizePluginEventData(payload),
-  }]
+  const eventData = canReadMemory(plugin) ? payload : sanitizePluginEventData(payload)
+  return deriveSillyTavernHostEventNames(eventName, payload)
+    .filter((name) => isSubscribedToPluginEvent(plugin, name))
+    .map((name) => ({ event: name, data: eventData }))
 }
 
 /**

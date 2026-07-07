@@ -583,7 +583,7 @@ test('adds SillyTavern aliases for generation lifecycle events', () => {
       event_type: 'committed',
       data: { session_id: 's1', variant_id: 'v1' },
     }).map((event) => event.event),
-    ['pipeline.committed', 'committed', 'MESSAGE_RECEIVED'],
+    ['pipeline.committed', 'committed', 'MESSAGE_RECEIVED', 'CHARACTER_MESSAGE_RENDERED', 'CHAT_CHANGED'],
   )
 })
 
@@ -619,6 +619,45 @@ test('maps generic host plugin event records without losing payload', () => {
   }])
 })
 
+test('derives common SillyTavern render and chat events from host message events', () => {
+  const record = {
+    id: 42,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'm1', role: 'assistant', content: 'secret', reason: 'writing_complete' },
+  }
+
+  assert.deepEqual(
+    mapPluginEventRecordToPluginEvents(record, {
+      id: 'plugin-a',
+      event_subscriptions: ['CHARACTER_MESSAGE_RENDERED', 'CHAT_CHANGED'],
+      permissions: ['ReadMemory'],
+    }).map((event) => event.event),
+    ['CHARACTER_MESSAGE_RENDERED', 'CHAT_CHANGED'],
+  )
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents({
+    id: 43,
+    event: 'MESSAGE_SENT',
+    data: { messageId: 'u1', role: 'user', content: 'hello' },
+  }, {
+    id: 'plugin-a',
+    event_subscriptions: ['USER_MESSAGE_RENDERED'],
+    permissions: [],
+  }), [{
+    event: 'USER_MESSAGE_RENDERED',
+    data: { messageId: 'u1', role: 'user' },
+  }])
+
+  assert.deepEqual(mapPluginEventRecordToPluginEvents(record, {
+    id: 'plugin-a',
+    event_subscriptions: ['CHAT_CHANGED'],
+    permissions: [],
+  }), [{
+    event: 'CHAT_CHANGED',
+    data: { messageId: 'm1', role: 'assistant', reason: 'writing_complete' },
+  }])
+})
+
 test('maps nested generic host plugin event records', () => {
   const record = {
     id: 43,
@@ -631,6 +670,12 @@ test('maps nested generic host plugin event records', () => {
   assert.deepEqual(mapPluginEventRecordToPluginEvents(record), [{
     event: 'MESSAGE_UPDATED',
     data: { messageId: 'm1' },
+  }, {
+    event: 'CHARACTER_MESSAGE_RENDERED',
+    data: { messageId: 'm1' },
+  }, {
+    event: 'CHAT_CHANGED',
+    data: { messageId: 'm1' },
   }])
 })
 
@@ -642,7 +687,7 @@ test('keeps existing pipeline event record mapping', () => {
 
   assert.deepEqual(
     mapPluginEventRecordToPluginEvents(record).map((event) => event.event),
-    ['pipeline.committed', 'committed', 'MESSAGE_RECEIVED'],
+    ['pipeline.committed', 'committed', 'MESSAGE_RECEIVED', 'CHARACTER_MESSAGE_RENDERED', 'CHAT_CHANGED'],
   )
 })
 
@@ -663,7 +708,10 @@ test('filters plugin events by declared subscriptions', () => {
     id: 'plugin-a',
     event_subscriptions: ['CHAT_CHANGED'],
     permissions: ['ReadMemory'],
-  }), [])
+  }), [{
+    event: 'CHAT_CHANGED',
+    data: { messageId: 'm1', content: 'secret' },
+  }])
 })
 
 test('redacts message content from subscribed plugins without ReadMemory', () => {
@@ -739,6 +787,54 @@ test('dispatches host events through storyforge.events and ST eventSource', () =
     ['storyforge', 's1'],
     ['st', 's1'],
   ])
+})
+
+test('dispatches authorized ST render and chat aliases without iframe re-deriving duplicates', () => {
+  const { window, postHostMessage } = createBridgeSandbox()
+  const calls = []
+
+  window.eventSource.on('MESSAGE_RECEIVED', (payload) => calls.push(['received', payload.messageId]))
+  window.eventSource.on('CHARACTER_MESSAGE_RENDERED', (payload) => calls.push(['rendered', window.SillyTavern.chat.at(-1).mes, payload.messageId]))
+  window.eventSource.on('CHAT_CHANGED', (payload) => calls.push(['changed', payload.reason]))
+
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'reply', reason: 'writing_complete' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'CHARACTER_MESSAGE_RENDERED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'reply', reason: 'writing_complete' },
+  })
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'CHAT_CHANGED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'reply', reason: 'writing_complete' },
+  })
+
+  assert.deepEqual(calls, [
+    ['received', 'node-ai'],
+    ['rendered', 'reply', 'node-ai'],
+    ['changed', 'writing_complete'],
+  ])
+})
+
+test('does not locally derive unauthorized ST aliases inside the plugin iframe', () => {
+  const { window, postHostMessage } = createBridgeSandbox()
+  const calls = []
+
+  window.eventSource.on('MESSAGE_RECEIVED', () => calls.push('received'))
+  window.eventSource.on('CHARACTER_MESSAGE_RENDERED', () => calls.push('rendered'))
+  window.eventSource.on('CHAT_CHANGED', () => calls.push('changed'))
+
+  postHostMessage({
+    type: MSG_EVENT,
+    event: 'MESSAGE_RECEIVED',
+    data: { messageId: 'node-ai', role: 'assistant', content: 'reply' },
+  })
+
+  assert.deepEqual(calls, ['received'])
 })
 
 test('syncs host message events into SillyTavern chat before plugin listeners run', async () => {
