@@ -3632,6 +3632,56 @@ mod tests {
         assert!(!tail_content.contains("LUNAR_VAULT_LORE"));
     }
 
+    #[test]
+    fn test_director_lore_both_route_enters_system_and_triggered_tail() {
+        use storyforge_domain::message_layout::MessageLayout;
+        use storyforge_domain::world_info::{
+            LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry,
+        };
+
+        let book = Arc::new(WorldInfoBook {
+            source: storyforge_domain::Source::Native,
+            entries: vec![WorldInfoEntry {
+                st_id: None,
+                keys: vec!["harbor".into()],
+                secondary_keys: vec![],
+                content: "BOTH_ROUTE_LORE".into(),
+                constant: true,
+                selective: true,
+                selective_logic: SelectiveLogic::And,
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Both,
+                extensions: serde_json::json!({}),
+            }],
+        });
+
+        let conv_store = {
+            let dir = std::env::temp_dir().join(format!("sf_both_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Arc::new(ConversationStore::new(dir))
+        };
+        let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
+
+        let system_extra = build_director_system_extra(&ctx);
+        let layout = MessageLayout::build()
+            .system(system_extra.as_str())
+            .tail(|_| build_director_tail("sail to the harbor", &ctx));
+        let msgs = layout.into_messages();
+        let tail_content = msgs.last().unwrap().content.as_str();
+
+        assert!(
+            system_extra.contains("BOTH_ROUTE_LORE"),
+            "Both route lore should enter stable Director system context: {system_extra}"
+        );
+        assert!(
+            tail_content.contains("BOTH_ROUTE_LORE"),
+            "Both route lore should also enter triggered Director tail: {tail_content}"
+        );
+    }
+
     // ─── 阶段 3：Director tail 消费 campaign_runtime 测试 ────────────────────
 
     /// 无 campaign_runtime 时，build_director_tail 仍用旧的扁平角色名

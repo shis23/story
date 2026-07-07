@@ -9570,6 +9570,41 @@ mod tests {
     }
 
     #[test]
+    fn stored_world_info_both_route_restores_constant_and_selective_semantics() {
+        let mut info = CharacterInfo::from(&make_test_character("Active Card"));
+        info.world_info_entries = vec![WorldInfoEntryInfo {
+            keys: vec!["harbor".into()],
+            content: "BOTH_ROUTE_LORE".into(),
+            constant: true,
+            route: "Both".into(),
+            is_global: false,
+            depth: 2,
+            order: 100,
+        }];
+
+        let stored = storage::StoredCharacter {
+            id: "active-card".into(),
+            info,
+            imported_at: "2026-07-07T00:00:00Z".into(),
+        };
+        let book = collect_world_info_for_active(&[stored], "Active Card");
+
+        let constant_contents: Vec<_> = book
+            .constant_entries()
+            .into_iter()
+            .map(|entry| entry.content.as_str())
+            .collect();
+        let triggered_contents: Vec<_> = book
+            .triggered_selective_entries("sail to the harbor")
+            .into_iter()
+            .map(|entry| entry.content.as_str())
+            .collect();
+
+        assert_eq!(constant_contents, vec!["BOTH_ROUTE_LORE"]);
+        assert_eq!(triggered_contents, vec!["BOTH_ROUTE_LORE"]);
+    }
+
+    #[test]
     fn character_info_and_restore_preserve_alternate_greetings() {
         let mut character = make_test_character("Greeter");
         character.first_mes = "default opening".into();

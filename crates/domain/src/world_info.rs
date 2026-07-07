@@ -179,7 +179,9 @@ impl WorldInfoEntry {
         let selective = st.selective;
         let position = st.position_as_i32();
 
-        let route = if constant {
+        let route = if constant && selective {
+            LoreRoute::Both
+        } else if constant {
             LoreRoute::Constant
         } else if selective {
             LoreRoute::Selective
@@ -417,6 +419,39 @@ mod tests {
         assert_eq!(
             contents(lore.search_by_keywords("castle forest crown decoy")),
             vec!["selective lore"]
+        );
+    }
+
+    #[test]
+    fn from_st_preserves_both_route_for_constant_and_selective_entries() {
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![crate::character::StWorldInfoEntry {
+                id: Some(7),
+                keys: vec!["harbor".into()],
+                secondary_keys: None,
+                content: Some("both route lore".into()),
+                constant: true,
+                selective: true,
+                selective_logic: Some(0),
+                position: None,
+                disable: None,
+                order: Some(42),
+                depth: Some(3),
+                extensions: serde_json::json!({ "source": "st" }),
+            }],
+            extra: Default::default(),
+        });
+
+        assert_eq!(lore.entries[0].route, LoreRoute::Both);
+        assert_eq!(
+            contents(lore.constant_entries()),
+            vec!["both route lore"],
+            "Both entries should stay in the director system context"
+        );
+        assert_eq!(
+            contents(lore.triggered_selective_entries("reach the harbor")),
+            vec!["both route lore"],
+            "Both entries should also remain keyword-triggerable"
         );
     }
 }
