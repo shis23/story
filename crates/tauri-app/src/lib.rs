@@ -1956,6 +1956,24 @@ struct PromptHookReply {
     error: Option<String>,
 }
 
+fn resolve_prompt_hook_pending(
+    pending: &PromptHookPendingMap,
+    request_id: &str,
+    messages: Option<Vec<ChatMessage>>,
+    error: Option<String>,
+) -> bool {
+    let sender = pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(request_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(PromptHookReply { messages, error });
+        true
+    } else {
+        false
+    }
+}
+
 fn frontend_prompt_hook(
     event_tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     pending: PromptHookPendingMap,
@@ -2017,14 +2035,7 @@ async fn plugin_prompt_hook_result(
     error: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
-    let sender = state
-        .prompt_hook_pending
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&request_id);
-    if let Some(sender) = sender {
-        let _ = sender.send(PromptHookReply { messages, error });
-    } else {
+    if !resolve_prompt_hook_pending(&state.prompt_hook_pending, &request_id, messages, error) {
         tracing::warn!("plugin_prompt_hook_result: unknown request_id {request_id}");
     }
     Ok(())
@@ -7670,6 +7681,170 @@ mod tests {
     use storyforge_domain::character::Character;
     use storyforge_domain::preset::{ST_REGEX_PLACEMENT_AI_OUTPUT, ST_REGEX_PLACEMENT_REASONING};
 
+    struct RecordingMockLlm {
+        responses: Mutex<std::collections::VecDeque<storyforge_domain::llm::ChatResponse>>,
+        requests: Mutex<Vec<storyforge_domain::llm::ChatRequest>>,
+    }
+
+    impl RecordingMockLlm {
+        fn new(responses: Vec<storyforge_domain::llm::ChatResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<storyforge_domain::llm::ChatRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+
+        fn clear_requests(&self) {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
+
+        fn next_response(&self) -> storyforge_domain::llm::ChatResponse {
+            self.responses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| storyforge_domain::llm::ChatResponse {
+                    content: "recording mock fallback response".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for RecordingMockLlm {
+        async fn chat(
+            &self,
+            req: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(req.clone());
+            Ok(self.next_response())
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &storyforge_domain::llm::ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(req.clone());
+            let response = self.next_response();
+            let _ = tx.send(storyforge_domain::llm::StreamChunk {
+                delta_content: Some(response.content.clone()),
+                delta_tool_calls: if response.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(response.tool_calls.clone())
+                },
+                finish_reason: Some("stop".into()),
+            });
+            Ok(response)
+        }
+    }
+
+    fn mock_chat_response(content: impl Into<String>) -> storyforge_domain::llm::ChatResponse {
+        storyforge_domain::llm::ChatResponse {
+            content: content.into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        }
+    }
+
+    fn command_prompt_hook_channel(
+        state: Arc<AppState>,
+        marker: &'static str,
+    ) -> tauri::ipc::Channel<WritingEvent> {
+        tauri::ipc::Channel::new(move |body| {
+            let event = body.deserialize::<WritingEvent>()?;
+            if event.event_type == "prompt_hook_request" {
+                let request_id = event
+                    .data
+                    .get("request_id")
+                    .and_then(|value| value.as_str())
+                    .expect("prompt hook request should include request_id");
+                let mut messages: Vec<ChatMessage> =
+                    serde_json::from_value(event.data["messages"].clone())
+                        .expect("prompt hook request should include messages");
+                messages.push(ChatMessage::user(marker));
+                assert!(
+                    resolve_prompt_hook_pending(
+                        &state.prompt_hook_pending,
+                        request_id,
+                        Some(messages),
+                        None,
+                    ),
+                    "pending prompt hook sender should be registered"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn state_with_recording_llm(llm: Arc<RecordingMockLlm>) -> Arc<AppState> {
+        let mut state = AppState::new_for_test();
+        state.mock_llm = llm as Arc<dyn LlmClient>;
+        let state = Arc::new(state);
+        {
+            let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            ctx.characters
+                .push(Arc::new(make_test_character("Seraphina")));
+        }
+        state
+    }
+
+    fn tauri_state_for_test(state: &Arc<AppState>) -> tauri::State<'_, Arc<AppState>> {
+        // Tauri State has no public constructor; command-level tests need the
+        // same wrapper type that invoke would provide around managed Arc state.
+        unsafe { std::mem::transmute::<&Arc<AppState>, tauri::State<'_, Arc<AppState>>>(state) }
+    }
+
+    fn plan_response_json() -> String {
+        serde_json::json!({
+            "scene_brief": "A compact command prompt hook test scene.",
+            "subagent_tasks": [
+                {
+                    "character_id": "Seraphina",
+                    "brief": "Perform a short beat.",
+                    "context_package": {
+                        "character_brief": "Seraphina, concise test character.",
+                        "scene_brief": "A compact command prompt hook test scene.",
+                        "relevant_lore": [],
+                        "constant_lore": [],
+                        "recent_window": [],
+                        "task": "Perform a short beat."
+                    }
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn any_recorded_request_contains_marker(llm: &RecordingMockLlm, marker: &str) -> bool {
+        llm.requests()
+            .iter()
+            .any(|req| req.messages.iter().any(|message| message.content == marker))
+    }
+
     struct FailingSerialize;
 
     impl Serialize for FailingSerialize {
@@ -7749,6 +7924,88 @@ mod tests {
         assert_eq!(hooked.len(), 2);
         assert_eq!(hooked[0].content, "plugin system");
         assert_eq!(hooked[1].content, "after hook");
+    }
+
+    #[tokio::test]
+    async fn start_writing_command_prompt_hook_messages_reach_mock_llm() {
+        let marker = "START_WRITING_COMMAND_HOOK_MARKER";
+        let llm = Arc::new(RecordingMockLlm::new(vec![
+            mock_chat_response(plan_response_json()),
+            mock_chat_response("Seraphina performs a short beat."),
+            mock_chat_response("Final draft from start_writing command."),
+        ]));
+        let app_state = state_with_recording_llm(llm.clone());
+        let channel = command_prompt_hook_channel(app_state.clone(), marker);
+
+        start_writing(
+            "Write a tiny command hook test scene.".into(),
+            None,
+            None,
+            None,
+            tauri_state_for_test(&app_state),
+            channel,
+        )
+        .await
+        .expect("start_writing should complete with recording mock LLM");
+
+        assert!(
+            any_recorded_request_contains_marker(&llm, marker),
+            "mock LLM should receive marker appended by command prompt hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerate_command_prompt_hook_messages_reach_mock_llm() {
+        let setup_marker = "REGENERATE_SETUP_HOOK_MARKER";
+        let regenerate_marker = "REGENERATE_COMMAND_HOOK_MARKER";
+        let llm = Arc::new(RecordingMockLlm::new(vec![
+            mock_chat_response(plan_response_json()),
+            mock_chat_response("Seraphina performs a short setup beat."),
+            mock_chat_response("Initial draft for regenerate command."),
+            mock_chat_response("Regenerated draft from command hook test."),
+        ]));
+        let app_state = state_with_recording_llm(llm.clone());
+
+        let setup = start_writing(
+            "Write setup text for regenerate.".into(),
+            None,
+            None,
+            None,
+            tauri_state_for_test(&app_state),
+            command_prompt_hook_channel(app_state.clone(), setup_marker),
+        )
+        .await
+        .expect("start_writing setup should complete");
+        let conversation_id = setup["conversation_id"]
+            .as_str()
+            .expect("start_writing result should include conversation_id")
+            .to_string();
+        let node_id = setup["node_id"]
+            .as_str()
+            .expect("start_writing result should include node_id")
+            .to_string();
+        llm.clear_requests();
+
+        regenerate(
+            RegenerateRequestDto {
+                conversation_id,
+                node_id,
+                targets: vec![RegenerateTargetDto {
+                    kind: "editor".into(),
+                }],
+                hint: Some("Keep it brief.".into()),
+                seed: None,
+            },
+            tauri_state_for_test(&app_state),
+            command_prompt_hook_channel(app_state.clone(), regenerate_marker),
+        )
+        .await
+        .expect("regenerate should complete with recording mock LLM");
+
+        assert!(
+            any_recorded_request_contains_marker(&llm, regenerate_marker),
+            "mock LLM should receive marker appended by regenerate command prompt hook"
+        );
     }
 
     #[tokio::test]
