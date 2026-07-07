@@ -2,15 +2,24 @@
 
 > 状态：2026-07-07 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用“理论通过”替代。
 
-> 自动化入口：`powershell -ExecutionPolicy Bypass -File scripts/verify-release.ps1`
+> 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
+> 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
 
 ## 0. 发布闸门
 
 任何候选版本必须满足：
 
-- `cargo clippy --workspace --all-targets -- -D warnings` 通过。
-- `cargo test --workspace` 通过。
-- `cd frontend && npm run build` 通过。
+自动化发布闸门必须通过 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 执行并通过。脚本按 fail-fast 顺序运行：
+
+1. `secret scan`：扫描 Git-tracked worktree 与 index 文件，只报告规则名和位置，不回显匹配行内容；排除 `target/**`、`node_modules/**`、`frontend/dist/**`、`.git/**`。
+2. `cargo fmt --check`。
+3. `cargo clippy --workspace --all-targets -- -D warnings`。
+4. `cargo test --workspace`。
+5. `cd frontend && npm.cmd test`。
+6. `cd frontend && npm.cmd run build`。
+
+- `-DryRun` 用于打印上述步骤和命令，不执行 secret scan、Cargo、npm 测试或构建。
+- `-SecretScanOnly` 用于快速执行第 1 步；通过后脚本停止，不继续运行格式化、Clippy、测试或构建。
 - release notes 明确列出仍需人工验证或降级的能力。
 - 用户数据目录、迁移、备份和排障路径已验证。
 - 本文件中未完成项不能伪装成已完成；允许标记为“延期/非阻塞”，但必须写明原因。
@@ -19,11 +28,15 @@
 
 2026-07-06 已验证：
 
+- 发布脚本当前覆盖 `secret scan`、`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`frontend npm.cmd test`、`frontend npm.cmd run build` 六步；候选版本应以脚本输出为准记录当次结果。
+- `secret scan`：覆盖 Git-tracked worktree 与 index 文件；排除 `target/**`、`node_modules/**`、`frontend/dist/**`、`.git/**`；命中时只记录规则名与位置，不写出匹配内容。
+- `cargo fmt --check`：作为 Rust 格式闸门。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过，作为 Rust warning-free 闸门。
 - `cargo test -p storyforge --lib`：通过。
 - `cargo test -p harness-real-llm`：确定性测试通过；真实 LLM 用例默认 ignore。
 - `cargo test --workspace`：通过；真实 LLM 用例按预期 ignore。
-- `frontend npm run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
+- `frontend npm.cmd test`：作为前端测试闸门。
+- `frontend npm.cmd run build`：通过；若出现 Vite dynamic/static import warning，按现有分包风险记录，不视为本轮阻塞。
 - CampaignStore 压测：Git Bash 用 `SF_STORE_PRESSURE_WRITES=500 cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture`；PowerShell 用 `$env:SF_STORE_PRESSURE_WRITES='500'; cargo test -p storyforge --lib pressure_sync_json_io -- --ignored --nocapture; Remove-Item Env:SF_STORE_PRESSURE_WRITES`。通过；本机 4 集合并发写入 500 次/集合，总耗时约 2.9s，p95 为 knowledge 6.6ms / tasks 7.4ms / summaries 6.8ms / mvu 8.5ms，max 约 28ms。
 - API key 安全存储相关测试：`cargo test -p storyforge-infra-util`、`cargo test -p storyforge --lib connection_store`、`cargo test -p storyforge --lib test_embed_config` 通过；覆盖新写入 SecretRef、旧明文迁移、运行时解析和删除清理。Windows Credential Manager 冒烟测试 `cargo test -p storyforge-infra-util system_keyring_write_read_delete_roundtrip -- --ignored --nocapture` 通过；`cargo check -p storyforge-infra-util --target aarch64-linux-android` 通过，Android 后端仍需真机写读删。
 - Tauri capability 权限收敛测试：`cargo test -p storyforge --test capabilities` 通过；`default.json` 已移除 `fs:default` / `dialog:default`，仅保留 dialog open/save/message/ask 与 fs read/write file，并静态校验前端文件 helper 与 capability 匹配。Android 真机导入/导出路径仍需手工回归。

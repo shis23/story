@@ -16,11 +16,19 @@
 
 ## 如何验证
 
-先跑自动化闸门：
+Windows 优先跑自动化发布闸门（包含 secret scan、cargo fmt、workspace clippy/tests、frontend test/build）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify-release.ps1
+```
+
+如需定位失败步骤，或在非 Windows 环境按项复跑基础命令：
 
 ```bash
+cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cd frontend && npm test
 cd frontend && npm run build
 ```
 
