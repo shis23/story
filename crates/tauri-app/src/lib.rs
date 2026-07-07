@@ -5327,24 +5327,40 @@ async fn meta_analyze_mvu_card(
         .map_err(|e| TauriCommandError::validation(format!("MVU 分析失败: {e}")))?;
 
     // 持久化到 CampaignStore
-    let store = get_campaign_store();
+    let analyzed_at = chrono::Utc::now().to_rfc3339();
     let stored = campaign_store::StoredMvuTranslation {
         source_character_id: character.id.clone(),
         character_name: character.name.clone(),
         translation: translation.clone(),
-        analyzed_at: chrono::Utc::now().to_rfc3339(),
+        analyzed_at: analyzed_at.clone(),
     };
-    store
-        .save_mvu(stored)
-        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    save_mvu_translation_async(get_campaign_store(), stored).await?;
 
     Ok(MvuTranslationDetailDto {
         source_character_id: character.id.as_str().to_string(),
         character_name: character.name.clone(),
-        analyzed_at: chrono::Utc::now().to_rfc3339(),
+        analyzed_at,
         translation,
         complexity: complexity_json,
     })
+}
+
+async fn save_mvu_translation_async(
+    store: &'static campaign_store::CampaignStore,
+    stored: campaign_store::StoredMvuTranslation,
+) -> Result<(), TauriCommandError> {
+    tokio::task::spawn_blocking(move || save_mvu_translation_to_store(store, stored))
+        .await
+        .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
+}
+
+fn save_mvu_translation_to_store(
+    store: &campaign_store::CampaignStore,
+    stored: campaign_store::StoredMvuTranslation,
+) -> Result<(), TauriCommandError> {
+    store
+        .save_mvu(stored)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
 }
 
 /// Tauri command: 列所有已分析的 MVU 翻译
@@ -7704,6 +7720,57 @@ mod tests {
 
         let reloaded = ConnectionStore::new_with_secret_store(&dir, secret_store);
         assert!(reloaded.active_connection().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_test_mvu_translation(
+        source_id: &str,
+        name: &str,
+        analyzed_at: &str,
+    ) -> campaign_store::StoredMvuTranslation {
+        campaign_store::StoredMvuTranslation {
+            source_character_id: Id::from_str(source_id),
+            character_name: name.into(),
+            translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(
+                vec![],
+            ),
+            analyzed_at: analyzed_at.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_mvu_translation_async_persists_and_replaces_existing() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_mvu_async_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: &'static campaign_store::CampaignStore =
+            Box::leak(Box::new(campaign_store::CampaignStore::new(&dir)));
+
+        save_mvu_translation_async(
+            store,
+            make_test_mvu_translation("src-mvu", "MVU 初版", "2026-07-07T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        save_mvu_translation_async(
+            store,
+            make_test_mvu_translation("src-mvu", "MVU 更新", "2026-07-07T00:00:01Z"),
+        )
+        .await
+        .unwrap();
+
+        let stored = store.get_mvu(&Id::from_str("src-mvu")).unwrap();
+        assert_eq!(stored.character_name, "MVU 更新");
+        assert_eq!(stored.analyzed_at, "2026-07-07T00:00:01Z");
+        assert_eq!(store.list_all_mvu().len(), 1);
+
+        let reloaded = campaign_store::CampaignStore::new(&dir);
+        let reloaded_stored = reloaded.get_mvu(&Id::from_str("src-mvu")).unwrap();
+        assert_eq!(reloaded_stored.character_name, "MVU 更新");
+        assert_eq!(reloaded_stored.analyzed_at, "2026-07-07T00:00:01Z");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
