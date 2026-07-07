@@ -6911,12 +6911,17 @@ fn export_campaign_st_cards(
 /// 包含 Campaign 元数据 + Instances + Definitions + Knowledge + Tasks + Summaries。
 #[tauri::command]
 fn export_campaign_bundle(campaign_id: String) -> Result<String, TauriCommandError> {
-    let store = get_campaign_store();
     let camp_id = Id::from_str(&campaign_id);
+    export_campaign_bundle_from_store(get_campaign_store(), camp_id)
+}
 
-    let campaign = store
-        .get_campaign(&camp_id)
-        .ok_or_else(|| TauriCommandError::not_found(format!("Campaign 不存在: {campaign_id}")))?;
+fn export_campaign_bundle_from_store(
+    store: &campaign_store::CampaignStore,
+    camp_id: Id,
+) -> Result<String, TauriCommandError> {
+    let campaign = store.get_campaign(&camp_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!("Campaign 不存在: {}", camp_id.as_str()))
+    })?;
 
     let stored_card = store.get_card(&campaign.card_id);
     let instances = store.list_instances(&camp_id);
@@ -7514,6 +7519,229 @@ mod tests {
             }
             other => panic!("expected internal serialization error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn export_campaign_bundle_includes_complete_campaign_state() {
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
+        use storyforge_domain::story_task::{StoryTask, TaskTrigger};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_export_bundle_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let card_id = Id::from_str("export-card");
+        let source_id = Id::from_str("export-source");
+        let campaign_id = Id::from_str("export-campaign");
+        let conversation_id = Id::from_str("export-conversation");
+        let def_a = Id::from_str("export-def-a");
+        let def_b = Id::from_str("export-def-b");
+        let instance_a = Id::from_str("export-instance-a");
+        let instance_b = Id::from_str("export-instance-b");
+        let knowledge_a = Id::from_str("export-knowledge-a");
+
+        let definitions = vec![
+            CharacterDefinition {
+                id: def_a.clone(),
+                card_id: card_id.clone(),
+                name: "Alpha".into(),
+                persona_prompt: "alpha persona".into(),
+                behavior_rules: "protect the key".into(),
+                base_backstory: vec!["Alpha found the sealed door.".into()],
+                group: Some("party".into()),
+                role_type: RoleType::Protagonist,
+                variable_schema: vec![],
+            },
+            CharacterDefinition {
+                id: def_b.clone(),
+                card_id: card_id.clone(),
+                name: "Beta".into(),
+                persona_prompt: "beta persona".into(),
+                behavior_rules: String::new(),
+                base_backstory: vec![],
+                group: Some("party".into()),
+                role_type: RoleType::Supporting,
+                variable_schema: vec![],
+            },
+        ];
+        let card = CharacterCard {
+            id: card_id.clone(),
+            name: "Export Bundle Card".into(),
+            source_character_id: source_id,
+            character_definitions: definitions.clone(),
+            raw_card_json: serde_json::json!({
+                "first_mes": "hello from export",
+                "alternate_greetings": ["alt export"]
+            }),
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: Some("ok".into()),
+        };
+        store.save_card(card).unwrap();
+
+        let mut campaign = Campaign::new(card_id.clone(), "Export Campaign");
+        campaign.id = campaign_id.clone();
+        campaign.conversation_id = Some(conversation_id.clone());
+        campaign.set_variable("story_clock", serde_json::json!("Day 9 - dusk"), 7);
+        store.save_campaign(campaign).unwrap();
+
+        let instances = vec![
+            CharacterInstance {
+                id: instance_a.clone(),
+                campaign_id: campaign_id.clone(),
+                definition_id: Some(def_a.clone()),
+                name: "Alpha".into(),
+                persona_override: Some("alpha override".into()),
+                behavior_override: None,
+                variables: vec![],
+                is_temporary: false,
+            },
+            CharacterInstance {
+                id: instance_b.clone(),
+                campaign_id: campaign_id.clone(),
+                definition_id: Some(def_b.clone()),
+                name: "Beta".into(),
+                persona_override: None,
+                behavior_override: Some("beta override".into()),
+                variables: vec![],
+                is_temporary: false,
+            },
+        ];
+        for instance in instances {
+            store.add_instance(instance).unwrap();
+        }
+
+        let mut knowledge = CharacterKnowledgeEntry::witnessed(
+            campaign_id.clone(),
+            instance_a.clone(),
+            "Alpha knows the door code",
+            4,
+        );
+        knowledge.id = knowledge_a.clone();
+        knowledge.pinned = true;
+        store.add_knowledge(vec![knowledge]).unwrap();
+
+        let mut task = StoryTask::user_planned(
+            campaign_id.clone(),
+            "Open the sealed door",
+            "Use the code later",
+            vec![TaskTrigger::TurnReminder { at_turn: 6 }],
+            5,
+        );
+        task.related_characters = vec![instance_a.clone(), instance_b.clone()];
+        store.add_task(task).unwrap();
+
+        store
+            .add_summary(RoundSummary {
+                id: Id::from_str("export-summary"),
+                campaign_id: campaign_id.clone(),
+                conversation_id: conversation_id.clone(),
+                turn: 5,
+                content: "Round five reached the sealed door.".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let bundle_json = export_campaign_bundle_from_store(&store, campaign_id.clone()).unwrap();
+        let bundle: CampaignBundle = serde_json::from_str(&bundle_json).unwrap();
+
+        assert_eq!(bundle.format_version, BUNDLE_FORMAT_VERSION);
+        assert_eq!(bundle.campaign.id, campaign_id);
+        assert_eq!(bundle.campaign.card_id, card_id);
+        assert_eq!(
+            bundle.campaign.conversation_id,
+            Some(conversation_id.clone())
+        );
+        assert_eq!(
+            bundle.campaign.get_variable("story_clock").unwrap(),
+            &serde_json::json!("Day 9 - dusk")
+        );
+
+        let exported_card = bundle.card.as_ref().unwrap();
+        assert_eq!(exported_card.id, card_id);
+        assert_eq!(
+            exported_card.source_character_id,
+            Id::from_str("export-source")
+        );
+        assert_eq!(
+            exported_card.extraction_status,
+            storyforge_domain::character::CharacterExtractionStatus::Extracted
+        );
+        assert_eq!(exported_card.extraction_message.as_deref(), Some("ok"));
+        let (first_mes, alternate_greetings) = raw_card_greetings(&exported_card.raw_card_json);
+        assert_eq!(first_mes, "hello from export");
+        assert_eq!(alternate_greetings, vec!["alt export"]);
+        assert_eq!(exported_card.character_definitions.len(), 2);
+        assert_eq!(bundle.definitions.len(), 2);
+        assert_eq!(bundle.definitions[0].id, def_a);
+        assert_eq!(
+            bundle.definitions[0].base_backstory[0],
+            "Alpha found the sealed door."
+        );
+
+        assert_eq!(bundle.instances.len(), 2);
+        assert_eq!(bundle.instances[0].definition_id, Some(def_a));
+        assert_eq!(
+            bundle.instances[0].persona_override.as_deref(),
+            Some("alpha override")
+        );
+        assert_eq!(bundle.instances[1].definition_id, Some(def_b));
+        assert_eq!(
+            bundle.instances[1].behavior_override.as_deref(),
+            Some("beta override")
+        );
+        assert_eq!(bundle.knowledge.len(), 1);
+        assert_eq!(bundle.knowledge[0].id, knowledge_a);
+        assert_eq!(bundle.knowledge[0].character_id, instance_a);
+        assert_eq!(
+            bundle.knowledge[0].knowledge_text,
+            "Alpha knows the door code"
+        );
+        assert_eq!(bundle.knowledge[0].turn_number, 4);
+        assert_eq!(bundle.knowledge[0].source, KnowledgeSource::Witnessed);
+        assert!(bundle.knowledge[0].pinned);
+        assert_eq!(bundle.tasks.len(), 1);
+        assert_eq!(bundle.tasks[0].title, "Open the sealed door");
+        assert_eq!(bundle.tasks[0].description, "Use the code later");
+        assert_eq!(
+            bundle.tasks[0].triggers,
+            vec![TaskTrigger::TurnReminder { at_turn: 6 }]
+        );
+        assert_eq!(
+            bundle.tasks[0].related_characters,
+            vec![Id::from_str("export-instance-a"), instance_b]
+        );
+        assert_eq!(bundle.summaries.len(), 1);
+        assert_eq!(bundle.summaries[0].conversation_id, conversation_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_campaign_bundle_reports_missing_campaign() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_export_bundle_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let err = export_campaign_bundle_from_store(&store, Id::from_str("missing-campaign"))
+            .expect_err("missing campaign should return not_found");
+
+        match err {
+            TauriCommandError::NotFound { message } => {
+                assert!(message.contains("missing-campaign"));
+            }
+            other => panic!("expected not_found error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
