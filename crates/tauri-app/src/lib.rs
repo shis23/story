@@ -6059,9 +6059,24 @@ fn create_campaign(
     opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
+    create_campaign_in_store(
+        get_campaign_store(),
+        state.conv_store.as_ref(),
+        card_id,
+        name,
+        opening_message,
+    )
+}
+
+fn create_campaign_in_store(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    card_id: String,
+    name: String,
+    opening_message: Option<String>,
+) -> Result<CampaignSummaryDto, TauriCommandError> {
     use storyforge_domain::conversation::Role as ConvRole;
 
-    let store = get_campaign_store();
     let card_id_value = Id::from_str(&card_id);
     if store.get_card(&card_id_value).is_none() {
         return Err(TauriCommandError::not_found(format!(
@@ -6072,14 +6087,12 @@ fn create_campaign(
     let mut campaign = storyforge_domain::campaign::Campaign::new(card_id_value, name);
 
     // 自动建对话并绑定到 Campaign
-    let conv = state
-        .conv_store
-        .create(Some(card_id.clone()), Some(campaign.id.clone()));
+    let conv = conv_store.create(Some(card_id.clone()), Some(campaign.id.clone()));
     campaign.conversation_id = Some(conv.id.clone());
     let (stored, campaign, instance_count) = match store.create_campaign_with_instances(campaign) {
         Ok(result) => result,
         Err(e) => {
-            if let Err(delete_err) = state.conv_store.delete(&conv.id) {
+            if let Err(delete_err) = conv_store.delete(&conv.id) {
                 tracing::warn!("创建 Campaign 失败后清理对话失败: {delete_err}");
             }
             return Err(TauriCommandError::storage(format!("存储写入失败: {e}")));
@@ -6089,10 +6102,7 @@ fn create_campaign(
     // 存开场白（从 CharacterStore 按 source_character_id 查扁平 Character greeting）
     if let Some(opening) =
         resolve_campaign_opening_message(&stored.card.source_character_id, opening_message)
-        && let Err(e) =
-            state
-                .conv_store
-                .append_final_message(&conv.id, ConvRole::Assistant, opening)
+        && let Err(e) = conv_store.append_final_message(&conv.id, ConvRole::Assistant, opening)
     {
         tracing::warn!("建 Campaign 时追加开场白失败: {e}");
     }
@@ -8208,6 +8218,48 @@ mod tests {
         let reloaded_card = reloaded.get_card_by_source(&character.id).unwrap();
         assert_eq!(reloaded_card.card.name, "Async Card Updated");
         assert_eq!(reloaded_card.card.character_definitions[0].name, "Second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_campaign_in_store_cleans_conversation_on_store_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_create_campaign_cleanup_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("Cleanup Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.character_definitions
+            .push(make_test_character_definition(
+                &card.id,
+                "cleanup-def",
+                "Cleanup",
+            ));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+        std::fs::create_dir_all(dir.join("instances.json")).unwrap();
+
+        let err = create_campaign_in_store(
+            &store,
+            &conv_store,
+            card_id,
+            "cleanup blocked".into(),
+            Some("opening line".into()),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("instances.json"),
+            "expected instances persist failure, got {err}"
+        );
+        assert!(store.list_campaigns().is_empty());
+        assert!(store.list_all_instances().is_empty());
+        assert!(conv_store.list().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
