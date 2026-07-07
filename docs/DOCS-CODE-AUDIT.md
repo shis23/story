@@ -235,8 +235,8 @@
 |---|---|---|---|
 | MVU-1 | 冻结通用插件扩张、划边界 | 已实现（文档层定边界） | `docs/PLAN-PLUGIN-MVU.md` |
 | MVU-2 | MVU Translation → variable schema diff 预览 | 已实现 | 预览逻辑 `MvuApplyPreview`/`compute_apply_preview` 存在；`meta_preview_mvu_apply` 命令 + 前端 `metaPreviewMvuApply` 已接 |
-| MVU-3 | 把 MVU schema patch apply 进 Campaign | 已实现 | `meta_apply_mvu_schema` 注册并算 preview+apply；W9 前接通 `tauri-api.js` + MetaPanel diff 展示 + 确认 apply |
-| MVU-4 | 原生状态栏从 Campaign 变量渲染 | 已实现 | `MvuStatusBar.vue` 渲染 bar/text/tag/icon；用于 `CharacterDetail.vue`（未进 `CampaignPanel`） |
+| MVU-3 | 把 MVU schema patch apply 进 Campaign | 已实现 | `meta_apply_mvu_schema` 注册并算 preview+apply；W9 前接通 `tauri-api.js` + MetaPanel diff 展示 + 确认 apply；`test_meta_apply_mvu_schema_backfills_all_campaign_instances_without_overwriting_values` 覆盖同一 definition 被多个 Campaign 引用时全部 backfill，且不覆盖已有 instance 变量值 |
+| MVU-4 | 原生状态栏渲染模型 | 部分 | `MvuStatusBar.vue` 渲染 bar/text/tag/icon；`mvuStatusBarModel.js` + `mvu-status-bar.test.mjs` 覆盖组件实际调用的 value/bar/icon/display fallback 与 JS fallback warning 状态；当前用于 `CharacterDetail.vue` 静态预览，Campaign 运行态变量接入与真实 UI 验收仍待跑 |
 | MVU-5 | 混合 JS fallback runtime（WebView） | 已实现 | `infra-plugin-host` 保留纯 `MvuRuntime`/DTO/事件协议，Tauri/WebView adapter 在 `tauri-app/src/mvu_webview_runtime.rs`；W10 DI 注入 pipeline 并在 postprocess 调 `execute_fragment`；harness 传 None 降级 |
 | MVU-6 | 插件权限/安全分层 | 部分 | `Permission` enum + `ensure_permission` 存在；未覆盖全部 5 计划层（无 `network_access` toggle 证据） |
 | ST-T1 | 定 ST V2/V3 导入保真范围 | 部分 | `from_st_card()` 覆盖所列字段；部分 checkbox 未结 |

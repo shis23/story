@@ -5716,6 +5716,14 @@ fn meta_apply_mvu_schema(
     definition_id: String,
 ) -> Result<(), TauriCommandError> {
     let store = get_campaign_store();
+    meta_apply_mvu_schema_in_store(store, source_character_id, definition_id)
+}
+
+fn meta_apply_mvu_schema_in_store(
+    store: &campaign_store::CampaignStore,
+    source_character_id: String,
+    definition_id: String,
+) -> Result<(), TauriCommandError> {
     let src_id = Id::from_str(&source_character_id);
     let def_id = Id::from_str(&definition_id);
 
@@ -5766,11 +5774,17 @@ fn meta_apply_mvu_schema(
     {
         apply_schema_to_definition(target_def, preview.merged_schema.clone());
     }
-    store
+    let updated_card = store
         .update_card(card.clone())
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
+    if updated_card.is_none() {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到要更新的 card: {}",
+            card.id
+        )));
+    }
 
-    // Best-effort：对已存在的 instances 补齐新变量。
+    // Best-effort：对已存在的 instances 补齐合并后 schema 中仍缺失的变量。
     // 注意：instance 与 definition 的关联是 definition_id，与 campaign 无关——
     // 一张卡的某个 definition 可能被多个 campaign 引用，全部都该 backfill。
     // 因此这里用 list_all_instances() 全量遍历，再按 definition_id 过滤。
@@ -5782,15 +5796,15 @@ fn meta_apply_mvu_schema(
             continue;
         }
         let mut updated = instance.clone();
-        let new_fields: Vec<_> = preview
-            .added_fields
+        let missing_fields: Vec<_> = preview
+            .merged_schema
             .iter()
             .filter(|f| !updated.variables.iter().any(|v| v.key == f.key))
             .collect();
-        if new_fields.is_empty() {
+        if missing_fields.is_empty() {
             continue;
         }
-        for field in new_fields {
+        for field in missing_fields {
             use storyforge_domain::variables::VariableValue;
             updated.variables.push(VariableValue::new(
                 field.key.clone(),
@@ -8705,6 +8719,21 @@ mod tests {
         }
     }
 
+    fn test_variable_field(
+        key: &str,
+        label: &str,
+        default: serde_json::Value,
+    ) -> storyforge_domain::variables::VariableField {
+        storyforge_domain::variables::VariableField {
+            key: key.into(),
+            label: label.into(),
+            value_type: storyforge_domain::variables::VariableType::Int,
+            default,
+            description: None,
+            group: Some("status".into()),
+        }
+    }
+
     #[test]
     fn test_card_summary_treats_fallback_as_not_extracted() {
         let character = make_test_character("Fallback Card");
@@ -8875,6 +8904,119 @@ mod tests {
                 .iter()
                 .any(|def| &def.id == definition_id)
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_meta_apply_mvu_schema_backfills_all_campaign_instances_without_overwriting_values() {
+        use storyforge_domain::campaign::Campaign;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_mvu_apply_backfill_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let character = make_test_character("MVU Apply Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        let mut definition = make_test_character_definition(&card.id, "mvu-apply-def", "Hero");
+        definition.variable_schema = vec![test_variable_field("hp", "HP", serde_json::json!(100))];
+        card.character_definitions.push(definition.clone());
+        store.save_card(card.clone()).unwrap();
+
+        store
+            .save_mvu(campaign_store::StoredMvuTranslation {
+                source_character_id: character.id.clone(),
+                character_name: character.name.clone(),
+                translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(
+                    vec![
+                        test_variable_field("hp", "Hit Points", serde_json::json!(200)),
+                        test_variable_field("mana", "Mana", serde_json::json!(30)),
+                    ],
+                ),
+                analyzed_at: "2026-07-07T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        let campaign_a = Campaign::new(card.id.clone(), "Campaign A");
+        let campaign_a_id = campaign_a.id.clone();
+        let (_, campaign_a, _) = store.create_campaign_with_instances(campaign_a).unwrap();
+        let campaign_b = Campaign::new(card.id.clone(), "Campaign B");
+        let campaign_b_id = campaign_b.id.clone();
+        let (_, campaign_b, _) = store.create_campaign_with_instances(campaign_b).unwrap();
+
+        let mut instance_a = store.list_instances(&campaign_a.id).remove(0);
+        let hp = instance_a
+            .variables
+            .iter_mut()
+            .find(|value| value.key == "hp")
+            .unwrap();
+        hp.value = serde_json::json!(42);
+        hp.last_updated_turn = 9;
+        store.update_instance(instance_a.clone()).unwrap();
+
+        let mut instance_b = store.list_instances(&campaign_b.id).remove(0);
+        instance_b.variables.retain(|value| value.key != "hp");
+        store.update_instance(instance_b).unwrap();
+
+        meta_apply_mvu_schema_in_store(
+            &store,
+            character.id.as_str().to_string(),
+            definition.id.as_str().to_string(),
+        )
+        .unwrap();
+
+        let updated_card = store.get_card(&card.id).unwrap().card;
+        let updated_def = updated_card
+            .character_definitions
+            .iter()
+            .find(|def| def.id == definition.id)
+            .unwrap();
+        let hp_schema = updated_def
+            .variable_schema
+            .iter()
+            .find(|field| field.key == "hp")
+            .unwrap();
+        assert_eq!(hp_schema.label, "Hit Points");
+        assert_eq!(hp_schema.default, serde_json::json!(200));
+        assert!(
+            updated_def
+                .variable_schema
+                .iter()
+                .any(|field| field.key == "mana" && field.default == serde_json::json!(30))
+        );
+
+        for campaign_id in [campaign_a_id, campaign_b_id] {
+            let instance = store.list_instances(&campaign_id).remove(0);
+            assert_eq!(instance.definition_id.as_ref(), Some(&definition.id));
+            let mana = instance
+                .variables
+                .iter()
+                .find(|value| value.key == "mana")
+                .unwrap();
+            assert_eq!(mana.value, serde_json::json!(30));
+            assert_eq!(mana.last_updated_turn, 0);
+        }
+
+        let preserved = store.list_instances(&campaign_a.id).remove(0);
+        let preserved_hp = preserved
+            .variables
+            .iter()
+            .find(|value| value.key == "hp")
+            .unwrap();
+        assert_eq!(preserved_hp.value, serde_json::json!(42));
+        assert_eq!(preserved_hp.last_updated_turn, 9);
+
+        let restored = store.list_instances(&campaign_b.id).remove(0);
+        let restored_hp = restored
+            .variables
+            .iter()
+            .find(|value| value.key == "hp")
+            .unwrap();
+        assert_eq!(restored_hp.value, serde_json::json!(200));
+        assert_eq!(restored_hp.last_updated_turn, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

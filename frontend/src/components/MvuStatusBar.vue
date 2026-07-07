@@ -10,7 +10,15 @@
  *
  * 零 JS：纯数据绑定，不跑卡的脚本。
  */
-import { computed } from 'vue'
+import {
+  getMvuValue,
+  hasMvuFallbackWarning,
+  mvuBarColor,
+  mvuBarPercent,
+  mvuDisplayValue,
+  mvuIconFor,
+  toMvuNumber,
+} from '../utils/mvuStatusBarModel.js'
 
 const props = defineProps({
   /** MvuTranslation.ui_bindings */
@@ -26,46 +34,43 @@ const props = defineProps({
 
 // 变量值查表：key -> value
 function getValue(key) {
-  const v = props.variables.find(x => x.key === key)
-  return v ? v.value : null
+  return getMvuValue(props.variables, key)
 }
 
 // 数字化（容错：字符串/数字都转）
 function toNum(v) {
-  if (v == null) return 0
-  const n = Number(v)
-  return isNaN(n) ? 0 : n
+  return toMvuNumber(v)
 }
 
 // bar 进度百分比（0-100），max 默认 100
 function barPercent(binding) {
-  const val = toNum(getValue(binding.variable_key))
-  const max = binding.display?.max ?? 100
-  if (max <= 0) return 0
-  return Math.max(0, Math.min(100, (val / max) * 100))
+  return mvuBarPercent(binding, props.variables)
 }
 
 // bar 颜色：按百分比分级（>50 绿 / 25-50 黄 / <25 红）
 function barColor(percent) {
-  if (percent > 50) return 'bg-ok'
-  if (percent > 25) return 'bg-warn'
-  return 'bg-err'
+  return mvuBarColor(percent)
 }
 
 // icon 映射查找
 function iconFor(binding) {
-  const val = getValue(binding.variable_key)
-  const mapping = binding.display?.mapping || {}
-  const key = String(val)
-  return mapping[key] || mapping['_default'] || '·'
+  return mvuIconFor(binding, props.variables, '·')
+}
+
+function displayValue(key) {
+  return mvuDisplayValue(props.variables, key)
+}
+
+function showFallbackWarning() {
+  return hasMvuFallbackWarning(props.fallbackCount)
 }
 </script>
 
 <template>
-  <div v-if="uiBindings.length > 0 || fallbackCount > 0" class="mvu-status-bar bg-surface/60 rounded-lg border border-line p-2.5 space-y-1.5">
+  <div v-if="uiBindings.length > 0 || showFallbackWarning()" class="mvu-status-bar bg-surface/60 rounded-lg border border-line p-2.5 space-y-1.5">
     <div class="flex items-center justify-between">
       <span class="text-[10px] font-medium text-ink-soft uppercase tracking-wide">状态栏</span>
-      <span v-if="fallbackCount > 0" class="text-[10px] text-warn" title="此卡含未翻译 JS，完整渲染需共享 WebView（下一轮实现）">
+      <span v-if="showFallbackWarning()" class="text-[10px] text-warn" title="此卡含未翻译 JS，完整渲染需共享 WebView（下一轮实现）">
         ⚠ {{ fallbackCount }} 项需 WebView
       </span>
     </div>
@@ -94,14 +99,14 @@ function iconFor(binding) {
         <!-- text：纯文本 -->
         <template v-else-if="b.display?.kind === 'text'">
           <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
-          <span class="text-ink flex-1 truncate">{{ getValue(b.variable_key) ?? '—' }}</span>
+          <span class="text-ink flex-1 truncate">{{ displayValue(b.variable_key) }}</span>
         </template>
 
         <!-- tag：标签 -->
         <template v-else-if="b.display?.kind === 'tag'">
           <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
           <span class="px-1.5 py-0.5 rounded-full bg-accent-soft text-accent text-[10px]">
-            {{ getValue(b.variable_key) ?? '—' }}
+            {{ displayValue(b.variable_key) }}
           </span>
         </template>
 
@@ -114,7 +119,7 @@ function iconFor(binding) {
         <!-- 兜底（未知 display） -->
         <template v-else>
           <span class="text-ink-soft w-14 sm:w-16 shrink-0 truncate">{{ b.variable_key }}</span>
-          <span class="text-ink flex-1 truncate">{{ getValue(b.variable_key) ?? '—' }}</span>
+          <span class="text-ink flex-1 truncate">{{ displayValue(b.variable_key) }}</span>
         </template>
       </div>
     </div>
