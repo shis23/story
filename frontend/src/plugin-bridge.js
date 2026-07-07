@@ -258,6 +258,9 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   const _eventTypes = ${JSON.stringify(ST_EVENT_TYPES)};
   const _eventListeners = {};
   const _slashCommands = [];
+  const _chat = [];
+  const _macros = {};
+  const _tools = {};
   const _hostOrigin = ${JSON.stringify(targetOrigin)};
   const _uiSlotAliases = {
     slash_command: 'slash',
@@ -640,6 +643,104 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return current;
   }
 
+  function _normalizeChatMessage(message, index) {
+    const source = message && typeof message === 'object' ? message : {};
+    const normalized = Object.assign({}, source);
+    normalized.message_id = source.message_id ?? source.id ?? index;
+    normalized.message = source.message ?? source.mes ?? '';
+    normalized.mes = source.mes ?? normalized.message;
+    return normalized;
+  }
+
+  function _getLastMessageId() {
+    return _chat.length - 1;
+  }
+
+  function _getChatMessages(messageId) {
+    const numericId = messageId === undefined || messageId === null || messageId === ''
+      ? null
+      : Number(messageId);
+    const end = Number.isInteger(numericId) ? Math.min(numericId, _chat.length - 1) : _chat.length - 1;
+    if (end < 0) return [];
+    return _chat.slice(0, end + 1).map(_normalizeChatMessage);
+  }
+
+  function _setChatMessage(message, messageId) {
+    const id = Number.isInteger(messageId) ? messageId : Number(messageId);
+    if (!Number.isFinite(id) || id < 0) return Promise.resolve(false);
+    const patch = message && typeof message === 'object' ? message : { message: String(message ?? '') };
+    const current = _chat[id] && typeof _chat[id] === 'object' ? _chat[id] : {};
+    const next = Object.assign({}, current, patch, { message_id: id });
+    if ('message' in patch && !('mes' in patch)) next.mes = patch.message;
+    if ('mes' in patch && !('message' in patch)) next.message = patch.mes;
+    _chat[id] = next;
+    return Promise.resolve(true);
+  }
+
+  function _setChatMessages(messages) {
+    const updates = Array.isArray(messages) ? messages : [messages];
+    updates.forEach(function(update) {
+      if (!update || typeof update !== 'object') return;
+      const id = update.message_id ?? update.id;
+      _setChatMessage(update, Number(id));
+    });
+    return Promise.resolve(true);
+  }
+
+  function _saveChat() {
+    return Promise.resolve(true);
+  }
+
+  function _callGenericPopup(html, type, defaultValue) {
+    if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
+    return Promise.resolve('');
+  }
+
+  function _getRequestHeaders() {
+    return { 'Content-Type': 'application/json' };
+  }
+
+  function _registerMacro(name, callback) {
+    if (typeof name === 'string' && name) {
+      _macros[name] = typeof callback === 'function' ? callback : function() { return ''; };
+    }
+    return callback;
+  }
+
+  function _unregisterMacro(name) {
+    delete _macros[name];
+  }
+
+  function _getContext() {
+    return {
+      chat: _chat,
+      name1: window.SillyTavern?.name1 || 'User',
+      name2: window.SillyTavern?.name2 || 'Assistant',
+      characters: [],
+      groups: [],
+      extensionSettings: window.extension_settings,
+      extension_settings: window.extension_settings,
+    };
+  }
+
+  function _createToolManager() {
+    return {
+      tools: _tools,
+      registerTool: function(tool) {
+        if (tool && typeof tool === 'object' && tool.name) {
+          _tools[tool.name] = tool;
+        }
+        return tool;
+      },
+      unregisterTool: function(name) {
+        delete _tools[name];
+      },
+      getTool: function(name) {
+        return _tools[name];
+      },
+    };
+  }
+
   function _createTavernHelper() {
     const onGenerateBeforeCombinePrompts = (callback) => window.storyforge.events.on(_eventTypes.GENERATE_BEFORE_COMBINE_PROMPTS, callback);
     const onChatCompletionPromptReady = (callback) => window.storyforge.events.on(_eventTypes.CHAT_COMPLETION_PROMPT_READY, callback);
@@ -655,6 +756,11 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       insertOrAssignVariables: _insertOrAssignVariables,
       replaceVariables: _replaceVariables,
       updateVariablesWith: _updateVariablesWith,
+      getChatMessages: _getChatMessages,
+      setChatMessages: _setChatMessages,
+      getLastMessageId: _getLastMessageId,
+      setChatMessage: _setChatMessage,
+      getContext: _getContext,
       eventOn: (eventName, callback) => window.storyforge.events.on(eventName, callback),
       eventOnce: (eventName, callback) => window.storyforge.events.once(eventName, callback),
       eventOff: (eventName, callback) => window.storyforge.events.off(eventName, callback),
@@ -675,6 +781,32 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       storageGet: (key) => window.storyforge.storage.get(key),
       storageSet: (key, value) => window.storyforge.storage.set(key, value),
       generate: (prompt) => window.storyforge.llm.generate(prompt),
+      saveChat: _saveChat,
+      callGenericPopup: _callGenericPopup,
+      getRequestHeaders: _getRequestHeaders,
+      registerMacro: _registerMacro,
+      unregisterMacro: _unregisterMacro,
+    };
+  }
+
+  function _createSillyTavern() {
+    return {
+      chat: _chat,
+      name1: 'User',
+      name2: 'Assistant',
+      POPUP_TYPE: {
+        INPUT: 'input',
+        CONFIRM: 'confirm',
+        TEXT: 'text',
+        DISPLAY: 'display',
+      },
+      getContext: _getContext,
+      saveChat: _saveChat,
+      callGenericPopup: _callGenericPopup,
+      getRequestHeaders: _getRequestHeaders,
+      ToolManager: _createToolManager(),
+      registerMacro: _registerMacro,
+      unregisterMacro: _unregisterMacro,
     };
   }
 
@@ -774,6 +906,14 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   };
   window.TavernHelper = window.TavernHelper || _createTavernHelper();
   window.tavernHelper = window.TavernHelper;
+  window.SillyTavern = window.SillyTavern || _createSillyTavern();
+  if (!Array.isArray(window.SillyTavern.chat)) window.SillyTavern.chat = _chat;
+  window.SillyTavern.chat = window.SillyTavern.chat || _chat;
+  window.SillyTavern.saveChat = window.SillyTavern.saveChat || _saveChat;
+  window.SillyTavern.callGenericPopup = window.SillyTavern.callGenericPopup || _callGenericPopup;
+  window.SillyTavern.getRequestHeaders = window.SillyTavern.getRequestHeaders || _getRequestHeaders;
+  window.SillyTavern.getContext = window.SillyTavern.getContext || _getContext;
+  window.SillyTavern.ToolManager = window.SillyTavern.ToolManager || _createToolManager();
   window.getVariables = window.getVariables || window.TavernHelper.getVariables;
   window.setVariables = window.setVariables || window.TavernHelper.setVariables;
   window.getVariable = window.getVariable || window.TavernHelper.getVariable;
@@ -781,6 +921,13 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   window.insertOrAssignVariables = window.insertOrAssignVariables || window.TavernHelper.insertOrAssignVariables;
   window.replaceVariables = window.replaceVariables || window.TavernHelper.replaceVariables;
   window.updateVariablesWith = window.updateVariablesWith || window.TavernHelper.updateVariablesWith;
+  window.getChatMessages = window.getChatMessages || window.TavernHelper.getChatMessages;
+  window.setChatMessages = window.setChatMessages || window.TavernHelper.setChatMessages;
+  window.getLastMessageId = window.getLastMessageId || window.TavernHelper.getLastMessageId;
+  window.setChatMessage = window.setChatMessage || window.TavernHelper.setChatMessage;
+  window.getContext = window.getContext || window.TavernHelper.getContext;
+  window.registerMacro = window.registerMacro || window.TavernHelper.registerMacro;
+  window.unregisterMacro = window.unregisterMacro || window.TavernHelper.unregisterMacro;
   window.saveSettingsDebounced = window.saveSettingsDebounced || function() {};
 
   function _call(method, params) {

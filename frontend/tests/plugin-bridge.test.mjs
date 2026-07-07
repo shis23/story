@@ -960,6 +960,53 @@ test('provides TavernHelper aliases for common ST plugin APIs', async () => {
   assert.equal(typeof variablePromise.then, 'function')
 })
 
+test('provides SillyTavern globals and chat message helpers for ST compatibility', async () => {
+  const { window, postedMessages } = createBridgeSandbox()
+  const readyMessageCount = postedMessages.length
+
+  assert.equal(typeof window.SillyTavern, 'object')
+  assert.equal(window.SillyTavern.chat, window.SillyTavern.getContext().chat)
+  assert.equal(window.getChatMessages, window.TavernHelper.getChatMessages)
+  assert.equal(window.setChatMessages, window.TavernHelper.setChatMessages)
+  assert.equal(window.getLastMessageId, window.TavernHelper.getLastMessageId)
+  assert.equal(window.setChatMessage, window.TavernHelper.setChatMessage)
+  assert.equal(typeof window.SillyTavern.saveChat, 'function')
+  assert.equal(typeof window.SillyTavern.callGenericPopup, 'function')
+  assert.equal(typeof window.SillyTavern.getRequestHeaders, 'function')
+  assert.equal(typeof window.SillyTavern.ToolManager.registerTool, 'function')
+  assert.equal(typeof window.registerMacro, 'function')
+  assert.equal(typeof window.unregisterMacro, 'function')
+
+  window.SillyTavern.chat.push({ name: 'User', mes: 'hello' })
+  window.SillyTavern.chat.push({ name: 'Assistant', message: 'old reply' })
+
+  assert.equal(window.getLastMessageId(), 1)
+  assert.equal(window.getChatMessages('0').length, 1)
+  assert.deepEqual(plain(window.getChatMessages(1)), [
+    { name: 'User', mes: 'hello', message_id: 0, message: 'hello' },
+    { name: 'Assistant', message: 'old reply', message_id: 1, mes: 'old reply' },
+  ])
+
+  assert.equal(await window.setChatMessages([{ message_id: 1, message: 'new reply' }]), true)
+  assert.equal(window.SillyTavern.chat[1].mes, 'new reply')
+  assert.equal(await window.setChatMessage({ variables: { hp: 5 } }, 1), true)
+  assert.deepEqual(plain(window.SillyTavern.chat[1].variables), { hp: 5 })
+  assert.equal(await window.SillyTavern.saveChat(), true)
+  assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
+  assert.deepEqual(plain(window.SillyTavern.getRequestHeaders()), { 'Content-Type': 'application/json' })
+
+  const macro = () => 'macro-value'
+  window.registerMacro('mvu', macro)
+  assert.equal(window.SillyTavern.getContext().chat.length, 2)
+
+  const tool = { name: 'mvu-tool', call: () => 'ok' }
+  assert.equal(window.SillyTavern.ToolManager.registerTool(tool), tool)
+  assert.equal(window.SillyTavern.ToolManager.getTool('mvu-tool'), tool)
+  window.SillyTavern.ToolManager.unregisterTool('mvu-tool')
+  assert.equal(window.SillyTavern.ToolManager.getTool('mvu-tool'), undefined)
+  assert.equal(postedMessages.length, readyMessageCount)
+})
+
 test('chains TavernHelper eventEmitAndWait returned payloads in listener order', async () => {
   const { window } = createBridgeSandbox()
   const calls = []
