@@ -208,3 +208,43 @@ test('MVU iframe shim keeps legacy non-strict script semantics without exposing 
     privateStillHidden: 'undefined',
   })
 })
+
+test('MVU iframe shim blocks remote jquery load without failing asset bootstrap', () => {
+  const { listeners, postedMessages } = createShimSandbox()
+
+  listeners.message({
+    data: {
+      type: 'mvu:load_assets',
+      html: '<main id="card"></main>',
+      js: [
+        '$("body").load("https://testingcf.jsdelivr.net/storyforge/probe.html", function(_html, status) {',
+        '  variables.remoteLoadStatus = status;',
+        '});',
+        'variables.assetsContinued = true;',
+      ].join('\n'),
+    },
+  })
+
+  const loaded = postedMessages.at(-1).message
+  assert.equal(loaded.type, 'mvu:assets_loaded')
+  assert.equal(loaded.error, undefined)
+
+  listeners.message({
+    data: {
+      type: 'mvu:execute',
+      request_id: 'req-blocked-load',
+      variables: {},
+      fragment_js: [
+        'variables.remoteLoadStatusSeen = variables.remoteLoadStatus;',
+        'variables.assetsContinuedSeen = variables.assetsContinued;',
+      ].join('\n'),
+    },
+  })
+
+  const result = postedMessages.at(-1).message
+  assert.equal(result.type, 'mvu:execute_result')
+  assert.deepEqual(plain(result.variable_updates), {
+    remoteLoadStatusSeen: 'error',
+    assetsContinuedSeen: true,
+  })
+})

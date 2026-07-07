@@ -95,6 +95,15 @@ function W(els) {
     if (v === undefined) return a.length ? a[0].innerHTML : '';
     a.forEach(function(e) { e.innerHTML = v; }); return a;
   };
+  a.load = function(url, data, complete) {
+    var callback = typeof data === 'function' ? data : complete;
+    console.warn('[MVU] blocked jquery load:', String(url || ''));
+    if (typeof callback === 'function') {
+      try { callback.call(a[0] || null, '', 'error', null); }
+      catch (err) { console.error('[MVU] jquery load callback error:', err); }
+    }
+    return a;
+  };
   a.css = function(p, v) {
     if (typeof p === 'string' && v !== undefined) { a.forEach(function(e) { e.style[p] = v; }); return a; }
     if (typeof p === 'object') { a.forEach(function(e) { for (var k in p) e.style[k] = p[k]; }); return a; }
