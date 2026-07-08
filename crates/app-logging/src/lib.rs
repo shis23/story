@@ -241,8 +241,13 @@ impl LogStore {
     pub fn new(log_dir: PathBuf) -> Self {
         // 确保目录存在
         std::fs::create_dir_all(&log_dir).ok();
+        let mut buffer = LogBuffer::new();
+        // P1-2 修复：启动时回填历史日志。原实现只建空内存缓冲，跨会话历史全丢，
+        // 调试面板看不到之前的日志。这里读取 log_dir/*.jsonl 按行反序列化后 push，
+        // 文件按日期升序读取（旧→新），保证最新条目最后入队、LRU 截断时保留最近。
+        backfill_from_dir(&mut buffer, &log_dir);
         Self {
-            buffer: Mutex::new(LogBuffer::new()),
+            buffer: Mutex::new(buffer),
             persist_lock: Mutex::new(()),
             log_dir,
         }
@@ -314,6 +319,47 @@ impl LogStore {
                         let _ = std::fs::remove_file(entry.path());
                     }
                 }
+            }
+        }
+    }
+}
+
+/// 启动时回填历史日志（P1-2）。
+///
+/// 读取 `log_dir/*.jsonl`，每行反序列化为 `LogEntry` 后 push 进 buffer。
+/// 文件按文件名（=日期 YYYY-MM-DD）升序排序后依次读取，保证旧条目先入队、
+/// 新条目后入队——LRU 截断（每类 MAX_ENTRIES_PER_KIND=2000）会淘汰最旧条目，
+/// 从而保留最近会话的历史。解析失败的行跳过（容错）。
+fn backfill_from_dir(buffer: &mut LogBuffer, log_dir: &std::path::Path) {
+    let read_dir = match std::fs::read_dir(log_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    // 收集 *.jsonl 文件名并按日期升序排序（文件名=YYYY-MM-DD，字典序=时间序）
+    let mut files: Vec<String> = read_dir
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .filter(|n| n.ends_with(".jsonl"))
+                .map(|s| s.to_string())
+        })
+        .collect();
+    files.sort();
+    for name in files {
+        let path = log_dir.join(&name);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<LogEntry>(line) {
+                Ok(entry) => buffer.push(entry),
+                // 容错：损坏/不兼容的行跳过，不阻断回填
+                Err(_) => continue,
             }
         }
     }
@@ -650,6 +696,71 @@ mod tests {
         assert_eq!(messages.len(), threads * per_thread);
         assert!(messages.contains("thread-0-entry-0"));
         assert!(messages.contains(&format!("thread-{}-entry-{}", threads - 1, per_thread - 1)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-2：LogStore::new 应回填磁盘 jsonl 历史，否则跨会话日志全丢、调试面板空白。
+    #[test]
+    fn test_log_store_backfills_history_on_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_log_backfill_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 模拟上一会话落盘的 3 条历史日志（直接写 jsonl，模拟 persist_entry 产物）
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let log_path = dir.join(format!("{date}.jsonl"));
+        let mut content = String::new();
+        let entries = vec![
+            make_entry(LogKind::LlmCall, LogLevel::Info, "old-call-1"),
+            make_entry(LogKind::LlmCall, LogLevel::Info, "old-call-2"),
+            make_entry(LogKind::Backend, LogLevel::Error, "old-error"),
+        ];
+        for e in &entries {
+            content.push_str(&serde_json::to_string(e).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(&log_path, content).unwrap();
+
+        // 新建 LogStore（模拟重启）应回填这 3 条
+        let store = LogStore::new(dir.clone());
+        let all = store.query(&LogFilter::default());
+        let messages: HashSet<String> = all.iter().map(|e| e.message.clone()).collect();
+        assert!(messages.contains("old-call-1"), "应回填 LlmCall 历史");
+        assert!(messages.contains("old-call-2"), "应回填 LlmCall 历史");
+        assert!(messages.contains("old-error"), "应回填 Backend Error 历史");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-2：损坏的 jsonl 行不应阻断回填（容错）。
+    #[test]
+    fn test_log_store_backfill_skips_corrupt_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_log_corrupt_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let log_path = dir.join(format!("{date}.jsonl"));
+        let good = make_entry(LogKind::LlmCall, LogLevel::Info, "good-line");
+        let good_json = serde_json::to_string(&good).unwrap();
+        // 混入损坏行
+        std::fs::write(
+            &log_path,
+            format!("{good_json}\nTHIS_IS_NOT_JSON\n{good_json}\n"),
+        )
+        .unwrap();
+
+        let store = LogStore::new(dir.clone());
+        let all = store.query(&LogFilter::default());
+        let count = all
+            .iter()
+            .filter(|e| e.message == "good-line")
+            .count();
+        assert_eq!(count, 2, "损坏行应被跳过,两条有效行应回填");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
