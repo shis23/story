@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import BaseDropdown from './base/BaseDropdown.vue'
 import RichContent from './RichContent.vue'
+import { subagentRolesFromProvenance } from '../utils/pipelineTrace.js'
 
 const props = defineProps({
   message: { type: Object, required: true },
@@ -40,14 +41,7 @@ const variantCount = computed(() => props.message.variants.length)
 
 // 从 Provenance 提取可重 roll 的子 Agent 角色名列表
 const subagentRoles = computed(() => {
-  const prov = currentVariant.value?.provenance
-  if (!prov?.subagent_results) return []
-  return prov.subagent_results
-    .filter(s => s.character_id)
-    .map(s => ({
-      id: s.character_id,        // 稳定 ID，用于 reroll target
-      label: s.display_name || s.character_id,  // 显示名
-    }))
+  return subagentRolesFromProvenance(currentVariant.value?.provenance)
 })
 
 function switchVariant(delta) {
