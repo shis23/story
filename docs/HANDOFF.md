@@ -15,9 +15,14 @@
 - UI smoke runner 已加入：`scripts/run-ui-smoke.ps1` 与 `frontend` 的 `npm run smoke:ui` 会在本机已有 `@playwright/test` 时跑浏览器级冒烟；当前环境缺少 Playwright 时会写 `artifacts/ui-smoke/SKIPPED.txt`，不能替代真实 Tauri 桌面 UI 证据。
 - 自动化发布基线已建立：`scripts/verify-release.ps1` 覆盖 secret scan、cargo fmt、workspace clippy/tests、frontend test/build；上次完整非沙箱 release gate 已通过，Vite dynamic/static import warning 仍按既有风险记录。
 - Android 仍处于打磨阶段：arm64-v8a debug/release 构建链路已有记录，但真机安装、文件导入、share/save sheet、Android keyring 和长会话稳定性仍需现场验收。
-- 真实 LLM 仍需发布候选实跑：确定性 harness 已通过，真实 LLM ignore 用例、真实卡、多轮质量、知识隔离/传播对抗和成本记录仍需补齐。
+- 真实 LLM 矩阵首次实跑通过（2026-07-08，deepseek-v4-flash，endpoint `opencode.ai/zen/go`）：8 个 suite 全绿——knowledge（private 封口 / told_by_other 传话链 / 广播分发 / private 不可二次传播）、i1（子 agent 越权被拦）、t1/t2/t3（首轮 / 多轮 / 三种重 roll）、c1/c6/c7（角色抽取 / meta 对话 / MVU 分析）。实跑同时暴露并修复了两个预存问题：`run-real-llm-smoke.ps1` 在 cargo 输出污染返回值管道 + stderr 触发 Stop 时崩溃（commit `f7f65d6`）；knowledge suite 对广播形态断言过严，LLM 合理输出 `BroadcastTarget::All` 被误判失败（commit `6126a1f`，断言放宽接受 All 或 Group，代码对两者处理均已覆盖）。成本/耗时未做结构化记录，复杂真实卡、长会话稳定性和真实 LLM 对抗仍是发布候选前的补充项。
 
 ## 最新提交
+
+真实 LLM 矩阵首次实跑（2026-07-08）:
+
+- `6126a1f test: relax knowledge broadcast assertion for LLM nondeterminism` — knowledge suite 接受 `BroadcastTarget::All` 或 `Group("守卫")`，消除 LLM 非确定性误伤
+- `f7f65d6 fix: real-llm smoke runner crashes on cargo output pipeline` — 修 `run-real-llm-smoke.ps1` 在 cargo 输出污染返回值管道 + stderr 触发 Stop 时的崩溃，保证官方真实验证入口可用
 
 前端重构 Phase 8(8 个 commit,详见 `docs/FRONTEND-REBUILD-2026-07-08.md`):
 
@@ -88,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 1. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
 2. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
 3. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
-4. 跑真实 LLM 矩阵：固定模型与参数，记录 T1/T2/T3 质量、耗时、成本、知识隔离/传播对抗和 postprocess 命中情况。
+4. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
 5. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
 6. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
 
