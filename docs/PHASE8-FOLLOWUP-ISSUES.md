@@ -73,27 +73,39 @@
 
 ## 三、本次新增待诊断问题（导演/编剧/Trace/后处理可见性）
 
-### P2-1 ⚪ 导演生成完成后，前端看不到导演输出了
+### P2-1 🟡 导演生成完成后，前端看不到导演输出了
 - **现象**：原本可以点开查看「导演输出」（Director 的 plan）的入口不见了。生成过程中还能看到（director_progress delta 流），但完成后看不到结果。
-- **待诊断**：可能 Director 的 plan/provenance 没正确存进 conversation node 的 provenance，或前端展开入口（trace 查看器）被 Phase 8 重构移除/丢失接线。需查 ChatMessage.vue 的 provenance 展示 + node 的 provenance 字段是否含 director plan。
+- **根因（已查清）**：渲染层缺陷，非数据丢失。`writingStore.pipeline.director.output`（累积的 delta）完成后仍在，但唯一展示它的 `StreamingMessage.vue:60-73` 导演折叠块，其挂载依赖 `writing.showPipeline`（`ConversationViewport.vue:131-135` 的 `v-if`），而 `useWriting.js:168` 在完成回调里 `showPipeline=false`，导致 StreamingMessage 整个卸载，导演折叠块随之消失。**注：这是 legacy App.vue 的既有行为（ab70021^ 同样 L795 showPipeline=false），非 Phase 8 回归。** 另外历史消息也查不到 plan：ChatMessage.vue 的 provenance 只用于 seed 显示和重 roll 菜单（无 plan 展开块），且 variant 的 provenance 只有 subagent_results 不含 director plan（`pipelineTrace.js`）。
+- **修复方向**：完成态需要独立的过程回顾组件，挂载条件脱离 showPipeline。最简：把导演/子Agent/编剧过程块从 StreamingMessage 提到 ConversationViewport，条件 `v-if="pipeline.director.output && !isWriting"`。若要历史消息也能查 plan，需把 plan/provenance 持久化到 message variant（当前缺失）。
+- **关键文件**：`frontend/src/composables/useWriting.js:168`、`frontend/src/components-v2/writing/ConversationViewport.vue:131-135`、`frontend/src/components-v2/writing/StreamingMessage.vue:60-73`
 
-### P2-2 ⚪ 流水线 Trace 在前端什么都看不到（导演生成过程中还能看到）
+### P2-2 🟡 流水线 Trace 在前端什么都看不到（导演生成过程中还能看到）
 - **现象**：Pipeline Trace 面板/区域，导演生成过程中有内容，但完成后变空。
-- **待诊断**：trace 是否依赖某个事件流在完成后被清空？或 trace 组件（DebugDrawer/PipelinePanel？）的 v-if 条件在完成态关闭？需查前端 trace 渲染的数据源和生命周期。
+- **根因（已查清）**：分两种观察位置：
+  - **若指对话区过程块**：与 P2-1 同因（StreamingMessage 卸载）。数据 `pluginStore.pluginPipelineEvents`（`plugin.js:13`）完成后保留，`pushPluginEventRecord` 只 append+slice 到 100 条，任何态都不清空。
+  - **若指右侧常驻 trace 面板**：`AppShell.vue:29` `<aside v-if="ui.powerMode && false">` 把桌面常驻调试抽屉**用 `&& false` 写死成永不渲染**。现在打开 trace 的唯一途径是 Overlay（🛠 按钮 → `showDebugDrawer`），该路径独立于 isWriting/完成态，trace tab 数据链健康（`PipelineTracePanel.vue:33-37` 读 pluginPipelineEvents，导演输出 L86-94 由 director_progress 重算，完成后仍有内容）。
+- **修复方向**：右侧常驻抽屉去掉 `AppShell.vue:29` 的 `&& false`（恢复 `v-if="ui.powerMode"`）；对话区过程块同 P2-1 修复。
+- **关键文件**：`frontend/src/components-v2/shell/AppShell.vue:29`、`frontend/src/components-v2/writing/ConversationViewport.vue:131-135`、`frontend/src/composables/useWriting.js:168`
 
-### P2-3 ⚪ 编剧（Editor）输出很久不出现
+### P2-3 🟡 编剧（Editor）输出很久不出现
 - **现象**：导演完成后，编剧输出要等很久，且最终混入了「改动说明」之类的非正文内容。
-- **待诊断**：结合 idx 36 Editor 日志，Editor 1 轮完成（19515ms，1402 tokens）。需确认：(a) 慢是模型延迟还是 pipeline 阻塞；(b) 「改动说明混入正文」是 Editor prompt 没约束好还是前端没分离 editor commentary 和 final text。
+- **根因（已查清，与 P2-4 同因）**：Editor 默认 `max_tool_rounds:5` 但 `tools:vec![]`，实际只跑一轮。慢的根因是 Editor prompt 被要求同时输出正文+元描述导致 token 偏多，收紧 prompt 后输出量下降会顺带提速。无需改并发/轮次配置。
 
 ### P2-4 🔴 编剧最后输出的「改动说明」混入了正文
 - **现象**：Editor 的总结性/说明性文字（如「以上是合并后的成文」之类的元描述）出现在用户看到的正文里。
-- **根因（部分）**：Editor prompt（`make_editor_config` 系统提示词）可能没明确禁止输出元描述；或 LLM 把思考过程写进了正文；或前端没做 editor commentary 与 final content 的分离。需查 Editor system prompt + 成文落库逻辑。
-- **关键文件**：`crates/app-agent/src/prompts/`（Editor prompt）、`crates/app-pipeline/src/lib.rs`（Editor 落库）
+- **根因（已查清，prompt 主动要求）**：`crates/app-pipeline/src/lib.rs:94` `EDITOR_SYSTEM_PROMPT` 第 3 条「3. 标注哪些子表演被你裁剪/改动了」**明确要求 LLM 输出元描述**——不是 LLM 自由发挥，是 prompt 自己要求的。Editor response.content 被 `apply_editor_output_regex`（lib.rs:1490-1500，只处理 `<think>` 块和用户正则）原样存为成文 content，零 commentary 剥离。前端 RichContent.vue 也只做格式化消毒，无正文/注释分段。全局唯一 commentary 要求来源就是 lib.rs:94 这一行。
+- **修复方向（治本，改 prompt）**：删除 lib.rs:94 第 3 条，改成明确禁止元描述：「只输出正文本身，严禁输出任何说明、注释、改动标注、总结性文字。第一行就必须是正文。」
+- **关键文件**：`crates/app-pipeline/src/lib.rs:90-96`（EDITOR_SYSTEM_PROMPT）
 
-### P2-5 🔴 后处理结果完全没有查看入口
-- **现象**：后处理（postprocess）的知识/变量/任务/摘要写回了（round_summaries.json/tasks.json 有内容），但前端没有地方能看到这些结果。用户不知道在哪查看后处理产出。
-- **修复方向**：Campaign 面板的知识/变量/任务/摘要 tab 应展示这些数据（CampaignKnowledgeTab/CampaignVariablesTab 等），需确认这些 tab 是否正确加载和渲染对应 store 数据。
-- **关键文件**：`frontend/src/components-v2/campaign/`（各 tab 组件）
+### P2-5 🟡 后处理结果完全没有查看入口
+- **现象**：后处理（postprocess）的知识/变量/任务/摘要写回了（round_summaries.json/tasks.json 有内容），但用户在前端找不到地方看这些结果。
+- **根因（已查清，入口太深 + 异步时机，非接线/渲染/数据问题）**：
+  - 数据层正常：`persist_postprocess_outcome_to_store`（lib.rs:2918-3013）四类全落盘；后端命令 `list_round_summaries`/`list_character_knowledge`/`list_tasks` 齐全且注册。
+  - 接线正常：CampaignKnowledgeTab/CampaignSummariesTab/CampaignTasksTab 都 import、都 v-if 挂载（CampaignPanel.vue:467-485）、都 onMounted+watch 自动加载。摘要 tab 显示 turn/content/created_at 三列。
+  - **真根因是 (d) 入口太深**：要看后处理结果需 5 步嵌套——PrimarySidebar 点 Campaign 管理 → CampaignPanel 默认 `activeTab='cards'`（CampaignPanel.vue:31）要切到游玩档 → 选卡 → 选档（切 detail tab）→ 再切知识/任务/摘要子 tab。且默认进的是角色卡 tab 不是档详情。
+  - 次要：postprocess 是 `spawn_blocking` 异步（lib.rs:2157-2172），写完立即看可能空，且无"后处理完成"UI 提示引导去看；子 tab 不自动刷新，需手动点刷新按钮。
+- **修复方向**：(1) 有 activeCampaign 时 CampaignPanel 默认进档详情而非角色卡；(2) 写作完成后给「查看本轮后处理结果」直达入口/toast；(3) postprocess 完成事件推前端后自动刷新当前 tab 并提示；(4) 路径扁平化（知识/任务/摘要 提为一级 tab 或加角标）。
+- **关键文件**：`frontend/src/components-v2/campaign/CampaignPanel.vue:31,467-485`、`frontend/src/composables/useWriting.js`（完成回调）
 
 ### P2-6 🟡 后处理知识抽取输出过长被截断，knowledge.json 不生成
 - **现象**：postprocess 跑 4 轮，前 3 轮 completion_tokens=4096（撞 max_tokens），knowledge_updates JSON 被截断 → parse 失败 → knowledge.json 不生成（其他 summaries/tasks 正常）。
