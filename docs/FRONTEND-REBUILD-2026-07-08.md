@@ -596,8 +596,8 @@ import { useWriting, useConversation, useMessageVariants } from './composables/.
 
 | 阶段 | 状态 | 提交 | 测试数 | 备注 |
 |---|---|---|---|---|
-| 0 | ✅ 完成 | (本次提交) | 157 旧全过 | 装依赖+建目录+stores/index.js+本文档;build 通过 |
-| 1 | ⬜ 待做 | | | |
+| 0 | ✅ 完成 | (阶段0提交) | 157 旧全过 | 装依赖+建目录+stores/index.js+本文档;build 通过 |
+| 1 | ✅ 完成 | (本次提交) | 196(157旧+39新) | 4 个 store(campaign/writing/plugin/ui)+ 跨 store getter + test glob 扩为 `tests/**/*.test.mjs` |
 | 2 | ⬜ 待做 | | | |
 | 3 | ⬜ 待做 | | | |
 | 4 | ⬜ 待做 | | | |
