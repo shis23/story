@@ -48,6 +48,7 @@ import NewCampaignForm from './components-v2/campaign/NewCampaignForm.vue'
 import ConnectionConfigPanel from './components-v2/config/ConnectionConfigPanel.vue'
 import PresetPanel from './components-v2/config/PresetPanel.vue'
 import PluginPanel from './components-v2/config/PluginPanel.vue'
+import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 // 保留原位(未迁移 v2,功能简单/隐藏运行时):
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
@@ -385,6 +386,12 @@ onMounted(async () => {
       <PluginPanel
         v-if="ui.showPluginPanel"
         @close="ui.showPluginPanel = false; ui.showSidebar = true; loadSidebarPlugins()"
+      />
+
+      <!-- Agent Profile 配置面板（Phase 8 补挂,P3-5） -->
+      <AgentProfileManager
+        v-if="ui.showAgentProfile"
+        @close="ui.showAgentProfile = false; ui.showSidebar = true"
       />
 
       <!-- ═══ 新建 Campaign 表单（Overlay,消费 useNewCampaignForm composable） ═══ -->

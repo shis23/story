@@ -3656,6 +3656,10 @@ pub struct CreateConnectionDto {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// 厂商扩展参数（P3-3），透传到请求体顶层。key=字段名(如 thinking/reasoning_effort),
+    /// value=任意 JSON。前端可填如 {"thinking":{"type":"enabled"},"reasoning_effort":"max"}。
+    #[serde(default)]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// 创建连接（从模板或自定义）
@@ -3680,6 +3684,7 @@ async fn create_connection(
             temperature: req.temperature,
             top_p: req.top_p,
             max_tokens: req.max_tokens,
+            extra: req.extra,
         },
         tool_mode,
     };

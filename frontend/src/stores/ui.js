@@ -19,6 +19,7 @@ export const useUiStore = defineStore('ui', () => {
   const showDebugDrawer = ref(false) // App.vue:65
   const showSidebar = ref(false) // App.vue:66 — 移动端左导航抽屉
   const showConnConfig = ref(false) // App.vue:340
+  const showAgentProfile = ref(false) // AgentProfile 管理面板（Phase 8 补挂,P3-5）
   const showHistory = ref(true) // App.vue:336
   const activeCampaignOverview = ref(true) // App.vue:338
 
@@ -77,6 +78,7 @@ export const useUiStore = defineStore('ui', () => {
     showDebugDrawer,
     showSidebar,
     showConnConfig,
+    showAgentProfile,
     showHistory,
     activeCampaignOverview,
     // getters

@@ -43,6 +43,7 @@ const ui = useUiStore()
         @open-conn="ui.showConnConfig = true"
         @open-preset="ui.showPresetPanel = true"
         @open-plugin="ui.showPluginPanel = true"
+        @open-agent-profile="ui.showAgentProfile = true"
         @open-meta="ui.showMetaPanel = true"
       />
     </Overlay>

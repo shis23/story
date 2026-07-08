@@ -23,6 +23,13 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         body["max_tokens"] = serde_json::json!(max_tokens);
     }
 
+    // P3-3：厂商扩展参数透传到请求体顶层（thinking/reasoning_effort 等）
+    if let Some(extra) = &req.params.extra {
+        for (key, value) in extra {
+            body[key] = value.clone();
+        }
+    }
+
     // 工具定义
     if let Some(tools) = &req.tools
         && !tools.is_empty()
@@ -156,6 +163,36 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_character");
+    }
+
+    #[test]
+    fn test_build_request_body_passes_extra_params() {
+        // P3-3：extra 扩展参数（thinking/reasoning_effort 等）应透传到请求体顶层
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type": "enabled"}),
+        );
+        extra.insert("reasoning_effort".into(), serde_json::json!("max"));
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                temperature: Some(0.7),
+                top_p: None,
+                max_tokens: Some(2048),
+                extra: Some(extra),
+            },
+            model: "minimax-m3".into(),
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["model"], "minimax-m3");
+        // temperature 走 f32→JSON,有浮点精度差异,用近似比较
+        let temp = body["temperature"].as_f64().unwrap();
+        assert!((temp - 0.7f64).abs() < 1e-5, "temperature 近似 0.7, 实际 {temp}");
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

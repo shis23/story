@@ -19,6 +19,7 @@ const emit = defineEmits([
   'open-preset',
   'open-plugin',
   'open-meta',
+  'open-agent-profile',
 ])
 
 // 导航项(对齐 AppSidebar.vue:40-54)
@@ -37,6 +38,7 @@ const items = computed(() => [
   { key: 'conn', label: '连接', icon: '⚡', event: 'open-conn', status: writing.activeConnection ? 'ok' : 'warn' },
   { key: 'preset', label: '预设', icon: '📑', event: 'open-preset' },
   { key: 'plugin', label: '插件', icon: '🔌', event: 'open-plugin' },
+  { key: 'agent-profile', label: 'Agent 配置', icon: '🤖', event: 'open-agent-profile' },
   { key: 'meta', label: 'Meta 助手', icon: '🔧', event: 'open-meta' },
 ])
 

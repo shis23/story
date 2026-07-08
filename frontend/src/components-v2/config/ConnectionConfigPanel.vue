@@ -38,6 +38,8 @@ const form = reactive({
   temperature: 1.0,
   topP: 0.95,
   maxTokens: 4096,
+  // P3-3：厂商扩展参数 JSON 文本（透传到请求体顶层，如 thinking/reasoning_effort）
+  extraJson: '',
 })
 
 const showAdvanced = ref(false)
@@ -46,6 +48,28 @@ const testing = ref(false)
 const testResult = ref(null)
 const saving = ref(false)
 const error = ref('')
+const extraParseError = ref('')
+
+// 把 extraJson 文本解析为对象（空串=不传）。解析失败设 extraParseError 并返回 null。
+function parseExtraParams() {
+  const raw = (form.extraJson || '').trim()
+  if (!raw) {
+    extraParseError.value = ''
+    return null
+  }
+  try {
+    const obj = JSON.parse(raw)
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+      extraParseError.value = '扩展参数必须是 JSON 对象（{}）'
+      return null
+    }
+    extraParseError.value = ''
+    return obj
+  } catch (e) {
+    extraParseError.value = 'JSON 格式错误：' + e.message
+    return null
+  }
+}
 
 // 在线拉取的模型列表（与模板预置合并去重）
 const fetchedModels = ref([])
@@ -88,8 +112,11 @@ async function handleFetchModels() {
       error.value = '服务商未返回模型列表，请手动输入或用模板默认'
     } else {
       fetchedModels.value = models
-      // 自动选中第一个（如果当前为空或不在选项里）
-      if (!form.model || !modelOptions.value.some((o) => o.value === form.model)) {
+      // P3-2 修复：不自动填充 models[0]。<datalist> 在输入框有值时只显示前缀匹配项,
+      // 自动填充会导致下拉只剩第一项（如只显示 minimax-m3）。保持输入框为空,
+      // 让用户点开下拉看到全部模型再选;仅在表单完全空(新建连接且无模板默认)时
+      // 才填第一个,避免空保存。
+      if (!form.model) {
         form.model = models[0]
       }
     }
@@ -170,6 +197,12 @@ async function handleSave() {
     error.value = '请填写 base_url / model / api_key'
     return
   }
+  // 解析扩展参数 JSON（失败则阻断保存）
+  const extra = parseExtraParams()
+  if (extraParseError.value) {
+    error.value = extraParseError.value
+    return
+  }
   saving.value = true
   error.value = ''
   try {
@@ -184,6 +217,7 @@ async function handleSave() {
       temperature: parseFloat(form.temperature),
       topP: parseFloat(form.topP),
       maxTokens: parseInt(form.maxTokens),
+      extra,
     })
     await loadConnections()
     form.name = ''
@@ -380,6 +414,17 @@ async function handleSetActive(id) {
                 <input v-model.number="form.maxTokens" type="number" step="256"
                   class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
               </div>
+            </div>
+            <!-- P3-3：厂商扩展参数（thinking/reasoning_effort 等）-->
+            <div class="mt-2 space-y-1">
+              <label class="text-[10px] text-ink-soft">扩展参数 JSON（透传到请求体顶层，如 thinking / reasoning_effort）</label>
+              <textarea
+                v-model="form.extraJson"
+                rows="2"
+                placeholder='{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
+                class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink font-mono focus:border-accent outline-none"
+              ></textarea>
+              <div v-if="extraParseError" class="text-[10px] text-err">{{ extraParseError }}</div>
             </div>
           </div>
 

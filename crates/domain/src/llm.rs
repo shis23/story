@@ -46,11 +46,19 @@ pub enum LlmProtocol {
 }
 
 /// 采样参数
+///
+/// `extra` 承载厂商扩展参数（P3-3），透传到请求 JSON 顶层。用于 thinking、
+/// reasoning_effort 等非标准字段，避免每加一个扩展就改结构体。值为 JSON，
+/// 支持 `{"type":"enabled"}`（thinking）或 `"max"`（reasoning_effort）等任意形态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// 厂商扩展参数（透传到请求体顶层），key=字段名，value=任意 JSON。
+    /// 例：`{"thinking": {"type":"enabled"}, "reasoning_effort": "max"}`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for SamplingParams {
@@ -59,6 +67,7 @@ impl Default for SamplingParams {
             temperature: Some(1.0),
             top_p: Some(0.95),
             max_tokens: Some(4096),
+            extra: None,
         }
     }
 }
