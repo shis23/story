@@ -597,14 +597,12 @@ import { useWriting, useConversation, useMessageVariants } from './composables/.
 | 阶段 | 状态 | 提交 | 测试数 | 备注 |
 |---|---|---|---|---|
 | 0 | ✅ 完成 | (阶段0提交) | 157 旧全过 | 装依赖+建目录+stores/index.js+本文档;build 通过 |
-| 1 | ✅ 完成 | (阶段1提交) | 196(157旧+39新) | 4 个 store(campaign/writing/plugin/ui)+ 跨 store getter + test glob 扩为 `tests/**/*.test.mjs` |
+| 1 | ✅ 完成 | (阶段1提交) | 196(157旧+39新) | 4 个 store + 跨 store getter |
 | 2 | ✅ 完成 | (阶段2提交) | node:196 + vitest:21 | 24 个 ui 组件(19 手写 + 5 Headless UI);双轨测试 |
-| 3 | ✅ 完成 | (阶段3提交) | 212(196+16) | 8 composable + 3 纯 util;范围外依赖用 options 注入避免循环依赖 |
-| 4 | ✅ 完成 | (本次合并提交) | build 通过 | shell 5 组件(AppShell/TopBar/PrimarySidebar/InspectorDrawer/PanelHost) |
-| 5 | ✅ 完成 | (本次合并提交) | build 通过 | writing 7 组件(Composer/ChatMessage契约保留/StreamingMessage/GreetingSelector/ConversationViewport/ConversationHistoryList/CampaignOverview)+ AppV2.vue 组装,8 composable 拓扑序接线 |
-| 7 | ✅ 完成 | (本次提交) | build 通过,16半脆弱测试全过 | meta 6(MetaPanel拆分,保留mvu-applied契约)+ config 4 + st 2 + debug 4;PluginHost/MvuJsRuntime 保留原位(半脆弱测试依赖) |
-| 5 | ⬜ 待做 | | | |
-| 6 | ⬜ 待做 | | | |
-| 7 | ⬜ 待做 | | | |
-| 8 | ⬜ 待做 | | | |
+| 3 | ✅ 完成 | (阶段3提交) | 212(196+16) | 8 composable + 3 纯 util;options 注入避免循环依赖 |
+| 4 | ✅ 完成 | (阶段4-6提交) | build 通过 | shell 5 组件 |
+| 5 | ✅ 完成 | (阶段4-6提交) | build 通过 | writing 7 组件 + AppV2.vue 组装(8 composable 拓扑序接线) |
+| 6 | ✅ 完成 | (阶段4-6提交) | build 通过 | campaign 7 组件(CampaignPanel 保留 refreshActiveDetailTab 契约) |
+| 7 | ✅ 完成 | (阶段7提交) | build 通过,16半脆弱测试全过 | meta 6 + config 4 + st 2 + debug 4;PluginHost/MvuJsRuntime 保留原位 |
+| 8 | ✅ 完成 | (本次提交) | build 422KB;node:212 + vitest:21 + 半脆弱:16;cargo:555全过 | main.js 切换 AppV2+Pinia;#panels 接 9 面板;InspectorDrawer 接 4 debug 组件;旧 App.vue 保留可回退 |
 | 9 | ⬜ 待做 | | | |

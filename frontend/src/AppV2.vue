@@ -44,10 +44,19 @@ import ConversationViewport from './components-v2/writing/ConversationViewport.v
 import Composer from './components-v2/writing/Composer.vue'
 import CampaignPanel from './components-v2/campaign/CampaignPanel.vue'
 import MetaPanel from './components-v2/meta/MetaPanel.vue'
+import NewCampaignForm from './components-v2/campaign/NewCampaignForm.vue'
+import ConnectionConfigPanel from './components-v2/config/ConnectionConfigPanel.vue'
+import PresetPanel from './components-v2/config/PresetPanel.vue'
+import PluginPanel from './components-v2/config/PluginPanel.vue'
+// 保留原位(未迁移 v2,功能简单/隐藏运行时):
+import CharacterList from './components/CharacterList.vue'
+import MvuJsRuntime from './components/MvuJsRuntime.vue'
+import PluginHost from './components/PluginHost.vue'
 import {
   useWritingStore,
   useCampaignStore,
   useUiStore,
+  usePluginStore,
 } from './stores/index.js'
 import { usePluginBridge } from './composables/usePluginBridge.js'
 import { useGreeting } from './composables/useGreeting.js'
@@ -73,6 +82,7 @@ import { alertDialog } from './components/base/BaseDialog.js'
 const writing = useWritingStore()
 const campaign = useCampaignStore()
 const ui = useUiStore()
+const plugin = usePluginStore()
 
 // ─── 范围外辅助函数（App.vue 内联实现，未列入迁移清单） ───
 // loadInstanceNameMap（App.vue:42-54）：刷新 activeCampaign 对应的实例名映射
@@ -157,6 +167,30 @@ function handleMvuApplied() {
   campaignPanelRef.value?.refreshActiveDetailTab?.()
 }
 
+// handleSelectChar（App.vue:672-693,范围外辅助):CharacterList 选中角色卡。
+// 用 active campaign / char 状态 + loadCharDetail + applySelectedOpeningMessage +
+// broadcastPluginEvent 拼装,降级路径为 no-op。
+async function handleSelectChar(char) {
+  ui.showCharList = false
+  if (!char) {
+    campaign.activeChar = null
+    campaign.activeCharDetail = null
+    writing.messages = []
+    campaign.currentConversationId = null
+    writing.selectedGreetingIndex = 0
+    broadcastChatChanged('character_cleared')
+    return
+  }
+  campaign.activeChar = char
+  campaign.currentConversationId = null
+  await loadCharDetail(char.id)
+  broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
+    characterId: char.id,
+    name: char.name,
+  })
+  greeting.applySelectedOpeningMessage()
+}
+
 // ─── Composable 装配 ───
 // 顺序遵循依赖拓扑：pluginBridge（无依赖）→ greeting → conversation → pipeline → writing → messageVariants → forms/import。
 // 注入的函数引用全部在运行时（用户操作触发）才被调用，此时下方所有 const 已完成初始化。
@@ -169,6 +203,8 @@ const {
   chatEventPayload,
   messageEventPayload,
   runPromptHookEvents,
+  setHookPluginHostRef,
+  onHookPluginSlotMount,
 } = pluginBridge
 
 // 2. greeting —— 开场白选择（注入 broadcastChatChanged + scrollToBottom）
@@ -305,20 +341,80 @@ onMounted(async () => {
     </template>
 
     <template #panels>
-      <!-- 阶段 6-7 补充：CampaignPanel / Meta 等面板 -->
+      <!-- ═══ 管理面板（每个用 ui.show* 控制；close 同时关面板并恢复侧栏） ═══ -->
+
+      <!-- 角色卡列表（保留原位组件,未迁 v2） -->
+      <CharacterList
+        v-if="ui.showCharList"
+        :active-id="campaign.activeChar?.id"
+        @select="handleSelectChar"
+        @close="ui.showCharList = false; ui.showSidebar = true"
+      />
+
+      <!-- LLM 连接配置 -->
+      <ConnectionConfigPanel
+        v-if="ui.showConnConfig"
+        @close="ui.showConnConfig = false; ui.showSidebar = true"
+        @changed="refreshActiveConnection"
+      />
+
+      <!-- Campaign 面板 -->
       <CampaignPanel
         v-if="ui.showCampaignPanel"
         ref="campaignPanelRef"
-        @close="ui.showCampaignPanel = false"
-        @campaign-changed="(c) => { campaign.activeCampaign = c }"
+        @close="ui.showCampaignPanel = false; ui.showSidebar = true"
+        @campaign-changed="(c) => { campaign.activeCampaign = c; loadInstanceNameMap() }"
       />
+
+      <!-- Meta 面板 -->
       <MetaPanel
         v-if="ui.showMetaPanel"
         :active-campaign="campaign.activeCampaign"
         :last-conversation-node="lastConversationNode"
-        @close="ui.showMetaPanel = false"
+        @close="ui.showMetaPanel = false; ui.showSidebar = true"
         @mvu-applied="handleMvuApplied"
       />
+
+      <!-- 预设面板 -->
+      <PresetPanel
+        v-if="ui.showPresetPanel"
+        @close="ui.showPresetPanel = false; ui.showSidebar = true"
+      />
+
+      <!-- 插件面板（关后刷新侧栏插件） -->
+      <PluginPanel
+        v-if="ui.showPluginPanel"
+        @close="ui.showPluginPanel = false; ui.showSidebar = true; loadSidebarPlugins()"
+      />
+
+      <!-- ═══ 新建 Campaign 表单（Overlay,消费 useNewCampaignForm composable） ═══ -->
+      <NewCampaignForm
+        :show="newCampaignForm.showNewCampaignForm.value"
+        :load-instance-name-map="loadInstanceNameMap"
+        :apply-conversation="applyConversation"
+        :broadcast-plugin-event="broadcastPluginEvent"
+        :load-conversation-history="loadConversationHistory"
+        :alert-dialog="alertDialog"
+        @update:show="(v) => { newCampaignForm.showNewCampaignForm.value = v }"
+        @close="newCampaignForm.showNewCampaignForm.value = false"
+      />
+
+      <!-- ═══ MVU JS Runtime（隐藏运行时,保留原位组件） ═══ -->
+      <MvuJsRuntime />
+
+      <!-- ═══ 插件 Hook Host 循环（隐藏,保留原位组件） ═══ -->
+      <div class="hidden" aria-hidden="true">
+        <PluginHost
+          v-for="p in plugin.hookPlugins"
+          :key="`hook-${p.id}`"
+          :ref="(el) => setHookPluginHostRef(p.id, el)"
+          :plugin="p"
+          :plugin-events="plugin.pluginPipelineEvents"
+          compact
+          height="0px"
+          @slot-mount="onHookPluginSlotMount"
+        />
+      </div>
     </template>
   </AppShell>
 </template>

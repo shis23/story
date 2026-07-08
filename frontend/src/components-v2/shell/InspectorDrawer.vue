@@ -1,9 +1,36 @@
 <script setup>
-import { useUiStore, usePluginStore } from '../../stores/index.js'
-import EmptyState from '../ui/EmptyState.vue'
+/**
+ * InspectorDrawer — 调试抽屉（右栏 / overlay）。
+ *
+ * 用 ui/Tabs 分四个面板,每个对应一个 debug 组件:
+ *   - trace   → PipelineTracePanel(流水线 trace:导演/子 Agent/编剧/后处理)
+ *   - events  → PluginEventLog(插件事件 feed)
+ *   - hooks   → PromptHookAuditLog(prompt hook 审计)
+ *   - logs    → LogPanel(app/frontend 日志)
+ */
+import { ref } from 'vue'
+import { useUiStore } from '../../stores/index.js'
+import Tabs from '../ui/Tabs.vue'
+import PipelineTracePanel from '../debug/PipelineTracePanel.vue'
+import PluginEventLog from '../debug/PluginEventLog.vue'
+import PromptHookAuditLog from '../debug/PromptHookAuditLog.vue'
+import LogPanel from '../debug/LogPanel.vue'
 
 const ui = useUiStore()
-const plugin = usePluginStore()
+
+const activeTab = ref('trace')
+const tabs = [
+  { key: 'trace', label: '流水线' },
+  { key: 'events', label: '插件事件' },
+  { key: 'hooks', label: 'Hook 审计' },
+  { key: 'logs', label: '日志' },
+]
+
+// LogPanel 暴露 loadLogs,切到日志 tab 时刷新
+const logPanelRef = ref(null)
+function onTabChange(key) {
+  if (key === 'logs') logPanelRef.value?.loadLogs?.()
+}
 </script>
 
 <template>
@@ -19,27 +46,13 @@ const plugin = usePluginStore()
       </button>
     </div>
 
-    <div class="flex-1 overflow-y-auto p-3 space-y-4">
-      <!-- 阶段 7 补充:PipelineTracePanel / PluginEventLog / PromptHookAuditLog -->
-
-      <EmptyState
-        v-if="plugin.pluginPipelineEvents.length === 0"
-        title="无调试事件"
-        description="流水线事件、插件事件、prompt hook 审计将在此显示"
-      />
-
-      <div v-else>
-        <h3 class="text-xs text-ink-soft mb-2">最近事件</h3>
-        <div class="space-y-1">
-          <div
-            v-for="evt in plugin.pluginPipelineEvents.slice(-20).reverse()"
-            :key="evt.seq"
-            class="text-xs text-ink-soft bg-surface-2 rounded px-2 py-1 font-mono"
-          >
-            {{ evt.type }} <span class="text-ink-faint">{{ evt.detail }}</span>
-          </div>
-        </div>
-      </div>
+    <div class="flex-1 overflow-y-auto p-3">
+      <Tabs v-model="activeTab" :tabs="tabs" @update:model-value="onTabChange">
+        <PipelineTracePanel v-if="activeTab === 'trace'" />
+        <PluginEventLog v-else-if="activeTab === 'events'" />
+        <PromptHookAuditLog v-else-if="activeTab === 'hooks'" />
+        <LogPanel v-else-if="activeTab === 'logs'" ref="logPanelRef" />
+      </Tabs>
     </div>
   </div>
 </template>
