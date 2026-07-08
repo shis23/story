@@ -32,7 +32,7 @@ const ui = useUiStore()
     </div>
 
     <!-- 左导航抽屉(overlay) -->
-    <Overlay :show="ui.showSidebar" side="left" :show-header="false" @update:show="ui.showSidebar = $event">
+    <Overlay :show="ui.showSidebar" side="left" :show-close="false" @update:show="ui.showSidebar = $event">
       <PrimarySidebar
         @close="ui.showSidebar = false"
         @new-campaign="$emit('new-campaign')"
@@ -49,7 +49,7 @@ const ui = useUiStore()
     </Overlay>
 
     <!-- 右调试抽屉(overlay,移动端 + power mode) -->
-    <Overlay :show="ui.showDebugDrawer" side="right" :show-header="false" @update:show="ui.showDebugDrawer = $event">
+    <Overlay :show="ui.showDebugDrawer" side="right" :show-close="false" @update:show="ui.showDebugDrawer = $event">
       <InspectorDrawer />
     </Overlay>
 

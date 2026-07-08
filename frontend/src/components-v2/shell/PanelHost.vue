@@ -16,6 +16,7 @@ const emit = defineEmits(['close'])
   <Overlay
     :show="show"
     :side="side"
+    :show-close="false"
     @update:show="emit('close')"
   >
     <template #default="{ close }">

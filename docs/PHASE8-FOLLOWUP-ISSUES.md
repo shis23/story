@@ -104,10 +104,10 @@
 
 ## 四、非 Bronze 但登记的问题
 
-### P3-1 🟢 标题栏右上角两个 x 号（需运行时视觉确认，无自绘重复）
-- **现象**：窗口标题栏出现两个关闭按钮。
-- **诊断（已查清）**：前端代码无自绘窗口控制按钮——TopBar.vue 只有「菜单」和「🛠」两个按钮，无 close/✕；PanelHost.vue 的关闭按钮是 `×` 图标，但仅在带标题的弹层（InspectorDrawer 用 `show-header=false` 不渲染它）。tauri.conf.json `decorations: true` 显示 OS 原生标题栏（Windows 三个按钮：最小化/最大化/关闭）。
-- **结论**：代码层面无重复关闭按钮的来源。最可能是用户观察到的视觉重叠——右侧 Overlay 弹层（`fixed right-0 top-0`）若占满宽度，其右上角接近 OS 标题栏关闭键，视觉上像「两个 x」。无可靠代码修复（移除 OS decorations 会丢失窗口拖拽/系统控件，代价更大）。**不影响功能。**若用户能截图确认第二个 x 的确切位置再做针对性修复。
+### P3-1 🟢 标题栏右上角两个 x 号
+- **现象**：窗口标题栏 / 管理面板右上角出现两个关闭按钮。
+- **根因（已查清）**：`Overlay.vue`（弹层基类）原本**无条件渲染一个自带 ✕ 关闭键**——有 `title` 时在标题栏，无 `title` 时在 `absolute right-2 top-2`（右上角）。但用 Overlay 的 3 处（PrimarySidebar / InspectorDrawer / PanelHost 派生的管理面板）**子组件自带关闭键**（PrimarySidebar 头部 ×、InspectorDrawer 头部 ×、PanelHost 头部 ×）。AppShell 虽传了 `:show-header="false` 表达「不要 Overlay 的关闭键」的意图，但 Overlay 根本没声明 `showHeader` prop——该 prop 被静默忽略，Overlay 仍画自己的 ✕，与子组件的 × 重叠；右侧 Overlay（`fixed right-0 top-0`）的右上角 ✕ 还紧贴 OS 标题栏 ×，视觉上像「两个 x」。
+- **修复**：(1) `Overlay.vue` 新增 `showClose` prop（默认 true，向后兼容），无 title 时 `v-else-if="showClose"` 才渲染 ✕；(2) AppShell 的 PrimarySidebar/InspectorDrawer 两个 Overlay 改传 `:show-close="false"`（它们自带关闭键）；(3) PanelHost 派生的管理面板（ConnectionConfigPanel/PresetPanel/PluginPanel/AgentProfileManager 等）也传 `:show-close="false"`（PanelHost 头部自带 ×）。带 title 的 center 弹窗（NewCampaignForm/MvuAnalyzer）依赖标题栏 ✕，保留默认 showClose=true。新增 overlay.test.mjs 回归测试（3 测试）。
 
 ### P3-2 🟢 模型列表 datalist 只显示 minimax-m3
 - **现象**：拉取模型列表后下拉只显示第一项。
@@ -146,9 +146,11 @@
 - `cargo test -p storyforge-app-agent --lib`：全 98 通过
 - `cargo test -p storyforge-app-logging --lib`：全 7 通过
 - `cargo test -p storyforge-infra-llm --lib`：全 34 通过
+- `cargo test --workspace --lib`：14 suite 全通过
 - `cargo check --workspace`：干净
 - `frontend npm run build`：干净
 - `frontend npm test`：全 212 通过
+- `frontend npm run test:ui`（vitest）：全 24 通过（含 overlay.test.mjs 3 测试）
 
 ## 修复后填写
 

@@ -12,6 +12,11 @@ const props = defineProps({
   modelValue: { type: Boolean, default: null },
   side: { type: String, default: 'right' }, // left | right | center | full
   title: { type: String, default: '' },
+  // P3-1 修复：是否渲染 Overlay 自带的关闭按钮 ✕。
+  // 子组件自带关闭按钮（如 PrimarySidebar/InspectorDrawer）时传 false，
+  // 否则 Overlay 的 ✕ 会与子组件关闭键、以及 OS 标题栏 × 视觉重叠，
+  // 用户看到「右上角两个 x」。无标题时默认仍渲染 ✕（center/full 弹窗需要）。
+  showClose: { type: Boolean, default: true },
 })
 const emit = defineEmits(['update:show', 'update:modelValue', 'close'])
 
@@ -128,9 +133,9 @@ const overlayTransition = {
                 ✕
               </button>
             </div>
-            <!-- 无标题时仍提供关闭按钮 -->
+            <!-- 无标题时可选提供关闭按钮（showClose=false 抑制） -->
             <div
-              v-else
+              v-else-if="showClose"
               class="absolute right-2 top-2 z-10"
             >
               <button
