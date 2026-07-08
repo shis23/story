@@ -5,6 +5,7 @@
 
 ## 当前项目状态
 
+- **前端重构 Phase 8 已完成**：App.vue(1462 行单文件)拆分为 60 个 v2 组件 + 4 个 Pinia store + 8 个 composable + 3 纯 util。main.js 已切换到 AppV2 + Pinia。旧 App.vue 及 20 个旧组件已删除;PluginHost/MvuJsRuntime/CharacterList + base/ 因被 v2 或测试引用而保留原位。双轨测试:node --test(212 个,纯 JS)+ vitest(21 个,组件挂载)。契约红线全部保住(141 旧测试护城河 + 16 半脆弱测试 + ChatMessage 8 emit + CampaignPanel refreshActiveDetailTab + MetaPanel mvu-applied)。详见 `docs/FRONTEND-REBUILD-2026-07-08.md`。
 - Campaign 主线已经成为写作运行时真相源：Director、Subagent、Editor、Postprocess 都围绕 Campaign/CharacterInstance 工作。
 - Agent Profile 与 Character Extraction 的主计划已完成并归档到 `docs/archive/2026-07-08-completed-plans/`；后续增强继续作为验收和质量任务跟踪，不再把这两个 plan 当作当前入口。
 - Meta Agent 维护层已完成基础闭环：health check、解释生成、typed patch、preview/accept/dismiss、MVU schema preview/apply 都已接入；MetaPanel 接受 patch 后的状态流已有前端纯模型测试覆盖。

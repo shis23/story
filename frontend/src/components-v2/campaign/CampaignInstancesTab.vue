@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
 import { confirmDialog, alertDialog } from '../../components/base/BaseDialog.js'
-import MvuStatusBar from '../../components/MvuStatusBar.vue'
+import MvuStatusBar from '../st/MvuStatusBar.vue'
 import {
   listInstances, getCharacterVariables, setCharacterVariable,
   promoteTemporaryInstance, getCampaign, getCard, metaGetMvuTranslation
@@ -228,9 +228,7 @@ defineExpose({ refresh: load })
       <div class="text-xs font-medium text-ink-soft mb-1">变量</div>
       <MvuStatusBar
         v-if="instanceMvuStatusBar"
-        :ui-bindings="instanceMvuStatusBar.uiBindings"
-        :variables="instanceMvuStatusBar.variables"
-        :fallback-count="instanceMvuStatusBar.fallbackCount"
+        :mvu-state="instanceMvuStatusBar"
       />
       <div v-if="instanceVariables.length === 0" class="text-xs text-ink-faint">暂无变量</div>
       <div

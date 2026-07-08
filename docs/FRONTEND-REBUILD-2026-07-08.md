@@ -604,5 +604,5 @@ import { useWriting, useConversation, useMessageVariants } from './composables/.
 | 5 | ✅ 完成 | (阶段4-6提交) | build 通过 | writing 7 组件 + AppV2.vue 组装(8 composable 拓扑序接线) |
 | 6 | ✅ 完成 | (阶段4-6提交) | build 通过 | campaign 7 组件(CampaignPanel 保留 refreshActiveDetailTab 契约) |
 | 7 | ✅ 完成 | (阶段7提交) | build 通过,16半脆弱测试全过 | meta 6 + config 4 + st 2 + debug 4;PluginHost/MvuJsRuntime 保留原位 |
-| 8 | ✅ 完成 | (本次提交) | build 422KB;node:212 + vitest:21 + 半脆弱:16;cargo:555全过 | main.js 切换 AppV2+Pinia;#panels 接 9 面板;InspectorDrawer 接 4 debug 组件;旧 App.vue 保留可回退 |
-| 9 | ⬜ 待做 | | | |
+| 8 | ✅ 完成 | (阶段8提交) | build 422KB;node:212 + vitest:21 + 半脆弱:16;cargo:555全过 | main.js 切换 AppV2+Pinia;#panels 接 9 面板;InspectorDrawer 接 4 debug 组件;旧 App.vue 保留可回退 |
+| 9 | ✅ 完成 | (本次提交) | 同上 | 删除 21 个旧文件(旧 App.vue + 20 旧组件 + BaseButton);保留 8 个(PluginHost/MvuJsRuntime/CharacterList + base/ 5 个);CampaignInstancesTab MvuStatusBar 改指 v2 版;不重命名 components-v2(保留项仍在 components/ 避免测试硬编码路径断裂) |
