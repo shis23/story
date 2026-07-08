@@ -20,6 +20,7 @@ import { ref, watch, nextTick, onMounted } from 'vue'
 import { useWritingStore, useCampaignStore, useUiStore } from '../../stores/index.js'
 import ChatMessage from './ChatMessage.vue'
 import StreamingMessage from './StreamingMessage.vue'
+import ProcessReview from './ProcessReview.vue'
 import GreetingSelector from './GreetingSelector.vue'
 import EmptyState from '../ui/EmptyState.vue'
 
@@ -133,6 +134,8 @@ onMounted(() => scrollToBottom())
       :pipeline="writing.pipeline"
       :role-label="writing.streamingRoleLabel"
     />
+    <!-- 写作完成后：过程回顾（P2-1 修复，独立于 showPipeline 挂载） -->
+    <ProcessReview />
     <div class="h-4"></div>
   </div>
 </template>

@@ -3917,19 +3917,33 @@ pub struct ConversationSummaryDto {
 
 #[tauri::command]
 fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<ConversationSummaryDto> {
-    // 联查角色卡名：snapshot_tool_ctx.characters 是 domain Character（含 id + name）
-    let tool_ctx = state.snapshot_tool_ctx();
-    let chars = &tool_ctx.characters;
+    // 联查角色卡名。
+    // conversation.character_id 存的是 CharacterCard.id（而非 domain Character 的
+    // source_character_id），所以必须用 campaign_store 的卡片表按 card.id 联查,
+    // 不能用 tool_ctx.characters（那是扁平 Character,id=source_character_id）。
+    // 兜底:character_id 联查不到时,走 campaign_id → campaign.card_id → card.name。
+    let store = get_campaign_store();
+    let cards = store.list_cards();
+    let card_by_id: std::collections::HashMap<&Id, &str> = cards
+        .iter()
+        .map(|sc| (&sc.card.id, sc.card.name.as_str()))
+        .collect();
     state
         .conv_store
         .list()
         .into_iter()
         .map(|c| {
             let card_name = c.character_id.as_ref().and_then(|cid| {
-                chars
-                    .iter()
-                    .find(|ch| ch.id.as_str() == cid)
-                    .map(|ch| ch.name.clone())
+                // 首选:直接按 character_id(=CharacterCard.id)查卡名
+                let cid_id = Id::from_str(cid);
+                card_by_id.get(&cid_id).map(|n| (*n).to_string())
+            }).or_else(|| {
+                // 兜底:campaign_id → campaign.card_id → card.name
+                c.campaign_id.as_ref().and_then(|camp_id| {
+                    store.get_campaign(camp_id).and_then(|campaign| {
+                        card_by_id.get(&campaign.card_id).map(|n| (*n).to_string())
+                    })
+                })
             });
             ConversationSummaryDto {
                 id: c.id.to_string(),

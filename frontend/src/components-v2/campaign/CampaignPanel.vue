@@ -97,6 +97,16 @@ const importStatus = ref('')
 onMounted(async () => {
   // Cards 由 CardLibrary 自管(其 setup 内自动加载);此处只取活跃 Campaign
   activeCampaign.value = await getActiveCampaign()
+  // 若已有活跃 Campaign,根据其 card_id 回填 selectedCardId 并预加载游玩档,
+  // 避免用户进入「游玩档」tab 看到空白(P1-4);且默认直入档详情(P2-5 入口扁平化,
+  // 让用户可直接看到知识/任务/摘要后处理结果,无需 5 步嵌套导航)。
+  if (activeCampaign.value?.card_id) {
+    selectedCardId.value = activeCampaign.value.card_id
+    selectedCampaignId.value = activeCampaign.value.id
+    await loadSelectedCampaignCardDetail()
+    await refreshCampaigns()
+    activeTab.value = 'detail'
+  }
 })
 
 // ─── Cards 操作(委托给 CardLibrary,导入后刷新) ───
