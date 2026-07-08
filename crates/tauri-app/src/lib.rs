@@ -11634,6 +11634,187 @@ mod tests {
     }
 
     #[test]
+    fn postprocess_skips_unknown_character_target() {
+        use storyforge_domain::agent::{PostProcessResult, VariableUpdate};
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_unknown_char_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        store.add_instance(lin.clone()).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: campaign.id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 2,
+        };
+
+        // outcome 包含一个未知角色名 + 一个已知角色/全局变量
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![],
+                variable_updates: vec![
+                    VariableUpdate {
+                        instance_id: Some(Id::from_str("UnknownChar")),
+                        key: "level".into(),
+                        value: serde_json::json!(99),
+                    },
+                    VariableUpdate {
+                        instance_id: None,
+                        key: "story_clock".into(),
+                        value: serde_json::json!("Night"),
+                    },
+                ],
+                task_updates: vec![],
+                parse_succeeded: true,
+            }),
+        };
+
+        persist_postprocess_outcome_to_store(&store, &persist_ctx, &outcome, &[String::from("Lin")]);
+
+        // 未知角色变量不写入（未报错即确认静默跳过）
+        let lin_check = store.get_instance(&campaign.id, &Id::from_str("inst-lin")).unwrap();
+        assert!(lin_check.get_variable("level").is_none(), "未知角色的变量不应写入任何 instance");
+
+        // 全局变量仍正常写入
+        let updated_campaign = store.get_campaign(&campaign.id).unwrap();
+        assert_eq!(updated_campaign.current_story_clock(), "Night");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn postprocess_validates_task_belongs_to_campaign() {
+        use storyforge_domain::agent::PostProcessResult;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger, TaskUpdate};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_task_campaign_mismatch_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        // 从当前 campaign
+        let campaign = Campaign::new(Id::from_str("card-main"), "Current Campaign");
+        store.save_campaign(campaign.clone()).unwrap();
+        let inst = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        store.add_instance(inst).unwrap();
+
+        // 创建一个归属于不同 campaign 的任务（模拟写回时引用了其他 campaign 的任务）
+        let other_camp_id = Id::from_str("other-campaign");
+        let other_task = StoryTask::user_planned(
+            other_camp_id.clone(),
+            "Intrude",
+            "Intrude other campaign",
+            vec![TaskTrigger::Manual],
+            1,
+        );
+        let other_task_id = other_task.id.clone();
+        store.add_task(other_task).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: campaign.id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 1,
+        };
+
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![],
+                variable_updates: vec![],
+                task_updates: vec![TaskUpdate {
+                    task_id: Some(other_task_id.clone()),
+                    new_status: TaskStatus::Completed,
+                    new_task: None,
+                }],
+                parse_succeeded: true,
+            }),
+        };
+
+        persist_postprocess_outcome_to_store(&store, &persist_ctx, &outcome, &[]);
+
+        // 其他 campaign 的任务状态不应被本 campaign 的写回修改
+        let stored_task = store.get_task(&other_task_id).unwrap();
+        assert!(
+            matches!(stored_task.status, TaskStatus::Pending),
+            "其他 campaign 的任务不应被当前 campaign 的写回修改：{stored_task:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn postprocess_empty_present_chars_rejects_witnessed_knowledge() {
+        use storyforge_domain::agent::PostProcessResult;
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_empty_present_witnessed_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let campaign = Campaign::new(Id::from_str("card-1"), "run");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let mut lin = CharacterInstance::temporary(campaign.id.clone(), "Lin");
+        lin.id = Id::from_str("inst-lin");
+        store.add_instance(lin.clone()).unwrap();
+
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: campaign.id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 1,
+        };
+
+        // Witnessed 知识 + present_chars 空集：知识路径收紧拒绝写入
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("Lin"),
+                    knowledge_text: "The key is under the mat.".into(),
+                    source: KnowledgeSource::Witnessed,
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: None,
+                    propagation: PropagationPolicy::Open,
+                }],
+                variable_updates: vec![],
+                task_updates: vec![],
+                parse_succeeded: true,
+            }),
+        };
+
+        persist_postprocess_outcome_to_store(&store, &persist_ctx, &outcome, &[]);
+
+        let knowledge = store.list_knowledge(&campaign.id);
+        assert!(
+            knowledge.is_empty(),
+            "present_chars 空集时 Witnessed 知识不应写入"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_postprocess_variable_keys_include_runtime_custom_schema_and_values() {
         use std::collections::HashMap;
         use storyforge_domain::campaign::{Campaign, CharacterInstance};
