@@ -1902,7 +1902,12 @@ fn make_director_config(
         max_tool_rounds: rounds_override.unwrap_or(15),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
-        terminal_tools: vec![],
+        // emit_plan 是"声明 Plan 产出完成"的终止信号，必须列入 terminal_tools。
+        // 否则 LLM 调用 emit_plan 后 run_tool_loop（runtime.rs:276）不终止，继续催
+        // "请继续使用工具完成任务"，导致 Director 在工具循环里空转耗尽 max_tool_rounds
+        // (15) 后失败。content 里的 JSON 完成探测兜不住 tool_call 路径（LLM 走
+        // emit_plan 时 content 是自然语言）。对齐 postprocess 的 terminal_tools 修复。
+        terminal_tools: vec!["emit_plan".into()],
     }
 }
 
@@ -3570,6 +3575,19 @@ mod tests {
         assert!(system_extra.contains("Dragon note: Aurelion"));
         assert!(!system_extra.contains("{{DRAGON}}"));
         assert_eq!(book.entries[0].content, "Dragon note: {{DRAGON}}");
+    }
+
+    #[test]
+    fn test_director_config_marks_emit_plan_as_terminal() {
+        // emit_plan 必须是终止工具，否则 LLM 调用 emit_plan 后 run_tool_loop 不终止，
+        // 循环到 max_tool_rounds(15) 失败。content 的 JSON 完成探测兜不住 tool_call 路径
+        // （LLM 走 emit_plan 时 content 是自然语言）。对齐 postprocess 的同源修复。
+        let cfg = make_director_config(None, &[], "", None, None);
+        assert!(
+            cfg.terminal_tools.iter().any(|t| t == "emit_plan"),
+            "terminal_tools 必须含 emit_plan，实际为 {:?}",
+            cfg.terminal_tools
+        );
     }
 
     /// §22 cache 命中验证：两轮调用（不同 intent/turn）但相同蓝灯世界设定 →
