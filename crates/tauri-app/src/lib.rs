@@ -11680,11 +11680,21 @@ mod tests {
             }),
         };
 
-        persist_postprocess_outcome_to_store(&store, &persist_ctx, &outcome, &[String::from("Lin")]);
+        persist_postprocess_outcome_to_store(
+            &store,
+            &persist_ctx,
+            &outcome,
+            &[String::from("Lin")],
+        );
 
         // 未知角色变量不写入（未报错即确认静默跳过）
-        let lin_check = store.get_instance(&campaign.id, &Id::from_str("inst-lin")).unwrap();
-        assert!(lin_check.get_variable("level").is_none(), "未知角色的变量不应写入任何 instance");
+        let lin_check = store
+            .get_instance(&campaign.id, &Id::from_str("inst-lin"))
+            .unwrap();
+        assert!(
+            lin_check.get_variable("level").is_none(),
+            "未知角色的变量不应写入任何 instance"
+        );
 
         // 全局变量仍正常写入
         let updated_campaign = store.get_campaign(&campaign.id).unwrap();
