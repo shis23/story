@@ -19,6 +19,7 @@ import {
   campaignCardShouldShowExtractButton as shouldShowExtractButton,
 } from '../utils/campaignCardStatus.js'
 import { buildGreetingOptionsFromDetail } from '../utils/campaignGreetingOptions.js'
+import { refreshSubTab, subTabRefKey } from '../utils/campaignTabRefresh.js'
 
 const emit = defineEmits(['close', 'campaign-changed'])
 
@@ -194,10 +195,15 @@ function refreshActiveDetailTab() {
     tasks: tasksTabRef,
     summaries: summariesTabRef,
   }
-  const tabRef = refMap[detailSubTab.value]
-  if (tabRef.value?.refresh) {
-    tabRef.value.refresh()
+  // 把 Vue template ref 包裹对象转成纯 { refresh } 映射
+  const tabRefs = {}
+  for (const key of Object.keys(refMap)) {
+    const refKey = subTabRefKey(key)
+    if (refKey && refMap[key].value) {
+      tabRefs[refKey] = refMap[key].value
+    }
   }
+  refreshSubTab(detailSubTab.value, tabRefs)
 }
 
 // ─── 导出操作 ───
