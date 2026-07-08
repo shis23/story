@@ -2,6 +2,8 @@
 
 > 更新日期：2026-07-08
 > 目的：给下一版前端重设计提供组件地图。本文按“用户界面需要什么组件”组织，不要求沿用当前视觉样式；现有实现路径仅用于帮助定位业务能力。
+>
+> **本文已落地**：Phase 8 前端重构已完成，60 个 v2 组件按本文 P0/P1/P2/P3 分区全部实现（详见末尾“实现状态映射”节与 `docs/FRONTEND-REBUILD-2026-07-08.md`）。下面正文保留原始设计蓝图作为意图参考，实现状态以末尾映射表为准。
 
 ## 设计目标
 
@@ -302,3 +304,90 @@ frontend/src/components/
 - Meta 助手：health issue、patch preview、accept/dismiss、MVU apply。
 - 插件/调试：事件 log、prompt hook audit、插件错误。
 - 移动端：主菜单抽屉、写作、Campaign 管理、导出入口。
+
+---
+
+## 实现状态映射（Phase 8 落地，2026-07-08）
+
+> 下面是蓝图组件到实际 v2 文件的映射。实际结构在 `frontend/src/components-v2/`，60 个 `.vue` 文件按 `shell/ui/writing/campaign/meta/st/config/debug` 分区。命名规则：蓝图里带 `Panel`/`Tab`/`List`/`Bar`/`Card` 后缀的概念，v2 落地时多数保留原名；带 `Frame`/`Host`/`Renderer` 的运行时承载类组件保留原位（契约依赖），不迁入 `components-v2/`。
+
+### 已实现为独立 v2 组件（47 个）
+
+| 蓝图组件 | v2 文件 | 备注 |
+| --- | --- | --- |
+| `AppShell` | `shell/AppShell.vue` | 三栏根布局 |
+| `TopBar` | `shell/TopBar.vue` | 消费 uiStore.pageTitle |
+| `PrimarySidebar` | `shell/PrimarySidebar.vue` | 消费 uiStore 视图切换 |
+| `InspectorDrawer` | `shell/InspectorDrawer.vue` | 右调试抽屉，Tabs 承载 4 debug 组件 |
+| `PanelHost` | `shell/PanelHost.vue` | 统一弹层承载 |
+| `Button`/`IconButton`/`Input`/`Textarea`/`Select` | `ui/{Button,IconButton,Input,Textarea,Select}.vue` | |
+| `SegmentedControl`/`Checkbox`/`Toggle`/`Slider` | `ui/{SegmentedControl,Checkbox,Toggle,Slider}.vue` | `NumberInput` 复用 `Input` |
+| `Tabs`/`Menu`/`Tooltip` | `ui/{Tabs,Menu,Tooltip}.vue` | Headless UI 承载 |
+| `Badge`/`Progress`/`Toast` | `ui/{Badge,Progress,Toast}.vue` | |
+| `Overlay`/`Dialog` | `ui/{Overlay,Dialog}.vue` | Headless UI 承载 |
+| `EmptyState`/`ErrorState`/`LoadingState` | `ui/{EmptyState,ErrorState,LoadingState}.vue` | |
+| `DataList`/`DataTable`/`DiffView`/`CodeBlock` | `ui/{DataList,DataTable,DiffView,CodeBlock}.vue` | |
+| `ConversationViewport` | `writing/ConversationViewport.vue` | defineExpose scrollToBottom |
+| `GreetingSelector` | `writing/GreetingSelector.vue` | |
+| `ChatMessage` | `writing/ChatMessage.vue` | **契约保留：8 emit + message shape** |
+| `StreamingMessage` | `writing/StreamingMessage.vue` | 消费 writingStore.pipeline |
+| `Composer` | `writing/Composer.vue` | |
+| `ConversationHistoryList` | `writing/ConversationHistoryList.vue` | |
+| `CampaignOverview` | `writing/CampaignOverview.vue` | |
+| `CampaignPanel` | `campaign/CampaignPanel.vue` | **契约保留：refreshActiveDetailTab expose** |
+| `CardLibrary` | `campaign/CardLibrary.vue` | |
+| `NewCampaignForm` | `campaign/NewCampaignForm.vue` | 消费 useNewCampaignForm |
+| `InstancesTab`/`KnowledgeTab`/`TasksTab`/`SummariesTab` | `campaign/Campaign{Instances,Knowledge,Tasks,Summaries}Tab.vue` | 4 个独立 tab |
+| `MetaPanel` | `meta/MetaPanel.vue` | **契约保留：lastConversationNode + mvu-applied emit** |
+| `MetaChat`/`HealthCheckPanel`/`PatchPreview` | `meta/{MetaChat,HealthCheckPanel,PatchPreview}.vue` | |
+| `GenerationExplanation`/`MvuAnalyzer` | `meta/{GenerationExplanation,MvuAnalyzer}.vue` | |
+| `MvuStatusBar` | `st/MvuStatusBar.vue` | 复用 `utils/mvuStatusBarModel.js` |
+| `RichContent` | `st/RichContent.vue` | 复用 `utils/formatContent.js` |
+| `StCompatibilityBadge` | `st/StCompatibilityBadge.vue` | |
+| `ConnectionConfigPanel`/`PresetPanel`/`AgentProfileManager`/`PluginPanel` | `config/{ConnectionConfigPanel,PresetPanel,AgentProfileManager,PluginPanel}.vue` | |
+| `PipelineTracePanel`/`PluginEventLog`/`PromptHookAuditLog`/`LogPanel` | `debug/{PipelineTracePanel,PluginEventLog,PromptHookAuditLog,LogPanel}.vue` | 复用 `utils/pipelineTrace.js`、`promptHookAudit.js` |
+
+### 内联实现（蓝图概念在 v2 里内联到父组件，未单独建文件，9 项）
+
+| 蓝图组件 | 内联位置 | 原因 |
+| --- | --- | --- |
+| `MessageVariantSwitcher`/`MessageActionMenu` | `writing/ChatMessage.vue` | 8 emit 契约要求单一组件持有，拆分增加 prop 传递复杂度 |
+| `InstanceVariableEditor` | `campaign/CampaignInstancesTab.vue` | 变量类型分支多但只在该 tab 用 |
+| `CampaignExportImportBar` | `campaign/CampaignPanel.vue` | |
+| `MvuStatusBlock` | `st/MvuStatusBar.vue` | 单变量块只服务状态栏 |
+| `MvuSchemaPreview`/`MvuApplyResult`/`MetaToolResultCard`/`TypedPatchList` | `meta/MetaPanel.vue` | Meta 内聚，拆分会跨组件传 patch DTO |
+| `RegexScriptSummary` | `config/PresetPanel.vue` | |
+| `DisplayContentBoundary` | `st/RichContent.vue` | |
+
+### 保留原位未迁入 v2（契约依赖，3 项）
+
+| 蓝图组件 | 原位文件 | 原因 |
+| --- | --- | --- |
+| `PluginHostFrame`/`PluginSlotRenderer` | `components/PluginHost.vue` | 半脆弱测试 `tests/plugin-host-slots.test.mjs` 正则读 `<script>` 段 + 6 个 slot helper 导出 |
+| `MvuJsRuntimeHost` | `components/MvuJsRuntime.vue` | 半脆弱测试 `tests/mvu-runtime-bridge.test.mjs` 正则读 `SHIM_SCRIPT` 标记 |
+| `CharacterListPanel` | `components/CharacterList.vue` | AppV2 仍引用作角色选择列表 |
+
+### 未实现 / 蓝图未要求单独建件（2 项）
+
+| 蓝图组件 | 状态 | 说明 |
+| --- | --- | --- |
+| `MobileNavigationDrawer` | 由 `PrimarySidebar` + AppShell 断点响应承载 | 桌面常驻左栏，移动端用 Overlay 抽屉模式 |
+| `CampaignDetailTabs` | 由 `CampaignPanel` 内联 `ui/Tabs` 承载 | 不单独建件 |
+| `CardDetailPreview` | 由 `CardLibrary` 选中态承载 | |
+| `CampaignList` | 由 `CardLibrary` 卡片展开承载 | |
+| `CharacterDetailPanel` | **删除** | 重构后无对应入口，角色详情由 CharacterList + Campaign tabs 承载 |
+
+### 状态层与逻辑层（非组件，配套落地）
+
+- **Pinia stores**（`frontend/src/stores/`）：`campaign.js` / `writing.js` / `plugin.js` / `ui.js` + `index.js` 工厂。
+- **Composables**（`frontend/src/composables/`）：`useWriting` / `usePipeline` / `usePluginBridge` / `useConversation` / `useMessageVariants` / `useGreeting` / `useCharacterImport` / `useNewCampaignForm`，共 8 个。
+- **纯 util**（`frontend/src/utils/`）：新增 `forkCampaignName.js` / `roleLabel.js` / `consoleForwarding.js`；既有 17 个 util 全部冻结签名未改。
+- **根组装**：`frontend/src/AppV2.vue` 串起 shell + writing + campaign + meta + st + config + debug，`main.js` 挂载 `AppV2 + createPinia()`。
+
+### 验证
+
+- `node --test`：212 pass（含 16 个半脆弱测试：plugin-host-slots 6 + mvu-runtime-bridge 10）。
+- `vitest`：21 pass（ui 库组件挂载测试，`tests/components-v2/`）。
+- `npm run build`：422KB 产物。
+- 契约红线：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode` 全部保留。
+

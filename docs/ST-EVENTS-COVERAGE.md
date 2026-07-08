@@ -61,7 +61,16 @@
 
 ### 前端 direct emit（`broadcastPluginEvent` / `emitPromptHookEventAndWait`）
 
-| ST 事件 | Emit 位置（frontend/src/App.vue:行） | 触发路径 | 备注 |
+> **位置声明（2026-07-08 Phase 8 重构后）**：原 `App.vue` 已拆分为 `AppV2.vue` + `composables/`。下表"App.vue:行"是重构前的历史行号，仅作 emit 点语义参考。重构后 emit 点分布在：
+> - `composables/usePluginBridge.js`（broadcast/emit/audit 封装）
+> - `composables/useConversation.js`（CHAT_LOADED / MESSAGE_RECEIVED / restart）
+> - `composables/useMessageVariants.js`（MESSAGE_UPDATED / MESSAGE_SWIPED / MESSAGE_DELETED）
+> - `composables/useWriting.js`（MESSAGE_SENT / GENERATE_BEFORE_COMBINE_PROMPTS / CHAT_COMPLETION_PROMPT_READY）
+> - `AppV2.vue`（APP_READY onMounted / CHARACTER_LOADED）
+>
+> 如需精确行号，用 `grep -n "<事件名>" frontend/src/AppV2.vue frontend/src/composables/*.js` 重新定位。事件名、触发路径、衍生关系**未变**，只是承载文件迁移了。
+
+| ST 事件 | Emit 位置（重构前 App.vue:行，已迁移见上） | 触发路径 | 备注 |
 |---|---|---|---|
 | `APP_READY` | `App.vue:398` | 应用初始化 `onMounted` | — |
 | `CHAT_LOADED` | `App.vue:510,526,594,1045` | init / new conversation / restart / switch character | 4 个不同入口 |
@@ -120,7 +129,7 @@ PipelineEvent 通过 `WritingEvent::from_pipeline_event` 转为 `{ event_type, d
 
 - `GENERATE_BEFORE_COMBINE_PROMPTS`：frontend intent hook（`App.vue:252`），写作前修改 intent/prompt
 - `CHAT_COMPLETION_PROMPT_READY`：frontend + backend hook（`App.vue:253,264` + `start_writing`/`regenerate` 后端 prompt_hook_request 链路）
-- prompt hook 有基础脱敏审计记录（`frontend/src/App.vue:178-185` `recordPromptHookAudit` + `frontend/src/utils/promptHooks.js` `appendPromptHookAuditRecord`）
+- prompt hook 有基础脱敏审计记录（重构后承载在 `frontend/src/composables/usePluginBridge.js` 的 `recordPromptHookAudit`，原 `App.vue:178-185` 已迁移；底层 `frontend/src/utils/promptHooks.js` 的 `appendPromptHookAuditRecord` 未变）
 
 ### 插件事件订阅与脱敏
 

@@ -19,6 +19,19 @@
 
 ## 最新提交
 
+前端重构 Phase 8(8 个 commit,详见 `docs/FRONTEND-REBUILD-2026-07-08.md`):
+
+- `ab70021 chore: remove legacy frontend code, finalize phase 8` — 删除旧 App.vue + 20 旧组件,保留 3 个契约文件
+- `aca27a3 feat: switch to AppV2 as main entry with pinia` — main.js 切换 AppV2+Pinia
+- `b6cda84 feat: rebuild meta/st/config/debug panels (p2/p3)` — meta 6 + config 4 + st 2 + debug 4
+- `455be3e feat: rebuild writing workspace + campaign panel + AppV2 assembly` — writing 7 + campaign 7 + AppV2 组装
+- `76b7107 feat: extract app.vue logic into composables` — 8 composable + 3 纯 util
+- `c6985d1 feat: add ui component library + vitest for component testing` — 24 个 ui 组件 + 双轨测试
+- `7e9da68 feat: extract pinia stores from app.vue state` — 4 个 store(campaign/writing/plugin/ui)
+- `81e1608 chore: scaffold frontend rebuild v2 (pinia, headless ui, dirs)` — 装依赖 + 建目录
+
+更早的提交(T1-T9 收尾批次,已合入 main):
+
 - `9c9d6de style: cargo fmt`
 - `1580fa6 feat: add prompt hook audit export with redaction verification`
 - `c54a7cf docs: add st events coverage index`
@@ -29,22 +42,18 @@
 - `2369591 docs: standardize release-checklist state markers with unified enum`
 - `1e466a6 docs: polish user-guide with screenshot placeholders and code-aligned markers`
 - `d4d1ffa test: add ui smoke runner`
-- `d72164b feat: audit prompt hook mutations`
-- `339d892 fix: align st popup constants`
-- `9498146 feat: add st tavern event globals`
-- `3e8d781 fix: satisfy release clippy gate`
 - 更早的 ST/插件兼容补强包括 common ST message aliases、slash unregister shim、prompt hooks fail-open 和真实复杂卡 smoke 记录。
 
 ## 发布闸门最新记录
 
-2026-07-08 完整六步通过（commit 栈 9c9d6de 及之前 7 个提交）：
+2026-07-08 完整六步通过（commit 栈 `ab70021` 前端重构 Phase 8 全部 9 阶段完成）：
 
 1. ✅ secret scan
 2. ✅ cargo fmt --check
 3. ✅ cargo clippy --workspace --all-targets -- -D warnings
-4. ✅ cargo test --workspace（所有测试通过，真实 LLM 用例按预期 ignore）
-5. ✅ frontend npm.cmd test（157 个测试全通过）
-6. ✅ frontend npm.cmd run build（通过，仅存已知 Vite dynamic import warning）
+4. ✅ cargo test --workspace（555 pass，真实 LLM 用例按预期 ignore）
+5. ✅ frontend npm.cmd test（node --test 212 pass + vitest 21 pass，双轨）
+6. ✅ frontend npm.cmd run build（422KB，仅存已知 Vite dynamic import warning）
 
 ## 如何验证
 

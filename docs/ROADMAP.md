@@ -194,3 +194,29 @@
 - 项目有明确的 post-mainline 优先级，不再无序扩张。
 
 详细计划见 `docs/PLAN-POST-MAINLINE.md`。
+
+## Phase 8: 前端架构重构
+
+**状态：已完成**（9 个阶段全部落地，2026-07-08；8 个 commit 栈 `81e1608`…`ab70021`）
+
+目标：把 1462 行的 `App.vue` 单文件拆成组件化、可测试、状态集中的现代前端架构，并清掉替换后的旧代码。
+
+任务：
+
+- ~~引入 Pinia 做状态层，按域拆 4 个 store（campaign/writing/plugin/ui）。~~ ✅ 阶段 1
+- ~~建 24 个基础 UI 组件（19 手写 + 5 Headless UI 承载），补组件挂载测试层。~~ ✅ 阶段 2
+- ~~把 App.vue 内联业务逻辑抽成 8 个 composable + 3 个纯 util。~~ ✅ 阶段 3
+- ~~搭 shell 应用框架（AppShell/TopBar/PrimarySidebar/InspectorDrawer/PanelHost）。~~ ✅ 阶段 4
+- ~~重写写作工作台（ChatMessage 保留 8 emit 契约）+ AppV2 首次组装。~~ ✅ 阶段 5
+- ~~重写 Campaign 面板（CampaignPanel 保留 refreshActiveDetailTab 契约）+ 4 个 tab。~~ ✅ 阶段 6
+- ~~重写 meta/st/config/debug 面板（MetaPanel 保留 mvu-applied 契约）。~~ ✅ 阶段 7
+- ~~main.js 切换到 AppV2 + Pinia，旧 App.vue 保留可回退。~~ ✅ 阶段 8
+- ~~删除旧 App.vue + 20 个旧组件，保留 PluginHost/MvuJsRuntime/CharacterList（契约依赖）。~~ ✅ 阶段 9
+
+验收：
+
+- ✅ 双轨测试：node --test 212 pass + vitest 21 pass，不破坏既有护城河（含 16 个半脆弱测试）。
+- ✅ 构建产物 422KB，仅存已知 Vite dynamic import warning。
+- ✅ 契约红线全部保留：ChatMessage 8 emit、CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`；`tauri-api.js`/`plugin-bridge.js`/`utils/*.js` 签名零改动。
+
+详细计划见 `docs/FRONTEND-REBUILD-2026-07-08.md`（执行手册）与 `docs/FRONTEND-COMPONENTS.md`（组件蓝图 + 实现状态映射）。

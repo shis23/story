@@ -3,7 +3,7 @@
 > 用途：证明核心身份/状态闭环有测试覆盖。新加测试要在本表登记。
 > 日期：2026-07-08
 > 对应：`docs/PLAN-POST-MAINLINE.md` 阶段 2（回归测试与评测基线）
-> 对应：`docs/WORK-NEXT-2026-07-08.md` T1
+> 对应：`docs/archive/2026-07-08-completed-plans/WORK-NEXT-2026-07-08.md` T1（已归档）
 
 ## 列说明
 
@@ -151,15 +151,15 @@
 |---|---|---|
 | `retain()` 单元测试 (ToolRegistry) | 中 | `filter_registry_by_whitelist` 被 B8 harness 覆盖，但 `ToolRegistry::retain` 本身无单元测试 |
 | 知识隔离：同名 instance 时 name 匹配失效逼 id（postprocess 层） | 高 | B4 覆盖了 writeback_isolation 层，但 `persist_postprocess_outcome_to_store` 层无同名 name→id 解析失败时的存储层测试 |
-| postprocess 写回：不认识的角色名被跳过 | 中 | 见 `docs/WORK-NEXT-2026-07-08.md` T4 |
-| postprocess 写回：campaign_id 不一致的 task 被拒绝 | 中 | 同上 |
-| postprocess 写回：空 present_chars 不写 private knowledge | 中 | 同上 |
-| 前端 Pipeline trace 映射 | 高 | `SubagentSnapshot` 的 `display_name`/`character_instance_id`/`fallback_reason` 展示逻辑无纯模型测试，见 T2 |
-| 前端 Campaign 各 tab 刷新 | 高 | MetaPanel accept → 变量/knowledge tab 无测试覆盖，见 T3 |
-| 前端 MetaPanel accept → variable tab 刷新 | 高 | 同上 |
+| ~~postprocess 写回：不认识的角色名被跳过~~ | ✅ 已补 | T4 落地：`crates/tauri-app/src/lib.rs:11637 postprocess_skips_unknown_character_target` |
+| ~~postprocess 写回：campaign_id 不一致的 task 被拒绝~~ | ✅ 已补 | T4 落地：`crates/tauri-app/src/lib.rs:11707 postprocess_validates_task_belongs_to_campaign` |
+| ~~postprocess 写回：空 present_chars 不写 private knowledge~~ | ✅ 已补 | T4 落地：`crates/tauri-app/src/lib.rs:11770 postprocess_empty_present_chars_rejects_witnessed_knowledge` |
+| ~~前端 Pipeline trace 映射~~ | ✅ 已补 | T2 落地：`frontend/tests/pipeline-trace.test.mjs`（纯模型，`utils/pipelineTrace.js`） |
+| ~~前端 Campaign 各 tab 刷新~~ | ✅ 已补 | T3 落地：`frontend/tests/campaign-tab-refresh.test.mjs`（`utils/campaignTabRefresh.js`） |
+| ~~前端 MetaPanel accept → variable tab 刷新~~ | ✅ 已补 | 同上 T3 |
 | `AgentProfileConfigStore::save()` 验证前置 | 低 | save 前调用 `config.validate()`——有 store 集成测试否？ |
 
-前列缺口由 `docs/WORK-NEXT-2026-07-08.md` 的 T2/T3/T4 分别补。本节在补完后更新。
+T2/T3/T4 的缺口已在 `docs/archive/2026-07-08-completed-plans/WORK-NEXT-2026-07-08.md` 批次填补。剩余两项（ToolRegistry::retain、AgentProfileConfigStore save 前置验证）是低优先级增强，未列入当前批次。
 
 ## 添加新测试时的登记步骤
 
