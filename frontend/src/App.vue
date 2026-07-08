@@ -20,7 +20,7 @@ import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { findLastAssistantConversationNode } from './utils/conversationNodes.js'
 import { campaignCardOptionSuffix, preferredCampaignCard } from './utils/campaignCardStatus.js'
 import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
-import { emitPromptHookEventAndWaitForPlugins, resolveHookedIntent, resolveHookedMessages } from './utils/promptHooks.js'
+import { appendPromptHookAuditRecord, emitPromptHookEventAndWaitForPlugins, resolveHookedIntent, resolveHookedMessages } from './utils/promptHooks.js'
 
 const powerMode = ref(false)
 const messages = ref([])
@@ -104,8 +104,10 @@ const hookPlugins = ref([])
 const showSidebarPlugins = ref(false)
 const hookPluginSlots = ref({})
 const pluginPipelineEvents = ref([])
+const promptHookAuditRecords = ref([])
 let pluginPipelineEventSeq = 0
 const MAX_PLUGIN_PIPELINE_EVENTS = 100
+const MAX_PROMPT_HOOK_AUDIT_RECORDS = 100
 
 // 加载侧栏插件
 async function loadSidebarPlugins() {
@@ -173,6 +175,15 @@ function broadcastPluginEvent(event, data = {}) {
   pushPluginEventRecord({ event, data })
 }
 
+function recordPromptHookAudit(record) {
+  promptHookAuditRecords.value = appendPromptHookAuditRecord(
+    promptHookAuditRecords.value,
+    record,
+    MAX_PROMPT_HOOK_AUDIT_RECORDS,
+  )
+  logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(record)}`).catch(() => {})
+}
+
 function activeVariantForMessage(message) {
   return message?.variants?.[message.active_variant] || message?.variants?.[0] || null
 }
@@ -212,12 +223,16 @@ async function emitPluginEventAndWait(event, data = {}) {
   return payload
 }
 
-async function emitPromptHookEventAndWait(event, data = {}) {
+async function emitPromptHookEventAndWait(event, data = {}, stage = '') {
   return await emitPromptHookEventAndWaitForPlugins(
     hookPlugins.value,
     hookPluginHostRefs,
     event,
     data,
+    {
+      stage,
+      onAudit: recordPromptHookAudit,
+    },
   )
 }
 
@@ -234,8 +249,8 @@ async function runPromptHookEvents(intent) {
     ...chatEventPayload(),
   }
 
-  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload)
-  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload)
+  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload, 'frontend_intent')
+  payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload, 'frontend_intent')
 
   return resolveHookedIntent(payload, intent)
 }
@@ -254,7 +269,7 @@ async function handlePromptHookRequest(data = {}) {
         model: data.model || '',
       }),
       messages: originalMessages,
-    })
+    }, 'llm_messages')
     const messagesForBackend = resolveHookedMessages(payload, originalMessages)
     await pluginPromptHookResult(requestId, messagesForBackend, null)
   } catch (err) {

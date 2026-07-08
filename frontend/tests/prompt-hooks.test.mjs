@@ -2,9 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  appendPromptHookAuditRecord,
   emitPromptHookEventAndWaitForPlugins,
+  promptHookChangedKeys,
   resolveHookedIntent,
   resolveHookedMessages,
+  summarizePromptHookPayload,
 } from '../src/utils/promptHooks.js'
 
 test('runs prompt hook plugins sequentially and skips plugins without ModifyPrompt', async () => {
@@ -50,8 +53,63 @@ test('runs prompt hook plugins sequentially and skips plugins without ModifyProm
   assert.deepEqual(result, { prompt: 'base + first + second' })
 })
 
+test('records prompt hook audit entries without storing prompt text', async () => {
+  const audits = []
+  const plugins = [
+    { id: 'first', permissions: ['ModifyPrompt'], manifest: { name: 'First Hook' } },
+    { id: 'missing-host', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['first', {
+      async emitPluginEventAndWait(event, payload) {
+        return {
+          ...payload,
+          prompt: `${payload.prompt} secret suffix`,
+          messages: [
+            ...payload.messages,
+            { role: 'system', content: 'hidden system secret' },
+          ],
+        }
+      },
+    }],
+  ])
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    {
+      prompt: 'private prompt body',
+      messages: [{ role: 'user', content: 'private message body' }],
+    },
+    {
+      stage: 'frontend_intent',
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  assert.equal(result.prompt, 'private prompt body secret suffix')
+  assert.equal(audits.length, 2)
+  assert.equal(audits[0].pluginId, 'first')
+  assert.equal(audits[0].pluginName, 'First Hook')
+  assert.equal(audits[0].event, 'CHAT_COMPLETION_PROMPT_READY')
+  assert.equal(audits[0].stage, 'frontend_intent')
+  assert.equal(audits[0].status, 'ok')
+  assert.deepEqual(audits[0].changedKeys, ['messages', 'prompt'])
+  assert.equal(audits[0].inputSummary.prompt.type, 'string')
+  assert.equal(audits[0].inputSummary.prompt.length, 'private prompt body'.length)
+  assert.equal(typeof audits[0].inputSummary.prompt.hash, 'string')
+  assert.equal(audits[0].inputSummary.messages.length, 1)
+  assert.equal(audits[0].outputSummary.messages.length, 2)
+  assert.equal(JSON.stringify(audits).includes('private prompt body'), false)
+  assert.equal(JSON.stringify(audits).includes('hidden system secret'), false)
+  assert.equal(audits[1].pluginId, 'missing-host')
+  assert.equal(audits[1].status, 'missing_host')
+})
+
 test('prompt hooks fail open and continue when one plugin throws or returns undefined', async () => {
   const errors = []
+  const audits = []
   const plugins = [
     { id: 'first', permissions: ['ModifyPrompt'] },
     { id: 'throws', permissions: ['ModifyPrompt'] },
@@ -66,7 +124,7 @@ test('prompt hooks fail open and continue when one plugin throws or returns unde
     }],
     ['throws', {
       async emitPluginEventAndWait() {
-        throw new Error('hook failed')
+        throw new Error('hook failed with private prompt text')
       },
     }],
     ['undefined', {
@@ -86,11 +144,24 @@ test('prompt hooks fail open and continue when one plugin throws or returns unde
     hostRefs,
     'CHAT_COMPLETION_PROMPT_READY',
     { prompt: 'base' },
-    { onError: (error, plugin) => errors.push([plugin.id, error.message]) },
+    {
+      onError: (error, plugin) => errors.push([plugin.id, error.message]),
+      onAudit: (record) => audits.push(record),
+    },
   )
 
   assert.deepEqual(result, { prompt: 'base + first + last' })
-  assert.deepEqual(errors, [['throws', 'hook failed']])
+  assert.deepEqual(errors, [['throws', 'hook failed with private prompt text']])
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status, record.changedKeys]), [
+    ['first', 'ok', ['prompt']],
+    ['throws', 'error', []],
+    ['undefined', 'no_change', []],
+    ['last', 'ok', ['prompt']],
+  ])
+  assert.equal(audits[1].error.name, 'Error')
+  assert.equal(audits[1].error.messageLength, 'hook failed with private prompt text'.length)
+  assert.equal(typeof audits[1].error.messageHash, 'string')
+  assert.equal(JSON.stringify(audits).includes('private prompt text'), false)
 })
 
 test('prompt hook error reporting is also fail open', async () => {
@@ -99,7 +170,7 @@ test('prompt hook error reporting is also fail open', async () => {
     new Map([
       ['throws', {
         async emitPluginEventAndWait() {
-          throw new Error('hook failed')
+          throw new Error('hook failed with private prompt text')
         },
       }],
       ['last', {
@@ -131,4 +202,68 @@ test('resolves backend prompt hook messages with original fallback', () => {
 
   assert.equal(resolveHookedMessages({ messages: hookedMessages }, originalMessages), hookedMessages)
   assert.equal(resolveHookedMessages({ messages: null }, originalMessages), originalMessages)
+})
+
+test('summarizes prompt hook payloads and ring buffer records safely', () => {
+  const summary = summarizePromptHookPayload({
+    intent: 'do not log this',
+    prompt: 'or this',
+    messages: [{ role: 'user', content: 'nor this' }],
+    messageCount: 1,
+  })
+
+  assert.equal(summary.intent.length, 'do not log this'.length)
+  assert.equal(summary.messages.type, 'array')
+  assert.equal(summary.messages.length, 1)
+  assert.equal(JSON.stringify(summary).includes('do not log this'), false)
+  assert.equal(JSON.stringify(summary).includes('nor this'), false)
+  assert.deepEqual(
+    promptHookChangedKeys({ prompt: 'a', messageCount: 1 }, { prompt: 'b', messageCount: 1 }),
+    ['prompt'],
+  )
+  assert.deepEqual(
+    appendPromptHookAuditRecord([{ id: 1 }, { id: 2 }], { id: 3 }, 2),
+    [{ id: 2 }, { id: 3 }],
+  )
+})
+
+test('prompt hook audit stays fail-open for cyclic and hostile payloads', async () => {
+  const audits = []
+  const cyclic = { prompt: 'cycle source', count: 1n }
+  cyclic.self = cyclic
+  Object.defineProperty(cyclic, 'hostile', {
+    enumerable: true,
+    get() {
+      throw new Error('hostile getter private text')
+    },
+  })
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    [{ id: 'cyclic', permissions: ['ModifyPrompt'] }, { id: 'last', permissions: ['ModifyPrompt'] }],
+    new Map([
+      ['cyclic', {
+        async emitPluginEventAndWait() {
+          return cyclic
+        },
+      }],
+      ['last', {
+        async emitPluginEventAndWait(event, payload) {
+          return { prompt: 'still continued' }
+        },
+      }],
+    ]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { onAudit: (record) => audits.push(record) },
+  )
+
+  assert.equal(result.prompt, 'still continued')
+  assert.equal(audits.length, 2)
+  assert.equal(audits[0].status, 'ok')
+  assert.equal(audits[0].outputSummary.self.circular, true)
+  assert.equal(audits[0].outputSummary.count.type, 'bigint')
+  assert.equal(audits[0].outputSummary.hostile.type, 'unreadable')
+  assert.equal(JSON.stringify(audits).includes('cycle source'), false)
+  assert.equal(JSON.stringify(audits).includes('hostile getter private text'), false)
+  assert.deepEqual(audits[1].changedKeys, ['count', 'hostile', 'prompt', 'self'])
 })
