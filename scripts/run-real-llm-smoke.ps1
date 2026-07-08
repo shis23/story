@@ -279,7 +279,17 @@ function Invoke-SmokeSuite {
         $arguments = $command[1..($command.Count - 1)]
 
         Write-Host ("RUN: {0}" -f (Format-Command -Command $command))
-        & $executable @arguments
+        # cargo writes build progress to stderr; under ErrorActionPreference=Stop
+        # the merged 2>&1 would turn those lines into terminating errors. Lower
+        # to Continue while we stream native output through Out-Host (which keeps
+        # it off the function return pipeline so $result stays a clean hashtable).
+        $prevErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $executable @arguments 2>&1 | Out-Host
+        } finally {
+            $ErrorActionPreference = $prevErrorPreference
+        }
         $exitCode = $LASTEXITCODE
     } finally {
         Pop-Location
@@ -367,6 +377,8 @@ try {
     exit 0
 } catch {
     Write-Host ''
-    Write-Error $_.Exception.Message
+    # Write-Error 在 ErrorActionPreference=Stop 下会再次抛出并丢失原始异常上下文;
+    # 直接写 host 流 + 显式退出码,保证失败信息可见且退出码确定。
+    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
     exit 1
 }
