@@ -117,7 +117,14 @@ async fn run_direct_json_fallback(
             ChatMessage::user(&user_msg),
         ],
         tools: None,
-        params: Default::default(),
+        // P2-6：knowledge_updates JSON 在多角色场景下较大，默认 max_tokens=4096
+        // 会被截断导致解析失败（knowledge.json 不生成）。fallback 专门做 JSON 抽取,
+        // 无工具调用开销,放宽到 8192 降低截断概率。
+        params: storyforge_domain::llm::SamplingParams {
+            temperature: Some(0.3),
+            top_p: Some(0.95),
+            max_tokens: Some(8192),
+        },
         model: base_config.model.clone(),
     };
     let llm = runtime.llm();

@@ -51,7 +51,7 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 - 不要重复抽已有的任务。
 
 【输出格式】
-调用 emit_postprocess 工具，或直接输出 JSON（不要多余解释）：
+调用 emit_postprocess 工具，或直接输出 JSON。**只输出一个 JSON 对象，第一个字符必须是 `{`，最后一个字符必须是 `}`。严禁输出任何解释、说明、前导语、结语、Markdown、代码围栏（```）或自然语言。**冗长输出会被截断导致解析失败：
 {
   "knowledge_updates": [
     {
@@ -259,6 +259,19 @@ mod tests {
         assert!(POSTPROCESS_SYSTEM_PROMPT.contains("knowledge_updates"));
         assert!(POSTPROCESS_SYSTEM_PROMPT.contains("variable_updates"));
         assert!(POSTPROCESS_SYSTEM_PROMPT.contains("task_updates"));
+    }
+
+    #[test]
+    fn test_prompt_forbids_verbose_output() {
+        // P2-6：prompt 必须强制「纯 JSON 无解释」,否则冗长输出被截断导致解析失败。
+        assert!(
+            POSTPROCESS_SYSTEM_PROMPT.contains("严禁") && POSTPROCESS_SYSTEM_PROMPT.contains("解释"),
+            "prompt 必须明确禁止解释性输出"
+        );
+        assert!(
+            POSTPROCESS_SYSTEM_PROMPT.contains("第一个字符必须是"),
+            "prompt 必须要求首字符即 JSON 开头"
+        );
     }
 
     #[test]
