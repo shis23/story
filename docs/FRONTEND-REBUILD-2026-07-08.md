@@ -597,8 +597,8 @@ import { useWriting, useConversation, useMessageVariants } from './composables/.
 | 阶段 | 状态 | 提交 | 测试数 | 备注 |
 |---|---|---|---|---|
 | 0 | ✅ 完成 | (阶段0提交) | 157 旧全过 | 装依赖+建目录+stores/index.js+本文档;build 通过 |
-| 1 | ✅ 完成 | (本次提交) | 196(157旧+39新) | 4 个 store(campaign/writing/plugin/ui)+ 跨 store getter + test glob 扩为 `tests/**/*.test.mjs` |
-| 2 | ⬜ 待做 | | | |
+| 1 | ✅ 完成 | (阶段1提交) | 196(157旧+39新) | 4 个 store(campaign/writing/plugin/ui)+ 跨 store getter + test glob 扩为 `tests/**/*.test.mjs` |
+| 2 | ✅ 完成 | (本次提交) | node:196 + vitest:21 | 24 个 ui 组件(Button/IconButton/Input/Textarea/Select/SegmentedControl/Checkbox/Toggle/Slider/Badge/Progress/Toast/EmptyState/ErrorState/LoadingState/DataList/DataTable/DiffView/CodeBlock + Headless UI: Overlay/Dialog/Tabs/Menu/Tooltip);双轨测试:node --test 跑纯JS,vitest 跑组件挂载 |
 | 3 | ⬜ 待做 | | | |
 | 4 | ⬜ 待做 | | | |
 | 5 | ⬜ 待做 | | | |
