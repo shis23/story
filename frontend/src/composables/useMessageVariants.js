@@ -112,8 +112,9 @@ export function useMessageVariants(options = {}) {
         hint,
       }, (event) => handlePipelineEvent(event))
 
-      // 重拉对话刷新 UI（单一事实源）：后端按「最后一条 → 原地替换 / 中间 → 开分支」
-      // 落库，前端不臆测 variant 数组，直接以后端真实状态为准。
+      // 重拉对话刷新 UI（单一事实源）：后端按「truncate + append」落库（P1-1）——
+      // 目标 AI 节点及之后被截断,新成文作为最后一条 assistant 节点追加。前端不臆测
+      // variant 数组,直接以后端真实状态为准。
       const refreshed = await getConversation(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
@@ -234,7 +235,7 @@ export function useMessageVariants(options = {}) {
         hint: intent,       // user 的意图作为 hint 注入导演+编剧
       }, (event) => handlePipelineEvent(event))
 
-      // 重拉对话刷新（regenerate 替换了 AI 消息的 variant）
+      // 重拉对话刷新（regenerate 走 truncate + append,P1-1：目标 AI 回答及其后轮次被删除,新成文 append 为最后一条）
       const refreshed = await getConversation(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
