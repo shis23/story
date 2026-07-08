@@ -24,6 +24,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# ZCode 工具会话产物（plans/todo 等，不进版本库）
+.zcode/
+
 # 临时/测试文件
 _test_out.txt
 _dbg.txt
