@@ -1,6 +1,10 @@
 # StoryForge 用户指南（发布候选）
 
-> 状态：2026-07-07 发布候选。本文面向首次使用者，覆盖使用前准备、导入 ST PNG/JSON、创建 Campaign、写第一轮、查看状态、失败排障、导出 Campaign bundle、兼容/降级边界、本地数据与备份。界面入口名称可能随候选版本微调；不确定处以当前界面中含义相同的 Campaign、导入、导出、排障相关入口为准。
+> **文档状态**：2026-07-08，发布候选。本文面向首次使用者，覆盖使用前准备、导入 ST PNG/JSON、创建 Campaign、写第一轮、查看状态、失败排障、导出、兼容/降级边界、本地数据与备份。
+>
+> **校对状态**：各章节末尾标注了"校对状态"——`已核对代码` 表示与当前代码事实一致；`待补截图` 表示需要真实 UI 截图证据后填写。
+>
+> 界面入口名称以当前界面中含义相同的 Campaign、导入、导出、排障相关入口为准。
 
 ## 1. 使用前准备
 
@@ -21,8 +25,8 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 - Character Instance：某个 Campaign 里的角色实例。即使两个角色显示名相同，也应通过 instance id 隔离知识和变量。
 - Campaign：一次故事运行的容器，保存角色实例、对话树、摘要、知识、变量、任务、Meta patch 和 MVU 相关状态。
 - Pipeline trace：每轮写作中 Director、Subagent、Editor、Postprocess 的输入输出摘要，用来解释和排障。
-- Campaign bundle：用于备份、迁移、复现问题或分享 StoryForge 内部 Campaign 状态的导出包，内容以 StoryForge JSON 为主。
-- 排障 bundle：用于反馈失败的诊断包，通常包含 app/platform 摘要、数据目录/日志/会话路径摘要和关键 store 摘要；它不应包含真实 API key。
+- Campaign bundle（界面中导出按钮为 `JSON Bundle`）：用于备份、迁移、复现问题或分享 StoryForge 内部 Campaign 状态的导出包，内容以 StoryForge JSON 为主。
+- 排障 bundle（界面中在 LogPanel 点击 📦 或 "导出 bundle" 按钮触发）：用于反馈失败的诊断包，通常包含 app/platform 摘要、数据目录/日志/会话路径摘要和关键 store 摘要；它不应包含真实 API key。
 - StoryForge JSON：StoryForge 内部导出格式，不等同于原始 ST 卡。需要保留完整 Campaign 状态时，优先导出 Campaign bundle。
 
 ## 3. 导入 ST PNG/JSON
@@ -35,6 +39,10 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 
 导入失败时，不要在正式数据目录里反复覆盖。先记录卡文件名、文件类型、错误提示和发生时间；如果界面可用，立即导出排障 bundle。需要继续复现时，改用空白或临时测试数据目录。
 
+> 📷 **待补截图**：导入按钮/入口、文件选择器、导入成功后的角色列表刷新效果。（发布前补，文件放 `docs/images/`）
+
+**校对状态**：已核对代码。导入流程的文案和路径与代码一致。
+
 ## 4. 创建 Campaign
 
 1. 从已导入的角色卡创建 Campaign。
@@ -44,6 +52,10 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 5. 打开 Campaign 面板，确认 instances、variables、knowledge、tasks、summaries 等标签页可见。
 
 多角色 Campaign 中，尽量避免依赖显示名做判断。两个同名角色应被视为不同 instance，知识和变量也应落到对应的 instance id。
+
+> 📷 **待补截图**：创建 Campaign 的入口、角色选择界面、active Campaign 标识、Campaign 面板各 tab 缩略图。（发布前补，文件放 `docs/images/`）
+
+**校对状态**：已核对代码。创建 Campaign 流程与当前 CampaignPanel 实现一致。
 
 ## 5. 写第一轮
 
@@ -62,6 +74,10 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 - Pipeline trace 能显示本轮 Agent 摘要。
 - 写作结果落到当前 Campaign，而不是 legacy 单角色路径。
 
+> 📷 **待补截图**：写作入口绑定 active Campaign 的显示（头像/名称区域）、Composer 区域、等待生成时的状态、Pipeline trace 展开效果。（发布前补，文件放 `docs/images/`）
+
+**校对状态**：已核对代码。写作流程与 CampaignRuntimeContext + PipelineOrchestrator 代码一致。
+
 ## 6. 查看状态
 
 写作后重点查看这些位置：
@@ -73,7 +89,11 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 - Tasks：确认任务创建、完成、放弃等状态可见。
 - Meta：运行 health check，必要时查看“解释本轮生成”或类似解释入口。
 
-如果状态看起来不对，先按“出问题先做什么”处理，再决定是否使用 Meta patch。Meta patch 应先 preview，再 accept；dismiss 不应改变 Campaign 状态。
+如果状态看起来不对，先按”出问题先做什么”处理，再决定是否使用 Meta patch。Meta patch 应先 preview，再 accept；dismiss 不应改变 Campaign 状态。
+
+> 📷 **待补截图**：Campaign 面板各 tab（Instances / Variables / Knowledge / Tasks / Summaries）、Pipeline trace 折叠/展开、health check 结果、Meta preview diff 效果。（发布前补，文件放 `docs/images/`）
+
+**校对状态**：已核对代码。各 tab 组件（CampaignInstancesTab / CampaignKnowledgeTab / CampaignTasksTab）及 MetaPanel 的 health check + explain + patch preview/accept/dismiss 闭环都存在。
 
 ## 7. 出问题先做什么
 
@@ -89,19 +109,44 @@ StoryForge 的写作主线围绕 Campaign，而不是单张角色卡。
 
 反馈问题时，最有用的材料是：操作步骤、平台、版本、ST 文件名、错误提示、排障 bundle、必要时的 Campaign bundle，以及已经打码的截图。
 
-## 8. 导出 Campaign Bundle
+**校对状态**：已核对代码。LogPanel 的"导出 bundle"按钮 + `log_export_bundle` 命令 + `diagnostic_context_for_data_dir` 都存在。
 
-Campaign bundle 用于备份、迁移、排障复现或分享 StoryForge 内部 Campaign 状态。
+## 8. 导出
+
+StoryForge 提供两种导出方式，入口在 Campaign 面板的"导出"区域：
+
+### Campaign Bundle（JSON）
+
+用于备份、迁移、排障复现或分享 StoryForge 内部 Campaign 状态。
 
 1. 打开目标 Campaign。
-2. 在导出相关入口选择 Campaign bundle。
-3. 保存生成的 StoryForge JSON。
+2. 在 Campaign 面板的"导出"区域点击 **`JSON Bundle`** 按钮（导出过程中按钮变为`导出中…`）。
+3. 保存生成的 StoryForge JSON（文件名由 Tauri 文件对话框指定）。
 4. 记录 StoryForge 版本、导出时间和 Campaign 名称。
-5. 如需排障，同时导出排障 bundle。
+5. 如需排障，同时到 LogPanel 点击 📦 按钮导出排障 bundle。
+
+### ST 卡 PNG
+
+用于与 SillyTavern 或其他 ST 兼容工具交换角色数据。
+
+1. 在 Campaign 面板的"导出"区域点击 **`ST 卡 PNG`** 按钮。
+2. 每个角色保存为独立的 ST 兼容 PNG。
+
+### 排障 bundle
+
+1. 打开 LogPanel（调试面板的日志标签页）。
+2. 点击 📦 按钮（title="导出 bundle"）。
+3. 文件内容包含 app/platform 摘要、数据目录/日志/会话路径、关键 store 摘要；**不包含真实 API key**。
+
+### 导出后建议
 
 导出后建议做一次冒烟检查：重新导入或打开导出物，确认角色实例、对话、摘要、知识、变量和任务仍在。
 
 Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embedder 配置文件应只保存 `storyforge-secret:v1:*` 形式的引用，真实 key 由系统凭据库存储。
+
+> 📷 **待补截图**：Campaign 面板"导出"区域（JSON Bundle / ST 卡 PNG 两个按钮）。（发布前补，文件放 `docs/images/`）
+
+**校对状态**：已核对代码。按钮文案 `JSON Bundle` / `ST 卡 PNG` / 排障 bundle 📦 均与 frontend 代码一致。
 
 ## 9. ST 兼容/降级边界
 
@@ -125,13 +170,16 @@ Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embed
 
 这些边界用于降低误解：发布候选可以跑主流程和常见兼容场景，但不要把它描述成正式全量 ST 运行时。
 
+**校对状态**：已核对代码。所列兼容范围与 ROADMAP Phase 5、HANDOFF、PLAN-ST-IMPORT-EXPORT.md、PLAN-PLUGIN-MVU.md 的已实现范围一致。边界声明与 HANDOFF 的诚实约束（"不承诺完整 ST 99 事件全集"等）一致。
+
 ## 10. 本地数据与备份
 
 StoryForge 以本地数据为主。应用不应被视为云同步或唯一备份来源；重要 Campaign 需要用户主动导出 Campaign bundle。
 
 桌面端：
 
-- 应用数据目录由 StoryForge/Tauri 管理。正常使用时不要在应用运行中手工移动、复制或覆盖内部 store 文件。
+- 应用数据目录由 StoryForge/Tauri 管理。Windows 桌面端数据目录为 `%APPDATA%\StoryForge`（即 `C:\Users\<用户名>\AppData\Roaming\StoryForge`），包含各 store JSON 文件（cards、campaigns、instances、knowledge、tasks、round_summaries、mvu_translations、connections、global_regex_scripts 等）。
+- 正常使用时不要在应用运行中手工移动、复制或覆盖内部 store 文件。
 - 测试版、开发版或复现失败时，尽量使用单独的测试数据目录；正式写作使用稳定的正式数据目录。
 - 排障 bundle 会记录 data、log、conversation 等路径摘要，帮助定位问题，但不应导出真实 API key。
 - 升级前建议导出 Campaign bundle；遇到失败时再保留一份排障 bundle。
@@ -149,6 +197,8 @@ Android：
 - 不要手工复制或公开含真实凭据的系统文件；也不要把 `connections.json`、`embed.json` 当作凭据备份。
 - 如果迁移失败，停止写入并保留旧目录；不要用新空目录覆盖旧数据。
 
+**校对状态**：已核对代码。数据目录的 `get_app_data_dir()` 返回 Windows `%APPDATA%\StoryForge`；各 store JSON 文件名与 `campaign_store.rs`、`connection_store.rs` 等实现一致。Android 数据目录未在本机确认，mark 为待真机。
+
 ## 11. 首次使用检查
 
 完成第一局 Campaign 前，逐项确认：
@@ -163,3 +213,5 @@ Android：
 - Summaries、Knowledge、Variables、Tasks 至少能打开查看。
 - 可导出 Campaign bundle。
 - 失败时知道先导出排障 bundle，再记录步骤和错误提示。
+
+**校对状态**：已核对代码。首次使用检查表项与当前主流程（导入→创建 Campaign→写作→查看→导出）一致。
