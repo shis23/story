@@ -36,12 +36,14 @@
  *   - loadSidebarPlugins()         App.vue:113-127
  *   - setupConsoleForwarding()     App.vue:402-412
  */
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import AppShell from './components-v2/shell/AppShell.vue'
 import CampaignOverview from './components-v2/writing/CampaignOverview.vue'
 import ConversationHistoryList from './components-v2/writing/ConversationHistoryList.vue'
 import ConversationViewport from './components-v2/writing/ConversationViewport.vue'
 import Composer from './components-v2/writing/Composer.vue'
+import CampaignPanel from './components-v2/campaign/CampaignPanel.vue'
+import MetaPanel from './components-v2/meta/MetaPanel.vue'
 import {
   useWritingStore,
   useCampaignStore,
@@ -141,6 +143,18 @@ const viewportRef = ref(null)
 function scrollToBottom() {
   // viewport 仅在 write 视图存在；其他视图调用为 no-op
   viewportRef.value?.scrollToBottom?.()
+}
+
+// ─── 功能面板 refs + 事件桥 ───
+// CampaignPanel ref：MetaPanel mvu-applied 后调用其 refreshActiveDetailTab（App.vue:56-61 链）
+const campaignPanelRef = ref(null)
+
+// lastConversationNode：生成溯源入口（campaign store getter）
+const lastConversationNode = computed(() => campaign.lastConversationNode)
+
+// MVU Apply 成功后刷新 Campaign 当前 detail 子 tab
+function handleMvuApplied() {
+  campaignPanelRef.value?.refreshActiveDetailTab?.()
 }
 
 // ─── Composable 装配 ───
@@ -291,7 +305,20 @@ onMounted(async () => {
     </template>
 
     <template #panels>
-      <!-- 阶段 6-7 补充：CampaignPanel / PluginPanel / CharList / ConnConfig / Preset / Meta 等面板 -->
+      <!-- 阶段 6-7 补充：CampaignPanel / Meta 等面板 -->
+      <CampaignPanel
+        v-if="ui.showCampaignPanel"
+        ref="campaignPanelRef"
+        @close="ui.showCampaignPanel = false"
+        @campaign-changed="(c) => { campaign.activeCampaign = c }"
+      />
+      <MetaPanel
+        v-if="ui.showMetaPanel"
+        :active-campaign="campaign.activeCampaign"
+        :last-conversation-node="lastConversationNode"
+        @close="ui.showMetaPanel = false"
+        @mvu-applied="handleMvuApplied"
+      />
     </template>
   </AppShell>
 </template>

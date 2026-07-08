@@ -602,8 +602,7 @@ import { useWriting, useConversation, useMessageVariants } from './composables/.
 | 3 | ✅ 完成 | (阶段3提交) | 212(196+16) | 8 composable + 3 纯 util;范围外依赖用 options 注入避免循环依赖 |
 | 4 | ✅ 完成 | (本次合并提交) | build 通过 | shell 5 组件(AppShell/TopBar/PrimarySidebar/InspectorDrawer/PanelHost) |
 | 5 | ✅ 完成 | (本次合并提交) | build 通过 | writing 7 组件(Composer/ChatMessage契约保留/StreamingMessage/GreetingSelector/ConversationViewport/ConversationHistoryList/CampaignOverview)+ AppV2.vue 组装,8 composable 拓扑序接线 |
-| 6 | ✅ 完成 | (本次合并提交) | build 通过 | campaign 7 组件(CampaignPanel保留refreshActiveDetailTab契约/4个Tab/CardLibrary/NewCampaignForm) |
-| 7 | ⬜ 待做 | | | |
+| 7 | ✅ 完成 | (本次提交) | build 通过,16半脆弱测试全过 | meta 6(MetaPanel拆分,保留mvu-applied契约)+ config 4 + st 2 + debug 4;PluginHost/MvuJsRuntime 保留原位(半脆弱测试依赖) |
 | 5 | ⬜ 待做 | | | |
 | 6 | ⬜ 待做 | | | |
 | 7 | ⬜ 待做 | | | |
