@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "test": "node --test \"tests/*.test.mjs\"",
+    "smoke:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/run-ui-smoke.ps1",
     "build": "vite build",
     "preview": "vite preview"
   },
