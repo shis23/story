@@ -327,7 +327,6 @@ defineExpose({ refreshActiveDetailTab })
               <CardLibrary
                 ref="cardLibraryRef"
                 @open-campaigns="openCampaignsForCard"
-                @import-bundle="handleImportBundle"
               />
             </template>
 

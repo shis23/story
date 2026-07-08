@@ -91,9 +91,8 @@ const EDITOR_SYSTEM_PROMPT: &str = r#"你是编剧。收集所有子 Agent 的�
 
 1. 节奏把控、视角切换、过渡衔接
 2. 输出最终成文（Markdown）
-3. 标注哪些子表演被你裁剪/改动了
 
-直接输出成文，不需要调用工具。"#;
+只输出正文本身，严禁输出任何说明、注释、改动标注、总结性文字、开场白或结语（例如「以下是合并后的成文」「我对某段做了裁剪」等）。第一行就必须是正文的开始。不需要调用工具。"#;
 
 const SUBAGENT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是角色 {name}。根据导演给你的任务和专属上下文，演出你这个角色在这场戏的行为/对白/心理。只演你自己，不要替别人说话。输出纯表演，不要解释。"#;
 
@@ -3587,6 +3586,29 @@ mod tests {
             cfg.terminal_tools.iter().any(|t| t == "emit_plan"),
             "terminal_tools 必须含 emit_plan，实际为 {:?}",
             cfg.terminal_tools
+        );
+    }
+
+    #[test]
+    fn test_editor_prompt_forbids_meta_commentary() {
+        // Editor prompt 历史上含「3. 标注哪些子表演被你裁剪/改动了」，主动要求 LLM 输出元描述，
+        // 导致元描述混入正文（P2-4）。必须改为显式禁止元描述，且不再要求标注改动。
+        // 防止日后误改回旧文本。
+        let cfg = make_editor_config(None, &[], None, None);
+        assert!(
+            !cfg.system_prompt.contains("标注哪些子表演被你裁剪/改动了"),
+            "editor prompt 不应再要求标注改动，实际为:\n{}",
+            cfg.system_prompt
+        );
+        assert!(
+            cfg.system_prompt.contains("严禁") && cfg.system_prompt.contains("说明"),
+            "editor prompt 必须显式禁止输出说明性文字，实际为:\n{}",
+            cfg.system_prompt
+        );
+        assert!(
+            cfg.system_prompt.contains("第一行"),
+            "editor prompt 必须要求第一行就是正文，实际为:\n{}",
+            cfg.system_prompt
         );
     }
 

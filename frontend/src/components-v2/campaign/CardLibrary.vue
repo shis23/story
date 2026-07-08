@@ -17,7 +17,7 @@ import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 
-const emit = defineEmits(['open-campaigns', 'import-bundle'])
+const emit = defineEmits(['open-campaigns'])
 
 // ─── Cards 状态 ───
 const cards = ref([])
@@ -86,11 +86,6 @@ function roleVariant(roleType) {
 
 <template>
   <div class="space-y-3">
-    <!-- 导入 Bundle 入口 -->
-    <div class="flex items-center justify-end gap-2">
-      <Button variant="default" size="sm" @click="emit('import-bundle')">导入 Bundle</Button>
-    </div>
-
     <LoadingState v-if="loadingCards" />
 
     <EmptyState

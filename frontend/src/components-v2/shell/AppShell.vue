@@ -26,7 +26,7 @@ const ui = useUiStore()
       </main>
 
       <!-- 右调试抽屉(桌面常驻用 v-if,移动用 overlay) -->
-      <aside v-if="ui.powerMode && false" class="hidden lg:block">
+      <aside v-if="ui.powerMode" class="hidden lg:block">
         <InspectorDrawer />
       </aside>
     </div>
