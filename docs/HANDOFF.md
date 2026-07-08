@@ -18,12 +18,32 @@
 
 ## 最新提交
 
+- `9c9d6de style: cargo fmt`
+- `1580fa6 feat: add prompt hook audit export with redaction verification`
+- `c54a7cf docs: add st events coverage index`
+- `a982614 test: add postprocess writeback boundary regression tests`
+- `dcdb04f test: extract campaign tab refresh mapping with test coverage`
+- `f3aadf2 test: extract subagent trace pure function with test coverage`
+- `c44d69c docs: add regression coverage index with verified test mappings`
+- `2369591 docs: standardize release-checklist state markers with unified enum`
+- `1e466a6 docs: polish user-guide with screenshot placeholders and code-aligned markers`
 - `d4d1ffa test: add ui smoke runner`
 - `d72164b feat: audit prompt hook mutations`
 - `339d892 fix: align st popup constants`
 - `9498146 feat: add st tavern event globals`
 - `3e8d781 fix: satisfy release clippy gate`
 - 更早的 ST/插件兼容补强包括 common ST message aliases、slash unregister shim、prompt hooks fail-open 和真实复杂卡 smoke 记录。
+
+## 发布闸门最新记录
+
+2026-07-08 完整六步通过（commit 栈 9c9d6de 及之前 7 个提交）：
+
+1. ✅ secret scan
+2. ✅ cargo fmt --check
+3. ✅ cargo clippy --workspace --all-targets -- -D warnings
+4. ✅ cargo test --workspace（所有测试通过，真实 LLM 用例按预期 ignore）
+5. ✅ frontend npm.cmd test（157 个测试全通过）
+6. ✅ frontend npm.cmd run build（通过，仅存已知 Vite dynamic import warning）
 
 ## 如何验证
 
