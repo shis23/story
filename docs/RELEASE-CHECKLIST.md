@@ -1,8 +1,24 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-08 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用“理论通过”替代。
+> 状态：2026-07-08 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用”理论通过”替代。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
+
+## 状态说明
+
+本文件中的验收项统一使用以下状态标记：
+
+| 状态 | 含义 | 后续操作 |
+|------|------|----------|
+| `待跑` | 自动化/手工可做但还没执行 | 安排执行，跑完更新为 `通过 YYYY-MM-DD` 或 `失败 YYYY-MM-DD` |
+| `待真机` | 需要 Android 真机才能验证 | 在真机测试后更新 |
+| `待截图` | 需要桌面 UI 截图作为证据 | 运行相关流程后补截图并更新 |
+| `通过 YYYY-MM-DD` | 已按步骤执行并满足预期 | 保持，除非后续改动破坏此项 |
+| `失败 YYYY-MM-DD` | 已执行但未满足预期 | 附失败日志/排障 bundle 路径，修复后重跑 |
+| `不适用` | 明确不做的项 | 附原因说明 |
+| `部分通过 YYYY-MM-DD` | 部分子项通过，部分仍待执行/待真机 | 附已通过和未通过的子项说明 |
+
+> 约束：任何项不得从 `待跑`/`待真机` 直接改为 `通过`——必须先执行再填结果。`通过` 必须附执行日期和来源（如 “自动化闸门”、”手动验收”、”真实 LLM suite”）。失败必须附失败日志或排障 bundle 路径（如 `artifacts/bronze/B1-2026-07-09/`）。
 > 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
 > 专项入口：真实复杂卡导入 + Campaign bundle roundtrip 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；若本机 Tauri lib 测试 harness 因 Windows loader `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 无法启动，只可追加 `-SkipTauriOnLoaderError` 取得 Tauri-free 导入保真局部 smoke，不能作为完整 S1 通过。B5 Meta 确定性后端冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1`。浏览器级 UI 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-ui-smoke.ps1`，若本机缺少 `@playwright/test` 会记录 skip，不能替代真实 Tauri UI 证据。真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
 
@@ -66,12 +82,7 @@
 
 ## 2. 执行记录规则
 
-每一行验收都需要记录候选版本、执行日期、执行人、平台、输入材料文件名、结果和失败附件位置。状态建议使用：
-
-- `待跑`：发布候选尚未执行。
-- `通过`：已按步骤执行并满足预期。
-- `失败`：已执行但未满足预期，必须附失败日志或排障 bundle。
-- `延期/非阻塞`：本候选版本不阻塞，必须写明原因和降级说明。
+每一行验收都需要记录候选版本、执行日期、执行人、平台、输入材料文件名、结果和失败附件位置。状态使用[第 0 节](#状态说明)定义的标准枚举。旧的状态写法（如"后端确定性 smoke 已通过；桌面 UI 证据待跑"）已统一改写为标准格式；阅读时以"状态"列的最新标记为准。
 
 失败时优先导出排障 bundle；不要在日志、文档、issue 或截图中写入真实 API key。连接配置文件应只出现 `storyforge-secret:v1:*` 形式的引用。
 
@@ -85,7 +96,7 @@
 | B2 多角色三轮 | 一张能抽取多个角色定义的 ST 卡或 JSON；同一数据目录保留三轮写作结果 | 1. 导入多角色卡。<br>2. 抽取 definitions。<br>3. 创建含多个 instance 的 Campaign。<br>4. 连续写 T1/T2/T3。<br>5. 每轮后打开 Pipeline 和 Campaign 面板。 | Director 能看到多个 instances；Subagent 分角色输出；Editor 输出正文；三轮后 summaries、knowledge、variables、tasks 至少有一类影响下一轮。 | app 日志；pipeline trace；Campaign bundle；若某轮失败，记录失败轮次和 Agent 阶段。 | 待跑 |
 | B3 同名隔离 | 两个同 display name 但不同 instance id 的角色，或能创建同名 instance 的测试 Campaign | 1. 创建两个同名 instance。<br>2. 给其中一个角色制造私有知识或变量。<br>3. 写一轮让 postprocess 写回。<br>4. 查看 knowledge 和 variables tab。 | 知识、变量按 instance id 落盘；同名角色不串写；name 匹配歧义时不会静默写错目标。 | app 日志；Campaign bundle；knowledge/variables 面板截图；相关 pipeline trace。 | 待跑 |
 | B4 后处理写回 | B2 的三轮 Campaign，或一张明确会产生知识、变量、任务、摘要的测试卡 | 1. 写作后等待 postprocess 完成。<br>2. 打开 summaries、knowledge、variables、tasks。<br>3. 检查 A→B→C 传话链示例。<br>4. 重启 app 后再次查看。 | 本轮摘要出现；知识面板显示知道者、来源者和 provenance；传话链可显示；变量落在正确 instance 或 campaign；任务创建/完成/放弃可见；重启后 active Campaign 和状态恢复。 | app 日志；`log_export_bundle`；Campaign bundle；重启前后截图。 | 待跑 |
-| B5 Meta 解释与修复 | 已有至少一轮生成、trace 和 provenance 的 Campaign；一个可触发 health issue 的小问题 | 1. 打开 Meta 面板。<br>2. 运行 health check。<br>3. 查看“解释本轮生成”。<br>4. 生成 patch preview。<br>5. 分别验证 dismiss 和 accept。<br>自动子项：运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1`。 | 解释能引用真实 trace/provenance；patch 先 preview，不直接写核心数据；dismiss 不改状态；accept 后对应 tab 刷新。 | Meta 面板截图；app 日志；patch preview 内容；Campaign bundle；meta smoke 输出。 | 后端确定性 smoke 已通过；桌面 UI 证据待跑 |
+| B5 Meta 解释与修复 | 已有至少一轮生成、trace 和 provenance 的 Campaign；一个可触发 health issue 的小问题 | 1. 打开 Meta 面板。<br>2. 运行 health check。<br>3. 查看”解释本轮生成”。<br>4. 生成 patch preview。<br>5. 分别验证 dismiss 和 accept。<br>自动子项：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1`。 | 解释能引用真实 trace/provenance；patch 先 preview，不直接写核心数据；dismiss 不改状态；accept 后对应 tab 刷新。 | Meta 面板截图；app 日志；patch preview 内容；Campaign bundle；meta smoke 输出。 | 部分通过 2026-07-07（后端 smoke 通过；桌面 UI 证据待截图） |
 | B6 排障与恢复 | 任一已完成 B1-B5 的 Campaign；一次人为制造的失败场景，如断网或取消生成 | 1. 触发失败。<br>2. 确认 UI 或日志可见错误。<br>3. 导出排障 bundle。<br>4. 重启 app。 | 失败不会伪装成成功；active state 不损坏；导出包包含 app/platform、data/log/conversation 路径和 store 摘要；不泄露真实 API key。 | `log_export_bundle`；app 日志；失败时 UI 文案截图。 | 待跑 |
 
 ## 4. Silver ST 兼容验收矩阵
@@ -94,9 +105,9 @@ Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON；自动子项可用仓库根目录 `test-card.png` | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；若本机 Tauri lib harness 因 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 无法启动，可用 `-SkipTauriOnLoaderError` 记录 Tauri-free 局部 smoke，但仍需在可启动 Tauri harness 的环境补跑完整脚本。<br>2. 在 UI 导入卡。<br>3. 打开角色详情。<br>4. 创建 Campaign。<br>5. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出并可重新导入。 | 导入错误日志；导出的 Campaign bundle；角色详情截图；real-card smoke 输出。 | 2026-07-07 本机完整 real-card smoke 通过：导入保真、Campaign bundle roundtrip、离线 MVU plumbing 均通过；UI 真实操作待跑 |
-| S2 世界书注入 | 含 Constant、Selective、Both 世界书条目的卡；两条不同意图的用户输入 | 1. 写一轮命中关键词的输入。<br>2. 写一轮不命中关键词的输入。<br>3. 检查 Director system/tail 摘要。 | Constant/Both 稳定进入 Director system；Selective/Both 按关键词进入 Director tail；未命中条目不注入。 | pipeline trace；Director 输入摘要；app 日志。 | 自动语义已覆盖，UI/真实卡待跑 |
-| S3 MVU schema 与状态栏 | 含 MVU 变量定义和状态栏片段的卡；可触发变量变化的一轮写作 | 1. 打开 MVU schema preview。<br>2. 检查新增、覆盖、无变化字段。<br>3. apply schema。<br>4. 写一轮并查看状态栏。 | preview 能区分新增/覆盖/无变化；apply 后变量 tab 刷新；状态栏原生渲染展示关键变量；JS 执行失败时有降级提示。 | Meta/MVU preview 截图；app 日志；Campaign bundle；JS fallback warning。 | schema preview/apply/backfill 与状态栏纯模型自动子项已覆盖；UI 真实操作、真实卡写作与 JS fallback 待跑 |
+| S1 导入保真 | 至少一张复杂 ST/MVU PNG 或 JSON，包含世界书、开场白、标签、extensions 和 raw JSON；自动子项可用仓库根目录 `test-card.png` | 1. 先运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；若本机 Tauri lib harness 因 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 无法启动，可用 `-SkipTauriOnLoaderError` 记录 Tauri-free 局部 smoke，但仍需在可启动 Tauri harness 的环境补跑完整脚本。<br>2. 在 UI 导入卡。<br>3. 打开角色详情。<br>4. 创建 Campaign。<br>5. 导出 StoryForge Campaign bundle。 | PNG/JSON 导入成功；世界书、开场白、标签、extensions 不丢；`raw_card_json` 保底保留；StoryForge bundle 可导出并可重新导入。 | 导入错误日志；导出的 Campaign bundle；角色详情截图；real-card smoke 输出。 | 部分通过 2026-07-07（自动化 real-card smoke 通过；UI 真实操作待截图） |
+| S2 世界书注入 | 含 Constant、Selective、Both 世界书条目的卡；两条不同意图的用户输入 | 1. 写一轮命中关键词的输入。<br>2. 写一轮不命中关键词的输入。<br>3. 检查 Director system/tail 摘要。 | Constant/Both 稳定进入 Director system；Selective/Both 按关键词进入 Director tail；未命中条目不注入。 | pipeline trace；Director 输入摘要；app 日志。 | 部分通过 2026-07-07（自动语义测试覆盖；UI/真实卡待截图） |
+| S3 MVU schema 与状态栏 | 含 MVU 变量定义和状态栏片段的卡；可触发变量变化的一轮写作 | 1. 打开 MVU schema preview。<br>2. 检查新增、覆盖、无变化字段。<br>3. apply schema。<br>4. 写一轮并查看状态栏。 | preview 能区分新增/覆盖/无变化；apply 后变量 tab 刷新；状态栏原生渲染展示关键变量；JS 执行失败时有降级提示。 | Meta/MVU preview 截图；app 日志；Campaign bundle；JS fallback warning。 | 部分通过 2026-07-07（schema preview/apply/backfill 与状态栏纯模型自动子项已覆盖；UI 真实操作、真实卡写作与 JS fallback 待截图） |
 | S4 Regex/HTML 降级 | 含 `promptOnly`、`markdownOnly`、display-only HTML、`minDepth/maxDepth`、Slash placement 3 和 reasoning 块的卡 | 1. 导入卡并写一轮。<br>2. 用普通输入和 `/` 前缀输入分别触发写作。<br>3. 检查 prompt 注入、消息展示和持久化内容。<br>4. 记录任何降级提示。 | `promptOnly` 不污染显示/存储；`markdownOnly` 不污染 prompt/持久化；display-only HTML 安全渲染；depth 过滤和 `<think>/<thinking>` 处理符合当前实现；Slash placement 3 只作用于 `/` 前缀输入且随后继续执行 Input 正则；不支持路径有清晰提示。 | pipeline trace；消息截图；app 日志；降级记录。 | 待跑 |
 | S5 导出兼容 | S1-S4 生成的 Campaign；至少一条知识和一条变量 | 1. 导出 StoryForge JSON bundle。<br>2. 导出 ST 卡 PNG 或共享 lorebook（若入口可用）。<br>3. 重新导入导出物做冒烟检查。 | StoryForge 内部多角色 Campaign 不强行退化成单角色卡；导出物保留必要 Campaign 数据；ST 兼容导出说明降级边界。 | 导出 bundle；重新导入日志；导出文件名和大小记录。 | 待跑 |
 
