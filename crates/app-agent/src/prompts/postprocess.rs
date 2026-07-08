@@ -126,7 +126,11 @@ pub fn make_postprocess_config(agent_profile_config: Option<&AgentProfileConfig>
         max_tool_rounds: rounds_override.unwrap_or(5),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
-        terminal_tools: vec![],
+        // emit_postprocess 是"声明产出完成"的终止信号，必须列入 terminal_tools，
+        // 否则 runtime（run_tool_loop）在 LLM 调用 emit_postprocess 后不会终止，
+        // 循环到 max_tool_rounds 抛 MaxRoundsExceeded，整个 postprocess 失败。
+        // 对齐 character_extractor 的 terminal_tools: ["emit_characters"] 模式。
+        terminal_tools: vec!["emit_postprocess".into()],
     }
 }
 
@@ -234,6 +238,18 @@ mod tests {
     fn test_config_has_correct_role() {
         let cfg = make_postprocess_config(None);
         assert_eq!(cfg.role, AgentRole::PostProcessor);
+    }
+
+    #[test]
+    fn test_config_marks_emit_postprocess_as_terminal() {
+        // emit_postprocess 必须是终止工具，否则 run_tool_loop 在 LLM 调用后不终止，
+        // 循环到 max_tool_rounds 抛 MaxRoundsExceeded，postprocess 整体失败（B1 阻塞根因）。
+        let cfg = make_postprocess_config(None);
+        assert!(
+            cfg.terminal_tools.iter().any(|t| t == "emit_postprocess"),
+            "terminal_tools 必须含 emit_postprocess，实际为 {:?}",
+            cfg.terminal_tools
+        );
     }
 
     #[test]
