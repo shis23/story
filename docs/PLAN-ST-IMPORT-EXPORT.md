@@ -1,7 +1,7 @@
 # ST 导入/导出计划（SillyTavern Import/Export）
 
 > 状态：已实现（2026-06-19，W7 Campaign 导出已落地：ST 卡 PNG tEXt 写入 + 共享 lorebook + JSON bundle；ST 导入保真已覆盖 V2/V3；多角色识别 fallback 就绪）。2026-07-07 追加：StoryForge Campaign JSON Bundle 已支持导入 round-trip，导入时生成全新 card/campaign/instance/knowledge/task/summary ID 并重写引用，避免覆盖现有数据。2026-07-07 续补：ST `data` 顶层未知字段（如 `group_only`、`creator_notes`）通过 flatten `extra` 保留到 `raw_card_json` 并参与回导 round-trip；单卡 CharacterStore 也已持久化 raw/mes_example/post_history_instructions/character_version/embedded_world_info，使 `export_st_card_png` 不再经过精简 DTO 丢保真字段。
-> 关联：`docs/ROADMAP.md` Phase 5（已完成）、`docs/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
+> 关联：`docs/ROADMAP.md` Phase 5（已完成）、`docs/archive/2026-07-08-completed-plans/PLAN-CHARACTER-EXTRACTION.md`、`docs/PLAN-PLUGIN-MVU.md`
 
 ## 目标
 
@@ -45,7 +45,7 @@
 
 ### 角色识别现状
 
-- `crates/app-agent/src/character_extractor.rs` 已实现多角色识别（见 `PLAN-CHARACTER-EXTRACTION.md`）。
+- `crates/app-agent/src/character_extractor.rs` 已实现多角色识别（见 `docs/archive/2026-07-08-completed-plans/PLAN-CHARACTER-EXTRACTION.md`）。
 - 5 层兜底解析确保 LLM 输出不规范时仍能提取。
 - 识别失败时 `ExtractError::Parse` 会返回错误，调用方可 fallback 到单角色模式。
 

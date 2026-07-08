@@ -12,4 +12,9 @@
 
 - `docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md`
 
+2026-07-08 已完成计划归档到：
+
+- `docs/archive/2026-07-08-completed-plans/PLAN-AGENT-PROFILE.md`
+- `docs/archive/2026-07-08-completed-plans/PLAN-CHARACTER-EXTRACTION.md`
+
 若旧归档文档写着“当前执行入口见 `docs/PLAN-CAMPAIGN-MAINLINE.md`”，请按历史记录理解；新的发布状态和下一步任务应写入当前 `docs/` 顶层文档。

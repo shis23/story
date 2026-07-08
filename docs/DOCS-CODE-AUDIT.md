@@ -4,6 +4,14 @@
 > 范围：核对 README、ROADMAP、HANDOFF（2026-06-18 已归档）、ARCHITECTURE-AUDIT、PLAN-* 与当前源码的一致性。
 > 本轮同步包含代码事实更新：`AppState` 数据目录隔离、`CampaignStore` 写入错误传播/记录、集合级锁拆分、workspace/all-targets clippy 清理、知识传播封口 MVP、release checklist 初版。
 
+## 2026-07-08 文档整理增量
+
+- `PLAN-AGENT-PROFILE.md` 和 `PLAN-CHARACTER-EXTRACTION.md` 的主目标已完成，已归档到 `docs/archive/2026-07-08-completed-plans/`。后续模型参数增强、复杂卡抽取质量和真实 LLM 质量记录不再以这两个根目录 plan 作为当前入口。
+- 根目录仍保留活跃计划：`PLAN-ANDROID.md`、`PLAN-KNOWLEDGE-PROPAGATION.md`、`PLAN-PLUGIN-MVU.md`、`PLAN-POST-MAINLINE.md`、`PLAN-ST-IMPORT-EXPORT.md`。这些文档对应的 Android 真机、真实 LLM、插件/ST 全兼容和发布验收仍有未完成项。
+- Prompt hook 审计状态已更新：前端已有脱敏 ring buffer / app log 记录，覆盖插件 ID、事件名、耗时、错误摘要和 payload hash/长度；完整可筛选 UI、导出和长链路审计面板仍未完成。
+- UI smoke runner 已加入 `scripts/run-ui-smoke.ps1` 和 `frontend` 的 `npm run smoke:ui`，但当前环境缺少 `@playwright/test` 时只会记录 skip；它是浏览器级冒烟，不替代真实 Tauri 桌面 UI 截图和人工验收。
+- 当前文档口径：可以承诺 ST/插件主链路、常见别名、Slash 常用 shim、最终 messages 级 prompt hook 和 fail-open；不能承诺 ST 99 事件全集、完整 TavernHelper/Slash 冷门语义、完整插件沙箱或真实插件 Gold 档全通过。
+
 ## 结论
 
 当前文档的大方向来自代码现状，核心架构判断成立；但 Campaign 主链路已经完成到 Phase 5，不能再按早期“写作流水线仍主要消费扁平 Character”的状态执行：
@@ -138,7 +146,7 @@
 - 角色类型解析支持英文（protagonist/supporting/extra）和中文（主角/临场/龙套）。
 - 11 个测试全部通过（含 MockLlmClient 端到端闭环）。
 
-详细计划见 `docs/PLAN-CHARACTER-EXTRACTION.md`。
+详细历史计划见 `docs/archive/2026-07-08-completed-plans/PLAN-CHARACTER-EXTRACTION.md`。
 
 ### Meta Agent 和 MVU
 
@@ -267,7 +275,7 @@
 
 2026-07-07 增量核对：前端插件事件总线已接入主写作链路。`App.vue::handlePipelineEvent` 会记录最近 100 条写作/重 roll `PipelineEvent`，透传给 `DebugDrawer` 与 `PluginHost`；`PluginHost` 在 iframe 未 ready 时会短暂排队并在加载后 flush；`plugin-bridge.js::mapPipelineEventToPluginEvents` 会发送 `pipeline.<event_type>`、原始事件名，以及 `GENERATION_STARTED`、`STREAM_TOKEN`、`GENERATION_ENDED`、`MESSAGE_RECEIVED` 等常用 ST 别名。2026-07-07 追加：`generateBridgeScript` 已给插件 iframe 注入 ST 风格 `event_types` / `eventTypes` 和 `eventSource.on/once/makeFirst/makeLast/removeListener/emit`，并与 `storyforge.events` 共用同一个监听器集合。2026-07-07 再追加：`App.vue` 已开始把主聊天宿主动作规范化进同一 feed，覆盖 `APP_READY`、`CHAT_LOADED`、`CHAT_CHANGED`、`MESSAGE_SENT/RECEIVED/UPDATED/DELETED/SWIPED`、`CHARACTER_LOADED`。2026-07-07 续补：iframe shim 已补 `eventSource.emitAndWait`；`eventSource.emit` / `storyforge.events.emit` 现在会按监听器顺序等待 async listener，便于后续 prompt hook 类插件异步改写 payload。2026-07-07 续补：插件 iframe bridge 的插件侧请求、挂载和 ready 消息会使用注入的宿主 origin；宿主侧只接受当前 iframe `contentWindow` 发来的消息，API 响应优先回传请求 `origin`，sandboxed opaque origin 场景才保留必要的 `*` 回退。2026-07-07 续补：iframe 已注入 `TavernHelper` / `tavernHelper` 常用 alias shim，转发 events、Slash、statusbar、slot、storage、variables 和 LLM generate 到 `window.storyforge`；Slash invocation 已覆盖基础 raw/named/unnamed 参数且保留零参数命令兼容，TavernHelper selector-based variable helpers 会在插件本地作用域读写，避免 `{type:'message'|'global'|'preset'}` selector 被误发后端；上述路径均有 VM 单测覆盖。剩余缺口是 ST 99 事件全集的真实触发点、prompt 组装钩子和完整 TavernHelper 方法全集。
 
-2026-07-07 续补核对：`storyforge-app-agent::AgentRuntime` 已新增异步 `PromptHook` 接缝，普通、streaming、`run_tool_loop_with_layout` 三条 LLM request 构造路径都会在创建 `ChatRequest` 前给 hook 改写本轮 `messages` 副本；子 Agent 独立 runtime 会继承同一 hook。新增单测用 `SequentialLlmClient` 捕获三条入口的最终 request，断言 hook 追加的 marker 确实进入 LLM messages；另覆盖 hook pending 时全局 cancel 可中断等待，避免后续接 iframe prompt hook 时卡住生成。2026-07-07 再续补：前端 `PluginHost` 已接 host-to-iframe hook request/response，`plugin-bridge.js` 覆盖可信 source、超时/错误回退和 iframe 内 async `eventSource.emitAndWait` mutation；`App.vue::runPromptHookEvents` 会在写作前按声明 `ModifyPrompt` 权限的插件顺序触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 并把最终 `intent`/`prompt` 写回本轮入参。2026-07-07 三续补：`start_writing` / `regenerate` 现在会给 `PipelineOrchestrator` 注入前端 prompt hook，后端在最终 LLM request 前通过 `prompt_hook_request` 事件把真实 `messages` 发给常驻隐藏 `PluginHost`，前端按声明 `ModifyPrompt` 权限的插件顺序触发 `CHAT_COMPLETION_PROMPT_READY` 后通过 `plugin_prompt_hook_result` 回传；普通插件事件 feed 不再广播 `prompt_hook_request`，hook 返回值支持 immutable payload 串联，pending request 在取消/超时/错误时会清理；超时或插件错误 fail-open 回原 messages。当前仍未完成的是 ST 99 事件全集真实触发点、完整 TavernHelper/Slash 冷门方法全集和 prompt hook 审计日志细化。
+2026-07-07 续补核对：`storyforge-app-agent::AgentRuntime` 已新增异步 `PromptHook` 接缝，普通、streaming、`run_tool_loop_with_layout` 三条 LLM request 构造路径都会在创建 `ChatRequest` 前给 hook 改写本轮 `messages` 副本；子 Agent 独立 runtime 会继承同一 hook。新增单测用 `SequentialLlmClient` 捕获三条入口的最终 request，断言 hook 追加的 marker 确实进入 LLM messages；另覆盖 hook pending 时全局 cancel 可中断等待，避免后续接 iframe prompt hook 时卡住生成。2026-07-07 再续补：前端 `PluginHost` 已接 host-to-iframe hook request/response，`plugin-bridge.js` 覆盖可信 source、超时/错误回退和 iframe 内 async `eventSource.emitAndWait` mutation；`App.vue::runPromptHookEvents` 会在写作前按声明 `ModifyPrompt` 权限的插件顺序触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 并把最终 `intent`/`prompt` 写回本轮入参。2026-07-07 三续补：`start_writing` / `regenerate` 现在会给 `PipelineOrchestrator` 注入前端 prompt hook，后端在最终 LLM request 前通过 `prompt_hook_request` 事件把真实 `messages` 发给常驻隐藏 `PluginHost`，前端按声明 `ModifyPrompt` 权限的插件顺序触发 `CHAT_COMPLETION_PROMPT_READY` 后通过 `plugin_prompt_hook_result` 回传；普通插件事件 feed 不再广播 `prompt_hook_request`，hook 返回值支持 immutable payload 串联，pending request 在取消/超时/错误时会清理；超时或插件错误 fail-open 回原 messages。当前仍未完成的是 ST 99 事件全集真实触发点、完整 TavernHelper/Slash 冷门方法全集和 prompt hook 完整审计 UI/导出细化。
 
 2026-07-07 四续补核对：前端把 `App.vue` 的 prompt hook 插件筛选与 fallback 规则抽为 `promptHooks` 纯模型，并新增 `prompt-hooks.test.mjs` 覆盖多插件顺序、非 `ModifyPrompt` 插件跳过、`intent`/`prompt`/`messages` fallback；`plugin-bridge.test.mjs` 新增 TavernHelper `eventEmitAndWait` 返回 payload 串联、prompt hook alias、以及 ST 常见 `setVariables(data, selector)` / `updateVariablesWith(updater, selector)` 参数顺序。该补强是自动化证据，不代表 ST 99 事件全集或完整 TavernHelper 方法全集已完成。
 

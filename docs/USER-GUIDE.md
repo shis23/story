@@ -116,7 +116,7 @@ Campaign bundle 和排障 bundle 都不应包含真实 API key。连接和 embed
 
 需要明确降级或尚未承诺的范围：
 
-- 不承诺 ST 99 事件全集、全部 prompt hooks 或冷门事件全量兼容；前端已为声明 `ModifyPrompt` 的插件提供常驻隐藏 `PluginHost` hook host，支持 host→iframe 可等待 hook 请求/响应，并会在写作前触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 改写写作入参；写作/重 roll 的最终 LLM messages 级 hook 也已接入，插件错误或超时会回退原 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；全量 ST 事件、冷门 Slash/TavernHelper 语义和 prompt hook 审计日志仍在推进中。
+- 不承诺 ST 99 事件全集、全部 prompt hooks 或冷门事件全量兼容；前端已为声明 `ModifyPrompt` 的插件提供常驻隐藏 `PluginHost` hook host，支持 host→iframe 可等待 hook 请求/响应，并会在写作前触发 `GENERATE_BEFORE_COMBINE_PROMPTS` 与 `CHAT_COMPLETION_PROMPT_READY` 改写写作入参；写作/重 roll 的最终 LLM messages 级 hook 也已接入，插件错误或超时会回退原 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；prompt hook 已有基础脱敏审计记录；全量 ST 事件、冷门 Slash/TavernHelper 语义和完整审计 UI/导出仍在推进中。
 - Regex Slash placement 3 的最小 `/` 前缀 hook 已接入；插件桥已提供常用 Slash 命令注册/触发 fallback，并能解析基础 raw/named/unnamed 参数。
 - PluginHost 已支持 per-slot 斜杠/状态栏挂载；复杂 JS 状态栏仍需真实卡回归，JS 失败时应以降级提示和原生状态展示为准。
 - JSR/ST/TavernHelper API shim 只覆盖常用子集，依赖冷门 API、pipe 语义或完整 prompt hooks 的重 DOM 卡可能跳过 JS 更新。

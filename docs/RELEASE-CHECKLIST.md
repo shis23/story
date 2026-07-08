@@ -1,10 +1,10 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-07 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用“理论通过”替代。
+> 状态：2026-07-08 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用“理论通过”替代。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 > 预检参数：加 `-DryRun` 只打印 release gate 将执行的步骤、工作目录和命令；加 `-SecretScanOnly` 只运行 secret scan。
-> 专项入口：真实复杂卡导入 + Campaign bundle roundtrip 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；若本机 Tauri lib 测试 harness 因 Windows loader `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 无法启动，只可追加 `-SkipTauriOnLoaderError` 取得 Tauri-free 导入保真局部 smoke，不能作为完整 S1 通过。B5 Meta 确定性后端冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1`。真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
+> 专项入口：真实复杂卡导入 + Campaign bundle roundtrip 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1`；若本机 Tauri lib 测试 harness 因 Windows loader `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 无法启动，只可追加 `-SkipTauriOnLoaderError` 取得 Tauri-free 导入保真局部 smoke，不能作为完整 S1 通过。B5 Meta 确定性后端冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1`。浏览器级 UI 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-ui-smoke.ps1`，若本机缺少 `@playwright/test` 会记录 skip，不能替代真实 Tauri UI 证据。真实 LLM 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`；Android host-side 冒烟用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1`，打包时追加 `-BuildApk`。
 
 ## 0. 发布闸门
 
@@ -90,7 +90,7 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback、基础 invocation 解析和基础 pipe chaining，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；完整 ST 冷门 Slash 语义、ST 99 事件全集和 prompt hook 审计日志不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback、注销、基础 invocation 解析和基础 pipe chaining，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；prompt hook 已有基础脱敏审计 ring buffer / app log。完整 ST 冷门 Slash/TavernHelper 语义、ST 99 事件全集、完整审计 UI/导出不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
@@ -145,7 +145,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
-- 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参，并可在最终 LLM request 前通过后端 `prompt_hook_request` / `plugin_prompt_hook_result` 链路改写 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 控制正文暴露；但还不是 ST 99 事件全集，prompt hook 审计日志与冷门语义仍应避免过度承诺。
+- 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参，并可在最终 LLM request 前通过后端 `prompt_hook_request` / `plugin_prompt_hook_result` 链路改写 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 控制正文暴露；prompt hook 已有基础脱敏审计记录。但还不是 ST 99 事件全集，完整审计 UI/导出和冷门语义仍应避免过度承诺。
 - 2026-07-07 自动化补强：前端新增 `prompt-hooks.test.mjs` 固化 `ModifyPrompt` 插件顺序合并、非授权插件跳过、intent/prompt/messages fallback；`plugin-bridge.test.mjs` 继续覆盖 TavernHelper `eventEmitAndWait` payload 串联、prompt hook alias 和 ST 常见 selector 参数顺序。
 - 插件 API 桥已改为调用 `plugin_*` 专用后端命令并注入 `pluginId`，变量读取权限已从写权限中拆出；但变量写入仍保留 `WriteVariables` 直接兼容路径，完整 propose/preview 写入流仍需后续收口，发布说明不要把插件权限描述成完整第三方插件沙箱。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。
