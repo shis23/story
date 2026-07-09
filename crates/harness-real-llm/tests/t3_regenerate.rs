@@ -42,7 +42,10 @@ fn find_fixture(name: &str) -> std::path::PathBuf {
     }
 }
 
-/// 跑首轮写作，返回 (conversation_id, node_id, env)。
+/// 跑首轮写作，返回 (conversation_id, node_id)。
+///
+/// 真实 LLM 下导演偶尔返回空/非法 Plan（PlanParse）或瞬态网络错误（Llm），
+/// 这些是瞬态的——重试可消除 flaky。业务错误（Regenerate/InvalidState）重试无意义。
 async fn setup_first_draft(env: &HarnessEnv) -> (Id, Id) {
     let card_path = find_fixture("test-card-seraphina.png");
     let bytes = std::fs::read(&card_path)
@@ -56,21 +59,45 @@ async fn setup_first_draft(env: &HarnessEnv) -> (Id, Id) {
     let campaign_id = env.create_campaign(&card, "t3-campaign");
     eprintln!("Campaign 已激活: {campaign_id}");
 
-    let conversation_id = env.conv_store.create(None, None).id;
-    let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
-    let ctx = env.fill_campaign_context(ctx);
+    use storyforge_app_pipeline::PipelineError;
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err: Option<PipelineError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // 每次重试用全新 conversation，避免半写入的脏状态。
+        let conversation_id = env.conv_store.create(None, None).id;
+        let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+        let ctx = env.fill_campaign_context(ctx);
 
-    let mut pipeline = env.new_pipeline();
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut pipeline = env.new_pipeline();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-    let (_text, node_id, _provenance) = pipeline
-        .start_writing("开场：角色登场".into(), &ctx, event_tx, cancel_rx)
-        .await
-        .expect("start_writing 失败");
-
-    eprintln!("首轮完成: node_id={node_id}");
-    (conversation_id, node_id)
+        match pipeline
+            .start_writing("开场：角色登场".into(), &ctx, event_tx, cancel_rx)
+            .await
+        {
+            Ok((_text, node_id, _provenance)) => {
+                eprintln!("首轮完成: node_id={node_id}");
+                return (conversation_id, node_id);
+            }
+            Err(e) => {
+                // Llm（520/超时/限流）和 PlanParse（导演返回空 Plan）都是瞬态，
+                // 重试可消除；其余是业务错误，直接 panic 暴露真 bug。
+                let transient = matches!(e, PipelineError::Llm(_) | PipelineError::PlanParse(_));
+                eprintln!(
+                    "首轮 start_writing 第 {attempt}/{MAX_ATTEMPTS} 次失败 (transient={transient}): {e:?}"
+                );
+                if !transient {
+                    panic!("首轮 start_writing 业务错误（非瞬态，不重试）: {e:?}");
+                }
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    panic!("首轮 start_writing {MAX_ATTEMPTS} 次均因瞬态错误失败: {last_err:?}");
 }
 
 /// 跑一次 regenerate，对 LLM 层瞬态错误（520 / 超时 / 限流）重试，业务错误立即 panic。
@@ -105,7 +132,10 @@ async fn regenerate_with_retry(
         match pipeline.regenerate(req, &ctx, event_tx, cancel_rx).await {
             Ok(ok) => return ok,
             Err(e) => {
-                let transient = matches!(e, PipelineError::Llm(_));
+                // Llm（520/超时/限流）和 PlanParse（导演返回空 Plan）都是瞬态，
+                // 与 setup_first_draft 的瞬态判定保持一致。
+                let transient =
+                    matches!(e, PipelineError::Llm(_) | PipelineError::PlanParse(_));
                 eprintln!(
                     "regenerate 第 {attempt}/{MAX_ATTEMPTS} 次失败 (transient={transient}): {e:?}"
                 );
@@ -150,14 +180,23 @@ async fn t3_regenerate_all() {
         provenance.last_hint
     );
 
-    // variant 数 +1
+    // P1-1 语义：重 roll 走 truncate + append——旧 node 被截断删除，新成文作为
+    // 新的最后一条 assistant 节点追加（旧 AI 回答彻底消失，而非 variant 级软删）。
     let conv_after = env.conv_store.get(&conv_id).unwrap();
-    let node_after = conv_after.find_node(&node_id).unwrap();
-    assert_eq!(
-        node_after.variants.len(),
-        variants_before + 1,
-        "regenerate 后应多 1 个 variant"
+    assert!(
+        conv_after.find_node(&node_id).is_none(),
+        "P1-1: 重 roll 后旧 node 应被 truncate 删除"
     );
+    let last_node = conv_after
+        .nodes
+        .last()
+        .expect("重 roll 后应有新 assistant 节点");
+    assert_eq!(
+        last_node.variants.len(),
+        1,
+        "新成文节点应只有 1 个 variant（truncate 后新建）"
+    );
+    let _ = variants_before; // 保留计数变量，语义对照（旧实现用 variants_before+1）
 
     env.cleanup();
 }
@@ -189,13 +228,22 @@ async fn t3_regenerate_editor_only() {
         "hint 应透传到 provenance"
     );
 
+    // P1-1 语义：旧 node 被 truncate 删除，新成文 append 为最后一条 assistant 节点
     let conv_after = env.conv_store.get(&conv_id).unwrap();
-    let node_after = conv_after.find_node(&node_id).unwrap();
-    assert_eq!(
-        node_after.variants.len(),
-        variants_before + 1,
-        "editor regenerate 后应多 1 个 variant"
+    assert!(
+        conv_after.find_node(&node_id).is_none(),
+        "P1-1: editor regenerate 后旧 node 应被 truncate 删除"
     );
+    let last_node = conv_after
+        .nodes
+        .last()
+        .expect("editor regenerate 后应有新 assistant 节点");
+    assert_eq!(
+        last_node.variants.len(),
+        1,
+        "新成文节点应只有 1 个 variant"
+    );
+    let _ = variants_before;
 
     env.cleanup();
 }
