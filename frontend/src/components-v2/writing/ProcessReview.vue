@@ -22,21 +22,24 @@ const expanded = ref(false)
 
 const directorOutput = computed(() => writing.pipeline.director?.output || '')
 const directorStatus = computed(() => writing.pipeline.director?.status)
+const editorOutput = computed(() => writing.pipeline.editor?.output || '')
+const editorStatus = computed(() => writing.pipeline.editor?.status)
 const subagents = computed(() =>
   (writing.pipeline.subagents || []).filter(
     (s) => s && s.status && s.status !== 'pending' && s.status !== 'idle',
   ),
 )
 
-// 有过程数据可回顾（已完成态，且至少导演或子 Agent 有输出）
+// 有过程数据可回顾（已完成态，且至少导演/编剧/子 Agent 有输出）
 const hasReview = computed(
   () =>
     !writing.isWriting &&
     writing.pipeline.state === 'done' &&
-    (directorOutput.value || subagents.value.length),
+    (directorOutput.value || editorOutput.value || subagents.value.length),
 )
 
 const directorDetail = computed(() => writing.pipeline.director?.detail || '')
+const editorDetail = computed(() => writing.pipeline.editor?.detail || '')
 </script>
 
 <template>
@@ -81,6 +84,16 @@ const directorDetail = computed(() => writing.pipeline.director?.detail || '')
             <div v-if="s.output" class="mt-1 text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
               {{ s.output }}
             </div>
+          </div>
+        </div>
+
+        <!-- 编剧成文 -->
+        <div v-if="editorOutput">
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">
+            ✍️ 编剧成文
+          </div>
+          <div class="text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
+            {{ editorOutput }}
           </div>
         </div>
       </div>

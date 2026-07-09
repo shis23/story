@@ -180,23 +180,16 @@ async fn t3_regenerate_all() {
         provenance.last_hint
     );
 
-    // P1-1 语义：重 roll 走 truncate + append——旧 node 被截断删除，新成文作为
-    // 新的最后一条 assistant 节点追加（旧 AI 回答彻底消失，而非 variant 级软删）。
+    // variant 保留语义：旧 node 仍在，多 1 个 variant，旧 variant 降级 Discarded，
+    // 新 variant 设 active（可切回查看旧版本）。
     let conv_after = env.conv_store.get(&conv_id).unwrap();
-    assert!(
-        conv_after.find_node(&node_id).is_none(),
-        "P1-1: 重 roll 后旧 node 应被 truncate 删除"
-    );
-    let last_node = conv_after
-        .nodes
-        .last()
-        .expect("重 roll 后应有新 assistant 节点");
+    let node_after = conv_after.find_node(&node_id).unwrap();
     assert_eq!(
-        last_node.variants.len(),
-        1,
-        "新成文节点应只有 1 个 variant（truncate 后新建）"
+        node_after.variants.len(),
+        variants_before + 1,
+        "重 roll 后应多 1 个 variant（旧版本保留）"
     );
-    let _ = variants_before; // 保留计数变量，语义对照（旧实现用 variants_before+1）
+    assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
 
     env.cleanup();
 }
@@ -228,22 +221,15 @@ async fn t3_regenerate_editor_only() {
         "hint 应透传到 provenance"
     );
 
-    // P1-1 语义：旧 node 被 truncate 删除，新成文 append 为最后一条 assistant 节点
+    // variant 保留语义：旧 node 仍在，多 1 个 variant
     let conv_after = env.conv_store.get(&conv_id).unwrap();
-    assert!(
-        conv_after.find_node(&node_id).is_none(),
-        "P1-1: editor regenerate 后旧 node 应被 truncate 删除"
-    );
-    let last_node = conv_after
-        .nodes
-        .last()
-        .expect("editor regenerate 后应有新 assistant 节点");
+    let node_after = conv_after.find_node(&node_id).unwrap();
     assert_eq!(
-        last_node.variants.len(),
-        1,
-        "新成文节点应只有 1 个 variant"
+        node_after.variants.len(),
+        variants_before + 1,
+        "editor regenerate 后应多 1 个 variant（旧版本保留）"
     );
-    let _ = variants_before;
+    assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
 
     env.cleanup();
 }

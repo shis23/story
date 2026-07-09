@@ -9,7 +9,7 @@
  *
  * 保留原 tab(全部 / 后端 / LLM / 前端)与 level 过滤、刷新 / 清空 / 导出 bundle 行为。
  */
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { logQuery, logClear, logExportBundle } from '../../tauri-api.js'
 import Tabs from '../ui/Tabs.vue'
 import Select from '../ui/Select.vue'
@@ -120,7 +120,16 @@ const columns = [
   { key: 'message', label: '消息' },
 ]
 
-onMounted(loadLogs)
+// 定时轮询：写作/抽取产生的日志会持续写入 LogStore 内存 buffer，
+// 只 onMounted 拉一次的话用户看不到后续日志。3 秒轮询保证日志面板实时刷新。
+let pollTimer = null
+onMounted(() => {
+  loadLogs()
+  pollTimer = setInterval(loadLogs, 3000)
+})
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+})
 
 defineExpose({ loadLogs })
 </script>

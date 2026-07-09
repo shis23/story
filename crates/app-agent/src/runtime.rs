@@ -14,7 +14,8 @@ use storyforge_domain::agent::{
 };
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::llm::{
-    ChatMessage, ChatRequest, ChatResponse, LlmError, StreamChunk, ToolCall, ToolSpec,
+    ChatMessage, ChatRequest, ChatResponse, LlmError, SamplingParams, StreamChunk, ToolCall,
+    ToolSpec,
 };
 use storyforge_domain::message_layout::MessageLayout;
 use storyforge_infra_llm::LlmClient;
@@ -201,7 +202,13 @@ impl AgentRuntime {
                 } else {
                     Some(tool_registry.tool_specs())
                 },
-                params: Default::default(),
+                // max_tokens 不设（None）：让模型/endpoint 用自己的默认 output 上限。
+                // 硬编码 4096 会导致大 input 任务（角色抽取等）output 空间不足返回空。
+                // temperature/top_p 保留 default（1.0/0.95）。
+                params: SamplingParams {
+                    max_tokens: None,
+                    ..Default::default()
+                },
                 model: config.model.clone(),
             };
 
@@ -332,7 +339,11 @@ impl AgentRuntime {
                 } else {
                     Some(tool_registry.tool_specs())
                 },
-                params: Default::default(),
+                // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
+                params: SamplingParams {
+                    max_tokens: None,
+                    ..Default::default()
+                },
                 model: config.model.clone(),
             };
 
@@ -479,7 +490,11 @@ impl AgentRuntime {
                 } else {
                     Some(tool_registry.tool_specs())
                 },
-                params: Default::default(),
+                // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
+                params: SamplingParams {
+                    max_tokens: None,
+                    ..Default::default()
+                },
                 model: config.model.clone(),
             };
 

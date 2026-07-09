@@ -1414,26 +1414,32 @@ impl PipelineOrchestrator {
             campaign_runtime,
         );
 
-        // 写入对话树（P1-1 修复：truncate + append 语义）：
-        // 用户期望重 roll 时旧的模型回答被清掉——
-        //   - 重 roll 用户消息：前端把紧随其后的 AI 消息作为 node_id 传进来
-        //   - 重 roll 模型正文：直接以该 AI 消息为 node_id
-        // 两种情况都归结为「从目标 AI 节点开始截断」，再 append 新 AI 成文，
-        // 保证旧的 AI 回答（及其后续轮次）彻底从对话中消失，而非软删/开分支残留。
-        //
-        // 兼容目标不在最后的情况：truncate_from 删掉目标及之后所有节点，
-        // 新成文作为新的最后一条 assistant 节点追加。
-        if let Err(e) = self
+        // 写入对话树（variant 保留语义）：
+        // - 重 roll **最后一条** AI 消息 → replace_active_variant（旧 active 降级
+        //   Discarded，可切换切回查看；新 variant 设 active 为 Draft）
+        // - 重 roll **中间**消息 → add_variant（保留旧版，开分支）
+        // 后端按 nodes.last() 实时判定，避免前端 isLast 标志脏数据。
+        // 用户可继续重 roll 产生多个版本，用 variant 切换按钮对比，满意后 accept。
+        let is_last_ai = self
             .conv_store
-            .truncate_from(&req.conversation_id, &req.node_id)
-        {
-            return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
-        }
-        if let Err(e) = self.conv_store.append_ai_draft(
-            &req.conversation_id,
-            final_text.clone(),
-            Some(provenance.clone()),
-        ) {
+            .is_last_assistant_node(&req.conversation_id, &req.node_id)
+            .map_err(|e| self.abort_with(&event_tx, PipelineError::Conversation(e)))?;
+        let land = if is_last_ai {
+            self.conv_store.replace_active_variant(
+                &req.conversation_id,
+                &req.node_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            )
+        } else {
+            self.conv_store.add_variant(
+                &req.conversation_id,
+                &req.node_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            )
+        };
+        if let Err(e) = land {
             return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
         }
 
@@ -2826,19 +2832,17 @@ mod tests {
         // hint 应记录进 Provenance
         assert_eq!(provenance.last_hint.as_deref(), Some("节奏太快"));
 
-        // P1-1 语义：重 roll 走 truncate + append——旧 node 被截断,新成文作为
-        // 新的最后一条 assistant 节点追加(旧的 AI 回答被清掉)。
+        // variant 保留语义：重 roll 后该 node 多 1 个 variant（分支），
+        // 旧 variant 降级 Discarded（可切回），新 variant 设 active。
         let conv_after = conv_store.get(&conv_id).unwrap();
-        // 旧 node 已不存在(被 truncate)
-        assert!(
-            conv_after.find_node(&node_id).is_none(),
-            "重 roll 后旧 node 应被 truncate 删除"
+        let node_after = conv_after.find_node(&node_id).unwrap();
+        assert_eq!(
+            node_after.variants.len(),
+            variants_before + 1,
+            "重 roll 后应多 1 个 variant"
         );
-        // 新的 assistant 节点是最后一条,且只有 1 个 variant(新建)
-        let last_node = conv_after.nodes.last().expect("应有新 assistant 节点");
-        assert_eq!(last_node.variants.len(), 1);
-        assert_eq!(last_node.active_variant, 0);
-        let _ = variants_before; // 保留计数语义对照（旧实现用 variants_before+1）
+        // active 切到新 variant
+        assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
@@ -2873,13 +2877,9 @@ mod tests {
 
         assert_eq!(text, "REGEX_FILTERED_REGEN");
         let conv_after = conv_store.get(&conv_id).unwrap();
-        // P1-1: 旧 node 被 truncate,新成文 append 为最后一条 assistant 节点
-        assert!(
-            conv_after.find_node(&node_id).is_none(),
-            "重 roll 后旧 node 应被 truncate 删除"
-        );
-        let last_node = conv_after.nodes.last().expect("应有新 assistant 节点");
-        assert_eq!(last_node.active().unwrap().content, "REGEX_FILTERED_REGEN");
+        // variant 保留语义：旧 node 仍在，新 variant 是 active
+        let node_after = conv_after.find_node(&node_id).unwrap();
+        assert_eq!(node_after.active().unwrap().content, "REGEX_FILTERED_REGEN");
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
@@ -2912,15 +2912,15 @@ mod tests {
         assert_eq!(provenance.last_hint.as_deref(), Some("角色 B 语气太冷"));
         assert_eq!(provenance.seed, 42);
 
-        // P1-1: 旧 node 被 truncate,新成文 append。旧的 AI 回答被清掉。
+        // variant 保留语义：旧 node 仍在，多 1 个 variant，active 切到新的
         let conv_after = conv_store.get(&conv_id).unwrap();
-        assert!(
-            conv_after.find_node(&node_id).is_none(),
-            "重 roll 后旧 node 应被 truncate 删除"
+        let node_after = conv_after.find_node(&node_id).unwrap();
+        assert_eq!(
+            node_after.variants.len(),
+            variants_before + 1,
+            "重 roll 后应多 1 个 variant"
         );
-        let last_node = conv_after.nodes.last().expect("应有新 assistant 节点");
-        assert_eq!(last_node.variants.len(), 1);
-        let _ = variants_before; // 保留对照（旧实现断言 variants_before+1）
+        assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
@@ -2998,15 +2998,15 @@ mod tests {
         let (_text, provenance) = result.unwrap();
         assert_eq!(provenance.last_hint.as_deref(), Some("语气太冷"));
 
-        // P1-1: 旧 node 被 truncate,新成文 append。旧的 AI 回答被清掉。
+        // variant 保留语义：旧 node 仍在，多 1 个 variant，active 切到新的
         let conv_after = conv_store.get(&conv_id).unwrap();
-        assert!(
-            conv_after.find_node(&node_id).is_none(),
-            "重 roll 后旧 node 应被 truncate 删除"
+        let node_after = conv_after.find_node(&node_id).unwrap();
+        assert_eq!(
+            node_after.variants.len(),
+            variants_before + 1,
+            "重 roll 后应多 1 个 variant"
         );
-        let last_node = conv_after.nodes.last().expect("应有新 assistant 节点");
-        assert_eq!(last_node.variants.len(), 1);
-        let _ = variants_before; // 保留对照（旧实现断言 variants_before+1）
+        assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
