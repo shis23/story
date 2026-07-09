@@ -209,8 +209,21 @@ pub async fn chat(
         .unwrap_or_else(|p| p.into_inner())
         .len();
 
+    // completion_probe：Meta Agent 是对话型 agent，没有 emit_* 终止工具。
+    // 当模型返回非空 content（不再调用工具）时，应视为最终回答，终止循环。
+    // 否则 run_tool_loop_streaming 的 drift recovery 会注入 reminder 逼模型继续调
+    // 工具，对「你好，介绍一下你能做什么」这类无需工具的问题会一直催到轮次耗尽。
+    let meta_completion_probe = |content: &str| !content.trim().is_empty();
+
     let resp = runtime
-        .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
+        .run_tool_loop_streaming(
+            &config,
+            user_msg,
+            &registry,
+            cancel,
+            progress_tx,
+            Some(&meta_completion_probe),
+        )
         .await
         .map_err(|e| crate::MetaError::ExecutionFailed(format!("Meta Agent 运行失败: {e}")))?;
 
