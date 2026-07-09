@@ -9,6 +9,7 @@ export const useUiStore = defineStore('ui', () => {
   const powerMode = ref(false) // App.vue:25 — 高玩模式总闸
   const appVersion = ref('...') // App.vue:28
   const importError = ref('') // App.vue:33 — 导入错误临时提示
+  const extracting = ref(null) // 导入后自动抽取的进度状态：{ id, name } | null
 
   // 面板开关(全 v-if)
   const showCharList = ref(false) // App.vue:34
@@ -70,6 +71,7 @@ export const useUiStore = defineStore('ui', () => {
     powerMode,
     appVersion,
     importError,
+    extracting,
     showCharList,
     showCampaignPanel,
     showMetaPanel,

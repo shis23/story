@@ -310,6 +310,21 @@ onMounted(async () => {
 <template>
   <AppShell @new-campaign="openNewCampaignDialog" @import="handleImport">
     <template #content>
+      <!-- 导入/抽取进度与错误提示条 -->
+      <div
+        v-if="ui.extracting || ui.importError"
+        class="shrink-0 px-3 py-2 text-xs flex items-center gap-2 border-b"
+        :class="ui.importError ? 'bg-err/10 text-err border-err/20' : 'bg-accent/10 text-accent border-accent/20'"
+      >
+        <span v-if="ui.extracting" class="flex items-center gap-1.5">
+          <span class="animate-spin inline-block">◌</span>
+          正在识别角色「{{ ui.extracting.name }}」…（可能需要数十秒）
+        </span>
+        <template v-else>
+          <span class="flex-1">{{ ui.importError }}</span>
+          <button class="text-ink-soft hover:text-ink" @click="ui.importError = ''">✕</button>
+        </template>
+      </div>
       <!-- 根据 ui.currentView 切换 overview/history/write -->
       <CampaignOverview
         v-if="ui.currentView === 'overview'"

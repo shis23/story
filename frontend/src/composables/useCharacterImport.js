@@ -62,24 +62,30 @@ export function useCharacterImport(options = {}) {
       const data = await readFile(filePath)
       const result = await importCharacter(data)
 
-      // 自动触发角色识别（写入 CampaignStore.cards.json，供 Campaign 面板使用）
-      // 失败不阻塞导入主流程：识别失败时 Campaign 面板可手动重试
-      extractCharacters(result.id).catch((e) => {
-        console.error('角色识别失败（不影响导入，可在 Campaign 面板重试）:', e)
-      })
-
-      // 导入成功，设为当前活跃角色
+      // 导入成功，先设为当前活跃角色并加载详情（让用户立即看到导入结果）
       campaignStore.activeChar = result
       campaignStore.currentConversationId = null
-      // 加载详情（内联 loadCharDetail）
       await loadCharDetail(result.id)
       broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
         characterId: result.id,
         name: result.name,
       })
 
-      // 用角色的开场白替换消息列表
-      applySelectedOpeningMessage()
+      // 自动触发角色识别（写入 CampaignStore.cards.json，供 Campaign 面板使用）。
+      // 带 UI 进度反馈：抽取期间 uiStore.extracting 显示「正在识别角色…」。
+      // 失败不阻塞导入主流程——识别失败时 Campaign 面板可手动重试。
+      uiStore.extracting = { id: result.id, name: result.name }
+      try {
+        await extractCharacters(result.id)
+        // 抽取成功后刷新详情，让角色定义立即可见
+        await loadCharDetail(result.id)
+        applySelectedOpeningMessage()
+      } catch (e) {
+        console.error('角色识别失败（不影响导入，可在 Campaign 面板重试）:', e)
+        uiStore.importError = '角色识别失败（可在 Campaign 面板重试）: ' + String(e)
+      } finally {
+        uiStore.extracting = null
+      }
     } catch (err) {
       uiStore.importError = String(err)
     }

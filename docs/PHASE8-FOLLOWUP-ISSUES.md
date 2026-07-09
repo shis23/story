@@ -130,6 +130,28 @@
 
 ---
 
+## 五、2026-07-09 B1 桌面 GUI 实跑暴露的新问题
+
+> 来源：Tauri 桌面 GUI 首次真实操作（临时 APPDATA 隔离，deepseek-v4-flash，opencode.ai/zen/go）。
+
+### B1-N1 🔴 runtime 硬编码 max_tokens=4096，大卡/复杂任务输出空间不足导致空响应
+
+- **现象**：导入 `test-card.png`（命定之诗与黄昏之歌v4.1，6.4MB），角色抽取连续 6+ 轮返回**完全空响应**（`content_len=0, tool_calls=0`），每轮白等 ~50s，最终 MaxRoundsExceeded。用户在 GUI 看不到任何抽取进度（因为抽取本身在空转失败）。
+- **日志证据**：`infra-llm: chat done: content_len=0, tool_calls=0` ×6 轮；`app-agent: 角色识别: 第 N 轮空响应`；LlmCall 记录 `323552+4096 tokens`（input 323K，output 上限 4096）。
+- **根因**：`crates/app-agent/src/runtime.rs:201` —— runtime 构造**所有** LLM 请求时硬编码 `params: Default::default()`（`SamplingParams::default()` = `max_tokens: Some(4096)`）。runtime 从不读连接配置或 AgentConfig 里的 params，永远用 4096。对 323K tokens input 的复杂多角色卡，4096 output 空间不足，模型直接返回空。
+- **设计判断（用户指示）**：**不应设置 max_tokens**——硬编码 4096 没有意义，应该不设（传 None），让模型/endpoint 用自己的默认 output 上限。P2-6 给 postprocess 单独放宽到 8192 是治标，runtime 层才是根。
+- **影响范围**：runtime 的 `run_tool_loop`(:201) 和 `run_tool_loop_streaming`(:335) 两个方法都硬编码 `Default::default()`，影响所有走 runtime 的 Agent（director/editor/subagent/character_extractor/meta/mvu_analyzer/summarizer）。
+- **修复方向**：runtime 请求的 `params.max_tokens` 改为 `None`（不限制 output），或从连接配置/AgentConfig 读取。需同步评估不设 max_tokens 对各 endpoint 的兼容性。
+- **当前状态**：小卡（seraphina 552KB）不受影响，B1 用小卡可绕过。大卡（命定之诗 6.4MB / 323K tokens）阻塞，属 S/Gold 档问题。
+
+### B1-N2 ⚪ 大卡抽取 input token 异常偏大（323552），疑似内容重复注入
+
+- **现象**：命定之诗v4.1（6.4MB PNG）的角色抽取 input 达 323,552 tokens。正常一张复杂卡的 input 不该到 32 万 token。
+- **疑似根因**：可能世界书条目/全量内容被重复注入到抽取 input，或卡内嵌入了异常大的 raw 数据。
+- **当前状态**：待诊断。需对比卡的实际文本内容 token 数与请求 input token 数，确认是否有重复注入。不阻塞 B1（小卡正常）。
+
+---
+
 ## 修复优先级建议（已全部完成 ✅）
 
 所有 P1/P2/P3 问题已修复（P0 在本轮验收前已修）。
