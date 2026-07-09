@@ -19,13 +19,13 @@ function handleChange(index) {
   if (tab) emit('update:modelValue', tab.key)
 }
 
-const tabClass = computed(() => (selected) => {
+const tabClass = (selected) => {
   const base =
     'px-3 py-2 text-sm border-b-2 transition-colors duration-150 select-none'
   return selected
     ? `${base} text-accent border-accent`
     : `${base} text-ink-soft border-transparent hover:text-ink`
-})
+}
 </script>
 
 <template>
@@ -38,9 +38,11 @@ const tabClass = computed(() => (selected) => {
         v-for="tab in tabs"
         :key="tab.key"
         v-slot="{ selected }"
-        :class="tabClass(selected)"
+        as="template"
       >
-        {{ tab.label }}
+        <button :class="tabClass(selected)">
+          {{ tab.label }}
+        </button>
       </Tab>
     </TabList>
 

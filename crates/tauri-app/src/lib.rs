@@ -2128,11 +2128,13 @@ async fn start_writing(
         .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
         .await;
 
-    // ─── P2 后处理流水线（best-effort，不阻断成文返回）──────────────────────
-    // 成文（DraftReady）后并行跑：剧情总结 + 后处理三合一。
+    // ─── P2 后处理流水线（后台执行，不阻断成文返回）──────────────────────
+    // 成文（DraftReady）后跑：剧情总结 + 后处理三合一。
+    // postprocess 放后台 spawn——draft_ready 后立即返回成文给前端，
+    // postprocess 在后台跑（知识/变量/摘要写回），通过 event_tx 推进度。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
     if let Ok((final_text, _, _)) = &result {
-        // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前，确保知识/变量写回能找到它们）
+        // Phase 6：落盘本轮创建的临时 instance（同步，在 postprocess 之前确保知识/变量写回能找到它们）
         persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
             .await;
 
@@ -2149,28 +2151,31 @@ async fn start_writing(
             .unwrap_or_default();
         let final_text = final_text.clone();
         let var_keys = postprocess_variable_keys(&ctx);
-        // 后处理用独立的 cancel（与写作共享 life-cycle，但写作已结束，这里新建一个）
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
-        // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
-        let outcome = pipeline
-            .run_postprocess(
-                &final_text,
-                "", // scene_brief：传空，summarizer/postprocess 从 final_text 自取
-                &present_chars,
-                &var_keys,
-                &ctx,
-                &event_tx,
-                pp_cancel_rx,
-                &mvu_fragments,
-            )
-            .await;
-        // 落盘到 CampaignStore（有 outcome 才落盘）
-        if let Some(outcome) = outcome {
-            persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
-        }
-        let _ = pp_cancel_tx; // 保活（其实不需要，写作已完，这里只是避免 unused）
+
+        // postprocess 后台跑，不阻塞 start_writing 返回。
+        // event_tx 和 pipeline 分别 clone/move 进 spawn 闭包。
+        let pp_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let outcome = pipeline
+                .run_postprocess(
+                    &final_text,
+                    "",
+                    &present_chars,
+                    &var_keys,
+                    &ctx,
+                    &pp_event_tx,
+                    pp_cancel_rx,
+                    &mvu_fragments,
+                )
+                .await;
+            if let Some(outcome) = outcome {
+                persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
+            }
+            let _ = pp_cancel_tx;
+        });
     }
 
     // 清理 cancel sender

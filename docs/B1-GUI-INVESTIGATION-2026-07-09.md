@@ -163,11 +163,92 @@ postprocess **确实在调**（start_writing lib.rs:2157 `run_postprocess` + :21
 
 ---
 
-## 修复优先级建议
+## 第二轮 GUI 实跑发现（2026-07-09，d2f7897 修复后）
 
-1. **问题 1（重 roll variant）**：最高优先。回退 P1-1 的 truncate+append，改回 replace_active_variant + 时机调整。这是用户核心交互，必须正确。
-2. **问题 4（ProcessReview 缺编剧）**：低风险前端改动，加一个区块。
-3. **问题 3（日志空）**：查 log_query 映射，中优先。
-4. **问题 2（trace 空）**：需实跑确认时机，中优先。
-5. **B1-N1（max_tokens）**：runtime 改为不设 max_tokens（传 None），影响所有 agent。
-6. **postprocess 未完成**：查 GUI 写作路径是否接 postprocess。
+> commit `d2f7897` 修复了问题 1/4/3(轮询)/B1-N1 后重启 GUI 实跑，又暴露了新问题。
+
+### 已验证修复生效的
+
+- **角色抽取**：seraphina 小卡第 1 轮即识别成功（`emit_characters` 终止工具正常，max_tokens=None 修复后小卡不再空响应）。
+- **重 roll variant 保留**：日志确认 `重 roll 完成: 2341 字`，variant 回退语义生效（旧版本不再被 truncate 删除）。
+- **导入进度反馈**：提示条显示「正在识别角色…」。
+- **Tabs 警告**：`Property "selected" was accessed during render` 修复（Tabs.vue 改用 `as="template"` + 内部 button）。
+
+### 新发现问题 5：编剧生成完后消失，直到 postprocess 完成才出现
+
+- **现象**：编剧流式输出完成后正文「消失」，直到后处理（postprocess）完成才重新出现。
+- **根因（已确认）**：`tauri-app/src/lib.rs` 的 `start_writing` 命令在拿到成文（`start_writing` pipeline 返回）后，**同步 await postprocess**（原 :2157），阻塞了命令返回。前端 `useWriting.js:168` 在 `apiStartWriting` 返回后才 `showPipeline=false` + push 成文消息。时间线：编剧流式结束 → postprocess 跑 30-50 秒（StreamingMessage 还挂着但没新内容，看着像消失了）→ postprocess 完成后成文才 push。
+- **修复方向（已实现，未提交验证）**：postprocess 改为 `tokio::spawn` 后台执行，`start_writing` 在成文后立即返回。前端立刻 push 成文，postprocess 后台跑并通过 Channel 推进度。
+- **改动文件**：`crates/tauri-app/src/lib.rs`（未提交）。
+- **状态**：已实现并编译通过，但因 app 进程反复超时退出未最终验证。
+
+### 新发现问题 6：流水线 trace 面板看不到事件（F12 诊断后定位）
+
+- **现象**：调试面板的「流水线」tab 看不到任何事件。
+- **F12 诊断结果**：事件**确实在推送**——console 显示 `[trace-diag] broadcastPluginPipelineEvent director_started / subagent_progress / subagent_done / editor_started ...`，说明 `handlePipelineEvent → broadcastPluginPipelineEvent → pushPluginEventRecord` 链路完整工作。
+- **count 恒为 100 的现象**：`plugin.pluginPipelineEvents` 始终 100 条（`slice(-100)` 裁剪），说明 store 确实在更新，事件在流入。
+- **真正根因（疑似）**：trace 面板（PipelineTracePanel.vue）读 `plugin.pluginPipelineEvents` 的 computed 可能因 **Tabs 组件 bug（问题 8）导致 TabPanel 不渲染 slot 内容**。Tabs 修复后需要重新验证。另一个可能：**subagent_progress 等高频流式事件挤满 100 条上限**，把 director_started/director_done 等关键事件挤出，trace 面板过滤后看不到结构化事件。
+- **已做改动（未提交）**：`MAX_PLUGIN_PIPELINE_EVENTS` 从 100 提升到 500。
+- **状态**：需在 Tabs 修复后重新验证。如果仍然空，需进一步查 PipelineTracePanel 的 computed 是否真的重新计算（Pinia 响应式问题）。
+
+### 新发现问题 7：日志面板点了能动但不显示数据
+
+- **现象**：切到「日志」tab 后面板有响应（Tabs 修复后），但 DataTable 显示空。
+- **诊断**：已加 `[log-diag] logQuery returned N entries` console.log，**但用户尚未反馈 N 的值**。
+- **可能根因**：
+  1. **N=0**：LogStore 内存 buffer 空——每次重启都清空临时目录，buffer 回填读到空目录；虽然 LlmInterceptor 会 push 到 buffer，但如果面板打开时 buffer 还没来得及积累，或 log_query 的 level 过滤把 Info 拦掉了。
+  2. **N>0 但面板空**：DataTable 渲染问题或 LogEntryDto 字段名不匹配（已确认字段名匹配：id/kind/level/timestamp/message）。
+- **修复方向**：
+  - 如果 N=0：让 `log_query` **直接读 jsonl 文件**而非只读内存 buffer（B1-GUI-INVESTIGATION 已建议），保证总能看到磁盘日志。
+  - 如果 N>0：查 DataTable 渲染。
+- **状态**：**待用户提供 `[log-diag]` 的 N 值**，这是定位的最后一步。
+
+### 新发现问题 8：Tabs 组件 headlessui 兼容 bug（已修）
+
+- **现象**：`[Vue warn]: Property "selected" was accessed during render but is not defined on instance`，出现在 TabList/Tab 渲染时。
+- **根因**：`ui/Tabs.vue` 的 `<Tab v-slot="{ selected }" :class="tabClass(selected)">` —— headlessui 的 `v-slot` slot prop 只暴露给**子内容**，不暴露给 Tab 元素自身的 `:class` 属性。`:class` 在 Tab 元素属性上求值时 `selected` 是 undefined。
+- **影响**：所有 tab 显示为「未选中」样式。可能导致 TabPanel 不渲染 slot 内容（从而 trace/日志面板空）。
+- **修复（已实现，未提交）**：Tab 改用 `as="template"` + 内部 `<button :class="tabClass(selected)">`，把 class 求值移到 v-slot 作用域内。
+- **状态**：已通过 HMR 推送，用户确认「日志可以点的动了」（Tabs 生效），但日志数据仍不显示（问题 7 未解）。
+
+### 新发现问题 9：后台进程反复超时退出
+
+- **现象**：`cargo tauri dev` 和 `vite dev` 以后台任务方式启动，但都会在 600s/300s 后**超时被杀**（`Background task timed_out`），导致 app 窗口反复消失。
+- **根因**：后台 Bash 命令的 timeout 上限（600000ms），但 `cargo tauri dev` 和 `vite dev` 是**长期运行的前台进程**，不会自行退出。
+- **影响**：无法在单次 app 会话中完成完整验证，每次 app 只能存活约 10 分钟。
+- **修复方向**：这不是代码问题，是工作流限制。需要用 `dangerouslyDisableSandbox` 或更长 timeout，或者用户自己在终端里启动 app 做长时间验证。
+
+### 已做但未提交的改动（工作树中）
+
+| 文件 | 改动 | 对应问题 |
+| --- | --- | --- |
+| `crates/tauri-app/src/lib.rs` | postprocess 改 spawn 后台执行 | 问题 5（编剧消失） |
+| `frontend/src/components-v2/ui/Tabs.vue` | Tab 用 as=template + 内部 button | 问题 8（Tabs bug） |
+| `frontend/src/stores/plugin.js` | MAX_PLUGIN_PIPELINE_EVENTS 100→500 | 问题 6（trace 上限） |
+| `frontend/src/composables/usePluginBridge.js` | 加 console.log 诊断（**需清理**） | 问题 6（诊断） |
+| `frontend/src/components-v2/debug/LogPanel.vue` | 加 console.log 诊断（**需清理**） | 问题 7（诊断） |
+
+---
+
+## 当前状态总结（2026-07-09 第二轮实跑后）
+
+### 已修复并提交（commit d2f7897 + 09e15fe）
+- ✅ 问题 1：重 roll variant 保留（回退 P1-1 truncate）
+- ✅ 问题 4：ProcessReview 加编剧区块
+- ✅ B1-N1：runtime max_tokens=None
+- ✅ 导入抽取进度反馈
+
+### 已实现未提交（工作树中，需验证后提交）
+- 🔧 问题 5：postprocess 后台 spawn（编剧不再消失）
+- 🔧 问题 8：Tabs headlessui 兼容修复（tab 不再报 selected 警告）
+- 🔧 问题 6 部分：MAX_PLUGIN_PIPELINE_EVENTS 100→500
+
+### 待定位（需更多信息）
+- ⚪ 问题 6：trace 面板空——事件在推（F12 确认），Tabs 修复后需重新验证是否显示
+- ⚪ 问题 7：日志面板空——需用户反馈 `[log-diag]` 的 N 值（N=0 → 后端 buffer 问题；N>0 → 渲染问题）
+
+### 下一步
+1. 提交已验证的 Tabs + postprocess spawn 修复（清理诊断日志后）
+2. 重启 app，在 Tabs 修复后验证 trace 和日志面板
+3. 根据日志面板的 `[log-diag]` N 值定位问题 7
+4. 如果 trace 仍空，查 Pinia computed 响应式是否正常触发

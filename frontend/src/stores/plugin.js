@@ -20,7 +20,7 @@ export const usePluginStore = defineStore('plugin', () => {
   let pluginPipelineEventSeq = 0 // App.vue:108
 
   // 常量(App.vue:109-110)
-  const MAX_PLUGIN_PIPELINE_EVENTS = 100
+  const MAX_PLUGIN_PIPELINE_EVENTS = 500
   const MAX_PROMPT_HOOK_AUDIT_RECORDS = 100
 
   // host ref 管理(被 usePluginBridge composable 调用)
