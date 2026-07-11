@@ -281,6 +281,7 @@ mod tests {
             status: AttemptStatus::AwaitingAcceptance,
             pending_state_changes: None,
             derivation: None,
+            quality_report: None,
             provenance: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         });

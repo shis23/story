@@ -463,7 +463,13 @@ impl PipelineOrchestrator {
             .map(|c| c.effective_max_concurrent_subagents())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
         let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
-        let far_block = render_far_memory_for_injection(&ctx.far_memory_hits, 3);
+        let recent_texts: Vec<String> = ctx
+            .recent_summaries
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        let far_block =
+            render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts);
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -1074,7 +1080,13 @@ impl PipelineOrchestrator {
                 .map(|c| c.effective_max_concurrent_subagents())
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
             let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
-            let far_block = render_far_memory_for_injection(&ctx.far_memory_hits, 3);
+            let recent_texts: Vec<String> = ctx
+                .recent_summaries
+                .iter()
+                .map(|s| s.content.clone())
+                .collect();
+            let far_block =
+                render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts);
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -1260,7 +1272,16 @@ impl PipelineOrchestrator {
                             "\n（以上为近期剧情摘要，仅供保持连续性；勿泄露你角色不该知道的信息。）",
                         );
                     }
-                    if let Some(block) = render_far_memory_for_injection(&ctx.far_memory_hits, 3) {
+                    let recent_texts: Vec<String> = ctx
+                        .recent_summaries
+                        .iter()
+                        .map(|s| s.content.clone())
+                        .collect();
+                    if let Some(block) = render_far_memory_for_injection_excluding(
+                        &ctx.far_memory_hits,
+                        3,
+                        &recent_texts,
+                    ) {
                         volatile_text.push_str("\n\n");
                         volatile_text.push_str(&block);
                         volatile_text.push_str(
@@ -1926,8 +1947,15 @@ fn build_director_tail(
         tail = tail.push(summary_block);
     }
 
-    // 远记忆自动召回（向量库 ArchivedSummary，按意图关键词；无命中则跳过）
-    if let Some(far_block) = render_far_memory_for_injection(&ctx.far_memory_hits, 3) {
+    // 远记忆自动召回；与近期摘要去重，避免重复占预算
+    let recent_texts: Vec<String> = ctx
+        .recent_summaries
+        .iter()
+        .map(|s| s.content.clone())
+        .collect();
+    if let Some(far_block) =
+        render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts)
+    {
         tail = tail.push(far_block);
     }
 
@@ -1954,16 +1982,42 @@ fn build_director_tail(
 /// - 取前 `limit` 条；单条截断 200 字。
 /// - 空列表返回 None。
 pub fn render_far_memory_for_injection(hits: &[String], limit: usize) -> Option<String> {
+    render_far_memory_for_injection_excluding(hits, limit, &[])
+}
+
+/// 同 `render_far_memory_for_injection`，但跳过与 `exclude`（通常是 recent_summaries）
+/// 内容高度重叠的命中，避免近期摘要与远记忆重复占预算。
+pub fn render_far_memory_for_injection_excluding(
+    hits: &[String],
+    limit: usize,
+    exclude: &[String],
+) -> Option<String> {
     if hits.is_empty() || limit == 0 {
         return None;
     }
+    let exclude_norms: Vec<String> = exclude
+        .iter()
+        .map(|s| normalize_summary_key(s))
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut lines = Vec::new();
-    for (i, content) in hits.iter().take(limit).enumerate() {
+    for content in hits {
+        if lines.len() >= limit {
+            break;
+        }
         let content = content.trim();
         if content.is_empty() {
             continue;
         }
-        lines.push(format!("{}. {}", i + 1, truncate_chars(content, 200)));
+        let key = normalize_summary_key(content);
+        if exclude_norms.iter().any(|ex| summaries_overlap(ex, &key)) {
+            continue;
+        }
+        lines.push(format!(
+            "{}. {}",
+            lines.len() + 1,
+            truncate_chars(content, 200)
+        ));
     }
     if lines.is_empty() {
         return None;
@@ -1972,6 +2026,31 @@ pub fn render_far_memory_for_injection(hits: &[String], limit: usize) -> Option<
         "远记忆召回（与当前意图相关的归档摘要，供规划参考，勿整段复述）：\n{}",
         lines.join("\n")
     ))
+}
+
+fn normalize_summary_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 粗粒度重叠：一方包含另一方的前缀/全文（≥12 字），或完全相等。
+fn summaries_overlap(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let min_len = 12usize;
+    if a.chars().count() >= min_len && b.contains(a) {
+        return true;
+    }
+    if b.chars().count() >= min_len && a.contains(b) {
+        return true;
+    }
+    false
 }
 
 /// 将近期 RoundSummary 渲染为导演 volatile tail 文本。
@@ -2108,7 +2187,10 @@ fn build_editor_tail(
             "{summary_block}\n（合并成文时保持与上述摘要一致，勿改写已发生事实。）"
         ));
     }
-    if let Some(far_block) = render_far_memory_for_injection(far_memory_hits, 3) {
+    let recent_texts: Vec<String> = recent_summaries.iter().map(|s| s.content.clone()).collect();
+    if let Some(far_block) =
+        render_far_memory_for_injection_excluding(far_memory_hits, 3, &recent_texts)
+    {
         tail = tail.push(format!(
             "{far_block}\n（合稿时仅作背景约束，勿整段复述远记忆。）"
         ));
@@ -4273,6 +4355,19 @@ mod tests {
         assert!(text.contains("远记忆召回"));
         assert!(text.contains("昨夜潜入诊所"));
         assert!(text.contains("陈警官上门"));
+    }
+
+    #[test]
+    fn test_render_far_memory_excludes_recent_overlap() {
+        let hits = vec![
+            "昨夜有人潜入诊所，林秋藏起病历。".into(),
+            "陈警官次日上门调查。".into(),
+        ];
+        let exclude = vec!["昨夜有人潜入诊所，林秋藏起病历。".into()];
+        let text =
+            render_far_memory_for_injection_excluding(&hits, 3, &exclude).expect("should keep one");
+        assert!(!text.contains("林秋藏起病历"), "重叠摘要应被剔除: {text}");
+        assert!(text.contains("陈警官次日上门"), "非重叠应保留: {text}");
     }
 
     #[test]

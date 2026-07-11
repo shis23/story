@@ -2446,6 +2446,7 @@ async fn start_writing(
                 status: storyforge_domain::turn::AttemptStatus::DraftReady,
                 pending_state_changes: None,
                 derivation: None,
+                quality_report: None,
                 provenance: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
@@ -2492,6 +2493,16 @@ async fn start_writing(
             for w in &quality_report.warnings {
                 tracing::info!(target: "quality_gate", "质量警告: {:?}", w.code);
             }
+        }
+        // 质量报告挂到当前 Attempt（若已创建），便于 accept 前复查
+        if let Some(ref turn) = turn_record {
+            let report_for_attempt = quality_report.clone();
+            let _ = update_turn_record(&turn.turn_id, |record| {
+                if let Some(att) = record.active_attempt_mut() {
+                    att.quality_report = Some(report_for_attempt);
+                }
+                record.touch();
+            });
         }
 
         // postprocess 后台跑，不阻塞 start_writing 返回。
@@ -4412,6 +4423,7 @@ async fn regenerate(
                     status: storyforge_domain::turn::AttemptStatus::DraftReady,
                     pending_state_changes: None,
                     derivation: None,
+                    quality_report: None,
                     provenance: None,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
@@ -4473,6 +4485,19 @@ async fn regenerate(
             for w in &quality_report.warnings {
                 tracing::info!(target: "quality_gate", "regenerate 质量警告: {:?}", w.code);
             }
+        }
+        // 挂到 regenerate 新建的 Attempt
+        if let (Some(campaign_id), Some(att_id)) = (&ctx.campaign_id, &regen_attempt_id)
+            && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
+        {
+            let report_for_attempt = quality_report.clone();
+            let att_id = att_id.clone();
+            let _ = update_turn_record(&turn.turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&att_id) {
+                    att.quality_report = Some(report_for_attempt);
+                }
+                record.touch();
+            });
         }
 
         let outcome = pipeline
