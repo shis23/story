@@ -147,7 +147,105 @@ fn get_turn_store() -> &'static turn_store::TurnStore {
     })
 }
 
-/// Phase A 屏障：检查活跃 Campaign 是否有未完成的 Turn。
+/// Phase A 启动恢复：幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn 为 Failed。
+///
+/// 规则（收敛决策步骤 12/16/17）：
+/// 1. Committing 态 Turn：重放 MutationBatch（幂等 upsert + revision CAS）。
+///    - revision 已是 target_revision → 校验/补齐 no-op。
+///    - revision 是 expected_revision → 完整重放 + bump。
+///    - revision 冲突 → 标 Failed（被外部推进，需人工处理）。
+/// 2. Generating/DraftReady/DerivingState/AwaitingAcceptance 态 Turn：
+///    标 Failed（无副作用，安全失败；已落盘 Draft 保留为 Draft）。
+/// 3. Committed/Degraded/Failed/Abandoned 态 Turn：不动。
+fn recover_turns_on_startup() {
+    let turn_store = get_turn_store();
+    let store = get_campaign_store();
+
+    // 1. 恢复 Committing 态 Turn（幂等重放）
+    let recoverable = turn_store.list_recoverable_turns();
+    for turn in &recoverable {
+        let campaign_id = turn.campaign_id.clone();
+        let turn_id = turn.turn_id.clone();
+
+        // 找到该 Turn 的 committed/committing attempt 的 MutationBatch
+        let batch = turn
+            .attempts
+            .iter()
+            .find(|a| {
+                a.status == storyforge_domain::turn::AttemptStatus::Committing
+                    || a.status == storyforge_domain::turn::AttemptStatus::Committed
+            })
+            .and_then(|a| a.pending_state_changes.clone());
+
+        if let Some(batch) = batch {
+            match turn_coordinator::CampaignMutationCoordinator::apply_mutation_batch(
+                store,
+                &campaign_id,
+                &batch,
+            ) {
+                Ok(_) => {
+                    tracing::info!(
+                        "Phase A 启动恢复: Turn {} 幂等重放成功 → Committed",
+                        turn_id
+                    );
+                    update_turn_record(&turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Committed;
+                        record.touch();
+                    });
+                }
+                Err(turn_coordinator::CommitError::RevisionConflict { expected, actual }) => {
+                    tracing::error!(
+                        "Phase A 启动恢复: Turn {} revision 冲突 (expected={}, actual={}) → Failed",
+                        turn_id,
+                        expected,
+                        actual
+                    );
+                    update_turn_record(&turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Failed;
+                        record.failure_reason = Some(format!(
+                            "启动恢复 revision 冲突: expected={expected}, actual={actual}"
+                        ));
+                        record.touch();
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Phase A 启动恢复: Turn {} 重放失败: {e} → 保持 Committing（需人工处理）",
+                        turn_id
+                    );
+                    // 保持 Committing 态——不标 Failed，因为可能有部分写入
+                }
+            }
+        } else {
+            // Committing 态但无 MutationBatch（可能配置关闭，空 diff）
+            tracing::info!(
+                "Phase A 启动恢复: Turn {} 无 MutationBatch → Committed（空 diff）",
+                turn_id
+            );
+            update_turn_record(&turn_id, |record| {
+                record.status = storyforge_domain::turn::TurnStatus::Committed;
+                record.touch();
+            });
+        }
+    }
+
+    // 2. 标记非 terminal 活动 Turn 为 Failed（无副作用，安全失败）
+    let active = turn_store.list_active_turns();
+    for turn in &active {
+        let turn_id = turn.turn_id.clone();
+        tracing::warn!(
+            "Phase A 启动恢复: Turn {} 在 {:?} 态崩溃 → 标 Failed（无副作用）",
+            turn_id,
+            turn.status
+        );
+        update_turn_record(&turn_id, |record| {
+            record.status = storyforge_domain::turn::TurnStatus::Failed;
+            record.failure_reason =
+                Some(format!("启动恢复：崩溃时处于 {:?} 态", turn.status));
+            record.touch();
+        });
+    }
+}
 ///
 /// 在 `start_writing` 追加 user 消息**之前**调用。
 /// 如果存在非 terminal Turn，返回错误，阻止新一轮启动。
@@ -8293,6 +8391,9 @@ pub fn run() {
         .manage(app_state)
         .manage(mvu_pending.clone())
         .setup(move |app| {
+            // Phase A: 启动恢复——幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn
+            recover_turns_on_startup();
+
             // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
             let mvu_rt =
                 WebViewMvuRuntime::with_shared_pending(app.handle().clone(), mvu_pending.clone());
