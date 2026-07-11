@@ -28,15 +28,21 @@ StoryTask
 
 RoundSummary
   每轮成文后的摘要，用于记忆和回溯
+  写入：Summarizer（已有）；Accept 后落盘
   （目标升级为 Chronicle A：code + headline + summary；见记忆规格）
 
 ChronicleEntry A/B/C（目标）
   纪要金字塔：leaf / 一次压缩 / 二次压缩；covers/covered_by 折叠默认概览
+  A ← Summarizer；B/C ← ChronicleCompressor（目标，攒满 200 再批压）
+
+ArchivedSummary（已有）
+  对话消息批压缩后的远记忆条目（MemoryArchiver）
+  入向量库；写作时按意图 hybrid 召回，与 RoundSummary 索引平面可并存但 source 区分
 ```
 
-记忆层级、编号、压缩与注入规则的权威说明：
+记忆层级、编号、压缩执行者、注入规则的权威说明：
 
-- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
+- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)（§3.4 谁写哪一层；§7 Agent 与 MemoryArchiver）
 
 ## Character
 

@@ -37,10 +37,11 @@
 | 机制 | 行为 |
 | --- | --- |
 | history | `DEFAULT_HISTORY_WINDOW_SIZE=20` 消息条 + epoch 整块前移；可有确定性 `【历史纪要】checkpoint` |
-| RoundSummary | Summarizer 产出；**Accept 后**落盘；load 最近 12、**tail 自动 inject 约 5 条截断 content** |
-| 远记忆 | Accept 后索引向量库；写作时 `intent → hybrid → top≈3` 进 tail |
-| 二次压缩 RoundSummary 金字塔 | **无** |
-| 概览字段 / 稳定 code / Director 点名 tool | **无**（仅有近期摘要工具向能力，非本规格完整形态） |
+| RoundSummary | **Summarizer** 产出；**Accept 后**落盘；load 最近 12、**tail 自动 inject 约 5 条截断 content** |
+| MemoryArchiver | **已有**：对话**消息正文**过长时批压 → `ArchivedSummary` 入向量库（`crates/app-memory`，水位 `archived_upto`） |
+| 远记忆召回 | Accept 后 RoundSummary 也可索引向量库；写作时 `intent → hybrid → top≈3` 进 tail（`FarMemoryHit`） |
+| 二次压缩 RoundSummary 金字塔 A→B→C | **无**（目标由 **ChronicleCompressor** 承担，见 §3.4 / §7） |
+| 概览字段 / 稳定 code / Director 点名 tool | **无**（仅有 `get_recent_summary` 等，非本规格完整形态） |
 | 正文与摘要去重 | 远记忆 vs recent_summaries 有去重；**history 正文 vs 同轮摘要无硬隔离** |
 
 ---
@@ -93,9 +94,20 @@ ChronicleEntry {
 - 压缩是 **稀有事件**（利于缓存：长稳定期 + 偶发冷启动）。  
 - 输入应用 **headline+summary 分批**，禁止单次塞 200 段 full。  
 - 失败可重试，不阻塞写作主路径。  
-- 长程任务/承诺：**任务与状态 Agent** 兜底，不依赖最底层 A 永远在目录里。
+- 长程任务/承诺：**任务与状态** 兜底，不依赖最底层 A 永远在目录里。  
+- **执行者不是每轮 Summarizer**，而是 §7 的 **ChronicleCompressor**。
 
 可选后续：日常「每 4 个 A → 1 个 B」流水；**默认规格以 200 阈值批压为准**。
+
+### 3.4 谁写哪一层（总表）
+
+| 产出 | 执行者 | 状态 | 原料 | 触发 |
+| --- | --- | --- | --- | --- |
+| **A**（leaf 纪要） | **Summarizer**（`AgentRole::Summarizer`） | **已有** | 本轮 Editor 成文（+ 场景 brief） | 每轮成文后，与 Postprocess **并行**；Accept 后规范落盘 |
+| **B / C**（阶段纪要） | **ChronicleCompressor**（新；见 §7.2） | **目标** | 多条 A 或 B 的 headline+summary | active 未覆盖计数 ≥200（后台批） |
+| **ArchivedSummary**（消息远记忆） | **MemoryArchiver**（见 §7.3） | **已有** | 对话树**消息正文**前缀 | `archived_upto` 之后未归档条数 ≥ threshold（默认约 50） |
+| 知识 / 变量 / 任务 | **PostProcessor** | **已有** | 本轮成文 + 在场角色等 | 与 Summarizer 并行；**不写剧情纪要** |
+| history `【历史纪要】checkpoint` | **本地确定性函数**（非 LLM） | **已有** | 掉出 history 窗的消息前缀 | 超窗组装 prompt 时 |
 
 ---
 
@@ -195,21 +207,108 @@ ChronicleEntry {
 
 ---
 
-## 7. 写入路径
+## 7. Agent 与后台组件（写入侧）
+
+本节固定 **谁干什么**，避免把 Summarizer、Postprocess、MemoryArchiver、ChronicleCompressor 混成「后处理写纪要」。
+
+### 7.1 Summarizer（已有）— 写 A
+
+| 项 | 说明 |
+| --- | --- |
+| 角色 | `AgentRole::Summarizer` |
+| 代码 | `crates/app-agent/src/prompts/summarizer.rs`；pipeline 成文后并行调用 |
+| 输入 | 本轮成文 `final_text`、可选 `scene_brief`、轮次 |
+| 输出 | 高密度**本轮**摘要（现状约 200–500 字正文）；**目标**解析为 `code` + `headline` + `summary`（+ 可选 full） |
+| 时机 | Editor **Draft 就绪后**，与 Postprocess **并行**；结果先入 TurnAttempt 候选 |
+| 落盘 | **用户 Accept** 后写入 Campaign / 升级为 Chronicle **A** 并索引 |
+| **不负责** | 多轮 A→B→C 批压；对话消息归档；知识/变量/任务 |
+
+提示词原则（保持）：只总结本轮、不展望、不复述前情；目标态在输出中增加一行级 **headline** 与稳定 **code**（或由系统分配 code）。
+
+### 7.2 ChronicleCompressor（目标新增）— 写 B / C
+
+| 项 | 说明 |
+| --- | --- |
+| 名称 | **ChronicleCompressor**（阶段纪要压缩器）；实现可为独立 `AgentRole` 或 `app-memory` 批任务 + 共用 LLM 客户端 |
+| 状态 | **规格目标；尚未实现** |
+| 输入 | 一批未覆盖 **A**（或 **B**）的 `code, headline, summary`（**分批**，禁止单次 200×full） |
+| 输出 | 约 50 条 **B** 或 **C**：`headline` + `summary` + `covers[]`；原子标记子项 `covered_by` |
+| 触发 | `count(active 未覆盖 A) ≥ 200` → ~50 B；`count(active 未覆盖 B) ≥ 200` → ~50 C |
+| 时机 | **Accept 落盘 A 之后**异步调度；或独立后台扫描；**不**插入每轮成文热路径 |
+| 失败 | 可重试；不阻塞 start_writing / accept 主路径 |
+| **不负责** | 本轮成文摘要（归 Summarizer）；消息原文归档（归 MemoryArchiver）；状态写回（归 Postprocess） |
+
+与 Summarizer 的关系：
+
+- **可共用**「高密度摘要」文风与模型配置档。  
+- **不可**并入 Summarizer 每轮 prompt：原料、触发频率、失败语义均不同。  
+- 压缩是 **稀有事件**，服务缓存稳定期；Summarizer 是 **每轮事件**。
+
+### 7.3 MemoryArchiver（已有）— 消息远记忆
+
+| 项 | 说明 |
+| --- | --- |
+| 名称 | `MemoryArchiver` |
+| 代码 | `crates/app-memory/src/archiver.rs`；Tauri `run_archive_with_watermark` / `auto_archive_if_needed` |
+| 原料 | 对话树中**可归档消息正文**（非 RoundSummary 列表） |
+| 水位 | `Conversation.archived_upto`：只处理未归档前缀，防重复归档 |
+| 触发 | 未归档条数 ≥ `ArchiveConfig.threshold`（默认 **50**）；常依赖嵌入配置才走自动路径 |
+| 过程 | 按 `archive_batch_size` 等分批 → LLM 压成高密度段（上限约 summary_max_chars）→ keywords + 可选 embedding → `vector_store.upsert` |
+| 产出 | `ArchivedSummary`：`id, content, source_range, keywords, vector?`；metadata 可含 campaign/conversation；`kind = ArchivedSummary`，`source ≈ message_archive` |
+| 读路径 | 写作时 `fill_far_memory_hits` → `recall_archived_hybrid(intent)` → `FarMemoryHit` 进 **tail**（约 top-3），**不进** history 原文窗 |
+| **不负责** | 每轮剧情纪要 A；A→B→C 金字塔；Postprocess 状态 |
+
+与 RoundSummary 入库的关系（现状易混）：
+
+- Accept 后 **RoundSummary** 也可 upsert 进**同一向量平面**（`source ≈ round_summary`），便于 hybrid 召回。  
+- **写入路径不同**：一个是 Archiver 压**消息**，一个是索引 **已接受轮次摘要**。  
+- 目标态下 **默认事件概览以 Chronicle A/B/C 为主**；`ArchivedSummary`（消息归档）主要走自动召回 / `search_chronicle` 类检索，不占满 200 行概览。
+
+### 7.4 PostProcessor（已有）— 不写纪要
+
+| 项 | 说明 |
+| --- | --- |
+| 角色 | `AgentRole::PostProcessor` |
+| 代码 | `crates/app-agent/src/prompts/postprocess.rs` |
+| 产出 | **知识**、**变量**、**任务/伏笔** 三件套（`emit_postprocess`） |
+| 时机 | 与 Summarizer **并行**，同属成文后流水线 |
+| **明确不写** | RoundSummary / Chronicle A/B/C / 消息归档 |
+
+口语「后处理阶段」可包含 Summarizer，但 **Postprocess Agent ≠ 写纪要**。
+
+### 7.5 写入总览（目标流水线）
 
 ```text
-Editor 成文
-  → Summarizer → A（code, headline, summary[/full]）候选
-  → Postprocess → 知识/变量/任务（非纪要）
-  → Accept
-       → A 落盘 + 索引（keyword/headline/entities/可选 vector）
-       → 若 active A ≥ 200：调度压缩 → B，标记 covers/covered_by
-       → 同理 B → C
+Editor 成文 (Draft)
+  ├─► Summarizer ──────────► 候选 A（headline+summary）
+  └─► PostProcessor ───────► 知识 / 变量 / 任务
+              │
+         用户 Accept
+              │
+              ├─► A 落盘 + 检索索引
+              ├─► 状态 MutationBatch 提交
+              ├─► 若 active A ≥ 200：enqueue ChronicleCompressor → B
+              └─► 若 active B ≥ 200：enqueue ChronicleCompressor → C
 
-消息过长归档（现有 Archiver）
-  → ArchivedSummary 并入「可检索平面」，kind 区分
-  → 默认概览以 Chronicle A/B/C 为主；归档块主要走召回/search
+对话消息积压（独立水位）
+  └─► MemoryArchiver → ArchivedSummary → 向量库
+              │
+         下一次 start_writing
+              └─► 装配：概览 A/B/C + 纪要带 + 近正文
+                  + hybrid 召回（A/B/C 索引 ∪ ArchivedSummary）小 K
+                  + Director tool 点名 summary/full
 ```
+
+### 7.6 读路径上各组件如何进 prompt（对照）
+
+| 来源 | 默认进 Director 的方式 |
+| --- | --- |
+| 近 H 轮对话正文 | history 近窗原文 |
+| 中距 S 轮 A.summary | history/装配中的纪要带（短） |
+| 活跃 A/B/C.headline | 【事件概览】≤200 行 |
+| 自动 hybrid hit | tail 小 K（ArchivedSummary 与索引摘要） |
+| tool `get_chronicle` | tool 消息 / tail（默认 summary） |
+| 知识/变量/任务 | 结构化状态块（Postprocess 已写盘的） |
 
 ---
 
@@ -242,11 +341,11 @@ compress_events?           // 本轮是否发生 A→B / B→C
 
 | 期 | 内容 | 依赖 |
 | --- | --- | --- |
-| **M1** | `code`+`headline`；概览注入（cap=200）；近窗与摘要硬去重；H/S 参数 | Summarizer 输出/解析 |
+| **M1** | `code`+`headline`；概览注入（cap=200）；近窗与摘要硬去重；H/S 参数 | **Summarizer** 输出/解析 |
 | **M2** | 装配顺序改为 概览→纪要带→近正文→tail；E 同步滑动；epoch 对齐 | MessageLayout 组装点 |
 | **M3** | `search_chronicle` + `get_chronicle(summary\|full)` + 预算；自动 K 去重 | Director tool 白名单 |
-| **M4** | A≥200→B、B≥200→C 后台压缩与 covered 折叠 | 异步任务 + 存储字段 |
-| **M5** | 可观测面板/日志 + 固定剧本验收 | — |
+| **M4** | **ChronicleCompressor**：A≥200→B、B≥200→C 与 covered 折叠 | 异步任务 + 存储字段；**不**改 Summarizer 热路径 |
+| **M5** | 可观测面板/日志 + 固定剧本验收；厘清 Archiver 与 Chronicle 索引在召回中的 kind/source | — |
 
 Quality 拦截 / NarrativeContract 可并行，但 **字段与注入顺序以本文件为准**。
 
@@ -272,7 +371,7 @@ Quality 拦截 / NarrativeContract 可并行，但 **字段与注入顺序以本
 | `docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md` | 总架构与阶段 A–D；§8 ContextCompiler / §7 History Epoch 的细化落地见本文件 |
 | `docs/ARCHITECTURE.md` | 模块边界；记忆装配见本文件链接 |
 | `docs/HANDOFF.md` | 交接入口；下一优先级含本规格实现 |
-| `docs/AGENT_INTERFACES.md` | Agent 职责；Director 工具与 Summarizer 对齐本文件 §6–7 |
-| `docs/DATA_MODEL.md` | 领域模型；Chronicle/RoundSummary 字段扩展以本文件 §3 为准 |
+| `docs/AGENT_INTERFACES.md` | Agent 职责；Director 工具、Summarizer、**ChronicleCompressor**、MemoryArchiver 对照本文件 §6–7 |
+| `docs/DATA_MODEL.md` | 领域模型；Chronicle/RoundSummary/ArchivedSummary 以本文件 §3、§7 为准 |
 
 实现时若与旧注释冲突（如「inject last-5」「仅 top-3 远记忆」），**以本规格目标态为准**，并在 PR 中更新旧注释。

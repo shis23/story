@@ -8,15 +8,25 @@
 User Intent
   -> Director Agent
       生成场景计划和角色任务
+      （目标：读概览/纪要带 + search_chronicle / get_chronicle）
   -> Subagent x N
       按角色隔离表演
   -> Editor Agent
       合并成最终正文
-  -> Postprocess Agents
-      生成摘要、知识、变量和任务更新
+  -> 成文后并行：
+      Summarizer        → 本轮纪要 A（RoundSummary）
+      PostProcessor     → 知识 / 变量 / 任务（不写纪要）
+  -> Accept 后异步（目标）：
+      ChronicleCompressor → A≥200 批压 B；B≥200 批压 C
+  -> 独立水位（已有）：
+      MemoryArchiver    → 对话消息批压 ArchivedSummary
   -> Meta Agent
       解释、诊断、补丁建议、MVU/数据健康分析
 ```
+
+记忆写入/读入与三窗装配的权威规格：
+
+- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)（尤其 §3.4、§7）
 
 ## Director Agent
 
@@ -125,14 +135,30 @@ User Intent
 - 保留更清晰的 provenance：哪些子表演被采用、删改或冲突解决。
 - 对结构化冲突给出可诊断记录，供 Meta Agent 解释。
 
-## Postprocess
+## Summarizer（剧情总结 Agent，已有）
 
 职责：
 
-- 从最终正文中抽取本轮摘要。
+- 根据**本轮成文**产出一条高密度本轮纪要（现状 `RoundSummary`；目标升级为 Chronicle **A**：`code` + `headline` + `summary`）。
+- 与 PostProcessor **并行**，同属成文后流水线；Accept 后规范落盘并进入检索索引。
+
+不负责：
+
+- 多轮纪要金字塔 A→B→C（见 **ChronicleCompressor**）。
+- 对话消息原文归档（见 **MemoryArchiver**）。
+- 知识 / 变量 / 任务（见 **PostProcessor**）。
+
+代码：`crates/app-agent/src/prompts/summarizer.rs`。可由 `AgentProfileConfig.enable_summarizer` 关闭。
+
+## Postprocess（PostProcessor）
+
+职责（仅三件套）：
+
 - 抽取角色知识更新。
 - 抽取 Campaign/角色变量更新。
 - 抽取任务状态变化或新伏笔。
+
+**不负责**从正文写剧情纪要 / RoundSummary（那是 Summarizer）。口语「后处理阶段」可同时跑 Summarizer，但 **Postprocess Agent ≠ 写纪要**。
 
 原则：
 
@@ -140,6 +166,31 @@ User Intent
 - 输出必须经过 Tauri 层校验后才能持久化。
 - 名字型引用必须归一化到 ID。
 - 不得凭空创建永久角色；临场角色必须走 temporary instance 请求。
+
+代码：`crates/app-agent/src/prompts/postprocess.rs`。可由 `enable_postprocess` 关闭。
+
+## ChronicleCompressor（目标新增）
+
+职责：
+
+- 当 **未覆盖 active A ≥ 200** 时，将一批 A 的 headline+summary **批压**为约 50 条 **B**，写 `covers` / `covered_by`。
+- 当 **未覆盖 active B ≥ 200** 时，同理压为约 50 条 **C**。
+- 后台异步，失败可重试；**不**进入每轮成文热路径。
+
+不负责：本轮成文摘要、消息归档、状态写回。可与 Summarizer 共用模型档，但 **独立入口/角色**。
+
+详见记忆规格 §7.2。实现前本角色可尚未出现在 `AgentRole` 枚举中。
+
+## MemoryArchiver（已有，非对话 Agent）
+
+职责：
+
+- 对话**消息正文**过长时，按 `archived_upto` 水位批取前缀，LLM 压成 `ArchivedSummary`，keywords + 可选 embedding 写入向量库。
+- 供写作时 hybrid 远记忆召回（`FarMemoryHit` → tail），**不**占用 Chronicle 默认 200 行事件概览的主语义。
+
+不负责：RoundSummary/A/B/C 纪要金字塔。
+
+代码：`crates/app-memory/src/archiver.rs`；Tauri 水位路径 `run_archive_with_watermark` / `auto_archive_if_needed`。
 
 ## Meta Agent
 
