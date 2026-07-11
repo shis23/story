@@ -506,7 +506,7 @@ compress_batch_id?
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分）**：分组校验 + LLM/降级文案 + 落盘 + **持久化 job 队列/启动重放/max_attempts 重试** |
 | **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
 
-并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。
+并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m3`（防漂移假稳定）。
 
 ---
 
