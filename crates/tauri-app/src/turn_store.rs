@@ -83,7 +83,7 @@ impl TurnStore {
         // 唯一约束：同一 Campaign 只能有一个活动 Turn
         if turns
             .iter()
-            .any(|t| &t.campaign_id == &record.campaign_id && t.status.is_active())
+            .any(|t| t.campaign_id == record.campaign_id && t.status.is_active())
         {
             return Err(format!(
                 "Campaign {} 已有活动 Turn，不能创建新 Turn",

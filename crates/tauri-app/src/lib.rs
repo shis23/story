@@ -5001,7 +5001,7 @@ async fn commit_turn_attempt(
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("TurnCommit 任务失败: {e}")))?
-    .map_err(|e| TauriCommandError::internal(e))?;
+    .map_err(TauriCommandError::internal)?;
 
     // 7. 标记 Committed + 其他 attempts Superseded
     update_turn_record(&turn_id, |record| {
@@ -14479,5 +14479,300 @@ mod tests {
             pending.is_empty(),
             "dismissed patch 不应出现在 pending 列表"
         );
+    }
+
+    // ─── Phase A: Turn 提交屏障契约测试 ──────────────────────────────────
+
+    #[test]
+    fn turn_barrier_rejects_start_writing_with_active_turn() {
+        let state = Arc::new(AppState::new_for_test());
+        // 用唯一 ID 避免 OnceLock 全局 TurnStore 的测试间冲突
+        let campaign_id = Id::new();
+
+        // 设置活跃 Campaign
+        {
+            let mut guard = state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(campaign_id.clone());
+        }
+
+        // 创建一个活动 Turn
+        let record = storyforge_domain::turn::TurnRecord::new(
+            campaign_id.clone(),
+            Id::from_str("conv-1"),
+            Id::from_str("node-1"),
+            0,
+        );
+        get_turn_store().create_turn(record).unwrap();
+
+        // 屏障检查应失败
+        let result = check_turn_barrier(&state);
+        assert!(
+            result.is_err(),
+            "barrier should reject start_writing when active Turn exists"
+        );
+    }
+
+    #[test]
+    fn turn_barrier_passes_without_active_turn() {
+        let state = Arc::new(AppState::new_for_test());
+        let campaign_id = Id::from_str("camp-test-no-turn");
+
+        {
+            let mut guard = state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(campaign_id.clone());
+        }
+
+        // 无活动 Turn → 放行
+        assert!(check_turn_barrier(&state).is_ok());
+    }
+
+    #[test]
+    fn turn_barrier_passes_non_campaign_mode() {
+        let state = Arc::new(AppState::new_for_test());
+        // 不设置 active_campaign → 非 Campaign 模式
+        assert!(check_turn_barrier(&state).is_ok());
+    }
+
+    #[test]
+    fn turn_record_committed_allows_next_turn() {
+        let state = Arc::new(AppState::new_for_test());
+        let campaign_id = Id::from_str("camp-committed");
+
+        {
+            let mut guard = state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(campaign_id.clone());
+        }
+
+        // 创建一个 Committed Turn
+        let mut record = storyforge_domain::turn::TurnRecord::new(
+            campaign_id.clone(),
+            Id::from_str("conv-1"),
+            Id::from_str("node-1"),
+            0,
+        );
+        record.status = storyforge_domain::turn::TurnStatus::Committed;
+        get_turn_store().save_turn(record).unwrap();
+
+        // Committed 是 terminal → 放行
+        assert!(check_turn_barrier(&state).is_ok());
+    }
+
+    #[tokio::test]
+    async fn accept_variant_non_campaign_keeps_legacy_behavior() {
+        let state = Arc::new(AppState::new_for_test());
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        let node_id = state
+            .conv_store
+            .append_ai_draft(&conversation.id, "draft".into(), None)
+            .unwrap();
+
+        // 不设 active_campaign → 非 Campaign 模式
+        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone())
+            .await
+            .unwrap();
+
+        // 应该是 Final（旧行为）
+        let updated = state.conv_store.get(&conversation.id).unwrap();
+        let node = updated.nodes.iter().find(|n| n.id == node_id).unwrap();
+        assert_eq!(node.active().unwrap().status, VariantStatus::Final);
+    }
+
+    #[tokio::test]
+    async fn accept_variant_campaign_historical_attempt_rejected() {
+        let state = Arc::new(AppState::new_for_test());
+        let campaign_id = Id::from_str("camp-historical");
+
+        {
+            let mut guard = state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(campaign_id.clone());
+        }
+
+        // 创建一个 conversation + AI draft（没有关联 TurnRecord）
+        let conversation = state.conv_store.create(Some("card-1".into()), None);
+        let node_id = state
+            .conv_store
+            .append_ai_draft(&conversation.id, "orphan draft".into(), None)
+            .unwrap();
+
+        // accept 应该拒绝——没有关联的 TurnRecord
+        let result =
+            accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone()).await;
+        assert!(result.is_err(), "should reject historical/orphan attempt");
+    }
+
+    #[test]
+    fn build_mutation_batch_empty_outcome() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-mb-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str("card-1"),
+            "test".to_string(),
+        );
+        let campaign_id = campaign.id.clone();
+        store.save_campaign(campaign).unwrap();
+
+        let pc = PostprocessPersistContext {
+            campaign_id: campaign_id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 1,
+        };
+        let outcome = storyforge_app_agent::PostProcessOutcome::default();
+
+        let batch = build_mutation_batch(&store, &pc, &outcome, &[]);
+
+        assert!(batch.is_empty(), "empty outcome should produce empty batch");
+        assert_eq!(batch.expected_revision, 0);
+        assert_eq!(batch.target_revision, 1);
+        assert_eq!(batch.status, storyforge_domain::turn::MutationBatchStatus::Prepared);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_mutation_batch_with_summary_and_variable() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-mb-var-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str("card-1"),
+            "test".to_string(),
+        );
+        let campaign_id = campaign.id.clone();
+        store.save_campaign(campaign).unwrap();
+
+        let pc = PostprocessPersistContext {
+            campaign_id: campaign_id.clone(),
+            conversation_id: Id::from_str("conv-1"),
+            turn: 1,
+        };
+        let outcome = storyforge_app_agent::PostProcessOutcome {
+            summary: Some("第一轮摘要".into()),
+            post_process: Some(storyforge_domain::agent::PostProcessResult {
+                variable_updates: vec![storyforge_domain::agent::VariableUpdate {
+                    instance_id: None,
+                    key: "story_clock".into(),
+                    value: serde_json::json!("Day 2"),
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let batch = build_mutation_batch(&store, &pc, &outcome, &[]);
+
+        // 应该有 1 个 UpsertSummary + 1 个 SetVariable
+        assert_eq!(batch.mutations.len(), 2, "should have summary + variable mutations");
+        assert!(batch.mutations.iter().any(|m| matches!(
+            m,
+            storyforge_domain::turn::Mutation::UpsertSummary(_)
+        )));
+        assert!(batch.mutations.iter().any(|m| matches!(
+            m,
+            storyforge_domain::turn::Mutation::SetVariable { key, .. } if key == "story_clock"
+        )));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn turn_store_unique_active_turn_per_campaign() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-unique-turn-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = turn_store::TurnStore::new(&dir);
+
+        let r1 = storyforge_domain::turn::TurnRecord::new(
+            Id::from_str("camp-1"),
+            Id::from_str("conv-1"),
+            Id::from_str("node-1"),
+            0,
+        );
+        ts.create_turn(r1).unwrap();
+
+        // 同 Campaign 第二个活动 Turn 应被拒绝
+        let r2 = storyforge_domain::turn::TurnRecord::new(
+            Id::from_str("camp-1"),
+            Id::from_str("conv-1"),
+            Id::from_str("node-2"),
+            0,
+        );
+        assert!(ts.create_turn(r2).is_err());
+
+        // 不同 Campaign 可以创建
+        let r3 = storyforge_domain::turn::TurnRecord::new(
+            Id::from_str("camp-2"),
+            Id::from_str("conv-2"),
+            Id::from_str("node-3"),
+            0,
+        );
+        assert!(ts.create_turn(r3).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn startup_recovery_marks_active_turns_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-recovery-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 模拟崩溃前状态：创建一个 Generating 态 Turn
+        {
+            let ts = turn_store::TurnStore::new(&dir);
+            let record = storyforge_domain::turn::TurnRecord::new(
+                Id::from_str("camp-recovery"),
+                Id::from_str("conv-1"),
+                Id::from_str("node-1"),
+                0,
+            );
+            ts.create_turn(record).unwrap();
+        }
+
+        // "重启"——重新打开同一目录的 TurnStore
+        let ts = turn_store::TurnStore::new(&dir);
+        let active = ts.list_active_turns();
+        assert_eq!(active.len(), 1, "should have 1 active turn before recovery");
+
+        // 模拟恢复逻辑：标记为 Failed
+        for turn in &active {
+            ts.save_turn(storyforge_domain::turn::TurnRecord {
+                status: storyforge_domain::turn::TurnStatus::Failed,
+                failure_reason: Some("启动恢复".into()),
+                ..turn.clone()
+            })
+            .unwrap();
+        }
+
+        // 恢复后没有活动 Turn
+        let ts2 = turn_store::TurnStore::new(&dir);
+        assert_eq!(
+            ts2.list_active_turns().len(),
+            0,
+            "no active turns after recovery"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
