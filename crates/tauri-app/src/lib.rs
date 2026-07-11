@@ -8626,6 +8626,46 @@ fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
         .collect()
 }
 
+/// 活动 Turn 的质量门禁摘要（供前端刷新后回填 ProcessReview）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTurnQualityDto {
+    pub turn_id: String,
+    pub attempt_id: String,
+    pub status: String,
+    pub passed: bool,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// 从 TurnRecord 提取活动 Attempt 的质量 DTO（无报告 → None）。
+fn active_turn_quality_from_record(
+    turn: &storyforge_domain::turn::TurnRecord,
+) -> Option<ActiveTurnQualityDto> {
+    let attempt = turn.active_attempt()?;
+    let report = attempt.quality_report.as_ref()?;
+    let warnings: Vec<String> = report.warnings.iter().map(|w| w.message.clone()).collect();
+    Some(ActiveTurnQualityDto {
+        turn_id: turn.turn_id.to_string(),
+        attempt_id: attempt.attempt_id.to_string(),
+        status: format!("{:?}", attempt.status),
+        passed: report.passed(),
+        warning_count: report.warnings.len(),
+        error_count: report.error_count(),
+        warnings,
+    })
+}
+
+/// 读取当前 Campaign 活动 Turn 上 active Attempt 的 QualityReport。
+///
+/// 无活动 Turn / 无质量报告 → None。不创建状态。
+#[tauri::command]
+fn get_active_turn_quality(campaign_id: String) -> Option<ActiveTurnQualityDto> {
+    let camp = Id::from_str(&campaign_id);
+    let turn = get_turn_store().get_active_turn(&camp)?;
+    active_turn_quality_from_record(&turn)
+}
+
 // ─── 导出命令（W7: ST 卡 PNG + 共享 Lorebook + JSON Bundle）─────────────────
 
 /// 导出的文件 DTO（文件名 + 字节）
@@ -9228,6 +9268,7 @@ pub fn run() {
             complete_task,
             abandon_task,
             list_round_summaries,
+            get_active_turn_quality,
             // P3 Meta Agent / MVU 五合一 / ST 预设分类
             meta_start_conversation,
             meta_chat,
@@ -15256,6 +15297,45 @@ mod tests {
     }
 
     // ─── Phase A: Turn 提交屏障契约测试（hermetic：临时 TurnStore）────────
+
+    #[test]
+    fn test_active_turn_quality_from_record() {
+        use storyforge_domain::turn::{
+            AttemptStatus, QualityReport, QualitySeverity, QualityWarning, QualityWarningCode,
+            TurnAttempt, TurnRecord,
+        };
+        let mut record = TurnRecord::new(
+            Id::from_str("camp-q"),
+            Id::from_str("conv-q"),
+            Id::from_str("node-q"),
+            0,
+        );
+        assert!(active_turn_quality_from_record(&record).is_none());
+
+        record.attempts.push(TurnAttempt {
+            attempt_id: Id::from_str("att-q"),
+            variant_id: Id::from_str("var-q"),
+            draft_hash: "h".into(),
+            status: AttemptStatus::AwaitingAcceptance,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: Some(QualityReport {
+                warnings: vec![QualityWarning {
+                    code: QualityWarningCode::TooShort { char_count: 10 },
+                    message: "字数过短".into(),
+                    severity: QualitySeverity::Warning,
+                }],
+            }),
+            provenance: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+
+        let dto = active_turn_quality_from_record(&record).expect("should have quality");
+        assert_eq!(dto.attempt_id, "att-q");
+        assert!(!dto.passed);
+        assert_eq!(dto.warning_count, 1);
+        assert_eq!(dto.warnings, vec!["字数过短".to_string()]);
+    }
 
     fn temp_turn_store() -> (std::path::PathBuf, turn_store::TurnStore) {
         let dir =

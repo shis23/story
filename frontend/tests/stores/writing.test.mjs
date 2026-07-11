@@ -78,6 +78,38 @@ test('streamingRoleLabel 无活跃对象时兜底 AI', () => {
   assert.equal(s.streamingRoleLabel, 'AI')
 })
 
+test('applyQualityFromTurn 把后端 DTO 写入 pipeline.quality', () => {
+  const s = setup()
+  s.pipeline.state = 'done'
+  s.applyQualityFromTurn({
+    turn_id: 't1',
+    attempt_id: 'a1',
+    status: 'AwaitingAcceptance',
+    passed: false,
+    warning_count: 2,
+    error_count: 1,
+    warnings: ['n-gram 重复', '字数过短'],
+  })
+  assert.equal(s.pipeline.quality.passed, false)
+  assert.equal(s.pipeline.quality.warningCount, 2)
+  assert.deepEqual(s.pipeline.quality.warnings, ['n-gram 重复', '字数过短'])
+  assert.equal(s.pipeline.quality.status, 'warn')
+  assert.equal(s.pipeline.quality.source, 'turn')
+  assert.equal(s.pipeline.stateLabel, '已产出 · 质量警告 2')
+})
+
+test('applyQualityFromTurn(null) 清空 quality', () => {
+  const s = setup()
+  s.applyQualityFromTurn({
+    passed: true,
+    warning_count: 0,
+    warnings: [],
+  })
+  assert.equal(s.pipeline.quality.passed, true)
+  s.applyQualityFromTurn(null)
+  assert.equal(s.pipeline.quality, null)
+})
+
 test('canChooseGreeting legacy + 无对话 + 多开场白时为 true', () => {
   setActivePinia(createPinia())
   const writing = useWritingStore()

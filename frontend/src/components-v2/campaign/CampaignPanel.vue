@@ -3,9 +3,10 @@ import { ref, computed, onMounted } from 'vue'
 import { alertDialog } from '../../components/base/BaseDialog.js'
 import {
   getCard,
-  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign,
+  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign, getActiveTurnQuality,
   exportCampaignStCards, exportCampaignBundle, importCampaignBundle
 } from '../../tauri-api.js'
+import { useWritingStore } from '../../stores/writing.js'
 import CampaignInstancesTab from './CampaignInstancesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
 import CampaignTasksTab from './CampaignTasksTab.vue'
@@ -26,6 +27,7 @@ import EmptyState from '../ui/EmptyState.vue'
 const emit = defineEmits(['close', 'campaign-changed'])
 
 const campaignStore = useCampaignStore()
+const writingStore = useWritingStore()
 
 // ─── Tab 控制 ───
 const activeTab = ref('cards') // 'cards' | 'campaigns' | 'detail'
@@ -167,6 +169,15 @@ async function handleSetActive(campaignId) {
   activeCampaign.value = await getActiveCampaign()
   // 同步到 store
   campaignStore.activeCampaign = activeCampaign.value
+  // 回填活动 Turn 质量报告（若有）
+  try {
+    if (activeCampaign.value?.id) {
+      const dto = await getActiveTurnQuality(activeCampaign.value.id)
+      writingStore.applyQualityFromTurn(dto)
+    }
+  } catch (e) {
+    console.error('getActiveTurnQuality:', e)
+  }
   emit('campaign-changed', activeCampaign.value)
 }
 

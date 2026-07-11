@@ -901,6 +901,25 @@ export async function listRoundSummaries(campaignId) {
   return []
 }
 
+/**
+ * 读取当前 Campaign 活动 Turn 的质量门禁结果（刷新后回填用）。
+ * @returns {Promise<null | {
+ *   turn_id: string,
+ *   attempt_id: string,
+ *   status: string,
+ *   passed: boolean,
+ *   warning_count: number,
+ *   error_count: number,
+ *   warnings: string[],
+ * }>}
+ */
+export async function getActiveTurnQuality(campaignId) {
+  if (isTauri()) {
+    return await invoke('get_active_turn_quality', { campaignId })
+  }
+  return null
+}
+
 // ─── P3 Meta Agent / MVU 五合一 / ST 预设分类 ──────────────────────────────
 
 /** 开始一个新的 Meta 对话（返回 conversation_id） */

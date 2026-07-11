@@ -71,6 +71,7 @@ import {
   getVersion,
   getActiveCampaign,
   getActiveConnection,
+  getActiveTurnQuality,
   getCharacter,
   listInstances,
   listPlugins,
@@ -302,6 +303,18 @@ const { handleImport } = characterImport
 const composerPlaceholder = () =>
   writing.writingMode === 'none' ? '请先导入角色卡或打开 Campaign…' : ''
 
+// 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）
+async function hydrateActiveTurnQuality() {
+  const campaignId = campaign.activeCampaign?.id
+  if (!campaignId || writing.isWriting) return
+  try {
+    const dto = await getActiveTurnQuality(campaignId)
+    if (dto) writing.applyQualityFromTurn(dto)
+  } catch (e) {
+    console.error('getActiveTurnQuality:', e)
+  }
+}
+
 // ─── 初始化（App.vue:388-399） ───
 onMounted(async () => {
   try { ui.appVersion = await getVersion() } catch (e) { console.error('getVersion:', e) }
@@ -310,6 +323,7 @@ onMounted(async () => {
   try {
     campaign.activeCampaign = await getActiveCampaign()
     await loadInstanceNameMap()
+    await hydrateActiveTurnQuality()
   } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()

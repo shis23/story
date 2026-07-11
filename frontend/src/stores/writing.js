@@ -60,6 +60,27 @@ export const useWritingStore = defineStore('writing', () => {
     )
   })
 
+  /** 用后端活动 Turn 的质量报告回填 pipeline.quality（刷新/重进后）。 */
+  function applyQualityFromTurn(dto) {
+    if (!dto) {
+      pipeline.quality = null
+      return
+    }
+    const warningCount = dto.warning_count ?? (dto.warnings?.length || 0)
+    const warnings = Array.isArray(dto.warnings) ? dto.warnings : []
+    const passed = !!dto.passed
+    pipeline.quality = {
+      passed,
+      warningCount,
+      warnings,
+      status: passed ? 'ok' : 'warn',
+      source: 'turn',
+    }
+    if (!passed && warningCount > 0 && pipeline.state === 'done') {
+      pipeline.stateLabel = `已产出 · 质量警告 ${warningCount}`
+    }
+  }
+
   return {
     messages,
     isWriting,
@@ -72,5 +93,6 @@ export const useWritingStore = defineStore('writing', () => {
     greetingOptions,
     selectedGreeting,
     canChooseGreeting,
+    applyQualityFromTurn,
   }
 })
