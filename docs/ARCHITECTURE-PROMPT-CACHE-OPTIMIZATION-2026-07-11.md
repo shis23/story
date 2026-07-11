@@ -446,13 +446,22 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 ## 10. 推荐实施顺序
 
+> **进度快照（2026-07-11，`878125f`）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。
+>
+> | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
+> | --- | --- | --- | --- |
+> | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
+> | B | 部分 | QualityGate **warn-only**（Accept 旁警告 + error_count）；非 hard-block | NarrativeContract、扩展 ScenePlan、Quality hard-block 产品决策 |
+> | C | **轻量落地** | history-epoch 窗口 + 确定性 checkpoint summary + `epoch_id` 可观测；`recent_summaries` load last-12 / inject last-5；FarMemoryHit 溯源；named inject budgets；原始 history 不被远记忆挤占契约 | 完整 token budget / segment volatility 全量、真实供应商 epoch 冷热对照 |
+> | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
+
 ### 阶段 A：建立测量和安全边界
 
 1. 修复当前 release gate 和插件宿主装配。
-2. 增加 ReasoningPolicy：Disabled / Native / Prompted 三选一。
-3. 规范化工具顺序和最终请求指纹，增加真实 cache usage、prompt version、hook 前后 hash 和 segment diff 记录。
-4. 增加最小 Turn 屏障：Postprocess/状态推导结束前禁止下一轮读取未提交 revision；暂不要求立刻迁移存储。
-5. 将 DeepSeek V4 报告转成固定真实 LLM 回归集。
+2. 增加 ReasoningPolicy：Disabled / Native / Prompted 三选一。 **（已落地：`ReasoningMode`）**
+3. 规范化工具顺序和最终请求指纹，增加真实 cache usage、prompt version、hook 前后 hash 和 segment diff 记录。 **（指纹 SHA-256 + usage 日志已落地；prompt version/segment diff 可继续补）**
+4. 增加最小 Turn 屏障：Postprocess/状态推导结束前禁止下一轮读取未提交 revision；暂不要求立刻迁移存储。 **（已落地并有契约测试）**
+5. 将 DeepSeek V4 报告转成固定真实 LLM 回归集。 **（部分 harness 存在；完整矩阵延后）**
 
 阶段 A 验收：同一输入的最终请求指纹可重复；工具顺序稳定；能记录供应商真实 cached/read/create token；原生 reasoning 与提示式 CoT 不会同时启用；并发触发下一轮时不会读到半提交状态。
 
@@ -460,24 +469,24 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 1. 增加 NarrativeContract。
 2. 扩展 ScenePlan：冲突、对立目标、stakes、beats、complication、must_not_resolve、exit_hook。
-3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。
+3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（warn-only 已接 Accept UX；非 hard-block）**
 4. 把梁元的角色欲望、情绪阶段和反全知思想拆入对应结构，不原样复制整份预设。
 
 阶段 B 验收：固定知识隔离 fixture 中身份/私有知识泄漏为零；质量门禁具有稳定错误码和有界修复；真实 LLM A/B 在不显著增加延迟和费用的前提下改善目标指标。
 
 ### 阶段 C：长期上下文和缓存
 
-1. 建立 ContextCompiler 与 segment volatility。
-2. 将 RoundSummary 接入 CampaignRuntimeContext。
-3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。
-4. 建立自动混合召回和 archived watermark。
-5. 调整 Subagent 公共前缀顺序。
+1. 建立 ContextCompiler 与 segment volatility。 **（最小版 + named budgets 已落地；完整 volatility 未做）**
+2. 将 RoundSummary 接入 CampaignRuntimeContext。 **（注入 / 工具可读路径已接）**
+3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
+4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
+5. 调整 Subagent 公共前缀顺序。 **（部分）**
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。
 
 ### 阶段 D：一致性与发布
 
-1. 将阶段 A 的最小 Turn 屏障升级为完整 TurnState、CampaignRevision 和原子 TurnCommit。
+1. 将阶段 A 的最小 Turn 屏障升级为完整 TurnState、CampaignRevision 和原子 TurnCommit。 **（Turn/revision 主线已较强；UnitOfWork 仍延后）**
 2. Journal/崩溃恢复与 UnitOfWork。
 3. 在事务接口稳定后再增加 SQLite/WAL adapter。
 4. Fast/Standard/Quality 自适应流水线。
