@@ -2378,7 +2378,7 @@ async fn start_writing(
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
     fill_campaign_context_async(&mut ctx, &app).await?;
     // ContextCompiler：按用户意图自动召回 ArchivedSummary 远记忆
-    fill_far_memory_hits(&mut ctx, &app, &intent);
+    fill_far_memory_hits(&mut ctx, &app, &intent).await;
 
     // Phase A: Campaign 模式下创建 TurnRecord
     let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
@@ -2951,29 +2951,46 @@ fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolCo
     tool_guard.archived_summaries.clear();
 }
 
-/// 按用户意图从向量库召回 ArchivedSummary（关键词，best-effort）。
+/// 按用户意图从向量库召回 ArchivedSummary（混合：关键词 + 可选嵌入，best-effort）。
 ///
 /// 失败只 warn，不阻断写作。无命中时 `far_memory_hits` 为空。
 /// 有 campaign 时优先过滤同 campaign 记录，兼容无标签的旧归档。
-fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
+/// 配置了 Embedder 时走向量+关键词合并；否则纯关键词。
+async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
     ctx.far_memory_hits.clear();
     let intent = intent.trim();
     if intent.is_empty() {
         return;
     }
     let campaign_filter = ctx.campaign_id.as_ref().map(|id| id.to_string());
-    match storyforge_app_memory::recall_archived_by_query_filtered(
+    let embedder = state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .and_then(|cfg| match storyforge_infra_llm::Embedder::new(cfg) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::debug!(target: "far_memory", "构建 Embedder 失败，关键词路径: {e}");
+                None
+            }
+        });
+    match storyforge_app_memory::recall_archived_hybrid(
         state.vector_store.as_ref(),
         intent,
         3,
         campaign_filter.as_deref(),
-    ) {
+        embedder.as_ref(),
+    )
+    .await
+    {
         Ok(hits) => {
             if !hits.is_empty() {
                 tracing::info!(
                     target: "far_memory",
-                    "远记忆召回 {} 条（intent 前 40 字）",
-                    hits.len()
+                    "远记忆召回 {} 条（hybrid={}）",
+                    hits.len(),
+                    embedder.is_some()
                 );
             }
             ctx.far_memory_hits = hits.into_iter().map(|h| h.content).collect();
@@ -4286,7 +4303,7 @@ async fn regenerate(
     fill_campaign_context_async(&mut ctx, &app).await?;
     // regenerate：用 hint（若有）做远记忆召回；无 hint 则跳过
     if let Some(hint) = recall_hint.as_deref().filter(|s| !s.trim().is_empty()) {
-        fill_far_memory_hits(&mut ctx, &app, hint);
+        fill_far_memory_hits(&mut ctx, &app, hint).await;
     }
 
     // cancel channel

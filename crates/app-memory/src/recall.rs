@@ -149,19 +149,44 @@ pub fn recall_archived_by_query_filtered(
     // 多取一些再按 kind / campaign 过滤，避免被 WorldInfo 占满
     let fetch = limit.saturating_mul(8).max(limit);
     let hits = store.search_by_keywords(&tokens, fetch)?;
+    Ok(filter_archived_hits(hits, limit, campaign_id, None))
+}
+
+/// 判断 ArchivedSummary 命中是否属于目标 campaign。
+///
+/// - 无过滤条件：全部接受
+/// - 有 campaign 标签且不匹配：拒绝
+/// - 无标签的旧归档：接受（兼容 MemoryArchiver 历史记录）
+fn accepts_campaign(hit: &VectorHit, campaign_id: Option<&str>) -> bool {
+    let Some(cid) = campaign_id else {
+        return true;
+    };
+    match hit.metadata.get("campaign_id").and_then(|v| v.as_str()) {
+        Some(hit_cid) => hit_cid == cid,
+        None => true,
+    }
+}
+
+/// 从原始 VectorHit 过滤出 ArchivedSummary，并按 campaign / min_score / limit 裁剪。
+fn filter_archived_hits(
+    hits: Vec<VectorHit>,
+    limit: usize,
+    campaign_id: Option<&str>,
+    min_score: Option<f32>,
+) -> Vec<MemoryHit> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for hit in hits {
         if hit.kind != storyforge_infra_vector::VectorKind::ArchivedSummary {
             continue;
         }
-        if let Some(cid) = campaign_id {
-            // 有 campaign 标签且不匹配 → 跳过；无标签的旧归档记录仍可命中
-            if let Some(hit_cid) = hit.metadata.get("campaign_id").and_then(|v| v.as_str())
-                && hit_cid != cid
-            {
-                continue;
-            }
+        if !accepts_campaign(&hit, campaign_id) {
+            continue;
+        }
+        if let Some(min) = min_score
+            && hit.score < min
+        {
+            continue;
         }
         if !seen.insert(hit.id.as_str().to_string()) {
             continue;
@@ -171,7 +196,74 @@ pub fn recall_archived_by_query_filtered(
             break;
         }
     }
-    Ok(out)
+    out
+}
+
+/// 合并向量命中与关键词命中：向量优先（已按 score 排），关键词补齐未出现的 id。
+pub fn merge_memory_hits(
+    vector_hits: Vec<MemoryHit>,
+    keyword_hits: Vec<MemoryHit>,
+    limit: usize,
+) -> Vec<MemoryHit> {
+    if limit == 0 {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in vector_hits.into_iter().chain(keyword_hits) {
+        // MemoryHit 无稳定 id 字段；用 content+kind 去重（同一摘要 content 唯一足够）
+        let key = format!("{}|{}", hit.kind, hit.content);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(hit);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// 混合远记忆召回：关键词基线 + 可选 Embedder 向量召回合并。
+///
+/// - 无 Embedder / 嵌入失败：退化为纯关键词（与 `recall_archived_by_query_filtered` 等价）
+/// - 有 Embedder：向量命中（min_score 默认 0.45）优先，关键词补齐
+/// - 空向量记录（仅关键词索引的 RoundSummary）会被向量路径自然跳过，由关键词兜底
+pub async fn recall_archived_hybrid(
+    store: &dyn VectorStore,
+    query: &str,
+    limit: usize,
+    campaign_id: Option<&str>,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<MemoryHit>, MemoryError> {
+    if limit == 0 || query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let keyword_hits = recall_archived_by_query_filtered(store, query, limit, campaign_id)?;
+
+    let Some(embedder) = embedder else {
+        return Ok(keyword_hits);
+    };
+
+    let query_vec = match embedder.embed(query).await {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(target: "app-memory", "远记忆嵌入失败，回退关键词: {e}");
+            return Ok(keyword_hits);
+        }
+    };
+
+    // 多取再过滤 kind/campaign；空向量记录会被 cosine 跳过
+    let fetch = limit.saturating_mul(8).max(limit);
+    let vector_raw = store.search_by_vector(&query_vec, fetch)?;
+    let vector_hits = filter_archived_hits(vector_raw, limit, campaign_id, Some(0.45));
+
+    if vector_hits.is_empty() {
+        return Ok(keyword_hits);
+    }
+
+    Ok(merge_memory_hits(vector_hits, keyword_hits, limit))
 }
 
 #[cfg(test)]
@@ -282,5 +374,54 @@ mod tests {
         assert!(hits.iter().any(|h| h.content.contains("A 营")));
         assert!(hits.iter().any(|h| h.content.contains("旧归档")));
         assert!(!hits.iter().any(|h| h.content.contains("B 营")));
+    }
+
+    #[test]
+    fn test_merge_memory_hits_vector_first_then_keyword_fill() {
+        let vector = vec![MemoryHit {
+            content: "向量命中：诊所潜入".into(),
+            score: 0.9,
+            kind: "ArchivedSummary".into(),
+            keywords: vec![],
+        }];
+        let keyword = vec![
+            MemoryHit {
+                content: "向量命中：诊所潜入".into(), // 重复
+                score: 1.0,
+                kind: "ArchivedSummary".into(),
+                keywords: vec![],
+            },
+            MemoryHit {
+                content: "关键词补齐：诊所值班".into(),
+                score: 1.0,
+                kind: "ArchivedSummary".into(),
+                keywords: vec![],
+            },
+        ];
+        let merged = merge_memory_hits(vector, keyword, 3);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].content.contains("向量命中"));
+        assert!(merged[1].content.contains("关键词补齐"));
+    }
+
+    #[tokio::test]
+    async fn test_recall_archived_hybrid_without_embedder_equals_keyword() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("a1"),
+                content: "昨夜有人潜入诊所".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        let hybrid = recall_archived_hybrid(&store, "诊所", 3, None, None)
+            .await
+            .unwrap();
+        let keyword = recall_archived_by_query_filtered(&store, "诊所", 3, None).unwrap();
+        assert_eq!(hybrid.len(), keyword.len());
+        assert_eq!(hybrid[0].content, keyword[0].content);
     }
 }
