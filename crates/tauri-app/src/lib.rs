@@ -188,6 +188,7 @@ fn recover_turns_on_startup(app_state: &AppState) {
             }) {
                 Ok(_) => {
                     // 与正常 commit 一致：RoundSummary 索引进远记忆向量池（best-effort）
+                    // 启动恢复路径只做同步关键词索引，避免阻塞启动
                     index_round_summaries_to_vector(app_state.vector_store.as_ref(), &batch);
                     tracing::info!(
                         "Phase A 启动恢复: Turn {} 幂等重放成功 → Committed",
@@ -3001,12 +3002,24 @@ async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent
     }
 }
 
-/// 把已 accept 的 RoundSummary 索引进向量库（关键词路径，不依赖 Embedder）。
+/// 把已 accept 的 RoundSummary 索引进向量库。
 ///
-/// 幂等：以 summary.id 为向量记录 id upsert。失败只 warn。
+/// - 始终写关键词（无 Embedder 也能召回）
+/// - 若传入 `embedder`，best-effort 嵌入真实向量供 hybrid 召回
+/// - 幂等：以 summary.id 为向量记录 id upsert
 fn index_round_summaries_to_vector(
     vector_store: &dyn VectorStore,
     batch: &storyforge_domain::turn::MutationBatch,
+) {
+    // 同步关键词路径（commit 关键不阻塞等嵌入）
+    index_round_summaries_to_vector_with_vectors(vector_store, batch, &[]);
+}
+
+/// 同 `index_round_summaries_to_vector`，但允许预计算向量（id → vector）。
+fn index_round_summaries_to_vector_with_vectors(
+    vector_store: &dyn VectorStore,
+    batch: &storyforge_domain::turn::MutationBatch,
+    vectors: &[(Id, Vec<f32>)],
 ) {
     for mutation in &batch.mutations {
         let storyforge_domain::turn::Mutation::UpsertSummary(summary) = mutation else {
@@ -3044,10 +3057,15 @@ fn index_round_summaries_to_vector(
             "source".into(),
             serde_json::Value::String("round_summary".into()),
         );
+        let vector = vectors
+            .iter()
+            .find(|(id, _)| id == &summary.id)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
         if let Err(e) = vector_store.upsert(VectorRecord {
             id: summary.id.clone(),
             content: content.to_string(),
-            vector: vec![], // 关键词路径；有 Embedder 时可由后台补齐
+            vector,
             keywords,
             kind: VectorKind::ArchivedSummary,
             metadata,
@@ -3064,6 +3082,63 @@ fn index_round_summaries_to_vector(
                 summary.id
             );
         }
+    }
+}
+
+/// 后台：为 batch 中的 RoundSummary 补齐嵌入向量（有 Embedder 时）。
+///
+/// 先关键词落盘保证可召回；嵌入成功后覆盖 upsert 写入真实向量。
+async fn index_round_summaries_async(
+    state: Arc<AppState>,
+    batch: storyforge_domain::turn::MutationBatch,
+) {
+    // 1. 关键词立即入库
+    index_round_summaries_to_vector(state.vector_store.as_ref(), &batch);
+
+    // 2. 可选嵌入补齐
+    let config = state
+        .embed_config
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let Some(config) = config else {
+        return;
+    };
+    let embedder = match storyforge_infra_llm::Embedder::new(config) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(target: "far_memory", "RoundSummary 嵌入跳过（Embedder 构建失败）: {e}");
+            return;
+        }
+    };
+
+    let mut vectors = Vec::new();
+    for mutation in &batch.mutations {
+        let storyforge_domain::turn::Mutation::UpsertSummary(summary) = mutation else {
+            continue;
+        };
+        let content = summary.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        match embedder.embed(content).await {
+            Ok(v) => vectors.push((summary.id.clone(), v)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "far_memory",
+                    "RoundSummary {} 嵌入失败（保留关键词索引）: {e}",
+                    summary.id
+                );
+            }
+        }
+    }
+    if !vectors.is_empty() {
+        index_round_summaries_to_vector_with_vectors(state.vector_store.as_ref(), &batch, &vectors);
+        tracing::info!(
+            target: "far_memory",
+            "RoundSummary 嵌入补齐 {} 条",
+            vectors.len()
+        );
     }
 }
 
@@ -5491,7 +5566,14 @@ async fn commit_turn_attempt(
     .map_err(TauriCommandError::internal)?;
 
     // 6b. ContextCompiler：已接受的 RoundSummary 进入远记忆向量池（best-effort）
-    index_round_summaries_to_vector(state.vector_store.as_ref(), &batch_for_index);
+    // 关键词同步入库；有 Embedder 时后台补齐真实向量
+    {
+        let state_for_index = state.clone();
+        let batch_index = batch_for_index;
+        tokio::spawn(async move {
+            index_round_summaries_async(state_for_index, batch_index).await;
+        });
+    }
 
     // 7. 标记 Committed + 其他 attempts Superseded
     // 副作用已完成，持久化失败只记日志（Campaign 已写入，不能回滚）
