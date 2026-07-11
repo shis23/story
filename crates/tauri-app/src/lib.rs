@@ -2489,17 +2489,31 @@ async fn start_writing(
                 provenance: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
-            // A.1：Attempt 创建失败必须传播——Draft 已在对话树时不能静默丢身份
-            update_turn_record(&turn.turn_id, |record| {
+            // A.1/P0-4：Attempt 创建失败必须传播，并补偿软删无主 Draft
+            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
                 record.attempts.push(attempt);
                 record.status = storyforge_domain::turn::TurnStatus::DraftReady;
                 record.touch();
-            })
-            .map_err(|e| {
-                TauriCommandError::internal(format!(
-                    "TurnAttempt 持久化失败（Draft 已产出但无 Attempt 身份）: {e}"
-                ))
-            })?;
+            }) {
+                if let Err(comp_e) = app
+                    .conv_store
+                    .soft_delete_variant(&conversation_id, draft_node_id)
+                {
+                    tracing::error!(
+                        "P0-4 补偿失败: soft_delete 无主 Draft {} 失败: {comp_e}（原错误: {e}）",
+                        draft_node_id
+                    );
+                }
+                // Turn 标 Failed，避免屏障卡死后续写作
+                let _ = update_turn_record(&turn.turn_id, |record| {
+                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                    record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
+                    record.touch();
+                });
+                return Err(TauriCommandError::internal(format!(
+                    "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
+                )));
+            }
             Some(attempt_id)
         } else {
             None
@@ -4559,7 +4573,9 @@ async fn regenerate(
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
                 let new_attempt_id = new_attempt.attempt_id.clone();
-                let _ = update_turn_record(&turn.turn_id, |record| {
+                // P0-4：regenerate Attempt 落盘失败不能吞掉，否则后处理会把 Turn
+                // 推到 AwaitingAcceptance 却找不到 Attempt，形成无法 accept 的死锁。
+                if let Err(e) = update_turn_record(&turn.turn_id, |record| {
                     // 旧活动 Attempt → Superseded
                     for att in &mut record.attempts {
                         if att.status.is_active() {
@@ -4569,7 +4585,26 @@ async fn regenerate(
                     record.attempts.push(new_attempt);
                     record.status = storyforge_domain::turn::TurnStatus::DraftReady;
                     record.touch();
-                });
+                }) {
+                    if let Err(comp_e) = app
+                        .conv_store
+                        .soft_delete_variant(&conversation_id, &node_id)
+                    {
+                        tracing::error!(
+                            "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
+                            node_id
+                        );
+                    }
+                    let _ = update_turn_record(&turn.turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Failed;
+                        record.failure_reason =
+                            Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
+                        record.touch();
+                    });
+                    return Err(TauriCommandError::internal(format!(
+                        "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
+                    )));
+                }
                 Some(new_attempt_id)
             } else {
                 None
@@ -4577,8 +4612,6 @@ async fn regenerate(
         } else {
             None
         };
-
-        // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前）
 
         let (final_text, present_chars, var_keys) = (
             text.clone(),

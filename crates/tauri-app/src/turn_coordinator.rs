@@ -205,21 +205,35 @@ impl CampaignMutationCoordinator {
             }
 
             Mutation::UpsertInstance(instance) => {
-                // accept 时落盘临时角色；幂等：同 id 已存在则 skip，同名不同 id 冲突报错
+                // accept 时落盘临时角色：
+                // - 同 id + 关键字段一致 → AlreadyPresent / no-op
+                // - 同 id + payload 不一致 → Conflict
+                // - 不同 id 同名 → Conflict
+                if instance.campaign_id != *campaign_id {
+                    return Err(CommitError::Storage(format!(
+                        "UpsertInstance campaign 不匹配: instance={}, expected={}",
+                        instance.campaign_id, campaign_id
+                    )));
+                }
                 let existing = store.list_instances(campaign_id);
-                if existing.iter().any(|i| i.id == instance.id) {
-                    return Ok(());
+                if let Some(prev) = existing.iter().find(|i| i.id == instance.id) {
+                    let same_payload = prev.name == instance.name
+                        && prev.definition_id == instance.definition_id
+                        && prev.is_temporary == instance.is_temporary
+                        && prev.persona_override == instance.persona_override
+                        && prev.behavior_override == instance.behavior_override;
+                    if same_payload {
+                        return Ok(());
+                    }
+                    return Err(CommitError::MutationConflict(format!(
+                        "UpsertInstance id={} payload 与已有实例冲突",
+                        instance.id
+                    )));
                 }
                 if existing.iter().any(|i| i.name == instance.name) {
                     return Err(CommitError::MutationConflict(format!(
                         "临时 instance '{}' 与已有同名角色冲突",
                         instance.name
-                    )));
-                }
-                if instance.campaign_id != *campaign_id {
-                    return Err(CommitError::Storage(format!(
-                        "UpsertInstance campaign 不匹配: instance={}, expected={}",
-                        instance.campaign_id, campaign_id
                     )));
                 }
                 store
@@ -457,9 +471,22 @@ mod tests {
         };
         CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
         assert_eq!(store.list_instances(&campaign_id).len(), 1);
-        // 同 id 重放不重复
+        // 同 id 同 payload 重放不重复
         CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
         assert_eq!(store.list_instances(&campaign_id).len(), 1);
+        // 同 id 不同 payload → Conflict
+        let mut conflict = inst.clone();
+        conflict.persona_override = Some("changed".into());
+        let batch2 = MutationBatch {
+            commit_id: Id::from_str("commit-temp-2"),
+            expected_revision: 1,
+            target_revision: 2,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::UpsertInstance(Box::new(conflict))],
+        };
+        let err = CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch2)
+            .expect_err("payload conflict");
+        assert!(matches!(err, CommitError::MutationConflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
