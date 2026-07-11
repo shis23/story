@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_meta_description_detected() {
         let text = "好的，我来为你写一个精彩的场景。夜风吹过窗棂，林秋坐在桌前，看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。窗外有猫叫，声音远处传来。";
-        let report = run_quality_gate(&text);
+        let report = run_quality_gate(text);
         let has_meta = report
             .warnings
             .iter()
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn test_no_ngram_repetition_for_unique_text() {
         let text = "夜风拂面，林秋静坐窗前。茶香袅袅升起，远处传来猫叫声声。他望向那片星空，回忆如潮水般涌来。冬天的夜晚总是这样安静而寒冷。";
-        let report = run_quality_gate(&text);
+        let report = run_quality_gate(text);
         let has_ngram = report
             .warnings
             .iter()

@@ -153,8 +153,10 @@ pub struct AgentBinding {
 ///
 /// 按 category 优先级顺序，插入已选模块的 content，最后拼接工具说明。
 ///
-/// A1 互斥规则（架构文档 §6.2）：`reasoning == Native` 时跳过 `ModuleCategory::Cot`，
-/// 因为厂商原生 thinking 与提示式 CoT 不可同时启用（双重推理浪费 token 且可能冲突）。
+/// A1 互斥规则（架构文档 §6.2）：只有 `Prompted` 模式注入 CoT 提示模块。
+/// - `Disabled` = 不启用任何推理引导（跳过 CoT）
+/// - `Native` = 使用厂商原生 thinking（跳过 CoT，避免双重推理）
+/// - `Prompted` = 使用提示式 CoT（注入 CoT 模块）
 pub fn assemble_system_prompt(
     role: &AgentRole,
     role_directive: &str,
@@ -177,8 +179,11 @@ pub fn assemble_system_prompt(
         ];
 
         for cat in &category_order {
-            // A1：Native reasoning 模式下跳过 CoT 提示模块
-            if *cat == ModuleCategory::Cot && *reasoning == crate::llm::ReasoningMode::Native {
+            // A1：只有 Prompted 模式注入 CoT；Disabled 和 Native 都跳过
+            // - Disabled = 不启用任何推理引导
+            // - Native = 使用厂商原生 thinking，CoT 冗余
+            // - Prompted = 使用提示式 CoT
+            if *cat == ModuleCategory::Cot && *reasoning != crate::llm::ReasoningMode::Prompted {
                 continue;
             }
             let ids = profile.selected_ids(role, cat);
@@ -881,8 +886,8 @@ pub mod builtins {
         }
 
         #[test]
-        fn test_assemble_disabled_reasoning_includes_cot() {
-            // A1：Disabled（默认）模式下 CoT 也正常注入
+        fn test_assemble_disabled_reasoning_excludes_cot() {
+            // A1：Disabled 模式下不注入 CoT
             let (profile, modules) = default_profile();
             let assembled = assemble_system_prompt(
                 &AgentRole::Director,
@@ -892,7 +897,10 @@ pub mod builtins {
                 "",
                 &crate::llm::ReasoningMode::Disabled,
             );
-            assert!(assembled.contains("思考指引"));
+            assert!(
+                !assembled.contains("思考指引"),
+                "Disabled 模式不应注入 CoT 提示，实际: {assembled}"
+            );
         }
 
         #[test]
