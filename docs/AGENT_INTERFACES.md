@@ -46,12 +46,12 @@ User Intent
 - `search_vectors(query, top_k)`
 - `get_recent_summary(limit)`
 
-目标记忆工具（规格已拍板，实现见记忆文档；与自动召回并存）：
+目标记忆工具（规格 v1.0；与自动召回并存）：
 
-- `search_chronicle(query, …)` — 返回短目录行（code + headline），不返回 full
-- `get_chronicle(code, detail=summary|full)` — **默认 summary**；full 可选、次数更严
+- `search_chronicle(query, …)` — **仅搜 Chronicle A/B/C**；返回短目录行（code + headline），不返回 full；**不含** ArchivedSummary
+- `get_chronicle(code|id, detail=summary|full)` — **默认 summary**；full 可选、次数更严；带来源字段，免责声明在 system 契约
 
-装配：近 H 轮正文 / 中 S 轮短纪要 / 远概览（cap≈200）/ epoch 同步滑动 / A≥200 批压 B。详见：
+装配：`H_anchor` 锚点 + epoch 内追加至最多 `H_anchor+E` 轮正文 / 纪要带 S / 远概览（行数∩token）/ epoch 快照冻结 / 确定性分组批压。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
@@ -173,22 +173,22 @@ User Intent
 
 职责：
 
-- 当 **未覆盖 active A ≥ 200** 时，将一批 A 的 headline+summary **批压**为约 50 条 **B**，写 `covers` / `covered_by`。
-- 当 **未覆盖 active B ≥ 200** 时，同理压为约 50 条 **C**。
-- 后台异步，失败可重试；**不**进入每轮成文热路径。
+- 阈值触发时，由**系统**按时间将未覆盖 A（或 B）切成连续不重叠组；**LLM 只写**每组 headline/summary；**系统**填 `covers`/`covered_by` 并校验「恰好覆盖一次」。
+- 实验默认：active A 达 200、组大小 4 → 约 50 条 B；B 同理 → C（参数可测后调整）。
+- 后台异步，失败可重试；发布时递增 `chronicle_revision`；**不**进入每轮成文热路径，**不**随意 bump `campaign_revision`。
 
 不负责：本轮成文摘要、消息归档、状态写回。可与 Summarizer 共用模型档，但 **独立入口/角色**。
 
-详见记忆规格 §7.2。实现前本角色可尚未出现在 `AgentRole` 枚举中。
+详见记忆规格 §7.3。实现前本角色可尚未出现在 `AgentRole` 枚举中。
 
 ## MemoryArchiver（已有，非对话 Agent）
 
 职责：
 
 - 对话**消息正文**过长时，按 `archived_upto` 水位批取前缀，LLM 压成 `ArchivedSummary`，keywords + 可选 embedding 写入向量库。
-- 供写作时 hybrid 远记忆召回（`FarMemoryHit` → tail），**不**占用 Chronicle 默认 200 行事件概览的主语义。
+- 供写作时 **auto recall**（`FarMemoryHit` → tail）；**v1 不进入 `search_chronicle`**（该工具仅 Chronicle A/B/C）。
 
-不负责：RoundSummary/A/B/C 纪要金字塔。
+不负责：RoundSummary/A/B/C 纪要金字塔；不是规范轮次纪要。
 
 代码：`crates/app-memory/src/archiver.rs`；Tauri 水位路径 `run_archive_with_watermark` / `auto_archive_if_needed`。
 

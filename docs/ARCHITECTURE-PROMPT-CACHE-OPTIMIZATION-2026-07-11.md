@@ -367,7 +367,7 @@ Usage
 
 ## 8. ContextCompiler 建议
 
-> **落地规格（2026-07-11 拍板）**：远楼概览 cap≈200、正文/纪要不重叠窗、三窗 epoch 同步滑动、A/B/C 攒 200 再压、Director 点名 tool 等，以专用文档为准，避免与本节早期评估表述漂移：  
+> **落地规格 v1.0（2026-07-11）**：含精确 epoch 成员公式（`H_anchor+E`）、epoch 快照、lineage、`chronicle_revision`、Chronicle/RoundSummary/ArchivedSummary 主从、确定性分组压缩、`search_chronicle` 仅 A/B/C。以专用文档为准：  
 > [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
 下面的 P0～P6 是**内容保留优先级**：当 token budget 不足时，越靠前的内容越不能被裁掉。它不是 SillyTavern 的 injection depth，也不是最终 messages 的物理排列顺序。
