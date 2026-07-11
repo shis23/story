@@ -30,12 +30,15 @@ const subagents = computed(() =>
   ),
 )
 
-// 有过程数据可回顾（已完成态，且至少导演/编剧/子 Agent 有输出）
+// 有过程数据可回顾：
+// - 本轮完成后的导演/编剧/子 Agent 输出
+// - 或刷新后从活动 Turn 回填的质量报告（state 可能仍是 idle）
 const hasReview = computed(
   () =>
     !writing.isWriting &&
-    writing.pipeline.state === 'done' &&
-    (directorOutput.value || editorOutput.value || subagents.value.length),
+    ((writing.pipeline.state === 'done' &&
+      (directorOutput.value || editorOutput.value || subagents.value.length)) ||
+      !!quality.value),
 )
 
 const directorDetail = computed(() => writing.pipeline.director?.detail || '')
