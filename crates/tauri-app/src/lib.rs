@@ -2510,6 +2510,7 @@ async fn start_writing(
                     record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
                     record.touch();
                 });
+                clear_current_cancel(&app);
                 return Err(TauriCommandError::internal(format!(
                     "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
                 )));
@@ -2642,10 +2643,7 @@ async fn start_writing(
     }
 
     // 清理 cancel sender
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        *slot = None;
-    }
+    clear_current_cancel(&app);
 
     match result {
         Ok((text, node_id, _provenance)) => Ok(serde_json::json!({
@@ -2702,6 +2700,12 @@ where
     get_turn_store()
         .with_turn_mut(turn_id, f)
         .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
+}
+
+/// 清理 AppState.current_cancel（写作/重 roll 结束或提前失败时统一调用）。
+fn clear_current_cancel(app: &AppState) {
+    let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+    *slot = None;
 }
 
 /// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
@@ -4601,6 +4605,7 @@ async fn regenerate(
                             Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
                         record.touch();
                     });
+                    clear_current_cancel(&app);
                     return Err(TauriCommandError::internal(format!(
                         "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
                     )));

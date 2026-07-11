@@ -221,7 +221,8 @@ impl CampaignMutationCoordinator {
                         && prev.definition_id == instance.definition_id
                         && prev.is_temporary == instance.is_temporary
                         && prev.persona_override == instance.persona_override
-                        && prev.behavior_override == instance.behavior_override;
+                        && prev.behavior_override == instance.behavior_override
+                        && prev.variables == instance.variables;
                     if same_payload {
                         return Ok(());
                     }
@@ -474,7 +475,7 @@ mod tests {
         // 同 id 同 payload 重放不重复
         CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
         assert_eq!(store.list_instances(&campaign_id).len(), 1);
-        // 同 id 不同 payload → Conflict
+        // 同 id 不同 persona → Conflict
         let mut conflict = inst.clone();
         conflict.persona_override = Some("changed".into());
         let batch2 = MutationBatch {
@@ -486,6 +487,23 @@ mod tests {
         };
         let err = CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch2)
             .expect_err("payload conflict");
+        assert!(matches!(err, CommitError::MutationConflict(_)));
+        // 同 id 不同 variables → Conflict
+        let mut conflict_vars = inst.clone();
+        conflict_vars.variables = vec![storyforge_domain::variables::VariableValue::new(
+            "hp",
+            serde_json::json!(1),
+            0,
+        )];
+        let batch3 = MutationBatch {
+            commit_id: Id::from_str("commit-temp-3"),
+            expected_revision: 1,
+            target_revision: 2,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::UpsertInstance(Box::new(conflict_vars))],
+        };
+        let err = CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch3)
+            .expect_err("variables conflict");
         assert!(matches!(err, CommitError::MutationConflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -111,7 +111,7 @@ pub fn default_campaign_variables() -> Vec<VariableField> {
 // ─── 实例值层（运行时存当前值）────────────────────────────────────────────
 
 /// 一个变量的当前值（实例层）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariableValue {
     pub key: String,
     pub value: serde_json::Value,
