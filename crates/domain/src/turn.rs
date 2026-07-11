@@ -6,6 +6,7 @@
 //! 核心思想：
 //! - `PipelineState` 描述 Agent 执行进度（Directing / Editing / Review）。
 //! - `TurnStatus` 描述本轮数据的一致性（草稿 / 状态推导 / Campaign 变更是否已提交）。
+//!
 //! 两者是正交维度，不在同一枚举上扩展。
 //!
 //! 一个 `TurnRecord` 代表一次用户意图触发的完整轮次，包含多个 `TurnAttempt`
@@ -297,7 +298,7 @@ pub struct TurnAttempt {
     pub attempt_id: Id,
     /// 对话树中的 AI Draft variant 节点 ID
     pub variant_id: Id,
-    /// 草稿内容的 hash（BLAKE3/SHA-256），用于检测编辑后 diff 失效
+    /// 草稿内容的 hash（SHA-256），用于检测编辑后 diff 失效
     pub draft_hash: String,
     pub status: AttemptStatus,
     /// 候选状态变更（postprocess 推导产出），None = 未推导
@@ -377,9 +378,14 @@ impl TurnRecord {
         self.attempts.iter().find(|a| &a.attempt_id == attempt_id)
     }
 
-    /// 按 variant_id 查找
+    /// 按 variant_id 查找——只返回活动（非 terminal）Attempt。
+    ///
+    /// P0-1 修复：regenerate 在同一 node 上创建新 Attempt 后，旧 Attempt 已 Superseded。
+    /// 如果返回第一个匹配（旧的），accept 会命中旧 Attempt。改为跳过 terminal 态。
     pub fn find_attempt_by_variant(&self, variant_id: &Id) -> Option<&TurnAttempt> {
-        self.attempts.iter().find(|a| &a.variant_id == variant_id)
+        self.attempts
+            .iter()
+            .find(|a| &a.variant_id == variant_id && a.status.is_active())
     }
 
     /// 按 attempt_id 查找（可变）
@@ -389,11 +395,11 @@ impl TurnRecord {
             .find(|a| &a.attempt_id == attempt_id)
     }
 
-    /// 按 variant_id 查找（可变）
+    /// 按 variant_id 查找（可变）——只返回活动（非 terminal）Attempt（同 P0-1 修复）
     pub fn find_attempt_by_variant_mut(&mut self, variant_id: &Id) -> Option<&mut TurnAttempt> {
         self.attempts
             .iter_mut()
-            .find(|a| &a.variant_id == variant_id)
+            .find(|a| &a.variant_id == variant_id && a.status.is_active())
     }
 
     /// 更新 updated_at 时间戳

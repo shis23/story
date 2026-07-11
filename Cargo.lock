@@ -3711,6 +3711,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "storyforge-app-agent",
  "storyforge-app-conversation",
  "storyforge-app-logging",

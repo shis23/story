@@ -43,6 +43,9 @@ regress = "0.11"
 # PNG 解析
 crc32fast = "1"
 
+# 哈希（P0-3：draft_hash 用 SHA-256 替代 DefaultHasher，保证跨进程稳定）
+sha2 = "0.10"
+
 # 领域模型
 storyforge-domain = { path = "crates/domain" }
 storyforge-infra-util = { path = "crates/infra-util" }
