@@ -30,6 +30,15 @@ pub struct Campaign {
     /// Ideal: remove in data migration; this is the truth-source of the `variables` entry.
     #[serde(default = "default_story_clock")]
     pub story_clock: String,
+    /// Campaign 聚合根的逻辑版本号。
+    ///
+    /// 一次 TurnCommit 或一次 MetaCommit 只 bump 一次(不是每个底层 CRUD bump)。
+    /// 新建/fork 的 Campaign 从 0 开始;旧 JSON 反序列化为 0(向后兼容)。
+    ///
+    /// TurnAttempt.base_campaign_revision 与 accept 时的 CAS 校验依赖此字段,
+    /// 用于检测"本轮基于的 Campaign revision 是否已被外部推进"。
+    #[serde(default)]
+    pub revision: u64,
 }
 
 fn default_story_clock() -> String {
@@ -51,6 +60,7 @@ impl Campaign {
             ),
             conversation_id: None,
             story_clock: default_story_clock(),
+            revision: 0,
         }
     }
 
@@ -73,6 +83,7 @@ impl Campaign {
             ),
             conversation_id: None,
             story_clock: default_story_clock(),
+            revision: 0,
         }
     }
 
@@ -535,5 +546,44 @@ mod tests {
         assert_eq!(a.persona_override, b.persona_override);
         assert_eq!(a.behavior_override, b.behavior_override);
         assert_eq!(a.definition_id, b.definition_id);
+    }
+
+    // --- Phase A: Campaign.revision ---
+
+    #[test]
+    fn test_campaign_new_revision_starts_at_zero() {
+        let campaign = Campaign::new(Id::new(), "run-1");
+        assert_eq!(campaign.revision, 0, "new campaign must start at revision 0");
+    }
+
+    #[test]
+    fn test_campaign_fork_revision_starts_at_zero() {
+        let campaign = Campaign::fork(Id::new(), "fork", Id::new(), Id::new());
+        assert_eq!(campaign.revision, 0, "forked campaign must start at revision 0");
+    }
+
+    #[test]
+    fn test_campaign_revision_backward_compat_old_json() {
+        // Simulate old JSON that has no revision field at all
+        let old_json = serde_json::json!({
+            "id": "camp-old",
+            "card_id": "card-1",
+            "name": "old campaign",
+            "created_at": "2026-01-01T00:00:00Z",
+            "story_clock": "Day 1"
+        });
+        let campaign: Campaign = serde_json::from_value(old_json).expect(
+            "old JSON without revision must deserialize successfully (serde default = 0)",
+        );
+        assert_eq!(campaign.revision, 0, "missing revision field must default to 0");
+    }
+
+    #[test]
+    fn test_campaign_revision_serializes_and_round_trips() {
+        let mut campaign = Campaign::new(Id::new(), "test");
+        campaign.revision = 42;
+        let json = serde_json::to_string(&campaign).unwrap();
+        let restored: Campaign = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.revision, 42, "revision must survive round-trip");
     }
 }
