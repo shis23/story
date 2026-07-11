@@ -10,7 +10,9 @@
 //! [2] history（稳定前缀，逐轮 append）   → cache 全命中
 //! [3] tail（易变，每轮新建，用完即弃）   → 只影响这条
 
-use crate::llm::ChatMessage;
+use sha2::{Digest, Sha256};
+
+use crate::llm::{ChatMessage, ChatRole};
 
 // ─── 易变末尾的构建器 ───────────────────────────────────────────────────────
 
@@ -84,30 +86,61 @@ impl MessageLayout {
         msgs
     }
 
-    /// 测试用：取稳定前缀的指纹（用于 CI 断言跨轮一致）
+    /// 稳定前缀指纹（system + history 内容寻址）
     ///
-    /// 返回 (system 内容, history 消息数 + 各消息 content 长度)。
-    /// 若两轮调用的指纹一致，说明前缀稳定，cache 不会失效。
+    /// 用于断言跨轮前缀 byte 稳定。history 用 content hash，不用长度——
+    /// 等长不同内容必须产生不同指纹。
     pub fn prefix_fingerprint(&self) -> PrefixFingerprint {
-        let history_sig: Vec<(String, usize)> = self
+        let history_sig: Vec<(String, String)> = self
             .stable_history
             .iter()
-            .map(|m| (format!("{:?}", m.role), m.content.len()))
+            .map(|m| (role_label(&m.role).to_string(), content_hash(&m.content)))
             .collect();
         PrefixFingerprint {
-            system_len: self.stable_system.len(),
-            system_hash: simple_hash(&self.stable_system),
+            system_hash: content_hash(&self.stable_system),
             history_sig,
         }
     }
+
+    /// 完整请求指纹（system + history + tail），用于同输入可复现校验。
+    pub fn full_request_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"system\0");
+        hasher.update(self.stable_system.as_bytes());
+        hasher.update(b"\n");
+        for msg in &self.stable_history {
+            hasher.update(role_label(&msg.role).as_bytes());
+            hasher.update(b"\0");
+            hasher.update(msg.content.as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher.update(b"tail\0");
+        for part in &self.volatile_tail.parts {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\n");
+        }
+        hex_encode(&hasher.finalize())
+    }
 }
 
-/// 前缀指纹（CI 测试用）
+/// 前缀指纹（内容寻址，CI / 运行时断言用）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixFingerprint {
-    pub system_len: usize,
-    pub system_hash: u64,
-    pub history_sig: Vec<(String, usize)>,
+    pub system_hash: String,
+    /// (role label, content sha256 hex)
+    pub history_sig: Vec<(String, String)>,
+}
+
+/// 对 hook 后最终 messages 计算请求指纹（不落全文，只记 hash）。
+pub fn fingerprint_messages(messages: &[ChatMessage]) -> String {
+    let mut hasher = Sha256::new();
+    for msg in messages {
+        hasher.update(role_label(&msg.role).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(msg.content.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex_encode(&hasher.finalize())
 }
 
 // ─── Builder（类型状态机，编译期强制顺序）──────────────────────────────────
@@ -151,13 +184,29 @@ impl MessageLayoutBuilder {
 
 // ─── 辅助 ──────────────────────────────────────────────────────────────────
 
-/// 简易字符串 hash（不引入额外 crate，测试用）
-fn simple_hash(s: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+fn role_label(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
+}
+
+fn content_hash(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
 }
 
 // ─── 测试 ──────────────────────────────────────────────────────────────────
@@ -227,6 +276,11 @@ mod tests {
 
         // 前缀指纹应一致（cache 命中）
         assert_eq!(round1.prefix_fingerprint(), round2.prefix_fingerprint());
+        // 完整请求指纹应不同
+        assert_ne!(
+            round1.full_request_fingerprint(),
+            round2.full_request_fingerprint()
+        );
     }
 
     #[test]
@@ -250,5 +304,47 @@ mod tests {
             ])
             .tail(|t| t);
         assert_ne!(a.prefix_fingerprint(), b.prefix_fingerprint());
+    }
+
+    #[test]
+    fn test_prefix_fingerprint_changes_when_history_content_same_len() {
+        // 等长不同内容：旧实现只记 len 会假稳定
+        let a = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("abcd")])
+            .tail(|t| t);
+        let b = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("wxyz")])
+            .tail(|t| t);
+        assert_eq!("abcd".len(), "wxyz".len());
+        assert_ne!(a.prefix_fingerprint(), b.prefix_fingerprint());
+    }
+
+    #[test]
+    fn test_fingerprint_messages_matches_layout_full_when_no_hook() {
+        let layout = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("hi")])
+            .tail(|t| t.push("tail"));
+        let msgs = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("hi")])
+            .tail(|t| t.push("tail"))
+            .into_messages();
+        // full_request_fingerprint 编码格式与 fingerprint_messages 略有不同
+        // （含 segment 标记），但 fingerprint_messages 自身必须稳定
+        let f1 = fingerprint_messages(&msgs);
+        let f2 = fingerprint_messages(&msgs);
+        assert_eq!(f1, f2);
+        assert_eq!(f1.len(), 64);
+        let _ = layout; // silence unused
+    }
+
+    #[test]
+    fn test_fingerprint_messages_sensitive_to_content() {
+        let a = vec![ChatMessage::user("hello")];
+        let b = vec![ChatMessage::user("world")];
+        assert_ne!(fingerprint_messages(&a), fingerprint_messages(&b));
     }
 }

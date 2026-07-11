@@ -17,10 +17,34 @@ use storyforge_domain::llm::{
     ChatMessage, ChatRequest, ChatResponse, LlmError, SamplingParams, StreamChunk, ToolCall,
     ToolSpec,
 };
-use storyforge_domain::message_layout::MessageLayout;
+use storyforge_domain::message_layout::{fingerprint_messages, MessageLayout};
 use storyforge_infra_llm::LlmClient;
 
 use crate::tools::{ToolContext, ToolRegistry};
+
+/// A2：记录 hook 后最终请求指纹（不落全文）与供应商 cache usage。
+fn log_request_observability(role: &AgentRole, round: u32, messages: &[ChatMessage], tag: &str) {
+    let fp = fingerprint_messages(messages);
+    let fp_short = if fp.len() >= 16 { &fp[..16] } else { fp.as_str() };
+    debug!(
+        target: "app-agent",
+        "{role}{tag}: round={round} request_fp={fp_short} msgs={}",
+        messages.len()
+    );
+}
+
+fn log_usage_observability(role: &AgentRole, round: u32, resp: &ChatResponse, tag: &str) {
+    if let Some(usage) = resp.usage.as_ref() {
+        info!(
+            target: "app-agent",
+            "{role}{tag}: round={round} prompt={} completion={} cached={} cache_create={}",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens,
+            usage.cache_creation_tokens
+        );
+    }
+}
 
 async fn execute_tool_call(
     tc: &ToolCall,
@@ -223,6 +247,7 @@ impl AgentRuntime {
             let request_messages = self
                 .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
                 .await?;
+            log_request_observability(&config.role, round, &request_messages, "");
 
             let req = ChatRequest {
                 messages: request_messages,
@@ -249,6 +274,7 @@ impl AgentRuntime {
                 result = self.llm.chat(&req) => result.map_err(AgentError::Llm)?,
                 _ = cancel_fut => return Err(AgentError::Cancelled),
             };
+            log_usage_observability(&config.role, round, &resp, "");
 
             // 没有工具调用 = 模型直接输出文本
             if resp.tool_calls.is_empty() {
@@ -357,6 +383,7 @@ impl AgentRuntime {
             let request_messages = self
                 .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
                 .await?;
+            log_request_observability(&config.role, round, &request_messages, "[stream]");
 
             let req = ChatRequest {
                 messages: request_messages,
@@ -383,6 +410,7 @@ impl AgentRuntime {
             };
             let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
             let resp = resp_res.map_err(AgentError::Llm)?;
+            log_usage_observability(&config.role, round, &resp, "[stream]");
 
             // 没有工具调用 = 模型直接输出文本（最终输出）
             if resp.tool_calls.is_empty() {
@@ -506,6 +534,7 @@ impl AgentRuntime {
             let request_messages = self
                 .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
                 .await?;
+            log_request_observability(&config.role, round, &request_messages, "[layout]");
 
             let req = ChatRequest {
                 messages: request_messages,
@@ -532,6 +561,7 @@ impl AgentRuntime {
             };
             let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
             let resp = resp_res.map_err(AgentError::Llm)?;
+            log_usage_observability(&config.role, round, &resp, "[layout]");
 
             // 没有工具调用 = 模型直接输出文本（最终输出）
             if resp.tool_calls.is_empty() {

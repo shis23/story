@@ -147,6 +147,10 @@ pub struct WritingContext {
     /// 远记忆自动召回命中（ArchivedSummary content，按相关度）。
     /// 由 Tauri 层在 start_writing 时按意图检索后填入；无向量库/无命中则为空。
     pub far_memory_hits: Vec<String>,
+    /// A2：本轮模板宏 `{{random}}` / `{{roll}}` 的确定性种子。
+    /// Pipeline 在 start_writing / regenerate 时用本轮 seed 写入 TemplateVarContext；
+    /// 外部也可预置（例如重放）。None = 渲染层回退时间种子（旧行为）。
+    pub template_random_seed: Option<u64>,
 }
 
 impl WritingContext {
@@ -171,6 +175,7 @@ impl WritingContext {
             agent_profile_config: None,
             recent_summaries: vec![],
             far_memory_hits: vec![],
+            template_random_seed: None,
         }
     }
 }
@@ -305,6 +310,8 @@ impl PipelineOrchestrator {
         let session_id = Id::new();
         let seed = rand_seed();
         self.pending_temporary_instances.clear();
+        // A2：本轮 seed 同时驱动 provenance 与模板 random/roll 宏
+        let template_seed = ctx.template_random_seed.unwrap_or(seed);
 
         info!(target: "app-pipeline", "流水线启动: session={session_id}");
 
@@ -335,7 +342,7 @@ impl PipelineOrchestrator {
             Ok(text) => text,
             Err(e) => return Err(self.abort_with(&event_tx, e)),
         };
-        let template_context = prompt_template_context_for_writing(ctx);
+        let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
 
         let director_config = make_director_config(
             ctx.profile.as_ref(),
@@ -873,6 +880,8 @@ impl PipelineOrchestrator {
         let session_id = Id::new();
         let seed = req.seed.unwrap_or_else(rand_seed);
         self.pending_temporary_instances.clear();
+        // A2：regenerate 的 seed（含用户指定）驱动模板 random/roll
+        let template_seed = ctx.template_random_seed.unwrap_or(seed);
 
         info!(target: "app-pipeline", "重 roll 启动: session={session_id}, targets={:?}, hint={}",
             req.targets, hint.as_deref().unwrap_or("(无)"));
@@ -922,7 +931,7 @@ impl PipelineOrchestrator {
             })
             .collect();
 
-        let template_context = prompt_template_context_for_writing(ctx);
+        let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
 
         // ─── 路径 A：整体重 roll（含 Director 或 targets 为空）──────────────
         if rerun_director || req.targets.is_empty() {
@@ -1697,22 +1706,31 @@ fn has_available_characters(ctx: &WritingContext) -> bool {
     }
 }
 
+/// A2：构造模板上下文并注入 random_seed（仅影响 random/roll，不固定 now）。
+///
+/// `random_seed` 优先用调用方本轮 seed；为 None 时回退 `ctx.template_random_seed`。
 fn prompt_template_context_for_writing(
     ctx: &WritingContext,
+    random_seed: Option<u64>,
 ) -> Option<storyforge_domain::prompt_module::TemplateVarContext> {
-    if let Some(runtime) = &ctx.campaign_runtime {
-        return prompt_template_context_from_campaign_runtime(runtime);
+    let mut template = if let Some(runtime) = &ctx.campaign_runtime {
+        prompt_template_context_from_campaign_runtime(runtime)?
+    } else {
+        if ctx.characters.len() != 1 {
+            return None;
+        }
+        ctx.characters.first().map(|character| {
+            storyforge_domain::prompt_module::TemplateVarContext::from_character(
+                character.as_ref(),
+                "玩家",
+            )
+        })?
+    };
+    let seed = random_seed.or(ctx.template_random_seed);
+    if seed.is_some() {
+        template.random_seed = seed;
     }
-
-    if ctx.characters.len() != 1 {
-        return None;
-    }
-    ctx.characters.first().map(|character| {
-        storyforge_domain::prompt_module::TemplateVarContext::from_character(
-            character.as_ref(),
-            "玩家",
-        )
-    })
+    Some(template)
 }
 
 fn prompt_template_context_from_campaign_runtime(
@@ -4676,7 +4694,7 @@ mod tests {
         let mut character = (*mock_character("Seraphina")).clone();
         character.scenario = "雨夜驿站".into();
         let ctx = WritingContext::legacy(vec![Arc::new(character)], None, Id::new());
-        let template = prompt_template_context_for_writing(&ctx).expect("legacy single card");
+        let template = prompt_template_context_for_writing(&ctx, None).expect("legacy single card");
 
         let module_id = Id::from_str("template-module");
         let module = storyforge_domain::prompt_module::PromptModule {
@@ -4751,7 +4769,8 @@ mod tests {
         let mut ctx = WritingContext::legacy(vec![mock_character("Legacy")], None, Id::new());
         ctx.campaign_runtime = Some(runtime);
 
-        let template = prompt_template_context_for_writing(&ctx).expect("single campaign instance");
+        let template =
+            prompt_template_context_for_writing(&ctx, None).expect("single campaign instance");
         let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
             "{{char}} {{description}} hp={{getvar::hp}} loc={{getvar::location}} clock={{getvar::story_clock}} weather={{getvar::campaign.weather}}",
             &template,
@@ -4770,7 +4789,7 @@ mod tests {
             None,
             Id::new(),
         );
-        assert!(prompt_template_context_for_writing(&multi).is_none());
+        assert!(prompt_template_context_for_writing(&multi, None).is_none());
 
         let mut campaign =
             storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "第一周目");
@@ -4810,7 +4829,7 @@ mod tests {
             WritingContext::legacy(vec![mock_character("Legacy")], None, Id::new());
         campaign_ctx.campaign_runtime = Some(runtime);
 
-        let template = prompt_template_context_for_writing(&campaign_ctx)
+        let template = prompt_template_context_for_writing(&campaign_ctx, None)
             .expect("multi-instance campaign should still expose scoped variables");
         let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
             "{{char}} {{description}} <bot> user=<user> campaign={{getvar::campaign.name}} weather={{getvar::weather}} lin={{getvar::instance.inst-lin.name}} hp={{getvar::instance.inst-lin.hp}} mei_loc={{getvar::instance.Mei.location}}",
@@ -4858,7 +4877,7 @@ mod tests {
         let mut ctx = WritingContext::legacy(vec![], None, Id::new());
         ctx.campaign_runtime = Some(runtime);
 
-        let template = prompt_template_context_for_writing(&ctx)
+        let template = prompt_template_context_for_writing(&ctx, None)
             .expect("duplicate-name campaign should expose id-scoped variables");
         let rendered = storyforge_domain::prompt_module::replace_template_vars_with_context(
             "a={{getvar::instance.inst-shadow-a.stance}} b={{getvar::instance.inst-shadow-b.stance}} by_name={{getvar::instance.影.stance}}",
@@ -4878,6 +4897,38 @@ mod tests {
         assert_eq!(truncate_chars("你好世界", 3), "你好世…");
         assert_eq!(truncate_chars("你好世界", 4), "你好世界");
         assert_eq!(truncate_chars("你好世界", 10), "你好世界");
+    }
+
+    /// A2：写作 seed 注入模板 random_seed 后，同 seed 渲染可复现
+    #[test]
+    fn test_template_random_seed_is_deterministic() {
+        let mut ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, Id::new());
+        ctx.template_random_seed = Some(42);
+        let template =
+            prompt_template_context_for_writing(&ctx, None).expect("single character");
+        assert_eq!(template.random_seed, Some(42));
+        let a = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "{{random::alpha::beta::gamma}}",
+            &template,
+        );
+        let b = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "{{random::alpha::beta::gamma}}",
+            &template,
+        );
+        assert_eq!(a, b, "fixed seed must make random macro deterministic");
+        assert!(
+            matches!(a.as_str(), "alpha" | "beta" | "gamma"),
+            "random macro should pick one of the options, got {a}"
+        );
+
+        let other = prompt_template_context_for_writing(&ctx, Some(99)).unwrap();
+        let c = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            "{{random::alpha::beta::gamma}}",
+            &other,
+        );
+        // 不同 seed 允许相同结果，但至少 random_seed 字段必须写入
+        assert_eq!(other.random_seed, Some(99));
+        let _ = c;
     }
 
     /// W10: mvu_runtime=None + 空 fragments → run_postprocess 无 campaign 时返回 None（正常跳过）

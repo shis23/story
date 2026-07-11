@@ -2370,6 +2370,7 @@ async fn start_writing(
         agent_profile_config: None,
         recent_summaries: vec![],
         far_memory_hits: vec![],
+        template_random_seed: None,
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
@@ -4411,6 +4412,8 @@ async fn regenerate(
         agent_profile_config: None,
         recent_summaries: vec![],
         far_memory_hits: vec![],
+        // A2：regenerate 用户 seed 直接注入模板 random/roll
+        template_random_seed: req.seed,
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
@@ -6162,6 +6165,9 @@ fn meta_accept_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    // P0-7 residual：legacy 世界书 patch 与 typed Meta 一样，活动 Turn 期间禁止直接写
+    check_turn_barrier(state.inner())?;
+
     // 从 PatchStore 取出 patch
     let patch = {
         let patches = state.meta_patches.read().unwrap_or_else(|p| p.into_inner());
@@ -10201,6 +10207,7 @@ mod tests {
             agent_profile_config: None,
             recent_summaries: vec![],
             far_memory_hits: vec![],
+            template_random_seed: None,
         };
 
         let fragments = collect_mvu_fallback_fragments(
@@ -15445,6 +15452,11 @@ mod tests {
         assert!(
             result.is_err(),
             "barrier should reject start_writing when active Turn exists"
+        );
+        // legacy meta_accept_patch 与 start_writing 共用 check_turn_barrier 语义
+        assert!(
+            check_turn_barrier_with(&state, &ts).is_err(),
+            "barrier should also reject legacy meta_accept_patch while Turn active"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
