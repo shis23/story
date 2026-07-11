@@ -603,6 +603,66 @@ impl CampaignStore {
         Ok(UpsertResult::Inserted)
     }
 
+    /// 按 summary.id 更新（covered_by 折叠 / 字段修补）。
+    pub fn update_summary_by_id(&self, summary: RoundSummary) -> Result<(), String> {
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = summaries.iter().position(|s| s.id == summary.id) {
+            summaries[idx] = summary;
+            return persist(&self.summaries_path, &summaries);
+        }
+        Err(format!("summary id={} 不存在", summary.id))
+    }
+
+    /// 插入 stage 纪要（B/C）：按 id 去重，不按 turn 覆盖 leaf A。
+    pub fn insert_stage_summary(&self, summary: RoundSummary) -> Result<UpsertResult, String> {
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = summaries.iter().position(|s| s.id == summary.id) {
+            if Self::payloads_match(&summaries[idx], &summary) {
+                return Ok(UpsertResult::AlreadyPresent);
+            }
+            return Ok(UpsertResult::Conflict(format!(
+                "stage summary id={} 已存在但 payload 不一致",
+                summary.id
+            )));
+        }
+        summaries.push(summary);
+        persist(&self.summaries_path, &summaries)?;
+        Ok(UpsertResult::Inserted)
+    }
+
+    /// 发布压缩结果：写 parent B/C + children.covered_by，bump chronicle_revision，清空 epoch。
+    pub fn publish_compress_result(
+        &self,
+        campaign_id: &Id,
+        parents: &[RoundSummary],
+        child_covered_by: &[(Id, Id)],
+    ) -> Result<(), String> {
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        for (child_id, parent_id) in child_covered_by {
+            if let Some(s) = summaries.iter_mut().find(|s| s.id == *child_id) {
+                s.covered_by = Some(parent_id.clone());
+            }
+        }
+        for parent in parents {
+            if let Some(idx) = summaries.iter().position(|s| s.id == parent.id) {
+                if !Self::payloads_match(&summaries[idx], parent) {
+                    return Err(format!("stage summary id={} conflict", parent.id));
+                }
+            } else {
+                summaries.push(parent.clone());
+            }
+        }
+        persist(&self.summaries_path, &summaries)?;
+        drop(summaries);
+        if let Some(mut camp) = self.get_campaign(campaign_id) {
+            camp.bump_chronicle_revision();
+            // 压缩改变 overview 成员：清空 epoch，下次编译重建
+            camp.context_epoch = None;
+            self.update_campaign(camp)?;
+        }
+        Ok(())
+    }
+
     // ─── MVU 翻译存储（P3 新增）──────────────────────────────────────────
 
     /// 列所有 MVU 翻译
@@ -1586,4 +1646,75 @@ mod tests {
         assert!(matches!(result, UpsertResult::Conflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn publish_compress_result_marks_covered_and_bumps_revision() {
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::chronicle::ChronicleLevel;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-compress-pub-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CampaignStore::new(&dir);
+        let camp = Campaign::new(Id::from_str("card"), "c");
+        let camp_id = camp.id.clone();
+        store.save_campaign(camp).unwrap();
+
+        let mut leaves = Vec::new();
+        for t in 1..=4u32 {
+            let s = RoundSummary::new(camp_id.clone(), Id::from_str("v"), t, format!("body{t}"))
+                .with_code(format!("A{t:04}"))
+                .with_headline(format!("h{t}"))
+                .with_lineage(Id::from_str("lin"));
+            leaves.push(s.clone());
+            store.add_summary(s).unwrap();
+        }
+        let ids: Vec<_> = leaves.iter().map(|s| s.id.clone()).collect();
+        let spans: Vec<(u32, u32)> = leaves.iter().map(|s| (s.turn, s.turn)).collect();
+        let groups = storyforge_domain::chronicle::partition_compress_groups(&ids, &spans, 2).unwrap();
+        let texts = vec![
+            storyforge_domain::chronicle::CompressGroupText {
+                headline: "B1".into(),
+                summary: "sum1".into(),
+            },
+            storyforge_domain::chronicle::CompressGroupText {
+                headline: "B2".into(),
+                summary: "sum2".into(),
+            },
+        ];
+        let pubr = storyforge_domain::chronicle::publish_compress_batch(
+            &camp_id,
+            &Id::from_str("lin"),
+            &ids,
+            &spans,
+            &groups,
+            &texts,
+            ChronicleLevel::B,
+            1,
+        )
+        .unwrap();
+        let parents: Vec<_> = pubr
+            .parents
+            .iter()
+            .map(|e| RoundSummary::from_chronicle_entry(e, Id::from_str("v")))
+            .collect();
+        let rev0 = store.get_campaign(&camp_id).unwrap().chronicle_revision;
+        store
+            .publish_compress_result(&camp_id, &parents, &pubr.child_covered_by)
+            .unwrap();
+        let all = store.list_summaries(&camp_id);
+        assert_eq!(all.len(), 6, "4 leaves + 2 B");
+        let covered = all.iter().filter(|s| s.covered_by.is_some() && s.level == 0).count();
+        assert_eq!(covered, 4);
+        let b_count = all.iter().filter(|s| s.level == 1).count();
+        assert_eq!(b_count, 2);
+        let camp2 = store.get_campaign(&camp_id).unwrap();
+        assert!(camp2.chronicle_revision > rev0);
+        assert!(camp2.context_epoch.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }

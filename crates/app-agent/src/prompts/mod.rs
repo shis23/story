@@ -4,12 +4,17 @@
 //! 改 prompt 只看本模块 + AGENT_INTERFACES.md。
 
 pub mod character_extractor;
+pub mod chronicle_compressor;
 pub mod postprocess;
 pub mod summarizer;
 
 pub use character_extractor::{
     CHARACTER_EXTRACTOR_SYSTEM_PROMPT, build_character_extractor_user_msg,
     make_character_extractor_config, register_character_extractor_tools,
+};
+pub use chronicle_compressor::{
+    CHRONICLE_COMPRESSOR_SYSTEM_PROMPT, build_chronicle_compressor_user_msg,
+    make_chronicle_compressor_config,
 };
 pub use postprocess::{
     POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, build_postprocess_user_msg_with_summary,

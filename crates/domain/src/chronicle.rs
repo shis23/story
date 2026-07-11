@@ -889,6 +889,111 @@ pub fn plan_compress_batch_for_uncovered(
     Ok(Some(groups))
 }
 
+/// 一组 LLM 产出的压缩文案（系统填 covers/span）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressGroupText {
+    pub headline: String,
+    pub summary: String,
+}
+
+/// 压缩发布结果（纯函数；调用方落盘）。
+#[derive(Debug, Clone)]
+pub struct CompressPublishResult {
+    /// 新 B 或 C 条目
+    pub parents: Vec<ChronicleEntry>,
+    /// 子条目 id → parent id（写 covered_by）
+    pub child_covered_by: Vec<(Id, Id)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressPublishError {
+    GroupTextLenMismatch { groups: usize, texts: usize },
+    EmptyInput,
+    Validation(CoversValidationError),
+    Group(CompressGroupError),
+}
+
+/// 系统侧发布压缩：校验 covers、生成 parent ChronicleEntry、计算 covered_by 映射。
+///
+/// `output_level`：B 或 C；`next_seq`：该 level 下一个序号（从 1 起）。
+#[allow(clippy::too_many_arguments)]
+pub fn publish_compress_batch(
+    campaign_id: &Id,
+    lineage_id: &Id,
+    input_ids_in_time_order: &[Id],
+    input_turn_spans: &[(u32, u32)],
+    groups: &[CompressGroup],
+    texts: &[CompressGroupText],
+    output_level: ChronicleLevel,
+    next_seq: u32,
+) -> Result<CompressPublishResult, CompressPublishError> {
+    if input_ids_in_time_order.is_empty() {
+        return Err(CompressPublishError::EmptyInput);
+    }
+    if groups.len() != texts.len() {
+        return Err(CompressPublishError::GroupTextLenMismatch {
+            groups: groups.len(),
+            texts: texts.len(),
+        });
+    }
+    validate_compress_covers(input_ids_in_time_order, input_turn_spans, groups)
+        .map_err(CompressPublishError::Validation)?;
+
+    let mut parents = Vec::with_capacity(groups.len());
+    let mut child_covered_by = Vec::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    for (i, (g, text)) in groups.iter().zip(texts.iter()).enumerate() {
+        let seq = next_seq.saturating_add(i as u32);
+        let parent_id = Id::new();
+        let code = ChronicleCode::new(output_level, seq);
+        let headline = truncate_headline(text.headline.trim(), 40);
+        let summary = text.summary.trim().to_string();
+        for child in &g.member_ids {
+            child_covered_by.push((child.clone(), parent_id.clone()));
+        }
+        parents.push(ChronicleEntry {
+            id: parent_id,
+            code,
+            level: output_level,
+            campaign_id: campaign_id.clone(),
+            lineage_id: lineage_id.clone(),
+            headline,
+            summary,
+            full: None,
+            turn_start: g.turn_start,
+            turn_end: g.turn_end,
+            covers: g.member_ids.clone(),
+            covered_by: None,
+            source_turn_ids: vec![],
+            source_variant_hashes: vec![],
+            source_campaign_revision: None,
+            origin_campaign_id: None,
+            origin_chronicle_id: None,
+            origin_code: None,
+            invalidated_at: None,
+            created_at: now.clone(),
+        });
+    }
+    Ok(CompressPublishResult {
+        parents,
+        child_covered_by,
+    })
+}
+
+/// 从已有 code 列表推算下一序号（同 level 前缀）。
+pub fn next_code_seq(existing_codes: &[ChronicleCode], level: ChronicleLevel) -> u32 {
+    let mut max = 0u32;
+    for c in existing_codes {
+        if c.level() == Some(level)
+            && let Ok(n) = c.as_str()[1..].parse::<u32>()
+        {
+            max = max.max(n);
+        }
+    }
+    max.saturating_add(1).max(1)
+}
+
+
 // ─── Compiler 纯函数 IO 草图 ───────────────────────────────────────────────
 
 /// 编译输入（不持有 LLM / IO）。
@@ -1313,6 +1418,47 @@ mod tests {
             panic!("expected NearRaw");
         }
         assert_eq!(out.chronicle_revision, 7);
+    }
+
+    #[test]
+    fn publish_compress_batch_sets_covers_and_covered_by() {
+        let ids: Vec<Id> = (1..=4).map(|i| Id::from_str(format!("a{i}"))).collect();
+        let spans: Vec<(u32, u32)> = (1..=4).map(|i| (i, i)).collect();
+        let groups = partition_compress_groups(&ids, &spans, 2).unwrap();
+        let texts = vec![
+            CompressGroupText {
+                headline: "阶段一".into(),
+                summary: "前两轮合并".into(),
+            },
+            CompressGroupText {
+                headline: "阶段二".into(),
+                summary: "后两轮合并".into(),
+            },
+        ];
+        let camp = Id::from_str("c");
+        let lin = Id::from_str("l");
+        let pubr = publish_compress_batch(
+            &camp,
+            &lin,
+            &ids,
+            &spans,
+            &groups,
+            &texts,
+            ChronicleLevel::B,
+            1,
+        )
+        .unwrap();
+        assert_eq!(pubr.parents.len(), 2);
+        assert_eq!(pubr.parents[0].code.as_str(), "B0001");
+        assert_eq!(pubr.parents[0].covers, groups[0].member_ids);
+        assert_eq!(pubr.parents[0].turn_start, 1);
+        assert_eq!(pubr.parents[0].turn_end, 2);
+        assert_eq!(pubr.child_covered_by.len(), 4);
+        assert_eq!(pubr.child_covered_by[0].1, pubr.parents[0].id);
+        assert_eq!(
+            next_code_seq(&[ChronicleCode::new(ChronicleLevel::B, 3)], ChronicleLevel::B),
+            4
+        );
     }
 
     #[test]

@@ -460,7 +460,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     if query.is_empty() || hay.contains(&query) {
                         hits.push(serde_json::json!({
                             "code": code,
-                            "level": 0,
+                            "level": s.level,
                             "headline": headline,
                             "turn_span": [s.turn, s.turn],
                             "chronicle_entry_id": s.id.to_string(),
@@ -539,7 +539,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                 Ok(serde_json::json!({
                     "found": true,
                     "code": s.code,
-                    "level": 0,
+                    "level": s.level,
                     "headline": s.overview_headline(40),
                     "detail": detail,
                     "body": body,

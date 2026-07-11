@@ -199,37 +199,22 @@ impl CampaignMutationCoordinator {
                             camp.bump_chronicle_revision();
                             let _ = store.update_campaign(camp);
                         }
-                        // M4 最小：阈值达到则规划压缩组（后台 LLM 发布尚未接线）
+                        // M4：达阈值则标记需后台压缩（实际 spawn 在 commit 成功后）
                         let all = store.list_summaries(campaign_id);
-                        let uncovered: Vec<_> = all
+                        let uncovered_a = all
                             .iter()
-                            .filter(|s| s.covered_by.is_none())
-                            .collect();
-                        let ids: Vec<_> = uncovered.iter().map(|s| s.id.clone()).collect();
-                        let spans: Vec<(u32, u32)> =
-                            uncovered.iter().map(|s| (s.turn, s.turn)).collect();
-                        match storyforge_domain::chronicle::plan_compress_batch_for_uncovered(
-                            &ids,
-                            &spans,
+                            .filter(|s| s.covered_by.is_none() && s.is_leaf_a())
+                            .count();
+                        if storyforge_domain::chronicle::should_enqueue_compress(
+                            uncovered_a,
                             storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
-                            storyforge_domain::chronicle::DEFAULT_COMPRESS_GROUP_SIZE,
                         ) {
-                            Ok(Some(groups)) => {
-                                tracing::info!(
-                                    target: "chronicle_compressor",
-                                    campaign_id = %campaign_id,
-                                    uncovered = uncovered.len(),
-                                    groups = groups.len(),
-                                    "A→B compress batch planned (enqueue stub; no LLM publish yet)"
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "chronicle_compressor",
-                                    "compress plan failed: {e:?}"
-                                );
-                            }
+                            tracing::info!(
+                                target: "chronicle_compressor",
+                                campaign_id = %campaign_id,
+                                uncovered_a,
+                                "A→B compress threshold reached (schedule after commit)"
+                            );
                         }
                         Ok(())
                     }

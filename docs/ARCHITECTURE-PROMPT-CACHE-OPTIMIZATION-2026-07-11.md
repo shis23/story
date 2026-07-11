@@ -456,7 +456,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
 > | B | 部分 | QualityGate：**Error 拦截** + `force_accept`→Turn **Degraded**；Warning 不拦；Accept 旁提示/二次确认 | NarrativeContract、扩展 ScenePlan、有界自动修复 |
-> | C | **M0–M3min + epoch 快照** | history-epoch + checkpoint；`ContextEpochSnapshot` 持久化/rollover；RoundSummary→A；Director 概览/纪要带 history 前缀 + 硬去重；chronicle tools（A） | M4 LLM 发布 B/C、M5 真模型缓存/远楼对照 |
+> | C | **M0–M4 可独立部分** | history-epoch + epoch 快照；RoundSummary A/B/C；Director 装配；chronicle tools；Compressor 后台发布 | M5 真模型缓存/远楼/压缩损失对照 |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
 ### 阶段 A：建立测量和安全边界
@@ -485,7 +485,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
-6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M2（含 epoch 快照）与 M3 最小已落地**；M4 仅阈值规划钩子，LLM 发布 B/C 仍待。
+6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4 可独立部分已落地**（含 Compressor 发布）；M5 真模型验收仍待。
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 

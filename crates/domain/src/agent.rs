@@ -476,6 +476,15 @@ pub struct RoundSummary {
     /// 被上层 B/C 折叠时填写 parent entry id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_by: Option<Id>,
+    /// Chronicle 层级：0=A leaf，1=B，2=C。缺省 0（旧 JSON）。
+    #[serde(default)]
+    pub level: u8,
+    /// 跨轮 span 的结束 turn（含）；缺省 0 表示 = `turn`（单轮 A）。
+    #[serde(default)]
+    pub turn_end: u32,
+    /// B/C 覆盖的子 entry id（系统填写）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covers: Vec<Id>,
 }
 
 impl RoundSummary {
@@ -491,7 +500,27 @@ impl RoundSummary {
             headline: None,
             lineage_id: None,
             covered_by: None,
+            level: 0,
+            turn_end: turn,
+            covers: vec![],
         }
+    }
+
+    pub fn effective_turn_end(&self) -> u32 {
+        if self.turn_end == 0 {
+            self.turn
+        } else {
+            self.turn_end.max(self.turn)
+        }
+    }
+
+    pub fn chronicle_level(&self) -> crate::chronicle::ChronicleLevel {
+        crate::chronicle::ChronicleLevel::from_u8(self.level)
+            .unwrap_or(crate::chronicle::ChronicleLevel::A)
+    }
+
+    pub fn is_leaf_a(&self) -> bool {
+        self.level == 0
     }
 
     /// 分配 leaf code（系统侧；Summarizer 不写 code）。
@@ -532,18 +561,19 @@ impl RoundSummary {
             .as_deref()
             .and_then(ChronicleCode::parse)
             .unwrap_or_else(|| ChronicleCode::new(ChronicleLevel::A, self.turn));
+        let level = self.chronicle_level();
         ChronicleEntry {
             id: self.id.clone(),
             code,
-            level: ChronicleLevel::A,
+            level,
             campaign_id: self.campaign_id.clone(),
             lineage_id: lineage,
             headline: self.overview_headline(40),
             summary: self.content.clone(),
             full: None,
             turn_start: self.turn,
-            turn_end: self.turn,
-            covers: vec![],
+            turn_end: self.effective_turn_end(),
+            covers: self.covers.clone(),
             covered_by: self.covered_by.clone(),
             source_turn_ids: vec![],
             source_variant_hashes: vec![],
@@ -553,6 +583,28 @@ impl RoundSummary {
             origin_code: None,
             invalidated_at: None,
             created_at: self.created_at.clone(),
+        }
+    }
+
+    /// ChronicleEntry（含 B/C）→ 存储形态 RoundSummary。
+    pub fn from_chronicle_entry(
+        entry: &crate::chronicle::ChronicleEntry,
+        conversation_id: Id,
+    ) -> Self {
+        Self {
+            id: entry.id.clone(),
+            campaign_id: entry.campaign_id.clone(),
+            conversation_id,
+            turn: entry.turn_start,
+            content: entry.summary.clone(),
+            created_at: entry.created_at.clone(),
+            code: Some(entry.code.as_str().to_string()),
+            headline: Some(entry.headline.clone()),
+            lineage_id: Some(entry.lineage_id.clone()),
+            covered_by: entry.covered_by.clone(),
+            level: entry.level.as_u8(),
+            turn_end: entry.turn_end,
+            covers: entry.covers.clone(),
         }
     }
 }

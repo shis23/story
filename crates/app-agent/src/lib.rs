@@ -10,6 +10,7 @@ pub mod tool_center;
 pub mod tools;
 
 pub mod character_extractor;
+pub mod chronicle_compressor;
 pub mod pipeline_postprocess;
 pub mod postprocess;
 pub mod prompts;
@@ -17,6 +18,11 @@ pub mod summarizer;
 
 // 重新导出核心类型
 pub use character_extractor::{ExtractError, attach_definitions_to_card, extract_characters};
+pub use chronicle_compressor::{
+    ChronicleCompressorError, CompressRunOutcome, compress_groups_with_llm,
+    parse_compress_group_texts, plan_level_batch, publish_with_deterministic_texts,
+    run_compress_if_needed,
+};
 pub use pipeline_postprocess::{PostProcessOutcome, run_postprocess_pipeline};
 pub use prompts::character_extractor::{
     CHARACTER_EXTRACTOR_SYSTEM_PROMPT, build_character_extractor_user_msg,

@@ -3446,14 +3446,15 @@ fn refresh_and_persist_context_epoch(
 
     let mut cands: Vec<OverviewCandidate> = Vec::new();
     for s in all_summaries {
+        let level = s.chronicle_level();
         let code = s
             .code
             .as_deref()
             .and_then(ChronicleCode::parse)
-            .unwrap_or_else(|| ChronicleCode::new(ChronicleLevel::A, s.turn));
+            .unwrap_or_else(|| ChronicleCode::new(level, s.turn));
         cands.push(OverviewCandidate {
             code,
-            level: ChronicleLevel::A,
+            level,
             turn_start: s.turn,
             covered_by: s.covered_by.clone(),
         });
@@ -5826,6 +5827,90 @@ async fn accept_variant_async(
     Ok(())
 }
 
+/// Accept 成功后：若 uncovered A/B 达阈值，后台跑 ChronicleCompressor 并落盘。
+fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
+    tokio::spawn(async move {
+        let store = get_campaign_store();
+        let camp = match store.get_campaign(&campaign_id) {
+            Some(c) => c,
+            None => return,
+        };
+        let lineage = camp.lineage_id.clone().unwrap_or_else(Id::new);
+        let conversation_id = camp
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| Id::from_str("unknown-conv"));
+        let entries = store.list_summaries(&campaign_id);
+        let uncovered_a = entries
+            .iter()
+            .filter(|s| s.covered_by.is_none() && s.is_leaf_a())
+            .count();
+        let uncovered_b = entries
+            .iter()
+            .filter(|s| {
+                s.covered_by.is_none()
+                    && s.chronicle_level() == storyforge_domain::chronicle::ChronicleLevel::B
+            })
+            .count();
+        let need_a = storyforge_domain::chronicle::should_enqueue_compress(
+            uncovered_a,
+            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
+        );
+        let need_b = storyforge_domain::chronicle::should_enqueue_compress(
+            uncovered_b,
+            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
+        );
+        if !need_a && !need_b {
+            return;
+        }
+
+        let llm = state.active_llm_or_mock();
+        let tool_snapshot = state.snapshot_tool_ctx();
+        let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
+        let (_tx, cancel) = tokio::sync::watch::channel(false);
+        match storyforge_app_agent::run_compress_if_needed(
+            &runtime,
+            &campaign_id,
+            &lineage,
+            &conversation_id,
+            entries,
+            cancel,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(outcomes) => {
+                for out in outcomes {
+                    if let Err(e) = store.publish_compress_result(
+                        &campaign_id,
+                        &out.parent_summaries,
+                        &out.publish.child_covered_by,
+                    ) {
+                        tracing::error!(
+                            target: "chronicle_compressor",
+                            "publish compress failed: {e}"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "chronicle_compressor",
+                            level = ?out.output_level,
+                            parents = out.parent_summaries.len(),
+                            children = out.publish.child_covered_by.len(),
+                            "compress batch published"
+                        );
+                    }
+                }
+            }
+            Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress) => {}
+            Err(e) => {
+                tracing::warn!(target: "chronicle_compressor", "compress run failed: {e}");
+            }
+        }
+    });
+}
+
 /// Phase A: Campaign 模式下的 TurnCommit（accept → 正文 Final + 状态变更 + revision bump）。
 async fn commit_turn_attempt(
     state: &Arc<AppState>,
@@ -6011,6 +6096,9 @@ async fn commit_turn_attempt(
             index_round_summaries_async(state_for_index, batch_index).await;
         });
     }
+
+    // 6c. M4：阈值达则后台 ChronicleCompressor（A→B / B→C）
+    maybe_spawn_chronicle_compress(state.clone(), campaign_id.clone());
 
     // 7. 标记 Committed 或 Degraded + 其他 attempts Superseded
     // 副作用已完成，持久化失败只记日志（Campaign 已写入，不能回滚）
@@ -10795,6 +10883,9 @@ mod tests {
                 headline: Some("密封门".into()),
                 lineage_id: None,
                 covered_by: None,
+                level: 0,
+                turn_end: 5,
+                covers: vec![],
             })
             .unwrap();
 
@@ -11031,6 +11122,9 @@ mod tests {
             headline: None,
             lineage_id: None,
             covered_by: None,
+            level: 0,
+            turn_end: 0,
+            covers: vec![],
         }];
 
         let result = import_campaign_bundle_into_store(

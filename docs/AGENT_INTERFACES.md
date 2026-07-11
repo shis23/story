@@ -46,7 +46,7 @@ User Intent
 - `search_vectors(query, top_k)`
 - `get_recent_summary(limit)`
 
-目标记忆工具（规格 v1.0；**M3 最小版已接 A**，与自动召回并存）：
+目标记忆工具（规格 v1.0；**M3 已接**，A/B/C 随存储 level；与自动召回并存）：
 
 - `search_chronicle(query, …)` — 当前搜 **Chronicle A**（RoundSummary 兼容视图）；返回短目录行（code + headline），不返回 full；**不含** ArchivedSummary；B/C 待压缩层
 - `get_chronicle(code|id, detail=summary|full)` — **默认 summary**；full 可选；带来源字段
