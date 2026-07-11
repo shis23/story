@@ -83,6 +83,8 @@ impl crate::LlmClient for MockLlmClient {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
             }),
         })
     }
@@ -144,6 +146,8 @@ impl crate::LlmClient for MockLlmClient {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
             }),
         })
     }

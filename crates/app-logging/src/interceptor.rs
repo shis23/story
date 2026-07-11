@@ -42,15 +42,21 @@ impl LlmInterceptor {
         let request_payload =
             serde_json::to_string(&req.messages).unwrap_or_else(|_| "<serialization error>".into());
 
-        let (response_text, prompt_tokens, completion_tokens) = if let Some(r) = resp {
-            (
-                r.content.clone(),
-                r.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
-                r.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
-            )
-        } else {
-            (String::new(), 0, 0)
-        };
+        let (response_text, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens) =
+            if let Some(r) = resp {
+                (
+                    r.content.clone(),
+                    r.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+                    r.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+                    r.usage.as_ref().map(|u| u.cached_tokens).unwrap_or(0),
+                    r.usage
+                        .as_ref()
+                        .map(|u| u.cache_creation_tokens)
+                        .unwrap_or(0),
+                )
+            } else {
+                (String::new(), 0, 0, 0, 0)
+            };
 
         let detail = LlmCallDetail {
             connection_name: self.connection_name.clone(),
@@ -61,6 +67,8 @@ impl LlmInterceptor {
             response_text,
             prompt_tokens,
             completion_tokens,
+            cached_tokens,
+            cache_creation_tokens,
             latency_ms,
             error: error.map(String::from),
         };
@@ -77,12 +85,17 @@ impl LlmInterceptor {
             level,
             timestamp: Utc::now(),
             message: format!(
-                "LLM {} {} ({}ms, {}+{} tokens)",
+                "LLM {} {} ({}ms, {}+{} tokens{})",
                 self.connection_name,
                 if error.is_some() { "失败" } else { "完成" },
                 latency_ms,
                 detail.prompt_tokens,
                 detail.completion_tokens,
+                if detail.cached_tokens > 0 {
+                    format!(", cache命中{}", detail.cached_tokens)
+                } else {
+                    String::new()
+                },
             ),
             fields: Default::default(),
             llm_detail: Some(detail),

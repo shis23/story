@@ -14,9 +14,9 @@
 use std::sync::{Mutex, OnceLock};
 
 use storyforge_domain::Id;
-use storyforge_domain::turn::{Mutation, MutationBatch};
 #[cfg(test)]
 use storyforge_domain::turn::MutationBatchStatus;
+use storyforge_domain::turn::{Mutation, MutationBatch};
 
 use crate::campaign_store::{CampaignStore, UpsertResult};
 
@@ -65,9 +65,7 @@ static GLOBAL_COMMIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// 在全局提交锁保护下执行闭包。
 ///
 /// 保证 TurnCommit 和 MetaCommit 不会并发修改同一 Campaign。
-pub fn with_campaign_lock<R>(
-    f: impl FnOnce() -> Result<R, CommitError>,
-) -> Result<R, CommitError> {
+pub fn with_campaign_lock<R>(f: impl FnOnce() -> Result<R, CommitError>) -> Result<R, CommitError> {
     let lock = GLOBAL_COMMIT_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().map_err(|_| CommitError::LockPoisoned)?;
     f()
@@ -142,48 +140,41 @@ impl CampaignMutationCoordinator {
             } => {
                 if let Some(inst_id) = instance_id {
                     // 角色级变量
-                    let mut inst = store
-                        .get_instance(campaign_id, inst_id)
-                        .ok_or_else(|| {
-                            CommitError::Storage(format!(
-                                "instance {inst_id} 不存在于 campaign {campaign_id}"
-                            ))
-                        })?;
+                    let mut inst = store.get_instance(campaign_id, inst_id).ok_or_else(|| {
+                        CommitError::Storage(format!(
+                            "instance {inst_id} 不存在于 campaign {campaign_id}"
+                        ))
+                    })?;
                     inst.set_variable(key, value.clone(), *turn);
-                    store
-                        .update_instance(inst)
-                        .map_err(CommitError::Storage)?;
+                    store.update_instance(inst).map_err(CommitError::Storage)?;
                 } else {
                     // 全局 Campaign 变量
                     let mut camp = store
                         .get_campaign(campaign_id)
-                        .ok_or_else(|| {
-                            CommitError::CampaignNotFound(campaign_id.clone())
-                        })?;
+                        .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
                     camp.set_variable(key, value.clone(), *turn);
-                    store
-                        .update_campaign(camp)
-                        .map_err(CommitError::Storage)?;
+                    store.update_campaign(camp).map_err(CommitError::Storage)?;
                 }
                 Ok(())
             }
 
             Mutation::UpsertKnowledge(km) => {
                 let entry = km.to_entry();
-                match store.upsert_knowledge(entry).map_err(CommitError::Storage)? {
+                match store
+                    .upsert_knowledge(entry)
+                    .map_err(CommitError::Storage)?
+                {
                     UpsertResult::Inserted | UpsertResult::AlreadyPresent => Ok(()),
                     UpsertResult::Conflict(msg) => Err(CommitError::MutationConflict(msg)),
                 }
             }
 
             Mutation::SetTaskStatus { task_id, status } => {
-                let mut task = store.get_task(task_id).ok_or_else(|| {
-                    CommitError::Storage(format!("task {task_id} 不存在"))
-                })?;
+                let mut task = store
+                    .get_task(task_id)
+                    .ok_or_else(|| CommitError::Storage(format!("task {task_id} 不存在")))?;
                 task.status = status.clone();
-                store
-                    .update_task(task)
-                    .map_err(CommitError::Storage)?;
+                store.update_task(task).map_err(CommitError::Storage)?;
                 Ok(())
             }
 
@@ -222,10 +213,7 @@ impl CampaignMutationCoordinator {
 
     /// 检查 Campaign 是否有活动 Turn（屏障检查用）。
     /// 实际检查由 TurnStore.get_active_turn 完成，这里只是转发。
-    pub fn has_active_turn(
-        turn_store: &crate::turn_store::TurnStore,
-        campaign_id: &Id,
-    ) -> bool {
+    pub fn has_active_turn(turn_store: &crate::turn_store::TurnStore, campaign_id: &Id) -> bool {
         turn_store.get_active_turn(campaign_id).is_some()
     }
 }
@@ -295,11 +283,8 @@ mod tests {
             mutations: vec![],
         };
 
-        let result = CampaignMutationCoordinator::apply_mutation_batch(
-            &store,
-            &campaign_id,
-            &batch,
-        );
+        let result =
+            CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch);
         assert!(matches!(result, Err(CommitError::RevisionConflict { .. })));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -324,7 +309,10 @@ mod tests {
         CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
 
         let updated = store.get_campaign(&campaign_id).unwrap();
-        assert_eq!(updated.revision, 1, "revision should stay at 1 after replay");
+        assert_eq!(
+            updated.revision, 1,
+            "revision should stay at 1 after replay"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

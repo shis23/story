@@ -161,6 +161,8 @@ impl SseEventAccumulator {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cached_tokens: u.prompt_cache_hit_tokens,
+                cache_creation_tokens: u.prompt_cache_miss_tokens,
             });
         }
 
@@ -200,11 +202,23 @@ pub(crate) mod openai_types {
     }
 
     /// 流式 usage（结构与非流式一致，字段类型与 domain::Usage 对齐为 u32）
+    ///
+    /// A2：增加可选缓存字段。DeepSeek 流式 usage 在顶层带
+    /// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；
+    /// OpenAI 嵌套在 `prompt_tokens_details.cached_tokens` 中（流式暂不解析嵌套，
+    /// 由非流式路径的 `parse_cached_tokens` 覆盖）。
     #[derive(Debug, Deserialize)]
     pub struct StreamUsage {
         pub prompt_tokens: u32,
         pub completion_tokens: u32,
+        #[serde(default)]
         pub total_tokens: u32,
+        /// DeepSeek 缓存命中
+        #[serde(default)]
+        pub prompt_cache_hit_tokens: u32,
+        /// DeepSeek 缓存未命中（≈ cache creation）
+        #[serde(default)]
+        pub prompt_cache_miss_tokens: u32,
     }
 
     #[derive(Debug, Deserialize)]

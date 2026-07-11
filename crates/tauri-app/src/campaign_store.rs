@@ -550,10 +550,7 @@ impl CampaignStore {
     /// 三态 upsert 知识条目（按 entry.id）。
     ///
     /// Phase A 幂等重放：重放时复用同一批 entry_id，payload 一致则 no-op。
-    pub fn upsert_knowledge(
-        &self,
-        entry: CharacterKnowledgeEntry,
-    ) -> Result<UpsertResult, String> {
+    pub fn upsert_knowledge(&self, entry: CharacterKnowledgeEntry) -> Result<UpsertResult, String> {
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = knowledge.iter().position(|k| k.id == entry.id) {
             if Self::payloads_match(&knowledge[idx], &entry) {
@@ -1505,9 +1502,13 @@ mod tests {
     fn upsert_knowledge_conflict_on_different_payload() {
         let dir = temp_dir();
         let store = CampaignStore::new(&dir);
-        store.upsert_knowledge(make_knowledge_entry("k-1", "看到了刀")).unwrap();
+        store
+            .upsert_knowledge(make_knowledge_entry("k-1", "看到了刀"))
+            .unwrap();
         // 同 ID 不同 text → Conflict
-        let result = store.upsert_knowledge(make_knowledge_entry("k-1", "看到了枪")).unwrap();
+        let result = store
+            .upsert_knowledge(make_knowledge_entry("k-1", "看到了枪"))
+            .unwrap();
         assert!(matches!(result, UpsertResult::Conflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }

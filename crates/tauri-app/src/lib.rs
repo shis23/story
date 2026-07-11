@@ -240,8 +240,7 @@ fn recover_turns_on_startup() {
         );
         update_turn_record(&turn_id, |record| {
             record.status = storyforge_domain::turn::TurnStatus::Failed;
-            record.failure_reason =
-                Some(format!("启动恢复：崩溃时处于 {:?} 态", turn.status));
+            record.failure_reason = Some(format!("启动恢复：崩溃时处于 {:?} 态", turn.status));
             record.touch();
         });
     }
@@ -743,17 +742,16 @@ impl AppState {
         > = MVU_RUNTIME.get().cloned().map(|r| {
             r as Arc<dyn storyforge_infra_plugin_host::mvu_runtime::MvuRuntime + Send + Sync>
         });
-        if let Some(prompt_hook) = prompt_hook {
-            PipelineOrchestrator::new_with_prompt_hook(
-                llm,
-                self.conv_store.clone(),
-                Arc::new(tool_ctx),
-                mvu_rt,
-                prompt_hook,
-            )
-        } else {
-            PipelineOrchestrator::new(llm, self.conv_store.clone(), Arc::new(tool_ctx), mvu_rt)
-        }
+        // A1：从活跃连接注入采样参数（含 reasoning 模式 + extra 扩展字段）
+        let sampling = get_conn_store().active_connection().map(|conn| conn.params);
+        PipelineOrchestrator::new_with_sampling(
+            llm,
+            self.conv_store.clone(),
+            Arc::new(tool_ctx),
+            mvu_rt,
+            prompt_hook,
+            sampling,
+        )
     }
 }
 
@@ -2254,7 +2252,9 @@ async fn start_writing(
             .map(|c| c.revision)
             .unwrap_or(0);
         let input_node = start_target.input_node_id.unwrap_or_else(|| {
-            tracing::warn!("Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder");
+            tracing::warn!(
+                "Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder"
+            );
             Id::from_str("unknown-input-node")
         });
         let record = storyforge_domain::turn::TurnRecord::new(
@@ -2265,7 +2265,9 @@ async fn start_writing(
         );
         if let Err(e) = get_turn_store().create_turn(record.clone()) {
             tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
-            return Err(TauriCommandError::internal(format!("创建 TurnRecord 失败: {e}")));
+            return Err(TauriCommandError::internal(format!(
+                "创建 TurnRecord 失败: {e}"
+            )));
         }
         Some(record)
     } else {
@@ -2368,12 +2370,7 @@ async fn start_writing(
                     (Some(pc), Some(o)) => {
                         let pc = pc.clone();
                         tokio::task::spawn_blocking(move || {
-                            build_mutation_batch(
-                                get_campaign_store(),
-                                &pc,
-                                &o,
-                                &present_chars,
-                            )
+                            build_mutation_batch(get_campaign_store(), &pc, &o, &present_chars)
                         })
                         .await
                         .ok()
@@ -3202,7 +3199,11 @@ fn derive_components_from_outcome(
                 DerivationStatus::Disabled
             },
             state_derivation: if o.post_process.is_some() {
-                if o.post_process.as_ref().map(|p| p.parse_succeeded).unwrap_or(false) {
+                if o.post_process
+                    .as_ref()
+                    .map(|p| p.parse_succeeded)
+                    .unwrap_or(false)
+                {
                     DerivationStatus::Succeeded
                 } else {
                     DerivationStatus::Failed
@@ -3327,11 +3328,8 @@ fn build_mutation_batch(
         for tu in &pp.task_updates {
             if let Some(tid) = &tu.task_id {
                 if let Some(task) = store.get_task(tid)
-                    && let Some(task) = normalize_task_update_for_postprocess(
-                        camp_id,
-                        task,
-                        tu.new_status.clone(),
-                    )
+                    && let Some(task) =
+                        normalize_task_update_for_postprocess(camp_id, task, tu.new_status.clone())
                 {
                     mutations.push(storyforge_domain::turn::Mutation::SetTaskStatus {
                         task_id: task.id.clone(),
@@ -4167,6 +4165,10 @@ pub struct CreateConnectionDto {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// A1：推理模式 "disabled" / "native" / "prompted"。
+    /// 默认 disabled。native = 使用厂商原生 thinking（自动注入），同时抑制 CoT 提示模块。
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// 厂商扩展参数（P3-3），透传到请求体顶层。key=字段名(如 thinking/reasoning_effort),
     /// value=任意 JSON。前端可填如 {"thinking":{"type":"enabled"},"reasoning_effort":"max"}。
     #[serde(default)]
@@ -4195,6 +4197,15 @@ async fn create_connection(
             temperature: req.temperature,
             top_p: req.top_p,
             max_tokens: req.max_tokens,
+            reasoning: req
+                .reasoning
+                .as_deref()
+                .map(|s| match s {
+                    "native" | "Native" => storyforge_domain::llm::ReasoningMode::Native,
+                    "prompted" | "Prompted" => storyforge_domain::llm::ReasoningMode::Prompted,
+                    _ => storyforge_domain::llm::ReasoningMode::Disabled,
+                })
+                .unwrap_or_default(),
             extra: req.extra,
         },
         tool_mode,
@@ -4449,18 +4460,22 @@ fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<Conversatio
         .list()
         .into_iter()
         .map(|c| {
-            let card_name = c.character_id.as_ref().and_then(|cid| {
-                // 首选:直接按 character_id(=CharacterCard.id)查卡名
-                let cid_id = Id::from_str(cid);
-                card_by_id.get(&cid_id).map(|n| (*n).to_string())
-            }).or_else(|| {
-                // 兜底:campaign_id → campaign.card_id → card.name
-                c.campaign_id.as_ref().and_then(|camp_id| {
-                    store.get_campaign(camp_id).and_then(|campaign| {
-                        card_by_id.get(&campaign.card_id).map(|n| (*n).to_string())
-                    })
+            let card_name = c
+                .character_id
+                .as_ref()
+                .and_then(|cid| {
+                    // 首选:直接按 character_id(=CharacterCard.id)查卡名
+                    let cid_id = Id::from_str(cid);
+                    card_by_id.get(&cid_id).map(|n| (*n).to_string())
                 })
-            });
+                .or_else(|| {
+                    // 兜底:campaign_id → campaign.card_id → card.name
+                    c.campaign_id.as_ref().and_then(|camp_id| {
+                        store.get_campaign(camp_id).and_then(|campaign| {
+                            card_by_id.get(&campaign.card_id).map(|n| (*n).to_string())
+                        })
+                    })
+                });
             ConversationSummaryDto {
                 id: c.id.to_string(),
                 character_id: c.character_id,
@@ -4655,6 +4670,15 @@ pub struct LogEntryDto {
     pub level: String,
     pub timestamp: String,
     pub message: String,
+    /// A2：LLM 调用的 prompt token 数（非 LLM 调用为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    /// A2：LLM 调用的 completion token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    /// A2：缓存命中 token 数（仅当 > 0 时有意义）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4691,14 +4715,67 @@ fn log_query(filter: LogFilterDto, state: tauri::State<'_, Arc<AppState>>) -> Ve
         .log_store
         .query(&log_filter)
         .into_iter()
-        .map(|e| LogEntryDto {
-            id: e.id.to_string(),
-            kind: format!("{:?}", e.kind),
-            level: format!("{:?}", e.level),
-            timestamp: e.timestamp.to_rfc3339(),
-            message: e.message,
+        .map(|e| {
+            // A2：从 llm_detail 提取 token 字段
+            let (prompt_tokens, completion_tokens, cached_tokens) =
+                if let Some(detail) = &e.llm_detail {
+                    (
+                        Some(detail.prompt_tokens),
+                        Some(detail.completion_tokens),
+                        if detail.cached_tokens > 0 {
+                            Some(detail.cached_tokens)
+                        } else {
+                            None
+                        },
+                    )
+                } else {
+                    (None, None, None)
+                };
+            LogEntryDto {
+                id: e.id.to_string(),
+                kind: format!("{:?}", e.kind),
+                level: format!("{:?}", e.level),
+                timestamp: e.timestamp.to_rfc3339(),
+                message: e.message,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            }
         })
         .collect()
+}
+
+/// A2：获取单条 LLM 调用的完整详情（含 request_payload / response_text / token 统计）
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmCallDetailDto {
+    pub connection_name: String,
+    pub model: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub cache_creation_tokens: u32,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+fn log_get_llm_call(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<LlmCallDetailDto> {
+    state
+        .log_store
+        .get_llm_call(&storyforge_domain::Id::from_str(&id))
+        .map(|d| LlmCallDetailDto {
+            connection_name: d.connection_name,
+            model: d.model,
+            prompt_tokens: d.prompt_tokens,
+            completion_tokens: d.completion_tokens,
+            cached_tokens: d.cached_tokens,
+            cache_creation_tokens: d.cache_creation_tokens,
+            latency_ms: d.latency_ms,
+            error: d.error,
+        })
 }
 
 #[tauri::command]
@@ -4933,13 +5010,14 @@ async fn commit_turn_attempt(
         .get_turn_by_variant(node_id)
         .ok_or_else(|| {
             TauriCommandError::validation(
-                "该变体没有关联的 TurnRecord，可能是历史草稿。请从此处 fork 或 regenerate。".to_string(),
+                "该变体没有关联的 TurnRecord，可能是历史草稿。请从此处 fork 或 regenerate。"
+                    .to_string(),
             )
         })?;
 
-    let attempt = turn.find_attempt_by_variant(node_id).ok_or_else(|| {
-        TauriCommandError::validation("该变体没有关联的 TurnAttempt".to_string())
-    })?;
+    let attempt = turn
+        .find_attempt_by_variant(node_id)
+        .ok_or_else(|| TauriCommandError::validation("该变体没有关联的 TurnAttempt".to_string()))?;
 
     // 2. 校验 attempt 状态
     if !attempt.status.is_active() {
@@ -5080,9 +5158,9 @@ async fn abandon_turn(
         ));
     };
 
-    let turn = get_turn_store().get_active_turn(&campaign_id).ok_or_else(|| {
-        TauriCommandError::validation("没有活动 Turn 可以放弃".to_string())
-    })?;
+    let turn = get_turn_store()
+        .get_active_turn(&campaign_id)
+        .ok_or_else(|| TauriCommandError::validation("没有活动 Turn 可以放弃".to_string()))?;
 
     // 把 input user 变体和所有未 accept 的 AI 变体标记 Discarded
     let conv_store = state.conv_store.clone();
@@ -8481,6 +8559,7 @@ pub fn run() {
             abandon_turn,
             // M1 日志命令
             log_query,
+            log_get_llm_call,
             log_clear,
             log_export_bundle,
             log_append_frontend,
@@ -14614,16 +14693,11 @@ mod tests {
 
     #[test]
     fn build_mutation_batch_empty_outcome() {
-        let dir = std::env::temp_dir().join(format!(
-            "storyforge-mb-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("storyforge-mb-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
-        let campaign = storyforge_domain::campaign::Campaign::new(
-            Id::from_str("card-1"),
-            "test".to_string(),
-        );
+        let campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "test".to_string());
         let campaign_id = campaign.id.clone();
         store.save_campaign(campaign).unwrap();
 
@@ -14639,23 +14713,22 @@ mod tests {
         assert!(batch.is_empty(), "empty outcome should produce empty batch");
         assert_eq!(batch.expected_revision, 0);
         assert_eq!(batch.target_revision, 1);
-        assert_eq!(batch.status, storyforge_domain::turn::MutationBatchStatus::Prepared);
+        assert_eq!(
+            batch.status,
+            storyforge_domain::turn::MutationBatchStatus::Prepared
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn build_mutation_batch_with_summary_and_variable() {
-        let dir = std::env::temp_dir().join(format!(
-            "storyforge-mb-var-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge-mb-var-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = campaign_store::CampaignStore::new(&dir);
-        let campaign = storyforge_domain::campaign::Campaign::new(
-            Id::from_str("card-1"),
-            "test".to_string(),
-        );
+        let campaign =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "test".to_string());
         let campaign_id = campaign.id.clone();
         store.save_campaign(campaign).unwrap();
 
@@ -14679,11 +14752,17 @@ mod tests {
         let batch = build_mutation_batch(&store, &pc, &outcome, &[]);
 
         // 应该有 1 个 UpsertSummary + 1 个 SetVariable
-        assert_eq!(batch.mutations.len(), 2, "should have summary + variable mutations");
-        assert!(batch.mutations.iter().any(|m| matches!(
-            m,
-            storyforge_domain::turn::Mutation::UpsertSummary(_)
-        )));
+        assert_eq!(
+            batch.mutations.len(),
+            2,
+            "should have summary + variable mutations"
+        );
+        assert!(
+            batch
+                .mutations
+                .iter()
+                .any(|m| matches!(m, storyforge_domain::turn::Mutation::UpsertSummary(_)))
+        );
         assert!(batch.mutations.iter().any(|m| matches!(
             m,
             storyforge_domain::turn::Mutation::SetVariable { key, .. } if key == "story_clock"
@@ -14732,10 +14811,8 @@ mod tests {
 
     #[test]
     fn startup_recovery_marks_active_turns_failed() {
-        let dir = std::env::temp_dir().join(format!(
-            "storyforge-recovery-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge-recovery-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // 模拟崩溃前状态：创建一个 Generating 态 Turn

@@ -90,8 +90,13 @@ impl ToolRegistry {
     }
 
     /// 获取所有工具定义（发给 LLM 的 tools 数组）
+    ///
+    /// A2（缓存稳定性）：按工具名排序，保证同一组工具在每次请求中的 JSON 顺序一致。
+    /// HashMap 迭代序不确定，会导致 tools 数组顺序变化，破坏前缀缓存命中。
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|(_, spec)| spec.clone()).collect()
+        let mut specs: Vec<ToolSpec> = self.tools.values().map(|(_, spec)| spec.clone()).collect();
+        specs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        specs
     }
 
     /// 执行工具调用
@@ -1058,5 +1063,36 @@ mod tests {
         let mut r = registry;
         filter_registry_by_whitelist(&mut r, None, "test-role");
         assert_eq!(r.tool_specs().len(), before);
+    }
+
+    /// A2：tool_specs() 返回按工具名排序（确定性顺序，稳定前缀缓存）
+    #[test]
+    fn tool_specs_sorted_by_name() {
+        let registry = registry_with_director_tools();
+        let specs = registry.tool_specs();
+        let names: Vec<String> = specs.iter().map(|s| s.function.name.clone()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "tool_specs() 应按名排序，实际顺序: {names:?}"
+        );
+    }
+
+    /// A2：多次调用 tool_specs() 返回相同顺序
+    #[test]
+    fn tool_specs_consistent_order_across_calls() {
+        let registry = registry_with_director_tools();
+        let first: Vec<String> = registry
+            .tool_specs()
+            .iter()
+            .map(|s| s.function.name.clone())
+            .collect();
+        let second: Vec<String> = registry
+            .tool_specs()
+            .iter()
+            .map(|s| s.function.name.clone())
+            .collect();
+        assert_eq!(first, second);
     }
 }

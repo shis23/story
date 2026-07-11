@@ -72,7 +72,11 @@ impl TurnStore {
     /// 列出所有活动 Turn（启动恢复时标记 Failed 用）。
     pub fn list_active_turns(&self) -> Vec<TurnRecord> {
         let turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
-        turns.iter().filter(|t| t.status.is_active()).cloned().collect()
+        turns
+            .iter()
+            .filter(|t| t.status.is_active())
+            .cloned()
+            .collect()
     }
 
     // ─── 写入 ──────────────────────────────────────────────────────────────
@@ -283,9 +287,11 @@ mod tests {
         store.create_turn(record).unwrap();
 
         assert!(store.get_turn_by_variant(&variant_id).is_some());
-        assert!(store
-            .get_turn_by_variant(&Id::from_str("nonexistent"))
-            .is_none());
+        assert!(
+            store
+                .get_turn_by_variant(&Id::from_str("nonexistent"))
+                .is_none()
+        );
     }
 
     #[test]

@@ -79,6 +79,10 @@ pub struct AgentRuntime {
     llm: Arc<dyn LlmClient>,
     tool_ctx: Arc<ToolContext>,
     prompt_hook: Option<PromptHook>,
+    /// A1：连接级采样参数覆盖（含 reasoning 模式）。
+    /// 由 pipeline 层在构造 runtime 时从 active connection 注入，
+    /// 让 runtime 内部构建 ChatRequest 时携带 reasoning 配置而非 Default::default()。
+    sampling_override: Option<SamplingParams>,
 }
 
 impl AgentRuntime {
@@ -87,6 +91,7 @@ impl AgentRuntime {
             llm,
             tool_ctx,
             prompt_hook: None,
+            sampling_override: None,
         }
     }
 
@@ -99,6 +104,30 @@ impl AgentRuntime {
             llm,
             tool_ctx,
             prompt_hook: Some(prompt_hook),
+            sampling_override: None,
+        }
+    }
+
+    /// A1：注入连接级采样参数（reasoning 模式、extra 等）。
+    pub fn with_sampling(mut self, params: SamplingParams) -> Self {
+        self.sampling_override = Some(params);
+        self
+    }
+
+    /// 构建 ChatRequest 的采样参数：override 存在则用 override（但 max_tokens 清空），
+    /// 否则用 Default。
+    fn build_params(&self) -> SamplingParams {
+        if let Some(p) = &self.sampling_override {
+            // max_tokens 仍不设（同原逻辑，避免 output 空间不足）
+            SamplingParams {
+                max_tokens: None,
+                ..p.clone()
+            }
+        } else {
+            SamplingParams {
+                max_tokens: None,
+                ..Default::default()
+            }
         }
     }
 
@@ -204,11 +233,8 @@ impl AgentRuntime {
                 },
                 // max_tokens 不设（None）：让模型/endpoint 用自己的默认 output 上限。
                 // 硬编码 4096 会导致大 input 任务（角色抽取等）output 空间不足返回空。
-                // temperature/top_p 保留 default（1.0/0.95）。
-                params: SamplingParams {
-                    max_tokens: None,
-                    ..Default::default()
-                },
+                // A1：reasoning 模式由 sampling_override 透传（若 pipeline 注入了连接参数）。
+                params: self.build_params(),
                 model: config.model.clone(),
             };
 
@@ -340,10 +366,8 @@ impl AgentRuntime {
                     Some(tool_registry.tool_specs())
                 },
                 // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
-                params: SamplingParams {
-                    max_tokens: None,
-                    ..Default::default()
-                },
+                // A1：reasoning 模式由 sampling_override 透传
+                params: self.build_params(),
                 model: config.model.clone(),
             };
 
@@ -491,10 +515,8 @@ impl AgentRuntime {
                     Some(tool_registry.tool_specs())
                 },
                 // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
-                params: SamplingParams {
-                    max_tokens: None,
-                    ..Default::default()
-                },
+                // A1：reasoning 模式由 sampling_override 透传
+                params: self.build_params(),
                 model: config.model.clone(),
             };
 
@@ -736,6 +758,7 @@ pub async fn spawn_subagents(
             llm: runtime.llm(),
             tool_ctx: sub_tool_ctx,
             prompt_hook: runtime.prompt_hook.clone(),
+            sampling_override: runtime.sampling_override.clone(),
         });
 
         // 注册子 Agent 工具（get_character 限制为当前 instance）
@@ -1365,6 +1388,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..Default::default()
             }),
         }]));
         let tool_ctx = Arc::new(ToolContext {
@@ -1428,6 +1452,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..Default::default()
             }),
         }]));
         let tool_ctx = Arc::new(ToolContext {
@@ -1484,6 +1509,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..Default::default()
             }),
         }]));
         let tool_ctx = Arc::new(ToolContext {
@@ -1549,6 +1575,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..Default::default()
             }),
         }]));
         let tool_ctx = Arc::new(ToolContext {
@@ -1692,6 +1719,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..Default::default()
                 }),
             },
             ChatResponse {
@@ -1702,6 +1730,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..Default::default()
                 }),
             },
         ]));

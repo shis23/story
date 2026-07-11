@@ -553,13 +553,19 @@ mod tests {
     #[test]
     fn test_campaign_new_revision_starts_at_zero() {
         let campaign = Campaign::new(Id::new(), "run-1");
-        assert_eq!(campaign.revision, 0, "new campaign must start at revision 0");
+        assert_eq!(
+            campaign.revision, 0,
+            "new campaign must start at revision 0"
+        );
     }
 
     #[test]
     fn test_campaign_fork_revision_starts_at_zero() {
         let campaign = Campaign::fork(Id::new(), "fork", Id::new(), Id::new());
-        assert_eq!(campaign.revision, 0, "forked campaign must start at revision 0");
+        assert_eq!(
+            campaign.revision, 0,
+            "forked campaign must start at revision 0"
+        );
     }
 
     #[test]
@@ -572,10 +578,12 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "story_clock": "Day 1"
         });
-        let campaign: Campaign = serde_json::from_value(old_json).expect(
-            "old JSON without revision must deserialize successfully (serde default = 0)",
+        let campaign: Campaign = serde_json::from_value(old_json)
+            .expect("old JSON without revision must deserialize successfully (serde default = 0)");
+        assert_eq!(
+            campaign.revision, 0,
+            "missing revision field must default to 0"
         );
-        assert_eq!(campaign.revision, 0, "missing revision field must default to 0");
     }
 
     #[test]

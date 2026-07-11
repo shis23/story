@@ -63,6 +63,12 @@ pub struct LlmCallDetail {
     pub response_text: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// A2：缓存命中 token（prompt 前缀缓存复用）
+    #[serde(default)]
+    pub cached_tokens: u32,
+    /// A2：缓存创建 token（本次写入缓存的 prompt token）
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
     pub latency_ms: u64,
     pub error: Option<String>,
 }
@@ -79,6 +85,10 @@ pub struct LlmCallDetailRedacted {
     pub response_text_redacted: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    #[serde(default)]
+    pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
     pub latency_ms: u64,
     pub error: Option<String>,
 }
@@ -95,6 +105,8 @@ impl LlmCallDetail {
             response_text_redacted: format!("<content {} chars>", self.response_text.len()),
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            cached_tokens: self.cached_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
             latency_ms: self.latency_ms,
             error: self.error.clone(),
         }
@@ -618,6 +630,8 @@ mod tests {
             response_text: "很长的回复...".into(),
             prompt_tokens: 100,
             completion_tokens: 50,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
             latency_ms: 1500,
             error: None,
         };
@@ -756,10 +770,7 @@ mod tests {
 
         let store = LogStore::new(dir.clone());
         let all = store.query(&LogFilter::default());
-        let count = all
-            .iter()
-            .filter(|e| e.message == "good-line")
-            .count();
+        let count = all.iter().filter(|e| e.message == "good-line").count();
         assert_eq!(count, 2, "损坏行应被跳过,两条有效行应回填");
 
         let _ = std::fs::remove_dir_all(&dir);

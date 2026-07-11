@@ -134,8 +134,7 @@ async fn regenerate_with_retry(
             Err(e) => {
                 // Llm（520/超时/限流）和 PlanParse（导演返回空 Plan）都是瞬态，
                 // 与 setup_first_draft 的瞬态判定保持一致。
-                let transient =
-                    matches!(e, PipelineError::Llm(_) | PipelineError::PlanParse(_));
+                let transient = matches!(e, PipelineError::Llm(_) | PipelineError::PlanParse(_));
                 eprintln!(
                     "regenerate 第 {attempt}/{MAX_ATTEMPTS} 次失败 (transient={transient}): {e:?}"
                 );

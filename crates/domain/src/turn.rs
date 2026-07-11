@@ -191,18 +191,13 @@ pub enum Mutation {
     /// upsert 知识条目（预分配 entry_id）
     UpsertKnowledge(Box<KnowledgeMutation>),
     /// 设置已有任务的绝对状态
-    SetTaskStatus {
-        task_id: Id,
-        status: TaskStatus,
-    },
+    SetTaskStatus { task_id: Id, status: TaskStatus },
     /// upsert 新建任务（预分配 task_id）
     UpsertNewTask(Box<StoryTask>),
     /// upsert 本轮摘要（campaign_id + turn 幂等键）
     UpsertSummary(Box<crate::agent::RoundSummary>),
     /// 将 AI 草稿 Draft → Final
-    FinalizeVariant {
-        variant_id: Id,
-    },
+    FinalizeVariant { variant_id: Id },
 }
 
 /// 知识 mutation 的完整载荷（对应 `CharacterKnowledgeEntry`，预分配 ID）。
@@ -371,7 +366,10 @@ impl TurnRecord {
 
     /// 获取活动 Attempt 的可变引用
     pub fn active_attempt_mut(&mut self) -> Option<&mut TurnAttempt> {
-        self.attempts.iter_mut().rev().find(|a| a.status.is_active())
+        self.attempts
+            .iter_mut()
+            .rev()
+            .find(|a| a.status.is_active())
     }
 
     /// 按 attempt_id 查找
@@ -386,7 +384,9 @@ impl TurnRecord {
 
     /// 按 attempt_id 查找（可变）
     pub fn find_attempt_mut(&mut self, attempt_id: &Id) -> Option<&mut TurnAttempt> {
-        self.attempts.iter_mut().find(|a| &a.attempt_id == attempt_id)
+        self.attempts
+            .iter_mut()
+            .find(|a| &a.attempt_id == attempt_id)
     }
 
     /// 按 variant_id 查找（可变）

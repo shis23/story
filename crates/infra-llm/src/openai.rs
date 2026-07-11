@@ -30,6 +30,15 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         }
     }
 
+    // A1：ReasoningMode::Native 自动注入标准 thinking 参数。
+    // 用户可通过 extra 覆盖（extra 先注入，reasoning 后注入——但 Native 只在
+    // body 缺少 thinking 字段时补默认值，避免覆盖用户显式设置）。
+    if req.params.reasoning == storyforge_domain::llm::ReasoningMode::Native
+        && body.get("thinking").is_none()
+    {
+        body["thinking"] = serde_json::json!({ "type": "enabled" });
+    }
+
     // 工具定义
     if let Some(tools) = &req.tools
         && !tools.is_empty()
@@ -49,6 +58,59 @@ pub fn build_stream_request_body(req: &ChatRequest) -> serde_json::Value {
     body["stream"] = serde_json::json!(true);
     body["stream_options"] = serde_json::json!({ "include_usage": true });
     body
+}
+
+/// 解析缓存命中 token（多厂商字段兼容）
+///
+/// - DeepSeek: `prompt_cache_hit_tokens`（顶层）
+/// - OpenAI: `prompt_tokens_details.cached_tokens`
+/// - Anthropic: `cache_read_input_tokens`
+fn parse_cached_tokens(usage: &serde_json::Value) -> u32 {
+    // DeepSeek
+    if let Some(v) = usage
+        .get("prompt_cache_hit_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        return v as u32;
+    }
+    // OpenAI nested
+    if let Some(v) = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        return v as u32;
+    }
+    // Anthropic
+    if let Some(v) = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        return v as u32;
+    }
+    0
+}
+
+/// 解析缓存创建 token（多厂商字段兼容）
+///
+/// - DeepSeek: `prompt_cache_miss_tokens`（顶层）
+/// - Anthropic: `cache_creation_input_tokens`
+fn parse_cache_creation_tokens(usage: &serde_json::Value) -> u32 {
+    // DeepSeek
+    if let Some(v) = usage
+        .get("prompt_cache_miss_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        return v as u32;
+    }
+    // Anthropic
+    if let Some(v) = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        return v as u32;
+    }
+    0
 }
 
 /// 将内部消息转为 OpenAI 格式
@@ -108,10 +170,20 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse, String> 
         .map(String::from);
 
     let usage = body.get("usage").and_then(|v| {
+        let prompt_tokens = v.get("prompt_tokens")?.as_u64()? as u32;
+        let completion_tokens = v.get("completion_tokens")?.as_u64()? as u32;
+        let total_tokens = v.get("total_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+
+        // A2：解析缓存命中 token（多厂商字段兼容）
+        let cached_tokens = parse_cached_tokens(v);
+        let cache_creation_tokens = parse_cache_creation_tokens(v);
+
         Some(Usage {
-            prompt_tokens: v.get("prompt_tokens")?.as_u64()? as u32,
-            completion_tokens: v.get("completion_tokens")?.as_u64()? as u32,
-            total_tokens: v.get("total_tokens")?.as_u64()? as u32,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            cache_creation_tokens,
         })
     });
 
@@ -169,10 +241,7 @@ mod tests {
     fn test_build_request_body_passes_extra_params() {
         // P3-3：extra 扩展参数（thinking/reasoning_effort 等）应透传到请求体顶层
         let mut extra = serde_json::Map::new();
-        extra.insert(
-            "thinking".into(),
-            serde_json::json!({"type": "enabled"}),
-        );
+        extra.insert("thinking".into(), serde_json::json!({"type": "enabled"}));
         extra.insert("reasoning_effort".into(), serde_json::json!("max"));
         let req = ChatRequest {
             messages: vec![ChatMessage::user("test")],
@@ -181,6 +250,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 max_tokens: Some(2048),
+                reasoning: storyforge_domain::llm::ReasoningMode::default(),
                 extra: Some(extra),
             },
             model: "minimax-m3".into(),
@@ -189,7 +259,10 @@ mod tests {
         assert_eq!(body["model"], "minimax-m3");
         // temperature 走 f32→JSON,有浮点精度差异,用近似比较
         let temp = body["temperature"].as_f64().unwrap();
-        assert!((temp - 0.7f64).abs() < 1e-5, "temperature 近似 0.7, 实际 {temp}");
+        assert!(
+            (temp - 0.7f64).abs() < 1e-5,
+            "temperature 近似 0.7, 实际 {temp}"
+        );
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "max");
@@ -242,5 +315,123 @@ mod tests {
         let resp = parse_response(&body).unwrap();
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].function.name, "get_character");
+    }
+
+    // ─── A1：ReasoningMode 注入测试 ─────────────────────────────────────
+
+    #[test]
+    fn test_native_reasoning_injects_thinking() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Native,
+                ..Default::default()
+            },
+            model: "deepseek-reasoner".into(),
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn test_disabled_reasoning_no_thinking() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Disabled,
+                ..Default::default()
+            },
+            model: "deepseek-chat".into(),
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_native_reasoning_extra_overrides_default() {
+        // 用户通过 extra 显式设置 thinking，Native 不应覆盖
+        let mut extra = serde_json::Map::new();
+        extra.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Native,
+                extra: Some(extra),
+                ..Default::default()
+            },
+            model: "test".into(),
+        };
+        let body = build_request_body(&req);
+        // extra 先注入 thinking=disabled，Native 检测到 thinking 已存在，不覆盖
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    // ─── A2：缓存 token 解析测试 ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_cached_tokens_deepseek() {
+        let usage = serde_json::json!({"prompt_cache_hit_tokens": 500});
+        assert_eq!(parse_cached_tokens(&usage), 500);
+    }
+
+    #[test]
+    fn test_parse_cached_tokens_openai_nested() {
+        let usage = serde_json::json!({"prompt_tokens_details": {"cached_tokens": 300}});
+        assert_eq!(parse_cached_tokens(&usage), 300);
+    }
+
+    #[test]
+    fn test_parse_cached_tokens_anthropic() {
+        let usage = serde_json::json!({"cache_read_input_tokens": 200});
+        assert_eq!(parse_cached_tokens(&usage), 200);
+    }
+
+    #[test]
+    fn test_parse_cached_tokens_missing() {
+        let usage = serde_json::json!({"prompt_tokens": 100});
+        assert_eq!(parse_cached_tokens(&usage), 0);
+    }
+
+    #[test]
+    fn test_parse_cache_creation_tokens_deepseek() {
+        let usage = serde_json::json!({"prompt_cache_miss_tokens": 400});
+        assert_eq!(parse_cache_creation_tokens(&usage), 400);
+    }
+
+    #[test]
+    fn test_parse_response_with_deepseek_cache() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "prompt_cache_hit_tokens": 800,
+                "prompt_cache_miss_tokens": 200
+            }
+        });
+        let resp = parse_response(&body).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_creation_tokens, 200);
+    }
+
+    #[test]
+    fn test_parse_response_with_openai_cache() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "prompt_tokens_details": {"cached_tokens": 600}
+            }
+        });
+        let resp = parse_response(&body).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.cached_tokens, 600);
     }
 }

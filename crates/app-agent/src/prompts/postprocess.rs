@@ -265,7 +265,8 @@ mod tests {
     fn test_prompt_forbids_verbose_output() {
         // P2-6：prompt 必须强制「纯 JSON 无解释」,否则冗长输出被截断导致解析失败。
         assert!(
-            POSTPROCESS_SYSTEM_PROMPT.contains("严禁") && POSTPROCESS_SYSTEM_PROMPT.contains("解释"),
+            POSTPROCESS_SYSTEM_PROMPT.contains("严禁")
+                && POSTPROCESS_SYSTEM_PROMPT.contains("解释"),
             "prompt 必须明确禁止解释性输出"
         );
         assert!(

@@ -124,6 +124,7 @@ async fn run_direct_json_fallback(
             temperature: Some(0.3),
             top_p: Some(0.95),
             max_tokens: Some(8192),
+            reasoning: storyforge_domain::llm::ReasoningMode::default(),
             extra: None,
         },
         model: base_config.model.clone(),
@@ -420,6 +421,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                ..Default::default()
             }),
         }
     }

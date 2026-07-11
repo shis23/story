@@ -176,6 +176,9 @@ pub struct PipelineOrchestrator {
     pending_temporary_instances: Vec<CharacterInstance>,
     /// MVU JS fallback 运行时（None=不支持 JS fallback，降级）
     mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
+    /// A1：连接级采样参数（含 reasoning 模式），从 active connection 注入。
+    /// None = 用 Default（reasoning=Disabled）。
+    sampling: Option<storyforge_domain::llm::SamplingParams>,
 }
 
 impl PipelineOrchestrator {
@@ -185,7 +188,33 @@ impl PipelineOrchestrator {
         tool_ctx: Arc<ToolContext>,
         mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
     ) -> Self {
-        let runtime = Arc::new(AgentRuntime::new(llm, tool_ctx));
+        Self::new_with_sampling(llm, conv_store, tool_ctx, mvu_runtime, None, None)
+    }
+
+    /// A1：带连接级采样参数的构造函数。
+    /// `sampling` 从 active connection 注入，让 runtime 构建 ChatRequest 时
+    /// 携带 reasoning 模式；同时保存到 orchestrator 供 prompt 组装层读取。
+    pub fn new_with_sampling(
+        llm: Arc<dyn LlmClient>,
+        conv_store: Arc<ConversationStore>,
+        tool_ctx: Arc<ToolContext>,
+        mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
+        prompt_hook: Option<PromptHook>,
+        sampling: Option<storyforge_domain::llm::SamplingParams>,
+    ) -> Self {
+        let runtime = if let Some(hook) = prompt_hook {
+            let mut rt = AgentRuntime::with_prompt_hook(llm, tool_ctx, hook);
+            if let Some(ref sp) = sampling {
+                rt = rt.with_sampling(sp.clone());
+            }
+            Arc::new(rt)
+        } else {
+            let mut rt = AgentRuntime::new(llm, tool_ctx);
+            if let Some(ref sp) = sampling {
+                rt = rt.with_sampling(sp.clone());
+            }
+            Arc::new(rt)
+        };
         Self {
             runtime,
             conv_store,
@@ -193,6 +222,7 @@ impl PipelineOrchestrator {
             session: None,
             pending_temporary_instances: Vec::new(),
             mvu_runtime,
+            sampling,
         }
     }
 
@@ -203,15 +233,22 @@ impl PipelineOrchestrator {
         mvu_runtime: Option<Arc<dyn MvuRuntime + Send + Sync>>,
         prompt_hook: PromptHook,
     ) -> Self {
-        let runtime = Arc::new(AgentRuntime::with_prompt_hook(llm, tool_ctx, prompt_hook));
-        Self {
-            runtime,
+        Self::new_with_sampling(
+            llm,
             conv_store,
-            state: PipelineState::Idle,
-            session: None,
-            pending_temporary_instances: Vec::new(),
+            tool_ctx,
             mvu_runtime,
-        }
+            Some(prompt_hook),
+            None,
+        )
+    }
+
+    /// A1：获取当前 reasoning 模式（供 prompt 组装层判断 CoT 互斥）。
+    pub fn reasoning_mode(&self) -> storyforge_domain::llm::ReasoningMode {
+        self.sampling
+            .as_ref()
+            .map(|s| s.reasoning.clone())
+            .unwrap_or_default()
     }
 
     /// 获取当前状态
@@ -295,10 +332,10 @@ impl PipelineOrchestrator {
             &build_director_system_extra(ctx),
             ctx.agent_profile_config.as_ref(),
             template_context.as_ref(),
+            &self.reasoning_mode(),
         );
         let mut director_registry = ToolRegistry::new();
         register_director_tools(&mut director_registry);
-        // 应用 AgentProfileConfig 的 tool_whitelist（None=默认全部，Some=只保留指定工具）
         if let Some(apc) = ctx.agent_profile_config.as_ref() {
             let wl = apc
                 .run_config_for(&AgentRole::Director)
@@ -482,6 +519,7 @@ impl PipelineOrchestrator {
             &ctx.modules,
             ctx.agent_profile_config.as_ref(),
             template_context.as_ref(),
+            &self.reasoning_mode(),
         );
 
         // 构造编剧的用户消息（子 Agent 产出）
@@ -878,6 +916,7 @@ impl PipelineOrchestrator {
                 &build_director_system_extra(ctx),
                 ctx.agent_profile_config.as_ref(),
                 template_context.as_ref(),
+                &self.reasoning_mode(),
             );
             let mut director_registry = ToolRegistry::new();
             register_director_tools(&mut director_registry);
@@ -1135,6 +1174,7 @@ impl PipelineOrchestrator {
                 &build_director_system_extra(ctx),
                 ctx.agent_profile_config.as_ref(),
                 template_context.as_ref(),
+                &self.reasoning_mode(),
             );
 
             self.state = PipelineState::Delegating;
@@ -1350,8 +1390,13 @@ impl PipelineOrchestrator {
         self.state = PipelineState::Editing;
         let _ = event_tx.send(PipelineEvent::EditorStarted);
 
-        let editor_config =
-            make_editor_config(profile, modules, agent_profile_config, template_context);
+        let editor_config = make_editor_config(
+            profile,
+            modules,
+            agent_profile_config,
+            template_context,
+            &self.reasoning_mode(),
+        );
 
         let performances_text: String = performances
             .iter()
@@ -1869,6 +1914,7 @@ fn make_director_config(
     system_extra: &str,
     agent_profile_config: Option<&AgentProfileConfig>,
     template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+    reasoning: &storyforge_domain::llm::ReasoningMode,
 ) -> AgentConfig {
     let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Director,
@@ -1876,6 +1922,7 @@ fn make_director_config(
         profile,
         modules,
         "",
+        reasoning,
     );
     // 蓝灯世界设定拼进 system 末尾（稳定段，§22.4）
     if !system_extra.is_empty() {
@@ -1943,6 +1990,7 @@ fn make_editor_config(
     modules: &[storyforge_domain::prompt_module::PromptModule],
     agent_profile_config: Option<&AgentProfileConfig>,
     template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+    reasoning: &storyforge_domain::llm::ReasoningMode,
 ) -> AgentConfig {
     let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
         &AgentRole::Editor,
@@ -1950,6 +1998,7 @@ fn make_editor_config(
         profile,
         modules,
         "",
+        reasoning,
     );
     if let Some(template_context) = template_context {
         system_prompt = storyforge_domain::prompt_module::replace_template_vars_with_context(
@@ -3599,7 +3648,7 @@ mod tests {
         // emit_plan 必须是终止工具，否则 LLM 调用 emit_plan 后 run_tool_loop 不终止，
         // 循环到 max_tool_rounds(15) 失败。content 的 JSON 完成探测兜不住 tool_call 路径
         // （LLM 走 emit_plan 时 content 是自然语言）。对齐 postprocess 的同源修复。
-        let cfg = make_director_config(None, &[], "", None, None);
+        let cfg = make_director_config(None, &[], "", None, None, &Default::default());
         assert!(
             cfg.terminal_tools.iter().any(|t| t == "emit_plan"),
             "terminal_tools 必须含 emit_plan，实际为 {:?}",
@@ -3612,7 +3661,7 @@ mod tests {
         // Editor prompt 历史上含「3. 标注哪些子表演被你裁剪/改动了」，主动要求 LLM 输出元描述，
         // 导致元描述混入正文（P2-4）。必须改为显式禁止元描述，且不再要求标注改动。
         // 防止日后误改回旧文本。
-        let cfg = make_editor_config(None, &[], None, None);
+        let cfg = make_editor_config(None, &[], None, None, &Default::default());
         assert!(
             !cfg.system_prompt.contains("标注哪些子表演被你裁剪/改动了"),
             "editor prompt 不应再要求标注改动，实际为:\n{}",
@@ -4328,7 +4377,14 @@ mod tests {
             source: storyforge_domain::prompt_module::ProfileSource::ImportedFromST,
         };
 
-        let config = make_director_config(Some(&profile), &[module], "", None, Some(&template));
+        let config = make_director_config(
+            Some(&profile),
+            &[module],
+            "",
+            None,
+            Some(&template),
+            &Default::default(),
+        );
 
         assert!(
             config

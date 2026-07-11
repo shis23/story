@@ -152,12 +152,16 @@ pub struct AgentBinding {
 /// 按 Profile 组装系统提示词（设计 §3.6.7 的核心流程）
 ///
 /// 按 category 优先级顺序，插入已选模块的 content，最后拼接工具说明。
+///
+/// A1 互斥规则（架构文档 §6.2）：`reasoning == Native` 时跳过 `ModuleCategory::Cot`，
+/// 因为厂商原生 thinking 与提示式 CoT 不可同时启用（双重推理浪费 token 且可能冲突）。
 pub fn assemble_system_prompt(
     role: &AgentRole,
     role_directive: &str,
     profile: Option<&PromptProfile>,
     modules: &[PromptModule],
     tool_directives: &str,
+    reasoning: &crate::llm::ReasoningMode,
 ) -> String {
     let mut parts = vec![role_directive.to_string()];
 
@@ -173,6 +177,10 @@ pub fn assemble_system_prompt(
         ];
 
         for cat in &category_order {
+            // A1：Native reasoning 模式下跳过 CoT 提示模块
+            if *cat == ModuleCategory::Cot && *reasoning == crate::llm::ReasoningMode::Native {
+                continue;
+            }
             let ids = profile.selected_ids(role, cat);
             for mid in ids {
                 if let Some(m) = modules
@@ -824,6 +832,7 @@ pub mod builtins {
                 Some(&profile),
                 &modules,
                 "工具说明",
+                &crate::llm::ReasoningMode::default(),
             );
 
             assert!(assembled.contains("你是编剧"));
@@ -832,6 +841,58 @@ pub mod builtins {
             assert!(assembled.contains("杀八股")); // 模块 content 中含"杀八股"
             assert!(assembled.contains("目标字数")); // 字数控制模块的 content
             assert!(assembled.contains("工具说明"));
+        }
+
+        #[test]
+        fn test_assemble_native_reasoning_excludes_cot() {
+            // A1：Native reasoning 模式下，CoT 提示模块应被跳过
+            let (profile, modules) = default_profile();
+            let assembled = assemble_system_prompt(
+                &AgentRole::Director,
+                "你是导演。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Native,
+            );
+            // CoT 模块 content 含"思考指引"
+            assert!(
+                !assembled.contains("思考指引"),
+                "Native reasoning 模式不应注入 CoT 提示，实际: {assembled}"
+            );
+        }
+
+        #[test]
+        fn test_assemble_prompted_reasoning_includes_cot() {
+            // A1：Prompted 模式下 CoT 模块正常注入
+            let (profile, modules) = default_profile();
+            let assembled = assemble_system_prompt(
+                &AgentRole::Director,
+                "你是导演。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Prompted,
+            );
+            assert!(
+                assembled.contains("思考指引"),
+                "Prompted 模式应注入 CoT 提示，实际: {assembled}"
+            );
+        }
+
+        #[test]
+        fn test_assemble_disabled_reasoning_includes_cot() {
+            // A1：Disabled（默认）模式下 CoT 也正常注入
+            let (profile, modules) = default_profile();
+            let assembled = assemble_system_prompt(
+                &AgentRole::Director,
+                "你是导演。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Disabled,
+            );
+            assert!(assembled.contains("思考指引"));
         }
 
         #[test]
@@ -1010,6 +1071,7 @@ pub mod builtins {
                 Some(&profile),
                 &[module],
                 "",
+                &crate::llm::ReasoningMode::default(),
             );
             assert!(
                 out.contains("[子Agent专属约束]"),

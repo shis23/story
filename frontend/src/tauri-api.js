@@ -622,6 +622,16 @@ export async function logClear(kind = null) {
 }
 
 /**
+ * A2：获取单条 LLM 调用详情（含 token 统计、缓存命中）
+ */
+export async function logGetLlmCall(id) {
+  if (isTauri()) {
+    return await invoke('log_get_llm_call', { id })
+  }
+  return null
+}
+
+/**
  * 导出日志 bundle
  */
 export async function logExportBundle(redactContent = true) {
