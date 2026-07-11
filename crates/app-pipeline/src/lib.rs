@@ -140,6 +140,10 @@ pub struct WritingContext {
     pub campaign_runtime: Option<Arc<storyforge_domain::campaign_runtime::CampaignRuntimeContext>>,
     /// Agent Profile 配置（可选）。None = 使用硬编码默认值。
     pub agent_profile_config: Option<AgentProfileConfig>,
+    /// 近期 RoundSummary（按 turn 升序）。注入 Director volatile tail，
+    /// 也同步到 ToolContext.archived_summaries 供 get_recent_summary 使用。
+    /// ContextCompiler 最小版：先接落盘摘要，完整 epoch/预算裁剪留给阶段 C。
+    pub recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
 }
 
 impl WritingContext {
@@ -162,6 +166,7 @@ impl WritingContext {
             regex_scripts: vec![],
             campaign_runtime: None,
             agent_profile_config: None,
+            recent_summaries: vec![],
         }
     }
 }
@@ -1861,6 +1866,11 @@ fn build_director_tail(
         }
     }
 
+    // ContextCompiler 最小版：近期 RoundSummary 注入 volatile tail（稳定 history 之后）
+    if let Some(summary_block) = render_recent_summaries_for_injection(&ctx.recent_summaries, 5) {
+        tail = tail.push(summary_block);
+    }
+
     // 任务/伏笔注入（P2，确定性查表，零 LLM）：只注入 Pending/Active 且触发满足的任务
     if !ctx.pending_tasks.is_empty() {
         let task_block = storyforge_domain::story_task::render_tasks_for_injection(
@@ -1877,6 +1887,36 @@ fn build_director_tail(
 
     tail = tail.push("请分析意图并输出 Plan。");
     tail
+}
+
+/// 将近期 RoundSummary 渲染为导演 volatile tail 文本。
+///
+/// - 按 turn 升序输入；取最近 `limit` 条。
+/// - 单条 content 截断到 240 字，避免吞掉当前意图预算。
+/// - 空列表返回 None（调用方不 push 空段）。
+pub fn render_recent_summaries_for_injection(
+    summaries: &[storyforge_domain::agent::RoundSummary],
+    limit: usize,
+) -> Option<String> {
+    if summaries.is_empty() || limit == 0 {
+        return None;
+    }
+    let start = summaries.len().saturating_sub(limit);
+    let mut lines = Vec::new();
+    for s in &summaries[start..] {
+        let content = s.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        lines.push(format!("- T{}: {}", s.turn, truncate_chars(content, 240)));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "近期剧情摘要（按轮次，供规划参考，勿直接复述）：\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// UTF-8 安全的字符截断（按 char 而非 byte 截断，避免中文 panic）
@@ -4043,6 +4083,20 @@ mod tests {
 
         let mut ctx = WritingContext::legacy(vec![], None, conv_store.create(None, None).id);
         ctx.campaign_runtime = Some(runtime);
+        ctx.recent_summaries = vec![
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("camp-1"),
+                Id::from_str("conv-1"),
+                1,
+                "林秋在雨夜诊所发现了未署名的病历。".into(),
+            ),
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("camp-1"),
+                Id::from_str("conv-1"),
+                2,
+                "陈警官上门问询，林秋隐瞒了部分线索。".into(),
+            ),
+        ];
 
         let layout = MessageLayout::build()
             .system("你是导演")
@@ -4058,6 +4112,14 @@ mod tests {
             tail_content.contains("inst-lin"),
             "应含 instance id: {tail_content}"
         );
+        assert!(
+            tail_content.contains("近期剧情摘要"),
+            "应注入近期摘要段: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("T2:") && tail_content.contains("陈警官上门问询"),
+            "应含最近一轮摘要: {tail_content}"
+        );
         assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
         assert!(
             tail_content.contains("Protagonist"),
@@ -4067,6 +4129,41 @@ mod tests {
             tail_content.contains("calm surgeon"),
             "应含 persona 摘要: {tail_content}"
         );
+    }
+
+    // ─── ContextCompiler 最小版：RoundSummary 注入 ───────────────────────────
+
+    #[test]
+    fn test_render_recent_summaries_for_injection_takes_last_n() {
+        let summaries = vec![
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("c"),
+                Id::from_str("conv"),
+                1,
+                "第一轮".into(),
+            ),
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("c"),
+                Id::from_str("conv"),
+                2,
+                "第二轮".into(),
+            ),
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("c"),
+                Id::from_str("conv"),
+                3,
+                "第三轮".into(),
+            ),
+        ];
+        let text = render_recent_summaries_for_injection(&summaries, 2).expect("should render");
+        assert!(text.contains("T2:") && text.contains("第二轮"));
+        assert!(text.contains("T3:") && text.contains("第三轮"));
+        assert!(!text.contains("T1:"));
+    }
+
+    #[test]
+    fn test_render_recent_summaries_empty_returns_none() {
+        assert!(render_recent_summaries_for_injection(&[], 5).is_none());
     }
 
     // ─── 阶段 3 cleanup：has_available_characters + UTF-8 截断 + variables 注入 ──

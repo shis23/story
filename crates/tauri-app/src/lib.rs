@@ -2360,6 +2360,7 @@ async fn start_writing(
         ),
         campaign_runtime: None,
         agent_profile_config: None,
+        recent_summaries: vec![],
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
@@ -2465,8 +2466,7 @@ async fn start_writing(
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
 
         // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（纯确定性规则，warn-only）
-        let quality_report =
-            storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        let quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
         let warning_msgs: Vec<String> = quality_report
             .warnings
             .iter()
@@ -2934,8 +2934,10 @@ async fn fill_campaign_context_async(
 fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolContext>>) {
     // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留。
     ctx.campaign_runtime = None;
+    ctx.recent_summaries.clear();
     let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = None;
+    tool_guard.archived_summaries.clear();
 }
 
 struct CampaignContextSnapshot {
@@ -2945,6 +2947,8 @@ struct CampaignContextSnapshot {
     pending_tasks: Vec<storyforge_domain::story_task::StoryTask>,
     scoped_regex_scripts: Vec<RegexScript>,
     runtime: Arc<CampaignRuntimeContext>,
+    /// 近期 RoundSummary（turn 升序），供 Director tail + get_recent_summary
+    recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
 }
 
 fn load_campaign_context_snapshot(
@@ -2953,7 +2957,10 @@ fn load_campaign_context_snapshot(
 ) -> Option<CampaignContextSnapshot> {
     let camp = store.get_campaign(active_id)?;
     let story_clock = camp.story_clock.clone();
-    let existing_turns = store.list_summaries(active_id).len() as u32;
+    let mut recent_summaries = store.list_summaries(active_id);
+    // 保证 turn 升序，便于 tail 取最近 N 条
+    recent_summaries.sort_by_key(|s| s.turn);
+    let existing_turns = recent_summaries.len() as u32;
     let turn = existing_turns + 1;
     let tasks = store.list_tasks(active_id);
     let instances = store.list_instances(active_id);
@@ -2994,6 +3001,7 @@ fn load_campaign_context_snapshot(
         pending_tasks: tasks,
         scoped_regex_scripts,
         runtime,
+        recent_summaries,
     })
 }
 
@@ -3008,9 +3016,16 @@ fn apply_campaign_context_snapshot(
     ctx.pending_tasks = snapshot.pending_tasks;
     append_missing_campaign_scoped_regex_scripts(ctx, snapshot.scoped_regex_scripts);
     ctx.campaign_runtime = Some(snapshot.runtime.clone());
+    ctx.recent_summaries = snapshot.recent_summaries;
 
     let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = Some(snapshot.runtime);
+    // 同步到 get_recent_summary 工具：content 列表（升序，工具内部 rev().take）
+    tool_guard.archived_summaries = ctx
+        .recent_summaries
+        .iter()
+        .map(|s| s.content.clone())
+        .collect();
 }
 
 /// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
@@ -3075,11 +3090,20 @@ pub fn fill_campaign_runtime_from_store(
 
     // 写入 WritingContext
     ctx.campaign_runtime = Some(runtime.clone());
+    // ContextCompiler 最小版：RoundSummary → Director tail + get_recent_summary
+    let mut recent_summaries = store.list_summaries(active_id);
+    recent_summaries.sort_by_key(|s| s.turn);
+    ctx.recent_summaries = recent_summaries;
 
     // 同步到 ToolContext（快照，非 store 引用）
     {
         let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         tool_guard.campaign_runtime = Some(runtime);
+        tool_guard.archived_summaries = ctx
+            .recent_summaries
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
     }
 }
 
@@ -4142,6 +4166,7 @@ async fn regenerate(
         ),
         campaign_runtime: None,
         agent_profile_config: None,
+        recent_summaries: vec![],
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
@@ -9764,6 +9789,7 @@ mod tests {
                 turn: 1,
             })),
             agent_profile_config: None,
+            recent_summaries: vec![],
         };
 
         let fragments = collect_mvu_fallback_fragments(
