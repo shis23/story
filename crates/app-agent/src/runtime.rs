@@ -661,6 +661,8 @@ pub async fn spawn_subagents(
     agent_profile_config: Option<&storyforge_domain::agent_profile_config::AgentProfileConfig>,
     // ContextCompiler 最小版：近期剧情摘要块（已渲染文本）。None/空 = 不注入。
     recent_summary_block: Option<&str>,
+    // 远记忆召回块（已渲染文本）。None/空 = 不注入。
+    far_memory_block: Option<&str>,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
     // Semaphore(0) would make every task wait forever; treat invalid input as serial execution.
@@ -734,6 +736,13 @@ pub async fn spawn_subagents(
             volatile_text.push_str(block);
             volatile_text
                 .push_str("\n（以上为近期剧情摘要，仅供保持连续性；勿泄露你角色不该知道的信息。）");
+        }
+        if let Some(block) = far_memory_block.map(str::trim).filter(|s| !s.is_empty()) {
+            volatile_text.push_str("\n\n");
+            volatile_text.push_str(block);
+            volatile_text.push_str(
+                "\n（以上为与当前意图相关的远记忆，仅作背景；勿泄露你角色不该知道的信息，勿整段复述。）",
+            );
         }
 
         let layout = MessageLayout::build().system(stable_system).tail(|_| {
@@ -1147,6 +1156,7 @@ mod tests {
             4,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1220,6 +1230,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None, // 无 Campaign runtime（旧路径测试）
             4,
+            None,
             None,
             None,
         )
@@ -1301,6 +1312,7 @@ mod tests {
                 None,
                 0,
                 Some(&profile),
+                None,
                 None,
             ),
         )
@@ -1706,6 +1718,7 @@ mod tests {
             1,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1939,6 +1952,7 @@ mod tests {
             4,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1995,6 +2009,7 @@ mod tests {
             4,
             None,
             None,
+            None,
         )
         .await;
 
@@ -2048,6 +2063,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None,
             4,
+            None,
             None,
             None,
         )
@@ -2278,6 +2294,7 @@ mod tests {
             4,
             None,
             None,
+            None,
         )
         .await;
 
@@ -2361,6 +2378,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None,
             4,
+            None,
             None,
             None,
         )

@@ -463,6 +463,7 @@ impl PipelineOrchestrator {
             .map(|c| c.effective_max_concurrent_subagents())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
         let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
+        let far_block = render_far_memory_for_injection(&ctx.far_memory_hits, 3);
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -474,6 +475,7 @@ impl PipelineOrchestrator {
             max_concurrent,
             ctx.agent_profile_config.as_ref(),
             summary_block.as_deref(),
+            far_block.as_deref(),
         )
         .await;
 
@@ -1072,6 +1074,7 @@ impl PipelineOrchestrator {
                 .map(|c| c.effective_max_concurrent_subagents())
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
             let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
+            let far_block = render_far_memory_for_injection(&ctx.far_memory_hits, 3);
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -1083,6 +1086,7 @@ impl PipelineOrchestrator {
                 max_concurrent,
                 ctx.agent_profile_config.as_ref(),
                 summary_block.as_deref(),
+                far_block.as_deref(),
             )
             .await;
 
@@ -1246,7 +1250,7 @@ impl PipelineOrchestrator {
                         format_subagent_context_volatile(&target_task.context_package),
                         target_task.brief,
                     );
-                    // ContextCompiler 最小版：regenerate 单子 Agent 也注入近期摘要
+                    // ContextCompiler 最小版：regenerate 单子 Agent 也注入近期摘要 + 远记忆
                     if let Some(block) =
                         render_recent_summaries_for_injection(&ctx.recent_summaries, 5)
                     {
@@ -1254,6 +1258,13 @@ impl PipelineOrchestrator {
                         volatile_text.push_str(&block);
                         volatile_text.push_str(
                             "\n（以上为近期剧情摘要，仅供保持连续性；勿泄露你角色不该知道的信息。）",
+                        );
+                    }
+                    if let Some(block) = render_far_memory_for_injection(&ctx.far_memory_hits, 3) {
+                        volatile_text.push_str("\n\n");
+                        volatile_text.push_str(&block);
+                        volatile_text.push_str(
+                            "\n（以上为与当前意图相关的远记忆，仅作背景；勿泄露你角色不该知道的信息，勿整段复述。）",
                         );
                     }
                     let hint_for_tail = hint.clone();
