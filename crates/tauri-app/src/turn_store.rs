@@ -121,16 +121,50 @@ impl TurnStore {
         expected: TurnStatus,
         new: TurnStatus,
     ) -> Result<bool, String> {
+        self.mutate_if(
+            turn_id,
+            |record| record.status == expected,
+            |record| {
+                record.status = new;
+                record.touch();
+            },
+        )
+    }
+
+    /// 持锁读取-条件校验-修改-原子持久化。
+    ///
+    /// - `Ok(true)`：predicate 通过且已写入
+    /// - `Ok(false)`：predicate 失败，未改动
+    /// - `Err`：Turn 不存在或持久化失败
+    ///
+    /// accept / 后台 postprocess 必须走此路径，避免 get→改→save 的 TOCTOU 覆盖。
+    pub fn mutate_if<P, M>(&self, turn_id: &Id, predicate: P, mutate: M) -> Result<bool, String>
+    where
+        P: FnOnce(&TurnRecord) -> bool,
+        M: FnOnce(&mut TurnRecord),
+    {
         let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(idx) = turns.iter().position(|t| &t.turn_id == turn_id) {
-            if turns[idx].status == expected {
-                turns[idx].status = new;
-                turns[idx].touch();
-                return persist_turns(&self.turns_path, &turns).map(|()| true);
-            }
-            return Ok(false); // 状态不匹配，CAS 失败
+        let Some(idx) = turns.iter().position(|t| &t.turn_id == turn_id) else {
+            return Err(format!("TurnRecord {} 不存在", turn_id));
+        };
+        if !predicate(&turns[idx]) {
+            return Ok(false);
         }
-        Err(format!("TurnRecord {} 不存在", turn_id))
+        mutate(&mut turns[idx]);
+        persist_turns(&self.turns_path, &turns)?;
+        Ok(true)
+    }
+
+    /// 持锁修改并持久化（无条件；Turn 不存在则 Err）。
+    pub fn with_turn_mut<F>(&self, turn_id: &Id, mutate: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut TurnRecord),
+    {
+        let applied = self.mutate_if(turn_id, |_| true, mutate)?;
+        if !applied {
+            return Err(format!("TurnRecord {} 未能更新", turn_id));
+        }
+        Ok(())
     }
 
     // ─── 测试辅助 ──────────────────────────────────────────────────────────
@@ -218,6 +252,51 @@ mod tests {
     }
 
     #[test]
+    fn mutate_if_skips_when_predicate_fails() {
+        let store = temp_store();
+        let record = make_record("camp-1");
+        let turn_id = record.turn_id.clone();
+        store.create_turn(record).unwrap();
+
+        let applied = store
+            .mutate_if(
+                &turn_id,
+                |r| r.status == TurnStatus::Committed,
+                |r| r.status = TurnStatus::Failed,
+            )
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(
+            store.get_turn(&turn_id).unwrap().status,
+            TurnStatus::Generating
+        );
+    }
+
+    #[test]
+    fn mutate_if_applies_under_lock_when_predicate_ok() {
+        let store = temp_store();
+        let record = make_record("camp-1");
+        let turn_id = record.turn_id.clone();
+        store.create_turn(record).unwrap();
+
+        let applied = store
+            .mutate_if(
+                &turn_id,
+                |r| r.status == TurnStatus::Generating,
+                |r| {
+                    r.status = TurnStatus::AwaitingAcceptance;
+                    r.touch();
+                },
+            )
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            store.get_turn(&turn_id).unwrap().status,
+            TurnStatus::AwaitingAcceptance
+        );
+    }
+
+    #[test]
     fn cas_turn_status_succeeds_on_match() {
         let store = temp_store();
         let record = make_record("camp-1");
@@ -282,6 +361,7 @@ mod tests {
             pending_state_changes: None,
             derivation: None,
             quality_report: None,
+            pending_temporary_instances: vec![],
             provenance: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         });

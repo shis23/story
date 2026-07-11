@@ -4944,8 +4944,7 @@ mod tests {
     fn test_template_random_seed_is_deterministic() {
         let mut ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, Id::new());
         ctx.template_random_seed = Some(42);
-        let template =
-            prompt_template_context_for_writing(&ctx, None).expect("single character");
+        let template = prompt_template_context_for_writing(&ctx, None).expect("single character");
         assert_eq!(template.random_seed, Some(42));
         let a = storyforge_domain::prompt_module::replace_template_vars_with_context(
             "{{random::alpha::beta::gamma}}",

@@ -194,31 +194,47 @@ fn recover_turns_on_startup(app_state: &AppState) {
                         "Phase A 启动恢复: Turn {} 幂等重放成功 → Committed",
                         turn_id
                     );
-                    // P0-5：补齐 Draft→Final + accepted_attempt_id + Attempt Committed
-                    if let Some(vid) = &variant_id
-                        && let Err(e) = app_state
+                    // A.1：只有 Draft→Final 也成功才标 Committed；否则保持 Committing 可重试
+                    let finalize_ok = match &variant_id {
+                        Some(vid) => match app_state
                             .conv_store
                             .accept_variant(&turn.conversation_id, vid)
-                    {
-                        tracing::error!(
-                            "Phase A 启动恢复: Turn {} Draft→Final 失败: {e}（继续标 Committed）",
-                            turn_id
-                        );
-                    }
-                    if let Err(e) = update_turn_record(&turn_id, |record| {
-                        record.status = storyforge_domain::turn::TurnStatus::Committed;
-                        if let Some(aid) = &attempt_id {
-                            record.accepted_attempt_id = Some(aid.clone());
-                            for att in &mut record.attempts {
-                                if &att.attempt_id == aid {
-                                    att.status = storyforge_domain::turn::AttemptStatus::Committed;
-                                } else if att.status.is_active() {
-                                    att.status = storyforge_domain::turn::AttemptStatus::Superseded;
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Phase A 启动恢复: Turn {} Draft→Final 失败: {e}（保持 Committing）",
+                                    turn_id
+                                );
+                                false
+                            }
+                        },
+                        None => {
+                            tracing::error!(
+                                "Phase A 启动恢复: Turn {} 无 variant_id，保持 Committing",
+                                turn_id
+                            );
+                            false
+                        }
+                    };
+                    if finalize_ok
+                        && let Err(e) = update_turn_record(&turn_id, |record| {
+                            record.status = storyforge_domain::turn::TurnStatus::Committed;
+                            if let Some(aid) = &attempt_id {
+                                record.accepted_attempt_id = Some(aid.clone());
+                                for att in &mut record.attempts {
+                                    if &att.attempt_id == aid {
+                                        att.status =
+                                            storyforge_domain::turn::AttemptStatus::Committed;
+                                    } else if att.status.is_active() {
+                                        att.status =
+                                            storyforge_domain::turn::AttemptStatus::Superseded;
+                                    }
                                 }
                             }
-                        }
-                        record.touch();
-                    }) {
+                            record.touch();
+                        })
+                    {
                         tracing::error!(
                             "Phase A 启动恢复: 标记 Turn {} Committed 失败: {e}",
                             turn_id
@@ -257,15 +273,31 @@ fn recover_turns_on_startup(app_state: &AppState) {
                 "Phase A 启动恢复: Turn {} 无 MutationBatch → 空 diff 恢复",
                 turn_id
             );
-            if let Some(vid) = &variant_id
-                && let Err(e) = app_state
+            // A.1：空 diff 同样要求 Draft→Final 成功才标 Committed
+            let finalize_ok = match &variant_id {
+                Some(vid) => match app_state
                     .conv_store
                     .accept_variant(&turn.conversation_id, vid)
-            {
-                tracing::error!(
-                    "Phase A 启动恢复: Turn {} 空 diff Draft→Final 失败: {e}",
-                    turn_id
-                );
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::error!(
+                            "Phase A 启动恢复: Turn {} 空 diff Draft→Final 失败: {e}（保持 Committing）",
+                            turn_id
+                        );
+                        false
+                    }
+                },
+                None => {
+                    tracing::error!(
+                        "Phase A 启动恢复: Turn {} 空 diff 无 variant_id，保持 Committing",
+                        turn_id
+                    );
+                    false
+                }
+            };
+            if !finalize_ok {
+                continue;
             }
             let empty_apply = store.get_campaign(&campaign_id).map(|camp| {
                 let empty_batch =
@@ -2137,12 +2169,14 @@ impl WritingEvent {
             PipelineEvent::QualityChecked {
                 passed,
                 warning_count,
+                error_count,
                 warnings,
             } => (
                 "quality_checked".into(),
                 serde_json::json!({
                     "passed": passed,
                     "warning_count": warning_count,
+                    "error_count": error_count,
                     "warnings": warnings,
                 }),
             ),
@@ -2442,6 +2476,7 @@ async fn start_writing(
         let created_attempt_id = if let Some(ref turn) = turn_record {
             let draft_hash = compute_draft_hash(final_text);
             let attempt_id = Id::new();
+            let temps = pipeline.pending_temporary_instances().to_vec();
             let attempt = storyforge_domain::turn::TurnAttempt {
                 attempt_id: attempt_id.clone(),
                 variant_id: draft_node_id.clone(),
@@ -2450,21 +2485,26 @@ async fn start_writing(
                 pending_state_changes: None,
                 derivation: None,
                 quality_report: None,
+                pending_temporary_instances: temps,
                 provenance: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
-            let _ = update_turn_record(&turn.turn_id, |record| {
+            // A.1：Attempt 创建失败必须传播——Draft 已在对话树时不能静默丢身份
+            update_turn_record(&turn.turn_id, |record| {
                 record.attempts.push(attempt);
                 record.status = storyforge_domain::turn::TurnStatus::DraftReady;
                 record.touch();
-            });
+            })
+            .map_err(|e| {
+                TauriCommandError::internal(format!(
+                    "TurnAttempt 持久化失败（Draft 已产出但无 Attempt 身份）: {e}"
+                ))
+            })?;
             Some(attempt_id)
         } else {
             None
         };
-        // Phase 6：落盘本轮创建的临时 instance（同步，在 postprocess 之前确保知识/变量写回能找到它们）
-        persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
-            .await;
+        // A.1：临时 instance 不再在 accept 前直接写 Campaign；挂在 Attempt，accept 时 Mutation 落盘
 
         // 从 session.plan 取在场角色 + 基础变量键
         let present_chars: Vec<String> = pipeline
@@ -2493,6 +2533,7 @@ async fn start_writing(
         let _ = event_tx.send(PipelineEvent::QualityChecked {
             passed: quality_report.passed(),
             warning_count: quality_report.warnings.len(),
+            error_count: quality_report.error_count(),
             warnings: warning_msgs,
         });
         if !quality_report.passed() {
@@ -2548,28 +2589,34 @@ async fn start_writing(
                     _ => None,
                 };
 
-                let _ = update_turn_record(&turn_id, |record| {
-                    // P0-2 修复：后台 postprocess 写回前检查 Turn 当前状态。
-                    // 如果 Turn 已经进入 Committing/Committed/Failed/Abandoned，
-                    // 说明 accept 已经开始或 Turn 已终结——不要覆盖。
-                    if record.status.is_terminal()
-                        || record.status == storyforge_domain::turn::TurnStatus::Committing
-                    {
+                // A.1：持锁条件写回，避免覆盖 Committing/terminal 快照
+                match update_turn_record_if(
+                    &turn_id,
+                    |record| {
+                        !record.status.is_terminal()
+                            && record.status != storyforge_domain::turn::TurnStatus::Committing
+                    },
+                    |record| {
+                        if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                            att.pending_state_changes = batch;
+                            att.derivation = Some(derivation);
+                            att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+                        }
+                        record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
+                        record.touch();
+                    },
+                ) {
+                    Ok(false) => {
                         tracing::warn!(
-                            "Phase A: 后台 postprocess 写回跳过——Turn {} 已在 {:?} 态",
-                            record.turn_id,
-                            record.status
+                            "Phase A: 后台 postprocess 写回跳过——Turn {} 已非可写态",
+                            turn_id
                         );
-                        return;
                     }
-                    if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                        att.pending_state_changes = batch;
-                        att.derivation = Some(derivation);
-                        att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+                    Ok(true) => {}
+                    Err(e) => {
+                        tracing::error!("Phase A: 后台 postprocess 写回失败 Turn {}: {e}", turn_id);
                     }
-                    record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
-                    record.touch();
-                });
+                }
             } else {
                 // 非 Campaign 路径或无 TurnRecord：保持旧行为（直接写）
                 if let Some(outcome) = outcome {
@@ -2638,15 +2685,20 @@ fn update_turn_record<F>(turn_id: &Id, f: F) -> Result<(), String>
 where
     F: FnOnce(&mut storyforge_domain::turn::TurnRecord),
 {
-    let store = get_turn_store();
-    let mut record = store
-        .get_turn(turn_id)
-        .ok_or_else(|| format!("TurnRecord 不存在: {turn_id}"))?;
-    f(&mut record);
-    store
-        .save_turn(record)
-        .map_err(|e| format!("保存 TurnRecord 失败: {e}"))?;
-    Ok(())
+    get_turn_store()
+        .with_turn_mut(turn_id, f)
+        .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
+}
+
+/// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
+fn update_turn_record_if<P, M>(turn_id: &Id, predicate: P, mutate: M) -> Result<bool, String>
+where
+    P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
+    M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
+{
+    get_turn_store()
+        .mutate_if(turn_id, predicate, mutate)
+        .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
 }
 
 struct StartConversationTarget {
@@ -3464,10 +3516,10 @@ impl TemporaryInstancesPersistContext {
     }
 }
 
-/// Phase 6：把本轮创建的临时 instance 落盘到 CampaignStore。
+/// 测试/兼容：直接把临时 instance 落盘到 CampaignStore。
 ///
-/// 去重逻辑：同一 campaign 内已存在同名 instance 时跳过。
-/// 落盘后，下一轮 `fill_campaign_context_async` 能读到这些 instance。
+/// 生产路径 A.1 改为 accept 时 `Mutation::UpsertInstance`；本函数保留给单测。
+#[allow(dead_code)]
 async fn persist_temporary_instances_async(
     ctx: &WritingContext,
     temporaries: Vec<storyforge_domain::campaign::CharacterInstance>,
@@ -4502,6 +4554,7 @@ async fn regenerate(
                     pending_state_changes: None,
                     derivation: None,
                     quality_report: None,
+                    pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
                     provenance: None,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
@@ -4526,8 +4579,6 @@ async fn regenerate(
         };
 
         // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前）
-        persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
-            .await;
 
         let (final_text, present_chars, var_keys) = (
             text.clone(),
@@ -4557,6 +4608,7 @@ async fn regenerate(
         let _ = event_tx.send(PipelineEvent::QualityChecked {
             passed: quality_report.passed(),
             warning_count: quality_report.warnings.len(),
+            error_count: quality_report.error_count(),
             warnings: warning_msgs,
         });
         if !quality_report.passed() {
@@ -4610,15 +4662,37 @@ async fn regenerate(
                 }
                 _ => None,
             };
-            let _ = update_turn_record(&turn.turn_id, |record| {
-                if let Some(att) = record.find_attempt_mut(&att_id) {
-                    att.pending_state_changes = batch;
-                    att.derivation = Some(derivation);
-                    att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+            // A.1：regenerate 后处理写回同样走条件 CAS
+            match update_turn_record_if(
+                &turn.turn_id,
+                |record| {
+                    !record.status.is_terminal()
+                        && record.status != storyforge_domain::turn::TurnStatus::Committing
+                },
+                |record| {
+                    if let Some(att) = record.find_attempt_mut(&att_id) {
+                        att.pending_state_changes = batch;
+                        att.derivation = Some(derivation);
+                        att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+                    }
+                    record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
+                    record.touch();
+                },
+            ) {
+                Ok(false) => {
+                    tracing::warn!(
+                        "Phase A: regenerate postprocess 写回跳过——Turn {} 已非可写态",
+                        turn.turn_id
+                    );
                 }
-                record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
-                record.touch();
-            });
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Phase A: regenerate postprocess 写回失败 Turn {}: {e}",
+                        turn.turn_id
+                    );
+                }
+            }
         } else if let Some(outcome) = outcome {
             // 非 Campaign 路径：保持旧行为（直接写）
             persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
@@ -5603,23 +5677,38 @@ async fn commit_turn_attempt(
     // 4. 获取候选 MutationBatch（可能为空 — 配置关闭或无推导产出）
     // P0-5：空 diff 也必须包含 FinalizeVariant，保证空 batch 仍 bump revision
     // 且 write-ahead journal 能完整记录 commit 意图。
-    let batch = {
-        let mut batch = attempt.pending_state_changes.clone().unwrap_or_else(|| {
-            storyforge_domain::turn::MutationBatch::new(Id::new(), current_revision)
-        });
-        let has_finalize = batch
-            .mutations
-            .iter()
-            .any(|m| matches!(m, storyforge_domain::turn::Mutation::FinalizeVariant { .. }));
-        if !has_finalize {
-            batch
+    let batch =
+        {
+            let mut batch = attempt.pending_state_changes.clone().unwrap_or_else(|| {
+                storyforge_domain::turn::MutationBatch::new(Id::new(), current_revision)
+            });
+            let has_finalize = batch
                 .mutations
-                .push(storyforge_domain::turn::Mutation::FinalizeVariant {
-                    variant_id: node_id.clone(),
-                });
-        }
-        batch
-    };
+                .iter()
+                .any(|m| matches!(m, storyforge_domain::turn::Mutation::FinalizeVariant { .. }));
+            if !has_finalize {
+                batch
+                    .mutations
+                    .push(storyforge_domain::turn::Mutation::FinalizeVariant {
+                        variant_id: node_id.clone(),
+                    });
+            }
+            // A.1：临时角色仅在 accept 时经 Coordinator 落盘
+            for temp in &attempt.pending_temporary_instances {
+                let already = batch.mutations.iter().any(|m| matches!(
+                m,
+                storyforge_domain::turn::Mutation::UpsertInstance(inst) if inst.id == temp.id
+            ));
+                if !already {
+                    batch
+                        .mutations
+                        .push(storyforge_domain::turn::Mutation::UpsertInstance(Box::new(
+                            temp.clone(),
+                        )));
+                }
+            }
+            batch
+        };
 
     // 5. CAS Turn → Committing（持久化，在任何副作用之前）
     // P0-4：持久化失败必须中止——不能在 Committing 未落盘时继续写 Campaign
@@ -5629,15 +5718,30 @@ async fn commit_turn_attempt(
     let batch_for_store = batch.clone();
     // 远记忆索引在 commit 成功后用；先 clone，避免 batch 被 spawn 吃掉
     let batch_for_index = batch.clone();
-    update_turn_record(&turn_id, |record| {
-        record.status = storyforge_domain::turn::TurnStatus::Committing;
-        if let Some(att) = record.find_attempt_mut(&attempt_id) {
-            att.status = storyforge_domain::turn::AttemptStatus::Committing;
-            att.pending_state_changes = Some(batch_for_store);
-        }
-        record.touch();
-    })
+    let cas_ok = update_turn_record_if(
+        &turn_id,
+        |record| {
+            record.status == storyforge_domain::turn::TurnStatus::AwaitingAcceptance
+                && record.find_attempt(&attempt_id).is_some_and(|a| {
+                    a.status == storyforge_domain::turn::AttemptStatus::AwaitingAcceptance
+                })
+        },
+        |record| {
+            record.status = storyforge_domain::turn::TurnStatus::Committing;
+            if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                att.status = storyforge_domain::turn::AttemptStatus::Committing;
+                att.pending_state_changes = Some(batch_for_store);
+            }
+            record.touch();
+        },
+    )
     .map_err(TauriCommandError::internal)?;
+    if !cas_ok {
+        return Err(TauriCommandError::validation(
+            "Turn 状态已变化，无法进入 Committing（可能已被并发 accept 或 postprocess 未完成）"
+                .to_string(),
+        ));
+    }
 
     // 6. 执行 TurnCommit（FinalizeVariant + apply_mutation_batch）
     // P0-6：全局提交锁序列化 TurnCommit / MetaCommit
@@ -15471,6 +15575,7 @@ mod tests {
                     severity: QualitySeverity::Warning,
                 }],
             }),
+            pending_temporary_instances: vec![],
             provenance: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         });

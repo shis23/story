@@ -199,6 +199,8 @@ pub enum Mutation {
     UpsertSummary(Box<crate::agent::RoundSummary>),
     /// 将 AI 草稿 Draft → Final
     FinalizeVariant { variant_id: Id },
+    /// upsert 临时角色实例（accept 时才落盘；Discard 不写 Campaign）
+    UpsertInstance(Box<crate::campaign::CharacterInstance>),
 }
 
 /// 知识 mutation 的完整载荷（对应 `CharacterKnowledgeEntry`，预分配 ID）。
@@ -308,6 +310,9 @@ pub struct TurnAttempt {
     /// DraftQualityGate 报告（warn-only；持久化供 accept 前复查/UI）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_report: Option<QualityReport>,
+    /// 本 Attempt 生成过程中创建的临时角色（仅 accept 时经 Mutation 落盘）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_temporary_instances: Vec<crate::campaign::CharacterInstance>,
     /// 溯源信息（用于部分重 roll）
     pub provenance: Option<Provenance>,
     pub created_at: String,
@@ -640,6 +645,7 @@ mod tests {
             pending_state_changes: None,
             derivation: None,
             quality_report: None,
+            pending_temporary_instances: vec![],
             provenance: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         });
@@ -668,6 +674,7 @@ mod tests {
             pending_state_changes: None,
             derivation: None,
             quality_report: None,
+            pending_temporary_instances: vec![],
             provenance: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         });
@@ -679,6 +686,7 @@ mod tests {
             pending_state_changes: None,
             derivation: None,
             quality_report: None,
+            pending_temporary_instances: vec![],
             provenance: None,
             created_at: "2026-01-01T00:01:00Z".into(),
         });

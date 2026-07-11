@@ -203,6 +203,30 @@ impl CampaignMutationCoordinator {
                 // TurnCoordinator.commit 会单独调 conv_store.accept_variant
                 Ok(())
             }
+
+            Mutation::UpsertInstance(instance) => {
+                // accept 时落盘临时角色；幂等：同 id 已存在则 skip，同名不同 id 冲突报错
+                let existing = store.list_instances(campaign_id);
+                if existing.iter().any(|i| i.id == instance.id) {
+                    return Ok(());
+                }
+                if existing.iter().any(|i| i.name == instance.name) {
+                    return Err(CommitError::MutationConflict(format!(
+                        "临时 instance '{}' 与已有同名角色冲突",
+                        instance.name
+                    )));
+                }
+                if instance.campaign_id != *campaign_id {
+                    return Err(CommitError::Storage(format!(
+                        "UpsertInstance campaign 不匹配: instance={}, expected={}",
+                        instance.campaign_id, campaign_id
+                    )));
+                }
+                store
+                    .add_instance((**instance).clone())
+                    .map_err(CommitError::Storage)?;
+                Ok(())
+            }
         }
     }
 
@@ -406,6 +430,36 @@ mod tests {
             &batch,
         );
         assert!(matches!(result, Err(CommitError::CampaignNotFound(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_upsert_instance_idempotent() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = Id::from_str("camp-temp");
+        let mut camp =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "temp camp");
+        camp.id = campaign_id.clone();
+        store.save_campaign(camp).unwrap();
+
+        let mut inst = storyforge_domain::campaign::CharacterInstance::temporary(
+            campaign_id.clone(),
+            "GhostTemp",
+        );
+        inst.id = Id::from_str("temp-1");
+        let batch = MutationBatch {
+            commit_id: Id::from_str("commit-temp"),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::UpsertInstance(Box::new(inst.clone()))],
+        };
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        assert_eq!(store.list_instances(&campaign_id).len(), 1);
+        // 同 id 重放不重复
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        assert_eq!(store.list_instances(&campaign_id).len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

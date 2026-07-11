@@ -283,6 +283,9 @@ pub enum PipelineEvent {
     QualityChecked {
         passed: bool,
         warning_count: usize,
+        /// Error 级问题数（与 warning 区分；旧事件缺省 0）
+        #[serde(default)]
+        error_count: usize,
         /// 警告摘要（message 列表，便于前端展示；无则空）
         #[serde(default)]
         warnings: Vec<String>,

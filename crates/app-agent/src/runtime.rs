@@ -17,7 +17,7 @@ use storyforge_domain::llm::{
     ChatMessage, ChatRequest, ChatResponse, LlmError, SamplingParams, StreamChunk, ToolCall,
     ToolSpec,
 };
-use storyforge_domain::message_layout::{fingerprint_messages, MessageLayout};
+use storyforge_domain::message_layout::{MessageLayout, fingerprint_messages};
 use storyforge_infra_llm::LlmClient;
 
 use crate::tools::{ToolContext, ToolRegistry};
@@ -25,7 +25,11 @@ use crate::tools::{ToolContext, ToolRegistry};
 /// A2：记录 hook 后最终请求指纹（不落全文）与供应商 cache usage。
 fn log_request_observability(role: &AgentRole, round: u32, messages: &[ChatMessage], tag: &str) {
     let fp = fingerprint_messages(messages);
-    let fp_short = if fp.len() >= 16 { &fp[..16] } else { fp.as_str() };
+    let fp_short = if fp.len() >= 16 {
+        &fp[..16]
+    } else {
+        fp.as_str()
+    };
     debug!(
         target: "app-agent",
         "{role}{tag}: round={round} request_fp={fp_short} msgs={}",
