@@ -296,20 +296,11 @@ impl Conversation {
     }
 
     /// 获取最近 N 条消息的文本（用于上下文窗口）
+    ///
+    /// 与 `recent_messages_as_chat` 使用同一 history-epoch 截断策略。
     pub fn recent_messages(&self, n: usize) -> Vec<String> {
-        self.nodes
-            .iter()
-            .rev()
-            .take(n)
-            .rev()
-            .filter_map(|node| {
-                let v = node.active()?;
-                if v.status == VariantStatus::Discarded || v.content.is_empty() {
-                    None
-                } else {
-                    Some(v.content.clone())
-                }
-            })
+        self.iter_recent_active(n, None)
+            .map(|v| v.content.clone())
             .collect()
     }
 
@@ -334,6 +325,9 @@ impl Conversation {
     /// 每条消息的 role 映射为 `ChatRole::User/Assistant`，content 不加「用户:」前缀。
     /// 这样历史能作为独立消息段进 LLM（而非塞进 user tail 文本），保证 system+history 前缀稳定，cache 命中。
     ///
+    /// 截断策略见 `select_history_window`：**history epoch**——先 append 增长，
+    /// 超过窗口后按整块 epoch 前移，避免每轮只丢 1 条导致前缀全面失配。
+    ///
     /// `before_node_id`：如果指定，只返回该节点之前的消息（regenerate 重 roll 时排除目标节点及之后）
     pub fn recent_messages_as_chat(
         &self,
@@ -356,10 +350,10 @@ impl Conversation {
             .collect()
     }
 
-    /// 共享迭代器：返回最近 N 条「活跃且非空非 Discarded」的变体（按时间正序）
+    /// 共享迭代器：返回 history-epoch 窗口内「活跃且非空非 Discarded」的变体（按时间正序）
     ///
     /// `recent_messages_with_role` 和 `recent_messages_as_chat` 都复用此逻辑，
-    /// 保证过滤规则（Discarded/空跳过）和截断规则（before_node_id）一致。
+    /// 保证过滤规则（Discarded/空跳过）和截断规则（before_node_id / epoch）一致。
     fn iter_recent_active(
         &self,
         n: usize,
@@ -374,14 +368,13 @@ impl Conversation {
         } else {
             self.nodes.len()
         };
-        // rev → take(n) → rev：取最近 N 条但保持正序
-        self.nodes[..end_idx]
+        let active: Vec<&MessageVariant> = self.nodes[..end_idx]
             .iter()
-            .rev()
-            .take(n)
-            .rev()
             .filter_map(|node| node.active())
             .filter(|v| v.status != VariantStatus::Discarded && !v.content.is_empty())
+            .collect();
+        let window = select_history_window(active.len(), n, default_history_epoch(n));
+        active.into_iter().skip(window.start).take(window.len)
     }
 
     /// 查找节点
@@ -393,6 +386,56 @@ impl Conversation {
     pub fn find_node_mut(&mut self, id: &Id) -> Option<&mut MessageNode> {
         self.nodes.iter_mut().find(|n| &n.id == id)
     }
+}
+
+/// history 窗口切片（相对 active 消息序列的索引区间）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryWindow {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl HistoryWindow {
+    pub fn end(&self) -> usize {
+        self.start + self.len
+    }
+}
+
+/// 默认 epoch：窗口的一半（至少 1），保证超窗后整块前移而不是每轮丢 1 条。
+pub fn default_history_epoch(window_size: usize) -> usize {
+    (window_size / 2).max(1)
+}
+
+/// 选择稳定的 history epoch 窗口。
+///
+/// 规则：
+/// 1. `total <= window_size`：返回 `[0, total)`，前缀随 append 单调增长。
+/// 2. `total > window_size`：按 epoch **整块**丢弃前缀  
+///    `start = ceil(overflow / epoch) * epoch`，  
+///    再取其后最多 `window_size` 条。同一 epoch 内多轮共享相同起点，前缀稳定。
+///
+/// 例：window=4, epoch=2  
+/// total 1..4 → start=0；total 5..6 → start=2；total 7..8 → start=4。
+///
+/// 对比纯滑动窗口（start = total - window）：total 5→1、total 6→2，每轮起点都变，cache 前缀全失配。
+pub fn select_history_window(total: usize, window_size: usize, epoch: usize) -> HistoryWindow {
+    if total == 0 || window_size == 0 {
+        return HistoryWindow { start: 0, len: 0 };
+    }
+    if total <= window_size {
+        return HistoryWindow {
+            start: 0,
+            len: total,
+        };
+    }
+    let epoch = epoch.max(1);
+    let overflow = total - window_size;
+    // ceil(overflow / epoch) * epoch
+    let start = overflow.div_ceil(epoch) * epoch;
+    // 防御：起点不超过 total
+    let start = start.min(total.saturating_sub(1));
+    let len = (total - start).min(window_size);
+    HistoryWindow { start, len }
 }
 
 #[cfg(test)]
@@ -508,11 +551,105 @@ mod tests {
             node("n3", variant(Role::User, "u2", VariantStatus::Final)),
             node("n4", variant(Role::Assistant, "a2", VariantStatus::Final)),
         ]);
-        // 只取最近 2 条，且保持正序
+        // window=2, epoch=1：overflow=2 → start=2 → [u2,a2]
         let msgs = c.recent_messages_as_chat(2, None);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "u2");
         assert_eq!(msgs[1].content, "a2");
+    }
+
+    #[test]
+    fn test_select_history_window_grows_then_epoch_shifts() {
+        // window=4, epoch=2
+        assert_eq!(
+            select_history_window(3, 4, 2),
+            HistoryWindow { start: 0, len: 3 }
+        );
+        assert_eq!(
+            select_history_window(4, 4, 2),
+            HistoryWindow { start: 0, len: 4 }
+        );
+        // total 5/6 同属一个 epoch：start=2
+        assert_eq!(
+            select_history_window(5, 4, 2),
+            HistoryWindow { start: 2, len: 3 }
+        );
+        assert_eq!(
+            select_history_window(6, 4, 2),
+            HistoryWindow { start: 2, len: 4 }
+        );
+        // total 7/8：start=4
+        assert_eq!(
+            select_history_window(7, 4, 2),
+            HistoryWindow { start: 4, len: 3 }
+        );
+        assert_eq!(
+            select_history_window(8, 4, 2),
+            HistoryWindow { start: 4, len: 4 }
+        );
+    }
+
+    #[test]
+    fn test_history_epoch_prefix_stable_within_epoch() {
+        // 6 条 active：u1 a1 u2 a2 u3 a3
+        // window=4, epoch=2 → start=2 → [u2,a2,u3,a3]
+        let mut nodes = vec![
+            node("n1", variant(Role::User, "u1", VariantStatus::Final)),
+            node("n2", variant(Role::Assistant, "a1", VariantStatus::Final)),
+            node("n3", variant(Role::User, "u2", VariantStatus::Final)),
+            node("n4", variant(Role::Assistant, "a2", VariantStatus::Final)),
+            node("n5", variant(Role::User, "u3", VariantStatus::Final)),
+            node("n6", variant(Role::Assistant, "a3", VariantStatus::Final)),
+        ];
+        let c6 = conv(nodes.clone());
+        let w = 4;
+        let msgs6 = c6.recent_messages_as_chat(w, None);
+        assert_eq!(
+            msgs6.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["u2", "a2", "u3", "a3"]
+        );
+
+        // total=5 时 start 也应为 2（与 total=6 共享起点）
+        let c5 = conv(nodes[..5].to_vec());
+        let msgs5 = c5.recent_messages_as_chat(w, None);
+        assert_eq!(msgs5[0].content, "u2");
+        assert_eq!(msgs5[0].content, msgs6[0].content);
+        // total=5 窗口内容是 [u2,a2,u3]；total=6 在其后 append a3
+        assert_eq!(msgs5.len(), 3);
+        assert_eq!(
+            msgs6[..3]
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            msgs5.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
+        );
+
+        // epoch 切换：total=7 → start=4 → [u3,a3,u4]
+        nodes.push(node("n7", variant(Role::User, "u4", VariantStatus::Final)));
+        let c7 = conv(nodes);
+        let msgs7 = c7.recent_messages_as_chat(w, None);
+        assert_eq!(msgs7[0].content, "u3");
+        assert_ne!(msgs7[0].content, msgs6[0].content);
+    }
+
+    #[test]
+    fn test_sliding_window_would_break_prefix_but_epoch_keeps_it() {
+        // 对比：纯滑动窗口 total=5/6 时起点会变（1→2），epoch 策略起点都是 2。
+        let pure_slide_start_5 = 5usize.saturating_sub(4); // 1
+        let pure_slide_start_6 = 6usize.saturating_sub(4); // 2
+        assert_ne!(pure_slide_start_5, pure_slide_start_6);
+
+        let e5 = select_history_window(5, 4, 2).start;
+        let e6 = select_history_window(6, 4, 2).start;
+        assert_eq!(e5, e6);
+        assert_eq!(e5, 2);
+    }
+
+    #[test]
+    fn test_default_history_epoch_is_half_window() {
+        assert_eq!(default_history_epoch(20), 10);
+        assert_eq!(default_history_epoch(1), 1);
+        assert_eq!(default_history_epoch(0), 1);
     }
 
     #[test]
