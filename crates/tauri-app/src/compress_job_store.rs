@@ -185,6 +185,27 @@ impl CompressJobStore {
         Ok((job, true))
     }
 
+    /// 原子领取：仅 `Pending → Running` 成功。已 Running/终态返回 Ok(false)。
+    ///
+    /// 防止同一 open job 被多个 worker 重复消费。
+    pub fn try_claim_pending(&self, job_id: &Id) -> Result<bool, String> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
+            return Err(format!("compress job {job_id} not found"));
+        };
+        if j.status != CompressJobStatus::Pending {
+            return Ok(false);
+        }
+        j.status = CompressJobStatus::Running;
+        j.attempts = j.attempts.saturating_add(1);
+        j.last_error = None;
+        j.updated_at = now_iso();
+        persist(&self.path, &jobs)?;
+        Ok(true)
+    }
+
+    /// 兼容测试路径：无条件标 Running（会增加 attempts）。生产 worker 请用 `try_claim_pending`。
+    #[cfg(test)]
     pub fn mark_running(&self, job_id: &Id) -> Result<(), String> {
         self.update_job(job_id, |j| {
             j.status = CompressJobStatus::Running;
@@ -212,11 +233,7 @@ impl CompressJobStore {
         })
     }
 
-    fn update_job(
-        &self,
-        job_id: &Id,
-        f: impl FnOnce(&mut CompressJob),
-    ) -> Result<(), String> {
+    fn update_job(&self, job_id: &Id, f: impl FnOnce(&mut CompressJob)) -> Result<(), String> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
         let Some(j) = jobs.iter_mut().find(|j| &j.id == job_id) else {
             return Err(format!("compress job {job_id} not found"));
@@ -232,10 +249,8 @@ mod tests {
     use super::*;
 
     fn temp_store() -> (PathBuf, CompressJobStore) {
-        let dir = std::env::temp_dir().join(format!(
-            "storyforge-compress-jobs-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("storyforge-compress-jobs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         (dir.clone(), CompressJobStore::new(&dir))
     }
@@ -265,22 +280,13 @@ mod tests {
             .enqueue_or_get_open(&camp, None, None, 200, 0)
             .unwrap();
         store.mark_running(&job.id).unwrap();
-        assert_eq!(
-            store.list_all()[0].status,
-            CompressJobStatus::Running
-        );
+        assert_eq!(store.list_all()[0].status, CompressJobStatus::Running);
         assert_eq!(store.reset_running_to_pending(), 1);
-        assert_eq!(
-            store.list_all()[0].status,
-            CompressJobStatus::Pending
-        );
+        assert_eq!(store.list_all()[0].status, CompressJobStatus::Pending);
         // reload from disk
         let reloaded = CompressJobStore::new(&dir);
         assert_eq!(reloaded.list_open().len(), 1);
-        assert_eq!(
-            reloaded.list_all()[0].status,
-            CompressJobStatus::Pending
-        );
+        assert_eq!(reloaded.list_all()[0].status, CompressJobStatus::Pending);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -296,7 +302,11 @@ mod tests {
             store.mark_running(&job.id).unwrap();
             store.mark_failed_or_retry(&job.id, "boom").unwrap();
         }
-        let j = store.list_all().into_iter().find(|j| j.id == job.id).unwrap();
+        let j = store
+            .list_all()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .unwrap();
         assert_eq!(j.status, CompressJobStatus::Failed);
         assert_eq!(j.attempts, DEFAULT_COMPRESS_JOB_MAX_ATTEMPTS);
         assert!(j.last_error.as_deref() == Some("boom"));
@@ -312,6 +322,32 @@ mod tests {
         store.mark_running(&job.id).unwrap();
         store.mark_succeeded(&job.id).unwrap();
         assert!(store.list_open().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn try_claim_pending_only_once() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store
+            .enqueue_or_get_open(&camp, None, None, 200, 0)
+            .unwrap();
+        assert!(store.try_claim_pending(&job.id).unwrap());
+        assert!(!store.try_claim_pending(&job.id).unwrap());
+        assert_eq!(store.list_all()[0].status, CompressJobStatus::Running);
+        assert_eq!(store.list_all()[0].attempts, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn try_claim_rejects_non_pending() {
+        let (dir, store) = temp_store();
+        let camp = Id::from_str("c1");
+        let (job, _) = store
+            .enqueue_or_get_open(&camp, None, None, 200, 0)
+            .unwrap();
+        store.mark_succeeded(&job.id).unwrap();
+        assert!(!store.try_claim_pending(&job.id).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

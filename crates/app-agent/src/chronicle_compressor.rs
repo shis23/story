@@ -13,18 +13,19 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::chronicle::{
-    next_code_seq, plan_compress_batch_for_uncovered, publish_compress_batch, ChronicleCode,
-    ChronicleLevel, CompressGroup, CompressGroupText, CompressPublishResult, DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
-    DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD, DEFAULT_COMPRESS_GROUP_SIZE,
+    ChronicleCode, ChronicleLevel, CompressGroup, CompressGroupText, CompressPublishResult,
+    DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD, DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
+    DEFAULT_COMPRESS_GROUP_SIZE, next_code_seq, plan_compress_batch_for_uncovered,
+    publish_compress_batch,
 };
 use storyforge_domain::llm::ChatResponse;
 
+use crate::AgentError;
 use crate::prompts::chronicle_compressor::{
     build_chronicle_compressor_user_msg, make_chronicle_compressor_config,
 };
 use crate::runtime::AgentRuntime;
 use crate::tools::ToolRegistry;
-use crate::AgentError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChronicleCompressorError {
@@ -73,14 +74,15 @@ pub fn plan_level_batch(
 }
 
 /// 解析 LLM JSON 数组 → CompressGroupText 列表。
-pub fn parse_compress_group_texts(raw: &str, expected_len: usize) -> Result<Vec<CompressGroupText>, ChronicleCompressorError> {
+pub fn parse_compress_group_texts(
+    raw: &str,
+    expected_len: usize,
+) -> Result<Vec<CompressGroupText>, ChronicleCompressorError> {
     let trimmed = raw.trim();
-    let json_str = extract_json_array(trimmed).ok_or_else(|| {
-        ChronicleCompressorError::Parse("未找到 JSON 数组".into())
-    })?;
-    let value: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-        ChronicleCompressorError::Parse(format!("JSON 解析: {e}"))
-    })?;
+    let json_str = extract_json_array(trimmed)
+        .ok_or_else(|| ChronicleCompressorError::Parse("未找到 JSON 数组".into()))?;
+    let value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| ChronicleCompressorError::Parse(format!("JSON 解析: {e}")))?;
     let arr = value
         .as_array()
         .ok_or_else(|| ChronicleCompressorError::Parse("根不是数组".into()))?;
@@ -257,8 +259,7 @@ pub async fn compress_groups_with_llm(
         .collect();
 
     let config = make_chronicle_compressor_config(agent_profile_config);
-    let user_msg =
-        build_chronicle_compressor_user_msg(output_level, groups, &members_per_group);
+    let user_msg = build_chronicle_compressor_user_msg(output_level, groups, &members_per_group);
     let registry = ToolRegistry::new();
     info!(
         target: "chronicle_compressor",
@@ -318,9 +319,12 @@ pub async fn run_compress_if_needed(
     let b_th = b_threshold.unwrap_or(DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD);
     let mut outcomes = Vec::new();
 
-    if let Some((ids, spans, groups)) =
-        plan_level_batch(&entries, ChronicleLevel::A, a_th, DEFAULT_COMPRESS_GROUP_SIZE)?
-    {
+    if let Some((ids, spans, groups)) = plan_level_batch(
+        &entries,
+        ChronicleLevel::A,
+        a_th,
+        DEFAULT_COMPRESS_GROUP_SIZE,
+    )? {
         let out = compress_groups_with_llm(
             runtime,
             campaign_id,
@@ -340,9 +344,12 @@ pub async fn run_compress_if_needed(
         outcomes.push(out);
     }
 
-    if let Some((ids, spans, groups)) =
-        plan_level_batch(&entries, ChronicleLevel::B, b_th, DEFAULT_COMPRESS_GROUP_SIZE)?
-    {
+    if let Some((ids, spans, groups)) = plan_level_batch(
+        &entries,
+        ChronicleLevel::B,
+        b_th,
+        DEFAULT_COMPRESS_GROUP_SIZE,
+    )? {
         let out = compress_groups_with_llm(
             runtime,
             campaign_id,
@@ -382,8 +389,8 @@ mod tests {
     use storyforge_infra_llm::LlmClient;
     use storyforge_infra_llm::mock_client::MockLlmClient;
 
-    use crate::tools::ToolContext;
     use crate::AgentRuntime;
+    use crate::tools::ToolContext;
 
     fn leaf(turn: u32) -> RoundSummary {
         RoundSummary::new(
@@ -408,10 +415,9 @@ mod tests {
     #[test]
     fn deterministic_publish_a_to_b() {
         let entries: Vec<_> = (1..=4).map(leaf).collect();
-        let (ids, spans, groups) =
-            plan_level_batch(&entries, ChronicleLevel::A, 4, 2)
-                .unwrap()
-                .expect("plan");
+        let (ids, spans, groups) = plan_level_batch(&entries, ChronicleLevel::A, 4, 2)
+            .unwrap()
+            .expect("plan");
         let out = publish_with_deterministic_texts(
             &Id::from_str("c"),
             &Id::from_str("lin"),
@@ -425,7 +431,13 @@ mod tests {
         .unwrap();
         assert_eq!(out.parent_summaries.len(), 2);
         assert_eq!(out.parent_summaries[0].level, 1);
-        assert!(out.parent_summaries[0].code.as_deref().unwrap().starts_with('B'));
+        assert!(
+            out.parent_summaries[0]
+                .code
+                .as_deref()
+                .unwrap()
+                .starts_with('B')
+        );
         assert_eq!(out.publish.child_covered_by.len(), 4);
     }
 

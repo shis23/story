@@ -144,6 +144,8 @@ pub struct WritingContext {
     /// 也同步到 ToolContext.archived_summaries 供 get_recent_summary 使用。
     /// load-side last-K + inject budgets 已落地；完整 token budget / 段 volatility 仍可后续扩展。
     pub recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    /// 渲染冻结 overview/band 的完整 catalog（可含远 A/B/C；不受 last-K 截断）。
+    pub chronicle_prompt_catalog: Vec<storyforge_domain::agent::RoundSummary>,
     /// 远记忆自动召回命中（带 id/score 溯源）。
     /// 由 Tauri 层在 start_writing 时按意图检索后填入；无向量库/无命中则为空。
     pub far_memory_hits: Vec<FarMemoryHit>,
@@ -354,6 +356,87 @@ pub fn chronicle_partition_for_context(
     }
 }
 
+/// 将对话 history 收敛到 near_raw turns（若已知）。
+///
+/// 规格：history 中正文应对齐 `near_raw_turns`，避免与 overview/band 重叠的旧正文仍占窗。
+/// 启发式：保留 checkpoint/非对话前缀；对话 user/assistant 对按出现顺序映射到 turn 序列后过滤。
+/// 若 near_turns 为空则原样返回。
+pub fn filter_history_to_near_raw_turns(
+    history: Vec<storyforge_domain::llm::ChatMessage>,
+    near_turns: &[u32],
+) -> Vec<storyforge_domain::llm::ChatMessage> {
+    use storyforge_domain::llm::{ChatMessage, ChatRole};
+    if near_turns.is_empty() || history.is_empty() {
+        return history;
+    }
+    let near: std::collections::HashSet<u32> = near_turns.iter().copied().collect();
+
+    let mut prefix = Vec::new();
+    let mut rest = Vec::new();
+    for m in history {
+        let is_special_prefix = matches!(m.role, ChatRole::User)
+            && (m.content.starts_with("【历史纪要】")
+                || m.content.starts_with("【事件概览】")
+                || m.content.starts_with("【中距纪要带】")
+                || m.content.starts_with("【事件概览")
+                || m.content.starts_with("【中距纪要"));
+        if rest.is_empty() && is_special_prefix {
+            prefix.push(m);
+        } else {
+            rest.push(m);
+        }
+    }
+
+    let mut pairs: Vec<Vec<ChatMessage>> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if matches!(rest[i].role, ChatRole::User) {
+            let mut pair = vec![rest[i].clone()];
+            if i + 1 < rest.len() && matches!(rest[i + 1].role, ChatRole::Assistant) {
+                pair.push(rest[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            pairs.push(pair);
+        } else if let Some(last) = pairs.last_mut() {
+            last.push(rest[i].clone());
+            i += 1;
+        } else {
+            pairs.push(vec![rest[i].clone()]);
+            i += 1;
+        }
+    }
+    if pairs.is_empty() {
+        prefix.extend(rest);
+        return prefix;
+    }
+
+    let mut sorted_near = near_turns.to_vec();
+    sorted_near.sort_unstable();
+    sorted_near.dedup();
+    let keep_from = pairs.len().saturating_sub(sorted_near.len());
+    let mut kept = prefix;
+    let mut kept_any_pair = false;
+    for (idx, pair) in pairs.into_iter().enumerate() {
+        if idx < keep_from {
+            continue;
+        }
+        let turn_idx = idx - keep_from;
+        let keep = turn_idx >= sorted_near.len()
+            || (turn_idx < sorted_near.len() && near.contains(&sorted_near[turn_idx]));
+        if keep {
+            kept.extend(pair);
+            kept_any_pair = true;
+        }
+    }
+    if !kept_any_pair {
+        // fail-open：过滤异常时保留前缀 + 全部 rest
+        kept.extend(rest);
+    }
+    kept
+}
+
 pub fn prepend_chronicle_history_prefix(
     history: Vec<storyforge_domain::llm::ChatMessage>,
     part: &ChroniclePromptPartition,
@@ -431,6 +514,7 @@ impl WritingContext {
             campaign_runtime: None,
             agent_profile_config: None,
             recent_summaries: vec![],
+            chronicle_prompt_catalog: vec![],
             far_memory_hits: vec![],
             template_random_seed: None,
             context_epoch: None,
@@ -641,10 +725,13 @@ impl PipelineOrchestrator {
             );
         }
         // M2：概览 + 纪要带进 history 前缀；近窗摘要从 tail 剔除（硬去重）
-        let chronicle_part = chronicle_partition_for_context(
-            &ctx.recent_summaries,
-            ctx.context_epoch.as_ref(),
-        );
+        let chronicle_src = if ctx.chronicle_prompt_catalog.is_empty() {
+            &ctx.recent_summaries
+        } else {
+            &ctx.chronicle_prompt_catalog
+        };
+        let chronicle_part =
+            chronicle_partition_for_context(chronicle_src, ctx.context_epoch.as_ref());
         tracing::debug!(
             target: "context_compiler",
             overview = chronicle_part.overview_lines.len(),
@@ -653,6 +740,7 @@ impl PipelineOrchestrator {
             "Director chronicle history prefix"
         );
         let history = prepend_chronicle_history_prefix(history, &chronicle_part);
+        let history = filter_history_to_near_raw_turns(history, &chronicle_part.near_turns);
         let director_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(director_config.system_prompt.clone())
             .history(history)
@@ -1306,12 +1394,17 @@ impl PipelineOrchestrator {
                     "Director regenerate history epoch"
                 );
             }
-            let chronicle_part = chronicle_partition_for_context(
-                &ctx.recent_summaries,
-                ctx.context_epoch.as_ref(),
-            );
+            let chronicle_src = if ctx.chronicle_prompt_catalog.is_empty() {
+                &ctx.recent_summaries
+            } else {
+                &ctx.chronicle_prompt_catalog
+            };
+            let chronicle_part =
+                chronicle_partition_for_context(chronicle_src, ctx.context_epoch.as_ref());
             let director_history =
                 prepend_chronicle_history_prefix(director_history, &chronicle_part);
+            let director_history =
+                filter_history_to_near_raw_turns(director_history, &chronicle_part.near_turns);
             let director_layout = storyforge_domain::message_layout::MessageLayout::build()
                 .system(director_config.system_prompt.clone())
                 .history(director_history)
@@ -2306,10 +2399,7 @@ fn build_director_tail(
     }
 
     // M2：近窗/纪要带已进 history 时不再在 tail 双税；仅注入更远且未进前缀的摘要（兜底）
-    let part = chronicle_partition_for_context(
-        &ctx.recent_summaries,
-        ctx.context_epoch.as_ref(),
-    );
+    let part = chronicle_partition_for_context(&ctx.recent_summaries, ctx.context_epoch.as_ref());
     let mut exclude_turns = part.near_turns.clone();
     exclude_turns.extend(part.band_turns.iter().copied());
     let tail_summaries = filter_summaries_excluding_turns(&ctx.recent_summaries, &exclude_turns);
@@ -2977,7 +3067,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3084,7 +3176,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3171,7 +3265,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3467,7 +3563,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3732,7 +3830,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3824,7 +3924,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3906,7 +4008,9 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
-            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -5565,5 +5669,29 @@ mod tests {
         assert_eq!(vars.len(), 2, "应收集到 2 个变量");
         assert_eq!(vars.get("hp").unwrap(), &serde_json::json!(80));
         assert_eq!(vars.get("state").unwrap(), &serde_json::json!("calm"));
+    }
+
+    #[test]
+    fn filter_history_to_near_raw_turns_keeps_prefix_and_near() {
+        use storyforge_domain::llm::ChatMessage;
+        let history = vec![
+            ChatMessage::user(
+                "【事件概览】
+A0001 far",
+            ),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u3"),
+            ChatMessage::assistant("a3"),
+        ];
+        // near only turn 2 and 3 mapped to last two pairs
+        let filtered = filter_history_to_near_raw_turns(history, &[2, 3]);
+        let texts: Vec<_> = filtered.iter().map(|m| m.content.as_str()).collect();
+        assert!(texts[0].starts_with("【事件概览】"));
+        assert!(texts.contains(&"u2"));
+        assert!(texts.contains(&"u3"));
+        assert!(!texts.contains(&"u1"));
     }
 }

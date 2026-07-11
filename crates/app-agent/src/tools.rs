@@ -693,6 +693,23 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     2 => "chronicle_c",
                     _ => "chronicle_a",
                 };
+                // B/C：展开 covers 子条目的 turn 范围；A：单 turn
+                let source_turn_ids: Vec<u32> = if s.covers.is_empty() {
+                    vec![s.turn]
+                } else {
+                    let mut turns: Vec<u32> = ctx
+                        .chronicle_summaries
+                        .iter()
+                        .filter(|c| s.covers.iter().any(|id| id == &c.id))
+                        .flat_map(|c| [c.turn, c.effective_turn_end()])
+                        .collect();
+                    if turns.is_empty() {
+                        turns = vec![s.turn, s.effective_turn_end()];
+                    }
+                    turns.sort_unstable();
+                    turns.dedup();
+                    turns
+                };
                 Ok(serde_json::json!({
                     "found": true,
                     "code": s.code,
@@ -704,7 +721,7 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     "turn_span": [s.turn, s.effective_turn_end()],
                     "covers": s.covers.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                     "chronicle_entry_id": s.id.to_string(),
-                    "source_turn_ids": [s.turn],
+                    "source_turn_ids": source_turn_ids,
                     "source_kind": source_kind,
                     "covered_by": s.covered_by.as_ref().map(|id| id.to_string()),
                     "budget_used": used,
@@ -1344,8 +1361,10 @@ mod tests {
                     world_info: None,
                     vector_store: None,
                     archived_summaries: vec![],
-            chronicle_summaries: vec![],
-                    chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+                    chronicle_summaries: vec![],
+                    chronicle_tool_budget: std::sync::Arc::new(
+                        crate::tools::ChronicleToolBudget::new(),
+                    ),
                     campaign_runtime: None,
                     current_character_instance_id: None,
                     regex_scripts: vec![],
@@ -1432,10 +1451,9 @@ mod tests {
         assert_eq!(first, second);
     }
 
-
     fn sample_chronicle_catalog() -> Vec<storyforge_domain::agent::RoundSummary> {
-        use storyforge_domain::agent::RoundSummary;
         use storyforge_domain::Id;
+        use storyforge_domain::agent::RoundSummary;
         let camp = Id::from_str("c1");
         let conv = Id::from_str("v1");
         let a = RoundSummary::new(camp.clone(), conv.clone(), 1, "远楼A：旧日密约".into())
@@ -1524,7 +1542,10 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(matches!(err, Err(ToolError::BadArgs(_))), "over full budget: {err:?}");
+        assert!(
+            matches!(err, Err(ToolError::BadArgs(_))),
+            "over full budget: {err:?}"
+        );
         assert_eq!(
             budget.snapshot().2,
             storyforge_domain::chronicle::DEFAULT_TOOL_FULL_MAX
@@ -1567,5 +1588,4 @@ mod tests {
             .await;
         assert!(matches!(err, Err(ToolError::BadArgs(_))), "{err:?}");
     }
-
 }

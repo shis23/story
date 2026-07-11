@@ -235,7 +235,7 @@ async fn i1_adversarial_knowledge_boundary() {
         world_info: None,
         vector_store: None,
         archived_summaries: vec![],
-            chronicle_summaries: vec![],
+        chronicle_summaries: vec![],
         chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
         campaign_runtime: Some(runtime.clone()),
         current_character_instance_id: Some(lin_inst_id.clone()),

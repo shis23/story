@@ -53,8 +53,8 @@
 | M0 公式与类型 | **`crates/domain/src/chronicle.rs`**：身份、lineage、revision 规则、epoch 成员、`ContextEpochSnapshot`、`compile_history_blocks`、compress 分组/`covers` 校验、overview 选择；单测覆盖 |
 | epoch 快照接线 / 概览进 history | **已接线**：`Campaign.context_epoch` 持久化；`fill_campaign`/`start_writing`/`regenerate` 编译入口 `refresh_context_epoch`（满 E rollover + chronicle_revision bump）；Director history 前缀 + tail 硬去重 |
 | `search_chronicle` / `get_chronicle` | **已完成（可独立部分）**（Director；A/B/C 目录 + 每轮预算；数据源=RoundSummary 兼容视图） |
-| ChronicleCompressor 后台 | **已接线 + 可恢复队列**：`compress_jobs.json` 入队；Accept/启动重放；`run_compress_if_needed` + `publish_compress_result`；LLM 失败降级确定性文案；失败 Pending 重试至 max_attempts |
-| 正文与摘要硬隔离 | domain `turn_inject_mode` / `filter_summaries_excluding_turns` **已有**；主路径 **尚未**按 near_raw 窗强制过滤 |
+| ChronicleCompressor 后台 | **已接线 + 可恢复队列**：`try_claim_pending` 防双 worker；仅 `created` 时 spawn；`publish` 后 metadata heal；NothingToCompress 可补 epoch/revision；失败 Pending 待下次 Accept/启动再调度（非自动忙等循环） |
+| 正文与摘要硬隔离 | domain 过滤 + 主路径 `filter_history_to_near_raw_turns`（启发式按 near_turns 收敛对话对；前缀概览/纪要保留） |
 | QualityGate Accept | **Error 拦截**；`force_accept` → Turn **Degraded**；Warning 不拦 |
 | Campaign 版本 | `revision` + **`chronicle_revision`** + **`lineage_id`**（新建/fork 分配；Accept 新 A 时 bump chronicle_revision） |
 
@@ -501,12 +501,12 @@ compress_batch_id?
 | --- | --- | --- |
 | **M0** | 本规格公式与类型：Chronicle 身份、lineage 算法、revision 规则、epoch 成员公式、ContextEpochSnapshot 最小字段、Compiler 纯函数 IO；单测覆盖公式与分组校验 | **已完成**（`domain/chronicle.rs`） |
 | **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化）；向量 source_* 字段；**暂不改**主写作 prompt 布局 | **完成（可独立部分）**：字段 + code/headline/lineage 分配 + 索引 metadata；加载路径缺 lineage 回填落盘 |
-| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照持久化+rollover+history 前缀+硬去重；token 全局预算编译器仍可扩展 |
-| **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：A/B/C 目录检索；level 过滤；`turn_span`/`covers`/`source_kind`；每轮 search/summary/full 预算；工具目录宽于 inject 窗口（优先 B/C） |
-| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分）**：分组校验 + LLM/降级文案 + 落盘 + **持久化 job 队列/启动重放/max_attempts 重试** |
+| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
+| **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
+| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分）**：队列 claim + 禁止重复 spawn + publish/heal 元数据；Turn/epoch **只计 A**；完整跨崩溃 publication intent 日志可继续硬化 |
 | **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
 
-并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m3`（防漂移假稳定）。
+并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.1`（防漂移假稳定）。
 
 ---
 

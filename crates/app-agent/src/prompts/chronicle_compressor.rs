@@ -75,13 +75,7 @@ pub fn build_chronicle_compressor_user_msg(
         ));
         if let Some(members) = members_per_group.get(i) {
             for (j, (code, headline, summary)) in members.iter().enumerate() {
-                parts.push(format!(
-                    "{}. [{}] {}\n{}",
-                    j + 1,
-                    code,
-                    headline,
-                    summary
-                ));
+                parts.push(format!("{}. [{}] {}\n{}", j + 1, code, headline, summary));
             }
         }
         parts.push(String::new());

@@ -34,7 +34,7 @@ pub const DEFAULT_TOOL_FULL_MAX: u32 = 2;
 /// 每轮 search_chronicle 上限。
 pub const DEFAULT_SEARCH_MAX: u32 = 3;
 /// Compiler / snapshot 算法版本（防漂移假稳定）。
-pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m3";
+pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.1";
 
 // ─── 身份与层级 ────────────────────────────────────────────────────────────
 
@@ -206,11 +206,7 @@ pub fn new_lineage_id() -> Id {
 }
 
 /// 条目是否适用于当前分支（规格 §3.3）。
-pub fn entry_applies_to_lineage(
-    entry: &ChronicleEntry,
-    campaign_id: &Id,
-    lineage_id: &Id,
-) -> bool {
+pub fn entry_applies_to_lineage(entry: &ChronicleEntry, campaign_id: &Id, lineage_id: &Id) -> bool {
     entry.is_active_for(campaign_id, lineage_id)
 }
 
@@ -594,11 +590,8 @@ pub fn refresh_context_epoch(
             }
         }
         Some(prev) => {
-            let membership = compute_epoch_membership(
-                committed,
-                prev.source_head_turn_id.as_ref(),
-                params,
-            );
+            let membership =
+                compute_epoch_membership(committed, prev.source_head_turn_id.as_ref(), params);
             if membership.needs_rollover_before_next_compile {
                 let membership = rollover_epoch_head(committed, params);
                 let snapshot = build_context_epoch_snapshot(
@@ -652,8 +645,11 @@ pub fn build_context_epoch_snapshot(
                 .first()
                 .and_then(sequence_from_committed_turn_id)
         });
-    let overview_codes =
-        select_overview_codes(overview_candidates, band_earliest, params.overview_max_entries);
+    let overview_codes = select_overview_codes(
+        overview_candidates,
+        band_earliest,
+        params.overview_max_entries,
+    );
 
     let epoch_id = if let Some(prev) = previous {
         if prev.source_head_turn_id == membership.epoch_start_head
@@ -726,11 +722,7 @@ pub enum TurnInjectMode {
     FarEligible,
 }
 
-pub fn turn_inject_mode(
-    turn_id: &Id,
-    near_raw: &[Id],
-    band: &[Id],
-) -> TurnInjectMode {
+pub fn turn_inject_mode(turn_id: &Id, near_raw: &[Id], band: &[Id]) -> TurnInjectMode {
     if near_raw.iter().any(|id| id == turn_id) {
         TurnInjectMode::NearRawBodyOnly
     } else if band.iter().any(|id| id == turn_id) {
@@ -872,7 +864,10 @@ pub fn should_enqueue_compress(uncovered_active_count: usize, threshold: usize) 
 /// 统计 uncovered leaf（covered_by is None）数量。
 pub fn count_uncovered_active(covered_flags: impl IntoIterator<Item = bool>) -> usize {
     // true = covered (skip); false = uncovered
-    covered_flags.into_iter().filter(|covered| !*covered).count()
+    covered_flags
+        .into_iter()
+        .filter(|covered| !*covered)
+        .count()
 }
 
 /// 为未覆盖 A 规划压缩组（仅确定性切分；LLM 文案与发布在后台任务）。
@@ -993,7 +988,6 @@ pub fn next_code_seq(existing_codes: &[ChronicleCode], level: ChronicleLevel) ->
     max.saturating_add(1).max(1)
 }
 
-
 // ─── Compiler 纯函数 IO 草图 ───────────────────────────────────────────────
 
 /// 编译输入（不持有 LLM / IO）。
@@ -1027,9 +1021,15 @@ pub struct ContextCompileOutput {
 #[derive(Debug, Clone)]
 pub enum HistoryBlock {
     Checkpoint(String),
-    Overview { lines: Vec<String> },
-    Band { lines: Vec<String> },
-    NearRaw { messages: Vec<crate::llm::ChatMessage> },
+    Overview {
+        lines: Vec<String>,
+    },
+    Band {
+        lines: Vec<String>,
+    },
+    NearRaw {
+        messages: Vec<crate::llm::ChatMessage>,
+    },
 }
 
 /// 纯函数：由 snapshot + 正文材料生成 history 块（规格 §5 物理序）。
@@ -1408,7 +1408,10 @@ mod tests {
         let out = compile_history_blocks(&input);
         assert_eq!(out.history_blocks.len(), 4);
         assert!(matches!(out.history_blocks[0], HistoryBlock::Checkpoint(_)));
-        assert!(matches!(out.history_blocks[1], HistoryBlock::Overview { .. }));
+        assert!(matches!(
+            out.history_blocks[1],
+            HistoryBlock::Overview { .. }
+        ));
         assert!(matches!(out.history_blocks[2], HistoryBlock::Band { .. }));
         if let HistoryBlock::NearRaw { messages } = &out.history_blocks[3] {
             assert_eq!(messages.len(), 2);
@@ -1456,7 +1459,10 @@ mod tests {
         assert_eq!(pubr.child_covered_by.len(), 4);
         assert_eq!(pubr.child_covered_by[0].1, pubr.parents[0].id);
         assert_eq!(
-            next_code_seq(&[ChronicleCode::new(ChronicleLevel::B, 3)], ChronicleLevel::B),
+            next_code_seq(
+                &[ChronicleCode::new(ChronicleLevel::B, 3)],
+                ChronicleLevel::B
+            ),
             4
         );
     }
@@ -1465,9 +1471,11 @@ mod tests {
     fn plan_compress_batch_threshold() {
         let ids: Vec<Id> = (1..=8).map(|i| Id::from_str(format!("a{i}"))).collect();
         let spans: Vec<(u32, u32)> = (1..=8).map(|i| (i, i)).collect();
-        assert!(plan_compress_batch_for_uncovered(&ids, &spans, 200, 4)
-            .unwrap()
-            .is_none());
+        assert!(
+            plan_compress_batch_for_uncovered(&ids, &spans, 200, 4)
+                .unwrap()
+                .is_none()
+        );
         let groups = plan_compress_batch_for_uncovered(&ids, &spans, 8, 4)
             .unwrap()
             .expect("should plan");
@@ -1509,7 +1517,10 @@ mod tests {
         assert!(!r1.rolled_over);
         assert_eq!(r1.membership.live_suffix_count, 0);
         assert_eq!(r1.snapshot.source_head_turn_id, Some(committed_turn_id(3)));
-        assert_eq!(r1.membership.anchor_turn_ids, vec![committed_turn_id(2), committed_turn_id(3)]);
+        assert_eq!(
+            r1.membership.anchor_turn_ids,
+            vec![committed_turn_id(2), committed_turn_id(3)]
+        );
 
         // +1 turn → live_suffix=1, same epoch
         let c4 = committed_turns_from_count(4);
@@ -1521,14 +1532,7 @@ mod tests {
                 covered_by: None,
             })
             .collect();
-        let r2 = refresh_context_epoch(
-            Some(&r1.snapshot),
-            &c4,
-            &cands4,
-            &band_lookup,
-            params,
-            0,
-        );
+        let r2 = refresh_context_epoch(Some(&r1.snapshot), &c4, &cands4, &band_lookup, params, 0);
         assert!(!r2.created && !r2.rolled_over);
         assert_eq!(r2.membership.live_suffix_count, 1);
         assert_eq!(r2.snapshot.epoch_id, r1.snapshot.epoch_id);
@@ -1545,14 +1549,7 @@ mod tests {
                 covered_by: None,
             })
             .collect();
-        let r3 = refresh_context_epoch(
-            Some(&r2.snapshot),
-            &c5,
-            &cands5,
-            &band_lookup,
-            params,
-            1,
-        );
+        let r3 = refresh_context_epoch(Some(&r2.snapshot), &c5, &cands5, &band_lookup, params, 1);
         // live_suffix would be 2 (>=E) → rolled over
         assert!(r3.rolled_over);
         assert_eq!(r3.snapshot.source_head_turn_id, Some(committed_turn_id(5)));
