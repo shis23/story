@@ -4,6 +4,7 @@ pub mod campaign;
 pub mod campaign_runtime;
 pub mod character;
 pub mod character_knowledge;
+pub mod chronicle;
 pub mod conversation;
 pub mod llm;
 pub mod message_layout;

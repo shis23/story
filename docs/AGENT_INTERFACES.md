@@ -46,12 +46,12 @@ User Intent
 - `search_vectors(query, top_k)`
 - `get_recent_summary(limit)`
 
-目标记忆工具（规格 v1.0；与自动召回并存）：
+目标记忆工具（规格 v1.0；**M3 最小版已接 A**，与自动召回并存）：
 
-- `search_chronicle(query, …)` — **仅搜 Chronicle A/B/C**；返回短目录行（code + headline），不返回 full；**不含** ArchivedSummary
-- `get_chronicle(code|id, detail=summary|full)` — **默认 summary**；full 可选、次数更严；带来源字段，免责声明在 system 契约
+- `search_chronicle(query, …)` — 当前搜 **Chronicle A**（RoundSummary 兼容视图）；返回短目录行（code + headline），不返回 full；**不含** ArchivedSummary；B/C 待压缩层
+- `get_chronicle(code|id, detail=summary|full)` — **默认 summary**；full 可选；带来源字段
 
-装配：`H_anchor` 锚点 + epoch 内追加至最多 `H_anchor+E` 轮正文 / 纪要带 S / 远概览（行数∩token）/ epoch 快照冻结 / 确定性分组批压。详见：
+装配进度：**M0** 公式/类型 + **M1** RoundSummary `code`/`headline` + **M3 工具最小** 已落地；**M2** 主路径（概览/纪要带进 history、epoch 快照）待接线。目标：`H_anchor`+`E` 近正文 / 纪要带 S / 远概览 / 确定性分组批压。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 

@@ -39,6 +39,13 @@ pub struct Campaign {
     /// 用于检测"本轮基于的 Campaign revision 是否已被外部推进"。
     #[serde(default)]
     pub revision: u64,
+    /// 记忆表示版本（Chronicle Accept / epoch rollover / 压缩发布等递增；与 revision 独立）。
+    /// 旧 JSON 缺省为 0。
+    #[serde(default)]
+    pub chronicle_revision: u64,
+    /// 当前写作记忆线（规格 lineage_id）；缺省 None → 运行时用 conversation 主线生成/回填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_id: Option<Id>,
 }
 
 fn default_story_clock() -> String {
@@ -61,6 +68,8 @@ impl Campaign {
             conversation_id: None,
             story_clock: default_story_clock(),
             revision: 0,
+            chronicle_revision: 0,
+            lineage_id: Some(Id::new()),
         }
     }
 
@@ -84,7 +93,22 @@ impl Campaign {
             conversation_id: None,
             story_clock: default_story_clock(),
             revision: 0,
+            // fork：新记忆线（规格：fork_at → new lineage_id）
+            chronicle_revision: 0,
+            lineage_id: Some(Id::new()),
         }
+    }
+
+    /// 确保有 lineage_id（旧存档迁移：惰性分配并返回是否新建）。
+    pub fn ensure_lineage_id(&mut self) -> &Id {
+        if self.lineage_id.is_none() {
+            self.lineage_id = Some(Id::new());
+        }
+        self.lineage_id.as_ref().expect("just set")
+    }
+
+    pub fn bump_chronicle_revision(&mut self) {
+        self.chronicle_revision = self.chronicle_revision.saturating_add(1);
     }
 
     pub fn get_variable(&self, key: &str) -> Option<&serde_json::Value> {

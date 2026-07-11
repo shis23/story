@@ -2192,6 +2192,9 @@ fn summaries_overlap(a: &str, b: &str) -> bool {
 ///
 /// - 按 turn 升序输入；取最近 `limit` 条（生产默认 `RECENT_SUMMARIES_INJECT_LIMIT`）。
 /// - 单条 content 截断到 `RECENT_SUMMARY_ITEM_MAX_CHARS`，避免吞掉当前意图预算。
+/// - 跳过 `covered_by` 已折叠条目（记忆规格 §5.1）。
+/// - 有 `code`/`headline` 时优先展示 Chronicle 导航行；否则回退 content 截断。
+/// - **M2 完整态**：概览/纪要带进 history、近正文硬隔离；当前仍为 tail 注入兼容路径。
 /// - 空列表返回 None（调用方不 push 空段）。
 pub fn render_recent_summaries_for_injection(
     summaries: &[storyforge_domain::agent::RoundSummary],
@@ -2203,23 +2206,44 @@ pub fn render_recent_summaries_for_injection(
     let start = summaries.len().saturating_sub(limit);
     let mut lines = Vec::new();
     for s in &summaries[start..] {
-        let content = s.content.trim();
-        if content.is_empty() {
+        if s.covered_by.is_some() {
             continue;
         }
-        lines.push(format!(
-            "- T{}: {}",
-            s.turn,
+        let content = s.content.trim();
+        if content.is_empty() && s.headline.as_ref().is_none_or(|h| h.trim().is_empty()) {
+            continue;
+        }
+        let body = if let Some(h) = s.headline.as_ref().filter(|h| !h.trim().is_empty()) {
+            truncate_chars(h.trim(), RECENT_SUMMARY_ITEM_MAX_CHARS)
+        } else {
             truncate_chars(content, RECENT_SUMMARY_ITEM_MAX_CHARS)
-        ));
+        };
+        let label = match s.code.as_deref() {
+            Some(code) if !code.is_empty() => format!("{code} T{}", s.turn),
+            _ => format!("T{}", s.turn),
+        };
+        lines.push(format!("- {label}: {body}"));
     }
     if lines.is_empty() {
         return None;
     }
     Some(format!(
-        "近期剧情摘要（按轮次，供规划参考，勿直接复述）：\n{}",
+        "近期剧情摘要（按轮次/Chronicle code，供规划参考，勿直接复述）：\n{}",
         lines.join("\n")
     ))
+}
+
+/// 硬去重：去掉与 `exclude_turns` 同 turn 的摘要（近正文窗内禁止 A 双税）。
+pub fn filter_summaries_excluding_turns(
+    summaries: &[storyforge_domain::agent::RoundSummary],
+    exclude_turns: &[u32],
+) -> Vec<storyforge_domain::agent::RoundSummary> {
+    summaries
+        .iter()
+        .filter(|s| !exclude_turns.contains(&s.turn))
+        .filter(|s| s.covered_by.is_none())
+        .cloned()
+        .collect()
 }
 
 /// UTF-8 安全的字符截断（按 char 而非 byte 截断，避免中文 panic）
@@ -2712,6 +2736,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -2817,6 +2842,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -2902,6 +2928,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3196,6 +3223,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3459,6 +3487,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3549,6 +3578,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3629,6 +3659,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],

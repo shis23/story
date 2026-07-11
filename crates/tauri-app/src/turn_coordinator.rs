@@ -193,7 +193,15 @@ impl CampaignMutationCoordinator {
                     .upsert_summary((**summary).clone())
                     .map_err(CommitError::Storage)?
                 {
-                    UpsertResult::Inserted | UpsertResult::AlreadyPresent => Ok(()),
+                    UpsertResult::Inserted => {
+                        // 记忆规格：Accept 新 Chronicle A → chronicle_revision++
+                        if let Some(mut camp) = store.get_campaign(campaign_id) {
+                            camp.bump_chronicle_revision();
+                            let _ = store.update_campaign(camp);
+                        }
+                        Ok(())
+                    }
+                    UpsertResult::AlreadyPresent => Ok(()),
                     UpsertResult::Conflict(msg) => Err(CommitError::MutationConflict(msg)),
                 }
             }

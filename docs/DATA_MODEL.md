@@ -26,13 +26,15 @@ CharacterKnowledgeEntry
 StoryTask
   剧情伏笔/任务，供 Director 在合适轮次注入
 
-RoundSummary
-  兼容视图 / 迁移源；目标演进为 Chronicle A 的存储形态（禁止长期双写两套库）
-  写入：Summarizer（已有）；Accept 后成为规范叙事纪要 A
+RoundSummary（已演进字段，M1）
+  兼容视图 / Chronicle A 存储形态（禁止长期双写两套库）
+  字段：既有 id/campaign/conversation/turn/content + `code`/`headline`/`lineage_id`/`covered_by`（serde default）
+  写入：Summarizer content → `build_mutation_batch` 分配 code+headline；Accept 落盘
+  转换：`RoundSummary::to_chronicle_a(lineage_fallback)`
 
-ChronicleEntry A/B/C（目标）
+ChronicleEntry A/B/C（domain 类型已有，`crates/domain/src/chronicle.rs`）
   主键 chronicle_entry_id；code 为 (campaign_id, lineage_id) 内别名
-  A ← Summarizer；B/C ← ChronicleCompressor（系统分组 + LLM 文案）
+  A ← Summarizer 路径；B/C ← ChronicleCompressor（系统分组 + LLM 文案；后台任务待 M4）
   covers/covered_by 折叠默认概览；不删底层记录
 
 ArchivedSummary（已有）

@@ -158,10 +158,11 @@ export function useMessageVariants(options = {}) {
   }
 
   // 来源 App.vue:906-919 handleAcceptVariant
-  async function handleAcceptVariant({ nodeId }) {
+  // Quality Error 默认拦截；用户确认后 forceAccept → Degraded
+  async function handleAcceptVariant({ nodeId, forceAccept = false } = {}) {
     if (!campaignStore.currentConversationId) return
     try {
-      await apiAcceptVariant(campaignStore.currentConversationId, nodeId)
+      await apiAcceptVariant(campaignStore.currentConversationId, nodeId, forceAccept)
       const msg = writingStore.messages.find((m) => m.id === nodeId)
       if (msg) {
         const variant = msg.variants[msg.active_variant]
@@ -169,6 +170,21 @@ export function useMessageVariants(options = {}) {
         broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(nodeId, { reason: 'accept_variant' }))
       }
     } catch (e) {
+      const msg = String(e?.message || e || '')
+      if (!forceAccept && /质量门禁|force_accept|Error 级/i.test(msg)) {
+        try {
+          const { ask } = await import('@tauri-apps/plugin-dialog')
+          const ok = await ask(
+            '质量门禁发现 Error 级问题。强制采纳将标记本轮为 Degraded，是否继续？',
+            { title: '强制采纳确认', kind: 'warning' },
+          )
+          if (ok) {
+            return handleAcceptVariant({ nodeId, forceAccept: true })
+          }
+        } catch (dialogErr) {
+          console.error('强制采纳确认失败:', dialogErr)
+        }
+      }
       console.error('采纳失败:', e)
     }
   }

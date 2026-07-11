@@ -235,6 +235,7 @@ async fn i1_adversarial_knowledge_boundary() {
         world_info: None,
         vector_store: None,
         archived_summaries: vec![],
+            chronicle_summaries: vec![],
         campaign_runtime: Some(runtime.clone()),
         current_character_instance_id: Some(lin_inst_id.clone()),
         regex_scripts: vec![],

@@ -36,6 +36,7 @@ fn empty_tool_context() -> Arc<ToolContext> {
         world_info: None,
         vector_store: None,
         archived_summaries: vec![],
+            chronicle_summaries: vec![],
         campaign_runtime: None,
         current_character_instance_id: None,
         regex_scripts: vec![],

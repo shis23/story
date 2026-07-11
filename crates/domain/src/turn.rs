@@ -475,6 +475,44 @@ impl QualityReport {
             .filter(|w| w.severity == QualitySeverity::Error)
             .count()
     }
+
+    /// 是否存在 Error 级问题（Warning 不拦 accept）。
+    pub fn has_errors(&self) -> bool {
+        self.error_count() > 0
+    }
+
+    /// Accept 策略：Error 默认拦截；`force=true` 时允许强制接受（→ Degraded）。
+    pub fn blocks_accept(&self, force: bool) -> bool {
+        self.has_errors() && !force
+    }
+}
+
+/// Accept 前质量门禁决策（产品：拦截 Error，允许强制接受 → Degraded）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityAcceptDecision {
+    /// 无 Error（Warning 可有）：正常 Committed 路径
+    AllowCommit,
+    /// 有 Error 且未 force：拒绝 accept
+    Block { error_count: usize },
+    /// 有 Error 且 force：允许 accept，Turn 应落 Degraded
+    ForceDegraded { error_count: usize },
+}
+
+/// 根据 QualityReport 与 force 标志决定是否放行 accept。
+pub fn quality_accept_decision(
+    report: Option<&QualityReport>,
+    force: bool,
+) -> QualityAcceptDecision {
+    let error_count = report.map(|r| r.error_count()).unwrap_or(0);
+    if error_count == 0 {
+        return QualityAcceptDecision::AllowCommit;
+    }
+    if force {
+        QualityAcceptDecision::ForceDegraded { error_count }
+    } else {
+        QualityAcceptDecision::Block { error_count }
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +537,44 @@ mod tests {
         };
         assert!(!report.passed());
         assert_eq!(report.error_count(), 0); // Warning 不是 Error
+    }
+
+    #[test]
+    fn quality_accept_blocks_errors_unless_force() {
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::MetaDescription {
+                    snippet: "x".into(),
+                },
+                message: "meta".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        assert_eq!(
+            quality_accept_decision(Some(&report), false),
+            QualityAcceptDecision::Block { error_count: 1 }
+        );
+        assert_eq!(
+            quality_accept_decision(Some(&report), true),
+            QualityAcceptDecision::ForceDegraded { error_count: 1 }
+        );
+        assert_eq!(
+            quality_accept_decision(None, false),
+            QualityAcceptDecision::AllowCommit
+        );
+        let warn_only = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::TooShort { char_count: 1 },
+                message: "短".into(),
+                severity: QualitySeverity::Warning,
+            }],
+        };
+        assert_eq!(
+            quality_accept_decision(Some(&warn_only), false),
+            QualityAcceptDecision::AllowCommit
+        );
+        assert!(report.blocks_accept(false));
+        assert!(!report.blocks_accept(true));
     }
 
     #[test]

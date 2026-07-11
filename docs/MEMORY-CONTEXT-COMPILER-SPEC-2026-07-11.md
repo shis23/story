@@ -1,10 +1,10 @@
 # 记忆与 Context 装配规格（远楼不失忆 + 缓存友好）
 
 > 日期：2026-07-11  
-> 版本：**v1.0 可拆任务实施规格**（目标态；尚未全部实现。下文「现状」与「目标」分列）  
+> 版本：**v1.0 可拆任务实施规格**（目标态；下文「现状」与「目标」分列）  
 > 修订依据：架构讨论拍板 + 两轮外部审查收紧（epoch 公式、快照、lineage、revision、存储主从、确定性分组、工具边界）  
 > 相关：`docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md` §7–8、§10 阶段 C  
-> 实现落点（现状代码）：`crates/domain/src/conversation.rs`（history-epoch）、`crates/app-pipeline`（inject budgets / layout）、`crates/app-memory`（归档/召回）、`crates/app-agent`（Summarizer / tools）、`crates/tauri-app`（fill_far_memory / RoundSummary 索引）
+> 实现落点：`crates/domain/src/chronicle.rs`（**M0 纯函数/类型**）、`crates/domain/src/agent.rs`（RoundSummary Chronicle 字段）、`crates/domain/src/conversation.rs`（history-epoch）、`crates/app-pipeline`（inject budgets / layout）、`crates/app-memory`（归档/召回）、`crates/app-agent`（Summarizer / tools）、`crates/tauri-app`（Accept 质量拦截、code 分配、向量 source_*）
 
 ---
 
@@ -42,16 +42,21 @@
 
 ---
 
-## 2. 现状（代码事实，2026-07-11）
+## 2. 现状（代码事实，2026-07-11 更新）
 
 | 机制 | 行为 |
 | --- | --- |
 | history | `DEFAULT_HISTORY_WINDOW_SIZE=20` 消息条 + epoch 整块前移；可有确定性 `【历史纪要】checkpoint` |
-| RoundSummary | **Summarizer** 产出；**Accept 后**落盘；load 最近 12、**tail 自动 inject 约 5 条截断 content** |
+| RoundSummary / Chronicle A 字段 | **Summarizer** 产出 content；`build_mutation_batch` 分配 `code`（A####）+ `headline` 截断；兼容字段 `lineage_id`/`covered_by`；`to_chronicle_a()` 纯转换；**Accept 后**落盘 |
 | MemoryArchiver | **已有**：对话**消息正文**过长时批压 → `ArchivedSummary` 入向量库（水位 `archived_upto`） |
-| 远记忆召回 | RoundSummary 也可索引向量库；`intent → hybrid → top≈3` 进 tail |
-| Chronicle A/B/C、epoch 快照、点名 tool | **无** |
-| 正文与摘要硬隔离 | **无**（仅 far vs recent_summaries 去重） |
+| 远记忆召回 | RoundSummary 索引向量库（metadata 含 `source_kind=chronicle_a` / `code` / `lineage_id`）；`intent → hybrid → top≈3` 进 tail |
+| M0 公式与类型 | **`crates/domain/src/chronicle.rs`**：身份、lineage、revision 规则、epoch 成员、`ContextEpochSnapshot`、`compile_history_blocks`、compress 分组/`covers` 校验、overview 选择；单测覆盖 |
+| epoch 快照接线 / 概览进 history | **未接线**主写作 prompt（仍 tail 注入近期摘要；M2 剩余） |
+| `search_chronicle` / `get_chronicle` | **最小版已注册**（Director；数据源=RoundSummary/Chronicle A；B/C 待 M4） |
+| ChronicleCompressor 后台 | **纯函数就绪**；异步任务与发布 **无**（M4） |
+| 正文与摘要硬隔离 | domain `turn_inject_mode` / `filter_summaries_excluding_turns` **已有**；主路径 **尚未**按 near_raw 窗强制过滤 |
+| QualityGate Accept | **Error 拦截**；`force_accept` → Turn **Degraded**；Warning 不拦 |
+| Campaign 版本 | `revision` + **`chronicle_revision`** + **`lineage_id`**（新建/fork 分配；Accept 新 A 时 bump chronicle_revision） |
 
 ---
 
@@ -488,16 +493,16 @@ compress_batch_id?
 
 ## 9. 实施分期（M0→M5）
 
-| 期 | 内容 |
-| --- | --- |
-| **M0** | 本规格公式与类型：Chronicle 身份、lineage 算法、revision 规则、epoch 成员公式、ContextEpochSnapshot 最小字段、Compiler 纯函数 IO；单测覆盖公式与分组校验 |
-| **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化或一次迁移）；向量 source_* 字段；**暂不改**主写作 prompt 布局 |
-| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 |
-| **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 |
-| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） |
+| 期 | 内容 | 状态（2026-07-11） |
+| --- | --- | --- |
+| **M0** | 本规格公式与类型：Chronicle 身份、lineage 算法、revision 规则、epoch 成员公式、ContextEpochSnapshot 最小字段、Compiler 纯函数 IO；单测覆盖公式与分组校验 | **已完成**（`domain/chronicle.rs`） |
+| **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化）；向量 source_* 字段；**暂不改**主写作 prompt 布局 | **基本完成**（字段 + code/headline 分配 + 索引 metadata；lineage 运行时回填可后续补） |
+| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **部分**：纯函数/去重 helper 有；**主路径 MessageLayout 重排未接线** |
+| **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **部分**：A 级 search/get 已注册并注入 `chronicle_summaries`；B/C/预算计数器待补 |
+| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **部分**：分组+covers 校验纯函数；**无后台发布任务** |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
 
-Quality 拦截 / NarrativeContract 可并行；**记忆语义以本文件为准**。
+并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。
 
 ---
 

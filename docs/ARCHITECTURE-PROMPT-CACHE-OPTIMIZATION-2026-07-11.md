@@ -449,13 +449,14 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 ## 10. 推荐实施顺序
 
-> **进度快照（2026-07-11，`878125f`）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。
+> **进度快照（2026-07-11）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。  
+> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0 完成**、**M1 基本完成**、M2 纯函数就绪待主路径接线）。
 >
 > | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
-> | B | 部分 | QualityGate **warn-only**（Accept 旁警告 + error_count）；非 hard-block | NarrativeContract、扩展 ScenePlan、Quality hard-block 产品决策 |
-> | C | **轻量落地** | history-epoch 窗口 + 确定性 checkpoint summary + `epoch_id` 可观测；`recent_summaries` load last-12 / inject last-5；FarMemoryHit 溯源；named inject budgets；原始 history 不被远记忆挤占契约 | 完整 token budget / segment volatility 全量、真实供应商 epoch 冷热对照 |
+> | B | 部分 | QualityGate：**Error 拦截** + `force_accept`→Turn **Degraded**；Warning 不拦；Accept 旁提示/二次确认 | NarrativeContract、扩展 ScenePlan、有界自动修复 |
+> | C | **轻量 + M0/M1/M3min** | history-epoch + checkpoint；`domain/chronicle` 公式；RoundSummary→A；Director chronicle tools（A）；inject budgets；history 不被远记忆挤占 | **M2 主路径**概览→纪要带→近正文、M4 后台压缩/B·C、真实供应商 epoch 冷热对照 |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
 ### 阶段 A：建立测量和安全边界
@@ -472,7 +473,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 1. 增加 NarrativeContract。
 2. 扩展 ScenePlan：冲突、对立目标、stakes、beats、complication、must_not_resolve、exit_hook。
-3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（warn-only 已接 Accept UX；非 hard-block）**
+3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（Error 拦截 + force→Degraded 已接；Warning 不拦；无自动重写）**
 4. 把梁元的角色欲望、情绪阶段和反全知思想拆入对应结构，不原样复制整份预设。
 
 阶段 B 验收：固定知识隔离 fixture 中身份/私有知识泄漏为零；质量门禁具有稳定错误码和有界修复；真实 LLM A/B 在不显著增加延迟和费用的前提下改善目标指标。
@@ -484,7 +485,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
-6. **记忆金字塔 + 缓存友好三窗（目标规格已写，待实现）**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — 概览→纪要带→近正文、E 同步滑动、active A≥200→B、Director `search_chronicle`/`get_chronicle`。
+6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0/M1 已落地**；M2 主路径装配 / M3 Director tools / M4 后台批压仍待。
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 

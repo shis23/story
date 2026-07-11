@@ -679,6 +679,7 @@ impl AppState {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3056,6 +3057,7 @@ fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolCo
     let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = None;
     tool_guard.archived_summaries.clear();
+    tool_guard.chronicle_summaries.clear();
 }
 
 /// 取 `before_node_id` 之前最近一条 User 消息正文（用于 regenerate 无 hint 时的远记忆查询）。
@@ -3196,6 +3198,27 @@ fn index_round_summaries_to_vector_with_vectors(
             "source".into(),
             serde_json::Value::String("round_summary".into()),
         );
+        // 记忆规格 M1：统一 source_kind / code / lineage（兼容旧检索）
+        metadata.insert(
+            "source_kind".into(),
+            serde_json::Value::String("chronicle_a".into()),
+        );
+        metadata.insert(
+            "source_entry_id".into(),
+            serde_json::Value::String(summary.id.to_string()),
+        );
+        if let Some(code) = &summary.code {
+            metadata.insert("code".into(), serde_json::Value::String(code.clone()));
+        }
+        if let Some(lin) = &summary.lineage_id {
+            metadata.insert(
+                "lineage_id".into(),
+                serde_json::Value::String(lin.to_string()),
+            );
+        }
+        if let Some(h) = &summary.headline {
+            metadata.insert("headline".into(), serde_json::Value::String(h.clone()));
+        }
         let vector = vectors
             .iter()
             .find(|(id, _)| id == &summary.id)
@@ -3388,6 +3411,8 @@ fn apply_campaign_context_snapshot(
         .iter()
         .map(|s| s.content.clone())
         .collect();
+    // 同步到 search_chronicle / get_chronicle（规范 A 兼容视图）
+    tool_guard.chronicle_summaries = ctx.recent_summaries.clone();
 }
 
 /// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
@@ -3468,6 +3493,7 @@ pub fn fill_campaign_runtime_from_store(
             .iter()
             .map(|s| s.content.clone())
             .collect();
+        tool_guard.chronicle_summaries = ctx.recent_summaries.clone();
     }
 }
 
@@ -3796,15 +3822,25 @@ fn build_mutation_batch(
     let expected_revision = store.get_campaign(camp_id).map(|c| c.revision).unwrap_or(0);
     let mut mutations: Vec<storyforge_domain::turn::Mutation> = vec![];
 
-    // 本轮摘要
+    // 本轮摘要 → Chronicle A 兼容字段（code/headline；Accept 落盘为规范 A）
     if let Some(summary) = &outcome.summary {
+        let existing = store.list_summaries(camp_id);
+        let next_seq = next_chronicle_a_seq(&existing);
+        let code = storyforge_domain::chronicle::ChronicleCode::new(
+            storyforge_domain::chronicle::ChronicleLevel::A,
+            next_seq,
+        );
+        let headline =
+            storyforge_domain::chronicle::truncate_headline(summary, 40);
         mutations.push(storyforge_domain::turn::Mutation::UpsertSummary(Box::new(
             storyforge_domain::agent::RoundSummary::new(
                 camp_id.clone(),
                 persist_ctx.conversation_id.clone(),
                 persist_ctx.turn,
                 summary.clone(),
-            ),
+            )
+            .with_code(code.as_str())
+            .with_headline(headline),
         )));
     }
 
@@ -5627,22 +5663,33 @@ fn edit_variant(
     Ok(())
 }
 
-/// 采纳当前变体（Draft → Final），并自动检查是否需要归档
+/// 采纳当前变体（Draft → Final），并自动检查是否需要归档。
+///
+/// `force_accept`：QualityGate 存在 **Error** 时默认拦截；传 true 强制接受并标记 Turn **Degraded**。
+/// Warning 不拦截。
 #[tauri::command]
 async fn accept_variant(
     conversation_id: String,
     node_id: String,
+    force_accept: Option<bool>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
-    accept_variant_async(state.inner().clone(), conv_id, nid).await
+    accept_variant_async(
+        state.inner().clone(),
+        conv_id,
+        nid,
+        force_accept.unwrap_or(false),
+    )
+    .await
 }
 
 async fn accept_variant_async(
     state: Arc<AppState>,
     conv_id: Id,
     node_id: Id,
+    force_accept: bool,
 ) -> Result<(), TauriCommandError> {
     // Phase A: Campaign 模式分流
     let active_campaign = {
@@ -5658,9 +5705,9 @@ async fn accept_variant_async(
 
     if let Some(campaign_id) = active_campaign {
         // Campaign 模式 → TurnCommit
-        commit_turn_attempt(&state, &campaign_id, &conv_id, &node_id).await?;
+        commit_turn_attempt(&state, &campaign_id, &conv_id, &node_id, force_accept).await?;
     } else {
-        // 非 Campaign 模式 → 保持现有行为
+        // 非 Campaign 模式 → 保持现有行为（无 Turn quality 报告）
         let conv_store = state.conv_store.clone();
         tokio::task::spawn_blocking(move || conv_store.accept_variant(&conv_id, &node_id))
             .await
@@ -5682,6 +5729,7 @@ async fn commit_turn_attempt(
     campaign_id: &Id,
     conv_id: &Id,
     node_id: &Id,
+    force_accept: bool,
 ) -> Result<(), TauriCommandError> {
     // 1. 查找包含该变体的 TurnRecord
     let turn = get_turn_store()
@@ -5705,6 +5753,29 @@ async fn commit_turn_attempt(
             attempt.status
         )));
     }
+
+    // 2b. QualityGate：Error 拦截；Warning 放行；force_accept → Degraded
+    let quality_decision = storyforge_domain::turn::quality_accept_decision(
+        attempt.quality_report.as_ref(),
+        force_accept,
+    );
+    let commit_as_degraded = match &quality_decision {
+        storyforge_domain::turn::QualityAcceptDecision::AllowCommit => false,
+        storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { error_count } => {
+            tracing::warn!(
+                target: "quality_gate",
+                turn_id = %turn.turn_id,
+                error_count,
+                "用户 force_accept：Quality Error 仍提交，Turn → Degraded"
+            );
+            true
+        }
+        storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
+            return Err(TauriCommandError::validation(format!(
+                "质量门禁拦截：存在 {error_count} 个 Error 级问题。可修复后重 roll，或 force_accept=true 强制接受（将标记为 Degraded）。"
+            )));
+        }
+    };
 
     // 3. 校验 revision
     let current_revision = get_campaign_store()
@@ -5838,27 +5909,54 @@ async fn commit_turn_attempt(
         });
     }
 
-    // 7. 标记 Committed + 其他 attempts Superseded
+    // 7. 标记 Committed 或 Degraded + 其他 attempts Superseded
     // 副作用已完成，持久化失败只记日志（Campaign 已写入，不能回滚）
+    let final_status = if commit_as_degraded {
+        storyforge_domain::turn::TurnStatus::Degraded
+    } else {
+        storyforge_domain::turn::TurnStatus::Committed
+    };
     if let Err(e) = update_turn_record(&turn_id, |record| {
-        record.status = storyforge_domain::turn::TurnStatus::Committed;
+        record.status = final_status.clone();
         record.accepted_attempt_id = Some(attempt_id.clone());
         for att in &mut record.attempts {
             if att.attempt_id != attempt_id && att.status.is_active() {
                 att.status = storyforge_domain::turn::AttemptStatus::Superseded;
             } else if att.attempt_id == attempt_id {
+                // Attempt 无 Degraded 变体：正文已提交仍记 Committed；Turn 层记 Degraded
                 att.status = storyforge_domain::turn::AttemptStatus::Committed;
             }
         }
         record.touch();
     }) {
         tracing::error!(
-            "Phase A: Turn {} 副作用已完成但标记 Committed 失败: {e}（启动恢复可重放）",
-            turn_id
+            "Phase A: Turn {} 副作用已完成但标记 {:?} 失败: {e}（启动恢复可重放）",
+            turn_id,
+            final_status
         );
     }
 
     Ok(())
+}
+
+/// 已有 RoundSummary 上分配下一个 Chronicle A 序号（兼容无 code 的旧行）。
+fn next_chronicle_a_seq(existing: &[storyforge_domain::agent::RoundSummary]) -> u32 {
+    let mut max_seq = 0u32;
+    for s in existing {
+        if let Some(code) = s.code.as_deref() {
+            if let Some(parsed) = storyforge_domain::chronicle::ChronicleCode::parse(code)
+                && parsed.level() == Some(storyforge_domain::chronicle::ChronicleLevel::A)
+            {
+                // "A0123" → 123
+                if let Ok(n) = code[1..].parse::<u32>() {
+                    max_seq = max_seq.max(n);
+                }
+            }
+        } else {
+            max_seq = max_seq.max(s.turn);
+        }
+    }
+    max_seq.saturating_add(1).max(1)
 }
 
 /// 软删除当前变体（→ Discarded）。
@@ -8837,6 +8935,14 @@ pub struct RoundSummaryDto {
     pub turn: u32,
     pub content: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_by: Option<String>,
 }
 
 impl From<&storyforge_domain::agent::RoundSummary> for RoundSummaryDto {
@@ -8848,6 +8954,10 @@ impl From<&storyforge_domain::agent::RoundSummary> for RoundSummaryDto {
             turn: s.turn,
             content: s.content.clone(),
             created_at: s.created_at.clone(),
+            code: s.code.clone(),
+            headline: s.headline.clone(),
+            lineage_id: s.lineage_id.as_ref().map(|id| id.to_string()),
+            covered_by: s.covered_by.as_ref().map(|id| id.to_string()),
         }
     }
 }
@@ -10576,6 +10686,10 @@ mod tests {
                 turn: 5,
                 content: "Round five reached the sealed door.".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                code: Some("A0005".into()),
+                headline: Some("密封门".into()),
+                lineage_id: None,
+                covered_by: None,
             })
             .unwrap();
 
@@ -10808,6 +10922,10 @@ mod tests {
             turn: 1,
             content: "Round one happened.".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            code: Some("A0001".into()),
+            headline: None,
+            lineage_id: None,
+            covered_by: None,
         }];
 
         let result = import_campaign_bundle_into_store(
@@ -11991,7 +12109,7 @@ mod tests {
             .append_ai_draft(&conversation.id, "draft text".into(), None)
             .unwrap();
 
-        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone())
+        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone(), false)
             .await
             .unwrap();
 
@@ -12935,6 +13053,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -14824,6 +14943,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -15769,7 +15889,7 @@ mod tests {
             .unwrap();
 
         // 不设 active_campaign → 非 Campaign 模式
-        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone())
+        accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone(), false)
             .await
             .unwrap();
 
@@ -15801,8 +15921,53 @@ mod tests {
 
         // accept 应该拒绝——没有关联的 TurnRecord
         let result =
-            accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone()).await;
+            accept_variant_async(state.clone(), conversation.id.clone(), node_id.clone(), false)
+                .await;
         assert!(result.is_err(), "should reject historical/orphan attempt");
+    }
+
+    #[test]
+    fn next_chronicle_a_seq_from_existing_codes_and_turns() {
+        let a = storyforge_domain::agent::RoundSummary::new(
+            Id::from_str("c"),
+            Id::from_str("v"),
+            2,
+            "x".into(),
+        )
+        .with_code("A0002");
+        let b = storyforge_domain::agent::RoundSummary::new(
+            Id::from_str("c"),
+            Id::from_str("v"),
+            9,
+            "y".into(),
+        ); // legacy no code → use turn
+        assert_eq!(next_chronicle_a_seq(&[a, b]), 10);
+        assert_eq!(next_chronicle_a_seq(&[]), 1);
+    }
+
+    #[test]
+    fn quality_accept_decision_matches_product_policy() {
+        use storyforge_domain::turn::{
+            quality_accept_decision, QualityAcceptDecision, QualityReport, QualitySeverity,
+            QualityWarning, QualityWarningCode,
+        };
+        let err = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::FormatLeak {
+                    snippet: "```".into(),
+                },
+                message: "format".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        assert!(matches!(
+            quality_accept_decision(Some(&err), false),
+            QualityAcceptDecision::Block { error_count: 1 }
+        ));
+        assert!(matches!(
+            quality_accept_decision(Some(&err), true),
+            QualityAcceptDecision::ForceDegraded { error_count: 1 }
+        ));
     }
 
     #[test]

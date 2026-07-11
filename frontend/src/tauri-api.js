@@ -564,10 +564,16 @@ export async function editVariant(conversationId, nodeId, newContent) {
   }
 }
 
-/** 采纳当前变体（Draft → Final） */
-export async function acceptVariant(conversationId, nodeId) {
+/** 采纳当前变体（Draft → Final）
+ * @param {boolean} [forceAccept=false] Quality Error 时需二次确认后传 true → Degraded
+ */
+export async function acceptVariant(conversationId, nodeId, forceAccept = false) {
   if (isTauri()) {
-    return await invoke('accept_variant', { conversationId, nodeId })
+    return await invoke('accept_variant', {
+      conversationId,
+      nodeId,
+      forceAccept: !!forceAccept,
+    })
   }
 }
 

@@ -30,11 +30,13 @@ const currentSourceContent = computed(() => currentVariant.value?.content ?? '')
 const variantCount = computed(() => props.message.variants.length)
 const subagentRoles = computed(() => subagentRolesFromProvenance(currentVariant.value?.provenance))
 const isUser = computed(() => props.message.role === 'user')
-// warn-only：采纳旁展示质量警告，不阻断 accept
+// Error 拦截（需强制采纳）；Warning 仅提示
 const qualityAcceptHint = computed(() => {
   const q = writing.pipeline.quality
   if (!q || q.passed) return null
+  const errors = q.errorCount || 0
   const n = q.warningCount || (Array.isArray(q.warnings) ? q.warnings.length : 0)
+  if (errors > 0) return `质量 Error ${errors}（采纳将确认）`
   if (!n) return null
   return `质量警告 ${n}`
 })

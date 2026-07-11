@@ -69,6 +69,17 @@ impl ToolCenter {
         c.reg("search_world_info", "按关键词搜索世界书", ToolScope::All);
         c.reg("search_vectors", "向量记忆搜索", ToolScope::All);
         c.reg("get_recent_summary", "获取远记忆摘要", ToolScope::All);
+        // Director 纪要工具（M3 最小：仅 Chronicle A 兼容视图）
+        c.reg(
+            "search_chronicle",
+            "搜索剧情纪要目录（code+headline）",
+            ToolScope::Roles(vec![AgentRole::Director]),
+        );
+        c.reg(
+            "get_chronicle",
+            "按 code/id 读取纪要 summary|full",
+            ToolScope::Roles(vec![AgentRole::Director]),
+        );
         // Director 专属
         c.reg(
             "get_character",
@@ -177,7 +188,7 @@ mod tests {
     fn director_default_tools_include_five() {
         let c = center();
         let names = c.default_tool_names_for(&AgentRole::Director);
-        // 3 个 All + 2 个 Director-only = 5
+        // 3 个 All + 2 个 Director-only + 2 个 chronicle = 7
         assert!(
             names.contains(&"search_world_info".into()),
             "missing search_world_info"
@@ -195,10 +206,18 @@ mod tests {
             "missing get_character"
         );
         assert!(names.contains(&"emit_plan".into()), "missing emit_plan");
+        assert!(
+            names.contains(&"search_chronicle".into()),
+            "missing search_chronicle"
+        );
+        assert!(
+            names.contains(&"get_chronicle".into()),
+            "missing get_chronicle"
+        );
         assert_eq!(
             names.len(),
-            5,
-            "Director should have 5 tools, got {}",
+            7,
+            "Director should have 7 tools, got {}",
             names.len()
         );
     }

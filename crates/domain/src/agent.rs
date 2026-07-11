@@ -450,7 +450,10 @@ impl PostProcessResult {
 
 // ─── 本轮剧情摘要（P2 新增，每轮一条原子单位）─────────────────────────────
 
-/// 一轮写作的剧情摘要（剧情总结 Agent 产出，独立于 archiver 的批量归档）
+/// 一轮写作的剧情摘要（剧情总结 Agent 产出，独立于 archiver 的批量归档）。
+///
+/// **演进方向（记忆规格 v1.0 M1）**：本结构是 Chronicle A 的兼容存储形态，
+/// 禁止再维护第二套完整 RoundSummary 副本。新增字段全部 `default`，旧 JSON 可反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundSummary {
     pub id: Id,
@@ -458,9 +461,21 @@ pub struct RoundSummary {
     pub conversation_id: Id,
     /// 第几轮（与对话树节点对应）
     pub turn: u32,
-    /// 摘要正文（200-500 字高密度总结）
+    /// 摘要正文（200-500 字高密度总结）— 对齐 Chronicle.summary
     pub content: String,
     pub created_at: String,
+    /// Chronicle 可读 code（如 A0001）；空 = 尚未分配
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// 概览短标题；空则注入侧可从 content 截断
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    /// 记忆线；缺省时由运行时用 conversation 主线 lineage 回填
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_id: Option<Id>,
+    /// 被上层 B/C 折叠时填写 parent entry id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_by: Option<Id>,
 }
 
 impl RoundSummary {
@@ -472,6 +487,105 @@ impl RoundSummary {
             turn,
             content,
             created_at: chrono::Utc::now().to_rfc3339(),
+            code: None,
+            headline: None,
+            lineage_id: None,
+            covered_by: None,
         }
+    }
+
+    /// 分配 leaf code（系统侧；Summarizer 不写 code）。
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    pub fn with_headline(mut self, headline: impl Into<String>) -> Self {
+        self.headline = Some(headline.into());
+        self
+    }
+
+    pub fn with_lineage(mut self, lineage_id: Id) -> Self {
+        self.lineage_id = Some(lineage_id);
+        self
+    }
+
+    /// 概览行：优先 headline，否则 content 截断。
+    pub fn overview_headline(&self, max_chars: usize) -> String {
+        if let Some(h) = &self.headline
+            && !h.trim().is_empty()
+        {
+            return crate::chronicle::truncate_headline(h, max_chars);
+        }
+        crate::chronicle::truncate_headline(&self.content, max_chars)
+    }
+
+    /// 兼容视图 → Chronicle A 条目（M1 纯转换，不落盘）。
+    pub fn to_chronicle_a(&self, lineage_fallback: &Id) -> crate::chronicle::ChronicleEntry {
+        use crate::chronicle::{ChronicleCode, ChronicleEntry, ChronicleLevel};
+        let lineage = self
+            .lineage_id
+            .clone()
+            .unwrap_or_else(|| lineage_fallback.clone());
+        let code = self
+            .code
+            .as_deref()
+            .and_then(ChronicleCode::parse)
+            .unwrap_or_else(|| ChronicleCode::new(ChronicleLevel::A, self.turn));
+        ChronicleEntry {
+            id: self.id.clone(),
+            code,
+            level: ChronicleLevel::A,
+            campaign_id: self.campaign_id.clone(),
+            lineage_id: lineage,
+            headline: self.overview_headline(40),
+            summary: self.content.clone(),
+            full: None,
+            turn_start: self.turn,
+            turn_end: self.turn,
+            covers: vec![],
+            covered_by: self.covered_by.clone(),
+            source_turn_ids: vec![],
+            source_variant_hashes: vec![],
+            source_campaign_revision: None,
+            origin_campaign_id: None,
+            origin_chronicle_id: None,
+            origin_code: None,
+            invalidated_at: None,
+            created_at: self.created_at.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod round_summary_chronicle_tests {
+    use super::*;
+    use crate::chronicle::ChronicleLevel;
+
+    #[test]
+    fn legacy_json_deserializes_without_chronicle_fields() {
+        let raw = r#"{
+            "id":"s1","campaign_id":"c1","conversation_id":"v1",
+            "turn":3,"content":"发生了重要转折。","created_at":"t"
+        }"#;
+        let s: RoundSummary = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.turn, 3);
+        assert!(s.code.is_none());
+        assert!(s.headline.is_none());
+    }
+
+    #[test]
+    fn to_chronicle_a_fills_code_and_headline() {
+        let s = RoundSummary::new(Id::from_str("c"), Id::from_str("v"), 7, "长摘要正文".into())
+            .with_code("A0007")
+            .with_headline("关系破裂")
+            .with_lineage(Id::from_str("lin-1"));
+        let a = s.to_chronicle_a(&Id::from_str("fallback"));
+        assert_eq!(a.level, ChronicleLevel::A);
+        assert_eq!(a.code.as_str(), "A0007");
+        assert_eq!(a.headline, "关系破裂");
+        assert_eq!(a.lineage_id.as_str(), "lin-1");
+        assert_eq!(a.turn_start, 7);
+        assert_eq!(a.summary, "长摘要正文");
     }
 }

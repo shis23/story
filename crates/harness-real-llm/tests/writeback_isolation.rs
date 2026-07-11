@@ -584,6 +584,7 @@ async fn b8_subagent_whitelist_cannot_add_unregistered_tool() {
         world_info: None,
         vector_store: None,
         archived_summaries: vec![],
+            chronicle_summaries: vec![],
         campaign_runtime: None,
         current_character_instance_id: None,
         regex_scripts: vec![],

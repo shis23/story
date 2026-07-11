@@ -42,6 +42,8 @@ pub struct ToolContext {
     pub vector_store: Option<Arc<dyn storyforge_infra_vector::VectorStore>>,
     /// 已归档的远记忆摘要（get_recent_summary 工具用）
     pub archived_summaries: Vec<String>,
+    /// 规范 Chronicle A 兼容视图（RoundSummary + code/headline；search/get_chronicle 用）
+    pub chronicle_summaries: Vec<storyforge_domain::agent::RoundSummary>,
     /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
     pub campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
     /// 当前子 Agent 绑定的 instance id（阶段 4 新增）。
@@ -409,6 +411,146 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
             })
         },
     );
+
+    // search_chronicle: 仅搜 Chronicle A（当前 RoundSummary 演进形态；B/C 待 M4）
+    registry.register(
+        ToolSpec::function(
+            "search_chronicle",
+            "搜索剧情纪要目录（code + headline）。只搜规范 Chronicle，不含消息归档块。用于点名远楼线索。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "关键词（匹配 code/headline/summary）"},
+                    "limit": {"type": "integer", "description": "最多返回条数（默认 3）"},
+                    "include_covered": {"type": "boolean", "description": "是否包含已被折叠的条目（默认 false）"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        |args, ctx| {
+            Box::pin(async move {
+                let query = args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs("缺少 query".into()))?
+                    .to_lowercase();
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3)
+                    .clamp(1, 10) as usize;
+                let include_covered = args
+                    .get("include_covered")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let mut hits = Vec::new();
+                for s in ctx.chronicle_summaries.iter().rev() {
+                    if !include_covered && s.covered_by.is_some() {
+                        continue;
+                    }
+                    let code = s.code.clone().unwrap_or_default();
+                    let headline = s.overview_headline(40);
+                    let hay = format!(
+                        "{} {} {}",
+                        code.to_lowercase(),
+                        headline.to_lowercase(),
+                        s.content.to_lowercase()
+                    );
+                    if query.is_empty() || hay.contains(&query) {
+                        hits.push(serde_json::json!({
+                            "code": code,
+                            "level": 0,
+                            "headline": headline,
+                            "turn_span": [s.turn, s.turn],
+                            "chronicle_entry_id": s.id.to_string(),
+                            "covered_by": s.covered_by.as_ref().map(|id| id.to_string()),
+                        }));
+                    }
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+                Ok(serde_json::json!({
+                    "query": args.get("query").and_then(|v| v.as_str()).unwrap_or(""),
+                    "results_count": hits.len(),
+                    "results": hits,
+                }))
+            })
+        },
+    );
+
+    // get_chronicle: 默认 summary；full 可选
+    registry.register(
+        ToolSpec::function(
+            "get_chronicle",
+            "按 code 或 id 读取一条剧情纪要。默认 detail=summary；full 返回更长正文。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "如 A0012"},
+                    "id": {"type": "string", "description": "chronicle_entry_id / RoundSummary id"},
+                    "detail": {"type": "string", "enum": ["summary", "full"], "description": "默认 summary"}
+                }
+            }),
+        ),
+        |args, ctx| {
+            Box::pin(async move {
+                let code = args.get("code").and_then(|v| v.as_str());
+                let id = args.get("id").and_then(|v| v.as_str());
+                if code.is_none() && id.is_none() {
+                    return Err(ToolError::BadArgs("需要 code 或 id".into()));
+                }
+                let detail = args
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("summary");
+                let found = ctx.chronicle_summaries.iter().find(|s| {
+                    if let Some(id) = id
+                        && s.id.as_str() == id
+                    {
+                        return true;
+                    }
+                    if let Some(code) = code
+                        && s.code.as_deref() == Some(code)
+                    {
+                        return true;
+                    }
+                    false
+                });
+                let Some(s) = found else {
+                    return Ok(serde_json::json!({
+                        "found": false,
+                        "message": "未找到对应纪要",
+                    }));
+                };
+                let body = if detail == "full" {
+                    s.content.clone()
+                } else if let Some(h) = s.headline.as_ref().filter(|h| !h.trim().is_empty()) {
+                    h.clone()
+                } else {
+                    let max = 240usize;
+                    if s.content.chars().count() <= max {
+                        s.content.clone()
+                    } else {
+                        format!("{}…", s.content.chars().take(max).collect::<String>())
+                    }
+                };
+                Ok(serde_json::json!({
+                    "found": true,
+                    "code": s.code,
+                    "level": 0,
+                    "headline": s.overview_headline(40),
+                    "detail": detail,
+                    "body": body,
+                    "chronicle_entry_id": s.id.to_string(),
+                    "source_turn_ids": [s.turn],
+                    "source_kind": "chronicle_a",
+                    "covered_by": s.covered_by.as_ref().map(|id| id.to_string()),
+                }))
+            })
+        },
+    );
 }
 
 fn render_world_info_tool_content(content: &str, ctx: &ToolContext) -> String {
@@ -595,6 +737,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -632,6 +775,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -661,6 +805,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -692,6 +837,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -747,6 +893,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: Some(cr),
             current_character_instance_id: Some(Id::from_str("inst-lin")),
             regex_scripts: vec![],
@@ -782,6 +929,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -816,6 +964,7 @@ mod tests {
             world_info: None,
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: Some(runtime),
             current_character_instance_id: Some(Id::from_str("inst-nonexistent")),
             regex_scripts: vec![],
@@ -880,6 +1029,7 @@ mod tests {
             })),
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -940,6 +1090,7 @@ mod tests {
             })),
             vector_store: None,
             archived_summaries: vec![],
+            chronicle_summaries: vec![],
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![RegexScript {
@@ -1010,6 +1161,7 @@ mod tests {
                     world_info: None,
                     vector_store: None,
                     archived_summaries: vec![],
+            chronicle_summaries: vec![],
                     campaign_runtime: None,
                     current_character_instance_id: None,
                     regex_scripts: vec![],
