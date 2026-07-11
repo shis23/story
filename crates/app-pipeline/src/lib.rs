@@ -142,7 +142,7 @@ pub struct WritingContext {
     pub agent_profile_config: Option<AgentProfileConfig>,
     /// 近期 RoundSummary（按 turn 升序）。注入 Director volatile tail，
     /// 也同步到 ToolContext.archived_summaries 供 get_recent_summary 使用。
-    /// ContextCompiler 最小版：先接落盘摘要，完整 epoch/预算裁剪留给阶段 C。
+    /// load-side last-K + inject budgets 已落地；完整 token budget / 段 volatility 仍可后续扩展。
     pub recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
     /// 远记忆自动召回命中（带 id/score 溯源）。
     /// 由 Tauri 层在 start_writing 时按意图检索后填入；无向量库/无命中则为空。
@@ -4451,6 +4451,72 @@ mod tests {
         assert!(
             tail_content.contains("calm surgeon"),
             "应含 persona 摘要: {tail_content}"
+        );
+    }
+
+    /// 阶段 C 契约：原始 history 在 stable_history；远记忆只进 volatile tail，
+    /// 不挤占 history 窗口（MessageLayout 物理顺序）。
+    #[test]
+    fn test_history_not_displaced_by_far_memory() {
+        use storyforge_domain::llm::{ChatMessage, ChatRole};
+        use storyforge_domain::message_layout::MessageLayout;
+
+        let history = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: "原始用户消息".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "原始 AI 消息".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let far = vec![FarMemoryHit::new(
+            "fm1",
+            "远记忆不应出现在 history",
+            0.99,
+            "ArchivedSummary",
+        )];
+        let far_block = render_far_memory_for_injection(&far, FAR_MEMORY_INJECT_LIMIT).unwrap();
+        let layout = MessageLayout::build()
+            .system("stable system")
+            .history(history.clone())
+            .tail(|_| {
+                storyforge_domain::message_layout::VolatileTail::new()
+                    .push("当前意图")
+                    .push(far_block)
+            });
+        let msgs = layout.into_messages();
+        // system + 2 history + 1 tail
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, ChatRole::System);
+        assert_eq!(msgs[1].content, "原始用户消息");
+        assert_eq!(msgs[2].content, "原始 AI 消息");
+        assert_eq!(msgs[3].role, ChatRole::User);
+        assert!(msgs[3].content.contains("远记忆"));
+        assert!(!msgs[1].content.contains("远记忆"));
+        assert!(!msgs[2].content.contains("远记忆"));
+        // 前缀指纹只看 system+history，tail 含远记忆不影响 prefix
+        let layout_a = MessageLayout::build()
+            .system("stable system")
+            .history(history.clone())
+            .tail(|_| storyforge_domain::message_layout::VolatileTail::new().push("意图A"));
+        let layout_b = MessageLayout::build()
+            .system("stable system")
+            .history(history)
+            .tail(|_| {
+                storyforge_domain::message_layout::VolatileTail::new()
+                    .push("意图B")
+                    .push(render_far_memory_for_injection(&far, FAR_MEMORY_INJECT_LIMIT).unwrap())
+            });
+        assert_eq!(
+            layout_a.prefix_fingerprint(),
+            layout_b.prefix_fingerprint(),
+            "far memory in tail must not change prefix fingerprint"
         );
     }
 
