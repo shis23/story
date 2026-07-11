@@ -4,6 +4,8 @@
 /// 实现完整写作流程：用户意图 → 导演 Plan → 子 Agent 并行 → 编剧成文 → 写入对话树。
 use std::sync::Arc;
 
+pub mod quality_gate;
+
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 

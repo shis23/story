@@ -279,6 +279,8 @@ pub enum PipelineEvent {
     EditorProgress { delta: String },
     /// 成文就绪
     DraftReady { text: String },
+    /// B3：草稿质量门禁检查完成
+    QualityChecked { passed: bool, warning_count: usize },
     /// 最终 LLM messages prompt hook 请求（前端插件可异步改写 messages）
     PromptHookRequest {
         request_id: String,

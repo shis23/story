@@ -402,9 +402,106 @@ impl TurnRecord {
     }
 }
 
+// ─── B3：DraftQualityGate 质量报告（架构文档 §9）───────────────────────────
+
+/// 质量警告严重级别
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QualitySeverity {
+    /// 轻微问题，不阻塞后续流程
+    Warning,
+    /// 严重问题，建议人工审查
+    Error,
+}
+
+/// 质量警告编码（稳定错误码，便于前端区分展示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QualityWarningCode {
+    /// n-gram 重复：同一段 N 字连续出现 ≥ K 次
+    NgramRepetition {
+        n: usize,
+        count: usize,
+        sample: String,
+    },
+    /// 元描述泄漏：草稿含 LLM 自述/指令残留
+    MetaDescription { snippet: String },
+    /// 字数过短
+    TooShort { char_count: usize },
+}
+
+/// 单条质量警告
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityWarning {
+    pub code: QualityWarningCode,
+    pub message: String,
+    pub severity: QualitySeverity,
+}
+
+/// 草稿质量报告（DraftQualityGate 输出）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QualityReport {
+    pub warnings: Vec<QualityWarning>,
+}
+
+impl QualityReport {
+    /// 门禁通过 = 无任何警告
+    pub fn passed(&self) -> bool {
+        self.warnings.is_empty()
+    }
+
+    /// Error 级别警告数
+    pub fn error_count(&self) -> usize {
+        self.warnings
+            .iter()
+            .filter(|w| w.severity == QualitySeverity::Error)
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_report_passed_when_empty() {
+        let report = QualityReport::default();
+        assert!(report.passed());
+        assert_eq!(report.error_count(), 0);
+    }
+
+    #[test]
+    fn quality_report_failed_with_warnings() {
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::TooShort { char_count: 10 },
+                message: "过短".into(),
+                severity: QualitySeverity::Warning,
+            }],
+        };
+        assert!(!report.passed());
+        assert_eq!(report.error_count(), 0); // Warning 不是 Error
+    }
+
+    #[test]
+    fn quality_report_error_count() {
+        let report = QualityReport {
+            warnings: vec![
+                QualityWarning {
+                    code: QualityWarningCode::TooShort { char_count: 10 },
+                    message: "过短".into(),
+                    severity: QualitySeverity::Warning,
+                },
+                QualityWarning {
+                    code: QualityWarningCode::MetaDescription {
+                        snippet: "作为AI".into(),
+                    },
+                    message: "元描述".into(),
+                    severity: QualitySeverity::Error,
+                },
+            ],
+        };
+        assert!(!report.passed());
+        assert_eq!(report.error_count(), 1);
+    }
 
     #[test]
     fn turn_status_terminal_states() {

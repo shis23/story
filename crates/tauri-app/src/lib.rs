@@ -2013,6 +2013,13 @@ impl WritingEvent {
             PipelineEvent::DraftReady { text } => {
                 ("draft_ready".into(), serde_json::json!({ "text": text }))
             }
+            PipelineEvent::QualityChecked {
+                passed,
+                warning_count,
+            } => (
+                "quality_checked".into(),
+                serde_json::json!({ "passed": passed, "warning_count": warning_count }),
+            ),
             PipelineEvent::PromptHookRequest {
                 request_id,
                 role,
@@ -2338,6 +2345,19 @@ async fn start_writing(
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+
+        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（纯确定性规则）
+        let _quality_report =
+            storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text.clone());
+        let _ = event_tx.send(PipelineEvent::QualityChecked {
+            passed: _quality_report.passed(),
+            warning_count: _quality_report.warnings.len(),
+        });
+        if !_quality_report.passed() {
+            for w in &_quality_report.warnings {
+                tracing::info!(target: "quality_gate", "质量警告: {:?}", w.code);
+            }
+        }
 
         // postprocess 后台跑，不阻塞 start_writing 返回。
         // event_tx 和 pipeline 分别 clone/move 进 spawn 闭包。
@@ -4047,6 +4067,18 @@ async fn regenerate(
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁
+        let _quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        let _ = event_tx.send(PipelineEvent::QualityChecked {
+            passed: _quality_report.passed(),
+            warning_count: _quality_report.warnings.len(),
+        });
+        if !_quality_report.passed() {
+            for w in &_quality_report.warnings {
+                tracing::info!(target: "quality_gate", "regenerate 质量警告: {:?}", w.code);
+            }
+        }
+
         let outcome = pipeline
             .run_postprocess(
                 &final_text,
