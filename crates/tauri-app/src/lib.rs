@@ -2604,13 +2604,10 @@ async fn start_writing(
                     _ => None,
                 };
 
-                // A.1：持锁条件写回，避免覆盖 Committing/terminal 快照
+                // P0：迟到结果只能写回当前活动 Attempt，不能复活 Superseded。
                 match update_turn_record_if(
                     &turn_id,
-                    |record| {
-                        !record.status.is_terminal()
-                            && record.status != storyforge_domain::turn::TurnStatus::Committing
-                    },
+                    |record| is_current_attempt_ready_for_postprocess(record, &attempt_id),
                     |record| {
                         if let Some(att) = record.find_attempt_mut(&attempt_id) {
                             att.pending_state_changes = batch;
@@ -2717,6 +2714,30 @@ where
     get_turn_store()
         .mutate_if(turn_id, predicate, mutate)
         .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
+}
+
+/// 后处理结果只能写回仍属于当前草稿的 Attempt。
+///
+/// `start_writing` 的 postprocess 在后台运行；用户可能在它返回前 regenerate。
+/// regenerate 会把旧 Attempt 标为 `Superseded` 并追加新 Attempt，因此这里不能只看
+/// TurnStatus，否则迟到结果会把旧 Attempt 重新置为 AwaitingAcceptance。
+/// 此函数作为 `TurnStore::mutate_if` 的 predicate，在同一把锁内完成检查与写回。
+fn is_current_attempt_ready_for_postprocess(
+    record: &storyforge_domain::turn::TurnRecord,
+    attempt_id: &Id,
+) -> bool {
+    use storyforge_domain::turn::{AttemptStatus, TurnStatus};
+
+    matches!(
+        record.status,
+        TurnStatus::DraftReady | TurnStatus::DerivingState
+    ) && record.active_attempt().is_some_and(|attempt| {
+        attempt.attempt_id == *attempt_id
+            && matches!(
+                attempt.status,
+                AttemptStatus::DraftReady | AttemptStatus::DerivingState
+            )
+    })
 }
 
 struct StartConversationTarget {
@@ -4700,13 +4721,10 @@ async fn regenerate(
                 }
                 _ => None,
             };
-            // A.1：regenerate 后处理写回同样走条件 CAS
+            // P0：同 start_writing；迟到结果只能写回当前活动 Attempt。
             match update_turn_record_if(
                 &turn.turn_id,
-                |record| {
-                    !record.status.is_terminal()
-                        && record.status != storyforge_domain::turn::TurnStatus::Committing
-                },
+                |record| is_current_attempt_ready_for_postprocess(record, &att_id),
                 |record| {
                     if let Some(att) = record.find_attempt_mut(&att_id) {
                         att.pending_state_changes = batch;
@@ -16007,5 +16025,58 @@ mod tests {
                 .any(|t| t.turn_id == turn_id)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P0：重 roll 后，旧 Attempt 的迟到 postprocess 不能把 Superseded 重新激活。
+    /// 否则 accept 会按同一 node 找到旧 diff，而不是当前草稿对应的 Attempt。
+    #[test]
+    fn postprocess_rejects_superseded_attempt_after_regenerate() {
+        use storyforge_domain::turn::{AttemptStatus, TurnAttempt, TurnRecord, TurnStatus};
+
+        let mut record = TurnRecord::new(
+            Id::from_str("camp-postprocess-race"),
+            Id::from_str("conv-postprocess-race"),
+            Id::from_str("node-postprocess-race"),
+            0,
+        );
+        record.status = TurnStatus::DraftReady;
+        let old_attempt_id = Id::from_str("attempt-old");
+        let new_attempt_id = Id::from_str("attempt-new");
+        let node_id = Id::from_str("node-postprocess-race");
+        record.attempts = vec![
+            TurnAttempt {
+                attempt_id: old_attempt_id.clone(),
+                variant_id: node_id.clone(),
+                draft_hash: "old-draft".into(),
+                status: AttemptStatus::Superseded,
+                pending_state_changes: None,
+                derivation: None,
+                quality_report: None,
+                pending_temporary_instances: vec![],
+                provenance: None,
+                created_at: "2026-07-11T00:00:00Z".into(),
+            },
+            TurnAttempt {
+                attempt_id: new_attempt_id.clone(),
+                variant_id: node_id,
+                draft_hash: "new-draft".into(),
+                status: AttemptStatus::DraftReady,
+                pending_state_changes: None,
+                derivation: None,
+                quality_report: None,
+                pending_temporary_instances: vec![],
+                provenance: None,
+                created_at: "2026-07-11T00:00:01Z".into(),
+            },
+        ];
+
+        assert!(
+            !is_current_attempt_ready_for_postprocess(&record, &old_attempt_id),
+            "late result for a superseded attempt must be ignored"
+        );
+        assert!(
+            is_current_attempt_ready_for_postprocess(&record, &new_attempt_id),
+            "current regenerate attempt may receive its own postprocess result"
+        );
     }
 }
