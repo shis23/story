@@ -450,13 +450,13 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 ## 10. 推荐实施顺序
 
 > **进度快照（2026-07-11）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。  
-> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0 完成**、**M1 基本完成**、M2 纯函数就绪待主路径接线）。
+> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4 可独立部分完成**；**M5** 真模型验收延后）。
 >
 > | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
 > | B | 部分 | QualityGate：**Error 拦截** + `force_accept`→Turn **Degraded**；Warning 不拦；Accept 旁提示/二次确认 | NarrativeContract、扩展 ScenePlan、有界自动修复 |
-> | C | **M0–M4 可独立部分** | history-epoch + epoch 快照；RoundSummary A/B/C；Director 装配；chronicle tools；Compressor 后台发布 + **可恢复 job 队列** | M5 真模型缓存/远楼/压缩损失对照 |
+> | C | **M0–M4 可独立部分** | history-epoch + epoch 快照；RoundSummary A/B/C；Director 装配；**A/B/C chronicle tools + 每轮预算**；lineage 回填；Compressor 后台发布 + **可恢复 job 队列** | M5 真模型缓存/远楼/压缩损失对照 |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
 ### 阶段 A：建立测量和安全边界

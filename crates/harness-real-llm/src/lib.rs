@@ -56,6 +56,7 @@ impl HarnessEnv {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],

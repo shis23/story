@@ -48,10 +48,10 @@ User Intent
 
 目标记忆工具（规格 v1.0；**M3 已接**，A/B/C 随存储 level；与自动召回并存）：
 
-- `search_chronicle(query, …)` — 当前搜 **Chronicle A**（RoundSummary 兼容视图）；返回短目录行（code + headline），不返回 full；**不含** ArchivedSummary；B/C 待压缩层
-- `get_chronicle(code|id, detail=summary|full)` — **默认 summary**；full 可选；带来源字段
+- `search_chronicle(query, level?, include_covered?, limit?)` — 搜 **Chronicle A/B/C**（RoundSummary 兼容视图，优先较近）；返回短目录行（code + headline + level + turn_span）；不返回 full；**不含** ArchivedSummary；每轮预算 `DEFAULT_SEARCH_MAX`
+- `get_chronicle(code|id, detail=summary|full)` — A/B/C；**默认 summary**；full 可选；返回 `source_kind`/`turn_span`/`covers`；每轮 summary/full 预算分计
 
-装配进度：**M0** 公式/类型 + **M1** RoundSummary `code`/`headline` + **M3 工具最小** 已落地；**M2** 主路径（概览/纪要带进 history、epoch 快照）待接线。目标：`H_anchor`+`E` 近正文 / 纪要带 S / 远概览 / 确定性分组批压。详见：
+装配进度：**M0–M4 可独立部分已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job 队列）。**M5** 真模型验收与 NarrativeContract / UnitOfWork 仍独立。目标：`H_anchor`+`E` 近正文 / 纪要带 S / 远概览 / 确定性分组批压。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 

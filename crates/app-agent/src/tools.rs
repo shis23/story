@@ -31,6 +31,89 @@ pub enum ToolError {
     Internal(String),
 }
 
+/// 本轮 Chronicle 工具调用预算（规格 `tool_summary_max` / `tool_full_max` / `search_max`）。
+///
+/// 用 `Arc` 包一层，使 `ToolContext` clone 后仍共享计数；每轮写作开始时换新实例。
+#[derive(Debug, Default)]
+pub struct ChronicleToolBudget {
+    search: std::sync::atomic::AtomicU32,
+    summary: std::sync::atomic::AtomicU32,
+    full: std::sync::atomic::AtomicU32,
+}
+
+impl Clone for ChronicleToolBudget {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            search: std::sync::atomic::AtomicU32::new(self.search.load(Relaxed)),
+            summary: std::sync::atomic::AtomicU32::new(self.summary.load(Relaxed)),
+            full: std::sync::atomic::AtomicU32::new(self.full.load(Relaxed)),
+        }
+    }
+}
+
+impl ChronicleToolBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn try_consume_search(&self) -> Result<u32, ToolError> {
+        self.try_consume(
+            &self.search,
+            storyforge_domain::chronicle::DEFAULT_SEARCH_MAX,
+            "search_chronicle",
+        )
+    }
+
+    pub fn try_consume_summary(&self) -> Result<u32, ToolError> {
+        self.try_consume(
+            &self.summary,
+            storyforge_domain::chronicle::DEFAULT_TOOL_SUMMARY_MAX,
+            "get_chronicle(summary)",
+        )
+    }
+
+    pub fn try_consume_full(&self) -> Result<u32, ToolError> {
+        self.try_consume(
+            &self.full,
+            storyforge_domain::chronicle::DEFAULT_TOOL_FULL_MAX,
+            "get_chronicle(full)",
+        )
+    }
+
+    fn try_consume(
+        &self,
+        counter: &std::sync::atomic::AtomicU32,
+        max: u32,
+        label: &str,
+    ) -> Result<u32, ToolError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let cur = counter.load(Relaxed);
+            if cur >= max {
+                return Err(ToolError::BadArgs(format!(
+                    "本轮 {label} 已达上限 {max}，请改用已读结果或缩小查询"
+                )));
+            }
+            if counter
+                .compare_exchange(cur, cur + 1, Relaxed, Relaxed)
+                .is_ok()
+            {
+                return Ok(cur + 1);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> (u32, u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.search.load(Relaxed),
+            self.summary.load(Relaxed),
+            self.full.load(Relaxed),
+        )
+    }
+}
+
 /// 工具上下文（提供给工具函数的数据源）
 #[derive(Clone)]
 pub struct ToolContext {
@@ -42,8 +125,10 @@ pub struct ToolContext {
     pub vector_store: Option<Arc<dyn storyforge_infra_vector::VectorStore>>,
     /// 已归档的远记忆摘要（get_recent_summary 工具用）
     pub archived_summaries: Vec<String>,
-    /// 规范 Chronicle A 兼容视图（RoundSummary + code/headline；search/get_chronicle 用）
+    /// Chronicle 目录（A/B/C RoundSummary 兼容视图；search/get_chronicle 用）
     pub chronicle_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    /// 本轮 Chronicle 工具预算（共享计数）
+    pub chronicle_tool_budget: Arc<ChronicleToolBudget>,
     /// Campaign 运行时快照（阶段 2 新增）。None = 未开 Campaign，走旧路径。
     pub campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
     /// 当前子 Agent 绑定的 instance id（阶段 4 新增）。
@@ -52,6 +137,28 @@ pub struct ToolContext {
     pub current_character_instance_id: Option<Id>,
     /// 本轮合并后的 ST regex scripts。工具返回 prompt 内容前可复用。
     pub regex_scripts: Vec<RegexScript>,
+}
+
+impl ToolContext {
+    /// 测试/占位用最小上下文。
+    pub fn empty() -> Self {
+        Self {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: Arc::new(ChronicleToolBudget::new()),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        }
+    }
+
+    /// 开始新一轮写作：重置 Chronicle 工具预算（保留目录与其它字段）。
+    pub fn reset_chronicle_tool_budget(&mut self) {
+        self.chronicle_tool_budget = Arc::new(ChronicleToolBudget::new());
+    }
 }
 
 /// 工具处理器（异步函数 trait）
@@ -412,23 +519,25 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
         },
     );
 
-    // search_chronicle: 仅搜 Chronicle A（当前 RoundSummary 演进形态；B/C 待 M4）
+    // search_chronicle: 搜 Chronicle A/B/C 目录（不含消息归档块）
     registry.register(
         ToolSpec::function(
             "search_chronicle",
-            "搜索剧情纪要目录（code + headline）。只搜规范 Chronicle，不含消息归档块。用于点名远楼线索。",
+            "搜索剧情纪要目录（code + headline）。含 A/B/C 规范 Chronicle，不含消息归档块。用于点名远楼线索。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "关键词（匹配 code/headline/summary）"},
                     "limit": {"type": "integer", "description": "最多返回条数（默认 3）"},
-                    "include_covered": {"type": "boolean", "description": "是否包含已被折叠的条目（默认 false）"}
+                    "include_covered": {"type": "boolean", "description": "是否包含已被折叠的条目（默认 false）"},
+                    "level": {"type": "string", "enum": ["a", "b", "c", "any"], "description": "限定层级，默认 any"}
                 },
                 "required": ["query"]
             }),
         ),
         |args, ctx| {
             Box::pin(async move {
+                let used = ctx.chronicle_tool_budget.try_consume_search()?;
                 let query = args
                     .get("query")
                     .and_then(|v| v.as_str())
@@ -443,11 +552,34 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .get("include_covered")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let level_filter = args
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("any")
+                    .to_ascii_lowercase();
+
+                // 新→旧：优先较近条目；B/C 与 A 同池按 turn_end 排
+                let mut catalog: Vec<&storyforge_domain::agent::RoundSummary> =
+                    ctx.chronicle_summaries.iter().collect();
+                catalog.sort_by_key(|s| std::cmp::Reverse(s.effective_turn_end()));
 
                 let mut hits = Vec::new();
-                for s in ctx.chronicle_summaries.iter().rev() {
+                for s in catalog {
                     if !include_covered && s.covered_by.is_some() {
                         continue;
+                    }
+                    if level_filter != "any" {
+                        let want = match level_filter.as_str() {
+                            "a" => 0,
+                            "b" => 1,
+                            "c" => 2,
+                            _ => return Err(ToolError::BadArgs(
+                                "level 须为 a/b/c/any".into(),
+                            )),
+                        };
+                        if s.level != want {
+                            continue;
+                        }
                     }
                     let code = s.code.clone().unwrap_or_default();
                     let headline = s.overview_headline(40);
@@ -461,8 +593,10 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                         hits.push(serde_json::json!({
                             "code": code,
                             "level": s.level,
+                            "level_name": chronicle_level_name(s.level),
                             "headline": headline,
-                            "turn_span": [s.turn, s.turn],
+                            "turn_span": [s.turn, s.effective_turn_end()],
+                            "covers_count": s.covers.len(),
                             "chronicle_entry_id": s.id.to_string(),
                             "covered_by": s.covered_by.as_ref().map(|id| id.to_string()),
                         }));
@@ -475,20 +609,22 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     "query": args.get("query").and_then(|v| v.as_str()).unwrap_or(""),
                     "results_count": hits.len(),
                     "results": hits,
+                    "budget_used_search": used,
+                    "budget_max_search": storyforge_domain::chronicle::DEFAULT_SEARCH_MAX,
                 }))
             })
         },
     );
 
-    // get_chronicle: 默认 summary；full 可选
+    // get_chronicle: 默认 summary；full 可选（含 B/C）
     registry.register(
         ToolSpec::function(
             "get_chronicle",
-            "按 code 或 id 读取一条剧情纪要。默认 detail=summary；full 返回更长正文。",
+            "按 code 或 id 读取一条剧情纪要（A/B/C）。默认 detail=summary；full 返回更长正文。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "如 A0012"},
+                    "code": {"type": "string", "description": "如 A0012 / B0003 / C0001"},
                     "id": {"type": "string", "description": "chronicle_entry_id / RoundSummary id"},
                     "detail": {"type": "string", "enum": ["summary", "full"], "description": "默认 summary"}
                 }
@@ -505,6 +641,11 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     .get("detail")
                     .and_then(|v| v.as_str())
                     .unwrap_or("summary");
+                let used = if detail == "full" {
+                    ctx.chronicle_tool_budget.try_consume_full()?
+                } else {
+                    ctx.chronicle_tool_budget.try_consume_summary()?
+                };
                 let found = ctx.chronicle_summaries.iter().find(|s| {
                     if let Some(id) = id
                         && s.id.as_str() == id
@@ -527,7 +668,18 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                 let body = if detail == "full" {
                     s.content.clone()
                 } else if let Some(h) = s.headline.as_ref().filter(|h| !h.trim().is_empty()) {
-                    h.clone()
+                    // summary：headline + 短截断正文，便于 B/C 导航
+                    let max = 240usize;
+                    let snippet = if s.content.chars().count() <= max {
+                        s.content.clone()
+                    } else {
+                        format!("{}…", s.content.chars().take(max).collect::<String>())
+                    };
+                    if snippet.trim().is_empty() || snippet == *h {
+                        h.clone()
+                    } else {
+                        format!("{h}\n{snippet}")
+                    }
                 } else {
                     let max = 240usize;
                     if s.content.chars().count() <= max {
@@ -536,21 +688,43 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                         format!("{}…", s.content.chars().take(max).collect::<String>())
                     }
                 };
+                let source_kind = match s.level {
+                    1 => "chronicle_b",
+                    2 => "chronicle_c",
+                    _ => "chronicle_a",
+                };
                 Ok(serde_json::json!({
                     "found": true,
                     "code": s.code,
                     "level": s.level,
+                    "level_name": chronicle_level_name(s.level),
                     "headline": s.overview_headline(40),
                     "detail": detail,
                     "body": body,
+                    "turn_span": [s.turn, s.effective_turn_end()],
+                    "covers": s.covers.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                     "chronicle_entry_id": s.id.to_string(),
                     "source_turn_ids": [s.turn],
-                    "source_kind": "chronicle_a",
+                    "source_kind": source_kind,
                     "covered_by": s.covered_by.as_ref().map(|id| id.to_string()),
+                    "budget_used": used,
+                    "budget_max": if detail == "full" {
+                        storyforge_domain::chronicle::DEFAULT_TOOL_FULL_MAX
+                    } else {
+                        storyforge_domain::chronicle::DEFAULT_TOOL_SUMMARY_MAX
+                    },
                 }))
             })
         },
     );
+}
+
+fn chronicle_level_name(level: u8) -> &'static str {
+    match level {
+        1 => "B",
+        2 => "C",
+        _ => "A",
+    }
 }
 
 fn render_world_info_tool_content(content: &str, ctx: &ToolContext) -> String {
@@ -738,6 +912,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -776,6 +951,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -806,6 +982,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -838,6 +1015,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: Some(runtime),
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -894,6 +1072,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: Some(cr),
             current_character_instance_id: Some(Id::from_str("inst-lin")),
             regex_scripts: vec![],
@@ -930,6 +1109,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -965,6 +1145,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: Some(runtime),
             current_character_instance_id: Some(Id::from_str("inst-nonexistent")),
             regex_scripts: vec![],
@@ -1030,6 +1211,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -1091,6 +1273,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![RegexScript {
@@ -1162,6 +1345,7 @@ mod tests {
                     vector_store: None,
                     archived_summaries: vec![],
             chronicle_summaries: vec![],
+                    chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
                     campaign_runtime: None,
                     current_character_instance_id: None,
                     regex_scripts: vec![],
@@ -1247,4 +1431,141 @@ mod tests {
             .collect();
         assert_eq!(first, second);
     }
+
+
+    fn sample_chronicle_catalog() -> Vec<storyforge_domain::agent::RoundSummary> {
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::Id;
+        let camp = Id::from_str("c1");
+        let conv = Id::from_str("v1");
+        let a = RoundSummary::new(camp.clone(), conv.clone(), 1, "远楼A：旧日密约".into())
+            .with_code("A0001")
+            .with_headline("旧日密约");
+        let mut b = RoundSummary::new(camp.clone(), conv.clone(), 1, "中期折叠：密约与背叛".into())
+            .with_code("B0001")
+            .with_headline("密约与背叛");
+        b.level = 1;
+        b.turn_end = 4;
+        b.covers = vec![a.id.clone()];
+        let a3 = RoundSummary::new(camp, conv, 6, "近轮A：对峙".into())
+            .with_code("A0006")
+            .with_headline("对峙");
+        vec![a, b, a3]
+    }
+
+    #[tokio::test]
+    async fn search_chronicle_finds_level_b() {
+        let mut catalog = sample_chronicle_catalog();
+        // clear covered_by on a3 path; ensure B is searchable
+        catalog[1].covered_by = None;
+        let budget = Arc::new(ChronicleToolBudget::new());
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: catalog,
+            chronicle_tool_budget: budget.clone(),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let result = registry
+            .dispatch(
+                "search_chronicle",
+                serde_json::json!({"query": "密约", "level": "b"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["results_count"], 1);
+        assert_eq!(result["results"][0]["code"], "B0001");
+        assert_eq!(result["results"][0]["level"], 1);
+        assert_eq!(result["results"][0]["level_name"], "B");
+        assert_eq!(result["results"][0]["turn_span"][1], 4);
+        assert_eq!(budget.snapshot().0, 1);
+    }
+
+    #[tokio::test]
+    async fn get_chronicle_full_budget_enforced() {
+        let catalog = sample_chronicle_catalog();
+        let budget = Arc::new(ChronicleToolBudget::new());
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: catalog,
+            chronicle_tool_budget: budget.clone(),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        for _ in 0..storyforge_domain::chronicle::DEFAULT_TOOL_FULL_MAX {
+            let ok = registry
+                .dispatch(
+                    "get_chronicle",
+                    serde_json::json!({"code": "B0001", "detail": "full"}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["found"], true);
+            assert_eq!(ok["source_kind"], "chronicle_b");
+        }
+        let err = registry
+            .dispatch(
+                "get_chronicle",
+                serde_json::json!({"code": "B0001", "detail": "full"}),
+                ctx,
+            )
+            .await;
+        assert!(matches!(err, Err(ToolError::BadArgs(_))), "over full budget: {err:?}");
+        assert_eq!(
+            budget.snapshot().2,
+            storyforge_domain::chronicle::DEFAULT_TOOL_FULL_MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn search_chronicle_budget_enforced() {
+        let catalog = sample_chronicle_catalog();
+        let budget = Arc::new(ChronicleToolBudget::new());
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: catalog,
+            chronicle_tool_budget: budget,
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        for _ in 0..storyforge_domain::chronicle::DEFAULT_SEARCH_MAX {
+            registry
+                .dispatch(
+                    "search_chronicle",
+                    serde_json::json!({"query": "对峙"}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        let err = registry
+            .dispatch(
+                "search_chronicle",
+                serde_json::json!({"query": "对峙"}),
+                ctx,
+            )
+            .await;
+        assert!(matches!(err, Err(ToolError::BadArgs(_))), "{err:?}");
+    }
+
 }

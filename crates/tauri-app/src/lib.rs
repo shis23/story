@@ -689,6 +689,7 @@ impl AppState {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -3324,11 +3325,15 @@ struct CampaignContextSnapshot {
     runtime: Arc<CampaignRuntimeContext>,
     /// 近期 RoundSummary（turn 升序），供 Director tail + get_recent_summary
     recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    /// search/get_chronicle 目录（含 B/C + 较远 A）
+    chronicle_tool_catalog: Vec<storyforge_domain::agent::RoundSummary>,
 }
 
 /// ContextCompiler load-side：写入 WritingContext 的近期摘要条数上限。
 /// turn 计数仍用全量 list_summaries.len()；注入侧再取 last 5。
 const RECENT_SUMMARIES_LOAD_LIMIT: usize = 12;
+/// search_chronicle / get_chronicle 目录上限：含 B/C 与较远 A，不必塞满 inject 窗口。
+const CHRONICLE_TOOL_CATALOG_LIMIT: usize = 256;
 
 /// 按 turn 升序后只保留最近 `limit` 条，避免长战役全量摘要进内存/工具上下文。
 fn take_recent_summaries_for_context(
@@ -3346,18 +3351,95 @@ fn take_recent_summaries_for_context(
     summaries
 }
 
+/// 工具侧 Chronicle 目录：优先保留全部 B/C，再保留最近的 A（按 turn_end）。
+fn build_chronicle_tool_catalog(
+    summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    limit: usize,
+) -> Vec<storyforge_domain::agent::RoundSummary> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut stages: Vec<_> = summaries
+        .iter()
+        .filter(|s| s.level > 0)
+        .cloned()
+        .collect();
+    stages.sort_by_key(|s| s.effective_turn_end());
+    let mut leaves: Vec<_> = summaries
+        .into_iter()
+        .filter(|s| s.level == 0)
+        .collect();
+    leaves.sort_by_key(|s| s.turn);
+
+    if stages.len() >= limit {
+        // 极端：B/C 已超 cap → 保留最新 stage
+        let drop_n = stages.len() - limit;
+        stages.drain(0..drop_n);
+        return stages;
+    }
+    let leaf_room = limit - stages.len();
+    if leaves.len() > leaf_room {
+        let drop_n = leaves.len() - leaf_room;
+        leaves.drain(0..drop_n);
+    }
+    stages.extend(leaves);
+    stages.sort_by_key(|s| s.effective_turn_end());
+    stages
+}
+
+/// 旧存档：缺 lineage 的 summary 回填为 campaign.lineage_id 并落盘。
+fn backfill_summary_lineage_if_needed(
+    store: &campaign_store::CampaignStore,
+    lineage: &Id,
+    summaries: &mut [storyforge_domain::agent::RoundSummary],
+) {
+    for s in summaries.iter_mut() {
+        if s.lineage_id.is_none() {
+            s.lineage_id = Some(lineage.clone());
+            if let Err(e) = store.update_summary_by_id(s.clone()) {
+                tracing::warn!(
+                    target: "context_compiler",
+                    "backfill summary lineage failed id={}: {e}",
+                    s.id
+                );
+            }
+        }
+    }
+}
+
+/// ensure campaign.lineage_id；若新建则立即 persist。
+fn ensure_campaign_lineage_persisted(
+    store: &campaign_store::CampaignStore,
+    camp: &mut storyforge_domain::campaign::Campaign,
+) -> Id {
+    let created = camp.lineage_id.is_none();
+    let lineage = camp.ensure_lineage_id().clone();
+    if created
+        && let Err(e) = store.update_campaign(camp.clone())
+    {
+        tracing::warn!(
+            target: "context_compiler",
+            "persist new lineage_id failed: {e}"
+        );
+    }
+    lineage
+}
+
 fn load_campaign_context_snapshot(
     store: &campaign_store::CampaignStore,
     active_id: &Id,
 ) -> Option<CampaignContextSnapshot> {
     let mut camp = store.get_campaign(active_id)?;
-    let _ = camp.ensure_lineage_id();
+    let lineage = ensure_campaign_lineage_persisted(store, &mut camp);
     let story_clock = camp.story_clock.clone();
-    // turn 用全量摘要条数；注入上下文只保留最近 K 条
-    let all_summaries = store.list_summaries(active_id);
+    // turn 用全量摘要条数；注入上下文只保留最近 K 条；工具目录另含 B/C
+    let mut all_summaries = store.list_summaries(active_id);
+    backfill_summary_lineage_if_needed(store, &lineage, &mut all_summaries);
     let existing_turns = all_summaries.len() as u32;
     let (epoch_snap, _) = refresh_and_persist_context_epoch(store, &mut camp, &all_summaries);
     let _ = epoch_snap; // applied via camp.context_epoch into runtime.campaign
+    let chronicle_tool_catalog =
+        build_chronicle_tool_catalog(all_summaries.clone(), CHRONICLE_TOOL_CATALOG_LIMIT);
     let recent_summaries =
         take_recent_summaries_for_context(all_summaries, RECENT_SUMMARIES_LOAD_LIMIT);
     let turn = existing_turns + 1;
@@ -3401,6 +3483,7 @@ fn load_campaign_context_snapshot(
         scoped_regex_scripts,
         runtime,
         recent_summaries,
+        chronicle_tool_catalog,
     })
 }
 
@@ -3427,8 +3510,9 @@ fn apply_campaign_context_snapshot(
         .iter()
         .map(|s| s.content.clone())
         .collect();
-    // 同步到 search_chronicle / get_chronicle（规范 A 兼容视图）
-    tool_guard.chronicle_summaries = ctx.recent_summaries.clone();
+    // 同步到 search_chronicle / get_chronicle（A/B/C 目录，宽于 inject 窗口）
+    tool_guard.chronicle_summaries = snapshot.chronicle_tool_catalog;
+    tool_guard.reset_chronicle_tool_budget();
 }
 
 /// 在 Context 编译入口刷新 ContextEpochSnapshot 并可选落盘。
@@ -3537,11 +3621,12 @@ pub fn fill_campaign_runtime_from_store(
         Some(c) => c,
         None => return,
     };
-    let _ = camp.ensure_lineage_id();
+    let lineage = ensure_campaign_lineage_persisted(store, &mut camp);
     ctx.campaign_id = Some(active_id.clone());
     ctx.story_clock = camp.story_clock.clone();
     // turn = 已有 round_summaries 数 + 1（下一轮）
-    let all_summaries = store.list_summaries(active_id);
+    let mut all_summaries = store.list_summaries(active_id);
+    backfill_summary_lineage_if_needed(store, &lineage, &mut all_summaries);
     let existing_turns = all_summaries.len() as u32;
     ctx.turn = existing_turns + 1;
     // pending_tasks：该 Campaign 下所有任务（build_director_user_msg 内部按触发条件过滤）
@@ -3592,6 +3677,8 @@ pub fn fill_campaign_runtime_from_store(
     ctx.campaign_runtime = Some(runtime.clone());
     // ContextCompiler：RoundSummary → Director history 前缀 + tools
     // load-side 只保留最近 K 条（turn 已在上方用全量条数计算）
+    let chronicle_tool_catalog =
+        build_chronicle_tool_catalog(all_summaries.clone(), CHRONICLE_TOOL_CATALOG_LIMIT);
     ctx.recent_summaries =
         take_recent_summaries_for_context(all_summaries, RECENT_SUMMARIES_LOAD_LIMIT);
 
@@ -3604,7 +3691,8 @@ pub fn fill_campaign_runtime_from_store(
             .iter()
             .map(|s| s.content.clone())
             .collect();
-        tool_guard.chronicle_summaries = ctx.recent_summaries.clone();
+        tool_guard.chronicle_summaries = chronicle_tool_catalog;
+        tool_guard.reset_chronicle_tool_budget();
     }
 }
 
@@ -3933,7 +4021,7 @@ fn build_mutation_batch(
     let expected_revision = store.get_campaign(camp_id).map(|c| c.revision).unwrap_or(0);
     let mut mutations: Vec<storyforge_domain::turn::Mutation> = vec![];
 
-    // 本轮摘要 → Chronicle A 兼容字段（code/headline；Accept 落盘为规范 A）
+    // 本轮摘要 → Chronicle A 兼容字段（code/headline/lineage；Accept 落盘为规范 A）
     if let Some(summary) = &outcome.summary {
         let existing = store.list_summaries(camp_id);
         let next_seq = next_chronicle_a_seq(&existing);
@@ -3943,6 +4031,10 @@ fn build_mutation_batch(
         );
         let headline =
             storyforge_domain::chronicle::truncate_headline(summary, 40);
+        let lineage = store
+            .get_campaign(camp_id)
+            .and_then(|c| c.lineage_id)
+            .unwrap_or_default();
         mutations.push(storyforge_domain::turn::Mutation::UpsertSummary(Box::new(
             storyforge_domain::agent::RoundSummary::new(
                 camp_id.clone(),
@@ -3951,7 +4043,8 @@ fn build_mutation_batch(
                 summary.clone(),
             )
             .with_code(code.as_str())
-            .with_headline(headline),
+            .with_headline(headline)
+            .with_lineage(lineage),
         )));
     }
 
@@ -13375,6 +13468,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -13478,6 +13572,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -15383,6 +15478,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(storyforge_app_agent::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
@@ -15452,6 +15548,43 @@ mod tests {
 
     /// 构造一个有 orphan knowledge 的 campaign，提议后返回的 patch 数 ≥ 1
     /// 且含 delete_orphan_knowledge action
+
+    #[test]
+    fn test_build_chronicle_tool_catalog_prefers_stages_and_recent_leaves() {
+        let campaign_id = Id::from_str("camp-catalog");
+        let mut items = Vec::new();
+        for turn in 1..=20 {
+            items.push(storyforge_domain::agent::RoundSummary::new(
+                campaign_id.clone(),
+                Id::new(),
+                turn,
+                format!("leaf-{turn}"),
+            ).with_code(format!("A{turn:04}")));
+        }
+        let mut stage = storyforge_domain::agent::RoundSummary::new(
+            campaign_id,
+            Id::new(),
+            1,
+            "stage-b".into(),
+        )
+        .with_code("B0001")
+        .with_headline("stage");
+        stage.level = 1;
+        stage.turn_end = 8;
+        items.push(stage);
+
+        let kept = build_chronicle_tool_catalog(items, 10);
+        assert_eq!(kept.len(), 10);
+        assert!(kept.iter().any(|s| s.code.as_deref() == Some("B0001")));
+        // remaining 9 slots are latest leaves
+        let leaf_turns: Vec<u32> = kept
+            .iter()
+            .filter(|s| s.level == 0)
+            .map(|s| s.turn)
+            .collect();
+        assert_eq!(leaf_turns, (12..=20).collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_meta_propose_campaign_repairs_orphan_knowledge() {
         use storyforge_domain::campaign::{Campaign, CharacterInstance};

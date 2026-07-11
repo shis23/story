@@ -439,6 +439,7 @@ mod tests {
             vector_store: None,
             archived_summaries: vec![],
             chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
             campaign_runtime: None,
             current_character_instance_id: None,
             regex_scripts: vec![],
