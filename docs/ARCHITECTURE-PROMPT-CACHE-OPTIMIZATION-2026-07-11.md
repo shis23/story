@@ -367,6 +367,9 @@ Usage
 
 ## 8. ContextCompiler 建议
 
+> **落地规格（2026-07-11 拍板）**：远楼概览 cap≈200、正文/纪要不重叠窗、三窗 epoch 同步滑动、A/B/C 攒 200 再压、Director 点名 tool 等，以专用文档为准，避免与本节早期评估表述漂移：  
+> [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
+
 下面的 P0～P6 是**内容保留优先级**：当 token budget 不足时，越靠前的内容越不能被裁掉。它不是 SillyTavern 的 injection depth，也不是最终 messages 的物理排列顺序。
 
 内容保留优先级：
@@ -481,8 +484,9 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
+6. **记忆金字塔 + 缓存友好三窗（目标规格已写，待实现）**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — 概览→纪要带→近正文、E 同步滑动、active A≥200→B、Director `search_chronicle`/`get_chronicle`。
 
-阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。
+阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 
 ### 阶段 D：一致性与发布
 

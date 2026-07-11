@@ -90,12 +90,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
-2. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
-3. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
-4. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
-5. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
-6. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
+1. **记忆 / Context 装配规格落地**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` — 概览 cap≈200、近 H 正文/中 S 纪要/远概览、epoch 同步滑动、A≥200→B 批压、Director `search_chronicle`/`get_chronicle`。实现前以该文档为目标态权威。
+2. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
+3. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
+4. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
+5. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
+6. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
+7. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
 
 ## 交接注意事项
 

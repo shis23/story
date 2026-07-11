@@ -36,6 +36,15 @@ User Intent
 - `search_vectors(query, top_k)`
 - `get_recent_summary(limit)`
 
+目标记忆工具（规格已拍板，实现见记忆文档；与自动召回并存）：
+
+- `search_chronicle(query, …)` — 返回短目录行（code + headline），不返回 full
+- `get_chronicle(code, detail=summary|full)` — **默认 summary**；full 可选、次数更严
+
+装配：近 H 轮正文 / 中 S 轮短纪要 / 远概览（cap≈200）/ epoch 同步滑动 / A≥200 批压 B。详见：
+
+- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
+
 当前输出：
 
 ```json

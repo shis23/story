@@ -28,7 +28,15 @@ StoryTask
 
 RoundSummary
   每轮成文后的摘要，用于记忆和回溯
+  （目标升级为 Chronicle A：code + headline + summary；见记忆规格）
+
+ChronicleEntry A/B/C（目标）
+  纪要金字塔：leaf / 一次压缩 / 二次压缩；covers/covered_by 折叠默认概览
 ```
+
+记忆层级、编号、压缩与注入规则的权威说明：
+
+- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
 ## Character
 

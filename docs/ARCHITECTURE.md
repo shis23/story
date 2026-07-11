@@ -121,6 +121,14 @@ Tauri
 
 架构方向不是删除 ST 兼容存储，而是把它降级为导入/导出和 fallback 来源。
 
+## 记忆与 Context 装配
+
+远楼记忆、RoundSummary/纪要金字塔、history-epoch、概览目录与 Director 点名展开的**目标规格**见：
+
+- [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
+
+总览与阶段划分仍见 [`docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md`](./ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md) §7–8、§10。
+
 ## 当前最高优先级债务
 
 1. Campaign 不是写作输入真相源。
