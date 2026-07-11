@@ -23,7 +23,7 @@ use crate::summarizer::{SummarizerError, run_summarizer};
 ///
 /// 两个 Option 独立：任一 Agent 失败，对应字段为 None，另一个照常返回。
 /// 调用方拿到结果后自行决定是否落盘 CampaignStore。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PostProcessOutcome {
     /// 本轮剧情摘要（总结 Agent 成功则有；失败或被 `enable_summarizer=false` 关闭为 None）
     pub summary: Option<String>,

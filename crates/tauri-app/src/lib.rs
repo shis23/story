@@ -2242,6 +2242,11 @@ async fn start_writing(
         // postprocess 后台跑，不阻塞 start_writing 返回。
         // event_tx 和 pipeline 分别 clone/move 进 spawn 闭包。
         let pp_event_tx = event_tx.clone();
+        let pp_turn_id = turn_record.as_ref().map(|t| t.turn_id.clone());
+        let pp_attempt_id = turn_record
+            .as_ref()
+            .and_then(|t| t.active_attempt())
+            .map(|a| a.attempt_id.clone());
         tokio::spawn(async move {
             let outcome = pipeline
                 .run_postprocess(
@@ -2255,8 +2260,43 @@ async fn start_writing(
                     &mvu_fragments,
                 )
                 .await;
-            if let Some(outcome) = outcome {
-                persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
+
+            // Phase A: postprocess 产出暂存到 TurnAttempt，不直接写 CampaignStore
+            if let (Some(turn_id), Some(attempt_id)) = (pp_turn_id, pp_attempt_id) {
+                let derivation = derive_components_from_outcome(&outcome);
+                let pc = PostprocessPersistContext::from_writing_context(&ctx);
+                let outcome_clone = outcome.clone();
+                let batch = match (pc, outcome_clone) {
+                    (Some(pc), Some(o)) => {
+                        let pc = pc.clone();
+                        tokio::task::spawn_blocking(move || {
+                            build_mutation_batch(
+                                get_campaign_store(),
+                                &pc,
+                                &o,
+                                &present_chars,
+                            )
+                        })
+                        .await
+                        .ok()
+                    }
+                    _ => None,
+                };
+
+                update_turn_record(&turn_id, |record| {
+                    if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                        att.pending_state_changes = batch;
+                        att.derivation = Some(derivation);
+                        att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+                    }
+                    record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
+                    record.touch();
+                });
+            } else {
+                // 非 Campaign 路径或无 TurnRecord：保持旧行为（直接写）
+                if let Some(outcome) = outcome {
+                    persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
+                }
             }
             let _ = pp_cancel_tx;
         });
@@ -3046,7 +3086,183 @@ async fn persist_postprocess_outcome_async(
     }
 }
 
-/// 把后处理产出落盘到 CampaignStore（知识 / 变量 / 任务 / 本轮摘要）
+/// Phase A: 从 PostProcessOutcome 推导 DerivationComponents（summary/state 分别追踪）。
+fn derive_components_from_outcome(
+    outcome: &Option<storyforge_app_agent::PostProcessOutcome>,
+) -> storyforge_domain::turn::DerivationComponents {
+    use storyforge_domain::turn::{DerivationComponents, DerivationStatus};
+    match outcome {
+        None => DerivationComponents {
+            // 两者都被配置关闭（run_postprocess 返回 None）
+            summary_derivation: DerivationStatus::Disabled,
+            state_derivation: DerivationStatus::Disabled,
+        },
+        Some(o) => DerivationComponents {
+            summary_derivation: if o.summary.is_some() {
+                DerivationStatus::Succeeded
+            } else {
+                DerivationStatus::Disabled
+            },
+            state_derivation: if o.post_process.is_some() {
+                if o.post_process.as_ref().map(|p| p.parse_succeeded).unwrap_or(false) {
+                    DerivationStatus::Succeeded
+                } else {
+                    DerivationStatus::Failed
+                }
+            } else {
+                DerivationStatus::Disabled
+            },
+        },
+    }
+}
+
+/// Phase A: 把后处理产出转换为 MutationBatch（不直接写 CampaignStore）。
+///
+/// 替代旧的 `persist_postprocess_outcome_to_store` 的写入逻辑，
+/// 只构建候选 diff，预分配知识和任务的稳定 ID。
+/// accept 时由 CampaignMutationCoordinator::apply_mutation_batch 提交。
+fn build_mutation_batch(
+    store: &campaign_store::CampaignStore,
+    persist_ctx: &PostprocessPersistContext,
+    outcome: &storyforge_app_agent::PostProcessOutcome,
+    present_chars: &[String],
+) -> storyforge_domain::turn::MutationBatch {
+    let camp_id = &persist_ctx.campaign_id;
+    let commit_id = Id::new();
+    let expected_revision = store.get_campaign(camp_id).map(|c| c.revision).unwrap_or(0);
+    let mut mutations: Vec<storyforge_domain::turn::Mutation> = vec![];
+
+    // 本轮摘要
+    if let Some(summary) = &outcome.summary {
+        mutations.push(storyforge_domain::turn::Mutation::UpsertSummary(Box::new(
+            storyforge_domain::agent::RoundSummary::new(
+                camp_id.clone(),
+                persist_ctx.conversation_id.clone(),
+                persist_ctx.turn,
+                summary.clone(),
+            ),
+        )));
+    }
+
+    // 后处理三合一
+    if let Some(pp) = &outcome.post_process {
+        let present_ids: std::collections::HashSet<String> =
+            present_chars.iter().cloned().collect();
+
+        let name_collisions: std::collections::HashSet<String> = {
+            let mut name_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for inst in store.list_instances(camp_id) {
+                *name_counts.entry(inst.name).or_insert(0) += 1;
+            }
+            name_counts
+                .into_iter()
+                .filter(|(_, count)| *count >= 2)
+                .map(|(name, _)| name)
+                .collect()
+        };
+
+        // 知识：broadcast 展开 + 预分配 entry_id（收敛决策步骤 18）
+        for u in &pp.knowledge_updates {
+            let entries = normalize_knowledge_update_for_postprocess(
+                store,
+                camp_id,
+                u,
+                persist_ctx.turn,
+                &present_ids,
+                &name_collisions,
+            );
+            for entry in entries {
+                let entry_id = entry.id.clone();
+                mutations.push(storyforge_domain::turn::Mutation::UpsertKnowledge(
+                    Box::new(storyforge_domain::turn::KnowledgeMutation {
+                        entry_id,
+                        campaign_id: entry.campaign_id.clone(),
+                        character_id: entry.character_id.clone(),
+                        knowledge_text: entry.knowledge_text.clone(),
+                        source: entry.source.clone(),
+                        source_character_id: entry.source_character_id.clone(),
+                        turn_number: entry.turn_number,
+                        event_id: entry.event_id.clone(),
+                        pinned: entry.pinned,
+                        propagation: entry.propagation.clone(),
+                    }),
+                ));
+            }
+        }
+
+        // 变量更新：角色级 / 全局级（绝对值，天然幂等）
+        for vu in &pp.variable_updates {
+            if let Some(inst_id) = &vu.instance_id {
+                if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
+                    let is_present = is_postprocess_instance_present(
+                        &inst,
+                        inst_id,
+                        &present_ids,
+                        &name_collisions,
+                    );
+                    if is_present {
+                        mutations.push(storyforge_domain::turn::Mutation::SetVariable {
+                            instance_id: Some(inst.id.clone()),
+                            key: vu.key.clone(),
+                            value: vu.value.clone(),
+                            turn: persist_ctx.turn,
+                        });
+                    } else {
+                        tracing::warn!(
+                            "跳过非在场角色 '{}' 的变量写入（present_chars 校验）",
+                            inst.name
+                        );
+                    }
+                }
+            } else {
+                mutations.push(storyforge_domain::turn::Mutation::SetVariable {
+                    instance_id: None,
+                    key: vu.key.clone(),
+                    value: vu.value.clone(),
+                    turn: persist_ctx.turn,
+                });
+            }
+        }
+
+        // 任务更新：已有（绝对状态）/ 新建（预分配 task_id）
+        for tu in &pp.task_updates {
+            if let Some(tid) = &tu.task_id {
+                if let Some(task) = store.get_task(tid)
+                    && let Some(task) = normalize_task_update_for_postprocess(
+                        camp_id,
+                        task,
+                        tu.new_status.clone(),
+                    )
+                {
+                    mutations.push(storyforge_domain::turn::Mutation::SetTaskStatus {
+                        task_id: task.id.clone(),
+                        status: task.status.clone(),
+                    });
+                }
+            } else if let Some(spec) = &tu.new_task {
+                let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
+                    camp_id.clone(),
+                    spec.title.clone(),
+                    spec.description.clone(),
+                    spec.triggers.clone(),
+                    persist_ctx.turn,
+                );
+                mutations.push(storyforge_domain::turn::Mutation::UpsertNewTask(Box::new(
+                    new_task,
+                )));
+            }
+        }
+    }
+
+    storyforge_domain::turn::MutationBatch {
+        commit_id,
+        expected_revision,
+        target_revision: expected_revision + 1,
+        status: storyforge_domain::turn::MutationBatchStatus::Prepared,
+        mutations,
+    }
+}
 fn persist_postprocess_outcome_to_store(
     store: &campaign_store::CampaignStore,
     persist_ctx: &PostprocessPersistContext,
