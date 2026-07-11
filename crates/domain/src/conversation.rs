@@ -232,6 +232,11 @@ pub struct Conversation {
     pub campaign_id: Option<Id>,
     /// 消息列表（按时间顺序，但可通过 parent_id 支持分支）
     pub nodes: Vec<MessageNode>,
+    /// 已归档的可归档消息水位（archivable 列表前缀长度）。
+    ///
+    /// 自动归档只处理 `archived_upto..archive_end`，避免同一段消息重复入向量池。
+    #[serde(default)]
+    pub archived_upto: usize,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -244,6 +249,7 @@ impl Conversation {
             character_id,
             campaign_id,
             nodes: Vec::new(),
+            archived_upto: 0,
             created_at: now,
             updated_at: now,
         }
@@ -468,6 +474,7 @@ mod tests {
             character_id: Some("char1".into()),
             campaign_id: None,
             nodes,
+            archived_upto: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

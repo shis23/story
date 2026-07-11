@@ -5751,25 +5751,21 @@ fn get_embed_config(state: tauri::State<'_, Arc<AppState>>) -> Option<serde_json
         })
 }
 
-/// 手动触发对话归档（将近期消息压缩为远记忆摘要并入库）
+/// 手动触发对话归档（将未归档前缀压缩为远记忆摘要并入库）
 #[tauri::command]
 async fn archive_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<usize, TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
-    let messages = archivable_messages_async(state.conv_store.clone(), conv_id).await?;
-
     let config = state
         .embed_config
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
         .ok_or("未配置嵌入 API，请先在设置中配置")?;
-
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
-
     let embedder = Arc::new(
         storyforge_infra_llm::Embedder::new(config)
             .map_err(|e| TauriCommandError::internal(e.to_string()))?,
@@ -5786,12 +5782,10 @@ async fn archive_conversation(
         model,
     );
 
-    let summaries = archiver
-        .maybe_archive(&messages)
+    let count = run_archive_with_watermark(&state, &conv_id, &archiver, true)
         .await
-        .map_err(|e| TauriCommandError::internal(format!("归档失败: {e}")))?;
-
-    Ok(summaries.len())
+        .map_err(TauriCommandError::internal)?;
+    Ok(count)
 }
 
 fn archivable_messages_from_conversation(conv: &Conversation) -> Vec<String> {
@@ -5808,54 +5802,119 @@ fn archivable_messages_from_conversation(conv: &Conversation) -> Vec<String> {
         .collect()
 }
 
-async fn archivable_messages_async(
+/// 归档快照：消息列表 + 水位 + campaign 标签。
+struct ArchiveSnapshot {
+    messages: Vec<String>,
+    archived_upto: usize,
+    campaign_id: Option<String>,
+    conversation_id: String,
+}
+
+async fn load_archive_snapshot(
     conv_store: Arc<ConversationStore>,
     conv_id: Id,
-) -> Result<Vec<String>, TauriCommandError> {
+) -> Result<ArchiveSnapshot, TauriCommandError> {
     tokio::task::spawn_blocking(move || {
-        conv_store
-            .get(&conv_id)
-            .map(|conv| archivable_messages_from_conversation(&conv))
-            .ok_or_else(|| {
-                storyforge_app_conversation::ConversationError::NotFound(conv_id.to_string())
-            })
+        let conv = conv_store.get(&conv_id).ok_or_else(|| {
+            TauriCommandError::from(storyforge_app_conversation::ConversationError::NotFound(
+                conv_id.to_string(),
+            ))
+        })?;
+        Ok::<ArchiveSnapshot, TauriCommandError>(ArchiveSnapshot {
+            messages: archivable_messages_from_conversation(&conv),
+            archived_upto: conv.archived_upto,
+            campaign_id: conv.campaign_id.map(|id| id.to_string()),
+            conversation_id: conv.id.to_string(),
+        })
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("读取归档消息任务失败: {e}")))?
-    .map_err(TauriCommandError::from)
+}
+
+/// 水位驱动归档：只处理 `archived_upto..` 前缀，成功后推进水位。
+///
+/// `require_threshold`：true 时与 ArchiveConfig.threshold 对齐（自动归档）；
+/// 手动命令也传 true，避免短对话误触发 LLM。
+async fn run_archive_with_watermark(
+    state: &Arc<AppState>,
+    conv_id: &Id,
+    archiver: &storyforge_app_memory::MemoryArchiver,
+    require_threshold: bool,
+) -> Result<usize, String> {
+    let snap = load_archive_snapshot(state.conv_store.clone(), conv_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let total = snap.messages.len();
+    let upto = snap.archived_upto.min(total);
+    if upto >= total {
+        return Ok(0);
+    }
+    let pending = &snap.messages[upto..];
+    if require_threshold
+        && pending.len() < storyforge_app_memory::ArchiveConfig::default().threshold
+    {
+        return Ok(0);
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let meta = storyforge_app_memory::ArchiveMeta {
+        campaign_id: snap.campaign_id,
+        conversation_id: Some(snap.conversation_id),
+    };
+
+    // 水位路径已确认 pending 需要归档：跳过 maybe_archive 的二次 threshold，
+    // 直接 archive_prefix；source_range 相对 pending 切片。
+    let summaries = archiver
+        .archive_prefix(pending, Some(&meta))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if summaries.is_empty() {
+        return Ok(0);
+    }
+
+    // 取最大 end_idx + 1 作为本轮推进量（相对 pending）
+    let advanced = summaries
+        .iter()
+        .map(|s| s.source_range.1.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    if advanced == 0 {
+        return Ok(summaries.len());
+    }
+    let new_upto = upto.saturating_add(advanced).min(total);
+    let conv_store = state.conv_store.clone();
+    let conv_id_clone = conv_id.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        conv_store.advance_archived_upto(&conv_id_clone, new_upto)
+    })
+    .await
+    .map_err(|e| format!("推进归档水位任务失败: {e}"))?
+    {
+        tracing::warn!("推进归档水位失败: {e}");
+    } else {
+        tracing::info!(
+            target: "far_memory",
+            "归档水位 {} → {}（+{} 条消息，{} 条总结）",
+            upto,
+            new_upto,
+            advanced,
+            summaries.len()
+        );
+    }
+    Ok(summaries.len())
 }
 
 // ─── 自动归档辅助 ──────────────────────────────────────────────────────────
 
-/// 检查对话消息数是否超过归档阈值，超过则在后台触发归档
+/// 检查对话未归档消息是否超过阈值，超过则在后台触发归档。
 ///
-/// 阈值：50 条非 Discarded 消息（与 ArchiveConfig.default().threshold 一致）。
+/// 阈值：50 条未归档消息（与 ArchiveConfig.default().threshold 一致）。
 /// 归档失败只 warn，不影响用户操作。
 async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
-    const ARCHIVE_THRESHOLD: usize = 50;
-
-    // 取对话，数非 Discarded 消息
-    let messages = match archivable_messages_async(state.conv_store.clone(), conv_id.clone()).await
-    {
-        Ok(messages) => messages,
-        Err(e) => {
-            tracing::debug!("读取自动归档消息失败，跳过: {e}");
-            return;
-        }
-    };
-
-    if messages.len() < ARCHIVE_THRESHOLD {
-        return;
-    }
-
-    tracing::info!(
-        "自动归档触发：对话 {} 消息数 {} >= 阈值 {}",
-        conv_id,
-        messages.len(),
-        ARCHIVE_THRESHOLD
-    );
-
-    // 检查嵌入配置
     let config = match state
         .embed_config
         .read()
@@ -5868,6 +5927,26 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
             return;
         }
     };
+
+    // 快速水位检查：未归档不足阈值则跳过（避免无意义构造 archiver）
+    match load_archive_snapshot(state.conv_store.clone(), conv_id.clone()).await {
+        Ok(snap) => {
+            let pending = snap.messages.len().saturating_sub(snap.archived_upto);
+            if pending < storyforge_app_memory::ArchiveConfig::default().threshold {
+                return;
+            }
+            tracing::info!(
+                "自动归档触发：对话 {} 未归档 {} 条 >= 阈值 {}",
+                conv_id,
+                pending,
+                storyforge_app_memory::ArchiveConfig::default().threshold
+            );
+        }
+        Err(e) => {
+            tracing::debug!("读取自动归档消息失败，跳过: {e}");
+            return;
+        }
+    }
 
     let llm = state.active_llm_or_mock();
     let vector_store = state.vector_store.clone();
@@ -5890,9 +5969,9 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
         model,
     );
 
-    match archiver.maybe_archive(&messages).await {
-        Ok(summaries) if !summaries.is_empty() => {
-            tracing::info!("自动归档完成：{} 条总结", summaries.len());
+    match run_archive_with_watermark(state, conv_id, &archiver, true).await {
+        Ok(n) if n > 0 => {
+            tracing::info!("自动归档完成：{} 条总结", n);
         }
         Ok(_) => {
             tracing::debug!("自动归档：无需归档");
@@ -11568,11 +11647,25 @@ mod tests {
             .append_ai_draft(&conversation.id, "kept draft".into(), None)
             .unwrap();
 
-        let messages = archivable_messages_async(state.conv_store.clone(), conversation.id.clone())
+        let snap = load_archive_snapshot(state.conv_store.clone(), conversation.id.clone())
             .await
             .unwrap();
 
-        assert_eq!(messages, vec!["user intent", "kept draft"]);
+        assert_eq!(snap.messages, vec!["user intent", "kept draft"]);
+        assert_eq!(snap.archived_upto, 0);
+    }
+
+    #[test]
+    fn test_archive_snapshot_respects_watermark_math() {
+        // 纯水位算术：未归档切片 = messages[archived_upto..]
+        let messages: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let archived_upto = 2usize;
+        let pending: &[String] = &messages[archived_upto..];
+        assert_eq!(pending, &["c".to_string(), "d".to_string()]);
+        let advanced = 1usize;
+        let new_upto = archived_upto + advanced;
+        assert_eq!(new_upto, 3);
+        assert_eq!(&messages[new_upto..], &["d".to_string()]);
     }
 
     #[tokio::test]

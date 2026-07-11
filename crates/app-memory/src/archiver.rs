@@ -91,44 +91,63 @@ impl MemoryArchiver {
     ///
     /// `recent_window` 是当前的近期消息列表。
     /// 返回归档的总结列表（可能为空）。
+    ///
+    /// 注意：本函数不负责水位/幂等——调用方应只传入尚未归档的前缀
+    ///（见 Conversation.archived_upto），否则向量池会出现重复 ArchivedSummary。
     pub async fn maybe_archive(
         &self,
         recent_window: &[String],
+    ) -> Result<Vec<ArchivedSummary>, MemoryError> {
+        self.maybe_archive_with_meta(recent_window, None).await
+    }
+
+    /// 同 `maybe_archive`，可附带 campaign/conversation metadata 写入向量记录。
+    pub async fn maybe_archive_with_meta(
+        &self,
+        recent_window: &[String],
+        meta: Option<&ArchiveMeta>,
     ) -> Result<Vec<ArchivedSummary>, MemoryError> {
         if recent_window.len() < self.config.threshold {
             debug!(target: "app-memory", "近期窗口 {} 条 < 阈值 {}，跳过归档", 
                 recent_window.len(), self.config.threshold);
             return Ok(vec![]);
         }
+        self.archive_prefix(recent_window, meta).await
+    }
 
-        let batch_size = self.config.archive_batch_size;
-        let trigger_count = self.config.archive_trigger_count;
-        let total_to_archive = batch_size * trigger_count;
-        let total_to_archive = total_to_archive.min(recent_window.len());
+    /// 归档给定消息前缀（不做 threshold 检查）。
+    ///
+    /// 用于水位驱动路径：调用方已确认需要归档，只传入未归档切片。
+    /// 最多归档 `archive_batch_size * archive_trigger_count` 条。
+    /// 返回的 `source_range` 相对于入参切片下标（0-based）。
+    pub async fn archive_prefix(
+        &self,
+        messages: &[String],
+        meta: Option<&ArchiveMeta>,
+    ) -> Result<Vec<ArchivedSummary>, MemoryError> {
+        if messages.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = self.config.archive_batch_size.max(1);
+        let trigger_count = self.config.archive_trigger_count.max(1);
+        let total_to_archive = (batch_size * trigger_count).min(messages.len());
 
         info!(target: "app-memory", "触发归档：取出最早的 {total_to_archive} 条消息压缩为长期记忆");
 
-        // 取出窗口头部（最早）的消息归档。
-        // 设计语义：窗口溢出时，把最早的消息压缩成 ArchivedSummary 入向量池，
-        // 调用方随后从 recent_window 删除这段（按返回的 source_range）。
-        // 注意：本函数是纯函数（入参是快照），**不负责去重/幂等**——
-        // 调用方必须保证不会对同一段消息重复归档（如用 last_archived_index 水位标记或加锁），
-        // 否则向量池会出现重复 ArchivedSummary，召回时 score 被放大。
-        let to_archive: Vec<(usize, String)> = recent_window
+        let to_archive: Vec<(usize, String)> = messages
             .iter()
             .enumerate()
             .take(total_to_archive)
             .map(|(i, s)| (i, s.clone()))
             .collect();
 
-        // 分批并发归档
         let mut summaries = Vec::new();
         let batches: Vec<Vec<(usize, String)>> = to_archive
             .chunks(batch_size)
             .map(|chunk| chunk.to_vec())
             .collect();
 
-        // 并发归档（用 futures::stream::buffer_unordered）
         use futures::StreamExt;
         let stream = futures::stream::iter(batches.into_iter().enumerate())
             .map(|(batch_idx, batch)| {
@@ -136,10 +155,10 @@ impl MemoryArchiver {
                 let config = self.config.clone();
                 let model = self.model.clone();
                 async move {
-                    let messages: Vec<&str> = batch.iter().map(|(_, m)| m.as_str()).collect();
+                    let msgs: Vec<&str> = batch.iter().map(|(_, m)| m.as_str()).collect();
                     let start_idx = batch.first().map(|(i, _)| *i).unwrap_or(0);
                     let end_idx = batch.last().map(|(i, _)| *i).unwrap_or(0);
-                    match archive_batch(&*llm, &messages, config.summary_max_chars, &model).await {
+                    match archive_batch(&*llm, &msgs, config.summary_max_chars, &model).await {
                         Ok((content, keywords)) => Ok(ArchivedSummary {
                             id: Id::new(),
                             content,
@@ -165,17 +184,35 @@ impl MemoryArchiver {
             }
         }
 
-        // 嵌入每条总结 → 入向量库
         for summary in &mut summaries {
             match self.embedder.embed(&summary.content).await {
                 Ok(vector) => {
+                    let mut metadata = std::collections::HashMap::new();
+                    if let Some(m) = meta {
+                        if let Some(cid) = &m.campaign_id {
+                            metadata.insert(
+                                "campaign_id".into(),
+                                serde_json::Value::String(cid.clone()),
+                            );
+                        }
+                        if let Some(vid) = &m.conversation_id {
+                            metadata.insert(
+                                "conversation_id".into(),
+                                serde_json::Value::String(vid.clone()),
+                            );
+                        }
+                        metadata.insert(
+                            "source".into(),
+                            serde_json::Value::String("message_archive".into()),
+                        );
+                    }
                     if let Err(e) = self.vector_store.upsert(VectorRecord {
                         id: summary.id.clone(),
                         content: summary.content.clone(),
                         vector: vector.clone(),
                         keywords: summary.keywords.clone(),
                         kind: VectorKind::ArchivedSummary,
-                        metadata: std::collections::HashMap::new(),
+                        metadata,
                     }) {
                         warn!(target: "app-memory", "总结 {} 入向量库失败: {e}", summary.id);
                     }
@@ -191,6 +228,13 @@ impl MemoryArchiver {
         info!(target: "app-memory", "归档完成：{} 条总结", summaries.len());
         Ok(summaries)
     }
+}
+
+/// 归档写入向量库时的可选标签（campaign / conversation 隔离）。
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveMeta {
+    pub campaign_id: Option<String>,
+    pub conversation_id: Option<String>,
 }
 
 // ─── 辅助函数 ──────────────────────────────────────────────────────────────

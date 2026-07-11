@@ -453,6 +453,28 @@ impl ConversationStore {
         })
     }
 
+    /// 推进归档水位（archived_upto）。只允许单调不减。
+    ///
+    /// `new_upto` 是 archivable 消息列表上的前缀长度（不是 node 下标）。
+    pub fn advance_archived_upto(
+        &self,
+        conv_id: &Id,
+        new_upto: usize,
+    ) -> Result<usize, ConversationError> {
+        self.with_conversation_mut(conv_id, |conv| {
+            if new_upto > conv.archived_upto {
+                conv.archived_upto = new_upto;
+                conv.updated_at = Utc::now();
+            }
+            Ok(conv.archived_upto)
+        })
+    }
+
+    /// 读取归档水位。
+    pub fn archived_upto(&self, conv_id: &Id) -> usize {
+        self.get(conv_id).map(|c| c.archived_upto).unwrap_or(0)
+    }
+
     /// 获取最近 N 条消息（用于上下文窗口）
     pub fn recent_messages(&self, conv_id: &Id, n: usize) -> Vec<String> {
         self.get(conv_id)
@@ -978,5 +1000,19 @@ mod tests {
             seed: 0,
             last_hint: None,
         }
+    }
+
+    #[test]
+    fn test_advance_archived_upto_is_monotonic() {
+        let store = temp_store();
+        let conv = store.create(None, None);
+        assert_eq!(store.archived_upto(&conv.id), 0);
+        assert_eq!(store.advance_archived_upto(&conv.id, 5).unwrap(), 5);
+        // 不允许回退
+        assert_eq!(store.advance_archived_upto(&conv.id, 3).unwrap(), 5);
+        assert_eq!(store.advance_archived_upto(&conv.id, 8).unwrap(), 8);
+        let reloaded = store.get(&conv.id).unwrap();
+        assert_eq!(reloaded.archived_upto, 8);
+        let _ = store.delete(&conv.id);
     }
 }
