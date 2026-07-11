@@ -13,9 +13,14 @@ use crate::archiver::MemoryError;
 
 // ─── 记忆命中结果 ──────────────────────────────────────────────────────────
 
-/// 记忆命中结果（Agent 工具返回用）
+/// 记忆命中结果（Agent 工具 / 远记忆自动召回）
+///
+/// A2 补 `id`：可追溯到向量库记录，merge 去重优先用 id。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryHit {
+    /// 向量库记录 id；关键词路径同样来自 VectorHit
+    #[serde(default)]
+    pub id: String,
     pub content: String,
     pub score: f32,
     pub kind: String,
@@ -25,6 +30,7 @@ pub struct MemoryHit {
 impl From<VectorHit> for MemoryHit {
     fn from(hit: VectorHit) -> Self {
         Self {
+            id: hit.id.to_string(),
             content: hit.content,
             score: hit.score,
             kind: format!("{:?}", hit.kind),
@@ -211,8 +217,12 @@ pub fn merge_memory_hits(
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for hit in vector_hits.into_iter().chain(keyword_hits) {
-        // MemoryHit 无稳定 id 字段；用 content+kind 去重（同一摘要 content 唯一足够）
-        let key = format!("{}|{}", hit.kind, hit.content);
+        // 优先用 id 去重；无 id 时回退 content+kind
+        let key = if hit.id.is_empty() {
+            format!("{}|{}", hit.kind, hit.content)
+        } else {
+            format!("id:{}", hit.id)
+        };
         if !seen.insert(key) {
             continue;
         }
@@ -284,6 +294,7 @@ mod tests {
         };
 
         let memory_hit = MemoryHit::from(hit);
+        assert_eq!(memory_hit.id, "test");
         assert_eq!(memory_hit.content, "测试内容");
         assert_eq!(memory_hit.score, 0.8);
     }
@@ -379,6 +390,7 @@ mod tests {
     #[test]
     fn test_merge_memory_hits_vector_first_then_keyword_fill() {
         let vector = vec![MemoryHit {
+            id: "v1".into(),
             content: "向量命中：诊所潜入".into(),
             score: 0.9,
             kind: "ArchivedSummary".into(),
@@ -386,12 +398,14 @@ mod tests {
         }];
         let keyword = vec![
             MemoryHit {
-                content: "向量命中：诊所潜入".into(), // 重复
+                id: "v1".into(), // 同 id 去重
+                content: "向量命中：诊所潜入".into(),
                 score: 1.0,
                 kind: "ArchivedSummary".into(),
                 keywords: vec![],
             },
             MemoryHit {
+                id: "k2".into(),
                 content: "关键词补齐：诊所值班".into(),
                 score: 1.0,
                 kind: "ArchivedSummary".into(),

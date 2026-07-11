@@ -144,13 +144,48 @@ pub struct WritingContext {
     /// 也同步到 ToolContext.archived_summaries 供 get_recent_summary 使用。
     /// ContextCompiler 最小版：先接落盘摘要，完整 epoch/预算裁剪留给阶段 C。
     pub recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
-    /// 远记忆自动召回命中（ArchivedSummary content，按相关度）。
+    /// 远记忆自动召回命中（带 id/score 溯源）。
     /// 由 Tauri 层在 start_writing 时按意图检索后填入；无向量库/无命中则为空。
-    pub far_memory_hits: Vec<String>,
+    pub far_memory_hits: Vec<FarMemoryHit>,
     /// A2：本轮模板宏 `{{random}}` / `{{roll}}` 的确定性种子。
     /// Pipeline 在 start_writing / regenerate 时用本轮 seed 写入 TemplateVarContext；
     /// 外部也可预置（例如重放）。None = 渲染层回退时间种子（旧行为）。
     pub template_random_seed: Option<u64>,
+}
+
+/// 远记忆命中（ContextCompiler 注入用，可追溯向量库 id / 分数）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FarMemoryHit {
+    pub id: String,
+    pub content: String,
+    pub score: f32,
+    pub kind: String,
+}
+
+impl FarMemoryHit {
+    pub fn new(
+        id: impl Into<String>,
+        content: impl Into<String>,
+        score: f32,
+        kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            content: content.into(),
+            score,
+            kind: kind.into(),
+        }
+    }
+
+    /// 测试/兼容：仅 content 的命中（无溯源）
+    pub fn from_content(content: impl Into<String>) -> Self {
+        Self {
+            id: String::new(),
+            content: content.into(),
+            score: 0.0,
+            kind: "ArchivedSummary".into(),
+        }
+    }
 }
 
 impl WritingContext {
@@ -1463,7 +1498,7 @@ impl PipelineOrchestrator {
         regex_scripts: &[RegexScript],
         template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
         recent_summaries: &[storyforge_domain::agent::RoundSummary],
-        far_memory_hits: &[String],
+        far_memory_hits: &[FarMemoryHit],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1998,15 +2033,16 @@ fn build_director_tail(
 /// 将远记忆召回结果渲染为导演 volatile tail 文本。
 ///
 /// - 取前 `limit` 条；单条截断 200 字。
+/// - 注入文本仍只含 content（不把 id/score 塞给模型）；溯源字段供日志/调试。
 /// - 空列表返回 None。
-pub fn render_far_memory_for_injection(hits: &[String], limit: usize) -> Option<String> {
+pub fn render_far_memory_for_injection(hits: &[FarMemoryHit], limit: usize) -> Option<String> {
     render_far_memory_for_injection_excluding(hits, limit, &[])
 }
 
 /// 同 `render_far_memory_for_injection`，但跳过与 `exclude`（通常是 recent_summaries）
 /// 内容高度重叠的命中，避免近期摘要与远记忆重复占预算。
 pub fn render_far_memory_for_injection_excluding(
-    hits: &[String],
+    hits: &[FarMemoryHit],
     limit: usize,
     exclude: &[String],
 ) -> Option<String> {
@@ -2019,11 +2055,11 @@ pub fn render_far_memory_for_injection_excluding(
         .filter(|s| !s.is_empty())
         .collect();
     let mut lines = Vec::new();
-    for content in hits {
+    for hit in hits {
         if lines.len() >= limit {
             break;
         }
-        let content = content.trim();
+        let content = hit.content.trim();
         if content.is_empty() {
             continue;
         }
@@ -2192,7 +2228,7 @@ fn build_editor_tail(
     performances_text: &str,
     hint: Option<&str>,
     recent_summaries: &[storyforge_domain::agent::RoundSummary],
-    far_memory_hits: &[String],
+    far_memory_hits: &[FarMemoryHit],
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
@@ -4367,19 +4403,23 @@ mod tests {
     #[test]
     fn test_render_far_memory_for_injection() {
         assert!(render_far_memory_for_injection(&[], 3).is_none());
-        let text =
-            render_far_memory_for_injection(&["昨夜潜入诊所".into(), "陈警官上门".into()], 3)
-                .expect("hits");
+        let hits = vec![
+            FarMemoryHit::new("a1", "昨夜潜入诊所", 0.9, "ArchivedSummary"),
+            FarMemoryHit::new("a2", "陈警官上门", 0.8, "ArchivedSummary"),
+        ];
+        let text = render_far_memory_for_injection(&hits, 3).expect("hits");
         assert!(text.contains("远记忆召回"));
         assert!(text.contains("昨夜潜入诊所"));
         assert!(text.contains("陈警官上门"));
+        // 注入文本不含溯源 id，避免污染模型上下文
+        assert!(!text.contains("a1"));
     }
 
     #[test]
     fn test_render_far_memory_excludes_recent_overlap() {
         let hits = vec![
-            "昨夜有人潜入诊所，林秋藏起病历。".into(),
-            "陈警官次日上门调查。".into(),
+            FarMemoryHit::from_content("昨夜有人潜入诊所，林秋藏起病历。"),
+            FarMemoryHit::from_content("陈警官次日上门调查。"),
         ];
         let exclude = vec!["昨夜有人潜入诊所，林秋藏起病历。".into()];
         let text =

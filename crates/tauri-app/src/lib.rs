@@ -3030,12 +3030,19 @@ async fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent
             if !hits.is_empty() {
                 tracing::info!(
                     target: "far_memory",
-                    "远记忆召回 {} 条（hybrid={}）",
+                    "远记忆召回 {} 条（hybrid={}）ids={:?}",
                     hits.len(),
-                    embedder.is_some()
+                    embedder.is_some(),
+                    hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
                 );
             }
-            ctx.far_memory_hits = hits.into_iter().map(|h| h.content).collect();
+            // 保留 id/score/kind 溯源；注入文本仍只用 content
+            ctx.far_memory_hits = hits
+                .into_iter()
+                .map(|h| {
+                    storyforge_app_pipeline::FarMemoryHit::new(h.id, h.content, h.score, h.kind)
+                })
+                .collect();
         }
         Err(e) => {
             tracing::warn!(target: "far_memory", "远记忆召回失败（跳过）: {e}");
