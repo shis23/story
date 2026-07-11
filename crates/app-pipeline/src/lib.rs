@@ -275,6 +275,85 @@ fn truncate_chars_pub(s: &str, max_chars: usize) -> String {
 }
 
 /// 把概览/纪要带作为 history 稳定前缀（旧于对话正文）。
+/// 优先使用冻结的 ContextEpochSnapshot 构造 history 前缀分区；无快照则回退动态划分。
+pub fn chronicle_partition_for_context(
+    summaries: &[storyforge_domain::agent::RoundSummary],
+    frozen: Option<&storyforge_domain::chronicle::ContextEpochSnapshot>,
+) -> ChroniclePromptPartition {
+    let fallback = partition_summaries_for_prompt(
+        summaries,
+        M2_H_ANCHOR_TURNS,
+        M2_BAND_TURNS,
+        M2_OVERVIEW_MAX,
+    );
+    let Some(snap) = frozen else {
+        return fallback;
+    };
+    use storyforge_domain::chronicle::sequence_from_committed_turn_id;
+    let by_code: std::collections::HashMap<String, &storyforge_domain::agent::RoundSummary> =
+        summaries
+            .iter()
+            .filter_map(|s| s.code.as_ref().map(|c| (c.clone(), s)))
+            .collect();
+    let by_turn: std::collections::HashMap<u32, &storyforge_domain::agent::RoundSummary> =
+        summaries.iter().map(|s| (s.turn, s)).collect();
+
+    let overview_lines: Vec<String> = snap
+        .overview_codes
+        .iter()
+        .map(|code| {
+            if let Some(s) = by_code.get(code.as_str()) {
+                format!("{} {}", code.as_str(), s.overview_headline(40))
+            } else {
+                code.as_str().to_string()
+            }
+        })
+        .collect();
+    let mut band_lines = Vec::new();
+    let mut band_turns = Vec::new();
+    for code in &snap.band_codes {
+        if let Some(s) = by_code.get(code.as_str()) {
+            band_turns.push(s.turn);
+            let body = if let Some(h) = s.headline.as_ref().filter(|h| !h.trim().is_empty()) {
+                h.trim().to_string()
+            } else {
+                truncate_chars_pub(&s.content, RECENT_SUMMARY_ITEM_MAX_CHARS)
+            };
+            band_lines.push(format!("{} T{}: {}", code.as_str(), s.turn, body));
+        }
+    }
+    // near turns: anchor + approximate live by max turn after head
+    let mut near_turns: Vec<u32> = snap
+        .raw_anchor_turn_ids
+        .iter()
+        .filter_map(sequence_from_committed_turn_id)
+        .collect();
+    if let Some(head) = snap
+        .source_head_turn_id
+        .as_ref()
+        .and_then(sequence_from_committed_turn_id)
+    {
+        for s in summaries {
+            if s.turn > head {
+                near_turns.push(s.turn);
+            }
+        }
+    }
+    near_turns.sort_unstable();
+    near_turns.dedup();
+    // if snapshot codes empty (fresh campaign), fall back
+    if overview_lines.is_empty() && band_lines.is_empty() && near_turns.is_empty() {
+        return fallback;
+    }
+    let _ = by_turn;
+    ChroniclePromptPartition {
+        overview_lines,
+        band_lines,
+        near_turns,
+        band_turns,
+    }
+}
+
 pub fn prepend_chronicle_history_prefix(
     history: Vec<storyforge_domain::llm::ChatMessage>,
     part: &ChroniclePromptPartition,
@@ -562,11 +641,9 @@ impl PipelineOrchestrator {
             );
         }
         // M2：概览 + 纪要带进 history 前缀；近窗摘要从 tail 剔除（硬去重）
-        let chronicle_part = partition_summaries_for_prompt(
+        let chronicle_part = chronicle_partition_for_context(
             &ctx.recent_summaries,
-            M2_H_ANCHOR_TURNS,
-            M2_BAND_TURNS,
-            M2_OVERVIEW_MAX,
+            ctx.context_epoch.as_ref(),
         );
         tracing::debug!(
             target: "context_compiler",
@@ -1229,11 +1306,9 @@ impl PipelineOrchestrator {
                     "Director regenerate history epoch"
                 );
             }
-            let chronicle_part = partition_summaries_for_prompt(
+            let chronicle_part = chronicle_partition_for_context(
                 &ctx.recent_summaries,
-                M2_H_ANCHOR_TURNS,
-                M2_BAND_TURNS,
-                M2_OVERVIEW_MAX,
+                ctx.context_epoch.as_ref(),
             );
             let director_history =
                 prepend_chronicle_history_prefix(director_history, &chronicle_part);
@@ -2231,11 +2306,9 @@ fn build_director_tail(
     }
 
     // M2：近窗/纪要带已进 history 时不再在 tail 双税；仅注入更远且未进前缀的摘要（兜底）
-    let part = partition_summaries_for_prompt(
+    let part = chronicle_partition_for_context(
         &ctx.recent_summaries,
-        M2_H_ANCHOR_TURNS,
-        M2_BAND_TURNS,
-        M2_OVERVIEW_MAX,
+        ctx.context_epoch.as_ref(),
     );
     let mut exclude_turns = part.near_turns.clone();
     exclude_turns.extend(part.band_turns.iter().copied());
