@@ -795,11 +795,16 @@ impl AppState {
         let conn_name = conn.name.clone();
 
         let client = storyforge_infra_llm::create_client(&conn).map_err(TauriCommandError::from)?;
+        // 生产路径统一包 retry（RateLimited/ServerError/Timeout 指数退避）
+        let retried = storyforge_infra_llm::with_retry(
+            client,
+            storyforge_domain::llm::RetryConfig::default(),
+        );
 
         // 包装 LlmInterceptor：每次 LLM 调用自动记录 payload/响应/token/延迟到 LogStore
         let intercepted: Arc<dyn LlmClient> =
             Arc::new(storyforge_app_logging::interceptor::LlmInterceptor::new(
-                Arc::from(client),
+                retried,
                 self.log_store.clone(),
                 conn_name,
             ));

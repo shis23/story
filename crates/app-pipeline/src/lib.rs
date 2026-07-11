@@ -555,6 +555,7 @@ impl PipelineOrchestrator {
                     &performances_text,
                     None,
                     &ctx.recent_summaries,
+                    &ctx.far_memory_hits,
                 )
             });
 
@@ -1134,6 +1135,7 @@ impl PipelineOrchestrator {
                     &ctx.regex_scripts,
                     template_context.as_ref(),
                     &ctx.recent_summaries,
+                    &ctx.far_memory_hits,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1182,6 +1184,7 @@ impl PipelineOrchestrator {
                     &ctx.regex_scripts,
                     template_context.as_ref(),
                     &ctx.recent_summaries,
+                    &ctx.far_memory_hits,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1384,6 +1387,7 @@ impl PipelineOrchestrator {
                     &ctx.regex_scripts,
                     template_context.as_ref(),
                     &ctx.recent_summaries,
+                    &ctx.far_memory_hits,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1418,6 +1422,7 @@ impl PipelineOrchestrator {
         regex_scripts: &[RegexScript],
         template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
         recent_summaries: &[storyforge_domain::agent::RoundSummary],
+        far_memory_hits: &[String],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1455,6 +1460,7 @@ impl PipelineOrchestrator {
                     &performances_text,
                     hint,
                     recent_summaries,
+                    far_memory_hits,
                 )
             });
 
@@ -2078,6 +2084,7 @@ fn build_editor_tail(
     performances_text: &str,
     hint: Option<&str>,
     recent_summaries: &[storyforge_domain::agent::RoundSummary],
+    far_memory_hits: &[String],
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
@@ -2088,6 +2095,11 @@ fn build_editor_tail(
     if let Some(summary_block) = render_recent_summaries_for_injection(recent_summaries, 5) {
         tail = tail.push(format!(
             "{summary_block}\n（合并成文时保持与上述摘要一致，勿改写已发生事实。）"
+        ));
+    }
+    if let Some(far_block) = render_far_memory_for_injection(far_memory_hits, 3) {
+        tail = tail.push(format!(
+            "{far_block}\n（合稿时仅作背景约束，勿整段复述远记忆。）"
         ));
     }
     if let Some(h) = hint {
@@ -4264,7 +4276,7 @@ mod tests {
         )];
         let layout = MessageLayout::build()
             .system("你是编剧")
-            .tail(|_| build_editor_tail("雨夜诊所", "### Lin\n林秋沉默。", None, &summaries));
+            .tail(|_| build_editor_tail("雨夜诊所", "### Lin\n林秋沉默。", None, &summaries, &[]));
         let msgs = layout.into_messages();
         let tail = msgs.last().unwrap().content.as_str();
         assert!(tail.contains("场景：雨夜诊所"), "应含场景: {tail}");
