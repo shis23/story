@@ -93,9 +93,71 @@ impl MemoryRecaller {
     }
 }
 
+/// 从自然语言查询抽取检索 token（中英混合）。
+///
+/// - 英文/数字：按空白与标点切词，长度 ≥ 2
+/// - 中文等非 ASCII：抽 2-gram，覆盖无空格连续文本
+pub fn extract_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for w in query.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
+        let w = w.trim();
+        if w.chars().count() >= 2 {
+            tokens.push(w.to_string());
+        }
+    }
+    let chars: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect();
+    for window in chars.windows(2) {
+        if window.iter().any(|c| !c.is_ascii()) {
+            tokens.push(window.iter().collect());
+        }
+    }
+    // 去重保序
+    let mut seen = std::collections::HashSet::new();
+    tokens.retain(|t| seen.insert(t.clone()));
+    tokens
+}
+
+/// 纯关键词远记忆召回（不依赖 Embedder）。
+///
+/// 用于 ContextCompiler 最小版：写作开始时按用户意图检索 `ArchivedSummary`，
+/// 注入 Director volatile tail。无命中 / 无 token 时返回空。
+pub fn recall_archived_by_query(
+    store: &dyn VectorStore,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryHit>, MemoryError> {
+    let tokens = extract_query_tokens(query);
+    if tokens.is_empty() || limit == 0 {
+        return Ok(vec![]);
+    }
+    // 多取一些再按 kind 过滤，避免被 WorldInfo 占满
+    let fetch = limit.saturating_mul(4).max(limit);
+    let hits = store.search_by_keywords(&tokens, fetch)?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in hits {
+        if hit.kind != storyforge_infra_vector::VectorKind::ArchivedSummary {
+            continue;
+        }
+        if !seen.insert(hit.id.as_str().to_string()) {
+            continue;
+        }
+        out.push(MemoryHit::from(hit));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storyforge_domain::Id;
+    use storyforge_infra_vector::{BruteForceStore, VectorKind, VectorRecord};
 
     #[test]
     fn test_memory_hit_from_vector_hit() {
@@ -111,5 +173,42 @@ mod tests {
         let memory_hit = MemoryHit::from(hit);
         assert_eq!(memory_hit.content, "测试内容");
         assert_eq!(memory_hit.score, 0.8);
+    }
+
+    #[test]
+    fn test_extract_query_tokens_chinese_bigrams() {
+        let tokens = extract_query_tokens("雨夜诊所");
+        assert!(tokens.iter().any(|t| t == "雨夜"));
+        assert!(tokens.iter().any(|t| t == "夜诊"));
+        assert!(tokens.iter().any(|t| t == "诊所"));
+    }
+
+    #[test]
+    fn test_recall_archived_by_query_filters_kind() {
+        let store = BruteForceStore::new();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("a1"),
+                content: "昨夜有人潜入诊所".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into(), "潜入".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("w1"),
+                content: "诊所常驻世界设定".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::WorldInfo,
+                metadata: Default::default(),
+            })
+            .unwrap();
+
+        let hits = recall_archived_by_query(&store, "诊所发生了什么", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("潜入诊所"));
     }
 }

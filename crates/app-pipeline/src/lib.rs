@@ -144,6 +144,9 @@ pub struct WritingContext {
     /// 也同步到 ToolContext.archived_summaries 供 get_recent_summary 使用。
     /// ContextCompiler 最小版：先接落盘摘要，完整 epoch/预算裁剪留给阶段 C。
     pub recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    /// 远记忆自动召回命中（ArchivedSummary content，按相关度）。
+    /// 由 Tauri 层在 start_writing 时按意图检索后填入；无向量库/无命中则为空。
+    pub far_memory_hits: Vec<String>,
 }
 
 impl WritingContext {
@@ -167,6 +170,7 @@ impl WritingContext {
             campaign_runtime: None,
             agent_profile_config: None,
             recent_summaries: vec![],
+            far_memory_hits: vec![],
         }
     }
 }
@@ -1905,6 +1909,11 @@ fn build_director_tail(
         tail = tail.push(summary_block);
     }
 
+    // 远记忆自动召回（向量库 ArchivedSummary，按意图关键词；无命中则跳过）
+    if let Some(far_block) = render_far_memory_for_injection(&ctx.far_memory_hits, 3) {
+        tail = tail.push(far_block);
+    }
+
     // 任务/伏笔注入（P2，确定性查表，零 LLM）：只注入 Pending/Active 且触发满足的任务
     if !ctx.pending_tasks.is_empty() {
         let task_block = storyforge_domain::story_task::render_tasks_for_injection(
@@ -1921,6 +1930,31 @@ fn build_director_tail(
 
     tail = tail.push("请分析意图并输出 Plan。");
     tail
+}
+
+/// 将远记忆召回结果渲染为导演 volatile tail 文本。
+///
+/// - 取前 `limit` 条；单条截断 200 字。
+/// - 空列表返回 None。
+pub fn render_far_memory_for_injection(hits: &[String], limit: usize) -> Option<String> {
+    if hits.is_empty() || limit == 0 {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for (i, content) in hits.iter().take(limit).enumerate() {
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        lines.push(format!("{}. {}", i + 1, truncate_chars(content, 200)));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "远记忆召回（与当前意图相关的归档摘要，供规划参考，勿整段复述）：\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// 将近期 RoundSummary 渲染为导演 volatile tail 文本。
@@ -4205,6 +4239,17 @@ mod tests {
     #[test]
     fn test_render_recent_summaries_empty_returns_none() {
         assert!(render_recent_summaries_for_injection(&[], 5).is_none());
+    }
+
+    #[test]
+    fn test_render_far_memory_for_injection() {
+        assert!(render_far_memory_for_injection(&[], 3).is_none());
+        let text =
+            render_far_memory_for_injection(&["昨夜潜入诊所".into(), "陈警官上门".into()], 3)
+                .expect("hits");
+        assert!(text.contains("远记忆召回"));
+        assert!(text.contains("昨夜潜入诊所"));
+        assert!(text.contains("陈警官上门"));
     }
 
     #[test]

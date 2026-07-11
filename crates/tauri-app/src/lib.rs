@@ -2361,6 +2361,7 @@ async fn start_writing(
         campaign_runtime: None,
         agent_profile_config: None,
         recent_summaries: vec![],
+        far_memory_hits: vec![],
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
@@ -2369,6 +2370,8 @@ async fn start_writing(
     fill_agent_profile_context(&mut ctx, &app);
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
     fill_campaign_context_async(&mut ctx, &app).await?;
+    // ContextCompiler：按用户意图自动召回 ArchivedSummary 远记忆
+    fill_far_memory_hits(&mut ctx, &app, &intent);
 
     // Phase A: Campaign 模式下创建 TurnRecord
     let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
@@ -2935,9 +2938,36 @@ fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolCo
     // 阶段 2 cleanup：先清空旧 runtime，避免 stale 数据残留。
     ctx.campaign_runtime = None;
     ctx.recent_summaries.clear();
+    ctx.far_memory_hits.clear();
     let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = None;
     tool_guard.archived_summaries.clear();
+}
+
+/// 按用户意图从向量库召回 ArchivedSummary（关键词，best-effort）。
+///
+/// 失败只 warn，不阻断写作。无命中时 `far_memory_hits` 为空。
+fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
+    ctx.far_memory_hits.clear();
+    let intent = intent.trim();
+    if intent.is_empty() {
+        return;
+    }
+    match storyforge_app_memory::recall_archived_by_query(state.vector_store.as_ref(), intent, 3) {
+        Ok(hits) => {
+            if !hits.is_empty() {
+                tracing::info!(
+                    target: "far_memory",
+                    "远记忆召回 {} 条（intent 前 40 字）",
+                    hits.len()
+                );
+            }
+            ctx.far_memory_hits = hits.into_iter().map(|h| h.content).collect();
+        }
+        Err(e) => {
+            tracing::warn!(target: "far_memory", "远记忆召回失败（跳过）: {e}");
+        }
+    }
 }
 
 struct CampaignContextSnapshot {
@@ -4126,6 +4156,7 @@ async fn regenerate(
 
     let conversation_id = Id::from_str(&req.conversation_id);
     let node_id = Id::from_str(&req.node_id);
+    let recall_hint = req.hint.clone();
 
     let pipeline_req = RegenerateRequest {
         conversation_id: conversation_id.clone(),
@@ -4167,11 +4198,16 @@ async fn regenerate(
         campaign_runtime: None,
         agent_profile_config: None,
         recent_summaries: vec![],
+        far_memory_hits: vec![],
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
     fill_agent_profile_context(&mut ctx, &app);
     fill_campaign_context_async(&mut ctx, &app).await?;
+    // regenerate：用 hint（若有）做远记忆召回；无 hint 则跳过
+    if let Some(hint) = recall_hint.as_deref().filter(|s| !s.trim().is_empty()) {
+        fill_far_memory_hits(&mut ctx, &app, hint);
+    }
 
     // cancel channel
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -9790,6 +9826,7 @@ mod tests {
             })),
             agent_profile_config: None,
             recent_summaries: vec![],
+            far_memory_hits: vec![],
         };
 
         let fragments = collect_mvu_fallback_fragments(
