@@ -1,0 +1,421 @@
+//! Campaign 版本化提交协调器（Phase A）
+//!
+//! `CampaignMutationCoordinator` 是 TurnCommit 和 MetaCommit 共用的版本化提交入口。
+//!
+//! 核心职责（收敛决策步骤 5/7/13/16/18）：
+//! 1. revision CAS：校验 `Campaign.revision == expected_revision`。
+//! 2. 逐条执行 Mutation（upsert 三态 / 绝对值写入）。
+//! 3. revision bump 一次（target_revision = expected + 1）。
+//! 4. per-campaign mutation lock：防止 TurnCommit 与 MetaCommit 并发。
+//!
+//! 物理原子性：阶段 A 只提供逻辑原子性（journal + 幂等 + 启动恢复），
+//! 真正的跨集合事务留给阶段 D（UnitOfWork/SQLite）。
+
+use std::sync::{Mutex, OnceLock};
+
+use storyforge_domain::Id;
+use storyforge_domain::turn::{Mutation, MutationBatch, MutationBatchStatus};
+
+use crate::campaign_store::{CampaignStore, UpsertResult};
+
+// ─── 提交错误 ───────────────────────────────────────────────────────────────
+
+/// 版本化提交的错误类型。
+#[derive(Debug, Clone)]
+pub enum CommitError {
+    /// Campaign 不存在
+    CampaignNotFound(Id),
+    /// revision CAS 失败（expected != current）
+    RevisionConflict { expected: u64, actual: u64 },
+    /// Mutation 的 upsert 发现 payload 冲突
+    MutationConflict(String),
+    /// 持久化失败
+    Storage(String),
+    /// per-campaign lock 获取失败（中毒锁）
+    LockPoisoned,
+}
+
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CampaignNotFound(id) => write!(f, "Campaign 不存在: {id}"),
+            Self::RevisionConflict { expected, actual } => {
+                write!(f, "revision 冲突: expected {expected}, actual {actual}")
+            }
+            Self::MutationConflict(msg) => write!(f, "mutation 冲突: {msg}"),
+            Self::Storage(msg) => write!(f, "存储失败: {msg}"),
+            Self::LockPoisoned => write!(f, "campaign mutation lock 中毒"),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+// ─── per-campaign mutation lock ─────────────────────────────────────────────
+
+/// 全局提交锁（Phase A 简化版）。
+///
+/// 阶段 A 用单个全局 Mutex 序列化所有 Campaign 的版本化提交。
+/// 不同 Campaign 之间会互相等待，但提交操作本身很快（JSON 写盘 + revision bump）。
+/// 阶段 D 可以升级为 per-campaign 细粒度锁。
+static GLOBAL_COMMIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// 在全局提交锁保护下执行闭包。
+///
+/// 保证 TurnCommit 和 MetaCommit 不会并发修改同一 Campaign。
+pub fn with_campaign_lock<R>(
+    f: impl FnOnce() -> Result<R, CommitError>,
+) -> Result<R, CommitError> {
+    let lock = GLOBAL_COMMIT_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().map_err(|_| CommitError::LockPoisoned)?;
+    f()
+}
+
+// ─── CampaignMutationCoordinator ────────────────────────────────────────────
+
+pub struct CampaignMutationCoordinator;
+
+impl CampaignMutationCoordinator {
+    /// 应用一个 MutationBatch 到 CampaignStore（TurnCommit / MetaCommit 共用入口）。
+    ///
+    /// 流程：
+    /// 1. CAS 校验 revision（区分首次提交与幂等重放）。
+    /// 2. 逐条执行 Mutation（upsert 三态 / 绝对值写入）。
+    /// 3. revision bump 一次（target_revision = expected + 1）。
+    ///
+    /// 幂等性：如果 `Campaign.revision == batch.target_revision`，
+    /// 说明 batch 已被重放过（同一 commit），只校验/补齐 mutation，不 bump revision。
+    /// 如果 revision 既不等于 expected 也不等于 target，说明被外部写入推进 → Conflict。
+    pub fn apply_mutation_batch(
+        store: &CampaignStore,
+        campaign_id: &Id,
+        batch: &MutationBatch,
+    ) -> Result<Id, CommitError> {
+        let campaign = store
+            .get_campaign(campaign_id)
+            .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
+
+        let is_replay = campaign.revision == batch.target_revision;
+        let is_first_apply = campaign.revision == batch.expected_revision;
+
+        if !is_replay && !is_first_apply {
+            // revision 既不是 expected 也不是 target → 被外部推进
+            return Err(CommitError::RevisionConflict {
+                expected: batch.expected_revision,
+                actual: campaign.revision,
+            });
+        }
+
+        // 逐条执行 mutation
+        for mutation in &batch.mutations {
+            Self::apply_single_mutation(store, campaign_id, mutation)?;
+        }
+
+        // revision bump（仅在首次提交时，幂等重放不 bump）
+        if is_first_apply {
+            let mut updated = store
+                .get_campaign(campaign_id)
+                .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
+            updated.revision = batch.target_revision;
+            store
+                .update_campaign(updated)
+                .map_err(CommitError::Storage)?;
+        }
+
+        Ok(batch.commit_id.clone())
+    }
+
+    /// 执行单条 Mutation（不 bump revision，由调用方统一 bump）。
+    fn apply_single_mutation(
+        store: &CampaignStore,
+        campaign_id: &Id,
+        mutation: &Mutation,
+    ) -> Result<(), CommitError> {
+        match mutation {
+            Mutation::SetVariable {
+                instance_id,
+                key,
+                value,
+                turn,
+            } => {
+                if let Some(inst_id) = instance_id {
+                    // 角色级变量
+                    let mut inst = store
+                        .get_instance(campaign_id, inst_id)
+                        .ok_or_else(|| {
+                            CommitError::Storage(format!(
+                                "instance {inst_id} 不存在于 campaign {campaign_id}"
+                            ))
+                        })?;
+                    inst.set_variable(key, value.clone(), *turn);
+                    store
+                        .update_instance(inst)
+                        .map_err(CommitError::Storage)?;
+                } else {
+                    // 全局 Campaign 变量
+                    let mut camp = store
+                        .get_campaign(campaign_id)
+                        .ok_or_else(|| {
+                            CommitError::CampaignNotFound(campaign_id.clone())
+                        })?;
+                    camp.set_variable(key, value.clone(), *turn);
+                    store
+                        .update_campaign(camp)
+                        .map_err(CommitError::Storage)?;
+                }
+                Ok(())
+            }
+
+            Mutation::UpsertKnowledge(km) => {
+                let entry = km.to_entry();
+                match store.upsert_knowledge(entry).map_err(CommitError::Storage)? {
+                    UpsertResult::Inserted | UpsertResult::AlreadyPresent => Ok(()),
+                    UpsertResult::Conflict(msg) => Err(CommitError::MutationConflict(msg)),
+                }
+            }
+
+            Mutation::SetTaskStatus { task_id, status } => {
+                let mut task = store.get_task(task_id).ok_or_else(|| {
+                    CommitError::Storage(format!("task {task_id} 不存在"))
+                })?;
+                task.status = status.clone();
+                store
+                    .update_task(task)
+                    .map_err(CommitError::Storage)?;
+                Ok(())
+            }
+
+            Mutation::UpsertNewTask(task) => {
+                match store
+                    .upsert_task((**task).clone())
+                    .map_err(CommitError::Storage)?
+                {
+                    UpsertResult::Inserted | UpsertResult::AlreadyPresent => Ok(()),
+                    UpsertResult::Conflict(msg) => Err(CommitError::MutationConflict(msg)),
+                }
+            }
+
+            Mutation::UpsertSummary(summary) => {
+                match store
+                    .upsert_summary((**summary).clone())
+                    .map_err(CommitError::Storage)?
+                {
+                    UpsertResult::Inserted | UpsertResult::AlreadyPresent => Ok(()),
+                    UpsertResult::Conflict(msg) => Err(CommitError::MutationConflict(msg)),
+                }
+            }
+
+            Mutation::FinalizeVariant { variant_id: _ } => {
+                // Draft → Final 由 ConversationStore 处理，不在 CampaignStore 范围
+                // TurnCoordinator.commit 会单独调 conv_store.accept_variant
+                Ok(())
+            }
+        }
+    }
+
+    /// 获取某 Campaign 的当前 revision（用于构建 MutationBatch 的 expected_revision）。
+    pub fn current_revision(store: &CampaignStore, campaign_id: &Id) -> Option<u64> {
+        store.get_campaign(campaign_id).map(|c| c.revision)
+    }
+
+    /// 检查 Campaign 是否有活动 Turn（屏障检查用）。
+    /// 实际检查由 TurnStore.get_active_turn 完成，这里只是转发。
+    pub fn has_active_turn(
+        turn_store: &crate::turn_store::TurnStore,
+        campaign_id: &Id,
+    ) -> bool {
+        turn_store.get_active_turn(campaign_id).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::campaign_store::CampaignStore;
+    use storyforge_domain::campaign::Campaign;
+    use storyforge_domain::character_knowledge::KnowledgeSource;
+    use storyforge_domain::turn::{KnowledgeMutation, Mutation};
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-coordinator-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn setup_campaign(store: &CampaignStore) -> Id {
+        let campaign = Campaign::new(Id::from_str("card-1"), "test".to_string());
+        let campaign_id = campaign.id.clone();
+        store.save_campaign(campaign).unwrap();
+        campaign_id
+    }
+
+    #[test]
+    fn apply_batch_bumps_revision_once() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        let batch = MutationBatch {
+            commit_id: Id::new(),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![],
+        };
+
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+
+        let updated = store.get_campaign(&campaign_id).unwrap();
+        assert_eq!(updated.revision, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_rejects_revision_conflict() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        // 手动 bump revision 到 2（模拟被另一个 TurnCommit 推进）
+        let mut camp = store.get_campaign(&campaign_id).unwrap();
+        camp.revision = 2;
+        store.update_campaign(camp).unwrap();
+
+        // batch 期望 0,target 1,但实际是 2 → conflict
+        let batch = MutationBatch {
+            commit_id: Id::new(),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![],
+        };
+
+        let result = CampaignMutationCoordinator::apply_mutation_batch(
+            &store,
+            &campaign_id,
+            &batch,
+        );
+        assert!(matches!(result, Err(CommitError::RevisionConflict { .. })));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_idempotent_replay() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        let batch = MutationBatch {
+            commit_id: Id::from_str("commit-1"),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![],
+        };
+
+        // 第一次应用
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        // 第二次（重放）：revision 已经是 1 == target_revision → 幂等 no-op
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+
+        let updated = store.get_campaign(&campaign_id).unwrap();
+        assert_eq!(updated.revision, 1, "revision should stay at 1 after replay");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_sets_global_variable() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        let batch = MutationBatch {
+            commit_id: Id::new(),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::SetVariable {
+                instance_id: None,
+                key: "story_clock".into(),
+                value: serde_json::json!("Day 5"),
+                turn: 1,
+            }],
+        };
+
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+
+        let camp = store.get_campaign(&campaign_id).unwrap();
+        assert_eq!(
+            camp.get_variable("story_clock"),
+            Some(&serde_json::json!("Day 5"))
+        );
+        assert_eq!(camp.revision, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_upserts_knowledge_idempotently() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = setup_campaign(&store);
+
+        let km = KnowledgeMutation {
+            entry_id: Id::from_str("k-1"),
+            campaign_id: campaign_id.clone(),
+            character_id: Id::from_str("char-1"),
+            knowledge_text: "看到了刀".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            turn_number: 1,
+            event_id: None,
+            pinned: false,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
+        };
+
+        let batch = MutationBatch {
+            commit_id: Id::from_str("commit-1"),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::UpsertKnowledge(Box::new(km.clone()))],
+        };
+
+        // 第一次
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        assert_eq!(store.list_knowledge(&campaign_id).len(), 1);
+
+        // 重放（revision 已是 1 == target）
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        assert_eq!(
+            store.list_knowledge(&campaign_id).len(),
+            1,
+            "knowledge should not be duplicated on replay"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_batch_unknown_campaign_returns_error() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+
+        let batch = MutationBatch {
+            commit_id: Id::new(),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![],
+        };
+
+        let result = CampaignMutationCoordinator::apply_mutation_batch(
+            &store,
+            &Id::from_str("nonexistent"),
+            &batch,
+        );
+        assert!(matches!(result, Err(CommitError::CampaignNotFound(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
