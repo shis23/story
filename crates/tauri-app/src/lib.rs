@@ -3194,16 +3194,37 @@ struct CampaignContextSnapshot {
     recent_summaries: Vec<storyforge_domain::agent::RoundSummary>,
 }
 
+/// ContextCompiler load-side：写入 WritingContext 的近期摘要条数上限。
+/// turn 计数仍用全量 list_summaries.len()；注入侧再取 last 5。
+const RECENT_SUMMARIES_LOAD_LIMIT: usize = 12;
+
+/// 按 turn 升序后只保留最近 `limit` 条，避免长战役全量摘要进内存/工具上下文。
+fn take_recent_summaries_for_context(
+    mut summaries: Vec<storyforge_domain::agent::RoundSummary>,
+    limit: usize,
+) -> Vec<storyforge_domain::agent::RoundSummary> {
+    summaries.sort_by_key(|s| s.turn);
+    if limit == 0 {
+        return Vec::new();
+    }
+    if summaries.len() > limit {
+        let drop_n = summaries.len() - limit;
+        summaries.drain(0..drop_n);
+    }
+    summaries
+}
+
 fn load_campaign_context_snapshot(
     store: &campaign_store::CampaignStore,
     active_id: &Id,
 ) -> Option<CampaignContextSnapshot> {
     let camp = store.get_campaign(active_id)?;
     let story_clock = camp.story_clock.clone();
-    let mut recent_summaries = store.list_summaries(active_id);
-    // 保证 turn 升序，便于 tail 取最近 N 条
-    recent_summaries.sort_by_key(|s| s.turn);
-    let existing_turns = recent_summaries.len() as u32;
+    // turn 用全量摘要条数；注入上下文只保留最近 K 条
+    let all_summaries = store.list_summaries(active_id);
+    let existing_turns = all_summaries.len() as u32;
+    let recent_summaries =
+        take_recent_summaries_for_context(all_summaries, RECENT_SUMMARIES_LOAD_LIMIT);
     let turn = existing_turns + 1;
     let tasks = store.list_tasks(active_id);
     let instances = store.list_instances(active_id);
@@ -3334,9 +3355,11 @@ pub fn fill_campaign_runtime_from_store(
     // 写入 WritingContext
     ctx.campaign_runtime = Some(runtime.clone());
     // ContextCompiler 最小版：RoundSummary → Director tail + get_recent_summary
-    let mut recent_summaries = store.list_summaries(active_id);
-    recent_summaries.sort_by_key(|s| s.turn);
-    ctx.recent_summaries = recent_summaries;
+    // load-side 只保留最近 K 条（turn 已在上方用全量条数计算）
+    ctx.recent_summaries = take_recent_summaries_for_context(
+        store.list_summaries(active_id),
+        RECENT_SUMMARIES_LOAD_LIMIT,
+    );
 
     // 同步到 ToolContext（快照，非 store 引用）
     {
@@ -14665,6 +14688,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_take_recent_summaries_for_context_keeps_last_k() {
+        let campaign_id = Id::from_str("camp-load-k");
+        let summaries: Vec<_> = (1..=15)
+            .map(|turn| {
+                storyforge_domain::agent::RoundSummary::new(
+                    campaign_id.clone(),
+                    Id::new(),
+                    turn,
+                    format!("summary-{turn}"),
+                )
+            })
+            .collect();
+        let kept = take_recent_summaries_for_context(summaries, 12);
+        assert_eq!(kept.len(), 12);
+        assert_eq!(kept.first().unwrap().turn, 4);
+        assert_eq!(kept.last().unwrap().turn, 15);
+        assert_eq!(kept.last().unwrap().content, "summary-15");
+    }
+
+    #[test]
+    fn test_take_recent_summaries_for_context_short_list_unchanged() {
+        let campaign_id = Id::from_str("camp-load-short");
+        let summaries = vec![storyforge_domain::agent::RoundSummary::new(
+            campaign_id,
+            Id::new(),
+            1,
+            "only".into(),
+        )];
+        let kept = take_recent_summaries_for_context(summaries, 12);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content, "only");
     }
 
     /// 构造一个有 orphan knowledge 的 campaign，提议后返回的 patch 数 ≥ 1

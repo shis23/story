@@ -101,12 +101,14 @@ export function usePipeline(handlers = {}) {
         // B3：warn-only 质量门禁结果，不阻断 accept/postprocess
         const passed = !!event.data?.passed
         const warningCount = event.data?.warning_count || 0
+        const errorCount = event.data?.error_count || 0
         const warnings = Array.isArray(event.data?.warnings) ? event.data.warnings : []
         writing.pipeline.quality = {
           passed,
           warningCount,
+          errorCount,
           warnings,
-          status: passed ? 'ok' : 'warn',
+          status: passed ? 'ok' : errorCount > 0 ? 'error' : 'warn',
         }
         if (!passed && warningCount > 0) {
           writing.pipeline.stateLabel = `已产出 · 质量警告 ${warningCount}`

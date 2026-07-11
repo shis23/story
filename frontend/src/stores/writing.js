@@ -67,13 +67,15 @@ export const useWritingStore = defineStore('writing', () => {
       return
     }
     const warningCount = dto.warning_count ?? (dto.warnings?.length || 0)
+    const errorCount = dto.error_count ?? 0
     const warnings = Array.isArray(dto.warnings) ? dto.warnings : []
     const passed = !!dto.passed
     pipeline.quality = {
       passed,
       warningCount,
+      errorCount,
       warnings,
-      status: passed ? 'ok' : 'warn',
+      status: passed ? 'ok' : errorCount > 0 ? 'error' : 'warn',
       source: 'turn',
     }
     if (!passed && warningCount > 0 && pipeline.state === 'done') {

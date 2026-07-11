@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import BaseDropdown from '../../components/base/BaseDropdown.vue'
 import RichContent from '../st/RichContent.vue'
 import { subagentRolesFromProvenance } from '../../utils/pipelineTrace.js'
+import { useWritingStore } from '../../stores/writing.js'
 
 // ⚠️ 契约红线组件:保持 props(4 个)+ emit(8 个)+ message shape 不变。
 // AppV2.vue 通过这 8 个 emit 接到 useMessageVariants composable。
@@ -15,6 +16,7 @@ const props = defineProps({
 
 const emit = defineEmits(['reroll', 'reroll-user', 'switch-variant', 'edit-variant', 'accept-variant', 'delete-variant', 'add-variant', 'branch'])
 
+const writing = useWritingStore()
 const showRerollMenu = ref(false)
 const showHintBox = ref(false)
 const pendingRerollKind = ref('')
@@ -28,6 +30,14 @@ const currentSourceContent = computed(() => currentVariant.value?.content ?? '')
 const variantCount = computed(() => props.message.variants.length)
 const subagentRoles = computed(() => subagentRolesFromProvenance(currentVariant.value?.provenance))
 const isUser = computed(() => props.message.role === 'user')
+// warn-only：采纳旁展示质量警告，不阻断 accept
+const qualityAcceptHint = computed(() => {
+  const q = writing.pipeline.quality
+  if (!q || q.passed) return null
+  const n = q.warningCount || (Array.isArray(q.warnings) ? q.warnings.length : 0)
+  if (!n) return null
+  return `质量警告 ${n}`
+})
 
 function switchVariant(delta) {
   let next = props.message.active_variant + delta
@@ -129,9 +139,15 @@ function rerollUser() {
     <div v-if="!isUser" class="flex flex-wrap items-center gap-2 mt-3 text-sm text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
       <button @click="startEdit" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors">✏️ 编辑</button>
       <button @click="acceptVariant" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors"
-        :class="currentVariant.status === 'final' ? 'text-ok' : ''">
+        :class="currentVariant.status === 'final' ? 'text-ok' : (qualityAcceptHint ? 'text-warn' : '')"
+        :title="qualityAcceptHint || undefined">
         {{ currentVariant.status === 'final' ? '✅ 已采纳' : '☑️ 采纳' }}
       </button>
+      <span
+        v-if="qualityAcceptHint && currentVariant.status !== 'final'"
+        class="text-[11px] text-warn"
+        :title="(writing.pipeline.quality?.warnings || []).join('\n')"
+      >{{ qualityAcceptHint }}</span>
       <button v-if="canBranch" @click="branchMessage" :disabled="busy" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">分支</button>
 
       <BaseDropdown v-model="showRerollMenu" align="left" :min-width="220">
