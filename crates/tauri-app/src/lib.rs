@@ -3893,7 +3893,42 @@ async fn regenerate(
         .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
-    if let Ok((text, _)) = &result {
+    if let Ok((text, _provenance)) = &result {
+        // Phase A: regenerate 创建新 TurnAttempt,旧 Attempt Superseded
+        // regenerate 的 replace_active_variant 改变了 node_id 的 active variant,
+        // 新 variant 在同一 node 上,用 req 的 node_id 作为 variant_id
+        let regen_attempt_id = if let Some(campaign_id) = &ctx.campaign_id {
+            if let Some(turn) = get_turn_store().get_active_turn(campaign_id) {
+                let new_attempt = storyforge_domain::turn::TurnAttempt {
+                    attempt_id: Id::new(),
+                    variant_id: node_id.clone(),
+                    draft_hash: compute_draft_hash(text),
+                    status: storyforge_domain::turn::AttemptStatus::DraftReady,
+                    pending_state_changes: None,
+                    derivation: None,
+                    provenance: None,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                let new_attempt_id = new_attempt.attempt_id.clone();
+                update_turn_record(&turn.turn_id, |record| {
+                    // 旧活动 Attempt → Superseded
+                    for att in &mut record.attempts {
+                        if att.status.is_active() {
+                            att.status = storyforge_domain::turn::AttemptStatus::Superseded;
+                        }
+                    }
+                    record.attempts.push(new_attempt);
+                    record.status = storyforge_domain::turn::TurnStatus::DraftReady;
+                    record.touch();
+                });
+                Some(new_attempt_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Phase 6：落盘本轮创建的临时 instance（在 postprocess 之前）
         persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
             .await;
@@ -3928,7 +3963,37 @@ async fn regenerate(
                 &mvu_fragments,
             )
             .await;
-        if let Some(outcome) = outcome {
+
+        // Phase A: postprocess 产出暂存到新 TurnAttempt（同 start_writing）
+        if let Some(campaign_id) = &ctx.campaign_id
+            && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
+            && let Some(att_id) = regen_attempt_id
+        {
+            let derivation = derive_components_from_outcome(&outcome);
+            let pc = PostprocessPersistContext::from_writing_context(&ctx);
+            let outcome_clone = outcome.clone();
+            let batch = match (pc, outcome_clone) {
+                (Some(pc), Some(o)) => {
+                    let pc = pc.clone();
+                    tokio::task::spawn_blocking(move || {
+                        build_mutation_batch(get_campaign_store(), &pc, &o, &present_chars)
+                    })
+                    .await
+                    .ok()
+                }
+                _ => None,
+            };
+            update_turn_record(&turn.turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&att_id) {
+                    att.pending_state_changes = batch;
+                    att.derivation = Some(derivation);
+                    att.status = storyforge_domain::turn::AttemptStatus::AwaitingAcceptance;
+                }
+                record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
+                record.touch();
+            });
+        } else if let Some(outcome) = outcome {
+            // 非 Campaign 路径：保持旧行为（直接写）
             persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
         }
     }
@@ -4857,7 +4922,10 @@ async fn commit_turn_attempt(
     Ok(())
 }
 
-/// 软删除当前变体（→ Discarded）
+/// 软删除当前变体（→ Discarded）。
+///
+/// Phase A: Campaign 模式下同时把对应 TurnAttempt 标 Discarded。
+/// Turn 仍开放，允许 regenerate（Discard Attempt ≠ Abandon Turn）。
 #[tauri::command]
 fn soft_delete_variant(
     conversation_id: String,
@@ -4866,10 +4934,92 @@ fn soft_delete_variant(
 ) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
+
+    // Phase A: Campaign 模式下标记 Attempt Discarded
+    if let Some(turn) = get_turn_store().get_turn_by_variant(&nid) {
+        let attempt_id = turn
+            .find_attempt_by_variant(&nid)
+            .map(|a| a.attempt_id.clone());
+        if let Some(att_id) = attempt_id {
+            update_turn_record(&turn.turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&att_id) {
+                    att.status = storyforge_domain::turn::AttemptStatus::Discarded;
+                }
+                record.touch();
+            });
+        }
+    }
+
     state
         .conv_store
         .soft_delete_variant(&conv_id, &nid)
         .map_err(|e| TauriCommandError::internal(e.to_string()))
+}
+
+/// Phase A: 放弃整个 Turn（终止本轮，排除 user 消息和所有 AI 草稿）。
+///
+/// 与 Discard Attempt 的区别：
+/// - Discard Attempt 只丢弃单个 AI 变体，Turn 仍开放。
+/// - Abandon Turn 终止整个 Turn，同时把 input user 变体和所有未 accept 的 AI 变体标记 Discarded。
+#[tauri::command]
+async fn abandon_turn(
+    conversation_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    let conv_id = Id::from_str(&conversation_id);
+
+    let active_campaign = {
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+
+    let Some(campaign_id) = active_campaign else {
+        return Err(TauriCommandError::validation(
+            "非 Campaign 模式不支持 abandon_turn".to_string(),
+        ));
+    };
+
+    let turn = get_turn_store().get_active_turn(&campaign_id).ok_or_else(|| {
+        TauriCommandError::validation("没有活动 Turn 可以放弃".to_string())
+    })?;
+
+    // 把 input user 变体和所有未 accept 的 AI 变体标记 Discarded
+    let conv_store = state.conv_store.clone();
+    let turn_clone = turn.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // Discard input user 消息
+        conv_store
+            .soft_delete_variant(&conv_id, &turn_clone.input_node_id)
+            .map_err(|e| e.to_string())?;
+        // Discard 所有未 accept 的 AI 变体
+        for attempt in &turn_clone.attempts {
+            if attempt.status.is_active() {
+                conv_store
+                    .soft_delete_variant(&conv_id, &attempt.variant_id)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("Abandon Turn 任务失败: {e}")))?
+    .map_err(TauriCommandError::internal)?;
+
+    // 标记 Turn Abandoned
+    update_turn_record(&turn.turn_id, |record| {
+        record.status = storyforge_domain::turn::TurnStatus::Abandoned;
+        for att in &mut record.attempts {
+            if att.status.is_active() {
+                att.status = storyforge_domain::turn::AttemptStatus::Discarded;
+            }
+        }
+        record.touch();
+    });
+
+    Ok(())
 }
 
 /// Tauri command: 删除指定消息及其后所有消息（截断对话 = 撤销从这条开始的写作）
@@ -8211,6 +8361,7 @@ pub fn run() {
             delete_message_from,
             add_variant,
             switch_variant,
+            abandon_turn,
             // M1 日志命令
             log_query,
             log_clear,
