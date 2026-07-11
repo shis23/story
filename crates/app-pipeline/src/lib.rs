@@ -1232,11 +1232,21 @@ impl PipelineOrchestrator {
                         target_task.character_id,
                         format_subagent_context_stable(&target_task.context_package),
                     );
-                    let volatile_text = format!(
+                    let mut volatile_text = format!(
                         "{}\n\n{}",
                         format_subagent_context_volatile(&target_task.context_package),
                         target_task.brief,
                     );
+                    // ContextCompiler 最小版：regenerate 单子 Agent 也注入近期摘要
+                    if let Some(block) =
+                        render_recent_summaries_for_injection(&ctx.recent_summaries, 5)
+                    {
+                        volatile_text.push_str("\n\n");
+                        volatile_text.push_str(&block);
+                        volatile_text.push_str(
+                            "\n（以上为近期剧情摘要，仅供保持连续性；勿泄露你角色不该知道的信息。）",
+                        );
+                    }
                     let hint_for_tail = hint.clone();
                     let sub_layout = storyforge_domain::message_layout::MessageLayout::build()
                         .system(stable_system)
