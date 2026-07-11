@@ -2436,11 +2436,13 @@ async fn start_writing(
     // postprocess 在后台跑（知识/变量/摘要写回），通过 event_tx 推进度。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
     if let Ok((final_text, draft_node_id, _)) = &result {
-        // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady
-        if let Some(ref turn) = turn_record {
+        // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady。
+        // 注意：本地 turn_record 快照不含新 Attempt，必须捕获 attempt_id 给后续写回。
+        let created_attempt_id = if let Some(ref turn) = turn_record {
             let draft_hash = compute_draft_hash(final_text);
+            let attempt_id = Id::new();
             let attempt = storyforge_domain::turn::TurnAttempt {
-                attempt_id: Id::new(),
+                attempt_id: attempt_id.clone(),
                 variant_id: draft_node_id.clone(),
                 draft_hash,
                 status: storyforge_domain::turn::AttemptStatus::DraftReady,
@@ -2455,7 +2457,10 @@ async fn start_writing(
                 record.status = storyforge_domain::turn::TurnStatus::DraftReady;
                 record.touch();
             });
-        }
+            Some(attempt_id)
+        } else {
+            None
+        };
         // Phase 6：落盘本轮创建的临时 instance（同步，在 postprocess 之前确保知识/变量写回能找到它们）
         persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
             .await;
@@ -2494,11 +2499,12 @@ async fn start_writing(
                 tracing::info!(target: "quality_gate", "质量警告: {:?}", w.code);
             }
         }
-        // 质量报告挂到当前 Attempt（若已创建），便于 accept 前复查
-        if let Some(ref turn) = turn_record {
+        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查
+        if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
             let report_for_attempt = quality_report.clone();
+            let attempt_id = attempt_id.clone();
             let _ = update_turn_record(&turn.turn_id, |record| {
-                if let Some(att) = record.active_attempt_mut() {
+                if let Some(att) = record.find_attempt_mut(&attempt_id) {
                     att.quality_report = Some(report_for_attempt);
                 }
                 record.touch();
@@ -2509,10 +2515,7 @@ async fn start_writing(
         // event_tx 和 pipeline 分别 clone/move 进 spawn 闭包。
         let pp_event_tx = event_tx.clone();
         let pp_turn_id = turn_record.as_ref().map(|t| t.turn_id.clone());
-        let pp_attempt_id = turn_record
-            .as_ref()
-            .and_then(|t| t.active_attempt())
-            .map(|a| a.attempt_id.clone());
+        let pp_attempt_id = created_attempt_id;
         tokio::spawn(async move {
             let outcome = pipeline
                 .run_postprocess(
