@@ -49,6 +49,9 @@ pub struct Campaign {
     /// 当前 Context epoch 快照（编译入口刷新；同 epoch 内 overview/band 冻结）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_epoch: Option<crate::chronicle::ContextEpochSnapshot>,
+    /// 压缩发布半提交意图（summaries 已写、metadata 未完成时保留；heal 后清空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_compress_publication: Option<crate::chronicle::PendingCompressPublication>,
 }
 
 fn default_story_clock() -> String {
@@ -74,6 +77,7 @@ impl Campaign {
             chronicle_revision: 0,
             lineage_id: Some(Id::new()),
             context_epoch: None,
+            pending_compress_publication: None,
         }
     }
 
@@ -101,6 +105,7 @@ impl Campaign {
             chronicle_revision: 0,
             lineage_id: Some(Id::new()),
             context_epoch: None,
+            pending_compress_publication: None,
         }
     }
 

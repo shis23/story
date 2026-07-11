@@ -319,8 +319,11 @@ impl CampaignStore {
     pub fn update_campaign(&self, campaign: Campaign) -> Result<(), String> {
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = campaigns.iter().position(|c| c.id == campaign.id) {
-            campaigns[idx] = campaign;
-            persist(&self.campaigns_path, &campaigns)?;
+            // 先 persist 再写内存，避免磁盘失败时内存已清空 epoch/marker
+            let mut next = campaigns.clone();
+            next[idx] = campaign;
+            persist(&self.campaigns_path, &next)?;
+            *campaigns = next;
         }
         Ok(())
     }
@@ -632,66 +635,99 @@ impl CampaignStore {
 
     /// 发布压缩结果：写 parent B/C + children.covered_by，bump chronicle_revision，清空 epoch。
     ///
-    /// 幂等：parents 已存在且 payload 一致时 no-op 插入。
-    /// 若 summaries 已写而 campaign 元数据未推进（崩溃窗口），worker 可调用
-    /// `heal_compress_publication_metadata` 仅补齐元数据。
+    /// 半提交协议：
+    /// 1) campaign.pending_compress_publication = intent（先落盘）
+    /// 2) summaries 写入（clone-then-persist）
+    /// 3) 完成：bump revision + clear epoch + clear pending
+    /// heal 只依赖 pending marker，不依赖 epoch 是否仍在。
     pub fn publish_compress_result(
         &self,
         campaign_id: &Id,
         parents: &[RoundSummary],
         child_covered_by: &[(Id, Id)],
     ) -> Result<(), String> {
-        // 先写 summaries，再写 campaign 元数据。若第二步失败，worker 可用 heal 补齐。
+        use storyforge_domain::chronicle::PendingCompressPublication;
+
+        let base_rev = self
+            .get_campaign(campaign_id)
+            .map(|c| c.chronicle_revision)
+            .unwrap_or(0);
+        let parent_ids: Vec<Id> = parents.iter().map(|p| p.id.clone()).collect();
+        let child_ids: Vec<Id> = child_covered_by.iter().map(|(c, _)| c.clone()).collect();
+        let pending = PendingCompressPublication::new(base_rev, parent_ids, child_ids);
+
+        // 1) 先写 intent
+        if let Some(mut camp) = self.get_campaign(campaign_id) {
+            camp.pending_compress_publication = Some(pending);
+            self.update_campaign(camp)?;
+        }
+
+        // 2) summaries：clone → persist → 写回内存（磁盘失败不污染内存）
         {
             let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+            let mut next = summaries.clone();
             for (child_id, parent_id) in child_covered_by {
-                if let Some(s) = summaries.iter_mut().find(|s| s.id == *child_id) {
+                if let Some(s) = next.iter_mut().find(|s| s.id == *child_id) {
                     s.covered_by = Some(parent_id.clone());
                 }
             }
             for parent in parents {
-                if let Some(idx) = summaries.iter().position(|s| s.id == parent.id) {
-                    if !Self::payloads_match(&summaries[idx], parent) {
+                if let Some(idx) = next.iter().position(|s| s.id == parent.id) {
+                    if !Self::payloads_match(&next[idx], parent) {
                         return Err(format!("stage summary id={} conflict", parent.id));
                     }
                 } else {
-                    summaries.push(parent.clone());
+                    next.push(parent.clone());
                 }
             }
-            persist(&self.summaries_path, &summaries)?;
+            persist(&self.summaries_path, &next)?;
+            *summaries = next;
         }
-        // 正常 publish 路径：始终 bump revision 并清空 epoch
-        self.apply_compress_campaign_metadata(campaign_id, /*force_bump*/ true)
+
+        // 3) 完成元数据
+        self.complete_compress_publication(campaign_id)
     }
 
-    /// 仅补齐 campaign 元数据（不写 summaries）。
-    /// - force_bump=true：总是 bump + clear epoch（完整 publish 后）
-    /// - force_bump=false：仅当 epoch 仍存在时 bump+clear（崩溃恢复，避免重复 bump）
+    /// 若存在 pending_compress_publication，完成 bump/clear；幂等。
     pub fn heal_compress_publication_metadata(&self, campaign_id: &Id) -> Result<(), String> {
-        self.apply_compress_campaign_metadata(campaign_id, /*force_bump*/ false)
+        self.complete_compress_publication(campaign_id)
     }
 
-    fn apply_compress_campaign_metadata(
-        &self,
-        campaign_id: &Id,
-        force_bump: bool,
-    ) -> Result<(), String> {
+    fn complete_compress_publication(&self, campaign_id: &Id) -> Result<(), String> {
         let Some(mut camp) = self.get_campaign(campaign_id) else {
             return Ok(());
         };
-        if force_bump || camp.context_epoch.is_some() {
+        let Some(pending) = camp.pending_compress_publication.clone() else {
+            // 无 marker：兼容旧路径——若仍有 epoch 且已有 covered+stage，仍尝试失效 epoch
+            if camp.context_epoch.is_some() {
+                let summaries = self.list_summaries(campaign_id);
+                let has_stage = summaries.iter().any(|s| s.level > 0);
+                let has_covered = summaries.iter().any(|s| s.covered_by.is_some());
+                if has_stage && has_covered {
+                    camp.bump_chronicle_revision();
+                    camp.context_epoch = None;
+                    return self.update_campaign(camp);
+                }
+            }
+            return Ok(());
+        };
+        // 仅当 revision 尚未越过 base 时 bump，避免重复 heal 连涨
+        if camp.chronicle_revision <= pending.base_chronicle_revision {
             camp.bump_chronicle_revision();
-            camp.context_epoch = None;
-            self.update_campaign(camp)?;
         }
-        Ok(())
+        camp.context_epoch = None;
+        camp.pending_compress_publication = None;
+        self.update_campaign(camp)
     }
 
-    /// 检测：是否存在 covered children / stage parents 但 campaign.context_epoch 仍冻结旧视图。
+    /// 需要 heal：存在 pending marker，或（兼容）epoch 未失效且已有 stage/covered。
     pub fn needs_compress_metadata_heal(&self, campaign_id: &Id) -> bool {
         let Some(camp) = self.get_campaign(campaign_id) else {
             return false;
         };
+        if camp.pending_compress_publication.is_some() {
+            return true;
+        }
         if camp.context_epoch.is_none() {
             return false;
         }
@@ -1754,6 +1790,38 @@ mod tests {
         let camp2 = store.get_campaign(&camp_id).unwrap();
         assert!(camp2.chronicle_revision > rev0);
         assert!(camp2.context_epoch.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn heal_completes_pending_marker_without_epoch() {
+        use storyforge_domain::chronicle::PendingCompressPublication;
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let camp_id = Id::from_str("camp-heal");
+        let mut camp = Campaign::new(Id::from_str("card"), "n");
+        camp.id = camp_id.clone();
+        camp.chronicle_revision = 3;
+        camp.context_epoch = None; // 模拟第一次 publish 后 epoch 已清，但第二次半提交
+        camp.pending_compress_publication = Some(PendingCompressPublication::new(
+            3,
+            vec![Id::from_str("p1")],
+            vec![Id::from_str("c1")],
+        ));
+        store.save_campaign(camp).unwrap();
+        assert!(store.needs_compress_metadata_heal(&camp_id));
+        store.heal_compress_publication_metadata(&camp_id).unwrap();
+        let camp2 = store.get_campaign(&camp_id).unwrap();
+        assert!(camp2.pending_compress_publication.is_none());
+        assert!(camp2.chronicle_revision > 3);
+        assert!(camp2.context_epoch.is_none());
+        // 再次 heal 幂等：不继续涨 revision
+        let rev = camp2.chronicle_revision;
+        store.heal_compress_publication_metadata(&camp_id).unwrap();
+        assert_eq!(
+            store.get_campaign(&camp_id).unwrap().chronicle_revision,
+            rev
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

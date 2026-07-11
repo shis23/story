@@ -6023,8 +6023,9 @@ fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
                 uncovered_b,
                 "compress job enqueued"
             );
-            // 已有 open job（可能 Running）时禁止重复 spawn，避免双 worker 并发 publish
-            if created {
+            // Pending（含失败回队）允许再次 spawn；Running 不重复 spawn。
+            // 实际互斥靠 try_claim_pending。
+            if created || job.status == compress_job_store::CompressJobStatus::Pending {
                 spawn_compress_job_worker(state, job.id);
             }
         }

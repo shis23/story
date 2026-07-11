@@ -34,7 +34,35 @@ pub const DEFAULT_TOOL_FULL_MAX: u32 = 2;
 /// 每轮 search_chronicle 上限。
 pub const DEFAULT_SEARCH_MAX: u32 = 3;
 /// Compiler / snapshot 算法版本（防漂移假稳定）。
-pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.1";
+pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.2";
+
+/// 压缩发布意图（磁盘侧半提交恢复用）。
+///
+/// 流程：写 summaries 前/后写入 campaign.pending；metadata 成功后清空。
+/// heal 只依赖本 marker，不依赖 context_epoch 是否仍存在。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCompressPublication {
+    pub publication_id: Id,
+    /// 发布前的 chronicle_revision（成功后应 > 该值）
+    pub base_chronicle_revision: u64,
+    /// 本批 parent stage summary ids
+    pub parent_ids: Vec<Id>,
+    /// 被覆盖的 child leaf/stage ids
+    pub child_ids: Vec<Id>,
+    pub created_at: String,
+}
+
+impl PendingCompressPublication {
+    pub fn new(base_chronicle_revision: u64, parent_ids: Vec<Id>, child_ids: Vec<Id>) -> Self {
+        Self {
+            publication_id: Id::new(),
+            base_chronicle_revision,
+            parent_ids,
+            child_ids,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
 
 // ─── 身份与层级 ────────────────────────────────────────────────────────────
 

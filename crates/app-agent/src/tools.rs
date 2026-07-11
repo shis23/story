@@ -693,23 +693,8 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                     2 => "chronicle_c",
                     _ => "chronicle_a",
                 };
-                // B/C：展开 covers 子条目的 turn 范围；A：单 turn
-                let source_turn_ids: Vec<u32> = if s.covers.is_empty() {
-                    vec![s.turn]
-                } else {
-                    let mut turns: Vec<u32> = ctx
-                        .chronicle_summaries
-                        .iter()
-                        .filter(|c| s.covers.iter().any(|id| id == &c.id))
-                        .flat_map(|c| [c.turn, c.effective_turn_end()])
-                        .collect();
-                    if turns.is_empty() {
-                        turns = vec![s.turn, s.effective_turn_end()];
-                    }
-                    turns.sort_unstable();
-                    turns.dedup();
-                    turns
-                };
+                // B/C：递归展开 covers 到 leaf A 的 turn 集合；A：单 turn
+                let source_turn_ids = expand_source_turn_ids(s, &ctx.chronicle_summaries);
                 Ok(serde_json::json!({
                     "found": true,
                     "code": s.code,
@@ -734,6 +719,54 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
             })
         },
     );
+}
+
+fn expand_source_turn_ids(
+    entry: &storyforge_domain::agent::RoundSummary,
+    catalog: &[storyforge_domain::agent::RoundSummary],
+) -> Vec<u32> {
+    use std::collections::{HashSet, VecDeque};
+    if entry.covers.is_empty() {
+        // leaf A 或无 covers 的 stage：返回闭区间内全部 turn（span 连续假设）
+        let start = entry.turn;
+        let end = entry.effective_turn_end();
+        return (start..=end).collect();
+    }
+    let by_id: std::collections::HashMap<_, _> =
+        catalog.iter().map(|s| (s.id.to_string(), s)).collect();
+    let mut turns = HashSet::new();
+    let mut q: VecDeque<String> = entry.covers.iter().map(|id| id.to_string()).collect();
+    let mut seen = HashSet::new();
+    while let Some(id) = q.pop_front() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(child) = by_id.get(&id) {
+            if child.covers.is_empty() || child.is_leaf_a() {
+                let start = child.turn;
+                let end = child.effective_turn_end();
+                for t in start..=end {
+                    turns.insert(t);
+                }
+            } else {
+                for c in &child.covers {
+                    q.push_back(c.to_string());
+                }
+                // 若子 stage 无进一步 covers 命中，至少纳入其 span
+                if child.covers.is_empty() {
+                    for t in child.turn..=child.effective_turn_end() {
+                        turns.insert(t);
+                    }
+                }
+            }
+        }
+    }
+    if turns.is_empty() {
+        return (entry.turn..=entry.effective_turn_end()).collect();
+    }
+    let mut out: Vec<u32> = turns.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 fn chronicle_level_name(level: u8) -> &'static str {
@@ -1587,5 +1620,31 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(ToolError::BadArgs(_))), "{err:?}");
+    }
+
+    #[test]
+    fn expand_source_turn_ids_recurses_c_to_a() {
+        use storyforge_domain::Id;
+        use storyforge_domain::agent::RoundSummary;
+        let camp = Id::from_str("c1");
+        let conv = Id::from_str("v1");
+        let a1 = RoundSummary::new(camp.clone(), conv.clone(), 1, "a1".into()).with_code("A0001");
+        let a2 = RoundSummary::new(camp.clone(), conv.clone(), 2, "a2".into()).with_code("A0002");
+        let a3 = RoundSummary::new(camp.clone(), conv.clone(), 3, "a3".into()).with_code("A0003");
+        let a4 = RoundSummary::new(camp.clone(), conv.clone(), 4, "a4".into()).with_code("A0004");
+        let mut b = RoundSummary::new(camp.clone(), conv.clone(), 1, "b".into())
+            .with_code("B0001")
+            .with_headline("b");
+        b.level = 1;
+        b.turn_end = 4;
+        b.covers = vec![a1.id.clone(), a2.id.clone(), a3.id.clone(), a4.id.clone()];
+        let mut c = RoundSummary::new(camp, conv, 1, "c".into())
+            .with_code("C0001")
+            .with_headline("c");
+        c.level = 2;
+        c.turn_end = 4;
+        c.covers = vec![b.id.clone()];
+        let catalog = vec![a1, a2, a3, a4, b, c.clone()];
+        assert_eq!(expand_source_turn_ids(&c, &catalog), vec![1, 2, 3, 4]);
     }
 }
