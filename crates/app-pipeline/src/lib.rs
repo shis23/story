@@ -458,6 +458,7 @@ impl PipelineOrchestrator {
             .as_ref()
             .map(|c| c.effective_max_concurrent_subagents())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
+        let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -468,6 +469,7 @@ impl PipelineOrchestrator {
             effective_runtime,
             max_concurrent,
             ctx.agent_profile_config.as_ref(),
+            summary_block.as_deref(),
         )
         .await;
 
@@ -1062,6 +1064,7 @@ impl PipelineOrchestrator {
                 .as_ref()
                 .map(|c| c.effective_max_concurrent_subagents())
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
+            let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -1072,6 +1075,7 @@ impl PipelineOrchestrator {
                 effective_runtime,
                 max_concurrent,
                 ctx.agent_profile_config.as_ref(),
+                summary_block.as_deref(),
             )
             .await;
 

@@ -659,6 +659,8 @@ pub async fn spawn_subagents(
     campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
     max_concurrent_subagents: usize,
     agent_profile_config: Option<&storyforge_domain::agent_profile_config::AgentProfileConfig>,
+    // ContextCompiler 最小版：近期剧情摘要块（已渲染文本）。None/空 = 不注入。
+    recent_summary_block: Option<&str>,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
     // Semaphore(0) would make every task wait forever; treat invalid input as serial execution.
@@ -715,13 +717,24 @@ pub async fn spawn_subagents(
             };
 
         // ── 构造 tail（易变段）──
-        let volatile_text = if let (Some(cr), Some(inst)) = (&campaign_runtime, matched_instance) {
-            // Campaign 模式：注入该 instance 的 knowledge（信息隔离）+ variables + scene + task
-            build_campaign_subagent_volatile(&task, cr, inst)
-        } else {
-            // 旧路径
-            format_context_volatile(&task.context_package)
-        };
+        let mut volatile_text =
+            if let (Some(cr), Some(inst)) = (&campaign_runtime, matched_instance) {
+                // Campaign 模式：注入该 instance 的 knowledge（信息隔离）+ variables + scene + task
+                build_campaign_subagent_volatile(&task, cr, inst)
+            } else {
+                // 旧路径
+                format_context_volatile(&task.context_package)
+            };
+        // ContextCompiler 最小版：子 Agent 也看到近期摘要（共享事实，不破信息隔离）
+        if let Some(block) = recent_summary_block
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            volatile_text.push_str("\n\n");
+            volatile_text.push_str(block);
+            volatile_text
+                .push_str("\n（以上为近期剧情摘要，仅供保持连续性；勿泄露你角色不该知道的信息。）");
+        }
 
         let layout = MessageLayout::build().system(stable_system).tail(|_| {
             storyforge_domain::message_layout::VolatileTail::new()
@@ -1133,6 +1146,7 @@ mod tests {
             None,                                         // 无 Campaign runtime（旧路径测试）
             4,
             None,
+            None,
         )
         .await;
 
@@ -1206,6 +1220,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None, // 无 Campaign runtime（旧路径测试）
             4,
+            None,
             None,
         )
         .await;
@@ -1286,6 +1301,7 @@ mod tests {
                 None,
                 0,
                 Some(&profile),
+                None,
             ),
         )
         .await
@@ -1689,6 +1705,7 @@ mod tests {
             None,
             1,
             None,
+            None,
         )
         .await;
 
@@ -1921,6 +1938,7 @@ mod tests {
             Some(cr),
             4,
             None,
+            None,
         )
         .await;
 
@@ -1976,6 +1994,7 @@ mod tests {
             Some(cr),
             4,
             None,
+            None,
         )
         .await;
 
@@ -2029,6 +2048,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None,
             4,
+            None,
             None,
         )
         .await;
@@ -2257,6 +2277,7 @@ mod tests {
             Some(cr),
             4,
             None,
+            None,
         )
         .await;
 
@@ -2340,6 +2361,7 @@ mod tests {
             mpsc::unbounded_channel::<PipelineEvent>().0,
             None,
             4,
+            None,
             None,
         )
         .await;
