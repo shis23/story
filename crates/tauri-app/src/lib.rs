@@ -4726,17 +4726,132 @@ async fn accept_variant_async(
     conv_id: Id,
     node_id: Id,
 ) -> Result<(), TauriCommandError> {
-    let conv_store = state.conv_store.clone();
-    let archive_conv_id = conv_id.clone();
-    tokio::task::spawn_blocking(move || conv_store.accept_variant(&conv_id, &node_id))
-        .await
-        .map_err(|e| TauriCommandError::internal(format!("采纳变体任务失败: {e}")))?
-        .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    // Phase A: Campaign 模式分流
+    let active_campaign = {
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
 
-    // 自动归档检查（后台异步，不阻塞响应）
+    // 自动归档用的 conversation_id（在分支之前 clone，避免 move 问题）
+    let archive_conv_id = conv_id.clone();
+
+    if let Some(campaign_id) = active_campaign {
+        // Campaign 模式 → TurnCommit
+        commit_turn_attempt(&state, &campaign_id, &conv_id, &node_id).await?;
+    } else {
+        // 非 Campaign 模式 → 保持现有行为
+        let conv_store = state.conv_store.clone();
+        tokio::task::spawn_blocking(move || conv_store.accept_variant(&conv_id, &node_id))
+            .await
+            .map_err(|e| TauriCommandError::internal(format!("采纳变体任务失败: {e}")))?
+            .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+    }
+
     let state_clone = state.clone();
     tokio::spawn(async move {
         auto_archive_if_needed(&state_clone, &archive_conv_id).await;
+    });
+
+    Ok(())
+}
+
+/// Phase A: Campaign 模式下的 TurnCommit（accept → 正文 Final + 状态变更 + revision bump）。
+async fn commit_turn_attempt(
+    state: &Arc<AppState>,
+    campaign_id: &Id,
+    conv_id: &Id,
+    node_id: &Id,
+) -> Result<(), TauriCommandError> {
+    // 1. 查找包含该变体的 TurnRecord
+    let turn = get_turn_store()
+        .get_turn_by_variant(node_id)
+        .ok_or_else(|| {
+            TauriCommandError::validation(
+                "该变体没有关联的 TurnRecord，可能是历史草稿。请从此处 fork 或 regenerate。".to_string(),
+            )
+        })?;
+
+    let attempt = turn.find_attempt_by_variant(node_id).ok_or_else(|| {
+        TauriCommandError::validation("该变体没有关联的 TurnAttempt".to_string())
+    })?;
+
+    // 2. 校验 attempt 状态
+    if !attempt.status.is_active() {
+        return Err(TauriCommandError::validation(format!(
+            "该 Attempt 状态为 {:?}，不能 accept（只有活动 Attempt 才能 accept）",
+            attempt.status
+        )));
+    }
+
+    // 3. 校验 revision
+    let current_revision = get_campaign_store()
+        .get_campaign(campaign_id)
+        .map(|c| c.revision)
+        .ok_or_else(|| TauriCommandError::internal("Campaign 不存在".to_string()))?;
+
+    if turn.base_campaign_revision != current_revision {
+        return Err(TauriCommandError::validation(format!(
+            "revision 冲突：Turn 基于 revision {}，但当前 Campaign revision 为 {}。该 Turn 已过期。",
+            turn.base_campaign_revision, current_revision
+        )));
+    }
+
+    // 4. 获取候选 MutationBatch（可能为空 — 配置关闭或无推导产出）
+    let batch = attempt.pending_state_changes.clone().unwrap_or_else(|| {
+        // 空 diff：创建一个只 bump revision 的空 batch
+        storyforge_domain::turn::MutationBatch::new(Id::new(), current_revision)
+    });
+
+    // 5. CAS Turn → Committing（持久化，在任何副作用之前）
+    let turn_id = turn.turn_id.clone();
+    let attempt_id = attempt.attempt_id.clone();
+    update_turn_record(&turn_id, |record| {
+        record.status = storyforge_domain::turn::TurnStatus::Committing;
+        if let Some(att) = record.find_attempt_mut(&attempt_id) {
+            att.status = storyforge_domain::turn::AttemptStatus::Committing;
+        }
+        record.touch();
+    });
+
+    // 6. 执行 TurnCommit（FinalizeVariant + apply_mutation_batch）
+    let conv_store = state.conv_store.clone();
+    let conv_id_clone = conv_id.clone();
+    let node_id_clone = node_id.clone();
+    tokio::task::spawn_blocking(move || {
+        // Draft → Final（FinalizeVariant）
+        conv_store
+            .accept_variant(&conv_id_clone, &node_id_clone)
+            .map_err(|e| format!("Draft → Final 失败: {e}"))?;
+
+        // apply_mutation_batch（知识/变量/任务/摘要 + revision bump）
+        turn_coordinator::CampaignMutationCoordinator::apply_mutation_batch(
+            get_campaign_store(),
+            &turn.campaign_id,
+            &batch,
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("TurnCommit 任务失败: {e}")))?
+    .map_err(|e| TauriCommandError::internal(e))?;
+
+    // 7. 标记 Committed + 其他 attempts Superseded
+    update_turn_record(&turn_id, |record| {
+        record.status = storyforge_domain::turn::TurnStatus::Committed;
+        record.accepted_attempt_id = Some(attempt_id.clone());
+        for att in &mut record.attempts {
+            if att.attempt_id != attempt_id && att.status.is_active() {
+                att.status = storyforge_domain::turn::AttemptStatus::Superseded;
+            } else if att.attempt_id == attempt_id {
+                att.status = storyforge_domain::turn::AttemptStatus::Committed;
+            }
+        }
+        record.touch();
     });
 
     Ok(())
