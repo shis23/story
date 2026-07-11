@@ -639,6 +639,7 @@ impl CampaignStore {
     /// 1) campaign.pending_compress_publication = intent（先落盘）
     /// 2) summaries 写入（clone-then-persist）
     /// 3) 完成：bump revision + clear epoch + clear pending
+    ///
     /// heal 只依赖 pending marker，不依赖 epoch 是否仍在。
     pub fn publish_compress_result(
         &self,
