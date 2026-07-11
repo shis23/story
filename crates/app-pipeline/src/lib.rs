@@ -536,14 +536,21 @@ impl PipelineOrchestrator {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
+        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
         let editor_history =
             self.conv_store
                 .recent_messages_as_chat(&ctx.conversation_id, 20, None);
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
-            .tail(|_| build_editor_tail(&plan.scene_brief, &performances_text, None));
+            .tail(|_| {
+                build_editor_tail(
+                    &plan.scene_brief,
+                    &performances_text,
+                    None,
+                    &ctx.recent_summaries,
+                )
+            });
 
         // 流式：编剧的输出 token 实时转成 EditorProgress 事件
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -1116,6 +1123,7 @@ impl PipelineOrchestrator {
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
                     template_context.as_ref(),
+                    &ctx.recent_summaries,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1163,6 +1171,7 @@ impl PipelineOrchestrator {
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
                     template_context.as_ref(),
+                    &ctx.recent_summaries,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1354,6 +1363,7 @@ impl PipelineOrchestrator {
                     ctx.agent_profile_config.as_ref(),
                     &ctx.regex_scripts,
                     template_context.as_ref(),
+                    &ctx.recent_summaries,
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1387,6 +1397,7 @@ impl PipelineOrchestrator {
         agent_profile_config: Option<&AgentProfileConfig>,
         regex_scripts: &[RegexScript],
         template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+        recent_summaries: &[storyforge_domain::agent::RoundSummary],
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -1411,14 +1422,21 @@ impl PipelineOrchestrator {
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
-        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/hint）
+        // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
         let editor_history =
             self.conv_store
                 .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
-            .tail(|_| build_editor_tail(&plan.scene_brief, &performances_text, hint));
+            .tail(|_| {
+                build_editor_tail(
+                    &plan.scene_brief,
+                    &performances_text,
+                    hint,
+                    recent_summaries,
+                )
+            });
 
         // 流式：编剧输出实时推 EditorProgress
         let (editor_prog_tx, mut editor_prog_rx) = mpsc::unbounded_channel::<String>();
@@ -2001,7 +2019,7 @@ fn make_director_config(
     }
 }
 
-/// 构造编剧的易变末尾（§22 volatile tail）：场景 + 子产出 + 可选 hint
+/// 构造编剧的易变末尾（§22 volatile tail）：场景 + 子产出 + 近期摘要 + 可选 hint
 ///
 /// 编剧 system 段只有 role_directive + 模块（不含蓝灯，编剧不需要）。
 /// 场景简述和子 Agent 产出每场戏都变，压在 tail。
@@ -2009,12 +2027,19 @@ fn build_editor_tail(
     scene_brief: &str,
     performances_text: &str,
     hint: Option<&str>,
+    recent_summaries: &[storyforge_domain::agent::RoundSummary],
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
     let mut tail = VolatileTail::new().push(format!(
         "场景：{scene_brief}\n\n子 Agent 表演：\n\n{performances_text}\n\n请合并成连贯成文。"
     ));
+    // ContextCompiler 最小版：编剧也看到近期事实，减少跨轮设定漂移
+    if let Some(summary_block) = render_recent_summaries_for_injection(recent_summaries, 5) {
+        tail = tail.push(format!(
+            "{summary_block}\n（合并成文时保持与上述摘要一致，勿改写已发生事实。）"
+        ));
+    }
     if let Some(h) = hint {
         let h = h.trim();
         if !h.is_empty() {
@@ -4164,6 +4189,30 @@ mod tests {
     #[test]
     fn test_render_recent_summaries_empty_returns_none() {
         assert!(render_recent_summaries_for_injection(&[], 5).is_none());
+    }
+
+    #[test]
+    fn test_editor_tail_includes_recent_summaries() {
+        use storyforge_domain::message_layout::MessageLayout;
+
+        let summaries = vec![storyforge_domain::agent::RoundSummary::new(
+            Id::from_str("c"),
+            Id::from_str("conv"),
+            3,
+            "林秋把病历藏进抽屉。".into(),
+        )];
+        let layout = MessageLayout::build()
+            .system("你是编剧")
+            .tail(|_| build_editor_tail("雨夜诊所", "### Lin\n林秋沉默。", None, &summaries));
+        let msgs = layout.into_messages();
+        let tail = msgs.last().unwrap().content.as_str();
+        assert!(tail.contains("场景：雨夜诊所"), "应含场景: {tail}");
+        assert!(tail.contains("近期剧情摘要"), "应含摘要段: {tail}");
+        assert!(tail.contains("林秋把病历藏进抽屉"), "应含摘要正文: {tail}");
+        assert!(
+            tail.contains("保持与上述摘要一致"),
+            "应提示保持一致性: {tail}"
+        );
     }
 
     // ─── 阶段 3 cleanup：has_available_characters + UTF-8 截断 + variables 注入 ──

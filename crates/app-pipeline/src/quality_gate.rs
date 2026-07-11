@@ -3,10 +3,13 @@
 /// 纯确定性规则门禁，不跑 LLM。在 Editor 产出 `final_text` 后、`run_postprocess` 前执行。
 /// Gate 失败不硬阻断——只标记警告，用户仍可手动 accept（符合 Phase A 草稿有身份但不自动变事实的哲学）。
 ///
-/// 检查项（第一版）：
+/// 检查项：
 /// 1. n-gram 重复检测：UTF-8 字符级 8-gram 连续出现 ≥ 3 次
 /// 2. 元描述检测：草稿含 LLM 自述/指令残留
 /// 3. 字数下限：< 50 字
+/// 4. 视角/破壁：对读者说话或指令式旁白
+/// 5. 格式泄漏：代码块 / think 标签 / HTML
+/// 6. 连续性：相邻句子完全重复
 use storyforge_domain::turn::{QualityReport, QualitySeverity, QualityWarning, QualityWarningCode};
 
 /// 运行草稿质量门禁
@@ -15,6 +18,9 @@ pub fn run_quality_gate(text: &str) -> QualityReport {
         check_ngram_repetition(text),
         check_meta_description(text),
         check_too_short(text),
+        check_perspective_leak(text),
+        check_format_leak(text),
+        check_consecutive_repeat(text),
     ]
     .into_iter()
     .flatten()
@@ -78,6 +84,10 @@ fn check_meta_description(text: &str) -> Option<QualityWarning> {
         "现在开始创作",
         "好的，我",
         "没问题，我",
+        "根据你的要求",
+        "按照你的要求",
+        "我将为你",
+        "我来为你",
     ];
 
     for pat in PATTERNS {
@@ -109,6 +119,92 @@ fn check_too_short(text: &str) -> Option<QualityWarning> {
     }
 }
 
+/// 视角/破壁：直接对读者说话或指令式旁白。
+fn check_perspective_leak(text: &str) -> Option<QualityWarning> {
+    const PATTERNS: &[&str] = &[
+        "亲爱的读者",
+        "各位读者",
+        "如果你想",
+        "如果你希望",
+        "请告诉我",
+        "请继续输入",
+        "下一章见",
+        "未完待续，请",
+        "（作者注",
+        "(作者注",
+        "OOC：",
+        "OOC:",
+        "【系统】",
+        "[系统]",
+    ];
+
+    for pat in PATTERNS {
+        if text.contains(pat) {
+            return Some(QualityWarning {
+                code: QualityWarningCode::PerspectiveLeak {
+                    snippet: pat.to_string(),
+                },
+                message: format!("草稿含视角/破壁内容：「{pat}」"),
+                severity: QualitySeverity::Error,
+            });
+        }
+    }
+    None
+}
+
+/// 格式泄漏：代码块、think 标签、HTML 等非正文残留。
+fn check_format_leak(text: &str) -> Option<QualityWarning> {
+    const PATTERNS: &[&str] = &[
+        "```", "<think>", "</think>", "<div", "</div>", "<span", "</span>", "<p>", "</p>",
+        "```json", "```xml",
+    ];
+
+    for pat in PATTERNS {
+        if text.contains(pat) {
+            return Some(QualityWarning {
+                code: QualityWarningCode::FormatLeak {
+                    snippet: pat.to_string(),
+                },
+                message: format!("草稿含格式泄漏：「{pat}」"),
+                severity: QualitySeverity::Error,
+            });
+        }
+    }
+    None
+}
+
+/// 连续性：相邻句子完全重复（按 。！？.!? 粗分句）。
+fn check_consecutive_repeat(text: &str) -> Option<QualityWarning> {
+    let sentences: Vec<&str> = text
+        .split(|c: char| "。！？.!?；;\n".contains(c))
+        .map(str::trim)
+        .filter(|s| s.chars().count() >= 6)
+        .collect();
+
+    for window in sentences.windows(2) {
+        if window[0] == window[1] {
+            let sample = truncate_sample(window[0], 40);
+            return Some(QualityWarning {
+                code: QualityWarningCode::ConsecutiveRepeat {
+                    sample: sample.clone(),
+                },
+                message: format!("相邻句子完全重复：「{sample}」"),
+                severity: QualitySeverity::Warning,
+            });
+        }
+    }
+    None
+}
+
+fn truncate_sample(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,16 +216,16 @@ mod tests {
         let report = run_quality_gate(text);
         assert!(
             report.passed(),
-            "正常文本应通过质量门禁，警告: {:?}",
+            "正常叙事应通过门禁，实际: {:?}",
             report.warnings
         );
     }
 
     #[test]
     fn test_ngram_repetition_detected() {
-        // 构造同一 8-gram 出现 3 次的文本
-        let repeat = "她的眼眸闪烁着光芒";
-        let text = format!("{repeat}，{repeat}，{repeat}，风轻轻吹过窗棂带来远方花香。");
+        // 构造明显重复的 8-gram
+        let unit = "abcdefgh";
+        let text = format!("{unit}{unit}{unit} 夜风拂过窗前，远处灯火微明。");
         let report = run_quality_gate(&text);
         assert!(!report.passed(), "含重复 8-gram 应被检出");
         let has_ngram = report.warnings.iter().any(|w| {
@@ -196,5 +292,47 @@ mod tests {
             .iter()
             .any(|w| matches!(&w.code, QualityWarningCode::NgramRepetition { .. }));
         assert!(!has_ngram, "无重复的文本不应检出 n-gram 重复");
+    }
+
+    #[test]
+    fn test_perspective_leak_detected() {
+        let text = "亲爱的读者，接下来请继续输入你的选择。夜风吹过窗棂，林秋坐在桌前看着残茶。他想起那年冬天，也是这样安静的夜晚。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PerspectiveLeak { .. })),
+            "应检出视角/破壁: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_format_leak_detected() {
+        let text = "夜风吹过窗棂。\n```json\n{\"ok\":true}\n```\n林秋坐在桌前，看着杯中残茶泛起的涟漪。他想起那年冬天。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::FormatLeak { .. })),
+            "应检出格式泄漏: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_consecutive_repeat_detected() {
+        let text = "林秋推开诊所的门。林秋推开诊所的门。窗外的雨还在下，灯火把地面映成浅金。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::ConsecutiveRepeat { .. })),
+            "应检出相邻句子重复: {:?}",
+            report.warnings
+        );
     }
 }

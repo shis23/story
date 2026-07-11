@@ -432,6 +432,12 @@ pub enum QualityWarningCode {
     MetaDescription { snippet: String },
     /// 字数过短
     TooShort { char_count: usize },
+    /// 视角/破壁：直接对读者说话或指令式旁白
+    PerspectiveLeak { snippet: String },
+    /// 格式泄漏：代码块、think 标签、HTML 等非正文残留
+    FormatLeak { snippet: String },
+    /// 连续性：相邻句子完全重复
+    ConsecutiveRepeat { sample: String },
 }
 
 /// 单条质量警告
