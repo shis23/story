@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { TabGroup, TabList, Tab, TabPanel } from '@headlessui/vue'
+import { TabGroup, TabList, Tab } from '@headlessui/vue'
 
 const props = defineProps({
   tabs: { type: Array, default: () => [] }, // [{ key, label }]
@@ -46,8 +46,8 @@ const tabClass = (selected) => {
       </Tab>
     </TabList>
 
-    <TabPanel class="pt-3 focus:outline-none">
+    <div class="pt-3 focus:outline-none">
       <slot />
-    </TabPanel>
+    </div>
   </TabGroup>
 </template>

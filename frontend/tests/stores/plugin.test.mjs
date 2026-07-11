@@ -41,9 +41,9 @@ test('nextPipelineEventSeq 单调递增', () => {
   assert.equal(s.nextPipelineEventSeq(), 3)
 })
 
-test('上限常量符合 App.vue 定义', () => {
+test('上限常量符合当前 trace 和审计容量契约', () => {
   const s = setup()
-  assert.equal(s.MAX_PLUGIN_PIPELINE_EVENTS, 100)
+  assert.equal(s.MAX_PLUGIN_PIPELINE_EVENTS, 500)
   assert.equal(s.MAX_PROMPT_HOOK_AUDIT_RECORDS, 100)
 })
 
