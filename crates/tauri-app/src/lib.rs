@@ -2129,9 +2129,14 @@ impl WritingEvent {
             PipelineEvent::QualityChecked {
                 passed,
                 warning_count,
+                warnings,
             } => (
                 "quality_checked".into(),
-                serde_json::json!({ "passed": passed, "warning_count": warning_count }),
+                serde_json::json!({
+                    "passed": passed,
+                    "warning_count": warning_count,
+                    "warnings": warnings,
+                }),
             ),
             PipelineEvent::PromptHookRequest {
                 request_id,
@@ -2459,15 +2464,21 @@ async fn start_writing(
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
 
-        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（纯确定性规则）
-        let _quality_report =
-            storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text.clone());
+        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（纯确定性规则，warn-only）
+        let quality_report =
+            storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        let warning_msgs: Vec<String> = quality_report
+            .warnings
+            .iter()
+            .map(|w| w.message.clone())
+            .collect();
         let _ = event_tx.send(PipelineEvent::QualityChecked {
-            passed: _quality_report.passed(),
-            warning_count: _quality_report.warnings.len(),
+            passed: quality_report.passed(),
+            warning_count: quality_report.warnings.len(),
+            warnings: warning_msgs,
         });
-        if !_quality_report.passed() {
-            for w in &_quality_report.warnings {
+        if !quality_report.passed() {
+            for w in &quality_report.warnings {
                 tracing::info!(target: "quality_gate", "质量警告: {:?}", w.code);
             }
         }
@@ -4213,14 +4224,20 @@ async fn regenerate(
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
-        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁
-        let _quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（warn-only）
+        let quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        let warning_msgs: Vec<String> = quality_report
+            .warnings
+            .iter()
+            .map(|w| w.message.clone())
+            .collect();
         let _ = event_tx.send(PipelineEvent::QualityChecked {
-            passed: _quality_report.passed(),
-            warning_count: _quality_report.warnings.len(),
+            passed: quality_report.passed(),
+            warning_count: quality_report.warnings.len(),
+            warnings: warning_msgs,
         });
-        if !_quality_report.passed() {
-            for w in &_quality_report.warnings {
+        if !quality_report.passed() {
+            for w in &quality_report.warnings {
                 tracing::info!(target: "quality_gate", "regenerate 质量警告: {:?}", w.code);
             }
         }

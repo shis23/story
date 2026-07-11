@@ -32,6 +32,7 @@ test('pipeline 初始结构符合冻结契约', () => {
   assert.equal(s.pipeline.postprocess.variable, 0)
   assert.equal(s.pipeline.postprocess.task, 0)
   assert.equal(s.pipeline.postprocess.reason, '')
+  assert.equal(s.pipeline.quality, null)
 })
 
 test('writingMode 无 campaign 无 char 时为 none', () => {

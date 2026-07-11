@@ -40,6 +40,8 @@ const hasReview = computed(
 
 const directorDetail = computed(() => writing.pipeline.director?.detail || '')
 const editorDetail = computed(() => writing.pipeline.editor?.detail || '')
+const quality = computed(() => writing.pipeline.quality)
+const qualityWarnings = computed(() => quality.value?.warnings || [])
 </script>
 
 <template>
@@ -95,6 +97,26 @@ const editorDetail = computed(() => writing.pipeline.editor?.detail || '')
           <div class="text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
             {{ editorOutput }}
           </div>
+        </div>
+
+        <!-- B3 质量门禁（warn-only） -->
+        <div v-if="quality">
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">
+            🧪 质量检查
+            <span
+              class="ml-1 normal-case tracking-normal"
+              :class="quality.passed ? 'text-ok' : 'text-warn'"
+            >
+              {{ quality.passed ? '通过' : `警告 ${quality.warningCount || qualityWarnings.length}` }}
+            </span>
+          </div>
+          <ul
+            v-if="qualityWarnings.length"
+            class="text-[11px] text-ink-soft space-y-1 list-disc pl-4"
+          >
+            <li v-for="(msg, i) in qualityWarnings" :key="i">{{ msg }}</li>
+          </ul>
+          <div v-else class="text-[11px] text-ink-faint">未发现确定性质量问题</div>
         </div>
       </div>
     </div>

@@ -87,6 +87,7 @@ export function useWriting(options = {}) {
     writingStore.pipeline.subagents = []
     writingStore.pipeline.editor = { status: 'idle', detail: '', output: '' }
     writingStore.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
+    writingStore.pipeline.quality = null
     // 清除编剧流式消息占位（上次写作残留）
     writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
 

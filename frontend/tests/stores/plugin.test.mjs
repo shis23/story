@@ -63,3 +63,38 @@ test('每个 store 实例有独立序号(新 pinia 重置)', () => {
   const s2 = usePluginStore()
   assert.equal(s2.nextPipelineEventSeq(), 1)
 })
+
+// loadSidebarPlugins 装配逻辑（AppV2 已从 stub 恢复）：
+// enabled → hookPlugins；enabled && ui_slots 含 SidebarPanel → sidebarPlugins
+test('插件装配规则：enabled 分流 hook/sidebar', () => {
+  const s = setup()
+  const all = [
+    { id: 'a', enabled: true, ui_slots: ['SidebarPanel'] },
+    { id: 'b', enabled: true, ui_slots: [] },
+    { id: 'c', enabled: false, ui_slots: ['SidebarPanel'] },
+  ]
+  const enabled = all.filter((p) => p.enabled)
+  s.hookPlugins = enabled
+  s.sidebarPlugins = enabled.filter((p) => p.ui_slots?.includes('SidebarPanel'))
+  assert.deepEqual(
+    s.hookPlugins.map((p) => p.id),
+    ['a', 'b'],
+  )
+  assert.deepEqual(
+    s.sidebarPlugins.map((p) => p.id),
+    ['a'],
+  )
+})
+
+test('插件装配会清掉已禁用插件的 hookPluginSlots', () => {
+  const s = setup()
+  s.hookPluginSlots = {
+    a: { SidebarPanel: '<div>a</div>' },
+    c: { SidebarPanel: '<div>c</div>' },
+  }
+  const enabledIds = new Set(['a', 'b'])
+  s.hookPluginSlots = Object.fromEntries(
+    Object.entries(s.hookPluginSlots).filter(([pluginId]) => enabledIds.has(pluginId)),
+  )
+  assert.deepEqual(Object.keys(s.hookPluginSlots), ['a'])
+})

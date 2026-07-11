@@ -46,7 +46,9 @@ const subagentEvents = computed(() =>
 const editorEvents = computed(() =>
   pipelineEvents.value.filter(
     (r) =>
-      r.event.event_type.startsWith('editor_') || r.event.event_type === 'draft_ready',
+      r.event.event_type.startsWith('editor_') ||
+      r.event.event_type === 'draft_ready' ||
+      r.event.event_type === 'quality_checked',
   ),
 )
 const postprocessEvents = computed(() =>
@@ -58,7 +60,7 @@ function lastStatus(events) {
   if (events.length === 0) return 'idle'
   const last = events[events.length - 1].event.event_type
   if (last.endsWith('_started') || last.endsWith('_progress')) return 'running'
-  if (last.endsWith('_done') || last === 'draft_ready') return 'done'
+  if (last.endsWith('_done') || last === 'draft_ready' || last === 'quality_checked') return 'done'
   if (last.endsWith('_failed') || last.endsWith('_cancelled') || last.endsWith('_error')) return 'error'
   if (last.endsWith('_skipped')) return 'done'
   return 'running'

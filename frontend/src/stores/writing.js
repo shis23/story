@@ -20,6 +20,8 @@ export const useWritingStore = defineStore('writing', () => {
     subagents: [],
     editor: { status: 'idle', detail: '', output: '' },
     postprocess: { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' },
+    // B3 DraftQualityGate 结果（warn-only；null = 本轮尚未检查）
+    quality: null,
   })
 
   // 写作模式(App.vue:307-311)

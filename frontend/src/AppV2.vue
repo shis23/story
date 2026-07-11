@@ -125,11 +125,21 @@ async function refreshActiveConnection() {
   }
 }
 
-// loadSidebarPlugins（App.vue:113-127）：本阶段由 plugin store 承载，AppV2 暂为 stub。
-// TODO 阶段 6-7：迁移插件侧栏装配逻辑。
+// loadSidebarPlugins（App.vue:113-127）：列出已启用插件并写入 plugin store。
+// hookPlugins = 全部 enabled；sidebarPlugins = 带 SidebarPanel slot 的 enabled。
 async function loadSidebarPlugins() {
   try {
-    await listPlugins()
+    const all = await listPlugins()
+    const enabled = (all || []).filter((p) => p.enabled)
+    const enabledIds = new Set(enabled.map((p) => p.id))
+    // 清理已卸载/禁用插件的 slot 注册
+    plugin.hookPluginSlots = Object.fromEntries(
+      Object.entries(plugin.hookPluginSlots || {}).filter(([pluginId]) =>
+        enabledIds.has(pluginId),
+      ),
+    )
+    plugin.hookPlugins = enabled
+    plugin.sidebarPlugins = enabled.filter((p) => p.ui_slots?.includes('SidebarPanel'))
   } catch (e) {
     console.error('加载侧栏插件失败:', e)
     logAppendFrontend('error', `loadSidebarPlugins: ${e}`).catch(() => {})

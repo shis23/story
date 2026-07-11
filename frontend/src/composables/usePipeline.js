@@ -97,6 +97,28 @@ export function usePipeline(handlers = {}) {
         writing.pipeline.stateLabel = '已产出'
         // 成文由 applyConversation 推入正式消息;StreamingMessage 随 showPipeline=false 消失
         break
+      case 'quality_checked': {
+        // B3：warn-only 质量门禁结果，不阻断 accept/postprocess
+        const passed = !!event.data?.passed
+        const warningCount = event.data?.warning_count || 0
+        const warnings = Array.isArray(event.data?.warnings) ? event.data.warnings : []
+        writing.pipeline.quality = {
+          passed,
+          warningCount,
+          warnings,
+          status: passed ? 'ok' : 'warn',
+        }
+        if (!passed && warningCount > 0) {
+          writing.pipeline.stateLabel = `已产出 · 质量警告 ${warningCount}`
+          if (writing.pipeline.editor?.status === 'done') {
+            writing.pipeline.editor = {
+              ...writing.pipeline.editor,
+              detail: `成文完成 · 质量警告 ${warningCount}`,
+            }
+          }
+        }
+        break
+      }
       case 'prompt_hook_request':
         handlePromptHookRequest(event.data)
         break

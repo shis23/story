@@ -279,8 +279,14 @@ pub enum PipelineEvent {
     EditorProgress { delta: String },
     /// 成文就绪
     DraftReady { text: String },
-    /// B3：草稿质量门禁检查完成
-    QualityChecked { passed: bool, warning_count: usize },
+    /// B3：草稿质量门禁检查完成（warn-only，不阻断流程）
+    QualityChecked {
+        passed: bool,
+        warning_count: usize,
+        /// 警告摘要（message 列表，便于前端展示；无则空）
+        #[serde(default)]
+        warnings: Vec<String>,
+    },
     /// 最终 LLM messages prompt hook 请求（前端插件可异步改写 messages）
     PromptHookRequest {
         request_id: String,
