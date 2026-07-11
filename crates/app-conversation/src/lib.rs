@@ -196,6 +196,19 @@ impl ConversationStore {
 
             let mut forked = Conversation::new(source.character_id.clone(), Some(campaign_id));
             forked.nodes = source.nodes[..=fork_idx].to_vec();
+            // 继承源对话水位，但钳制到 fork 前缀可归档消息数，避免把已归档前缀再归档一遍
+            let forked_archivable = forked
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.active()
+                        .map(|v| {
+                            v.status != storyforge_domain::conversation::VariantStatus::Discarded
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            forked.archived_upto = source.archived_upto.min(forked_archivable);
             forked.updated_at = Utc::now();
             forked
         };
@@ -801,6 +814,7 @@ mod tests {
         assert_eq!(forked.nodes[0].id, first);
         assert_eq!(forked.nodes[1].id, branch_point);
         assert_eq!(forked.nodes[1].active_content(), "branch point");
+        assert_eq!(forked.archived_upto, 0);
 
         let persisted = store.get(&forked.id).unwrap();
         assert_eq!(persisted.nodes.len(), 2);
@@ -810,6 +824,24 @@ mod tests {
                 .is_err()
         );
 
+        let _ = store.delete(&conv.id);
+        let _ = store.delete(&forked.id);
+    }
+
+    #[test]
+    fn test_fork_at_inherits_archived_upto_clamped_to_prefix() {
+        let store = temp_store();
+        let source_campaign_id = Id::from_str("source-wm");
+        let fork_campaign_id = Id::from_str("fork-wm");
+        let conv = store.create(Some("card-1".into()), Some(source_campaign_id));
+        let _u1 = store.append_user_message(&conv.id, "u1".into()).unwrap();
+        let branch = store.append_ai_draft(&conv.id, "ai1".into(), None).unwrap();
+        let _u2 = store.append_user_message(&conv.id, "u2".into()).unwrap();
+        // 源对话水位 5，但 fork 前缀只有 2 条可归档 → 钳到 2
+        store.advance_archived_upto(&conv.id, 5).unwrap();
+        let forked = store.fork_at(&conv.id, fork_campaign_id, &branch).unwrap();
+        assert_eq!(forked.nodes.len(), 2);
+        assert_eq!(forked.archived_upto, 2);
         let _ = store.delete(&conv.id);
         let _ = store.delete(&forked.id);
     }
