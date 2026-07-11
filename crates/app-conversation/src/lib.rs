@@ -461,6 +461,21 @@ impl ConversationStore {
                 .position(|n| &n.id == node_id)
                 .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
             conv.nodes.truncate(pos);
+            // 截断后可归档条数变少：水位钳制到当前 archivable 长度，避免指向已删除前缀之外
+            let archivable = conv
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.active()
+                        .map(|v| {
+                            v.status != storyforge_domain::conversation::VariantStatus::Discarded
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            if conv.archived_upto > archivable {
+                conv.archived_upto = archivable;
+            }
             conv.updated_at = Utc::now();
             Ok(())
         })
@@ -844,6 +859,24 @@ mod tests {
         assert_eq!(forked.archived_upto, 2);
         let _ = store.delete(&conv.id);
         let _ = store.delete(&forked.id);
+    }
+
+    #[test]
+    fn test_truncate_from_clamps_archived_upto() {
+        let store = temp_store();
+        let conv = store.create(None, None);
+        let n1 = store.append_user_message(&conv.id, "u1".into()).unwrap();
+        let n2 = store.append_ai_draft(&conv.id, "ai1".into(), None).unwrap();
+        let _n3 = store.append_user_message(&conv.id, "u2".into()).unwrap();
+        store.advance_archived_upto(&conv.id, 3).unwrap();
+        assert_eq!(store.archived_upto(&conv.id), 3);
+        // 截断到 n2（保留 n1；删除 n2 及之后）→ 仅剩 1 条可归档
+        store.truncate_from(&conv.id, &n2).unwrap();
+        let updated = store.get(&conv.id).unwrap();
+        assert_eq!(updated.nodes.len(), 1);
+        assert_eq!(updated.nodes[0].id, n1);
+        assert_eq!(updated.archived_upto, 1);
+        let _ = store.delete(&conv.id);
     }
 
     #[test]

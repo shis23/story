@@ -2966,6 +2966,32 @@ fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolCo
     tool_guard.archived_summaries.clear();
 }
 
+/// 取 `before_node_id` 之前最近一条 User 消息正文（用于 regenerate 无 hint 时的远记忆查询）。
+fn last_user_intent_before(
+    conv_store: &ConversationStore,
+    conv_id: &Id,
+    before_node_id: &Id,
+) -> Option<String> {
+    let conv = conv_store.get(conv_id)?;
+    let pos = conv.nodes.iter().position(|n| &n.id == before_node_id)?;
+    for node in conv.nodes[..pos].iter().rev() {
+        let Some(v) = node.active() else {
+            continue;
+        };
+        if v.status == storyforge_domain::conversation::VariantStatus::Discarded {
+            continue;
+        }
+        if v.role != storyforge_domain::conversation::Role::User {
+            continue;
+        }
+        let content = v.content.trim();
+        if !content.is_empty() {
+            return Some(content.to_string());
+        }
+    }
+    None
+}
+
 /// 按用户意图从向量库召回 ArchivedSummary（混合：关键词 + 可选嵌入，best-effort）。
 ///
 /// 失败只 warn，不阻断写作。无命中时 `far_memory_hits` 为空。
@@ -4390,9 +4416,25 @@ async fn regenerate(
     fill_profile_context(&mut ctx, &app);
     fill_agent_profile_context(&mut ctx, &app);
     fill_campaign_context_async(&mut ctx, &app).await?;
-    // regenerate：用 hint（若有）做远记忆召回；无 hint 则跳过
-    if let Some(hint) = recall_hint.as_deref().filter(|s| !s.trim().is_empty()) {
-        fill_far_memory_hits(&mut ctx, &app, hint).await;
+    // regenerate：hint 优先；无 hint 时回退到该 AI 节点之前最近一条 user 意图
+    let fallback_intent = if recall_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        last_user_intent_before(&app.conv_store, &conversation_id, &node_id)
+    } else {
+        None
+    };
+    let far_query = recall_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or(fallback_intent);
+    if let Some(query) = far_query.as_deref() {
+        fill_far_memory_hits(&mut ctx, &app, query).await;
     }
 
     // cancel channel
@@ -14040,6 +14082,38 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_last_user_intent_before_finds_nearest_user() {
+        let state = AppState::new_for_test();
+        let conv = state.conv_store.create(None, None);
+        let _u1 = state
+            .conv_store
+            .append_user_message(&conv.id, "第一次意图".into())
+            .unwrap();
+        let _a1 = state
+            .conv_store
+            .append_ai_draft(&conv.id, "成文1".into(), None)
+            .unwrap();
+        let u2 = state
+            .conv_store
+            .append_user_message(&conv.id, "第二次意图".into())
+            .unwrap();
+        let a2 = state
+            .conv_store
+            .append_ai_draft(&conv.id, "成文2".into(), None)
+            .unwrap();
+        let intent = last_user_intent_before(&state.conv_store, &conv.id, &a2);
+        assert_eq!(intent.as_deref(), Some("第二次意图"));
+        // before 第二条 user 节点 → 取第一次意图
+        assert_eq!(
+            last_user_intent_before(&state.conv_store, &conv.id, &u2).as_deref(),
+            Some("第一次意图")
+        );
+        // before 首条 user → 无更早 user
+        assert!(last_user_intent_before(&state.conv_store, &conv.id, &_u1).is_none());
+        let _ = state.conv_store.delete(&conv.id);
     }
 
     /// RoundSummary accept 后索引进向量库，并可被远记忆关键词召回。
