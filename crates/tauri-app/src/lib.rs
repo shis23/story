@@ -5951,6 +5951,13 @@ fn meta_accept_typed_patch(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    // Phase A 屏障：活动 Turn 存在时拒绝 Meta patch accept（防并发写竞争）
+    let cid = Id::from_str(&campaign_id);
+    if get_turn_store().get_active_turn(&cid).is_some() {
+        return Err(TauriCommandError::validation(
+            "当前有未完成的轮次，请先 Accept、Discard 或 Abandon 后再接受 Meta patch".to_string(),
+        ));
+    }
     let store = get_campaign_store();
     meta_accept_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
 }
@@ -7282,10 +7289,19 @@ fn fork_campaign(
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
+    let source_cid = Id::from_str(&source_campaign_id);
+
+    // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
+    if get_turn_store().get_active_turn(&source_cid).is_some() {
+        return Err(TauriCommandError::validation(
+            "源 Campaign 有未完成的 Turn，请先 Accept、Discard 或 Abandon 后再 fork（阶段 A 只支持从已提交 head fork）".to_string(),
+        ));
+    }
+
     fork_campaign_in_store(
         get_campaign_store(),
         &state.conv_store,
-        Id::from_str(&source_campaign_id),
+        source_cid,
         Id::from_str(&fork_node_id),
         name,
     )
