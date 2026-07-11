@@ -153,6 +153,16 @@ pub struct WritingContext {
     pub template_random_seed: Option<u64>,
 }
 
+// ─── ContextCompiler named budgets（注入侧；load-side last-K 在 tauri-app）──────
+/// Director/Editor tail：近期 RoundSummary 最多注入条数。
+pub const RECENT_SUMMARIES_INJECT_LIMIT: usize = 5;
+/// Director/Editor tail：远记忆最多注入条数。
+pub const FAR_MEMORY_INJECT_LIMIT: usize = 3;
+/// 单条近期摘要 content 截断（字符）。
+pub const RECENT_SUMMARY_ITEM_MAX_CHARS: usize = 240;
+/// 单条远记忆 content 截断（字符）。
+pub const FAR_MEMORY_ITEM_MAX_CHARS: usize = 200;
+
 /// 远记忆命中（ContextCompiler 注入用，可追溯向量库 id / 分数）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FarMemoryHit {
@@ -399,9 +409,23 @@ impl PipelineOrchestrator {
 
         // §22 cache 友好布局：system（role_directive + 模块 + 蓝灯）+ history（对话历史）+ tail（意图/角色/任务）
         // 对话历史作为独立消息段（而非塞进 user 文本），保证 system+history 前缀稳定、cache 命中。
-        let history = self
-            .conv_store
-            .recent_messages_as_chat(&ctx.conversation_id, 20, None);
+        // 超窗时 history 首条为确定性 epoch checkpoint（同 epoch 内稳定）。
+        let (history, epoch_info) = self.conv_store.recent_history_with_epoch(
+            &ctx.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            None,
+        );
+        if let Some(info) = &epoch_info {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Director history epoch"
+            );
+        }
         let director_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(director_config.system_prompt.clone())
             .history(history)
@@ -504,14 +528,20 @@ impl PipelineOrchestrator {
             .as_ref()
             .map(|c| c.effective_max_concurrent_subagents())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
-        let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
+        let summary_block = render_recent_summaries_for_injection(
+            &ctx.recent_summaries,
+            RECENT_SUMMARIES_INJECT_LIMIT,
+        );
         let recent_texts: Vec<String> = ctx
             .recent_summaries
             .iter()
             .map(|s| s.content.clone())
             .collect();
-        let far_block =
-            render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts);
+        let far_block = render_far_memory_for_injection_excluding(
+            &ctx.far_memory_hits,
+            FAR_MEMORY_INJECT_LIMIT,
+            &recent_texts,
+        );
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
@@ -593,9 +623,22 @@ impl PipelineOrchestrator {
             .join("\n\n---\n\n");
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
-        let editor_history =
-            self.conv_store
-                .recent_messages_as_chat(&ctx.conversation_id, 20, None);
+        let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
+            &ctx.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            None,
+        );
+        if let Some(info) = &editor_epoch {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Editor history epoch"
+            );
+        }
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
@@ -749,7 +792,10 @@ impl PipelineOrchestrator {
             ctx.turn, enable_postprocess, enable_summarizer
         );
 
-        let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
+        let summary_block = render_recent_summaries_for_injection(
+            &ctx.recent_summaries,
+            RECENT_SUMMARIES_INJECT_LIMIT,
+        );
         let mut outcome = storyforge_app_agent::run_postprocess_pipeline(
             &self.runtime,
             final_text,
@@ -1017,11 +1063,22 @@ impl PipelineOrchestrator {
                 };
 
             // §22 cache 友好布局：history 排除重 roll 目标节点及之后
-            let director_history = self.conv_store.recent_messages_as_chat(
+            let (director_history, director_epoch) = self.conv_store.recent_history_with_epoch(
                 &req.conversation_id,
-                20,
+                storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
                 Some(&req.node_id),
             );
+            if let Some(info) = &director_epoch {
+                tracing::debug!(
+                    target: "context_compiler",
+                    epoch_id = %info.epoch_id,
+                    start = info.start,
+                    len = info.len,
+                    dropped = info.dropped,
+                    has_checkpoint = info.has_checkpoint,
+                    "Director regenerate history epoch"
+                );
+            }
             let director_layout = storyforge_domain::message_layout::MessageLayout::build()
                 .system(director_config.system_prompt.clone())
                 .history(director_history)
@@ -1123,14 +1180,20 @@ impl PipelineOrchestrator {
                 .as_ref()
                 .map(|c| c.effective_max_concurrent_subagents())
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS);
-            let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
+            let summary_block = render_recent_summaries_for_injection(
+                &ctx.recent_summaries,
+                RECENT_SUMMARIES_INJECT_LIMIT,
+            );
             let recent_texts: Vec<String> = ctx
                 .recent_summaries
                 .iter()
                 .map(|s| s.content.clone())
                 .collect();
-            let far_block =
-                render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts);
+            let far_block = render_far_memory_for_injection_excluding(
+                &ctx.far_memory_hits,
+                FAR_MEMORY_INJECT_LIMIT,
+                &recent_texts,
+            );
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
@@ -1307,9 +1370,10 @@ impl PipelineOrchestrator {
                         target_task.brief,
                     );
                     // ContextCompiler 最小版：regenerate 单子 Agent 也注入近期摘要 + 远记忆
-                    if let Some(block) =
-                        render_recent_summaries_for_injection(&ctx.recent_summaries, 5)
-                    {
+                    if let Some(block) = render_recent_summaries_for_injection(
+                        &ctx.recent_summaries,
+                        RECENT_SUMMARIES_INJECT_LIMIT,
+                    ) {
                         volatile_text.push_str("\n\n");
                         volatile_text.push_str(&block);
                         volatile_text.push_str(
@@ -1323,7 +1387,7 @@ impl PipelineOrchestrator {
                         .collect();
                     if let Some(block) = render_far_memory_for_injection_excluding(
                         &ctx.far_memory_hits,
-                        3,
+                        FAR_MEMORY_INJECT_LIMIT,
                         &recent_texts,
                     ) {
                         volatile_text.push_str("\n\n");
@@ -1524,9 +1588,22 @@ impl PipelineOrchestrator {
             .join("\n\n---\n\n");
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
-        let editor_history =
-            self.conv_store
-                .recent_messages_as_chat(&req.conversation_id, 20, Some(&req.node_id));
+        let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
+            &req.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            Some(&req.node_id),
+        );
+        if let Some(info) = &editor_epoch {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Editor regenerate history epoch"
+            );
+        }
         let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
@@ -1996,7 +2073,9 @@ fn build_director_tail(
     }
 
     // ContextCompiler 最小版：近期 RoundSummary 注入 volatile tail（稳定 history 之后）
-    if let Some(summary_block) = render_recent_summaries_for_injection(&ctx.recent_summaries, 5) {
+    if let Some(summary_block) =
+        render_recent_summaries_for_injection(&ctx.recent_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
+    {
         tail = tail.push(summary_block);
     }
 
@@ -2006,9 +2085,11 @@ fn build_director_tail(
         .iter()
         .map(|s| s.content.clone())
         .collect();
-    if let Some(far_block) =
-        render_far_memory_for_injection_excluding(&ctx.far_memory_hits, 3, &recent_texts)
-    {
+    if let Some(far_block) = render_far_memory_for_injection_excluding(
+        &ctx.far_memory_hits,
+        FAR_MEMORY_INJECT_LIMIT,
+        &recent_texts,
+    ) {
         tail = tail.push(far_block);
     }
 
@@ -2070,7 +2151,7 @@ pub fn render_far_memory_for_injection_excluding(
         lines.push(format!(
             "{}. {}",
             lines.len() + 1,
-            truncate_chars(content, 200)
+            truncate_chars(content, FAR_MEMORY_ITEM_MAX_CHARS)
         ));
     }
     if lines.is_empty() {
@@ -2109,8 +2190,8 @@ fn summaries_overlap(a: &str, b: &str) -> bool {
 
 /// 将近期 RoundSummary 渲染为导演 volatile tail 文本。
 ///
-/// - 按 turn 升序输入；取最近 `limit` 条。
-/// - 单条 content 截断到 240 字，避免吞掉当前意图预算。
+/// - 按 turn 升序输入；取最近 `limit` 条（生产默认 `RECENT_SUMMARIES_INJECT_LIMIT`）。
+/// - 单条 content 截断到 `RECENT_SUMMARY_ITEM_MAX_CHARS`，避免吞掉当前意图预算。
 /// - 空列表返回 None（调用方不 push 空段）。
 pub fn render_recent_summaries_for_injection(
     summaries: &[storyforge_domain::agent::RoundSummary],
@@ -2126,7 +2207,11 @@ pub fn render_recent_summaries_for_injection(
         if content.is_empty() {
             continue;
         }
-        lines.push(format!("- T{}: {}", s.turn, truncate_chars(content, 240)));
+        lines.push(format!(
+            "- T{}: {}",
+            s.turn,
+            truncate_chars(content, RECENT_SUMMARY_ITEM_MAX_CHARS)
+        ));
     }
     if lines.is_empty() {
         return None;
@@ -2236,15 +2321,19 @@ fn build_editor_tail(
         "场景：{scene_brief}\n\n子 Agent 表演：\n\n{performances_text}\n\n请合并成连贯成文。"
     ));
     // ContextCompiler 最小版：编剧也看到近期事实，减少跨轮设定漂移
-    if let Some(summary_block) = render_recent_summaries_for_injection(recent_summaries, 5) {
+    if let Some(summary_block) =
+        render_recent_summaries_for_injection(recent_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
+    {
         tail = tail.push(format!(
             "{summary_block}\n（合并成文时保持与上述摘要一致，勿改写已发生事实。）"
         ));
     }
     let recent_texts: Vec<String> = recent_summaries.iter().map(|s| s.content.clone()).collect();
-    if let Some(far_block) =
-        render_far_memory_for_injection_excluding(far_memory_hits, 3, &recent_texts)
-    {
+    if let Some(far_block) = render_far_memory_for_injection_excluding(
+        far_memory_hits,
+        FAR_MEMORY_INJECT_LIMIT,
+        &recent_texts,
+    ) {
         tail = tail.push(format!(
             "{far_block}\n（合稿时仅作背景约束，勿整段复述远记忆。）"
         ));

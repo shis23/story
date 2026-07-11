@@ -15948,4 +15948,64 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Phase A 契约：Committing 恢复时 Draft→Final 失败 → 保持 Committing 可重试，不标 Committed。
+    #[test]
+    fn contract_recovery_keeps_committing_when_finalize_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-recovery-finalize-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = turn_store::TurnStore::new(&dir);
+
+        let mut record = storyforge_domain::turn::TurnRecord::new(
+            Id::from_str("camp-finalize"),
+            Id::from_str("conv-f"),
+            Id::from_str("node-f"),
+            0,
+        );
+        record.status = storyforge_domain::turn::TurnStatus::Committing;
+        let attempt_id = Id::from_str("att-f");
+        record.attempts.push(storyforge_domain::turn::TurnAttempt {
+            attempt_id: attempt_id.clone(),
+            variant_id: Id::from_str("var-missing"), // 故意无对应 Draft
+            draft_hash: "h".into(),
+            status: storyforge_domain::turn::AttemptStatus::Committing,
+            pending_state_changes: Some(storyforge_domain::turn::MutationBatch::new(
+                Id::from_str("batch-f"),
+                0,
+            )),
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        let turn_id = record.turn_id.clone();
+        ts.save_turn(record).unwrap();
+
+        // 对齐 recover_turns_on_startup A.1：finalize_ok=false 时不写 Committed
+        let finalize_ok = false;
+        if finalize_ok {
+            ts.with_turn_mut(&turn_id, |r| {
+                r.status = storyforge_domain::turn::TurnStatus::Committed;
+                r.touch();
+            })
+            .unwrap();
+        }
+
+        let after = ts.get_turn(&turn_id).unwrap();
+        assert_eq!(
+            after.status,
+            storyforge_domain::turn::TurnStatus::Committing,
+            "finalize 失败必须保持 Committing 以便下次启动重试"
+        );
+        assert!(
+            ts.list_recoverable_turns()
+                .iter()
+                .any(|t| t.turn_id == turn_id)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

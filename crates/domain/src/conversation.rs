@@ -333,6 +333,8 @@ impl Conversation {
     ///
     /// 截断策略见 `select_history_window`：**history epoch**——先 append 增长，
     /// 超过窗口后按整块 epoch 前移，避免每轮只丢 1 条导致前缀全面失配。
+    /// 当窗口起点 > 0 时，在 history 最前插入一条确定性 **checkpoint summary**
+    ///（压缩被丢弃前缀），同一 epoch 内该条内容稳定。
     ///
     /// `before_node_id`：如果指定，只返回该节点之前的消息（regenerate 重 roll 时排除目标节点及之后）
     pub fn recent_messages_as_chat(
@@ -340,32 +342,59 @@ impl Conversation {
         n: usize,
         before_node_id: Option<&Id>,
     ) -> Vec<ChatMessage> {
-        self.iter_recent_active(n, before_node_id)
-            .map(|v| {
-                let role = match v.role {
-                    Role::User => ChatRole::User,
-                    Role::Assistant => ChatRole::Assistant,
-                };
-                ChatMessage {
-                    role,
-                    content: v.content.clone(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                }
-            })
-            .collect()
+        self.recent_history_with_epoch(n, before_node_id).0
     }
 
-    /// 共享迭代器：返回 history-epoch 窗口内「活跃且非空非 Discarded」的变体（按时间正序）
-    ///
-    /// `recent_messages_with_role` 和 `recent_messages_as_chat` 都复用此逻辑，
-    /// 保证过滤规则（Discarded/空跳过）和截断规则（before_node_id / epoch）一致。
-    fn iter_recent_active(
+    /// 同 `recent_messages_as_chat`，并返回 epoch 元数据（可观测 / 指纹解释）。
+    pub fn recent_history_with_epoch(
         &self,
         n: usize,
         before_node_id: Option<&Id>,
-    ) -> impl Iterator<Item = &MessageVariant> {
-        // 确定截止位置：before_node_id 指定时只取该节点之前（不含）
+    ) -> (Vec<ChatMessage>, HistoryEpochInfo) {
+        let active = self.collect_active_variants(before_node_id);
+        let window = select_history_window(active.len(), n, default_history_epoch(n));
+        let dropped_count = window.start.min(active.len());
+        let dropped_pairs: Vec<(Role, &str)> = active[..dropped_count]
+            .iter()
+            .map(|v| (v.role.clone(), v.content.as_str()))
+            .collect();
+        let checkpoint =
+            build_epoch_checkpoint_summary(&dropped_pairs, HISTORY_CHECKPOINT_MAX_CHARS);
+        let has_checkpoint = checkpoint.is_some();
+        let mut msgs = Vec::with_capacity(window.len + usize::from(has_checkpoint));
+        if let Some(cp) = checkpoint {
+            // 固定 role=User：checkpoint 作为 history 稳定前缀的第一条，不进 system（避免污染 Session 前缀）。
+            msgs.push(ChatMessage {
+                role: ChatRole::User,
+                content: cp,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        for v in active.iter().skip(window.start).take(window.len) {
+            let role = match v.role {
+                Role::User => ChatRole::User,
+                Role::Assistant => ChatRole::Assistant,
+            };
+            msgs.push(ChatMessage {
+                role,
+                content: v.content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        let info = HistoryEpochInfo {
+            epoch_id: history_epoch_id(window),
+            start: window.start,
+            len: window.len,
+            dropped: dropped_count,
+            has_checkpoint,
+        };
+        (msgs, info)
+    }
+
+    /// 共享：收集 before_node 截止的活跃非空非 Discarded 变体（时间正序）。
+    fn collect_active_variants(&self, before_node_id: Option<&Id>) -> Vec<&MessageVariant> {
         let end_idx = if let Some(bid) = before_node_id {
             self.nodes
                 .iter()
@@ -374,11 +403,23 @@ impl Conversation {
         } else {
             self.nodes.len()
         };
-        let active: Vec<&MessageVariant> = self.nodes[..end_idx]
+        self.nodes[..end_idx]
             .iter()
             .filter_map(|node| node.active())
             .filter(|v| v.status != VariantStatus::Discarded && !v.content.is_empty())
-            .collect();
+            .collect()
+    }
+
+    /// 共享迭代器：返回 history-epoch 窗口内「活跃且非空非 Discarded」的变体（按时间正序）
+    ///
+    /// `recent_messages_with_role` 使用此逻辑（**不含** checkpoint 文本行）；
+    /// `recent_messages_as_chat` 走 `recent_history_with_epoch`（含 checkpoint）。
+    fn iter_recent_active(
+        &self,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> impl Iterator<Item = &MessageVariant> {
+        let active = self.collect_active_variants(before_node_id);
         let window = select_history_window(active.len(), n, default_history_epoch(n));
         active.into_iter().skip(window.start).take(window.len)
     }
@@ -394,6 +435,12 @@ impl Conversation {
     }
 }
 
+/// 默认 history 窗口条数（Director/Editor 共用；epoch = window/2）。
+pub const DEFAULT_HISTORY_WINDOW_SIZE: usize = 20;
+
+/// 丢弃前缀 checkpoint 的最大字符预算（确定性压缩，非 LLM）。
+pub const HISTORY_CHECKPOINT_MAX_CHARS: usize = 800;
+
 /// history 窗口切片（相对 active 消息序列的索引区间）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryWindow {
@@ -405,6 +452,17 @@ impl HistoryWindow {
     pub fn end(&self) -> usize {
         self.start + self.len
     }
+}
+
+/// 当前 history-epoch 可观测元数据（供日志 / 指纹解释；不进模型全文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEpochInfo {
+    /// 稳定 id：同一 start 在 epoch 内不变（前缀 checkpoint 也稳定）。
+    pub epoch_id: String,
+    pub start: usize,
+    pub len: usize,
+    pub dropped: usize,
+    pub has_checkpoint: bool,
 }
 
 /// 默认 epoch：窗口的一半（至少 1），保证超窗后整块前移而不是每轮丢 1 条。
@@ -442,6 +500,53 @@ pub fn select_history_window(total: usize, window_size: usize, epoch: usize) -> 
     let start = start.min(total.saturating_sub(1));
     let len = (total - start).min(window_size);
     HistoryWindow { start, len }
+}
+
+/// epoch_id：由窗口起点决定（同 epoch 内 append 不改 id）。
+pub fn history_epoch_id(window: HistoryWindow) -> String {
+    format!("hist-epoch-start-{}", window.start)
+}
+
+/// 对 history-epoch 丢弃的前缀做确定性 checkpoint summary（非 LLM）。
+///
+/// 同一 dropped 前缀 → 同一文本；供新 epoch 的 history 前缀复用，避免「整块丢消息无痕迹」。
+pub fn build_epoch_checkpoint_summary(
+    dropped: &[(Role, &str)],
+    max_chars: usize,
+) -> Option<String> {
+    if dropped.is_empty() || max_chars == 0 {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(dropped.len());
+    for (role, content) in dropped {
+        let text = content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let label = match role {
+            Role::User => "用户",
+            Role::Assistant => "AI",
+        };
+        // 单条先截到 120 字，总预算再二次截断
+        let piece: String = text.chars().take(120).collect();
+        let piece = if text.chars().count() > 120 {
+            format!("{piece}…")
+        } else {
+            piece
+        };
+        lines.push(format!("{label}: {piece}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let body = lines.join(" / ");
+    let header = "【历史纪要】";
+    let full = format!("{header}{body}");
+    if full.chars().count() <= max_chars {
+        return Some(full);
+    }
+    let truncated: String = full.chars().take(max_chars.saturating_sub(1)).collect();
+    Some(format!("{truncated}…"))
 }
 
 #[cfg(test)]
@@ -558,11 +663,13 @@ mod tests {
             node("n3", variant(Role::User, "u2", VariantStatus::Final)),
             node("n4", variant(Role::Assistant, "a2", VariantStatus::Final)),
         ]);
-        // window=2, epoch=1：overflow=2 → start=2 → [u2,a2]
+        // window=2, epoch=1：overflow=2 → start=2 → checkpoint + [u2,a2]
         let msgs = c.recent_messages_as_chat(2, None);
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].content, "u2");
-        assert_eq!(msgs[1].content, "a2");
+        assert_eq!(msgs.len(), 3, "checkpoint + 2 raw");
+        assert!(msgs[0].content.starts_with("【历史纪要】"));
+        assert!(msgs[0].content.contains("u1"));
+        assert_eq!(msgs[1].content, "u2");
+        assert_eq!(msgs[2].content, "a2");
     }
 
     #[test]
@@ -599,7 +706,7 @@ mod tests {
     #[test]
     fn test_history_epoch_prefix_stable_within_epoch() {
         // 6 条 active：u1 a1 u2 a2 u3 a3
-        // window=4, epoch=2 → start=2 → [u2,a2,u3,a3]
+        // window=4, epoch=2 → start=2 → checkpoint(u1/a1) + [u2,a2,u3,a3]
         let mut nodes = vec![
             node("n1", variant(Role::User, "u1", VariantStatus::Final)),
             node("n2", variant(Role::Assistant, "a1", VariantStatus::Final)),
@@ -610,33 +717,56 @@ mod tests {
         ];
         let c6 = conv(nodes.clone());
         let w = 4;
-        let msgs6 = c6.recent_messages_as_chat(w, None);
+        let (msgs6, info6) = c6.recent_history_with_epoch(w, None);
+        assert!(info6.has_checkpoint);
+        assert_eq!(info6.epoch_id, "hist-epoch-start-2");
+        assert!(msgs6[0].content.starts_with("【历史纪要】"));
         assert_eq!(
-            msgs6.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            msgs6[1..]
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
             vec!["u2", "a2", "u3", "a3"]
         );
 
-        // total=5 时 start 也应为 2（与 total=6 共享起点）
+        // total=5 时 start 也应为 2（与 total=6 共享起点 + 同一 checkpoint）
         let c5 = conv(nodes[..5].to_vec());
-        let msgs5 = c5.recent_messages_as_chat(w, None);
-        assert_eq!(msgs5[0].content, "u2");
+        let (msgs5, info5) = c5.recent_history_with_epoch(w, None);
+        assert_eq!(info5.epoch_id, info6.epoch_id);
         assert_eq!(msgs5[0].content, msgs6[0].content);
-        // total=5 窗口内容是 [u2,a2,u3]；total=6 在其后 append a3
-        assert_eq!(msgs5.len(), 3);
+        // total=5 窗口内容是 checkpoint + [u2,a2,u3]；total=6 在其后 append a3
+        assert_eq!(msgs5.len(), 4);
         assert_eq!(
-            msgs6[..3]
+            msgs6[..4]
                 .iter()
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>(),
             msgs5.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()
         );
 
-        // epoch 切换：total=7 → start=4 → [u3,a3,u4]
+        // epoch 切换：total=7 → start=4 → 新 checkpoint + [u3,a3,u4]
         nodes.push(node("n7", variant(Role::User, "u4", VariantStatus::Final)));
         let c7 = conv(nodes);
-        let msgs7 = c7.recent_messages_as_chat(w, None);
-        assert_eq!(msgs7[0].content, "u3");
+        let (msgs7, info7) = c7.recent_history_with_epoch(w, None);
+        assert_eq!(info7.epoch_id, "hist-epoch-start-4");
+        assert_ne!(info7.epoch_id, info6.epoch_id);
         assert_ne!(msgs7[0].content, msgs6[0].content);
+        assert_eq!(msgs7[1].content, "u3");
+    }
+
+    #[test]
+    fn test_epoch_checkpoint_deterministic_and_budget() {
+        let dropped = vec![
+            (Role::User, "打开月亮金库"),
+            (Role::Assistant, "守卫拦住去路"),
+        ];
+        let a = build_epoch_checkpoint_summary(&dropped, 800).unwrap();
+        let b = build_epoch_checkpoint_summary(&dropped, 800).unwrap();
+        assert_eq!(a, b);
+        assert!(a.starts_with("【历史纪要】"));
+        let tight = build_epoch_checkpoint_summary(&dropped, 20).unwrap();
+        assert!(tight.chars().count() <= 20);
+        assert!(build_epoch_checkpoint_summary(&[], 800).is_none());
     }
 
     #[test]

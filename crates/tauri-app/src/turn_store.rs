@@ -296,6 +296,124 @@ mod tests {
         );
     }
 
+    /// Phase A 契约：accept CAS 与 postprocess 写回争用时，
+    /// 已进入 Committing 的 Turn 不能被 postprocess 条件写回覆盖。
+    #[test]
+    fn contract_postprocess_skips_when_committing() {
+        let store = temp_store();
+        let mut record = make_record("camp-race");
+        let turn_id = record.turn_id.clone();
+        let attempt_id = Id::from_str("att-race");
+        record.status = TurnStatus::AwaitingAcceptance;
+        record.attempts.push(TurnAttempt {
+            attempt_id: attempt_id.clone(),
+            variant_id: Id::from_str("var-race"),
+            draft_hash: "h".into(),
+            status: AttemptStatus::AwaitingAcceptance,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        store.create_turn(record).unwrap();
+
+        // accept 路径：AwaitingAcceptance → Committing
+        let cas_ok = store
+            .mutate_if(
+                &turn_id,
+                |r| {
+                    r.status == TurnStatus::AwaitingAcceptance
+                        && r.find_attempt(&attempt_id)
+                            .is_some_and(|a| a.status == AttemptStatus::AwaitingAcceptance)
+                },
+                |r| {
+                    r.status = TurnStatus::Committing;
+                    if let Some(att) = r.find_attempt_mut(&attempt_id) {
+                        att.status = AttemptStatus::Committing;
+                    }
+                    r.touch();
+                },
+            )
+            .unwrap();
+        assert!(cas_ok);
+
+        // 迟到的 postprocess：predicate 与生产路径一致
+        let pp_ok = store
+            .mutate_if(
+                &turn_id,
+                |r| !r.status.is_terminal() && r.status != TurnStatus::Committing,
+                |r| {
+                    r.status = TurnStatus::AwaitingAcceptance;
+                    if let Some(att) = r.find_attempt_mut(&attempt_id) {
+                        att.status = AttemptStatus::AwaitingAcceptance;
+                        att.pending_state_changes = None;
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!pp_ok, "postprocess must not overwrite Committing");
+        let after = store.get_turn(&turn_id).unwrap();
+        assert_eq!(after.status, TurnStatus::Committing);
+        assert_eq!(
+            after.find_attempt(&attempt_id).unwrap().status,
+            AttemptStatus::Committing
+        );
+    }
+
+    /// Phase A 契约：Discard 只标 Attempt，不把 pending_temporary_instances 写进 Campaign。
+    /// （Campaign 落盘仅经 accept 的 UpsertInstance；本测断言 Attempt 侧状态机。）
+    #[test]
+    fn contract_discard_attempt_keeps_temps_on_attempt_only() {
+        let store = temp_store();
+        let mut record = make_record("camp-discard");
+        let turn_id = record.turn_id.clone();
+        let attempt_id = Id::from_str("att-disc");
+        let mut temp = storyforge_domain::campaign::CharacterInstance::temporary(
+            Id::from_str("camp-discard"),
+            "GhostOnlyOnAttempt",
+        );
+        temp.id = Id::from_str("temp-ghost");
+        record.status = TurnStatus::AwaitingAcceptance;
+        record.attempts.push(TurnAttempt {
+            attempt_id: attempt_id.clone(),
+            variant_id: Id::from_str("var-disc"),
+            draft_hash: "h".into(),
+            status: AttemptStatus::AwaitingAcceptance,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![temp.clone()],
+            provenance: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        store.create_turn(record).unwrap();
+
+        // soft_delete_variant 语义：仅 Attempt → Discarded；Turn 仍 active
+        store
+            .with_turn_mut(&turn_id, |r| {
+                if let Some(att) = r.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Discarded;
+                }
+                r.touch();
+            })
+            .unwrap();
+
+        let after = store.get_turn(&turn_id).unwrap();
+        assert_eq!(after.status, TurnStatus::AwaitingAcceptance);
+        let att = after.find_attempt(&attempt_id).unwrap();
+        assert_eq!(att.status, AttemptStatus::Discarded);
+        assert_eq!(att.pending_temporary_instances.len(), 1);
+        assert_eq!(att.pending_temporary_instances[0].id, temp.id);
+        // 活动 Turn 仍在（允许 regenerate），temps 未“提交”到别处
+        assert!(
+            store
+                .get_active_turn(&Id::from_str("camp-discard"))
+                .is_some()
+        );
+    }
+
     #[test]
     fn cas_turn_status_succeeds_on_match() {
         let store = temp_store();

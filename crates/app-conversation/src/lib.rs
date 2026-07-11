@@ -527,6 +527,7 @@ impl ConversationStore {
     ///
     /// 返回真正的 `[user, assistant, ...]` 消息（role 映射，content 无前缀），
     /// 让历史作为独立消息段进 LLM，保证 system+history 前缀稳定、cache 命中。
+    /// 超窗时首条可能是确定性 epoch checkpoint summary。
     /// `before_node_id`：regenerate 重 roll 时排除目标节点及之后。
     pub fn recent_messages_as_chat(
         &self,
@@ -534,9 +535,26 @@ impl ConversationStore {
         n: usize,
         before_node_id: Option<&Id>,
     ) -> Vec<ChatMessage> {
-        self.get(conv_id)
-            .map(|c| c.recent_messages_as_chat(n, before_node_id))
-            .unwrap_or_default()
+        self.recent_history_with_epoch(conv_id, n, before_node_id).0
+    }
+
+    /// 同 `recent_messages_as_chat`，附带 HistoryEpochInfo（可观测）。
+    pub fn recent_history_with_epoch(
+        &self,
+        conv_id: &Id,
+        n: usize,
+        before_node_id: Option<&Id>,
+    ) -> (
+        Vec<ChatMessage>,
+        Option<storyforge_domain::conversation::HistoryEpochInfo>,
+    ) {
+        match self.get(conv_id) {
+            Some(c) => {
+                let (msgs, info) = c.recent_history_with_epoch(n, before_node_id);
+                (msgs, Some(info))
+            }
+            None => (Vec::new(), None),
+        }
     }
 
     // ─── 部分重 roll（对应设计 §3.7.3）─────────────────────────────────────

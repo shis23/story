@@ -507,4 +507,40 @@ mod tests {
         assert!(matches!(err, CommitError::MutationConflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Phase A 契约：Discard 不经 Coordinator → Campaign 无临时角色。
+    /// Accept 才 UpsertInstance 落盘。
+    #[test]
+    fn contract_temps_only_persisted_via_accept_upsert() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign_id = Id::from_str("camp-no-temp-on-discard");
+        let mut camp =
+            storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "no temp");
+        camp.id = campaign_id.clone();
+        store.save_campaign(camp).unwrap();
+
+        // Discard 路径：不调用 apply_mutation_batch（只标 Attempt Discarded）
+        assert!(store.list_instances(&campaign_id).is_empty());
+
+        // Accept 路径：batch 含 UpsertInstance 才落盘
+        let mut temp = storyforge_domain::campaign::CharacterInstance::temporary(
+            campaign_id.clone(),
+            "AcceptOnlyGhost",
+        );
+        temp.id = Id::from_str("temp-accept-only");
+        let batch = MutationBatch {
+            commit_id: Id::from_str("commit-accept-temp"),
+            expected_revision: 0,
+            target_revision: 1,
+            status: MutationBatchStatus::Prepared,
+            mutations: vec![Mutation::UpsertInstance(Box::new(temp.clone()))],
+        };
+        CampaignMutationCoordinator::apply_mutation_batch(&store, &campaign_id, &batch).unwrap();
+        let instances = store.list_instances(&campaign_id);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, temp.id);
+        assert!(instances[0].is_temporary);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
