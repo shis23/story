@@ -42,6 +42,18 @@ pub struct StoredMvuTranslation {
 pub const FORCE_RERUN_BLOCKED_BY_CAMPAIGN: &str =
     "这张角色卡已有游玩档，暂不支持重新识别；请先导入一份新卡再重跑识别。";
 
+/// upsert 三态结果（Phase A 幂等重放用）。
+///
+/// - `Inserted`：ID 不存在，已插入。
+/// - `AlreadyPresent`：ID 存在且 payload 完全一致，no-op（幂等重放）。
+/// - `Conflict`：ID 存在但 payload 不一致（数据腐败或实现错误）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertResult {
+    Inserted,
+    AlreadyPresent,
+    Conflict(String),
+}
+
 pub struct CampaignStore {
     cards_path: PathBuf,
     campaigns_path: PathBuf,
@@ -524,6 +536,74 @@ impl CampaignStore {
         summaries.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
         summaries.push(summary);
         persist(&self.summaries_path, &summaries)
+    }
+
+    // ─── Phase A: 三态 upsert（TurnCommit 幂等重放用）─────────────────────
+
+    /// 比较两个值的 payload 是否完全一致（用于幂等重放的 no-op 判定）。
+    ///
+    /// 用 serde_json 规范化比较，避免浮点精度或字段顺序差异导致误判。
+    fn payloads_match<T: serde::Serialize>(a: &T, b: &T) -> bool {
+        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    }
+
+    /// 三态 upsert 知识条目（按 entry.id）。
+    ///
+    /// Phase A 幂等重放：重放时复用同一批 entry_id，payload 一致则 no-op。
+    pub fn upsert_knowledge(
+        &self,
+        entry: CharacterKnowledgeEntry,
+    ) -> Result<UpsertResult, String> {
+        let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = knowledge.iter().position(|k| k.id == entry.id) {
+            if Self::payloads_match(&knowledge[idx], &entry) {
+                return Ok(UpsertResult::AlreadyPresent);
+            }
+            return Ok(UpsertResult::Conflict(format!(
+                "knowledge entry id={} 已存在但 payload 不一致",
+                entry.id
+            )));
+        }
+        knowledge.push(entry);
+        persist(&self.knowledge_path, &knowledge)?;
+        Ok(UpsertResult::Inserted)
+    }
+
+    /// 三态 upsert 任务（按 task.id）。
+    pub fn upsert_task(&self, task: StoryTask) -> Result<UpsertResult, String> {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = tasks.iter().position(|t| t.id == task.id) {
+            if Self::payloads_match(&tasks[idx], &task) {
+                return Ok(UpsertResult::AlreadyPresent);
+            }
+            return Ok(UpsertResult::Conflict(format!(
+                "task id={} 已存在但 payload 不一致",
+                task.id
+            )));
+        }
+        tasks.push(task);
+        persist(&self.tasks_path, &tasks)?;
+        Ok(UpsertResult::Inserted)
+    }
+
+    /// 三态 upsert 本轮摘要（按 campaign_id + turn 幂等键，payload 比较 content）。
+    pub fn upsert_summary(&self, summary: RoundSummary) -> Result<UpsertResult, String> {
+        let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = summaries
+            .iter()
+            .position(|s| s.campaign_id == summary.campaign_id && s.turn == summary.turn)
+        {
+            if Self::payloads_match(&summaries[idx], &summary) {
+                return Ok(UpsertResult::AlreadyPresent);
+            }
+            return Ok(UpsertResult::Conflict(format!(
+                "summary campaign={}? turn={} 已存在但 payload 不一致",
+                summary.campaign_id, summary.turn
+            )));
+        }
+        summaries.push(summary);
+        persist(&self.summaries_path, &summaries)?;
+        Ok(UpsertResult::Inserted)
     }
 
     // ─── MVU 翻译存储（P3 新增）──────────────────────────────────────────
@@ -1378,6 +1458,131 @@ mod tests {
         assert!(store.delete_card(&Id::from_str("card-1")).unwrap());
         assert!(store.get_mvu(&Id::from_str("src-1")).is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Phase A: 三态 upsert 测试 ────────────────────────────────────────
+
+    fn make_knowledge_entry(id: &str, text: &str) -> CharacterKnowledgeEntry {
+        CharacterKnowledgeEntry {
+            id: Id::from_str(id),
+            campaign_id: Id::from_str("camp-1"),
+            character_id: Id::from_str("char-1"),
+            knowledge_text: text.into(),
+            source: storyforge_domain::character_knowledge::KnowledgeSource::Witnessed,
+            source_character_id: None,
+            source_knowledge_id: None,
+            turn_number: 1,
+            event_id: None,
+            pinned: false,
+            propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
+        }
+    }
+
+    #[test]
+    fn upsert_knowledge_inserts_new() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let entry = make_knowledge_entry("k-1", "看到了刀");
+        let result = store.upsert_knowledge(entry).unwrap();
+        assert_eq!(result, UpsertResult::Inserted);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_knowledge_noop_on_identical_payload() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let entry = make_knowledge_entry("k-1", "看到了刀");
+        store.upsert_knowledge(entry.clone()).unwrap();
+        // 重放同一 entry → AlreadyPresent
+        let result = store.upsert_knowledge(entry).unwrap();
+        assert_eq!(result, UpsertResult::AlreadyPresent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_knowledge_conflict_on_different_payload() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        store.upsert_knowledge(make_knowledge_entry("k-1", "看到了刀")).unwrap();
+        // 同 ID 不同 text → Conflict
+        let result = store.upsert_knowledge(make_knowledge_entry("k-1", "看到了枪")).unwrap();
+        assert!(matches!(result, UpsertResult::Conflict(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_task_inserts_and_idempotent() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let task = StoryTask::from_narrative(
+            Id::from_str("camp-1"),
+            "寻找密室".to_string(),
+            "在书房找到暗门".to_string(),
+            vec![],
+            1,
+        );
+        let task_id = task.id.clone();
+
+        let result1 = store.upsert_task(task.clone()).unwrap();
+        assert_eq!(result1, UpsertResult::Inserted);
+
+        // 重放 → AlreadyPresent
+        let result2 = store.upsert_task(task).unwrap();
+        assert_eq!(result2, UpsertResult::AlreadyPresent);
+
+        // 确认只有一条
+        assert_eq!(store.list_tasks(&Id::from_str("camp-1")).len(), 1);
+        let _ = task_id;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_summary_inserts_and_idempotent_by_campaign_turn() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let summary = RoundSummary::new(
+            Id::from_str("camp-1"),
+            Id::from_str("conv-1"),
+            1,
+            "第一轮摘要".into(),
+        );
+
+        let result1 = store.upsert_summary(summary.clone()).unwrap();
+        assert_eq!(result1, UpsertResult::Inserted);
+
+        // 重放同一 summary → AlreadyPresent
+        let result2 = store.upsert_summary(summary).unwrap();
+        assert_eq!(result2, UpsertResult::AlreadyPresent);
+
+        assert_eq!(store.list_summaries(&Id::from_str("camp-1")).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_summary_conflict_on_different_content() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        store
+            .upsert_summary(RoundSummary::new(
+                Id::from_str("camp-1"),
+                Id::from_str("conv-1"),
+                1,
+                "第一轮摘要".into(),
+            ))
+            .unwrap();
+
+        // 同 campaign+turn 但不同 content → Conflict
+        let result = store
+            .upsert_summary(RoundSummary::new(
+                Id::from_str("camp-1"),
+                Id::from_str("conv-1"),
+                1,
+                "改过的摘要".into(),
+            ))
+            .unwrap();
+        assert!(matches!(result, UpsertResult::Conflict(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
