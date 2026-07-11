@@ -456,7 +456,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
 > | B | 部分 | QualityGate：**Error 拦截** + `force_accept`→Turn **Degraded**；Warning 不拦；Accept 旁提示/二次确认 | NarrativeContract、扩展 ScenePlan、有界自动修复 |
-> | C | **M0–M4 可独立部分** | history-epoch + epoch 快照；RoundSummary A/B/C；Director 装配；chronicle tools；Compressor 后台发布 | M5 真模型缓存/远楼/压缩损失对照 |
+> | C | **M0–M4 可独立部分** | history-epoch + epoch 快照；RoundSummary A/B/C；Director 装配；chronicle tools；Compressor 后台发布 + **可恢复 job 队列** | M5 真模型缓存/远楼/压缩损失对照 |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
 ### 阶段 A：建立测量和安全边界

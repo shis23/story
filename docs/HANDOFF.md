@@ -90,7 +90,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. **记忆 / Context 装配规格续作**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **v1.0** — **M0–M4 可独立部分完成**（epoch 快照 + Compressor A→B/B→C 后台发布）。下一步：**M5** 真模型缓存/远楼/压缩损失验收。Quality Error 拦截 + force→Degraded 已接。
+1. **记忆 / Context 装配规格续作**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **v1.0** — **M0–M4 可独立部分完成**（含 Compressor 可恢复 job 队列）。下一步：**M5** 真模型缓存/远楼/压缩损失验收；NarrativeContract/ScenePlan；UnitOfWork/SQLite 仍独立。Quality Error 拦截 + force→Degraded 已接。
 2. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
 3. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
 4. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。

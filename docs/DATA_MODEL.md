@@ -39,6 +39,9 @@ ChronicleEntry A/B/C（`crates/domain/src/chronicle.rs`）
 ArchivedSummary（已有）
   消息正文批压缩（MemoryArchiver）；非规范轮次纪要
   向量 source_kind 区分；auto recall 可用；v1 不进 search_chronicle
+
+CompressJob（M4 队列）
+  `data/compress_jobs.json`：Pending/Running/Succeeded/Failed；campaign 级 open 去重；启动 Running→Pending 重放
 ```
 
 权威规格（v1.0：身份、epoch 公式、revision、主从、工具边界）：

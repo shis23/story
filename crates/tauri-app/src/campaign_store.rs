@@ -721,7 +721,7 @@ fn load_or_default<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     )
 }
 
-fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
+pub(crate) fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<(), String> {
     storyforge_infra_util::atomic_write_json(path, data).map_err(|e| {
         let msg = format!("持久化失败 {}: {e}", path.display());
         tracing::error!("{msg}");

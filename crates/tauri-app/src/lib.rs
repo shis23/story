@@ -1,4 +1,5 @@
 pub mod campaign_store;
+mod compress_job_store;
 mod connection_store;
 pub mod error;
 mod global_regex_store;
@@ -130,11 +131,19 @@ fn get_global_regex_store() -> &'static global_regex_store::GlobalRegexStore {
 }
 
 static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new();
+static COMPRESS_JOB_STORE: OnceLock<compress_job_store::CompressJobStore> = OnceLock::new();
 
 fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     CAMPAIGN_STORE.get_or_init(|| {
         let data_dir = get_app_data_dir();
         campaign_store::CampaignStore::new(&data_dir)
+    })
+}
+
+fn get_compress_job_store() -> &'static compress_job_store::CompressJobStore {
+    COMPRESS_JOB_STORE.get_or_init(|| {
+        let data_dir = get_app_data_dir();
+        compress_job_store::CompressJobStore::new(&data_dir)
     })
 }
 
@@ -5827,47 +5836,141 @@ async fn accept_variant_async(
     Ok(())
 }
 
-/// Accept 成功后：若 uncovered A/B 达阈值，后台跑 ChronicleCompressor 并落盘。
+/// 统计 campaign 未覆盖 A/B 数量。
+fn count_uncovered_chronicle_levels(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+) -> (usize, usize) {
+    let entries = store.list_summaries(campaign_id);
+    let uncovered_a = entries
+        .iter()
+        .filter(|s| s.covered_by.is_none() && s.is_leaf_a())
+        .count();
+    let uncovered_b = entries
+        .iter()
+        .filter(|s| {
+            s.covered_by.is_none()
+                && s.chronicle_level() == storyforge_domain::chronicle::ChronicleLevel::B
+        })
+        .count();
+    (uncovered_a, uncovered_b)
+}
+
+/// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
 fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
+    let store = get_campaign_store();
+    let job_store = get_compress_job_store();
+    let (uncovered_a, uncovered_b) = count_uncovered_chronicle_levels(store, &campaign_id);
+    let need_a = storyforge_domain::chronicle::should_enqueue_compress(
+        uncovered_a,
+        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
+    );
+    let need_b = storyforge_domain::chronicle::should_enqueue_compress(
+        uncovered_b,
+        storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
+    );
+    if !need_a && !need_b {
+        return;
+    }
+    let camp = store.get_campaign(&campaign_id);
+    let conversation_id = camp.as_ref().and_then(|c| c.conversation_id.clone());
+    let lineage_id = camp.as_ref().and_then(|c| c.lineage_id.clone());
+    match job_store.enqueue_or_get_open(
+        &campaign_id,
+        conversation_id,
+        lineage_id,
+        uncovered_a as u32,
+        uncovered_b as u32,
+    ) {
+        Ok((job, created)) => {
+            tracing::info!(
+                target: "chronicle_compressor",
+                campaign_id = %campaign_id,
+                job_id = %job.id,
+                created,
+                uncovered_a,
+                uncovered_b,
+                "compress job enqueued"
+            );
+            spawn_compress_job_worker(state, job.id);
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "chronicle_compressor",
+                "enqueue compress job failed: {e}"
+            );
+        }
+    }
+}
+
+/// 启动恢复：Running→Pending，然后为所有 open job spawn worker。
+fn recover_compress_jobs_on_startup(app_state: Arc<AppState>) {
+    let job_store = get_compress_job_store();
+    let reset = job_store.reset_running_to_pending();
+    if reset > 0 {
+        tracing::info!(
+            target: "chronicle_compressor",
+            reset,
+            "startup: reset Running compress jobs to Pending"
+        );
+    }
+    let open = job_store.list_open();
+    if open.is_empty() {
+        return;
+    }
+    tracing::info!(
+        target: "chronicle_compressor",
+        count = open.len(),
+        "startup: replaying open compress jobs"
+    );
+    for job in open {
+        spawn_compress_job_worker(app_state.clone(), job.id);
+    }
+}
+
+/// 消费单个 compress job（可崩溃重试：失败回到 Pending 或 Failed）。
+fn spawn_compress_job_worker(state: Arc<AppState>, job_id: Id) {
     tokio::spawn(async move {
+        let job_store = get_compress_job_store();
         let store = get_campaign_store();
-        let camp = match store.get_campaign(&campaign_id) {
-            Some(c) => c,
-            None => return,
+        let job = match job_store
+            .list_all()
+            .into_iter()
+            .find(|j| j.id == job_id)
+        {
+            Some(j) if j.status.is_open() => j,
+            _ => return,
         };
-        let lineage = camp.lineage_id.clone().unwrap_or_else(Id::new);
-        let conversation_id = camp
-            .conversation_id
-            .clone()
-            .unwrap_or_else(|| Id::from_str("unknown-conv"));
-        let entries = store.list_summaries(&campaign_id);
-        let uncovered_a = entries
-            .iter()
-            .filter(|s| s.covered_by.is_none() && s.is_leaf_a())
-            .count();
-        let uncovered_b = entries
-            .iter()
-            .filter(|s| {
-                s.covered_by.is_none()
-                    && s.chronicle_level() == storyforge_domain::chronicle::ChronicleLevel::B
-            })
-            .count();
-        let need_a = storyforge_domain::chronicle::should_enqueue_compress(
-            uncovered_a,
-            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
-        );
-        let need_b = storyforge_domain::chronicle::should_enqueue_compress(
-            uncovered_b,
-            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_B_THRESHOLD,
-        );
-        if !need_a && !need_b {
+        if let Err(e) = job_store.mark_running(&job_id) {
+            tracing::warn!(target: "chronicle_compressor", "mark_running {job_id}: {e}");
             return;
         }
+
+        let campaign_id = job.campaign_id.clone();
+        let camp = match store.get_campaign(&campaign_id) {
+            Some(c) => c,
+            None => {
+                let _ = job_store.mark_failed_or_retry(&job_id, "campaign missing");
+                return;
+            }
+        };
+        let lineage = job
+            .lineage_id
+            .clone()
+            .or(camp.lineage_id.clone())
+            .unwrap_or_else(Id::new);
+        let conversation_id = job
+            .conversation_id
+            .clone()
+            .or(camp.conversation_id.clone())
+            .unwrap_or_else(|| Id::from_str("unknown-conv"));
+        let entries = store.list_summaries(&campaign_id);
 
         let llm = state.active_llm_or_mock();
         let tool_snapshot = state.snapshot_tool_ctx();
         let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
         let (_tx, cancel) = tokio::sync::watch::channel(false);
+
         match storyforge_app_agent::run_compress_if_needed(
             &runtime,
             &campaign_id,
@@ -5882,30 +5985,47 @@ fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
         .await
         {
             Ok(outcomes) => {
+                let mut publish_err: Option<String> = None;
                 for out in outcomes {
                     if let Err(e) = store.publish_compress_result(
                         &campaign_id,
                         &out.parent_summaries,
                         &out.publish.child_covered_by,
                     ) {
-                        tracing::error!(
-                            target: "chronicle_compressor",
-                            "publish compress failed: {e}"
-                        );
-                    } else {
-                        tracing::info!(
-                            target: "chronicle_compressor",
-                            level = ?out.output_level,
-                            parents = out.parent_summaries.len(),
-                            children = out.publish.child_covered_by.len(),
-                            "compress batch published"
-                        );
+                        publish_err = Some(e);
+                        break;
                     }
+                    tracing::info!(
+                        target: "chronicle_compressor",
+                        job_id = %job_id,
+                        level = ?out.output_level,
+                        parents = out.parent_summaries.len(),
+                        children = out.publish.child_covered_by.len(),
+                        "compress batch published"
+                    );
+                }
+                if let Some(e) = publish_err {
+                    let _ = job_store.mark_failed_or_retry(&job_id, e);
+                } else {
+                    let _ = job_store.mark_succeeded(&job_id);
                 }
             }
-            Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress) => {}
+            Err(storyforge_app_agent::ChronicleCompressorError::NothingToCompress) => {
+                // 阈值已不满足（并发压缩或手动清理）— 视为成功完成
+                let _ = job_store.mark_succeeded(&job_id);
+                tracing::info!(
+                    target: "chronicle_compressor",
+                    job_id = %job_id,
+                    "compress job nothing to do → succeeded"
+                );
+            }
             Err(e) => {
-                tracing::warn!(target: "chronicle_compressor", "compress run failed: {e}");
+                tracing::warn!(
+                    target: "chronicle_compressor",
+                    job_id = %job_id,
+                    "compress run failed: {e}"
+                );
+                let _ = job_store.mark_failed_or_retry(&job_id, e.to_string());
             }
         }
     });
@@ -9687,6 +9807,8 @@ pub fn run() {
         .setup(move |app| {
             // Phase A: 启动恢复——幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn
             recover_turns_on_startup(recovery_state.as_ref());
+            // M4: 重放未完成 ChronicleCompressor 任务（Running→Pending 后 spawn）
+            recover_compress_jobs_on_startup(recovery_state.clone());
 
             // W8: 创建 WebViewMvuRuntime，共享同一个 pending map
             let mvu_rt =
