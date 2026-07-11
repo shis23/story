@@ -14,7 +14,9 @@
 use std::sync::{Mutex, OnceLock};
 
 use storyforge_domain::Id;
-use storyforge_domain::turn::{Mutation, MutationBatch, MutationBatchStatus};
+use storyforge_domain::turn::{Mutation, MutationBatch};
+#[cfg(test)]
+use storyforge_domain::turn::MutationBatchStatus;
 
 use crate::campaign_store::{CampaignStore, UpsertResult};
 

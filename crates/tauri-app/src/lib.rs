@@ -138,6 +138,40 @@ fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     })
 }
 
+static TURN_STORE: OnceLock<turn_store::TurnStore> = OnceLock::new();
+
+fn get_turn_store() -> &'static turn_store::TurnStore {
+    TURN_STORE.get_or_init(|| {
+        let data_dir = get_app_data_dir();
+        turn_store::TurnStore::new(&data_dir)
+    })
+}
+
+/// Phase A 屏障：检查活跃 Campaign 是否有未完成的 Turn。
+///
+/// 在 `start_writing` 追加 user 消息**之前**调用。
+/// 如果存在非 terminal Turn，返回错误，阻止新一轮启动。
+/// 非 Campaign 模式（无活跃 Campaign）直接放行。
+fn check_turn_barrier(state: &Arc<AppState>) -> Result<(), TauriCommandError> {
+    let active_campaign_id = {
+        let guard = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+    let Some(campaign_id) = active_campaign_id else {
+        return Ok(()); // 非 Campaign 模式，放行
+    };
+    if let Some(turn) = get_turn_store().get_active_turn(&campaign_id) {
+        return Err(TauriCommandError::validation(format!(
+            "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再开始下一轮",
+            turn.turn_id, turn.status
+        )));
+    }
+    Ok(())
+}
+
 fn to_json_value<T: Serialize + ?Sized>(
     value: &T,
     label: &str,
@@ -2058,6 +2092,9 @@ async fn start_writing(
     let app = state.inner().clone();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
 
+    // Phase A 屏障：存在非 terminal Turn → 拒绝启动（在追加 user 消息之前）
+    check_turn_barrier(&app)?;
+
     // 前端事件转发任务
     let on_event_clone = on_event.clone();
     tokio::spawn(async move {
@@ -2111,6 +2148,32 @@ async fn start_writing(
     // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
     fill_campaign_context_async(&mut ctx, &app).await?;
 
+    // Phase A: Campaign 模式下创建 TurnRecord
+    let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
+        // 获取当前 Campaign revision 作为 base
+        let base_revision = get_campaign_store()
+            .get_campaign(campaign_id)
+            .map(|c| c.revision)
+            .unwrap_or(0);
+        let input_node = start_target.input_node_id.unwrap_or_else(|| {
+            tracing::warn!("Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder");
+            Id::from_str("unknown-input-node")
+        });
+        let record = storyforge_domain::turn::TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            input_node,
+            base_revision,
+        );
+        if let Err(e) = get_turn_store().create_turn(record.clone()) {
+            tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
+            return Err(TauriCommandError::internal(format!("创建 TurnRecord 失败: {e}")));
+        }
+        Some(record)
+    } else {
+        None // 非 Campaign 模式，不创建 TurnRecord
+    };
+
     // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
     let (cancel_tx, cancel_rx) = watch::channel(false);
     {
@@ -2135,7 +2198,26 @@ async fn start_writing(
     // postprocess 放后台 spawn——draft_ready 后立即返回成文给前端，
     // postprocess 在后台跑（知识/变量/摘要写回），通过 event_tx 推进度。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
-    if let Ok((final_text, _, _)) = &result {
+    if let Ok((final_text, draft_node_id, _)) = &result {
+        // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady
+        if let Some(ref turn) = turn_record {
+            let draft_hash = compute_draft_hash(final_text);
+            let attempt = storyforge_domain::turn::TurnAttempt {
+                attempt_id: Id::new(),
+                variant_id: draft_node_id.clone(),
+                draft_hash,
+                status: storyforge_domain::turn::AttemptStatus::DraftReady,
+                pending_state_changes: None,
+                derivation: None,
+                provenance: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            update_turn_record(&turn.turn_id, |record| {
+                record.attempts.push(attempt);
+                record.status = storyforge_domain::turn::TurnStatus::DraftReady;
+                record.touch();
+            });
+        }
         // Phase 6：落盘本轮创建的临时 instance（同步，在 postprocess 之前确保知识/变量写回能找到它们）
         persist_temporary_instances_async(&ctx, pipeline.pending_temporary_instances().to_vec())
             .await;
@@ -2192,13 +2274,48 @@ async fn start_writing(
             "conversation_id": conversation_id.to_string(),
             "node_id": node_id.to_string(),
         })),
-        Err(e) => Err(TauriCommandError::from(format!("写作失败: {e}"))),
+        Err(e) => {
+            // Phase A: 写作失败 → TurnRecord 标 Failed（无副作用，安全失败）
+            if let Some(ref turn) = turn_record {
+                update_turn_record(&turn.turn_id, |record| {
+                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                    record.failure_reason = Some(format!("写作失败: {e}"));
+                    record.touch();
+                });
+            }
+            Err(TauriCommandError::from(format!("写作失败: {e}")))
+        }
+    }
+}
+
+/// 计算草稿内容的 hash（用于检测编辑后 diff 失效）。
+fn compute_draft_hash(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 读取-修改-写回 TurnRecord 的便捷辅助。
+fn update_turn_record<F>(turn_id: &Id, f: F)
+where
+    F: FnOnce(&mut storyforge_domain::turn::TurnRecord),
+{
+    let store = get_turn_store();
+    if let Some(mut record) = store.get_turn(turn_id) {
+        f(&mut record);
+        if let Err(e) = store.save_turn(record) {
+            tracing::error!("Phase A: 保存 TurnRecord 失败: {e}");
+        }
     }
 }
 
 struct StartConversationTarget {
     conversation_id: Id,
     regex_character_id: Option<String>,
+    /// Phase A: 追加的 user 消息节点 ID（TurnRecord.input_node_id 用）
+    input_node_id: Option<Id>,
 }
 
 async fn prepare_start_conversation_async(
@@ -2248,12 +2365,15 @@ fn prepare_start_conversation(
         .map(|cid| cid.as_str().to_string())
         .or(requested_conversation_id);
 
-    let conversation_id = if let Some(id_str) = conversation_id {
+    let (conversation_id, input_node_id) = if let Some(id_str) = conversation_id {
         let id = Id::from_str(&id_str);
-        if let Err(e) = state.conv_store.append_user_message(&id, intent.clone()) {
-            tracing::warn!("追加 user 消息失败: {e}");
+        match state.conv_store.append_user_message(&id, intent.clone()) {
+            Ok(node_id) => (id, Some(node_id)),
+            Err(e) => {
+                tracing::warn!("追加 user 消息失败: {e}");
+                (id, None)
+            }
         }
-        id
     } else {
         let conv = state.conv_store.create(character_id.clone(), None);
         let id = conv.id.clone();
@@ -2267,10 +2387,14 @@ fn prepare_start_conversation(
         {
             tracing::warn!("追加开场白失败: {e}");
         }
-        if let Err(e) = state.conv_store.append_user_message(&id, intent.clone()) {
-            tracing::warn!("追加 user 消息失败: {e}");
-        }
-        id
+        let node_id = state
+            .conv_store
+            .append_user_message(&id, intent.clone())
+            .map_err(|e| {
+                tracing::warn!("追加 user 消息失败: {e}");
+            })
+            .ok();
+        (id, node_id)
     };
 
     let regex_character_id = character_id.or_else(|| {
@@ -2283,6 +2407,7 @@ fn prepare_start_conversation(
     StartConversationTarget {
         conversation_id,
         regex_character_id,
+        input_node_id,
     }
 }
 
