@@ -17,12 +17,14 @@ use storyforge_domain::llm::{
     ChatMessage, ChatRequest, ChatResponse, LlmError, SamplingParams, StreamChunk, ToolCall,
     ToolSpec,
 };
-use storyforge_domain::message_layout::{MessageLayout, fingerprint_messages};
+use storyforge_domain::message_layout::{
+    MessageLayout, PROMPT_LAYOUT_VERSION, fingerprint_messages, messages_segment_summary,
+};
 use storyforge_infra_llm::LlmClient;
 
 use crate::tools::{ToolContext, ToolRegistry};
 
-/// A2：记录 hook 后最终请求指纹（不落全文）与供应商 cache usage。
+/// A2：记录 hook 后最终请求指纹、prompt layout version、segment 摘要（不落全文）。
 fn log_request_observability(role: &AgentRole, round: u32, messages: &[ChatMessage], tag: &str) {
     let fp = fingerprint_messages(messages);
     let fp_short = if fp.len() >= 16 {
@@ -30,10 +32,12 @@ fn log_request_observability(role: &AgentRole, round: u32, messages: &[ChatMessa
     } else {
         fp.as_str()
     };
+    let segs = messages_segment_summary(messages);
     debug!(
         target: "app-agent",
-        "{role}{tag}: round={round} request_fp={fp_short} msgs={}",
-        messages.len()
+        "{role}{tag}: round={round} pv={PROMPT_LAYOUT_VERSION} request_fp={fp_short} msgs={} segs={}",
+        messages.len(),
+        segs.short_label()
     );
 }
 
@@ -523,6 +527,13 @@ impl AgentRuntime {
         completion_probe: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
     ) -> Result<ChatResponse, AgentError> {
         // 初始 messages = [system, history..., tail]（layout 已组装好三段）
+        let pre_hook_segs = layout.segment_fingerprint();
+        debug!(
+            target: "app-agent",
+            "{}[layout]: pre_hook segs={}",
+            config.role,
+            pre_hook_segs.short_label()
+        );
         let mut messages = layout.into_messages();
         let rounds = config.max_tool_rounds;
 
@@ -538,6 +549,21 @@ impl AgentRuntime {
             let request_messages = self
                 .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
                 .await?;
+            // round1：对比 hook 前后 system/history 是否被改写（缓存解释）
+            if round == 1 {
+                let post = messages_segment_summary(&request_messages);
+                if post.system_hash != pre_hook_segs.system_hash
+                    || post.history_hash != pre_hook_segs.history_hash
+                {
+                    info!(
+                        target: "app-agent",
+                        "{}[layout]: prompt hook changed stable prefix pre={} post={}",
+                        config.role,
+                        pre_hook_segs.short_label(),
+                        post.short_label()
+                    );
+                }
+            }
             log_request_observability(&config.role, round, &request_messages, "[layout]");
 
             let req = ChatRequest {

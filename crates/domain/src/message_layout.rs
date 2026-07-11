@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::llm::{ChatMessage, ChatRole};
 
+/// MessageLayout / 请求指纹算法版本（日志与 CI 对齐；改算法时 bump）。
+pub const PROMPT_LAYOUT_VERSION: &str = "layout-a2-sha256-v1";
+
 // ─── 易变末尾的构建器 ───────────────────────────────────────────────────────
 
 /// 易变末尾（当轮 user message）
@@ -121,6 +124,30 @@ impl MessageLayout {
         }
         hex_encode(&hasher.finalize())
     }
+
+    /// 三段各自内容寻址指纹（hook 前 layout；用于 segment diff / 缓存解释）。
+    pub fn segment_fingerprint(&self) -> SegmentFingerprint {
+        let mut history_hasher = Sha256::new();
+        for msg in &self.stable_history {
+            history_hasher.update(role_label(&msg.role).as_bytes());
+            history_hasher.update(b"\0");
+            history_hasher.update(msg.content.as_bytes());
+            history_hasher.update(b"\n");
+        }
+        let mut tail_hasher = Sha256::new();
+        for part in &self.volatile_tail.parts {
+            tail_hasher.update(part.as_bytes());
+            tail_hasher.update(b"\n");
+        }
+        SegmentFingerprint {
+            prompt_version: PROMPT_LAYOUT_VERSION.to_string(),
+            system_hash: content_hash(&self.stable_system),
+            history_hash: hex_encode(&history_hasher.finalize()),
+            history_len: self.stable_history.len(),
+            tail_hash: hex_encode(&tail_hasher.finalize()),
+            tail_parts: self.volatile_tail.parts.len(),
+        }
+    }
 }
 
 /// 前缀指纹（内容寻址，CI / 运行时断言用）
@@ -129,6 +156,32 @@ pub struct PrefixFingerprint {
     pub system_hash: String,
     /// (role label, content sha256 hex)
     pub history_sig: Vec<(String, String)>,
+}
+
+/// 三段 segment 指纹（debug 日志；不落全文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFingerprint {
+    pub prompt_version: String,
+    pub system_hash: String,
+    pub history_hash: String,
+    pub history_len: usize,
+    pub tail_hash: String,
+    pub tail_parts: usize,
+}
+
+impl SegmentFingerprint {
+    /// 日志用短摘要（各 hash 前 12 hex）。
+    pub fn short_label(&self) -> String {
+        format!(
+            "pv={} sys={} hist={}/{} tail={}/{}",
+            self.prompt_version,
+            short_hex(&self.system_hash, 12),
+            short_hex(&self.history_hash, 12),
+            self.history_len,
+            short_hex(&self.tail_hash, 12),
+            self.tail_parts
+        )
+    }
 }
 
 /// 对 hook 后最终 messages 计算请求指纹（不落全文，只记 hash）。
@@ -141,6 +194,55 @@ pub fn fingerprint_messages(messages: &[ChatMessage]) -> String {
         hasher.update(b"\n");
     }
     hex_encode(&hasher.finalize())
+}
+
+/// hook 后 messages 的粗粒度 segment 摘要（首条 system / 中间 history / 末条 user 启发式）。
+///
+/// 非 layout 路径或 hook 改写后无法严格还原三段时，仍可对比 system/tail 是否漂移。
+pub fn messages_segment_summary(messages: &[ChatMessage]) -> SegmentFingerprint {
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role, ChatRole::System))
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let tail = messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, ChatRole::User))
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let history_msgs: Vec<&ChatMessage> = messages
+        .iter()
+        .filter(|m| !matches!(m.role, ChatRole::System))
+        .collect();
+    // 去掉末尾 user（视作 tail）后剩余为 history 近似
+    let hist_slice = if history_msgs
+        .last()
+        .is_some_and(|m| matches!(m.role, ChatRole::User))
+    {
+        &history_msgs[..history_msgs.len().saturating_sub(1)]
+    } else {
+        &history_msgs[..]
+    };
+    let mut history_hasher = Sha256::new();
+    for msg in hist_slice {
+        history_hasher.update(role_label(&msg.role).as_bytes());
+        history_hasher.update(b"\0");
+        history_hasher.update(msg.content.as_bytes());
+        history_hasher.update(b"\n");
+    }
+    SegmentFingerprint {
+        prompt_version: PROMPT_LAYOUT_VERSION.to_string(),
+        system_hash: content_hash(system),
+        history_hash: hex_encode(&history_hasher.finalize()),
+        history_len: hist_slice.len(),
+        tail_hash: content_hash(tail),
+        tail_parts: usize::from(!tail.is_empty()),
+    }
+}
+
+fn short_hex(hex: &str, n: usize) -> &str {
+    if hex.len() >= n { &hex[..n] } else { hex }
 }
 
 // ─── Builder（类型状态机，编译期强制顺序）──────────────────────────────────
@@ -346,5 +448,46 @@ mod tests {
         let a = vec![ChatMessage::user("hello")];
         let b = vec![ChatMessage::user("world")];
         assert_ne!(fingerprint_messages(&a), fingerprint_messages(&b));
+    }
+
+    #[test]
+    fn test_segment_fingerprint_tail_only_diff() {
+        let a = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("h")])
+            .tail(|t| t.push("t1"));
+        let b = MessageLayout::build()
+            .system("sys")
+            .history(vec![ChatMessage::user("h")])
+            .tail(|t| t.push("t2"));
+        let sa = a.segment_fingerprint();
+        let sb = b.segment_fingerprint();
+        assert_eq!(sa.prompt_version, PROMPT_LAYOUT_VERSION);
+        assert_eq!(sa.system_hash, sb.system_hash);
+        assert_eq!(sa.history_hash, sb.history_hash);
+        assert_ne!(sa.tail_hash, sb.tail_hash);
+        assert!(sa.short_label().contains("pv="));
+    }
+
+    #[test]
+    fn test_messages_segment_summary_tracks_system() {
+        let a = vec![
+            ChatMessage::system("S1"),
+            ChatMessage::user("h"),
+            ChatMessage::user("tail"),
+        ];
+        let b = vec![
+            ChatMessage::system("S2"),
+            ChatMessage::user("h"),
+            ChatMessage::user("tail"),
+        ];
+        assert_ne!(
+            messages_segment_summary(&a).system_hash,
+            messages_segment_summary(&b).system_hash
+        );
+        assert_eq!(
+            messages_segment_summary(&a).tail_hash,
+            messages_segment_summary(&b).tail_hash
+        );
     }
 }

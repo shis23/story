@@ -463,7 +463,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 1. 修复当前 release gate 和插件宿主装配。
 2. 增加 ReasoningPolicy：Disabled / Native / Prompted 三选一。 **（已落地：`ReasoningMode`）**
-3. 规范化工具顺序和最终请求指纹，增加真实 cache usage、prompt version、hook 前后 hash 和 segment diff 记录。 **（指纹 SHA-256 + usage 日志已落地；prompt version/segment diff 可继续补）**
+3. 规范化工具顺序和最终请求指纹，增加真实 cache usage、prompt version、hook 前后 hash 和 segment diff 记录。 **（指纹 SHA-256 + `PROMPT_LAYOUT_VERSION` + segment 摘要日志 + usage 日志 + hook 改写稳定前缀告警已落地）**
 4. 增加最小 Turn 屏障：Postprocess/状态推导结束前禁止下一轮读取未提交 revision；暂不要求立刻迁移存储。 **（已落地并有契约测试）**
 5. 将 DeepSeek V4 报告转成固定真实 LLM 回归集。 **（部分 harness 存在；完整矩阵延后）**
 
