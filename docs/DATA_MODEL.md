@@ -16,6 +16,7 @@ CharacterDefinition
 
 Campaign
   一局故事存档：card_id、story_clock、campaign variables、fork 信息
+  另：`revision`（状态 CAS）、`chronicle_revision`、`lineage_id`、`context_epoch`（ContextEpochSnapshot）
 
 CharacterInstance
   Campaign 内的角色实例：instance id、definition_id、override、变量、temporary 标记

@@ -199,6 +199,38 @@ impl CampaignMutationCoordinator {
                             camp.bump_chronicle_revision();
                             let _ = store.update_campaign(camp);
                         }
+                        // M4 最小：阈值达到则规划压缩组（后台 LLM 发布尚未接线）
+                        let all = store.list_summaries(campaign_id);
+                        let uncovered: Vec<_> = all
+                            .iter()
+                            .filter(|s| s.covered_by.is_none())
+                            .collect();
+                        let ids: Vec<_> = uncovered.iter().map(|s| s.id.clone()).collect();
+                        let spans: Vec<(u32, u32)> =
+                            uncovered.iter().map(|s| (s.turn, s.turn)).collect();
+                        match storyforge_domain::chronicle::plan_compress_batch_for_uncovered(
+                            &ids,
+                            &spans,
+                            storyforge_domain::chronicle::DEFAULT_COMPRESS_ACTIVE_A_THRESHOLD,
+                            storyforge_domain::chronicle::DEFAULT_COMPRESS_GROUP_SIZE,
+                        ) {
+                            Ok(Some(groups)) => {
+                                tracing::info!(
+                                    target: "chronicle_compressor",
+                                    campaign_id = %campaign_id,
+                                    uncovered = uncovered.len(),
+                                    groups = groups.len(),
+                                    "A→B compress batch planned (enqueue stub; no LLM publish yet)"
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "chronicle_compressor",
+                                    "compress plan failed: {e:?}"
+                                );
+                            }
+                        }
                         Ok(())
                     }
                     UpsertResult::AlreadyPresent => Ok(()),

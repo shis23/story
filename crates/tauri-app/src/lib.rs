@@ -2406,6 +2406,8 @@ async fn start_writing(
         recent_summaries: vec![],
         far_memory_hits: vec![],
         template_random_seed: None,
+        context_epoch: None,
+        chronicle_revision: 0,
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
@@ -3339,11 +3341,14 @@ fn load_campaign_context_snapshot(
     store: &campaign_store::CampaignStore,
     active_id: &Id,
 ) -> Option<CampaignContextSnapshot> {
-    let camp = store.get_campaign(active_id)?;
+    let mut camp = store.get_campaign(active_id)?;
+    let _ = camp.ensure_lineage_id();
     let story_clock = camp.story_clock.clone();
     // turn 用全量摘要条数；注入上下文只保留最近 K 条
     let all_summaries = store.list_summaries(active_id);
     let existing_turns = all_summaries.len() as u32;
+    let (epoch_snap, _) = refresh_and_persist_context_epoch(store, &mut camp, &all_summaries);
+    let _ = epoch_snap; // applied via camp.context_epoch into runtime.campaign
     let recent_summaries =
         take_recent_summaries_for_context(all_summaries, RECENT_SUMMARIES_LOAD_LIMIT);
     let turn = existing_turns + 1;
@@ -3402,6 +3407,8 @@ fn apply_campaign_context_snapshot(
     append_missing_campaign_scoped_regex_scripts(ctx, snapshot.scoped_regex_scripts);
     ctx.campaign_runtime = Some(snapshot.runtime.clone());
     ctx.recent_summaries = snapshot.recent_summaries;
+    ctx.context_epoch = snapshot.runtime.campaign.context_epoch.clone();
+    ctx.chronicle_revision = snapshot.runtime.campaign.chronicle_revision;
 
     let mut tool_guard = tool_ctx.write().unwrap_or_else(|p| p.into_inner());
     tool_guard.campaign_runtime = Some(snapshot.runtime);
@@ -3413,6 +3420,94 @@ fn apply_campaign_context_snapshot(
         .collect();
     // 同步到 search_chronicle / get_chronicle（规范 A 兼容视图）
     tool_guard.chronicle_summaries = ctx.recent_summaries.clone();
+}
+
+/// 在 Context 编译入口刷新 ContextEpochSnapshot 并可选落盘。
+///
+/// - live_suffix 满 E → rollover（新 overview/band/anchor）
+/// - 同 epoch 内 overview/band 冻结
+/// - created/rollover 时 bump chronicle_revision
+fn refresh_and_persist_context_epoch(
+    store: &campaign_store::CampaignStore,
+    camp: &mut storyforge_domain::campaign::Campaign,
+    all_summaries: &[storyforge_domain::agent::RoundSummary],
+) -> (
+    storyforge_domain::chronicle::ContextEpochSnapshot,
+    storyforge_domain::chronicle::EpochMembership,
+) {
+    use storyforge_domain::chronicle::{
+        committed_turns_from_count, refresh_context_epoch, sequence_from_committed_turn_id,
+        ChronicleCode, ChronicleLevel, ContextWindowParams, OverviewCandidate,
+    };
+
+    let committed_count = all_summaries.iter().map(|s| s.turn).max().unwrap_or(0);
+    let n = committed_count.max(all_summaries.len() as u32);
+    let committed = committed_turns_from_count(n);
+
+    let mut cands: Vec<OverviewCandidate> = Vec::new();
+    for s in all_summaries {
+        let code = s
+            .code
+            .as_deref()
+            .and_then(ChronicleCode::parse)
+            .unwrap_or_else(|| ChronicleCode::new(ChronicleLevel::A, s.turn));
+        cands.push(OverviewCandidate {
+            code,
+            level: ChronicleLevel::A,
+            turn_start: s.turn,
+            covered_by: s.covered_by.clone(),
+        });
+    }
+
+    let code_by_turn: std::collections::HashMap<u32, ChronicleCode> = all_summaries
+        .iter()
+        .map(|s| {
+            let code = s
+                .code
+                .as_deref()
+                .and_then(ChronicleCode::parse)
+                .unwrap_or_else(|| ChronicleCode::new(ChronicleLevel::A, s.turn));
+            (s.turn, code)
+        })
+        .collect();
+
+    let band_lookup = |id: &Id| {
+        sequence_from_committed_turn_id(id).and_then(|t| code_by_turn.get(&t).cloned())
+    };
+
+    let params = ContextWindowParams::default();
+    let existing = camp.context_epoch.clone();
+    let result = refresh_context_epoch(
+        existing.as_ref(),
+        &committed,
+        &cands,
+        &band_lookup,
+        params,
+        camp.chronicle_revision,
+    );
+
+    if result.should_bump_chronicle_revision() {
+        camp.bump_chronicle_revision();
+    }
+    let mut snap = result.snapshot;
+    snap.chronicle_revision = camp.chronicle_revision;
+    camp.context_epoch = Some(snap.clone());
+    if let Err(e) = store.update_campaign(camp.clone()) {
+        tracing::warn!(target: "context_compiler", "persist context_epoch failed: {e}");
+    } else {
+        tracing::debug!(
+            target: "context_compiler",
+            epoch_id = %snap.epoch_id,
+            rolled_over = result.rolled_over,
+            created = result.created,
+            live_suffix = result.membership.live_suffix_count,
+            chronicle_revision = camp.chronicle_revision,
+            overview = snap.overview_codes.len(),
+            band = snap.band_codes.len(),
+            "context epoch refreshed"
+        );
+    }
+    (snap, result.membership)
 }
 
 /// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
@@ -3428,14 +3523,16 @@ pub fn fill_campaign_runtime_from_store(
     store: &campaign_store::CampaignStore,
     active_id: &Id,
 ) {
-    let camp = match store.get_campaign(active_id) {
+    let mut camp = match store.get_campaign(active_id) {
         Some(c) => c,
         None => return,
     };
+    let _ = camp.ensure_lineage_id();
     ctx.campaign_id = Some(active_id.clone());
     ctx.story_clock = camp.story_clock.clone();
     // turn = 已有 round_summaries 数 + 1（下一轮）
-    let existing_turns = store.list_summaries(active_id).len() as u32;
+    let all_summaries = store.list_summaries(active_id);
+    let existing_turns = all_summaries.len() as u32;
     ctx.turn = existing_turns + 1;
     // pending_tasks：该 Campaign 下所有任务（build_director_user_msg 内部按触发条件过滤）
     ctx.pending_tasks = store.list_tasks(active_id);
@@ -3466,6 +3563,12 @@ pub fn fill_campaign_runtime_from_store(
         std::collections::HashMap::new()
     };
 
+    // M2 完整：编译入口刷新 epoch 快照（满 E 则 rollover）并落盘
+    let (epoch_snap, _membership) =
+        refresh_and_persist_context_epoch(store, &mut camp, &all_summaries);
+    ctx.context_epoch = Some(epoch_snap);
+    ctx.chronicle_revision = camp.chronicle_revision;
+
     let runtime = Arc::new(CampaignRuntimeContext {
         campaign: camp,
         instances,
@@ -3477,12 +3580,10 @@ pub fn fill_campaign_runtime_from_store(
 
     // 写入 WritingContext
     ctx.campaign_runtime = Some(runtime.clone());
-    // ContextCompiler 最小版：RoundSummary → Director tail + get_recent_summary
+    // ContextCompiler：RoundSummary → Director history 前缀 + tools
     // load-side 只保留最近 K 条（turn 已在上方用全量条数计算）
-    ctx.recent_summaries = take_recent_summaries_for_context(
-        store.list_summaries(active_id),
-        RECENT_SUMMARIES_LOAD_LIMIT,
-    );
+    ctx.recent_summaries =
+        take_recent_summaries_for_context(all_summaries, RECENT_SUMMARIES_LOAD_LIMIT);
 
     // 同步到 ToolContext（快照，非 store 引用）
     {
@@ -4571,6 +4672,8 @@ async fn regenerate(
         far_memory_hits: vec![],
         // A2：regenerate 用户 seed 直接注入模板 random/roll
         template_random_seed: req.seed,
+        context_epoch: None,
+        chronicle_revision: 0,
     };
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     fill_profile_context(&mut ctx, &app);
@@ -10508,6 +10611,8 @@ mod tests {
             recent_summaries: vec![],
             far_memory_hits: vec![],
             template_random_seed: None,
+        context_epoch: None,
+        chronicle_revision: 0,
         };
 
         let fragments = collect_mvu_fallback_fragments(
@@ -13089,6 +13194,124 @@ mod tests {
                 RegexScriptSource::Scoped,
                 RegexScriptSource::Scoped
             ]
+        );
+
+        // ContextEpochSnapshot 应在 fill 时创建并落盘
+        assert!(
+            ctx.context_epoch.is_some(),
+            "fill_campaign should freeze context_epoch"
+        );
+        let reloaded = campaign_store.get_campaign(&campaign.id).unwrap();
+        assert!(reloaded.context_epoch.is_some());
+        assert_eq!(
+            reloaded.context_epoch.as_ref().unwrap().epoch_id,
+            ctx.context_epoch.as_ref().unwrap().epoch_id
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_context_epoch_rollover_when_live_suffix_reaches_e() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::chronicle::{
+            committed_turn_id, DEFAULT_E, DEFAULT_H_ANCHOR,
+        };
+        use storyforge_app_agent::tools::ToolContext;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_epoch_rollover_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let campaign_store = campaign_store::CampaignStore::new(&dir);
+        let card_id = Id::from_str("card-epoch");
+        campaign_store
+            .save_card(storyforge_domain::character::CharacterCard {
+                id: card_id.clone(),
+                name: "Epoch Card".into(),
+                source_character_id: Id::from_str("src"),
+                character_definitions: vec![],
+                raw_card_json: serde_json::json!({}),
+                extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+                extraction_message: None,
+            })
+            .unwrap();
+        let campaign = Campaign::new(card_id, "epoch-camp");
+        let camp_id = campaign.id.clone();
+        campaign_store.save_campaign(campaign).unwrap();
+
+        // 先写入 H_anchor 条摘要 → 创建 epoch（head=H, live=0）
+        for t in 1..=DEFAULT_H_ANCHOR {
+            campaign_store
+                .add_summary(
+                    storyforge_domain::agent::RoundSummary::new(
+                        camp_id.clone(),
+                        Id::from_str("conv"),
+                        t,
+                        format!("round {t}"),
+                    )
+                    .with_code(format!("A{t:04}"))
+                    .with_headline(format!("h{t}")),
+                )
+                .unwrap();
+        }
+        let tool_ctx = Arc::new(RwLock::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        }));
+        let mut ctx = WritingContext::legacy(vec![], None, Id::from_str("conv"));
+        fill_campaign_runtime_from_store(&mut ctx, &tool_ctx, &campaign_store, &camp_id);
+        let epoch1 = ctx.context_epoch.clone().expect("epoch after first fill");
+        assert_eq!(
+            epoch1.source_head_turn_id,
+            Some(committed_turn_id(DEFAULT_H_ANCHOR))
+        );
+        let rev1 = ctx.chronicle_revision;
+
+        // 再追加 E 条 → 下次 fill 应 rollover
+        for t in (DEFAULT_H_ANCHOR + 1)..=(DEFAULT_H_ANCHOR + DEFAULT_E) {
+            campaign_store
+                .add_summary(
+                    storyforge_domain::agent::RoundSummary::new(
+                        camp_id.clone(),
+                        Id::from_str("conv"),
+                        t,
+                        format!("round {t}"),
+                    )
+                    .with_code(format!("A{t:04}"))
+                    .with_headline(format!("h{t}")),
+                )
+                .unwrap();
+        }
+        let mut ctx2 = WritingContext::legacy(vec![], None, Id::from_str("conv"));
+        fill_campaign_runtime_from_store(&mut ctx2, &tool_ctx, &campaign_store, &camp_id);
+        let epoch2 = ctx2.context_epoch.clone().expect("epoch after rollover fill");
+        assert_ne!(epoch1.epoch_id, epoch2.epoch_id, "rollover must new epoch_id");
+        assert_eq!(
+            epoch2.source_head_turn_id,
+            Some(committed_turn_id(DEFAULT_H_ANCHOR + DEFAULT_E))
+        );
+        assert!(
+            ctx2.chronicle_revision > rev1,
+            "rollover should bump chronicle_revision"
+        );
+        // 同 epoch 再 fill 应稳定
+        let mut ctx3 = WritingContext::legacy(vec![], None, Id::from_str("conv"));
+        fill_campaign_runtime_from_store(&mut ctx3, &tool_ctx, &campaign_store, &camp_id);
+        assert_eq!(
+            ctx3.context_epoch.as_ref().unwrap().epoch_id,
+            epoch2.epoch_id
+        );
+        assert_eq!(
+            ctx3.context_epoch.as_ref().unwrap().source_hash,
+            epoch2.source_hash
         );
 
         let _ = std::fs::remove_dir_all(&dir);

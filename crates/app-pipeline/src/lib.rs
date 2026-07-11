@@ -151,6 +151,10 @@ pub struct WritingContext {
     /// Pipeline 在 start_writing / regenerate 时用本轮 seed 写入 TemplateVarContext；
     /// 外部也可预置（例如重放）。None = 渲染层回退时间种子（旧行为）。
     pub template_random_seed: Option<u64>,
+    /// 本轮编译冻结的 ContextEpochSnapshot（fill_campaign 时刷新并落盘）。
+    pub context_epoch: Option<storyforge_domain::chronicle::ContextEpochSnapshot>,
+    /// 本轮捕获的 chronicle_revision（与 snapshot 一致）。
+    pub chronicle_revision: u64,
 }
 
 // ─── ContextCompiler named budgets（注入侧；load-side last-K 在 tauri-app）──────
@@ -350,6 +354,8 @@ impl WritingContext {
             recent_summaries: vec![],
             far_memory_hits: vec![],
             template_random_seed: None,
+            context_epoch: None,
+            chronicle_revision: 0,
         }
     }
 }

@@ -520,6 +520,199 @@ pub fn select_overview_codes(
     selected.into_iter().map(|c| c.code.clone()).collect()
 }
 
+// ─── Epoch 刷新 / 创建 / rollover（编译入口纯函数）────────────────────────
+
+/// 将已提交轮次序号映射为稳定 turn_id（无 TurnRecord UUID 时的确定性 id）。
+pub fn committed_turn_id(sequence: u32) -> Id {
+    Id::from_str(format!("committed-turn-{sequence}"))
+}
+
+/// 从 1..=n 的已提交轮次构造 CommittedTurnRef 序列。
+pub fn committed_turns_from_count(n: u32) -> Vec<CommittedTurnRef> {
+    (1..=n)
+        .map(|sequence| CommittedTurnRef {
+            turn_id: committed_turn_id(sequence),
+            sequence,
+        })
+        .collect()
+}
+
+/// 从 turn_id 解析序号（仅识别 `committed-turn-{n}`）。
+pub fn sequence_from_committed_turn_id(turn_id: &Id) -> Option<u32> {
+    let s = turn_id.as_str();
+    s.strip_prefix("committed-turn-")?.parse().ok()
+}
+
+/// Epoch 刷新结果。
+#[derive(Debug, Clone)]
+pub struct EpochRefreshResult {
+    pub snapshot: ContextEpochSnapshot,
+    pub membership: EpochMembership,
+    /// 是否因 live_suffix 满 E 而 rollover
+    pub rolled_over: bool,
+    /// 是否新建（原先无 snapshot）
+    pub created: bool,
+}
+
+impl EpochRefreshResult {
+    pub fn should_bump_chronicle_revision(&self) -> bool {
+        self.rolled_over || self.created
+    }
+}
+
+/// 根据现有 snapshot + 已提交序列，在「下一次 Context 编译前」刷新 epoch。
+///
+/// 规则（规格 §4.1）：
+/// - 无 snapshot → 以当前最后一个已提交为 head 创建 epoch（live_suffix 空）
+/// - 有 snapshot 且 membership.needs_rollover → rollover 后写新 snapshot
+/// - 否则沿用 snapshot 的 overview/band/anchor（仅 membership 反映 live_suffix 增长）
+pub fn refresh_context_epoch(
+    existing: Option<&ContextEpochSnapshot>,
+    committed: &[CommittedTurnRef],
+    overview_candidates: &[OverviewCandidate],
+    // band_turn_id → ChronicleCode（leaf A）
+    band_code_for_turn: &dyn Fn(&Id) -> Option<ChronicleCode>,
+    params: ContextWindowParams,
+    chronicle_revision: u64,
+) -> EpochRefreshResult {
+    match existing {
+        None => {
+            let membership = rollover_epoch_head(committed, params);
+            let snapshot = build_context_epoch_snapshot(
+                &membership,
+                overview_candidates,
+                band_code_for_turn,
+                params,
+                chronicle_revision,
+                None,
+            );
+            EpochRefreshResult {
+                snapshot,
+                membership,
+                rolled_over: false,
+                created: true,
+            }
+        }
+        Some(prev) => {
+            let membership = compute_epoch_membership(
+                committed,
+                prev.source_head_turn_id.as_ref(),
+                params,
+            );
+            if membership.needs_rollover_before_next_compile {
+                let membership = rollover_epoch_head(committed, params);
+                let snapshot = build_context_epoch_snapshot(
+                    &membership,
+                    overview_candidates,
+                    band_code_for_turn,
+                    params,
+                    chronicle_revision,
+                    Some(prev),
+                );
+                EpochRefreshResult {
+                    snapshot,
+                    membership,
+                    rolled_over: true,
+                    created: false,
+                }
+            } else {
+                // 同 epoch：冻结 overview/band/anchor；membership 带 live_suffix
+                EpochRefreshResult {
+                    snapshot: prev.clone(),
+                    membership,
+                    rolled_over: false,
+                    created: false,
+                }
+            }
+        }
+    }
+}
+
+/// 从 membership 构造可持久化 ContextEpochSnapshot。
+pub fn build_context_epoch_snapshot(
+    membership: &EpochMembership,
+    overview_candidates: &[OverviewCandidate],
+    band_code_for_turn: &dyn Fn(&Id) -> Option<ChronicleCode>,
+    params: ContextWindowParams,
+    chronicle_revision: u64,
+    previous: Option<&ContextEpochSnapshot>,
+) -> ContextEpochSnapshot {
+    let band_codes: Vec<ChronicleCode> = membership
+        .band_turn_ids
+        .iter()
+        .filter_map(band_code_for_turn)
+        .collect();
+    let band_earliest = membership
+        .band_turn_ids
+        .first()
+        .and_then(sequence_from_committed_turn_id)
+        .or_else(|| {
+            membership
+                .anchor_turn_ids
+                .first()
+                .and_then(sequence_from_committed_turn_id)
+        });
+    let overview_codes =
+        select_overview_codes(overview_candidates, band_earliest, params.overview_max_entries);
+
+    let epoch_id = if let Some(prev) = previous {
+        if prev.source_head_turn_id == membership.epoch_start_head
+            && prev.raw_anchor_turn_ids == membership.anchor_turn_ids
+        {
+            prev.epoch_id.clone()
+        } else {
+            format!(
+                "ctx-epoch-{}",
+                membership
+                    .epoch_start_head
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("empty")
+            )
+        }
+    } else {
+        format!(
+            "ctx-epoch-{}",
+            membership
+                .epoch_start_head
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("empty")
+        )
+    };
+
+    let mut source_hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    source_hasher.update(epoch_id.as_bytes());
+    source_hasher.update(b"|");
+    for c in &overview_codes {
+        source_hasher.update(c.as_str().as_bytes());
+        source_hasher.update(b",");
+    }
+    source_hasher.update(b"|");
+    for c in &band_codes {
+        source_hasher.update(c.as_str().as_bytes());
+        source_hasher.update(b",");
+    }
+    source_hasher.update(b"|");
+    for id in &membership.anchor_turn_ids {
+        source_hasher.update(id.as_str().as_bytes());
+        source_hasher.update(b",");
+    }
+    let source_hash = format!("{:x}", source_hasher.finalize());
+
+    ContextEpochSnapshot {
+        epoch_id,
+        source_head_turn_id: membership.epoch_start_head.clone(),
+        overview_codes,
+        band_codes,
+        raw_anchor_turn_ids: membership.anchor_turn_ids.clone(),
+        compiler_version: CONTEXT_COMPILER_VERSION.to_string(),
+        chronicle_revision,
+        source_hash,
+    }
+}
+
 // ─── 硬去重 ────────────────────────────────────────────────────────────────
 
 /// 装配期硬去重判定（规格 §5.1）。
@@ -667,6 +860,33 @@ pub fn validate_compress_covers(
         }
     }
     Ok(())
+}
+
+// ─── ChronicleCompressor 触发判定（M4 最小）──────────────────────────────────
+
+/// 未覆盖 active 条目是否达到批压阈值。
+pub fn should_enqueue_compress(uncovered_active_count: usize, threshold: usize) -> bool {
+    threshold > 0 && uncovered_active_count >= threshold
+}
+
+/// 统计 uncovered leaf（covered_by is None）数量。
+pub fn count_uncovered_active(covered_flags: impl IntoIterator<Item = bool>) -> usize {
+    // true = covered (skip); false = uncovered
+    covered_flags.into_iter().filter(|covered| !*covered).count()
+}
+
+/// 为未覆盖 A 规划压缩组（仅确定性切分；LLM 文案与发布在后台任务）。
+pub fn plan_compress_batch_for_uncovered(
+    uncovered_ids_in_time_order: &[Id],
+    turn_spans: &[(u32, u32)],
+    threshold: usize,
+    group_size: usize,
+) -> Result<Option<Vec<CompressGroup>>, CompressGroupError> {
+    if !should_enqueue_compress(uncovered_ids_in_time_order.len(), threshold) {
+        return Ok(None);
+    }
+    let groups = partition_compress_groups(uncovered_ids_in_time_order, turn_spans, group_size)?;
+    Ok(Some(groups))
 }
 
 // ─── Compiler 纯函数 IO 草图 ───────────────────────────────────────────────
@@ -1096,8 +1316,130 @@ mod tests {
     }
 
     #[test]
+    fn plan_compress_batch_threshold() {
+        let ids: Vec<Id> = (1..=8).map(|i| Id::from_str(format!("a{i}"))).collect();
+        let spans: Vec<(u32, u32)> = (1..=8).map(|i| (i, i)).collect();
+        assert!(plan_compress_batch_for_uncovered(&ids, &spans, 200, 4)
+            .unwrap()
+            .is_none());
+        let groups = plan_compress_batch_for_uncovered(&ids, &spans, 8, 4)
+            .unwrap()
+            .expect("should plan");
+        assert_eq!(groups.len(), 2);
+        assert!(should_enqueue_compress(200, 200));
+        assert!(!should_enqueue_compress(199, 200));
+        assert_eq!(count_uncovered_active([false, true, false]), 2);
+    }
+
+    #[test]
     fn truncate_headline_by_chars() {
         assert_eq!(truncate_headline("你好世界", 2), "你好");
         assert_eq!(truncate_headline("ab", 10), "ab");
+    }
+
+    #[test]
+    fn refresh_creates_epoch_then_grows_suffix_then_rollover() {
+        let params = ContextWindowParams {
+            h_anchor: 2,
+            e: 2,
+            s: 2,
+            overview_max_entries: 50,
+        };
+        // 3 committed turns
+        let c3 = committed_turns_from_count(3);
+        let cands: Vec<OverviewCandidate> = (1..=3)
+            .map(|t| OverviewCandidate {
+                code: ChronicleCode::new(ChronicleLevel::A, t),
+                level: ChronicleLevel::A,
+                turn_start: t,
+                covered_by: None,
+            })
+            .collect();
+        let band_lookup = |id: &Id| {
+            sequence_from_committed_turn_id(id).map(|t| ChronicleCode::new(ChronicleLevel::A, t))
+        };
+        let r1 = refresh_context_epoch(None, &c3, &cands, &band_lookup, params, 0);
+        assert!(r1.created);
+        assert!(!r1.rolled_over);
+        assert_eq!(r1.membership.live_suffix_count, 0);
+        assert_eq!(r1.snapshot.source_head_turn_id, Some(committed_turn_id(3)));
+        assert_eq!(r1.membership.anchor_turn_ids, vec![committed_turn_id(2), committed_turn_id(3)]);
+
+        // +1 turn → live_suffix=1, same epoch
+        let c4 = committed_turns_from_count(4);
+        let cands4: Vec<OverviewCandidate> = (1..=4)
+            .map(|t| OverviewCandidate {
+                code: ChronicleCode::new(ChronicleLevel::A, t),
+                level: ChronicleLevel::A,
+                turn_start: t,
+                covered_by: None,
+            })
+            .collect();
+        let r2 = refresh_context_epoch(
+            Some(&r1.snapshot),
+            &c4,
+            &cands4,
+            &band_lookup,
+            params,
+            0,
+        );
+        assert!(!r2.created && !r2.rolled_over);
+        assert_eq!(r2.membership.live_suffix_count, 1);
+        assert_eq!(r2.snapshot.epoch_id, r1.snapshot.epoch_id);
+        assert_eq!(r2.snapshot.overview_codes, r1.snapshot.overview_codes);
+        assert_eq!(r2.snapshot.band_codes, r1.snapshot.band_codes);
+
+        // +2 turns total suffix=2 == E → next compile rollover
+        let c5 = committed_turns_from_count(5);
+        let cands5: Vec<OverviewCandidate> = (1..=5)
+            .map(|t| OverviewCandidate {
+                code: ChronicleCode::new(ChronicleLevel::A, t),
+                level: ChronicleLevel::A,
+                turn_start: t,
+                covered_by: None,
+            })
+            .collect();
+        let r3 = refresh_context_epoch(
+            Some(&r2.snapshot),
+            &c5,
+            &cands5,
+            &band_lookup,
+            params,
+            1,
+        );
+        // live_suffix would be 2 (>=E) → rolled over
+        assert!(r3.rolled_over);
+        assert_eq!(r3.snapshot.source_head_turn_id, Some(committed_turn_id(5)));
+        assert_eq!(r3.membership.live_suffix_count, 0);
+        assert_ne!(r3.snapshot.epoch_id, r1.snapshot.epoch_id);
+        assert!(r3.should_bump_chronicle_revision());
+    }
+
+    #[test]
+    fn same_epoch_two_refreshes_stable_codes() {
+        let params = ContextWindowParams {
+            h_anchor: 3,
+            e: 5,
+            s: 3,
+            overview_max_entries: 20,
+        };
+        let c10 = committed_turns_from_count(10);
+        let cands: Vec<OverviewCandidate> = (1..=10)
+            .map(|t| OverviewCandidate {
+                code: ChronicleCode::new(ChronicleLevel::A, t),
+                level: ChronicleLevel::A,
+                turn_start: t,
+                covered_by: None,
+            })
+            .collect();
+        let band_lookup = |id: &Id| {
+            sequence_from_committed_turn_id(id).map(|t| ChronicleCode::new(ChronicleLevel::A, t))
+        };
+        let a = refresh_context_epoch(None, &c10, &cands, &band_lookup, params, 0);
+        let b = refresh_context_epoch(Some(&a.snapshot), &c10, &cands, &band_lookup, params, 0);
+        assert_eq!(a.snapshot.overview_codes, b.snapshot.overview_codes);
+        assert_eq!(a.snapshot.band_codes, b.snapshot.band_codes);
+        assert_eq!(a.snapshot.source_hash, b.snapshot.source_hash);
+        assert_eq!(a.snapshot.epoch_id, b.snapshot.epoch_id);
     }
 }

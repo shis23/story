@@ -46,6 +46,9 @@ pub struct Campaign {
     /// 当前写作记忆线（规格 lineage_id）；缺省 None → 运行时用 conversation 主线生成/回填。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_id: Option<Id>,
+    /// 当前 Context epoch 快照（编译入口刷新；同 epoch 内 overview/band 冻结）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch: Option<crate::chronicle::ContextEpochSnapshot>,
 }
 
 fn default_story_clock() -> String {
@@ -70,6 +73,7 @@ impl Campaign {
             revision: 0,
             chronicle_revision: 0,
             lineage_id: Some(Id::new()),
+            context_epoch: None,
         }
     }
 
@@ -96,6 +100,7 @@ impl Campaign {
             // fork：新记忆线（规格：fork_at → new lineage_id）
             chronicle_revision: 0,
             lineage_id: Some(Id::new()),
+            context_epoch: None,
         }
     }
 

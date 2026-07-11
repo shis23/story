@@ -51,9 +51,9 @@
 | MemoryArchiver | **已有**：对话**消息正文**过长时批压 → `ArchivedSummary` 入向量库（水位 `archived_upto`） |
 | 远记忆召回 | RoundSummary 索引向量库（metadata 含 `source_kind=chronicle_a` / `code` / `lineage_id`）；`intent → hybrid → top≈3` 进 tail |
 | M0 公式与类型 | **`crates/domain/src/chronicle.rs`**：身份、lineage、revision 规则、epoch 成员、`ContextEpochSnapshot`、`compile_history_blocks`、compress 分组/`covers` 校验、overview 选择；单测覆盖 |
-| epoch 快照接线 / 概览进 history | **过渡接线**：`partition_summaries_for_prompt` 把概览/纪要带 prepend 进 Director history；近窗+纪要带从 tail 剔除。完整 `ContextEpochSnapshot` 冻结/rollover 仍待 |
+| epoch 快照接线 / 概览进 history | **已接线**：`Campaign.context_epoch` 持久化；`fill_campaign`/`start_writing`/`regenerate` 编译入口 `refresh_context_epoch`（满 E rollover + chronicle_revision bump）；Director history 前缀 + tail 硬去重 |
 | `search_chronicle` / `get_chronicle` | **最小版已注册**（Director；数据源=RoundSummary/Chronicle A；B/C 待 M4） |
-| ChronicleCompressor 后台 | **纯函数就绪**；异步任务与发布 **无**（M4） |
+| ChronicleCompressor 后台 | **纯函数 + Accept 阈值规划钩子**；LLM 文案/covers 发布与 B/C 落盘 **仍无** |
 | 正文与摘要硬隔离 | domain `turn_inject_mode` / `filter_summaries_excluding_turns` **已有**；主路径 **尚未**按 near_raw 窗强制过滤 |
 | QualityGate Accept | **Error 拦截**；`force_accept` → Turn **Degraded**；Warning 不拦 |
 | Campaign 版本 | `revision` + **`chronicle_revision`** + **`lineage_id`**（新建/fork 分配；Accept 新 A 时 bump chronicle_revision） |
@@ -497,9 +497,9 @@ compress_batch_id?
 | --- | --- | --- |
 | **M0** | 本规格公式与类型：Chronicle 身份、lineage 算法、revision 规则、epoch 成员公式、ContextEpochSnapshot 最小字段、Compiler 纯函数 IO；单测覆盖公式与分组校验 | **已完成**（`domain/chronicle.rs`） |
 | **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化）；向量 source_* 字段；**暂不改**主写作 prompt 布局 | **基本完成**（字段 + code/headline 分配 + 索引 metadata；lineage 运行时回填可后续补） |
-| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **过渡完成**：Director history 前缀 + tail 硬去重已接；**完整 epoch 快照持久化/rollover 未做** |
+| **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照持久化+rollover+history 前缀+硬去重；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **部分**：A 级 search/get 已注册并注入 `chronicle_summaries`；B/C/预算计数器待补 |
-| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **部分**：分组+covers 校验纯函数；**无后台发布任务** |
+| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **部分**：分组/covers 校验 + Accept 阈值 `plan_compress_batch` 日志钩子；**无 LLM 发布/covered 写回** |
 | **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
 
 并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。
