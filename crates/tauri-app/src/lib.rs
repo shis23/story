@@ -14143,20 +14143,23 @@ mod tests {
         assert_eq!(ctx.story_clock, "Day 3");
         assert_eq!(ctx.turn, 2);
         assert_eq!(ctx.pending_tasks.len(), 1);
+        // ContextCompiler 最小版：RoundSummary 进入 WritingContext + ToolContext
+        assert_eq!(ctx.recent_summaries.len(), 1);
+        assert_eq!(ctx.recent_summaries[0].content, "A previous turn happened");
         let runtime = ctx.campaign_runtime.as_ref().unwrap();
         assert_eq!(runtime.instances.len(), 1);
         assert_eq!(runtime.knowledge.len(), 1);
         assert_eq!(runtime.tasks.len(), 1);
         assert_eq!(runtime.turn, 2);
 
-        let tool_runtime = tool_ctx
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .campaign_runtime
-            .clone()
-            .unwrap();
+        let tool_guard = tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        let tool_runtime = tool_guard.campaign_runtime.clone().unwrap();
         assert_eq!(tool_runtime.campaign.id, campaign.id);
         assert_eq!(tool_runtime.instances[0].id, instance.id);
+        assert_eq!(
+            tool_guard.archived_summaries,
+            vec!["A previous turn happened"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
