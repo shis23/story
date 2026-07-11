@@ -163,6 +163,135 @@ pub const RECENT_SUMMARY_ITEM_MAX_CHARS: usize = 240;
 /// 单条远记忆 content 截断（字符）。
 pub const FAR_MEMORY_ITEM_MAX_CHARS: usize = 200;
 
+/// M2 过渡：Director history 前缀使用的近正文/纪要带默认（对齐 chronicle 实验默认）。
+pub const M2_H_ANCHOR_TURNS: u32 = storyforge_domain::chronicle::DEFAULT_H_ANCHOR;
+pub const M2_BAND_TURNS: u32 = storyforge_domain::chronicle::DEFAULT_S;
+pub const M2_OVERVIEW_MAX: usize = storyforge_domain::chronicle::DEFAULT_OVERVIEW_MAX_ENTRIES;
+
+/// 将 RoundSummary 划分为：概览 / 纪要带 / 近正文 turn 集合（按 turn 序号）。
+#[derive(Debug, Clone)]
+pub struct ChroniclePromptPartition {
+    pub overview_lines: Vec<String>,
+    pub band_lines: Vec<String>,
+    pub near_turns: Vec<u32>,
+    pub band_turns: Vec<u32>,
+}
+
+pub fn partition_summaries_for_prompt(
+    summaries: &[storyforge_domain::agent::RoundSummary],
+    h_anchor: u32,
+    band_s: u32,
+    overview_max: usize,
+) -> ChroniclePromptPartition {
+    let mut sorted = summaries.to_vec();
+    sorted.sort_by_key(|s| s.turn);
+    if sorted.is_empty() {
+        return ChroniclePromptPartition {
+            overview_lines: vec![],
+            band_lines: vec![],
+            near_turns: vec![],
+            band_turns: vec![],
+        };
+    }
+    let max_turn = sorted.last().map(|s| s.turn).unwrap_or(0);
+    let near_start = if h_anchor == 0 {
+        max_turn.saturating_add(1)
+    } else {
+        max_turn.saturating_sub(h_anchor - 1)
+    };
+    let near_turns: Vec<u32> = sorted
+        .iter()
+        .map(|s| s.turn)
+        .filter(|t| *t >= near_start)
+        .collect();
+    let band_end = near_start.saturating_sub(1);
+    let band_start = if band_s == 0 || band_end == 0 {
+        0
+    } else {
+        band_end.saturating_sub(band_s - 1).max(1)
+    };
+    let mut band_lines = Vec::new();
+    let mut band_turns = Vec::new();
+    let mut overview_cands = Vec::new();
+    for s in &sorted {
+        if s.covered_by.is_some() {
+            continue;
+        }
+        if s.turn >= near_start {
+            continue;
+        }
+        if band_s > 0 && s.turn >= band_start && s.turn <= band_end {
+            band_turns.push(s.turn);
+            let code = s.code.as_deref().unwrap_or("");
+            let body = if let Some(h) = s.headline.as_ref().filter(|h| !h.trim().is_empty()) {
+                h.trim().to_string()
+            } else {
+                truncate_chars_pub(&s.content, RECENT_SUMMARY_ITEM_MAX_CHARS)
+            };
+            if code.is_empty() {
+                band_lines.push(format!("T{}: {}", s.turn, body));
+            } else {
+                band_lines.push(format!("{code} T{}: {}", s.turn, body));
+            }
+        } else if s.turn < band_start || band_s == 0 {
+            overview_cands.push(s.clone());
+        }
+    }
+    if overview_cands.len() > overview_max {
+        let drop_n = overview_cands.len() - overview_max;
+        overview_cands = overview_cands[drop_n..].to_vec();
+    }
+    let overview_lines: Vec<String> = overview_cands
+        .iter()
+        .map(|s| {
+            let code = s.code.as_deref().unwrap_or("");
+            let h = s.overview_headline(40);
+            if code.is_empty() {
+                format!("T{} {}", s.turn, h)
+            } else {
+                format!("{code} {h}")
+            }
+        })
+        .collect();
+    ChroniclePromptPartition {
+        overview_lines,
+        band_lines,
+        near_turns,
+        band_turns,
+    }
+}
+
+fn truncate_chars_pub(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// 把概览/纪要带作为 history 稳定前缀（旧于对话正文）。
+pub fn prepend_chronicle_history_prefix(
+    history: Vec<storyforge_domain::llm::ChatMessage>,
+    part: &ChroniclePromptPartition,
+) -> Vec<storyforge_domain::llm::ChatMessage> {
+    let mut out = Vec::new();
+    if !part.overview_lines.is_empty() {
+        out.push(storyforge_domain::llm::ChatMessage::user(format!(
+            "【事件概览】（code/headline，导航用；与状态/原文冲突时以状态与正文为准）\n{}",
+            part.overview_lines.join("\n")
+        )));
+    }
+    if !part.band_lines.is_empty() {
+        out.push(storyforge_domain::llm::ChatMessage::user(format!(
+            "【中距纪要带】（短摘要；同轮正文不在此重复）\n{}",
+            part.band_lines.join("\n")
+        )));
+    }
+    out.extend(history);
+    out
+}
+
 /// 远记忆命中（ContextCompiler 注入用，可追溯向量库 id / 分数）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FarMemoryHit {
@@ -426,6 +555,21 @@ impl PipelineOrchestrator {
                 "Director history epoch"
             );
         }
+        // M2：概览 + 纪要带进 history 前缀；近窗摘要从 tail 剔除（硬去重）
+        let chronicle_part = partition_summaries_for_prompt(
+            &ctx.recent_summaries,
+            M2_H_ANCHOR_TURNS,
+            M2_BAND_TURNS,
+            M2_OVERVIEW_MAX,
+        );
+        tracing::debug!(
+            target: "context_compiler",
+            overview = chronicle_part.overview_lines.len(),
+            band = chronicle_part.band_lines.len(),
+            near_turns = ?chronicle_part.near_turns,
+            "Director chronicle history prefix"
+        );
+        let history = prepend_chronicle_history_prefix(history, &chronicle_part);
         let director_layout = storyforge_domain::message_layout::MessageLayout::build()
             .system(director_config.system_prompt.clone())
             .history(history)
@@ -1079,6 +1223,14 @@ impl PipelineOrchestrator {
                     "Director regenerate history epoch"
                 );
             }
+            let chronicle_part = partition_summaries_for_prompt(
+                &ctx.recent_summaries,
+                M2_H_ANCHOR_TURNS,
+                M2_BAND_TURNS,
+                M2_OVERVIEW_MAX,
+            );
+            let director_history =
+                prepend_chronicle_history_prefix(director_history, &chronicle_part);
             let director_layout = storyforge_domain::message_layout::MessageLayout::build()
                 .system(director_config.system_prompt.clone())
                 .history(director_history)
@@ -2072,9 +2224,18 @@ fn build_director_tail(
         }
     }
 
-    // ContextCompiler 最小版：近期 RoundSummary 注入 volatile tail（稳定 history 之后）
+    // M2：近窗/纪要带已进 history 时不再在 tail 双税；仅注入更远且未进前缀的摘要（兜底）
+    let part = partition_summaries_for_prompt(
+        &ctx.recent_summaries,
+        M2_H_ANCHOR_TURNS,
+        M2_BAND_TURNS,
+        M2_OVERVIEW_MAX,
+    );
+    let mut exclude_turns = part.near_turns.clone();
+    exclude_turns.extend(part.band_turns.iter().copied());
+    let tail_summaries = filter_summaries_excluding_turns(&ctx.recent_summaries, &exclude_turns);
     if let Some(summary_block) =
-        render_recent_summaries_for_injection(&ctx.recent_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
+        render_recent_summaries_for_injection(&tail_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
     {
         tail = tail.push(summary_block);
     }
@@ -4466,14 +4627,17 @@ mod tests {
             tail_content.contains("inst-lin"),
             "应含 instance id: {tail_content}"
         );
+        // M2：近 H 轮摘要进 history 前缀，不在 tail 双税
         assert!(
-            tail_content.contains("近期剧情摘要"),
-            "应注入近期摘要段: {tail_content}"
+            !tail_content.contains("近期剧情摘要"),
+            "近窗摘要不应再进 tail: {tail_content}"
         );
         assert!(
-            tail_content.contains("T2:") && tail_content.contains("陈警官上门问询"),
-            "应含最近一轮摘要: {tail_content}"
+            !tail_content.contains("陈警官上门问询"),
+            "近窗摘要正文不应出现在 tail: {tail_content}"
         );
+        let part = partition_summaries_for_prompt(&ctx.recent_summaries, 5, 10, 200);
+        assert!(part.near_turns.contains(&1) && part.near_turns.contains(&2));
         assert!(tail_content.contains("Lin"), "应含角色名: {tail_content}");
         assert!(
             tail_content.contains("Protagonist"),
@@ -4584,6 +4748,55 @@ mod tests {
     #[test]
     fn test_render_recent_summaries_empty_returns_none() {
         assert!(render_recent_summaries_for_injection(&[], 5).is_none());
+    }
+
+    #[test]
+    fn test_partition_summaries_near_band_overview() {
+        let mut summaries = Vec::new();
+        for t in 1..=20u32 {
+            summaries.push(
+                storyforge_domain::agent::RoundSummary::new(
+                    Id::from_str("c"),
+                    Id::from_str("v"),
+                    t,
+                    format!("事件{t}"),
+                )
+                .with_code(format!("A{t:04}"))
+                .with_headline(format!("头{t}")),
+            );
+        }
+        let p = partition_summaries_for_prompt(&summaries, 5, 10, 200);
+        assert_eq!(p.near_turns, vec![16, 17, 18, 19, 20]);
+        assert_eq!(p.band_turns.first(), Some(&6));
+        assert_eq!(p.band_turns.last(), Some(&15));
+        assert_eq!(p.band_lines.len(), 10);
+        assert_eq!(p.overview_lines.len(), 5);
+        assert!(p.overview_lines[0].contains("A0001") || p.overview_lines[0].contains("头1"));
+        let hist = prepend_chronicle_history_prefix(vec![], &p);
+        assert_eq!(hist.len(), 2);
+        assert!(hist[0].content.contains("事件概览"));
+        assert!(hist[1].content.contains("中距纪要"));
+    }
+
+    #[test]
+    fn test_filter_summaries_excluding_near_turns() {
+        let summaries = vec![
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("c"),
+                Id::from_str("v"),
+                1,
+                "a".into(),
+            ),
+            storyforge_domain::agent::RoundSummary::new(
+                Id::from_str("c"),
+                Id::from_str("v"),
+                2,
+                "b".into(),
+            ),
+        ];
+        let f = filter_summaries_excluding_turns(&summaries, &[2]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].turn, 1);
     }
 
     #[test]
