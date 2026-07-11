@@ -240,9 +240,22 @@ async fn archive_batch(
 /// 简单关键词提取（从文本中提取出现频率较高的词）
 ///
 /// 对 CJK 文本使用 bigram 分词，对拉丁文本使用整词。
-fn extract_keywords(text: &str) -> Vec<String> {
+/// 也用于 RoundSummary → 向量库关键词索引，供远记忆召回。
+///
+/// 同频时按首次出现顺序稳定排序，避免 HashMap 乱序导致短摘要丢关键 bigram。
+pub fn extract_keywords(text: &str) -> Vec<String> {
     let mut word_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut first_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut order = 0usize;
+
+    let mut bump = |word: String| {
+        if !first_seen.contains_key(&word) {
+            first_seen.insert(word.clone(), order);
+            order += 1;
+        }
+        *word_counts.entry(word).or_insert(0) += 1;
+    };
 
     // 按空白和标点（含 CJK 标点）分段
     for segment in text.split(|c: char| c.is_whitespace() || is_punctuation(c)) {
@@ -255,28 +268,33 @@ fn extract_keywords(text: &str) -> Vec<String> {
             // CJK 文本：提取 bigram 作为关键词
             let cjk_chars: Vec<char> = segment.chars().filter(|c| is_cjk_char(*c)).collect();
             for pair in cjk_chars.windows(2) {
-                let bigram: String = pair.iter().collect();
-                *word_counts.entry(bigram).or_insert(0) += 1;
+                bump(pair.iter().collect());
             }
             // 也提取段中混杂的拉丁单词
             for latin_word in segment.split(|c: char| is_cjk_char(c) || is_punctuation(c)) {
                 let w = latin_word.trim();
                 if w.len() >= 2 && w.is_ascii() {
-                    *word_counts.entry(w.to_string()).or_insert(0) += 1;
+                    bump(w.to_string());
                 }
             }
         } else {
             // 纯拉丁文本：整词
             if segment.len() >= 2 && segment.len() <= 20 {
-                *word_counts.entry(segment.to_string()).or_insert(0) += 1;
+                bump(segment.to_string());
             }
         }
     }
 
-    // 按频率排序，取前 10 个
-    let mut words: Vec<(String, usize)> = word_counts.into_iter().collect();
-    words.sort_by_key(|word| std::cmp::Reverse(word.1));
-    words.into_iter().take(10).map(|(w, _)| w).collect()
+    // 频率降序；同频按首次出现升序。短摘要取前 24 个，降低漏关键词概率。
+    let mut words: Vec<(String, usize, usize)> = word_counts
+        .into_iter()
+        .map(|(w, c)| {
+            let seen = *first_seen.get(&w).unwrap_or(&usize::MAX);
+            (w, c, seen)
+        })
+        .collect();
+    words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    words.into_iter().take(24).map(|(w, _, _)| w).collect()
 }
 
 /// 判断字符是否为 CJK 统一表意文字

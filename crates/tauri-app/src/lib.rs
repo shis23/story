@@ -187,6 +187,8 @@ fn recover_turns_on_startup(app_state: &AppState) {
                 )
             }) {
                 Ok(_) => {
+                    // 与正常 commit 一致：RoundSummary 索引进远记忆向量池（best-effort）
+                    index_round_summaries_to_vector(app_state.vector_store.as_ref(), &batch);
                     tracing::info!(
                         "Phase A 启动恢复: Turn {} 幂等重放成功 → Committed",
                         turn_id
@@ -2952,13 +2954,20 @@ fn clear_campaign_runtime(ctx: &mut WritingContext, tool_ctx: &Arc<RwLock<ToolCo
 /// 按用户意图从向量库召回 ArchivedSummary（关键词，best-effort）。
 ///
 /// 失败只 warn，不阻断写作。无命中时 `far_memory_hits` 为空。
+/// 有 campaign 时优先过滤同 campaign 记录，兼容无标签的旧归档。
 fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str) {
     ctx.far_memory_hits.clear();
     let intent = intent.trim();
     if intent.is_empty() {
         return;
     }
-    match storyforge_app_memory::recall_archived_by_query(state.vector_store.as_ref(), intent, 3) {
+    let campaign_filter = ctx.campaign_id.as_ref().map(|id| id.to_string());
+    match storyforge_app_memory::recall_archived_by_query_filtered(
+        state.vector_store.as_ref(),
+        intent,
+        3,
+        campaign_filter.as_deref(),
+    ) {
         Ok(hits) => {
             if !hits.is_empty() {
                 tracing::info!(
@@ -2971,6 +2980,72 @@ fn fill_far_memory_hits(ctx: &mut WritingContext, state: &AppState, intent: &str
         }
         Err(e) => {
             tracing::warn!(target: "far_memory", "远记忆召回失败（跳过）: {e}");
+        }
+    }
+}
+
+/// 把已 accept 的 RoundSummary 索引进向量库（关键词路径，不依赖 Embedder）。
+///
+/// 幂等：以 summary.id 为向量记录 id upsert。失败只 warn。
+fn index_round_summaries_to_vector(
+    vector_store: &dyn VectorStore,
+    batch: &storyforge_domain::turn::MutationBatch,
+) {
+    for mutation in &batch.mutations {
+        let storyforge_domain::turn::Mutation::UpsertSummary(summary) = mutation else {
+            continue;
+        };
+        let content = summary.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        // extract_keywords 取高频；extract_query_tokens 补全 query 侧 2-gram/词，
+        // 合并后召回与 intent 分词更对齐。
+        let mut keywords = storyforge_app_memory::extract_keywords(content);
+        for t in storyforge_app_memory::extract_query_tokens(content) {
+            if !keywords.iter().any(|k| k == &t) {
+                keywords.push(t);
+            }
+        }
+        if keywords.is_empty() {
+            continue;
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "campaign_id".into(),
+            serde_json::Value::String(summary.campaign_id.to_string()),
+        );
+        metadata.insert(
+            "conversation_id".into(),
+            serde_json::Value::String(summary.conversation_id.to_string()),
+        );
+        metadata.insert(
+            "turn".into(),
+            serde_json::Value::Number(summary.turn.into()),
+        );
+        metadata.insert(
+            "source".into(),
+            serde_json::Value::String("round_summary".into()),
+        );
+        if let Err(e) = vector_store.upsert(VectorRecord {
+            id: summary.id.clone(),
+            content: content.to_string(),
+            vector: vec![], // 关键词路径；有 Embedder 时可由后台补齐
+            keywords,
+            kind: VectorKind::ArchivedSummary,
+            metadata,
+        }) {
+            tracing::warn!(
+                target: "far_memory",
+                "RoundSummary {} 入向量库失败: {e}",
+                summary.id
+            );
+        } else {
+            tracing::debug!(
+                target: "far_memory",
+                "RoundSummary {} 已索引到远记忆向量库",
+                summary.id
+            );
         }
     }
 }
@@ -5357,6 +5432,8 @@ async fn commit_turn_attempt(
     let turn_id = turn.turn_id.clone();
     let attempt_id = attempt.attempt_id.clone();
     let batch_for_store = batch.clone();
+    // 远记忆索引在 commit 成功后用；先 clone，避免 batch 被 spawn 吃掉
+    let batch_for_index = batch.clone();
     update_turn_record(&turn_id, |record| {
         record.status = storyforge_domain::turn::TurnStatus::Committing;
         if let Some(att) = record.find_attempt_mut(&attempt_id) {
@@ -5395,6 +5472,9 @@ async fn commit_turn_attempt(
     .await
     .map_err(|e| TauriCommandError::internal(format!("TurnCommit 任务失败: {e}")))?
     .map_err(TauriCommandError::internal)?;
+
+    // 6b. ContextCompiler：已接受的 RoundSummary 进入远记忆向量池（best-effort）
+    index_round_summaries_to_vector(state.vector_store.as_ref(), &batch_for_index);
 
     // 7. 标记 Committed + 其他 attempts Superseded
     // 副作用已完成，持久化失败只记日志（Campaign 已写入，不能回滚）
@@ -13699,6 +13779,45 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RoundSummary accept 后索引进向量库，并可被远记忆关键词召回。
+    #[test]
+    fn test_index_round_summary_to_far_memory() {
+        let store = BruteForceStore::new();
+        let camp_id = Id::from_str("camp-fm");
+        let conv_id = Id::from_str("conv-fm");
+        let summary = storyforge_domain::agent::RoundSummary::new(
+            camp_id.clone(),
+            conv_id,
+            7,
+            "昨夜有人潜入诊所，陈警官随后上门调查。".into(),
+        );
+        let summary_id = summary.id.clone();
+        let mut batch = storyforge_domain::turn::MutationBatch::new(Id::new(), 0);
+        batch
+            .mutations
+            .push(storyforge_domain::turn::Mutation::UpsertSummary(Box::new(
+                summary,
+            )));
+
+        index_round_summaries_to_vector(&store, &batch);
+
+        let hits = storyforge_app_memory::recall_archived_by_query_filtered(
+            &store,
+            "诊所",
+            5,
+            Some("camp-fm"),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("潜入诊所"));
+        assert_eq!(hits[0].kind, "ArchivedSummary");
+
+        // 幂等：同一 id 再索引不复制
+        index_round_summaries_to_vector(&store, &batch);
+        assert_eq!(store.count(), 1);
+        let _ = store.delete(&summary_id);
     }
 
     // ─── Phase 2: CampaignRuntimeContext 快照接入验证 ────────────────────────

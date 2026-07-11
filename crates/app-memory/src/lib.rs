@@ -11,5 +11,8 @@ pub mod archiver;
 pub mod recall;
 
 // 重新导出核心类型
-pub use archiver::{ArchiveConfig, ArchivedSummary, MemoryArchiver};
-pub use recall::{MemoryHit, MemoryRecaller, extract_query_tokens, recall_archived_by_query};
+pub use archiver::{ArchiveConfig, ArchivedSummary, MemoryArchiver, extract_keywords};
+pub use recall::{
+    MemoryHit, MemoryRecaller, extract_query_tokens, recall_archived_by_query,
+    recall_archived_by_query_filtered,
+};

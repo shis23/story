@@ -124,23 +124,44 @@ pub fn extract_query_tokens(query: &str) -> Vec<String> {
 ///
 /// 用于 ContextCompiler 最小版：写作开始时按用户意图检索 `ArchivedSummary`，
 /// 注入 Director volatile tail。无命中 / 无 token 时返回空。
+///
+/// `campaign_id` 若提供，只返回 metadata.campaign_id 匹配或无 campaign 标签的旧记录
+///（兼容归档器尚未写 campaign 标签的历史向量）。
 pub fn recall_archived_by_query(
     store: &dyn VectorStore,
     query: &str,
     limit: usize,
 ) -> Result<Vec<MemoryHit>, MemoryError> {
+    recall_archived_by_query_filtered(store, query, limit, None)
+}
+
+/// 带可选 campaign 过滤的远记忆关键词召回。
+pub fn recall_archived_by_query_filtered(
+    store: &dyn VectorStore,
+    query: &str,
+    limit: usize,
+    campaign_id: Option<&str>,
+) -> Result<Vec<MemoryHit>, MemoryError> {
     let tokens = extract_query_tokens(query);
     if tokens.is_empty() || limit == 0 {
         return Ok(vec![]);
     }
-    // 多取一些再按 kind 过滤，避免被 WorldInfo 占满
-    let fetch = limit.saturating_mul(4).max(limit);
+    // 多取一些再按 kind / campaign 过滤，避免被 WorldInfo 占满
+    let fetch = limit.saturating_mul(8).max(limit);
     let hits = store.search_by_keywords(&tokens, fetch)?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for hit in hits {
         if hit.kind != storyforge_infra_vector::VectorKind::ArchivedSummary {
             continue;
+        }
+        if let Some(cid) = campaign_id {
+            // 有 campaign 标签且不匹配 → 跳过；无标签的旧归档记录仍可命中
+            if let Some(hit_cid) = hit.metadata.get("campaign_id").and_then(|v| v.as_str())
+                && hit_cid != cid
+            {
+                continue;
+            }
         }
         if !seen.insert(hit.id.as_str().to_string()) {
             continue;
@@ -210,5 +231,56 @@ mod tests {
         let hits = recall_archived_by_query(&store, "诊所发生了什么", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("潜入诊所"));
+    }
+
+    #[test]
+    fn test_recall_archived_by_query_filtered_by_campaign() {
+        let store = BruteForceStore::new();
+        let mut meta_a = std::collections::HashMap::new();
+        meta_a.insert(
+            "campaign_id".into(),
+            serde_json::Value::String("camp-a".into()),
+        );
+        let mut meta_b = std::collections::HashMap::new();
+        meta_b.insert(
+            "campaign_id".into(),
+            serde_json::Value::String("camp-b".into()),
+        );
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("a1"),
+                content: "A 营：昨夜有人潜入诊所".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: meta_a,
+            })
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("b1"),
+                content: "B 营：诊所火灾".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: meta_b,
+            })
+            .unwrap();
+        store
+            .upsert(VectorRecord {
+                id: Id::from_str("legacy"),
+                content: "旧归档：诊所值班".into(),
+                vector: vec![],
+                keywords: vec!["诊所".into()],
+                kind: VectorKind::ArchivedSummary,
+                metadata: Default::default(),
+            })
+            .unwrap();
+
+        let hits = recall_archived_by_query_filtered(&store, "诊所", 5, Some("camp-a")).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.content.contains("A 营")));
+        assert!(hits.iter().any(|h| h.content.contains("旧归档")));
+        assert!(!hits.iter().any(|h| h.content.contains("B 营")));
     }
 }
