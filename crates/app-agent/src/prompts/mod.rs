@@ -12,7 +12,7 @@ pub use character_extractor::{
     make_character_extractor_config, register_character_extractor_tools,
 };
 pub use postprocess::{
-    POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, make_postprocess_config,
-    register_postprocess_tools,
+    POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, build_postprocess_user_msg_with_summary,
+    make_postprocess_config, register_postprocess_tools,
 };
 pub use summarizer::{SUMMARIZER_SYSTEM_PROMPT, build_summarizer_user_msg, make_summarizer_config};

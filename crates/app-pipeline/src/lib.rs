@@ -694,6 +694,7 @@ impl PipelineOrchestrator {
             ctx.turn, enable_postprocess, enable_summarizer
         );
 
+        let summary_block = render_recent_summaries_for_injection(&ctx.recent_summaries, 5);
         let mut outcome = storyforge_app_agent::run_postprocess_pipeline(
             &self.runtime,
             final_text,
@@ -706,6 +707,7 @@ impl PipelineOrchestrator {
             enable_postprocess,
             enable_summarizer,
             ctx.agent_profile_config.as_ref(),
+            summary_block.as_deref(),
         )
         .await;
 

@@ -20,7 +20,7 @@ use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse};
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
 use crate::prompts::{
-    build_postprocess_user_msg, make_postprocess_config, register_postprocess_tools,
+    build_postprocess_user_msg_with_summary, make_postprocess_config, register_postprocess_tools,
 };
 use crate::runtime::AgentRuntime;
 use crate::tools::{ToolRegistry, filter_registry_by_whitelist};
@@ -46,14 +46,16 @@ pub async fn run_postprocess(
     story_clock: &str,
     cancel: watch::Receiver<bool>,
     agent_profile_config: Option<&AgentProfileConfig>,
+    recent_summary_block: Option<&str>,
 ) -> Result<PostProcessResult, PostProcessError> {
     let config: AgentConfig = make_postprocess_config(agent_profile_config);
-    let user_msg = build_postprocess_user_msg(
+    let user_msg = build_postprocess_user_msg_with_summary(
         final_text,
         present_characters,
         variable_keys,
         turn,
         story_clock,
+        recent_summary_block,
     );
 
     let mut registry = ToolRegistry::new();
@@ -673,6 +675,7 @@ mod tests {
             "第 7 轮",
             cancel,
             None,
+            None,
         )
         .await
         .expect("postprocess should recover via direct JSON fallback");
@@ -738,6 +741,7 @@ mod tests {
             "第 7 轮",
             cancel,
             None,
+            None,
         )
         .await
         .expect("postprocess should recover when primary tool path returns an empty JSON result");
@@ -800,6 +804,7 @@ mod tests {
             7,
             "第 7 轮",
             cancel,
+            None,
             None,
         )
         .await;
@@ -866,6 +871,7 @@ mod tests {
                 7,
                 "第 7 轮",
                 cancel,
+                None,
                 None,
             )
             .await

@@ -147,6 +147,25 @@ pub fn build_postprocess_user_msg(
     turn: u32,
     story_clock: &str,
 ) -> String {
+    build_postprocess_user_msg_with_summary(
+        final_text,
+        present_characters,
+        variable_keys,
+        turn,
+        story_clock,
+        None,
+    )
+}
+
+/// 同 `build_postprocess_user_msg`，可附加近期剧情摘要（ContextCompiler 最小版）。
+pub fn build_postprocess_user_msg_with_summary(
+    final_text: &str,
+    present_characters: &[String],
+    variable_keys: &[String],
+    turn: u32,
+    story_clock: &str,
+    recent_summary_block: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     parts.push(format!(
         "【当前轮次】第 {turn} 轮（故事时间：{story_clock}）"
@@ -161,6 +180,14 @@ pub fn build_postprocess_user_msg(
     ));
     if !variable_keys.is_empty() {
         parts.push(format!("【可更新变量】{}", variable_keys.join(", ")));
+    }
+    if let Some(block) = recent_summary_block
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!(
+            "【近期剧情摘要】\n{block}\n（请在提取知识/变量/任务时与上述摘要保持一致，勿捏造已否决事实。）"
+        ));
     }
     parts.push(format!("【本轮成文】\n{final_text}"));
     parts.push("请按指定 JSON 格式输出后处理结果。".to_string());
@@ -288,6 +315,24 @@ mod tests {
         assert!(msg.contains("第2天"));
         assert!(msg.contains("林医生、陈警官"));
         assert!(msg.contains("hp, state"));
+        assert!(msg.contains("林医生走进急诊室"));
+    }
+
+    #[test]
+    fn test_build_postprocess_user_msg_with_summary_includes_block() {
+        let msg = build_postprocess_user_msg_with_summary(
+            "林医生走进急诊室",
+            &["林医生".to_string()],
+            &["hp".to_string()],
+            3,
+            "第2天",
+            Some(
+                "近期剧情摘要（按轮次，供规划参考，勿直接复述）：
+- T1: 昨夜有人潜入",
+            ),
+        );
+        assert!(msg.contains("【近期剧情摘要】"));
+        assert!(msg.contains("昨夜有人潜入"));
         assert!(msg.contains("林医生走进急诊室"));
     }
 }

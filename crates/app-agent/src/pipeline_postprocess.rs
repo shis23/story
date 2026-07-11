@@ -57,6 +57,7 @@ pub async fn run_postprocess_pipeline(
     enable_postprocess: bool,
     enable_summarizer: bool,
     agent_profile_config: Option<&AgentProfileConfig>,
+    recent_summary_block: Option<&str>,
 ) -> PostProcessOutcome {
     // 各 clone 一份 cancel 给两个子任务
     let cancel_summary = cancel.clone();
@@ -69,6 +70,7 @@ pub async fn run_postprocess_pipeline(
     let chars_for_postproc = present_characters.to_vec();
     let keys_for_postproc = variable_keys.to_vec();
     let clock_for_postproc = story_clock.to_string();
+    let summary_block_for_postproc = recent_summary_block.map(str::to_string);
 
     // runtime 需要在两个 spawn 里被引用——它在 run_tool_loop 里只借用 &self，
     // 但 spawn 要求 'static，所以这里靠 Arc 包装一份。runtime 内部的 llm/tool_ctx 本就是 Arc。
@@ -126,6 +128,7 @@ pub async fn run_postprocess_pipeline(
             &clock_for_postproc,
             cancel_postproc,
             agent_profile_config,
+            summary_block_for_postproc.as_deref(),
         )
         .await
         {
@@ -208,6 +211,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         )
         .await;
 
@@ -244,6 +248,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         )
         .await;
 
@@ -271,6 +276,7 @@ mod tests {
             true,  // postprocess 开
             false, // summarizer 关
             None,
+            None,
         )
         .await;
 
@@ -294,6 +300,7 @@ mod tests {
             rx,
             false, // postprocess 关
             true,  // summarizer 开
+            None,
             None,
         )
         .await;
@@ -321,6 +328,7 @@ mod tests {
             rx,
             false,
             false,
+            None,
             None,
         )
         .await;
