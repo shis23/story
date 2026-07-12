@@ -331,7 +331,7 @@ fn bronze_b2_three_turn_accept_writeback_and_reload() {
         let mut record = TurnRecord::new(
             campaign.id.clone(),
             conversation.id.clone(),
-            Id::from_str(&format!("input-{turn_no}")),
+            Id::from_str(format!("input-{turn_no}")),
             (turn_no - 1) as u64,
         );
         record.status = TurnStatus::AwaitingAcceptance;
