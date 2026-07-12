@@ -504,9 +504,33 @@ compress_batch_id?
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **部分完成（2026-07-11）**：`harness-real-llm` `m5_*` + `run-real-llm-smoke.ps1 -Suite m5`；见下「M5 实跑记录」 |
 
 并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
+
+### M5 实跑记录（2026-07-11，脱敏）
+
+| 项 | 值 |
+| --- | --- |
+| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory -- --ignored`（S1–S5 分跑） |
+| 基线 commit | `1b7db7d`（M4.2.2）+ 本轮 m5 harness |
+| endpoint host | `cli.2529985.xyz`（OpenAI 兼容 `/v1`） |
+| model | 请求 `grok-4.5`（响应侧曾见 `grok-4.5-build`） |
+| 结论等级 | **Partial Pass**（路径/工具/压缩达标；写作轮供应商 `cached_tokens` 多为 0） |
+
+| Suite | 结果 | 要点 |
+| --- | --- | --- |
+| **S3** compress loss | **Pass** | 阈值 8 / group 4 → 2×B；covers 8；事实 token **3/3**；`get_chronicle(A0001)` 仍可读；~42s |
+| **S2** far floor | **Pass** | 注入 A0001 远楼 token + 近轮填充；**无 embedding**；`search_chronicle`/`get_chronicle` 命中；catalog=20 |
+| **S1** same-epoch cache | **Partial** | 6 轮成文全非空；各轮 **最大 prompt 请求 `system_hash` 六轮一致**（`225bab02…`）；写作轮 `cached_tokens=0`；仅 extract boot 见高 cache（~2944/3005）；harness **未 Accept** → `summaries=0`、`turn` 停在 1、catalog 空（与线上 Accept 写 Chronicle 路径不同） |
+| **S4** epoch rollover | **Partial（路径 Pass）** | inject 后 epoch `ctx-epoch-empty` → `ctx-epoch-committed-turn-25`，rev 1→2，overview/band 重建；cold/hot 写作仍 `cached=0` |
+| **S5** long session | **Pass（稳定性）** | 8/8 成文；约 41 LLM 调用；合计 prompt≈145k、completion≈41k、wall≈372s；cache 几乎仅 boot；`summaries_on_disk=0`（同 S1 Accept 缺口） |
+
+**参数标定建议（本轮不改生产默认）**：
+
+- **不调整** `compress_active_A_threshold=200` / `group_size=4`：S3 在测试阈值下事实保留满额，无证据要求改默认。
+- **不调整** `H_anchor`/`E`：S2 远楼可达；S4 能刷新 epoch。
+- **后续**：M5 harness 补「写作后 Accept/写 RoundSummary」闭环，再测同 epoch 热 cache；对照另一供应商是否写作轮也报 `cached_tokens`。当前写作路径 cache 空更像 **供应商/网关统计或前缀未命中策略**，不是 system 段无故抖动（S1 hash 稳定）。
 
 ---
 

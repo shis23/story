@@ -79,6 +79,10 @@ $SuiteDefinitions = [ordered]@{
         Description = 'Adversarial knowledge boundary real LLM'
         Filter = 'i1_adversarial_knowledge_boundary'
     }
+    m5 = @{
+        Description = 'M5 memory/cache/far-floor/compress real LLM matrix'
+        Filter = 'm5_'
+    }
 }
 
 function Find-RepoRoot {

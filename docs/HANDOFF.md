@@ -1,6 +1,6 @@
 # StoryForge 交接说明
 
-> 更新日期：2026-07-08
+> 更新日期：2026-07-11
 > 范围：发布验收、文档归档与下一步推进。本文只描述当前状态、验证方式和下一优先级，不替代具体实现计划。
 
 ## 当前项目状态
@@ -90,7 +90,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. **记忆 / Context 装配规格续作**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **v1.0** — **M0–M4.2.2 可独立部分完成**（epoch refresh 与 publish/heal 同锁；锁内重读 Campaign+summaries）。下一步：**M5** 真模型验收；NarrativeContract/ScenePlan；UnitOfWork/SQLite 仍独立。Quality Error 拦截 + force→Degraded 已接。
+1. **记忆 / Context 装配规格续作**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **v1.0** — **M0–M4.2.2 完成**；**M5 Partial Pass**（2026-07-11，`grok-4.5` @ `cli.2529985.xyz`：S2/S3/S5 绿，S1/S4 路径绿但写作轮 `cached_tokens` 多为 0；见规格 M5 实跑记录）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。下一步：M5 harness 补 Accept/写 summary 闭环再测热 cache；**不改** 200/4 默认。并行：NarrativeContract/ScenePlan；UnitOfWork/SQLite。Quality Error 拦截 + force→Degraded 已接。
 2. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
 3. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
 4. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
