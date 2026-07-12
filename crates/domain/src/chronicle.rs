@@ -34,7 +34,7 @@ pub const DEFAULT_TOOL_FULL_MAX: u32 = 2;
 /// 每轮 search_chronicle 上限。
 pub const DEFAULT_SEARCH_MAX: u32 = 3;
 /// Compiler / snapshot 算法版本（防漂移假稳定）。
-pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.2";
+pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.2.1";
 
 /// 压缩发布意图（磁盘侧半提交恢复用）。
 ///
@@ -47,18 +47,27 @@ pub struct PendingCompressPublication {
     pub base_chronicle_revision: u64,
     /// 本批 parent stage summary ids
     pub parent_ids: Vec<Id>,
-    /// 被覆盖的 child leaf/stage ids
+    /// child_id → parent_id 覆盖关系（完成前必须在 summaries 中成立）
+    #[serde(default)]
+    pub child_covered_by: Vec<(Id, Id)>,
+    /// 旧字段兼容（仅反序列化；新写入不再使用）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_ids: Vec<Id>,
     pub created_at: String,
 }
 
 impl PendingCompressPublication {
-    pub fn new(base_chronicle_revision: u64, parent_ids: Vec<Id>, child_ids: Vec<Id>) -> Self {
+    pub fn new(
+        base_chronicle_revision: u64,
+        parent_ids: Vec<Id>,
+        child_covered_by: Vec<(Id, Id)>,
+    ) -> Self {
         Self {
             publication_id: Id::new(),
             base_chronicle_revision,
             parent_ids,
-            child_ids,
+            child_covered_by,
+            child_ids: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
         }
     }

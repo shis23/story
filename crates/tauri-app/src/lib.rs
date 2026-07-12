@@ -6147,12 +6147,16 @@ fn spawn_compress_job_worker(state: Arc<AppState>, job_id: Id) {
                     );
                 }
                 if let Some(e) = publish_err {
-                    // summaries 可能已部分写入：尝试补齐 campaign 元数据后再记失败重试
-                    if let Err(he) = store.heal_compress_publication_metadata(&campaign_id) {
-                        tracing::warn!(
-                            target: "chronicle_compressor",
-                            "heal after publish err failed: {he}"
-                        );
+                    // 仅当 marker 仍在且 summaries 校验可通过时 heal 才能完成；
+                    // 校验失败会保留 marker，并让 job 回 Pending 下次 Accept/启动再试。
+                    if store.needs_compress_metadata_heal(&campaign_id) {
+                        match store.heal_compress_publication_metadata(&campaign_id) {
+                            Ok(()) => {}
+                            Err(he) => tracing::warn!(
+                                target: "chronicle_compressor",
+                                "heal after publish err (marker kept if incomplete): {he}"
+                            ),
+                        }
                     }
                     if let Err(me) = job_store.mark_failed_or_retry(&job_id, e) {
                         tracing::error!(target: "chronicle_compressor", "mark_failed_or_retry: {me}");

@@ -635,12 +635,12 @@ impl CampaignStore {
 
     /// 发布压缩结果：写 parent B/C + children.covered_by，bump chronicle_revision，清空 epoch。
     ///
-    /// 半提交协议：
-    /// 1) campaign.pending_compress_publication = intent（先落盘）
-    /// 2) summaries 写入（clone-then-persist）
-    /// 3) 完成：bump revision + clear epoch + clear pending
+    /// 半提交协议（整段在 `with_campaign_lock` 内，避免覆盖 Accept/Meta 并发写）：
+    /// 1) 基于**锁内最新** Campaign 写 `pending_compress_publication`
+    /// 2) summaries clone→persist→写回
+    /// 3) 校验 parent 存在且 child→parent 覆盖成立后，完成 metadata 并清 marker
     ///
-    /// heal 只依赖 pending marker，不依赖 epoch 是否仍在。
+    /// heal 只在校验通过时完成；校验失败保留 marker。
     pub fn publish_compress_result(
         &self,
         campaign_id: &Id,
@@ -649,52 +649,68 @@ impl CampaignStore {
     ) -> Result<(), String> {
         use storyforge_domain::chronicle::PendingCompressPublication;
 
-        let base_rev = self
-            .get_campaign(campaign_id)
-            .map(|c| c.chronicle_revision)
-            .unwrap_or(0);
-        let parent_ids: Vec<Id> = parents.iter().map(|p| p.id.clone()).collect();
-        let child_ids: Vec<Id> = child_covered_by.iter().map(|(c, _)| c.clone()).collect();
-        let pending = PendingCompressPublication::new(base_rev, parent_ids, child_ids);
+        crate::turn_coordinator::with_campaign_lock(|| {
+            let base_rev = self
+                .get_campaign(campaign_id)
+                .map(|c| c.chronicle_revision)
+                .unwrap_or(0);
+            let parent_ids: Vec<Id> = parents.iter().map(|p| p.id.clone()).collect();
+            let pending =
+                PendingCompressPublication::new(base_rev, parent_ids, child_covered_by.to_vec());
 
-        // 1) 先写 intent
-        if let Some(mut camp) = self.get_campaign(campaign_id) {
+            // 1) intent（锁内最新 campaign）
+            let mut camp = self.get_campaign(campaign_id).ok_or_else(|| {
+                crate::turn_coordinator::CommitError::CampaignNotFound(campaign_id.clone())
+            })?;
             camp.pending_compress_publication = Some(pending);
-            self.update_campaign(camp)?;
-        }
+            self.update_campaign(camp)
+                .map_err(crate::turn_coordinator::CommitError::Storage)?;
 
-        // 2) summaries：clone → persist → 写回内存（磁盘失败不污染内存）
-        {
-            let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
-            let mut next = summaries.clone();
-            for (child_id, parent_id) in child_covered_by {
-                if let Some(s) = next.iter_mut().find(|s| s.id == *child_id) {
-                    s.covered_by = Some(parent_id.clone());
-                }
-            }
-            for parent in parents {
-                if let Some(idx) = next.iter().position(|s| s.id == parent.id) {
-                    if !Self::payloads_match(&next[idx], parent) {
-                        return Err(format!("stage summary id={} conflict", parent.id));
+            // 2) summaries
+            {
+                let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
+                let mut next = summaries.clone();
+                for (child_id, parent_id) in child_covered_by {
+                    if let Some(s) = next.iter_mut().find(|s| s.id == *child_id) {
+                        s.covered_by = Some(parent_id.clone());
                     }
-                } else {
-                    next.push(parent.clone());
                 }
+                for parent in parents {
+                    if let Some(idx) = next.iter().position(|s| s.id == parent.id) {
+                        if !Self::payloads_match(&next[idx], parent) {
+                            return Err(crate::turn_coordinator::CommitError::Storage(format!(
+                                "stage summary id={} conflict",
+                                parent.id
+                            )));
+                        }
+                    } else {
+                        next.push(parent.clone());
+                    }
+                }
+                persist(&self.summaries_path, &next)
+                    .map_err(crate::turn_coordinator::CommitError::Storage)?;
+                *summaries = next;
             }
-            persist(&self.summaries_path, &next)?;
-            *summaries = next;
-        }
 
-        // 3) 完成元数据
-        self.complete_compress_publication(campaign_id)
+            // 3) 校验后完成
+            self.complete_compress_publication_inner(campaign_id)
+                .map_err(crate::turn_coordinator::CommitError::Storage)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
     }
 
-    /// 若存在 pending_compress_publication，完成 bump/clear；幂等。
+    /// 若存在 pending_compress_publication，在锁内校验后完成 bump/clear；幂等。
     pub fn heal_compress_publication_metadata(&self, campaign_id: &Id) -> Result<(), String> {
-        self.complete_compress_publication(campaign_id)
+        crate::turn_coordinator::with_campaign_lock(|| {
+            self.complete_compress_publication_inner(campaign_id)
+                .map_err(crate::turn_coordinator::CommitError::Storage)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
     }
 
-    fn complete_compress_publication(&self, campaign_id: &Id) -> Result<(), String> {
+    fn complete_compress_publication_inner(&self, campaign_id: &Id) -> Result<(), String> {
         let Some(mut camp) = self.get_campaign(campaign_id) else {
             return Ok(());
         };
@@ -712,6 +728,14 @@ impl CampaignStore {
             }
             return Ok(());
         };
+
+        // 完成前校验：parent 存在 + child→parent 覆盖
+        if let Err(reason) = self.verify_pending_publication(campaign_id, &pending) {
+            return Err(format!(
+                "pending publication incomplete, keep marker: {reason}"
+            ));
+        }
+
         // 仅当 revision 尚未越过 base 时 bump，避免重复 heal 连涨
         if camp.chronicle_revision <= pending.base_chronicle_revision {
             camp.bump_chronicle_revision();
@@ -719,6 +743,43 @@ impl CampaignStore {
         camp.context_epoch = None;
         camp.pending_compress_publication = None;
         self.update_campaign(camp)
+    }
+
+    fn verify_pending_publication(
+        &self,
+        campaign_id: &Id,
+        pending: &storyforge_domain::chronicle::PendingCompressPublication,
+    ) -> Result<(), String> {
+        let summaries = self.list_summaries(campaign_id);
+        for pid in &pending.parent_ids {
+            if !summaries.iter().any(|s| s.id == *pid) {
+                return Err(format!("missing parent {pid}"));
+            }
+        }
+        // 新格式：child_covered_by 对
+        if !pending.child_covered_by.is_empty() {
+            for (child_id, parent_id) in &pending.child_covered_by {
+                let Some(child) = summaries.iter().find(|s| s.id == *child_id) else {
+                    return Err(format!("missing child {child_id}"));
+                };
+                if child.covered_by.as_ref() != Some(parent_id) {
+                    return Err(format!(
+                        "child {child_id} covered_by mismatch (want {parent_id})"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        // 旧格式兼容：仅 child_ids 存在且已有任意 covered_by
+        for cid in &pending.child_ids {
+            let Some(child) = summaries.iter().find(|s| s.id == *cid) else {
+                return Err(format!("missing child {cid}"));
+            };
+            if child.covered_by.is_none() {
+                return Err(format!("child {cid} not covered yet"));
+            }
+        }
+        Ok(())
     }
 
     /// 需要 heal：存在 pending marker，或（兼容）epoch 未失效且已有 stage/covered。
@@ -1804,12 +1865,30 @@ mod tests {
         camp.id = camp_id.clone();
         camp.chronicle_revision = 3;
         camp.context_epoch = None; // 模拟第一次 publish 后 epoch 已清，但第二次半提交
+        store.save_campaign(camp.clone()).unwrap();
+
+        // 先落盘 parent/child，再挂 marker（模拟 summaries 已写、metadata 未完成）
+        let mut parent =
+            RoundSummary::new(camp_id.clone(), Id::from_str("v"), 1, "B".into()).with_code("B0001");
+        parent.id = Id::from_str("p1");
+        parent.level = 1;
+        parent.turn_end = 1;
+        let mut child =
+            RoundSummary::new(camp_id.clone(), Id::from_str("v"), 1, "A".into()).with_code("A0001");
+        child.id = Id::from_str("c1");
+        child.covered_by = Some(Id::from_str("p1"));
+        // insert_stage_summary 按 id 去重，不会按 turn 覆盖 leaf/parent
+        store.insert_stage_summary(parent).unwrap();
+        store.insert_stage_summary(child).unwrap();
+        let listed = store.list_summaries(&camp_id);
+        assert_eq!(listed.len(), 2, "expected parent+child, got {listed:?}");
+
         camp.pending_compress_publication = Some(PendingCompressPublication::new(
             3,
             vec![Id::from_str("p1")],
-            vec![Id::from_str("c1")],
+            vec![(Id::from_str("c1"), Id::from_str("p1"))],
         ));
-        store.save_campaign(camp).unwrap();
+        store.update_campaign(camp).unwrap();
         assert!(store.needs_compress_metadata_heal(&camp_id));
         store.heal_compress_publication_metadata(&camp_id).unwrap();
         let camp2 = store.get_campaign(&camp_id).unwrap();
@@ -1823,6 +1902,37 @@ mod tests {
             store.get_campaign(&camp_id).unwrap().chronicle_revision,
             rev
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn heal_keeps_marker_when_summaries_incomplete() {
+        use storyforge_domain::chronicle::PendingCompressPublication;
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let camp_id = Id::from_str("camp-incomplete");
+        let mut camp = Campaign::new(Id::from_str("card"), "n");
+        camp.id = camp_id.clone();
+        camp.chronicle_revision = 1;
+        camp.pending_compress_publication = Some(PendingCompressPublication::new(
+            1,
+            vec![Id::from_str("missing-parent")],
+            vec![(
+                Id::from_str("missing-child"),
+                Id::from_str("missing-parent"),
+            )],
+        ));
+        store.save_campaign(camp).unwrap();
+        let err = store
+            .heal_compress_publication_metadata(&camp_id)
+            .expect_err("should keep marker");
+        assert!(
+            err.contains("incomplete") || err.contains("missing"),
+            "{err}"
+        );
+        let camp2 = store.get_campaign(&camp_id).unwrap();
+        assert!(camp2.pending_compress_publication.is_some());
+        assert_eq!(camp2.chronicle_revision, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
