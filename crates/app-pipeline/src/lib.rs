@@ -933,12 +933,14 @@ impl PipelineOrchestrator {
             &self.reasoning_mode(),
         );
 
-        // 构造编剧的用户消息（子 Agent 产出）
-        let performances_text: String = performances
-            .iter()
-            .map(|p| format!("### {}\n{}", p.character_id, p.full_text))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
+        let editor_contract =
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                &plan,
+                ctx.campaign_runtime.as_deref(),
+            );
+        // 构造编剧的用户消息（子 Agent 产出）：对异己 private 探针做硬 redaction。
+        let performances_text =
+            redact_performances_for_editor(&performances, Some(&editor_contract));
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
         let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
@@ -961,11 +963,6 @@ impl PipelineOrchestrator {
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
             .tail(|_| {
-                let contract =
-                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                        &plan,
-                        ctx.campaign_runtime.as_deref(),
-                    );
                 build_editor_tail(
                     &plan.scene_brief,
                     &performances_text,
@@ -973,7 +970,7 @@ impl PipelineOrchestrator {
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
                     plan.scene_plan.as_ref(),
-                    Some(&contract),
+                    Some(&editor_contract),
                 )
             });
 
@@ -1917,11 +1914,13 @@ impl PipelineOrchestrator {
             &self.reasoning_mode(),
         );
 
-        let performances_text: String = performances
-            .iter()
-            .map(|p| format!("### {}\n{}", p.character_id, p.full_text))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
+        let editor_contract =
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                plan,
+                campaign_runtime,
+            );
+        let performances_text =
+            redact_performances_for_editor(performances, Some(&editor_contract));
 
         // §22 cache 友好布局：system（role_directive + 模块）+ history + tail（场景/子产出/摘要/hint）
         let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
@@ -1944,11 +1943,6 @@ impl PipelineOrchestrator {
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
             .tail(|_| {
-                let contract =
-                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                        plan,
-                        campaign_runtime,
-                    );
                 build_editor_tail(
                     &plan.scene_brief,
                     &performances_text,
@@ -1956,7 +1950,7 @@ impl PipelineOrchestrator {
                     recent_summaries,
                     far_memory_hits,
                     plan.scene_plan.as_ref(),
-                    Some(&contract),
+                    Some(&editor_contract),
                 )
             });
 
@@ -2677,6 +2671,73 @@ fn make_director_config(
 
 /// 构造编剧的易变末尾（§22 volatile tail）：场景 + 子产出 + 近期摘要 + 可选 hint
 ///
+/// Editor performance 硬 redaction：按 NarrativeContract 裁掉异己 private 探针。
+///
+/// 规则：
+/// - 某 performance 的 `character_id` 若不是 secret 拥有者，则 full_text 中的
+///   稳定探针替换为 `[REDACTED_PRIVATE]`；
+/// - 拥有者 performance 保留原文；
+/// - 无 contract 时不做裁剪（向后兼容）。
+fn redact_performances_for_editor(
+    performances: &[storyforge_domain::agent::Performance],
+    contract: Option<&storyforge_domain::narrative_contract::NarrativeContract>,
+) -> String {
+    use storyforge_domain::narrative_contract::extract_gate_probes;
+
+    let Some(c) = contract else {
+        return performances
+            .iter()
+            .map(|p| format!("### {}\n{}", p.character_id, p.full_text))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+    };
+
+    // (probe, owner_id)
+    let mut probes: Vec<(String, String)> = Vec::new();
+    for b in &c.private_bindings {
+        for p in extract_gate_probes(&b.secret) {
+            probes.push((p, b.owner_id.clone()));
+        }
+    }
+    for token in &c.must_not_reveal {
+        let token = token.trim();
+        if token.chars().count() < 4 {
+            continue;
+        }
+        let owner = c.owner_of_secret(token).unwrap_or("").to_string();
+        if !probes.iter().any(|(p, _)| p == token) {
+            probes.push((token.to_string(), owner));
+        }
+    }
+
+    performances
+        .iter()
+        .map(|p| {
+            let mut text = p.full_text.clone();
+            let speaker = p.character_id.as_str();
+            for (probe, owner) in &probes {
+                if owner.is_empty() {
+                    // 无归属：保守 redact 全部 performance
+                    if text.contains(probe) {
+                        text = text.replace(probe, "[REDACTED_PRIVATE]");
+                    }
+                    continue;
+                }
+                // speaker 是 owner，或 speaker 名等于 owner binding 的 name → 保留
+                let is_owner = speaker == owner
+                    || c.private_bindings
+                        .iter()
+                        .any(|b| b.owner_id == *owner && b.owner_labels().contains(&speaker));
+                if !is_owner && text.contains(probe) {
+                    text = text.replace(probe, "[REDACTED_PRIVATE]");
+                }
+            }
+            format!("### {speaker}\n{text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
 /// 编剧 system 段只有 role_directive + 模块（不含蓝灯，编剧不需要）。
 /// 场景简述和子 Agent 产出每场戏都变，压在 tail。
 fn build_editor_tail(
@@ -5285,6 +5346,51 @@ mod tests {
         assert!(
             !rendered.contains("SF_SECRET_CHEN_BADGE_X91"),
             "editor tail must not dump raw secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_redact_performances_strips_non_owner_private_probe() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        let perfs = vec![
+            storyforge_domain::agent::Performance {
+                character_id: "inst-lin".into(),
+                narrative: String::new(),
+                dialogue: String::new(),
+                inner_thoughts: String::new(),
+                full_text: "我知道 SF_SECRET_CHEN_BADGE_X91".into(),
+            },
+            storyforge_domain::agent::Performance {
+                character_id: "inst-chen".into(),
+                narrative: String::new(),
+                dialogue: String::new(),
+                inner_thoughts: String::new(),
+                full_text: "我的秘密是 SF_SECRET_CHEN_BADGE_X91".into(),
+            },
+        ];
+        let contract = NarrativeContract {
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+        let redacted = redact_performances_for_editor(&perfs, Some(&contract));
+        assert!(
+            redacted.contains("[REDACTED_PRIVATE]"),
+            "non-owner probe must redact: {redacted}"
+        );
+        // owner keeps raw
+        assert!(
+            redacted.contains("### inst-chen\n我的秘密是 SF_SECRET_CHEN_BADGE_X91"),
+            "owner must keep secret: {redacted}"
+        );
+        // non-owner loses raw
+        assert!(
+            !redacted.contains("### inst-lin\n我知道 SF_SECRET_CHEN_BADGE_X91"),
+            "non-owner must not keep raw: {redacted}"
         );
     }
 

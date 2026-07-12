@@ -2356,6 +2356,130 @@ async fn plugin_prompt_hook_result(
     Ok(())
 }
 
+/// 阶段 B：有界 1× Editor auto-fix 的输入上下文（合并参数以避开 clippy too_many_arguments）。
+struct QualityAutofixCtx<'a> {
+    pipeline: &'a mut PipelineOrchestrator,
+    draft_node_id: &'a Id,
+    conversation_id: &'a Id,
+    writing_ctx: &'a WritingContext,
+    event_tx: &'a tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    cancel: watch::Receiver<bool>,
+    log_prefix: &'a str,
+}
+
+/// 阶段 B：有界 1× Editor auto-fix。
+///
+/// 对草稿跑 NarrativeContract QualityGate；若有 Error 且尚未 auto-fix，
+/// 仅 Editor 重跑一次（hint 来自警告摘要），再 gate。最多 1 次。
+async fn quality_gate_with_optional_editor_autofix(
+    mut final_text: String,
+    ctx: QualityAutofixCtx<'_>,
+) -> (String, storyforge_domain::turn::QualityReport) {
+    let QualityAutofixCtx {
+        pipeline,
+        draft_node_id,
+        conversation_id,
+        writing_ctx,
+        event_tx,
+        cancel,
+        log_prefix,
+    } = ctx;
+    let contract = pipeline
+        .session()
+        .and_then(|s| s.plan.as_ref())
+        .map(|plan| {
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                plan,
+                writing_ctx.campaign_runtime.as_deref(),
+            )
+        });
+    let mut quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+        &final_text,
+        contract.as_ref(),
+    );
+    let warning_msgs: Vec<String> = quality_report
+        .warnings
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
+    let _ = event_tx.send(PipelineEvent::QualityChecked {
+        passed: quality_report.passed(),
+        warning_count: quality_report.warnings.len(),
+        error_count: quality_report.error_count(),
+        warnings: warning_msgs,
+    });
+    if !quality_report.passed() {
+        for w in &quality_report.warnings {
+            tracing::info!(target: "quality_gate", "{log_prefix} 质量警告: {:?}", w.code);
+        }
+    }
+
+    if quality_report.has_errors() {
+        let hint = storyforge_app_pipeline::quality_gate::build_quality_fix_hint(&quality_report);
+        tracing::info!(
+            target: "quality_gate",
+            "{log_prefix} Error={}，尝试 1× Editor auto-fix",
+            quality_report.error_count()
+        );
+        let regen_req = RegenerateRequest {
+            conversation_id: conversation_id.clone(),
+            node_id: draft_node_id.clone(),
+            targets: vec![PartialRollTarget::Editor],
+            hint: Some(hint),
+            seed: None,
+        };
+        match pipeline
+            .regenerate(regen_req, writing_ctx, event_tx.clone(), cancel)
+            .await
+        {
+            Ok((fixed_text, _)) => {
+                final_text = fixed_text;
+                let contract2 = pipeline.session().and_then(|s| s.plan.as_ref()).map(|plan| {
+                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                        plan,
+                        writing_ctx.campaign_runtime.as_deref(),
+                    )
+                });
+                quality_report =
+                    storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+                        &final_text,
+                        contract2.as_ref(),
+                    );
+                let warning_msgs: Vec<String> = quality_report
+                    .warnings
+                    .iter()
+                    .map(|w| w.message.clone())
+                    .collect();
+                let _ = event_tx.send(PipelineEvent::QualityChecked {
+                    passed: quality_report.passed(),
+                    warning_count: quality_report.warnings.len(),
+                    error_count: quality_report.error_count(),
+                    warnings: warning_msgs,
+                });
+                if !quality_report.passed() {
+                    for w in &quality_report.warnings {
+                        tracing::info!(
+                            target: "quality_gate",
+                            "{log_prefix} auto-fix 后仍有警告: {:?}",
+                            w.code
+                        );
+                    }
+                } else {
+                    tracing::info!(target: "quality_gate", "{log_prefix} auto-fix 后通过门禁");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "quality_gate",
+                    "{log_prefix} Editor auto-fix 失败（保留原稿）: {e}"
+                );
+            }
+        }
+    }
+
+    (final_text, quality_report)
+}
+
 #[tauri::command]
 async fn start_writing(
     intent: String,
@@ -2554,43 +2678,35 @@ async fn start_writing(
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
 
-        // B3/B DraftQualityGate：postprocess 前对草稿跑质量门禁（含 NarrativeContract 私密扫描）
-        let quality_report = {
-            let plan_ref = pipeline.session().and_then(|s| s.plan.as_ref());
-            let contract = plan_ref.map(|plan| {
-                storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                    plan,
-                    ctx.campaign_runtime.as_deref(),
-                )
-            });
-            storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
-                &final_text,
-                contract.as_ref(),
-            )
+        // B3/B DraftQualityGate + 有界 1× Editor auto-fix
+        let cancel_for_fix = {
+            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref()
+                .map(|tx| tx.subscribe())
+                .unwrap_or_else(|| watch::channel(false).1)
         };
-        let warning_msgs: Vec<String> = quality_report
-            .warnings
-            .iter()
-            .map(|w| w.message.clone())
-            .collect();
-        let _ = event_tx.send(PipelineEvent::QualityChecked {
-            passed: quality_report.passed(),
-            warning_count: quality_report.warnings.len(),
-            error_count: quality_report.error_count(),
-            warnings: warning_msgs,
-        });
-        if !quality_report.passed() {
-            for w in &quality_report.warnings {
-                tracing::info!(target: "quality_gate", "质量警告: {:?}", w.code);
-            }
-        }
-        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查
+        let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
+            final_text,
+            QualityAutofixCtx {
+                pipeline: &mut pipeline,
+                draft_node_id,
+                conversation_id: &conversation_id,
+                writing_ctx: &ctx,
+                event_tx: &event_tx,
+                cancel: cancel_for_fix,
+                log_prefix: "start_writing",
+            },
+        )
+        .await;
+        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash
         if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
             let report_for_attempt = quality_report.clone();
             let attempt_id = attempt_id.clone();
+            let fixed_hash = compute_draft_hash(&final_text);
             let _ = update_turn_record(&turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&attempt_id) {
                     att.quality_report = Some(report_for_attempt);
+                    att.draft_hash = fixed_hash;
                 }
                 record.touch();
             });
@@ -4922,7 +5038,7 @@ async fn regenerate(
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .regenerate(pipeline_req, &ctx, event_tx.clone(), cancel_rx)
+        .regenerate(pipeline_req.clone(), &ctx, event_tx.clone(), cancel_rx)
         .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
@@ -5004,36 +5120,28 @@ async fn regenerate(
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
-        // B3/B DraftQualityGate：postprocess 前对草稿跑质量门禁（含 NarrativeContract）
-        let quality_report = {
-            let plan_ref = pipeline.session().and_then(|s| s.plan.as_ref());
-            let contract = plan_ref.map(|plan| {
-                storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                    plan,
-                    ctx.campaign_runtime.as_deref(),
-                )
-            });
-            storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
-                &final_text,
-                contract.as_ref(),
-            )
+        // B3/B DraftQualityGate + 有界 1× Editor auto-fix
+        let cancel_for_fix = {
+            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref()
+                .map(|tx| tx.subscribe())
+                .unwrap_or_else(|| watch::channel(false).1)
         };
-        let warning_msgs: Vec<String> = quality_report
-            .warnings
-            .iter()
-            .map(|w| w.message.clone())
-            .collect();
-        let _ = event_tx.send(PipelineEvent::QualityChecked {
-            passed: quality_report.passed(),
-            warning_count: quality_report.warnings.len(),
-            error_count: quality_report.error_count(),
-            warnings: warning_msgs,
-        });
-        if !quality_report.passed() {
-            for w in &quality_report.warnings {
-                tracing::info!(target: "quality_gate", "regenerate 质量警告: {:?}", w.code);
-            }
-        }
+        // regenerate 返回的 node 即当前 node_id（variant 更新）
+        let draft_node_for_fix = pipeline_req.node_id.clone();
+        let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
+            final_text,
+            QualityAutofixCtx {
+                pipeline: &mut pipeline,
+                draft_node_id: &draft_node_for_fix,
+                conversation_id: &pipeline_req.conversation_id,
+                writing_ctx: &ctx,
+                event_tx: &event_tx,
+                cancel: cancel_for_fix,
+                log_prefix: "regenerate",
+            },
+        )
+        .await;
         // 挂到 regenerate 新建的 Attempt
         if let (Some(campaign_id), Some(att_id)) = (&ctx.campaign_id, &regen_attempt_id)
             && let Some(turn) = get_turn_store().get_active_turn(campaign_id)

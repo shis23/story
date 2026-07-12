@@ -80,8 +80,11 @@ impl HttpLlmClient {
     /// 返回 Result 而非 panic——连接配置错误（如构造 reqwest client 失败）
     /// 时应优雅返回错误，让用户看到提示而非崩溃。
     pub fn new(conn: &LlmConnection) -> Result<Self, LlmError> {
+        // 部分兼容网关（Cloudflare）会拦默认 reqwest UA；统一浏览器 UA。
+        const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 StoryForge/0.1";
         // 同步 client：connect timeout 30s + request timeout 120s
         let client = reqwest::Client::builder()
+            .user_agent(UA)
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(120))
             .build()
@@ -89,6 +92,7 @@ impl HttpLlmClient {
 
         // 流式 client：connect timeout 30s，无 request timeout（SSE 可能持续很久）
         let stream_client = reqwest::Client::builder()
+            .user_agent(UA)
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| LlmError::Internal(format!("构建 stream client 失败: {e}")))?;

@@ -267,36 +267,146 @@ fn check_private_knowledge_leak(text: &str, contract: &NarrativeContract) -> Vec
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // v1：仅扫描显式 must_not_reveal 探针 → Error。
-    // private_bindings 是归属信息，无说话者归因时不自动 Error（避免拥有者合法回忆被拦）。
+    // 收集候选探针：private_bindings 提取的稳定探针 + 显式 must_not_reveal。
+    // Error 决策 attribution-aware：
+    // - 拥有者标签出现在同一句子/邻近窗口 → 允许（合法回忆）
+    // - 其他角色标签出现在同一窗口 → Error（越权）
+    // - 无归属线索但出现稳定探针 → Error（叙述层全知）
+    let mut probes: Vec<(String, Option<String>)> = Vec::new();
+    for b in &contract.private_bindings {
+        for p in storyforge_domain::narrative_contract::extract_gate_probes(&b.secret) {
+            probes.push((p, Some(b.owner_id.clone())));
+        }
+    }
     for token in &contract.must_not_reveal {
         let token = token.trim();
         if token.chars().count() < 4 {
             continue;
         }
-        if !seen.insert(token.to_string()) {
+        let owner = contract.owner_of_secret(token).map(str::to_string);
+        probes.push((token.to_string(), owner));
+    }
+
+    for (token, owner_hint) in probes {
+        if !seen.insert(token.clone()) {
             continue;
         }
-        if text.contains(token) {
-            let owner = contract.owner_of_secret(token).map(str::to_string);
-            // 日志/报告不落完整 secret 原文：只给截断 SHA-256 + owner。
-            let fingerprint = secret_fingerprint(token);
-            out.push(QualityWarning {
-                code: QualityWarningCode::PrivateKnowledgeLeak {
-                    secret_fingerprint: fingerprint.clone(),
-                    owner_id: owner.clone(),
-                },
-                message: match owner {
-                    Some(o) => {
-                        format!("正文出现硬禁探针（fp={fingerprint}，归属 {o}），可能越权全知")
-                    }
-                    None => format!("正文出现硬禁探针（fp={fingerprint}），可能越权全知"),
-                },
-                severity: QualitySeverity::Error,
-            });
+        if !text.contains(&token) {
+            continue;
         }
+        let binding = contract.binding_for_probe(&token);
+        let owner_id = binding
+            .map(|b| b.owner_id.clone())
+            .or(owner_hint)
+            .unwrap_or_default();
+        let owner_labels: Vec<String> = binding
+            .map(|b| b.owner_labels().into_iter().map(str::to_string).collect())
+            .unwrap_or_else(|| {
+                if owner_id.is_empty() {
+                    vec![]
+                } else {
+                    vec![owner_id.clone()]
+                }
+            });
+
+        // 其他焦点角色标签（非拥有者）
+        let other_labels: Vec<String> = contract
+            .focalizers
+            .iter()
+            .filter(|f| !owner_labels.iter().any(|o| o == *f))
+            .cloned()
+            .chain(
+                contract
+                    .private_bindings
+                    .iter()
+                    .filter(|b| b.owner_id != owner_id)
+                    .flat_map(|b| b.owner_labels().into_iter().map(str::to_string)),
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let leak = is_attributed_private_leak(text, &token, &owner_labels, &other_labels);
+        if !leak {
+            continue;
+        }
+
+        let fingerprint = secret_fingerprint(&token);
+        let owner_opt = if owner_id.is_empty() {
+            None
+        } else {
+            Some(owner_id.clone())
+        };
+        out.push(QualityWarning {
+            code: QualityWarningCode::PrivateKnowledgeLeak {
+                secret_fingerprint: fingerprint.clone(),
+                owner_id: owner_opt.clone(),
+            },
+            message: match owner_opt {
+                Some(o) => {
+                    format!(
+                        "正文出现私密探针（fp={fingerprint}，归属 {o}），疑非拥有者/叙述层越权全知"
+                    )
+                }
+                None => format!("正文出现私密探针（fp={fingerprint}），疑越权全知"),
+            },
+            severity: QualitySeverity::Error,
+        });
     }
     out
+}
+
+/// attribution-aware 泄漏判定。
+///
+/// 对每个 probe 命中位置取邻近窗口（约前后 48 字）：
+/// - 窗口内有拥有者标签且无其他角色标签 → 合法
+/// - 窗口内有其他角色标签 → 泄漏
+/// - 窗口内无任何角色标签 → 叙述层泄漏
+fn is_attributed_private_leak(
+    text: &str,
+    probe: &str,
+    owner_labels: &[String],
+    other_labels: &[String],
+) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(probe) {
+        let abs = search_from + rel;
+        let window = nearby_window(text, abs, probe.chars().count(), 48);
+        let has_owner = owner_labels
+            .iter()
+            .any(|l| !l.is_empty() && window.contains(l));
+        let has_other = other_labels
+            .iter()
+            .any(|l| !l.is_empty() && window.contains(l));
+        if has_other {
+            return true;
+        }
+        if !has_owner {
+            // 无归属线索：叙述层/作者视角
+            return true;
+        }
+        // 仅拥有者：继续检查其他命中
+        search_from = abs + probe.len().max(1);
+        if search_from >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn nearby_window(text: &str, byte_pos: usize, probe_chars: usize, radius_chars: usize) -> String {
+    // 以字符为单位取窗口，避免 UTF-8 切半
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let start_idx = chars
+        .iter()
+        .position(|(i, _)| *i >= byte_pos)
+        .unwrap_or(chars.len().saturating_sub(1));
+    let from = start_idx.saturating_sub(radius_chars);
+    let to = (start_idx + probe_chars + radius_chars).min(chars.len());
+    chars[from..to].iter().map(|(_, c)| *c).collect()
 }
 
 /// 私密探针短指纹（截断 SHA-256，跨版本稳定；不落全文）
@@ -305,6 +415,35 @@ fn secret_fingerprint(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     // 16 hex chars = 64-bit 截断，足够报告去重/审计对照，且不回放原文
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// 将 QualityReport 拼成 Editor 修复 hint（只列违规，不倾倒 secret 原文）。
+pub fn build_quality_fix_hint(report: &QualityReport) -> String {
+    let mut parts = vec![
+        "请只修复下列质量问题，其余正文尽量保留；不要输出说明，只输出修订后的正文：".to_string(),
+    ];
+    for (i, w) in report.warnings.iter().enumerate() {
+        if w.severity != QualitySeverity::Error
+            && !matches!(
+                &w.code,
+                QualityWarningCode::EmDashDensity { .. }
+                    | QualityWarningCode::NegationThenAffirmation { .. }
+            )
+        {
+            // 自动修复优先 Error；破折号/否后肯也给提示
+            if w.severity != QualitySeverity::Error {
+                continue;
+            }
+        }
+        parts.push(format!("{}. {}", i + 1, w.message));
+    }
+    if parts.len() == 1 {
+        // 兜底：把全部 warnings 塞进去
+        for (i, w) in report.warnings.iter().enumerate() {
+            parts.push(format!("{}. {}", i + 1, w.message));
+        }
+    }
+    parts.join("\n")
 }
 
 fn truncate_sample(s: &str, max_chars: usize) -> String {
@@ -478,14 +617,16 @@ mod tests {
     fn test_private_knowledge_leak_error() {
         use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
         let contract = NarrativeContract {
+            focalizers: vec!["inst-lin".into(), "inst-chen".into()],
             private_bindings: vec![PrivateBinding {
                 owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
                 secret: "SF_SECRET_CHEN_BADGE_X91".into(),
             }],
-            // 仅显式探针触发 Error
             must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
             ..Default::default()
         };
+        // 非拥有者（林秋）口中出现异己 secret → Error
         let text = "林秋低声说：我知道 SF_SECRET_CHEN_BADGE_X91 这件事。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味。";
         let report = run_quality_gate_with_contract(text, Some(&contract));
         assert!(
@@ -493,10 +634,9 @@ mod tests {
                 &w.code,
                 QualityWarningCode::PrivateKnowledgeLeak { .. }
             ) && w.severity == QualitySeverity::Error),
-            "应检出硬禁探针 Error: {:?}",
+            "应检出 attribution-aware 私密泄漏 Error: {:?}",
             report.warnings
         );
-        // 报告不得包含完整 secret 原文
         assert!(
             report
                 .warnings
@@ -509,15 +649,17 @@ mod tests {
     }
 
     #[test]
-    fn test_private_binding_alone_does_not_error_without_must_not_reveal() {
+    fn test_owner_legal_private_recall_passes() {
         use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
-        // 仅 private_bindings、无 must_not_reveal：拥有者/正文出现 secret 不自动 Error
+        // 拥有者合法回忆：不 Error
         let contract = NarrativeContract {
+            focalizers: vec!["inst-lin".into(), "inst-chen".into()],
             private_bindings: vec![PrivateBinding {
                 owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
                 secret: "SF_SECRET_CHEN_BADGE_X91".into(),
             }],
-            must_not_reveal: vec![],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
             ..Default::default()
         };
         let text = "陈警官在心里默念 SF_SECRET_CHEN_BADGE_X91。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味。";
@@ -527,7 +669,34 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
-            "private_bindings alone must not Error: {:?}",
+            "owner legal recall must not Error: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_narrator_private_probe_without_owner_errors() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        // 叙述层无角色归属却出现探针 → Error
+        let contract = NarrativeContract {
+            focalizers: vec!["inst-lin".into(), "inst-chen".into()],
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+        let text =
+            "真相其实是 SF_SECRET_CHEN_BADGE_X91。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味。";
+        let report = run_quality_gate_with_contract(text, Some(&contract));
+        assert!(
+            report.warnings.iter().any(|w| matches!(
+                &w.code,
+                QualityWarningCode::PrivateKnowledgeLeak { .. }
+            ) && w.severity == QualitySeverity::Error),
+            "narrator probe must Error: {:?}",
             report.warnings
         );
     }
@@ -538,6 +707,7 @@ mod tests {
         let contract = NarrativeContract {
             private_bindings: vec![PrivateBinding {
                 owner_id: "inst-chen".into(),
+                owner_name: Some("陈警官".into()),
                 secret: "SF_SECRET_CHEN_BADGE_X91".into(),
             }],
             must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
@@ -553,6 +723,20 @@ mod tests {
             "无探针不应泄漏: {:?}",
             report.warnings
         );
+    }
+
+    #[test]
+    fn test_build_quality_fix_hint_mentions_errors() {
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::EmDashDensity { count: 3 },
+                message: "草稿含破折号 3 处".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        let hint = build_quality_fix_hint(&report);
+        assert!(hint.contains("破折号"), "hint={hint}");
+        assert!(hint.contains("请只修复"), "hint={hint}");
     }
 
     #[test]

@@ -50,8 +50,71 @@ impl Default for StyleConstraints {
 pub struct PrivateBinding {
     /// 拥有者 instance_id / character_id
     pub owner_id: String,
+    /// 显示名（attribution 扫描用；可空）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
     /// 稳定探针或短摘要
     pub secret: String,
+}
+
+impl PrivateBinding {
+    /// 用于归属扫描的标签：owner_id + 可选 name
+    pub fn owner_labels(&self) -> Vec<&str> {
+        let mut v = vec![self.owner_id.as_str()];
+        if let Some(n) = self
+            .owner_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            v.push(n);
+        }
+        v
+    }
+}
+
+/// 从私密知识文本中提取可用于门禁扫描的稳定探针。
+///
+/// 优先 `SF_SECRET_*` 形 token；否则短文本（≤48 字）整段作为探针；
+/// 过长自然语言不自动生成硬探针（避免误拦）。
+pub fn extract_gate_probes(secret_text: &str) -> Vec<String> {
+    let t = secret_text.trim();
+    if t.is_empty() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let bytes = t.as_bytes();
+    let needle = b"SF_SECRET_";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let start = i;
+            i += needle.len();
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let token = &t[start..i];
+            if token.chars().count() >= 8 {
+                out.push(token.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if !out.is_empty() {
+        out.sort();
+        out.dedup();
+        return out;
+    }
+    if t.chars().count() <= 48 {
+        out.push(t.to_string());
+    }
+    out
 }
 
 /// 叙事契约
@@ -67,7 +130,7 @@ pub struct NarrativeContract {
     /// 私密绑定
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_bindings: Vec<PrivateBinding>,
-    /// 正文不得错误泄露的探针
+    /// 正文不得错误泄露的探针（稳定 token 清单；Error 决策优先 attribution）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_not_reveal: Vec<String>,
     /// 本场不得一次性解决的问题（来自 ScenePlan）
@@ -115,8 +178,8 @@ impl NarrativeContract {
 
         let mut private_bindings = Vec::new();
         if let Some(cr) = runtime {
-            // 仅收集本场焦点角色的私密归属；不把全文 secret 自动塞进 must_not_reveal。
-            // must_not_reveal 留给显式探针（如测试/导演硬约束），避免拥有者合法回忆也被 Error 拦截。
+            // 仅收集本场焦点角色的私密归属。
+            // 稳定探针进 must_not_reveal 清单；Error 决策在 gate 走 attribution-aware。
             for inst in &cr.instances {
                 let id = inst.id.as_str();
                 if !focalizers.is_empty() && !focalizers.iter().any(|f| f == id || f == &inst.name)
@@ -131,9 +194,20 @@ impl NarrativeContract {
                         }
                         private_bindings.push(PrivateBinding {
                             owner_id: id.to_string(),
+                            owner_name: Some(inst.name.clone()),
                             secret: secret.to_string(),
                         });
                     }
+                }
+            }
+        }
+
+        // 生产探针：从 private_bindings 提取稳定 token（SF_SECRET_* 或短文本）。
+        let mut must_not_reveal = Vec::new();
+        for b in &private_bindings {
+            for p in extract_gate_probes(&b.secret) {
+                if !must_not_reveal.contains(&p) {
+                    must_not_reveal.push(p);
                 }
             }
         }
@@ -143,8 +217,7 @@ impl NarrativeContract {
             focalizers,
             public_facts,
             private_bindings,
-            // 不从 private_bindings 自动复制：无说话者归因时，硬拦会误伤拥有者合法使用。
-            must_not_reveal: vec![],
+            must_not_reveal,
             must_not_resolve,
             style_constraints: StyleConstraints::default(),
         }
@@ -157,6 +230,19 @@ impl NarrativeContract {
             .iter()
             .find(|b| b.secret == secret || secret.contains(&b.secret) || b.secret.contains(secret))
             .map(|b| b.owner_id.as_str())
+    }
+
+    /// 查找绑定：优先 exact secret，再 probes / contains
+    pub fn binding_for_probe(&self, probe: &str) -> Option<&PrivateBinding> {
+        let probe = probe.trim();
+        self.private_bindings.iter().find(|b| {
+            if b.secret == probe {
+                return true;
+            }
+            extract_gate_probes(&b.secret).iter().any(|p| p == probe)
+                || b.secret.contains(probe)
+                || probe.contains(&b.secret)
+        })
     }
 
     /// 渲染为 Editor/Director 短约束
@@ -193,7 +279,7 @@ impl NarrativeContract {
         }
         if !self.must_not_reveal.is_empty() {
             lines.push(format!(
-                "- 本场硬禁探针：{} 条（正文出现即质量 Error）",
+                "- 本场稳定私密探针：{} 条（非拥有者口中/叙述出现即质量 Error）",
                 self.must_not_reveal.len()
             ));
         }
@@ -311,8 +397,17 @@ mod tests {
         };
         let c = NarrativeContract::from_plan_and_runtime(&plan, Some(&runtime));
         assert_eq!(c.private_bindings.len(), 2);
-        // private_bindings 不自动进入 must_not_reveal（避免拥有者合法使用被 Error）
-        assert!(c.must_not_reveal.is_empty());
+        // 生产探针：SF_SECRET_* 稳定 token 进入 must_not_reveal 清单
+        assert!(
+            c.must_not_reveal
+                .iter()
+                .any(|p| p == "SF_SECRET_LIN_VAULT_0427")
+        );
+        assert!(
+            c.must_not_reveal
+                .iter()
+                .any(|p| p == "SF_SECRET_CHEN_BADGE_X91")
+        );
         assert_eq!(
             c.owner_of_secret("SF_SECRET_LIN_VAULT_0427"),
             Some("inst-lin")
@@ -323,6 +418,24 @@ mod tests {
             "prompt must not dump full secret text: {rendered}"
         );
         assert!(rendered.contains("私密归属角色") || rendered.contains("私密知识"));
+    }
+
+    #[test]
+    fn extract_gate_probes_prefers_sf_secret_token() {
+        let probes = extract_gate_probes("我藏了 SF_SECRET_LIN_VAULT_0427 在保险柜");
+        assert_eq!(probes, vec!["SF_SECRET_LIN_VAULT_0427".to_string()]);
+    }
+
+    #[test]
+    fn extract_gate_probes_short_text_whole() {
+        let probes = extract_gate_probes("徽章号X91");
+        assert_eq!(probes, vec!["徽章号X91".to_string()]);
+    }
+
+    #[test]
+    fn extract_gate_probes_long_text_skipped() {
+        let long = "这是一段很长的自然语言私密回忆，没有稳定 token，也不应该整段自动变成硬禁探针，否则会误伤大量正文描写。";
+        assert!(extract_gate_probes(long).is_empty());
     }
 
     #[test]
