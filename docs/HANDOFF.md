@@ -90,7 +90,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. **阶段 B 主结构已接**（2026-07-11）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency（desire/action/emotion_stage）+ QualityGate 破折号/否后肯/私密泄漏 + Prompted `builtin-cot-scene-checklist`。仍延后：有界自动修复（1× Editor）、Editor performance 硬红action、真实 LLM 质量 A/B。
+1. **阶段 B 主结构已接**（2026-07-11）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency（desire/action/emotion_stage）+ QualityGate 破折号/否后肯 + **显式 `must_not_reveal` 探针** 的 `PrivateKnowledgeLeak` 基础机制 + Prompted `builtin-cot-scene-checklist`。**注意**：生产 `from_plan_and_runtime` 当前不自动生成硬禁探针（`must_not_reveal` 为空）；私密归属契约已注入，**attribution-aware 生产私密泄漏硬门禁 / 探针生成**延后 B2。仍延后：有界自动修复（1× Editor）、Editor performance 硬红action、真实 LLM 质量 A/B。
 2. **记忆 / Context 装配**：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **M0–M4.2.2 完成**；**M5 探针重跑 Partial Evidence**（2026-07-12 `grok-4.5`：S1/S6 写作流式 cache 可见；S3 B-only **实体/标识符** 6/6 非语义保真；S4 epoch+band 过；非生产 Accept / **非**参数已标定）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。**不改** 200/4。UnitOfWork/SQLite 仍独立。下一步：生产 CommitTurn、≥20 Accept 跨 H+E、脱敏 JSONL。
 3. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
 4. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。

@@ -10,21 +10,36 @@
 /// 4. 视角/破壁：对读者说话或指令式旁白
 /// 5. 格式泄漏：代码块 / think 标签 / HTML
 /// 6. 连续性：相邻句子完全重复
+use storyforge_domain::narrative_contract::NarrativeContract;
 use storyforge_domain::turn::{QualityReport, QualitySeverity, QualityWarning, QualityWarningCode};
 
-/// 运行草稿质量门禁
+/// 运行草稿质量门禁（无契约：不做 private leak 扫描）
 pub fn run_quality_gate(text: &str) -> QualityReport {
-    let warnings: Vec<QualityWarning> = vec![
+    run_quality_gate_with_contract(text, None)
+}
+
+/// 运行草稿质量门禁；传入 NarrativeContract 时扫描 must_not_reveal / private_bindings。
+pub fn run_quality_gate_with_contract(
+    text: &str,
+    contract: Option<&NarrativeContract>,
+) -> QualityReport {
+    let mut warnings: Vec<QualityWarning> = vec![
         check_ngram_repetition(text),
         check_meta_description(text),
         check_too_short(text),
         check_perspective_leak(text),
         check_format_leak(text),
         check_consecutive_repeat(text),
+        check_em_dash(text, contract),
+        check_negation_then_affirmation(text, contract),
     ]
     .into_iter()
     .flatten()
     .collect();
+
+    if let Some(c) = contract {
+        warnings.extend(check_private_knowledge_leak(text, c));
+    }
 
     QualityReport { warnings }
 }
@@ -196,6 +211,102 @@ fn check_consecutive_repeat(text: &str) -> Option<QualityWarning> {
     None
 }
 
+fn check_em_dash(text: &str, contract: Option<&NarrativeContract>) -> Option<QualityWarning> {
+    let ban = contract
+        .map(|c| c.style_constraints.ban_em_dash)
+        .unwrap_or(true);
+    if !ban {
+        return None;
+    }
+    let count_double = text.matches("——").count();
+    let count_em = text.matches('—').count().saturating_sub(count_double * 2);
+    let count = count_double + count_em;
+    if count == 0 {
+        return None;
+    }
+    let severity = if count >= 3 {
+        QualitySeverity::Error
+    } else {
+        QualitySeverity::Warning
+    };
+    Some(QualityWarning {
+        code: QualityWarningCode::EmDashDensity { count },
+        message: format!("草稿含破折号 {count} 处（建议改用逗号/句号/省略号）"),
+        severity,
+    })
+}
+
+fn check_negation_then_affirmation(
+    text: &str,
+    contract: Option<&NarrativeContract>,
+) -> Option<QualityWarning> {
+    let ban = contract
+        .map(|c| c.style_constraints.ban_negation_affirmation)
+        .unwrap_or(true);
+    if !ban {
+        return None;
+    }
+    // find 返回字节索引；从 &text[i..] 取字符窗口，避免把字节偏移当 char 计数。
+    if let Some(i) = text.find("不是") {
+        let tail: String = text[i..].chars().take(24).collect();
+        if tail.contains("而是") || tail.contains("就是") {
+            let sample = truncate_sample(&tail, 32);
+            return Some(QualityWarning {
+                code: QualityWarningCode::NegationThenAffirmation {
+                    sample: sample.clone(),
+                },
+                message: format!("草稿含否后肯结构：「{sample}」"),
+                severity: QualitySeverity::Warning,
+            });
+        }
+    }
+    None
+}
+
+fn check_private_knowledge_leak(text: &str, contract: &NarrativeContract) -> Vec<QualityWarning> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // v1：仅扫描显式 must_not_reveal 探针 → Error。
+    // private_bindings 是归属信息，无说话者归因时不自动 Error（避免拥有者合法回忆被拦）。
+    for token in &contract.must_not_reveal {
+        let token = token.trim();
+        if token.chars().count() < 4 {
+            continue;
+        }
+        if !seen.insert(token.to_string()) {
+            continue;
+        }
+        if text.contains(token) {
+            let owner = contract.owner_of_secret(token).map(str::to_string);
+            // 日志/报告不落完整 secret 原文：只给截断 SHA-256 + owner。
+            let fingerprint = secret_fingerprint(token);
+            out.push(QualityWarning {
+                code: QualityWarningCode::PrivateKnowledgeLeak {
+                    secret_fingerprint: fingerprint.clone(),
+                    owner_id: owner.clone(),
+                },
+                message: match owner {
+                    Some(o) => {
+                        format!("正文出现硬禁探针（fp={fingerprint}，归属 {o}），可能越权全知")
+                    }
+                    None => format!("正文出现硬禁探针（fp={fingerprint}），可能越权全知"),
+                },
+                severity: QualitySeverity::Error,
+            });
+        }
+    }
+    out
+}
+
+/// 私密探针短指纹（截断 SHA-256，跨版本稳定；不落全文）
+fn secret_fingerprint(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(secret.as_bytes());
+    // 16 hex chars = 64-bit 截断，足够报告去重/审计对照，且不回放原文
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 fn truncate_sample(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if count <= max_chars {
@@ -332,6 +443,129 @@ mod tests {
                 .iter()
                 .any(|w| matches!(&w.code, QualityWarningCode::ConsecutiveRepeat { .. })),
             "应检出相邻句子重复: {:?}",
+            report.warnings
+        );
+    }
+    #[test]
+    fn test_em_dash_detected() {
+        let text = "夜风——吹过窗棂，林秋坐在桌前，看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::EmDashDensity { .. })),
+            "应检出破折号: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_negation_then_affirmation_detected() {
+        let text = "林秋不是在害怕，而是在盘算下一步。窗外雨声淅沥，急诊灯把走廊照得惨白。他抬起头看着陈警官。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::NegationThenAffirmation { .. })),
+            "应检出否后肯: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_private_knowledge_leak_error() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        let contract = NarrativeContract {
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            // 仅显式探针触发 Error
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+        let text = "林秋低声说：我知道 SF_SECRET_CHEN_BADGE_X91 这件事。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味。";
+        let report = run_quality_gate_with_contract(text, Some(&contract));
+        assert!(
+            report.warnings.iter().any(|w| matches!(
+                &w.code,
+                QualityWarningCode::PrivateKnowledgeLeak { .. }
+            ) && w.severity == QualitySeverity::Error),
+            "应检出硬禁探针 Error: {:?}",
+            report.warnings
+        );
+        // 报告不得包含完整 secret 原文
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| !w.message.contains("SF_SECRET_CHEN_BADGE_X91")),
+            "warning message must not contain raw secret: {:?}",
+            report.warnings
+        );
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn test_private_binding_alone_does_not_error_without_must_not_reveal() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        // 仅 private_bindings、无 must_not_reveal：拥有者/正文出现 secret 不自动 Error
+        let contract = NarrativeContract {
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            must_not_reveal: vec![],
+            ..Default::default()
+        };
+        let text = "陈警官在心里默念 SF_SECRET_CHEN_BADGE_X91。窗外雨还在下，急诊灯闪着白光，空气里有消毒水味。";
+        let report = run_quality_gate_with_contract(text, Some(&contract));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
+            "private_bindings alone must not Error: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_private_knowledge_absent_passes_contract() {
+        use storyforge_domain::narrative_contract::{NarrativeContract, PrivateBinding};
+        let contract = NarrativeContract {
+            private_bindings: vec![PrivateBinding {
+                owner_id: "inst-chen".into(),
+                secret: "SF_SECRET_CHEN_BADGE_X91".into(),
+            }],
+            must_not_reveal: vec!["SF_SECRET_CHEN_BADGE_X91".into()],
+            ..Default::default()
+        };
+        let text = "林秋坐在桌前，看着杯中残茶泛起的涟漪。他想起那年冬天，也是这样安静的夜晚。窗外有猫叫，声音远处传来。";
+        let report = run_quality_gate_with_contract(text, Some(&contract));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::PrivateKnowledgeLeak { .. })),
+            "无探针不应泄漏: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn test_negation_then_affirmation_with_chinese_prefix() {
+        // 前缀含多字节中文：find 返回字节偏移，必须从 &text[i..] 扫描
+        let text = "夜色渐深，急诊室灯光惨白，林秋不是在害怕，而是在盘算下一步。窗外雨声淅沥，他把报告推到陈警官面前。";
+        let report = run_quality_gate(text);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| matches!(&w.code, QualityWarningCode::NegationThenAffirmation { .. })),
+            "中文前缀下仍应检出否后肯: {:?}",
             report.warnings
         );
     }

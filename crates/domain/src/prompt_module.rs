@@ -669,7 +669,7 @@ pub mod builtins {
         vec![AgentRole::Editor, AgentRole::Subagent("*".into())]
     }
 
-    /// 预置模块列表（5 个核心模块）
+    /// 预置模块列表（6 个核心模块）
     pub fn preset_modules() -> Vec<PromptModule> {
         vec![
             // 1. 视角：第三人称（最常用）
@@ -716,6 +716,18 @@ pub mod builtins {
                 applicable_roles: all_roles(),
                 tags: vec!["CoT".into(), "通用".into()],
             },
+
+            // 4b. CoT：场景清单五步（梁元结构吸收，仅 Prompted 注入）
+            PromptModule {
+                id: Id::from_str("builtin-cot-scene-checklist"),
+                name: "场景清单五步".into(),
+                category: ModuleCategory::Cot,
+                content: "【思考指引：场景清单】\n在输出前按五步内部思考（不要输出思考过程）：\n1. 解析用户意图：何时、何人、何事与言外之意。\n2. 对照近期结构，避免重复套路，必要时换推进角度。\n3. 情节待决：冲突、对立目标、节拍、本场不得一次解决的问题。\n4. 知识边界：每人知/不知/误解；禁止跨角色私密全知。\n5. 文风与可检项：避免破折号堆砌、否后肯、元叙述；然后只输出 Plan 或正文。".into(),
+                exclusivity: Exclusivity::Single,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: all_roles(),
+                tags: vec!["CoT".into(), "场景清单".into(), "梁元结构".into()],
+            },
             // 5. 输出规范：字数控制
             PromptModule {
                 id: Id::from_str("builtin-output-word-count"),
@@ -741,7 +753,7 @@ pub mod builtins {
         let mut director_cats = HashMap::new();
         director_cats.insert(
             ModuleCategory::Cot,
-            vec![Id::from_str("builtin-cot-generic")],
+            vec![Id::from_str("builtin-cot-scene-checklist")],
         );
         selections.insert(AgentRole::Director, director_cats);
 
@@ -791,7 +803,7 @@ pub mod builtins {
         #[test]
         fn test_preset_modules_count() {
             let modules = preset_modules();
-            assert_eq!(modules.len(), 5);
+            assert_eq!(modules.len(), 6);
         }
 
         #[test]

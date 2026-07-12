@@ -174,6 +174,9 @@ fn volatile_tail_knowledge_isolation_between_instances() {
             recent_window: vec![],
             task: "出场".into(),
         },
+        current_desire: None,
+        ongoing_action: None,
+        emotion_stage: None,
     };
 
     let lin_tail = build_campaign_subagent_volatile(&task, &cr, &inst_lin);
@@ -319,6 +322,9 @@ async fn temporary_instance_isolation() {
             recent_window: vec![],
             task: "出现".into(),
         },
+        current_desire: None,
+        ongoing_action: None,
+        emotion_stage: None,
     };
     let tail = build_campaign_subagent_volatile(&task, &cr2, &temp_inst);
     assert!(

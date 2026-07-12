@@ -130,17 +130,14 @@ mod tests {
             plan: Some(Plan {
                 scene_brief: "雨夜告别场景".into(),
                 subagent_tasks: vec![
-                    SubagentTask {
-                        character_id: "alice".into(),
-                        brief: "扮演 Alice，表达离别的不舍".into(),
-                        context_package: make_context_package(),
-                    },
-                    SubagentTask {
-                        character_id: "bob".into(),
-                        brief: "扮演 Bob，沉默但内心翻涌".into(),
-                        context_package: make_context_package(),
-                    },
+                    SubagentTask::new(
+                        "alice",
+                        "扮演 Alice，表达离别的不舍",
+                        make_context_package(),
+                    ),
+                    SubagentTask::new("bob", "扮演 Bob，沉默但内心翻涌", make_context_package()),
                 ],
+                scene_plan: None,
             }),
             subagent_results: vec![
                 SubagentSnapshot {

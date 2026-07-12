@@ -401,11 +401,24 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
     registry.register(
         ToolSpec::function(
             "emit_plan",
-            "输出结构化的写作计划。包含场景简述和每个子 Agent 的任务。",
+            "输出结构化的写作计划。包含场景简述、可选 ScenePlan（冲突/节拍等）和每个子 Agent 的任务（可选欲望/手头动作）。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "scene_brief": {"type": "string", "description": "场景简述"},
+                    "scene_plan": {
+                        "type": "object",
+                        "description": "扩展场景规划（可选）",
+                        "properties": {
+                            "conflict": {"type": "string"},
+                            "opposing_goals": {"type": "array", "items": {"type": "string"}},
+                            "stakes": {"type": "string"},
+                            "beats": {"type": "array", "items": {"type": "string"}},
+                            "complication": {"type": "string"},
+                            "must_not_resolve": {"type": "string"},
+                            "exit_hook": {"type": "string"}
+                        }
+                    },
                     "subagent_tasks": {
                         "type": "array",
                         "items": {
@@ -413,6 +426,9 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                             "properties": {
                                 "character_id": {"type": "string"},
                                 "brief": {"type": "string"},
+                                "current_desire": {"type": "string", "description": "与用户输入无关的当前欲望"},
+                                "ongoing_action": {"type": "string", "description": "进场前正在做的事"},
+                                "emotion_stage": {"type": "integer", "minimum": 1, "maximum": 6, "description": "情绪阶段 1-6，禁止正文直说"}
                             }
                         }
                     }

@@ -70,29 +70,32 @@ pub enum PipelineError {
 const DIRECTOR_SYSTEM_PROMPT: &str = r#"你是写作导演。用户给你写作意图，你要：
 
 1. 调用 search_world_info / get_character 了解可用素材
-2. 判断本场戏：核心冲突是什么？引入哪些角色？
-3. 决定出场角色，为每个角色分配任务
-4. 为每个角色构造专属上下文包
-5. 输出结构化 Plan
+2. 判断本场戏：核心冲突、对立目标、赌注、节拍；哪些线本场不得一次解决
+3. 决定出场角色，为每个角色分配任务，并给出与用户输入无关的当前欲望/手头动作（可选 emotion_stage 1-6，禁止正文直说阶段名）
+4. 为每个角色构造专属上下文包（注意知识隔离：角色只能知道自己的信息）
+5. 输出结构化 Plan（含可选 scene_plan）
 
 不要自己写正文。
 
 【输出格式（必须严格遵守）】
 调用 emit_plan 工具输出 Plan；如果无法调用工具，则直接输出如下 JSON（前后不要有任何其他文字、解释或 markdown 标记）：
 
-{"scene_brief": "本场戏的一句话场景简述", "subagent_tasks": [{"character_id": "角色标识", "brief": "该角色在本场戏的任务简述"}]}
+{"scene_brief":"本场戏的一句话场景简述","scene_plan":{"conflict":"核心冲突","opposing_goals":["A想…","B想…"],"stakes":"失败代价","beats":["开场","升级","复杂化"],"complication":"搅局","must_not_resolve":"本场不得解决的问题","exit_hook":"留给下轮的钩子"},"subagent_tasks":[{"character_id":"角色标识","brief":"该角色任务","current_desire":"与用户输入无关的当前欲望","ongoing_action":"进场前正在做的事","emotion_stage":3}]}
+
+scene_plan 与 current_desire/ongoing_action/emotion_stage 均可选；旧格式仅 scene_brief+brief 仍可接受。
 
 character_id 规则：
 - 如果可用角色列表显示为「Campaign 实例」，character_id 必须使用括号内的 instance_id（如 inst-xxx），不要使用角色名。
 - 如果可用角色列表为普通角色名，character_id 使用角色名。
 
 示例（用户意图「写一场雨中告别」，可用角色 Seraphina）：
-{"scene_brief": "雨中告别，屋檐下两人对话", "subagent_tasks": [{"character_id": "Seraphina", "brief": "演出告别时的温柔与不舍"}]}"#;
+{"scene_brief":"雨中告别，屋檐下两人对话","scene_plan":{"conflict":"想留与必须走","stakes":"错过最后一面","must_not_resolve":"两人关系终局","exit_hook":"雨势未停"},"subagent_tasks":[{"character_id":"Seraphina","brief":"演出告别时的温柔与不舍","current_desire":"想再听对方说一句留下来","ongoing_action":"撑伞站在檐下"}]}"#;
 
 const EDITOR_SYSTEM_PROMPT: &str = r#"你是编剧。收集所有子 Agent 的表演，合并成连贯成文：
 
-1. 节奏把控、视角切换、过渡衔接
-2. 输出最终成文（Markdown）
+1. 节奏把控、视角切换、过渡衔接；角色对话要有目的，纹理随人设变化
+2. 遵守 tail 中的 ScenePlan 与 NarrativeContract：限知叙述、不替角色全知他人私密；本场不得解决的问题保持未决；尾部停在互动中段便于接续
+3. 输出最终成文（Markdown）
 
 只输出正文本身，严禁输出任何说明、注释、改动标注、总结性文字、开场白或结语（例如「以下是合并后的成文」「我对某段做了裁剪」等）。第一行就必须是正文的开始。不需要调用工具。"#;
 
@@ -958,12 +961,19 @@ impl PipelineOrchestrator {
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
             .tail(|_| {
+                let contract =
+                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                        &plan,
+                        ctx.campaign_runtime.as_deref(),
+                    );
                 build_editor_tail(
                     &plan.scene_brief,
                     &performances_text,
                     None,
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
+                    plan.scene_plan.as_ref(),
+                    Some(&contract),
                 )
             });
 
@@ -1934,12 +1944,19 @@ impl PipelineOrchestrator {
             .system(editor_config.system_prompt.clone())
             .history(editor_history)
             .tail(|_| {
+                let contract =
+                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                        plan,
+                        campaign_runtime,
+                    );
                 build_editor_tail(
                     &plan.scene_brief,
                     &performances_text,
                     hint,
                     recent_summaries,
                     far_memory_hits,
+                    plan.scene_plan.as_ref(),
+                    Some(&contract),
                 )
             });
 
@@ -2668,12 +2685,29 @@ fn build_editor_tail(
     hint: Option<&str>,
     recent_summaries: &[storyforge_domain::agent::RoundSummary],
     far_memory_hits: &[FarMemoryHit],
+    scene_plan: Option<&storyforge_domain::agent::ScenePlan>,
+    narrative_contract: Option<&storyforge_domain::narrative_contract::NarrativeContract>,
 ) -> storyforge_domain::message_layout::VolatileTail {
     use storyforge_domain::message_layout::VolatileTail;
 
-    let mut tail = VolatileTail::new().push(format!(
+    let mut head = format!(
         "场景：{scene_brief}\n\n子 Agent 表演：\n\n{performances_text}\n\n请合并成连贯成文。"
-    ));
+    );
+    if let Some(sp) = scene_plan {
+        let rendered = sp.render_for_prompt();
+        if !rendered.is_empty() {
+            head.push_str("\n\n");
+            head.push_str(&rendered);
+        }
+    }
+    if let Some(nc) = narrative_contract {
+        let rendered = nc.render_for_prompt();
+        if !rendered.is_empty() {
+            head.push_str("\n\n");
+            head.push_str(&rendered);
+        }
+    }
+    let mut tail = VolatileTail::new().push(head);
     // ContextCompiler 最小版：编剧也看到近期事实，减少跨轮设定漂移
     if let Some(summary_block) =
         render_recent_summaries_for_injection(recent_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
@@ -2835,18 +2869,82 @@ fn parse_plan_json(v: &serde_json::Value) -> Result<Plan, PipelineError> {
                 }
             };
 
+            let current_desire = t
+                .get("current_desire")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let ongoing_action = t
+                .get("ongoing_action")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let emotion_stage = t.get("emotion_stage").and_then(|v| {
+                let n = if let Some(n) = v.as_u64() {
+                    u8::try_from(n).ok()?
+                } else {
+                    v.as_str()?.parse::<u8>().ok()?
+                };
+                (1..=6).contains(&n).then_some(n)
+            });
+
             SubagentTask {
                 character_id,
                 brief,
                 context_package,
+                current_desire,
+                ongoing_action,
+                emotion_stage,
             }
         })
         .collect();
 
+    let scene_plan = v.get("scene_plan").and_then(parse_scene_plan);
+
     Ok(Plan {
         scene_brief,
         subagent_tasks,
+        scene_plan,
     })
+}
+
+/// 解析可选 ScenePlan 对象；全空则返回 None
+fn parse_scene_plan(v: &serde_json::Value) -> Option<storyforge_domain::agent::ScenePlan> {
+    if !v.is_object() {
+        return None;
+    }
+    let str_field = |key: &str| -> Option<String> {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let list_field = |key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let plan = storyforge_domain::agent::ScenePlan {
+        conflict: str_field("conflict"),
+        opposing_goals: list_field("opposing_goals"),
+        stakes: str_field("stakes"),
+        beats: list_field("beats"),
+        complication: str_field("complication"),
+        must_not_resolve: str_field("must_not_resolve"),
+        exit_hook: str_field("exit_hook"),
+    };
+    if plan.is_empty() { None } else { Some(plan) }
 }
 
 /// 解析 ContextPackage JSON
@@ -3854,8 +3952,12 @@ mod tests {
                         recent_window: vec![],
                         task: format!("{character_id} task"),
                     },
+                    current_desire: None,
+                    ongoing_action: None,
+                    emotion_stage: None,
                 })
                 .collect(),
+            scene_plan: None,
         };
         let old_snapshot = |character_id: &str, full_text: &str| {
             storyforge_domain::conversation::SubagentSnapshot {
@@ -5027,9 +5129,17 @@ mod tests {
             3,
             "林秋把病历藏进抽屉。".into(),
         )];
-        let layout = MessageLayout::build()
-            .system("你是编剧")
-            .tail(|_| build_editor_tail("雨夜诊所", "### Lin\n林秋沉默。", None, &summaries, &[]));
+        let layout = MessageLayout::build().system("你是编剧").tail(|_| {
+            build_editor_tail(
+                "雨夜诊所",
+                "### Lin\n林秋沉默。",
+                None,
+                &summaries,
+                &[],
+                None,
+                None,
+            )
+        });
         let msgs = layout.into_messages();
         let tail = msgs.last().unwrap().content.as_str();
         assert!(tail.contains("场景：雨夜诊所"), "应含场景: {tail}");
@@ -5044,6 +5154,140 @@ mod tests {
     // ─── 阶段 3 cleanup：has_available_characters + UTF-8 截断 + variables 注入 ──
 
     /// has_available_characters：旧路径 - characters 非空 → true
+
+    #[test]
+    fn test_parse_plan_json_scene_plan_and_agency_fields() {
+        let v = serde_json::json!({
+            "scene_brief": "雨夜诊所",
+            "scene_plan": {
+                "conflict": "是否透露真相",
+                "opposing_goals": ["林想隐瞒", "陈想追问"],
+                "stakes": "信任破裂",
+                "beats": ["对峙", "犹豫"],
+                "must_not_resolve": "主线谜底",
+                "exit_hook": "雨未停"
+            },
+            "subagent_tasks": [{
+                "character_id": "inst-lin",
+                "brief": "诊治",
+                "current_desire": "想快点结束问话",
+                "ongoing_action": "擦手",
+                "emotion_stage": 3
+            }]
+        });
+        let plan = parse_plan_json(&v).expect("plan");
+        assert_eq!(plan.scene_brief, "雨夜诊所");
+        let sp = plan.scene_plan.expect("scene_plan");
+        assert_eq!(sp.conflict.as_deref(), Some("是否透露真相"));
+        assert_eq!(sp.must_not_resolve.as_deref(), Some("主线谜底"));
+        assert_eq!(
+            plan.subagent_tasks[0].current_desire.as_deref(),
+            Some("想快点结束问话")
+        );
+        assert_eq!(
+            plan.subagent_tasks[0].ongoing_action.as_deref(),
+            Some("擦手")
+        );
+        assert_eq!(plan.subagent_tasks[0].emotion_stage, Some(3));
+    }
+
+    #[test]
+    fn test_parse_plan_json_old_shape_still_works() {
+        let v = serde_json::json!({
+            "scene_brief": "旧场景",
+            "subagent_tasks": [{"character_id": "A", "brief": "演"}]
+        });
+        let plan = parse_plan_json(&v).expect("old plan");
+        assert!(plan.scene_plan.is_none());
+        assert!(plan.subagent_tasks[0].current_desire.is_none());
+    }
+
+    #[test]
+    fn test_parse_plan_json_rejects_out_of_range_emotion_stage() {
+        let v = serde_json::json!({
+            "scene_brief": "场景",
+            "subagent_tasks": [{
+                "character_id": "A",
+                "brief": "演",
+                "emotion_stage": 7
+            }]
+        });
+        let plan = parse_plan_json(&v).expect("plan");
+        assert!(plan.subagent_tasks[0].emotion_stage.is_none());
+
+        let v2 = serde_json::json!({
+            "scene_brief": "场景",
+            "subagent_tasks": [{
+                "character_id": "A",
+                "brief": "演",
+                "emotion_stage": 256
+            }]
+        });
+        let plan2 = parse_plan_json(&v2).expect("plan2");
+        assert!(plan2.subagent_tasks[0].emotion_stage.is_none());
+
+        // 257 as u8 会截断成 1；必须先 try_from 再校验范围
+        let v3 = serde_json::json!({
+            "scene_brief": "场景",
+            "subagent_tasks": [{
+                "character_id": "A",
+                "brief": "演",
+                "emotion_stage": 257
+            }]
+        });
+        let plan3 = parse_plan_json(&v3).expect("plan3");
+        assert!(
+            plan3.subagent_tasks[0].emotion_stage.is_none(),
+            "257 must not truncate to stage 1"
+        );
+    }
+
+    #[test]
+    fn test_editor_tail_includes_scene_plan_and_contract() {
+        let sp = storyforge_domain::agent::ScenePlan {
+            conflict: Some("对峙".into()),
+            must_not_resolve: Some("主线谜底".into()),
+            ..Default::default()
+        };
+        let mut contract = storyforge_domain::narrative_contract::NarrativeContract::default();
+        contract
+            .must_not_reveal
+            .push("SF_SECRET_CHEN_BADGE_X91".into());
+        contract.focalizers.push("inst-lin".into());
+        let summaries: Vec<storyforge_domain::agent::RoundSummary> = vec![];
+        let tail = build_editor_tail(
+            "雨夜诊所",
+            "### Lin\n沉默。",
+            None,
+            &summaries,
+            &[],
+            Some(&sp),
+            Some(&contract),
+        );
+        let rendered = tail.joined_content();
+        assert!(
+            rendered.contains("【场景规划 ScenePlan】") && rendered.contains("对峙"),
+            "ScenePlan must be injected into editor tail: {rendered}"
+        );
+        assert!(
+            rendered.contains("主线谜底"),
+            "must_not_resolve must appear in editor tail: {rendered}"
+        );
+        assert!(
+            rendered.contains("【叙事契约 NarrativeContract】"),
+            "NarrativeContract header missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("限知第三人称") || rendered.contains("硬禁探针"),
+            "contract body missing: {rendered}"
+        );
+        // Editor tail 不应倾倒完整自然语言 secret
+        assert!(
+            !rendered.contains("SF_SECRET_CHEN_BADGE_X91"),
+            "editor tail must not dump raw secret: {rendered}"
+        );
+    }
+
     #[test]
     fn test_has_available_characters_flat_true() {
         let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, Id::new());

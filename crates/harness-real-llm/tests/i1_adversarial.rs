@@ -210,6 +210,9 @@ async fn i1_adversarial_knowledge_boundary() {
             recent_window: vec![],
             task: "Lin 独自在急诊室值班".into(),
         },
+        current_desire: None,
+        ongoing_action: None,
+        emotion_stage: None,
     };
     let lin_volatile = build_campaign_subagent_volatile(&task, &runtime, &lin_inst);
     eprintln!("Lin volatile tail 长度: {}", lin_volatile.len());

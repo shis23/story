@@ -9,6 +9,7 @@ pub mod conversation;
 pub mod llm;
 pub mod message_layout;
 pub mod mvu_translation;
+pub mod narrative_contract;
 pub mod preset;
 pub mod prompt_module;
 pub mod story_task;

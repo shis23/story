@@ -44,9 +44,14 @@ impl VolatileTail {
         self.parts.is_empty()
     }
 
+    /// 只读拼接内容（测试 / 调试注入结果；不消费 self）
+    pub fn joined_content(&self) -> String {
+        self.parts.join("\n\n")
+    }
+
     /// 拼成单条 user message 的 content
     fn into_content(self) -> String {
-        self.parts.join("\n\n")
+        self.joined_content()
     }
 }
 

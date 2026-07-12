@@ -162,6 +162,120 @@ impl From<&WorldInfoEntry> for LoreEntryLight {
 
 // ─── Plan（对应设计 §3.2 Plan）───────────────────────────────────────────
 
+/// 扩展场景规划（阶段 B / ScenePlan）。
+///
+/// 全部可选；旧 Plan JSON / Provenance 无此字段时按空处理。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScenePlan {
+    /// 本场核心冲突
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    /// 对立目标（各方想要什么）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opposing_goals: Vec<String>,
+    /// 赌注 / 失败代价
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stakes: Option<String>,
+    /// 本场节拍（短句列表）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beats: Vec<String>,
+    /// 本场复杂化 / 搅局
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complication: Option<String>,
+    /// 本场**不得**一次性解决的问题
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_not_resolve: Option<String>,
+    /// 收束时留下的出口钩子
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_hook: Option<String>,
+}
+
+impl ScenePlan {
+    /// 是否完全为空（无任何有效内容）
+    pub fn is_empty(&self) -> bool {
+        self.conflict.as_ref().is_none_or(|s| s.trim().is_empty())
+            && self.opposing_goals.iter().all(|s| s.trim().is_empty())
+            && self.stakes.as_ref().is_none_or(|s| s.trim().is_empty())
+            && self.beats.iter().all(|s| s.trim().is_empty())
+            && self
+                .complication
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+            && self
+                .must_not_resolve
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+            && self.exit_hook.as_ref().is_none_or(|s| s.trim().is_empty())
+    }
+
+    /// 渲染为短文本，供 Editor / Director tail 注入。
+    pub fn render_for_prompt(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec!["【场景规划 ScenePlan】".to_string()];
+        if let Some(c) = self
+            .conflict
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(format!("- 冲突：{c}"));
+        }
+        let goals: Vec<&str> = self
+            .opposing_goals
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !goals.is_empty() {
+            lines.push(format!("- 对立目标：{}", goals.join("；")));
+        }
+        if let Some(s) = self
+            .stakes
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(format!("- 赌注：{s}"));
+        }
+        let beats: Vec<&str> = self
+            .beats
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !beats.is_empty() {
+            lines.push(format!("- 节拍：{}", beats.join(" → ")));
+        }
+        if let Some(c) = self
+            .complication
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(format!("- 复杂化：{c}"));
+        }
+        if let Some(m) = self
+            .must_not_resolve
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(format!("- 本场不得解决：{m}"));
+        }
+        if let Some(e) = self
+            .exit_hook
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(format!("- 出口钩子：{e}"));
+        }
+        lines.join("\n")
+    }
+}
+
 /// 导演输出的 Plan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -169,6 +283,20 @@ pub struct Plan {
     pub scene_brief: String,
     /// 分配给每个子 Agent 的任务
     pub subagent_tasks: Vec<SubagentTask>,
+    /// 扩展场景规划（阶段 B）；旧数据缺省为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_plan: Option<ScenePlan>,
+}
+
+impl Plan {
+    /// 最小构造（无 ScenePlan）
+    pub fn new(scene_brief: impl Into<String>, subagent_tasks: Vec<SubagentTask>) -> Self {
+        Self {
+            scene_brief: scene_brief.into(),
+            subagent_tasks,
+            scene_plan: None,
+        }
+    }
 }
 
 /// 单个子 Agent 的任务
@@ -180,6 +308,33 @@ pub struct SubagentTask {
     pub brief: String,
     /// 专属上下文包
     pub context_package: ContextPackage,
+    /// 与用户输入无关的当前欲望（梁元 CharacterAgency 结构化吸收）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_desire: Option<String>,
+    /// 进场前已在做的事
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ongoing_action: Option<String>,
+    /// 情绪阶段 1..=6；仅幕后约束，禁止正文直说阶段名
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emotion_stage: Option<u8>,
+}
+
+impl SubagentTask {
+    /// 最小构造（无 agency 字段）
+    pub fn new(
+        character_id: impl Into<String>,
+        brief: impl Into<String>,
+        context_package: ContextPackage,
+    ) -> Self {
+        Self {
+            character_id: character_id.into(),
+            brief: brief.into(),
+            context_package,
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
+        }
+    }
 }
 
 // ─── 子 Agent 产出（Performance）与编剧产出（Draft）──────────────────────

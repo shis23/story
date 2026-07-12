@@ -981,12 +981,56 @@ pub fn build_campaign_subagent_volatile(
         }
     }
 
-    let knowledge = cr.knowledge_for_instance(inst);
-    if !knowledge.is_empty() {
+    let knowledge_entries: Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> =
+        cr.knowledge_for_instance(inst)
+            .into_iter()
+            .cloned()
+            .collect();
+    if !knowledge_entries.is_empty() {
+        let pinned = storyforge_domain::character_knowledge::render_knowledge_for_injection(
+            &knowledge_entries,
+            true,
+            32,
+            None,
+        );
+        let recent = storyforge_domain::character_knowledge::render_knowledge_for_injection(
+            &knowledge_entries,
+            false,
+            32,
+            None,
+        );
         parts.push("## 你所知道的信息\n".into());
-        for k in &knowledge {
-            parts.push(format!("- {}\n", k.knowledge_text));
+        if !pinned.is_empty() {
+            parts.push(pinned);
         }
+        if !recent.is_empty() {
+            parts.push(recent);
+        }
+        parts.push("硬约束：只能使用以上你已知信息；禁止替其他角色知道或说出其秘密。\n".into());
+    }
+
+    if let Some(desire) = task
+        .current_desire
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!(
+            "## 你当前的欲望（与用户指令无关，必须体现在行动中）\n{desire}\n"
+        ));
+    }
+    if let Some(action) = task
+        .ongoing_action
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("## 你进场前正在做的事\n{action}\n"));
+    }
+    if let Some(stage) = task.emotion_stage {
+        parts.push(format!(
+            "## 情绪阶段（幕后约束）\n按阶段 {stage}/6 演绎反应节奏；禁止在正文中写出阶段编号或阶段名称。\n"
+        ));
     }
 
     if !inst.variables.is_empty() {
@@ -1156,6 +1200,9 @@ mod tests {
                     recent_window: vec![],
                     task: "演出你的部分".into(),
                 },
+                current_desire: None,
+                ongoing_action: None,
+                emotion_stage: None,
             },
             SubagentTask {
                 character_id: "B".into(),
@@ -1168,6 +1215,9 @@ mod tests {
                     recent_window: vec![],
                     task: "演出你的部分".into(),
                 },
+                current_desire: None,
+                ongoing_action: None,
+                emotion_stage: None,
             },
         ];
 
@@ -1255,6 +1305,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
         // 6 个任务，超过并发上限 4
         let tasks: Vec<SubagentTask> = ["A", "B", "C", "D", "E", "F"]
@@ -1321,6 +1374,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -1782,6 +1838,9 @@ mod tests {
                 recent_window: vec![],
                 task: "Act now".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -1998,6 +2057,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -2057,6 +2119,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -2115,6 +2180,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -2177,6 +2245,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
 
         let (sys, instance_id) = build_campaign_subagent_system("你是角色", &task, &cr, inst);
@@ -2234,6 +2305,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
 
         let volatile = build_campaign_subagent_volatile(&task, &cr, inst);
@@ -2270,6 +2344,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
 
         // Lin 的 tail
@@ -2296,6 +2373,52 @@ mod tests {
     }
 
     /// Campaign 模式 system prompt 包含常驻世界设定
+
+    #[test]
+    fn test_campaign_volatile_includes_desire_and_private_tag() {
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, PropagationPolicy};
+
+        let mut cr = (*make_campaign_runtime()).clone();
+        let lin = cr.find_instance_by_id_or_name("inst-lin").unwrap().clone();
+        let mut secret = CharacterKnowledgeEntry::witnessed(
+            cr.campaign.id.clone(),
+            lin.id.clone(),
+            "SF_SECRET_LIN_VAULT_0427",
+            1,
+        );
+        secret.set_propagation(PropagationPolicy::Private);
+        cr.knowledge.push(secret);
+
+        let task = SubagentTask {
+            character_id: "inst-lin".into(),
+            brief: "演出".into(),
+            context_package: ContextPackage {
+                character_brief: String::new(),
+                scene_brief: "急诊室".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: "演出".into(),
+            },
+            current_desire: Some("想尽快处理完伤者".into()),
+            ongoing_action: Some("正在缝合".into()),
+            emotion_stage: Some(2),
+        };
+        let tail = build_campaign_subagent_volatile(&task, &cr, &lin);
+        assert!(tail.contains("SF_SECRET_LIN_VAULT_0427"), "tail={tail}");
+        assert!(
+            tail.contains("秘密") || tail.contains("禁止外传"),
+            "private tag missing: {tail}"
+        );
+        assert!(tail.contains("想尽快处理完伤者"), "desire missing: {tail}");
+        assert!(tail.contains("正在缝合"), "ongoing missing: {tail}");
+        assert!(tail.contains("2/6"), "stage missing: {tail}");
+        assert!(
+            tail.contains("禁止替其他角色"),
+            "hard constraint missing: {tail}"
+        );
+    }
+
     #[test]
     fn test_campaign_system_prompt_includes_constant_lore() {
         let cr = make_campaign_runtime();
@@ -2314,6 +2437,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
 
         let (sys, _) = build_campaign_subagent_system("你是角色", &task, &cr, inst);
@@ -2346,6 +2472,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -2409,6 +2538,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         };
 
         let (sys, _) = build_campaign_subagent_system("你是角色", &task, &cr, inst);
@@ -2434,6 +2566,9 @@ mod tests {
                 recent_window: vec![],
                 task: "演出你的部分".into(),
             },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
         }];
 
         let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());

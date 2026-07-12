@@ -555,7 +555,11 @@ fn c6_explain_generation() {
                     recent_window: vec![],
                     task: "检查伤员".into(),
                 },
+                current_desire: None,
+                ongoing_action: None,
+                emotion_stage: None,
             }],
+            scene_plan: None,
         }),
         subagent_results: vec![SubagentSnapshot {
             character_id: "lin".into(),

@@ -446,6 +446,18 @@ pub enum QualityWarningCode {
     FormatLeak { snippet: String },
     /// 连续性：相邻句子完全重复
     ConsecutiveRepeat { sample: String },
+    /// 破折号密度（梁元风格确定性检查）
+    EmDashDensity { count: usize },
+    /// 否后肯句式（不是……而是……）
+    NegationThenAffirmation { sample: String },
+    /// 私密知识泄漏（显式 must_not_reveal 探针出现在正文）
+    ///
+    /// `secret_fingerprint` 为探针截断 SHA-256（不落原文）。
+    PrivateKnowledgeLeak {
+        secret_fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_id: Option<String>,
+    },
 }
 
 /// 单条质量警告

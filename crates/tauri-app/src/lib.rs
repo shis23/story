@@ -2554,8 +2554,20 @@ async fn start_writing(
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
 
-        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（纯确定性规则，warn-only）
-        let quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        // B3/B DraftQualityGate：postprocess 前对草稿跑质量门禁（含 NarrativeContract 私密扫描）
+        let quality_report = {
+            let plan_ref = pipeline.session().and_then(|s| s.plan.as_ref());
+            let contract = plan_ref.map(|plan| {
+                storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                    plan,
+                    ctx.campaign_runtime.as_deref(),
+                )
+            });
+            storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+                &final_text,
+                contract.as_ref(),
+            )
+        };
         let warning_msgs: Vec<String> = quality_report
             .warnings
             .iter()
@@ -4992,8 +5004,20 @@ async fn regenerate(
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments =
             collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
-        // B3 DraftQualityGate：postprocess 前对草稿跑质量门禁（warn-only）
-        let quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate(&final_text);
+        // B3/B DraftQualityGate：postprocess 前对草稿跑质量门禁（含 NarrativeContract）
+        let quality_report = {
+            let plan_ref = pipeline.session().and_then(|s| s.plan.as_ref());
+            let contract = plan_ref.map(|plan| {
+                storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                    plan,
+                    ctx.campaign_runtime.as_deref(),
+                )
+            });
+            storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+                &final_text,
+                contract.as_ref(),
+            )
+        };
         let warning_msgs: Vec<String> = quality_report
             .warnings
             .iter()
