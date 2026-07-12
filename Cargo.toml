@@ -8,6 +8,7 @@ members = [
     "crates/infra-vector",
     "crates/infra-regex",
     "crates/infra-plugin-host",
+    "crates/infra-sqlite",
     "crates/app-logging",
     "crates/app-agent",
     "crates/app-conversation",
@@ -69,6 +70,7 @@ rand = "0.9"
 # infra 层
 storyforge-infra-regex = { path = "crates/infra-regex" }
 storyforge-infra-plugin-host = { path = "crates/infra-plugin-host" }
+storyforge-infra-sqlite = { path = "crates/infra-sqlite" }
 storyforge-app-meta = { path = "crates/app-meta" }
 
 # app 层
