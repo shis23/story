@@ -504,34 +504,38 @@ compress_batch_id?
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **部分完成（2026-07-11）**：`harness-real-llm` `m5_*` + `run-real-llm-smoke.ps1 -Suite m5`；见下「M5 实跑记录」 |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **探针已跑；验收 Inconclusive / Partial Evidence**（2026-07-12 复核定级 + SSE 嵌套 cache 修复）；见下「M5 实跑记录」 |
 
 并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
 
-### M5 实跑记录（2026-07-11，脱敏）
+### M5 实跑记录（2026-07-11 初跑 / 2026-07-12 复核定级，脱敏）
 
 | 项 | 值 |
 | --- | --- |
-| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory -- --ignored`（S1–S5 分跑） |
-| 基线 commit | `1b7db7d`（M4.2.2）+ 本轮 m5 harness |
+| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory -- --ignored`（S1–S6） |
+| 基线 | M4.2.2 + m5 harness；**SSE 流式 OpenAI 嵌套 `prompt_tokens_details.cached_tokens` 已修**（与非流式对齐） |
 | endpoint host | `cli.2529985.xyz`（OpenAI 兼容 `/v1`） |
 | model | 请求 `grok-4.5`（响应侧曾见 `grok-4.5-build`） |
-| 结论等级 | **Partial Pass**（路径/工具/压缩达标；写作轮供应商 `cached_tokens` 多为 0） |
+| 结论等级 | **M5 real-model probes executed；验收 Inconclusive / Partial Evidence**（非简单 Partial Pass） |
 
-| Suite | 结果 | 要点 |
+| Suite | 合理结论 | 要点 |
 | --- | --- | --- |
-| **S3** compress loss | **Pass** | 阈值 8 / group 4 → 2×B；covers 8；事实 token **3/3**；`get_chronicle(A0001)` 仍可读；~42s |
-| **S2** far floor | **Pass** | 注入 A0001 远楼 token + 近轮填充；**无 embedding**；`search_chronicle`/`get_chronicle` 命中；catalog=20 |
-| **S1** same-epoch cache | **Partial** | 6 轮成文全非空；各轮 **最大 prompt 请求 `system_hash` 六轮一致**（`225bab02…`）；写作轮 `cached_tokens=0`；仅 extract boot 见高 cache（~2944/3005）；harness **未 Accept** → `summaries=0`、`turn` 停在 1、catalog 空（与线上 Accept 写 Chronicle 路径不同） |
-| **S4** epoch rollover | **Partial（路径 Pass）** | inject 后 epoch `ctx-epoch-empty` → `ctx-epoch-committed-turn-25`，rev 1→2，overview/band 重建；cold/hot 写作仍 `cached=0` |
-| **S5** long session | **Pass（稳定性）** | 8/8 成文；约 41 LLM 调用；合计 prompt≈145k、completion≈41k、wall≈372s；cache 几乎仅 boot；`summaries_on_disk=0`（S1 路径；见 S6 闭环） |
-| **S6** Accept 闭环 | **Pass（路径）+ cache Partial** | 4 轮「写作→`accept_variant`→summarizer-only→落 A」：`accepted=4/4` `summarized=4/4` codes `A0001…A0004`；`fill.turn`→5、`catalog=4`；Director 最大 prompt **system_hash 四轮一致**；**写作轮 `cached_tokens` 仍全 0**；**summarizer 四轮均 `cached=128`**（稳定小命中）。说明：无 Accept 时的 catalog/turn 缺口已补；写作前缀热 cache 仍像网关/供应商侧 |
+| **S1** same-epoch cache | 生成路径 **Pass**；缓存 **Inconclusive** | 仅统计 `turn*` 写作样本（排除 boot）；`0>=0` 不再假 PASS；最大 prompt hash **≠** 可靠 Director 身份 |
+| **S2** far floor | 工具目录精确搜索 **Pass**；远记忆行为 **未验证** | 直调 `search_chronicle`/`get_chronicle`；无 embedding；**不**证 Director 召回 / near_raw 排除 |
+| **S3** compress | 分组/covers/旧 A 可读 **Pass**；B 保真须 **B-only 重跑** | 旧跑「3/3」因扫全部 summaries（含未删 A）**无效**；断言已改为 **仅 parents/B** + 不重复事实 |
+| **S4** epoch | 路径硬断言已加强；cache **Inconclusive** | 须 `epoch_id` 变、`revision` 递增、overview/band 非空（旧版仅日志） |
+| **S5** | 8 轮生成 smoke **Pass** | **不是** H+E 长会话；无 Accept/summaries；无事实连续/成本上限 |
+| **S6** | **手工记忆闭环** Pass；生产 Accept **未验证**；写作 cache **Inconclusive** | 绕过 TurnRecord/QualityGate/MutationBatch；`draft_accepted` 真失败会失败；summarizer 非流式 cache≠写作流式 cache |
 
-**参数标定建议（本轮不改生产默认）**：
+**观测缺口（已部分关闭）**：
 
-- **不调整** `compress_active_A_threshold=200` / `group_size=4`：S3 在测试阈值下事实保留满额，无证据要求改默认。
-- **不调整** `H_anchor`/`E`：S2 远楼可达；S4 能刷新 epoch。
-- **cache 结论**：S6 已排除「无 Accept / 无 catalog」主因；写作轮仍 0 cache + summarizer 固定 128 → 优先标 **供应商/网关 usage 策略**，非 system 抖动。可选后续：第二供应商对照；非必须再扩轮次。
+- 写作主链 `chat_stream` 曾只解析 DeepSeek 顶层 cache 字段，漏 OpenAI 嵌套 → 写作 `cached=0` 与 summarizer `cached=128` **不能**直接归因网关。
+- 修复后须 **重跑 S1/S6 写作样本** 才能更新 cache 结论；在此之前保持 Inconclusive。
+
+**参数标定**：
+
+- **不改** 生产 `200/4`、`H_anchor`/`E` 仍合理，但 **不等于已完成标定**（阈值 8 ≠ 200；8 轮 < 15 近正文上界）。
+- 下一步补测：B-only S3 真跑；≥20 Accept 轮跨 H+E；脱敏 JSONL 证据；可选生产 CommitTurn 探针。
 
 ---
 

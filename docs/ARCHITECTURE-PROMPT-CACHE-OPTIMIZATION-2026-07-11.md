@@ -449,14 +449,14 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 ## 10. 推荐实施顺序
 
-> **进度快照（2026-07-11）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。  
-> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4.2.2 完成**；**M5 Partial Pass** 2026-07-11，见该文实跑记录）。
+> **进度快照（2026-07-11 续）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。  
+> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4.2.2 完成**；**M5 探针 Inconclusive / Partial Evidence** 2026-07-12 复核，见该文实跑记录）。
 >
 > | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
-> | B | 部分 | QualityGate：**Error 拦截** + `force_accept`→Turn **Degraded**；Warning 不拦；Accept 旁提示/二次确认 | NarrativeContract、扩展 ScenePlan、有界自动修复 |
-> | C | **M0–M4.2.2 + M5 部分** | history-epoch + prompt catalog；near_raw；A/B/C tools；Turn 只计 A；Compressor + epoch 同锁；**m5 harness** 远楼/压缩/长会话/**Accept 闭环**真跑 | 写作轮热 cache 第二供应商对照；UnitOfWork/SQLite |
+> | B | **主结构已接** | `NarrativeContract` + `ScenePlan` 扩展；Subagent `current_desire`/`ongoing_action`/`emotion_stage`；Editor/Director 注入；QualityGate：破折号/否后肯/`PrivateKnowledgeLeak` + contract 扫描；Prompted `builtin-cot-scene-checklist`；Error 拦截 + force→Degraded | 有界自动修复（1× Editor）；Editor performance 硬红action；真实 LLM A/B |
+> | C | **M0–M4.2.2 + M5 探针** | history-epoch + prompt catalog；near_raw；A/B/C tools；Turn 只计 A；Compressor + epoch 同锁；**m5 harness** + **流式嵌套 cache 解析** | B-only 压缩重跑；生产 Accept 探针；≥H+E 长会话；UnitOfWork/SQLite |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
 ### 阶段 A：建立测量和安全边界
@@ -471,10 +471,10 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 ### 阶段 B：低风险高收益
 
-1. 增加 NarrativeContract。
-2. 扩展 ScenePlan：冲突、对立目标、stakes、beats、complication、must_not_resolve、exit_hook。
-3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（Error 拦截 + force→Degraded 已接；Warning 不拦；无自动重写）**
-4. 把梁元的角色欲望、情绪阶段和反全知思想拆入对应结构，不原样复制整份预设。
+1. 增加 NarrativeContract。 **（已落地：`domain::narrative_contract`，from_plan_and_runtime + prompt/gate 接线）**
+2. 扩展 ScenePlan：冲突、对立目标、stakes、beats、complication、must_not_resolve、exit_hook。 **（已挂 `Plan.scene_plan`；emit/parse/Editor tail 已接）**
+3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（Error 拦截 + force→Degraded 已接；Warning 不拦；已扩破折号/否后肯/私密泄漏；无自动重写）**
+4. 把梁元的角色欲望、情绪阶段和反全知思想拆入对应结构，不原样复制整份预设。 **（SubagentTask agency 字段 + Prompted 场景清单五步 CoT；未移植整份预设）**
 
 阶段 B 验收：固定知识隔离 fixture 中身份/私有知识泄漏为零；质量门禁具有稳定错误码和有界修复；真实 LLM A/B 在不显著增加延迟和费用的前提下改善目标指标。
 
@@ -485,7 +485,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
-6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 Partial Pass**（`grok-4.5`：远楼/压缩/长会话通过；写作轮 `cached_tokens` 多 0，Director system_hash 稳定）。
+6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 探针 Inconclusive / Partial Evidence**（勿把 boot cache / 未删 A 事实 / 手工 accept 写成验收通过）。
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 

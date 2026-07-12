@@ -39,12 +39,15 @@ use harness_real_llm::{HarnessEnv, require_real_llm};
 #[derive(Debug, Clone)]
 struct UsageSample {
     tag: String,
+    streaming: bool,
     prompt_tokens: u32,
     cached_tokens: u32,
     cache_creation_tokens: u32,
     completion_tokens: u32,
     request_fp16: String,
     system_hash16: String,
+    history_hash16: String,
+    tail_hash16: String,
     history_len: usize,
     tail_parts: usize,
     msg_count: usize,
@@ -75,7 +78,7 @@ impl UsageRecordingLlmClient {
         self.samples.lock().unwrap().clone()
     }
 
-    fn record(&self, req: &ChatRequest, resp: &ChatResponse, elapsed_ms: u128) {
+    fn record(&self, req: &ChatRequest, resp: &ChatResponse, elapsed_ms: u128, streaming: bool) {
         let segs = messages_segment_summary(&req.messages);
         let fp = fingerprint_messages(&req.messages);
         let usage = resp.usage.clone().unwrap_or(Usage {
@@ -87,20 +90,24 @@ impl UsageRecordingLlmClient {
         });
         let sample = UsageSample {
             tag: self.turn_tag.lock().unwrap().clone(),
+            streaming,
             prompt_tokens: usage.prompt_tokens,
             cached_tokens: usage.cached_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             completion_tokens: usage.completion_tokens,
             request_fp16: fp.chars().take(16).collect(),
             system_hash16: segs.system_hash.chars().take(16).collect(),
+            history_hash16: segs.history_hash.chars().take(16).collect(),
+            tail_hash16: segs.tail_hash.chars().take(16).collect(),
             history_len: segs.history_len,
             tail_parts: segs.tail_parts,
             msg_count: req.messages.len(),
             elapsed_ms,
         };
         eprintln!(
-            "[m5-usage] tag={} prompt={} cached={} create={} completion={} ratio={:.3} fp={} sys={} hist={} tail_parts={} msgs={} ms={} pv={}",
+            "[m5-usage] tag={} stream={} prompt={} cached={} create={} completion={} ratio={:.3} fp={} sys={} hist_h={} tail_h={} hist_n={} tail_parts={} msgs={} ms={} pv={}",
             sample.tag,
+            sample.streaming,
             sample.prompt_tokens,
             sample.cached_tokens,
             sample.cache_creation_tokens,
@@ -112,6 +119,8 @@ impl UsageRecordingLlmClient {
             },
             sample.request_fp16,
             sample.system_hash16,
+            sample.history_hash16,
+            sample.tail_hash16,
             sample.history_len,
             sample.tail_parts,
             sample.msg_count,
@@ -127,7 +136,7 @@ impl LlmClient for UsageRecordingLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let t0 = Instant::now();
         let resp = self.inner.chat(req).await?;
-        self.record(req, &resp, t0.elapsed().as_millis());
+        self.record(req, &resp, t0.elapsed().as_millis(), false);
         Ok(resp)
     }
 
@@ -139,7 +148,7 @@ impl LlmClient for UsageRecordingLlmClient {
     ) -> Result<ChatResponse, LlmError> {
         let t0 = Instant::now();
         let resp = self.inner.chat_stream(req, tx, cancel).await?;
-        self.record(req, &resp, t0.elapsed().as_millis());
+        self.record(req, &resp, t0.elapsed().as_millis(), true);
         Ok(resp)
     }
 }
@@ -245,10 +254,19 @@ fn next_chronicle_a_seq(existing: &[RoundSummary]) -> u32 {
     max_seq.saturating_add(1).max(1)
 }
 
-/// 写作 → Draft accept → summarizer → 落 Chronicle A（对齐线上 Accept 后 summary 可见性）。
+/// 手工记忆闭环结果（**不是**生产 CommitTurn/Accept）。
 ///
-/// 不走完整 TurnRecord/QualityGate/MutationBatch（那是 Tauri 层）；本探针验证
-/// **记忆侧**「成文被采纳 + A 纪要进入 store + 下一轮 fill 看见 catalog/epoch」。
+/// 绕过 TurnRecord / QualityGate / MutationBatch / `commit_turn_attempt`；
+/// 只验证 conv Draft→Final + summarizer + 直接 `add_summary` 后 catalog 可见。
+#[derive(Debug, Clone)]
+struct ManualMemoryLoopResult {
+    text: String,
+    summary: Option<String>,
+    draft_accepted: bool,
+    summary_persisted: bool,
+}
+
+/// 写作 → `conv_store.accept_variant` → summarizer → 直接落 Chronicle A。
 async fn accept_write_and_summarize(
     env: &HarnessEnv,
     campaign_id: &Id,
@@ -257,18 +275,40 @@ async fn accept_write_and_summarize(
     write_tag: &str,
     summary_tag: &str,
     recorder: &UsageRecordingLlmClient,
-) -> (String, Option<String>) {
+) -> ManualMemoryLoopResult {
     recorder.set_tag(write_tag);
     let (text, node_id) = run_turn_with_node(env, conversation_id, intent).await;
     if text.trim().is_empty() {
-        return (text, None);
+        return ManualMemoryLoopResult {
+            text,
+            summary: None,
+            draft_accepted: false,
+            summary_persisted: false,
+        };
     }
     let Some(node_id) = node_id else {
-        return (text, None);
+        return ManualMemoryLoopResult {
+            text,
+            summary: None,
+            draft_accepted: false,
+            summary_persisted: false,
+        };
     };
 
-    if let Err(e) = env.conv_store.accept_variant(conversation_id, &node_id) {
-        eprintln!("accept_variant 失败: {e}");
+    let draft_accepted = match env.conv_store.accept_variant(conversation_id, &node_id) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("accept_variant 失败: {e}");
+            false
+        }
+    };
+    if !draft_accepted {
+        return ManualMemoryLoopResult {
+            text,
+            summary: None,
+            draft_accepted: false,
+            summary_persisted: false,
+        };
     }
 
     // 用写作后的 fill 上下文（正确 turn / recent / epoch）跑 summarizer
@@ -300,6 +340,7 @@ async fn accept_write_and_summarize(
         .await;
 
     let summary_text = outcome.and_then(|o| o.summary);
+    let mut summary_persisted = false;
     if let Some(ref summary) = summary_text {
         let lineage = ensure_lineage(env, campaign_id);
         let existing = env.campaign_store.list_summaries(campaign_id);
@@ -318,21 +359,27 @@ async fn accept_write_and_summarize(
         .with_code(code.as_str())
         .with_headline(headline)
         .with_lineage(lineage);
-        if let Err(e) = env.campaign_store.add_summary(rs) {
-            eprintln!("add_summary 失败: {e}");
+        match env.campaign_store.add_summary(rs) {
+            Ok(()) => summary_persisted = true,
+            Err(e) => eprintln!("add_summary 失败: {e}"),
         }
     } else {
         eprintln!("{summary_tag}: summarizer 未产出 summary");
     }
 
-    (text, summary_text)
+    ManualMemoryLoopResult {
+        text,
+        summary: summary_text,
+        draft_accepted,
+        summary_persisted,
+    }
 }
 
 fn print_usage_table(samples: &[UsageSample]) {
     eprintln!("--- M5 usage table ---");
     eprintln!(
-        "{:<18} {:>8} {:>8} {:>8} {:>8} {:>7} {:>6}",
-        "tag", "prompt", "cached", "create", "compl", "ratio", "ms"
+        "{:<18} {:<6} {:>8} {:>8} {:>8} {:>8} {:>7} {:>6}",
+        "tag", "stream", "prompt", "cached", "create", "compl", "ratio", "ms"
     );
     for s in samples {
         let ratio = if s.prompt_tokens > 0 {
@@ -341,8 +388,9 @@ fn print_usage_table(samples: &[UsageSample]) {
             0.0
         };
         eprintln!(
-            "{:<18} {:>8} {:>8} {:>8} {:>8} {:>7.3} {:>6}",
+            "{:<18} {:<6} {:>8} {:>8} {:>8} {:>8} {:>7.3} {:>6}",
             s.tag,
+            if s.streaming { "yes" } else { "no" },
             s.prompt_tokens,
             s.cached_tokens,
             s.cache_creation_tokens,
@@ -351,6 +399,14 @@ fn print_usage_table(samples: &[UsageSample]) {
             s.elapsed_ms
         );
     }
+}
+
+/// 仅统计写作轮（tag 前缀匹配，排除 boot/extract）。
+fn writing_samples<'a>(samples: &'a [UsageSample], tag_prefix: &str) -> Vec<&'a UsageSample> {
+    samples
+        .iter()
+        .filter(|s| s.tag.starts_with(tag_prefix) && s.tag != "boot")
+        .collect()
 }
 
 fn max_cached_for_tag(samples: &[UsageSample], tag_prefix: &str) -> u32 {
@@ -413,12 +469,11 @@ fn ensure_lineage(env: &HarnessEnv, campaign_id: &Id) -> Id {
 
 /// S1：6 轮真实写作，观察同 epoch 内 `cached_tokens` 与 system 段稳定性。
 ///
-/// 通过标准（务实）：
-/// - 至少 4 轮成文非空
-/// - usage 样本非空
-/// - 后半程（turn4–6）最大 cached ≥ 前半程（turn1–3）最大 cached，**或**
-///   任一热轮 cached>0（供应商对小 prompt 可能延迟建 cache）
-/// - 同 tag 内 system_hash 在连续 Director 主请求上不无故全变（soft warn）
+/// 通过标准：
+/// - 至少 4 轮成文非空 + 写作轮 usage 样本非空
+/// - **缓存结论仅看 turn* 写作样本**（排除 boot/extract）
+/// - 写作轮全 0 cache → **Inconclusive**（不假 PASS）；有真实热命中才记 cache signal
+/// - system/history/tail hash 仅作观测（最大 prompt 请求 ≠ 可靠 Director 身份）
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s1_same_epoch_cache_hit_multi_turn() {
@@ -469,7 +524,12 @@ async fn m5_s1_same_epoch_cache_hit_multi_turn() {
     let samples = recorder.samples();
     print_usage_table(&samples);
     assert!(non_empty >= 4, "S1 至少 4 轮成文非空，实际 {non_empty}");
-    assert!(!samples.is_empty(), "S1 应录到 usage 样本");
+
+    let write_samples = writing_samples(&samples, "turn");
+    assert!(
+        !write_samples.is_empty(),
+        "S1 应录到写作轮 usage 样本（排除 boot）"
+    );
 
     let early_cached = (1..=3)
         .map(|i| max_cached_for_tag(&samples, &format!("turn{i}")))
@@ -479,28 +539,43 @@ async fn m5_s1_same_epoch_cache_hit_multi_turn() {
         .map(|i| max_cached_for_tag(&samples, &format!("turn{i}")))
         .max()
         .unwrap_or(0);
-    let any_cached = samples.iter().any(|s| s.cached_tokens > 0);
+    // 禁止用 boot/extract 的高 cache 冒充写作 cache
+    let any_write_cached = write_samples.iter().any(|s| s.cached_tokens > 0);
+    let any_stream_write_cached = write_samples
+        .iter()
+        .any(|s| s.streaming && s.cached_tokens > 0);
+    let boot_cached = samples
+        .iter()
+        .filter(|s| s.tag == "boot")
+        .map(|s| s.cached_tokens)
+        .max()
+        .unwrap_or(0);
     eprintln!(
-        "S1 cache summary: early_max_cached={early_cached} late_max_cached={late_cached} any_cached={any_cached}"
+        "S1 cache summary: early_write_max={early_cached} late_write_max={late_cached} \
+         any_write_cached={any_write_cached} any_stream_write_cached={any_stream_write_cached} \
+         boot_cached={boot_cached} (boot 不计入写作结论)"
     );
 
-    // 供应商限制：允许 any_cached 或 late>=early（含同为 0 时 soft pass + 明确日志）
-    if !any_cached {
+    if !any_write_cached {
+        // 0>=0 不得记 PASS：写作 cache 无证据 → Inconclusive
         eprintln!(
-            "S1 PARTIAL: 全轮 cached_tokens=0（可能供应商对当前前缀未建缓存或字段未返回）。\
-             不判架构失败；请对照 request_fp/system_hash 是否稳定。"
+            "S1 cache Inconclusive: 写作轮 cached_tokens 全 0（可能未命中，或历史流式嵌套 usage 漏解析；\
+             已修 SSE 后若仍为 0 再对照供应商）。生成路径本身非空即探针执行成功。"
+        );
+    } else if late_cached > early_cached || (late_cached > 0 && early_cached > 0) {
+        eprintln!(
+            "S1 cache signal: 写作轮有 cached_tokens late={late_cached} early={early_cached} \
+             stream_hit={any_stream_write_cached}"
         );
     } else {
-        assert!(
-            late_cached >= early_cached || late_cached > 0,
-            "S1: 后半程 cache 应不劣于前半程或至少有命中 late={late_cached} early={early_cached}"
+        eprintln!(
+            "S1 cache weak signal: any_write_cached 但 late({late_cached}) 未优于 early({early_cached})"
         );
-        eprintln!("S1 PASS: 观察到真实 cached_tokens 信号");
     }
 
-    // system_hash 稳定性 soft check：同 turn 内多次调用允许变（subagent）；
-    // 跨 turn 的「最大 prompt」主请求 system_hash 若完全离散则 warn。
+    // 观测：每轮最大 prompt 请求的三段 hash（身份不可靠，可能是 Editor）
     let mut per_turn_sys: Vec<String> = Vec::new();
+    let mut per_turn_hist: Vec<String> = Vec::new();
     for i in 1..=6 {
         let tag = format!("turn{i}");
         if let Some(best) = samples
@@ -509,26 +584,38 @@ async fn m5_s1_same_epoch_cache_hit_multi_turn() {
             .max_by_key(|s| s.prompt_tokens)
         {
             per_turn_sys.push(best.system_hash16.clone());
+            per_turn_hist.push(format!(
+                "{}(stream={})",
+                best.history_hash16, best.streaming
+            ));
         }
     }
     if per_turn_sys.len() >= 3 {
         let first = &per_turn_sys[0];
         let same_as_first = per_turn_sys.iter().filter(|h| *h == first).count();
         eprintln!(
-            "S1 system_hash of largest-prompt call per turn: {:?} (same_as_first={same_as_first}/{})",
+            "S1 largest-prompt system_hash per turn (NOT proven Director): {:?} same_as_first={same_as_first}/{}",
             per_turn_sys,
             per_turn_sys.len()
         );
+        eprintln!("S1 largest-prompt history_hash/stream: {per_turn_hist:?}");
     }
 
     let conv = env.conv_store.get(&conversation_id).expect("会话");
-    eprintln!("S1 nodes={} summaries={}", conv.nodes.len(), env.campaign_store.list_summaries(&campaign_id).len());
+    eprintln!(
+        "S1 generation PASS (cache separate): nodes={} summaries={} write_calls={}",
+        conv.nodes.len(),
+        env.campaign_store.list_summaries(&campaign_id).len(),
+        write_samples.len()
+    );
     env.cleanup();
 }
 
 // ─── S2: 远楼 search/get ──────────────────────────────────────────────────────
 
-/// S2：注入含唯一 token 的远楼 A + 近轮填充，验证 search/get 不依赖 embedding。
+/// S2：注入含唯一 token 的远楼 A + 近轮填充，验证 **工具目录** search/get（无 embedding）。
+///
+/// 不证明 Director 会主动召回远楼；不证明 A0001 已离开 near_raw。
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s2_far_floor_search_and_get() {
@@ -642,13 +729,19 @@ async fn m5_s2_far_floor_search_and_get() {
     );
 
     print_usage_table(&recorder.samples());
-    eprintln!("S2 PASS: 远楼 search/get 可达（无 embedding）");
+    eprintln!(
+        "S2 PASS (tool catalog): search/get 精确命中远楼 code（无 embedding）；\
+         Director 自动召回 / near_raw 排除未验证"
+    );
     env.cleanup();
 }
 
 // ─── S3: 压缩损失探针 ─────────────────────────────────────────────────────────
 
-/// S3：8 条 A（阈值 8 / group 4）→ 真 LLM 压 B → publish → 事实保留 ≥2/3。
+/// S3：8 条 A（阈值 8 / group 4）→ 真 LLM 压 B → publish。
+///
+/// - 分组/covers/旧 A 可读：硬断言
+/// - **压缩事实保真：只在 B（parents）上检测**，不得用未删 A 原文凑数
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s3_compress_loss_probe() {
@@ -658,21 +751,38 @@ async fn m5_s3_compress_loss_probe() {
     let (campaign_id, conversation_id) = setup_campaign(&env, "m5-s3-compress").await;
     let lineage = ensure_lineage(&env, &campaign_id);
 
-    const FACTS: [&str; 3] = [
-        "FACT-银鸦徽章编号-A7F2",
-        "FACT-旧码头坐标-北纬31.2",
-        "FACT-联络口令-月下无声",
+    // 每组不重复：姓名/数字/时间/否定/因果 —— 组1→B1，组2→B2
+    const GROUP1_FACTS: [&str; 3] = [
+        "FACT-G1-人名-卫岚澈",
+        "FACT-G1-数字-徽章A7F2",
+        "FACT-G1-时间-雨夜03:17",
+    ];
+    const GROUP2_FACTS: [&str; 3] = [
+        "FACT-G2-否定-绝非走私货",
+        "FACT-G2-因果-因口令错误导致伏击",
+        "FACT-G2-坐标-北纬31.208",
+    ];
+    // 每条 A 只带本组一个独有事实，避免跨组重复降低难度
+    let leaf_facts: [&str; 8] = [
+        GROUP1_FACTS[0],
+        GROUP1_FACTS[1],
+        GROUP1_FACTS[2],
+        "填充叙述-组1过渡-无关键编号",
+        GROUP2_FACTS[0],
+        GROUP2_FACTS[1],
+        GROUP2_FACTS[2],
+        "填充叙述-组2过渡-无关键编号",
     ];
 
     let mut entries = Vec::new();
     for t in 1u32..=8 {
-        let fact = FACTS[((t - 1) as usize) % FACTS.len()];
+        let fact = leaf_facts[(t - 1) as usize];
         let s = RoundSummary::new(
             campaign_id.clone(),
             conversation_id.clone(),
             t,
             format!(
-                "第{t}轮。角色推进调查。必须保留的关键事实：{fact}。其它叙述：雨势渐大，街灯闪烁。"
+                "第{t}轮纪要。必须由压缩层保留的独有事实：{fact}。其余氛围：雨势渐大，街灯闪烁，角色推进调查。"
             ),
         )
         .with_code(format!("A{t:04}"))
@@ -734,31 +844,42 @@ async fn m5_s3_compress_loss_probe() {
         parents.iter().map(|p| p.code.clone()).collect::<Vec<_>>()
     );
 
-    // 事实保留：在 B 全文或仍可读的 A summary 中
-    let blob: String = all
+    // 压缩保真：只在 B parents 的 headline+content 中找事实（禁止扫 A 原文）
+    let b_blob: String = parents
         .iter()
-        .map(|s| format!("{} {} {}", s.code.as_deref().unwrap_or(""), s.headline.as_deref().unwrap_or(""), s.content))
+        .map(|p| {
+            format!(
+                "{} {} {}",
+                p.code.as_deref().unwrap_or(""),
+                p.headline.as_deref().unwrap_or(""),
+                p.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
+    let all_probe_facts = [
+        GROUP1_FACTS[0],
+        GROUP1_FACTS[1],
+        GROUP1_FACTS[2],
+        GROUP2_FACTS[0],
+        GROUP2_FACTS[1],
+        GROUP2_FACTS[2],
+    ];
     let mut kept = 0usize;
-    for f in FACTS {
-        let hit = blob.contains(f);
-        eprintln!("S3 fact kept={hit}: {f}");
+    for f in all_probe_facts {
+        let hit = b_blob.contains(f);
+        eprintln!("S3 B-only fact kept={hit}: {f}");
         if hit {
             kept += 1;
         }
     }
+    // 6 个独有事实，压缩后期望至少保留一半（2/3 旧阈值过松且可被 A 污染）
     assert!(
-        kept >= 2,
-        "S3 事实保留应 ≥2/3，实际 {kept}/3；B 正文:\n{}",
-        parents
-            .iter()
-            .map(|p| p.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n---\n")
+        kept >= 3,
+        "S3 B-only 事实保留应 ≥3/6，实际 {kept}/6；B 正文:\n{b_blob}"
     );
 
-    // get_chronicle 旧 A 仍可读
+    // 旧 A 可读：独立断言，不计入压缩保真
     let tool_ctx = Arc::new(ToolContext {
         characters: vec![],
         world_info: None,
@@ -781,15 +902,24 @@ async fn m5_s3_compress_loss_probe() {
         .await
         .unwrap();
     assert_eq!(got["found"], true);
+    assert!(
+        got.to_string().contains(GROUP1_FACTS[0]),
+        "旧 A summary 应仍含原始事实（与 B 保真独立）"
+    );
 
     print_usage_table(&recorder.samples());
-    eprintln!("S3 PASS: covers ok + facts {kept}/3 + get A still readable");
+    eprintln!(
+        "S3 PASS: covers ok + B-only facts {kept}/6 + get A still readable (A not used for fidelity)"
+    );
     env.cleanup();
 }
 
 // ─── S4: epoch rollover 冷启动信号 ────────────────────────────────────────────
 
-/// S4：注入足够 A 触发 rollover 边界后，再跑 2 轮写作，对比 cache 冷/热。
+/// S4：注入足够 A 触发 epoch 重算后，再跑 2 轮写作。
+///
+/// 硬断言：epoch_id 变化、chronicle_revision 递增、overview/band 非空。
+/// cache 冷热仅为观测（Inconclusive 不挡路径 PASS）。
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s4_epoch_rollover_cold_warm() {
@@ -836,26 +966,48 @@ async fn m5_s4_epoch_rollover_cold_warm() {
     }
 
     // fill 触发 refresh
+    let rev_before = ctx_before.chronicle_revision;
     let ctx_mid = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx_mid = env.fill_campaign_context(ctx_mid);
     let epoch_mid = ctx_mid
         .context_epoch
         .as_ref()
         .map(|e| e.epoch_id.clone());
+    let overview_mid = ctx_mid
+        .context_epoch
+        .as_ref()
+        .map(|e| e.overview_codes.len())
+        .unwrap_or(0);
+    let band_mid = ctx_mid
+        .context_epoch
+        .as_ref()
+        .map(|e| e.band_codes.len())
+        .unwrap_or(0);
+    let rev_mid = ctx_mid.chronicle_revision;
     eprintln!(
-        "S4 after inject fill: epoch={epoch_mid:?} overview={} band={} rev={} (epoch_changed={})",
-        ctx_mid
-            .context_epoch
-            .as_ref()
-            .map(|e| e.overview_codes.len())
-            .unwrap_or(0),
-        ctx_mid
-            .context_epoch
-            .as_ref()
-            .map(|e| e.band_codes.len())
-            .unwrap_or(0),
-        ctx_mid.chronicle_revision,
+        "S4 after inject fill: epoch={epoch_mid:?} overview={overview_mid} band={band_mid} rev={rev_mid} (epoch_changed={})",
         epoch_before != epoch_mid
+    );
+
+    assert!(
+        epoch_before.is_some() && epoch_mid.is_some(),
+        "S4 注入前后都应有 context_epoch"
+    );
+    assert_ne!(
+        epoch_before, epoch_mid,
+        "S4 大量注入后 epoch_id 必须变化（rollover/refresh），before={epoch_before:?} mid={epoch_mid:?}"
+    );
+    assert!(
+        rev_mid > rev_before,
+        "S4 chronicle_revision 必须递增 before={rev_before} mid={rev_mid}"
+    );
+    assert!(
+        overview_mid > 0,
+        "S4 refresh 后 overview_codes 应非空，实际 {overview_mid}"
+    );
+    assert!(
+        band_mid > 0 || overview_mid > 0,
+        "S4 refresh 后 band/overview 至少一侧非空 band={band_mid} overview={overview_mid}"
     );
 
     recorder.set_tag("s4-cold");
@@ -885,7 +1037,6 @@ async fn m5_s4_epoch_rollover_cold_warm() {
         text_hot.len()
     );
 
-    // 不强制 hot>cold（供应商策略），但要求两次调用都有 usage 样本且成文非空
     assert!(!text_cold.trim().is_empty() || !text_hot.trim().is_empty());
     assert!(
         samples.iter().any(|s| s.tag.starts_with("s4-cold"))
@@ -898,16 +1049,20 @@ async fn m5_s4_epoch_rollover_cold_warm() {
             hot_cached >= cold_cached
         );
     } else {
-        eprintln!("S4 PARTIAL: no cached_tokens on cold/hot — record only");
+        eprintln!("S4 cache Inconclusive: cold/hot writing cached_tokens=0 — 路径断言已独立通过");
     }
 
-    eprintln!("S4 PASS(path): epoch refresh + dual write observed");
+    eprintln!(
+        "S4 PASS(path): epoch_id changed + rev {rev_before}→{rev_mid} + overview={overview_mid} band={band_mid}"
+    );
     env.cleanup();
 }
 
 // ─── S5 汇总：长会话压力（更多轮） ────────────────────────────────────────────
 
-/// 额外压力：连续 8 轮写作，输出完整 cost/latency/cache 曲线（成本不敏感场景）。
+/// 8 轮真实生成 smoke + cost/latency 曲线。
+///
+/// **不是**记忆架构长会话：无 Accept、无 summaries、未越过 H_anchor+E=15。
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s5_long_session_cost_curve() {
@@ -963,18 +1118,19 @@ async fn m5_s5_long_session_cost_curve() {
 
     assert!(ok >= 6, "S5 至少 6/8 轮非空，实际 {ok}");
     let summaries = env.campaign_store.list_summaries(&campaign_id).len();
-    eprintln!("S5 summaries_on_disk={summaries}");
+    eprintln!(
+        "S5 generation smoke PASS: summaries_on_disk={summaries} \
+         (no Accept; not H+E long-session; not fact-continuity)"
+    );
     env.cleanup();
 }
 
-// ─── S6: Accept 闭环热 cache / catalog ───────────────────────────────────────
+// ─── S6: 手工记忆闭环（非生产 Accept）────────────────────────────────────────
 
-/// S6：4 轮「写作 → accept_variant → summarizer → 落 A」。
+/// S6：4 轮「写作 → conv accept_variant → summarizer → 直接 add_summary」。
 ///
-/// 验证记忆侧闭环（相对 S1 无 Accept）：
-/// 1. summaries 随轮次增长，code 为 A0001…
-/// 2. fill 后 turn 递增、catalog 非空、epoch 有 overview
-/// 3. 记录 writing vs summary 的 cached_tokens；Director 最大 prompt 的 system_hash 稳定
+/// **不是**生产 CommitTurn（无 TurnRecord/QualityGate/MutationBatch）。
+/// 验证：draft_accepted 真成功、A 落盘、catalog/turn 可见；写作 cache 单独定级。
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s6_accept_loop_hot_cache() {
@@ -991,14 +1147,15 @@ async fn m5_s6_accept_loop_hot_cache() {
         "收束：暂避灯塔，约定次日在银鸦标记处再会",
     ];
 
-    let mut accepted = 0usize;
-    let mut summarized = 0usize;
+    let mut draft_ok = 0usize;
+    let mut summary_ok = 0usize;
+    let mut text_ok = 0usize;
     for (i, intent) in intents.iter().enumerate() {
         let n = i + 1;
         let write_tag = format!("s6w{n}");
         let sum_tag = format!("s6s{n}");
         let t0 = Instant::now();
-        let (text, summary) = accept_write_and_summarize(
+        let r = accept_write_and_summarize(
             &env,
             &campaign_id,
             &conversation_id,
@@ -1008,28 +1165,29 @@ async fn m5_s6_accept_loop_hot_cache() {
             &recorder,
         )
         .await;
-        if !text.trim().is_empty() {
-            accepted += 1;
+        if !r.text.trim().is_empty() {
+            text_ok += 1;
         }
-        if summary.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-            summarized += 1;
+        if r.draft_accepted {
+            draft_ok += 1;
+        }
+        if r.summary_persisted {
+            summary_ok += 1;
         }
         let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
         let ctx = env.fill_campaign_context(ctx);
         let n_sum = env.campaign_store.list_summaries(&campaign_id).len();
         eprintln!(
-            "S6 turn{n}: text_len={} summary_len={} wall_ms={} store_summaries={} fill_turn={} catalog={} epoch={:?} overview={}",
-            text.len(),
-            summary.as_ref().map(|s| s.len()).unwrap_or(0),
+            "S6 turn{n}: text_len={} draft_accepted={} summary_persisted={} summary_len={} wall_ms={} store_summaries={} fill_turn={} catalog={} epoch={:?}",
+            r.text.len(),
+            r.draft_accepted,
+            r.summary_persisted,
+            r.summary.as_ref().map(|s| s.len()).unwrap_or(0),
             t0.elapsed().as_millis(),
             n_sum,
             ctx.turn,
             ctx.chronicle_prompt_catalog.len(),
             ctx.context_epoch.as_ref().map(|e| e.epoch_id.clone()),
-            ctx.context_epoch
-                .as_ref()
-                .map(|e| e.overview_codes.len())
-                .unwrap_or(0),
         );
     }
 
@@ -1042,12 +1200,13 @@ async fn m5_s6_accept_loop_hot_cache() {
     let sum_cached = (1..=4)
         .map(|i| max_cached_for_tag(&samples, &format!("s6s{i}")))
         .collect::<Vec<_>>();
-    let late_write_cached = write_cached.iter().skip(1).copied().max().unwrap_or(0);
-    let early_write_cached = write_cached.first().copied().unwrap_or(0);
     let any_write_cached = write_cached.iter().any(|&c| c > 0);
     let any_sum_cached = sum_cached.iter().any(|&c| c > 0);
+    let any_stream_write = samples
+        .iter()
+        .filter(|s| s.tag.starts_with("s6w"))
+        .any(|s| s.streaming && s.cached_tokens > 0);
 
-    // Director 最大 prompt system_hash 跨 writing 轮
     let mut per_turn_sys = Vec::new();
     for i in 1..=4 {
         let tag = format!("s6w{i}");
@@ -1056,33 +1215,36 @@ async fn m5_s6_accept_loop_hot_cache() {
             .filter(|s| s.tag == tag)
             .max_by_key(|s| s.prompt_tokens)
         {
-            per_turn_sys.push(best.system_hash16.clone());
+            per_turn_sys.push(format!(
+                "{}:{}:stream={}",
+                best.system_hash16, best.history_hash16, best.streaming
+            ));
         }
     }
-    let sys_stable = per_turn_sys.len() >= 2
-        && per_turn_sys.iter().all(|h| h == &per_turn_sys[0]);
 
     let all = env.campaign_store.list_summaries(&campaign_id);
-    let codes: Vec<_> = all
-        .iter()
-        .filter_map(|s| s.code.clone())
-        .collect();
+    let codes: Vec<_> = all.iter().filter_map(|s| s.code.clone()).collect();
     let ctx_final = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx_final = env.fill_campaign_context(ctx_final);
 
     eprintln!(
-        "S6 summary: accepted={accepted}/4 summarized={summarized}/4 codes={codes:?} final_turn={} catalog={} write_cached={write_cached:?} sum_cached={sum_cached:?} sys_stable={sys_stable} sys={per_turn_sys:?}",
+        "S6 summary: text_ok={text_ok}/4 draft_accepted={draft_ok}/4 summary_persisted={summary_ok}/4 \
+         codes={codes:?} final_turn={} catalog={} write_cached={write_cached:?} sum_cached={sum_cached:?} segs={per_turn_sys:?}",
         ctx_final.turn,
         ctx_final.chronicle_prompt_catalog.len(),
     );
     eprintln!(
-        "S6 cache: any_write_cached={any_write_cached} any_sum_cached={any_sum_cached} early_write={early_write_cached} late_write={late_write_cached}"
+        "S6 cache: any_write_cached={any_write_cached} stream_write_hit={any_stream_write} any_sum_cached={any_sum_cached}"
     );
 
-    assert!(accepted >= 3, "S6 至少 3 轮成文，实际 {accepted}");
+    // draft_accepted 必须真成功，不能用「正文非空」冒充 Accept
     assert!(
-        summarized >= 2,
-        "S6 至少 2 轮 summary 落盘，实际 {summarized}"
+        draft_ok >= 3,
+        "S6 至少 3 轮 conv accept_variant 成功，实际 {draft_ok}（text_ok={text_ok}）"
+    );
+    assert!(
+        summary_ok >= 2,
+        "S6 至少 2 轮 summary 真正落盘，实际 {summary_ok}"
     );
     assert!(
         all.len() >= 2,
@@ -1091,23 +1253,21 @@ async fn m5_s6_accept_loop_hot_cache() {
     );
     assert!(
         ctx_final.turn >= 3,
-        "S6 Accept 后 fill.turn 应 ≥3，实际 {}",
+        "S6 手工闭环后 fill.turn 应 ≥3，实际 {}",
         ctx_final.turn
     );
     assert!(
         !ctx_final.chronicle_prompt_catalog.is_empty(),
-        "S6 Accept 后 prompt catalog 不应为空"
+        "S6 手工闭环后 prompt catalog 不应为空"
     );
-    if sys_stable {
-        eprintln!("S6 PASS: system_hash 稳定 + Accept/summary 闭环");
-    } else {
-        eprintln!("S6 WARN: system_hash 不完全稳定: {per_turn_sys:?}");
-    }
+    eprintln!(
+        "S6 PASS (manual memory loop, NOT production CommitTurn): draft+summary+catalog"
+    );
     if any_write_cached {
-        eprintln!("S6 cache signal on writing turns: {write_cached:?}");
+        eprintln!("S6 write cache signal: {write_cached:?} stream_hit={any_stream_write}");
     } else {
         eprintln!(
-            "S6 PARTIAL cache: writing turns still cached_tokens=0 after Accept/catalog（供应商/网关侧可能不记写作前缀 cache）"
+            "S6 write cache Inconclusive: writing turns cached_tokens=0（非流式 summarizer 命中不计入写作）"
         );
     }
 

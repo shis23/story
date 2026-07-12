@@ -90,13 +90,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. **记忆 / Context 装配规格续作**（与发布矩阵可并行）：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **v1.0** — **M0–M4.2.2 完成**；**M5 Partial Pass**（2026-07-11，`grok-4.5` @ `cli.2529985.xyz`：S2/S3/S5/S6 路径绿；S6 Accept 闭环 4/4 summary+catalog；写作轮 `cached_tokens` 仍 0、summarizer 稳定 128；见规格 M5 实跑记录）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。下一步可选：第二供应商对照热 cache；**不改** 200/4。并行：NarrativeContract/ScenePlan；UnitOfWork/SQLite。Quality Error 拦截 + force→Degraded 已接。
-2. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
-3. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
-4. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
-5. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
-6. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
-7. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
+1. **阶段 B 主结构已接**（2026-07-11）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency（desire/action/emotion_stage）+ QualityGate 破折号/否后肯/私密泄漏 + Prompted `builtin-cot-scene-checklist`。仍延后：有界自动修复（1× Editor）、Editor performance 硬红action、真实 LLM 质量 A/B。
+2. **记忆 / Context 装配**：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **M0–M4.2.2 完成**；**M5 探针已跑，验收 Inconclusive / Partial Evidence**（2026-07-12 复核：流式嵌套 cache 已修；S3 须 B-only 重跑；S6 为手工闭环非生产 Accept）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。**不改** 200/4。UnitOfWork/SQLite 仍独立。
+3. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
+4. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
+5. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
+6. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
+7. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
+8. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
 
 ## 交接注意事项
 

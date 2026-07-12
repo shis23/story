@@ -161,8 +161,9 @@ impl SseEventAccumulator {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
-                cached_tokens: u.prompt_cache_hit_tokens,
-                cache_creation_tokens: u.prompt_cache_miss_tokens,
+                // 与非流式 openai::parse_cached_tokens 同语义：DeepSeek 顶层 / OpenAI 嵌套 / Anthropic
+                cached_tokens: u.resolved_cached_tokens(),
+                cache_creation_tokens: u.resolved_cache_creation_tokens(),
             });
         }
 
@@ -201,12 +202,13 @@ pub(crate) mod openai_types {
         pub usage: Option<StreamUsage>,
     }
 
-    /// 流式 usage（结构与非流式一致，字段类型与 domain::Usage 对齐为 u32）
+    /// 流式 usage（字段类型与 domain::Usage 对齐为 u32）
     ///
-    /// A2：增加可选缓存字段。DeepSeek 流式 usage 在顶层带
-    /// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；
-    /// OpenAI 嵌套在 `prompt_tokens_details.cached_tokens` 中（流式暂不解析嵌套，
-    /// 由非流式路径的 `parse_cached_tokens` 覆盖）。
+    /// A2/M5：与非流式 `openai::parse_cached_tokens` 对齐——
+    /// DeepSeek 顶层 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；
+    /// OpenAI 嵌套 `prompt_tokens_details.cached_tokens`；
+    /// Anthropic `cache_read_input_tokens` / `cache_creation_input_tokens`。
+    /// 写作主链走 chat_stream，漏解析嵌套会把真实 cache 误报为 0。
     #[derive(Debug, Deserialize)]
     pub struct StreamUsage {
         pub prompt_tokens: u32,
@@ -219,6 +221,43 @@ pub(crate) mod openai_types {
         /// DeepSeek 缓存未命中（≈ cache creation）
         #[serde(default)]
         pub prompt_cache_miss_tokens: u32,
+        /// OpenAI 嵌套缓存细节
+        #[serde(default)]
+        pub prompt_tokens_details: Option<StreamPromptTokensDetails>,
+        /// Anthropic 缓存命中
+        #[serde(default)]
+        pub cache_read_input_tokens: u32,
+        /// Anthropic 缓存创建
+        #[serde(default)]
+        pub cache_creation_input_tokens: u32,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct StreamPromptTokensDetails {
+        #[serde(default)]
+        pub cached_tokens: u32,
+    }
+
+    impl StreamUsage {
+        /// 优先 DeepSeek 顶层，其次 OpenAI 嵌套，再次 Anthropic。
+        pub fn resolved_cached_tokens(&self) -> u32 {
+            if self.prompt_cache_hit_tokens > 0 {
+                return self.prompt_cache_hit_tokens;
+            }
+            if let Some(d) = &self.prompt_tokens_details
+                && d.cached_tokens > 0
+            {
+                return d.cached_tokens;
+            }
+            self.cache_read_input_tokens
+        }
+
+        pub fn resolved_cache_creation_tokens(&self) -> u32 {
+            if self.prompt_cache_miss_tokens > 0 {
+                return self.prompt_cache_miss_tokens;
+            }
+            self.cache_creation_input_tokens
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -362,5 +401,60 @@ mod tests {
 
         let chunk = rx.try_recv().unwrap();
         assert_eq!(chunk.delta_content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn stream_usage_resolves_openai_nested_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 215,
+            "completion_tokens": 35,
+            "total_tokens": 250,
+            "prompt_tokens_details": {"cached_tokens": 128}
+        }"#;
+        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.prompt_cache_hit_tokens, 0);
+        assert_eq!(u.resolved_cached_tokens(), 128);
+        assert_eq!(u.resolved_cache_creation_tokens(), 0);
+    }
+
+    #[test]
+    fn stream_usage_prefers_deepseek_top_level_over_nested() {
+        let json = r#"{
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_cache_hit_tokens": 800,
+            "prompt_cache_miss_tokens": 200,
+            "prompt_tokens_details": {"cached_tokens": 1}
+        }"#;
+        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.resolved_cached_tokens(), 800);
+        assert_eq!(u.resolved_cache_creation_tokens(), 200);
+    }
+
+    #[test]
+    fn stream_usage_resolves_anthropic_cache_fields() {
+        let json = r#"{
+            "prompt_tokens": 500,
+            "completion_tokens": 20,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 50
+        }"#;
+        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.resolved_cached_tokens(), 300);
+        assert_eq!(u.resolved_cache_creation_tokens(), 50);
+    }
+
+    #[test]
+    fn sse_usage_chunk_maps_openai_nested_into_domain_usage() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        // 末 chunk：choices 空 + OpenAI 嵌套 cache
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":215,"completion_tokens":35,"total_tokens":250,"prompt_tokens_details":{"cached_tokens":128}}}"#;
+        acc.on_line(format!("data: {json}").as_bytes(), &tx).unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        let usage = acc.usage.expect("usage from final chunk");
+        assert_eq!(usage.prompt_tokens, 215);
+        assert_eq!(usage.cached_tokens, 128);
+        assert_eq!(usage.completion_tokens, 35);
     }
 }
