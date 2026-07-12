@@ -1,8 +1,8 @@
 # M5 / Phase B 评估线结果
 
-> 分支：`codex/eval-m5-phaseb`  
-> 基线：`7fb1899`  
-> 日期：2026-07-13  
+> 分支：`codex/eval-m5-phaseb`
+> 基线：`7fb1899`
+> 日期：2026-07-13
 > 工作目录：`C:\tmp\storyforge-eval`
 
 ## 1. Commit 列表（相对基线）
@@ -64,10 +64,10 @@ cargo test -p harness-real-llm --test eval_m5_phaseb_deterministic --lib
 
 覆盖：
 
-1. **生产 CommitTurn Accept** — TurnRecord/Attempt、draft_hash、QualityGate 拦截/force→Degraded、MutationBatch、Campaign revision bump、Chronicle A 经 Accept 落盘、variant Final  
-2. **长会话 20 Accept** — `turns_accepted=20`，`max_near_raw = H_anchor+E = 15`，`crossed_h_plus_e=true`，早期事实仍在 store  
-3. **Phase B A/B** — 同 fixture / 同 seed；baseline 不扫 private leak；B 臂检出后 1× autofix；证据无 `SF_SECRET_*` 原文  
-4. **JSONL 脱敏** — 拒绝 `api_key` / `SF_SECRET_*` / 完整 messages 写盘  
+1. **生产 CommitTurn Accept** — TurnRecord/Attempt、draft_hash、QualityGate 拦截/force→Degraded、MutationBatch、Campaign revision bump、Chronicle A 经 Accept 落盘、variant Final
+2. **长会话 20 Accept** — `turns_accepted=20`，`max_near_raw = H_anchor+E = 15`，`crossed_h_plus_e=true`，早期事实仍在 store
+3. **Phase B A/B** — 同 fixture / 同 seed；baseline 不扫 private leak；B 臂检出后 1× autofix；证据无 `SF_SECRET_*` 原文
+4. **JSONL 脱敏** — 拒绝 `api_key` / `SF_SECRET_*` / 完整 messages 写盘
 
 ### 真实模型调用
 
@@ -113,20 +113,20 @@ cargo test -p harness-real-llm --test eval_m5_phaseb_deterministic --lib
 
 **不建议**仅凭本线宣称：
 
-- 生产参数已标定  
-- 真实模型 Phase B 质量/成本已对照完成  
-- 完整 M5 验收通过  
+- 生产参数已标定
+- 真实模型 Phase B 质量/成本已对照完成
+- 完整 M5 验收通过
 
 ### 剩余风险
 
-1. CommitTurn 探针复刻公开 store API，与 Tauri `commit_turn_attempt` 私有路径若后续漂移需同步。  
-2. 长会话确定性路径用合成 draft/summary，不验证真实 LLM 早期事实**叙述可达性**。  
-3. Phase B 真实 A/B 仍缺固定模型、温度、seed 的多采样成本矩阵。  
-4. 编译 tauri-app 时本地需要 `frontend/dist`（gitignore）；本线未改发布产物。  
+1. CommitTurn 探针复刻公开 store API，与 Tauri `commit_turn_attempt` 私有路径若后续漂移需同步。
+2. 长会话确定性路径用合成 draft/summary，不验证真实 LLM 早期事实**叙述可达性**。
+3. Phase B 真实 A/B 仍缺固定模型、温度、seed 的多采样成本矩阵。
+4. 编译 tauri-app 时本地需要 `frontend/dist`（gitignore）；本线未改发布产物。
 
 ### 后续建议
 
-1. 授权后跑：`STORYFORGE_EVAL_REAL_LLM=1` + `run-real-llm-smoke.ps1 -Suite eval`（先小预算）。  
-2. 真实 ≥20 写作+Accept 长会话（注意 token 预算）。  
-3. 固定模型参数下 Phase B 泄漏率/延迟/token 对照表写入新证据目录（仍脱敏）。  
+1. 授权后跑：`STORYFORGE_EVAL_REAL_LLM=1` + `run-real-llm-smoke.ps1 -Suite eval`（先小预算）。
+2. 真实 ≥20 写作+Accept 长会话（注意 token 预算）。
+3. 固定模型参数下 Phase B 泄漏率/延迟/token 对照表写入新证据目录（仍脱敏）。
 4. 证据足够前 **不改** 生产 `200/4` 与 `H_anchor`/`E`。
