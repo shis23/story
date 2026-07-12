@@ -450,7 +450,8 @@ mod tests {
         let mut acc = SseEventAccumulator::new();
         // 末 chunk：choices 空 + OpenAI 嵌套 cache
         let json = r#"{"choices":[],"usage":{"prompt_tokens":215,"completion_tokens":35,"total_tokens":250,"prompt_tokens_details":{"cached_tokens":128}}}"#;
-        acc.on_line(format!("data: {json}").as_bytes(), &tx).unwrap();
+        acc.on_line(format!("data: {json}").as_bytes(), &tx)
+            .unwrap();
         acc.on_line(b"", &tx).unwrap();
         let usage = acc.usage.expect("usage from final chunk");
         assert_eq!(usage.prompt_tokens, 215);

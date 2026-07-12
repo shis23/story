@@ -301,8 +301,14 @@ function Invoke-SmokeSuite {
 
     $suiteEndedAt = Get-Date
     if ($exitCode -eq 0) {
-        Write-Host ("OK: suite {0} passed." -f $SuiteName) -ForegroundColor Green
-        $status = 'PASS'
+        if ($SuiteName -eq 'm5') {
+            # M5 是真实模型探索性探针：exit 0 = 探针执行通过，不等于缓存/压缩验收通过
+            Write-Host ("OK: suite {0} probe execution passed (M5 acceptance may still be INCONCLUSIVE)." -f $SuiteName) -ForegroundColor Green
+            $status = 'PROBE_PASS'
+        } else {
+            Write-Host ("OK: suite {0} passed." -f $SuiteName) -ForegroundColor Green
+            $status = 'PASS'
+        }
     } else {
         Write-Host ("FAIL: suite {0} failed with exit code {1}." -f $SuiteName, $exitCode) -ForegroundColor Red
         $status = 'FAIL'
@@ -373,8 +379,15 @@ try {
     }
 
     Write-Host ''
+    $ranM5 = @($results | Where-Object { $_.Suite -eq 'm5' }).Count -gt 0
+    $m5ProbeOk = @($results | Where-Object { $_.Suite -eq 'm5' -and $_.ExitCode -eq 0 }).Count -gt 0
     if ($DryRun) {
         Write-Host 'Real LLM smoke dry run completed.' -ForegroundColor Green
+    } elseif ($ranM5 -and $m5ProbeOk) {
+        Write-Host 'PROBE EXECUTION PASS' -ForegroundColor Green
+        Write-Host 'M5 ACCEPTANCE: INCONCLUSIVE' -ForegroundColor Yellow
+        Write-Host 'Real LLM smoke: non-M5 suites (if any) exited 0; M5 probe executed without hard failure.' -ForegroundColor Green
+        Write-Host 'Do not treat this as cache/compress parameter calibration or production Accept proof.' -ForegroundColor Yellow
     } else {
         Write-Host 'Real LLM smoke passed.' -ForegroundColor Green
     }

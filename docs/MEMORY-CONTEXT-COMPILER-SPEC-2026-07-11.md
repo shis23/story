@@ -523,9 +523,9 @@ compress_batch_id?
 | **S1** same-epoch cache | 生成路径 **Pass**；缓存 **Inconclusive** | 仅统计 `turn*` 写作样本（排除 boot）；`0>=0` 不再假 PASS；最大 prompt hash **≠** 可靠 Director 身份 |
 | **S2** far floor | 工具目录精确搜索 **Pass**；远记忆行为 **未验证** | 直调 `search_chronicle`/`get_chronicle`；无 embedding；**不**证 Director 召回 / near_raw 排除 |
 | **S3** compress | 分组/covers/旧 A 可读 **Pass**；B 保真须 **B-only 重跑** | 旧跑「3/3」因扫全部 summaries（含未删 A）**无效**；断言已改为 **仅 parents/B** + 不重复事实 |
-| **S4** epoch | 路径硬断言已加强；cache **Inconclusive** | 须 `epoch_id` 变、`revision` 递增、overview/band 非空（旧版仅日志） |
+| **S4** epoch | 路径硬断言已加强；cache **Inconclusive** | 须 `epoch_id` 变、`revision` 递增、**overview 与 band 均非空**（独立断言，非 OR） |
 | **S5** | 8 轮生成 smoke **Pass** | **不是** H+E 长会话；无 Accept/summaries；无事实连续/成本上限 |
-| **S6** | **手工记忆闭环** Pass；生产 Accept **未验证**；写作 cache **Inconclusive** | 绕过 TurnRecord/QualityGate/MutationBatch；`draft_accepted` 真失败会失败；summarizer 非流式 cache≠写作流式 cache |
+| **S6** | **手工记忆闭环** 探针 Pass；生产 Accept **未验证**；写作 cache **Inconclusive** | 绕过 TurnRecord/QualityGate/MutationBatch；**成功率门槛** draft≥3/4、summary≥2/4（非 4/4 硬失败）；`run-real-llm-smoke -Suite m5` 打印 `PROBE EXECUTION PASS` / `M5 ACCEPTANCE: INCONCLUSIVE` |
 
 **观测缺口（已部分关闭）**：
 

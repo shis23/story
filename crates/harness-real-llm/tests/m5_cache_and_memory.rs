@@ -627,14 +627,7 @@ async fn m5_s2_far_floor_search_and_get() {
 
     const FAR_TOKEN: &str = "ZXQ-远楼密约-7719";
     // 远楼：turn 1
-    inject_leaf_a(
-        &env,
-        &campaign_id,
-        &conversation_id,
-        &lineage,
-        1,
-        FAR_TOKEN,
-    );
+    inject_leaf_a(&env, &campaign_id, &conversation_id, &lineage, 1, FAR_TOKEN);
     // 填充足够多近轮，使 near_raw 窗口挤掉 turn1（H_anchor+E=15，注入 18 条）
     for t in 2..=20 {
         inject_leaf_a(
@@ -649,19 +642,9 @@ async fn m5_s2_far_floor_search_and_get() {
 
     // 真实写作 2 轮，确保 fill 路径刷新 epoch/catalog
     recorder.set_tag("s2-turn1");
-    let _ = run_turn(
-        &env,
-        &conversation_id,
-        "继续推进当前场景，不要回顾远古密约",
-    )
-    .await;
+    let _ = run_turn(&env, &conversation_id, "继续推进当前场景，不要回顾远古密约").await;
     recorder.set_tag("s2-turn2");
-    let _ = run_turn(
-        &env,
-        &conversation_id,
-        "角色检查装备，为下一行动做准备",
-    )
-    .await;
+    let _ = run_turn(&env, &conversation_id, "角色检查装备，为下一行动做准备").await;
 
     // 直调工具（不依赖模型是否选 tool）
     let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
@@ -678,9 +661,7 @@ async fn m5_s2_far_floor_search_and_get() {
         "S2 catalog={} prompt_catalog={} epoch_overview={:?}",
         catalog.len(),
         ctx.chronicle_prompt_catalog.len(),
-        ctx.context_epoch
-            .as_ref()
-            .map(|e| e.overview_codes.len())
+        ctx.context_epoch.as_ref().map(|e| e.overview_codes.len())
     );
 
     let tool_ctx = Arc::new(ToolContext {
@@ -815,7 +796,7 @@ async fn m5_s3_compress_loss_probe() {
         entries,
         cancel,
         None,
-        Some(8),  // 测试阈值
+        Some(8),   // 测试阈值
         Some(999), // 不触发 B→C
     )
     .await
@@ -969,10 +950,7 @@ async fn m5_s4_epoch_rollover_cold_warm() {
     let rev_before = ctx_before.chronicle_revision;
     let ctx_mid = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx_mid = env.fill_campaign_context(ctx_mid);
-    let epoch_mid = ctx_mid
-        .context_epoch
-        .as_ref()
-        .map(|e| e.epoch_id.clone());
+    let epoch_mid = ctx_mid.context_epoch.as_ref().map(|e| e.epoch_id.clone());
     let overview_mid = ctx_mid
         .context_epoch
         .as_ref()
@@ -1001,29 +979,20 @@ async fn m5_s4_epoch_rollover_cold_warm() {
         rev_mid > rev_before,
         "S4 chronicle_revision 必须递增 before={rev_before} mid={rev_mid}"
     );
+    // 规格：refresh 后 overview 与 band 应同建；禁止 `band||overview` 被 overview 强断言遮蔽
     assert!(
         overview_mid > 0,
         "S4 refresh 后 overview_codes 应非空，实际 {overview_mid}"
     );
     assert!(
-        band_mid > 0 || overview_mid > 0,
-        "S4 refresh 后 band/overview 至少一侧非空 band={band_mid} overview={overview_mid}"
+        band_mid > 0,
+        "S4 refresh 后 band_codes 应非空，实际 {band_mid}"
     );
 
     recorder.set_tag("s4-cold");
-    let text_cold = run_turn(
-        &env,
-        &conversation_id,
-        "新阶段：角色抵达灯塔，重新评估局势",
-    )
-    .await;
+    let text_cold = run_turn(&env, &conversation_id, "新阶段：角色抵达灯塔，重新评估局势").await;
     recorder.set_tag("s4-hot");
-    let text_hot = run_turn(
-        &env,
-        &conversation_id,
-        "同阶段续写：灯塔内发现旧日志",
-    )
-    .await;
+    let text_hot = run_turn(&env, &conversation_id, "同阶段续写：灯塔内发现旧日志").await;
 
     let samples = recorder.samples();
     print_usage_table(&samples);
@@ -1237,20 +1206,19 @@ async fn m5_s6_accept_loop_hot_cache() {
         "S6 cache: any_write_cached={any_write_cached} stream_write_hit={any_stream_write} any_sum_cached={any_sum_cached}"
     );
 
-    // draft_accepted 必须真成功，不能用「正文非空」冒充 Accept
+    // 概率型真实模型 smoke：成功率门槛（非「任一失败即 fail」的确定性闭环）
+    // draft_ok 统计的是 accept_variant 真成功，不能用「正文非空」冒充
+    const S6_MIN_DRAFT_OK: usize = 3;
+    const S6_MIN_SUMMARY_OK: usize = 2;
     assert!(
-        draft_ok >= 3,
-        "S6 至少 3 轮 conv accept_variant 成功，实际 {draft_ok}（text_ok={text_ok}）"
+        draft_ok >= S6_MIN_DRAFT_OK,
+        "S6 成功率门槛：conv accept_variant ≥{S6_MIN_DRAFT_OK}/4，实际 {draft_ok}（text_ok={text_ok}）"
     );
     assert!(
-        summary_ok >= 2,
-        "S6 至少 2 轮 summary 真正落盘，实际 {summary_ok}"
+        summary_ok >= S6_MIN_SUMMARY_OK,
+        "S6 成功率门槛：summary 落盘 ≥{S6_MIN_SUMMARY_OK}/4，实际 {summary_ok}"
     );
-    assert!(
-        all.len() >= 2,
-        "S6 store 应有 ≥2 条 A，实际 {}",
-        all.len()
-    );
+    assert!(all.len() >= 2, "S6 store 应有 ≥2 条 A，实际 {}", all.len());
     assert!(
         ctx_final.turn >= 3,
         "S6 手工闭环后 fill.turn 应 ≥3，实际 {}",
@@ -1261,7 +1229,9 @@ async fn m5_s6_accept_loop_hot_cache() {
         "S6 手工闭环后 prompt catalog 不应为空"
     );
     eprintln!(
-        "S6 PASS (manual memory loop, NOT production CommitTurn): draft+summary+catalog"
+        "S6 PROBE EXECUTION PASS (manual memory loop, NOT production CommitTurn; \
+         thresholds draft≥{S6_MIN_DRAFT_OK} summary≥{S6_MIN_SUMMARY_OK}, not 4/4 hard): \
+         draft+summary+catalog"
     );
     if any_write_cached {
         eprintln!("S6 write cache signal: {write_cached:?} stream_hit={any_stream_write}");
