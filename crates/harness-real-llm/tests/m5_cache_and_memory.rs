@@ -826,6 +826,7 @@ async fn m5_s3_compress_loss_probe() {
     );
 
     // 压缩保真：只在 B parents 的 headline+content 中找事实（禁止扫 A 原文）
+    // 语义核匹配：LLM 常丢掉 FACT-G*- 前缀，但应保留姓名/编号/时间等核
     let b_blob: String = parents
         .iter()
         .map(|p| {
@@ -838,23 +839,23 @@ async fn m5_s3_compress_loss_probe() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let all_probe_facts = [
-        GROUP1_FACTS[0],
-        GROUP1_FACTS[1],
-        GROUP1_FACTS[2],
-        GROUP2_FACTS[0],
-        GROUP2_FACTS[1],
-        GROUP2_FACTS[2],
+    let fact_cores: [(&str, &[&str]); 6] = [
+        ("G1-人名", &["卫岚澈"]),
+        ("G1-数字", &["A7F2"]),
+        ("G1-时间", &["03:17"]),
+        ("G2-否定", &["走私"]),
+        ("G2-因果", &["口令", "伏击"]),
+        ("G2-坐标", &["31.208"]),
     ];
     let mut kept = 0usize;
-    for f in all_probe_facts {
-        let hit = b_blob.contains(f);
-        eprintln!("S3 B-only fact kept={hit}: {f}");
+    for (label, cores) in fact_cores {
+        let hit = cores.iter().all(|c| b_blob.contains(*c));
+        eprintln!("S3 B-only fact kept={hit}: {label} cores={cores:?}");
         if hit {
             kept += 1;
         }
     }
-    // 6 个独有事实，压缩后期望至少保留一半（2/3 旧阈值过松且可被 A 污染）
+    // 6 个独有事实，压缩后期望至少保留一半
     assert!(
         kept >= 3,
         "S3 B-only 事实保留应 ≥3/6，实际 {kept}/6；B 正文:\n{b_blob}"

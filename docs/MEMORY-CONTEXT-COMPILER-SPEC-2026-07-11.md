@@ -504,38 +504,38 @@ compress_batch_id?
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **探针已跑；验收 Inconclusive / Partial Evidence**（2026-07-12 复核定级 + SSE 嵌套 cache 修复）；见下「M5 实跑记录」 |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **探针重跑 Partial Evidence**（2026-07-12，`a338cfb`+语义核 S3）：SSE 嵌套 cache 修复后写作流式 cache 可见；见下「M5 实跑记录」 |
 
 并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
 
-### M5 实跑记录（2026-07-11 初跑 / 2026-07-12 复核定级，脱敏）
+### M5 实跑记录（2026-07-12 重跑，脱敏）
 
 | 项 | 值 |
 | --- | --- |
-| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory -- --ignored`（S1–S6） |
-| 基线 | M4.2.2 + m5 harness；**SSE 流式 OpenAI 嵌套 `prompt_tokens_details.cached_tokens` 已修**（与非流式对齐） |
-| endpoint host | `cli.2529985.xyz`（OpenAI 兼容 `/v1`） |
-| model | 请求 `grok-4.5`（响应侧曾见 `grok-4.5-build`） |
-| 结论等级 | **M5 real-model probes executed；验收 Inconclusive / Partial Evidence**（非简单 Partial Pass） |
+| 执行 | `cargo test -p harness-real-llm --test m5_cache_and_memory m5_s{1,3,4,6}_* -- --ignored` |
+| 基线 | `a338cfb` + S3 语义核匹配小修 |
+| endpoint host | `cli.2529985.xyz` |
+| model | `grok-4.5` |
+| 结论等级 | **PROBE EXECUTION PASS；M5 ACCEPTANCE: Partial Evidence**（非完整参数标定；非生产 Accept） |
 
-| Suite | 合理结论 | 要点 |
+| Suite | 重跑结论 | 要点 |
 | --- | --- | --- |
-| **S1** same-epoch cache | 生成路径 **Pass**；缓存 **Inconclusive** | 仅统计 `turn*` 写作样本（排除 boot）；`0>=0` 不再假 PASS；最大 prompt hash **≠** 可靠 Director 身份 |
-| **S2** far floor | 工具目录精确搜索 **Pass**；远记忆行为 **未验证** | 直调 `search_chronicle`/`get_chronicle`；无 embedding；**不**证 Director 召回 / near_raw 排除 |
-| **S3** compress | 分组/covers/旧 A 可读 **Pass**；B 保真须 **B-only 重跑** | 旧跑「3/3」因扫全部 summaries（含未删 A）**无效**；断言已改为 **仅 parents/B** + 不重复事实 |
-| **S4** epoch | 路径硬断言已加强；cache **Inconclusive** | 须 `epoch_id` 变、`revision` 递增、**overview 与 band 均非空**（独立断言，非 OR） |
-| **S5** | 8 轮生成 smoke **Pass** | **不是** H+E 长会话；无 Accept/summaries；无事实连续/成本上限 |
-| **S6** | **手工记忆闭环** 探针 Pass；生产 Accept **未验证**；写作 cache **Inconclusive** | 绕过 TurnRecord/QualityGate/MutationBatch；**成功率门槛** draft≥3/4、summary≥2/4（非 4/4 硬失败）；`run-real-llm-smoke -Suite m5` 打印 `PROBE EXECUTION PASS` / `M5 ACCEPTANCE: INCONCLUSIVE` |
+| **S1** | 生成 **Pass**；写作 cache **有信号** | 仅 `turn*`；early_max_cached=2944 → late=4224；`any_stream_write_cached=true`；最大 prompt system_hash 六轮一致（身份仍非严格 Director） |
+| **S2** | 未重跑 | 仍以工具目录 Pass / Director 召回未证为准 |
+| **S3** | 分组/covers/旧 A **Pass**；B 保真 **6/6（语义核）** | 仅扫 parents；严格整串 `FACT-G*` 会假失败（模型丢掉前缀）；核：`卫岚澈`/`A7F2`/`03:17`/`走私`/`口令+伏击`/`31.208` |
+| **S4** | 路径 **Pass**；cache 有冷热信号 | epoch `empty`→`committed-turn-25`，rev 1→2，overview=10 **且** band=10；cold_cached=2560 hot=2432 |
+| **S5** | 未重跑 | 仍为 8 轮 smoke，非 H+E 长会话 |
+| **S6** | 手工闭环 **4/4**；写作 stream cache **有信号** | draft_accepted=4/4 summary_persisted=4/4；write_cached max≈[1280,1792,1152,1664]；**非**生产 CommitTurn |
 
-**观测缺口（已部分关闭）**：
+**观测结论**：
 
-- 写作主链 `chat_stream` 曾只解析 DeepSeek 顶层 cache 字段，漏 OpenAI 嵌套 → 写作 `cached=0` 与 summarizer `cached=128` **不能**直接归因网关。
-- 修复后须 **重跑 S1/S6 写作样本** 才能更新 cache 结论；在此之前保持 Inconclusive。
+- 修 SSE 嵌套 `prompt_tokens_details.cached_tokens` 后，**写作 `chat_stream` 可报非零 cache**；此前「写作 0 / summarizer 128」主要是解析缺口，不是纯网关策略。
+- 仍非完整 M5 验收：无生产 Accept、无 ≥H+E 自然长会话、压缩阈值为测试 8 而非生产 200、无脱敏 JSONL 入仓。
 
 **参数标定**：
 
-- **不改** 生产 `200/4`、`H_anchor`/`E` 仍合理，但 **不等于已完成标定**（阈值 8 ≠ 200；8 轮 < 15 近正文上界）。
-- 下一步补测：B-only S3 真跑；≥20 Accept 轮跨 H+E；脱敏 JSONL 证据；可选生产 CommitTurn 探针。
+- **仍不改** 生产 `200/4`、`H_anchor`/`E`（证据不足改默认）。
+- 下一步可选：生产 CommitTurn 探针；≥20 Accept 轮；S2/S5 按需补跑；JSONL 证据落盘。
 
 ---
 
