@@ -2610,6 +2610,10 @@ async fn start_writing(
     // postprocess 放后台 spawn——draft_ready 后立即返回成文给前端，
     // postprocess 在后台跑（知识/变量/摘要写回），通过 event_tx 推进度。
     // 仅在有活跃 Campaign 时执行（无 Campaign 跳过，向后兼容）。
+    //
+    // auto-fix 可能改写正文：命令返回值必须用修复后的 final_text，
+    // 不能再回退到 pipeline 原始 result 里的原稿。
+    let mut response_text: Option<String> = None;
     if let Ok((final_text, draft_node_id, _)) = &result {
         // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady。
         // 注意：本地 turn_record 快照不含新 Attempt，必须捕获 attempt_id 给后续写回。
@@ -2698,15 +2702,15 @@ async fn start_writing(
             },
         )
         .await;
+        // 返回给前端的必须是 auto-fix 后的正文
+        response_text = Some(final_text.clone());
         // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash
         if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
             let report_for_attempt = quality_report.clone();
             let attempt_id = attempt_id.clone();
-            let fixed_hash = compute_draft_hash(&final_text);
             let _ = update_turn_record(&turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                    att.quality_report = Some(report_for_attempt);
-                    att.draft_hash = fixed_hash;
+                    sync_attempt_after_autofix(att, &final_text, report_for_attempt);
                 }
                 record.touch();
             });
@@ -2787,11 +2791,14 @@ async fn start_writing(
     clear_current_cancel(&app);
 
     match result {
-        Ok((text, node_id, _provenance)) => Ok(serde_json::json!({
-            "text": text,
-            "conversation_id": conversation_id.to_string(),
-            "node_id": node_id.to_string(),
-        })),
+        Ok((orig_text, node_id, _provenance)) => {
+            let text = response_text.unwrap_or(orig_text);
+            Ok(serde_json::json!({
+                "text": text,
+                "conversation_id": conversation_id.to_string(),
+                "node_id": node_id.to_string(),
+            }))
+        }
         Err(e) => {
             // Phase A: 写作失败 → TurnRecord 标 Failed（无副作用，安全失败）
             if let Some(ref turn) = turn_record {
@@ -2804,6 +2811,19 @@ async fn start_writing(
             Err(TauriCommandError::from(format!("写作失败: {e}")))
         }
     }
+}
+
+/// auto-fix 后同步 Attempt：quality_report + draft_hash 必须对齐最终正文。
+///
+/// Accept 会重新读取活动 variant 并严格比较 draft_hash；若只更新报告不更新 hash，
+/// regenerate→auto-fix→accept 会硬失败。
+fn sync_attempt_after_autofix(
+    attempt: &mut storyforge_domain::turn::TurnAttempt,
+    final_text: &str,
+    report: storyforge_domain::turn::QualityReport,
+) {
+    attempt.quality_report = Some(report);
+    attempt.draft_hash = compute_draft_hash(final_text);
 }
 
 /// 计算草稿内容的 hash（用于检测编辑后 diff 失效）。
@@ -5042,6 +5062,8 @@ async fn regenerate(
         .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
+    // auto-fix 后命令返回值必须是修复稿，且 Attempt.draft_hash 必须同步。
+    let mut response_text: Option<String> = None;
     if let Ok((text, _provenance)) = &result {
         // Phase A: regenerate 创建新 TurnAttempt,旧 Attempt Superseded
         // regenerate 的 replace_active_variant 改变了 node_id 的 active variant,
@@ -5142,7 +5164,9 @@ async fn regenerate(
             },
         )
         .await;
-        // 挂到 regenerate 新建的 Attempt
+        // 返回给前端的必须是 auto-fix 后的正文
+        response_text = Some(final_text.clone());
+        // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）
         if let (Some(campaign_id), Some(att_id)) = (&ctx.campaign_id, &regen_attempt_id)
             && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
         {
@@ -5150,7 +5174,7 @@ async fn regenerate(
             let att_id = att_id.clone();
             let _ = update_turn_record(&turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&att_id) {
-                    att.quality_report = Some(report_for_attempt);
+                    sync_attempt_after_autofix(att, &final_text, report_for_attempt);
                 }
                 record.touch();
             });
@@ -5228,7 +5252,7 @@ async fn regenerate(
     }
 
     match result {
-        Ok((text, _provenance)) => Ok(text),
+        Ok((orig_text, _provenance)) => Ok(response_text.unwrap_or(orig_text)),
         Err(e) => Err(TauriCommandError::from(format!("重 roll 失败: {e}"))),
     }
 }
@@ -10445,6 +10469,50 @@ fn collect_world_info_for_active(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sync_attempt_after_autofix_updates_hash_to_final_text() {
+        let original = "原稿含破折号——且过短";
+        let fixed = "修复后的正文足够长，并且去掉了破折号，急诊灯下林秋与陈警官对坐，雨声敲窗，空气里有消毒水味。";
+        let mut attempt = storyforge_domain::turn::TurnAttempt {
+            attempt_id: Id::new(),
+            variant_id: Id::new(),
+            draft_hash: compute_draft_hash(original),
+            status: storyforge_domain::turn::AttemptStatus::DraftReady,
+            pending_state_changes: None,
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let report = storyforge_domain::turn::QualityReport { warnings: vec![] };
+        sync_attempt_after_autofix(&mut attempt, fixed, report);
+        assert_eq!(
+            attempt.draft_hash,
+            compute_draft_hash(fixed),
+            "auto-fix 后 Attempt.draft_hash 必须等于修复稿 hash"
+        );
+        assert_ne!(
+            attempt.draft_hash,
+            compute_draft_hash(original),
+            "不能继续指向原稿 hash"
+        );
+        assert!(attempt.quality_report.is_some());
+    }
+
+    #[test]
+    fn autofix_response_must_prefer_fixed_over_original() {
+        // 模拟 start_writing/regenerate 返回选择逻辑：有 response_text 用修复稿
+        fn choose(response_text: Option<String>, original: String) -> String {
+            response_text.unwrap_or(original)
+        }
+        let original = "原稿".to_string();
+        let fixed = "修复稿".to_string();
+        assert_eq!(choose(Some(fixed.clone()), original.clone()), fixed);
+        assert_eq!(choose(None, original.clone()), original);
+    }
+
     use super::*;
     use serde::ser::Error as _;
     use std::collections::HashMap;

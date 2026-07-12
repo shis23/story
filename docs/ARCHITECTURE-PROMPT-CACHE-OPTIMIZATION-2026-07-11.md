@@ -1,8 +1,8 @@
 # StoryForge 架构、提示词与缓存优化评估
 
-> 日期：2026-07-11  
-> 范围：项目现状、架构风险、DeepSeek V4 角色扮演反馈、梁元·月食预设、提示词优化边界、KV/Prompt Cache 命中策略。  
-> 性质：评估与实施建议，不表示文中方案已经实现。  
+> 日期：2026-07-11
+> 范围：项目现状、架构风险、DeepSeek V4 角色扮演反馈、梁元·月食预设、提示词优化边界、KV/Prompt Cache 命中策略。
+> 性质：评估与实施建议，不表示文中方案已经实现。
 > 外部材料：[DeepSeek V4 用户反馈意见汇总报告（2026-05-20）](https://github.com/victorchen96/deepseek_v4_rolepaly_instruct/blob/main/deepseek_v4_feedback_report_20260520.md)。
 
 ## 1. 结论先行
@@ -367,7 +367,7 @@ Usage
 
 ## 8. ContextCompiler 建议
 
-> **落地规格 v1.0（2026-07-11）**：含精确 epoch 成员公式（`H_anchor+E`）、epoch 快照、lineage、`chronicle_revision`、Chronicle/RoundSummary/ArchivedSummary 主从、确定性分组压缩、`search_chronicle` 仅 A/B/C。以专用文档为准：  
+> **落地规格 v1.0（2026-07-11）**：含精确 epoch 成员公式（`H_anchor+E`）、epoch 快照、lineage、`chronicle_revision`、Chronicle/RoundSummary/ArchivedSummary 主从、确定性分组压缩、`search_chronicle` 仅 A/B/C。以专用文档为准：
 > [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
 下面的 P0～P6 是**内容保留优先级**：当 token budget 不足时，越靠前的内容越不能被裁掉。它不是 SillyTavern 的 injection depth，也不是最终 messages 的物理排列顺序。
@@ -449,13 +449,13 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 ## 10. 推荐实施顺序
 
-> **进度快照（2026-07-11 续）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。  
+> **进度快照（2026-07-11 续）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。
 > 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4.2.2 完成**；**M5 探针 Inconclusive / Partial Evidence** 2026-07-12 复核，见该文实跑记录）。
 >
 > | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
-> | B | **主结构+B2 已接** | `NarrativeContract` + `ScenePlan` 扩展；Subagent agency；Editor/Director 注入；QualityGate：破折号/否后肯 + **生产稳定探针** + **attribution-aware** `PrivateKnowledgeLeak`；Editor performance 硬 redaction；有界 1× Editor auto-fix；Prompted checklist；**真实 LLM smoke** `deepseek-v4-pro@cli.2529985.xyz`：knowledge/i1/t1/t3 全绿 | 结构化质量/成本 A/B 对照矩阵（非 smoke） |
+> | B | **主结构+B2 已接** | `NarrativeContract` + `ScenePlan` 扩展；Subagent agency；Editor/Director 注入；QualityGate：破折号/否后肯 + **生产稳定探针** + **文本窗口启发式 attribution** `PrivateKnowledgeLeak`；Editor performance 硬 redaction；有界 1× Editor auto-fix；Prompted checklist；**真实 LLM smoke** `deepseek-v4-pro@cli.2529985.xyz`：knowledge/i1/t1/t3 全绿 | 结构化质量/成本 A/B 对照矩阵（非 smoke） |
 > | C | **M0–M4.2.2 + M5 探针** | history-epoch + prompt catalog；near_raw；A/B/C tools；Turn 只计 A；Compressor + epoch 同锁；**m5 harness** + **流式嵌套 cache 解析** | B-only 压缩重跑；生产 Accept 探针；≥H+E 长会话；UnitOfWork/SQLite |
 > | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
 
@@ -473,11 +473,11 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 
 1. 增加 NarrativeContract。 **（已落地：`domain::narrative_contract`，from_plan_and_runtime + prompt/gate 接线；生产从 private 知识提取稳定探针 `SF_SECRET_*`/短文本）**
 2. 扩展 ScenePlan：冲突、对立目标、stakes、beats、complication、must_not_resolve、exit_hook。 **（已挂 `Plan.scene_plan`；emit/parse/Editor tail 已接）**
-3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（Error 拦截 + force→Degraded 已接；Warning 不拦；已扩破折号/否后肯；attribution-aware `PrivateKnowledgeLeak`；有界 1× Editor auto-fix；Editor performance 硬 redaction）**
+3. 增加第一版 DraftQualityGate：重复、视角、格式、连续性。 **（Error 拦截 + force→Degraded 已接；Warning 不拦；已扩破折号/否后肯；文本窗口启发式 attribution `PrivateKnowledgeLeak`；有界 1× Editor auto-fix；Editor performance 硬 redaction）**
 4. 把梁元的角色欲望、情绪阶段和反全知思想拆入对应结构，不原样复制整份预设。 **（SubagentTask agency 字段 + Prompted 场景清单五步 CoT；未移植整份预设）**
 
-阶段 B 验收：固定知识隔离 fixture 中身份/私有知识泄漏为零；质量门禁具有稳定错误码和有界修复；真实 LLM A/B 在不显著增加延迟和费用的前提下改善目标指标。  
-**当前诚实口径**：私密归属契约 + 生产稳定探针 + attribution-aware Gate + Editor redaction + 1× auto-fix 已接。  
+阶段 B 验收：固定知识隔离 fixture 中身份/私有知识泄漏为零；质量门禁具有稳定错误码和有界修复；真实 LLM A/B 在不显著增加延迟和费用的前提下改善目标指标。
+**当前诚实口径**：私密归属契约 + 生产稳定探针 + 文本窗口启发式 attribution Gate + Editor redaction + 1× auto-fix 已接。
 **真实 LLM**（2026-07-12，`deepseek-v4-pro` @ `cli.2529985.xyz`，需浏览器 UA）：`knowledge` / `i1` / `t1` / `t3` smoke 全绿。这是路径可用性证据，**不是**结构化质量/成本 A/B 矩阵。
 
 ### 阶段 C：长期上下文和缓存

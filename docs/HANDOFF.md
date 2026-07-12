@@ -90,7 +90,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke
 
 ## 下一优先级
 
-1. **阶段 B 主结构 + B2 已接**（2026-07-11/12）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency + QualityGate 破折号/否后肯 + **生产稳定探针生成（`SF_SECRET_*`/短文本）** + **attribution-aware `PrivateKnowledgeLeak`** + Editor performance 硬 redaction + 有界 1× Editor auto-fix + Prompted checklist。**真实 LLM smoke**（2026-07-12，`deepseek-v4-pro` @ `cli.2529985.xyz`）：`knowledge`/`i1`/`t1`/`t3` 全绿；结构化质量/成本 A/B 矩阵仍可补。   
+1. **阶段 B 主结构 + B2 已接**（2026-07-11/12）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency + QualityGate 破折号/否后肯 + **生产稳定探针生成（`SF_SECRET_*`/短文本）** + **文本窗口启发式 attribution `PrivateKnowledgeLeak`** + Editor performance 硬 redaction + 有界 1× Editor auto-fix + Prompted checklist。**真实 LLM smoke**（2026-07-12，`deepseek-v4-pro` @ `cli.2529985.xyz`）：`knowledge`/`i1`/`t1`/`t3` 全绿；结构化质量/成本 A/B 矩阵仍可补。
 2. **记忆 / Context 装配**：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **M0–M4.2.2 完成**；**M5 探针重跑 Partial Evidence**（2026-07-12 `grok-4.5`：S1/S6 写作流式 cache 可见；S3 B-only **实体/标识符** 6/6 非语义保真；S4 epoch+band 过；非生产 Accept / **非**参数已标定）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。**不改** 200/4。UnitOfWork/SQLite 仍独立。下一步：生产 CommitTurn、≥20 Accept 跨 H+E、脱敏 JSONL。
 3. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
 4. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
