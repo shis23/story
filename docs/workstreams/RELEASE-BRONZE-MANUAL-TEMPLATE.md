@@ -1,7 +1,7 @@
 # Bronze 人工 GUI / 真实模型证据模板
 
-> 用途：自动化无法证明的桌面 GUI 与真实模型路径。  
-> 约束：使用独立 dev-data，不读取/覆盖用户真实 Campaign。  
+> 用途：自动化无法证明的桌面 GUI 与真实模型路径。
+> 约束：使用独立 dev-data，不读取/覆盖用户真实 Campaign。
 > 证据目录建议：`artifacts/bronze/B#-YYYY-MM-DD/`
 
 ## 公共前置

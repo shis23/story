@@ -303,12 +303,7 @@ fn b4_name_collision_raw_name_must_not_masquerade_as_id_path() {
     let name_collisions = HashSet::from([String::from("Dup")]);
 
     assert!(
-        !is_postprocess_instance_present(
-            &inst_a,
-            &Id::from_str("Dup"),
-            &present,
-            &name_collisions
-        ),
+        !is_postprocess_instance_present(&inst_a, &Id::from_str("Dup"), &present, &name_collisions),
         "raw_id=name 且 name 在 collisions 中时，不得静默走 id 路放行"
     );
 }

@@ -172,12 +172,7 @@ fn attempt(
     }
 }
 
-fn knowledge_mutation(
-    campaign_id: &Id,
-    character_id: &Id,
-    text: &str,
-    turn: u32,
-) -> Mutation {
+fn knowledge_mutation(campaign_id: &Id, character_id: &Id, text: &str, turn: u32) -> Mutation {
     Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
         entry_id: Id::new(),
         campaign_id: campaign_id.clone(),
@@ -266,7 +261,10 @@ fn bronze_b2_three_turn_accept_writeback_and_reload() {
         .expect("Chen instance")
         .clone();
 
-    let conversation = convs.create(Some(card.id.as_str().to_string()), Some(campaign.id.clone()));
+    let conversation = convs.create(
+        Some(card.id.as_str().to_string()),
+        Some(campaign.id.clone()),
+    );
     let mut campaign = store.get_campaign(&campaign.id).unwrap();
     campaign.conversation_id = Some(conversation.id.clone());
     store.save_campaign(campaign.clone()).unwrap();
@@ -291,14 +289,14 @@ fn bronze_b2_three_turn_accept_writeback_and_reload() {
             .unwrap();
 
         let mut batch = MutationBatch::new(Id::new(), (turn_no - 1) as u64);
-        batch.mutations.push(Mutation::UpsertSummary(Box::new(
-            RoundSummary::new(
+        batch
+            .mutations
+            .push(Mutation::UpsertSummary(Box::new(RoundSummary::new(
                 campaign.id.clone(),
                 conversation.id.clone(),
                 turn_no,
                 format!("summary for turn {turn_no}"),
-            ),
-        )));
+            ))));
         batch.mutations.push(knowledge_mutation(
             &campaign.id,
             &lin.id,
@@ -479,7 +477,10 @@ fn bronze_b3_same_name_instance_isolation_no_silent_cross_write() {
             propagation: PropagationPolicy::Open,
         },
         2,
-        &HashSet::from([echo_a.id.as_str().to_string(), echo_b.id.as_str().to_string()]),
+        &HashSet::from([
+            echo_a.id.as_str().to_string(),
+            echo_b.id.as_str().to_string(),
+        ]),
         &collisions,
     );
     let by_id_b = normalize_knowledge_update_for_postprocess(
@@ -495,7 +496,10 @@ fn bronze_b3_same_name_instance_isolation_no_silent_cross_write() {
             propagation: PropagationPolicy::Open,
         },
         2,
-        &HashSet::from([echo_a.id.as_str().to_string(), echo_b.id.as_str().to_string()]),
+        &HashSet::from([
+            echo_a.id.as_str().to_string(),
+            echo_b.id.as_str().to_string(),
+        ]),
         &collisions,
     );
     assert_eq!(by_id_a.len(), 1);
@@ -755,11 +759,17 @@ fn bronze_regenerate_supersedes_old_attempt_and_keeps_new_accept_path() {
 
     let after = turns.get_turn(&record.turn_id).unwrap();
     assert_eq!(
-        after.find_attempt(&Id::from_str("attempt-old")).unwrap().status,
+        after
+            .find_attempt(&Id::from_str("attempt-old"))
+            .unwrap()
+            .status,
         AttemptStatus::Superseded
     );
     assert_eq!(
-        after.find_attempt(&Id::from_str("attempt-new")).unwrap().status,
+        after
+            .find_attempt(&Id::from_str("attempt-new"))
+            .unwrap()
+            .status,
         AttemptStatus::DraftReady
     );
     // P0-1: find_attempt_by_variant must return the active attempt, not the superseded one.
@@ -793,10 +803,7 @@ fn bronze_regenerate_supersedes_old_attempt_and_keeps_new_accept_path() {
         AttemptStatus::AwaitingAcceptance
     );
     assert_eq!(
-        ready
-            .find_attempt_by_variant(&node_id)
-            .unwrap()
-            .attempt_id,
+        ready.find_attempt_by_variant(&node_id).unwrap().attempt_id,
         Id::from_str("attempt-new")
     );
     assert!(
