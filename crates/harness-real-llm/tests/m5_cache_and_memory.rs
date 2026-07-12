@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use std::collections::HashMap;
+
 use storyforge_app_agent::{
     AgentRuntime, ChronicleToolBudget, run_compress_if_needed,
     tools::{ToolContext, ToolRegistry, register_director_tools},
@@ -21,10 +23,12 @@ use storyforge_app_agent::{
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
+use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmError, StreamChunk, Usage};
 use storyforge_domain::message_layout::{
     PROMPT_LAYOUT_VERSION, fingerprint_messages, messages_segment_summary,
 };
+use storyforge_domain::prompt_module::ProfileSource;
 use storyforge_infra_llm::LlmClient;
 use tokio::sync::{mpsc, watch};
 
@@ -183,6 +187,15 @@ async fn setup_campaign(env: &HarnessEnv, name: &str) -> (Id, Id) {
 }
 
 async fn run_turn(env: &HarnessEnv, conversation_id: &Id, intent: &str) -> String {
+    let (text, _node) = run_turn_with_node(env, conversation_id, intent).await;
+    text
+}
+
+async fn run_turn_with_node(
+    env: &HarnessEnv,
+    conversation_id: &Id,
+    intent: &str,
+) -> (String, Option<Id>) {
     let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
     let ctx = env.fill_campaign_context(ctx);
     let mut pipeline = env.new_pipeline();
@@ -192,12 +205,127 @@ async fn run_turn(env: &HarnessEnv, conversation_id: &Id, intent: &str) -> Strin
         .start_writing(intent.into(), &ctx, event_tx, cancel_rx)
         .await
     {
-        Ok((text, _node_id, _provenance)) => text,
+        Ok((text, node_id, _provenance)) => (text, Some(node_id)),
         Err(e) => {
             eprintln!("start_writing 失败: {e}");
-            String::new()
+            (String::new(), None)
         }
     }
+}
+
+/// 仅开 summarizer（关三合一 postprocess），降低 Accept 闭环成本。
+fn summarizer_only_profile() -> AgentProfileConfig {
+    AgentProfileConfig::new(
+        Id::from_str("m5-accept-summarizer-only"),
+        "m5-accept".into(),
+        "M5 accept-loop: summarizer only".into(),
+        HashMap::new(),
+        4,
+        false,
+        true,
+        ProfileSource::UserCreated,
+        1,
+    )
+}
+
+fn next_chronicle_a_seq(existing: &[RoundSummary]) -> u32 {
+    let mut max_seq = 0u32;
+    for s in existing {
+        if let Some(code) = s.code.as_deref() {
+            if let Some(parsed) = storyforge_domain::chronicle::ChronicleCode::parse(code)
+                && parsed.level() == Some(storyforge_domain::chronicle::ChronicleLevel::A)
+                && let Ok(n) = code[1..].parse::<u32>()
+            {
+                max_seq = max_seq.max(n);
+            }
+        } else {
+            max_seq = max_seq.max(s.turn);
+        }
+    }
+    max_seq.saturating_add(1).max(1)
+}
+
+/// 写作 → Draft accept → summarizer → 落 Chronicle A（对齐线上 Accept 后 summary 可见性）。
+///
+/// 不走完整 TurnRecord/QualityGate/MutationBatch（那是 Tauri 层）；本探针验证
+/// **记忆侧**「成文被采纳 + A 纪要进入 store + 下一轮 fill 看见 catalog/epoch」。
+async fn accept_write_and_summarize(
+    env: &HarnessEnv,
+    campaign_id: &Id,
+    conversation_id: &Id,
+    intent: &str,
+    write_tag: &str,
+    summary_tag: &str,
+    recorder: &UsageRecordingLlmClient,
+) -> (String, Option<String>) {
+    recorder.set_tag(write_tag);
+    let (text, node_id) = run_turn_with_node(env, conversation_id, intent).await;
+    if text.trim().is_empty() {
+        return (text, None);
+    }
+    let Some(node_id) = node_id else {
+        return (text, None);
+    };
+
+    if let Err(e) = env.conv_store.accept_variant(conversation_id, &node_id) {
+        eprintln!("accept_variant 失败: {e}");
+    }
+
+    // 用写作后的 fill 上下文（正确 turn / recent / epoch）跑 summarizer
+    let mut ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+    ctx = env.fill_campaign_context(ctx);
+    ctx.agent_profile_config = Some(summarizer_only_profile());
+
+    let present: Vec<String> = ctx
+        .campaign_runtime
+        .as_ref()
+        .map(|rt| rt.instances.iter().map(|i| i.name.clone()).collect())
+        .unwrap_or_default();
+
+    recorder.set_tag(summary_tag);
+    let pipeline = env.new_pipeline();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let outcome = pipeline
+        .run_postprocess(
+            &text,
+            intent,
+            &present,
+            &[],
+            &ctx,
+            &event_tx,
+            cancel_rx,
+            &[],
+        )
+        .await;
+
+    let summary_text = outcome.and_then(|o| o.summary);
+    if let Some(ref summary) = summary_text {
+        let lineage = ensure_lineage(env, campaign_id);
+        let existing = env.campaign_store.list_summaries(campaign_id);
+        let seq = next_chronicle_a_seq(&existing);
+        let code = storyforge_domain::chronicle::ChronicleCode::new(
+            storyforge_domain::chronicle::ChronicleLevel::A,
+            seq,
+        );
+        let headline = storyforge_domain::chronicle::truncate_headline(summary, 40);
+        let rs = RoundSummary::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            ctx.turn,
+            summary.clone(),
+        )
+        .with_code(code.as_str())
+        .with_headline(headline)
+        .with_lineage(lineage);
+        if let Err(e) = env.campaign_store.add_summary(rs) {
+            eprintln!("add_summary 失败: {e}");
+        }
+    } else {
+        eprintln!("{summary_tag}: summarizer 未产出 summary");
+    }
+
+    (text, summary_text)
 }
 
 fn print_usage_table(samples: &[UsageSample]) {
@@ -836,5 +964,152 @@ async fn m5_s5_long_session_cost_curve() {
     assert!(ok >= 6, "S5 至少 6/8 轮非空，实际 {ok}");
     let summaries = env.campaign_store.list_summaries(&campaign_id).len();
     eprintln!("S5 summaries_on_disk={summaries}");
+    env.cleanup();
+}
+
+// ─── S6: Accept 闭环热 cache / catalog ───────────────────────────────────────
+
+/// S6：4 轮「写作 → accept_variant → summarizer → 落 A」。
+///
+/// 验证记忆侧闭环（相对 S1 无 Accept）：
+/// 1. summaries 随轮次增长，code 为 A0001…
+/// 2. fill 后 turn 递增、catalog 非空、epoch 有 overview
+/// 3. 记录 writing vs summary 的 cached_tokens；Director 最大 prompt 的 system_hash 稳定
+#[tokio::test]
+#[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
+async fn m5_s6_accept_loop_hot_cache() {
+    let real = require_real_llm();
+    let recorder = Arc::new(UsageRecordingLlmClient::new(real));
+    let env = HarnessEnv::new(recorder.clone());
+    let (campaign_id, conversation_id) = setup_campaign(&env, "m5-s6-accept").await;
+    eprintln!("S6 campaign={campaign_id}");
+
+    let intents = [
+        "开场：雾港码头，角色发现刻着银鸦的木箱",
+        "继续：打开木箱见到旧海图，标注坐标北纬31.2",
+        "推进：追兵逼近，角色用口令「月下无声」联络接应",
+        "收束：暂避灯塔，约定次日在银鸦标记处再会",
+    ];
+
+    let mut accepted = 0usize;
+    let mut summarized = 0usize;
+    for (i, intent) in intents.iter().enumerate() {
+        let n = i + 1;
+        let write_tag = format!("s6w{n}");
+        let sum_tag = format!("s6s{n}");
+        let t0 = Instant::now();
+        let (text, summary) = accept_write_and_summarize(
+            &env,
+            &campaign_id,
+            &conversation_id,
+            intent,
+            &write_tag,
+            &sum_tag,
+            &recorder,
+        )
+        .await;
+        if !text.trim().is_empty() {
+            accepted += 1;
+        }
+        if summary.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+            summarized += 1;
+        }
+        let ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+        let ctx = env.fill_campaign_context(ctx);
+        let n_sum = env.campaign_store.list_summaries(&campaign_id).len();
+        eprintln!(
+            "S6 turn{n}: text_len={} summary_len={} wall_ms={} store_summaries={} fill_turn={} catalog={} epoch={:?} overview={}",
+            text.len(),
+            summary.as_ref().map(|s| s.len()).unwrap_or(0),
+            t0.elapsed().as_millis(),
+            n_sum,
+            ctx.turn,
+            ctx.chronicle_prompt_catalog.len(),
+            ctx.context_epoch.as_ref().map(|e| e.epoch_id.clone()),
+            ctx.context_epoch
+                .as_ref()
+                .map(|e| e.overview_codes.len())
+                .unwrap_or(0),
+        );
+    }
+
+    let samples = recorder.samples();
+    print_usage_table(&samples);
+
+    let write_cached = (1..=4)
+        .map(|i| max_cached_for_tag(&samples, &format!("s6w{i}")))
+        .collect::<Vec<_>>();
+    let sum_cached = (1..=4)
+        .map(|i| max_cached_for_tag(&samples, &format!("s6s{i}")))
+        .collect::<Vec<_>>();
+    let late_write_cached = write_cached.iter().skip(1).copied().max().unwrap_or(0);
+    let early_write_cached = write_cached.first().copied().unwrap_or(0);
+    let any_write_cached = write_cached.iter().any(|&c| c > 0);
+    let any_sum_cached = sum_cached.iter().any(|&c| c > 0);
+
+    // Director 最大 prompt system_hash 跨 writing 轮
+    let mut per_turn_sys = Vec::new();
+    for i in 1..=4 {
+        let tag = format!("s6w{i}");
+        if let Some(best) = samples
+            .iter()
+            .filter(|s| s.tag == tag)
+            .max_by_key(|s| s.prompt_tokens)
+        {
+            per_turn_sys.push(best.system_hash16.clone());
+        }
+    }
+    let sys_stable = per_turn_sys.len() >= 2
+        && per_turn_sys.iter().all(|h| h == &per_turn_sys[0]);
+
+    let all = env.campaign_store.list_summaries(&campaign_id);
+    let codes: Vec<_> = all
+        .iter()
+        .filter_map(|s| s.code.clone())
+        .collect();
+    let ctx_final = WritingContext::legacy(vec![], None, conversation_id.clone());
+    let ctx_final = env.fill_campaign_context(ctx_final);
+
+    eprintln!(
+        "S6 summary: accepted={accepted}/4 summarized={summarized}/4 codes={codes:?} final_turn={} catalog={} write_cached={write_cached:?} sum_cached={sum_cached:?} sys_stable={sys_stable} sys={per_turn_sys:?}",
+        ctx_final.turn,
+        ctx_final.chronicle_prompt_catalog.len(),
+    );
+    eprintln!(
+        "S6 cache: any_write_cached={any_write_cached} any_sum_cached={any_sum_cached} early_write={early_write_cached} late_write={late_write_cached}"
+    );
+
+    assert!(accepted >= 3, "S6 至少 3 轮成文，实际 {accepted}");
+    assert!(
+        summarized >= 2,
+        "S6 至少 2 轮 summary 落盘，实际 {summarized}"
+    );
+    assert!(
+        all.len() >= 2,
+        "S6 store 应有 ≥2 条 A，实际 {}",
+        all.len()
+    );
+    assert!(
+        ctx_final.turn >= 3,
+        "S6 Accept 后 fill.turn 应 ≥3，实际 {}",
+        ctx_final.turn
+    );
+    assert!(
+        !ctx_final.chronicle_prompt_catalog.is_empty(),
+        "S6 Accept 后 prompt catalog 不应为空"
+    );
+    if sys_stable {
+        eprintln!("S6 PASS: system_hash 稳定 + Accept/summary 闭环");
+    } else {
+        eprintln!("S6 WARN: system_hash 不完全稳定: {per_turn_sys:?}");
+    }
+    if any_write_cached {
+        eprintln!("S6 cache signal on writing turns: {write_cached:?}");
+    } else {
+        eprintln!(
+            "S6 PARTIAL cache: writing turns still cached_tokens=0 after Accept/catalog（供应商/网关侧可能不记写作前缀 cache）"
+        );
+    }
+
     env.cleanup();
 }

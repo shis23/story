@@ -524,13 +524,14 @@ compress_batch_id?
 | **S2** far floor | **Pass** | 注入 A0001 远楼 token + 近轮填充；**无 embedding**；`search_chronicle`/`get_chronicle` 命中；catalog=20 |
 | **S1** same-epoch cache | **Partial** | 6 轮成文全非空；各轮 **最大 prompt 请求 `system_hash` 六轮一致**（`225bab02…`）；写作轮 `cached_tokens=0`；仅 extract boot 见高 cache（~2944/3005）；harness **未 Accept** → `summaries=0`、`turn` 停在 1、catalog 空（与线上 Accept 写 Chronicle 路径不同） |
 | **S4** epoch rollover | **Partial（路径 Pass）** | inject 后 epoch `ctx-epoch-empty` → `ctx-epoch-committed-turn-25`，rev 1→2，overview/band 重建；cold/hot 写作仍 `cached=0` |
-| **S5** long session | **Pass（稳定性）** | 8/8 成文；约 41 LLM 调用；合计 prompt≈145k、completion≈41k、wall≈372s；cache 几乎仅 boot；`summaries_on_disk=0`（同 S1 Accept 缺口） |
+| **S5** long session | **Pass（稳定性）** | 8/8 成文；约 41 LLM 调用；合计 prompt≈145k、completion≈41k、wall≈372s；cache 几乎仅 boot；`summaries_on_disk=0`（S1 路径；见 S6 闭环） |
+| **S6** Accept 闭环 | **Pass（路径）+ cache Partial** | 4 轮「写作→`accept_variant`→summarizer-only→落 A」：`accepted=4/4` `summarized=4/4` codes `A0001…A0004`；`fill.turn`→5、`catalog=4`；Director 最大 prompt **system_hash 四轮一致**；**写作轮 `cached_tokens` 仍全 0**；**summarizer 四轮均 `cached=128`**（稳定小命中）。说明：无 Accept 时的 catalog/turn 缺口已补；写作前缀热 cache 仍像网关/供应商侧 |
 
 **参数标定建议（本轮不改生产默认）**：
 
 - **不调整** `compress_active_A_threshold=200` / `group_size=4`：S3 在测试阈值下事实保留满额，无证据要求改默认。
 - **不调整** `H_anchor`/`E`：S2 远楼可达；S4 能刷新 epoch。
-- **后续**：M5 harness 补「写作后 Accept/写 RoundSummary」闭环，再测同 epoch 热 cache；对照另一供应商是否写作轮也报 `cached_tokens`。当前写作路径 cache 空更像 **供应商/网关统计或前缀未命中策略**，不是 system 段无故抖动（S1 hash 稳定）。
+- **cache 结论**：S6 已排除「无 Accept / 无 catalog」主因；写作轮仍 0 cache + summarizer 固定 128 → 优先标 **供应商/网关 usage 策略**，非 system 抖动。可选后续：第二供应商对照；非必须再扩轮次。
 
 ---
 
