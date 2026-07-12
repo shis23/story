@@ -503,10 +503,10 @@ compress_batch_id?
 | **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化）；向量 source_* 字段；**暂不改**主写作 prompt 布局 | **完成（可独立部分）**：字段 + code/headline/lineage 分配 + 索引 metadata；加载路径缺 lineage 回填落盘 |
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
-| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.1）**：claim；Pending Accept 重试；publish/heal 进 `with_campaign_lock`；marker 校验 parent/covers 后才完成 |
+| **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
 | **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **未做**（需真 LLM） |
 
-并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.1`（防漂移假稳定）。
+并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
 
 ---
 

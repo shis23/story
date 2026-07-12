@@ -3470,9 +3470,11 @@ fn load_campaign_context_snapshot(
     // turn 只计 A；注入 recent last-K；prompt catalog 覆盖 snapshot codes；工具目录含 B/C
     let mut all_summaries = store.list_summaries(active_id);
     backfill_summary_lineage_if_needed(store, &lineage, &mut all_summaries);
-    let turn = next_writing_turn(&all_summaries);
     let (epoch_snap, _) = refresh_and_persist_context_epoch(store, &mut camp, &all_summaries);
     let _ = epoch_snap; // applied via camp.context_epoch into runtime.campaign
+    // 锁内可能已合并压缩结果：重新 list 供 catalog / turn 使用
+    let all_summaries = store.list_summaries(active_id);
+    let turn = next_writing_turn(&all_summaries);
     let chronicle_prompt_catalog =
         build_chronicle_prompt_catalog(&all_summaries, camp.context_epoch.as_ref());
     // 全量目录：get_chronicle 按 code 点名旧 A 不受 256 截断；search 仍有 limit/预算
@@ -3558,6 +3560,12 @@ fn apply_campaign_context_snapshot(
 /// - live_suffix 满 E → rollover（新 overview/band/anchor）
 /// - 同 epoch 内 overview/band 冻结
 /// - created/rollover 时 bump chronicle_revision
+///
+/// **并发边界**：与 Compressor publish/heal 共用 `with_campaign_lock`。
+/// 锁内重新读取最新 Campaign + summaries 再计算并落盘，避免用过期快照回写
+/// 覆盖压缩后的 chronicle_revision / epoch / pending marker。
+///
+/// `all_summaries` 仅作锁失败时的无落盘兜底输入；成功路径以锁内 list 为准。
 fn refresh_and_persist_context_epoch(
     store: &campaign_store::CampaignStore,
     camp: &mut storyforge_domain::campaign::Campaign,
@@ -3565,6 +3573,61 @@ fn refresh_and_persist_context_epoch(
 ) -> (
     storyforge_domain::chronicle::ContextEpochSnapshot,
     storyforge_domain::chronicle::EpochMembership,
+) {
+    let campaign_id = camp.id.clone();
+    let locked = turn_coordinator::with_campaign_lock(|| {
+        let Some(mut latest) = store.get_campaign(&campaign_id) else {
+            return Err(turn_coordinator::CommitError::CampaignNotFound(
+                campaign_id.clone(),
+            ));
+        };
+        let summaries = store.list_summaries(&campaign_id);
+        let (snap, membership, should_persist, bumped_rev) =
+            compute_context_epoch_refresh_parts(&latest, &summaries);
+
+        if should_persist {
+            latest.chronicle_revision = bumped_rev;
+            latest.context_epoch = Some(snap.clone());
+            // 不触碰 pending_compress_publication：压缩半提交仍由 heal 收口
+            store
+                .update_campaign(latest.clone())
+                .map_err(turn_coordinator::CommitError::Storage)?;
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %snap.epoch_id,
+                chronicle_revision = latest.chronicle_revision,
+                overview = snap.overview_codes.len(),
+                band = snap.band_codes.len(),
+                "context epoch refreshed under campaign lock"
+            );
+        }
+
+        *camp = store.get_campaign(&campaign_id).unwrap_or(latest);
+        Ok((snap, membership))
+    });
+
+    match locked {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "context_compiler",
+                "refresh context_epoch under lock failed: {e}; in-memory compute without persist"
+            );
+            let (snap, membership, _, _) = compute_context_epoch_refresh_parts(camp, all_summaries);
+            (snap, membership)
+        }
+    }
+}
+
+/// 纯计算：基于给定 camp/summaries 产出 snapshot + membership + 是否需要 persist + 新 revision。
+fn compute_context_epoch_refresh_parts(
+    camp: &storyforge_domain::campaign::Campaign,
+    all_summaries: &[storyforge_domain::agent::RoundSummary],
+) -> (
+    storyforge_domain::chronicle::ContextEpochSnapshot,
+    storyforge_domain::chronicle::EpochMembership,
+    bool,
+    u64,
 ) {
     use storyforge_domain::chronicle::{
         ChronicleCode, ChronicleLevel, ContextWindowParams, OverviewCandidate,
@@ -3617,28 +3680,17 @@ fn refresh_and_persist_context_epoch(
         camp.chronicle_revision,
     );
 
-    if result.should_bump_chronicle_revision() {
-        camp.bump_chronicle_revision();
+    let mut rev = camp.chronicle_revision;
+    let should_bump = result.should_bump_chronicle_revision();
+    if should_bump {
+        rev = rev.saturating_add(1);
     }
     let mut snap = result.snapshot;
-    snap.chronicle_revision = camp.chronicle_revision;
-    camp.context_epoch = Some(snap.clone());
-    if let Err(e) = store.update_campaign(camp.clone()) {
-        tracing::warn!(target: "context_compiler", "persist context_epoch failed: {e}");
-    } else {
-        tracing::debug!(
-            target: "context_compiler",
-            epoch_id = %snap.epoch_id,
-            rolled_over = result.rolled_over,
-            created = result.created,
-            live_suffix = result.membership.live_suffix_count,
-            chronicle_revision = camp.chronicle_revision,
-            overview = snap.overview_codes.len(),
-            band = snap.band_codes.len(),
-            "context epoch refreshed"
-        );
-    }
-    (snap, result.membership)
+    snap.chronicle_revision = rev;
+    // 需要落盘：新建 / rollover / bump，或 camp 尚无 epoch
+    let should_persist =
+        should_bump || result.created || result.rolled_over || camp.context_epoch.is_none();
+    (snap, result.membership, should_persist, rev)
 }
 
 /// 从指定 CampaignStore 的活跃 Campaign 组装 CampaignRuntimeContext 快照写入 ctx + tool_ctx。
@@ -3694,11 +3746,14 @@ pub fn fill_campaign_runtime_from_store(
         std::collections::HashMap::new()
     };
 
-    // M2 完整：编译入口刷新 epoch 快照（满 E 则 rollover）并落盘
+    // M2 完整：编译入口刷新 epoch 快照（满 E 则 rollover）并落盘（锁内重读）
     let (epoch_snap, _membership) =
         refresh_and_persist_context_epoch(store, &mut camp, &all_summaries);
     ctx.context_epoch = Some(epoch_snap);
     ctx.chronicle_revision = camp.chronicle_revision;
+    // 刷新后重读 summaries（压缩可能已在锁窗口内发布）
+    let all_summaries = store.list_summaries(active_id);
+    ctx.turn = next_writing_turn(&all_summaries);
 
     let runtime = Arc::new(CampaignRuntimeContext {
         campaign: camp,

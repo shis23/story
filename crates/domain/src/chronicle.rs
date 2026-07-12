@@ -34,7 +34,7 @@ pub const DEFAULT_TOOL_FULL_MAX: u32 = 2;
 /// 每轮 search_chronicle 上限。
 pub const DEFAULT_SEARCH_MAX: u32 = 3;
 /// Compiler / snapshot 算法版本（防漂移假稳定）。
-pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.2.1";
+pub const CONTEXT_COMPILER_VERSION: &str = "memory-spec-v1.0-m4.2.2";
 
 /// 压缩发布意图（磁盘侧半提交恢复用）。
 ///
