@@ -285,6 +285,34 @@ fn b4_present_chars_name_id_matching() {
     );
 }
 
+/// P4 同名收紧：Agent 给的是角色名（raw_id=name），present 也只含该 name 时，
+/// 不得把 name 误判为 id 路从而绕过 name_collisions。
+#[test]
+fn b4_name_collision_raw_name_must_not_masquerade_as_id_path() {
+    let inst_a = CharacterInstance {
+        id: Id::from_str("inst-a"),
+        campaign_id: Id::from_str("camp-1"),
+        definition_id: None,
+        name: "Dup".into(),
+        persona_override: None,
+        behavior_override: None,
+        variables: vec![],
+        is_temporary: false,
+    };
+    let present = HashSet::from([String::from("Dup")]);
+    let name_collisions = HashSet::from([String::from("Dup")]);
+
+    assert!(
+        !is_postprocess_instance_present(
+            &inst_a,
+            &Id::from_str("Dup"),
+            &present,
+            &name_collisions
+        ),
+        "raw_id=name 且 name 在 collisions 中时，不得静默走 id 路放行"
+    );
+}
+
 /// P4 同名收紧：若两个 instance 同名且 name 在 name_collisions 中，name 路失效。
 /// 只有 id 在 present 中的那个 instance 通过。
 #[test]

@@ -4877,8 +4877,12 @@ pub fn is_postprocess_instance_present(
         );
         return true;
     }
-    // id 路优先（精确匹配）
-    if present_ids.contains(raw_id.as_str()) || present_ids.contains(inst.id.as_str()) {
+    // id 路：只认 instance id（或 raw_id 本身就是该 instance id）。
+    // 不能把 raw_id 的任意字符串命中 present 都当 id 路——同名碰撞时 Agent 常给角色名，
+    // 若把 name 当成 id 命中，会绕过下面的 name_collisions 收紧并静默写到第一个同名目标。
+    if present_ids.contains(inst.id.as_str())
+        || (raw_id == &inst.id && present_ids.contains(raw_id.as_str()))
+    {
         return true;
     }
     // name 路兜底：P4 同名收紧——campaign 内存在同名 instance 时 name 路失效，逼 id
