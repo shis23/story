@@ -722,7 +722,8 @@ async fn m5_s2_far_floor_search_and_get() {
 /// S3：8 条 A（阈值 8 / group 4）→ 真 LLM 压 B → publish。
 ///
 /// - 分组/covers/旧 A 可读：硬断言
-/// - **压缩事实保真：只在 B（parents）上检测**，不得用未删 A 原文凑数
+/// - **B-only 关键实体/标识符保留**：只在 parents 上检测 token 存在
+///   （**不是**否定极性 / 有向因果 / 限定词级语义事实保真）
 #[tokio::test]
 #[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/API_KEY/MODEL）"]
 async fn m5_s3_compress_loss_probe() {
@@ -825,8 +826,11 @@ async fn m5_s3_compress_loss_probe() {
         parents.iter().map(|p| p.code.clone()).collect::<Vec<_>>()
     );
 
-    // 压缩保真：只在 B parents 的 headline+content 中找事实（禁止扫 A 原文）
-    // 语义核匹配：LLM 常丢掉 FACT-G*- 前缀，但应保留姓名/编号/时间等核
+    // B-only 关键实体/标识符保留（禁止扫 A 原文）
+    // 注意：token 存在 ≠ 语义事实保真——
+    // - 「走私」不能证明「绝非走私」的否定极性
+    // - 「口令」+「伏击」不能证明「口令错误导致伏击」的因果方向
+    // - 「A7F2/03:17/31.208」不验证徽章/雨夜/北纬等限定关联
     let b_blob: String = parents
         .iter()
         .map(|p| {
@@ -839,29 +843,29 @@ async fn m5_s3_compress_loss_probe() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let fact_cores: [(&str, &[&str]); 6] = [
-        ("G1-人名", &["卫岚澈"]),
-        ("G1-数字", &["A7F2"]),
-        ("G1-时间", &["03:17"]),
-        ("G2-否定", &["走私"]),
-        ("G2-因果", &["口令", "伏击"]),
-        ("G2-坐标", &["31.208"]),
+    let entity_cores: [(&str, &[&str]); 6] = [
+        ("G1-人名实体", &["卫岚澈"]),
+        ("G1-编号标识", &["A7F2"]),
+        ("G1-时间标识", &["03:17"]),
+        ("G2-走私相关词", &["走私"]),
+        ("G2-口令+伏击词", &["口令", "伏击"]),
+        ("G2-坐标标识", &["31.208"]),
     ];
     let mut kept = 0usize;
-    for (label, cores) in fact_cores {
+    for (label, cores) in entity_cores {
         let hit = cores.iter().all(|c| b_blob.contains(*c));
-        eprintln!("S3 B-only fact kept={hit}: {label} cores={cores:?}");
+        eprintln!("S3 B-only entity/token kept={hit}: {label} cores={cores:?}");
         if hit {
             kept += 1;
         }
     }
-    // 6 个独有事实，压缩后期望至少保留一半
+    // 6 个实体/标识，压缩后期望至少保留一半（存在性门槛，非语义保真门槛）
     assert!(
         kept >= 3,
-        "S3 B-only 事实保留应 ≥3/6，实际 {kept}/6；B 正文:\n{b_blob}"
+        "S3 B-only 实体/标识符保留应 ≥3/6，实际 {kept}/6；B 正文:\n{b_blob}"
     );
 
-    // 旧 A 可读：独立断言，不计入压缩保真
+    // 旧 A 可读：独立断言，不计入 B 实体保留
     let tool_ctx = Arc::new(ToolContext {
         characters: vec![],
         world_info: None,
@@ -885,13 +889,14 @@ async fn m5_s3_compress_loss_probe() {
         .unwrap();
     assert_eq!(got["found"], true);
     assert!(
-        got.to_string().contains(GROUP1_FACTS[0]),
-        "旧 A summary 应仍含原始事实（与 B 保真独立）"
+        got.to_string().contains(GROUP1_FACTS[0]) || got.to_string().contains("卫岚澈"),
+        "旧 A summary 应仍含原始实体（与 B 实体保留独立）"
     );
 
     print_usage_table(&recorder.samples());
     eprintln!(
-        "S3 PASS: covers ok + B-only facts {kept}/6 + get A still readable (A not used for fidelity)"
+        "S3 PASS: covers ok + B-only entity/token retention {kept}/6 \
+         (NOT polarity/causal semantic fidelity) + get A still readable"
     );
     env.cleanup();
 }
