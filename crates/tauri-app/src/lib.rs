@@ -2704,16 +2704,27 @@ async fn start_writing(
         .await;
         // 返回给前端的必须是 auto-fix 后的正文
         response_text = Some(final_text.clone());
-        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash
+        // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash。
+        // 关键同步失败必须传播：否则命令返回修复稿但 Attempt 仍指原稿 hash，Accept 会硬失败。
         if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
             let report_for_attempt = quality_report.clone();
             let attempt_id = attempt_id.clone();
-            let _ = update_turn_record(&turn.turn_id, |record| {
+            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&attempt_id) {
                     sync_attempt_after_autofix(att, &final_text, report_for_attempt);
                 }
                 record.touch();
-            });
+            }) {
+                let _ = update_turn_record(&turn.turn_id, |record| {
+                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                    record.failure_reason = Some(format!("auto-fix 后 Attempt 同步失败: {e}"));
+                    record.touch();
+                });
+                clear_current_cancel(&app);
+                return Err(TauriCommandError::internal(format!(
+                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
+                )));
+            }
         }
 
         // postprocess 后台跑，不阻塞 start_writing 返回。
@@ -2792,7 +2803,7 @@ async fn start_writing(
 
     match result {
         Ok((orig_text, node_id, _provenance)) => {
-            let text = response_text.unwrap_or(orig_text);
+            let text = prefer_autofix_response_text(response_text, orig_text);
             Ok(serde_json::json!({
                 "text": text,
                 "conversation_id": conversation_id.to_string(),
@@ -2811,6 +2822,11 @@ async fn start_writing(
             Err(TauriCommandError::from(format!("写作失败: {e}")))
         }
     }
+}
+
+/// 命令响应优先使用 auto-fix 后的正文；无修复时回退 pipeline 原稿。
+fn prefer_autofix_response_text(response_text: Option<String>, original: String) -> String {
+    response_text.unwrap_or(original)
 }
 
 /// auto-fix 后同步 Attempt：quality_report + draft_hash 必须对齐最终正文。
@@ -5166,18 +5182,30 @@ async fn regenerate(
         .await;
         // 返回给前端的必须是 auto-fix 后的正文
         response_text = Some(final_text.clone());
-        // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）
+        // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）。
+        // 关键同步失败必须传播，不能 best-effort 返回修复稿却留下原稿 hash。
         if let (Some(campaign_id), Some(att_id)) = (&ctx.campaign_id, &regen_attempt_id)
             && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
         {
             let report_for_attempt = quality_report.clone();
             let att_id = att_id.clone();
-            let _ = update_turn_record(&turn.turn_id, |record| {
+            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
                 if let Some(att) = record.find_attempt_mut(&att_id) {
                     sync_attempt_after_autofix(att, &final_text, report_for_attempt);
                 }
                 record.touch();
-            });
+            }) {
+                let _ = update_turn_record(&turn.turn_id, |record| {
+                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                    record.failure_reason =
+                        Some(format!("regenerate auto-fix 后 Attempt 同步失败: {e}"));
+                    record.touch();
+                });
+                clear_current_cancel(&app);
+                return Err(TauriCommandError::internal(format!(
+                    "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
+                )));
+            }
         }
 
         let outcome = pipeline
@@ -5252,7 +5280,7 @@ async fn regenerate(
     }
 
     match result {
-        Ok((orig_text, _provenance)) => Ok(response_text.unwrap_or(orig_text)),
+        Ok((orig_text, _provenance)) => Ok(prefer_autofix_response_text(response_text, orig_text)),
         Err(e) => Err(TauriCommandError::from(format!("重 roll 失败: {e}"))),
     }
 }
@@ -10503,14 +10531,17 @@ mod tests {
 
     #[test]
     fn autofix_response_must_prefer_fixed_over_original() {
-        // 模拟 start_writing/regenerate 返回选择逻辑：有 response_text 用修复稿
-        fn choose(response_text: Option<String>, original: String) -> String {
-            response_text.unwrap_or(original)
-        }
+        // 直接测生产 helper，防止命令再次回退到原稿
         let original = "原稿".to_string();
         let fixed = "修复稿".to_string();
-        assert_eq!(choose(Some(fixed.clone()), original.clone()), fixed);
-        assert_eq!(choose(None, original.clone()), original);
+        assert_eq!(
+            prefer_autofix_response_text(Some(fixed.clone()), original.clone()),
+            fixed
+        );
+        assert_eq!(
+            prefer_autofix_response_text(None, original.clone()),
+            original
+        );
     }
 
     use super::*;
