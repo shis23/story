@@ -12,6 +12,17 @@
 //! 凭证：环境变量优先回退——有 `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL` 用之；
 //! 否则读 `data/connections.json` 的 active 连接。真实 LLM 测试一律 `#[ignore]`，
 //! 由 `require_real_llm()` 早返保护，`cargo test` 默认零网络。
+//!
+//! M5 / Phase B 评估扩展：
+//! - [`evidence`] 脱敏 JSONL 证据
+//! - [`commit_probe`] 生产忠实 CommitTurn/Accept
+//! - [`long_session`] ≥20 Accept 跨 H_anchor+E
+//! - [`phase_b_matrix`] Phase B A/B 对照矩阵
+
+pub mod commit_probe;
+pub mod evidence;
+pub mod long_session;
+pub mod phase_b_matrix;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};

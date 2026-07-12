@@ -83,6 +83,10 @@ $SuiteDefinitions = [ordered]@{
         Description = 'M5 memory/cache/far-floor/compress real LLM matrix'
         Filter = 'm5_'
     }
+    eval = @{
+        Description = 'M5/Phase B evaluation harness (CommitTurn, long-session, A/B matrix); requires STORYFORGE_EVAL_REAL_LLM=1'
+        Filter = 'eval_'
+    }
 }
 
 function Find-RepoRoot {
@@ -301,9 +305,9 @@ function Invoke-SmokeSuite {
 
     $suiteEndedAt = Get-Date
     if ($exitCode -eq 0) {
-        if ($SuiteName -eq 'm5') {
-            # M5 是真实模型探索性探针：exit 0 = 探针执行通过，不等于缓存/压缩验收通过
-            Write-Host ("OK: suite {0} probe execution passed (M5 acceptance may still be INCONCLUSIVE)." -f $SuiteName) -ForegroundColor Green
+        if ($SuiteName -eq 'm5' -or $SuiteName -eq 'eval') {
+            # M5/eval 是真实模型探索性探针：exit 0 = 探针执行通过，不等于完整验收通过
+            Write-Host ("OK: suite {0} probe execution passed (acceptance may still be Partial Evidence / Inconclusive)." -f $SuiteName) -ForegroundColor Green
             $status = 'PROBE_PASS'
         } else {
             Write-Host ("OK: suite {0} passed." -f $SuiteName) -ForegroundColor Green
@@ -342,12 +346,43 @@ try {
         $toolMode = '<default>'
     }
 
+    $evalEnabled = Get-RequiredEnv -Name 'STORYFORGE_EVAL_REAL_LLM'
+    if ($null -eq $evalEnabled) {
+        $evalEnabled = '<unset>'
+    }
+    $evalMaxCalls = Get-RequiredEnv -Name 'STORYFORGE_EVAL_MAX_CALLS'
+    if ($null -eq $evalMaxCalls) {
+        $evalMaxCalls = '40'
+    }
+    $evalMaxTurns = Get-RequiredEnv -Name 'STORYFORGE_EVAL_MAX_TURNS'
+    if ($null -eq $evalMaxTurns) {
+        $evalMaxTurns = '24'
+    }
+    $evalTimeout = Get-RequiredEnv -Name 'STORYFORGE_EVAL_TIMEOUT_SECS'
+    if ($null -eq $evalTimeout) {
+        $evalTimeout = '180'
+    }
+
     Write-Host ("StoryForge real LLM smoke root: {0}" -f $repoRoot)
     Write-Host ("Started: {0}" -f (Format-Timestamp -Value $startedAt))
     Write-Host ("Endpoint: {0}" -f $endpoint)
     Write-Host ("Model: {0}" -f $model)
     Write-Host ("Tool mode: {0}" -f $toolMode)
     Write-Host ("Suites: {0}" -f ($suites -join ', '))
+    Write-Host ("Eval real switch: STORYFORGE_EVAL_REAL_LLM={0}" -f $evalEnabled)
+    Write-Host ("Eval budget: max_calls={0} max_turns={1} timeout_secs={2}" -f $evalMaxCalls, $evalMaxTurns, $evalTimeout)
+    if ($suites -contains 'eval') {
+        $evalOn = $false
+        if ($null -ne (Get-RequiredEnv -Name 'STORYFORGE_EVAL_REAL_LLM')) {
+            $v = (Get-RequiredEnv -Name 'STORYFORGE_EVAL_REAL_LLM').Trim().ToLowerInvariant()
+            if ($v -in @('1', 'true', 'yes', 'on')) {
+                $evalOn = $true
+            }
+        }
+        if (-not $evalOn -and -not $DryRun) {
+            throw 'Suite eval requires STORYFORGE_EVAL_REAL_LLM=1 (explicit paid-model authorization). Deterministic eval tests run via cargo test without this switch.'
+        }
+    }
     if ($DryRun) {
         Write-Host 'Dry run enabled; commands will be printed but not executed.'
     }
@@ -381,13 +416,19 @@ try {
     Write-Host ''
     $ranM5 = @($results | Where-Object { $_.Suite -eq 'm5' }).Count -gt 0
     $m5ProbeOk = @($results | Where-Object { $_.Suite -eq 'm5' -and $_.ExitCode -eq 0 }).Count -gt 0
+    $ranEval = @($results | Where-Object { $_.Suite -eq 'eval' }).Count -gt 0
+    $evalProbeOk = @($results | Where-Object { $_.Suite -eq 'eval' -and $_.ExitCode -eq 0 }).Count -gt 0
     if ($DryRun) {
         Write-Host 'Real LLM smoke dry run completed.' -ForegroundColor Green
-    } elseif ($ranM5 -and $m5ProbeOk) {
+    } elseif (($ranM5 -and $m5ProbeOk) -or ($ranEval -and $evalProbeOk)) {
         Write-Host 'PROBE EXECUTION PASS' -ForegroundColor Green
-        Write-Host 'M5 ACCEPTANCE: INCONCLUSIVE' -ForegroundColor Yellow
-        Write-Host 'Real LLM smoke: non-M5 suites (if any) exited 0; M5 probe executed without hard failure.' -ForegroundColor Green
-        Write-Host 'Do not treat this as cache/compress parameter calibration or production Accept proof.' -ForegroundColor Yellow
+        if ($ranM5 -and $m5ProbeOk) {
+            Write-Host 'M5 ACCEPTANCE: INCONCLUSIVE / Partial Evidence' -ForegroundColor Yellow
+        }
+        if ($ranEval -and $evalProbeOk) {
+            Write-Host 'EVAL M5/PHASEB: PROBE EXECUTION PASS (paid-model matrix may still be Partial Evidence)' -ForegroundColor Yellow
+        }
+        Write-Host 'Do not treat this as full parameter calibration or complete M5 acceptance.' -ForegroundColor Yellow
     } else {
         Write-Host 'Real LLM smoke passed.' -ForegroundColor Green
     }
