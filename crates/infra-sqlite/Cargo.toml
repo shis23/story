@@ -1,0 +1,18 @@
+[package]
+name = "storyforge-infra-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite foundation: connection, migrations, unit of work, JSON importer"
+
+[dependencies]
+storyforge-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
