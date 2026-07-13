@@ -78,7 +78,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pip
 | Android dry-run | `scripts/run-android-host-pipeline.ps1 -DryRun` | **PASS** status=`dry-run` |
 | Whitespace | `git diff --check c3a972d..HEAD` | **PASS** |
 | Secret scan (workstream files only) | pattern scan of new scripts/tests | **PASS** (0 hits) |
-| Full `verify-release -SecretScanOnly` | repo-wide | **FAIL pre-existing**: `crates/harness-real-llm/tests/eval_m5_phaseb_deterministic.rs:176` fixture `sk-test-should-not-write` (outside this line; not introduced here) |
+| Full `verify-release -SecretScanOnly` | repo-wide | **FAIL pre-existing**: eval M5 deterministic fixture uses a synthetic OpenAI-style token string at `crates/harness-real-llm/tests/eval_m5_phaseb_deterministic.rs:176` (outside this line; not introduced here) |
 
 ### Windows host build
 
