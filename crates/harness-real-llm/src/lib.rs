@@ -15,10 +15,12 @@
 //!
 //! M5 / Phase B 评估扩展：
 //! - [`evidence`] 脱敏 JSONL 证据
+//! - [`budget`] 真实 LLM 调用预算 + usage 录制
 //! - [`commit_probe`] 生产忠实 CommitTurn/Accept
-//! - [`long_session`] ≥20 Accept 跨 H_anchor+E
+//! - [`long_session`] ≥20 Accept + ContextEpoch membership 校验
 //! - [`phase_b_matrix`] Phase B A/B 对照矩阵
 
+pub mod budget;
 pub mod commit_probe;
 pub mod evidence;
 pub mod long_session;
