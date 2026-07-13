@@ -171,11 +171,24 @@ pub enum AcceptError {
     NoTurnRecord,
     NoAttempt,
     InvalidAttemptStatus(String),
-    QualityBlocked { error_count: usize },
-    RevisionConflict { base: u64, current: u64 },
+    QualityBlocked {
+        error_count: usize,
+    },
+    RevisionConflict {
+        base: u64,
+        current: u64,
+    },
     DraftHashMismatch,
     CasFailed,
     CampaignMissing,
+    CampaignScopeMismatch {
+        turn_campaign: String,
+        requested: String,
+    },
+    ConversationScopeMismatch {
+        turn_conversation: String,
+        requested: String,
+    },
     Storage(String),
     Commit(String),
 }
@@ -209,6 +222,20 @@ impl std::fmt::Display for AcceptError {
                 "Turn 状态已变化，无法进入 Committing（可能已被并发 accept 或 postprocess 未完成）"
             ),
             Self::CampaignMissing => write!(f, "Campaign 不存在"),
+            Self::CampaignScopeMismatch {
+                turn_campaign,
+                requested,
+            } => write!(
+                f,
+                "Campaign 归属不匹配：Turn 属于 {turn_campaign}，请求 accept 的是 {requested}。请切回原 Campaign 或 regenerate。"
+            ),
+            Self::ConversationScopeMismatch {
+                turn_conversation,
+                requested,
+            } => write!(
+                f,
+                "Conversation 归属不匹配：Turn 属于 {turn_conversation}，请求 accept 的是 {requested}。"
+            ),
             Self::Storage(msg) => write!(f, "{msg}"),
             Self::Commit(msg) => write!(f, "{msg}"),
         }
@@ -303,6 +330,19 @@ impl<'a> TurnLifecycleService<'a> {
             .ok_or(AcceptError::NoAttempt)?
             .clone();
 
+        if &turn.campaign_id != campaign_id {
+            return Err(AcceptError::CampaignScopeMismatch {
+                turn_campaign: turn.campaign_id.to_string(),
+                requested: campaign_id.to_string(),
+            });
+        }
+        if &turn.conversation_id != conversation_id {
+            return Err(AcceptError::ConversationScopeMismatch {
+                turn_conversation: turn.conversation_id.to_string(),
+                requested: conversation_id.to_string(),
+            });
+        }
+
         if attempt.status != AttemptStatus::AwaitingAcceptance {
             return Err(AcceptError::InvalidAttemptStatus(format!(
                 "{:?}",
@@ -322,9 +362,11 @@ impl<'a> TurnLifecycleService<'a> {
             }
         };
 
+        // Always scope revision / mutations to the Turn's own campaign.
+        let owner_campaign_id = turn.campaign_id.clone();
         let camp = self
             .campaign_store
-            .get_campaign(campaign_id)
+            .get_campaign(&owner_campaign_id)
             .ok_or(AcceptError::CampaignMissing)?;
         let campaign_revision_before = camp.revision;
         if turn.base_campaign_revision != campaign_revision_before {
@@ -343,6 +385,12 @@ impl<'a> TurnLifecycleService<'a> {
         let turn_id = turn.turn_id.clone();
         let attempt_id = attempt.attempt_id.clone();
         let batch_for_store = batch.clone();
+        let final_status = if commit_as_degraded {
+            TurnStatus::Degraded
+        } else {
+            TurnStatus::Committed
+        };
+        let intended = final_status.clone();
         let cas_ok = self
             .update_turn_record_if(
                 &turn_id,
@@ -354,6 +402,7 @@ impl<'a> TurnLifecycleService<'a> {
                 },
                 |record| {
                     record.status = TurnStatus::Committing;
+                    record.intended_terminal_status = Some(intended);
                     if let Some(att) = record.find_attempt_mut(&attempt_id) {
                         att.status = AttemptStatus::Committing;
                         att.pending_state_changes = Some(batch_for_store);
@@ -372,7 +421,7 @@ impl<'a> TurnLifecycleService<'a> {
                 .map_err(|e| CommitError::Storage(format!("Draft → Final 失败: {e}")))?;
             CampaignMutationCoordinator::apply_mutation_batch(
                 self.campaign_store,
-                campaign_id,
+                &owner_campaign_id,
                 &batch,
             )?;
             Ok(())
@@ -383,19 +432,12 @@ impl<'a> TurnLifecycleService<'a> {
             return Err(AcceptError::Commit(e.to_string()));
         }
 
-        let final_status = if commit_as_degraded {
-            TurnStatus::Degraded
-        } else {
-            TurnStatus::Committed
-        };
-        // Side effects already landed; terminal mark failure is best-effort (recoverable).
-        let _ = self.update_turn_record(&turn_id, |record| {
-            finalize_committed_turn(record, &attempt_id, final_status.clone());
-        });
+        // Side effects landed: terminal mark must surface persistence failure.
+        self.mark_terminal_after_side_effects(&turn_id, &attempt_id, final_status.clone())?;
 
         let campaign_revision_after = self
             .campaign_store
-            .get_campaign(campaign_id)
+            .get_campaign(&owner_campaign_id)
             .map(|c| c.revision)
             .unwrap_or(campaign_revision_before);
 
@@ -409,6 +451,20 @@ impl<'a> TurnLifecycleService<'a> {
             campaign_revision_after,
             batch,
         })
+    }
+
+    /// Persist terminal Turn/Attempt state after side effects. Errors must not be swallowed.
+    pub fn mark_terminal_after_side_effects(
+        &self,
+        turn_id: &Id,
+        attempt_id: &Id,
+        turn_status: TurnStatus,
+    ) -> Result<(), AcceptError> {
+        self.update_turn_record(turn_id, |record| {
+            finalize_committed_turn(record, attempt_id, turn_status);
+            record.intended_terminal_status = None;
+        })
+        .map_err(AcceptError::Storage)
     }
 
     /// Startup recovery: replay Committing turns; fail non-side-effect active turns.
@@ -426,6 +482,27 @@ impl<'a> TurnLifecycleService<'a> {
             let attempt_id = attempt.map(|a| a.attempt_id.clone());
             let variant_id = attempt.map(|a| a.variant_id.clone());
             let batch = attempt.and_then(|a| a.pending_state_changes.clone());
+            let terminal = match turn.intended_terminal_status.clone() {
+                Some(TurnStatus::Degraded) => TurnStatus::Degraded,
+                Some(TurnStatus::Committed) | None => TurnStatus::Committed,
+                Some(other) => {
+                    let _ = other;
+                    TurnStatus::Committed
+                }
+            };
+
+            // Finalize first. Campaign mutations must not land if Draft→Final cannot complete.
+            let finalize_ok = match &variant_id {
+                Some(vid) => self
+                    .conv_store
+                    .accept_variant(&turn.conversation_id, vid)
+                    .is_ok(),
+                None => false,
+            };
+            if !finalize_ok {
+                // Keep Committing for next boot / manual recovery.
+                continue;
+            }
 
             if let Some(batch) = batch {
                 match turn_coordinator::with_campaign_lock(|| {
@@ -437,21 +514,17 @@ impl<'a> TurnLifecycleService<'a> {
                 }) {
                     Ok(_) => {
                         on_recovered_batch(&batch);
-                        let finalize_ok = match &variant_id {
-                            Some(vid) => self
-                                .conv_store
-                                .accept_variant(&turn.conversation_id, vid)
-                                .is_ok(),
-                            None => false,
-                        };
-                        if finalize_ok {
+                        if let Some(aid) = &attempt_id {
+                            let _ = self.mark_terminal_after_side_effects(
+                                &turn_id,
+                                aid,
+                                terminal.clone(),
+                            );
+                        } else {
                             let _ = self.update_turn_record(&turn_id, |record| {
-                                if let Some(aid) = &attempt_id {
-                                    finalize_committed_turn(record, aid, TurnStatus::Committed);
-                                } else {
-                                    record.status = TurnStatus::Committed;
-                                    record.touch();
-                                }
+                                record.status = terminal.clone();
+                                record.intended_terminal_status = None;
+                                record.touch();
                             });
                         }
                     }
@@ -461,6 +534,7 @@ impl<'a> TurnLifecycleService<'a> {
                             record.failure_reason = Some(format!(
                                 "启动恢复 revision 冲突: expected={expected}, actual={actual}"
                             ));
+                            record.intended_terminal_status = None;
                             record.touch();
                         });
                     }
@@ -469,16 +543,6 @@ impl<'a> TurnLifecycleService<'a> {
                     }
                 }
             } else {
-                let finalize_ok = match &variant_id {
-                    Some(vid) => self
-                        .conv_store
-                        .accept_variant(&turn.conversation_id, vid)
-                        .is_ok(),
-                    None => false,
-                };
-                if !finalize_ok {
-                    continue;
-                }
                 let empty_apply = self.campaign_store.get_campaign(&campaign_id).map(|camp| {
                     let empty_batch = MutationBatch::new(Id::new(), camp.revision);
                     turn_coordinator::with_campaign_lock(|| {
@@ -491,14 +555,19 @@ impl<'a> TurnLifecycleService<'a> {
                 });
                 match empty_apply {
                     Some(Ok(_)) | None => {
-                        let _ = self.update_turn_record(&turn_id, |record| {
-                            if let Some(aid) = &attempt_id {
-                                finalize_committed_turn(record, aid, TurnStatus::Committed);
-                            } else {
-                                record.status = TurnStatus::Committed;
+                        if let Some(aid) = &attempt_id {
+                            let _ = self.mark_terminal_after_side_effects(
+                                &turn_id,
+                                aid,
+                                terminal.clone(),
+                            );
+                        } else {
+                            let _ = self.update_turn_record(&turn_id, |record| {
+                                record.status = terminal.clone();
+                                record.intended_terminal_status = None;
                                 record.touch();
-                            }
-                        });
+                            });
+                        }
                     }
                     Some(Err(CommitError::RevisionConflict { expected, actual })) => {
                         let _ = self.update_turn_record(&turn_id, |record| {
@@ -506,6 +575,7 @@ impl<'a> TurnLifecycleService<'a> {
                             record.failure_reason = Some(format!(
                                 "启动恢复空 batch revision 冲突: expected={expected}, actual={actual}"
                             ));
+                            record.intended_terminal_status = None;
                             record.touch();
                         });
                     }
@@ -524,6 +594,7 @@ impl<'a> TurnLifecycleService<'a> {
             let _ = self.update_turn_record(&turn_id, |record| {
                 record.status = TurnStatus::Failed;
                 record.failure_reason = Some(format!("启动恢复：崩溃时处于 {status:?} 态"));
+                record.intended_terminal_status = None;
                 record.touch();
             });
         }
@@ -1040,5 +1111,223 @@ mod tests {
             .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
             .expect("synced hash accepts");
         assert_eq!(outcome.turn_status, TurnStatus::Committed);
+    }
+
+    #[test]
+    fn accept_rejects_cross_campaign_and_does_not_mutate_active_campaign() {
+        let fx = Fixture::new("cross_camp");
+        let draft = "旧 Campaign 草稿正文足够长用于跨档隔离。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            Some("旧档摘要不应写到新档"),
+        );
+
+        // Active campaign is a different one (user switched campaigns).
+        let mut other = Campaign::new(Id::new(), "active-other");
+        other.lineage_id = Some(Id::new());
+        let other_id = other.id.clone();
+        fx.campaign_store.save_campaign(other).unwrap();
+        let other_before = fx.campaign_store.get_campaign(&other_id).unwrap().revision;
+        let owner_before = fx
+            .campaign_store
+            .get_campaign(&fx.campaign_id)
+            .unwrap()
+            .revision;
+
+        let err = fx
+            .service()
+            .accept_by_variant(&other_id, &fx.conversation_id, &variant_id, false)
+            .expect_err("must not accept under foreign active campaign");
+        assert!(
+            matches!(err, AcceptError::CampaignScopeMismatch { .. }),
+            "unexpected err: {err}"
+        );
+
+        let other_after = fx.campaign_store.get_campaign(&other_id).unwrap();
+        assert_eq!(
+            other_after.revision, other_before,
+            "active campaign must not bump"
+        );
+        assert!(
+            fx.campaign_store.list_summaries(&other_id).is_empty(),
+            "active campaign must not receive mutations"
+        );
+        let owner_after = fx.campaign_store.get_campaign(&fx.campaign_id).unwrap();
+        assert_eq!(
+            owner_after.revision, owner_before,
+            "owner campaign untouched on reject"
+        );
+        assert!(fx.campaign_store.list_summaries(&fx.campaign_id).is_empty());
+        let still_draft = fx
+            .conv_store
+            .get(&fx.conversation_id)
+            .and_then(|c| {
+                c.nodes
+                    .iter()
+                    .find(|n| n.id == variant_id)
+                    .and_then(|n| n.active())
+                    .map(|v| {
+                        matches!(
+                            v.status,
+                            storyforge_domain::conversation::VariantStatus::Draft
+                        )
+                    })
+            })
+            .unwrap_or(false);
+        assert!(still_draft, "foreign accept must not finalize variant");
+    }
+
+    #[test]
+    fn accept_rejects_conversation_scope_mismatch() {
+        let fx = Fixture::new("cross_conv");
+        let draft = "对话归属校验草稿正文足够长。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        let foreign_conv = fx.conv_store.create(None, None).id;
+        let err = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &foreign_conv, &variant_id, false)
+            .expect_err("conversation mismatch");
+        assert!(
+            matches!(err, AcceptError::ConversationScopeMismatch { .. }),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_force_degraded_terminal_status() {
+        let fx = Fixture::new("recover_degraded");
+        let draft = "force accept 崩溃恢复必须保持 Degraded。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let record = fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport {
+                warnings: vec![QualityWarning {
+                    code: QualityWarningCode::FormatLeak {
+                        snippet: "```".into(),
+                    },
+                    message: "format".into(),
+                    severity: QualitySeverity::Error,
+                }],
+            }),
+            Some("degraded summary"),
+        );
+        let attempt_id = record.attempts[0].attempt_id.clone();
+        // Simulate crash after CAS into Committing with intended Degraded.
+        fx.service()
+            .update_turn_record(&record.turn_id, |r| {
+                r.status = TurnStatus::Committing;
+                r.intended_terminal_status = Some(TurnStatus::Degraded);
+                if let Some(att) = r.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Committing;
+                }
+                r.touch();
+            })
+            .unwrap();
+
+        fx.service().recover_turns_on_startup(|_| {});
+        let after = fx.turn_store.get_turn(&record.turn_id).unwrap();
+        assert_eq!(
+            after.status,
+            TurnStatus::Degraded,
+            "force-accept recovery must not upgrade Degraded to Committed"
+        );
+        assert_eq!(after.accepted_attempt_id.as_ref(), Some(&attempt_id));
+    }
+
+    #[test]
+    fn recovery_does_not_apply_campaign_mutations_when_finalize_fails() {
+        let fx = Fixture::new("recover_finalize_order");
+        let mut other = Campaign::new(Id::new(), "owner");
+        other.lineage_id = Some(Id::new());
+        let camp_id = other.id.clone();
+        fx.campaign_store.save_campaign(other).unwrap();
+        let before = fx.campaign_store.get_campaign(&camp_id).unwrap().revision;
+
+        let mut committing = TurnRecord::new(
+            camp_id.clone(),
+            fx.conversation_id.clone(),
+            Id::from_str("in-finalize-order"),
+            before,
+        );
+        committing.status = TurnStatus::Committing;
+        committing.intended_terminal_status = Some(TurnStatus::Committed);
+        let missing_variant = Id::from_str("missing-variant-order");
+        let mut batch = MutationBatch::new(Id::from_str("batch-order"), before);
+        batch.mutations.push(Mutation::SetVariable {
+            instance_id: None,
+            key: "should_not_write".into(),
+            value: serde_json::json!(1),
+            turn: 1,
+        });
+        committing.attempts.push(TurnAttempt {
+            attempt_id: Id::from_str("att-order"),
+            variant_id: missing_variant,
+            draft_hash: "h".into(),
+            status: AttemptStatus::Committing,
+            pending_state_changes: Some(batch),
+            derivation: None,
+            quality_report: None,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "t".into(),
+        });
+        let turn_id = committing.turn_id.clone();
+        fx.turn_store.create_turn(committing).unwrap();
+
+        fx.service().recover_turns_on_startup(|_| {});
+
+        let after_camp = fx.campaign_store.get_campaign(&camp_id).unwrap();
+        assert_eq!(
+            after_camp.revision, before,
+            "finalize failure must not apply campaign mutations / bump revision"
+        );
+        let still = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(still.status, TurnStatus::Committing);
+    }
+
+    #[test]
+    fn accept_surfaces_terminal_mark_storage_failure() {
+        let fx = Fixture::new("terminal_mark");
+        let draft = "终态落盘失败必须向上返回错误。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let record = fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        let attempt_id = record.attempts[0].attempt_id.clone();
+        // Move turn into Committing with intended terminal, as if side effects already landed.
+        fx.service()
+            .update_turn_record(&record.turn_id, |r| {
+                r.status = TurnStatus::Committing;
+                r.intended_terminal_status = Some(TurnStatus::Committed);
+                if let Some(att) = r.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Committing;
+                }
+                r.touch();
+            })
+            .unwrap();
+
+        // Break TurnStore persistence so terminal mark cannot be saved.
+        let turns_path = fx._data_dir.join("turns.json");
+        std::fs::remove_file(&turns_path).ok();
+        std::fs::create_dir_all(&turns_path).unwrap();
+
+        let err = fx
+            .service()
+            .mark_terminal_after_side_effects(&record.turn_id, &attempt_id, TurnStatus::Committed)
+            .expect_err("terminal mark failure must surface");
+        assert!(matches!(err, AcceptError::Storage(_)), "unexpected: {err}");
     }
 }

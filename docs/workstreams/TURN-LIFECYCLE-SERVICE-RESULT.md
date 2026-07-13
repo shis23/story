@@ -119,6 +119,17 @@ git diff --check c3a972d..HEAD
 
 未运行：全 workspace、真实/付费 LLM、GUI。
 
+## P0 返修（同线）
+
+| 问题 | 修复 |
+| --- | --- |
+| Accept 使用调用方 active Campaign 写副作用 | `accept_by_variant` 校验 Turn.campaign_id/conversation_id，并只对 Turn 所属 Campaign 做 revision/MutationBatch |
+| force Degraded 恢复成 Committed | TurnRecord 增加 `intended_terminal_status`；CAS 进 Committing 时写入；恢复复用 |
+| 恢复先写 Campaign 再 Final | 恢复改为先 Draft→Final，失败则保持 Committing 且不 apply mutations |
+| 终态 TurnRecord 写入失败被吞 | `mark_terminal_after_side_effects` 返回 `AcceptError::Storage`，Accept 不再 `let _ =` |
+
+新增契约测试：`accept_rejects_cross_campaign_*`、`accept_rejects_conversation_scope_mismatch`、`recovery_preserves_force_degraded_terminal_status`、`recovery_does_not_apply_campaign_mutations_when_finalize_fails`、`accept_surfaces_terminal_mark_storage_failure`。
+
 ## 未完成项与风险
 
 1. postprocess / quality autofix 编排仍在 Tauri command，共享度尚未覆盖完整写作后台闭环。
