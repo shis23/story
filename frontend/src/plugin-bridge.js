@@ -545,6 +545,15 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return true;
   }
 
+  function _unsupportedSlashResult(name) {
+    const commandName = String(name || '').trim() || '<empty>';
+    const error = new Error('Unsupported slash command: ' + commandName + ' is not registered');
+    error.code = 'SLASH_UNSUPPORTED';
+    error.unsupported = true;
+    error.command = commandName;
+    throw error;
+  }
+
   function _invokeSlashCommand(name, args) {
     const index = _findSlashCommandIndex(name);
     const command = index >= 0 ? _slashCommands[index] : null;
@@ -556,7 +565,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     if (name === 'genraw') {
       return window.storyforge.llm.generate(args && args.length ? args[0] : '');
     }
-    return undefined;
+    return _unsupportedSlashResult(name);
   }
 
   function _isPromiseLike(value) {
@@ -972,16 +981,23 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _saveChat() {
-    return Promise.resolve(true);
+    // Local chat mirror only — no host conversation persist path yet.
+    return Promise.resolve({
+      ok: true,
+      degraded: true,
+      reason: 'local_mirror_only_no_host_persist',
+    });
   }
 
   function _callGenericPopup(html, type, defaultValue) {
+    // No native popup UI; return ST-compatible degraded defaults.
     if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
     if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
     return Promise.resolve('');
   }
 
   function _getRequestHeaders() {
+    // Static shim — no session auth headers are exposed to plugins.
     return { 'Content-Type': 'application/json' };
   }
 
