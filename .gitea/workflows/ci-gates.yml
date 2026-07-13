@@ -1,0 +1,135 @@
+# Gitea Actions: fast PR / push gates.
+#
+# Runs formatting, strict Clippy, workspace tests, frontend tests/build,
+# Pester release-helper tests, and a fail-closed repository secret scan.
+# This workflow does NOT build host artifacts, APKs, or installers.
+name: ci-gates
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Cancel superseded runs on the same ref so stale pushes do not pile up.
+concurrency:
+  group: ci-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: only read the repo contents. No deploy/packages/admin.
+permissions:
+  contents: read
+
+jobs:
+  rust-fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  rust-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  frontend-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      # Strict npm ci: fail closed if package-lock is out of sync.
+      - name: npm ci
+        run: npm ci
+      - name: npm test
+        run: npm test
+      - name: npm run build
+        run: npm run build
+
+  pester-release-tests:
+    # PowerShell release-helper Pester suite runs on a Windows runner.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run release-build Pester tests
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/run-release-build-tests.ps1
+      - name: Verify release gate (secret scan only, dry-run safe)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release.ps1 -SecretScanOnly
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Repository secret scan (fail-closed)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release.ps1 -SecretScanOnly
+
+  workflow-syntax:
+    # Validate every tracked workflow YAML parses without errors.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate workflow YAML syntax
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $dir = '.gitea\workflows'
+          $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.yml' -File) +
+                   @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'No workflow files found.' }
+          foreach ($f in $files) {
+            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
+            if (-not $result.Valid) {
+              Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
+              $result.Errors | ForEach-Object { Write-Host "  $_" }
+              exit 1
+            }
+            Write-Host "OK: $($f.Name)" -ForegroundColor Green
+          }

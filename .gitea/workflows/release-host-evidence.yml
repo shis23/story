@@ -1,0 +1,163 @@
+# Gitea Actions: manual / tagged host artifact evidence.
+#
+# Produces Windows host build evidence and Android host smoke evidence by
+# invoking the production PowerShell helpers. Uploads manifests, provenance,
+# hash sidecars, and SBOM-style inventories as artifacts with bounded retention.
+#
+# This workflow does NOT sign, publish, deploy, install to a device, or run GUI
+# acceptance. It may only claim host evidence and (when produced) an unsigned APK.
+name: release-host-evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_bundle:
+        description: 'Skip Tauri bundle (host-binary-only evidence)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+  push:
+    tags: ['v*']
+
+# Cancel superseded evidence runs on the same ref.
+concurrency:
+  group: release-host-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: read repo to checkout. Artifacts are uploaded via the
+# implicit actions token; no packages/deploy/admin/oidc scopes needed.
+permissions:
+  contents: read
+
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Prevent the workflow from accidentally inheriting the developer's
+      # workstation target directory. CI always uses a clean checkout.
+      CARGO_TARGET_DIR: ''
+      # Never echo secret values into logs. These are placeholders so the
+      # env block documents intent; no real secrets are referenced.
+      RUST_LOG: 'info'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Read skip-bundle input
+        id: bundle
+        shell: powershell
+        run: |
+          $skip = '${{ github.event.inputs.skip_bundle }}'
+          if ($skip -eq 'true') {
+            Write-Host '::set-output name=skip_flag::-SkipBundle'
+          } else {
+            Write-Host '::set-output name=skip_flag::'
+          }
+
+      - name: Windows host release build
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-release-build.ps1 ${{ steps.bundle.outputs.skip_flag }}
+
+      - name: Locate evidence directory
+        id: evidence
+        shell: powershell
+        run: |
+          $root = Join-Path $PWD 'artifacts\release-build'
+          $latest = Get-ChildItem -LiteralPath $root -Directory |
+            Where-Object { $_.Name -like 'windows-*' } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $latest) {
+            throw 'No windows-* evidence directory found.'
+          }
+          Write-Host "::set-output name=dir::$($latest.FullName)"
+          Write-Host "Evidence dir: $($latest.FullName)"
+
+      - name: Validate manifest schema
+        shell: powershell
+        run: |
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $manifest = Get-Content -LiteralPath (Join-Path '${{ steps.evidence.outputs.dir }}' 'manifest.json') -Raw | ConvertFrom-Json
+          Assert-ReleaseManifestSchema -Manifest $manifest
+          Write-Host 'Manifest schema validation passed.'
+
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-host-evidence-${{ github.sha }}
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+
+  android-host-evidence:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ''
+      RUST_LOG: 'info'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # Android host smoke: frontend build, capabilities tests, and aarch64
+      # Rust check. SDK/NDK are NOT installed here, so -BuildApk is intentionally
+      # omitted: requesting APK evidence without prerequisites fails closed.
+      - name: Android host pipeline (host smoke, no device, no APK)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pipeline.ps1
+
+      - name: Locate Android evidence directory
+        id: evidence
+        shell: powershell
+        run: |
+          $root = Join-Path $PWD 'artifacts\release-build'
+          $latest = Get-ChildItem -LiteralPath $root -Directory |
+            Where-Object { $_.Name -like 'android-*' } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $latest) {
+            throw 'No android-* evidence directory found.'
+          }
+          Write-Host "::set-output name=dir::$($latest.FullName)"
+
+      - name: Validate Android manifest schema
+        shell: powershell
+        run: |
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $manifest = Get-Content -LiteralPath (Join-Path '${{ steps.evidence.outputs.dir }}' 'manifest.json') -Raw | ConvertFrom-Json
+          Assert-ReleaseManifestSchema -Manifest $manifest
+          Write-Host 'Android manifest schema validation passed.'
+
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-host-evidence-${{ github.sha }}
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
