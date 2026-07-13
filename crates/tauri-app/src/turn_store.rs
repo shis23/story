@@ -150,8 +150,14 @@ impl TurnStore {
         if !predicate(&turns[idx]) {
             return Ok(false);
         }
+        let before = turns[idx].clone();
         mutate(&mut turns[idx]);
-        persist_turns(&self.turns_path, &turns)?;
+        if let Err(error) = persist_turns(&self.turns_path, &turns) {
+            // Keep the in-memory journal aligned with the durable copy. Callers may
+            // retry/recover a Committing turn after a transient terminal-write error.
+            turns[idx] = before;
+            return Err(error);
+        }
         Ok(true)
     }
 

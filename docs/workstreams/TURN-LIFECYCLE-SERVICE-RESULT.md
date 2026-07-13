@@ -143,3 +143,44 @@ git diff --check c3a972d..HEAD
 **建议合并。** 默认行为未改，Accept/恢复/Attempt 状态机有契约测试与 Bronze/Phase B 确定性回归，
 且 Tauri 与 harness 已走同一 Accept 实现。合并后可降低 `CommitProbe` 与私有 `commit_turn_attempt`
 继续漂移的风险。
+
+## Review hardening（2026-07-13）
+
+本轮进一步关闭 Accept 与启动恢复的原子性边界：
+
+- `TurnLifecycleService` 在同一 Campaign lock 内先只读预检 conversation/active variant、唯一
+  `FinalizeVariant` 和完整 `MutationBatch`，永久错误不会先把正文写成 Final。
+- Campaign batch 预检会按顺序模拟 instance、knowledge、task、summary 和 revision 约束，避免
+  “前半批已写、后半批才发现永久冲突”。临时 instance 作为 batch 前置 mutation 参与预检。
+- 预检通过后先幂等提交 Campaign batch，再持久化 Draft → Final。若 Final 写失败，Turn 保持
+  `Committing`；恢复看到 `revision == target_revision` 时 batch 为 no-op，只补写 Final，不重复
+  bump revision。
+- missing variant/conversation/Campaign 或临时存储错误保持 `Committing` 并记录诊断；revision、
+  mutation payload 等永久冲突在任何 Final 写入前标记 Turn/Attempt `Failed`。
+- legacy journal 只有 Error 级 QualityReport 能证明曾经 force accept 时才恢复为 `Degraded`；
+  无法证明 terminal intent 时保持 `Committing`，不会猜测升级为 `Committed`。
+- TurnStore 的内存 mutation 在持久化失败时回滚到旧记录，终态写失败仍可由后续启动恢复。
+
+新增故障注入/契约覆盖包括：
+
+- `permanent_mutation_error_does_not_finalize_variant`
+- `recovery_with_no_batch_and_missing_campaign_stays_committing`
+- `legacy_force_accept_without_intended_status_recovers_degraded`
+- `legacy_unknown_terminal_intent_stays_committing`
+- `recovery_terminal_write_failure_keeps_turn_recoverable`
+- `final_persist_failure_recovers_without_reapplying_campaign_batch`
+
+返修后实测：
+
+| 门禁 | 结果 |
+| --- | --- |
+| `cargo test -p storyforge --lib` | 236 passed / 0 failed / 3 ignored |
+| `cargo test -p storyforge-domain --lib` | 243 passed |
+| `cargo test -p storyforge-app-pipeline --lib` | 87 passed |
+| `cargo test -p storyforge-app-agent --lib` | 109 passed |
+| `cargo test -p harness-real-llm --lib` | 17 passed |
+| Bronze / M5 Phase B deterministic | 8 passed / 5 passed |
+| affected crates strict Clippy | PASS |
+| fmt / diff-check | PASS |
+
+未调用真实 LLM，未修改默认 JSON backend，未 push。
