@@ -411,6 +411,37 @@ try {
     Write-ReleaseJson -Object $manifest -Path $manifestPath
     Write-Host ("Wrote manifest: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $manifestPath))
 
+    Start-ReleaseBuildStep -Name 'manifest schema validation'
+    Assert-ReleaseManifestSchema -Manifest $manifest
+    Write-Host 'Manifest schema validation passed.'
+
+    Start-ReleaseBuildStep -Name 'artifact hash sidecars'
+    if ($DryRun) {
+        Write-Host 'DRY RUN: would write <artifact>.sha256 sidecar files for present artifacts'
+    } else {
+        $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
+        foreach ($art in $presentArtifacts) {
+            $fullPath = Join-Path $script:RepoRoot ($art.relative_path -replace '/', '\')
+            if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+                $hashFile = Write-ReleaseHashFile -ArtifactPath $fullPath
+                Write-Host ("Wrote hash sidecar: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $hashFile))
+            }
+        }
+    }
+
+    Start-ReleaseBuildStep -Name 'provenance attestation'
+    $provArtifacts = if ($DryRun) { [object[]]@() } else { [object[]]@($script:Artifacts | Where-Object { $_.status -eq 'present' }) }
+    if ($null -eq $provArtifacts) { $provArtifacts = [object[]]@() }
+    $provenance = New-ReleaseProvenance `
+        -Commit $identity.commit `
+        -Branch $identity.branch `
+        -Target 'x86_64-pc-windows-msvc' `
+        -Artifacts $provArtifacts `
+        -RepoRoot $script:RepoRoot
+    $provenancePath = Join-Path $runDir 'provenance.json'
+    Write-ReleaseJson -Object $provenance -Path $provenancePath
+    Write-Host ("Wrote provenance: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $provenancePath))
+
     $summaryPath = Join-Path $runDir 'SUMMARY.txt'
     $summaryLines = New-Object System.Collections.Generic.List[string]
     foreach ($line in @(
@@ -442,7 +473,9 @@ try {
         foreach ($dir in $targets) {
             Write-Host ("Removing old run dir: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $dir.FullName))
         }
-        Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
+        if ($null -ne $targets -and @($targets).Count -gt 0) {
+            Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
+        }
         Write-Host ("Retention complete; keep={0}" -f $KeepRuns)
     }
 
