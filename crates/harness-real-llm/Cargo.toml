@@ -19,10 +19,12 @@ storyforge-app-logging.workspace = true
 storyforge-tauri-app = { package = "storyforge", path = "../tauri-app" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-async-trait.workspace = true
