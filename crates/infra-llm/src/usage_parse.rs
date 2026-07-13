@@ -279,9 +279,8 @@ mod tests {
         }))
         .expect("usage present");
         assert!(u.prompt_tokens > 0);
-        assert_eq!(u.cached_tokens, 0);
-        assert!(
-            !(u.cached_tokens > 0),
+        assert_eq!(
+            u.cached_tokens, 0,
             "zero cached must not satisfy positive cache signal"
         );
     }
