@@ -713,6 +713,15 @@ fn canonicalize(value: &Value) -> Value {
     }
 }
 
+fn path_is_intentional(path: &str, full: &str, intentional_paths: &[&str]) -> bool {
+    intentional_paths.iter().any(|p| {
+        *p == path
+            || full == *p
+            || full.ends_with(&format!(".{p}"))
+            || path.ends_with(&format!(".{p}"))
+    })
+}
+
 fn compare_value(
     area: &str,
     path: &str,
@@ -726,10 +735,7 @@ fn compare_value(
     } else {
         format!("{area}.{path}")
     };
-    if intentional_paths
-        .iter()
-        .any(|p| full.ends_with(p) || *p == path)
-    {
+    if path_is_intentional(path, &full, intentional_paths) {
         if before != after {
             out.push(CompatFinding {
                 area: area.into(),
@@ -751,8 +757,20 @@ fn compare_value(
                 } else {
                     format!("{path}.{key}")
                 };
+                let child_full = format!("{area}.{child}");
                 match b.get(key) {
                     Some(bv) => compare_value(area, &child, av, bv, intentional_paths, out),
+                    None if path_is_intentional(&child, &child_full, intentional_paths) => {
+                        out.push(CompatFinding {
+                            area: area.into(),
+                            field_path: child,
+                            severity: CompatSeverity::Intentional,
+                            detail: "listed intentional normalization path dropped/normalized"
+                                .into(),
+                            before: Some(av.clone()),
+                            after: None,
+                        });
+                    }
                     None => out.push(CompatFinding {
                         area: area.into(),
                         field_path: child,
@@ -1121,6 +1139,84 @@ mod tests {
             book.entries[0].secondary_keys,
             vec!["secondary-a", "secondary-b"]
         );
+    }
+
+    #[test]
+    fn first_import_from_source_json_preserves_alias_keys_and_book_meta() {
+        // Compare SOURCE JSON → first import, not import → reimport.
+        // Catches losses that already happen on the initial parse/normalize step.
+        let source = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Source Fidelity",
+                "group_only": true,
+                "creator_notes": "keep me",
+                "extensions": {
+                    "stat_data": {"hp": 9},
+                    "unknown_plugin": {"x": 1}
+                },
+                "character_book": {
+                    "name": "Source Book",
+                    "description": "from source",
+                    "scan_depth": 4,
+                    "extensions": {"book_plugin": {"on": true}},
+                    "entries": [{
+                        "id": 1,
+                        "key": ["alpha", "beta"],
+                        "keysecondary": "sec-a, sec-b",
+                        "content": "alias lore",
+                        "selective": true,
+                        "position": "after_char",
+                        "order": 3,
+                        "depth": 2,
+                        "extensions": {"entry_extra": 7}
+                    }]
+                }
+            }
+        });
+        let imported =
+            import_character_from_json(&serde_json::to_vec(&source).unwrap()).expect("import");
+
+        assert_eq!(imported.raw_card_json["group_only"], true);
+        assert_eq!(imported.raw_card_json["creator_notes"], "keep me");
+        assert_eq!(
+            imported.raw_card_json["character_book"]["name"],
+            "Source Book"
+        );
+        assert_eq!(
+            imported.raw_card_json["character_book"]["entries"][0]["keys"],
+            serde_json::json!(["alpha", "beta"]),
+            "first import must materialize legacy key aliases into keys in raw_card_json"
+        );
+        assert_eq!(
+            imported.raw_card_json["character_book"]["entries"][0]["secondary_keys"],
+            serde_json::json!(["sec-a", "sec-b"])
+        );
+
+        let book = imported.embedded_world_info.as_ref().expect("book");
+        assert_eq!(book.entries[0].keys, vec!["alpha", "beta"]);
+        assert_eq!(book.entries[0].secondary_keys, vec!["sec-a", "sec-b"]);
+        assert_eq!(
+            book.metadata.get("name").and_then(|v| v.as_str()),
+            Some("Source Book")
+        );
+
+        // Source-vs-first-import semantic compare for opaque extras / extensions.
+        let source_data = &source["data"];
+        // Legacy aliases are intentionally normalized into canonical keys /
+        // secondary_keys on first import; the path suffix match in compare_st_data
+        // treats these as intentional, not loss.
+        let report = compare_st_data(
+            source_data,
+            &imported.raw_card_json,
+            &["key", "keysecondary", "position"],
+        );
+        let losses: Vec<_> = report
+            .into_iter()
+            .filter(|f| f.severity == CompatSeverity::Loss)
+            .collect();
+        assert!(losses.is_empty(), "source→first-import losses: {losses:?}");
     }
 
     #[test]

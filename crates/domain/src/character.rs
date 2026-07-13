@@ -229,7 +229,24 @@ impl Character {
     }
 
     /// 从 ST 卡 JSON 解析为领域模型
-    pub fn from_st_card(card: StCharacterCard) -> Self {
+    pub fn from_st_card(mut card: StCharacterCard) -> Self {
+        // Normalize alias fields before serializing raw_card_json so the first
+        // import already materializes legacy ST key shapes into canonical fields.
+        if let Some(book) = card.data.character_book.as_mut() {
+            for entry in &mut book.entries {
+                entry.keys = entry.resolved_keys();
+                let secondary = entry.resolved_secondary_keys();
+                entry.secondary_keys = if secondary.is_empty() {
+                    None
+                } else {
+                    Some(secondary)
+                };
+                // Drop import-only alias payloads from the preserved raw JSON.
+                entry.key_alias = None;
+                entry.keysecondary_alias = None;
+            }
+        }
+
         let raw_json =
             serde_json::to_value(&card.data).expect("ST character data should serialize to JSON");
         let spec_version = card.spec_version.unwrap_or_else(|| "2.0".into());
