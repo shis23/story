@@ -731,4 +731,55 @@ mod tests {
         crc_input.extend_from_slice(data);
         out.extend_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
     }
+
+    #[test]
+    fn test_import_rejects_empty_chara_payload_fail_closed() {
+        // A chara tEXt whose payload is empty must be rejected (no JSON), not
+        // silently produce a half-built Character.
+        let png = png_with_text_chunk("chara", "");
+        let err = import_character(&png).expect_err("empty chara must fail closed");
+        assert!(matches!(
+            err,
+            ImportError::JsonError(_) | ImportError::NoCharacterData
+        ));
+    }
+
+    #[test]
+    fn test_import_rejects_oversized_total_import_before_any_parse() {
+        // MAX_IMPORT_SIZE (100 MiB) is enforced before PNG parsing begins, so a
+        // decompression/size bomb is rejected with no partial store and no
+        // observable parse side effects.
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(b"\xEF\xBB\xBF{");
+        bomb.extend(std::iter::repeat_n(b'A', MAX_IMPORT_SIZE + 16));
+        bomb.extend_from_slice(b"}");
+        let err = import_character(&bomb).expect_err("oversized import must fail closed");
+        assert!(matches!(err, ImportError::PngError(_)));
+    }
+
+    #[test]
+    fn test_import_is_all_or_nothing_no_partial_character() {
+        // The importer is pure parsing with no store, so the no-partial-store
+        // invariant is: a rejection never yields a (half-built) Character. We
+        // exercise several rejection shapes and assert each returns Err with no
+        // Ok value that could leak a partial build.
+        let bad_png = png::build_placeholder_png(); // no chara chunk
+        let truncated_json = br#"{"spec":"chara_card_v2","data":{"name":"x""#; // no closing brace
+        let bad_base64 = png_with_text_chunk("chara", "%%%not-base64%%%");
+        let bad_json = png_with_text_chunk(
+            "chara",
+            &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, br#"not json"#),
+        );
+        for (label, input) in [
+            ("placeholder-png", bad_png.as_slice()),
+            ("truncated-json", truncated_json),
+            ("bad-base64", &bad_base64),
+            ("bad-json", &bad_json),
+        ] {
+            assert!(
+                import_character(input).is_err(),
+                "{label}: importer must reject without producing a partial Character"
+            );
+        }
+    }
 }

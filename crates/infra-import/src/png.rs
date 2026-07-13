@@ -472,4 +472,84 @@ mod tests {
             .any(|c| matches!(c, PngChunk::Text { keyword, .. } if keyword == "chara"));
         assert!(has_chara, "应有 chara tEXt 块");
     }
+
+    // Build a raw PNG chunk (length BE + type + data + crc) for hostile-input tests.
+    fn raw_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(chunk_type);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(chunk_type.len() + data.len());
+        crc_input.extend_from_slice(chunk_type);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
+        out
+    }
+
+    fn minimal_png_with_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut png = Vec::new();
+        png.extend_from_slice(&PNG_SIGNATURE);
+        png.extend_from_slice(&raw_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+        ));
+        png.extend_from_slice(&raw_chunk(chunk_type, data));
+        png.extend_from_slice(&raw_chunk(b"IEND", &[]));
+        png
+    }
+
+    #[test]
+    fn parse_png_rejects_chunk_with_bad_crc() {
+        let mut png = minimal_png_with_chunk(b"tEXt", b"chara\0payload");
+        // Corrupt the CRC of the tEXt chunk (last 4 bytes before IEND).
+        // PNG = sig(8) + IHDR(25) + tEXt(12+payload) ... corrupt final crc byte.
+        let crc_pos = png.len() - 4 - 12; // 12 = IEND chunk total (4+4+0+4)
+        png[crc_pos] ^= 0xFF;
+        let err = parse_png(&png).expect_err("bad CRC must be rejected");
+        assert!(matches!(err, ImportError::PngError(_)));
+    }
+
+    #[test]
+    fn parse_png_rejects_oversized_single_chunk() {
+        // Declare a 70 MiB chunk body but provide only a few bytes.
+        let mut png = Vec::new();
+        png.extend_from_slice(&PNG_SIGNATURE);
+        png.extend_from_slice(&raw_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+        ));
+        // length = 70 * 1024 * 1024 (> 64 MiB MAX_CHUNK_SIZE)
+        png.extend_from_slice(&(70u32 * 1024 * 1024).to_be_bytes());
+        png.extend_from_slice(b"tEXt");
+        png.extend_from_slice(b"truncated-body");
+        let err = parse_png(&png).expect_err("oversized chunk must be rejected");
+        assert!(matches!(err, ImportError::PngError(_)));
+    }
+
+    #[test]
+    fn parse_png_rejects_truncated_chunk_body() {
+        let mut png = Vec::new();
+        png.extend_from_slice(&PNG_SIGNATURE);
+        png.extend_from_slice(&raw_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+        ));
+        // Declare a 1000-byte tEXt body but give only 5 bytes (no CRC either).
+        png.extend_from_slice(&1000u32.to_be_bytes());
+        png.extend_from_slice(b"tEXt");
+        png.extend_from_slice(b"short");
+        let err = parse_png(&png).expect_err("truncated chunk body must be rejected");
+        assert!(matches!(err, ImportError::PngError(_)));
+    }
+
+    #[test]
+    fn parse_png_stops_cleanly_on_dangling_partial_header() {
+        // A valid PNG followed by a few trailing bytes (partial next chunk
+        // header) must not error: the loop guard stops at pos+8 > len and
+        // returns the chunks collected so far.
+        let mut png = minimal_png_with_chunk(b"IDAT", &[0x78, 0x01, 0x01]);
+        png.extend_from_slice(&[0u8; 3]); // dangling 3 bytes (< 8 header)
+        let chunks = parse_png(&png).expect("dangling partial header should not error");
+        assert!(!chunks.is_empty(), "should still return collected chunks");
+    }
 }
