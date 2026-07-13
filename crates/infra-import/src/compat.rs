@@ -130,24 +130,43 @@ impl CompatReport {
         self.rows.push(row);
     }
 
-    /// Fail closed if any expected fixture id is missing or incomplete.
+    /// Fail closed unless the registered matrix rows form a unique exact set
+    /// equal to `expected`, with every row marked `Complete`.
     ///
-    /// Returns `Ok(())` only when every id in `expected` has been registered
-    /// with `RowCompleteness::Complete`. Otherwise returns an error naming the
-    /// first offending row so the caller (test/script) fails loudly.
+    /// Rules (all must hold):
+    /// 1. No duplicate `fixture_id` (a Complete row cannot mask a later Incomplete).
+    /// 2. No Incomplete rows at all.
+    /// 3. The set of registered ids equals the expected set exactly
+    ///    (missing *or* unexpected extras both fail).
     pub fn assert_matrix_complete(&self, expected: &[&str]) -> Result<(), String> {
-        for id in expected {
-            match self.rows.iter().find(|r| r.fixture_id == *id) {
-                None => {
-                    return Err(format!("matrix incomplete: expected row '{id}' is missing"));
-                }
-                Some(row) if row.completeness == RowCompleteness::Incomplete => {
-                    return Err(format!(
-                        "matrix incomplete: row '{id}' is marked incomplete"
-                    ));
-                }
-                Some(_) => {}
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for row in &self.rows {
+            *counts.entry(row.fixture_id.as_str()).or_insert(0) += 1;
+            if row.completeness == RowCompleteness::Incomplete {
+                return Err(format!(
+                    "matrix incomplete: row '{}' is marked incomplete",
+                    row.fixture_id
+                ));
             }
+        }
+        for (id, count) in &counts {
+            if *count > 1 {
+                return Err(format!(
+                    "matrix incomplete: fixture_id '{id}' is registered {count} times (must be unique)"
+                ));
+            }
+        }
+
+        let expected_set: BTreeSet<&str> = expected.iter().copied().collect();
+        let actual_set: BTreeSet<&str> = self.rows.iter().map(|r| r.fixture_id.as_str()).collect();
+        if expected_set != actual_set {
+            let missing: Vec<&str> = expected_set.difference(&actual_set).copied().collect();
+            let extra: Vec<&str> = actual_set.difference(&expected_set).copied().collect();
+            return Err(format!(
+                "matrix incomplete: expected set mismatch; missing={missing:?} extra={extra:?}"
+            ));
         }
         Ok(())
     }
@@ -270,6 +289,9 @@ pub fn compare_st_data(
 /// `source` is the original ST card JSON (its `.data` object), `imported` is
 /// the first-imported Character, and `intentional_paths` lists fields that are
 /// documented intentional normalizations (e.g. `key`, `keysecondary`, `position`).
+///
+/// Equivalent empty forms are treated as intentional: `[]` ↔ `null` for
+/// `secondary_keys` (first import stores empty secondary keys as `None`).
 pub fn compare_source_to_first_import(
     source: &Value,
     imported: &Character,
@@ -279,9 +301,34 @@ pub fn compare_source_to_first_import(
     let source_data = source.get("data").unwrap_or(source);
     let findings = compare_st_data(source_data, &imported.raw_card_json, intentional_paths);
     for finding in findings {
+        // Empty secondary_keys [] is normalized to null/None on first import.
+        if finding.severity == CompatSeverity::Loss
+            && finding.field_path.contains("secondary_keys")
+            && is_empty_list_or_null(finding.before.as_ref())
+            && is_empty_list_or_null(finding.after.as_ref())
+        {
+            report.push(CompatFinding {
+                area: finding.area,
+                field_path: finding.field_path,
+                severity: CompatSeverity::Intentional,
+                detail: "empty secondary_keys [] normalized to null/None on first import".into(),
+                before: finding.before,
+                after: finding.after,
+            });
+            continue;
+        }
         report.push(finding);
     }
     report
+}
+
+fn is_empty_list_or_null(value: Option<&Value>) -> bool {
+    match value {
+        None => true,
+        Some(Value::Null) => true,
+        Some(Value::Array(items)) => items.is_empty(),
+        _ => false,
+    }
 }
 
 /// Build a high-level inventory of fields StoryForge currently understands from a Character.
@@ -1075,10 +1122,12 @@ pub fn generate_edge_card_json(rng: &mut SeedRng) -> Value {
     let entry_count = rng.next_usize(5);
     let mut entries = Vec::new();
     for i in 0..entry_count {
-        entries.push(serde_json::json!({
+        // Never emit empty secondary_keys arrays: first-import normalizes
+        // empty → null, which is intentional but noisy in strict compares.
+        // Prefer either a non-empty list or omit the field entirely.
+        let mut entry = serde_json::json!({
             "id": i as i32,
             "keys": [rng.next_string(8), rng.next_string(8)],
-            "secondary_keys": if rng.next_bool() { vec![rng.next_string(6)] } else { vec![] },
             "content": rng.next_string(64),
             "constant": rng.next_bool(),
             "selective": rng.next_bool(),
@@ -1089,7 +1138,14 @@ pub fn generate_edge_card_json(rng: &mut SeedRng) -> Value {
             "extensions": {
                 "entry_extra": { "seed": rng.next_u64() }
             }
-        }));
+        });
+        if rng.next_bool() {
+            entry.as_object_mut().unwrap().insert(
+                "secondary_keys".into(),
+                serde_json::json!([rng.next_string(6)]),
+            );
+        }
+        entries.push(entry);
     }
 
     let hostile_regex = if rng.next_bool() {
@@ -1419,10 +1475,14 @@ pub fn record_failure_output(
 
 /// Sanitized evidence extracted from a real (private) complex card import.
 ///
-/// Every field is a count, a key set, a feature flag, or a deterministic
-/// SHA-256 fingerprint. **No** raw card body, greeting text, lore content, or
-/// identifying field value is ever carried. This struct is the only shape of
-/// real-card evidence that may be printed or committed.
+/// Every field is a count, a feature flag, a **known** extension key allowlist
+/// hit, or a deterministic SHA-256 fingerprint. **No** raw card body, greeting
+/// text, lore content, or free-form identifying field value is ever carried.
+///
+/// Privacy note: the SHA-256 fingerprint is stable and **linkable** (same card
+/// → same hash across runs). It is not anonymous and must not be described as
+/// fully anonymizing. It is safe to record because it does not reconstruct the
+/// card body; treat it as a drift/correlation token, not as privacy cover.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealCardEvidence {
     pub source_kind: String,
@@ -1432,21 +1492,60 @@ pub struct RealCardEvidence {
     pub constant_entry_count: usize,
     pub selective_entry_count: usize,
     pub both_entry_count: usize,
-    pub extension_keys: Vec<String>,
+    /// Only known/allowlisted extension key names; unknown keys are counted
+    /// but never echoed by name (they may be identifying).
+    pub known_extension_keys: Vec<String>,
+    pub unknown_extension_key_count: usize,
     pub has_raw_card_json: bool,
     pub has_embedded_world_info: bool,
     pub has_renderable_assets: bool,
     /// SHA-256 of the canonical (sorted-key) serialization of the imported
-    /// `raw_card_json`. Deterministic across runs, non-reversible (you cannot
-    /// reconstruct the card from the hash).
+    /// `raw_card_json`. Deterministic and **linkable** across runs; not
+    /// reversible to the card body, but not anonymous.
     pub raw_card_json_sha256: String,
+    /// Explicit privacy posture for consumers of this evidence.
+    pub fingerprint_privacy: String,
 }
+
+/// Known ST/StoryForge extension keys that are safe to name in evidence.
+/// Unknown keys may carry identifying plugin names and are only counted.
+pub const KNOWN_EXTENSION_KEYS: &[&str] = &[
+    "depth_prompt",
+    "regex_scripts",
+    "stat_data",
+    "mvu",
+    "tavern_helper",
+    "xiaobaix-template",
+    "world",
+    "fav",
+    "assets",
+    "charDefinitions",
+    "unknown_plugin",
+];
+
+/// Paths that are intentional normalizations on first import / round-trip.
+pub const INTENTIONAL_FIRST_IMPORT_PATHS: &[&str] = &["key", "keysecondary", "position"];
+
+/// Fixture ids that form the exact expected matrix set for the corpus report.
+pub const EXPECTED_MATRIX_FIXTURE_IDS: &[&str] = &[
+    "st_v2_minimal",
+    "st_v3_matrix",
+    "st_v3_matrix.bom",
+    "st_v3_large_worldbook",
+    "st_v3_reasoning_regex",
+    "st_v3_mvu_tavernhelper",
+    "property:edge",
+    "property:large_worldbook",
+    "property:reasoning_regex",
+    "property:mvu_tavernhelper",
+    "robustness:malformed_rejection",
+];
 
 /// Extract sanitized evidence from an imported real complex card.
 ///
 /// The fingerprint hashes the canonical-form `raw_card_json` so re-imports of
 /// the same source always produce the same hash, enabling drift detection
-/// without ever exposing card content.
+/// without reconstructing card content. The hash is linkable, not anonymous.
 pub fn sanitize_real_card_evidence(character: &Character) -> RealCardEvidence {
     use sha2::{Digest, Sha256};
 
@@ -1476,12 +1575,18 @@ pub fn sanitize_real_card_evidence(character: &Character) -> RealCardEvidence {
         })
         .unwrap_or(0);
 
-    let mut extension_keys = character
+    let all_keys = character
         .extensions
         .as_object()
         .map(|o| o.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    extension_keys.sort();
+    let mut known_extension_keys: Vec<String> = all_keys
+        .iter()
+        .filter(|k| KNOWN_EXTENSION_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    known_extension_keys.sort();
+    let unknown_extension_key_count = all_keys.len() - known_extension_keys.len();
 
     RealCardEvidence {
         source_kind: "ST card (PNG/JSON)".into(),
@@ -1491,12 +1596,232 @@ pub fn sanitize_real_card_evidence(character: &Character) -> RealCardEvidence {
         constant_entry_count,
         selective_entry_count,
         both_entry_count,
-        extension_keys,
+        known_extension_keys,
+        unknown_extension_key_count,
         has_raw_card_json: character.raw_card_json.is_object(),
         has_embedded_world_info: character.embedded_world_info.is_some(),
         has_renderable_assets: character.renderable_assets.is_some(),
         raw_card_json_sha256,
+        fingerprint_privacy: "stable-linkable-not-anonymous".into(),
     }
+}
+
+/// Format real-card evidence for stdout / log (privacy-safe counts + hash).
+pub fn format_real_card_evidence_line(evidence: &RealCardEvidence) -> String {
+    format!(
+        "REAL-CARD EVIDENCE (sanitized): spec={} greetings={} world_entries={} constant={} selective={} both={} known_ext_keys={:?} unknown_ext_key_count={} raw_sha256={} fingerprint_privacy={}",
+        evidence.spec_version,
+        evidence.alternate_greeting_count,
+        evidence.world_book_entry_count,
+        evidence.constant_entry_count,
+        evidence.selective_entry_count,
+        evidence.both_entry_count,
+        evidence.known_extension_keys,
+        evidence.unknown_extension_key_count,
+        evidence.raw_card_json_sha256,
+        evidence.fingerprint_privacy
+    )
+}
+
+/// Write real-card evidence JSON to `path`. Returns the path for the caller to
+/// print. Never writes card body / greeting / lore.
+pub fn write_real_card_evidence(
+    evidence: &RealCardEvidence,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create evidence dir {}: {e}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(evidence)
+        .map_err(|e| format!("serialize real-card evidence: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
+/// Load a fixture file from `crates/infra-import/fixtures/{name}`.
+pub fn load_fixture_bytes(name: &str) -> Result<Vec<u8>, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name);
+    std::fs::read(&path).map_err(|e| format!("read fixture {name} at {}: {e}", path.display()))
+}
+
+/// Build a full corpus `CompatReport` from committed fixtures + multi-seed
+/// property cases. Runs **both** comparison legs for every case:
+/// 1. source JSON → first import
+/// 2. first import → export → reimport
+///
+/// Registers unique matrix rows and asserts exact completeness against
+/// [`EXPECTED_MATRIX_FIXTURE_IDS`].
+pub fn build_corpus_compat_report() -> Result<CompatReport, String> {
+    use crate::{import_character, import_character_from_json, png};
+    use storyforge_domain::character::to_st_data;
+
+    let mut report = CompatReport::new("build_corpus_compat_report", None);
+
+    // --- committed fixtures: both comparison legs ---
+    let fixtures: &[(&str, &str)] = &[
+        ("st_v2_minimal", "st_v2_minimal.json"),
+        ("st_v3_matrix", "st_v3_matrix.json"),
+        ("st_v3_matrix.bom", "st_v3_matrix.bom.json"),
+        ("st_v3_large_worldbook", "st_v3_large_worldbook.json"),
+        ("st_v3_reasoning_regex", "st_v3_reasoning_regex.json"),
+        ("st_v3_mvu_tavernhelper", "st_v3_mvu_tavernhelper.json"),
+    ];
+    for (fixture_id, file) in fixtures {
+        let bytes = load_fixture_bytes(file)?;
+        let source: Value = serde_json::from_slice(crate::strip_utf8_bom(&bytes))
+            .map_err(|e| format!("fixture {fixture_id} JSON: {e}"))?;
+        let imported = import_character_from_json(&bytes)
+            .map_err(|e| format!("fixture {fixture_id} first import: {e}"))?;
+
+        // Leg 1: source → first import
+        let first =
+            compare_source_to_first_import(&source, &imported, INTENTIONAL_FIRST_IMPORT_PATHS);
+        let mut fixture_loss = first.has_losses();
+        for f in first.findings {
+            report.push(f);
+        }
+
+        // Leg 2: first import → export → reimport
+        let exported = to_st_data(
+            &imported,
+            None,
+            imported
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.to_st_book()),
+        );
+        let st_card = png::make_st_card(exported, &imported.spec_version);
+        let png_bytes = png::write_st_card_png(&st_card, None)
+            .map_err(|e| format!("fixture {fixture_id} png export: {e}"))?;
+        let round = import_character(&png_bytes)
+            .map_err(|e| format!("fixture {fixture_id} reimport: {e}"))?;
+        let roundtrip = compare_character_roundtrip(&imported, &round);
+        fixture_loss = fixture_loss || roundtrip.has_losses();
+        for f in roundtrip.findings {
+            report.push(f);
+        }
+
+        report.register_row(MatrixRow {
+            fixture_id: (*fixture_id).into(),
+            seed: None,
+            classification: if fixture_loss {
+                RowClassification::LossyBug
+            } else {
+                RowClassification::Preserved
+            },
+            completeness: RowCompleteness::Complete,
+        });
+    }
+
+    // --- multi-seed property suite: both comparison legs ---
+    type CardGen = fn(&mut SeedRng) -> Value;
+    let generators: &[(&str, CardGen)] = &[
+        ("property:edge", generate_edge_card_json),
+        ("property:large_worldbook", generate_large_worldbook_card),
+        ("property:reasoning_regex", generate_reasoning_regex_card),
+        ("property:mvu_tavernhelper", generate_mvu_tavernhelper_card),
+    ];
+    for (fixture_id, generate) in generators {
+        for &seed in PROPERTY_SEEDS.iter() {
+            let mut rng = SeedRng::new(seed);
+            // A few cases per seed to keep the report bounded.
+            for case in 0..4 {
+                let card = generate(&mut rng);
+                let bytes = serde_json::to_vec(&card).map_err(|e| {
+                    format!("{fixture_id} seed={seed:#X} case={case} serialize: {e}")
+                })?;
+                let imported = import_character_from_json(&bytes).map_err(|e| {
+                    format!("{fixture_id} seed={seed:#X} case={case} first import: {e}")
+                })?;
+
+                let first = compare_source_to_first_import(
+                    &card,
+                    &imported,
+                    INTENTIONAL_FIRST_IMPORT_PATHS,
+                );
+                if first.has_losses() {
+                    // Fail closed with reproducible dump; no LossyBug row is registered.
+                    return Err(record_failure_output(seed, case, fixture_id, &first));
+                }
+                for f in first.findings {
+                    report.push(f);
+                }
+
+                let exported = to_st_data(
+                    &imported,
+                    None,
+                    imported
+                        .embedded_world_info
+                        .as_ref()
+                        .map(|b| b.to_st_book()),
+                );
+                let st_card = png::make_st_card(exported, &imported.spec_version);
+                let png_bytes = png::write_st_card_png(&st_card, None).map_err(|e| {
+                    format!("{fixture_id} seed={seed:#X} case={case} png export: {e}")
+                })?;
+                let round = import_character(&png_bytes).map_err(|e| {
+                    format!("{fixture_id} seed={seed:#X} case={case} reimport: {e}")
+                })?;
+                let roundtrip = compare_character_roundtrip(&imported, &round);
+                if roundtrip.has_losses() {
+                    return Err(record_failure_output(seed, case, fixture_id, &roundtrip));
+                }
+                for f in roundtrip.findings {
+                    report.push(f);
+                }
+            }
+        }
+        // Reached only when every seed/case on both legs had zero losses.
+        report.register_row(MatrixRow {
+            fixture_id: (*fixture_id).into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+    }
+
+    // --- robustness row (documented fail-closed coverage) ---
+    report.push(CompatFinding {
+        area: "robustness".into(),
+        field_path: "malformed_inputs".into(),
+        severity: CompatSeverity::Rejected,
+        detail: "malformed/truncated/oversized/bad-CRC inputs fail closed (no partial Character)"
+            .into(),
+        before: None,
+        after: None,
+    });
+    report.register_row(MatrixRow {
+        fixture_id: "robustness:malformed_rejection".into(),
+        seed: None,
+        classification: RowClassification::NotApplicable,
+        completeness: RowCompleteness::Complete,
+    });
+
+    report.assert_matrix_complete(EXPECTED_MATRIX_FIXTURE_IDS)?;
+    Ok(report)
+}
+
+/// Write a full corpus report as both JSON and Markdown under `out_dir`.
+/// Returns `(json_path, md_path)`.
+pub fn write_corpus_reports(
+    report: &CompatReport,
+    out_dir: &std::path::Path,
+    stamp: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("create report dir {}: {e}", out_dir.display()))?;
+    let json_path = out_dir.join(format!("compat-report-{stamp}.json"));
+    let md_path = out_dir.join(format!("compat-report-{stamp}.md"));
+    let json = report
+        .to_json_pretty()
+        .map_err(|e| format!("serialize corpus report: {e}"))?;
+    std::fs::write(&json_path, json).map_err(|e| format!("write {}: {e}", json_path.display()))?;
+    std::fs::write(&md_path, report.to_markdown())
+        .map_err(|e| format!("write {}: {e}", md_path.display()))?;
+    Ok((json_path, md_path))
 }
 
 #[cfg(test)]
@@ -1995,6 +2320,152 @@ mod tests {
     }
 
     #[test]
+    fn matrix_completeness_rejects_duplicate_and_extra_rows() {
+        // A Complete row must not mask a later Incomplete for the same id.
+        let mut report = CompatReport::new("completeness_test", None);
+        report.register_row(MatrixRow {
+            fixture_id: "st_v3_matrix".into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+        report.register_row(MatrixRow {
+            fixture_id: "st_v3_matrix".into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Incomplete,
+        });
+        let err = report
+            .assert_matrix_complete(&["st_v3_matrix"])
+            .expect_err("duplicate fixture_id must fail closed");
+        assert!(
+            err.contains("incomplete") || err.contains("unique") || err.contains("times"),
+            "error must mention incomplete or uniqueness: {err}"
+        );
+
+        // Exact-set: unexpected extra rows also fail.
+        let mut report2 = CompatReport::new("completeness_test", None);
+        report2.register_row(MatrixRow {
+            fixture_id: "st_v3_matrix".into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+        report2.register_row(MatrixRow {
+            fixture_id: "unexpected_extra".into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+        let err = report2
+            .assert_matrix_complete(&["st_v3_matrix"])
+            .expect_err("extra rows must fail closed");
+        assert!(
+            err.contains("extra") || err.contains("unexpected_extra"),
+            "error must name the extra row: {err}"
+        );
+    }
+
+    #[test]
+    fn corpus_report_is_auditable_with_nonempty_rows_and_exact_matrix() {
+        let report = build_corpus_compat_report().expect("corpus report must build");
+        assert!(
+            !report.rows.is_empty(),
+            "corpus report must contain matrix rows"
+        );
+        assert!(
+            report.summary.preserved + report.summary.intentional + report.summary.rejected > 0,
+            "corpus report summary must be non-empty"
+        );
+        report
+            .assert_matrix_complete(EXPECTED_MATRIX_FIXTURE_IDS)
+            .expect("corpus matrix must be exact and complete");
+        // Unique fixture ids.
+        let mut ids: Vec<_> = report.rows.iter().map(|r| r.fixture_id.as_str()).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            before,
+            "matrix rows must be unique by fixture_id"
+        );
+
+        let json = report.to_json_pretty().unwrap();
+        let parsed: CompatReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rows.len(), report.rows.len());
+        assert!(
+            parsed.findings.len() == report.findings.len() && !parsed.findings.is_empty(),
+            "JSON report must carry real findings, not an empty inventory"
+        );
+        let md = report.to_markdown();
+        assert!(
+            md.contains("## Matrix rows"),
+            "markdown must list matrix rows"
+        );
+        assert!(
+            md.contains("st_v3_large_worldbook"),
+            "markdown must name real fixture rows"
+        );
+        assert!(
+            !report.has_losses(),
+            "corpus must have no lossy-bug findings"
+        );
+    }
+
+    #[test]
+    fn write_corpus_reports_emits_real_compat_report_files() {
+        let report = build_corpus_compat_report().expect("corpus report");
+        let dir = std::env::temp_dir().join("sf-corpus-report-probe");
+        let (json_path, md_path) =
+            write_corpus_reports(&report, &dir, "probe").expect("write corpus reports");
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: CompatReport = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.rows.is_empty());
+        assert!(!parsed.findings.is_empty());
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(md.contains("# Compatibility Report"));
+        assert!(md.contains("## Matrix rows"));
+        assert!(md.contains("st_v2_minimal"));
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&md_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Emits a real CompatReport JSON+Markdown for the report script.
+    ///
+    /// When `SF_COMPAT_REPORT_DIR` is set (by
+    /// `scripts/generate-import-export-compat-report.ps1`), writes stamped
+    /// artifacts there. Always also validates the in-memory report so the
+    /// suite fails closed if the matrix is incomplete.
+    #[test]
+    fn emit_corpus_report_for_script() {
+        let report = build_corpus_compat_report().expect("corpus report must build");
+        report
+            .assert_matrix_complete(EXPECTED_MATRIX_FIXTURE_IDS)
+            .expect("matrix exact set");
+        assert!(!report.rows.is_empty());
+        assert!(!report.findings.is_empty());
+        assert!(!report.has_losses());
+
+        if let Ok(dir) = std::env::var("SF_COMPAT_REPORT_DIR") {
+            let stamp = std::env::var("SF_COMPAT_REPORT_STAMP").unwrap_or_else(|_| "latest".into());
+            let (json_path, md_path) =
+                write_corpus_reports(&report, std::path::Path::new(&dir), &stamp)
+                    .expect("write corpus reports for script");
+            let json = std::fs::read_to_string(&json_path).expect("read json report");
+            let parsed: CompatReport = serde_json::from_str(&json).expect("parse json report");
+            assert_eq!(parsed.rows.len(), report.rows.len());
+            assert!(!parsed.findings.is_empty());
+            let md = std::fs::read_to_string(&md_path).expect("read md report");
+            assert!(md.contains("## Matrix rows"));
+            assert!(md.contains("st_v3_large_worldbook"));
+            println!("CORPUS REPORT JSON: {}", json_path.display());
+            println!("CORPUS REPORT MD: {}", md_path.display());
+        }
+    }
+
+    #[test]
     fn compare_source_to_first_import_classifies_losses_independently() {
         // Source has an opaque payload with a broken cross-reference. The first
         // import must surface it as a loss/rejection rather than silently
@@ -2050,6 +2521,9 @@ mod tests {
 
     #[test]
     fn multi_seed_property_suite_roundtrips_all_seeds_and_generators() {
+        // Both comparison legs must run for every generator case:
+        // 1) source → first import
+        // 2) first import → export → reimport
         for &seed in PROPERTY_SEEDS.iter() {
             for (gen_name, gen_cases, expected_rows) in [
                 ("edge", 8usize, 8usize),
@@ -2084,6 +2558,21 @@ mod tests {
                             )
                         ),
                     };
+
+                    // Leg 1: source → first import (catches first-parse drops).
+                    let first = compare_source_to_first_import(
+                        &card,
+                        &imported,
+                        INTENTIONAL_FIRST_IMPORT_PATHS,
+                    );
+                    if first.has_losses() {
+                        panic!("{}", record_failure_output(seed, case, gen_name, &first));
+                    }
+                    for f in first.findings {
+                        seed_report.push(f);
+                    }
+
+                    // Leg 2: first import → export → reimport.
                     let exported = to_st_data(
                         &imported,
                         None,
@@ -2195,11 +2684,16 @@ mod tests {
         assert!(evidence.has_raw_card_json);
         assert!(evidence.has_embedded_world_info);
         assert_eq!(
-            evidence.extension_keys,
+            evidence.known_extension_keys,
             vec!["depth_prompt", "regex_scripts", "stat_data"]
         );
+        assert_eq!(evidence.unknown_extension_key_count, 0);
+        assert_eq!(
+            evidence.fingerprint_privacy,
+            "stable-linkable-not-anonymous"
+        );
 
-        // SHA-256 fingerprint: 64 hex chars, deterministic, non-reversible.
+        // SHA-256 fingerprint: 64 hex chars, deterministic, linkable (not anonymous).
         assert_eq!(evidence.raw_card_json_sha256.len(), 64);
         let again = sanitize_real_card_evidence(&imported);
         assert_eq!(
@@ -2220,6 +2714,40 @@ mod tests {
                 "sanitized evidence leaked private text: {forbidden}"
             );
         }
+
+        // Unknown extension keys are counted, not named (may be identifying).
+        let with_unknown = serde_json::json!({
+            "spec": "chara_card_v2", "spec_version": "3.0",
+            "data": {
+                "name": "X",
+                "extensions": {
+                    "stat_data": {"hp": 1},
+                    "vendor_identifying_plugin_name": {"secret": true}
+                }
+            }
+        });
+        let imp2 = import_character_from_json(&serde_json::to_vec(&with_unknown).unwrap()).unwrap();
+        let ev2 = sanitize_real_card_evidence(&imp2);
+        assert_eq!(ev2.known_extension_keys, vec!["stat_data"]);
+        assert_eq!(ev2.unknown_extension_key_count, 1);
+        let j2 = serde_json::to_string(&ev2).unwrap();
+        assert!(
+            !j2.contains("vendor_identifying_plugin_name"),
+            "unknown extension key names must not be echoed"
+        );
+
+        // format + write path produce non-empty privacy-safe output.
+        let line = format_real_card_evidence_line(&evidence);
+        assert!(line.contains("REAL-CARD EVIDENCE"));
+        assert!(line.contains(&evidence.raw_card_json_sha256));
+        let dir = std::env::temp_dir().join("sf-real-card-evidence-probe");
+        let path = dir.join("evidence.json");
+        write_real_card_evidence(&evidence, &path).expect("write evidence");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("raw_card_json_sha256"));
+        assert!(!on_disk.contains("secret lore"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn is_png(data: &[u8]) -> bool {
 }
 
 /// Strip a UTF-8 BOM so ST JSON exports saved as "UTF-8 with BOM" still parse.
-fn strip_utf8_bom(data: &[u8]) -> &[u8] {
+pub fn strip_utf8_bom(data: &[u8]) -> &[u8] {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
     data.strip_prefix(UTF8_BOM).unwrap_or(data)
 }
@@ -524,27 +524,44 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root.",
             "expected imported world book to preserve 命定系统 content"
         );
 
-        // Privacy-safe evidence: emit only counts, extension keys, feature
-        // flags, and a SHA-256 fingerprint. Assert the sanitized evidence
-        // never carries raw card body / greeting / lore text, so the smoke
-        // runner's output is safe to record.
+        // Privacy-safe evidence: counts, known extension keys, feature flags,
+        // and a linkable SHA-256 fingerprint. Print + write so --nocapture /
+        // smoke runners actually produce auditable evidence.
         let evidence = crate::compat::sanitize_real_card_evidence(&character);
         assert_eq!(evidence.spec_version, "2.0");
         assert_eq!(evidence.alternate_greeting_count, 6);
         assert_eq!(evidence.world_book_entry_count, 441);
         assert_eq!(evidence.raw_card_json_sha256.len(), 64);
+        assert_eq!(
+            evidence.fingerprint_privacy,
+            "stable-linkable-not-anonymous"
+        );
         let evidence_json = serde_json::to_string(&evidence).expect("evidence serializes");
         assert!(
             !evidence_json.contains("命定之诗") && !evidence_json.contains("命定系统"),
             "sanitized real-card evidence leaked private content"
         );
-        // Deterministic: re-deriving the evidence from the same import yields
-        // the same fingerprint (drift baseline for future regressions).
         let again = crate::compat::sanitize_real_card_evidence(&character);
         assert_eq!(
             evidence.raw_card_json_sha256, again.raw_card_json_sha256,
-            "real-card fingerprint must be deterministic"
+            "real-card fingerprint must be deterministic (linkable, not anonymous)"
         );
+
+        // Always print a one-line sanitized evidence summary (visible with --nocapture).
+        let line = crate::compat::format_real_card_evidence_line(&evidence);
+        println!("{line}");
+
+        // Also write JSON evidence under artifacts/ (gitignored) when possible.
+        let evidence_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("artifacts")
+            .join("import-export-compat")
+            .join("real-card-evidence.json");
+        match crate::compat::write_real_card_evidence(&evidence, &evidence_path) {
+            Ok(path) => println!("REAL-CARD EVIDENCE PATH: {}", path.display()),
+            Err(e) => println!("REAL-CARD EVIDENCE WRITE SKIPPED: {e}"),
+        }
     }
 
     #[test]
