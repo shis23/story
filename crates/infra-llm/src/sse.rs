@@ -156,15 +156,23 @@ impl SseEventAccumulator {
         }
 
         // 末 chunk 携带 usage（choices 通常为空）。需 stream_options.include_usage=true
+        // 与非流式共用 usage_parse 语义：先把 StreamUsage 还原为 JSON 再归一化。
         if let Some(u) = &chunk.usage {
-            self.usage = Some(storyforge_domain::llm::Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                // 与非流式 openai::parse_cached_tokens 同语义：DeepSeek 顶层 / OpenAI 嵌套 / Anthropic
-                cached_tokens: u.resolved_cached_tokens(),
-                cache_creation_tokens: u.resolved_cache_creation_tokens(),
+            let usage_json = serde_json::json!({
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens,
+                "prompt_cache_hit_tokens": u.prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": u.prompt_cache_miss_tokens,
+                "prompt_tokens_details": u.prompt_tokens_details.as_ref().map(|d| {
+                    serde_json::json!({"cached_tokens": d.cached_tokens})
+                }),
+                "cache_read_input_tokens": u.cache_read_input_tokens,
+                "cache_creation_input_tokens": u.cache_creation_input_tokens,
             });
+            if let Some(parsed) = crate::usage_parse::parse_provider_usage(&usage_json) {
+                self.usage = Some(parsed);
+            }
         }
 
         // 推送 chunk（只带 content delta + finish_reason；

@@ -5,6 +5,7 @@ pub mod openai;
 pub mod retry;
 pub mod sse;
 pub mod text_tools;
+pub mod usage_parse;
 
 // 重新导出嵌入客户端
 pub use embedder::{EmbedConfig, Embedder, default_embed_config};
