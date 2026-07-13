@@ -17,6 +17,17 @@ export function exportPromptHookAudit(records) {
     {
       exportedAt: new Date().toISOString(),
       kind: 'prompt_hook_audit_export',
+      schema: {
+        identity: ['pluginId', 'pluginName', 'event', 'stage'],
+        timing: ['durationMs'],
+        outcome: ['status', 'changedKeys', 'error'],
+        redaction: ['inputSummary', 'outputSummary'],
+        guarantees: [
+          'no_full_prompt_bodies',
+          'no_private_memory_text',
+          'no_api_keys_or_secrets',
+        ],
+      },
       totalRecords: safeRecords.length,
       records: safeRecords,
     },

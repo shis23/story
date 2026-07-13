@@ -23,6 +23,42 @@ function hashString(value) {
   return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
+const SENSITIVE_AUDIT_KEY_PATTERN = /(api[_-]?key|authorization|password|secret|token|private[_-]?memory|credential)/i
+
+function isSensitiveAuditKey(key) {
+  return SENSITIVE_AUDIT_KEY_PATTERN.test(String(key || ''))
+}
+
+function withTimeout(promise, timeoutMs, onTimeout) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    return Promise.resolve(promise)
+  }
+  let timer = null
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      fn(value)
+    }
+    timer = setTimeout(() => {
+      try {
+        onTimeout?.()
+      } catch {
+        // Timeout side effects must not fail closed.
+      }
+      const error = new Error(`Plugin hook timed out after ${timeoutMs}ms`)
+      error.code = 'PROMPT_HOOK_TIMEOUT'
+      finish(reject, error)
+    }, timeoutMs)
+    Promise.resolve(promise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    )
+  })
+}
+
 function safeStableStringify(value) {
   try {
     return JSON.stringify(value)
@@ -79,6 +115,9 @@ function summarizeHookValue(value, seen = new WeakSet()) {
     }
     const childSummaries = keys.map((key) => {
       try {
+        if (isSensitiveAuditKey(key)) {
+          return [key, { type: 'sensitive', redacted: true }]
+        }
         return [key, summarizeHookValue(value[key], seen)]
       } catch (error) {
         return [key, { type: 'unreadable', error: summarizeHookError(error) }]
@@ -86,9 +125,11 @@ function summarizeHookValue(value, seen = new WeakSet()) {
     })
     return {
       type: 'object',
-      keys,
+      keys: keys.map((key) => (isSensitiveAuditKey(key) ? `<redacted:${hashString(key)}>` : key)),
       circular: childSummaries.some(([, child]) => summaryContainsCircular(child)) || undefined,
-      hash: hashString(safeStableStringify(childSummaries)),
+      hash: hashString(safeStableStringify(childSummaries.map(([key, child]) => (
+        isSensitiveAuditKey(key) ? [`<redacted:${hashString(key)}>`, child] : [key, child]
+      )))),
     }
   }
   if (valueType === 'number') {
@@ -110,10 +151,15 @@ export function summarizePromptHookPayload(payload = {}) {
     return { __payload: { type: 'object', unreadable: true, error: summarizeHookError(error) } }
   }
   for (const key of keys) {
+    const summaryKey = isSensitiveAuditKey(key) ? `<redacted:${hashString(key)}>` : key
     try {
-      summary[key] = summarizeHookValue(payload[key])
+      if (isSensitiveAuditKey(key)) {
+        summary[summaryKey] = { type: 'sensitive', redacted: true }
+        continue
+      }
+      summary[summaryKey] = summarizeHookValue(payload[key])
     } catch (error) {
-      summary[key] = { type: 'unreadable', error: summarizeHookError(error) }
+      summary[summaryKey] = { type: 'unreadable', error: summarizeHookError(error) }
     }
   }
   return summary
@@ -211,9 +257,16 @@ function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload
 
 export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, event, data = {}, options = {}) {
   let payload = data
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : null
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null
 
   for (const plugin of plugins || []) {
     if (!canModifyPrompt(plugin)) continue
+
+    if (isCancelled?.()) {
+      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload))
+      continue
+    }
 
     const host = hostRefs?.get?.(plugin.id)
     if (!host?.emitPluginEventAndWait) {
@@ -224,7 +277,10 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
     const beforePayload = payload
     const startedAt = nowMs()
     try {
-      const nextPayload = await host.emitPluginEventAndWait(event, payload)
+      const pending = host.emitPluginEventAndWait(event, payload)
+      const nextPayload = timeoutMs === null
+        ? await pending
+        : await withTimeout(pending, timeoutMs)
       if (nextPayload !== undefined) {
         payload = nextPayload
       }
@@ -238,12 +294,26 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
         payload,
       ))
     } catch (error) {
+      const timedOut = error?.code === 'PROMPT_HOOK_TIMEOUT'
+        || /timed out/i.test(String(error?.message || error || ''))
       try {
         options?.onError?.(error, plugin)
       } catch {
         // Error reporting should not make prompt hooks fail closed.
       }
-      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'error', startedAt, beforePayload, payload, error))
+      emitAudit(
+        options,
+        buildAuditRecord(
+          plugin,
+          event,
+          options.stage,
+          timedOut ? 'timeout' : 'error',
+          startedAt,
+          beforePayload,
+          payload,
+          error,
+        ),
+      )
     }
   }
 

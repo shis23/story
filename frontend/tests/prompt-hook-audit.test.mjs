@@ -123,4 +123,8 @@ test('export metadata is always present', () => {
   assert.equal(typeof parsed.exportedAt, 'string')
   assert.ok(parsed.exportedAt.length > 0)
   assert.equal(parsed.kind, 'prompt_hook_audit_export')
+  assert.deepEqual(parsed.schema.identity, ['pluginId', 'pluginName', 'event', 'stage'])
+  assert.deepEqual(parsed.schema.timing, ['durationMs'])
+  assert.ok(parsed.schema.guarantees.includes('no_full_prompt_bodies'))
+  assert.ok(parsed.schema.guarantees.includes('no_api_keys_or_secrets'))
 })
