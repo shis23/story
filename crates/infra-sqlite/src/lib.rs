@@ -14,6 +14,7 @@ pub mod contract;
 pub mod error;
 pub mod importer;
 pub mod migrations;
+pub mod production;
 pub mod unit_of_work;
 
 pub use connection::Database;

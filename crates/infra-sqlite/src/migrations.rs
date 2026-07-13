@@ -24,13 +24,20 @@ impl Migration {
     }
 }
 
-/// v1 内置 migration 列表（单向、编号）。
+/// 内置 migration 列表（单向、编号）。
 pub fn builtin_migrations() -> Vec<Migration> {
-    vec![Migration {
-        version: 1,
-        name: "init_schema_v1",
-        sql: include_str!("../migrations/V001__init_schema.sql"),
-    }]
+    vec![
+        Migration {
+            version: 1,
+            name: "init_schema_v1",
+            sql: include_str!("../migrations/V001__init_schema.sql"),
+        },
+        Migration {
+            version: 2,
+            name: "production_commit_ledger",
+            sql: include_str!("../migrations/V002__production_commit_ledger.sql"),
+        },
+    ]
 }
 
 /// 应用全部未执行 migration；已应用的校验 checksum。
@@ -177,12 +184,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1]);
-        assert_eq!(current_version(&db).unwrap(), 1);
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(current_version(&db).unwrap(), 2);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 1);
+        assert_eq!(current_version(&db).unwrap(), 2);
 
         // 核心表应存在
         for table in [
@@ -193,6 +200,7 @@ mod tests {
             "turn_attempts",
             "round_summaries",
             "round_summary_covers",
+            "mutation_commits",
             "import_runs",
         ] {
             let exists: i64 = db
@@ -205,6 +213,40 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "missing table {table}");
         }
+    }
+
+    #[test]
+    fn existing_v1_database_upgrades_to_v2_without_losing_data() {
+        let mut db = Database::open_in_memory().unwrap();
+        let v1 = builtin_migrations().remove(0);
+        assert_eq!(migrate_with(&mut db, &[v1]).unwrap(), vec![1]);
+        db.connection()
+            .execute(
+                "INSERT INTO character_cards (card_id, name, payload_json) VALUES ('card-upgrade', 'Upgrade', '{}')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(migrate(&mut db).unwrap(), vec![2]);
+        assert_eq!(current_version(&db).unwrap(), 2);
+        let cards: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM character_cards WHERE card_id = 'card-upgrade'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cards, 1);
+        let ledger_exists: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='mutation_commits'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger_exists, 1);
     }
 
     #[test]
