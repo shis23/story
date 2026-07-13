@@ -107,13 +107,7 @@ mod tests {
         expect: Option<Usage>,
     }
 
-    fn usage(
-        prompt: u32,
-        completion: u32,
-        total: u32,
-        cached: u32,
-        creation: u32,
-    ) -> Usage {
+    fn usage(prompt: u32, completion: u32, total: u32, cached: u32, creation: u32) -> Usage {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,

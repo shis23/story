@@ -248,6 +248,8 @@ pub(crate) mod openai_types {
 
     impl StreamUsage {
         /// 优先 DeepSeek 顶层，其次 OpenAI 嵌套，再次 Anthropic。
+        /// 测试与调试用；生产 SSE 路径经 `usage_parse::parse_provider_usage` 归一化。
+        #[cfg(test)]
         pub fn resolved_cached_tokens(&self) -> u32 {
             if self.prompt_cache_hit_tokens > 0 {
                 return self.prompt_cache_hit_tokens;
@@ -260,6 +262,7 @@ pub(crate) mod openai_types {
             self.cache_read_input_tokens
         }
 
+        #[cfg(test)]
         pub fn resolved_cache_creation_tokens(&self) -> u32 {
             if self.prompt_cache_miss_tokens > 0 {
                 return self.prompt_cache_miss_tokens;

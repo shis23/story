@@ -60,7 +60,7 @@ pub fn build_stream_request_body(req: &ChatRequest) -> serde_json::Value {
     body
 }
 
-use crate::usage_parse::{parse_cache_creation_tokens, parse_cached_tokens, parse_provider_usage};
+use crate::usage_parse::parse_provider_usage;
 
 /// 将内部消息转为 OpenAI 格式
 fn build_messages(messages: &[ChatMessage]) -> serde_json::Value {
@@ -308,31 +308,31 @@ mod tests {
     #[test]
     fn test_parse_cached_tokens_deepseek() {
         let usage = serde_json::json!({"prompt_cache_hit_tokens": 500});
-        assert_eq!(parse_cached_tokens(&usage), 500);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 500);
     }
 
     #[test]
     fn test_parse_cached_tokens_openai_nested() {
         let usage = serde_json::json!({"prompt_tokens_details": {"cached_tokens": 300}});
-        assert_eq!(parse_cached_tokens(&usage), 300);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 300);
     }
 
     #[test]
     fn test_parse_cached_tokens_anthropic() {
         let usage = serde_json::json!({"cache_read_input_tokens": 200});
-        assert_eq!(parse_cached_tokens(&usage), 200);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 200);
     }
 
     #[test]
     fn test_parse_cached_tokens_missing() {
         let usage = serde_json::json!({"prompt_tokens": 100});
-        assert_eq!(parse_cached_tokens(&usage), 0);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 0);
     }
 
     #[test]
     fn test_parse_cache_creation_tokens_deepseek() {
         let usage = serde_json::json!({"prompt_cache_miss_tokens": 400});
-        assert_eq!(parse_cache_creation_tokens(&usage), 400);
+        assert_eq!(crate::usage_parse::parse_cache_creation_tokens(&usage), 400);
     }
 
     #[test]
