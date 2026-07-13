@@ -41,6 +41,12 @@ pub enum SqliteError {
     #[error("unit of work already finished")]
     UnitOfWorkFinished,
 
+    #[error("production repository conflict: {0}")]
+    Conflict(String),
+
+    #[error("production repository record not found: {0}")]
+    RecordNotFound(String),
+
     #[error("{0}")]
     Other(String),
 }
