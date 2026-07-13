@@ -9,7 +9,13 @@
 ///
 /// 前端侧的 iframe 沙箱宿主 + postMessage API 桥在 JS 层实现，
 /// 本 crate 定义后端的权限校验和插件管理逻辑。
+pub mod compat_matrix;
 pub mod mvu_runtime;
+
+pub use compat_matrix::{
+    CompatEntry, CompatStatus, INTENTIONALLY_UNSUPPORTED_ST_EVENTS, PERMISSION_COMPAT_MATRIX,
+    ST_API_COMPAT_MATRIX, find_permission_entry, unsupported_event_names,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

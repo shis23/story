@@ -185,8 +185,7 @@ function isSubscribedToPluginEvent(plugin, eventName) {
 
 const SENSITIVE_EVENT_FIELDS = new Set([
   'content',
-  'displayContent',
-  'display_content',
+  'displaycontent',
   'text',
   'token',
   'delta',
@@ -194,7 +193,30 @@ const SENSITIVE_EVENT_FIELDS = new Set([
   'prompt',
   'intent',
   'raw',
+  // Body-like / diagnostic fields that can carry private text without ReadMemory.
+  'message',
+  'errormessage',
+  'error',
+  'stack',
+  'stderr',
+  'stdout',
+  'detail',
+  'details',
+  'body',
+  'payload',
+  'responsebody',
+  'apikey',
+  'authorization',
+  'password',
+  'secret',
+  'credential',
+  'privatememory',
 ])
+
+function isSensitiveEventField(key) {
+  const normalized = String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
+  return SENSITIVE_EVENT_FIELDS.has(normalized)
+}
 
 function sanitizePluginEventData(value) {
   if (Array.isArray(value)) {
@@ -206,7 +228,7 @@ function sanitizePluginEventData(value) {
 
   const sanitized = {}
   for (const [key, child] of Object.entries(value)) {
-    if (SENSITIVE_EVENT_FIELDS.has(key)) continue
+    if (isSensitiveEventField(key)) continue
     sanitized[key] = sanitizePluginEventData(child)
   }
   return sanitized
@@ -240,7 +262,7 @@ function createPluginEventPayload(pipelineEvent, options = {}) {
     payload.text = eventData.delta || ''
   } else if (includeSensitive && pipelineEvent.event_type === 'draft_ready') {
     payload.text = eventData.text || ''
-  } else if (pipelineEvent.event_type === 'error') {
+  } else if (includeSensitive && pipelineEvent.event_type === 'error') {
     payload.message = eventData.message || ''
   }
 
@@ -545,18 +567,41 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return true;
   }
 
-  function _invokeSlashCommand(name, args) {
+  function _unsupportedSlashResult(name, options) {
+    const commandName = String(name || '').trim() || '<empty>';
+    const message = 'Unsupported slash command: ' + commandName + ' is not registered';
+    const result = {
+      ok: false,
+      unsupported: true,
+      reason: 'unsupported_slash_command',
+      command: commandName,
+      message: message,
+    };
+    // Pipes need a hard failure so later segments do not run on silent success.
+    // Single-command ST callers keep a non-throwing object for compatibility.
+    if (options && options.throwing) {
+      const error = new Error(message);
+      error.code = 'SLASH_UNSUPPORTED';
+      error.unsupported = true;
+      error.command = commandName;
+      error.result = result;
+      throw error;
+    }
+    return result;
+  }
+
+  function _invokeSlashCommand(name, args, options) {
     const index = _findSlashCommandIndex(name);
     const command = index >= 0 ? _slashCommands[index] : null;
-    if (!command) return _invokeBuiltinSlashCommand(name, args);
+    if (!command) return _invokeBuiltinSlashCommand(name, args, options);
     return command.callback.apply(null, args);
   }
 
-  function _invokeBuiltinSlashCommand(name, args) {
+  function _invokeBuiltinSlashCommand(name, args, options) {
     if (name === 'genraw') {
       return window.storyforge.llm.generate(args && args.length ? args[0] : '');
     }
-    return undefined;
+    return _unsupportedSlashResult(name, options);
   }
 
   function _isPromiseLike(value) {
@@ -586,6 +631,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 
   function _executeSlashInvocation(input) {
     const segments = _splitSlashPipeline(input);
+    const multiSegment = segments.length > 1;
     let previousResult;
     let chain = null;
     function runSegment(index, resolvedPipe) {
@@ -595,7 +641,10 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
         parsed.pipe = resolvedPipe;
         parsed.previousResult = resolvedPipe;
       }
-      return _invokeSlashCommand(parsed.name, [parsed.args, parsed]);
+      // Multi-segment pipes fail closed on unknown commands so later stages never run.
+      return _invokeSlashCommand(parsed.name, [parsed.args, parsed], {
+        throwing: multiSegment,
+      });
     }
     for (let i = 0; i < segments.length; i++) {
       if (chain) {
@@ -618,7 +667,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     if (args.length === 0 && (trimmedName.charAt(0) === '/' || /\\s|\\|/.test(trimmedName))) {
       return _executeSlashInvocation(name);
     }
-    return _invokeSlashCommand(trimmedName, args);
+    return _invokeSlashCommand(trimmedName, args, { throwing: false });
   }
 
   function _parseSlashTokens(rawArgs) {
@@ -972,16 +1021,25 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
   }
 
   function _saveChat() {
-    return Promise.resolve(true);
+    // Local chat mirror only — no host conversation persist path yet.
+    // Keep ST boolean compatibility: awaited value is true, while the
+    // promise object itself carries a visible degraded marker.
+    const pending = Promise.resolve(true);
+    pending.ok = true;
+    pending.degraded = true;
+    pending.reason = 'local_mirror_only_no_host_persist';
+    return pending;
   }
 
   function _callGenericPopup(html, type, defaultValue) {
+    // No native popup UI; return ST-compatible degraded defaults.
     if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
     if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
     return Promise.resolve('');
   }
 
   function _getRequestHeaders() {
+    // Static shim — no session auth headers are exposed to plugins.
     return { 'Content-Type': 'application/json' };
   }
 

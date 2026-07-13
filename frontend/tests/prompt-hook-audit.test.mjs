@@ -123,4 +123,91 @@ test('export metadata is always present', () => {
   assert.equal(typeof parsed.exportedAt, 'string')
   assert.ok(parsed.exportedAt.length > 0)
   assert.equal(parsed.kind, 'prompt_hook_audit_export')
+  assert.deepEqual(parsed.schema.identity, ['pluginId', 'pluginName', 'event', 'stage'])
+  assert.deepEqual(parsed.schema.timing, ['durationMs'])
+  assert.ok(parsed.schema.guarantees.includes('no_full_prompt_bodies'))
+  assert.ok(parsed.schema.guarantees.includes('no_api_keys_or_secrets'))
+})
+
+test('exportPromptHookAudit sanitizes hostile records instead of passthrough JSON', () => {
+  const json = exportPromptHookAudit([
+    {
+      kind: 'prompt_hook',
+      pluginId: 'leaky',
+      pluginName: 'Leaky',
+      event: 'CHAT_COMPLETION_PROMPT_READY',
+      stage: 'frontend_intent',
+      status: 'ok',
+      durationMs: 3,
+      changedKeys: ['prompt'],
+      prompt: 'private prompt body that must never export',
+      api_key: 'SF_SECRET_abc',
+      messages: [{ role: 'user', content: 'private message body' }],
+      inputSummary: {
+        prompt: { type: 'string', length: 12, hash: 'abcd' },
+        api_key: 'SF_SECRET_should_be_stripped',
+      },
+      outputSummary: {
+        prompt: 'raw prompt text in summary',
+      },
+      error: {
+        name: 'Error',
+        message: 'hook failed with private prompt text',
+        stack: 'Error: hook failed with private prompt text',
+      },
+    },
+  ])
+
+  assert.equal(json.includes('private prompt body that must never export'), false)
+  assert.equal(json.includes('SF_SECRET_'), false)
+  assert.equal(json.includes('private message body'), false)
+  assert.equal(json.includes('raw prompt text in summary'), false)
+  assert.equal(json.includes('hook failed with private prompt text'), false)
+
+  const parsed = parsePromptHookAuditExport(json)
+  assert.equal(parsed.records[0].pluginId, 'leaky')
+  assert.equal(parsed.records[0].prompt, undefined)
+  assert.equal(parsed.records[0].api_key, undefined)
+  assert.equal(parsed.records[0].messages, undefined)
+  assert.equal(parsed.records[0].error.message, undefined)
+  assert.equal(typeof parsed.records[0].error.messageHash, 'string')
+  assert.equal(parsed.records[0].inputSummary.api_key, undefined)
+})
+
+test('hostile safe-leaf and identity fields cannot smuggle secrets into audit export', () => {
+  const markers = [
+    'SF_SECRET_plugin_name',
+    'SF_SECRET_stage',
+    'SF_SECRET_changed_key',
+    'SF_SECRET_error_name',
+    'SF_SECRET_leaf_value',
+    'SF_SECRET_leaf_hash',
+    'SF_SECRET_leaf_keys',
+  ]
+  const json = exportPromptHookAudit([{
+    pluginId: 'plugin-a',
+    pluginName: markers[0],
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    stage: markers[1],
+    status: 'ok',
+    changedKeys: [markers[2]],
+    error: { name: markers[3], message: 'hidden message' },
+    inputSummary: {
+      hostile: {
+        type: 'string',
+        value: markers[4],
+        hash: markers[5],
+      },
+    },
+    outputSummary: {
+      hostile: {
+        type: 'object',
+        keys: [markers[6]],
+      },
+    },
+  }])
+
+  for (const marker of markers) {
+    assert.equal(json.includes(marker), false, `audit export leaked ${marker}`)
+  }
 })

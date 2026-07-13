@@ -6,14 +6,19 @@
 // useWritingStore(messages / currentConversationId 读取)、useCampaignStore(writingMode / campaign / char 读取)。
 // 只 import 不修改:tauri-api.js、plugin-bridge.js、utils/promptHooks.js。
 
-import { ST_EVENT_TYPES } from '../plugin-bridge.js'
+import {
+  DEFAULT_PLUGIN_HOOK_TIMEOUT_MS,
+  ST_EVENT_TYPES,
+} from '../plugin-bridge.js'
 import { logAppendFrontend, pluginPromptHookResult } from '../tauri-api.js'
 import {
   appendPromptHookAuditRecord,
+  createPromptHookCancelledError,
   emitPromptHookEventAndWaitForPlugins,
   resolveHookedIntent,
   resolveHookedMessages,
 } from '../utils/promptHooks.js'
+import { sanitizePromptHookAuditRecord } from '../utils/promptHookAudit.js'
 import { usePluginStore } from '../stores/plugin.js'
 import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
@@ -22,6 +27,53 @@ export function usePluginBridge() {
   const plugin = usePluginStore()
   const writing = useWritingStore()
   const campaign = useCampaignStore()
+
+  // Production defaults: per-plugin timeout is always on; cancellation is scoped
+  // to one write/reroll generation so late events cannot revive old hooks.
+  let promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  let nextPromptHookGenerationId = 0
+  let activePromptHookGeneration = null
+
+  function setPromptHookTimeoutMs(timeoutMs) {
+    const previous = promptHookTimeoutMs
+    if (timeoutMs === undefined) {
+      promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+      return previous
+    }
+    if (timeoutMs === null) {
+      promptHookTimeoutMs = null
+      return previous
+    }
+    const next = Number(timeoutMs)
+    promptHookTimeoutMs = Number.isFinite(next) ? Math.max(0, next) : DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+    return previous
+  }
+
+  function beginPromptHookGeneration() {
+    if (activePromptHookGeneration && !activePromptHookGeneration.controller.signal.aborted) {
+      activePromptHookGeneration.controller.abort()
+    }
+    activePromptHookGeneration = {
+      id: ++nextPromptHookGenerationId,
+      controller: new AbortController(),
+    }
+    return activePromptHookGeneration.id
+  }
+
+  function ensurePromptHookGeneration() {
+    if (!activePromptHookGeneration) beginPromptHookGeneration()
+    return activePromptHookGeneration
+  }
+
+  function cancelPromptHooks() {
+    const generation = ensurePromptHookGeneration()
+    if (!generation.controller.signal.aborted) generation.controller.abort()
+    return generation.id
+  }
+
+  function isPromptHooksCancelled() {
+    return Boolean(activePromptHookGeneration?.controller.signal.aborted)
+  }
 
   // ─── host ref 管理(App.vue:131-138)──────────────────────────────────
   // setHookPluginHostRef 在 App.vue 模板里作为 :ref 回调被调用,需要保持引用稳定。
@@ -74,12 +126,13 @@ export function usePluginBridge() {
 
   // ─── prompt hook 审计(App.vue:178-185)──────────────────────────────
   function recordPromptHookAudit(record) {
+    const safeRecord = sanitizePromptHookAuditRecord(record)
     plugin.promptHookAuditRecords = appendPromptHookAuditRecord(
       plugin.promptHookAuditRecords,
-      record,
+      safeRecord,
       plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
     )
-    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(record)}`).catch(() => {})
+    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(safeRecord)}`).catch(() => {})
   }
 
   // ─── payload 构造(App.vue:187-213)──────────────────────────────────
@@ -124,8 +177,14 @@ export function usePluginBridge() {
     return payload
   }
 
-  // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage 与 onAudit 回调。
-  async function emitPromptHookEventAndWait(event, data = {}, stage = '') {
+  // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage / timeout / cancel / onAudit。
+  async function emitPromptHookEventAndWait(
+    event,
+    data = {},
+    stage = '',
+    generation = ensurePromptHookGeneration(),
+  ) {
+    if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
     return await emitPromptHookEventAndWaitForPlugins(
       plugin.hookPlugins,
       plugin.hookPluginHostRefs,
@@ -133,6 +192,8 @@ export function usePluginBridge() {
       data,
       {
         stage,
+        timeoutMs: promptHookTimeoutMs,
+        signal: generation.controller.signal,
         onAudit: recordPromptHookAudit,
       },
     )
@@ -141,6 +202,8 @@ export function usePluginBridge() {
   // ─── prompt hook 编排(App.vue:239-278)─────────────────────────────
   // runPromptHookEvents:写作前对用户意图依次触发两个 GENERATE hook,返回最终 intent。
   async function runPromptHookEvents(intent) {
+    beginPromptHookGeneration()
+    const generation = activePromptHookGeneration
     let payload = {
       intent,
       prompt: intent,
@@ -153,8 +216,18 @@ export function usePluginBridge() {
       ...chatEventPayload(),
     }
 
-    payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload, 'frontend_intent')
-    payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload, 'frontend_intent')
+    payload = await emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS,
+      payload,
+      'frontend_intent',
+      generation,
+    )
+    payload = await emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+      payload,
+      'frontend_intent',
+      generation,
+    )
 
     return resolveHookedIntent(payload, intent)
   }
@@ -166,7 +239,10 @@ export function usePluginBridge() {
     const originalMessages = Array.isArray(data.messages) ? data.messages : []
     if (!requestId) return
 
+    if (!activePromptHookGeneration) beginPromptHookGeneration()
+    const generation = activePromptHookGeneration
     try {
+      if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
       const payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, {
         ...chatEventPayload({
           promptHookStage: 'llm_messages',
@@ -175,7 +251,7 @@ export function usePluginBridge() {
           model: data.model || '',
         }),
         messages: originalMessages,
-      }, 'llm_messages')
+      }, 'llm_messages', generation)
       const messagesForBackend = resolveHookedMessages(payload, originalMessages)
       await pluginPromptHookResult(requestId, messagesForBackend, null)
     } catch (err) {
@@ -209,5 +285,10 @@ export function usePluginBridge() {
     // prompt hook 编排
     runPromptHookEvents,
     handlePromptHookRequest,
+    // production timeout/cancel wiring
+    setPromptHookTimeoutMs,
+    beginPromptHookGeneration,
+    cancelPromptHooks,
+    isPromptHooksCancelled,
   }
 }

@@ -725,8 +725,17 @@ test('redacts message content from subscribed plugins without ReadMemory', () =>
       messageId: 'm1',
       content: 'secret content',
       displayContent: '<b>secret</b>',
+      message: 'secret message body',
+      error: 'secret error body',
+      stack: 'Error: secret stack',
+      Message: 'secret mixed-case message',
+      error_message: 'secret snake-case error',
+      responseBody: 'secret camel-case body',
+      API_Key: 'secret normalized API key',
+      private_memory: 'secret normalized private memory',
       nested: {
         text: 'secret nested',
+        error: 'nested secret error',
         safe: 'metadata',
       },
     },
@@ -1287,15 +1296,21 @@ test('supports ST slash command unregister helpers and alias cleanup', () => {
   window.registerSlashCommand('rest', () => calls.push('rest'), ['sleep'])
 
   assert.equal(window.unregisterSlashCommand('hp'), true)
-  assert.equal(window.triggerSlashCommand('heal'), undefined)
-  assert.equal(window.triggerSlashCommand('hp'), undefined)
+  assert.deepEqual(plain(window.triggerSlashCommand('heal')), {
+    ok: false,
+    unsupported: true,
+    reason: 'unsupported_slash_command',
+    command: 'heal',
+    message: 'Unsupported slash command: heal is not registered',
+  })
+  assert.equal(plain(window.triggerSlashCommand('hp')).unsupported, true)
   assert.deepEqual(Array.from(window.SlashCommandParser.commands, (command) => command.name), ['inspect', 'rest'])
 
   assert.equal(window.SlashCommandParser.removeCommandObject('look'), true)
   assert.equal(window.storyforge.slashCommands.unregister('inspect'), false)
-  assert.equal(window.triggerSlashCommand('look'), undefined)
+  assert.equal(plain(window.triggerSlashCommand('look')).unsupported, true)
   assert.equal(window.TavernHelper.unregisterSlashCommand('sleep'), true)
-  assert.equal(window.triggerSlashCommand('rest'), undefined)
+  assert.equal(plain(window.triggerSlashCommand('rest')).unsupported, true)
   assert.deepEqual(calls, [])
   assert.deepEqual(Array.from(window.storyforge.slashCommands.list(), (command) => command.name), [])
 })
@@ -1320,7 +1335,7 @@ test('prefers slash command primary names over aliases when unregistering collis
   ])
 
   assert.equal(window.unregisterSlashCommand('hp'), true)
-  assert.equal(window.triggerSlashCommand('hp'), undefined)
+  assert.equal(plain(window.triggerSlashCommand('hp')).unsupported, true)
   window.triggerSlashCommand('heal')
   assert.deepEqual(calls, ['hp-primary', 'heal', 'heal'])
 })
@@ -1543,7 +1558,10 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(window.SillyTavern.chat[1].mes, 'new reply')
   assert.equal(await window.setChatMessage({ variables: { hp: 5 } }, 1), true)
   assert.deepEqual(plain(window.SillyTavern.chat[1].variables), { hp: 5 })
-  assert.equal(await window.SillyTavern.saveChat(), true)
+  const savePending = window.SillyTavern.saveChat()
+  assert.equal(savePending.degraded, true)
+  assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
+  assert.equal(await savePending, true)
   assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', 2), null)
