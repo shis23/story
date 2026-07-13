@@ -9,12 +9,18 @@
 ///
 /// 前端侧的 iframe 沙箱宿主 + postMessage API 桥在 JS 层实现，
 /// 本 crate 定义后端的权限校验和插件管理逻辑。
+pub mod audit;
 pub mod compat_matrix;
 pub mod mvu_runtime;
 
+pub use audit::{
+    AuditOrderBy, AuditPage, AuditQuery, AuditRecord, CorrelationId, chain_audit_records,
+    compute_audit_record_hash, ensure_live_permission, next_correlation_id, paginate_audit_records,
+    query_audit_records, retain_audit_records,
+};
 pub use compat_matrix::{
     CompatEntry, CompatStatus, INTENTIONALLY_UNSUPPORTED_ST_EVENTS, PERMISSION_COMPAT_MATRIX,
-    ST_API_COMPAT_MATRIX, find_permission_entry, unsupported_event_names,
+    ST_API_COMPAT_MATRIX, ST_EVENT_COMPAT_MATRIX, find_permission_entry, unsupported_event_names,
 };
 
 use serde::{Deserialize, Serialize};
