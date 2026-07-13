@@ -405,6 +405,22 @@ fn backup_manifest_and_file_name_redact_sensitive_label_and_source_path() {
 }
 
 #[test]
+fn backup_redacts_bare_credential_shaped_label() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+    let bare_credential = format!("{}{}", "sk-live-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    let backup =
+        create_backup_checkpoint(&db, dir.path().join("backup"), &bare_credential).unwrap();
+    let manifest = fs::read_to_string(&backup.manifest_path).unwrap();
+    let file_name = backup.backup_db_path.file_name().unwrap().to_string_lossy();
+    assert!(!manifest.contains(bare_credential.as_str()));
+    assert!(!file_name.contains(bare_credential.as_str()));
+    assert_eq!(backup.label, "[REDACTED]");
+}
+
+#[test]
 fn export_includes_jobs_ledger_and_redacts_extended_secrets() {
     let dir = TempDir::new().unwrap();
     let live_path = dir.path().join("live.sqlite3");
@@ -514,6 +530,56 @@ fn export_does_not_return_hostile_field_names_and_redacts_android_paths() {
         let text = fs::read_to_string(entry).unwrap_or_default();
         assert!(!text.contains(hostile_key));
         assert!(!text.contains(hostile_path));
+    }
+}
+
+#[test]
+fn export_redacts_secret_shaped_payload_ids_and_cover_edges() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::open(dir.path().join("live.sqlite3")).unwrap();
+    migrate(&mut db).unwrap();
+    let mut campaign = Campaign::new(Id::from_str("card-export-ids"), "Export IDs");
+    campaign.id = Id::from_str("camp-export-ids");
+    campaign.lineage_id = Some(Id::from_str("lineage-export-ids"));
+    let mut conversation = Conversation::new(None, Some(campaign.id.clone()));
+    conversation.id = Id::from_str("conv-export-ids");
+    campaign.conversation_id = Some(conversation.id.clone());
+    SqliteProductionRepository::bootstrap_campaign(&mut db, &campaign, &conversation).unwrap();
+
+    let secret_parent = format!("{}{}", "sk-parent-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    let secret_child = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature123456";
+    let mut child = RoundSummary::new(
+        campaign.id.clone(),
+        conversation.id.clone(),
+        1,
+        "child".to_string(),
+    )
+    .with_lineage(campaign.lineage_id.clone().unwrap());
+    child.id = Id::from_str(secret_child);
+    let mut parent = RoundSummary::new(
+        campaign.id.clone(),
+        conversation.id.clone(),
+        1,
+        "parent".to_string(),
+    )
+    .with_lineage(campaign.lineage_id.clone().unwrap());
+    parent.id = Id::from_str(&secret_parent);
+    parent.level = 1;
+    SqliteChronicleRepository::seed_summary(&mut db, &child).unwrap();
+    SqliteChronicleRepository::seed_summary(&mut db, &parent).unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO round_summary_covers (parent_id, child_id) VALUES (?1, ?2)",
+            rusqlite::params![secret_parent.as_str(), secret_child],
+        )
+        .unwrap();
+
+    let export_dir = dir.path().join("export");
+    export_readonly_snapshot(&db, &export_dir).unwrap();
+    for entry in walkdir_files(&export_dir) {
+        let text = fs::read_to_string(entry).unwrap_or_default();
+        assert!(!text.contains(secret_parent.as_str()));
+        assert!(!text.contains(secret_child));
     }
 }
 

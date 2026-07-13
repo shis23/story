@@ -279,7 +279,7 @@ pub fn export_readonly_snapshot(
         )?;
     }
 
-    let covers = export_cover_edges_tx(&tx)?;
+    let covers = export_cover_edges_tx(&tx, &mut redacted_fields)?;
     fs::write(
         export_dir.join("round_summary_covers.json"),
         serde_json::to_vec_pretty(&covers).map_err(SqliteError::from)?,
@@ -426,15 +426,20 @@ fn export_table_payloads_tx(
             SqliteError::Other(format!("corrupt payload_json in {table} id={id}: {e}"))
         })?;
         redact_value(&mut value, redacted_fields);
+        let mut exported_id = Value::String(id);
+        redact_value(&mut exported_id, redacted_fields);
         out.push(serde_json::json!({
-            "id": id,
+            "id": exported_id,
             "payload": value,
         }));
     }
     Ok(out)
 }
 
-fn export_cover_edges_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Value>> {
+fn export_cover_edges_tx(
+    tx: &rusqlite::Transaction<'_>,
+    redacted_fields: &mut BTreeSet<String>,
+) -> Result<Vec<Value>> {
     let mut stmt = tx.prepare(
         "SELECT parent_id, child_id FROM round_summary_covers ORDER BY parent_id, child_id",
     )?;
@@ -446,7 +451,9 @@ fn export_cover_edges_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Value>> {
     })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let mut value = row?;
+        redact_value(&mut value, redacted_fields);
+        out.push(value);
     }
     Ok(out)
 }
@@ -569,6 +576,36 @@ fn looks_like_secret_text(text: &str) -> bool {
         || compact.contains("credential:")
         || compact.contains("privatekey=")
         || compact.contains("privatekey:")
+        || looks_like_bare_credential(text)
+}
+
+fn looks_like_bare_credential(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len().saturating_sub(2) {
+        if bytes[start..].starts_with(b"sk-") {
+            let credential_len = bytes[start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'-' || **byte == b'_')
+                .count();
+            if credential_len >= 24 {
+                return true;
+            }
+        }
+    }
+
+    text.split_whitespace().any(|token| {
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '_');
+        let parts = token.split('.').collect::<Vec<_>>();
+        token.starts_with("eyJ")
+            && parts.len() == 3
+            && parts.iter().all(|part| {
+                part.len() >= 8
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+    })
 }
 
 fn looks_like_absolute_path_text(text: &str) -> bool {

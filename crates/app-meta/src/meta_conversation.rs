@@ -885,6 +885,7 @@ mod tests {
                     order: 100,
                     route: LoreRoute::Constant,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 },
                 WorldInfoEntry {
                     st_id: Some(2),
@@ -900,6 +901,7 @@ mod tests {
                     order: 100,
                     route: LoreRoute::Constant,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 },
             ],
             source: storyforge_domain::Source::Native,

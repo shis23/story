@@ -393,6 +393,12 @@ fn validate_publication_request(
         for window in children.windows(2) {
             let prev_end = window[0].effective_turn_end();
             let next_start = window[1].turn;
+            if next_start <= prev_end {
+                return Err(SqliteError::Conflict(format!(
+                    "parent {} covers overlap between turn {} and {}",
+                    parent.id, prev_end, next_start
+                )));
+            }
             if next_start > prev_end.saturating_add(1) {
                 return Err(SqliteError::Conflict(format!(
                     "parent {} covers are not continuous: gap between turn {} and {}",

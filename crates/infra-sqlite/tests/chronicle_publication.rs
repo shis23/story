@@ -424,6 +424,58 @@ fn rejects_overlapping_or_non_continuous_covers() {
 }
 
 #[test]
+fn rejects_true_overlap_between_stage_children() {
+    let mut f = fixture_with_leaves(4);
+    let (b_parents, b_covers, b_pub) = a_to_b_request(&f);
+    publish(&mut f.db, &f.campaign_id, &b_pub, &b_parents, &b_covers).unwrap();
+
+    // Corrupt the second B span so it overlaps the first B at turn 2. This is
+    // deliberately distinct from the gap case covered above.
+    let mut overlapping_b = b_parents[1].clone();
+    overlapping_b.turn = 2;
+    overlapping_b.turn_end = 4;
+    f.db
+        .connection()
+        .execute(
+            "UPDATE round_summaries SET turn = ?1, turn_end = ?2, payload_json = ?3 WHERE summary_id = ?4",
+            rusqlite::params![
+                overlapping_b.turn,
+                overlapping_b.turn_end,
+                serde_json::to_string(&overlapping_b).unwrap(),
+                overlapping_b.id.as_str(),
+            ],
+        )
+        .unwrap();
+
+    let c_parent = parent_c(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "bad-overlap-c",
+        b_parents.iter().map(|parent| parent.id.clone()).collect(),
+        1,
+        4,
+        "C0099",
+    );
+    let covers = b_parents
+        .iter()
+        .map(|parent| (parent.id.clone(), c_parent.id.clone()))
+        .collect::<Vec<_>>();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &Id::from_str("pub-true-overlap"),
+        std::slice::from_ref(&c_parent),
+        &covers,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("overlap") || err.to_string().contains("continuous"),
+        "{err}"
+    );
+}
+
+#[test]
 fn rejects_wrong_lineage_parent_level_and_turn_span() {
     let mut f = fixture_with_leaves(2);
 

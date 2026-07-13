@@ -417,6 +417,7 @@ mod tests {
                 LoreRoute::Selective
             },
             extensions: serde_json::json!({}),
+            extra: Default::default(),
         }
     }
 

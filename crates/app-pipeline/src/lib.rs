@@ -4489,6 +4489,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });
@@ -4531,6 +4532,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });
@@ -4620,6 +4622,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });
@@ -4672,6 +4675,7 @@ mod tests {
                     order: 100,
                     route: LoreRoute::Constant,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 },
                 WorldInfoEntry {
                     st_id: None,
@@ -4687,6 +4691,7 @@ mod tests {
                     order: 200,
                     route: LoreRoute::Selective,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 },
                 WorldInfoEntry {
                     st_id: None,
@@ -4702,6 +4707,7 @@ mod tests {
                     order: 100,
                     route: LoreRoute::Selective,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 },
             ],
             metadata: Default::default(),
@@ -4750,6 +4756,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Selective,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });
@@ -4800,6 +4807,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Selective,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });
@@ -4843,6 +4851,7 @@ mod tests {
                 order: 100,
                 route: LoreRoute::Both,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });

@@ -1260,6 +1260,7 @@ mod tests {
                 order: 100,
                 route,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }
         }
 
@@ -1335,6 +1336,7 @@ mod tests {
                     order: 100,
                     route: LoreRoute::Selective,
                     extensions: serde_json::json!({}),
+                    extra: Default::default(),
                 }],
                 metadata: Default::default(),
             })),
