@@ -413,8 +413,16 @@ function New-ReleaseDependencyInventory {
         $cargo = Get-Command cargo -ErrorAction SilentlyContinue
         if ($cargo -and (Test-Path -LiteralPath $CargoTomlPath)) {
             try {
-                $metaJson = & cargo metadata --format-version 1 --no-deps 2>$null
-                if ($LASTEXITCODE -eq 0 -and $metaJson) {
+                # Include transitive packages for SBOM-style inventory (not just workspace members).
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    $metaJson = & cargo metadata --format-version 1 --manifest-path $CargoTomlPath 2>$null
+                    $metaCode = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                if ($metaCode -eq 0 -and $metaJson) {
                     $generator = 'cargo-metadata'
                     $meta = $metaJson | ConvertFrom-Json
                     foreach ($pkg in $meta.packages) {

@@ -92,8 +92,15 @@ function Invoke-ReleaseBuildCommand {
     Push-Location -LiteralPath $WorkingDirectory
     try {
         Write-Host ("RUN: {0}" -f $formatted)
-        & $Command[0] @($Command[1..($Command.Count - 1)])
-        $code = $LASTEXITCODE
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $Command[0] @($Command[1..($Command.Count - 1)])
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($null -eq $code) { $code = 0 }
         if ($code -ne 0) {
             if ($AllowFail) {
                 $script:Warnings.Add("step '$Name' exited $code (allowed non-fatal)")
@@ -240,9 +247,28 @@ try {
     if (-not $SkipFrontend) {
         $nodeModules = Join-Path $frontendRoot 'node_modules'
         if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
-            $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci/install' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci')
+            # Prefer ci when lockfile present; fall back to install for local hosts.
+            $ciCode = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') -AllowFail
+            if ($ciCode -ne 0) {
+                $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd install' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'install')
+            }
         }
         $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
+    } else {
+        # Tauri generate_context! requires frontendDist to exist. Mirror bronze smoke:
+        # create a local gitignored placeholder so host compile can proceed without GUI claim.
+        $distDir = Join-Path $frontendRoot 'dist'
+        $indexPath = Join-Path $distDir 'index.html'
+        if (-not (Test-Path -LiteralPath $indexPath) -and -not $DryRun) {
+            New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+            @(
+                '<!doctype html>'
+                '<html><head><meta charset="utf-8"><title>StoryForge release placeholder</title></head>'
+                '<body><div id="app">StoryForge release placeholder</div></body></html>'
+            ) | Set-Content -LiteralPath $indexPath -Encoding utf8
+            $script:Notes.Add('created local frontend/dist placeholder because -SkipFrontend and dist was missing')
+            Write-Host 'Created local frontend/dist placeholder for Tauri release compile context.' -ForegroundColor Yellow
+        }
     }
 
     # Rust release binary.
@@ -309,12 +335,9 @@ try {
         -PackageLockPath (Join-Path $script:RepoRoot 'frontend\package-lock.json') `
         -PreferCargoTree:$false
     $inventoryPath = Join-Path $runDir 'dependency-inventory.json'
-    if (-not $DryRun) {
-        Write-ReleaseJson -Object $inventory -Path $inventoryPath
-        Write-Host ("Wrote inventory: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $inventoryPath))
-    } else {
-        Write-Host ("DRY RUN: would write {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $inventoryPath))
-    }
+    # Inventory is cheap local metadata and is always written (even in dry-run).
+    Write-ReleaseJson -Object $inventory -Path $inventoryPath
+    Write-Host ("Wrote inventory: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $inventoryPath))
     $script:Notes.Add(('dependency_inventory_generator={0}' -f $inventory.generator))
 
     $script:Notes.Add('host-only; GUI acceptance not claimed')

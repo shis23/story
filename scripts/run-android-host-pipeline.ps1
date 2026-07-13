@@ -111,8 +111,16 @@ function Invoke-AndroidHostCommand {
     Push-Location -LiteralPath $WorkingDirectory
     try {
         Write-Host ("RUN: {0}" -f $formatted)
-        $output = & $Command[0] @($Command[1..($Command.Count - 1)]) 2>&1
-        $code = $LASTEXITCODE
+        # Native tools often write warnings to stderr. Capture without turning
+        # those records into terminating errors under $ErrorActionPreference=Stop.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = & $Command[0] @($Command[1..($Command.Count - 1)]) 2>&1
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
         $lines = @($output | ForEach-Object { "$_" })
         if ($LogPath) {
             $lines | Set-Content -LiteralPath $LogPath -Encoding utf8
@@ -120,6 +128,7 @@ function Invoke-AndroidHostCommand {
         foreach ($line in $lines) {
             Write-Host $line
         }
+        if ($null -eq $code) { $code = 0 }
         if ($code -ne 0 -and -not $AllowFail) {
             Assert-ReleaseExitCode -ExitCode $code -StepName $Name
         }
@@ -242,11 +251,13 @@ try {
     $apkAttempted = $false
     if ($BuildApk) {
         $issues = @(
-            Get-AndroidPathIssue -Name 'ANDROID_HOME'
-            Get-AndroidPathIssue -Name 'NDK_HOME'
-        ) | Where-Object { $null -ne $_ }
+            @(
+                Get-AndroidPathIssue -Name 'ANDROID_HOME'
+                Get-AndroidPathIssue -Name 'NDK_HOME'
+            ) | Where-Object { $null -ne $_ }
+        )
 
-        if ($issues.Count -gt 0) {
+        if (@($issues).Count -gt 0) {
             if ($DryRun) {
                 foreach ($issue in $issues) {
                     Write-Host ("DRY RUN NOTE: {0}" -f $issue)
