@@ -1,0 +1,72 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "3.0",
+  "data": {
+    "name": "MVU TavernHelper Fixture",
+    "description": "sanitized MVU schema + tavernhelper + multi-definition fixture",
+    "personality": "deterministic",
+    "scenario": "compat lab",
+    "first_mes": "Primary greeting.",
+    "tags": ["fixture", "mvu", "tavernhelper"],
+    "creator": "StoryForge",
+    "character_version": "fixture-mvu-1",
+    "alternate_greetings": ["Alt A", "Alt B"],
+    "group_only": true,
+    "creator_notes": "synthetic multi-definition corpus",
+    "extensions": {
+      "depth_prompt": {
+        "depth": 4,
+        "prompt": "sanitized depth prompt",
+        "variables": {
+          "mood": "calm",
+          "energy": 80
+        }
+      },
+      "stat_data": {
+        "hp": 100,
+        "mood": "neutral",
+        "energy": 50
+      },
+      "mvu": {
+        "initvar": {
+          "sanity": 100,
+          "stress": 0
+        }
+      },
+      "tavern_helper": [
+        {
+          "id": "th-1",
+          "name": "Sanitized helper",
+          "type": "global",
+          "version": "1.0.0",
+          "code": "/* sanitized placeholder script; no private content */"
+        }
+      ],
+      "xiaobaix-template": {
+        "enabled": true,
+        "template": "sanitized template"
+      },
+      "charDefinitions": [
+        { "name": "Def Alpha", "description": "sanitized definition alpha" },
+        { "name": "Def Alpha", "description": "sanitized same-name definition beta" },
+        { "name": "Def Gamma", "description": "sanitized definition gamma" }
+      ]
+    },
+    "character_book": {
+      "name": "MVU Book",
+      "description": "book metadata",
+      "scan_depth": 3,
+      "extensions": { "book_plugin": { "enabled": true } },
+      "entries": [
+        {
+          "id": 1,
+          "keys": ["stat", "mvu"],
+          "content": "sanitized stat lore",
+          "constant": true,
+          "position": "before_char",
+          "order": 1
+        }
+      ]
+    }
+  }
+}

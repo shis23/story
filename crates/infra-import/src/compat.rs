@@ -969,6 +969,231 @@ pub fn generate_edge_card_json(rng: &mut SeedRng) -> Value {
     })
 }
 
+/// Generate a sanitized large-worldbook ST card for property testing.
+///
+/// Deterministic from `rng`. Covers constant/selective/both routes, legacy
+/// `key`/`keysecondary` aliases, numeric and string positions, entry
+/// `extensions`, and a few `disable: true` entries (which are intentionally
+/// filtered on import).
+pub fn generate_large_worldbook_card(rng: &mut SeedRng) -> Value {
+    let active = 40 + rng.next_usize(20);
+    let disabled = 1 + rng.next_usize(4);
+    let mut entries = Vec::new();
+    let mut id = 0i32;
+    for _ in 0..active {
+        let route = rng.next_usize(3);
+        let mut entry = serde_json::json!({
+            "id": id,
+            "content": rng.next_string(48),
+            "order": id,
+            "extensions": { "entry_extra": { "rank": id } }
+        });
+        let entry_obj = entry.as_object_mut().unwrap();
+        match route {
+            0 => {
+                entry_obj.insert("constant".into(), Value::Bool(true));
+                entry_obj.insert(
+                    "position".into(),
+                    if rng.next_bool() {
+                        Value::String("before_char".into())
+                    } else {
+                        Value::from(0)
+                    },
+                );
+            }
+            1 => {
+                entry_obj.insert("selective".into(), Value::Bool(true));
+                entry_obj.insert(
+                    "selective_logic".into(),
+                    Value::from(rng.next_usize(3) as i64),
+                );
+                entry_obj.insert("depth".into(), Value::from(rng.next_usize(8) as i64));
+                entry_obj.insert(
+                    "position".into(),
+                    if rng.next_bool() {
+                        Value::String("after_char".into())
+                    } else {
+                        Value::from(1)
+                    },
+                );
+            }
+            _ => {
+                entry_obj.insert("constant".into(), Value::Bool(true));
+                entry_obj.insert("selective".into(), Value::Bool(true));
+                entry_obj.insert("position".into(), Value::from(rng.next_usize(5) as i64));
+            }
+        }
+        if rng.next_bool() {
+            entry_obj.insert("key".into(), serde_json::json!([rng.next_string(6)]));
+            entry_obj.insert("keysecondary".into(), Value::String(rng.next_string(10)));
+        } else {
+            entry_obj.insert("keys".into(), serde_json::json!([rng.next_string(6)]));
+            entry_obj.insert(
+                "secondary_keys".into(),
+                serde_json::json!([rng.next_string(6)]),
+            );
+        }
+        entries.push(entry);
+        id += 1;
+    }
+    for _ in 0..disabled {
+        entries.push(serde_json::json!({
+            "id": id + 10000,
+            "disable": true,
+            "keys": [rng.next_string(6)],
+            "content": rng.next_string(16),
+            "selective": true,
+            "position": 0,
+            "order": 0
+        }));
+        id += 1;
+    }
+
+    serde_json::json!({
+        "spec": "chara_card_v2",
+        "spec_version": if rng.next_bool() { "3.0" } else { "2.0" },
+        "data": {
+            "name": format!("large-{}", rng.next_string(8)),
+            "description": rng.next_string(40),
+            "personality": rng.next_string(20),
+            "scenario": rng.next_string(20),
+            "first_mes": rng.next_string(24),
+            "tags": [rng.next_string(6), "large-book"],
+            "creator": "compat-large",
+            "character_version": format!("{}", rng.next_usize(9)),
+            "alternate_greetings": (0..rng.next_usize(3)).map(|_| Value::String(rng.next_string(24))).collect::<Vec<_>>(),
+            "extensions": {
+                "depth_prompt": { "depth": rng.next_usize(8) as i64, "prompt": rng.next_string(16) },
+                "unknown_plugin": { "flag": rng.next_bool() }
+            },
+            "character_book": {
+                "name": rng.next_string(8),
+                "description": rng.next_string(16),
+                "scan_depth": rng.next_usize(20) as i64,
+                "extensions": { "book_plugin": { "on": true } },
+                "entries": entries
+            }
+        }
+    })
+}
+
+/// Generate a sanitized reasoning/regex ST card for property testing.
+///
+/// Deterministic from `rng`. Covers Reasoning (placement 6), Input (1),
+/// Output (2) regex scripts with minDepth/maxDepth, markdownOnly/promptOnly.
+pub fn generate_reasoning_regex_card(rng: &mut SeedRng) -> Value {
+    let script_count = 1 + rng.next_usize(3);
+    let mut scripts = Vec::new();
+    let placements = [6i32, 1, 2, 5];
+    for i in 0..script_count {
+        let placement = placements[rng.next_usize(placements.len())];
+        let mut script = serde_json::json!({
+            "id": format!("reasoning-{}-{}", i, rng.next_string(4)),
+            "scriptName": rng.next_string(10),
+            "findRegex": format!("/{}/g", rng.next_string(12)),
+            "replaceString": rng.next_string(6),
+            "placement": [placement],
+            "disabled": false
+        });
+        let obj = script.as_object_mut().unwrap();
+        if rng.next_bool() {
+            obj.insert("promptOnly".into(), Value::Bool(rng.next_bool()));
+        }
+        if rng.next_bool() {
+            obj.insert("markdownOnly".into(), Value::Bool(rng.next_bool()));
+        }
+        if rng.next_bool() {
+            obj.insert("minDepth".into(), Value::from(rng.next_usize(5) as i64));
+            obj.insert("maxDepth".into(), Value::from(rng.next_usize(10) as i64));
+        }
+        scripts.push(script);
+    }
+
+    serde_json::json!({
+        "spec": "chara_card_v2",
+        "spec_version": "3.0",
+        "data": {
+            "name": format!("reasoning-{}", rng.next_string(8)),
+            "description": rng.next_string(40),
+            "first_mes": rng.next_string(24),
+            "tags": ["reasoning", "regex"],
+            "creator": "compat-reasoning",
+            "alternate_greetings": [rng.next_string(20)],
+            "extensions": {
+                "depth_prompt": { "depth": rng.next_usize(6) as i64, "prompt": rng.next_string(16) },
+                "regex_scripts": scripts,
+                "fav": rng.next_bool()
+            }
+        }
+    })
+}
+
+/// Generate a sanitized MVU/TavernHelper/multi-definition ST card for property testing.
+///
+/// Deterministic from `rng`. Covers stat_data, mvu.initvar, depth_prompt.variables,
+/// tavern_helper payloads, and multiple character definitions including same-name
+/// instances (which must stay isolated by id, not name).
+pub fn generate_mvu_tavernhelper_card(rng: &mut SeedRng) -> Value {
+    let def_count = 2 + rng.next_usize(3);
+    let same_name = rng.next_string(8);
+    let mut defs = Vec::new();
+    for i in 0..def_count {
+        // Half the definitions deliberately share a display name to exercise
+        // same-name instance isolation.
+        let name = if i % 2 == 0 {
+            same_name.clone()
+        } else {
+            format!("def-{}", rng.next_string(6))
+        };
+        defs.push(serde_json::json!({
+            "name": name,
+            "description": format!("sanitized def {}", i)
+        }));
+    }
+
+    serde_json::json!({
+        "spec": "chara_card_v2",
+        "spec_version": "3.0",
+        "data": {
+            "name": format!("mvu-{}", rng.next_string(8)),
+            "description": rng.next_string(40),
+            "first_mes": rng.next_string(24),
+            "tags": ["mvu", "tavernhelper"],
+            "creator": "compat-mvu",
+            "alternate_greetings": [rng.next_string(20)],
+            "group_only": true,
+            "extensions": {
+                "depth_prompt": {
+                    "depth": rng.next_usize(6) as i64,
+                    "prompt": rng.next_string(16),
+                    "variables": {
+                        "mood": rng.next_string(6),
+                        "energy": rng.next_usize(100) as i64
+                    }
+                },
+                "stat_data": {
+                    "hp": rng.next_usize(200) as i64,
+                    "mood": rng.next_string(6)
+                },
+                "mvu": {
+                    "initvar": {
+                        "sanity": rng.next_usize(100) as i64,
+                        "stress": rng.next_usize(50) as i64
+                    }
+                },
+                "tavern_helper": [{
+                    "id": format!("th-{}", rng.next_string(4)),
+                    "name": rng.next_string(8),
+                    "type": "global",
+                    "version": "1.0.0",
+                    "code": "/* sanitized placeholder; no private content */"
+                }],
+                "charDefinitions": defs
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,5 +1505,130 @@ mod tests {
         }
         assert!(aggregate.summary.preserved > 0);
         assert_eq!(aggregate.summary.loss, 0);
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {name} at {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn large_worldbook_fixture_imports_all_routes_and_aliases() {
+        let bytes = fixture_bytes("st_v3_large_worldbook.json");
+        let imported =
+            import_character_from_json(&bytes).expect("large worldbook fixture should import");
+        let book = imported
+            .embedded_world_info
+            .as_ref()
+            .expect("large worldbook fixture must carry an embedded book");
+        assert!(
+            book.entries.len() >= 100,
+            "large worldbook fixture should have >=100 entries, got {}",
+            book.entries.len()
+        );
+        let constant = book.entries.iter().filter(|e| e.constant).count();
+        let selective = book.entries.iter().filter(|e| e.selective).count();
+        let both = book
+            .entries
+            .iter()
+            .filter(|e| e.constant && e.selective)
+            .count();
+        assert!(constant > 0, "expected constant route entries");
+        assert!(selective > 0, "expected selective route entries");
+        assert!(both > 0, "expected both-route entries");
+        // Intentional normalization: ST entries marked `disable: true` are
+        // filtered out on import (documented product boundary), so the imported
+        // book must never contain a disabled entry even though the source did.
+        assert!(
+            !book.entries.iter().any(|e| e.disabled),
+            "imported book must not retain disabled entries (filtered by design)"
+        );
+        assert!(
+            book.entries
+                .iter()
+                .any(|e| e.keys.iter().any(|k| k == "alias-primary")),
+            "expected a legacy `key` alias to be materialized into keys"
+        );
+        assert!(
+            !book.metadata.is_empty(),
+            "expected book-level metadata to survive import"
+        );
+    }
+
+    #[test]
+    fn reasoning_regex_fixture_preserves_reasoning_and_depth_metadata() {
+        let bytes = fixture_bytes("st_v3_reasoning_regex.json");
+        let imported =
+            import_character_from_json(&bytes).expect("reasoning regex fixture should import");
+        let scripts = imported.scoped_regex_scripts();
+        assert!(
+            scripts.iter().any(|s| s.placement_codes.contains(&6)),
+            "expected a Reasoning (placement 6) regex script"
+        );
+        let reasoning = scripts
+            .iter()
+            .find(|s| s.placement_codes.contains(&6))
+            .expect("reasoning script");
+        assert!(reasoning.min_depth.is_some() || reasoning.max_depth.is_some());
+    }
+
+    #[test]
+    fn mvu_tavernhelper_fixture_preserves_mvu_schema_and_payloads() {
+        let bytes = fixture_bytes("st_v3_mvu_tavernhelper.json");
+        let imported =
+            import_character_from_json(&bytes).expect("mvu tavernhelper fixture should import");
+        let mvu = extract_mvu_schema_from_extensions(&imported.extensions);
+        assert!(
+            !mvu.is_empty(),
+            "expected MVU/stat_data schema fields to be detected"
+        );
+        let ext = imported
+            .extensions
+            .as_object()
+            .expect("extensions should be an object");
+        assert!(
+            ext.contains_key("tavern_helper"),
+            "expected tavern_helper extension payload to survive"
+        );
+        assert!(
+            ext.contains_key("depth_prompt"),
+            "expected depth_prompt extension to survive"
+        );
+    }
+
+    #[test]
+    fn generated_cards_roundtrip_each_generator_variant_without_loss() {
+        for seed in [0x5EED_0001u64, 0x5EED_0002, 0x5EED_0003] {
+            let mut rng = SeedRng::new(seed);
+            for generator in [
+                generate_large_worldbook_card(&mut rng),
+                generate_reasoning_regex_card(&mut rng),
+                generate_mvu_tavernhelper_card(&mut rng),
+            ] {
+                let bytes = serde_json::to_vec(&generator).unwrap();
+                let imported =
+                    import_character_from_json(&bytes).expect("generated card should import");
+                let exported = to_st_data(
+                    &imported,
+                    None,
+                    imported
+                        .embedded_world_info
+                        .as_ref()
+                        .map(|b| b.to_st_book()),
+                );
+                let st_card = png::make_st_card(exported, &imported.spec_version);
+                let png_bytes = png::write_st_card_png(&st_card, None).unwrap();
+                let round = import_character(&png_bytes).expect("generated card should reimport");
+                let report = compare_character_roundtrip(&imported, &round);
+                assert!(
+                    !report.has_losses(),
+                    "generator seed={seed} losses:\n{}",
+                    report.to_json_pretty().unwrap()
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,79 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Reasoning Regex Fixture",
+    "description": "sanitized reasoning placement and depth-scoped regex fixture",
+    "personality": "deterministic",
+    "scenario": "compat lab",
+    "first_mes": "Primary greeting.",
+    "mes_example": "<START>\n{{user}}: hi\n{{char}}: hello",
+    "system_prompt": "system",
+    "post_history_instructions": "phi",
+    "tags": ["fixture", "reasoning", "regex"],
+    "creator": "StoryForge",
+    "character_version": "fixture-reasoning-1",
+    "alternate_greetings": ["Alt A"],
+    "extensions": {
+      "depth_prompt": { "depth": 4, "prompt": "sanitized depth prompt" },
+      "regex_scripts": [
+        {
+          "id": "reasoning-strip",
+          "scriptName": "Reasoning strip",
+          "findRegex": "/<think>[\\s\\S]*?<\\/think>/g",
+          "replaceString": "",
+          "placement": [6],
+          "disabled": false,
+          "markdownOnly": false,
+          "promptOnly": false,
+          "minDepth": 1,
+          "maxDepth": 8
+        },
+        {
+          "id": "input-rewrite",
+          "scriptName": "Input rewrite",
+          "findRegex": "/foo/g",
+          "replaceString": "bar",
+          "placement": [1],
+          "disabled": false,
+          "promptOnly": true,
+          "markdownOnly": false,
+          "minDepth": 0,
+          "maxDepth": 0
+        },
+        {
+          "id": "output-display",
+          "scriptName": "Output display",
+          "findRegex": "/<img[^>]*>/gi",
+          "replaceString": "[image]",
+          "placement": [2],
+          "disabled": false,
+          "markdownOnly": true,
+          "promptOnly": false
+        }
+      ],
+      "fav": true,
+      "assets": {
+        "default": "<div class=\"display\">sanitized display asset</div>"
+      }
+    },
+    "character_book": {
+      "name": "Reasoning Book",
+      "description": "book metadata",
+      "scan_depth": 5,
+      "extensions": { "book_plugin": { "enabled": true } },
+      "entries": [
+        {
+          "id": 1,
+          "keys": ["think", "reasoning"],
+          "content": "sanitized reasoning lore",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "order": 1,
+          "depth": 3
+        }
+      ]
+    }
+  }
+}
