@@ -1,6 +1,34 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { exportPromptHookAudit, parsePromptHookAuditExport } from '../src/utils/promptHookAudit.js'
+import {
+  exportPromptHookAudit,
+  parsePromptHookAuditExport,
+  queryPromptHookAudit,
+  paginateAuditRecords,
+  computeAuditRecordHash,
+  chainAuditRecords,
+  retainAuditRecords,
+} from '../src/utils/promptHookAudit.js'
+
+function baseRecord(overrides = {}) {
+  return {
+    kind: 'prompt_hook',
+    pluginId: 'plugin-a',
+    pluginName: 'Plugin A',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    stage: 'frontend_intent',
+    status: 'ok',
+    durationMs: 10,
+    changedKeys: ['prompt'],
+    inputSummary: { prompt: { type: 'string', length: 4, hash: 'a1b2c3d4' } },
+    outputSummary: { prompt: { type: 'string', length: 6, hash: 'e5f6g7h8' } },
+    error: null,
+    correlationId: 'corr-1',
+    generationId: 'gen-1',
+    recordedAt: 1000,
+    ...overrides,
+  }
+}
 
 test('export with empty records produces valid JSON with zero count', () => {
   const json = exportPromptHookAudit([])
@@ -210,4 +238,153 @@ test('hostile safe-leaf and identity fields cannot smuggle secrets into audit ex
   for (const marker of markers) {
     assert.equal(json.includes(marker), false, `audit export leaked ${marker}`)
   }
+})
+
+// ─── query / filter / pagination / chain / retention ────────────────────────
+
+test('queryPromptHookAudit filters by pluginId, event, stage, status, correlation, generation', () => {
+  const records = [
+    baseRecord({ pluginId: 'p1', event: 'E1', stage: 's1', status: 'ok', correlationId: 'c1', generationId: 'g1' }),
+    baseRecord({ pluginId: 'p2', event: 'E1', stage: 's2', status: 'error', correlationId: 'c2', generationId: 'g1' }),
+    baseRecord({ pluginId: 'p1', event: 'E2', stage: 's1', status: 'timeout', correlationId: 'c1', generationId: 'g2' }),
+  ]
+
+  assert.equal(queryPromptHookAudit(records, { pluginId: 'p1' }).length, 2)
+  assert.equal(queryPromptHookAudit(records, { event: 'E1' }).length, 2)
+  assert.equal(queryPromptHookAudit(records, { stage: 's1' }).length, 2)
+  assert.equal(queryPromptHookAudit(records, { status: 'ok' }).length, 1)
+  assert.equal(queryPromptHookAudit(records, { correlationId: 'c1' }).length, 2)
+  assert.equal(queryPromptHookAudit(records, { generationId: 'g1' }).length, 2)
+  // Combined filters narrow further.
+  assert.equal(queryPromptHookAudit(records, { pluginId: 'p1', status: 'timeout' }).length, 1)
+  // Null/empty input is safe.
+  assert.deepEqual(queryPromptHookAudit(null, {}), [])
+})
+
+test('queryPromptHookAudit filters by duration range and recordedAt range', () => {
+  const records = [
+    baseRecord({ durationMs: 5, recordedAt: 100 }),
+    baseRecord({ durationMs: 50, recordedAt: 200 }),
+    baseRecord({ durationMs: 500, recordedAt: 300 }),
+  ]
+
+  assert.equal(queryPromptHookAudit(records, { minDurationMs: 40, maxDurationMs: 100 }).length, 1)
+  assert.equal(queryPromptHookAudit(records, { sinceMs: 150, untilMs: 250 }).length, 1)
+  assert.equal(queryPromptHookAudit(records, { sinceMs: 200 }).length, 2)
+})
+
+test('paginateAuditRecords applies deterministic ordering and bounds', () => {
+  const records = [
+    baseRecord({ pluginId: 'zeta', durationMs: 5, recordedAt: 300 }),
+    baseRecord({ pluginId: 'alpha', durationMs: 50, recordedAt: 100 }),
+    baseRecord({ pluginId: 'mid', durationMs: 500, recordedAt: 200 }),
+  ]
+
+  const byDurationDesc = paginateAuditRecords(records, { orderBy: 'durationMs', order: 'desc', limit: 2 })
+  assert.deepEqual(byDurationDesc.map((r) => r.pluginId), ['mid', 'alpha'])
+
+  const byRecordedAsc = paginateAuditRecords(records, { orderBy: 'recordedAt', order: 'asc' })
+  assert.deepEqual(byRecordedAsc.map((r) => r.pluginId), ['alpha', 'mid', 'zeta'])
+
+  // Offset is honored.
+  const paged = paginateAuditRecords(records, { orderBy: 'recordedAt', order: 'asc', limit: 1, offset: 1 })
+  assert.deepEqual(paged.map((r) => r.pluginId), ['mid'])
+
+  // Default order is insertion order; limit bounds result without error.
+  assert.equal(paginateAuditRecords(records, { limit: 0 }).length, 0)
+  assert.equal(paginateAuditRecords(records, {}).length, 3)
+})
+
+test('computeAuditRecordHash is deterministic and stable across reordering of summary keys', () => {
+  const r = baseRecord()
+  const reordered = baseRecord({
+    inputSummary: { prompt: { type: 'string', length: 4, hash: 'a1b2c3d4' } },
+  })
+  // Same logical content → same hash.
+  assert.equal(computeAuditRecordHash(r), computeAuditRecordHash(reordered))
+  // Different content → different hash.
+  const changed = baseRecord({ status: 'error' })
+  assert.notEqual(computeAuditRecordHash(r), computeAuditRecordHash(changed))
+})
+
+test('chainAuditRecords links records via prevHash and recomputes deterministically', () => {
+  const records = [
+    baseRecord({ pluginId: 'p1', recordedAt: 100 }),
+    baseRecord({ pluginId: 'p2', recordedAt: 200 }),
+    baseRecord({ pluginId: 'p3', recordedAt: 300 }),
+  ]
+  const chained = chainAuditRecords(records)
+
+  assert.equal(chained[0].prevHash, null)
+  assert.equal(chained[0].recordHash.length > 0, true)
+  assert.equal(chained[1].prevHash, chained[0].recordHash)
+  assert.equal(chained[2].prevHash, chained[1].recordHash)
+  // Re-chaining the same input produces identical hashes (deterministic).
+  const reChained = chainAuditRecords(records)
+  assert.deepEqual(
+    chained.map((r) => r.recordHash),
+    reChained.map((r) => r.recordHash),
+  )
+})
+
+test('chainAuditRecords detects tampering when a middle record changes', () => {
+  const records = [
+    baseRecord({ pluginId: 'p1', recordedAt: 100 }),
+    baseRecord({ pluginId: 'p2', recordedAt: 200 }),
+    baseRecord({ pluginId: 'p3', recordedAt: 300 }),
+  ]
+  const original = chainAuditRecords(records)
+  const tampered = chainAuditRecords([
+    records[0],
+    { ...records[1], status: 'error' },
+    records[2],
+  ])
+  // Tampering with p2 changes its own hash and breaks the chain at p3.
+  assert.notEqual(original[1].recordHash, tampered[1].recordHash)
+  assert.notEqual(original[2].recordHash, tampered[2].recordHash)
+  assert.notEqual(tampered[2].prevHash, original[2].prevHash)
+})
+
+test('retainAuditRecords bounds the ring buffer to the most recent records', () => {
+  const records = []
+  for (let i = 0; i < 10; i += 1) {
+    records.push(baseRecord({ pluginId: `p${i}`, recordedAt: 100 + i }))
+  }
+  const retained = retainAuditRecords(records, 3)
+  assert.equal(retained.length, 3)
+  // Retention keeps the newest (highest recordedAt when ordered by recency).
+  assert.deepEqual(retained.map((r) => r.pluginId), ['p7', 'p8', 'p9'])
+})
+
+test('chainAuditRecords and export never retain secrets or prompt bodies', () => {
+  const records = [
+    baseRecord({
+      prompt: 'private prompt body that must never chain',
+      api_key: 'SF_SECRET_chain',
+      messages: [{ role: 'user', content: 'private message body' }],
+    }),
+  ]
+  const chained = chainAuditRecords(records)
+  const json = JSON.stringify(chained)
+  assert.equal(json.includes('private prompt body that must never chain'), false)
+  assert.equal(json.includes('SF_SECRET_chain'), false)
+  assert.equal(json.includes('private message body'), false)
+  // The chained record still carries the tamper-evident hash.
+  assert.equal(typeof chained[0].recordHash, 'string')
+  assert.equal(chained[0].prevHash, null)
+})
+
+test('query and pagination re-sanitize hostile records at the boundary', () => {
+  const hostile = [{
+    pluginId: 'plugin-a',
+    prompt: 'private prompt body',
+    api_key: 'SF_SECRET_x',
+    status: 'ok',
+    inputSummary: { prompt: 'raw prompt text in summary' },
+  }]
+  const queried = queryPromptHookAudit(hostile, { pluginId: 'plugin-a' })
+  const json = JSON.stringify(queried)
+  assert.equal(json.includes('private prompt body'), false)
+  assert.equal(json.includes('SF_SECRET_'), false)
+  assert.equal(json.includes('raw prompt text in summary'), false)
 })

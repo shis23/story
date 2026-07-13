@@ -295,6 +295,8 @@ export function sanitizePromptHookAuditRecord(record) {
     inputSummary: sanitizeSummaryObject(record.inputSummary || {}),
     outputSummary: sanitizeSummaryObject(record.outputSummary || {}),
     error: sanitizeError(record.error),
+    correlationId: sanitizeFieldName(record.correlationId || ''),
+    generationId: sanitizeFieldName(record.generationId || ''),
   }
 }
 
@@ -341,4 +343,197 @@ export function exportPromptHookAudit(records) {
  */
 export function parsePromptHookAuditExport(jsonStr) {
   return JSON.parse(jsonStr)
+}
+
+// ─── query / filter / pagination / tamper-evident chain / retention ──────────
+
+const HASHABLE_AUDIT_FIELDS = Object.freeze([
+  'pluginId',
+  'pluginName',
+  'event',
+  'stage',
+  'status',
+  'durationMs',
+  'changedKeys',
+  'inputSummary',
+  'outputSummary',
+  'error',
+  'correlationId',
+  'generationId',
+])
+
+/**
+ * Deterministically serialize an audit record's hashable fields. Produces a
+ * stable canonical string regardless of key insertion order so equivalent
+ * records hash identically. Only sanitized-shape fields participate; no raw
+ * prompt bodies or secrets are part of the material.
+ */
+function canonicalRecordMaterial(record) {
+  const safe = sanitizePromptHookAuditRecord(record)
+  const parts = []
+  for (const field of HASHABLE_AUDIT_FIELDS) {
+    parts.push(`${field}=${stableStringify(safe[field])}`)
+  }
+  return parts.join('|')
+}
+
+function stableStringify(value, seen = new WeakSet()) {
+  const type = typeof value
+  if (value === null || value === undefined) return String(value)
+  if (type === 'string') return JSON.stringify(value)
+  if (type === 'number' || type === 'boolean') return String(value)
+  if (type === 'bigint') return `${value}n`
+  if (type === 'symbol' || type === 'function') return type
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[circular]'
+    seen.add(value)
+    return `[${value.map((item) => stableStringify(item, seen)).join(',')}]`
+  }
+  if (type === 'object') {
+    if (seen.has(value)) return '{circular}'
+    seen.add(value)
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key], seen)}`).join(',')}}`
+  }
+  return String(value)
+}
+
+/**
+ * Compute a tamper-evident hash over the sanitized record shape. Deterministic
+ * across key reordering; never includes raw prompts/secrets (those are dropped
+ * by sanitizePromptHookAuditRecord before hashing).
+ */
+export function computeAuditRecordHash(record) {
+  return hashString(canonicalRecordMaterial(record))
+}
+
+/**
+ * Filter audit records. Every record is re-sanitized at this boundary so
+ * hostile fields injected into the ring buffer cannot leak through a query.
+ *
+ * @param {Array<object>} records
+ * @param {object} [filters] - pluginId, event, stage, status, correlationId,
+ *   generationId, minDurationMs, maxDurationMs, sinceMs, untilMs
+ * @returns {Array<object>} sanitized matching records
+ */
+export function queryPromptHookAudit(records, filters = {}) {
+  if (!Array.isArray(records)) return []
+  const safeFilters = filters && typeof filters === 'object' ? filters : {}
+  const minDuration = Number.isFinite(safeFilters.minDurationMs) ? safeFilters.minDurationMs : null
+  const maxDuration = Number.isFinite(safeFilters.maxDurationMs) ? safeFilters.maxDurationMs : null
+  const since = Number.isFinite(safeFilters.sinceMs) ? safeFilters.sinceMs : null
+  const until = Number.isFinite(safeFilters.untilMs) ? safeFilters.untilMs : null
+
+  const out = []
+  for (const raw of records) {
+    const safe = sanitizePromptHookAuditRecord(raw)
+    if (safeFilters.pluginId !== undefined && safe.pluginId !== safeFilters.pluginId) continue
+    if (safeFilters.event !== undefined && safe.event !== safeFilters.event) continue
+    if (safeFilters.stage !== undefined && safe.stage !== safeFilters.stage) continue
+    if (safeFilters.status !== undefined && safe.status !== safeFilters.status) continue
+    if (safeFilters.correlationId !== undefined && (safe.correlationId || null) !== (safeFilters.correlationId || null)) continue
+    if (safeFilters.generationId !== undefined && (safe.generationId || null) !== (safeFilters.generationId || null)) continue
+    if (minDuration !== null && safe.durationMs < minDuration) continue
+    if (maxDuration !== null && safe.durationMs > maxDuration) continue
+    // recordedAt is not part of the sanitized shape (not identity-bearing);
+    // filter on the raw value when the caller supplied a time window.
+    const recordedAt = Number.isFinite(raw?.recordedAt) ? raw.recordedAt : null
+    if (since !== null && (recordedAt === null || recordedAt < since)) continue
+    if (until !== null && (recordedAt === null || recordedAt > until)) continue
+    // Preserve recordedAt on the returned record for downstream ordering.
+    out.push({ ...safe, recordedAt })
+  }
+  return out
+}
+
+/**
+ * Deterministic ordering + bounded pagination over sanitized records.
+ * orderBy supports: recordedAt, durationMs, pluginId, event, status.
+ * Default order is insertion order (no sort), limit/offset applied.
+ */
+export function paginateAuditRecords(records, options = {}) {
+  const safe = Array.isArray(records) ? records.map((r) => {
+    const s = sanitizePromptHookAuditRecord(r)
+    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
+  }) : []
+  const orderBy = options.orderBy
+  const order = options.order === 'asc' ? 'asc' : 'desc'
+  const limit = Number.isFinite(options.limit) && options.limit >= 0 ? Math.floor(options.limit) : safe.length
+  const offset = Number.isFinite(options.offset) && options.offset >= 0 ? Math.floor(options.offset) : 0
+
+  if (orderBy) {
+    const getter = (record) => {
+      if (orderBy === 'recordedAt') return record.recordedAt ?? null
+      if (orderBy === 'durationMs') return record.durationMs ?? 0
+      return record[orderBy] ?? ''
+    }
+    safe.sort((a, b) => {
+      const av = getter(a)
+      const bv = getter(b)
+      if (av === bv) return 0
+      if (av === null || av === undefined) return 1
+      if (bv === null || bv === undefined) return -1
+      return av < bv ? -1 : 1
+    })
+    if (order === 'desc') safe.reverse()
+  }
+
+  return safe.slice(offset, offset + limit)
+}
+
+/**
+ * Build a tamper-evident chain over sanitized records. Each record gets a
+ * recordHash computed from its sanitized shape plus the previous record's
+ * hash (prevHash). Deterministic: re-chaining identical input yields identical
+ * hashes; mutating any record invalidates its own and all downstream hashes.
+ *
+ * @param {Array<object>} records
+ * @returns {Array<object>} sanitized records with { recordHash, prevHash }
+ */
+export function chainAuditRecords(records) {
+  const safe = Array.isArray(records) ? records.map((r) => {
+    const s = sanitizePromptHookAuditRecord(r)
+    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
+  }) : []
+  let prevHash = null
+  return safe.map((record) => {
+    const material = `${prevHash}|${canonicalRecordMaterial(record)}`
+    const recordHash = hashString(material)
+    const chained = { ...record, recordHash, prevHash }
+    prevHash = recordHash
+    return chained
+  })
+}
+
+/**
+ * Retention helper: keep the most recent `limit` records (by recordedAt when
+ * available, otherwise insertion order). Bounds the ring buffer size. Returns
+ * the retained records in their original insertion order (newest-first display
+ * is the caller's responsibility).
+ */
+export function retainAuditRecords(records, limit = 100) {
+  if (!Array.isArray(records)) return []
+  const safe = records.map((r) => {
+    const s = sanitizePromptHookAuditRecord(r)
+    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
+  })
+  const max = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : 100
+  if (safe.length <= max) return safe
+  // Pick the most-recent `max` records by recordedAt (then insertion index),
+  // then return them in their original insertion order.
+  const indexed = safe.map((record, index) => ({ record, index }))
+  const keepIndices = new Set(
+    [...indexed]
+      .sort((a, b) => {
+        const ar = a.record.recordedAt
+        const br = b.record.recordedAt
+        if (ar === br) return b.index - a.index
+        if (ar === null) return 1
+        if (br === null) return -1
+        return br - ar
+      })
+      .slice(0, max)
+      .map((entry) => entry.index),
+  )
+  return safe.filter((_, index) => keepIndices.has(index))
 }
