@@ -29,6 +29,7 @@
 8. `7addb06` docs(workstream): finalize release build RESULT commit list
 9. `22e1c85` fix(release-build): close fail-closed gaps in host evidence runners
 10. `86133e4` fix(release-build): close final fail-closed evidence gaps
+11. `459fd86` fix(release-build): sanitize command and failure output
 
 ## Modified / added files
 
@@ -58,11 +59,11 @@ Not tracked (generated outside Git, already gitignored via `artifacts/`):
 | Step | Result |
 | --- | --- |
 | Initial Pester without helpers | RED: missing `ReleaseBuild.Common.ps1` |
-| Helpers + unit tests | GREEN: 35/35 |
+| Helpers + unit tests | GREEN: 37/37 |
 | Pipeline dry-run before scope/type fixes | RED: function-scope import / List cast issues |
 | After script-scope import + array casts | GREEN: parser + dry-run + fail-closed |
 | Final review tests | RED: 9 failures covering manifest recursion, APK contract, retention junction/delete safety, path boundary, run-id collision, and Pester result policy |
-| Final review implementation | GREEN: 35 unit + 13 pipeline; production missing-NDK child process exits before npm/cargo |
+| Final review implementation | GREEN: 37 unit + 14 pipeline; production missing-NDK child process exits before npm/cargo |
 | Secret-scan fixture false positive | RED on the strict default repository scan for a static synthetic key-shaped fixture |
 | Runtime-constructed hostile fixture | GREEN for both worktree and staged index; no allowlist or `-SkipSecretScan` required |
 
@@ -80,7 +81,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pip
 
 | Gate | Command | Result |
 | --- | --- | --- |
-| Unit + pipeline tests | `scripts/tests/run-release-build-tests.ps1` | **PASS** (35 unit + 13 pipeline; 0 skipped/pending/inconclusive) |
+| Unit + pipeline tests | `scripts/tests/run-release-build-tests.ps1` | **PASS** (37 unit + 14 pipeline; 0 skipped/pending/inconclusive) |
 | Windows dry-run | `scripts/run-release-build.ps1 -DryRun` | **PASS** status=`dry-run` |
 | Android dry-run | `scripts/run-android-host-pipeline.ps1 -DryRun` | **PASS** status=`dry-run` |
 | Whitespace | `git diff --check c3a972d..HEAD` | **PASS** |
@@ -190,6 +191,18 @@ Review findings closed in-branch:
 | Run directories collided within one second | Millisecond timestamp plus GUID nonce; creation is non-overwriting |
 | Pester could report success with zero executed or skipped tests | Entrypoint requires total > 0 and zero failed/skipped/pending/inconclusive tests |
 | Missing Android prerequisites were checked after host build work | Production `-BuildApk` preflight now exits non-zero before npm/cargo; child-process test covers the runner path |
+
+### Failure-output redaction follow-up (`459fd86`)
+
+- `Protect-ReleasePath` now removes `Authorization: Bearer ...` and standalone
+  Bearer credentials in addition to the existing token/key patterns.
+- Both runners sanitize displayed command text and route exception message,
+  script stack, and invocation position through one tested
+  `Get-ReleaseSafeErrorDetails` helper.
+- Top-level failure output uses direct stderr text rather than `Write-Error`,
+  avoiding PowerShell adding an unsanitized script path to a new error record.
+- Synthetic credential + Windows user-path RED/GREEN tests contain no real key;
+  the strict default repository scan remains green.
 
 ## Unfinished / risks
 
