@@ -1,0 +1,64 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "3.0",
+  "data": {
+    "name": "V3 Matrix Fixture",
+    "description": "sanitized matrix fixture",
+    "personality": "steady",
+    "scenario": "compat lab",
+    "first_mes": "Primary greeting.",
+    "mes_example": "<START>\nExample",
+    "system_prompt": "system",
+    "post_history_instructions": "phi",
+    "tags": ["fixture", "matrix"],
+    "creator": "StoryForge",
+    "character_version": "fixture-1",
+    "alternate_greetings": ["Alt A", "Alt B"],
+    "group_only": true,
+    "creator_notes": "unknown top-level data field",
+    "extensions": {
+      "stat_data": { "hp": 42, "mood": "calm" },
+      "unknown_plugin": { "nested": { "flag": true } },
+      "regex_scripts": [
+        {
+          "id": "fixture-regex",
+          "scriptName": "Fixture cleanup",
+          "findRegex": "/foo/g",
+          "replaceString": "bar",
+          "placement": [1, 2],
+          "disabled": false,
+          "promptOnly": true,
+          "markdownOnly": false
+        }
+      ]
+    },
+    "character_book": {
+      "name": "Fixture Book",
+      "description": "book metadata",
+      "scan_depth": 5,
+      "extensions": { "book_plugin": { "enabled": true } },
+      "entries": [
+        {
+          "id": 1,
+          "keys": ["always"],
+          "content": "Constant lore",
+          "constant": true,
+          "position": "before_char",
+          "order": 10
+        },
+        {
+          "id": 2,
+          "key": ["trigger"],
+          "keysecondary": "secondary-a, secondary-b",
+          "content": "Selective lore",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "order": 11,
+          "depth": 3,
+          "extensions": { "entry_extra": { "rank": 1 } }
+        }
+      ]
+    }
+  }
+}

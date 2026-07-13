@@ -100,6 +100,11 @@ impl CampaignStore {
         }
     }
 
+    /// Directory that owns the JSON files for this store (for reload/verify).
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.cards_path.parent()
+    }
+
     // ─── CharacterCard CRUD ───────────────────────────────────────────────
 
     pub fn list_cards(&self) -> Vec<StoredCard> {

@@ -1,3 +1,4 @@
+pub mod compat;
 pub mod png;
 
 use storyforge_domain::character::{Character, StCharacterCard};
@@ -47,7 +48,7 @@ pub fn import_character(data: &[u8]) -> Result<Character, ImportError> {
 
 /// 从 JSON 直接导入角色卡
 pub fn import_character_from_json(data: &[u8]) -> Result<Character, ImportError> {
-    let card: StCharacterCard = serde_json::from_slice(data)?;
+    let card: StCharacterCard = serde_json::from_slice(strip_utf8_bom(data))?;
     Ok(Character::from_st_card(card))
 }
 
@@ -70,19 +71,25 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
     let json_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)?;
 
-    let card: StCharacterCard = serde_json::from_slice(&json_bytes)?;
+    let card: StCharacterCard = serde_json::from_slice(strip_utf8_bom(&json_bytes))?;
     Ok(Character::from_st_card(card))
 }
 
 /// 导入 ST 预设（JSON）
 pub fn import_preset(data: &[u8]) -> Result<Preset, ImportError> {
-    let st: StPreset = serde_json::from_slice(data)?;
+    let st: StPreset = serde_json::from_slice(strip_utf8_bom(data))?;
     Ok(Preset::from_st(st))
 }
 
 /// 检查是否为 PNG 文件
 fn is_png(data: &[u8]) -> bool {
     data.len() >= 8 && data[..8] == png::PNG_SIGNATURE
+}
+
+/// Strip a UTF-8 BOM so ST JSON exports saved as "UTF-8 with BOM" still parse.
+fn strip_utf8_bom(data: &[u8]) -> &[u8] {
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    data.strip_prefix(UTF8_BOM).unwrap_or(data)
 }
 
 #[cfg(test)]
@@ -539,6 +546,19 @@ mod tests {
         let err = import_character_from_png(&png).expect_err("bad JSON should fail");
 
         assert!(matches!(err, ImportError::JsonError(_)));
+    }
+
+    #[test]
+    fn test_import_character_from_png_accepts_bom_json_payload() {
+        let mut json_bytes = vec![0xEF, 0xBB, 0xBF];
+        json_bytes.extend(serde_json::to_vec(&make_test_card_json()).unwrap());
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, json_bytes);
+        let png = png_with_text_chunk("chara", &encoded);
+
+        let character = import_character_from_png(&png).expect("PNG chara BOM should be accepted");
+
+        assert_eq!(character.name, "测试角色");
     }
 
     #[test]
