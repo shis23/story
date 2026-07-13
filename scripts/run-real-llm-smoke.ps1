@@ -87,6 +87,10 @@ $SuiteDefinitions = [ordered]@{
         Description = 'M5 evidence: production pipeline write + synthetic Chronicle fixture + faithful Accept across H_anchor+E'
         Filter = 'eval_real_llm_pipeline_write_synthetic_chronicle_accept_across_epoch'
     }
+    endurance = @{
+        Description = '100-turn endurance: production pipeline + faithful Accept + checkpoint/resume + sanitized evidence'
+        Filter = 'endurance_real_llm'
+    }
 }
 
 function Find-RepoRoot {
@@ -230,8 +234,8 @@ function Resolve-Suites {
 function Show-Suites {
     Write-Host 'Available real LLM smoke suites:'
     foreach ($name in $SuiteDefinitions.Keys) {
-        Write-Host ("  {0,-9} {1}" -f $name, $SuiteDefinitions[$name].Description)
-        Write-Host ("            filter: {0}" -f $SuiteDefinitions[$name].Filter)
+        Write-Host ("  {0,-11} {1}" -f $name, $SuiteDefinitions[$name].Description)
+        Write-Host ("              filter: {0}" -f $SuiteDefinitions[$name].Filter)
     }
     Write-Host ("  {0,-9} {1}" -f 'all', 'Run every suite above in order')
 }
@@ -305,7 +309,7 @@ function Invoke-SmokeSuite {
 
     $suiteEndedAt = Get-Date
     if ($exitCode -eq 0) {
-        if ($SuiteName -eq 'm5' -or $SuiteName -eq 'eval') {
+        if ($SuiteName -eq 'm5' -or $SuiteName -eq 'eval' -or $SuiteName -eq 'endurance') {
             # M5/eval 是真实模型探索性探针：exit 0 = 探针执行通过，不等于完整验收通过
             Write-Host ("OK: suite {0} probe execution passed (acceptance may still be Partial Evidence / Inconclusive)." -f $SuiteName) -ForegroundColor Green
             $status = 'PROBE_PASS'
@@ -409,6 +413,32 @@ try {
             Write-Warning 'Eval max_calls is below 3x max_turns; the production pipeline may fail closed before completing all Accept rounds.'
         }
     }
+
+    if ($suites -contains 'endurance') {
+        $endOn = $false
+        if ($null -ne (Get-RequiredEnv -Name 'STORYFORGE_EVAL_REAL_LLM')) {
+            $v = (Get-RequiredEnv -Name 'STORYFORGE_EVAL_REAL_LLM').Trim().ToLowerInvariant()
+            if ($v -in @('1', 'true', 'yes', 'on')) {
+                $endOn = $true
+            }
+        }
+        if (-not $endOn -and -not $DryRun) {
+            throw 'Suite endurance requires STORYFORGE_EVAL_REAL_LLM=1 (explicit paid-model authorization).'
+        }
+        # endurance builds the character in code — no fixture PNG required.
+        $endStage = Get-RequiredEnv -Name 'STORYFORGE_EVAL_ENDURANCE_STAGE'
+        if ($null -eq $endStage) {
+            $endStage = 'canary'
+        }
+        Write-Host ("Endurance stage: STORYFORGE_EVAL_ENDURANCE_STAGE={0}" -f $endStage)
+        if ($endStage -eq 'full') {
+            $endMaxCalls = $evalMaxCalls
+            $endParsedCalls = 0
+            if ( [int]::TryParse($endMaxCalls, [ref]$endParsedCalls) -and $endParsedCalls -lt 700) {
+                Write-Warning 'Endurance full stage requires STORYFORGE_EVAL_MAX_CALLS >= 700 for 100 accepted turns.'
+            }
+        }
+    }
     if ($DryRun) {
         Write-Host 'Dry run enabled; commands will be printed but not executed.'
     }
@@ -431,7 +461,7 @@ try {
     Write-Host ("Ended: {0}" -f (Format-Timestamp -Value $endedAt))
     Write-Host 'Suite results:'
     foreach ($result in $results) {
-        Write-Host ("  {0,-9} {1,-7} filter={2} exit={3}" -f $result.Suite, $result.Status, $result.Filter, $result.ExitCode)
+        Write-Host ("  {0,-11} {1,-7} filter={2} exit={3}" -f $result.Suite, $result.Status, $result.Filter, $result.ExitCode)
     }
 
     $failures = @($results | Where-Object { $_.ExitCode -ne 0 })
