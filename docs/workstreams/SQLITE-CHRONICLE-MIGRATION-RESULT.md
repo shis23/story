@@ -48,33 +48,41 @@ cold start (existing runner rechecks version after `BEGIN IMMEDIATE`).
 
 **Single `BEGIN IMMEDIATE` UoW semantics:**
 
-1. Replay ledger by `publication_id` + payload fingerprint (identical → no-op;
-   same id / different payload → conflict).
-2. Validate parents (B/C only), lineage, conversation scope, continuous
-   non-overlapping covers, child level (B covers A, C covers B), turn spans,
-   and source graph presence **before writes**.
-3. Write `pending_compress_publication` marker on Campaign.
-4. Parent upsert (exact identity / payload; conflict on same id / different body).
-5. Child `covered_by` updates + `round_summary_covers` rewrite.
-6. Verify marker completeness, bump `chronicle_revision` once, clear marker /
+1. Replay ledger by `publication_id` + payload fingerprint; completed replay
+   **re-verifies** parents/covers/child `covered_by` against live rows (drift →
+   conflict, not silent no-op). Same id / different payload → conflict.
+2. Reject reused non-empty `job_id`; refuse to overwrite an unrelated existing
+   `pending_compress_publication` marker.
+3. Validate parents (B/C only), parent+child lineage (None rejected), conversation
+   scope, continuous non-overlapping covers, child level (B covers A, C covers B),
+   turn spans, and source graph presence **before writes**.
+4. Write `pending_compress_publication` marker on Campaign.
+5. Parent upsert (exact identity / payload; conflict on same id / different body).
+6. Child `covered_by` updates + `round_summary_covers` rewrite.
+7. Verify marker completeness, bump `chronicle_revision` once, clear marker /
    `context_epoch`, complete job row.
-7. Fault points after parent insert, child update, revision bump, and marker
+8. Fault points after parent insert, child update, revision bump, and marker
    cleanup each roll back the full publication.
 
 ### Migration readiness (`crates/infra-sqlite/src/readiness.rs`)
 
 - `validate_source_manifest` — dry-run JSON tree validation + manifest hash;
-  **never opens/writes a live DB**
-- `create_backup_checkpoint` — online SQLite backup + manifest; live DB content
-  unchanged
-- `export_readonly_snapshot` — read-only JSON export for rollback inspection;
-  secret fields removed (`api_key`, tokens, passwords, …); live DB not mutated
+  **never opens/writes a live DB**; hash labels/order match importer
+  (`round_summaries`, sorted item encoding, path-sorted conversations)
+- `create_backup_checkpoint` — unique millisecond/nanos filenames, refuse live
+  path / existing-file overwrite, schema_version read from **backup DB**
+- `export_readonly_snapshot` — single deferred snapshot transaction; includes
+  `chronicle_publication_jobs` / `mutation_commits` / `import_runs`; corrupt
+  `payload_json` fails closed; secret field names + free-text patterns redacted
+  (`apiKey`, `credential`, `bearer`, `token=…`, …)
 
 ### Importer diagnostics (`crates/infra-sqlite/src/importer.rs`)
 
 - Pre-write validation rejects:
   - duplicate Attempt ownership across Turns
   - partial/invalid summary graphs (missing cover parent/child)
+  - covers ↔ `covered_by` bidirectional mismatch
+  - parent/child scope drift (`campaign_id` / `conversation_id` / `lineage_id`)
 - Still all-or-nothing: failed import leaves no business rows
 - Attempt upsert also refuse rehanging an existing `attempt_id` onto another Turn
 
@@ -85,7 +93,9 @@ cold start (existing runner rechecks version after `BEGIN IMMEDIATE`).
 | `917f0de` | docs(workstream): plan SQLite chronicle migration |
 | `0b5a426` | feat(infra-sqlite): transactional Chronicle B/C publication UoW |
 | `904ff38` | feat(infra-sqlite): migration readiness tools and importer diagnostics |
-| (this file) | docs(workstream): SQLite chronicle migration result |
+| `5c30c6c` | docs(workstream): record SQLite chronicle migration result |
+| (hardening) | fix(infra-sqlite): harden chronicle publication and migration readiness |
+| (this update) | docs(workstream): update chronicle migration hardening evidence |
 
 ## Modified files (relative to `c3a972d`, excluding this RESULT until committed)
 
@@ -125,6 +135,11 @@ GREEN after implementation:
 | fault after revision bump | `fault_after_revision_bump_rolls_back_publication` |
 | fault after marker cleanup | `fault_after_marker_cleanup_rolls_back_publication` |
 | accept path still usable | `existing_turn_accept_uow_still_green_after_publication_module` |
+| child lineage=None rejected | `child_with_missing_lineage_is_rejected` |
+| child conversation scope | `child_with_wrong_conversation_is_rejected` |
+| completed replay checks live state | `completed_replay_rejects_when_db_state_drifted` |
+| job_id uniqueness | `duplicate_job_id_is_rejected` |
+| existing pending marker preserved | `existing_pending_marker_is_not_silently_overwritten` |
 
 ### Migration readiness / V3
 
@@ -142,6 +157,10 @@ GREEN:
 | V1→V3 upgrade keeps data | `v1_and_v2_databases_upgrade_to_v3_publication_schema` |
 | concurrent first start → V3 | `concurrent_first_start_migrations_are_idempotent` |
 | unit V1 upgrade path | `existing_v1_database_upgrades_to_v2_without_losing_data` (now applies 2+3) |
+| dry-run hash == importer hash | `source_manifest_hash_matches_importer_hash` |
+| unique backup paths + backup schema | `backup_uses_unique_paths_and_backup_db_schema_version` |
+| export jobs/ledger + extended secrets | `export_includes_jobs_ledger_and_redacts_extended_secrets` |
+| corrupt payload fails export | `export_rejects_corrupt_payload_json` |
 
 ### Importer diagnostics
 
@@ -155,6 +174,7 @@ GREEN:
 - `importer_rejects_duplicate_attempt_ownership_with_clear_diagnostics`
 - `importer_rejects_partial_summary_graph_without_half_import`
 - `importer_still_accepts_valid_source_all_or_nothing`
+- `importer_rejects_covers_covered_by_mismatch_and_scope_drift`
 
 ## Actual gate results (scoped only; no full workspace)
 
@@ -162,7 +182,7 @@ GREEN:
 | --- | --- |
 | `cargo fmt -p storyforge-infra-sqlite -p storyforge-domain -- --check` | PASS |
 | `cargo test -p storyforge-domain` | PASS: 243 passed |
-| `cargo test -p storyforge-infra-sqlite` | PASS: 20 unit + 12 publication + 6 readiness + 3 importer diagnostics + 1 concurrency + 25 production UoW |
+| `cargo test -p storyforge-infra-sqlite` | PASS: 20 unit + 17 publication + 10 readiness + 4 importer diagnostics + 1 concurrency + 25 production UoW |
 | `cargo clippy -p storyforge-domain -p storyforge-infra-sqlite --all-targets -- -D warnings` | PASS |
 | `git diff --check c3a972d..HEAD` | PASS |
 
@@ -201,12 +221,15 @@ Existing Turn accept UoW suite (`production_uow.rs`, 25 tests) remains green.
 
 1. Publication UoW is production-shaped but **not app-wired**; JSON compress
    publish remains the live path.
-2. Export redaction is field-name based; unknown secret keys in free-form JSON
-   may still appear unless named in the deny list.
+2. Export redaction is field-name + free-text pattern based; novel secret key
+   names outside the deny/pattern list may still appear.
 3. Backup requires the rusqlite `backup` feature (bundled SQLite); increases
    compile surface slightly when this crate is linked.
-4. Importer diagnostics cover Attempt ownership and summary graph shape; other
-   cross-entity consistency checks remain future work.
+4. Importer diagnostics now cover Attempt ownership, bidirectional summary
+   covers, and basic parent/child scope; broader entity-graph checks remain
+   future work.
+5. `job_id` uniqueness is enforced when provided; callers that omit `job_id`
+   rely on `publication_id` identity only.
 
 ## Merge recommendation
 
