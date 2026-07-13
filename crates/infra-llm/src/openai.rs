@@ -2,7 +2,7 @@
 ///
 /// 负责将内部 ChatRequest 转为 OpenAI JSON 格式，以及将 OpenAI 响应转回 ChatResponse。
 /// DeepSeek、Groq、Moonshot、OpenRouter 等都走此路径。
-use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, ToolCall, Usage};
+use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, ToolCall};
 
 /// 构建 OpenAI 兼容的请求 JSON
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
@@ -60,58 +60,7 @@ pub fn build_stream_request_body(req: &ChatRequest) -> serde_json::Value {
     body
 }
 
-/// 解析缓存命中 token（多厂商字段兼容）
-///
-/// - DeepSeek: `prompt_cache_hit_tokens`（顶层）
-/// - OpenAI: `prompt_tokens_details.cached_tokens`
-/// - Anthropic: `cache_read_input_tokens`
-fn parse_cached_tokens(usage: &serde_json::Value) -> u32 {
-    // DeepSeek
-    if let Some(v) = usage
-        .get("prompt_cache_hit_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        return v as u32;
-    }
-    // OpenAI nested
-    if let Some(v) = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64())
-    {
-        return v as u32;
-    }
-    // Anthropic
-    if let Some(v) = usage
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        return v as u32;
-    }
-    0
-}
-
-/// 解析缓存创建 token（多厂商字段兼容）
-///
-/// - DeepSeek: `prompt_cache_miss_tokens`（顶层）
-/// - Anthropic: `cache_creation_input_tokens`
-fn parse_cache_creation_tokens(usage: &serde_json::Value) -> u32 {
-    // DeepSeek
-    if let Some(v) = usage
-        .get("prompt_cache_miss_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        return v as u32;
-    }
-    // Anthropic
-    if let Some(v) = usage
-        .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        return v as u32;
-    }
-    0
-}
+use crate::usage_parse::parse_provider_usage;
 
 /// 将内部消息转为 OpenAI 格式
 fn build_messages(messages: &[ChatMessage]) -> serde_json::Value {
@@ -169,23 +118,8 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse, String> 
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let usage = body.get("usage").and_then(|v| {
-        let prompt_tokens = v.get("prompt_tokens")?.as_u64()? as u32;
-        let completion_tokens = v.get("completion_tokens")?.as_u64()? as u32;
-        let total_tokens = v.get("total_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-
-        // A2：解析缓存命中 token（多厂商字段兼容）
-        let cached_tokens = parse_cached_tokens(v);
-        let cache_creation_tokens = parse_cache_creation_tokens(v);
-
-        Some(Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            cached_tokens,
-            cache_creation_tokens,
-        })
-    });
+    // A2：流式/非流式共用 usage 解析（OpenAI / DeepSeek / Anthropic）
+    let usage = body.get("usage").and_then(parse_provider_usage);
 
     Ok(ChatResponse {
         content,
@@ -374,31 +308,31 @@ mod tests {
     #[test]
     fn test_parse_cached_tokens_deepseek() {
         let usage = serde_json::json!({"prompt_cache_hit_tokens": 500});
-        assert_eq!(parse_cached_tokens(&usage), 500);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 500);
     }
 
     #[test]
     fn test_parse_cached_tokens_openai_nested() {
         let usage = serde_json::json!({"prompt_tokens_details": {"cached_tokens": 300}});
-        assert_eq!(parse_cached_tokens(&usage), 300);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 300);
     }
 
     #[test]
     fn test_parse_cached_tokens_anthropic() {
         let usage = serde_json::json!({"cache_read_input_tokens": 200});
-        assert_eq!(parse_cached_tokens(&usage), 200);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 200);
     }
 
     #[test]
     fn test_parse_cached_tokens_missing() {
         let usage = serde_json::json!({"prompt_tokens": 100});
-        assert_eq!(parse_cached_tokens(&usage), 0);
+        assert_eq!(crate::usage_parse::parse_cached_tokens(&usage), 0);
     }
 
     #[test]
     fn test_parse_cache_creation_tokens_deepseek() {
         let usage = serde_json::json!({"prompt_cache_miss_tokens": 400});
-        assert_eq!(parse_cache_creation_tokens(&usage), 400);
+        assert_eq!(crate::usage_parse::parse_cache_creation_tokens(&usage), 400);
     }
 
     #[test]

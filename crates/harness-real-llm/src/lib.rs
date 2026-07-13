@@ -22,8 +22,10 @@
 
 pub mod budget;
 pub mod commit_probe;
+pub mod context_compile_bench;
 pub mod evidence;
 pub mod long_session;
+pub mod observability;
 pub mod phase_b_matrix;
 pub mod production_evidence;
 

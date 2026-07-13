@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmError, StreamChunk, Usage};
-use storyforge_domain::message_layout::{fingerprint_messages, messages_segment_summary};
+use storyforge_domain::message_layout::{fingerprint_chat_request, messages_segment_summary};
 use storyforge_infra_llm::LlmClient;
 use tokio::sync::{mpsc, watch};
 
@@ -160,7 +160,8 @@ impl BudgetedLlmClient {
         outcome: &str,
     ) {
         let segs = messages_segment_summary(&req.messages);
-        let fp = fingerprint_messages(&req.messages);
+        // 含 model / tools / sampling，避免仅 message 正文导致假稳定
+        let fp = fingerprint_chat_request(req);
         let usage = usage.unwrap_or(Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
