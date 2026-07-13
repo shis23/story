@@ -1095,3 +1095,274 @@ function Assert-ReleasePesterResult {
         throw "Pester result for '$Label' is not clean: total=$total failed=$failed skipped=$skipped pending=$pending inconclusive=$inconclusive."
     }
 }
+
+function New-ReleaseProvenance {
+    <#
+    .SYNOPSIS
+    Builds an unsigned host provenance record for release evidence.
+
+    .DESCRIPTION
+    Creates a provenance-style attestation referencing artifacts by sha256
+    digest and relative path. This is an unsigned host-only attestation, not a
+    SLSA/cosign/in-toto signed attestation. All strings are sanitized.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Commit,
+        [Parameter(Mandatory = $true)][string]$Branch,
+        [Parameter(Mandatory = $true)][string]$Target,
+        [AllowEmptyCollection()][object[]]$Artifacts = @(),
+        [AllowEmptyCollection()][string[]]$Notes = @(),
+        [string]$RepoRoot
+    )
+
+    if ($null -eq $Artifacts) { $Artifacts = @() }
+    $subjects = @()
+    foreach ($art in $Artifacts) {
+        if ($null -eq $art) { continue }
+        $subjects += [pscustomobject]@{
+            relative_path = Protect-ReleasePath -Text ([string]$art.relative_path) -RepoRoot $RepoRoot
+            sha256        = [string]$art.sha256
+            kind          = [string]$art.kind
+            size_bytes    = [long]$art.size_bytes
+            status        = [string]$art.status
+        }
+    }
+
+    $baseNotes = @(
+        'Unsigned host provenance attestation for release evidence only.',
+        'This is not a SLSA, cosign, or in-toto signed attestation.',
+        'No signing keys were used; subjects are identified by sha256 digest.'
+    )
+    $allNotes = @($baseNotes) + @($Notes | ForEach-Object {
+        Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
+    })
+
+    $prov = [pscustomobject]@{
+        schema_version   = 1
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        commit           = $Commit
+        branch           = $Branch
+        target           = $Target
+        subjects         = $subjects
+        notes            = $allNotes
+    }
+    return (Protect-ReleaseObject -Value $prov -RepoRoot $RepoRoot)
+}
+
+function Write-ReleaseHashFile {
+    <#
+    .SYNOPSIS
+    Writes a `<file>.sha256` sidecar digest in the standard SUM format.
+
+    .DESCRIPTION
+    Writes `<lowercased-sha256> *<basename>` to `<ArtifactPath>.sha256` so that
+    `sha256sum -c` style verification tools can consume it. Fails closed when
+    the artifact does not exist.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ArtifactPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
+        throw "Cannot write hash file for missing artifact: $ArtifactPath"
+    }
+
+    $hash = Get-ReleaseFileSha256 -Path $ArtifactPath
+    $basename = Split-Path -Leaf $ArtifactPath
+    $content = "{0} *{1}" -f $hash, $basename
+    $hashPath = $ArtifactPath + '.sha256'
+    Set-Content -LiteralPath $hashPath -Value $content -Encoding utf8 -NoNewline
+    return $hashPath
+}
+
+function Test-ReleaseArchiveIntegrity {
+    <#
+    .SYNOPSIS
+    Verifies that a zip-based archive (APK, etc.) can be opened and read.
+
+    .DESCRIPTION
+    Opens the archive with System.IO.Compression and enumerates entries to
+    confirm the file is not truncated or corrupt. Fails closed on missing or
+    unreadable files. Does not accept GUI or device evidence.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedKind
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Archive integrity check failed: missing $ExpectedKind archive: $Path"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        $entryCount = 0
+        try {
+            foreach ($entry in $zip.Entries) {
+                $entryCount += 1
+            }
+        } finally {
+            $zip.Dispose()
+        }
+        if ($entryCount -le 0) {
+            throw "Archive integrity check failed: $ExpectedKind archive has zero entries: $Path"
+        }
+    } catch {
+        $msg = $_.Exception.Message
+        throw "Archive integrity check failed for $ExpectedKind ($Path): $msg"
+    }
+}
+
+function Assert-ReleaseManifestSchema {
+    <#
+    .SYNOPSIS
+    Validates that a release manifest object conforms to the expected schema.
+
+    .DESCRIPTION
+    Checks required top-level fields, valid build_status values, valid
+    acceptance scope (GUI and device must never be 'accepted'), and that
+    present artifacts always carry a sha256 digest. Fails closed on violations.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest
+    )
+
+    if ($null -eq $Manifest) {
+        throw 'Manifest schema validation failed: manifest is null.'
+    }
+
+    $requiredFields = @(
+        'schema_version', 'generated_at_utc', 'commit', 'branch', 'target',
+        'tool_versions', 'artifacts', 'build_status', 'warnings', 'notes',
+        'acceptance'
+    )
+    foreach ($field in $requiredFields) {
+        if ($Manifest.PSObject.Properties.Name -notcontains $field) {
+            throw "Manifest schema validation failed: missing required field '$field'."
+        }
+    }
+
+    $validStatuses = @('ok', 'failed', 'partial', 'dry-run')
+    if ($validStatuses -notcontains $Manifest.build_status) {
+        throw ("Manifest schema validation failed: invalid build_status '{0}'." -f $Manifest.build_status)
+    }
+
+    $acc = $Manifest.acceptance
+    if ($null -eq $acc) {
+        throw 'Manifest schema validation failed: acceptance block is null.'
+    }
+    if ($acc.PSObject.Properties.Name -notcontains 'gui' -or
+        $acc.PSObject.Properties.Name -notcontains 'android_device') {
+        throw 'Manifest schema validation failed: acceptance block missing gui/android_device fields.'
+    }
+    if ($acc.gui -ne 'not_claimed') {
+        throw ("Manifest schema validation failed: GUI acceptance is '{0}' but must be 'not_claimed'." -f $acc.gui)
+    }
+    if ($acc.android_device -ne 'not_claimed') {
+        throw ("Manifest schema validation failed: android_device acceptance is '{0}' but must be 'not_claimed'." -f $acc.android_device)
+    }
+
+    foreach ($art in @($Manifest.artifacts)) {
+        if ($null -eq $art) { continue }
+        if ($art.PSObject.Properties.Name -notcontains 'relative_path' -or
+            $art.PSObject.Properties.Name -notcontains 'sha256' -or
+            $art.PSObject.Properties.Name -notcontains 'kind' -or
+            $art.PSObject.Properties.Name -notcontains 'status') {
+            throw 'Manifest schema validation failed: artifact record missing required fields.'
+        }
+        $validArtStatuses = @('present', 'missing', 'skipped')
+        if ($validArtStatuses -notcontains $art.status) {
+            throw ("Manifest schema validation failed: invalid artifact status '{0}'." -f $art.status)
+        }
+        if ($art.status -eq 'present' -and [string]::IsNullOrWhiteSpace($art.sha256)) {
+            throw ("Manifest schema validation failed: present artifact '{0}' has no sha256 digest." -f $art.relative_path)
+        }
+    }
+}
+
+function Test-ReleaseWorkflowSyntax {
+    <#
+    .SYNOPSIS
+    Validates that a workflow YAML file parses without syntax errors.
+
+    .DESCRIPTION
+    Uses the local Python interpreter with PyYAML (when available) to parse the
+    YAML file. Returns a result object with Valid, ErrorCount, and Errors.
+    Fails closed only when the file is missing; parse errors are returned in
+    the result (not thrown) so callers can report them.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Workflow file not found: $Path"
+    }
+
+    $pyScript = @'
+import sys, json
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"valid": False, "error_count": 1, "errors": ["PyYAML is not installed; cannot validate YAML syntax"]}))
+    sys.exit(0)
+
+path = sys.argv[1]
+errors = []
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        errors.append("Workflow file is empty or parsed to null")
+    elif not isinstance(data, dict):
+        errors.append("Workflow root must be a mapping/dict")
+except yaml.YAMLError as exc:
+    msg = str(exc).replace("\n", " ")
+    errors.append("YAML parse error: " + msg[:500])
+except Exception as exc:
+    errors.append("Unexpected error: " + str(exc)[:500])
+
+result = {"valid": len(errors) == 0, "error_count": len(errors), "errors": errors}
+print(json.dumps(result))
+'@
+
+    $tmpPy = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-yaml-{0}.py" -f [guid]::NewGuid().ToString('N'))
+    try {
+        Set-Content -LiteralPath $tmpPy -Value $pyScript -Encoding utf8
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $rawOutput = & python $tmpPy $Path 2>&1
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+
+        if ($code -ne 0 -or [string]::IsNullOrWhiteSpace($rawOutput)) {
+            return [pscustomobject]@{
+                Valid      = $false
+                ErrorCount = 1
+                Errors     = @("python yaml validation exited $code or produced no output")
+            }
+        }
+
+        $lastLine = @($rawOutput | Where-Object { $_ -match '^\{' })[-1]
+        if (-not $lastLine) {
+            return [pscustomobject]@{
+                Valid      = $false
+                ErrorCount = 1
+                Errors     = @('python yaml validation produced no JSON output')
+            }
+        }
+
+        $parsed = $lastLine | ConvertFrom-Json
+        return [pscustomobject]@{
+            Valid      = [bool]$parsed.valid
+            ErrorCount = [int]$parsed.error_count
+            Errors     = @($parsed.errors)
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmpPy -Force -ErrorAction SilentlyContinue
+    }
+}

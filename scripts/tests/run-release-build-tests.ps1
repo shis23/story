@@ -54,6 +54,7 @@ try {
     $testFiles = @(
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Tests.ps1')
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Pipeline.Tests.ps1')
+        (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.CI.Tests.ps1')
     )
 
     foreach ($testFile in $testFiles) {
