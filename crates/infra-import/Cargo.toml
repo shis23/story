@@ -10,5 +10,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 crc32fast.workspace = true
 
+# SHA-256 指纹（real-card evidence 里的 sanitized hash）
+sha2.workspace = true
+
 # Base64 解码（PNG embed 的角色卡 JSON 是 base64 编码的）
 base64 = "0.22"

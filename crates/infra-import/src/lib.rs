@@ -474,8 +474,13 @@ mod tests {
                     .join("..")
                     .join("test-card.png")
             });
-        let bytes = std::fs::read(&fixture_path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+        let bytes = std::fs::read(&fixture_path).unwrap_or_else(|err| {
+            panic!(
+                "REAL-CORPUS MODE requires a local real card fixture, but failed to read {}: {err}.
+Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root.",
+                fixture_path.display()
+            )
+        });
 
         let character = import_character(&bytes).expect("real complex card should import");
 
@@ -517,6 +522,28 @@ mod tests {
                 .iter()
                 .any(|entry| entry.content.contains("命定系统")),
             "expected imported world book to preserve 命定系统 content"
+        );
+
+        // Privacy-safe evidence: emit only counts, extension keys, feature
+        // flags, and a SHA-256 fingerprint. Assert the sanitized evidence
+        // never carries raw card body / greeting / lore text, so the smoke
+        // runner's output is safe to record.
+        let evidence = crate::compat::sanitize_real_card_evidence(&character);
+        assert_eq!(evidence.spec_version, "2.0");
+        assert_eq!(evidence.alternate_greeting_count, 6);
+        assert_eq!(evidence.world_book_entry_count, 441);
+        assert_eq!(evidence.raw_card_json_sha256.len(), 64);
+        let evidence_json = serde_json::to_string(&evidence).expect("evidence serializes");
+        assert!(
+            !evidence_json.contains("命定之诗") && !evidence_json.contains("命定系统"),
+            "sanitized real-card evidence leaked private content"
+        );
+        // Deterministic: re-deriving the evidence from the same import yields
+        // the same fingerprint (drift baseline for future regressions).
+        let again = crate::compat::sanitize_real_card_evidence(&character);
+        assert_eq!(
+            evidence.raw_card_json_sha256, again.raw_card_json_sha256,
+            "real-card fingerprint must be deterministic"
         );
     }
 

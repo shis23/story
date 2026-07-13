@@ -159,6 +159,85 @@ impl CompatReport {
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+
+    /// Render a stable Markdown summary of this report.
+    ///
+    /// Carries the matrix version, generator/seed, classified-finding counts,
+    /// the registered matrix rows, and (if present) the loss/intentional
+    /// findings. No raw card body is ever emitted: findings are summarized by
+    /// area / field_path / severity / detail only.
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+        md.push_str(&format!(
+            "# Compatibility Report\n\n- generated_by: `{}`\n- format_version: {}\n- matrix_version: {}\n",
+            self.generated_by, self.format_version, self.matrix_version
+        ));
+        if let Some(seed) = self.seed {
+            md.push_str(&format!("- seed: `0x{seed:08X}`\n"));
+        }
+        md.push_str("\n## Summary\n\n");
+        md.push_str("| loss | intentional | preserved | rejected |\n");
+        md.push_str("|------|-------------|-----------|----------|\n");
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            self.summary.loss,
+            self.summary.intentional,
+            self.summary.preserved,
+            self.summary.rejected
+        ));
+
+        if !self.rows.is_empty() {
+            md.push_str("\n## Matrix rows\n\n");
+            md.push_str("| fixture_id | seed | classification | completeness |\n");
+            md.push_str("|------------|------|----------------|--------------|\n");
+            for row in &self.rows {
+                let seed = row
+                    .seed
+                    .map(|s| format!("`0x{s:08X}`"))
+                    .unwrap_or_else(|| "—".into());
+                md.push_str(&format!(
+                    "| {} | {} | {:?} | {:?} |\n",
+                    row.fixture_id, seed, row.classification, row.completeness
+                ));
+            }
+        }
+
+        let losses: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::Loss)
+            .collect();
+        if !losses.is_empty() {
+            md.push_str("\n## Loss findings\n\n");
+            md.push_str("| area | field_path | detail |\n");
+            md.push_str("|------|-------------|--------|\n");
+            for f in losses {
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    f.area, f.field_path, f.detail
+                ));
+            }
+        }
+
+        let intentional: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.severity == CompatSeverity::Intentional)
+            .collect();
+        if !intentional.is_empty() {
+            md.push_str("\n## Intentional normalizations\n\n");
+            md.push_str("| area | field_path | detail |\n");
+            md.push_str("|------|-------------|--------|\n");
+            for f in intentional {
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    f.area, f.field_path, f.detail
+                ));
+            }
+        }
+
+        md
+    }
 }
 
 /// Compare two ST-shaped character data payloads for semantic round-trip fidelity.
@@ -1338,6 +1417,88 @@ pub fn record_failure_output(
     out
 }
 
+/// Sanitized evidence extracted from a real (private) complex card import.
+///
+/// Every field is a count, a key set, a feature flag, or a deterministic
+/// SHA-256 fingerprint. **No** raw card body, greeting text, lore content, or
+/// identifying field value is ever carried. This struct is the only shape of
+/// real-card evidence that may be printed or committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealCardEvidence {
+    pub source_kind: String,
+    pub spec_version: String,
+    pub alternate_greeting_count: usize,
+    pub world_book_entry_count: usize,
+    pub constant_entry_count: usize,
+    pub selective_entry_count: usize,
+    pub both_entry_count: usize,
+    pub extension_keys: Vec<String>,
+    pub has_raw_card_json: bool,
+    pub has_embedded_world_info: bool,
+    pub has_renderable_assets: bool,
+    /// SHA-256 of the canonical (sorted-key) serialization of the imported
+    /// `raw_card_json`. Deterministic across runs, non-reversible (you cannot
+    /// reconstruct the card from the hash).
+    pub raw_card_json_sha256: String,
+}
+
+/// Extract sanitized evidence from an imported real complex card.
+///
+/// The fingerprint hashes the canonical-form `raw_card_json` so re-imports of
+/// the same source always produce the same hash, enabling drift detection
+/// without ever exposing card content.
+pub fn sanitize_real_card_evidence(character: &Character) -> RealCardEvidence {
+    use sha2::{Digest, Sha256};
+
+    let canon = canonicalize(&character.raw_card_json);
+    let canon_bytes = serde_json::to_vec(&canon).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&canon_bytes);
+    let digest = hasher.finalize();
+    let raw_card_json_sha256 = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let book = character.embedded_world_info.as_ref();
+    let constant_entry_count = book
+        .map(|b| b.entries.iter().filter(|e| e.constant).count())
+        .unwrap_or(0);
+    let selective_entry_count = book
+        .map(|b| b.entries.iter().filter(|e| e.selective).count())
+        .unwrap_or(0);
+    let both_entry_count = book
+        .map(|b| {
+            b.entries
+                .iter()
+                .filter(|e| e.constant && e.selective)
+                .count()
+        })
+        .unwrap_or(0);
+
+    let mut extension_keys = character
+        .extensions
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    extension_keys.sort();
+
+    RealCardEvidence {
+        source_kind: "ST card (PNG/JSON)".into(),
+        spec_version: character.spec_version.clone(),
+        alternate_greeting_count: character.alternate_greetings.len(),
+        world_book_entry_count: book.map(|b| b.entries.len()).unwrap_or(0),
+        constant_entry_count,
+        selective_entry_count,
+        both_entry_count,
+        extension_keys,
+        has_raw_card_json: character.raw_card_json.is_object(),
+        has_embedded_world_info: character.embedded_world_info.is_some(),
+        has_renderable_assets: character.renderable_assets.is_some(),
+        raw_card_json_sha256,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1991,5 +2152,164 @@ mod tests {
             "sanitized dump must not echo before/after values"
         );
         assert!(dump.contains("repro:"), "dump must include repro hint");
+    }
+
+    #[test]
+    fn real_card_evidence_is_sanitized_and_deterministic() {
+        // Build a synthetic complex card (no real private data) and assert the
+        // sanitized evidence carries only counts/keys/hashes, never the body.
+        let source = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Synthetic Evidence Card",
+                "description": "private body that must never leak",
+                "first_mes": "secret greeting text",
+                "alternate_greetings": ["g1", "g2", "g3"],
+                "extensions": {
+                    "depth_prompt": {"depth": 4},
+                    "stat_data": {"hp": 10},
+                    "regex_scripts": []
+                },
+                "character_book": {
+                    "name": "Secret Book",
+                    "entries": [
+                        {"id": 1, "keys": ["k"], "content": "secret lore", "constant": true},
+                        {"id": 2, "keys": ["k2"], "content": "secret lore 2", "selective": true},
+                        {"id": 3, "keys": ["k3"], "content": "both", "constant": true, "selective": true}
+                    ]
+                }
+            }
+        });
+        let imported =
+            import_character_from_json(&serde_json::to_vec(&source).unwrap()).expect("import");
+        let evidence = sanitize_real_card_evidence(&imported);
+
+        // Counts and feature flags only.
+        assert_eq!(evidence.spec_version, "3.0");
+        assert_eq!(evidence.alternate_greeting_count, 3);
+        assert_eq!(evidence.world_book_entry_count, 3);
+        assert_eq!(evidence.constant_entry_count, 2);
+        assert_eq!(evidence.selective_entry_count, 2);
+        assert_eq!(evidence.both_entry_count, 1);
+        assert!(evidence.has_raw_card_json);
+        assert!(evidence.has_embedded_world_info);
+        assert_eq!(
+            evidence.extension_keys,
+            vec!["depth_prompt", "regex_scripts", "stat_data"]
+        );
+
+        // SHA-256 fingerprint: 64 hex chars, deterministic, non-reversible.
+        assert_eq!(evidence.raw_card_json_sha256.len(), 64);
+        let again = sanitize_real_card_evidence(&imported);
+        assert_eq!(
+            evidence.raw_card_json_sha256, again.raw_card_json_sha256,
+            "fingerprint must be deterministic for the same import"
+        );
+
+        // Privacy: the serialized evidence must NEVER contain private body text.
+        let json = serde_json::to_string(&evidence).unwrap();
+        for forbidden in [
+            "private body that must never leak",
+            "secret greeting text",
+            "secret lore",
+            "Synthetic Evidence Card",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "sanitized evidence leaked private text: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_card_evidence_fingerprint_detects_drift() {
+        // Two cards that differ only in body content must produce different
+        // fingerprints (drift detection), proving the hash is meaningful.
+        let base = serde_json::json!({
+            "spec": "chara_card_v2", "spec_version": "3.0",
+            "data": {"name": "Drift", "description": "version one"}
+        });
+        let mutated = serde_json::json!({
+            "spec": "chara_card_v2", "spec_version": "3.0",
+            "data": {"name": "Drift", "description": "version two"}
+        });
+        let a = sanitize_real_card_evidence(
+            &import_character_from_json(&serde_json::to_vec(&base).unwrap()).unwrap(),
+        );
+        let b = sanitize_real_card_evidence(
+            &import_character_from_json(&serde_json::to_vec(&mutated).unwrap()).unwrap(),
+        );
+        assert_ne!(
+            a.raw_card_json_sha256, b.raw_card_json_sha256,
+            "different content must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn markdown_report_is_stable_and_sanitized() {
+        let mut report = CompatReport::new("markdown_probe", Some(0xBEEF));
+        report.register_row(MatrixRow {
+            fixture_id: "st_v3_matrix".into(),
+            seed: Some(0xBEEF),
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+        report.push(CompatFinding {
+            area: "character".into(),
+            field_path: "name".into(),
+            severity: CompatSeverity::Preserved,
+            detail: "stable".into(),
+            before: None,
+            after: None,
+        });
+        report.push(CompatFinding {
+            area: "character_book.entry".into(),
+            field_path: "position".into(),
+            severity: CompatSeverity::Intentional,
+            detail: "normalized string label to numeric".into(),
+            before: None,
+            after: None,
+        });
+
+        let md = report.to_markdown();
+        assert!(md.contains("# Compatibility Report"));
+        assert!(md.contains("matrix_version"));
+        assert!(md.contains("seed: `0x0000BEEF`"));
+        assert!(md.contains("## Summary"));
+        assert!(md.contains("## Matrix rows"));
+        assert!(md.contains("st_v3_matrix"));
+        assert!(md.contains("## Intentional normalizations"));
+        // Sanitized: no before/after value columns in the markdown tables.
+        assert!(!md.contains("private body"));
+    }
+
+    #[test]
+    fn write_reports_emits_both_json_and_markdown() {
+        let mut report = CompatReport::new("write_probe", Some(0x1234));
+        report.register_row(MatrixRow {
+            fixture_id: "st_v2_minimal".into(),
+            seed: None,
+            classification: RowClassification::Preserved,
+            completeness: RowCompleteness::Complete,
+        });
+
+        let dir = std::env::temp_dir().join("sf-compat-report-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("compat-probe.json");
+        let md_path = dir.join("compat-probe.md");
+        std::fs::write(&json_path, report.to_json_pretty().unwrap()).unwrap();
+        std::fs::write(&md_path, report.to_markdown()).unwrap();
+
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: CompatReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.matrix_version, CompatReport::MATRIX_VERSION);
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(md.contains("# Compatibility Report"));
+        assert!(md.contains("st_v2_minimal"));
+
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&md_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
