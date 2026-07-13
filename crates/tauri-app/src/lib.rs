@@ -7,6 +7,7 @@ mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
 mod storage;
+pub mod storage_backend;
 pub mod turn_coordinator;
 pub mod turn_lifecycle;
 pub mod turn_store;
