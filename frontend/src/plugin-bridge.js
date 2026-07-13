@@ -17,6 +17,15 @@ export const DEFAULT_PLUGIN_HOOK_TIMEOUT_MS = 5000
 export const PROMPT_HOOK_PERMISSION = 'ModifyPrompt'
 export const READ_MEMORY_PERMISSION = 'ReadMemory'
 
+// Host-side persistence adapters. Default import is a no-op until a host wires
+// a real adapter; this keeps `chat.save` deterministic and out of tauri-app.
+import {
+  applyPersistenceAdapters as applyAdapters,
+  createDefaultSaveChatAdapter,
+  classifySaveChatResult,
+  PERSISTENCE_DEGRADED_REASON,
+} from './utils/pluginPersistence.js'
+
 export const ST_EVENT_TYPES = Object.freeze({
   APP_READY: 'APP_READY',
   CHAT_CHANGED: 'CHAT_CHANGED',
@@ -148,6 +157,10 @@ export const API_METHODS = {
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
+  // chat.save is a host-side persistence adapter route (no backend command,
+  // no plugin permission gate beyond what the adapter enforces). Falls back to
+  // the degraded local-mirror adapter when the host injects nothing.
+  'chat.save':        { permission: null,              command: null },
   'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ intent: p.intent ?? p.prompt ?? '' }) },
 }
 
@@ -1020,15 +1033,67 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return Promise.resolve(true);
   }
 
-  function _saveChat() {
-    // Local chat mirror only — no host conversation persist path yet.
+  function _degradedSaveChatPending() {
+    // Local chat mirror only fallback — no host persistence result.
     // Keep ST boolean compatibility: awaited value is true, while the
     // promise object itself carries a visible degraded marker.
     const pending = Promise.resolve(true);
     pending.ok = true;
     pending.degraded = true;
     pending.reason = 'local_mirror_only_no_host_persist';
+    pending.persistedAt = null;
     return pending;
+  }
+
+  function _stampSaveChatPending(pending, result) {
+    pending.ok = result?.ok !== false;
+    pending.degraded = Boolean(result?.degraded);
+    pending.reason = result?.reason || null;
+    pending.persistedAt = result?.persistedAt ?? null;
+    return pending;
+  }
+
+  function _saveChat() {
+    // Try the host-side persistence adapter first (chat.save route). When the
+    // host is unavailable, rejects, times out, or returns a degraded marker,
+    // fall back to the local-mirror degraded promise so ST plugins keep working
+    // (await saveChat() resolves truthy === ST boolean compatibility).
+    if (!_canPostToHost()) return _degradedSaveChatPending();
+
+    // A single stampable promise object so synchronous property reads before
+    // resolution AND the resolved value both reflect host/degraded state.
+    let resolveSave
+    let settled = false
+    const pending = new Promise((resolve) => { resolveSave = resolve })
+    pending.ok = true
+    pending.degraded = true
+    pending.reason = 'local_mirror_only_no_host_persist'
+    pending.persistedAt = null
+
+    const finish = function(result) {
+      if (settled) return
+      settled = true
+      _stampSaveChatPending(pending, result || {})
+      resolveSave(true)
+    }
+
+    // Bounded wait for the host adapter. The default host route always
+    // answers; if it does not (or the host crashed), fall back to degraded.
+    const timer = setTimeout(function() {
+      finish({ ok: true, degraded: true, reason: 'local_mirror_only_no_host_persist', persistedAt: null })
+    }, 2000)
+
+    _call('chat.save', { chat: _chat })
+      .then(function(result) {
+        clearTimeout(timer)
+        finish(result)
+      })
+      .catch(function() {
+        clearTimeout(timer)
+        finish(null)
+      })
+
+    return pending
   }
 
   function _callGenericPopup(html, type, defaultValue) {
@@ -1503,6 +1568,12 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 export function createHostHandler(plugin, invoke, options = {}) {
   const isTrustedSource = options.isTrustedSource || (() => true)
   // 插件本地 storage（宿主侧维护，避免 iframe localStorage 被清除）
+  // Persistence adapters: merge injected overrides on top of degraded defaults.
+  const defaultAdapters = applyAdapters({
+    saveChat: options.saveChatAdapter,
+    popup: options.popupAdapter,
+    requestHeaders: options.requestHeadersAdapter,
+  })
 
   return async function handleMessage(event) {
     if (!isTrustedSource(event)) return
@@ -1538,6 +1609,28 @@ export function createHostHandler(plugin, invoke, options = {}) {
         id: data.id,
         result: true,
       })
+      return
+    }
+    if (data.method === 'chat.save') {
+      // Deterministic host-side persistence adapter. No backend command and no
+      // plugin permission gate: the adapter itself enforces the contract.
+      const saveChatAdapter = options.saveChatAdapter || defaultAdapters.saveChat
+      try {
+        const result = await saveChatAdapter.saveChat(
+          { pluginId: plugin.id, ...(data.params || {}) },
+        )
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result,
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { ok: false, degraded: true, reason: 'persist_failed', persistedAt: null },
+        })
+      }
       return
     }
 

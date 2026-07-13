@@ -18,6 +18,7 @@ import {
   READ_MEMORY_PERMISSION,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
+import { createSaveChatAdapter } from '../src/utils/pluginPersistence.js'
 
 function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyforge.local', storage = new Map(), options = {}) {
   const listeners = {}
@@ -48,6 +49,8 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     },
     localStorage: window.localStorage,
     console,
+    setTimeout,
+    clearTimeout,
   }
   sandbox.globalThis = sandbox
 
@@ -1559,9 +1562,10 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(await window.setChatMessage({ variables: { hp: 5 } }, 1), true)
   assert.deepEqual(plain(window.SillyTavern.chat[1].variables), { hp: 5 })
   const savePending = window.SillyTavern.saveChat()
+  // saveChat now tries the host persistence route first; the synchronous
+  // degraded marker stays present until the host (or its timeout) answers.
   assert.equal(savePending.degraded, true)
   assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
-  assert.equal(await savePending, true)
   assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', 2), null)
@@ -1582,7 +1586,12 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(window.toastr._calls.length, 2)
   window.toastr.clear()
   assert.equal(window.toastr._calls.length, 0)
-  assert.equal(postedMessages.length, readyMessageCount)
+  // saveChat posted one chat.save request to the host (still pending); no
+  // other stray messages should have been emitted beyond that.
+  const saveRequests = postedMessages
+    .filter((entry) => entry.message.type === MSG_REQUEST && entry.message.method === 'chat.save')
+  assert.equal(saveRequests.length, 1)
+  assert.equal(saveRequests[0].message.pluginId, 'plugin-a')
 })
 
 test('backfills ST popup constants on preexisting partial SillyTavern globals', async () => {
@@ -1834,4 +1843,106 @@ test('persists extension_settings through host storage when iframe localStorage 
     second.window.SillyTavern.getContext().extension_settings,
     second.window.extension_settings,
   )
+})
+
+test('host saveChat route calls the injected persistence adapter', async () => {
+  const saved = []
+  const adapter = createSaveChatAdapter({
+    async persist(snapshot) {
+      saved.push(snapshot)
+      return { ok: true, persistedAt: 'ts-1' }
+    },
+  })
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-1',
+      method: 'chat.save',
+      params: { chat: [{ role: 'user', content: 'hi' }] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(saved, [
+    { pluginId: 'plugin-a', chat: [{ role: 'user', content: 'hi' }] },
+  ])
+  assert.equal(source.posted.at(-1).message.result.ok, true)
+  assert.equal(source.posted.at(-1).message.result.degraded, false)
+  assert.equal(source.posted.at(-1).message.result.persistedAt, 'ts-1')
+})
+
+test('host saveChat route falls back to degraded when no adapter is injected', async () => {
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const handler = createHostHandler({ id: 'plugin-a', permissions: [] }, async () => null)
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-2',
+      method: 'chat.save',
+      params: { chat: [] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.equal(source.posted.at(-1).message.result.ok, true)
+  assert.equal(source.posted.at(-1).message.result.degraded, true)
+  assert.equal(source.posted.at(-1).message.result.reason, 'local_mirror_only_no_host_persist')
+})
+
+test('iframe saveChat tries host persistence and preserves degraded promise when host unavailable', async () => {
+  const { window } = createBridgeSandbox('plugin-a', 'https://host.example')
+  // No host is listening (parent.postMessage records but no response),
+  // so the iframe must keep the ST-compatible degraded promise. The synchronous
+  // degraded marker is present until the host adapter (or its timeout) answers.
+  const savePending = window.SillyTavern.saveChat()
+  assert.equal(savePending.degraded, true)
+  assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
+  assert.equal(typeof savePending.then, 'function')
+})
+
+test('iframe saveChat resolves with persisted metadata when host acknowledges save', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  const savePromise = window.SillyTavern.saveChat()
+  await flushPromises()
+
+  const request = postedMessages
+    .map((entry) => entry.message)
+    .find((message) => message.type === MSG_REQUEST && message.method === 'chat.save')
+  assert.ok(request, 'iframe should post a chat.save request to the host')
+
+  // Simulate the host responding with a persisted result.
+  postHostMessage({
+    type: MSG_RESPONSE,
+    id: request.id,
+    result: { ok: true, degraded: false, persistedAt: 'ts-iframe' },
+  })
+  await flushPromises()
+
+  const resolved = await savePromise
+  assert.equal(resolved, true)
+  assert.equal(savePromise.degraded, false)
+  assert.equal(savePromise.persistedAt, 'ts-iframe')
 })
