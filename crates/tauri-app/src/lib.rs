@@ -1411,6 +1411,7 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
         let book = WorldInfoBook {
             entries,
             source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
         };
         ctx.world_info = Some(Arc::new(book));
     }
@@ -10015,28 +10016,18 @@ fn import_campaign_bundle_into_store(
         })
         .collect();
 
-    store
-        .save_card(card)
-        .map_err(|e| TauriCommandError::storage(format!("导入角色卡失败: {e}")))?;
-
+    // Build fully rewritten payloads first so a mid-write failure can roll back
+    // without leaving a partially imported Campaign graph.
     let mut campaign = bundle.campaign;
     campaign.id = new_campaign_id.clone();
     campaign.card_id = new_card_id.clone();
     campaign.fork_from = None;
-    let conversation = conv_store.create(
-        Some(new_card_id.as_str().to_string()),
-        Some(campaign.id.clone()),
-    );
-    campaign.conversation_id = Some(conversation.id.clone());
-    store
-        .save_campaign(campaign)
-        .map_err(|e| TauriCommandError::storage(format!("导入 Campaign 失败: {e}")))?;
 
     let mut instance_id_map: HashMap<Id, Id> = HashMap::new();
-    let mut instance_count = 0;
     for instance in &bundle.instances {
         instance_id_map.insert(instance.id.clone(), Id::new());
     }
+    let mut rewritten_instances = Vec::with_capacity(bundle.instances.len());
     for mut instance in bundle.instances {
         let Some(new_instance_id) = instance_id_map.get(&instance.id).cloned() else {
             continue;
@@ -10046,17 +10037,14 @@ fn import_campaign_bundle_into_store(
         instance.definition_id = instance
             .definition_id
             .and_then(|id| definition_id_map.get(&id).cloned());
-        store
-            .add_instance(instance)
-            .map_err(|e| TauriCommandError::storage(format!("导入角色实例失败: {e}")))?;
-        instance_count += 1;
+        rewritten_instances.push(instance);
     }
 
     let mut knowledge_id_map: HashMap<Id, Id> = HashMap::new();
     for entry in &bundle.knowledge {
         knowledge_id_map.insert(entry.id.clone(), Id::new());
     }
-    let mut imported_knowledge = Vec::new();
+    let mut rewritten_knowledge = Vec::new();
     for mut entry in bundle.knowledge {
         let Some(new_character_id) = instance_id_map.get(&entry.character_id).cloned() else {
             continue;
@@ -10073,14 +10061,10 @@ fn import_campaign_bundle_into_store(
         entry.source_knowledge_id = entry
             .source_knowledge_id
             .and_then(|id| knowledge_id_map.get(&id).cloned());
-        imported_knowledge.push(entry);
+        rewritten_knowledge.push(entry);
     }
-    let knowledge_count = imported_knowledge.len();
-    store
-        .add_knowledge(imported_knowledge)
-        .map_err(|e| TauriCommandError::storage(format!("导入知识失败: {e}")))?;
 
-    let mut task_count = 0;
+    let mut rewritten_tasks = Vec::with_capacity(bundle.tasks.len());
     for mut task in bundle.tasks {
         task.id = Id::new();
         task.campaign_id = new_campaign_id.clone();
@@ -10089,38 +10073,108 @@ fn import_campaign_bundle_into_store(
             .into_iter()
             .filter_map(|id| instance_id_map.get(&id).cloned())
             .collect();
-        store
-            .add_task(task)
-            .map_err(|e| TauriCommandError::storage(format!("导入任务失败: {e}")))?;
-        task_count += 1;
+        rewritten_tasks.push(task);
     }
 
-    let mut summary_count = 0;
+    let mut rewritten_summaries = Vec::with_capacity(bundle.summaries.len());
     for mut summary in bundle.summaries {
         summary.id = Id::new();
         summary.campaign_id = new_campaign_id.clone();
-        summary.conversation_id = conversation.id.clone();
-        store
-            .add_summary(summary)
-            .map_err(|e| TauriCommandError::storage(format!("导入摘要失败: {e}")))?;
-        summary_count += 1;
+        // conversation id filled after conversation is created.
+        rewritten_summaries.push(summary);
     }
 
-    tracing::info!(
-        "Imported Campaign Bundle {} -> {}",
-        old_campaign_id,
-        new_campaign_id
-    );
+    let mut created_conversation_id: Option<Id> = None;
+    let mut card_saved = false;
+    let mut campaign_saved = false;
 
-    Ok(CampaignImportResult {
-        campaign_id: new_campaign_id.as_str().to_string(),
-        card_id: new_card_id.as_str().to_string(),
-        conversation_id: conversation.id.as_str().to_string(),
-        instance_count,
-        knowledge_count,
-        task_count,
-        summary_count,
-    })
+    let rollback = |created_conversation_id: &Option<Id>,
+                    card_saved: bool,
+                    campaign_saved: bool|
+     -> Result<(), TauriCommandError> {
+        if campaign_saved {
+            let _ = store.delete_campaign(&new_campaign_id);
+        }
+        if card_saved {
+            let _ = store.delete_card(&new_card_id);
+        }
+        if let Some(conversation_id) = created_conversation_id {
+            let _ = conv_store.delete(conversation_id);
+        }
+        Ok(())
+    };
+
+    let result = (|| {
+        store
+            .save_card(card)
+            .map_err(|e| TauriCommandError::storage(format!("导入角色卡失败: {e}")))?;
+        card_saved = true;
+
+        let conversation = conv_store.create(
+            Some(new_card_id.as_str().to_string()),
+            Some(new_campaign_id.clone()),
+        );
+        created_conversation_id = Some(conversation.id.clone());
+        campaign.conversation_id = Some(conversation.id.clone());
+        store
+            .save_campaign(campaign)
+            .map_err(|e| TauriCommandError::storage(format!("导入 Campaign 失败: {e}")))?;
+        campaign_saved = true;
+
+        let mut instance_count = 0;
+        for instance in rewritten_instances {
+            store
+                .add_instance(instance)
+                .map_err(|e| TauriCommandError::storage(format!("导入角色实例失败: {e}")))?;
+            instance_count += 1;
+        }
+
+        let knowledge_count = rewritten_knowledge.len();
+        store
+            .add_knowledge(rewritten_knowledge)
+            .map_err(|e| TauriCommandError::storage(format!("导入知识失败: {e}")))?;
+
+        let mut task_count = 0;
+        for task in rewritten_tasks {
+            store
+                .add_task(task)
+                .map_err(|e| TauriCommandError::storage(format!("导入任务失败: {e}")))?;
+            task_count += 1;
+        }
+
+        let mut summary_count = 0;
+        for mut summary in rewritten_summaries {
+            summary.conversation_id = conversation.id.clone();
+            store
+                .add_summary(summary)
+                .map_err(|e| TauriCommandError::storage(format!("导入摘要失败: {e}")))?;
+            summary_count += 1;
+        }
+
+        tracing::info!(
+            "Imported Campaign Bundle {} -> {}",
+            old_campaign_id,
+            new_campaign_id
+        );
+
+        Ok(CampaignImportResult {
+            campaign_id: new_campaign_id.as_str().to_string(),
+            card_id: new_card_id.as_str().to_string(),
+            conversation_id: conversation.id.as_str().to_string(),
+            instance_count,
+            knowledge_count,
+            task_count,
+            summary_count,
+        })
+    })();
+
+    match result {
+        Ok(ok) => Ok(ok),
+        Err(err) => {
+            let _ = rollback(&created_conversation_id, card_saved, campaign_saved);
+            Err(err)
+        }
+    }
 }
 
 /// 把 CharacterKnowledgeEntry 列表转为 ST WorldInfoBook（导出用）
@@ -10135,7 +10189,9 @@ fn knowledge_to_st_book(
         .map(|(i, e)| StWorldInfoEntry {
             id: Some(i as i32 + 1),
             keys: vec![e.knowledge_text.chars().take(20).collect()],
+            key_alias: None,
             secondary_keys: None,
+            keysecondary_alias: None,
             content: Some(e.knowledge_text.clone()),
             constant: e.pinned,   // pinned → 蓝灯（常驻）
             selective: !e.pinned, // 非 pinned → 绿灯（选择性）
@@ -10469,6 +10525,7 @@ fn world_info_book_from_entries(
     Some(storyforge_domain::world_info::WorldInfoBook {
         entries: entries.iter().map(world_info_entry_from_info).collect(),
         source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
     })
 }
 
@@ -10496,6 +10553,7 @@ fn collect_world_info_for_active(
     WorldInfoBook {
         entries,
         source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
     }
 }
 
@@ -11814,6 +11872,381 @@ mod tests {
             result.conversation_id
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_campaign_bundle_is_atomic_on_mid_write_failure() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_bundle_atomic_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Force instance persistence to fail after card/campaign writes.
+        std::fs::create_dir_all(dir.join("instances.json")).unwrap();
+
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let old_card_id = Id::from_str("atomic-card");
+        let old_campaign_id = Id::from_str("atomic-campaign");
+        let old_def = Id::from_str("atomic-def");
+        let old_instance = Id::from_str("atomic-instance");
+
+        let definitions = vec![CharacterDefinition {
+            id: old_def.clone(),
+            card_id: old_card_id.clone(),
+            name: "Atomic".into(),
+            persona_prompt: "persona".into(),
+            behavior_rules: String::new(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Protagonist,
+            variable_schema: vec![],
+        }];
+        let card = CharacterCard {
+            id: old_card_id.clone(),
+            name: "Atomic Card".into(),
+            source_character_id: Id::from_str("atomic-source"),
+            character_definitions: definitions.clone(),
+            raw_card_json: serde_json::json!({"first_mes": "hi"}),
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: None,
+        };
+        let mut campaign = Campaign::new(old_card_id.clone(), "Atomic Campaign");
+        campaign.id = old_campaign_id.clone();
+        campaign.set_variable("story_clock", serde_json::json!("Day 3"), 2);
+        let instances = vec![CharacterInstance {
+            id: old_instance,
+            campaign_id: old_campaign_id,
+            definition_id: Some(old_def),
+            name: "Atomic".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![storyforge_domain::variables::VariableValue::new(
+                "hp",
+                serde_json::json!(77),
+                2,
+            )],
+            is_temporary: false,
+        }];
+
+        let err = import_campaign_bundle_into_store(
+            &store,
+            &conv_store,
+            CampaignBundle {
+                format_version: BUNDLE_FORMAT_VERSION,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                card: Some(card),
+                campaign,
+                instances,
+                definitions,
+                knowledge: vec![],
+                tasks: vec![],
+                summaries: vec![],
+            },
+        )
+        .expect_err("instance write failure should fail the import");
+
+        match err {
+            TauriCommandError::Storage { .. } | TauriCommandError::Internal { .. } => {}
+            other => panic!("expected storage/internal error, got {other:?}"),
+        }
+
+        assert!(
+            store.list_cards().is_empty(),
+            "failed import must not leave a partial card"
+        );
+        assert!(
+            store.list_campaigns().is_empty(),
+            "failed import must not leave a partial campaign"
+        );
+        assert!(
+            store.list_all_instances().is_empty(),
+            "failed import must not leave partial instances"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn campaign_bundle_roundtrip_preserves_variables_and_multi_character_semantics() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterCard, CharacterDefinition, RoleType};
+        use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, KnowledgeSource};
+        use storyforge_domain::story_task::{StoryTask, TaskTrigger};
+        use storyforge_domain::variables::VariableValue;
+
+        let export_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_bundle_vars_export_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let import_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_bundle_vars_import_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let export_store = campaign_store::CampaignStore::new(&export_dir);
+        let import_store = campaign_store::CampaignStore::new(&import_dir);
+        let import_conv = ConversationStore::new(import_dir.join("conversations"));
+
+        let card_id = Id::from_str("vars-card");
+        let campaign_id = Id::from_str("vars-campaign");
+        let def_a = Id::from_str("vars-def-a");
+        let def_b = Id::from_str("vars-def-b");
+        let inst_a = Id::from_str("vars-inst-a");
+        let inst_b = Id::from_str("vars-inst-b");
+        let knowledge_a = Id::from_str("vars-know-a");
+        let knowledge_b = Id::from_str("vars-know-b");
+
+        let definitions = vec![
+            CharacterDefinition {
+                id: def_a.clone(),
+                card_id: card_id.clone(),
+                name: "Alpha".into(),
+                persona_prompt: "alpha persona".into(),
+                behavior_rules: "alpha rules".into(),
+                base_backstory: vec!["alpha backstory".into()],
+                group: Some("party".into()),
+                role_type: RoleType::Protagonist,
+                variable_schema: vec![],
+            },
+            CharacterDefinition {
+                id: def_b.clone(),
+                card_id: card_id.clone(),
+                name: "Beta".into(),
+                persona_prompt: "beta persona".into(),
+                behavior_rules: "beta rules".into(),
+                base_backstory: vec![],
+                group: Some("party".into()),
+                role_type: RoleType::Supporting,
+                variable_schema: vec![],
+            },
+        ];
+        let card = CharacterCard {
+            id: card_id.clone(),
+            name: "Multi Card".into(),
+            source_character_id: Id::from_str("vars-source"),
+            character_definitions: definitions.clone(),
+            raw_card_json: serde_json::json!({
+                "first_mes": "multi-open",
+                "alternate_greetings": ["m1", "m2"]
+            }),
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
+            extraction_message: Some("two characters".into()),
+        };
+        export_store.save_card(card).unwrap();
+
+        let mut campaign = Campaign::new(card_id.clone(), "Vars Campaign");
+        campaign.id = campaign_id.clone();
+        campaign.revision = 4;
+        campaign.chronicle_revision = 2;
+        campaign.set_variable("story_clock", serde_json::json!("Day 12 - night"), 8);
+        campaign.set_variable("weather", serde_json::json!("storm"), 8);
+        export_store.save_campaign(campaign).unwrap();
+
+        for instance in [
+            CharacterInstance {
+                id: inst_a.clone(),
+                campaign_id: campaign_id.clone(),
+                definition_id: Some(def_a.clone()),
+                name: "Alpha".into(),
+                persona_override: Some("alpha live".into()),
+                behavior_override: None,
+                variables: vec![VariableValue::new("hp", serde_json::json!(88), 8)],
+                is_temporary: false,
+            },
+            CharacterInstance {
+                id: inst_b.clone(),
+                campaign_id: campaign_id.clone(),
+                definition_id: Some(def_b.clone()),
+                name: "Beta".into(),
+                persona_override: None,
+                behavior_override: Some("beta live".into()),
+                variables: vec![VariableValue::new("mood", serde_json::json!("wary"), 8)],
+                is_temporary: false,
+            },
+        ] {
+            export_store.add_instance(instance).unwrap();
+        }
+
+        let mut witnessed = CharacterKnowledgeEntry::witnessed(
+            campaign_id.clone(),
+            inst_a.clone(),
+            "Alpha saw the seal break",
+            7,
+        );
+        witnessed.id = knowledge_a.clone();
+        witnessed.pinned = true;
+        let mut told = CharacterKnowledgeEntry {
+            id: knowledge_b,
+            campaign_id: campaign_id.clone(),
+            character_id: inst_b.clone(),
+            knowledge_text: "Beta was told about the seal".into(),
+            source: KnowledgeSource::ToldByOther,
+            source_character_id: Some(inst_a.clone()),
+            source_knowledge_id: Some(knowledge_a),
+            turn_number: 8,
+            event_id: None,
+            pinned: false,
+            propagation: Default::default(),
+        };
+        let _ = &mut told;
+        export_store.add_knowledge(vec![witnessed, told]).unwrap();
+
+        let mut task = StoryTask::user_planned(
+            campaign_id.clone(),
+            "Repair the seal",
+            "Both characters involved",
+            vec![TaskTrigger::TurnReminder { at_turn: 10 }],
+            8,
+        );
+        task.related_characters = vec![inst_a, inst_b];
+        export_store.add_task(task).unwrap();
+
+        let bundle_json = export_campaign_bundle_from_store(&export_store, campaign_id).unwrap();
+        let bundle: CampaignBundle = serde_json::from_str(&bundle_json).unwrap();
+        assert_eq!(bundle.definitions.len(), 2);
+        assert_eq!(bundle.instances.len(), 2);
+        assert!(
+            bundle.card.as_ref().unwrap().character_definitions.len() == 2,
+            "bundle must keep multi-character definitions instead of flattening"
+        );
+
+        let imported =
+            import_campaign_bundle_into_store(&import_store, &import_conv, bundle).unwrap();
+        let new_campaign_id = Id::from_str(&imported.campaign_id);
+        let imported_campaign = import_store.get_campaign(&new_campaign_id).unwrap();
+        assert_eq!(
+            imported_campaign.get_variable("story_clock").unwrap(),
+            &serde_json::json!("Day 12 - night")
+        );
+        assert_eq!(
+            imported_campaign.get_variable("weather").unwrap(),
+            &serde_json::json!("storm")
+        );
+        // revision/chronicle_revision are Campaign fields and must survive export→import.
+        assert_eq!(imported_campaign.revision, 4);
+        assert_eq!(imported_campaign.chronicle_revision, 2);
+
+        let imported_card = import_store
+            .get_card(&Id::from_str(&imported.card_id))
+            .unwrap();
+        assert_eq!(imported_card.card.character_definitions.len(), 2);
+        assert!(
+            imported_card
+                .card
+                .character_definitions
+                .iter()
+                .any(|d| d.name == "Alpha")
+                && imported_card
+                    .card
+                    .character_definitions
+                    .iter()
+                    .any(|d| d.name == "Beta"),
+            "multi-character definitions must both survive"
+        );
+
+        let imported_instances = import_store.list_instances(&new_campaign_id);
+        assert_eq!(imported_instances.len(), 2);
+        let alpha = imported_instances
+            .iter()
+            .find(|i| i.name == "Alpha")
+            .unwrap();
+        let beta = imported_instances
+            .iter()
+            .find(|i| i.name == "Beta")
+            .unwrap();
+        assert_eq!(
+            alpha
+                .variables
+                .iter()
+                .find(|v| v.key == "hp")
+                .map(|v| &v.value),
+            Some(&serde_json::json!(88))
+        );
+        assert_eq!(
+            beta.variables
+                .iter()
+                .find(|v| v.key == "mood")
+                .map(|v| &v.value),
+            Some(&serde_json::json!("wary"))
+        );
+        assert_eq!(alpha.persona_override.as_deref(), Some("alpha live"));
+        assert_eq!(beta.behavior_override.as_deref(), Some("beta live"));
+
+        let knowledge = import_store.list_knowledge(&new_campaign_id);
+        assert_eq!(knowledge.len(), 2);
+        let told = knowledge
+            .iter()
+            .find(|k| k.source == KnowledgeSource::ToldByOther)
+            .unwrap();
+        let source_instance = told.source_character_id.as_ref().unwrap();
+        assert_eq!(source_instance, &alpha.id);
+        assert!(
+            knowledge
+                .iter()
+                .any(|k| k.id == *told.source_knowledge_id.as_ref().unwrap()),
+            "knowledge provenance must point at rewritten source knowledge id"
+        );
+
+        let tasks = import_store.list_tasks(&new_campaign_id);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].related_characters.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&export_dir);
+        let _ = std::fs::remove_dir_all(&import_dir);
+    }
+
+    #[test]
+    fn import_campaign_bundle_rejects_unsupported_version_without_mutation() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::character::CharacterCard;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_bundle_bad_version_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let card = CharacterCard {
+            id: Id::from_str("v-card"),
+            name: "V".into(),
+            source_character_id: Id::from_str("v-source"),
+            character_definitions: vec![],
+            raw_card_json: serde_json::Value::Null,
+            extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
+            extraction_message: None,
+        };
+        let campaign = Campaign::new(card.id.clone(), "V");
+        let err = import_campaign_bundle_into_store(
+            &store,
+            &conv_store,
+            CampaignBundle {
+                format_version: 99,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                card: Some(card),
+                campaign,
+                instances: vec![],
+                definitions: vec![],
+                knowledge: vec![],
+                tasks: vec![],
+                summaries: vec![],
+            },
+        )
+        .expect_err("unsupported version must fail");
+        match err {
+            TauriCommandError::Validation { .. } => {}
+            other => panic!("expected validation error, got {other:?}"),
+        }
+        assert!(store.list_cards().is_empty());
+        assert!(store.list_campaigns().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13223,6 +13656,7 @@ mod tests {
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({"entry_extra": true}),
             }],
+            metadata: Default::default(),
         });
 
         let stored = storage::StoredCharacter {
