@@ -24,7 +24,8 @@
 3. `58316ce` feat(release-build): Windows and Android host evidence runners
 4. `63b1205` test(release-build): avoid static secret-scan false positives in fixtures
 5. `0a63cf7` fix(release-build): harden host runners for local evidence collection
-6. (this RESULT commit, if present on tip)
+6. `20a2c5c` docs(workstream): record release build pipeline RESULT
+7. `f0dc74e` docs(workstream): avoid secret-scan false positive in RESULT text
 
 ## Modified / added files
 
