@@ -113,7 +113,9 @@ function Invoke-AndroidHostCommand {
         } finally {
             $ErrorActionPreference = $prevEap
         }
-        $lines = @($output | ForEach-Object { "$_" })
+        $lines = @($output | ForEach-Object {
+            Protect-ReleasePath -Text "$_" -RepoRoot $script:RepoRoot
+        })
         if ($LogPath) {
             $lines | Set-Content -LiteralPath $LogPath -Encoding utf8
         }
@@ -180,15 +182,14 @@ function Add-ApkArtifactAndInspect {
     try {
         $entries = Get-ZipEntryNames -ZipPath $item.FullName
         $info = Get-ReleaseApkInspection -Entries $entries -ApkLabel $item.Name
+        Assert-ReleaseApkInspection -Inspection $info
         $script:ApkInspections.Add($info)
-        if (-not $info.capabilities.native_arm64) {
-            $script:Warnings.Add(("APK {0} missing arm64-v8a native libs" -f $item.Name))
-        }
         if (-not $info.sqlite_bundled) {
-            $script:Notes.Add(("APK {0}: no obvious bundled sqlite .so name matched; runtime may still use linked sqlite" -f $item.Name))
+            $script:Notes.Add(("APK {0}: no exact bundled sqlite/sqlcipher .so matched; runtime may still use linked sqlite" -f $item.Name))
         }
     } catch {
-        $script:Warnings.Add(("failed to inspect APK {0}: {1}" -f $item.Name, $_.Exception.Message))
+        $safeMessage = Protect-ReleasePath -Text $_.Exception.Message -RepoRoot $script:RepoRoot
+        throw ("APK inspection failed closed for {0}: {1}" -f $item.Name, $safeMessage)
     }
 
     return $true
@@ -256,36 +257,37 @@ try {
         $script:Notes.Add('secret scan skipped by flag')
     }
 
+    $androidBuildIssues = @()
+    if ($BuildApk) {
+        $androidBuildIssues = @(Get-ReleaseAndroidBuildPathIssues)
+        if (@($androidBuildIssues).Count -gt 0) {
+            if ($DryRun) {
+                foreach ($issue in $androidBuildIssues) {
+                    Write-Host ("DRY RUN NOTE: {0}" -f $issue)
+                    $script:Notes.Add($issue)
+                }
+                $script:Notes.Add('APK build would fail-closed without ANDROID_HOME/NDK_HOME')
+            } else {
+                # Requested production APK evidence must fail before any host build work.
+                Assert-ReleaseAndroidBuildEnvironment
+            }
+        }
+    }
+
     $frontendRoot = Join-Path $script:RepoRoot 'frontend'
     $tauriAppRoot = Join-Path $script:RepoRoot 'crates\tauri-app'
     $buildStatus = 'ok'
 
     # Host-side smoke steps (no device).
-    $nodeModules = Join-Path $frontendRoot 'node_modules'
-    if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
-        # Fail-closed reproducible install only.
-        Invoke-AndroidHostCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') | Out-Null
-    }
+    # Always recreate dependencies from package-lock for reproducible release input.
+    Invoke-AndroidHostCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') | Out-Null
     Invoke-AndroidHostCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build') | Out-Null
     Invoke-AndroidHostCommand -Name 'cargo test -p storyforge --test capabilities' -WorkingDirectory $script:RepoRoot -Command @('cargo', 'test', '-p', 'storyforge', '--test', 'capabilities') | Out-Null
     Invoke-AndroidHostCommand -Name 'cargo check -p storyforge-infra-util --target aarch64-linux-android' -WorkingDirectory $script:RepoRoot -Command @('cargo', 'check', '-p', 'storyforge-infra-util', '--target', 'aarch64-linux-android') | Out-Null
 
     $apkAttempted = $false
     if ($BuildApk) {
-        $issues = @(Get-ReleaseAndroidBuildPathIssues)
-
-        if (@($issues).Count -gt 0) {
-            if ($DryRun) {
-                foreach ($issue in $issues) {
-                    Write-Host ("DRY RUN NOTE: {0}" -f $issue)
-                    $script:Notes.Add($issue)
-                }
-                $script:Notes.Add('APK build would fail-closed without ANDROID_HOME/NDK_HOME')
-                $buildStatus = 'failed'
-            } else {
-                Assert-ReleaseAndroidBuildEnvironment
-            }
-        } else {
+        if (@($androidBuildIssues).Count -eq 0) {
             $apkAttempted = $true
             $debugLog = Join-Path $runDir 'android-debug-build.log'
             $releaseLog = Join-Path $runDir 'android-release-build.log'
@@ -326,6 +328,9 @@ try {
                 if ($freshCount -eq 0) {
                     $buildStatus = 'failed'
                 }
+                if ($buildStatus -ne 'failed') {
+                    Assert-ReleaseRequiredApkKinds -Artifacts ([object[]]$script:Artifacts.ToArray())
+                }
             }
         }
     } else {
@@ -348,7 +353,7 @@ try {
     $apkInspectionArr = if ($script:ApkInspections.Count -gt 0) { [object[]]$script:ApkInspections.ToArray() } else { @() }
     $warningReportArr = if ($script:WarningReports.Count -gt 0) { [object[]]$script:WarningReports.ToArray() } else { @() }
     $noteArrForEvidence = [string[]]@($script:Notes | ForEach-Object { [string]$_ })
-    $evidence = [pscustomobject]@{
+    $evidence = Protect-ReleaseObject -Value ([pscustomobject]@{
         schema_version = 1
         commit = $identity.commit
         branch = $identity.branch
@@ -356,7 +361,7 @@ try {
         apk_inspections = $apkInspectionArr
         warning_reports = $warningReportArr
         notes = $noteArrForEvidence
-    }
+    }) -RepoRoot $script:RepoRoot
     $inspectionPath = Join-Path $runDir 'apk-inspection.json'
     Write-ReleaseJson -Object $evidence -Path $inspectionPath
 
@@ -411,8 +416,8 @@ try {
     } else {
         foreach ($dir in $targets) {
             Write-Host ("Removing old run dir: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $dir.FullName))
-            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
+        Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
     }
 
     Write-Host ''

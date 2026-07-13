@@ -46,6 +46,11 @@ function Find-RepoRoot {
 
 try {
     $repoRoot = Find-RepoRoot
+    $commonPath = Join-Path $repoRoot 'scripts\release-build\ReleaseBuild.Common.ps1'
+    if (-not (Test-Path -LiteralPath $commonPath)) {
+        throw "Release build helper file not found: $commonPath"
+    }
+    . $commonPath
     $testFiles = @(
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Tests.ps1')
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Pipeline.Tests.ps1')
@@ -78,32 +83,18 @@ try {
     $version = $pesterModule.Version
     Write-Host ("Using Pester {0}" -f $version)
 
-    $totalFailed = 0
     if ($version.Major -ge 5) {
         $config = New-PesterConfiguration
         $config.Run.Path = $testFiles
         $config.Run.Exit = $false
         $config.Output.Verbosity = 'Detailed'
         $result = Invoke-Pester -Configuration $config
-        if ($result.FailedCount -gt 0) {
-            $totalFailed = [int]$result.FailedCount
-        }
+        Assert-ReleasePesterResult -Result $result -Label 'release-build test suite'
     } else {
         foreach ($testFile in $testFiles) {
             $result = Invoke-Pester -Path $testFile -PassThru
-            if ($null -eq $result) {
-                throw "Pester returned no result object for $testFile"
-            }
-            if ($result.PSObject.Properties.Name -contains 'FailedCount') {
-                $totalFailed += [int]$result.FailedCount
-            } elseif ($result.PSObject.Properties.Name -contains 'Failed') {
-                $totalFailed += [int]$result.Failed.Count
-            }
+            Assert-ReleasePesterResult -Result $result -Label $testFile
         }
-    }
-
-    if ($totalFailed -gt 0) {
-        throw ("Release build tests failed: {0} failed assertion(s)." -f $totalFailed)
     }
 
     Write-Host 'Release build tests passed.' -ForegroundColor Green

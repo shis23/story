@@ -272,11 +272,8 @@ try {
     $bundleRequested = -not $SkipBundle
 
     if (-not $SkipFrontend) {
-        $nodeModules = Join-Path $frontendRoot 'node_modules'
-        if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
-            # Fail-closed reproducible install only. No npm install fallback.
-            $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci')
-        }
+        # Always recreate dependencies from package-lock for reproducible release input.
+        $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci')
         $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
     } else {
         # Tauri generate_context! requires frontendDist to exist. Mirror bronze smoke:
@@ -380,6 +377,12 @@ try {
     Write-ReleaseJson -Object $inventory -Path $inventoryPath
     Write-Host ("Wrote inventory: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $inventoryPath))
     $script:Notes.Add(('dependency_inventory_generator={0}' -f $inventory.generator))
+    $inventoryEvidence = [pscustomobject]@{
+        relative_path = Get-RelativeReleasePath -RepoRoot $runDir -FullPath $inventoryPath
+        sha256 = Get-ReleaseFileSha256 -Path $inventoryPath
+        component_count = @($inventory.components).Count
+        generator = $inventory.generator
+    }
 
     $script:Notes.Add('host-only; GUI acceptance not claimed')
     $script:Notes.Add('android device acceptance not claimed')
@@ -397,6 +400,7 @@ try {
         -Target 'x86_64-pc-windows-msvc' `
         -ToolVersions $toolVersions `
         -Artifacts $artifactArr `
+        -DependencyInventory $inventoryEvidence `
         -BuildStatus $buildStatus `
         -Warnings $warningArr `
         -Notes $noteArr `
@@ -436,8 +440,8 @@ try {
     } else {
         foreach ($dir in $targets) {
             Write-Host ("Removing old run dir: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $dir.FullName))
-            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
         }
+        Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
         Write-Host ("Retention complete; keep={0}" -f $KeepRuns)
     }
 

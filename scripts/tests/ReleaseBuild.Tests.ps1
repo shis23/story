@@ -169,6 +169,39 @@ Describe 'ReleaseBuild manifest construction' {
         $manifest.build_status | Should Be 'failed'
         $manifest.artifacts[0].status | Should Be 'missing'
     }
+
+    It 'sanitizes every manifest string and binds the dependency inventory hash' {
+        $fake = 'sk' + '-' + ('q' * 24)
+        $artifact = New-ReleaseArtifactRecord `
+            -RelativePath "C:\Users\Predator\repo\$fake.exe" `
+            -SizeBytes 12 `
+            -Sha256 ('a' * 64) `
+            -Kind 'windows-exe' `
+            -Status 'present'
+        $inventory = [pscustomobject]@{
+            relative_path = "C:\Users\Predator\inventory.json"
+            sha256 = ('b' * 64)
+            component_count = 42
+            generator = "unsafe-$fake"
+        }
+        $manifest = New-ReleaseBuildManifest `
+            -Commit "commit-$fake" `
+            -Branch "C:\Users\Predator\branch" `
+            -Target 'x86_64-pc-windows-msvc' `
+            -ToolVersions @{ rustc = "C:\Users\Predator\rustc" } `
+            -Artifacts @($artifact) `
+            -DependencyInventory $inventory `
+            -BuildStatus 'ok' `
+            -Warnings @() `
+            -Notes @() `
+            -RepoRoot 'C:\Users\Predator\repo'
+
+        $json = $manifest | ConvertTo-Json -Depth 12
+        $json | Should Not Match ([regex]::Escape($fake))
+        $json | Should Not Match 'C:\\Users\\Predator'
+        $manifest.dependency_inventory.sha256 | Should Be ('b' * 64)
+        $manifest.dependency_inventory.component_count | Should Be 42
+    }
 }
 
 Describe 'ReleaseBuild fail-closed guards' {
@@ -214,7 +247,7 @@ Describe 'ReleaseBuild APK inspection helpers' {
     It 'detects arm64-v8a native lib entries from zip listing' {
         $entries = @(
             'lib/arm64-v8a/libstoryforge.so'
-            'lib/arm64-v8a/libsqlite3x.so'
+            'lib/arm64-v8a/libsqlite3.so'
             'assets/index.html'
             'META-INF/MANIFEST.MF'
         )
@@ -223,6 +256,7 @@ Describe 'ReleaseBuild APK inspection helpers' {
         $info.has_native_libs | Should Be $true
         $info.sqlite_bundled | Should Be $true
         $info.capabilities.native_arm64 | Should Be $true
+        { Assert-ReleaseApkInspection -Inspection $info } | Should Not Throw
     }
 
     It 'reports missing arm64 and sqlite when absent' {
@@ -234,6 +268,23 @@ Describe 'ReleaseBuild APK inspection helpers' {
         $info.abis -contains 'arm64-v8a' | Should Be $false
         $info.sqlite_bundled | Should Be $false
         $info.capabilities.native_arm64 | Should Be $false
+        { Assert-ReleaseApkInspection -Inspection $info } | Should Throw
+    }
+
+    It 'does not treat arbitrary sqlite substrings as a bundled native library' {
+        $info = Get-ReleaseApkInspection -Entries @(
+            'lib/arm64-v8a/libstoryforge.so'
+            'assets/sqlite-documentation.txt'
+            'lib/arm64-v8a/libsqlite3x.so'
+        ) -ApkLabel 'app-arm64-debug.apk'
+        $info.sqlite_bundled | Should Be $false
+    }
+
+    It 'requires both fresh debug and release APK evidence kinds' {
+        $debug = New-ReleaseArtifactRecord -RelativePath 'debug.apk' -SizeBytes 1 -Sha256 ('a' * 64) -Kind 'android-debug-apk' -Status 'present'
+        $release = New-ReleaseArtifactRecord -RelativePath 'release.apk' -SizeBytes 1 -Sha256 ('b' * 64) -Kind 'android-release-apk' -Status 'present'
+        { Assert-ReleaseRequiredApkKinds -Artifacts @($debug) } | Should Throw
+        { Assert-ReleaseRequiredApkKinds -Artifacts @($debug, $release) } | Should Not Throw
     }
 }
 
@@ -294,6 +345,67 @@ Describe 'ReleaseBuild cleanup retention' {
         } finally {
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    It 'rejects a retention root that is itself a junction' {
+        $base = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-retention-junction-{0}" -f [guid]::NewGuid().ToString('N'))
+        $real = Join-Path $base 'real'
+        $link = Join-Path $base 'link'
+        New-Item -ItemType Directory -Path $real -Force | Out-Null
+        New-Item -ItemType Junction -Path $link -Target $real | Out-Null
+        try {
+            { Get-ReleaseRetentionCleanupTargets -Root $link -Keep 1 } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'deletes only verified targets and propagates cleanup failures' {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-retention-delete-{0}" -f [guid]::NewGuid().ToString('N'))
+        $inside = Join-Path $root 'windows-old'
+        $outside = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-outside-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $inside, $outside -Force | Out-Null
+        try {
+            { Remove-ReleaseRetentionTargets -Root $root -Targets @((Get-Item -LiteralPath $outside)) } | Should Throw
+            Test-Path -LiteralPath $outside | Should Be $true
+            Remove-ReleaseRetentionTargets -Root $root -Targets @((Get-Item -LiteralPath $inside))
+            Test-Path -LiteralPath $inside | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $root, $outside -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild path boundaries and run identity' {
+    It 'does not classify a sibling path with the same prefix as repository-relative' {
+        $value = Get-RelativeReleasePath -RepoRoot 'C:\repo' -FullPath 'C:\repo2\artifact.exe'
+        $value | Should Be '<EXTERNAL_PATH>'
+    }
+
+    It 'creates unique run directories even within the same second' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-run-dir-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $repo -Force | Out-Null
+        try {
+            $first = New-ReleaseRunDirectory -RepoRoot $repo -Prefix 'windows'
+            $second = New-ReleaseRunDirectory -RepoRoot $repo -Prefix 'windows'
+            $first | Should Not Be $second
+            Test-Path -LiteralPath $first | Should Be $true
+            Test-Path -LiteralPath $second | Should Be $true
+        } finally {
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild Pester result policy' {
+    It 'rejects zero executed, failed, skipped, pending, and inconclusive results' {
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 0; FailedCount = 0; SkippedCount = 0; PendingCount = 0; InconclusiveCount = 0 }) -Label 'zero' } | Should Throw
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 2; FailedCount = 1; SkippedCount = 0; PendingCount = 0; InconclusiveCount = 0 }) -Label 'failed' } | Should Throw
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 2; FailedCount = 0; SkippedCount = 1; PendingCount = 0; InconclusiveCount = 0 }) -Label 'skipped' } | Should Throw
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 2; FailedCount = 0; SkippedCount = 0; PendingCount = 1; InconclusiveCount = 0 }) -Label 'pending' } | Should Throw
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 2; FailedCount = 0; SkippedCount = 0; PendingCount = 0; InconclusiveCount = 1 }) -Label 'inconclusive' } | Should Throw
+        { Assert-ReleasePesterResult -Result ([pscustomobject]@{ TotalCount = 2; FailedCount = 0; SkippedCount = 0; PendingCount = 0; InconclusiveCount = 0 }) -Label 'green' } | Should Not Throw
     }
 }
 

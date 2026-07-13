@@ -88,6 +88,39 @@ function Protect-ReleasePath {
     return $result
 }
 
+function Protect-ReleaseObject {
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [string]$RepoRoot
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) {
+        return (Protect-ReleasePath -Text ([string]$Value) -RepoRoot $RepoRoot)
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $safe = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $safe[[string]$key] = Protect-ReleaseObject -Value $Value[$key] -RepoRoot $RepoRoot
+        }
+        return $safe
+    }
+    if ($Value -is [pscustomobject]) {
+        $safe = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $safe[$property.Name] = Protect-ReleaseObject -Value $property.Value -RepoRoot $RepoRoot
+        }
+        return [pscustomobject]$safe
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value | ForEach-Object { Protect-ReleaseObject -Value $_ -RepoRoot $RepoRoot })
+        return ,$items
+    }
+    return $Value
+}
+
 function Get-ReleaseFileSha256 {
     param(
         [Parameter(Mandatory = $true)]
@@ -203,6 +236,9 @@ function New-ReleaseBuildManifest {
         [AllowEmptyCollection()]
         [string[]]$Notes = @(),
 
+        [AllowNull()]
+        [object]$DependencyInventory = $null,
+
         [string]$RepoRoot
     )
 
@@ -218,7 +254,7 @@ function New-ReleaseBuildManifest {
         Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
     })
 
-    return [pscustomobject]@{
+    $manifest = [pscustomobject]@{
         schema_version = 1
         generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         commit         = $Commit
@@ -226,6 +262,7 @@ function New-ReleaseBuildManifest {
         target         = $Target
         tool_versions  = $safeTools
         artifacts      = @($Artifacts)
+        dependency_inventory = $DependencyInventory
         build_status   = $BuildStatus
         warnings       = $safeWarnings
         notes          = $safeNotes
@@ -235,6 +272,7 @@ function New-ReleaseBuildManifest {
             host_build     = $BuildStatus
         }
     }
+    return (Protect-ReleaseObject -Value $manifest -RepoRoot $RepoRoot)
 }
 
 function Test-ReleaseStatusIsSuccess {
@@ -513,7 +551,7 @@ function Get-ReleaseApkInspection {
             }
             $hasNative = $true
         }
-        if ($normalized -match '(?i)sqlite') {
+        if ($normalized -match '(?i)^lib/[^/]+/(libsqlite3|libsqlcipher)\.so$') {
             $sqlite = $true
         }
     }
@@ -529,6 +567,37 @@ function Get-ReleaseApkInspection {
         capabilities     = [pscustomobject]@{
             native_arm64 = $hasArm64
             sqlite       = $sqlite
+        }
+    }
+}
+
+function Assert-ReleaseApkInspection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Inspection
+    )
+
+    if (-not $Inspection.has_native_libs) {
+        throw "APK '$($Inspection.label)' contains no native libraries."
+    }
+    if (-not $Inspection.capabilities.native_arm64) {
+        throw "APK '$($Inspection.label)' contains no arm64-v8a native library."
+    }
+}
+
+function Assert-ReleaseRequiredApkKinds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Artifacts
+    )
+
+    foreach ($kind in @('android-debug-apk', 'android-release-apk')) {
+        $present = @($Artifacts | Where-Object {
+            $_.kind -eq $kind -and $_.status -eq 'present'
+        })
+        if ($present.Count -eq 0) {
+            throw "Required fresh APK evidence kind '$kind' is missing."
         }
     }
 }
@@ -692,6 +761,37 @@ function New-ReleaseDependencyInventory {
     }
 }
 
+function Test-ReleasePathWithinRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    if ($pathFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    return $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-ReleaseDirectoryNotReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) {
+        throw "$Label is not a directory: $Path"
+    }
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label must not be a junction, symlink, or reparse point: $Path"
+    }
+    return $item
+}
+
 function Get-ReleaseRetentionCleanupTargets {
     param(
         [Parameter(Mandatory = $true)]
@@ -713,6 +813,9 @@ function Get-ReleaseRetentionCleanupTargets {
         return @()
     }
 
+    $rootItem = Assert-ReleaseDirectoryNotReparsePoint -Path $Root -Label 'Retention root'
+    $rootFull = [System.IO.Path]::GetFullPath($rootItem.FullName).TrimEnd('\', '/')
+
     $protected = @{}
     foreach ($p in @($ProtectFullNames)) {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
@@ -723,7 +826,7 @@ function Get-ReleaseRetentionCleanupTargets {
         }
     }
 
-    $candidates = @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | Where-Object {
+    $candidates = @(Get-ChildItem -LiteralPath $rootFull -Directory -ErrorAction Stop | Where-Object {
         $name = $_.Name
         $matched = $false
         foreach ($prefix in @($NamePrefixes)) {
@@ -750,6 +853,34 @@ function Get-ReleaseRetentionCleanupTargets {
         -not $protected.ContainsKey($_.FullName)
     })
     return $toDelete
+}
+
+function Remove-ReleaseRetentionTargets {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Targets
+    )
+
+    $rootItem = Assert-ReleaseDirectoryNotReparsePoint -Path $Root -Label 'Retention root'
+    $rootFull = [System.IO.Path]::GetFullPath($rootItem.FullName).TrimEnd('\', '/')
+    foreach ($target in @($Targets)) {
+        $targetPath = if ($target -is [System.IO.FileSystemInfo]) { $target.FullName } else { [string]$target }
+        if ([string]::IsNullOrWhiteSpace($targetPath)) {
+            throw 'Retention target path is empty.'
+        }
+        $targetFull = [System.IO.Path]::GetFullPath($targetPath).TrimEnd('\', '/')
+        if (-not (Test-ReleasePathWithinRoot -Root $rootFull -Path $targetFull)) {
+            throw "Retention target escapes the trusted root: $targetFull"
+        }
+        if (-not ([System.IO.Path]::GetDirectoryName($targetFull)).Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Retention target must be a direct child of the trusted root: $targetFull"
+        }
+        $targetItem = Assert-ReleaseDirectoryNotReparsePoint -Path $targetFull -Label 'Retention target'
+        Remove-Item -LiteralPath $targetItem.FullName -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $targetItem.FullName) {
+            throw "Retention cleanup failed to remove target: $($targetItem.FullName)"
+        }
+    }
 }
 
 function Find-ReleaseRepoRoot {
@@ -846,9 +977,10 @@ function New-ReleaseRunDirectory {
         New-Item -ItemType Directory -Force -Path $root | Out-Null
     }
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dir = Join-Path $root ("{0}-{1}" -f $Prefix, $stamp)
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $nonce = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $dir = Join-Path $root ("{0}-{1}-{2}" -f $Prefix, $stamp, $nonce)
+    New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
     return $dir
 }
 
@@ -881,10 +1013,51 @@ function Get-RelativeReleasePath {
     $rootFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
     $pathFull = [System.IO.Path]::GetFullPath($FullPath)
 
-    if ($pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (Test-ReleasePathWithinRoot -Root $rootFull -Path $pathFull) {
         $rel = $pathFull.Substring($rootFull.Length).TrimStart('\', '/')
         return ($rel -replace '\\', '/')
     }
 
-    return (Protect-ReleasePath -Text $pathFull -RepoRoot $RepoRoot)
+    return '<EXTERNAL_PATH>'
+}
+
+function Get-ReleaseResultCount {
+    param(
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string[]]$PropertyNames
+    )
+
+    foreach ($name in $PropertyNames) {
+        if ($Result.PSObject.Properties.Name -contains $name) {
+            $value = $Result.$name
+            if ($null -eq $value) { continue }
+            if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+                return @($value).Count
+            }
+            return [int]$value
+        }
+    }
+    return 0
+}
+
+function Assert-ReleasePesterResult {
+    param(
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if ($null -eq $Result) {
+        throw "Pester returned no result for '$Label'."
+    }
+    $total = Get-ReleaseResultCount -Result $Result -PropertyNames @('TotalCount', 'Total')
+    $failed = Get-ReleaseResultCount -Result $Result -PropertyNames @('FailedCount', 'Failed')
+    $skipped = Get-ReleaseResultCount -Result $Result -PropertyNames @('SkippedCount', 'Skipped')
+    $pending = Get-ReleaseResultCount -Result $Result -PropertyNames @('PendingCount', 'Pending')
+    $inconclusive = Get-ReleaseResultCount -Result $Result -PropertyNames @('InconclusiveCount', 'Inconclusive')
+    if ($total -le 0) {
+        throw "Pester executed zero tests for '$Label'."
+    }
+    if ($failed -gt 0 -or $skipped -gt 0 -or $pending -gt 0 -or $inconclusive -gt 0) {
+        throw "Pester result for '$Label' is not clean: total=$total failed=$failed skipped=$skipped pending=$pending inconclusive=$inconclusive."
+    }
 }

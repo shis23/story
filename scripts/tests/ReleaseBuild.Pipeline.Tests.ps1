@@ -16,9 +16,16 @@ function Invoke-PwshFile {
     )
 
     $allArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $File) + $Args
-    $output = & powershell.exe @allArgs 2>&1
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & powershell.exe @allArgs 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
     return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output   = @($output | ForEach-Object { "$_" })
     }
 }
@@ -55,6 +62,7 @@ Describe 'Release build dry-run' {
             $result = Invoke-PwshFile -File $scriptPath -Args @('-DryRun', '-OutputDir', $outDir)
             $result.ExitCode | Should Be 0
             ($result.Output -join "`n") | Should Match 'DRY RUN'
+            ($result.Output -join "`n") | Should Match 'npm\.cmd ci'
             $manifestPath = Join-Path $outDir 'manifest.json'
             Test-Path -LiteralPath $manifestPath | Should Be $true
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -75,6 +83,7 @@ Describe 'Release build dry-run' {
             $result = Invoke-PwshFile -File $scriptPath -Args @('-DryRun', '-OutputDir', $outDir)
             $result.ExitCode | Should Be 0
             ($result.Output -join "`n") | Should Match 'DRY RUN'
+            ($result.Output -join "`n") | Should Match 'npm\.cmd ci'
             $manifestPath = Join-Path $outDir 'manifest.json'
             Test-Path -LiteralPath $manifestPath | Should Be $true
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -88,6 +97,11 @@ Describe 'Release build dry-run' {
 }
 
 Describe 'Release build fail-closed behavior' {
+    It 'default repository secret scan passes without an allowlist' {
+        . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
+        { Invoke-ReleaseSecretScan -RepoRoot $RepoRoot } | Should Not Throw
+    }
+
     It 'fails closed when required cargo tool is unavailable in a synthetic check' {
         . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
         { Assert-ReleaseToolAvailable -Name 'cargo' -CommandPath $null } | Should Throw
@@ -138,5 +152,24 @@ Describe 'Release build fail-closed behavior' {
         $text | Should Match 'npm\.cmd'', ''ci'''
         $text | Should Not Match "npm\.cmd', 'install'"
         $text | Should Not Match 'npm\.cmd", "install"'
+    }
+
+    It 'production Android -BuildApk fails before host builds when prerequisites are missing' {
+        $outDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-and-fail-{0}" -f [guid]::NewGuid().ToString('N'))
+        $savedNdk = [Environment]::GetEnvironmentVariable('NDK_HOME')
+        $savedAndroid = [Environment]::GetEnvironmentVariable('ANDROID_HOME')
+        try {
+            [Environment]::SetEnvironmentVariable('NDK_HOME', $null)
+            [Environment]::SetEnvironmentVariable('ANDROID_HOME', 'C:\missing-android-sdk-for-production-test')
+            $scriptPath = Join-Path $RepoRoot 'scripts\run-android-host-pipeline.ps1'
+            $result = Invoke-PwshFile -File $scriptPath -Args @('-BuildApk', '-SkipSecretScan', '-OutputDir', $outDir)
+            $result.ExitCode | Should Not Be 0
+            ($result.Output -join "`n") | Should Match 'Android APK build environment is incomplete'
+            ($result.Output -join "`n") | Should Not Match 'frontend npm\.cmd run build'
+        } finally {
+            [Environment]::SetEnvironmentVariable('NDK_HOME', $savedNdk)
+            [Environment]::SetEnvironmentVariable('ANDROID_HOME', $savedAndroid)
+            Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
