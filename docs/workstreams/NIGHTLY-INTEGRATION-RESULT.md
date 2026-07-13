@@ -100,7 +100,7 @@
 
 | 级别 | 问题 | 修复 |
 | --- | --- | --- |
-| P0 | `MAX_CALLS` / `TIMEOUT_SECS` 只读不生效 | 新增 `BudgetedLlmClient`：原子计数 + `tokio::timeout`；超限返回 `LlmError::Internal` / `Timeout` |
+| P0 | `MAX_CALLS` / `TIMEOUT_SECS` 只读不生效 | 新增 `BudgetedLlmClient`：原子计数 + `tokio::timeout`；超限返回 `LlmError::Internal` / `Timeout`；真实 suite 仅保留单轮入口，`MAX_CALLS` 即 suite 总上限 |
 | P0 | fixture 缺失时零调用假通过 | `eval_real_llm_single_turn_evidence` 在 fixture 缺失时 **panic Inconclusive**；断言 `calls_used >= 1` |
 | P1 | 跨 H+E 测试未跑 ContextCompiler | `long_session` 接入 `compute_epoch_membership` / `refresh_context_epoch`；断言 near_raw 截断与 early turn 挤出 |
 | P1 | 真实 usage JSONL 占位 0 | 单轮真实测试写入 `BudgetedLlmClient` 录制的 prompt/cached/completion + segment hash |
@@ -114,7 +114,7 @@
 | 格式 | `cargo fmt --all -- --check` | **PASS** |
 | 空白检查 | `git diff --check 7fb1899..HEAD` | **PASS** |
 | 严格 lint | `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** |
-| workspace 测试 | `cargo test --workspace` | **PASS — 985 passed / 0 failed / 24 ignored** |
+| workspace 测试 | `cargo test --workspace` | **PASS — 985 passed / 0 failed / 23 ignored** |
 | 前端 Node 测试 | `npm test` | **PASS — 218 passed / 0 failed** |
 | 前端生产构建 | `npm run build` | **PASS — built in ~1.9s** |
 | secret scan | 7fb1899..HEAD 新增行 | **PASS — 0 真实密钥** |
@@ -135,7 +135,7 @@
 ### Diff 统计（7fb1899..HEAD）
 
 - **37 files** changed
-- **+7086 / -36**
+- **+7019 / -36**
 
 ## 7. 未合并 SQL commit 及原因
 

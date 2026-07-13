@@ -30,7 +30,6 @@ use harness_real_llm::{HarnessEnv, require_real_llm};
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
 use storyforge_domain::message_layout::{fingerprint_messages, messages_segment_summary};
-use storyforge_infra_llm::LlmClient;
 
 fn require_eval_budget() -> RealLlmRunBudget {
     let budget = RealLlmRunBudget::from_env();
@@ -232,56 +231,10 @@ async fn eval_real_llm_single_turn_evidence() {
     env.cleanup();
 }
 
-/// 真实模型预算硬上限 smoke：`max_calls=1` 时第二次 chat 必须被拦截。
-///
-/// 不依赖 fixture / 多 Agent pipeline，专门验证预算包装生效。
-#[tokio::test]
-#[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1 与 LLM 凭证；默认不跑"]
-async fn eval_real_llm_budget_enforced() {
-    let mut budget = require_eval_budget();
-    // Force a tight budget for this test regardless of env default.
-    budget.max_calls = 1;
-    budget.timeout_secs = budget.timeout_secs.max(15);
-
-    let llm = require_budgeted_client(&budget);
-    llm.set_tag("budget-probe");
-    llm.set_role("budget");
-
-    let req = storyforge_domain::llm::ChatRequest {
-        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
-        messages: vec![storyforge_domain::llm::ChatMessage::user(
-            "Reply with exactly one word: ok",
-        )],
-        tools: None,
-        params: storyforge_domain::llm::SamplingParams::default(),
-    };
-
-    let first = llm.chat(&req).await;
-    assert!(
-        first.is_ok(),
-        "first call within budget should succeed: {first:?}"
-    );
-    let second = llm.chat(&req).await;
-    assert!(
-        matches!(
-            second,
-            Err(storyforge_domain::llm::LlmError::Internal(ref s)) if s.contains("budget exhausted")
-        ),
-        "second call must be blocked by max_calls=1, got: {second:?}"
-    );
-    assert_eq!(llm.calls_used(), 1);
-    assert_eq!(llm.samples().len(), 1);
-    // Real usage should be non-zero from a successful first call (best-effort; some mocks may zero).
-    let sample = &llm.samples()[0];
-    eprintln!(
-        "budget probe: prompt={} completion={} cached={} fp={}",
-        sample.prompt_tokens, sample.completion_tokens, sample.cached_tokens, sample.request_fp16
-    );
-}
-
 // 说明：长会话 / Phase B 的**确定性**骨架已从本真实 suite 移除，
 // 避免 STORYFORGE_EVAL_REAL_LLM=1 时零调用假通过。
 // 确定性覆盖见：
+//   - harness-real-llm::budget::tests（max_calls / timeout，不消耗真实模型）
 //   - harness-real-llm::long_session::tests
 //   - harness-real-llm::phase_b_matrix
 //   - tests/eval_m5_phaseb_deterministic.rs
