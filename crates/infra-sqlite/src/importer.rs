@@ -50,7 +50,23 @@ impl<'a> JsonImporter<'a> {
     /// - tasks.json / round_summaries.json / turns.json
     /// - conversations/*.json
     pub fn import_data_dir(&mut self, data_dir: impl AsRef<Path>) -> Result<ImportReport> {
-        let data_dir = data_dir.as_ref();
+        self.import_data_dir_inner(data_dir.as_ref(), || {})
+    }
+
+    #[cfg(test)]
+    fn import_data_dir_after_precheck(
+        &mut self,
+        data_dir: impl AsRef<Path>,
+        after_precheck: impl FnOnce(),
+    ) -> Result<ImportReport> {
+        self.import_data_dir_inner(data_dir.as_ref(), after_precheck)
+    }
+
+    fn import_data_dir_inner(
+        &mut self,
+        data_dir: &Path,
+        after_precheck: impl FnOnce(),
+    ) -> Result<ImportReport> {
         if !data_dir.exists() {
             return Err(SqliteError::ImportSourceMissing(data_dir.to_path_buf()));
         }
@@ -61,21 +77,11 @@ impl<'a> JsonImporter<'a> {
         let source_manifest_hash = snapshot.manifest_hash.clone();
 
         if let Some(run_id) = find_completed_run(self.db, &source_manifest_hash)? {
-            return Ok(ImportReport {
-                run_id,
-                source_manifest_hash,
-                status: ImportStatus::SkippedDuplicate,
-                cards: snapshot.cards.len(),
-                campaigns: snapshot.campaigns.len(),
-                instances: snapshot.instances.len(),
-                knowledge: snapshot.knowledge.len(),
-                tasks: snapshot.tasks.len(),
-                summaries: snapshot.summaries.len(),
-                conversations: snapshot.conversations.len(),
-                turns: snapshot.turns.len(),
-                skipped_as_duplicate: true,
-            });
+            return Ok(duplicate_report(run_id, &snapshot));
         }
+
+        // Test hook makes the check-to-BEGIN race deterministic. Production uses a no-op.
+        after_precheck();
 
         let run_id = new_id();
         let started_at = chrono::Utc::now().to_rfc3339();
@@ -113,6 +119,14 @@ impl<'a> JsonImporter<'a> {
         started_at: &str,
     ) -> Result<ImportReport> {
         let uow = UnitOfWork::begin(self.db.connection_mut())?;
+        let completed_after_lock = {
+            let tx = uow.transaction()?;
+            find_completed_run_tx(tx, &snapshot.manifest_hash)?
+        };
+        if let Some(existing_run_id) = completed_after_lock {
+            uow.commit()?;
+            return Ok(duplicate_report(existing_run_id, snapshot));
+        }
         {
             let tx = uow.transaction()?;
             tx.execute(
@@ -147,6 +161,10 @@ impl<'a> JsonImporter<'a> {
             for conv in &snapshot.conversations {
                 upsert_conversation(tx, conv)?;
             }
+
+            // Fail closed with diagnostics before any summary/turn writes.
+            reject_invalid_source_graphs(&snapshot.summaries, &snapshot.turns)?;
+
             // summaries 可能互相引用 covered_by / covers：
             // 1) 先写入行（covered_by 置空，避免插入顺序触发 FK）
             // 2) 回填 covered_by
@@ -189,6 +207,23 @@ impl<'a> JsonImporter<'a> {
             turns: snapshot.turns.len(),
             skipped_as_duplicate: false,
         })
+    }
+}
+
+fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
+    ImportReport {
+        run_id,
+        source_manifest_hash: snapshot.manifest_hash.clone(),
+        status: ImportStatus::SkippedDuplicate,
+        cards: snapshot.cards.len(),
+        campaigns: snapshot.campaigns.len(),
+        instances: snapshot.instances.len(),
+        knowledge: snapshot.knowledge.len(),
+        tasks: snapshot.tasks.len(),
+        summaries: snapshot.summaries.len(),
+        conversations: snapshot.conversations.len(),
+        turns: snapshot.turns.len(),
+        skipped_as_duplicate: true,
     }
 }
 
@@ -313,6 +348,21 @@ fn find_completed_run(db: &Database, hash: &str) -> Result<Option<String>> {
         .query_row(rusqlite::params![hash], |row| row.get(0))
         .optional()?;
     Ok(run_id)
+}
+
+fn find_completed_run_tx(tx: &rusqlite::Transaction<'_>, hash: &str) -> Result<Option<String>> {
+    tx.query_row(
+        r#"
+        SELECT run_id FROM import_runs
+        WHERE source_manifest_hash = ?1 AND status = 'completed'
+        ORDER BY finished_at DESC
+        LIMIT 1
+        "#,
+        [hash],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn upsert_card(tx: &rusqlite::Transaction<'_>, card: &Value) -> Result<()> {
@@ -629,6 +679,22 @@ fn upsert_turn(tx: &rusqlite::Transaction<'_>, turn: &Value) -> Result<()> {
 
 fn upsert_attempt(tx: &rusqlite::Transaction<'_>, turn_id: &str, attempt: &Value) -> Result<()> {
     let attempt_id = required_str(attempt, "attempt_id", "turn_attempt")?;
+    let existing_owner: Option<String> = tx
+        .query_row(
+            "SELECT turn_id FROM turn_attempts WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing_owner
+        .as_deref()
+        .is_some_and(|owner| owner != turn_id)
+    {
+        return Err(SqliteError::CorruptImportInput(format!(
+            "duplicate attempt ownership: attempt {attempt_id} already owned by turn {}, refusing rehang onto {turn_id}",
+            existing_owner.as_deref().unwrap_or_default()
+        )));
+    }
     let variant_id = required_str(attempt, "variant_id", "turn_attempt")?;
     let draft_hash = optional_str(attempt, "draft_hash").unwrap_or_default();
     let status = optional_str(attempt, "status").unwrap_or_else(|| "generating".into());
@@ -652,6 +718,15 @@ fn upsert_attempt(tx: &rusqlite::Transaction<'_>, turn_id: &str, attempt: &Value
         ],
     )?;
     Ok(())
+}
+
+fn reject_invalid_source_graphs(summaries: &[Value], turns: &[Value]) -> Result<()> {
+    let mut issues = crate::readiness::validate_summary_graph(summaries);
+    issues.extend(crate::readiness::validate_attempt_ownership(turns));
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(SqliteError::CorruptImportInput(issues.join("; ")))
 }
 
 fn required_str<'v>(value: &'v Value, key: &str, entity: &str) -> Result<&'v str> {
@@ -733,6 +808,7 @@ mod tests {
     use crate::connection::Database;
     use serde_json::json;
     use std::fs;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     fn write_json(path: &Path, value: &Value) {
@@ -812,7 +888,8 @@ mod tests {
                     "created_at": "2026-07-13T00:00:00Z",
                     "level": 0,
                     "lineage_id": "lin-1",
-                    "code": "A0001"
+                    "code": "A0001",
+                    "covered_by": "sum-b"
                 },
                 {
                     "id": "sum-b",
@@ -829,8 +906,7 @@ mod tests {
                 }
             ]),
         );
-        // covered_by 在第二遍可更新；这里写在 A 上模拟折叠
-        // 为简单起见 covers 关联已足够测 FK
+        // covers 与 covered_by 双向一致（importer 诊断要求）
 
         write_json(
             &root.join("conversations").join("conv-1.json"),
@@ -893,6 +969,60 @@ mod tests {
         assert_eq!(table_count(&db, "campaigns").unwrap(), 1);
         assert_eq!(table_count(&db, "turns").unwrap(), 1);
         assert_eq!(table_count(&db, "import_runs").unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_same_manifest_converges_to_one_completed_run() {
+        let data = sample_data_dir();
+        let db_dir = TempDir::new().unwrap();
+        let db_path = db_dir.path().join("concurrent-import.sqlite3");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let source = data.path().to_path_buf();
+                let db_path = db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut db = Database::open(db_path).unwrap();
+                    JsonImporter::new(&mut db)
+                        .import_data_dir_after_precheck(&source, || {
+                            barrier.wait();
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        let reports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.status == ImportStatus::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.status == ImportStatus::SkippedDuplicate)
+                .count(),
+            1
+        );
+
+        let db = Database::open(db_path).unwrap();
+        let completed: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM import_runs WHERE status = 'completed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
     }
 
     #[test]
