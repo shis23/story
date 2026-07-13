@@ -3792,12 +3792,15 @@ dependencies = [
  "storyforge-infra-llm",
  "storyforge-infra-plugin-host",
  "storyforge-infra-regex",
+ "storyforge-infra-sqlite",
  "storyforge-infra-util",
  "storyforge-infra-vector",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -3980,6 +3983,7 @@ name = "storyforge-infra-sqlite"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

@@ -9,9 +9,12 @@
 //!
 //! 设计见 `docs/adr/0001-sqlite-migration-foundation.md`。
 
+pub mod backend;
 pub mod connection;
 pub mod contract;
+pub mod cutover;
 pub mod error;
+pub mod exporter;
 pub mod importer;
 pub mod migrations;
 pub mod production;
@@ -19,8 +22,17 @@ pub mod publication;
 pub mod readiness;
 pub mod unit_of_work;
 
+pub use backend::{
+    BackendDiagnostics, BackendSelection, BackendSelectionError, BackendSource,
+    DEFAULT_BACKEND_ENV_VAR, PinnedBackend, StorageBackend,
+};
 pub use connection::Database;
+pub use cutover::{
+    BackendMarker, CutoverDiagnostics, CutoverFault, CutoverOutcome, CutoverPlan, CutoverReport,
+    CutoverRequest, CutoverState, MarkerStatus, recover_or_verify, run_cutover,
+};
 pub use error::{Result, SqliteError};
+pub use exporter::{ReverseExportReport, ReverseExportResult, export_sqlite_to_json};
 pub use importer::{ImportReport, ImportStatus, JsonImporter};
 pub use migrations::{Migration, builtin_migrations, current_version, migrate, migrate_with};
 pub use publication::{PublishFault, PublishOutcome, PublishRequest, SqliteChronicleRepository};
