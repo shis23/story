@@ -2,7 +2,7 @@
 
 > 集成分支：`codex/integration-nightly-2026-07-13`
 > 基线：`7fb1899`
-> 收口 HEAD：`799ea2f`
+> 收口 HEAD：`0177d0e`
 > 日期：2026-07-13
 > 工作目录：`C:\tmp\storyforge-integration`
 
@@ -74,6 +74,7 @@
 | `669d2c9` | fix(infra-sqlite): migration 按 version 排序 + 拒绝非法集合 |
 | `922d018` | feat(eval): BudgetedLlmClient 真正限制 max_calls / timeout |
 | `799ea2f` | fix(eval): fixture 缺失失败；诚实 H/E ContextEpoch；真实 usage 落盘 |
+| `0177d0e` | docs(workstream): 更新 RESULT（HEAD/计数/阻断修复） |
 
 ## 3. 冲突处理记录
 
