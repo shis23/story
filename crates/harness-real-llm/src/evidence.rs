@@ -113,6 +113,14 @@ pub struct EvidenceAbRow {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
+    /// Continuity/agency marker: whether the draft maintained scene continuity
+    /// (deterministic = true; real-model path overwrites).
+    #[serde(default)]
+    pub continuity_ok: bool,
+    /// Output emptiness/truncation/failure indicator.
+    /// `ok` / `empty` / `truncated` / `failed`
+    #[serde(default = "default_ab_outcome")]
+    pub output_status: String,
     pub assertion_results: Vec<AssertionResult>,
     pub recorded_at_unix_ms: u128,
 }
@@ -120,6 +128,10 @@ pub struct EvidenceAbRow {
 pub const EVIDENCE_SCHEMA_VERSION: &str = "eval-m5-phaseb-v1";
 
 fn default_call_outcome() -> String {
+    "ok".into()
+}
+
+fn default_ab_outcome() -> String {
     "ok".into()
 }
 
