@@ -26,6 +26,8 @@
 5. `0a63cf7` fix(release-build): harden host runners for local evidence collection
 6. `20a2c5c` docs(workstream): record release build pipeline RESULT
 7. `f0dc74e` docs(workstream): avoid secret-scan false positive in RESULT text
+8. `7addb06` docs(workstream): finalize release build RESULT commit list
+9. `22e1c85` fix(release-build): close fail-closed gaps in host evidence runners
 
 ## Modified / added files
 
@@ -157,6 +159,20 @@ No APK signing, publishing, device install, or GUI launch was attempted.
 - Observed retention removing older windows/android dry-run dirs during later runs
 - No keystores, APKs, or large build trees committed
 
+## Fail-closed hardening follow-up (`22e1c85`)
+
+Review findings closed in-branch:
+
+| Finding | Fix |
+| --- | --- |
+| Windows bundle / Android APK failure degraded to `partial` with exit 0 | Requested bundle/APK paths now fail closed; `partial`/`failed` exit non-zero via `Get-ReleaseProcessExitCode` |
+| Stale installer/APK harvest attributed to current SHA | Artifact collection requires freshness vs `build_started_utc`; Android only scans current Gradle outputs |
+| Retention deleted arbitrary dirs under evidence root | Only `windows-*` / `android-*` prefixes; skip reparse points; protect current run dir |
+| Secret scan not in runners | `Invoke-ReleaseSecretScan` runs by default; `-SkipSecretScan` is explicit |
+| Android fail-closed tests used hard-coded strings | Tests call `Get-ReleaseAndroidBuildPathIssues` / `Assert-ReleaseAndroidBuildEnvironment` |
+| `npm ci` fell back to `npm install` | Fallback removed; reproducible `npm ci` only |
+| Manifest warnings/notes not redacted | `New-ReleaseBuildManifest` redacts warnings/notes with `Protect-ReleasePath` |
+
 ## Unfinished / risks
 
 | Item | Status | Risk |
@@ -165,7 +181,7 @@ No APK signing, publishing, device install, or GUI launch was attempted.
 | Frontend production build as part of non-skip Windows runner | Implemented; this machine evidence used `-SkipFrontend` + placeholder for compile context | Medium — re-run without skip on a clean machine |
 | Android debug/release APK build + ABI/SQLite inspection on real APKs | Blocked by missing `NDK_HOME` | High for Android package evidence; host smoke still ok |
 | Normalized Gradle/Kotlin/proguard warning report from real APK logs | Helper + tests present; no real APK log captured this host | Low until APK build runs |
-| Repo-wide secret scan | Pre-existing eval fixture false-positive remains | Process — fix on eval line or allowlist policy |
+| Repo-wide secret scan | Pre-existing eval fixture false-positive remains | Process — fix on eval line or allowlist policy; runners can use `-SkipSecretScan` only for local host binary collection |
 | GUI / physical device acceptance | Explicitly out of scope | Do not treat host ok as release PASS |
 
 ## Merge recommendation
