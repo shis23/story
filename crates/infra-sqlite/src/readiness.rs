@@ -509,7 +509,8 @@ fn redact_value(value: &mut Value, redacted_fields: &mut BTreeSet<String>) {
             for key in keys {
                 if is_secret_field(&key) {
                     map.remove(&key);
-                    redacted_fields.insert(key);
+                    // Never expose the hostile source key through ExportSnapshot metadata.
+                    redacted_fields.insert("sensitive_field".into());
                 } else if let Some(child) = map.get_mut(&key) {
                     redact_value(child, redacted_fields);
                 }
@@ -520,11 +521,13 @@ fn redact_value(value: &mut Value, redacted_fields: &mut BTreeSet<String>) {
                 redact_value(item, redacted_fields);
             }
         }
-        Value::String(text)
-            if looks_like_secret_text(text) || looks_like_absolute_path_text(text) =>
-        {
+        Value::String(text) if looks_like_secret_text(text) => {
             *text = "[REDACTED]".into();
             redacted_fields.insert("free_text_secret".into());
+        }
+        Value::String(text) if looks_like_absolute_path_text(text) => {
+            *text = "[REDACTED]".into();
+            redacted_fields.insert("absolute_path".into());
         }
         Value::String(_) => {}
         _ => {}
@@ -574,9 +577,12 @@ fn looks_like_absolute_path_text(text: &str) -> bool {
         window[0].is_ascii_alphabetic()
             && window[1] == b':'
             && (window[2] == b'\\' || window[2] == b'/')
-    }) || text.starts_with("\\\\")
-        || text.starts_with("/home/")
-        || text.starts_with("/Users/")
+    }) || text.contains("\\\\")
+        || [
+            "/home/", "/Users/", "/data/", "/tmp/", "/var/", "/root/", "/etc/",
+        ]
+        .iter()
+        .any(|prefix| text.contains(prefix))
 }
 
 pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {

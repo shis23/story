@@ -239,7 +239,11 @@ fn readonly_export_contains_no_secrets_and_does_not_mutate_live_db() {
         !found_secret,
         "export must redact secrets for rollback inspection"
     );
-    assert!(snapshot.redacted_fields.contains(&"api_key".to_string()));
+    assert!(
+        snapshot
+            .redacted_fields
+            .contains(&"sensitive_field".to_string())
+    );
 }
 
 #[test]
@@ -461,6 +465,56 @@ fn export_includes_jobs_ledger_and_redacts_extended_secrets() {
         }
     }
     assert!(!found_secret, "export leaked secret material");
+}
+
+#[test]
+fn export_does_not_return_hostile_field_names_and_redacts_android_paths() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::open(dir.path().join("live.sqlite3")).unwrap();
+    migrate(&mut db).unwrap();
+    let mut campaign = Campaign::new(Id::from_str("card"), "Export");
+    campaign.id = Id::from_str("camp-hostile");
+    let mut conversation = Conversation::new(None, Some(campaign.id.clone()));
+    conversation.id = Id::from_str("conv-hostile");
+    campaign.conversation_id = Some(conversation.id.clone());
+    SqliteProductionRepository::bootstrap_campaign(&mut db, &campaign, &conversation).unwrap();
+
+    let hostile_key = "api_key_token=hostile-field-name";
+    let hostile_path = "/data/user/0/com.storyforge/files/private.json";
+    let payload = serde_json::json!({
+        hostile_key: "hidden-value",
+        "operational_error": format!("failed while reading {hostile_path}")
+    });
+    db.connection()
+        .execute(
+            "UPDATE campaigns SET payload_json = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![payload.to_string(), campaign.id.as_str()],
+        )
+        .unwrap();
+
+    let export_dir = dir.path().join("export");
+    let snapshot = export_readonly_snapshot(&db, &export_dir).unwrap();
+    assert!(
+        snapshot
+            .redacted_fields
+            .contains(&"sensitive_field".to_string())
+    );
+    assert!(
+        snapshot
+            .redacted_fields
+            .contains(&"absolute_path".to_string())
+    );
+    assert!(
+        snapshot
+            .redacted_fields
+            .iter()
+            .all(|field| !field.contains("hostile") && !field.contains("api_key_token"))
+    );
+    for entry in walkdir_files(&export_dir) {
+        let text = fs::read_to_string(entry).unwrap_or_default();
+        assert!(!text.contains(hostile_key));
+        assert!(!text.contains(hostile_path));
+    }
 }
 
 #[test]

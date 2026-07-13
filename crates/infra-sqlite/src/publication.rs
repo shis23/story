@@ -513,13 +513,10 @@ fn verify_completed_publication_state(
             "completed publication drift: campaign still has a pending publication marker".into(),
         ));
     }
-    if let Some(epoch) = campaign.context_epoch.as_ref()
-        && epoch.chronicle_revision != job.target_chronicle_revision
-    {
-        return Err(SqliteError::Conflict(format!(
-            "completed publication drift: context epoch revision {} differs from publication {}",
-            epoch.chronicle_revision, job.target_chronicle_revision
-        )));
+    if campaign.context_epoch.is_some() {
+        return Err(SqliteError::Conflict(
+            "completed publication drift: context epoch must remain cleared".into(),
+        ));
     }
 
     // Re-run the full scope/lineage/level/span validation against live children.

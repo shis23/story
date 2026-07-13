@@ -874,6 +874,31 @@ fn completed_replay_rejects_campaign_revision_marker_and_epoch_drift() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("epoch"), "{err}");
+
+    campaign.context_epoch = Some(
+        storyforge_domain::chronicle::ContextEpochSnapshot::new_empty(
+            "same-revision-but-not-exact",
+            campaign.chronicle_revision,
+        ),
+    );
+    f.db.connection()
+        .execute(
+            "UPDATE campaigns SET payload_json = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&campaign).unwrap(),
+                f.campaign_id.as_str()
+            ],
+        )
+        .unwrap();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("epoch"), "{err}");
 }
 
 #[test]

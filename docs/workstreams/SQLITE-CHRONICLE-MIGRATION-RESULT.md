@@ -184,7 +184,7 @@ GREEN:
 | --- | --- |
 | `cargo fmt -p storyforge-infra-sqlite -p storyforge-domain -- --check` | PASS |
 | `cargo test -p storyforge-domain` | PASS: 243 passed |
-| `cargo test -p storyforge-infra-sqlite --all-targets` | PASS: 21 unit + 19 publication + 15 readiness + 4 importer diagnostics + 1 migration concurrency + 25 production UoW |
+| `cargo test -p storyforge-infra-sqlite --all-targets` | PASS: 21 unit + 19 publication + 16 readiness + 4 importer diagnostics + 1 migration concurrency + 25 production UoW |
 | `cargo clippy -p storyforge-domain -p storyforge-infra-sqlite --all-targets -- -D warnings` | PASS |
 | `git diff --check c3a972d..HEAD` | PASS |
 
@@ -200,13 +200,17 @@ SQLite backend into the app:
   test;
 - completed Chronicle publication replay revalidates the exact parent payload,
   exact cover edge set, child reverse edges, target Campaign revision, cleared
-  marker, context epoch revision, and live scope/lineage/level/span invariants;
+  marker, exact cleared context epoch state, and live scope/lineage/level/span
+  invariants;
 - readiness validation rejects null collections and incomplete Chronicle graph
   identity, level, or turn-span data;
 - backup checkpoints run `PRAGMA integrity_check` against the backup and do not
   expose sensitive labels or live absolute paths;
 - read-only exports include `schema_migrations`, redact all operational tables
-  recursively, and omit the live database path from the manifest.
+  recursively, and omit the live database path from the manifest. Returned
+  redaction metadata uses fixed categories rather than hostile source keys, and
+  operational Android/Linux paths such as `/data`, `/tmp`, and `/var` are
+  redacted from free text.
 
 ## Default-backend proof
 
