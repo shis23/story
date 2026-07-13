@@ -371,3 +371,62 @@ test('late backend prompt hook cannot reset or execute a cancelled generation', 
   assert.equal(calls, 0)
   assert.equal(bridge.isPromptHooksCancelled(), true)
 })
+
+test('production prompt-hook path stamps correlation/generation and enforces budget/revocation', async () => {
+  const { plugin, bridge } = setup()
+  plugin.hookPlugins = [
+    { id: 'bloater', permissions: ['ModifyPrompt'], manifest: { name: 'Bloater' } },
+    { id: 'revoked', permissions: ['ModifyPrompt'], manifest: { name: 'Revoked' } },
+    { id: 'ok', permissions: ['ModifyPrompt'], manifest: { name: 'Ok' } },
+  ]
+  plugin.setHookPluginHostRef('bloater', {
+    async emitPluginEventAndWait(_event, payload) {
+      return { ...payload, prompt: `${payload.prompt}${'X'.repeat(400)}` }
+    },
+  })
+  plugin.setHookPluginHostRef('revoked', {
+    async emitPluginEventAndWait() {
+      throw new Error('should not run after revocation')
+    },
+  })
+  plugin.setHookPluginHostRef('ok', {
+    async emitPluginEventAndWait(_event, payload) {
+      return { ...payload, prompt: `${payload.prompt} + ok` }
+    },
+  })
+
+  bridge.setPromptHookMaxPayloadBytes(64)
+  bridge.setLivePluginPermissionsResolver((hp) => (
+    hp.id === 'revoked' ? ['ReadMemory'] : hp.permissions
+  ))
+  bridge.beginPromptHookGeneration()
+
+  const result = await bridge.emitPromptHookEventAndWait(
+    ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+    { prompt: 'base' },
+    'production_wiring',
+  )
+
+  assert.deepEqual(result, { prompt: 'base + ok' })
+  assert.deepEqual(
+    plugin.promptHookAuditRecords.map((record) => [record.pluginId, record.status]),
+    [
+      ['bloater', 'budget_exceeded'],
+      ['revoked', 'revoked'],
+      ['ok', 'ok'],
+    ],
+  )
+  for (const record of plugin.promptHookAuditRecords) {
+    assert.equal(typeof record.generationId, 'string')
+    assert.ok(record.generationId.length > 0)
+    assert.equal(typeof record.correlationId, 'string')
+    assert.match(record.correlationId, /^hook:/)
+    assert.equal(typeof record.recordHash, 'string')
+    assert.ok(record.recordHash.length > 0)
+  }
+  // Chained integrity: second prevHash equals first recordHash.
+  assert.equal(
+    plugin.promptHookAuditRecords[1].prevHash,
+    plugin.promptHookAuditRecords[0].recordHash,
+  )
+})

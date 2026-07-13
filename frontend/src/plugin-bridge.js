@@ -157,10 +157,11 @@ export const API_METHODS = {
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
-  // chat.save is a host-side persistence adapter route (no backend command,
-  // no plugin permission gate beyond what the adapter enforces). Falls back to
-  // the degraded local-mirror adapter when the host injects nothing.
+  // Host-side adapter routes (no backend command). Defaults are degraded shims;
+  // production can inject real adapters without editing tauri-app storage code.
   'chat.save':        { permission: null,              command: null },
+  'ui.popup':         { permission: null,              command: null },
+  'ui.requestHeaders':{ permission: null,              command: null },
   'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ intent: p.intent ?? p.prompt ?? '' }) },
 }
 
@@ -283,26 +284,39 @@ function createPluginEventPayload(pipelineEvent, options = {}) {
 }
 
 /**
- * Detect whether a state_changed pipeline event carries a committed state.
+ * Only true terminal turn commits may fan out to MESSAGE_RECEIVED /
+ * CHARACTER_MESSAGE_RENDERED / CHAT_CHANGED.
  *
- * The pipeline historically may emit `StateChanged{Committed}` instead of a
- * bare `committed` variant. This closes that ambiguity: when the event is a
- * state_changed carrying `state === 'committed'` (or a nested
- * `change.Committed` / `Committed` typed payload), the host also derives the
- * committed alias chain so plugins subscribed to MESSAGE_RECEIVED /
- * CHARACTER_MESSAGE_RENDERED / CHAT_CHANGED still fire.
+ * Pipeline `state_changed{Committed}` after `append_ai_draft` is NOT a user
+ * Accept: the variant is still Draft and may be discarded. Mapping that state
+ * to ST message events would let plugins mutate variables/network/storage
+ * before Accept with no rollback path.
+ *
+ * Allowed sources:
+ * - event_type === 'committed' (PipelineEvent::Committed)
+ * - explicit terminal markers on the payload (turn/attempt accepted final)
  */
-function derivesCommittedAlias(pipelineEvent) {
-  if (pipelineEvent?.event_type !== 'state_changed') return false
-  const data = pipelineEvent?.data
-  if (!data || typeof data !== 'object') return false
-  const state = typeof data.state === 'string' ? data.state.toLowerCase() : null
-  if (state === 'committed') return true
-  // Nested typed Change shapes: { change: { Committed: {...} } } or
-  // { change: 'Committed' }.
-  const change = data.change
-  if (change && typeof change === 'object' && Object.prototype.hasOwnProperty.call(change, 'Committed')) return true
-  if (typeof change === 'string' && change.toLowerCase() === 'committed') return true
+export function isTerminalTurnCommitEvent(pipelineEvent) {
+  if (!pipelineEvent?.event_type) return false
+  if (pipelineEvent.event_type === 'committed') return true
+  if (pipelineEvent.event_type !== 'state_changed') return false
+  const data = pipelineEvent.data && typeof pipelineEvent.data === 'object'
+    ? pipelineEvent.data
+    : {}
+  // Explicit accept / finalization markers only. Bare pipeline state labels
+  // like "Committed" after draft write are intentionally excluded.
+  if (data.terminalTurnCommit === true || data.turnCommitted === true || data.accepted === true) {
+    return true
+  }
+  const turnStatus = String(data.turnStatus || data.turn_status || '').toLowerCase()
+  const attemptStatus = String(data.attemptStatus || data.attempt_status || '').toLowerCase()
+  const variantStatus = String(data.variantStatus || data.variant_status || '').toLowerCase()
+  if (
+    (turnStatus === 'committed' || turnStatus === 'degraded')
+    && (attemptStatus === 'committed' || attemptStatus === 'final' || variantStatus === 'final')
+  ) {
+    return true
+  }
   return false
 }
 
@@ -320,12 +334,13 @@ export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
   const names = [
     `pipeline.${pipelineEvent.event_type}`,
     pipelineEvent.event_type,
-    ...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []),
   ]
-  // state_changed → committed alias derivation (closes the StateChanged{Committed}
-  // ambiguity). Inject the committed alias chain so subscribed ST plugins fire.
-  if (derivesCommittedAlias(pipelineEvent)) {
+  // Only terminal turn commits get ST message/chat aliases. Bare
+  // state_changed{Committed} after draft append must not.
+  if (isTerminalTurnCommitEvent(pipelineEvent)) {
     names.push('committed', ...(ST_EVENT_ALIASES.committed || []))
+  } else if (pipelineEvent.event_type !== 'committed') {
+    names.push(...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []))
   }
 
   return uniqueEventNames(names)
@@ -1098,6 +1113,9 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     pending.degraded = true
     pending.reason = 'local_mirror_only_no_host_persist'
     pending.persistedAt = null
+    // Generation token: after a timed-out fallback, ignore late host success so
+    // retries cannot double-write when a previous saveChat later resolves.
+    const generation = String(++_reqId) + ':saveChat'
 
     const finish = function(result) {
       if (settled) return
@@ -1109,31 +1127,81 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     // Bounded wait for the host adapter. The default host route always
     // answers; if it does not (or the host crashed), fall back to degraded.
     const timer = setTimeout(function() {
-      finish({ ok: true, degraded: true, reason: 'local_mirror_only_no_host_persist', persistedAt: null })
+      finish({
+        ok: true,
+        degraded: true,
+        reason: 'local_mirror_only_no_host_persist',
+        persistedAt: null,
+        timedOut: true,
+        generation: generation,
+      })
     }, 500)
 
-    _call('chat.save', { chat: _chat })
+    _call('chat.save', { chat: _chat, generation: generation })
       .then(function(result) {
         clearTimeout(timer)
+        // Late success after timeout must not flip the already-settled promise
+        // or imply a second durable write for the same saveChat call.
+        if (settled) return
         finish(result)
       })
       .catch(function() {
         clearTimeout(timer)
+        if (settled) return
         finish(null)
       })
 
     return pending
   }
 
+  function _degradedPopupValue(type, defaultValue) {
+    if (defaultValue !== undefined) return String(defaultValue)
+    if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return null
+    return ''
+  }
+
   function _callGenericPopup(html, type, defaultValue) {
-    // No native popup UI; return ST-compatible degraded defaults.
-    if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
-    if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
-    return Promise.resolve('');
+    // Host popup adapter when available; race a short timeout so missing host
+    // handlers never hang ST plugins forever.
+    if (_canPostToHost()) {
+      return Promise.race([
+        _call('ui.popup', {
+          html: html,
+          type: type,
+          defaultValue: defaultValue,
+        }).then(function(result) {
+          if (result && typeof result === 'object' && 'value' in result) return result.value
+          return result
+        }),
+        new Promise(function(resolve) {
+          setTimeout(function() {
+            resolve(_degradedPopupValue(type, defaultValue))
+          }, 250)
+        }),
+      ]).catch(function() {
+        return _degradedPopupValue(type, defaultValue)
+      })
+    }
+    return Promise.resolve(_degradedPopupValue(type, defaultValue))
   }
 
   function _getRequestHeaders() {
-    // Static shim — no session auth headers are exposed to plugins.
+    // Host request-headers adapter when available; always redacted server-side.
+    // Synchronous ST API: return the last cached host headers or the static shim.
+    // Fire-and-forget refresh must not block or hang callers.
+    if (_canPostToHost()) {
+      Promise.race([
+        _call('ui.requestHeaders', {}),
+        new Promise(function(resolve) { setTimeout(function() { resolve(null) }, 250) }),
+      ]).then(function(headers) {
+        if (headers && typeof headers === 'object') {
+          window.__sfRequestHeadersCache = headers
+        }
+      }).catch(function() {})
+      if (window.__sfRequestHeadersCache && typeof window.__sfRequestHeadersCache === 'object') {
+        return window.__sfRequestHeadersCache
+      }
+    }
     return { 'Content-Type': 'application/json' };
   }
 
@@ -1643,6 +1711,8 @@ export function createHostHandler(plugin, invoke, options = {}) {
     if (data.method === 'chat.save') {
       // Deterministic host-side persistence adapter. No backend command and no
       // plugin permission gate: the adapter itself enforces the contract.
+      // Generation tokens let timed-out iframe callers ignore late host success
+      // without blocking a later explicit retry under a new generation.
       const saveChatAdapter = options.saveChatAdapter || defaultAdapters.saveChat
       try {
         const result = await saveChatAdapter.saveChat(
@@ -1658,6 +1728,42 @@ export function createHostHandler(plugin, invoke, options = {}) {
           type: MSG_RESPONSE,
           id: data.id,
           result: { ok: false, degraded: true, reason: 'persist_failed', persistedAt: null },
+        })
+      }
+      return
+    }
+    if (data.method === 'ui.popup') {
+      const popupAdapter = options.popupAdapter || defaultAdapters.popup
+      try {
+        const value = await popupAdapter.popup(data.params || {}, plugin)
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { value, degraded: value === undefined },
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { value: undefined, degraded: true },
+        })
+      }
+      return
+    }
+    if (data.method === 'ui.requestHeaders') {
+      const headersAdapter = options.requestHeadersAdapter || defaultAdapters.requestHeaders
+      try {
+        const headers = headersAdapter.getHeaders()
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: headers,
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { 'Content-Type': 'application/json' },
         })
       }
       return
@@ -1698,9 +1804,19 @@ export function createPluginHookBridge(plugin, options = {}) {
   const getTarget = typeof options.getTarget === 'function' ? options.getTarget : () => null
   const isTrustedSource = options.isTrustedSource || (() => true)
   const targetOrigin = normalizeTargetOrigin(options.targetOrigin)
-  const timeoutMs = Number.isFinite(options.timeoutMs)
-    ? Math.max(0, options.timeoutMs)
-    : DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  // timeoutMs === null disables the bridge-level timer so an outer runtime
+  // (promptHooks.js) owns timeout accounting and audits status=timeout.
+  // Finite values enable a bridge-local timer (tests / standalone callers).
+  // Default remains DEFAULT_PLUGIN_HOOK_TIMEOUT_MS for backward compatibility
+  // when production forgets to pass timeoutMs: null.
+  let timeoutMs
+  if (options.timeoutMs === null) {
+    timeoutMs = null
+  } else if (Number.isFinite(options.timeoutMs)) {
+    timeoutMs = Math.max(0, options.timeoutMs)
+  } else {
+    timeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  }
   const onError = typeof options.onError === 'function' ? options.onError : () => {}
   let nextHookId = 0
   const pending = new Map()
@@ -1709,13 +1825,23 @@ export function createPluginHookBridge(plugin, options = {}) {
     const entry = pending.get(id)
     if (!entry) return false
     pending.delete(id)
-    clearTimeout(entry.timer)
+    if (entry.timer) clearTimeout(entry.timer)
     resolver(entry)
     return true
   }
 
   function fallback(entry, reason) {
     if (reason) onError(reason)
+    if (reason && /timed out/i.test(String(reason?.message || reason || ''))) {
+      const error = reason instanceof Error ? reason : new Error(String(reason))
+      error.code = error.code || 'PROMPT_HOOK_TIMEOUT'
+      // Prefer reject so outer withTimeout / audit can classify timeout instead
+      // of silently resolving as ok with the fallback payload.
+      if (typeof entry.reject === 'function') {
+        entry.reject(error)
+        return
+      }
+    }
     entry.resolve(entry.fallback)
   }
 
@@ -1741,11 +1867,13 @@ export function createPluginHookBridge(plugin, options = {}) {
     }
 
     const id = String(++nextHookId)
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        settle(id, (entry) => fallback(entry, new Error(`Plugin hook timed out: ${eventName}`)))
-      }, timeoutMs)
-      pending.set(id, { resolve, fallback: payload, timer })
+    return new Promise((resolve, reject) => {
+      const timer = timeoutMs === null
+        ? null
+        : setTimeout(() => {
+          settle(id, (entry) => fallback(entry, new Error(`Plugin hook timed out: ${eventName}`)))
+        }, timeoutMs)
+      pending.set(id, { resolve, reject, fallback: payload, timer })
       target.postMessage({
         type: MSG_HOOK_REQUEST,
         pluginId,

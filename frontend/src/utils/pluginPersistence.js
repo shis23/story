@@ -26,18 +26,25 @@ const POPUP_TYPES = Object.freeze({
   CROP: 5,
 })
 
-// Keys that must never be echoed back to a plugin, even from a custom adapter.
-const FORBIDDEN_HEADER_KEYS = new Set([
+// Normalized header name fragments that must never be echoed back to a plugin,
+// even from a custom adapter. Matching is on alnum-only lowercase keys so
+// variants like X-ApiKey / Proxy-Authorization / x_api_key are covered.
+const FORBIDDEN_HEADER_KEY_FRAGMENTS = [
   'authorization',
   'apikey',
-  'api-key',
-  'x-api-key',
-  'api_key',
-  'bearer',
+  'proxyauthorization',
+  'proxyauthenticate',
+  'wwwauthenticate',
   'cookie',
-  'set-cookie',
-  'x-auth-token',
-])
+  'setcookie',
+  'authtoken',
+  'accessToken'.toLowerCase(),
+  'refreshtoken',
+  'secret',
+  'password',
+  'credential',
+  'bearer',
+]
 
 function isCancelled(signal) {
   return Boolean(signal?.aborted)
@@ -202,13 +209,17 @@ export function createDefaultRequestHeadersAdapter() {
   return createRequestHeadersAdapter({})
 }
 
+function isForbiddenHeaderKey(key) {
+  const normalized = String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!normalized) return true
+  return FORBIDDEN_HEADER_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))
+}
+
 function redactHeaders(headers) {
   const out = {}
   for (const [key, value] of Object.entries(headers || {})) {
-    const normalized = String(key || '').toLowerCase()
-    if (FORBIDDEN_HEADER_KEYS.has(normalized)) continue
-    if (FORBIDDEN_HEADER_KEYS.has(String(normalized).replace(/[^a-z0-9]/g, ''))) continue
-    if (typeof value === 'string' && /bearer\s|sk-|SF_SECRET_|api[_-]?key|authorization/i.test(value)) {
+    if (isForbiddenHeaderKey(key)) continue
+    if (typeof value === 'string' && /bearer\s|sk-|SF_SECRET_|api[_-]?key|authorization|proxy-?authorization/i.test(value)) {
       continue
     }
     out[key] = value

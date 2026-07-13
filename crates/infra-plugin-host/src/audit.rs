@@ -26,7 +26,9 @@ impl CorrelationId {
 
 /// Redacted audit record for plugin host surfaces.
 ///
-/// Never stores raw prompts, messages, credentials, or stacks.
+/// Never stores raw prompts, messages, credentials, or stacks. Prefer
+/// [`AuditRecord::redacted`] so free-form secret-bearing strings cannot be
+/// stuffed into identity fields by accident.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub plugin_id: String,
@@ -39,10 +41,89 @@ pub struct AuditRecord {
     /// Summary only — never raw content.
     pub changed_keys: Vec<String>,
     pub recorded_at_ms: u64,
-    /// Hash over sanitized fields. Populated by [`chain_audit_records`].
+    /// Integrity hash over sanitized fields. Populated by [`chain_audit_records`].
+    /// FNV-1a 32-bit: accidental-corruption detection only, not a crypto seal.
     pub record_hash: Option<String>,
     /// Previous record hash in the chain. Populated by [`chain_audit_records`].
     pub prev_hash: Option<String>,
+}
+
+fn sanitize_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let forbidden = [
+        "api_key",
+        "apikey",
+        "authorization",
+        "sf_secret_",
+        "password",
+        "credential",
+        "bearer ",
+        "sk-",
+        "private prompt",
+        "stack",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    if forbidden.iter().any(|token| lower.contains(token)) {
+        return format!("<redacted:{}>", fnv1a_hex(trimmed));
+    }
+    // Keep printable labels bounded; drop control characters.
+    trimmed
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(96)
+        .collect()
+}
+
+fn sanitize_status(value: &str) -> String {
+    match value {
+        "ok" | "no_change" | "timeout" | "cancelled" | "error" | "audit_error"
+        | "missing_host" | "unloaded" | "revoked" | "budget_exceeded" => value.to_string(),
+        _ => "audit_error".to_string(),
+    }
+}
+
+/// Input for [`AuditRecord::redacted`]. Keeps the constructor arg count low.
+#[derive(Debug, Clone, Default)]
+pub struct AuditRecordInput {
+    pub plugin_id: String,
+    pub event: String,
+    pub stage: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub correlation_id: Option<CorrelationId>,
+    pub generation_id: Option<String>,
+    pub changed_keys: Vec<String>,
+    pub recorded_at_ms: u64,
+}
+
+impl AuditRecord {
+    /// Controlled constructor that redacts identity labels and rejects secret-
+    /// like free text from entering the audit ring.
+    pub fn redacted(input: AuditRecordInput) -> Self {
+        Self {
+            plugin_id: sanitize_label(&input.plugin_id),
+            event: sanitize_label(&input.event),
+            stage: sanitize_label(&input.stage),
+            status: sanitize_status(&input.status),
+            duration_ms: input.duration_ms,
+            correlation_id: input
+                .correlation_id
+                .map(|id| CorrelationId::new(sanitize_label(id.as_str()))),
+            generation_id: input.generation_id.map(|id| sanitize_label(&id)),
+            changed_keys: input
+                .changed_keys
+                .into_iter()
+                .take(128)
+                .map(|key| sanitize_label(&key))
+                .collect(),
+            recorded_at_ms: input.recorded_at_ms,
+            record_hash: None,
+            prev_hash: None,
+        }
+    }
 }
 
 /// Query filters for audit records.
@@ -99,10 +180,11 @@ fn fnv1a_hex(input: &str) -> String {
     format!("{hash:08x}")
 }
 
-/// Compute a tamper-evident hash over sanitized record fields.
+/// Compute an integrity hash over sanitized record fields.
 ///
 /// Does not include secrets or raw prompt bodies because those fields are
-/// never present on [`AuditRecord`].
+/// never present on [`AuditRecord`] when built via [`AuditRecord::redacted`].
+/// FNV-1a 32-bit: local accidental-corruption detection only (no trusted head).
 pub fn compute_audit_record_hash(record: &AuditRecord, prev_hash: Option<&str>) -> String {
     let mut material = String::new();
     material.push_str(prev_hash.unwrap_or(""));
@@ -304,7 +386,7 @@ mod tests {
     use super::*;
 
     fn sample(plugin_id: &str, recorded_at_ms: u64, status: &str) -> AuditRecord {
-        AuditRecord {
+        AuditRecord::redacted(AuditRecordInput {
             plugin_id: plugin_id.into(),
             event: "CHAT_COMPLETION_PROMPT_READY".into(),
             stage: "frontend_intent".into(),
@@ -314,9 +396,27 @@ mod tests {
             generation_id: Some("gen-1".into()),
             changed_keys: vec!["prompt".into()],
             recorded_at_ms,
-            record_hash: None,
-            prev_hash: None,
-        }
+        })
+    }
+
+    #[test]
+    fn redacted_constructor_strips_secret_like_labels() {
+        let record = AuditRecord::redacted(AuditRecordInput {
+            plugin_id: "plugin-a".into(),
+            event: "CHAT_COMPLETION_PROMPT_READY".into(),
+            stage: "frontend_intent".into(),
+            status: "ok".into(),
+            duration_ms: 1,
+            correlation_id: Some(CorrelationId::new("corr with SF_SECRET_x")),
+            generation_id: Some("api_key_should_go".into()),
+            changed_keys: vec!["Authorization".into(), "prompt".into()],
+            recorded_at_ms: 1,
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("SF_SECRET_"));
+        assert!(!json.contains("api_key_should_go"));
+        assert!(!json.contains("Authorization"));
+        assert!(record.changed_keys.iter().all(|key| !key.contains("Authorization")));
     }
 
     #[test]

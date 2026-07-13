@@ -140,6 +140,9 @@ test('custom request headers adapter is redacted before it can leak credentials'
       'Content-Type': 'application/json',
       Authorization: 'Bearer secret-token',
       'x-api-key': 'SF_SECRET_abc',
+      'X-ApiKey': 'also-secret',
+      'Proxy-Authorization': 'Basic abc',
+      'Set-Cookie': 'sid=1',
     }),
   })
 
@@ -147,6 +150,9 @@ test('custom request headers adapter is redacted before it can leak credentials'
 
   assert.equal(headers.Authorization, undefined)
   assert.equal(headers['x-api-key'], undefined)
+  assert.equal(headers['X-ApiKey'], undefined)
+  assert.equal(headers['Proxy-Authorization'], undefined)
+  assert.equal(headers['Set-Cookie'], undefined)
   assert.equal(headers['Content-Type'], 'application/json')
 })
 

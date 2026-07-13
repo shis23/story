@@ -66,6 +66,20 @@ function sanitizeFieldName(value) {
   return text
 }
 
+// Correlation / generation ids may start with digits (e.g. "1") or use
+// structured forms like "hook:1:2". Keep them when they are short and free of
+// secret-like material; otherwise hash-redact.
+const SAFE_CORRELATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}$/
+
+function sanitizeCorrelationId(value) {
+  const text = String(value ?? '')
+  if (!text) return ''
+  if (!SAFE_CORRELATION_PATTERN.test(text) || FORBIDDEN_VALUE_PATTERN.test(text)) {
+    return redactLabel(text)
+  }
+  return text
+}
+
 function sanitizePluginLabel(value) {
   const text = String(value ?? '')
   if (!SAFE_PLUGIN_LABEL_PATTERN.test(text) || FORBIDDEN_VALUE_PATTERN.test(text)) {
@@ -295,8 +309,8 @@ export function sanitizePromptHookAuditRecord(record) {
     inputSummary: sanitizeSummaryObject(record.inputSummary || {}),
     outputSummary: sanitizeSummaryObject(record.outputSummary || {}),
     error: sanitizeError(record.error),
-    correlationId: sanitizeFieldName(record.correlationId || ''),
-    generationId: sanitizeFieldName(record.generationId || ''),
+    correlationId: sanitizeCorrelationId(record.correlationId || ''),
+    generationId: sanitizeCorrelationId(record.generationId || ''),
   }
 }
 
@@ -345,7 +359,14 @@ export function parsePromptHookAuditExport(jsonStr) {
   return JSON.parse(jsonStr)
 }
 
-// ─── query / filter / pagination / tamper-evident chain / retention ──────────
+// ─── query / filter / pagination / integrity chain / retention ───────────────
+//
+// Integrity notes (honest claims):
+// - Hashes are FNV-1a 32-bit over sanitized fields. They detect accidental
+//   mutation / reordering of the local ring buffer; they are NOT a
+//   cryptographic tamper-evident seal, have no trusted head, and cannot resist
+//   a motivated attacker who rewrites the whole chain.
+// - Always re-sanitize at query/export/chain boundaries.
 
 const HASHABLE_AUDIT_FIELDS = Object.freeze([
   'pluginId',
@@ -399,9 +420,11 @@ function stableStringify(value, seen = new WeakSet()) {
 }
 
 /**
- * Compute a tamper-evident hash over the sanitized record shape. Deterministic
+ * Compute an integrity hash over the sanitized record shape. Deterministic
  * across key reordering; never includes raw prompts/secrets (those are dropped
  * by sanitizePromptHookAuditRecord before hashing).
+ *
+ * Not a cryptographic seal: FNV-1a 32-bit, no trusted head, no public verifier.
  */
 export function computeAuditRecordHash(record) {
   return hashString(canonicalRecordMaterial(record))
@@ -482,10 +505,13 @@ export function paginateAuditRecords(records, options = {}) {
 }
 
 /**
- * Build a tamper-evident chain over sanitized records. Each record gets a
+ * Build a local integrity chain over sanitized records. Each record gets a
  * recordHash computed from its sanitized shape plus the previous record's
  * hash (prevHash). Deterministic: re-chaining identical input yields identical
- * hashes; mutating any record invalidates its own and all downstream hashes.
+ * hashes; mutating any record invalidates its own and all downstream hashes
+ * for accidental-corruption detection.
+ *
+ * This is NOT a cryptographic tamper-evident log (no trusted head / verifier).
  *
  * @param {Array<object>} records
  * @returns {Array<object>} sanitized records with { recordHash, prevHash }
@@ -511,12 +537,27 @@ export function chainAuditRecords(records) {
  * the retained records in their original insertion order (newest-first display
  * is the caller's responsibility).
  */
+function preserveIntegrityMeta(raw, sanitized) {
+  const out = {
+    ...sanitized,
+    recordedAt: Number.isFinite(raw?.recordedAt) ? raw.recordedAt : null,
+  }
+  // Preserve already-computed integrity hashes when present. sanitize() drops
+  // unknown fields intentionally; re-attach only well-formed hash strings.
+  if (typeof raw?.recordHash === 'string' && /^[a-f0-9]{8,64}$/i.test(raw.recordHash)) {
+    out.recordHash = raw.recordHash
+  }
+  if (raw?.prevHash === null) {
+    out.prevHash = null
+  } else if (typeof raw?.prevHash === 'string' && /^[a-f0-9]{8,64}$/i.test(raw.prevHash)) {
+    out.prevHash = raw.prevHash
+  }
+  return out
+}
+
 export function retainAuditRecords(records, limit = 100) {
   if (!Array.isArray(records)) return []
-  const safe = records.map((r) => {
-    const s = sanitizePromptHookAuditRecord(r)
-    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
-  })
+  const safe = records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
   const max = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : 100
   if (safe.length <= max) return safe
   // Pick the most-recent `max` records by recordedAt (then insertion index),

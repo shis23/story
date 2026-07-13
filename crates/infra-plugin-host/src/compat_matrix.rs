@@ -197,9 +197,17 @@ pub const ST_EVENT_COMPAT_MATRIX: &[CompatEntry] = &[
     CompatEntry {
         id: "evt:COMMITTED_ALIAS",
         surface: "events",
-        name: "state_changed→committed",
+        name: "pipeline.committed",
         status: CompatStatus::Alias,
-        reason: Some("closes StateChanged{Committed} ambiguity"),
+        reason: Some("terminal turn commit only; not pipeline state_changed after draft"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:STATE_CHANGED_PIPELINE_COMMITTED",
+        surface: "events",
+        name: "state_changed{Committed}",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("draft_not_user_accept_must_not_fanout_message_events"),
         requires_permissions: &[],
     },
     CompatEntry {

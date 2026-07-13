@@ -1949,43 +1949,56 @@ test('iframe saveChat resolves with persisted metadata when host acknowledges sa
 
 // ─── committed alias + slash pipe hardening + correlation ────────────────────
 
-test('derives committed alias from state_changed with committed state', () => {
-  // The pipeline historically could emit StateChanged{Committed} rather than a
-  // bare committed variant. The host must still derive the committed alias.
+test('does not fan out MESSAGE_* from bare pipeline state_changed{Committed} after draft', () => {
+  // append_ai_draft → PipelineState::Committed is NOT a user Accept. Plugins
+  // must not receive MESSAGE_RECEIVED/CHAT_CHANGED before Accept/Discard.
   const events = mapPipelineEventToPluginEvents({
     event_type: 'state_changed',
-    data: { state: 'committed', session_id: 's1', variant_id: 'v1' },
+    data: { state: 'Committed', session_id: 's1', variant_id: 'v1' },
   })
   assert.deepEqual(events.map((e) => e.event), [
     'pipeline.state_changed',
     'state_changed',
+  ])
+  assert.equal(events.some((e) => e.event === 'MESSAGE_RECEIVED'), false)
+  assert.equal(events.some((e) => e.event === 'CHAT_CHANGED'), false)
+  assert.equal(events.some((e) => e.event === 'committed'), false)
+})
+
+test('does not derive committed alias from nested StateChanged draft payload', () => {
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { change: { Committed: { variant_id: 'v9' } }, session_id: 's1' },
+  })
+  assert.equal(events.some((e) => e.event === 'MESSAGE_RECEIVED'), false)
+  assert.equal(events.some((e) => e.event === 'committed'), false)
+})
+
+test('fans out MESSAGE_* only for terminal turn commit events', () => {
+  const terminal = mapPipelineEventToPluginEvents({
+    event_type: 'committed',
+    data: { session_id: 's1', variant_id: 'v1' },
+  })
+  assert.deepEqual(terminal.map((e) => e.event), [
+    'pipeline.committed',
     'committed',
     'MESSAGE_RECEIVED',
     'CHARACTER_MESSAGE_RENDERED',
     'CHAT_CHANGED',
   ])
-})
 
-test('does not derive committed alias from unrelated state_changed states', () => {
-  const events = mapPipelineEventToPluginEvents({
+  const marked = mapPipelineEventToPluginEvents({
     event_type: 'state_changed',
-    data: { state: 'streaming', session_id: 's1' },
+    data: {
+      state: 'Committed',
+      turnStatus: 'Committed',
+      attemptStatus: 'Committed',
+      variantStatus: 'Final',
+      terminalTurnCommit: true,
+    },
   })
-  assert.deepEqual(events.map((e) => e.event), [
-    'pipeline.state_changed',
-    'state_changed',
-  ])
-})
-
-test('derives committed alias from nested StateChanged payload shape', () => {
-  // Some pipeline payloads nest the committed state under a typed Change.
-  const events = mapPipelineEventToPluginEvents({
-    event_type: 'state_changed',
-    data: { change: { Committed: { variant_id: 'v9' } }, session_id: 's1' },
-  })
-  assert.ok(events.some((e) => e.event === 'committed'))
-  assert.ok(events.some((e) => e.event === 'MESSAGE_RECEIVED'))
-  assert.ok(events.some((e) => e.event === 'CHAT_CHANGED'))
+  assert.ok(marked.some((e) => e.event === 'MESSAGE_RECEIVED'))
+  assert.ok(marked.some((e) => e.event === 'CHAT_CHANGED'))
 })
 
 test('slash pipe stops at an unknown segment and does not run later segments', () => {

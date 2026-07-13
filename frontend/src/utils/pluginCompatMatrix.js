@@ -76,8 +76,8 @@ export const PIPELINE_EVENT_ALIAS_MATRIX = [
   { id: 'alias:started', surface: 'events', name: 'started', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.started→GENERATION_STARTED' },
   { id: 'alias:editor_progress', surface: 'events', name: 'editor_progress', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.editor_progress→STREAM_TOKEN' },
   { id: 'alias:draft_ready', surface: 'events', name: 'draft_ready', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.draft_ready→GENERATION_ENDED' },
-  { id: 'alias:committed', surface: 'events', name: 'committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.committed→MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED', reason: 'derived_for_state_changed_committed_too' },
-  { id: 'alias:state_changed_committed', surface: 'events', name: 'state_changed→committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.state_changed{data.state=committed|change.Committed}→committed chain', reason: 'closes_StateChangedCommitted_ambiguity' },
+  { id: 'alias:committed', surface: 'events', name: 'committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.committed→MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED', reason: 'terminal_turn_commit_only' },
+  { id: 'alias:state_changed_pipeline_committed', surface: 'events', name: 'state_changed{Committed}', status: SUPPORT.INTENTIONALLY_UNSUPPORTED, mapsFrom: 'pipeline.state_changed after append_ai_draft', reason: 'draft_not_user_accept_must_not_fanout_message_events', fallback: 'wait_for_pipeline.committed_or_terminal_turn_markers' },
   { id: 'alias:error', surface: 'events', name: 'error', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.error→GENERATION_STOPPED' },
   { id: 'alias:prompt_hook_request', surface: 'events', name: 'prompt_hook_request', status: SUPPORT.INTENTIONALLY_UNSUPPORTED, reason: 'filtered_from_generic_plugin_broadcast', fallback: 'use_hook_request_channel' },
 ]
@@ -139,7 +139,7 @@ export const AUDIT_MATRIX = [
   { id: 'audit:no_secrets', surface: 'audit', name: 'no_api_keys_or_private_memory', status: SUPPORT.IMPLEMENTED },
   { id: 'audit:export', surface: 'audit', name: 'exportPromptHookAudit', status: SUPPORT.IMPLEMENTED },
   { id: 'audit:query', surface: 'audit', name: 'query_filter_pagination', status: SUPPORT.IMPLEMENTED },
-  { id: 'audit:chain', surface: 'audit', name: 'tamper_evident_hash_chain', status: SUPPORT.IMPLEMENTED },
+  { id: 'audit:chain', surface: 'audit', name: 'local_integrity_hash_chain', status: SUPPORT.IMPLEMENTED, reason: 'fnv1a_no_trusted_head_not_crypto_seal' },
   { id: 'audit:retention', surface: 'audit', name: 'bounded_retention', status: SUPPORT.IMPLEMENTED },
 ]
 

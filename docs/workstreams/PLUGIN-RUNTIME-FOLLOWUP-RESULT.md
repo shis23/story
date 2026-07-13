@@ -1,92 +1,88 @@
 # Plugin Runtime Compatibility Follow-Up Result
 
-- 分支：`codex/plugin-runtime-followup`
-- 工作目录：`C:\tmp\storyforge-plugin-runtime`
-- 基线：`43799c5`（docs plan）/ 合并前 `b46ddc8`
-- 日期：2026-07-13
-- HEAD：见下方 commit 列表末项
+- Branch: `codex/plugin-runtime-followup`
+- Worktree: `C:\tmp\storyforge-plugin-runtime`
+- Base plan commit: `43799c5`
+- Date: 2026-07-13
+- HEAD: see commit list below
 
-## 结论
+## Conclusion
 
-按 PLAN 用 TDD 完成插件运行时兼容垂直切片：把 degraded shim 升级为可注入契约，硬化 prompt-hook 超时/取消/卸载/撤销/预算，关闭 `StateChanged{Committed}` 别名歧义，补齐可查询/可分页/防篡改审计，并生成机器可读 + Markdown 兼容报告。
+Completed the plugin-runtime follow-up vertical slice with TDD, then applied a security/compatibility self-audit fix pass for production wiring.
 
-**未宣称完整 ST 99，未宣称真实 iframe/GUI 验收，未改 `tauri-app` / SQLite / 存储代码，未 push，未调用真实 LLM。**
+Did **not** claim full ST 99, real iframe/GUI acceptance, edit `tauri-app` / SQLite / storage code, push, or call real LLMs.
 
-## Commit 列表（相对 `43799c5`）
+## Commits (since `43799c5`)
 
-| Commit | 说明 |
-|--------|------|
-| `035ac07` | feat(plugin): injectable persistence adapter for saveChat/popup/requestHeaders |
-| `2dfba2a` | feat(plugin): harden prompt-hook runtime with budgets, unload, revocation, fail policy |
-| `879a82a` | feat(plugin): tamper-evident audit query/filter/pagination/retention |
-| `e8ede2b` | feat(plugin): close committed alias and harden slash/tavernHelper/correlation |
-| `e3e3a38` | feat(plugin-host): rust correlation/permission + audit chain inventory |
-| `e122b1c` | feat(plugin): machine-readable + markdown compatibility report |
-| *(tip)* | docs(workstream): PLUGIN-RUNTIME-FOLLOWUP-RESULT |
+| Commit | Summary |
+|--------|---------|
+| `035ac07` | injectable persistence adapter for saveChat/popup/requestHeaders |
+| `2dfba2a` | prompt-hook budgets, unload, revocation, fail policy |
+| `879a82a` | audit query/filter/pagination/retention + integrity chain |
+| `e8ede2b` | committed alias + slash/correlation hardening |
+| `e3e3a38` | Rust correlation/permission + audit inventory |
+| `e122b1c` | machine-readable + Markdown compatibility report |
+| `510052b` | PLUGIN-RUNTIME-FOLLOWUP-RESULT (initial) |
+| *(tip)* | review-fix: terminal-commit only, production wiring, honest integrity claims |
 
-## 兼容矩阵变化
+## Compatibility matrix
 
-### 行数 / 分类（executable `PLUGIN_COMPAT_MATRIX`）
+Executable frontend matrix totals after follow-up:
 
-| 指标 | 跟进前（约） | 跟进后 |
-|------|-------------|--------|
-| 总行数 | ~75 | **88** |
-| implemented | 高占比 | **52** |
-| alias | 含 committed 歧义 | **10**（含 `state_changed→committed`） |
-| derived | 3 | **3** |
-| shim | 若干 | **5** |
-| degraded | saveChat/popup/headers/mock UI | **4** |
-| intentionally_unsupported | ST 长尾 | **10** |
-| noop | settings/worldinfo 生命周期 | **4** |
+| Status | Count |
+|--------|------:|
+| total | 88 |
+| implemented | 52 |
+| alias | 10 |
+| derived | 3 |
+| shim | 5 |
+| degraded | 4 |
+| intentionally_unsupported | 10 |
+| noop | 4 |
 
-机器可读报告：`frontend/src/utils/pluginCompatReport.js`  
-Markdown 摘要：`generateMarkdownReport()`  
-Rust 库存：`crates/infra-plugin-host/src/compat_matrix.rs`（`ST_EVENT_COMPAT_MATRIX`）
+Report generators:
+- `frontend/src/utils/pluginCompatReport.js`
+- Rust inventory: `crates/infra-plugin-host/src/compat_matrix.rs`
 
-### 关键兼容行为变化
+### Key behavior changes
 
-1. **`Committed` 别名歧义关闭**  
-   `pipeline.state_changed` + `data.state=committed` / 嵌套 `change.Committed` 现在会推导 `committed → MESSAGE_RECEIVED | CHARACTER_MESSAGE_RENDERED | CHAT_CHANGED`。
+1. **Terminal turn commit only for MESSAGE_* fan-out**
+   Only `pipeline.committed` or payloads with explicit terminal markers (`terminalTurnCommit` / turn+attempt Final) map to `MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED`.
+   Bare `state_changed{Committed}` after `append_ai_draft` does **not** fan out, because the variant is still Draft and may be discarded.
 
-2. **`saveChat` 可注入适配器**  
-   host 侧 `chat.save` 路由 + `createSaveChatAdapter`；iframe 先尝试 host，超时/失败回退 degraded；`await saveChat() === true` + `.degraded` 标记保持。
+2. **Injectable saveChat adapter**
+   Host route `chat.save` + `createSaveChatAdapter`. Iframe tries host first; 500ms timeout falls back to degraded local mirror. Late host success after timeout cannot rewrite the settled promise (generation token). `await saveChat() === true` remains ST-compatible.
 
-3. **popup / request headers 显式契约**  
-   可注入、可取消/鉴权；headers 永远剥离 Authorization/api-key/bearer。
+3. **Popup / request headers adapters**
+   Host routes `ui.popup` / `ui.requestHeaders` with short timeouts so missing handlers never hang. Headers redact Authorization / X-ApiKey / Proxy-Authorization / cookie variants.
 
-4. **Prompt hook 运行时**  
-   超时、取消 fail-closed、权限撤销、payload 预算、generation/correlation id、机器可读 fail policy。
+4. **Prompt-hook production wiring**
+   `usePluginBridge` now passes generationId, correlationId, payload budget, and live permission resolver. `PluginHost` disables bridge-level timeout (`timeoutMs: null`) so the outer runtime owns timeout audits.
 
-5. **审计**  
-   query/filter/pagination/retention；query/export 边界二次脱敏；`recordHash`/`prevHash` 防篡改链；不存 prompt/密钥/stack。
+5. **Audit path**
+   `recordPromptHookAudit` sanitizes, chains, and retains records in the live store. Integrity hashes are FNV-1a local corruption detection (no trusted head / not a crypto seal). No prompt bodies, secrets, or stacks.
 
-6. **Slash**  
-   未知单命令显式 `unsupported`；管道未知段 throw 且后续段不执行（已有 + 回归）。
+6. **Slash**
+   Unknown single commands return explicit unsupported objects; unknown pipe segments throw and stop later segments.
 
-## 测试与门禁
+## Gates
 
 ### Frontend
 
 ```text
 npm test
-# 294 passed
+# 295 passed
 
 npm run build
 # PASS
 ```
-
-专项相关（含于全量）：
-
-- `plugin-persistence` / `plugin-bridge` / `plugin-compat-matrix` / `plugin-compat-report`
-- `prompt-hooks` / `prompt-hook-audit`
-- `plugin-host-correlation` / composables / stores 等
 
 ### Rust
 
 ```text
 CARGO_TARGET_DIR=C:\tmp\storyforge-parallel-target
 cargo test -p storyforge-infra-plugin-host
-# 24 passed (was 16)
+# 25 passed
 
 cargo clippy -p storyforge-infra-plugin-host --all-targets -- -D warnings
 # PASS
@@ -96,72 +92,59 @@ cargo clippy -p storyforge-infra-plugin-host --all-targets -- -D warnings
 
 ```text
 git diff --check
-# PASS
+# PASS on current tree after whitespace cleanup
 ```
 
-### 未跑 / 禁止项
+### Not run / prohibited
 
-- 全 workspace `cargo test`
-- 真实 GUI / 第三方 iframe 手测
-- 付费 / 真实 LLM
-- 未改 `crates/tauri-app`、SQLite/storage、`docs/HANDOFF.md`、`docs/RELEASE-CHECKLIST.md`
-- 未 push / rebase / force-push / 改 `main`
+- full workspace cargo test
+- real GUI / third-party iframe manual acceptance
+- paid/real LLM
+- no edits to tauri-app / SQLite storage / HANDOFF / RELEASE-CHECKLIST
+- no push / rebase / force-push / main edits
 
-## 安全与兼容性自审
+## Security and compatibility self-audit (post-fix)
 
-| 检查 | 结果 |
-|------|------|
-| 无 ReadMemory 正文脱敏 | 保持；字段名归一化覆盖 |
-| 审计无完整 prompt/messages | query/export/chain 二次消毒 + 敌意记录测试 |
-| 审计无 api_key / SF_SECRET_ / stack | sanitize + chain material 不含密钥 |
-| 未知 slash 不静默成功 | 单命令 unsupported；管道 throw |
-| cancel 不复活旧 generation | generation-scoped AbortSignal + 测试 |
-| saveChat 兼容 | `await === true`，degraded 标记可见 |
-| headers 不泄凭证 | adapter 强制 redact |
-| 分类诚实 | supported/degraded/noop/unsupported 保持区分 |
-| 无 ST 99 / GUI 全量声明 | 报告 `fullSt99=false`、`realIframeGuiAcceptance=false` |
+| Check | Result |
+|------|--------|
+| Draft state_changed does not emit MESSAGE_* | PASS (terminal markers only) |
+| Production budget/revocation/correlation wired | PASS via usePluginBridge |
+| Bridge/outer double-timeout no longer masks timeout as ok | PASS (`timeoutMs: null` in PluginHost; bridge timeout rejects) |
+| Header redaction covers X-ApiKey / Proxy-Authorization | PASS |
+| saveChat late success after timeout ignored | PASS |
+| Audit chain/query/retention on live path | PASS in recordPromptHookAudit |
+| Integrity claim honesty | FNV-1a local chain only, not crypto tamper-evidence |
+| Rust AuditRecord secret-safe constructor | PASS (`AuditRecord::redacted`) |
 
-## 剩余 degraded / unsupported / noop
+## Remaining degraded / unsupported / noop
 
-### Degraded（4）
+### Degraded (4)
 
-| Id | Reason / Fallback |
-|----|-------------------|
-| `th:saveChat` | 默认可注入 host adapter；默认仍 `local_mirror_only_no_host_persist` |
-| `th:callGenericPopup` | 无 UI；default/null |
-| `th:getRequestHeaders` | 静态 `Content-Type` only |
-| `host:mock_ui` | 标注 mock UI only |
+- `th:saveChat` default local mirror (injectable host adapter available)
+- `th:callGenericPopup` no UI / default-or-null
+- `th:getRequestHeaders` static/redacted JSON content-type
+- `host:mock_ui` labelled mock only
 
-### Intentionally unsupported（代表）
+### Intentionally unsupported (representative)
 
-- after-combine / force worldinfo / tool calls / group 系列
-- 未知 slash、`prompt_hook_request` 通用广播
+- after-combine / force worldinfo / tool calls / groups
+- unknown slash
+- bare pipeline `state_changed{Committed}` message fan-out
 
 ### Noop
 
-- worldinfo settings/update、settings loaded、extensions first load
+- worldinfo settings/update, settings loaded, extensions first load
 
-完整列表见 `generateMachineReadableReport().remainingDegradedOrUnsupported`。
+## Risks
 
-## 风险
+1. Real third-party iframe + Tauri IPC still only mock/Node deterministic coverage.
+2. Production Accept path must emit `pipeline.committed` or terminal markers; draft state_changed alone will not notify ST message listeners.
+3. saveChat default remains degraded until a real host adapter is injected outside tauri-app storage.
+4. Audit integrity hashes are not cryptographic evidence.
+5. Not full ST 99; release copy must stay honest.
 
-1. 真实第三方 iframe + Tauri IPC 仍仅有 mock/Node 确定性测试；GUI 手测未做。  
-2. `saveChat` 默认仍 degraded；生产若注入真实 adapter 需单独接线（本切片刻意不进 tauri-app）。  
-3. iframe `saveChat` host 超时 500ms：无 host 时会短暂等待后回退（测试已覆盖同步 degraded 标记）。  
-4. 未知 slash 显式失败可能影响依赖静默 `undefined` 的旧插件。  
-5. 非全集 ST 99：发布文案不得宣称完整 ST。
+## Merge advice
 
-## 合并建议
+**Recommend merge after this review-fix.**
 
-**建议合并**（独立、可回滚、门禁绿）：
-
-- 垂直切片完整：事件别名、Slash、prompt-hook 预算/取消、持久化适配器、审计查询/链、报告
-- 边界遵守：无 tauri-app / SQLite / HANDOFF / RELEASE-CHECKLIST / push
-- 剩余风险主要是真实 GUI 与 ST 长尾，不阻塞本切片
-
-Reviewer 重点：
-
-1. `state_changed→committed` 是否覆盖你们流水线真实 payload 形状  
-2. `saveChat` Promise 上 degraded 标记 + host 超时回退兼容性  
-3. 审计 chain 只哈希脱敏字段，是否满足你们合规期望  
-4. 报告文案是否足够阻止 ST 99 过度宣称
+The critical Accept/Discard safety bug is fixed, production wiring for budget/revocation/correlation/audit chain is in place, timeout classification is honest, and claims no longer overstate integrity guarantees. Remaining risk is real GUI/third-party plugin hand testing, not this slice's gate health.

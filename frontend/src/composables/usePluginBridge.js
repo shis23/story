@@ -18,10 +18,18 @@ import {
   resolveHookedIntent,
   resolveHookedMessages,
 } from '../utils/promptHooks.js'
-import { sanitizePromptHookAuditRecord } from '../utils/promptHookAudit.js'
+import {
+  chainAuditRecords,
+  retainAuditRecords,
+  sanitizePromptHookAuditRecord,
+} from '../utils/promptHookAudit.js'
 import { usePluginStore } from '../stores/plugin.js'
 import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
+
+// Production payload budget for prompt-hook mutations. Oversized plugin
+// responses are discarded (fail-open) and audited as budget_exceeded.
+const DEFAULT_PROMPT_HOOK_MAX_PAYLOAD_BYTES = 256 * 1024
 
 export function usePluginBridge() {
   const plugin = usePluginStore()
@@ -31,8 +39,16 @@ export function usePluginBridge() {
   // Production defaults: per-plugin timeout is always on; cancellation is scoped
   // to one write/reroll generation so late events cannot revive old hooks.
   let promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  let promptHookMaxPayloadBytes = DEFAULT_PROMPT_HOOK_MAX_PAYLOAD_BYTES
   let nextPromptHookGenerationId = 0
+  let nextPromptHookCorrelationSeq = 0
   let activePromptHookGeneration = null
+  // Live permission resolver for runtime revocation checks. Defaults to the
+  // plugin's current declared permissions (so uninstall/disable can revoke).
+  let getLivePluginPermissions = (hp) => {
+    const live = (plugin.hookPlugins || []).find((item) => item?.id === hp?.id)
+    return live?.permissions || hp?.permissions || []
+  }
 
   function setPromptHookTimeoutMs(timeoutMs) {
     const previous = promptHookTimeoutMs
@@ -126,13 +142,24 @@ export function usePluginBridge() {
 
   // ─── prompt hook 审计(App.vue:178-185)──────────────────────────────
   function recordPromptHookAudit(record) {
-    const safeRecord = sanitizePromptHookAuditRecord(record)
-    plugin.promptHookAuditRecords = appendPromptHookAuditRecord(
+    const safeRecord = sanitizePromptHookAuditRecord({
+      ...record,
+      recordedAt: Number.isFinite(record?.recordedAt) ? record.recordedAt : Date.now(),
+    })
+    // Append → re-sanitize → chain → retain so the live ring buffer always
+    // carries tamper-evident hashes without retaining raw prompts/secrets.
+    const appended = appendPromptHookAuditRecord(
       plugin.promptHookAuditRecords,
       safeRecord,
       plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
     )
-    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(safeRecord)}`).catch(() => {})
+    const chained = chainAuditRecords(appended)
+    plugin.promptHookAuditRecords = retainAuditRecords(
+      chained,
+      plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
+    )
+    const latest = plugin.promptHookAuditRecords[plugin.promptHookAuditRecords.length - 1]
+    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(latest || safeRecord)}`).catch(() => {})
   }
 
   // ─── payload 构造(App.vue:187-213)──────────────────────────────────
@@ -185,6 +212,8 @@ export function usePluginBridge() {
     generation = ensurePromptHookGeneration(),
   ) {
     if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
+    nextPromptHookCorrelationSeq += 1
+    const correlationId = `hook:${generation.id}:${nextPromptHookCorrelationSeq}`
     return await emitPromptHookEventAndWaitForPlugins(
       plugin.hookPlugins,
       plugin.hookPluginHostRefs,
@@ -194,9 +223,32 @@ export function usePluginBridge() {
         stage,
         timeoutMs: promptHookTimeoutMs,
         signal: generation.controller.signal,
+        generationId: String(generation.id),
+        correlationId,
+        maxPayloadBytesPerPlugin: promptHookMaxPayloadBytes,
+        getPluginPermissions: getLivePluginPermissions,
         onAudit: recordPromptHookAudit,
       },
     )
+  }
+
+  function setPromptHookMaxPayloadBytes(bytes) {
+    const previous = promptHookMaxPayloadBytes
+    if (bytes === undefined || bytes === null) {
+      promptHookMaxPayloadBytes = DEFAULT_PROMPT_HOOK_MAX_PAYLOAD_BYTES
+      return previous
+    }
+    const next = Number(bytes)
+    promptHookMaxPayloadBytes = Number.isFinite(next) && next >= 0
+      ? Math.floor(next)
+      : DEFAULT_PROMPT_HOOK_MAX_PAYLOAD_BYTES
+    return previous
+  }
+
+  function setLivePluginPermissionsResolver(resolver) {
+    const previous = getLivePluginPermissions
+    if (typeof resolver === 'function') getLivePluginPermissions = resolver
+    return previous
   }
 
   // ─── prompt hook 编排(App.vue:239-278)─────────────────────────────
@@ -287,6 +339,8 @@ export function usePluginBridge() {
     handlePromptHookRequest,
     // production timeout/cancel wiring
     setPromptHookTimeoutMs,
+    setPromptHookMaxPayloadBytes,
+    setLivePluginPermissionsResolver,
     beginPromptHookGeneration,
     cancelPromptHooks,
     isPromptHooksCancelled,
