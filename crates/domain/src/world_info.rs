@@ -8,6 +8,10 @@ use crate::character::StWorldInfoEntry;
 pub struct WorldInfoBook {
     pub entries: Vec<WorldInfoEntry>,
     pub source: Source,
+    /// ST character_book / lorebook 顶层未知字段（name/description/scan_depth/extensions 等）。
+    /// 导入时从 StWorldInfoBook.extra 保留，导出时写回，避免 book-level metadata 静默丢失。
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// 世界书条目（内部表示）
@@ -131,6 +135,7 @@ impl WorldInfoBook {
 
         Self {
             entries,
+            metadata: st.extra,
             source: Source::ImportedFromST,
         }
     }
@@ -139,7 +144,7 @@ impl WorldInfoBook {
     pub fn to_st_book(&self) -> crate::character::StWorldInfoBook {
         crate::character::StWorldInfoBook {
             entries: self.entries.iter().map(|e| e.to_st_entry()).collect(),
-            extra: Default::default(),
+            extra: self.metadata.clone(),
         }
     }
 
@@ -191,8 +196,8 @@ impl WorldInfoEntry {
 
         Self {
             st_id: st.id,
-            keys: st.keys,
-            secondary_keys: st.secondary_keys.unwrap_or_default(),
+            keys: st.resolved_keys(),
+            secondary_keys: st.resolved_secondary_keys(),
             content: st.content.unwrap_or_default(),
             constant,
             selective,
@@ -212,11 +217,13 @@ impl WorldInfoEntry {
         StWorldInfoEntry {
             id: self.st_id,
             keys: self.keys.clone(),
+            key_alias: None,
             secondary_keys: if self.secondary_keys.is_empty() {
                 None
             } else {
                 Some(self.secondary_keys.clone())
             },
+            keysecondary_alias: None,
             content: Some(self.content.clone()),
             constant: self.constant,
             selective: self.selective,
@@ -267,6 +274,7 @@ mod tests {
         WorldInfoBook {
             entries,
             source: crate::Source::Native,
+            metadata: Default::default(),
         }
     }
 
@@ -428,7 +436,9 @@ mod tests {
             entries: vec![crate::character::StWorldInfoEntry {
                 id: Some(7),
                 keys: vec!["harbor".into()],
+                key_alias: None,
                 secondary_keys: None,
+                keysecondary_alias: None,
                 content: Some("both route lore".into()),
                 constant: true,
                 selective: true,

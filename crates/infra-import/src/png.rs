@@ -368,7 +368,9 @@ mod tests {
                 entries: vec![StWorldInfoEntry {
                     id: Some(7),
                     keys: vec!["primary".into()],
+                    key_alias: None,
                     secondary_keys: Some(vec!["secondary".into()]),
+                    keysecondary_alias: None,
                     content: Some("book entry".into()),
                     constant: false,
                     selective: true,

@@ -903,6 +903,7 @@ mod tests {
                 },
             ],
             source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
         })
     }
 

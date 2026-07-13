@@ -106,8 +106,14 @@ pub struct StWorldInfoEntry {
     pub id: Option<i32>,
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Older ST exports use singular `key` instead of `keys`.
+    #[serde(default, rename = "key", skip_serializing)]
+    pub key_alias: Option<serde_json::Value>,
     #[serde(default)]
     pub secondary_keys: Option<Vec<String>>,
+    /// Older ST exports use `keysecondary` (string or array) instead of `secondary_keys`.
+    #[serde(default, rename = "keysecondary", skip_serializing)]
+    pub keysecondary_alias: Option<serde_json::Value>,
     pub content: Option<String>,
     #[serde(default)]
     pub constant: bool,
@@ -143,6 +149,40 @@ impl StWorldInfoEntry {
             },
             _ => 0,
         }
+    }
+
+    /// Resolve primary keys, accepting both `keys` and legacy `key`.
+    pub fn resolved_keys(&self) -> Vec<String> {
+        if !self.keys.is_empty() {
+            return self.keys.clone();
+        }
+        parse_string_list_value(self.key_alias.as_ref())
+    }
+
+    /// Resolve secondary keys, accepting both `secondary_keys` and legacy `keysecondary`.
+    pub fn resolved_secondary_keys(&self) -> Vec<String> {
+        if let Some(keys) = &self.secondary_keys
+            && !keys.is_empty()
+        {
+            return keys.clone();
+        }
+        parse_string_list_value(self.keysecondary_alias.as_ref())
+    }
+}
+
+fn parse_string_list_value(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -971,7 +1011,9 @@ mod multi_character_tests {
             entries: vec![StWorldInfoEntry {
                 id: Some(1),
                 keys: vec!["测试".into()],
+                key_alias: None,
                 secondary_keys: None,
+                keysecondary_alias: None,
                 content: Some("测试知识".into()),
                 constant: true,
                 selective: false,
