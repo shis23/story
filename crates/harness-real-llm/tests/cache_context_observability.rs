@@ -105,6 +105,22 @@ fn context_compile_benchmark_and_budget_assertions() {
     assert!(report.turns >= 100);
     assert!(report.observed_max_near_raw <= report.max_near_raw);
     assert!(report.assertions.iter().all(|a| a.passed));
+    eprintln!(
+        "[cache-context-obs] turns={} max_near={}/{} final_near={} band={} overview={} slope={:.4} p50={}ms p95={}ms evidence_bytes={} h={} e={} overview_max={}",
+        report.turns,
+        report.observed_max_near_raw,
+        report.max_near_raw,
+        report.final_near_raw,
+        report.final_band,
+        report.final_overview,
+        report.prompt_growth_slope,
+        report.latency_ms_p50,
+        report.latency_ms_p95,
+        report.evidence_bytes,
+        report.h_anchor,
+        report.e,
+        report.overview_max_entries
+    );
     let body = std::fs::read_to_string(&cfg.report_path).unwrap();
     assert!(!body.contains("api_key"));
     assert!(!body.contains("SF_SECRET_"));
