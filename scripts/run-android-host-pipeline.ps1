@@ -1,0 +1,404 @@
+<#
+.SYNOPSIS
+Runs Android host-side release checks and optional APK evidence collection.
+
+.DESCRIPTION
+Reuses the fail-closed Android host smoke path (frontend build, capability
+tests, arm64 infra-util check). When -BuildApk is set and ANDROID_HOME/NDK_HOME
+permit, builds debug/release arm64 APKs, inspects ABI/native/SQLite entries,
+normalizes Gradle/Kotlin/Tauri/proguard warnings, applies size budgets, and
+writes a host-only evidence manifest.
+
+Does not install to a device, does not sign/publish, and does not claim device
+acceptance.
+
+.PARAMETER DryRun
+Print planned steps without executing builds.
+
+.PARAMETER BuildApk
+Attempt debug and unsigned release arm64 APK builds when SDK/NDK are present.
+
+.PARAMETER KeepRuns
+Number of previous android evidence runs to retain (default 5).
+
+.PARAMETER OutputDir
+Optional explicit evidence directory.
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pipeline.ps1 -DryRun
+
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pipeline.ps1 -BuildApk
+#>
+[CmdletBinding()]
+param(
+    [switch]$DryRun,
+    [switch]$BuildApk,
+    [int]$KeepRuns = 5,
+    [string]$OutputDir
+)
+
+Set-StrictMode -Version 3.0
+$ErrorActionPreference = 'Stop'
+
+$script:StepNumber = 0
+$script:Warnings = New-Object System.Collections.Generic.List[string]
+$script:Notes = New-Object System.Collections.Generic.List[string]
+$script:Artifacts = New-Object System.Collections.Generic.List[object]
+$script:WarningReports = New-Object System.Collections.Generic.List[object]
+$script:ApkInspections = New-Object System.Collections.Generic.List[object]
+
+# Resolve repo root early so helpers can be dot-sourced into script scope.
+$script:RepoRoot = (Get-Location).ProviderPath
+try {
+    $gitRoot = (& git rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $gitRoot) {
+        $script:RepoRoot = (Resolve-Path -LiteralPath $gitRoot).ProviderPath
+    }
+} catch { }
+
+$commonPath = Join-Path $script:RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1'
+if (-not (Test-Path -LiteralPath $commonPath)) {
+    throw "Missing release build helpers: $commonPath"
+}
+. $commonPath
+$script:RepoRoot = Find-ReleaseRepoRoot
+
+function Start-AndroidHostStep {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $script:StepNumber += 1
+    Write-Host ''
+    Write-Host ("[{0}] {1}" -f $script:StepNumber, $Name) -ForegroundColor Cyan
+}
+
+function Format-EnvPathState {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { return '<not set>' }
+    if (Test-Path -LiteralPath $value) { return (Protect-ReleasePath -Text ("{0} (exists)" -f $value) -RepoRoot $script:RepoRoot) }
+    return (Protect-ReleasePath -Text ("{0} (missing)" -f $value) -RepoRoot $script:RepoRoot)
+}
+
+function Get-AndroidPathIssue {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return "$Name is required for -BuildApk but is not set."
+    }
+    if (-not (Test-Path -LiteralPath $value -PathType Container)) {
+        return "$Name does not point to an existing directory."
+    }
+    return $null
+}
+
+function Invoke-AndroidHostCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string[]]$Command,
+        [string]$LogPath,
+        [switch]$AllowFail
+    )
+
+    Start-AndroidHostStep -Name $Name
+    $formatted = Format-ReleaseCommand -Command $Command
+    if ($DryRun) {
+        Write-Host ("DRY RUN: cd {0}" -f (Protect-ReleasePath -Text $WorkingDirectory -RepoRoot $script:RepoRoot))
+        Write-Host ("DRY RUN: {0}" -f $formatted)
+        return @{ ExitCode = 0; Lines = @() }
+    }
+
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        Write-Host ("RUN: {0}" -f $formatted)
+        $output = & $Command[0] @($Command[1..($Command.Count - 1)]) 2>&1
+        $code = $LASTEXITCODE
+        $lines = @($output | ForEach-Object { "$_" })
+        if ($LogPath) {
+            $lines | Set-Content -LiteralPath $LogPath -Encoding utf8
+        }
+        foreach ($line in $lines) {
+            Write-Host $line
+        }
+        if ($code -ne 0 -and -not $AllowFail) {
+            Assert-ReleaseExitCode -ExitCode $code -StepName $Name
+        }
+        return @{ ExitCode = $code; Lines = $lines }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Get-ZipEntryNames {
+    param([Parameter(Mandatory = $true)][string]$ZipPath)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        return @($zip.Entries | ForEach-Object { $_.FullName })
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Add-ApkArtifactAndInspect {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApkPath,
+        [Parameter(Mandatory = $true)][string]$Kind
+    )
+
+    if (-not (Test-Path -LiteralPath $ApkPath -PathType Leaf)) {
+        $rel = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $ApkPath
+        $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath $rel -SizeBytes 0 -Sha256 $null -Kind $Kind -Status 'missing'))
+        return
+    }
+
+    $item = Get-Item -LiteralPath $ApkPath
+    $rel = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $item.FullName
+    $sha = Get-ReleaseFileSha256 -Path $item.FullName
+    $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath $rel -SizeBytes ([long]$item.Length) -Sha256 $sha -Kind $Kind -Status 'present'))
+
+    $budgets = Get-ReleaseSizeBudgets
+    if ($budgets.Contains($Kind)) {
+        $budgetResult = Get-ReleaseSizeBudgetResult -Label $Kind -SizeBytes ([long]$item.Length) -BudgetBytes ([long]$budgets[$Kind])
+        if ($budgetResult.Status -eq 'warning' -and $budgetResult.Warning) {
+            $script:Warnings.Add($budgetResult.Warning)
+            Write-Host ("WARNING: {0}" -f $budgetResult.Warning) -ForegroundColor Yellow
+        }
+    }
+
+    try {
+        $entries = Get-ZipEntryNames -ZipPath $item.FullName
+        $info = Get-ReleaseApkInspection -Entries $entries -ApkLabel $item.Name
+        $script:ApkInspections.Add($info)
+        if (-not $info.capabilities.native_arm64) {
+            $script:Warnings.Add(("APK {0} missing arm64-v8a native libs" -f $item.Name))
+        }
+        if (-not $info.sqlite_bundled) {
+            $script:Notes.Add(("APK {0}: no obvious bundled sqlite .so name matched; runtime may still use linked sqlite" -f $item.Name))
+        }
+    } catch {
+        $script:Warnings.Add(("failed to inspect APK {0}: {1}" -f $item.Name, $_.Exception.Message))
+    }
+}
+
+function Find-Arm64Apks {
+    param([string]$RepoRoot)
+
+    $searchRoots = @(
+        (Join-Path $RepoRoot 'crates\tauri-app\gen\android\app\build\outputs\apk'),
+        (Join-Path $RepoRoot 'crates\tauri-app\src-tauri'),
+        (Join-Path $RepoRoot 'target')
+    )
+
+    $found = @()
+    foreach ($root in $searchRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $found += @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.apk' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'arm64|aarch64' -or $_.FullName -match 'arm64|aarch64' })
+    }
+    return @($found | Sort-Object FullName -Unique)
+}
+
+try {
+    Write-Host ("StoryForge Android host pipeline root: {0}" -f (Protect-ReleasePath -Text $script:RepoRoot -RepoRoot $script:RepoRoot))
+    Write-Host 'Android environment summary:' -ForegroundColor Cyan
+    Write-Host ("  ANDROID_HOME: {0}" -f (Format-EnvPathState -Name 'ANDROID_HOME'))
+    Write-Host ("  NDK_HOME:      {0}" -f (Format-EnvPathState -Name 'NDK_HOME'))
+    Write-Host ("  JAVA_HOME:     {0}" -f (Format-EnvPathState -Name 'JAVA_HOME'))
+    Write-Host '  adb/device:    not required / not used'
+
+    if ($DryRun) {
+        Write-Host 'Dry run enabled; commands will be printed but not executed.'
+        $script:Notes.Add('dry-run mode')
+    }
+
+    $identity = Get-ReleaseGitIdentity -RepoRoot $script:RepoRoot
+    $toolVersions = Get-ReleaseToolVersions
+
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $runDir = New-ReleaseRunDirectory -RepoRoot $script:RepoRoot -Prefix 'android'
+    } else {
+        $runDir = $OutputDir
+        if (-not (Test-Path -LiteralPath $runDir)) {
+            New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+        }
+    }
+    $script:Notes.Add(('evidence_dir={0}' -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $runDir)))
+
+    $frontendRoot = Join-Path $script:RepoRoot 'frontend'
+    $tauriAppRoot = Join-Path $script:RepoRoot 'crates\tauri-app'
+    $buildStatus = 'ok'
+
+    # Host-side smoke steps (no device).
+    $nodeModules = Join-Path $frontendRoot 'node_modules'
+    if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
+        Invoke-AndroidHostCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') | Out-Null
+    }
+    Invoke-AndroidHostCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build') | Out-Null
+    Invoke-AndroidHostCommand -Name 'cargo test -p storyforge --test capabilities' -WorkingDirectory $script:RepoRoot -Command @('cargo', 'test', '-p', 'storyforge', '--test', 'capabilities') | Out-Null
+    Invoke-AndroidHostCommand -Name 'cargo check -p storyforge-infra-util --target aarch64-linux-android' -WorkingDirectory $script:RepoRoot -Command @('cargo', 'check', '-p', 'storyforge-infra-util', '--target', 'aarch64-linux-android') | Out-Null
+
+    $apkAttempted = $false
+    if ($BuildApk) {
+        $issues = @(
+            Get-AndroidPathIssue -Name 'ANDROID_HOME'
+            Get-AndroidPathIssue -Name 'NDK_HOME'
+        ) | Where-Object { $null -ne $_ }
+
+        if ($issues.Count -gt 0) {
+            if ($DryRun) {
+                foreach ($issue in $issues) {
+                    Write-Host ("DRY RUN NOTE: {0}" -f $issue)
+                    $script:Notes.Add($issue)
+                }
+                $script:Notes.Add('APK build would fail-closed without ANDROID_HOME/NDK_HOME')
+            } else {
+                throw ("Android APK build environment is incomplete:{0}  {1}" -f [Environment]::NewLine, ($issues -join ([Environment]::NewLine + '  ')))
+            }
+        } else {
+            $apkAttempted = $true
+            $debugLog = Join-Path $runDir 'android-debug-build.log'
+            $releaseLog = Join-Path $runDir 'android-release-build.log'
+
+            $debugResult = Invoke-AndroidHostCommand `
+                -Name 'cargo tauri android build debug arm64 APK' `
+                -WorkingDirectory $tauriAppRoot `
+                -Command @('cargo', 'tauri', 'android', 'build', '--debug', '--target', 'aarch64', '--ci', '--split-per-abi', '--apk') `
+                -LogPath $debugLog `
+                -AllowFail
+
+            $releaseResult = Invoke-AndroidHostCommand `
+                -Name 'cargo tauri android build unsigned release arm64 APK' `
+                -WorkingDirectory $tauriAppRoot `
+                -Command @('cargo', 'tauri', 'android', 'build', '--target', 'aarch64', '--ci', '--split-per-abi', '--apk') `
+                -LogPath $releaseLog `
+                -AllowFail
+
+            $allLines = @($debugResult.Lines) + @($releaseResult.Lines)
+            $report = ConvertTo-ReleaseWarningReport -Lines $allLines -Source 'android-build' -RepoRoot $script:RepoRoot
+            $script:WarningReports.Add($report)
+            foreach ($w in $report.warnings) {
+                $script:Warnings.Add(("{0}: {1}" -f $w.category, $w.message))
+            }
+
+            if ($debugResult.ExitCode -ne 0 -or $releaseResult.ExitCode -ne 0) {
+                $buildStatus = 'partial'
+                $script:Notes.Add('one or more APK builds failed; see logs in evidence dir')
+            }
+
+            Start-AndroidHostStep -Name 'inspect APK artifacts'
+            $apks = Find-Arm64Apks -RepoRoot $script:RepoRoot
+            if (@($apks).Count -eq 0) {
+                $script:Warnings.Add('no arm64 APK artifacts found after build attempt')
+                if ($buildStatus -eq 'ok') { $buildStatus = 'partial' }
+            } else {
+                foreach ($apk in $apks) {
+                    $kind = if ($apk.Name -match 'release') { 'android-release-apk' } else { 'android-debug-apk' }
+                    Add-ApkArtifactAndInspect -ApkPath $apk.FullName -Kind $kind
+                }
+            }
+        }
+    } else {
+        $script:Notes.Add('APK build not requested; host smoke only')
+    }
+
+    if ($DryRun) {
+        $buildStatus = 'dry-run'
+        $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath 'crates/tauri-app/gen/android/.../app-arm64-debug.apk' -SizeBytes 0 -Sha256 $null -Kind 'android-debug-apk' -Status 'skipped'))
+        $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath 'crates/tauri-app/gen/android/.../app-arm64-release-unsigned.apk' -SizeBytes 0 -Sha256 $null -Kind 'android-release-apk' -Status 'skipped'))
+    }
+
+    $script:Notes.Add('host-only; android device acceptance not claimed')
+    $script:Notes.Add('GUI acceptance not claimed')
+    if (-not $apkAttempted -and $BuildApk) {
+        $script:Notes.Add('APK build skipped due to missing prerequisites')
+    }
+
+    Start-AndroidHostStep -Name 'write evidence'
+    $apkInspectionArr = if ($script:ApkInspections.Count -gt 0) { [object[]]$script:ApkInspections.ToArray() } else { @() }
+    $warningReportArr = if ($script:WarningReports.Count -gt 0) { [object[]]$script:WarningReports.ToArray() } else { @() }
+    $noteArrForEvidence = [string[]]@($script:Notes | ForEach-Object { [string]$_ })
+    $evidence = [pscustomobject]@{
+        schema_version = 1
+        commit = $identity.commit
+        branch = $identity.branch
+        tool_versions = $toolVersions
+        apk_inspections = $apkInspectionArr
+        warning_reports = $warningReportArr
+        notes = $noteArrForEvidence
+    }
+    $inspectionPath = Join-Path $runDir 'apk-inspection.json'
+    Write-ReleaseJson -Object $evidence -Path $inspectionPath
+
+    $warningArr = [string[]]@($script:Warnings | ForEach-Object { [string]$_ })
+    $noteArr = [string[]]@($script:Notes | ForEach-Object { [string]$_ })
+    if ($script:Artifacts.Count -gt 0) {
+        $artifactArr = [object[]]$script:Artifacts.ToArray()
+    } else {
+        $artifactArr = [object[]]@()
+    }
+    $manifest = New-ReleaseBuildManifest `
+        -Commit $identity.commit `
+        -Branch $identity.branch `
+        -Target 'aarch64-linux-android' `
+        -ToolVersions $toolVersions `
+        -Artifacts $artifactArr `
+        -BuildStatus $buildStatus `
+        -Warnings $warningArr `
+        -Notes $noteArr
+    $manifestPath = Join-Path $runDir 'manifest.json'
+    Write-ReleaseJson -Object $manifest -Path $manifestPath
+
+    $summaryPath = Join-Path $runDir 'SUMMARY.txt'
+    $summary = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @(
+        'StoryForge Android host pipeline summary'
+        ("commit={0}" -f $identity.commit)
+        ("branch={0}" -f $identity.branch)
+        ("build_status={0}" -f $buildStatus)
+        ("apk_build_requested={0}" -f [bool]$BuildApk)
+        ("artifacts={0}" -f $script:Artifacts.Count)
+        ("warnings={0}" -f $script:Warnings.Count)
+        'acceptance.gui=not_claimed'
+        'acceptance.android_device=not_claimed'
+        '--- warnings ---'
+    )) { $summary.Add([string]$line) }
+    foreach ($w in $script:Warnings) { $summary.Add([string]$w) }
+    $summary.Add('--- notes ---')
+    foreach ($n in $script:Notes) { $summary.Add([string]$n) }
+    Set-Content -LiteralPath $summaryPath -Value $summary.ToArray() -Encoding utf8
+
+    Start-AndroidHostStep -Name 'retention cleanup'
+    $artifactRoot = Join-Path $script:RepoRoot 'artifacts\release-build'
+    $targets = Get-ReleaseRetentionCleanupTargets -Root $artifactRoot -Keep $KeepRuns
+    if ($DryRun) {
+        Write-Host ("DRY RUN: would remove {0} old run dir(s), keep {1}" -f @($targets).Count, $KeepRuns)
+    } else {
+        foreach ($dir in $targets) {
+            Write-Host ("Removing old run dir: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $dir.FullName))
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Host ''
+    if ($buildStatus -eq 'failed') {
+        Write-Host 'Android host pipeline FAILED (fail-closed).' -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host ("Android host pipeline finished with status={0}." -f $buildStatus) -ForegroundColor Green
+    Write-Host 'Reminder: host smoke/APK build is not device PASS.' -ForegroundColor Yellow
+    exit 0
+} catch {
+    Write-Host ''
+    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host ("STACK: {0}" -f $_.ScriptStackTrace) -ForegroundColor DarkRed
+    }
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkRed
+    }
+    Write-Error $_.Exception.Message
+    exit 1
+}
