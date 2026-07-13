@@ -25,6 +25,7 @@ pub mod commit_probe;
 pub mod evidence;
 pub mod long_session;
 pub mod phase_b_matrix;
+pub mod production_evidence;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,12 +42,14 @@ use storyforge_infra_vector::BruteForceStore;
 use storyforge_app_agent::ToolContext;
 use storyforge_tauri_app::campaign_store::CampaignStore;
 use storyforge_tauri_app::fill_campaign_runtime_from_store;
+use storyforge_tauri_app::turn_store::TurnStore;
 
 /// 一次性环境：全部 tempdir，进程隔离，不污染真实 `data/`。
 pub struct HarnessEnv {
     pub data_dir: PathBuf,
     pub campaign_store: Arc<CampaignStore>,
     pub conv_store: Arc<ConversationStore>,
+    pub turn_store: Arc<TurnStore>,
     pub tool_ctx: Arc<RwLock<ToolContext>>,
     pub vector_store: Arc<BruteForceStore>,
     pub llm: Arc<dyn LlmClient>,
@@ -63,6 +66,7 @@ impl HarnessEnv {
 
         let campaign_store = Arc::new(CampaignStore::new(&data_dir));
         let conv_store = Arc::new(ConversationStore::new(data_dir.join("conversations")));
+        let turn_store = Arc::new(TurnStore::new(&data_dir));
         let tool_ctx = Arc::new(RwLock::new(ToolContext {
             characters: vec![],
             world_info: None,
@@ -84,6 +88,7 @@ impl HarnessEnv {
             data_dir,
             campaign_store,
             conv_store,
+            turn_store,
             tool_ctx,
             vector_store,
             llm,

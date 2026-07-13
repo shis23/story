@@ -11,6 +11,7 @@
 //! 这不是 `m5_s6` 的手工 `add_summary` 旁路。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use storyforge_app_conversation::ConversationStore;
 use storyforge_domain::Id;
@@ -61,9 +62,9 @@ pub struct ProductionAcceptResult {
 /// 隔离的 CommitTurn 环境（独立 tempdir，不触全局 OnceLock 生产 store）。
 pub struct CommitProbeEnv {
     pub data_dir: PathBuf,
-    pub campaign_store: CampaignStore,
-    pub turn_store: TurnStore,
-    pub conv_store: ConversationStore,
+    pub campaign_store: Arc<CampaignStore>,
+    pub turn_store: Arc<TurnStore>,
+    pub conv_store: Arc<ConversationStore>,
 }
 
 impl CommitProbeEnv {
@@ -71,9 +72,25 @@ impl CommitProbeEnv {
         let data_dir =
             std::env::temp_dir().join(format!("sf_eval_commit_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("create commit probe tempdir");
-        let campaign_store = CampaignStore::new(&data_dir);
-        let turn_store = TurnStore::new(&data_dir);
-        let conv_store = ConversationStore::new(data_dir.join("conversations"));
+        let campaign_store = Arc::new(CampaignStore::new(&data_dir));
+        let turn_store = Arc::new(TurnStore::new(&data_dir));
+        let conv_store = Arc::new(ConversationStore::new(data_dir.join("conversations")));
+        Self {
+            data_dir,
+            campaign_store,
+            turn_store,
+            conv_store,
+        }
+    }
+
+    /// 在同一个 harness 环境上复用生产 Accept 探针，确保写作、Context 编译与
+    /// CommitTurn 观察的是同一组 store/cache，而不是磁盘上的第二份快照。
+    pub fn from_shared(
+        data_dir: PathBuf,
+        campaign_store: Arc<CampaignStore>,
+        turn_store: Arc<TurnStore>,
+        conv_store: Arc<ConversationStore>,
+    ) -> Self {
         Self {
             data_dir,
             campaign_store,
@@ -122,6 +139,15 @@ impl CommitProbeEnv {
 
     /// 构造 AwaitingAcceptance 的 TurnRecord + Attempt（含可选 UpsertSummary batch）。
     pub fn prepare_awaiting_accept(&self, input: &ProductionAcceptInput) -> TurnRecord {
+        self.prepare_awaiting_accept_with_input_node(input, Id::from_str("eval-input-node"))
+    }
+
+    /// 与真实 start_writing 对齐，使用本轮实际 user input node 创建 TurnRecord。
+    pub fn prepare_awaiting_accept_with_input_node(
+        &self,
+        input: &ProductionAcceptInput,
+        input_node_id: Id,
+    ) -> TurnRecord {
         let camp = self
             .campaign_store
             .get_campaign(&input.campaign_id)
@@ -179,7 +205,7 @@ impl CommitProbeEnv {
         let mut record = TurnRecord::new(
             input.campaign_id.clone(),
             input.conversation_id.clone(),
-            Id::from_str("eval-input-node"),
+            input_node_id,
             base_revision,
         );
         record.status = TurnStatus::AwaitingAcceptance;

@@ -1,8 +1,8 @@
 # M5 生产证据线 Day Plan
 
-> 分支：`codex/m5-production-evidence`  
-> 基线：`main@053847f`  
-> 工作目录：`C:\tmp\storyforge-m5`  
+> 分支：`codex/m5-production-evidence`
+> 基线：`main@053847f`
+> 工作目录：`C:\tmp\storyforge-m5`
 > 日期：2026-07-13
 
 ## 范围
@@ -62,4 +62,3 @@ JSONL writer 串成一个可复跑的多轮生产证据入口。
   - 接受轮数 `> H_anchor + E`，且 epoch id/成员确实 rollover；
   - fixture 缺失、零调用、未跨 epoch 均返回失败。
 - 真实模型调用次数为 `0`，RESULT 明确列出真实运行命令与仍未完成的真实证据。
-

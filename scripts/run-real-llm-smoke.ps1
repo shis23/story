@@ -84,8 +84,8 @@ $SuiteDefinitions = [ordered]@{
         Filter = 'm5_'
     }
     eval = @{
-        Description = 'M5/Phase B evaluation harness (CommitTurn, long-session, A/B matrix); requires STORYFORGE_EVAL_REAL_LLM=1'
-        Filter = 'eval_'
+        Description = 'M5 production evidence: multi-turn write -> CommitTurn/Accept across H_anchor+E; requires explicit paid-model authorization'
+        Filter = 'eval_real_llm_production_write_commit_accept_across_epoch'
     }
 }
 
@@ -381,6 +381,21 @@ try {
         }
         if (-not $evalOn -and -not $DryRun) {
             throw 'Suite eval requires STORYFORGE_EVAL_REAL_LLM=1 (explicit paid-model authorization). Deterministic eval tests run via cargo test without this switch.'
+        }
+        $parsedTurns = 0
+        $parsedCalls = 0
+        $parsedTimeout = 0
+        if (-not [int]::TryParse($evalMaxTurns, [ref]$parsedTurns) -or $parsedTurns -le 15) {
+            throw 'Suite eval requires STORYFORGE_EVAL_MAX_TURNS >= 16 so accepted turns strictly cross H_anchor+E=15.'
+        }
+        if (-not [int]::TryParse($evalMaxCalls, [ref]$parsedCalls) -or $parsedCalls -lt $parsedTurns) {
+            throw 'Suite eval requires STORYFORGE_EVAL_MAX_CALLS >= STORYFORGE_EVAL_MAX_TURNS (absolute minimum; 96 calls is the recommended 16-turn starting budget).'
+        }
+        if (-not [int]::TryParse($evalTimeout, [ref]$parsedTimeout) -or $parsedTimeout -lt 1) {
+            throw 'Suite eval requires STORYFORGE_EVAL_TIMEOUT_SECS >= 1.'
+        }
+        if ($parsedCalls -lt ($parsedTurns * 3)) {
+            Write-Warning 'Eval max_calls is below 3x max_turns; the production pipeline may fail closed before completing all Accept rounds.'
         }
     }
     if ($DryRun) {

@@ -33,6 +33,9 @@ pub struct EvidenceCallRecord {
     pub cache_creation_tokens: u32,
     pub completion_tokens: u32,
     pub elapsed_ms: u128,
+    /// `ok` / `client_error` / `timeout`；禁止落供应商原始错误正文。
+    #[serde(default = "default_call_outcome")]
+    pub outcome: String,
     pub assertion_results: Vec<AssertionResult>,
     pub model_label: String,
     pub recorded_at_unix_ms: u128,
@@ -71,6 +74,13 @@ pub struct EvidenceTurnRecord {
     pub text_len: usize,
     pub text_sha16: String,
     pub early_fact_reachable: Option<bool>,
+    /// ContextEpoch 仅落短指纹与计数，不落完整成员或正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch_id16: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch_source_hash16: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch_anchor_count: Option<usize>,
     pub assertion_results: Vec<AssertionResult>,
     pub elapsed_ms: u128,
     pub recorded_at_unix_ms: u128,
@@ -99,6 +109,10 @@ pub struct EvidenceAbRow {
 }
 
 pub const EVIDENCE_SCHEMA_VERSION: &str = "eval-m5-phaseb-v1";
+
+fn default_call_outcome() -> String {
+    "ok".into()
+}
 
 /// JSONL 证据写入器（自动创建父目录）。
 pub struct EvidenceWriter {
@@ -252,6 +266,10 @@ pub fn sanitize_call_record(rec: &mut EvidenceCallRecord) {
     rec.system_hash16 = truncate_hex16(&rec.system_hash16);
     rec.history_hash16 = truncate_hex16(&rec.history_hash16);
     rec.tail_hash16 = truncate_hex16(&rec.tail_hash16);
+    rec.outcome = match rec.outcome.as_str() {
+        "ok" | "client_error" | "timeout" => rec.outcome.clone(),
+        _ => "client_error".into(),
+    };
     if rec.model_label.len() > 64 {
         rec.model_label = rec.model_label.chars().take(64).collect();
     }
@@ -265,6 +283,11 @@ pub fn sanitize_turn_record(rec: &mut EvidenceTurnRecord) {
     }
     rec.draft_hash16 = truncate_hex16(&rec.draft_hash16);
     rec.text_sha16 = truncate_hex16(&rec.text_sha16);
+    rec.context_epoch_id16 = rec.context_epoch_id16.as_deref().map(truncate_hex16);
+    rec.context_epoch_source_hash16 = rec
+        .context_epoch_source_hash16
+        .as_deref()
+        .map(truncate_hex16);
 }
 
 fn truncate_hex16(s: &str) -> String {
@@ -417,6 +440,7 @@ mod tests {
             cache_creation_tokens: 0,
             completion_tokens: 30,
             elapsed_ms: 12,
+            outcome: "ok".into(),
             assertion_results: vec![AssertionResult {
                 name: "non_empty".into(),
                 passed: true,
