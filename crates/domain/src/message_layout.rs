@@ -201,6 +201,37 @@ pub fn fingerprint_messages(messages: &[ChatMessage]) -> String {
     hex_encode(&hasher.finalize())
 }
 
+/// 粗粒度 token 估计：按 UTF-8 字节 / 4 上取整（不依赖真实 tokenizer）。
+///
+/// 仅用于前缀可复用估计与预算斜率，**不得**当作供应商 billed token。
+pub fn estimate_tokens_approx(text: &str) -> u32 {
+    let bytes = text.len() as u32;
+    bytes.saturating_add(3) / 4
+}
+
+/// 两条消息列表的最长公共消息前缀长度（按 role+content 精确相等计数）。
+///
+/// 不落全文；用于跨轮 cache-prefix 稳定性与可复用 token 估计。
+pub fn longest_common_message_prefix_len(a: &[ChatMessage], b: &[ChatMessage]) -> usize {
+    let mut n = 0usize;
+    for (left, right) in a.iter().zip(b.iter()) {
+        if left.role != right.role || left.content != right.content {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// 公共前缀消息的可复用 token 估计（不含未共享后缀）。
+pub fn estimate_reusable_prefix_tokens(a: &[ChatMessage], b: &[ChatMessage]) -> u32 {
+    let n = longest_common_message_prefix_len(a, b);
+    a.iter()
+        .take(n)
+        .map(|m| estimate_tokens_approx(&m.content))
+        .sum()
+}
+
 /// hook 后 messages 的粗粒度 segment 摘要（首条 system / 中间 history / 末条 user 启发式）。
 ///
 /// 非 layout 路径或 hook 改写后无法严格还原三段时，仍可对比 system/tail 是否漂移。
@@ -493,6 +524,55 @@ mod tests {
         assert_eq!(
             messages_segment_summary(&a).tail_hash,
             messages_segment_summary(&b).tail_hash
+        );
+    }
+
+    #[test]
+    fn longest_common_message_prefix_counts_exact_role_content() {
+        let a = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("h1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("tail-a"),
+        ];
+        let b = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("h1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("tail-b"),
+        ];
+        assert_eq!(longest_common_message_prefix_len(&a, &b), 3);
+        let reusable = estimate_reusable_prefix_tokens(&a, &b);
+        let expected = estimate_tokens_approx("sys")
+            + estimate_tokens_approx("h1")
+            + estimate_tokens_approx("a1");
+        assert_eq!(reusable, expected);
+        assert!(reusable > 0);
+    }
+
+    #[test]
+    fn longest_common_prefix_breaks_on_role_or_content_mismatch() {
+        let a = vec![ChatMessage::system("sys"), ChatMessage::user("same")];
+        let b = vec![ChatMessage::system("sys"), ChatMessage::assistant("same")];
+        assert_eq!(longest_common_message_prefix_len(&a, &b), 1);
+
+        let c = vec![ChatMessage::system("sys"), ChatMessage::user("x")];
+        let d = vec![ChatMessage::system("sys"), ChatMessage::user("y")];
+        assert_eq!(longest_common_message_prefix_len(&c, &d), 1);
+        assert_eq!(
+            estimate_reusable_prefix_tokens(&c, &d),
+            estimate_tokens_approx("sys")
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_approx_is_deterministic_and_non_zero_for_text() {
+        assert_eq!(estimate_tokens_approx(""), 0);
+        assert_eq!(estimate_tokens_approx("abcd"), 1);
+        assert_eq!(estimate_tokens_approx("abcdefgh"), 2);
+        assert_eq!(
+            estimate_tokens_approx("hello world"),
+            estimate_tokens_approx("hello world")
         );
     }
 }
