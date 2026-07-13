@@ -2,7 +2,7 @@
 //!
 //! 覆盖：
 //! 1. 生产忠实 CommitTurn Accept 闭环
-//! 2. ≥20 Accept 跨越 H_anchor+E
+//! 2. ≥20 Accept 后 ContextEpoch near_raw 被 H_anchor+E 截断（非真实 LLM 叙述可达）
 //! 3. Phase B A/B 对照矩阵
 //! 4. 脱敏 JSONL 证据
 
@@ -100,7 +100,7 @@ fn eval_production_accept_blocks_quality_error() {
 }
 
 #[test]
-fn eval_long_session_20_accepts_cross_h_plus_e() {
+fn eval_long_session_20_accepts_caps_near_raw_via_context_epoch() {
     let dir = std::env::temp_dir().join(format!("sf_eval_ls_{}", uuid::Uuid::new_v4()));
     let cfg = LongSessionConfig {
         turns: 20,
@@ -114,11 +114,20 @@ fn eval_long_session_20_accepts_cross_h_plus_e() {
     assert_eq!(report.turns_accepted, 20);
     assert_eq!(report.max_near_raw, DEFAULT_H_ANCHOR + DEFAULT_E);
     assert!(
-        report.crossed_h_plus_e,
+        report.accepted_exceeds_h_plus_e,
         "expected 20 > H+E={}",
         report.max_near_raw
     );
+    assert!(
+        report.near_raw_capped_to_h_plus_e,
+        "ContextEpoch membership must cap near_raw to H+E"
+    );
+    assert!(report.crossed_h_plus_e);
     assert!(report.early_fact_present_in_store);
+    assert!(
+        !report.early_turn_in_near_raw,
+        "early turn must leave near_raw after >H+E accepts"
+    );
     assert_eq!(report.final_summary_count, 20);
     assert!(report.assertions.iter().all(|a| a.passed));
 

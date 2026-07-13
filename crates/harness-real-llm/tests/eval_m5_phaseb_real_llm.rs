@@ -6,28 +6,33 @@
 //! $env:LLM_BASE_URL='...'
 //! $env:LLM_API_KEY='...'
 //! $env:LLM_MODEL='...'
+//! $env:STORYFORGE_EVAL_MAX_CALLS='8'
+//! $env:STORYFORGE_EVAL_TIMEOUT_SECS='60'
 //! cargo test -p harness-real-llm --test eval_m5_phaseb_real_llm -- --ignored --nocapture
 //! # 或
 //! powershell -File .\scripts\run-real-llm-smoke.ps1 -Suite eval
 //! ```
 //!
-//! 无凭证 / 无开关时不得假通过：本文件全部 `#[ignore]`。
+//! 无凭证 / 无开关 / fixture 缺失时**不得假通过**：本文件全部 `#[ignore]`；
+//! 运行时 fixture 缺失或预算耗尽会 `panic`/`assert` 失败，而不是 exit 0 + PROBE PASS。
+//!
+//! 确定性 Accept / Phase B skeleton **不在**本真实 suite 内；它们在
+//! `eval_m5_phaseb_deterministic` 与 lib 单元测试中覆盖。
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use harness_real_llm::budget::BudgetedLlmClient;
 use harness_real_llm::evidence::{
     AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceWriter, RealLlmRunBudget,
-    short_hash16,
 };
-use harness_real_llm::long_session::{LongSessionConfig, run_deterministic_long_session};
-use harness_real_llm::phase_b_matrix::{default_phase_b_fixtures, run_phase_b_matrix};
 use harness_real_llm::{HarnessEnv, require_real_llm};
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
 use storyforge_domain::message_layout::{fingerprint_messages, messages_segment_summary};
+use storyforge_infra_llm::LlmClient;
 
-fn require_eval_real_llm() -> Arc<dyn storyforge_infra_llm::LlmClient> {
+fn require_eval_budget() -> RealLlmRunBudget {
     let budget = RealLlmRunBudget::from_env();
     if !budget.enabled {
         panic!(
@@ -35,7 +40,15 @@ fn require_eval_real_llm() -> Arc<dyn storyforge_infra_llm::LlmClient> {
              Set STORYFORGE_EVAL_REAL_LLM=1 and LLM_BASE_URL/API_KEY/MODEL."
         );
     }
-    require_real_llm()
+    if budget.max_calls == 0 {
+        panic!("STORYFORGE_EVAL_MAX_CALLS must be >= 1 for real eval");
+    }
+    budget
+}
+
+fn require_budgeted_client(budget: &RealLlmRunBudget) -> Arc<BudgetedLlmClient> {
+    let inner = require_real_llm();
+    BudgetedLlmClient::wrap(inner, budget)
 }
 
 fn evidence_dir(name: &str) -> std::path::PathBuf {
@@ -50,58 +63,32 @@ fn evidence_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// 真实模型 smoke：1 轮写作 + 记录脱敏 usage（不宣称完整 M5 验收）。
+///
+/// 预算：`BudgetedLlmClient` 真正限制 `max_calls` 与 `timeout_secs`。
+/// fixture 缺失：直接 panic（Inconclusive 不等于 PASS）。
 #[tokio::test]
 #[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1 与 LLM 凭证；默认不跑"]
 async fn eval_real_llm_single_turn_evidence() {
-    let budget = RealLlmRunBudget::from_env();
-    assert!(budget.enabled);
-    assert!(budget.max_calls >= 1, "budget max_calls must be >= 1");
+    let budget = require_eval_budget();
+    let llm = require_budgeted_client(&budget);
+    llm.set_tag("turn1");
+    llm.set_role("pipeline");
 
-    let llm = require_eval_real_llm();
-    let env = HarnessEnv::new(llm);
+    let env = HarnessEnv::new(llm.clone() as Arc<dyn storyforge_infra_llm::LlmClient>);
     let dir = evidence_dir("single_turn");
     let writer =
         EvidenceWriter::create(dir.join("calls.jsonl"), "real-single").expect("evidence writer");
 
-    // minimal campaign setup via fixture card if present; otherwise skip soft
     let card_path = find_fixture("test-card-seraphina.png");
     if !card_path.exists() {
-        eprintln!(
-            "fixture missing: {} — recording budget-only pass",
+        // 明确失败：不允许「零调用 + PROBE PASS」。
+        env.cleanup();
+        panic!(
+            "INCONCLUSIVE (not pass): required fixture missing: {}. \
+             Provide test-card-seraphina.png at repo root or set a reachable path; \
+             refusing to report PROBE PASS with zero LLM calls.",
             card_path.display()
         );
-        writer
-            .write_call(EvidenceCallRecord {
-                schema_version: EVIDENCE_SCHEMA_VERSION.into(),
-                run_id: "real-single".into(),
-                suite: "eval_real_single".into(),
-                turn_index: 0,
-                role: "setup".into(),
-                tag: "fixture_missing".into(),
-                streaming: false,
-                request_fp16: String::new(),
-                system_hash16: String::new(),
-                history_hash16: String::new(),
-                tail_hash16: String::new(),
-                history_len: 0,
-                tail_parts: 0,
-                msg_count: 0,
-                prompt_tokens: 0,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                completion_tokens: 0,
-                elapsed_ms: 0,
-                assertion_results: vec![AssertionResult {
-                    name: "fixture_present".into(),
-                    passed: false,
-                    detail: Some("inconclusive".into()),
-                }],
-                model_label: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
-                recorded_at_unix_ms: 0,
-            })
-            .unwrap();
-        env.cleanup();
-        return;
     }
 
     let bytes = std::fs::read(&card_path).expect("read fixture");
@@ -118,126 +105,210 @@ async fn eval_real_llm_single_turn_evidence() {
     let mut pipeline = env.new_pipeline();
     let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (_c_tx, cancel) = tokio::sync::watch::channel(false);
-    let result = pipeline
-        .start_writing(
+
+    // Outer wall-clock timeout as a second belt on top of per-call timeout.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(
+            budget
+                .timeout_secs
+                .saturating_mul(budget.max_calls as u64)
+                .max(budget.timeout_secs),
+        ),
+        pipeline.start_writing(
             "开场：雾港码头，角色发现银鸦木箱".into(),
             &ctx,
             event_tx,
             cancel,
-        )
-        .await;
+        ),
+    )
+    .await;
+
     let elapsed_ms = t0.elapsed().as_millis();
-    let (text_len, ok) = match &result {
-        Ok((text, _, _)) => (text.chars().count(), !text.trim().is_empty()),
-        Err(e) => {
+    let (text_len, ok, err_detail) = match result {
+        Ok(Ok((text, _, _))) => (text.chars().count(), !text.trim().is_empty(), None),
+        Ok(Err(e)) => {
             eprintln!("start_writing err: {e}");
-            (0, false)
+            (0, false, Some(format!("pipeline_err={e}")))
+        }
+        Err(_) => {
+            eprintln!("start_writing wall-clock timeout");
+            (0, false, Some("wall_clock_timeout".into()))
         }
     };
 
-    writer
-        .write_call(EvidenceCallRecord {
-            schema_version: EVIDENCE_SCHEMA_VERSION.into(),
-            run_id: "real-single".into(),
-            suite: "eval_real_single".into(),
-            turn_index: 1,
-            role: "pipeline".into(),
-            tag: "turn1".into(),
-            streaming: true,
-            request_fp16: short_hash16("pipeline-turn1"),
-            system_hash16: String::new(),
-            history_hash16: String::new(),
-            tail_hash16: String::new(),
-            history_len: 0,
-            tail_parts: 0,
-            msg_count: 0,
-            prompt_tokens: 0,
-            cached_tokens: 0,
-            cache_creation_tokens: 0,
-            completion_tokens: 0,
-            elapsed_ms,
-            assertion_results: vec![AssertionResult {
-                name: "non_empty_draft".into(),
-                passed: ok,
-                detail: Some(format!("text_len={text_len}")),
-            }],
-            model_label: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
-            recorded_at_unix_ms: 0,
-        })
-        .unwrap();
+    // Write one evidence line per recorded sample (real usage, not zeros).
+    let samples = llm.samples();
+    if samples.is_empty() {
+        writer
+            .write_call(EvidenceCallRecord {
+                schema_version: EVIDENCE_SCHEMA_VERSION.into(),
+                run_id: "real-single".into(),
+                suite: "eval_real_single".into(),
+                turn_index: 1,
+                role: "pipeline".into(),
+                tag: "no_llm_calls".into(),
+                streaming: true,
+                request_fp16: String::new(),
+                system_hash16: String::new(),
+                history_hash16: String::new(),
+                tail_hash16: String::new(),
+                history_len: 0,
+                tail_parts: 0,
+                msg_count: 0,
+                prompt_tokens: 0,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                completion_tokens: 0,
+                elapsed_ms,
+                assertion_results: vec![
+                    AssertionResult {
+                        name: "non_empty_draft".into(),
+                        passed: ok,
+                        detail: Some(format!("text_len={text_len}")),
+                    },
+                    AssertionResult {
+                        name: "usage_recorded".into(),
+                        passed: false,
+                        detail: err_detail.clone(),
+                    },
+                ],
+                model_label: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
+                recorded_at_unix_ms: 0,
+            })
+            .unwrap();
+    } else {
+        for (idx, sample) in samples.iter().enumerate() {
+            let rec = sample.to_evidence_call(
+                "real-single",
+                "eval_real_single",
+                (idx + 1) as u32,
+                std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
+                vec![
+                    AssertionResult {
+                        name: "usage_recorded".into(),
+                        passed: sample.prompt_tokens > 0 || sample.completion_tokens > 0,
+                        detail: Some(format!(
+                            "prompt={} completion={} cached={}",
+                            sample.prompt_tokens, sample.completion_tokens, sample.cached_tokens
+                        )),
+                    },
+                    AssertionResult {
+                        name: "non_empty_draft".into(),
+                        passed: ok,
+                        detail: Some(format!("text_len={text_len}")),
+                    },
+                ],
+            );
+            writer.write_call(rec).unwrap();
+        }
+    }
 
     eprintln!(
-        "eval real single: campaign={campaign_id} ok={ok} text_len={text_len} ms={elapsed_ms} evidence={}",
+        "eval real single: campaign={campaign_id} ok={ok} text_len={text_len} ms={elapsed_ms} \
+         calls={}/{} prompt_tokens={} completion_tokens={} evidence={}",
+        llm.calls_used(),
+        llm.max_calls(),
+        llm.total_prompt_tokens(),
+        llm.total_completion_tokens(),
         writer.path().display()
     );
-    assert!(ok, "real single turn should produce non-empty draft");
+
+    assert!(
+        llm.calls_used() >= 1,
+        "real single turn must issue >=1 budgeted LLM call (got {}); \
+         refusing zero-call PASS",
+        llm.calls_used()
+    );
+    assert!(
+        llm.calls_used() <= llm.max_calls(),
+        "budget violated: calls_used={} max={}",
+        llm.calls_used(),
+        llm.max_calls()
+    );
+    assert!(
+        ok,
+        "real single turn should produce non-empty draft; detail={err_detail:?}"
+    );
     env.cleanup();
 }
 
-/// 真实模型长会话：默认仍跑确定性 production Accept 骨架并写证据；
-/// 完整真实写作循环成本高，需 `STORYFORGE_EVAL_MAX_TURNS` 与预算。
+/// 真实模型预算硬上限 smoke：`max_calls=1` 时第二次 chat 必须被拦截。
+///
+/// 不依赖 fixture / 多 Agent pipeline，专门验证预算包装生效。
 #[tokio::test]
-#[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1；长会话昂贵"]
-async fn eval_real_llm_long_session_budgeted() {
-    let budget = RealLlmRunBudget::from_env();
-    if !budget.enabled {
-        panic!("STORYFORGE_EVAL_REAL_LLM disabled");
-    }
-    // 即使启用真实开关，本探针仍先固化 deterministic production Accept 证据，
-    // 避免在未授权预算下默默烧掉 token。完整真实 20 轮写作需额外显式 MAX_TURNS>=20。
-    let dir = evidence_dir("long_session");
-    let turns = budget.max_turns.clamp(1, 20);
-    let cfg = LongSessionConfig {
-        turns,
-        suite: "eval_real_long_session".into(),
-        run_id: format!("real-long-{}", uuid::Uuid::new_v4()),
-        evidence_path: dir.join("long.jsonl"),
-        early_fact_turn: 1,
-        early_fact_token: "EARLYFACT-REAL-BUDGET".into(),
+#[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1 与 LLM 凭证；默认不跑"]
+async fn eval_real_llm_budget_enforced() {
+    let mut budget = require_eval_budget();
+    // Force a tight budget for this test regardless of env default.
+    budget.max_calls = 1;
+    budget.timeout_secs = budget.timeout_secs.max(15);
+
+    let llm = require_budgeted_client(&budget);
+    llm.set_tag("budget-probe");
+    llm.set_role("budget");
+
+    let req = storyforge_domain::llm::ChatRequest {
+        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
+        messages: vec![storyforge_domain::llm::ChatMessage::user(
+            "Reply with exactly one word: ok",
+        )],
+        tools: None,
+        params: storyforge_domain::llm::SamplingParams::default(),
     };
-    let report = run_deterministic_long_session(&cfg);
-    eprintln!(
-        "eval real long-session (production-accept skeleton): accepted={}/{} crossed_h_e={} evidence={}",
-        report.turns_accepted,
-        report.turns_requested,
-        report.crossed_h_plus_e,
-        report.evidence_path.display()
+
+    let first = llm.chat(&req).await;
+    assert!(
+        first.is_ok(),
+        "first call within budget should succeed: {first:?}"
     );
-    assert_eq!(report.turns_accepted, turns);
-    if turns > report.max_near_raw {
-        assert!(report.crossed_h_plus_e);
-    }
+    let second = llm.chat(&req).await;
+    assert!(
+        matches!(
+            second,
+            Err(storyforge_domain::llm::LlmError::Internal(ref s)) if s.contains("budget exhausted")
+        ),
+        "second call must be blocked by max_calls=1, got: {second:?}"
+    );
+    assert_eq!(llm.calls_used(), 1);
+    assert_eq!(llm.samples().len(), 1);
+    // Real usage should be non-zero from a successful first call (best-effort; some mocks may zero).
+    let sample = &llm.samples()[0];
+    eprintln!(
+        "budget probe: prompt={} completion={} cached={} fp={}",
+        sample.prompt_tokens, sample.completion_tokens, sample.cached_tokens, sample.request_fp16
+    );
 }
 
-/// Phase B 矩阵：确定性 A/B 始终可跑；真实模型对照需同一 seed 的额外采样（此处只落矩阵骨架）。
-#[tokio::test]
-#[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1"]
-async fn eval_real_llm_phase_b_matrix_skeleton() {
-    let budget = RealLlmRunBudget::from_env();
-    if !budget.enabled {
-        panic!("STORYFORGE_EVAL_REAL_LLM disabled");
-    }
-    let _ = require_eval_real_llm(); // prove credentials resolve
-    let dir = evidence_dir("phase_b");
-    let report = run_phase_b_matrix(
-        &default_phase_b_fixtures(),
-        dir.join("ab.jsonl"),
-        "real-pb-skeleton",
-    );
-    assert!(report.assertions.iter().all(|a| a.passed));
-    eprintln!(
-        "eval phase-b matrix skeleton rows={} evidence={}",
-        report.rows.len(),
-        report.evidence_path.display()
-    );
-}
+// 说明：长会话 / Phase B 的**确定性**骨架已从本真实 suite 移除，
+// 避免 STORYFORGE_EVAL_REAL_LLM=1 时零调用假通过。
+// 确定性覆盖见：
+//   - harness-real-llm::long_session::tests
+//   - harness-real-llm::phase_b_matrix
+//   - tests/eval_m5_phaseb_deterministic.rs
+// 真实 ≥20 写作循环需单独授权与更高预算，尚未实现。
 
 fn find_fixture(name: &str) -> std::path::PathBuf {
+    // Prefer explicit override.
+    if let Ok(p) = std::env::var("STORYFORGE_EVAL_FIXTURE_CARD") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return path;
+        }
+    }
     let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     loop {
         let candidate = dir.join(name);
         if candidate.exists() {
             return candidate;
+        }
+        // also check common fixtures/ locations
+        let alt = dir.join("fixtures").join(name);
+        if alt.exists() {
+            return alt;
+        }
+        let alt2 = dir.join("testdata").join(name);
+        if alt2.exists() {
+            return alt2;
         }
         if let Some(parent) = dir.parent() {
             dir = parent.to_path_buf();
