@@ -11,6 +11,10 @@
 `BudgetedLlmClient`、生产忠实 `CommitTurn`/Accept 探针、ContextEpoch 计算与脱敏
 JSONL writer 串成一个可复跑的多轮生产证据入口。
 
+> 返修边界澄清：production pipeline write 与 production-faithful Accept 可复用；完整
+> Tauri Summarizer/postprocess 后台路径不在本切片公开接口内，因此 Chronicle A 仅作为
+> `synthetic_chronicle_fixture`，不得描述为完整 production postprocess 闭环。
+
 交付范围：
 
 1. 真实模型入口执行连续多轮 `write → CommitTurn/Accept`，每轮使用同一 Campaign、

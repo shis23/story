@@ -1,9 +1,8 @@
-//! M5 生产证据真实模型入口（默认 ignored，需显式付费授权）。
+//! M5 pipeline-write 证据真实模型入口（默认 ignored，需显式付费授权）。
 //!
-//! 该 suite 运行生产 Context 装配与多轮 `write → CommitTurn/Accept`，目标轮数必须
-//! 严格跨越 `H_anchor + E`。模型调用全程共享一个 `BudgetedLlmClient`，并分别写
-//! calls/turns 脱敏 JSONL。fixture 缺失、零调用、预算耗尽、证据写失败、未跨 epoch
-//! 都会失败，不会输出假 PASS。
+//! 写作使用 production pipeline；Chronicle A 是明确标记的 synthetic fixture，
+//! **不**代表 Tauri 完整 Summarizer/postprocess/TurnAttempt 后台闭环。Accept 使用
+//! production-faithful CommitProbe。目标轮数必须严格跨越 `H_anchor + E`。
 //!
 //! ```text
 //! $env:STORYFORGE_EVAL_REAL_LLM='1'
@@ -13,6 +12,7 @@
 //! $env:STORYFORGE_EVAL_MAX_CALLS='96'
 //! $env:STORYFORGE_EVAL_MAX_TURNS='16'
 //! $env:STORYFORGE_EVAL_TIMEOUT_SECS='180'
+//! $env:STORYFORGE_EVAL_FIXTURE_CARD='C:\path\to\card.png'
 //! cargo test -p harness-real-llm --test eval_m5_phaseb_real_llm -- --ignored --nocapture
 //! ```
 
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use harness_real_llm::budget::BudgetedLlmClient;
 use harness_real_llm::evidence::RealLlmRunBudget;
 use harness_real_llm::production_evidence::{
-    PipelineProductionTurnWriter, ProductionEvidenceConfig, require_fixture_file,
+    PipelineProductionTurnWriter, ProductionEvidenceConfig, require_explicit_fixture_path,
     run_production_evidence_loop,
 };
 use harness_real_llm::{HarnessEnv, require_real_llm};
@@ -62,12 +62,14 @@ fn evidence_dir() -> std::path::PathBuf {
 
 #[tokio::test]
 #[ignore = "需要 STORYFORGE_EVAL_REAL_LLM=1 与 LLM 凭证；默认不跑"]
-async fn eval_real_llm_production_write_commit_accept_across_epoch() {
+async fn eval_real_llm_pipeline_write_synthetic_chronicle_accept_across_epoch() {
     let budget = require_eval_budget();
 
     // fixture 必须在构造真实 client 之前验证，缺失时确保零付费调用并 fail closed。
-    let card_path = find_fixture("test-card-seraphina.png");
-    require_fixture_file(&card_path).unwrap_or_else(|e| panic!("INCONCLUSIVE (not pass): {e}"));
+    let card_path = require_explicit_fixture_path(
+        std::env::var_os("STORYFORGE_EVAL_FIXTURE_CARD").map(std::path::PathBuf::from),
+    )
+    .unwrap_or_else(|e| panic!("INCONCLUSIVE (not pass): {e}"));
 
     let llm = BudgetedLlmClient::wrap(require_real_llm(), &budget);
     let env = HarnessEnv::new(llm.clone() as Arc<dyn LlmClient>);
@@ -95,6 +97,7 @@ async fn eval_real_llm_production_write_commit_accept_across_epoch() {
         calls_path: dir.join("calls.jsonl"),
         turns_path: dir.join("turns.jsonl"),
         model_label: std::env::var("LLM_MODEL").unwrap_or_else(|_| "unknown".into()),
+        hard_deadline: None,
     };
     let mut writer = PipelineProductionTurnWriter;
     let result = run_production_evidence_loop(
@@ -110,7 +113,7 @@ async fn eval_real_llm_production_write_commit_accept_across_epoch() {
     match result {
         Ok(report) => {
             eprintln!(
-                "M5 production evidence PASS: accepts={}/{} calls={}/{} epoch_ids={} \
+                "M5 pipeline-write + synthetic-Chronicle evidence PASS: accepts={}/{} calls={}/{} epoch_ids={} \
                  elapsed_ms={} calls_jsonl={} turns_jsonl={}",
                 report.turns_accepted,
                 report.turns_requested,
@@ -124,31 +127,14 @@ async fn eval_real_llm_production_write_commit_accept_across_epoch() {
             assert!(report.crossed_h_plus_e);
             assert!(report.epoch_rolled_over);
             assert!(report.calls_used >= report.turns_accepted);
+            assert_eq!(report.write_path, "production_pipeline");
+            assert_eq!(report.chronicle_path, "synthetic_chronicle_fixture");
+            assert!(!report.production_postprocess_complete);
         }
         Err(err) => {
             env.cleanup();
-            panic!("M5 production evidence failed closed: {err}");
+            panic!("M5 pipeline/synthetic evidence failed closed: {err}");
         }
     }
     env.cleanup();
-}
-
-fn find_fixture(name: &str) -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("STORYFORGE_EVAL_FIXTURE_CARD") {
-        return std::path::PathBuf::from(p);
-    }
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    loop {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return candidate;
-        }
-        let alt = dir.join("fixtures").join(name);
-        if alt.exists() {
-            return alt;
-        }
-        if !dir.pop() {
-            return std::path::PathBuf::from(name);
-        }
-    }
 }

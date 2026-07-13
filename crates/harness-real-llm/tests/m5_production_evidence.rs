@@ -1,6 +1,7 @@
 //! M5 生产证据多轮 orchestration（确定性，不调用付费模型）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use harness_real_llm::HarnessEnv;
@@ -10,8 +11,10 @@ use harness_real_llm::evidence::{
     RealLlmRunBudget, contains_forbidden_evidence_payload, read_evidence_lines,
 };
 use harness_real_llm::production_evidence::{
-    ProductionEvidenceConfig, ProductionTurnWriter, WrittenProductionTurn, require_fixture_file,
-    run_production_evidence_loop,
+    ChronicleCandidateSource, ProductionEvidenceConfig, ProductionEvidenceStage,
+    ProductionEvidenceStageHook, ProductionTurnWriter, WrittenProductionTurn,
+    require_explicit_fixture_path, require_fixture_file, run_production_evidence_loop,
+    run_production_evidence_loop_with_hook,
 };
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
@@ -55,6 +58,10 @@ struct DeterministicTurnWriter {
 
 #[async_trait]
 impl ProductionTurnWriter for DeterministicTurnWriter {
+    fn write_path(&self) -> &'static str {
+        "deterministic_writer_fixture"
+    }
+
     async fn write_turn(
         &mut self,
         env: &HarnessEnv,
@@ -90,6 +97,9 @@ impl ProductionTurnWriter for DeterministicTurnWriter {
             summary_text: self
                 .emit_summary
                 .then(|| format!("第{turn_index}轮：雾港线索继续推进。")),
+            chronicle_source: self
+                .emit_summary
+                .then_some(ChronicleCandidateSource::SyntheticChronicleFixture),
         })
     }
 }
@@ -132,7 +142,22 @@ fn config(dir: &std::path::Path) -> ProductionEvidenceConfig {
         calls_path: dir.join("calls.jsonl"),
         turns_path: dir.join("turns.jsonl"),
         model_label: "fake-model".into(),
+        hard_deadline: None,
     }
+}
+
+async fn issue_setup_call(env: &HarnessEnv, llm: &BudgetedLlmClient) {
+    llm.set_tag("setup_extract");
+    llm.set_role("setup");
+    let req = ChatRequest {
+        model: "fake".into(),
+        messages: vec![storyforge_domain::llm::ChatMessage::user(
+            "setup extraction call",
+        )],
+        tools: None,
+        params: storyforge_domain::llm::SamplingParams::default(),
+    };
+    env.llm.chat(&req).await.expect("setup call");
 }
 
 #[test]
@@ -143,10 +168,27 @@ fn missing_fixture_fails_before_any_real_model_setup() {
     assert!(err.to_string().contains("required fixture missing"));
 }
 
+#[test]
+fn real_eval_requires_explicit_fixture_override() {
+    let err = require_explicit_fixture_path(None).unwrap_err();
+    assert!(err.to_string().contains("STORYFORGE_EVAL_FIXTURE_CARD"));
+
+    let dir = std::env::temp_dir().join(format!("sf-m5-explicit-fixture-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("card.png");
+    std::fs::write(&path, b"fixture-marker").unwrap();
+    assert_eq!(
+        require_explicit_fixture_path(Some(path.clone())).unwrap(),
+        path
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn multi_turn_loop_uses_real_context_rollover_and_writes_redacted_jsonl() {
     let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
-    let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
+    let (env, llm, campaign_id, conversation_id, dir) = setup(turns + 1);
+    issue_setup_call(&env, &llm).await;
     let mut writer = DeterministicTurnWriter { emit_summary: true };
 
     let report = run_production_evidence_loop(
@@ -165,11 +207,21 @@ async fn multi_turn_loop_uses_real_context_rollover_and_writes_redacted_jsonl() 
     assert!(report.crossed_h_plus_e);
     assert!(report.epoch_rolled_over);
     assert!(report.observed_epoch_ids16.len() >= 2);
+    assert!(!report.production_postprocess_complete);
 
     let calls = read_evidence_lines(&report.calls_path).unwrap();
     let accepted = read_evidence_lines(&report.turns_path).unwrap();
     assert_eq!(calls.len(), turns as usize);
+    assert_eq!(calls[0]["tag"], "turn1");
+    assert!(calls.iter().all(|line| line["tag"] != "setup_extract"));
     assert_eq!(accepted.len(), turns as usize);
+    assert!(accepted.iter().all(|line| {
+        line["write_path"] == "deterministic_writer_fixture"
+            && line["chronicle_path"] == "synthetic_chronicle_fixture"
+            && line["accept_path"] == "production_faithful_commit_probe"
+            && line["production_postprocess_complete"] == false
+            && line["kind"] == "pipeline_write_synthetic_chronicle_accept"
+    }));
     assert!(
         accepted
             .iter()
@@ -230,12 +282,14 @@ async fn loop_fails_closed_on_zero_llm_calls() {
                 draft_text: draft,
                 variant_id,
                 summary_text: Some(format!("summary {turn_index}")),
+                chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
             })
         }
     }
 
     let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
-    let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
+    let (env, llm, campaign_id, conversation_id, dir) = setup(turns + 1);
+    issue_setup_call(&env, &llm).await;
     let mut writer = ZeroCallWriter;
     let err = run_production_evidence_loop(
         &env,
@@ -247,7 +301,103 @@ async fn loop_fails_closed_on_zero_llm_calls() {
     )
     .await
     .unwrap_err();
-    assert!(err.to_string().contains("zero LLM calls"));
+    assert!(
+        err.to_string().contains("turn 1 produced zero LLM calls"),
+        "setup samples must not let turn1 pass: {err}"
+    );
+    env.cleanup();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[derive(Clone)]
+struct DelayAtStage {
+    stage: ProductionEvidenceStage,
+    delay: Duration,
+}
+
+#[async_trait]
+impl ProductionEvidenceStageHook for DelayAtStage {
+    async fn on_stage(&self, stage: ProductionEvidenceStage, _turn_index: u32) {
+        if stage == self.stage {
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn hard_deadline_flushes_completed_samples_and_covers_accept_evidence_boundaries() {
+    for stage in [
+        ProductionEvidenceStage::AfterWriteBeforeCallEvidence,
+        ProductionEvidenceStage::AfterCallEvidence,
+        ProductionEvidenceStage::AfterAccept,
+    ] {
+        let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
+        let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
+        let mut cfg = config(&dir);
+        cfg.hard_deadline = Some(Duration::from_millis(100));
+        let hook = DelayAtStage {
+            stage,
+            delay: Duration::from_millis(250),
+        };
+        let mut writer = DeterministicTurnWriter { emit_summary: true };
+        let err = run_production_evidence_loop_with_hook(
+            &env,
+            llm,
+            campaign_id,
+            conversation_id,
+            &cfg,
+            &mut writer,
+            &hook,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("suite timeout"),
+            "stage={stage:?}: {err}"
+        );
+        let calls = read_evidence_lines(&cfg.calls_path).unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "stage={stage:?} must preserve completed usage"
+        );
+        assert_eq!(calls[0]["turn_index"], 1);
+        env.cleanup();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn hard_deadline_covers_final_context_fill_boundary() {
+    let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
+    let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
+    let mut cfg = config(&dir);
+    cfg.hard_deadline = Some(Duration::from_secs(1));
+    let hook = DelayAtStage {
+        stage: ProductionEvidenceStage::BeforeFinalFill,
+        delay: Duration::from_secs(2),
+    };
+    let mut writer = DeterministicTurnWriter { emit_summary: true };
+    let err = run_production_evidence_loop_with_hook(
+        &env,
+        llm,
+        campaign_id,
+        conversation_id,
+        &cfg,
+        &mut writer,
+        &hook,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("suite timeout"));
+    assert_eq!(
+        read_evidence_lines(&cfg.calls_path).unwrap().len(),
+        turns as usize
+    );
+    assert_eq!(
+        read_evidence_lines(&cfg.turns_path).unwrap().len(),
+        turns as usize
+    );
     env.cleanup();
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -58,6 +58,15 @@ pub struct EvidenceTurnRecord {
     pub suite: String,
     pub turn_index: u32,
     pub kind: String,
+    /// 写作来源、Chronicle 来源与 Accept 路径必须拆开，防止 synthetic fixture 被误宣称。
+    #[serde(default)]
+    pub write_path: String,
+    #[serde(default)]
+    pub chronicle_path: String,
+    #[serde(default)]
+    pub accept_path: String,
+    #[serde(default)]
+    pub production_postprocess_complete: bool,
     pub draft_accepted: bool,
     pub force_accept: bool,
     pub quality_error_count: usize,
