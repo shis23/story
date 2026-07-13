@@ -340,6 +340,11 @@ pub struct TurnRecord {
     pub accepted_attempt_id: Option<Id>,
     /// 失败原因（Failed/Degraded 时）
     pub failure_reason: Option<String>,
+    /// Accept 进入 Committing 前已决定的终态（Committed / Degraded）。
+    ///
+    /// 崩溃恢复必须复用该意图：force accept 的 Degraded 不能被恢复路径升级成 Committed。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_terminal_status: Option<TurnStatus>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -363,6 +368,7 @@ impl TurnRecord {
             attempts: vec![],
             accepted_attempt_id: None,
             failure_reason: None,
+            intended_terminal_status: None,
             created_at: now.clone(),
             updated_at: now,
         }
