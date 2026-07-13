@@ -1,3 +1,4 @@
+pub mod compat;
 pub mod png;
 
 use storyforge_domain::character::{Character, StCharacterCard};
@@ -47,7 +48,7 @@ pub fn import_character(data: &[u8]) -> Result<Character, ImportError> {
 
 /// 从 JSON 直接导入角色卡
 pub fn import_character_from_json(data: &[u8]) -> Result<Character, ImportError> {
-    let card: StCharacterCard = serde_json::from_slice(data)?;
+    let card: StCharacterCard = serde_json::from_slice(strip_utf8_bom(data))?;
     Ok(Character::from_st_card(card))
 }
 
@@ -76,13 +77,19 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
 
 /// 导入 ST 预设（JSON）
 pub fn import_preset(data: &[u8]) -> Result<Preset, ImportError> {
-    let st: StPreset = serde_json::from_slice(data)?;
+    let st: StPreset = serde_json::from_slice(strip_utf8_bom(data))?;
     Ok(Preset::from_st(st))
 }
 
 /// 检查是否为 PNG 文件
 fn is_png(data: &[u8]) -> bool {
     data.len() >= 8 && data[..8] == png::PNG_SIGNATURE
+}
+
+/// Strip a UTF-8 BOM so ST JSON exports saved as "UTF-8 with BOM" still parse.
+fn strip_utf8_bom(data: &[u8]) -> &[u8] {
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    data.strip_prefix(UTF8_BOM).unwrap_or(data)
 }
 
 #[cfg(test)]
