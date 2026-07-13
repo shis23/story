@@ -72,14 +72,14 @@ Harness 既有生产 Accept 探针在改为共享路径后仍绿：
 
 ## Commit 列表
 
-（相对基线 `c3a972d`）
+（相对基线 `c3a972d`；完整顺序以 `git log --oneline c3a972d..HEAD` 为准）
 
 1. `0a31e65` docs(workstream): plan shared turn lifecycle service
 2. `f0b06c4` feat(turn-lifecycle): add shared TurnLifecycleService and contract tests
 3. `7cca144` refactor(tauri): thin turn lifecycle adapters over shared service
 4. `33c4a66` refactor(harness): route CommitProbe accept through shared lifecycle
 5. `3069253` docs(workstream): record turn lifecycle shared service result
-6. `edd7033` docs(workstream): stabilize turn lifecycle RESULT commit list
+6. 后续 docs commits：RESULT 列表/HEAD 说明修正（不改变实现）
 
 ## 修改文件
 
