@@ -46,6 +46,40 @@ pub struct AcceptTurnRequest<'a> {
 
 pub struct SqliteProductionRepository;
 
+struct TurnRow {
+    turn_id: String,
+    campaign_id: String,
+    conversation_id: String,
+    input_node_id: String,
+    base_campaign_revision: u64,
+    status: String,
+    accepted_attempt_id: Option<String>,
+    failure_reason: Option<String>,
+    created_at: String,
+    updated_at: String,
+    payload_json: String,
+}
+
+struct AttemptRow {
+    attempt_id: String,
+    turn_id: String,
+    variant_id: String,
+    draft_hash: String,
+    status: String,
+    created_at: String,
+    payload_json: String,
+}
+
+struct LedgerRow {
+    campaign_id: String,
+    turn_id: String,
+    attempt_id: String,
+    expected_revision: u64,
+    target_revision: u64,
+    terminal_status: String,
+    payload_hash: String,
+}
+
 /// Stable draft identity used by the JSON production path and the SQLite adapter.
 pub fn compute_draft_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
@@ -129,19 +163,11 @@ impl SqliteProductionRepository {
     }
 
     pub fn get_turn(db: &Database, turn_id: &Id) -> Result<Option<TurnRecord>> {
-        load_payload(
-            db.connection(),
-            "SELECT payload_json FROM turns WHERE turn_id = ?1",
-            turn_id.as_str(),
-        )
+        load_validated_turn(db.connection(), turn_id)
     }
 
     pub fn get_attempt(db: &Database, attempt_id: &Id) -> Result<Option<TurnAttempt>> {
-        load_payload(
-            db.connection(),
-            "SELECT payload_json FROM turn_attempts WHERE attempt_id = ?1",
-            attempt_id.as_str(),
-        )
+        load_validated_attempt(db.connection(), attempt_id)
     }
 
     pub fn get_instance(db: &Database, instance_id: &Id) -> Result<Option<CharacterInstance>> {
@@ -207,15 +233,33 @@ impl SqliteProductionRepository {
         let uow = UnitOfWork::begin(db.connection_mut())?;
         let tx = uow.transaction()?;
 
-        if let Some(existing_hash) = tx
+        let mut turn = load_validated_turn(tx, request.turn_id)?
+            .ok_or_else(|| SqliteError::RecordNotFound(format!("turn {}", request.turn_id)))?;
+
+        if let Some(ledger) = tx
             .query_row(
-                "SELECT payload_hash FROM mutation_commits WHERE commit_id = ?1",
+                r#"
+                SELECT campaign_id, turn_id, attempt_id, expected_revision,
+                       target_revision, terminal_status, payload_hash
+                FROM mutation_commits WHERE commit_id = ?1
+                "#,
                 [request.batch.commit_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok(LedgerRow {
+                        campaign_id: row.get(0)?,
+                        turn_id: row.get(1)?,
+                        attempt_id: row.get(2)?,
+                        expected_revision: row.get(3)?,
+                        target_revision: row.get(4)?,
+                        terminal_status: row.get(5)?,
+                        payload_hash: row.get(6)?,
+                    })
+                },
             )
             .optional()?
         {
-            if existing_hash == fingerprint {
+            validate_ledger_replay(&ledger, &turn, &request, &fingerprint)?;
+            if ledger.payload_hash == fingerprint {
                 uow.commit()?;
                 return Ok(AcceptOutcome::AlreadyCommitted);
             }
@@ -225,12 +269,6 @@ impl SqliteProductionRepository {
             )));
         }
 
-        let mut turn: TurnRecord = load_payload_tx(
-            tx,
-            "SELECT payload_json FROM turns WHERE turn_id = ?1",
-            [request.turn_id.as_str()],
-        )?
-        .ok_or_else(|| SqliteError::RecordNotFound(format!("turn {}", request.turn_id)))?;
         if turn.status != TurnStatus::AwaitingAcceptance {
             return Err(SqliteError::Conflict(format!(
                 "turn {} is {:?}, expected AwaitingAcceptance",
@@ -328,6 +366,8 @@ impl SqliteProductionRepository {
             ));
         }
 
+        validate_finalize_variant(&attempt, &conversation, request.batch)?;
+
         for mutation in &request.batch.mutations {
             apply_mutation(tx, &mut campaign, &mut conversation, &attempt, mutation)?;
         }
@@ -416,6 +456,12 @@ fn apply_mutation(
             }
         }
         Mutation::UpsertKnowledge(mutation) => {
+            if mutation.campaign_id != campaign.id {
+                return Err(SqliteError::Conflict(format!(
+                    "knowledge {} belongs to campaign {}, expected {}",
+                    mutation.entry_id, mutation.campaign_id, campaign.id
+                )));
+            }
             let entry = mutation.to_entry();
             upsert_exact(
                 tx,
@@ -464,6 +510,22 @@ fn apply_mutation(
             if summary.campaign_id != campaign.id || summary.conversation_id != conversation.id {
                 return Err(SqliteError::Conflict(format!(
                     "summary {} scope mismatch",
+                    summary.id
+                )));
+            }
+            if summary
+                .lineage_id
+                .as_ref()
+                .is_some_and(|lineage| campaign.lineage_id.as_ref() != Some(lineage))
+            {
+                return Err(SqliteError::Conflict(format!(
+                    "summary {} lineage does not belong to campaign {}",
+                    summary.id, campaign.id
+                )));
+            }
+            if summary.level != 0 || !summary.covers.is_empty() || summary.covered_by.is_some() {
+                return Err(SqliteError::Conflict(format!(
+                    "Turn accept only permits leaf Chronicle A summary {}",
                     summary.id
                 )));
             }
@@ -612,6 +674,24 @@ fn write_turn(tx: &Transaction<'_>, turn: &TurnRecord) -> Result<()> {
         ],
     )?;
     for attempt in &turn.attempts {
+        let existing_owner: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM turn_attempts WHERE attempt_id = ?1",
+                [attempt.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_owner
+            .as_deref()
+            .is_some_and(|owner| owner != turn.turn_id.as_str())
+        {
+            return Err(SqliteError::Conflict(format!(
+                "refusing to rehang attempt {} from turn {} to {}",
+                attempt.attempt_id,
+                existing_owner.as_deref().unwrap_or_default(),
+                turn.turn_id
+            )));
+        }
         tx.execute(
             r#"
             INSERT INTO turn_attempts (
@@ -758,6 +838,254 @@ fn load_payload<T: DeserializeOwned>(
     payload
         .map(|value| serde_json::from_str(&value).map_err(Into::into))
         .transpose()
+}
+
+fn load_validated_turn(conn: &rusqlite::Connection, turn_id: &Id) -> Result<Option<TurnRecord>> {
+    let row = conn
+        .query_row(
+            r#"
+            SELECT turn_id, campaign_id, conversation_id, input_node_id,
+                   base_campaign_revision, status, accepted_attempt_id,
+                   failure_reason, created_at, updated_at, payload_json
+            FROM turns WHERE turn_id = ?1
+            "#,
+            [turn_id.as_str()],
+            |row| {
+                Ok(TurnRow {
+                    turn_id: row.get(0)?,
+                    campaign_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    input_node_id: row.get(3)?,
+                    base_campaign_revision: row.get(4)?,
+                    status: row.get(5)?,
+                    accepted_attempt_id: row.get(6)?,
+                    failure_reason: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    payload_json: row.get(10)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let turn: TurnRecord = serde_json::from_str(&row.payload_json)?;
+    validate_turn_row(&row, &turn)?;
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT attempt_id, turn_id, variant_id, draft_hash, status, created_at, payload_json
+        FROM turn_attempts WHERE turn_id = ?1 ORDER BY rowid
+        "#,
+    )?;
+    let rows = stmt.query_map([turn_id.as_str()], |row| {
+        Ok(AttemptRow {
+            attempt_id: row.get(0)?,
+            turn_id: row.get(1)?,
+            variant_id: row.get(2)?,
+            draft_hash: row.get(3)?,
+            status: row.get(4)?,
+            created_at: row.get(5)?,
+            payload_json: row.get(6)?,
+        })
+    })?;
+    let mut structured_attempts = Vec::new();
+    for row in rows {
+        let row = row?;
+        let attempt: TurnAttempt = serde_json::from_str(&row.payload_json)?;
+        validate_attempt_row(&row, &attempt, turn_id)?;
+        structured_attempts.push(attempt);
+    }
+    if structured_attempts.len() != turn.attempts.len() {
+        return Err(SqliteError::Conflict(format!(
+            "turn {} attempt ownership drift: payload={}, structured={}",
+            turn.turn_id,
+            turn.attempts.len(),
+            structured_attempts.len()
+        )));
+    }
+    for payload_attempt in &turn.attempts {
+        let structured = structured_attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == payload_attempt.attempt_id)
+            .ok_or_else(|| {
+                SqliteError::Conflict(format!(
+                    "turn {} payload attempt {} is not owned by its structured row",
+                    turn.turn_id, payload_attempt.attempt_id
+                ))
+            })?;
+        if serde_json::to_value(structured)? != serde_json::to_value(payload_attempt)? {
+            return Err(SqliteError::Conflict(format!(
+                "turn {} attempt {} payload drift",
+                turn.turn_id, payload_attempt.attempt_id
+            )));
+        }
+    }
+    Ok(Some(turn))
+}
+
+fn load_validated_attempt(
+    conn: &rusqlite::Connection,
+    attempt_id: &Id,
+) -> Result<Option<TurnAttempt>> {
+    let row = conn
+        .query_row(
+            r#"
+            SELECT attempt_id, turn_id, variant_id, draft_hash, status, created_at, payload_json
+            FROM turn_attempts WHERE attempt_id = ?1
+            "#,
+            [attempt_id.as_str()],
+            |row| {
+                Ok(AttemptRow {
+                    attempt_id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    variant_id: row.get(2)?,
+                    draft_hash: row.get(3)?,
+                    status: row.get(4)?,
+                    created_at: row.get(5)?,
+                    payload_json: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let attempt: TurnAttempt = serde_json::from_str(&row.payload_json)?;
+    let turn_id = Id::from_str(&row.turn_id);
+    validate_attempt_row(&row, &attempt, &turn_id)?;
+    let turn = load_validated_turn(conn, &turn_id)?.ok_or_else(|| {
+        SqliteError::Conflict(format!(
+            "attempt {} structured owner turn {} is missing",
+            attempt.attempt_id, turn_id
+        ))
+    })?;
+    let parent_attempt = turn.find_attempt(&attempt.attempt_id).ok_or_else(|| {
+        SqliteError::Conflict(format!(
+            "attempt {} is not present in owner turn {} payload",
+            attempt.attempt_id, turn_id
+        ))
+    })?;
+    if serde_json::to_value(parent_attempt)? != serde_json::to_value(&attempt)? {
+        return Err(SqliteError::Conflict(format!(
+            "attempt {} differs from owner turn payload",
+            attempt.attempt_id
+        )));
+    }
+    Ok(Some(attempt))
+}
+
+fn validate_turn_row(row: &TurnRow, turn: &TurnRecord) -> Result<()> {
+    let accepted_attempt_id = turn.accepted_attempt_id.as_ref().map(Id::as_str);
+    if row.turn_id != turn.turn_id.as_str() {
+        return Err(SqliteError::Conflict(format!(
+            "turn_id drift: structured={}, payload={}",
+            row.turn_id, turn.turn_id
+        )));
+    }
+    if row.campaign_id != turn.campaign_id.as_str()
+        || row.conversation_id != turn.conversation_id.as_str()
+        || row.input_node_id != turn.input_node_id.as_str()
+        || row.base_campaign_revision != turn.base_campaign_revision
+        || row.status != enum_text(&turn.status)?
+        || row.accepted_attempt_id.as_deref() != accepted_attempt_id
+        || row.failure_reason != turn.failure_reason
+        || row.created_at != turn.created_at
+        || row.updated_at != turn.updated_at
+    {
+        return Err(SqliteError::Conflict(format!(
+            "turn {} structured columns drift from payload",
+            turn.turn_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attempt_row(
+    row: &AttemptRow,
+    attempt: &TurnAttempt,
+    expected_turn_id: &Id,
+) -> Result<()> {
+    if row.attempt_id != attempt.attempt_id.as_str() {
+        return Err(SqliteError::Conflict(format!(
+            "attempt_id drift: structured={}, payload={}",
+            row.attempt_id, attempt.attempt_id
+        )));
+    }
+    if row.turn_id != expected_turn_id.as_str()
+        || row.variant_id != attempt.variant_id.as_str()
+        || row.draft_hash != attempt.draft_hash
+        || row.status != enum_text(&attempt.status)?
+        || row.created_at != attempt.created_at
+    {
+        return Err(SqliteError::Conflict(format!(
+            "attempt {} structured columns drift from payload/owner",
+            attempt.attempt_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_finalize_variant(
+    attempt: &TurnAttempt,
+    conversation: &Conversation,
+    batch: &MutationBatch,
+) -> Result<()> {
+    let finalize_ids: Vec<&Id> = batch
+        .mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            Mutation::FinalizeVariant { variant_id } => Some(variant_id),
+            _ => None,
+        })
+        .collect();
+    if finalize_ids.len() != 1 {
+        return Err(SqliteError::Conflict(format!(
+            "MutationBatch must contain exactly one FinalizeVariant, got {}",
+            finalize_ids.len()
+        )));
+    }
+    let variant_id = finalize_ids[0];
+    if variant_id != &attempt.variant_id {
+        return Err(SqliteError::Conflict(format!(
+            "FinalizeVariant {} does not match attempt variant {}",
+            variant_id, attempt.variant_id
+        )));
+    }
+    if conversation.find_node(variant_id).is_none() {
+        return Err(SqliteError::Conflict(format!(
+            "FinalizeVariant {} is not present in conversation {}",
+            variant_id, conversation.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ledger_replay(
+    ledger: &LedgerRow,
+    turn: &TurnRecord,
+    request: &AcceptTurnRequest<'_>,
+    fingerprint: &str,
+) -> Result<()> {
+    let attempt_belongs = turn
+        .find_attempt(request.attempt_id)
+        .is_some_and(|attempt| attempt.attempt_id == *request.attempt_id);
+    if ledger.payload_hash != fingerprint
+        || ledger.turn_id != request.turn_id.as_str()
+        || ledger.attempt_id != request.attempt_id.as_str()
+        || ledger.campaign_id != turn.campaign_id.as_str()
+        || ledger.expected_revision != request.batch.expected_revision
+        || ledger.target_revision != request.batch.target_revision
+        || ledger.terminal_status != enum_text(&request.terminal_status)?
+        || !attempt_belongs
+    {
+        return Err(SqliteError::Conflict(format!(
+            "commit_id {} ledger ownership or payload mismatch",
+            request.batch.commit_id
+        )));
+    }
+    Ok(())
 }
 
 fn load_payload_tx<T, P>(tx: &Transaction<'_>, sql: &str, params: P) -> Result<Option<T>>

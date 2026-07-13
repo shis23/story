@@ -118,6 +118,53 @@ fn request<'a>(
     }
 }
 
+fn persist_request_batch(f: &mut Fixture) {
+    let mut turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    turn.find_attempt_mut(&f.attempt_id)
+        .unwrap()
+        .pending_state_changes = Some(f.batch.clone());
+    SqliteProductionRepository::save_turn(&mut f.db, &turn).unwrap();
+}
+
+fn assert_accept_unchanged(f: &Fixture) {
+    let campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.revision, 0);
+    assert_eq!(campaign.chronicle_revision, 0);
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::AwaitingAcceptance);
+    assert_eq!(
+        turn.find_attempt(&f.attempt_id).unwrap().status,
+        AttemptStatus::AwaitingAcceptance
+    );
+    let conversation = SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation
+            .find_node(&f.node_id)
+            .unwrap()
+            .active()
+            .unwrap()
+            .status,
+        VariantStatus::Draft
+    );
+    assert!(
+        SqliteProductionRepository::list_summaries(&f.db, &f.campaign_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        SqliteProductionRepository::count_commit_ledger(&f.db).unwrap(),
+        0
+    );
+}
+
 #[test]
 fn accept_commits_turn_campaign_chronicle_and_variant_atomically() {
     let mut f = fixture();
@@ -169,6 +216,56 @@ fn accept_commits_turn_campaign_chronicle_and_variant_atomically() {
 }
 
 #[test]
+fn accept_rejects_batch_without_finalize_variant_with_zero_side_effects() {
+    let mut f = fixture();
+    f.batch
+        .mutations
+        .retain(|mutation| !matches!(mutation, Mutation::FinalizeVariant { .. }));
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("FinalizeVariant"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
+fn accept_rejects_duplicate_finalize_variant_with_zero_side_effects() {
+    let mut f = fixture();
+    f.batch.mutations.push(Mutation::FinalizeVariant {
+        variant_id: f.node_id.clone(),
+    });
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("FinalizeVariant"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
+fn accept_rejects_wrong_finalize_variant_with_zero_side_effects() {
+    let mut f = fixture();
+    for mutation in &mut f.batch.mutations {
+        if let Mutation::FinalizeVariant { variant_id } = mutation {
+            *variant_id = Id::from_str("wrong-variant");
+        }
+    }
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("FinalizeVariant"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
 fn repeated_commit_id_is_idempotent_without_revision_bump() {
     let mut f = fixture();
     assert_eq!(
@@ -199,6 +296,39 @@ fn repeated_commit_id_is_idempotent_without_revision_bump() {
 }
 
 #[test]
+fn ledger_replay_rejects_campaign_turn_attempt_ownership_drift() {
+    let mut f = fixture();
+    SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap();
+
+    let other_campaign_id = Id::from_str("camp-ledger-other");
+    let other_conversation_id = Id::from_str("conv-ledger-other");
+    let mut other_campaign = Campaign::new(Id::from_str("card-ledger-other"), "Other");
+    other_campaign.id = other_campaign_id.clone();
+    other_campaign.conversation_id = Some(other_conversation_id.clone());
+    let mut other_conversation = Conversation::new(None, Some(other_campaign_id.clone()));
+    other_conversation.id = other_conversation_id;
+    SqliteProductionRepository::bootstrap_campaign(&mut f.db, &other_campaign, &other_conversation)
+        .unwrap();
+    f.db.connection()
+        .execute(
+            "UPDATE mutation_commits SET campaign_id = ?1 WHERE commit_id = ?2",
+            rusqlite::params![other_campaign_id.as_str(), f.batch.commit_id.as_str()],
+        )
+        .unwrap();
+
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("ledger ownership"));
+}
+
+#[test]
 fn turn_and_attempt_domain_payloads_round_trip() {
     let f = fixture();
     let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
@@ -213,6 +343,129 @@ fn turn_and_attempt_domain_payloads_round_trip() {
     let stored_batch = attempt.pending_state_changes.unwrap();
     assert_eq!(stored_batch.commit_id, f.batch.commit_id);
     assert_eq!(stored_batch.mutations.len(), f.batch.mutations.len());
+}
+
+#[test]
+fn get_turn_rejects_payload_id_drift_instead_of_rehanging_record() {
+    let f = fixture();
+    let mut payload: serde_json::Value =
+        f.db.connection()
+            .query_row(
+                "SELECT payload_json FROM turns WHERE turn_id = ?1",
+                [f.turn_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap();
+    payload["turn_id"] = serde_json::json!("rehung-turn");
+    f.db.connection()
+        .execute(
+            "UPDATE turns SET payload_json = ?1 WHERE turn_id = ?2",
+            rusqlite::params![serde_json::to_string(&payload).unwrap(), f.turn_id.as_str()],
+        )
+        .unwrap();
+    let err = SqliteProductionRepository::get_turn(&f.db, &f.turn_id).unwrap_err();
+    assert!(err.to_string().contains("turn_id"));
+}
+
+#[test]
+fn get_turn_rejects_structured_scope_status_and_base_revision_drift() {
+    let mut f = fixture();
+    let other_campaign_id = Id::from_str("camp-other-scope");
+    let other_conversation_id = Id::from_str("conv-other-scope");
+    let mut other_campaign = Campaign::new(Id::from_str("card-other-scope"), "Other");
+    other_campaign.id = other_campaign_id.clone();
+    other_campaign.conversation_id = Some(other_conversation_id.clone());
+    let mut other_conversation = Conversation::new(None, Some(other_campaign_id.clone()));
+    other_conversation.id = other_conversation_id.clone();
+    SqliteProductionRepository::bootstrap_campaign(&mut f.db, &other_campaign, &other_conversation)
+        .unwrap();
+    f.db.connection()
+        .execute(
+            "UPDATE turns SET campaign_id = ?1, conversation_id = ?2, status = 'committed', base_campaign_revision = 9 WHERE turn_id = ?3",
+            rusqlite::params![
+                other_campaign_id.as_str(),
+                other_conversation_id.as_str(),
+                f.turn_id.as_str()
+            ],
+        )
+        .unwrap();
+    let err = SqliteProductionRepository::get_turn(&f.db, &f.turn_id).unwrap_err();
+    assert!(err.to_string().contains("structured"));
+}
+
+#[test]
+fn get_attempt_rejects_payload_id_drift() {
+    let f = fixture();
+    let mut payload: serde_json::Value =
+        f.db.connection()
+            .query_row(
+                "SELECT payload_json FROM turn_attempts WHERE attempt_id = ?1",
+                [f.attempt_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap();
+    payload["attempt_id"] = serde_json::json!("rehung-attempt");
+    f.db.connection()
+        .execute(
+            "UPDATE turn_attempts SET payload_json = ?1 WHERE attempt_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).unwrap(),
+                f.attempt_id.as_str()
+            ],
+        )
+        .unwrap();
+    let err = SqliteProductionRepository::get_attempt(&f.db, &f.attempt_id).unwrap_err();
+    assert!(err.to_string().contains("attempt_id"));
+}
+
+#[test]
+fn get_attempt_and_parent_turn_reject_structured_ownership_and_field_drift() {
+    let mut f = fixture();
+    let mut second = TurnRecord::new(
+        f.campaign_id.clone(),
+        f.conversation_id.clone(),
+        Id::from_str("input-terminal"),
+        0,
+    );
+    second.turn_id = Id::from_str("turn-terminal-owner");
+    second.status = TurnStatus::Failed;
+    SqliteProductionRepository::save_turn(&mut f.db, &second).unwrap();
+    f.db.connection()
+        .execute(
+            "UPDATE turn_attempts SET turn_id = ?1, variant_id = 'wrong-variant', draft_hash = 'wrong-hash', status = 'committed' WHERE attempt_id = ?2",
+            rusqlite::params![second.turn_id.as_str(), f.attempt_id.as_str()],
+        )
+        .unwrap();
+    let attempt_err = SqliteProductionRepository::get_attempt(&f.db, &f.attempt_id).unwrap_err();
+    assert!(attempt_err.to_string().contains("structured"));
+    let turn_err = SqliteProductionRepository::get_turn(&f.db, &f.turn_id).unwrap_err();
+    assert!(turn_err.to_string().contains("attempt"));
+}
+
+#[test]
+fn save_turn_rejects_rehanging_an_existing_attempt_id() {
+    let mut f = fixture();
+    let existing_attempt = SqliteProductionRepository::get_attempt(&f.db, &f.attempt_id)
+        .unwrap()
+        .unwrap();
+    let mut second = TurnRecord::new(
+        f.campaign_id.clone(),
+        f.conversation_id.clone(),
+        Id::from_str("input-rehang"),
+        0,
+    );
+    second.turn_id = Id::from_str("turn-rehang-target");
+    second.status = TurnStatus::Failed;
+    second.attempts.push(existing_attempt);
+
+    let err = SqliteProductionRepository::save_turn(&mut f.db, &second).unwrap_err();
+    assert!(err.to_string().contains("rehang"));
+    let original = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert!(original.find_attempt(&f.attempt_id).is_some());
 }
 
 #[test]
@@ -296,6 +549,121 @@ fn accept_supports_every_mutation_variant_in_one_transaction() {
             .knowledge_text,
         "钟楼入口藏在雨巷尽头"
     );
+}
+
+#[test]
+fn accept_rejects_knowledge_owned_by_another_existing_campaign() {
+    let mut f = fixture();
+    let other_campaign_id = Id::from_str("camp-other-knowledge");
+    let other_conversation_id = Id::from_str("conv-other-knowledge");
+    let mut other_campaign = Campaign::new(Id::from_str("card-other-knowledge"), "Other");
+    other_campaign.id = other_campaign_id.clone();
+    other_campaign.conversation_id = Some(other_conversation_id.clone());
+    let mut other_conversation = Conversation::new(None, Some(other_campaign_id.clone()));
+    other_conversation.id = other_conversation_id;
+    SqliteProductionRepository::bootstrap_campaign(&mut f.db, &other_campaign, &other_conversation)
+        .unwrap();
+    f.batch.mutations.insert(
+        0,
+        Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
+            entry_id: Id::from_str("knowledge-wrong-campaign"),
+            campaign_id: other_campaign_id,
+            character_id: Id::from_str("character-other"),
+            knowledge_text: "不应跨 Campaign 写入".into(),
+            source: KnowledgeSource::Witnessed,
+            source_character_id: None,
+            turn_number: 1,
+            event_id: None,
+            pinned: false,
+            propagation: PropagationPolicy::Open,
+        })),
+    );
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("knowledge"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
+fn accept_rejects_chronicle_b_in_turn_batch() {
+    let mut f = fixture();
+    for mutation in &mut f.batch.mutations {
+        if let Mutation::UpsertSummary(summary) = mutation {
+            summary.level = 1;
+        }
+    }
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("Chronicle A"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
+fn accept_rejects_leaf_summary_with_covers_or_covered_by() {
+    for use_covered_by in [false, true] {
+        let mut f = fixture();
+        for mutation in &mut f.batch.mutations {
+            if let Mutation::UpsertSummary(summary) = mutation {
+                if use_covered_by {
+                    summary.covered_by = Some(summary.id.clone());
+                } else {
+                    summary.covers.push(summary.id.clone());
+                }
+            }
+        }
+        persist_request_batch(&mut f);
+        let err = SqliteProductionRepository::accept_turn(
+            &mut f.db,
+            request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Chronicle A"));
+        assert_accept_unchanged(&f);
+    }
+}
+
+#[test]
+fn accept_rejects_chronicle_a_with_wrong_source_scope() {
+    let mut f = fixture();
+    for mutation in &mut f.batch.mutations {
+        if let Mutation::UpsertSummary(summary) = mutation {
+            summary.conversation_id = Id::from_str("wrong-conversation");
+        }
+    }
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("scope"));
+    assert_accept_unchanged(&f);
+}
+
+#[test]
+fn accept_rejects_chronicle_a_with_wrong_lineage() {
+    let mut f = fixture();
+    for mutation in &mut f.batch.mutations {
+        if let Mutation::UpsertSummary(summary) = mutation {
+            summary.lineage_id = Some(Id::from_str("wrong-lineage"));
+        }
+    }
+    persist_request_batch(&mut f);
+    let err = SqliteProductionRepository::accept_turn(
+        &mut f.db,
+        request(&f.turn_id, &f.attempt_id, &f.batch, &f.draft_hash),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("lineage"));
+    assert_accept_unchanged(&f);
 }
 
 #[test]

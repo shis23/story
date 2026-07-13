@@ -68,7 +68,7 @@ pub fn migrate_with(db: &mut Database, migrations: &[Migration]) -> Result<Vec<i
             continue;
         }
 
-        apply_one(db, migration).map_err(|e| match e {
+        let applied = apply_one(db, migration).map_err(|e| match e {
             SqliteError::Sqlite(err) => SqliteError::MigrationFailed {
                 version: migration.version,
                 name: migration.name.to_string(),
@@ -76,7 +76,9 @@ pub fn migrate_with(db: &mut Database, migrations: &[Migration]) -> Result<Vec<i
             },
             other => other,
         })?;
-        applied_now.push(migration.version);
+        if applied {
+            applied_now.push(migration.version);
+        }
     }
     Ok(applied_now)
 }
@@ -131,13 +133,24 @@ fn load_applied(db: &Database, version: i64) -> Result<Option<String>> {
     }
 }
 
-fn apply_one(db: &mut Database, migration: &Migration) -> Result<()> {
+fn apply_one(db: &mut Database, migration: &Migration) -> Result<bool> {
     let checksum = migration.checksum();
     let applied_at = chrono::Utc::now().to_rfc3339();
 
     let uow = UnitOfWork::begin(db.connection_mut())?;
     {
         let tx = uow.transaction()?;
+        if let Some(existing) = load_applied_tx(tx, migration.version)? {
+            if existing != checksum {
+                return Err(SqliteError::MigrationChecksumMismatch {
+                    version: migration.version,
+                    expected: existing,
+                    actual: checksum,
+                });
+            }
+            uow.commit()?;
+            return Ok(false);
+        }
         tx.execute_batch(migration.sql)?;
         tx.execute(
             r#"
@@ -148,7 +161,17 @@ fn apply_one(db: &mut Database, migration: &Migration) -> Result<()> {
         )?;
     }
     uow.commit()?;
-    Ok(())
+    Ok(true)
+}
+
+fn load_applied_tx(tx: &rusqlite::Transaction<'_>, version: i64) -> Result<Option<String>> {
+    let mut stmt = tx.prepare("SELECT checksum FROM schema_migrations WHERE version = ?1")?;
+    let mut rows = stmt.query(rusqlite::params![version])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// 当前已应用的最大 version；无则 0。
@@ -179,6 +202,8 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 mod tests {
     use super::*;
     use crate::connection::Database;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
 
     #[test]
     fn migrate_applies_v1_and_is_idempotent() {
@@ -384,5 +409,48 @@ mod tests {
         }];
         let err = migrate_with(&mut db, &non_pos).unwrap_err();
         assert!(matches!(err, SqliteError::InvalidMigrationSet(_)));
+    }
+
+    #[test]
+    fn concurrent_apply_rechecks_version_after_acquiring_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("migration-race.sqlite3");
+        let mut setup = Database::open(&path).unwrap();
+        ensure_migrations_table(&mut setup).unwrap();
+        drop(setup);
+
+        let migration = Migration {
+            version: 77,
+            name: "concurrent_race",
+            sql: "CREATE TABLE IF NOT EXISTS concurrent_race (id INTEGER PRIMARY KEY);",
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let mut db = Database::open(&path).unwrap();
+                let migration = migration.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    assert!(load_applied(&db, migration.version).unwrap().is_none());
+                    barrier.wait();
+                    apply_one(&mut db, &migration)
+                })
+            })
+            .collect();
+
+        for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+            result.expect("both migrators must converge after taking the write lock");
+        }
+
+        let db = Database::open(path).unwrap();
+        let rows: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 77",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }
