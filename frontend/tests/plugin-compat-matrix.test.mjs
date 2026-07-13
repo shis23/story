@@ -56,6 +56,8 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     },
     localStorage: window.localStorage,
     console,
+    setTimeout,
+    clearTimeout,
   }
   sandbox.globalThis = sandbox
 

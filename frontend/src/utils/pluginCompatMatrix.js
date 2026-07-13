@@ -76,7 +76,8 @@ export const PIPELINE_EVENT_ALIAS_MATRIX = [
   { id: 'alias:started', surface: 'events', name: 'started', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.started→GENERATION_STARTED' },
   { id: 'alias:editor_progress', surface: 'events', name: 'editor_progress', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.editor_progress→STREAM_TOKEN' },
   { id: 'alias:draft_ready', surface: 'events', name: 'draft_ready', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.draft_ready→GENERATION_ENDED' },
-  { id: 'alias:committed', surface: 'events', name: 'committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.committed→MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED', reason: 'pipeline_state_machine_may_send_StateChanged_instead' },
+  { id: 'alias:committed', surface: 'events', name: 'committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.committed→MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED', reason: 'derived_for_state_changed_committed_too' },
+  { id: 'alias:state_changed_committed', surface: 'events', name: 'state_changed→committed', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.state_changed{data.state=committed|change.Committed}→committed chain', reason: 'closes_StateChangedCommitted_ambiguity' },
   { id: 'alias:error', surface: 'events', name: 'error', status: SUPPORT.ALIAS, mapsFrom: 'pipeline.error→GENERATION_STOPPED' },
   { id: 'alias:prompt_hook_request', surface: 'events', name: 'prompt_hook_request', status: SUPPORT.INTENTIONALLY_UNSUPPORTED, reason: 'filtered_from_generic_plugin_broadcast' },
 ]

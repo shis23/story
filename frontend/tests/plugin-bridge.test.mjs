@@ -1946,3 +1946,135 @@ test('iframe saveChat resolves with persisted metadata when host acknowledges sa
   assert.equal(savePromise.degraded, false)
   assert.equal(savePromise.persistedAt, 'ts-iframe')
 })
+
+// ─── committed alias + slash pipe hardening + correlation ────────────────────
+
+test('derives committed alias from state_changed with committed state', () => {
+  // The pipeline historically could emit StateChanged{Committed} rather than a
+  // bare committed variant. The host must still derive the committed alias.
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { state: 'committed', session_id: 's1', variant_id: 'v1' },
+  })
+  assert.deepEqual(events.map((e) => e.event), [
+    'pipeline.state_changed',
+    'state_changed',
+    'committed',
+    'MESSAGE_RECEIVED',
+    'CHARACTER_MESSAGE_RENDERED',
+    'CHAT_CHANGED',
+  ])
+})
+
+test('does not derive committed alias from unrelated state_changed states', () => {
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { state: 'streaming', session_id: 's1' },
+  })
+  assert.deepEqual(events.map((e) => e.event), [
+    'pipeline.state_changed',
+    'state_changed',
+  ])
+})
+
+test('derives committed alias from nested StateChanged payload shape', () => {
+  // Some pipeline payloads nest the committed state under a typed Change.
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { change: { Committed: { variant_id: 'v9' } }, session_id: 's1' },
+  })
+  assert.ok(events.some((e) => e.event === 'committed'))
+  assert.ok(events.some((e) => e.event === 'MESSAGE_RECEIVED'))
+  assert.ok(events.some((e) => e.event === 'CHAT_CHANGED'))
+})
+
+test('slash pipe stops at an unknown segment and does not run later segments', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('echo', (rawArgs) => {
+    calls.push(['echo', rawArgs])
+    return rawArgs.toUpperCase()
+  })
+  window.registerSlashCommand('after', (rawArgs, context) => {
+    calls.push(['after', rawArgs, context.pipe])
+    return 'ran-after'
+  })
+
+  // An unknown middle segment must hard-fail and stop the pipeline so the
+  // later registered segment never runs.
+  assert.throws(
+    () => window.triggerSlash('/echo hi | missing | after tail'),
+    /Unsupported slash command: missing/,
+  )
+  assert.deepEqual(calls, [['echo', 'hi']])
+})
+
+test('slash pipe surfaces an unsupported result object for a single unknown command', () => {
+  const { window } = createBridgeSandbox()
+  const result = window.triggerSlash('/totally-unknown arg')
+  assert.equal(result.unsupported, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'unsupported_slash_command')
+  assert.equal(result.command, 'totally-unknown')
+})
+
+test('async slash pipe cancels remaining segments when an upstream segment rejects', async () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+  window.registerSlashCommand('boom', async () => {
+    calls.push('boom')
+    throw new Error('upstream failure')
+  })
+  window.registerSlashCommand('after', () => {
+    calls.push('after')
+    return 'after'
+  })
+
+  await assert.rejects(
+    window.triggerSlash('/boom | after'),
+    /upstream failure/,
+  )
+  assert.deepEqual(calls, ['boom'])
+})
+
+test('host hook bridge ignores late duplicate response id after settle', async () => {
+  const target = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const hookBridge = createPluginHookBridge(
+    { id: 'plugin-a' },
+    {
+      getTarget: () => target,
+      isTrustedSource: (event) => event.source === target,
+      targetOrigin: '*',
+      timeoutMs: 1000,
+    },
+  )
+
+  const payload = { prompt: 'base' }
+  const promise = hookBridge.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+  const request = target.posted.at(-1).message
+
+  // First trusted response settles the hook.
+  assert.equal(
+    hookBridge.handleMessage({
+      source: target,
+      data: { type: MSG_HOOK_RESPONSE, pluginId: 'plugin-a', id: request.id, result: { prompt: 'first' } },
+    }),
+    true,
+  )
+  // A late duplicate response with the same id must be ignored.
+  assert.equal(
+    hookBridge.handleMessage({
+      source: target,
+      data: { type: MSG_HOOK_RESPONSE, pluginId: 'plugin-a', id: request.id, result: { prompt: 'late' } },
+    }),
+    false,
+  )
+
+  assert.deepEqual(await promise, { prompt: 'first' })
+})

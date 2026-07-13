@@ -283,6 +283,30 @@ function createPluginEventPayload(pipelineEvent, options = {}) {
 }
 
 /**
+ * Detect whether a state_changed pipeline event carries a committed state.
+ *
+ * The pipeline historically may emit `StateChanged{Committed}` instead of a
+ * bare `committed` variant. This closes that ambiguity: when the event is a
+ * state_changed carrying `state === 'committed'` (or a nested
+ * `change.Committed` / `Committed` typed payload), the host also derives the
+ * committed alias chain so plugins subscribed to MESSAGE_RECEIVED /
+ * CHARACTER_MESSAGE_RENDERED / CHAT_CHANGED still fire.
+ */
+function derivesCommittedAlias(pipelineEvent) {
+  if (pipelineEvent?.event_type !== 'state_changed') return false
+  const data = pipelineEvent?.data
+  if (!data || typeof data !== 'object') return false
+  const state = typeof data.state === 'string' ? data.state.toLowerCase() : null
+  if (state === 'committed') return true
+  // Nested typed Change shapes: { change: { Committed: {...} } } or
+  // { change: 'Committed' }.
+  const change = data.change
+  if (change && typeof change === 'object' && Object.prototype.hasOwnProperty.call(change, 'Committed')) return true
+  if (typeof change === 'string' && change.toLowerCase() === 'committed') return true
+  return false
+}
+
+/**
  * 将 Tauri WritingEvent 映射为插件可订阅事件。
  *
  * 同时发送 StoryForge 原生事件名（pipeline.xxx / xxx）和少量 ST 常用别名；
@@ -298,6 +322,11 @@ export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
     pipelineEvent.event_type,
     ...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []),
   ]
+  // state_changed → committed alias derivation (closes the StateChanged{Committed}
+  // ambiguity). Inject the committed alias chain so subscribed ST plugins fire.
+  if (derivesCommittedAlias(pipelineEvent)) {
+    names.push('committed', ...(ST_EVENT_ALIASES.committed || []))
+  }
 
   return uniqueEventNames(names)
     .filter((name) => {
@@ -1081,7 +1110,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     // answers; if it does not (or the host crashed), fall back to degraded.
     const timer = setTimeout(function() {
       finish({ ok: true, degraded: true, reason: 'local_mirror_only_no_host_persist', persistedAt: null })
-    }, 2000)
+    }, 500)
 
     _call('chat.save', { chat: _chat })
       .then(function(result) {
