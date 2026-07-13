@@ -367,24 +367,9 @@ pub fn run_cutover_with_fault(
             schema_version,
             ref manifest_hash,
         } => {
-            // Already cut over: verify and return. No JSON mutation.
-            let manifest = readiness::validate_source_manifest(&plan.data_dir)?;
-            // Reopen and audit through the production path.
-            audit_published_database(&plan.db_path)?;
-            let report = CutoverReport {
-                manifest_hash: manifest_hash.clone(),
-                cards: manifest.cards,
-                campaigns: manifest.campaigns,
-                instances: manifest.instances,
-                knowledge: manifest.knowledge,
-                tasks: manifest.tasks,
-                summaries: manifest.summaries,
-                conversations: manifest.conversations,
-                turns: manifest.turns,
-                schema_version,
-                import_skipped_duplicate: false,
-                backup_label: String::new(),
-            };
+            // Already cut over: audit the SQLite DB only. Never re-open JSON
+            // source trees — SQLite is the sole authority after the marker.
+            let report = audit_sqlite_authoritative(plan, schema_version, manifest_hash)?;
             return Ok(CutoverOutcome::AlreadyCutover(report));
         }
         MarkerStatus::JsonAuthoritative | MarkerStatus::Absent => {
@@ -402,6 +387,24 @@ pub fn run_cutover_with_fault(
     // cutover. On Windows this prevents concurrent rename/replace of the
     // database; on Unix flock provides the same.
     let _lock_guard = acquire_cutover_lock(plan)?;
+
+    // Re-check authority after lock to close the TOCTOU window between the
+    // pre-lock inspect and exclusive lock acquisition.
+    match inspect_marker(plan) {
+        MarkerStatus::SqliteAuthoritative {
+            schema_version,
+            ref manifest_hash,
+        } => {
+            let report = audit_sqlite_authoritative(plan, schema_version, manifest_hash)?;
+            return Ok(CutoverOutcome::AlreadyCutover(report));
+        }
+        MarkerStatus::JsonAuthoritative | MarkerStatus::Absent => {}
+        MarkerStatus::Stale { reason } => {
+            return Err(SqliteError::Other(format!(
+                "stale backend marker after lock; refusing cutover until resolved: {reason}"
+            )));
+        }
+    }
 
     if fault == CutoverFault::AfterLock {
         return Err(SqliteError::Other(
@@ -554,8 +557,8 @@ fn verify_imported_database(
     )?;
     check_count(db, "turns", "turn_id", manifest.turns)?;
 
-    // Recompute manifest hash from the imported data and compare.
-    // We re-read the import_runs row which stores the source_manifest_hash.
+    // Recompute a content hash from the live database payloads and compare it
+    // to the source manifest. Do not trust the importer's self-written row alone.
     let stored_hash: Option<String> = db
         .connection()
         .query_row(
@@ -565,16 +568,120 @@ fn verify_imported_database(
         )
         .ok()
         .flatten();
-    match stored_hash {
-        Some(hash) if hash == manifest.manifest_hash => Ok(()),
-        Some(hash) => Err(SqliteError::Other(format!(
-            "import manifest hash mismatch: db={hash}, source={}",
-            manifest.manifest_hash
-        ))),
-        None => Err(SqliteError::Other(
+    if let Some(hash) = &stored_hash {
+        if hash != &manifest.manifest_hash {
+            return Err(SqliteError::Other(format!(
+                "import_runs manifest hash mismatch: db={hash}, source={}",
+                manifest.manifest_hash
+            )));
+        }
+    } else {
+        return Err(SqliteError::Other(
             "no completed import_runs row found for verification".into(),
-        )),
+        ));
     }
+
+    let content_hash = recompute_db_content_hash(db)?;
+    if content_hash != manifest.manifest_hash {
+        return Err(SqliteError::Other(format!(
+            "database content hash mismatch: db={content_hash}, source={}",
+            manifest.manifest_hash
+        )));
+    }
+    Ok(())
+}
+
+fn audit_sqlite_authoritative(
+    plan: &CutoverPlan,
+    schema_version: i64,
+    manifest_hash: &str,
+) -> Result<CutoverReport> {
+    audit_published_database(&plan.db_path)?;
+    let db = Database::open(&plan.db_path)?;
+    let version = crate::migrations::current_version(&db)?;
+    if version != schema_version {
+        return Err(SqliteError::Other(format!(
+            "database schema version {version} != marker version {schema_version}"
+        )));
+    }
+    Ok(CutoverReport {
+        manifest_hash: manifest_hash.to_string(),
+        cards: table_count(&db, "character_cards")?,
+        campaigns: table_count(&db, "campaigns")?,
+        instances: table_count(&db, "character_instances")?,
+        knowledge: table_count(&db, "character_knowledge")?,
+        tasks: table_count(&db, "story_tasks")?,
+        summaries: table_count(&db, "round_summaries")?,
+        conversations: table_count(&db, "conversations")?,
+        turns: table_count(&db, "turns")?,
+        schema_version,
+        import_skipped_duplicate: false,
+        backup_label: String::new(),
+    })
+}
+
+fn table_count(db: &Database, table: &str) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = db
+        .connection()
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(|e| SqliteError::Other(format!("count {table}: {e}")))?;
+    Ok(count as usize)
+}
+
+/// Rebuild the source-manifest hash from stored payload_json rows so verification
+/// is independent of the importer's self-reported import_runs value.
+fn recompute_db_content_hash(db: &Database) -> Result<String> {
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    fn load_payloads(db: &Database, table: &str) -> Result<Vec<Value>> {
+        let sql = format!("SELECT payload_json FROM {table}");
+        let mut stmt = db.connection().prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            out.push(serde_json::from_str(&raw).map_err(|e| {
+                SqliteError::Other(format!("corrupt payload_json in {table}: {e}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    fn hash_named_array(hasher: &mut Sha256, name: &str, items: &[Value]) {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        let mut encoded: Vec<String> = items
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .collect();
+        encoded.sort();
+        for item in encoded {
+            hasher.update(item.as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+
+    let cards = load_payloads(db, "character_cards")?;
+    let campaigns = load_payloads(db, "campaigns")?;
+    let instances = load_payloads(db, "character_instances")?;
+    let knowledge = load_payloads(db, "character_knowledge")?;
+    let tasks = load_payloads(db, "story_tasks")?;
+    let summaries = load_payloads(db, "round_summaries")?;
+    let turns = load_payloads(db, "turns")?;
+    let conversations = load_payloads(db, "conversations")?;
+
+    let mut hasher = Sha256::new();
+    hash_named_array(&mut hasher, "cards", &cards);
+    hash_named_array(&mut hasher, "campaigns", &campaigns);
+    hash_named_array(&mut hasher, "instances", &instances);
+    hash_named_array(&mut hasher, "knowledge", &knowledge);
+    hash_named_array(&mut hasher, "tasks", &tasks);
+    hash_named_array(&mut hasher, "round_summaries", &summaries);
+    hash_named_array(&mut hasher, "turns", &turns);
+    hash_named_array(&mut hasher, "conversations", &conversations);
+    Ok(hex_encode(hasher.finalize()))
 }
 
 fn check_count(db: &Database, table: &str, id_column: &str, expected: usize) -> Result<()> {

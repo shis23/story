@@ -5,12 +5,13 @@
 //! exported directory. The export is **explicit, versioned, validated, and
 //! secret-safe**: it never deletes the SQLite DB or original JSON backup.
 //!
-//! The export reads from the SQLite database and writes JSON files into a
-//! target directory. It includes an export manifest with schema/backend
-//! versions, payload hashes, and an unsupported-fields list.
+//! The export reads from the SQLite database and stages files under a temporary
+//! directory, then atomically renames the staging tree into the final export
+//! directory. Absolute paths, path-escape sequences, and secret-shaped values
+//! are rejected or redacted.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rusqlite::Connection;
 use rusqlite::TransactionBehavior;
@@ -50,8 +51,9 @@ pub struct ReverseExportResult {
 
 /// Export a SQLite database to a portable JSON directory layout.
 ///
-/// The target directory must not be inside the live database path. Original
-/// JSON or SQLite data is never modified or deleted.
+/// The target directory must not be the live database directory. Original
+/// JSON or SQLite data is never modified or deleted. The export is staged
+/// under `<export_dir>.tmp` and published atomically.
 pub fn export_sqlite_to_json(
     db: &Database,
     export_dir: impl AsRef<Path>,
@@ -63,22 +65,46 @@ pub fn export_sqlite_to_json(
         .path()
         .parent()
         .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
-    let export_canon = fs::canonicalize(&export_dir)
-        .or_else(|_| {
-            fs::create_dir_all(&export_dir)?;
-            fs::canonicalize(&export_dir)
-        })
-        .map_err(|e| SqliteError::Other(format!("cannot resolve export dir: {e}")))?;
-    if let Some(live) = live_parent
-        && live == export_canon
-    {
-        return Err(SqliteError::Other(
-            "refusing to export into the live database directory".into(),
-        ));
+    if export_dir.exists() {
+        let export_canon = fs::canonicalize(&export_dir)
+            .map_err(|e| SqliteError::Other(format!("cannot resolve export dir: {e}")))?;
+        if let Some(live) = &live_parent
+            && live == &export_canon
+        {
+            return Err(SqliteError::Other(
+                "refusing to export into the live database directory".into(),
+            ));
+        }
+    } else if let Some(parent) = export_dir.parent() {
+        let parent_canon = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        if let Some(live) = &live_parent
+            && live == &parent_canon
+            && export_dir
+                .file_name()
+                .is_some_and(|name| name == live.file_name().unwrap_or_default())
+        {
+            return Err(SqliteError::Other(
+                "refusing to export into the live database directory".into(),
+            ));
+        }
     }
 
-    fs::create_dir_all(&export_dir)?;
-    fs::create_dir_all(export_dir.join("conversations"))?;
+    // Stage under a sibling temp directory, then atomically publish.
+    let stage_dir = {
+        let parent = export_dir.parent().unwrap_or_else(|| Path::new("."));
+        let name = export_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("export");
+        parent.join(format!(
+            ".{name}.staging-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+        ))
+    };
+    if stage_dir.exists() {
+        fs::remove_dir_all(&stage_dir)?;
+    }
+    fs::create_dir_all(stage_dir.join("conversations"))?;
 
     // Single read-only transaction for a consistent snapshot.
     let mut conn = Connection::open(db.path())?;
@@ -107,16 +133,16 @@ pub fn export_sqlite_to_json(
     let turns = export_table_array(&tx, "turns", "turn_id", &mut unsupported)?;
 
     // Conversations are stored as individual files matching the JSON layout.
-    let conversations = export_conversations(&tx, &export_dir, &mut unsupported)?;
+    let conversations = export_conversations(&tx, &stage_dir, &mut unsupported)?;
 
-    // Write array files.
-    write_array_file(&export_dir, "cards.json", &cards)?;
-    write_array_file(&export_dir, "campaigns.json", &campaigns)?;
-    write_array_file(&export_dir, "instances.json", &instances)?;
-    write_array_file(&export_dir, "knowledge.json", &knowledge)?;
-    write_array_file(&export_dir, "tasks.json", &tasks)?;
-    write_array_file(&export_dir, "round_summaries.json", &summaries)?;
-    write_array_file(&export_dir, "turns.json", &turns)?;
+    // Write array files into the staging tree only.
+    write_array_file(&stage_dir, "cards.json", &cards)?;
+    write_array_file(&stage_dir, "campaigns.json", &campaigns)?;
+    write_array_file(&stage_dir, "instances.json", &instances)?;
+    write_array_file(&stage_dir, "knowledge.json", &knowledge)?;
+    write_array_file(&stage_dir, "tasks.json", &tasks)?;
+    write_array_file(&stage_dir, "round_summaries.json", &summaries)?;
+    write_array_file(&stage_dir, "turns.json", &turns)?;
 
     tx.commit()?;
 
@@ -146,7 +172,7 @@ pub fn export_sqlite_to_json(
         unsupported_fields: unsupported,
     };
 
-    let manifest_path = export_dir.join(EXPORT_MANIFEST_FILENAME);
+    let staged_manifest_path = stage_dir.join(EXPORT_MANIFEST_FILENAME);
     let manifest = serde_json::json!({
         "created_at": chrono::Utc::now().to_rfc3339(),
         "direction": "sqlite-to-json-rollback",
@@ -168,10 +194,33 @@ pub fn export_sqlite_to_json(
         "note": "Import this directory via the JSON importer to roll back to JSON backend.",
     });
     fs::write(
-        &manifest_path,
+        &staged_manifest_path,
         serde_json::to_vec_pretty(&manifest).map_err(SqliteError::from)?,
     )?;
 
+    // Atomic publish: move any previous export aside, then rename the staging
+    // tree into place. Stale conversation files cannot remain because the whole
+    // tree is replaced.
+    if export_dir.exists() {
+        let aside = {
+            let parent = export_dir.parent().unwrap_or_else(|| Path::new("."));
+            let name = export_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("export");
+            parent.join(format!(
+                ".{name}.pre-export-{}",
+                chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+            ))
+        };
+        fs::rename(&export_dir, &aside)?;
+    }
+    if let Some(parent) = export_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&stage_dir, &export_dir)?;
+
+    let manifest_path = export_dir.join(EXPORT_MANIFEST_FILENAME);
     Ok(ReverseExportResult {
         report,
         export_dir,
@@ -230,7 +279,7 @@ fn export_table_array(
 
 fn export_conversations(
     tx: &rusqlite::Transaction<'_>,
-    export_dir: &Path,
+    stage_dir: &Path,
     unsupported: &mut Vec<String>,
 ) -> Result<Vec<Value>> {
     let exists: Option<i64> = tx
@@ -255,9 +304,10 @@ fn export_conversations(
     })?;
 
     let mut out = Vec::new();
-    let conv_dir = export_dir.join("conversations");
+    let conv_dir = stage_dir.join("conversations");
     for row in rows {
         let (id, payload) = row?;
+        let safe_id = sanitize_conversation_filename(&id)?;
         let mut value: Value = serde_json::from_str(&payload).map_err(|e| {
             SqliteError::Other(format!(
                 "corrupt payload_json in conversations id={id}: {e}"
@@ -270,8 +320,22 @@ fn export_conversations(
         }
         redact_secret_values(&mut value, unsupported);
 
-        // Write the individual conversation file.
-        let conv_path = conv_dir.join(format!("{id}.json"));
+        // Write the individual conversation file under the staging tree only.
+        let conv_path = conv_dir.join(format!("{safe_id}.json"));
+        // Defense-in-depth: reject any path that would escape the conversations dir.
+        let canon_parent = fs::canonicalize(&conv_dir).unwrap_or_else(|_| conv_dir.clone());
+        if let Some(parent) = conv_path.parent() {
+            let parent_canon = if parent.exists() {
+                fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+            } else {
+                parent.to_path_buf()
+            };
+            if parent_canon != canon_parent && parent != conv_dir {
+                return Err(SqliteError::Other(format!(
+                    "conversation path escaped staging directory: {id}"
+                )));
+            }
+        }
         fs::write(
             &conv_path,
             serde_json::to_vec_pretty(&value).map_err(SqliteError::from)?,
@@ -279,6 +343,79 @@ fn export_conversations(
         out.push(value);
     }
     Ok(out)
+}
+
+/// Reject path-escape and absolute path shapes in conversation ids before they
+/// are used as filenames.
+fn sanitize_conversation_filename(id: &str) -> Result<String> {
+    if id.is_empty() {
+        return Err(SqliteError::Other(
+            "conversation id is empty; refusing export".into(),
+        ));
+    }
+    if id.contains('\0') {
+        return Err(SqliteError::Other(
+            "conversation id contains NUL; refusing export".into(),
+        ));
+    }
+    let path = Path::new(id);
+    if path.is_absolute() {
+        return Err(SqliteError::Other(format!(
+            "conversation id looks absolute; refusing export: {id}"
+        )));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let s = part.to_string_lossy();
+                if s == ".." || s == "." {
+                    return Err(SqliteError::Other(format!(
+                        "conversation id has path components; refusing export: {id}"
+                    )));
+                }
+                components.push(s.into_owned());
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(SqliteError::Other(format!(
+                    "conversation id has path components; refusing export: {id}"
+                )));
+            }
+        }
+    }
+    if components.len() != 1 {
+        return Err(SqliteError::Other(format!(
+            "conversation id must be a single path segment; refusing export: {id}"
+        )));
+    }
+    let name = &components[0];
+    // Keep only portable filename characters.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        // Still safe as a single segment after component checks; replace unsafe chars.
+        let sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+            return Err(SqliteError::Other(format!(
+                "conversation id sanitizes to empty/unsafe name: {id}"
+            )));
+        }
+        return Ok(sanitized);
+    }
+    Ok(name.clone())
 }
 
 /// Recursively redact values whose keys look like secrets, and free-text that

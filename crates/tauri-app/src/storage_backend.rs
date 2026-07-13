@@ -4,13 +4,10 @@
 //! SQLite is explicitly selected, runs the fail-closed cutover. JSON remains
 //! the production default — no dual-write, no automatic data deletion.
 //!
-//! The existing JSON stores (`CampaignStore`, `TurnStore`, `ConversationStore`)
-//! are **not** replaced when SQLite is selected. Instead, the cutover produces
-//! a SQLite database that is authoritative for future SQLite-native operations,
-//! while the JSON stores continue to be used until a full store migration is
-//! completed in a separate workstream. This wiring is deliberately additive:
-//! it makes the backend selection observable and verified without changing the
-//! runtime data path.
+//! After a successful cutover (or when a valid SQLite marker already exists),
+//! `sqlite_runtime` is activated and becomes the sole authority for
+//! Campaign / Conversation / Turn Accept and recovery. JSON stores are not
+//! consulted for those operations and are never dual-written.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -141,6 +141,27 @@ fn idempotent_restart_returns_already_cutover() {
     }
 }
 
+#[test]
+fn already_cutover_survives_deleted_json_source() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = make_request(dir.path());
+    run_cutover(&request).unwrap();
+
+    // Destroy the original JSON tree. SQLite is authoritative; restart must not
+    // re-validate JSON or fail to start.
+    fs::remove_file(dir.path().join("cards.json")).unwrap();
+    fs::remove_file(dir.path().join("campaigns.json")).unwrap();
+    fs::remove_dir_all(dir.path().join("conversations")).unwrap();
+
+    let outcome = recover_or_verify(&request).unwrap();
+    assert!(matches!(outcome, CutoverOutcome::AlreadyCutover(_)));
+    assert!(matches!(
+        inspect_marker(&request.plan),
+        MarkerStatus::SqliteAuthoritative { .. }
+    ));
+}
+
 // ── Fault injection: JSON stays authoritative ──────────────────────
 
 #[test]

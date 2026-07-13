@@ -244,3 +244,42 @@ fn reverse_export_refuses_live_db_directory() {
     let err = export_sqlite_to_json(&db, dir.path()).unwrap_err();
     assert!(err.to_string().contains("refusing"));
 }
+
+#[test]
+fn reverse_export_replaces_stale_conversation_files_atomically() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let request = CutoverRequest {
+        plan: CutoverPlan::new(dir.path(), dir.path().join("storyforge.sqlite3")),
+        label: "atomic-export".into(),
+    };
+    run_cutover(&request).unwrap();
+
+    let export_dir = TempDir::new().unwrap();
+    // Seed a stale conversation that must not survive publish.
+    fs::create_dir_all(export_dir.path().join("conversations")).unwrap();
+    fs::write(
+        export_dir.path().join("conversations").join("stale.json"),
+        b"{\"id\":\"stale\"}",
+    )
+    .unwrap();
+
+    let db = Database::open(dir.path().join("storyforge.sqlite3")).unwrap();
+    export_sqlite_to_json(&db, export_dir.path()).unwrap();
+
+    assert!(
+        !export_dir
+            .path()
+            .join("conversations")
+            .join("stale.json")
+            .exists(),
+        "stale conversation survived non-atomic export"
+    );
+    assert!(
+        export_dir
+            .path()
+            .join("conversations")
+            .join("conv-1.json")
+            .exists()
+    );
+}

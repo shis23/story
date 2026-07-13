@@ -12,8 +12,19 @@ Connected the existing SQLite migration, repository, publication, readiness, and
 importer primitives to the application as an **explicit opt-in backend**. The
 implementation provides a typed backend selector, a fail-closed JSON → SQLite
 cutover coordinator, startup recovery, a versioned authority marker, a SQLite →
-JSON reverse export, and application wiring — all without changing the default
-backend, without JSON/SQLite dual-write, and without deleting user data.
+JSON reverse export, and a **real production storage boundary** for Accept /
+recovery / active-turn barrier — all without changing the default backend,
+without JSON/SQLite dual-write, and without deleting user data.
+
+Architecture-review hardening (same branch) closed the previous blockers:
+
+1. `resolve_backend()` is now called from `run()` before recovery;
+2. SQLite Accept / recovery / barrier no longer consult JSON stores;
+3. already-cutover restart audits SQLite only (deleted JSON still starts);
+4. cutover rechecks authority after lock (TOCTOU closed);
+5. verification recomputes DB content hash (not importer self-report alone);
+6. reverse export stages then atomically publishes (no stale conversation residue);
+7. conversation filenames reject path escape / absolute shapes.
 
 ## Architecture
 
@@ -75,17 +86,20 @@ remaining authoritative until the **marker is written last**:
 - Refuses to export into the live database directory.
 - Never mutates the live database (verified by byte-level hash comparison).
 
-### Application wiring (`crates/tauri-app/src/storage_backend.rs`)
+### Application wiring
 
-- `resolve_backend(data_dir)` — resolves and pins the backend at startup.
-  When SQLite is selected, runs `recover_or_verify`; when JSON (default),
-  opens no database.
-- `check_marker_status(data_dir)` — read-only marker inspection.
-- `BackendResolution` — result struct with pinned backend, optional DB path,
-  diagnostics, and `cutover_performed` flag.
-- **No JSON store is replaced or bypassed.** The wiring is additive: it makes
-  the backend selection observable and verified without changing the runtime
-  data path. The existing `TurnLifecycleService` semantics are preserved.
+- `storage_backend::resolve_backend(data_dir)` — called from `run()` before
+  `AppState` recovery. When SQLite is selected, runs `recover_or_verify` and
+  activates the process-owned DB handle.
+- `sqlite_runtime` — process-owned `Mutex<Database>` boundary:
+  - `accept_by_variant` → `SqliteProductionRepository::accept_turn`
+  - `recover_turns_on_startup` → `fail_incomplete_turns` (atomic accept model)
+  - `get_active_turn` for turn barrier
+  - `save_turn` / `save_conversation` / `save_campaign` / list helpers
+- `commit_turn_attempt` and `recover_turns_on_startup` branch on
+  `sqlite_runtime::is_sqlite_active()` and **never fall back to JSON** when
+  SQLite is authoritative.
+- JSON remains the default path when the selector is unset.
 
 ## Cutover/rollback state machine
 
@@ -156,14 +170,14 @@ proves JSON remains authoritative and the temp DB is cleaned up:
 | Unit (lib) | 30 |
 | `backend_selection` | 7 |
 | `chronicle_publication` | 20 |
-| `cutover` | 15 |
+| `cutover` | 16 |
 | `importer_diagnostics` | 4 |
 | `migration_concurrency` | 1 |
 | `migration_readiness` | 18 |
 | `platform_locking` | 5 |
 | `production_uow` | 25 |
-| `reverse_export` | 5 |
-| **Total** | **130 passed, 0 failed** |
+| `reverse_export` | 6 |
+| **Total** | **132 passed, 0 failed** |
 
 `cargo test -p storyforge --lib`:
 
@@ -179,7 +193,7 @@ proves JSON remains authoritative and the temp DB is cleaned up:
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
-| `cargo test -p storyforge-infra-sqlite` | PASS: 130 passed |
+| `cargo test -p storyforge-infra-sqlite` | PASS: 132 passed |
 | `cargo test -p storyforge --lib turn_lifecycle` | PASS: 22 passed |
 | `cargo test -p storyforge --lib campaign_bundle` | PASS: 13 passed |
 | `cargo test -p storyforge --lib` | PASS: 251 passed, 3 ignored |
@@ -223,26 +237,20 @@ After initial implementation, an independent review closed the following gaps:
 
 ## Remaining risks
 
-1. **Store migration not completed**: the existing JSON stores
-   (`CampaignStore`, `TurnStore`, `ConversationStore`) are not yet replaced by
-   SQLite-backed implementations at runtime. The cutover produces an
-   authoritative SQLite database, but the runtime still uses JSON stores until
-   a separate workstream replaces them. This is by design for this slice.
+1. **Draft pipeline path still largely JSON-shaped**: Accept / recovery /
+   active-turn barrier are SQLite-authoritative after opt-in, but many pre-accept
+   draft/write command handlers still construct JSON stores. Full end-to-end
+   draft creation under SQLite (append_ai_draft / postprocess mutate) needs a
+   follow-up store migration for every write path, not only Accept.
 2. **Concurrent import test flake**: `importer::tests::concurrent_same_manifest_converges_to_one_completed_run`
    can occasionally hit `SQLITE_BUSY` under high contention (busy_timeout=5000ms).
-   This is a pre-existing test timing issue, not a correctness regression — the
-   test passes reliably in isolation and the production path handles busy
-   retries via `busy_timeout`.
+   Pre-existing timing issue; production uses busy_timeout retries.
 3. **Export redaction is pattern-based**: secret key names outside the deny-list
-   or novel credential shapes may still appear. The deny-list covers common
-   patterns (`api_key`, `password`, `token`, `sk-…`, JWT, `bearer`).
-4. **Windows lock granularity**: the cutover lock uses share-deny-write on
-   Windows, which prevents concurrent cutover but does not use a true exclusive
-   lock. Concurrent app instances could still open the database for reads. The
-   ADR's single-app-instance assumption holds.
-5. **Multi-process long-running stress**: tests cover two concurrent cutover
-   threads and two-connection accept races; longer multi-process stress is
-   future work.
+   or novel credential shapes may still appear.
+4. **Windows lock granularity**: cutover lock uses share-deny-write; ADR single
+   app instance assumption holds.
+5. **Multi-process long-running stress** beyond concurrent cutover/accept races
+   is future work.
 
 ## Commit list
 

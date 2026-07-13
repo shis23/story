@@ -166,6 +166,126 @@ impl SqliteProductionRepository {
         load_validated_turn(db.connection(), turn_id)
     }
 
+    /// Resolve a turn by any attempt's variant_id (Accept entrypoint).
+    pub fn get_turn_by_variant(db: &Database, variant_id: &Id) -> Result<Option<TurnRecord>> {
+        let turn_id: Option<String> = db
+            .connection()
+            .query_row(
+                "SELECT turn_id FROM turn_attempts WHERE variant_id = ?1 LIMIT 1",
+                [variant_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match turn_id {
+            Some(id) => load_validated_turn(db.connection(), &Id::from_str(id)),
+            None => Ok(None),
+        }
+    }
+
+    /// Active (non-terminal) turns for a campaign, if any.
+    pub fn get_active_turn(db: &Database, campaign_id: &Id) -> Result<Option<TurnRecord>> {
+        let turn_id: Option<String> = db
+            .connection()
+            .query_row(
+                r#"
+                SELECT turn_id FROM turns
+                WHERE campaign_id = ?1
+                  AND status IN ('generating', 'draft_ready', 'deriving_state',
+                                 'awaiting_acceptance', 'committing')
+                LIMIT 1
+                "#,
+                [campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match turn_id {
+            Some(id) => load_validated_turn(db.connection(), &Id::from_str(id)),
+            None => Ok(None),
+        }
+    }
+
+    /// All non-terminal turns across campaigns (startup recovery / barrier).
+    pub fn list_active_turns(db: &Database) -> Result<Vec<TurnRecord>> {
+        let mut stmt = db.connection().prepare(
+            r#"
+            SELECT turn_id FROM turns
+            WHERE status IN ('generating', 'draft_ready', 'deriving_state',
+                             'awaiting_acceptance', 'committing')
+            ORDER BY updated_at, turn_id
+            "#,
+        )?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for id in ids {
+            let id = id?;
+            if let Some(turn) = load_validated_turn(db.connection(), &Id::from_str(id))? {
+                out.push(turn);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persist a conversation draft/final graph outside of accept (pipeline path).
+    pub fn save_conversation(db: &mut Database, conversation: &Conversation) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        write_conversation(tx, conversation)?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Persist a campaign outside of accept (setup / non-accept mutations).
+    pub fn save_campaign(db: &mut Database, campaign: &Campaign) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        // Ensure placeholder card exists for FK.
+        tx.execute(
+            "INSERT OR IGNORE INTO character_cards (card_id, source_character_id, name, imported_at, payload_json) VALUES (?1, NULL, 'sqlite-production-placeholder', NULL, '{}')",
+            [campaign.card_id.as_str()],
+        )?;
+        write_campaign(tx, campaign)?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Mark every non-terminal turn Failed. Used by SQLite startup recovery where
+    /// accept is atomic (no multi-file Committing journal to replay).
+    pub fn fail_incomplete_turns(db: &mut Database) -> Result<usize> {
+        migrations::migrate(db)?;
+        let active = Self::list_active_turns(db)?;
+        if active.is_empty() {
+            return Ok(0);
+        }
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let mut count = 0usize;
+        for mut turn in active {
+            // Committing should be rare under atomic accept; still fail-closed.
+            turn.status = TurnStatus::Failed;
+            turn.failure_reason =
+                Some("sqlite recovery: incomplete turn failed after process restart".into());
+            for attempt in &mut turn.attempts {
+                if matches!(
+                    attempt.status,
+                    AttemptStatus::Generating
+                        | AttemptStatus::DraftReady
+                        | AttemptStatus::DerivingState
+                        | AttemptStatus::AwaitingAcceptance
+                        | AttemptStatus::Committing
+                ) {
+                    attempt.status = AttemptStatus::Failed;
+                }
+            }
+            turn.touch();
+            write_turn(tx, &turn)?;
+            count += 1;
+        }
+        uow.commit()?;
+        Ok(count)
+    }
+
     pub fn get_attempt(db: &Database, attempt_id: &Id) -> Result<Option<TurnAttempt>> {
         load_validated_attempt(db.connection(), attempt_id)
     }

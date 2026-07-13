@@ -6,6 +6,7 @@ mod global_regex_store;
 mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
+pub mod sqlite_runtime;
 mod storage;
 pub mod storage_backend;
 pub mod turn_coordinator;
@@ -171,6 +172,18 @@ fn get_turn_store() -> &'static turn_store::TurnStore {
 ///    Committing 不在此步处理（避免覆盖第 1 步未完成的恢复）。
 /// 3. Committed/Degraded/Failed/Abandoned 态 Turn：不动。
 fn recover_turns_on_startup(app_state: &AppState) {
+    // SQLite accept is atomic: recover by failing incomplete pipeline turns.
+    // Never fall back to JSON stores when SQLite is authoritative.
+    if sqlite_runtime::is_sqlite_active() {
+        match sqlite_runtime::recover_turns_on_startup() {
+            Ok(n) if n > 0 => {
+                tracing::warn!(count = n, "sqlite recovery failed incomplete turns")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("sqlite recovery failed: {e}"),
+        }
+        return;
+    }
     let service = turn_lifecycle::TurnLifecycleService::new(
         get_campaign_store(),
         get_turn_store(),
@@ -216,6 +229,22 @@ fn reject_if_active_turn_in(
     turn_store: &turn_store::TurnStore,
     campaign_id: &Id,
 ) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        match sqlite_runtime::get_active_turn(campaign_id) {
+            Ok(Some(turn)) => {
+                return Err(TauriCommandError::validation(format!(
+                    "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
+                    turn.turn_id, turn.status
+                )));
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(TauriCommandError::internal(format!(
+                    "sqlite active turn lookup failed: {e}"
+                )));
+            }
+        }
+    }
     if let Some(turn) = turn_store.get_active_turn(campaign_id) {
         return Err(TauriCommandError::validation(format!(
             "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
@@ -6201,6 +6230,14 @@ async fn commit_turn_attempt(
     let state_for_accept = state.clone();
     let campaign_id_for_accept = campaign_id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        if sqlite_runtime::is_sqlite_active() {
+            return sqlite_runtime::accept_by_variant(
+                &campaign_id_for_accept,
+                &conv_id,
+                &node_id,
+                force_accept,
+            );
+        }
         let service = turn_lifecycle::TurnLifecycleService::new(
             get_campaign_store(),
             get_turn_store(),
@@ -10281,6 +10318,33 @@ async fn mvu_execute_result(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Resolve storage backend before any store recovery. JSON remains default;
+    // explicit SQLite selection runs fail-closed cutover and activates the
+    // process-owned SQLite production boundary (no dual-write).
+    let data_dir = get_app_data_dir();
+    match storage_backend::resolve_backend(&data_dir) {
+        Ok(resolution) => {
+            tracing::info!(
+                backend = resolution.diagnostics.backend,
+                source = resolution.diagnostics.source,
+                schema_version = ?resolution.diagnostics.schema_version,
+                cutover = resolution.cutover_performed,
+                "storage backend resolved"
+            );
+            if let Some(db_path) = resolution.db_path
+                && let Err(e) = sqlite_runtime::activate(&db_path)
+            {
+                tracing::error!("failed to activate sqlite backend: {e}");
+                // Fail closed: do not continue with JSON when SQLite was selected.
+                panic!("sqlite backend activation failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("storage backend resolution failed: {e}");
+            panic!("storage backend resolution failed: {e}");
+        }
+    }
+
     // 先构造 AppState（含 log_store），再初始化 tracing 接入 LogStore
     let app_state = Arc::new(AppState::new());
     storyforge_app_logging::init_tracing(app_state.log_store.clone());

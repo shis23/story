@@ -1,0 +1,275 @@
+//! Process-owned SQLite production storage boundary.
+//!
+//! When the backend selector chooses SQLite, this module owns the open
+//! database handle and routes Accept / recovery / campaign / conversation /
+//! turn operations through `SqliteProductionRepository`. JSON stores are not
+//! consulted and no dual-write occurs.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use storyforge_domain::Id;
+use storyforge_domain::campaign::Campaign;
+use storyforge_domain::conversation::Conversation;
+use storyforge_domain::turn::{AttemptStatus, QualitySeverity, TurnRecord, TurnStatus};
+use storyforge_infra_sqlite::Database;
+use storyforge_infra_sqlite::production::{
+    AcceptOutcome as SqliteAcceptOutcome, AcceptTurnRequest, SqliteProductionRepository,
+    compute_draft_hash,
+};
+use storyforge_infra_sqlite::{current_version, migrate};
+
+/// Process-owned SQLite handle. Opened once when SQLite is selected.
+static SQLITE_DB: OnceLock<Mutex<Database>> = OnceLock::new();
+static SQLITE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Whether the process is running with SQLite as the authoritative backend.
+pub fn is_sqlite_active() -> bool {
+    SQLITE_DB.get().is_some()
+}
+
+/// Open and pin the SQLite database for this process. Fail closed if the path
+/// cannot be opened or migrated.
+pub fn activate(db_path: impl AsRef<Path>) -> Result<(), String> {
+    if SQLITE_DB.get().is_some() {
+        return Ok(());
+    }
+    let path = db_path.as_ref().to_path_buf();
+    let mut db = Database::open(&path).map_err(|e| format!("open sqlite: {e}"))?;
+    migrate(&mut db).map_err(|e| format!("migrate sqlite: {e}"))?;
+    let _ = current_version(&db).map_err(|e| format!("schema version: {e}"))?;
+    SQLITE_PATH
+        .set(path)
+        .map_err(|_| "sqlite path already set".to_string())?;
+    SQLITE_DB
+        .set(Mutex::new(db))
+        .map_err(|_| "sqlite database already set".to_string())?;
+    Ok(())
+}
+
+fn with_db_mut<T>(f: impl FnOnce(&mut Database) -> Result<T, String>) -> Result<T, String> {
+    let mutex = SQLITE_DB
+        .get()
+        .ok_or_else(|| "sqlite backend is not active".to_string())?;
+    let mut db = mutex
+        .lock()
+        .map_err(|_| "sqlite database lock poisoned".to_string())?;
+    f(&mut db)
+}
+
+fn with_db<T>(f: impl FnOnce(&Database) -> Result<T, String>) -> Result<T, String> {
+    let mutex = SQLITE_DB
+        .get()
+        .ok_or_else(|| "sqlite backend is not active".to_string())?;
+    let db = mutex
+        .lock()
+        .map_err(|_| "sqlite database lock poisoned".to_string())?;
+    f(&db)
+}
+
+pub fn get_campaign(campaign_id: &Id) -> Result<Option<Campaign>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_campaign(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn get_conversation(conversation_id: &Id) -> Result<Option<Conversation>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_conversation(db, conversation_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn get_turn_by_variant(variant_id: &Id) -> Result<Option<TurnRecord>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_turn_by_variant(db, variant_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn get_active_turn(campaign_id: &Id) -> Result<Option<TurnRecord>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_active_turn(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn list_active_turns() -> Result<Vec<TurnRecord>, String> {
+    with_db(|db| SqliteProductionRepository::list_active_turns(db).map_err(|e| e.to_string()))
+}
+
+pub fn save_turn(turn: &TurnRecord) -> Result<(), String> {
+    with_db_mut(|db| SqliteProductionRepository::save_turn(db, turn).map_err(|e| e.to_string()))
+}
+
+pub fn save_conversation(conversation: &Conversation) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_conversation(db, conversation).map_err(|e| e.to_string())
+    })
+}
+
+pub fn save_campaign(campaign: &Campaign) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_campaign(db, campaign).map_err(|e| e.to_string())
+    })
+}
+
+/// Atomic Accept through the SQLite production UoW.
+pub fn accept_by_variant(
+    campaign_id: &Id,
+    conversation_id: &Id,
+    variant_id: &Id,
+    force_accept: bool,
+) -> Result<crate::turn_lifecycle::AcceptOutcome, crate::turn_lifecycle::AcceptError> {
+    use crate::turn_lifecycle::{AcceptError, AcceptOutcome, prepare_commit_batch};
+
+    let turn = get_turn_by_variant(variant_id)
+        .map_err(AcceptError::Storage)?
+        .ok_or(AcceptError::NoTurnRecord)?;
+    if &turn.campaign_id != campaign_id {
+        return Err(AcceptError::CampaignScopeMismatch {
+            turn_campaign: turn.campaign_id.to_string(),
+            requested: campaign_id.to_string(),
+        });
+    }
+    if &turn.conversation_id != conversation_id {
+        return Err(AcceptError::ConversationScopeMismatch {
+            turn_conversation: turn.conversation_id.to_string(),
+            requested: conversation_id.to_string(),
+        });
+    }
+
+    let attempt = turn
+        .attempts
+        .iter()
+        .find(|a| a.variant_id == *variant_id)
+        .cloned()
+        .ok_or(AcceptError::NoAttempt)?;
+    if attempt.status != AttemptStatus::AwaitingAcceptance
+        && turn.status != TurnStatus::AwaitingAcceptance
+    {
+        // Allow already-committed replay through the ledger below.
+        if !matches!(
+            turn.status,
+            TurnStatus::Committed | TurnStatus::Degraded | TurnStatus::Committing
+        ) {
+            return Err(AcceptError::InvalidAttemptStatus(format!(
+                "{:?}",
+                attempt.status
+            )));
+        }
+    }
+
+    // Quality gate: block errors unless force.
+    let commit_as_degraded = match attempt.quality_report.as_ref() {
+        Some(report)
+            if report
+                .warnings
+                .iter()
+                .any(|w| w.severity == QualitySeverity::Error)
+                && !force_accept =>
+        {
+            return Err(AcceptError::QualityBlocked {
+                error_count: report
+                    .warnings
+                    .iter()
+                    .filter(|w| w.severity == QualitySeverity::Error)
+                    .count(),
+            });
+        }
+        Some(report)
+            if report
+                .warnings
+                .iter()
+                .any(|w| w.severity == QualitySeverity::Error)
+                && force_accept =>
+        {
+            true
+        }
+        _ => false,
+    };
+
+    let conversation = get_conversation(conversation_id)
+        .map_err(AcceptError::Storage)?
+        .ok_or_else(|| AcceptError::Storage(format!("conversation {conversation_id} missing")))?;
+    let current_text = conversation
+        .nodes
+        .iter()
+        .find(|n| n.id == *variant_id)
+        .and_then(|n| n.active())
+        .map(|v| v.content.clone())
+        .unwrap_or_default();
+    if compute_draft_hash(&current_text) != attempt.draft_hash {
+        return Err(AcceptError::DraftHashMismatch);
+    }
+
+    let camp = get_campaign(&turn.campaign_id)
+        .map_err(AcceptError::Storage)?
+        .ok_or(AcceptError::CampaignMissing)?;
+    let campaign_revision_before = camp.revision;
+    if turn.base_campaign_revision != campaign_revision_before {
+        return Err(AcceptError::RevisionConflict {
+            base: turn.base_campaign_revision,
+            current: campaign_revision_before,
+        });
+    }
+
+    let batch = prepare_commit_batch(&attempt, variant_id, campaign_revision_before);
+    let terminal_status = if commit_as_degraded {
+        TurnStatus::Degraded
+    } else {
+        TurnStatus::Committed
+    };
+    let turn_id = turn.turn_id.clone();
+    let attempt_id = attempt.attempt_id.clone();
+    let draft_hash = attempt.draft_hash.clone();
+
+    let outcome = with_db_mut(|db| {
+        let request = AcceptTurnRequest {
+            turn_id: &turn_id,
+            attempt_id: &attempt_id,
+            draft_hash: &draft_hash,
+            batch: &batch,
+            terminal_status: terminal_status.clone(),
+        };
+        SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
+    })
+    .map_err(|e| {
+        // Map common conflict shapes.
+        if e.contains("revision") {
+            AcceptError::RevisionConflict {
+                base: campaign_revision_before,
+                current: campaign_revision_before,
+            }
+        } else if e.contains("not found") {
+            AcceptError::Storage(e)
+        } else {
+            AcceptError::Commit(e)
+        }
+    })?;
+
+    let campaign_revision_after = get_campaign(&turn.campaign_id)
+        .ok()
+        .flatten()
+        .map(|c| c.revision)
+        .unwrap_or(campaign_revision_before + 1);
+
+    let _ = outcome; // Applied | AlreadyCommitted — both OK for the caller.
+    let _ = matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted);
+
+    Ok(AcceptOutcome {
+        turn_id,
+        attempt_id,
+        turn_status: terminal_status,
+        attempt_status: AttemptStatus::Committed,
+        commit_as_degraded,
+        campaign_revision_before,
+        campaign_revision_after,
+        batch,
+    })
+}
+
+/// SQLite startup recovery: fail incomplete pipeline turns. Accept is atomic,
+/// so there is no multi-file Committing journal to replay.
+pub fn recover_turns_on_startup() -> Result<usize, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::fail_incomplete_turns(db).map_err(|e| e.to_string())
+    })
+}
