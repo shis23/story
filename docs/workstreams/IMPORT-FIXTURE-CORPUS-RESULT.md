@@ -2,7 +2,8 @@
 
 - 分支：`codex/import-fixture-corpus`
 - 基线：`b46ddc8`
-- 收口 HEAD：`dc7823d`（`dc7823de3781004e9e366b0bd9b6e974ec7db816`）
+- 代码收口 HEAD（最后一个代码/测试提交）：`1799836`（`1799836da3c6fdc8d252f6a79a347ecbe50ea430`）
+- 本文档系列最终 HEAD：见 `git rev-parse HEAD`（文档提交会移动 HEAD，故以实际为准）
 - 工作目录：`C:\tmp\storyforge-import-corpus`
 - 日期：2026-07-13
 
