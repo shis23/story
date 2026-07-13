@@ -51,6 +51,14 @@ Describe 'Release build script parser' {
         $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
         @($errors).Count | Should Be 0
     }
+
+    It 'both production runners use sanitized catch details and avoid raw Write-Error' {
+        foreach ($relative in @('scripts\run-release-build.ps1', 'scripts\run-android-host-pipeline.ps1')) {
+            $text = Get-Content -LiteralPath (Join-Path $RepoRoot $relative) -Raw
+            $text | Should Match 'Get-ReleaseSafeErrorDetails'
+            $text | Should Not Match ([regex]::Escape('Write-Error $_.Exception.Message'))
+        }
+    }
 }
 
 Describe 'Release build dry-run' {

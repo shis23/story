@@ -48,7 +48,9 @@ function Protect-ReleasePath {
         'sk-[A-Za-z0-9_-]{20,}',
         'AKIA[0-9A-Z]{16}',
         'xox[baprs]-[0-9A-Za-z-]{10,}',
-        '(?i)(api[_-]?key|secret|token|password|passwd)\s*[:=]\s*[''"]?[^\s''"]{12,}'
+        '(?i)\bauthorization\s*:\s*(bearer|basic|token)?\s*[^\s''"`,;]{8,}',
+        '(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}',
+        '(?i)(api[_-]?key|secret|token|password|passwd|credential|authorization)\s*[:=]\s*[''"]?[^\s''"]{12,}'
     )
     foreach ($pattern in $secretPatterns) {
         $result = [regex]::Replace($result, $pattern, '<REDACTED_SECRET>')
@@ -119,6 +121,38 @@ function Protect-ReleaseObject {
         return ,$items
     }
     return $Value
+}
+
+function Get-ReleaseSafeErrorDetails {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ErrorRecord,
+
+        [string]$RepoRoot
+    )
+
+    $message = if ($ErrorRecord.PSObject.Properties.Name -contains 'Exception' -and
+        $null -ne $ErrorRecord.Exception -and
+        $ErrorRecord.Exception.PSObject.Properties.Name -contains 'Message') {
+        [string]$ErrorRecord.Exception.Message
+    } else {
+        [string]$ErrorRecord
+    }
+    $stack = if ($ErrorRecord.PSObject.Properties.Name -contains 'ScriptStackTrace') {
+        [string]$ErrorRecord.ScriptStackTrace
+    } else { '' }
+    $position = ''
+    if ($ErrorRecord.PSObject.Properties.Name -contains 'InvocationInfo' -and
+        $null -ne $ErrorRecord.InvocationInfo -and
+        $ErrorRecord.InvocationInfo.PSObject.Properties.Name -contains 'PositionMessage') {
+        $position = [string]$ErrorRecord.InvocationInfo.PositionMessage
+    }
+
+    return [pscustomobject]@{
+        message = Protect-ReleasePath -Text $message -RepoRoot $RepoRoot
+        stack = Protect-ReleasePath -Text $stack -RepoRoot $RepoRoot
+        position = Protect-ReleasePath -Text $position -RepoRoot $RepoRoot
+    }
 }
 
 function Get-ReleaseFileSha256 {

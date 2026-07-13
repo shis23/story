@@ -42,6 +42,33 @@ Describe 'ReleaseBuild path redaction' {
         $redacted | Should Not Match 'C:\\Users\\someone'
         $redacted | Should Match '<REDACTED_SECRET>|<HOME>'
     }
+
+    It 'redacts Authorization and Bearer credentials from error-shaped text' {
+        $opaque = ('opaque' * 5)
+        $raw = "Authorization: Bearer $opaque failed at C:\Users\Predator\repo\script.ps1"
+        $redacted = Protect-ReleasePath -Text $raw -RepoRoot 'C:\Users\Predator\repo'
+        $redacted | Should Not Match ([regex]::Escape($opaque))
+        $redacted | Should Not Match 'C:\\Users\\Predator'
+        $redacted | Should Match '<REDACTED_SECRET>'
+    }
+
+    It 'sanitizes every top-level error detail through the production helper' {
+        $opaque = ('credential' * 4)
+        $record = [pscustomobject]@{
+            Exception = [pscustomobject]@{
+                Message = "Authorization: Bearer $opaque at C:\Users\Predator\repo\run.ps1"
+            }
+            ScriptStackTrace = "stack C:\Users\Predator\repo\secret.ps1 token=$opaque"
+            InvocationInfo = [pscustomobject]@{
+                PositionMessage = "position C:\Users\Predator\repo\run.ps1 Bearer $opaque"
+            }
+        }
+        $safe = Get-ReleaseSafeErrorDetails -ErrorRecord $record -RepoRoot 'C:\Users\Predator\repo'
+        $json = $safe | ConvertTo-Json -Depth 5
+        $json | Should Not Match ([regex]::Escape($opaque))
+        $json | Should Not Match 'C:\\Users\\Predator'
+        $safe.message | Should Match '<REDACTED_SECRET>'
+    }
 }
 
 Describe 'ReleaseBuild SHA-256 hashing' {

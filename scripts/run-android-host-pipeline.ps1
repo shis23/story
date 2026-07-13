@@ -94,15 +94,16 @@ function Invoke-AndroidHostCommand {
 
     Start-AndroidHostStep -Name $Name
     $formatted = Format-ReleaseCommand -Command $Command
+    $safeFormatted = Protect-ReleasePath -Text $formatted -RepoRoot $script:RepoRoot
     if ($DryRun) {
         Write-Host ("DRY RUN: cd {0}" -f (Protect-ReleasePath -Text $WorkingDirectory -RepoRoot $script:RepoRoot))
-        Write-Host ("DRY RUN: {0}" -f $formatted)
+        Write-Host ("DRY RUN: {0}" -f $safeFormatted)
         return @{ ExitCode = 0; Lines = @() }
     }
 
     Push-Location -LiteralPath $WorkingDirectory
     try {
-        Write-Host ("RUN: {0}" -f $formatted)
+        Write-Host ("RUN: {0}" -f $safeFormatted)
         # Native tools often write warnings to stderr. Capture without turning
         # those records into terminating errors under $ErrorActionPreference=Stop.
         $prevEap = $ErrorActionPreference
@@ -431,14 +432,13 @@ try {
     Write-Host 'Reminder: host smoke/APK build is not device PASS.' -ForegroundColor Yellow
     exit 0
 } catch {
-    Write-Host ''
-    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
-    if ($_.ScriptStackTrace) {
-        Write-Host ("STACK: {0}" -f $_.ScriptStackTrace) -ForegroundColor DarkRed
+    $safeError = Get-ReleaseSafeErrorDetails -ErrorRecord $_ -RepoRoot $script:RepoRoot
+    [Console]::Error.WriteLine(("ERROR: {0}" -f $safeError.message))
+    if ($safeError.stack) {
+        [Console]::Error.WriteLine(("STACK: {0}" -f $safeError.stack))
     }
-    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
-        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkRed
+    if ($safeError.position) {
+        [Console]::Error.WriteLine(("POSITION: {0}" -f $safeError.position))
     }
-    Write-Error $_.Exception.Message
     exit 1
 }
