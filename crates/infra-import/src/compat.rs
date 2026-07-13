@@ -2460,8 +2460,21 @@ mod tests {
             let md = std::fs::read_to_string(&md_path).expect("read md report");
             assert!(md.contains("## Matrix rows"));
             assert!(md.contains("st_v3_large_worldbook"));
-            println!("CORPUS REPORT JSON: {}", json_path.display());
-            println!("CORPUS REPORT MD: {}", md_path.display());
+            // Prefer stamped relative labels; never print absolute host paths.
+            println!(
+                "CORPUS REPORT JSON: artifacts/import-export-compat/{}",
+                json_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("compat-report.json")
+            );
+            println!(
+                "CORPUS REPORT MD: artifacts/import-export-compat/{}",
+                md_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("compat-report.md")
+            );
         }
     }
 

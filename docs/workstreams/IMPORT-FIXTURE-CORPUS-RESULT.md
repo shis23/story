@@ -2,7 +2,7 @@
 
 - 分支：`codex/import-fixture-corpus`
 - 基线：`b46ddc8`
-- 代码收口 HEAD（最后一个代码/测试提交）：`2130fda`（`2130fda9e23d7d8596eb4c106a734099af53fa75`）
+- 代码收口 HEAD：见下方 commits 最新 `fix(import)`/`feat(import)` 提交；文档提交会移动最终 HEAD
 - 本文档系列最终 HEAD：见 `git rev-parse HEAD`（文档提交会移动 HEAD，故以实际为准）
 - 工作目录：`C:\tmp\storyforge-import-corpus`
 - 日期：2026-07-13
@@ -123,7 +123,7 @@ powershell .\scripts\run-real-card-smoke.ps1 -SkipTauriOnLoaderError
 | 截断块体 | `PngError` | `parse_png_rejects_truncated_chunk_body` |
 | 悬挂部分头 | 停止并返回已收集块（不 error） | `parse_png_stops_cleanly_on_dangling_partial_header` |
 | 空 chara payload | `JsonError`/`NoCharacterData` | `test_import_rejects_empty_chara_payload_fail_closed` |
-| > 100 MiB 导入 | `PngError`（MAX_IMPORT_SIZE，parse 前拒绝） | `test_import_rejects_oversized_total_import_before_any_parse` |
+| > 100 MiB 导入 | `PngError`（MAX_IMPORT_SIZE：调用方已读入内存后、parse 前拒绝；**不是**读取前防 OOM） | `test_import_rejects_oversized_total_import_before_any_parse` |
 | 四种畸形（placeholder/truncated json/bad base64/bad json） | 全部 `Err`，无半成品 Character | `test_import_is_all_or_nothing_no_partial_character` |
 
 **原子性边界**：infra-import 是纯解析（无 store），因此「no partial store」= 解析是
@@ -198,11 +198,15 @@ git diff --check b46ddc8..HEAD
   不含 before/after 值；`artifacts/` 被 gitignore，不入库。唯一保留真实卡字符串处为
   ignored 测试断言（仅在本地 fixture 存在时运行，从不打印卡正文）。
 
-## 残留边界与风险
+## 残留边界与风险（非阻断）
 
-- **真实复杂卡**：本工作树无 `test-card.png`，真实卡 smoke 未执行；需在具备本地 fixture
-  的机器上跑 `scripts/run-real-card-smoke.ps1`（必要时 `-SkipTauriOnLoaderError`）补完整
-  S1 证据。
+- **真实复杂卡未验收**：本工作树无 `test-card.png`，真实卡 smoke 未执行；**不能宣称真实卡
+  矩阵已验收**。需在具备本地 fixture 的机器上跑
+  `scripts/run-real-card-smoke.ps1`（必要时 `-SkipTauriOnLoaderError`）补完整 S1 证据。
+- **100 MiB 限制边界**：`MAX_IMPORT_SIZE` 在 `import_character(&[u8])` 入口、调用方已把
+  文件读入内存后、parse 前拒绝。这是 all-or-nothing 解析护栏，**不是**读取前防 OOM。
+- **smoke 路径脱敏**：real-card evidence 输出使用仓库相对路径标签
+  （`artifacts/import-export-compat/real-card-evidence.json`），不再打印绝对 host 路径。
 - **Turn/Attempt runtime**：Bundle v2 不携带运行时 Turn 状态（本线禁止扩展）。
 - **MVU JS 分析**：仅保证 deterministic schema 探测与 opaque extensions 保留；JS→typed 规则
   仍依赖可选 LLM 路径（本线不调）。
@@ -212,11 +216,17 @@ git diff --check b46ddc8..HEAD
 
 ## 是否建议合并
 
-**建议合并**（独立可审、专项门禁通过、无 GUI/LLM/push 越界、无禁止区域改动）。
+**建议作为测试/证据增强线合并**（独立可审、专项门禁通过、五个 P1 已接线、无 GUI/LLM/push
+越界、无禁止区域改动）。
+
+**明确不做的承诺**：
+
+- 不宣称真实卡矩阵已验收（本轮无 `test-card.png` 实跑）。
+- 不宣称 100 MiB 限制是读取前防 OOM。
 
 合并前建议 reviewer 关注：
 
-1. `sha2` 依赖加入 infra-import（仅用于脱敏 SHA-256 指纹，workspace 既有版本，无新 vendor）。
-2. real-card ignored 测试现在额外断言脱敏证据；确认该断言不破坏既有 smoke runner 行为。
-3. 是否接受 intentional normalization 列表（position 单向、disabled 过滤、id 重生成、
-   alias 首导规范化）为产品边界。
+1. `sha2` 依赖加入 infra-import（仅用于 linkable 指纹，workspace 既有版本）。
+2. 报告产物现在是真实 CompatReport（rows/findings/summary），不是硬编码 inventory。
+3. intentional normalization 列表（position 单向、disabled 过滤、id 重生成、alias 首导规范化、
+   空 `secondary_keys` []→null）是否接受为产品边界。

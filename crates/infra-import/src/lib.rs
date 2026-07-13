@@ -475,10 +475,13 @@ mod tests {
                     .join("test-card.png")
             });
         let bytes = std::fs::read(&fixture_path).unwrap_or_else(|err| {
+            // Do not echo absolute host paths in failure text; keep the env/label only.
+            let label = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
+                .map(|_| "SF_COMPLEX_CARD_FIXTURE")
+                .unwrap_or("test-card.png (repo root)");
             panic!(
-                "REAL-CORPUS MODE requires a local real card fixture, but failed to read {}: {err}.
-Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root.",
-                fixture_path.display()
+                "REAL-CORPUS MODE requires a local real card fixture, but failed to read {label}: {err}.
+Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
             )
         });
 
@@ -552,14 +555,15 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root.",
         println!("{line}");
 
         // Also write JSON evidence under artifacts/ (gitignored) when possible.
+        // Paths printed below are relative/repo-local labels only — no absolute
+        // host paths in smoke evidence output.
+        let evidence_rel = "artifacts/import-export-compat/real-card-evidence.json";
         let evidence_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
-            .join("artifacts")
-            .join("import-export-compat")
-            .join("real-card-evidence.json");
+            .join(evidence_rel);
         match crate::compat::write_real_card_evidence(&evidence, &evidence_path) {
-            Ok(path) => println!("REAL-CARD EVIDENCE PATH: {}", path.display()),
+            Ok(_) => println!("REAL-CARD EVIDENCE PATH: {evidence_rel}"),
             Err(e) => println!("REAL-CARD EVIDENCE WRITE SKIPPED: {e}"),
         }
     }
@@ -790,9 +794,10 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root.",
 
     #[test]
     fn test_import_rejects_oversized_total_import_before_any_parse() {
-        // MAX_IMPORT_SIZE (100 MiB) is enforced before PNG parsing begins, so a
-        // decompression/size bomb is rejected with no partial store and no
-        // observable parse side effects.
+        // MAX_IMPORT_SIZE (100 MiB) is enforced at the start of import_character,
+        // *after* the caller has already read bytes into memory. This is a
+        // parse-side fail-closed guard (no half-built Character), not a
+        // pre-read OOM defense.
         let mut bomb = Vec::new();
         bomb.extend_from_slice(b"\xEF\xBB\xBF{");
         bomb.extend(std::iter::repeat_n(b'A', MAX_IMPORT_SIZE + 16));
