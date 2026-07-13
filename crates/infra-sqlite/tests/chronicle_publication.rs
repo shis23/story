@@ -712,6 +712,171 @@ fn completed_replay_rejects_when_db_state_drifted() {
 }
 
 #[test]
+fn completed_replay_rejects_exact_parent_and_edge_drift() {
+    let mut f = fixture_with_leaves(5);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap();
+
+    f.db.connection()
+        .execute(
+            "UPDATE round_summaries
+             SET headline = 'drifted',
+                 payload_json = json_set(payload_json, '$.headline', 'drifted')
+             WHERE summary_id = ?1",
+            [parents[0].id.as_str()],
+        )
+        .unwrap();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("drift"), "{err}");
+
+    f.db.connection()
+        .execute(
+            "UPDATE round_summaries
+             SET headline = ?1, payload_json = ?2
+             WHERE summary_id = ?3",
+            rusqlite::params![
+                parents[0].headline,
+                serde_json::to_string(&parents[0]).unwrap(),
+                parents[0].id.as_str()
+            ],
+        )
+        .unwrap();
+    f.db.connection()
+        .execute(
+            "DELETE FROM round_summary_covers WHERE parent_id = ?1 AND child_id = ?2",
+            rusqlite::params![parents[0].id.as_str(), f.leaves[0].id.as_str()],
+        )
+        .unwrap();
+    f.db.connection()
+        .execute(
+            "INSERT INTO round_summary_covers (parent_id, child_id) VALUES (?1, ?2)",
+            rusqlite::params![parents[0].id.as_str(), f.leaves[4].id.as_str()],
+        )
+        .unwrap();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("drift"), "{err}");
+}
+
+#[test]
+fn completed_replay_rejects_campaign_revision_marker_and_epoch_drift() {
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap();
+
+    let mut campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+        .unwrap()
+        .unwrap();
+    campaign.chronicle_revision += 1;
+    campaign.pending_compress_publication = Some(
+        storyforge_domain::chronicle::PendingCompressPublication::new(
+            campaign.chronicle_revision,
+            vec![Id::from_str("foreign-parent")],
+            vec![(
+                Id::from_str("foreign-child"),
+                Id::from_str("foreign-parent"),
+            )],
+        ),
+    );
+    campaign.context_epoch = Some(
+        storyforge_domain::chronicle::ContextEpochSnapshot::new_empty(
+            "stale-epoch",
+            campaign.chronicle_revision + 1,
+        ),
+    );
+    f.db.connection()
+        .execute(
+            "UPDATE campaigns
+             SET chronicle_revision = ?1, payload_json = ?2
+             WHERE campaign_id = ?3",
+            rusqlite::params![
+                campaign.chronicle_revision,
+                serde_json::to_string(&campaign).unwrap(),
+                f.campaign_id.as_str()
+            ],
+        )
+        .unwrap();
+
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("revision"), "{err}");
+
+    campaign.chronicle_revision -= 1;
+    f.db.connection()
+        .execute(
+            "UPDATE campaigns SET chronicle_revision = ?1, payload_json = ?2 WHERE campaign_id = ?3",
+            rusqlite::params![
+                campaign.chronicle_revision,
+                serde_json::to_string(&campaign).unwrap(),
+                f.campaign_id.as_str()
+            ],
+        )
+        .unwrap();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("marker"), "{err}");
+
+    campaign.pending_compress_publication = None;
+    f.db.connection()
+        .execute(
+            "UPDATE campaigns SET payload_json = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&campaign).unwrap(),
+                f.campaign_id.as_str()
+            ],
+        )
+        .unwrap();
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("epoch"), "{err}");
+}
+
+#[test]
 fn duplicate_job_id_is_rejected() {
     let mut f = fixture_with_leaves(4);
     let (parents, child_covered_by, publication_id) = a_to_b_request(&f);

@@ -129,16 +129,26 @@ pub fn create_backup_checkpoint(
     }
     fs::create_dir_all(backup_dir)?;
 
-    let safe_label = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let label_is_sensitive = looks_like_secret_text(label) || looks_like_absolute_path_text(label);
+    let safe_label = if label_is_sensitive {
+        "checkpoint".to_string()
+    } else {
+        let normalized = label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        if normalized.is_empty() {
+            "checkpoint".to_string()
+        } else {
+            normalized
+        }
+    };
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -190,16 +200,24 @@ pub fn create_backup_checkpoint(
 
     // Schema version is read from the backup DB itself.
     let backup_db = Database::open(&backup_db_path)?;
-    let schema_version = migrations::current_version(&backup_db).unwrap_or(0);
+    let integrity: String =
+        backup_db
+            .connection()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(SqliteError::Other(format!(
+            "backup integrity_check failed: {integrity}"
+        )));
+    }
+    let schema_version = migrations::current_version(&backup_db)?;
     let mut hasher = Sha256::new();
     hasher.update(fs::read(&backup_db_path)?);
     let manifest_hash = hex_encode(hasher.finalize());
 
     let manifest = serde_json::json!({
-        "label": label,
+        "label": if label_is_sensitive { "[REDACTED]" } else { safe_label.as_str() },
         "created_at": chrono::Utc::now().to_rfc3339(),
         "schema_version": schema_version,
-        "source_path": db.path().display().to_string(),
         "backup_db": backup_db_path.file_name().and_then(|s| s.to_str()),
         "manifest_hash": manifest_hash,
     });
@@ -220,7 +238,11 @@ pub fn create_backup_checkpoint(
         manifest_path,
         schema_version,
         manifest_hash,
-        label: label.to_string(),
+        label: if label_is_sensitive {
+            "[REDACTED]".to_string()
+        } else {
+            safe_label
+        },
     })
 }
 
@@ -280,6 +302,7 @@ pub fn export_readonly_snapshot(
             "created_at",
             "completed_at",
         ],
+        &mut redacted_fields,
     )?;
     fs::write(
         export_dir.join("chronicle_publication_jobs.json"),
@@ -300,6 +323,7 @@ pub fn export_readonly_snapshot(
             "payload_hash",
             "committed_at",
         ],
+        &mut redacted_fields,
     )?;
     fs::write(
         export_dir.join("mutation_commits.json"),
@@ -318,10 +342,22 @@ pub fn export_readonly_snapshot(
             "finished_at",
             "error",
         ],
+        &mut redacted_fields,
     )?;
     fs::write(
         export_dir.join("import_runs.json"),
         serde_json::to_vec_pretty(&imports).map_err(SqliteError::from)?,
+    )?;
+
+    let schema_migrations = export_named_rows_tx(
+        &tx,
+        "schema_migrations",
+        &["version", "name", "applied_at", "checksum"],
+        &mut redacted_fields,
+    )?;
+    fs::write(
+        export_dir.join("schema_migrations.json"),
+        serde_json::to_vec_pretty(&schema_migrations).map_err(SqliteError::from)?,
     )?;
 
     let schema_version: i64 = tx
@@ -338,7 +374,6 @@ pub fn export_readonly_snapshot(
     // Do not write secret field names or values into on-disk export artifacts.
     let manifest = serde_json::json!({
         "created_at": chrono::Utc::now().to_rfc3339(),
-        "source_path": db.path().display().to_string(),
         "schema_version": schema_version,
         "redacted_field_count": redacted_fields.len(),
         "mode": "readonly-rollback-inspection",
@@ -355,7 +390,8 @@ pub fn export_readonly_snapshot(
             "round_summary_covers",
             "chronicle_publication_jobs",
             "mutation_commits",
-            "import_runs"
+            "import_runs",
+            "schema_migrations"
         ],
     });
     fs::write(
@@ -419,6 +455,7 @@ fn export_named_rows_tx(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     columns: &[&str],
+    redacted_fields: &mut BTreeSet<String>,
 ) -> Result<Vec<Value>> {
     let exists: Option<i64> = tx
         .query_row(
@@ -432,7 +469,6 @@ fn export_named_rows_tx(
     }
     let sql = format!("SELECT {} FROM {table} ORDER BY rowid", columns.join(", "));
     let mut stmt = tx.prepare(&sql)?;
-    let col_count = columns.len();
     let rows = stmt.query_map([], |row| {
         let mut map = serde_json::Map::new();
         for (idx, name) in columns.iter().enumerate() {
@@ -448,12 +484,20 @@ fn export_named_rows_tx(
                 value.map(Value::String).unwrap_or(Value::Null),
             );
         }
-        let _ = col_count;
         Ok(Value::Object(map))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let mut value = row?;
+        redact_value(&mut value, redacted_fields);
+        if let Value::Object(map) = &mut value
+            && let Some(source_root) = map.get_mut("source_root")
+            && !source_root.is_null()
+        {
+            *source_root = Value::String("[REDACTED_PATH]".into());
+            redacted_fields.insert("source_root".into());
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -476,7 +520,9 @@ fn redact_value(value: &mut Value, redacted_fields: &mut BTreeSet<String>) {
                 redact_value(item, redacted_fields);
             }
         }
-        Value::String(text) if looks_like_secret_text(text) => {
+        Value::String(text)
+            if looks_like_secret_text(text) || looks_like_absolute_path_text(text) =>
+        {
             *text = "[REDACTED]".into();
             redacted_fields.insert("free_text_secret".into());
         }
@@ -487,23 +533,50 @@ fn redact_value(value: &mut Value, redacted_fields: &mut BTreeSet<String>) {
 
 fn is_secret_field(key: &str) -> bool {
     let lower = key.to_ascii_lowercase().replace('-', "_");
+    let compact: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     REDACTED_FIELD_NAMES.iter().any(|name| {
+        let compact_name: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         lower == *name
             || lower.ends_with(&format!("_{name}"))
             || lower.ends_with(name)
             || lower.contains(name)
+            || compact == compact_name
+            || compact.ends_with(&compact_name)
     })
 }
 
 fn looks_like_secret_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("api_key=")
-        || lower.contains("apikey=")
-        || lower.contains("token=")
+    let compact = lower.replace([' ', '\t'], "");
+    compact.contains("api_key=")
+        || compact.contains("api_key:")
+        || compact.contains("apikey=")
+        || compact.contains("apikey:")
+        || compact.contains("token=")
+        || compact.contains("token:")
         || lower.contains("bearer ")
-        || lower.contains("password=")
-        || lower.contains("secret=")
-        || lower.contains("credential=")
+        || compact.contains("password=")
+        || compact.contains("password:")
+        || compact.contains("secret=")
+        || compact.contains("secret:")
+        || compact.contains("credential=")
+        || compact.contains("credential:")
+        || compact.contains("privatekey=")
+        || compact.contains("privatekey:")
+}
+
+fn looks_like_absolute_path_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.windows(3).any(|window| {
+        window[0].is_ascii_alphabetic()
+            && window[1] == b':'
+            && (window[2] == b'\\' || window[2] == b'/')
+    }) || text.starts_with("\\\\")
+        || text.starts_with("/home/")
+        || text.starts_with("/Users/")
 }
 
 pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
@@ -526,6 +599,13 @@ pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
         let Some(id) = summary.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
+        if summary.get("lineage_id").and_then(|v| v.as_str()).is_none() {
+            issues.push(format!("summary {id} missing lineage_id"));
+        }
+        let level = summary.get("level").and_then(|v| v.as_u64());
+        if !matches!(level, Some(0..=2)) {
+            issues.push(format!("summary {id} has invalid level {level:?}"));
+        }
         if let Some(covered_by) = summary.get("covered_by").and_then(|v| v.as_str()) {
             if !by_id.contains_key(covered_by) {
                 issues.push(format!(
@@ -608,12 +688,83 @@ pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
             for field in ["campaign_id", "conversation_id", "lineage_id"] {
                 let child_v = summary.get(field).and_then(|v| v.as_str());
                 let parent_v = parent.get(field).and_then(|v| v.as_str());
-                if child_v.is_some() && parent_v.is_some() && child_v != parent_v {
+                if child_v.is_none() || parent_v.is_none() || child_v != parent_v {
                     issues.push(format!(
                         "summary graph scope mismatch on {field}: child {id}={:?}, parent {covered_by}={:?}",
                         child_v, parent_v
                     ));
                 }
+            }
+        }
+
+        let covers = summary
+            .get("covers")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if covers.is_empty() {
+            if summary
+                .get("level")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|level| level > 0)
+            {
+                issues.push(format!("summary {id} level requires non-empty covers"));
+            }
+            continue;
+        }
+        let parent_level = summary.get("level").and_then(|v| v.as_u64());
+        if !matches!(parent_level, Some(1 | 2)) {
+            issues.push(format!(
+                "summary {id} invalid parent level {parent_level:?}"
+            ));
+            continue;
+        }
+        let mut spans = Vec::new();
+        for child_id in covers.iter().filter_map(|v| v.as_str()) {
+            let Some(child) = by_id.get(child_id) else {
+                continue;
+            };
+            let child_level = child.get("level").and_then(|v| v.as_u64());
+            if child_level != parent_level.map(|level| level - 1) {
+                issues.push(format!(
+                    "summary {id} level {parent_level:?} cannot cover child {child_id} level {child_level:?}"
+                ));
+            }
+            if let Some(start) = child.get("turn").and_then(|v| v.as_u64()) {
+                let end = child
+                    .get("turn_end")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(start);
+                if end < start {
+                    issues.push(format!(
+                        "summary {child_id} has invalid turn span {start}-{end}"
+                    ));
+                }
+                spans.push((start, end));
+            } else {
+                issues.push(format!("summary {child_id} missing turn span"));
+            }
+        }
+        spans.sort_unstable();
+        for window in spans.windows(2) {
+            if window[1].0 != window[0].1.saturating_add(1) {
+                issues.push(format!(
+                    "summary {id} covers are not continuous between turns {} and {}",
+                    window[0].1, window[1].0
+                ));
+            }
+        }
+        if let (Some((expected_start, _)), Some((_, expected_end))) = (spans.first(), spans.last())
+        {
+            let parent_start = summary.get("turn").and_then(|v| v.as_u64());
+            let parent_end = summary
+                .get("turn_end")
+                .and_then(|v| v.as_u64())
+                .or(parent_start);
+            if parent_start != Some(*expected_start) || parent_end != Some(*expected_end) {
+                issues.push(format!(
+                    "summary {id} turn span {parent_start:?}-{parent_end:?} does not match children {expected_start}-{expected_end}"
+                ));
             }
         }
     }
@@ -659,7 +810,6 @@ fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
         .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
     match value {
         Value::Array(items) => Ok(items),
-        Value::Null if optional => Ok(Vec::new()),
         other => Err(SqliteError::CorruptImportInput(format!(
             "{} must be a JSON array, got {}",
             path.display(),

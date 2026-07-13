@@ -30,7 +30,9 @@ without enabling SQLite in the production app.
 - `payload_hash` (normalized request fingerprint)
 - `status` (`completed` on success)
 - `created_at` / `completed_at`
-- indexes on `(campaign_id, completed_at)` and `job_id`
+- index on `(campaign_id, completed_at)` and a partial unique index on non-empty
+  `job_id`; completed import manifests also have a partial unique index as the
+  durable fallback behind the post-`BEGIN IMMEDIATE` duplicate recheck
 
 Migrations remain ordered, checksummed, idempotent, and safe under concurrent
 cold start (existing runner rechecks version after `BEGIN IMMEDIATE`).
@@ -182,11 +184,29 @@ GREEN:
 | --- | --- |
 | `cargo fmt -p storyforge-infra-sqlite -p storyforge-domain -- --check` | PASS |
 | `cargo test -p storyforge-domain` | PASS: 243 passed |
-| `cargo test -p storyforge-infra-sqlite` | PASS: 20 unit + 17 publication + 10 readiness + 4 importer diagnostics + 1 concurrency + 25 production UoW |
+| `cargo test -p storyforge-infra-sqlite --all-targets` | PASS: 21 unit + 19 publication + 15 readiness + 4 importer diagnostics + 1 migration concurrency + 25 production UoW |
 | `cargo clippy -p storyforge-domain -p storyforge-infra-sqlite --all-targets -- -D warnings` | PASS |
 | `git diff --check c3a972d..HEAD` | PASS |
 
 Existing Turn accept UoW suite (`production_uow.rs`, 25 tests) remains green.
+
+## Final review hardening
+
+The final review pass closed the remaining fail-closed gaps without wiring the
+SQLite backend into the app:
+
+- importer duplicate detection is rechecked after acquiring the write lock,
+  with a database unique-index fallback and a deterministic two-connection race
+  test;
+- completed Chronicle publication replay revalidates the exact parent payload,
+  exact cover edge set, child reverse edges, target Campaign revision, cleared
+  marker, context epoch revision, and live scope/lineage/level/span invariants;
+- readiness validation rejects null collections and incomplete Chronicle graph
+  identity, level, or turn-span data;
+- backup checkpoints run `PRAGMA integrity_check` against the backup and do not
+  expose sensitive labels or live absolute paths;
+- read-only exports include `schema_migrations`, redact all operational tables
+  recursively, and omit the live database path from the manifest.
 
 ## Default-backend proof
 

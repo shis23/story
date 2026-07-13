@@ -378,6 +378,29 @@ fn backup_uses_unique_paths_and_backup_db_schema_version() {
 }
 
 #[test]
+fn backup_manifest_and_file_name_redact_sensitive_label_and_source_path() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("private-live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+    let backup = create_backup_checkpoint(
+        &db,
+        dir.path().join("backup"),
+        "privateKey=do-not-export C:\\Users\\Predator",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(&backup.manifest_path).unwrap();
+    let file_name = backup.backup_db_path.file_name().unwrap().to_string_lossy();
+    for forbidden in ["do-not-export", "Predator", "privateKey", "private-live"] {
+        assert!(!manifest.contains(forbidden), "manifest leaked {forbidden}");
+        assert!(
+            !file_name.contains(forbidden),
+            "file name leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn export_includes_jobs_ledger_and_redacts_extended_secrets() {
     let dir = TempDir::new().unwrap();
     let live_path = dir.path().join("live.sqlite3");
@@ -465,4 +488,127 @@ fn export_rejects_corrupt_payload_json() {
             || err.to_string().contains("corrupt"),
         "{err}"
     );
+}
+
+#[test]
+fn export_redacts_operational_rows_and_omits_absolute_source_paths() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+
+    db.connection()
+        .execute(
+            "INSERT INTO import_runs
+             (run_id, source_root, source_manifest_hash, status, started_at, finished_at, error)
+             VALUES ('run-secret', 'C:\\Users\\Predator\\secret-source', 'hash', 'failed', 't', 't',
+                     'privateKey=do-not-export token=do-not-export')",
+            [],
+        )
+        .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO character_cards (card_id, name, payload_json)
+             VALUES ('card-secret', 'Secret', '{\"id\":\"card-secret\",\"privateKey\":\"do-not-export\"}')",
+            [],
+        )
+        .unwrap();
+
+    let export_dir = dir.path().join("export");
+    export_readonly_snapshot(&db, &export_dir).unwrap();
+    assert!(export_dir.join("schema_migrations.json").exists());
+
+    for entry in walkdir_files(&export_dir) {
+        let text = fs::read_to_string(&entry).unwrap_or_default();
+        for forbidden in [
+            "do-not-export",
+            "privateKey",
+            "C:\\Users\\Predator",
+            &live_path.display().to_string(),
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{} leaked {forbidden}",
+                entry.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn readiness_rejects_null_array_that_importer_would_reject() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    write_json(
+        &dir.path().join("round_summaries.json"),
+        &serde_json::Value::Null,
+    );
+    assert!(validate_source_manifest(dir.path()).is_err());
+}
+
+#[test]
+fn dry_run_rejects_missing_lineage_invalid_level_and_non_contiguous_span() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    write_json(
+        &dir.path().join("round_summaries.json"),
+        &serde_json::json!([
+            {
+                "id": "sum-a1", "campaign_id": "camp-1", "conversation_id": "conv-1",
+                "turn": 1, "level": 0, "content": "a1", "created_at": "t",
+                "covered_by": "sum-b1"
+            },
+            {
+                "id": "sum-a2", "campaign_id": "camp-1", "conversation_id": "conv-1",
+                "lineage_id": "lin-1", "turn": 3, "level": 0, "content": "a2",
+                "created_at": "t", "covered_by": "sum-b1"
+            },
+            {
+                "id": "sum-b1", "campaign_id": "camp-1", "conversation_id": "conv-1",
+                "lineage_id": "lin-1", "turn": 1, "turn_end": 3, "level": 2,
+                "content": "bad", "created_at": "t", "covers": ["sum-a1", "sum-a2"]
+            }
+        ]),
+    );
+    let report = validate_source_manifest(dir.path()).unwrap();
+    let joined = report.issues.join("; ");
+    assert!(joined.contains("lineage"), "{joined}");
+    assert!(joined.contains("level"), "{joined}");
+    assert!(
+        joined.contains("continuous") || joined.contains("span"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn database_enforces_non_empty_job_id_uniqueness() {
+    let dir = TempDir::new().unwrap();
+    let mut db = Database::open(dir.path().join("db.sqlite3")).unwrap();
+    migrate(&mut db).unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO character_cards (card_id, name, payload_json) VALUES ('card', 'c', '{}')",
+            [],
+        )
+        .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO campaigns
+             (campaign_id, card_id, name, revision, chronicle_revision, story_clock, created_at, payload_json)
+             VALUES ('camp', 'card', 'c', 0, 0, 'Day 1', 't', '{}')",
+            [],
+        )
+        .unwrap();
+    let insert = |publication: &str| {
+        db.connection().execute(
+            "INSERT INTO chronicle_publication_jobs
+             (publication_id, campaign_id, job_id, base_chronicle_revision,
+              target_chronicle_revision, parent_ids_json, child_covered_by_json,
+              payload_hash, status, created_at, completed_at)
+             VALUES (?1, 'camp', 'same-job', 0, 1, '[]', '[]', ?1, 'completed', 't', 't')",
+            [publication],
+        )
+    };
+    insert("pub-1").unwrap();
+    assert!(insert("pub-2").is_err());
 }

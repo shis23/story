@@ -18,5 +18,11 @@ CREATE TABLE IF NOT EXISTS chronicle_publication_jobs (
 CREATE INDEX IF NOT EXISTS idx_chronicle_publication_jobs_campaign
     ON chronicle_publication_jobs(campaign_id, completed_at);
 
-CREATE INDEX IF NOT EXISTS idx_chronicle_publication_jobs_job_id
-    ON chronicle_publication_jobs(job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chronicle_publication_jobs_job_id
+    ON chronicle_publication_jobs(job_id)
+    WHERE job_id IS NOT NULL AND job_id <> '';
+
+-- Importer re-checks after BEGIN IMMEDIATE; this is the durable last line of defence.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_import_runs_completed_manifest
+    ON import_runs(source_manifest_hash)
+    WHERE status = 'completed';

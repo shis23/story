@@ -46,6 +46,7 @@ struct JobRow {
     campaign_id: String,
     payload_hash: String,
     status: String,
+    target_chronicle_revision: u64,
 }
 
 pub struct SqliteChronicleRepository;
@@ -103,7 +104,7 @@ impl SqliteChronicleRepository {
             }
             if job.status == "completed" {
                 // Replay is only a no-op when durable state still matches the job.
-                verify_completed_publication_state(tx, request.campaign_id, &request)?;
+                verify_completed_publication_state(tx, &job, &request)?;
                 uow.commit()?;
                 return Ok(PublishOutcome::AlreadyPublished);
             }
@@ -480,9 +481,50 @@ fn rewrite_parent_covers(tx: &Transaction<'_>, parent: &RoundSummary) -> Result<
 
 fn verify_completed_publication_state(
     tx: &Transaction<'_>,
-    campaign_id: &Id,
+    job: &JobRow,
     request: &PublishRequest<'_>,
 ) -> Result<()> {
+    let campaign: Campaign = load_payload(
+        tx,
+        "SELECT payload_json FROM campaigns WHERE campaign_id = ?1",
+        request.campaign_id.as_str(),
+    )?
+    .ok_or_else(|| {
+        SqliteError::Conflict(format!(
+            "completed publication drift: missing campaign {}",
+            request.campaign_id
+        ))
+    })?;
+    let indexed_revision: u64 = tx.query_row(
+        "SELECT chronicle_revision FROM campaigns WHERE campaign_id = ?1",
+        [request.campaign_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if campaign.chronicle_revision != job.target_chronicle_revision
+        || indexed_revision != job.target_chronicle_revision
+    {
+        return Err(SqliteError::Conflict(format!(
+            "completed publication drift: campaign revision payload={} indexed={} target={}",
+            campaign.chronicle_revision, indexed_revision, job.target_chronicle_revision
+        )));
+    }
+    if campaign.pending_compress_publication.is_some() {
+        return Err(SqliteError::Conflict(
+            "completed publication drift: campaign still has a pending publication marker".into(),
+        ));
+    }
+    if let Some(epoch) = campaign.context_epoch.as_ref()
+        && epoch.chronicle_revision != job.target_chronicle_revision
+    {
+        return Err(SqliteError::Conflict(format!(
+            "completed publication drift: context epoch revision {} differs from publication {}",
+            epoch.chronicle_revision, job.target_chronicle_revision
+        )));
+    }
+
+    // Re-run the full scope/lineage/level/span validation against live children.
+    validate_publication_request(tx, &campaign, request)?;
+
     for parent in request.parents {
         let existing = load_summary(tx, &parent.id)?.ok_or_else(|| {
             SqliteError::Conflict(format!(
@@ -491,27 +533,24 @@ fn verify_completed_publication_state(
             ))
         })?;
         if !json_payloads_equal(&json(&existing)?, &json(parent)?)? {
-            // Compare semantic identity for replay: covers/level/content must match request.
-            if existing.level != parent.level
-                || existing.covers.iter().collect::<HashSet<_>>()
-                    != parent.covers.iter().collect::<HashSet<_>>()
-                || existing.content != parent.content
-                || existing.campaign_id != parent.campaign_id
-            {
-                return Err(SqliteError::Conflict(format!(
-                    "completed publication drift: parent {} payload mismatch",
-                    parent.id
-                )));
-            }
-        }
-        let cover_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM round_summary_covers WHERE parent_id = ?1",
-            [parent.id.as_str()],
-            |row| row.get(0),
-        )?;
-        if cover_count as usize != parent.covers.len() {
             return Err(SqliteError::Conflict(format!(
-                "completed publication drift: parent {} cover edges incomplete",
+                "completed publication drift: parent {} payload mismatch",
+                parent.id
+            )));
+        }
+        let mut stmt = tx.prepare(
+            "SELECT child_id FROM round_summary_covers WHERE parent_id = ?1 ORDER BY child_id",
+        )?;
+        let rows = stmt.query_map([parent.id.as_str()], |row| row.get::<_, String>(0))?;
+        let actual_edges: HashSet<String> = rows.collect::<std::result::Result<_, _>>()?;
+        let expected_edges: HashSet<String> = parent
+            .covers
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
+        if actual_edges != expected_edges {
+            return Err(SqliteError::Conflict(format!(
+                "completed publication drift: parent {} cover edge set mismatch",
                 parent.id
             )));
         }
@@ -520,7 +559,7 @@ fn verify_completed_publication_state(
         let covered_by: Option<String> = tx
             .query_row(
                 "SELECT covered_by FROM round_summaries WHERE summary_id = ?1 AND campaign_id = ?2",
-                rusqlite::params![child_id.as_str(), campaign_id.as_str()],
+                rusqlite::params![child_id.as_str(), request.campaign_id.as_str()],
                 |row| row.get(0),
             )
             .optional()?
@@ -684,7 +723,7 @@ fn write_campaign(tx: &Transaction<'_>, campaign: &Campaign) -> Result<()> {
 fn load_job(tx: &Transaction<'_>, publication_id: &Id) -> Result<Option<JobRow>> {
     tx.query_row(
         r#"
-        SELECT campaign_id, payload_hash, status
+        SELECT campaign_id, payload_hash, status, target_chronicle_revision
         FROM chronicle_publication_jobs WHERE publication_id = ?1
         "#,
         [publication_id.as_str()],
@@ -693,6 +732,7 @@ fn load_job(tx: &Transaction<'_>, publication_id: &Id) -> Result<Option<JobRow>>
                 campaign_id: row.get(0)?,
                 payload_hash: row.get(1)?,
                 status: row.get(2)?,
+                target_chronicle_revision: row.get(3)?,
             })
         },
     )
