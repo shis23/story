@@ -29,7 +29,8 @@
 | `f27a9d1` | fix(plugin): make unknown slash and degraded helpers fail visibly |
 | `8c2b289` | fix(plugin): harden prompt-hook timeout cancel and secret redaction |
 | `e005538` | test(plugin): cover PluginHost correlation and usePluginBridge mounts |
-| *(tip)* | docs(workstream): PLUGIN-COMPAT-MATRIX-RESULT（本提交） |
+| `939c350` | docs(workstream): PLUGIN-COMPAT-MATRIX-RESULT |
+| *(tip)* | fix(plugin): wire timeout/cancel and close review gaps |
 
 ## 修改文件
 
@@ -163,13 +164,14 @@ git diff --check c3a972d..HEAD
 
 | 检查 | 证据 |
 |------|------|
-| 无 ReadMemory 正文脱敏 | matrix + 既有 `plugin-bridge` 测试 |
+| 无 ReadMemory 正文脱敏 | `content`/`message`/`error`/`stack` 等字段均剥离（plugin-bridge 测试） |
 | 审计无完整 prompt/messages | `prompt-hooks` / matrix audit export |
-| 审计无 `api_key` / `SF_SECRET_` 键名与原文 | `summarizePromptHookPayload` 敏感键 redaction + matrix 测试 |
-| 未知 slash 不静默成功 | throw `Unsupported slash command` |
-| timeout 不阻塞写作链 | fail-open + 后续插件继续；audit `timeout` |
-| cancel 不死锁 | 后续插件 audit `cancelled`，不调用 host |
+| 审计无 `api_key` / `SF_SECRET_` 键名与原文 | summarize + **export 二次消毒**（hostile records 测试） |
+| 未知 slash 不静默成功 | 单命令返回 `{unsupported:true,...}`；管道 throw |
+| timeout 生产接线 | `usePluginBridge` 默认 `DEFAULT_PLUGIN_HOOK_TIMEOUT_MS` |
+| cancel 生产接线 | `cancelWriting` → `cancelPromptHooks()`；后续插件 `cancelled` |
 | 重复/晚到 hook response id | settle 后 `handleMessage` 返回 false |
+| saveChat 兼容 | `await saveChat() === true`，promise 上带 `degraded` 标记 |
 
 ## 未完成项与风险
 

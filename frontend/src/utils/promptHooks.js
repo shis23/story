@@ -1,4 +1,7 @@
-import { canModifyPrompt } from '../plugin-bridge.js'
+import {
+  canModifyPrompt,
+  DEFAULT_PLUGIN_HOOK_TIMEOUT_MS,
+} from '../plugin-bridge.js'
 
 const PROMPT_HOOK_AUDIT_LIMIT = 100
 
@@ -257,7 +260,16 @@ function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload
 
 export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, event, data = {}, options = {}) {
   let payload = data
-  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : null
+  // Default to DEFAULT_PLUGIN_HOOK_TIMEOUT_MS when callers omit timeoutMs.
+  // Explicit null disables timeout (tests / emergency bypass only).
+  let timeoutMs = null
+  if (options.timeoutMs === null) {
+    timeoutMs = null
+  } else if (Number.isFinite(options.timeoutMs)) {
+    timeoutMs = Math.max(0, options.timeoutMs)
+  } else {
+    timeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  }
   const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null
 
   for (const plugin of plugins || []) {

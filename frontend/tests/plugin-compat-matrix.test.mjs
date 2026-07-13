@@ -177,6 +177,8 @@ test('unknown slash commands fail visibly instead of silent undefined', () => {
     error = err
   }
 
+  // Compat: single unknown command must not throw synchronously for ST plugins.
+  assert.equal(error, null)
   const classified = classifySlashOutcome(result, error)
   assert.equal(
     classified.visibleFailure,
@@ -203,14 +205,14 @@ test('slash pipe errors surface when a segment is unknown', async () => {
 
 test('degraded TavernHelper helpers expose visible degradation markers', async () => {
   const { window } = createBridgeSandbox()
-  const saveResult = await window.TavernHelper.saveChat()
+  const savePending = window.TavernHelper.saveChat()
+  // Compat: await saveChat() stays boolean-true for ST plugins that check truthiness/=== true.
+  assert.equal(savePending.degraded, true)
+  assert.match(String(savePending.reason || ''), /local_mirror|no_host_persist/i)
+  assert.equal(await savePending, true)
+
   const popupResult = await window.TavernHelper.callGenericPopup('confirm?', window.SillyTavern.POPUP_TYPE.CONFIRM)
   const headers = window.TavernHelper.getRequestHeaders()
-
-  assert.equal(classifyDegradedHelperResult('saveChat', saveResult).visible, true)
-  assert.equal(saveResult.degraded, true)
-  assert.ok(saveResult.reason)
-  assert.match(saveResult.reason, /local_mirror|no_host_persist/i)
 
   // CONFIRM has no UI: ST-compatible null is the visible degraded outcome.
   assert.equal(popupResult, null)

@@ -215,6 +215,7 @@ const {
   chatEventPayload,
   messageEventPayload,
   runPromptHookEvents,
+  cancelPromptHooks,
   setHookPluginHostRef,
   onHookPluginSlotMount,
 } = pluginBridge
@@ -247,6 +248,7 @@ const { handlePipelineEvent } = pipeline
 const writingApi = useWriting({
   handlePipelineEvent,
   runPromptHookEvents,
+  cancelPromptHooks,
   applyConversation,
   broadcastPluginEvent,
   messageEventPayload,

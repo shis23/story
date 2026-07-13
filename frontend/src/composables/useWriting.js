@@ -185,6 +185,12 @@ export function useWriting(options = {}) {
   // 来源 App.vue:812-819 cancelWriting
   async function cancelWriting() {
     try {
+      // Cooperative cancel for in-flight frontend prompt hooks (if wired).
+      try {
+        options.cancelPromptHooks?.()
+      } catch (hookCancelError) {
+        console.error('取消 prompt hook 失败:', hookCancelError)
+      }
       await apiCancelWriting()
       writingStore.pipeline.stateLabel = '正在停止…'
     } catch (e) {

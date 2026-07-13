@@ -188,3 +188,79 @@ test('runPromptHookEvents mutates intent through sequential frontend hooks', asy
   assert.equal(hooked, 'go north::before::ready')
   assert.equal(plugin.promptHookAuditRecords.length, 2)
 })
+
+test('usePluginBridge wires default timeout without caller-supplied options', async () => {
+  const { plugin, bridge } = setup()
+  plugin.hookPlugins = [
+    { id: 'slow', permissions: ['ModifyPrompt'], manifest: { name: 'Slow' } },
+    { id: 'fast', permissions: ['ModifyPrompt'], manifest: { name: 'Fast' } },
+  ]
+  plugin.setHookPluginHostRef('slow', {
+    async emitPluginEventAndWait() {
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      return { prompt: 'late-should-not-apply' }
+    },
+  })
+  plugin.setHookPluginHostRef('fast', {
+    async emitPluginEventAndWait(event, payload) {
+      return { ...payload, prompt: `${payload.prompt || 'base'} + fast` }
+    },
+  })
+
+  // Production path: emitPromptHookEventAndWait does not accept timeout options from callers.
+  const previousTimeout = bridge.setPromptHookTimeoutMs?.(5)
+  try {
+    const result = await bridge.emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+      { prompt: 'base' },
+      'wired_timeout',
+    )
+    assert.deepEqual(result, { prompt: 'base + fast' })
+    assert.equal(plugin.promptHookAuditRecords[0].status, 'timeout')
+    assert.equal(plugin.promptHookAuditRecords[1].status, 'ok')
+  } finally {
+    if (typeof previousTimeout === 'number' || previousTimeout === null) {
+      bridge.setPromptHookTimeoutMs?.(previousTimeout)
+    } else {
+      bridge.setPromptHookTimeoutMs?.(undefined)
+    }
+  }
+})
+
+test('usePluginBridge cancelPromptHooks stops later plugins on the real path', async () => {
+  const { plugin, bridge } = setup()
+  const calls = []
+  plugin.hookPlugins = [
+    { id: 'first', permissions: ['ModifyPrompt'], manifest: { name: 'First' } },
+    { id: 'second', permissions: ['ModifyPrompt'], manifest: { name: 'Second' } },
+  ]
+  plugin.setHookPluginHostRef('first', {
+    async emitPluginEventAndWait(event, payload) {
+      calls.push('first')
+      bridge.cancelPromptHooks()
+      return { ...payload, prompt: `${payload.prompt} + first` }
+    },
+  })
+  plugin.setHookPluginHostRef('second', {
+    async emitPluginEventAndWait(event, payload) {
+      calls.push('second')
+      return { ...payload, prompt: `${payload.prompt} + second` }
+    },
+  })
+
+  const result = await bridge.emitPromptHookEventAndWait(
+    ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+    { prompt: 'base' },
+    'wired_cancel',
+  )
+
+  assert.deepEqual(result, { prompt: 'base + first' })
+  assert.deepEqual(calls, ['first'])
+  assert.deepEqual(
+    plugin.promptHookAuditRecords.map((record) => [record.pluginId, record.status]),
+    [
+      ['first', 'ok'],
+      ['second', 'cancelled'],
+    ],
+  )
+})

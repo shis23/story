@@ -128,3 +128,48 @@ test('export metadata is always present', () => {
   assert.ok(parsed.schema.guarantees.includes('no_full_prompt_bodies'))
   assert.ok(parsed.schema.guarantees.includes('no_api_keys_or_secrets'))
 })
+
+test('exportPromptHookAudit sanitizes hostile records instead of passthrough JSON', () => {
+  const json = exportPromptHookAudit([
+    {
+      kind: 'prompt_hook',
+      pluginId: 'leaky',
+      pluginName: 'Leaky',
+      event: 'CHAT_COMPLETION_PROMPT_READY',
+      stage: 'frontend_intent',
+      status: 'ok',
+      durationMs: 3,
+      changedKeys: ['prompt'],
+      prompt: 'private prompt body that must never export',
+      api_key: 'SF_SECRET_abc',
+      messages: [{ role: 'user', content: 'private message body' }],
+      inputSummary: {
+        prompt: { type: 'string', length: 12, hash: 'abcd' },
+        api_key: 'SF_SECRET_should_be_stripped',
+      },
+      outputSummary: {
+        prompt: 'raw prompt text in summary',
+      },
+      error: {
+        name: 'Error',
+        message: 'hook failed with private prompt text',
+        stack: 'Error: hook failed with private prompt text',
+      },
+    },
+  ])
+
+  assert.equal(json.includes('private prompt body that must never export'), false)
+  assert.equal(json.includes('SF_SECRET_'), false)
+  assert.equal(json.includes('private message body'), false)
+  assert.equal(json.includes('raw prompt text in summary'), false)
+  assert.equal(json.includes('hook failed with private prompt text'), false)
+
+  const parsed = parsePromptHookAuditExport(json)
+  assert.equal(parsed.records[0].pluginId, 'leaky')
+  assert.equal(parsed.records[0].prompt, undefined)
+  assert.equal(parsed.records[0].api_key, undefined)
+  assert.equal(parsed.records[0].messages, undefined)
+  assert.equal(parsed.records[0].error.message, undefined)
+  assert.equal(typeof parsed.records[0].error.messageHash, 'string')
+  assert.equal(parsed.records[0].inputSummary.api_key, undefined)
+})

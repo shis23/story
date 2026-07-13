@@ -6,7 +6,10 @@
 // useWritingStore(messages / currentConversationId 读取)、useCampaignStore(writingMode / campaign / char 读取)。
 // 只 import 不修改:tauri-api.js、plugin-bridge.js、utils/promptHooks.js。
 
-import { ST_EVENT_TYPES } from '../plugin-bridge.js'
+import {
+  DEFAULT_PLUGIN_HOOK_TIMEOUT_MS,
+  ST_EVENT_TYPES,
+} from '../plugin-bridge.js'
 import { logAppendFrontend, pluginPromptHookResult } from '../tauri-api.js'
 import {
   appendPromptHookAuditRecord,
@@ -22,6 +25,37 @@ export function usePluginBridge() {
   const plugin = usePluginStore()
   const writing = useWritingStore()
   const campaign = useCampaignStore()
+
+  // Production defaults: per-plugin timeout is always on; cancel is cooperative.
+  let promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  let promptHooksCancelled = false
+
+  function setPromptHookTimeoutMs(timeoutMs) {
+    const previous = promptHookTimeoutMs
+    if (timeoutMs === undefined) {
+      promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+      return previous
+    }
+    if (timeoutMs === null) {
+      promptHookTimeoutMs = null
+      return previous
+    }
+    const next = Number(timeoutMs)
+    promptHookTimeoutMs = Number.isFinite(next) ? Math.max(0, next) : DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+    return previous
+  }
+
+  function cancelPromptHooks() {
+    promptHooksCancelled = true
+  }
+
+  function resetPromptHookCancellation() {
+    promptHooksCancelled = false
+  }
+
+  function isPromptHooksCancelled() {
+    return promptHooksCancelled
+  }
 
   // ─── host ref 管理(App.vue:131-138)──────────────────────────────────
   // setHookPluginHostRef 在 App.vue 模板里作为 :ref 回调被调用,需要保持引用稳定。
@@ -124,7 +158,7 @@ export function usePluginBridge() {
     return payload
   }
 
-  // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage 与 onAudit 回调。
+  // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage / timeout / cancel / onAudit。
   async function emitPromptHookEventAndWait(event, data = {}, stage = '') {
     return await emitPromptHookEventAndWaitForPlugins(
       plugin.hookPlugins,
@@ -133,6 +167,8 @@ export function usePluginBridge() {
       data,
       {
         stage,
+        timeoutMs: promptHookTimeoutMs,
+        isCancelled: isPromptHooksCancelled,
         onAudit: recordPromptHookAudit,
       },
     )
@@ -141,6 +177,7 @@ export function usePluginBridge() {
   // ─── prompt hook 编排(App.vue:239-278)─────────────────────────────
   // runPromptHookEvents:写作前对用户意图依次触发两个 GENERATE hook,返回最终 intent。
   async function runPromptHookEvents(intent) {
+    resetPromptHookCancellation()
     let payload = {
       intent,
       prompt: intent,
@@ -166,6 +203,7 @@ export function usePluginBridge() {
     const originalMessages = Array.isArray(data.messages) ? data.messages : []
     if (!requestId) return
 
+    resetPromptHookCancellation()
     try {
       const payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, {
         ...chatEventPayload({
@@ -209,5 +247,10 @@ export function usePluginBridge() {
     // prompt hook 编排
     runPromptHookEvents,
     handlePromptHookRequest,
+    // production timeout/cancel wiring
+    setPromptHookTimeoutMs,
+    cancelPromptHooks,
+    resetPromptHookCancellation,
+    isPromptHooksCancelled,
   }
 }
