@@ -128,112 +128,28 @@ function Invoke-NativeStep {
     }
 }
 
-function Invoke-SecretScan {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    Start-ReleaseStep -Name 'secret scan'
-
-    $pathspecs = @(
-        '.',
-        ':(exclude)target/**',
-        ':(exclude)node_modules/**',
-        ':(exclude)frontend/dist/**',
-        ':(exclude).git/**'
-    )
-
-    if ($DryRun) {
-        Write-Host 'DRY RUN: scan Git-tracked files for common secret patterns'
-        Write-Host ("DRY RUN: excludes {0}" -f (($pathspecs | Where-Object { $_ -like ':(exclude)*' }) -join ', '))
-        return
-    }
-
-    $rules = @(
-        @{
-            Name = 'private key block'
-            Pattern = '-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----'
-        },
-        @{
-            Name = 'AWS access key id'
-            Pattern = 'AKIA[0-9A-Z]{16}'
-        },
-        @{
-            Name = 'OpenAI-style API key'
-            Pattern = 'sk-[A-Za-z0-9_-]{20,}'
-        },
-        @{
-            Name = 'Slack token'
-            Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}'
-        },
-        @{
-            Name = 'authorization header'
-            Pattern = '(Authorization|X-Api-Key)[[:space:]]*:[[:space:]]*(token|Bearer|Basic)?[[:space:]]*[A-Za-z0-9_./+=-]{20,}'
-        },
-        @{
-            Name = 'secret assignment'
-            Pattern = '(api[_-]?key|secret|token|password|passwd|authorization)[[:space:]]*[:=][[:space:]]*[''"][^''"]{16,}[''"]'
-        }
-    )
-
-    $findings = New-Object System.Collections.Generic.List[string]
-    $scanTargets = @(
-        @{
-            Name = 'worktree'
-            Args = @()
-        },
-        @{
-            Name = 'index'
-            Args = @('--cached')
-        }
-    )
-
-    foreach ($target in $scanTargets) {
-        foreach ($rule in $rules) {
-            $output = & git -C $RepoRoot grep @($target.Args) -n -I -E -e $($rule.Pattern) -- @pathspecs 2>&1
-            $exitCode = $LASTEXITCODE
-
-            if ($exitCode -eq 1) {
-                continue
-            }
-
-            if ($exitCode -ne 0) {
-                throw "Secret scan failed while running $($target.Name) rule '$($rule.Name)': $($output -join [Environment]::NewLine)"
-            }
-
-            foreach ($line in $output) {
-                if ($line -match '^(.+?):([0-9]+):') {
-                    $findings.Add(("{0} {1} at {2}:{3}" -f $target.Name, $rule.Name, $Matches[1], $Matches[2]))
-                } else {
-                    $findings.Add(("{0} {1} at unknown location" -f $target.Name, $rule.Name))
-                }
-            }
-        }
-    }
-
-    if ($findings.Count -gt 0) {
-        Write-Host 'Potential secret material found:' -ForegroundColor Red
-        $findings | Sort-Object -Unique | ForEach-Object {
-            Write-Host ("  {0}" -f $_)
-        }
-
-        throw 'Secret scan failed. Remove the secret material or replace it with a safe reference before releasing.'
-    }
-
-    Write-Host 'OK: secret scan found no matches in Git-tracked files.'
-}
-
 try {
     $repoRoot = Find-RepoRoot
     $frontendRoot = Join-Path $repoRoot 'frontend'
+
+    # Reuse production secret-scan helper (tracked + untracked build inputs).
+    $commonPath = Join-Path $repoRoot 'scripts\release-build\ReleaseBuild.Common.ps1'
+    if (-not (Test-Path -LiteralPath $commonPath)) {
+        throw "Missing release build helpers: $commonPath"
+    }
+    . $commonPath
 
     Write-Host ("StoryForge release gate root: {0}" -f $repoRoot)
     if ($DryRun) {
         Write-Host 'Dry run enabled; commands will be printed but not executed.'
     }
 
-    Invoke-SecretScan -RepoRoot $repoRoot
+    Start-ReleaseStep -Name 'secret scan'
+    if ($DryRun) {
+        Write-Host 'DRY RUN: scan Git-tracked and untracked build-input files for common secret patterns'
+    } else {
+        Invoke-ReleaseSecretScan -RepoRoot $repoRoot
+    }
     if ($SecretScanOnly) {
         Write-Host ''
         Write-Host 'Secret scan passed.' -ForegroundColor Green

@@ -27,9 +27,11 @@ available in this environment. All evidence below is from local validation only.
 
 | # | Hash | Message |
 |---|------|---------|
-| 1 | _this work_ | `feat(ci): add release CI evidence pipeline, provenance, and workflow gates` |
-
-(Final commit hashes populated after `git commit`.)
+| 1 | `49f5cbf` | `feat(release): add provenance, manifest schema, hash, and workflow validation helpers` |
+| 2 | `3dd022d` | `feat(release): wire provenance, hash sidecars, schema validation into runners` |
+| 3 | `dcdb5cc` | `ci(gitea): add fast gate and host artifact evidence workflows` |
+| 4 | `65dd82f` | `docs(workstream): chronicle release CI evidence result` |
+| 5 | _this remediation_ | `fix(release-ci): stage subjects, harden scan/YAML/workflows, offline-verifiable packages` |
 
 ## Files Changed
 
@@ -97,12 +99,12 @@ All in `scripts/release-build/ReleaseBuild.Common.ps1`:
 
 ## Local Validation Gates
 
-### Pester Tests (71 total, 0 failed)
+### Pester Tests (76 total, 0 failed)
 
 ```
 ReleaseBuild.Tests.ps1:           Passed: 37  Failed: 0
 ReleaseBuild.Pipeline.Tests.ps1:  Passed: 14  Failed: 0
-ReleaseBuild.CI.Tests.ps1:        Passed: 20  Failed: 0
+ReleaseBuild.CI.Tests.ps1:        Passed: 25  Failed: 0
 ```
 
 Command:
@@ -190,6 +192,29 @@ parameter of `New-ReleaseProvenance`, crashing the run.
 **Fix:** Changed `New-ReleaseProvenance`'s `-Artifacts` parameter from
 `Mandatory=$true` to `AllowEmptyCollection` (matching the existing pattern in
 `New-ReleaseBuildManifest`), and added a null-coalesce guard at the call site.
+
+### Remediation (post-review blockers)
+
+Addressed review findings that would have blocked merge/CI:
+
+1. **Upload package offline-verifiable:** `Copy-ReleaseEvidenceSubjects` stages
+   binaries/APKs under `subjects/<kind>/` with matching `.sha256` sidecars inside
+   the evidence directory. Provenance subjects now point at those staged paths.
+   The Windows evidence job re-hashes subjects after staging before upload.
+2. **YAML validation no longer hard-requires python:** pure-PowerShell structural
+   validator always available (`-PreferPowerShell`); python+PyYAML is optional.
+3. **Ubuntu jobs:** install GTK/WebKit Tauri system deps and build `frontend/dist`
+   before clippy/test. Secret-scan and workflow-syntax jobs run on Windows with
+   `pwsh` (no bare `shell: powershell` on Ubuntu).
+4. **Android job:** `rustup target add aarch64-linux-android` before host pipeline.
+5. **Windows native stdout/stderr redacted** in `run-release-build.ps1` command
+   runner (capture `2>&1`, re-emit through `Protect-ReleasePath`).
+6. **Secret scan covers untracked build inputs** via `git ls-files --others`
+   + `Find-ReleaseSecretPatternFindings` (path/rule only, never secret values).
+   `verify-release.ps1` now reuses the production helper.
+7. **`.sha256` written UTF-8 without BOM** via `UTF8Encoding($false)`.
+8. **Pester 5:** `Run.PassThru = $true` set so result objects are returned.
+9. **ZIP/APK integrity reads entry payloads**, not just entry names.
 
 ### Verified: No path/command output leakage
 

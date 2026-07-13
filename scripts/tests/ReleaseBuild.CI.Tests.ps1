@@ -74,6 +74,26 @@ Describe 'ReleaseBuild hash file writer' {
         }
     }
 
+    It 'writes UTF-8 without BOM so sha256sum -c can consume the sidecar' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-hash-bom-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $artifactPath = Join-Path $dir 'storyforge.exe'
+            [System.IO.File]::WriteAllBytes($artifactPath, [byte[]](9, 8, 7, 6))
+            $hashFile = Write-ReleaseHashFile -ArtifactPath $artifactPath
+            $bytes = [System.IO.File]::ReadAllBytes($hashFile)
+            # UTF-8 BOM is EF BB BF; standard sha256sum files must not start with it.
+            if ($bytes.Length -ge 3) {
+                $hasBom = ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+                $hasBom | Should Be $false
+            }
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+            $text | Should Match '^[a-f0-9]{64} \*'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'fails closed when the artifact does not exist' {
         $missing = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-missing-{0}.bin" -f [guid]::NewGuid().ToString('N'))
         { Write-ReleaseHashFile -ArtifactPath $missing } | Should Throw
@@ -117,6 +137,56 @@ Describe 'ReleaseBuild archive integrity verification' {
             { Test-ReleaseArchiveIntegrity -Path $corrupt -ExpectedKind 'apk' } | Should Throw
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'reads entry payloads instead of only enumerating names' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-zip-payload-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $zipPath = Join-Path $dir 'payload.zip'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::Open($zipPath, 'Create')
+            try {
+                $entry = $zip.CreateEntry('lib/arm64-v8a/libtest.so')
+                $writer = New-Object System.IO.StreamWriter($entry.Open())
+                $writer.Write('native-payload-bytes')
+                $writer.Close()
+            } finally {
+                $zip.Dispose()
+            }
+            $result = Test-ReleaseArchiveIntegrity -Path $zipPath -ExpectedKind 'apk'
+            $result.entry_count | Should BeGreaterThan 0
+            $result.bytes_read | Should BeGreaterThan 0
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild evidence subject staging' {
+    It 'copies present subjects and hash sidecars into the evidence directory for offline verification' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-stage-repo-{0}" -f [guid]::NewGuid().ToString('N'))
+        $evidence = Join-Path $repo 'artifacts\release-build\windows-run'
+        $binDir = Join-Path $repo 'target\release'
+        New-Item -ItemType Directory -Path $binDir, $evidence -Force | Out-Null
+        try {
+            $exe = Join-Path $binDir 'storyforge.exe'
+            [System.IO.File]::WriteAllBytes($exe, [byte[]](1, 2, 3, 4, 5))
+            $sha = Get-ReleaseFileSha256 -Path $exe
+            $art = New-ReleaseArtifactRecord -RelativePath 'target/release/storyforge.exe' -SizeBytes 5 -Sha256 $sha -Kind 'windows-exe' -Status 'present'
+            $staged = Copy-ReleaseEvidenceSubjects -Artifacts @($art) -EvidenceDir $evidence -RepoRoot $repo
+            $staged.Count | Should Be 1
+            $staged[0].relative_path | Should Match '^subjects/'
+            $subjectPath = Join-Path $evidence ($staged[0].relative_path -replace '/', '\')
+            Test-Path -LiteralPath $subjectPath | Should Be $true
+            Test-Path -LiteralPath ($subjectPath + '.sha256') | Should Be $true
+            $rehash = Get-ReleaseFileSha256 -Path $subjectPath
+            $rehash | Should Be $sha
+            $sidecar = Get-Content -LiteralPath ($subjectPath + '.sha256') -Raw
+            $sidecar | Should Match ([regex]::Escape($sha))
+        } finally {
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -288,6 +358,58 @@ Describe 'ReleaseBuild retention empty-target guard' {
             @($targets).Count | Should Be 0
         } finally {
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild secret scan untracked inputs' {
+    It 'scans untracked build-input files and fails closed without echoing secrets' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-scan-untracked-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $repo | Out-Null
+        Push-Location $repo
+        try {
+            & git init --quiet | Out-Null
+            & git config user.email 'test@example.com'
+            & git config user.name 'test'
+            Set-Content -LiteralPath (Join-Path $repo 'README.md') -Value 'ok' -Encoding utf8
+            & git add README.md
+            & git commit -m 'init' --quiet | Out-Null
+            $fake = 'sk' + '-' + ('u' * 24)
+            Set-Content -LiteralPath (Join-Path $repo 'local-build.env') -Value ("API_TOKEN=$fake") -Encoding utf8
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
+        } finally {
+            Pop-Location
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild workflow syntax without python dependency' {
+    It 'validates workflow structure with the pure PowerShell path when python is unavailable' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-ps-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'ok.yml'
+            @(
+                'name: test'
+                'on: [push]'
+                'concurrency:'
+                '  group: g'
+                '  cancel-in-progress: true'
+                'permissions:'
+                '  contents: read'
+                'jobs:'
+                '  build:'
+                '    runs-on: ubuntu-latest'
+                '    timeout-minutes: 10'
+                '    steps:'
+                '      - run: echo hi'
+            ) | Set-Content -LiteralPath $wf -Encoding utf8
+            $result = Test-ReleaseWorkflowSyntax -Path $wf -PreferPowerShell
+            $result.Valid | Should Be $true
+            $result.Engine | Should Match 'powershell|python'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }

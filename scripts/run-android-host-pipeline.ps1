@@ -407,27 +407,39 @@ try {
     Assert-ReleaseManifestSchema -Manifest $manifest
     Write-Host 'Manifest schema validation passed.'
 
-    Start-AndroidHostStep -Name 'artifact hash sidecars'
+    Start-AndroidHostStep -Name 'stage evidence subjects and hash sidecars'
+    $stagedSubjects = [object[]]@()
     if ($DryRun) {
-        Write-Host 'DRY RUN: would write <artifact>.sha256 sidecar files for present artifacts'
+        Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
     } else {
         $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
         foreach ($art in $presentArtifacts) {
-            $fullPath = Join-Path $script:RepoRoot ($art.relative_path -replace '/', '\')
-            if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-                $hashFile = Write-ReleaseHashFile -ArtifactPath $fullPath
-                Write-Host ("Wrote hash sidecar: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $hashFile))
-                # Verify archive integrity for APK artifacts.
-                if ($art.kind -match 'apk') {
-                    Test-ReleaseArchiveIntegrity -Path $fullPath -ExpectedKind $art.kind
-                    Write-Host ("Verified archive integrity: {0}" -f $art.relative_path)
-                }
+            $fullPath = Join-Path $script:RepoRoot ($art.relative_path -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            if ((Test-Path -LiteralPath $fullPath -PathType Leaf) -and ($art.kind -match 'apk')) {
+                $integrity = Test-ReleaseArchiveIntegrity -Path $fullPath -ExpectedKind $art.kind
+                Write-Host ("Verified archive integrity: {0} entries={1} bytes_read={2}" -f $art.relative_path, $integrity.entry_count, $integrity.bytes_read)
             }
+        }
+        $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
+        foreach ($s in $stagedSubjects) {
+            Write-Host ("Staged subject: {0} sha256={1}" -f $s.relative_path, $s.sha256)
         }
     }
 
     Start-AndroidHostStep -Name 'provenance attestation'
-    $provArtifacts = if ($DryRun) { [object[]]@() } else { [object[]]@($script:Artifacts | Where-Object { $_.status -eq 'present' }) }
+    $provArtifacts = if ($DryRun) {
+        [object[]]@()
+    } else {
+        [object[]]@($stagedSubjects | ForEach-Object {
+            [pscustomobject]@{
+                relative_path = $_.relative_path
+                sha256        = $_.sha256
+                kind          = $_.kind
+                size_bytes    = $_.size_bytes
+                status        = $_.status
+            }
+        })
+    }
     if ($null -eq $provArtifacts) { $provArtifacts = [object[]]@() }
     $provenance = New-ReleaseProvenance `
         -Commit $identity.commit `

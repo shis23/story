@@ -1,8 +1,8 @@
 # Gitea Actions: manual / tagged host artifact evidence.
 #
 # Produces Windows host build evidence and Android host smoke evidence by
-# invoking the production PowerShell helpers. Uploads manifests, provenance,
-# hash sidecars, and SBOM-style inventories as artifacts with bounded retention.
+# invoking the production PowerShell helpers. Uploads subjects, hash sidecars,
+# manifests, provenance, and SBOM-style inventories with bounded retention.
 #
 # This workflow does NOT sign, publish, deploy, install to a device, or run GUI
 # acceptance. It may only claim host evidence and (when produced) an unsigned APK.
@@ -35,11 +35,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      # Prevent the workflow from accidentally inheriting the developer's
-      # workstation target directory. CI always uses a clean checkout.
+      # Prevent the workflow from accidentally inheriting a workstation target dir.
       CARGO_TARGET_DIR: ''
-      # Never echo secret values into logs. These are placeholders so the
-      # env block documents intent; no real secrets are referenced.
       RUST_LOG: 'info'
     steps:
       - name: Checkout
@@ -57,25 +54,30 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Read skip-bundle input
+      - name: Resolve skip-bundle flag
         id: bundle
-        shell: powershell
+        shell: pwsh
         run: |
           $skip = '${{ github.event.inputs.skip_bundle }}'
           if ($skip -eq 'true') {
-            Write-Host '::set-output name=skip_flag::-SkipBundle'
+            "skip_flag=-SkipBundle" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host '::set-output name=skip_flag::'
+            "skip_flag=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
       - name: Windows host release build
-        shell: powershell
+        shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-release-build.ps1 ${{ steps.bundle.outputs.skip_flag }}
+          $flag = '${{ steps.bundle.outputs.skip_flag }}'
+          if ([string]::IsNullOrWhiteSpace($flag)) {
+            pwsh -NoProfile -File scripts/run-release-build.ps1
+          } else {
+            pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle
+          }
 
       - name: Locate evidence directory
         id: evidence
-        shell: powershell
+        shell: pwsh
         run: |
           $root = Join-Path $PWD 'artifacts\release-build'
           $latest = Get-ChildItem -LiteralPath $root -Directory |
@@ -85,18 +87,46 @@ jobs:
           if (-not $latest) {
             throw 'No windows-* evidence directory found.'
           }
-          Write-Host "::set-output name=dir::$($latest.FullName)"
+          "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Evidence dir: $($latest.FullName)"
 
-      - name: Validate manifest schema
-        shell: powershell
+      - name: Validate manifest schema and staged subjects
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
-          $manifest = Get-Content -LiteralPath (Join-Path '${{ steps.evidence.outputs.dir }}' 'manifest.json') -Raw | ConvertFrom-Json
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
           Assert-ReleaseManifestSchema -Manifest $manifest
-          Write-Host 'Manifest schema validation passed.'
+          $provPath = Join-Path $evidenceDir 'provenance.json'
+          if (-not (Test-Path -LiteralPath $provPath)) {
+            throw 'provenance.json missing from evidence package.'
+          }
+          $prov = Get-Content -LiteralPath $provPath -Raw | ConvertFrom-Json
+          $subjectsDir = Join-Path $evidenceDir 'subjects'
+          if ($manifest.build_status -eq 'ok') {
+            if (-not (Test-Path -LiteralPath $subjectsDir)) {
+              throw 'subjects/ directory missing from evidence package for build_status=ok.'
+            }
+            foreach ($subj in @($prov.subjects)) {
+              $path = Join-Path $evidenceDir ($subj.relative_path -replace '/', '\')
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Subject missing from package: $($subj.relative_path)"
+              }
+              $sidecar = $path + '.sha256'
+              if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
+                throw "Hash sidecar missing for subject: $($subj.relative_path)"
+              }
+              $rehash = Get-ReleaseFileSha256 -Path $path
+              if ($rehash -ne $subj.sha256) {
+                throw "Offline rehash mismatch for $($subj.relative_path)"
+              }
+              Write-Host "Verified subject: $($subj.relative_path)"
+            }
+          }
+          Write-Host 'Manifest schema + subject offline verification passed.'
 
-      - name: Upload Windows evidence
+      - name: Upload Windows evidence (subjects + sidecars + manifest + provenance)
         uses: actions/upload-artifact@v4
         with:
           name: windows-host-evidence-${{ github.sha }}
@@ -117,6 +147,14 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Ensure aarch64-linux-android target
+        shell: pwsh
+        run: |
+          rustup target add aarch64-linux-android
+          rustup target list --installed | Select-String 'aarch64-linux-android'
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -129,13 +167,13 @@ jobs:
       # Rust check. SDK/NDK are NOT installed here, so -BuildApk is intentionally
       # omitted: requesting APK evidence without prerequisites fails closed.
       - name: Android host pipeline (host smoke, no device, no APK)
-        shell: powershell
+        shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pipeline.ps1
+          pwsh -NoProfile -File scripts/run-android-host-pipeline.ps1
 
       - name: Locate Android evidence directory
         id: evidence
-        shell: powershell
+        shell: pwsh
         run: |
           $root = Join-Path $PWD 'artifacts\release-build'
           $latest = Get-ChildItem -LiteralPath $root -Directory |
@@ -145,14 +183,19 @@ jobs:
           if (-not $latest) {
             throw 'No android-* evidence directory found.'
           }
-          Write-Host "::set-output name=dir::$($latest.FullName)"
+          "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Validate Android manifest schema
-        shell: powershell
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
-          $manifest = Get-Content -LiteralPath (Join-Path '${{ steps.evidence.outputs.dir }}' 'manifest.json') -Raw | ConvertFrom-Json
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
           Assert-ReleaseManifestSchema -Manifest $manifest
+          if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'provenance.json'))) {
+            throw 'Android provenance.json missing from evidence package.'
+          }
           Write-Host 'Android manifest schema validation passed.'
 
       - name: Upload Android evidence

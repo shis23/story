@@ -430,13 +430,55 @@ function Invoke-ReleaseSecretScan {
         }
     }
 
+    # Also scan untracked build-input files that may participate in the build
+    # but are not yet in the index/worktree tracked set.
+    $excludeDirs = @('target', 'node_modules', 'frontend/dist', 'frontend/node_modules', '.git', 'artifacts')
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $untracked = @(& git -C $RepoRoot ls-files --others --exclude-standard 2>$null)
+        $utCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($utCode -eq 0 -and $untracked) {
+        foreach ($rel in $untracked) {
+            $normalized = ($rel -replace '\\', '/')
+            $skip = $false
+            foreach ($ex in $excludeDirs) {
+                if ($normalized -eq $ex -or $normalized.StartsWith("$ex/")) {
+                    $skip = $true
+                    break
+                }
+            }
+            if ($skip) { continue }
+            $full = Join-Path $RepoRoot ($rel -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+            # Skip binary / very large files.
+            $item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+            if (-not $item -or $item.Length -gt 2MB) { continue }
+            try {
+                $text = [System.IO.File]::ReadAllText($full)
+            } catch {
+                continue
+            }
+            $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
+            foreach ($hit in $patternHits) {
+                # Report rule name + path only; never echo secret values.
+                $ruleName = $hit -replace '^secret-pattern:', ''
+                $safePath = Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot
+                $findings.Add(("untracked {0} at {1}" -f $ruleName, $safePath))
+            }
+        }
+    }
+
     if ($findings.Count -gt 0) {
         Write-Host 'Potential secret material found:' -ForegroundColor Red
         $findings | Sort-Object -Unique | ForEach-Object { Write-Host ("  {0}" -f $_) }
         throw 'Secret scan failed. Remove the secret material or replace it with a safe reference before releasing.'
     }
 
-    Write-Host 'OK: secret scan found no matches in Git-tracked files.'
+    Write-Host 'OK: secret scan found no matches in Git-tracked or untracked build-input files.'
 }
 
 function Get-ReleaseAndroidBuildPathIssues {
@@ -1156,8 +1198,8 @@ function Write-ReleaseHashFile {
 
     .DESCRIPTION
     Writes `<lowercased-sha256> *<basename>` to `<ArtifactPath>.sha256` so that
-    `sha256sum -c` style verification tools can consume it. Fails closed when
-    the artifact does not exist.
+    `sha256sum -c` style verification tools can consume it. Uses UTF-8 without
+    BOM. Fails closed when the artifact does not exist.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ArtifactPath
@@ -1171,19 +1213,23 @@ function Write-ReleaseHashFile {
     $basename = Split-Path -Leaf $ArtifactPath
     $content = "{0} *{1}" -f $hash, $basename
     $hashPath = $ArtifactPath + '.sha256'
-    Set-Content -LiteralPath $hashPath -Value $content -Encoding utf8 -NoNewline
+    # UTF-8 without BOM: Windows PowerShell's Set-Content -Encoding utf8 emits a BOM,
+    # which breaks sha256sum -c on Linux. Write raw UTF-8 bytes instead.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($hashPath, $content, $utf8NoBom)
     return $hashPath
 }
 
 function Test-ReleaseArchiveIntegrity {
     <#
     .SYNOPSIS
-    Verifies that a zip-based archive (APK, etc.) can be opened and read.
+    Verifies that a zip-based archive (APK, etc.) can be opened and its payloads read.
 
     .DESCRIPTION
-    Opens the archive with System.IO.Compression and enumerates entries to
-    confirm the file is not truncated or corrupt. Fails closed on missing or
-    unreadable files. Does not accept GUI or device evidence.
+    Opens the archive with System.IO.Compression, enumerates entries, and reads
+    each entry payload into a buffer to confirm the file is not truncated or
+    corrupt. Fails closed on missing or unreadable files. Does not accept GUI
+    or device evidence. Returns entry_count and bytes_read for evidence.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -1198,9 +1244,26 @@ function Test-ReleaseArchiveIntegrity {
     try {
         $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
         $entryCount = 0
+        $bytesRead = [long]0
+        $buffer = New-Object byte[] 8192
         try {
             foreach ($entry in $zip.Entries) {
                 $entryCount += 1
+                # Directories have Length 0 and no payload stream of interest.
+                if ($entry.Length -le 0 -and $entry.FullName.EndsWith('/')) {
+                    continue
+                }
+                $stream = $null
+                try {
+                    $stream = $entry.Open()
+                    while ($true) {
+                        $n = $stream.Read($buffer, 0, $buffer.Length)
+                        if ($n -le 0) { break }
+                        $bytesRead += $n
+                    }
+                } finally {
+                    if ($null -ne $stream) { $stream.Dispose() }
+                }
             }
         } finally {
             $zip.Dispose()
@@ -1208,10 +1271,82 @@ function Test-ReleaseArchiveIntegrity {
         if ($entryCount -le 0) {
             throw "Archive integrity check failed: $ExpectedKind archive has zero entries: $Path"
         }
+        return [pscustomobject]@{
+            entry_count = $entryCount
+            bytes_read  = $bytesRead
+            kind        = $ExpectedKind
+            path        = $Path
+        }
     } catch {
         $msg = $_.Exception.Message
         throw "Archive integrity check failed for $ExpectedKind ($Path): $msg"
     }
+}
+
+function Copy-ReleaseEvidenceSubjects {
+    <#
+    .SYNOPSIS
+    Stages present artifact subjects and hash sidecars into an evidence directory.
+
+    .DESCRIPTION
+    Copies each present artifact into `<EvidenceDir>/subjects/<kind>/<basename>`
+    and writes a matching `.sha256` sidecar next to it. Returns staged subject
+    records with evidence-relative paths so provenance can reference offline-
+    verifiable files inside the uploaded package. Fails closed on missing sources.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Artifacts,
+        [Parameter(Mandatory = $true)][string]$EvidenceDir,
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    if ($null -eq $Artifacts) { $Artifacts = @() }
+    $subjectsRoot = Join-Path $EvidenceDir 'subjects'
+    if (-not (Test-Path -LiteralPath $subjectsRoot)) {
+        New-Item -ItemType Directory -Force -Path $subjectsRoot | Out-Null
+    }
+
+    $staged = New-Object System.Collections.Generic.List[object]
+    foreach ($art in $Artifacts) {
+        if ($null -eq $art) { continue }
+        if ($art.status -ne 'present') { continue }
+        if ([string]::IsNullOrWhiteSpace($art.relative_path)) {
+            throw 'Cannot stage subject with empty relative_path.'
+        }
+        if ([string]::IsNullOrWhiteSpace($art.sha256)) {
+            throw ("Cannot stage present subject without sha256: {0}" -f $art.relative_path)
+        }
+
+        $source = Join-Path $RepoRoot ($art.relative_path -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Cannot stage missing subject source: $($art.relative_path)"
+        }
+
+        $kindDir = Join-Path $subjectsRoot ($art.kind -replace '[^A-Za-z0-9._-]', '_')
+        if (-not (Test-Path -LiteralPath $kindDir)) {
+            New-Item -ItemType Directory -Force -Path $kindDir | Out-Null
+        }
+        $basename = Split-Path -Leaf $source
+        $dest = Join-Path $kindDir $basename
+        Copy-Item -LiteralPath $source -Destination $dest -Force
+        $hashFile = Write-ReleaseHashFile -ArtifactPath $dest
+        $rehash = Get-ReleaseFileSha256 -Path $dest
+        if ($rehash -ne $art.sha256) {
+            throw ("Staged subject hash mismatch for {0}: expected {1}, got {2}" -f $art.relative_path, $art.sha256, $rehash)
+        }
+
+        $relEvidence = Get-RelativeReleasePath -RepoRoot $EvidenceDir -FullPath $dest
+        $staged.Add([pscustomobject]@{
+            relative_path = $relEvidence
+            source_path   = $art.relative_path
+            sha256        = $rehash
+            kind          = $art.kind
+            size_bytes    = [long](Get-Item -LiteralPath $dest).Length
+            status        = 'present'
+            hash_sidecar  = (Get-RelativeReleasePath -RepoRoot $EvidenceDir -FullPath $hashFile)
+        }) | Out-Null
+    }
+    return ,$staged.ToArray()
 }
 
 function Assert-ReleaseManifestSchema {
@@ -1281,23 +1416,95 @@ function Assert-ReleaseManifestSchema {
     }
 }
 
+function Test-ReleaseWorkflowSyntaxPowerShell {
+    <#
+    .SYNOPSIS
+    Pure-PowerShell structural validation of a Gitea/GitHub Actions workflow YAML.
+
+    .DESCRIPTION
+    Does not require python/PyYAML. Checks that the file is non-empty, has a
+    `jobs:` mapping, and that top-level keys look like a workflow. Catches
+    obvious syntax errors (unbalanced brackets, empty file, missing jobs).
+    Not a full YAML parser — prefer python+PyYAML when available.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $errors.Add('Workflow file is empty')
+        return [pscustomobject]@{
+            Valid = $false; ErrorCount = $errors.Count; Errors = @($errors); Engine = 'powershell'
+        }
+    }
+
+    # Obvious bracket imbalance (common YAML list/map typo).
+    $openSquare = ([regex]::Matches($text, '\[')).Count
+    $closeSquare = ([regex]::Matches($text, '\]')).Count
+    if ($openSquare -ne $closeSquare) {
+        $errors.Add('Unbalanced square brackets')
+    }
+    $openCurly = ([regex]::Matches($text, '\{')).Count
+    $closeCurly = ([regex]::Matches($text, '\}')).Count
+    if ($openCurly -ne $closeCurly) {
+        $errors.Add('Unbalanced curly braces')
+    }
+
+    # Required structural markers for Actions workflows.
+    if ($text -notmatch '(?m)^jobs\s*:') {
+        $errors.Add("Missing top-level 'jobs:' mapping")
+    }
+    if ($text -notmatch '(?m)^(on|name)\s*:') {
+        $errors.Add("Missing top-level 'on:' or 'name:' key")
+    }
+
+    # Detect tab-indent (YAML forbids tabs for indentation).
+    if ($text -match '(?m)^\t') {
+        $errors.Add('Tab indentation is not allowed in YAML')
+    }
+
+    return [pscustomobject]@{
+        Valid      = ($errors.Count -eq 0)
+        ErrorCount = $errors.Count
+        Errors     = @($errors)
+        Engine     = 'powershell'
+    }
+}
+
 function Test-ReleaseWorkflowSyntax {
     <#
     .SYNOPSIS
     Validates that a workflow YAML file parses without syntax errors.
 
     .DESCRIPTION
-    Uses the local Python interpreter with PyYAML (when available) to parse the
-    YAML file. Returns a result object with Valid, ErrorCount, and Errors.
-    Fails closed only when the file is missing; parse errors are returned in
-    the result (not thrown) so callers can report them.
+    Prefers pure-PowerShell structural validation (always available). When
+    python+PyYAML is present and -PreferPowerShell is not set, also runs a
+    full YAML parse and merges results. Never hard-fails solely because
+    python is missing. Returns Valid/ErrorCount/Errors/Engine.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$PreferPowerShell
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Workflow file not found: $Path"
+    }
+
+    $psResult = Test-ReleaseWorkflowSyntaxPowerShell -Path $Path
+    if ($PreferPowerShell) {
+        return $psResult
+    }
+
+    # Optional python+PyYAML enrichment when available.
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) {
+        $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if (-not $pythonCmd) {
+        return $psResult
     }
 
     $pyScript = @'
@@ -1305,7 +1512,7 @@ import sys, json
 try:
     import yaml
 except ImportError:
-    print(json.dumps({"valid": False, "error_count": 1, "errors": ["PyYAML is not installed; cannot validate YAML syntax"]}))
+    print(json.dumps({"valid": False, "error_count": 1, "errors": ["PyYAML is not installed"], "engine": "python-missing-pyyaml"}))
     sys.exit(0)
 
 path = sys.argv[1]
@@ -1323,44 +1530,43 @@ except yaml.YAMLError as exc:
 except Exception as exc:
     errors.append("Unexpected error: " + str(exc)[:500])
 
-result = {"valid": len(errors) == 0, "error_count": len(errors), "errors": errors}
+result = {"valid": len(errors) == 0, "error_count": len(errors), "errors": errors, "engine": "python"}
 print(json.dumps(result))
 '@
 
     $tmpPy = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-yaml-{0}.py" -f [guid]::NewGuid().ToString('N'))
     try {
-        Set-Content -LiteralPath $tmpPy -Value $pyScript -Encoding utf8
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($tmpPy, $pyScript, $utf8NoBom)
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $rawOutput = & python $tmpPy $Path 2>&1
+            $rawOutput = & $pythonCmd.Source $tmpPy $Path 2>&1
             $code = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
         }
 
-        if ($code -ne 0 -or [string]::IsNullOrWhiteSpace($rawOutput)) {
-            return [pscustomobject]@{
-                Valid      = $false
-                ErrorCount = 1
-                Errors     = @("python yaml validation exited $code or produced no output")
-            }
+        if ($code -ne 0 -or [string]::IsNullOrWhiteSpace(($rawOutput | Out-String))) {
+            # Python failed; fall back to pure PowerShell result.
+            return $psResult
         }
 
-        $lastLine = @($rawOutput | Where-Object { $_ -match '^\{' })[-1]
+        $lastLine = @($rawOutput | Where-Object { "$_" -match '^\{' })[-1]
         if (-not $lastLine) {
-            return [pscustomobject]@{
-                Valid      = $false
-                ErrorCount = 1
-                Errors     = @('python yaml validation produced no JSON output')
-            }
+            return $psResult
         }
 
         $parsed = $lastLine | ConvertFrom-Json
+        # If python reports missing PyYAML, keep PowerShell result.
+        if ($parsed.engine -eq 'python-missing-pyyaml') {
+            return $psResult
+        }
         return [pscustomobject]@{
             Valid      = [bool]$parsed.valid
             ErrorCount = [int]$parsed.error_count
             Errors     = @($parsed.errors)
+            Engine     = 'python'
         }
     } finally {
         Remove-Item -LiteralPath $tmpPy -Force -ErrorAction SilentlyContinue

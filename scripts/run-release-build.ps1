@@ -97,13 +97,17 @@ function Invoke-ReleaseBuildCommand {
     Push-Location -LiteralPath $WorkingDirectory
     try {
         Write-Host ("RUN: {0}" -f $safeFormatted)
+        # Capture native stdout/stderr and re-emit only after path/secret redaction.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            & $Command[0] @($Command[1..($Command.Count - 1)])
+            $output = & $Command[0] @($Command[1..($Command.Count - 1)]) 2>&1
             $code = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
+        }
+        foreach ($line in @($output)) {
+            Write-Host (Protect-ReleasePath -Text "$line" -RepoRoot $script:RepoRoot)
         }
         if ($null -eq $code) { $code = 0 }
         if ($code -ne 0) {
@@ -415,22 +419,34 @@ try {
     Assert-ReleaseManifestSchema -Manifest $manifest
     Write-Host 'Manifest schema validation passed.'
 
-    Start-ReleaseBuildStep -Name 'artifact hash sidecars'
+    Start-ReleaseBuildStep -Name 'stage evidence subjects and hash sidecars'
+    $stagedSubjects = [object[]]@()
     if ($DryRun) {
-        Write-Host 'DRY RUN: would write <artifact>.sha256 sidecar files for present artifacts'
+        Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
     } else {
         $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
-        foreach ($art in $presentArtifacts) {
-            $fullPath = Join-Path $script:RepoRoot ($art.relative_path -replace '/', '\')
-            if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-                $hashFile = Write-ReleaseHashFile -ArtifactPath $fullPath
-                Write-Host ("Wrote hash sidecar: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $hashFile))
-            }
+        $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
+        foreach ($s in $stagedSubjects) {
+            Write-Host ("Staged subject: {0} sha256={1}" -f $s.relative_path, $s.sha256)
         }
     }
 
     Start-ReleaseBuildStep -Name 'provenance attestation'
-    $provArtifacts = if ($DryRun) { [object[]]@() } else { [object[]]@($script:Artifacts | Where-Object { $_.status -eq 'present' }) }
+    # Provenance subjects reference staged evidence-relative paths so the
+    # uploaded package can be verified offline without the original build tree.
+    $provArtifacts = if ($DryRun) {
+        [object[]]@()
+    } else {
+        [object[]]@($stagedSubjects | ForEach-Object {
+            [pscustomobject]@{
+                relative_path = $_.relative_path
+                sha256        = $_.sha256
+                kind          = $_.kind
+                size_bytes    = $_.size_bytes
+                status        = $_.status
+            }
+        })
+    }
     if ($null -eq $provArtifacts) { $provArtifacts = [object[]]@() }
     $provenance = New-ReleaseProvenance `
         -Commit $identity.commit `

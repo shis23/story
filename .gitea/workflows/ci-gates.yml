@@ -29,6 +29,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -38,10 +40,36 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Install Linux Tauri / WebKit system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Setup Node (frontendDist for Tauri generate_context!)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend dist for Tauri context
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -51,8 +79,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Install Linux Tauri / WebKit system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Setup Node (frontendDist for Tauri generate_context!)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend dist for Tauri context
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
       - name: cargo test --workspace
         run: cargo test --workspace
 
@@ -87,36 +141,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run release-build Pester tests
-        shell: powershell
+        shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/run-release-build-tests.ps1
-      - name: Verify release gate (secret scan only, dry-run safe)
-        shell: powershell
+          pwsh -NoProfile -File scripts/tests/run-release-build-tests.ps1
+      - name: Verify release gate (secret scan only)
+        shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release.ps1 -SecretScanOnly
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
 
   secret-scan:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Repository secret scan (fail-closed)
-        shell: powershell
+      - name: Repository secret scan (fail-closed, tracked + untracked)
+        shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release.ps1 -SecretScanOnly
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
 
   workflow-syntax:
-    # Validate every tracked workflow YAML parses without errors.
-    runs-on: ubuntu-latest
+    # Validate every tracked workflow YAML with the pure-PowerShell path
+    # (no python hard dependency). PreferPowerShell keeps this reproducible
+    # on any runner with PowerShell Core / Windows PowerShell.
+    runs-on: windows-latest
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Validate workflow YAML syntax
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
@@ -125,11 +181,11 @@ jobs:
                    @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
           if ($files.Count -eq 0) { throw 'No workflow files found.' }
           foreach ($f in $files) {
-            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
+            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName -PreferPowerShell
             if (-not $result.Valid) {
               Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
               $result.Errors | ForEach-Object { Write-Host "  $_" }
               exit 1
             }
-            Write-Host "OK: $($f.Name)" -ForegroundColor Green
+            Write-Host "OK: $($f.Name) (engine=$($result.Engine))" -ForegroundColor Green
           }

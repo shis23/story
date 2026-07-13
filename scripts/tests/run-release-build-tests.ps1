@@ -88,6 +88,7 @@ try {
         $config = New-PesterConfiguration
         $config.Run.Path = $testFiles
         $config.Run.Exit = $false
+        $config.Run.PassThru = $true
         $config.Output.Verbosity = 'Detailed'
         $result = Invoke-Pester -Configuration $config
         Assert-ReleasePesterResult -Result $result -Label 'release-build test suite'
