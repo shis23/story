@@ -147,6 +147,10 @@ impl<'a> JsonImporter<'a> {
             for conv in &snapshot.conversations {
                 upsert_conversation(tx, conv)?;
             }
+
+            // Fail closed with diagnostics before any summary/turn writes.
+            reject_invalid_source_graphs(&snapshot.summaries, &snapshot.turns)?;
+
             // summaries 可能互相引用 covered_by / covers：
             // 1) 先写入行（covered_by 置空，避免插入顺序触发 FK）
             // 2) 回填 covered_by
@@ -629,6 +633,22 @@ fn upsert_turn(tx: &rusqlite::Transaction<'_>, turn: &Value) -> Result<()> {
 
 fn upsert_attempt(tx: &rusqlite::Transaction<'_>, turn_id: &str, attempt: &Value) -> Result<()> {
     let attempt_id = required_str(attempt, "attempt_id", "turn_attempt")?;
+    let existing_owner: Option<String> = tx
+        .query_row(
+            "SELECT turn_id FROM turn_attempts WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing_owner
+        .as_deref()
+        .is_some_and(|owner| owner != turn_id)
+    {
+        return Err(SqliteError::CorruptImportInput(format!(
+            "duplicate attempt ownership: attempt {attempt_id} already owned by turn {}, refusing rehang onto {turn_id}",
+            existing_owner.as_deref().unwrap_or_default()
+        )));
+    }
     let variant_id = required_str(attempt, "variant_id", "turn_attempt")?;
     let draft_hash = optional_str(attempt, "draft_hash").unwrap_or_default();
     let status = optional_str(attempt, "status").unwrap_or_else(|| "generating".into());
@@ -652,6 +672,15 @@ fn upsert_attempt(tx: &rusqlite::Transaction<'_>, turn_id: &str, attempt: &Value
         ],
     )?;
     Ok(())
+}
+
+fn reject_invalid_source_graphs(summaries: &[Value], turns: &[Value]) -> Result<()> {
+    let mut issues = crate::readiness::validate_summary_graph(summaries);
+    issues.extend(crate::readiness::validate_attempt_ownership(turns));
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(SqliteError::CorruptImportInput(issues.join("; ")))
 }
 
 fn required_str<'v>(value: &'v Value, key: &str, entity: &str) -> Result<&'v str> {
