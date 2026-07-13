@@ -2,7 +2,7 @@
 
 > 集成分支：`codex/integration-nightly-2026-07-13`
 > 基线：`7fb1899`
-> 收口 HEAD：`504a06a`
+> 收口 HEAD：分支 tip（见 `git rev-parse --short HEAD`；阻断修复收口 `799ea2f`）
 > 日期：2026-07-13
 > 工作目录：`C:\tmp\storyforge-integration`
 
