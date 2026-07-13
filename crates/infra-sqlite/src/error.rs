@@ -26,6 +26,9 @@ pub enum SqliteError {
         message: String,
     },
 
+    #[error("invalid migration set: {0}")]
+    InvalidMigrationSet(String),
+
     #[error("import source not found: {0}")]
     ImportSourceMissing(PathBuf),
 

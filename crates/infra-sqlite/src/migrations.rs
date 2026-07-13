@@ -39,11 +39,16 @@ pub fn migrate(db: &mut Database) -> Result<Vec<i64>> {
 }
 
 /// 可注入 migration 列表（测试用，可模拟中途失败）。
+///
+/// 调用方传入顺序不保证正确：本函数始终按 `version` 升序执行副本。
+/// 拒绝非正 version、重复 version。
 pub fn migrate_with(db: &mut Database, migrations: &[Migration]) -> Result<Vec<i64>> {
     ensure_migrations_table(db)?;
 
+    let ordered = order_and_validate_migrations(migrations)?;
+
     let mut applied_now = Vec::new();
-    for migration in migrations {
+    for migration in &ordered {
         if let Some(existing) = load_applied(db, migration.version)? {
             let expected = migration.checksum();
             if existing != expected {
@@ -67,6 +72,29 @@ pub fn migrate_with(db: &mut Database, migrations: &[Migration]) -> Result<Vec<i
         applied_now.push(migration.version);
     }
     Ok(applied_now)
+}
+
+/// 校验并按 version 升序返回 migration 副本。
+fn order_and_validate_migrations(migrations: &[Migration]) -> Result<Vec<Migration>> {
+    let mut ordered = migrations.to_vec();
+    ordered.sort_by_key(|m| m.version);
+
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &ordered {
+        if m.version <= 0 {
+            return Err(SqliteError::InvalidMigrationSet(format!(
+                "migration version must be positive, got {}",
+                m.version
+            )));
+        }
+        if !seen.insert(m.version) {
+            return Err(SqliteError::InvalidMigrationSet(format!(
+                "duplicate migration version {}",
+                m.version
+            )));
+        }
+    }
+    Ok(ordered)
 }
 
 fn ensure_migrations_table(db: &mut Database) -> Result<()> {
@@ -251,5 +279,68 @@ mod tests {
             [],
         );
         assert!(err.is_err(), "FK should reject missing campaign");
+    }
+
+    #[test]
+    fn migrate_with_sorts_by_version_regardless_of_input_order() {
+        let mut db = Database::open_in_memory().unwrap();
+        ensure_migrations_table(&mut db).unwrap();
+
+        // Intentionally out of order: V2 before V1. Runner must sort and apply V1 first.
+        let v2 = Migration {
+            version: 2,
+            name: "second",
+            sql: "CREATE TABLE t2 (id INTEGER PRIMARY KEY);",
+        };
+        let v1 = Migration {
+            version: 1,
+            name: "first",
+            sql: "CREATE TABLE t1 (id INTEGER PRIMARY KEY);",
+        };
+        let applied = migrate_with(&mut db, &[v2, v1]).unwrap();
+        assert_eq!(applied, vec![1, 2]);
+        assert_eq!(current_version(&db).unwrap(), 2);
+
+        // Both tables exist; ordering was correct even though V2 was listed first.
+        for table in ["t1", "t2"] {
+            let exists: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing table {table}");
+        }
+    }
+
+    #[test]
+    fn migrate_with_rejects_duplicate_and_non_positive_versions() {
+        let mut db = Database::open_in_memory().unwrap();
+        ensure_migrations_table(&mut db).unwrap();
+
+        let dup = [
+            Migration {
+                version: 1,
+                name: "a",
+                sql: "CREATE TABLE a (id INTEGER PRIMARY KEY);",
+            },
+            Migration {
+                version: 1,
+                name: "b",
+                sql: "CREATE TABLE b (id INTEGER PRIMARY KEY);",
+            },
+        ];
+        let err = migrate_with(&mut db, &dup).unwrap_err();
+        assert!(matches!(err, SqliteError::InvalidMigrationSet(_)));
+
+        let non_pos = [Migration {
+            version: 0,
+            name: "zero",
+            sql: "CREATE TABLE z (id INTEGER PRIMARY KEY);",
+        }];
+        let err = migrate_with(&mut db, &non_pos).unwrap_err();
+        assert!(matches!(err, SqliteError::InvalidMigrationSet(_)));
     }
 }
