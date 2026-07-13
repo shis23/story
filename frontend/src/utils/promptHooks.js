@@ -254,7 +254,7 @@ function summarizeHookError(error) {
   }
 }
 
-function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload, afterPayload, error = null) {
+function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload, afterPayload, error = null, context = {}) {
   try {
     const finishedAt = nowMs()
     const safeAfterPayload = afterPayload === undefined ? beforePayload : afterPayload
@@ -272,6 +272,8 @@ function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload
       inputSummary,
       outputSummary,
       error: summarizeHookError(error),
+      correlationId: context.correlationId || null,
+      generationId: context.generationId || null,
     }
   } catch (auditError) {
     return {
@@ -286,7 +288,43 @@ function buildAuditRecord(plugin, event, stage, status, startedAt, beforePayload
       inputSummary: {},
       outputSummary: {},
       error: summarizeHookError(auditError),
+      correlationId: context.correlationId || null,
+      generationId: context.generationId || null,
     }
+  }
+}
+
+const PROMPT_HOOK_FAIL_OPEN_STATUSES = new Set(['error', 'timeout', 'budget_exceeded', 'missing_host', 'revoked', 'no_change', 'ok'])
+
+/**
+ * Machine-readable fail policy for prompt hook outcomes.
+ *
+ * Mutating pre-generation hooks fail-open on plugin error / timeout / budget /
+ * missing host (the turn continues with the fallback payload), but fail-closed
+ * on cancellation (the whole turn must abort). This makes the classification
+ * explicit and testable instead of an implicit runtime invariant.
+ */
+export function classifyPromptHookFailurePolicy(stage, operationType, status) {
+  if (status === 'cancelled') {
+    return { failOpen: false, reason: 'cancellation_aborts_turn' }
+  }
+  if (status === 'audit_error') {
+    return { failOpen: true, reason: 'audit_error_is_non_fatal' }
+  }
+  if (PROMPT_HOOK_FAIL_OPEN_STATUSES.has(status)) {
+    return { failOpen: true, reason: `${status}_continues_chain` }
+  }
+  // Unknown status: conservatively fail-open for non-mutating surfaces but
+  // surface an explicit reason so callers can detect the gap.
+  return { failOpen: true, reason: 'unknown_status_defaulted_fail_open' }
+}
+
+function payloadByteSize(payload) {
+  try {
+    return JSON.stringify(payload ?? {}).length
+  } catch {
+    // Unserializable payload: estimate via the summarized hash material.
+    return safeStableStringify(payload).length
   }
 }
 
@@ -304,6 +342,18 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
   }
   const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null
   const signal = options.signal || null
+  const getPluginPermissions = typeof options.getPluginPermissions === 'function'
+    ? options.getPluginPermissions
+    : null
+  const maxPayloadBytes = Number.isFinite(options.maxPayloadBytesPerPlugin)
+    ? Math.max(0, options.maxPayloadBytesPerPlugin)
+    : null
+  // Correlation / generation ids stamped on every async audit record so late
+  // responses and overlapping generations stay traceable without raw payloads.
+  const auditContext = {
+    correlationId: options.correlationId || null,
+    generationId: options.generationId || null,
+  }
 
   const throwIfAborted = () => {
     if (signal?.aborted) {
@@ -312,20 +362,34 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
   }
 
   for (const plugin of plugins || []) {
+    // Declaration-time permission gate: plugins that never declared
+    // ModifyPrompt are silently skipped (no audit row, preserves legacy
+    // behavior for read-only plugins in the hook list).
     if (!canModifyPrompt(plugin)) continue
 
+    // Runtime permission re-check: when a resolver is provided, a plugin that
+    // declared ModifyPrompt but lost it at runtime (revoked / disabled) is
+    // audited as 'revoked' and skipped without running its hook.
+    if (getPluginPermissions) {
+      const runtimePlugin = { ...plugin, permissions: getPluginPermissions(plugin) || [] }
+      if (!canModifyPrompt(runtimePlugin)) {
+        emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'revoked', nowMs(), payload, payload, null, auditContext))
+        continue
+      }
+    }
+
     if (signal?.aborted) {
-      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload))
+      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload, null, auditContext))
       throw createPromptHookCancelledError()
     }
     if (isCancelled?.()) {
-      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload))
+      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload, null, auditContext))
       continue
     }
 
     const host = hostRefs?.get?.(plugin.id)
     if (!host?.emitPluginEventAndWait) {
-      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'missing_host', nowMs(), payload, payload))
+      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'missing_host', nowMs(), payload, payload, null, auditContext))
       continue
     }
 
@@ -340,6 +404,22 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
         : await withTimeout(abortable, timeoutMs)
       throwIfAborted()
       if (nextPayload !== undefined) {
+        // Per-plugin payload size budget: discard an oversized mutation and
+        // continue the chain on the pre-mutation payload (fail-open).
+        if (maxPayloadBytes !== null && payloadByteSize(nextPayload) > maxPayloadBytes) {
+          emitAudit(options, buildAuditRecord(
+            plugin,
+            event,
+            options.stage,
+            'budget_exceeded',
+            startedAt,
+            beforePayload,
+            payload,
+            null,
+            auditContext,
+          ))
+          continue
+        }
         payload = nextPayload
       }
       emitAudit(options, buildAuditRecord(
@@ -350,6 +430,8 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
         startedAt,
         beforePayload,
         payload,
+        null,
+        auditContext,
       ))
     } catch (error) {
       const cancelled = isPromptHookCancelledError(error)
@@ -371,6 +453,7 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
           beforePayload,
           payload,
           error,
+          auditContext,
         ),
       )
       if (cancelled) throw error

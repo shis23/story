@@ -20,6 +20,9 @@ const SAFE_STATUSES = new Set([
   'error',
   'audit_error',
   'missing_host',
+  'unloaded',
+  'revoked',
+  'budget_exceeded',
 ])
 const SAFE_SUMMARY_TYPES = new Set([
   'array',
