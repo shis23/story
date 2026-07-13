@@ -2,7 +2,7 @@
 
 - 分支：`codex/import-fixture-corpus`
 - 基线：`b46ddc8`
-- 代码收口 HEAD（最后一个代码/测试提交）：`1799836`（`1799836da3c6fdc8d252f6a79a347ecbe50ea430`）
+- 代码收口 HEAD（最后一个代码/测试提交）：`2130fda`（`2130fda9e23d7d8596eb4c106a734099af53fa75`）
 - 本文档系列最终 HEAD：见 `git rev-parse HEAD`（文档提交会移动 HEAD，故以实际为准）
 - 工作目录：`C:\tmp\storyforge-import-corpus`
 - 日期：2026-07-13
@@ -18,6 +18,7 @@ JSON + Markdown 报告。全程 TDD（红→绿），未调用真实/付费 LLM�
 ## 分支与提交
 
 ```text
+2130fda fix(import): close evidence-chain P1s in fixture corpus reports
 1799836 feat(import): privacy-safe real fixture evidence and JSON+Markdown reports
 6b4ae6f test(import): atomic no-partial-store robustness and size/bomb guards
 f4ffbae feat(import): compat matrix schema, multi-seed property suite, fail-closed completeness
@@ -40,11 +41,25 @@ ace1089 docs(workstream): plan import fixture corpus
 - `crates/infra-import/fixtures/st_v3_mvu_tavernhelper.json` — MVU/stat_data/initvar +
   tavern_helper + 多角色定义（含同名）。
 - `crates/infra-import/Cargo.toml` / `Cargo.lock` — 新增 `sha2`（脱敏指纹，workspace 既有依赖）。
-- `scripts/generate-import-export-compat-report.ps1` — 语料库清单、5 seed、intentional/gap、
-  同时写 JSON + Markdown。
+- `scripts/generate-import-export-compat-report.ps1` — 从真实 CompatReport 落盘 JSON+Markdown
+  （rows/findings/summary），并校验非空矩阵。
 - `docs/workstreams/IMPORT-FIXTURE-CORPUS-{PROMPT,PLAN,RESULT}.md` — 计划与结果。
 
 无 `tauri-app` / `infra-sqlite` / `main.rs` / `HANDOFF.md` / `RELEASE-CHECKLIST.md` 改动。
+
+## P1 证据链返修（2026-07-13）
+
+| P1 | 修复 |
+| --- | --- |
+| 报告脚本 Markdown 空章节 | 不再把 `$Inventory` 先转 JSON 字符串再读属性；脚本只校验并复制真实 CompatReport 产物 |
+| JSON 硬编码清单 | `build_corpus_compat_report` + `emit_corpus_report_for_script` 写出含 rows/findings/summary 的真实报告 |
+| `assert_matrix_complete` 可被 Complete 遮蔽 Incomplete | 改为唯一 `fixture_id` + exact set 匹配；重复/额外/缺失均 fail-closed |
+| multi-seed 只跑 import→export→reimport | multi-seed 与 corpus builder 均同时跑 source→first-import 与 round-trip 两腿 |
+| 真实卡证据未打印/落盘 | ignored 测试 `println!` + 写 `artifacts/.../real-card-evidence.json` |
+| SHA-256 被描述为完全匿名 | 字段改为 `fingerprint_privacy=stable-linkable-not-anonymous`；未知 extension key 只计数量不回显名字 |
+
+返修后 `scripts/generate-import-export-compat-report.ps1` 实测：
+`rows=11, findings≈18848, loss=0, preserved≈12937`，Markdown 含完整 Matrix rows。
 
 ## Fixture 语料库
 
@@ -149,7 +164,7 @@ cargo test -p storyforge-domain --lib
 # 249 passed; 0 failed
 
 cargo test -p storyforge-infra-import --lib
-# 49 passed; 0 failed; 1 ignored (real fixture)
+# 53 passed; 0 failed; 1 ignored (real fixture)
 
 powershell .\scripts\run-real-card-smoke.ps1 -SkipTauriOnLoaderError
 # FAIL: test-card.png not present in this worktree (fail-closed, as designed)
@@ -167,8 +182,8 @@ git diff --check b46ddc8..HEAD
 # clean
 ```
 
-测试函数总数（infra-import）：50（49 非 ignore + 1 ignored 真实卡）。本线新增 21 个红→绿
-测试。
+测试函数总数（infra-import）：54（53 非 ignore + 1 ignored 真实卡）。本线含 P1 返修后的
+证据链红→绿测试。
 
 ## 自审（数据损失 / 坏引用 / 部分写入 / 隐私）
 
@@ -179,7 +194,7 @@ git diff --check b46ddc8..HEAD
 - **部分写入**：infra-import 纯解析，all-or-nothing；四类畸形输入全部 `Err` 且无半成品
   Character。store 级原子性在 tauri-app，未动。
 - **隐私**：committed fixture 全部 synthetic/sanitized（grep 真实卡名 `命定`/`seraphina`
-  等均无命中）；real-card 证据仅含计数/扩展键/feature flag/SHA-256 指纹；脱敏失败输出
+  等均无命中）；real-card 证据仅含计数/已知扩展键 allowlist/feature flag/linkable SHA-256 指纹（非匿名）；脱敏失败输出
   不含 before/after 值；`artifacts/` 被 gitignore，不入库。唯一保留真实卡字符串处为
   ignored 测试断言（仅在本地 fixture 存在时运行，从不打印卡正文）。
 
