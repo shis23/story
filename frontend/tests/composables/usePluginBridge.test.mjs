@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { createPinia, setActivePinia } from 'pinia'
 
 import { usePluginBridge } from '../../src/composables/usePluginBridge.js'
+import { usePipeline } from '../../src/composables/usePipeline.js'
+import { useWriting } from '../../src/composables/useWriting.js'
 import { usePluginStore } from '../../src/stores/plugin.js'
 import { useWritingStore } from '../../src/stores/writing.js'
 import { useCampaignStore } from '../../src/stores/campaign.js'
@@ -248,19 +250,124 @@ test('usePluginBridge cancelPromptHooks stops later plugins on the real path', a
     },
   })
 
-  const result = await bridge.emitPromptHookEventAndWait(
-    ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
-    { prompt: 'base' },
-    'wired_cancel',
+  await assert.rejects(
+    bridge.emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+      { prompt: 'base' },
+      'wired_cancel',
+    ),
+    (error) => error?.code === 'PROMPT_HOOK_CANCELLED',
   )
 
-  assert.deepEqual(result, { prompt: 'base + first' })
   assert.deepEqual(calls, ['first'])
   assert.deepEqual(
     plugin.promptHookAuditRecords.map((record) => [record.pluginId, record.status]),
-    [
-      ['first', 'ok'],
-      ['second', 'cancelled'],
-    ],
+    [['first', 'cancelled']],
   )
+})
+
+test('production writing cancel races an in-flight prompt hook and never starts the backend', async () => {
+  const { plugin, writing, campaign, bridge } = setup()
+  writing.activeConnection = { id: 'conn-1' }
+  campaign.activeCampaign = { id: 'campaign-1', name: 'Campaign' }
+  plugin.hookPlugins = [
+    { id: 'hung', permissions: ['ModifyPrompt'], manifest: { name: 'Hung' } },
+  ]
+  plugin.setHookPluginHostRef('hung', {
+    emitPluginEventAndWait() {
+      return new Promise(() => {})
+    },
+  })
+  bridge.setPromptHookTimeoutMs(25)
+
+  let backendStarts = 0
+  const pipelineEvents = []
+  const writingApi = useWriting({
+    runPromptHookEvents: bridge.runPromptHookEvents,
+    cancelPromptHooks: bridge.cancelPromptHooks,
+    isPromptHooksCancelled: bridge.isPromptHooksCancelled,
+    startWritingApi: async () => {
+      backendStarts += 1
+      return { text: 'should-not-run', conversation_id: 'c1', node_id: 'n1' }
+    },
+    cancelWritingApi: async () => true,
+    handlePipelineEvent: (event) => pipelineEvents.push(event.event_type),
+  })
+
+  const pending = writingApi.startWriting('intent')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await writingApi.cancelWriting()
+  await pending
+
+  assert.equal(backendStarts, 0)
+  assert.deepEqual(pipelineEvents, [])
+  assert.equal(writing.isWriting, false)
+  assert.notEqual(writing.pipeline.state, 'error')
+})
+
+test('cancel races the current hook instead of waiting for its timeout', async () => {
+  const { plugin, bridge } = setup()
+  plugin.hookPlugins = [
+    { id: 'hung', permissions: ['ModifyPrompt'], manifest: { name: 'Hung' } },
+    { id: 'later', permissions: ['ModifyPrompt'], manifest: { name: 'Later' } },
+  ]
+  plugin.setHookPluginHostRef('hung', {
+    emitPluginEventAndWait() {
+      return new Promise(() => {})
+    },
+  })
+  let laterCalls = 0
+  plugin.setHookPluginHostRef('later', {
+    async emitPluginEventAndWait(_event, payload) {
+      laterCalls += 1
+      return payload
+    },
+  })
+  bridge.setPromptHookTimeoutMs(500)
+  bridge.beginPromptHookGeneration()
+
+  const startedAt = Date.now()
+  const pending = bridge.emitPromptHookEventAndWait(
+    ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+    { prompt: 'base' },
+    'cancel_race',
+  )
+  setTimeout(() => bridge.cancelPromptHooks(), 5)
+
+  await assert.rejects(pending, (error) => error?.code === 'PROMPT_HOOK_CANCELLED')
+  assert.ok(Date.now() - startedAt < 250, 'cancel should beat the 500ms timeout')
+  assert.equal(laterCalls, 0)
+  assert.deepEqual(
+    plugin.promptHookAuditRecords.map((record) => [record.pluginId, record.status]),
+    [['hung', 'cancelled']],
+  )
+})
+
+test('late backend prompt hook cannot reset or execute a cancelled generation', async () => {
+  const { plugin, bridge } = setup()
+  let calls = 0
+  plugin.hookPlugins = [
+    { id: 'hook', permissions: ['ModifyPrompt'], manifest: { name: 'Hook' } },
+  ]
+  plugin.setHookPluginHostRef('hook', {
+    async emitPluginEventAndWait(_event, payload) {
+      calls += 1
+      return payload
+    },
+  })
+
+  bridge.beginPromptHookGeneration()
+  bridge.cancelPromptHooks()
+  const pipeline = usePipeline({ pluginBridge: bridge })
+  pipeline.handlePipelineEvent({
+    event_type: 'prompt_hook_request',
+    data: {
+      request_id: 'late-request',
+      messages: [{ role: 'user', content: 'private' }],
+    },
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(calls, 0)
+  assert.equal(bridge.isPromptHooksCancelled(), true)
 })

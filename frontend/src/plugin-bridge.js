@@ -185,8 +185,7 @@ function isSubscribedToPluginEvent(plugin, eventName) {
 
 const SENSITIVE_EVENT_FIELDS = new Set([
   'content',
-  'displayContent',
-  'display_content',
+  'displaycontent',
   'text',
   'token',
   'delta',
@@ -196,6 +195,7 @@ const SENSITIVE_EVENT_FIELDS = new Set([
   'raw',
   // Body-like / diagnostic fields that can carry private text without ReadMemory.
   'message',
+  'errormessage',
   'error',
   'stack',
   'stderr',
@@ -204,7 +204,19 @@ const SENSITIVE_EVENT_FIELDS = new Set([
   'details',
   'body',
   'payload',
+  'responsebody',
+  'apikey',
+  'authorization',
+  'password',
+  'secret',
+  'credential',
+  'privatememory',
 ])
+
+function isSensitiveEventField(key) {
+  const normalized = String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
+  return SENSITIVE_EVENT_FIELDS.has(normalized)
+}
 
 function sanitizePluginEventData(value) {
   if (Array.isArray(value)) {
@@ -216,7 +228,7 @@ function sanitizePluginEventData(value) {
 
   const sanitized = {}
   for (const [key, child] of Object.entries(value)) {
-    if (SENSITIVE_EVENT_FIELDS.has(key)) continue
+    if (isSensitiveEventField(key)) continue
     sanitized[key] = sanitizePluginEventData(child)
   }
   return sanitized

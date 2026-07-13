@@ -11,11 +11,11 @@
 把现有插件 / SillyTavern 兼容声明落成可执行确定性矩阵，并修掉矩阵暴露的安全与可见性缺口：
 
 1. **事件矩阵**：覆盖全部 `ST_EVENT_TYPES`，区分 implemented / alias / derived / shim / noop / intentionally_unsupported。
-2. **Slash**：注册/注销/别名/参数/管道/冲突保持；**未知命令改为显式抛错**，不再静默 `undefined`。
-3. **TavernHelper**：常用 shim 保持；`saveChat` 返回 **degraded** 结果；popup/headers 在矩阵中标记 degraded，不伪装完整 ST。
-4. **Prompt hook**：串行顺序、ModifyPrompt 门控、fail-open；新增 **timeout / cancel** 审计状态；晚到/重复 hook response id 忽略。
-5. **权限与脱敏**：订阅过滤 + 无 `ReadMemory` 正文脱敏；审计摘要 **脱敏 `api_key` 等敏感键名**。
-6. **审计导出**：补充 schema 元数据（identity / timing / outcome / redaction guarantees）。
+2. **Slash**：注册/注销/别名/参数/管道/冲突保持；未知单命令返回显式 `unsupported`，管道遇到未知段则抛错，均不再静默 `undefined`。
+3. **TavernHelper**：常用 shim 保持；`await saveChat() === true`，同时在 Promise 上暴露 degraded 标记；popup/headers 在矩阵中标记 degraded，不伪装完整 ST。
+4. **Prompt hook**：串行顺序、ModifyPrompt 门控、fail-open；新增 generation-scoped `AbortSignal`，取消会立即抢赢 timeout、阻止 backend start，并拒绝晚到旧 generation。
+5. **权限与脱敏**：订阅过滤 + 无 `ReadMemory` 正文脱敏；字段名先归一化再判断，覆盖大小写、snake/camel 变体。
+6. **审计导出**：补充 schema 元数据，并对 identity、summary leaf、error、changed keys 做严格形状校验和二次消毒。
 7. **PluginHost / usePluginBridge**：确定性 mock UI 事件 id 相关、挂载队列、slot 隔离、host ref mount/unmount、hook 顺序测试。
 
 未调用真实/付费 LLM，未操作 GUI，未 push，未改 `docs/HANDOFF.md` / SQLite / import-export / Android。
@@ -30,7 +30,7 @@
 | `8c2b289` | fix(plugin): harden prompt-hook timeout cancel and secret redaction |
 | `e005538` | test(plugin): cover PluginHost correlation and usePluginBridge mounts |
 | `939c350` | docs(workstream): PLUGIN-COMPAT-MATRIX-RESULT |
-| *(tip)* | fix(plugin): wire timeout/cancel and close review gaps |
+| *(tip)* | fix(plugin): make cancellation and audit export fail closed |
 
 ## 修改文件
 
@@ -79,7 +79,7 @@
 |------|------|
 | register / unregister / aliases / parse / pipe / collision | implemented |
 | `genraw` | shim → `llm.generate` |
-| unknown command | **intentionally_unsupported，显式 throw** |
+| unknown command | **intentionally_unsupported**；单命令显式返回 unsupported，管道 throw |
 
 ### TavernHelper
 
@@ -96,7 +96,7 @@
 | 能力 | 状态 |
 |------|------|
 | 顺序、ModifyPrompt、fail-open、mutation boundary | implemented |
-| timeout / cancel / late duplicate id | implemented |
+| timeout / generation cancel / late duplicate id | implemented |
 | audit identity/timing/outcome + 无 prompt/secret | implemented |
 | PluginHost mount、hidden hook ready、slots、event id | implemented（mock UI 标注） |
 
@@ -134,7 +134,13 @@ node --test \
   tests/prompt-hook-audit.test.mjs \
   tests/plugin-bridge.test.mjs \
   tests/stores/plugin.test.mjs
-# 110 passed
+# 117 passed
+
+npm test
+# 250 passed
+
+npm run build
+# PASS
 ```
 
 ### Rust（专项）
@@ -164,12 +170,13 @@ git diff --check c3a972d..HEAD
 
 | 检查 | 证据 |
 |------|------|
-| 无 ReadMemory 正文脱敏 | `content`/`message`/`error`/`stack` 等字段均剥离（plugin-bridge 测试） |
+| 无 ReadMemory 正文脱敏 | `content`/`Message`/`error_message`/`responseBody` 等大小写/命名变体均剥离（plugin-bridge 测试） |
 | 审计无完整 prompt/messages | `prompt-hooks` / matrix audit export |
 | 审计无 `api_key` / `SF_SECRET_` 键名与原文 | summarize + **export 二次消毒**（hostile records 测试） |
 | 未知 slash 不静默成功 | 单命令返回 `{unsupported:true,...}`；管道 throw |
 | timeout 生产接线 | `usePluginBridge` 默认 `DEFAULT_PLUGIN_HOOK_TIMEOUT_MS` |
-| cancel 生产接线 | `cancelWriting` → `cancelPromptHooks()`；后续插件 `cancelled` |
+| cancel 生产接线 | App 在 `useWriting` / `usePipeline` 之间共享同一 bridge；取消竞速当前 hook，生产组合测试断言 backend start 为 0 |
+| 晚到事件隔离 | 每次写作/重 roll 开新 generation；backend request 不重置取消状态 |
 | 重复/晚到 hook response id | settle 后 `handleMessage` 返回 false |
 | saveChat 兼容 | `await saveChat() === true`，promise 上带 `degraded` 标记 |
 
@@ -179,7 +186,7 @@ git diff --check c3a972d..HEAD
 2. **`committed` 别名**：映射存在，但流水线可能发 `StateChanged{Committed}` 而非 `Committed` 变体（历史已知）。
 3. **`saveChat` / popup / request headers** 仍是 degraded shim，真实持久化与 UI 未做。
 4. **真实插件 iframe + Tauri IPC** 仅有 mock UI / Node 确定性测试；真机 GUI 验证仍需后续。
-5. **Turn lifecycle / backend prompt_hook pending 并发边界** 未在本线扩展（避免越界）。
+5. generation 取消竞态已有确定性组合测试；真实第三方 iframe 在 GUI 中无响应时的体验仍待手测。
 6. 本机为跑 Pinia 测试执行了 `npm install`；`node_modules` 被 ignore，未提交 lock 变更。
 
 ## 是否建议合并
@@ -192,6 +199,6 @@ git diff --check c3a972d..HEAD
 
 合并前建议 reviewer 重点看：
 
-1. 未知 slash 从 `undefined` 改为 throw 是否影响已有插件依赖静默失败的路径
-2. `saveChat` 返回对象而非 `true` 的兼容性
-3. prompt hook `timeoutMs` / `isCancelled` 默认关闭（仅 options 显式启用）对现网行为无回归
+1. 未知 slash 从 `undefined` 改为显式 unsupported/管道错误是否影响依赖静默失败的插件
+2. `saveChat` 保持 await 后为 `true`，degraded 元数据挂在 pending Promise 上的兼容性
+3. generation-scoped cancel 在真实第三方 iframe 长时间不响应时是否符合 GUI 预期

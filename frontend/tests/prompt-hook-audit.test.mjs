@@ -173,3 +173,41 @@ test('exportPromptHookAudit sanitizes hostile records instead of passthrough JSO
   assert.equal(typeof parsed.records[0].error.messageHash, 'string')
   assert.equal(parsed.records[0].inputSummary.api_key, undefined)
 })
+
+test('hostile safe-leaf and identity fields cannot smuggle secrets into audit export', () => {
+  const markers = [
+    'SF_SECRET_plugin_name',
+    'SF_SECRET_stage',
+    'SF_SECRET_changed_key',
+    'SF_SECRET_error_name',
+    'SF_SECRET_leaf_value',
+    'SF_SECRET_leaf_hash',
+    'SF_SECRET_leaf_keys',
+  ]
+  const json = exportPromptHookAudit([{
+    pluginId: 'plugin-a',
+    pluginName: markers[0],
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    stage: markers[1],
+    status: 'ok',
+    changedKeys: [markers[2]],
+    error: { name: markers[3], message: 'hidden message' },
+    inputSummary: {
+      hostile: {
+        type: 'string',
+        value: markers[4],
+        hash: markers[5],
+      },
+    },
+    outputSummary: {
+      hostile: {
+        type: 'object',
+        keys: [markers[6]],
+      },
+    },
+  }])
+
+  for (const marker of markers) {
+    assert.equal(json.includes(marker), false, `audit export leaked ${marker}`)
+  }
+})

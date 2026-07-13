@@ -728,6 +728,11 @@ test('redacts message content from subscribed plugins without ReadMemory', () =>
       message: 'secret message body',
       error: 'secret error body',
       stack: 'Error: secret stack',
+      Message: 'secret mixed-case message',
+      error_message: 'secret snake-case error',
+      responseBody: 'secret camel-case body',
+      API_Key: 'secret normalized API key',
+      private_memory: 'secret normalized private memory',
       nested: {
         text: 'secret nested',
         error: 'nested secret error',

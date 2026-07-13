@@ -62,6 +62,38 @@ function withTimeout(promise, timeoutMs, onTimeout) {
   })
 }
 
+export function createPromptHookCancelledError() {
+  const error = new Error('Plugin hook generation cancelled')
+  error.name = 'AbortError'
+  error.code = 'PROMPT_HOOK_CANCELLED'
+  return error
+}
+
+export function isPromptHookCancelledError(error) {
+  return error?.code === 'PROMPT_HOOK_CANCELLED'
+}
+
+function withAbort(promise, signal) {
+  if (!signal) return Promise.resolve(promise)
+  if (signal.aborted) return Promise.reject(createPromptHookCancelledError())
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback(value)
+    }
+    const onAbort = () => finish(reject, createPromptHookCancelledError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    Promise.resolve(promise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    )
+  })
+}
+
 function safeStableStringify(value) {
   try {
     return JSON.stringify(value)
@@ -271,10 +303,21 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
     timeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
   }
   const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null
+  const signal = options.signal || null
+
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw createPromptHookCancelledError()
+    }
+  }
 
   for (const plugin of plugins || []) {
     if (!canModifyPrompt(plugin)) continue
 
+    if (signal?.aborted) {
+      emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload))
+      throw createPromptHookCancelledError()
+    }
     if (isCancelled?.()) {
       emitAudit(options, buildAuditRecord(plugin, event, options.stage, 'cancelled', nowMs(), payload, payload))
       continue
@@ -289,10 +332,13 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
     const beforePayload = payload
     const startedAt = nowMs()
     try {
+      throwIfAborted()
       const pending = host.emitPluginEventAndWait(event, payload)
+      const abortable = withAbort(pending, signal)
       const nextPayload = timeoutMs === null
-        ? await pending
-        : await withTimeout(pending, timeoutMs)
+        ? await abortable
+        : await withTimeout(abortable, timeoutMs)
+      throwIfAborted()
       if (nextPayload !== undefined) {
         payload = nextPayload
       }
@@ -306,6 +352,7 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
         payload,
       ))
     } catch (error) {
+      const cancelled = isPromptHookCancelledError(error)
       const timedOut = error?.code === 'PROMPT_HOOK_TIMEOUT'
         || /timed out/i.test(String(error?.message || error || ''))
       try {
@@ -319,13 +366,14 @@ export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, ev
           plugin,
           event,
           options.stage,
-          timedOut ? 'timeout' : 'error',
+          cancelled ? 'cancelled' : timedOut ? 'timeout' : 'error',
           startedAt,
           beforePayload,
           payload,
           error,
         ),
       )
+      if (cancelled) throw error
     }
   }
 

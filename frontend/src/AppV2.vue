@@ -215,7 +215,9 @@ const {
   chatEventPayload,
   messageEventPayload,
   runPromptHookEvents,
+  beginPromptHookGeneration,
   cancelPromptHooks,
+  isPromptHooksCancelled,
   setHookPluginHostRef,
   onHookPluginSlotMount,
 } = pluginBridge
@@ -241,7 +243,7 @@ const {
 } = conversation
 
 // 4. pipeline —— 流水线事件 reducer（注入 scrollToBottom）
-const pipeline = usePipeline({ scrollToBottom })
+const pipeline = usePipeline({ scrollToBottom, pluginBridge })
 const { handlePipelineEvent } = pipeline
 
 // 5. writing —— 开始 / 取消写作（注入 handlePipelineEvent + 范围外辅助）
@@ -249,6 +251,7 @@ const writingApi = useWriting({
   handlePipelineEvent,
   runPromptHookEvents,
   cancelPromptHooks,
+  isPromptHooksCancelled,
   applyConversation,
   broadcastPluginEvent,
   messageEventPayload,
@@ -270,6 +273,7 @@ const messageVariants = useMessageVariants({
   scrollToBottom,
   alertDialog,
   startWriting,
+  beginPromptHookGeneration,
 })
 const {
   handleReroll,

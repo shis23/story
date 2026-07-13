@@ -13,10 +13,12 @@ import {
 import { logAppendFrontend, pluginPromptHookResult } from '../tauri-api.js'
 import {
   appendPromptHookAuditRecord,
+  createPromptHookCancelledError,
   emitPromptHookEventAndWaitForPlugins,
   resolveHookedIntent,
   resolveHookedMessages,
 } from '../utils/promptHooks.js'
+import { sanitizePromptHookAuditRecord } from '../utils/promptHookAudit.js'
 import { usePluginStore } from '../stores/plugin.js'
 import { useWritingStore } from '../stores/writing.js'
 import { useCampaignStore } from '../stores/campaign.js'
@@ -26,9 +28,11 @@ export function usePluginBridge() {
   const writing = useWritingStore()
   const campaign = useCampaignStore()
 
-  // Production defaults: per-plugin timeout is always on; cancel is cooperative.
+  // Production defaults: per-plugin timeout is always on; cancellation is scoped
+  // to one write/reroll generation so late events cannot revive old hooks.
   let promptHookTimeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
-  let promptHooksCancelled = false
+  let nextPromptHookGenerationId = 0
+  let activePromptHookGeneration = null
 
   function setPromptHookTimeoutMs(timeoutMs) {
     const previous = promptHookTimeoutMs
@@ -45,16 +49,30 @@ export function usePluginBridge() {
     return previous
   }
 
-  function cancelPromptHooks() {
-    promptHooksCancelled = true
+  function beginPromptHookGeneration() {
+    if (activePromptHookGeneration && !activePromptHookGeneration.controller.signal.aborted) {
+      activePromptHookGeneration.controller.abort()
+    }
+    activePromptHookGeneration = {
+      id: ++nextPromptHookGenerationId,
+      controller: new AbortController(),
+    }
+    return activePromptHookGeneration.id
   }
 
-  function resetPromptHookCancellation() {
-    promptHooksCancelled = false
+  function ensurePromptHookGeneration() {
+    if (!activePromptHookGeneration) beginPromptHookGeneration()
+    return activePromptHookGeneration
+  }
+
+  function cancelPromptHooks() {
+    const generation = ensurePromptHookGeneration()
+    if (!generation.controller.signal.aborted) generation.controller.abort()
+    return generation.id
   }
 
   function isPromptHooksCancelled() {
-    return promptHooksCancelled
+    return Boolean(activePromptHookGeneration?.controller.signal.aborted)
   }
 
   // ─── host ref 管理(App.vue:131-138)──────────────────────────────────
@@ -108,12 +126,13 @@ export function usePluginBridge() {
 
   // ─── prompt hook 审计(App.vue:178-185)──────────────────────────────
   function recordPromptHookAudit(record) {
+    const safeRecord = sanitizePromptHookAuditRecord(record)
     plugin.promptHookAuditRecords = appendPromptHookAuditRecord(
       plugin.promptHookAuditRecords,
-      record,
+      safeRecord,
       plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
     )
-    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(record)}`).catch(() => {})
+    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(safeRecord)}`).catch(() => {})
   }
 
   // ─── payload 构造(App.vue:187-213)──────────────────────────────────
@@ -159,7 +178,13 @@ export function usePluginBridge() {
   }
 
   // emitPromptHookEventAndWait 委托 utils/promptHooks.js,传入 stage / timeout / cancel / onAudit。
-  async function emitPromptHookEventAndWait(event, data = {}, stage = '') {
+  async function emitPromptHookEventAndWait(
+    event,
+    data = {},
+    stage = '',
+    generation = ensurePromptHookGeneration(),
+  ) {
+    if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
     return await emitPromptHookEventAndWaitForPlugins(
       plugin.hookPlugins,
       plugin.hookPluginHostRefs,
@@ -168,7 +193,7 @@ export function usePluginBridge() {
       {
         stage,
         timeoutMs: promptHookTimeoutMs,
-        isCancelled: isPromptHooksCancelled,
+        signal: generation.controller.signal,
         onAudit: recordPromptHookAudit,
       },
     )
@@ -177,7 +202,8 @@ export function usePluginBridge() {
   // ─── prompt hook 编排(App.vue:239-278)─────────────────────────────
   // runPromptHookEvents:写作前对用户意图依次触发两个 GENERATE hook,返回最终 intent。
   async function runPromptHookEvents(intent) {
-    resetPromptHookCancellation()
+    beginPromptHookGeneration()
+    const generation = activePromptHookGeneration
     let payload = {
       intent,
       prompt: intent,
@@ -190,8 +216,18 @@ export function usePluginBridge() {
       ...chatEventPayload(),
     }
 
-    payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS, payload, 'frontend_intent')
-    payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, payload, 'frontend_intent')
+    payload = await emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.GENERATE_BEFORE_COMBINE_PROMPTS,
+      payload,
+      'frontend_intent',
+      generation,
+    )
+    payload = await emitPromptHookEventAndWait(
+      ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+      payload,
+      'frontend_intent',
+      generation,
+    )
 
     return resolveHookedIntent(payload, intent)
   }
@@ -203,8 +239,10 @@ export function usePluginBridge() {
     const originalMessages = Array.isArray(data.messages) ? data.messages : []
     if (!requestId) return
 
-    resetPromptHookCancellation()
+    if (!activePromptHookGeneration) beginPromptHookGeneration()
+    const generation = activePromptHookGeneration
     try {
+      if (generation.controller.signal.aborted) throw createPromptHookCancelledError()
       const payload = await emitPromptHookEventAndWait(ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY, {
         ...chatEventPayload({
           promptHookStage: 'llm_messages',
@@ -213,7 +251,7 @@ export function usePluginBridge() {
           model: data.model || '',
         }),
         messages: originalMessages,
-      }, 'llm_messages')
+      }, 'llm_messages', generation)
       const messagesForBackend = resolveHookedMessages(payload, originalMessages)
       await pluginPromptHookResult(requestId, messagesForBackend, null)
     } catch (err) {
@@ -249,8 +287,8 @@ export function usePluginBridge() {
     handlePromptHookRequest,
     // production timeout/cancel wiring
     setPromptHookTimeoutMs,
+    beginPromptHookGeneration,
     cancelPromptHooks,
-    resetPromptHookCancellation,
     isPromptHooksCancelled,
   }
 }

@@ -13,8 +13,8 @@ pub mod compat_matrix;
 pub mod mvu_runtime;
 
 pub use compat_matrix::{
-    find_permission_entry, unsupported_event_names, CompatEntry, CompatStatus,
-    INTENTIONALLY_UNSUPPORTED_ST_EVENTS, PERMISSION_COMPAT_MATRIX, ST_API_COMPAT_MATRIX,
+    CompatEntry, CompatStatus, INTENTIONALLY_UNSUPPORTED_ST_EVENTS, PERMISSION_COMPAT_MATRIX,
+    ST_API_COMPAT_MATRIX, find_permission_entry, unsupported_event_names,
 };
 
 use serde::{Deserialize, Serialize};
