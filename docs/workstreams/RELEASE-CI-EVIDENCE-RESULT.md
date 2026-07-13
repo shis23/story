@@ -99,12 +99,12 @@ All in `scripts/release-build/ReleaseBuild.Common.ps1`:
 
 ## Local Validation Gates
 
-### Pester Tests (76 total, 0 failed)
+### Pester Tests (79 total, 0 failed)
 
 ```
 ReleaseBuild.Tests.ps1:           Passed: 37  Failed: 0
 ReleaseBuild.Pipeline.Tests.ps1:  Passed: 14  Failed: 0
-ReleaseBuild.CI.Tests.ps1:        Passed: 25  Failed: 0
+ReleaseBuild.CI.Tests.ps1:        Passed: 28  Failed: 0
 ```
 
 Command:
@@ -215,6 +215,14 @@ Addressed review findings that would have blocked merge/CI:
 7. **`.sha256` written UTF-8 without BOM** via `UTF8Encoding($false)`.
 8. **Pester 5:** `Run.PassThru = $true` set so result objects are returned.
 9. **ZIP/APK integrity reads entry payloads**, not just entry names.
+10. **Host evidence defaults to `-SkipBundle`** (`skip_bundle` default `true`);
+    tags also host-only. Explicit `skip_bundle=false` installs pinned
+    `tauri-cli==2.11.2` via `cargo install --locked` before bundling.
+11. **Workflow YAML validation requires a real parser** (PyYAML or Node
+    yaml/js-yaml). Structural PowerShell checks are test-only
+    (`-PreferPowerShell`); CI installs pinned `PyYAML==6.0.2`.
+12. **Untracked secret scan is fail-closed** on `git ls-files` failure, unread
+    files, and inputs larger than 2 MiB (no silent skip).
 
 ### Verified: No path/command output leakage
 

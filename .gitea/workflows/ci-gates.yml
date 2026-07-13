@@ -163,15 +163,24 @@ jobs:
           pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
 
   workflow-syntax:
-    # Validate every tracked workflow YAML with the pure-PowerShell path
-    # (no python hard dependency). PreferPowerShell keeps this reproducible
-    # on any runner with PowerShell Core / Windows PowerShell.
+    # Real YAML parser required (PyYAML). Structural-only PowerShell checks
+    # are not accepted for production workflow validation.
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Validate workflow YAML syntax
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PyYAML
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'PyYAML==6.0.2'
+          python -c "import yaml; print(yaml.__version__)"
+      - name: Validate workflow YAML syntax with PyYAML
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -181,7 +190,10 @@ jobs:
                    @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
           if ($files.Count -eq 0) { throw 'No workflow files found.' }
           foreach ($f in $files) {
-            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName -PreferPowerShell
+            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
+            if ($result.Engine -notmatch 'pyyaml|node-yaml') {
+              throw "FAIL: $($f.Name) did not use a real YAML parser (engine=$($result.Engine))"
+            }
             if (-not $result.Valid) {
               Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
               $result.Errors | ForEach-Object { Write-Host "  $_" }

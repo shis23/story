@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       skip_bundle:
-        description: 'Skip Tauri bundle (host-binary-only evidence)'
+        description: 'Skip Tauri bundle (host-binary-only evidence). Default true for reliable host evidence; set false only after tauri-cli is installed.'
         required: false
-        default: 'false'
+        default: 'true'
         type: choice
         options: ['true', 'false']
   push:
@@ -54,25 +54,41 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
+      # Default path is host-only (-SkipBundle). Tags and empty inputs also
+      # default to host-only so a fresh runner never fails for missing tauri-cli.
+      # When skip_bundle is explicitly false, install a pinned cargo-tauri.
       - name: Resolve skip-bundle flag
         id: bundle
         shell: pwsh
         run: |
           $skip = '${{ github.event.inputs.skip_bundle }}'
-          if ($skip -eq 'true') {
-            "skip_flag=-SkipBundle" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # workflow_dispatch default is true; tags / empty => host-only.
+          if ([string]::IsNullOrWhiteSpace($skip) -or $skip -eq 'true') {
+            "skip_bundle=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            "skip_flag=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "skip_bundle=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Install pinned tauri-cli when bundle is requested
+        if: steps.bundle.outputs.skip_bundle == 'false'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pinned = '2.11.2'
+          cargo install tauri-cli --locked --version $pinned --force
+          cargo tauri --version
+          $ver = (& cargo tauri --version 2>&1 | Out-String).Trim()
+          if ($ver -notmatch [regex]::Escape($pinned)) {
+            throw "Expected tauri-cli $pinned, got: $ver"
           }
 
       - name: Windows host release build
         shell: pwsh
         run: |
-          $flag = '${{ steps.bundle.outputs.skip_flag }}'
-          if ([string]::IsNullOrWhiteSpace($flag)) {
-            pwsh -NoProfile -File scripts/run-release-build.ps1
-          } else {
+          if ('${{ steps.bundle.outputs.skip_bundle }}' -eq 'true') {
             pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle
+          } else {
+            pwsh -NoProfile -File scripts/run-release-build.ps1
           }
 
       - name: Locate evidence directory

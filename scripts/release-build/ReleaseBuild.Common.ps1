@@ -431,44 +431,58 @@ function Invoke-ReleaseSecretScan {
     }
 
     # Also scan untracked build-input files that may participate in the build
-    # but are not yet in the index/worktree tracked set.
+    # but are not yet in the index/worktree tracked set. Fail closed: listing,
+    # size, and read failures are errors, not silent skips.
     $excludeDirs = @('target', 'node_modules', 'frontend/dist', 'frontend/node_modules', '.git', 'artifacts')
+    $maxUntrackedBytes = 2MB
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $untracked = @(& git -C $RepoRoot ls-files --others --exclude-standard 2>$null)
+        $untracked = @(& git -C $RepoRoot ls-files --others --exclude-standard 2>&1)
         $utCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEap
     }
-    if ($utCode -eq 0 -and $untracked) {
-        foreach ($rel in $untracked) {
-            $normalized = ($rel -replace '\\', '/')
-            $skip = $false
-            foreach ($ex in $excludeDirs) {
-                if ($normalized -eq $ex -or $normalized.StartsWith("$ex/")) {
-                    $skip = $true
-                    break
-                }
+    if ($utCode -ne 0) {
+        throw ("Secret scan failed while listing untracked files (git ls-files exit {0})." -f $utCode)
+    }
+    foreach ($rel in $untracked) {
+        if ([string]::IsNullOrWhiteSpace("$rel")) { continue }
+        # git may emit non-path diagnostics when mixed with stderr; only scan path-like lines.
+        $normalized = ("$rel" -replace '\\', '/')
+        if ($normalized -match '^(fatal:|error:|warning:)') {
+            throw ("Secret scan failed while listing untracked files: {0}" -f (Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot))
+        }
+        $skip = $false
+        foreach ($ex in $excludeDirs) {
+            if ($normalized -eq $ex -or $normalized.StartsWith("$ex/")) {
+                $skip = $true
+                break
             }
-            if ($skip) { continue }
-            $full = Join-Path $RepoRoot ($rel -replace '/', [System.IO.Path]::DirectorySeparatorChar)
-            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
-            # Skip binary / very large files.
-            $item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
-            if (-not $item -or $item.Length -gt 2MB) { continue }
-            try {
-                $text = [System.IO.File]::ReadAllText($full)
-            } catch {
-                continue
-            }
-            $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
-            foreach ($hit in $patternHits) {
-                # Report rule name + path only; never echo secret values.
-                $ruleName = $hit -replace '^secret-pattern:', ''
-                $safePath = Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot
-                $findings.Add(("untracked {0} at {1}" -f $ruleName, $safePath))
-            }
+        }
+        if ($skip) { continue }
+        $full = Join-Path $RepoRoot ($normalized -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            # Directories appear in ls-files only as files; ignore missing leaves that
+            # disappeared between listing and open only if path is not a file.
+            if (Test-Path -LiteralPath $full) { continue }
+            throw ("Secret scan failed: untracked path vanished or is not a readable file: {0}" -f (Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot))
+        }
+        $item = Get-Item -LiteralPath $full -ErrorAction Stop
+        if ($item.Length -gt $maxUntrackedBytes) {
+            throw ("Secret scan failed: untracked build-input '{0}' is {1} bytes (limit {2}). Move it under an excluded path or reduce size so it can be scanned fail-closed." -f (Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot), $item.Length, $maxUntrackedBytes)
+        }
+        try {
+            $text = [System.IO.File]::ReadAllText($full)
+        } catch {
+            throw ("Secret scan failed: cannot read untracked build-input '{0}'." -f (Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot))
+        }
+        $patternHits = @(Find-ReleaseSecretPatternFindings -Text $text)
+        foreach ($hit in $patternHits) {
+            # Report rule name + path only; never echo secret values.
+            $ruleName = $hit -replace '^secret-pattern:', ''
+            $safePath = Protect-ReleasePath -Text $normalized -RepoRoot $RepoRoot
+            $findings.Add(("untracked {0} at {1}" -f $ruleName, $safePath))
         }
     }
 
@@ -1422,10 +1436,9 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
     Pure-PowerShell structural validation of a Gitea/GitHub Actions workflow YAML.
 
     .DESCRIPTION
-    Does not require python/PyYAML. Checks that the file is non-empty, has a
-    `jobs:` mapping, and that top-level keys look like a workflow. Catches
-    obvious syntax errors (unbalanced brackets, empty file, missing jobs).
-    Not a full YAML parser — prefer python+PyYAML when available.
+    Heuristic only — not a real YAML parser. Used solely as an emergency fallback
+    when explicitly allowed. Production validation must use PyYAML or a Node YAML
+    parser.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path
@@ -1436,11 +1449,10 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
     if ([string]::IsNullOrWhiteSpace($text)) {
         $errors.Add('Workflow file is empty')
         return [pscustomobject]@{
-            Valid = $false; ErrorCount = $errors.Count; Errors = @($errors); Engine = 'powershell'
+            Valid = $false; ErrorCount = $errors.Count; Errors = @($errors); Engine = 'powershell-structural'
         }
     }
 
-    # Obvious bracket imbalance (common YAML list/map typo).
     $openSquare = ([regex]::Matches($text, '\[')).Count
     $closeSquare = ([regex]::Matches($text, '\]')).Count
     if ($openSquare -ne $closeSquare) {
@@ -1451,16 +1463,12 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
     if ($openCurly -ne $closeCurly) {
         $errors.Add('Unbalanced curly braces')
     }
-
-    # Required structural markers for Actions workflows.
     if ($text -notmatch '(?m)^jobs\s*:') {
         $errors.Add("Missing top-level 'jobs:' mapping")
     }
     if ($text -notmatch '(?m)^(on|name)\s*:') {
         $errors.Add("Missing top-level 'on:' or 'name:' key")
     }
-
-    # Detect tab-indent (YAML forbids tabs for indentation).
     if ($text -match '(?m)^\t') {
         $errors.Add('Tab indentation is not allowed in YAML')
     }
@@ -1469,43 +1477,15 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
         Valid      = ($errors.Count -eq 0)
         ErrorCount = $errors.Count
         Errors     = @($errors)
-        Engine     = 'powershell'
+        Engine     = 'powershell-structural'
     }
 }
 
-function Test-ReleaseWorkflowSyntax {
-    <#
-    .SYNOPSIS
-    Validates that a workflow YAML file parses without syntax errors.
-
-    .DESCRIPTION
-    Prefers pure-PowerShell structural validation (always available). When
-    python+PyYAML is present and -PreferPowerShell is not set, also runs a
-    full YAML parse and merges results. Never hard-fails solely because
-    python is missing. Returns Valid/ErrorCount/Errors/Engine.
-    #>
+function Test-ReleaseWorkflowSyntaxWithPyYaml {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$PreferPowerShell
+        [Parameter(Mandatory = $true)][string]$PythonCommand
     )
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "Workflow file not found: $Path"
-    }
-
-    $psResult = Test-ReleaseWorkflowSyntaxPowerShell -Path $Path
-    if ($PreferPowerShell) {
-        return $psResult
-    }
-
-    # Optional python+PyYAML enrichment when available.
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $pythonCmd) {
-        $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
-    }
-    if (-not $pythonCmd) {
-        return $psResult
-    }
 
     $pyScript = @'
 import sys, json
@@ -1524,13 +1504,19 @@ try:
         errors.append("Workflow file is empty or parsed to null")
     elif not isinstance(data, dict):
         errors.append("Workflow root must be a mapping/dict")
+    else:
+        jobs = data.get("jobs")
+        if not isinstance(jobs, dict):
+            errors.append("Top-level 'jobs' must be a mapping after YAML parse")
+        if "on" not in data and "name" not in data:
+            errors.append("Missing top-level 'on' or 'name' after YAML parse")
 except yaml.YAMLError as exc:
     msg = str(exc).replace("\n", " ")
     errors.append("YAML parse error: " + msg[:500])
 except Exception as exc:
     errors.append("Unexpected error: " + str(exc)[:500])
 
-result = {"valid": len(errors) == 0, "error_count": len(errors), "errors": errors, "engine": "python"}
+result = {"valid": len(errors) == 0, "error_count": len(errors), "errors": errors, "engine": "pyyaml"}
 print(json.dumps(result))
 '@
 
@@ -1541,34 +1527,177 @@ print(json.dumps(result))
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $rawOutput = & $pythonCmd.Source $tmpPy $Path 2>&1
+            $rawOutput = & $PythonCommand $tmpPy $Path 2>&1
             $code = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
         }
-
         if ($code -ne 0 -or [string]::IsNullOrWhiteSpace(($rawOutput | Out-String))) {
-            # Python failed; fall back to pure PowerShell result.
-            return $psResult
+            return [pscustomobject]@{
+                Valid = $false
+                ErrorCount = 1
+                Errors = @("python PyYAML validation exited $code or produced no output")
+                Engine = 'pyyaml'
+            }
         }
-
         $lastLine = @($rawOutput | Where-Object { "$_" -match '^\{' })[-1]
         if (-not $lastLine) {
-            return $psResult
+            return [pscustomobject]@{
+                Valid = $false
+                ErrorCount = 1
+                Errors = @('python PyYAML validation produced no JSON output')
+                Engine = 'pyyaml'
+            }
         }
-
         $parsed = $lastLine | ConvertFrom-Json
-        # If python reports missing PyYAML, keep PowerShell result.
-        if ($parsed.engine -eq 'python-missing-pyyaml') {
-            return $psResult
-        }
         return [pscustomobject]@{
             Valid      = [bool]$parsed.valid
             ErrorCount = [int]$parsed.error_count
             Errors     = @($parsed.errors)
-            Engine     = 'python'
+            Engine     = [string]$parsed.engine
         }
     } finally {
         Remove-Item -LiteralPath $tmpPy -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ReleaseWorkflowSyntaxWithNodeYaml {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$NodeCommand
+    )
+
+    # Use Node's process.argv only; no shell interpolation of workflow content.
+    $js = @'
+const fs = require("fs");
+const path = process.argv[1];
+function fail(msg) {
+  process.stdout.write(JSON.stringify({ valid: false, error_count: 1, errors: [msg], engine: "node-yaml" }));
+  process.exit(0);
+}
+let yaml;
+try {
+  yaml = require("yaml");
+} catch (_) {
+  try {
+    yaml = require("js-yaml");
+  } catch (e2) {
+    fail("Neither 'yaml' nor 'js-yaml' Node packages are installed");
+  }
+}
+try {
+  const text = fs.readFileSync(path, "utf8");
+  const data = yaml.load ? yaml.load(text) : yaml.parse(text);
+  const errors = [];
+  if (data == null) errors.push("Workflow file is empty or parsed to null");
+  else if (typeof data !== "object" || Array.isArray(data)) errors.push("Workflow root must be a mapping/dict");
+  else {
+    if (!data.jobs || typeof data.jobs !== "object" || Array.isArray(data.jobs)) {
+      errors.push("Top-level 'jobs' must be a mapping after YAML parse");
+    }
+    if (!Object.prototype.hasOwnProperty.call(data, "on") && !Object.prototype.hasOwnProperty.call(data, "name")) {
+      errors.push("Missing top-level 'on' or 'name' after YAML parse");
+    }
+  }
+  process.stdout.write(JSON.stringify({ valid: errors.length === 0, error_count: errors.length, errors, engine: "node-yaml" }));
+} catch (e) {
+  const msg = String(e && e.message ? e.message : e).replace(/\n/g, " ").slice(0, 500);
+  process.stdout.write(JSON.stringify({ valid: false, error_count: 1, errors: ["YAML parse error: " + msg], engine: "node-yaml" }));
+}
+'@
+
+    $tmpJs = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-yaml-{0}.js" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($tmpJs, $js, $utf8NoBom)
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $rawOutput = & $NodeCommand $tmpJs $Path 2>&1
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($code -ne 0 -or [string]::IsNullOrWhiteSpace(($rawOutput | Out-String))) {
+            return [pscustomobject]@{
+                Valid = $false
+                ErrorCount = 1
+                Errors = @("node YAML validation exited $code or produced no output")
+                Engine = 'node-yaml'
+            }
+        }
+        $lastLine = @($rawOutput | Where-Object { "$_" -match '^\{' })[-1]
+        if (-not $lastLine) {
+            return [pscustomobject]@{
+                Valid = $false
+                ErrorCount = 1
+                Errors = @('node YAML validation produced no JSON output')
+                Engine = 'node-yaml'
+            }
+        }
+        $parsed = $lastLine | ConvertFrom-Json
+        return [pscustomobject]@{
+            Valid      = [bool]$parsed.valid
+            ErrorCount = [int]$parsed.error_count
+            Errors     = @($parsed.errors)
+            Engine     = [string]$parsed.engine
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmpJs -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ReleaseWorkflowSyntax {
+    <#
+    .SYNOPSIS
+    Validates that a workflow YAML file parses without syntax errors.
+
+    .DESCRIPTION
+    Uses a real YAML parser by default (PyYAML via python, or Node yaml/js-yaml).
+    Fails closed when no real parser is available unless -AllowStructuralFallback
+    is set. -PreferPowerShell forces the heuristic path (tests only).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$PreferPowerShell,
+        [switch]$AllowStructuralFallback
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Workflow file not found: $Path"
+    }
+
+    if ($PreferPowerShell) {
+        return (Test-ReleaseWorkflowSyntaxPowerShell -Path $Path)
+    }
+
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) {
+        $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if ($pythonCmd) {
+        $pyResult = Test-ReleaseWorkflowSyntaxWithPyYaml -Path $Path -PythonCommand $pythonCmd.Source
+        if ($pyResult.Engine -ne 'python-missing-pyyaml') {
+            return $pyResult
+        }
+    }
+
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeCmd) {
+        $nodeResult = Test-ReleaseWorkflowSyntaxWithNodeYaml -Path $Path -NodeCommand $nodeCmd.Source
+        if ($nodeResult.Errors -notcontains "Neither 'yaml' nor 'js-yaml' Node packages are installed") {
+            return $nodeResult
+        }
+    }
+
+    if ($AllowStructuralFallback) {
+        return (Test-ReleaseWorkflowSyntaxPowerShell -Path $Path)
+    }
+
+    return [pscustomobject]@{
+        Valid      = $false
+        ErrorCount = 1
+        Errors     = @('No real YAML parser available (need python+PyYAML or node with yaml/js-yaml). Structural-only checks are not accepted for production validation.')
+        Engine     = 'none'
     }
 }

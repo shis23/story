@@ -254,7 +254,7 @@ Describe 'ReleaseBuild manifest schema validation' {
 }
 
 Describe 'ReleaseBuild workflow YAML validation' {
-    It 'validates a well-formed workflow file parses without error' {
+    It 'validates a well-formed workflow file with a real YAML parser' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
         try {
@@ -271,26 +271,36 @@ Describe 'ReleaseBuild workflow YAML validation' {
             $result = Test-ReleaseWorkflowSyntax -Path $wf
             $result.Valid | Should Be $true
             $result.ErrorCount | Should Be 0
+            $result.Engine | Should Match 'pyyaml|node-yaml'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
-    It 'detects invalid YAML syntax' {
+    It 'detects invalid YAML syntax with a real parser (not structural-only)' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-bad-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
         try {
             $wf = Join-Path $dir 'bad.yml'
+            # Valid-looking keys for the structural heuristic, but invalid YAML quoting.
             @(
                 'name: test'
-                'on: [push'
+                'on: push'
                 'jobs:'
-                '  : bad indent'
-                '    - run: oops'
+                '  build:'
+                '    runs-on: ubuntu-latest'
+                '    steps:'
+                '      - run: "unclosed quote'
             ) | Set-Content -LiteralPath $wf -Encoding utf8
+            $structural = Test-ReleaseWorkflowSyntax -Path $wf -PreferPowerShell
+            # Structural path may still pass; real parser must fail.
             $result = Test-ReleaseWorkflowSyntax -Path $wf
             $result.Valid | Should Be $false
             $result.ErrorCount | Should BeGreaterThan 0
+            $result.Engine | Should Match 'pyyaml|node-yaml'
+            if ($structural.Valid) {
+                $result.Valid | Should Be $false
+            }
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -299,6 +309,24 @@ Describe 'ReleaseBuild workflow YAML validation' {
     It 'fails closed for a missing workflow file' {
         $missing = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-no-wf-{0}.yml" -f [guid]::NewGuid().ToString('N'))
         { Test-ReleaseWorkflowSyntax -Path $missing } | Should Throw
+    }
+
+    It 'rejects jobs that are not a mapping after real parse' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-jobs-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'jobs-null.yml'
+            @(
+                'name: test'
+                'on: push'
+                'jobs: null'
+            ) | Set-Content -LiteralPath $wf -Encoding utf8
+            $result = Test-ReleaseWorkflowSyntax -Path $wf
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'jobs'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -382,10 +410,32 @@ Describe 'ReleaseBuild secret scan untracked inputs' {
             Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    It 'fails closed when an untracked build-input exceeds the scan size limit' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-scan-large-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $repo | Out-Null
+        Push-Location $repo
+        try {
+            & git init --quiet | Out-Null
+            & git config user.email 'test@example.com'
+            & git config user.name 'test'
+            Set-Content -LiteralPath (Join-Path $repo 'README.md') -Value 'ok' -Encoding utf8
+            & git add README.md
+            & git commit -m 'init' --quiet | Out-Null
+            $big = Join-Path $repo 'oversized-input.bin'
+            # 2 MiB + 1 byte — must fail closed, not skip.
+            $bytes = New-Object byte[] (2MB + 1)
+            [System.IO.File]::WriteAllBytes($big, $bytes)
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
+        } finally {
+            Pop-Location
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
-Describe 'ReleaseBuild workflow syntax without python dependency' {
-    It 'validates workflow structure with the pure PowerShell path when python is unavailable' {
+Describe 'ReleaseBuild workflow syntax structural fallback' {
+    It 'can run PreferPowerShell structural checks but production path requires a real parser engine' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-ps-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
         try {
@@ -405,11 +455,25 @@ Describe 'ReleaseBuild workflow syntax without python dependency' {
                 '    steps:'
                 '      - run: echo hi'
             ) | Set-Content -LiteralPath $wf -Encoding utf8
-            $result = Test-ReleaseWorkflowSyntax -Path $wf -PreferPowerShell
-            $result.Valid | Should Be $true
-            $result.Engine | Should Match 'powershell|python'
+            $structural = Test-ReleaseWorkflowSyntax -Path $wf -PreferPowerShell
+            $structural.Valid | Should Be $true
+            $structural.Engine | Should Match 'powershell'
+            $real = Test-ReleaseWorkflowSyntax -Path $wf
+            $real.Valid | Should Be $true
+            $real.Engine | Should Match 'pyyaml|node-yaml'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+Describe 'ReleaseBuild host evidence workflow defaults' {
+    It 'defaults skip_bundle to true and pins tauri-cli when bundle is requested' {
+        $wf = Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'
+        $text = Get-Content -LiteralPath $wf -Raw
+        $text | Should Match 'default:\s*''true'''
+        $text | Should Match 'tauri-cli --locked --version'
+        $text | Should Match '2\.11\.2'
+        $text | Should Match 'SkipBundle'
     }
 }
