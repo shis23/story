@@ -1,7 +1,6 @@
 //! 生产忠实 CommitTurn / Accept 探针（不经 Tauri command 私有路径）。
 //!
-//! 用公开的 `TurnStore` + `CampaignMutationCoordinator` + `ConversationStore`
-//! 复刻生产 `commit_turn_attempt` 的关键断言与副作用：
+//! 通过共享 `turn_lifecycle::TurnLifecycleService` 走生产 Accept 路径：
 //! - draft_hash 校验
 //! - QualityGate Error 拦截 / force → Degraded
 //! - AwaitingAcceptance 才可 accept
@@ -19,11 +18,11 @@ use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign::Campaign;
 use storyforge_domain::chronicle::{ChronicleCode, ChronicleLevel, truncate_headline};
 use storyforge_domain::turn::{
-    AttemptStatus, Mutation, MutationBatch, MutationBatchStatus, QualityAcceptDecision,
-    QualityReport, TurnAttempt, TurnRecord, TurnStatus, quality_accept_decision,
+    AttemptStatus, Mutation, MutationBatch, MutationBatchStatus, QualityReport, TurnAttempt,
+    TurnRecord, TurnStatus,
 };
 use storyforge_tauri_app::campaign_store::CampaignStore;
-use storyforge_tauri_app::turn_coordinator::{CampaignMutationCoordinator, with_campaign_lock};
+use storyforge_tauri_app::turn_lifecycle::{self, TurnLifecycleService};
 use storyforge_tauri_app::turn_store::TurnStore;
 
 use crate::evidence::{AssertionResult, draft_hash_hex, short_hash16};
@@ -230,316 +229,188 @@ impl CommitProbeEnv {
         let campaign_revision_before = camp_before.revision;
         let chronicle_revision_before = camp_before.chronicle_revision;
 
-        let turn = match self.turn_store.get_turn_by_variant(&input.variant_id) {
-            Some(t) => t,
-            None => {
-                return ProductionAcceptResult {
-                    ok: false,
-                    error: Some("no TurnRecord for variant".into()),
+        let service =
+            TurnLifecycleService::new(&self.campaign_store, &self.turn_store, &self.conv_store);
+        match service.accept_by_variant(
+            &input.campaign_id,
+            &input.conversation_id,
+            &input.variant_id,
+            input.force_accept,
+        ) {
+            Ok(outcome) => {
+                assertions.push(AssertionResult {
+                    name: "turn_record_present".into(),
+                    passed: true,
+                    detail: None,
+                });
+                assertions.push(AssertionResult {
+                    name: "attempt_awaiting_acceptance".into(),
+                    passed: true,
+                    detail: None,
+                });
+                if outcome.commit_as_degraded {
+                    assertions.push(AssertionResult {
+                        name: "quality_force_degraded".into(),
+                        passed: true,
+                        detail: None,
+                    });
+                }
+                assertions.push(AssertionResult {
+                    name: "revision_cas".into(),
+                    passed: true,
+                    detail: Some(format!("rev={campaign_revision_before}")),
+                });
+                assertions.push(AssertionResult {
+                    name: "draft_hash_match".into(),
+                    passed: true,
+                    detail: Some(short_hash16(&draft_hash)),
+                });
+
+                let camp_after = self
+                    .campaign_store
+                    .get_campaign(&input.campaign_id)
+                    .expect("campaign after");
+                let campaign_revision_after = camp_after.revision;
+                let chronicle_revision_after = camp_after.chronicle_revision;
+                let summary_code = outcome.batch.mutations.iter().find_map(|m| match m {
+                    Mutation::UpsertSummary(s) => s.code.clone(),
+                    _ => None,
+                });
+
+                assertions.push(AssertionResult {
+                    name: "campaign_revision_bumped".into(),
+                    passed: campaign_revision_after == campaign_revision_before + 1,
+                    detail: Some(format!(
+                        "{campaign_revision_before}->{campaign_revision_after}"
+                    )),
+                });
+                if summary_code.is_some() {
+                    assertions.push(AssertionResult {
+                        name: "chronicle_a_persisted".into(),
+                        passed: chronicle_revision_after > chronicle_revision_before
+                            || !self
+                                .campaign_store
+                                .list_summaries(&input.campaign_id)
+                                .is_empty(),
+                        detail: summary_code.clone(),
+                    });
+                }
+
+                let final_ok = self
+                    .conv_store
+                    .get(&input.conversation_id)
+                    .and_then(|c| {
+                        c.nodes
+                            .iter()
+                            .find(|n| n.id == input.variant_id)
+                            .and_then(|n| n.active())
+                            .map(|v| {
+                                matches!(
+                                    v.status,
+                                    storyforge_domain::conversation::VariantStatus::Final
+                                )
+                            })
+                    })
+                    .unwrap_or(false);
+                assertions.push(AssertionResult {
+                    name: "variant_final".into(),
+                    passed: final_ok,
+                    detail: None,
+                });
+
+                let all_pass = assertions.iter().all(|a| a.passed);
+                ProductionAcceptResult {
+                    ok: all_pass,
+                    error: if all_pass {
+                        None
+                    } else {
+                        Some("one or more post-commit assertions failed".into())
+                    },
                     force_accept: input.force_accept,
-                    turn_status: None,
-                    attempt_status: None,
+                    turn_status: Some(outcome.turn_status),
+                    attempt_status: Some(outcome.attempt_status),
                     campaign_revision_before,
-                    campaign_revision_after: campaign_revision_before,
+                    campaign_revision_after,
                     chronicle_revision_before,
-                    chronicle_revision_after: chronicle_revision_before,
-                    summary_code: None,
+                    chronicle_revision_after,
+                    summary_code,
                     draft_hash,
-                    assertions: vec![AssertionResult {
+                    assertions,
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if matches!(err, turn_lifecycle::AcceptError::NoTurnRecord) {
+                    assertions.push(AssertionResult {
                         name: "turn_record_present".into(),
                         passed: false,
                         detail: Some("missing".into()),
-                    }],
-                };
-            }
-        };
-
-        assertions.push(AssertionResult {
-            name: "turn_record_present".into(),
-            passed: true,
-            detail: None,
-        });
-
-        let attempt = match turn.find_attempt_by_variant(&input.variant_id) {
-            Some(a) => a.clone(),
-            None => {
-                return fail_result(
+                    });
+                    return ProductionAcceptResult {
+                        ok: false,
+                        error: Some("no TurnRecord for variant".into()),
+                        force_accept: input.force_accept,
+                        turn_status: None,
+                        attempt_status: None,
+                        campaign_revision_before,
+                        campaign_revision_after: campaign_revision_before,
+                        chronicle_revision_before,
+                        chronicle_revision_after: chronicle_revision_before,
+                        summary_code: None,
+                        draft_hash,
+                        assertions,
+                    };
+                }
+                if matches!(err, turn_lifecycle::AcceptError::QualityBlocked { .. }) {
+                    assertions.push(AssertionResult {
+                        name: "turn_record_present".into(),
+                        passed: true,
+                        detail: None,
+                    });
+                    assertions.push(AssertionResult {
+                        name: "attempt_awaiting_acceptance".into(),
+                        passed: true,
+                        detail: None,
+                    });
+                    assertions.push(AssertionResult {
+                        name: "quality_block".into(),
+                        passed: true,
+                        detail: Some(msg.clone()),
+                    });
+                    let error = Some(match err {
+                        turn_lifecycle::AcceptError::QualityBlocked { error_count } => {
+                            format!("quality gate blocked accept: {error_count} error(s)")
+                        }
+                        _ => msg.clone(),
+                    });
+                    let turn = self.turn_store.get_turn_by_variant(&input.variant_id);
+                    return ProductionAcceptResult {
+                        ok: false,
+                        error,
+                        force_accept: input.force_accept,
+                        turn_status: turn.as_ref().map(|t| t.status.clone()),
+                        attempt_status: turn
+                            .as_ref()
+                            .and_then(|t| t.find_attempt_by_variant(&input.variant_id))
+                            .map(|a| a.status.clone()),
+                        campaign_revision_before,
+                        campaign_revision_after: campaign_revision_before,
+                        chronicle_revision_before,
+                        chronicle_revision_after: chronicle_revision_before,
+                        summary_code: None,
+                        draft_hash,
+                        assertions,
+                    };
+                }
+                fail_result(
                     input,
                     campaign_revision_before,
                     chronicle_revision_before,
                     draft_hash,
                     assertions,
-                    "no active TurnAttempt for variant",
-                );
+                    &msg,
+                )
             }
-        };
-
-        if attempt.status != AttemptStatus::AwaitingAcceptance {
-            return fail_result(
-                input,
-                campaign_revision_before,
-                chronicle_revision_before,
-                draft_hash,
-                assertions,
-                &format!("attempt status {:?} not AwaitingAcceptance", attempt.status),
-            );
-        }
-        assertions.push(AssertionResult {
-            name: "attempt_awaiting_acceptance".into(),
-            passed: true,
-            detail: None,
-        });
-
-        // QualityGate policy
-        let decision = quality_accept_decision(attempt.quality_report.as_ref(), input.force_accept);
-        let commit_as_degraded = match &decision {
-            QualityAcceptDecision::AllowCommit => false,
-            QualityAcceptDecision::ForceDegraded { error_count } => {
-                assertions.push(AssertionResult {
-                    name: "quality_force_degraded".into(),
-                    passed: true,
-                    detail: Some(format!("error_count={error_count}")),
-                });
-                true
-            }
-            QualityAcceptDecision::Block { error_count } => {
-                assertions.push(AssertionResult {
-                    name: "quality_block".into(),
-                    passed: true,
-                    detail: Some(format!("error_count={error_count}")),
-                });
-                return ProductionAcceptResult {
-                    ok: false,
-                    error: Some(format!(
-                        "quality gate blocked accept: {error_count} error(s)"
-                    )),
-                    force_accept: input.force_accept,
-                    turn_status: Some(turn.status.clone()),
-                    attempt_status: Some(attempt.status.clone()),
-                    campaign_revision_before,
-                    campaign_revision_after: campaign_revision_before,
-                    chronicle_revision_before,
-                    chronicle_revision_after: chronicle_revision_before,
-                    summary_code: None,
-                    draft_hash,
-                    assertions,
-                };
-            }
-        };
-
-        // revision CAS
-        if turn.base_campaign_revision != campaign_revision_before {
-            return fail_result(
-                input,
-                campaign_revision_before,
-                chronicle_revision_before,
-                draft_hash,
-                assertions,
-                &format!(
-                    "revision conflict turn.base={} current={}",
-                    turn.base_campaign_revision, campaign_revision_before
-                ),
-            );
-        }
-        assertions.push(AssertionResult {
-            name: "revision_cas".into(),
-            passed: true,
-            detail: Some(format!("rev={campaign_revision_before}")),
-        });
-
-        // draft_hash re-check against live variant content
-        let live_text =
-            read_variant_content(&self.conv_store, &input.conversation_id, &input.variant_id);
-        let live_hash = draft_hash_hex(&live_text);
-        if live_hash != attempt.draft_hash {
-            return fail_result(
-                input,
-                campaign_revision_before,
-                chronicle_revision_before,
-                draft_hash,
-                assertions,
-                "draft_hash mismatch vs live variant",
-            );
-        }
-        assertions.push(AssertionResult {
-            name: "draft_hash_match".into(),
-            passed: true,
-            detail: Some(short_hash16(&live_hash)),
-        });
-
-        // ensure FinalizeVariant present
-        let mut batch = attempt
-            .pending_state_changes
-            .clone()
-            .unwrap_or_else(|| MutationBatch::new(Id::new(), campaign_revision_before));
-        let has_finalize = batch
-            .mutations
-            .iter()
-            .any(|m| matches!(m, Mutation::FinalizeVariant { .. }));
-        if !has_finalize {
-            batch.mutations.push(Mutation::FinalizeVariant {
-                variant_id: input.variant_id.clone(),
-            });
-        }
-
-        let summary_code = batch.mutations.iter().find_map(|m| match m {
-            Mutation::UpsertSummary(s) => s.code.clone(),
-            _ => None,
-        });
-
-        // CAS turn → Committing
-        let turn_id = turn.turn_id.clone();
-        let attempt_id = attempt.attempt_id.clone();
-        let batch_for_store = batch.clone();
-        let cas_ok = self
-            .turn_store
-            .mutate_if(
-                &turn_id,
-                |record| {
-                    record.status == TurnStatus::AwaitingAcceptance
-                        && record
-                            .find_attempt(&attempt_id)
-                            .is_some_and(|a| a.status == AttemptStatus::AwaitingAcceptance)
-                },
-                |record| {
-                    record.status = TurnStatus::Committing;
-                    if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                        att.status = AttemptStatus::Committing;
-                        att.pending_state_changes = Some(batch_for_store);
-                    }
-                    record.touch();
-                },
-            )
-            .expect("mutate_if");
-        if !cas_ok {
-            return fail_result(
-                input,
-                campaign_revision_before,
-                chronicle_revision_before,
-                draft_hash,
-                assertions,
-                "turn CAS into Committing failed",
-            );
-        }
-
-        // side effects under campaign lock
-        let apply_result = with_campaign_lock(|| {
-            self.conv_store
-                .accept_variant(&input.conversation_id, &input.variant_id)
-                .map_err(|e| {
-                    storyforge_tauri_app::turn_coordinator::CommitError::Storage(format!(
-                        "Draft→Final failed: {e}"
-                    ))
-                })?;
-            CampaignMutationCoordinator::apply_mutation_batch(
-                &self.campaign_store,
-                &input.campaign_id,
-                &batch,
-            )?;
-            Ok(())
-        });
-
-        if let Err(e) = apply_result {
-            let _ = self.turn_store.with_turn_mut(&turn_id, |record| {
-                record.status = TurnStatus::Failed;
-                record.failure_reason = Some(e.to_string());
-                record.touch();
-            });
-            return fail_result(
-                input,
-                campaign_revision_before,
-                chronicle_revision_before,
-                draft_hash,
-                assertions,
-                &format!("commit side effects failed: {e}"),
-            );
-        }
-
-        let final_status = if commit_as_degraded {
-            TurnStatus::Degraded
-        } else {
-            TurnStatus::Committed
-        };
-        let _ = self.turn_store.with_turn_mut(&turn_id, |record| {
-            record.status = final_status.clone();
-            record.accepted_attempt_id = Some(attempt_id.clone());
-            for att in &mut record.attempts {
-                if att.attempt_id != attempt_id && att.status.is_active() {
-                    att.status = AttemptStatus::Superseded;
-                } else if att.attempt_id == attempt_id {
-                    att.status = AttemptStatus::Committed;
-                }
-            }
-            record.touch();
-        });
-
-        let camp_after = self
-            .campaign_store
-            .get_campaign(&input.campaign_id)
-            .expect("campaign after");
-        let campaign_revision_after = camp_after.revision;
-        let chronicle_revision_after = camp_after.chronicle_revision;
-
-        assertions.push(AssertionResult {
-            name: "campaign_revision_bumped".into(),
-            passed: campaign_revision_after == campaign_revision_before + 1,
-            detail: Some(format!(
-                "{campaign_revision_before}->{campaign_revision_after}"
-            )),
-        });
-        if summary_code.is_some() {
-            assertions.push(AssertionResult {
-                name: "chronicle_a_persisted".into(),
-                passed: chronicle_revision_after > chronicle_revision_before
-                    || !self
-                        .campaign_store
-                        .list_summaries(&input.campaign_id)
-                        .is_empty(),
-                detail: summary_code.clone(),
-            });
-        }
-
-        // variant must be Final
-        let final_ok = self
-            .conv_store
-            .get(&input.conversation_id)
-            .and_then(|c| {
-                c.nodes
-                    .iter()
-                    .find(|n| n.id == input.variant_id)
-                    .and_then(|n| n.active())
-                    .map(|v| {
-                        matches!(
-                            v.status,
-                            storyforge_domain::conversation::VariantStatus::Final
-                        )
-                    })
-            })
-            .unwrap_or(false);
-        assertions.push(AssertionResult {
-            name: "variant_final".into(),
-            passed: final_ok,
-            detail: None,
-        });
-
-        let all_pass = assertions.iter().all(|a| a.passed);
-        ProductionAcceptResult {
-            ok: all_pass,
-            error: if all_pass {
-                None
-            } else {
-                Some("one or more post-commit assertions failed".into())
-            },
-            force_accept: input.force_accept,
-            turn_status: Some(final_status),
-            attempt_status: Some(AttemptStatus::Committed),
-            campaign_revision_before,
-            campaign_revision_after,
-            chronicle_revision_before,
-            chronicle_revision_after,
-            summary_code,
-            draft_hash,
-            assertions,
         }
     }
 }
@@ -579,35 +450,9 @@ fn fail_result(
     }
 }
 
-fn read_variant_content(conv_store: &ConversationStore, conv_id: &Id, node_id: &Id) -> String {
-    let conv = match conv_store.get(conv_id) {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    conv.nodes
-        .iter()
-        .find(|n| &n.id == node_id)
-        .and_then(|node| node.active())
-        .map(|v| v.content.clone())
-        .unwrap_or_default()
-}
-
 /// 与生产 `next_chronicle_a_seq` 对齐：优先解析 A 级 code，否则用 turn。
 pub fn next_chronicle_a_seq(existing: &[RoundSummary]) -> u32 {
-    let mut max_seq = 0u32;
-    for s in existing {
-        if let Some(code) = s.code.as_deref() {
-            if let Some(parsed) = ChronicleCode::parse(code)
-                && parsed.level() == Some(ChronicleLevel::A)
-                && let Ok(n) = code[1..].parse::<u32>()
-            {
-                max_seq = max_seq.max(n);
-            }
-        } else {
-            max_seq = max_seq.max(s.turn);
-        }
-    }
-    max_seq.saturating_add(1).max(1)
+    turn_lifecycle::next_chronicle_a_seq(existing)
 }
 
 #[cfg(test)]
