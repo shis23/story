@@ -114,7 +114,8 @@ Describe 'ReleaseBuild manifest construction' {
             -Artifacts @($artifact) `
             -BuildStatus 'ok' `
             -Warnings @('size budget warning: windows-exe') `
-            -Notes @('host-only; not GUI acceptance')
+            -Notes @('host-only; not GUI acceptance') `
+            -RepoRoot 'C:\Users\Predator\project'
 
         $json = $manifest | ConvertTo-Json -Depth 8
         $json | Should Not Match 'C:\\Users'
@@ -125,6 +126,26 @@ Describe 'ReleaseBuild manifest construction' {
         $manifest.build_status | Should Be 'ok'
         $manifest.acceptance.gui | Should Be 'not_claimed'
         $manifest.acceptance.android_device | Should Be 'not_claimed'
+    }
+
+    It 'redacts secrets and user paths inside warnings and notes' {
+        $fake = 'sk' + '-' + ('b' * 24)
+        $manifest = New-ReleaseBuildManifest `
+            -Commit 'abc' `
+            -Branch 'test' `
+            -Target 'x86_64-pc-windows-msvc' `
+            -ToolVersions @{ rustc = '1' } `
+            -Artifacts @() `
+            -BuildStatus 'ok' `
+            -Warnings @("leak=$fake path=C:\Users\Predator\secret") `
+            -Notes @("cache=C:\Users\Predator\.cargo") `
+            -RepoRoot 'C:\Users\Predator\project'
+
+        $json = $manifest | ConvertTo-Json -Depth 8
+        $json | Should Not Match ([regex]::Escape($fake))
+        $json | Should Not Match 'C:\\Users\\Predator'
+        $manifest.warnings[0] | Should Match '<REDACTED_SECRET>|<HOME>'
+        $manifest.notes[0] | Should Match '<HOME>'
     }
 
     It 'marks missing expected artifacts as failed status' {
@@ -235,16 +256,95 @@ Describe 'ReleaseBuild cleanup retention' {
         New-Item -ItemType Directory -Path $root | Out-Null
         try {
             1..5 | ForEach-Object {
-                $dir = Join-Path $root ("run-{0:D2}" -f $_)
+                $dir = Join-Path $root ("windows-run-{0:D2}" -f $_)
                 New-Item -ItemType Directory -Path $dir | Out-Null
                 Start-Sleep -Milliseconds 15
                 Set-Content -LiteralPath (Join-Path $dir 'marker.txt') -Value $_
             }
-            $toDelete = Get-ReleaseRetentionCleanupTargets -Root $root -Keep 2
+            $toDelete = Get-ReleaseRetentionCleanupTargets -Root $root -Keep 2 -NamePrefixes @('windows-')
             $toDelete.Count | Should Be 3
         } finally {
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    It 'only deletes prefixed run dirs and never the protected current run' {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-retention-safe-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $root | Out-Null
+        try {
+            $keep = Join-Path $root 'windows-current'
+            $old = Join-Path $root 'windows-old'
+            $other = Join-Path $root 'scratch-not-a-run'
+            New-Item -ItemType Directory -Path $keep, $old, $other | Out-Null
+            Start-Sleep -Milliseconds 20
+            # Make old older than keep
+            (Get-Item -LiteralPath $old).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddHours(-2)
+            (Get-Item -LiteralPath $keep).LastWriteTimeUtc = (Get-Date).ToUniversalTime()
+
+            $toDelete = Get-ReleaseRetentionCleanupTargets `
+                -Root $root `
+                -Keep 1 `
+                -NamePrefixes @('windows-', 'android-') `
+                -ProtectFullNames @($keep)
+
+            $names = @($toDelete | ForEach-Object { $_.Name })
+            $names -contains 'windows-old' | Should Be $true
+            $names -contains 'windows-current' | Should Be $false
+            $names -contains 'scratch-not-a-run' | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild exit policy' {
+    It 'exits non-zero for failed and partial host statuses' {
+        (Test-ReleaseStatusIsSuccess -BuildStatus 'ok') | Should Be $true
+        (Test-ReleaseStatusIsSuccess -BuildStatus 'dry-run') | Should Be $true
+        (Test-ReleaseStatusIsSuccess -BuildStatus 'failed') | Should Be $false
+        (Test-ReleaseStatusIsSuccess -BuildStatus 'partial') | Should Be $false
+    }
+}
+
+Describe 'ReleaseBuild artifact freshness' {
+    It 'rejects artifacts older than the build start watermark' {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-stale-{0}.exe" -f [guid]::NewGuid().ToString('N'))
+        try {
+            Set-Content -LiteralPath $tmp -Value 'old'
+            $item = Get-Item -LiteralPath $tmp
+            $item.LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddHours(-3)
+            $start = (Get-Date).ToUniversalTime().AddMinutes(-5)
+            (Test-ReleaseArtifactIsFresh -FileInfo $item -NotBeforeUtc $start) | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'accepts artifacts written at or after the build start watermark' {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-fresh-{0}.exe" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $start = (Get-Date).ToUniversalTime().AddSeconds(-2)
+            Set-Content -LiteralPath $tmp -Value 'new'
+            $item = Get-Item -LiteralPath $tmp
+            (Test-ReleaseArtifactIsFresh -FileInfo $item -NotBeforeUtc $start) | Should Be $true
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'ReleaseBuild secret scan helper' {
+    It 'flags secret-like content without echoing the secret value' {
+        $fake = 'sk' + '-' + ('z' * 24)
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("token=$fake"))
+        $findings.Count | Should BeGreaterThan 0
+        ($findings -join ' ') | Should Not Match ([regex]::Escape($fake))
+        ($findings -join ' ') | Should Match 'OpenAI-style API key|secret'
+    }
+
+    It 'returns no findings for clean text' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text 'build ok commit=abc size=12')
+        $findings.Count | Should Be 0
     }
 }
 

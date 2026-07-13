@@ -201,13 +201,22 @@ function New-ReleaseBuildManifest {
         [string[]]$Warnings = @(),
 
         [AllowEmptyCollection()]
-        [string[]]$Notes = @()
+        [string[]]$Notes = @(),
+
+        [string]$RepoRoot
     )
 
     $safeTools = [ordered]@{}
     foreach ($key in ($ToolVersions.Keys | Sort-Object)) {
-        $safeTools[[string]$key] = Protect-ReleasePath -Text ([string]$ToolVersions[$key]) -RepoRoot $null
+        $safeTools[[string]$key] = Protect-ReleasePath -Text ([string]$ToolVersions[$key]) -RepoRoot $RepoRoot
     }
+
+    $safeWarnings = @($Warnings | ForEach-Object {
+        Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
+    })
+    $safeNotes = @($Notes | ForEach-Object {
+        Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
+    })
 
     return [pscustomobject]@{
         schema_version = 1
@@ -218,13 +227,165 @@ function New-ReleaseBuildManifest {
         tool_versions  = $safeTools
         artifacts      = @($Artifacts)
         build_status   = $BuildStatus
-        warnings       = @($Warnings)
-        notes          = @($Notes)
+        warnings       = $safeWarnings
+        notes          = $safeNotes
         acceptance     = [pscustomobject]@{
             gui            = 'not_claimed'
             android_device = 'not_claimed'
             host_build     = $BuildStatus
         }
+    }
+}
+
+function Test-ReleaseStatusIsSuccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BuildStatus
+    )
+
+    return ($BuildStatus -eq 'ok' -or $BuildStatus -eq 'dry-run')
+}
+
+function Get-ReleaseProcessExitCode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BuildStatus
+    )
+
+    if (Test-ReleaseStatusIsSuccess -BuildStatus $BuildStatus) {
+        return 0
+    }
+    return 1
+}
+
+function Test-ReleaseArtifactIsFresh {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$FileInfo,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$NotBeforeUtc
+    )
+
+    $writeUtc = $FileInfo.LastWriteTimeUtc
+    # Allow small filesystem timestamp skew.
+    return ($writeUtc -ge $NotBeforeUtc.AddSeconds(-2))
+}
+
+function Find-ReleaseSecretPatternFindings {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return @()
+    }
+
+    $rules = @(
+        @{ Name = 'private key block'; Pattern = '-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----' },
+        @{ Name = 'AWS access key id'; Pattern = 'AKIA[0-9A-Z]{16}' },
+        @{ Name = 'OpenAI-style API key'; Pattern = 'sk-[A-Za-z0-9_-]{20,}' },
+        @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
+        @{ Name = 'authorization header'; Pattern = '(?i)(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
+        @{ Name = 'secret assignment'; Pattern = '(?i)(api[_-]?key|secret|token|password|passwd|authorization)\s*[:=]\s*[''"][^''"]{16,}[''"]' }
+    )
+
+    $findings = @()
+    foreach ($rule in $rules) {
+        if ([regex]::IsMatch($Text, $rule.Pattern)) {
+            $findings += ("secret-pattern:{0}" -f $rule.Name)
+        }
+    }
+    return $findings
+}
+
+function Invoke-ReleaseSecretScan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $pathspecs = @(
+        '.',
+        ':(exclude)target/**',
+        ':(exclude)node_modules/**',
+        ':(exclude)frontend/dist/**',
+        ':(exclude)frontend/node_modules/**',
+        ':(exclude).git/**',
+        ':(exclude)artifacts/**'
+    )
+
+    $rules = @(
+        @{ Name = 'private key block'; Pattern = '-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----' },
+        @{ Name = 'AWS access key id'; Pattern = 'AKIA[0-9A-Z]{16}' },
+        @{ Name = 'OpenAI-style API key'; Pattern = 'sk-[A-Za-z0-9_-]{20,}' },
+        @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
+        @{ Name = 'authorization header'; Pattern = '(Authorization|X-Api-Key)[[:space:]]*:[[:space:]]*(token|Bearer|Basic)?[[:space:]]*[A-Za-z0-9_./+=-]{20,}' },
+        @{ Name = 'secret assignment'; Pattern = '(api[_-]?key|secret|token|password|passwd|authorization)[[:space:]]*[:=][[:space:]]*[''"][^''"]{16,}[''"]' }
+    )
+
+    $findings = New-Object System.Collections.Generic.List[string]
+    $scanTargets = @(
+        @{ Name = 'worktree'; Args = @() },
+        @{ Name = 'index'; Args = @('--cached') }
+    )
+
+    foreach ($target in $scanTargets) {
+        foreach ($rule in $rules) {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = & git -C $RepoRoot grep @($target.Args) -n -I -E -e $($rule.Pattern) -- @pathspecs 2>&1
+                $exitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+
+            if ($exitCode -eq 1) { continue }
+            if ($exitCode -ne 0) {
+                throw "Secret scan failed while running $($target.Name) rule '$($rule.Name)'."
+            }
+
+            foreach ($line in @($output)) {
+                if ($line -match '^(.+?):([0-9]+):') {
+                    $findings.Add(("{0} {1} at {2}:{3}" -f $target.Name, $rule.Name, $Matches[1], $Matches[2]))
+                } else {
+                    $findings.Add(("{0} {1} at unknown location" -f $target.Name, $rule.Name))
+                }
+            }
+        }
+    }
+
+    if ($findings.Count -gt 0) {
+        Write-Host 'Potential secret material found:' -ForegroundColor Red
+        $findings | Sort-Object -Unique | ForEach-Object { Write-Host ("  {0}" -f $_) }
+        throw 'Secret scan failed. Remove the secret material or replace it with a safe reference before releasing.'
+    }
+
+    Write-Host 'OK: secret scan found no matches in Git-tracked files.'
+}
+
+function Get-ReleaseAndroidBuildPathIssues {
+    $issues = @()
+    foreach ($name in @('ANDROID_HOME', 'NDK_HOME')) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            $issues += "$name is required for -BuildApk but is not set."
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $value -PathType Container)) {
+            $issues += "$name is required for -BuildApk but does not point to an existing directory."
+        }
+    }
+    return @($issues)
+}
+
+function Assert-ReleaseAndroidBuildEnvironment {
+    $issues = @(Get-ReleaseAndroidBuildPathIssues)
+    if (@($issues).Count -gt 0) {
+        throw ("Android APK build environment is incomplete:{0}  {1}" -f [Environment]::NewLine, ($issues -join ([Environment]::NewLine + '  ')))
     }
 }
 
@@ -537,7 +698,11 @@ function Get-ReleaseRetentionCleanupTargets {
         [string]$Root,
 
         [Parameter(Mandatory = $true)]
-        [int]$Keep
+        [int]$Keep,
+
+        [string[]]$NamePrefixes = @('windows-', 'android-'),
+
+        [string[]]$ProtectFullNames = @()
     )
 
     if ($Keep -lt 0) {
@@ -548,12 +713,43 @@ function Get-ReleaseRetentionCleanupTargets {
         return @()
     }
 
-    $dirs = @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object LastWriteTimeUtc -Descending)
-    if ($dirs.Count -le $Keep) {
+    $protected = @{}
+    foreach ($p in @($ProtectFullNames)) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        try {
+            $protected[[System.IO.Path]::GetFullPath($p)] = $true
+        } catch {
+            $protected[$p] = $true
+        }
+    }
+
+    $candidates = @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | Where-Object {
+        $name = $_.Name
+        $matched = $false
+        foreach ($prefix in @($NamePrefixes)) {
+            if ($name.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $matched = $true
+                break
+            }
+        }
+        if (-not $matched) { return $false }
+
+        # Skip reparse points / junctions / symlinks.
+        if (($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        return $true
+    } | Sort-Object LastWriteTimeUtc -Descending)
+
+    if ($candidates.Count -le $Keep) {
         return @()
     }
 
-    return @($dirs | Select-Object -Skip $Keep)
+    # Keep the newest N matching runs; never delete the protected current run even if it falls outside Keep.
+    $toDelete = @($candidates | Select-Object -Skip $Keep | Where-Object {
+        -not $protected.ContainsKey($_.FullName)
+    })
+    return $toDelete
 }
 
 function Find-ReleaseRepoRoot {

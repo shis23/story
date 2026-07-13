@@ -94,25 +94,27 @@ Describe 'Release build fail-closed behavior' {
     }
 
     It 'android issue array remains countable with a single missing tool' {
-        # Regression: a single Where-Object hit must not become a bare string under StrictMode.
-        $issues = @(
-            @('NDK_HOME is required for -BuildApk but is not set.', $null) |
-                Where-Object { $null -ne $_ }
-        )
-        @($issues).Count | Should Be 1
-        $issues[0] | Should Match 'NDK_HOME'
+        . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
+        $issues = @(Get-ReleaseAndroidBuildPathIssues)
+        # Production helper always returns an array even for a single issue.
+        @($issues).Count | Should BeGreaterThan 0
     }
 
-    It 'android -BuildApk without NDK_HOME fails closed when not dry-run' {
+    It 'android -BuildApk prerequisites use production helper and fail closed without NDK_HOME' {
+        . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
         $savedNdk = [Environment]::GetEnvironmentVariable('NDK_HOME')
+        $savedAndroid = [Environment]::GetEnvironmentVariable('ANDROID_HOME')
         try {
             [Environment]::SetEnvironmentVariable('NDK_HOME', $null)
-            $ndk = [Environment]::GetEnvironmentVariable('NDK_HOME')
-            [string]::IsNullOrWhiteSpace($ndk) | Should Be $true
-            $issue = 'NDK_HOME is required for -BuildApk but is not set.'
-            $issue | Should Match 'NDK_HOME'
+            if ([string]::IsNullOrWhiteSpace($savedAndroid)) {
+                [Environment]::SetEnvironmentVariable('ANDROID_HOME', 'C:\missing-android-sdk-for-test')
+            }
+            $issues = @(Get-ReleaseAndroidBuildPathIssues)
+            (@($issues | Where-Object { $_ -match 'NDK_HOME' }).Count) | Should BeGreaterThan 0
+            { Assert-ReleaseAndroidBuildEnvironment } | Should Throw
         } finally {
             [Environment]::SetEnvironmentVariable('NDK_HOME', $savedNdk)
+            [Environment]::SetEnvironmentVariable('ANDROID_HOME', $savedAndroid)
         }
     }
 
@@ -120,5 +122,21 @@ Describe 'Release build fail-closed behavior' {
         . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
         $missing = Join-Path ([System.IO.Path]::GetTempPath()) ("missing-{0}.exe" -f [guid]::NewGuid().ToString('N'))
         { Assert-ReleaseArtifactExists -Path $missing -Label 'windows-exe' } | Should Throw
+    }
+
+    It 'partial and failed statuses are fail-closed for process exit' {
+        . (Join-Path $RepoRoot 'scripts\release-build\ReleaseBuild.Common.ps1')
+        (Get-ReleaseProcessExitCode -BuildStatus 'partial') | Should Not Be 0
+        (Get-ReleaseProcessExitCode -BuildStatus 'failed') | Should Not Be 0
+        (Get-ReleaseProcessExitCode -BuildStatus 'ok') | Should Be 0
+        (Get-ReleaseProcessExitCode -BuildStatus 'dry-run') | Should Be 0
+    }
+
+    It 'frontend dependency install policy is npm ci only' {
+        $scriptPath = Join-Path $RepoRoot 'scripts\run-release-build.ps1'
+        $text = Get-Content -LiteralPath $scriptPath -Raw
+        $text | Should Match 'npm\.cmd'', ''ci'''
+        $text | Should Not Match "npm\.cmd', 'install'"
+        $text | Should Not Match 'npm\.cmd", "install"'
     }
 }

@@ -20,6 +20,9 @@ Skip frontend npm build (still records skip in the manifest).
 Skip `cargo tauri build` and only run `cargo build --release -p storyforge`
 when possible.
 
+.PARAMETER SkipSecretScan
+Skip the fail-closed Git-tracked secret scan. Prefer leaving this off for release evidence.
+
 .PARAMETER KeepRuns
 Number of previous artifacts/release-build runs to retain (default 5).
 
@@ -38,6 +41,7 @@ param(
     [switch]$DryRun,
     [switch]$SkipFrontend,
     [switch]$SkipBundle,
+    [switch]$SkipSecretScan,
     [int]$KeepRuns = 5,
     [string]$OutputDir
 )
@@ -117,7 +121,9 @@ function Invoke-ReleaseBuildCommand {
 function Add-PresentArtifact {
     param(
         [Parameter(Mandatory = $true)][string]$FullPath,
-        [Parameter(Mandatory = $true)][string]$Kind
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [datetime]$NotBeforeUtc,
+        [switch]$RequireFresh
     )
 
     if (-not (Test-Path -LiteralPath $FullPath -PathType Leaf)) {
@@ -127,6 +133,13 @@ function Add-PresentArtifact {
     }
 
     $item = Get-Item -LiteralPath $FullPath
+    if ($RequireFresh -and -not (Test-ReleaseArtifactIsFresh -FileInfo $item -NotBeforeUtc $NotBeforeUtc)) {
+        $relStale = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $item.FullName
+        $script:Warnings.Add(("stale artifact ignored for current SHA evidence: {0}" -f $relStale))
+        Write-Host ("WARNING: ignoring stale artifact (older than build start): {0}" -f $relStale) -ForegroundColor Yellow
+        return $false
+    }
+
     $rel = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $item.FullName
     $sha = Get-ReleaseFileSha256 -Path $item.FullName
     $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath $rel -SizeBytes ([long]$item.Length) -Sha256 $sha -Kind $Kind -Status 'present'))
@@ -204,6 +217,8 @@ try {
 
     $identity = Get-ReleaseGitIdentity -RepoRoot $script:RepoRoot
     $toolVersions = Get-ReleaseToolVersions
+    $buildStartedUtc = (Get-Date).ToUniversalTime()
+    $script:Notes.Add(('build_started_utc={0}' -f $buildStartedUtc.ToString('o')))
 
     if ([string]::IsNullOrWhiteSpace($OutputDir)) {
         $runDir = New-ReleaseRunDirectory -RepoRoot $script:RepoRoot -Prefix 'windows'
@@ -214,6 +229,17 @@ try {
         }
     }
     $script:Notes.Add(('evidence_dir={0}' -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $runDir)))
+
+    if (-not $SkipSecretScan) {
+        Start-ReleaseBuildStep -Name 'secret scan'
+        if ($DryRun) {
+            Write-Host 'DRY RUN: git-tracked secret scan'
+        } else {
+            Invoke-ReleaseSecretScan -RepoRoot $script:RepoRoot
+        }
+    } else {
+        $script:Notes.Add('secret scan skipped by flag')
+    }
 
     Test-WorkingTreeCleanForRelease -RepoRoot $script:RepoRoot
 
@@ -243,15 +269,13 @@ try {
     $tauriAppRoot = Join-Path $script:RepoRoot 'crates\tauri-app'
 
     $buildStatus = 'ok'
+    $bundleRequested = -not $SkipBundle
 
     if (-not $SkipFrontend) {
         $nodeModules = Join-Path $frontendRoot 'node_modules'
         if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
-            # Prefer ci when lockfile present; fall back to install for local hosts.
-            $ciCode = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') -AllowFail
-            if ($ciCode -ne 0) {
-                $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd install' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'install')
-            }
+            # Fail-closed reproducible install only. No npm install fallback.
+            $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci')
         }
         $null = Invoke-ReleaseBuildCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
     } else {
@@ -274,19 +298,21 @@ try {
     # Rust release binary.
     $null = Invoke-ReleaseBuildCommand -Name 'cargo build --release -p storyforge' -WorkingDirectory $script:RepoRoot -Command @('cargo', 'build', '--release', '-p', 'storyforge')
 
-    if (-not $SkipBundle) {
-        $null = & cargo tauri --version 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            # Prefer bundle if tauri CLI is available; allow non-fatal when toolchain incomplete.
-            $bundleCode = Invoke-ReleaseBuildCommand -Name 'cargo tauri build (Windows host bundle)' -WorkingDirectory $tauriAppRoot -Command @('cargo', 'tauri', 'build', '--ci') -AllowFail
-            if ($bundleCode -ne 0) {
-                $buildStatus = 'partial'
-                $script:Notes.Add('tauri bundle failed or incomplete; release exe evidence may still be present')
-            }
+    if ($bundleRequested) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & cargo tauri --version 2>$null
+            $tauriCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+
+        if ($tauriCode -eq 0) {
+            # Bundle is part of the requested release path: fail closed on non-zero.
+            $null = Invoke-ReleaseBuildCommand -Name 'cargo tauri build (Windows host bundle)' -WorkingDirectory $tauriAppRoot -Command @('cargo', 'tauri', 'build', '--ci')
         } else {
-            $script:Notes.Add('cargo tauri CLI unavailable; skipped Windows bundle step')
-            $script:Warnings.Add('tauri CLI missing; bundle step skipped')
-            if ($buildStatus -eq 'ok') { $buildStatus = 'partial' }
+            throw 'cargo tauri CLI is required for Windows bundle evidence but is unavailable. Use -SkipBundle for host-binary-only evidence.'
         }
     } else {
         $script:Notes.Add('tauri bundle skipped by flag')
@@ -305,20 +331,35 @@ try {
         $script:Notes.Add('artifact hashing skipped in dry-run')
         $buildStatus = 'dry-run'
     } else {
-        # Always require the main release binary when not dry-run.
+        # Always require a fresh main release binary for the current run SHA.
         $mainExe = Join-Path $script:RepoRoot 'target\release\storyforge.exe'
-        if (-not (Add-PresentArtifact -FullPath $mainExe -Kind 'windows-exe')) {
-            $missingRequired = $true
-        } else {
+        if (Add-PresentArtifact -FullPath $mainExe -Kind 'windows-exe' -NotBeforeUtc $buildStartedUtc -RequireFresh) {
             $anyPresent = $true
+        } else {
+            $missingRequired = $true
+            $alreadyRecorded = @($script:Artifacts | Where-Object {
+                $_.kind -eq 'windows-exe' -and $_.relative_path -eq (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $mainExe)
+            }).Count -gt 0
+            if (-not $alreadyRecorded) {
+                $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $mainExe) -SizeBytes 0 -Sha256 $null -Kind 'windows-exe' -Status 'missing'))
+            }
         }
 
         foreach ($item in $expected) {
             if ($item.Path -eq $mainExe) { continue }
             if (Test-Path -LiteralPath $item.Path -PathType Leaf) {
-                if (Add-PresentArtifact -FullPath $item.Path -Kind $item.Kind) {
+                # Optional bundle/installer artifacts only count when fresh for this run.
+                if (Add-PresentArtifact -FullPath $item.Path -Kind $item.Kind -NotBeforeUtc $buildStartedUtc -RequireFresh) {
                     $anyPresent = $true
                 }
+            }
+        }
+
+        if ($bundleRequested) {
+            $freshBundle = @($script:Artifacts | Where-Object { $_.status -eq 'present' -and $_.kind -in @('windows-msi', 'windows-nsis') })
+            if ($freshBundle.Count -eq 0) {
+                $missingRequired = $true
+                $script:Warnings.Add('requested Windows bundle produced no fresh installer artifacts for this run')
             }
         }
 
@@ -358,7 +399,8 @@ try {
         -Artifacts $artifactArr `
         -BuildStatus $buildStatus `
         -Warnings $warningArr `
-        -Notes $noteArr
+        -Notes $noteArr `
+        -RepoRoot $script:RepoRoot
 
     $manifestPath = Join-Path $runDir 'manifest.json'
     Write-ReleaseJson -Object $manifest -Path $manifestPath
@@ -376,15 +418,19 @@ try {
         'acceptance.gui=not_claimed'
         'acceptance.android_device=not_claimed'
         '--- warnings ---'
-    )) { $summaryLines.Add([string]$line) }
-    foreach ($w in $script:Warnings) { $summaryLines.Add([string]$w) }
+    )) { $summaryLines.Add([string](Protect-ReleasePath -Text $line -RepoRoot $script:RepoRoot)) }
+    foreach ($w in $script:Warnings) { $summaryLines.Add([string](Protect-ReleasePath -Text $w -RepoRoot $script:RepoRoot)) }
     $summaryLines.Add('--- notes ---')
-    foreach ($n in $script:Notes) { $summaryLines.Add([string]$n) }
+    foreach ($n in $script:Notes) { $summaryLines.Add([string](Protect-ReleasePath -Text $n -RepoRoot $script:RepoRoot)) }
     Set-Content -LiteralPath $summaryPath -Value $summaryLines.ToArray() -Encoding utf8
 
     Start-ReleaseBuildStep -Name 'retention cleanup'
     $artifactRoot = Join-Path $script:RepoRoot 'artifacts\release-build'
-    $targets = Get-ReleaseRetentionCleanupTargets -Root $artifactRoot -Keep $KeepRuns
+    $targets = Get-ReleaseRetentionCleanupTargets `
+        -Root $artifactRoot `
+        -Keep $KeepRuns `
+        -NamePrefixes @('windows-', 'android-') `
+        -ProtectFullNames @($runDir)
     if ($DryRun) {
         Write-Host ("DRY RUN: would remove {0} old run dir(s), keep {1}" -f @($targets).Count, $KeepRuns)
     } else {
@@ -396,9 +442,10 @@ try {
     }
 
     Write-Host ''
-    if ($buildStatus -eq 'failed') {
-        Write-Host 'Windows release build FAILED (fail-closed).' -ForegroundColor Red
-        exit 1
+    $exitCode = Get-ReleaseProcessExitCode -BuildStatus $buildStatus
+    if ($exitCode -ne 0) {
+        Write-Host ("Windows release build FAILED (fail-closed) status={0}." -f $buildStatus) -ForegroundColor Red
+        exit $exitCode
     }
 
     Write-Host ("Windows release build finished with status={0}." -f $buildStatus) -ForegroundColor Green

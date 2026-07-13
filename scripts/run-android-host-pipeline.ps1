@@ -18,6 +18,9 @@ Print planned steps without executing builds.
 .PARAMETER BuildApk
 Attempt debug and unsigned release arm64 APK builds when SDK/NDK are present.
 
+.PARAMETER SkipSecretScan
+Skip the fail-closed Git-tracked secret scan. Prefer leaving this off for release evidence.
+
 .PARAMETER KeepRuns
 Number of previous android evidence runs to retain (default 5).
 
@@ -34,6 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-android-host-pip
 param(
     [switch]$DryRun,
     [switch]$BuildApk,
+    [switch]$SkipSecretScan,
     [int]$KeepRuns = 5,
     [string]$OutputDir
 )
@@ -77,18 +81,6 @@ function Format-EnvPathState {
     if ([string]::IsNullOrWhiteSpace($value)) { return '<not set>' }
     if (Test-Path -LiteralPath $value) { return (Protect-ReleasePath -Text ("{0} (exists)" -f $value) -RepoRoot $script:RepoRoot) }
     return (Protect-ReleasePath -Text ("{0} (missing)" -f $value) -RepoRoot $script:RepoRoot)
-}
-
-function Get-AndroidPathIssue {
-    param([Parameter(Mandatory = $true)][string]$Name)
-    $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) {
-        return "$Name is required for -BuildApk but is not set."
-    }
-    if (-not (Test-Path -LiteralPath $value -PathType Container)) {
-        return "$Name does not point to an existing directory."
-    }
-    return $null
 }
 
 function Invoke-AndroidHostCommand {
@@ -153,16 +145,25 @@ function Get-ZipEntryNames {
 function Add-ApkArtifactAndInspect {
     param(
         [Parameter(Mandatory = $true)][string]$ApkPath,
-        [Parameter(Mandatory = $true)][string]$Kind
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [datetime]$NotBeforeUtc,
+        [switch]$RequireFresh
     )
 
     if (-not (Test-Path -LiteralPath $ApkPath -PathType Leaf)) {
         $rel = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $ApkPath
         $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath $rel -SizeBytes 0 -Sha256 $null -Kind $Kind -Status 'missing'))
-        return
+        return $false
     }
 
     $item = Get-Item -LiteralPath $ApkPath
+    if ($RequireFresh -and -not (Test-ReleaseArtifactIsFresh -FileInfo $item -NotBeforeUtc $NotBeforeUtc)) {
+        $relStale = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $item.FullName
+        $script:Warnings.Add(("stale APK ignored for current SHA evidence: {0}" -f $relStale))
+        Write-Host ("WARNING: ignoring stale APK (older than build start): {0}" -f $relStale) -ForegroundColor Yellow
+        return $false
+    }
+
     $rel = Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $item.FullName
     $sha = Get-ReleaseFileSha256 -Path $item.FullName
     $script:Artifacts.Add((New-ReleaseArtifactRecord -RelativePath $rel -SizeBytes ([long]$item.Length) -Sha256 $sha -Kind $Kind -Status 'present'))
@@ -189,22 +190,29 @@ function Add-ApkArtifactAndInspect {
     } catch {
         $script:Warnings.Add(("failed to inspect APK {0}: {1}" -f $item.Name, $_.Exception.Message))
     }
+
+    return $true
 }
 
 function Find-Arm64Apks {
-    param([string]$RepoRoot)
+    param(
+        [string]$RepoRoot,
+        [datetime]$NotBeforeUtc
+    )
 
+    # Prefer the current-run Gradle outputs; do not harvest arbitrary historical APKs from target/.
     $searchRoots = @(
-        (Join-Path $RepoRoot 'crates\tauri-app\gen\android\app\build\outputs\apk'),
-        (Join-Path $RepoRoot 'crates\tauri-app\src-tauri'),
-        (Join-Path $RepoRoot 'target')
+        (Join-Path $RepoRoot 'crates\tauri-app\gen\android\app\build\outputs\apk')
     )
 
     $found = @()
     foreach ($root in $searchRoots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         $found += @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.apk' -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'arm64|aarch64' -or $_.FullName -match 'arm64|aarch64' })
+            Where-Object {
+                ($_.Name -match 'arm64|aarch64' -or $_.FullName -match 'arm64|aarch64') -and
+                (Test-ReleaseArtifactIsFresh -FileInfo $_ -NotBeforeUtc $NotBeforeUtc)
+            })
     }
     return @($found | Sort-Object FullName -Unique)
 }
@@ -224,6 +232,8 @@ try {
 
     $identity = Get-ReleaseGitIdentity -RepoRoot $script:RepoRoot
     $toolVersions = Get-ReleaseToolVersions
+    $buildStartedUtc = (Get-Date).ToUniversalTime()
+    $script:Notes.Add(('build_started_utc={0}' -f $buildStartedUtc.ToString('o')))
 
     if ([string]::IsNullOrWhiteSpace($OutputDir)) {
         $runDir = New-ReleaseRunDirectory -RepoRoot $script:RepoRoot -Prefix 'android'
@@ -235,6 +245,17 @@ try {
     }
     $script:Notes.Add(('evidence_dir={0}' -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $runDir)))
 
+    if (-not $SkipSecretScan) {
+        Start-AndroidHostStep -Name 'secret scan'
+        if ($DryRun) {
+            Write-Host 'DRY RUN: git-tracked secret scan'
+        } else {
+            Invoke-ReleaseSecretScan -RepoRoot $script:RepoRoot
+        }
+    } else {
+        $script:Notes.Add('secret scan skipped by flag')
+    }
+
     $frontendRoot = Join-Path $script:RepoRoot 'frontend'
     $tauriAppRoot = Join-Path $script:RepoRoot 'crates\tauri-app'
     $buildStatus = 'ok'
@@ -242,6 +263,7 @@ try {
     # Host-side smoke steps (no device).
     $nodeModules = Join-Path $frontendRoot 'node_modules'
     if (-not (Test-Path -LiteralPath $nodeModules) -and -not $DryRun) {
+        # Fail-closed reproducible install only.
         Invoke-AndroidHostCommand -Name 'frontend npm.cmd ci' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'ci') | Out-Null
     }
     Invoke-AndroidHostCommand -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build') | Out-Null
@@ -250,12 +272,7 @@ try {
 
     $apkAttempted = $false
     if ($BuildApk) {
-        $issues = @(
-            @(
-                Get-AndroidPathIssue -Name 'ANDROID_HOME'
-                Get-AndroidPathIssue -Name 'NDK_HOME'
-            ) | Where-Object { $null -ne $_ }
-        )
+        $issues = @(Get-ReleaseAndroidBuildPathIssues)
 
         if (@($issues).Count -gt 0) {
             if ($DryRun) {
@@ -264,27 +281,27 @@ try {
                     $script:Notes.Add($issue)
                 }
                 $script:Notes.Add('APK build would fail-closed without ANDROID_HOME/NDK_HOME')
+                $buildStatus = 'failed'
             } else {
-                throw ("Android APK build environment is incomplete:{0}  {1}" -f [Environment]::NewLine, ($issues -join ([Environment]::NewLine + '  ')))
+                Assert-ReleaseAndroidBuildEnvironment
             }
         } else {
             $apkAttempted = $true
             $debugLog = Join-Path $runDir 'android-debug-build.log'
             $releaseLog = Join-Path $runDir 'android-release-build.log'
 
+            # APK builds are requested evidence: fail closed, do not degrade to partial exit 0.
             $debugResult = Invoke-AndroidHostCommand `
                 -Name 'cargo tauri android build debug arm64 APK' `
                 -WorkingDirectory $tauriAppRoot `
                 -Command @('cargo', 'tauri', 'android', 'build', '--debug', '--target', 'aarch64', '--ci', '--split-per-abi', '--apk') `
-                -LogPath $debugLog `
-                -AllowFail
+                -LogPath $debugLog
 
             $releaseResult = Invoke-AndroidHostCommand `
                 -Name 'cargo tauri android build unsigned release arm64 APK' `
                 -WorkingDirectory $tauriAppRoot `
                 -Command @('cargo', 'tauri', 'android', 'build', '--target', 'aarch64', '--ci', '--split-per-abi', '--apk') `
-                -LogPath $releaseLog `
-                -AllowFail
+                -LogPath $releaseLog
 
             $allLines = @($debugResult.Lines) + @($releaseResult.Lines)
             $report = ConvertTo-ReleaseWarningReport -Lines $allLines -Source 'android-build' -RepoRoot $script:RepoRoot
@@ -293,20 +310,21 @@ try {
                 $script:Warnings.Add(("{0}: {1}" -f $w.category, $w.message))
             }
 
-            if ($debugResult.ExitCode -ne 0 -or $releaseResult.ExitCode -ne 0) {
-                $buildStatus = 'partial'
-                $script:Notes.Add('one or more APK builds failed; see logs in evidence dir')
-            }
-
             Start-AndroidHostStep -Name 'inspect APK artifacts'
-            $apks = Find-Arm64Apks -RepoRoot $script:RepoRoot
+            $apks = Find-Arm64Apks -RepoRoot $script:RepoRoot -NotBeforeUtc $buildStartedUtc
             if (@($apks).Count -eq 0) {
-                $script:Warnings.Add('no arm64 APK artifacts found after build attempt')
-                if ($buildStatus -eq 'ok') { $buildStatus = 'partial' }
+                $script:Warnings.Add('no fresh arm64 APK artifacts found after build attempt')
+                $buildStatus = 'failed'
             } else {
+                $freshCount = 0
                 foreach ($apk in $apks) {
                     $kind = if ($apk.Name -match 'release') { 'android-release-apk' } else { 'android-debug-apk' }
-                    Add-ApkArtifactAndInspect -ApkPath $apk.FullName -Kind $kind
+                    if (Add-ApkArtifactAndInspect -ApkPath $apk.FullName -Kind $kind -NotBeforeUtc $buildStartedUtc -RequireFresh) {
+                        $freshCount += 1
+                    }
+                }
+                if ($freshCount -eq 0) {
+                    $buildStatus = 'failed'
                 }
             }
         }
@@ -357,7 +375,8 @@ try {
         -Artifacts $artifactArr `
         -BuildStatus $buildStatus `
         -Warnings $warningArr `
-        -Notes $noteArr
+        -Notes $noteArr `
+        -RepoRoot $script:RepoRoot
     $manifestPath = Join-Path $runDir 'manifest.json'
     Write-ReleaseJson -Object $manifest -Path $manifestPath
 
@@ -374,15 +393,19 @@ try {
         'acceptance.gui=not_claimed'
         'acceptance.android_device=not_claimed'
         '--- warnings ---'
-    )) { $summary.Add([string]$line) }
-    foreach ($w in $script:Warnings) { $summary.Add([string]$w) }
+    )) { $summary.Add([string](Protect-ReleasePath -Text $line -RepoRoot $script:RepoRoot)) }
+    foreach ($w in $script:Warnings) { $summary.Add([string](Protect-ReleasePath -Text $w -RepoRoot $script:RepoRoot)) }
     $summary.Add('--- notes ---')
-    foreach ($n in $script:Notes) { $summary.Add([string]$n) }
+    foreach ($n in $script:Notes) { $summary.Add([string](Protect-ReleasePath -Text $n -RepoRoot $script:RepoRoot)) }
     Set-Content -LiteralPath $summaryPath -Value $summary.ToArray() -Encoding utf8
 
     Start-AndroidHostStep -Name 'retention cleanup'
     $artifactRoot = Join-Path $script:RepoRoot 'artifacts\release-build'
-    $targets = Get-ReleaseRetentionCleanupTargets -Root $artifactRoot -Keep $KeepRuns
+    $targets = Get-ReleaseRetentionCleanupTargets `
+        -Root $artifactRoot `
+        -Keep $KeepRuns `
+        -NamePrefixes @('windows-', 'android-') `
+        -ProtectFullNames @($runDir)
     if ($DryRun) {
         Write-Host ("DRY RUN: would remove {0} old run dir(s), keep {1}" -f @($targets).Count, $KeepRuns)
     } else {
@@ -393,9 +416,10 @@ try {
     }
 
     Write-Host ''
-    if ($buildStatus -eq 'failed') {
-        Write-Host 'Android host pipeline FAILED (fail-closed).' -ForegroundColor Red
-        exit 1
+    $exitCode = Get-ReleaseProcessExitCode -BuildStatus $buildStatus
+    if ($exitCode -ne 0) {
+        Write-Host ("Android host pipeline FAILED (fail-closed) status={0}." -f $buildStatus) -ForegroundColor Red
+        exit $exitCode
     }
 
     Write-Host ("Android host pipeline finished with status={0}." -f $buildStatus) -ForegroundColor Green
