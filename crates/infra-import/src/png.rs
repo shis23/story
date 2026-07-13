@@ -380,6 +380,7 @@ mod tests {
                     order: Some(13),
                     depth: Some(5),
                     extensions: serde_json::json!({"entry_extra": {"rank": 9}}),
+                    extra: Default::default(),
                 }],
                 extra: book_extra,
             }),

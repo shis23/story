@@ -1400,6 +1400,7 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
                 order: e.order,
                 route,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             });
         }
     }
@@ -9785,6 +9786,334 @@ struct CampaignBundle {
     summaries: Vec<storyforge_domain::agent::RoundSummary>,
 }
 
+#[derive(Debug, PartialEq)]
+struct BundleStoreSnapshot {
+    cards: serde_json::Value,
+    campaigns: serde_json::Value,
+    instances: serde_json::Value,
+    knowledge: serde_json::Value,
+    tasks: serde_json::Value,
+    summaries: serde_json::Value,
+    mvu: serde_json::Value,
+    conversations: serde_json::Value,
+}
+
+fn value_of<T: Serialize>(value: T, label: &str) -> Result<serde_json::Value, String> {
+    serde_json::to_value(value).map_err(|error| format!("serialize {label}: {error}"))
+}
+
+fn bundle_store_snapshot_in_memory(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+) -> Result<BundleStoreSnapshot, String> {
+    let mut conversations: Vec<_> = conv_store
+        .list()
+        .into_iter()
+        .filter_map(|summary| conv_store.get(&summary.id))
+        .collect();
+    conversations.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    Ok(BundleStoreSnapshot {
+        cards: value_of(store.list_cards(), "cards")?,
+        campaigns: value_of(store.list_campaigns(), "campaigns")?,
+        instances: value_of(store.list_all_instances(), "instances")?,
+        knowledge: value_of(store.list_all_knowledge(), "knowledge")?,
+        tasks: value_of(store.list_all_tasks(), "tasks")?,
+        summaries: value_of(store.list_all_summaries(), "summaries")?,
+        mvu: value_of(store.list_all_mvu(), "mvu_translations")?,
+        conversations: value_of(conversations, "conversations")?,
+    })
+}
+
+fn read_json_collection_strict<T>(path: &std::path::Path) -> Result<serde_json::Value, String>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{} metadata: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("{} read: {error}", path.display()))?;
+    let parsed: Vec<T> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} parse: {error}", path.display()))?;
+    value_of(parsed, &path.display().to_string())
+}
+
+fn read_conversations_strict(dir: &std::path::Path) -> Result<serde_json::Value, String> {
+    if !dir.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("{} metadata: {error}", dir.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    let mut conversations = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).map_err(|error| format!("{} read_dir: {error}", dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("{} entry: {error}", dir.display()))?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("{} read: {error}", path.display()))?;
+            let conversation: storyforge_domain::conversation::Conversation =
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("{} parse: {error}", path.display()))?;
+            conversations.push(conversation);
+        }
+    }
+    conversations.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    value_of(conversations, "conversations")
+}
+
+fn read_bundle_disk_snapshot_strict(
+    data_dir: &std::path::Path,
+    conversations_dir: &std::path::Path,
+) -> Result<BundleStoreSnapshot, String> {
+    Ok(BundleStoreSnapshot {
+        cards: read_json_collection_strict::<campaign_store::StoredCard>(
+            &data_dir.join("cards.json"),
+        )?,
+        campaigns: read_json_collection_strict::<storyforge_domain::campaign::Campaign>(
+            &data_dir.join("campaigns.json"),
+        )?,
+        instances: read_json_collection_strict::<storyforge_domain::campaign::CharacterInstance>(
+            &data_dir.join("instances.json"),
+        )?,
+        knowledge: read_json_collection_strict::<
+            storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+        >(&data_dir.join("knowledge.json"))?,
+        tasks: read_json_collection_strict::<storyforge_domain::story_task::StoryTask>(
+            &data_dir.join("tasks.json"),
+        )?,
+        summaries: read_json_collection_strict::<storyforge_domain::agent::RoundSummary>(
+            &data_dir.join("round_summaries.json"),
+        )?,
+        mvu: read_json_collection_strict::<campaign_store::StoredMvuTranslation>(
+            &data_dir.join("mvu_translations.json"),
+        )?,
+        conversations: read_conversations_strict(conversations_dir)?,
+    })
+}
+
+fn validate_bundle_summary_graph(
+    campaign: &storyforge_domain::campaign::Campaign,
+    summaries: &[storyforge_domain::agent::RoundSummary],
+) -> Result<(), TauriCommandError> {
+    use std::collections::{HashMap, HashSet};
+    use storyforge_domain::agent::RoundSummary;
+
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    let Some(conversation_id) = campaign.conversation_id.as_ref() else {
+        return Err(TauriCommandError::validation(
+            "Bundle 含 Chronicle 摘要但 Campaign 缺少 conversation_id",
+        ));
+    };
+    let Some(lineage_id) = campaign.lineage_id.as_ref() else {
+        return Err(TauriCommandError::validation(
+            "Bundle 含 Chronicle 摘要但 Campaign 缺少 lineage_id",
+        ));
+    };
+
+    let mut by_id: HashMap<Id, &RoundSummary> = HashMap::with_capacity(summaries.len());
+    let mut codes = HashSet::with_capacity(summaries.len());
+    for summary in summaries {
+        if by_id.insert(summary.id.clone(), summary).is_some() {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 id 重复: {}",
+                summary.id
+            )));
+        }
+        if summary.campaign_id != campaign.id {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} campaign scope 不匹配",
+                summary.id
+            )));
+        }
+        if summary.conversation_id != *conversation_id {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} conversation scope 不匹配",
+                summary.id
+            )));
+        }
+        if summary.lineage_id.as_ref() != Some(lineage_id) {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} lineage scope 不匹配",
+                summary.id
+            )));
+        }
+        if summary.level > 2 {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} level={} 非法",
+                summary.id, summary.level
+            )));
+        }
+        if let Some(raw_code) = summary.code.as_deref() {
+            let code =
+                storyforge_domain::chronicle::ChronicleCode::parse(raw_code).ok_or_else(|| {
+                    TauriCommandError::validation(format!(
+                        "Bundle 摘要 {} code 非法: {raw_code}",
+                        summary.id
+                    ))
+                })?;
+            if code
+                .level()
+                .is_none_or(|level| level.as_u8() != summary.level)
+            {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要 {} code={} 与 level={} 不匹配",
+                    summary.id, raw_code, summary.level
+                )));
+            }
+            if !codes.insert(code.as_str().to_string()) {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle lineage {} 内 Chronicle code 重复: {}",
+                    lineage_id, raw_code
+                )));
+            }
+        }
+        if summary.turn == 0 || (summary.turn_end != 0 && summary.turn_end < summary.turn) {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} turn span 非法: {}..{}",
+                summary.id, summary.turn, summary.turn_end
+            )));
+        }
+        if summary.level == 0 {
+            if !summary.covers.is_empty() || summary.effective_turn_end() != summary.turn {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle A 摘要 {} 必须是无 covers 的单轮 leaf",
+                    summary.id
+                )));
+            }
+        } else if summary.covers.is_empty() {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle B/C 摘要 {} 必须覆盖子摘要",
+                summary.id
+            )));
+        }
+
+        let mut unique_covers = HashSet::with_capacity(summary.covers.len());
+        for child_id in &summary.covers {
+            if child_id == &summary.id || !unique_covers.insert(child_id) {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要 {} covers 含 self/重复 child {}",
+                    summary.id, child_id
+                )));
+            }
+        }
+    }
+
+    for summary in summaries {
+        if let Some(parent_id) = &summary.covered_by {
+            let Some(parent) = by_id.get(parent_id).copied() else {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要 {} covered_by 引用无效: {}",
+                    summary.id, parent_id
+                )));
+            };
+            if !parent.covers.contains(&summary.id) {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要图不对称: {} covered_by {}，但 parent 未 covers child",
+                    summary.id, parent_id
+                )));
+            }
+            if parent.level != summary.level + 1 {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要层级非法: parent {} level={} child {} level={}",
+                    parent.id, parent.level, summary.id, summary.level
+                )));
+            }
+        }
+
+        if summary.covers.is_empty() {
+            continue;
+        }
+        let mut children = Vec::with_capacity(summary.covers.len());
+        for child_id in &summary.covers {
+            let Some(child) = by_id.get(child_id).copied() else {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要 {} covers 引用无效: {}",
+                    summary.id, child_id
+                )));
+            };
+            if child.covered_by.as_ref() != Some(&summary.id) {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要图不对称: {} covers {}，但 child.covered_by 不匹配",
+                    summary.id, child.id
+                )));
+            }
+            if summary.level != child.level + 1 {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要层级非法: parent {} level={} child {} level={}",
+                    summary.id, summary.level, child.id, child.level
+                )));
+            }
+            children.push(child);
+        }
+        children.sort_by_key(|child| child.turn);
+        let mut expected_turn = summary.turn;
+        for child in children {
+            if child.turn != expected_turn {
+                return Err(TauriCommandError::validation(format!(
+                    "Bundle 摘要 {} covers span 不连续/不重合: expected turn {}, child {} starts {}",
+                    summary.id, expected_turn, child.id, child.turn
+                )));
+            }
+            expected_turn = child.effective_turn_end().checked_add(1).ok_or_else(|| {
+                TauriCommandError::validation(format!("Bundle 摘要 {} child span 溢出", summary.id))
+            })?;
+        }
+        if expected_turn - 1 != summary.effective_turn_end() {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 {} span 与 covers 不一致",
+                summary.id
+            )));
+        }
+    }
+
+    // Level checks already make cycles impossible for valid graphs. Keep an explicit
+    // DFS guard so malformed legacy levels cannot hide a cyclic covers graph.
+    fn visit(
+        id: &Id,
+        by_id: &HashMap<Id, &RoundSummary>,
+        visiting: &mut HashSet<Id>,
+        visited: &mut HashSet<Id>,
+    ) -> Result<(), TauriCommandError> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id.clone()) {
+            return Err(TauriCommandError::validation(format!(
+                "Bundle 摘要 covers 图存在环: {id}"
+            )));
+        }
+        if let Some(summary) = by_id.get(id) {
+            for child in &summary.covers {
+                visit(child, by_id, visiting, visited)?;
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id.clone());
+        Ok(())
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for id in by_id.keys() {
+        visit(id, &by_id, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
 /// StoryForge Campaign Bundle 导入结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignImportResult {
@@ -9969,6 +10298,18 @@ fn import_campaign_bundle_into_store(
     conv_store: &ConversationStore,
     bundle: CampaignBundle,
 ) -> Result<CampaignImportResult, TauriCommandError> {
+    import_campaign_bundle_into_store_with_after_campaign(store, conv_store, bundle, || Ok(()))
+}
+
+fn import_campaign_bundle_into_store_with_after_campaign<F>(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    bundle: CampaignBundle,
+    after_campaign_saved: F,
+) -> Result<CampaignImportResult, TauriCommandError>
+where
+    F: FnOnce() -> Result<(), TauriCommandError>,
+{
     use std::collections::HashMap;
 
     if bundle.format_version == 0 || bundle.format_version > BUNDLE_FORMAT_VERSION {
@@ -9977,6 +10318,7 @@ fn import_campaign_bundle_into_store(
             bundle.format_version
         )));
     }
+    validate_bundle_summary_graph(&bundle.campaign, &bundle.summaries)?;
 
     let old_campaign_id = bundle.campaign.id.clone();
     let new_card_id = Id::new();
@@ -10022,6 +10364,9 @@ fn import_campaign_bundle_into_store(
     campaign.id = new_campaign_id.clone();
     campaign.card_id = new_card_id.clone();
     campaign.fork_from = None;
+    // This marker describes an in-flight publication in the source store. Its ids
+    // are rewritten below and its job/ledger state is not part of Bundle v2.
+    campaign.pending_compress_publication = None;
 
     let mut instance_id_map: HashMap<Id, Id> = HashMap::new();
     for instance in &bundle.instances {
@@ -10153,18 +10498,27 @@ fn import_campaign_bundle_into_store(
     }
 
     let mut created_conversation_id: Option<Id> = None;
-    let mut card_saved = false;
-    let mut campaign_saved = false;
+    let memory_baseline = bundle_store_snapshot_in_memory(store, conv_store)
+        .map_err(|error| TauriCommandError::storage(format!("导入前快照失败: {error}")))?;
+    let data_dir = store
+        .data_dir()
+        .ok_or_else(|| TauriCommandError::storage("导入前 CampaignStore 缺少 data_dir"))?;
+    let disk_baseline = read_bundle_disk_snapshot_strict(data_dir, conv_store.data_dir())
+        .map_err(|error| TauriCommandError::storage(format!("导入前磁盘校验失败: {error}")))?;
+    if disk_baseline != memory_baseline {
+        return Err(TauriCommandError::storage(
+            "导入前内存缓存与磁盘状态不一致，拒绝覆盖",
+        ));
+    }
 
-    let rollback = |created_conversation_id: &Option<Id>,
-                    card_saved: bool,
-                    campaign_saved: bool|
-     -> Result<(), String> {
+    let rollback = |created_conversation_id: &Option<Id>| -> Result<(), String> {
         let mut errors = Vec::new();
-        if campaign_saved && let Err(e) = store.delete_campaign(&new_campaign_id) {
+        // Always compensate known ids: a store method can mutate its cache before a
+        // persistence error is returned, so a success flag alone is insufficient.
+        if let Err(e) = store.delete_campaign(&new_campaign_id) {
             errors.push(format!("delete_campaign: {e}"));
         }
-        if card_saved && let Err(e) = store.delete_card(&new_card_id) {
+        if let Err(e) = store.delete_card(&new_card_id) {
             errors.push(format!("delete_card: {e}"));
         }
         if let Some(conversation_id) = created_conversation_id
@@ -10172,27 +10526,31 @@ fn import_campaign_bundle_into_store(
         {
             errors.push(format!("delete_conversation: {e}"));
         }
-        // Re-open from disk and verify no partial import remains.
-        if let Some(data_dir) = store.data_dir() {
-            let reloaded = campaign_store::CampaignStore::new(data_dir);
-            if reloaded.get_card(&new_card_id).is_some() {
-                errors.push("rollback verification: card still present on disk".into());
+
+        match bundle_store_snapshot_in_memory(store, conv_store) {
+            Ok(current) if current != memory_baseline => errors.push(
+                "rollback verification: in-memory stores differ from pre-import snapshot".into(),
+            ),
+            Err(error) => errors.push(format!(
+                "rollback verification: in-memory snapshot failed: {error}"
+            )),
+            Ok(_) => {}
+        }
+
+        match store.data_dir() {
+            Some(data_dir) => {
+                match read_bundle_disk_snapshot_strict(data_dir, conv_store.data_dir()) {
+                    Ok(current) if current != disk_baseline => errors.push(
+                        "rollback verification: durable stores differ from pre-import snapshot"
+                            .into(),
+                    ),
+                    Err(error) => errors.push(format!(
+                        "rollback verification: strict disk read failed: {error}"
+                    )),
+                    Ok(_) => {}
+                }
             }
-            if reloaded.get_campaign(&new_campaign_id).is_some() {
-                errors.push("rollback verification: campaign still present on disk".into());
-            }
-            if !reloaded.list_instances(&new_campaign_id).is_empty() {
-                errors.push("rollback verification: instances still present on disk".into());
-            }
-            if !reloaded.list_knowledge(&new_campaign_id).is_empty() {
-                errors.push("rollback verification: knowledge still present on disk".into());
-            }
-            if !reloaded.list_tasks(&new_campaign_id).is_empty() {
-                errors.push("rollback verification: tasks still present on disk".into());
-            }
-            if !reloaded.list_summaries(&new_campaign_id).is_empty() {
-                errors.push("rollback verification: summaries still present on disk".into());
-            }
+            None => errors.push("rollback verification: CampaignStore has no data_dir".into()),
         }
         if errors.is_empty() {
             Ok(())
@@ -10205,18 +10563,19 @@ fn import_campaign_bundle_into_store(
         store
             .save_card(card)
             .map_err(|e| TauriCommandError::storage(format!("导入角色卡失败: {e}")))?;
-        card_saved = true;
 
-        let conversation = conv_store.create(
-            Some(new_card_id.as_str().to_string()),
-            Some(new_campaign_id.clone()),
-        );
+        let conversation = conv_store
+            .create_persisted(
+                Some(new_card_id.as_str().to_string()),
+                Some(new_campaign_id.clone()),
+            )
+            .map_err(|e| TauriCommandError::storage(format!("导入对话失败: {e}")))?;
         created_conversation_id = Some(conversation.id.clone());
         campaign.conversation_id = Some(conversation.id.clone());
         store
             .save_campaign(campaign)
             .map_err(|e| TauriCommandError::storage(format!("导入 Campaign 失败: {e}")))?;
-        campaign_saved = true;
+        after_campaign_saved()?;
 
         let mut instance_count = 0;
         for instance in rewritten_instances {
@@ -10277,7 +10636,7 @@ fn import_campaign_bundle_into_store(
 
     match result {
         Ok(ok) => Ok(ok),
-        Err(err) => match rollback(&created_conversation_id, card_saved, campaign_saved) {
+        Err(err) => match rollback(&created_conversation_id) {
             Ok(()) => Err(err),
             Err(rollback_err) => Err(TauriCommandError::storage(format!(
                 "导入失败且回滚未完全验证: 原始错误={err}; 回滚={rollback_err}"
@@ -10310,6 +10669,7 @@ fn knowledge_to_st_book(
             order: Some(100),
             depth: Some(2),
             extensions: serde_json::json!({}),
+            extra: Default::default(),
         })
         .collect();
 
@@ -10621,6 +10981,7 @@ fn world_info_entry_from_info(
         order: e.order,
         route,
         extensions: serde_json::json!({}),
+        extra: Default::default(),
     }
 }
 
@@ -11809,6 +12170,7 @@ mod tests {
         let mut campaign = Campaign::new(old_card_id.clone(), "Bundle Campaign");
         campaign.id = old_campaign_id.clone();
         campaign.conversation_id = Some(old_conversation_id.clone());
+        let campaign_lineage = campaign.lineage_id.clone().unwrap();
 
         let instances = vec![
             CharacterInstance {
@@ -11879,7 +12241,7 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             code: Some("A0001".into()),
             headline: None,
-            lineage_id: None,
+            lineage_id: Some(campaign_lineage),
             covered_by: None,
             level: 0,
             turn_end: 0,
@@ -11995,8 +12357,6 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // Force instance persistence to fail after card/campaign writes.
-        std::fs::create_dir_all(dir.join("instances.json")).unwrap();
 
         let store = campaign_store::CampaignStore::new(&dir);
         let conv_store = ConversationStore::new(dir.join("conversations"));
@@ -12044,7 +12404,7 @@ mod tests {
             is_temporary: false,
         }];
 
-        let err = import_campaign_bundle_into_store(
+        let err = import_campaign_bundle_into_store_with_after_campaign(
             &store,
             &conv_store,
             CampaignBundle {
@@ -12058,8 +12418,9 @@ mod tests {
                 tasks: vec![],
                 summaries: vec![],
             },
+            || Err(TauriCommandError::storage("injected after campaign save")),
         )
-        .expect_err("instance write failure should fail the import");
+        .expect_err("post-campaign failure should fail the import");
 
         match err {
             TauriCommandError::Storage { .. } | TauriCommandError::Internal { .. } => {}
@@ -12360,6 +12721,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn valid_summary_graph_bundle() -> CampaignBundle {
+        use storyforge_domain::agent::RoundSummary;
+        use storyforge_domain::campaign::Campaign;
+
+        let card_id = Id::from_str("graph-card");
+        let campaign_id = Id::from_str("graph-campaign");
+        let conversation_id = Id::from_str("graph-conversation");
+        let a1_id = Id::from_str("graph-a1");
+        let a2_id = Id::from_str("graph-a2");
+        let b_id = Id::from_str("graph-b1");
+        let mut campaign = Campaign::new(card_id, "Graph Campaign");
+        campaign.id = campaign_id.clone();
+        campaign.conversation_id = Some(conversation_id.clone());
+        let lineage_id = campaign.lineage_id.clone().unwrap();
+
+        let mut a1 = RoundSummary::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            1,
+            "leaf one".into(),
+        );
+        a1.id = a1_id.clone();
+        a1.code = Some("A0001".into());
+        a1.lineage_id = Some(lineage_id.clone());
+        a1.covered_by = Some(b_id.clone());
+
+        let mut a2 = RoundSummary::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            2,
+            "leaf two".into(),
+        );
+        a2.id = a2_id.clone();
+        a2.code = Some("A0002".into());
+        a2.lineage_id = Some(lineage_id.clone());
+        a2.covered_by = Some(b_id.clone());
+
+        let mut b = RoundSummary::new(campaign_id, conversation_id, 1, "band".into());
+        b.id = b_id;
+        b.code = Some("B0001".into());
+        b.lineage_id = Some(lineage_id);
+        b.level = 1;
+        b.turn_end = 2;
+        b.covers = vec![a1_id, a2_id];
+
+        CampaignBundle {
+            format_version: BUNDLE_FORMAT_VERSION,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            card: None,
+            campaign,
+            instances: vec![],
+            definitions: vec![],
+            knowledge: vec![],
+            tasks: vec![],
+            summaries: vec![a1, a2, b],
+        }
+    }
+
+    #[test]
+    fn import_campaign_bundle_rejects_malformed_summary_graphs_before_writes() {
+        let cases = [
+            "duplicate-id",
+            "asymmetric-edge",
+            "cycle",
+            "wrong-level",
+            "wrong-span",
+            "scope-drift",
+            "campaign-lineage-missing",
+            "lineage-missing",
+            "lineage-drift",
+            "code-level-mismatch",
+            "duplicate-code",
+            "duplicate-cover",
+        ];
+
+        for case in cases {
+            let dir = std::env::temp_dir().join(format!(
+                "storyforge_test_import_bad_graph_{case}_{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = campaign_store::CampaignStore::new(&dir);
+            let conv_store = ConversationStore::new(dir.join("conversations"));
+            let mut bundle = valid_summary_graph_bundle();
+
+            match case {
+                "duplicate-id" => bundle.summaries.push(bundle.summaries[0].clone()),
+                "asymmetric-edge" => bundle.summaries[0].covered_by = None,
+                "cycle" => {
+                    let parent_id = bundle.summaries[2].id.clone();
+                    let child_id = bundle.summaries[0].id.clone();
+                    bundle.summaries[0].covers = vec![parent_id];
+                    bundle.summaries[2].covered_by = Some(child_id);
+                }
+                "wrong-level" => bundle.summaries[2].level = 2,
+                "wrong-span" => bundle.summaries[2].turn_end = 1,
+                "scope-drift" => bundle.summaries[1].campaign_id = Id::from_str("other-campaign"),
+                "campaign-lineage-missing" => bundle.campaign.lineage_id = None,
+                "lineage-missing" => bundle.summaries[0].lineage_id = None,
+                "lineage-drift" => {
+                    bundle.summaries[0].lineage_id = Some(Id::from_str("other-lineage"))
+                }
+                "code-level-mismatch" => bundle.summaries[2].code = Some("A9999".into()),
+                "duplicate-code" => bundle.summaries[1].code = bundle.summaries[0].code.clone(),
+                "duplicate-cover" => {
+                    let child = bundle.summaries[2].covers[0].clone();
+                    bundle.summaries[2].covers.push(child);
+                }
+                _ => unreachable!(),
+            }
+
+            let error = import_campaign_bundle_into_store(&store, &conv_store, bundle)
+                .expect_err("malformed summary graph must fail closed");
+            assert!(
+                matches!(error, TauriCommandError::Validation { .. }),
+                "case={case}, unexpected={error:?}"
+            );
+            assert!(store.list_cards().is_empty(), "case={case}");
+            assert!(store.list_campaigns().is_empty(), "case={case}");
+            assert!(store.list_all_summaries().is_empty(), "case={case}");
+            assert!(conv_store.list().is_empty(), "case={case}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn import_campaign_bundle_clears_nonportable_pending_compress_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_pending_marker_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+        let mut bundle = valid_summary_graph_bundle();
+        let parent = bundle.summaries[2].id.clone();
+        let children: Vec<_> = bundle.summaries[..2]
+            .iter()
+            .map(|summary| (summary.id.clone(), parent.clone()))
+            .collect();
+        bundle.campaign.pending_compress_publication = Some(
+            storyforge_domain::chronicle::PendingCompressPublication::new(
+                bundle.campaign.chronicle_revision,
+                vec![parent],
+                children,
+            ),
+        );
+
+        let imported = import_campaign_bundle_into_store(&store, &conv_store, bundle).unwrap();
+        let campaign = store
+            .get_campaign(&Id::from_str(&imported.campaign_id))
+            .unwrap();
+        assert!(
+            campaign.pending_compress_publication.is_none(),
+            "an in-flight source publication cannot be resumed with rewritten ids"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn import_campaign_bundle_rewrites_summary_covers_and_preserves_bc_graph() {
         use storyforge_domain::agent::RoundSummary;
@@ -12407,6 +12927,7 @@ mod tests {
         campaign.id = campaign_id.clone();
         campaign.conversation_id = Some(conversation_id.clone());
         campaign.chronicle_revision = 3;
+        let campaign_lineage = campaign.lineage_id.clone().unwrap();
 
         let instances = vec![CharacterInstance {
             id: instance_id,
@@ -12427,6 +12948,7 @@ mod tests {
         );
         a1.id = leaf_a1.clone();
         a1.code = Some("A0001".into());
+        a1.lineage_id = Some(campaign_lineage.clone());
         a1.level = 0;
         a1.turn_end = 1;
         a1.covered_by = Some(parent_b.clone());
@@ -12439,6 +12961,7 @@ mod tests {
         );
         a2.id = leaf_a2.clone();
         a2.code = Some("A0002".into());
+        a2.lineage_id = Some(campaign_lineage.clone());
         a2.level = 0;
         a2.turn_end = 2;
         a2.covered_by = Some(parent_b.clone());
@@ -12452,6 +12975,7 @@ mod tests {
         );
         b.id = parent_b.clone();
         b.code = Some("B0001".into());
+        b.lineage_id = Some(campaign_lineage);
         b.level = 1;
         b.turn_end = 2;
         b.covers = vec![leaf_a1.clone(), leaf_a2.clone()];
@@ -12637,8 +13161,6 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // Force instance persistence to fail after card/campaign writes.
-        std::fs::create_dir_all(dir.join("instances.json")).unwrap();
 
         let store = campaign_store::CampaignStore::new(&dir);
         let conv_store = ConversationStore::new(dir.join("conversations"));
@@ -12679,7 +13201,8 @@ mod tests {
             is_temporary: false,
         }];
 
-        let _ = import_campaign_bundle_into_store(
+        let instances_path = dir.join("instances.json");
+        let error = import_campaign_bundle_into_store_with_after_campaign(
             &store,
             &conv_store,
             CampaignBundle {
@@ -12693,8 +13216,24 @@ mod tests {
                 tasks: vec![],
                 summaries: vec![],
             },
+            || {
+                // Corrupt a collection only after the strict preflight so this
+                // exercises rollback verification rather than baseline rejection.
+                std::fs::create_dir_all(&instances_path).map_err(|error| {
+                    TauriCommandError::storage(format!("inject rollback fault: {error}"))
+                })?;
+                Ok(())
+            },
         )
         .expect_err("instance write failure should fail import");
+        let message = match error {
+            TauriCommandError::Storage { message } => message,
+            other => panic!("expected storage error, got {other:?}"),
+        };
+        assert!(
+            message.contains("strict disk read failed") && message.contains("instances.json"),
+            "rollback verification must report unreadable disk state: {message}"
+        );
 
         // Reload store from disk — in-memory empty is not enough.
         let reloaded = campaign_store::CampaignStore::new(&dir);
@@ -12711,6 +13250,109 @@ mod tests {
             "rollback must clear instances on disk"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_bundle_disk_snapshot_rejects_unreadable_collection() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_strict_snapshot_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("instances.json")).unwrap();
+        let conversations_dir = dir.join("conversations");
+        std::fs::create_dir_all(&conversations_dir).unwrap();
+
+        let error = read_bundle_disk_snapshot_strict(&dir, &conversations_dir)
+            .expect_err("a collection path that is a directory must not deserialize as empty");
+
+        assert!(error.contains("instances.json"), "unexpected: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_campaign_bundle_rejects_preexisting_corrupt_store_before_any_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_corrupt_baseline_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt = br#"[{"card":"truncated"}"#;
+        std::fs::write(dir.join("cards.json"), corrupt).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+        let campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str("corrupt-baseline-card"),
+            "Corrupt Baseline",
+        );
+
+        let error = import_campaign_bundle_into_store(
+            &store,
+            &conv_store,
+            CampaignBundle {
+                format_version: BUNDLE_FORMAT_VERSION,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                card: None,
+                campaign,
+                instances: vec![],
+                definitions: vec![],
+                knowledge: vec![],
+                tasks: vec![],
+                summaries: vec![],
+            },
+        )
+        .expect_err("corrupt pre-import disk state must fail before writes");
+
+        assert!(matches!(error, TauriCommandError::Storage { .. }));
+        assert_eq!(
+            std::fs::read(dir.join("cards.json")).unwrap(),
+            corrupt,
+            "preflight must not overwrite a corrupt source file"
+        );
+        assert!(store.list_cards().is_empty());
+        assert!(store.list_campaigns().is_empty());
+        assert!(conv_store.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_campaign_bundle_conversation_create_failure_leaves_no_card_or_campaign() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_import_conversation_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conversations_path = dir.join("conversations");
+        std::fs::write(&conversations_path, b"blocked").unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(conversations_path);
+        let campaign = storyforge_domain::campaign::Campaign::new(
+            Id::from_str("conv-fail-card"),
+            "Conversation Failure",
+        );
+
+        let error = import_campaign_bundle_into_store(
+            &store,
+            &conv_store,
+            CampaignBundle {
+                format_version: BUNDLE_FORMAT_VERSION,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                card: None,
+                campaign,
+                instances: vec![],
+                definitions: vec![],
+                knowledge: vec![],
+                tasks: vec![],
+                summaries: vec![],
+            },
+        )
+        .expect_err("conversation create must fail closed");
+
+        assert!(matches!(error, TauriCommandError::Storage { .. }));
+        assert!(store.list_cards().is_empty());
+        assert!(store.list_campaigns().is_empty());
+        assert!(conv_store.list().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14119,6 +14761,7 @@ mod tests {
                 order: 12,
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({"entry_extra": true}),
+                extra: Default::default(),
             }],
             metadata: Default::default(),
         });

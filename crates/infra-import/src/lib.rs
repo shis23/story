@@ -71,7 +71,7 @@ pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> 
     let json_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chara_text)?;
 
-    let card: StCharacterCard = serde_json::from_slice(&json_bytes)?;
+    let card: StCharacterCard = serde_json::from_slice(strip_utf8_bom(&json_bytes))?;
     Ok(Character::from_st_card(card))
 }
 
@@ -546,6 +546,19 @@ mod tests {
         let err = import_character_from_png(&png).expect_err("bad JSON should fail");
 
         assert!(matches!(err, ImportError::JsonError(_)));
+    }
+
+    #[test]
+    fn test_import_character_from_png_accepts_bom_json_payload() {
+        let mut json_bytes = vec![0xEF, 0xBB, 0xBF];
+        json_bytes.extend(serde_json::to_vec(&make_test_card_json()).unwrap());
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, json_bytes);
+        let png = png_with_text_chunk("chara", &encoded);
+
+        let character = import_character_from_png(&png).expect("PNG chara BOM should be accepted");
+
+        assert_eq!(character.name, "测试角色");
     }
 
     #[test]

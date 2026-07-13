@@ -132,6 +132,9 @@ pub struct StWorldInfoEntry {
     pub depth: Option<i32>,
     #[serde(default)]
     pub extensions: serde_json::Value,
+    /// Unknown entry-level ST fields (for example probability/automation metadata).
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl StWorldInfoEntry {
@@ -1040,6 +1043,7 @@ mod multi_character_tests {
                 order: None,
                 depth: None,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             extra: Default::default(),
         };
@@ -1048,5 +1052,47 @@ mod multi_character_tests {
         let cb = exported.character_book.unwrap();
         assert_eq!(cb.entries.len(), 1);
         assert_eq!(cb.entries[0].keys, vec!["测试"]);
+    }
+
+    #[test]
+    fn test_world_info_entry_unknown_fields_survive_first_import_and_export() {
+        let card: StCharacterCard = serde_json::from_value(serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Entry Extras",
+                "character_book": {
+                    "entries": [{
+                        "id": 7,
+                        "keys": ["harbor"],
+                        "content": "The harbor closes at dusk.",
+                        "constant": true,
+                        "probability": 73,
+                        "automation_id": "entry-hook-7"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let character = Character::from_st_card(card);
+        let book = character
+            .embedded_world_info
+            .as_ref()
+            .expect("embedded book should import");
+        assert_eq!(
+            book.entries[0].extra.get("probability"),
+            Some(&serde_json::json!(73))
+        );
+        assert_eq!(
+            book.entries[0].extra.get("automation_id"),
+            Some(&serde_json::json!("entry-hook-7"))
+        );
+
+        let exported = to_st_data(&character, None, Some(book.to_st_book()));
+        let exported_json = serde_json::to_value(exported).unwrap();
+        let entry = &exported_json["character_book"]["entries"][0];
+        assert_eq!(entry["probability"], serde_json::json!(73));
+        assert_eq!(entry["automation_id"], serde_json::json!("entry-hook-7"));
     }
 }

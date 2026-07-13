@@ -40,6 +40,9 @@ pub struct WorldInfoEntry {
     pub route: LoreRoute,
     /// ST extensions（保留原始 JSON）
     pub extensions: serde_json::Value,
+    /// ST entry-level fields unknown to StoryForge, preserved for round-trip.
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// 世界书条目路由（D13：用户可调，默认按灯色映射）
@@ -208,6 +211,7 @@ impl WorldInfoEntry {
             order: st.order.unwrap_or(100),
             route,
             extensions: st.extensions,
+            extra: st.extra,
         }
     }
 
@@ -237,6 +241,7 @@ impl WorldInfoEntry {
             order: Some(self.order),
             depth: Some(self.depth),
             extensions: self.extensions.clone(),
+            extra: self.extra.clone(),
         }
     }
 }
@@ -267,6 +272,7 @@ mod tests {
             order: 100,
             route,
             extensions: serde_json::json!({}),
+            extra: Default::default(),
         }
     }
 
@@ -448,6 +454,7 @@ mod tests {
                 order: Some(42),
                 depth: Some(3),
                 extensions: serde_json::json!({ "source": "st" }),
+                extra: Default::default(),
             }],
             extra: Default::default(),
         });

@@ -61,6 +61,10 @@ impl ConversationStore {
         }
     }
 
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     /// 获取缓存锁，恢复被毒化的 mutex 而非 panic
     fn lock_cache(&self) -> MutexGuard<'_, Vec<Conversation>> {
         self.cache
@@ -142,6 +146,25 @@ impl ConversationStore {
         let mut cache = self.lock_cache();
         cache.push(conv.clone());
         conv
+    }
+
+    /// Create a conversation only after its durable JSON record has been written.
+    ///
+    /// Import/transaction-like callers must use this entry point so an I/O failure
+    /// cannot be mistaken for a created conversation or pollute the in-memory cache.
+    pub fn create_persisted(
+        &self,
+        character_id: Option<String>,
+        campaign_id: Option<Id>,
+    ) -> Result<Conversation, ConversationError> {
+        self.ensure_loaded();
+
+        let conv = Conversation::new(character_id, campaign_id);
+        self.persist(&conv)?;
+
+        let mut cache = self.lock_cache();
+        cache.push(conv.clone());
+        Ok(conv)
     }
 
     /// 获取对话列表（摘要，card_name 由 Tauri 层联查填充）
@@ -731,6 +754,27 @@ mod tests {
 
         // 清理
         let _ = store.delete(&conv.id);
+    }
+
+    #[test]
+    fn create_persisted_fails_without_polluting_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "storyforge_test_conv_create_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked_dir = root.join("conversations");
+        std::fs::write(&blocked_dir, b"not a directory").unwrap();
+        let store = ConversationStore::new(blocked_dir);
+
+        let result = store.create_persisted(Some("blocked".into()), Some(Id::new()));
+
+        assert!(result.is_err(), "conversation persistence must fail closed");
+        assert!(
+            store.list().is_empty(),
+            "a failed create must not enter the in-memory cache"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
