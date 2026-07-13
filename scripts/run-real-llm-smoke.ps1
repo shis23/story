@@ -84,8 +84,8 @@ $SuiteDefinitions = [ordered]@{
         Filter = 'm5_'
     }
     eval = @{
-        Description = 'M5/Phase B evaluation harness (CommitTurn, long-session, A/B matrix); requires STORYFORGE_EVAL_REAL_LLM=1'
-        Filter = 'eval_'
+        Description = 'M5 evidence: production pipeline write + synthetic Chronicle fixture + faithful Accept across H_anchor+E'
+        Filter = 'eval_real_llm_pipeline_write_synthetic_chronicle_accept_across_epoch'
     }
 }
 
@@ -334,13 +334,15 @@ try {
         exit 0
     }
 
-    Assert-LlmEnvironment
+    if (-not $DryRun) {
+        Assert-LlmEnvironment
+    }
 
     $repoRoot = Find-RepoRoot
     $suites = @(Resolve-Suites -RequestedSuites $Suite)
     $startedAt = Get-Date
-    $endpoint = Redact-Endpoint -BaseUrl (Get-RequiredEnv -Name 'LLM_BASE_URL')
-    $model = Get-RequiredEnv -Name 'LLM_MODEL'
+    $endpoint = if ($DryRun) { '<not required for dry run>' } else { Redact-Endpoint -BaseUrl (Get-RequiredEnv -Name 'LLM_BASE_URL') }
+    $model = if ($DryRun) { '<not required for dry run>' } else { Get-RequiredEnv -Name 'LLM_MODEL' }
     $toolMode = Get-RequiredEnv -Name 'LLM_TOOL_MODE'
     if ($null -eq $toolMode) {
         $toolMode = '<default>'
@@ -381,6 +383,30 @@ try {
         }
         if (-not $evalOn -and -not $DryRun) {
             throw 'Suite eval requires STORYFORGE_EVAL_REAL_LLM=1 (explicit paid-model authorization). Deterministic eval tests run via cargo test without this switch.'
+        }
+        $evalFixture = Get-RequiredEnv -Name 'STORYFORGE_EVAL_FIXTURE_CARD'
+        if (-not $DryRun) {
+            if ($null -eq $evalFixture) {
+                throw 'Suite eval requires STORYFORGE_EVAL_FIXTURE_CARD pointing to an existing character-card PNG; the repository has no default fixture.'
+            }
+            if (-not (Test-Path -LiteralPath $evalFixture -PathType Leaf)) {
+                throw ("Suite eval fixture does not exist: {0}" -f $evalFixture)
+            }
+        }
+        $parsedTurns = 0
+        $parsedCalls = 0
+        $parsedTimeout = 0
+        if (-not [int]::TryParse($evalMaxTurns, [ref]$parsedTurns) -or $parsedTurns -le 15) {
+            throw 'Suite eval requires STORYFORGE_EVAL_MAX_TURNS >= 16 so accepted turns strictly cross H_anchor+E=15.'
+        }
+        if (-not [int]::TryParse($evalMaxCalls, [ref]$parsedCalls) -or $parsedCalls -lt $parsedTurns) {
+            throw 'Suite eval requires STORYFORGE_EVAL_MAX_CALLS >= STORYFORGE_EVAL_MAX_TURNS (absolute minimum; 96 calls is the recommended 16-turn starting budget).'
+        }
+        if (-not [int]::TryParse($evalTimeout, [ref]$parsedTimeout) -or $parsedTimeout -lt 1) {
+            throw 'Suite eval requires STORYFORGE_EVAL_TIMEOUT_SECS >= 1.'
+        }
+        if ($parsedCalls -lt ($parsedTurns * 3)) {
+            Write-Warning 'Eval max_calls is below 3x max_turns; the production pipeline may fail closed before completing all Accept rounds.'
         }
     }
     if ($DryRun) {
@@ -426,7 +452,8 @@ try {
             Write-Host 'M5 ACCEPTANCE: INCONCLUSIVE / Partial Evidence' -ForegroundColor Yellow
         }
         if ($ranEval -and $evalProbeOk) {
-            Write-Host 'EVAL M5/PHASEB: PROBE EXECUTION PASS (paid-model matrix may still be Partial Evidence)' -ForegroundColor Yellow
+            Write-Host 'EVAL M5: PIPELINE WRITE + SYNTHETIC CHRONICLE FIXTURE + ACCEPT PROBE PASS' -ForegroundColor Yellow
+            Write-Host 'Production Summarizer/postprocess evidence remains incomplete.' -ForegroundColor Yellow
         }
         Write-Host 'Do not treat this as full parameter calibration or complete M5 acceptance.' -ForegroundColor Yellow
     } else {

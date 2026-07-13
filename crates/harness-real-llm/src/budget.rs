@@ -36,6 +36,7 @@ pub struct UsageSample {
     pub tail_parts: usize,
     pub msg_count: usize,
     pub elapsed_ms: u128,
+    pub outcome: String,
 }
 
 impl UsageSample {
@@ -67,6 +68,7 @@ impl UsageSample {
             cache_creation_tokens: self.cache_creation_tokens,
             completion_tokens: self.completion_tokens,
             elapsed_ms: self.elapsed_ms,
+            outcome: self.outcome.clone(),
             assertion_results: assertions,
             model_label: model_label.into(),
             recorded_at_unix_ms: 0,
@@ -79,6 +81,7 @@ pub struct BudgetedLlmClient {
     inner: Arc<dyn LlmClient>,
     calls: AtomicU32,
     max_calls: u32,
+    max_turns: u32,
     timeout_secs: u64,
     samples: Mutex<Vec<UsageSample>>,
     turn_tag: Mutex<String>,
@@ -91,6 +94,7 @@ impl BudgetedLlmClient {
             inner,
             calls: AtomicU32::new(0),
             max_calls: budget.max_calls,
+            max_turns: budget.max_turns,
             timeout_secs: budget.timeout_secs.max(1),
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("boot".into()),
@@ -112,6 +116,14 @@ impl BudgetedLlmClient {
 
     pub fn max_calls(&self) -> u32 {
         self.max_calls
+    }
+
+    pub fn max_turns(&self) -> u32 {
+        self.max_turns
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     pub fn samples(&self) -> Vec<UsageSample> {
@@ -139,10 +151,17 @@ impl BudgetedLlmClient {
         Ok(())
     }
 
-    fn record(&self, req: &ChatRequest, resp: &ChatResponse, elapsed_ms: u128, streaming: bool) {
+    fn record(
+        &self,
+        req: &ChatRequest,
+        usage: Option<Usage>,
+        elapsed_ms: u128,
+        streaming: bool,
+        outcome: &str,
+    ) {
         let segs = messages_segment_summary(&req.messages);
         let fp = fingerprint_messages(&req.messages);
-        let usage = resp.usage.clone().unwrap_or(Usage {
+        let usage = usage.unwrap_or(Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
@@ -165,12 +184,14 @@ impl BudgetedLlmClient {
             tail_parts: segs.tail_parts,
             msg_count: req.messages.len(),
             elapsed_ms,
+            outcome: outcome.into(),
         };
         eprintln!(
-            "[eval-budget] call={} tag={} stream={} prompt={} cached={} completion={} ms={}",
+            "[eval-budget] call={} tag={} stream={} outcome={} prompt={} cached={} completion={} ms={}",
             self.calls_used(),
             sample.tag,
             sample.streaming,
+            sample.outcome,
             sample.prompt_tokens,
             sample.cached_tokens,
             sample.completion_tokens,
@@ -188,12 +209,22 @@ impl LlmClient for BudgetedLlmClient {
         let fut = self.inner.chat(req);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                self.record(req, None, t0.elapsed().as_millis(), false, "client_error");
+                return Err(e);
+            }
             Err(_) => {
+                self.record(req, None, t0.elapsed().as_millis(), false, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
-        self.record(req, &resp, t0.elapsed().as_millis(), false);
+        self.record(
+            req,
+            resp.usage.clone(),
+            t0.elapsed().as_millis(),
+            false,
+            "ok",
+        );
         Ok(resp)
     }
 
@@ -208,12 +239,22 @@ impl LlmClient for BudgetedLlmClient {
         let fut = self.inner.chat_stream(req, tx, cancel);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                self.record(req, None, t0.elapsed().as_millis(), true, "client_error");
+                return Err(e);
+            }
             Err(_) => {
+                self.record(req, None, t0.elapsed().as_millis(), true, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
-        self.record(req, &resp, t0.elapsed().as_millis(), true);
+        self.record(
+            req,
+            resp.usage.clone(),
+            t0.elapsed().as_millis(),
+            true,
+            "ok",
+        );
         Ok(resp)
     }
 }
@@ -283,6 +324,7 @@ mod tests {
             inner: Arc::new(SlowClient),
             calls: AtomicU32::new(0),
             max_calls: 5,
+            max_turns: 1,
             timeout_secs: 1,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("t".into()),
@@ -295,6 +337,8 @@ mod tests {
             "expected Timeout, got {result:?}"
         );
         assert_eq!(client.calls_used(), 1);
-        assert!(client.samples().is_empty(), "timeout must not record usage");
+        let samples = client.samples();
+        assert_eq!(samples.len(), 1, "timeout invocation must be recorded");
+        assert_eq!(samples[0].outcome, "timeout");
     }
 }
