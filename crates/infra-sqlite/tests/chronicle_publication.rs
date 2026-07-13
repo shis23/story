@@ -209,6 +209,8 @@ fn publish(
     parents: &[RoundSummary],
     child_covered_by: &[(Id, Id)],
 ) -> storyforge_infra_sqlite::Result<PublishOutcome> {
+    // job_id is optional and unique when present; default to publication_id for isolation.
+    let job = format!("job-{}", publication_id.as_str());
     SqliteChronicleRepository::publish_compress(
         db,
         PublishRequest {
@@ -216,7 +218,7 @@ fn publish(
             publication_id,
             parents,
             child_covered_by,
-            job_id: Some("job-a-to-b"),
+            job_id: Some(job.as_str()),
         },
     )
 }
@@ -577,5 +579,252 @@ fn existing_turn_accept_uow_still_green_after_publication_module() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn child_with_missing_lineage_is_rejected() {
+    let mut f = fixture_with_leaves(2);
+    f.db.connection()
+        .execute(
+            "UPDATE round_summaries
+             SET lineage_id = NULL,
+                 payload_json = json_remove(payload_json, '$.lineage_id')
+             WHERE summary_id = ?1",
+            [f.leaves[0].id.as_str()],
+        )
+        .unwrap();
+
+    let parents = vec![parent_b(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "parent-no-child-lineage",
+        vec![f.leaves[0].id.clone(), f.leaves[1].id.clone()],
+        1,
+        2,
+        "B0001",
+    )];
+    let covers = vec![
+        (f.leaves[0].id.clone(), parents[0].id.clone()),
+        (f.leaves[1].id.clone(), parents[0].id.clone()),
+    ];
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &Id::from_str("pub-no-child-lineage"),
+        &parents,
+        &covers,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("lineage"), "{err}");
+}
+
+#[test]
+fn child_with_wrong_conversation_is_rejected() {
+    let mut f = fixture_with_leaves(2);
+    // Insert a second conversation so the FK still holds while scope drifts.
+    f.db.connection()
+        .execute(
+            "INSERT INTO conversations (
+                conversation_id, campaign_id, character_id, archived_upto,
+                created_at, updated_at, payload_json
+             ) VALUES ('conv-other', ?1, NULL, 0, 't', 't', '{}')",
+            [f.campaign_id.as_str()],
+        )
+        .unwrap();
+    f.db.connection()
+        .execute(
+            "UPDATE round_summaries
+             SET conversation_id = 'conv-other',
+                 payload_json = json_set(payload_json, '$.conversation_id', 'conv-other')
+             WHERE summary_id = ?1",
+            [f.leaves[0].id.as_str()],
+        )
+        .unwrap();
+
+    let parents = vec![parent_b(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "parent-wrong-conv",
+        vec![f.leaves[0].id.clone(), f.leaves[1].id.clone()],
+        1,
+        2,
+        "B0001",
+    )];
+    let covers = vec![
+        (f.leaves[0].id.clone(), parents[0].id.clone()),
+        (f.leaves[1].id.clone(), parents[0].id.clone()),
+    ];
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &Id::from_str("pub-wrong-conv"),
+        &parents,
+        &covers,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("conversation") || err.to_string().contains("scope"),
+        "{err}"
+    );
+}
+
+#[test]
+fn completed_replay_rejects_when_db_state_drifted() {
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap();
+
+    // Drift: clear one child's covered_by after successful publication.
+    f.db.connection()
+        .execute(
+            "UPDATE round_summaries
+             SET covered_by = NULL,
+                 payload_json = json_remove(payload_json, '$.covered_by')
+             WHERE summary_id = ?1",
+            [f.leaves[0].id.as_str()],
+        )
+        .unwrap();
+
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("drift")
+            || err.to_string().contains("incomplete")
+            || err.to_string().contains("covered"),
+        "{err}"
+    );
+}
+
+#[test]
+fn duplicate_job_id_is_rejected() {
+    let mut f = fixture_with_leaves(4);
+    let (parents, child_covered_by, publication_id) = a_to_b_request(&f);
+    publish(
+        &mut f.db,
+        &f.campaign_id,
+        &publication_id,
+        &parents,
+        &child_covered_by,
+    )
+    .unwrap();
+
+    // Seed two fresh leaves and publish under same job id.
+    let leaf5 = leaf(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "leaf-5",
+        5,
+        "A0005",
+    );
+    let leaf6 = leaf(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "leaf-6",
+        6,
+        "A0006",
+    );
+    SqliteChronicleRepository::seed_summary(&mut f.db, &leaf5).unwrap();
+    SqliteChronicleRepository::seed_summary(&mut f.db, &leaf6).unwrap();
+    let parents2 = vec![parent_b(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "parent-job-dup",
+        vec![leaf5.id.clone(), leaf6.id.clone()],
+        5,
+        6,
+        "B0003",
+    )];
+    let covers2 = vec![
+        (leaf5.id.clone(), parents2[0].id.clone()),
+        (leaf6.id.clone(), parents2[0].id.clone()),
+    ];
+    let first_job = format!("job-{}", publication_id.as_str());
+    let err = SqliteChronicleRepository::publish_compress(
+        &mut f.db,
+        PublishRequest {
+            campaign_id: &f.campaign_id,
+            publication_id: &Id::from_str("pub-job-dup"),
+            parents: &parents2,
+            child_covered_by: &covers2,
+            job_id: Some(first_job.as_str()),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("job"), "{err}");
+}
+
+#[test]
+fn existing_pending_marker_is_not_silently_overwritten() {
+    let mut f = fixture_with_leaves(2);
+    let mut campaign = SqliteProductionRepository::get_campaign(&f.db, &f.campaign_id)
+        .unwrap()
+        .unwrap();
+    campaign.pending_compress_publication = Some(
+        storyforge_domain::chronicle::PendingCompressPublication::new(
+            campaign.chronicle_revision,
+            vec![Id::from_str("foreign-parent")],
+            vec![(
+                Id::from_str("foreign-child"),
+                Id::from_str("foreign-parent"),
+            )],
+        ),
+    );
+    // Write campaign pending marker outside publication path.
+    let uow = storyforge_infra_sqlite::UnitOfWork::begin(f.db.connection_mut()).unwrap();
+    let tx = uow.transaction().unwrap();
+    tx.execute(
+        "UPDATE campaigns SET payload_json = ?1 WHERE campaign_id = ?2",
+        rusqlite::params![
+            serde_json::to_string(&campaign).unwrap(),
+            f.campaign_id.as_str()
+        ],
+    )
+    .unwrap();
+    uow.commit().unwrap();
+
+    let parents = vec![parent_b(
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.lineage_id,
+        "parent-with-existing-marker",
+        vec![f.leaves[0].id.clone(), f.leaves[1].id.clone()],
+        1,
+        2,
+        "B0001",
+    )];
+    let covers = vec![
+        (f.leaves[0].id.clone(), parents[0].id.clone()),
+        (f.leaves[1].id.clone(), parents[0].id.clone()),
+    ];
+    let err = publish(
+        &mut f.db,
+        &f.campaign_id,
+        &Id::from_str("pub-existing-marker"),
+        &parents,
+        &covers,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("pending") || err.to_string().contains("marker"),
+        "{err}"
     );
 }

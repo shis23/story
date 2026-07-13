@@ -326,3 +326,143 @@ fn walkdir_files(root: &std::path::Path) -> Vec<PathBuf> {
     walk(root, &mut out);
     out
 }
+
+#[test]
+fn source_manifest_hash_matches_importer_hash() {
+    let dir = TempDir::new().unwrap();
+    sample_source(dir.path());
+    let report = validate_source_manifest(dir.path()).unwrap();
+
+    let mut db = Database::open_in_memory().unwrap();
+    let imported = storyforge_infra_sqlite::JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .unwrap();
+    assert_eq!(report.manifest_hash, imported.source_manifest_hash);
+}
+
+#[test]
+fn backup_uses_unique_paths_and_backup_db_schema_version() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+    let mut campaign = Campaign::new(Id::from_str("card"), "Live");
+    campaign.id = Id::from_str("camp-live");
+    let mut conversation = Conversation::new(None, Some(campaign.id.clone()));
+    conversation.id = Id::from_str("conv-live");
+    campaign.conversation_id = Some(conversation.id.clone());
+    SqliteProductionRepository::bootstrap_campaign(&mut db, &campaign, &conversation).unwrap();
+
+    let backup_dir = dir.path().join("backup");
+    let first = create_backup_checkpoint(&db, &backup_dir, "pre-cutover").unwrap();
+    let first_bytes = fs::read(&first.backup_db_path).unwrap();
+    let second = create_backup_checkpoint(&db, &backup_dir, "pre-cutover").unwrap();
+    assert_ne!(first.backup_db_path, second.backup_db_path);
+    assert!(first.backup_db_path.exists());
+    assert!(second.backup_db_path.exists());
+    // Existing backup file must remain untouched by a later checkpoint.
+    assert_eq!(fs::read(&first.backup_db_path).unwrap(), first_bytes);
+    // Refuse writing a backup into the live database path.
+    let err = create_backup_checkpoint(&db, &live_path, "bad-target").unwrap_err();
+    assert!(
+        err.to_string().contains("live")
+            || err.to_string().contains("exists")
+            || err.to_string().contains("backup")
+            || err.to_string().contains("directory"),
+        "{err}"
+    );
+
+    let backup_db = Database::open(&first.backup_db_path).unwrap();
+    assert_eq!(current_version(&backup_db).unwrap(), first.schema_version);
+    assert_eq!(first.schema_version, 3);
+}
+
+#[test]
+fn export_includes_jobs_ledger_and_redacts_extended_secrets() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+    let mut campaign = Campaign::new(Id::from_str("card"), "Export");
+    campaign.id = Id::from_str("camp-export");
+    let mut conversation = Conversation::new(None, Some(campaign.id.clone()));
+    conversation.id = Id::from_str("conv-export");
+    campaign.conversation_id = Some(conversation.id.clone());
+    SqliteProductionRepository::bootstrap_campaign(&mut db, &campaign, &conversation).unwrap();
+
+    db.connection()
+        .execute(
+            "UPDATE campaigns SET payload_json = json_set(
+                payload_json,
+                '$.apiKey', 'camel-secret',
+                '$.credential', 'cred-secret',
+                '$.bearer', 'bearer-secret',
+                '$.note', 'token=abc123'
+            )",
+            [],
+        )
+        .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO chronicle_publication_jobs (
+                publication_id, campaign_id, job_id, base_chronicle_revision,
+                target_chronicle_revision, parent_ids_json, child_covered_by_json,
+                payload_hash, status, created_at, completed_at
+            ) VALUES ('pub-x', 'camp-export', 'job-x', 0, 1, '[]', '[]', 'h', 'completed', 't', 't')",
+            [],
+        )
+        .unwrap();
+
+    let export_dir = dir.path().join("export");
+    let snapshot = export_readonly_snapshot(&db, &export_dir).unwrap();
+    assert!(export_dir.join("chronicle_publication_jobs.json").exists());
+    assert!(export_dir.join("mutation_commits.json").exists());
+    assert!(export_dir.join("import_runs.json").exists());
+    assert!(!snapshot.redacted_fields.is_empty());
+
+    let mut found_secret = false;
+    for entry in walkdir_files(&export_dir) {
+        let text = fs::read_to_string(&entry).unwrap_or_default();
+        for needle in [
+            "camel-secret",
+            "cred-secret",
+            "bearer-secret",
+            "token=abc123",
+            "apiKey",
+            "credential",
+            "bearer",
+        ] {
+            if text.contains(needle) {
+                found_secret = true;
+            }
+        }
+    }
+    assert!(!found_secret, "export leaked secret material");
+}
+
+#[test]
+fn export_rejects_corrupt_payload_json() {
+    let dir = TempDir::new().unwrap();
+    let live_path = dir.path().join("live.sqlite3");
+    let mut db = Database::open(&live_path).unwrap();
+    migrate(&mut db).unwrap();
+    let mut campaign = Campaign::new(Id::from_str("card"), "Export");
+    campaign.id = Id::from_str("camp-export");
+    let mut conversation = Conversation::new(None, Some(campaign.id.clone()));
+    conversation.id = Id::from_str("conv-export");
+    campaign.conversation_id = Some(conversation.id.clone());
+    SqliteProductionRepository::bootstrap_campaign(&mut db, &campaign, &conversation).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE campaigns SET payload_json = '{not-json' WHERE campaign_id = 'camp-export'",
+            [],
+        )
+        .unwrap();
+    let err = export_readonly_snapshot(&db, dir.path().join("export-bad")).unwrap_err();
+    assert!(
+        err.to_string().contains("payload")
+            || err.to_string().contains("json")
+            || err.to_string().contains("corrupt"),
+        "{err}"
+    );
+}

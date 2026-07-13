@@ -3,13 +3,13 @@
 //! These APIs never enable SQLite as the production backend and must not mutate
 //! the live database when exporting or validating source manifests.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
-use serde_json::{Map, Value};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::connection::Database;
@@ -26,6 +26,10 @@ const REDACTED_FIELD_NAMES: &[&str] = &[
     "refresh_token",
     "authorization",
     "private_key",
+    "credential",
+    "credentials",
+    "bearer",
+    "client_secret",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,13 +78,14 @@ pub fn validate_source_manifest(data_dir: impl AsRef<Path>) -> Result<SourceMani
     let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
 
+    // Keep labels/order identical to the importer so hashes are comparable.
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
     hash_named_array(&mut hasher, "campaigns", &campaigns);
     hash_named_array(&mut hasher, "instances", &instances);
     hash_named_array(&mut hasher, "knowledge", &knowledge);
     hash_named_array(&mut hasher, "tasks", &tasks);
-    hash_named_array(&mut hasher, "summaries", &summaries);
+    hash_named_array(&mut hasher, "round_summaries", &summaries);
     hash_named_array(&mut hasher, "turns", &turns);
     hash_named_array(&mut hasher, "conversations", &conversations);
     let manifest_hash = hex_encode(hasher.finalize());
@@ -110,7 +115,20 @@ pub fn create_backup_checkpoint(
     label: &str,
 ) -> Result<BackupCheckpoint> {
     let backup_dir = backup_dir.as_ref();
+    let live_path = canonicalize_existing(db.path()).unwrap_or_else(|| db.path().to_path_buf());
+    if paths_equal(&live_path, backup_dir) {
+        return Err(SqliteError::Other(
+            "refusing to write backup into the live database path".into(),
+        ));
+    }
+    if backup_dir.is_file() {
+        return Err(SqliteError::Other(format!(
+            "backup target is not a directory: {}",
+            backup_dir.display()
+        )));
+    }
     fs::create_dir_all(backup_dir)?;
+
     let safe_label = label
         .chars()
         .map(|c| {
@@ -121,9 +139,45 @@ pub fn create_backup_checkpoint(
             }
         })
         .collect::<String>();
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let backup_db_path = backup_dir.join(format!("storyforge-{safe_label}-{stamp}.sqlite3"));
-    let manifest_path = backup_dir.join(format!("storyforge-{safe_label}-{stamp}.manifest.json"));
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut backup_db_path =
+        backup_dir.join(format!("storyforge-{safe_label}-{stamp}-{nanos:x}.sqlite3"));
+    let mut manifest_path = backup_dir.join(format!(
+        "storyforge-{safe_label}-{stamp}-{nanos:x}.manifest.json"
+    ));
+
+    // Never overwrite an existing backup/manifest (including symlink targets).
+    let mut attempt = 0u32;
+    while backup_db_path.exists()
+        || manifest_path.exists()
+        || is_symlink(&backup_db_path)
+        || is_symlink(&manifest_path)
+    {
+        attempt = attempt.saturating_add(1);
+        if attempt > 32 {
+            return Err(SqliteError::Other(
+                "backup path collision: unable to allocate unique backup filename".into(),
+            ));
+        }
+        backup_db_path = backup_dir.join(format!(
+            "storyforge-{safe_label}-{stamp}-{nanos:x}-{attempt}.sqlite3"
+        ));
+        manifest_path = backup_dir.join(format!(
+            "storyforge-{safe_label}-{stamp}-{nanos:x}-{attempt}.manifest.json"
+        ));
+    }
+
+    if let Some(canon_backup) = canonicalize_existing(&backup_db_path)
+        && paths_equal(&live_path, &canon_backup)
+    {
+        return Err(SqliteError::Other(
+            "refusing to overwrite the live database via backup path".into(),
+        ));
+    }
 
     // Online backup copies pages; live DB contents remain unchanged.
     {
@@ -134,7 +188,9 @@ pub fn create_backup_checkpoint(
             .map_err(|e| SqliteError::Other(format!("sqlite backup failed: {e}")))?;
     }
 
-    let schema_version = migrations::current_version(db).unwrap_or(0);
+    // Schema version is read from the backup DB itself.
+    let backup_db = Database::open(&backup_db_path)?;
+    let schema_version = migrations::current_version(&backup_db).unwrap_or(0);
     let mut hasher = Sha256::new();
     hasher.update(fs::read(&backup_db_path)?);
     let manifest_hash = hex_encode(hasher.finalize());
@@ -147,6 +203,13 @@ pub fn create_backup_checkpoint(
         "backup_db": backup_db_path.file_name().and_then(|s| s.to_str()),
         "manifest_hash": manifest_hash,
     });
+    // Refuse racey overwrite if another process created the manifest meanwhile.
+    if manifest_path.exists() || is_symlink(&manifest_path) {
+        return Err(SqliteError::Other(format!(
+            "backup manifest already exists: {}",
+            manifest_path.display()
+        )));
+    }
     fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).map_err(SqliteError::from)?,
@@ -168,9 +231,14 @@ pub fn export_readonly_snapshot(
 ) -> Result<ExportSnapshot> {
     let export_dir = export_dir.as_ref();
     fs::create_dir_all(export_dir)?;
-    let mut redacted_fields = BTreeSet::new();
 
-    let tables = [
+    // Single-transaction consistent snapshot of live tables.
+    let mut conn = Connection::open(db.path())?;
+    conn.pragma_update(None, "query_only", true)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+
+    let mut redacted_fields = BTreeSet::new();
+    let payload_tables = [
         ("character_cards", "card_id"),
         ("campaigns", "campaign_id"),
         ("character_instances", "instance_id"),
@@ -181,22 +249,89 @@ pub fn export_readonly_snapshot(
         ("turn_attempts", "attempt_id"),
         ("round_summaries", "summary_id"),
     ];
-
-    for (table, id_column) in tables {
-        let path = export_dir.join(format!("{table}.json"));
-        let rows = export_table_payloads(db, table, id_column, &mut redacted_fields)?;
+    for (table, id_column) in payload_tables {
+        let rows = export_table_payloads_tx(&tx, table, id_column, &mut redacted_fields)?;
         fs::write(
-            path,
+            export_dir.join(format!("{table}.json")),
             serde_json::to_vec_pretty(&rows).map_err(SqliteError::from)?,
         )?;
     }
 
-    // Covers edge list (no payload secrets expected).
-    let covers = export_cover_edges(db)?;
+    let covers = export_cover_edges_tx(&tx)?;
     fs::write(
         export_dir.join("round_summary_covers.json"),
         serde_json::to_vec_pretty(&covers).map_err(SqliteError::from)?,
     )?;
+
+    // Operational / ledger tables needed for rollback inspection.
+    let jobs = export_named_rows_tx(
+        &tx,
+        "chronicle_publication_jobs",
+        &[
+            "publication_id",
+            "campaign_id",
+            "job_id",
+            "base_chronicle_revision",
+            "target_chronicle_revision",
+            "parent_ids_json",
+            "child_covered_by_json",
+            "payload_hash",
+            "status",
+            "created_at",
+            "completed_at",
+        ],
+    )?;
+    fs::write(
+        export_dir.join("chronicle_publication_jobs.json"),
+        serde_json::to_vec_pretty(&jobs).map_err(SqliteError::from)?,
+    )?;
+
+    let commits = export_named_rows_tx(
+        &tx,
+        "mutation_commits",
+        &[
+            "commit_id",
+            "campaign_id",
+            "turn_id",
+            "attempt_id",
+            "expected_revision",
+            "target_revision",
+            "terminal_status",
+            "payload_hash",
+            "committed_at",
+        ],
+    )?;
+    fs::write(
+        export_dir.join("mutation_commits.json"),
+        serde_json::to_vec_pretty(&commits).map_err(SqliteError::from)?,
+    )?;
+
+    let imports = export_named_rows_tx(
+        &tx,
+        "import_runs",
+        &[
+            "run_id",
+            "source_root",
+            "source_manifest_hash",
+            "status",
+            "started_at",
+            "finished_at",
+            "error",
+        ],
+    )?;
+    fs::write(
+        export_dir.join("import_runs.json"),
+        serde_json::to_vec_pretty(&imports).map_err(SqliteError::from)?,
+    )?;
+
+    let schema_version: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    tx.commit()?;
 
     let redacted_fields: Vec<String> = redacted_fields.into_iter().collect();
     let manifest_path = export_dir.join("export_manifest.json");
@@ -204,9 +339,24 @@ pub fn export_readonly_snapshot(
     let manifest = serde_json::json!({
         "created_at": chrono::Utc::now().to_rfc3339(),
         "source_path": db.path().display().to_string(),
-        "schema_version": migrations::current_version(db).unwrap_or(0),
+        "schema_version": schema_version,
         "redacted_field_count": redacted_fields.len(),
         "mode": "readonly-rollback-inspection",
+        "tables": [
+            "character_cards",
+            "campaigns",
+            "character_instances",
+            "character_knowledge",
+            "story_tasks",
+            "conversations",
+            "turns",
+            "turn_attempts",
+            "round_summaries",
+            "round_summary_covers",
+            "chronicle_publication_jobs",
+            "mutation_commits",
+            "import_runs"
+        ],
     });
     fs::write(
         &manifest_path,
@@ -220,15 +370,14 @@ pub fn export_readonly_snapshot(
     })
 }
 
-fn export_table_payloads(
-    db: &Database,
+fn export_table_payloads_tx(
+    tx: &rusqlite::Transaction<'_>,
     table: &str,
     id_column: &str,
     redacted_fields: &mut BTreeSet<String>,
 ) -> Result<Vec<Value>> {
-    // table/id_column are internal literals only.
     let sql = format!("SELECT {id_column}, payload_json FROM {table} ORDER BY {id_column}");
-    let mut stmt = db.connection().prepare(&sql)?;
+    let mut stmt = tx.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let payload: String = row.get(1)?;
@@ -237,7 +386,9 @@ fn export_table_payloads(
     let mut out = Vec::new();
     for row in rows {
         let (id, payload) = row?;
-        let mut value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        let mut value: Value = serde_json::from_str(&payload).map_err(|e| {
+            SqliteError::Other(format!("corrupt payload_json in {table} id={id}: {e}"))
+        })?;
         redact_value(&mut value, redacted_fields);
         out.push(serde_json::json!({
             "id": id,
@@ -247,8 +398,8 @@ fn export_table_payloads(
     Ok(out)
 }
 
-fn export_cover_edges(db: &Database) -> Result<Vec<Value>> {
-    let mut stmt = db.connection().prepare(
+fn export_cover_edges_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Value>> {
+    let mut stmt = tx.prepare(
         "SELECT parent_id, child_id FROM round_summary_covers ORDER BY parent_id, child_id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -256,6 +407,49 @@ fn export_cover_edges(db: &Database) -> Result<Vec<Value>> {
             "parent_id": row.get::<_, String>(0)?,
             "child_id": row.get::<_, String>(1)?,
         }))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn export_named_rows_tx(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    columns: &[&str],
+) -> Result<Vec<Value>> {
+    let exists: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(Vec::new());
+    }
+    let sql = format!("SELECT {} FROM {table} ORDER BY rowid", columns.join(", "));
+    let mut stmt = tx.prepare(&sql)?;
+    let col_count = columns.len();
+    let rows = stmt.query_map([], |row| {
+        let mut map = serde_json::Map::new();
+        for (idx, name) in columns.iter().enumerate() {
+            let value: Option<String> = match row.get_ref(idx)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Integer(v) => Some(v.to_string()),
+                rusqlite::types::ValueRef::Real(v) => Some(v.to_string()),
+                rusqlite::types::ValueRef::Text(v) => Some(String::from_utf8_lossy(v).into_owned()),
+                rusqlite::types::ValueRef::Blob(_) => Some("<blob>".into()),
+            };
+            map.insert(
+                (*name).to_string(),
+                value.map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+        let _ = col_count;
+        Ok(Value::Object(map))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -282,15 +476,34 @@ fn redact_value(value: &mut Value, redacted_fields: &mut BTreeSet<String>) {
                 redact_value(item, redacted_fields);
             }
         }
+        Value::String(text) if looks_like_secret_text(text) => {
+            *text = "[REDACTED]".into();
+            redacted_fields.insert("free_text_secret".into());
+        }
+        Value::String(_) => {}
         _ => {}
     }
 }
 
 fn is_secret_field(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    REDACTED_FIELD_NAMES
-        .iter()
-        .any(|name| lower == *name || lower.ends_with(&format!("_{name}")))
+    let lower = key.to_ascii_lowercase().replace('-', "_");
+    REDACTED_FIELD_NAMES.iter().any(|name| {
+        lower == *name
+            || lower.ends_with(&format!("_{name}"))
+            || lower.ends_with(name)
+            || lower.contains(name)
+    })
+}
+
+fn looks_like_secret_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("token=")
+        || lower.contains("bearer ")
+        || lower.contains("password=")
+        || lower.contains("secret=")
+        || lower.contains("credential=")
 }
 
 pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
@@ -306,21 +519,35 @@ pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
         }
     }
 
+    // Build reverse maps for bidirectional consistency.
+    let mut parent_to_children: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut child_to_parent: HashMap<String, String> = HashMap::new();
     for summary in summaries {
         let Some(id) = summary.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if let Some(covered_by) = summary.get("covered_by").and_then(|v| v.as_str())
-            && !by_id.contains_key(covered_by)
-        {
-            issues.push(format!(
-                "summary graph missing covered_by parent {covered_by} for {id}"
-            ));
+        if let Some(covered_by) = summary.get("covered_by").and_then(|v| v.as_str()) {
+            if !by_id.contains_key(covered_by) {
+                issues.push(format!(
+                    "summary graph missing covered_by parent {covered_by} for {id}"
+                ));
+            } else {
+                child_to_parent.insert(id.to_string(), covered_by.to_string());
+                parent_to_children
+                    .entry(covered_by.to_string())
+                    .or_default()
+                    .insert(id.to_string());
+            }
         }
         if let Some(Value::Array(covers)) = summary.get("covers") {
             for child in covers {
                 match child.as_str() {
-                    Some(child_id) if by_id.contains_key(child_id) => {}
+                    Some(child_id) if by_id.contains_key(child_id) => {
+                        parent_to_children
+                            .entry(id.to_string())
+                            .or_default()
+                            .insert(child_id.to_string());
+                    }
                     Some(child_id) => issues.push(format!(
                         "summary graph missing cover child {child_id} for parent {id}"
                     )),
@@ -329,6 +556,68 @@ pub(crate) fn validate_summary_graph(summaries: &[Value]) -> Vec<String> {
             }
         }
     }
+
+    // Bidirectional covers <-> covered_by consistency.
+    for summary in summaries {
+        let Some(id) = summary.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(Value::Array(covers)) = summary.get("covers") {
+            for child in covers {
+                let Some(child_id) = child.as_str() else {
+                    continue;
+                };
+                match child_to_parent.get(child_id) {
+                    Some(parent) if parent == id => {}
+                    Some(parent) => issues.push(format!(
+                        "summary graph covered_by mismatch: child {child_id} covered_by={parent}, parent {id} covers it"
+                    )),
+                    None => issues.push(format!(
+                        "summary graph covered_by missing for covered child {child_id} of parent {id}"
+                    )),
+                }
+            }
+        }
+        if let Some(covered_by) = summary.get("covered_by").and_then(|v| v.as_str()) {
+            let parent_covers = parent_to_children.get(covered_by);
+            let listed = parent_covers.is_some_and(|set| set.contains(id));
+            // Also require parent.covers array explicitly list the child when present.
+            if let Some(parent) = by_id.get(covered_by) {
+                let covers = parent
+                    .get("covers")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let in_covers = covers.iter().any(|c| c.as_str() == Some(id));
+                if !in_covers {
+                    issues.push(format!(
+                        "summary graph cover mismatch: child {id} covered_by={covered_by} but parent covers omit it"
+                    ));
+                }
+            } else if !listed {
+                issues.push(format!(
+                    "summary graph cover mismatch: child {id} covered_by={covered_by}"
+                ));
+            }
+        }
+
+        // Scope consistency against parent when covered.
+        if let Some(covered_by) = summary.get("covered_by").and_then(|v| v.as_str())
+            && let Some(parent) = by_id.get(covered_by)
+        {
+            for field in ["campaign_id", "conversation_id", "lineage_id"] {
+                let child_v = summary.get(field).and_then(|v| v.as_str());
+                let parent_v = parent.get(field).and_then(|v| v.as_str());
+                if child_v.is_some() && parent_v.is_some() && child_v != parent_v {
+                    issues.push(format!(
+                        "summary graph scope mismatch on {field}: child {id}={:?}, parent {covered_by}={:?}",
+                        child_v, parent_v
+                    ));
+                }
+            }
+        }
+    }
+
     issues
 }
 
@@ -366,7 +655,8 @@ fn read_json_array(path: PathBuf, optional: bool) -> Result<Vec<Value>> {
         return Err(SqliteError::ImportSourceMissing(path));
     }
     let raw = fs::read_to_string(&path)?;
-    let value: Value = serde_json::from_str(&raw)?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
     match value {
         Value::Array(items) => Ok(items),
         Value::Null if optional => Ok(Vec::new()),
@@ -382,47 +672,43 @@ fn read_conversation_dir(dir: PathBuf) -> Result<Vec<Value>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    // Match importer path-order sorting so hashes stay aligned.
+    paths.sort();
     let mut items: Vec<Value> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    for path in paths {
         let raw = fs::read_to_string(&path)?;
-        items.push(serde_json::from_str(&raw)?);
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|e| SqliteError::CorruptImportInput(format!("{}: {e}", path.display())))?;
+        if !value.is_object() {
+            return Err(SqliteError::CorruptImportInput(format!(
+                "{}: expected conversation object",
+                path.display()
+            )));
+        }
+        items.push(value);
     }
-    items.sort_by(|a, b| {
-        let left = a.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        let right = b.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        left.cmp(right)
-    });
     Ok(items)
 }
 
 fn hash_named_array(hasher: &mut Sha256, name: &str, items: &[Value]) {
     hasher.update(name.as_bytes());
     hasher.update(b"\0");
-    for item in items {
-        hasher.update(stable_json(item).as_bytes());
+    // Match importer: sort compact JSON of each item, then hash.
+    let mut encoded: Vec<String> = items.iter().map(stable_json).collect();
+    encoded.sort();
+    for item in encoded {
+        hasher.update(item.as_bytes());
         hasher.update(b"\n");
     }
 }
 
 fn stable_json(value: &Value) -> String {
-    // Keep dry-run hashing compatible with importer-style stable serialization.
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = Map::new();
-            for key in keys {
-                out.insert(key.clone(), map.get(key).cloned().unwrap_or(Value::Null));
-            }
-            Value::Object(out).to_string()
-        }
-        other => other.to_string(),
-    }
+    // serde_json Value serializes object keys in BTreeMap order.
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -434,4 +720,24 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
         out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }

@@ -841,7 +841,8 @@ mod tests {
                     "created_at": "2026-07-13T00:00:00Z",
                     "level": 0,
                     "lineage_id": "lin-1",
-                    "code": "A0001"
+                    "code": "A0001",
+                    "covered_by": "sum-b"
                 },
                 {
                     "id": "sum-b",
@@ -858,8 +859,7 @@ mod tests {
                 }
             ]),
         );
-        // covered_by 在第二遍可更新；这里写在 A 上模拟折叠
-        // 为简单起见 covers 关联已足够测 FK
+        // covers 与 covered_by 双向一致（importer 诊断要求）
 
         write_json(
             &root.join("conversations").join("conv-1.json"),

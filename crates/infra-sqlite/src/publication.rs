@@ -102,12 +102,22 @@ impl SqliteChronicleRepository {
                 )));
             }
             if job.status == "completed" {
+                // Replay is only a no-op when durable state still matches the job.
+                verify_completed_publication_state(tx, request.campaign_id, &request)?;
                 uow.commit()?;
                 return Ok(PublishOutcome::AlreadyPublished);
             }
             return Err(SqliteError::Conflict(format!(
                 "publication {} is in status {}",
                 request.publication_id, job.status
+            )));
+        }
+
+        if let Some(job_id) = request.job_id
+            && job_id_exists(tx, job_id)?
+        {
+            return Err(SqliteError::Conflict(format!(
+                "publication job_id {job_id} is already used"
             )));
         }
 
@@ -126,6 +136,15 @@ impl SqliteChronicleRepository {
             return Err(SqliteError::Conflict(format!(
                 "campaign {} payload chronicle_revision {} differs from indexed {}",
                 campaign.id, campaign.chronicle_revision, structured_chronicle_revision
+            )));
+        }
+
+        if let Some(existing_pending) = campaign.pending_compress_publication.as_ref()
+            && existing_pending.publication_id != *request.publication_id
+        {
+            return Err(SqliteError::Conflict(format!(
+                "campaign {} already has pending publication marker {}",
+                campaign.id, existing_pending.publication_id
             )));
         }
 
@@ -330,13 +349,21 @@ fn validate_publication_request(
                     "child {child_id} campaign mismatch"
                 )));
             }
-            if child
-                .lineage_id
-                .as_ref()
-                .is_some_and(|lineage| campaign.lineage_id.as_ref() != Some(lineage))
-            {
+            let child_lineage = child.lineage_id.as_ref().map(Id::as_str);
+            let campaign_lineage = campaign.lineage_id.as_ref().map(Id::as_str);
+            if child_lineage.is_none() || child_lineage != campaign_lineage {
                 return Err(SqliteError::Conflict(format!(
-                    "child {child_id} lineage does not match campaign"
+                    "child {child_id} lineage does not match campaign lineage"
+                )));
+            }
+            let expected_conversation = campaign
+                .conversation_id
+                .as_ref()
+                .map(Id::as_str)
+                .unwrap_or_default();
+            if child.conversation_id.as_str() != expected_conversation {
+                return Err(SqliteError::Conflict(format!(
+                    "child {child_id} conversation scope does not match campaign"
                 )));
             }
             if child.covered_by.is_some() && child.covered_by.as_ref() != Some(&parent.id) {
@@ -449,6 +476,73 @@ fn rewrite_parent_covers(tx: &Transaction<'_>, parent: &RoundSummary) -> Result<
         )?;
     }
     Ok(())
+}
+
+fn verify_completed_publication_state(
+    tx: &Transaction<'_>,
+    campaign_id: &Id,
+    request: &PublishRequest<'_>,
+) -> Result<()> {
+    for parent in request.parents {
+        let existing = load_summary(tx, &parent.id)?.ok_or_else(|| {
+            SqliteError::Conflict(format!(
+                "completed publication drift: missing parent {}",
+                parent.id
+            ))
+        })?;
+        if !json_payloads_equal(&json(&existing)?, &json(parent)?)? {
+            // Compare semantic identity for replay: covers/level/content must match request.
+            if existing.level != parent.level
+                || existing.covers.iter().collect::<HashSet<_>>()
+                    != parent.covers.iter().collect::<HashSet<_>>()
+                || existing.content != parent.content
+                || existing.campaign_id != parent.campaign_id
+            {
+                return Err(SqliteError::Conflict(format!(
+                    "completed publication drift: parent {} payload mismatch",
+                    parent.id
+                )));
+            }
+        }
+        let cover_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM round_summary_covers WHERE parent_id = ?1",
+            [parent.id.as_str()],
+            |row| row.get(0),
+        )?;
+        if cover_count as usize != parent.covers.len() {
+            return Err(SqliteError::Conflict(format!(
+                "completed publication drift: parent {} cover edges incomplete",
+                parent.id
+            )));
+        }
+    }
+    for (child_id, parent_id) in request.child_covered_by {
+        let covered_by: Option<String> = tx
+            .query_row(
+                "SELECT covered_by FROM round_summaries WHERE summary_id = ?1 AND campaign_id = ?2",
+                rusqlite::params![child_id.as_str(), campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if covered_by.as_deref() != Some(parent_id.as_str()) {
+            return Err(SqliteError::Conflict(format!(
+                "completed publication drift: child {child_id} covered_by incomplete"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn job_id_exists(tx: &Transaction<'_>, job_id: &str) -> Result<bool> {
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM chronicle_publication_jobs WHERE job_id = ?1 LIMIT 1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn verify_pending_publication(

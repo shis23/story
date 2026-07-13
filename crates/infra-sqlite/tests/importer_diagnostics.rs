@@ -217,3 +217,74 @@ fn importer_still_accepts_valid_source_all_or_nothing() {
     assert_eq!(report.status, ImportStatus::Completed);
     assert_eq!(report.summaries, 2);
 }
+
+#[test]
+fn importer_rejects_covers_covered_by_mismatch_and_scope_drift() {
+    let dir = TempDir::new().unwrap();
+    base_source(dir.path());
+    write_json(&dir.path().join("turns.json"), &json!([]));
+    write_json(
+        &dir.path().join("round_summaries.json"),
+        &json!([
+            {
+                "id": "sum-a1",
+                "campaign_id": "camp-1",
+                "conversation_id": "conv-1",
+                "turn": 1,
+                "content": "leaf",
+                "created_at": "t",
+                "level": 0,
+                "lineage_id": "lin-1",
+                "code": "A0001",
+                "covered_by": "sum-b1"
+            },
+            {
+                "id": "sum-b1",
+                "campaign_id": "camp-1",
+                "conversation_id": "conv-other",
+                "turn": 1,
+                "turn_end": 1,
+                "content": "stage",
+                "created_at": "t",
+                "level": 1,
+                "lineage_id": "lin-other",
+                "code": "B0001",
+                "covers": ["sum-a1", "sum-a2"]
+            },
+            {
+                "id": "sum-a2",
+                "campaign_id": "camp-1",
+                "conversation_id": "conv-1",
+                "turn": 2,
+                "content": "leaf2",
+                "created_at": "t",
+                "level": 0,
+                "lineage_id": "lin-1",
+                "code": "A0002"
+            }
+        ]),
+    );
+
+    let mut db = Database::open_in_memory().unwrap();
+    let err = JsonImporter::new(&mut db)
+        .import_data_dir(dir.path())
+        .unwrap_err();
+    match err {
+        SqliteError::CorruptImportInput(msg) => {
+            assert!(
+                msg.contains("cover")
+                    || msg.contains("covered_by")
+                    || msg.contains("scope")
+                    || msg.contains("conversation")
+                    || msg.contains("lineage"),
+                "{msg}"
+            );
+        }
+        other => panic!("expected CorruptImportInput, got {other}"),
+    }
+    let summaries: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM round_summaries", [], |r| r.get(0))
+        .unwrap_or(0);
+    assert_eq!(summaries, 0);
+}
