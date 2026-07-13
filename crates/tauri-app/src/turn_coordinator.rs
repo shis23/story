@@ -76,6 +76,201 @@ pub fn with_campaign_lock<R>(f: impl FnOnce() -> Result<R, CommitError>) -> Resu
 pub struct CampaignMutationCoordinator;
 
 impl CampaignMutationCoordinator {
+    fn payloads_match<T: serde::Serialize>(a: &T, b: &T) -> bool {
+        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    }
+
+    fn instance_payloads_match(
+        a: &storyforge_domain::campaign::CharacterInstance,
+        b: &storyforge_domain::campaign::CharacterInstance,
+    ) -> bool {
+        a.name == b.name
+            && a.definition_id == b.definition_id
+            && a.is_temporary == b.is_temporary
+            && a.persona_override == b.persona_override
+            && a.behavior_override == b.behavior_override
+            && a.variables == b.variables
+            && a.campaign_id == b.campaign_id
+    }
+
+    /// Validate every permanent batch precondition without writing.
+    ///
+    /// The caller must keep the campaign commit lock held from this preflight through
+    /// apply/finalize. Storage failures may still happen later, but missing entities,
+    /// scope drift, revision conflicts and id/payload conflicts are rejected here.
+    pub fn preflight_mutation_batch(
+        store: &CampaignStore,
+        campaign_id: &Id,
+        batch: &MutationBatch,
+    ) -> Result<(), CommitError> {
+        let campaign = store
+            .get_campaign(campaign_id)
+            .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
+        let is_replay = campaign.revision == batch.target_revision;
+        let is_first_apply = campaign.revision == batch.expected_revision;
+        if !is_replay && !is_first_apply {
+            return Err(CommitError::RevisionConflict {
+                expected: batch.expected_revision,
+                actual: campaign.revision,
+            });
+        }
+
+        // Simulate ordered mutations in memory so a later conflict cannot leave an
+        // earlier JSON collection partially written.
+        let mut instances = store.list_instances(campaign_id);
+        let mut knowledge = store.list_all_knowledge();
+        let mut tasks = store.list_all_tasks();
+        let mut summaries = store.list_all_summaries();
+
+        for mutation in &batch.mutations {
+            match mutation {
+                Mutation::SetVariable {
+                    instance_id: Some(instance_id),
+                    ..
+                } => {
+                    if !instances.iter().any(|instance| instance.id == *instance_id) {
+                        return Err(CommitError::MutationConflict(format!(
+                            "instance {instance_id} 不存在于 campaign {campaign_id}"
+                        )));
+                    }
+                }
+                Mutation::SetVariable {
+                    instance_id: None, ..
+                }
+                | Mutation::FinalizeVariant { .. } => {}
+                Mutation::UpsertKnowledge(km) => {
+                    let entry = km.to_entry();
+                    if entry.campaign_id != *campaign_id {
+                        return Err(CommitError::MutationConflict(format!(
+                            "knowledge {} campaign 不匹配: {}, expected={campaign_id}",
+                            entry.id, entry.campaign_id
+                        )));
+                    }
+                    if !instances
+                        .iter()
+                        .any(|instance| instance.id == entry.character_id)
+                    {
+                        return Err(CommitError::MutationConflict(format!(
+                            "knowledge {} character {} 不存在于 campaign {campaign_id}",
+                            entry.id, entry.character_id
+                        )));
+                    }
+                    if let Some(source_id) = &entry.source_character_id
+                        && !instances.iter().any(|instance| instance.id == *source_id)
+                    {
+                        return Err(CommitError::MutationConflict(format!(
+                            "knowledge {} source character {} 不存在于 campaign {campaign_id}",
+                            entry.id, source_id
+                        )));
+                    }
+                    if let Some(existing) = knowledge.iter().find(|item| item.id == entry.id) {
+                        if !Self::payloads_match(existing, &entry) {
+                            return Err(CommitError::MutationConflict(format!(
+                                "knowledge entry id={} 已存在但 payload 不一致",
+                                entry.id
+                            )));
+                        }
+                    } else {
+                        knowledge.push(entry);
+                    }
+                }
+                Mutation::SetTaskStatus { task_id, .. } => {
+                    let Some(task) = tasks.iter().find(|task| task.id == *task_id) else {
+                        return Err(CommitError::MutationConflict(format!(
+                            "task {task_id} 不存在"
+                        )));
+                    };
+                    if task.campaign_id != *campaign_id {
+                        return Err(CommitError::MutationConflict(format!(
+                            "task {task_id} 不属于 campaign {campaign_id}"
+                        )));
+                    }
+                }
+                Mutation::UpsertNewTask(task) => {
+                    if task.campaign_id != *campaign_id {
+                        return Err(CommitError::MutationConflict(format!(
+                            "task {} campaign 不匹配: {}, expected={campaign_id}",
+                            task.id, task.campaign_id
+                        )));
+                    }
+                    if let Some(missing) = task.related_characters.iter().find(|character_id| {
+                        !instances
+                            .iter()
+                            .any(|instance| instance.id == **character_id)
+                    }) {
+                        return Err(CommitError::MutationConflict(format!(
+                            "task {} related character {} 不存在于 campaign {campaign_id}",
+                            task.id, missing
+                        )));
+                    }
+                    if let Some(existing) = tasks.iter().find(|item| item.id == task.id) {
+                        if !Self::payloads_match(existing, task.as_ref()) {
+                            return Err(CommitError::MutationConflict(format!(
+                                "task id={} 已存在但 payload 不一致",
+                                task.id
+                            )));
+                        }
+                    } else {
+                        tasks.push((**task).clone());
+                    }
+                }
+                Mutation::UpsertSummary(summary) => {
+                    if summary.campaign_id != *campaign_id {
+                        return Err(CommitError::MutationConflict(format!(
+                            "summary {} campaign 不匹配: {}, expected={campaign_id}",
+                            summary.id, summary.campaign_id
+                        )));
+                    }
+                    if let Some(conversation_id) = &campaign.conversation_id
+                        && summary.conversation_id != *conversation_id
+                    {
+                        return Err(CommitError::MutationConflict(format!(
+                            "summary {} conversation 不匹配: {}, expected={conversation_id}",
+                            summary.id, summary.conversation_id
+                        )));
+                    }
+                    if let Some(existing) = summaries.iter().find(|item| {
+                        item.campaign_id == summary.campaign_id && item.turn == summary.turn
+                    }) {
+                        if !Self::payloads_match(existing, summary.as_ref()) {
+                            return Err(CommitError::MutationConflict(format!(
+                                "summary campaign={} turn={} 已存在但 payload 不一致",
+                                summary.campaign_id, summary.turn
+                            )));
+                        }
+                    } else {
+                        summaries.push((**summary).clone());
+                    }
+                }
+                Mutation::UpsertInstance(instance) => {
+                    if instance.campaign_id != *campaign_id {
+                        return Err(CommitError::MutationConflict(format!(
+                            "UpsertInstance campaign 不匹配: instance={}, expected={campaign_id}",
+                            instance.campaign_id
+                        )));
+                    }
+                    if let Some(existing) = instances.iter().find(|item| item.id == instance.id) {
+                        if !Self::instance_payloads_match(existing, instance.as_ref()) {
+                            return Err(CommitError::MutationConflict(format!(
+                                "UpsertInstance id={} payload 与已有实例冲突",
+                                instance.id
+                            )));
+                        }
+                    } else {
+                        if instances.iter().any(|item| item.name == instance.name) {
+                            return Err(CommitError::MutationConflict(format!(
+                                "临时 instance '{}' 与已有同名角色冲突",
+                                instance.name
+                            )));
+                        }
+                        instances.push((**instance).clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 应用一个 MutationBatch 到 CampaignStore（TurnCommit / MetaCommit 共用入口）。
     ///
     /// 流程：
@@ -91,6 +286,7 @@ impl CampaignMutationCoordinator {
         campaign_id: &Id,
         batch: &MutationBatch,
     ) -> Result<Id, CommitError> {
+        Self::preflight_mutation_batch(store, campaign_id, batch)?;
         let campaign = store
             .get_campaign(campaign_id)
             .ok_or_else(|| CommitError::CampaignNotFound(campaign_id.clone()))?;
@@ -197,7 +393,7 @@ impl CampaignMutationCoordinator {
                         // 记忆规格：Accept 新 Chronicle A → chronicle_revision++
                         if let Some(mut camp) = store.get_campaign(campaign_id) {
                             camp.bump_chronicle_revision();
-                            let _ = store.update_campaign(camp);
+                            store.update_campaign(camp).map_err(CommitError::Storage)?;
                         }
                         // M4：达阈值则标记需后台压缩（实际 spawn 在 commit 成功后）
                         let all = store.list_summaries(campaign_id);
@@ -428,13 +624,21 @@ mod tests {
             pinned: false,
             propagation: storyforge_domain::character_knowledge::PropagationPolicy::Open,
         };
+        let mut owner = storyforge_domain::campaign::CharacterInstance::temporary(
+            campaign_id.clone(),
+            "KnowledgeOwner",
+        );
+        owner.id = Id::from_str("char-1");
 
         let batch = MutationBatch {
             commit_id: Id::from_str("commit-1"),
             expected_revision: 0,
             target_revision: 1,
             status: MutationBatchStatus::Prepared,
-            mutations: vec![Mutation::UpsertKnowledge(Box::new(km.clone()))],
+            mutations: vec![
+                Mutation::UpsertInstance(Box::new(owner)),
+                Mutation::UpsertKnowledge(Box::new(km.clone())),
+            ],
         };
 
         // 第一次

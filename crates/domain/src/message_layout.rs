@@ -12,7 +12,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::llm::{ChatMessage, ChatRole};
+use crate::llm::{ChatMessage, ChatRequest, ChatRole, ToolCall};
 
 /// MessageLayout / 请求指纹算法版本（日志与 CI 对齐；改算法时 bump）。
 pub const PROMPT_LAYOUT_VERSION: &str = "layout-a2-sha256-v1";
@@ -117,10 +117,7 @@ impl MessageLayout {
         hasher.update(self.stable_system.as_bytes());
         hasher.update(b"\n");
         for msg in &self.stable_history {
-            hasher.update(role_label(&msg.role).as_bytes());
-            hasher.update(b"\0");
-            hasher.update(msg.content.as_bytes());
-            hasher.update(b"\n");
+            hash_message_into(&mut hasher, msg);
         }
         hasher.update(b"tail\0");
         for part in &self.volatile_tail.parts {
@@ -134,10 +131,7 @@ impl MessageLayout {
     pub fn segment_fingerprint(&self) -> SegmentFingerprint {
         let mut history_hasher = Sha256::new();
         for msg in &self.stable_history {
-            history_hasher.update(role_label(&msg.role).as_bytes());
-            history_hasher.update(b"\0");
-            history_hasher.update(msg.content.as_bytes());
-            history_hasher.update(b"\n");
+            hash_message_into(&mut history_hasher, msg);
         }
         let mut tail_hasher = Sha256::new();
         for part in &self.volatile_tail.parts {
@@ -190,15 +184,140 @@ impl SegmentFingerprint {
 }
 
 /// 对 hook 后最终 messages 计算请求指纹（不落全文，只记 hash）。
+///
+/// 包含 role / content / tool_call_id / tool_calls（id+name+arguments），
+/// 避免工具调用差异被静默忽略。
 pub fn fingerprint_messages(messages: &[ChatMessage]) -> String {
     let mut hasher = Sha256::new();
     for msg in messages {
-        hasher.update(role_label(&msg.role).as_bytes());
-        hasher.update(b"\0");
-        hasher.update(msg.content.as_bytes());
-        hasher.update(b"\n");
+        hash_message_into(&mut hasher, msg);
     }
     hex_encode(&hasher.finalize())
+}
+
+/// 完整 ChatRequest 指纹：messages + model + tools + sampling params。
+///
+/// 可观测性用；不落明文，只记 hash。
+pub fn fingerprint_chat_request(req: &ChatRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"messages\0");
+    for msg in &req.messages {
+        hash_message_into(&mut hasher, msg);
+    }
+    hasher.update(b"model\0");
+    hasher.update(req.model.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(b"tools\0");
+    match &req.tools {
+        None => hasher.update(b"none\n"),
+        Some(tools) => {
+            for t in tools {
+                hasher.update(t.tool_type.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(t.function.name.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(t.function.description.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(t.function.parameters.to_string().as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+    }
+    hasher.update(b"params\0");
+    // 采样参数：用 Debug 稳定字段拼接，避免依赖 serde 私有布局
+    hasher.update(
+        format!(
+            "temp={:?};top_p={:?};max={:?};reasoning={:?};extra={:?}",
+            req.params.temperature,
+            req.params.top_p,
+            req.params.max_tokens,
+            req.params.reasoning,
+            req.params.extra
+        )
+        .as_bytes(),
+    );
+    hasher.update(b"\n");
+    hex_encode(&hasher.finalize())
+}
+
+fn hash_message_into(hasher: &mut Sha256, msg: &ChatMessage) {
+    hasher.update(role_label(&msg.role).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(msg.content.as_bytes());
+    hasher.update(b"\0");
+    if let Some(id) = &msg.tool_call_id {
+        hasher.update(b"tool_call_id\0");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\0");
+    }
+    if let Some(calls) = &msg.tool_calls {
+        hasher.update(b"tool_calls\0");
+        for c in calls {
+            hash_tool_call_into(hasher, c);
+        }
+    }
+    hasher.update(b"\n");
+}
+
+fn hash_tool_call_into(hasher: &mut Sha256, call: &ToolCall) {
+    hasher.update(call.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(call.call_type.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(call.function.name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(call.function.arguments.as_bytes());
+    hasher.update(b"\0");
+}
+
+fn messages_equal_for_prefix(a: &ChatMessage, b: &ChatMessage) -> bool {
+    if a.role != b.role || a.content != b.content || a.tool_call_id != b.tool_call_id {
+        return false;
+    }
+    match (&a.tool_calls, &b.tool_calls) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|(l, r)| {
+                    l.id == r.id
+                        && l.call_type == r.call_type
+                        && l.function.name == r.function.name
+                        && l.function.arguments == r.function.arguments
+                })
+        }
+        _ => false,
+    }
+}
+
+/// 粗粒度 token 估计：按 UTF-8 字节 / 4 上取整（不依赖真实 tokenizer）。
+///
+/// 仅用于前缀可复用估计与预算斜率，**不得**当作供应商 billed token。
+pub fn estimate_tokens_approx(text: &str) -> u32 {
+    let bytes = text.len() as u32;
+    bytes.saturating_add(3) / 4
+}
+
+/// 两条消息列表的最长公共消息前缀长度（按 role+content 精确相等计数）。
+///
+/// 不落全文；用于跨轮 cache-prefix 稳定性与可复用 token 估计。
+pub fn longest_common_message_prefix_len(a: &[ChatMessage], b: &[ChatMessage]) -> usize {
+    let mut n = 0usize;
+    for (left, right) in a.iter().zip(b.iter()) {
+        if !messages_equal_for_prefix(left, right) {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// 公共前缀消息的可复用 token 估计（不含未共享后缀）。
+pub fn estimate_reusable_prefix_tokens(a: &[ChatMessage], b: &[ChatMessage]) -> u32 {
+    let n = longest_common_message_prefix_len(a, b);
+    a.iter()
+        .take(n)
+        .map(|m| estimate_tokens_approx(&m.content))
+        .sum()
 }
 
 /// hook 后 messages 的粗粒度 segment 摘要（首条 system / 中间 history / 末条 user 启发式）。
@@ -231,10 +350,7 @@ pub fn messages_segment_summary(messages: &[ChatMessage]) -> SegmentFingerprint 
     };
     let mut history_hasher = Sha256::new();
     for msg in hist_slice {
-        history_hasher.update(role_label(&msg.role).as_bytes());
-        history_hasher.update(b"\0");
-        history_hasher.update(msg.content.as_bytes());
-        history_hasher.update(b"\n");
+        hash_message_into(&mut history_hasher, msg);
     }
     SegmentFingerprint {
         prompt_version: PROMPT_LAYOUT_VERSION.to_string(),
@@ -494,5 +610,115 @@ mod tests {
             messages_segment_summary(&a).tail_hash,
             messages_segment_summary(&b).tail_hash
         );
+    }
+
+    #[test]
+    fn longest_common_message_prefix_counts_exact_role_content() {
+        let a = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("h1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("tail-a"),
+        ];
+        let b = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("h1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("tail-b"),
+        ];
+        assert_eq!(longest_common_message_prefix_len(&a, &b), 3);
+        let reusable = estimate_reusable_prefix_tokens(&a, &b);
+        let expected = estimate_tokens_approx("sys")
+            + estimate_tokens_approx("h1")
+            + estimate_tokens_approx("a1");
+        assert_eq!(reusable, expected);
+        assert!(reusable > 0);
+    }
+
+    #[test]
+    fn longest_common_prefix_breaks_on_role_or_content_mismatch() {
+        let a = vec![ChatMessage::system("sys"), ChatMessage::user("same")];
+        let b = vec![ChatMessage::system("sys"), ChatMessage::assistant("same")];
+        assert_eq!(longest_common_message_prefix_len(&a, &b), 1);
+
+        let c = vec![ChatMessage::system("sys"), ChatMessage::user("x")];
+        let d = vec![ChatMessage::system("sys"), ChatMessage::user("y")];
+        assert_eq!(longest_common_message_prefix_len(&c, &d), 1);
+        assert_eq!(
+            estimate_reusable_prefix_tokens(&c, &d),
+            estimate_tokens_approx("sys")
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_approx_is_deterministic_and_non_zero_for_text() {
+        assert_eq!(estimate_tokens_approx(""), 0);
+        assert_eq!(estimate_tokens_approx("abcd"), 1);
+        assert_eq!(estimate_tokens_approx("abcdefgh"), 2);
+        assert_eq!(
+            estimate_tokens_approx("hello world"),
+            estimate_tokens_approx("hello world")
+        );
+    }
+
+    #[test]
+    fn fingerprint_and_lcp_include_tool_calls() {
+        use crate::llm::{FunctionCall, ToolCall};
+        let base = ChatMessage::assistant("call");
+        let with_tool = ChatMessage {
+            role: ChatRole::Assistant,
+            content: "call".into(),
+            tool_calls: Some(vec![ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "search".into(),
+                    arguments: "{\"q\":1}".into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+        assert_ne!(
+            fingerprint_messages(std::slice::from_ref(&base)),
+            fingerprint_messages(std::slice::from_ref(&with_tool))
+        );
+        assert_eq!(
+            longest_common_message_prefix_len(
+                std::slice::from_ref(&base),
+                std::slice::from_ref(&with_tool)
+            ),
+            0
+        );
+        let a = vec![ChatMessage::system("s"), with_tool.clone()];
+        let b = vec![ChatMessage::system("s"), with_tool];
+        assert_eq!(longest_common_message_prefix_len(&a, &b), 2);
+    }
+
+    #[test]
+    fn fingerprint_chat_request_includes_model_tools_and_params() {
+        use crate::llm::{SamplingParams, ToolSpec};
+        let msgs = vec![ChatMessage::user("hi")];
+        let a = ChatRequest {
+            messages: msgs.clone(),
+            tools: None,
+            params: SamplingParams::default(),
+            model: "m1".into(),
+        };
+        let mut b = a.clone();
+        b.model = "m2".into();
+        assert_ne!(fingerprint_chat_request(&a), fingerprint_chat_request(&b));
+
+        b = a.clone();
+        b.tools = Some(vec![ToolSpec::function(
+            "t",
+            "d",
+            serde_json::json!({"type": "object"}),
+        )]);
+        assert_ne!(fingerprint_chat_request(&a), fingerprint_chat_request(&b));
+
+        b = a.clone();
+        b.params.temperature = Some(0.2);
+        assert_ne!(fingerprint_chat_request(&a), fingerprint_chat_request(&b));
+        assert_eq!(fingerprint_chat_request(&a), fingerprint_chat_request(&a));
     }
 }

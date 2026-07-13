@@ -1,0 +1,10 @@
+﻿{
+  "spec": "chara_card_v2",
+  "spec_version": "3.0",
+  "data": {
+    "name": "BOM Fixture",
+    "description": "UTF-8 BOM prefixed",
+    "group_only": false,
+    "extensions": {}
+  }
+}

@@ -429,6 +429,7 @@ mod tests {
                 make_entry(3, vec!["城市"], false),
             ],
             source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
         };
 
         let report = inspect_world_info(&book);
@@ -444,6 +445,7 @@ mod tests {
                 make_entry(2, vec!["城市"], true),
             ],
             source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
         };
 
         let report = inspect_world_info(&book);

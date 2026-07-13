@@ -13,8 +13,10 @@ import { usePluginBridge } from './usePluginBridge.js'
 export function usePipeline(handlers = {}) {
   const writing = useWritingStore()
   const campaign = useCampaignStore()
-  // 广播(pipeline 事件喂给插件事件 feed)与 prompt hook 编排来自 usePluginBridge。
-  const { broadcastPluginPipelineEvent, handlePromptHookRequest } = usePluginBridge()
+  // Production injects App's bridge so prompt-hook generation/cancel state is
+  // shared with useWriting. Tests and isolated callers retain a safe fallback.
+  const pluginBridge = handlers.pluginBridge || usePluginBridge()
+  const { broadcastPluginPipelineEvent, handlePromptHookRequest } = pluginBridge
 
   // 范围外依赖(由调用方注入):App.vue 里 scrollToBottom 是 DOM 自动滚动逻辑
   // (读 messagesContainer ref),不属于本 composable 迁移范围。

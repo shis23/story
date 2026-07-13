@@ -106,8 +106,14 @@ pub struct StWorldInfoEntry {
     pub id: Option<i32>,
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Older ST exports use singular `key` instead of `keys`.
+    #[serde(default, rename = "key", skip_serializing)]
+    pub key_alias: Option<serde_json::Value>,
     #[serde(default)]
     pub secondary_keys: Option<Vec<String>>,
+    /// Older ST exports use `keysecondary` (string or array) instead of `secondary_keys`.
+    #[serde(default, rename = "keysecondary", skip_serializing)]
+    pub keysecondary_alias: Option<serde_json::Value>,
     pub content: Option<String>,
     #[serde(default)]
     pub constant: bool,
@@ -126,6 +132,9 @@ pub struct StWorldInfoEntry {
     pub depth: Option<i32>,
     #[serde(default)]
     pub extensions: serde_json::Value,
+    /// Unknown entry-level ST fields (for example probability/automation metadata).
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl StWorldInfoEntry {
@@ -143,6 +152,40 @@ impl StWorldInfoEntry {
             },
             _ => 0,
         }
+    }
+
+    /// Resolve primary keys, accepting both `keys` and legacy `key`.
+    pub fn resolved_keys(&self) -> Vec<String> {
+        if !self.keys.is_empty() {
+            return self.keys.clone();
+        }
+        parse_string_list_value(self.key_alias.as_ref())
+    }
+
+    /// Resolve secondary keys, accepting both `secondary_keys` and legacy `keysecondary`.
+    pub fn resolved_secondary_keys(&self) -> Vec<String> {
+        if let Some(keys) = &self.secondary_keys
+            && !keys.is_empty()
+        {
+            return keys.clone();
+        }
+        parse_string_list_value(self.keysecondary_alias.as_ref())
+    }
+}
+
+fn parse_string_list_value(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -189,7 +232,24 @@ impl Character {
     }
 
     /// 从 ST 卡 JSON 解析为领域模型
-    pub fn from_st_card(card: StCharacterCard) -> Self {
+    pub fn from_st_card(mut card: StCharacterCard) -> Self {
+        // Normalize alias fields before serializing raw_card_json so the first
+        // import already materializes legacy ST key shapes into canonical fields.
+        if let Some(book) = card.data.character_book.as_mut() {
+            for entry in &mut book.entries {
+                entry.keys = entry.resolved_keys();
+                let secondary = entry.resolved_secondary_keys();
+                entry.secondary_keys = if secondary.is_empty() {
+                    None
+                } else {
+                    Some(secondary)
+                };
+                // Drop import-only alias payloads from the preserved raw JSON.
+                entry.key_alias = None;
+                entry.keysecondary_alias = None;
+            }
+        }
+
         let raw_json =
             serde_json::to_value(&card.data).expect("ST character data should serialize to JSON");
         let spec_version = card.spec_version.unwrap_or_else(|| "2.0".into());
@@ -971,7 +1031,9 @@ mod multi_character_tests {
             entries: vec![StWorldInfoEntry {
                 id: Some(1),
                 keys: vec!["测试".into()],
+                key_alias: None,
                 secondary_keys: None,
+                keysecondary_alias: None,
                 content: Some("测试知识".into()),
                 constant: true,
                 selective: false,
@@ -981,6 +1043,7 @@ mod multi_character_tests {
                 order: None,
                 depth: None,
                 extensions: serde_json::json!({}),
+                extra: Default::default(),
             }],
             extra: Default::default(),
         };
@@ -989,5 +1052,47 @@ mod multi_character_tests {
         let cb = exported.character_book.unwrap();
         assert_eq!(cb.entries.len(), 1);
         assert_eq!(cb.entries[0].keys, vec!["测试"]);
+    }
+
+    #[test]
+    fn test_world_info_entry_unknown_fields_survive_first_import_and_export() {
+        let card: StCharacterCard = serde_json::from_value(serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "Entry Extras",
+                "character_book": {
+                    "entries": [{
+                        "id": 7,
+                        "keys": ["harbor"],
+                        "content": "The harbor closes at dusk.",
+                        "constant": true,
+                        "probability": 73,
+                        "automation_id": "entry-hook-7"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let character = Character::from_st_card(card);
+        let book = character
+            .embedded_world_info
+            .as_ref()
+            .expect("embedded book should import");
+        assert_eq!(
+            book.entries[0].extra.get("probability"),
+            Some(&serde_json::json!(73))
+        );
+        assert_eq!(
+            book.entries[0].extra.get("automation_id"),
+            Some(&serde_json::json!("entry-hook-7"))
+        );
+
+        let exported = to_st_data(&character, None, Some(book.to_st_book()));
+        let exported_json = serde_json::to_value(exported).unwrap();
+        let entry = &exported_json["character_book"]["entries"][0];
+        assert_eq!(entry["probability"], serde_json::json!(73));
+        assert_eq!(entry["automation_id"], serde_json::json!("entry-hook-7"));
     }
 }

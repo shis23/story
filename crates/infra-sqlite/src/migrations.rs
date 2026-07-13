@@ -37,6 +37,11 @@ pub fn builtin_migrations() -> Vec<Migration> {
             name: "production_commit_ledger",
             sql: include_str!("../migrations/V002__production_commit_ledger.sql"),
         },
+        Migration {
+            version: 3,
+            name: "chronicle_publication_jobs",
+            sql: include_str!("../migrations/V003__chronicle_publication_jobs.sql"),
+        },
     ]
 }
 
@@ -209,12 +214,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1, 2]);
-        assert_eq!(current_version(&db).unwrap(), 2);
+        assert_eq!(first, vec![1, 2, 3]);
+        assert_eq!(current_version(&db).unwrap(), 3);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 2);
+        assert_eq!(current_version(&db).unwrap(), 3);
 
         // 核心表应存在
         for table in [
@@ -226,6 +231,7 @@ mod tests {
             "round_summaries",
             "round_summary_covers",
             "mutation_commits",
+            "chronicle_publication_jobs",
             "import_runs",
         ] {
             let exists: i64 = db
@@ -252,8 +258,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(migrate(&mut db).unwrap(), vec![2]);
-        assert_eq!(current_version(&db).unwrap(), 2);
+        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3]);
+        assert_eq!(current_version(&db).unwrap(), 3);
         let cards: i64 = db
             .connection()
             .query_row(
@@ -263,15 +269,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cards, 1);
-        let ledger_exists: i64 = db
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='mutation_commits'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ledger_exists, 1);
+        for table in ["mutation_commits", "chronicle_publication_jobs"] {
+            let exists: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing {table}");
+        }
     }
 
     #[test]

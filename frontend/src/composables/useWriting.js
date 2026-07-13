@@ -25,12 +25,20 @@ import {
   getConversation,
 } from '../tauri-api.js'
 import { ST_EVENT_TYPES } from '../plugin-bridge.js'
+import {
+  createPromptHookCancelledError,
+  isPromptHookCancelledError,
+} from '../utils/promptHooks.js'
 import { assistantRoleLabel } from '../utils/roleLabel.js'
 
 /**
  * @param {{
  *   handlePipelineEvent?: (event: object) => void,
  *   runPromptHookEvents?: (intent: string) => Promise<string>,
+ *   cancelPromptHooks?: () => void,
+ *   isPromptHooksCancelled?: () => boolean,
+ *   startWritingApi?: (...args: any[]) => Promise<object>,
+ *   cancelWritingApi?: () => Promise<unknown>,
  *   applyConversation?: (conv: object) => void,
  *   broadcastPluginEvent?: (event: string, data?: object) => void,
  *   messageEventPayload?: (messageId: string, extra?: object) => object,
@@ -46,6 +54,9 @@ export function useWriting(options = {}) {
 
   const handlePipelineEvent = options.handlePipelineEvent || (() => {})
   const runPromptHookEvents = options.runPromptHookEvents || ((intent) => Promise.resolve(intent))
+  const isPromptHooksCancelled = options.isPromptHooksCancelled || (() => false)
+  const startWritingApi = options.startWritingApi || apiStartWriting
+  const cancelWritingApi = options.cancelWritingApi || apiCancelWriting
   const applyConversation = options.applyConversation || (() => {})
   const broadcastPluginEvent = options.broadcastPluginEvent || (() => {})
   const messageEventPayload = options.messageEventPayload || (() => ({}))
@@ -117,10 +128,11 @@ export function useWriting(options = {}) {
       // legacy 模式传 activeChar.id 保持旧命令兼容
       const charIdForWriting = writingStore.writingMode === 'campaign' ? null : campaignStore.activeChar?.id
       const hookedIntent = await runPromptHookEvents(intent)
+      if (isPromptHooksCancelled()) throw createPromptHookCancelledError()
       const openingMessage = writingStore.writingMode === 'legacy' && !campaignStore.currentConversationId
         ? writingStore.selectedGreeting?.content || null
         : null
-      const result = await apiStartWriting(hookedIntent, charIdForWriting, (event) => {
+      const result = await startWritingApi(hookedIntent, charIdForWriting, (event) => {
         onPipelineEvent(event)
       }, campaignStore.currentConversationId, openingMessage)
 
@@ -175,8 +187,10 @@ export function useWriting(options = {}) {
         writingStore.messages = writingStore.messages.filter((m) => m.id !== userMsgId)
       }
       writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
-      writingStore.pipeline.state = 'error'
-      writingStore.pipeline.stateLabel = `失败: ${err}`
+      const cancelled = isPromptHookCancelledError(err)
+      if (cancelled) writingStore.showPipeline = false
+      writingStore.pipeline.state = cancelled ? 'idle' : 'error'
+      writingStore.pipeline.stateLabel = cancelled ? '已停止' : `失败: ${err}`
     } finally {
       writingStore.isWriting = false
     }
@@ -185,7 +199,13 @@ export function useWriting(options = {}) {
   // 来源 App.vue:812-819 cancelWriting
   async function cancelWriting() {
     try {
-      await apiCancelWriting()
+      // Cooperative cancel for in-flight frontend prompt hooks (if wired).
+      try {
+        options.cancelPromptHooks?.()
+      } catch (hookCancelError) {
+        console.error('取消 prompt hook 失败:', hookCancelError)
+      }
+      await cancelWritingApi()
       writingStore.pipeline.stateLabel = '正在停止…'
     } catch (e) {
       console.error('取消失败:', e)

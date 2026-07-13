@@ -47,6 +47,7 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   scrollToBottom?: () => void,
  *   alertDialog?: (message: string) => Promise<void> | void,
  *   startWriting?: (intent: string, skipLocalPush?: boolean) => Promise<void>,
+ *   beginPromptHookGeneration?: () => number,
  * }} [options]
  */
 export function useMessageVariants(options = {}) {
@@ -64,6 +65,7 @@ export function useMessageVariants(options = {}) {
   const scrollToBottom = options.scrollToBottom || (() => {})
   const alertDialog = options.alertDialog || ((msg) => { console.error('alertDialog(未注入):', msg) })
   const startWriting = options.startWriting || (() => { console.error('useMessageVariants: startWriting 未注入') })
+  const beginPromptHookGeneration = options.beginPromptHookGeneration || (() => 0)
 
   // 来源 App.vue:314-317 getAssistantRoleLabel
   function getAssistantRoleLabel() {
@@ -105,6 +107,7 @@ export function useMessageVariants(options = {}) {
     }
 
     try {
+      beginPromptHookGeneration()
       const result = await apiRegenerate({
         conversationId: campaignStore.currentConversationId,
         nodeId: messageId,
@@ -244,6 +247,7 @@ export function useMessageVariants(options = {}) {
     writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
 
     try {
+      beginPromptHookGeneration()
       await apiRegenerate({
         conversationId: campaignStore.currentConversationId,
         nodeId: aiMsg.id,

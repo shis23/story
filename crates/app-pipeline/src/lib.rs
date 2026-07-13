@@ -4490,6 +4490,7 @@ mod tests {
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
         let ctx = WritingContext::legacy(vec![], Some(book), conv_store.create(None, None).id);
 
@@ -4531,6 +4532,7 @@ mod tests {
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
         let conv_store = {
             let dir = std::env::temp_dir().join(format!("sf_lore_regex_{}", uuid::Uuid::new_v4()));
@@ -4619,6 +4621,7 @@ mod tests {
                 route: LoreRoute::Constant,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
 
         // 第 1 轮：intent=A，turn=1
@@ -4701,6 +4704,7 @@ mod tests {
                     extensions: serde_json::json!({}),
                 },
             ],
+            metadata: Default::default(),
         });
 
         let conv_store = {
@@ -4747,6 +4751,7 @@ mod tests {
                 route: LoreRoute::Selective,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
         let conv_store = {
             let dir =
@@ -4796,6 +4801,7 @@ mod tests {
                 route: LoreRoute::Selective,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
 
         let conv_store = {
@@ -4838,6 +4844,7 @@ mod tests {
                 route: LoreRoute::Both,
                 extensions: serde_json::json!({}),
             }],
+            metadata: Default::default(),
         });
 
         let conv_store = {
