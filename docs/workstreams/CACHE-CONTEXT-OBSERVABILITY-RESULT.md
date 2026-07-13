@@ -142,3 +142,13 @@ cargo test -p harness-real-llm --test cache_context_observability context_compil
 3. 未宣称 provider cache hits；真实限量跑可作为 follow-up，不阻塞本 deterministic 证据合并。
 
 不建议在本 PR 中夹带真实调用结果，除非另开授权运行并只记录 host/model/计数/hash。
+
+## 11. Review follow-up fixes
+
+Addressed post-implementation review before merge:
+
+1. **SSE 真统一 parser**：`StreamDelta.usage` 改为 `serde_json::Value`，直接进 `parse_provider_usage`；partial / string numbers 不再被严格 `StreamUsage` 挡掉。
+2. **total_tokens 语义**：缺省时统一 `prompt+completion`；显式 `0` 保留；矩阵增加 missing/explicit-zero cases。
+3. **request fingerprint / LCP**：`fingerprint_messages` 含 tool_calls/tool_call_id；新增 `fingerprint_chat_request`（model/tools/sampling）；budget 录制改用 request 级指纹。
+4. **120 轮 bench**：compile 输入严格拆分 `anchor_body` vs `live_suffix_body`；断言 `stable_h_anchor_membership`（max/final anchor == H）。
+5. **latency**：每轮 `as_micros()` 采样；断言 `latency_samples_complete`（samples==turns 且 total_us>0），不再用恒真的 `ms>0 || turns>0`。

@@ -230,6 +230,23 @@ mod tests {
                 expect: None,
             },
             Case {
+                name: "missing_total_filled_from_prompt_plus_completion",
+                json: serde_json::json!({
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2
+                }),
+                expect: Some(usage(11, 2, 13, 0, 0)),
+            },
+            Case {
+                name: "explicit_total_zero_preserved",
+                json: serde_json::json!({
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 0
+                }),
+                expect: Some(usage(11, 2, 0, 0, 0)),
+            },
+            Case {
                 name: "zero_cached_is_valid_not_success_condition",
                 json: serde_json::json!({
                     "prompt_tokens": 10,

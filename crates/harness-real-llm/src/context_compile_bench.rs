@@ -57,10 +57,14 @@ pub fn run_context_compile_benchmark(
     let mut token_estimates: Vec<u32> = Vec::with_capacity(cfg.turns as usize);
     let mut latencies: Vec<u128> = Vec::with_capacity(cfg.turns as usize);
     let mut observed_max_near = 0u32;
+    let mut observed_max_anchor = 0u32;
     let mut final_near = 0usize;
+    let mut final_anchor = 0usize;
+    let mut final_live = 0usize;
     let mut final_band = 0usize;
     let mut final_overview = 0usize;
     let mut chronicle_revision = 0u64;
+    let mut latency_us: Vec<u128> = Vec::with_capacity(cfg.turns as usize);
 
     for i in 1..=cfg.turns {
         let t0 = Instant::now();
@@ -92,21 +96,29 @@ pub fn run_context_compile_benchmark(
         );
         epoch = Some(refreshed.snapshot.clone());
 
-        // 合成 near 正文：anchor + live_suffix 各 1 条 user/assistant 对
-        let near_ids = &refreshed.membership.near_raw_turn_ids;
-        let mut near_msgs = Vec::new();
-        for tid in near_ids {
+        // 合成 near 正文：严格按 membership 拆分 H_anchor 与 live_suffix
+        let body_for = |tid: &Id| -> Vec<ChatMessage> {
             let seq = committed
                 .iter()
                 .find(|c| &c.turn_id == tid)
                 .map(|c| c.sequence)
                 .unwrap_or(0);
-            near_msgs.push(ChatMessage::user(format!(
-                "intent-{seq}: synthetic user intent for turn {seq}"
-            )));
-            near_msgs.push(ChatMessage::assistant(format!(
-                "draft-{seq}: synthetic accepted draft body for turn {seq}, padded for token slope."
-            )));
+            vec![
+                ChatMessage::user(format!(
+                    "intent-{seq}: synthetic user intent for turn {seq}"
+                )),
+                ChatMessage::assistant(format!(
+                    "draft-{seq}: synthetic accepted draft body for turn {seq}, padded for token slope."
+                )),
+            ]
+        };
+        let mut anchor_body = Vec::new();
+        for tid in &refreshed.membership.anchor_turn_ids {
+            anchor_body.extend(body_for(tid));
+        }
+        let mut live_suffix_body = Vec::new();
+        for tid in &refreshed.membership.live_suffix_turn_ids {
+            live_suffix_body.extend(body_for(tid));
         }
 
         let overview_lines: Vec<(ChronicleCode, String)> = refreshed
@@ -122,7 +134,6 @@ pub fn run_context_compile_benchmark(
             .map(|c| (c.clone(), format!("band summary {}", c.as_str())))
             .collect();
 
-        // anchor/live 在 compile 输入里拆开；这里把 near 全放 live，anchor 空，计数仍来自 membership
         let input = ContextCompileInput {
             snapshot: refreshed.snapshot.clone(),
             capture: ContextCompileCapture {
@@ -130,8 +141,8 @@ pub fn run_context_compile_benchmark(
                 chronicle_revision,
                 epoch_id: refreshed.snapshot.epoch_id.clone(),
             },
-            live_suffix_body: near_msgs,
-            anchor_body: Vec::new(),
+            live_suffix_body,
+            anchor_body,
             optional_checkpoint: None,
             overview_lines,
             band_lines,
@@ -158,22 +169,30 @@ pub fn run_context_compile_benchmark(
             }
         }
         token_estimates.push(est);
-        let elapsed = t0.elapsed().as_millis();
-        latencies.push(elapsed);
+        // 用微秒避免亚毫秒轮次全被截成 0ms 导致“恒真”延迟断言
+        let elapsed_us = t0.elapsed().as_micros();
+        latency_us.push(elapsed_us);
+        latencies.push(elapsed_us / 1000);
 
         let near_count = refreshed.membership.near_raw_turn_ids.len() as u32;
+        let anchor_count = refreshed.membership.anchor_turn_ids.len() as u32;
         observed_max_near = observed_max_near.max(near_count);
+        observed_max_anchor = observed_max_anchor.max(anchor_count);
         final_near = refreshed.membership.near_raw_turn_ids.len();
+        final_anchor = refreshed.membership.anchor_turn_ids.len();
+        final_live = refreshed.membership.live_suffix_turn_ids.len();
         final_band = refreshed.membership.band_turn_ids.len();
         final_overview = refreshed.snapshot.overview_codes.len();
     }
 
     let slope = prompt_growth_slope(&token_estimates);
-    let mut sorted_lat = latencies.clone();
-    sorted_lat.sort_unstable();
-    let latency_ms_total: u128 = latencies.iter().sum();
-    let latency_ms_p50 = percentile_ms(&sorted_lat, 0.50);
-    let latency_ms_p95 = percentile_ms(&sorted_lat, 0.95);
+    let mut sorted_lat_us = latency_us.clone();
+    sorted_lat_us.sort_unstable();
+    let latency_us_total: u128 = latency_us.iter().sum();
+    let latency_ms_total = latency_us_total / 1000;
+    let latency_ms_p50 = percentile_ms(&sorted_lat_us, 0.50) / 1000;
+    let latency_ms_p95 = percentile_ms(&sorted_lat_us, 0.95) / 1000;
+    let latency_samples = latency_us.len() as u32;
 
     let max_near_raw = cfg.params.max_near_raw_turns();
     let mut assertions = vec![
@@ -216,7 +235,28 @@ pub fn run_context_compile_benchmark(
         BenchmarkAssertion {
             name: "membership_non_empty_final".into(),
             passed: final_near > 0,
-            detail: format!("near={final_near} band={final_band} overview={final_overview}"),
+            detail: format!(
+                "near={final_near} anchor={final_anchor} live={final_live} band={final_band} overview={final_overview}"
+            ),
+        },
+        BenchmarkAssertion {
+            name: "stable_h_anchor_membership".into(),
+            // 越过 H+E 后 membership 的 anchor 应稳定为 H_anchor（不是把全部 near 塞进 live）
+            passed: observed_max_anchor == cfg.params.h_anchor
+                && final_anchor == cfg.params.h_anchor as usize,
+            detail: format!(
+                "observed_max_anchor={observed_max_anchor} final_anchor={final_anchor} h={}",
+                cfg.params.h_anchor
+            ),
+        },
+        BenchmarkAssertion {
+            name: "latency_samples_complete".into(),
+            // 不要求 wall-clock >0ms（机器可能亚毫秒），但必须每轮采样且可汇总
+            passed: latency_samples == cfg.turns && latency_us_total > 0,
+            detail: format!(
+                "samples={latency_samples}/{} total_us={latency_us_total} p50_ms={latency_ms_p50} p95_ms={latency_ms_p95}",
+                cfg.turns
+            ),
         },
     ];
 
@@ -300,7 +340,18 @@ mod tests {
             assert!(a.passed, "assertion {} failed: {}", a.name, a.detail);
         }
         assert!(report.evidence_bytes > 0);
-        assert!(report.latency_ms_total > 0 || report.turns > 0);
+        assert!(
+            report
+                .assertions
+                .iter()
+                .any(|a| a.name == "stable_h_anchor_membership" && a.passed)
+        );
+        assert!(
+            report
+                .assertions
+                .iter()
+                .any(|a| a.name == "latency_samples_complete" && a.passed)
+        );
         let body = std::fs::read_to_string(&cfg.report_path).unwrap();
         assert!(body.contains("prompt_growth_slope"));
         assert!(!body.contains("api_key"));

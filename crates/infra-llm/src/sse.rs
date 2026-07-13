@@ -156,23 +156,12 @@ impl SseEventAccumulator {
         }
 
         // 末 chunk 携带 usage（choices 通常为空）。需 stream_options.include_usage=true
-        // 与非流式共用 usage_parse 语义：先把 StreamUsage 还原为 JSON 再归一化。
-        if let Some(u) = &chunk.usage {
-            let usage_json = serde_json::json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens,
-                "prompt_cache_hit_tokens": u.prompt_cache_hit_tokens,
-                "prompt_cache_miss_tokens": u.prompt_cache_miss_tokens,
-                "prompt_tokens_details": u.prompt_tokens_details.as_ref().map(|d| {
-                    serde_json::json!({"cached_tokens": d.cached_tokens})
-                }),
-                "cache_read_input_tokens": u.cache_read_input_tokens,
-                "cache_creation_input_tokens": u.cache_creation_input_tokens,
-            });
-            if let Some(parsed) = crate::usage_parse::parse_provider_usage(&usage_json) {
-                self.usage = Some(parsed);
-            }
+        // 直接把 usage JSON 交给统一 parser：partial / string numbers / nested cache
+        // 不再先经严格 StreamUsage 反序列化（否则缺 completion_tokens 会整段失败）。
+        if let Some(u) = &chunk.usage
+            && let Some(parsed) = crate::usage_parse::parse_provider_usage(u)
+        {
+            self.usage = Some(parsed);
         }
 
         // 推送 chunk（只带 content delta + finish_reason；
@@ -204,71 +193,12 @@ pub(crate) mod openai_types {
 
     #[derive(Debug, Deserialize)]
     pub struct StreamDelta {
+        #[serde(default)]
         pub choices: Vec<StreamChoice>,
-        /// 末 chunk（choices 为空）会带 usage，需请求时设 stream_options.include_usage=true
+        /// 末 chunk（choices 为空）会带 usage；用 Value 保留 partial/string schema，
+        /// 由 `usage_parse::parse_provider_usage` 归一化（与非流式同一路径）。
         #[serde(default)]
-        pub usage: Option<StreamUsage>,
-    }
-
-    /// 流式 usage（字段类型与 domain::Usage 对齐为 u32）
-    ///
-    /// A2/M5：与非流式 `openai::parse_cached_tokens` 对齐——
-    /// DeepSeek 顶层 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；
-    /// OpenAI 嵌套 `prompt_tokens_details.cached_tokens`；
-    /// Anthropic `cache_read_input_tokens` / `cache_creation_input_tokens`。
-    /// 写作主链走 chat_stream，漏解析嵌套会把真实 cache 误报为 0。
-    #[derive(Debug, Deserialize)]
-    pub struct StreamUsage {
-        pub prompt_tokens: u32,
-        pub completion_tokens: u32,
-        #[serde(default)]
-        pub total_tokens: u32,
-        /// DeepSeek 缓存命中
-        #[serde(default)]
-        pub prompt_cache_hit_tokens: u32,
-        /// DeepSeek 缓存未命中（≈ cache creation）
-        #[serde(default)]
-        pub prompt_cache_miss_tokens: u32,
-        /// OpenAI 嵌套缓存细节
-        #[serde(default)]
-        pub prompt_tokens_details: Option<StreamPromptTokensDetails>,
-        /// Anthropic 缓存命中
-        #[serde(default)]
-        pub cache_read_input_tokens: u32,
-        /// Anthropic 缓存创建
-        #[serde(default)]
-        pub cache_creation_input_tokens: u32,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    pub struct StreamPromptTokensDetails {
-        #[serde(default)]
-        pub cached_tokens: u32,
-    }
-
-    impl StreamUsage {
-        /// 优先 DeepSeek 顶层，其次 OpenAI 嵌套，再次 Anthropic。
-        /// 测试与调试用；生产 SSE 路径经 `usage_parse::parse_provider_usage` 归一化。
-        #[cfg(test)]
-        pub fn resolved_cached_tokens(&self) -> u32 {
-            if self.prompt_cache_hit_tokens > 0 {
-                return self.prompt_cache_hit_tokens;
-            }
-            if let Some(d) = &self.prompt_tokens_details
-                && d.cached_tokens > 0
-            {
-                return d.cached_tokens;
-            }
-            self.cache_read_input_tokens
-        }
-
-        #[cfg(test)]
-        pub fn resolved_cache_creation_tokens(&self) -> u32 {
-            if self.prompt_cache_miss_tokens > 0 {
-                return self.prompt_cache_miss_tokens;
-            }
-            self.cache_creation_input_tokens
-        }
+        pub usage: Option<serde_json::Value>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -415,47 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_usage_resolves_openai_nested_cached_tokens() {
-        let json = r#"{
-            "prompt_tokens": 215,
-            "completion_tokens": 35,
-            "total_tokens": 250,
-            "prompt_tokens_details": {"cached_tokens": 128}
-        }"#;
-        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(u.prompt_cache_hit_tokens, 0);
-        assert_eq!(u.resolved_cached_tokens(), 128);
-        assert_eq!(u.resolved_cache_creation_tokens(), 0);
-    }
-
-    #[test]
-    fn stream_usage_prefers_deepseek_top_level_over_nested() {
-        let json = r#"{
-            "prompt_tokens": 1000,
-            "completion_tokens": 10,
-            "prompt_cache_hit_tokens": 800,
-            "prompt_cache_miss_tokens": 200,
-            "prompt_tokens_details": {"cached_tokens": 1}
-        }"#;
-        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(u.resolved_cached_tokens(), 800);
-        assert_eq!(u.resolved_cache_creation_tokens(), 200);
-    }
-
-    #[test]
-    fn stream_usage_resolves_anthropic_cache_fields() {
-        let json = r#"{
-            "prompt_tokens": 500,
-            "completion_tokens": 20,
-            "cache_read_input_tokens": 300,
-            "cache_creation_input_tokens": 50
-        }"#;
-        let u: openai_types::StreamUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(u.resolved_cached_tokens(), 300);
-        assert_eq!(u.resolved_cache_creation_tokens(), 50);
-    }
-
-    #[test]
     fn sse_usage_chunk_maps_openai_nested_into_domain_usage() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut acc = SseEventAccumulator::new();
@@ -468,5 +357,53 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 215);
         assert_eq!(usage.cached_tokens, 128);
         assert_eq!(usage.completion_tokens, 35);
+        assert_eq!(usage.total_tokens, 250);
+    }
+
+    #[test]
+    fn sse_usage_accepts_partial_prompt_only_and_fills_total() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        // partial：无 completion_tokens；total 缺省 → prompt+completion
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":90,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        acc.on_line(format!("data: {json}").as_bytes(), &tx)
+            .unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        let usage = acc
+            .usage
+            .expect("partial usage should parse via unified path");
+        assert_eq!(usage.prompt_tokens, 90);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 90);
+        assert_eq!(usage.cached_tokens, 40);
+    }
+
+    #[test]
+    fn sse_usage_accepts_string_number_fields() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":"120","completion_tokens":"8","prompt_cache_hit_tokens":"96"}}"#;
+        acc.on_line(format!("data: {json}").as_bytes(), &tx)
+            .unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        let usage = acc.usage.expect("string numbers should parse");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.total_tokens, 128);
+        assert_eq!(usage.cached_tokens, 96);
+    }
+
+    #[test]
+    fn sse_usage_deepseek_and_anthropic_fields_via_unified_parser() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":500,"completion_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":50}}"#;
+        acc.on_line(format!("data: {json}").as_bytes(), &tx)
+            .unwrap();
+        acc.on_line(b"", &tx).unwrap();
+        let usage = acc.usage.expect("anthropic fields");
+        assert_eq!(usage.cached_tokens, 300);
+        assert_eq!(usage.cache_creation_tokens, 50);
+        assert_eq!(usage.total_tokens, 520);
     }
 }
