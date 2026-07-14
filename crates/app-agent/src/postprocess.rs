@@ -126,6 +126,7 @@ async fn run_direct_json_fallback(
             temperature: Some(0.3),
             top_p: Some(0.95),
             max_tokens: Some(8192),
+            max_tokens_explicit: false,
             reasoning: storyforge_domain::llm::ReasoningMode::default(),
             extra: None,
         },

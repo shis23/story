@@ -146,21 +146,21 @@ impl AgentRuntime {
         self
     }
 
-    /// 构建 ChatRequest 的采样参数：override 存在则用 override（但 max_tokens 清空），
-    /// 否则用 Default。
+    /// Build the request sampling parameters.  An absent cap delegates output sizing to the
+    /// provider; an explicitly configured cap is user intent and must reach the request.
     fn build_params(&self) -> SamplingParams {
-        if let Some(p) = &self.sampling_override {
-            // max_tokens 仍不设（同原逻辑，避免 output 空间不足）
-            SamplingParams {
-                max_tokens: None,
-                ..p.clone()
-            }
+        let mut params = if let Some(p) = &self.sampling_override {
+            p.clone()
         } else {
-            SamplingParams {
-                max_tokens: None,
-                ..Default::default()
-            }
+            SamplingParams::default()
+        };
+        // Old connection records have no intent bit and were populated by the old UI with
+        // 4096 unconditionally. Treat that exact unmarked value as a legacy default, not a
+        // user-requested cap; newly saved user values carry `max_tokens_explicit=true`.
+        if !params.max_tokens_explicit && params.max_tokens == Some(4096) {
+            params.max_tokens = None;
         }
+        params
     }
 
     /// 获取 LLM 客户端（供子 Agent 构造独立 runtime 时 clone）
@@ -1182,6 +1182,53 @@ mod tests {
             }
             Ok(resp)
         }
+    }
+
+    #[test]
+    fn sampling_defaults_to_provider_migrates_legacy_cap_and_preserves_explicit_cap() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+        let tool_ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let default_runtime = AgentRuntime::new(llm.clone(), tool_ctx.clone());
+        assert_eq!(default_runtime.build_params().max_tokens, None);
+
+        let explicit_runtime = AgentRuntime::new(llm, tool_ctx).with_sampling(SamplingParams {
+            max_tokens: Some(4096),
+            max_tokens_explicit: true,
+            ..SamplingParams::default()
+        });
+        assert_eq!(explicit_runtime.build_params().max_tokens, Some(4096));
+
+        let legacy_runtime = AgentRuntime::new(
+            Arc::new(MockLlmClient::with_defaults()),
+            Arc::new(ToolContext {
+                characters: vec![],
+                world_info: None,
+                vector_store: None,
+                archived_summaries: vec![],
+                chronicle_summaries: vec![],
+                chronicle_tool_budget: Arc::new(crate::tools::ChronicleToolBudget::new()),
+                campaign_runtime: None,
+                current_character_instance_id: None,
+                regex_scripts: vec![],
+            }),
+        )
+        .with_sampling(SamplingParams {
+            max_tokens: Some(4096),
+            max_tokens_explicit: false,
+            ..SamplingParams::default()
+        });
+        assert_eq!(legacy_runtime.build_params().max_tokens, None);
     }
 
     /// 验证全局取消会中止所有子 Agent

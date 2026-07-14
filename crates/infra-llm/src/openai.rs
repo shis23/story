@@ -150,6 +150,7 @@ mod tests {
         assert_eq!(body["model"], "deepseek-chat");
         assert_eq!(body["stream"], false);
         assert!(body["messages"].as_array().unwrap().len() == 2);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]
@@ -184,6 +185,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 max_tokens: Some(2048),
+                max_tokens_explicit: true,
                 reasoning: storyforge_domain::llm::ReasoningMode::default(),
                 extra: Some(extra),
             },

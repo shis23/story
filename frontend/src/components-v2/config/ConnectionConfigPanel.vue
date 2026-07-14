@@ -17,6 +17,7 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import EmptyState from '../ui/EmptyState.vue'
+import { normalizeOptionalMaxTokens } from '../../utils/connectionSampling.js'
 
 const emit = defineEmits(['close', 'changed'])
 
@@ -37,7 +38,7 @@ const form = reactive({
   toolMode: 'native',
   temperature: 1.0,
   topP: 0.95,
-  maxTokens: 4096,
+  maxTokens: null,
   // P3-3：厂商扩展参数 JSON 文本（透传到请求体顶层，如 thinking/reasoning_effort）
   extraJson: '',
 })
@@ -203,6 +204,13 @@ async function handleSave() {
     error.value = extraParseError.value
     return
   }
+  let maxTokens
+  try {
+    maxTokens = normalizeOptionalMaxTokens(form.maxTokens)
+  } catch (e) {
+    error.value = 'max_tokens 必须是正整数，留空则使用模型默认上限'
+    return
+  }
   saving.value = true
   error.value = ''
   try {
@@ -216,7 +224,8 @@ async function handleSave() {
       toolMode: form.toolMode,
       temperature: parseFloat(form.temperature),
       topP: parseFloat(form.topP),
-      maxTokens: parseInt(form.maxTokens),
+      maxTokens,
+      maxTokensExplicit: maxTokens !== null,
       extra,
     })
     await loadConnections()
@@ -410,8 +419,8 @@ async function handleSetActive(id) {
                   class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
               </div>
               <div class="space-y-1">
-                <label class="text-[10px] text-ink-soft">max_tokens</label>
-                <input v-model.number="form.maxTokens" type="number" step="256"
+                <label class="text-[10px] text-ink-soft">max_tokens（留空=模型默认）</label>
+                <input v-model.number="form.maxTokens" type="number" min="1" step="256" placeholder="留空"
                   class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
               </div>
             </div>

@@ -5751,6 +5751,8 @@ pub struct CreateConnectionDto {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_tokens_explicit: bool,
     /// A1：推理模式 "disabled" / "native" / "prompted"。
     /// 默认 disabled。native = 使用厂商原生 thinking（自动注入），同时抑制 CoT 提示模块。
     #[serde(default)]
@@ -5783,6 +5785,7 @@ async fn create_connection(
             temperature: req.temperature,
             top_p: req.top_p,
             max_tokens: req.max_tokens,
+            max_tokens_explicit: req.max_tokens_explicit,
             reasoning: req
                 .reasoning
                 .as_deref()

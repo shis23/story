@@ -77,6 +77,10 @@ pub struct SamplingParams {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Whether this cap came from an explicit user choice rather than the legacy UI default.
+    /// It is metadata only: providers receive `max_tokens` when the request field is `Some`.
+    #[serde(default)]
+    pub max_tokens_explicit: bool,
     /// 推理模式（A1）：Disabled / Native / Prompted 三选一。
     #[serde(default)]
     pub reasoning: ReasoningMode,
@@ -91,7 +95,11 @@ impl Default for SamplingParams {
         Self {
             temperature: Some(1.0),
             top_p: Some(0.95),
-            max_tokens: Some(4096),
+            // Omit the field unless the user deliberately configures a cap. The main agent
+            // runtime already delegated output sizing to the provider, but the old default
+            // still leaked into connection records and direct request consumers.
+            max_tokens: None,
+            max_tokens_explicit: false,
             reasoning: ReasoningMode::default(),
             extra: None,
         }
@@ -549,6 +557,7 @@ mod tests {
         let json = r#"{"temperature":1.0,"top_p":0.95,"max_tokens":4096}"#;
         let params: SamplingParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.reasoning, ReasoningMode::Disabled);
+        assert!(!params.max_tokens_explicit);
     }
 
     #[test]
@@ -585,5 +594,12 @@ mod tests {
         let deserialized: Usage = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.cached_tokens, 800);
         assert_eq!(deserialized.cache_creation_tokens, 200);
+    }
+
+    #[test]
+    fn sampling_params_default_leaves_output_limit_to_provider() {
+        let params = SamplingParams::default();
+        assert_eq!(params.max_tokens, None);
+        assert!(!params.max_tokens_explicit);
     }
 }

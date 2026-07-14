@@ -398,6 +398,7 @@ export async function createConnection(req) {
         temperature: req.temperature ?? null,
         top_p: req.topP ?? null,
         max_tokens: req.maxTokens ?? null,
+        max_tokens_explicit: req.maxTokensExplicit ?? false,
         // P3-3：厂商扩展参数（thinking/reasoning_effort 等），透传到请求体顶层
         extra: req.extra ?? null,
       },
