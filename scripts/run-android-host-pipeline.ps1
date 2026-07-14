@@ -366,6 +366,22 @@ try {
     $inspectionPath = Join-Path $runDir 'apk-inspection.json'
     Write-ReleaseJson -Object $evidence -Path $inspectionPath
 
+    Start-AndroidHostStep -Name 'dependency / SBOM-style inventory'
+    $inventory = New-ReleaseDependencyInventory `
+        -CargoTomlPath (Join-Path $script:RepoRoot 'Cargo.toml') `
+        -PackageLockPath (Join-Path $script:RepoRoot 'frontend\package-lock.json') `
+        -PreferCargoTree:$false
+    $inventoryPath = Join-Path $runDir 'dependency-inventory.json'
+    Write-ReleaseJson -Object $inventory -Path $inventoryPath
+    Write-Host ("Wrote inventory: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $inventoryPath))
+    $script:Notes.Add(('dependency_inventory_generator={0}' -f $inventory.generator))
+    $inventoryEvidence = [pscustomobject]@{
+        relative_path = Get-RelativeReleasePath -RepoRoot $runDir -FullPath $inventoryPath
+        sha256 = Get-ReleaseFileSha256 -Path $inventoryPath
+        component_count = @($inventory.components).Count
+        generator = $inventory.generator
+    }
+
     $warningArr = [string[]]@($script:Warnings | ForEach-Object { [string]$_ })
     $noteArr = [string[]]@($script:Notes | ForEach-Object { [string]$_ })
     if ($script:Artifacts.Count -gt 0) {
@@ -379,12 +395,60 @@ try {
         -Target 'aarch64-linux-android' `
         -ToolVersions $toolVersions `
         -Artifacts $artifactArr `
+        -DependencyInventory $inventoryEvidence `
         -BuildStatus $buildStatus `
         -Warnings $warningArr `
         -Notes $noteArr `
         -RepoRoot $script:RepoRoot
     $manifestPath = Join-Path $runDir 'manifest.json'
     Write-ReleaseJson -Object $manifest -Path $manifestPath
+
+    Start-AndroidHostStep -Name 'manifest schema validation'
+    Assert-ReleaseManifestSchema -Manifest $manifest
+    Write-Host 'Manifest schema validation passed.'
+
+    Start-AndroidHostStep -Name 'stage evidence subjects and hash sidecars'
+    $stagedSubjects = [object[]]@()
+    if ($DryRun) {
+        Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
+    } else {
+        $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
+        foreach ($art in $presentArtifacts) {
+            $fullPath = Join-Path $script:RepoRoot ($art.relative_path -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+            if ((Test-Path -LiteralPath $fullPath -PathType Leaf) -and ($art.kind -match 'apk')) {
+                $integrity = Test-ReleaseArchiveIntegrity -Path $fullPath -ExpectedKind $art.kind
+                Write-Host ("Verified archive integrity: {0} entries={1} bytes_read={2}" -f $art.relative_path, $integrity.entry_count, $integrity.bytes_read)
+            }
+        }
+        $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
+        foreach ($s in $stagedSubjects) {
+            Write-Host ("Staged subject: {0} sha256={1}" -f $s.relative_path, $s.sha256)
+        }
+    }
+
+    Start-AndroidHostStep -Name 'provenance attestation'
+    $provArtifacts = if ($DryRun) {
+        [object[]]@()
+    } else {
+        [object[]]@($stagedSubjects | ForEach-Object {
+            [pscustomobject]@{
+                relative_path = $_.relative_path
+                sha256        = $_.sha256
+                kind          = $_.kind
+                size_bytes    = $_.size_bytes
+                status        = $_.status
+            }
+        })
+    }
+    if ($null -eq $provArtifacts) { $provArtifacts = [object[]]@() }
+    $provenance = New-ReleaseProvenance `
+        -Commit $identity.commit `
+        -Branch $identity.branch `
+        -Target 'aarch64-linux-android' `
+        -Artifacts $provArtifacts `
+        -RepoRoot $script:RepoRoot
+    $provenancePath = Join-Path $runDir 'provenance.json'
+    Write-ReleaseJson -Object $provenance -Path $provenancePath
 
     $summaryPath = Join-Path $runDir 'SUMMARY.txt'
     $summary = New-Object System.Collections.Generic.List[string]
@@ -418,7 +482,9 @@ try {
         foreach ($dir in $targets) {
             Write-Host ("Removing old run dir: {0}" -f (Get-RelativeReleasePath -RepoRoot $script:RepoRoot -FullPath $dir.FullName))
         }
-        Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
+        if ($null -ne $targets -and @($targets).Count -gt 0) {
+            Remove-ReleaseRetentionTargets -Root $artifactRoot -Targets $targets
+        }
     }
 
     Write-Host ''

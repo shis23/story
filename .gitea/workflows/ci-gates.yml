@@ -1,0 +1,203 @@
+# Gitea Actions: fast PR / push gates.
+#
+# Runs formatting, strict Clippy, workspace tests, frontend tests/build,
+# Pester release-helper tests, and a fail-closed repository secret scan.
+# This workflow does NOT build host artifacts, APKs, or installers.
+name: ci-gates
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Cancel superseded runs on the same ref so stale pushes do not pile up.
+concurrency:
+  group: ci-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: only read the repo contents. No deploy/packages/admin.
+permissions:
+  contents: read
+
+jobs:
+  rust-fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  rust-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Linux Tauri / WebKit system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Setup Node (frontendDist for Tauri generate_context!)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend dist for Tauri context
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Linux Tauri / WebKit system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Node (frontendDist for Tauri generate_context!)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend dist for Tauri context
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  frontend-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      # Strict npm ci: fail closed if package-lock is out of sync.
+      - name: npm ci
+        run: npm ci
+      - name: npm test
+        run: npm test
+      - name: npm run build
+        run: npm run build
+
+  pester-release-tests:
+    # PowerShell release-helper Pester suite runs on a Windows runner.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run release-build Pester tests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/tests/run-release-build-tests.ps1
+      - name: Verify release gate (secret scan only)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+
+  secret-scan:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Repository secret scan (fail-closed, tracked + untracked)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+
+  workflow-syntax:
+    # Real YAML parser required (PyYAML). Structural-only PowerShell checks
+    # are not accepted for production workflow validation.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PyYAML
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'PyYAML==6.0.2'
+          python -c "import yaml; print(yaml.__version__)"
+      - name: Validate workflow YAML syntax with PyYAML
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $dir = '.gitea\workflows'
+          $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.yml' -File) +
+                   @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'No workflow files found.' }
+          foreach ($f in $files) {
+            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
+            if ($result.Engine -notmatch 'pyyaml|node-yaml') {
+              throw "FAIL: $($f.Name) did not use a real YAML parser (engine=$($result.Engine))"
+            }
+            if (-not $result.Valid) {
+              Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
+              $result.Errors | ForEach-Object { Write-Host "  $_" }
+              exit 1
+            }
+            Write-Host "OK: $($f.Name) (engine=$($result.Engine))" -ForegroundColor Green
+          }

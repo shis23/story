@@ -54,6 +54,7 @@ try {
     $testFiles = @(
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Tests.ps1')
         (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.Pipeline.Tests.ps1')
+        (Join-Path $repoRoot 'scripts\tests\ReleaseBuild.CI.Tests.ps1')
     )
 
     foreach ($testFile in $testFiles) {
@@ -87,6 +88,7 @@ try {
         $config = New-PesterConfiguration
         $config.Run.Path = $testFiles
         $config.Run.Exit = $false
+        $config.Run.PassThru = $true
         $config.Output.Verbosity = 'Detailed'
         $result = Invoke-Pester -Configuration $config
         Assert-ReleasePesterResult -Result $result -Label 'release-build test suite'
