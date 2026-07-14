@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
@@ -70,6 +71,9 @@ pub struct CampaignStore {
     tasks: Mutex<Vec<StoryTask>>,
     summaries: Mutex<Vec<RoundSummary>>,
     mvu: Mutex<Vec<StoredMvuTranslation>>,
+    /// When SQLite is the process authority, this legacy JSON store must not
+    /// be read as a fallback or used as a secondary write target.
+    json_access_disabled: AtomicBool,
 }
 
 impl CampaignStore {
@@ -90,6 +94,7 @@ impl CampaignStore {
             tasks: Mutex::new(load_or_default(&tasks_path)),
             summaries: Mutex::new(load_or_default(&summaries_path)),
             mvu: Mutex::new(load_or_default(&mvu_path)),
+            json_access_disabled: AtomicBool::new(false),
             cards_path,
             campaigns_path,
             instances_path,
@@ -100,18 +105,69 @@ impl CampaignStore {
         }
     }
 
+    /// Construct a non-I/O sentinel for an SQLite-authoritative process.
+    /// Reads return no JSON-derived data and every write fails closed.
+    pub fn disabled() -> Self {
+        Self {
+            cards_path: PathBuf::new(),
+            campaigns_path: PathBuf::new(),
+            instances_path: PathBuf::new(),
+            knowledge_path: PathBuf::new(),
+            tasks_path: PathBuf::new(),
+            summaries_path: PathBuf::new(),
+            mvu_path: PathBuf::new(),
+            cards: Mutex::new(Vec::new()),
+            campaigns: Mutex::new(Vec::new()),
+            instances: Mutex::new(Vec::new()),
+            knowledge: Mutex::new(Vec::new()),
+            tasks: Mutex::new(Vec::new()),
+            summaries: Mutex::new(Vec::new()),
+            mvu: Mutex::new(Vec::new()),
+            json_access_disabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Permanently close this process-local JSON handle after an opt-in
+    /// backend has become authoritative. This only protects against an
+    /// accidental lazy initialization before backend resolution.
+    pub fn disable_json_access(&self) {
+        self.json_access_disabled.store(true, Ordering::Release);
+    }
+
+    fn json_access_disabled(&self) -> bool {
+        self.json_access_disabled.load(Ordering::Acquire)
+    }
+
+    fn ensure_json_write_allowed(&self) -> Result<(), String> {
+        if self.json_access_disabled() {
+            return Err(
+                "legacy JSON CampaignStore is disabled while SQLite is authoritative".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Directory that owns the JSON files for this store (for reload/verify).
     pub fn data_dir(&self) -> Option<&Path> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.cards_path.parent()
     }
 
     // ─── CharacterCard CRUD ───────────────────────────────────────────────
 
     pub fn list_cards(&self) -> Vec<StoredCard> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.cards.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn get_card(&self, id: &Id) -> Option<StoredCard> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.cards
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -121,6 +177,9 @@ impl CampaignStore {
     }
 
     pub fn get_card_by_source(&self, source_character_id: &Id) -> Option<StoredCard> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.cards
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -130,6 +189,7 @@ impl CampaignStore {
     }
 
     pub fn save_card(&self, card: CharacterCard) -> Result<StoredCard, String> {
+        self.ensure_json_write_allowed()?;
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         // 同 source_character_id 去重（重跑识别时覆盖）
         cards.retain(|c| c.card.source_character_id != card.source_character_id);
@@ -143,6 +203,7 @@ impl CampaignStore {
     }
 
     pub fn save_card_if_no_campaigns(&self, card: CharacterCard) -> Result<StoredCard, String> {
+        self.ensure_json_write_allowed()?;
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -175,6 +236,7 @@ impl CampaignStore {
     }
 
     pub fn update_card(&self, card: CharacterCard) -> Result<Option<StoredCard>, String> {
+        self.ensure_json_write_allowed()?;
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let stored = StoredCard {
             card,
@@ -190,6 +252,7 @@ impl CampaignStore {
     }
 
     pub fn delete_card(&self, id: &Id) -> Result<bool, String> {
+        self.ensure_json_write_allowed()?;
         let mut cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
@@ -239,6 +302,9 @@ impl CampaignStore {
     // ─── Campaign CRUD ────────────────────────────────────────────────────
 
     pub fn list_campaigns(&self) -> Vec<Campaign> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -246,6 +312,9 @@ impl CampaignStore {
     }
 
     pub fn list_campaigns_of_card(&self, card_id: &Id) -> Vec<Campaign> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -256,6 +325,9 @@ impl CampaignStore {
     }
 
     pub fn get_campaign(&self, id: &Id) -> Option<Campaign> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.campaigns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -265,6 +337,7 @@ impl CampaignStore {
     }
 
     pub fn save_campaign(&self, campaign: Campaign) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         campaigns.retain(|c| c.id != campaign.id);
         campaigns.push(campaign);
@@ -275,6 +348,7 @@ impl CampaignStore {
         &self,
         campaign: Campaign,
     ) -> Result<(StoredCard, Campaign, usize), String> {
+        self.ensure_json_write_allowed()?;
         let cards = self.cards.lock().unwrap_or_else(|p| p.into_inner());
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
@@ -322,6 +396,7 @@ impl CampaignStore {
     }
 
     pub fn update_campaign(&self, campaign: Campaign) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = campaigns.iter().position(|c| c.id == campaign.id) {
             // 先 persist 再写内存，避免磁盘失败时内存已清空 epoch/marker
@@ -334,6 +409,7 @@ impl CampaignStore {
     }
 
     pub fn delete_campaign(&self, id: &Id) -> Result<bool, String> {
+        self.ensure_json_write_allowed()?;
         let mut campaigns = self.campaigns.lock().unwrap_or_else(|p| p.into_inner());
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
@@ -361,6 +437,9 @@ impl CampaignStore {
     // ─── CharacterInstance CRUD ───────────────────────────────────────────
 
     pub fn list_all_instances(&self) -> Vec<CharacterInstance> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.instances
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -368,6 +447,9 @@ impl CampaignStore {
     }
 
     pub fn list_instances(&self, campaign_id: &Id) -> Vec<CharacterInstance> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.instances
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -378,6 +460,9 @@ impl CampaignStore {
     }
 
     pub fn get_instance(&self, campaign_id: &Id, instance_id: &Id) -> Option<CharacterInstance> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.instances
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -387,6 +472,7 @@ impl CampaignStore {
     }
 
     pub fn add_instance(&self, instance: CharacterInstance) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
         instances.retain(|i| i.id != instance.id);
         instances.push(instance);
@@ -394,6 +480,7 @@ impl CampaignStore {
     }
 
     pub fn update_instance(&self, instance: CharacterInstance) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = instances.iter().position(|i| i.id == instance.id) {
             instances[idx] = instance;
@@ -405,6 +492,9 @@ impl CampaignStore {
     // ─── CharacterKnowledge CRUD（P2 新增）─────────────────────────────────
 
     pub fn list_all_knowledge(&self) -> Vec<CharacterKnowledgeEntry> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.knowledge
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -413,6 +503,9 @@ impl CampaignStore {
 
     /// 查某 campaign 下所有角色的知识条目
     pub fn list_knowledge(&self, campaign_id: &Id) -> Vec<CharacterKnowledgeEntry> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.knowledge
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -428,6 +521,9 @@ impl CampaignStore {
         campaign_id: &Id,
         character_id: &Id,
     ) -> Vec<CharacterKnowledgeEntry> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.knowledge
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -439,6 +535,7 @@ impl CampaignStore {
 
     /// 批量追加知识条目（后处理 Agent 产出后调用）
     pub fn add_knowledge(&self, entries: Vec<CharacterKnowledgeEntry>) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -449,6 +546,7 @@ impl CampaignStore {
 
     /// 删除单条知识条目（按 id），返回是否找到并删除
     pub fn delete_knowledge(&self, knowledge_id: &Id) -> Result<bool, String> {
+        self.ensure_json_write_allowed()?;
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
         let before = knowledge.len();
         knowledge.retain(|k| k.id != *knowledge_id);
@@ -462,11 +560,17 @@ impl CampaignStore {
     // ─── StoryTask CRUD（P2 新增）──────────────────────────────────────────
 
     pub fn list_all_tasks(&self) -> Vec<StoryTask> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.tasks.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 查某 campaign 下所有任务（按 status 筛选：传 None 返回全部）
     pub fn list_tasks(&self, campaign_id: &Id) -> Vec<StoryTask> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.tasks
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -477,6 +581,9 @@ impl CampaignStore {
     }
 
     pub fn get_task(&self, task_id: &Id) -> Option<StoryTask> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.tasks
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -487,6 +594,7 @@ impl CampaignStore {
 
     /// 新建任务（用户规划或后处理抽取）
     pub fn add_task(&self, task: StoryTask) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         tasks.retain(|t| t.id != task.id);
         tasks.push(task);
@@ -495,6 +603,7 @@ impl CampaignStore {
 
     /// 更新任务（状态变化 / 注入记录 / 标完成）
     pub fn update_task(&self, task: StoryTask) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = tasks.iter().position(|t| t.id == task.id) {
             tasks[idx] = task;
@@ -505,6 +614,7 @@ impl CampaignStore {
 
     /// 删除任务
     pub fn delete_task(&self, task_id: &Id) -> Result<bool, String> {
+        self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         let before = tasks.len();
         tasks.retain(|t| t.id != *task_id);
@@ -518,6 +628,9 @@ impl CampaignStore {
     // ─── RoundSummary CRUD（P2 新增）───────────────────────────────────────
 
     pub fn list_all_summaries(&self) -> Vec<RoundSummary> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.summaries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -526,6 +639,9 @@ impl CampaignStore {
 
     /// 查某 campaign 的所有本轮摘要（按 turn 升序）
     pub fn list_summaries(&self, campaign_id: &Id) -> Vec<RoundSummary> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         let mut out: Vec<_> = self
             .summaries
             .lock()
@@ -540,6 +656,7 @@ impl CampaignStore {
 
     /// 追加一条本轮摘要（剧情总结 Agent 产出后调用）
     pub fn add_summary(&self, summary: RoundSummary) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         summaries.retain(|s| !(s.campaign_id == summary.campaign_id && s.turn == summary.turn));
         summaries.push(summary);
@@ -559,6 +676,7 @@ impl CampaignStore {
     ///
     /// Phase A 幂等重放：重放时复用同一批 entry_id，payload 一致则 no-op。
     pub fn upsert_knowledge(&self, entry: CharacterKnowledgeEntry) -> Result<UpsertResult, String> {
+        self.ensure_json_write_allowed()?;
         let mut knowledge = self.knowledge.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = knowledge.iter().position(|k| k.id == entry.id) {
             if Self::payloads_match(&knowledge[idx], &entry) {
@@ -576,6 +694,7 @@ impl CampaignStore {
 
     /// 三态 upsert 任务（按 task.id）。
     pub fn upsert_task(&self, task: StoryTask) -> Result<UpsertResult, String> {
+        self.ensure_json_write_allowed()?;
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = tasks.iter().position(|t| t.id == task.id) {
             if Self::payloads_match(&tasks[idx], &task) {
@@ -593,6 +712,7 @@ impl CampaignStore {
 
     /// 三态 upsert 本轮摘要（按 campaign_id + turn 幂等键，payload 比较 content）。
     pub fn upsert_summary(&self, summary: RoundSummary) -> Result<UpsertResult, String> {
+        self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = summaries
             .iter()
@@ -613,6 +733,7 @@ impl CampaignStore {
 
     /// 按 summary.id 更新（covered_by 折叠 / 字段修补）。
     pub fn update_summary_by_id(&self, summary: RoundSummary) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = summaries.iter().position(|s| s.id == summary.id) {
             summaries[idx] = summary;
@@ -623,6 +744,7 @@ impl CampaignStore {
 
     /// 插入 stage 纪要（B/C）：按 id 去重，不按 turn 覆盖 leaf A。
     pub fn insert_stage_summary(&self, summary: RoundSummary) -> Result<UpsertResult, String> {
+        self.ensure_json_write_allowed()?;
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = summaries.iter().position(|s| s.id == summary.id) {
             if Self::payloads_match(&summaries[idx], &summary) {
@@ -652,6 +774,7 @@ impl CampaignStore {
         parents: &[RoundSummary],
         child_covered_by: &[(Id, Id)],
     ) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         use storyforge_domain::chronicle::PendingCompressPublication;
 
         crate::turn_coordinator::with_campaign_lock(|| {
@@ -707,6 +830,7 @@ impl CampaignStore {
 
     /// 若存在 pending_compress_publication，在锁内校验后完成 bump/clear；幂等。
     pub fn heal_compress_publication_metadata(&self, campaign_id: &Id) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         crate::turn_coordinator::with_campaign_lock(|| {
             self.complete_compress_publication_inner(campaign_id)
                 .map_err(crate::turn_coordinator::CommitError::Storage)?;
@@ -789,6 +913,9 @@ impl CampaignStore {
 
     /// 需要 heal：存在 pending marker，或（兼容）epoch 未失效且已有 stage/covered。
     pub fn needs_compress_metadata_heal(&self, campaign_id: &Id) -> bool {
+        if self.json_access_disabled() {
+            return false;
+        }
         let Some(camp) = self.get_campaign(campaign_id) else {
             return false;
         };
@@ -808,11 +935,17 @@ impl CampaignStore {
 
     /// 列所有 MVU 翻译
     pub fn list_all_mvu(&self) -> Vec<StoredMvuTranslation> {
+        if self.json_access_disabled() {
+            return Vec::new();
+        }
         self.mvu.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// 查某角色卡的 MVU 翻译
     pub fn get_mvu(&self, source_character_id: &Id) -> Option<StoredMvuTranslation> {
+        if self.json_access_disabled() {
+            return None;
+        }
         self.mvu
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -823,6 +956,7 @@ impl CampaignStore {
 
     /// 保存/覆盖某角色卡的 MVU 翻译（按 source_character_id 去重）
     pub fn save_mvu(&self, stored: StoredMvuTranslation) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
         let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
         mvu.retain(|m| m.source_character_id != stored.source_character_id);
         mvu.push(stored);
@@ -831,6 +965,7 @@ impl CampaignStore {
 
     /// 删某角色卡的 MVU 翻译（删卡时级联）
     pub fn delete_mvu(&self, source_character_id: &Id) -> Result<bool, String> {
+        self.ensure_json_write_allowed()?;
         let mut mvu = self.mvu.lock().unwrap_or_else(|p| p.into_inner());
         let before = mvu.len();
         mvu.retain(|m| m.source_character_id != *source_character_id);
@@ -987,6 +1122,17 @@ mod tests {
         store.save_card(card).unwrap();
         assert_eq!(store.list_cards().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disabled_store_never_exposes_or_writes_legacy_json_data() {
+        let store = CampaignStore::disabled();
+        let campaign = Campaign::new(Id::from_str("card-1"), "sqlite authority".to_string());
+
+        assert!(store.list_campaigns().is_empty());
+        assert!(store.get_campaign(&campaign.id).is_none());
+        assert!(store.save_campaign(campaign).is_err());
+        assert!(store.data_dir().is_none());
     }
 
     #[test]

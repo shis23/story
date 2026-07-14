@@ -6,8 +6,9 @@
 //! consulted and no dual-write occurs.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use storyforge_app_conversation::{ConversationError, ConversationPersistence};
 use storyforge_domain::Id;
 use storyforge_domain::campaign::Campaign;
 use storyforge_domain::conversation::Conversation;
@@ -20,8 +21,48 @@ use storyforge_infra_sqlite::production::{
 use storyforge_infra_sqlite::{current_version, migrate};
 
 /// Process-owned SQLite handle. Opened once when SQLite is selected.
-static SQLITE_DB: OnceLock<Mutex<Database>> = OnceLock::new();
+static SQLITE_DB: OnceLock<Arc<Mutex<Database>>> = OnceLock::new();
 static SQLITE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// SQLite-backed durable authority injected into `ConversationStore` when the
+/// opt-in backend is active. It makes the existing pipeline's user/draft/
+/// regenerate mutations write the same database used by Accept and recovery.
+#[derive(Clone)]
+pub struct SqliteConversationPersistence {
+    db: Arc<Mutex<Database>>,
+}
+
+impl SqliteConversationPersistence {
+    fn new(db: Arc<Mutex<Database>>) -> Self {
+        Self { db }
+    }
+}
+
+impl ConversationPersistence for SqliteConversationPersistence {
+    fn load_all(&self) -> Result<Vec<Conversation>, ConversationError> {
+        let db = self.db.lock().map_err(|_| {
+            ConversationError::ExternalStorage("sqlite database lock poisoned".into())
+        })?;
+        SqliteProductionRepository::list_conversations(&db)
+            .map_err(|error| ConversationError::ExternalStorage(error.to_string()))
+    }
+
+    fn save(&self, conversation: &Conversation) -> Result<(), ConversationError> {
+        let mut db = self.db.lock().map_err(|_| {
+            ConversationError::ExternalStorage("sqlite database lock poisoned".into())
+        })?;
+        SqliteProductionRepository::save_conversation(&mut db, conversation)
+            .map_err(|error| ConversationError::ExternalStorage(error.to_string()))
+    }
+
+    fn delete(&self, id: &Id) -> Result<(), ConversationError> {
+        let mut db = self.db.lock().map_err(|_| {
+            ConversationError::ExternalStorage("sqlite database lock poisoned".into())
+        })?;
+        SqliteProductionRepository::delete_conversation(&mut db, id)
+            .map_err(|error| ConversationError::ExternalStorage(error.to_string()))
+    }
+}
 
 /// Whether the process is running with SQLite as the authoritative backend.
 pub fn is_sqlite_active() -> bool {
@@ -42,9 +83,18 @@ pub fn activate(db_path: impl AsRef<Path>) -> Result<(), String> {
         .set(path)
         .map_err(|_| "sqlite path already set".to_string())?;
     SQLITE_DB
-        .set(Mutex::new(db))
+        .set(Arc::new(Mutex::new(db)))
         .map_err(|_| "sqlite database already set".to_string())?;
     Ok(())
+}
+
+/// Build the sole durable conversation authority for an SQLite process.
+pub fn conversation_persistence() -> Result<Arc<dyn ConversationPersistence>, String> {
+    let db = SQLITE_DB
+        .get()
+        .cloned()
+        .ok_or_else(|| "sqlite backend is not active".to_string())?;
+    Ok(Arc::new(SqliteConversationPersistence::new(db)))
 }
 
 fn with_db_mut<T>(f: impl FnOnce(&mut Database) -> Result<T, String>) -> Result<T, String> {
@@ -73,6 +123,10 @@ pub fn get_campaign(campaign_id: &Id) -> Result<Option<Campaign>, String> {
     })
 }
 
+pub fn list_campaigns() -> Result<Vec<Campaign>, String> {
+    with_db(|db| SqliteProductionRepository::list_campaigns(db).map_err(|e| e.to_string()))
+}
+
 pub fn get_conversation(conversation_id: &Id) -> Result<Option<Conversation>, String> {
     with_db(|db| {
         SqliteProductionRepository::get_conversation(db, conversation_id).map_err(|e| e.to_string())
@@ -85,6 +139,10 @@ pub fn get_turn_by_variant(variant_id: &Id) -> Result<Option<TurnRecord>, String
     })
 }
 
+pub fn get_turn(turn_id: &Id) -> Result<Option<TurnRecord>, String> {
+    with_db(|db| SqliteProductionRepository::get_turn(db, turn_id).map_err(|e| e.to_string()))
+}
+
 pub fn get_active_turn(campaign_id: &Id) -> Result<Option<TurnRecord>, String> {
     with_db(|db| {
         SqliteProductionRepository::get_active_turn(db, campaign_id).map_err(|e| e.to_string())
@@ -95,8 +153,78 @@ pub fn list_active_turns() -> Result<Vec<TurnRecord>, String> {
     with_db(|db| SqliteProductionRepository::list_active_turns(db).map_err(|e| e.to_string()))
 }
 
+pub fn list_instances(
+    campaign_id: &Id,
+) -> Result<Vec<storyforge_domain::campaign::CharacterInstance>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::list_instances(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn list_knowledge(
+    campaign_id: &Id,
+) -> Result<Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::list_knowledge(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn list_tasks(
+    campaign_id: &Id,
+) -> Result<Vec<storyforge_domain::story_task::StoryTask>, String> {
+    with_db(|db| SqliteProductionRepository::list_tasks(db, campaign_id).map_err(|e| e.to_string()))
+}
+
+pub fn list_summaries(
+    campaign_id: &Id,
+) -> Result<Vec<storyforge_domain::agent::RoundSummary>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::list_summaries(db, campaign_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn get_card_payload(card_id: &Id) -> Result<Option<serde_json::Value>, String> {
+    with_db(|db| {
+        SqliteProductionRepository::get_card_payload(db, card_id).map_err(|e| e.to_string())
+    })
+}
+
 pub fn save_turn(turn: &TurnRecord) -> Result<(), String> {
     with_db_mut(|db| SqliteProductionRepository::save_turn(db, turn).map_err(|e| e.to_string()))
+}
+
+/// Mutate a Turn under the same process-owned SQLite lock that guards all
+/// other runtime operations. This replaces the JSON `TurnStore` read/modify/
+/// write helpers in opt-in mode and prevents a silent fallback to JSON.
+pub fn update_turn_record<F>(turn_id: &Id, f: F) -> Result<(), String>
+where
+    F: FnOnce(&mut TurnRecord),
+{
+    with_db_mut(|db| {
+        let mut turn = SqliteProductionRepository::get_turn(db, turn_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("TurnRecord {turn_id} does not exist"))?;
+        f(&mut turn);
+        SqliteProductionRepository::save_turn(db, &turn).map_err(|e| e.to_string())
+    })
+}
+
+pub fn mutate_turn_if<P, M>(turn_id: &Id, predicate: P, mutate: M) -> Result<bool, String>
+where
+    P: FnOnce(&TurnRecord) -> bool,
+    M: FnOnce(&mut TurnRecord),
+{
+    with_db_mut(|db| {
+        let mut turn = SqliteProductionRepository::get_turn(db, turn_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("TurnRecord {turn_id} does not exist"))?;
+        if !predicate(&turn) {
+            return Ok(false);
+        }
+        mutate(&mut turn);
+        SqliteProductionRepository::save_turn(db, &turn).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
 }
 
 pub fn save_conversation(conversation: &Conversation) -> Result<(), String> {
@@ -139,6 +267,7 @@ pub fn accept_by_variant(
     let attempt = turn
         .attempts
         .iter()
+        .rev()
         .find(|a| a.variant_id == *variant_id)
         .cloned()
         .ok_or(AcceptError::NoAttempt)?;
@@ -155,6 +284,43 @@ pub fn accept_by_variant(
                 attempt.status
             )));
         }
+    }
+
+    // A retry after the SQLite UoW committed must reach the repository's
+    // mutation ledger unchanged. Do not re-prepare the Attempt: terminal
+    // records are no longer AwaitingAcceptance, but `accept_turn` can safely
+    // validate the persisted batch and return AlreadyCommitted.
+    if matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded) {
+        let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
+            AcceptError::Storage(format!(
+                "terminal turn {} has no persisted MutationBatch for replay",
+                turn.turn_id
+            ))
+        })?;
+        let terminal_status = turn.status.clone();
+        let outcome = with_db_mut(|db| {
+            let request = AcceptTurnRequest {
+                turn_id: &turn.turn_id,
+                attempt_id: &attempt.attempt_id,
+                draft_hash: &attempt.draft_hash,
+                batch: &batch,
+                terminal_status: terminal_status.clone(),
+            };
+            SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
+        })
+        .map_err(AcceptError::Commit)?;
+        debug_assert!(matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted));
+
+        return Ok(AcceptOutcome {
+            turn_id: turn.turn_id,
+            attempt_id: attempt.attempt_id,
+            turn_status: terminal_status.clone(),
+            attempt_status: AttemptStatus::Committed,
+            commit_as_degraded: terminal_status == TurnStatus::Degraded,
+            campaign_revision_before: batch.expected_revision,
+            campaign_revision_after: batch.target_revision,
+            batch,
+        });
     }
 
     // Quality gate: block errors unless force.
@@ -220,6 +386,37 @@ pub fn accept_by_variant(
     let turn_id = turn.turn_id.clone();
     let attempt_id = attempt.attempt_id.clone();
     let draft_hash = attempt.draft_hash.clone();
+
+    // `SqliteProductionRepository` intentionally verifies that the exact
+    // candidate batch was durable before it finalizes. Persist the batch
+    // generated by the app service first; otherwise an empty postprocess
+    // candidate (which still needs FinalizeVariant) is rejected and force
+    // Accept can never close a normal draft.
+    with_db_mut(|db| {
+        let mut current = SqliteProductionRepository::get_turn(db, &turn_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("turn {turn_id} disappeared before accept preparation"))?;
+        if current.status != TurnStatus::AwaitingAcceptance {
+            return Err(format!(
+                "turn {turn_id} changed to {:?} before accept preparation",
+                current.status
+            ));
+        }
+        let stored_attempt = current
+            .find_attempt_mut(&attempt_id)
+            .ok_or_else(|| format!("attempt {attempt_id} disappeared before accept preparation"))?;
+        if stored_attempt.status != AttemptStatus::AwaitingAcceptance
+            || stored_attempt.draft_hash != draft_hash
+        {
+            return Err(format!(
+                "attempt {attempt_id} changed before accept preparation"
+            ));
+        }
+        stored_attempt.pending_state_changes = Some(batch.clone());
+        current.touch();
+        SqliteProductionRepository::save_turn(db, &current).map_err(|e| e.to_string())
+    })
+    .map_err(AcceptError::Storage)?;
 
     let outcome = with_db_mut(|db| {
         let request = AcceptTurnRequest {

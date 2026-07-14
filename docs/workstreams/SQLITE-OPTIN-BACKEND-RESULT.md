@@ -99,6 +99,39 @@ remaining authoritative until the **marker is written last**:
 - `commit_turn_attempt` and `recover_turns_on_startup` branch on
   `sqlite_runtime::is_sqlite_active()` and **never fall back to JSON** when
   SQLite is authoritative.
+- In SQLite mode, `AppState` builds `ConversationStore` with the runtime
+  `ConversationPersistence` adapter. `prepare_start_conversation`,
+  `start_writing`, `regenerate`, variant edit/delete/switch, abandon, and
+  attempt mutations therefore read and write the same SQLite authority.
+  Persist failures are returned to the caller; a JSON shadow conversation is
+  not created.
+- `prepare_start_conversation` reads the selected campaign/conversation from
+  SQLite; `start_writing` obtains the SQLite campaign revision and persists the
+  new turn there; `regenerate` discovers and mutates its active attempt there.
+  Post-accept invalidates the in-process conversation cache so it cannot retain
+  a stale Draft after SQLite records the Final variant.
+- The SQLite context snapshot reads campaign, instances, knowledge, tasks,
+  summaries, card payload, and epoch state through the runtime boundary. The
+  JSON-only chronicle compressor and MVU fallback fragments are explicitly
+  skipped in SQLite mode rather than silently reading or writing JSON.
+- The campaign picker (`list_campaigns`, `get_campaign`, selection, and active
+  campaign lookup) reads SQLite after cutover. Selection is process-local in
+  SQLite mode until a SQLite-native preference record is added; it does not
+  read or write the legacy JSON authority pointer.
+- `CampaignStore` becomes a no-I/O disabled sentinel in SQLite mode. Any
+  unported JSON campaign read returns no legacy data and every mutation returns
+  an error, which prevents a forgotten command handler from creating a shadow
+  JSON write. Campaign creation and fork remain explicitly unavailable until
+  they have SQLite-native transactions.
+- `regenerate` verifies selected Campaign, requested conversation, and active
+  Turn scope *before* it invokes the pipeline mutation. SQLite Accept also
+  replays an already terminal request through its persisted mutation ledger
+  rather than trying to re-prepare a non-`AwaitingAcceptance` Attempt.
+- `sqlite_optin_lifecycle` performs a JSON-to-SQLite cutover, deletes the JSON
+  campaign/conversation/turn source, then exercises user message, draft,
+  regenerate, blocked normal Accept, scope rejection, force Accept, ledger
+  replay, picker lookup, and restart recovery against a freshly re-opened
+  SQLite database.
 - JSON remains the default path when the selector is unset.
 
 ## Cutover/rollback state machine
@@ -183,7 +216,7 @@ proves JSON remains authoritative and the temp DB is cleaned up:
 
 | Suite | Tests |
 | --- | --- |
-| Full tauri-app lib | 251 passed, 0 failed, 3 ignored |
+| Full tauri-app lib | 255 passed, 0 failed, 3 ignored |
 | `turn_lifecycle` | 22 passed |
 | `campaign_bundle` | 13 passed |
 | `storage_backend` | 4 passed |
@@ -194,10 +227,12 @@ proves JSON remains authoritative and the temp DB is cleaned up:
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
 | `cargo test -p storyforge-infra-sqlite` | PASS: 132 passed |
+| `cargo test -p storyforge-app-conversation` | PASS: 19 passed |
+| `cargo test -p storyforge --test sqlite_optin_lifecycle` | PASS: 1 passed |
 | `cargo test -p storyforge --lib turn_lifecycle` | PASS: 22 passed |
 | `cargo test -p storyforge --lib campaign_bundle` | PASS: 13 passed |
-| `cargo test -p storyforge --lib` | PASS: 251 passed, 3 ignored |
-| `cargo clippy -p storyforge-infra-sqlite -p storyforge --all-targets -- -D warnings` | PASS |
+| `cargo test -p storyforge --lib` | PASS: 255 passed, 3 ignored |
+| `cargo clippy -p storyforge-infra-sqlite -p storyforge-app-conversation -p storyforge --all-targets -- -D warnings` | PASS |
 | `git diff --check b46ddc8..HEAD` | PASS |
 
 ## Platform evidence
@@ -223,25 +258,45 @@ After initial implementation, an independent review closed the following gaps:
 4. **Marker verification**: `inspect_marker` re-opens the database and checks
    schema version + openability, not just file existence. A stale marker with
    a missing or corrupt database is rejected, not silently trusted.
+5. **Writing authority closure**: an external conversation load failure is
+   retryable and never becomes a permanently loaded empty cache; a failed
+   conversation mutation is rolled back/invalidated so a later save cannot
+   flush rejected draft text. The selected Campaign/picker now routes to
+   SQLite, JSON compress-job recovery is skipped, and cross-Campaign regenerate
+   is rejected before pipeline mutation.
+6. **Replay closure**: a terminal SQLite Accept reuses its durable
+   `MutationBatch` and enters the repository ledger replay path, rather than
+   failing the pre-write `AwaitingAcceptance` check.
+7. **Active Campaign isolation**: startup and context fallback share one
+   resolver that ignores `active_campaign.json` whenever SQLite is active. A
+   restart regression test writes a stale JSON pointer and proves SQLite uses
+   only an explicit in-process selection, while JSON mode retains its legacy
+   behavior.
 
 ## Default-backend proof
 
 - `StorageBackend::default() == Json`.
 - `resolve_backend` opens no database when JSON is selected.
 - `STORYFORGE_STORAGE_BACKEND` is the only override; unset → JSON.
-- No `tauri-app` command handler or store constructor was changed to use SQLite
-  at runtime — the wiring is additive (observable + verified, no runtime switch).
+- JSON-mode command handlers and stores retain their original behavior. SQLite
+  routing is activated only after an explicit, verified opt-in cutover and is
+  process-pinned for the lifetime of the app.
+- Any remaining legacy `CampaignStore` access is inert in SQLite mode: it
+  exposes no JSON-derived records and refuses writes, so there is no secondary
+  authority or fallback after cutover.
 - No JSON/SQLite dual-write: the cutover is a one-time atomic transition, and
   the marker is the sole authority indicator.
 - No original JSON or SQLite data is ever deleted automatically.
 
 ## Remaining risks
 
-1. **Draft pipeline path still largely JSON-shaped**: Accept / recovery /
-   active-turn barrier are SQLite-authoritative after opt-in, but many pre-accept
-   draft/write command handlers still construct JSON stores. Full end-to-end
-   draft creation under SQLite (append_ai_draft / postprocess mutate) needs a
-   follow-up store migration for every write path, not only Accept.
+1. **SQLite coverage is intentionally scoped to the writing lifecycle**:
+   campaign creation/fork and some non-writing UI CRUD paths have not been
+   migrated. They now fail closed through the disabled legacy store (creation
+   and fork also have explicit command guards); JSON-only MVU fallback and
+   chronicle compression are skipped rather than falling back to a JSON shadow
+   store. Those operations need dedicated SQLite-native implementations before
+   they can be enabled.
 2. **Concurrent import test flake**: `importer::tests::concurrent_same_manifest_converges_to_one_completed_run`
    can occasionally hit `SQLITE_BUSY` under high contention (busy_timeout=5000ms).
    Pre-existing timing issue; production uses busy_timeout retries.
