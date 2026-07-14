@@ -64,6 +64,15 @@ fn sanitize_label(value: &str) -> String {
         "credential",
         "bearer ",
         "sk-",
+        "token=",
+        "token:",
+        "cookie=",
+        "cookie:",
+        "set-cookie",
+        "secret=",
+        "secret:",
+        "prompt=",
+        "prompt:",
         "private prompt",
         "stack",
     ];
@@ -508,19 +517,23 @@ mod tests {
     #[test]
     fn redacted_constructor_strips_secret_like_labels() {
         let record = AuditRecord::redacted(AuditRecordInput {
-            plugin_id: "plugin-a".into(),
-            event: "CHAT_COMPLETION_PROMPT_READY".into(),
-            stage: "frontend_intent".into(),
+            plugin_id: "token=plugin-secret".into(),
+            event: "cookie=session-secret".into(),
+            stage: "prompt=private-prompt-body".into(),
             status: "ok".into(),
             duration_ms: 1,
             correlation_id: Some(CorrelationId::new("corr with SF_SECRET_x")),
-            generation_id: Some("api_key_should_go".into()),
-            changed_keys: vec!["Authorization".into(), "prompt".into()],
+            generation_id: Some("secret=must-not-serialize".into()),
+            changed_keys: vec!["Authorization".into(), "cookie=do-not-leak".into()],
             recorded_at_ms: 1,
         });
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("SF_SECRET_"));
-        assert!(!json.contains("api_key_should_go"));
+        assert!(!json.contains("plugin-secret"));
+        assert!(!json.contains("session-secret"));
+        assert!(!json.contains("private-prompt-body"));
+        assert!(!json.contains("must-not-serialize"));
+        assert!(!json.contains("do-not-leak"));
         assert!(!json.contains("Authorization"));
         assert!(
             record

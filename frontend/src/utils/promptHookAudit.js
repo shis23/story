@@ -600,17 +600,17 @@ export function verifyAuditRecordChain(records) {
 
 /**
  * Append one sanitized record only after verifying the persisted segment.
- * A completely uninitialized legacy list may be initialized once; partially
- * chained or corrupted records are never silently re-signed.
+ * Only an empty ring may initialize itself. A non-empty list without hashes is
+ * ambiguous (it could be a historical legacy list or a chain stripped by an
+ * attacker), so it is fail-closed rather than silently re-signed. Any future
+ * legacy migration must be explicit and versioned outside this append path.
  */
 export function appendAuditRecordWithIntegrity(records, record, limit = 100) {
   const rawExisting = Array.isArray(records) ? records : []
   const existing = rawExisting
     .map((entry) => preserveIntegrityMeta(entry, sanitizePromptHookAuditRecord(entry)))
-  // Distinguish truly legacy (no metadata properties at all) from malformed or
-  // partial integrity metadata. Sanitization may turn invalid hashes into null,
-  // but that must remain a fail-closed corruption signal rather than granting a
-  // silent re-chain.
+  // Sanitization may turn invalid hashes into null, but that must remain a
+  // fail-closed corruption signal rather than granting a silent re-chain.
   const hasAnyIntegrityMetadata = rawExisting.some((entry) => (
     entry
     && typeof entry === 'object'
@@ -619,7 +619,20 @@ export function appendAuditRecordWithIntegrity(records, record, limit = 100) {
       || Object.prototype.hasOwnProperty.call(entry, 'prevHash')
     )
   ))
-  const initialized = hasAnyIntegrityMetadata ? existing : chainAuditRecords(existing)
+  if (rawExisting.length > 0 && !hasAnyIntegrityMetadata) {
+    return {
+      records: existing,
+      integrity: {
+        valid: false,
+        recordCount: existing.length,
+        invalidIndex: 0,
+        reason: 'missing_integrity_metadata',
+        headHash: null,
+      },
+      appended: false,
+    }
+  }
+  const initialized = existing
   const integrity = verifyAuditRecordChain(initialized)
   if (!integrity.valid) {
     return { records: initialized, integrity, appended: false }

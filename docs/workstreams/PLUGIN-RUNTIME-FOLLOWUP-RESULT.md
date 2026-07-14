@@ -23,7 +23,8 @@ Did **not** claim full ST 99, real iframe/GUI acceptance, edit `tauri-app` / SQL
 | `e3e3a38` | Rust correlation/permission + audit inventory |
 | `e122b1c` | machine-readable + Markdown compatibility report |
 | `510052b` | PLUGIN-RUNTIME-FOLLOWUP-RESULT (initial) |
-| *(tip)* | review-fix: terminal-commit only, production wiring, honest integrity claims |
+| `dd3d470` | terminal-commit only, production wiring, bounded save retries, executable integrity checks |
+| *(tip)* | P1 follow-up: Accept de-duplication, fail-closed missing audit metadata, stricter Rust label redaction |
 
 ## Compatibility matrix
 
@@ -48,7 +49,7 @@ Report generators:
 
 1. **Terminal turn commit only for MESSAGE_* fan-out**
    A Draft completion emits only `GENERATION_ENDED` with `draft_ready`; it never emits `MESSAGE_RECEIVED`.
-   `handleAcceptVariant` is the frontend terminal source after the backend Accept succeeds. It emits exactly one `MESSAGE_RECEIVED` carrying `terminalTurnCommit`, terminal Turn/Attempt/Variant status, and force-accept/Degraded state; the host derives render/chat events from that one source. Bare `state_changed{Committed}` after `append_ai_draft` still does **not** fan out.
+   `handleAcceptVariant` is the frontend terminal source after the backend Accept succeeds. It coalesces concurrent normal/force Accepts and suppresses backend-idempotent replays per conversation/node/variant, then emits exactly one `MESSAGE_RECEIVED` carrying `terminalTurnCommit`, terminal Turn/Attempt/Variant status, and force-accept/Degraded state; the host derives render/chat events from that one source. Bare `state_changed{Committed}` after `append_ai_draft` still does **not** fan out.
 
 2. **Injectable saveChat adapter**
    Host route `chat.save` + `createSaveChatAdapter`. The host deduplicates same-snapshot in-flight and successful retries before the real persistence adapter runs. A 500ms iframe timeout resolves ST-compatibly but reports `persist_outcome_unknown` / `outcomeUnknown=true`; it does not claim a known local-only outcome. `await saveChat() === true` remains ST-compatible.
@@ -60,7 +61,7 @@ Report generators:
    `usePluginBridge` now passes generationId, correlationId, payload budget, and live permission resolver. `PluginHost` disables bridge-level timeout (`timeoutMs: null`) so the outer runtime owns timeout audits.
 
 5. **Audit path**
-   `recordPromptHookAudit` sanitizes and verifies the stored segment before appending. A corrupt chain is not silently re-chained. Export/query/pagination preserve safe timestamp/hash metadata and expose a verification verdict. FNV-1a is only a local accidental-corruption checksum (no trusted head, not cryptographic tamper evidence). No prompt bodies, secrets, or stacks. Rust `AuditRecord` fields are private and the type intentionally does not implement `Deserialize`.
+   `recordPromptHookAudit` sanitizes and verifies the stored segment before appending. A non-empty record list with missing/invalid integrity metadata is fail-closed rather than treated as legacy and re-chained; only an empty ring initializes a new chain. Export/query/pagination preserve safe timestamp/hash metadata and expose a verification verdict. FNV-1a is only a local accidental-corruption checksum (no trusted head, not cryptographic tamper evidence). No prompt bodies, secrets, or stacks. Rust `AuditRecord` fields are private, the type intentionally does not implement `Deserialize`, and secret-shaped token/cookie/prompt labels are redacted.
 
 6. **Slash**
    Unknown single commands return explicit unsupported objects; unknown pipe segments throw and stop later segments.
@@ -71,7 +72,7 @@ Report generators:
 
 ```text
 npm test
-# 305 passed
+# 308 passed
 
 npm run build
 # PASS

@@ -447,3 +447,24 @@ test('audit append treats malformed existing integrity metadata as corruption, n
   assert.equal(appendResult.integrity.valid, false)
   assert.equal(appendResult.integrity.reason, 'missing_record_hash')
 })
+
+test('audit append rejects a non-empty chain after all integrity metadata is stripped', () => {
+  const chained = chainAuditRecords([
+    baseRecord({ pluginId: 'one', recordedAt: 100 }),
+    baseRecord({ pluginId: 'two', recordedAt: 200 }),
+  ])
+  const strippedAndTampered = chained.map(({ recordHash, prevHash, ...record }, index) => ({
+    ...record,
+    status: index === 0 ? 'error' : record.status,
+  }))
+
+  const appendResult = appendAuditRecordWithIntegrity(
+    strippedAndTampered,
+    baseRecord({ pluginId: 'three', recordedAt: 300 }),
+  )
+
+  assert.equal(appendResult.appended, false)
+  assert.equal(appendResult.records.length, strippedAndTampered.length)
+  assert.equal(appendResult.integrity.valid, false)
+  assert.equal(appendResult.integrity.reason, 'missing_integrity_metadata')
+})

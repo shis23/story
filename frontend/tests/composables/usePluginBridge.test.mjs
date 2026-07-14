@@ -517,6 +517,79 @@ test('production write, discard, accept, and force-accept publish terminal messa
   assert.equal(forceAccepted[1].data.forceAccept, true)
 })
 
+test('concurrent and replayed accepts publish one terminal message event per variant', async () => {
+  const { writing, campaign } = setup()
+  campaign.currentConversationId = 'conv-accept-dedupe'
+  writing.messages = [{
+    id: 'accept-dedupe',
+    role: 'assistant',
+    active_variant: 0,
+    variants: [{ id: 'variant-dedupe', content: 'draft', status: 'draft' }],
+  }]
+  const events = []
+  const gates = []
+  let calls = 0
+  const variants = useMessageVariants({
+    acceptVariantApi: async () => {
+      calls += 1
+      await new Promise((resolve) => gates.push(resolve))
+    },
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload: (messageId, extra = {}) => ({ messageId, ...extra }),
+  })
+
+  const first = variants.handleAcceptVariant({ nodeId: 'accept-dedupe' })
+  const concurrent = variants.handleAcceptVariant({ nodeId: 'accept-dedupe' })
+  assert.equal(calls, 1, 'concurrent Accept calls must join one backend request')
+  gates.shift()()
+  await Promise.all([first, concurrent])
+  assert.equal(events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED).length, 1)
+
+  await variants.handleAcceptVariant({ nodeId: 'accept-dedupe' })
+  assert.equal(calls, 1, 'a backend-idempotent replay must not re-publish terminal events')
+  assert.equal(events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED).length, 1)
+
+  writing.messages[0].variants = [{ id: 'variant-force-dedupe', content: 'force draft', status: 'draft' }]
+  const forceFirst = variants.handleAcceptVariant({ nodeId: 'accept-dedupe', forceAccept: true })
+  const forceConcurrent = variants.handleAcceptVariant({ nodeId: 'accept-dedupe', forceAccept: true })
+  assert.equal(calls, 2, 'concurrent force Accept calls must also join one request')
+  gates.shift()()
+  await Promise.all([forceFirst, forceConcurrent])
+  assert.equal(events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED).length, 2)
+})
+
+test('a quality-gated normal Accept and its force retry publish one terminal event', async () => {
+  const { writing, campaign } = setup()
+  campaign.currentConversationId = 'conv-quality-retry'
+  writing.messages = [{
+    id: 'quality-retry',
+    role: 'assistant',
+    active_variant: 0,
+    variants: [{ id: 'variant-quality-retry', content: 'draft', status: 'draft' }],
+  }]
+  const events = []
+  const calls = []
+  const variants = useMessageVariants({
+    acceptVariantApi: async (_conversationId, _nodeId, forceAccept) => {
+      calls.push(forceAccept)
+      if (!forceAccept) throw new Error('force_accept required')
+    },
+    askForceAccept: async () => true,
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload: (messageId, extra = {}) => ({ messageId, ...extra }),
+  })
+
+  await Promise.all([
+    variants.handleAcceptVariant({ nodeId: 'quality-retry' }),
+    variants.handleAcceptVariant({ nodeId: 'quality-retry' }),
+  ])
+
+  assert.deepEqual(calls, [false, true])
+  const received = events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED)
+  assert.equal(received.length, 1)
+  assert.equal(received[0].data.turnStatus, 'Degraded')
+})
+
 test('default live-permission resolver revokes a plugin removed during the hook chain', async () => {
   const { plugin, bridge } = setup()
   const first = { id: 'first', permissions: ['ModifyPrompt'], manifest: { name: 'First' } }
