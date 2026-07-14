@@ -1885,6 +1885,86 @@ test('host saveChat route calls the injected persistence adapter', async () => {
   assert.equal(source.posted.at(-1).message.result.persistedAt, 'ts-1')
 })
 
+test('host saveChat route deduplicates a timed-out retry of the same chat snapshot', async () => {
+  let persistCalls = 0
+  let releasePersist
+  const adapter = createSaveChatAdapter({
+    persist() {
+      persistCalls += 1
+      return new Promise((resolve) => { releasePersist = resolve })
+    },
+  })
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  const makeEvent = (id) => ({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id,
+      method: 'chat.save',
+      params: { chat: [{ role: 'user', content: 'same snapshot' }] },
+    },
+    source: { posted: [], postMessage(message) { this.posted.push(message) } },
+    origin: 'https://plugin.example',
+  })
+  const first = makeEvent('save-first')
+  const retry = makeEvent('save-retry')
+
+  const firstPending = handler(first)
+  await Promise.resolve()
+  const retryPending = handler(retry)
+  await Promise.resolve()
+  assert.equal(persistCalls, 1)
+
+  releasePersist({ ok: true, persistedAt: 'ts-deduplicated' })
+  await Promise.all([firstPending, retryPending])
+  assert.equal(first.source.posted.at(-1).result.persistedAt, 'ts-deduplicated')
+  assert.equal(retry.source.posted.at(-1).result.persistedAt, 'ts-deduplicated')
+})
+
+test('host saveChat idempotency survives handler recreation with the same adapter', async () => {
+  let persistCalls = 0
+  let releasePersist
+  const adapter = createSaveChatAdapter({
+    persist() {
+      persistCalls += 1
+      return new Promise((resolve) => { releasePersist = resolve })
+    },
+  })
+  const makeHandler = () => createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  const makeEvent = (id) => ({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id,
+      method: 'chat.save',
+      params: { chat: [{ role: 'assistant', content: 'same snapshot after remount' }] },
+    },
+    source: { posted: [], postMessage(message) { this.posted.push(message) } },
+    origin: 'https://plugin.example',
+  })
+  const first = makeEvent('save-before-remount')
+  const retry = makeEvent('save-after-remount')
+
+  const firstPending = makeHandler()(first)
+  await Promise.resolve()
+  const retryPending = makeHandler()(retry)
+  await Promise.resolve()
+  assert.equal(persistCalls, 1)
+
+  releasePersist({ ok: true, persistedAt: 'ts-remount-safe' })
+  await Promise.all([firstPending, retryPending])
+  assert.equal(first.source.posted.at(-1).result.persistedAt, 'ts-remount-safe')
+  assert.equal(retry.source.posted.at(-1).result.persistedAt, 'ts-remount-safe')
+})
+
 test('host saveChat route falls back to degraded when no adapter is injected', async () => {
   const source = {
     posted: [],
@@ -1920,6 +2000,17 @@ test('iframe saveChat tries host persistence and preserves degraded promise when
   assert.equal(savePending.degraded, true)
   assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
   assert.equal(typeof savePending.then, 'function')
+})
+
+test('iframe saveChat timeout reports an unknown persistence outcome', async () => {
+  const { window } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const pending = window.SillyTavern.saveChat()
+
+  assert.equal(await pending, true)
+  assert.equal(pending.degraded, true)
+  assert.equal(pending.reason, 'persist_outcome_unknown')
+  assert.equal(pending.outcomeUnknown, true)
+  assert.equal(pending.persistedAt, null)
 })
 
 test('iframe saveChat resolves with persisted metadata when host acknowledges save', async () => {

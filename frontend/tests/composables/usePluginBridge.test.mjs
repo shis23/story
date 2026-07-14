@@ -5,10 +5,12 @@ import { createPinia, setActivePinia } from 'pinia'
 import { usePluginBridge } from '../../src/composables/usePluginBridge.js'
 import { usePipeline } from '../../src/composables/usePipeline.js'
 import { useWriting } from '../../src/composables/useWriting.js'
+import { useMessageVariants } from '../../src/composables/useMessageVariants.js'
 import { usePluginStore } from '../../src/stores/plugin.js'
 import { useWritingStore } from '../../src/stores/writing.js'
 import { useCampaignStore } from '../../src/stores/campaign.js'
 import { ST_EVENT_TYPES } from '../../src/plugin-bridge.js'
+import { chainAuditRecords } from '../../src/utils/promptHookAudit.js'
 
 // tauri-api.js reads window.__TAURI_INTERNALS__; Node tests need a stub.
 if (typeof globalThis.window === 'undefined') {
@@ -429,4 +431,157 @@ test('production prompt-hook path stamps correlation/generation and enforces bud
     plugin.promptHookAuditRecords[1].prevHash,
     plugin.promptHookAuditRecords[0].recordHash,
   )
+})
+
+test('production write, discard, accept, and force-accept publish terminal message events exactly once', async () => {
+  const { writing, campaign } = setup()
+  writing.activeConnection = { id: 'conn-1' }
+  campaign.activeCampaign = { id: 'campaign-1', name: 'Campaign' }
+  const events = []
+  const messageEventPayload = (messageId, extra = {}) => ({
+    messageId,
+    role: 'assistant',
+    ...extra,
+  })
+
+  const writingApi = useWriting({
+    startWritingApi: async () => ({
+      text: 'draft body',
+      conversation_id: 'conv-1',
+      node_id: 'draft-1',
+    }),
+    getConversationApi: async () => null,
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload,
+  })
+
+  await writingApi.startWriting('write a draft')
+  assert.equal(events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED).length, 0)
+  assert.equal(events.at(-1).event, ST_EVENT_TYPES.GENERATION_ENDED)
+  assert.equal(events.at(-1).data.reason, 'draft_ready')
+  assert.equal(writing.messages.find((message) => message.id === 'draft-1').variants[0].status, 'draft')
+
+  let deleteCalls = 0
+  const variants = useMessageVariants({
+    deleteMessageFromApi: async () => { deleteCalls += 1 },
+    getConversationApi: async () => null,
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload,
+  })
+  await variants.handleDeleteVariant({ nodeId: 'draft-1' })
+  assert.equal(deleteCalls, 1)
+  assert.equal(events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED).length, 0)
+
+  writing.messages = [{
+    id: 'accept-1',
+    role: 'assistant',
+    active_variant: 0,
+    variants: [{ id: 'variant-1', content: 'accepted', status: 'draft' }],
+  }]
+  let acceptCalls = 0
+  const acceptingVariants = useMessageVariants({
+    acceptVariantApi: async (_conversationId, _nodeId, forceAccept) => {
+      acceptCalls += 1
+      assert.equal(forceAccept, false)
+    },
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload,
+  })
+  await acceptingVariants.handleAcceptVariant({ nodeId: 'accept-1' })
+  const accepted = events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED)
+  assert.equal(acceptCalls, 1)
+  assert.equal(accepted.length, 1)
+  assert.equal(accepted[0].data.terminalTurnCommit, true)
+  assert.equal(accepted[0].data.turnStatus, 'Committed')
+  assert.equal(events.some((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_UPDATED && entry.data?.reason === 'accept_variant'), false)
+
+  writing.messages = [{
+    id: 'force-1',
+    role: 'assistant',
+    active_variant: 0,
+    variants: [{ id: 'variant-2', content: 'force accepted', status: 'draft' }],
+  }]
+  const forcedVariants = useMessageVariants({
+    acceptVariantApi: async (_conversationId, _nodeId, forceAccept) => {
+      acceptCalls += 1
+      assert.equal(forceAccept, true)
+    },
+    broadcastPluginEvent: (event, data) => events.push({ event, data }),
+    messageEventPayload,
+  })
+  await forcedVariants.handleAcceptVariant({ nodeId: 'force-1', forceAccept: true })
+  const forceAccepted = events.filter((entry) => entry.event === ST_EVENT_TYPES.MESSAGE_RECEIVED)
+  assert.equal(acceptCalls, 2)
+  assert.equal(forceAccepted.length, 2)
+  assert.equal(forceAccepted[1].data.turnStatus, 'Degraded')
+  assert.equal(forceAccepted[1].data.forceAccept, true)
+})
+
+test('default live-permission resolver revokes a plugin removed during the hook chain', async () => {
+  const { plugin, bridge } = setup()
+  const first = { id: 'first', permissions: ['ModifyPrompt'], manifest: { name: 'First' } }
+  const removed = { id: 'removed', permissions: ['ModifyPrompt'], manifest: { name: 'Removed' } }
+  plugin.hookPlugins = [first, removed]
+  let removedRan = false
+  plugin.setHookPluginHostRef('first', {
+    async emitPluginEventAndWait(_event, payload) {
+      plugin.hookPlugins = [first]
+      return { ...payload, prompt: `${payload.prompt} + first` }
+    },
+  })
+  plugin.setHookPluginHostRef('removed', {
+    async emitPluginEventAndWait() {
+      removedRan = true
+      throw new Error('a removed plugin must not run')
+    },
+  })
+
+  const result = await bridge.emitPromptHookEventAndWait(
+    ST_EVENT_TYPES.CHAT_COMPLETION_PROMPT_READY,
+    { prompt: 'base' },
+    'live_removal',
+  )
+
+  assert.deepEqual(result, { prompt: 'base + first' })
+  assert.equal(removedRan, false)
+  assert.deepEqual(
+    plugin.promptHookAuditRecords.map((record) => [record.pluginId, record.status]),
+    [['first', 'ok'], ['removed', 'revoked']],
+  )
+})
+
+test('live audit recorder refuses to overwrite a corrupted stored chain', () => {
+  const { plugin, bridge } = setup()
+  plugin.promptHookAuditRecords = chainAuditRecords([{
+    pluginId: 'audit-plugin',
+    pluginName: 'Audit Plugin',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    stage: 'frontend_intent',
+    status: 'ok',
+    durationMs: 1,
+    changedKeys: [],
+    inputSummary: {},
+    outputSummary: {},
+    error: null,
+    recordedAt: 100,
+  }])
+  plugin.promptHookAuditRecords[0].status = 'error'
+
+  const result = bridge.recordPromptHookAudit({
+    pluginId: 'audit-plugin',
+    pluginName: 'Audit Plugin',
+    event: 'CHAT_COMPLETION_PROMPT_READY',
+    stage: 'frontend_intent',
+    status: 'ok',
+    durationMs: 1,
+    changedKeys: [],
+    inputSummary: {},
+    outputSummary: {},
+    error: null,
+  })
+
+  assert.equal(result.appended, false)
+  assert.equal(result.integrity.valid, false)
+  assert.equal(result.integrity.invalidIndex, 0)
+  assert.equal(plugin.promptHookAuditRecords.length, 1)
 })

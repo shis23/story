@@ -235,11 +235,35 @@ pub const ST_EVENT_COMPAT_MATRIX: &[CompatEntry] = &[
         requires_permissions: &[],
     },
     CompatEntry {
+        id: "evt:TOOL_CALLS_RENDERED",
+        surface: "events",
+        name: "TOOL_CALLS_RENDERED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("agent_tool_rendering_not_exposed_to_st_plugins"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
         id: "evt:GROUP_UPDATED",
         surface: "events",
         name: "GROUP_UPDATED",
         status: CompatStatus::IntentionallyUnsupported,
         reason: Some("no_group_model"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GROUP_MEMBER_DRAFTED",
+        surface: "events",
+        name: "GROUP_MEMBER_DRAFTED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_group_draft_model"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GROUP_WRAPPER_FINISHED",
+        surface: "events",
+        name: "GROUP_WRAPPER_FINISHED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_group_wrapper_model"),
         requires_permissions: &[],
     },
     CompatEntry {
@@ -355,6 +379,18 @@ mod tests {
             unsupported_event_names().len(),
             INTENTIONALLY_UNSUPPORTED_ST_EVENTS.len()
         );
+    }
+
+    #[test]
+    fn every_unsupported_event_has_a_matching_matrix_row() {
+        for name in INTENTIONALLY_UNSUPPORTED_ST_EVENTS {
+            assert!(
+                ST_EVENT_COMPAT_MATRIX.iter().any(|entry| {
+                    entry.name == *name && entry.status == CompatStatus::IntentionallyUnsupported
+                }),
+                "missing intentionally unsupported matrix row for {name}"
+            );
+        }
     }
 
     #[test]

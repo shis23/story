@@ -12,15 +12,13 @@ import {
 } from '../plugin-bridge.js'
 import { logAppendFrontend, pluginPromptHookResult } from '../tauri-api.js'
 import {
-  appendPromptHookAuditRecord,
   createPromptHookCancelledError,
   emitPromptHookEventAndWaitForPlugins,
   resolveHookedIntent,
   resolveHookedMessages,
 } from '../utils/promptHooks.js'
 import {
-  chainAuditRecords,
-  retainAuditRecords,
+  appendAuditRecordWithIntegrity,
   sanitizePromptHookAuditRecord,
 } from '../utils/promptHookAudit.js'
 import { usePluginStore } from '../stores/plugin.js'
@@ -47,7 +45,9 @@ export function usePluginBridge() {
   // plugin's current declared permissions (so uninstall/disable can revoke).
   let getLivePluginPermissions = (hp) => {
     const live = (plugin.hookPlugins || []).find((item) => item?.id === hp?.id)
-    return live?.permissions || hp?.permissions || []
+    // A missing live entry means the plugin was removed or disabled while a
+    // hook chain was in flight. Never resurrect its install-time permissions.
+    return Array.isArray(live?.permissions) ? live.permissions : []
   }
 
   function setPromptHookTimeoutMs(timeoutMs) {
@@ -147,19 +147,21 @@ export function usePluginBridge() {
       recordedAt: Number.isFinite(record?.recordedAt) ? record.recordedAt : Date.now(),
     })
     // Append → re-sanitize → chain → retain so the live ring buffer always
-    // carries tamper-evident hashes without retaining raw prompts/secrets.
-    const appended = appendPromptHookAuditRecord(
+    // detects accidental corruption without retaining raw prompts/secrets.
+    const appendResult = appendAuditRecordWithIntegrity(
       plugin.promptHookAuditRecords,
       safeRecord,
       plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
     )
-    const chained = chainAuditRecords(appended)
-    plugin.promptHookAuditRecords = retainAuditRecords(
-      chained,
-      plugin.MAX_PROMPT_HOOK_AUDIT_RECORDS,
-    )
+    plugin.promptHookAuditRecords = appendResult.records
     const latest = plugin.promptHookAuditRecords[plugin.promptHookAuditRecords.length - 1]
-    logAppendFrontend('info', `prompt_hook_audit ${JSON.stringify(latest || safeRecord)}`).catch(() => {})
+    const integrity = appendResult.integrity
+    const level = appendResult.appended ? 'info' : 'warn'
+    const payload = appendResult.appended
+      ? latest || safeRecord
+      : { kind: 'prompt_hook_integrity', valid: integrity.valid, reason: integrity.reason, invalidIndex: integrity.invalidIndex }
+    logAppendFrontend(level, `prompt_hook_audit ${JSON.stringify(payload)}`).catch(() => {})
+    return appendResult
   }
 
   // ─── payload 构造(App.vue:187-213)──────────────────────────────────

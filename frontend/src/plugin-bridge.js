@@ -95,6 +95,17 @@ function deriveSillyTavernHostEventNames(eventName, data = {}) {
 }
 
 const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
+const HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER = new WeakMap()
+const MAX_DEDUPED_SAVE_CHAT_REQUESTS = 128
+
+function saveChatRequestsForAdapter(adapter) {
+  let requests = HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.get(adapter)
+  if (!requests) {
+    requests = new Map()
+    HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.set(adapter, requests)
+  }
+  return requests
+}
 
 function hostPluginStorageKey(pluginId, key) {
   return [
@@ -144,6 +155,25 @@ function writeHostPluginStorage(pluginId, key, value) {
     // Keep the fallback map updated even when host localStorage is unavailable.
   }
   HOST_PLUGIN_STORAGE_FALLBACK.set(storageKey, value)
+}
+
+// A bounded host-local key for idempotent chat persistence. It never leaves the
+// host or logs the chat body. Repeating the exact snapshot after an iframe
+// timeout joins the original in-flight persistence request instead of writing
+// it twice.
+function saveChatSnapshotKey(pluginId, chat) {
+  let snapshot = ''
+  try {
+    snapshot = JSON.stringify(chat ?? [])
+  } catch {
+    snapshot = '[unserializable-chat]'
+  }
+  let hash = 2166136261
+  for (let index = 0; index < snapshot.length; index += 1) {
+    hash ^= snapshot.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return `${String(pluginId)}:${(hash >>> 0).toString(16)}:${snapshot.length}`
 }
 
 // ─── 方法 → 权限 + Tauri 命令映射 ──────────────────────────────────────────
@@ -1086,6 +1116,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     pending.degraded = true;
     pending.reason = 'local_mirror_only_no_host_persist';
     pending.persistedAt = null;
+    pending.outcomeUnknown = false;
     return pending;
   }
 
@@ -1094,6 +1125,7 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     pending.degraded = Boolean(result?.degraded);
     pending.reason = result?.reason || null;
     pending.persistedAt = result?.persistedAt ?? null;
+    pending.outcomeUnknown = Boolean(result?.outcomeUnknown);
     return pending;
   }
 
@@ -1113,8 +1145,10 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     pending.degraded = true
     pending.reason = 'local_mirror_only_no_host_persist'
     pending.persistedAt = null
-    // Generation token: after a timed-out fallback, ignore late host success so
-    // retries cannot double-write when a previous saveChat later resolves.
+    pending.outcomeUnknown = false
+    // Generation token correlates this iframe call. Host-side snapshot
+    // idempotency owns durable retry safety; ignoring a late response alone is
+    // not enough to prevent a second persistence side effect.
     const generation = String(++_reqId) + ':saveChat'
 
     const finish = function(result) {
@@ -1124,15 +1158,17 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
       resolveSave(true)
     }
 
-    // Bounded wait for the host adapter. The default host route always
-    // answers; if it does not (or the host crashed), fall back to degraded.
+    // A timeout means persistence may still complete at the host. Preserve ST's
+    // truthy await contract, but expose outcome_unknown instead of claiming a
+    // known local-only fallback.
     const timer = setTimeout(function() {
       finish({
-        ok: true,
+        ok: false,
         degraded: true,
-        reason: 'local_mirror_only_no_host_persist',
+        reason: 'persist_outcome_unknown',
         persistedAt: null,
         timedOut: true,
+        outcomeUnknown: true,
         generation: generation,
       })
     }, 500)
@@ -1671,6 +1707,34 @@ export function createHostHandler(plugin, invoke, options = {}) {
     popup: options.popupAdapter,
     requestHeaders: options.requestHeadersAdapter,
   })
+  const saveChatAdapter = defaultAdapters.saveChat
+  // The injected adapter can survive a PluginHost remount. Bind its idempotency
+  // map to that adapter rather than the short-lived message handler closure.
+  const saveChatRequests = saveChatRequestsForAdapter(saveChatAdapter)
+
+  function persistChatIdempotently(params) {
+    const key = saveChatSnapshotKey(plugin.id, params?.chat)
+    const existing = saveChatRequests.get(key)
+    if (existing) return existing
+
+    const pending = Promise.resolve()
+      .then(() => saveChatAdapter.saveChat({ pluginId: plugin.id, ...(params || {}) }))
+    saveChatRequests.set(key, pending)
+    while (saveChatRequests.size > MAX_DEDUPED_SAVE_CHAT_REQUESTS) {
+      const oldest = saveChatRequests.keys().next().value
+      if (oldest === undefined) break
+      saveChatRequests.delete(oldest)
+    }
+    pending.then(
+      (result) => {
+        // Failed/degraded outcomes may be retried. Successful outcomes remain
+        // cached so a retry after a lost/late response cannot double-write.
+        if (result?.ok !== true || result?.degraded) saveChatRequests.delete(key)
+      },
+      () => saveChatRequests.delete(key),
+    )
+    return pending
+  }
 
   return async function handleMessage(event) {
     if (!isTrustedSource(event)) return
@@ -1709,15 +1773,10 @@ export function createHostHandler(plugin, invoke, options = {}) {
       return
     }
     if (data.method === 'chat.save') {
-      // Deterministic host-side persistence adapter. No backend command and no
-      // plugin permission gate: the adapter itself enforces the contract.
-      // Generation tokens let timed-out iframe callers ignore late host success
-      // without blocking a later explicit retry under a new generation.
-      const saveChatAdapter = options.saveChatAdapter || defaultAdapters.saveChat
+      // Every same-snapshot retry joins this host-local promise. This protects
+      // the actual durable adapter, not just the iframe's late UI response.
       try {
-        const result = await saveChatAdapter.saveChat(
-          { pluginId: plugin.id, ...(data.params || {}) },
-        )
+        const result = await persistChatIdempotently(data.params || {})
         postResponse(event, {
           type: MSG_RESPONSE,
           id: data.id,

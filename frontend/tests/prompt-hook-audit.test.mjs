@@ -4,9 +4,13 @@ import {
   exportPromptHookAudit,
   parsePromptHookAuditExport,
   queryPromptHookAudit,
+  queryPromptHookAuditWithIntegrity,
   paginateAuditRecords,
+  paginateAuditRecordsWithIntegrity,
   computeAuditRecordHash,
   chainAuditRecords,
+  verifyAuditRecordChain,
+  appendAuditRecordWithIntegrity,
   retainAuditRecords,
 } from '../src/utils/promptHookAudit.js'
 
@@ -152,7 +156,7 @@ test('export metadata is always present', () => {
   assert.ok(parsed.exportedAt.length > 0)
   assert.equal(parsed.kind, 'prompt_hook_audit_export')
   assert.deepEqual(parsed.schema.identity, ['pluginId', 'pluginName', 'event', 'stage'])
-  assert.deepEqual(parsed.schema.timing, ['durationMs'])
+  assert.deepEqual(parsed.schema.timing, ['durationMs', 'recordedAt'])
   assert.ok(parsed.schema.guarantees.includes('no_full_prompt_bodies'))
   assert.ok(parsed.schema.guarantees.includes('no_api_keys_or_secrets'))
 })
@@ -387,4 +391,59 @@ test('query and pagination re-sanitize hostile records at the boundary', () => {
   assert.equal(json.includes('private prompt body'), false)
   assert.equal(json.includes('SF_SECRET_'), false)
   assert.equal(json.includes('raw prompt text in summary'), false)
+})
+
+test('audit export, query, and pagination preserve safe integrity metadata and report verification', () => {
+  const chained = chainAuditRecords([
+    baseRecord({ pluginId: 'one', recordedAt: 100 }),
+    baseRecord({ pluginId: 'two', recordedAt: 200 }),
+  ])
+  const exported = parsePromptHookAuditExport(exportPromptHookAudit(chained))
+  const queried = queryPromptHookAudit(chained, { pluginId: 'two' })
+  const paged = paginateAuditRecords(chained, { orderBy: 'recordedAt', order: 'asc' })
+  const verifiedQuery = queryPromptHookAuditWithIntegrity(chained, { pluginId: 'two' })
+  const verifiedPage = paginateAuditRecordsWithIntegrity(chained, { orderBy: 'recordedAt', order: 'asc' })
+
+  assert.equal(exported.integrity.valid, true)
+  assert.equal(exported.records[0].recordedAt, 100)
+  assert.equal(exported.records[1].prevHash, exported.records[0].recordHash)
+  assert.equal(queried[0].recordHash, chained[1].recordHash)
+  assert.equal(queried[0].prevHash, chained[1].prevHash)
+  assert.equal(paged[0].recordedAt, 100)
+  assert.equal(paged[1].recordHash, chained[1].recordHash)
+  assert.equal(verifiedQuery.integrity.valid, true)
+  assert.equal(verifiedPage.integrity.valid, true)
+})
+
+test('audit verification detects stored corruption and append refuses to silently re-chain it', () => {
+  const chained = chainAuditRecords([
+    baseRecord({ pluginId: 'one', recordedAt: 100 }),
+    baseRecord({ pluginId: 'two', recordedAt: 200 }),
+  ])
+  const corrupted = chained.map((record) => ({ ...record }))
+  corrupted[0].status = 'error'
+
+  const verification = verifyAuditRecordChain(corrupted)
+  const appendResult = appendAuditRecordWithIntegrity(corrupted, baseRecord({ pluginId: 'three', recordedAt: 300 }))
+
+  assert.equal(verification.valid, false)
+  assert.equal(verification.invalidIndex, 0)
+  assert.equal(appendResult.appended, false)
+  assert.equal(appendResult.records.length, corrupted.length)
+  assert.equal(appendResult.integrity.valid, false)
+})
+
+test('audit append treats malformed existing integrity metadata as corruption, not legacy input', () => {
+  const malformed = [
+    { ...baseRecord({ recordedAt: 100 }), recordHash: 'not-a-valid-hash', prevHash: null },
+  ]
+
+  const appendResult = appendAuditRecordWithIntegrity(
+    malformed,
+    baseRecord({ pluginId: 'new', recordedAt: 200 }),
+  )
+
+  assert.equal(appendResult.appended, false)
+  assert.equal(appendResult.integrity.valid, false)
+  assert.equal(appendResult.integrity.reason, 'missing_record_hash')
 })

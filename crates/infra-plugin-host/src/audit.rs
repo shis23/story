@@ -2,7 +2,7 @@
 //!
 //! This module stays free of SQLite / tauri-app storage. It provides:
 //! - redacted audit records with no prompt bodies or secrets
-//! - tamper-evident record hashes + chain metadata
+//! - local integrity hashes + chain metadata (not a cryptographic seal)
 //! - query / filter / pagination / retention
 //! - correlation ids for asynchronous plugin operations
 
@@ -28,24 +28,26 @@ impl CorrelationId {
 ///
 /// Never stores raw prompts, messages, credentials, or stacks. Prefer
 /// [`AuditRecord::redacted`] so free-form secret-bearing strings cannot be
-/// stuffed into identity fields by accident.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// stuffed into identity fields by accident. Fields are private and this type
+/// deliberately does not implement `Deserialize`, so untrusted JSON cannot
+/// bypass the redacting constructor.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AuditRecord {
-    pub plugin_id: String,
-    pub event: String,
-    pub stage: String,
-    pub status: String,
-    pub duration_ms: u64,
-    pub correlation_id: Option<CorrelationId>,
-    pub generation_id: Option<String>,
+    plugin_id: String,
+    event: String,
+    stage: String,
+    status: String,
+    duration_ms: u64,
+    correlation_id: Option<CorrelationId>,
+    generation_id: Option<String>,
     /// Summary only — never raw content.
-    pub changed_keys: Vec<String>,
-    pub recorded_at_ms: u64,
+    changed_keys: Vec<String>,
+    recorded_at_ms: u64,
     /// Integrity hash over sanitized fields. Populated by [`chain_audit_records`].
     /// FNV-1a 32-bit: accidental-corruption detection only, not a crypto seal.
-    pub record_hash: Option<String>,
+    record_hash: Option<String>,
     /// Previous record hash in the chain. Populated by [`chain_audit_records`].
-    pub prev_hash: Option<String>,
+    prev_hash: Option<String>,
 }
 
 fn sanitize_label(value: &str) -> String {
@@ -79,8 +81,8 @@ fn sanitize_label(value: &str) -> String {
 
 fn sanitize_status(value: &str) -> String {
     match value {
-        "ok" | "no_change" | "timeout" | "cancelled" | "error" | "audit_error"
-        | "missing_host" | "unloaded" | "revoked" | "budget_exceeded" => value.to_string(),
+        "ok" | "no_change" | "timeout" | "cancelled" | "error" | "audit_error" | "missing_host"
+        | "unloaded" | "revoked" | "budget_exceeded" => value.to_string(),
         _ => "audit_error".to_string(),
     }
 }
@@ -124,6 +126,63 @@ impl AuditRecord {
             prev_hash: None,
         }
     }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
+    pub fn stage(&self) -> &str {
+        &self.stage
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
+    pub fn correlation_id(&self) -> Option<&CorrelationId> {
+        self.correlation_id.as_ref()
+    }
+
+    pub fn generation_id(&self) -> Option<&str> {
+        self.generation_id.as_deref()
+    }
+
+    pub fn changed_keys(&self) -> &[String] {
+        &self.changed_keys
+    }
+
+    pub fn recorded_at_ms(&self) -> u64 {
+        self.recorded_at_ms
+    }
+
+    pub fn record_hash(&self) -> Option<&str> {
+        self.record_hash.as_deref()
+    }
+
+    pub fn prev_hash(&self) -> Option<&str> {
+        self.prev_hash.as_deref()
+    }
+}
+
+/// Result of checking a stored local audit-chain segment.
+///
+/// FNV-1a only detects accidental mutation or reordering. This result must not
+/// be presented as a cryptographic tamper-proof guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditChainVerification {
+    pub valid: bool,
+    pub record_count: usize,
+    pub invalid_index: Option<usize>,
+    pub reason: Option<&'static str>,
+    pub head_hash: Option<String>,
 }
 
 /// Query filters for audit records.
@@ -230,6 +289,53 @@ pub fn chain_audit_records(records: &[AuditRecord]) -> Vec<AuditRecord> {
     out
 }
 
+/// Verify the hashes and links already stored in an audit-chain segment.
+///
+/// The first record may retain a `prev_hash` from an older entry removed by
+/// bounded retention; its own hash is still verifiable against that anchor.
+/// This function intentionally never re-chains or mutates its input.
+pub fn verify_audit_record_chain(records: &[AuditRecord]) -> AuditChainVerification {
+    let mut previous_hash: Option<String> = None;
+    for (index, record) in records.iter().enumerate() {
+        let Some(record_hash) = record.record_hash.as_deref() else {
+            return AuditChainVerification {
+                valid: false,
+                record_count: records.len(),
+                invalid_index: Some(index),
+                reason: Some("missing_record_hash"),
+                head_hash: previous_hash,
+            };
+        };
+        if index > 0 && record.prev_hash.as_deref() != previous_hash.as_deref() {
+            return AuditChainVerification {
+                valid: false,
+                record_count: records.len(),
+                invalid_index: Some(index),
+                reason: Some("previous_hash_mismatch"),
+                head_hash: previous_hash,
+            };
+        }
+        let expected = compute_audit_record_hash(record, record.prev_hash.as_deref());
+        if record_hash != expected {
+            return AuditChainVerification {
+                valid: false,
+                record_count: records.len(),
+                invalid_index: Some(index),
+                reason: Some("record_hash_mismatch"),
+                head_hash: previous_hash,
+            };
+        }
+        previous_hash = Some(record_hash.to_string());
+    }
+    AuditChainVerification {
+        valid: true,
+        record_count: records.len(),
+        invalid_index: None,
+        reason: None,
+        head_hash: previous_hash,
+    }
+}
+
 /// Filter audit records.
 pub fn query_audit_records(records: &[AuditRecord], query: &AuditQuery) -> Vec<AuditRecord> {
     records
@@ -324,13 +430,13 @@ pub fn paginate_audit_records(records: &[AuditRecord], page: &AuditPage) -> Vec<
             AuditOrderBy::Event => a.event.cmp(&b.event),
             AuditOrderBy::Status => a.status.cmp(&b.status),
         };
-        if page.descending {
-            ord.reverse()
-        } else {
-            ord
-        }
+        if page.descending { ord.reverse() } else { ord }
     });
-    sorted.into_iter().skip(page.offset).take(page.limit).collect()
+    sorted
+        .into_iter()
+        .skip(page.offset)
+        .take(page.limit)
+        .collect()
 }
 
 /// Keep the most recent `limit` records (by recorded_at_ms), preserving
@@ -345,8 +451,11 @@ pub fn retain_audit_records(records: &[AuditRecord], limit: usize) -> Vec<AuditR
             .cmp(&a.1.recorded_at_ms)
             .then_with(|| b.0.cmp(&a.0))
     });
-    let keep: std::collections::HashSet<usize> =
-        indexed.into_iter().take(limit).map(|(idx, _)| idx).collect();
+    let keep: std::collections::HashSet<usize> = indexed
+        .into_iter()
+        .take(limit)
+        .map(|(idx, _)| idx)
+        .collect();
     records
         .iter()
         .enumerate()
@@ -372,10 +481,7 @@ pub fn ensure_live_permission(
 }
 
 /// Next correlation id from a monotonic counter map keyed by plugin id.
-pub fn next_correlation_id(
-    counters: &mut HashMap<String, u64>,
-    plugin_id: &str,
-) -> CorrelationId {
+pub fn next_correlation_id(counters: &mut HashMap<String, u64>, plugin_id: &str) -> CorrelationId {
     let entry = counters.entry(plugin_id.to_string()).or_insert(0);
     *entry = entry.saturating_add(1);
     CorrelationId::new(format!("{plugin_id}:{entry}"))
@@ -416,7 +522,12 @@ mod tests {
         assert!(!json.contains("SF_SECRET_"));
         assert!(!json.contains("api_key_should_go"));
         assert!(!json.contains("Authorization"));
-        assert!(record.changed_keys.iter().all(|key| !key.contains("Authorization")));
+        assert!(
+            record
+                .changed_keys
+                .iter()
+                .all(|key| !key.contains("Authorization"))
+        );
     }
 
     #[test]
@@ -450,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_a_mutated_stored_chain_without_rechaining_it() {
+        let records = chain_audit_records(&[sample("p1", 100, "ok"), sample("p2", 200, "ok")]);
+        let mut tampered = records.clone();
+        tampered[0].status = "error".into();
+
+        let verification = verify_audit_record_chain(&tampered);
+        assert!(!verification.valid);
+        assert_eq!(verification.invalid_index, Some(0));
+    }
+
+    #[test]
     fn query_and_pagination_are_deterministic() {
         let records = vec![
             sample("zeta", 300, "ok"),
@@ -476,7 +598,9 @@ mod tests {
             },
         );
         assert_eq!(
-            page.iter().map(|r| r.plugin_id.as_str()).collect::<Vec<_>>(),
+            page.iter()
+                .map(|r| r.plugin_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["alpha", "mid"]
         );
     }
@@ -519,7 +643,13 @@ mod tests {
     fn audit_records_never_hold_secret_fields() {
         let record = sample("p1", 1, "ok");
         let json = serde_json::to_string(&record).unwrap();
-        for banned in ["api_key", "Authorization", "SF_SECRET_", "private prompt", "stack"] {
+        for banned in [
+            "api_key",
+            "Authorization",
+            "SF_SECRET_",
+            "private prompt",
+            "stack",
+        ] {
             assert!(!json.contains(banned), "audit record leaked {banned}");
         }
     }

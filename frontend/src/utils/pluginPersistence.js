@@ -128,6 +128,7 @@ export function classifySaveChatResult(result) {
   pending.reason = result?.reason || null
   pending.cancelled = Boolean(result?.cancelled)
   pending.persistedAt = result?.persistedAt ?? null
+  pending.outcomeUnknown = Boolean(result?.outcomeUnknown)
   return pending
 }
 

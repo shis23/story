@@ -33,11 +33,11 @@ Executable frontend matrix totals after follow-up:
 |--------|------:|
 | total | 88 |
 | implemented | 52 |
-| alias | 10 |
+| alias | 9 |
 | derived | 3 |
 | shim | 5 |
 | degraded | 4 |
-| intentionally_unsupported | 10 |
+| intentionally_unsupported | 11 |
 | noop | 4 |
 
 Report generators:
@@ -47,11 +47,11 @@ Report generators:
 ### Key behavior changes
 
 1. **Terminal turn commit only for MESSAGE_* fan-out**
-   Only `pipeline.committed` or payloads with explicit terminal markers (`terminalTurnCommit` / turn+attempt Final) map to `MESSAGE_RECEIVED|CHARACTER_MESSAGE_RENDERED|CHAT_CHANGED`.
-   Bare `state_changed{Committed}` after `append_ai_draft` does **not** fan out, because the variant is still Draft and may be discarded.
+   A Draft completion emits only `GENERATION_ENDED` with `draft_ready`; it never emits `MESSAGE_RECEIVED`.
+   `handleAcceptVariant` is the frontend terminal source after the backend Accept succeeds. It emits exactly one `MESSAGE_RECEIVED` carrying `terminalTurnCommit`, terminal Turn/Attempt/Variant status, and force-accept/Degraded state; the host derives render/chat events from that one source. Bare `state_changed{Committed}` after `append_ai_draft` still does **not** fan out.
 
 2. **Injectable saveChat adapter**
-   Host route `chat.save` + `createSaveChatAdapter`. Iframe tries host first; 500ms timeout falls back to degraded local mirror. Late host success after timeout cannot rewrite the settled promise (generation token). `await saveChat() === true` remains ST-compatible.
+   Host route `chat.save` + `createSaveChatAdapter`. The host deduplicates same-snapshot in-flight and successful retries before the real persistence adapter runs. A 500ms iframe timeout resolves ST-compatibly but reports `persist_outcome_unknown` / `outcomeUnknown=true`; it does not claim a known local-only outcome. `await saveChat() === true` remains ST-compatible.
 
 3. **Popup / request headers adapters**
    Host routes `ui.popup` / `ui.requestHeaders` with short timeouts so missing handlers never hang. Headers redact Authorization / X-ApiKey / Proxy-Authorization / cookie variants.
@@ -60,7 +60,7 @@ Report generators:
    `usePluginBridge` now passes generationId, correlationId, payload budget, and live permission resolver. `PluginHost` disables bridge-level timeout (`timeoutMs: null`) so the outer runtime owns timeout audits.
 
 5. **Audit path**
-   `recordPromptHookAudit` sanitizes, chains, and retains records in the live store. Integrity hashes are FNV-1a local corruption detection (no trusted head / not a crypto seal). No prompt bodies, secrets, or stacks.
+   `recordPromptHookAudit` sanitizes and verifies the stored segment before appending. A corrupt chain is not silently re-chained. Export/query/pagination preserve safe timestamp/hash metadata and expose a verification verdict. FNV-1a is only a local accidental-corruption checksum (no trusted head, not cryptographic tamper evidence). No prompt bodies, secrets, or stacks. Rust `AuditRecord` fields are private and the type intentionally does not implement `Deserialize`.
 
 6. **Slash**
    Unknown single commands return explicit unsupported objects; unknown pipe segments throw and stop later segments.
@@ -71,7 +71,7 @@ Report generators:
 
 ```text
 npm test
-# 295 passed
+# 305 passed
 
 npm run build
 # PASS
@@ -82,7 +82,7 @@ npm run build
 ```text
 CARGO_TARGET_DIR=C:\tmp\storyforge-parallel-target
 cargo test -p storyforge-infra-plugin-host
-# 25 passed
+# 27 passed
 
 cargo clippy -p storyforge-infra-plugin-host --all-targets -- -D warnings
 # PASS
@@ -107,14 +107,15 @@ git diff --check
 
 | Check | Result |
 |------|--------|
-| Draft state_changed does not emit MESSAGE_* | PASS (terminal markers only) |
+| Draft write/Discard does not emit MESSAGE_RECEIVED | PASS (production composable path) |
+| Accept / force Accept emits one terminal MESSAGE_RECEIVED | PASS (production composable path) |
 | Production budget/revocation/correlation wired | PASS via usePluginBridge |
 | Bridge/outer double-timeout no longer masks timeout as ok | PASS (`timeoutMs: null` in PluginHost; bridge timeout rejects) |
 | Header redaction covers X-ApiKey / Proxy-Authorization | PASS |
-| saveChat late success after timeout ignored | PASS |
-| Audit chain/query/retention on live path | PASS in recordPromptHookAudit |
-| Integrity claim honesty | FNV-1a local chain only, not crypto tamper-evidence |
-| Rust AuditRecord secret-safe constructor | PASS (`AuditRecord::redacted`) |
+| saveChat timeout/retry cannot double-write adapter | PASS (host snapshot idempotency) |
+| Audit chain/query/page on live path | PASS (verify before append; no silent re-chain) |
+| Integrity claim honesty | FNV-1a local accidental-corruption checksum only, not crypto tamper evidence |
+| Rust AuditRecord construction/deserialization boundary | PASS (private fields + `AuditRecord::redacted`; no `Deserialize`) |
 
 ## Remaining degraded / unsupported / noop
 
@@ -138,7 +139,7 @@ git diff --check
 ## Risks
 
 1. Real third-party iframe + Tauri IPC still only mock/Node deterministic coverage.
-2. Production Accept path must emit `pipeline.committed` or terminal markers; draft state_changed alone will not notify ST message listeners.
+2. Frontend terminal fan-out is covered, but real third-party iframe side effects still need manual GUI acceptance.
 3. saveChat default remains degraded until a real host adapter is injected outside tauri-app storage.
 4. Audit integrity hashes are not cryptographic evidence.
 5. Not full ST 99; release copy must stay honest.
@@ -147,4 +148,4 @@ git diff --check
 
 **Recommend merge after this review-fix.**
 
-The critical Accept/Discard safety bug is fixed, production wiring for budget/revocation/correlation/audit chain is in place, timeout classification is honest, and claims no longer overstate integrity guarantees. Remaining risk is real GUI/third-party plugin hand testing, not this slice's gate health.
+The critical Accept/Discard safety bug is fixed, production wiring for budget/revocation/correlation/audit chain is in place, saveChat persistence retry behavior is bounded and honest, and claims no longer overstate integrity guarantees. Remaining risk is real GUI/third-party plugin hand testing, not this slice's gate health.

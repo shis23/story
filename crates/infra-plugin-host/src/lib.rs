@@ -14,9 +14,10 @@ pub mod compat_matrix;
 pub mod mvu_runtime;
 
 pub use audit::{
-    AuditOrderBy, AuditPage, AuditQuery, AuditRecord, AuditRecordInput, CorrelationId,
-    chain_audit_records, compute_audit_record_hash, ensure_live_permission, next_correlation_id,
-    paginate_audit_records, query_audit_records, retain_audit_records,
+    AuditChainVerification, AuditOrderBy, AuditPage, AuditQuery, AuditRecord, AuditRecordInput,
+    CorrelationId, chain_audit_records, compute_audit_record_hash, ensure_live_permission,
+    next_correlation_id, paginate_audit_records, query_audit_records, retain_audit_records,
+    verify_audit_record_chain,
 };
 pub use compat_matrix::{
     CompatEntry, CompatStatus, INTENTIONALLY_UNSUPPORTED_ST_EVENTS, PERMISSION_COMPAT_MATRIX,

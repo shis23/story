@@ -112,6 +112,24 @@ function sanitizeHash(value) {
   return /^[a-f0-9]{8,64}$/i.test(text) ? text : hashString(text)
 }
 
+function sanitizeIntegrityHash(value) {
+  try {
+    const text = String(value ?? '')
+    return /^[a-f0-9]{8,64}$/i.test(text) ? text.toLowerCase() : null
+  } catch {
+    return null
+  }
+}
+
+function sanitizeRecordedAt(value) {
+  try {
+    const number = Number(value)
+    return Number.isSafeInteger(number) && number >= 0 ? number : null
+  } catch {
+    return null
+  }
+}
+
 function sanitizeLength(value) {
   const number = Number(value)
   if (!Number.isSafeInteger(number) || number < 0) return 0
@@ -311,6 +329,12 @@ export function sanitizePromptHookAuditRecord(record) {
     error: sanitizeError(record.error),
     correlationId: sanitizeCorrelationId(record.correlationId || ''),
     generationId: sanitizeCorrelationId(record.generationId || ''),
+    // Integrity metadata is safe structured data. Preserve it at every
+    // sanitizer boundary so export/query/pagination can be independently
+    // checked without carrying raw prompt material.
+    recordedAt: sanitizeRecordedAt(record.recordedAt),
+    recordHash: sanitizeIntegrityHash(record.recordHash),
+    prevHash: record.prevHash === null ? null : sanitizeIntegrityHash(record.prevHash),
   }
 }
 
@@ -322,17 +346,19 @@ export function sanitizePromptHookAuditRecord(record) {
  */
 export function exportPromptHookAudit(records) {
   const safeRecords = Array.isArray(records)
-    ? records.map((record) => sanitizePromptHookAuditRecord(record))
+    ? records.map((record) => preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record)))
     : []
+  const integrity = verifyAuditRecordChain(safeRecords)
   return JSON.stringify(
     {
       exportedAt: new Date().toISOString(),
       kind: 'prompt_hook_audit_export',
       schema: {
         identity: ['pluginId', 'pluginName', 'event', 'stage'],
-        timing: ['durationMs'],
+        timing: ['durationMs', 'recordedAt'],
         outcome: ['status', 'changedKeys', 'error'],
         redaction: ['inputSummary', 'outputSummary'],
+        integrity: ['recordHash', 'prevHash'],
         guarantees: [
           'no_full_prompt_bodies',
           'no_private_memory_text',
@@ -341,6 +367,7 @@ export function exportPromptHookAudit(records) {
         ],
       },
       totalRecords: safeRecords.length,
+      integrity,
       records: safeRecords,
     },
     null,
@@ -381,6 +408,7 @@ const HASHABLE_AUDIT_FIELDS = Object.freeze([
   'error',
   'correlationId',
   'generationId',
+  'recordedAt',
 ])
 
 /**
@@ -424,10 +452,12 @@ function stableStringify(value, seen = new WeakSet()) {
  * across key reordering; never includes raw prompts/secrets (those are dropped
  * by sanitizePromptHookAuditRecord before hashing).
  *
- * Not a cryptographic seal: FNV-1a 32-bit, no trusted head, no public verifier.
+ * Not a cryptographic seal: FNV-1a 32-bit, no trusted head. Use
+ * verifyAuditRecordChain for local accidental-corruption detection.
  */
-export function computeAuditRecordHash(record) {
-  return hashString(canonicalRecordMaterial(record))
+export function computeAuditRecordHash(record, prevHash = record?.prevHash ?? null) {
+  const previous = prevHash === null ? null : sanitizeIntegrityHash(prevHash)
+  return hashString(`${previous}|${canonicalRecordMaterial(record)}`)
 }
 
 /**
@@ -458,15 +488,19 @@ export function queryPromptHookAudit(records, filters = {}) {
     if (safeFilters.generationId !== undefined && (safe.generationId || null) !== (safeFilters.generationId || null)) continue
     if (minDuration !== null && safe.durationMs < minDuration) continue
     if (maxDuration !== null && safe.durationMs > maxDuration) continue
-    // recordedAt is not part of the sanitized shape (not identity-bearing);
-    // filter on the raw value when the caller supplied a time window.
-    const recordedAt = Number.isFinite(raw?.recordedAt) ? raw.recordedAt : null
+    const recordedAt = sanitizeRecordedAt(raw?.recordedAt)
     if (since !== null && (recordedAt === null || recordedAt < since)) continue
     if (until !== null && (recordedAt === null || recordedAt > until)) continue
-    // Preserve recordedAt on the returned record for downstream ordering.
-    out.push({ ...safe, recordedAt })
+    // Preserve verified-safe integrity metadata for downstream inspection.
+    out.push(preserveIntegrityMeta(raw, safe))
   }
   return out
+}
+
+/** Return a query result together with an executable integrity verdict. */
+export function queryPromptHookAuditWithIntegrity(records, filters = {}) {
+  const matched = queryPromptHookAudit(records, filters)
+  return { records: matched, integrity: verifyAuditRecordChain(matched) }
 }
 
 /**
@@ -475,10 +509,9 @@ export function queryPromptHookAudit(records, filters = {}) {
  * Default order is insertion order (no sort), limit/offset applied.
  */
 export function paginateAuditRecords(records, options = {}) {
-  const safe = Array.isArray(records) ? records.map((r) => {
-    const s = sanitizePromptHookAuditRecord(r)
-    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
-  }) : []
+  const safe = Array.isArray(records)
+    ? records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
+    : []
   const orderBy = options.orderBy
   const order = options.order === 'asc' ? 'asc' : 'desc'
   const limit = Number.isFinite(options.limit) && options.limit >= 0 ? Math.floor(options.limit) : safe.length
@@ -504,6 +537,12 @@ export function paginateAuditRecords(records, options = {}) {
   return safe.slice(offset, offset + limit)
 }
 
+/** Return a page together with an executable integrity verdict. */
+export function paginateAuditRecordsWithIntegrity(records, options = {}) {
+  const page = paginateAuditRecords(records, options)
+  return { records: page, integrity: verifyAuditRecordChain(page) }
+}
+
 /**
  * Build a local integrity chain over sanitized records. Each record gets a
  * recordHash computed from its sanitized shape plus the previous record's
@@ -516,19 +555,88 @@ export function paginateAuditRecords(records, options = {}) {
  * @param {Array<object>} records
  * @returns {Array<object>} sanitized records with { recordHash, prevHash }
  */
-export function chainAuditRecords(records) {
-  const safe = Array.isArray(records) ? records.map((r) => {
-    const s = sanitizePromptHookAuditRecord(r)
-    return { ...s, recordedAt: Number.isFinite(r?.recordedAt) ? r.recordedAt : null }
-  }) : []
-  let prevHash = null
+export function chainAuditRecords(records, previousHash = null) {
+  const safe = Array.isArray(records)
+    ? records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
+    : []
+  let prevHash = previousHash === null ? null : sanitizeIntegrityHash(previousHash)
   return safe.map((record) => {
-    const material = `${prevHash}|${canonicalRecordMaterial(record)}`
-    const recordHash = hashString(material)
+    const recordHash = computeAuditRecordHash(record, prevHash)
     const chained = { ...record, recordHash, prevHash }
     prevHash = recordHash
     return chained
   })
+}
+
+/**
+ * Verify a stored local integrity-chain segment without rewriting it.
+ *
+ * This is intentionally only accidental-corruption detection: FNV-1a is not
+ * cryptographic and there is no externally trusted head. The verifier makes
+ * that limited property executable instead of merely documented.
+ */
+export function verifyAuditRecordChain(records) {
+  if (!Array.isArray(records)) {
+    return { valid: false, recordCount: 0, invalidIndex: null, reason: 'not_an_array', headHash: null }
+  }
+  const safe = records.map((record) => preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record)))
+  let previousHash = null
+  for (let index = 0; index < safe.length; index += 1) {
+    const record = safe[index]
+    if (!record.recordHash) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'missing_record_hash', headHash: previousHash }
+    }
+    if (index > 0 && record.prevHash !== previousHash) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'previous_hash_mismatch', headHash: previousHash }
+    }
+    const expected = computeAuditRecordHash(record, record.prevHash)
+    if (record.recordHash !== expected) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'record_hash_mismatch', headHash: previousHash }
+    }
+    previousHash = record.recordHash
+  }
+  return { valid: true, recordCount: safe.length, invalidIndex: null, reason: null, headHash: previousHash }
+}
+
+/**
+ * Append one sanitized record only after verifying the persisted segment.
+ * A completely uninitialized legacy list may be initialized once; partially
+ * chained or corrupted records are never silently re-signed.
+ */
+export function appendAuditRecordWithIntegrity(records, record, limit = 100) {
+  const rawExisting = Array.isArray(records) ? records : []
+  const existing = rawExisting
+    .map((entry) => preserveIntegrityMeta(entry, sanitizePromptHookAuditRecord(entry)))
+  // Distinguish truly legacy (no metadata properties at all) from malformed or
+  // partial integrity metadata. Sanitization may turn invalid hashes into null,
+  // but that must remain a fail-closed corruption signal rather than granting a
+  // silent re-chain.
+  const hasAnyIntegrityMetadata = rawExisting.some((entry) => (
+    entry
+    && typeof entry === 'object'
+    && (
+      Object.prototype.hasOwnProperty.call(entry, 'recordHash')
+      || Object.prototype.hasOwnProperty.call(entry, 'prevHash')
+    )
+  ))
+  const initialized = hasAnyIntegrityMetadata ? existing : chainAuditRecords(existing)
+  const integrity = verifyAuditRecordChain(initialized)
+  if (!integrity.valid) {
+    return { records: initialized, integrity, appended: false }
+  }
+  const safeRecord = preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record))
+  const prevHash = integrity.headHash
+  const next = {
+    ...safeRecord,
+    prevHash,
+    recordHash: computeAuditRecordHash(safeRecord, prevHash),
+  }
+  const retained = retainAuditRecords([...initialized, next], limit)
+  return {
+    records: retained,
+    integrity: verifyAuditRecordChain(retained),
+    appended: true,
+  }
 }
 
 /**
@@ -540,17 +648,9 @@ export function chainAuditRecords(records) {
 function preserveIntegrityMeta(raw, sanitized) {
   const out = {
     ...sanitized,
-    recordedAt: Number.isFinite(raw?.recordedAt) ? raw.recordedAt : null,
-  }
-  // Preserve already-computed integrity hashes when present. sanitize() drops
-  // unknown fields intentionally; re-attach only well-formed hash strings.
-  if (typeof raw?.recordHash === 'string' && /^[a-f0-9]{8,64}$/i.test(raw.recordHash)) {
-    out.recordHash = raw.recordHash
-  }
-  if (raw?.prevHash === null) {
-    out.prevHash = null
-  } else if (typeof raw?.prevHash === 'string' && /^[a-f0-9]{8,64}$/i.test(raw.prevHash)) {
-    out.prevHash = raw.prevHash
+    recordedAt: sanitizeRecordedAt(raw?.recordedAt),
+    recordHash: sanitizeIntegrityHash(raw?.recordHash),
+    prevHash: raw?.prevHash === null ? null : sanitizeIntegrityHash(raw?.prevHash),
   }
   return out
 }

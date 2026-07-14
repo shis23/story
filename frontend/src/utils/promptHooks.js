@@ -320,12 +320,35 @@ export function classifyPromptHookFailurePolicy(stage, operationType, status) {
 }
 
 function payloadByteSize(payload) {
+  let serialized = ''
   try {
-    return JSON.stringify(payload ?? {}).length
+    serialized = JSON.stringify(payload ?? {})
   } catch {
     // Unserializable payload: estimate via the summarized hash material.
-    return safeStableStringify(payload).length
+    serialized = safeStableStringify(payload)
   }
+  const text = typeof serialized === 'string' ? serialized : String(serialized ?? '')
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).byteLength
+  }
+  // WebView fallback for older runtimes without TextEncoder. Count UTF-8 bytes
+  // directly rather than treating UTF-16 code units as bytes.
+  let bytes = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
+      const next = text.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        index += 1
+      } else {
+        bytes += 3
+      }
+    } else bytes += 3
+  }
+  return bytes
 }
 
 export async function emitPromptHookEventAndWaitForPlugins(plugins, hostRefs, event, data = {}, options = {}) {

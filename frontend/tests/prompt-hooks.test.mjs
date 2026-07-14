@@ -380,6 +380,29 @@ test('enforces a per-plugin payload size budget and audits oversized plugins as 
   ])
 })
 
+test('payload budget counts UTF-8 bytes rather than JavaScript code units', async () => {
+  const audits = []
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    [{ id: 'multibyte', permissions: ['ModifyPrompt'] }],
+    new Map([['multibyte', {
+      async emitPluginEventAndWait(_event, payload) {
+        return { ...payload, prompt: '你'.repeat(100) }
+      },
+    }]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      // The JSON source has roughly 113 UTF-16 code units but more than 300
+      // UTF-8 bytes, so a byte budget of 150 must reject it.
+      maxPayloadBytesPerPlugin: 150,
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  assert.deepEqual(result, { prompt: 'base' })
+  assert.equal(audits[0].status, 'budget_exceeded')
+})
+
 test('classifyPromptHookFailurePolicy is machine-readable and fail-open for errors/timeouts', () => {
   // Pre-generation mutating hooks fail-open on plugin error and timeout.
   assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'error').failOpen, true)
