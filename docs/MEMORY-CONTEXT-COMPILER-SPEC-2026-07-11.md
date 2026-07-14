@@ -504,11 +504,11 @@ compress_batch_id?
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **探针重跑 Partial Evidence**（2026-07-12）：SSE 嵌套 cache 修复后写作流式 cache 可见；S3 为 B-only **实体/标识符保留**（非语义保真）；见下「M5 实跑记录」 |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **Partial Evidence**（更新至 2026-07-14）：早期 S1/S3/S4/S6 探针完成；真实 endurance 已完成 Canary 3/3、Coverage 12/12、Stability 30/30，Full 暂停于 45/100；仍非完整生产 Postprocess 闭环，参数未标定 |
 
-并行已落地：**Quality Error 拦截 + force → Degraded**。NarrativeContract / UnitOfWork 仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
+并行已落地：**Quality Error 拦截 + force → Degraded**、NarrativeContract / ScenePlan、共享 Turn Accept 服务和 SQLite opt-in 基础。完整生产 Postprocess 共享服务与默认后端切换仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
 
-### M5 实跑记录（2026-07-12 重跑，脱敏）
+### M5 早期实跑记录（2026-07-12 重跑，脱敏）
 
 | 项 | 值 |
 | --- | --- |
@@ -531,12 +531,38 @@ compress_batch_id?
 **观测结论**：
 
 - 修 SSE 嵌套 `prompt_tokens_details.cached_tokens` 后，**写作 `chat_stream` 可报非零 cache**；此前「写作 0 / summarizer 128」主要是解析缺口，不是纯网关策略。S1 证明 **usage 解析有效**，不证明缓存效率已充分优化。
-- 仍非完整 M5 验收：无生产 Accept、无 ≥H+E 自然长会话、压缩阈值为测试 8 而非生产 200、无脱敏 JSONL 入仓。
+- 该轮仍非完整 M5 验收：当时无生产 Accept、无 ≥H+E 自然长会话、压缩阈值为测试 8 而非生产 200、无脱敏 JSONL 入仓。后续 2026-07-14 endurance 已补生产写作/Accept 与跨 H+E 证据，见下一节。
 
 **参数标定**：
 
 - **仍不改** 生产 `200/4`、`H_anchor`/`E`（证据不足改默认；**不得**称为参数已标定）。
-- 下一步优先级：生产 `CommitTurn` 探针；≥20 Accept 轮跨 H+E；脱敏 JSONL 证据落盘；若要语义保真则升级 S3 极性/因果/限定词匹配后再称。
+- 当时下一步优先级：生产 `CommitTurn` 探针；≥20 Accept 轮跨 H+E；脱敏 JSONL 证据落盘；若要语义保真则升级 S3 极性/因果/限定词匹配后再称。
+
+### M5 endurance 记录（2026-07-14，脱敏）
+
+权威结果：`docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-RESULT.md`。
+
+| 阶段 | Accept | Calls | Epoch | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| Canary | 3/3 | 30/30 | 1 | Pass |
+| Coverage | 12/12 | 106/120 | 1 | Pass |
+| Stability | 30/30 | 282/300 | 3 | Pass |
+| Full | 45/100 | 415/700 | 5 | Partial Evidence |
+
+本轮已经补齐：
+
+- 真实模型 production pipeline 写作。
+- 共享 Turn 生命周期 / production-faithful Accept。
+- 生产 `H_anchor=5`、`E=10` 下跨 H+E、epoch rollover、near_raw 截断与 early-fact 探针。
+- budget/timeout、checkpoint/resume、usage/segment hash 与脱敏 JSONL 写盘；证据目录位于 Git 外部。
+- 可选 `STORYFORGE_EVAL_MAX_TOKENS` 会覆盖实际评估 `ChatRequest`；默认不发送 `max_tokens`。
+
+仍未补齐：
+
+- Full 100-turn 尚缺 55 个 Accept。
+- Summarizer/PostProcessor/TurnAttempt 后台写回与 Chronicle A 仍未抽为 Tauri/harness 共用生产服务；现有 Chronicle 路径含 `synthetic_chronicle_fixture`，`production_postprocess_complete=false`。
+- 证据 JSONL 未提交到仓库，不能从 clean checkout 独立重放真实调用；仓库只保留 runner、schema、断言和脱敏守卫。
+- `200/4`、`H_anchor`/`E` 仍未完成参数标定，不修改生产默认。
 
 ---
 

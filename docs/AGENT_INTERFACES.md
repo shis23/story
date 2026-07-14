@@ -16,8 +16,8 @@ User Intent
   -> 成文后并行：
       Summarizer        → 本轮纪要 A（RoundSummary）
       PostProcessor     → 知识 / 变量 / 任务（不写纪要）
-  -> Accept 后异步（目标）：
-      ChronicleCompressor → A≥200 批压 B；B≥200 批压 C
+  -> Accept 后异步（已有基础）：
+       ChronicleCompressor → A≥200 批压 B；B≥200 批压 C
   -> 独立水位（已有）：
       MemoryArchiver    → 对话消息批压 ArchivedSummary
   -> Meta Agent
@@ -51,7 +51,7 @@ User Intent
 - `search_chronicle(query, level?, include_covered?, limit?)` — 搜 **Chronicle A/B/C**（RoundSummary 兼容视图，优先较近）；返回短目录行（code + headline + level + turn_span）；不返回 full；**不含** ArchivedSummary；每轮预算 `DEFAULT_SEARCH_MAX`
 - `get_chronicle(code|id, detail=summary|full)` — A/B/C；**默认 summary**；full 可选；返回 `source_kind`/`turn_span`/`covers`；每轮 summary/full 预算分计
 
-装配进度：**M0–M4 可独立部分已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job 队列）。**M5** 真模型验收与 NarrativeContract / UnitOfWork 仍独立。目标：`H_anchor`+`E` 近正文 / 纪要带 S / 远概览 / 确定性分组批压。详见：
+装配进度：**M0–M4.2.2 已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job/publication、共享 Turn Accept 和 SQLite opt-in UoW）。NarrativeContract / ScenePlan 已进入写作与 Gate。**M5 仍为 Partial Evidence**：生产写作/Accept 已覆盖到 Full 45/100，但完整 Summarizer/PostProcessor/Attempt 后台写回仍未成为 Tauri 与 harness 共用服务。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
@@ -139,7 +139,7 @@ User Intent
 
 职责：
 
-- 根据**本轮成文**产出一条高密度本轮纪要（现状 `RoundSummary`；目标升级为 Chronicle **A**：`code` + `headline` + `summary`）。
+- 根据**本轮成文**产出一条高密度 Chronicle **A**（兼容 `RoundSummary` 视图，含 `code` + `headline` + `summary` + lineage/source 字段）。
 - 与 PostProcessor **并行**，同属成文后流水线；Accept 后规范落盘并进入检索索引。
 
 不负责：
@@ -169,7 +169,9 @@ User Intent
 
 代码：`crates/app-agent/src/prompts/postprocess.rs`。可由 `enable_postprocess` 关闭。
 
-## ChronicleCompressor（目标新增）
+当前生产编排边界：Tauri 写作命令负责启动 Summarizer/PostProcessor、同步 Attempt 和持久化候选结果；harness 尚未能复用这整段后台编排，只复用了 production pipeline 与共享 Accept。下一步应抽出共享 `ProductionPostprocessService`，避免测试长期维护 synthetic Chronicle 替身。
+
+## ChronicleCompressor（已有基础）
 
 职责：
 
@@ -179,7 +181,7 @@ User Intent
 
 不负责：本轮成文摘要、消息归档、状态写回。可与 Summarizer 共用模型档，但 **独立入口/角色**。
 
-详见记忆规格 §7.3。实现前本角色可尚未出现在 `AgentRole` 枚举中。
+详见记忆规格 §7.3。当前已具备 job claim/retry、A→B→C publication、连续非重叠 covers、`covered_by`、revision 与幂等 replay；真实模型压缩质量和生产规模参数仍待标定。
 
 ## MemoryArchiver（已有，非对话 Agent）
 
@@ -221,7 +223,7 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 
 | Agent | 工具 | 注册函数 |
 | --- | --- | --- |
-| Director | `search_world_info`, `get_character`, `emit_plan`, `search_vectors`, `get_recent_summary` | `register_director_tools` |
+| Director | `search_world_info`, `get_character`, `emit_plan`, `search_vectors`, `get_recent_summary`, `search_chronicle`, `get_chronicle` | `register_director_tools` + Chronicle tool registry |
 | Subagent | `get_character`（信息隔离：有 `current_character_instance_id` 时只返回自己的 instance） | `register_subagent_tools` |
 | Editor | `compose` | `register_editor_tools` |
 | Postprocess | `emit_postprocess`（声明产出，handler 原样返回 args） | `register_postprocess_tools` |

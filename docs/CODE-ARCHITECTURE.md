@@ -1,7 +1,9 @@
-# StoryForge 代码架构与逻辑文档
+# StoryForge 代码架构与逻辑文档（2026-06-19 历史快照）
 
 > 生成日期：2026-06-19
 > 基于 6 轮双盲审查的代码事实
+
+> **状态说明（2026-07-14）**：本文保留为 6 月 19 日的详细代码快照，后续章节中的 crate 图、Tauri command 数量、前端组件和写作/Postprocess 数据流已部分过时。当前架构以 `docs/ARCHITECTURE.md`、`docs/HANDOFF.md` 和 `docs/AGENT_INTERFACES.md` 为准；不要引用本文的数字或流程作为当前发布声明。
 
 ## 1. Crate 依赖图
 

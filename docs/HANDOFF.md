@@ -1,109 +1,74 @@
-# StoryForge 交接说明
+﻿# StoryForge 浜ゆ帴璇存槑
 
-> 更新日期：2026-07-11
-> 范围：发布验收、文档归档与下一步推进。本文只描述当前状态、验证方式和下一优先级，不替代具体实现计划。
+> 鏇存柊鏃ユ湡锛?026-07-14
+> 褰撳墠鍩虹嚎锛歚main == origin/main == 99b1ea3`
+> 鑼冨洿锛氬綋鍓嶄唬鐮佷簨瀹炪€佽瘉鎹瓑绾с€侀獙璇佸叆鍙ｄ笌涓嬩竴浼樺厛绾с€?
+## 褰撳墠缁撹
 
-## 当前项目状态
+StoryForge 宸茶繘鍏ュ伐绋嬪寲鍙戝竷鍊欓€夐樁娈点€侰ampaign-first 澶?Agent 鍐欎綔銆乀urn/Attempt 涓€鑷存€с€丳hase B 璐ㄩ噺涓庣瀵嗙煡璇嗛棬绂併€丆hronicle M0鈥揗4.2.2銆佹彃浠?瀵煎叆鍏煎纭寲銆乷pt-in SQLite 鍜屽彂甯冭瘉鎹剼鏈潎宸插舰鎴愬彲鎵ц涓荤嚎銆?
+褰撳墠涓嶈兘瀹ｇО姝ｅ紡鍙戝竷鎴栧畬鏁?M5 楠屾敹锛屼富瑕佺己鍙ｆ槸锛?
+1. M5 Full 鐪熷疄妯″瀷璇佹嵁浠?45/100 Accept銆?2. M5 harness 鐨勫啓浣滃拰 Accept 浣跨敤鐢熶骇鏈嶅姟锛屼絾 Summarizer/PostProcessor/TurnAttempt 鍚庡彴鍐欏洖涓?Chronicle A 浠嶆湭褰㈡垚鍙緵 harness 澶嶇敤鐨勫畬鏁寸敓浜у簲鐢ㄦ湇鍔°€?3. SQLite opt-in 宸叉垚涓?Accept/recovery/barrier 鐨勬潈濞佽矾寰勶紝浣嗛儴鍒?pre-accept draft/postprocess 鍛戒护浠嶉渶缁х画杩佺Щ锛岄伩鍏嶆贩鍚堝悗绔敓鍛藉懆鏈熴€?4. Gitea runner銆佹闈㈢湡瀹?GUI銆丄ndroid 鐪熸満銆佺鍚嶅畨瑁呭寘鍜岀涓夋柟鎻掍欢 iframe 浠嶇己鐜板満璇佹嵁銆?
+## 宸茶惤鍦颁富绾?
+| 棰嗗煙 | 褰撳墠鐘舵€?|
+| --- | --- |
+| Campaign 鍐欎綔 | Director 鈫?Subagent 鈫?Editor 涓昏矾寰勫凡鎺ワ紱ScenePlan銆丯arrativeContract銆乤gency 瀛楁杩涘叆鎻愮ず璇嶄笌 Gate |
+| Turn 涓€鑷存€?| TurnRecord / TurnAttempt銆乨raft hash銆乺evision CAS銆丮utationBatch銆丄ccept 灞忛殰銆佽繜鍒?postprocess 瀹堝崼銆佸穿婧冩仮澶嶅凡鎺?|
+| Phase B / B2 | 绉佸瘑褰掑睘濂戠害銆佹樉寮忔帰閽堛€佹枃鏈獥鍙?attribution銆丒ditor performance redaction銆?脳 Editor auto-fix 宸叉帴 |
+| 璁板繂 / Context | ContextEpoch銆乶ear_raw銆丄/B/C 鏌ヨ宸ュ叿銆丆hronicleCompressor job/publication銆乧ache usage 涓?segment 瑙傛祴宸叉帴 |
+| SQLite | 榛樿浠嶄负 JSON锛涙樉寮?opt-in cutover銆乵arker銆丄ccept UoW銆乺ecovery銆乥arrier銆佸浠藉拰 reverse export 宸叉帴 |
+| 鎻掍欢 | prompt hook銆佹潈闄愭挙閿€銆侀绠?瓒呮椂/鍙栨秷銆佸璁￠摼銆佸吋瀹圭煩闃典笌鏄惧紡 degraded/unsupported 琛屼负宸叉帴 |
+| 瀵煎叆/瀵煎嚭 | ST/Campaign Bundle 鍏煎鐭╅樀銆佸師瀛愬け璐ャ€佸紩鐢ㄦ牎楠屻€乫ixture corpus 鍜岃劚鏁忔姤鍛婂凡鎺?|
+| 鍙戝竷璇佹嵁 | Windows/Android host runner銆乵anifest/provenance/hash銆丟itea workflow 宸叉彁浜わ紱杩滅 runner 瀹炶窇灏氭湭楠岃瘉 |
 
-- **前端重构 Phase 8 已完成**：App.vue(1462 行单文件)拆分为 60 个 v2 组件 + 4 个 Pinia store + 8 个 composable + 3 纯 util。main.js 已切换到 AppV2 + Pinia。旧 App.vue 及 20 个旧组件已删除;PluginHost/MvuJsRuntime/CharacterList + base/ 因被 v2 或测试引用而保留原位。双轨测试:node --test(212 个,纯 JS)+ vitest(21 个,组件挂载)。契约红线全部保住(141 旧测试护城河 + 16 半脆弱测试 + ChatMessage 8 emit + CampaignPanel refreshActiveDetailTab + MetaPanel mvu-applied)。详见 `docs/FRONTEND-REBUILD-2026-07-08.md`。
-- Campaign 主线已经成为写作运行时真相源：Director、Subagent、Editor、Postprocess 都围绕 Campaign/CharacterInstance 工作。
-- Agent Profile 与 Character Extraction 的主计划已完成并归档到 `docs/archive/2026-07-08-completed-plans/`；后续增强继续作为验收和质量任务跟踪，不再把这两个 plan 当作当前入口。
-- Meta Agent 维护层已完成基础闭环：health check、解释生成、typed patch、preview/accept/dismiss、MVU schema preview/apply 都已接入；MetaPanel 接受 patch 后的状态流已有前端纯模型测试覆盖。
-- ST 导入/导出与 MVU 基础能力已落地：V2/V3 导入保真、raw JSON/extensions 保留、Campaign JSON bundle、ST 卡 PNG/共享 lorebook 导出、MVU 状态栏/schema preview、JS fallback runtime 接入写作流程。
-- ST/插件兼容已推进到主生成事件、常见聊天事件别名、`eventSource`/`TavernHelper` 常用 shim、Slash 注册/触发/注销、ModifyPrompt 前端 hook、最终 LLM messages 级 prompt hook 和普通事件订阅/正文脱敏。
-- Prompt hook 现在有基础审计记录：前端会记录脱敏后的 hook 请求/响应、插件 ID、事件名、耗时、错误摘要和 payload hash/长度；这不是完整的可筛选 UI/导出审计面板。
-- UI smoke runner 已加入：`scripts/run-ui-smoke.ps1` 与 `frontend` 的 `npm run smoke:ui` 会在本机已有 `@playwright/test` 时跑浏览器级冒烟；当前环境缺少 Playwright 时会写 `artifacts/ui-smoke/SKIPPED.txt`，不能替代真实 Tauri 桌面 UI 证据。
-- 自动化发布基线已建立：`scripts/verify-release.ps1` 覆盖 secret scan、cargo fmt、workspace clippy/tests、frontend test/build；上次完整非沙箱 release gate 已通过，Vite dynamic/static import warning 仍按既有风险记录。
-- Android 仍处于打磨阶段：arm64-v8a debug/release 构建链路已有记录，但真机安装、文件导入、share/save sheet、Android keyring 和长会话稳定性仍需现场验收。
-- 真实 LLM 矩阵首次实跑通过（2026-07-08，deepseek-v4-flash，endpoint `opencode.ai/zen/go`）：8 个 suite 全绿——knowledge（private 封口 / told_by_other 传话链 / 广播分发 / private 不可二次传播）、i1（子 agent 越权被拦）、t1/t2/t3（首轮 / 多轮 / 三种重 roll）、c1/c6/c7（角色抽取 / meta 对话 / MVU 分析）。实跑同时暴露并修复了两个预存问题：`run-real-llm-smoke.ps1` 在 cargo 输出污染返回值管道 + stderr 触发 Stop 时崩溃（commit `f7f65d6`）；knowledge suite 对广播形态断言过严，LLM 合理输出 `BroadcastTarget::All` 被误判失败（commit `6126a1f`，断言放宽接受 All 或 Group，代码对两者处理均已覆盖）。成本/耗时未做结构化记录，复杂真实卡、长会话稳定性和真实 LLM 对抗仍是发布候选前的补充项。
+## LLM Request Policy
 
-## 最新提交
+- 涓诲啓浣滈粯璁?`max_tokens=None`锛岃姹備綋鐪佺暐璇ュ瓧娈碉紝鐢?endpoint/model 鍐冲畾榛樿杈撳嚭涓婇檺銆?- 鍘嗗彶鏈爣璁扮殑 `4096` 瑙嗕负鏃?UI 榛樿锛屼笉浼氱獊鐒跺彉鎴愮敓浜х‖涓婇檺銆?- 鐢ㄦ埛鏄惧紡濉啓姝ｆ暣鏁版椂鎵嶅彂閫佷笂闄愶紱`4096`銆乣384000` 绛夊潎浼氭寜鐢ㄦ埛鎰忓浘閫忎紶銆?- M5 鍙敤 `STORYFORGE_EVAL_MAX_TOKENS` 瑕嗙洊璇勪及璇锋眰锛涜鍊肩幇鍦ㄤ綔鐢ㄤ簬瀹為檯 `ChatRequest`锛屼笉鏄繛鎺ュ璞′笂鐨勬棤鏁堝瓧娈点€?- 涓撶敤璇锋眰浠嶅彲鏈夌嫭绔嬩笂闄愶紝渚嬪杩炴帴 ping銆丣SON fallback 鍜?MemoryArchiver锛涗笉寰楁妸瀹冧滑鎻忚堪鎴愪富鍐欎綔闄愬埗銆?
+## M5 / Phase B 璇佹嵁
 
-真实 LLM 矩阵首次实跑（2026-07-08）:
+鏉冨▉缁撴灉锛歚docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-RESULT.md`銆?
+| 闃舵 | Accept | Calls | Epoch | 缁撹 |
+| --- | ---: | ---: | ---: | --- |
+| Canary | 3/3 | 30/30 | 1 | Pass |
+| Coverage | 12/12 | 106/120 | 1 | Pass |
+| Stability | 30/30 | 282/300 | 3 | Pass |
+| Full | 45/100 | 415/700 | 5 | Partial Evidence |
 
-- `6126a1f test: relax knowledge broadcast assertion for LLM nondeterminism` — knowledge suite 接受 `BroadcastTarget::All` 或 `Group("守卫")`，消除 LLM 非确定性误伤
-- `f7f65d6 fix: real-llm smoke runner crashes on cargo output pipeline` — 修 `run-real-llm-smoke.ps1` 在 cargo 输出污染返回值管道 + stderr 触发 Stop 时的崩溃，保证官方真实验证入口可用
+璇佹嵁杈圭晫锛?
+- 鍐欎綔鍏ュ彛锛歱roduction pipeline銆?- Accept锛氬叡浜?`TurnLifecycleService` / production-faithful commit probe銆?- Chronicle锛氬綋鍓嶄粛鍚?`synthetic_chronicle_fixture`锛宍production_postprocess_complete=false`銆?- 鐜版湁 45/100 璇佹嵁鐩綍淇濈暀鍦?`C:\tmp\endurance-evidence-full`锛屼笉鍦?Git 杩借釜鑼冨洿銆?- 涓嶅緱鎹淇敼鎴栧绉板凡鏍囧畾 `200/4`銆乣H_anchor=5`銆乣E=10`銆?
+## 瀛樺偍杈圭晫
 
-前端重构 Phase 8(8 个 commit,详见 `docs/FRONTEND-REBUILD-2026-07-08.md`):
+榛樿琛屼负淇濇寔 JSON锛岄伩鍏嶅湪鏈畬鎴愬叏鐢熷懡鍛ㄦ湡杩佺Щ鍓嶅己鍒跺垏鎹㈢敤鎴锋暟鎹€?
+SQLite opt-in 宸茶鐩栵細
 
-- `ab70021 chore: remove legacy frontend code, finalize phase 8` — 删除旧 App.vue + 20 旧组件,保留 3 个契约文件
-- `aca27a3 feat: switch to AppV2 as main entry with pinia` — main.js 切换 AppV2+Pinia
-- `b6cda84 feat: rebuild meta/st/config/debug panels (p2/p3)` — meta 6 + config 4 + st 2 + debug 4
-- `455be3e feat: rebuild writing workspace + campaign panel + AppV2 assembly` — writing 7 + campaign 7 + AppV2 组装
-- `76b7107 feat: extract app.vue logic into composables` — 8 composable + 3 纯 util
-- `c6985d1 feat: add ui component library + vitest for component testing` — 24 个 ui 组件 + 双轨测试
-- `7e9da68 feat: extract pinia stores from app.vue state` — 4 个 store(campaign/writing/plugin/ui)
-- `81e1608 chore: scaffold frontend rebuild v2 (pinia, headless ui, dirs)` — 装依赖 + 建目录
+- 绫诲瀷鍖?backend selector 涓庤繘绋?pin銆?- fail-closed cutover銆乵arker銆侀攣銆佸唴瀹?hash 閲嶇畻鍜屽惎鍔ㄦ仮澶嶃€?- Turn Accept / recovery / active-turn barrier 鏉冨▉璺緞銆?- Chronicle publication UoW銆佹晠闅滄敞鍏ュ洖婊氥€佸浠藉拰 SQLite鈫扟SON reverse export銆?
+浠嶉渶琛ラ綈锛?
+- `append_ai_draft`銆丄ttempt 涓棿鎬併€乤utofix/postprocess 鍐欏洖绛夊畬鏁?pre-accept 鐢熷懡鍛ㄦ湡銆?- Windows/Android 鐪熸鍚敤 SQLite 鍚庣殑鏂囦欢閿併€佺敓鍛藉懆鏈熷拰澶ф暟鎹幇鍦洪獙璇併€?
+## 2026-07-14 楠岃瘉璁板綍
 
-更早的提交(T1-T9 收尾批次,已合入 main):
+- `cargo fmt --all -- --check`锛氶€氳繃銆?- `cargo clippy --workspace --all-targets -- -D warnings`锛氶€氳繃銆?- `cargo test --workspace`锛氶€氳繃锛涚湡瀹炴ā鍨嬨€丱S credential store 绛夌敤渚嬫寜璁捐 ignored銆?- `cargo test -p harness-real-llm`锛氬叏閮ㄧ‘瀹氭€?suite 閫氳繃锛涚湡瀹炴ā鍨嬬敤渚嬫寜璁捐 ignored銆?- `frontend npm.cmd test`锛?11/311 閫氳繃銆?- `frontend npm.cmd run build`锛氶€氳繃锛涗繚鐣欐棦鏈?Vite dynamic/static import warning銆?- 鏈疆鏈柊澧炵湡瀹?浠樿垂妯″瀷璋冪敤銆?
+## 楠岃瘉鍏ュ彛
 
-- `9c9d6de style: cargo fmt`
-- `1580fa6 feat: add prompt hook audit export with redaction verification`
-- `c54a7cf docs: add st events coverage index`
-- `a982614 test: add postprocess writeback boundary regression tests`
-- `dcdb04f test: extract campaign tab refresh mapping with test coverage`
-- `f3aadf2 test: extract subagent trace pure function with test coverage`
-- `c44d69c docs: add regression coverage index with verified test mappings`
-- `2369591 docs: standardize release-checklist state markers with unified enum`
-- `1e466a6 docs: polish user-guide with screenshot placeholders and code-aligned markers`
-- `d4d1ffa test: add ui smoke runner`
-- 更早的 ST/插件兼容补强包括 common ST message aliases、slash unregister shim、prompt hooks fail-open 和真实复杂卡 smoke 记录。
-
-## 发布闸门最新记录
-
-2026-07-08 完整六步通过（commit 栈 `ab70021` 前端重构 Phase 8 全部 9 阶段完成）：
-
-1. ✅ secret scan
-2. ✅ cargo fmt --check
-3. ✅ cargo clippy --workspace --all-targets -- -D warnings
-4. ✅ cargo test --workspace（555 pass，真实 LLM 用例按预期 ignore）
-5. ✅ frontend npm.cmd test（node --test 212 pass + vitest 21 pass，双轨）
-6. ✅ frontend npm.cmd run build（422KB，仅存已知 Vite dynamic import warning）
-
-## 如何验证
-
-Windows 优先跑自动化发布闸门：
+瀹屾暣纭畾鎬у彂甯冮椄闂細
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 ```
 
-按需复跑专项：
-
+鐪熷疄妯″瀷 smoke 鍙粠鐜鍙橀噺璇诲彇鍑瘉锛?
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-card-smoke.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-meta-smoke.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-ui-smoke.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-android-smoke.ps1
-```
-
-真实 LLM 发布验收只从 shell 环境变量读取连接信息，不要写入仓库或文档：
-
-```powershell
-$env:LLM_BASE_URL = 'https://your-compatible-endpoint/v1/chat/completions'
-$env:LLM_API_KEY = 'use-a-real-key-from-your-shell-only'
-$env:LLM_MODEL = 'your-model'
+$env:LLM_BASE_URL='https://your-compatible-endpoint/v1'
+$env:LLM_API_KEY='<secret-from-shell>'
+$env:LLM_MODEL='<model>'
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge
 ```
 
-手工验收按 `docs/RELEASE-CHECKLIST.md` 执行。每一行都要记录候选版本、日期、平台、输入材料、执行人、结果、失败日志或排障 bundle。没有实跑的项目保持 `待跑` 或 `待真机`，不要提前改成通过。
+M5 endurance 榛樿涓嶅彂閫佽緭鍑轰笂闄愶紱濡傞渶鏄惧紡 ceiling锛?
+```powershell
+$env:STORYFORGE_EVAL_MAX_TOKENS='384000'
+```
 
-## 下一优先级
+## 涓嬩竴浼樺厛绾?
+1. 鎶藉嚭鍏变韩 ProductionPostprocessService锛氳 Tauri 涓?harness 澶嶇敤 Summarizer銆丳ostProcessor銆丄ttempt 鍚屾銆丆hronicle A 鍙戝竷鍜岃繜鍒扮粨鏋滃畧鍗€?2. 鍦ㄥ畬鏁寸敓浜?postprocess 璺緞鎺ラ€氬悗杩愯鏂扮殑 M5 100-Accept 璇佹嵁锛涚幇鏈?45/100 浣滀负鏃ц矾寰勫熀绾夸繚鐣欍€?3. 瀹屾垚 SQLite pre-accept draft/postprocess 鍏ㄧ敓鍛藉懆鏈熻縼绉讳笌鏁呴殰娉ㄥ叆銆?4. 閮ㄧ讲骞跺疄璺?Gitea runner锛岄獙璇?workflow銆佷笂浼犲寘銆乻ubject/sidecar 鍜岀绾?re-hash銆?5. 鐢变汉宸ヨˉ妗岄潰 GUI銆丄ndroid 鐪熸満銆佺鍚嶅寘鍜岀湡瀹炵涓夋柟鎻掍欢楠屾敹銆?
+## 浜ゆ帴绾︽潫
 
-1. **阶段 B 主结构 + B2 已接**（2026-07-11/12）：`NarrativeContract` + `Plan.scene_plan` + Subagent agency + QualityGate 破折号/否后肯 + **生产稳定探针生成（`SF_SECRET_*`/短文本）** + **文本窗口启发式 attribution `PrivateKnowledgeLeak`** + Editor performance 硬 redaction + 有界 1× Editor auto-fix + Prompted checklist。**真实 LLM smoke**（2026-07-12，`deepseek-v4-pro` @ `cli.2529985.xyz`）：`knowledge`/`i1`/`t1`/`t3` 全绿；结构化质量/成本 A/B 矩阵仍可补。
-2. **记忆 / Context 装配**：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` **M0–M4.2.2 完成**；**M5 探针重跑 Partial Evidence**（2026-07-12 `grok-4.5`：S1/S6 写作流式 cache 可见；S3 B-only **实体/标识符** 6/6 非语义保真；S4 epoch+band 过；非生产 Accept / **非**参数已标定）。入口：`scripts/run-real-llm-smoke.ps1 -Suite m5`。**不改** 200/4。UnitOfWork/SQLite 仍独立。下一步：生产 CommitTurn、≥20 Accept 跨 H+E、脱敏 JSONL。
-3. 跑 Bronze 桌面主流程矩阵：小卡导入、创建 Campaign、三轮写作、postprocess、Meta explain/patch、重启恢复和排障 bundle。
-4. 跑 Silver 真实 ST/MVU 卡矩阵：用 `test-card.png` 和至少一张复杂真实卡补 UI 导入、世界书注入、MVU schema/status bar、regex/HTML 降级和导出记录。
-5. 补插件兼容验收：ST 99 事件全集真实触发点、冷门 Slash/TavernHelper 语义、prompt hook 审计 UI/导出、真实插件回归仍未完成。
-6. 真实 LLM 矩阵首跑已过（2026-07-08，deepseek-v4-flash，8 suite 全绿）。待补强：固定模型与参数的对照记录、T1/T2/T3 的质量/耗时/成本结构化记录、更多真实卡、长会话稳定性和多次对抗取样。脚本与断言脆弱性已随 commit `f7f65d6` / `6126a1f` 修复。
-7. 跑 Android 真机矩阵：安装、系统文件选择器导入、主流程、导出 save/share sheet、Android keyring 和长文本/生命周期。
-8. 将 `docs/USER-GUIDE.md` 从草案打磨为发布版：补截图或短录屏入口、确认数据目录描述、确认导出入口名称和 Android 差异。
-
-## 交接注意事项
-
-- 本项目当前只需要 Git 提交/推送，不需要回推 VPS 或同步 Termux 文档。
-- 不要把真实 API key 写入文档、日志摘要、issue、截图或示例配置；文档中只允许出现 `storyforge-secret:v1:*` 这类 SecretRef 形式。
-- 发布说明不要承诺完整 ST 99 事件全集、冷门 Slash/TavernHelper 语义、完整第三方插件沙箱或完整语义级安全边界。
-- Prompt hook 可以说“最终 messages 级链路已接入，插件错误/超时 fail-open，基础脱敏审计记录已补”；不要说“完整审计面板、导出和可搜索追踪已完成”。
-- 传话链和 private/封口能力当前仍要按“文本匹配级门禁 + 真实 LLM 对抗待验证”描述。
-- `CampaignStore` 桌面小/中等数据量暂不阻塞，但 Android、大卡导入和真实长会话必须实测后再决定是否推进后台 flush、分文件索引或 schema 迁移。
+- 涓嶆妸鐪熷疄 API key 鍐欏叆浠撳簱銆佹枃妗ｃ€佹棩蹇椼€佹埅鍥炬垨璇佹嵁 JSONL銆?- 涓嶆妸妯″瀷鏈€澶ц兘鍔涚獥鍙ｇ瓑鍚屼簬姣忔璇锋眰搴旇缃殑杈撳嚭闀垮害锛沗max_tokens` 鏄?ceiling锛屼笉鏄洰鏍囬暱搴︺€?- 涓嶆妸 deterministic fixture銆佸彲鎵ц鍏ュ彛鎴?synthetic Chronicle 鍐欐垚瀹屾暣鐢熶骇楠屾敹銆?- 涓嶉粯璁ゅ垏鎹?SQLite锛涘繀椤讳繚鐣?fail-closed cutover銆佸浠藉拰 reverse export銆?- `docs/archive/**` 涓庢棫 workstream PLAN/RESULT 鏄巻鍙茶瘉鎹紝闄ら潪淇浜嬪疄閿欒锛屽惁鍒欎笉鍥炲啓鎴愬綋鍓嶇姸鎬併€?

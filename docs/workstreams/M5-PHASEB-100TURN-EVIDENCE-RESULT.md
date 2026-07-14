@@ -1,11 +1,12 @@
 # M5 + Phase B 100-Turn Real Evidence Result
 
-> 分支：`codex/m5-phaseb-100turn-evidence`
+> 原分支：`codex/m5-phaseb-100turn-evidence`
 > 基线：`a8303d6`
-> 工作目录：`C:\tmp\storyforge-m5-endurance`
+> 原工作目录：`C:\tmp\storyforge-m5-endurance`（合并后已删除）
 > 日期：2026-07-14
 > 模型：`deepseek-v4-flash` @ `cli.2529985.xyz`
-> 原始功能 HEAD：`d5229ad`（后续提交补充 RESULT 与评估输出上限接线）
+> 分支收口 HEAD：`b953310`
+> 合并状态：已合入 `main`，merge commit `99b1ea3`
 
 ## 结论
 
@@ -38,7 +39,9 @@
 | `75b3c9c` | `feat(eval): add resumable 100-turn endurance runner core` |
 | `f940813` | `feat(eval): expand Phase B matrix and evidence metrics` |
 | `d5229ad` | `test(eval): gate endurance stages and wire real-model entry` |
-| *(本 RESULT 提交)* | `docs(workstream): record M5 Phase B 100-turn evidence result` |
+| `e44d562` | `docs(workstream): record M5 Phase B 100-turn evidence result` |
+| `d527804` | `feat(eval): allow harness max_tokens override via env`（连接层接线后确认不影响实际请求，已由下一提交修正） |
+| `b953310` | `fix(eval): apply output cap to effective requests` |
 
 ## 新增 / 修改文件
 
@@ -182,15 +185,15 @@ Stability 阶段通过 3 次断点续跑完成（5→10→20→30），验证了
    Summarizer/PostProcessor/TurnAttempt 后台写回公开接口。`production_postprocess_complete=false`。
 3. **模型 Plan 解析不稳定**：`deepseek-v4-flash` 偶发输出自然语言而非 JSON Plan；bounded
    retry 可消除大部分，但仍有少数轮次需多次尝试，消耗调用预算。
-4. **`CommitProbeEnv` 仍需随 Tauri 私有 Accept 路径漂移而复核**。
+4. **Accept 已直接复用共享 Turn 生命周期服务**，不再维护第二套 Accept 状态机；仍需在 Turn 服务接口变更时保持 harness 契约测试同步。
 5. **不得据此标定或修改 `200/4`、`H_anchor`/`E`**，不得宣称完整 M5 通过。
 
-本线未修改 SQLite、GUI、Android、`docs/HANDOFF.md`、`docs/RELEASE-CHECKLIST.md` 或生产默认参数。
+本 workstream 本身未修改 SQLite、GUI、Android 或生产默认参数；合并后的主文档状态由后续文档同步提交维护。
 
-## 是否建议合并
+## 合并结论
 
-**建议合并到评估栈。** 分阶段门禁、checkpoint/resume、脱敏证据、budget enforcement 和
-Phase B 12+ 矩阵已就绪，可作为可复跑的 harness 基建。
+**已合入 `main`。** 分阶段门禁、checkpoint/resume、脱敏证据、budget enforcement 和
+Phase B 12+ 矩阵作为可复跑 harness 基建保留。
 
 **不建议**仅凭本线宣称：
 - 生产参数已标定

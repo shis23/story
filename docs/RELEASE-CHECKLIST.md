@@ -1,6 +1,6 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-08 更新。自动化基线与 workspace clippy 闸门已纳入；Bronze、Silver、真实 LLM、Android 验收改为可执行矩阵。真实卡、真实 LLM、Android 真机和打包结果必须逐项记录，不能用”理论通过”替代。
+> 状态：2026-07-14 更新。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in 和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner 和打包结果必须逐项记录，不能用“理论通过”替代。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 
@@ -28,7 +28,7 @@
 
 自动化发布闸门必须通过 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1` 执行并通过。脚本按 fail-fast 顺序运行：
 
-1. `secret scan`：扫描 Git-tracked worktree 与 index 文件，只报告规则名和位置，不回显匹配行内容；排除 `target/**`、`node_modules/**`、`frontend/dist/**`、`.git/**`。
+1. `secret scan`：复用 release runner 的 fail-closed helper，扫描 Git-tracked/index 与未跟踪构建输入；只报告规则名和脱敏位置，不回显匹配内容；不可读、枚举失败或超限的未跟踪构建输入必须失败。
 2. `cargo fmt --check`。
 3. `cargo clippy --workspace --all-targets -- -D warnings`。
 4. `cargo test --workspace`。
@@ -42,6 +42,15 @@
 - 本文件中未完成项不能伪装成已完成；允许标记为“延期/非阻塞”，但必须写明原因。
 
 ## 1. 当前自动化基线
+
+2026-07-14 已验证（`main` `99b1ea3`）：
+
+- `cargo fmt --all -- --check`、workspace Clippy `-D warnings`、`cargo test --workspace` 全部通过。
+- `cargo test -p harness-real-llm` 全部确定性 suite 通过；真实模型用例按设计 ignored。
+- frontend `npm.cmd test` 311/311 通过，`npm.cmd run build` 通过；保留既有 Vite dynamic/static import warning。
+- Windows/Android host runner、manifest/provenance/hash/subject sidecar 与 Gitea workflow 已进入主线；远端 Gitea runner、完整 Tauri bundle 和 Android APK 本轮未实跑。
+- M5 runner 已进入主线；Canary/Coverage/Stability 通过，Full 45/100 Partial Evidence。Chronicle 仍含 synthetic fixture，不得写成完整生产 Postprocess 验收。
+- SQLite opt-in 的 cutover、Accept/recovery/barrier、Chronicle publication、backup/reverse export 已通过确定性和 Windows host 测试；完整 pre-accept 生命周期和 Android 真机仍待验证。
 
 2026-07-07 已验证：
 
@@ -123,6 +132,8 @@ Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基
 | L4 知识隔离对抗 | 含私有知识和未授权角色的 Campaign；对抗 prompt | 1. 写入或导入私有知识。<br>2. 用对抗 prompt 诱导未授权角色索取秘密。<br>3. 检查正文、trace 和知识写回。 | 未授权角色不能读出私有知识；失败/阻断在日志或 trace 中可见；不把文本匹配级门禁描述成完整语义安全。 | pipeline trace；app 日志；Campaign bundle；对抗 prompt 文本。 | 部分通过 2026-07-09（i1 suite 1 passed：volatile tail 隔离 + 成文不含秘密端到端生效；LLM 尝试越权 get_character("Chen") 被 P0 门禁拦下返回 NotFound；完整 UI 对抗采样待补） |
 | L5 知识传播对抗 | harness 真实 LLM 环境；支持 ignored 测试的连接配置 | 1. 在当前 shell 设置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。<br>2. 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`。<br>3. 保存输出摘要。<br>4. 对失败用例归因。 | 真实 PostProcessor 能抽出定向告知、身份组广播和 private 封口；写回层链路/门禁断言通过；脚本输出不打印 API key。 | 测试输出；harness 日志；失败时相关 fixture 名称。 | 通过 2026-07-09（deepseek-v4-flash，knowledge suite 1 passed：private 封口/传话链/身份组广播/在场感知全命中；P2-6 postprocess 截断修复 + cb971eb terminal_tools 修复在真实模型下验证） |
 | L6 Postprocess 覆盖 | L3 的三轮 Campaign；至少一轮明确包含事实、变量变化、任务变化和摘要点 | 1. 写作后等待 postprocess。<br>2. 检查 summaries、knowledge、variables、tasks。<br>3. 记录未命中的类别。 | 知识、变量、任务、摘要至少各命中一次；Postprocess 不凭空创建永久事实；失败重试不无限循环。 | app 日志；Campaign bundle；面板截图；成本记录。 | 待跑 |
+| L7 M5 endurance | 固定真实模型；production `H_anchor=5` / `E=10`；独立脱敏 evidence 目录 | 1. 设置真实模型 env 与预算。<br>2. 依次通过 canary/coverage/stability gate。<br>3. 运行 full 100 Accept。<br>4. 检查 checkpoint、usage、epoch、early-fact 与 secret scan。 | 100/100 Accept；预算不超限；epoch rollover 与 near_raw 截断正确；证据无 key/prompt/story 正文；路径字段准确声明 production/synthetic 边界。 | `endurance_calls/turns/checkpoint/manifest.jsonl`；RESULT；不得提交原始 key。 | 部分通过 2026-07-14（Canary 3/3、Coverage 12/12、Stability 30/30；Full 45/100、415/700 calls、5 epochs；`production_postprocess_complete=false`） |
+| L8 完整生产 Postprocess | 已抽出的共享 ProductionPostprocessService；真实模型；可审计 Campaign | 1. 由 Tauri 与 harness 调用同一共享服务。<br>2. 跑 Summarizer、PostProcessor、Attempt 同步、Chronicle A、Accept。<br>3. 注入迟到结果、取消和存储失败。 | 无 synthetic Chronicle；Attempt/hash/quality 与最终稿一致；迟到结果不复活；失败传播；Accept 后摘要/知识/变量/任务和索引一致。 | call/turn evidence；Campaign/SQLite 导出；故障注入日志。 | 待跑（共享服务尚未抽出） |
 
 > **2026-07-09 真实 LLM 矩阵全 8 suite 实跑汇总**（deepseek-v4-flash，endpoint `opencode.ai/zen/go`）：t1（首轮，50s）、t2（多轮，227s）、t3（reroll，83s）、knowledge（传播，34s）、c1（角色抽取，10s）、c6（Meta chat，6.3s）、c7（MVU，35s）、i1（对抗，17s）全部通过。实跑中发现并修复两个此前单元测试（mock）无法覆盖的真实回归：t3 测试断言未跟 P1-1 truncate+append 语义更新（commit `6e3f5ed`）、c6 Meta Agent drift recovery 对无工具回答过度激进（commit `1d23777`）。B5 meta smoke 4/4 + S1 real-card smoke 4 步（含 tauri-app lib harness，本机无 `0xc0000139`）全过。成本/耗时结构化记录、固定模型对照、长会话稳定性、多次对抗取样、桌面 GUI 截图仍待补。
 
@@ -149,6 +160,9 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - private/封口知识不会通过 postprocess 的告知或广播写入被继续传播；失败/阻断应在日志中可见。
 - 传话链当前依赖文本匹配；发布说明不要把它描述成完整语义级追踪。
 - 数据迁移失败不覆盖旧目录。
+- SQLite cutover 在 marker 写入前保持 JSON 权威；失败不得形成双权威或删除 JSON。
+- SQLite marker 必须与可打开数据库、schema version 和内容 hash 一致；陈旧/损坏 marker fail closed。
+- SQLite reverse export 使用 staging + atomic publish，不写 live DB、不允许 conversation 路径逃逸，并可重新导入。
 - 排障 bundle 包含日志和诊断上下文摘要，且不泄露 API key；Android 系统分享/保存链路仍需真机验证。
 
 ## 8. 发布遗留风险
@@ -158,7 +172,7 @@ Android 候选版本必须在真机上跑主流程。x86_64 emulator 可保留�
 - `infra-plugin-host` 的 Tauri 依赖已拆到 `tauri-app/src/mvu_webview_runtime.rs` adapter；发布前继续关注 WebView MVU 真实卡回归。
 - `CampaignStore` 已从单 Mutex 拆为集合级锁；桌面压测 500 次/集合通过，暂不因桌面小/中等数据量阻塞发布。Android 设备、真实长会话和大卡导入仍需验证后再决定是否拆后台 flush / `spawn_blocking`。
 - API key 明文存储已接入 `keyring`/系统凭据库；Windows Credential Manager 写入/读取/删除已用 ignored 冒烟测试验证。发布前仍需在 macOS/Linux/Android，尤其 Android 真机环境，分别验证凭据写入、读取、迁移和删除。
-- 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 的 `GENERATE_BEFORE_COMBINE_PROMPTS` / `CHAT_COMPLETION_PROMPT_READY` 改写入参，并可在最终 LLM request 前通过后端 `prompt_hook_request` / `plugin_prompt_hook_result` 链路改写 messages；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 控制正文暴露；prompt hook 已有基础脱敏审计记录。但还不是 ST 99 事件全集，完整审计 UI/导出和冷门语义仍应避免过度承诺。
+- 插件事件总线已覆盖主生成链和常见聊天宿主动作，声明 `ModifyPrompt` 的插件可在写作前通过常驻隐藏 hook host 改写入参，并可在最终 LLM request 前通过后端链路改写 messages；普通事件 feed 已按订阅和 `ReadMemory` 控制正文暴露。prompt hook 已具备 timeout/cancel/budget/revocation、脱敏审计 query/分页/retention/export 和本地完整性链，但仍不是 ST 99 事件全集、密码学审计或完整第三方插件沙箱。
 - 2026-07-07 自动化补强：前端新增 `prompt-hooks.test.mjs` 固化 `ModifyPrompt` 插件顺序合并、非授权插件跳过、intent/prompt/messages fallback；`plugin-bridge.test.mjs` 继续覆盖 TavernHelper `eventEmitAndWait` payload 串联、prompt hook alias 和 ST 常见 selector 参数顺序。
 - 插件 API 桥已改为调用 `plugin_*` 专用后端命令并注入 `pluginId`，变量读取权限已从写权限中拆出；但变量写入仍保留 `WriteVariables` 直接兼容路径，完整 propose/preview 写入流仍需后续收口，发布说明不要把插件权限描述成完整第三方插件沙箱。
 - 秘密/封口机制当前是文本匹配级门禁，不等同完整语义安全边界；发布前仍需真实 LLM 对抗样例确认不会给用户虚假的安全感。

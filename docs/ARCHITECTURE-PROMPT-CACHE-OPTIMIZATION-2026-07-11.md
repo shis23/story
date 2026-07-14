@@ -76,9 +76,9 @@ AppV2 的 `loadSidebarPlugins()` 当前只调用 `listPlugins()`，没有把结�
 
 不建议把“完整复刻 ST 99 事件和 TavernHelper 全部语义”作为主架构目标。
 
-### P1：LLM Request Policy 没有统一落到主路径
+### P1：LLM Request Policy 已部分统一，provider capability / retry 仍未收口
 
-连接层能保存 temperature、top_p、max_tokens 和厂商扩展参数，但 AgentRuntime 会重新构造 SamplingParams；重试器也已实现但没有统一包裹生产客户端。结果是“UI 有设置”与“所有 Agent 实际使用设置”之间缺少单一事实来源。
+当前 active connection 的 temperature、top_p、reasoning、extra 和显式 `max_tokens` 已注入 Pipeline/AgentRuntime。默认 `max_tokens=None`，历史未标记的 4096 视为旧 UI 默认；用户显式填写正整数时才透传。连接 UI 与主写作请求的采样意图已对齐。仍未统一的是 provider capability 探测、模型级默认策略和所有生产客户端的 retry 包装，因此完整 `RequestPolicy` 仍是后续架构项。
 
 建议新增统一 `RequestPolicy`：
 
@@ -456,8 +456,8 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
 > | B | **主结构+B2 已接** | `NarrativeContract` + `ScenePlan` 扩展；Subagent agency；Editor/Director 注入；QualityGate：破折号/否后肯 + **生产稳定探针** + **文本窗口启发式 attribution** `PrivateKnowledgeLeak`；Editor performance 硬 redaction；有界 1× Editor auto-fix；Prompted checklist；**真实 LLM smoke** `deepseek-v4-pro@cli.2529985.xyz`：knowledge/i1/t1/t3 全绿 | 结构化质量/成本 A/B 对照矩阵（非 smoke） |
-> | C | **M0–M4.2.2 + M5 探针** | history-epoch + prompt catalog；near_raw；A/B/C tools；Turn 只计 A；Compressor + epoch 同锁；**m5 harness** + **流式嵌套 cache 解析** | B-only 压缩重跑；生产 Accept 探针；≥H+E 长会话；UnitOfWork/SQLite |
-> | D | 未开 | — | UnitOfWork / SQLite、完整 TurnState 事务升级、Android 真机矩阵 |
+> | C | **M0–M4.2.2 + M5 Partial Evidence** | history-epoch + prompt catalog；near_raw；A/B/C tools；Compressor + epoch 同锁；真实 endurance：Canary 3/3、Coverage 12/12、Stability 30/30、Full 45/100；生产写作/Accept + 流式 cache 解析 | 完整生产 Postprocess/Chronicle A 共享服务；Full 剩余 55 Accept；语义级压缩保真与参数标定 |
+> | D | **Turn UoW + SQLite opt-in 已接** | TurnRecord/Attempt、revision CAS、共享 Accept/recovery；SQLite cutover、Accept UoW、barrier、Chronicle publication、backup/reverse export | SQLite pre-accept draft/postprocess 全生命周期；默认后端切换评估；Android/GUI/runner 现场矩阵 |
 
 ### 阶段 A：建立测量和安全边界
 
@@ -487,15 +487,15 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
-6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 探针 Inconclusive / Partial Evidence**（勿把 boot cache / 未删 A 事实 / 手工 accept 写成验收通过）。
+6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 Partial Evidence** 已升级到 production pipeline + shared Accept 的 45/100 endurance，但 Chronicle 仍含 synthetic fixture，勿写成完整生产 Postprocess 或参数标定通过。
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 
 ### 阶段 D：一致性与发布
 
-1. 将阶段 A 的最小 Turn 屏障升级为完整 TurnState、CampaignRevision 和原子 TurnCommit。 **（Turn/revision 主线已较强；UnitOfWork 仍延后）**
-2. Journal/崩溃恢复与 UnitOfWork。
-3. 在事务接口稳定后再增加 SQLite/WAL adapter。
+1. 将阶段 A 的最小 Turn 屏障升级为完整 TurnState、CampaignRevision 和原子 TurnCommit。 **（已落地 TurnRecord/Attempt、revision CAS、MutationBatch、共享 Accept/recovery 服务）**
+2. Journal/崩溃恢复与 UnitOfWork。 **（JSON 专用 journal + SQLite Accept UoW 已接；完整 pre-accept 生命周期仍需统一）**
+3. 在事务接口稳定后再增加 SQLite/WAL adapter。 **（显式 opt-in 已接；默认仍为 JSON，尚未完成 draft/postprocess 全路径迁移）**
 4. Fast/Standard/Quality 自适应流水线。
 5. 桌面 Bronze/Silver 与 Android 真机矩阵。
 

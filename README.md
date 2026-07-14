@@ -1,104 +1,89 @@
 # StoryForge
 
-StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它的目标不是做一个通用聊天壳，而是把角色卡、世界书、变量、任务、剧情摘要和多轮分支统一进一个可持续运行的故事 Campaign。
+StoryForge 是一个 Android-first 的 AI 多 Agent 协作写作应用。它不是通用聊天壳，而是把角色卡、世界书、角色实例、变量、任务、剧情纪要、长期记忆和多轮分支组织进可持续运行的故事 Campaign。
 
-桌面端 Tauri 主要用于开发、调试和验证；长期产品形态优先考虑移动端阅读与创作体验。
+桌面端 Tauri 主要用于开发、调试、数据迁移和发布验证；移动端仍是长期产品方向。
 
 ## 项目定位
 
-StoryForge 的主线是 Campaign：
+- Campaign 是写作运行时的主线真相源。
+- Director 规划场景，Subagent 按角色隔离表演，Editor 合并成文。
+- Summarizer 生成本轮 Chronicle A；PostProcessor 提取知识、变量和任务更新。
+- TurnRecord / TurnAttempt、draft hash、revision CAS 与 Accept 屏障保证正文和 Campaign 状态一致提交。
+- Meta Agent 负责解释、诊断、补丁建议和数据健康检查，不参与常规正文生成。
+- SillyTavern 角色卡、世界书、插件 API 和 MVU 是兼容输入与扩展层，不是内部领域模型。
 
-- SillyTavern 角色卡是导入、兼容和素材来源。
-- Campaign 是运行时真相源，承载一局故事的角色实例、变量、知识、任务、摘要和分支。
-- Director Agent 规划场景，Subagent 按角色并行表演，Editor Agent 合并成文，Postprocess 将成文写回 Campaign 状态。
-- Meta Agent 是诊断、解释和修复层，不是另一个普通聊天入口。
+## 当前状态
 
-当前代码已经具备多角色 Campaign 主线、信息隔离、临时角色落盘和后处理写回闭环；未开启 Campaign 时仍保留扁平 `Character` 兼容路径。后续开发应继续围绕 Campaign 运行态做 Android、验收和知识传播增强。
+- 多角色 Campaign 写作、重 roll、QualityGate、1× Editor auto-fix、私密知识归属门禁与 Editor redaction 已接入。
+- Chronicle M0–M4.2.2、ContextEpoch、A/B/C 查询工具和压缩 publication 基础已落地。
+- M5 endurance runner 已合入；真实 Full 证据为 45/100 Accept，仍是 Partial Evidence。
+- 默认存储仍是 JSON；SQLite 是显式 opt-in 后端，已覆盖 cutover、Accept、recovery、barrier 和 reverse export，完整 draft/postprocess 生命周期仍需继续统一。
+- 发布脚本、Gitea workflow、导入兼容矩阵和插件兼容矩阵已具备确定性门禁；真实 GUI、Gitea runner、Android 真机和完整生产 Postprocess 证据仍未关闭。
 
 ## 技术栈
 
-- Rust workspace，14 个 crate。
-- Tauri v2，提供本地应用壳、文件导入和 110 个命令（按 `#[tauri::command]` 标注统计）。
-- Vue 3 + Vite + Tailwind v4 前端。
+- Rust workspace，16 个 crate。
+- Tauri v2，约 125 个 command。
+- Vue 3 + Pinia + Vite + Tailwind v4。
 - OpenAI-compatible LLM API。
-- 本地 JSON 存储。
-- 内置关键词/向量记忆接口，当前向量实现为 `BruteForceStore`。
+- 默认 JSON 存储；opt-in SQLite/WAL 基础设施。
+- 关键词、向量、ContextEpoch 与 Chronicle A/B/C 记忆路径。
 
 ## 快速启动
 
-环境要求：
+环境要求：Windows 11、Node.js v24+、Rust stable（edition 2024）。
 
-- Windows 11 / Git Bash 或 PowerShell。
-- Node.js v24+。
-- Rust stable，支持 edition 2024。
-
-安装前端依赖：
-
-```bash
+```powershell
 cd frontend
-npm install
-```
+npm ci
+npm run build
 
-运行前端开发服务：
-
-```bash
-npm run dev
-```
-
-运行 Tauri 应用：
-
-```bash
+cd ..
 cargo tauri dev
 ```
 
-运行 Rust 测试：
+完整确定性门禁：
 
-```bash
-cargo test --workspace
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1
 ```
 
-前端构建：
+或分别执行：
 
-```bash
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cd frontend
-npm run build
+npm.cmd test
+npm.cmd run build
 ```
 
 ## 代码结构
 
 ```text
-crates/domain              领域模型：角色、Campaign、变量、任务、对话、Agent DTO
-crates/app-agent           Agent 运行时、工具循环、提示词、后处理解析
-crates/app-pipeline        写作流水线编排：Director -> Subagents -> Editor -> Postprocess
-crates/app-conversation    对话树、variant、重 roll Provenance
+crates/domain              领域模型、Turn、Chronicle、NarrativeContract、LLM DTO
+crates/app-agent           Agent runtime、工具循环、提示词、质量与后处理解析
+crates/app-pipeline        Director → Subagent → Editor 写作编排
+crates/app-conversation    对话树、variant、Provenance
 crates/app-memory          摘要归档与记忆召回
 crates/app-meta            Meta Agent、MVU 分析、补丁会话
-crates/infra-*             LLM、导入、插件、向量、正则等基础设施
-crates/tauri-app           Tauri 命令、本地 store、前后端桥接
-frontend                   Vue 前端
-docs                       当前架构、数据模型、Agent 契约和路线图
+crates/infra-*             LLM、SQLite、导入、插件、向量、正则、通用 IO
+crates/tauri-app           Tauri 命令、应用服务、JSON/SQLite 组合根
+crates/harness-real-llm    确定性与真实模型评估、M5 endurance 证据
+frontend                   Vue 3 / Pinia 前端
+docs                       当前规格、架构、验收和历史归档
 ```
 
-## 核心文档
+## 当前权威文档
 
-- [路线图](docs/ROADMAP.md)
+- [交接说明](docs/HANDOFF.md)
 - [架构说明](docs/ARCHITECTURE.md)
-- [架构审计与重构建议](docs/ARCHITECTURE-AUDIT.md)
-- [文档与代码对齐审计](docs/DOCS-CODE-AUDIT.md)
-- [数据模型](docs/DATA_MODEL.md)
 - [Agent 接口](docs/AGENT_INTERFACES.md)
-- [Campaign 主线计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-CAMPAIGN-MAINLINE.md)
-- [Meta Agent 计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-META-AGENT.md)
-- [前端工作台计划（已归档）](docs/archive/2026-06-19-completed-phases/PLAN-FRONTEND-WORKBENCH.md)
-- [Campaign 角色统一计划（已归档）](docs/archive/2026-06-17-campaign-mainline-phase5/PLAN-CHARACTER-UNIFICATION.md)
-- [Agent Profile 计划](docs/PLAN-AGENT-PROFILE.md)
-- [角色识别增强计划](docs/PLAN-CHARACTER-EXTRACTION.md)
-- [MVU/插件计划](docs/PLAN-PLUGIN-MVU.md)
-- [ST 导入/导出计划](docs/PLAN-ST-IMPORT-EXPORT.md)
-- [知识传播引擎](docs/PLAN-KNOWLEDGE-PROPAGATION.md)
-- [Android 计划](docs/PLAN-ANDROID.md)
-- [主线完成后的收口与发布准备](docs/PLAN-POST-MAINLINE.md)
+- [Memory / Context Compiler 规格](docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
+- [Prompt / Cache 架构优化记录](docs/ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md)
 - [发布检查清单](docs/RELEASE-CHECKLIST.md)
-- [交接说明（已归档）](docs/archive/2026-06-18-pre-phase-completion/HANDOFF.md)
+- [M5 100-turn 结果](docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-RESULT.md)
 
-旧版文档已归档到 [docs/archive/2026-06-16-pre-rewrite](docs/archive/2026-06-16-pre-rewrite)。
+历史计划和旧架构快照位于 [docs/archive](docs/archive/README.md)。
