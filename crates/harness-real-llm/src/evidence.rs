@@ -113,6 +113,14 @@ pub struct EvidenceAbRow {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
+    /// Continuity/agency marker: whether the draft maintained scene continuity
+    /// (deterministic = true; real-model path overwrites).
+    #[serde(default)]
+    pub continuity_ok: bool,
+    /// Output emptiness/truncation/failure indicator.
+    /// `ok` / `empty` / `truncated` / `failed`
+    #[serde(default = "default_ab_outcome")]
+    pub output_status: String,
     pub assertion_results: Vec<AssertionResult>,
     pub recorded_at_unix_ms: u128,
 }
@@ -120,6 +128,10 @@ pub struct EvidenceAbRow {
 pub const EVIDENCE_SCHEMA_VERSION: &str = "eval-m5-phaseb-v1";
 
 fn default_call_outcome() -> String {
+    "ok".into()
+}
+
+fn default_ab_outcome() -> String {
     "ok".into()
 }
 
@@ -354,6 +366,8 @@ pub struct RealLlmRunBudget {
     pub max_calls: u32,
     pub max_turns: u32,
     pub timeout_secs: u64,
+    /// Optional request-level output ceiling. `None` delegates to the provider/model default.
+    pub max_tokens: Option<u32>,
 }
 
 impl Default for RealLlmRunBudget {
@@ -363,6 +377,7 @@ impl Default for RealLlmRunBudget {
             max_calls: 0,
             max_turns: 0,
             timeout_secs: 120,
+            max_tokens: None,
         }
     }
 }
@@ -374,6 +389,7 @@ impl RealLlmRunBudget {
     /// - `STORYFORGE_EVAL_MAX_CALLS`（默认 40）
     /// - `STORYFORGE_EVAL_MAX_TURNS`（默认 24）
     /// - `STORYFORGE_EVAL_TIMEOUT_SECS`（默认 180）
+    /// - `STORYFORGE_EVAL_MAX_TOKENS`（默认不发送；正整数时覆盖每次评估请求）
     pub fn from_env() -> Self {
         let enabled = std::env::var("STORYFORGE_EVAL_REAL_LLM")
             .ok()
@@ -385,11 +401,16 @@ impl RealLlmRunBudget {
         let max_calls = parse_u32_env("STORYFORGE_EVAL_MAX_CALLS", 40);
         let max_turns = parse_u32_env("STORYFORGE_EVAL_MAX_TURNS", 24);
         let timeout_secs = parse_u64_env("STORYFORGE_EVAL_TIMEOUT_SECS", 180);
+        let max_tokens = std::env::var("STORYFORGE_EVAL_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0);
         Self {
             enabled,
             max_calls,
             max_turns,
             timeout_secs,
+            max_tokens,
         }
     }
 

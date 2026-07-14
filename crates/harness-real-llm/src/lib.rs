@@ -23,6 +23,7 @@
 pub mod budget;
 pub mod commit_probe;
 pub mod context_compile_bench;
+pub mod endurance;
 pub mod evidence;
 pub mod long_session;
 pub mod observability;
@@ -64,7 +65,13 @@ impl HarnessEnv {
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
         let data_dir =
             std::env::temp_dir().join(format!("storyforge_harness_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&data_dir).expect("创建 tempdir 失败");
+        Self::open(data_dir, llm)
+    }
+
+    /// Open or create a harness environment rooted at an explicit data directory.
+    /// Used by endurance resume so accepted turns can continue from disk state.
+    pub fn open(data_dir: PathBuf, llm: Arc<dyn LlmClient>) -> Self {
+        std::fs::create_dir_all(&data_dir).expect("create data_dir 失败");
 
         let campaign_store = Arc::new(CampaignStore::new(&data_dir));
         let conv_store = Arc::new(ConversationStore::new(data_dir.join("conversations")));

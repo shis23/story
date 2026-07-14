@@ -83,6 +83,7 @@ pub struct BudgetedLlmClient {
     max_calls: u32,
     max_turns: u32,
     timeout_secs: u64,
+    max_tokens: Option<u32>,
     samples: Mutex<Vec<UsageSample>>,
     turn_tag: Mutex<String>,
     role_label: Mutex<String>,
@@ -96,6 +97,7 @@ impl BudgetedLlmClient {
             max_calls: budget.max_calls,
             max_turns: budget.max_turns,
             timeout_secs: budget.timeout_secs.max(1),
+            max_tokens: budget.max_tokens,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("boot".into()),
             role_label: Mutex::new("pipeline".into()),
@@ -149,6 +151,14 @@ impl BudgetedLlmClient {
             )));
         }
         Ok(())
+    }
+
+    fn effective_request(&self, req: &ChatRequest) -> ChatRequest {
+        let mut effective = req.clone();
+        if let Some(max_tokens) = self.max_tokens {
+            effective.params.max_tokens = Some(max_tokens);
+        }
+        effective
     }
 
     fn record(
@@ -206,21 +216,22 @@ impl BudgetedLlmClient {
 impl LlmClient for BudgetedLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         self.reserve_call()?;
+        let req = self.effective_request(req);
         let t0 = Instant::now();
-        let fut = self.inner.chat(req);
+        let fut = self.inner.chat(&req);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                self.record(req, None, t0.elapsed().as_millis(), false, "client_error");
+                self.record(&req, None, t0.elapsed().as_millis(), false, "client_error");
                 return Err(e);
             }
             Err(_) => {
-                self.record(req, None, t0.elapsed().as_millis(), false, "timeout");
+                self.record(&req, None, t0.elapsed().as_millis(), false, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
-            req,
+            &req,
             resp.usage.clone(),
             t0.elapsed().as_millis(),
             false,
@@ -236,21 +247,22 @@ impl LlmClient for BudgetedLlmClient {
         cancel: watch::Receiver<bool>,
     ) -> Result<ChatResponse, LlmError> {
         self.reserve_call()?;
+        let req = self.effective_request(req);
         let t0 = Instant::now();
-        let fut = self.inner.chat_stream(req, tx, cancel);
+        let fut = self.inner.chat_stream(&req, tx, cancel);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                self.record(req, None, t0.elapsed().as_millis(), true, "client_error");
+                self.record(&req, None, t0.elapsed().as_millis(), true, "client_error");
                 return Err(e);
             }
             Err(_) => {
-                self.record(req, None, t0.elapsed().as_millis(), true, "timeout");
+                self.record(&req, None, t0.elapsed().as_millis(), true, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
-            req,
+            &req,
             resp.usage.clone(),
             t0.elapsed().as_millis(),
             true,
@@ -283,6 +295,7 @@ mod tests {
             max_calls: 1,
             max_turns: 1,
             timeout_secs: 30,
+            max_tokens: None,
         };
         let client = BudgetedLlmClient::wrap(inner, &budget);
         let req = dummy_req();
@@ -295,6 +308,21 @@ mod tests {
         );
         assert_eq!(client.calls_used(), 1);
         assert_eq!(client.samples().len(), 1);
+    }
+
+    #[test]
+    fn budget_applies_explicit_max_tokens_to_effective_request_only() {
+        let mut source = dummy_req();
+        source.params.max_tokens = None;
+        let budget = RealLlmRunBudget {
+            max_tokens: Some(384_000),
+            ..RealLlmRunBudget::default()
+        };
+        let client = BudgetedLlmClient::wrap(Arc::new(MockLlmClient::with_defaults()), &budget);
+
+        let effective = client.effective_request(&source);
+        assert_eq!(effective.params.max_tokens, Some(384_000));
+        assert_eq!(source.params.max_tokens, None);
     }
 
     #[tokio::test]
@@ -327,6 +355,7 @@ mod tests {
             max_calls: 5,
             max_turns: 1,
             timeout_secs: 1,
+            max_tokens: None,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("t".into()),
             role_label: Mutex::new("r".into()),
