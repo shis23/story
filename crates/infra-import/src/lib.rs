@@ -87,7 +87,7 @@ fn is_png(data: &[u8]) -> bool {
 }
 
 /// Strip a UTF-8 BOM so ST JSON exports saved as "UTF-8 with BOM" still parse.
-fn strip_utf8_bom(data: &[u8]) -> &[u8] {
+pub fn strip_utf8_bom(data: &[u8]) -> &[u8] {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
     data.strip_prefix(UTF8_BOM).unwrap_or(data)
 }
@@ -95,6 +95,52 @@ fn strip_utf8_bom(data: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_card_evidence_write_failure_fails_the_smoke_contract_without_host_path() {
+        let character = import_character_from_json(
+            &serde_json::to_vec(&make_test_card_json()).expect("serialize synthetic card"),
+        )
+        .expect("synthetic card imports");
+        let evidence = crate::compat::sanitize_real_card_evidence(&character);
+        let root = std::env::temp_dir().join(format!(
+            "sf-real-card-evidence-blocker-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary root");
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").expect("create file blocker");
+
+        let panic = std::panic::catch_unwind(|| {
+            persist_real_card_evidence_or_fail(
+                &evidence,
+                &blocker.join("evidence.json"),
+                "artifacts/import-export-compat/real-card-evidence.json",
+            );
+        })
+        .expect_err("a real-card smoke evidence write failure must fail the test");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(message.contains("REAL-CARD EVIDENCE WRITE FAILED"));
+        assert!(!message.contains(&root.display().to_string()));
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir(&root);
+    }
+
+    fn persist_real_card_evidence_or_fail(
+        evidence: &crate::compat::RealCardEvidence,
+        path: &std::path::Path,
+        evidence_rel: &str,
+    ) {
+        crate::compat::write_real_card_evidence(evidence, path).unwrap_or_else(|err| {
+            panic!("REAL-CARD EVIDENCE WRITE FAILED: {evidence_rel} ({err})")
+        });
+        println!("REAL-CARD EVIDENCE PATH: {evidence_rel}");
+    }
 
     /// 构造一个最小的 ST V3 角色卡 JSON
     fn make_test_card_json() -> serde_json::Value {
@@ -474,8 +520,16 @@ mod tests {
                     .join("..")
                     .join("test-card.png")
             });
-        let bytes = std::fs::read(&fixture_path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+        let bytes = std::fs::read(&fixture_path).unwrap_or_else(|err| {
+            // Do not echo absolute host paths in failure text; keep the env/label only.
+            let label = std::env::var_os("SF_COMPLEX_CARD_FIXTURE")
+                .map(|_| "SF_COMPLEX_CARD_FIXTURE")
+                .unwrap_or("test-card.png (repo root)");
+            panic!(
+                "REAL-CORPUS MODE requires a local real card fixture, but failed to read {label}: {err}.
+Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
+            )
+        });
 
         let character = import_character(&bytes).expect("real complex card should import");
 
@@ -518,6 +572,43 @@ mod tests {
                 .any(|entry| entry.content.contains("命定系统")),
             "expected imported world book to preserve 命定系统 content"
         );
+
+        // Privacy-safe evidence: counts, known extension keys, feature flags,
+        // and a linkable SHA-256 fingerprint. Print + write so --nocapture /
+        // smoke runners actually produce auditable evidence.
+        let evidence = crate::compat::sanitize_real_card_evidence(&character);
+        assert_eq!(evidence.spec_version, "2.0");
+        assert_eq!(evidence.alternate_greeting_count, 6);
+        assert_eq!(evidence.world_book_entry_count, 441);
+        assert_eq!(evidence.raw_card_json_sha256.len(), 64);
+        assert_eq!(
+            evidence.fingerprint_privacy,
+            "stable-linkable-not-anonymous"
+        );
+        let evidence_json = serde_json::to_string(&evidence).expect("evidence serializes");
+        assert!(
+            !evidence_json.contains("命定之诗") && !evidence_json.contains("命定系统"),
+            "sanitized real-card evidence leaked private content"
+        );
+        let again = crate::compat::sanitize_real_card_evidence(&character);
+        assert_eq!(
+            evidence.raw_card_json_sha256, again.raw_card_json_sha256,
+            "real-card fingerprint must be deterministic (linkable, not anonymous)"
+        );
+
+        // Always print a one-line sanitized evidence summary (visible with --nocapture).
+        let line = crate::compat::format_real_card_evidence_line(&evidence);
+        println!("{line}");
+
+        // Also write JSON evidence under artifacts/ (gitignored) when possible.
+        // Paths printed below are relative/repo-local labels only — no absolute
+        // host paths in smoke evidence output.
+        let evidence_rel = "artifacts/import-export-compat/real-card-evidence.json";
+        let evidence_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(evidence_rel);
+        persist_real_card_evidence_or_fail(&evidence, &evidence_path, evidence_rel);
     }
 
     #[test]
@@ -730,5 +821,57 @@ mod tests {
         crc_input.extend_from_slice(chunk_type);
         crc_input.extend_from_slice(data);
         out.extend_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
+    }
+
+    #[test]
+    fn test_import_rejects_empty_chara_payload_fail_closed() {
+        // A chara tEXt whose payload is empty must be rejected (no JSON), not
+        // silently produce a half-built Character.
+        let png = png_with_text_chunk("chara", "");
+        let err = import_character(&png).expect_err("empty chara must fail closed");
+        assert!(matches!(
+            err,
+            ImportError::JsonError(_) | ImportError::NoCharacterData
+        ));
+    }
+
+    #[test]
+    fn test_import_rejects_oversized_total_import_before_any_parse() {
+        // MAX_IMPORT_SIZE (100 MiB) is enforced at the start of import_character,
+        // *after* the caller has already read bytes into memory. This is a
+        // parse-side fail-closed guard (no half-built Character), not a
+        // pre-read OOM defense.
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(b"\xEF\xBB\xBF{");
+        bomb.extend(std::iter::repeat_n(b'A', MAX_IMPORT_SIZE + 16));
+        bomb.extend_from_slice(b"}");
+        let err = import_character(&bomb).expect_err("oversized import must fail closed");
+        assert!(matches!(err, ImportError::PngError(_)));
+    }
+
+    #[test]
+    fn test_import_is_all_or_nothing_no_partial_character() {
+        // The importer is pure parsing with no store, so the no-partial-store
+        // invariant is: a rejection never yields a (half-built) Character. We
+        // exercise several rejection shapes and assert each returns Err with no
+        // Ok value that could leak a partial build.
+        let bad_png = png::build_placeholder_png(); // no chara chunk
+        let truncated_json = br#"{"spec":"chara_card_v2","data":{"name":"x""#; // no closing brace
+        let bad_base64 = png_with_text_chunk("chara", "%%%not-base64%%%");
+        let bad_json = png_with_text_chunk(
+            "chara",
+            &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, br#"not json"#),
+        );
+        for (label, input) in [
+            ("placeholder-png", bad_png.as_slice()),
+            ("truncated-json", truncated_json),
+            ("bad-base64", &bad_base64),
+            ("bad-json", &bad_json),
+        ] {
+            assert!(
+                import_character(input).is_err(),
+                "{label}: importer must reject without producing a partial Character"
+            );
+        }
     }
 }

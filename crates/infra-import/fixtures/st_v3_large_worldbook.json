@@ -1,0 +1,2557 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "3.0",
+  "data": {
+    "name": "Large Worldbook Fixture",
+    "description": "sanitized large worldbook corpus fixture",
+    "personality": "deterministic",
+    "scenario": "compat lab",
+    "first_mes": "Primary greeting.",
+    "tags": [
+      "fixture",
+      "large-book"
+    ],
+    "creator": "StoryForge",
+    "character_version": "fixture-large-1",
+    "alternate_greetings": [
+      "Alt A",
+      "Alt B",
+      "Alt C"
+    ],
+    "creator_notes": "synthetic corpus",
+    "extensions": {
+      "depth_prompt": {
+        "depth": 4,
+        "prompt": "sanitized depth"
+      },
+      "unknown_plugin": {
+        "flag": true
+      }
+    },
+    "character_book": {
+      "name": "Large Fixture Book",
+      "description": "sanitized book metadata",
+      "scan_depth": 10,
+      "token_budget": 2048,
+      "recursive_scanning": false,
+      "extensions": {
+        "book_plugin": {
+          "enabled": true
+        }
+      },
+      "entries": [
+        {
+          "id": 0,
+          "content": "sanitized lore entry 0",
+          "constant": true,
+          "position": "before_char",
+          "key": [
+            "alias-primary",
+            "alias-0"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 0,
+          "extensions": {
+            "entry_extra": {
+              "rank": 0
+            }
+          }
+        },
+        {
+          "id": 1,
+          "content": "sanitized lore entry 1",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-1",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-1"
+          ],
+          "order": 1,
+          "extensions": {
+            "entry_extra": {
+              "rank": 1
+            }
+          }
+        },
+        {
+          "id": 2,
+          "content": "sanitized lore entry 2",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-2",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-2"
+          ],
+          "order": 2,
+          "extensions": {
+            "entry_extra": {
+              "rank": 2
+            }
+          }
+        },
+        {
+          "id": 3,
+          "content": "sanitized lore entry 3",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-3",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-3"
+          ],
+          "order": 3,
+          "extensions": {
+            "entry_extra": {
+              "rank": 3
+            }
+          }
+        },
+        {
+          "id": 4,
+          "content": "sanitized lore entry 4",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-4",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-4"
+          ],
+          "order": 4,
+          "extensions": {
+            "entry_extra": {
+              "rank": 4
+            }
+          }
+        },
+        {
+          "id": 5,
+          "content": "sanitized lore entry 5",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-5",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-5"
+          ],
+          "order": 5,
+          "extensions": {
+            "entry_extra": {
+              "rank": 5
+            }
+          }
+        },
+        {
+          "id": 6,
+          "content": "sanitized lore entry 6",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-6",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-6"
+          ],
+          "order": 6,
+          "extensions": {
+            "entry_extra": {
+              "rank": 6
+            }
+          }
+        },
+        {
+          "id": 7,
+          "content": "sanitized lore entry 7",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-7",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-7"
+          ],
+          "order": 7,
+          "extensions": {
+            "entry_extra": {
+              "rank": 7
+            }
+          }
+        },
+        {
+          "id": 8,
+          "content": "sanitized lore entry 8",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-8",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-8"
+          ],
+          "order": 8,
+          "extensions": {
+            "entry_extra": {
+              "rank": 8
+            }
+          }
+        },
+        {
+          "id": 9,
+          "content": "sanitized lore entry 9",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-9",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-9"
+          ],
+          "order": 9,
+          "extensions": {
+            "entry_extra": {
+              "rank": 9
+            }
+          }
+        },
+        {
+          "id": 10,
+          "content": "sanitized lore entry 10",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "key": [
+            "alias-primary",
+            "alias-10"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 10,
+          "extensions": {
+            "entry_extra": {
+              "rank": 10
+            }
+          }
+        },
+        {
+          "id": 11,
+          "content": "sanitized lore entry 11",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-11",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-11"
+          ],
+          "order": 11,
+          "extensions": {
+            "entry_extra": {
+              "rank": 11
+            }
+          }
+        },
+        {
+          "id": 12,
+          "content": "sanitized lore entry 12",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-12",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-12"
+          ],
+          "order": 12,
+          "extensions": {
+            "entry_extra": {
+              "rank": 12
+            }
+          }
+        },
+        {
+          "id": 13,
+          "content": "sanitized lore entry 13",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-13",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-13"
+          ],
+          "order": 13,
+          "extensions": {
+            "entry_extra": {
+              "rank": 13
+            }
+          }
+        },
+        {
+          "id": 14,
+          "content": "sanitized lore entry 14",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-14",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-14"
+          ],
+          "order": 14,
+          "extensions": {
+            "entry_extra": {
+              "rank": 14
+            }
+          }
+        },
+        {
+          "id": 15,
+          "content": "sanitized lore entry 15",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-15",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-15"
+          ],
+          "order": 15,
+          "extensions": {
+            "entry_extra": {
+              "rank": 15
+            }
+          }
+        },
+        {
+          "id": 16,
+          "content": "sanitized lore entry 16",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-16",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-16"
+          ],
+          "order": 16,
+          "extensions": {
+            "entry_extra": {
+              "rank": 16
+            }
+          }
+        },
+        {
+          "id": 17,
+          "content": "sanitized lore entry 17",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-17",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-17"
+          ],
+          "order": 17,
+          "extensions": {
+            "entry_extra": {
+              "rank": 17
+            }
+          }
+        },
+        {
+          "id": 18,
+          "content": "sanitized lore entry 18",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-18",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-18"
+          ],
+          "order": 18,
+          "extensions": {
+            "entry_extra": {
+              "rank": 18
+            }
+          }
+        },
+        {
+          "id": 19,
+          "content": "sanitized lore entry 19",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-19",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-19"
+          ],
+          "order": 19,
+          "extensions": {
+            "entry_extra": {
+              "rank": 19
+            }
+          }
+        },
+        {
+          "id": 20,
+          "content": "sanitized lore entry 20",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "key": [
+            "alias-primary",
+            "alias-20"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 20,
+          "extensions": {
+            "entry_extra": {
+              "rank": 20
+            }
+          }
+        },
+        {
+          "id": 21,
+          "content": "sanitized lore entry 21",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-21",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-21"
+          ],
+          "order": 21,
+          "extensions": {
+            "entry_extra": {
+              "rank": 21
+            }
+          }
+        },
+        {
+          "id": 22,
+          "content": "sanitized lore entry 22",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-22",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-22"
+          ],
+          "order": 22,
+          "extensions": {
+            "entry_extra": {
+              "rank": 22
+            }
+          }
+        },
+        {
+          "id": 23,
+          "content": "sanitized lore entry 23",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-23",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-23"
+          ],
+          "order": 23,
+          "extensions": {
+            "entry_extra": {
+              "rank": 23
+            }
+          }
+        },
+        {
+          "id": 24,
+          "content": "sanitized lore entry 24",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-24",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-24"
+          ],
+          "order": 24,
+          "extensions": {
+            "entry_extra": {
+              "rank": 24
+            }
+          }
+        },
+        {
+          "id": 25,
+          "content": "sanitized lore entry 25",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-25",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-25"
+          ],
+          "order": 25,
+          "extensions": {
+            "entry_extra": {
+              "rank": 25
+            }
+          }
+        },
+        {
+          "id": 26,
+          "content": "sanitized lore entry 26",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-26",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-26"
+          ],
+          "order": 26,
+          "extensions": {
+            "entry_extra": {
+              "rank": 26
+            }
+          }
+        },
+        {
+          "id": 27,
+          "content": "sanitized lore entry 27",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-27",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-27"
+          ],
+          "order": 27,
+          "extensions": {
+            "entry_extra": {
+              "rank": 27
+            }
+          }
+        },
+        {
+          "id": 28,
+          "content": "sanitized lore entry 28",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-28",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-28"
+          ],
+          "order": 28,
+          "extensions": {
+            "entry_extra": {
+              "rank": 28
+            }
+          }
+        },
+        {
+          "id": 29,
+          "content": "sanitized lore entry 29",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-29",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-29"
+          ],
+          "order": 29,
+          "extensions": {
+            "entry_extra": {
+              "rank": 29
+            }
+          }
+        },
+        {
+          "id": 30,
+          "content": "sanitized lore entry 30",
+          "constant": true,
+          "position": "before_char",
+          "key": [
+            "alias-primary",
+            "alias-30"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 30,
+          "extensions": {
+            "entry_extra": {
+              "rank": 30
+            }
+          }
+        },
+        {
+          "id": 31,
+          "content": "sanitized lore entry 31",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-31",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-31"
+          ],
+          "order": 31,
+          "extensions": {
+            "entry_extra": {
+              "rank": 31
+            }
+          }
+        },
+        {
+          "id": 32,
+          "content": "sanitized lore entry 32",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-32",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-32"
+          ],
+          "order": 32,
+          "extensions": {
+            "entry_extra": {
+              "rank": 32
+            }
+          }
+        },
+        {
+          "id": 33,
+          "content": "sanitized lore entry 33",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-33",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-33"
+          ],
+          "order": 33,
+          "extensions": {
+            "entry_extra": {
+              "rank": 33
+            }
+          }
+        },
+        {
+          "id": 34,
+          "content": "sanitized lore entry 34",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-34",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-34"
+          ],
+          "order": 34,
+          "extensions": {
+            "entry_extra": {
+              "rank": 34
+            }
+          }
+        },
+        {
+          "id": 35,
+          "content": "sanitized lore entry 35",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-35",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-35"
+          ],
+          "order": 35,
+          "extensions": {
+            "entry_extra": {
+              "rank": 35
+            }
+          }
+        },
+        {
+          "id": 36,
+          "content": "sanitized lore entry 36",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-36",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-36"
+          ],
+          "order": 36,
+          "extensions": {
+            "entry_extra": {
+              "rank": 36
+            }
+          }
+        },
+        {
+          "id": 37,
+          "content": "sanitized lore entry 37",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-37",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-37"
+          ],
+          "order": 37,
+          "extensions": {
+            "entry_extra": {
+              "rank": 37
+            }
+          }
+        },
+        {
+          "id": 38,
+          "content": "sanitized lore entry 38",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-38",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-38"
+          ],
+          "order": 38,
+          "extensions": {
+            "entry_extra": {
+              "rank": 38
+            }
+          }
+        },
+        {
+          "id": 39,
+          "content": "sanitized lore entry 39",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-39",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-39"
+          ],
+          "order": 39,
+          "extensions": {
+            "entry_extra": {
+              "rank": 39
+            }
+          }
+        },
+        {
+          "id": 40,
+          "content": "sanitized lore entry 40",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "key": [
+            "alias-primary",
+            "alias-40"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 40,
+          "extensions": {
+            "entry_extra": {
+              "rank": 40
+            }
+          }
+        },
+        {
+          "id": 41,
+          "content": "sanitized lore entry 41",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-41",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-41"
+          ],
+          "order": 41,
+          "extensions": {
+            "entry_extra": {
+              "rank": 41
+            }
+          }
+        },
+        {
+          "id": 42,
+          "content": "sanitized lore entry 42",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-42",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-42"
+          ],
+          "order": 42,
+          "extensions": {
+            "entry_extra": {
+              "rank": 42
+            }
+          }
+        },
+        {
+          "id": 43,
+          "content": "sanitized lore entry 43",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-43",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-43"
+          ],
+          "order": 43,
+          "extensions": {
+            "entry_extra": {
+              "rank": 43
+            }
+          }
+        },
+        {
+          "id": 44,
+          "content": "sanitized lore entry 44",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-44",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-44"
+          ],
+          "order": 44,
+          "extensions": {
+            "entry_extra": {
+              "rank": 44
+            }
+          }
+        },
+        {
+          "id": 45,
+          "content": "sanitized lore entry 45",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-45",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-45"
+          ],
+          "order": 45,
+          "extensions": {
+            "entry_extra": {
+              "rank": 45
+            }
+          }
+        },
+        {
+          "id": 46,
+          "content": "sanitized lore entry 46",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-46",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-46"
+          ],
+          "order": 46,
+          "extensions": {
+            "entry_extra": {
+              "rank": 46
+            }
+          }
+        },
+        {
+          "id": 47,
+          "content": "sanitized lore entry 47",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-47",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-47"
+          ],
+          "order": 47,
+          "extensions": {
+            "entry_extra": {
+              "rank": 47
+            }
+          }
+        },
+        {
+          "id": 48,
+          "content": "sanitized lore entry 48",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-48",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-48"
+          ],
+          "order": 48,
+          "extensions": {
+            "entry_extra": {
+              "rank": 48
+            }
+          }
+        },
+        {
+          "id": 49,
+          "content": "sanitized lore entry 49",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-49",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-49"
+          ],
+          "order": 49,
+          "extensions": {
+            "entry_extra": {
+              "rank": 49
+            }
+          }
+        },
+        {
+          "id": 50,
+          "content": "sanitized lore entry 50",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "key": [
+            "alias-primary",
+            "alias-50"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 50,
+          "extensions": {
+            "entry_extra": {
+              "rank": 50
+            }
+          }
+        },
+        {
+          "id": 51,
+          "content": "sanitized lore entry 51",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-51",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-51"
+          ],
+          "order": 51,
+          "extensions": {
+            "entry_extra": {
+              "rank": 51
+            }
+          }
+        },
+        {
+          "id": 52,
+          "content": "sanitized lore entry 52",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-52",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-52"
+          ],
+          "order": 52,
+          "extensions": {
+            "entry_extra": {
+              "rank": 52
+            }
+          }
+        },
+        {
+          "id": 53,
+          "content": "sanitized lore entry 53",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-53",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-53"
+          ],
+          "order": 53,
+          "extensions": {
+            "entry_extra": {
+              "rank": 53
+            }
+          }
+        },
+        {
+          "id": 54,
+          "content": "sanitized lore entry 54",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-54",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-54"
+          ],
+          "order": 54,
+          "extensions": {
+            "entry_extra": {
+              "rank": 54
+            }
+          }
+        },
+        {
+          "id": 55,
+          "content": "sanitized lore entry 55",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-55",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-55"
+          ],
+          "order": 55,
+          "extensions": {
+            "entry_extra": {
+              "rank": 55
+            }
+          }
+        },
+        {
+          "id": 56,
+          "content": "sanitized lore entry 56",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-56",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-56"
+          ],
+          "order": 56,
+          "extensions": {
+            "entry_extra": {
+              "rank": 56
+            }
+          }
+        },
+        {
+          "id": 57,
+          "content": "sanitized lore entry 57",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-57",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-57"
+          ],
+          "order": 57,
+          "extensions": {
+            "entry_extra": {
+              "rank": 57
+            }
+          }
+        },
+        {
+          "id": 58,
+          "content": "sanitized lore entry 58",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-58",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-58"
+          ],
+          "order": 58,
+          "extensions": {
+            "entry_extra": {
+              "rank": 58
+            }
+          }
+        },
+        {
+          "id": 59,
+          "content": "sanitized lore entry 59",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-59",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-59"
+          ],
+          "order": 59,
+          "extensions": {
+            "entry_extra": {
+              "rank": 59
+            }
+          }
+        },
+        {
+          "id": 60,
+          "content": "sanitized lore entry 60",
+          "constant": true,
+          "position": "before_char",
+          "key": [
+            "alias-primary",
+            "alias-60"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 60,
+          "extensions": {
+            "entry_extra": {
+              "rank": 60
+            }
+          }
+        },
+        {
+          "id": 61,
+          "content": "sanitized lore entry 61",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-61",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-61"
+          ],
+          "order": 61,
+          "extensions": {
+            "entry_extra": {
+              "rank": 61
+            }
+          }
+        },
+        {
+          "id": 62,
+          "content": "sanitized lore entry 62",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-62",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-62"
+          ],
+          "order": 62,
+          "extensions": {
+            "entry_extra": {
+              "rank": 62
+            }
+          }
+        },
+        {
+          "id": 63,
+          "content": "sanitized lore entry 63",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-63",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-63"
+          ],
+          "order": 63,
+          "extensions": {
+            "entry_extra": {
+              "rank": 63
+            }
+          }
+        },
+        {
+          "id": 64,
+          "content": "sanitized lore entry 64",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-64",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-64"
+          ],
+          "order": 64,
+          "extensions": {
+            "entry_extra": {
+              "rank": 64
+            }
+          }
+        },
+        {
+          "id": 65,
+          "content": "sanitized lore entry 65",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-65",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-65"
+          ],
+          "order": 65,
+          "extensions": {
+            "entry_extra": {
+              "rank": 65
+            }
+          }
+        },
+        {
+          "id": 66,
+          "content": "sanitized lore entry 66",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-66",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-66"
+          ],
+          "order": 66,
+          "extensions": {
+            "entry_extra": {
+              "rank": 66
+            }
+          }
+        },
+        {
+          "id": 67,
+          "content": "sanitized lore entry 67",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-67",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-67"
+          ],
+          "order": 67,
+          "extensions": {
+            "entry_extra": {
+              "rank": 67
+            }
+          }
+        },
+        {
+          "id": 68,
+          "content": "sanitized lore entry 68",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-68",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-68"
+          ],
+          "order": 68,
+          "extensions": {
+            "entry_extra": {
+              "rank": 68
+            }
+          }
+        },
+        {
+          "id": 69,
+          "content": "sanitized lore entry 69",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-69",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-69"
+          ],
+          "order": 69,
+          "extensions": {
+            "entry_extra": {
+              "rank": 69
+            }
+          }
+        },
+        {
+          "id": 70,
+          "content": "sanitized lore entry 70",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "key": [
+            "alias-primary",
+            "alias-70"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 70,
+          "extensions": {
+            "entry_extra": {
+              "rank": 70
+            }
+          }
+        },
+        {
+          "id": 71,
+          "content": "sanitized lore entry 71",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-71",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-71"
+          ],
+          "order": 71,
+          "extensions": {
+            "entry_extra": {
+              "rank": 71
+            }
+          }
+        },
+        {
+          "id": 72,
+          "content": "sanitized lore entry 72",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-72",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-72"
+          ],
+          "order": 72,
+          "extensions": {
+            "entry_extra": {
+              "rank": 72
+            }
+          }
+        },
+        {
+          "id": 73,
+          "content": "sanitized lore entry 73",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-73",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-73"
+          ],
+          "order": 73,
+          "extensions": {
+            "entry_extra": {
+              "rank": 73
+            }
+          }
+        },
+        {
+          "id": 74,
+          "content": "sanitized lore entry 74",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-74",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-74"
+          ],
+          "order": 74,
+          "extensions": {
+            "entry_extra": {
+              "rank": 74
+            }
+          }
+        },
+        {
+          "id": 75,
+          "content": "sanitized lore entry 75",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-75",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-75"
+          ],
+          "order": 75,
+          "extensions": {
+            "entry_extra": {
+              "rank": 75
+            }
+          }
+        },
+        {
+          "id": 76,
+          "content": "sanitized lore entry 76",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-76",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-76"
+          ],
+          "order": 76,
+          "extensions": {
+            "entry_extra": {
+              "rank": 76
+            }
+          }
+        },
+        {
+          "id": 77,
+          "content": "sanitized lore entry 77",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-77",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-77"
+          ],
+          "order": 77,
+          "extensions": {
+            "entry_extra": {
+              "rank": 77
+            }
+          }
+        },
+        {
+          "id": 78,
+          "content": "sanitized lore entry 78",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-78",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-78"
+          ],
+          "order": 78,
+          "extensions": {
+            "entry_extra": {
+              "rank": 78
+            }
+          }
+        },
+        {
+          "id": 79,
+          "content": "sanitized lore entry 79",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-79",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-79"
+          ],
+          "order": 79,
+          "extensions": {
+            "entry_extra": {
+              "rank": 79
+            }
+          }
+        },
+        {
+          "id": 80,
+          "content": "sanitized lore entry 80",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "key": [
+            "alias-primary",
+            "alias-80"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 80,
+          "extensions": {
+            "entry_extra": {
+              "rank": 80
+            }
+          }
+        },
+        {
+          "id": 81,
+          "content": "sanitized lore entry 81",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-81",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-81"
+          ],
+          "order": 81,
+          "extensions": {
+            "entry_extra": {
+              "rank": 81
+            }
+          }
+        },
+        {
+          "id": 82,
+          "content": "sanitized lore entry 82",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-82",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-82"
+          ],
+          "order": 82,
+          "extensions": {
+            "entry_extra": {
+              "rank": 82
+            }
+          }
+        },
+        {
+          "id": 83,
+          "content": "sanitized lore entry 83",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-83",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-83"
+          ],
+          "order": 83,
+          "extensions": {
+            "entry_extra": {
+              "rank": 83
+            }
+          }
+        },
+        {
+          "id": 84,
+          "content": "sanitized lore entry 84",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-84",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-84"
+          ],
+          "order": 84,
+          "extensions": {
+            "entry_extra": {
+              "rank": 84
+            }
+          }
+        },
+        {
+          "id": 85,
+          "content": "sanitized lore entry 85",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-85",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-85"
+          ],
+          "order": 85,
+          "extensions": {
+            "entry_extra": {
+              "rank": 85
+            }
+          }
+        },
+        {
+          "id": 86,
+          "content": "sanitized lore entry 86",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-86",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-86"
+          ],
+          "order": 86,
+          "extensions": {
+            "entry_extra": {
+              "rank": 86
+            }
+          }
+        },
+        {
+          "id": 87,
+          "content": "sanitized lore entry 87",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-87",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-87"
+          ],
+          "order": 87,
+          "extensions": {
+            "entry_extra": {
+              "rank": 87
+            }
+          }
+        },
+        {
+          "id": 88,
+          "content": "sanitized lore entry 88",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-88",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-88"
+          ],
+          "order": 88,
+          "extensions": {
+            "entry_extra": {
+              "rank": 88
+            }
+          }
+        },
+        {
+          "id": 89,
+          "content": "sanitized lore entry 89",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-89",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-89"
+          ],
+          "order": 89,
+          "extensions": {
+            "entry_extra": {
+              "rank": 89
+            }
+          }
+        },
+        {
+          "id": 90,
+          "content": "sanitized lore entry 90",
+          "constant": true,
+          "position": "before_char",
+          "key": [
+            "alias-primary",
+            "alias-90"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 90,
+          "extensions": {
+            "entry_extra": {
+              "rank": 90
+            }
+          }
+        },
+        {
+          "id": 91,
+          "content": "sanitized lore entry 91",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-91",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-91"
+          ],
+          "order": 91,
+          "extensions": {
+            "entry_extra": {
+              "rank": 91
+            }
+          }
+        },
+        {
+          "id": 92,
+          "content": "sanitized lore entry 92",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-92",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-92"
+          ],
+          "order": 92,
+          "extensions": {
+            "entry_extra": {
+              "rank": 92
+            }
+          }
+        },
+        {
+          "id": 93,
+          "content": "sanitized lore entry 93",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-93",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-93"
+          ],
+          "order": 93,
+          "extensions": {
+            "entry_extra": {
+              "rank": 93
+            }
+          }
+        },
+        {
+          "id": 94,
+          "content": "sanitized lore entry 94",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-94",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-94"
+          ],
+          "order": 94,
+          "extensions": {
+            "entry_extra": {
+              "rank": 94
+            }
+          }
+        },
+        {
+          "id": 95,
+          "content": "sanitized lore entry 95",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-95",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-95"
+          ],
+          "order": 95,
+          "extensions": {
+            "entry_extra": {
+              "rank": 95
+            }
+          }
+        },
+        {
+          "id": 96,
+          "content": "sanitized lore entry 96",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-96",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-96"
+          ],
+          "order": 96,
+          "extensions": {
+            "entry_extra": {
+              "rank": 96
+            }
+          }
+        },
+        {
+          "id": 97,
+          "content": "sanitized lore entry 97",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-97",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-97"
+          ],
+          "order": 97,
+          "extensions": {
+            "entry_extra": {
+              "rank": 97
+            }
+          }
+        },
+        {
+          "id": 98,
+          "content": "sanitized lore entry 98",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-98",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-98"
+          ],
+          "order": 98,
+          "extensions": {
+            "entry_extra": {
+              "rank": 98
+            }
+          }
+        },
+        {
+          "id": 99,
+          "content": "sanitized lore entry 99",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-99",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-99"
+          ],
+          "order": 99,
+          "extensions": {
+            "entry_extra": {
+              "rank": 99
+            }
+          }
+        },
+        {
+          "id": 100,
+          "content": "sanitized lore entry 100",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "key": [
+            "alias-primary",
+            "alias-100"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 100,
+          "extensions": {
+            "entry_extra": {
+              "rank": 100
+            }
+          }
+        },
+        {
+          "id": 101,
+          "content": "sanitized lore entry 101",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-101",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-101"
+          ],
+          "order": 101,
+          "extensions": {
+            "entry_extra": {
+              "rank": 101
+            }
+          }
+        },
+        {
+          "id": 102,
+          "content": "sanitized lore entry 102",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-102",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-102"
+          ],
+          "order": 102,
+          "extensions": {
+            "entry_extra": {
+              "rank": 102
+            }
+          }
+        },
+        {
+          "id": 103,
+          "content": "sanitized lore entry 103",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-103",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-103"
+          ],
+          "order": 103,
+          "extensions": {
+            "entry_extra": {
+              "rank": 103
+            }
+          }
+        },
+        {
+          "id": 104,
+          "content": "sanitized lore entry 104",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-104",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-104"
+          ],
+          "order": 104,
+          "extensions": {
+            "entry_extra": {
+              "rank": 104
+            }
+          }
+        },
+        {
+          "id": 105,
+          "content": "sanitized lore entry 105",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-105",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-105"
+          ],
+          "order": 105,
+          "extensions": {
+            "entry_extra": {
+              "rank": 105
+            }
+          }
+        },
+        {
+          "id": 106,
+          "content": "sanitized lore entry 106",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-106",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-106"
+          ],
+          "order": 106,
+          "extensions": {
+            "entry_extra": {
+              "rank": 106
+            }
+          }
+        },
+        {
+          "id": 107,
+          "content": "sanitized lore entry 107",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-107",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-107"
+          ],
+          "order": 107,
+          "extensions": {
+            "entry_extra": {
+              "rank": 107
+            }
+          }
+        },
+        {
+          "id": 108,
+          "content": "sanitized lore entry 108",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-108",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-108"
+          ],
+          "order": 108,
+          "extensions": {
+            "entry_extra": {
+              "rank": 108
+            }
+          }
+        },
+        {
+          "id": 109,
+          "content": "sanitized lore entry 109",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-109",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-109"
+          ],
+          "order": 109,
+          "extensions": {
+            "entry_extra": {
+              "rank": 109
+            }
+          }
+        },
+        {
+          "id": 110,
+          "content": "sanitized lore entry 110",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "key": [
+            "alias-primary",
+            "alias-110"
+          ],
+          "keysecondary": "secondary-a, secondary-b",
+          "order": 110,
+          "extensions": {
+            "entry_extra": {
+              "rank": 110
+            }
+          }
+        },
+        {
+          "id": 111,
+          "content": "sanitized lore entry 111",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-111",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-111"
+          ],
+          "order": 111,
+          "extensions": {
+            "entry_extra": {
+              "rank": 111
+            }
+          }
+        },
+        {
+          "id": 112,
+          "content": "sanitized lore entry 112",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-112",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-112"
+          ],
+          "order": 112,
+          "extensions": {
+            "entry_extra": {
+              "rank": 112
+            }
+          }
+        },
+        {
+          "id": 113,
+          "content": "sanitized lore entry 113",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-113",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-113"
+          ],
+          "order": 113,
+          "extensions": {
+            "entry_extra": {
+              "rank": 113
+            }
+          }
+        },
+        {
+          "id": 114,
+          "content": "sanitized lore entry 114",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-114",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-114"
+          ],
+          "order": 114,
+          "extensions": {
+            "entry_extra": {
+              "rank": 114
+            }
+          }
+        },
+        {
+          "id": 115,
+          "content": "sanitized lore entry 115",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-115",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-115"
+          ],
+          "order": 115,
+          "extensions": {
+            "entry_extra": {
+              "rank": 115
+            }
+          }
+        },
+        {
+          "id": 116,
+          "content": "sanitized lore entry 116",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-116",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-116"
+          ],
+          "order": 116,
+          "extensions": {
+            "entry_extra": {
+              "rank": 116
+            }
+          }
+        },
+        {
+          "id": 117,
+          "content": "sanitized lore entry 117",
+          "constant": true,
+          "position": "before_char",
+          "keys": [
+            "key-117",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-117"
+          ],
+          "order": 117,
+          "extensions": {
+            "entry_extra": {
+              "rank": 117
+            }
+          }
+        },
+        {
+          "id": 118,
+          "content": "sanitized lore entry 118",
+          "selective": true,
+          "selective_logic": 1,
+          "position": "after_char",
+          "depth": 4,
+          "keys": [
+            "key-118",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-118"
+          ],
+          "order": 118,
+          "extensions": {
+            "entry_extra": {
+              "rank": 118
+            }
+          }
+        },
+        {
+          "id": 119,
+          "content": "sanitized lore entry 119",
+          "constant": true,
+          "selective": true,
+          "selective_logic": 0,
+          "position": 1,
+          "depth": 2,
+          "keys": [
+            "key-119",
+            "shared"
+          ],
+          "secondary_keys": [
+            "sec-119"
+          ],
+          "order": 119,
+          "extensions": {
+            "entry_extra": {
+              "rank": 119
+            }
+          }
+        },
+        {
+          "id": 1000,
+          "disable": true,
+          "keys": [
+            "disabled-0"
+          ],
+          "content": "sanitized disabled entry 0",
+          "selective": true,
+          "position": 0,
+          "order": 0
+        },
+        {
+          "id": 1001,
+          "disable": true,
+          "keys": [
+            "disabled-1"
+          ],
+          "content": "sanitized disabled entry 1",
+          "selective": true,
+          "position": 0,
+          "order": 0
+        },
+        {
+          "id": 1002,
+          "disable": true,
+          "keys": [
+            "disabled-2"
+          ],
+          "content": "sanitized disabled entry 2",
+          "selective": true,
+          "position": 0,
+          "order": 0
+        },
+        {
+          "id": 1003,
+          "disable": true,
+          "keys": [
+            "disabled-3"
+          ],
+          "content": "sanitized disabled entry 3",
+          "selective": true,
+          "position": 0,
+          "order": 0
+        },
+        {
+          "id": 1004,
+          "disable": true,
+          "keys": [
+            "disabled-4"
+          ],
+          "content": "sanitized disabled entry 4",
+          "selective": true,
+          "position": 0,
+          "order": 0
+        }
+      ]
+    }
+  }
+}
