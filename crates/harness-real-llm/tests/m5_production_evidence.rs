@@ -118,6 +118,7 @@ fn setup(
         max_calls,
         max_turns: DEFAULT_H_ANCHOR + DEFAULT_E + 1,
         timeout_secs: 5,
+        max_tokens: None,
     };
     let llm = BudgetedLlmClient::wrap(Arc::new(DeterministicUsageClient), &budget);
     let env = HarnessEnv::new(llm.clone() as Arc<dyn LlmClient>);

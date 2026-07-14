@@ -379,17 +379,9 @@ fn parse_env_tool_mode(value: Option<&str>) -> Result<ToolMode, String> {
 /// F1 修好后，`HttpLlmClient.chat()`/`chat_stream()` 已正确回退到连接配置的 model，
 /// 不再需要 `ModelPinningLlmClient` wrapper。
 pub fn require_real_llm() -> Arc<dyn LlmClient> {
-    let mut conn = resolve_llm_connection().expect(
+    let conn = resolve_llm_connection().expect(
         "未配置真实 LLM 凭证：设 LLM_BASE_URL/LLM_API_KEY/LLM_MODEL 或 data/connections.json",
     );
-    // Allow harness-specific max_tokens override without touching production defaults.
-    // dsv4f supports up to 384K output; default SamplingParams.max_tokens=4096 is too
-    // restrictive for creative writing. This only affects the harness client.
-    if let Ok(v) = std::env::var("STORYFORGE_EVAL_MAX_TOKENS")
-        && let Ok(n) = v.trim().parse::<u32>()
-    {
-        conn.params.max_tokens = Some(n);
-    }
     let client = storyforge_infra_llm::create_client(&conn)
         .map_err(|e| format!("构造 LLM client 失败: {e}"))
         .expect("LLM client 构造失败");

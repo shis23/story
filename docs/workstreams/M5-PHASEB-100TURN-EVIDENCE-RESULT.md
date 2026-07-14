@@ -5,7 +5,7 @@
 > 工作目录：`C:\tmp\storyforge-m5-endurance`
 > 日期：2026-07-14
 > 模型：`deepseek-v4-flash` @ `cli.2529985.xyz`
-> HEAD：`d5229ad`
+> 原始功能 HEAD：`d5229ad`（后续提交补充 RESULT 与评估输出上限接线）
 
 ## 结论
 
@@ -14,7 +14,7 @@
 
 - **探针执行**：**PASS**
 - **分阶段 Accept**：Canary 3/3 PASS、Coverage 12/12 PASS、Stability 30/30 PASS
-- **Full 100-turn**：**Partial Evidence**（仍在后台推进，checkpoint 支持断点续跑）
+- **Full 100-turn**：**Partial Evidence**（45/100，checkpoint 支持断点续跑）
 - **Phase B A/B 矩阵**：15 对 fixture，确定性门禁全 PASS
 - **生产参数标定**：**不改** `200/4`、`H_anchor`、`E`
 
@@ -25,7 +25,7 @@
 | Canary | 3 | 3 | 30 / 30 | 1 | **pass** |
 | Coverage | 12 | 12 | 106 / 120 | 1 | **pass** |
 | Stability | 30 | 30 | 282 / 300 | 3 | **pass** |
-| Full | 100 | 推进中 | — / 700 | — | **partial**（断点续跑） |
+| Full | 100 | 45 | 415 / 700 | 5 | **partial**（暂停于 checkpoint） |
 
 > Stability 在 3 个独立 epoch 中跨过了 `H_anchor+E=15`，并注入/检索了全部 3 个
 > early-fact probe（`EF-ALPHA-4471`、`EF-BETA-2098`、`EF-GAMMA-6603`）。
@@ -92,6 +92,7 @@ $env:STORYFORGE_EVAL_REAL_LLM='1'
 $env:STORYFORGE_EVAL_MAX_CALLS='300'   # Full 用 700
 $env:STORYFORGE_EVAL_MAX_TURNS='30'    # Full 用 100
 $env:STORYFORGE_EVAL_TIMEOUT_SECS='120'
+$env:STORYFORGE_EVAL_MAX_TOKENS='384000' # 可选；不设置则不发送 max_tokens
 $env:STORYFORGE_EVAL_ENDURANCE_STAGE='stability'  # canary|coverage|stability|full
 $env:STORYFORGE_EVAL_EVIDENCE_DIR='C:\tmp\endurance-evidence-stability'
 cargo test -p harness-real-llm --test endurance_real_llm endurance_real_llm_full_100_turn -- --ignored --nocapture
@@ -104,7 +105,7 @@ cargo test -p harness-real-llm --test endurance_real_llm endurance_real_llm_full
 | Canary | 30 | 1 | 1/1 |
 | Coverage | 106（含 resume） | 1 | 2/2 |
 | Stability | 282（含 3 次 resume） | 3 | 3/3 |
-| Full | 推进中 | — | — |
+| Full | 415（45/100 Accept，含 resume） | 5 | 1/3 已检查通过 |
 
 **API key 从未写入仓库、证据 JSONL、日志、命令示例或 RESULT。** 证据目录通过
 `STORYFORGE_EVAL_EVIDENCE_DIR` 显式配置，不在 git 追踪范围内。
@@ -165,7 +166,7 @@ Stability 阶段通过 3 次断点续跑完成（5→10→20→30），验证了
 | Canary | `C:\tmp\endurance-evidence-canary-3\` |
 | Coverage | `C:\tmp\endurance-evidence-coverage\` |
 | Stability | `C:\tmp\endurance-evidence-stability\` |
-| Full | `C:\tmp\endurance-evidence-full\`（推进中） |
+| Full | `C:\tmp\endurance-evidence-full\`（暂停于 45/100，可续跑） |
 
 每个目录包含：`endurance_calls.jsonl`、`endurance_turns.jsonl`、
 `endurance_checkpoint.jsonl`、`endurance_manifest.jsonl`、`campaign_data/`。
@@ -174,8 +175,8 @@ Stability 阶段通过 3 次断点续跑完成（5→10→20→30），验证了
 
 ## 未完成项与风险
 
-1. **Full 100-turn 尚未完整跑完**：`deepseek-v4-flash` 每轮 5-8 分钟，100 轮需 8-12 小时。
-   当前仍在后台推进。中断后从 checkpoint 续跑，不重放已 accept 的轮次。完成的最高
+1. **Full 100-turn 尚未完整跑完**：当前 checkpoint 为 45/100 Accept、415/700 calls。
+   当前没有后台进程；后续可从 checkpoint 续跑，不重放已 accept 的轮次。完成的最高
    checkpoint 即为 **Partial Evidence** 边界。
 2. **Chronicle path 仍为 synthetic fixture**：harness 没有可安全复用的生产
    Summarizer/PostProcessor/TurnAttempt 后台写回公开接口。`production_postprocess_complete=false`。
