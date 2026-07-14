@@ -438,7 +438,11 @@ function Invoke-ReleaseSecretScan {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $untracked = @(& git -C $RepoRoot ls-files --others --exclude-standard 2>&1)
+        # A user-level core.excludesFile is outside the release input boundary.
+        # Ignore it so an unreadable host-global ignore cannot masquerade as an
+        # untracked path or make a clean repository scan fail. Repository-local
+        # .gitignore/.git/info/exclude rules remain part of --exclude-standard.
+        $untracked = @(& git -C $RepoRoot -c 'core.excludesFile=' ls-files --others --exclude-standard 2>&1)
         $utCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEap
@@ -1570,7 +1574,9 @@ function Test-ReleaseWorkflowSyntaxWithNodeYaml {
     # Use Node's process.argv only; no shell interpolation of workflow content.
     $js = @'
 const fs = require("fs");
-const path = process.argv[1];
+// argv[1] is this temporary helper script; argv[2] is the workflow requested
+// by the PowerShell caller (`node <tmpJs> <workflowPath>`).
+const path = process.argv[2];
 function fail(msg) {
   process.stdout.write(JSON.stringify({ valid: false, error_count: 1, errors: [msg], engine: "node-yaml" }));
   process.exit(0);

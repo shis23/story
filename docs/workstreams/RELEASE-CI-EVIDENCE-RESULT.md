@@ -27,11 +27,13 @@ available in this environment. All evidence below is from local validation only.
 
 | # | Hash | Message |
 |---|------|---------|
-| 1 | `49f5cbf` | `feat(release): add provenance, manifest schema, hash, and workflow validation helpers` |
-| 2 | `3dd022d` | `feat(release): wire provenance, hash sidecars, schema validation into runners` |
-| 3 | `dcdb5cc` | `ci(gitea): add fast gate and host artifact evidence workflows` |
-| 4 | `65dd82f` | `docs(workstream): chronicle release CI evidence result` |
-| 5 | _this remediation_ | `fix(release-ci): stage subjects, harden scan/YAML/workflows, offline-verifiable packages` |
+| 1 | `db53e6c` | `docs(workstream): plan release CI evidence` |
+| 2 | `49f5cbf` | `feat(release): add provenance, manifest schema, hash, and workflow validation helpers` |
+| 3 | `3dd022d` | `feat(release): wire provenance, hash sidecars, schema validation into runners` |
+| 4 | `dcdb5cc` | `ci(gitea): add fast gate and host artifact evidence workflows` |
+| 5 | `65dd82f` | `docs(workstream): chronicle release CI evidence result` |
+| 6 | `ad9da1b` | `fix(release-ci): stage subjects, harden scan/YAML/workflows for offline verification` |
+| 7 | `afae42a` | `fix(release-ci): pin tauri-cli path, require real YAML parser, fail-closed untracked scan` |
 
 ## Files Changed
 
@@ -42,7 +44,7 @@ available in this environment. All evidence below is from local validation only.
 | `scripts/release-build/ReleaseBuild.Common.ps1` | **Modified** — added `New-ReleaseProvenance`, `Write-ReleaseHashFile`, `Test-ReleaseArchiveIntegrity`, `Assert-ReleaseManifestSchema`, `Test-ReleaseWorkflowSyntax` |
 | `scripts/run-release-build.ps1` | **Modified** — wired provenance, hash sidecars, schema validation, retention empty-guard |
 | `scripts/run-android-host-pipeline.ps1` | **Modified** — wired provenance, hash sidecars, archive integrity, schema validation, SBOM inventory, retention empty-guard |
-| `scripts/tests/ReleaseBuild.CI.Tests.ps1` | **New** — 20 Pester tests for provenance, hash files, archive integrity, manifest schema, workflow validation, governance |
+| `scripts/tests/ReleaseBuild.CI.Tests.ps1` | **New** — 30 Pester tests for provenance, hash files, archive integrity, manifest schema, workflow validation, governance, and the Node-only parser path |
 | `scripts/tests/run-release-build-tests.ps1` | **Modified** — registered `ReleaseBuild.CI.Tests.ps1` in the test runner |
 | `docs/workstreams/RELEASE-CI-EVIDENCE-RESULT.md` | **New** — this document |
 
@@ -50,7 +52,7 @@ available in this environment. All evidence below is from local validation only.
 
 ### `ci-gates.yml` — Fast PR / Push Gates
 
-Triggered on all pushes and pull requests. Six parallel jobs:
+Triggered on all pushes and pull requests. Seven parallel jobs:
 
 | Job | Runner | Timeout | Purpose |
 |-----|--------|---------|---------|
@@ -59,8 +61,8 @@ Triggered on all pushes and pull requests. Six parallel jobs:
 | `rust-test` | ubuntu-latest | 45m | `cargo test --workspace` |
 | `frontend-gate` | ubuntu-latest | 20m | `npm ci` (strict), `npm test`, `npm run build` |
 | `pester-release-tests` | windows-latest | 20m | Full Pester suite + `verify-release -SecretScanOnly` |
-| `secret-scan` | ubuntu-latest | 10m | Fail-closed repository secret scan |
-| `workflow-syntax` | ubuntu-latest | 5m | YAML syntax validation of all `.gitea/workflows/` files |
+| `secret-scan` | windows-latest | 10m | Fail-closed repository secret scan |
+| `workflow-syntax` | windows-latest | 10m | YAML syntax validation of all `.gitea/workflows/` files with pinned PyYAML |
 
 **Governance features:**
 - `concurrency: { group: ci-gates-${{ github.ref }}, cancel-in-progress: true }`
@@ -95,22 +97,30 @@ All in `scripts/release-build/ReleaseBuild.Common.ps1`:
 | `Write-ReleaseHashFile` | Writes `<file>.sha256` sidecar in `sha256sum -c` format (`<hash> *<basename>`). |
 | `Test-ReleaseArchiveIntegrity` | Opens a zip/APK archive with `System.IO.Compression` to confirm it is not truncated/corrupt. |
 | `Assert-ReleaseManifestSchema` | Validates manifest required fields, `build_status` values, acceptance scope (GUI/device must be `not_claimed`), and that present artifacts always carry sha256. |
-| `Test-ReleaseWorkflowSyntax` | Validates a workflow YAML file parses without errors using local Python+PyYAML. Returns `{ Valid, ErrorCount, Errors }`. |
+| `Test-ReleaseWorkflowSyntax` | Requires a real YAML parser: PyYAML, or Node `yaml`/`js-yaml` when installed. The production path fails closed if neither is available; returns `{ Valid, ErrorCount, Errors }`. |
 
 ## Local Validation Gates
 
-### Pester Tests (79 total, 0 failed)
+### Pester Tests (81 total, 0 failed)
 
 ```
 ReleaseBuild.Tests.ps1:           Passed: 37  Failed: 0
 ReleaseBuild.Pipeline.Tests.ps1:  Passed: 14  Failed: 0
-ReleaseBuild.CI.Tests.ps1:        Passed: 28  Failed: 0
+ReleaseBuild.CI.Tests.ps1:        Passed: 30  Failed: 0
 ```
 
 Command:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\run-release-build-tests.ps1
 ```
+
+**Parser evidence boundary:** this workstation has neither PyYAML nor a global
+Node `yaml`/`js-yaml` package, so generic local parser tests verify the required
+`Engine=none` fail-closed result. The Node-only tests inject an isolated module
+and use JSON (a YAML subset) to prove that the helper reads the requested
+workflow argument for both valid and malformed input. The actual workflow
+syntax job installs pinned PyYAML before parsing every workflow, but that remote
+job has not yet run.
 
 ### Dry Runs
 
@@ -201,8 +211,10 @@ Addressed review findings that would have blocked merge/CI:
    binaries/APKs under `subjects/<kind>/` with matching `.sha256` sidecars inside
    the evidence directory. Provenance subjects now point at those staged paths.
    The Windows evidence job re-hashes subjects after staging before upload.
-2. **YAML validation no longer hard-requires python:** pure-PowerShell structural
-   validator always available (`-PreferPowerShell`); python+PyYAML is optional.
+2. **YAML validation requires a real parser:** CI installs pinned
+   `PyYAML==6.0.2`; local callers can instead use Node `yaml`/`js-yaml` when it
+   is installed. Pure-PowerShell structural validation is test-only via explicit
+   `-PreferPowerShell`, and the production path fails closed without a real parser.
 3. **Ubuntu jobs:** install GTK/WebKit Tauri system deps and build `frontend/dist`
    before clippy/test. Secret-scan and workflow-syntax jobs run on Windows with
    `pwsh` (no bare `shell: powershell` on Ubuntu).
@@ -215,14 +227,19 @@ Addressed review findings that would have blocked merge/CI:
 7. **`.sha256` written UTF-8 without BOM** via `UTF8Encoding($false)`.
 8. **Pester 5:** `Run.PassThru = $true` set so result objects are returned.
 9. **ZIP/APK integrity reads entry payloads**, not just entry names.
-10. **Host evidence defaults to `-SkipBundle`** (`skip_bundle` default `true`);
-    tags also host-only. Explicit `skip_bundle=false` installs pinned
+10. **The host-evidence workflow defaults to `-SkipBundle`** (`skip_bundle`
+    default `true`); tags also host-only. This does not change the bare
+    `run-release-build.ps1` default, which still requests a bundle unless passed
+    `-SkipBundle`. Explicit workflow `skip_bundle=false` installs pinned
     `tauri-cli==2.11.2` via `cargo install --locked` before bundling.
-11. **Workflow YAML validation requires a real parser** (PyYAML or Node
-    yaml/js-yaml). Structural PowerShell checks are test-only
-    (`-PreferPowerShell`); CI installs pinned `PyYAML==6.0.2`.
+11. **The Node fallback parses the requested workflow file** rather than its
+    generated helper script; Node-only valid and malformed-workflow tests cover
+    this path without invoking PyYAML.
 12. **Untracked secret scan is fail-closed** on `git ls-files` failure, unread
     files, and inputs larger than 2 MiB (no silent skip).
+    Host-global `core.excludesFile` is explicitly isolated so an unreadable
+    personal ignore file cannot be mistaken for a repository input; repository
+    ignore rules remain in force.
 
 ### Verified: No path/command output leakage
 

@@ -254,7 +254,7 @@ Describe 'ReleaseBuild manifest schema validation' {
 }
 
 Describe 'ReleaseBuild workflow YAML validation' {
-    It 'validates a well-formed workflow file with a real YAML parser' {
+    It 'validates a well-formed workflow with a real parser or fails closed without one' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
         try {
@@ -269,9 +269,14 @@ Describe 'ReleaseBuild workflow YAML validation' {
                 '      - run: echo hello'
             ) | Set-Content -LiteralPath $wf -Encoding utf8
             $result = Test-ReleaseWorkflowSyntax -Path $wf
-            $result.Valid | Should Be $true
-            $result.ErrorCount | Should Be 0
-            $result.Engine | Should Match 'pyyaml|node-yaml'
+            if ($result.Engine -eq 'none') {
+                $result.Valid | Should Be $false
+                ($result.Errors -join ' ') | Should Match 'No real YAML parser'
+            } else {
+                $result.Valid | Should Be $true
+                $result.ErrorCount | Should Be 0
+                $result.Engine | Should Match 'pyyaml|node-yaml'
+            }
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -297,7 +302,11 @@ Describe 'ReleaseBuild workflow YAML validation' {
             $result = Test-ReleaseWorkflowSyntax -Path $wf
             $result.Valid | Should Be $false
             $result.ErrorCount | Should BeGreaterThan 0
-            $result.Engine | Should Match 'pyyaml|node-yaml'
+            if ($result.Engine -eq 'none') {
+                ($result.Errors -join ' ') | Should Match 'No real YAML parser'
+            } else {
+                $result.Engine | Should Match 'pyyaml|node-yaml'
+            }
             if ($structural.Valid) {
                 $result.Valid | Should Be $false
             }
@@ -323,22 +332,104 @@ Describe 'ReleaseBuild workflow YAML validation' {
             ) | Set-Content -LiteralPath $wf -Encoding utf8
             $result = Test-ReleaseWorkflowSyntax -Path $wf
             $result.Valid | Should Be $false
-            ($result.Errors -join ' ') | Should Match 'jobs'
+            if ($result.Engine -eq 'none') {
+                ($result.Errors -join ' ') | Should Match 'No real YAML parser'
+            } else {
+                ($result.Errors -join ' ') | Should Match 'jobs'
+            }
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
 
+Describe 'ReleaseBuild Node-only workflow YAML validation' {
+    It 'parses the requested valid workflow with the Node parser path' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-node-yaml-valid-{0}" -f [guid]::NewGuid().ToString('N'))
+        $previousNodePath = $env:NODE_PATH
+        New-Item -ItemType Directory -Path (Join-Path $dir 'node_modules\yaml') -Force | Out-Null
+        try {
+            # JSON is a YAML subset. The isolated module deliberately requires the
+            # target marker, so passing the generated helper script instead fails.
+            @'
+exports.parse = function (text) {
+  if (!text.includes('node_only_marker')) {
+    throw new Error('expected the requested workflow file');
+  }
+  return JSON.parse(text.replace(/^\uFEFF/, ''));
+};
+'@ | Set-Content -LiteralPath (Join-Path $dir 'node_modules\yaml\index.js') -Encoding utf8
+            $workflow = Join-Path $dir 'valid.yml'
+            @'
+{
+  "node_only_marker": "valid",
+  "name": "node-only-valid",
+  "jobs": { "build": { "runs-on": "windows-latest" } }
+}
+'@ | Set-Content -LiteralPath $workflow -Encoding utf8
+            $env:NODE_PATH = (Join-Path $dir 'node_modules')
+
+            $node = Get-Command node -ErrorAction Stop
+            $result = Test-ReleaseWorkflowSyntaxWithNodeYaml -Path $workflow -NodeCommand $node.Source
+
+            $result.Valid | Should Be $true
+            $result.Engine | Should Be 'node-yaml'
+        } finally {
+            $env:NODE_PATH = $previousNodePath
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects malformed requested workflow with the Node parser path' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-node-yaml-invalid-{0}" -f [guid]::NewGuid().ToString('N'))
+        $previousNodePath = $env:NODE_PATH
+        New-Item -ItemType Directory -Path (Join-Path $dir 'node_modules\yaml') -Force | Out-Null
+        try {
+            @'
+exports.parse = function (text) {
+  if (!text.includes('node_only_marker')) {
+    throw new Error('expected the requested workflow file');
+  }
+  return JSON.parse(text.replace(/^\uFEFF/, ''));
+};
+'@ | Set-Content -LiteralPath (Join-Path $dir 'node_modules\yaml\index.js') -Encoding utf8
+            $workflow = Join-Path $dir 'invalid.yml'
+            @'
+{
+  "node_only_marker": "invalid",
+  "name": "node-only-invalid",
+'@ | Set-Content -LiteralPath $workflow -Encoding utf8
+            $env:NODE_PATH = (Join-Path $dir 'node_modules')
+
+            $node = Get-Command node -ErrorAction Stop
+            $result = Test-ReleaseWorkflowSyntaxWithNodeYaml -Path $workflow -NodeCommand $node.Source
+
+            $result.Valid | Should Be $false
+            $result.Engine | Should Be 'node-yaml'
+            ($result.Errors -join ' ') | Should Match 'YAML parse error'
+        } finally {
+            $env:NODE_PATH = $previousNodePath
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Describe 'ReleaseBuild Gitea workflow governance checks' {
-    It 'all tracked workflow files parse without syntax errors' {
+    It 'parses tracked workflows with a real parser or fails closed without one' {
         $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
         $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File -ErrorAction SilentlyContinue) +
                  @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
         @($files).Count | Should BeGreaterThan 0
-        foreach ($f in $files) {
-            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
-            $result.Valid | Should Be $true
+        $results = @($files | ForEach-Object { Test-ReleaseWorkflowSyntax -Path $_.FullName })
+        if (@($results | Where-Object { $_.Engine -eq 'none' }).Count -gt 0) {
+            # The CI workflow installs PyYAML. A minimal local test environment
+            # must not silently substitute heuristic parsing.
+            $noneCount = @($results | Where-Object { $_.Engine -eq 'none' }).Count
+            $totalCount = @($results).Count
+            $noneCount | Should Be $totalCount
+            @($results | Where-Object { $_.Valid }).Count | Should Be 0
+        } else {
+            @($results | Where-Object { -not $_.Valid }).Count | Should Be 0
         }
     }
 
@@ -459,8 +550,13 @@ Describe 'ReleaseBuild workflow syntax structural fallback' {
             $structural.Valid | Should Be $true
             $structural.Engine | Should Match 'powershell'
             $real = Test-ReleaseWorkflowSyntax -Path $wf
-            $real.Valid | Should Be $true
-            $real.Engine | Should Match 'pyyaml|node-yaml'
+            if ($real.Engine -eq 'none') {
+                $real.Valid | Should Be $false
+                ($real.Errors -join ' ') | Should Match 'No real YAML parser'
+            } else {
+                $real.Valid | Should Be $true
+                $real.Engine | Should Match 'pyyaml|node-yaml'
+            }
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
