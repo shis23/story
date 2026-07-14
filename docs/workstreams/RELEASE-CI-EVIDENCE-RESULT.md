@@ -23,7 +23,7 @@ and Android host). Added comprehensive Pester coverage for every new helper.
 **Remote Gitea Actions execution is unverified** — no Gitea Actions runner is
 available in this environment. All evidence below is from local validation only.
 
-## Commits
+## Prior Implementation Commits
 
 | # | Hash | Message |
 |---|------|---------|
@@ -34,6 +34,7 @@ available in this environment. All evidence below is from local validation only.
 | 5 | `65dd82f` | `docs(workstream): chronicle release CI evidence result` |
 | 6 | `ad9da1b` | `fix(release-ci): stage subjects, harden scan/YAML/workflows for offline verification` |
 | 7 | `afae42a` | `fix(release-ci): pin tauri-cli path, require real YAML parser, fail-closed untracked scan` |
+| 8 | `71db1a3` | `fix(release-ci): verify node yaml fallback and host excludes` |
 
 ## Files Changed
 
@@ -44,7 +45,7 @@ available in this environment. All evidence below is from local validation only.
 | `scripts/release-build/ReleaseBuild.Common.ps1` | **Modified** — added `New-ReleaseProvenance`, `Write-ReleaseHashFile`, `Test-ReleaseArchiveIntegrity`, `Assert-ReleaseManifestSchema`, `Test-ReleaseWorkflowSyntax` |
 | `scripts/run-release-build.ps1` | **Modified** — wired provenance, hash sidecars, schema validation, retention empty-guard |
 | `scripts/run-android-host-pipeline.ps1` | **Modified** — wired provenance, hash sidecars, archive integrity, schema validation, SBOM inventory, retention empty-guard |
-| `scripts/tests/ReleaseBuild.CI.Tests.ps1` | **New** — 30 Pester tests for provenance, hash files, archive integrity, manifest schema, workflow validation, governance, and the Node-only parser path |
+| `scripts/tests/ReleaseBuild.CI.Tests.ps1` | **New** — 31 Pester tests for provenance, hash files, archive integrity, manifest schema, workflow validation, governance, Node-only parser dispatch, and global-excludes handling |
 | `scripts/tests/run-release-build-tests.ps1` | **Modified** — registered `ReleaseBuild.CI.Tests.ps1` in the test runner |
 | `docs/workstreams/RELEASE-CI-EVIDENCE-RESULT.md` | **New** — this document |
 
@@ -101,12 +102,12 @@ All in `scripts/release-build/ReleaseBuild.Common.ps1`:
 
 ## Local Validation Gates
 
-### Pester Tests (81 total, 0 failed)
+### Pester Tests (82 total, 0 failed)
 
 ```
 ReleaseBuild.Tests.ps1:           Passed: 37  Failed: 0
 ReleaseBuild.Pipeline.Tests.ps1:  Passed: 14  Failed: 0
-ReleaseBuild.CI.Tests.ps1:        Passed: 30  Failed: 0
+ReleaseBuild.CI.Tests.ps1:        Passed: 31  Failed: 0
 ```
 
 Command:
@@ -116,9 +117,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\run-release-
 
 **Parser evidence boundary:** this workstation has neither PyYAML nor a global
 Node `yaml`/`js-yaml` package, so generic local parser tests verify the required
-`Engine=none` fail-closed result. The Node-only tests inject an isolated module
-and use JSON (a YAML subset) to prove that the helper reads the requested
-workflow argument for both valid and malformed input. The actual workflow
+`Engine=none` fail-closed result. The Node-only tests mock Python discovery,
+inject an isolated `yaml.parse` adapter, and call the public dispatcher with
+JSON (a YAML subset), proving Node selection plus the requested-workflow
+argument for both valid and malformed input. This is a wrapper-contract test,
+not a compatibility suite for a third-party YAML package. The actual workflow
 syntax job installs pinned PyYAML before parsing every workflow, but that remote
 job has not yet run.
 
@@ -232,14 +235,18 @@ Addressed review findings that would have blocked merge/CI:
     `run-release-build.ps1` default, which still requests a bundle unless passed
     `-SkipBundle`. Explicit workflow `skip_bundle=false` installs pinned
     `tauri-cli==2.11.2` via `cargo install --locked` before bundling.
-11. **The Node fallback parses the requested workflow file** rather than its
-    generated helper script; Node-only valid and malformed-workflow tests cover
-    this path without invoking PyYAML.
+11. **The public Node fallback selects and parses the requested workflow file**
+    rather than its generated helper script when Python discovery is unavailable;
+    Node-only valid and malformed-workflow tests cover that wrapper contract
+    without invoking PyYAML. They do not claim third-party YAML-package
+    compatibility beyond the `load`/`parse` interface.
 12. **Untracked secret scan is fail-closed** on `git ls-files` failure, unread
     files, and inputs larger than 2 MiB (no silent skip).
     Host-global `core.excludesFile` is explicitly isolated so an unreadable
     personal ignore file cannot be mistaken for a repository input; repository
-    ignore rules remain in force.
+    ignore rules remain in force. A deterministic temporary-repository test
+    proves a globally excluded secret is still caught while a committed
+    repository ignore rule remains honored.
 
 ### Verified: No path/command output leakage
 

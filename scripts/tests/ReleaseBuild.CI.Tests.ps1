@@ -344,13 +344,14 @@ Describe 'ReleaseBuild workflow YAML validation' {
 }
 
 Describe 'ReleaseBuild Node-only workflow YAML validation' {
-    It 'parses the requested valid workflow with the Node parser path' {
+    It 'selects Node and parses the requested valid workflow when Python is unavailable' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-node-yaml-valid-{0}" -f [guid]::NewGuid().ToString('N'))
         $previousNodePath = $env:NODE_PATH
         New-Item -ItemType Directory -Path (Join-Path $dir 'node_modules\yaml') -Force | Out-Null
         try {
-            # JSON is a YAML subset. The isolated module deliberately requires the
-            # target marker, so passing the generated helper script instead fails.
+            # JSON is a YAML subset. This isolated adapter implements yaml.parse
+            # and deliberately requires the target marker, so passing the
+            # generated helper script instead fails.
             @'
 exports.parse = function (text) {
   if (!text.includes('node_only_marker')) {
@@ -369,18 +370,20 @@ exports.parse = function (text) {
 '@ | Set-Content -LiteralPath $workflow -Encoding utf8
             $env:NODE_PATH = (Join-Path $dir 'node_modules')
 
-            $node = Get-Command node -ErrorAction Stop
-            $result = Test-ReleaseWorkflowSyntaxWithNodeYaml -Path $workflow -NodeCommand $node.Source
+            Mock Get-Command { $null } -ParameterFilter { $Name -in @('python', 'python3') }
+            $result = Test-ReleaseWorkflowSyntax -Path $workflow
 
             $result.Valid | Should Be $true
             $result.Engine | Should Be 'node-yaml'
+            Assert-MockCalled Get-Command -ParameterFilter { $Name -eq 'python' } -Times 1 -Scope It -Exactly
+            Assert-MockCalled Get-Command -ParameterFilter { $Name -eq 'python3' } -Times 1 -Scope It -Exactly
         } finally {
             $env:NODE_PATH = $previousNodePath
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
-    It 'rejects malformed requested workflow with the Node parser path' {
+    It 'selects Node and rejects malformed requested workflow when Python is unavailable' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-node-yaml-invalid-{0}" -f [guid]::NewGuid().ToString('N'))
         $previousNodePath = $env:NODE_PATH
         New-Item -ItemType Directory -Path (Join-Path $dir 'node_modules\yaml') -Force | Out-Null
@@ -401,12 +404,14 @@ exports.parse = function (text) {
 '@ | Set-Content -LiteralPath $workflow -Encoding utf8
             $env:NODE_PATH = (Join-Path $dir 'node_modules')
 
-            $node = Get-Command node -ErrorAction Stop
-            $result = Test-ReleaseWorkflowSyntaxWithNodeYaml -Path $workflow -NodeCommand $node.Source
+            Mock Get-Command { $null } -ParameterFilter { $Name -in @('python', 'python3') }
+            $result = Test-ReleaseWorkflowSyntax -Path $workflow
 
             $result.Valid | Should Be $false
             $result.Engine | Should Be 'node-yaml'
             ($result.Errors -join ' ') | Should Match 'YAML parse error'
+            Assert-MockCalled Get-Command -ParameterFilter { $Name -eq 'python' } -Times 1 -Scope It -Exactly
+            Assert-MockCalled Get-Command -ParameterFilter { $Name -eq 'python3' } -Times 1 -Scope It -Exactly
         } finally {
             $env:NODE_PATH = $previousNodePath
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -519,6 +524,60 @@ Describe 'ReleaseBuild secret scan untracked inputs' {
             [System.IO.File]::WriteAllBytes($big, $bytes)
             { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
         } finally {
+            Pop-Location
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'ignores unsafe host-global excludes while preserving repository ignore rules' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-scan-global-excludes-{0}" -f [guid]::NewGuid().ToString('N'))
+        $previousGlobalConfig = $env:GIT_CONFIG_GLOBAL
+        $previousNoSystem = $env:GIT_CONFIG_NOSYSTEM
+        New-Item -ItemType Directory -Path $repo | Out-Null
+        Push-Location $repo
+        try {
+            & git init --quiet | Out-Null
+            & git config user.email 'test@example.com'
+            & git config user.name 'test'
+            Set-Content -LiteralPath (Join-Path $repo 'README.md') -Value 'ok' -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $repo '.gitignore') -Value 'repo-ignored.env' -Encoding utf8
+            & git add README.md .gitignore
+            & git commit -m 'init' --quiet | Out-Null
+
+            # Simulate a host-global exclude that would hide an untracked secret
+            # from --exclude-standard. Release scanning must override it, while
+            # the committed repository .gitignore remains effective.
+            $globalExcludes = Join-Path $repo 'host-global-excludes'
+            $globalConfig = Join-Path $repo 'host-global.gitconfig'
+            Set-Content -LiteralPath $globalExcludes -Value 'globally-hidden.env' -Encoding utf8
+            & git config --file $globalConfig core.excludesFile $globalExcludes
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to configure synthetic global excludes file.' }
+            $env:GIT_CONFIG_GLOBAL = $globalConfig
+            $env:GIT_CONFIG_NOSYSTEM = '1'
+
+            $fake = 'sk' + '-' + ('g' * 24)
+            Set-Content -LiteralPath (Join-Path $repo 'globally-hidden.env') -Value ("API_TOKEN=$fake") -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $repo 'repo-ignored.env') -Value ("API_TOKEN=$fake") -Encoding utf8
+
+            # The global pattern is ignored by the release scanner, so the hidden
+            # secret must be found rather than silently skipped.
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
+
+            Remove-Item -LiteralPath (Join-Path $repo 'globally-hidden.env') -Force
+            # The repository-owned ignore rule is still honored; its fake secret
+            # must not be scanned as an untracked build input.
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Not Throw
+        } finally {
+            if ($null -eq $previousGlobalConfig) {
+                Remove-Item Env:\GIT_CONFIG_GLOBAL -ErrorAction SilentlyContinue
+            } else {
+                $env:GIT_CONFIG_GLOBAL = $previousGlobalConfig
+            }
+            if ($null -eq $previousNoSystem) {
+                Remove-Item Env:\GIT_CONFIG_NOSYSTEM -ErrorAction SilentlyContinue
+            } else {
+                $env:GIT_CONFIG_NOSYSTEM = $previousNoSystem
+            }
             Pop-Location
             Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
         }
