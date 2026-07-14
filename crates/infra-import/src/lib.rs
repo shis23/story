@@ -96,6 +96,52 @@ pub fn strip_utf8_bom(data: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn real_card_evidence_write_failure_fails_the_smoke_contract_without_host_path() {
+        let character = import_character_from_json(
+            &serde_json::to_vec(&make_test_card_json()).expect("serialize synthetic card"),
+        )
+        .expect("synthetic card imports");
+        let evidence = crate::compat::sanitize_real_card_evidence(&character);
+        let root = std::env::temp_dir().join(format!(
+            "sf-real-card-evidence-blocker-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary root");
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").expect("create file blocker");
+
+        let panic = std::panic::catch_unwind(|| {
+            persist_real_card_evidence_or_fail(
+                &evidence,
+                &blocker.join("evidence.json"),
+                "artifacts/import-export-compat/real-card-evidence.json",
+            );
+        })
+        .expect_err("a real-card smoke evidence write failure must fail the test");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(message.contains("REAL-CARD EVIDENCE WRITE FAILED"));
+        assert!(!message.contains(&root.display().to_string()));
+
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir(&root);
+    }
+
+    fn persist_real_card_evidence_or_fail(
+        evidence: &crate::compat::RealCardEvidence,
+        path: &std::path::Path,
+        evidence_rel: &str,
+    ) {
+        crate::compat::write_real_card_evidence(evidence, path).unwrap_or_else(|err| {
+            panic!("REAL-CARD EVIDENCE WRITE FAILED: {evidence_rel} ({err})")
+        });
+        println!("REAL-CARD EVIDENCE PATH: {evidence_rel}");
+    }
+
     /// 构造一个最小的 ST V3 角色卡 JSON
     fn make_test_card_json() -> serde_json::Value {
         serde_json::json!({
@@ -562,10 +608,7 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
             .join("..")
             .join("..")
             .join(evidence_rel);
-        match crate::compat::write_real_card_evidence(&evidence, &evidence_path) {
-            Ok(_) => println!("REAL-CARD EVIDENCE PATH: {evidence_rel}"),
-            Err(e) => println!("REAL-CARD EVIDENCE WRITE SKIPPED: {e}"),
-        }
+        persist_real_card_evidence_or_fail(&evidence, &evidence_path, evidence_rel);
     }
 
     #[test]

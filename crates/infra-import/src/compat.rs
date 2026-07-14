@@ -1631,11 +1631,11 @@ pub fn write_real_card_evidence(
 ) -> Result<std::path::PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create evidence dir {}: {e}", parent.display()))?;
+            .map_err(|e| format!("create real-card evidence directory: {e}"))?;
     }
     let json = serde_json::to_string_pretty(evidence)
         .map_err(|e| format!("serialize real-card evidence: {e}"))?;
-    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(path, json).map_err(|e| format!("write real-card evidence: {e}"))?;
     Ok(path.to_path_buf())
 }
 

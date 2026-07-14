@@ -62,14 +62,13 @@ $fixture = if ([System.IO.Path]::IsPathRooted($FixturePath)) {
 }
 
 if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
-  throw "Complex card fixture not found: $fixture"
+  throw "Complex card fixture not found: use -FixturePath or place test-card.png at the repository root."
 }
 
 $resolvedFixture = (Resolve-Path -LiteralPath $fixture).Path
 
 Write-Host "StoryForge real-card smoke"
-Write-Host "Root: $root"
-Write-Host "Fixture: $resolvedFixture"
+Write-Host "Fixture: configured (path withheld)"
 
 $previousFixture = $env:SF_COMPLEX_CARD_FIXTURE
 try {
