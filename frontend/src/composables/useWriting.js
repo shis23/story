@@ -38,6 +38,7 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   cancelPromptHooks?: () => void,
  *   isPromptHooksCancelled?: () => boolean,
  *   startWritingApi?: (...args: any[]) => Promise<object>,
+ *   getConversationApi?: (conversationId: string) => Promise<object | null>,
  *   cancelWritingApi?: () => Promise<unknown>,
  *   applyConversation?: (conv: object) => void,
  *   broadcastPluginEvent?: (event: string, data?: object) => void,
@@ -56,6 +57,7 @@ export function useWriting(options = {}) {
   const runPromptHookEvents = options.runPromptHookEvents || ((intent) => Promise.resolve(intent))
   const isPromptHooksCancelled = options.isPromptHooksCancelled || (() => false)
   const startWritingApi = options.startWritingApi || apiStartWriting
+  const getConversationApi = options.getConversationApi || getConversation
   const cancelWritingApi = options.cancelWritingApi || apiCancelWriting
   const applyConversation = options.applyConversation || (() => {})
   const broadcastPluginEvent = options.broadcastPluginEvent || (() => {})
@@ -146,16 +148,12 @@ export function useWriting(options = {}) {
       if (streamingIdx >= 0) {
         writingStore.messages.splice(streamingIdx, 1)
       }
-      const refreshed = await getConversation(campaignStore.currentConversationId)
+      const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
         writingStore.messages.forEach((m) => {
           if (m.role === 'assistant') m.role_label = getAssistantRoleLabel()
         })
-        broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(msgId, {
-          reason: 'writing_complete',
-          content: text,
-        }))
       } else {
         writingStore.messages.push({
           id: msgId,
@@ -166,15 +164,21 @@ export function useWriting(options = {}) {
             id: `v-${Date.now()}`,
             content: text,
             display_content: text,
-            status: 'final',
+            // The pipeline has produced a Draft only. It remains mutable and
+            // may be discarded until the explicit Accept command succeeds.
+            status: 'draft',
             provenance: null,
           }],
         })
-        broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(msgId, {
-          reason: 'writing_complete',
-          content: text,
-        }))
       }
+      // A produced draft is deliberately not a received/committed message.
+      // Only useMessageVariants.handleAcceptVariant may publish the terminal
+      // MESSAGE_RECEIVED fan-out after the backend has accepted this variant.
+      broadcastPluginEvent(ST_EVENT_TYPES.GENERATION_ENDED, messageEventPayload(msgId, {
+        reason: 'draft_ready',
+        draft: true,
+        variantStatus: 'Draft',
+      }))
 
       writingStore.pipeline.state = 'done'
       writingStore.pipeline.stateLabel = '已完成'

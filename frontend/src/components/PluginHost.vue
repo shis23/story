@@ -251,10 +251,15 @@ function onWindowMessage(event) {
 
 onMounted(() => {
   handler = createHostHandler(props.plugin, invoke, { isTrustedSource: isTrustedPluginSource })
+  // Outer promptHooks.js owns the timeout budget and timeout audit status.
+  // Disabling the bridge timer prevents double 5s timeouts that would settle
+  // as ok with the fallback payload before the outer runtime can classify
+  // status=timeout.
   hookBridge = createPluginHookBridge(props.plugin, {
     getTarget: () => iframeRef.value?.contentWindow,
     isTrustedSource: isTrustedPluginSource,
     targetOrigin: PLUGIN_IFRAME_TARGET_ORIGIN,
+    timeoutMs: null,
     onError: (error) => {
       emit('error', { pluginId: props.plugin.id, error: String(error?.message || error) })
     },
@@ -279,6 +284,7 @@ watch(() => props.plugin, (newPlugin) => {
       getTarget: () => iframeRef.value?.contentWindow,
       isTrustedSource: isTrustedPluginSource,
       targetOrigin: PLUGIN_IFRAME_TARGET_ORIGIN,
+      timeoutMs: null,
       onError: (error) => {
         emit('error', { pluginId: newPlugin.id, error: String(error?.message || error) })
       },

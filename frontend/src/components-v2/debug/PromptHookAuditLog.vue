@@ -41,7 +41,12 @@ function statusVariant(status) {
     case 'ok': return 'ok'
     case 'no_change': return 'neutral'
     case 'error': return 'err'
+    case 'timeout': return 'warn'
+    case 'cancelled': return 'neutral'
     case 'missing_host': return 'warn'
+    case 'unloaded': return 'warn'
+    case 'revoked': return 'warn'
+    case 'budget_exceeded': return 'warn'
     case 'audit_error': return 'err'
     default: return 'neutral'
   }

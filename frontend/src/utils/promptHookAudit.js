@@ -20,6 +20,9 @@ const SAFE_STATUSES = new Set([
   'error',
   'audit_error',
   'missing_host',
+  'unloaded',
+  'revoked',
+  'budget_exceeded',
 ])
 const SAFE_SUMMARY_TYPES = new Set([
   'array',
@@ -63,6 +66,20 @@ function sanitizeFieldName(value) {
   return text
 }
 
+// Correlation / generation ids may start with digits (e.g. "1") or use
+// structured forms like "hook:1:2". Keep them when they are short and free of
+// secret-like material; otherwise hash-redact.
+const SAFE_CORRELATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}$/
+
+function sanitizeCorrelationId(value) {
+  const text = String(value ?? '')
+  if (!text) return ''
+  if (!SAFE_CORRELATION_PATTERN.test(text) || FORBIDDEN_VALUE_PATTERN.test(text)) {
+    return redactLabel(text)
+  }
+  return text
+}
+
 function sanitizePluginLabel(value) {
   const text = String(value ?? '')
   if (!SAFE_PLUGIN_LABEL_PATTERN.test(text) || FORBIDDEN_VALUE_PATTERN.test(text)) {
@@ -93,6 +110,24 @@ function sanitizeStatus(value) {
 function sanitizeHash(value) {
   const text = String(value ?? '')
   return /^[a-f0-9]{8,64}$/i.test(text) ? text : hashString(text)
+}
+
+function sanitizeIntegrityHash(value) {
+  try {
+    const text = String(value ?? '')
+    return /^[a-f0-9]{8,64}$/i.test(text) ? text.toLowerCase() : null
+  } catch {
+    return null
+  }
+}
+
+function sanitizeRecordedAt(value) {
+  try {
+    const number = Number(value)
+    return Number.isSafeInteger(number) && number >= 0 ? number : null
+  } catch {
+    return null
+  }
 }
 
 function sanitizeLength(value) {
@@ -292,6 +327,14 @@ export function sanitizePromptHookAuditRecord(record) {
     inputSummary: sanitizeSummaryObject(record.inputSummary || {}),
     outputSummary: sanitizeSummaryObject(record.outputSummary || {}),
     error: sanitizeError(record.error),
+    correlationId: sanitizeCorrelationId(record.correlationId || ''),
+    generationId: sanitizeCorrelationId(record.generationId || ''),
+    // Integrity metadata is safe structured data. Preserve it at every
+    // sanitizer boundary so export/query/pagination can be independently
+    // checked without carrying raw prompt material.
+    recordedAt: sanitizeRecordedAt(record.recordedAt),
+    recordHash: sanitizeIntegrityHash(record.recordHash),
+    prevHash: record.prevHash === null ? null : sanitizeIntegrityHash(record.prevHash),
   }
 }
 
@@ -303,17 +346,19 @@ export function sanitizePromptHookAuditRecord(record) {
  */
 export function exportPromptHookAudit(records) {
   const safeRecords = Array.isArray(records)
-    ? records.map((record) => sanitizePromptHookAuditRecord(record))
+    ? records.map((record) => preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record)))
     : []
+  const integrity = verifyAuditRecordChain(safeRecords)
   return JSON.stringify(
     {
       exportedAt: new Date().toISOString(),
       kind: 'prompt_hook_audit_export',
       schema: {
         identity: ['pluginId', 'pluginName', 'event', 'stage'],
-        timing: ['durationMs'],
+        timing: ['durationMs', 'recordedAt'],
         outcome: ['status', 'changedKeys', 'error'],
         redaction: ['inputSummary', 'outputSummary'],
+        integrity: ['recordHash', 'prevHash'],
         guarantees: [
           'no_full_prompt_bodies',
           'no_private_memory_text',
@@ -322,6 +367,7 @@ export function exportPromptHookAudit(records) {
         ],
       },
       totalRecords: safeRecords.length,
+      integrity,
       records: safeRecords,
     },
     null,
@@ -338,4 +384,310 @@ export function exportPromptHookAudit(records) {
  */
 export function parsePromptHookAuditExport(jsonStr) {
   return JSON.parse(jsonStr)
+}
+
+// ─── query / filter / pagination / integrity chain / retention ───────────────
+//
+// Integrity notes (honest claims):
+// - Hashes are FNV-1a 32-bit over sanitized fields. They detect accidental
+//   mutation / reordering of the local ring buffer; they are NOT a
+//   cryptographic tamper-evident seal, have no trusted head, and cannot resist
+//   a motivated attacker who rewrites the whole chain.
+// - Always re-sanitize at query/export/chain boundaries.
+
+const HASHABLE_AUDIT_FIELDS = Object.freeze([
+  'pluginId',
+  'pluginName',
+  'event',
+  'stage',
+  'status',
+  'durationMs',
+  'changedKeys',
+  'inputSummary',
+  'outputSummary',
+  'error',
+  'correlationId',
+  'generationId',
+  'recordedAt',
+])
+
+/**
+ * Deterministically serialize an audit record's hashable fields. Produces a
+ * stable canonical string regardless of key insertion order so equivalent
+ * records hash identically. Only sanitized-shape fields participate; no raw
+ * prompt bodies or secrets are part of the material.
+ */
+function canonicalRecordMaterial(record) {
+  const safe = sanitizePromptHookAuditRecord(record)
+  const parts = []
+  for (const field of HASHABLE_AUDIT_FIELDS) {
+    parts.push(`${field}=${stableStringify(safe[field])}`)
+  }
+  return parts.join('|')
+}
+
+function stableStringify(value, seen = new WeakSet()) {
+  const type = typeof value
+  if (value === null || value === undefined) return String(value)
+  if (type === 'string') return JSON.stringify(value)
+  if (type === 'number' || type === 'boolean') return String(value)
+  if (type === 'bigint') return `${value}n`
+  if (type === 'symbol' || type === 'function') return type
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[circular]'
+    seen.add(value)
+    return `[${value.map((item) => stableStringify(item, seen)).join(',')}]`
+  }
+  if (type === 'object') {
+    if (seen.has(value)) return '{circular}'
+    seen.add(value)
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key], seen)}`).join(',')}}`
+  }
+  return String(value)
+}
+
+/**
+ * Compute an integrity hash over the sanitized record shape. Deterministic
+ * across key reordering; never includes raw prompts/secrets (those are dropped
+ * by sanitizePromptHookAuditRecord before hashing).
+ *
+ * Not a cryptographic seal: FNV-1a 32-bit, no trusted head. Use
+ * verifyAuditRecordChain for local accidental-corruption detection.
+ */
+export function computeAuditRecordHash(record, prevHash = record?.prevHash ?? null) {
+  const previous = prevHash === null ? null : sanitizeIntegrityHash(prevHash)
+  return hashString(`${previous}|${canonicalRecordMaterial(record)}`)
+}
+
+/**
+ * Filter audit records. Every record is re-sanitized at this boundary so
+ * hostile fields injected into the ring buffer cannot leak through a query.
+ *
+ * @param {Array<object>} records
+ * @param {object} [filters] - pluginId, event, stage, status, correlationId,
+ *   generationId, minDurationMs, maxDurationMs, sinceMs, untilMs
+ * @returns {Array<object>} sanitized matching records
+ */
+export function queryPromptHookAudit(records, filters = {}) {
+  if (!Array.isArray(records)) return []
+  const safeFilters = filters && typeof filters === 'object' ? filters : {}
+  const minDuration = Number.isFinite(safeFilters.minDurationMs) ? safeFilters.minDurationMs : null
+  const maxDuration = Number.isFinite(safeFilters.maxDurationMs) ? safeFilters.maxDurationMs : null
+  const since = Number.isFinite(safeFilters.sinceMs) ? safeFilters.sinceMs : null
+  const until = Number.isFinite(safeFilters.untilMs) ? safeFilters.untilMs : null
+
+  const out = []
+  for (const raw of records) {
+    const safe = sanitizePromptHookAuditRecord(raw)
+    if (safeFilters.pluginId !== undefined && safe.pluginId !== safeFilters.pluginId) continue
+    if (safeFilters.event !== undefined && safe.event !== safeFilters.event) continue
+    if (safeFilters.stage !== undefined && safe.stage !== safeFilters.stage) continue
+    if (safeFilters.status !== undefined && safe.status !== safeFilters.status) continue
+    if (safeFilters.correlationId !== undefined && (safe.correlationId || null) !== (safeFilters.correlationId || null)) continue
+    if (safeFilters.generationId !== undefined && (safe.generationId || null) !== (safeFilters.generationId || null)) continue
+    if (minDuration !== null && safe.durationMs < minDuration) continue
+    if (maxDuration !== null && safe.durationMs > maxDuration) continue
+    const recordedAt = sanitizeRecordedAt(raw?.recordedAt)
+    if (since !== null && (recordedAt === null || recordedAt < since)) continue
+    if (until !== null && (recordedAt === null || recordedAt > until)) continue
+    // Preserve verified-safe integrity metadata for downstream inspection.
+    out.push(preserveIntegrityMeta(raw, safe))
+  }
+  return out
+}
+
+/** Return a query result together with an executable integrity verdict. */
+export function queryPromptHookAuditWithIntegrity(records, filters = {}) {
+  const matched = queryPromptHookAudit(records, filters)
+  return { records: matched, integrity: verifyAuditRecordChain(matched) }
+}
+
+/**
+ * Deterministic ordering + bounded pagination over sanitized records.
+ * orderBy supports: recordedAt, durationMs, pluginId, event, status.
+ * Default order is insertion order (no sort), limit/offset applied.
+ */
+export function paginateAuditRecords(records, options = {}) {
+  const safe = Array.isArray(records)
+    ? records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
+    : []
+  const orderBy = options.orderBy
+  const order = options.order === 'asc' ? 'asc' : 'desc'
+  const limit = Number.isFinite(options.limit) && options.limit >= 0 ? Math.floor(options.limit) : safe.length
+  const offset = Number.isFinite(options.offset) && options.offset >= 0 ? Math.floor(options.offset) : 0
+
+  if (orderBy) {
+    const getter = (record) => {
+      if (orderBy === 'recordedAt') return record.recordedAt ?? null
+      if (orderBy === 'durationMs') return record.durationMs ?? 0
+      return record[orderBy] ?? ''
+    }
+    safe.sort((a, b) => {
+      const av = getter(a)
+      const bv = getter(b)
+      if (av === bv) return 0
+      if (av === null || av === undefined) return 1
+      if (bv === null || bv === undefined) return -1
+      return av < bv ? -1 : 1
+    })
+    if (order === 'desc') safe.reverse()
+  }
+
+  return safe.slice(offset, offset + limit)
+}
+
+/** Return a page together with an executable integrity verdict. */
+export function paginateAuditRecordsWithIntegrity(records, options = {}) {
+  const page = paginateAuditRecords(records, options)
+  return { records: page, integrity: verifyAuditRecordChain(page) }
+}
+
+/**
+ * Build a local integrity chain over sanitized records. Each record gets a
+ * recordHash computed from its sanitized shape plus the previous record's
+ * hash (prevHash). Deterministic: re-chaining identical input yields identical
+ * hashes; mutating any record invalidates its own and all downstream hashes
+ * for accidental-corruption detection.
+ *
+ * This is NOT a cryptographic tamper-evident log (no trusted head / verifier).
+ *
+ * @param {Array<object>} records
+ * @returns {Array<object>} sanitized records with { recordHash, prevHash }
+ */
+export function chainAuditRecords(records, previousHash = null) {
+  const safe = Array.isArray(records)
+    ? records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
+    : []
+  let prevHash = previousHash === null ? null : sanitizeIntegrityHash(previousHash)
+  return safe.map((record) => {
+    const recordHash = computeAuditRecordHash(record, prevHash)
+    const chained = { ...record, recordHash, prevHash }
+    prevHash = recordHash
+    return chained
+  })
+}
+
+/**
+ * Verify a stored local integrity-chain segment without rewriting it.
+ *
+ * This is intentionally only accidental-corruption detection: FNV-1a is not
+ * cryptographic and there is no externally trusted head. The verifier makes
+ * that limited property executable instead of merely documented.
+ */
+export function verifyAuditRecordChain(records) {
+  if (!Array.isArray(records)) {
+    return { valid: false, recordCount: 0, invalidIndex: null, reason: 'not_an_array', headHash: null }
+  }
+  const safe = records.map((record) => preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record)))
+  let previousHash = null
+  for (let index = 0; index < safe.length; index += 1) {
+    const record = safe[index]
+    if (!record.recordHash) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'missing_record_hash', headHash: previousHash }
+    }
+    if (index > 0 && record.prevHash !== previousHash) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'previous_hash_mismatch', headHash: previousHash }
+    }
+    const expected = computeAuditRecordHash(record, record.prevHash)
+    if (record.recordHash !== expected) {
+      return { valid: false, recordCount: safe.length, invalidIndex: index, reason: 'record_hash_mismatch', headHash: previousHash }
+    }
+    previousHash = record.recordHash
+  }
+  return { valid: true, recordCount: safe.length, invalidIndex: null, reason: null, headHash: previousHash }
+}
+
+/**
+ * Append one sanitized record only after verifying the persisted segment.
+ * Only an empty ring may initialize itself. A non-empty list without hashes is
+ * ambiguous (it could be a historical legacy list or a chain stripped by an
+ * attacker), so it is fail-closed rather than silently re-signed. Any future
+ * legacy migration must be explicit and versioned outside this append path.
+ */
+export function appendAuditRecordWithIntegrity(records, record, limit = 100) {
+  const rawExisting = Array.isArray(records) ? records : []
+  const existing = rawExisting
+    .map((entry) => preserveIntegrityMeta(entry, sanitizePromptHookAuditRecord(entry)))
+  // Sanitization may turn invalid hashes into null, but that must remain a
+  // fail-closed corruption signal rather than granting a silent re-chain.
+  const hasAnyIntegrityMetadata = rawExisting.some((entry) => (
+    entry
+    && typeof entry === 'object'
+    && (
+      Object.prototype.hasOwnProperty.call(entry, 'recordHash')
+      || Object.prototype.hasOwnProperty.call(entry, 'prevHash')
+    )
+  ))
+  if (rawExisting.length > 0 && !hasAnyIntegrityMetadata) {
+    return {
+      records: existing,
+      integrity: {
+        valid: false,
+        recordCount: existing.length,
+        invalidIndex: 0,
+        reason: 'missing_integrity_metadata',
+        headHash: null,
+      },
+      appended: false,
+    }
+  }
+  const initialized = existing
+  const integrity = verifyAuditRecordChain(initialized)
+  if (!integrity.valid) {
+    return { records: initialized, integrity, appended: false }
+  }
+  const safeRecord = preserveIntegrityMeta(record, sanitizePromptHookAuditRecord(record))
+  const prevHash = integrity.headHash
+  const next = {
+    ...safeRecord,
+    prevHash,
+    recordHash: computeAuditRecordHash(safeRecord, prevHash),
+  }
+  const retained = retainAuditRecords([...initialized, next], limit)
+  return {
+    records: retained,
+    integrity: verifyAuditRecordChain(retained),
+    appended: true,
+  }
+}
+
+/**
+ * Retention helper: keep the most recent `limit` records (by recordedAt when
+ * available, otherwise insertion order). Bounds the ring buffer size. Returns
+ * the retained records in their original insertion order (newest-first display
+ * is the caller's responsibility).
+ */
+function preserveIntegrityMeta(raw, sanitized) {
+  const out = {
+    ...sanitized,
+    recordedAt: sanitizeRecordedAt(raw?.recordedAt),
+    recordHash: sanitizeIntegrityHash(raw?.recordHash),
+    prevHash: raw?.prevHash === null ? null : sanitizeIntegrityHash(raw?.prevHash),
+  }
+  return out
+}
+
+export function retainAuditRecords(records, limit = 100) {
+  if (!Array.isArray(records)) return []
+  const safe = records.map((r) => preserveIntegrityMeta(r, sanitizePromptHookAuditRecord(r)))
+  const max = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : 100
+  if (safe.length <= max) return safe
+  // Pick the most-recent `max` records by recordedAt (then insertion index),
+  // then return them in their original insertion order.
+  const indexed = safe.map((record, index) => ({ record, index }))
+  const keepIndices = new Set(
+    [...indexed]
+      .sort((a, b) => {
+        const ar = a.record.recordedAt
+        const br = b.record.recordedAt
+        if (ar === br) return b.index - a.index
+        if (ar === null) return 1
+        if (br === null) return -1
+        return br - ar
+      })
+      .slice(0, max)
+      .map((entry) => entry.index),
+  )
+  return safe.filter((_, index) => keepIndices.has(index))
 }

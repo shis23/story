@@ -18,6 +18,7 @@ import {
   READ_MEMORY_PERMISSION,
   ST_EVENT_TYPES,
 } from '../src/plugin-bridge.js'
+import { createSaveChatAdapter } from '../src/utils/pluginPersistence.js'
 
 function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyforge.local', storage = new Map(), options = {}) {
   const listeners = {}
@@ -48,6 +49,8 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     },
     localStorage: window.localStorage,
     console,
+    setTimeout,
+    clearTimeout,
   }
   sandbox.globalThis = sandbox
 
@@ -1559,9 +1562,10 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(await window.setChatMessage({ variables: { hp: 5 } }, 1), true)
   assert.deepEqual(plain(window.SillyTavern.chat[1].variables), { hp: 5 })
   const savePending = window.SillyTavern.saveChat()
+  // saveChat now tries the host persistence route first; the synchronous
+  // degraded marker stays present until the host (or its timeout) answers.
   assert.equal(savePending.degraded, true)
   assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
-  assert.equal(await savePending, true)
   assert.equal(await window.SillyTavern.callGenericPopup('prompt', window.SillyTavern.POPUP_TYPE.INPUT, '10'), '10')
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', window.SillyTavern.POPUP_TYPE.CONFIRM), null)
   assert.equal(await window.SillyTavern.callGenericPopup('confirm cleanup?', 2), null)
@@ -1582,7 +1586,12 @@ test('provides SillyTavern globals and chat message helpers for ST compatibility
   assert.equal(window.toastr._calls.length, 2)
   window.toastr.clear()
   assert.equal(window.toastr._calls.length, 0)
-  assert.equal(postedMessages.length, readyMessageCount)
+  // saveChat posted one chat.save request to the host (still pending); no
+  // other stray messages should have been emitted beyond that.
+  const saveRequests = postedMessages
+    .filter((entry) => entry.message.type === MSG_REQUEST && entry.message.method === 'chat.save')
+  assert.equal(saveRequests.length, 1)
+  assert.equal(saveRequests[0].message.pluginId, 'plugin-a')
 })
 
 test('backfills ST popup constants on preexisting partial SillyTavern globals', async () => {
@@ -1834,4 +1843,342 @@ test('persists extension_settings through host storage when iframe localStorage 
     second.window.SillyTavern.getContext().extension_settings,
     second.window.extension_settings,
   )
+})
+
+test('host saveChat route calls the injected persistence adapter', async () => {
+  const saved = []
+  const adapter = createSaveChatAdapter({
+    async persist(snapshot) {
+      saved.push(snapshot)
+      return { ok: true, persistedAt: 'ts-1' }
+    },
+  })
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-1',
+      method: 'chat.save',
+      params: { chat: [{ role: 'user', content: 'hi' }] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.deepEqual(saved, [
+    { pluginId: 'plugin-a', chat: [{ role: 'user', content: 'hi' }] },
+  ])
+  assert.equal(source.posted.at(-1).message.result.ok, true)
+  assert.equal(source.posted.at(-1).message.result.degraded, false)
+  assert.equal(source.posted.at(-1).message.result.persistedAt, 'ts-1')
+})
+
+test('host saveChat route deduplicates a timed-out retry of the same chat snapshot', async () => {
+  let persistCalls = 0
+  let releasePersist
+  const adapter = createSaveChatAdapter({
+    persist() {
+      persistCalls += 1
+      return new Promise((resolve) => { releasePersist = resolve })
+    },
+  })
+  const handler = createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  const makeEvent = (id) => ({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id,
+      method: 'chat.save',
+      params: { chat: [{ role: 'user', content: 'same snapshot' }] },
+    },
+    source: { posted: [], postMessage(message) { this.posted.push(message) } },
+    origin: 'https://plugin.example',
+  })
+  const first = makeEvent('save-first')
+  const retry = makeEvent('save-retry')
+
+  const firstPending = handler(first)
+  await Promise.resolve()
+  const retryPending = handler(retry)
+  await Promise.resolve()
+  assert.equal(persistCalls, 1)
+
+  releasePersist({ ok: true, persistedAt: 'ts-deduplicated' })
+  await Promise.all([firstPending, retryPending])
+  assert.equal(first.source.posted.at(-1).result.persistedAt, 'ts-deduplicated')
+  assert.equal(retry.source.posted.at(-1).result.persistedAt, 'ts-deduplicated')
+})
+
+test('host saveChat idempotency survives handler recreation with the same adapter', async () => {
+  let persistCalls = 0
+  let releasePersist
+  const adapter = createSaveChatAdapter({
+    persist() {
+      persistCalls += 1
+      return new Promise((resolve) => { releasePersist = resolve })
+    },
+  })
+  const makeHandler = () => createHostHandler(
+    { id: 'plugin-a', permissions: [] },
+    async () => null,
+    { saveChatAdapter: adapter },
+  )
+  const makeEvent = (id) => ({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id,
+      method: 'chat.save',
+      params: { chat: [{ role: 'assistant', content: 'same snapshot after remount' }] },
+    },
+    source: { posted: [], postMessage(message) { this.posted.push(message) } },
+    origin: 'https://plugin.example',
+  })
+  const first = makeEvent('save-before-remount')
+  const retry = makeEvent('save-after-remount')
+
+  const firstPending = makeHandler()(first)
+  await Promise.resolve()
+  const retryPending = makeHandler()(retry)
+  await Promise.resolve()
+  assert.equal(persistCalls, 1)
+
+  releasePersist({ ok: true, persistedAt: 'ts-remount-safe' })
+  await Promise.all([firstPending, retryPending])
+  assert.equal(first.source.posted.at(-1).result.persistedAt, 'ts-remount-safe')
+  assert.equal(retry.source.posted.at(-1).result.persistedAt, 'ts-remount-safe')
+})
+
+test('host saveChat route falls back to degraded when no adapter is injected', async () => {
+  const source = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const handler = createHostHandler({ id: 'plugin-a', permissions: [] }, async () => null)
+
+  await handler({
+    data: {
+      type: MSG_REQUEST,
+      pluginId: 'plugin-a',
+      id: 'save-2',
+      method: 'chat.save',
+      params: { chat: [] },
+    },
+    source,
+    origin: 'https://plugin.example',
+  })
+
+  assert.equal(source.posted.at(-1).message.result.ok, true)
+  assert.equal(source.posted.at(-1).message.result.degraded, true)
+  assert.equal(source.posted.at(-1).message.result.reason, 'local_mirror_only_no_host_persist')
+})
+
+test('iframe saveChat tries host persistence and preserves degraded promise when host unavailable', async () => {
+  const { window } = createBridgeSandbox('plugin-a', 'https://host.example')
+  // No host is listening (parent.postMessage records but no response),
+  // so the iframe must keep the ST-compatible degraded promise. The synchronous
+  // degraded marker is present until the host adapter (or its timeout) answers.
+  const savePending = window.SillyTavern.saveChat()
+  assert.equal(savePending.degraded, true)
+  assert.equal(savePending.reason, 'local_mirror_only_no_host_persist')
+  assert.equal(typeof savePending.then, 'function')
+})
+
+test('iframe saveChat timeout reports an unknown persistence outcome', async () => {
+  const { window } = createBridgeSandbox('plugin-a', 'https://host.example')
+  const pending = window.SillyTavern.saveChat()
+
+  assert.equal(await pending, true)
+  assert.equal(pending.degraded, true)
+  assert.equal(pending.reason, 'persist_outcome_unknown')
+  assert.equal(pending.outcomeUnknown, true)
+  assert.equal(pending.persistedAt, null)
+})
+
+test('iframe saveChat resolves with persisted metadata when host acknowledges save', async () => {
+  const { window, postedMessages, postHostMessage } = createBridgeSandbox('plugin-a', 'https://host.example')
+
+  const savePromise = window.SillyTavern.saveChat()
+  await flushPromises()
+
+  const request = postedMessages
+    .map((entry) => entry.message)
+    .find((message) => message.type === MSG_REQUEST && message.method === 'chat.save')
+  assert.ok(request, 'iframe should post a chat.save request to the host')
+
+  // Simulate the host responding with a persisted result.
+  postHostMessage({
+    type: MSG_RESPONSE,
+    id: request.id,
+    result: { ok: true, degraded: false, persistedAt: 'ts-iframe' },
+  })
+  await flushPromises()
+
+  const resolved = await savePromise
+  assert.equal(resolved, true)
+  assert.equal(savePromise.degraded, false)
+  assert.equal(savePromise.persistedAt, 'ts-iframe')
+})
+
+// ─── committed alias + slash pipe hardening + correlation ────────────────────
+
+test('does not fan out MESSAGE_* from bare pipeline state_changed{Committed} after draft', () => {
+  // append_ai_draft → PipelineState::Committed is NOT a user Accept. Plugins
+  // must not receive MESSAGE_RECEIVED/CHAT_CHANGED before Accept/Discard.
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { state: 'Committed', session_id: 's1', variant_id: 'v1' },
+  })
+  assert.deepEqual(events.map((e) => e.event), [
+    'pipeline.state_changed',
+    'state_changed',
+  ])
+  assert.equal(events.some((e) => e.event === 'MESSAGE_RECEIVED'), false)
+  assert.equal(events.some((e) => e.event === 'CHAT_CHANGED'), false)
+  assert.equal(events.some((e) => e.event === 'committed'), false)
+})
+
+test('does not derive committed alias from nested StateChanged draft payload', () => {
+  const events = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: { change: { Committed: { variant_id: 'v9' } }, session_id: 's1' },
+  })
+  assert.equal(events.some((e) => e.event === 'MESSAGE_RECEIVED'), false)
+  assert.equal(events.some((e) => e.event === 'committed'), false)
+})
+
+test('fans out MESSAGE_* only for terminal turn commit events', () => {
+  const terminal = mapPipelineEventToPluginEvents({
+    event_type: 'committed',
+    data: { session_id: 's1', variant_id: 'v1' },
+  })
+  assert.deepEqual(terminal.map((e) => e.event), [
+    'pipeline.committed',
+    'committed',
+    'MESSAGE_RECEIVED',
+    'CHARACTER_MESSAGE_RENDERED',
+    'CHAT_CHANGED',
+  ])
+
+  const marked = mapPipelineEventToPluginEvents({
+    event_type: 'state_changed',
+    data: {
+      state: 'Committed',
+      turnStatus: 'Committed',
+      attemptStatus: 'Committed',
+      variantStatus: 'Final',
+      terminalTurnCommit: true,
+    },
+  })
+  assert.ok(marked.some((e) => e.event === 'MESSAGE_RECEIVED'))
+  assert.ok(marked.some((e) => e.event === 'CHAT_CHANGED'))
+})
+
+test('slash pipe stops at an unknown segment and does not run later segments', () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+
+  window.registerSlashCommand('echo', (rawArgs) => {
+    calls.push(['echo', rawArgs])
+    return rawArgs.toUpperCase()
+  })
+  window.registerSlashCommand('after', (rawArgs, context) => {
+    calls.push(['after', rawArgs, context.pipe])
+    return 'ran-after'
+  })
+
+  // An unknown middle segment must hard-fail and stop the pipeline so the
+  // later registered segment never runs.
+  assert.throws(
+    () => window.triggerSlash('/echo hi | missing | after tail'),
+    /Unsupported slash command: missing/,
+  )
+  assert.deepEqual(calls, [['echo', 'hi']])
+})
+
+test('slash pipe surfaces an unsupported result object for a single unknown command', () => {
+  const { window } = createBridgeSandbox()
+  const result = window.triggerSlash('/totally-unknown arg')
+  assert.equal(result.unsupported, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'unsupported_slash_command')
+  assert.equal(result.command, 'totally-unknown')
+})
+
+test('async slash pipe cancels remaining segments when an upstream segment rejects', async () => {
+  const { window } = createBridgeSandbox()
+  const calls = []
+  window.registerSlashCommand('boom', async () => {
+    calls.push('boom')
+    throw new Error('upstream failure')
+  })
+  window.registerSlashCommand('after', () => {
+    calls.push('after')
+    return 'after'
+  })
+
+  await assert.rejects(
+    window.triggerSlash('/boom | after'),
+    /upstream failure/,
+  )
+  assert.deepEqual(calls, ['boom'])
+})
+
+test('host hook bridge ignores late duplicate response id after settle', async () => {
+  const target = {
+    posted: [],
+    postMessage(message, targetOrigin) {
+      this.posted.push({ message, targetOrigin })
+    },
+  }
+  const hookBridge = createPluginHookBridge(
+    { id: 'plugin-a' },
+    {
+      getTarget: () => target,
+      isTrustedSource: (event) => event.source === target,
+      targetOrigin: '*',
+      timeoutMs: 1000,
+    },
+  )
+
+  const payload = { prompt: 'base' }
+  const promise = hookBridge.emitAndWait('CHAT_COMPLETION_PROMPT_READY', payload)
+  const request = target.posted.at(-1).message
+
+  // First trusted response settles the hook.
+  assert.equal(
+    hookBridge.handleMessage({
+      source: target,
+      data: { type: MSG_HOOK_RESPONSE, pluginId: 'plugin-a', id: request.id, result: { prompt: 'first' } },
+    }),
+    true,
+  )
+  // A late duplicate response with the same id must be ignored.
+  assert.equal(
+    hookBridge.handleMessage({
+      source: target,
+      data: { type: MSG_HOOK_RESPONSE, pluginId: 'plugin-a', id: request.id, result: { prompt: 'late' } },
+    }),
+    false,
+  )
+
+  assert.deepEqual(await promise, { prompt: 'first' })
 })

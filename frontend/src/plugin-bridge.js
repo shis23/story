@@ -17,6 +17,15 @@ export const DEFAULT_PLUGIN_HOOK_TIMEOUT_MS = 5000
 export const PROMPT_HOOK_PERMISSION = 'ModifyPrompt'
 export const READ_MEMORY_PERMISSION = 'ReadMemory'
 
+// Host-side persistence adapters. Default import is a no-op until a host wires
+// a real adapter; this keeps `chat.save` deterministic and out of tauri-app.
+import {
+  applyPersistenceAdapters as applyAdapters,
+  createDefaultSaveChatAdapter,
+  classifySaveChatResult,
+  PERSISTENCE_DEGRADED_REASON,
+} from './utils/pluginPersistence.js'
+
 export const ST_EVENT_TYPES = Object.freeze({
   APP_READY: 'APP_READY',
   CHAT_CHANGED: 'CHAT_CHANGED',
@@ -86,6 +95,17 @@ function deriveSillyTavernHostEventNames(eventName, data = {}) {
 }
 
 const HOST_PLUGIN_STORAGE_FALLBACK = new Map()
+const HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER = new WeakMap()
+const MAX_DEDUPED_SAVE_CHAT_REQUESTS = 128
+
+function saveChatRequestsForAdapter(adapter) {
+  let requests = HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.get(adapter)
+  if (!requests) {
+    requests = new Map()
+    HOST_SAVE_CHAT_REQUESTS_BY_ADAPTER.set(adapter, requests)
+  }
+  return requests
+}
 
 function hostPluginStorageKey(pluginId, key) {
   return [
@@ -137,6 +157,25 @@ function writeHostPluginStorage(pluginId, key, value) {
   HOST_PLUGIN_STORAGE_FALLBACK.set(storageKey, value)
 }
 
+// A bounded host-local key for idempotent chat persistence. It never leaves the
+// host or logs the chat body. Repeating the exact snapshot after an iframe
+// timeout joins the original in-flight persistence request instead of writing
+// it twice.
+function saveChatSnapshotKey(pluginId, chat) {
+  let snapshot = ''
+  try {
+    snapshot = JSON.stringify(chat ?? [])
+  } catch {
+    snapshot = '[unserializable-chat]'
+  }
+  let hash = 2166136261
+  for (let index = 0; index < snapshot.length; index += 1) {
+    hash ^= snapshot.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return `${String(pluginId)}:${(hash >>> 0).toString(16)}:${snapshot.length}`
+}
+
 // ─── 方法 → 权限 + Tauri 命令映射 ──────────────────────────────────────────
 
 export const API_METHODS = {
@@ -148,6 +187,11 @@ export const API_METHODS = {
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端
   'storage.set':      { permission: null,              command: null },
+  // Host-side adapter routes (no backend command). Defaults are degraded shims;
+  // production can inject real adapters without editing tauri-app storage code.
+  'chat.save':        { permission: null,              command: null },
+  'ui.popup':         { permission: null,              command: null },
+  'ui.requestHeaders':{ permission: null,              command: null },
   'llm.generate':     { permission: 'CallLlm',         command: 'start_writing',     params: (p) => ({ intent: p.intent ?? p.prompt ?? '' }) },
 }
 
@@ -270,6 +314,43 @@ function createPluginEventPayload(pipelineEvent, options = {}) {
 }
 
 /**
+ * Only true terminal turn commits may fan out to MESSAGE_RECEIVED /
+ * CHARACTER_MESSAGE_RENDERED / CHAT_CHANGED.
+ *
+ * Pipeline `state_changed{Committed}` after `append_ai_draft` is NOT a user
+ * Accept: the variant is still Draft and may be discarded. Mapping that state
+ * to ST message events would let plugins mutate variables/network/storage
+ * before Accept with no rollback path.
+ *
+ * Allowed sources:
+ * - event_type === 'committed' (PipelineEvent::Committed)
+ * - explicit terminal markers on the payload (turn/attempt accepted final)
+ */
+export function isTerminalTurnCommitEvent(pipelineEvent) {
+  if (!pipelineEvent?.event_type) return false
+  if (pipelineEvent.event_type === 'committed') return true
+  if (pipelineEvent.event_type !== 'state_changed') return false
+  const data = pipelineEvent.data && typeof pipelineEvent.data === 'object'
+    ? pipelineEvent.data
+    : {}
+  // Explicit accept / finalization markers only. Bare pipeline state labels
+  // like "Committed" after draft write are intentionally excluded.
+  if (data.terminalTurnCommit === true || data.turnCommitted === true || data.accepted === true) {
+    return true
+  }
+  const turnStatus = String(data.turnStatus || data.turn_status || '').toLowerCase()
+  const attemptStatus = String(data.attemptStatus || data.attempt_status || '').toLowerCase()
+  const variantStatus = String(data.variantStatus || data.variant_status || '').toLowerCase()
+  if (
+    (turnStatus === 'committed' || turnStatus === 'degraded')
+    && (attemptStatus === 'committed' || attemptStatus === 'final' || variantStatus === 'final')
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
  * 将 Tauri WritingEvent 映射为插件可订阅事件。
  *
  * 同时发送 StoryForge 原生事件名（pipeline.xxx / xxx）和少量 ST 常用别名；
@@ -283,8 +364,14 @@ export function mapPipelineEventToPluginEvents(pipelineEvent, plugin = null) {
   const names = [
     `pipeline.${pipelineEvent.event_type}`,
     pipelineEvent.event_type,
-    ...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []),
   ]
+  // Only terminal turn commits get ST message/chat aliases. Bare
+  // state_changed{Committed} after draft append must not.
+  if (isTerminalTurnCommitEvent(pipelineEvent)) {
+    names.push('committed', ...(ST_EVENT_ALIASES.committed || []))
+  } else if (pipelineEvent.event_type !== 'committed') {
+    names.push(...(ST_EVENT_ALIASES[pipelineEvent.event_type] || []))
+  }
 
   return uniqueEventNames(names)
     .filter((name) => {
@@ -1020,26 +1107,137 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     return Promise.resolve(true);
   }
 
-  function _saveChat() {
-    // Local chat mirror only — no host conversation persist path yet.
+  function _degradedSaveChatPending() {
+    // Local chat mirror only fallback — no host persistence result.
     // Keep ST boolean compatibility: awaited value is true, while the
     // promise object itself carries a visible degraded marker.
     const pending = Promise.resolve(true);
     pending.ok = true;
     pending.degraded = true;
     pending.reason = 'local_mirror_only_no_host_persist';
+    pending.persistedAt = null;
+    pending.outcomeUnknown = false;
     return pending;
   }
 
+  function _stampSaveChatPending(pending, result) {
+    pending.ok = result?.ok !== false;
+    pending.degraded = Boolean(result?.degraded);
+    pending.reason = result?.reason || null;
+    pending.persistedAt = result?.persistedAt ?? null;
+    pending.outcomeUnknown = Boolean(result?.outcomeUnknown);
+    return pending;
+  }
+
+  function _saveChat() {
+    // Try the host-side persistence adapter first (chat.save route). When the
+    // host is unavailable, rejects, times out, or returns a degraded marker,
+    // fall back to the local-mirror degraded promise so ST plugins keep working
+    // (await saveChat() resolves truthy === ST boolean compatibility).
+    if (!_canPostToHost()) return _degradedSaveChatPending();
+
+    // A single stampable promise object so synchronous property reads before
+    // resolution AND the resolved value both reflect host/degraded state.
+    let resolveSave
+    let settled = false
+    const pending = new Promise((resolve) => { resolveSave = resolve })
+    pending.ok = true
+    pending.degraded = true
+    pending.reason = 'local_mirror_only_no_host_persist'
+    pending.persistedAt = null
+    pending.outcomeUnknown = false
+    // Generation token correlates this iframe call. Host-side snapshot
+    // idempotency owns durable retry safety; ignoring a late response alone is
+    // not enough to prevent a second persistence side effect.
+    const generation = String(++_reqId) + ':saveChat'
+
+    const finish = function(result) {
+      if (settled) return
+      settled = true
+      _stampSaveChatPending(pending, result || {})
+      resolveSave(true)
+    }
+
+    // A timeout means persistence may still complete at the host. Preserve ST's
+    // truthy await contract, but expose outcome_unknown instead of claiming a
+    // known local-only fallback.
+    const timer = setTimeout(function() {
+      finish({
+        ok: false,
+        degraded: true,
+        reason: 'persist_outcome_unknown',
+        persistedAt: null,
+        timedOut: true,
+        outcomeUnknown: true,
+        generation: generation,
+      })
+    }, 500)
+
+    _call('chat.save', { chat: _chat, generation: generation })
+      .then(function(result) {
+        clearTimeout(timer)
+        // Late success after timeout must not flip the already-settled promise
+        // or imply a second durable write for the same saveChat call.
+        if (settled) return
+        finish(result)
+      })
+      .catch(function() {
+        clearTimeout(timer)
+        if (settled) return
+        finish(null)
+      })
+
+    return pending
+  }
+
+  function _degradedPopupValue(type, defaultValue) {
+    if (defaultValue !== undefined) return String(defaultValue)
+    if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return null
+    return ''
+  }
+
   function _callGenericPopup(html, type, defaultValue) {
-    // No native popup UI; return ST-compatible degraded defaults.
-    if (defaultValue !== undefined) return Promise.resolve(String(defaultValue));
-    if (type === _popupTypes.CONFIRM || String(type || '').toLowerCase() === 'confirm') return Promise.resolve(null);
-    return Promise.resolve('');
+    // Host popup adapter when available; race a short timeout so missing host
+    // handlers never hang ST plugins forever.
+    if (_canPostToHost()) {
+      return Promise.race([
+        _call('ui.popup', {
+          html: html,
+          type: type,
+          defaultValue: defaultValue,
+        }).then(function(result) {
+          if (result && typeof result === 'object' && 'value' in result) return result.value
+          return result
+        }),
+        new Promise(function(resolve) {
+          setTimeout(function() {
+            resolve(_degradedPopupValue(type, defaultValue))
+          }, 250)
+        }),
+      ]).catch(function() {
+        return _degradedPopupValue(type, defaultValue)
+      })
+    }
+    return Promise.resolve(_degradedPopupValue(type, defaultValue))
   }
 
   function _getRequestHeaders() {
-    // Static shim — no session auth headers are exposed to plugins.
+    // Host request-headers adapter when available; always redacted server-side.
+    // Synchronous ST API: return the last cached host headers or the static shim.
+    // Fire-and-forget refresh must not block or hang callers.
+    if (_canPostToHost()) {
+      Promise.race([
+        _call('ui.requestHeaders', {}),
+        new Promise(function(resolve) { setTimeout(function() { resolve(null) }, 250) }),
+      ]).then(function(headers) {
+        if (headers && typeof headers === 'object') {
+          window.__sfRequestHeadersCache = headers
+        }
+      }).catch(function() {})
+      if (window.__sfRequestHeadersCache && typeof window.__sfRequestHeadersCache === 'object') {
+        return window.__sfRequestHeadersCache
+      }
+    }
     return { 'Content-Type': 'application/json' };
   }
 
@@ -1503,6 +1701,40 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
 export function createHostHandler(plugin, invoke, options = {}) {
   const isTrustedSource = options.isTrustedSource || (() => true)
   // 插件本地 storage（宿主侧维护，避免 iframe localStorage 被清除）
+  // Persistence adapters: merge injected overrides on top of degraded defaults.
+  const defaultAdapters = applyAdapters({
+    saveChat: options.saveChatAdapter,
+    popup: options.popupAdapter,
+    requestHeaders: options.requestHeadersAdapter,
+  })
+  const saveChatAdapter = defaultAdapters.saveChat
+  // The injected adapter can survive a PluginHost remount. Bind its idempotency
+  // map to that adapter rather than the short-lived message handler closure.
+  const saveChatRequests = saveChatRequestsForAdapter(saveChatAdapter)
+
+  function persistChatIdempotently(params) {
+    const key = saveChatSnapshotKey(plugin.id, params?.chat)
+    const existing = saveChatRequests.get(key)
+    if (existing) return existing
+
+    const pending = Promise.resolve()
+      .then(() => saveChatAdapter.saveChat({ pluginId: plugin.id, ...(params || {}) }))
+    saveChatRequests.set(key, pending)
+    while (saveChatRequests.size > MAX_DEDUPED_SAVE_CHAT_REQUESTS) {
+      const oldest = saveChatRequests.keys().next().value
+      if (oldest === undefined) break
+      saveChatRequests.delete(oldest)
+    }
+    pending.then(
+      (result) => {
+        // Failed/degraded outcomes may be retried. Successful outcomes remain
+        // cached so a retry after a lost/late response cannot double-write.
+        if (result?.ok !== true || result?.degraded) saveChatRequests.delete(key)
+      },
+      () => saveChatRequests.delete(key),
+    )
+    return pending
+  }
 
   return async function handleMessage(event) {
     if (!isTrustedSource(event)) return
@@ -1538,6 +1770,61 @@ export function createHostHandler(plugin, invoke, options = {}) {
         id: data.id,
         result: true,
       })
+      return
+    }
+    if (data.method === 'chat.save') {
+      // Every same-snapshot retry joins this host-local promise. This protects
+      // the actual durable adapter, not just the iframe's late UI response.
+      try {
+        const result = await persistChatIdempotently(data.params || {})
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result,
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { ok: false, degraded: true, reason: 'persist_failed', persistedAt: null },
+        })
+      }
+      return
+    }
+    if (data.method === 'ui.popup') {
+      const popupAdapter = options.popupAdapter || defaultAdapters.popup
+      try {
+        const value = await popupAdapter.popup(data.params || {}, plugin)
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { value, degraded: value === undefined },
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { value: undefined, degraded: true },
+        })
+      }
+      return
+    }
+    if (data.method === 'ui.requestHeaders') {
+      const headersAdapter = options.requestHeadersAdapter || defaultAdapters.requestHeaders
+      try {
+        const headers = headersAdapter.getHeaders()
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: headers,
+        })
+      } catch {
+        postResponse(event, {
+          type: MSG_RESPONSE,
+          id: data.id,
+          result: { 'Content-Type': 'application/json' },
+        })
+      }
       return
     }
 
@@ -1576,9 +1863,19 @@ export function createPluginHookBridge(plugin, options = {}) {
   const getTarget = typeof options.getTarget === 'function' ? options.getTarget : () => null
   const isTrustedSource = options.isTrustedSource || (() => true)
   const targetOrigin = normalizeTargetOrigin(options.targetOrigin)
-  const timeoutMs = Number.isFinite(options.timeoutMs)
-    ? Math.max(0, options.timeoutMs)
-    : DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  // timeoutMs === null disables the bridge-level timer so an outer runtime
+  // (promptHooks.js) owns timeout accounting and audits status=timeout.
+  // Finite values enable a bridge-local timer (tests / standalone callers).
+  // Default remains DEFAULT_PLUGIN_HOOK_TIMEOUT_MS for backward compatibility
+  // when production forgets to pass timeoutMs: null.
+  let timeoutMs
+  if (options.timeoutMs === null) {
+    timeoutMs = null
+  } else if (Number.isFinite(options.timeoutMs)) {
+    timeoutMs = Math.max(0, options.timeoutMs)
+  } else {
+    timeoutMs = DEFAULT_PLUGIN_HOOK_TIMEOUT_MS
+  }
   const onError = typeof options.onError === 'function' ? options.onError : () => {}
   let nextHookId = 0
   const pending = new Map()
@@ -1587,13 +1884,23 @@ export function createPluginHookBridge(plugin, options = {}) {
     const entry = pending.get(id)
     if (!entry) return false
     pending.delete(id)
-    clearTimeout(entry.timer)
+    if (entry.timer) clearTimeout(entry.timer)
     resolver(entry)
     return true
   }
 
   function fallback(entry, reason) {
     if (reason) onError(reason)
+    if (reason && /timed out/i.test(String(reason?.message || reason || ''))) {
+      const error = reason instanceof Error ? reason : new Error(String(reason))
+      error.code = error.code || 'PROMPT_HOOK_TIMEOUT'
+      // Prefer reject so outer withTimeout / audit can classify timeout instead
+      // of silently resolving as ok with the fallback payload.
+      if (typeof entry.reject === 'function') {
+        entry.reject(error)
+        return
+      }
+    }
     entry.resolve(entry.fallback)
   }
 
@@ -1619,11 +1926,13 @@ export function createPluginHookBridge(plugin, options = {}) {
     }
 
     const id = String(++nextHookId)
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        settle(id, (entry) => fallback(entry, new Error(`Plugin hook timed out: ${eventName}`)))
-      }, timeoutMs)
-      pending.set(id, { resolve, fallback: payload, timer })
+    return new Promise((resolve, reject) => {
+      const timer = timeoutMs === null
+        ? null
+        : setTimeout(() => {
+          settle(id, (entry) => fallback(entry, new Error(`Plugin hook timed out: ${eventName}`)))
+        }, timeoutMs)
+      pending.set(id, { resolve, reject, fallback: payload, timer })
       target.postMessage({
         type: MSG_HOOK_REQUEST,
         pluginId,

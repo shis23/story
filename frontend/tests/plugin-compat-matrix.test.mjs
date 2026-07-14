@@ -56,6 +56,8 @@ function createBridgeSandbox(pluginId = 'plugin-a', hostOrigin = 'https://storyf
     },
     localStorage: window.localStorage,
     console,
+    setTimeout,
+    clearTimeout,
   }
   sandbox.globalThis = sandbox
 
@@ -340,9 +342,11 @@ test('late duplicate hook response ids are ignored after settle', async () => {
   const request = target.posted.at(-1)
   assert.equal(request.type, MSG_HOOK_REQUEST)
 
-  // First settle via timeout path.
-  const timedOut = await promise
-  assert.equal(timedOut, payload)
+  // First settle via timeout path. Bridge-local timeouts reject so an outer
+  // runtime can audit status=timeout instead of silently resolving as ok.
+  await assert.rejects(promise, (error) => (
+    error?.code === 'PROMPT_HOOK_TIMEOUT' || /timed out/i.test(String(error?.message || error))
+  ))
   assert.ok(errors.some((message) => /timed out/i.test(message)))
 
   // Late duplicate response must not throw or re-resolve.

@@ -159,6 +159,147 @@ pub const INTENTIONALLY_UNSUPPORTED_ST_EVENTS: &[&str] = &[
     "GROUP_WRAPPER_FINISHED",
 ];
 
+/// Expanded ST event inventory with explicit status + fallback reason.
+/// Every non-supported row must carry a reason so reports stay honest.
+pub const ST_EVENT_COMPAT_MATRIX: &[CompatEntry] = &[
+    CompatEntry {
+        id: "evt:APP_READY",
+        surface: "events",
+        name: "APP_READY",
+        status: CompatStatus::Implemented,
+        reason: None,
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:CHAT_LOADED",
+        surface: "events",
+        name: "CHAT_LOADED",
+        status: CompatStatus::Implemented,
+        reason: None,
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:MESSAGE_RECEIVED",
+        surface: "events",
+        name: "MESSAGE_RECEIVED",
+        status: CompatStatus::Implemented,
+        reason: Some("body redacted without ReadMemory"),
+        requires_permissions: &[Permission::ReadMemory],
+    },
+    CompatEntry {
+        id: "evt:GENERATION_STARTED",
+        surface: "events",
+        name: "GENERATION_STARTED",
+        status: CompatStatus::Alias,
+        reason: Some("maps from pipeline.started"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:COMMITTED_ALIAS",
+        surface: "events",
+        name: "pipeline.committed",
+        status: CompatStatus::Alias,
+        reason: Some("terminal turn commit only; not pipeline state_changed after draft"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:STATE_CHANGED_PIPELINE_COMMITTED",
+        surface: "events",
+        name: "state_changed{Committed}",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("draft_not_user_accept_must_not_fanout_message_events"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GENERATE_AFTER_COMBINE_PROMPTS",
+        surface: "events",
+        name: "GENERATE_AFTER_COMBINE_PROMPTS",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("hook_chain_before_and_ready_only"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:WORLDINFO_FORCE_ACTIVATE",
+        surface: "events",
+        name: "WORLDINFO_FORCE_ACTIVATE",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_force_activate_ui"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:TOOL_CALLS_PERFORMED",
+        surface: "events",
+        name: "TOOL_CALLS_PERFORMED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("agent_tools_not_exposed_to_st_plugins"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:TOOL_CALLS_RENDERED",
+        surface: "events",
+        name: "TOOL_CALLS_RENDERED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("agent_tool_rendering_not_exposed_to_st_plugins"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GROUP_UPDATED",
+        surface: "events",
+        name: "GROUP_UPDATED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_group_model"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GROUP_MEMBER_DRAFTED",
+        surface: "events",
+        name: "GROUP_MEMBER_DRAFTED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_group_draft_model"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GROUP_WRAPPER_FINISHED",
+        surface: "events",
+        name: "GROUP_WRAPPER_FINISHED",
+        status: CompatStatus::IntentionallyUnsupported,
+        reason: Some("no_group_wrapper_model"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:SETTINGS_LOADED",
+        surface: "events",
+        name: "SETTINGS_LOADED",
+        status: CompatStatus::Noop,
+        reason: Some("settings_not_broadcast_as_st_events"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:SAVE_CHAT",
+        surface: "tavernHelper",
+        name: "saveChat",
+        status: CompatStatus::Degraded,
+        reason: Some("host adapter injectable; default local_mirror_only_no_host_persist"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:CALL_GENERIC_POPUP",
+        surface: "tavernHelper",
+        name: "callGenericPopup",
+        status: CompatStatus::Degraded,
+        reason: Some("no_ui_returns_default_or_null"),
+        requires_permissions: &[],
+    },
+    CompatEntry {
+        id: "evt:GET_REQUEST_HEADERS",
+        surface: "tavernHelper",
+        name: "getRequestHeaders",
+        status: CompatStatus::Degraded,
+        reason: Some("static_json_content_type_only_no_auth"),
+        requires_permissions: &[],
+    },
+];
+
 pub fn find_permission_entry(name: &str) -> Option<&'static CompatEntry> {
     PERMISSION_COMPAT_MATRIX
         .iter()
@@ -167,6 +308,20 @@ pub fn find_permission_entry(name: &str) -> Option<&'static CompatEntry> {
 
 pub fn unsupported_event_names() -> &'static [&'static str] {
     INTENTIONALLY_UNSUPPORTED_ST_EVENTS
+}
+
+/// Every non-supported ST event / API row must declare a reason.
+pub fn non_supported_entries_with_reasons() -> Vec<&'static CompatEntry> {
+    ST_EVENT_COMPAT_MATRIX
+        .iter()
+        .chain(ST_API_COMPAT_MATRIX.iter())
+        .filter(|entry| {
+            !matches!(
+                entry.status,
+                CompatStatus::Implemented | CompatStatus::Alias | CompatStatus::Derived
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -223,6 +378,49 @@ mod tests {
         assert_eq!(
             unsupported_event_names().len(),
             INTENTIONALLY_UNSUPPORTED_ST_EVENTS.len()
+        );
+    }
+
+    #[test]
+    fn every_unsupported_event_has_a_matching_matrix_row() {
+        for name in INTENTIONALLY_UNSUPPORTED_ST_EVENTS {
+            assert!(
+                ST_EVENT_COMPAT_MATRIX.iter().any(|entry| {
+                    entry.name == *name && entry.status == CompatStatus::IntentionallyUnsupported
+                }),
+                "missing intentionally unsupported matrix row for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_supported_event_row_has_a_reason() {
+        let rows = non_supported_entries_with_reasons();
+        assert!(!rows.is_empty());
+        for entry in rows {
+            assert!(
+                entry.reason.is_some(),
+                "non-supported entry {} missing reason",
+                entry.id
+            );
+            assert!(!entry.reason.unwrap().is_empty());
+        }
+        // Keep the four classifications distinct in the inventory.
+        let statuses: Vec<CompatStatus> = ST_EVENT_COMPAT_MATRIX.iter().map(|e| e.status).collect();
+        assert!(statuses.contains(&CompatStatus::Implemented));
+        assert!(statuses.contains(&CompatStatus::Alias));
+        assert!(statuses.contains(&CompatStatus::Degraded));
+        assert!(statuses.contains(&CompatStatus::IntentionallyUnsupported));
+        assert!(statuses.contains(&CompatStatus::Noop));
+    }
+
+    #[test]
+    fn committed_alias_row_is_documented() {
+        assert!(
+            ST_EVENT_COMPAT_MATRIX
+                .iter()
+                .any(|entry| entry.id == "evt:COMMITTED_ALIAS"
+                    && entry.status == CompatStatus::Alias)
         );
     }
 }

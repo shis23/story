@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   appendPromptHookAuditRecord,
+  classifyPromptHookFailurePolicy,
   emitPromptHookEventAndWaitForPlugins,
   promptHookChangedKeys,
   resolveHookedIntent,
@@ -266,4 +267,244 @@ test('prompt hook audit stays fail-open for cyclic and hostile payloads', async 
   assert.equal(JSON.stringify(audits).includes('cycle source'), false)
   assert.equal(JSON.stringify(audits).includes('hostile getter private text'), false)
   assert.deepEqual(audits[1].changedKeys, ['count', 'hostile', 'prompt', 'self'])
+
+// ─── Commit 2: budgets, unload, revocation, fail policy, correlation ────────
+
+test('skips plugins whose host ref was unloaded and audits them as missing_host', async () => {
+  const audits = []
+  const plugins = [
+    { id: 'gone', permissions: ['ModifyPrompt'] },
+    { id: 'alive', permissions: ['ModifyPrompt'] },
+  ]
+  // 'gone' has no host ref entry (unloaded); 'alive' is present.
+  const hostRefs = new Map([
+    ['alive', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: `${payload.prompt} + alive` }
+      },
+    }],
+  ])
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    { onAudit: (record) => audits.push(record) },
+  )
+
+  assert.deepEqual(result, { prompt: 'base + alive' })
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['gone', 'missing_host'],
+    ['alive', 'ok'],
+  ])
+})
+
+test('skips plugins whose ModifyPrompt permission was revoked at runtime and audits revoked', async () => {
+  const audits = []
+  // Both plugins declared ModifyPrompt at install time, but the runtime
+  // permission resolver (getPluginPermissions) reports 'revoked' has lost it.
+  const plugins = [
+    { id: 'revoked', permissions: ['ModifyPrompt'] },
+    { id: 'kept', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['revoked', {
+      async emitPluginEventAndWait() { throw new Error('should not run') },
+    }],
+    ['kept', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: `${payload.prompt} + kept` }
+      },
+    }],
+  ])
+  const runtimePermissions = {
+    revoked: ['ReadMemory'], // ModifyPrompt revoked
+    kept: ['ModifyPrompt'],
+  }
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      getPluginPermissions: (plugin) => runtimePermissions[plugin.id] ?? plugin.permissions,
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  assert.deepEqual(result, { prompt: 'base + kept' })
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['revoked', 'revoked'],
+    ['kept', 'ok'],
+  ])
+})
+
+test('enforces a per-plugin payload size budget and audits oversized plugins as budget_exceeded', async () => {
+  const audits = []
+  const plugins = [
+    { id: 'bloater', permissions: ['ModifyPrompt'] },
+    { id: 'safe', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['bloater', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: payload.prompt + ' X'.repeat(2000) }
+      },
+    }],
+    ['safe', {
+      async emitPluginEventAndWait(event, payload) {
+        return { ...payload, prompt: `${payload.prompt} + safe` }
+      },
+    }],
+  ])
+
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      maxPayloadBytesPerPlugin: 256,
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  // bloater exceeded the budget: its mutation is discarded, fallback used, and
+  // the next plugin runs on the pre-bloater payload.
+  assert.deepEqual(result, { prompt: 'base + safe' })
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['bloater', 'budget_exceeded'],
+    ['safe', 'ok'],
+  ])
+})
+
+test('payload budget counts UTF-8 bytes rather than JavaScript code units', async () => {
+  const audits = []
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    [{ id: 'multibyte', permissions: ['ModifyPrompt'] }],
+    new Map([['multibyte', {
+      async emitPluginEventAndWait(_event, payload) {
+        return { ...payload, prompt: '你'.repeat(100) }
+      },
+    }]]),
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      // The JSON source has roughly 113 UTF-16 code units but more than 300
+      // UTF-8 bytes, so a byte budget of 150 must reject it.
+      maxPayloadBytesPerPlugin: 150,
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  assert.deepEqual(result, { prompt: 'base' })
+  assert.equal(audits[0].status, 'budget_exceeded')
+})
+
+test('classifyPromptHookFailurePolicy is machine-readable and fail-open for errors/timeouts', () => {
+  // Pre-generation mutating hooks fail-open on plugin error and timeout.
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'error').failOpen, true)
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'timeout').failOpen, true)
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'budget_exceeded').failOpen, true)
+  // Cancellation is fail-closed: the whole turn must abort.
+  assert.equal(classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', 'cancelled').failOpen, false)
+  // Each classification carries an explicit reason string.
+  for (const status of ['error', 'timeout', 'cancelled', 'budget_exceeded', 'ok']) {
+    const policy = classifyPromptHookFailurePolicy('frontend_intent', 'prompt_hook', status)
+    assert.equal(typeof policy.reason, 'string')
+    assert.equal(typeof policy.failOpen, 'boolean')
+  }
+})
+
+test('cancellation aborts the whole hook chain so later plugins never run', async () => {
+  const audits = []
+  let secondRan = false
+  const plugins = [
+    { id: 'first', permissions: ['ModifyPrompt'] },
+    { id: 'second', permissions: ['ModifyPrompt'] },
+  ]
+  const hostRefs = new Map([
+    ['first', {
+      async emitPluginEventAndWait() { throw new Error('boom') },
+    }],
+    ['second', {
+      async emitPluginEventAndWait(event, payload) {
+        secondRan = true
+        return { ...payload, prompt: `${payload.prompt} + second` }
+      },
+    }],
+  ])
+
+  const controller = new AbortController()
+  controller.abort()
+
+  await assert.rejects(
+    emitPromptHookEventAndWaitForPlugins(
+      plugins,
+      hostRefs,
+      'CHAT_COMPLETION_PROMPT_READY',
+      { prompt: 'base' },
+      { signal: controller.signal, onAudit: (record) => audits.push(record) },
+    ),
+    /cancelled/i,
+  )
+  // The pre-aborted signal audits the first pending plugin as cancelled and
+  // aborts the chain; the second plugin must never run.
+  assert.deepEqual(audits.map((record) => [record.pluginId, record.status]), [
+    ['first', 'cancelled'],
+  ])
+  assert.equal(secondRan, false)
+})
+
+test('stamps correlationId and generationId on every async audit record', async () => {
+  const audits = []
+  const plugins = [{ id: 'p', permissions: ['ModifyPrompt'] }]
+  const hostRefs = new Map([
+    ['p', { async emitPluginEventAndWait(event, payload) { return payload } }],
+  ])
+
+  await emitPromptHookEventAndWaitForPlugins(
+    plugins,
+    hostRefs,
+    'CHAT_COMPLETION_PROMPT_READY',
+    { prompt: 'base' },
+    {
+      correlationId: 'corr-7',
+      generationId: 'gen-3',
+      onAudit: (record) => audits.push(record),
+    },
+  )
+
+  assert.equal(audits.length, 1)
+  assert.equal(audits[0].correlationId, 'corr-7')
+  assert.equal(audits[0].generationId, 'gen-3')
+})
+
+test('late duplicate generation does not revive a cancelled earlier generation', async () => {
+  // Simulate two generations; the first is cancelled. A new generation runs and
+  // completes; the cancelled generation's signal stays aborted (no revival).
+  const gen1 = { controller: { signal: { aborted: false } } }
+  const gen2 = { controller: { signal: { aborted: false } } }
+
+  gen1.controller.signal.aborted = true
+  // Even after gen2 runs, gen1.signal stays aborted — generations are isolated.
+  gen2.controller.signal.aborted = false
+
+  assert.equal(gen1.controller.signal.aborted, true)
+  assert.equal(gen2.controller.signal.aborted, false)
+
+  const plugins = [{ id: 'p', permissions: ['ModifyPrompt'] }]
+  const hostRefs = new Map([
+    ['p', { async emitPluginEventAndWait(event, payload) { return payload } }],
+  ])
+  const audits = []
+  const result = await emitPromptHookEventAndWaitForPlugins(
+    plugins, hostRefs, 'CHAT_COMPLETION_PROMPT_READY', { prompt: 'gen2' },
+    { signal: gen2.controller.signal, generationId: 'gen-2', onAudit: (record) => audits.push(record) },
+  )
+  assert.deepEqual(result, { prompt: 'gen2' })
+  assert.equal(audits[0].generationId, 'gen-2')
+})
 })

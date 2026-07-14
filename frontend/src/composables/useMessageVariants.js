@@ -46,8 +46,12 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   loadConversationHistory?: () => Promise<void> | void,
  *   scrollToBottom?: () => void,
  *   alertDialog?: (message: string) => Promise<void> | void,
+ *   askForceAccept?: (message: string, options?: object) => Promise<boolean> | boolean,
  *   startWriting?: (intent: string, skipLocalPush?: boolean) => Promise<void>,
  *   beginPromptHookGeneration?: () => number,
+ *   acceptVariantApi?: (conversationId: string, nodeId: string, forceAccept?: boolean) => Promise<unknown>,
+ *   deleteMessageFromApi?: (conversationId: string, nodeId: string) => Promise<unknown>,
+ *   getConversationApi?: (conversationId: string) => Promise<object | null>,
  * }} [options]
  */
 export function useMessageVariants(options = {}) {
@@ -66,6 +70,38 @@ export function useMessageVariants(options = {}) {
   const alertDialog = options.alertDialog || ((msg) => { console.error('alertDialog(未注入):', msg) })
   const startWriting = options.startWriting || (() => { console.error('useMessageVariants: startWriting 未注入') })
   const beginPromptHookGeneration = options.beginPromptHookGeneration || (() => 0)
+  const acceptVariantApi = options.acceptVariantApi || apiAcceptVariant
+  const deleteMessageFromApi = options.deleteMessageFromApi || apiDeleteMessageFrom
+  const getConversationApi = options.getConversationApi || getConversation
+  const askForceAccept = options.askForceAccept || (async (message, dialogOptions) => {
+    const { ask } = await import('@tauri-apps/plugin-dialog')
+    return ask(message, dialogOptions)
+  })
+  // Backend Accept is deliberately idempotent, but terminal plugin fan-out is
+  // an external side effect. Coalesce in-flight requests and remember a
+  // successfully published variant so double-clicks/replayed commands cannot
+  // emit MESSAGE_RECEIVED twice.
+  const pendingAccepts = new Map()
+  const publishedTerminalAccepts = new Set()
+  const MAX_PUBLISHED_TERMINAL_ACCEPTS = 512
+
+  function acceptVariantIdentity(nodeId) {
+    const message = writingStore.messages.find((item) => item?.id === nodeId)
+    const variant = message?.variants?.[message.active_variant] || message?.variants?.[0] || null
+    return {
+      variant,
+      key: `${campaignStore.currentConversationId || ''}\u001f${nodeId || ''}\u001f${variant?.id || 'active-variant'}`,
+    }
+  }
+
+  function rememberPublishedTerminalAccept(key) {
+    publishedTerminalAccepts.add(key)
+    while (publishedTerminalAccepts.size > MAX_PUBLISHED_TERMINAL_ACCEPTS) {
+      const oldest = publishedTerminalAccepts.values().next().value
+      if (oldest === undefined) break
+      publishedTerminalAccepts.delete(oldest)
+    }
+  }
 
   // 来源 App.vue:314-317 getAssistantRoleLabel
   function getAssistantRoleLabel() {
@@ -118,7 +154,7 @@ export function useMessageVariants(options = {}) {
       // 重拉对话刷新 UI（单一事实源）：后端按「最后一条 → 原地替换（旧 variant 降级
       // Discarded 可切回）/ 中间 → 开分支（保留旧版）」落库。前端不臆测 variant 数组，
       // 直接以后端真实状态为准。
-      const refreshed = await getConversation(campaignStore.currentConversationId)
+      const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
         // 保留 role_label 覆盖（applyConversation 重置为 AI/我）
@@ -147,7 +183,7 @@ export function useMessageVariants(options = {}) {
     if (!campaignStore.currentConversationId) return
     try {
       await apiEditVariant(campaignStore.currentConversationId, nodeId, newContent)
-      const refreshed = await getConversation(campaignStore.currentConversationId)
+      const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
         writingStore.messages.forEach((m) => {
@@ -164,31 +200,58 @@ export function useMessageVariants(options = {}) {
   // Quality Error 默认拦截；用户确认后 forceAccept → Degraded
   async function handleAcceptVariant({ nodeId, forceAccept = false } = {}) {
     if (!campaignStore.currentConversationId) return
-    try {
-      await apiAcceptVariant(campaignStore.currentConversationId, nodeId, forceAccept)
-      const msg = writingStore.messages.find((m) => m.id === nodeId)
-      if (msg) {
-        const variant = msg.variants[msg.active_variant]
-        if (variant) variant.status = 'final'
-        broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_UPDATED, messageEventPayload(nodeId, { reason: 'accept_variant' }))
-      }
-    } catch (e) {
-      const msg = String(e?.message || e || '')
-      if (!forceAccept && /质量门禁|force_accept|Error 级/i.test(msg)) {
-        try {
-          const { ask } = await import('@tauri-apps/plugin-dialog')
-          const ok = await ask(
-            '质量门禁发现 Error 级问题。强制采纳将标记本轮为 Degraded，是否继续？',
-            { title: '强制采纳确认', kind: 'warning' },
-          )
-          if (ok) {
-            return handleAcceptVariant({ nodeId, forceAccept: true })
-          }
-        } catch (dialogErr) {
-          console.error('强制采纳确认失败:', dialogErr)
+    const { variant, key } = acceptVariantIdentity(nodeId)
+    if (variant?.status === 'final' || publishedTerminalAccepts.has(key)) return
+    // Keep the normal quality-gate attempt distinct from its later force retry.
+    // Concurrent attempts of the same flavor share one promise; a direct force
+    // click and a dialog-confirmed force retry also converge on the force key.
+    const pendingKey = `${key}\u001f${forceAccept ? 'force' : 'normal'}`
+    const existing = pendingAccepts.get(pendingKey)
+    if (existing) return existing
+
+    const task = (async () => {
+      try {
+        await acceptVariantApi(campaignStore.currentConversationId, nodeId, forceAccept)
+        const msg = writingStore.messages.find((m) => m.id === nodeId)
+        if (msg) {
+          const acceptedVariant = msg.variants[msg.active_variant]
+          if (acceptedVariant) acceptedVariant.status = 'final'
         }
+        // A successful Accept is the only frontend source of terminal message
+        // fan-out. Mark before broadcasting so any synchronous/re-entrant
+        // caller observes the terminal state too.
+        rememberPublishedTerminalAccept(key)
+        broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(nodeId, {
+          reason: 'accept_variant',
+          terminalTurnCommit: true,
+          turnStatus: forceAccept ? 'Degraded' : 'Committed',
+          attemptStatus: 'Final',
+          variantStatus: 'Final',
+          forceAccept: Boolean(forceAccept),
+        }))
+      } catch (e) {
+        const msg = String(e?.message || e || '')
+        if (!forceAccept && /质量门禁|force_accept|Error 级/i.test(msg)) {
+          try {
+            const ok = await askForceAccept(
+              '质量门禁发现 Error 级问题。强制采纳将标记本轮为 Degraded，是否继续？',
+              { title: '强制采纳确认', kind: 'warning' },
+            )
+            if (ok) {
+              return handleAcceptVariant({ nodeId, forceAccept: true })
+            }
+          } catch (dialogErr) {
+            console.error('强制采纳确认失败:', dialogErr)
+          }
+        }
+        console.error('采纳失败:', e)
       }
-      console.error('采纳失败:', e)
+    })()
+    pendingAccepts.set(pendingKey, task)
+    try {
+      return await task
+    } finally {
+      pendingAccepts.delete(pendingKey)
     }
   }
 
@@ -196,9 +259,9 @@ export function useMessageVariants(options = {}) {
   async function handleDeleteVariant({ nodeId }) {
     if (!campaignStore.currentConversationId) return
     try {
-      await apiDeleteMessageFrom(campaignStore.currentConversationId, nodeId)
+      await deleteMessageFromApi(campaignStore.currentConversationId, nodeId)
       // 重新拉取对话刷新（truncate 后该消息及之后都消失）
-      const refreshed = await getConversation(campaignStore.currentConversationId)
+      const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
         writingStore.messages.forEach((m) => {
@@ -256,7 +319,7 @@ export function useMessageVariants(options = {}) {
       }, (event) => handlePipelineEvent(event))
 
       // 重拉对话刷新（regenerate 新增 variant：最后一条→旧降级Discarded+新active，中间→开分支）
-      const refreshed = await getConversation(campaignStore.currentConversationId)
+      const refreshed = await getConversationApi(campaignStore.currentConversationId)
       if (refreshed) {
         applyConversation(refreshed)
         writingStore.messages.forEach((m) => {
@@ -297,7 +360,7 @@ export function useMessageVariants(options = {}) {
       await loadInstanceNameMap()
 
       if (result.conversation_id) {
-        const conv = await getConversation(result.conversation_id)
+        const conv = await getConversationApi(result.conversation_id)
         if (conv) {
           applyConversation(conv)
           writingStore.messages.forEach((m) => {
