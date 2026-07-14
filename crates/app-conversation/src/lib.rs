@@ -4,7 +4,7 @@
 /// 存储位置：data/conversations/<id>.json
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,19 @@ pub enum ConversationError {
 
     #[error("变体已被丢弃，无法采纳")]
     VariantDiscarded,
+
+    #[error("external conversation storage error: {0}")]
+    ExternalStorage(String),
+}
+
+/// Durable authority for a [`ConversationStore`] that is not backed by JSON
+/// files. Implementations must provide a complete read/write/delete view of
+/// conversations; `ConversationStore` never falls back to its JSON directory
+/// when an external authority is configured.
+pub trait ConversationPersistence: Send + Sync {
+    fn load_all(&self) -> Result<Vec<Conversation>, ConversationError>;
+    fn save(&self, conversation: &Conversation) -> Result<(), ConversationError>;
+    fn delete(&self, id: &Id) -> Result<(), ConversationError>;
 }
 
 // ─── 对话存储（对应设计 §11.3 data/conversations/）─────────────────────────
@@ -46,6 +59,9 @@ pub enum ConversationError {
 /// 对话持久化存储
 pub struct ConversationStore {
     dir: PathBuf,
+    /// Optional external durable authority (for example the opt-in SQLite
+    /// backend). When present, JSON files are never read or written.
+    persistence: Option<Arc<dyn ConversationPersistence>>,
     /// 内存缓存（key = conversation_id）
     cache: Mutex<Vec<Conversation>>,
     /// 是否已从磁盘加载（AtomicBool 实现 &self 可修改）
@@ -56,6 +72,20 @@ impl ConversationStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            persistence: None,
+            cache: Mutex::new(Vec::new()),
+            loaded: AtomicBool::new(false),
+        }
+    }
+
+    /// Build a store whose sole durable authority is supplied by the caller.
+    ///
+    /// The SQLite opt-in path uses this adapter so the writing pipeline can
+    /// keep the normal conversation API without creating a JSON shadow copy.
+    pub fn with_persistence(persistence: Arc<dyn ConversationPersistence>) -> Self {
+        Self {
+            dir: PathBuf::new(),
+            persistence: Some(persistence),
             cache: Mutex::new(Vec::new()),
             loaded: AtomicBool::new(false),
         }
@@ -72,33 +102,53 @@ impl ConversationStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 确保从磁盘加载所有对话
-    fn ensure_loaded(&self) {
+    /// 确保从磁盘加载所有对话。
+    ///
+    /// 外部 authority 的读取错误必须保留为错误：将其当作空列表并标记
+    /// `loaded` 会永久隐藏暂时性 SQLite 故障，并会让后续写入基于虚假的
+    /// 空缓存。JSON 路径保持原来的宽容加载行为。
+    fn ensure_loaded(&self) -> Result<(), ConversationError> {
         if self.loaded.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
         let mut cache = self.lock_cache();
         // 双重检查（另一个线程可能已经加载了）
         if self.loaded.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
-        std::fs::create_dir_all(&self.dir).ok();
+        if let Some(persistence) = &self.persistence {
+            let conversations = match persistence.load_all() {
+                Ok(conversations) => conversations,
+                Err(error) => {
+                    // Do not serve stale or partially loaded data after an
+                    // external authority failure. Leaving `loaded` false
+                    // makes the next operation retry the durable read.
+                    cache.clear();
+                    return Err(error);
+                }
+            };
+            cache.clear();
+            cache.extend(conversations);
+        } else {
+            std::fs::create_dir_all(&self.dir).ok();
 
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false)
-                    && let Ok(data) = std::fs::read_to_string(&path)
-                    && let Ok(conv) = serde_json::from_str::<Conversation>(&data)
-                {
-                    cache.push(conv);
+            if let Ok(entries) = std::fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false)
+                        && let Ok(data) = std::fs::read_to_string(&path)
+                        && let Ok(conv) = serde_json::from_str::<Conversation>(&data)
+                    {
+                        cache.push(conv);
+                    }
                 }
             }
         }
 
         self.loaded.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// 清空缓存并标记为未加载，下次访问时从磁盘重新加载。
@@ -113,6 +163,9 @@ impl ConversationStore {
 
     /// 持久化对话到磁盘（原子写：.tmp → rename）
     fn persist(&self, conv: &Conversation) -> Result<(), ConversationError> {
+        if let Some(persistence) = &self.persistence {
+            return persistence.save(conv);
+        }
         let path = self.dir.join(format!("{}.json", conv.id.as_str()));
         storyforge_infra_util::atomic_write_json(&path, conv)?;
         Ok(())
@@ -123,24 +176,50 @@ impl ConversationStore {
     where
         F: FnOnce(&mut Conversation) -> Result<R, ConversationError>,
     {
-        self.ensure_loaded();
+        self.ensure_loaded()?;
         let mut cache = self.lock_cache();
-        let conv = cache
+        let position = cache
             .iter_mut()
-            .find(|c| &c.id == id)
+            .position(|c| &c.id == id)
             .ok_or_else(|| ConversationError::NotFound(id.to_string()))?;
-        let result = f(conv)?;
-        self.persist(conv)?;
+
+        // A persistence error may be transient or ambiguous. Never retain the
+        // speculative mutation in this process: another successful mutation
+        // must first reload durable state instead of flushing this rejected one.
+        let original = cache[position].clone();
+        let result = match f(&mut cache[position]) {
+            Ok(result) => result,
+            Err(error) => {
+                cache[position] = original;
+                return Err(error);
+            }
+        };
+        let mutated = cache[position].clone();
+
+        if let Err(error) = self.persist(&mutated) {
+            cache[position] = original;
+            if self.persistence.is_some() {
+                cache.clear();
+                self.loaded.store(false, Ordering::Release);
+            }
+            return Err(error);
+        }
+
         Ok(result)
     }
 
     /// 创建新对话（可绑定 Campaign）
     pub fn create(&self, character_id: Option<String>, campaign_id: Option<Id>) -> Conversation {
-        self.ensure_loaded();
-
         let conv = Conversation::new(character_id, campaign_id);
-        if let Err(e) = self.persist(&conv) {
+        if let Err(e) = self.ensure_loaded().and_then(|_| self.persist(&conv)) {
             tracing::error!("持久化新对话失败: {e}");
+            // This legacy no-Result API cannot report a durable failure. In
+            // external-authority mode it must nevertheless fail closed: do not
+            // create a cache-only conversation that later mutations could
+            // accidentally flush. SQLite callers use `create_persisted`.
+            if self.persistence.is_some() {
+                return conv;
+            }
         }
 
         let mut cache = self.lock_cache();
@@ -157,7 +236,7 @@ impl ConversationStore {
         character_id: Option<String>,
         campaign_id: Option<Id>,
     ) -> Result<Conversation, ConversationError> {
-        self.ensure_loaded();
+        self.ensure_loaded()?;
 
         let conv = Conversation::new(character_id, campaign_id);
         self.persist(&conv)?;
@@ -169,7 +248,10 @@ impl ConversationStore {
 
     /// 获取对话列表（摘要，card_name 由 Tauri 层联查填充）
     pub fn list(&self) -> Vec<ConversationSummary> {
-        self.ensure_loaded();
+        if let Err(error) = self.ensure_loaded() {
+            tracing::error!("load conversation authority for list failed: {error}");
+            return Vec::new();
+        }
 
         let cache = self.lock_cache();
         cache
@@ -188,7 +270,10 @@ impl ConversationStore {
 
     /// 按 Campaign ID 查对话（一 Campaign 一对话）
     pub fn find_by_campaign(&self, campaign_id: &Id) -> Option<Conversation> {
-        self.ensure_loaded();
+        if let Err(error) = self.ensure_loaded() {
+            tracing::error!("load conversation authority for campaign lookup failed: {error}");
+            return None;
+        }
         let cache = self.lock_cache();
         cache
             .iter()
@@ -203,7 +288,7 @@ impl ConversationStore {
         campaign_id: Id,
         fork_node_id: &Id,
     ) -> Result<Conversation, ConversationError> {
-        self.ensure_loaded();
+        self.ensure_loaded()?;
 
         let forked = {
             let cache = self.lock_cache();
@@ -243,7 +328,10 @@ impl ConversationStore {
     }
 
     pub fn get(&self, id: &Id) -> Option<Conversation> {
-        self.ensure_loaded();
+        if let Err(error) = self.ensure_loaded() {
+            tracing::error!("load conversation authority for lookup failed: {error}");
+            return None;
+        }
 
         let cache = self.lock_cache();
         cache.iter().find(|c| &c.id == id).cloned()
@@ -251,11 +339,15 @@ impl ConversationStore {
 
     /// 删除对话
     pub fn delete(&self, id: &Id) -> Result<(), ConversationError> {
-        self.ensure_loaded();
+        self.ensure_loaded()?;
 
-        let path = self.dir.join(format!("{}.json", id.as_str()));
-        if path.exists() {
-            std::fs::remove_file(&path)?;
+        if let Some(persistence) = &self.persistence {
+            persistence.delete(id)?;
+        } else {
+            let path = self.dir.join(format!("{}.json", id.as_str()));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
         }
 
         let mut cache = self.lock_cache();
@@ -736,11 +828,221 @@ pub fn build_provenance_with_campaign(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct MemoryPersistence {
+        conversations: Mutex<Vec<Conversation>>,
+        save_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConversationPersistence for MemoryPersistence {
+        fn load_all(&self) -> Result<Vec<Conversation>, ConversationError> {
+            Ok(self
+                .conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
+        }
+
+        fn save(&self, conversation: &Conversation) -> Result<(), ConversationError> {
+            let mut conversations = self
+                .conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            conversations.retain(|current| current.id != conversation.id);
+            conversations.push(conversation.clone());
+            self.save_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn delete(&self, id: &Id) -> Result<(), ConversationError> {
+            self.conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|conversation| &conversation.id != id);
+            Ok(())
+        }
+    }
+
+    /// An in-memory authority which can fail before it changes durable state.
+    /// This lets the store tests distinguish a rejected write from a later,
+    /// successful retry.
+    #[derive(Default)]
+    struct FlakyPersistence {
+        conversations: Mutex<Vec<Conversation>>,
+        fail_load: AtomicBool,
+        fail_save: AtomicBool,
+        load_calls: AtomicUsize,
+        save_calls: AtomicUsize,
+    }
+
+    impl FlakyPersistence {
+        fn set_fail_load(&self, fail: bool) {
+            self.fail_load.store(fail, Ordering::Release);
+        }
+
+        fn set_fail_save(&self, fail: bool) {
+            self.fail_save.store(fail, Ordering::Release);
+        }
+    }
+
+    impl ConversationPersistence for FlakyPersistence {
+        fn load_all(&self) -> Result<Vec<Conversation>, ConversationError> {
+            self.load_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_load.load(Ordering::Acquire) {
+                return Err(ConversationError::ExternalStorage(
+                    "injected load failure".to_owned(),
+                ));
+            }
+
+            Ok(self
+                .conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
+        }
+
+        fn save(&self, conversation: &Conversation) -> Result<(), ConversationError> {
+            self.save_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_save.load(Ordering::Acquire) {
+                return Err(ConversationError::ExternalStorage(
+                    "injected save failure".to_owned(),
+                ));
+            }
+
+            let mut conversations = self
+                .conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            conversations.retain(|current| current.id != conversation.id);
+            conversations.push(conversation.clone());
+            Ok(())
+        }
+
+        fn delete(&self, id: &Id) -> Result<(), ConversationError> {
+            self.conversations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|conversation| &conversation.id != id);
+            Ok(())
+        }
+    }
 
     fn temp_store() -> ConversationStore {
         let dir =
             std::env::temp_dir().join(format!("storyforge_test_conv_{}", uuid::Uuid::new_v4()));
         ConversationStore::new(dir)
+    }
+
+    #[test]
+    fn external_persistence_is_the_only_conversation_authority() {
+        let persistence = Arc::new(MemoryPersistence::default());
+        let store = ConversationStore::with_persistence(persistence.clone());
+
+        let conversation = store
+            .create_persisted(
+                Some("sqlite-card".into()),
+                Some(Id::from_str("sqlite-campaign")),
+            )
+            .expect("external persistence must durably create conversation");
+        let user_node = store
+            .append_user_message(&conversation.id, "write through sqlite".into())
+            .expect("user message must persist through the external authority");
+        let draft_node = store
+            .append_ai_draft(&conversation.id, "draft through sqlite".into(), None)
+            .expect("draft must persist through the external authority");
+
+        let reloaded = ConversationStore::with_persistence(persistence.clone());
+        let loaded = reloaded
+            .get(&conversation.id)
+            .expect("a fresh store must load the externally persisted conversation");
+        assert_eq!(loaded.nodes.len(), 2);
+        assert_eq!(loaded.nodes[0].id, user_node);
+        assert_eq!(loaded.nodes[1].id, draft_node);
+        assert_eq!(
+            loaded.nodes[1].active().unwrap().status,
+            VariantStatus::Draft
+        );
+        assert!(
+            persistence
+                .save_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 3,
+            "creation and both message mutations must use the external authority"
+        );
+    }
+
+    #[test]
+    fn external_load_failure_is_retried_instead_of_becoming_a_loaded_empty_store() {
+        let persistence = Arc::new(FlakyPersistence::default());
+        let stored = Conversation::new(Some("recoverable".into()), None);
+        persistence.save(&stored).unwrap();
+        persistence.set_fail_load(true);
+
+        let store = ConversationStore::with_persistence(persistence.clone());
+        assert!(
+            store.get(&stored.id).is_none(),
+            "a failed authority load must not serve a fabricated empty result"
+        );
+
+        persistence.set_fail_load(false);
+        let recovered = store
+            .get(&stored.id)
+            .expect("the next read must retry the previously failed load");
+
+        assert_eq!(recovered.id, stored.id);
+        assert_eq!(persistence.load_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn failed_external_create_is_not_cached_and_can_be_retried() {
+        let persistence = Arc::new(FlakyPersistence::default());
+        let store = ConversationStore::with_persistence(persistence.clone());
+        persistence.set_fail_save(true);
+
+        let failed = store.create_persisted(Some("not-durable".into()), None);
+
+        assert!(failed.is_err(), "a critical create must fail closed");
+        assert!(
+            store.list().is_empty(),
+            "a rejected create must never become a cache-only conversation"
+        );
+
+        persistence.set_fail_save(false);
+        let retried = store
+            .create_persisted(Some("durable".into()), None)
+            .expect("the caller can retry after the authority recovers");
+
+        let reloaded = ConversationStore::with_persistence(persistence.clone());
+        assert!(
+            reloaded.get(&retried.id).is_some(),
+            "only the successful retry may become durable"
+        );
+    }
+
+    #[test]
+    fn failed_external_mutation_does_not_leak_into_a_later_successful_save() {
+        let persistence = Arc::new(FlakyPersistence::default());
+        let store = ConversationStore::with_persistence(persistence.clone());
+        let conversation = store.create_persisted(None, None).unwrap();
+        persistence.set_fail_save(true);
+
+        let failed = store.append_user_message(&conversation.id, "rejected".into());
+
+        assert!(failed.is_err(), "the rejected mutation must be reported");
+
+        persistence.set_fail_save(false);
+        store
+            .append_user_message(&conversation.id, "accepted".into())
+            .expect("a later mutation can retry against durable state");
+
+        let reloaded = ConversationStore::with_persistence(persistence);
+        let durable = reloaded.get(&conversation.id).unwrap();
+        assert_eq!(durable.nodes.len(), 1);
+        assert_eq!(durable.nodes[0].active_content(), "accepted");
     }
 
     #[test]

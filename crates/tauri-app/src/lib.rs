@@ -6,7 +6,9 @@ mod global_regex_store;
 mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
+pub mod sqlite_runtime;
 mod storage;
+pub mod storage_backend;
 pub mod turn_coordinator;
 pub mod turn_lifecycle;
 pub mod turn_store;
@@ -135,10 +137,21 @@ static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new()
 static COMPRESS_JOB_STORE: OnceLock<compress_job_store::CompressJobStore> = OnceLock::new();
 
 fn get_campaign_store() -> &'static campaign_store::CampaignStore {
-    CAMPAIGN_STORE.get_or_init(|| {
-        let data_dir = get_app_data_dir();
-        campaign_store::CampaignStore::new(&data_dir)
-    })
+    let store = CAMPAIGN_STORE.get_or_init(|| {
+        if sqlite_runtime::is_sqlite_active() {
+            campaign_store::CampaignStore::disabled()
+        } else {
+            let data_dir = get_app_data_dir();
+            campaign_store::CampaignStore::new(&data_dir)
+        }
+    });
+    if sqlite_runtime::is_sqlite_active() {
+        // Backend resolution normally happens before this lazy store is ever
+        // initialized. Keep this guard for accidental early initialization so
+        // SQLite mode can never use JSON as a fallback or second write target.
+        store.disable_json_access();
+    }
+    store
 }
 
 fn get_compress_job_store() -> &'static compress_job_store::CompressJobStore {
@@ -157,6 +170,28 @@ fn get_turn_store() -> &'static turn_store::TurnStore {
     })
 }
 
+/// Read Turn state from the process-selected authority. SQLite mode never
+/// consults the legacy JSON `TurnStore`, including on error paths.
+fn get_active_turn_for_backend(
+    campaign_id: &Id,
+) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+    if sqlite_runtime::is_sqlite_active() {
+        sqlite_runtime::get_active_turn(campaign_id)
+    } else {
+        Ok(get_turn_store().get_active_turn(campaign_id))
+    }
+}
+
+fn get_turn_by_variant_for_backend(
+    variant_id: &Id,
+) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+    if sqlite_runtime::is_sqlite_active() {
+        sqlite_runtime::get_turn_by_variant(variant_id)
+    } else {
+        Ok(get_turn_store().get_turn_by_variant(variant_id))
+    }
+}
+
 /// Phase A 启动恢复：幂等重放 Committing 态 Turn + 标记非 terminal 活动 Turn 为 Failed。
 ///
 /// 规则（收敛决策步骤 12/16/17）：
@@ -170,6 +205,18 @@ fn get_turn_store() -> &'static turn_store::TurnStore {
 ///    Committing 不在此步处理（避免覆盖第 1 步未完成的恢复）。
 /// 3. Committed/Degraded/Failed/Abandoned 态 Turn：不动。
 fn recover_turns_on_startup(app_state: &AppState) {
+    // SQLite accept is atomic: recover by failing incomplete pipeline turns.
+    // Never fall back to JSON stores when SQLite is authoritative.
+    if sqlite_runtime::is_sqlite_active() {
+        match sqlite_runtime::recover_turns_on_startup() {
+            Ok(n) if n > 0 => {
+                tracing::warn!(count = n, "sqlite recovery failed incomplete turns")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("sqlite recovery failed: {e}"),
+        }
+        return;
+    }
     let service = turn_lifecycle::TurnLifecycleService::new(
         get_campaign_store(),
         get_turn_store(),
@@ -215,6 +262,22 @@ fn reject_if_active_turn_in(
     turn_store: &turn_store::TurnStore,
     campaign_id: &Id,
 ) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        match sqlite_runtime::get_active_turn(campaign_id) {
+            Ok(Some(turn)) => {
+                return Err(TauriCommandError::validation(format!(
+                    "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
+                    turn.turn_id, turn.status
+                )));
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(TauriCommandError::internal(format!(
+                    "sqlite active turn lookup failed: {e}"
+                )));
+            }
+        }
+    }
     if let Some(turn) = turn_store.get_active_turn(campaign_id) {
         return Err(TauriCommandError::validation(format!(
             "当前有未完成的轮次（turn_id={}, status={:?}），请先 Accept、Discard 或 Abandon 后再修改",
@@ -403,6 +466,26 @@ fn load_active_campaign(data_dir: &Path) -> Option<Id> {
         .map(Id::from_str)
 }
 
+fn should_load_legacy_active_campaign_pointer(sqlite_active: bool) -> bool {
+    !sqlite_active
+}
+
+fn resolve_active_campaign_with_legacy_fallback(
+    memory_active_id: Option<Id>,
+    data_dir: &Path,
+    sqlite_active: bool,
+) -> Option<Id> {
+    if should_load_legacy_active_campaign_pointer(sqlite_active) {
+        memory_active_id.or_else(|| load_active_campaign(data_dir))
+    } else {
+        memory_active_id
+    }
+}
+
+fn load_active_campaign_for_backend(data_dir: &Path) -> Option<Id> {
+    resolve_active_campaign_with_legacy_fallback(None, data_dir, sqlite_runtime::is_sqlite_active())
+}
+
 fn save_active_campaign(data_dir: &Path, id: Option<&Id>) {
     let path = data_dir.join("active_campaign.json");
     let v = serde_json::json!({ "campaign_id": id.map(|i| i.as_str()).unwrap_or("") });
@@ -480,7 +563,13 @@ impl AppState {
         let mock_llm: Arc<dyn LlmClient> =
             Arc::new(storyforge_infra_llm::mock_client::MockLlmClient::with_defaults());
 
-        let conv_store = Arc::new(ConversationStore::new(conv_dir));
+        let conv_store = if sqlite_runtime::is_sqlite_active() {
+            let persistence = sqlite_runtime::conversation_persistence()
+                .expect("sqlite backend was activated before AppState construction");
+            Arc::new(ConversationStore::with_persistence(persistence))
+        } else {
+            Arc::new(ConversationStore::new(conv_dir))
+        };
         let log_store = Arc::new(LogStore::new(log_dir));
 
         let tool_ctx = Arc::new(RwLock::new(ToolContext {
@@ -586,7 +675,10 @@ impl AppState {
             typed_patches: Arc::new(RwLock::new(Vec::new())),
             typed_patch_accept_lock: Mutex::new(()),
             embed_config: Arc::new(RwLock::new(load_embed_config(&data_dir))),
-            active_campaign: Mutex::new(load_active_campaign(&data_dir)),
+            // SQLite mode must not let a legacy JSON UI preference select an
+            // authority record after cutover. SQLite-native preference storage
+            // is intentionally deferred; selection remains in-process.
+            active_campaign: Mutex::new(load_active_campaign_for_backend(&data_dir)),
             plugin_registry,
             module_store,
             profile_store,
@@ -2361,10 +2453,19 @@ async fn start_writing(
     // Phase A: Campaign 模式下创建 TurnRecord
     let turn_record = if let Some(campaign_id) = &ctx.campaign_id {
         // 获取当前 Campaign revision 作为 base
-        let base_revision = get_campaign_store()
-            .get_campaign(campaign_id)
-            .map(|c| c.revision)
-            .unwrap_or(0);
+        let base_revision = if sqlite_runtime::is_sqlite_active() {
+            sqlite_runtime::get_campaign(campaign_id)
+                .map_err(TauriCommandError::internal)?
+                .ok_or_else(|| {
+                    TauriCommandError::internal(format!("sqlite campaign {} missing", campaign_id))
+                })?
+                .revision
+        } else {
+            get_campaign_store()
+                .get_campaign(campaign_id)
+                .map(|c| c.revision)
+                .unwrap_or(0)
+        };
         let input_node = start_target.input_node_id.unwrap_or_else(|| {
             tracing::warn!(
                 "Phase A: user 消息节点 ID 未知，TurnRecord.input_node_id 用 placeholder"
@@ -2377,7 +2478,12 @@ async fn start_writing(
             input_node,
             base_revision,
         );
-        if let Err(e) = get_turn_store().create_turn(record.clone()) {
+        let create_turn = if sqlite_runtime::is_sqlite_active() {
+            sqlite_runtime::save_turn(&record)
+        } else {
+            get_turn_store().create_turn(record.clone())
+        };
+        if let Err(e) = create_turn {
             tracing::error!("Phase A: 创建 TurnRecord 失败: {e}");
             return Err(TauriCommandError::internal(format!(
                 "创建 TurnRecord 失败: {e}"
@@ -2474,8 +2580,7 @@ async fn start_writing(
         let final_text = final_text.clone();
         let var_keys = postprocess_variable_keys(&ctx);
         let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
-        let mvu_fragments =
-            collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+        let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         let cancel_for_fix = {
@@ -2527,6 +2632,7 @@ async fn start_writing(
         let pp_event_tx = event_tx.clone();
         let pp_turn_id = turn_record.as_ref().map(|t| t.turn_id.clone());
         let pp_attempt_id = created_attempt_id;
+        let pp_runtime = ctx.campaign_runtime.clone();
         tokio::spawn(async move {
             let outcome = pipeline
                 .run_postprocess(
@@ -2549,11 +2655,49 @@ async fn start_writing(
                 let batch = match (pc, outcome_clone) {
                     (Some(pc), Some(o)) => {
                         let pc = pc.clone();
-                        tokio::task::spawn_blocking(move || {
-                            build_mutation_batch(get_campaign_store(), &pc, &o, &present_chars)
+                        let runtime = pp_runtime.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            build_mutation_batch_for_backend(
+                                &pc,
+                                &o,
+                                &present_chars,
+                                runtime.as_deref(),
+                            )
                         })
                         .await
-                        .ok()
+                        {
+                            Ok(Ok(batch)) => Some(batch),
+                            Ok(Err(error)) => {
+                                let error = error.to_string();
+                                tracing::error!(
+                                    "sqlite/json postprocess batch construction failed for Turn {}: {error}",
+                                    turn_id
+                                );
+                                let _ = update_turn_record(&turn_id, |record| {
+                                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                                    record.failure_reason = Some(format!(
+                                        "postprocess mutation batch construction failed: {error}"
+                                    ));
+                                    record.touch();
+                                });
+                                return;
+                            }
+                            Err(error) => {
+                                let error = error.to_string();
+                                tracing::error!(
+                                    "postprocess batch task failed for Turn {}: {error}",
+                                    turn_id
+                                );
+                                let _ = update_turn_record(&turn_id, |record| {
+                                    record.status = storyforge_domain::turn::TurnStatus::Failed;
+                                    record.failure_reason = Some(format!(
+                                        "postprocess mutation batch task failed: {error}"
+                                    ));
+                                    record.touch();
+                                });
+                                return;
+                            }
+                        }
                     }
                     _ => None,
                 };
@@ -2636,6 +2780,9 @@ fn update_turn_record<F>(turn_id: &Id, f: F) -> Result<(), String>
 where
     F: FnOnce(&mut storyforge_domain::turn::TurnRecord),
 {
+    if sqlite_runtime::is_sqlite_active() {
+        return sqlite_runtime::update_turn_record(turn_id, f);
+    }
     get_turn_store()
         .with_turn_mut(turn_id, f)
         .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
@@ -2653,6 +2800,9 @@ where
     P: FnOnce(&storyforge_domain::turn::TurnRecord) -> bool,
     M: FnOnce(&mut storyforge_domain::turn::TurnRecord),
 {
+    if sqlite_runtime::is_sqlite_active() {
+        return sqlite_runtime::mutate_turn_if(turn_id, predicate, mutate);
+    }
     get_turn_store()
         .mutate_if(turn_id, predicate, mutate)
         .map_err(|e| format!("条件更新 TurnRecord 失败: {e}"))
@@ -2694,7 +2844,7 @@ async fn prepare_start_conversation_async(
         )
     })
     .await
-    .map_err(|e| TauriCommandError::internal(format!("准备写作对话任务失败: {e}")))
+    .map_err(|e| TauriCommandError::internal(format!("准备写作对话任务失败: {e}")))?
 }
 
 fn prepare_start_conversation(
@@ -2705,16 +2855,33 @@ fn prepare_start_conversation(
     legacy_opening_character: Option<Arc<storyforge_domain::character::Character>>,
     opening_message: Option<String>,
     intent: String,
-) -> StartConversationTarget {
+) -> Result<StartConversationTarget, TauriCommandError> {
     let campaign_conv_id: Option<Id> = {
         let active = state
             .active_campaign
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        active
-            .as_ref()
-            .and_then(|cid| campaign_store.get_campaign(cid))
-            .and_then(|c| c.conversation_id.clone())
+        if sqlite_runtime::is_sqlite_active() {
+            match active.as_ref() {
+                Some(campaign_id) => {
+                    sqlite_runtime::get_campaign(campaign_id)
+                        .map_err(TauriCommandError::internal)?
+                        .ok_or_else(|| {
+                            TauriCommandError::internal(format!(
+                                "sqlite campaign {} missing while preparing writing",
+                                campaign_id
+                            ))
+                        })?
+                        .conversation_id
+                }
+                None => None,
+            }
+        } else {
+            active
+                .as_ref()
+                .and_then(|cid| campaign_store.get_campaign(cid))
+                .and_then(|campaign| campaign.conversation_id.clone())
+        }
     };
     let conversation_id = campaign_conv_id
         .map(|cid| cid.as_str().to_string())
@@ -2725,12 +2892,26 @@ fn prepare_start_conversation(
         match state.conv_store.append_user_message(&id, intent.clone()) {
             Ok(node_id) => (id, Some(node_id)),
             Err(e) => {
+                if sqlite_runtime::is_sqlite_active() {
+                    return Err(TauriCommandError::internal(format!(
+                        "sqlite user message persistence failed: {e}"
+                    )));
+                }
                 tracing::warn!("追加 user 消息失败: {e}");
                 (id, None)
             }
         }
     } else {
-        let conv = state.conv_store.create(character_id.clone(), None);
+        let conv = if sqlite_runtime::is_sqlite_active() {
+            state
+                .conv_store
+                .create_persisted(character_id.clone(), None)
+                .map_err(|e| {
+                    TauriCommandError::internal(format!("sqlite conversation creation failed: {e}"))
+                })?
+        } else {
+            state.conv_store.create(character_id.clone(), None)
+        };
         let id = conv.id.clone();
         let legacy_opening =
             resolve_legacy_opening_message(legacy_opening_character.as_ref(), opening_message);
@@ -2740,15 +2921,25 @@ fn prepare_start_conversation(
                     .conv_store
                     .append_final_message(&id, ConversationRole::Assistant, opening)
         {
+            if sqlite_runtime::is_sqlite_active() {
+                return Err(TauriCommandError::internal(format!(
+                    "sqlite opening message persistence failed: {e}"
+                )));
+            }
             tracing::warn!("追加开场白失败: {e}");
         }
-        let node_id = state
-            .conv_store
-            .append_user_message(&id, intent.clone())
-            .map_err(|e| {
+        let node_id = match state.conv_store.append_user_message(&id, intent.clone()) {
+            Ok(node_id) => Some(node_id),
+            Err(e) if sqlite_runtime::is_sqlite_active() => {
+                return Err(TauriCommandError::internal(format!(
+                    "sqlite user message persistence failed: {e}"
+                )));
+            }
+            Err(e) => {
                 tracing::warn!("追加 user 消息失败: {e}");
-            })
-            .ok();
+                None
+            }
+        };
         (id, node_id)
     };
 
@@ -2759,11 +2950,11 @@ fn prepare_start_conversation(
             .and_then(|c| c.character_id)
     });
 
-    StartConversationTarget {
+    Ok(StartConversationTarget {
         conversation_id,
         regex_character_id,
         input_node_id,
-    }
+    })
 }
 
 fn resolve_legacy_opening_message(
@@ -2935,9 +3126,11 @@ fn fill_campaign_context(ctx: &mut WritingContext, state: &AppState) {
             .active_campaign
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        guard
-            .clone()
-            .or_else(|| load_active_campaign(&state.data_dir))
+        resolve_active_campaign_with_legacy_fallback(
+            guard.clone(),
+            &state.data_dir,
+            sqlite_runtime::is_sqlite_active(),
+        )
     };
     let active_id = match active_id {
         Some(id) => id,
@@ -2961,12 +3154,28 @@ async fn fill_campaign_context_async(
         guard.clone()
     };
     let data_dir = state.data_dir.clone();
+    let sqlite_active = sqlite_runtime::is_sqlite_active();
     let snapshot = tokio::task::spawn_blocking(move || {
-        let active_id = memory_active_id.or_else(|| load_active_campaign(&data_dir))?;
-        load_campaign_context_snapshot(get_campaign_store(), &active_id)
+        let active_id = resolve_active_campaign_with_legacy_fallback(
+            memory_active_id,
+            &data_dir,
+            sqlite_active,
+        );
+        let Some(active_id) = active_id else {
+            return Ok(None);
+        };
+        if sqlite_runtime::is_sqlite_active() {
+            load_sqlite_campaign_context_snapshot(&active_id)
+        } else {
+            Ok(load_campaign_context_snapshot(
+                get_campaign_store(),
+                &active_id,
+            ))
+        }
     })
     .await
-    .map_err(|e| TauriCommandError::internal(format!("加载 Campaign 快照任务失败: {e}")))?;
+    .map_err(|e| TauriCommandError::internal(format!("加载 Campaign 快照任务失败: {e}")))?
+    .map_err(TauriCommandError::internal)?;
 
     if let Some(snapshot) = snapshot {
         apply_campaign_context_snapshot(ctx, &state.tool_ctx, snapshot);
@@ -3434,6 +3643,93 @@ fn load_campaign_context_snapshot(
         chronicle_tool_catalog,
         chronicle_prompt_catalog,
     })
+}
+
+/// SQLite opt-in version of the Campaign context compiler input. The writing
+/// pipeline receives the same immutable domain snapshot as the JSON backend,
+/// but every Campaign/instance/task/knowledge/summary read and every epoch
+/// refresh write uses the process-owned SQLite authority.
+fn load_sqlite_campaign_context_snapshot(
+    active_id: &Id,
+) -> Result<Option<CampaignContextSnapshot>, String> {
+    let Some(mut camp) = sqlite_runtime::get_campaign(active_id)? else {
+        return Ok(None);
+    };
+
+    let mut campaign_changed = false;
+    if camp.lineage_id.is_none() {
+        camp.ensure_lineage_id();
+        campaign_changed = true;
+    }
+    let all_summaries = sqlite_runtime::list_summaries(active_id)?;
+    let (epoch_snap, _membership, should_persist_epoch, bumped_revision) =
+        compute_context_epoch_refresh_parts(&camp, &all_summaries);
+    if should_persist_epoch {
+        camp.chronicle_revision = bumped_revision;
+        camp.context_epoch = Some(epoch_snap.clone());
+        campaign_changed = true;
+    }
+    if campaign_changed {
+        sqlite_runtime::save_campaign(&camp)?;
+    }
+
+    let all_summaries = sqlite_runtime::list_summaries(active_id)?;
+    let turn = next_writing_turn(&all_summaries);
+    let chronicle_prompt_catalog =
+        build_chronicle_prompt_catalog(&all_summaries, camp.context_epoch.as_ref());
+    let recent_summaries =
+        take_recent_summaries_for_context(all_summaries.clone(), RECENT_SUMMARIES_LOAD_LIMIT);
+    let tasks = sqlite_runtime::list_tasks(active_id)?;
+    let instances = sqlite_runtime::list_instances(active_id)?;
+    let knowledge = sqlite_runtime::list_knowledge(active_id)?;
+
+    let stored_card = sqlite_runtime::get_card_payload(&camp.card_id)?.and_then(|payload| {
+        serde_json::from_value::<campaign_store::StoredCard>(payload.clone())
+            .ok()
+            .or_else(|| {
+                serde_json::from_value::<storyforge_domain::character::CharacterCard>(payload)
+                    .ok()
+                    .map(|card| campaign_store::StoredCard {
+                        card,
+                        imported_at: String::new(),
+                    })
+            })
+    });
+    let scoped_regex_scripts = stored_card
+        .as_ref()
+        .map(|stored| stored.card.scoped_regex_scripts())
+        .unwrap_or_default();
+    let definitions_by_id = stored_card
+        .map(|stored| {
+            stored
+                .card
+                .character_definitions
+                .into_iter()
+                .map(|definition| (definition.id.clone(), definition))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let story_clock = camp.story_clock.clone();
+    let runtime = Arc::new(CampaignRuntimeContext {
+        campaign: camp,
+        instances,
+        definitions_by_id,
+        knowledge,
+        tasks: tasks.clone(),
+        turn,
+    });
+    Ok(Some(CampaignContextSnapshot {
+        active_id: active_id.clone(),
+        story_clock,
+        turn,
+        pending_tasks: tasks,
+        scoped_regex_scripts,
+        runtime,
+        recent_summaries,
+        chronicle_tool_catalog: all_summaries,
+        chronicle_prompt_catalog,
+    }))
 }
 
 fn apply_campaign_context_snapshot(
@@ -3934,6 +4230,24 @@ fn collect_mvu_fallback_fragments(
     fragments
 }
 
+/// SQLite does not yet migrate the optional MVU translation cache. Do not
+/// read its JSON file as a hidden second authority; run postprocess without
+/// those optional snippets until MVU has a typed SQLite table.
+fn collect_mvu_fallback_fragments_for_backend(
+    ctx: &WritingContext,
+    present_chars: &[String],
+) -> Vec<storyforge_domain::mvu_translation::FallbackFragment> {
+    if sqlite_runtime::is_sqlite_active() {
+        tracing::debug!(
+            count = present_chars.len(),
+            "sqlite backend skips JSON-only MVU fallback fragments"
+        );
+        Vec::new()
+    } else {
+        collect_mvu_fallback_fragments(ctx, get_campaign_store(), present_chars)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PostprocessPersistContext {
     campaign_id: Id,
@@ -4164,6 +4478,284 @@ fn build_mutation_batch(
         target_revision: expected_revision + 1,
         status: storyforge_domain::turn::MutationBatchStatus::Prepared,
         mutations,
+    }
+}
+
+/// SQLite opt-in equivalent of `build_mutation_batch`. It is deliberately
+/// pure over the SQLite-loaded `CampaignRuntimeContext`: postprocess never
+/// consults the JSON CampaignStore after cutover, while the Accept UoW still
+/// validates the resulting batch against the current SQLite revision.
+fn build_mutation_batch_from_runtime(
+    persist_ctx: &PostprocessPersistContext,
+    outcome: &storyforge_app_agent::PostProcessOutcome,
+    present_chars: &[String],
+    runtime: &CampaignRuntimeContext,
+) -> storyforge_domain::turn::MutationBatch {
+    use storyforge_domain::character_knowledge::{
+        BroadcastTarget, KnowledgeSource, PropagationPolicy,
+    };
+    use storyforge_domain::turn::{
+        KnowledgeMutation, Mutation, MutationBatch, MutationBatchStatus,
+    };
+
+    let campaign = &runtime.campaign;
+    let mut mutations = Vec::new();
+    let present_ids: std::collections::HashSet<String> = present_chars.iter().cloned().collect();
+    let name_collisions: std::collections::HashSet<String> = {
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for instance in &runtime.instances {
+            *counts.entry(instance.name.clone()).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter_map(|(name, count)| (count >= 2).then_some(name))
+            .collect()
+    };
+    let resolve_instance = |value: &Id| {
+        runtime
+            .instances
+            .iter()
+            .find(|instance| instance.id == *value || instance.name == value.as_str())
+            .cloned()
+    };
+    let is_group_member = |instance: &storyforge_domain::campaign::CharacterInstance,
+                           group: &str| {
+        instance
+            .definition_id
+            .as_ref()
+            .and_then(|id| runtime.definitions_by_id.get(id))
+            .and_then(|definition| definition.group.as_deref())
+            == Some(group)
+    };
+    let source_entry_for = |source_id: &Id, text: &str| {
+        runtime
+            .knowledge
+            .iter()
+            .filter(|entry| entry.character_id == *source_id)
+            .filter(|entry| knowledge_text_matches(&entry.knowledge_text, text))
+            .max_by(|left, right| {
+                left.turn_number
+                    .cmp(&right.turn_number)
+                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+            })
+            .cloned()
+    };
+    let source_policy_blocks =
+        |update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+         target: Option<&storyforge_domain::campaign::CharacterInstance>| {
+            let propagating =
+                update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
+            if !propagating {
+                return false;
+            }
+            let Some(source_raw) = update.source_character_id.as_ref() else {
+                return false;
+            };
+            let Some(source) = resolve_instance(source_raw) else {
+                return false;
+            };
+            let Some(entry) = source_entry_for(&source.id, &update.knowledge_text) else {
+                return false;
+            };
+            match &entry.propagation {
+                PropagationPolicy::Open => false,
+                PropagationPolicy::Private => true,
+                PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
+                    (Some(BroadcastTarget::Group(target_group)), _) => target_group != group,
+                    (Some(BroadcastTarget::All), _) => true,
+                    (None, Some(target_instance)) => !is_group_member(target_instance, group),
+                    (None, None) => true,
+                },
+            }
+        };
+
+    if let Some(summary) = &outcome.summary {
+        let code = storyforge_domain::chronicle::ChronicleCode::new(
+            storyforge_domain::chronicle::ChronicleLevel::A,
+            persist_ctx.turn,
+        );
+        let lineage = campaign.lineage_id.clone().unwrap_or_default();
+        mutations.push(Mutation::UpsertSummary(Box::new(
+            storyforge_domain::agent::RoundSummary::new(
+                persist_ctx.campaign_id.clone(),
+                persist_ctx.conversation_id.clone(),
+                persist_ctx.turn,
+                summary.clone(),
+            )
+            .with_code(code.as_str())
+            .with_headline(storyforge_domain::chronicle::truncate_headline(summary, 40))
+            .with_lineage(lineage),
+        )));
+    }
+
+    if let Some(postprocess) = &outcome.post_process {
+        for update in &postprocess.knowledge_updates {
+            if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
+                continue;
+            }
+            if source_policy_blocks(update, None) {
+                continue;
+            }
+            let source_instance = update
+                .source_character_id
+                .as_ref()
+                .and_then(resolve_instance);
+            let source_character_id = source_instance.as_ref().map(|instance| instance.id.clone());
+            let targets: Vec<_> = match &update.broadcast {
+                Some(BroadcastTarget::All) => runtime
+                    .instances
+                    .iter()
+                    .filter(|instance| Some(&instance.id) != source_character_id.as_ref())
+                    .cloned()
+                    .collect(),
+                Some(BroadcastTarget::Group(group)) => runtime
+                    .instances
+                    .iter()
+                    .filter(|instance| {
+                        Some(&instance.id) != source_character_id.as_ref()
+                            && is_group_member(instance, group)
+                    })
+                    .cloned()
+                    .collect(),
+                None => resolve_instance(&update.character_id).into_iter().collect(),
+            };
+
+            for target in targets {
+                if source_policy_blocks(update, Some(&target)) {
+                    continue;
+                }
+                let presence_exempt = matches!(
+                    update.source,
+                    KnowledgeSource::ToldByOther | KnowledgeSource::Backstory
+                );
+                if update.broadcast.is_none()
+                    && !presence_exempt
+                    && (present_ids.is_empty()
+                        || !is_postprocess_instance_present(
+                            &target,
+                            &update.character_id,
+                            &present_ids,
+                            &name_collisions,
+                        ))
+                {
+                    continue;
+                }
+                mutations.push(Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
+                    entry_id: Id::new(),
+                    campaign_id: persist_ctx.campaign_id.clone(),
+                    character_id: target.id,
+                    knowledge_text: update.knowledge_text.clone(),
+                    source: if update.broadcast.is_some() {
+                        KnowledgeSource::ToldByOther
+                    } else {
+                        update.source.clone()
+                    },
+                    source_character_id: source_character_id.clone(),
+                    turn_number: persist_ctx.turn,
+                    event_id: None,
+                    pinned: update.pinned,
+                    propagation: update.propagation.clone(),
+                })));
+            }
+        }
+
+        for update in &postprocess.variable_updates {
+            if let Some(instance_raw) = &update.instance_id {
+                if let Some(instance) = resolve_instance(instance_raw)
+                    && is_postprocess_instance_present(
+                        &instance,
+                        instance_raw,
+                        &present_ids,
+                        &name_collisions,
+                    )
+                {
+                    mutations.push(Mutation::SetVariable {
+                        instance_id: Some(instance.id),
+                        key: update.key.clone(),
+                        value: update.value.clone(),
+                        turn: persist_ctx.turn,
+                    });
+                }
+            } else {
+                mutations.push(Mutation::SetVariable {
+                    instance_id: None,
+                    key: update.key.clone(),
+                    value: update.value.clone(),
+                    turn: persist_ctx.turn,
+                });
+            }
+        }
+
+        for update in &postprocess.task_updates {
+            if let Some(task_id) = &update.task_id {
+                if let Some(task) = runtime
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *task_id)
+                    .cloned()
+                    && let Some(task) = normalize_task_update_for_postprocess(
+                        &persist_ctx.campaign_id,
+                        task,
+                        update.new_status.clone(),
+                    )
+                {
+                    mutations.push(Mutation::SetTaskStatus {
+                        task_id: task.id,
+                        status: task.status,
+                    });
+                }
+            } else if let Some(spec) = &update.new_task {
+                mutations.push(Mutation::UpsertNewTask(Box::new(
+                    storyforge_domain::story_task::StoryTask::from_narrative(
+                        persist_ctx.campaign_id.clone(),
+                        spec.title.clone(),
+                        spec.description.clone(),
+                        spec.triggers.clone(),
+                        persist_ctx.turn,
+                    ),
+                )));
+            }
+        }
+    }
+
+    MutationBatch {
+        commit_id: Id::new(),
+        expected_revision: campaign.revision,
+        target_revision: campaign.revision + 1,
+        status: MutationBatchStatus::Prepared,
+        mutations,
+    }
+}
+
+fn build_mutation_batch_for_backend(
+    persist_ctx: &PostprocessPersistContext,
+    outcome: &storyforge_app_agent::PostProcessOutcome,
+    present_chars: &[String],
+    runtime: Option<&CampaignRuntimeContext>,
+) -> Result<storyforge_domain::turn::MutationBatch, String> {
+    if sqlite_runtime::is_sqlite_active() {
+        let runtime = runtime.ok_or_else(|| {
+            "sqlite postprocess has no CampaignRuntimeContext; refusing JSON fallback".to_string()
+        })?;
+        if runtime.campaign.id != persist_ctx.campaign_id {
+            return Err(format!(
+                "sqlite postprocess campaign scope mismatch: runtime={}, requested={}",
+                runtime.campaign.id, persist_ctx.campaign_id
+            ));
+        }
+        Ok(build_mutation_batch_from_runtime(
+            persist_ctx,
+            outcome,
+            present_chars,
+            runtime,
+        ))
+    } else {
+        Ok(build_mutation_batch(
+            get_campaign_store(),
+            persist_ctx,
+            outcome,
+            present_chars,
+        ))
     }
 }
 fn persist_postprocess_outcome_to_store(
@@ -4716,6 +5308,46 @@ fn parse_target_dto(target: &RegenerateTargetDto) -> Result<PartialRollTarget, T
     }
 }
 
+/// Refuse a regenerate request unless the target conversation and the active
+/// Turn belong to the same selected Campaign. This check must happen before
+/// `PipelineOrchestrator::regenerate`, because that pipeline mutates the
+/// requested conversation's draft in place.
+fn validate_regenerate_campaign_scope(
+    active_campaign: Option<&Id>,
+    conversation: &Conversation,
+    active_turn: Option<&storyforge_domain::turn::TurnRecord>,
+) -> Result<(), TauriCommandError> {
+    match (active_campaign, conversation.campaign_id.as_ref()) {
+        (None, None) => Ok(()),
+        (None, Some(conversation_campaign)) => Err(TauriCommandError::validation(format!(
+            "campaign conversation {} requires selecting campaign {} before regenerate",
+            conversation.id, conversation_campaign
+        ))),
+        (Some(active), Some(conversation_campaign)) if active == conversation_campaign => {
+            let turn = active_turn.ok_or_else(|| {
+                TauriCommandError::validation(format!(
+                    "campaign {} has no active turn for regenerate",
+                    active
+                ))
+            })?;
+            if turn.campaign_id != *active || turn.conversation_id != conversation.id {
+                return Err(TauriCommandError::validation(format!(
+                    "regenerate scope mismatch: conversation {} is not the active turn conversation",
+                    conversation.id
+                )));
+            }
+            Ok(())
+        }
+        (Some(active), Some(conversation_campaign)) => Err(TauriCommandError::validation(format!(
+            "regenerate campaign mismatch: selected {active}, conversation belongs to {conversation_campaign}"
+        ))),
+        (Some(active), None) => Err(TauriCommandError::validation(format!(
+            "legacy conversation {} cannot regenerate while campaign {} is active",
+            conversation.id, active
+        ))),
+    }
+}
+
 /// Tauri command: 重 roll（整体/只重编剧/只重某子 Agent，可附 hint）
 ///
 /// 通过 Channel 推送事件，返回新 variant 的成文。
@@ -4738,6 +5370,29 @@ async fn regenerate(
     let node_id = Id::from_str(&req.node_id);
     let recall_hint = req.hint.clone();
 
+    // Scope before constructing/running the pipeline. A cross-campaign
+    // request used to mutate the requested conversation first and only then
+    // attach an Attempt to the currently selected Campaign.
+    let conversation = app.conv_store.get(&conversation_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!("conversation {conversation_id} was not found"))
+    })?;
+    let active_campaign = app
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let active_turn = active_campaign
+        .as_ref()
+        .map(get_active_turn_for_backend)
+        .transpose()
+        .map_err(TauriCommandError::internal)?
+        .flatten();
+    validate_regenerate_campaign_scope(
+        active_campaign.as_ref(),
+        &conversation,
+        active_turn.as_ref(),
+    )?;
+
     let pipeline_req = RegenerateRequest {
         conversation_id: conversation_id.clone(),
         node_id: node_id.clone(),
@@ -4757,10 +5412,7 @@ async fn regenerate(
 
     // tool_ctx 快照（保持与 start_writing 一致）
     let tool_snapshot = app.snapshot_tool_ctx();
-    let regex_character_id = app
-        .conv_store
-        .get(&conversation_id)
-        .and_then(|conversation| conversation.character_id);
+    let regex_character_id = conversation.character_id.clone();
     let mut ctx = WritingContext {
         characters: tool_snapshot.characters.clone(),
         world_info: tool_snapshot.world_info.clone(),
@@ -4835,7 +5487,9 @@ async fn regenerate(
         // regenerate 的 replace_active_variant 改变了 node_id 的 active variant,
         // 新 variant 在同一 node 上,用 req 的 node_id 作为 variant_id
         let regen_attempt_id = if let Some(campaign_id) = &ctx.campaign_id {
-            if let Some(turn) = get_turn_store().get_active_turn(campaign_id) {
+            if let Some(turn) =
+                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
+            {
                 let new_attempt = turn_lifecycle::new_draft_attempt(
                     Id::new(),
                     node_id.clone(),
@@ -4892,8 +5546,7 @@ async fn regenerate(
         );
         let (_pp_tx, pp_rx) = watch::channel(false);
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
-        let mvu_fragments =
-            collect_mvu_fallback_fragments(&ctx, get_campaign_store(), &present_chars);
+        let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         let cancel_for_fix = {
             let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
@@ -4920,9 +5573,13 @@ async fn regenerate(
         response_text = Some(final_text.clone());
         // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）。
         // 关键同步失败必须传播，不能 best-effort 返回修复稿却留下原稿 hash。
-        if let (Some(campaign_id), Some(att_id)) = (&ctx.campaign_id, &regen_attempt_id)
-            && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
-        {
+        let active_turn_after_regenerate = match &ctx.campaign_id {
+            Some(campaign_id) => {
+                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
+            }
+            None => None,
+        };
+        if let (Some(turn), Some(att_id)) = (active_turn_after_regenerate, &regen_attempt_id) {
             let report_for_attempt = quality_report.clone();
             let att_id = att_id.clone();
             if let Err(e) = update_turn_record(&turn.turn_id, |record| {
@@ -4958,21 +5615,36 @@ async fn regenerate(
             .await;
 
         // Phase A: postprocess 产出暂存到新 TurnAttempt（同 start_writing）
-        if let Some(campaign_id) = &ctx.campaign_id
-            && let Some(turn) = get_turn_store().get_active_turn(campaign_id)
-            && let Some(att_id) = regen_attempt_id
-        {
+        let active_turn_for_postprocess = match &ctx.campaign_id {
+            Some(campaign_id) => {
+                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
+            }
+            None => None,
+        };
+        if let (Some(turn), Some(att_id)) = (active_turn_for_postprocess, regen_attempt_id) {
             let derivation = derive_components_from_outcome(&outcome);
             let pc = PostprocessPersistContext::from_writing_context(&ctx);
             let outcome_clone = outcome.clone();
             let batch = match (pc, outcome_clone) {
                 (Some(pc), Some(o)) => {
                     let pc = pc.clone();
+                    let runtime = ctx.campaign_runtime.clone();
                     tokio::task::spawn_blocking(move || {
-                        build_mutation_batch(get_campaign_store(), &pc, &o, &present_chars)
+                        build_mutation_batch_for_backend(
+                            &pc,
+                            &o,
+                            &present_chars,
+                            runtime.as_deref(),
+                        )
                     })
                     .await
-                    .ok()
+                    .map_err(|error| {
+                        TauriCommandError::internal(format!(
+                            "postprocess batch task failed: {error}"
+                        ))
+                    })?
+                    .map_err(TauriCommandError::internal)?
+                    .into()
                 }
                 _ => None,
             };
@@ -5864,7 +6536,9 @@ fn edit_variant(
 
     // P0-3：编辑后 draft_hash 不再匹配 → 标记关联 Attempt 为 Stale
     // commit_turn_attempt 会因 hash 不匹配拒绝 accept，Stale 是显式信号
-    if let Some(turn) = get_turn_store().get_turn_by_variant(&nid) {
+    if let Some(turn) =
+        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+    {
         let turn_id = turn.turn_id.clone();
         if let Some(att) = turn.find_attempt_by_variant(&nid) {
             let attempt_id = att.attempt_id.clone();
@@ -5962,6 +6636,16 @@ fn count_uncovered_chronicle_levels(
 
 /// Accept 成功后：达阈值则**持久化入队**，再 spawn worker 消费 job。
 fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
+    if sqlite_runtime::is_sqlite_active() {
+        // Chronicle publication jobs are already typed in infra-sqlite, but
+        // the background worker still depends on the JSON job store. Refuse
+        // that secondary authority rather than silently reading/writing it.
+        tracing::debug!(
+            campaign_id = %campaign_id,
+            "sqlite backend skips JSON-only chronicle compressor worker"
+        );
+        return;
+    }
     let store = get_campaign_store();
     let job_store = get_compress_job_store();
     let (uncovered_a, uncovered_b) = count_uncovered_chronicle_levels(store, &campaign_id);
@@ -6011,8 +6695,22 @@ fn maybe_spawn_chronicle_compress(state: Arc<AppState>, campaign_id: Id) {
     }
 }
 
+fn should_recover_json_compress_jobs(sqlite_active: bool) -> bool {
+    !sqlite_active
+}
+
 /// 启动恢复：Running→Pending，然后为所有 open job spawn worker。
 fn recover_compress_jobs_on_startup(app_state: Arc<AppState>) {
+    // Chronicle compression still has a JSON job-store implementation only.
+    // An opt-in SQLite process must neither resume nor mutate that secondary
+    // store until the SQLite-native job path exists.
+    if !should_recover_json_compress_jobs(sqlite_runtime::is_sqlite_active()) {
+        tracing::info!(
+            target: "chronicle_compressor",
+            "startup: skipping JSON chronicle-job recovery in SQLite mode"
+        );
+        return;
+    }
     let job_store = get_compress_job_store();
     let reset = job_store.reset_running_to_pending();
     if reset > 0 {
@@ -6200,6 +6898,14 @@ async fn commit_turn_attempt(
     let state_for_accept = state.clone();
     let campaign_id_for_accept = campaign_id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        if sqlite_runtime::is_sqlite_active() {
+            return sqlite_runtime::accept_by_variant(
+                &campaign_id_for_accept,
+                &conv_id,
+                &node_id,
+                force_accept,
+            );
+        }
         let service = turn_lifecycle::TurnLifecycleService::new(
             get_campaign_store(),
             get_turn_store(),
@@ -6216,6 +6922,13 @@ async fn commit_turn_attempt(
         turn_lifecycle::AcceptError::CampaignMissing => TauriCommandError::internal(e.to_string()),
         other => TauriCommandError::validation(other.to_string()),
     })?;
+
+    // SQLite Accept mutates the conversation graph in its atomic UoW. Drop
+    // the in-process projection so subsequent context reads reload the Final
+    // variant from SQLite instead of retaining a stale Draft cache entry.
+    if sqlite_runtime::is_sqlite_active() {
+        state.conv_store.invalidate();
+    }
 
     // ContextCompiler：已接受的 RoundSummary 进入远记忆向量池（best-effort）
     {
@@ -6250,7 +6963,9 @@ fn soft_delete_variant(
     let nid = Id::from_str(&node_id);
 
     // Phase A: Campaign 模式下标记 Attempt Discarded
-    if let Some(turn) = get_turn_store().get_turn_by_variant(&nid) {
+    if let Some(turn) =
+        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+    {
         let attempt_id = turn
             .find_attempt_by_variant(&nid)
             .map(|a| a.attempt_id.clone());
@@ -6296,8 +7011,8 @@ async fn abandon_turn(
         ));
     };
 
-    let turn = get_turn_store()
-        .get_active_turn(&campaign_id)
+    let turn = get_active_turn_for_backend(&campaign_id)
+        .map_err(TauriCommandError::internal)?
         .ok_or_else(|| TauriCommandError::validation("没有活动 Turn 可以放弃".to_string()))?;
 
     // 把 input user 变体和所有未 accept 的 AI 变体标记 Discarded
@@ -6384,7 +7099,9 @@ fn switch_variant(
         .map_err(|e| TauriCommandError::internal(e.to_string()))?;
 
     // P0-3：切换变体后，当前 active variant 变了 → 旧 Attempt 标 Stale
-    if let Some(turn) = get_turn_store().get_turn_by_variant(&nid) {
+    if let Some(turn) =
+        get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+    {
         let turn_id = turn.turn_id.clone();
         if let Some(att) = turn.find_attempt_by_variant(&nid) {
             let attempt_id = att.attempt_id.clone();
@@ -8577,6 +9294,11 @@ fn create_campaign(
     opening_message: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign creation is not available in the SQLite opt-in backend yet".to_string(),
+        ));
+    }
     create_campaign_in_store(
         get_campaign_store(),
         state.conv_store.as_ref(),
@@ -8702,6 +9424,12 @@ fn fork_campaign(
     name: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CampaignSummaryDto, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "SQLite opt-in currently rejects campaign fork rather than writing a JSON shadow copy"
+                .to_string(),
+        ));
+    }
     let source_cid = Id::from_str(&source_campaign_id);
 
     // Phase A: fork 限制——不允许从有活动 Turn 的 Campaign fork（收敛决策盲区 2）
@@ -8721,25 +9449,56 @@ fn fork_campaign(
 }
 
 #[tauri::command]
-fn list_campaigns(card_id: Option<String>) -> Vec<CampaignSummaryDto> {
+fn list_campaigns(card_id: Option<String>) -> Result<Vec<CampaignSummaryDto>, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        let requested_card = card_id.as_ref().map(Id::from_str);
+        let campaigns = sqlite_runtime::list_campaigns().map_err(TauriCommandError::internal)?;
+        return campaigns
+            .into_iter()
+            .filter(|campaign| match &requested_card {
+                Some(id) => campaign.card_id == *id,
+                None => true,
+            })
+            .map(|campaign| {
+                let mut dto = CampaignSummaryDto::from(&campaign);
+                dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
+                    .map_err(TauriCommandError::internal)?
+                    .len();
+                Ok(dto)
+            })
+            .collect();
+    }
     let store = get_campaign_store();
     let campaigns = if let Some(cid) = card_id {
         store.list_campaigns_of_card(&Id::from_str(&cid))
     } else {
         store.list_campaigns()
     };
-    campaigns
+    Ok(campaigns
         .iter()
         .map(|c| {
             let mut dto = CampaignSummaryDto::from(c);
             dto.instance_count = store.list_instances(&c.id).len();
             dto
         })
-        .collect()
+        .collect())
 }
 
 #[tauri::command]
 fn get_campaign(id: String) -> Result<CampaignSummaryDto, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        let campaign_id = Id::from_str(&id);
+        let campaign = sqlite_runtime::get_campaign(&campaign_id)
+            .map_err(TauriCommandError::internal)?
+            .ok_or_else(|| {
+                TauriCommandError::not_found(format!("campaign id={id} was not found"))
+            })?;
+        let mut dto = CampaignSummaryDto::from(&campaign);
+        dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
+            .map_err(TauriCommandError::internal)?
+            .len();
+        return Ok(dto);
+    }
     let store = get_campaign_store();
     let c = store
         .get_campaign(&Id::from_str(&id))
@@ -8755,8 +9514,16 @@ fn set_active_campaign(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let campaign_id = Id::from_str(&id);
-    // 校验存在
-    if get_campaign_store().get_campaign(&campaign_id).is_none() {
+    if sqlite_runtime::is_sqlite_active() {
+        if sqlite_runtime::get_campaign(&campaign_id)
+            .map_err(TauriCommandError::internal)?
+            .is_none()
+        {
+            return Err(TauriCommandError::not_found(format!(
+                "campaign id={id} was not found"
+            )));
+        }
+    } else if get_campaign_store().get_campaign(&campaign_id).is_none() {
         return Err(TauriCommandError::not_found(format!(
             "找不到 campaign id={id}"
         )));
@@ -8765,22 +9532,43 @@ fn set_active_campaign(
         .active_campaign
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
-    save_active_campaign(&state.data_dir, Some(&campaign_id));
+    if !sqlite_runtime::is_sqlite_active() {
+        save_active_campaign(&state.data_dir, Some(&campaign_id));
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn get_active_campaign(state: tauri::State<'_, Arc<AppState>>) -> Option<CampaignSummaryDto> {
+fn get_active_campaign(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Option<CampaignSummaryDto>, TauriCommandError> {
     let id = state
         .active_campaign
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .clone()?;
+        .clone();
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    if sqlite_runtime::is_sqlite_active() {
+        let Some(campaign) =
+            sqlite_runtime::get_campaign(&id).map_err(TauriCommandError::internal)?
+        else {
+            return Ok(None);
+        };
+        let mut dto = CampaignSummaryDto::from(&campaign);
+        dto.instance_count = sqlite_runtime::list_instances(&campaign.id)
+            .map_err(TauriCommandError::internal)?
+            .len();
+        return Ok(Some(dto));
+    }
     let store = get_campaign_store();
-    let c = store.get_campaign(&id)?;
+    let Some(c) = store.get_campaign(&id) else {
+        return Ok(None);
+    };
     let mut dto = CampaignSummaryDto::from(&c);
     dto.instance_count = store.list_instances(&c.id).len();
-    Some(dto)
+    Ok(Some(dto))
 }
 
 #[tauri::command]
@@ -9287,7 +10075,7 @@ fn active_turn_quality_from_record(
 #[tauri::command]
 fn get_active_turn_quality(campaign_id: String) -> Option<ActiveTurnQualityDto> {
     let camp = Id::from_str(&campaign_id);
-    let turn = get_turn_store().get_active_turn(&camp)?;
+    let turn = get_active_turn_for_backend(&camp).ok()??;
     active_turn_quality_from_record(&turn)
 }
 
@@ -10280,6 +11068,33 @@ async fn mvu_execute_result(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Resolve storage backend before any store recovery. JSON remains default;
+    // explicit SQLite selection runs fail-closed cutover and activates the
+    // process-owned SQLite production boundary (no dual-write).
+    let data_dir = get_app_data_dir();
+    match storage_backend::resolve_backend(&data_dir) {
+        Ok(resolution) => {
+            tracing::info!(
+                backend = resolution.diagnostics.backend,
+                source = resolution.diagnostics.source,
+                schema_version = ?resolution.diagnostics.schema_version,
+                cutover = resolution.cutover_performed,
+                "storage backend resolved"
+            );
+            if let Some(db_path) = resolution.db_path
+                && let Err(e) = sqlite_runtime::activate(&db_path)
+            {
+                tracing::error!("failed to activate sqlite backend: {e}");
+                // Fail closed: do not continue with JSON when SQLite was selected.
+                panic!("sqlite backend activation failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("storage backend resolution failed: {e}");
+            panic!("storage backend resolution failed: {e}");
+        }
+    }
+
     // 先构造 AppState（含 log_store），再初始化 tracing 接入 LogStore
     let app_state = Arc::new(AppState::new());
     storyforge_app_logging::init_tracing(app_state.log_store.clone());
@@ -18352,5 +19167,88 @@ mod tests {
             is_current_attempt_ready_for_postprocess(&record, &new_attempt_id),
             "current regenerate attempt may receive its own postprocess result"
         );
+    }
+
+    #[test]
+    fn regenerate_scope_rejects_cross_campaign_before_pipeline_mutates_a_draft() {
+        let active_campaign = Id::from_str("campaign-active");
+        let foreign_campaign = Id::from_str("campaign-foreign");
+        let foreign_conversation = Conversation::new(None, Some(foreign_campaign));
+        let active_turn = storyforge_domain::turn::TurnRecord::new(
+            active_campaign.clone(),
+            Id::from_str("conversation-active"),
+            Id::from_str("input-active"),
+            0,
+        );
+
+        assert!(
+            validate_regenerate_campaign_scope(
+                Some(&active_campaign),
+                &foreign_conversation,
+                Some(&active_turn),
+            )
+            .is_err(),
+            "scope validation must reject before PipelineOrchestrator can alter the foreign draft"
+        );
+
+        let matching_conversation = Conversation::new(None, Some(active_campaign.clone()));
+        let matching_turn = storyforge_domain::turn::TurnRecord::new(
+            active_campaign.clone(),
+            matching_conversation.id.clone(),
+            Id::from_str("input-matching"),
+            0,
+        );
+        assert!(
+            validate_regenerate_campaign_scope(
+                Some(&active_campaign),
+                &matching_conversation,
+                Some(&matching_turn),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sqlite_mode_never_recovers_the_legacy_json_compress_job_store() {
+        assert!(!should_recover_json_compress_jobs(true));
+        assert!(should_recover_json_compress_jobs(false));
+    }
+
+    #[test]
+    fn sqlite_mode_never_uses_the_legacy_active_campaign_pointer() {
+        assert!(!should_load_legacy_active_campaign_pointer(true));
+        assert!(should_load_legacy_active_campaign_pointer(false));
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge-sqlite-active-pointer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("active_campaign.json"),
+            r#"{"campaign_id":"stale-json-campaign"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_active_campaign_with_legacy_fallback(None, &dir, true),
+            None,
+            "a restarted SQLite process must ignore a stale JSON selector"
+        );
+        assert_eq!(
+            resolve_active_campaign_with_legacy_fallback(
+                Some(Id::from_str("selected-in-memory")),
+                &dir,
+                true,
+            ),
+            Some(Id::from_str("selected-in-memory")),
+            "SQLite may use only the explicit in-process selection"
+        );
+        assert_eq!(
+            resolve_active_campaign_with_legacy_fallback(None, &dir, false),
+            Some(Id::from_str("stale-json-campaign")),
+            "JSON mode preserves its legacy restart behavior"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

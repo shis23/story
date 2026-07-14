@@ -13,6 +13,7 @@ storyforge-infra-util.workspace = true
 storyforge-infra-import.workspace = true
 storyforge-infra-llm.workspace = true
 storyforge-infra-regex.workspace = true
+storyforge-infra-sqlite.workspace = true
 storyforge-app-logging.workspace = true
 storyforge-app-agent.workspace = true
 storyforge-app-conversation.workspace = true
@@ -28,6 +29,7 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
@@ -39,3 +41,6 @@ tauri-build = { version = "2", features = [] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"

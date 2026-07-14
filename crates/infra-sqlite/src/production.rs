@@ -154,6 +154,17 @@ impl SqliteProductionRepository {
         )
     }
 
+    /// List every Campaign from the authoritative SQLite backend. The Tauri
+    /// campaign picker uses this in opt-in mode instead of consulting the
+    /// legacy JSON store after cutover.
+    pub fn list_campaigns(db: &Database) -> Result<Vec<Campaign>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM campaigns ORDER BY campaign_id",
+            [],
+        )
+    }
+
     pub fn get_conversation(db: &Database, conversation_id: &Id) -> Result<Option<Conversation>> {
         load_payload(
             db.connection(),
@@ -162,8 +173,199 @@ impl SqliteProductionRepository {
         )
     }
 
+    /// Load every conversation from the authoritative SQLite backend. This is
+    /// intentionally separate from the legacy JSON conversation directory so
+    /// an opt-in process never has to create a shadow cache on disk.
+    pub fn list_conversations(db: &Database) -> Result<Vec<Conversation>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM conversations ORDER BY created_at, conversation_id",
+            [],
+        )
+    }
+
+    /// Delete an orphan conversation. A conversation with Turn history is
+    /// deliberately rejected rather than leaving dangling SQLite rows or
+    /// falling back to a legacy JSON delete path.
+    pub fn delete_conversation(db: &mut Database, conversation_id: &Id) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let has_turn: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = ?1)",
+            [conversation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_turn {
+            return Err(SqliteError::Conflict(format!(
+                "refusing to delete conversation {conversation_id} with turn history"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM conversations WHERE conversation_id = ?1",
+            [conversation_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Return the raw stored card wrapper. JSON cutover preserves the legacy
+    /// `StoredCard { card, imported_at }` payload shape, which belongs to the
+    /// Tauri layer rather than this infra crate.
+    pub fn get_card_payload(db: &Database, card_id: &Id) -> Result<Option<serde_json::Value>> {
+        load_payload(
+            db.connection(),
+            "SELECT payload_json FROM character_cards WHERE card_id = ?1",
+            card_id.as_str(),
+        )
+    }
+
+    pub fn list_instances(db: &Database, campaign_id: &Id) -> Result<Vec<CharacterInstance>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM character_instances WHERE campaign_id = ?1 ORDER BY instance_id",
+            [campaign_id.as_str()],
+        )
+    }
+
+    pub fn list_knowledge(db: &Database, campaign_id: &Id) -> Result<Vec<CharacterKnowledgeEntry>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM character_knowledge WHERE campaign_id = ?1 ORDER BY knowledge_id",
+            [campaign_id.as_str()],
+        )
+    }
+
+    pub fn list_tasks(db: &Database, campaign_id: &Id) -> Result<Vec<StoryTask>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM story_tasks WHERE campaign_id = ?1 ORDER BY task_id",
+            [campaign_id.as_str()],
+        )
+    }
+
     pub fn get_turn(db: &Database, turn_id: &Id) -> Result<Option<TurnRecord>> {
         load_validated_turn(db.connection(), turn_id)
+    }
+
+    /// Resolve a turn by any attempt's variant_id (Accept entrypoint).
+    pub fn get_turn_by_variant(db: &Database, variant_id: &Id) -> Result<Option<TurnRecord>> {
+        let turn_id: Option<String> = db
+            .connection()
+            .query_row(
+                "SELECT turn_id FROM turn_attempts WHERE variant_id = ?1 LIMIT 1",
+                [variant_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match turn_id {
+            Some(id) => load_validated_turn(db.connection(), &Id::from_str(id)),
+            None => Ok(None),
+        }
+    }
+
+    /// Active (non-terminal) turns for a campaign, if any.
+    pub fn get_active_turn(db: &Database, campaign_id: &Id) -> Result<Option<TurnRecord>> {
+        let turn_id: Option<String> = db
+            .connection()
+            .query_row(
+                r#"
+                SELECT turn_id FROM turns
+                WHERE campaign_id = ?1
+                  AND status IN ('generating', 'draft_ready', 'deriving_state',
+                                 'awaiting_acceptance', 'committing')
+                LIMIT 1
+                "#,
+                [campaign_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match turn_id {
+            Some(id) => load_validated_turn(db.connection(), &Id::from_str(id)),
+            None => Ok(None),
+        }
+    }
+
+    /// All non-terminal turns across campaigns (startup recovery / barrier).
+    pub fn list_active_turns(db: &Database) -> Result<Vec<TurnRecord>> {
+        let mut stmt = db.connection().prepare(
+            r#"
+            SELECT turn_id FROM turns
+            WHERE status IN ('generating', 'draft_ready', 'deriving_state',
+                             'awaiting_acceptance', 'committing')
+            ORDER BY updated_at, turn_id
+            "#,
+        )?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for id in ids {
+            let id = id?;
+            if let Some(turn) = load_validated_turn(db.connection(), &Id::from_str(id))? {
+                out.push(turn);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persist a conversation draft/final graph outside of accept (pipeline path).
+    pub fn save_conversation(db: &mut Database, conversation: &Conversation) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        write_conversation(tx, conversation)?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Persist a campaign outside of accept (setup / non-accept mutations).
+    pub fn save_campaign(db: &mut Database, campaign: &Campaign) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        // Ensure placeholder card exists for FK.
+        tx.execute(
+            "INSERT OR IGNORE INTO character_cards (card_id, source_character_id, name, imported_at, payload_json) VALUES (?1, NULL, 'sqlite-production-placeholder', NULL, '{}')",
+            [campaign.card_id.as_str()],
+        )?;
+        write_campaign(tx, campaign)?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Mark every non-terminal turn Failed. Used by SQLite startup recovery where
+    /// accept is atomic (no multi-file Committing journal to replay).
+    pub fn fail_incomplete_turns(db: &mut Database) -> Result<usize> {
+        migrations::migrate(db)?;
+        let active = Self::list_active_turns(db)?;
+        if active.is_empty() {
+            return Ok(0);
+        }
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let mut count = 0usize;
+        for mut turn in active {
+            // Committing should be rare under atomic accept; still fail-closed.
+            turn.status = TurnStatus::Failed;
+            turn.failure_reason =
+                Some("sqlite recovery: incomplete turn failed after process restart".into());
+            for attempt in &mut turn.attempts {
+                if matches!(
+                    attempt.status,
+                    AttemptStatus::Generating
+                        | AttemptStatus::DraftReady
+                        | AttemptStatus::DerivingState
+                        | AttemptStatus::AwaitingAcceptance
+                        | AttemptStatus::Committing
+                ) {
+                    attempt.status = AttemptStatus::Failed;
+                }
+            }
+            turn.touch();
+            write_turn(tx, &turn)?;
+            count += 1;
+        }
+        uow.commit()?;
+        Ok(count)
     }
 
     pub fn get_attempt(db: &Database, attempt_id: &Id) -> Result<Option<TurnAttempt>> {
@@ -838,6 +1040,25 @@ fn load_payload<T: DeserializeOwned>(
     payload
         .map(|value| serde_json::from_str(&value).map_err(Into::into))
         .transpose()
+}
+
+fn load_payload_list<T, const N: usize>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: [&str; N],
+) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(serde_json::from_str(&row?)?);
+    }
+    Ok(values)
 }
 
 fn load_validated_turn(conn: &rusqlite::Connection, turn_id: &Id) -> Result<Option<TurnRecord>> {
