@@ -262,8 +262,9 @@ async fn run_sqlite_endurance_stage(
                 )
             }
             ScheduledAction::PrivateProbe { probe_kind } => {
+                let _ = probe_kind;
                 format!(
-                    "turn {turn_index}: private-knowledge probe ({probe_kind:?}); keep isolation."
+                    "turn {turn_index}: continue the scene with careful information isolation between characters."
                 )
             }
             ScheduledAction::EarlyFactInject { probe_id } => {
@@ -287,7 +288,9 @@ async fn run_sqlite_endurance_stage(
                 format!("turn {turn_index}: cache stability observation.")
             }
             ScheduledAction::CacheInvalidate => {
-                format!("turn {turn_index}: cache invalidation probe.")
+                format!(
+                    "turn {turn_index}: introduce a small continuity disturbance and continue the investigation."
+                )
             }
         };
 
@@ -305,7 +308,7 @@ async fn run_sqlite_endurance_stage(
             _ => None,
         };
 
-        const MAX_WRITE_ATTEMPTS: usize = 3;
+        const MAX_WRITE_ATTEMPTS: usize = 5;
         let mut written = None;
         let mut last_err = None;
         for attempt in 1..=MAX_WRITE_ATTEMPTS {
