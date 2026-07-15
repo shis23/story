@@ -438,6 +438,41 @@ try {
                 Write-Warning 'Endurance full stage requires STORYFORGE_EVAL_MAX_CALLS >= 700 for 100 accepted turns.'
             }
         }
+
+        # Durable evidence root preflight (no model calls). Prefer EVIDENCE_ROOT;
+        # legacy EVIDENCE_DIR is accepted. Temp roots require explicit allow flag.
+        $evidenceRoot = Get-RequiredEnv -Name 'STORYFORGE_EVAL_EVIDENCE_ROOT'
+        $evidenceDir = Get-RequiredEnv -Name 'STORYFORGE_EVAL_EVIDENCE_DIR'
+        $allowEphemeral = Get-RequiredEnv -Name 'STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE'
+        $allowEphemeralOn = $false
+        if ($null -ne $allowEphemeral) {
+            $ae = $allowEphemeral.Trim().ToLowerInvariant()
+            if ($ae -in @('1', 'true', 'yes', 'on')) { $allowEphemeralOn = $true }
+        }
+        if ($null -eq $evidenceRoot -and $null -eq $evidenceDir) {
+            if (-not $allowEphemeralOn) {
+                throw 'Suite endurance requires STORYFORGE_EVAL_EVIDENCE_ROOT (preferred) or STORYFORGE_EVAL_EVIDENCE_DIR. Temp roots need STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE=1.'
+            }
+            Write-Warning 'No durable evidence root set; ephemeral evidence is explicitly allowed for this process only.'
+        } else {
+            $candidate = if ($null -ne $evidenceRoot) { $evidenceRoot } else { $evidenceDir }
+            if ($candidate -match '(^|[\\/])\.\.([\\/]|$)') {
+                throw 'Evidence root path must not contain parent-directory traversal segments.'
+            }
+            $full = [System.IO.Path]::GetFullPath($candidate)
+            $repoFull = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd('\', '/')
+            if ($full.Equals($repoFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $full.StartsWith(($repoFull + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Evidence root must not live inside the repository.'
+            }
+            $tempFull = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
+            $isTemp = $full.StartsWith(($tempFull + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase) -or
+                $full -match '(?i)([\\/]tmp[\\/]|[\\/]temp[\\/]|:\\tmp\\|:\\temp\\)'
+            if ($isTemp -and -not $allowEphemeralOn) {
+                throw 'Ephemeral/temp evidence roots are rejected unless STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE=1.'
+            }
+            Write-Host ("Endurance evidence root preflight OK (basename={0})" -f ([System.IO.Path]::GetFileName($full)))
+        }
     }
     if ($DryRun) {
         Write-Host 'Dry run enabled; commands will be printed but not executed.'

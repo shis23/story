@@ -288,7 +288,15 @@ fn dry_run_passes_with_valid_inputs() {
     assert!(report.budget_valid);
     assert!(report.schema_ok);
     assert!(report.secret_guards_ok);
+    assert!(report.evidence_root_ok);
     assert!(report.assertions.iter().all(|a| a.passed));
+    // Path details must be redacted (basename only), never full host paths with secrets.
+    for a in &report.assertions {
+        if let Some(detail) = &a.detail {
+            assert!(!detail.contains("sk-"));
+            assert!(!detail.contains("api_key"));
+        }
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -299,6 +307,98 @@ fn dry_run_fails_with_missing_fixture() {
     let report = dry_run_validate(false, &dir, &budget);
     assert!(!report.fixture_ok);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dry_run_rejects_repo_internal_root_under_production_policy() {
+    let budget = EnduranceBudget::default();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
+    let policy = harness_real_llm::evidence_retention::EvidenceRootPolicy::production(repo.clone());
+    let report = dry_run_validate_with_policy(true, &repo.join("crates"), &budget, &policy);
+    assert!(!report.evidence_root_ok);
+}
+
+#[test]
+fn resume_from_evidence_dir_fails_closed_on_mixed_run_ids() {
+    use harness_real_llm::evidence_retention::{
+        EvidenceRootPolicy, allocate_run_id, prepare_run_dir, validate_evidence_root,
+    };
+    let root = temp_dir("mix_resume");
+    let policy = EvidenceRootPolicy::for_tests(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf(),
+    );
+    let validated = validate_evidence_root(&root, &policy).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    let cp_path = run_dir.join("endurance_checkpoint.jsonl");
+    let schedule = EnduranceSchedule::new(3);
+    let cps = simulate_resumable_run(&schedule, 1, 2, &cp_path);
+    // Overwrite second checkpoint line with a different run id to simulate mix.
+    let mut mixed = cps[1].clone();
+    mixed.run_id = "run-full-00000000-0000-0000-0000-000000000099".into();
+    write_checkpoint(&cp_path, &mixed).unwrap();
+    // Unsealed resume requires an integrity baseline (auditable fail-closed path).
+    harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&run_dir).unwrap();
+    let err = resume_from_evidence_dir(&run_dir, Some(&run_id));
+    assert!(err.is_err(), "mixed run ids must fail closed");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn resume_from_evidence_dir_returns_next_turn_without_replay() {
+    use harness_real_llm::evidence_retention::{
+        EvidenceRootPolicy, allocate_run_id, prepare_run_dir, validate_evidence_root,
+    };
+    let root = temp_dir("ok_resume");
+    let policy = EvidenceRootPolicy::for_tests(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf(),
+    );
+    let validated = validate_evidence_root(&root, &policy).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    let cp_path = run_dir.join("endurance_checkpoint.jsonl");
+    // Write a single checkpoint with the controlled run id.
+    write_checkpoint(
+        &cp_path,
+        &EnduranceCheckpoint {
+            schema_version: EnduranceCheckpoint::schema_version().into(),
+            run_id: run_id.clone(),
+            stage: "full".into(),
+            accepted_turn_number: 7,
+            calls_used: 40,
+            max_calls: 700,
+            campaign_revision: 7,
+            chronicle_revision: 0,
+            last_draft_hash16: "abcdabcdabcdabcd".into(),
+            last_summary_code: Some("ok".into()),
+            context_epoch_id16: None,
+            early_fact_probe_ids: vec![],
+            early_fact_checked_passed: vec![],
+            campaign_id: Some("c".into()),
+            conversation_id: Some("v".into()),
+            data_dir_rel: Some("campaign_data".into()),
+            observed_epoch_ids16: vec![],
+            recorded_at_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&run_dir).unwrap();
+    let (next, cp) = resume_from_evidence_dir(&run_dir, Some(&run_id)).unwrap();
+    assert_eq!(next, 8);
+    assert_eq!(cp.accepted_turn_number, 7);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // ── Evidence size budget ──

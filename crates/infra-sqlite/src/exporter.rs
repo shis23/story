@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -132,6 +133,24 @@ pub fn export_sqlite_to_json(
     let summaries = export_table_array(&tx, "round_summaries", "summary_id", &mut unsupported)?;
     let turns = export_table_array(&tx, "turns", "turn_id", &mut unsupported)?;
 
+    // Pre-accept outbox is SQLite-native recovery ledger. JSON backend has no
+    // equivalent file; classify explicitly rather than silently dropping.
+    if table_exists(&tx, "preaccept_outbox")? {
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM preaccept_outbox", [], |row| {
+            row.get(0)
+        })?;
+        if count > 0 {
+            unsupported.push(format!(
+                "preaccept_outbox:{count} rows (SQLite-native pre-accept recovery ledger; not represented in JSON backend)"
+            ));
+        } else {
+            unsupported.push(
+                "preaccept_outbox:empty (SQLite-native table; unsupported by JSON reverse export)"
+                    .into(),
+            );
+        }
+    }
+
     // Conversations are stored as individual files matching the JSON layout.
     let conversations = export_conversations(&tx, &stage_dir, &mut unsupported)?;
 
@@ -228,21 +247,24 @@ pub fn export_sqlite_to_json(
     })
 }
 
-fn export_table_array(
-    tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    id_column: &str,
-    unsupported: &mut Vec<String>,
-) -> Result<Vec<Value>> {
+fn table_exists(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
     let exists: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
             [table],
             |row| row.get(0),
         )
-        .ok()
-        .flatten();
-    if exists.is_none() {
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn export_table_array(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_column: &str,
+    unsupported: &mut Vec<String>,
+) -> Result<Vec<Value>> {
+    if !table_exists(tx, table)? {
         return Ok(Vec::new());
     }
 

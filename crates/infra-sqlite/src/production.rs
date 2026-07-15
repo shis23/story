@@ -821,7 +821,7 @@ fn write_campaign(tx: &Transaction<'_>, campaign: &Campaign) -> Result<()> {
     Ok(())
 }
 
-fn write_conversation(tx: &Transaction<'_>, conversation: &Conversation) -> Result<()> {
+pub(crate) fn write_conversation(tx: &Transaction<'_>, conversation: &Conversation) -> Result<()> {
     tx.execute(
         r#"
         INSERT INTO conversations (
@@ -846,7 +846,7 @@ fn write_conversation(tx: &Transaction<'_>, conversation: &Conversation) -> Resu
     Ok(())
 }
 
-fn write_turn(tx: &Transaction<'_>, turn: &TurnRecord) -> Result<()> {
+pub(crate) fn write_turn(tx: &Transaction<'_>, turn: &TurnRecord) -> Result<()> {
     tx.execute(
         r#"
         INSERT INTO turns (
@@ -1061,7 +1061,10 @@ where
     Ok(values)
 }
 
-fn load_validated_turn(conn: &rusqlite::Connection, turn_id: &Id) -> Result<Option<TurnRecord>> {
+pub(crate) fn load_validated_turn(
+    conn: &rusqlite::Connection,
+    turn_id: &Id,
+) -> Result<Option<TurnRecord>> {
     let row = conn
         .query_row(
             r#"
@@ -1146,7 +1149,7 @@ fn load_validated_turn(conn: &rusqlite::Connection, turn_id: &Id) -> Result<Opti
     Ok(Some(turn))
 }
 
-fn load_validated_attempt(
+pub(crate) fn load_validated_attempt(
     conn: &rusqlite::Connection,
     attempt_id: &Id,
 ) -> Result<Option<TurnAttempt>> {
@@ -1309,7 +1312,7 @@ fn validate_ledger_replay(
     Ok(())
 }
 
-fn load_payload_tx<T, P>(tx: &Transaction<'_>, sql: &str, params: P) -> Result<Option<T>>
+pub(crate) fn load_payload_tx<T, P>(tx: &Transaction<'_>, sql: &str, params: P) -> Result<Option<T>>
 where
     T: DeserializeOwned,
     P: rusqlite::Params,
@@ -1350,7 +1353,7 @@ fn hash_json(payload: &serde_json::Value) -> Result<String> {
     Ok(hex_encode(hasher.finalize()))
 }
 
-fn enum_text(value: &impl Serialize) -> Result<String> {
+pub(crate) fn enum_text(value: &impl Serialize) -> Result<String> {
     let value = serde_json::to_value(value)?;
     value
         .as_str()
@@ -1358,7 +1361,7 @@ fn enum_text(value: &impl Serialize) -> Result<String> {
         .ok_or_else(|| SqliteError::Other("enum did not serialize as string".into()))
 }
 
-fn json(value: &impl Serialize) -> Result<String> {
+pub(crate) fn json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 

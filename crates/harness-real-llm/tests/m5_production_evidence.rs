@@ -11,10 +11,11 @@ use harness_real_llm::evidence::{
     RealLlmRunBudget, contains_forbidden_evidence_payload, read_evidence_lines,
 };
 use harness_real_llm::production_evidence::{
-    ChronicleCandidateSource, ProductionEvidenceConfig, ProductionEvidenceStage,
-    ProductionEvidenceStageHook, ProductionTurnWriter, WrittenProductionTurn,
-    require_explicit_fixture_path, require_fixture_file, run_production_evidence_loop,
-    run_production_evidence_loop_with_hook,
+    ChronicleCandidateSource, FixedProductionPostprocessWriter, ProductionEvidenceConfig,
+    ProductionEvidenceStage, ProductionEvidenceStageHook, ProductionPostprocessProof,
+    ProductionTurnWriter, WrittenProductionTurn, require_explicit_fixture_path,
+    require_fixture_file, run_production_evidence_loop, run_production_evidence_loop_with_hook,
+    verify_production_postprocess_claim,
 };
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
@@ -100,6 +101,7 @@ impl ProductionTurnWriter for DeterministicTurnWriter {
             chronicle_source: self
                 .emit_summary
                 .then_some(ChronicleCandidateSource::SyntheticChronicleFixture),
+            postprocess_proof: None,
         })
     }
 }
@@ -182,6 +184,230 @@ fn real_eval_requires_explicit_fixture_override() {
         require_explicit_fixture_path(Some(path.clone())).unwrap(),
         path
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forged_production_postprocess_claim_without_proof_is_rejected() {
+    let (env, _llm, campaign_id, conversation_id, _dir) = setup(2);
+    let loop_input = Id::from_str("loop-input-1");
+    let forged = WrittenProductionTurn {
+        draft_text: "forged".into(),
+        variant_id: Id::new(),
+        summary_text: Some("forged summary".into()),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: None,
+    };
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &forged,
+    )
+    .expect_err("forged claim must fail closed");
+    assert!(
+        err.to_string().contains("without verified proof"),
+        "unexpected: {err}"
+    );
+
+    // postprocess_applied-style inconsistency: service source + proof.applied=false
+    let variant_id = Id::new();
+    let not_applied = WrittenProductionTurn {
+        draft_text: "x".into(),
+        variant_id: variant_id.clone(),
+        summary_text: Some("s".into()),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: Some(ProductionPostprocessProof {
+            turn_id: Id::new(),
+            attempt_id: Id::new(),
+            input_node_id: loop_input.clone(),
+            turn_index: 1,
+            variant_id: variant_id.clone(),
+            draft_hash: "deadbeef".into(),
+            summary_text: Some("s".into()),
+            batch_digest: None,
+            applied: false,
+        }),
+    };
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &not_applied,
+    )
+    .expect_err("applied=false must fail");
+    assert!(err.to_string().contains("not applied"), "unexpected: {err}");
+
+    // synthetic + proof is inconsistent
+    let mixed = WrittenProductionTurn {
+        draft_text: "x".into(),
+        variant_id: variant_id.clone(),
+        summary_text: Some("s".into()),
+        chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
+        postprocess_proof: Some(ProductionPostprocessProof {
+            turn_id: Id::new(),
+            attempt_id: Id::new(),
+            input_node_id: loop_input.clone(),
+            turn_index: 1,
+            variant_id,
+            draft_hash: "deadbeef".into(),
+            summary_text: Some("s".into()),
+            batch_digest: None,
+            applied: true,
+        }),
+    };
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &mixed,
+    )
+    .expect_err("synthetic+proof must fail");
+    assert!(
+        err.to_string().contains("synthetic_chronicle_fixture"),
+        "unexpected: {err}"
+    );
+    env.cleanup();
+}
+
+#[tokio::test]
+async fn malicious_writer_cannot_reuse_prior_turn_proof() {
+    let (env, _llm, campaign_id, conversation_id, _dir) = setup(4);
+    let base_ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+    let ctx = env.fill_campaign_context(base_ctx);
+
+    // Produce a legitimate proof for turn 1 / input A.
+    let mut honest = FixedProductionPostprocessWriter {
+        summary_template: "第{turn}轮：诚实摘要。".into(),
+    };
+    // Seed a user message so input_node_id is stable for turn 1.
+    let input_t1 = env
+        .conv_store
+        .append_user_message(&conversation_id, "t1 intent".into())
+        .unwrap();
+    let written_t1 = honest
+        .write_turn(&env, &ctx, 1, "t1")
+        .await
+        .expect("honest turn1");
+    let proof_t1 = written_t1
+        .postprocess_proof
+        .clone()
+        .expect("honest proof required");
+    assert_eq!(proof_t1.input_node_id, input_t1);
+    assert_eq!(proof_t1.turn_index, 1);
+
+    // Evidence loop moves to turn 2 with a different input_node_id.
+    let input_t2 = env
+        .conv_store
+        .append_user_message(&conversation_id, "t2 intent".into())
+        .unwrap();
+    assert_ne!(input_t1, input_t2);
+
+    // Malicious writer reuses the valid turn-1 proof for turn 2.
+    let malicious = WrittenProductionTurn {
+        draft_text: written_t1.draft_text.clone(),
+        variant_id: written_t1.variant_id.clone(),
+        summary_text: written_t1.summary_text.clone(),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: Some(proof_t1),
+    };
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &input_t2,
+        2,
+        &malicious,
+    )
+    .expect_err("reused prior-turn proof must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("input_node_id") || msg.contains("turn_index"),
+        "unexpected: {msg}"
+    );
+
+    // Same for mismatched turn_index even if input is forced equal (proof still carries t1).
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &input_t1,
+        2,
+        &malicious,
+    )
+    .expect_err("turn_index mismatch must fail");
+    assert!(err.to_string().contains("turn_index"), "unexpected: {err}");
+    env.cleanup();
+}
+
+#[tokio::test]
+async fn multi_turn_loop_uses_shared_production_postprocess_service() {
+    let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
+    let (env, llm, campaign_id, conversation_id, dir) = setup(turns + 1);
+    issue_setup_call(&env, &llm).await;
+    let writer = FixedProductionPostprocessWriter {
+        summary_template: "第{turn}轮：生产后处理摘要。".into(),
+    };
+
+    // FixedProductionPostprocessWriter itself does not call LLM; issue one call per turn
+    // so the evidence loop's zero-call guard stays green while postprocess is production-shared.
+    struct CountingWriter {
+        inner: FixedProductionPostprocessWriter,
+    }
+    #[async_trait]
+    impl ProductionTurnWriter for CountingWriter {
+        fn write_path(&self) -> &'static str {
+            "production_postprocess_service"
+        }
+        async fn write_turn(
+            &mut self,
+            env: &HarnessEnv,
+            ctx: &WritingContext,
+            turn_index: u32,
+            intent: &str,
+        ) -> Result<WrittenProductionTurn, String> {
+            let req = ChatRequest {
+                model: "fake".into(),
+                messages: vec![storyforge_domain::llm::ChatMessage::user(format!(
+                    "turn={turn_index}"
+                ))],
+                tools: None,
+                params: storyforge_domain::llm::SamplingParams::default(),
+            };
+            env.llm.chat(&req).await.map_err(|e| e.to_string())?;
+            self.inner.write_turn(env, ctx, turn_index, intent).await
+        }
+    }
+
+    let mut writer = CountingWriter { inner: writer };
+    let report = run_production_evidence_loop(
+        &env,
+        llm.clone(),
+        campaign_id,
+        conversation_id,
+        &config(&dir),
+        &mut writer,
+    )
+    .await
+    .expect("production postprocess evidence loop");
+
+    assert_eq!(report.turns_accepted, turns);
+    assert!(report.production_postprocess_complete);
+    assert_eq!(report.chronicle_path, "production_postprocess_service");
+    let accepted = read_evidence_lines(&report.turns_path).unwrap();
+    assert!(accepted.iter().all(|line| {
+        line["chronicle_path"] == "production_postprocess_service"
+            && line["production_postprocess_complete"] == true
+            && line["kind"] == "pipeline_write_production_postprocess_accept"
+    }));
+
+    env.cleanup();
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -284,6 +510,7 @@ async fn loop_fails_closed_on_zero_llm_calls() {
                 variant_id,
                 summary_text: Some(format!("summary {turn_index}")),
                 chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
+                postprocess_proof: None,
             })
         }
     }

@@ -6,12 +6,15 @@ mod global_regex_store;
 mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
+pub mod production_postprocess;
 pub mod sqlite_runtime;
 mod storage;
 pub mod storage_backend;
 pub mod turn_coordinator;
 pub mod turn_lifecycle;
 pub mod turn_store;
+
+use production_postprocess::TurnAttemptSink;
 
 use chrono::Utc;
 use connection_store::ConnectionStore;
@@ -496,6 +499,46 @@ fn save_active_campaign(data_dir: &Path, id: Option<&Id>) {
 
 // ─── AppState（M1 新增，注入到 Tauri managed state）─────────────────────────
 
+/// Operation-owned cancel handle for one start_writing / regenerate generation.
+///
+/// Pipeline, autofix and postprocess all clone `cancel_rx` at operation start.
+/// The global slot only keeps the sender + generation id so `cancel_writing`
+/// and compare-and-clear can target the correct generation.
+#[derive(Debug)]
+pub struct WritingCancelHandle {
+    pub operation_id: Id,
+    pub cancel_tx: watch::Sender<bool>,
+}
+
+/// Create a new writing operation cancel pair and install it into AppState.
+/// Any previous operation is cancelled first.
+fn begin_writing_operation(app: &AppState) -> (Id, watch::Receiver<bool>) {
+    let operation_id = Id::new();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    {
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = slot.take() {
+            let _ = existing.cancel_tx.send(true);
+        }
+        *slot = Some(WritingCancelHandle {
+            operation_id: operation_id.clone(),
+            cancel_tx,
+        });
+    }
+    (operation_id, cancel_rx)
+}
+
+/// Clear AppState.current_cancel only when it still belongs to this operation.
+fn clear_current_cancel_if(app: &AppState, operation_id: &Id) {
+    let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|handle| handle.operation_id == *operation_id)
+    {
+        *slot = None;
+    }
+}
+
 /// 应用全局状态
 pub struct AppState {
     /// App data directory used by stateful stores owned by this process.
@@ -506,8 +549,9 @@ pub struct AppState {
     pub log_store: Arc<LogStore>,
     /// 工具上下文（导入角色卡时同步更新，RwLock 支持运行时写入）
     pub tool_ctx: Arc<RwLock<ToolContext>>,
-    /// 当前运行的流水线 cancel sender（None = 无运行中的写作）
-    pub current_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// 当前运行的写作/regenerate 取消句柄（operation-owned）。
+    /// None = 无运行中的写作。
+    pub current_cancel: Mutex<Option<WritingCancelHandle>>,
     /// 等待前端插件处理最终 LLM messages prompt hook 的请求。
     prompt_hook_pending: PromptHookPendingMap,
     /// 当前活跃连接构造的 LLM client（None = 用 mock_llm）
@@ -2494,23 +2538,15 @@ async fn start_writing(
         None // 非 Campaign 模式，不创建 TurnRecord
     };
 
-    // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = slot.take() {
-            // 上一次写作未正常清理，先取消它
-            let _ = existing.send(true);
-        }
-        *slot = Some(cancel_tx);
-    }
+    // Operation-owned cancel: pipeline / autofix / postprocess all clone this receiver.
+    let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
+        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx.clone())
         .await;
 
     // ─── P2 后处理流水线（后台执行，不阻断成文返回）──────────────────────
@@ -2555,7 +2591,7 @@ async fn start_writing(
                     record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
                     record.touch();
                 });
-                clear_current_cancel(&app);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
                     "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
                 )));
@@ -2579,16 +2615,11 @@ async fn start_writing(
             .unwrap_or_default();
         let final_text = final_text.clone();
         let var_keys = postprocess_variable_keys(&ctx);
-        let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
+        // Reuse the operation-owned cancel receiver (no global re-subscribe / no fallback).
+        let pp_cancel_rx = cancel_rx.clone();
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
-        let cancel_for_fix = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
         let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
             final_text,
             QualityAutofixCtx {
@@ -2597,7 +2628,7 @@ async fn start_writing(
                 conversation_id: &conversation_id,
                 writing_ctx: &ctx,
                 event_tx: &event_tx,
-                cancel: cancel_for_fix,
+                cancel: cancel_rx.clone(),
                 log_prefix: "start_writing",
             },
         )
@@ -2606,137 +2637,89 @@ async fn start_writing(
         response_text = Some(final_text.clone());
         // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash。
         // 关键同步失败必须传播：否则命令返回修复稿但 Attempt 仍指原稿 hash，Accept 会硬失败。
-        if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
-            let report_for_attempt = quality_report.clone();
-            let attempt_id = attempt_id.clone();
-            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                    sync_attempt_after_autofix(att, &final_text, report_for_attempt);
-                }
-                record.touch();
-            }) {
-                let _ = update_turn_record(&turn.turn_id, |record| {
-                    record.status = storyforge_domain::turn::TurnStatus::Failed;
-                    record.failure_reason = Some(format!("auto-fix 后 Attempt 同步失败: {e}"));
-                    record.touch();
-                });
-                clear_current_cancel(&app);
+        let pp_identity = match (&turn_record, &created_attempt_id, &ctx.campaign_id) {
+            (Some(turn), Some(attempt_id), Some(campaign_id)) => {
+                Some(production_postprocess::PostprocessIdentity {
+                    turn_id: turn.turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: ctx.turn,
+                })
+            }
+            _ => None,
+        };
+        if let Some(identity) = &pp_identity {
+            let sink = BackendTurnAttemptSink;
+            // new_json is fine for autofix: it only uses sink, not batch_source.
+            let service = production_postprocess::ProductionPostprocessService::new_json(
+                get_campaign_store(),
+                &sink,
+            );
+            if let Err(e) =
+                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
+            {
+                let combined = service_fail_turn(&sink, identity, e);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
-                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
+                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
         }
 
-        // postprocess 后台跑，不阻塞 start_writing 返回。
-        // event_tx 和 pipeline 分别 clone/move 进 spawn 闭包。
+        // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
+        // Keep current_cancel alive until the background task finishes so cancel_writing
+        // can still reach postprocess after the command returns.
         let pp_event_tx = event_tx.clone();
-        let pp_turn_id = turn_record.as_ref().map(|t| t.turn_id.clone());
-        let pp_attempt_id = created_attempt_id;
         let pp_runtime = ctx.campaign_runtime.clone();
+        let app_for_pp = app.clone();
+        let operation_id_for_pp = operation_id.clone();
         tokio::spawn(async move {
-            let outcome = pipeline
-                .run_postprocess(
-                    &final_text,
-                    "",
-                    &present_chars,
-                    &var_keys,
-                    &ctx,
-                    &pp_event_tx,
-                    pp_cancel_rx,
-                    &mvu_fragments,
-                )
-                .await;
-
-            // Phase A: postprocess 产出暂存到 TurnAttempt，不直接写 CampaignStore
-            if let (Some(turn_id), Some(attempt_id)) = (pp_turn_id, pp_attempt_id) {
-                let derivation = derive_components_from_outcome(&outcome);
-                let pc = PostprocessPersistContext::from_writing_context(&ctx);
-                let outcome_clone = outcome.clone();
-                let batch = match (pc, outcome_clone) {
-                    (Some(pc), Some(o)) => {
-                        let pc = pc.clone();
-                        let runtime = pp_runtime.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            build_mutation_batch_for_backend(
-                                &pc,
-                                &o,
-                                &present_chars,
-                                runtime.as_deref(),
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(batch)) => Some(batch),
-                            Ok(Err(error)) => {
-                                let error = error.to_string();
-                                tracing::error!(
-                                    "sqlite/json postprocess batch construction failed for Turn {}: {error}",
-                                    turn_id
-                                );
-                                let _ = update_turn_record(&turn_id, |record| {
-                                    record.status = storyforge_domain::turn::TurnStatus::Failed;
-                                    record.failure_reason = Some(format!(
-                                        "postprocess mutation batch construction failed: {error}"
-                                    ));
-                                    record.touch();
-                                });
-                                return;
-                            }
-                            Err(error) => {
-                                let error = error.to_string();
-                                tracing::error!(
-                                    "postprocess batch task failed for Turn {}: {error}",
-                                    turn_id
-                                );
-                                let _ = update_turn_record(&turn_id, |record| {
-                                    record.status = storyforge_domain::turn::TurnStatus::Failed;
-                                    record.failure_reason = Some(format!(
-                                        "postprocess mutation batch task failed: {error}"
-                                    ));
-                                    record.touch();
-                                });
-                                return;
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-
-                // P0：迟到结果只能写回当前活动 Attempt，不能复活 Superseded。
-                match update_turn_record_if(
-                    &turn_id,
-                    |record| is_current_attempt_ready_for_postprocess(record, &attempt_id),
-                    |record| {
-                        if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                            turn_lifecycle::apply_postprocess_to_attempt(att, batch, derivation);
-                        }
-                        record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
-                        record.touch();
-                    },
-                ) {
-                    Ok(false) => {
-                        tracing::warn!(
-                            "Phase A: 后台 postprocess 写回跳过——Turn {} 已非可写态",
-                            turn_id
-                        );
-                    }
-                    Ok(true) => {}
-                    Err(e) => {
-                        tracing::error!("Phase A: 后台 postprocess 写回失败 Turn {}: {e}", turn_id);
-                    }
-                }
-            } else {
-                // 非 Campaign 路径或无 TurnRecord：保持旧行为（直接写）
-                if let Some(outcome) = outcome {
-                    persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
-                }
+            let result = run_shared_postprocess_background(
+                pipeline,
+                ctx,
+                final_text,
+                present_chars,
+                var_keys,
+                mvu_fragments,
+                pp_event_tx,
+                pp_cancel_rx,
+                pp_identity,
+                pp_runtime,
+            )
+            .await;
+            if let Err(e) = result {
+                tracing::error!("start_writing background postprocess failed closed: {e}");
             }
-            let _ = pp_cancel_tx;
+            clear_current_cancel_if(&app_for_pp, &operation_id_for_pp);
         });
+        // Defer clear_current_cancel to the spawn completion path below.
+        // Skip the normal clear for the success path with background postprocess.
+        match result {
+            Ok((orig_text, node_id, _provenance)) => {
+                let text = prefer_autofix_response_text(response_text, orig_text);
+                return Ok(serde_json::json!({
+                    "text": text,
+                    "conversation_id": conversation_id.to_string(),
+                    "node_id": node_id.to_string(),
+                }));
+            }
+            Err(e) => {
+                if let Some(ref turn) = turn_record {
+                    let _ = update_turn_record(&turn.turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Failed;
+                        record.failure_reason = Some(format!("写作失败: {e}"));
+                        record.touch();
+                    });
+                }
+                clear_current_cancel_if(&app, &operation_id);
+                return Err(TauriCommandError::from(format!("写作失败: {e}")));
+            }
+        }
     }
 
-    // 清理 cancel sender
-    clear_current_cancel(&app);
+    // No background postprocess path: clear only this operation.
+    clear_current_cancel_if(&app, &operation_id);
 
     match result {
         Ok((orig_text, node_id, _provenance)) => {
@@ -2767,12 +2750,288 @@ fn prefer_autofix_response_text(response_text: Option<String>, original: String)
 }
 
 /// auto-fix 后同步 Attempt：quality_report + draft_hash 必须对齐最终正文。
+#[cfg_attr(not(test), allow(dead_code))]
 fn sync_attempt_after_autofix(
     attempt: &mut storyforge_domain::turn::TurnAttempt,
     final_text: &str,
     report: storyforge_domain::turn::QualityReport,
 ) {
     turn_lifecycle::sync_attempt_after_autofix(attempt, final_text, report)
+}
+
+/// Routes Attempt/Turn persistence through the active backend (JSON or SQLite).
+struct BackendTurnAttemptSink;
+
+impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
+    fn load_turn(
+        &self,
+        turn_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        if sqlite_runtime::is_sqlite_active() {
+            sqlite_runtime::get_turn(turn_id)
+        } else {
+            Ok(get_turn_store().get_turn(turn_id))
+        }
+    }
+
+    fn sync_autofix(
+        &self,
+        identity: &production_postprocess::PostprocessIdentity,
+        final_text: &str,
+        report: storyforge_domain::turn::QualityReport,
+    ) -> Result<(), production_postprocess::ProductionPostprocessError> {
+        use production_postprocess::ProductionPostprocessError;
+        use storyforge_domain::turn::{AttemptStatus, TurnStatus};
+
+        // Capture typed validation under the same conditional durable mutation.
+        let mut precondition: Option<ProductionPostprocessError> = None;
+        let mut not_writable = false;
+        let applied = update_turn_record_if(
+            &identity.turn_id,
+            |record| {
+                if record.campaign_id != identity.campaign_id {
+                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                        field: "campaign_id",
+                        expected: identity.campaign_id.to_string(),
+                        actual: record.campaign_id.to_string(),
+                    });
+                    return false;
+                }
+                if record.conversation_id != identity.conversation_id {
+                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                        field: "conversation_id",
+                        expected: identity.conversation_id.to_string(),
+                        actual: record.conversation_id.to_string(),
+                    });
+                    return false;
+                }
+                if record.find_attempt(&identity.attempt_id).is_none() {
+                    precondition = Some(ProductionPostprocessError::AttemptMissing {
+                        turn_id: identity.turn_id.to_string(),
+                        attempt_id: identity.attempt_id.to_string(),
+                    });
+                    return false;
+                }
+                let writable = matches!(
+                    record.status,
+                    TurnStatus::DraftReady | TurnStatus::DerivingState
+                ) && record.find_attempt(&identity.attempt_id).is_some_and(
+                    |attempt| {
+                        matches!(
+                            attempt.status,
+                            AttemptStatus::DraftReady | AttemptStatus::DerivingState
+                        )
+                    },
+                );
+                if !writable {
+                    not_writable = true;
+                    return false;
+                }
+                true
+            },
+            |record| {
+                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
+                    turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
+                }
+                record.touch();
+            },
+        )
+        .map_err(ProductionPostprocessError::AutofixSync)?;
+        if applied {
+            Ok(())
+        } else if let Some(err) = precondition {
+            Err(err)
+        } else if not_writable {
+            // Concurrent supersede / late status: durable zero-write, non-fatal.
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn attach_postprocess(
+        &self,
+        identity: &production_postprocess::PostprocessIdentity,
+        batch: Option<storyforge_domain::turn::MutationBatch>,
+        derivation: storyforge_domain::turn::DerivationComponents,
+    ) -> Result<bool, String> {
+        update_turn_record_if(
+            &identity.turn_id,
+            |record| {
+                record.campaign_id == identity.campaign_id
+                    && record.conversation_id == identity.conversation_id
+                    && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
+            },
+            |record| {
+                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
+                    turn_lifecycle::apply_postprocess_to_attempt(att, batch, derivation);
+                }
+                record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
+                record.touch();
+            },
+        )
+    }
+
+    fn mark_failed_if_current(
+        &self,
+        identity: &production_postprocess::PostprocessIdentity,
+        reason: String,
+    ) -> Result<bool, String> {
+        update_turn_record_if(
+            &identity.turn_id,
+            |record| {
+                record.campaign_id == identity.campaign_id
+                    && record.conversation_id == identity.conversation_id
+                    && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
+            },
+            |record| {
+                record.status = storyforge_domain::turn::TurnStatus::Failed;
+                record.failure_reason = Some(reason);
+                record.touch();
+            },
+        )
+    }
+}
+
+/// Shared production postprocess entry used by start_writing (spawned) and regenerate (awaited).
+///
+/// Runner orchestration still uses `PipelineOrchestrator::run_postprocess` at the command
+/// layer. Outcome writeback / guards / Chronicle candidates are owned by
+/// `ProductionPostprocessService`.
+///
+/// Returns `Ok(applied)` or `Err` for critical consistency failures that callers must
+/// surface (regenerate) / fail-closed (background start_writing).
+#[allow(clippy::too_many_arguments)]
+async fn run_shared_postprocess_background(
+    pipeline: PipelineOrchestrator,
+    writing_ctx: WritingContext,
+    final_text: String,
+    present_chars: Vec<String>,
+    variable_keys: Vec<String>,
+    fallback_fragments: Vec<storyforge_domain::mvu_translation::FallbackFragment>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    cancel: watch::Receiver<bool>,
+    identity: Option<production_postprocess::PostprocessIdentity>,
+    runtime: Option<std::sync::Arc<CampaignRuntimeContext>>,
+) -> Result<bool, production_postprocess::ProductionPostprocessError> {
+    use production_postprocess::{ProductionPostprocessError, ProductionPostprocessService};
+
+    if *cancel.borrow() {
+        tracing::warn!("Phase A: postprocess 写回跳过——cancelled");
+        return Ok(false);
+    }
+
+    let outcome = pipeline
+        .run_postprocess(
+            &final_text,
+            "",
+            &present_chars,
+            &variable_keys,
+            &writing_ctx,
+            &event_tx,
+            cancel.clone(),
+            &fallback_fragments,
+        )
+        .await;
+
+    if *cancel.borrow() {
+        tracing::warn!("Phase A: postprocess 写回跳过——cancelled after runner");
+        return Ok(false);
+    }
+
+    let sink = BackendTurnAttemptSink;
+    let Some(identity) = identity else {
+        // 非 Campaign 路径：保持旧行为（直接写 store）
+        if let Some(outcome) = outcome {
+            persist_postprocess_outcome_async(&writing_ctx, outcome, present_chars).await;
+        }
+        return Ok(false);
+    };
+
+    let result = if sqlite_runtime::is_sqlite_active() {
+        match runtime.as_ref() {
+            Some(runtime) => {
+                let service = ProductionPostprocessService::new_runtime(runtime.as_ref(), &sink);
+                service.apply_outcome(&identity, outcome, &present_chars, &cancel)
+            }
+            None => {
+                // Same unified PostProcessFailed path as apply_outcome errors.
+                Err(ProductionPostprocessError::BatchConstruction(
+                    "sqlite postprocess has no CampaignRuntimeContext; refusing JSON fallback"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        let service = ProductionPostprocessService::new_json(get_campaign_store(), &sink);
+        service.apply_outcome(&identity, outcome, &present_chars, &cancel)
+    };
+
+    match result {
+        Ok(result) if result.applied => {
+            let (knowledge_count, variable_count, task_count) = result
+                .outcome
+                .as_ref()
+                .and_then(|o| o.post_process.as_ref())
+                .map(|pp| {
+                    (
+                        pp.knowledge_updates.len(),
+                        pp.variable_updates.len(),
+                        pp.task_updates.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            let _ = event_tx.send(PipelineEvent::PostProcessDone {
+                knowledge_count,
+                variable_count,
+                task_count,
+            });
+            Ok(true)
+        }
+        Ok(result) => {
+            if let Some(reason) = result.skipped_reason.as_deref() {
+                tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
+                if reason == "cancelled" {
+                    let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                        reason: "postprocess cancelled".into(),
+                    });
+                }
+            }
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::error!("Phase A: postprocess 失败: {e}");
+            let combined = service_fail_turn(&sink, &identity, e);
+            let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                reason: combined.to_string(),
+            });
+            Err(combined)
+        }
+    }
+}
+
+fn service_fail_turn(
+    sink: &BackendTurnAttemptSink,
+    identity: &production_postprocess::PostprocessIdentity,
+    original: production_postprocess::ProductionPostprocessError,
+) -> production_postprocess::ProductionPostprocessError {
+    // Identity-validation errors must never mark/write the Turn.
+    if matches!(
+        original,
+        production_postprocess::ProductionPostprocessError::ScopeMismatch { .. }
+            | production_postprocess::ProductionPostprocessError::AttemptMissing { .. }
+    ) {
+        return original;
+    }
+    // Only mark Failed when this identity still owns the current writable Attempt.
+    // Superseded / cancelled late errors are zero-write and keep the new Attempt intact.
+    match sink.mark_failed_if_current(identity, original.to_string()) {
+        Ok(_marked) => original,
+        Err(mark_error) => production_postprocess::ProductionPostprocessError::MarkFailed {
+            original: original.to_string(),
+            mark_error,
+        },
+    }
 }
 
 /// 读取-修改-写回 TurnRecord 的便捷辅助。
@@ -2786,12 +3045,6 @@ where
     get_turn_store()
         .with_turn_mut(turn_id, f)
         .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
-}
-
-/// 清理 AppState.current_cancel（写作/重 roll 结束或提前失败时统一调用）。
-fn clear_current_cancel(app: &AppState) {
-    let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-    *slot = None;
 }
 
 /// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
@@ -4288,475 +4541,26 @@ async fn persist_postprocess_outcome_async(
     }
 }
 
-/// Phase A: 从 PostProcessOutcome 推导 DerivationComponents（summary/state 分别追踪）。
-fn derive_components_from_outcome(
-    outcome: &Option<storyforge_app_agent::PostProcessOutcome>,
-) -> storyforge_domain::turn::DerivationComponents {
-    use storyforge_domain::turn::{DerivationComponents, DerivationStatus};
-    match outcome {
-        None => DerivationComponents {
-            // 两者都被配置关闭（run_postprocess 返回 None）
-            summary_derivation: DerivationStatus::Disabled,
-            state_derivation: DerivationStatus::Disabled,
-        },
-        Some(o) => DerivationComponents {
-            summary_derivation: if o.summary.is_some() {
-                DerivationStatus::Succeeded
-            } else {
-                DerivationStatus::Disabled
-            },
-            state_derivation: if o.post_process.is_some() {
-                if o.post_process
-                    .as_ref()
-                    .map(|p| p.parse_succeeded)
-                    .unwrap_or(false)
-                {
-                    DerivationStatus::Succeeded
-                } else {
-                    DerivationStatus::Failed
-                }
-            } else {
-                DerivationStatus::Disabled
-            },
-        },
-    }
-}
-
 /// Phase A: 把后处理产出转换为 MutationBatch（不直接写 CampaignStore）。
 ///
-/// 替代旧的 `persist_postprocess_outcome_to_store` 的写入逻辑，
-/// 只构建候选 diff，预分配知识和任务的稳定 ID。
-/// accept 时由 CampaignMutationCoordinator::apply_mutation_batch 提交。
+/// 委托共享 `production_postprocess` 实现，保留局部 wrapper 兼容既有测试。
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_mutation_batch(
     store: &campaign_store::CampaignStore,
     persist_ctx: &PostprocessPersistContext,
     outcome: &storyforge_app_agent::PostProcessOutcome,
     present_chars: &[String],
 ) -> storyforge_domain::turn::MutationBatch {
-    let camp_id = &persist_ctx.campaign_id;
-    let commit_id = Id::new();
-    let expected_revision = store.get_campaign(camp_id).map(|c| c.revision).unwrap_or(0);
-    let mut mutations: Vec<storyforge_domain::turn::Mutation> = vec![];
-
-    // 本轮摘要 → Chronicle A 兼容字段（code/headline/lineage；Accept 落盘为规范 A）
-    if let Some(summary) = &outcome.summary {
-        let existing = store.list_summaries(camp_id);
-        let next_seq = next_chronicle_a_seq(&existing);
-        let code = storyforge_domain::chronicle::ChronicleCode::new(
-            storyforge_domain::chronicle::ChronicleLevel::A,
-            next_seq,
-        );
-        let headline = storyforge_domain::chronicle::truncate_headline(summary, 40);
-        let lineage = store
-            .get_campaign(camp_id)
-            .and_then(|c| c.lineage_id)
-            .unwrap_or_default();
-        mutations.push(storyforge_domain::turn::Mutation::UpsertSummary(Box::new(
-            storyforge_domain::agent::RoundSummary::new(
-                camp_id.clone(),
-                persist_ctx.conversation_id.clone(),
-                persist_ctx.turn,
-                summary.clone(),
-            )
-            .with_code(code.as_str())
-            .with_headline(headline)
-            .with_lineage(lineage),
-        )));
-    }
-
-    // 后处理三合一
-    if let Some(pp) = &outcome.post_process {
-        let present_ids: std::collections::HashSet<String> =
-            present_chars.iter().cloned().collect();
-
-        let name_collisions: std::collections::HashSet<String> = {
-            let mut name_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for inst in store.list_instances(camp_id) {
-                *name_counts.entry(inst.name).or_insert(0) += 1;
-            }
-            name_counts
-                .into_iter()
-                .filter(|(_, count)| *count >= 2)
-                .map(|(name, _)| name)
-                .collect()
-        };
-
-        // 知识：broadcast 展开 + 预分配 entry_id（收敛决策步骤 18）
-        for u in &pp.knowledge_updates {
-            let entries = normalize_knowledge_update_for_postprocess(
-                store,
-                camp_id,
-                u,
-                persist_ctx.turn,
-                &present_ids,
-                &name_collisions,
-            );
-            for entry in entries {
-                let entry_id = entry.id.clone();
-                mutations.push(storyforge_domain::turn::Mutation::UpsertKnowledge(
-                    Box::new(storyforge_domain::turn::KnowledgeMutation {
-                        entry_id,
-                        campaign_id: entry.campaign_id.clone(),
-                        character_id: entry.character_id.clone(),
-                        knowledge_text: entry.knowledge_text.clone(),
-                        source: entry.source.clone(),
-                        source_character_id: entry.source_character_id.clone(),
-                        turn_number: entry.turn_number,
-                        event_id: entry.event_id.clone(),
-                        pinned: entry.pinned,
-                        propagation: entry.propagation.clone(),
-                    }),
-                ));
-            }
-        }
-
-        // 变量更新：角色级 / 全局级（绝对值，天然幂等）
-        for vu in &pp.variable_updates {
-            if let Some(inst_id) = &vu.instance_id {
-                if let Some(inst) = find_instance_by_name_or_id(store, camp_id, inst_id) {
-                    let is_present = is_postprocess_instance_present(
-                        &inst,
-                        inst_id,
-                        &present_ids,
-                        &name_collisions,
-                    );
-                    if is_present {
-                        mutations.push(storyforge_domain::turn::Mutation::SetVariable {
-                            instance_id: Some(inst.id.clone()),
-                            key: vu.key.clone(),
-                            value: vu.value.clone(),
-                            turn: persist_ctx.turn,
-                        });
-                    } else {
-                        tracing::warn!(
-                            "跳过非在场角色 '{}' 的变量写入（present_chars 校验）",
-                            inst.name
-                        );
-                    }
-                }
-            } else {
-                mutations.push(storyforge_domain::turn::Mutation::SetVariable {
-                    instance_id: None,
-                    key: vu.key.clone(),
-                    value: vu.value.clone(),
-                    turn: persist_ctx.turn,
-                });
-            }
-        }
-
-        // 任务更新：已有（绝对状态）/ 新建（预分配 task_id）
-        for tu in &pp.task_updates {
-            if let Some(tid) = &tu.task_id {
-                if let Some(task) = store.get_task(tid)
-                    && let Some(task) =
-                        normalize_task_update_for_postprocess(camp_id, task, tu.new_status.clone())
-                {
-                    mutations.push(storyforge_domain::turn::Mutation::SetTaskStatus {
-                        task_id: task.id.clone(),
-                        status: task.status.clone(),
-                    });
-                }
-            } else if let Some(spec) = &tu.new_task {
-                let new_task = storyforge_domain::story_task::StoryTask::from_narrative(
-                    camp_id.clone(),
-                    spec.title.clone(),
-                    spec.description.clone(),
-                    spec.triggers.clone(),
-                    persist_ctx.turn,
-                );
-                mutations.push(storyforge_domain::turn::Mutation::UpsertNewTask(Box::new(
-                    new_task,
-                )));
-            }
-        }
-    }
-
-    storyforge_domain::turn::MutationBatch {
-        commit_id,
-        expected_revision,
-        target_revision: expected_revision + 1,
-        status: storyforge_domain::turn::MutationBatchStatus::Prepared,
-        mutations,
-    }
-}
-
-/// SQLite opt-in equivalent of `build_mutation_batch`. It is deliberately
-/// pure over the SQLite-loaded `CampaignRuntimeContext`: postprocess never
-/// consults the JSON CampaignStore after cutover, while the Accept UoW still
-/// validates the resulting batch against the current SQLite revision.
-fn build_mutation_batch_from_runtime(
-    persist_ctx: &PostprocessPersistContext,
-    outcome: &storyforge_app_agent::PostProcessOutcome,
-    present_chars: &[String],
-    runtime: &CampaignRuntimeContext,
-) -> storyforge_domain::turn::MutationBatch {
-    use storyforge_domain::character_knowledge::{
-        BroadcastTarget, KnowledgeSource, PropagationPolicy,
-    };
-    use storyforge_domain::turn::{
-        KnowledgeMutation, Mutation, MutationBatch, MutationBatchStatus,
-    };
-
-    let campaign = &runtime.campaign;
-    let mut mutations = Vec::new();
-    let present_ids: std::collections::HashSet<String> = present_chars.iter().cloned().collect();
-    let name_collisions: std::collections::HashSet<String> = {
-        let mut counts = std::collections::HashMap::<String, usize>::new();
-        for instance in &runtime.instances {
-            *counts.entry(instance.name.clone()).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .filter_map(|(name, count)| (count >= 2).then_some(name))
-            .collect()
-    };
-    let resolve_instance = |value: &Id| {
-        runtime
-            .instances
-            .iter()
-            .find(|instance| instance.id == *value || instance.name == value.as_str())
-            .cloned()
-    };
-    let is_group_member = |instance: &storyforge_domain::campaign::CharacterInstance,
-                           group: &str| {
-        instance
-            .definition_id
-            .as_ref()
-            .and_then(|id| runtime.definitions_by_id.get(id))
-            .and_then(|definition| definition.group.as_deref())
-            == Some(group)
-    };
-    let source_entry_for = |source_id: &Id, text: &str| {
-        runtime
-            .knowledge
-            .iter()
-            .filter(|entry| entry.character_id == *source_id)
-            .filter(|entry| knowledge_text_matches(&entry.knowledge_text, text))
-            .max_by(|left, right| {
-                left.turn_number
-                    .cmp(&right.turn_number)
-                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-            })
-            .cloned()
-    };
-    let source_policy_blocks =
-        |update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
-         target: Option<&storyforge_domain::campaign::CharacterInstance>| {
-            let propagating =
-                update.broadcast.is_some() || matches!(update.source, KnowledgeSource::ToldByOther);
-            if !propagating {
-                return false;
-            }
-            let Some(source_raw) = update.source_character_id.as_ref() else {
-                return false;
-            };
-            let Some(source) = resolve_instance(source_raw) else {
-                return false;
-            };
-            let Some(entry) = source_entry_for(&source.id, &update.knowledge_text) else {
-                return false;
-            };
-            match &entry.propagation {
-                PropagationPolicy::Open => false,
-                PropagationPolicy::Private => true,
-                PropagationPolicy::GroupRestricted(group) => match (&update.broadcast, target) {
-                    (Some(BroadcastTarget::Group(target_group)), _) => target_group != group,
-                    (Some(BroadcastTarget::All), _) => true,
-                    (None, Some(target_instance)) => !is_group_member(target_instance, group),
-                    (None, None) => true,
-                },
-            }
-        };
-
-    if let Some(summary) = &outcome.summary {
-        let code = storyforge_domain::chronicle::ChronicleCode::new(
-            storyforge_domain::chronicle::ChronicleLevel::A,
-            persist_ctx.turn,
-        );
-        let lineage = campaign.lineage_id.clone().unwrap_or_default();
-        mutations.push(Mutation::UpsertSummary(Box::new(
-            storyforge_domain::agent::RoundSummary::new(
-                persist_ctx.campaign_id.clone(),
-                persist_ctx.conversation_id.clone(),
-                persist_ctx.turn,
-                summary.clone(),
-            )
-            .with_code(code.as_str())
-            .with_headline(storyforge_domain::chronicle::truncate_headline(summary, 40))
-            .with_lineage(lineage),
-        )));
-    }
-
-    if let Some(postprocess) = &outcome.post_process {
-        for update in &postprocess.knowledge_updates {
-            if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
-                continue;
-            }
-            if source_policy_blocks(update, None) {
-                continue;
-            }
-            let source_instance = update
-                .source_character_id
-                .as_ref()
-                .and_then(resolve_instance);
-            let source_character_id = source_instance.as_ref().map(|instance| instance.id.clone());
-            let targets: Vec<_> = match &update.broadcast {
-                Some(BroadcastTarget::All) => runtime
-                    .instances
-                    .iter()
-                    .filter(|instance| Some(&instance.id) != source_character_id.as_ref())
-                    .cloned()
-                    .collect(),
-                Some(BroadcastTarget::Group(group)) => runtime
-                    .instances
-                    .iter()
-                    .filter(|instance| {
-                        Some(&instance.id) != source_character_id.as_ref()
-                            && is_group_member(instance, group)
-                    })
-                    .cloned()
-                    .collect(),
-                None => resolve_instance(&update.character_id).into_iter().collect(),
-            };
-
-            for target in targets {
-                if source_policy_blocks(update, Some(&target)) {
-                    continue;
-                }
-                let presence_exempt = matches!(
-                    update.source,
-                    KnowledgeSource::ToldByOther | KnowledgeSource::Backstory
-                );
-                if update.broadcast.is_none()
-                    && !presence_exempt
-                    && (present_ids.is_empty()
-                        || !is_postprocess_instance_present(
-                            &target,
-                            &update.character_id,
-                            &present_ids,
-                            &name_collisions,
-                        ))
-                {
-                    continue;
-                }
-                mutations.push(Mutation::UpsertKnowledge(Box::new(KnowledgeMutation {
-                    entry_id: Id::new(),
-                    campaign_id: persist_ctx.campaign_id.clone(),
-                    character_id: target.id,
-                    knowledge_text: update.knowledge_text.clone(),
-                    source: if update.broadcast.is_some() {
-                        KnowledgeSource::ToldByOther
-                    } else {
-                        update.source.clone()
-                    },
-                    source_character_id: source_character_id.clone(),
-                    turn_number: persist_ctx.turn,
-                    event_id: None,
-                    pinned: update.pinned,
-                    propagation: update.propagation.clone(),
-                })));
-            }
-        }
-
-        for update in &postprocess.variable_updates {
-            if let Some(instance_raw) = &update.instance_id {
-                if let Some(instance) = resolve_instance(instance_raw)
-                    && is_postprocess_instance_present(
-                        &instance,
-                        instance_raw,
-                        &present_ids,
-                        &name_collisions,
-                    )
-                {
-                    mutations.push(Mutation::SetVariable {
-                        instance_id: Some(instance.id),
-                        key: update.key.clone(),
-                        value: update.value.clone(),
-                        turn: persist_ctx.turn,
-                    });
-                }
-            } else {
-                mutations.push(Mutation::SetVariable {
-                    instance_id: None,
-                    key: update.key.clone(),
-                    value: update.value.clone(),
-                    turn: persist_ctx.turn,
-                });
-            }
-        }
-
-        for update in &postprocess.task_updates {
-            if let Some(task_id) = &update.task_id {
-                if let Some(task) = runtime
-                    .tasks
-                    .iter()
-                    .find(|task| task.id == *task_id)
-                    .cloned()
-                    && let Some(task) = normalize_task_update_for_postprocess(
-                        &persist_ctx.campaign_id,
-                        task,
-                        update.new_status.clone(),
-                    )
-                {
-                    mutations.push(Mutation::SetTaskStatus {
-                        task_id: task.id,
-                        status: task.status,
-                    });
-                }
-            } else if let Some(spec) = &update.new_task {
-                mutations.push(Mutation::UpsertNewTask(Box::new(
-                    storyforge_domain::story_task::StoryTask::from_narrative(
-                        persist_ctx.campaign_id.clone(),
-                        spec.title.clone(),
-                        spec.description.clone(),
-                        spec.triggers.clone(),
-                        persist_ctx.turn,
-                    ),
-                )));
-            }
-        }
-    }
-
-    MutationBatch {
-        commit_id: Id::new(),
-        expected_revision: campaign.revision,
-        target_revision: campaign.revision + 1,
-        status: MutationBatchStatus::Prepared,
-        mutations,
-    }
-}
-
-fn build_mutation_batch_for_backend(
-    persist_ctx: &PostprocessPersistContext,
-    outcome: &storyforge_app_agent::PostProcessOutcome,
-    present_chars: &[String],
-    runtime: Option<&CampaignRuntimeContext>,
-) -> Result<storyforge_domain::turn::MutationBatch, String> {
-    if sqlite_runtime::is_sqlite_active() {
-        let runtime = runtime.ok_or_else(|| {
-            "sqlite postprocess has no CampaignRuntimeContext; refusing JSON fallback".to_string()
-        })?;
-        if runtime.campaign.id != persist_ctx.campaign_id {
-            return Err(format!(
-                "sqlite postprocess campaign scope mismatch: runtime={}, requested={}",
-                runtime.campaign.id, persist_ctx.campaign_id
-            ));
-        }
-        Ok(build_mutation_batch_from_runtime(
-            persist_ctx,
-            outcome,
-            present_chars,
-            runtime,
-        ))
-    } else {
-        Ok(build_mutation_batch(
-            get_campaign_store(),
-            persist_ctx,
-            outcome,
-            present_chars,
-        ))
-    }
+    production_postprocess::build_json_mutation_batch(
+        store,
+        &production_postprocess::PostprocessPersistContext {
+            campaign_id: persist_ctx.campaign_id.clone(),
+            conversation_id: persist_ctx.conversation_id.clone(),
+            turn: persist_ctx.turn,
+        },
+        outcome,
+        present_chars,
+    )
 }
 fn persist_postprocess_outcome_to_store(
     store: &campaign_store::CampaignStore,
@@ -4886,7 +4690,7 @@ fn persist_postprocess_outcome_to_store(
     }
 }
 
-fn normalize_task_update_for_postprocess(
+pub(crate) fn normalize_task_update_for_postprocess(
     camp_id: &Id,
     mut task: storyforge_domain::story_task::StoryTask,
     new_status: storyforge_domain::story_task::TaskStatus,
@@ -5159,7 +4963,7 @@ fn should_block_source_knowledge_propagation(
     false
 }
 
-fn knowledge_text_matches(restricted: &str, candidate: &str) -> bool {
+pub(crate) fn knowledge_text_matches(restricted: &str, candidate: &str) -> bool {
     let restricted = normalize_knowledge_text(restricted);
     let candidate = normalize_knowledge_text(candidate);
     if restricted.is_empty() || candidate.is_empty() {
@@ -5234,7 +5038,7 @@ pub fn is_postprocess_instance_present(
     false
 }
 
-fn find_instance_by_name_or_id(
+pub(crate) fn find_instance_by_name_or_id(
     store: &campaign_store::CampaignStore,
     camp_id: &Id,
     name_or_id: &Id,
@@ -5259,8 +5063,8 @@ fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, TauriC
         .current_cancel
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some(tx) = slot.as_ref() {
-        let _ = tx.send(true);
+    if let Some(handle) = slot.as_ref() {
+        let _ = handle.cancel_tx.send(true);
         Ok(true)
     } else {
         Ok(false) // 无运行中的写作
@@ -5462,21 +5266,19 @@ async fn regenerate(
         fill_far_memory_hits(&mut ctx, &app, query).await;
     }
 
-    // cancel channel
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = slot.take() {
-            let _ = existing.send(true);
-        }
-        *slot = Some(cancel_tx);
-    }
+    // Operation-owned cancel for regenerate.
+    let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .regenerate(pipeline_req.clone(), &ctx, event_tx.clone(), cancel_rx)
+        .regenerate(
+            pipeline_req.clone(),
+            &ctx,
+            event_tx.clone(),
+            cancel_rx.clone(),
+        )
         .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
@@ -5517,7 +5319,7 @@ async fn regenerate(
                             Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
                         record.touch();
                     });
-                    clear_current_cancel(&app);
+                    clear_current_cancel_if(&app, &operation_id);
                     return Err(TauriCommandError::internal(format!(
                         "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
                     )));
@@ -5544,16 +5346,11 @@ async fn regenerate(
                 .unwrap_or_default(),
             postprocess_variable_keys(&ctx),
         );
-        let (_pp_tx, pp_rx) = watch::channel(false);
+        // Operation-owned cancel clones only (no global re-subscribe / no false fallback).
+        let pp_rx = cancel_rx.clone();
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
-        let cancel_for_fix = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
         // regenerate 返回的 node 即当前 node_id（variant 更新）
         let draft_node_for_fix = pipeline_req.node_id.clone();
         let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
@@ -5564,7 +5361,7 @@ async fn regenerate(
                 conversation_id: &pipeline_req.conversation_id,
                 writing_ctx: &ctx,
                 event_tx: &event_tx,
-                cancel: cancel_for_fix,
+                cancel: cancel_rx.clone(),
                 log_prefix: "regenerate",
             },
         )
@@ -5579,111 +5376,63 @@ async fn regenerate(
             }
             None => None,
         };
-        if let (Some(turn), Some(att_id)) = (active_turn_after_regenerate, &regen_attempt_id) {
-            let report_for_attempt = quality_report.clone();
-            let att_id = att_id.clone();
-            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                if let Some(att) = record.find_attempt_mut(&att_id) {
-                    sync_attempt_after_autofix(att, &final_text, report_for_attempt);
-                }
-                record.touch();
-            }) {
-                let _ = update_turn_record(&turn.turn_id, |record| {
-                    record.status = storyforge_domain::turn::TurnStatus::Failed;
-                    record.failure_reason =
-                        Some(format!("regenerate auto-fix 后 Attempt 同步失败: {e}"));
-                    record.touch();
-                });
-                clear_current_cancel(&app);
+        let pp_identity = match (
+            active_turn_after_regenerate.as_ref(),
+            regen_attempt_id.as_ref(),
+            ctx.campaign_id.as_ref(),
+        ) {
+            (Some(turn), Some(att_id), Some(campaign_id)) => {
+                Some(production_postprocess::PostprocessIdentity {
+                    turn_id: turn.turn_id.clone(),
+                    attempt_id: att_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: ctx.turn,
+                })
+            }
+            _ => None,
+        };
+        if let Some(identity) = &pp_identity {
+            let sink = BackendTurnAttemptSink;
+            let service = production_postprocess::ProductionPostprocessService::new_json(
+                get_campaign_store(),
+                &sink,
+            );
+            if let Err(e) =
+                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
+            {
+                let combined = service_fail_turn(&sink, identity, e);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
-                    "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
+                    "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
         }
 
-        let outcome = pipeline
-            .run_postprocess(
-                &final_text,
-                "",
-                &present_chars,
-                &var_keys,
-                &ctx,
-                &event_tx,
-                pp_rx,
-                &mvu_fragments,
-            )
-            .await;
-
-        // Phase A: postprocess 产出暂存到新 TurnAttempt（同 start_writing）
-        let active_turn_for_postprocess = match &ctx.campaign_id {
-            Some(campaign_id) => {
-                get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
-            }
-            None => None,
-        };
-        if let (Some(turn), Some(att_id)) = (active_turn_for_postprocess, regen_attempt_id) {
-            let derivation = derive_components_from_outcome(&outcome);
-            let pc = PostprocessPersistContext::from_writing_context(&ctx);
-            let outcome_clone = outcome.clone();
-            let batch = match (pc, outcome_clone) {
-                (Some(pc), Some(o)) => {
-                    let pc = pc.clone();
-                    let runtime = ctx.campaign_runtime.clone();
-                    tokio::task::spawn_blocking(move || {
-                        build_mutation_batch_for_backend(
-                            &pc,
-                            &o,
-                            &present_chars,
-                            runtime.as_deref(),
-                        )
-                    })
-                    .await
-                    .map_err(|error| {
-                        TauriCommandError::internal(format!(
-                            "postprocess batch task failed: {error}"
-                        ))
-                    })?
-                    .map_err(TauriCommandError::internal)?
-                    .into()
-                }
-                _ => None,
-            };
-            // P0：同 start_writing；迟到结果只能写回当前活动 Attempt。
-            match update_turn_record_if(
-                &turn.turn_id,
-                |record| is_current_attempt_ready_for_postprocess(record, &att_id),
-                |record| {
-                    if let Some(att) = record.find_attempt_mut(&att_id) {
-                        turn_lifecycle::apply_postprocess_to_attempt(att, batch, derivation);
-                    }
-                    record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
-                    record.touch();
-                },
-            ) {
-                Ok(false) => {
-                    tracing::warn!(
-                        "Phase A: regenerate postprocess 写回跳过——Turn {} 已非可写态",
-                        turn.turn_id
-                    );
-                }
-                Ok(true) => {}
-                Err(e) => {
-                    tracing::error!(
-                        "Phase A: regenerate postprocess 写回失败 Turn {}: {e}",
-                        turn.turn_id
-                    );
-                }
-            }
-        } else if let Some(outcome) = outcome {
-            // 非 Campaign 路径：保持旧行为（直接写）
-            persist_postprocess_outcome_async(&ctx, outcome, present_chars).await;
+        // regenerate 保持同步语义：await 共享后处理；关键失败向上返回。
+        let pp_runtime = ctx.campaign_runtime.clone();
+        if let Err(e) = run_shared_postprocess_background(
+            pipeline,
+            ctx,
+            final_text,
+            present_chars,
+            var_keys,
+            mvu_fragments,
+            event_tx.clone(),
+            pp_rx,
+            pp_identity,
+            pp_runtime,
+        )
+        .await
+        {
+            clear_current_cancel_if(&app, &operation_id);
+            return Err(TauriCommandError::internal(format!(
+                "regenerate postprocess 关键失败: {e}"
+            )));
         }
     }
 
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        *slot = None;
-    }
+    clear_current_cancel_if(&app, &operation_id);
 
     match result {
         Ok((orig_text, _provenance)) => Ok(prefer_autofix_response_text(response_text, orig_text)),
@@ -6948,6 +6697,7 @@ async fn commit_turn_attempt(
 }
 
 /// 已有 RoundSummary 上分配下一个 Chronicle A 序号（兼容无 code 的旧行）。
+#[cfg_attr(not(test), allow(dead_code))]
 fn next_chronicle_a_seq(existing: &[storyforge_domain::agent::RoundSummary]) -> u32 {
     turn_lifecycle::next_chronicle_a_seq(existing)
 }
@@ -17099,15 +16849,9 @@ mod tests {
             assert!(slot.is_none());
         }
 
-        // 模拟 start_writing 设置 cancel sender
-        let (tx, rx) = watch::channel(false);
-        {
-            let mut slot = state
-                .current_cancel
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            *slot = Some(tx);
-        }
+        // 模拟 start_writing 设置 operation-owned cancel
+        let (_op_a, rx_a) = begin_writing_operation(&state);
+        assert!(!*rx_a.borrow());
 
         // 触发取消
         {
@@ -17115,19 +16859,369 @@ mod tests {
                 .current_cancel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let tx = slot.as_ref().unwrap();
-            let _ = tx.send(true);
+            let handle = slot.as_ref().unwrap();
+            let _ = handle.cancel_tx.send(true);
         }
-        assert!(*rx.borrow(), "cancel 应已触发");
+        assert!(*rx_a.borrow(), "cancel 应已触发");
 
-        // 清理
+        // 清理本 operation
+        let op = state
+            .current_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|h| h.operation_id.clone())
+            .unwrap();
+        clear_current_cancel_if(&state, &op);
+        assert!(
+            state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn operation_owned_cancel_interleaving_preserves_active_generation() {
+        let state = AppState::new_for_test();
+
+        // Operation A starts.
+        let (op_a, rx_a) = begin_writing_operation(&state);
+        assert!(!*rx_a.borrow());
+
+        // Operation B starts while A is still "postprocessing": A must observe cancel,
+        // and the global slot becomes B.
+        let (op_b, rx_b) = begin_writing_operation(&state);
+        assert_ne!(op_a, op_b);
+        assert!(*rx_a.borrow(), "starting B must cancel A");
+        assert!(!*rx_b.borrow());
         {
-            let mut slot = state
+            let slot = state
                 .current_cancel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            *slot = None;
+            assert_eq!(slot.as_ref().unwrap().operation_id, op_b);
         }
+
+        // A finishing must not clear B's sender.
+        clear_current_cancel_if(&state, &op_a);
+        {
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                slot.as_ref().map(|h| h.operation_id.clone()),
+                Some(op_b.clone()),
+                "A clear must not wipe B"
+            );
+        }
+        assert!(!*rx_b.borrow());
+
+        // cancel_writing still cancels the active generation B.
+        {
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let _ = slot.as_ref().unwrap().cancel_tx.send(true);
+        }
+        assert!(*rx_b.borrow(), "active cancel must still reach B");
+
+        // B clear succeeds; stale A clear remains a no-op.
+        clear_current_cancel_if(&state, &op_b);
+        clear_current_cancel_if(&state, &op_a);
+        assert!(
+            state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scope_validation_errors_do_not_mark_turn_failed() {
+        use production_postprocess::{
+            JsonTurnAttemptSink, PostprocessIdentity, ProductionPostprocessError,
+            ProductionPostprocessService,
+        };
+        use std::sync::Arc;
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
+
+        let dir =
+            std::env::temp_dir().join(format!("sf_scope_zero_write_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let campaign_store = Arc::new(campaign_store::CampaignStore::new(&dir));
+        let turn_store = Arc::new(turn_store::TurnStore::new(&dir));
+        let mut campaign = Campaign::new(Id::new(), "scope-zero");
+        campaign.lineage_id = Some(Id::new());
+        let campaign_id = campaign.id.clone();
+        campaign_store.save_campaign(campaign).unwrap();
+        let conversation_id = Id::from_str("conv-scope");
+        let attempt_id = Id::new();
+        let mut record = TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            Id::from_str("input"),
+            0,
+        );
+        record.status = TurnStatus::DraftReady;
+        record.attempts.push(turn_lifecycle::new_draft_attempt(
+            attempt_id.clone(),
+            Id::from_str("variant"),
+            "draft",
+            vec![],
+        ));
+        let turn_id = record.turn_id.clone();
+        turn_store.create_turn(record).unwrap();
+
+        let sink = JsonTurnAttemptSink {
+            turn_store: &turn_store,
+        };
+        let service = ProductionPostprocessService::new_json(&campaign_store, &sink);
+        let (_tx, cancel_rx) = watch::channel(false);
+        let before = turn_store.get_turn(&turn_id).unwrap();
+        let original_hash = before.find_attempt(&attempt_id).unwrap().draft_hash.clone();
+
+        let assert_zero_write = |label: &str| {
+            let after = turn_store.get_turn(&turn_id).unwrap();
+            assert_eq!(after.status, before.status, "{label}: status");
+            assert_eq!(
+                after.conversation_id, before.conversation_id,
+                "{label}: conversation"
+            );
+            assert_eq!(after.campaign_id, before.campaign_id, "{label}: campaign");
+            assert_eq!(after.failure_reason, before.failure_reason, "{label}: fail");
+            let att = after.find_attempt(&attempt_id).unwrap();
+            assert_eq!(att.draft_hash, original_hash, "{label}: draft_hash");
+            assert!(att.pending_state_changes.is_none(), "{label}: batch");
+            assert!(
+                campaign_store.list_summaries(&campaign_id).is_empty(),
+                "{label}: summaries"
+            );
+        };
+
+        // apply_outcome cross-campaign
+        let err = service
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: Id::from_str("other-campaign"),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: 1,
+                },
+                Some(storyforge_app_agent::PostProcessOutcome {
+                    summary: Some("must not write".into()),
+                    post_process: None,
+                }),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("cross campaign must fail");
+        assert!(matches!(
+            err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        let bad_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: Id::from_str("other-campaign"),
+            conversation_id: conversation_id.clone(),
+            turn_number: 1,
+        };
+        let combined = service_fail_turn(&BackendTurnAttemptSink, &bad_identity, err);
+        assert!(matches!(
+            combined,
+            ProductionPostprocessError::ScopeMismatch { .. }
+        ));
+        assert_zero_write("apply cross campaign");
+
+        // start_writing / regenerate adapter path: sync_autofix via Backend sink.
+        // Install the same turn into the process JSON turn store used by BackendTurnAttemptSink.
+        // save_turn upserts so parallel tests / prior state cannot leave us without the record.
+        get_turn_store()
+            .save_turn(before.clone())
+            .expect("seed backend turn store");
+        let backend = BackendTurnAttemptSink;
+        // new_json only needs sink for autofix; campaign_store is unused on this path.
+        let backend_service =
+            ProductionPostprocessService::new_json(get_campaign_store(), &backend);
+
+        let camp_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: Id::from_str("other-campaign"),
+            conversation_id: conversation_id.clone(),
+            turn_number: 1,
+        };
+        let camp_err = backend_service
+            .sync_autofix_attempt(
+                &camp_identity,
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend cross campaign");
+        assert!(matches!(
+            camp_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        let combined = service_fail_turn(&backend, &camp_identity, camp_err);
+        assert!(matches!(
+            combined,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        // zero-write on process turn store
+        let after_backend = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_backend.status, TurnStatus::DraftReady);
+        assert_eq!(after_backend.failure_reason, None);
+        assert_eq!(
+            after_backend.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+
+        let conv_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: campaign_id.clone(),
+            conversation_id: Id::from_str("other-conversation"),
+            turn_number: 1,
+        };
+        let conv_err = backend_service
+            .sync_autofix_attempt(
+                &conv_identity,
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend cross conversation");
+        assert!(matches!(
+            conv_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "conversation_id",
+                ..
+            }
+        ));
+        let _ = service_fail_turn(&backend, &conv_identity, conv_err);
+        let after_conv = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_conv.conversation_id, conversation_id);
+        assert_eq!(after_conv.failure_reason, None);
+        assert_eq!(
+            after_conv.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+
+        let miss_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: Id::from_str("ghost-attempt"),
+            campaign_id: campaign_id.clone(),
+            conversation_id: conversation_id.clone(),
+            turn_number: 1,
+        };
+        let miss_err = backend_service
+            .sync_autofix_attempt(
+                &miss_identity,
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend missing attempt");
+        assert!(matches!(
+            miss_err,
+            ProductionPostprocessError::AttemptMissing { .. }
+        ));
+        let _ = service_fail_turn(&backend, &miss_identity, miss_err);
+        let after_miss = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_miss.status, TurnStatus::DraftReady);
+        assert_eq!(after_miss.failure_reason, None);
+        assert_eq!(
+            after_miss.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+
+        // Concurrent supersede + late Storage/BatchConstruction from old postprocess.
+        let new_attempt_id = Id::new();
+        get_turn_store()
+            .with_turn_mut(&turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Superseded;
+                }
+                let mut new_att = turn_lifecycle::new_draft_attempt(
+                    new_attempt_id.clone(),
+                    Id::from_str("variant-new"),
+                    "regenerated",
+                    vec![],
+                );
+                new_att.status = AttemptStatus::DraftReady;
+                record.attempts.push(new_att);
+                record.status = TurnStatus::DraftReady;
+                record.failure_reason = None;
+                record.touch();
+            })
+            .unwrap();
+        let old_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: campaign_id.clone(),
+            conversation_id: conversation_id.clone(),
+            turn_number: 1,
+        };
+        backend_service
+            .sync_autofix_attempt(
+                &old_identity,
+                "superseded-must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect("superseded is non-fatal zero-write");
+        // Late Storage / BatchConstruction from old background postprocess must not Fail the Turn.
+        for err in [
+            ProductionPostprocessError::Storage("late attach".into()),
+            ProductionPostprocessError::BatchConstruction("late batch".into()),
+        ] {
+            let combined = service_fail_turn(&backend, &old_identity, err);
+            assert!(
+                matches!(
+                    combined,
+                    ProductionPostprocessError::Storage(_)
+                        | ProductionPostprocessError::BatchConstruction(_)
+                ),
+                "unexpected: {combined}"
+            );
+            let after = get_turn_store().get_turn(&turn_id).unwrap();
+            assert_eq!(after.status, TurnStatus::DraftReady);
+            assert_eq!(after.failure_reason, None);
+            assert_eq!(
+                after.find_attempt(&new_attempt_id).unwrap().status,
+                AttemptStatus::DraftReady
+            );
+            assert_eq!(
+                after.find_attempt(&attempt_id).unwrap().status,
+                AttemptStatus::Superseded
+            );
+        }
+        let after_super = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(
+            after_super.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+        assert_eq!(after_super.conversation_id, conversation_id);
+
+        // Cleanup process store entry so other tests are not polluted.
+        let _ = get_turn_store().with_turn_mut(&turn_id, |r| {
+            r.status = TurnStatus::Failed;
+            r.failure_reason = Some("test cleanup".into());
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 验证 active_llm_or_mock：无活跃连接时回退 mock（关键 fallback 行为）

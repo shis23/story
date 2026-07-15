@@ -42,6 +42,11 @@ pub fn builtin_migrations() -> Vec<Migration> {
             name: "chronicle_publication_jobs",
             sql: include_str!("../migrations/V003__chronicle_publication_jobs.sql"),
         },
+        Migration {
+            version: 4,
+            name: "preaccept_lifecycle",
+            sql: include_str!("../migrations/V004__preaccept_lifecycle.sql"),
+        },
     ]
 }
 
@@ -214,12 +219,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1, 2, 3]);
-        assert_eq!(current_version(&db).unwrap(), 3);
+        assert_eq!(first, vec![1, 2, 3, 4]);
+        assert_eq!(current_version(&db).unwrap(), 4);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 3);
+        assert_eq!(current_version(&db).unwrap(), 4);
 
         // 核心表应存在
         for table in [
@@ -232,6 +237,7 @@ mod tests {
             "round_summary_covers",
             "mutation_commits",
             "chronicle_publication_jobs",
+            "preaccept_outbox",
             "import_runs",
         ] {
             let exists: i64 = db
@@ -258,8 +264,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3]);
-        assert_eq!(current_version(&db).unwrap(), 3);
+        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4]);
+        assert_eq!(current_version(&db).unwrap(), 4);
         let cards: i64 = db
             .connection()
             .query_row(
@@ -269,7 +275,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cards, 1);
-        for table in ["mutation_commits", "chronicle_publication_jobs"] {
+        for table in [
+            "mutation_commits",
+            "chronicle_publication_jobs",
+            "preaccept_outbox",
+        ] {
             let exists: i64 = db
                 .connection()
                 .query_row(

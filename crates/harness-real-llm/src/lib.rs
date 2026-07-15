@@ -25,6 +25,7 @@ pub mod commit_probe;
 pub mod context_compile_bench;
 pub mod endurance;
 pub mod evidence;
+pub mod evidence_retention;
 pub mod long_session;
 pub mod observability;
 pub mod phase_b_matrix;
@@ -125,6 +126,208 @@ impl HarnessEnv {
     /// harness 不依赖磁盘 `active_campaign.json`）。
     pub fn set_active_campaign(&self, id: Id) {
         *self.active_campaign.lock().unwrap() = Some(id);
+    }
+
+    /// Apply the shared ProductionPostprocessService with a deterministic outcome.
+    ///
+    /// Creates a DraftReady Turn/Attempt if needed, attaches Chronicle A + candidates
+    /// via the same state machine as Tauri, and returns a verified writeback proof.
+    pub async fn apply_production_postprocess(
+        &self,
+        ctx: &WritingContext,
+        variant_id: &Id,
+        draft_text: &str,
+        summary_text: Option<String>,
+        turn_number: u32,
+        input_node_id: Id,
+    ) -> Result<crate::production_evidence::ProductionPostprocessProof, String> {
+        use storyforge_app_agent::PostProcessOutcome;
+        use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
+        use storyforge_tauri_app::production_postprocess::{
+            FixedPostprocessRunner, JsonTurnAttemptSink, PostprocessIdentity, PostprocessRunner,
+            ProductionPostprocessRequest, ProductionPostprocessService,
+        };
+        use storyforge_tauri_app::turn_lifecycle;
+
+        let campaign_id = ctx
+            .campaign_id
+            .clone()
+            .ok_or_else(|| "apply_production_postprocess requires campaign_id".to_string())?;
+
+        // Ensure an active DraftReady attempt exists for this variant.
+        let (turn_id, attempt_id) =
+            if let Some(existing) = self.turn_store.get_turn_by_variant(variant_id) {
+                if existing.input_node_id != input_node_id {
+                    return Err(format!(
+                        "existing turn input_node_id {} != requested {}",
+                        existing.input_node_id, input_node_id
+                    ));
+                }
+                let attempt = existing
+                    .find_attempt_by_variant(variant_id)
+                    .ok_or_else(|| "turn exists but attempt missing for variant".to_string())?;
+                (existing.turn_id.clone(), attempt.attempt_id.clone())
+            } else {
+                let camp = self
+                    .campaign_store
+                    .get_campaign(&campaign_id)
+                    .ok_or_else(|| "campaign missing".to_string())?;
+                // Close any other active turn for this campaign first.
+                if let Some(active) = self.turn_store.get_active_turn(&campaign_id) {
+                    self.turn_store
+                        .with_turn_mut(&active.turn_id, |record| {
+                            if record.status.is_active() {
+                                record.status = TurnStatus::Failed;
+                                record.failure_reason =
+                                    Some("superseded by harness production postprocess".into());
+                                record.touch();
+                            }
+                        })
+                        .map_err(|e| format!("close prior active turn: {e}"))?;
+                }
+                let attempt = turn_lifecycle::new_draft_attempt(
+                    Id::new(),
+                    variant_id.clone(),
+                    draft_text,
+                    vec![],
+                );
+                let attempt_id = attempt.attempt_id.clone();
+                let mut record = TurnRecord::new(
+                    campaign_id.clone(),
+                    ctx.conversation_id.clone(),
+                    input_node_id.clone(),
+                    camp.revision,
+                );
+                record.status = TurnStatus::DraftReady;
+                record.attempts.push(attempt);
+                let turn_id = record.turn_id.clone();
+                self.turn_store
+                    .create_turn(record)
+                    .map_err(|e| format!("create turn for postprocess: {e}"))?;
+                // Ensure quality report is present for Accept.
+                let sink = JsonTurnAttemptSink {
+                    turn_store: &self.turn_store,
+                };
+                let service = ProductionPostprocessService::new_json(&self.campaign_store, &sink);
+                let identity = PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: ctx.conversation_id.clone(),
+                    turn_number,
+                };
+                service
+                    .sync_autofix_attempt(&identity, draft_text, QualityReport { warnings: vec![] })
+                    .map_err(|e| e.to_string())?;
+                (turn_id, attempt_id)
+            };
+
+        let outcome = PostProcessOutcome {
+            summary: summary_text,
+            post_process: None,
+        };
+        let runner: Arc<dyn PostprocessRunner> = Arc::new(FixedPostprocessRunner {
+            outcome: Some(outcome),
+        });
+        let sink = JsonTurnAttemptSink {
+            turn_store: &self.turn_store,
+        };
+        let service = ProductionPostprocessService::new_json(&self.campaign_store, &sink);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let result = service
+            .run(
+                ProductionPostprocessRequest {
+                    identity: Some(PostprocessIdentity {
+                        turn_id: turn_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        campaign_id: campaign_id.clone(),
+                        conversation_id: ctx.conversation_id.clone(),
+                        turn_number,
+                    }),
+                    final_text: draft_text.to_string(),
+                    quality_report: None,
+                    present_chars: vec![],
+                    cancel: cancel_rx,
+                },
+                runner,
+                false,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !result.applied {
+            return Err(format!(
+                "production postprocess did not apply: {:?}",
+                result.skipped_reason
+            ));
+        }
+
+        // Verify durable writeback before returning a proof callers may trust.
+        let turn = self
+            .turn_store
+            .get_turn(&turn_id)
+            .ok_or_else(|| "turn missing after production postprocess".to_string())?;
+        if turn.status != TurnStatus::AwaitingAcceptance {
+            return Err(format!(
+                "turn status after postprocess is {:?}, expected AwaitingAcceptance",
+                turn.status
+            ));
+        }
+        let attempt = turn
+            .find_attempt(&attempt_id)
+            .ok_or_else(|| "attempt missing after production postprocess".to_string())?;
+        if attempt.status != AttemptStatus::AwaitingAcceptance {
+            return Err(format!(
+                "attempt status after postprocess is {:?}, expected AwaitingAcceptance",
+                attempt.status
+            ));
+        }
+        if attempt.pending_state_changes.is_none() && result.batch.is_none() {
+            // outcome may be empty, but derivation must still be recorded when applied.
+            if attempt.derivation.is_none() {
+                return Err("applied postprocess left no derivation/batch".into());
+            }
+        }
+        if result.summary_text.is_some() {
+            let has_summary = attempt
+                .pending_state_changes
+                .as_ref()
+                .map(|b| {
+                    b.mutations
+                        .iter()
+                        .any(|m| matches!(m, storyforge_domain::turn::Mutation::UpsertSummary(_)))
+                })
+                .unwrap_or(false);
+            if !has_summary {
+                return Err("summary outcome applied but UpsertSummary missing from batch".into());
+            }
+        }
+
+        let durable_batch = attempt.pending_state_changes.clone();
+        let batch_digest = durable_batch
+            .as_ref()
+            .map(crate::production_evidence::mutation_batch_digest);
+        let draft_hash = attempt.draft_hash.clone();
+        if turn.input_node_id != input_node_id {
+            return Err(format!(
+                "turn input_node_id {} != requested {}",
+                turn.input_node_id, input_node_id
+            ));
+        }
+        if attempt.variant_id != *variant_id {
+            return Err("attempt variant_id mismatch after production postprocess".into());
+        }
+
+        Ok(crate::production_evidence::ProductionPostprocessProof {
+            turn_id,
+            attempt_id,
+            input_node_id,
+            turn_index: turn_number,
+            variant_id: variant_id.clone(),
+            draft_hash,
+            summary_text: result.summary_text,
+            batch_digest,
+            applied: true,
+        })
     }
 
     /// 组装一个 campaign-mode 的 `WritingContext`（复用线上 `fill_campaign_runtime_from_store`）。

@@ -17,6 +17,7 @@ pub mod error;
 pub mod exporter;
 pub mod importer;
 pub mod migrations;
+pub mod preaccept;
 pub mod production;
 pub mod publication;
 pub mod readiness;
@@ -35,6 +36,12 @@ pub use error::{Result, SqliteError};
 pub use exporter::{ReverseExportReport, ReverseExportResult, export_sqlite_to_json};
 pub use importer::{ImportReport, ImportStatus, JsonImporter};
 pub use migrations::{Migration, builtin_migrations, current_version, migrate, migrate_with};
+pub use preaccept::{
+    AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyOutcome,
+    PostprocessApplyRequest, PreacceptFault, PreacceptOutboxKind, PreacceptOutboxRow,
+    PreacceptOutboxStatus, PreacceptRecoverySnapshot, RegenerateAttemptRequest,
+    SqlitePreacceptRepository,
+};
 pub use publication::{PublishFault, PublishOutcome, PublishRequest, SqliteChronicleRepository};
 pub use readiness::{
     BackupCheckpoint, ExportSnapshot, SourceManifestReport, create_backup_checkpoint,

@@ -292,7 +292,7 @@ fn stale_marker_with_missing_db_is_rejected() {
     let marker = serde_json::json!({
         "version": 1,
         "backend": "sqlite",
-        "schema_version": 3,
+        "schema_version": 4,
         "manifest_hash": "fake",
         "created_at": "2026-07-13T00:00:00Z"
     });
