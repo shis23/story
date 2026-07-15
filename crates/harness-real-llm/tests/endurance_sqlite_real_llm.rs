@@ -231,13 +231,19 @@ async fn run_sqlite_endurance_stage(
                 )
             }
             ScheduledAction::RegenerateOverall => {
-                format!("turn {turn_index}: overall regenerate.")
+                format!(
+                    "turn {turn_index}: continue the investigation from a slightly different angle while keeping continuity."
+                )
             }
             ScheduledAction::RegenerateEditor => {
-                format!("turn {turn_index}: editor-only regenerate.")
+                format!(
+                    "turn {turn_index}: polish the latest scene prose while preserving plot facts."
+                )
             }
             ScheduledAction::RegenerateSubagent => {
-                format!("turn {turn_index}: subagent-only regenerate.")
+                format!(
+                    "turn {turn_index}: rework one supporting character performance without changing the overall beat."
+                )
             }
             ScheduledAction::PrivateProbe { probe_kind } => {
                 format!(
@@ -272,8 +278,10 @@ async fn run_sqlite_endurance_stage(
         llm.set_tag(format!("sqlite-turn{turn_index}"));
         llm.set_role("pipeline");
 
+        // Empty targets = full regenerate path in pipeline (not Director-only partial).
+        // Director-only is rejected when provenance still holds prior subagent results.
         let regen_targets = match &action {
-            ScheduledAction::RegenerateOverall => Some(vec![PartialRollTarget::Director]),
+            ScheduledAction::RegenerateOverall => Some(Vec::new()),
             ScheduledAction::RegenerateEditor => Some(vec![PartialRollTarget::Editor]),
             ScheduledAction::RegenerateSubagent => {
                 Some(vec![PartialRollTarget::Subagent("pending".into())])
