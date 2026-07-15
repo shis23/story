@@ -311,6 +311,22 @@ impl SqliteHarnessEnv {
         let base = WritingContext::legacy(vec![], None, conversation_id.clone());
         let ctx = self.fill_campaign_context(base)?;
 
+        let mut pipeline = self.new_pipeline();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Drain events so the channel never fills in harness.
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        // Generate first, then open a fresh Generating turn immediately before land.
+        let (draft_text, _provisional_node, provenance) = pipeline
+            .start_writing(intent.to_string(), &ctx, event_tx, cancel_rx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        self.fail_active_turn_if_any(
+            &campaign_id,
+            "superseded by sqlite endurance pre-land cleanup",
+        )?;
         let camp = sqlite_runtime::get_campaign(&campaign_id)?
             .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
         let turn = TurnRecord::new(
@@ -319,20 +335,8 @@ impl SqliteHarnessEnv {
             input_node_id.clone(),
             camp.revision,
         );
-        // Keep turn generating until preaccept lands the draft.
         let turn_id = turn.turn_id.clone();
         sqlite_runtime::save_turn(&turn)?;
-
-        let mut pipeline = self.new_pipeline();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Drain events so the channel never fills in harness.
-        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-        let (draft_text, _provisional_node, provenance) = pipeline
-            .start_writing(intent.to_string(), &ctx, event_tx, cancel_rx)
-            .await
-            .map_err(|e| e.to_string())?;
 
         let attempt_id = Id::new();
         let land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
@@ -464,6 +468,20 @@ impl SqliteHarnessEnv {
         let base = WritingContext::legacy(vec![], None, conversation_id.clone());
         let ctx = self.fill_campaign_context(base)?;
 
+        let mut pipeline = self.new_pipeline();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let (draft_text, _provisional_node, provenance) = pipeline
+            .start_writing(intent.to_string(), &ctx, event_tx.clone(), cancel_rx.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        self.fail_active_turn_if_any(
+            &campaign_id,
+            "superseded by sqlite endurance regenerate pre-land cleanup",
+        )?;
         let camp = sqlite_runtime::get_campaign(&campaign_id)?
             .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
         let turn = TurnRecord::new(
@@ -474,21 +492,6 @@ impl SqliteHarnessEnv {
         );
         let turn_id = turn.turn_id.clone();
         sqlite_runtime::save_turn(&turn)?;
-
-        let mut pipeline = self.new_pipeline();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-        let (draft_text, _provisional_node, provenance) = pipeline
-            .start_writing(
-                intent.to_string(),
-                &ctx,
-                event_tx.clone(),
-                cancel_rx.clone(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
 
         let first_attempt_id = Id::new();
         let first_land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {

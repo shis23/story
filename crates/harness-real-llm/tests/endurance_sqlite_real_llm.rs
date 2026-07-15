@@ -379,7 +379,9 @@ async fn run_sqlite_endurance_stage(
                         || err.contains("Internal")
                         || err.contains("所有子 Agent 均失败")
                         || err.contains("不在旧 Plan")
-                        || err.contains("部分重 roll");
+                        || err.contains("部分重 roll")
+                        || err.contains("expected Generating")
+                        || err.contains("is Failed");
                     eprintln!(
                         "[sqlite endurance {}] turn {turn_index} attempt {attempt}/{MAX_WRITE_ATTEMPTS} failed (transient={transient}): {err}",
                         stage.label()
