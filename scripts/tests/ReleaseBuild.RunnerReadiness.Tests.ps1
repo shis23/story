@@ -1658,6 +1658,63 @@ jobs:
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    It 'fails closed when verifier is only inside unreachable if/function/try contexts (top-level reachable required)' {
+        # Direct AST unit checks for control-flow unreachable shapes.
+        (Test-ReleaseRunInvokesCommand -ScriptText 'if ($false) { Assert-ReleaseEvidencePackage -EvidenceDir x }' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText 'function NotRun { Assert-ReleaseEvidencePackage -EvidenceDir x }' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText 'try { throw "x" } catch { Assert-ReleaseEvidencePackage -EvidenceDir x }' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText 'foreach ($i in 1) { Assert-ReleaseEvidencePackage -EvidenceDir x }' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText '& { Assert-ReleaseEvidencePackage -EvidenceDir x }' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        # Top-level direct call and top-level assignment RHS remain accepted.
+        (Test-ReleaseRunInvokesCommand -ScriptText 'Assert-ReleaseEvidencePackage -EvidenceDir x' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $true
+        (Test-ReleaseRunInvokesCommand -ScriptText '$result = Assert-ReleaseEvidencePackage -EvidenceDir x' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $true
+        # Early return/exit before a top-level call is not a guaranteed execution path for the call.
+        (Test-ReleaseRunInvokesCommand -ScriptText "return`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText "exit 0`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-unreach-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Unreachable if
+        shell: pwsh
+        run: |
+          if ($false) { Assert-ReleaseEvidencePackage -EvidenceDir x }
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Uninvoked function
+        shell: pwsh
+        run: |
+          function NotRun { Assert-ReleaseEvidencePackage -EvidenceDir x }
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|top-level|reachable|command|executable'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Describe 'Release dry-run offline rehash readiness' {

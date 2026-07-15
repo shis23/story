@@ -2827,8 +2827,15 @@ function Assert-ReleaseEvidencePackage {
 function Test-ReleaseRunInvokesCommand {
     <#
     .SYNOPSIS
-    Returns true only when PowerShell AST contains a real CommandAst whose command
-    name equals the requested command (not Write-Host/assignment string literals).
+    Returns true only for a top-level reachable CommandAst whose command name equals
+    the requested command.
+
+    .DESCRIPTION
+    Accepts:
+      - top-level bare call: Assert-X ...
+      - top-level assignment RHS: $result = Assert-X ...
+    Rejects Write-Host/string/assignment decoys and commands nested in if/loop/
+    function/try-catch/scriptblock, or any command after a top-level return/exit/throw.
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
@@ -2855,29 +2862,90 @@ function Test-ReleaseRunInvokesCommand {
     }
 
     $wanted = $CommandName.Trim()
-    $commands = $ast.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst]
-        }, $true)
-
-    foreach ($cmd in @($commands)) {
-        if ($null -eq $cmd -or $null -eq $cmd.CommandElements -or $cmd.CommandElements.Count -lt 1) {
-            continue
-        }
-        $first = $cmd.CommandElements[0]
-        $name = $null
-        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-            $name = [string]$first.Value
-        } elseif ($first -is [System.Management.Automation.Language.CommandParameterAst]) {
-            continue
-        } else {
-            # Only accept bare command name constants, not expandable/scriptblock forms.
-            continue
-        }
-        if ([string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
+    $root = $ast.EndBlock
+    if ($null -eq $root -or $null -eq $root.Statements) {
+        return $false
     }
+
+    function Get-CommandNameFromAst {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        if ($null -eq $CommandAst.CommandElements -or $CommandAst.CommandElements.Count -lt 1) {
+            return $null
+        }
+        $first = $CommandAst.CommandElements[0]
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            return [string]$first.Value
+        }
+        return $null
+    }
+
+    function Test-IsTransferCommand {
+        param([Parameter(Mandatory = $true)][string]$Name)
+        return [string]::Equals($Name, 'return', [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($Name, 'exit', [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($Name, 'throw', [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    # Walk only top-level statements; do not recurse into nested blocks.
+    foreach ($stmt in @($root.Statements)) {
+        if ($null -eq $stmt) { continue }
+
+        # Unconditional transfer statements make later top-level statements unreachable.
+        if ($stmt -is [System.Management.Automation.Language.ReturnStatementAst] -or
+            $stmt -is [System.Management.Automation.Language.ExitStatementAst] -or
+            $stmt -is [System.Management.Automation.Language.ThrowStatementAst]) {
+            return $false
+        }
+
+        # Pipeline statement: command1 | command2 ...  (we only accept first element command form)
+        if ($stmt -is [System.Management.Automation.Language.PipelineAst]) {
+            $elements = @($stmt.PipelineElements)
+            if ($elements.Count -ne 1) {
+                # Pipelines are not a guaranteed standalone top-level verifier call.
+                continue
+            }
+            $elem = $elements[0]
+            if ($elem -is [System.Management.Automation.Language.CommandAst]) {
+                $name = Get-CommandNameFromAst -CommandAst $elem
+                if ($null -eq $name) { continue }
+                if (Test-IsTransferCommand -Name $name) {
+                    # Unconditional transfer makes later top-level statements unreachable.
+                    return $false
+                }
+                if ([string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $true
+                }
+            }
+            continue
+        }
+
+        # Assignment: $x = Assert-X ...  (RHS must itself be a single-command pipeline)
+        if ($stmt -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            $rhs = $stmt.Right
+            if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                # PowerShell wraps assignment RHS expressions; pipeline RHS is nested.
+                if ($rhs.Expression -is [System.Management.Automation.Language.PipelineAst]) {
+                    $rhs = $rhs.Expression
+                } else {
+                    continue
+                }
+            }
+            if ($rhs -is [System.Management.Automation.Language.PipelineAst]) {
+                $elements = @($rhs.PipelineElements)
+                if ($elements.Count -eq 1 -and $elements[0] -is [System.Management.Automation.Language.CommandAst]) {
+                    $name = Get-CommandNameFromAst -CommandAst $elements[0]
+                    if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        return $true
+                    }
+                }
+            }
+            continue
+        }
+
+        # Any other top-level statement kinds (if/function/try/foreach/while/switch/etc.)
+        # are not accepted as hosting the verifier; their nested CommandAsts are ignored.
+    }
+
     return $false
 }
 
