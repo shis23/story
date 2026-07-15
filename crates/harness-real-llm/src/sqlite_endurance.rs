@@ -286,12 +286,17 @@ impl SqliteHarnessEnv {
 
     /// Full production-faithful write: user msg → pipeline → preaccept draft →
     /// fixed production postprocess → SQLite Accept.
+    ///
+    /// `summary_probe_id` is optional early-fact token material for inject turns.
+    /// When set, it is embedded only in the durable SQLite RoundSummary content so
+    /// later EarlyFactCheck can prove retrieval via `list_summaries` (no story body).
     pub async fn write_accept_turn(
         &self,
         conversation_id: &Id,
         intent: &str,
         turn_index: u32,
         row_id: &str,
+        summary_probe_id: Option<&str>,
     ) -> Result<SqliteTurnResult, String> {
         let campaign_id = self
             .active_campaign_id()
@@ -352,9 +357,16 @@ impl SqliteHarnessEnv {
         let variant_id = land.variant_id;
 
         // Deterministic production postprocess (shared service + SQLite sink).
-        let summary_text = Some(format!(
-            "endurance turn {turn_index} summary; probes remain non-secret fingerprints only"
-        ));
+        // Early-fact inject embeds the probe id in RoundSummary so later check turns
+        // can prove SQLite list_summaries retrieval without replaying story text.
+        let summary_text = Some(match summary_probe_id {
+            Some(pid) if !pid.trim().is_empty() => format!(
+                "endurance turn {turn_index} summary; early_fact_probe={pid}; fingerprints only"
+            ),
+            _ => format!(
+                "endurance turn {turn_index} summary; probes remain non-secret fingerprints only"
+            ),
+        });
         let proof = self
             .apply_production_postprocess_sqlite(SqlitePostprocessRequest {
                 campaign_id: &campaign_id,

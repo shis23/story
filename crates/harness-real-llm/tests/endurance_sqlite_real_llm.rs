@@ -307,6 +307,11 @@ async fn run_sqlite_endurance_stage(
             }
             _ => None,
         };
+        // Early-fact inject embeds the probe token in SQLite RoundSummary only.
+        let summary_probe_id = match &action {
+            ScheduledAction::EarlyFactInject { probe_id } => Some(probe_id.as_str()),
+            _ => None,
+        };
 
         const MAX_WRITE_ATTEMPTS: usize = 5;
         let mut written = None;
@@ -324,8 +329,14 @@ async fn run_sqlite_endurance_stage(
                     )
                     .await
                 } else {
-                    env.write_accept_turn(&conversation_id, &intent, turn_index, &row.row_id)
-                        .await
+                    env.write_accept_turn(
+                        &conversation_id,
+                        &intent,
+                        turn_index,
+                        &row.row_id,
+                        summary_probe_id,
+                    )
+                    .await
                 }
             };
             let result = match tokio::time::timeout(deadline.remaining()?, fut).await {
@@ -413,21 +424,27 @@ async fn run_sqlite_endurance_stage(
                 .map_err(EnduranceError::Writer)?;
             let reachable = contents.iter().any(|c| c.contains(probe_id))
                 || contents.iter().any(|c| c.contains(&short_hash16(probe_id)));
-            if reachable {
-                observed
-                    .observations
-                    .insert(harness_real_llm::coverage_ledger::ObservationKey::EarlyFactChecked);
-                observed.observations.insert(
-                    harness_real_llm::coverage_ledger::ObservationKey::CommandPath(
-                        "sqlite_runtime::list_summaries".into(),
-                    ),
-                );
-                observed.observations.insert(
-                    harness_real_llm::coverage_ledger::ObservationKey::ServicePath(
-                        "early_fact_check".into(),
-                    ),
-                );
+            if !reachable {
+                return Err(EnduranceError::Writer(format!(
+                    "early fact probe not reachable via sqlite list_summaries \
+                     (row={}, probe_hash={})",
+                    row.row_id,
+                    short_hash16(probe_id)
+                )));
             }
+            observed
+                .observations
+                .insert(harness_real_llm::coverage_ledger::ObservationKey::EarlyFactChecked);
+            observed.observations.insert(
+                harness_real_llm::coverage_ledger::ObservationKey::CommandPath(
+                    "sqlite_runtime::list_summaries".into(),
+                ),
+            );
+            observed.observations.insert(
+                harness_real_llm::coverage_ledger::ObservationKey::ServicePath(
+                    "early_fact_check".into(),
+                ),
+            );
         }
 
         ledger.record(observed.clone());
