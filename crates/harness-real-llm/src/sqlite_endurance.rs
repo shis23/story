@@ -503,34 +503,72 @@ impl SqliteHarnessEnv {
         self.conv_store.invalidate();
         let previous_variant_id = first_land.variant_id;
 
-        // Prefer a real character id for Subagent-only regenerate when possible.
+        // Subagent-only regenerate must target a character present in the just-landed
+        // draft provenance. Instance display names are not plan ids.
         let mut targets = targets;
         if targets
             .iter()
             .any(|t| matches!(t, PartialRollTarget::Subagent(_)))
         {
-            if let Some(inst) = sqlite_runtime::list_instances(&campaign_id)?
-                .into_iter()
-                .find(|i| !i.name.trim().is_empty())
-            {
-                // Subagent target is the character label used in Director plan tasks.
-                targets = vec![PartialRollTarget::Subagent(inst.name.clone())];
+            let plan_ids = self
+                .conv_store
+                .get(conversation_id)
+                .and_then(|c| {
+                    c.find_node(&previous_variant_id)
+                        .and_then(|n| n.active())
+                        .and_then(|v| v.provenance.clone())
+                })
+                .map(|p| {
+                    p.subagent_results
+                        .into_iter()
+                        .map(|s| s.character_id)
+                        .filter(|id| !id.trim().is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            targets = if let Some(id) = plan_ids.into_iter().next() {
+                vec![PartialRollTarget::Subagent(id)]
             } else {
-                targets = vec![PartialRollTarget::Editor];
-            }
+                // No subagent provenance: editor-only still exercises regenerate UoW.
+                vec![PartialRollTarget::Editor]
+            };
         }
 
         let regen_req = RegenerateRequest {
             conversation_id: conversation_id.clone(),
             node_id: previous_variant_id.clone(),
-            targets,
+            targets: targets.clone(),
             hint: Some(format!("endurance regenerate turn {turn_index}")),
             seed: None,
         };
-        let (regen_text, regen_provenance) = pipeline
-            .regenerate(regen_req, &ctx, event_tx, cancel_rx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let regen_result = pipeline
+            .regenerate(regen_req, &ctx, event_tx.clone(), cancel_rx.clone())
+            .await;
+        let (regen_text, regen_provenance) = match regen_result {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                // Fall back to full regenerate when partial target is invalid for this draft.
+                if msg.contains("不在旧 Plan")
+                    || msg.contains("PartialRoll")
+                    || msg.contains("部分重 roll")
+                {
+                    let fallback = RegenerateRequest {
+                        conversation_id: conversation_id.clone(),
+                        node_id: previous_variant_id.clone(),
+                        targets: Vec::new(),
+                        hint: Some(format!("endurance regenerate fallback turn {turn_index}")),
+                        seed: None,
+                    };
+                    pipeline
+                        .regenerate(fallback, &ctx, event_tx, cancel_rx)
+                        .await
+                        .map_err(|e2| format!("regenerate fallback after {msg}: {e2}"))?
+                } else {
+                    return Err(msg);
+                }
+            }
+        };
         if regen_text.trim().is_empty() {
             return Err("sqlite regenerate returned empty draft".into());
         }
