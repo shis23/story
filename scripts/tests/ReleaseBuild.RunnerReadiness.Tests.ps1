@@ -983,6 +983,31 @@ Describe 'Release offline evidence package verifier' {
         }
     }
 
+    It 'P0: rejects present manifest artifacts that have no staged subject/provenance coverage' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-art-uncovered-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            # Attack: add a second present artifact that is never staged/provenance-bound.
+            $extra = [pscustomobject]@{
+                relative_path = 'target/release/uncovered.exe'
+                size_bytes = 4
+                sha256 = ('e' * 64)
+                kind = 'windows-exe'
+                status = 'present'
+            }
+            $manifest.artifacts = @($manifest.artifacts) + @($extra)
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'uncovered|mapping|exact-set|artifact|source|missing|coverage|unmapped'
+            ($result.Errors -join ' ') | Should Match 'uncovered\.exe|target/release/uncovered'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'P1: each present staged_subject uniquely maps to one present artifact by source fields' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-map-{0}" -f [guid]::NewGuid().ToString('N'))
         try {
@@ -1348,6 +1373,23 @@ Describe 'Release workflow static governance (runner readiness)' {
         # Production android job must not pass -BuildApk (comment mentions are fine).
         $text | Should Not Match '(?m)^\s*[^#\r\n]*-BuildApk\b'
         $text | Should Match 'contents:\s*read'
+    }
+
+    It 'release-host-evidence both host jobs call full Assert-ReleaseEvidencePackage before upload' {
+        $wf = Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'
+        $text = Get-Content -LiteralPath $wf -Raw
+        # Full offline verifier, not only schema/manual rehash.
+        $text | Should Match 'Assert-ReleaseEvidencePackage'
+        # Must appear for both windows and android evidence jobs (two invocations).
+        $matches = [regex]::Matches($text, 'Assert-ReleaseEvidencePackage')
+        $matches.Count | Should BeGreaterThan 1
+        # Weak schema-only rehash loops must not remain as the sole verification path.
+        $text | Should Not Match '(?m)^\s*foreach \(\$subj in @\(\$prov\.subjects\)\)'
+        $gov = Assert-ReleaseWorkflowStaticContract -RepoRoot $RepoRoot
+        if (-not $gov.Valid) {
+            throw ("workflow static contract failed: {0}" -f ($gov.Errors -join '; '))
+        }
+        $gov.checks['full_offline_verifier'] | Should Be $true
     }
 }
 

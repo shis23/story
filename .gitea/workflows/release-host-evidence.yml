@@ -106,41 +106,16 @@ jobs:
           "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Evidence dir: $($latest.FullName)"
 
-      - name: Validate manifest schema and staged subjects
+      - name: Offline verify Windows evidence package (fail-closed)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
           $evidenceDir = '${{ steps.evidence.outputs.dir }}'
-          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
-          Assert-ReleaseManifestSchema -Manifest $manifest
-          $provPath = Join-Path $evidenceDir 'provenance.json'
-          if (-not (Test-Path -LiteralPath $provPath)) {
-            throw 'provenance.json missing from evidence package.'
-          }
-          $prov = Get-Content -LiteralPath $provPath -Raw | ConvertFrom-Json
-          $subjectsDir = Join-Path $evidenceDir 'subjects'
-          if ($manifest.build_status -eq 'ok') {
-            if (-not (Test-Path -LiteralPath $subjectsDir)) {
-              throw 'subjects/ directory missing from evidence package for build_status=ok.'
-            }
-            foreach ($subj in @($prov.subjects)) {
-              $path = Join-Path $evidenceDir ($subj.relative_path -replace '/', '\')
-              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-                throw "Subject missing from package: $($subj.relative_path)"
-              }
-              $sidecar = $path + '.sha256'
-              if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
-                throw "Hash sidecar missing for subject: $($subj.relative_path)"
-              }
-              $rehash = Get-ReleaseFileSha256 -Path $path
-              if ($rehash -ne $subj.sha256) {
-                throw "Offline rehash mismatch for $($subj.relative_path)"
-              }
-              Write-Host "Verified subject: $($subj.relative_path)"
-            }
-          }
-          Write-Host 'Manifest schema + subject offline verification passed.'
+          # Full offline verifier: staged↔provenance exact-set, artifact→staged
+          # reverse mapping, sidecar grammar, reparse rejection, recursive secret scan.
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+          Write-Host ("Full offline verification passed; subjects={0} build_status={1}" -f $result.subject_count, $result.build_status)
 
       - name: Upload Windows evidence (subjects + sidecars + manifest + provenance)
         uses: actions/upload-artifact@v4
@@ -201,18 +176,15 @@ jobs:
           }
           "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Validate Android manifest schema
+      - name: Offline verify Android evidence package (fail-closed)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
           $evidenceDir = '${{ steps.evidence.outputs.dir }}'
-          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
-          Assert-ReleaseManifestSchema -Manifest $manifest
-          if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'provenance.json'))) {
-            throw 'Android provenance.json missing from evidence package.'
-          }
-          Write-Host 'Android manifest schema validation passed.'
+          # Full offline verifier for Android host evidence before upload.
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+          Write-Host ("Full offline verification passed; subjects={0} build_status={1}" -f $result.subject_count, $result.build_status)
 
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4

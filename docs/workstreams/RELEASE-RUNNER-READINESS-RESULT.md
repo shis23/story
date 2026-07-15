@@ -250,8 +250,22 @@ Further P0 hardening:
    `sha256sum` line (`^[0-9a-f]{64} \*<basename>$`). Hash-only, multi-line, and
    path-bearing basenames fail closed.
 
-Full suite after this pass: **136** Pester tests passed
-(37 + 14 + 31 + 54). Windows/Android dry-runs exit 0. `git diff --check` clean.
+### P0 reverse artifact coverage + full workflow offline verifier
+
+1. **Reverse exact-set:** every present `manifest.artifact` must be uniquely
+   covered by a staged subject (`source_relative_path` mapping). Adding an
+   uncovered present artifact (e.g. `target/release/uncovered.exe`) fails closed
+   even if staged↔provenance already match.
+2. **Remote workflow gate:** both `windows-host-evidence` and
+   `android-host-evidence` jobs call `Assert-ReleaseEvidencePackage` before
+   upload. Weak schema/manual rehash-only loops are removed so mapping, sidecar
+   grammar, reparse rejection, and recursive secret scan cannot be bypassed.
+3. **Static contract:** `Assert-ReleaseWorkflowStaticContract` checks
+   `full_offline_verifier` (≥2 `Assert-ReleaseEvidencePackage` calls; no
+   provenance subject foreach rehash loop).
+
+Full suite after this pass: **138** Pester tests passed
+(37 + 14 + 31 + 56). Windows/Android dry-runs exit 0. `git diff --check` clean.
 
 ## Risks / follow-ups
 

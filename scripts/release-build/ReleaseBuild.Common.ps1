@@ -2696,6 +2696,20 @@ function Test-ReleaseEvidencePackage {
             }
         }
 
+        # Reverse exact-set: every present artifact must be covered by exactly one
+        # staged subject (and therefore by provenance once staged↔prov binding holds).
+        foreach ($srcKey in @($artifactBySource.Keys)) {
+            if (-not $mappedSources.ContainsKey($srcKey)) {
+                Add-SafeEvidenceError -Message ("present manifest artifact has no staged subject/provenance coverage: {0}" -f (Protect-ReleasePath -Text $srcKey -RepoRoot $evidenceRoot))
+            }
+        }
+        if ($presentArtifacts.Count -gt 0 -and $stagedSubjects.Count -ne $presentArtifacts.Count) {
+            # Count mismatch is an additional fail-closed signal when uniqueness held.
+            if ($mappedSources.Count -ne $presentArtifacts.Count -or $mappedSources.Count -ne $stagedSubjects.Count) {
+                Add-SafeEvidenceError -Message ("exact-set artifact/staged coverage count mismatch: present_artifacts={0} staged_subjects={1} mapped={2}." -f $presentArtifacts.Count, $stagedSubjects.Count, $mappedSources.Count)
+            }
+        }
+
         $stagedKeySet = @{}
         $provKeySet = @{}
 
@@ -2826,6 +2840,7 @@ function Assert-ReleaseWorkflowStaticContract {
         artifact_retention = $false
         host_only_default = $false
         real_yaml_parser_required = $false
+        full_offline_verifier = $false
     }
     $errors = New-Object System.Collections.Generic.List[string]
 
@@ -2902,8 +2917,19 @@ function Assert-ReleaseWorkflowStaticContract {
         if (-not $hostOnly) {
             $errors.Add('release-host-evidence must default to host-only (skip_bundle=true, no -BuildApk).') | Out-Null
         }
+
+        # Both host jobs must call the full offline verifier before upload.
+        $assertMatches = [regex]::Matches($hostText, 'Assert-ReleaseEvidencePackage')
+        $hasWindowsJob = ($hostText -match 'windows-host-evidence')
+        $hasAndroidJob = ($hostText -match 'android-host-evidence')
+        $fullVerifier = ($assertMatches.Count -ge 2) -and $hasWindowsJob -and $hasAndroidJob -and ($hostText -notmatch '(?m)^\s*foreach \(\$subj in @\(\$prov\.subjects\)\)')
+        $checks['full_offline_verifier'] = $fullVerifier
+        if (-not $fullVerifier) {
+            $errors.Add('release-host-evidence windows and android jobs must call Assert-ReleaseEvidencePackage before upload (no weak schema/manual rehash-only path).') | Out-Null
+        }
     } else {
         $errors.Add('release-host-evidence.yml is missing.') | Out-Null
+        $checks['full_offline_verifier'] = $false
     }
 
     $ciWf = Join-Path $workflowDir 'ci-gates.yml'
