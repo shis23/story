@@ -541,6 +541,9 @@ pub struct PipelineOrchestrator {
     /// A1：连接级采样参数（含 reasoning 模式），从 active connection 注入。
     /// None = 用 Default（reasoning=Disabled）。
     sampling: Option<storyforge_domain::llm::SamplingParams>,
+    /// When true, generation returns text/provenance without durable conversation
+    /// writes. Callers (SQLite pre-accept UoW) own the atomic land point.
+    defer_conversation_land: bool,
 }
 
 impl PipelineOrchestrator {
@@ -585,7 +588,20 @@ impl PipelineOrchestrator {
             pending_temporary_instances: Vec::new(),
             mvu_runtime,
             sampling,
+            defer_conversation_land: false,
         }
+    }
+
+    /// Defer durable conversation writes so a higher-level UoW can land the draft.
+    ///
+    /// Default remains false (pipeline lands via ConversationStore). SQLite
+    /// pre-accept production path sets this so generation and persistence split.
+    pub fn set_defer_conversation_land(&mut self, defer: bool) {
+        self.defer_conversation_land = defer;
+    }
+
+    pub fn defer_conversation_land(&self) -> bool {
+        self.defer_conversation_land
     }
 
     pub fn new_with_prompt_hook(
@@ -1026,14 +1042,20 @@ impl PipelineOrchestrator {
             effective_runtime_for_prov.as_deref(),
         );
 
-        // 写入对话树
-        let node_id = match self.conv_store.append_ai_draft(
-            &ctx.conversation_id,
-            final_text.clone(),
-            Some(provenance.clone()),
-        ) {
-            Ok(id) => id,
-            Err(e) => return Err(self.abort_with(&event_tx, PipelineError::Conversation(e))),
+        // 写入对话树（可 defer：SQLite pre-accept UoW 拥有原子落点）
+        let node_id = if self.defer_conversation_land {
+            // Provisional id only; caller must land via create_draft_attempt and
+            // use the authoritative variant_id from that UoW outcome.
+            Id::new()
+        } else {
+            match self.conv_store.append_ai_draft(
+                &ctx.conversation_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            ) {
+                Ok(id) => id,
+                Err(e) => return Err(self.abort_with(&event_tx, PipelineError::Conversation(e))),
+            }
         };
 
         self.state = PipelineState::Committed;
@@ -2006,27 +2028,32 @@ impl PipelineOrchestrator {
         // - 重 roll **中间**消息 → add_variant（保留旧版，开分支）
         // 后端按 nodes.last() 实时判定，避免前端 isLast 标志脏数据。
         // 用户可继续重 roll 产生多个版本，用 variant 切换按钮对比，满意后 accept。
-        let is_last_ai = self
-            .conv_store
-            .is_last_assistant_node(&req.conversation_id, &req.node_id)
-            .map_err(|e| self.abort_with(&event_tx, PipelineError::Conversation(e)))?;
-        let land = if is_last_ai {
-            self.conv_store.replace_active_variant(
-                &req.conversation_id,
-                &req.node_id,
-                final_text.clone(),
-                Some(provenance.clone()),
-            )
-        } else {
-            self.conv_store.add_variant(
-                &req.conversation_id,
-                &req.node_id,
-                final_text.clone(),
-                Some(provenance.clone()),
-            )
-        };
-        if let Err(e) = land {
-            return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
+        //
+        // defer_conversation_land：跳过 ConversationStore 写入，由 SQLite
+        // pre-accept UoW（append_regenerate_attempt / sync_autofix）原子落盘。
+        if !self.defer_conversation_land {
+            let is_last_ai = self
+                .conv_store
+                .is_last_assistant_node(&req.conversation_id, &req.node_id)
+                .map_err(|e| self.abort_with(&event_tx, PipelineError::Conversation(e)))?;
+            let land = if is_last_ai {
+                self.conv_store.replace_active_variant(
+                    &req.conversation_id,
+                    &req.node_id,
+                    final_text.clone(),
+                    Some(provenance.clone()),
+                )
+            } else {
+                self.conv_store.add_variant(
+                    &req.conversation_id,
+                    &req.node_id,
+                    final_text.clone(),
+                    Some(provenance.clone()),
+                )
+            };
+            if let Err(e) = land {
+                return Err(self.abort_with(&event_tx, PipelineError::Conversation(e)));
+            }
         }
 
         self.state = PipelineState::Committed;

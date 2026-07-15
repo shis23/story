@@ -48,6 +48,9 @@ use storyforge_domain::preset::{
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
+use storyforge_infra_sqlite::preaccept::{
+    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest, RegenerateAttemptRequest,
+};
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
 use storyforge_infra_regex::{
     RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
@@ -844,14 +847,20 @@ impl AppState {
         });
         // A1：从活跃连接注入采样参数（含 reasoning 模式 + extra 扩展字段）
         let sampling = get_conn_store().active_connection().map(|conn| conn.params);
-        PipelineOrchestrator::new_with_sampling(
+        let mut pipeline = PipelineOrchestrator::new_with_sampling(
             llm,
             self.conv_store.clone(),
             Arc::new(tool_ctx),
             mvu_rt,
             prompt_hook,
             sampling,
-        )
+        );
+        // SQLite pre-accept UoW owns the atomic conversation+attempt land point.
+        // Pipeline generation returns text/provenance without durable ConversationStore writes.
+        if sqlite_runtime::is_sqlite_active() {
+            pipeline.set_defer_conversation_land(true);
+        }
+        pipeline
     }
 }
 
@@ -2558,45 +2567,83 @@ async fn start_writing(
     // auto-fix 可能改写正文：命令返回值必须用修复后的 final_text，
     // 不能再回退到 pipeline 原始 result 里的原稿。
     let mut response_text: Option<String> = None;
-    if let Ok((final_text, draft_node_id, _)) = &result {
+    if let Ok((final_text, draft_node_id, provenance)) = &result {
         // Phase A: 成文后创建 TurnAttempt 并更新 TurnRecord → DraftReady。
+        // SQLite opt-in: atomic preaccept UoW (conversation + attempt + outbox).
+        // JSON default: pipeline already landed the draft; attach attempt separately.
         // 注意：本地 turn_record 快照不含新 Attempt，必须捕获 attempt_id 给后续写回。
+        let mut landed_draft_node_id = draft_node_id.clone();
         let created_attempt_id = if let Some(ref turn) = turn_record {
             let attempt_id = Id::new();
             let temps = pipeline.pending_temporary_instances().to_vec();
-            let attempt = turn_lifecycle::new_draft_attempt(
-                attempt_id.clone(),
-                draft_node_id.clone(),
-                final_text,
-                temps,
-            );
-            // A.1/P0-4：Attempt 创建失败必须传播，并补偿软删无主 Draft
-            if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                record.attempts.push(attempt);
-                record.status = storyforge_domain::turn::TurnStatus::DraftReady;
-                record.touch();
-            }) {
-                if let Err(comp_e) = app
-                    .conv_store
-                    .soft_delete_variant(&conversation_id, draft_node_id)
-                {
-                    tracing::error!(
-                        "P0-4 补偿失败: soft_delete 无主 Draft {} 失败: {comp_e}（原错误: {e}）",
-                        draft_node_id
-                    );
+            if sqlite_runtime::is_sqlite_active() {
+                let campaign_id = ctx.campaign_id.as_ref().ok_or_else(|| {
+                    TauriCommandError::internal(
+                        "sqlite preaccept draft requires campaign_id".to_string(),
+                    )
+                })?;
+                match sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+                    campaign_id,
+                    conversation_id: &conversation_id,
+                    turn_id: &turn.turn_id,
+                    attempt_id: &attempt_id,
+                    draft_text: final_text,
+                    pending_temporary_instances: temps,
+                    provenance: provenance.clone(),
+                }) {
+                    Ok(outcome) => {
+                        landed_draft_node_id = outcome.variant_id;
+                        app.conv_store.invalidate();
+                        Some(outcome.attempt_id)
+                    }
+                    Err(e) => {
+                        let _ = update_turn_record(&turn.turn_id, |record| {
+                            record.status = storyforge_domain::turn::TurnStatus::Failed;
+                            record.failure_reason =
+                                Some(format!("sqlite preaccept draft 失败: {e}"));
+                            record.touch();
+                        });
+                        clear_current_cancel_if(&app, &operation_id);
+                        return Err(TauriCommandError::internal(format!(
+                            "sqlite preaccept draft 失败: {e}"
+                        )));
+                    }
                 }
-                // Turn 标 Failed，避免屏障卡死后续写作
-                let _ = update_turn_record(&turn.turn_id, |record| {
-                    record.status = storyforge_domain::turn::TurnStatus::Failed;
-                    record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
+            } else {
+                let attempt = turn_lifecycle::new_draft_attempt(
+                    attempt_id.clone(),
+                    draft_node_id.clone(),
+                    final_text,
+                    temps,
+                );
+                // A.1/P0-4：Attempt 创建失败必须传播，并补偿软删无主 Draft
+                if let Err(e) = update_turn_record(&turn.turn_id, |record| {
+                    record.attempts.push(attempt);
+                    record.status = storyforge_domain::turn::TurnStatus::DraftReady;
                     record.touch();
-                });
-                clear_current_cancel_if(&app, &operation_id);
-                return Err(TauriCommandError::internal(format!(
-                    "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
-                )));
+                }) {
+                    if let Err(comp_e) = app
+                        .conv_store
+                        .soft_delete_variant(&conversation_id, draft_node_id)
+                    {
+                        tracing::error!(
+                            "P0-4 补偿失败: soft_delete 无主 Draft {} 失败: {comp_e}（原错误: {e}）",
+                            draft_node_id
+                        );
+                    }
+                    // Turn 标 Failed，避免屏障卡死后续写作
+                    let _ = update_turn_record(&turn.turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Failed;
+                        record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
+                        record.touch();
+                    });
+                    clear_current_cancel_if(&app, &operation_id);
+                    return Err(TauriCommandError::internal(format!(
+                        "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
+                    )));
+                }
+                Some(attempt_id)
             }
-            Some(attempt_id)
         } else {
             None
         };
@@ -2620,11 +2667,12 @@ async fn start_writing(
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
+        // SQLite: use the authoritative landed variant id (not the provisional pipeline id).
         let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
             final_text,
             QualityAutofixCtx {
                 pipeline: &mut pipeline,
-                draft_node_id,
+                draft_node_id: &landed_draft_node_id,
                 conversation_id: &conversation_id,
                 writing_ctx: &ctx,
                 event_tx: &event_tx,
@@ -2665,6 +2713,9 @@ async fn start_writing(
                     "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
             }
+            if sqlite_runtime::is_sqlite_active() {
+                app.conv_store.invalidate();
+            }
         }
 
         // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
@@ -2696,12 +2747,13 @@ async fn start_writing(
         // Defer clear_current_cancel to the spawn completion path below.
         // Skip the normal clear for the success path with background postprocess.
         match result {
-            Ok((orig_text, node_id, _provenance)) => {
+            Ok((orig_text, _provisional_node_id, _provenance)) => {
                 let text = prefer_autofix_response_text(response_text, orig_text);
+                // Prefer the authoritative landed variant id (SQLite UoW may replace provisional).
                 return Ok(serde_json::json!({
                     "text": text,
                     "conversation_id": conversation_id.to_string(),
-                    "node_id": node_id.to_string(),
+                    "node_id": landed_draft_node_id.to_string(),
                 }));
             }
             Err(e) => {
@@ -2783,6 +2835,60 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         use production_postprocess::ProductionPostprocessError;
         use storyforge_domain::turn::{AttemptStatus, TurnStatus};
 
+        if sqlite_runtime::is_sqlite_active() {
+            // Typed pre-validation against the authoritative SQLite turn before UoW.
+            let turn = sqlite_runtime::get_turn(&identity.turn_id)
+                .map_err(ProductionPostprocessError::AutofixSync)?
+                .ok_or_else(|| ProductionPostprocessError::AttemptMissing {
+                    turn_id: identity.turn_id.to_string(),
+                    attempt_id: identity.attempt_id.to_string(),
+                })?;
+            if turn.campaign_id != identity.campaign_id {
+                return Err(ProductionPostprocessError::ScopeMismatch {
+                    field: "campaign_id",
+                    expected: identity.campaign_id.to_string(),
+                    actual: turn.campaign_id.to_string(),
+                });
+            }
+            if turn.conversation_id != identity.conversation_id {
+                return Err(ProductionPostprocessError::ScopeMismatch {
+                    field: "conversation_id",
+                    expected: identity.conversation_id.to_string(),
+                    actual: turn.conversation_id.to_string(),
+                });
+            }
+            if turn.find_attempt(&identity.attempt_id).is_none() {
+                return Err(ProductionPostprocessError::AttemptMissing {
+                    turn_id: identity.turn_id.to_string(),
+                    attempt_id: identity.attempt_id.to_string(),
+                });
+            }
+            let writable = matches!(
+                turn.status,
+                TurnStatus::DraftReady | TurnStatus::DerivingState
+            ) && turn
+                .find_attempt(&identity.attempt_id)
+                .is_some_and(|attempt| {
+                    matches!(
+                        attempt.status,
+                        AttemptStatus::DraftReady | AttemptStatus::DerivingState
+                    )
+                });
+            if !writable {
+                // Concurrent supersede / late status: durable zero-write, non-fatal.
+                return Ok(());
+            }
+            return sqlite_runtime::sync_autofix(AutofixSyncRequest {
+                campaign_id: &identity.campaign_id,
+                conversation_id: &identity.conversation_id,
+                turn_id: &identity.turn_id,
+                attempt_id: &identity.attempt_id,
+                final_text,
+                quality_report: report,
+            })
+            .map_err(ProductionPostprocessError::AutofixSync);
+        }
+
         // Capture typed validation under the same conditional durable mutation.
         let mut precondition: Option<ProductionPostprocessError> = None;
         let mut not_writable = false;
@@ -2855,6 +2961,22 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         batch: Option<storyforge_domain::turn::MutationBatch>,
         derivation: storyforge_domain::turn::DerivationComponents,
     ) -> Result<bool, String> {
+        if sqlite_runtime::is_sqlite_active() {
+            use storyforge_infra_sqlite::preaccept::PostprocessApplyOutcome;
+            return match sqlite_runtime::apply_postprocess(PostprocessApplyRequest {
+                campaign_id: &identity.campaign_id,
+                conversation_id: &identity.conversation_id,
+                turn_id: &identity.turn_id,
+                attempt_id: &identity.attempt_id,
+                batch,
+                derivation,
+            })? {
+                PostprocessApplyOutcome::Applied | PostprocessApplyOutcome::AlreadyApplied => {
+                    Ok(true)
+                }
+                PostprocessApplyOutcome::SkippedLate => Ok(false),
+            };
+        }
         update_turn_record_if(
             &identity.turn_id,
             |record| {
@@ -5284,47 +5406,81 @@ async fn regenerate(
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
     // auto-fix 后命令返回值必须是修复稿，且 Attempt.draft_hash 必须同步。
     let mut response_text: Option<String> = None;
-    if let Ok((text, _provenance)) = &result {
+    if let Ok((text, provenance)) = &result {
         // Phase A: regenerate 创建新 TurnAttempt,旧 Attempt Superseded
         // regenerate 的 replace_active_variant 改变了 node_id 的 active variant,
         // 新 variant 在同一 node 上,用 req 的 node_id 作为 variant_id
+        // SQLite: atomic preaccept UoW owns conversation + attempt land.
         let regen_attempt_id = if let Some(campaign_id) = &ctx.campaign_id {
             if let Some(turn) =
                 get_active_turn_for_backend(campaign_id).map_err(TauriCommandError::internal)?
             {
-                let new_attempt = turn_lifecycle::new_draft_attempt(
-                    Id::new(),
-                    node_id.clone(),
-                    text,
-                    pipeline.pending_temporary_instances().to_vec(),
-                );
-                let new_attempt_id = new_attempt.attempt_id.clone();
-                // P0-4：regenerate Attempt 落盘失败不能吞掉，否则后处理会把 Turn
-                // 推到 AwaitingAcceptance 却找不到 Attempt，形成无法 accept 的死锁。
-                if let Err(e) = update_turn_record(&turn.turn_id, |record| {
-                    turn_lifecycle::append_regenerate_attempt(record, new_attempt);
-                }) {
-                    if let Err(comp_e) = app
-                        .conv_store
-                        .soft_delete_variant(&conversation_id, &node_id)
-                    {
-                        tracing::error!(
-                            "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
-                            node_id
-                        );
+                let new_attempt_id = Id::new();
+                if sqlite_runtime::is_sqlite_active() {
+                    match sqlite_runtime::append_regenerate_attempt(RegenerateAttemptRequest {
+                        campaign_id,
+                        conversation_id: &conversation_id,
+                        turn_id: &turn.turn_id,
+                        previous_variant_id: &node_id,
+                        attempt_id: &new_attempt_id,
+                        draft_text: text,
+                        pending_temporary_instances: pipeline
+                            .pending_temporary_instances()
+                            .to_vec(),
+                        provenance: Some(provenance.clone()),
+                    }) {
+                        Ok(outcome) => {
+                            app.conv_store.invalidate();
+                            Some(outcome.attempt_id)
+                        }
+                        Err(e) => {
+                            let _ = update_turn_record(&turn.turn_id, |record| {
+                                record.status = storyforge_domain::turn::TurnStatus::Failed;
+                                record.failure_reason =
+                                    Some(format!("sqlite preaccept regenerate 失败: {e}"));
+                                record.touch();
+                            });
+                            clear_current_cancel_if(&app, &operation_id);
+                            return Err(TauriCommandError::internal(format!(
+                                "sqlite preaccept regenerate 失败: {e}"
+                            )));
+                        }
                     }
-                    let _ = update_turn_record(&turn.turn_id, |record| {
-                        record.status = storyforge_domain::turn::TurnStatus::Failed;
-                        record.failure_reason =
-                            Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
-                        record.touch();
-                    });
-                    clear_current_cancel_if(&app, &operation_id);
-                    return Err(TauriCommandError::internal(format!(
-                        "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
-                    )));
+                } else {
+                    let new_attempt = turn_lifecycle::new_draft_attempt(
+                        new_attempt_id,
+                        node_id.clone(),
+                        text,
+                        pipeline.pending_temporary_instances().to_vec(),
+                    );
+                    let new_attempt_id = new_attempt.attempt_id.clone();
+                    // P0-4：regenerate Attempt 落盘失败不能吞掉，否则后处理会把 Turn
+                    // 推到 AwaitingAcceptance 却找不到 Attempt，形成无法 accept 的死锁。
+                    if let Err(e) = update_turn_record(&turn.turn_id, |record| {
+                        turn_lifecycle::append_regenerate_attempt(record, new_attempt);
+                    }) {
+                        if let Err(comp_e) = app
+                            .conv_store
+                            .soft_delete_variant(&conversation_id, &node_id)
+                        {
+                            tracing::error!(
+                                "P0-4 regenerate 补偿失败: soft_delete node {} 失败: {comp_e}（原错误: {e}）",
+                                node_id
+                            );
+                        }
+                        let _ = update_turn_record(&turn.turn_id, |record| {
+                            record.status = storyforge_domain::turn::TurnStatus::Failed;
+                            record.failure_reason =
+                                Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
+                            record.touch();
+                        });
+                        clear_current_cancel_if(&app, &operation_id);
+                        return Err(TauriCommandError::internal(format!(
+                            "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
+                        )));
+                    }
+                    Some(new_attempt_id)
                 }
-                Some(new_attempt_id)
             } else {
                 None
             }
@@ -5406,6 +5562,9 @@ async fn regenerate(
                 return Err(TauriCommandError::internal(format!(
                     "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
+            }
+            if sqlite_runtime::is_sqlite_active() {
+                app.conv_store.invalidate();
             }
         }
 
@@ -6281,6 +6440,32 @@ fn edit_variant(
 ) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
     let nid = Id::from_str(&node_id);
+
+    // SQLite opt-in: atomic edit + Stale via preaccept UoW when a live Attempt is linked.
+    if sqlite_runtime::is_sqlite_active() {
+        if let Some(turn) =
+            get_turn_by_variant_for_backend(&nid).map_err(TauriCommandError::internal)?
+            && let Some(att) = turn.find_attempt_by_variant(&nid)
+        {
+            sqlite_runtime::mark_stale_after_edit(
+                &turn.campaign_id,
+                &turn.conversation_id,
+                &turn.turn_id,
+                &att.attempt_id,
+                &new_content,
+            )
+            .map_err(TauriCommandError::internal)?;
+            state.conv_store.invalidate();
+            return Ok(());
+        }
+        // No linked Attempt: plain conversation edit only (still SQLite-backed store).
+        state
+            .conv_store
+            .edit_variant(&conv_id, &nid, new_content)
+            .map_err(|e| TauriCommandError::internal(e.to_string()))?;
+        return Ok(());
+    }
+
     state
         .conv_store
         .edit_variant(&conv_id, &nid, new_content)

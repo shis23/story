@@ -14,6 +14,11 @@ use storyforge_domain::campaign::Campaign;
 use storyforge_domain::conversation::Conversation;
 use storyforge_domain::turn::{AttemptStatus, QualitySeverity, TurnRecord, TurnStatus};
 use storyforge_infra_sqlite::Database;
+use storyforge_infra_sqlite::preaccept::{
+    AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyOutcome,
+    PostprocessApplyRequest, PreacceptOutboxRow, PreacceptRecoverySnapshot,
+    RegenerateAttemptRequest, SqlitePreacceptRepository,
+};
 use storyforge_infra_sqlite::production::{
     AcceptOutcome as SqliteAcceptOutcome, AcceptTurnRequest, SqliteProductionRepository,
     compute_draft_hash,
@@ -463,10 +468,85 @@ pub fn accept_by_variant(
     })
 }
 
-/// SQLite startup recovery: fail incomplete pipeline turns. Accept is atomic,
-/// so there is no multi-file Committing journal to replay.
+/// SQLite startup recovery: fail incomplete pre-accept turns (outbox-aware),
+/// then fail any remaining Committing turns via production recovery.
 pub fn recover_turns_on_startup() -> Result<usize, String> {
     with_db_mut(|db| {
-        SqliteProductionRepository::fail_incomplete_turns(db).map_err(|e| e.to_string())
+        let preaccept =
+            SqlitePreacceptRepository::fail_incomplete_preaccept(db).map_err(|e| e.to_string())?;
+        let production =
+            SqliteProductionRepository::fail_incomplete_turns(db).map_err(|e| e.to_string())?;
+        Ok(preaccept + production)
+    })
+}
+
+// ─── Pre-accept lifecycle gateway (shared by Tauri + harness) ──────────────
+
+/// Atomic first-draft land: conversation AI node + Turn/Attempt DraftReady + outbox.
+pub fn create_draft_attempt(
+    request: DraftAttemptRequest<'_>,
+) -> Result<DraftAttemptOutcome, String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::create_draft_attempt(db, request).map_err(|e| e.to_string())
+    })
+}
+
+/// Atomic autofix land: conversation content + attempt draft_hash/quality_report + outbox.
+pub fn sync_autofix(request: AutofixSyncRequest<'_>) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::sync_autofix(db, request).map_err(|e| e.to_string())
+    })
+}
+
+/// Atomic postprocess land: MutationBatch/derivation/AwaitingAcceptance + outbox.
+pub fn apply_postprocess(
+    request: PostprocessApplyRequest<'_>,
+) -> Result<PostprocessApplyOutcome, String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::apply_postprocess(db, request).map_err(|e| e.to_string())
+    })
+}
+
+/// Atomic regenerate land: supersede old attempt, new draft variant, new Attempt, outbox.
+pub fn append_regenerate_attempt(
+    request: RegenerateAttemptRequest<'_>,
+) -> Result<DraftAttemptOutcome, String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::append_regenerate_attempt(db, request).map_err(|e| e.to_string())
+    })
+}
+
+/// Atomic edit-stale: conversation content + Attempt=Stale + outbox.
+pub fn mark_stale_after_edit(
+    campaign_id: &Id,
+    conversation_id: &Id,
+    turn_id: &Id,
+    attempt_id: &Id,
+    new_content: &str,
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqlitePreacceptRepository::mark_stale_after_edit(
+            db,
+            campaign_id,
+            conversation_id,
+            turn_id,
+            attempt_id,
+            new_content,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+pub fn list_preaccept_outbox_for_turn(turn_id: &Id) -> Result<Vec<PreacceptOutboxRow>, String> {
+    with_db(|db| {
+        SqlitePreacceptRepository::list_outbox_for_turn(db, turn_id).map_err(|e| e.to_string())
+    })
+}
+
+pub fn recover_active_preaccept_state(
+    campaign_id: &Id,
+) -> Result<PreacceptRecoverySnapshot, String> {
+    with_db(|db| {
+        SqlitePreacceptRepository::recover_active_state(db, campaign_id).map_err(|e| e.to_string())
     })
 }
