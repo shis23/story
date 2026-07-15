@@ -25,6 +25,7 @@ pub mod commit_probe;
 pub mod context_compile_bench;
 pub mod endurance;
 pub mod evidence;
+pub mod evidence_retention;
 pub mod long_session;
 pub mod observability;
 pub mod phase_b_matrix;
