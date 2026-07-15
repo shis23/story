@@ -251,6 +251,7 @@ fn v1_and_v2_databases_upgrade_to_v3_publication_schema() {
     let mut db = Database::open_in_memory().unwrap();
     let migrations = builtin_migrations();
     assert!(migrations.iter().any(|m| m.version == 3));
+    assert!(migrations.iter().any(|m| m.version == 4));
 
     // V1 only
     let v1 = migrations.iter().find(|m| m.version == 1).unwrap().clone();
@@ -262,9 +263,9 @@ fn v1_and_v2_databases_upgrade_to_v3_publication_schema() {
         )
         .unwrap();
 
-    // Upgrade through V2 and V3
-    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3]);
-    assert_eq!(current_version(&db).unwrap(), 3);
+    // Upgrade through V2, V3, and V4
+    assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4]);
+    assert_eq!(current_version(&db).unwrap(), 4);
     let cards: i64 = db
         .connection()
         .query_row(
@@ -274,7 +275,11 @@ fn v1_and_v2_databases_upgrade_to_v3_publication_schema() {
         )
         .unwrap();
     assert_eq!(cards, 1);
-    for table in ["mutation_commits", "chronicle_publication_jobs"] {
+    for table in [
+        "mutation_commits",
+        "chronicle_publication_jobs",
+        "preaccept_outbox",
+    ] {
         let exists: i64 = db
             .connection()
             .query_row(
@@ -292,7 +297,7 @@ fn publication_seed_survives_v3_and_job_table_is_empty_until_publish() {
     let dir = TempDir::new().unwrap();
     let mut db = Database::open(dir.path().join("db.sqlite3")).unwrap();
     migrate(&mut db).unwrap();
-    assert_eq!(current_version(&db).unwrap(), 3);
+    assert_eq!(current_version(&db).unwrap(), 4);
 
     let mut campaign = Campaign::new(Id::from_str("card"), "Jobs");
     campaign.id = Id::from_str("camp-jobs");
@@ -378,7 +383,7 @@ fn backup_uses_unique_paths_and_backup_db_schema_version() {
 
     let backup_db = Database::open(&first.backup_db_path).unwrap();
     assert_eq!(current_version(&backup_db).unwrap(), first.schema_version);
-    assert_eq!(first.schema_version, 3);
+    assert_eq!(first.schema_version, 4);
 }
 
 #[test]

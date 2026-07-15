@@ -302,11 +302,11 @@ mod tests {
     #[test]
     fn diagnostics_omit_paths_and_secrets() {
         let pinned = PinnedBackend::new(StorageBackend::Sqlite, BackendSource::Env);
-        let diag = BackendDiagnostics::from_pinned(&pinned, Some(3));
+        let diag = BackendDiagnostics::from_pinned(&pinned, Some(4));
         let json = serde_json::to_string(&diag).unwrap();
         assert!(json.contains("\"backend\":\"sqlite\""));
         assert!(json.contains("\"source\":\"env\""));
-        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"schema_version\":4"));
         // No Windows drive letters (C:\), no user paths, no temp dirs.
         assert!(!json.contains("C:\\"));
         assert!(!json.contains("/tmp/"));
