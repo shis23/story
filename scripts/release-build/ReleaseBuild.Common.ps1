@@ -1707,3 +1707,594 @@ function Test-ReleaseWorkflowSyntax {
         Engine     = 'none'
     }
 }
+
+function Get-ReleaseRunnerToolPresence {
+    <#
+    .SYNOPSIS
+    Discovers local tools required by release runners and workflow syntax gates.
+    #>
+    param(
+        [hashtable]$Overrides
+    )
+
+    $presence = [ordered]@{
+        cargo         = $false
+        rustc         = $false
+        'npm.cmd'     = $false
+        node          = $false
+        python        = $false
+        pyyaml        = $false
+        'cargo-tauri' = $false
+    }
+
+    if ($null -ne $Overrides) {
+        foreach ($key in $Overrides.Keys) {
+            $presence[[string]$key] = [bool]$Overrides[$key]
+        }
+        return [hashtable]$presence
+    }
+
+    $presence['cargo'] = [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+    $presence['rustc'] = [bool](Get-Command rustc -ErrorAction SilentlyContinue)
+    $presence['npm.cmd'] = [bool](Get-Command npm.cmd -ErrorAction SilentlyContinue)
+    if (-not $presence['npm.cmd']) {
+        $presence['npm.cmd'] = [bool](Get-Command npm -ErrorAction SilentlyContinue)
+    }
+    $presence['node'] = [bool](Get-Command node -ErrorAction SilentlyContinue)
+
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) {
+        $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    $presence['python'] = [bool]$pythonCmd
+    if ($pythonCmd) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & $pythonCmd.Source -c "import yaml" 2>$null
+            $presence['pyyaml'] = ($LASTEXITCODE -eq 0)
+        } catch {
+            $presence['pyyaml'] = $false
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & cargo tauri --version 2>$null
+        $presence['cargo-tauri'] = ($LASTEXITCODE -eq 0)
+    } catch {
+        $presence['cargo-tauri'] = $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    return [hashtable]$presence
+}
+
+function Test-ReleaseRunnerPreflight {
+    <#
+    .SYNOPSIS
+    Local fail-closed preflight for Gitea/host release runners.
+
+    .DESCRIPTION
+    Produces a machine-readable readiness report distinguishing host-only
+    readiness, missing dependencies, and explicit bundle/APK authorization.
+    Never claims GUI, device, or remote CI evidence. Paths and secrets are
+    redacted from the report.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('windows-host', 'android-host', 'ci-gates')]
+        [string]$Profile,
+
+        [string]$RepoRoot,
+
+        [hashtable]$ToolPresence,
+
+        [switch]$RequireBundle,
+        [switch]$RequireApk,
+        [switch]$FailClosed
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+        $RepoRoot = Find-ReleaseRepoRoot
+    } else {
+        $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).ProviderPath
+    }
+
+    $tools = Get-ReleaseRunnerToolPresence -Overrides $ToolPresence
+    $missing = New-Object System.Collections.Generic.List[string]
+    $notes = New-Object System.Collections.Generic.List[string]
+
+    $required = @('cargo', 'rustc', 'npm.cmd', 'node')
+    if ($Profile -eq 'ci-gates') {
+        $required = @('cargo', 'rustc', 'npm.cmd', 'node', 'python', 'pyyaml')
+    }
+
+    foreach ($name in $required) {
+        if (-not [bool]$tools[$name]) {
+            $missing.Add($name) | Out-Null
+        }
+    }
+
+    if ($RequireBundle) {
+        if (-not [bool]$tools['cargo-tauri']) {
+            $missing.Add('cargo-tauri') | Out-Null
+        }
+    }
+
+    if ($RequireApk) {
+        $androidIssues = @(Get-ReleaseAndroidBuildPathIssues)
+        foreach ($issue in $androidIssues) {
+            if ($issue -match 'ANDROID_HOME') {
+                $missing.Add('ANDROID_HOME') | Out-Null
+            } elseif ($issue -match 'NDK_HOME') {
+                $missing.Add('NDK_HOME') | Out-Null
+            } else {
+                $missing.Add((Protect-ReleasePath -Text $issue -RepoRoot $RepoRoot)) | Out-Null
+            }
+        }
+        if ($Profile -ne 'android-host') {
+            $notes.Add('APK authorization requested outside android-host profile') | Out-Null
+        }
+    }
+
+    $uniqueMissing = @($missing | Select-Object -Unique)
+    $ready = ($uniqueMissing.Count -eq 0)
+    $status = if ($ready) {
+        'ready'
+    } elseif ($RequireBundle -or $RequireApk) {
+        if (@($uniqueMissing | Where-Object { $_ -in @('cargo-tauri', 'ANDROID_HOME', 'NDK_HOME') }).Count -gt 0) {
+            'needs_explicit_authorization'
+        } else {
+            'missing_dependencies'
+        }
+    } else {
+        'missing_dependencies'
+    }
+
+    $notes.Add('Local preflight only; remote Gitea runner execution is not proven by this report.') | Out-Null
+    $notes.Add('GUI acceptance and Android device acceptance are never claimable from this preflight.') | Out-Null
+    if (-not $RequireBundle) {
+        $notes.Add('Bundle evidence is not authorized; host-only path does not require cargo-tauri.') | Out-Null
+    }
+    if (-not $RequireApk) {
+        $notes.Add('APK evidence is not authorized; host smoke does not require ANDROID_HOME/NDK_HOME.') | Out-Null
+    }
+
+    $safeTools = [ordered]@{}
+    foreach ($key in @($tools.Keys | Sort-Object)) {
+        $safeTools[[string]$key] = [bool]$tools[$key]
+    }
+
+    $report = [pscustomobject]@{
+        schema_version = 1
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        profile = $Profile
+        ready = $ready
+        status = $status
+        missing = @($uniqueMissing | ForEach-Object {
+            Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
+        })
+        tools = [pscustomobject]$safeTools
+        intents = [pscustomobject]@{
+            host_only = (-not $RequireBundle -and -not $RequireApk)
+            bundle_authorized = [bool]$RequireBundle
+            apk_authorized = [bool]$RequireApk
+        }
+        claims = [pscustomobject]@{
+            gui = 'not_claimable'
+            android_device = 'not_claimable'
+            remote_ci = 'not_claimable'
+            host_build = if ($ready -and $Profile -ne 'ci-gates') { 'preflight_ok' } else { 'not_proven' }
+        }
+        notes = @($notes | ForEach-Object {
+            Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
+        })
+    }
+
+    $report = Protect-ReleaseObject -Value $report -RepoRoot $RepoRoot
+
+    if ($FailClosed -and -not $ready) {
+        $detail = if ($uniqueMissing.Count -gt 0) { ($uniqueMissing -join ', ') } else { $status }
+        throw ("Release runner preflight failed for profile '{0}': {1}" -f $Profile, $detail)
+    }
+
+    return $report
+}
+
+function Test-ReleaseEvidencePackage {
+    <#
+    .SYNOPSIS
+    Offline-verifies a release evidence directory (manifest, provenance, subjects).
+
+    .DESCRIPTION
+    Fail-closed offline verification for evidence packages produced by the host
+    runners. Rejects missing subjects/sidecars, hash mismatches, BOM sidecars,
+    path escapes, unknown schema versions, sensitive notes/warnings, and missing
+    inventory/provenance for successful builds. Dry-run packages require
+    -AllowDryRun and never claim remote CI.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$EvidenceDir,
+        [switch]$AllowDryRun
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $notes = New-Object System.Collections.Generic.List[string]
+    $subjectCount = 0
+    $remoteCiClaimed = $false
+
+    if (-not (Test-Path -LiteralPath $EvidenceDir -PathType Container)) {
+        return [pscustomobject]@{
+            Valid = $false
+            ErrorCount = 1
+            Errors = @("Evidence directory missing: $EvidenceDir")
+            Notes = @()
+            subject_count = 0
+            remote_ci_claimed = $false
+        }
+    }
+
+    $evidenceRoot = (Resolve-Path -LiteralPath $EvidenceDir).ProviderPath
+    $manifestPath = Join-Path $evidenceRoot 'manifest.json'
+    $provPath = Join-Path $evidenceRoot 'provenance.json'
+
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        $errors.Add('manifest.json is missing from the evidence package.') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            ErrorCount = $errors.Count
+            Errors = @($errors | ForEach-Object { Protect-ReleasePath -Text $_ -RepoRoot $evidenceRoot })
+            Notes = @()
+            subject_count = 0
+            remote_ci_claimed = $false
+        }
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    } catch {
+        $errors.Add('manifest.json is not valid JSON.') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            ErrorCount = $errors.Count
+            Errors = @($errors)
+            Notes = @()
+            subject_count = 0
+            remote_ci_claimed = $false
+        }
+    }
+
+    try {
+        Assert-ReleaseManifestSchema -Manifest $manifest
+    } catch {
+        $errors.Add((Protect-ReleasePath -Text $_.Exception.Message -RepoRoot $evidenceRoot)) | Out-Null
+    }
+
+    if ($null -eq $manifest.schema_version -or [int]$manifest.schema_version -ne 1) {
+        $errors.Add(("Unknown or unsupported schema_version '{0}'." -f $manifest.schema_version)) | Out-Null
+    }
+
+    $secretProbe = @()
+    if ($manifest.PSObject.Properties.Name -contains 'warnings') {
+        $secretProbe += @($manifest.warnings | ForEach-Object { [string]$_ })
+    }
+    if ($manifest.PSObject.Properties.Name -contains 'notes') {
+        $secretProbe += @($manifest.notes | ForEach-Object { [string]$_ })
+    }
+    $secretFindings = @()
+    foreach ($text in $secretProbe) {
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $secretFindings += @(Find-ReleaseSecretPatternFindings -Text $text)
+        # Defense in depth for common API token shapes.
+        if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
+            $secretFindings += [pscustomobject]@{ Rule = 'openai-style-token'; RelativePath = 'manifest.notes/warnings' }
+        }
+    }
+    if ($secretFindings.Count -gt 0) {
+        $errors.Add('Sensitive secret-like content found in manifest warnings/notes; package rejected (values redacted).') | Out-Null
+    }
+
+    $isDryRun = ($manifest.build_status -eq 'dry-run')
+    if ($isDryRun) {
+        if (-not $AllowDryRun) {
+            $errors.Add('dry-run evidence package rejected without -AllowDryRun; dry-run is not remote CI evidence.') | Out-Null
+        } else {
+            $notes.Add('Accepted as local dry-run evidence only; not remote CI, not GUI, not device acceptance.') | Out-Null
+        }
+    }
+
+    if ($manifest.build_status -eq 'ok' -or ($isDryRun -and $AllowDryRun -eq $false)) {
+        # Continuity: successful packages require provenance + inventory.
+    }
+
+    if ($manifest.build_status -eq 'ok') {
+        if (-not (Test-Path -LiteralPath $provPath -PathType Leaf)) {
+            $errors.Add('provenance.json is missing from the evidence package.') | Out-Null
+        }
+        $invMeta = $manifest.dependency_inventory
+        if ($null -eq $invMeta -or [string]::IsNullOrWhiteSpace([string]$invMeta.relative_path)) {
+            $errors.Add('dependency inventory metadata is missing from the manifest for build_status=ok.') | Out-Null
+        } else {
+            $invRel = [string]$invMeta.relative_path -replace '/', [System.IO.Path]::DirectorySeparatorChar
+            if ($invRel.Contains('..')) {
+                $errors.Add('dependency inventory path escape rejected.') | Out-Null
+            } else {
+                $invPath = Join-Path $evidenceRoot $invRel
+                if (-not (Test-ReleasePathWithinRoot -Root $evidenceRoot -Path $invPath)) {
+                    $errors.Add('dependency inventory path is outside the evidence package.') | Out-Null
+                } elseif (-not (Test-Path -LiteralPath $invPath -PathType Leaf)) {
+                    $errors.Add('dependency inventory file is missing from the evidence package.') | Out-Null
+                } elseif (-not [string]::IsNullOrWhiteSpace([string]$invMeta.sha256)) {
+                    $invHash = Get-ReleaseFileSha256 -Path $invPath
+                    if ($invHash -ne ([string]$invMeta.sha256).ToLowerInvariant()) {
+                        $errors.Add('dependency inventory sha256 mismatch.') | Out-Null
+                    }
+                }
+            }
+        }
+    } elseif ($isDryRun -and $AllowDryRun) {
+        if (Test-Path -LiteralPath $provPath -PathType Leaf) {
+            $notes.Add('dry-run package includes provenance; still not remote CI evidence.') | Out-Null
+        }
+        $notes.Add('dry-run packages may omit staged subjects; offline rehash of present inventory/manifest only.') | Out-Null
+    }
+
+    $prov = $null
+    if (Test-Path -LiteralPath $provPath -PathType Leaf) {
+        try {
+            $prov = Get-Content -LiteralPath $provPath -Raw | ConvertFrom-Json
+            if ($null -eq $prov.schema_version -or [int]$prov.schema_version -ne 1) {
+                $errors.Add(("Unknown or unsupported provenance schema_version '{0}'." -f $prov.schema_version)) | Out-Null
+            }
+            $provSecretProbe = @()
+            if ($prov.PSObject.Properties.Name -contains 'notes') {
+                $provSecretProbe += @($prov.notes | ForEach-Object { [string]$_ })
+            }
+            foreach ($text in $provSecretProbe) {
+                if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
+                    $errors.Add('Sensitive secret-like content found in provenance notes; package rejected (values redacted).') | Out-Null
+                    break
+                }
+            }
+        } catch {
+            $errors.Add('provenance.json is not valid JSON.') | Out-Null
+        }
+    }
+
+    $subjects = @()
+    if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
+        $subjects = @($prov.subjects)
+    } elseif ($manifest.build_status -eq 'ok') {
+        # Fall back to present artifacts when provenance subjects are unavailable.
+        $subjects = @($manifest.artifacts | Where-Object { $_.status -eq 'present' })
+    }
+
+    if ($manifest.build_status -eq 'ok' -and @($subjects).Count -eq 0) {
+        $errors.Add('build_status=ok package has no present subjects to verify.') | Out-Null
+    }
+
+    foreach ($subj in $subjects) {
+        if ($null -eq $subj) { continue }
+        $rel = [string]$subj.relative_path
+        if ([string]::IsNullOrWhiteSpace($rel)) {
+            $errors.Add('Subject relative_path is empty.') | Out-Null
+            continue
+        }
+        if ($rel -match '(^|/|\\)\.\.(/|\\|$)' -or $rel.StartsWith('/') -or $rel -match '^[A-Za-z]:') {
+            $errors.Add(("Subject path escape rejected for '{0}'." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            continue
+        }
+
+        $subjectPath = Join-Path $evidenceRoot ($rel -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-ReleasePathWithinRoot -Root $evidenceRoot -Path $subjectPath)) {
+            $errors.Add(("Subject path is outside the evidence package: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            continue
+        }
+
+        if ($manifest.build_status -eq 'ok' -or $subj.status -eq 'present') {
+            if (-not (Test-Path -LiteralPath $subjectPath -PathType Leaf)) {
+                $errors.Add(("Subject file missing: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+                continue
+            }
+
+            $sidecar = $subjectPath + '.sha256'
+            if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
+                $errors.Add(("Hash sidecar missing for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+                continue
+            }
+
+            $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecar)
+            if ($sidecarBytes.Length -ge 3 -and $sidecarBytes[0] -eq 0xEF -and $sidecarBytes[1] -eq 0xBB -and $sidecarBytes[2] -eq 0xBF) {
+                $errors.Add(("Hash sidecar is UTF-8 BOM encoded (rejected): {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
+            }
+
+            $sidecarText = [System.Text.Encoding]::UTF8.GetString($sidecarBytes).Trim()
+            if ($sidecarText.Length -gt 0 -and [int][char]$sidecarText[0] -eq 0xFEFF) {
+                $errors.Add(("Hash sidecar has BOM marker (rejected): {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
+                $sidecarText = $sidecarText.TrimStart([char]0xFEFF).Trim()
+            }
+
+            $rehash = Get-ReleaseFileSha256 -Path $subjectPath
+            $expected = ([string]$subj.sha256).ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($expected)) {
+                $errors.Add(("Subject missing sha256 digest: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            } elseif ($rehash -ne $expected) {
+                $errors.Add(("Offline rehash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            }
+
+            if ($sidecarText -match '([a-fA-F0-9]{64})') {
+                $sidecarHash = $Matches[1].ToLowerInvariant()
+                if ($sidecarHash -ne $rehash -or ($expected -and $sidecarHash -ne $expected)) {
+                    $errors.Add(("Sidecar hash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+                }
+            } else {
+                $errors.Add(("Sidecar content is not a valid sha256 sum line: {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
+            }
+
+            $subjectCount += 1
+        }
+    }
+
+    # Also validate present artifacts listed only in the manifest for ok builds.
+    if ($manifest.build_status -eq 'ok') {
+        foreach ($art in @($manifest.artifacts)) {
+            if ($null -eq $art -or $art.status -ne 'present') { continue }
+            $rel = [string]$art.relative_path
+            if ($rel -match '(^|/|\\)\.\.(/|\\|$)' -or $rel.StartsWith('/') -or $rel -match '^[A-Za-z]:') {
+                $errors.Add(("Artifact path escape rejected for '{0}'." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            }
+        }
+    }
+
+    $safeErrors = @($errors | ForEach-Object {
+        Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot
+    })
+    $safeNotes = @($notes | ForEach-Object {
+        Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot
+    })
+
+    return [pscustomobject]@{
+        Valid = ($errors.Count -eq 0)
+        ErrorCount = $errors.Count
+        Errors = $safeErrors
+        Notes = $safeNotes
+        subject_count = $subjectCount
+        remote_ci_claimed = $remoteCiClaimed
+        build_status = [string]$manifest.build_status
+    }
+}
+
+function Assert-ReleaseEvidencePackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$EvidenceDir,
+        [switch]$AllowDryRun
+    )
+
+    $result = Test-ReleaseEvidencePackage -EvidenceDir $EvidenceDir -AllowDryRun:$AllowDryRun
+    if (-not $result.Valid) {
+        $joined = ($result.Errors -join [Environment]::NewLine)
+        throw ("Evidence package verification failed:{0}{1}" -f [Environment]::NewLine, $joined)
+    }
+    return $result
+}
+
+function Assert-ReleaseWorkflowStaticContract {
+    <#
+    .SYNOPSIS
+    Static governance checks for tracked Gitea release workflows.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    $checks = [ordered]@{
+        actions_pinned = $false
+        npm_ci = $false
+        secret_scan = $false
+        artifact_retention = $false
+        host_only_default = $false
+        real_yaml_parser_required = $false
+    }
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    $workflowDir = Join-Path $RepoRoot '.gitea\workflows'
+    if (-not (Test-Path -LiteralPath $workflowDir -PathType Container)) {
+        throw "Workflow directory missing: $workflowDir"
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File) +
+             @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        throw 'No workflow files found for static contract validation.'
+    }
+
+    $allText = ''
+    foreach ($f in $files) {
+        $text = Get-Content -LiteralPath $f.FullName -Raw
+        $allText += "`n" + $text
+        $syntax = Test-ReleaseWorkflowSyntax -Path $f.FullName
+        if ($syntax.Engine -notmatch 'pyyaml|node-yaml') {
+            $errors.Add(("Workflow {0} did not use a real YAML parser (engine={1})" -f $f.Name, $syntax.Engine)) | Out-Null
+        }
+        if (-not $syntax.Valid) {
+            $errors.Add(("Workflow {0} failed YAML validation: {1}" -f $f.Name, ($syntax.Errors -join '; '))) | Out-Null
+        }
+    }
+
+    $requiredPins = @(
+        'actions/checkout@v4',
+        'actions/setup-node@v4',
+        'dtolnay/rust-toolchain@stable'
+    )
+    $pinOk = $true
+    foreach ($pin in $requiredPins) {
+        if ($allText -notmatch [regex]::Escape($pin)) {
+            $pinOk = $false
+            $errors.Add("Missing pinned action reference: $pin") | Out-Null
+        }
+    }
+    if ($allText -match 'actions/[A-Za-z0-9_-]+@main' -or $allText -match 'actions/[A-Za-z0-9_-]+@master') {
+        $pinOk = $false
+        $errors.Add('Unpinned @main/@master action reference is not allowed.') | Out-Null
+    }
+    $checks['actions_pinned'] = $pinOk
+
+    $checks['npm_ci'] = ($allText -match 'npm ci')
+    if (-not $checks['npm_ci']) {
+        $errors.Add('Workflows must use strict npm ci.') | Out-Null
+    }
+    if ($allText -match 'npm install(?!\s)') {
+        # Allow only if not present; soft check against install.
+    }
+    if ($allText -match '(?m)^\s*run:\s*npm install\s*$') {
+        $checks['npm_ci'] = $false
+        $errors.Add('Workflows must not use bare npm install for release gates.') | Out-Null
+    }
+
+    $checks['secret_scan'] = ($allText -match 'SecretScanOnly' -or $allText -match 'secret scan' -or $allText -match 'verify-release\.ps1')
+    if (-not $checks['secret_scan']) {
+        $errors.Add('Workflows must include a fail-closed secret scan step.') | Out-Null
+    }
+
+    $checks['artifact_retention'] = ($allText -match 'retention-days:\s*14')
+    if (-not $checks['artifact_retention']) {
+        $errors.Add('Host evidence workflow must set artifact retention-days: 14.') | Out-Null
+    }
+
+    $hostWf = Join-Path $workflowDir 'release-host-evidence.yml'
+    if (Test-Path -LiteralPath $hostWf) {
+        $hostText = Get-Content -LiteralPath $hostWf -Raw
+        # Comments may mention -BuildApk; only non-comment command lines are forbidden.
+        $hostOnly = ($hostText -match "default:\s*'true'") -and ($hostText -match 'SkipBundle') -and ($hostText -notmatch '(?m)^\s*[^#\r\n]*-BuildApk\b')
+        $checks['host_only_default'] = $hostOnly
+        if (-not $hostOnly) {
+            $errors.Add('release-host-evidence must default to host-only (skip_bundle=true, no -BuildApk).') | Out-Null
+        }
+    } else {
+        $errors.Add('release-host-evidence.yml is missing.') | Out-Null
+    }
+
+    $ciWf = Join-Path $workflowDir 'ci-gates.yml'
+    if (Test-Path -LiteralPath $ciWf) {
+        $ciText = Get-Content -LiteralPath $ciWf -Raw
+        $checks['real_yaml_parser_required'] = ($ciText -match 'PyYAML' -and $ciText -match 'Test-ReleaseWorkflowSyntax' -and $ciText -match 'pyyaml\|node-yaml')
+        if (-not $checks['real_yaml_parser_required']) {
+            $errors.Add('ci-gates must require a real YAML parser for workflow syntax validation.') | Out-Null
+        }
+    } else {
+        $errors.Add('ci-gates.yml is missing.') | Out-Null
+    }
+
+    return [pscustomobject]@{
+        Valid = ($errors.Count -eq 0)
+        ErrorCount = $errors.Count
+        Errors = @($errors)
+        # Hashtable so callers can index checks['name'] under Windows PowerShell 5.
+        checks = [hashtable]$checks
+    }
+}
