@@ -1420,6 +1420,11 @@ pub struct EnduranceTurnRecordInput<'a> {
     pub turn_status: String,
     pub assertions: Vec<AssertionResult>,
     pub elapsed_ms: u128,
+    /// Paths default to the legacy JSON probe labels when None.
+    pub write_path: Option<&'a str>,
+    pub chronicle_path: Option<&'a str>,
+    pub accept_path: Option<&'a str>,
+    pub production_postprocess_complete: Option<bool>,
 }
 
 /// Build an `EvidenceTurnRecord` for an endurance turn, embedding schedule metadata.
@@ -1431,10 +1436,16 @@ pub fn build_endurance_turn_record(input: EnduranceTurnRecordInput<'_>) -> Evide
         suite: format!("endurance_{}", input.stage.label()),
         turn_index: input.turn_index,
         kind: format!("endurance_{kind}"),
-        write_path: "production_pipeline".into(),
-        chronicle_path: "synthetic_chronicle_fixture".into(),
-        accept_path: "production_faithful_commit_probe".into(),
-        production_postprocess_complete: false,
+        write_path: input.write_path.unwrap_or("production_pipeline").into(),
+        chronicle_path: input
+            .chronicle_path
+            .unwrap_or("synthetic_chronicle_fixture")
+            .into(),
+        accept_path: input
+            .accept_path
+            .unwrap_or("production_faithful_commit_probe")
+            .into(),
+        production_postprocess_complete: input.production_postprocess_complete.unwrap_or(false),
         draft_accepted: input.draft_accepted,
         force_accept: false,
         quality_error_count: 0,
@@ -2281,6 +2292,10 @@ mod tests {
             turn_status: "Committed".into(),
             assertions: vec![],
             elapsed_ms: 42,
+            write_path: None,
+            chronicle_path: None,
+            accept_path: None,
+            production_postprocess_complete: None,
         });
         assert_eq!(rec.turn_index, 5);
         assert_eq!(rec.kind, "endurance_write");

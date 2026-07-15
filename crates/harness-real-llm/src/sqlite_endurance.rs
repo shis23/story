@@ -1,0 +1,867 @@
+//! SQLite-backed endurance adapter for Gate B / Gate C.
+//!
+//! Uses the same `sqlite_runtime` production gateway as Tauri for draft land,
+//! autofix/postprocess attach, regenerate, and Accept. JSON stores are not the
+//! authority after activation.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+
+use serde::Deserialize;
+use storyforge_app_agent::{PostProcessOutcome, ToolContext};
+use storyforge_app_conversation::ConversationStore;
+use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
+use storyforge_domain::Id;
+use storyforge_domain::Source;
+use storyforge_domain::campaign::{Campaign, CharacterInstance};
+use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
+use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
+use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
+use storyforge_infra_llm::LlmClient;
+use storyforge_infra_sqlite::preaccept::{
+    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyOutcome, PostprocessApplyRequest,
+    PreacceptOutboxKind,
+};
+use storyforge_infra_vector::BruteForceStore;
+use storyforge_tauri_app::campaign_store::{CampaignStore, StoredCard};
+use storyforge_tauri_app::fill_campaign_runtime_from_sqlite;
+use storyforge_tauri_app::production_postprocess::{
+    FixedPostprocessRunner, PostprocessIdentity, PostprocessRunner, ProductionPostprocessError,
+    ProductionPostprocessRequest, ProductionPostprocessService, TurnAttemptSink,
+};
+use storyforge_tauri_app::sqlite_runtime;
+use storyforge_tauri_app::turn_lifecycle;
+
+use crate::coverage_ledger::{ObservationKey, ObservedCoverage, SqlitePostcondition};
+use crate::evidence::short_hash16;
+use crate::production_evidence::{ProductionPostprocessProof, mutation_batch_digest};
+
+const FIXTURE_REL: &str = "fixtures/m5_sqlite_endurance_v1.json";
+
+/// Process-owned SQLite endurance environment.
+pub struct SqliteHarnessEnv {
+    pub data_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub conv_store: Arc<ConversationStore>,
+    /// Disabled sentinel — never used for authority after activate.
+    pub campaign_store: Arc<CampaignStore>,
+    pub tool_ctx: Arc<RwLock<ToolContext>>,
+    pub vector_store: Arc<BruteForceStore>,
+    pub llm: Arc<dyn LlmClient>,
+    pub active_campaign: Mutex<Option<Id>>,
+    pub fixture_hash16: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteTurnResult {
+    pub draft_text: String,
+    pub variant_id: Id,
+    pub turn_id: Id,
+    pub attempt_id: Id,
+    pub input_node_id: Id,
+    pub postprocess_proof: ProductionPostprocessProof,
+    pub accept: SqliteAcceptSummary,
+    pub observed: ObservedCoverage,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteAcceptSummary {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub campaign_revision_before: u64,
+    pub campaign_revision_after: u64,
+    pub chronicle_revision_before: u64,
+    pub chronicle_revision_after: u64,
+    pub draft_hash: String,
+    pub turn_status: TurnStatus,
+    pub attempt_status: AttemptStatus,
+    pub summary_code: Option<String>,
+}
+
+struct SqlitePostprocessRequest<'a> {
+    campaign_id: &'a Id,
+    conversation_id: &'a Id,
+    turn_id: &'a Id,
+    attempt_id: &'a Id,
+    variant_id: &'a Id,
+    draft_text: &'a str,
+    summary_text: Option<String>,
+    turn_number: u32,
+    input_node_id: Id,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureRoot {
+    fixture_version: String,
+    safe_probe_facts: Vec<String>,
+    must_not_reveal: Vec<String>,
+    character: FixtureCharacter,
+    definitions: Vec<FixtureDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureCharacter {
+    id: String,
+    name: String,
+    description: String,
+    personality: String,
+    scenario: String,
+    first_mes: String,
+    system_prompt: String,
+    creator: String,
+    character_version: String,
+    tags: Vec<String>,
+    world_info: Vec<FixtureWorldInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureWorldInfo {
+    keys: Vec<String>,
+    content: String,
+    constant: bool,
+    selective: bool,
+    route: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureDefinition {
+    id: String,
+    name: String,
+    role_type: String,
+    persona_prompt: String,
+    behavior_rules: String,
+    #[allow(dead_code)]
+    private_knowledge: Vec<String>,
+}
+
+impl SqliteHarnessEnv {
+    /// Bootstrap a fresh SQLite authority under `data_dir` and seed the fixture.
+    pub fn bootstrap(data_dir: PathBuf, llm: Arc<dyn LlmClient>) -> Result<Self, String> {
+        std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+        let db_path = data_dir.join("storyforge.sqlite3");
+        // Empty DB activate: production repository migrate on first write.
+        sqlite_runtime::activate(&db_path)?;
+
+        let persistence = sqlite_runtime::conversation_persistence()?;
+        let conv_store = Arc::new(ConversationStore::with_persistence(persistence));
+        let campaign_store = Arc::new(CampaignStore::disabled());
+        let tool_ctx = Arc::new(RwLock::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        }));
+        let vector_store = Arc::new(BruteForceStore::with_persistence(
+            data_dir.join("vectors.json"),
+        ));
+
+        let mut env = Self {
+            data_dir,
+            db_path,
+            conv_store,
+            campaign_store,
+            tool_ctx,
+            vector_store,
+            llm,
+            active_campaign: Mutex::new(None),
+            fixture_hash16: String::new(),
+        };
+        let fixture_path = fixture_path();
+        let (campaign_id, fixture_hash) = env.seed_fixture(&fixture_path)?;
+        env.fixture_hash16 = fixture_hash;
+        env.set_active_campaign(campaign_id);
+        let _ = sqlite_runtime::recover_turns_on_startup()?;
+        Ok(env)
+    }
+
+    /// Re-open an existing SQLite evidence data dir (resume).
+    pub fn open_existing(data_dir: PathBuf, llm: Arc<dyn LlmClient>) -> Result<Self, String> {
+        let db_path = data_dir.join("storyforge.sqlite3");
+        if !db_path.exists() {
+            return Err(format!("sqlite db missing at {}", db_path.display()));
+        }
+        sqlite_runtime::activate(&db_path)?;
+        let persistence = sqlite_runtime::conversation_persistence()?;
+        let conv_store = Arc::new(ConversationStore::with_persistence(persistence));
+        let campaign_store = Arc::new(CampaignStore::disabled());
+        let tool_ctx = Arc::new(RwLock::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(
+                storyforge_app_agent::ChronicleToolBudget::new(),
+            ),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        }));
+        let vector_store = Arc::new(BruteForceStore::with_persistence(
+            data_dir.join("vectors.json"),
+        ));
+        let fixture_path = fixture_path();
+        let fixture_bytes = std::fs::read(&fixture_path).map_err(|e| e.to_string())?;
+        let fixture_hash16 = short_hash16(&String::from_utf8_lossy(&fixture_bytes));
+        let env = Self {
+            data_dir,
+            db_path,
+            conv_store,
+            campaign_store,
+            tool_ctx,
+            vector_store,
+            llm,
+            active_campaign: Mutex::new(None),
+            fixture_hash16,
+        };
+        // Re-inject tool_ctx character material from fixture without re-seeding DB.
+        let root = load_fixture(&fixture_path)?;
+        env.inject_character_from_fixture(&root);
+        let _ = sqlite_runtime::recover_turns_on_startup()?;
+        Ok(env)
+    }
+
+    pub fn set_active_campaign(&self, id: Id) {
+        *self.active_campaign.lock().unwrap() = Some(id);
+    }
+
+    pub fn active_campaign_id(&self) -> Option<Id> {
+        self.active_campaign.lock().unwrap().clone()
+    }
+
+    pub fn fill_campaign_context(&self, mut ctx: WritingContext) -> Result<WritingContext, String> {
+        ctx.campaign_runtime = None;
+        {
+            let mut g = self.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+            g.campaign_runtime = None;
+        }
+        let Some(active_id) = self.active_campaign_id() else {
+            return Ok(ctx);
+        };
+        fill_campaign_runtime_from_sqlite(&mut ctx, &self.tool_ctx, &active_id)?;
+        Ok(ctx)
+    }
+
+    pub fn new_pipeline(&self) -> PipelineOrchestrator {
+        let mut tool_ctx = self
+            .tool_ctx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        tool_ctx.vector_store = Some(self.vector_store.clone());
+        let mut pipeline = PipelineOrchestrator::new(
+            self.llm.clone(),
+            self.conv_store.clone(),
+            Arc::new(tool_ctx),
+            None,
+        );
+        // SQLite production path: generation defers durable conversation land.
+        pipeline.set_defer_conversation_land(true);
+        pipeline
+    }
+
+    /// Full production-faithful write: user msg → pipeline → preaccept draft →
+    /// fixed production postprocess → SQLite Accept.
+    pub async fn write_accept_turn(
+        &self,
+        conversation_id: &Id,
+        intent: &str,
+        turn_index: u32,
+        row_id: &str,
+    ) -> Result<SqliteTurnResult, String> {
+        let campaign_id = self
+            .active_campaign_id()
+            .ok_or_else(|| "active campaign required".to_string())?;
+
+        let input_node_id = self
+            .conv_store
+            .append_user_message(conversation_id, intent.to_string())
+            .map_err(|e| e.to_string())?;
+
+        let base = WritingContext::legacy(vec![], None, conversation_id.clone());
+        let ctx = self.fill_campaign_context(base)?;
+
+        let camp = sqlite_runtime::get_campaign(&campaign_id)?
+            .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
+        let turn = TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            input_node_id.clone(),
+            camp.revision,
+        );
+        // Keep turn generating until preaccept lands the draft.
+        let turn_id = turn.turn_id.clone();
+        sqlite_runtime::save_turn(&turn)?;
+
+        let mut pipeline = self.new_pipeline();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Drain events so the channel never fills in harness.
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let (draft_text, _provisional_node, provenance) = pipeline
+            .start_writing(intent.to_string(), &ctx, event_tx, cancel_rx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let attempt_id = Id::new();
+        let land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+            campaign_id: &campaign_id,
+            conversation_id,
+            turn_id: &turn_id,
+            attempt_id: &attempt_id,
+            draft_text: &draft_text,
+            pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
+            provenance,
+        })?;
+        self.conv_store.invalidate();
+        let variant_id = land.variant_id;
+
+        // Deterministic production postprocess (shared service + SQLite sink).
+        let summary_text = Some(format!(
+            "endurance turn {turn_index} summary; probes remain non-secret fingerprints only"
+        ));
+        let proof = self
+            .apply_production_postprocess_sqlite(SqlitePostprocessRequest {
+                campaign_id: &campaign_id,
+                conversation_id,
+                turn_id: &turn_id,
+                attempt_id: &attempt_id,
+                variant_id: &variant_id,
+                draft_text: &draft_text,
+                summary_text,
+                turn_number: turn_index,
+                input_node_id: input_node_id.clone(),
+            })
+            .await?;
+
+        let accept = self.accept_variant(&campaign_id, conversation_id, &variant_id)?;
+        if !accept.ok {
+            return Err(accept.error.unwrap_or_else(|| "accept failed".into()));
+        }
+        self.conv_store.invalidate();
+
+        let outbox = sqlite_runtime::list_preaccept_outbox_for_turn(&turn_id).unwrap_or_default();
+        let outbox_kinds: Vec<String> = outbox
+            .iter()
+            .map(|r| match r.kind {
+                PreacceptOutboxKind::DraftReady => "draft_ready".into(),
+                PreacceptOutboxKind::AutofixSync => "autofix_sync".into(),
+                PreacceptOutboxKind::PostprocessApply => "postprocess_apply".into(),
+                PreacceptOutboxKind::Regenerate => "regenerate".into(),
+                PreacceptOutboxKind::EditStale => "edit_stale".into(),
+                PreacceptOutboxKind::RecoveryFail => "recovery_fail".into(),
+            })
+            .collect();
+
+        let mut observations = BTreeSet::new();
+        observations.insert(ObservationKey::SqliteAuthoritative);
+        observations.insert(ObservationKey::JsonFallbackFalse);
+        observations.insert(ObservationKey::CommandPath(
+            "sqlite_runtime::create_draft_attempt".into(),
+        ));
+        observations.insert(ObservationKey::ServicePath("pipeline.start_writing".into()));
+        observations.insert(ObservationKey::DraftLanded);
+        observations.insert(ObservationKey::PostprocessApplied);
+        observations.insert(ObservationKey::Accepted);
+        observations.insert(ObservationKey::OutboxKind("draft_ready".into()));
+        observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        observations.insert(ObservationKey::AgentRole("pipeline".into()));
+
+        let observed = ObservedCoverage {
+            row_id: row_id.to_string(),
+            turn_index,
+            command_path: "sqlite_runtime::create_draft_attempt".into(),
+            service_path: "pipeline.start_writing".into(),
+            agent_events: vec!["pipeline".into()],
+            turn_id16: short_hash16(turn_id.as_str()),
+            attempt_id16: short_hash16(attempt_id.as_str()),
+            variant_id16: short_hash16(variant_id.as_str()),
+            sqlite_post: SqlitePostcondition {
+                sqlite_authoritative: true,
+                json_fallback: false,
+                turn_status: format!("{:?}", accept.turn_status),
+                attempt_status: format!("{:?}", accept.attempt_status),
+                outbox_kinds,
+                campaign_revision_after: accept.campaign_revision_after,
+                postprocess_applied: proof.applied,
+                batch_digest16: proof.batch_digest.clone(),
+            },
+            observations,
+        };
+
+        Ok(SqliteTurnResult {
+            draft_text,
+            variant_id,
+            turn_id,
+            attempt_id,
+            input_node_id,
+            postprocess_proof: proof,
+            accept,
+            observed,
+        })
+    }
+
+    pub fn accept_variant(
+        &self,
+        campaign_id: &Id,
+        conversation_id: &Id,
+        variant_id: &Id,
+    ) -> Result<SqliteAcceptSummary, String> {
+        let before = sqlite_runtime::get_campaign(campaign_id)?
+            .map(|c| (c.revision, c.chronicle_revision))
+            .unwrap_or((0, 0));
+        match sqlite_runtime::accept_by_variant(campaign_id, conversation_id, variant_id, false) {
+            Ok(outcome) => {
+                let after = sqlite_runtime::get_campaign(campaign_id)?
+                    .map(|c| (c.revision, c.chronicle_revision))
+                    .unwrap_or((outcome.campaign_revision_after, before.1));
+                let draft_hash = sqlite_runtime::get_turn(&outcome.turn_id)?
+                    .and_then(|t| {
+                        t.find_attempt(&outcome.attempt_id)
+                            .map(|a| a.draft_hash.clone())
+                    })
+                    .unwrap_or_default();
+                Ok(SqliteAcceptSummary {
+                    ok: true,
+                    error: None,
+                    campaign_revision_before: before.0,
+                    campaign_revision_after: after.0,
+                    chronicle_revision_before: before.1,
+                    chronicle_revision_after: after.1,
+                    draft_hash,
+                    turn_status: outcome.turn_status,
+                    attempt_status: outcome.attempt_status,
+                    summary_code: None,
+                })
+            }
+            Err(e) => Ok(SqliteAcceptSummary {
+                ok: false,
+                error: Some(e.to_string()),
+                campaign_revision_before: before.0,
+                campaign_revision_after: before.0,
+                chronicle_revision_before: before.1,
+                chronicle_revision_after: before.1,
+                draft_hash: String::new(),
+                turn_status: TurnStatus::Failed,
+                attempt_status: AttemptStatus::Failed,
+                summary_code: None,
+            }),
+        }
+    }
+
+    pub fn list_summary_contents(&self, campaign_id: &Id) -> Result<Vec<String>, String> {
+        Ok(sqlite_runtime::list_summaries(campaign_id)?
+            .into_iter()
+            .map(|s| s.content)
+            .collect())
+    }
+
+    async fn apply_production_postprocess_sqlite(
+        &self,
+        req: SqlitePostprocessRequest<'_>,
+    ) -> Result<ProductionPostprocessProof, String> {
+        // Empty quality report + draft hash sync via SQLite UoW.
+        let identity = PostprocessIdentity {
+            turn_id: req.turn_id.clone(),
+            attempt_id: req.attempt_id.clone(),
+            campaign_id: req.campaign_id.clone(),
+            conversation_id: req.conversation_id.clone(),
+            turn_number: req.turn_number,
+        };
+        let sink = SqliteGatewayTurnAttemptSink;
+        let quality = QualityReport { warnings: vec![] };
+        sink.sync_autofix(&identity, req.draft_text, quality)
+            .map_err(|e| e.to_string())?;
+
+        let runtime = self
+            .fill_campaign_context(WritingContext::legacy(
+                vec![],
+                None,
+                req.conversation_id.clone(),
+            ))?
+            .campaign_runtime
+            .ok_or_else(|| "campaign runtime missing for SQLite postprocess".to_string())?;
+
+        let outcome = PostProcessOutcome {
+            summary: req.summary_text.clone(),
+            post_process: None,
+        };
+        let runner: Arc<dyn PostprocessRunner> = Arc::new(FixedPostprocessRunner {
+            outcome: Some(outcome),
+        });
+        let service = ProductionPostprocessService::new_runtime(runtime.as_ref(), &sink);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let result = service
+            .run(
+                ProductionPostprocessRequest {
+                    identity: Some(identity.clone()),
+                    final_text: req.draft_text.to_string(),
+                    quality_report: None,
+                    present_chars: vec![],
+                    cancel: cancel_rx,
+                },
+                runner,
+                false,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !result.applied {
+            return Err(format!(
+                "sqlite production postprocess did not apply: {:?}",
+                result.skipped_reason
+            ));
+        }
+
+        let turn = sqlite_runtime::get_turn(req.turn_id)?
+            .ok_or_else(|| "turn missing after postprocess".to_string())?;
+        if turn.status != TurnStatus::AwaitingAcceptance {
+            return Err(format!(
+                "turn status {:?} expected AwaitingAcceptance",
+                turn.status
+            ));
+        }
+        let attempt = turn
+            .find_attempt(req.attempt_id)
+            .ok_or_else(|| "attempt missing after postprocess".to_string())?;
+        if attempt.status != AttemptStatus::AwaitingAcceptance {
+            return Err(format!(
+                "attempt status {:?} expected AwaitingAcceptance",
+                attempt.status
+            ));
+        }
+        if turn.input_node_id != req.input_node_id {
+            return Err("input_node_id mismatch after postprocess".into());
+        }
+        if attempt.variant_id != *req.variant_id {
+            return Err("variant_id mismatch after postprocess".into());
+        }
+        let batch_digest = attempt
+            .pending_state_changes
+            .as_ref()
+            .map(mutation_batch_digest);
+
+        Ok(ProductionPostprocessProof {
+            turn_id: req.turn_id.clone(),
+            attempt_id: req.attempt_id.clone(),
+            input_node_id: req.input_node_id,
+            turn_index: req.turn_number,
+            variant_id: req.variant_id.clone(),
+            draft_hash: attempt.draft_hash.clone(),
+            summary_text: result.summary_text,
+            batch_digest,
+            applied: true,
+        })
+    }
+
+    fn seed_fixture(&self, path: &Path) -> Result<(Id, String), String> {
+        let root = load_fixture(path)?;
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let fixture_hash = short_hash16(&String::from_utf8_lossy(&bytes));
+
+        let character = character_from_fixture(&root);
+        self.inject_character_from_fixture(&root);
+
+        let mut card = CharacterCard::from_character(&character);
+        let mut defs = Vec::new();
+        for d in &root.definitions {
+            defs.push(definition_from_fixture(d));
+        }
+        // Ensure at least one definition when fixture empty.
+        if defs.is_empty() {
+            defs.push(CharacterDefinition::fallback_from_character(
+                &character,
+                &[],
+            ));
+        }
+        let definitions = storyforge_app_agent::attach_definitions_to_card(defs, &card.id);
+        card.character_definitions = definitions;
+        card.id = Id::from_str(&root.character.id);
+
+        let stored = StoredCard {
+            card: card.clone(),
+            imported_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let payload = serde_json::to_value(&stored).map_err(|e| e.to_string())?;
+        sqlite_runtime::save_card_payload(
+            &card.id,
+            &card.name,
+            Some(card.source_character_id.as_str()),
+            Some(stored.imported_at.as_str()),
+            &payload,
+        )?;
+
+        let campaign = Campaign::new(card.id.clone(), "m5-sqlite-endurance".to_string());
+        let campaign_id = campaign.id.clone();
+        sqlite_runtime::save_campaign(&campaign)?;
+
+        let conversation = self
+            .conv_store
+            .create_persisted(None, Some(campaign_id.clone()))
+            .map_err(|e| e.to_string())?;
+        let conversation_id = conversation.id;
+        let mut campaign = sqlite_runtime::get_campaign(&campaign_id)?
+            .ok_or_else(|| "campaign missing after save".to_string())?;
+        campaign.conversation_id = Some(conversation_id);
+        sqlite_runtime::save_campaign(&campaign)?;
+
+        for def in &card.character_definitions {
+            if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
+                let inst = CharacterInstance::from_definition(campaign_id.clone(), def);
+                sqlite_runtime::save_instance(&inst)?;
+            }
+        }
+
+        // Temporary definition intentionally not instantiated until pipeline creates it.
+        let _ = (
+            root.fixture_version,
+            root.safe_probe_facts,
+            root.must_not_reveal,
+        );
+        Ok((campaign_id, fixture_hash))
+    }
+
+    fn inject_character_from_fixture(&self, root: &FixtureRoot) {
+        let character = character_from_fixture(root);
+        let mut ctx = self.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        ctx.characters.retain(|c| c.name != character.name);
+        if let Some(wi) = character.embedded_world_info.clone() {
+            ctx.world_info = Some(Arc::new(wi));
+        }
+        ctx.characters.push(Arc::new(character));
+    }
+}
+
+/// TurnAttemptSink that routes through the process SQLite preaccept gateway.
+struct SqliteGatewayTurnAttemptSink;
+
+impl TurnAttemptSink for SqliteGatewayTurnAttemptSink {
+    fn load_turn(&self, turn_id: &Id) -> Result<Option<TurnRecord>, String> {
+        sqlite_runtime::get_turn(turn_id)
+    }
+
+    fn sync_autofix(
+        &self,
+        identity: &PostprocessIdentity,
+        final_text: &str,
+        report: QualityReport,
+    ) -> Result<(), ProductionPostprocessError> {
+        // Typed precheck
+        let turn = sqlite_runtime::get_turn(&identity.turn_id)
+            .map_err(ProductionPostprocessError::AutofixSync)?
+            .ok_or_else(|| ProductionPostprocessError::AttemptMissing {
+                turn_id: identity.turn_id.to_string(),
+                attempt_id: identity.attempt_id.to_string(),
+            })?;
+        if turn.campaign_id != identity.campaign_id {
+            return Err(ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                expected: identity.campaign_id.to_string(),
+                actual: turn.campaign_id.to_string(),
+            });
+        }
+        if turn.conversation_id != identity.conversation_id {
+            return Err(ProductionPostprocessError::ScopeMismatch {
+                field: "conversation_id",
+                expected: identity.conversation_id.to_string(),
+                actual: turn.conversation_id.to_string(),
+            });
+        }
+        if turn.find_attempt(&identity.attempt_id).is_none() {
+            return Err(ProductionPostprocessError::AttemptMissing {
+                turn_id: identity.turn_id.to_string(),
+                attempt_id: identity.attempt_id.to_string(),
+            });
+        }
+        let writable = matches!(
+            turn.status,
+            TurnStatus::DraftReady | TurnStatus::DerivingState
+        ) && turn.find_attempt(&identity.attempt_id).is_some_and(|a| {
+            matches!(
+                a.status,
+                AttemptStatus::DraftReady | AttemptStatus::DerivingState
+            )
+        });
+        if !writable {
+            return Ok(());
+        }
+        sqlite_runtime::sync_autofix(AutofixSyncRequest {
+            campaign_id: &identity.campaign_id,
+            conversation_id: &identity.conversation_id,
+            turn_id: &identity.turn_id,
+            attempt_id: &identity.attempt_id,
+            final_text,
+            quality_report: report,
+        })
+        .map_err(ProductionPostprocessError::AutofixSync)
+    }
+
+    fn attach_postprocess(
+        &self,
+        identity: &PostprocessIdentity,
+        batch: Option<storyforge_domain::turn::MutationBatch>,
+        derivation: storyforge_domain::turn::DerivationComponents,
+    ) -> Result<bool, String> {
+        match sqlite_runtime::apply_postprocess(PostprocessApplyRequest {
+            campaign_id: &identity.campaign_id,
+            conversation_id: &identity.conversation_id,
+            turn_id: &identity.turn_id,
+            attempt_id: &identity.attempt_id,
+            batch,
+            derivation,
+        })? {
+            PostprocessApplyOutcome::Applied | PostprocessApplyOutcome::AlreadyApplied => Ok(true),
+            PostprocessApplyOutcome::SkippedLate => Ok(false),
+        }
+    }
+
+    fn mark_failed_if_current(
+        &self,
+        identity: &PostprocessIdentity,
+        reason: String,
+    ) -> Result<bool, String> {
+        // Minimal fail path via mutate if current and writable.
+        sqlite_runtime::mutate_turn_if(
+            &identity.turn_id,
+            |record| {
+                record.campaign_id == identity.campaign_id
+                    && record.conversation_id == identity.conversation_id
+                    && turn_lifecycle::is_current_attempt_ready_for_postprocess(
+                        record,
+                        &identity.attempt_id,
+                    )
+            },
+            |record| {
+                record.status = TurnStatus::Failed;
+                record.failure_reason = Some(reason);
+                record.touch();
+            },
+        )
+    }
+}
+
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL)
+}
+
+fn load_fixture(path: &Path) -> Result<FixtureRoot, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn character_from_fixture(root: &FixtureRoot) -> Character {
+    let mut entries = Vec::new();
+    for (i, wi) in root.character.world_info.iter().enumerate() {
+        let route = match wi.route.as_str() {
+            "selective" => LoreRoute::Selective,
+            "both" => LoreRoute::Both,
+            _ => LoreRoute::Constant,
+        };
+        entries.push(WorldInfoEntry {
+            st_id: Some(i as i32),
+            keys: wi.keys.clone(),
+            secondary_keys: vec![],
+            content: wi.content.clone(),
+            constant: wi.constant,
+            selective: wi.selective,
+            selective_logic: SelectiveLogic::And,
+            disabled: false,
+            position: 0,
+            depth: 4,
+            order: i as i32,
+            route,
+            extensions: serde_json::Value::Null,
+            extra: Default::default(),
+        });
+    }
+    Character {
+        id: Id::from_str(&root.character.id),
+        name: root.character.name.clone(),
+        description: root.character.description.clone(),
+        personality: root.character.personality.clone(),
+        scenario: root.character.scenario.clone(),
+        first_mes: root.character.first_mes.clone(),
+        mes_example: String::new(),
+        system_prompt: root.character.system_prompt.clone(),
+        post_history_instructions: String::new(),
+        tags: root.character.tags.clone(),
+        creator: root.character.creator.clone(),
+        character_version: root.character.character_version.clone(),
+        alternate_greetings: vec![],
+        embedded_world_info: Some(WorldInfoBook {
+            entries,
+            source: Source::Native,
+            metadata: Default::default(),
+        }),
+        extensions: serde_json::Value::Null,
+        renderable_assets: Default::default(),
+        source: Source::Native,
+        spec_version: "3.0".to_string(),
+        raw_card_json: serde_json::Value::Null,
+    }
+}
+
+fn definition_from_fixture(d: &FixtureDefinition) -> CharacterDefinition {
+    let role_type = match d.role_type.as_str() {
+        "supporting" => RoleType::Supporting,
+        "extra" | "temporary" => RoleType::Extra,
+        _ => RoleType::Protagonist,
+    };
+    let mut def = CharacterDefinition::fallback_from_character(
+        &Character {
+            id: Id::from_str(&d.id),
+            name: d.name.clone(),
+            description: d.persona_prompt.clone(),
+            personality: d.behavior_rules.clone(),
+            scenario: String::new(),
+            first_mes: String::new(),
+            mes_example: String::new(),
+            system_prompt: String::new(),
+            post_history_instructions: String::new(),
+            tags: vec![],
+            creator: "fixture".into(),
+            character_version: "1".into(),
+            alternate_greetings: vec![],
+            embedded_world_info: None,
+            extensions: serde_json::Value::Null,
+            renderable_assets: Default::default(),
+            source: Source::Native,
+            spec_version: "3.0".into(),
+            raw_card_json: serde_json::Value::Null,
+        },
+        &[],
+    );
+    def.id = Id::from_str(&d.id);
+    def.name = d.name.clone();
+    def.role_type = role_type;
+    def.persona_prompt = d.persona_prompt.clone();
+    def.behavior_rules = d.behavior_rules.clone();
+    def
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_loads_and_hashes() {
+        let path = fixture_path();
+        assert!(
+            path.exists(),
+            "fixture must be committed at {}",
+            path.display()
+        );
+        let root = load_fixture(&path).expect("fixture parse");
+        assert_eq!(root.fixture_version, "m5_sqlite_endurance_v1");
+        assert_eq!(root.safe_probe_facts.len(), 3);
+        assert!(root.definitions.len() >= 4);
+    }
+}

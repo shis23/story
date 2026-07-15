@@ -332,6 +332,54 @@ impl SqliteProductionRepository {
         Ok(())
     }
 
+    /// Persist a character-card wrapper payload (Tauri `StoredCard` JSON shape).
+    ///
+    /// Used by opt-in SQLite harness bootstrap and cutover-like seeding. The
+    /// payload is stored as opaque JSON so this crate stays free of Tauri DTOs.
+    pub fn save_card_payload(
+        db: &mut Database,
+        card_id: &Id,
+        name: &str,
+        source_character_id: Option<&str>,
+        imported_at: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let payload_json = json(payload)?;
+        tx.execute(
+            r#"
+            INSERT INTO character_cards (card_id, source_character_id, name, imported_at, payload_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(card_id) DO UPDATE SET
+                source_character_id = excluded.source_character_id,
+                name = excluded.name,
+                imported_at = excluded.imported_at,
+                payload_json = excluded.payload_json
+            "#,
+            rusqlite::params![
+                card_id.as_str(),
+                source_character_id,
+                name,
+                imported_at,
+                payload_json
+            ],
+        )?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Persist a character instance outside of accept (campaign setup path).
+    pub fn save_instance(db: &mut Database, instance: &CharacterInstance) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        write_instance(tx, instance)?;
+        uow.commit()?;
+        Ok(())
+    }
+
     /// Mark every non-terminal turn Failed. Used by SQLite startup recovery where
     /// accept is atomic (no multi-file Committing journal to replay).
     pub fn fail_incomplete_turns(db: &mut Database) -> Result<usize> {

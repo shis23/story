@@ -3813,7 +3813,7 @@ async fn index_round_summaries_async(
     }
 }
 
-struct CampaignContextSnapshot {
+pub struct CampaignContextSnapshot {
     active_id: Id,
     story_clock: String,
     turn: u32,
@@ -4024,7 +4024,8 @@ fn load_campaign_context_snapshot(
 /// pipeline receives the same immutable domain snapshot as the JSON backend,
 /// but every Campaign/instance/task/knowledge/summary read and every epoch
 /// refresh write uses the process-owned SQLite authority.
-fn load_sqlite_campaign_context_snapshot(
+/// Public for harness SQLite endurance: same snapshot path as production opt-in.
+pub fn load_sqlite_campaign_context_snapshot(
     active_id: &Id,
 ) -> Result<Option<CampaignContextSnapshot>, String> {
     let Some(mut camp) = sqlite_runtime::get_campaign(active_id)? else {
@@ -4107,7 +4108,8 @@ fn load_sqlite_campaign_context_snapshot(
     }))
 }
 
-fn apply_campaign_context_snapshot(
+/// Apply a pre-built campaign context snapshot (JSON or SQLite).
+pub fn apply_campaign_context_snapshot(
     ctx: &mut WritingContext,
     tool_ctx: &Arc<RwLock<ToolContext>>,
     snapshot: CampaignContextSnapshot,
@@ -4281,6 +4283,24 @@ fn compute_context_epoch_refresh_parts(
 ///
 /// 调用前应已清空 `ctx.campaign_runtime` 与 `tool_ctx.campaign_runtime`（防 stale）。
 /// 若 store 中找不到该 campaign，直接返回（无 campaign 模式）。
+/// Fill WritingContext from the process-owned SQLite authority (opt-in only).
+pub fn fill_campaign_runtime_from_sqlite(
+    ctx: &mut WritingContext,
+    tool_ctx: &Arc<RwLock<ToolContext>>,
+    active_id: &Id,
+) -> Result<(), String> {
+    if !sqlite_runtime::is_sqlite_active() {
+        return Err("fill_campaign_runtime_from_sqlite requires SQLite backend".into());
+    }
+    match load_sqlite_campaign_context_snapshot(active_id)? {
+        Some(snapshot) => {
+            apply_campaign_context_snapshot(ctx, tool_ctx, snapshot);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 pub fn fill_campaign_runtime_from_store(
     ctx: &mut WritingContext,
     tool_ctx: &Arc<RwLock<ToolContext>>,

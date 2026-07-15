@@ -244,6 +244,38 @@ pub fn save_campaign(campaign: &Campaign) -> Result<(), String> {
     })
 }
 
+/// Persist a card payload under the process-owned SQLite authority.
+///
+/// `payload` should be the Tauri `StoredCard` JSON shape (`{ card, imported_at }`)
+/// so production context loaders can deserialize it unchanged.
+pub fn save_card_payload(
+    card_id: &Id,
+    name: &str,
+    source_character_id: Option<&str>,
+    imported_at: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_card_payload(
+            db,
+            card_id,
+            name,
+            source_character_id,
+            imported_at,
+            payload,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+pub fn save_instance(
+    instance: &storyforge_domain::campaign::CharacterInstance,
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_instance(db, instance).map_err(|e| e.to_string())
+    })
+}
+
 /// Atomic Accept through the SQLite production UoW.
 pub fn accept_by_variant(
     campaign_id: &Id,

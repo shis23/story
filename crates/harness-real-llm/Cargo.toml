@@ -11,6 +11,7 @@ storyforge-infra-import.workspace = true
 storyforge-infra-llm.workspace = true
 storyforge-infra-util.workspace = true
 storyforge-infra-vector.workspace = true
+storyforge-infra-sqlite = { path = "../infra-sqlite" }
 storyforge-app-agent.workspace = true
 storyforge-app-conversation.workspace = true
 storyforge-app-pipeline.workspace = true
@@ -27,4 +28,5 @@ chrono.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

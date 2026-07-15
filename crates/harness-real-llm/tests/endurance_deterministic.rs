@@ -458,6 +458,10 @@ fn endurance_turn_record_for_regenerate_action() {
         turn_status: "Committed".into(),
         assertions: vec![],
         elapsed_ms: 100,
+        write_path: None,
+        chronicle_path: None,
+        accept_path: None,
+        production_postprocess_complete: None,
     });
     assert_eq!(rec.kind, "endurance_regenerate_editor");
     assert!(rec.draft_accepted);
@@ -495,6 +499,10 @@ fn endurance_turn_record_for_private_probe() {
         turn_status: "Committed".into(),
         assertions: vec![],
         elapsed_ms: 50,
+        write_path: None,
+        chronicle_path: None,
+        accept_path: None,
+        production_postprocess_complete: None,
     });
     assert_eq!(rec.kind, "endurance_private_probe");
     let mode = rec

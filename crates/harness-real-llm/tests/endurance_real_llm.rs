@@ -452,6 +452,10 @@ async fn run_endurance_stage(
             turn_status: format!("{:?}", accept.turn_status),
             assertions: accept.assertions.clone(),
             elapsed_ms,
+            write_path: None,
+            chronicle_path: None,
+            accept_path: None,
+            production_postprocess_complete: None,
         });
         turn_writer.write_turn(turn_rec)?;
 

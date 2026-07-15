@@ -1,0 +1,105 @@
+{
+  "fixture_version": "m5_sqlite_endurance_v1",
+  "name": "SQLite M5 endurance synthetic multi-role matrix",
+  "safe_probe_facts": [
+    "PROBE_FACT_ALPHA_DOCK_CODE",
+    "PROBE_FACT_BETA_LEDGER_MARK",
+    "PROBE_FACT_GAMMA_WHISTLE_NOTE"
+  ],
+  "must_not_reveal": [
+    "OWNER_ONLY_SECRET_CHEN_BADGE",
+    "OWNER_ONLY_SECRET_LIN_PASSCODE"
+  ],
+  "character": {
+    "id": "m5-sqlite-endurance-card",
+    "name": "雨港矩阵",
+    "description": "合成多角色矩阵卡：主角陈、支援林、临时角色以及同名不同 ID 的两名码头工人。仅用于 SQLite endurance 证据，无真实私人内容。",
+    "personality": "多角色协作、信息隔离、任务推进。",
+    "scenario": "雨夜港口矩阵测试场景。",
+    "first_mes": "雨水打在码头钢板。陈压低声音：保持矩阵观测，不要把私密徽章编号说出口。",
+    "system_prompt": "你是合成矩阵卡的写作助手，只推进可验证场景，不输出私密编号原文。",
+    "creator": "storyforge-harness",
+    "character_version": "1.0",
+    "tags": ["synthetic", "m5", "sqlite", "endurance"],
+    "world_info": [
+      {
+        "keys": ["港口", "码头"],
+        "content": "港口矩阵区是测试世界书常量路由。",
+        "constant": true,
+        "selective": false,
+        "route": "constant"
+      },
+      {
+        "keys": ["徽章", "陈"],
+        "content": "选择性路由：仅当触发徽章相关关键词时注入。",
+        "constant": false,
+        "selective": true,
+        "route": "selective"
+      },
+      {
+        "keys": ["账本", "林"],
+        "content": "双路由世界书条目：常量+选择。",
+        "constant": true,
+        "selective": true,
+        "route": "both"
+      }
+    ]
+  },
+  "definitions": [
+    {
+      "id": "def-chen",
+      "name": "陈",
+      "role_type": "protagonist",
+      "persona_prompt": "陈：银鸦卧底，谨慎。",
+      "behavior_rules": "不泄露徽章编号。",
+      "private_knowledge": ["OWNER_ONLY_SECRET_CHEN_BADGE"]
+    },
+    {
+      "id": "def-lin",
+      "name": "林",
+      "role_type": "supporting",
+      "persona_prompt": "林：外部调查员。",
+      "behavior_rules": "不泄露访问密码。",
+      "private_knowledge": ["OWNER_ONLY_SECRET_LIN_PASSCODE"]
+    },
+    {
+      "id": "def-temp-courier",
+      "name": "临时信使",
+      "role_type": "extra",
+      "persona_prompt": "临时信使，只知道公开码头动向。",
+      "behavior_rules": "无私密知识。",
+      "private_knowledge": []
+    },
+    {
+      "id": "def-docker-a",
+      "name": "码头工人",
+      "role_type": "supporting",
+      "persona_prompt": "码头工人甲。",
+      "behavior_rules": "同名不同 ID 矩阵 A。",
+      "private_knowledge": []
+    },
+    {
+      "id": "def-docker-b",
+      "name": "码头工人",
+      "role_type": "supporting",
+      "persona_prompt": "码头工人乙。",
+      "behavior_rules": "同名不同 ID 矩阵 B。",
+      "private_knowledge": []
+    }
+  ],
+  "mvu_schema": {
+    "tension": { "type": "number", "default": 1 },
+    "trust_chen_lin": { "type": "number", "default": 0 }
+  },
+  "tasks": [
+    {
+      "id": "task-watch-ship",
+      "title": "监视可疑货船",
+      "status": "pending"
+    }
+  ],
+  "variables": {
+    "campaign.matrix_mode": "sqlite_endurance",
+    "campaign.probe_ready": "false"
+  }
+}

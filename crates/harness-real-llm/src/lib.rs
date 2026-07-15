@@ -23,6 +23,7 @@
 pub mod budget;
 pub mod commit_probe;
 pub mod context_compile_bench;
+pub mod coverage_ledger;
 pub mod endurance;
 pub mod evidence;
 pub mod evidence_retention;
@@ -30,6 +31,7 @@ pub mod long_session;
 pub mod observability;
 pub mod phase_b_matrix;
 pub mod production_evidence;
+pub mod sqlite_endurance;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
