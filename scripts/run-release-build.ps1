@@ -406,12 +406,15 @@ try {
         Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
     } else {
         $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
-        $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
+        # Direct assignment (no @(Copy-...)): Copy already returns object[]. Flatten defensively.
+        $stagedSubjects = ConvertTo-ReleaseStagedSubjectArray -InputObject (
+            Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot
+        )
         foreach ($s in $stagedSubjects) {
             Write-Host ("Staged subject: {0} (source={1}) sha256={2}" -f $s.relative_path, $s.source_relative_path, $s.sha256)
         }
     }
-    if ($null -eq $stagedSubjects) { $stagedSubjects = [object[]]@() }
+    $stagedSubjects = ConvertTo-ReleaseStagedSubjectArray -InputObject $stagedSubjects
 
     # Manifest keeps source-tree artifact paths and a separate staged_subjects
     # list for offline verification under subjects/....

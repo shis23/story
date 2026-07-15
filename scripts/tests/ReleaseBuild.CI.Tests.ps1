@@ -175,10 +175,14 @@ Describe 'ReleaseBuild evidence subject staging' {
             [System.IO.File]::WriteAllBytes($exe, [byte[]](1, 2, 3, 4, 5))
             $sha = Get-ReleaseFileSha256 -Path $exe
             $art = New-ReleaseArtifactRecord -RelativePath 'target/release/storyforge.exe' -SizeBytes 5 -Sha256 $sha -Kind 'windows-exe' -Status 'present'
-            $staged = Copy-ReleaseEvidenceSubjects -Artifacts @($art) -EvidenceDir $evidence -RepoRoot $repo
-            $staged.Count | Should Be 1
-            $staged[0].relative_path | Should Match '^subjects/'
-            $subjectPath = Join-Path $evidence ($staged[0].relative_path -replace '/', '\')
+            # Prefer direct assignment; @() wrapper around unary-comma returns can nest.
+            $staged = ConvertTo-ReleaseStagedSubjectArray -InputObject (
+                Copy-ReleaseEvidenceSubjects -Artifacts @($art) -EvidenceDir $evidence -RepoRoot $repo
+            )
+            @($staged).Count | Should Be 1
+            $record = @($staged)[0]
+            $record.relative_path | Should Match '^subjects/'
+            $subjectPath = Join-Path $evidence ($record.relative_path -replace '/', '\')
             Test-Path -LiteralPath $subjectPath | Should Be $true
             Test-Path -LiteralPath ($subjectPath + '.sha256') | Should Be $true
             $rehash = Get-ReleaseFileSha256 -Path $subjectPath

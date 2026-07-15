@@ -232,8 +232,26 @@ Further P0 hardening:
 7. TOCTOU model unchanged: open-then-hash + reparse rejection; package
    immutability assumed during verification (not a sealed OS snapshot handle).
 
-Full suite after this pass: **133** Pester tests passed
-(37 + 14 + 31 + 51). Windows/Android dry-runs exit 0. `git diff --check` clean.
+### P0 runner-shape flatten + P1 source mapping / sidecar grammar
+
+1. **Runner shape:** Windows/Android runners no longer use
+   `@(Copy-ReleaseEvidenceSubjects ...)`. They assign directly and flatten via
+   `ConvertTo-ReleaseStagedSubjectArray` so unary-comma `object[]` returns do
+   not nest into `manifest.staged_subjects`.
+2. **Regression:** nested `@(Copy-...)` input flattens to flat staged records;
+   non-dry-run `build_status=ok` package verifies offline.
+3. **P1 source mapping:** each present `staged_subject` must uniquely map to
+   one present `manifest.artifact` by
+   `source_relative_path` + `kind` + `sha256` + `size_bytes` + `status`.
+   Missing source, orphan source, field inconsistency, and duplicate mapping
+   fail closed. Offline verifier does **not** reopen source files outside the
+   package; it checks the declared chain only.
+4. **P1 sidecar grammar:** sidecars must be a **single** standard
+   `sha256sum` line (`^[0-9a-f]{64} \*<basename>$`). Hash-only, multi-line, and
+   path-bearing basenames fail closed.
+
+Full suite after this pass: **136** Pester tests passed
+(37 + 14 + 31 + 54). Windows/Android dry-runs exit 0. `git diff --check` clean.
 
 ## Risks / follow-ups
 

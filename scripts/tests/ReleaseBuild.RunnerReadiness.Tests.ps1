@@ -914,6 +914,174 @@ Describe 'Release offline evidence package verifier' {
         }
     }
 
+    It 'P0: runner-shape Copy (unary-comma object[]) flattens into manifest.staged_subjects and verifies ok' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-runner-shape-{0}" -f [guid]::NewGuid().ToString('N'))
+        $evidence = Join-Path $repo 'artifacts\release-build\windows-run'
+        $binDir = Join-Path $repo 'target\release'
+        New-Item -ItemType Directory -Path $binDir, $evidence -Force | Out-Null
+        try {
+            $exe = Join-Path $binDir 'storyforge.exe'
+            [System.IO.File]::WriteAllBytes($exe, [byte[]](1, 2, 3, 4, 5, 6))
+            $sha = Get-ReleaseFileSha256 -Path $exe
+            $art = New-ReleaseArtifactRecord -RelativePath 'target/release/storyforge.exe' -SizeBytes 6 -Sha256 $sha -Kind 'windows-exe' -Status 'present'
+
+            # Exact runner anti-pattern that nests: @(Copy-...) around unary-comma object[].
+            $nested = @(Copy-ReleaseEvidenceSubjects -Artifacts @($art) -EvidenceDir $evidence -RepoRoot $repo)
+            # Production helper must flatten to flat records.
+            $flat = ConvertTo-ReleaseStagedSubjectArray -InputObject $nested
+            @($flat).Count | Should Be 1
+            $first = @($flat)[0]
+            @($first.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'relative_path' | Should Be $true
+            [string]$first.relative_path | Should Match '^subjects/'
+
+            $inv = [pscustomobject]@{
+                relative_path = 'dependency-inventory.json'
+                sha256 = ('c' * 64)
+                component_count = 1
+                generator = 'fallback'
+            }
+            $inventory = [pscustomobject]@{ generator = 'fallback'; components = @([pscustomobject]@{ name = 'storyforge'; version = '0.0.0' }) }
+            $invPath = Join-Path $evidence 'dependency-inventory.json'
+            Write-ReleaseJson -Object $inventory -Path $invPath
+            $inv.sha256 = Get-ReleaseFileSha256 -Path $invPath
+
+            $manifest = New-ReleaseBuildManifest `
+                -Commit 'abcdef0123456789abcdef0123456789abcdef01' `
+                -Branch 'codex/release-runner-readiness' `
+                -Target 'x86_64-pc-windows-msvc' `
+                -ToolVersions @{ rustc = '1'; cargo = '1'; node = '20'; npm = '10' } `
+                -Artifacts @($art) `
+                -StagedSubjects $flat `
+                -DependencyInventory $inv `
+                -BuildStatus 'ok' `
+                -Warnings @() `
+                -Notes @('host-only; GUI acceptance not claimed') `
+                -RepoRoot $repo
+            # staged_subjects must be flat records, not nested arrays.
+            @($manifest.staged_subjects).Count | Should Be 1
+            $ss0 = @($manifest.staged_subjects)[0]
+            @($ss0.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'source_relative_path' | Should Be $true
+            [string]$ss0.source_relative_path | Should Be 'target/release/storyforge.exe'
+
+            $prov = New-ReleaseProvenance `
+                -Commit 'abcdef0123456789abcdef0123456789abcdef01' `
+                -Branch 'codex/release-runner-readiness' `
+                -Target 'x86_64-pc-windows-msvc' `
+                -Artifacts @($flat) `
+                -RepoRoot $repo
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $evidence 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $evidence 'provenance.json')
+
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $evidence
+            if (-not $result.Valid) {
+                throw ("runner-shape ok package should verify, errors: {0}" -f ($result.Errors -join '; '))
+            }
+            $result.Valid | Should Be $true
+            $result.subject_count | Should BeGreaterThan 0
+        } finally {
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P1: each present staged_subject uniquely maps to one present artifact by source fields' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-map-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            # Missing source_relative_path
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $manifest.staged_subjects[0].PSObject.Properties.Remove('source_relative_path')
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            $noSource = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $noSource.Valid | Should Be $false
+            ($noSource.Errors -join ' ') | Should Match 'source_relative_path|source|mapping|orphan'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir2 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-map2-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            # Hash mismatch vs present artifact
+            New-SyntheticEvidencePackage -Root $dir2 -RunnerTopology | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir2 'manifest.json') -Raw | ConvertFrom-Json
+            $manifest.staged_subjects[0].sha256 = ('d' * 64)
+            $prov = Get-Content -LiteralPath (Join-Path $dir2 'provenance.json') -Raw | ConvertFrom-Json
+            $prov.subjects[0].sha256 = ('d' * 64)
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir2 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir2 'provenance.json')
+            $mismatch = Test-ReleaseEvidencePackage -EvidenceDir $dir2
+            $mismatch.Valid | Should Be $false
+            ($mismatch.Errors -join ' ') | Should Match 'mapping|source|mismatch|inconsistent|sha256|size|kind'
+        } finally {
+            Remove-Item -LiteralPath $dir2 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir3 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-map3-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            # Two staged subjects claim the same present artifact (duplicate mapping)
+            New-SyntheticEvidencePackage -Root $dir3 -RunnerTopology | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir3 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir3 'provenance.json') -Raw | ConvertFrom-Json
+            $dupStaged = $manifest.staged_subjects[0]
+            $dup2 = [pscustomobject]@{
+                relative_path = 'subjects/windows-exe/storyforge-copy.exe'
+                source_relative_path = [string]$dupStaged.source_relative_path
+                size_bytes = [long]$dupStaged.size_bytes
+                sha256 = [string]$dupStaged.sha256
+                kind = [string]$dupStaged.kind
+                status = 'present'
+                hash_sidecar = 'subjects/windows-exe/storyforge-copy.exe.sha256'
+            }
+            $srcPath = Join-Path $dir3 'subjects\windows-exe\storyforge.exe'
+            $copyPath = Join-Path $dir3 'subjects\windows-exe\storyforge-copy.exe'
+            Copy-Item -LiteralPath $srcPath -Destination $copyPath -Force
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText(($copyPath + '.sha256'), ("{0} *storyforge-copy.exe" -f $dupStaged.sha256), $utf8NoBom)
+            $manifest.staged_subjects = @($dupStaged, $dup2)
+            $prov.subjects = @(
+                [pscustomobject]@{ relative_path = $dupStaged.relative_path; size_bytes = $dupStaged.size_bytes; sha256 = $dupStaged.sha256; kind = $dupStaged.kind; status = 'present' },
+                [pscustomobject]@{ relative_path = $dup2.relative_path; size_bytes = $dup2.size_bytes; sha256 = $dup2.sha256; kind = $dup2.kind; status = 'present' }
+            )
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir3 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir3 'provenance.json')
+            $dup = Test-ReleaseEvidencePackage -EvidenceDir $dir3
+            $dup.Valid | Should Be $false
+            ($dup.Errors -join ' ') | Should Match 'duplicate|mapping|source'
+        } finally {
+            Remove-Item -LiteralPath $dir3 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P1: rejects sidecar content that is not a full standard sha256sum single line' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-sidecar-gram-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
+            $sidecar = Join-Path $dir 'subjects\windows-exe\storyforge.exe.sha256'
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            # Hash-only line (missing binary marker and basename) must fail closed.
+            $hashOnly = (Get-Content -LiteralPath $sidecar -Raw).Trim().Substring(0, 64)
+            [System.IO.File]::WriteAllText($sidecar, $hashOnly, $utf8NoBom)
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'sidecar|grammar|sum line|sha256sum|format'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir2 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-sidecar-multi-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir2 -RunnerTopology | Out-Null
+            $sidecar = Join-Path $dir2 'subjects\windows-exe\storyforge.exe.sha256'
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            $line = (Get-Content -LiteralPath $sidecar -Raw).Trim()
+            [System.IO.File]::WriteAllText($sidecar, ($line + "`n" + $line), $utf8NoBom)
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir2
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'sidecar|grammar|single|sum line|format|multi'
+        } finally {
+            Remove-Item -LiteralPath $dir2 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'P1: requires non-negative size_bytes and fails closed on size mismatch or missing size' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-size-{0}" -f [guid]::NewGuid().ToString('N'))
         try {

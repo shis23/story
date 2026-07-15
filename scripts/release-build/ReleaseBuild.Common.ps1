@@ -289,6 +289,82 @@ function Test-ReleaseStagedSubjectPath {
     return [bool]($rel -match '^(?i)subjects/')
 }
 
+function ConvertTo-ReleaseStagedSubjectArray {
+    <#
+    .SYNOPSIS
+    Flattens runner-shaped staged subject results into a flat object[] of records.
+
+    .DESCRIPTION
+    Copy-ReleaseEvidenceSubjects returns a unary-comma object[]. Wrapping that
+    return with @(...) can nest arrays. This helper unwraps nested arrays and
+    yields a flat object[] of staged subject records for manifest/provenance.
+    #>
+    param(
+        [AllowNull()][object]$InputObject
+    )
+
+    $flat = New-Object System.Collections.Generic.List[object]
+    function Add-Flattened {
+        param([AllowNull()][object]$Node)
+        if ($null -eq $Node) { return }
+        if ($Node -is [string] -or $Node -is [ValueType]) { return }
+        # Treat objects that already look like staged records as leaves.
+        if ($Node -is [pscustomobject] -or $Node -is [System.Management.Automation.PSObject]) {
+            $names = @($Node.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($names -contains 'relative_path' -or $names -contains 'source_relative_path' -or $names -contains 'sha256') {
+                $flat.Add($Node) | Out-Null
+                return
+            }
+        }
+        if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
+            foreach ($item in @($Node)) {
+                Add-Flattened -Node $item
+            }
+            return
+        }
+    }
+    Add-Flattened -Node $InputObject
+    # Unary comma preserves empty and single-element object[] across function returns.
+    return ,([object[]]@($flat.ToArray()))
+}
+
+function Test-ReleaseSha256SumLine {
+    <#
+    .SYNOPSIS
+    Validates a single standard sha256sum line: "<64-hex> *basename".
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [string]$ExpectedBasename
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return [pscustomobject]@{ Valid = $false; Hash = $null; Basename = $null; Reason = 'empty' }
+    }
+    # Exactly one non-empty line (allow a single trailing newline after TrimEnd of outer reader).
+    $normalized = $Text -replace "`r`n", "`n" -replace "`r", "`n"
+    if ($normalized.Contains("`n")) {
+        $parts = @($normalized -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($parts.Count -ne 1) {
+            return [pscustomobject]@{ Valid = $false; Hash = $null; Basename = $null; Reason = 'multi-line' }
+        }
+        $normalized = $parts[0]
+    }
+    $normalized = $normalized.Trim()
+    if ($normalized -notmatch '^(?i)([0-9a-f]{64}) \*(.+)$') {
+        return [pscustomobject]@{ Valid = $false; Hash = $null; Basename = $null; Reason = 'grammar' }
+    }
+    $hash = $Matches[1].ToLowerInvariant()
+    $base = $Matches[2]
+    if ($base -match '[\\/]' -or $base -match '\s') {
+        return [pscustomobject]@{ Valid = $false; Hash = $hash; Basename = $base; Reason = 'basename' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedBasename) -and $base -ne $ExpectedBasename) {
+        return [pscustomobject]@{ Valid = $false; Hash = $hash; Basename = $base; Reason = 'basename-mismatch' }
+    }
+    return [pscustomobject]@{ Valid = $true; Hash = $hash; Basename = $base; Reason = 'ok' }
+}
+
 function New-ReleaseBuildManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -340,7 +416,7 @@ function New-ReleaseBuildManifest {
         Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
     })
 
-    if ($null -eq $StagedSubjects) { $StagedSubjects = @() }
+    $flatStaged = ConvertTo-ReleaseStagedSubjectArray -InputObject $StagedSubjects
 
     $manifest = [pscustomobject]@{
         schema_version = 1
@@ -351,7 +427,7 @@ function New-ReleaseBuildManifest {
         tool_versions  = $safeTools
         artifacts      = @($Artifacts)
         # Offline-verifiable staged subjects (subjects/...). Source tree paths stay on artifacts.
-        staged_subjects = @($StagedSubjects)
+        staged_subjects = $flatStaged
         dependency_inventory = $DependencyInventory
         build_status   = $BuildStatus
         warnings       = $safeWarnings
@@ -1609,7 +1685,8 @@ function Copy-ReleaseEvidenceSubjects {
             -Status 'present' `
             -HashSidecar $hashSidecarRel)) | Out-Null
     }
-    return ,$staged.ToArray()
+    # Flatten and return object[]. ConvertTo already uses unary-comma return.
+    return (ConvertTo-ReleaseStagedSubjectArray -InputObject $staged.ToArray())
 }
 
 function Assert-ReleaseManifestSchema {
@@ -2507,11 +2584,13 @@ function Test-ReleaseEvidencePackage {
             Add-SafeEvidenceError -Message ("Hash sidecar is UTF-8 BOM encoded (rejected): {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
         }
 
-        $sidecarText = [System.Text.Encoding]::UTF8.GetString($sidecarBytes).Trim()
+        $sidecarText = [System.Text.Encoding]::UTF8.GetString($sidecarBytes)
         if ($sidecarText.Length -gt 0 -and [int][char]$sidecarText[0] -eq 0xFEFF) {
             Add-SafeEvidenceError -Message ("Hash sidecar has BOM marker (rejected): {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
-            $sidecarText = $sidecarText.TrimStart([char]0xFEFF).Trim()
+            $sidecarText = $sidecarText.TrimStart([char]0xFEFF)
         }
+        # Preserve newline structure for multi-line rejection; only strip outer whitespace edges lightly.
+        $sidecarText = $sidecarText.TrimEnd("`0")
 
         $rehash = Get-ReleaseFileSha256 -Path $subjectPath
         $expected = ([string]$Entry.sha256).ToLowerInvariant()
@@ -2526,13 +2605,15 @@ function Test-ReleaseEvidencePackage {
             Add-SafeEvidenceError -Message ("Size mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
         }
 
-        if ($sidecarText -match '([a-fA-F0-9]{64})') {
-            $sidecarHash = $Matches[1].ToLowerInvariant()
+        $expectedBase = Split-Path -Leaf (($rel -replace '\\', '/'))
+        $sumLine = Test-ReleaseSha256SumLine -Text $sidecarText -ExpectedBasename $expectedBase
+        if (-not $sumLine.Valid) {
+            Add-SafeEvidenceError -Message ("Sidecar is not a single standard sha256sum line (grammar={0}): {1}" -f $sumLine.Reason, (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
+        } else {
+            $sidecarHash = [string]$sumLine.Hash
             if ($sidecarHash -ne $rehash -or ($expected -and $sidecarHash -ne $expected)) {
                 Add-SafeEvidenceError -Message ("Sidecar hash mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
             }
-        } else {
-            Add-SafeEvidenceError -Message ("Sidecar content is not a valid sha256 sum line: {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
         }
 
         return $true
@@ -2557,6 +2638,62 @@ function Test-ReleaseEvidencePackage {
         }
         if ($provSubjects.Count -eq 0) {
             Add-SafeEvidenceError -Message 'build_status=ok package has no provenance subjects to bind.'
+        }
+
+        # Each present staged_subject must uniquely map to one present source artifact
+        # by source_relative_path + kind + sha256 + size_bytes + status. Offline verifier
+        # does not reopen the source file outside the package; it checks the declared chain.
+        $presentArtifacts = @($manifest.artifacts | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        $artifactBySource = @{}
+        foreach ($art in $presentArtifacts) {
+            $srcKey = (([string]$art.relative_path) -replace '\\', '/').Trim().TrimStart('./').ToLowerInvariant()
+            while ($srcKey.Contains('//')) { $srcKey = $srcKey -replace '//', '/' }
+            if ([string]::IsNullOrWhiteSpace($srcKey)) { continue }
+            if ($artifactBySource.ContainsKey($srcKey)) {
+                Add-SafeEvidenceError -Message ("duplicate present manifest artifact source path: {0}" -f (Protect-ReleasePath -Text $srcKey -RepoRoot $evidenceRoot))
+            } else {
+                $artifactBySource[$srcKey] = $art
+            }
+        }
+        $mappedSources = @{}
+        foreach ($subj in $stagedSubjects) {
+            $srcRel = $null
+            if ($subj.PSObject.Properties.Name -contains 'source_relative_path') {
+                $srcRel = [string]$subj.source_relative_path
+            }
+            if ([string]::IsNullOrWhiteSpace($srcRel)) {
+                Add-SafeEvidenceError -Message ("staged subject missing source_relative_path mapping: {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
+                continue
+            }
+            $srcKey = ($srcRel -replace '\\', '/').Trim().TrimStart('./').ToLowerInvariant()
+            while ($srcKey.Contains('//')) { $srcKey = $srcKey -replace '//', '/' }
+            if (-not $artifactBySource.ContainsKey($srcKey)) {
+                Add-SafeEvidenceError -Message ("staged subject has no present source artifact mapping: {0}" -f (Protect-ReleasePath -Text $srcRel -RepoRoot $evidenceRoot))
+                continue
+            }
+            if ($mappedSources.ContainsKey($srcKey)) {
+                Add-SafeEvidenceError -Message ("duplicate staged subject mapping to the same source artifact: {0}" -f (Protect-ReleasePath -Text $srcRel -RepoRoot $evidenceRoot))
+                continue
+            }
+            $mappedSources[$srcKey] = $true
+            $art = $artifactBySource[$srcKey]
+            $checks = @(
+                @{ Name = 'kind'; Left = [string]$subj.kind; Right = [string]$art.kind },
+                @{ Name = 'sha256'; Left = ([string]$subj.sha256).ToLowerInvariant(); Right = ([string]$art.sha256).ToLowerInvariant() },
+                @{ Name = 'status'; Left = [string]$subj.status; Right = [string]$art.status }
+            )
+            foreach ($c in $checks) {
+                if ($c.Left -ne $c.Right) {
+                    Add-SafeEvidenceError -Message ("staged subject source mapping inconsistent on {0}: {1}" -f $c.Name, (Protect-ReleasePath -Text $srcRel -RepoRoot $evidenceRoot))
+                }
+            }
+            $subjSizeOk = $true
+            $artSizeOk = $true
+            try { $subjSize = [long]$subj.size_bytes } catch { $subjSizeOk = $false }
+            try { $artSize = [long]$art.size_bytes } catch { $artSizeOk = $false }
+            if (-not $subjSizeOk -or -not $artSizeOk -or $subjSize -ne $artSize) {
+                Add-SafeEvidenceError -Message ("staged subject source mapping inconsistent on size_bytes: {0}" -f (Protect-ReleasePath -Text $srcRel -RepoRoot $evidenceRoot))
+            }
         }
 
         $stagedKeySet = @{}
