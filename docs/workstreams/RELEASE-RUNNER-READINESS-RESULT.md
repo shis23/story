@@ -260,18 +260,26 @@ Further P0 hardening:
    `android-host-evidence` jobs call `Assert-ReleaseEvidencePackage` before
    upload. Weak schema/manual rehash-only loops are removed so mapping, sidecar
    grammar, reparse rejection, and recursive secret scan cannot be bypassed.
-3. **Static contract (job/step order + top-level AST):**
+3. **Static contract (job/step order + flat top-level AST):**
    `full_offline_verifier` is decided by real YAML parse
    (`Test-ReleaseHostEvidenceVerifierOrder` via PyYAML or Node yaml/js-yaml),
    then PowerShell AST reachability checks (`Test-ReleaseRunInvokesCommand`).
    Each of `windows-host-evidence` / `android-host-evidence` must have a `run`
    step with a **top-level reachable** `CommandAst` named
    `Assert-ReleaseEvidencePackage` **before** `actions/upload-artifact`.
+   The verifier step is modeled as a **restricted flat script**: before the
+   wanted command is reached, only simple assignments and a single-command
+   dot-source (`. path`) are allowed.
    Accepted: bare top-level call, top-level assignment RHS
-   (`$result = Assert-...`). Rejected: comment-only, `Write-Host`/string
-   decoys, assignment-only names, commands inside `if`/loop/function/
-   try-catch/nested scriptblock, and calls after top-level `return`/`exit`/
-   `throw`. Structural YAML fallback is never PASS.
+   (`$result = Assert-...`), and production-like setup
+   (`$ErrorActionPreference=...` / `. .\scripts\release-build\...` /
+   `$evidenceDir=...` then Assert).
+   Rejected: comment-only, `Write-Host`/string decoys, assignment-only names,
+   commands inside `if`/loop/function/try-catch/nested scriptblock, any
+   pre-verifier control flow (including `if ($true) { return|exit|throw }`),
+   arbitrary pre-verifier commands (e.g. `Write-Host` before Assert),
+   call-operator (`& path`) forms, multi-command pipelines, and calls after
+   top-level `return`/`exit`/`throw`. Structural YAML fallback is never PASS.
 4. **Main integration + M5 fixture:** merged `main` (`12b5f44`) into this
    branch. `evidence_retention_deterministic.rs::seal_refuses_secret_payload`
    now runtime-assembles its secret-shaped payload so
@@ -279,8 +287,8 @@ Further P0 hardening:
    `ForbiddenPayload` rejection. Prior endurance/SQLite runtime-assembled
    fixtures remain intact.
 
-Full suite after this pass: **145** Pester tests passed
-(37 + 14 + 31 + 63). Windows/Android dry-runs exit 0.
+Full suite after this pass: **146** Pester tests passed
+(37 + 14 + 31 + 64). Windows/Android dry-runs exit 0.
 `Invoke-ReleaseSecretScan` OK. `git diff --check main..HEAD` clean.
 
 **Still not proven:** remote Gitea runner execution, GUI acceptance, device

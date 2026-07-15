@@ -1669,9 +1669,25 @@ jobs:
         # Top-level direct call and top-level assignment RHS remain accepted.
         (Test-ReleaseRunInvokesCommand -ScriptText 'Assert-ReleaseEvidencePackage -EvidenceDir x' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $true
         (Test-ReleaseRunInvokesCommand -ScriptText '$result = Assert-ReleaseEvidencePackage -EvidenceDir x' -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $true
+        # Flat production-like setup (assignment + dot-source + assignment RHS) is accepted.
+        $flatOk = @'
+$ErrorActionPreference = "Stop"
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = "x"
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+Write-Host "ok"
+'@
+        (Test-ReleaseRunInvokesCommand -ScriptText $flatOk -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $true
         # Early return/exit before a top-level call is not a guaranteed execution path for the call.
         (Test-ReleaseRunInvokesCommand -ScriptText "return`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
         (Test-ReleaseRunInvokesCommand -ScriptText "exit 0`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        # Conditional pre-verifier transfer also fails closed (not just bare return/exit/throw).
+        (Test-ReleaseRunInvokesCommand -ScriptText "if (`$true) { return }`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText "if (`$true) { exit 0 }`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText "if (`$true) { throw 'x' }`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        (Test-ReleaseRunInvokesCommand -ScriptText "switch (1) { default { return } }`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
+        # Arbitrary pre-verifier commands (non-dot-source) fail closed.
+        (Test-ReleaseRunInvokesCommand -ScriptText "Write-Host 'setup'`nAssert-ReleaseEvidencePackage -EvidenceDir x" -CommandName 'Assert-ReleaseEvidencePackage') | Should Be $false
 
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-unreach-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -1711,6 +1727,52 @@ jobs:
             $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
             $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
             ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|top-level|reachable|command|executable'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when pre-verifier if-return/exit/throw makes the top-level call non-guaranteed' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-ifxfer-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Conditional return before verifier
+        shell: pwsh
+        run: |
+          if ($true) { return }
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Conditional exit before verifier
+        shell: pwsh
+        run: |
+          if ($true) { exit 0 }
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|control|reachable|executable|command'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }

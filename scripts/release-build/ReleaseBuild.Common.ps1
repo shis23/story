@@ -2827,15 +2827,18 @@ function Assert-ReleaseEvidencePackage {
 function Test-ReleaseRunInvokesCommand {
     <#
     .SYNOPSIS
-    Returns true only for a top-level reachable CommandAst whose command name equals
-    the requested command.
+    Returns true only for a flat, top-level reachable CommandAst whose command name
+    equals the requested command.
 
     .DESCRIPTION
-    Accepts:
+    The verifier step is modeled as a restricted flat script. Before the wanted
+    command is reached, only simple assignments and a single-command dot-source
+    (`. path`) are allowed. Accepts:
       - top-level bare call: Assert-X ...
       - top-level assignment RHS: $result = Assert-X ...
-    Rejects Write-Host/string/assignment decoys and commands nested in if/loop/
-    function/try-catch/scriptblock, or any command after a top-level return/exit/throw.
+    Rejects Write-Host/string decoys, commands nested in if/loop/function/try/
+    scriptblock, any pre-verifier control flow (including `if ($true) { return }`),
+    and any statement after a top-level return/exit/throw.
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
@@ -2886,7 +2889,54 @@ function Test-ReleaseRunInvokesCommand {
             [string]::Equals($Name, 'throw', [System.StringComparison]::OrdinalIgnoreCase)
     }
 
-    # Walk only top-level statements; do not recurse into nested blocks.
+    function Test-IsControlFlowStatement {
+        param([Parameter(Mandatory = $true)]$Statement)
+        return (
+            $Statement -is [System.Management.Automation.Language.IfStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.SwitchStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.ForStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.ForEachStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.WhileStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.DoUntilStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.TryStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.TrapStatementAst] -or
+            $Statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -or
+            $Statement -is [System.Management.Automation.Language.DataStatementAst]
+        )
+    }
+
+    function Test-AssignmentIsWantedCommand {
+        param(
+            [Parameter(Mandatory = $true)]$Assignment,
+            [Parameter(Mandatory = $true)][string]$WantedName
+        )
+        $rhs = $Assignment.Right
+        if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            # PowerShell wraps assignment RHS expressions; pipeline RHS is nested.
+            if ($rhs.Expression -is [System.Management.Automation.Language.PipelineAst]) {
+                $rhs = $rhs.Expression
+            } else {
+                return $false
+            }
+        }
+        if ($rhs -isnot [System.Management.Automation.Language.PipelineAst]) {
+            return $false
+        }
+        $elements = @($rhs.PipelineElements)
+        if ($elements.Count -ne 1 -or $elements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+            return $false
+        }
+        $name = Get-CommandNameFromAst -CommandAst $elements[0]
+        if ($null -eq $name) {
+            return $false
+        }
+        return [string]::Equals($name, $WantedName, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    # Walk only top-level statements. Before the wanted command is reached the step
+    # must stay flat: simple assignment and dot-source only. Nested blocks and any
+    # pre-verifier control flow (including conditional return/exit/throw) fail closed.
     foreach ($stmt in @($root.Statements)) {
         if ($null -eq $stmt) { continue }
 
@@ -2897,53 +2947,81 @@ function Test-ReleaseRunInvokesCommand {
             return $false
         }
 
-        # Pipeline statement: command1 | command2 ...  (we only accept first element command form)
+        # Pre-verifier control flow can skip the call (e.g. if ($true) { return }).
+        if (Test-IsControlFlowStatement -Statement $stmt) {
+            return $false
+        }
+
+        # Pipeline statement: command1 | command2 ...  (single-command only)
         if ($stmt -is [System.Management.Automation.Language.PipelineAst]) {
             $elements = @($stmt.PipelineElements)
             if ($elements.Count -ne 1) {
-                # Pipelines are not a guaranteed standalone top-level verifier call.
-                continue
+                # Multi-command pipelines are not a guaranteed standalone verifier call.
+                return $false
             }
             $elem = $elements[0]
-            if ($elem -is [System.Management.Automation.Language.CommandAst]) {
-                $name = Get-CommandNameFromAst -CommandAst $elem
-                if ($null -eq $name) { continue }
-                if (Test-IsTransferCommand -Name $name) {
-                    # Unconditional transfer makes later top-level statements unreachable.
-                    return $false
-                }
-                if ([string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    return $true
-                }
+            if ($elem -isnot [System.Management.Automation.Language.CommandAst]) {
+                return $false
             }
-            continue
+            # Dot-source (`. path`) is the only non-wanted setup command allowed
+            # before the verifier. InvocationOperator carries the dot; the first
+            # CommandElement is the path expression, not a command name of '.'.
+            if ($elem.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot) {
+                continue
+            }
+            # Call operator (& path) is not accepted as the verifier itself here.
+            if ($elem.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand) {
+                return $false
+            }
+            $name = Get-CommandNameFromAst -CommandAst $elem
+            if ($null -eq $name) {
+                return $false
+            }
+            if (Test-IsTransferCommand -Name $name) {
+                return $false
+            }
+            if ([string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+            # Any other pre-verifier command (Write-Host, etc.) fails closed.
+            return $false
         }
 
-        # Assignment: $x = Assert-X ...  (RHS must itself be a single-command pipeline)
+        # Assignment: simple values allowed; RHS may be the wanted command.
         if ($stmt -is [System.Management.Automation.Language.AssignmentStatementAst]) {
-            $rhs = $stmt.Right
-            if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                # PowerShell wraps assignment RHS expressions; pipeline RHS is nested.
-                if ($rhs.Expression -is [System.Management.Automation.Language.PipelineAst]) {
-                    $rhs = $rhs.Expression
-                } else {
-                    continue
+            if (Test-AssignmentIsWantedCommand -Assignment $stmt -WantedName $wanted) {
+                return $true
+            }
+            # Non-command RHS (or non-wanted command) is allowed as flat setup,
+            # but nested control-flow / scriptblocks in the assignment fail closed.
+            $nestedControl = $false
+            foreach ($node in @($stmt.FindAll({
+                            param($n)
+                            $n -is [System.Management.Automation.Language.IfStatementAst] -or
+                            $n -is [System.Management.Automation.Language.SwitchStatementAst] -or
+                            $n -is [System.Management.Automation.Language.ForStatementAst] -or
+                            $n -is [System.Management.Automation.Language.ForEachStatementAst] -or
+                            $n -is [System.Management.Automation.Language.WhileStatementAst] -or
+                            $n -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+                            $n -is [System.Management.Automation.Language.DoUntilStatementAst] -or
+                            $n -is [System.Management.Automation.Language.TryStatementAst] -or
+                            $n -is [System.Management.Automation.Language.TrapStatementAst] -or
+                            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -or
+                            $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+                        }, $true))) {
+                if ($null -ne $node) {
+                    $nestedControl = $true
+                    break
                 }
             }
-            if ($rhs -is [System.Management.Automation.Language.PipelineAst]) {
-                $elements = @($rhs.PipelineElements)
-                if ($elements.Count -eq 1 -and $elements[0] -is [System.Management.Automation.Language.CommandAst]) {
-                    $name = Get-CommandNameFromAst -CommandAst $elements[0]
-                    if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        return $true
-                    }
-                }
+            if ($nestedControl) {
+                return $false
             }
             continue
         }
 
-        # Any other top-level statement kinds (if/function/try/foreach/while/switch/etc.)
-        # are not accepted as hosting the verifier; their nested CommandAsts are ignored.
+        # Any other top-level statement kind before the verifier fails closed.
+        return $false
     }
 
     return $false
