@@ -12,12 +12,20 @@
 //! $env:LLM_API_KEY='<secret-from-env>'
 //! $env:LLM_MODEL='...'
 //! $env:STORYFORGE_EVAL_FIXTURE_CARD='C:\path\to\card.png'
-//! $env:STORYFORGE_EVAL_EVIDENCE_DIR='C:\tmp\endurance-evidence'
+//! $env:STORYFORGE_EVAL_EVIDENCE_ROOT='D:\storyforge-evidence'  # durable root (preferred)
+//! # legacy single-run path still accepted when validated:
+//! # $env:STORYFORGE_EVAL_EVIDENCE_DIR='D:\storyforge-evidence\run-full-<uuid>'
 //! $env:STORYFORGE_EVAL_MAX_CALLS='700'
 //! $env:STORYFORGE_EVAL_MAX_TURNS='100'
 //! $env:STORYFORGE_EVAL_TIMEOUT_SECS='180'
 //! cargo test -p harness-real-llm --test endurance_real_llm -- endurance_real_llm_full_100_turn --ignored --nocapture
 //! ```
+//!
+//! Evidence retention notes:
+//! - Prefer a durable `STORYFORGE_EVAL_EVIDENCE_ROOT` outside the repo and outside temp cleanup dirs.
+//! - Each fresh run allocates a unique `run-<stage>-<uuid>` directory with an atomic `run_manifest.json`.
+//! - Resume reuses the same run directory and fails closed on mixed run IDs / hash / schema drift.
+//! - This harness never reconstructs the lost historical 45/100 checkpoint.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,17 +61,64 @@ fn require_endurance_budget() -> RealLlmRunBudget {
     budget
 }
 
-fn evidence_dir() -> PathBuf {
-    std::env::var("STORYFORGE_EVAL_EVIDENCE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir().join(format!("storyforge_endurance_{}", uuid::Uuid::new_v4()))
-        })
-}
+/// Resolve a durable evidence **run directory**.
+///
+/// - If `STORYFORGE_EVAL_EVIDENCE_DIR` already points at a controlled run dir with
+///   a checkpoint (resume path), reuse it.
+/// - Else resolve `STORYFORGE_EVAL_EVIDENCE_ROOT` / `STORYFORGE_EVAL_EVIDENCE_DIR`
+///   via the retention policy and allocate a fresh `run-<stage>-<uuid>` dir.
+/// - Ephemeral temp roots require `STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE=1`.
+fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidencePaths) {
+    use harness_real_llm::evidence_retention::{
+        EVIDENCE_DIR_ENV, EvidenceRootPolicy, allocate_run_id, is_controlled_run_dirname,
+        open_endurance_run_paths, prepare_run_dir, resolve_evidence_root,
+    };
 
-/// Build an endurance evidence paths rooted at the given dir.
-fn build_evidence_paths(dir: &std::path::Path) -> EnduranceEvidencePaths {
-    EnduranceEvidencePaths::new(dir.to_path_buf())
+    let allow_ephemeral = std::env::var("STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let policy = EvidenceRootPolicy {
+        repo_root,
+        allow_ephemeral,
+        require_explicit: !allow_ephemeral,
+    };
+
+    // Resume path: explicit EVIDENCE_DIR that already holds a checkpoint.
+    if let Ok(raw) = std::env::var(EVIDENCE_DIR_ENV) {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let path = PathBuf::from(raw);
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if path.is_dir()
+                && is_controlled_run_dirname(name)
+                && path.join("endurance_checkpoint.jsonl").exists()
+            {
+                let paths = EnduranceEvidencePaths::new(path.clone());
+                return (name.to_string(), path, paths);
+            }
+        }
+    }
+
+    let root = resolve_evidence_root(None, None, &policy)
+        .unwrap_or_else(|e| panic!("illegal or missing evidence root: {e}"));
+    let (run_id, paths) = open_endurance_run_paths(&root, stage.label())
+        .unwrap_or_else(|e| panic!("failed to open exclusive evidence run dir: {e}"));
+    let dir = paths.root.clone();
+    // Touch allocate helpers so resume/manual layouts stay consistent.
+    let _ = (allocate_run_id, prepare_run_dir);
+    (run_id, dir, paths)
 }
 
 /// The core endurance runner for a single stage. Uses the production pipeline writer,
@@ -89,13 +144,31 @@ async fn run_endurance_stage(
         )));
     }
 
-    let run_id = format!("endurance-{}-{}", stage.label(), uuid::Uuid::new_v4());
     let schedule = EnduranceSchedule::new(target_turns);
     let model_label = std::env::var("LLM_MODEL").unwrap_or_default();
 
-    // Check for resume from checkpoint
-    let resume_cp = read_latest_checkpoint(&paths.checkpoint_jsonl);
-    let start_turn = resume_turn_from_checkpoint(resume_cp.as_ref());
+    // Fail-closed resume: mixed run ids / schema drift / missing checkpoint content abort.
+    let (start_turn, resume_cp, run_id) = if paths.checkpoint_jsonl.exists() {
+        let (next, cp) = resume_from_evidence_dir(&paths.root, None)?;
+        let run_id = cp.run_id.clone();
+        (next, Some(cp), run_id)
+    } else if let Some(name) = paths
+        .root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| harness_real_llm::evidence_retention::is_controlled_run_dirname(s))
+    {
+        (1, None, name.to_string())
+    } else {
+        // Fresh run under a non-namespaced legacy dir: still allocate a controlled id
+        // for evidence lines (directory name may lag until retention seal).
+        let run_id = harness_real_llm::evidence_retention::allocate_run_id(
+            paths.root.parent().unwrap_or(paths.root.as_path()),
+            stage.label(),
+        )
+        .unwrap_or_else(|_| format!("run-{}-{}", stage.label(), uuid::Uuid::new_v4()));
+        (1, None, run_id)
+    };
     let mut early_fact_probe_ids = resume_cp
         .as_ref()
         .map(|c| c.early_fact_probe_ids.clone())
@@ -636,12 +709,24 @@ async fn endurance_real_llm_full_100_turn() {
     let budget = require_endurance_budget();
     let stage = parse_target_stage();
 
-    let dir = evidence_dir();
-    let paths = build_evidence_paths(&dir);
+    let (run_id_for_log, dir, paths) = evidence_run_dir(stage);
+    eprintln!(
+        "[endurance] evidence run_id={} dir_name={}",
+        run_id_for_log,
+        dir.file_name().and_then(|s| s.to_str()).unwrap_or("<run>")
+    );
     let data_dir = dir.join("campaign_data");
 
     // Resume from sanitized checkpoint when available; otherwise bootstrap a fresh campaign.
-    let resume_cp = read_latest_checkpoint(&paths.checkpoint_jsonl);
+    // Fail closed on mixed ids / schema drift before any model call.
+    let resume_cp = if paths.checkpoint_jsonl.exists() {
+        match resume_from_evidence_dir(&paths.root, Some(run_id_for_log.as_str())) {
+            Ok((_, cp)) => Some(cp),
+            Err(err) => panic!("fail-closed resume preflight: {err}"),
+        }
+    } else {
+        None
+    };
     // On resume, the suite-wide budget is remaining = stage.max - checkpoint.calls_used.
     let mut budget = budget;
     if let Some(cp) = resume_cp.as_ref() {
@@ -731,6 +816,41 @@ async fn endurance_real_llm_full_100_turn() {
             assert!(paths.check_no_secrets().is_ok());
             // Evidence must be within size budget
             assert!(paths.total_size() < 2 * 1024 * 1024);
+            // Seal a durable, offline-verifiable run manifest (no secrets / no abs paths).
+            let seal = harness_real_llm::evidence_retention::seal_run(
+                &paths.root,
+                harness_real_llm::evidence_retention::SealOptions {
+                    run_id: row.run_id.clone(),
+                    status: harness_real_llm::evidence_retention::RunStatus::Completed,
+                    stage: row.stage.clone(),
+                    model_label: std::env::var("LLM_MODEL")
+                        .unwrap_or_default()
+                        .chars()
+                        .take(64)
+                        .collect(),
+                    budget: harness_real_llm::evidence_retention::BudgetSummary {
+                        max_calls: row.max_calls,
+                        max_turns: row.target_turns,
+                        timeout_secs: budget.timeout_secs,
+                        max_tokens: budget.max_tokens,
+                    },
+                    commit: std::env::var("STORYFORGE_EVAL_COMMIT").unwrap_or_default(),
+                    branch: std::env::var("STORYFORGE_EVAL_BRANCH").unwrap_or_default(),
+                },
+            );
+            match seal {
+                Ok(manifest) => {
+                    eprintln!(
+                        "[endurance] sealed run_manifest files={} status=completed",
+                        manifest.files.len()
+                    );
+                    harness_real_llm::evidence_retention::verify_run(&paths.root)
+                        .expect("offline verify after seal");
+                }
+                Err(err) => {
+                    eprintln!("[endurance] seal warning (fail-closed for retention): {err}");
+                }
+            }
         }
         Err(err) => {
             eprintln!("ENDURANCE {} FAIL CLOSED: {err}", stage.label());
@@ -750,7 +870,7 @@ async fn endurance_real_llm_phase_b_matrix_12_scenarios() {
 
     // Phase B matrix is deterministic but we verify the full matrix passes
     // and evidence is redacted.
-    let dir = evidence_dir();
+    let (_run_id, dir, _paths) = evidence_run_dir(EnduranceStage::Coverage);
     let phase_b_path = dir.join("endurance_phase_b.jsonl");
 
     let fixtures = harness_real_llm::phase_b_matrix::default_phase_b_fixtures();

@@ -923,15 +923,37 @@ pub struct EnduranceRunConfig {
 impl EnduranceRunConfig {
     /// Parse config from environment variables. All real-secret values come from
     /// the environment only — never written to source.
+    ///
+    /// Evidence root resolution is **fail-closed**:
+    /// - Prefer `STORYFORGE_EVAL_EVIDENCE_ROOT` (durable multi-run root)
+    /// - Else `STORYFORGE_EVAL_EVIDENCE_DIR` (legacy single-run path)
+    /// - Else a unique temp root only when `STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE=1`
+    ///
+    /// Repo-internal, live `data/`, and (unless allowed) temp roots are rejected.
+    /// Each call allocates a unique controlled `run-<stage>-<uuid>` directory.
     pub fn from_env(stage: EnduranceStage) -> Self {
-        let evidence_dir = std::env::var("STORYFORGE_EVAL_EVIDENCE_DIR").unwrap_or_else(|_| {
-            std::env::temp_dir()
-                .join(format!("storyforge_endurance_{}", uuid::Uuid::new_v4()))
-                .to_string_lossy()
-                .into_owned()
-        });
-        let root = PathBuf::from(evidence_dir);
-        std::fs::create_dir_all(&root).expect("create evidence dir");
+        Self::from_env_with_repo_root(stage, discover_repo_root())
+    }
+
+    /// Same as [`from_env`] but with an explicit repo root for policy checks.
+    pub fn from_env_with_repo_root(stage: EnduranceStage, repo_root: PathBuf) -> Self {
+        let allow_ephemeral = std::env::var("STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        let policy = crate::evidence_retention::EvidenceRootPolicy {
+            repo_root,
+            allow_ephemeral,
+            require_explicit: !allow_ephemeral,
+        };
+        let root = crate::evidence_retention::resolve_evidence_root(None, None, &policy)
+            .unwrap_or_else(|e| panic!("illegal or missing evidence root: {e}"));
+        let (run_id, evidence_paths) =
+            crate::evidence_retention::open_endurance_run_paths(&root, stage.label())
+                .unwrap_or_else(|e| panic!("failed to open exclusive evidence run dir: {e}"));
 
         let model_label = std::env::var("LLM_MODEL").unwrap_or_default();
         let endpoint_host_redacted = std::env::var("LLM_BASE_URL")
@@ -960,16 +982,64 @@ impl EnduranceRunConfig {
         let budget = EnduranceBudget::for_stage(stage);
 
         Self {
-            run_id: format!("endurance-{}-{}", stage.label(), uuid::Uuid::new_v4()),
+            run_id,
             stage,
             model_label,
             endpoint_host_redacted,
-            evidence_paths: EnduranceEvidencePaths::new(root),
+            evidence_paths,
             budget,
             commit,
             branch,
             seed,
         }
+    }
+}
+
+/// Best-effort repo root discovery for evidence-root policy (never panics).
+fn discover_repo_root() -> PathBuf {
+    if let Ok(root) = std::env::var("STORYFORGE_REPO_ROOT") {
+        let p = PathBuf::from(root.trim());
+        if p.is_dir() {
+            return p;
+        }
+    }
+    // CARGO_MANIFEST_DIR for harness-real-llm is crates/harness-real-llm.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Fail-closed resume gate for an existing evidence directory.
+///
+/// When a checkpoint exists, `expected_run_id` (if provided) or the checkpoint's
+/// own `run_id` must match every evidence line and the optional sealed manifest.
+/// Mixed ids, schema drift, or missing checkpoint content fail closed.
+pub fn resume_from_evidence_dir(
+    evidence_dir: &Path,
+    expected_run_id: Option<&str>,
+) -> Result<(u32, EnduranceCheckpoint), EnduranceError> {
+    let cp = read_latest_checkpoint(&evidence_dir.join("endurance_checkpoint.jsonl")).ok_or_else(
+        || {
+            EnduranceError::InvalidConfig(
+                "resume requested but checkpoint missing or schema-invalid".into(),
+            )
+        },
+    )?;
+    let expected = expected_run_id.unwrap_or(cp.run_id.as_str());
+    match crate::evidence_retention::load_resume_context(evidence_dir, expected) {
+        Ok(ctx) => {
+            if ctx.accepted_turn_number != cp.accepted_turn_number {
+                return Err(EnduranceError::InvalidConfig(
+                    "resume context accepted_turn_number disagrees with checkpoint".into(),
+                ));
+            }
+            Ok((ctx.next_turn, cp))
+        }
+        Err(e) => Err(EnduranceError::InvalidConfig(format!(
+            "fail-closed resume: {e}"
+        ))),
     }
 }
 
@@ -984,14 +1054,34 @@ pub struct DryRunReport {
     pub schema_ok: bool,
     pub disk_space_ok: bool,
     pub secret_guards_ok: bool,
+    pub evidence_root_ok: bool,
     pub assertions: Vec<AssertionResult>,
 }
 
 /// Perform dry-run validation: zero model calls.
+///
+/// `evidence_root` is validated with a conservative policy when possible. For
+/// unit tests that pass ephemeral temp dirs, ephemeral roots are allowed.
 pub fn dry_run_validate(
     fixture_exists: bool,
     evidence_root: &Path,
     budget: &EnduranceBudget,
+) -> DryRunReport {
+    dry_run_validate_with_policy(
+        fixture_exists,
+        evidence_root,
+        budget,
+        &crate::evidence_retention::EvidenceRootPolicy::for_tests(discover_repo_root()),
+    )
+}
+
+/// Dry-run with an explicit evidence-root policy (production runners should pass
+/// [`crate::evidence_retention::EvidenceRootPolicy::production`]).
+pub fn dry_run_validate_with_policy(
+    fixture_exists: bool,
+    evidence_root: &Path,
+    budget: &EnduranceBudget,
+    policy: &crate::evidence_retention::EvidenceRootPolicy,
 ) -> DryRunReport {
     let mut assertions = Vec::new();
 
@@ -1002,11 +1092,24 @@ pub fn dry_run_validate(
         detail: None,
     });
 
-    let output_dir_writable = std::fs::create_dir_all(evidence_root).is_ok();
+    let evidence_root_ok =
+        crate::evidence_retention::preflight_evidence_root(evidence_root, policy).is_ok();
+    assertions.push(AssertionResult {
+        name: "evidence_root_policy".into(),
+        passed: evidence_root_ok,
+        detail: Some(crate::evidence_retention::redact_path_for_display(
+            evidence_root,
+        )),
+    });
+
+    let output_dir_writable = evidence_root_ok || std::fs::create_dir_all(evidence_root).is_ok();
     assertions.push(AssertionResult {
         name: "output_dir_writable".into(),
         passed: output_dir_writable,
-        detail: Some(evidence_root.display().to_string()),
+        // Never echo full host paths that might embed usernames/secrets.
+        detail: Some(crate::evidence_retention::redact_path_for_display(
+            evidence_root,
+        )),
     });
 
     let budget_valid = budget.max_calls >= 1 && budget.max_turns >= 1 && budget.timeout_secs >= 1;
@@ -1019,21 +1122,26 @@ pub fn dry_run_validate(
         )),
     });
 
-    let schema_ok = EVIDENCE_SCHEMA_VERSION == "eval-m5-phaseb-v1";
+    let schema_ok = EVIDENCE_SCHEMA_VERSION == "eval-m5-phaseb-v1"
+        && crate::evidence_retention::RETENTION_SCHEMA_VERSION == "m5-evidence-retention-v1";
     assertions.push(AssertionResult {
         name: "schema_version_ok".into(),
         passed: schema_ok,
-        detail: Some(EVIDENCE_SCHEMA_VERSION.into()),
+        detail: Some(format!(
+            "evidence={EVIDENCE_SCHEMA_VERSION};retention={}",
+            crate::evidence_retention::RETENTION_SCHEMA_VERSION
+        )),
     });
 
-    // Disk space: check we can write at least max_evidence_bytes
-    let disk_space_ok = if let Ok(metadata) = std::fs::metadata(evidence_root) {
-        let _ = metadata;
-        // Best-effort: try writing a temp file of the max evidence size (divided by 10 to be fast)
+    // Disk space: check we can write a small probe under the root when allowed.
+    let disk_space_ok = if evidence_root_ok {
         let probe = evidence_root.join(".disk_probe");
         let probe_ok = std::fs::write(&probe, vec![0u8; 1024]).is_ok();
         let _ = std::fs::remove_file(&probe);
         probe_ok
+    } else if let Ok(metadata) = std::fs::metadata(evidence_root) {
+        let _ = metadata;
+        false
     } else {
         false
     };
@@ -1043,14 +1151,10 @@ pub fn dry_run_validate(
         detail: None,
     });
 
-    // Secret guards: verify no LLM_API_KEY in environment leaks into a sample
-    let api_key_set = std::env::var("LLM_API_KEY").is_ok();
-    let secret_guards_ok = if api_key_set {
-        // Verify the redaction guard fires on a sample containing the key marker
-        !contains_forbidden_evidence_payload(r#"{"role":"x","tag":"y"}"#)
-    } else {
-        true
-    };
+    // Secret guards: verify the redaction detector stays armed. Never read or
+    // echo LLM_API_KEY values.
+    let secret_guards_ok = !contains_forbidden_evidence_payload(r#"{"role":"x","tag":"y"}"#)
+        && contains_forbidden_evidence_payload(r#"{"api_key":"redacted"}"#);
     assertions.push(AssertionResult {
         name: "secret_guards_ok".into(),
         passed: secret_guards_ok,
@@ -1064,6 +1168,7 @@ pub fn dry_run_validate(
         schema_ok,
         disk_space_ok,
         secret_guards_ok,
+        evidence_root_ok,
         assertions,
     }
 }
@@ -2040,6 +2145,7 @@ mod tests {
         assert!(report.schema_ok);
         assert!(report.disk_space_ok);
         assert!(report.secret_guards_ok);
+        assert!(report.evidence_root_ok);
         assert!(report.assertions.iter().all(|a| a.passed));
         let _ = std::fs::remove_dir_all(dir);
     }
