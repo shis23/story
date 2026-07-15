@@ -389,23 +389,6 @@ try {
     } else {
         $artifactArr = [object[]]@()
     }
-    $manifest = New-ReleaseBuildManifest `
-        -Commit $identity.commit `
-        -Branch $identity.branch `
-        -Target 'aarch64-linux-android' `
-        -ToolVersions $toolVersions `
-        -Artifacts $artifactArr `
-        -DependencyInventory $inventoryEvidence `
-        -BuildStatus $buildStatus `
-        -Warnings $warningArr `
-        -Notes $noteArr `
-        -RepoRoot $script:RepoRoot
-    $manifestPath = Join-Path $runDir 'manifest.json'
-    Write-ReleaseJson -Object $manifest -Path $manifestPath
-
-    Start-AndroidHostStep -Name 'manifest schema validation'
-    Assert-ReleaseManifestSchema -Manifest $manifest
-    Write-Host 'Manifest schema validation passed.'
 
     Start-AndroidHostStep -Name 'stage evidence subjects and hash sidecars'
     $stagedSubjects = [object[]]@()
@@ -422,9 +405,31 @@ try {
         }
         $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
         foreach ($s in $stagedSubjects) {
-            Write-Host ("Staged subject: {0} sha256={1}" -f $s.relative_path, $s.sha256)
+            Write-Host ("Staged subject: {0} (source={1}) sha256={2}" -f $s.relative_path, $s.source_relative_path, $s.sha256)
         }
     }
+    if ($null -eq $stagedSubjects) { $stagedSubjects = [object[]]@() }
+
+    # Manifest keeps source-tree artifact paths and a separate staged_subjects
+    # list for offline verification under subjects/....
+    $manifest = New-ReleaseBuildManifest `
+        -Commit $identity.commit `
+        -Branch $identity.branch `
+        -Target 'aarch64-linux-android' `
+        -ToolVersions $toolVersions `
+        -Artifacts $artifactArr `
+        -StagedSubjects $stagedSubjects `
+        -DependencyInventory $inventoryEvidence `
+        -BuildStatus $buildStatus `
+        -Warnings $warningArr `
+        -Notes $noteArr `
+        -RepoRoot $script:RepoRoot
+    $manifestPath = Join-Path $runDir 'manifest.json'
+    Write-ReleaseJson -Object $manifest -Path $manifestPath
+
+    Start-AndroidHostStep -Name 'manifest schema validation'
+    Assert-ReleaseManifestSchema -Manifest $manifest
+    Write-Host 'Manifest schema validation passed.'
 
     Start-AndroidHostStep -Name 'provenance attestation'
     $provArtifacts = if ($DryRun) {

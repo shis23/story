@@ -188,15 +188,15 @@ Additional fail-closed verifier fixes landed after the initial readiness commit:
 
 Further P0 hardening:
 
-1. For `build_status=ok`, `manifest.artifacts` (present) and
+1. For `build_status=ok`, `manifest.staged_subjects` (present) and
    `provenance.subjects` form a **bidirectional exact-set** keyed by
    normalized `relative_path|kind|status|sha256|size_bytes`. Duplicates, missing
    members, extra members, and field disagreements fail closed.
-2. Every present **manifest** artifact is fully checked (exists, non-reparse,
+2. Every present **staged subject** is fully checked (exists, non-reparse,
    sidecar, rehash, size) even when provenance subjects exist — provenance
-   presence never skips manifest verification.
-3. Attack regression: `manifest=claimed.exe` while
-   `provenance=checked.exe` fails closed.
+   presence never skips staged-subject verification.
+3. Attack regression: staged `claimed.exe` while provenance only lists
+   `checked.exe` fails closed.
 4. `commit` / `branch` / `target` must be non-empty; `commit` must match strict
    git SHA (`^[0-9a-fA-F]{7,40}$`) on both manifest and provenance.
 5. Generic secret scanner recursively walks all string leaves in
@@ -206,8 +206,34 @@ Further P0 hardening:
    `Get-ReleaseEvidenceVerifierTrustModel` (`open-then-hash` with reparse
    rejection; package immutability assumed for the verification window).
 
-Full suite after P0 pass: **128** Pester tests passed
-(37 + 14 + 31 + 46). Dry-runs exit 0. `git diff --check` clean.
+### P0 source vs staged subject path domains + P1 scanner/size hardening
+
+1. **Path-domain split:** `manifest.artifacts[*].relative_path` keeps the
+   runner **source** tree path (e.g. `target/release/storyforge.exe` or APK
+   build outputs). Offline verification never treats those source paths as
+   subject files.
+2. **Single staged subject record:**
+   `New-ReleaseStagedSubjectRecord` /
+   `manifest.staged_subjects[]` with
+   `relative_path` under `subjects/…`, optional
+   `source_relative_path`, `size_bytes`, `sha256`, `kind`, `status`,
+   `hash_sidecar`. Windows and Android runners both emit this structure after
+   staging.
+3. **Binding surface:** for `build_status=ok`, exact-set bind is
+   `manifest.staged_subjects` ↔ `provenance.subjects` on the staged domain only.
+   Source paths are not forced equal to `subjects/…`.
+4. **Topology fixtures:** readiness suite includes real runner topology
+   packages (source ≠ staged) and rejects packages that only present
+   source-relative paths for offline checks.
+5. **P1 size_bytes:** required, non-negative, and rechecked against the staged
+   file length on every present staged/provenance subject.
+6. **P1 scanner:** recursive walk scans object **keys** and values; depth
+   overflow beyond max depth **fail-closes** (no silent truncation).
+7. TOCTOU model unchanged: open-then-hash + reparse rejection; package
+   immutability assumed during verification (not a sealed OS snapshot handle).
+
+Full suite after this pass: **133** Pester tests passed
+(37 + 14 + 31 + 51). Windows/Android dry-runs exit 0. `git diff --check` clean.
 
 ## Risks / follow-ups
 

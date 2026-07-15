@@ -241,6 +241,54 @@ function New-ReleaseArtifactRecord {
     }
 }
 
+function New-ReleaseStagedSubjectRecord {
+    <#
+    .SYNOPSIS
+    Builds a single offline-verifiable staged subject record for evidence packages.
+
+    .DESCRIPTION
+    Separates the source tree artifact path (source_relative_path) from the
+    evidence-package staged path (relative_path under subjects/). Offline
+    verification only opens relative_path inside EvidenceDir.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$StagedRelativePath,
+        [Parameter(Mandatory = $true)][string]$SourceRelativePath,
+        [Parameter(Mandatory = $true)][long]$SizeBytes,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Sha256,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][ValidateSet('present', 'missing', 'skipped')][string]$Status,
+        [string]$HashSidecar
+    )
+
+    $staged = ($StagedRelativePath -replace '\\', '/').Trim().TrimStart('./')
+    while ($staged.Contains('//')) { $staged = $staged -replace '//', '/' }
+    $source = ($SourceRelativePath -replace '\\', '/').Trim().TrimStart('./')
+    while ($source.Contains('//')) { $source = $source -replace '//', '/' }
+    $sidecar = if ([string]::IsNullOrWhiteSpace($HashSidecar)) {
+        $staged + '.sha256'
+    } else {
+        ($HashSidecar -replace '\\', '/').Trim().TrimStart('./')
+    }
+
+    return [pscustomobject]@{
+        relative_path        = $staged
+        source_relative_path = $source
+        size_bytes           = [long]$SizeBytes
+        sha256               = $Sha256
+        kind                 = $Kind
+        status               = $Status
+        hash_sidecar         = $sidecar
+    }
+}
+
+function Test-ReleaseStagedSubjectPath {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativePath)
+    $rel = ([string]$RelativePath -replace '\\', '/').Trim().TrimStart('./')
+    while ($rel.Contains('//')) { $rel = $rel -replace '//', '/' }
+    return [bool]($rel -match '^(?i)subjects/')
+}
+
 function New-ReleaseBuildManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -273,6 +321,10 @@ function New-ReleaseBuildManifest {
         [AllowNull()]
         [object]$DependencyInventory = $null,
 
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$StagedSubjects = @(),
+
         [string]$RepoRoot
     )
 
@@ -288,6 +340,8 @@ function New-ReleaseBuildManifest {
         Protect-ReleasePath -Text ([string]$_) -RepoRoot $RepoRoot
     })
 
+    if ($null -eq $StagedSubjects) { $StagedSubjects = @() }
+
     $manifest = [pscustomobject]@{
         schema_version = 1
         generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
@@ -296,6 +350,8 @@ function New-ReleaseBuildManifest {
         target         = $Target
         tool_versions  = $safeTools
         artifacts      = @($Artifacts)
+        # Offline-verifiable staged subjects (subjects/...). Source tree paths stay on artifacts.
+        staged_subjects = @($StagedSubjects)
         dependency_inventory = $DependencyInventory
         build_status   = $BuildStatus
         warnings       = $safeWarnings
@@ -381,18 +437,27 @@ function Find-ReleaseSecretPatternFindings {
 function Get-ReleaseObjectStringLeaves {
     <#
     .SYNOPSIS
-    Recursively collects all string leaves from JSON-like objects for secret scanning.
+    Recursively collects string leaves and object keys from JSON-like objects for secret scanning.
+
+    .DESCRIPTION
+    Walks values and property/dictionary keys. Depth is bounded; callers must treat
+    DepthExceeded=$true as fail-closed (scanner trust boundary overflow).
     #>
     param(
         [AllowNull()][object]$Value,
-        [int]$Depth = 0
+        [int]$Depth = 0,
+        [int]$MaxDepth = 32
     )
 
     $leaves = New-Object System.Collections.Generic.List[string]
+    $script:ReleaseObjectLeafDepthExceeded = $false
     function Walk-ObjectLeaves {
         param([AllowNull()][object]$Node, [int]$Level)
         if ($null -eq $Node) { return }
-        if ($Level -gt 32) { return }
+        if ($Level -gt $MaxDepth) {
+            $script:ReleaseObjectLeafDepthExceeded = $true
+            return
+        }
         if ($Node -is [string]) {
             $leaves.Add([string]$Node) | Out-Null
             return
@@ -401,13 +466,28 @@ function Get-ReleaseObjectStringLeaves {
         if ($Node -is [ValueType]) { return }
         if ($Node -is [System.Collections.IDictionary]) {
             foreach ($key in @($Node.Keys)) {
-                Walk-ObjectLeaves -Node $Node[$key] -Level ($Level + 1)
+                $keyText = [string]$key
+                $leaves.Add($keyText) | Out-Null
+                $val = $Node[$key]
+                if ($val -is [string] -or $val -is [ValueType]) {
+                    # Also scan key=value / key: value forms so secret-shaped keys are caught.
+                    $leaves.Add(('{0}={1}' -f $keyText, $val)) | Out-Null
+                    $leaves.Add(('{0}: {1}' -f $keyText, $val)) | Out-Null
+                }
+                Walk-ObjectLeaves -Node $val -Level ($Level + 1)
             }
             return
         }
         if ($Node -is [pscustomobject]) {
             foreach ($property in @($Node.PSObject.Properties)) {
-                Walk-ObjectLeaves -Node $property.Value -Level ($Level + 1)
+                $keyText = [string]$property.Name
+                $leaves.Add($keyText) | Out-Null
+                $val = $property.Value
+                if ($val -is [string] -or $val -is [ValueType]) {
+                    $leaves.Add(('{0}={1}' -f $keyText, $val)) | Out-Null
+                    $leaves.Add(('{0}: {1}' -f $keyText, $val)) | Out-Null
+                }
+                Walk-ObjectLeaves -Node $val -Level ($Level + 1)
             }
             return
         }
@@ -418,8 +498,11 @@ function Get-ReleaseObjectStringLeaves {
         }
     }
     Walk-ObjectLeaves -Node $Value -Level $Depth
-    # Return a flat string[] (no unary-comma wrapper) so callers can foreach leaves.
-    return [string[]]@($leaves.ToArray())
+    return [pscustomobject]@{
+        Leaves = [string[]]@($leaves.ToArray())
+        DepthExceeded = [bool]$script:ReleaseObjectLeafDepthExceeded
+        MaxDepth = [int]$MaxDepth
+    }
 }
 
 function Test-ReleaseGitCommitSha {
@@ -437,9 +520,12 @@ function Get-ReleaseEvidenceSubjectBindingKey {
     $kind = ([string]$Entry.kind).Trim().ToLowerInvariant()
     $status = ([string]$Entry.status).Trim().ToLowerInvariant()
     $sha = ([string]$Entry.sha256).Trim().ToLowerInvariant()
-    $size = 0
-    if ($Entry.PSObject.Properties.Name -contains 'size_bytes' -and $null -ne $Entry.size_bytes) {
-        $size = [long]$Entry.size_bytes
+    if ($Entry.PSObject.Properties.Name -notcontains 'size_bytes' -or $null -eq $Entry.size_bytes) {
+        throw 'size_bytes is required for exact-set subject binding.'
+    }
+    $size = [long]$Entry.size_bytes
+    if ($size -lt 0) {
+        throw 'size_bytes must be non-negative for exact-set subject binding.'
     }
     return ('{0}|{1}|{2}|{3}|{4}' -f $rel.ToLowerInvariant(), $kind, $status, $sha, $size)
 }
@@ -1512,15 +1598,16 @@ function Copy-ReleaseEvidenceSubjects {
         }
 
         $relEvidence = Get-RelativeReleasePath -RepoRoot $EvidenceDir -FullPath $dest
-        $staged.Add([pscustomobject]@{
-            relative_path = $relEvidence
-            source_path   = $art.relative_path
-            sha256        = $rehash
-            kind          = $art.kind
-            size_bytes    = [long](Get-Item -LiteralPath $dest).Length
-            status        = 'present'
-            hash_sidecar  = (Get-RelativeReleasePath -RepoRoot $EvidenceDir -FullPath $hashFile)
-        }) | Out-Null
+        $stagedSize = [long](Get-Item -LiteralPath $dest).Length
+        $hashSidecarRel = Get-RelativeReleasePath -RepoRoot $EvidenceDir -FullPath $hashFile
+        $staged.Add((New-ReleaseStagedSubjectRecord `
+            -StagedRelativePath $relEvidence `
+            -SourceRelativePath ([string]$art.relative_path) `
+            -SizeBytes $stagedSize `
+            -Sha256 $rehash `
+            -Kind ([string]$art.kind) `
+            -Status 'present' `
+            -HashSidecar $hashSidecarRel)) | Out-Null
     }
     return ,$staged.ToArray()
 }
@@ -2222,10 +2309,13 @@ function Test-ReleaseEvidencePackage {
         Add-SafeEvidenceError -Message ("build_status '{0}' is fail-closed; offline verification does not accept partial/failed packages as success." -f $buildStatus)
     }
 
-    # Recursive generic secret scan over every string leaf in the manifest.
+    # Recursive generic secret scan over every string leaf and object key in the manifest.
     $manifestSecretFindings = New-Object System.Collections.Generic.List[string]
-    $manifestLeaves = @(Get-ReleaseObjectStringLeaves -Value $manifest | ForEach-Object { $_ })
-    foreach ($leaf in $manifestLeaves) {
+    $manifestLeafWalk = Get-ReleaseObjectStringLeaves -Value $manifest
+    if ($manifestLeafWalk.DepthExceeded) {
+        Add-SafeEvidenceError -Message ("manifest object graph exceeds scanner max depth ({0}); fail-closed depth overflow." -f $manifestLeafWalk.MaxDepth)
+    }
+    foreach ($leaf in @($manifestLeafWalk.Leaves)) {
         if ($null -eq $leaf) { continue }
         $text = [string]$leaf
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
@@ -2307,8 +2397,11 @@ function Test-ReleaseEvidencePackage {
             }
 
             $provSecretFindings = New-Object System.Collections.Generic.List[string]
-            $provLeaves = @(Get-ReleaseObjectStringLeaves -Value $prov | ForEach-Object { $_ })
-            foreach ($leaf in $provLeaves) {
+            $provLeafWalk = Get-ReleaseObjectStringLeaves -Value $prov
+            if ($provLeafWalk.DepthExceeded) {
+                Add-SafeEvidenceError -Message ("provenance object graph exceeds scanner max depth ({0}); fail-closed depth overflow." -f $provLeafWalk.MaxDepth)
+            }
+            foreach ($leaf in @($provLeafWalk.Leaves)) {
                 if ($null -eq $leaf) { continue }
                 $text = [string]$leaf
                 if ([string]::IsNullOrWhiteSpace($text)) { continue }
@@ -2337,6 +2430,26 @@ function Test-ReleaseEvidencePackage {
         )
 
         $rel = [string]$Entry.relative_path
+        if (-not (Test-ReleaseStagedSubjectPath -RelativePath $rel)) {
+            Add-SafeEvidenceError -Message ("{0} path is not a staged subjects/ path (source paths are not offline-verifiable): {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
+        }
+
+        if ($Entry.PSObject.Properties.Name -notcontains 'size_bytes' -or $null -eq $Entry.size_bytes -or [string]::IsNullOrWhiteSpace([string]$Entry.size_bytes)) {
+            Add-SafeEvidenceError -Message ("{0} missing required size_bytes: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
+        }
+        try {
+            $declaredSize = [long]$Entry.size_bytes
+        } catch {
+            Add-SafeEvidenceError -Message ("{0} size_bytes is not a valid integer: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
+        }
+        if ($declaredSize -lt 0) {
+            Add-SafeEvidenceError -Message ("{0} size_bytes must be non-negative: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
+        }
+
         try {
             $subjectPath = Test-ReleaseEvidencePathSafe `
                 -EvidenceRoot $evidenceRoot `
@@ -2359,7 +2472,11 @@ function Test-ReleaseEvidencePackage {
             return $false
         }
 
-        $sidecarRel = (([string]$rel) -replace '\\', '/') + '.sha256'
+        $sidecarRel = if ($Entry.PSObject.Properties.Name -contains 'hash_sidecar' -and -not [string]::IsNullOrWhiteSpace([string]$Entry.hash_sidecar)) {
+            ([string]$Entry.hash_sidecar) -replace '\\', '/'
+        } else {
+            (([string]$rel) -replace '\\', '/') + '.sha256'
+        }
         try {
             $sidecar = Test-ReleaseEvidencePathSafe `
                 -EvidenceRoot $evidenceRoot `
@@ -2404,11 +2521,9 @@ function Test-ReleaseEvidencePackage {
             Add-SafeEvidenceError -Message ("Offline rehash mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
         }
 
-        if ($Entry.PSObject.Properties.Name -contains 'size_bytes' -and $null -ne $Entry.size_bytes) {
-            $actualSize = [long](Get-Item -LiteralPath $subjectPath).Length
-            if ($actualSize -ne [long]$Entry.size_bytes) {
-                Add-SafeEvidenceError -Message ("Size mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
-            }
+        $actualSize = [long](Get-Item -LiteralPath $subjectPath).Length
+        if ($actualSize -ne $declaredSize) {
+            Add-SafeEvidenceError -Message ("Size mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
         }
 
         if ($sidecarText -match '([a-fA-F0-9]{64})') {
@@ -2424,62 +2539,81 @@ function Test-ReleaseEvidencePackage {
     }
 
     # For build_status=ok, require bidirectional exact-set binding between
-    # manifest present artifacts and provenance subjects.
+    # manifest.staged_subjects (evidence-relative) and provenance.subjects.
+    # Source artifact paths (target/release/..., APK build tree, etc.) are never
+    # offline-verified as subject files.
     if ($buildStatus -eq 'ok') {
-        $manifestPresent = @($manifest.artifacts | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        $stagedSubjects = @()
+        if ($manifest.PSObject.Properties.Name -contains 'staged_subjects' -and $null -ne $manifest.staged_subjects) {
+            $stagedSubjects = @($manifest.staged_subjects | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        }
         $provSubjects = @()
         if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
             $provSubjects = @($prov.subjects | Where-Object { $null -ne $_ })
         }
 
-        if ($manifestPresent.Count -eq 0) {
-            Add-SafeEvidenceError -Message 'build_status=ok package has no present manifest artifacts to bind.'
+        if ($stagedSubjects.Count -eq 0) {
+            Add-SafeEvidenceError -Message 'build_status=ok package has no present staged subjects to bind (source artifact paths alone are not offline-verifiable).'
         }
         if ($provSubjects.Count -eq 0) {
             Add-SafeEvidenceError -Message 'build_status=ok package has no provenance subjects to bind.'
         }
 
-        $manifestKeys = New-Object System.Collections.Generic.List[string]
-        $provKeys = New-Object System.Collections.Generic.List[string]
-        $manifestKeySet = @{}
+        $stagedKeySet = @{}
         $provKeySet = @{}
 
-        foreach ($art in $manifestPresent) {
-            $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $art
-            if ($manifestKeySet.ContainsKey($key)) {
-                Add-SafeEvidenceError -Message ("duplicate manifest artifact in exact-set binding: {0}" -f (Protect-ReleasePath -Text ([string]$art.relative_path) -RepoRoot $evidenceRoot))
-            } else {
-                $manifestKeySet[$key] = $true
+        foreach ($subj in $stagedSubjects) {
+            if (-not (Test-ReleaseStagedSubjectPath -RelativePath ([string]$subj.relative_path))) {
+                Add-SafeEvidenceError -Message ("staged subject path is not under subjects/: {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
+                continue
             }
-            $manifestKeys.Add($key) | Out-Null
+            try {
+                $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $subj
+            } catch {
+                Add-SafeEvidenceError -Message $_.Exception.Message
+                continue
+            }
+            if ($stagedKeySet.ContainsKey($key)) {
+                Add-SafeEvidenceError -Message ("duplicate staged subject in exact-set binding: {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
+            } else {
+                $stagedKeySet[$key] = $true
+            }
         }
         foreach ($subj in $provSubjects) {
-            $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $subj
+            if (-not (Test-ReleaseStagedSubjectPath -RelativePath ([string]$subj.relative_path))) {
+                Add-SafeEvidenceError -Message ("provenance subject path is not under subjects/ (source paths are not offline-verifiable): {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
+                continue
+            }
+            try {
+                $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $subj
+            } catch {
+                Add-SafeEvidenceError -Message $_.Exception.Message
+                continue
+            }
             if ($provKeySet.ContainsKey($key)) {
                 Add-SafeEvidenceError -Message ("duplicate provenance subject in exact-set binding: {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
             } else {
                 $provKeySet[$key] = $true
             }
-            $provKeys.Add($key) | Out-Null
         }
 
-        foreach ($key in @($manifestKeySet.Keys)) {
+        foreach ($key in @($stagedKeySet.Keys)) {
             if (-not $provKeySet.ContainsKey($key)) {
                 $rel = ($key -split '\|')[0]
-                Add-SafeEvidenceError -Message ("exact-set binding mismatch: manifest present artifact missing from provenance subjects ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+                Add-SafeEvidenceError -Message ("exact-set binding mismatch: staged subject missing from provenance subjects ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
             }
         }
         foreach ($key in @($provKeySet.Keys)) {
-            if (-not $manifestKeySet.ContainsKey($key)) {
+            if (-not $stagedKeySet.ContainsKey($key)) {
                 $rel = ($key -split '\|')[0]
-                Add-SafeEvidenceError -Message ("exact-set binding mismatch: provenance subject is extra vs manifest present artifacts ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+                Add-SafeEvidenceError -Message ("exact-set binding mismatch: provenance subject is extra vs staged subjects ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
             }
         }
 
-        # Always fully check every present manifest artifact (existence, non-reparse,
+        # Always fully check every present staged subject (existence, non-reparse,
         # sidecar, rehash, size) even when provenance subjects exist. Never skip.
-        foreach ($art in $manifestPresent) {
-            if (Test-OneEvidencePresentEntry -Entry $art -Label 'Manifest artifact') {
+        foreach ($subj in $stagedSubjects) {
+            if (Test-OneEvidencePresentEntry -Entry $subj -Label 'Staged subject') {
                 $subjectCount += 1
             }
         }
@@ -2489,10 +2623,13 @@ function Test-ReleaseEvidencePackage {
             $null = Test-OneEvidencePresentEntry -Entry $subj -Label 'Provenance subject'
         }
     } else {
-        # Non-ok paths: still verify any present provenance subjects when present.
+        # Non-ok paths: still verify any present provenance/staged subjects when present.
         $subjects = @()
         if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
             $subjects = @($prov.subjects | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        }
+        if ($subjects.Count -eq 0 -and $manifest.PSObject.Properties.Name -contains 'staged_subjects') {
+            $subjects = @($manifest.staged_subjects | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
         }
         foreach ($subj in $subjects) {
             if (Test-OneEvidencePresentEntry -Entry $subj -Label 'Subject') {

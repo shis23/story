@@ -40,7 +40,13 @@ function New-SyntheticEvidencePackage {
         [switch]$SubjectAsSymlink,
         [switch]$SidecarAsSymlink,
         [switch]$InventoryAsSymlink,
-        [switch]$SubjectsDirAsJunction
+        [switch]$SubjectsDirAsJunction,
+        # Real runner topology: artifacts keep source tree paths; staged subjects live under subjects/.
+        [switch]$RunnerTopology,
+        [string]$SourceRelativePath = 'target/release/storyforge.exe',
+        [Nullable[long]]$ForcedSizeBytes = $null,
+        [switch]$OmitStagedSubjects,
+        [switch]$OmitSizeBytes
     )
 
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -49,8 +55,10 @@ function New-SyntheticEvidencePackage {
         New-Item -ItemType Directory -Force -Path $subjectsDir | Out-Null
     }
 
-    $subjectRel = 'subjects/windows-exe/storyforge.exe'
-    $subjectPath = Join-Path $Root ($subjectRel -replace '/', '\')
+    # Staged path is always under subjects/ unless PathEscape injects a hostile relative path
+    # into the records (file itself is never written at the escape location).
+    $stagedRel = if ($PathEscape) { '../outside/storyforge.exe' } else { 'subjects/windows-exe/storyforge.exe' }
+    $subjectPath = Join-Path $Root ('subjects\windows-exe\storyforge.exe')
     $outsideDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-outside-{0}" -f [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $outsideDir | Out-Null
     $outsideFile = Join-Path $outsideDir 'storyforge.exe'
@@ -65,7 +73,7 @@ function New-SyntheticEvidencePackage {
         }
     }
 
-    if (-not $OmitSubject) {
+    if (-not $OmitSubject -and -not $PathEscape) {
         if ($SubjectAsSymlink) {
             $null = cmd /c mklink "$subjectPath" "$outsideFile"
             if ($LASTEXITCODE -ne 0) {
@@ -83,6 +91,7 @@ function New-SyntheticEvidencePackage {
         'a' * 64
     }
     $reportedSha = if ($TamperHash) { 'b' * 64 } else { $sha }
+    $sizeBytes = if ($null -ne $ForcedSizeBytes) { [long]$ForcedSizeBytes } else { 6 }
 
     if (-not $OmitSidecar -and -not $OmitSubject) {
         $sidecarPath = $subjectPath + '.sha256'
@@ -104,10 +113,17 @@ function New-SyntheticEvidencePackage {
         }
     }
 
-    $artifactPath = if ($PathEscape) { '../outside/storyforge.exe' } else { $subjectRel }
+    # Source-domain artifact path (real runner topology) vs staged subject path.
+    $artifactSourcePath = if ($RunnerTopology) {
+        $SourceRelativePath
+    } elseif ($PathEscape) {
+        $stagedRel
+    } else {
+        $stagedRel
+    }
     $artifact = New-ReleaseArtifactRecord `
-        -RelativePath $artifactPath `
-        -SizeBytes 6 `
+        -RelativePath $artifactSourcePath `
+        -SizeBytes $sizeBytes `
         -Sha256 $reportedSha `
         -Kind 'windows-exe' `
         -Status 'present'
@@ -122,6 +138,28 @@ function New-SyntheticEvidencePackage {
     }
 
     $defaultCommit = 'abcdef0123456789abcdef0123456789abcdef01'
+    $stagedSubject = $null
+    if (-not $OmitStagedSubjects) {
+        $stagedSubject = New-ReleaseStagedSubjectRecord `
+            -StagedRelativePath $stagedRel `
+            -SourceRelativePath $artifactSourcePath `
+            -SizeBytes $sizeBytes `
+            -Sha256 $reportedSha `
+            -Kind 'windows-exe' `
+            -Status 'present' `
+            -HashSidecar ($stagedRel + '.sha256')
+        if ($OmitSizeBytes -and $null -ne $stagedSubject) {
+            $stagedSubject = [pscustomobject]@{
+                relative_path = $stagedSubject.relative_path
+                source_relative_path = $stagedSubject.source_relative_path
+                sha256 = $stagedSubject.sha256
+                kind = $stagedSubject.kind
+                status = $stagedSubject.status
+                hash_sidecar = $stagedSubject.hash_sidecar
+            }
+        }
+    }
+
     $manifest = [pscustomobject]@{
         schema_version = $schemaVersion
         generated_at_utc = '2026-07-15T00:00:00Z'
@@ -130,6 +168,7 @@ function New-SyntheticEvidencePackage {
         target = 'x86_64-pc-windows-msvc'
         tool_versions = [pscustomobject]@{ rustc = '1.0'; cargo = '1.0'; node = '20'; npm = '10' }
         artifacts = @($artifact)
+        staged_subjects = if ($OmitStagedSubjects) { @() } else { @($stagedSubject) }
         dependency_inventory = if ($MissingInventory) {
             $null
         } else {
@@ -179,21 +218,38 @@ function New-SyntheticEvidencePackage {
         } else {
             @('Unsigned host provenance attestation for release evidence only.')
         }
+        $provSubject = if ($null -ne $stagedSubject) {
+            [pscustomobject]@{
+                relative_path = $stagedSubject.relative_path
+                sha256 = $stagedSubject.sha256
+                kind = $stagedSubject.kind
+                size_bytes = if ($OmitSizeBytes) { $null } else { $stagedSubject.size_bytes }
+                status = $stagedSubject.status
+            }
+        } else {
+            [pscustomobject]@{
+                relative_path = $stagedRel
+                sha256 = $reportedSha
+                kind = 'windows-exe'
+                size_bytes = if ($OmitSizeBytes) { $null } else { $sizeBytes }
+                status = 'present'
+            }
+        }
+        if ($OmitSizeBytes) {
+            $provSubject = [pscustomobject]@{
+                relative_path = $provSubject.relative_path
+                sha256 = $provSubject.sha256
+                kind = $provSubject.kind
+                status = $provSubject.status
+            }
+        }
         $prov = [pscustomobject]@{
             schema_version = $schemaVersion
             generated_at_utc = '2026-07-15T00:00:00Z'
             commit = if ($ProvenanceCommit) { $ProvenanceCommit } else { $defaultCommit }
             branch = if ($ProvenanceBranch) { $ProvenanceBranch } else { 'codex/release-runner-readiness' }
             target = if ($ProvenanceTarget) { $ProvenanceTarget } else { 'x86_64-pc-windows-msvc' }
-            subjects = @(
-                [pscustomobject]@{
-                    relative_path = $artifactPath
-                    sha256 = $reportedSha
-                    kind = 'windows-exe'
-                    size_bytes = 6
-                    status = 'present'
-                }
-            )
+            subjects = @($provSubject)
             notes = $provNotes
         }
         Write-ReleaseJson -Object $prov -Path (Join-Path $Root 'provenance.json')
@@ -667,10 +723,10 @@ Describe 'Release offline evidence package verifier' {
         }
     }
 
-    It 'P0: rejects claimed.exe in manifest while only checked.exe is verified in provenance' {
+    It 'P0: rejects claimed.exe in staged subjects while only checked.exe is verified in provenance' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-claimed-{0}" -f [guid]::NewGuid().ToString('N'))
         try {
-            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
             $checkedRel = 'subjects/windows-exe/checked.exe'
             $claimedRel = 'subjects/windows-exe/claimed.exe'
             $checkedPath = Join-Path $dir ($checkedRel -replace '/', '\')
@@ -685,14 +741,16 @@ Describe 'Release offline evidence package verifier' {
 
             $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
             $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
-            # Attack: manifest claims claimed.exe; provenance only checks checked.exe.
-            $manifest.artifacts = @(
+            # Attack: staged subjects claim claimed.exe; provenance only checks checked.exe.
+            $manifest.staged_subjects = @(
                 [pscustomobject]@{
                     relative_path = $claimedRel
+                    source_relative_path = 'target/release/claimed.exe'
                     size_bytes = 4
                     sha256 = $claimedSha
                     kind = 'windows-exe'
                     status = 'present'
+                    hash_sidecar = ($claimedRel + '.sha256')
                 }
             )
             $prov.subjects = @(
@@ -717,10 +775,10 @@ Describe 'Release offline evidence package verifier' {
         }
     }
 
-    It 'P0: rejects duplicate subjects and extra/missing set members for ok packages' {
+    It 'P0: rejects duplicate staged subjects and extra/missing set members for ok packages' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-dup-{0}" -f [guid]::NewGuid().ToString('N'))
         try {
-            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
             $rel = 'subjects/windows-exe/storyforge.exe'
             $path = Join-Path $dir ($rel -replace '/', '\')
             $sha = Get-ReleaseFileSha256 -Path $path
@@ -728,13 +786,22 @@ Describe 'Release offline evidence package verifier' {
             $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
             $entry = [pscustomobject]@{
                 relative_path = $rel
+                source_relative_path = 'target/release/storyforge.exe'
+                size_bytes = 6
+                sha256 = $sha
+                kind = 'windows-exe'
+                status = 'present'
+                hash_sidecar = ($rel + '.sha256')
+            }
+            $provEntry = [pscustomobject]@{
+                relative_path = $rel
                 size_bytes = 6
                 sha256 = $sha
                 kind = 'windows-exe'
                 status = 'present'
             }
-            $manifest.artifacts = @($entry, $entry)
-            $prov.subjects = @($entry)
+            $manifest.staged_subjects = @($entry, $entry)
+            $prov.subjects = @($provEntry)
             Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
             Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
             $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
@@ -742,6 +809,190 @@ Describe 'Release offline evidence package verifier' {
             ($result.Errors -join ' ') | Should Match 'duplicate|binding|exact-set'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P0: accepts real runner topology with source path != staged subjects path' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-topo-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology -SourceRelativePath 'target/release/storyforge.exe' | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            [string]$manifest.artifacts[0].relative_path | Should Match 'target/release'
+            [string]$manifest.staged_subjects[0].relative_path | Should Match '^subjects/'
+            [string]$manifest.staged_subjects[0].source_relative_path | Should Match 'target/release'
+            [string]$prov.subjects[0].relative_path | Should Match '^subjects/'
+            # Offline verifier must not require source path presence inside evidence dir.
+            $sourceInEvidence = Join-Path $dir 'target\release\storyforge.exe'
+            Test-Path -LiteralPath $sourceInEvidence | Should Be $false
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            if (-not $result.Valid) {
+                throw ("expected topology package valid, errors: {0}" -f ($result.Errors -join '; '))
+            }
+            $result.Valid | Should Be $true
+            $result.subject_count | Should BeGreaterThan 0
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P0: never treats source-relative artifact paths as offline subject files' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-srcpath-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
+            # Plant a decoy at the source path inside evidence; verifier must still use staged subjects only.
+            $decoyDir = Join-Path $dir 'target\release'
+            New-Item -ItemType Directory -Force -Path $decoyDir | Out-Null
+            $decoy = Join-Path $decoyDir 'storyforge.exe'
+            [System.IO.File]::WriteAllBytes($decoy, [byte[]](9, 9, 9, 9, 9, 9, 9))
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            $decoySha = Get-ReleaseFileSha256 -Path $decoy
+            [System.IO.File]::WriteAllText(($decoy + '.sha256'), ("{0} *storyforge.exe" -f $decoySha), $utf8NoBom)
+
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            # Hostile: force binding against source path instead of staged subjects.
+            $manifest.staged_subjects = @()
+            $manifest.artifacts = @(
+                [pscustomobject]@{
+                    relative_path = 'target/release/storyforge.exe'
+                    size_bytes = 7
+                    sha256 = $decoySha
+                    kind = 'windows-exe'
+                    status = 'present'
+                }
+            )
+            $prov.subjects = @(
+                [pscustomobject]@{
+                    relative_path = 'target/release/storyforge.exe'
+                    size_bytes = 7
+                    sha256 = $decoySha
+                    kind = 'windows-exe'
+                    status = 'present'
+                }
+            )
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'staged|subjects/|source|binding|missing'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P0: windows/android staging emits staged subject records distinct from source artifacts' {
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-stage-topo-{0}" -f [guid]::NewGuid().ToString('N'))
+        $evidence = Join-Path $repo 'artifacts\release-build\windows-run'
+        $binDir = Join-Path $repo 'target\release'
+        New-Item -ItemType Directory -Path $binDir, $evidence -Force | Out-Null
+        try {
+            $exe = Join-Path $binDir 'storyforge.exe'
+            [System.IO.File]::WriteAllBytes($exe, [byte[]](1, 2, 3, 4, 5))
+            $sha = Get-ReleaseFileSha256 -Path $exe
+            $art = New-ReleaseArtifactRecord -RelativePath 'target/release/storyforge.exe' -SizeBytes 5 -Sha256 $sha -Kind 'windows-exe' -Status 'present'
+            # Do not wrap with @() here: Copy-ReleaseEvidenceSubjects already returns object[].
+            $staged = Copy-ReleaseEvidenceSubjects -Artifacts @($art) -EvidenceDir $evidence -RepoRoot $repo
+            @($staged).Count | Should Be 1
+            $record = @($staged)[0]
+            [string]$record.relative_path | Should Match '^subjects/'
+            [string]$record.source_relative_path | Should Be 'target/release/storyforge.exe'
+            @($record.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'size_bytes' | Should Be $true
+            [long]$record.size_bytes | Should Be 5
+            [string]$record.relative_path | Should Not Be ([string]$record.source_relative_path)
+            # Provenance must bind staged path, not source path.
+            $prov = New-ReleaseProvenance `
+                -Commit 'abcdef0123456789abcdef0123456789abcdef01' `
+                -Branch 'test' `
+                -Target 'x86_64-pc-windows-msvc' `
+                -Artifacts @($record) `
+                -RepoRoot $repo
+            [string]$prov.subjects[0].relative_path | Should Match '^subjects/'
+            [string]$prov.subjects[0].relative_path | Should Not Match '^target/'
+        } finally {
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P1: requires non-negative size_bytes and fails closed on size mismatch or missing size' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-size-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology -ForcedSizeBytes 6 | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            # Negative size rejected.
+            $manifest.staged_subjects[0].size_bytes = -1
+            $prov.subjects[0].size_bytes = -1
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+            $neg = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $neg.Valid | Should Be $false
+            ($neg.Errors -join ' ') | Should Match 'size_bytes|size'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir2 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-size2-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir2 -RunnerTopology -OmitSizeBytes | Out-Null
+            $missing = Test-ReleaseEvidencePackage -EvidenceDir $dir2
+            $missing.Valid | Should Be $false
+            ($missing.Errors -join ' ') | Should Match 'size_bytes|size'
+        } finally {
+            Remove-Item -LiteralPath $dir2 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir3 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-size3-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir3 -RunnerTopology -ForcedSizeBytes 99 | Out-Null
+            $mismatch = Test-ReleaseEvidencePackage -EvidenceDir $dir3
+            $mismatch.Valid | Should Be $false
+            ($mismatch.Errors -join ' ') | Should Match 'size|mismatch'
+        } finally {
+            Remove-Item -LiteralPath $dir3 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P1: recursive scanner fail-closes on depth overflow and scans object keys' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-depth-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -RunnerTopology | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            # Build a deep nest beyond scanner max depth (32). Write with high JSON depth
+            # so ConvertTo-Json does not silently truncate the attack surface.
+            $node = [pscustomobject]@{ leaf = 'ok' }
+            for ($i = 0; $i -lt 40; $i++) {
+                $node = [pscustomobject]@{ child = $node }
+            }
+            $manifest | Add-Member -NotePropertyName deep -NotePropertyValue $node -Force
+            $manifestPath = Join-Path $dir 'manifest.json'
+            $json = $manifest | ConvertTo-Json -Depth 100
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText($manifestPath, $json, $utf8NoBom)
+            $deep = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $deep.Valid | Should Be $false
+            ($deep.Errors -join ' ') | Should Match 'depth|overflow|max depth|too deep'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $dir2 = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-keyscan-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir2 -RunnerTopology | Out-Null
+            # Inject secret-shaped object key via raw JSON so property name is scanned.
+            $raw = Get-Content -LiteralPath (Join-Path $dir2 'manifest.json') -Raw
+            $raw = $raw.TrimEnd()
+            if ($raw.EndsWith('}')) {
+                $raw = $raw.Substring(0, $raw.Length - 1) + (', "api-key": "' + ('Z' * 20) + '"}')
+            }
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText((Join-Path $dir2 'manifest.json'), $raw, $utf8NoBom)
+            $keyScan = Test-ReleaseEvidencePackage -EvidenceDir $dir2
+            $keyScan.Valid | Should Be $false
+            ($keyScan.Errors -join ' ') | Should Match 'secret|sensitive|redact'
+            ($keyScan.Errors -join ' ') | Should Not Match ([regex]::Escape(('Z' * 20)))
+        } finally {
+            Remove-Item -LiteralPath $dir2 -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
