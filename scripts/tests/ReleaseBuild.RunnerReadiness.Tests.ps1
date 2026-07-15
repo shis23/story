@@ -121,10 +121,11 @@ function New-SyntheticEvidencePackage {
         $notes = @($ManifestNotes)
     }
 
+    $defaultCommit = 'abcdef0123456789abcdef0123456789abcdef01'
     $manifest = [pscustomobject]@{
         schema_version = $schemaVersion
         generated_at_utc = '2026-07-15T00:00:00Z'
-        commit = 'abc1234'
+        commit = $defaultCommit
         branch = 'codex/release-runner-readiness'
         target = 'x86_64-pc-windows-msvc'
         tool_versions = [pscustomobject]@{ rustc = '1.0'; cargo = '1.0'; node = '20'; npm = '10' }
@@ -181,7 +182,7 @@ function New-SyntheticEvidencePackage {
         $prov = [pscustomobject]@{
             schema_version = $schemaVersion
             generated_at_utc = '2026-07-15T00:00:00Z'
-            commit = if ($ProvenanceCommit) { $ProvenanceCommit } else { 'abc1234' }
+            commit = if ($ProvenanceCommit) { $ProvenanceCommit } else { $defaultCommit }
             branch = if ($ProvenanceBranch) { $ProvenanceBranch } else { 'codex/release-runner-readiness' }
             target = if ($ProvenanceTarget) { $ProvenanceTarget } else { 'x86_64-pc-windows-msvc' }
             subjects = @(
@@ -620,7 +621,9 @@ Describe 'Release offline evidence package verifier' {
                 New-SyntheticEvidencePackage -Root $dir -RemoteCi $claim | Out-Null
                 $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
                 $result.Valid | Should Be $false
-                $result.remote_ci_claim | Should Be $claim
+                # Helper returns a controlled form; original claim remains visible when non-secret.
+                [string]$result.remote_ci_claim | Should Match ([regex]::Escape($claim))
+                [string]$result.remote_ci_claim | Should Match 'out_of_bounds|REDACTED|controlled|invalid'
                 $result.remote_ci_claimed | Should Be $true
                 ($result.Errors -join ' ') | Should Match 'remote_ci'
                 ($result.Errors -join ' ') | Should Match $claim
@@ -662,6 +665,162 @@ Describe 'Release offline evidence package verifier' {
                 Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+    }
+
+    It 'P0: rejects claimed.exe in manifest while only checked.exe is verified in provenance' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-claimed-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            $checkedRel = 'subjects/windows-exe/checked.exe'
+            $claimedRel = 'subjects/windows-exe/claimed.exe'
+            $checkedPath = Join-Path $dir ($checkedRel -replace '/', '\')
+            $claimedPath = Join-Path $dir ($claimedRel -replace '/', '\')
+            [System.IO.File]::WriteAllBytes($checkedPath, [byte[]](7, 7, 7, 7))
+            [System.IO.File]::WriteAllBytes($claimedPath, [byte[]](8, 8, 8, 8))
+            $checkedSha = Get-ReleaseFileSha256 -Path $checkedPath
+            $claimedSha = Get-ReleaseFileSha256 -Path $claimedPath
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText(($checkedPath + '.sha256'), ("{0} *checked.exe" -f $checkedSha), $utf8NoBom)
+            [System.IO.File]::WriteAllText(($claimedPath + '.sha256'), ("{0} *claimed.exe" -f $claimedSha), $utf8NoBom)
+
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            # Attack: manifest claims claimed.exe; provenance only checks checked.exe.
+            $manifest.artifacts = @(
+                [pscustomobject]@{
+                    relative_path = $claimedRel
+                    size_bytes = 4
+                    sha256 = $claimedSha
+                    kind = 'windows-exe'
+                    status = 'present'
+                }
+            )
+            $prov.subjects = @(
+                [pscustomobject]@{
+                    relative_path = $checkedRel
+                    size_bytes = 4
+                    sha256 = $checkedSha
+                    kind = 'windows-exe'
+                    status = 'present'
+                }
+            )
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'binding|exact-set|mismatch|missing|extra'
+            ($result.Errors -join ' ') | Should Match 'claimed|checked'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'P0: rejects duplicate subjects and extra/missing set members for ok packages' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-dup-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            $rel = 'subjects/windows-exe/storyforge.exe'
+            $path = Join-Path $dir ($rel -replace '/', '\')
+            $sha = Get-ReleaseFileSha256 -Path $path
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            $entry = [pscustomobject]@{
+                relative_path = $rel
+                size_bytes = 6
+                sha256 = $sha
+                kind = 'windows-exe'
+                status = 'present'
+            }
+            $manifest.artifacts = @($entry, $entry)
+            $prov.subjects = @($entry)
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'duplicate|binding|exact-set'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects empty commit/branch/target and non-SHA commit identity' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-sha-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            $manifest.commit = 'not-a-sha'
+            $manifest.branch = ''
+            $manifest.target = ' '
+            $prov.commit = 'not-a-sha'
+            $prov.branch = ''
+            $prov.target = ' '
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'commit|branch|target|SHA|empty'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'recursively scans nested manifest/provenance strings for bare Bearer and unquoted api-key/token' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-recsec-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            $manifest = Get-Content -LiteralPath (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+            $prov = Get-Content -LiteralPath (Join-Path $dir 'provenance.json') -Raw | ConvertFrom-Json
+            $bearer = 'Bearer ' + ('N' * 28)
+            $apiKey = 'api-key: ' + ('K' * 20)
+            $token = 'token=' + ('T' * 20)
+            $credential = 'credential: ' + ('C' * 20)
+            # Nested string fields beyond top-level notes/warnings.
+            $manifest | Add-Member -NotePropertyName meta -NotePropertyValue ([pscustomobject]@{
+                nested = [pscustomobject]@{ leak = $bearer }
+            }) -Force
+            $manifest.tool_versions | Add-Member -NotePropertyName debug -NotePropertyValue $apiKey -Force
+            $prov | Add-Member -NotePropertyName builder -NotePropertyValue ([pscustomobject]@{
+                env = @($token, $credential)
+            }) -Force
+            Write-ReleaseJson -Object $manifest -Path (Join-Path $dir 'manifest.json')
+            Write-ReleaseJson -Object $prov -Path (Join-Path $dir 'provenance.json')
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'secret|sensitive|redact'
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('N' * 28)))
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('K' * 20)))
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('T' * 20)))
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('C' * 20)))
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'sanitizes remote_ci_claim helper output when the raw claim is secret-shaped' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-rci-sec-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $secretClaim = 'passed sk-' + ('r' * 24)
+            New-SyntheticEvidencePackage -Root $dir -RemoteCi $secretClaim | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            $result.remote_ci_claimed | Should Be $true
+            [string]$result.remote_ci_claim | Should Not Match 'sk-r{10,}'
+            [string]$result.remote_ci_claim | Should Not Match ([regex]::Escape($secretClaim))
+            [string]$result.remote_ci_claim | Should Match 'REDACTED|controlled|out_of_bounds|invalid'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'documents TOCTOU trust model for offline evidence verification' {
+        $result = Get-ReleaseEvidenceVerifierTrustModel
+        $result.model | Should Match 'TOCTOU|snapshot|open-then-hash|handle'
+        $result.notes.Count | Should BeGreaterThan 0
+        ($result.notes -join ' ') | Should Match 'reparse|hash|race|trust'
+        ($result.notes -join ' ') | Should Not Match 'C:\\Users'
     }
 }
 

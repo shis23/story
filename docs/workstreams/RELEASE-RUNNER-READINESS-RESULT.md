@@ -177,14 +177,37 @@ Additional fail-closed verifier fixes landed after the initial readiness commit:
 3. Provenance notes use the generic `Find-ReleaseSecretPatternFindings` scanner
    (api_key / Bearer / authorization / sk-* etc.), not sk-* alone.
 4. `acceptance.remote_ci` is validated; `claimed`/`passed` fail closed and
-   `remote_ci_claim` preserves the original value (no fixed `false` cover-up).
+   `remote_ci_claim` returns a controlled form (no fixed `false` cover-up;
+   secret-shaped claims are redacted).
 5. Manifest vs provenance `commit` / `branch` / `target` identity must match.
 6. `partial` / `failed` packages fail closed; CLI never prints
    `VERIFICATION PASSED` or exits 0 for those statuses.
 7. Real-process CLI tests cover missing dir redaction and partial/failed exits.
 
-Full suite after hardening: **122** Pester tests passed
-(37 + 14 + 31 + 40), `git diff --check` clean.
+### P0 subject exact-set binding + identity/scanner tightening
+
+Further P0 hardening:
+
+1. For `build_status=ok`, `manifest.artifacts` (present) and
+   `provenance.subjects` form a **bidirectional exact-set** keyed by
+   normalized `relative_path|kind|status|sha256|size_bytes`. Duplicates, missing
+   members, extra members, and field disagreements fail closed.
+2. Every present **manifest** artifact is fully checked (exists, non-reparse,
+   sidecar, rehash, size) even when provenance subjects exist — provenance
+   presence never skips manifest verification.
+3. Attack regression: `manifest=claimed.exe` while
+   `provenance=checked.exe` fails closed.
+4. `commit` / `branch` / `target` must be non-empty; `commit` must match strict
+   git SHA (`^[0-9a-fA-F]{7,40}$`) on both manifest and provenance.
+5. Generic secret scanner recursively walks all string leaves in
+   manifest/provenance graphs and covers bare `Bearer`, unquoted
+   `api-key`/`token`/`credential`, plus existing patterns.
+6. TOCTOU trust model is explicit via
+   `Get-ReleaseEvidenceVerifierTrustModel` (`open-then-hash` with reparse
+   rejection; package immutability assumed for the verification window).
+
+Full suite after P0 pass: **128** Pester tests passed
+(37 + 14 + 31 + 46). Dry-runs exit 0. `git diff --check` clean.
 
 ## Risks / follow-ups
 

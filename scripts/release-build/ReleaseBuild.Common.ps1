@@ -361,7 +361,12 @@ function Find-ReleaseSecretPatternFindings {
         @{ Name = 'OpenAI-style API key'; Pattern = 'sk-[A-Za-z0-9_-]{20,}' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
         @{ Name = 'authorization header'; Pattern = '(?i)(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
-        @{ Name = 'secret assignment'; Pattern = '(?i)(api[_-]?key|secret|token|password|passwd|authorization)\s*[:=]\s*[''"][^''"]{16,}[''"]' }
+        # Bare Bearer tokens without an Authorization: prefix.
+        @{ Name = 'bare bearer token'; Pattern = '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}' },
+        # Quoted secret assignments (existing).
+        @{ Name = 'secret assignment'; Pattern = '(?i)(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"][^''"]{16,}[''"]' },
+        # Unquoted api-key / token / credential assignments or colon forms.
+        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)\b(api[_-]?key|token|password|passwd|secret|credential)\b\s*[:=]\s*[^\s''"]{16,}' }
     )
 
     $findings = @()
@@ -371,6 +376,89 @@ function Find-ReleaseSecretPatternFindings {
         }
     }
     return $findings
+}
+
+function Get-ReleaseObjectStringLeaves {
+    <#
+    .SYNOPSIS
+    Recursively collects all string leaves from JSON-like objects for secret scanning.
+    #>
+    param(
+        [AllowNull()][object]$Value,
+        [int]$Depth = 0
+    )
+
+    $leaves = New-Object System.Collections.Generic.List[string]
+    function Walk-ObjectLeaves {
+        param([AllowNull()][object]$Node, [int]$Level)
+        if ($null -eq $Node) { return }
+        if ($Level -gt 32) { return }
+        if ($Node -is [string]) {
+            $leaves.Add([string]$Node) | Out-Null
+            return
+        }
+        # Skip non-string scalars (bool/int/long/decimal/datetime).
+        if ($Node -is [ValueType]) { return }
+        if ($Node -is [System.Collections.IDictionary]) {
+            foreach ($key in @($Node.Keys)) {
+                Walk-ObjectLeaves -Node $Node[$key] -Level ($Level + 1)
+            }
+            return
+        }
+        if ($Node -is [pscustomobject]) {
+            foreach ($property in @($Node.PSObject.Properties)) {
+                Walk-ObjectLeaves -Node $property.Value -Level ($Level + 1)
+            }
+            return
+        }
+        if ($Node -is [System.Collections.IEnumerable]) {
+            foreach ($item in @($Node)) {
+                Walk-ObjectLeaves -Node $item -Level ($Level + 1)
+            }
+        }
+    }
+    Walk-ObjectLeaves -Node $Value -Level $Depth
+    # Return a flat string[] (no unary-comma wrapper) so callers can foreach leaves.
+    return [string[]]@($leaves.ToArray())
+}
+
+function Test-ReleaseGitCommitSha {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Commit)
+    # Strict git SHA: 7-40 lowercase/uppercase hex (short or full object id).
+    return [bool]([regex]::IsMatch([string]$Commit, '^[0-9a-fA-F]{7,40}$'))
+}
+
+function Get-ReleaseEvidenceSubjectBindingKey {
+    param([Parameter(Mandatory = $true)][object]$Entry)
+
+    $rel = ([string]$Entry.relative_path) -replace '\\', '/'
+    $rel = $rel.Trim().TrimStart('./')
+    while ($rel.Contains('//')) { $rel = $rel -replace '//', '/' }
+    $kind = ([string]$Entry.kind).Trim().ToLowerInvariant()
+    $status = ([string]$Entry.status).Trim().ToLowerInvariant()
+    $sha = ([string]$Entry.sha256).Trim().ToLowerInvariant()
+    $size = 0
+    if ($Entry.PSObject.Properties.Name -contains 'size_bytes' -and $null -ne $Entry.size_bytes) {
+        $size = [long]$Entry.size_bytes
+    }
+    return ('{0}|{1}|{2}|{3}|{4}' -f $rel.ToLowerInvariant(), $kind, $status, $sha, $size)
+}
+
+function Get-ReleaseEvidenceVerifierTrustModel {
+    <#
+    .SYNOPSIS
+    Declares the offline verifier TOCTOU / reparse trust model.
+    #>
+    return [pscustomobject]@{
+        model = 'open-then-hash with reparse rejection (TOCTOU-aware, not a sealed snapshot handle)'
+        notes = @(
+            'Verifier rejects junction/symlink/reparse points on evidence roots, subjects, sidecars, inventory, and ancestor path segments before hashing.',
+            'Hashing uses open-then-hash of the validated path; this is not a single durable OS file handle snapshot across the whole package.',
+            'TOCTOU race trust model: the package directory is assumed immutable for the duration of verification; concurrent writers are out of trust boundary.',
+            'Canonical path checks bound subjects inside EvidenceDir after reparse rejection to reduce path-escape races.',
+            'Operators must treat mutable or shared evidence directories as untrusted; copy to a private immutable tree before verification when in doubt.'
+        )
+    }
 }
 
 function Invoke-ReleaseSecretScan {
@@ -2086,21 +2174,46 @@ function Test-ReleaseEvidencePackage {
         Add-SafeEvidenceError -Message ("Unknown or unsupported schema_version '{0}'." -f $manifest.schema_version)
     }
 
-    # remote_ci claim is explicit and must never be silently rewritten to false.
+    # Identity: non-empty commit/branch/target; commit must be a strict git SHA.
+    foreach ($field in @('commit', 'branch', 'target')) {
+        $val = [string]$manifest.$field
+        if ([string]::IsNullOrWhiteSpace($val)) {
+            Add-SafeEvidenceError -Message ("manifest {0} identity is empty." -f $field)
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$manifest.commit) -and -not (Test-ReleaseGitCommitSha -Commit ([string]$manifest.commit))) {
+        Add-SafeEvidenceError -Message 'manifest commit is not a strict git SHA format.'
+    }
+
+    # remote_ci claim is explicit; raw value never returned unsanitized.
+    $rawRemoteCiClaim = 'absent'
     if ($manifest.PSObject.Properties.Name -contains 'acceptance' -and $null -ne $manifest.acceptance) {
         $acc = $manifest.acceptance
         if ($acc.PSObject.Properties.Name -contains 'remote_ci') {
-            $remoteCiClaim = [string]$acc.remote_ci
+            $rawRemoteCiClaim = [string]$acc.remote_ci
         }
     }
     $allowedRemoteCi = @('not_claimed', 'not_claimable', 'absent', '')
-    if (-not [string]::IsNullOrWhiteSpace($remoteCiClaim) -and $allowedRemoteCi -notcontains $remoteCiClaim) {
+    if (-not [string]::IsNullOrWhiteSpace($rawRemoteCiClaim) -and $allowedRemoteCi -notcontains $rawRemoteCiClaim) {
         $remoteCiClaimed = $true
-        Add-SafeEvidenceError -Message ("remote_ci claim '{0}' is out of bounds; only not_claimed/not_claimable are allowed." -f $remoteCiClaim)
+        $secretHits = @(Find-ReleaseSecretPatternFindings -Text $rawRemoteCiClaim)
+        if ($secretHits.Count -gt 0 -or $rawRemoteCiClaim -match 'sk-[A-Za-z0-9_-]{10,}') {
+            $remoteCiClaim = 'out_of_bounds_REDACTED'
+            Add-SafeEvidenceError -Message 'remote_ci claim is out of bounds and secret-shaped; value redacted from helper output.'
+        } else {
+            $controlled = Protect-ReleasePath -Text $rawRemoteCiClaim -RepoRoot $evidenceRoot
+            $controlled = Protect-ReleasePath -Text $controlled
+            # Bound length and character set so helper output stays controlled.
+            if ($controlled.Length -gt 64) { $controlled = $controlled.Substring(0, 64) }
+            $remoteCiClaim = 'out_of_bounds:' + $controlled
+            Add-SafeEvidenceError -Message ("remote_ci claim '{0}' is out of bounds; only not_claimed/not_claimable are allowed." -f $controlled)
+        }
     } else {
         $remoteCiClaimed = $false
-        if ([string]::IsNullOrWhiteSpace($remoteCiClaim)) {
+        if ([string]::IsNullOrWhiteSpace($rawRemoteCiClaim)) {
             $remoteCiClaim = 'absent'
+        } else {
+            $remoteCiClaim = $rawRemoteCiClaim
         }
     }
 
@@ -2109,20 +2222,19 @@ function Test-ReleaseEvidencePackage {
         Add-SafeEvidenceError -Message ("build_status '{0}' is fail-closed; offline verification does not accept partial/failed packages as success." -f $buildStatus)
     }
 
-    $secretProbe = @()
-    if ($manifest.PSObject.Properties.Name -contains 'warnings') {
-        $secretProbe += @($manifest.warnings | ForEach-Object { [string]$_ })
-    }
-    if ($manifest.PSObject.Properties.Name -contains 'notes') {
-        $secretProbe += @($manifest.notes | ForEach-Object { [string]$_ })
-    }
-    $secretFindings = @()
-    foreach ($text in $secretProbe) {
+    # Recursive generic secret scan over every string leaf in the manifest.
+    $manifestSecretFindings = New-Object System.Collections.Generic.List[string]
+    $manifestLeaves = @(Get-ReleaseObjectStringLeaves -Value $manifest | ForEach-Object { $_ })
+    foreach ($leaf in $manifestLeaves) {
+        if ($null -eq $leaf) { continue }
+        $text = [string]$leaf
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
-        $secretFindings += @(Find-ReleaseSecretPatternFindings -Text $text)
+        foreach ($hit in @(Find-ReleaseSecretPatternFindings -Text $text)) {
+            $manifestSecretFindings.Add([string]$hit) | Out-Null
+        }
     }
-    if ($secretFindings.Count -gt 0) {
-        Add-SafeEvidenceError -Message 'Sensitive secret-like content found in manifest warnings/notes; package rejected (values redacted).'
+    if ($manifestSecretFindings.Count -gt 0) {
+        Add-SafeEvidenceError -Message 'Sensitive secret-like content found in manifest object graph; package rejected (values redacted).'
     }
 
     $isDryRun = ($buildStatus -eq 'dry-run')
@@ -2175,6 +2287,16 @@ function Test-ReleaseEvidencePackage {
                 Add-SafeEvidenceError -Message ("Unknown or unsupported provenance schema_version '{0}'." -f $prov.schema_version)
             }
 
+            foreach ($field in @('commit', 'branch', 'target')) {
+                $pVal = [string]$prov.$field
+                if ([string]::IsNullOrWhiteSpace($pVal)) {
+                    Add-SafeEvidenceError -Message ("provenance {0} identity is empty." -f $field)
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$prov.commit) -and -not (Test-ReleaseGitCommitSha -Commit ([string]$prov.commit))) {
+                Add-SafeEvidenceError -Message 'provenance commit is not a strict git SHA format.'
+            }
+
             # Identity consistency: commit/branch/target must match the manifest.
             foreach ($field in @('commit', 'branch', 'target')) {
                 $mVal = [string]$manifest.$field
@@ -2184,20 +2306,23 @@ function Test-ReleaseEvidencePackage {
                 }
             }
 
-            $provSecretProbe = @()
-            if ($prov.PSObject.Properties.Name -contains 'notes') {
-                $provSecretProbe += @($prov.notes | ForEach-Object { [string]$_ })
-            }
-            $provSecretFindings = @()
-            foreach ($text in $provSecretProbe) {
+            $provSecretFindings = New-Object System.Collections.Generic.List[string]
+            $provLeaves = @(Get-ReleaseObjectStringLeaves -Value $prov | ForEach-Object { $_ })
+            foreach ($leaf in $provLeaves) {
+                if ($null -eq $leaf) { continue }
+                $text = [string]$leaf
                 if ([string]::IsNullOrWhiteSpace($text)) { continue }
-                $provSecretFindings += @(Find-ReleaseSecretPatternFindings -Text $text)
+                foreach ($hit in @(Find-ReleaseSecretPatternFindings -Text $text)) {
+                    $provSecretFindings.Add([string]$hit) | Out-Null
+                }
             }
             if ($provSecretFindings.Count -gt 0) {
-                Add-SafeEvidenceError -Message 'Sensitive secret-like content found in provenance notes; package rejected (values redacted).'
+                Add-SafeEvidenceError -Message 'Sensitive secret-like content found in provenance object graph; package rejected (values redacted).'
             }
         } catch {
             if ($_.Exception.Message -match 'reparse|symlink|junction') {
+                Add-SafeEvidenceError -Message $_.Exception.Message
+            } elseif ($_.Exception.Message -match 'identity|SHA|empty|schema|secret') {
                 Add-SafeEvidenceError -Message $_.Exception.Message
             } else {
                 Add-SafeEvidenceError -Message 'provenance.json is not valid JSON or cannot be read safely.'
@@ -2205,70 +2330,59 @@ function Test-ReleaseEvidencePackage {
         }
     }
 
-    $subjects = @()
-    if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
-        $subjects = @($prov.subjects)
-    } elseif ($buildStatus -eq 'ok') {
-        $subjects = @($manifest.artifacts | Where-Object { $_.status -eq 'present' })
-    }
+    function Test-OneEvidencePresentEntry {
+        param(
+            [Parameter(Mandatory = $true)][object]$Entry,
+            [Parameter(Mandatory = $true)][string]$Label
+        )
 
-    if ($buildStatus -eq 'ok' -and @($subjects).Count -eq 0) {
-        Add-SafeEvidenceError -Message 'build_status=ok package has no present subjects to verify.'
-    }
-
-    foreach ($subj in $subjects) {
-        if ($null -eq $subj) { continue }
-        $rel = [string]$subj.relative_path
-        $requiresPresent = ($buildStatus -eq 'ok' -or $subj.status -eq 'present')
-        if (-not $requiresPresent) { continue }
-
+        $rel = [string]$Entry.relative_path
         try {
             $subjectPath = Test-ReleaseEvidencePathSafe `
                 -EvidenceRoot $evidenceRoot `
                 -RelativePath $rel `
-                -Label 'Subject'
+                -Label $Label
         } catch {
             Add-SafeEvidenceError -Message $_.Exception.Message
-            continue
+            return $false
         }
 
         if (-not (Test-Path -LiteralPath $subjectPath -PathType Leaf)) {
-            Add-SafeEvidenceError -Message ("Subject file missing: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
-            continue
+            Add-SafeEvidenceError -Message ("{0} file missing: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
         }
 
         try {
-            $null = Assert-ReleasePathNotReparsePoint -Path $subjectPath -Label 'Subject file'
+            $null = Assert-ReleasePathNotReparsePoint -Path $subjectPath -Label ("{0} file" -f $Label)
         } catch {
             Add-SafeEvidenceError -Message $_.Exception.Message
-            continue
+            return $false
         }
 
-        $sidecarRel = $rel + '.sha256'
+        $sidecarRel = (([string]$rel) -replace '\\', '/') + '.sha256'
         try {
             $sidecar = Test-ReleaseEvidencePathSafe `
                 -EvidenceRoot $evidenceRoot `
                 -RelativePath $sidecarRel `
-                -Label 'Hash sidecar'
+                -Label ("{0} hash sidecar" -f $Label)
         } catch {
-            # Sidecar relative path is derived; still report as missing/escape.
             $sidecar = $subjectPath + '.sha256'
             if ($_.Exception.Message -match 'reparse|symlink|junction|escape|outside') {
                 Add-SafeEvidenceError -Message $_.Exception.Message
-                continue
+                return $false
             }
         }
 
         if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
-            Add-SafeEvidenceError -Message ("Hash sidecar missing for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
-            continue
+            Add-SafeEvidenceError -Message ("Hash sidecar missing for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            return $false
         }
 
         try {
-            $null = Assert-ReleasePathNotReparsePoint -Path $sidecar -Label 'Hash sidecar'
+            $null = Assert-ReleasePathNotReparsePoint -Path $sidecar -Label ("{0} hash sidecar" -f $Label)
         } catch {
             Add-SafeEvidenceError -Message $_.Exception.Message
-            continue
+            return $false
         }
 
         $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecar)
@@ -2283,33 +2397,106 @@ function Test-ReleaseEvidencePackage {
         }
 
         $rehash = Get-ReleaseFileSha256 -Path $subjectPath
-        $expected = ([string]$subj.sha256).ToLowerInvariant()
+        $expected = ([string]$Entry.sha256).ToLowerInvariant()
         if ([string]::IsNullOrWhiteSpace($expected)) {
-            Add-SafeEvidenceError -Message ("Subject missing sha256 digest: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            Add-SafeEvidenceError -Message ("{0} missing sha256 digest: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
         } elseif ($rehash -ne $expected) {
-            Add-SafeEvidenceError -Message ("Offline rehash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            Add-SafeEvidenceError -Message ("Offline rehash mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+        }
+
+        if ($Entry.PSObject.Properties.Name -contains 'size_bytes' -and $null -ne $Entry.size_bytes) {
+            $actualSize = [long](Get-Item -LiteralPath $subjectPath).Length
+            if ($actualSize -ne [long]$Entry.size_bytes) {
+                Add-SafeEvidenceError -Message ("Size mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            }
         }
 
         if ($sidecarText -match '([a-fA-F0-9]{64})') {
             $sidecarHash = $Matches[1].ToLowerInvariant()
             if ($sidecarHash -ne $rehash -or ($expected -and $sidecarHash -ne $expected)) {
-                Add-SafeEvidenceError -Message ("Sidecar hash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+                Add-SafeEvidenceError -Message ("Sidecar hash mismatch for {0}: {1}" -f $Label, (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
             }
         } else {
             Add-SafeEvidenceError -Message ("Sidecar content is not a valid sha256 sum line: {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
         }
 
-        $subjectCount += 1
+        return $true
     }
 
+    # For build_status=ok, require bidirectional exact-set binding between
+    # manifest present artifacts and provenance subjects.
     if ($buildStatus -eq 'ok') {
-        foreach ($art in @($manifest.artifacts)) {
-            if ($null -eq $art -or $art.status -ne 'present') { continue }
-            $rel = [string]$art.relative_path
-            try {
-                $null = Test-ReleaseEvidencePathSafe -EvidenceRoot $evidenceRoot -RelativePath $rel -Label 'Artifact'
-            } catch {
-                Add-SafeEvidenceError -Message $_.Exception.Message
+        $manifestPresent = @($manifest.artifacts | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        $provSubjects = @()
+        if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
+            $provSubjects = @($prov.subjects | Where-Object { $null -ne $_ })
+        }
+
+        if ($manifestPresent.Count -eq 0) {
+            Add-SafeEvidenceError -Message 'build_status=ok package has no present manifest artifacts to bind.'
+        }
+        if ($provSubjects.Count -eq 0) {
+            Add-SafeEvidenceError -Message 'build_status=ok package has no provenance subjects to bind.'
+        }
+
+        $manifestKeys = New-Object System.Collections.Generic.List[string]
+        $provKeys = New-Object System.Collections.Generic.List[string]
+        $manifestKeySet = @{}
+        $provKeySet = @{}
+
+        foreach ($art in $manifestPresent) {
+            $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $art
+            if ($manifestKeySet.ContainsKey($key)) {
+                Add-SafeEvidenceError -Message ("duplicate manifest artifact in exact-set binding: {0}" -f (Protect-ReleasePath -Text ([string]$art.relative_path) -RepoRoot $evidenceRoot))
+            } else {
+                $manifestKeySet[$key] = $true
+            }
+            $manifestKeys.Add($key) | Out-Null
+        }
+        foreach ($subj in $provSubjects) {
+            $key = Get-ReleaseEvidenceSubjectBindingKey -Entry $subj
+            if ($provKeySet.ContainsKey($key)) {
+                Add-SafeEvidenceError -Message ("duplicate provenance subject in exact-set binding: {0}" -f (Protect-ReleasePath -Text ([string]$subj.relative_path) -RepoRoot $evidenceRoot))
+            } else {
+                $provKeySet[$key] = $true
+            }
+            $provKeys.Add($key) | Out-Null
+        }
+
+        foreach ($key in @($manifestKeySet.Keys)) {
+            if (-not $provKeySet.ContainsKey($key)) {
+                $rel = ($key -split '\|')[0]
+                Add-SafeEvidenceError -Message ("exact-set binding mismatch: manifest present artifact missing from provenance subjects ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            }
+        }
+        foreach ($key in @($provKeySet.Keys)) {
+            if (-not $manifestKeySet.ContainsKey($key)) {
+                $rel = ($key -split '\|')[0]
+                Add-SafeEvidenceError -Message ("exact-set binding mismatch: provenance subject is extra vs manifest present artifacts ({0})." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            }
+        }
+
+        # Always fully check every present manifest artifact (existence, non-reparse,
+        # sidecar, rehash, size) even when provenance subjects exist. Never skip.
+        foreach ($art in $manifestPresent) {
+            if (Test-OneEvidencePresentEntry -Entry $art -Label 'Manifest artifact') {
+                $subjectCount += 1
+            }
+        }
+        # Also fully check provenance subjects (same physical set when binding holds;
+        # still required so a binding bug cannot skip a subject path).
+        foreach ($subj in $provSubjects) {
+            $null = Test-OneEvidencePresentEntry -Entry $subj -Label 'Provenance subject'
+        }
+    } else {
+        # Non-ok paths: still verify any present provenance subjects when present.
+        $subjects = @()
+        if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
+            $subjects = @($prov.subjects | Where-Object { $null -ne $_ -and $_.status -eq 'present' })
+        }
+        foreach ($subj in $subjects) {
+            if (Test-OneEvidencePresentEntry -Entry $subj -Label 'Subject') {
+                $subjectCount += 1
             }
         }
     }
@@ -2320,6 +2507,7 @@ function Test-ReleaseEvidencePackage {
     $safeNotes = @($notes | ForEach-Object {
         Protect-ReleasePath -Text (Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot)
     })
+    $safeRemoteClaim = Protect-ReleasePath -Text (Protect-ReleasePath -Text ([string]$remoteCiClaim) -RepoRoot $evidenceRoot)
 
     return [pscustomobject]@{
         Valid = ($errors.Count -eq 0)
@@ -2327,9 +2515,10 @@ function Test-ReleaseEvidencePackage {
         Errors = $safeErrors
         Notes = $safeNotes
         subject_count = $subjectCount
-        remote_ci_claim = $remoteCiClaim
+        remote_ci_claim = $safeRemoteClaim
         remote_ci_claimed = [bool]$remoteCiClaimed
         build_status = $buildStatus
+        trust_model = (Get-ReleaseEvidenceVerifierTrustModel).model
     }
 }
 
