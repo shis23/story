@@ -1377,19 +1377,189 @@ Describe 'Release workflow static governance (runner readiness)' {
 
     It 'release-host-evidence both host jobs call full Assert-ReleaseEvidencePackage before upload' {
         $wf = Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'
-        $text = Get-Content -LiteralPath $wf -Raw
-        # Full offline verifier, not only schema/manual rehash.
-        $text | Should Match 'Assert-ReleaseEvidencePackage'
-        # Must appear for both windows and android evidence jobs (two invocations).
-        $matches = [regex]::Matches($text, 'Assert-ReleaseEvidencePackage')
-        $matches.Count | Should BeGreaterThan 1
-        # Weak schema-only rehash loops must not remain as the sole verification path.
-        $text | Should Not Match '(?m)^\s*foreach \(\$subj in @\(\$prov\.subjects\)\)'
+        $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+        if (-not $order.Valid) {
+            throw ("host evidence verifier order failed: {0}" -f ($order.Errors -join '; '))
+        }
+        $order.Engine | Should Match 'pyyaml|node-yaml'
+        $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+        $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $true
         $gov = Assert-ReleaseWorkflowStaticContract -RepoRoot $RepoRoot
         if (-not $gov.Valid) {
             throw ("workflow static contract failed: {0}" -f ($gov.Errors -join '; '))
         }
         $gov.checks['full_offline_verifier'] | Should Be $true
+    }
+
+    It 'fails closed when android verifier is comment-only (parsed job/step order)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-comment-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          # Assert-ReleaseEvidencePackage -EvidenceDir x
+          Write-Host 'comment only'
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'android-host-evidence|Assert-ReleaseEvidencePackage|before upload|missing'
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when android verifier is after upload-artifact (parsed job/step order)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-after-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'android-host-evidence|before upload|order|after'
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when windows verifier is missing entirely (parsed job/step order)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-winmiss-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'windows-host-evidence|Assert-ReleaseEvidencePackage|missing|before upload'
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when windows verifier is after upload-artifact (parsed job/step order)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-winafter-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          Assert-ReleaseEvidencePackage -EvidenceDir x
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'windows-host-evidence|before upload|order|after'
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

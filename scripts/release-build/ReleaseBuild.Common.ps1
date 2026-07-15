@@ -2824,6 +2824,301 @@ function Assert-ReleaseEvidencePackage {
     return $result
 }
 
+function Test-ReleaseHostEvidenceVerifierOrder {
+    <#
+    .SYNOPSIS
+    Parses release-host-evidence.yml with a real YAML engine and checks that each
+    host job has an executable Assert-ReleaseEvidencePackage run step before upload.
+
+    .DESCRIPTION
+    Fail-closed on missing jobs, comment-only mentions, verifier-after-upload, or
+    absence of a real YAML parser. Structural fallback is never treated as PASS.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkflowPath
+    )
+
+    $requiredJobs = @('windows-host-evidence', 'android-host-evidence')
+    $jobResults = @{}
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    if (-not (Test-Path -LiteralPath $WorkflowPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Valid = $false
+            Engine = 'none'
+            Errors = @("Workflow file not found: $WorkflowPath")
+            jobs = [hashtable]@{}
+        }
+    }
+
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) { $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue }
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+
+    $pyScript = @'
+import sys, json
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"ok": False, "engine": "python-missing-pyyaml", "error": "PyYAML is not installed", "jobs": {}}))
+    sys.exit(0)
+
+path = sys.argv[1]
+required = ["windows-host-evidence", "android-host-evidence"]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+except Exception as exc:
+    print(json.dumps({"ok": False, "engine": "pyyaml", "error": "YAML parse error: " + str(exc)[:500], "jobs": {}}))
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    print(json.dumps({"ok": False, "engine": "pyyaml", "error": "Workflow root must be a mapping", "jobs": {}}))
+    sys.exit(0)
+
+jobs = data.get("jobs")
+if not isinstance(jobs, dict):
+    print(json.dumps({"ok": False, "engine": "pyyaml", "error": "Top-level jobs must be a mapping", "jobs": {}}))
+    sys.exit(0)
+
+out = {}
+for name in required:
+    job = jobs.get(name)
+    if not isinstance(job, dict):
+        out[name] = {
+            "present": False,
+            "has_verifier_before_upload": False,
+            "verifier_index": -1,
+            "upload_index": -1,
+            "reason": "job missing or not a mapping"
+        }
+        continue
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        out[name] = {
+            "present": True,
+            "has_verifier_before_upload": False,
+            "verifier_index": -1,
+            "upload_index": -1,
+            "reason": "steps missing or not a list"
+        }
+        continue
+    verifier_idx = -1
+    upload_idx = -1
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("actions/upload-artifact"):
+            if upload_idx < 0:
+                upload_idx = i
+        run = step.get("run")
+        if isinstance(run, str) and "Assert-ReleaseEvidencePackage" in run:
+            # YAML run values exclude comments-only lines that are pure comments;
+            # still require a non-comment command occurrence.
+            has_cmd = False
+            for line in run.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "Assert-ReleaseEvidencePackage" in stripped:
+                    has_cmd = True
+                    break
+            if has_cmd and verifier_idx < 0:
+                verifier_idx = i
+    ok = verifier_idx >= 0 and upload_idx >= 0 and verifier_idx < upload_idx
+    reason = "ok"
+    if verifier_idx < 0:
+        reason = "missing executable Assert-ReleaseEvidencePackage run step"
+    elif upload_idx < 0:
+        reason = "missing actions/upload-artifact step"
+    elif verifier_idx >= upload_idx:
+        reason = "Assert-ReleaseEvidencePackage is not before upload-artifact"
+    out[name] = {
+        "present": True,
+        "has_verifier_before_upload": ok,
+        "verifier_index": verifier_idx,
+        "upload_index": upload_idx,
+        "reason": reason
+    }
+
+print(json.dumps({"ok": True, "engine": "pyyaml", "error": "", "jobs": out}))
+'@
+
+    $jsScript = @'
+const fs = require("fs");
+const path = process.argv[2];
+function emit(obj) { process.stdout.write(JSON.stringify(obj)); process.exit(0); }
+let yaml;
+try { yaml = require("yaml"); }
+catch (_) {
+  try { yaml = require("js-yaml"); }
+  catch (e2) { emit({ ok: false, engine: "node-yaml", error: "Neither yaml nor js-yaml installed", jobs: {} }); }
+}
+let data;
+try {
+  const text = fs.readFileSync(path, "utf8");
+  data = yaml.load ? yaml.load(text) : yaml.parse(text);
+} catch (e) {
+  emit({ ok: false, engine: "node-yaml", error: "YAML parse error: " + String(e && e.message ? e.message : e).slice(0, 500), jobs: {} });
+}
+if (!data || typeof data !== "object" || Array.isArray(data)) {
+  emit({ ok: false, engine: "node-yaml", error: "Workflow root must be a mapping", jobs: {} });
+}
+const jobs = data.jobs;
+if (!jobs || typeof jobs !== "object" || Array.isArray(jobs)) {
+  emit({ ok: false, engine: "node-yaml", error: "Top-level jobs must be a mapping", jobs: {} });
+}
+const required = ["windows-host-evidence", "android-host-evidence"];
+const out = {};
+for (const name of required) {
+  const job = jobs[name];
+  if (!job || typeof job !== "object" || Array.isArray(job)) {
+    out[name] = { present: false, has_verifier_before_upload: false, verifier_index: -1, upload_index: -1, reason: "job missing or not a mapping" };
+    continue;
+  }
+  const steps = job.steps;
+  if (!Array.isArray(steps)) {
+    out[name] = { present: true, has_verifier_before_upload: false, verifier_index: -1, upload_index: -1, reason: "steps missing or not a list" };
+    continue;
+  }
+  let verifierIdx = -1;
+  let uploadIdx = -1;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step || typeof step !== "object") continue;
+    const uses = step.uses;
+    if (typeof uses === "string" && uses.indexOf("actions/upload-artifact") === 0) {
+      if (uploadIdx < 0) uploadIdx = i;
+    }
+    const run = step.run;
+    if (typeof run === "string" && run.indexOf("Assert-ReleaseEvidencePackage") >= 0) {
+      let hasCmd = false;
+      for (const line of run.split(/\r?\n/)) {
+        const stripped = line.trim();
+        if (!stripped || stripped.charAt(0) === "#") continue;
+        if (stripped.indexOf("Assert-ReleaseEvidencePackage") >= 0) { hasCmd = true; break; }
+      }
+      if (hasCmd && verifierIdx < 0) verifierIdx = i;
+    }
+  }
+  let reason = "ok";
+  let ok = verifierIdx >= 0 && uploadIdx >= 0 && verifierIdx < uploadIdx;
+  if (verifierIdx < 0) reason = "missing executable Assert-ReleaseEvidencePackage run step";
+  else if (uploadIdx < 0) reason = "missing actions/upload-artifact step";
+  else if (verifierIdx >= uploadIdx) reason = "Assert-ReleaseEvidencePackage is not before upload-artifact";
+  out[name] = { present: true, has_verifier_before_upload: ok, verifier_index: verifierIdx, upload_index: uploadIdx, reason: reason };
+}
+emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
+'@
+
+    $parsed = $null
+    $engine = 'none'
+    if ($pythonCmd) {
+        $tmpPy = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-host-order-{0}.py" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText($tmpPy, $pyScript, $utf8NoBom)
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $raw = & $pythonCmd.Source $tmpPy $WorkflowPath 2>&1
+                $code = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+            $line = @($raw | Where-Object { "$_" -match '^\{' })[-1]
+            if ($code -eq 0 -and $line) {
+                $candidate = $line | ConvertFrom-Json
+                if ([string]$candidate.engine -ne 'python-missing-pyyaml') {
+                    $parsed = $candidate
+                    $engine = [string]$candidate.engine
+                }
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmpPy -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($null -eq $parsed -and $nodeCmd) {
+        $tmpJs = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-host-order-{0}.js" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText($tmpJs, $jsScript, $utf8NoBom)
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $raw = & $nodeCmd.Source $tmpJs $WorkflowPath 2>&1
+                $code = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+            $line = @($raw | Where-Object { "$_" -match '^\{' })[-1]
+            if ($code -eq 0 -and $line) {
+                $parsed = $line | ConvertFrom-Json
+                $engine = [string]$parsed.engine
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmpJs -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($null -eq $parsed) {
+        return [pscustomobject]@{
+            Valid = $false
+            Engine = 'none'
+            Errors = @('No real YAML parser available for host evidence verifier order (need python+PyYAML or node with yaml/js-yaml). Structural-only checks are not accepted.')
+            jobs = [hashtable]@{}
+        }
+    }
+
+    if (-not [bool]$parsed.ok) {
+        $msg = if ($parsed.error) { [string]$parsed.error } else { 'host evidence verifier order parse failed' }
+        return [pscustomobject]@{
+            Valid = $false
+            Engine = $engine
+            Errors = @($msg)
+            jobs = [hashtable]@{}
+        }
+    }
+
+    foreach ($jobName in $requiredJobs) {
+        $info = $null
+        if ($parsed.jobs -and $parsed.jobs.PSObject.Properties.Name -contains $jobName) {
+            $info = $parsed.jobs.$jobName
+        }
+        if ($null -eq $info) {
+            $errors.Add(("job '{0}' missing from parsed workflow." -f $jobName)) | Out-Null
+            $jobResults[$jobName] = [pscustomobject]@{
+                Present = $false
+                HasVerifierBeforeUpload = $false
+                VerifierIndex = -1
+                UploadIndex = -1
+                Reason = 'missing'
+            }
+            continue
+        }
+        $has = [bool]$info.has_verifier_before_upload
+        $jobResults[$jobName] = [pscustomobject]@{
+            Present = [bool]$info.present
+            HasVerifierBeforeUpload = $has
+            VerifierIndex = [int]$info.verifier_index
+            UploadIndex = [int]$info.upload_index
+            Reason = [string]$info.reason
+        }
+        if (-not $has) {
+            $errors.Add(("job '{0}' full offline verifier order failed: {1}" -f $jobName, [string]$info.reason)) | Out-Null
+        }
+    }
+
+    return [pscustomobject]@{
+        Valid = ($errors.Count -eq 0)
+        Engine = $engine
+        Errors = @($errors)
+        jobs = [hashtable]$jobResults
+    }
+}
+
 function Assert-ReleaseWorkflowStaticContract {
     <#
     .SYNOPSIS
@@ -2918,14 +3213,16 @@ function Assert-ReleaseWorkflowStaticContract {
             $errors.Add('release-host-evidence must default to host-only (skip_bundle=true, no -BuildApk).') | Out-Null
         }
 
-        # Both host jobs must call the full offline verifier before upload.
-        $assertMatches = [regex]::Matches($hostText, 'Assert-ReleaseEvidencePackage')
-        $hasWindowsJob = ($hostText -match 'windows-host-evidence')
-        $hasAndroidJob = ($hostText -match 'android-host-evidence')
-        $fullVerifier = ($assertMatches.Count -ge 2) -and $hasWindowsJob -and $hasAndroidJob -and ($hostText -notmatch '(?m)^\s*foreach \(\$subj in @\(\$prov\.subjects\)\)')
-        $checks['full_offline_verifier'] = $fullVerifier
-        if (-not $fullVerifier) {
-            $errors.Add('release-host-evidence windows and android jobs must call Assert-ReleaseEvidencePackage before upload (no weak schema/manual rehash-only path).') | Out-Null
+        # Job/step-order aware check via real YAML parser (not full-text regex counts).
+        $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $hostWf
+        $checks['full_offline_verifier'] = [bool]$order.Valid
+        if (-not $order.Valid) {
+            foreach ($e in @($order.Errors)) {
+                $errors.Add([string]$e) | Out-Null
+            }
+            if ($order.Engine -eq 'none') {
+                $errors.Add('release-host-evidence full offline verifier order requires a real YAML parser.') | Out-Null
+            }
         }
     } else {
         $errors.Add('release-host-evidence.yml is missing.') | Out-Null
