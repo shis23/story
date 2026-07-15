@@ -2,11 +2,12 @@
 
 > 原分支：`codex/m5-phaseb-100turn-evidence`
 > 基线：`a8303d6`
-> 原工作目录：`C:\tmp\storyforge-m5-endurance`（合并后已删除）
+> 原工作目录：`C:\tmp\storyforge-m5-endurance`（已从 Git worktree 删除；宿主空目录不是证据目录）
 > 日期：2026-07-14
 > 模型：`deepseek-v4-flash` @ `cli.2529985.xyz`
 > 分支收口 HEAD：`b953310`
-> 合并状态：已合入 `main`，merge commit `99b1ea3`
+>
+> **2026-07-15 后续维护注记（非原始运行结论）**：此线已通过 merge commit `99b1ea3` 合入 `main`。原始外部 evidence / `campaign_data` 未纳入 Git，现已在本机清理；本 RESULT 中的 45/100 只能作为已记录的历史 Partial Evidence，不能续跑或独立重放。
 
 ## 结论
 
@@ -15,7 +16,7 @@
 
 - **探针执行**：**PASS**
 - **分阶段 Accept**：Canary 3/3 PASS、Coverage 12/12 PASS、Stability 30/30 PASS
-- **Full 100-turn**：**Partial Evidence**（45/100，checkpoint 支持断点续跑）
+- **Full 100-turn**：**Partial Evidence**（运行结束时 45/100；当时 checkpoint 支持断点续跑，当前 artifacts 已清理）
 - **Phase B A/B 矩阵**：15 对 fixture，确定性门禁全 PASS
 - **生产参数标定**：**不改** `200/4`、`H_anchor`、`E`
 
@@ -30,7 +31,7 @@
 
 > Stability 在 3 个独立 epoch 中跨过了 `H_anchor+E=15`，并注入/检索了全部 3 个
 > early-fact probe（`EF-ALPHA-4471`、`EF-BETA-2098`、`EF-GAMMA-6603`）。
-> Full run 从 fresh evidence dir 启动；中断后从 sanitized checkpoint 续跑，不重放已 accept 的轮次。
+> Full run 在运行当时从 fresh evidence dir 启动；中断后从 sanitized checkpoint 续跑，不重放已 accept 的轮次。当前 artifacts 已清理，不能继续这次运行。
 
 ## Commit 列表（相对基线 `a8303d6`）
 
@@ -110,12 +111,12 @@ cargo test -p harness-real-llm --test endurance_real_llm endurance_real_llm_full
 | Stability | 282（含 3 次 resume） | 3 | 3/3 |
 | Full | 415（45/100 Accept，含 resume） | 5 | 1/3 已检查通过 |
 
-**API key 从未写入仓库、证据 JSONL、日志、命令示例或 RESULT。** 证据目录通过
-`STORYFORGE_EVAL_EVIDENCE_DIR` 显式配置，不在 git 追踪范围内。
+**运行时记录显示** API key 未写入仓库、证据 JSONL、日志、命令示例或 RESULT。证据目录通过
+`STORYFORGE_EVAL_EVIDENCE_DIR` 显式配置，不在 git 追踪范围内；原始 JSONL 已清理，当前不能独立审计该次记录。
 
 ### 脱敏验证
 
-所有阶段的 evidence JSONL 已通过 `check_no_secrets()` 扫描：
+运行时记录显示所有阶段的 evidence JSONL 已通过 `check_no_secrets()` 扫描（原文件现已不存在，以下为当时运行记录）：
 
 - 无 `sk-` / `SF_SECRET_` / `api_key` / `Bearer` 标记
 - 无原始 prompt / story text / private knowledge / API response body
@@ -166,42 +167,47 @@ Stability 阶段通过 3 次断点续跑完成（5→10→20→30），验证了
 
 | 阶段 | 位置 |
 | --- | --- |
-| Canary | `C:\tmp\endurance-evidence-canary-3\` |
-| Coverage | `C:\tmp\endurance-evidence-coverage\` |
-| Stability | `C:\tmp\endurance-evidence-stability\` |
-| Full | `C:\tmp\endurance-evidence-full\`（暂停于 45/100，可续跑） |
+| Canary | 原 `C:\tmp\endurance-evidence-canary-3\`（已清理） |
+| Coverage | 原 `C:\tmp\endurance-evidence-coverage\`（已清理） |
+| Stability | 原 `C:\tmp\endurance-evidence-stability\`（已清理） |
+| Full | 原 `C:\tmp\endurance-evidence-full\`（曾暂停于 45/100；已清理，不能续跑） |
 
-每个目录包含：`endurance_calls.jsonl`、`endurance_turns.jsonl`、
+运行时每个目录包含：`endurance_calls.jsonl`、`endurance_turns.jsonl`、
 `endurance_checkpoint.jsonl`、`endurance_manifest.jsonl`、`campaign_data/`。
 
-> 证据目录不在 git 追踪范围内（通过显式 env 配置，非仓库内）。
+> 证据目录从未纳入 Git；当前本机副本已清理，因此仓库仅保留 runner、schema、断言与本 RESULT，不能独立重放或续跑该次真实调用。
 
 ## 未完成项与风险
 
-1. **Full 100-turn 尚未完整跑完**：当前 checkpoint 为 45/100 Accept、415/700 calls。
-   当前没有后台进程；后续可从 checkpoint 续跑，不重放已 accept 的轮次。完成的最高
-   checkpoint 即为 **Partial Evidence** 边界。
+1. **Full 100-turn 尚未完整跑完**：最后记录的 checkpoint 为 45/100 Accept、415/700 calls。
+   原始外部 evidence/campaign_data 已在本机清理后缺失，不能从 checkpoint 续跑或独立复核原始 JSONL；该数字保留为当时运行报告的 **Partial Evidence** 边界。
 2. **Chronicle path 仍为 synthetic fixture**：harness 没有可安全复用的生产
    Summarizer/PostProcessor/TurnAttempt 后台写回公开接口。`production_postprocess_complete=false`。
 3. **模型 Plan 解析不稳定**：`deepseek-v4-flash` 偶发输出自然语言而非 JSON Plan；bounded
    retry 可消除大部分，但仍有少数轮次需多次尝试，消耗调用预算。
-4. **Accept 已直接复用共享 Turn 生命周期服务**，不再维护第二套 Accept 状态机；仍需在 Turn 服务接口变更时保持 harness 契约测试同步。
+4. **`CommitProbeEnv` 仍需随 Tauri 私有 Accept 路径漂移而复核**。
 5. **不得据此标定或修改 `200/4`、`H_anchor`/`E`**，不得宣称完整 M5 通过。
 
-本 workstream 本身未修改 SQLite、GUI、Android 或生产默认参数；合并后的主文档状态由后续文档同步提交维护。
+本线未修改 SQLite、GUI、Android、`docs/HANDOFF.md`、`docs/RELEASE-CHECKLIST.md` 或生产默认参数。
 
-## 合并结论
+## 是否建议合并（原始结论）
 
-**已合入 `main`。** 分阶段门禁、checkpoint/resume、脱敏证据、budget enforcement 和
-Phase B 12+ 矩阵作为可复跑 harness 基建保留。
+**建议合并到评估栈。** 分阶段门禁、checkpoint/resume、脱敏证据、budget enforcement 和
+Phase B 12+ 矩阵已就绪，可作为可复跑的 harness 基建。
 
 **不建议**仅凭本线宣称：
 - 生产参数已标定
 - 完整 100-turn M5 ACCEPTANCE 通过（Full 尚未完整跑完）
 - 生产 Summarizer/postprocess 完整闭环已验证
 
-### 后续建议
+### 原始后续建议（2026-07-14）
 
-1. Full 100-turn 续跑完成后更新本 RESULT 的 Full 行 acceptance。
+1. Full 100-turn 续跑完成后更新本 RESULT 的 Full 行 acceptance。（见下方维护注记：原 checkpoint 已清理。）
 2. 如需更稳定的 endurance run，可切换到 Director Plan 解析更稳定的模型。
 3. 证据足够前 **不改** 生产 `200/4` 与 `H_anchor`/`E`。
+
+## 2026-07-15 后续维护注记
+
+- 上述原始第 1 项不能再复用同一 checkpoint：四个临时 evidence 目录和 `campaign_data` 均已清理。若要完成 Full，必须使用新的、可持久保留且脱敏的 evidence 目录发起新的运行。
+- 当前 harness 的 CommitProbe 已调用共享 JSON `TurnLifecycleService`，不再维护第二套 JSON Accept 状态机；它仍不执行 Tauri command 或 SQLite `accept_turn` 路径，因此不会把本次历史运行升级为完整生产 Accept 证据。
+- 本文的当前合并状态、证据可用性和架构边界以此维护注记为准；2026-07-14 的运行结果和原始合并建议保留在前文，供追溯。

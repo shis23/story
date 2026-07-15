@@ -450,13 +450,13 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 ## 10. 推荐实施顺序
 
 > **进度快照（2026-07-11 续）**——本节原为评估建议；下列标注反映当前代码主线，不等于阶段完全关闭。
-> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4.2.2 完成**；**M5 探针 Inconclusive / Partial Evidence** 2026-07-12 复核，见该文实跑记录）。
+> 记忆域以 `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md` §2 / §9 为准（**M0–M4.2.2 完成**；2026-07-12 的早期参数/语义探针含 Inconclusive 项，但探针执行为 PASS；截至 2026-07-14 的整体 **M5 Acceptance 为 Partial Evidence**，见该文实跑记录）。
 >
 > | 阶段 | 状态 | 已落地要点 | 仍显式延后 |
 > | --- | --- | --- | --- |
 > | A | **主线可过** | TurnRecord/Attempt、AwaitingAcceptance-only accept、draft_hash SHA-256、write-ahead batch、`mutate_if`、启动 recovery（Finalize 失败保持 Committing）、活动 Turn 屏障、ReasoningMode 三选一、请求指纹+`cached_tokens` 日志、临时角色 accept 时 UpsertInstance、契约测试 | 预分配 Attempt 身份（强于 fail-and-compensate）、完整真实 LLM 回归集矩阵 |
 > | B | **主结构+B2 已接** | `NarrativeContract` + `ScenePlan` 扩展；Subagent agency；Editor/Director 注入；QualityGate：破折号/否后肯 + **生产稳定探针** + **文本窗口启发式 attribution** `PrivateKnowledgeLeak`；Editor performance 硬 redaction；有界 1× Editor auto-fix；Prompted checklist；**真实 LLM smoke** `deepseek-v4-pro@cli.2529985.xyz`：knowledge/i1/t1/t3 全绿 | 结构化质量/成本 A/B 对照矩阵（非 smoke） |
-> | C | **M0–M4.2.2 + M5 Partial Evidence** | history-epoch + prompt catalog；near_raw；A/B/C tools；Compressor + epoch 同锁；真实 endurance：Canary 3/3、Coverage 12/12、Stability 30/30、Full 45/100；生产写作/Accept + 流式 cache 解析 | 完整生产 Postprocess/Chronicle A 共享服务；Full 剩余 55 Accept；语义级压缩保真与参数标定 |
+> | C | **M0–M4.2.2 + M5 Partial Evidence** | history-epoch + prompt catalog；near_raw；A/B/C tools；Compressor + epoch 同锁；真实 endurance 历史记录：Canary 3/3、Coverage 12/12、Stability 30/30、Full 45/100；production pipeline 写作 + 共享 JSON 生命周期 probe + 流式 cache 解析 | 完整生产 Postprocess/Chronicle A 共享服务；原 checkpoint 已清理，需在新 evidence 目录重新运行完整 100 Accept；语义级压缩保真与参数标定 |
 > | D | **Turn UoW + SQLite opt-in 已接** | TurnRecord/Attempt、revision CAS、共享 Accept/recovery；SQLite cutover、Accept UoW、barrier、Chronicle publication、backup/reverse export | SQLite pre-accept draft/postprocess 全生命周期；默认后端切换评估；Android/GUI/runner 现场矩阵 |
 
 ### 阶段 A：建立测量和安全边界
@@ -487,7 +487,7 @@ Editor 输出的是可展示但非规范的 draft。DraftQualityGate 通过后�
 3. 用 History Epoch + checkpoint summary 替代固定 20 条滑动窗口。 **（epoch 窗口 + 确定性 checkpoint 已落地；窗口大小仍默认 20）**
 4. 建立自动混合召回和 archived watermark。 **（watermark + FarMemoryHit 溯源已有）**
 5. 调整 Subagent 公共前缀顺序。 **（部分）**
-6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 Partial Evidence** 已升级到 production pipeline + shared Accept 的 45/100 endurance，但 Chronicle 仍含 synthetic fixture，勿写成完整生产 Postprocess 或参数标定通过。
+6. **记忆金字塔 + 缓存友好三窗**：见 [`MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md) — **M0–M4.2.2 已落地**；**M5 Partial Evidence** 留有 production pipeline + 共享 JSON 生命周期 probe 的 45/100 endurance 历史记录，但原始外部证据已清理。Chronicle 仍含 synthetic fixture；后续必须在新 evidence 目录重跑完整 100 Accept，勿写成完整生产 Postprocess 或参数标定通过。
 
 阶段 C 验收：最近原始消息不会被远记忆挤掉；同一 epoch 内观察到真实前缀复用；epoch rollover 只发生一次预期冷启动；同一历史区间不重复归档；检索结果可追溯到来源。 **（扩展验收以记忆规格 §8 为准）**
 

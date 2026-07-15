@@ -1,6 +1,6 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-14 更新。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in 和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner 和打包结果必须逐项记录，不能用“理论通过”替代。
+> 状态：2026-07-15 更新。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in 和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner 和打包结果必须逐项记录，不能用“理论通过”替代。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 
@@ -43,13 +43,13 @@
 
 ## 1. 当前自动化基线
 
-2026-07-14 已验证（`main` `99b1ea3`）：
+2026-07-14 已验证（代码验证基线 `99b1ea3`，不是当前 `main` SHA）：
 
 - `cargo fmt --all -- --check`、workspace Clippy `-D warnings`、`cargo test --workspace` 全部通过。
 - `cargo test -p harness-real-llm` 全部确定性 suite 通过；真实模型用例按设计 ignored。
 - frontend `npm.cmd test` 311/311 通过，`npm.cmd run build` 通过；保留既有 Vite dynamic/static import warning。
 - Windows/Android host runner、manifest/provenance/hash/subject sidecar 与 Gitea workflow 已进入主线；远端 Gitea runner、完整 Tauri bundle 和 Android APK 本轮未实跑。
-- M5 runner 已进入主线；Canary/Coverage/Stability 通过，Full 45/100 Partial Evidence。Chronicle 仍含 synthetic fixture，不得写成完整生产 Postprocess 验收。
+- M5 runner 已进入主线；Canary/Coverage/Stability 通过，Full 留下 45/100 的历史 Partial Evidence。原始外部 JSONL/campaign data 已清理，不能续跑或独立重放；Chronicle 仍含 synthetic fixture，不得写成完整生产 Postprocess 验收。
 - SQLite opt-in 的 cutover、Accept/recovery/barrier、Chronicle publication、backup/reverse export 已通过确定性和 Windows host 测试；完整 pre-accept 生命周期和 Android 真机仍待验证。
 
 2026-07-07 已验证：
@@ -110,7 +110,7 @@
 
 ## 4. Silver ST 兼容验收矩阵
 
-Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback、注销、基础 invocation 解析和基础 pipe chaining，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；prompt hook 已有基础脱敏审计 ring buffer / app log。完整 ST 冷门 Slash/TavernHelper 语义、ST 99 事件全集、完整审计 UI/导出不作为本轮已完成承诺。
+Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基础体验。Regex Slash placement 3 已覆盖 `/` 前缀输入到导演意图的最小 hook；插件桥已提供常用 Slash 注册/触发 fallback、注销、基础 invocation 解析和基础 pipe chaining，`PluginHost` 已提供 per-slot 状态栏/斜杠挂载，并支持声明 `ModifyPrompt` 插件的常驻隐藏 hook host 通过 host→iframe 可等待 prompt hook 改写写作入参。最终 messages 级 prompt hook 已接入写作/重 roll 的 LLM request 前置等待链路；普通事件 feed 已按 `event_subscriptions` 和 `ReadMemory` 做订阅/正文脱敏；prompt hook 已有基础脱敏审计 ring buffer / app log，基础审计 UI 显示 store 已裁剪的最近 100 条记录并支持脱敏 export，审计记录层支持 query、分页和 retention。完整 ST 冷门 Slash/TavernHelper 语义、ST 99 事件全集、真实第三方插件 GUI 验收和密码学审计证明不作为本轮已完成承诺。
 
 | ID | 输入材料 | 操作步骤 | 预期结果 | 失败日志 / 导出包 | 状态 |
 | --- | --- | --- | --- | --- | --- |
@@ -132,7 +132,7 @@ Silver 关注真实 ST/MVU 卡的导入保真、降级可见和状态栏/MVU 基
 | L4 知识隔离对抗 | 含私有知识和未授权角色的 Campaign；对抗 prompt | 1. 写入或导入私有知识。<br>2. 用对抗 prompt 诱导未授权角色索取秘密。<br>3. 检查正文、trace 和知识写回。 | 未授权角色不能读出私有知识；失败/阻断在日志或 trace 中可见；不把文本匹配级门禁描述成完整语义安全。 | pipeline trace；app 日志；Campaign bundle；对抗 prompt 文本。 | 部分通过 2026-07-09（i1 suite 1 passed：volatile tail 隔离 + 成文不含秘密端到端生效；LLM 尝试越权 get_character("Chen") 被 P0 门禁拦下返回 NotFound；完整 UI 对抗采样待补） |
 | L5 知识传播对抗 | harness 真实 LLM 环境；支持 ignored 测试的连接配置 | 1. 在当前 shell 设置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。<br>2. 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-real-llm-smoke.ps1 -Suite knowledge`。<br>3. 保存输出摘要。<br>4. 对失败用例归因。 | 真实 PostProcessor 能抽出定向告知、身份组广播和 private 封口；写回层链路/门禁断言通过；脚本输出不打印 API key。 | 测试输出；harness 日志；失败时相关 fixture 名称。 | 通过 2026-07-09（deepseek-v4-flash，knowledge suite 1 passed：private 封口/传话链/身份组广播/在场感知全命中；P2-6 postprocess 截断修复 + cb971eb terminal_tools 修复在真实模型下验证） |
 | L6 Postprocess 覆盖 | L3 的三轮 Campaign；至少一轮明确包含事实、变量变化、任务变化和摘要点 | 1. 写作后等待 postprocess。<br>2. 检查 summaries、knowledge、variables、tasks。<br>3. 记录未命中的类别。 | 知识、变量、任务、摘要至少各命中一次；Postprocess 不凭空创建永久事实；失败重试不无限循环。 | app 日志；Campaign bundle；面板截图；成本记录。 | 待跑 |
-| L7 M5 endurance | 固定真实模型；production `H_anchor=5` / `E=10`；独立脱敏 evidence 目录 | 1. 设置真实模型 env 与预算。<br>2. 依次通过 canary/coverage/stability gate。<br>3. 运行 full 100 Accept。<br>4. 检查 checkpoint、usage、epoch、early-fact 与 secret scan。 | 100/100 Accept；预算不超限；epoch rollover 与 near_raw 截断正确；证据无 key/prompt/story 正文；路径字段准确声明 production/synthetic 边界。 | `endurance_calls/turns/checkpoint/manifest.jsonl`；RESULT；不得提交原始 key。 | 部分通过 2026-07-14（Canary 3/3、Coverage 12/12、Stability 30/30；Full 45/100、415/700 calls、5 epochs；`production_postprocess_complete=false`） |
+| L7 M5 endurance | 固定真实模型；production `H_anchor=5` / `E=10`；独立脱敏 evidence 目录 | 1. 设置真实模型 env 与预算。<br>2. 依次通过 canary/coverage/stability gate。<br>3. 运行 full 100 Accept。<br>4. 检查 checkpoint、usage、epoch、early-fact 与 secret scan。 | 100/100 Accept；预算不超限；epoch rollover 与 near_raw 截断正确；证据无 key/prompt/story 正文；路径字段准确声明 production/synthetic 边界。 | `endurance_calls/turns/checkpoint/manifest.jsonl`；RESULT；不得提交原始 key。 | 部分通过 2026-07-14（Canary 3/3、Coverage 12/12、Stability 30/30；Full 45/100、415/700 calls、5 epochs；`production_postprocess_complete=false`）。原外部 JSONL/campaign data 已清理，不能续跑或独立重放。 |
 | L8 完整生产 Postprocess | 已抽出的共享 ProductionPostprocessService；真实模型；可审计 Campaign | 1. 由 Tauri 与 harness 调用同一共享服务。<br>2. 跑 Summarizer、PostProcessor、Attempt 同步、Chronicle A、Accept。<br>3. 注入迟到结果、取消和存储失败。 | 无 synthetic Chronicle；Attempt/hash/quality 与最终稿一致；迟到结果不复活；失败传播；Accept 后摘要/知识/变量/任务和索引一致。 | call/turn evidence；Campaign/SQLite 导出；故障注入日志。 | 待跑（共享服务尚未抽出） |
 
 > **2026-07-09 真实 LLM 矩阵全 8 suite 实跑汇总**（deepseek-v4-flash，endpoint `opencode.ai/zen/go`）：t1（首轮，50s）、t2（多轮，227s）、t3（reroll，83s）、knowledge（传播，34s）、c1（角色抽取，10s）、c6（Meta chat，6.3s）、c7（MVU，35s）、i1（对抗，17s）全部通过。实跑中发现并修复两个此前单元测试（mock）无法覆盖的真实回归：t3 测试断言未跟 P1-1 truncate+append 语义更新（commit `6e3f5ed`）、c6 Meta Agent drift recovery 对无工具回答过度激进（commit `1d23777`）。B5 meta smoke 4/4 + S1 real-card smoke 4 步（含 tauri-app lib harness，本机无 `0xc0000139`）全过。成本/耗时结构化记录、固定模型对照、长会话稳定性、多次对抗取样、桌面 GUI 截图仍待补。

@@ -497,14 +497,14 @@ compress_batch_id?
 
 ## 9. 实施分期（M0→M5）
 
-| 期 | 内容 | 状态（2026-07-11） |
+| 期 | 内容 | 状态（截至最新相关证据） |
 | --- | --- | --- |
 | **M0** | 本规格公式与类型：Chronicle 身份、lineage 算法、revision 规则、epoch 成员公式、ContextEpochSnapshot 最小字段、Compiler 纯函数 IO；单测覆盖公式与分组校验 | **已完成**（`domain/chronicle.rs`） |
 | **M1** | Accept 后 RoundSummary **演进为**规范 Chronicle A（兼容反序列化）；向量 source_* 字段；**暂不改**主写作 prompt 布局 | **完成（可独立部分）**：字段 + code/headline/lineage 分配 + 索引 metadata；加载路径缺 lineage 回填落盘 |
 | **M2** | epoch 快照；概览/纪要带/近正文装配；硬去重；token∩行数预算；关闭同 turn 双税 | **完成（可独立部分）**：快照+`chronicle_prompt_catalog` 渲染 + near_raw history 收敛；token 全局预算编译器仍可扩展 |
 | **M3** | `search_chronicle`（仅 A/B/C）+ `get_chronicle`；工具预算；来源字段 | **完成（可独立部分）**：全量工具目录（点名旧 A）；B/C `source_turn_ids` 展开 covers；每轮预算；`code_prefix`/score/full token 帽仍可扩展 |
 | **M4** | ChronicleCompressor 确定性分组 A→B→C；幂等后台任务；covered 折叠 | **完成（可独立部分 / M4.2.2）**：claim；Pending Accept 重试；publish/heal + **epoch refresh** 同 Campaign 锁；marker 校验后完成 |
-| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **Partial Evidence**（更新至 2026-07-14）：早期 S1/S3/S4/S6 探针完成；真实 endurance 已完成 Canary 3/3、Coverage 12/12、Stability 30/30，Full 暂停于 45/100；仍非完整生产 Postprocess 闭环，参数未标定 |
+| **M5** | 真实模型缓存/远楼/压缩损失验收；参数标定（含是否调整 200/4） | **Partial Evidence**（截至 2026-07-14 的历史记录）：早期 S1/S3/S4/S6 探针完成；真实 endurance 已完成 Canary 3/3、Coverage 12/12、Stability 30/30，Full 停于 45/100；原始外部 evidence 已清理，仍非完整生产 Postprocess 闭环，参数未标定 |
 
 并行已落地：**Quality Error 拦截 + force → Degraded**、NarrativeContract / ScenePlan、共享 Turn Accept 服务和 SQLite opt-in 基础。完整生产 Postprocess 共享服务与默认后端切换仍独立。**记忆语义以本文件为准**。实现常量 `CONTEXT_COMPILER_VERSION` 现为 `memory-spec-v1.0-m4.2.2`（防漂移假稳定）。
 
@@ -552,14 +552,14 @@ compress_batch_id?
 本轮已经补齐：
 
 - 真实模型 production pipeline 写作。
-- 共享 Turn 生命周期 / production-faithful Accept。
+- probe 调用共享 JSON Turn 生命周期 / production-faithful Accept；不覆盖 Tauri command 或 SQLite Accept 路径。
 - 生产 `H_anchor=5`、`E=10` 下跨 H+E、epoch rollover、near_raw 截断与 early-fact 探针。
-- budget/timeout、checkpoint/resume、usage/segment hash 与脱敏 JSONL 写盘；证据目录位于 Git 外部。
+- budget/timeout、checkpoint/resume、usage/segment hash 与脱敏 JSONL 写盘；证据目录原位于 Git 外部，但已不再保留在本机，无法从该 checkpoint 续跑。
 - 可选 `STORYFORGE_EVAL_MAX_TOKENS` 会覆盖实际评估 `ChatRequest`；默认不发送 `max_tokens`。
 
 仍未补齐：
 
-- Full 100-turn 尚缺 55 个 Accept。
+- 原 Full checkpoint 已清理；若要完成 M5 endurance，必须在新的可持久保留 evidence 目录重新运行完整 100 Accept，不能只补 55 个 Accept。
 - Summarizer/PostProcessor/TurnAttempt 后台写回与 Chronicle A 仍未抽为 Tauri/harness 共用生产服务；现有 Chronicle 路径含 `synthetic_chronicle_fixture`，`production_postprocess_complete=false`。
 - 证据 JSONL 未提交到仓库，不能从 clean checkout 独立重放真实调用；仓库只保留 runner、schema、断言和脱敏守卫。
 - `200/4`、`H_anchor`/`E` 仍未完成参数标定，不修改生产默认。

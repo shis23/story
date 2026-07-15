@@ -38,47 +38,64 @@ User Intent
 - 选择出场角色。
 - 为每个角色生成 `SubagentTask`。
 
-当前工具：
+当前工具（含已接入的 Chronicle 工具）：
 
 - `search_world_info(query)`
 - `get_character(name)`
 - `emit_plan(scene_brief, subagent_tasks)`
 - `search_vectors(query, top_k)`
 - `get_recent_summary(limit)`
-
-目标记忆工具（规格 v1.0；**M3 已接**，A/B/C 随存储 level；与自动召回并存）：
-
 - `search_chronicle(query, level?, include_covered?, limit?)` — 搜 **Chronicle A/B/C**（RoundSummary 兼容视图，优先较近）；返回短目录行（code + headline + level + turn_span）；不返回 full；**不含** ArchivedSummary；每轮预算 `DEFAULT_SEARCH_MAX`
 - `get_chronicle(code|id, detail=summary|full)` — A/B/C；**默认 summary**；full 可选；返回 `source_kind`/`turn_span`/`covers`；每轮 summary/full 预算分计
 
-装配进度：**M0–M4.2.2 已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job/publication、共享 Turn Accept 和 SQLite opt-in UoW）。NarrativeContract / ScenePlan 已进入写作与 Gate。**M5 仍为 Partial Evidence**：生产写作/Accept 已覆盖到 Full 45/100，但完整 Summarizer/PostProcessor/Attempt 后台写回仍未成为 Tauri 与 harness 共用服务。详见：
+装配进度：**M0–M4.2.2 已落地**（含 epoch 快照、A/B/C 工具目录与预算、Compressor job/publication、共享 Turn Accept 和 SQLite opt-in UoW）。NarrativeContract / ScenePlan 已进入写作与 Gate。**M5 仍为历史 Partial Evidence**：production pipeline 写作与 probe 调用的共享 JSON Turn 生命周期服务已覆盖到 Full 45/100；原始外部 evidence 已清理，且完整 Summarizer/PostProcessor/Attempt 后台写回仍未成为 Tauri 与 harness 共用服务。详见：
 
 - [`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`](./MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md)
 
-当前输出：
+当前输出（`scene_plan` 与 agency 字段均可选；旧 JSON 仍可解析）：
 
 ```json
 {
   "scene_brief": "本场戏的一句话场景简述",
+  "scene_plan": {
+    "conflict": "核心冲突",
+    "opposing_goals": ["角色 A 的目标", "角色 B 的目标"],
+    "stakes": "失败代价",
+    "beats": ["开场", "升级", "复杂化"],
+    "complication": "搅局",
+    "must_not_resolve": "本场不得解决的问题",
+    "exit_hook": "留给下轮的钩子"
+  },
   "subagent_tasks": [
     {
       "character_id": "当前仍可能是角色名",
-      "brief": "该角色在本场戏的任务"
+      "brief": "该角色在本场戏的任务",
+      "current_desire": "与用户输入无关的当前欲望",
+      "ongoing_action": "进场前正在做的事",
+      "emotion_stage": 3
     }
   ]
 }
 ```
 
-目标输出：
+向稳定 instance ID 收敛后的目标输出（同样支持上述可选场景与 agency 字段）：
 
 ```json
 {
   "scene_brief": "本场戏的一句话场景简述",
+  "scene_plan": {
+    "conflict": "核心冲突",
+    "must_not_resolve": "本场不得解决的问题",
+    "exit_hook": "留给下轮的钩子"
+  },
   "subagent_tasks": [
     {
       "character_instance_id": "stable-id",
       "display_name": "角色名",
-      "brief": "该角色在本场戏的任务"
+      "brief": "该角色在本场戏的任务",
+      "current_desire": "与用户输入无关的当前欲望",
+      "ongoing_action": "进场前正在做的事",
+      "emotion_stage": 3
     }
   ],
   "requested_temporary_characters": [
@@ -139,7 +156,7 @@ User Intent
 
 职责：
 
-- 根据**本轮成文**产出一条高密度 Chronicle **A**（兼容 `RoundSummary` 视图，含 `code` + `headline` + `summary` + lineage/source 字段）。
+- LLM 根据**本轮成文**生成高密度摘要正文；系统在规范落盘时补齐 Chronicle **A** / `RoundSummary` 兼容视图所需的 ID、`code`、`headline`、lineage 与范围字段。`source_kind` 是 Chronicle 工具返回字段，不是 `RoundSummary` 的 LLM 输出字段。
 - 与 PostProcessor **并行**，同属成文后流水线；Accept 后规范落盘并进入检索索引。
 
 不负责：
@@ -169,7 +186,7 @@ User Intent
 
 代码：`crates/app-agent/src/prompts/postprocess.rs`。可由 `enable_postprocess` 关闭。
 
-当前生产编排边界：Tauri 写作命令负责启动 Summarizer/PostProcessor、同步 Attempt 和持久化候选结果；harness 尚未能复用这整段后台编排，只复用了 production pipeline 与共享 Accept。下一步应抽出共享 `ProductionPostprocessService`，避免测试长期维护 synthetic Chronicle 替身。
+当前生产编排边界：Tauri 写作命令负责启动 Summarizer/PostProcessor、同步 Attempt 和持久化候选结果；harness 尚未能复用这整段后台编排，只复用了 production pipeline，且其 probe 调用共享 JSON `TurnLifecycleService`。该 probe 不执行 Tauri command 或 SQLite Accept 路径。下一步应抽出共享 `ProductionPostprocessService`，避免测试长期维护 synthetic Chronicle 替身。
 
 ## ChronicleCompressor（已有基础）
 
@@ -223,7 +240,7 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 
 | Agent | 工具 | 注册函数 |
 | --- | --- | --- |
-| Director | `search_world_info`, `get_character`, `emit_plan`, `search_vectors`, `get_recent_summary`, `search_chronicle`, `get_chronicle` | `register_director_tools` + Chronicle tool registry |
+| Director | `search_world_info`, `get_character`, `emit_plan`, `search_vectors`, `get_recent_summary`, `search_chronicle`, `get_chronicle` | `register_director_tools` |
 | Subagent | `get_character`（信息隔离：有 `current_character_instance_id` 时只返回自己的 instance） | `register_subagent_tools` |
 | Editor | `compose` | `register_editor_tools` |
 | Postprocess | `emit_postprocess`（声明产出，handler 原样返回 args） | `register_postprocess_tools` |

@@ -1,11 +1,19 @@
-﻿# StoryForge 鏋舵瀯璇存槑
+# StoryForge 架构说明
 
-> 鏇存柊鏃ユ湡锛?026-07-14
-> 鏈枃鎻忚堪褰撳墠 `main` 鐨勪唬鐮佽竟鐣屻€傚巻鍙叉灦鏋勫揩鐓т綅浜?`docs/archive/`銆?
-## 鏋舵瀯鍘熷垯
+> 更新日期：2026-07-15
+> 本文描述当前 `main` 的代码边界。历史架构快照位于 `docs/archive/`。
 
-1. Campaign 鏄暱鏈熸晠浜嬬姸鎬佺殑涓荤嚎鐪熺浉婧愩€?2. 姝ｆ枃銆丄ttempt銆丆ampaign revision 鍜?MutationBatch 蹇呴』閫氳繃 Turn 鐢熷懡鍛ㄦ湡涓€鑷存彁浜ゃ€?3. app/domain 灞備笉渚濊禆 Tauri锛汿auri 鏄粍鍚堟牴鍜屾湰鍦板瓨鍌ㄩ€傞厤灞傘€?4. LLM 鍙互浣跨敤鍚嶅瓧浜ゆ祦锛岃惤鐩樺拰鎺堟潈蹇呴』浣跨敤绋冲畾 ID銆?5. JSON 鏄粯璁ゅ悗绔紱SQLite 鍙兘閫氳繃鏄惧紡 opt-in銆乫ail-closed cutover 鍜屽彲閫嗗鍑哄惎鐢ㄣ€?6. Harness 搴斿鐢ㄧ敓浜у簲鐢ㄦ湇鍔★紝涓嶉暱鏈熺淮鎶ょ浜屽鐘舵€佹満鎴栤€滆繎浼肩敓浜р€濆疄鐜般€?7. 鎵€鏈夌湡瀹炴ā鍨嬨€丟UI銆佽澶囧拰鍙戝竷澹版槑蹇呴』涓庤瘉鎹瓑绾х粦瀹氥€?
-## Workspace 杈圭晫
+## 架构原则
+
+1. Campaign 是长期故事状态的主线真相源。
+2. 正文、Attempt、Campaign revision 和 MutationBatch 必须通过 Turn 生命周期一致提交。
+3. app/domain 层不依赖 Tauri；Tauri 是组合根和本地存储适配层。
+4. LLM 可以使用名字交流，落盘和授权必须使用稳定 ID。
+5. JSON 是默认后端；SQLite 只能通过显式 opt-in、fail-closed cutover 和可逆导出启用。
+6. Harness 应复用生产应用服务，不长期维护第二套状态机或“近似生产”实现。
+7. 所有真实模型、GUI、设备和发布声明必须与证据等级绑定。
+
+## Workspace 边界
 
 ```text
 frontend
@@ -41,8 +49,9 @@ crates/harness-real-llm
   -> deterministic gates / real-model probes / M5 evidence
 ```
 
-褰撳墠 workspace 鍏?16 涓?crate銆俙domain` 涓嶄緷璧栧唴閮ㄥ簲鐢ㄥ眰锛沗app-*` 涓嶄緷璧?`tauri-app`锛汿auri 璐熻矗鎶?store 缁勮涓哄簲鐢ㄥ眰浣跨敤鐨勫揩鐓у拰鏈嶅姟銆?
-## 鍐欎綔涓?Turn 鐢熷懡鍛ㄦ湡
+当前 workspace 共 16 个 crate。`domain` 不依赖内部应用层；`app-*` 不依赖 `tauri-app`；Tauri 负责把 store 组装为应用层使用的快照和服务。
+
+## 写作与 Turn 生命周期
 
 ```text
 User intent
@@ -67,38 +76,90 @@ User intent
      -> Committed or Degraded
 ```
 
-鏍稿績涓嶅彉閲忥細
+核心不变量：
 
-- 鍙湁娲诲姩 Attempt 鍙互鍐欏洖銆?- 鏃?Attempt 鐨勮繜鍒扮粨鏋滀笉鑳借鐩栨柊鑽夌銆?- `draft_hash` 蹇呴』瀵瑰簲鏈€缁堣繑鍥炵粰鐢ㄦ埛鐨勬鏂囷紝鍖呮嫭 auto-fix 绋裤€?- force accept 鐨勭洰鏍囩粓鎬佹槸 `Degraded`锛屾仮澶嶆椂涓嶅緱鍙樺洖 `Committed`銆?- Campaign / conversation scope 涓嶅尮閰嶆椂蹇呴』 fail closed銆?- 鎺ュ彈杩囩▼鐨勫瓨鍌ㄥけ璐ュ繀椤讳紶鎾紝涓嶅厑璁稿搷搴旀垚鍔熻€岀鐩樼姸鎬佹粸鍚庛€?
-## Postprocess 杈圭晫
+- 只有活动 Attempt 可以写回。
+- 旧 Attempt 的迟到结果不能覆盖新草稿。
+- `draft_hash` 必须对应最终返回给用户的正文，包括 auto-fix 稿。
+- force accept 的目标终态是 `Degraded`，恢复时不得变回 `Committed`。
+- Campaign / conversation scope 不匹配时必须 fail closed。
+- 接受过程的存储失败必须传播，不允许响应成功而磁盘状态滞后。
 
-鎴愭枃鍚庣殑鈥滃悗澶勭悊闃舵鈥濆寘鍚袱涓亴璐ｄ笉鍚岀殑 Agent锛?
-- Summarizer锛氱敓鎴愭湰杞?Chronicle A / RoundSummary銆?- PostProcessor锛氱敓鎴愮煡璇嗐€佸彉閲忓拰浠诲姟鍊欓€夋洿鏂般€?
-褰撳墠 Tauri 鍐欎綔鍛戒护璐熻矗鍚庡彴缂栨帓銆丄ttempt 鍚屾鍜屾寔涔呭寲閫傞厤銆侻5 harness 宸插鐢ㄧ敓浜у啓浣?Pipeline 涓庡叡浜?Accept 鏈嶅姟锛屼絾浠嶄娇鐢ㄦ槑纭爣璁扮殑 synthetic Chronicle fixture锛涘洜姝ゅ畬鏁?Summarizer/PostProcessor/Attempt 鍚庡彴鍐欏洖灏氭湭鎴愪负鍙敱 Tauri 涓?harness 鍏卞悓璋冪敤鐨勫叡浜簲鐢ㄦ湇鍔°€?
-涓嬩竴鏋舵瀯鍒囩墖搴旀娊鍑?`ProductionPostprocessService`锛岀粺涓€锛?
-- Summarizer / PostProcessor 璋冪敤涓庡彇娑堛€?- MutationBatch normalize 涓?ID/scope 鏍￠獙銆?- quality report銆乨raft hash 鍜?Attempt 鐘舵€佸悓姝ャ€?- Chronicle A 鍙戝竷銆佸悜閲忕储寮曞拰鍘嬬缉璋冨害銆?- 杩熷埌缁撴灉銆侀噸璇曘€佸箓绛夋仮澶嶄笌澶辫触浼犳挱銆?
-Tauri command 鍙仛 DTO銆佷簨浠跺拰鍚庡彴浠诲姟閫傞厤锛沨arness 鐩存帴璋冪敤鍏变韩鏈嶅姟锛屼笉鍚姩 GUI銆?
+## Postprocess 边界
+
+成文后的“后处理阶段”包含两个职责不同的 Agent：
+
+- Summarizer：生成本轮 Chronicle A / RoundSummary。
+- PostProcessor：生成知识、变量和任务候选更新。
+
+当前 Tauri 写作命令负责后台编排、Attempt 同步和持久化适配。M5 harness 已复用生产写作 Pipeline，并通过 probe 调用共享 JSON `TurnLifecycleService`；它不执行 Tauri command 或 SQLite Accept 路径。Harness 仍使用明确标记的 synthetic Chronicle fixture，因此完整 Summarizer/PostProcessor/Attempt 后台写回尚未成为可由 Tauri 与 harness 共同调用的共享应用服务。
+
+下一架构切片应抽出 `ProductionPostprocessService`，统一：
+
+- Summarizer / PostProcessor 调用与取消。
+- MutationBatch normalize 与 ID/scope 校验。
+- quality report、draft hash 和 Attempt 状态同步。
+- Chronicle A 发布、向量索引和压缩调度。
+- 迟到结果、重试、幂等恢复与失败传播。
+
+Tauri command 只做 DTO、事件和后台任务适配；harness 直接调用共享服务，不启动 GUI。
+
 ## Memory / Context / Chronicle
 
-- `H_anchor=5`銆乣E=10` 鏄綋鍓嶇敓浜ч粯璁わ紝涓嶅緱绉颁负宸叉爣瀹氬弬鏁般€?- ContextEpoch 鍥哄畾鍚屼竴 epoch 鐨?anchor銆乷verview銆乥and 鍜?revision 瑙嗗浘銆?- Director 鍙娇鐢?`search_chronicle` / `get_chronicle` 鏌ヨ Chronicle A/B/C銆?- ChronicleCompressor job/publication 鍩虹鏀寔 A鈫払鈫扖銆佽繛缁潪閲嶅彔 covers銆乣covered_by`銆乺evision 涓庡箓绛?replay銆?- MemoryArchiver 澶勭悊瀵硅瘽娑堟伅褰掓。锛屼笌 Chronicle A/B/C 鏄笉鍚屾按浣嶅拰鐢ㄩ€斻€?
-鏉冨▉瑙勬牸锛歚docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`銆?
+- `H_anchor=5`、`E=10` 是当前生产默认，不得称为已标定参数。
+- ContextEpoch 固定同一 epoch 的 anchor、overview、band 和 revision 视图。
+- Director 可使用 `search_chronicle` / `get_chronicle` 查询 Chronicle A/B/C。
+- ChronicleCompressor job/publication 基础支持 A→B→C、连续非重叠 covers、`covered_by`、revision 与幂等 replay。
+- MemoryArchiver 处理对话消息归档，与 Chronicle A/B/C 是不同水位和用途。
+
+权威规格：`docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`。
+
 ## LLM Request Policy
 
-- active connection 鐨?temperature銆乼op_p銆乺easoning銆乪xtra 鍜屾樉寮忚緭鍑轰笂闄愪細娉ㄥ叆 Pipeline/AgentRuntime銆?- 榛樿 `max_tokens=None`锛孫penAI-compatible 璇锋眰浣撶渷鐣ヨ瀛楁銆?- 鍘嗗彶鏈爣璁扮殑 `Some(4096)` 瑙嗕负鏃?UI 榛樿骞跺綊涓€涓?`None`銆?- 鐢ㄦ埛鏄惧紡濉啓姝ｆ暣鏁版椂閫忎紶锛涙ā鍨嬫敮鎸佺殑鏈€澶ц緭鍑哄彧鏄?ceiling 鑳藉姏锛屼笉浠ｈ〃姣忚疆搴旂敓鎴愯闀垮害銆?- 杩炴帴 ping銆丣SON fallback銆丮emoryArchiver 鍜岃瘎浼伴绠楀彲浠ユ湁鍚勮嚜鐨勪笓鐢ㄩ檺鍒躲€?
-閲嶈瘯绛栫暐鍜?provider capability 鎺㈡祴浠嶆湭褰㈡垚瀹屾暣缁熶竴鐨?`RequestPolicy` 鏈嶅姟锛涘綋鍓嶄富瑕佽В鍐充簡閲囨牱鍙傛暟鎰忓浘鍜屼富鍐欎綔閫忎紶闂銆?
-## 瀛樺偍鍚庣
+- active connection 的 temperature、top_p、reasoning、extra 和显式输出上限会注入 Pipeline/AgentRuntime。
+- 默认 `max_tokens=None`，OpenAI-compatible 请求体省略该字段。
+- 历史未标记的 `Some(4096)` 视为旧 UI 默认并归一为 `None`。
+- 用户显式填写正整数时透传；模型支持的最大输出只是 ceiling 能力，不代表每轮应生成该长度。
+- 连接 ping、JSON fallback、MemoryArchiver 和评估预算可以有各自的专用限制。
 
-### JSON锛堥粯璁わ級
+重试策略和 provider capability 探测仍未形成完整统一的 `RequestPolicy` 服务；当前主要解决了采样参数意图和主写作透传问题。
 
-JSON stores 浠嶆槸鏈?opt-in 鐢ㄦ埛鐨勯粯璁ゆ潈濞佹暟鎹簮銆俆urn journal銆乺evision銆丮utationBatch 鍜屾仮澶嶉€昏緫鎻愪緵涓撶敤閫昏緫鍘熷瓙鎬э紝浣嗕笉鏄暟鎹簱浜嬪姟銆?
-### SQLite锛堟樉寮?opt-in锛?
-SQLite 鍚庣褰撳墠鍏峰锛?
-- `StorageBackend::{Json, Sqlite}` 涓庤繘绋?pin銆?- cutover 閿併€佷复鏃跺簱銆佸浠姐€佸唴瀹?hash銆乵arker-last 鍙戝竷鍜屽惎鍔ㄦ仮澶嶃€?- Accept UoW銆乺ecovery銆乤ctive-turn barrier銆?- Chronicle publication UoW 鍜屾晠闅滄敞鍏ュ洖婊氥€?- SQLite鈫扟SON staging + atomic publish reverse export銆?
-褰撳墠闄愬埗锛氶儴鍒?pre-accept draft銆丄ttempt 涓棿鎬佸拰 postprocess 鍐欏懡浠や粛闇€瀹屾垚鍏ㄨ矾寰勮縼绉汇€傞粯璁ゅ悗绔笉寰楀湪璇ュ伐浣滃畬鎴愬墠鍒囨崲涓?SQLite銆?
-## 鎻掍欢涓庡鍏ヨ竟鐣?
-- 鎻掍欢 runtime 鏀寔鏄惧紡鏉冮檺銆佽繍琛屾椂鎾ら攢銆乸rompt-hook timeout/cancel/budget銆佸璁℃煡璇?鍒嗛〉/retention 鍜屾樉寮?degraded/unsupported 鍏煎鐭╅樀銆?- FNV-1a audit chain 浠呮槸鏈湴瀹屾暣鎬ч摼锛屼笉鏄瘑鐮佸绛惧悕鎴栧彲淇″ご璇佹槑銆?- ST/涓栫晫涔?Campaign Bundle 瀵煎叆鎵ц fail-closed 寮曠敤鏍￠獙涓庤ˉ鍋垮洖婊氾紱鐪熷疄澶嶆潅鍗′粛闇€鍦ㄥ悎娉?fixture 鐜琛ヨ瘉鎹€?- 鎻掍欢 iframe銆佺湡瀹炵涓夋柟鎵╁睍鍜屽畬鏁?ST 闀垮熬璇箟浠嶉渶 GUI 楠屾敹銆?
-## 鍙戝竷杈圭晫
+## 存储后端
 
-- 鏈湴 workspace銆佸墠绔拰 host-side release runner 宸叉湁鑷姩鍖栬瘉鎹€?- Gitea workflow 宸叉彁浜わ紝浣嗚繙绔?runner 鎵ц灏氭湭楠岃瘉銆?- Windows bundle銆丄ndroid APK銆佺鍚嶃€丟UI 鍜岀湡鏈鸿瘉鎹繀椤诲湪 `docs/RELEASE-CHECKLIST.md` 鍗曠嫭璁板綍銆?- M5 褰撳墠涓?45/100 Partial Evidence锛屼笖 `production_postprocess_complete=false`銆?
-## 褰撳墠涓昏鎶€鏈€?
-1. 鍏变韩 ProductionPostprocessService銆?2. SQLite pre-accept 鍏ㄧ敓鍛藉懆鏈熻縼绉汇€?3. 瀹屾暣鐢熶骇璺緞 M5 100-Accept銆?4. Gitea runner 涓庡彲绂荤嚎楠岃瘉鐨勭湡瀹炰骇鐗╄瘉鎹€?5. GUI銆丄ndroid 鐪熸満鍜岀涓夋柟鎻掍欢鐜板満鐭╅樀銆?
+### JSON（默认）
+
+JSON stores 仍是未 opt-in 用户的默认权威数据源。Turn journal、revision、MutationBatch 和恢复逻辑提供专用逻辑原子性，但不是数据库事务。
+
+### SQLite（显式 opt-in）
+
+SQLite 后端当前具备：
+
+- `StorageBackend::{Json, Sqlite}` 与进程 pin。
+- cutover 锁、临时库、备份、内容 hash、marker-last 发布和启动恢复。
+- Accept UoW、recovery、active-turn barrier。
+- Chronicle publication UoW 和故障注入回滚。
+- SQLite→JSON staging + atomic publish reverse export。
+
+当前限制：部分 pre-accept draft、Attempt 中间态和 postprocess 写命令仍需完成全路径迁移。默认后端不得在该工作完成前切换为 SQLite。
+
+## 插件与导入边界
+
+- 插件 runtime 支持显式权限、运行时撤销、prompt-hook timeout/cancel/budget、审计查询/分页/retention 和显式 degraded/unsupported 兼容矩阵。
+- FNV-1a audit chain 仅是本地完整性链，不是密码学签名或可信头证明。
+- ST/世界书/Campaign Bundle 导入执行 fail-closed 引用校验与补偿回滚；真实复杂卡仍需在合法 fixture 环境补证据。
+- 插件 iframe、真实第三方扩展和完整 ST 长尾语义仍需 GUI 验收。
+
+## 发布边界
+
+- 本地 workspace、前端和 host-side release runner 已有自动化证据。
+- Gitea workflow 已提交，但远端 runner 执行尚未验证。
+- Windows bundle、Android APK、签名、GUI 和真机证据必须在 `docs/RELEASE-CHECKLIST.md` 单独记录。
+- M5 当前为已记录的 45/100 Partial Evidence（原始外部 JSONL 已清理），且 `production_postprocess_complete=false`。
+
+## 当前主要技术债
+
+1. 共享 ProductionPostprocessService。
+2. SQLite pre-accept 全生命周期迁移。
+3. 完整生产路径 M5 100-Accept。
+4. Gitea runner 与可离线验证的真实产物证据。
+5. GUI、Android 真机和第三方插件现场矩阵。
