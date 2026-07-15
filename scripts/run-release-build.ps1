@@ -399,12 +399,32 @@ try {
     } else {
         $artifactArr = [object[]]@()
     }
+
+    Start-ReleaseBuildStep -Name 'stage evidence subjects and hash sidecars'
+    $stagedSubjects = [object[]]@()
+    if ($DryRun) {
+        Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
+    } else {
+        $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
+        # Direct assignment (no @(Copy-...)): Copy already returns object[]. Flatten defensively.
+        $stagedSubjects = ConvertTo-ReleaseStagedSubjectArray -InputObject (
+            Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot
+        )
+        foreach ($s in $stagedSubjects) {
+            Write-Host ("Staged subject: {0} (source={1}) sha256={2}" -f $s.relative_path, $s.source_relative_path, $s.sha256)
+        }
+    }
+    $stagedSubjects = ConvertTo-ReleaseStagedSubjectArray -InputObject $stagedSubjects
+
+    # Manifest keeps source-tree artifact paths and a separate staged_subjects
+    # list for offline verification under subjects/....
     $manifest = New-ReleaseBuildManifest `
         -Commit $identity.commit `
         -Branch $identity.branch `
         -Target 'x86_64-pc-windows-msvc' `
         -ToolVersions $toolVersions `
         -Artifacts $artifactArr `
+        -StagedSubjects $stagedSubjects `
         -DependencyInventory $inventoryEvidence `
         -BuildStatus $buildStatus `
         -Warnings $warningArr `
@@ -418,18 +438,6 @@ try {
     Start-ReleaseBuildStep -Name 'manifest schema validation'
     Assert-ReleaseManifestSchema -Manifest $manifest
     Write-Host 'Manifest schema validation passed.'
-
-    Start-ReleaseBuildStep -Name 'stage evidence subjects and hash sidecars'
-    $stagedSubjects = [object[]]@()
-    if ($DryRun) {
-        Write-Host 'DRY RUN: would stage subjects/ and <artifact>.sha256 sidecars into the evidence directory'
-    } else {
-        $presentArtifacts = @($script:Artifacts | Where-Object { $_.status -eq 'present' })
-        $stagedSubjects = @(Copy-ReleaseEvidenceSubjects -Artifacts $presentArtifacts -EvidenceDir $runDir -RepoRoot $script:RepoRoot)
-        foreach ($s in $stagedSubjects) {
-            Write-Host ("Staged subject: {0} sha256={1}" -f $s.relative_path, $s.sha256)
-        }
-    }
 
     Start-ReleaseBuildStep -Name 'provenance attestation'
     # Provenance subjects reference staged evidence-relative paths so the

@@ -54,23 +54,12 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      # Default path is host-only (-SkipBundle). Tags and empty inputs also
-      # default to host-only so a fresh runner never fails for missing tauri-cli.
-      # When skip_bundle is explicitly false, install a pinned cargo-tauri.
-      - name: Resolve skip-bundle flag
-        id: bundle
-        shell: pwsh
-        run: |
-          $skip = '${{ github.event.inputs.skip_bundle }}'
-          # workflow_dispatch default is true; tags / empty => host-only.
-          if ([string]::IsNullOrWhiteSpace($skip) -or $skip -eq 'true') {
-            "skip_bundle=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            "skip_bundle=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-
       - name: Install pinned tauri-cli when bundle is requested
-        if: steps.bundle.outputs.skip_bundle == 'false'
+        # Only an explicit manual `false` requests a bundle. Tags and missing
+        # input stay host-only; malformed input is rejected by the producer
+        # before it can run a build, so a fresh runner never implicitly depends
+        # on cargo-tauri.
+        if: github.event.inputs.skip_bundle == 'false'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -83,64 +72,48 @@ jobs:
           }
 
       - name: Windows host release build
-        shell: pwsh
-        run: |
-          if ('${{ steps.bundle.outputs.skip_bundle }}' -eq 'true') {
-            pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle
-          } else {
-            pwsh -NoProfile -File scripts/run-release-build.ps1
-          }
-
-      - name: Locate evidence directory
         id: evidence
         shell: pwsh
+        # Keep dispatch input as data. Do not interpolate it directly into a
+        # PowerShell string: malformed API input must fail closed, not become
+        # executable source text.
+        env:
+          SF_RELEASE_SKIP_BUNDLE_INPUT: ${{ github.event.inputs.skip_bundle }}
         run: |
-          $root = Join-Path $PWD 'artifacts\release-build'
-          $latest = Get-ChildItem -LiteralPath $root -Directory |
-            Where-Object { $_.Name -like 'windows-*' } |
-            Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-          if (-not $latest) {
-            throw 'No windows-* evidence directory found.'
+          $ErrorActionPreference = 'Stop'
+          $evidenceDir = Join-Path $PWD ("artifacts\release-build\windows-gitea-" + [guid]::NewGuid().ToString('N'))
+          $skipBundleInput = [string]$env:SF_RELEASE_SKIP_BUNDLE_INPUT
+          if ($skipBundleInput -notin @('', 'true', 'false')) {
+            throw 'skip_bundle must be empty, true, or false.'
           }
-          "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Evidence dir: $($latest.FullName)"
+          if (Test-Path -LiteralPath $evidenceDir) {
+            throw 'Refusing to reuse an existing Windows evidence directory.'
+          }
+          # An explicit false is the sole opt-in to a bundle. Empty tag input
+          # and the workflow_dispatch default true take the else (host-only)
+          # branch; every other supplied value was rejected above.
+          if ($skipBundleInput -eq 'false') {
+            pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+          } else {
+            pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows release build failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'manifest.json') -PathType Leaf)) {
+            throw 'Windows build did not produce manifest.json in its controlled evidence directory.'
+          }
+          "dir=$evidenceDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Validate manifest schema and staged subjects
+      - name: Offline verify Windows evidence package (fail-closed)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
           $evidenceDir = '${{ steps.evidence.outputs.dir }}'
-          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
-          Assert-ReleaseManifestSchema -Manifest $manifest
-          $provPath = Join-Path $evidenceDir 'provenance.json'
-          if (-not (Test-Path -LiteralPath $provPath)) {
-            throw 'provenance.json missing from evidence package.'
-          }
-          $prov = Get-Content -LiteralPath $provPath -Raw | ConvertFrom-Json
-          $subjectsDir = Join-Path $evidenceDir 'subjects'
-          if ($manifest.build_status -eq 'ok') {
-            if (-not (Test-Path -LiteralPath $subjectsDir)) {
-              throw 'subjects/ directory missing from evidence package for build_status=ok.'
-            }
-            foreach ($subj in @($prov.subjects)) {
-              $path = Join-Path $evidenceDir ($subj.relative_path -replace '/', '\')
-              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-                throw "Subject missing from package: $($subj.relative_path)"
-              }
-              $sidecar = $path + '.sha256'
-              if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
-                throw "Hash sidecar missing for subject: $($subj.relative_path)"
-              }
-              $rehash = Get-ReleaseFileSha256 -Path $path
-              if ($rehash -ne $subj.sha256) {
-                throw "Offline rehash mismatch for $($subj.relative_path)"
-              }
-              Write-Host "Verified subject: $($subj.relative_path)"
-            }
-          }
-          Write-Host 'Manifest schema + subject offline verification passed.'
+          # Full offline verifier: staged↔provenance exact-set, artifact→staged
+          # reverse mapping, sidecar grammar, reparse rejection, recursive secret scan.
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
 
       - name: Upload Windows evidence (subjects + sidecars + manifest + provenance)
         uses: actions/upload-artifact@v4
@@ -183,36 +156,31 @@ jobs:
       # Rust check. SDK/NDK are NOT installed here, so -BuildApk is intentionally
       # omitted: requesting APK evidence without prerequisites fails closed.
       - name: Android host pipeline (host smoke, no device, no APK)
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/run-android-host-pipeline.ps1
-
-      - name: Locate Android evidence directory
         id: evidence
         shell: pwsh
         run: |
-          $root = Join-Path $PWD 'artifacts\release-build'
-          $latest = Get-ChildItem -LiteralPath $root -Directory |
-            Where-Object { $_.Name -like 'android-*' } |
-            Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-          if (-not $latest) {
-            throw 'No android-* evidence directory found.'
+          $ErrorActionPreference = 'Stop'
+          $evidenceDir = Join-Path $PWD ("artifacts\release-build\android-gitea-" + [guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $evidenceDir) {
+            throw 'Refusing to reuse an existing Android evidence directory.'
           }
-          "dir=$($latest.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          pwsh -NoProfile -File scripts/run-android-host-pipeline.ps1 -OutputDir $evidenceDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Android host pipeline failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'manifest.json') -PathType Leaf)) {
+            throw 'Android host pipeline did not produce manifest.json in its controlled evidence directory.'
+          }
+          "dir=$evidenceDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Validate Android manifest schema
+      - name: Offline verify Android evidence package (fail-closed)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           . .\scripts\release-build\ReleaseBuild.Common.ps1
           $evidenceDir = '${{ steps.evidence.outputs.dir }}'
-          $manifest = Get-Content -LiteralPath (Join-Path $evidenceDir 'manifest.json') -Raw | ConvertFrom-Json
-          Assert-ReleaseManifestSchema -Manifest $manifest
-          if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'provenance.json'))) {
-            throw 'Android provenance.json missing from evidence package.'
-          }
-          Write-Host 'Android manifest schema validation passed.'
+          # Full offline verifier for Android host evidence before upload.
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
 
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4

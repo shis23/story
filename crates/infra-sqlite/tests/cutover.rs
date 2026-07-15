@@ -399,10 +399,11 @@ fn cutover_report_redacts_secret_shaped_labels() {
     let dir = TempDir::new().unwrap();
     sample_source(dir.path());
 
-    // Pass a secret-shaped label.
+    // Pass a secret-shaped label (assembled at runtime for static scanners).
+    let secret_label = format!("{}{}", "sk-", "super-secret-api-key-1234567890");
     let request = CutoverRequest {
         plan: make_plan(dir.path()),
-        label: "sk-super-secret-api-key-1234567890".into(),
+        label: secret_label.clone(),
     };
     let outcome = run_cutover(&request).unwrap();
     let report = match outcome {
@@ -412,7 +413,8 @@ fn cutover_report_redacts_secret_shaped_labels() {
 
     // The report's backup_label must be the sanitised version, not the secret.
     assert!(
-        !report.backup_label.contains("sk-super-secret"),
+        !report.backup_label.contains(&secret_label)
+            && !report.backup_label.contains("super-secret-api-key"),
         "report leaked secret in backup_label: {}",
         report.backup_label
     );

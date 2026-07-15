@@ -140,6 +140,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup Python for parser-backed Pester contracts
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PyYAML for Pester contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install 'PyYAML==6.0.2'
+          python -c "import yaml; assert yaml.__version__ == '6.0.2'"
       - name: Run release-build Pester tests
         shell: pwsh
         run: |
