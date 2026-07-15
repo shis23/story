@@ -197,6 +197,22 @@ async fn run_sqlite_endurance_stage(
     };
     let ledger_path = paths.root.join("endurance_coverage_ledger.jsonl");
     let mut ledger_lines = Vec::new();
+    if start_turn == 1 && ledger_path.exists() {
+        let _ = std::fs::remove_file(&ledger_path);
+    }
+    // Resume must reload previously sealed coverage observations; exact-set
+    // verification is suite-wide, not process-local.
+    if start_turn > 1 && ledger_path.exists() {
+        let prior = std::fs::read_to_string(&ledger_path).map_err(EnduranceError::EvidenceIo)?;
+        for line in prior.lines().filter(|l| !l.trim().is_empty()) {
+            let obs: harness_real_llm::coverage_ledger::ObservedCoverage =
+                serde_json::from_str(line).map_err(|e| {
+                    EnduranceError::InvalidConfig(format!("coverage ledger parse: {e}"))
+                })?;
+            ledger.record(obs.clone());
+            ledger_lines.push(line.to_string());
+        }
+    }
 
     let mut turns_accepted = start_turn.saturating_sub(1);
     // Assigned before first checkpoint read; initial values are never observed.
@@ -408,7 +424,21 @@ async fn run_sqlite_endurance_stage(
         }
 
         ledger.record(observed.clone());
-        ledger_lines.push(serde_json::to_string(&observed).unwrap_or_default());
+        let line = serde_json::to_string(&observed).unwrap_or_default();
+        ledger_lines.push(line.clone());
+        // Durable per-turn append so resume can rebuild exact-set without replaying.
+        {
+            use std::io::Write;
+            if let Some(parent) = ledger_path.parent() {
+                std::fs::create_dir_all(parent).map_err(EnduranceError::EvidenceIo)?;
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&ledger_path)
+                .map_err(EnduranceError::EvidenceIo)?;
+            writeln!(f, "{line}").map_err(EnduranceError::EvidenceIo)?;
+        }
 
         turns_accepted += 1;
         last_campaign_revision = written.accept.campaign_revision_after;
@@ -610,7 +640,9 @@ async fn endurance_sqlite_real_llm_staged() {
         let remaining = stage.max_calls().saturating_sub(cp.calls_used);
         // Process-local BudgetedLlmClient budget must cover remaining work plus
         // bounded Plan-parse retries; stage accounting still uses prior+runner calls.
-        let headroom = ((stage.target_turns().saturating_sub(cp.accepted_turn_number)) as u32)
+        let headroom = stage
+            .target_turns()
+            .saturating_sub(cp.accepted_turn_number)
             .saturating_mul(12)
             .max(40);
         budget.max_calls = remaining.saturating_add(headroom).max(1);
