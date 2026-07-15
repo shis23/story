@@ -38,13 +38,20 @@ pub struct ProductionEvidenceConfig {
 pub enum ChronicleCandidateSource {
     /// Harness 生成的确定性 Chronicle A 候选；不等于生产 Summarizer/postprocess。
     SyntheticChronicleFixture,
+    /// 通过共享 `ProductionPostprocessService` 写入 Attempt 的生产后处理路径。
+    ProductionPostprocessService,
 }
 
 impl ChronicleCandidateSource {
     fn evidence_label(self) -> &'static str {
         match self {
             Self::SyntheticChronicleFixture => "synthetic_chronicle_fixture",
+            Self::ProductionPostprocessService => "production_postprocess_service",
         }
+    }
+
+    fn is_production_complete(self) -> bool {
+        matches!(self, Self::ProductionPostprocessService)
     }
 }
 
@@ -54,6 +61,9 @@ pub struct WrittenProductionTurn {
     pub variant_id: Id,
     pub summary_text: Option<String>,
     pub chronicle_source: Option<ChronicleCandidateSource>,
+    /// When true, Turn/Attempt already prepared by ProductionPostprocessService;
+    /// evidence loop must not call prepare_awaiting_accept again.
+    pub postprocess_applied: bool,
 }
 
 #[async_trait]
@@ -97,8 +107,9 @@ impl ProductionTurnWriter for PipelineProductionTurnWriter {
         if draft_text.trim().is_empty() {
             return Err("pipeline write returned empty draft".into());
         }
-        // Tauri 的完整 Summarizer/postprocess/TurnAttempt 后台写回没有可安全复用的公开
-        // harness 接口。这里只生成明确标记的 synthetic fixture，禁止写成生产 postprocess。
+        // Real-model pipeline path still does not auto-run production postprocess here:
+        // callers that need the shared service should use FixedProductionPostprocessWriter
+        // or call env.apply_production_postprocess explicitly.
         let summary_text = Some(format!(
             "第{turn_index}轮已接受；正文指纹 {}。",
             short_hash16(&draft_text)
@@ -108,6 +119,59 @@ impl ProductionTurnWriter for PipelineProductionTurnWriter {
             variant_id,
             summary_text,
             chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
+            postprocess_applied: false,
+        })
+    }
+}
+
+/// Deterministic writer that routes Chronicle/Attempt writeback through the shared
+/// ProductionPostprocessService (no real Summarizer/PostProcessor LLM calls).
+pub struct FixedProductionPostprocessWriter {
+    pub summary_template: String,
+}
+
+#[async_trait]
+impl ProductionTurnWriter for FixedProductionPostprocessWriter {
+    fn write_path(&self) -> &'static str {
+        "production_postprocess_service"
+    }
+
+    async fn write_turn(
+        &mut self,
+        env: &HarnessEnv,
+        ctx: &WritingContext,
+        turn_index: u32,
+        _intent: &str,
+    ) -> Result<WrittenProductionTurn, String> {
+        let draft = format!(
+            "第{turn_index}轮生产后处理正文：雾港调查继续推进，保留足够长度供 Accept 校验。{}",
+            "线索稳定。".repeat(8)
+        );
+        let variant_id = env
+            .conv_store
+            .append_ai_draft(&ctx.conversation_id, draft.clone(), None)
+            .map_err(|e| e.to_string())?;
+        let summary = self
+            .summary_template
+            .replace("{turn}", &turn_index.to_string());
+        let applied = env
+            .apply_production_postprocess(
+                ctx,
+                &variant_id,
+                &draft,
+                Some(summary.clone()),
+                turn_index,
+            )
+            .await?;
+        if !applied {
+            return Err("production postprocess did not apply to active attempt".into());
+        }
+        Ok(WrittenProductionTurn {
+            draft_text: draft,
+            variant_id,
+            summary_text: Some(summary),
+            chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+            postprocess_applied: true,
         })
     }
 }
@@ -365,6 +429,7 @@ pub async fn run_production_evidence_loop_with_hook<
     );
 
     let mut turns_accepted = 0u32;
+    let mut observed_production_postprocess_complete = false;
     let mut observed_epochs = Vec::new();
     let mut observed_epoch_set = BTreeSet::new();
     let write_path = writer.write_path().to_string();
@@ -432,18 +497,24 @@ pub async fn run_production_evidence_loop_with_hook<
             return Err(ProductionEvidenceError::ZeroCalls { turn_index });
         }
 
-        let chronicle_path = match (&written.summary_text, written.chronicle_source) {
-            (Some(_), Some(source)) => source.evidence_label(),
-            (None, None) => "none",
-            _ => {
-                return Err(ProductionEvidenceError::InvalidConfig(
+        let (chronicle_path, production_postprocess_complete) =
+            match (&written.summary_text, written.chronicle_source) {
+                (Some(_), Some(source)) => {
+                    (source.evidence_label(), source.is_production_complete())
+                }
+                (None, None) => ("none", false),
+                _ => {
+                    return Err(ProductionEvidenceError::InvalidConfig(
                     "summary_text and chronicle_source must either both be present or both absent"
                         .into(),
                 ));
-            }
-        };
+                }
+            };
         if chronicle_path != "none" {
             observed_chronicle_path = chronicle_path.into();
+        }
+        if production_postprocess_complete {
+            observed_production_postprocess_complete = true;
         }
 
         deadline.check()?;
@@ -457,7 +528,10 @@ pub async fn run_production_evidence_loop_with_hook<
             quality_report: Some(storyforge_domain::turn::QualityReport { warnings: vec![] }),
             force_accept: false,
         };
-        probe.prepare_awaiting_accept_with_input_node(&accept_input, input_node_id);
+        // ProductionPostprocessService already attached Attempt/batch; do not re-prepare.
+        if !written.postprocess_applied {
+            probe.prepare_awaiting_accept_with_input_node(&accept_input, input_node_id);
+        }
         deadline.check()?;
         let accept = probe.accept_production(&accept_input);
         deadline.check()?;
@@ -472,13 +546,15 @@ pub async fn run_production_evidence_loop_with_hook<
             turn_index,
             kind: if chronicle_path == "synthetic_chronicle_fixture" {
                 "pipeline_write_synthetic_chronicle_accept".into()
+            } else if chronicle_path == "production_postprocess_service" {
+                "pipeline_write_production_postprocess_accept".into()
             } else {
                 "pipeline_write_no_chronicle_accept".into()
             },
             write_path: write_path.clone(),
             chronicle_path: chronicle_path.into(),
             accept_path: "production_faithful_commit_probe".into(),
-            production_postprocess_complete: false,
+            production_postprocess_complete,
             draft_accepted: accept.ok,
             force_accept: false,
             quality_error_count: 0,
@@ -558,6 +634,6 @@ pub async fn run_production_evidence_loop_with_hook<
         elapsed_ms: deadline.started.elapsed().as_millis(),
         write_path,
         chronicle_path: observed_chronicle_path,
-        production_postprocess_complete: false,
+        production_postprocess_complete: observed_production_postprocess_complete,
     })
 }

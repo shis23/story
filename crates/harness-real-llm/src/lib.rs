@@ -127,6 +127,124 @@ impl HarnessEnv {
         *self.active_campaign.lock().unwrap() = Some(id);
     }
 
+    /// Apply the shared ProductionPostprocessService with a deterministic outcome.
+    ///
+    /// Creates a DraftReady Turn/Attempt if needed, attaches Chronicle A + candidates
+    /// via the same state machine as Tauri, and returns whether writeback applied.
+    pub async fn apply_production_postprocess(
+        &self,
+        ctx: &WritingContext,
+        variant_id: &Id,
+        draft_text: &str,
+        summary_text: Option<String>,
+        turn_number: u32,
+    ) -> Result<bool, String> {
+        use storyforge_app_agent::PostProcessOutcome;
+        use storyforge_domain::turn::{QualityReport, TurnRecord, TurnStatus};
+        use storyforge_tauri_app::production_postprocess::{
+            FixedPostprocessRunner, JsonTurnAttemptSink, PostprocessIdentity, PostprocessRunner,
+            ProductionPostprocessRequest, ProductionPostprocessService,
+        };
+        use storyforge_tauri_app::turn_lifecycle;
+
+        let campaign_id = ctx
+            .campaign_id
+            .clone()
+            .ok_or_else(|| "apply_production_postprocess requires campaign_id".to_string())?;
+
+        // Ensure an active DraftReady attempt exists for this variant.
+        let (turn_id, attempt_id) =
+            if let Some(existing) = self.turn_store.get_turn_by_variant(variant_id) {
+                let attempt = existing
+                    .find_attempt_by_variant(variant_id)
+                    .ok_or_else(|| "turn exists but attempt missing for variant".to_string())?;
+                (existing.turn_id.clone(), attempt.attempt_id.clone())
+            } else {
+                let camp = self
+                    .campaign_store
+                    .get_campaign(&campaign_id)
+                    .ok_or_else(|| "campaign missing".to_string())?;
+                // Close any other active turn for this campaign first.
+                if let Some(active) = self.turn_store.get_active_turn(&campaign_id) {
+                    let _ = self.turn_store.with_turn_mut(&active.turn_id, |record| {
+                        if record.status.is_active() {
+                            record.status = TurnStatus::Failed;
+                            record.failure_reason =
+                                Some("superseded by harness production postprocess".into());
+                            record.touch();
+                        }
+                    });
+                }
+                let attempt = turn_lifecycle::new_draft_attempt(
+                    Id::new(),
+                    variant_id.clone(),
+                    draft_text,
+                    vec![],
+                );
+                let attempt_id = attempt.attempt_id.clone();
+                let mut record = TurnRecord::new(
+                    campaign_id.clone(),
+                    ctx.conversation_id.clone(),
+                    Id::from_str("harness-input"),
+                    camp.revision,
+                );
+                record.status = TurnStatus::DraftReady;
+                record.attempts.push(attempt);
+                let turn_id = record.turn_id.clone();
+                self.turn_store
+                    .create_turn(record)
+                    .map_err(|e| format!("create turn for postprocess: {e}"))?;
+                // Ensure quality report is present for Accept.
+                let sink = JsonTurnAttemptSink {
+                    turn_store: &self.turn_store,
+                };
+                let service = ProductionPostprocessService::new_json(&self.campaign_store, &sink);
+                service
+                    .sync_autofix_attempt(
+                        &turn_id,
+                        &attempt_id,
+                        draft_text,
+                        QualityReport { warnings: vec![] },
+                    )
+                    .map_err(|e| e.to_string())?;
+                (turn_id, attempt_id)
+            };
+
+        let outcome = PostProcessOutcome {
+            summary: summary_text,
+            post_process: None,
+        };
+        let runner: Arc<dyn PostprocessRunner> = Arc::new(FixedPostprocessRunner {
+            outcome: Some(outcome),
+        });
+        let sink = JsonTurnAttemptSink {
+            turn_store: &self.turn_store,
+        };
+        let service = ProductionPostprocessService::new_json(&self.campaign_store, &sink);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let result = service
+            .run(
+                ProductionPostprocessRequest {
+                    identity: Some(PostprocessIdentity {
+                        turn_id,
+                        attempt_id,
+                        campaign_id,
+                        conversation_id: ctx.conversation_id.clone(),
+                        turn_number,
+                    }),
+                    final_text: draft_text.to_string(),
+                    quality_report: None,
+                    present_chars: vec![],
+                    cancel: cancel_rx,
+                },
+                runner,
+                false,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result.applied)
+    }
+
     /// 组装一个 campaign-mode 的 `WritingContext`（复用线上 `fill_campaign_runtime_from_store`）。
     ///
     /// `base_ctx` 用 `WritingContext::legacy` 起步，本方法在其上填充 campaign 字段 +

@@ -11,10 +11,10 @@ use harness_real_llm::evidence::{
     RealLlmRunBudget, contains_forbidden_evidence_payload, read_evidence_lines,
 };
 use harness_real_llm::production_evidence::{
-    ChronicleCandidateSource, ProductionEvidenceConfig, ProductionEvidenceStage,
-    ProductionEvidenceStageHook, ProductionTurnWriter, WrittenProductionTurn,
-    require_explicit_fixture_path, require_fixture_file, run_production_evidence_loop,
-    run_production_evidence_loop_with_hook,
+    ChronicleCandidateSource, FixedProductionPostprocessWriter, ProductionEvidenceConfig,
+    ProductionEvidenceStage, ProductionEvidenceStageHook, ProductionTurnWriter,
+    WrittenProductionTurn, require_explicit_fixture_path, require_fixture_file,
+    run_production_evidence_loop, run_production_evidence_loop_with_hook,
 };
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
@@ -100,6 +100,7 @@ impl ProductionTurnWriter for DeterministicTurnWriter {
             chronicle_source: self
                 .emit_summary
                 .then_some(ChronicleCandidateSource::SyntheticChronicleFixture),
+            postprocess_applied: false,
         })
     }
 }
@@ -182,6 +183,71 @@ fn real_eval_requires_explicit_fixture_override() {
         require_explicit_fixture_path(Some(path.clone())).unwrap(),
         path
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn multi_turn_loop_uses_shared_production_postprocess_service() {
+    let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
+    let (env, llm, campaign_id, conversation_id, dir) = setup(turns + 1);
+    issue_setup_call(&env, &llm).await;
+    let writer = FixedProductionPostprocessWriter {
+        summary_template: "第{turn}轮：生产后处理摘要。".into(),
+    };
+
+    // FixedProductionPostprocessWriter itself does not call LLM; issue one call per turn
+    // so the evidence loop's zero-call guard stays green while postprocess is production-shared.
+    struct CountingWriter {
+        inner: FixedProductionPostprocessWriter,
+    }
+    #[async_trait]
+    impl ProductionTurnWriter for CountingWriter {
+        fn write_path(&self) -> &'static str {
+            "production_postprocess_service"
+        }
+        async fn write_turn(
+            &mut self,
+            env: &HarnessEnv,
+            ctx: &WritingContext,
+            turn_index: u32,
+            intent: &str,
+        ) -> Result<WrittenProductionTurn, String> {
+            let req = ChatRequest {
+                model: "fake".into(),
+                messages: vec![storyforge_domain::llm::ChatMessage::user(format!(
+                    "turn={turn_index}"
+                ))],
+                tools: None,
+                params: storyforge_domain::llm::SamplingParams::default(),
+            };
+            env.llm.chat(&req).await.map_err(|e| e.to_string())?;
+            self.inner.write_turn(env, ctx, turn_index, intent).await
+        }
+    }
+
+    let mut writer = CountingWriter { inner: writer };
+    let report = run_production_evidence_loop(
+        &env,
+        llm.clone(),
+        campaign_id,
+        conversation_id,
+        &config(&dir),
+        &mut writer,
+    )
+    .await
+    .expect("production postprocess evidence loop");
+
+    assert_eq!(report.turns_accepted, turns);
+    assert!(report.production_postprocess_complete);
+    assert_eq!(report.chronicle_path, "production_postprocess_service");
+    let accepted = read_evidence_lines(&report.turns_path).unwrap();
+    assert!(accepted.iter().all(|line| {
+        line["chronicle_path"] == "production_postprocess_service"
+            && line["production_postprocess_complete"] == true
+            && line["kind"] == "pipeline_write_production_postprocess_accept"
+    }));
+
+    env.cleanup();
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -284,6 +350,7 @@ async fn loop_fails_closed_on_zero_llm_calls() {
                 variant_id,
                 summary_text: Some(format!("summary {turn_index}")),
                 chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
+                postprocess_applied: false,
             })
         }
     }
