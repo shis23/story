@@ -28,21 +28,57 @@ function New-SyntheticEvidencePackage {
         [switch]$UnknownSchema,
         [switch]$SensitiveNote,
         [switch]$MissingInventory,
-        [switch]$MissingProvenance
+        [switch]$MissingProvenance,
+        [ValidateSet('ok', 'failed', 'partial', 'dry-run')]
+        [string]$BuildStatus = 'ok',
+        [string]$RemoteCi = 'not_claimed',
+        [string]$ProvenanceCommit,
+        [string]$ProvenanceBranch,
+        [string]$ProvenanceTarget,
+        [string[]]$ProvenanceNotes,
+        [string[]]$ManifestNotes,
+        [switch]$SubjectAsSymlink,
+        [switch]$SidecarAsSymlink,
+        [switch]$InventoryAsSymlink,
+        [switch]$SubjectsDirAsJunction
     )
 
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $subjectsDir = Join-Path $Root 'subjects\windows-exe'
-    New-Item -ItemType Directory -Force -Path $subjectsDir | Out-Null
+    if (-not $SubjectsDirAsJunction) {
+        New-Item -ItemType Directory -Force -Path $subjectsDir | Out-Null
+    }
 
     $subjectRel = 'subjects/windows-exe/storyforge.exe'
     $subjectPath = Join-Path $Root ($subjectRel -replace '/', '\')
-    if (-not $OmitSubject) {
-        [System.IO.File]::WriteAllBytes($subjectPath, [byte[]](1, 2, 3, 4, 5, 6))
+    $outsideDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-outside-{0}" -f [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $outsideDir | Out-Null
+    $outsideFile = Join-Path $outsideDir 'storyforge.exe'
+    [System.IO.File]::WriteAllBytes($outsideFile, [byte[]](9, 9, 9, 9, 9, 9))
+
+    if ($SubjectsDirAsJunction) {
+        $subjectsParent = Join-Path $Root 'subjects'
+        New-Item -ItemType Directory -Force -Path $subjectsParent | Out-Null
+        $null = cmd /c mklink /J "$subjectsDir" "$outsideDir"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to create subjects directory junction for adversarial test."
+        }
     }
 
-    $sha = if (Test-Path -LiteralPath $subjectPath -PathType Leaf) {
-        Get-ReleaseFileSha256 -Path $subjectPath
+    if (-not $OmitSubject) {
+        if ($SubjectAsSymlink) {
+            $null = cmd /c mklink "$subjectPath" "$outsideFile"
+            if ($LASTEXITCODE -ne 0) {
+                throw "Unable to create subject symlink for adversarial test."
+            }
+        } else {
+            [System.IO.File]::WriteAllBytes($subjectPath, [byte[]](1, 2, 3, 4, 5, 6))
+        }
+    }
+
+    $sha = if ((-not $OmitSubject) -and (Test-Path -LiteralPath $subjectPath)) {
+        # Hash the real bytes when possible; symlink targets still have content.
+        try { Get-ReleaseFileSha256 -Path $subjectPath } catch { 'a' * 64 }
     } else {
         'a' * 64
     }
@@ -51,7 +87,15 @@ function New-SyntheticEvidencePackage {
     if (-not $OmitSidecar -and -not $OmitSubject) {
         $sidecarPath = $subjectPath + '.sha256'
         $content = "{0} *storyforge.exe" -f $reportedSha
-        if ($BomSidecar) {
+        if ($SidecarAsSymlink) {
+            $outsideSidecar = Join-Path $outsideDir 'storyforge.exe.sha256'
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText($outsideSidecar, $content, $utf8NoBom)
+            $null = cmd /c mklink "$sidecarPath" "$outsideSidecar"
+            if ($LASTEXITCODE -ne 0) {
+                throw "Unable to create sidecar symlink for adversarial test."
+            }
+        } elseif ($BomSidecar) {
             $utf8Bom = New-Object System.Text.UTF8Encoding $true
             [System.IO.File]::WriteAllText($sidecarPath, $content, $utf8Bom)
         } else {
@@ -73,6 +117,9 @@ function New-SyntheticEvidencePackage {
     if ($SensitiveNote) {
         $notes += ('token=sk-' + ('z' * 24))
     }
+    if ($null -ne $ManifestNotes) {
+        $notes = @($ManifestNotes)
+    }
 
     $manifest = [pscustomobject]@{
         schema_version = $schemaVersion
@@ -92,13 +139,14 @@ function New-SyntheticEvidencePackage {
                 generator = 'fallback'
             }
         }
-        build_status = 'ok'
+        build_status = $BuildStatus
         warnings = @()
         notes = $notes
         acceptance = [pscustomobject]@{
             gui = 'not_claimed'
             android_device = 'not_claimed'
-            host_build = 'ok'
+            host_build = $BuildStatus
+            remote_ci = $RemoteCi
         }
     }
 
@@ -107,19 +155,35 @@ function New-SyntheticEvidencePackage {
             generator = 'fallback'
             components = @([pscustomobject]@{ name = 'storyforge'; version = '0.0.0' })
         }
-        Write-ReleaseJson -Object $inventory -Path (Join-Path $Root 'dependency-inventory.json')
-        $manifest.dependency_inventory.sha256 = Get-ReleaseFileSha256 -Path (Join-Path $Root 'dependency-inventory.json')
+        $invPath = Join-Path $Root 'dependency-inventory.json'
+        if ($InventoryAsSymlink) {
+            $outsideInv = Join-Path $outsideDir 'dependency-inventory.json'
+            Write-ReleaseJson -Object $inventory -Path $outsideInv
+            $null = cmd /c mklink "$invPath" "$outsideInv"
+            if ($LASTEXITCODE -ne 0) {
+                throw "Unable to create inventory symlink for adversarial test."
+            }
+            $manifest.dependency_inventory.sha256 = Get-ReleaseFileSha256 -Path $outsideInv
+        } else {
+            Write-ReleaseJson -Object $inventory -Path $invPath
+            $manifest.dependency_inventory.sha256 = Get-ReleaseFileSha256 -Path $invPath
+        }
     }
 
     Write-ReleaseJson -Object $manifest -Path (Join-Path $Root 'manifest.json')
 
     if (-not $MissingProvenance) {
+        $provNotes = if ($null -ne $ProvenanceNotes) {
+            @($ProvenanceNotes)
+        } else {
+            @('Unsigned host provenance attestation for release evidence only.')
+        }
         $prov = [pscustomobject]@{
             schema_version = $schemaVersion
             generated_at_utc = '2026-07-15T00:00:00Z'
-            commit = 'abc1234'
-            branch = 'codex/release-runner-readiness'
-            target = 'x86_64-pc-windows-msvc'
+            commit = if ($ProvenanceCommit) { $ProvenanceCommit } else { 'abc1234' }
+            branch = if ($ProvenanceBranch) { $ProvenanceBranch } else { 'codex/release-runner-readiness' }
+            target = if ($ProvenanceTarget) { $ProvenanceTarget } else { 'x86_64-pc-windows-msvc' }
             subjects = @(
                 [pscustomobject]@{
                     relative_path = $artifactPath
@@ -129,12 +193,35 @@ function New-SyntheticEvidencePackage {
                     status = 'present'
                 }
             )
-            notes = @('Unsigned host provenance attestation for release evidence only.')
+            notes = $provNotes
         }
         Write-ReleaseJson -Object $prov -Path (Join-Path $Root 'provenance.json')
     }
 
     return $Root
+}
+
+function Invoke-VerifyReleaseEvidenceCli {
+    param(
+        [Parameter(Mandatory = $true)][string]$EvidenceDir,
+        [switch]$AllowDryRun
+    )
+
+    $scriptPath = Join-Path $RepoRoot 'scripts\verify-release-evidence.ps1'
+    $allArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath, '-EvidenceDir', $EvidenceDir)
+    if ($AllowDryRun) { $allArgs += '-AllowDryRun' }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & powershell.exe @allArgs 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return [pscustomobject]@{
+        ExitCode = $code
+        Output = @($output | ForEach-Object { "$_" })
+    }
 }
 
 Describe 'Release runner preflight report' {
@@ -438,6 +525,195 @@ Describe 'Release offline evidence package verifier' {
             $result.Valid | Should Be $false
             ($result.Errors -join ' ') | Should Match 'provenance'
             { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects subject files that are symlinks/reparse points' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-subj-link-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -SubjectAsSymlink | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'reparse|symlink|junction'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects sidecar files that are symlinks/reparse points' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-side-link-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -SidecarAsSymlink | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'reparse|symlink|junction'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects inventory files that are symlinks/reparse points' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-inv-link-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -InventoryAsSymlink | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'reparse|symlink|junction|inventory'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects subjects directory that is a junction/reparse point' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-subj-junc-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -SubjectsDirAsJunction | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'reparse|symlink|junction'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'redacts missing EvidenceDir path and secret-shaped input from verifier errors' {
+        $homeUser = Join-Path $env:USERPROFILE ("sf-missing-ev-{0}" -f [guid]::NewGuid().ToString('N'))
+        $secretish = 'sk-' + ('q' * 24)
+        $missing = Join-Path $homeUser $secretish
+        $result = Test-ReleaseEvidencePackage -EvidenceDir $missing
+        $result.Valid | Should Be $false
+        $joined = $result.Errors -join ' '
+        $joined | Should Match 'missing|not found|Evidence'
+        $joined | Should Not Match ([regex]::Escape($env:USERPROFILE))
+        $joined | Should Not Match 'C:\\Users'
+        $joined | Should Not Match ([regex]::Escape($secretish))
+        $joined | Should Not Match 'sk-q{10,}'
+    }
+
+    It 'rejects provenance api_key and Bearer secrets via the generic scanner' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-prov-sec-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $apiKey = 'api_key=' + '"' + ('x' * 20) + '"'
+            $bearer = 'Authorization: Bearer ' + ('B' * 32)
+            New-SyntheticEvidencePackage -Root $dir -ProvenanceNotes @($apiKey, $bearer) | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'secret|sensitive|redact'
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('x' * 20)))
+            ($result.Errors -join ' ') | Should Not Match ([regex]::Escape(('B' * 32)))
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects remote_ci claimed/passed and reports the original claim value' {
+        foreach ($claim in @('claimed', 'passed')) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-rci-{0}-{1}" -f $claim, [guid]::NewGuid().ToString('N'))
+            try {
+                New-SyntheticEvidencePackage -Root $dir -RemoteCi $claim | Out-Null
+                $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+                $result.Valid | Should Be $false
+                $result.remote_ci_claim | Should Be $claim
+                $result.remote_ci_claimed | Should Be $true
+                ($result.Errors -join ' ') | Should Match 'remote_ci'
+                ($result.Errors -join ' ') | Should Match $claim
+                { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'fails closed when manifest and provenance commit/branch/target disagree' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-ident-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage `
+                -Root $dir `
+                -ProvenanceCommit 'deadbeef' `
+                -ProvenanceBranch 'other-branch' `
+                -ProvenanceTarget 'aarch64-linux-android' | Out-Null
+            $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+            $result.Valid | Should Be $false
+            ($result.Errors -join ' ') | Should Match 'commit|branch|target|identity|mismatch'
+            { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed for partial and failed packages instead of treating them as success' {
+        foreach ($status in @('partial', 'failed')) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-ev-status-{0}-{1}" -f $status, [guid]::NewGuid().ToString('N'))
+            try {
+                New-SyntheticEvidencePackage -Root $dir -BuildStatus $status -OmitSubject -OmitSidecar -MissingInventory -MissingProvenance | Out-Null
+                $result = Test-ReleaseEvidencePackage -EvidenceDir $dir
+                $result.Valid | Should Be $false
+                $result.build_status | Should Be $status
+                ($result.Errors -join ' ') | Should Match $status
+                { Assert-ReleaseEvidencePackage -EvidenceDir $dir } | Should Throw
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+Describe 'Release evidence verifier CLI (real process)' {
+    It 'CLI exits non-zero for missing EvidenceDir without leaking host paths or secrets' {
+        $secretish = 'sk-' + ('c' * 24)
+        $missing = Join-Path $env:USERPROFILE ("sf-cli-missing-{0}\{1}" -f [guid]::NewGuid().ToString('N'), $secretish)
+        $cli = Invoke-VerifyReleaseEvidenceCli -EvidenceDir $missing
+        $cli.ExitCode | Should Not Be 0
+        $text = $cli.Output -join "`n"
+        $text | Should Not Match 'VERIFICATION PASSED'
+        $text | Should Match 'FAILED|ERROR|missing|not found|Evidence'
+        $text | Should Not Match ([regex]::Escape($env:USERPROFILE))
+        $text | Should Not Match 'C:\\Users\\'
+        $text | Should Not Match ([regex]::Escape($secretish))
+    }
+
+    It 'CLI fails closed for partial packages and does not print VERIFICATION PASSED' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-cli-partial-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -BuildStatus 'partial' -OmitSubject -OmitSidecar -MissingInventory -MissingProvenance | Out-Null
+            $cli = Invoke-VerifyReleaseEvidenceCli -EvidenceDir $dir
+            $cli.ExitCode | Should Not Be 0
+            $text = $cli.Output -join "`n"
+            $text | Should Not Match 'VERIFICATION PASSED'
+            $text | Should Match 'FAILED|fail-closed|partial'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'CLI fails closed for failed packages and does not print VERIFICATION PASSED' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-cli-failed-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir -BuildStatus 'failed' -OmitSubject -OmitSidecar -MissingInventory -MissingProvenance | Out-Null
+            $cli = Invoke-VerifyReleaseEvidenceCli -EvidenceDir $dir
+            $cli.ExitCode | Should Not Be 0
+            $text = $cli.Output -join "`n"
+            $text | Should Not Match 'VERIFICATION PASSED'
+            $text | Should Match 'FAILED|fail-closed|failed'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'CLI accepts a well-formed ok package with exit 0' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-cli-ok-{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            New-SyntheticEvidencePackage -Root $dir | Out-Null
+            $cli = Invoke-VerifyReleaseEvidenceCli -EvidenceDir $dir
+            $cli.ExitCode | Should Be 0
+            ($cli.Output -join "`n") | Should Match 'VERIFICATION PASSED'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }

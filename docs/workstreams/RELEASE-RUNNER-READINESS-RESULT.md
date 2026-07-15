@@ -166,6 +166,26 @@ OK: secret scan found no matches in Git-tracked or untracked build-input files.
 | Dry-run without `-AllowDryRun` | Verifier rejects |
 | Workflow without real YAML parser | Static contract / existing syntax gate fail closed |
 
+## Follow-up hardening (adversarial verifier pass)
+
+Additional fail-closed verifier fixes landed after the initial readiness commit:
+
+1. Subjects, sidecars, inventory, and parent path segments reject
+   junction/symlink/reparse points; canonical path escape is rejected.
+2. Missing `EvidenceDir` and all verifier errors are path/secret redacted
+   (no raw host home path, no secret-shaped fragments).
+3. Provenance notes use the generic `Find-ReleaseSecretPatternFindings` scanner
+   (api_key / Bearer / authorization / sk-* etc.), not sk-* alone.
+4. `acceptance.remote_ci` is validated; `claimed`/`passed` fail closed and
+   `remote_ci_claim` preserves the original value (no fixed `false` cover-up).
+5. Manifest vs provenance `commit` / `branch` / `target` identity must match.
+6. `partial` / `failed` packages fail closed; CLI never prints
+   `VERIFICATION PASSED` or exits 0 for those statuses.
+7. Real-process CLI tests cover missing dir redaction and partial/failed exits.
+
+Full suite after hardening: **122** Pester tests passed
+(37 + 14 + 31 + 40), `git diff --check` clean.
+
 ## Risks / follow-ups
 
 1. **Remote runner still unverified.** Operators must register a runner with
@@ -177,6 +197,8 @@ OK: secret scan found no matches in Git-tracked or untracked build-input files.
    emulate Gitea Actions runtime semantics.
 4. Fixture string assembly is only for static scanners; runtime secret-shape
    rejection tests remain intact.
+5. Creating symlinks/junctions in adversarial tests requires local filesystem
+   privilege; if mklink fails the suite surfaces that as a hard error.
 
 ## Recommendation
 

@@ -886,6 +886,76 @@ function Assert-ReleaseDirectoryNotReparsePoint {
     return $item
 }
 
+function Assert-ReleasePathNotReparsePoint {
+    <#
+    .SYNOPSIS
+    Rejects files or directories that are junctions, symlinks, or other reparse points.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "$Label path is missing."
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw ("{0} must not be a junction, symlink, or reparse point." -f $Label)
+    }
+    return $item
+}
+
+function Test-ReleaseEvidencePathSafe {
+    <#
+    .SYNOPSIS
+    Ensures a subject/sidecar/inventory path stays inside EvidenceDir without reparse escapes.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $rel = [string]$RelativePath
+    if ([string]::IsNullOrWhiteSpace($rel)) {
+        throw "$Label relative_path is empty."
+    }
+    if ($rel -match '(^|/|\\)\.\.(/|\\|$)' -or $rel.StartsWith('/') -or $rel -match '^[A-Za-z]:') {
+        throw ("{0} path escape rejected." -f $Label)
+    }
+
+    $candidate = Join-Path $EvidenceRoot ($rel -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+    if (-not (Test-ReleasePathWithinRoot -Root $EvidenceRoot -Path $candidate)) {
+        throw ("{0} path is outside the evidence package." -f $Label)
+    }
+
+    # Walk every ancestor under EvidenceRoot and reject reparse points so a
+    # junctioned subjects/ tree cannot smuggle external content.
+    $rootFull = [System.IO.Path]::GetFullPath($EvidenceRoot).TrimEnd('\', '/')
+    $full = [System.IO.Path]::GetFullPath($candidate)
+    $cursor = $full
+    while ($true) {
+        if (-not (Test-Path -LiteralPath $cursor)) { break }
+        $null = Assert-ReleasePathNotReparsePoint -Path $cursor -Label $Label
+        if ($cursor.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path -Parent $cursor
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $cursor) { break }
+        if (-not (Test-ReleasePathWithinRoot -Root $EvidenceRoot -Path $parent)) { break }
+        $cursor = $parent
+    }
+
+    # Canonical path must still resolve inside the evidence root.
+    if (Test-Path -LiteralPath $candidate) {
+        $resolved = (Resolve-Path -LiteralPath $candidate).ProviderPath
+        if (-not (Test-ReleasePathWithinRoot -Root $EvidenceRoot -Path $resolved)) {
+            throw ("{0} canonical path escapes the evidence package." -f $Label)
+        }
+    }
+
+    return $candidate
+}
+
 function Get-ReleaseRetentionCleanupTargets {
     param(
         [Parameter(Mandatory = $true)]
@@ -1914,9 +1984,9 @@ function Test-ReleaseEvidencePackage {
     .DESCRIPTION
     Fail-closed offline verification for evidence packages produced by the host
     runners. Rejects missing subjects/sidecars, hash mismatches, BOM sidecars,
-    path escapes, unknown schema versions, sensitive notes/warnings, and missing
-    inventory/provenance for successful builds. Dry-run packages require
-    -AllowDryRun and never claim remote CI.
+    path escapes, reparse points, unknown schema versions, sensitive notes/warnings,
+    identity mismatch, out-of-bounds remote_ci claims, and non-success build_status
+    packages. Dry-run packages require -AllowDryRun and never claim remote CI.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$EvidenceDir,
@@ -1926,16 +1996,46 @@ function Test-ReleaseEvidencePackage {
     $errors = New-Object System.Collections.Generic.List[string]
     $notes = New-Object System.Collections.Generic.List[string]
     $subjectCount = 0
+    $remoteCiClaim = 'absent'
     $remoteCiClaimed = $false
+    $buildStatus = 'unknown'
+    $evidenceRoot = $null
+
+    function Add-SafeEvidenceError {
+        param([Parameter(Mandatory = $true)][string]$Message)
+        $safe = Protect-ReleasePath -Text $Message -RepoRoot $evidenceRoot
+        # Always strip absolute Windows/Unix home shapes even when RepoRoot is unknown.
+        $safe = Protect-ReleasePath -Text $safe
+        $errors.Add($safe) | Out-Null
+    }
 
     if (-not (Test-Path -LiteralPath $EvidenceDir -PathType Container)) {
+        Add-SafeEvidenceError -Message 'Evidence directory missing.'
         return [pscustomobject]@{
             Valid = $false
-            ErrorCount = 1
-            Errors = @("Evidence directory missing: $EvidenceDir")
+            ErrorCount = $errors.Count
+            Errors = @($errors)
             Notes = @()
             subject_count = 0
+            remote_ci_claim = $remoteCiClaim
             remote_ci_claimed = $false
+            build_status = $buildStatus
+        }
+    }
+
+    try {
+        $null = Assert-ReleaseDirectoryNotReparsePoint -Path $EvidenceDir -Label 'Evidence directory'
+    } catch {
+        Add-SafeEvidenceError -Message $_.Exception.Message
+        return [pscustomobject]@{
+            Valid = $false
+            ErrorCount = $errors.Count
+            Errors = @($errors | ForEach-Object { Protect-ReleasePath -Text $_ })
+            Notes = @()
+            subject_count = 0
+            remote_ci_claim = $remoteCiClaim
+            remote_ci_claimed = $false
+            build_status = $buildStatus
         }
     }
 
@@ -1944,39 +2044,69 @@ function Test-ReleaseEvidencePackage {
     $provPath = Join-Path $evidenceRoot 'provenance.json'
 
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-        $errors.Add('manifest.json is missing from the evidence package.') | Out-Null
-        return [pscustomobject]@{
-            Valid = $false
-            ErrorCount = $errors.Count
-            Errors = @($errors | ForEach-Object { Protect-ReleasePath -Text $_ -RepoRoot $evidenceRoot })
-            Notes = @()
-            subject_count = 0
-            remote_ci_claimed = $false
-        }
-    }
-
-    try {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    } catch {
-        $errors.Add('manifest.json is not valid JSON.') | Out-Null
+        Add-SafeEvidenceError -Message 'manifest.json is missing from the evidence package.'
         return [pscustomobject]@{
             Valid = $false
             ErrorCount = $errors.Count
             Errors = @($errors)
             Notes = @()
             subject_count = 0
+            remote_ci_claim = $remoteCiClaim
             remote_ci_claimed = $false
+            build_status = $buildStatus
         }
     }
 
     try {
+        $null = Assert-ReleasePathNotReparsePoint -Path $manifestPath -Label 'manifest.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    } catch {
+        Add-SafeEvidenceError -Message 'manifest.json is not valid JSON or is a reparse point.'
+        return [pscustomobject]@{
+            Valid = $false
+            ErrorCount = $errors.Count
+            Errors = @($errors)
+            Notes = @()
+            subject_count = 0
+            remote_ci_claim = $remoteCiClaim
+            remote_ci_claimed = $false
+            build_status = $buildStatus
+        }
+    }
+
+    $buildStatus = [string]$manifest.build_status
+
+    try {
         Assert-ReleaseManifestSchema -Manifest $manifest
     } catch {
-        $errors.Add((Protect-ReleasePath -Text $_.Exception.Message -RepoRoot $evidenceRoot)) | Out-Null
+        Add-SafeEvidenceError -Message $_.Exception.Message
     }
 
     if ($null -eq $manifest.schema_version -or [int]$manifest.schema_version -ne 1) {
-        $errors.Add(("Unknown or unsupported schema_version '{0}'." -f $manifest.schema_version)) | Out-Null
+        Add-SafeEvidenceError -Message ("Unknown or unsupported schema_version '{0}'." -f $manifest.schema_version)
+    }
+
+    # remote_ci claim is explicit and must never be silently rewritten to false.
+    if ($manifest.PSObject.Properties.Name -contains 'acceptance' -and $null -ne $manifest.acceptance) {
+        $acc = $manifest.acceptance
+        if ($acc.PSObject.Properties.Name -contains 'remote_ci') {
+            $remoteCiClaim = [string]$acc.remote_ci
+        }
+    }
+    $allowedRemoteCi = @('not_claimed', 'not_claimable', 'absent', '')
+    if (-not [string]::IsNullOrWhiteSpace($remoteCiClaim) -and $allowedRemoteCi -notcontains $remoteCiClaim) {
+        $remoteCiClaimed = $true
+        Add-SafeEvidenceError -Message ("remote_ci claim '{0}' is out of bounds; only not_claimed/not_claimable are allowed." -f $remoteCiClaim)
+    } else {
+        $remoteCiClaimed = $false
+        if ([string]::IsNullOrWhiteSpace($remoteCiClaim)) {
+            $remoteCiClaim = 'absent'
+        }
+    }
+
+    # partial/failed packages are never offline-success; fail closed with explicit status.
+    if ($buildStatus -eq 'partial' -or $buildStatus -eq 'failed') {
+        Add-SafeEvidenceError -Message ("build_status '{0}' is fail-closed; offline verification does not accept partial/failed packages as success." -f $buildStatus)
     }
 
     $secretProbe = @()
@@ -1990,51 +2120,43 @@ function Test-ReleaseEvidencePackage {
     foreach ($text in $secretProbe) {
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
         $secretFindings += @(Find-ReleaseSecretPatternFindings -Text $text)
-        # Defense in depth for common API token shapes.
-        if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
-            $secretFindings += [pscustomobject]@{ Rule = 'openai-style-token'; RelativePath = 'manifest.notes/warnings' }
-        }
     }
     if ($secretFindings.Count -gt 0) {
-        $errors.Add('Sensitive secret-like content found in manifest warnings/notes; package rejected (values redacted).') | Out-Null
+        Add-SafeEvidenceError -Message 'Sensitive secret-like content found in manifest warnings/notes; package rejected (values redacted).'
     }
 
-    $isDryRun = ($manifest.build_status -eq 'dry-run')
+    $isDryRun = ($buildStatus -eq 'dry-run')
     if ($isDryRun) {
         if (-not $AllowDryRun) {
-            $errors.Add('dry-run evidence package rejected without -AllowDryRun; dry-run is not remote CI evidence.') | Out-Null
+            Add-SafeEvidenceError -Message 'dry-run evidence package rejected without -AllowDryRun; dry-run is not remote CI evidence.'
         } else {
             $notes.Add('Accepted as local dry-run evidence only; not remote CI, not GUI, not device acceptance.') | Out-Null
         }
     }
 
-    if ($manifest.build_status -eq 'ok' -or ($isDryRun -and $AllowDryRun -eq $false)) {
-        # Continuity: successful packages require provenance + inventory.
-    }
-
-    if ($manifest.build_status -eq 'ok') {
+    if ($buildStatus -eq 'ok') {
         if (-not (Test-Path -LiteralPath $provPath -PathType Leaf)) {
-            $errors.Add('provenance.json is missing from the evidence package.') | Out-Null
+            Add-SafeEvidenceError -Message 'provenance.json is missing from the evidence package.'
         }
         $invMeta = $manifest.dependency_inventory
         if ($null -eq $invMeta -or [string]::IsNullOrWhiteSpace([string]$invMeta.relative_path)) {
-            $errors.Add('dependency inventory metadata is missing from the manifest for build_status=ok.') | Out-Null
+            Add-SafeEvidenceError -Message 'dependency inventory metadata is missing from the manifest for build_status=ok.'
         } else {
-            $invRel = [string]$invMeta.relative_path -replace '/', [System.IO.Path]::DirectorySeparatorChar
-            if ($invRel.Contains('..')) {
-                $errors.Add('dependency inventory path escape rejected.') | Out-Null
-            } else {
-                $invPath = Join-Path $evidenceRoot $invRel
-                if (-not (Test-ReleasePathWithinRoot -Root $evidenceRoot -Path $invPath)) {
-                    $errors.Add('dependency inventory path is outside the evidence package.') | Out-Null
-                } elseif (-not (Test-Path -LiteralPath $invPath -PathType Leaf)) {
-                    $errors.Add('dependency inventory file is missing from the evidence package.') | Out-Null
+            try {
+                $invPath = Test-ReleaseEvidencePathSafe `
+                    -EvidenceRoot $evidenceRoot `
+                    -RelativePath ([string]$invMeta.relative_path) `
+                    -Label 'dependency inventory'
+                if (-not (Test-Path -LiteralPath $invPath -PathType Leaf)) {
+                    Add-SafeEvidenceError -Message 'dependency inventory file is missing from the evidence package.'
                 } elseif (-not [string]::IsNullOrWhiteSpace([string]$invMeta.sha256)) {
                     $invHash = Get-ReleaseFileSha256 -Path $invPath
                     if ($invHash -ne ([string]$invMeta.sha256).ToLowerInvariant()) {
-                        $errors.Add('dependency inventory sha256 mismatch.') | Out-Null
+                        Add-SafeEvidenceError -Message 'dependency inventory sha256 mismatch.'
                     }
                 }
+            } catch {
+                Add-SafeEvidenceError -Message $_.Exception.Message
             }
         }
     } elseif ($isDryRun -and $AllowDryRun) {
@@ -2047,115 +2169,156 @@ function Test-ReleaseEvidencePackage {
     $prov = $null
     if (Test-Path -LiteralPath $provPath -PathType Leaf) {
         try {
+            $null = Assert-ReleasePathNotReparsePoint -Path $provPath -Label 'provenance.json'
             $prov = Get-Content -LiteralPath $provPath -Raw | ConvertFrom-Json
             if ($null -eq $prov.schema_version -or [int]$prov.schema_version -ne 1) {
-                $errors.Add(("Unknown or unsupported provenance schema_version '{0}'." -f $prov.schema_version)) | Out-Null
+                Add-SafeEvidenceError -Message ("Unknown or unsupported provenance schema_version '{0}'." -f $prov.schema_version)
             }
+
+            # Identity consistency: commit/branch/target must match the manifest.
+            foreach ($field in @('commit', 'branch', 'target')) {
+                $mVal = [string]$manifest.$field
+                $pVal = [string]$prov.$field
+                if ($mVal -ne $pVal) {
+                    Add-SafeEvidenceError -Message ("manifest/provenance {0} identity mismatch." -f $field)
+                }
+            }
+
             $provSecretProbe = @()
             if ($prov.PSObject.Properties.Name -contains 'notes') {
                 $provSecretProbe += @($prov.notes | ForEach-Object { [string]$_ })
             }
+            $provSecretFindings = @()
             foreach ($text in $provSecretProbe) {
-                if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
-                    $errors.Add('Sensitive secret-like content found in provenance notes; package rejected (values redacted).') | Out-Null
-                    break
-                }
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                $provSecretFindings += @(Find-ReleaseSecretPatternFindings -Text $text)
+            }
+            if ($provSecretFindings.Count -gt 0) {
+                Add-SafeEvidenceError -Message 'Sensitive secret-like content found in provenance notes; package rejected (values redacted).'
             }
         } catch {
-            $errors.Add('provenance.json is not valid JSON.') | Out-Null
+            if ($_.Exception.Message -match 'reparse|symlink|junction') {
+                Add-SafeEvidenceError -Message $_.Exception.Message
+            } else {
+                Add-SafeEvidenceError -Message 'provenance.json is not valid JSON or cannot be read safely.'
+            }
         }
     }
 
     $subjects = @()
     if ($null -ne $prov -and $prov.PSObject.Properties.Name -contains 'subjects') {
         $subjects = @($prov.subjects)
-    } elseif ($manifest.build_status -eq 'ok') {
-        # Fall back to present artifacts when provenance subjects are unavailable.
+    } elseif ($buildStatus -eq 'ok') {
         $subjects = @($manifest.artifacts | Where-Object { $_.status -eq 'present' })
     }
 
-    if ($manifest.build_status -eq 'ok' -and @($subjects).Count -eq 0) {
-        $errors.Add('build_status=ok package has no present subjects to verify.') | Out-Null
+    if ($buildStatus -eq 'ok' -and @($subjects).Count -eq 0) {
+        Add-SafeEvidenceError -Message 'build_status=ok package has no present subjects to verify.'
     }
 
     foreach ($subj in $subjects) {
         if ($null -eq $subj) { continue }
         $rel = [string]$subj.relative_path
-        if ([string]::IsNullOrWhiteSpace($rel)) {
-            $errors.Add('Subject relative_path is empty.') | Out-Null
-            continue
-        }
-        if ($rel -match '(^|/|\\)\.\.(/|\\|$)' -or $rel.StartsWith('/') -or $rel -match '^[A-Za-z]:') {
-            $errors.Add(("Subject path escape rejected for '{0}'." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+        $requiresPresent = ($buildStatus -eq 'ok' -or $subj.status -eq 'present')
+        if (-not $requiresPresent) { continue }
+
+        try {
+            $subjectPath = Test-ReleaseEvidencePathSafe `
+                -EvidenceRoot $evidenceRoot `
+                -RelativePath $rel `
+                -Label 'Subject'
+        } catch {
+            Add-SafeEvidenceError -Message $_.Exception.Message
             continue
         }
 
-        $subjectPath = Join-Path $evidenceRoot ($rel -replace '/', [System.IO.Path]::DirectorySeparatorChar)
-        if (-not (Test-ReleasePathWithinRoot -Root $evidenceRoot -Path $subjectPath)) {
-            $errors.Add(("Subject path is outside the evidence package: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+        if (-not (Test-Path -LiteralPath $subjectPath -PathType Leaf)) {
+            Add-SafeEvidenceError -Message ("Subject file missing: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
             continue
         }
 
-        if ($manifest.build_status -eq 'ok' -or $subj.status -eq 'present') {
-            if (-not (Test-Path -LiteralPath $subjectPath -PathType Leaf)) {
-                $errors.Add(("Subject file missing: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
-                continue
-            }
+        try {
+            $null = Assert-ReleasePathNotReparsePoint -Path $subjectPath -Label 'Subject file'
+        } catch {
+            Add-SafeEvidenceError -Message $_.Exception.Message
+            continue
+        }
 
+        $sidecarRel = $rel + '.sha256'
+        try {
+            $sidecar = Test-ReleaseEvidencePathSafe `
+                -EvidenceRoot $evidenceRoot `
+                -RelativePath $sidecarRel `
+                -Label 'Hash sidecar'
+        } catch {
+            # Sidecar relative path is derived; still report as missing/escape.
             $sidecar = $subjectPath + '.sha256'
-            if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
-                $errors.Add(("Hash sidecar missing for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            if ($_.Exception.Message -match 'reparse|symlink|junction|escape|outside') {
+                Add-SafeEvidenceError -Message $_.Exception.Message
                 continue
             }
-
-            $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecar)
-            if ($sidecarBytes.Length -ge 3 -and $sidecarBytes[0] -eq 0xEF -and $sidecarBytes[1] -eq 0xBB -and $sidecarBytes[2] -eq 0xBF) {
-                $errors.Add(("Hash sidecar is UTF-8 BOM encoded (rejected): {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
-            }
-
-            $sidecarText = [System.Text.Encoding]::UTF8.GetString($sidecarBytes).Trim()
-            if ($sidecarText.Length -gt 0 -and [int][char]$sidecarText[0] -eq 0xFEFF) {
-                $errors.Add(("Hash sidecar has BOM marker (rejected): {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
-                $sidecarText = $sidecarText.TrimStart([char]0xFEFF).Trim()
-            }
-
-            $rehash = Get-ReleaseFileSha256 -Path $subjectPath
-            $expected = ([string]$subj.sha256).ToLowerInvariant()
-            if ([string]::IsNullOrWhiteSpace($expected)) {
-                $errors.Add(("Subject missing sha256 digest: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
-            } elseif ($rehash -ne $expected) {
-                $errors.Add(("Offline rehash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
-            }
-
-            if ($sidecarText -match '([a-fA-F0-9]{64})') {
-                $sidecarHash = $Matches[1].ToLowerInvariant()
-                if ($sidecarHash -ne $rehash -or ($expected -and $sidecarHash -ne $expected)) {
-                    $errors.Add(("Sidecar hash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
-                }
-            } else {
-                $errors.Add(("Sidecar content is not a valid sha256 sum line: {0}" -f (Protect-ReleasePath -Text ($rel + '.sha256') -RepoRoot $evidenceRoot))) | Out-Null
-            }
-
-            $subjectCount += 1
         }
+
+        if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
+            Add-SafeEvidenceError -Message ("Hash sidecar missing for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            continue
+        }
+
+        try {
+            $null = Assert-ReleasePathNotReparsePoint -Path $sidecar -Label 'Hash sidecar'
+        } catch {
+            Add-SafeEvidenceError -Message $_.Exception.Message
+            continue
+        }
+
+        $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecar)
+        if ($sidecarBytes.Length -ge 3 -and $sidecarBytes[0] -eq 0xEF -and $sidecarBytes[1] -eq 0xBB -and $sidecarBytes[2] -eq 0xBF) {
+            Add-SafeEvidenceError -Message ("Hash sidecar is UTF-8 BOM encoded (rejected): {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
+        }
+
+        $sidecarText = [System.Text.Encoding]::UTF8.GetString($sidecarBytes).Trim()
+        if ($sidecarText.Length -gt 0 -and [int][char]$sidecarText[0] -eq 0xFEFF) {
+            Add-SafeEvidenceError -Message ("Hash sidecar has BOM marker (rejected): {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
+            $sidecarText = $sidecarText.TrimStart([char]0xFEFF).Trim()
+        }
+
+        $rehash = Get-ReleaseFileSha256 -Path $subjectPath
+        $expected = ([string]$subj.sha256).ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($expected)) {
+            Add-SafeEvidenceError -Message ("Subject missing sha256 digest: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+        } elseif ($rehash -ne $expected) {
+            Add-SafeEvidenceError -Message ("Offline rehash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+        }
+
+        if ($sidecarText -match '([a-fA-F0-9]{64})') {
+            $sidecarHash = $Matches[1].ToLowerInvariant()
+            if ($sidecarHash -ne $rehash -or ($expected -and $sidecarHash -ne $expected)) {
+                Add-SafeEvidenceError -Message ("Sidecar hash mismatch for subject: {0}" -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))
+            }
+        } else {
+            Add-SafeEvidenceError -Message ("Sidecar content is not a valid sha256 sum line: {0}" -f (Protect-ReleasePath -Text $sidecarRel -RepoRoot $evidenceRoot))
+        }
+
+        $subjectCount += 1
     }
 
-    # Also validate present artifacts listed only in the manifest for ok builds.
-    if ($manifest.build_status -eq 'ok') {
+    if ($buildStatus -eq 'ok') {
         foreach ($art in @($manifest.artifacts)) {
             if ($null -eq $art -or $art.status -ne 'present') { continue }
             $rel = [string]$art.relative_path
-            if ($rel -match '(^|/|\\)\.\.(/|\\|$)' -or $rel.StartsWith('/') -or $rel -match '^[A-Za-z]:') {
-                $errors.Add(("Artifact path escape rejected for '{0}'." -f (Protect-ReleasePath -Text $rel -RepoRoot $evidenceRoot))) | Out-Null
+            try {
+                $null = Test-ReleaseEvidencePathSafe -EvidenceRoot $evidenceRoot -RelativePath $rel -Label 'Artifact'
+            } catch {
+                Add-SafeEvidenceError -Message $_.Exception.Message
             }
         }
     }
 
     $safeErrors = @($errors | ForEach-Object {
-        Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot
+        Protect-ReleasePath -Text (Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot)
     })
     $safeNotes = @($notes | ForEach-Object {
-        Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot
+        Protect-ReleasePath -Text (Protect-ReleasePath -Text ([string]$_) -RepoRoot $evidenceRoot)
     })
 
     return [pscustomobject]@{
@@ -2164,8 +2327,9 @@ function Test-ReleaseEvidencePackage {
         Errors = $safeErrors
         Notes = $safeNotes
         subject_count = $subjectCount
-        remote_ci_claimed = $remoteCiClaimed
-        build_status = [string]$manifest.build_status
+        remote_ci_claim = $remoteCiClaim
+        remote_ci_claimed = [bool]$remoteCiClaimed
+        build_status = $buildStatus
     }
 }
 
