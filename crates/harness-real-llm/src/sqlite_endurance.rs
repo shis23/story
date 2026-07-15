@@ -268,6 +268,22 @@ impl SqliteHarnessEnv {
         pipeline
     }
 
+
+    fn fail_active_turn_if_any(&self, campaign_id: &Id, reason: &str) -> Result<(), String> {
+        if let Some(active) = sqlite_runtime::get_active_turn(campaign_id)?
+            && active.status.is_active()
+        {
+            sqlite_runtime::update_turn_record(&active.turn_id, |record| {
+                if record.status.is_active() {
+                    record.status = TurnStatus::Failed;
+                    record.failure_reason = Some(reason.to_string());
+                    record.touch();
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// Full production-faithful write: user msg → pipeline → preaccept draft →
     /// fixed production postprocess → SQLite Accept.
     pub async fn write_accept_turn(
@@ -280,6 +296,12 @@ impl SqliteHarnessEnv {
         let campaign_id = self
             .active_campaign_id()
             .ok_or_else(|| "active campaign required".to_string())?;
+
+        // Fail-closed retries must not leave a Generating turn blocking the next attempt.
+        self.fail_active_turn_if_any(
+            &campaign_id,
+            "superseded by sqlite endurance write retry/setup",
+        )?;
 
         let input_node_id = self
             .conv_store
@@ -429,19 +451,10 @@ impl SqliteHarnessEnv {
             .active_campaign_id()
             .ok_or_else(|| "active campaign required".to_string())?;
 
-        // Close any leftover active turn so the new Generating turn is exclusive.
-        if let Some(active) = sqlite_runtime::get_active_turn(&campaign_id)?
-            && active.status.is_active()
-        {
-            sqlite_runtime::update_turn_record(&active.turn_id, |record| {
-                if record.status.is_active() {
-                    record.status = TurnStatus::Failed;
-                    record.failure_reason =
-                        Some("superseded by sqlite endurance regenerate setup".into());
-                    record.touch();
-                }
-            })?;
-        }
+        self.fail_active_turn_if_any(
+            &campaign_id,
+            "superseded by sqlite endurance regenerate setup",
+        )?;
 
         let input_node_id = self
             .conv_store

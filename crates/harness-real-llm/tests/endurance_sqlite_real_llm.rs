@@ -342,6 +342,7 @@ async fn run_sqlite_endurance_stage(
                     let transient = err.contains("PlanParse")
                         || err.contains("Plan 解析")
                         || err.contains("未找到有效 Plan")
+                        || err.contains("already has active turn")
                         || err.contains("timeout")
                         || err.contains("Timeout")
                         || err.contains("520")
