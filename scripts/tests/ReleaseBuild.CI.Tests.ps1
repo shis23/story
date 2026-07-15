@@ -286,6 +286,35 @@ Describe 'ReleaseBuild workflow YAML validation' {
         }
     }
 
+    It 'rejects a YAML 1.1 boolean key masquerading as the workflow trigger' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-boolean-on-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'boolean-key.yml'
+            # PyYAML's YAML 1.1 resolver parses this unquoted key as Boolean
+            # True. A Gitea workflow still needs an explicit source-level `on:`
+            # key, rather than a semantically unrelated Boolean key.
+            @(
+                'name: test'
+                'true: [push]'
+                'jobs:'
+                '  build:'
+                '    runs-on: ubuntu-latest'
+                '    steps:'
+                '      - run: echo hello'
+            ) | Set-Content -LiteralPath $wf -Encoding utf8
+            $result = Test-ReleaseWorkflowSyntax -Path $wf
+            $result.Valid | Should Be $false
+            if ($result.Engine -eq 'none') {
+                ($result.Errors -join ' ') | Should Match 'No real YAML parser'
+            } else {
+                ($result.Errors -join ' ') | Should Match 'explicit top-level.*on|Missing top-level.*on'
+            }
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'detects invalid YAML syntax with a real parser (not structural-only)' {
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-bad-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $dir | Out-Null
@@ -369,6 +398,7 @@ exports.parse = function (text) {
 {
   "node_only_marker": "valid",
   "name": "node-only-valid",
+  "on": "push",
   "jobs": { "build": { "runs-on": "windows-latest" } }
 }
 '@ | Set-Content -LiteralPath $workflow -Encoding utf8

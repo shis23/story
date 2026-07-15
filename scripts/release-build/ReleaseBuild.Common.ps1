@@ -1792,8 +1792,8 @@ function Test-ReleaseWorkflowSyntaxPowerShell {
     if ($text -notmatch '(?m)^jobs\s*:') {
         $errors.Add("Missing top-level 'jobs:' mapping")
     }
-    if ($text -notmatch '(?m)^(on|name)\s*:') {
-        $errors.Add("Missing top-level 'on:' or 'name:' key")
+    if ($text -notmatch '(?m)^(?:\uFEFF)?(?:on|["'']on["''])\s*:') {
+        $errors.Add("Missing explicit top-level 'on:' key")
     }
     if ($text -match '(?m)^\t') {
         $errors.Add('Tab indentation is not allowed in YAML')
@@ -1814,7 +1814,7 @@ function Test-ReleaseWorkflowSyntaxWithPyYaml {
     )
 
     $pyScript = @'
-import sys, json
+import sys, json, re
 try:
     import yaml
 except ImportError:
@@ -1823,9 +1823,56 @@ except ImportError:
 
 path = sys.argv[1]
 errors = []
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+def construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "YAML merge keys are not allowed in workflow files", key_node.start_mark
+            )
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "found duplicate key: {0}".format(key), key_node.start_mark
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping
+)
 try:
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        source = f.read()
+    def has_explicit_root_on_key(text):
+        root_indent = None
+        for raw_line in text.splitlines():
+            line = raw_line.lstrip("\ufeff")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped in ("---", "{", "}"):
+                continue
+            key_match = re.match(r"^([ \t]*)(?:\"[^\"\r\n]+\"|'[^'\r\n]+'|[A-Za-z_][A-Za-z0-9_-]*)[ \t]*:", line)
+            if not key_match:
+                continue
+            if root_indent is None:
+                root_indent = key_match.group(1)
+            on_match = re.match(r"^([ \t]*)(?:on|[\"']on[\"'])[ \t]*:", line)
+            if on_match and root_indent == on_match.group(1):
+                return True
+        return False
+    # PyYAML parses YAML 1.1's unquoted `on` as Boolean True. Require the
+    # source-level trigger spelling so a `true:` mapping key cannot impersonate
+    # a runnable Gitea workflow.
+    has_explicit_on_key = has_explicit_root_on_key(source)
+    if re.search(r"(?m)^[ \t]*<<[ \t]*:", source):
+        raise ValueError("YAML merge keys are not allowed in workflow files")
+    if re.search(r"(?:^|[ \t,:\[{])(?:&|\*)[A-Za-z0-9_-]+", source):
+        raise ValueError("YAML anchors and aliases are not allowed in workflow files")
+    data = yaml.load(source, Loader=UniqueKeySafeLoader)
     if data is None:
         errors.append("Workflow file is empty or parsed to null")
     elif not isinstance(data, dict):
@@ -1834,8 +1881,8 @@ try:
         jobs = data.get("jobs")
         if not isinstance(jobs, dict):
             errors.append("Top-level 'jobs' must be a mapping after YAML parse")
-        if "on" not in data and "name" not in data:
-            errors.append("Missing top-level 'on' or 'name' after YAML parse")
+        if not has_explicit_on_key:
+            errors.append("Missing explicit top-level 'on:' workflow trigger key")
 except yaml.YAMLError as exc:
     msg = str(exc).replace("\n", " ")
     errors.append("YAML parse error: " + msg[:500])
@@ -1903,6 +1950,20 @@ function fail(msg) {
   process.stdout.write(JSON.stringify({ valid: false, error_count: 1, errors: [msg], engine: "node-yaml" }));
   process.exit(0);
 }
+function hasExplicitRootOnKey(text) {
+  let rootIndent = null;
+  for (let line of text.split(/\r?\n/)) {
+    line = line.replace(/^\uFEFF/, "");
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed === "---" || trimmed === "{" || trimmed === "}") continue;
+    const key = /^([ \t]*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z_][A-Za-z0-9_-]*)[ \t]*:/.exec(line);
+    if (!key) continue;
+    if (rootIndent === null) rootIndent = key[1];
+    const on = /^([ \t]*)(?:on|["']on["'])[ \t]*:/.exec(line);
+    if (on && rootIndent === on[1]) return true;
+  }
+  return false;
+}
 let yaml;
 try {
   yaml = require("yaml");
@@ -1915,6 +1976,11 @@ try {
 }
 try {
   const text = fs.readFileSync(path, "utf8");
+  // A parser may treat YAML 1.1 `on` as Boolean true. The workflow source must
+  // still spell the root trigger key explicitly; `true:` is not a trigger.
+  const hasExplicitOnKey = hasExplicitRootOnKey(text);
+  if (/(^|\n)[ \t]*<<[ \t]*:/.test(text)) throw new Error("YAML merge keys are not allowed in workflow files");
+  if (/(^|[ \t,:\[{])(?:&|\*)[A-Za-z0-9_-]+/.test(text)) throw new Error("YAML anchors and aliases are not allowed in workflow files");
   const data = yaml.load ? yaml.load(text) : yaml.parse(text);
   const errors = [];
   if (data == null) errors.push("Workflow file is empty or parsed to null");
@@ -1923,8 +1989,8 @@ try {
     if (!data.jobs || typeof data.jobs !== "object" || Array.isArray(data.jobs)) {
       errors.push("Top-level 'jobs' must be a mapping after YAML parse");
     }
-    if (!Object.prototype.hasOwnProperty.call(data, "on") && !Object.prototype.hasOwnProperty.call(data, "name")) {
-      errors.push("Missing top-level 'on' or 'name' after YAML parse");
+    if (!hasExplicitOnKey) {
+      errors.push("Missing explicit top-level 'on:' workflow trigger key");
     }
   }
   process.stdout.write(JSON.stringify({ valid: errors.length === 0, error_count: errors.length, errors, engine: "node-yaml" }));
@@ -2906,11 +2972,23 @@ function Test-ReleaseRunInvokesCommand {
         )
     }
 
+    function Test-PipelineRunsInBackground {
+        param([Parameter(Mandatory = $true)]$Pipeline)
+        return (($Pipeline.PSObject.Properties.Name -contains 'Background') -and [bool]$Pipeline.Background)
+    }
+
     function Test-AssignmentIsWantedCommand {
         param(
             [Parameter(Mandatory = $true)]$Assignment,
             [Parameter(Mandatory = $true)][string]$WantedName
         )
+        if ($Assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+            return $false
+        }
+        if ($Assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+            -not [string]::Equals([string]$Assignment.Left.VariablePath.UserPath, 'result', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
         $rhs = $Assignment.Right
         if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) {
             # PowerShell wraps assignment RHS expressions; pipeline RHS is nested.
@@ -2921,6 +2999,9 @@ function Test-ReleaseRunInvokesCommand {
             }
         }
         if ($rhs -isnot [System.Management.Automation.Language.PipelineAst]) {
+            return $false
+        }
+        if (Test-PipelineRunsInBackground -Pipeline $rhs) {
             return $false
         }
         $elements = @($rhs.PipelineElements)
@@ -2954,6 +3035,9 @@ function Test-ReleaseRunInvokesCommand {
 
         # Pipeline statement: command1 | command2 ...  (single-command only)
         if ($stmt -is [System.Management.Automation.Language.PipelineAst]) {
+            if (Test-PipelineRunsInBackground -Pipeline $stmt) {
+                return $false
+            }
             $elements = @($stmt.PipelineElements)
             if ($elements.Count -ne 1) {
                 # Multi-command pipelines are not a guaranteed standalone verifier call.
@@ -3047,7 +3131,7 @@ function Test-ReleaseVerifierStepScriptContract {
     $errs = New-Object System.Collections.Generic.List[string]
     $evidenceExpr = $null
     $requiredEvidenceLiteral = '${{ steps.evidence.outputs.dir }}'
-    $requiredDotSourceSuffix = 'scripts/release-build/ReleaseBuild.Common.ps1'
+    $requiredDotSourceRelativePath = 'scripts/release-build/ReleaseBuild.Common.ps1'
     $wanted = 'Assert-ReleaseEvidencePackage'
 
     if ([string]::IsNullOrWhiteSpace($ScriptText)) {
@@ -3076,6 +3160,22 @@ function Test-ReleaseVerifierStepScriptContract {
     )
     if ($null -eq $ast -or ($null -ne $parseErrors -and @($parseErrors).Count -gt 0)) {
         $errs.Add('verifier run script failed PowerShell parse') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            Errors = @($errs)
+            EvidenceDirExpression = $null
+        }
+    }
+
+    $usingStatements = @($ast.UsingStatements | Where-Object { $null -ne $_ })
+    if ($usingStatements.Count -gt 0 -or
+        $null -ne $ast.ScriptRequirements -or
+        $null -ne $ast.ParamBlock -or
+        $null -ne $ast.DynamicParamBlock -or
+        $null -ne $ast.BeginBlock -or
+        $null -ne $ast.ProcessBlock -or
+        (($ast.PSObject.Properties.Name -contains 'CleanBlock') -and $null -ne $ast.CleanBlock)) {
+        $errs.Add('verifier run must use a bare EndBlock only; using/requires/param and named-block preambles are not allowed') | Out-Null
         return [pscustomobject]@{
             Valid = $false
             Errors = @($errs)
@@ -3122,66 +3222,83 @@ function Test-ReleaseVerifierStepScriptContract {
         if ($CommandAst.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Dot) {
             return $false
         }
-        if ($null -eq $CommandAst.CommandElements -or $CommandAst.CommandElements.Count -lt 1) {
+        if (@($CommandAst.Redirections | Where-Object { $null -ne $_ }).Count -gt 0) {
+            return $false
+        }
+        if ($null -eq $CommandAst.CommandElements -or $CommandAst.CommandElements.Count -ne 1) {
             return $false
         }
         $first = $CommandAst.CommandElements[0]
-        $pathText = $null
-        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-            $pathText = [string]$first.Value
-        } else {
-            $pathText = [string]$first.Extent.Text.Trim().Trim("'`"")
+        if ($first -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            return $false
         }
+        $pathText = [string]$first.Value
         if ([string]::IsNullOrWhiteSpace($pathText)) {
             return $false
         }
         $norm = ($pathText -replace '\\', '/').Trim()
-        return $norm.EndsWith($requiredDotSourceSuffix, [System.StringComparison]::OrdinalIgnoreCase)
+        while ($norm.StartsWith('./', [System.StringComparison]::Ordinal)) {
+            $norm = $norm.Substring(2)
+        }
+        # A suffix check would trust e.g. .\\evil\\scripts\\release-build\\ReleaseBuild.Common.ps1.
+        # The controlled verifier may source exactly one repository-relative common script.
+        return [string]::Equals($norm, $requiredDotSourceRelativePath, [System.StringComparison]::OrdinalIgnoreCase)
     }
 
     function Get-EvidenceDirArgExpression {
         param([Parameter(Mandatory = $true)]$CommandAst)
         $elements = @($CommandAst.CommandElements)
-        for ($i = 0; $i -lt $elements.Count; $i++) {
-            $el = $elements[$i]
-            if ($el -isnot [System.Management.Automation.Language.CommandParameterAst]) {
-                continue
-            }
-            $paramName = [string]$el.ParameterName
-            if (-not [string]::Equals($paramName, 'EvidenceDir', [System.StringComparison]::OrdinalIgnoreCase)) {
-                continue
-            }
-            if ($i + 1 -ge $elements.Count) {
-                return [pscustomobject]@{ Kind = 'missing-arg'; Expression = $null }
-            }
-            $arg = $elements[$i + 1]
-            if ($arg -is [System.Management.Automation.Language.VariableExpressionAst]) {
-                return [pscustomobject]@{
-                    Kind = 'variable'
-                    Expression = [string]$arg.VariablePath.UserPath
-                }
-            }
-            $lit = Get-StringConstantValue -Node $arg
-            if ($null -ne $lit) {
-                return [pscustomobject]@{
-                    Kind = 'literal'
-                    Expression = $lit
-                }
-            }
+        # Whitelist the whole invocation rather than hunting only for dangerous
+        # parameters. Command arguments are executable PowerShell expressions, so
+        # an extra -Verbose:$(...) can mutate evidence or replace the command before
+        # normal parameter binding happens.
+        if ($elements.Count -ne 3) {
+            return [pscustomobject]@{ Kind = 'invalid-grammar'; Expression = $null }
+        }
+        if (@($CommandAst.Redirections | Where-Object { $null -ne $_ }).Count -gt 0) {
+            return [pscustomobject]@{ Kind = 'invalid-grammar'; Expression = $null }
+        }
+        $commandName = Get-CommandNameFromAstLocal -CommandAst $CommandAst
+        if ($null -eq $commandName -or
+            -not [string]::Equals($commandName, 'Assert-ReleaseEvidencePackage', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Kind = 'invalid-grammar'; Expression = $null }
+        }
+        $parameter = $elements[1]
+        if ($parameter -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+            -not [string]::Equals([string]$parameter.ParameterName, 'EvidenceDir', [System.StringComparison]::OrdinalIgnoreCase) -or
+            $null -ne $parameter.Argument) {
+            return [pscustomobject]@{ Kind = 'invalid-grammar'; Expression = $null }
+        }
+        $arg = $elements[2]
+        if ($arg -is [System.Management.Automation.Language.VariableExpressionAst]) {
             return [pscustomobject]@{
-                Kind = 'unsupported'
-                Expression = [string]$arg.Extent.Text
+                Kind = 'variable'
+                Expression = [string]$arg.VariablePath.UserPath
             }
         }
-        return [pscustomobject]@{ Kind = 'missing-param'; Expression = $null }
+        if ($arg -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            return [pscustomobject]@{
+                Kind = 'literal'
+                Expression = [string]$arg.Value
+            }
+        }
+        return [pscustomobject]@{
+            Kind = 'unsupported'
+            Expression = [string]$arg.Extent.Text
+        }
     }
 
     function Test-CommandHasAllowDryRun {
         param([Parameter(Mandatory = $true)]$CommandAst)
         foreach ($el in @($CommandAst.CommandElements)) {
-            if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and
-                [string]::Equals([string]$el.ParameterName, 'AllowDryRun', [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $true
+            if ($el -is [System.Management.Automation.Language.CommandParameterAst]) {
+                $parameterName = [string]$el.ParameterName
+                # PowerShell resolves unambiguous parameter prefixes at runtime, so
+                # -AllowD is just as dangerous as the full -AllowDryRun switch here.
+                if (-not [string]::IsNullOrWhiteSpace($parameterName) -and
+                    'AllowDryRun'.StartsWith($parameterName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $true
+                }
             }
         }
         return $false
@@ -3205,8 +3322,8 @@ function Test-ReleaseVerifierStepScriptContract {
             } else {
                 $localErrs.Add(("EvidenceDir variable `${0} is not bound to steps.evidence.outputs.dir before Assert" -f $vn)) | Out-Null
             }
-        } elseif ($argInfo.Kind -eq 'missing-param' -or $argInfo.Kind -eq 'missing-arg') {
-            $localErrs.Add('Assert-ReleaseEvidencePackage is missing a bound -EvidenceDir argument') | Out-Null
+        } elseif ($argInfo.Kind -eq 'invalid-grammar') {
+            $localErrs.Add('Assert-ReleaseEvidencePackage must use the exact grammar: -EvidenceDir followed by one literal or simple variable argument') | Out-Null
         } else {
             $localErrs.Add('Assert-ReleaseEvidencePackage -EvidenceDir must be a constant or simple variable bound to steps.evidence.outputs.dir') | Out-Null
         }
@@ -3218,21 +3335,46 @@ function Test-ReleaseVerifierStepScriptContract {
     }
 
     $varBindings = @{}
-    $sawRequiredDotSource = $false
+    $requiredDotSourceCount = 0
+    $dotSourceCount = 0
+    $requiredDotSourceIndex = -1
     $sawWanted = $false
+    $wantedStatementIndex = -1
     $allowDryRunSeen = $false
+    $statementIndex = -1
 
     foreach ($stmt in @($root.Statements)) {
         if ($null -eq $stmt) { continue }
+        $statementIndex += 1
+
+        # The offline verifier must be the terminal executable operation in its
+        # step. Even apparently benign logging can contain subexpressions which
+        # mutate the already-verified evidence before the following upload.
+        if ($sawWanted) {
+            $errs.Add('verifier run must contain no statements after Assert-ReleaseEvidencePackage') | Out-Null
+            continue
+        }
 
         if ($stmt -is [System.Management.Automation.Language.AssignmentStatementAst]) {
             $leftName = $null
+            $isSimpleLocalAssignmentTarget = $false
             if ($stmt.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
                 $leftName = [string]$stmt.Left.VariablePath.UserPath
+                $isSimpleLocalAssignmentTarget = ($leftName -match '^[A-Za-z_][A-Za-z0-9_]*$')
+            }
+            if ($null -ne $leftName -and -not $isSimpleLocalAssignmentTarget) {
+                $errs.Add('verifier setup assignments must target an unqualified simple local variable (no provider, scope, or drive)') | Out-Null
             }
             $rhsLit = Get-StringConstantValue -Node $stmt.Right
-            if ($null -ne $leftName -and $null -ne $rhsLit) {
+            $isWantedAssignment = $false
+            if ($isSimpleLocalAssignmentTarget -and
+                $stmt.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+                $null -ne $rhsLit) {
                 $varBindings[$leftName] = $rhsLit
+            } elseif ($isSimpleLocalAssignmentTarget) {
+                # A non-literal (or compound) rebind must invalidate a prior trusted
+                # literal binding rather than leaving stale provenance in the map.
+                [void]$varBindings.Remove($leftName)
             }
 
             $rhs = $stmt.Right
@@ -3245,13 +3387,28 @@ function Test-ReleaseVerifierStepScriptContract {
                 if ($els.Count -eq 1 -and $els[0] -is [System.Management.Automation.Language.CommandAst]) {
                     $cmd = $els[0]
                     $name = Get-CommandNameFromAstLocal -CommandAst $cmd
-                    if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if ($stmt.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+                        $isSimpleLocalAssignmentTarget -and
+                        [string]::Equals($leftName, 'result', [System.StringComparison]::OrdinalIgnoreCase) -and
+                        $null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $isWantedAssignment = $true
                         $sawWanted = $true
+                        if ($wantedStatementIndex -lt 0) { $wantedStatementIndex = $statementIndex }
                         $binding = Resolve-WantedCommandBinding -CommandAst $cmd -VarMap $varBindings
                         if ($binding.AllowDryRun) { $allowDryRunSeen = $true }
                         if ($null -ne $binding.EvidenceDirExpression) { $evidenceExpr = [string]$binding.EvidenceDirExpression }
                         foreach ($be in @($binding.Errors)) { $errs.Add([string]$be) | Out-Null }
                     }
+                }
+            }
+            if (-not $isWantedAssignment) {
+                if ($null -eq $leftName) {
+                    $errs.Add('verifier setup assignments must target a simple variable') | Out-Null
+                } elseif (-not $isSimpleLocalAssignmentTarget) {
+                    # The qualified target has already been reported above; never
+                    # treat provider/scope state as a trusted variable binding.
+                } elseif ($null -eq $rhsLit) {
+                    $errs.Add('verifier setup assignments must be simple string literals; command-bearing or dynamic setup is not allowed') | Out-Null
                 }
             }
             continue
@@ -3263,26 +3420,39 @@ function Test-ReleaseVerifierStepScriptContract {
                 continue
             }
             $cmd = $els[0]
-            if (Test-IsRequiredCommonDotSource -CommandAst $cmd) {
-                $sawRequiredDotSource = $true
+            if ($cmd.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot) {
+                $dotSourceCount += 1
+                if (Test-IsRequiredCommonDotSource -CommandAst $cmd) {
+                    $requiredDotSourceCount += 1
+                    if ($requiredDotSourceIndex -lt 0) { $requiredDotSourceIndex = $statementIndex }
+                } else {
+                    $errs.Add('verifier run may dot-source only the exact scripts/release-build/ReleaseBuild.Common.ps1 path') | Out-Null
+                }
                 continue
             }
             $name = Get-CommandNameFromAstLocal -CommandAst $cmd
             if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $sawWanted = $true
+                if ($wantedStatementIndex -lt 0) { $wantedStatementIndex = $statementIndex }
                 $binding = Resolve-WantedCommandBinding -CommandAst $cmd -VarMap $varBindings
                 if ($binding.AllowDryRun) { $allowDryRunSeen = $true }
                 if ($null -ne $binding.EvidenceDirExpression) { $evidenceExpr = [string]$binding.EvidenceDirExpression }
                 foreach ($be in @($binding.Errors)) { $errs.Add([string]$be) | Out-Null }
+                continue
             }
+            continue
         }
     }
 
-    if (-not $sawRequiredDotSource) {
+    if ($dotSourceCount -eq 0) {
         $errs.Add('verifier run must dot-source scripts/release-build/ReleaseBuild.Common.ps1 before Assert') | Out-Null
+    } elseif ($dotSourceCount -ne 1 -or $requiredDotSourceCount -ne 1) {
+        $errs.Add('verifier run must dot-source only one exact scripts/release-build/ReleaseBuild.Common.ps1 path') | Out-Null
     }
     if (-not $sawWanted) {
         $errs.Add('missing Assert-ReleaseEvidencePackage CommandAst after flat-script walk') | Out-Null
+    } elseif ($requiredDotSourceIndex -lt 0 -or $requiredDotSourceIndex -ge $wantedStatementIndex) {
+        $errs.Add('verifier run must dot-source scripts/release-build/ReleaseBuild.Common.ps1 before Assert') | Out-Null
     }
     if ($allowDryRunSeen) {
         $errs.Add('verifier run must not pass -AllowDryRun (host evidence is not dry-run)') | Out-Null
@@ -3300,6 +3470,874 @@ function Test-ReleaseVerifierStepScriptContract {
     }
 }
 
+function Get-ReleasePowerShellRunAst {
+    <#
+    .SYNOPSIS
+    Parses a workflow run block as PowerShell without treating its text as evidence
+    that a command actually executes.
+
+    .DESCRIPTION
+    A here-string, comment, or quoted literal may contain a command-looking string.
+    Callers therefore consume CommandAst nodes from this helper rather than matching
+    raw run text. Parse errors deliberately yield Valid=false.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $ScriptText,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($null -eq $ast -or ($null -ne $parseErrors -and @($parseErrors).Count -gt 0)) {
+        return [pscustomobject]@{ Valid = $false; Ast = $null; TopLevelCommands = @(); AllCommands = @() }
+    }
+
+    $topLevel = New-Object System.Collections.Generic.List[object]
+    $endBlock = $ast.EndBlock
+    if ($null -ne $endBlock -and $null -ne $endBlock.Statements) {
+        foreach ($statement in @($endBlock.Statements)) {
+            if ($statement -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+            if (($statement.PSObject.Properties.Name -contains 'Background') -and [bool]$statement.Background) { continue }
+            $elements = @($statement.PipelineElements)
+            if ($elements.Count -eq 1 -and $elements[0] -is [System.Management.Automation.Language.CommandAst]) {
+                $topLevel.Add($elements[0]) | Out-Null
+            }
+        }
+    }
+    $all = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+    $topLevelArray = [object[]]$topLevel.ToArray()
+    $allArray = [object[]]$all
+    return [pscustomobject]@{
+        Valid = $true
+        Ast = $ast
+        TopLevelCommands = $topLevelArray
+        AllCommands = $allArray
+    }
+}
+
+function Test-ReleasePowerShellAstHasBareEndBlock {
+    <#
+    .SYNOPSIS
+    Rejects parse-time and named-block preambles before evaluating a restricted
+    workflow `run` grammar.
+
+    .DESCRIPTION
+    `using module`, `#requires`, and a param/begin/process/clean block can load
+    or run code before an otherwise command-shaped gate or producer. A flat
+    EndBlock command check alone therefore cannot prove that the checked-in
+    command is the first executable behavior.
+    #>
+    param([Parameter(Mandatory = $true)]$Ast)
+
+    if ($null -eq $Ast -or $null -eq $Ast.EndBlock) { return $false }
+    if (($Ast.PSObject.Properties.Name -contains 'UsingStatements') -and
+        @($Ast.UsingStatements | Where-Object { $null -ne $_ }).Count -gt 0) {
+        return $false
+    }
+    if (($Ast.PSObject.Properties.Name -contains 'ScriptRequirements') -and $null -ne $Ast.ScriptRequirements) {
+        return $false
+    }
+    foreach ($propertyName in @('ParamBlock', 'DynamicParamBlock', 'BeginBlock', 'ProcessBlock', 'CleanBlock')) {
+        if (($Ast.PSObject.Properties.Name -contains $propertyName) -and $null -ne $Ast.$propertyName) {
+            return $false
+        }
+    }
+    $definitions = @($Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.TypeDefinitionAst] -or
+                [string]::Equals($node.GetType().Name, 'ConfigurationDefinitionAst', [System.StringComparison]::Ordinal)
+            }, $true))
+    return ($definitions.Count -eq 0)
+}
+
+function Get-ReleaseCommandFirstString {
+    param([Parameter(Mandatory = $true)]$CommandAst)
+    $elements = @($CommandAst.CommandElements)
+    if ($elements.Count -eq 0) { return $null }
+    if ($elements[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return [string]$elements[0].Value
+    }
+    return $null
+}
+
+function Test-ReleaseCommandHasParameter {
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ParameterName
+    )
+    foreach ($element in @($CommandAst.CommandElements)) {
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            [string]::Equals([string]$element.ParameterName, $ParameterName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ReleaseCommandHasFileArgument {
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath
+    )
+    $expected = ($ExpectedRelativePath -replace '\\', '/').Trim()
+    $elements = @($CommandAst.CommandElements)
+    for ($i = 0; $i -lt ($elements.Count - 1); $i += 1) {
+        $parameter = $elements[$i]
+        if ($parameter -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+            -not [string]::Equals([string]$parameter.ParameterName, 'File', [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $value = $elements[$i + 1]
+        if ($value -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+        $actual = ([string]$value.Value -replace '\\', '/').Trim()
+        while ($actual.StartsWith('./', [System.StringComparison]::Ordinal)) {
+            $actual = $actual.Substring(2)
+        }
+        if ([string]::Equals($actual, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ReleaseCommandHasBareSwitchParameter {
+    <#
+    .SYNOPSIS
+    Requires exactly one bare switch parameter, not merely a parameter-shaped
+    token whose explicit value can disable the requested behavior.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ParameterName
+    )
+
+    $elements = @($CommandAst.CommandElements)
+    $matches = @()
+    for ($i = 0; $i -lt $elements.Count; $i += 1) {
+        $element = $elements[$i]
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            [string]::Equals([string]$element.ParameterName, $ParameterName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $matches += [pscustomobject]@{ Parameter = $element; Index = $i }
+        }
+    }
+    if ($matches.Count -ne 1) { return $false }
+
+    $match = $matches[0]
+    if (-not [string]::IsNullOrEmpty([string]$match.Parameter.Argument)) { return $false }
+    # `-Switch $false` is also an explicit false switch value even though the
+    # AST stores it as the next command element rather than Parameter.Argument.
+    if (($match.Index + 1) -lt $elements.Count -and
+        $elements[$match.Index + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+        return $false
+    }
+    return $true
+}
+
+function Test-ReleaseCommandHasExactVariableParameterValue {
+    <#
+    .SYNOPSIS
+    Requires one `-Parameter $variable` pair with no inline/dynamic value.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ParameterName,
+        [Parameter(Mandatory = $true)][string]$VariableName
+    )
+
+    $elements = @($CommandAst.CommandElements)
+    $parameterIndexes = @()
+    for ($i = 0; $i -lt $elements.Count; $i += 1) {
+        $element = $elements[$i]
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            [string]::Equals([string]$element.ParameterName, $ParameterName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $parameterIndexes += $i
+        }
+    }
+    if ($parameterIndexes.Count -ne 1) { return $false }
+    $index = [int]$parameterIndexes[0]
+    $parameter = $elements[$index]
+    if (-not [string]::IsNullOrEmpty([string]$parameter.Argument) -or ($index + 1) -ge $elements.Count) {
+        return $false
+    }
+    $value = $elements[$index + 1]
+    return ($value -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        [string]::Equals([string]$value.VariablePath.UserPath, $VariableName, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-ReleasePowerShellFileInvocationShape {
+    <#
+    .SYNOPSIS
+    Verifies that a CommandAst really launches a fixed script via pwsh -File.
+
+    .DESCRIPTION
+    `pwsh -Command ... -File script.ps1` and `-EncodedCommand ... -File` are
+    not trusted as file invocations: the earlier launcher mode can prevent the
+    intended script from running. Required switches must be bare, so
+    `-SecretScanOnly:$false` cannot masquerade as a scan.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath,
+        [string]$RequiredBareSwitch,
+        [switch]$RequireNoProfile
+    )
+
+    $first = Get-ReleaseCommandFirstString -CommandAst $CommandAst
+    if ($null -eq $first -or
+        -not (@('pwsh', 'pwsh.exe', 'powershell', 'powershell.exe') -contains $first.Trim().ToLowerInvariant())) {
+        return $false
+    }
+
+    $elements = @($CommandAst.CommandElements)
+    $fileIndexes = @()
+    $noProfileIndexes = @()
+    for ($i = 1; $i -lt $elements.Count; $i += 1) {
+        $element = $elements[$i]
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+        $name = ([string]$element.ParameterName).Trim().ToLowerInvariant()
+        if ($name -eq 'noprofile') {
+            if (-not [string]::IsNullOrEmpty([string]$element.Argument)) { return $false }
+            $noProfileIndexes += $i
+        }
+        if ($name -eq 'file') { $fileIndexes += $i }
+    }
+    if ($fileIndexes.Count -ne 1) { return $false }
+
+    $fileIndex = [int]$fileIndexes[0]
+    # Treat the launcher prefix as a closed grammar. PowerShell accepts
+    # abbreviated host switches (`-Co`, `-Enc`) and `-WorkingDirectory`; any
+    # such token before -File can prevent the repository-relative script from
+    # being the program that actually executes. Production only needs bare
+    # -NoProfile before one literal -File.
+    $preFileNoProfileCount = 0
+    for ($i = 1; $i -lt $fileIndex; $i += 1) {
+        $element = $elements[$i]
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+            -not [string]::Equals([string]$element.ParameterName, 'NoProfile', [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::IsNullOrEmpty([string]$element.Argument)) {
+            return $false
+        }
+        $preFileNoProfileCount += 1
+    }
+    if ($RequireNoProfile -and $preFileNoProfileCount -ne 1) { return $false }
+    $fileParameter = $elements[$fileIndex]
+    if (-not [string]::IsNullOrEmpty([string]$fileParameter.Argument) -or ($fileIndex + 1) -ge $elements.Count) {
+        return $false
+    }
+    $fileValue = $elements[$fileIndex + 1]
+    if ($fileValue -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+    $actualPath = ([string]$fileValue.Value -replace '\\', '/').Trim()
+    while ($actualPath.StartsWith('./', [System.StringComparison]::Ordinal)) {
+        $actualPath = $actualPath.Substring(2)
+    }
+    $expectedPath = ($ExpectedRelativePath -replace '\\', '/').Trim()
+    if (-not [string]::Equals($actualPath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RequiredBareSwitch) -and
+        -not (Test-ReleaseCommandHasBareSwitchParameter -CommandAst $CommandAst -ParameterName $RequiredBareSwitch)) {
+        return $false
+    }
+    return $true
+}
+
+function Test-ReleasePowerShellFileInvocationExactArguments {
+    <#
+    .SYNOPSIS
+    Requires a closed post-`-File` grammar for a repository-controlled host
+    script invocation.
+
+    .DESCRIPTION
+    A correct `pwsh -NoProfile -File scripts/x.ps1` prefix is insufficient if a
+    later workflow edit can append behavior-changing flags such as `-BuildApk`,
+    `-DryRun`, or an alternate output path. This helper permits only named bare
+    switches and named `$variable` values explicitly declared by the caller.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$CommandAst,
+        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath,
+        [string[]]$RequiredBareSwitches = @(),
+        [string[]]$AllowedBareSwitches = @(),
+        [hashtable]$RequiredVariableParameters = @{},
+        [switch]$RequireNoProfile
+    )
+
+    if (-not (Test-ReleasePowerShellFileInvocationShape `
+            -CommandAst $CommandAst `
+            -ExpectedRelativePath $ExpectedRelativePath `
+            -RequireNoProfile:$RequireNoProfile)) {
+        return $false
+    }
+
+    $elements = @($CommandAst.CommandElements)
+    $fileIndex = -1
+    for ($i = 1; $i -lt $elements.Count; $i += 1) {
+        $element = $elements[$i]
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and
+            [string]::Equals([string]$element.ParameterName, 'File', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $fileIndex = $i
+            break
+        }
+    }
+    if ($fileIndex -lt 0 -or ($fileIndex + 1) -ge $elements.Count) { return $false }
+
+    $allowedBare = @{}
+    foreach ($name in @($AllowedBareSwitches) + @($RequiredBareSwitches)) {
+        if ([string]::IsNullOrWhiteSpace([string]$name)) { return $false }
+        $allowedBare[([string]$name).Trim().ToLowerInvariant()] = $true
+    }
+    $requiredBare = @{}
+    foreach ($name in @($RequiredBareSwitches)) {
+        if ([string]::IsNullOrWhiteSpace([string]$name)) { return $false }
+        $requiredBare[([string]$name).Trim().ToLowerInvariant()] = $true
+    }
+    $expectedVariables = @{}
+    foreach ($key in @($RequiredVariableParameters.Keys)) {
+        if ([string]::IsNullOrWhiteSpace([string]$key) -or
+            [string]::IsNullOrWhiteSpace([string]$RequiredVariableParameters[$key])) {
+            return $false
+        }
+        $expectedVariables[([string]$key).Trim().ToLowerInvariant()] = [string]$RequiredVariableParameters[$key]
+    }
+
+    $seenBare = @{}
+    $seenVariables = @{}
+    $i = $fileIndex + 2
+    while ($i -lt $elements.Count) {
+        $parameter = $elements[$i]
+        if ($parameter -isnot [System.Management.Automation.Language.CommandParameterAst]) { return $false }
+        $parameterName = ([string]$parameter.ParameterName).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($parameterName) -or -not [string]::IsNullOrEmpty([string]$parameter.Argument)) {
+            return $false
+        }
+
+        if ($allowedBare.ContainsKey($parameterName)) {
+            if ($seenBare.ContainsKey($parameterName)) { return $false }
+            if (($i + 1) -lt $elements.Count -and
+                $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+                return $false
+            }
+            $seenBare[$parameterName] = $true
+            $i += 1
+            continue
+        }
+
+        if ($expectedVariables.ContainsKey($parameterName)) {
+            if ($seenVariables.ContainsKey($parameterName) -or ($i + 1) -ge $elements.Count) { return $false }
+            $value = $elements[$i + 1]
+            if ($value -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+                -not [string]::Equals([string]$value.VariablePath.UserPath, [string]$expectedVariables[$parameterName], [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+            $seenVariables[$parameterName] = $true
+            $i += 2
+            continue
+        }
+        return $false
+    }
+
+    foreach ($required in @($requiredBare.Keys)) {
+        if (-not $seenBare.ContainsKey($required)) { return $false }
+    }
+    foreach ($required in @($expectedVariables.Keys)) {
+        if (-not $seenVariables.ContainsKey($required)) { return $false }
+    }
+    return $true
+}
+
+function Get-ReleaseFlatSingleCommandAst {
+    <#
+    .SYNOPSIS
+    Returns a command only when a workflow run body is one flat foreground
+    command with no setup, fall-through, or exit-code-masking tail.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText)
+
+    $parsed = Get-ReleasePowerShellRunAst -ScriptText $ScriptText
+    if (-not $parsed.Valid -or $null -eq $parsed.Ast -or $null -eq $parsed.Ast.EndBlock) { return $null }
+    if (-not (Test-ReleasePowerShellAstHasBareEndBlock -Ast $parsed.Ast)) { return $null }
+    $statements = @($parsed.Ast.EndBlock.Statements)
+    if ($statements.Count -ne 1 -or $statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) {
+        return $null
+    }
+    $pipeline = $statements[0]
+    if (($pipeline.PSObject.Properties.Name -contains 'Background') -and [bool]$pipeline.Background) { return $null }
+    $elements = @($pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or $elements[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $null }
+    return $elements[0]
+}
+
+function Test-ReleaseExactNpmCiGateScript {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText)
+
+    $command = Get-ReleaseFlatSingleCommandAst -ScriptText $ScriptText
+    if ($null -eq $command) { return $false }
+    $elements = @($command.CommandElements)
+    if ($elements.Count -ne 2 -or
+        $elements[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        $elements[1] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return $false
+    }
+    return ((@('npm', 'npm.cmd') -contains ([string]$elements[0].Value).Trim().ToLowerInvariant()) -and
+        [string]::Equals([string]$elements[1].Value, 'ci', [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-ReleaseExactSecretScanGateScript {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText)
+
+    $command = Get-ReleaseFlatSingleCommandAst -ScriptText $ScriptText
+    if ($null -eq $command) { return $false }
+    return Test-ReleasePowerShellFileInvocationExactArguments `
+        -CommandAst $command `
+        -ExpectedRelativePath 'scripts/verify-release.ps1' `
+        -RequiredBareSwitches @('SecretScanOnly') `
+        -RequireNoProfile
+}
+
+function Test-ReleaseRunContainsPowerShellFileInvocation {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
+        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath,
+        [string]$RequiredParameter,
+        [switch]$TopLevelOnly
+    )
+    $parsed = Get-ReleasePowerShellRunAst -ScriptText $ScriptText
+    if (-not $parsed.Valid) { return $false }
+    $commands = if ($TopLevelOnly) { @($parsed.TopLevelCommands) } else { @($parsed.AllCommands) }
+    foreach ($command in $commands) {
+        if (Test-ReleasePowerShellFileInvocationShape `
+            -CommandAst $command `
+            -ExpectedRelativePath $ExpectedRelativePath `
+            -RequiredBareSwitch $RequiredParameter `
+            -RequireNoProfile) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ReleaseRunContainsTopLevelNpmCommand {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
+        [Parameter(Mandatory = $true)][ValidateSet('ci', 'install')][string]$Subcommand
+    )
+    $parsed = Get-ReleasePowerShellRunAst -ScriptText $ScriptText
+    if (-not $parsed.Valid) { return $false }
+    foreach ($command in @($parsed.TopLevelCommands)) {
+        $first = Get-ReleaseCommandFirstString -CommandAst $command
+        if ($null -eq $first -or -not (@('npm', 'npm.cmd') -contains $first.Trim().ToLowerInvariant())) { continue }
+        $elements = @($command.CommandElements)
+        if ($elements.Count -lt 2 -or $elements[1] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+        if ([string]::Equals([string]$elements[1].Value, $Subcommand, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ReleaseWindowsHostOnlyProducerScriptContract {
+    <#
+    .SYNOPSIS
+    Proves the Windows evidence producer takes the controlled host-only path by
+    default and for tag runs.
+
+    .DESCRIPTION
+    A raw `-SkipBundle` substring is not enough: it can live in an unreachable
+    branch while the default branch still builds a bundle. The controlled
+    producer deliberately has one narrow shape:
+
+      if ($skipBundleInput -eq 'false') {
+          pwsh ... run-release-build.ps1 -OutputDir $evidenceDir
+      } else {
+          pwsh ... run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+      }
+
+    `$skipBundleInput` is a literal data value loaded from a controlled step
+    environment variable, never an expression interpolated into PowerShell
+    source. Empty tag input and the workflow_dispatch default of `true`
+    therefore take the else branch. This helper rejects a branch reversal, an
+    arbitrary condition, switch arguments such as `-SkipBundle:$false`, extra
+    build invocations, and nested/control-flow decoys.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText)
+
+    $parsed = Get-ReleasePowerShellRunAst -ScriptText $ScriptText
+    if (-not $parsed.Valid) { return $false }
+    if (-not (Test-ReleasePowerShellAstHasBareEndBlock -Ast $parsed.Ast)) { return $false }
+
+    function Test-IsControlledWindowsBuildCommand {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        return Test-ReleasePowerShellFileInvocationExactArguments `
+            -CommandAst $CommandAst `
+            -ExpectedRelativePath 'scripts/run-release-build.ps1' `
+            -AllowedBareSwitches @('SkipBundle') `
+            -RequiredVariableParameters @{ OutputDir = 'evidenceDir' } `
+            -RequireNoProfile
+    }
+
+    function Test-CommandHasExactEvidenceOutputDir {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        return Test-ReleaseCommandHasExactVariableParameterValue `
+            -CommandAst $CommandAst `
+            -ParameterName 'OutputDir' `
+            -VariableName 'evidenceDir'
+    }
+
+    function Test-CommandHasRequiredBareSkipBundle {
+        param(
+            [Parameter(Mandatory = $true)]$CommandAst,
+            [Parameter(Mandatory = $true)][bool]$Required
+        )
+        $skipParameters = @($CommandAst.CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandParameterAst] -and
+                [string]::Equals([string]$_.ParameterName, 'SkipBundle', [System.StringComparison]::OrdinalIgnoreCase)
+            })
+        if (-not $Required) { return ($skipParameters.Count -eq 0) }
+        if ($skipParameters.Count -ne 1) { return $false }
+        # Only a bare switch is safe. `-SkipBundle:$false` would syntactically
+        # contain the parameter while disabling the host-only behavior.
+        return [string]::IsNullOrEmpty([string]$skipParameters[0].Argument)
+    }
+
+    function Get-ExactBuildCommandFromBranch {
+        param(
+            [Parameter(Mandatory = $true)]$StatementBlock,
+            [Parameter(Mandatory = $true)][bool]$RequireSkipBundle
+        )
+        if ($null -eq $StatementBlock) { return $null }
+        $statements = @($StatementBlock.Statements)
+        if ($statements.Count -ne 1) { return $null }
+        $statement = $statements[0]
+        if ($statement -isnot [System.Management.Automation.Language.PipelineAst] -or
+            (($statement.PSObject.Properties.Name -contains 'Background') -and [bool]$statement.Background)) {
+            return $null
+        }
+        $elements = @($statement.PipelineElements)
+        if ($elements.Count -ne 1 -or $elements[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+            return $null
+        }
+        $command = $elements[0]
+        $requiredBareSwitches = if ($RequireSkipBundle) { @('SkipBundle') } else { @() }
+        $allowedBareSwitches = if ($RequireSkipBundle) { @('SkipBundle') } else { @() }
+        if (-not (Test-ReleasePowerShellFileInvocationExactArguments `
+                -CommandAst $command `
+                -ExpectedRelativePath 'scripts/run-release-build.ps1' `
+                -RequiredBareSwitches $requiredBareSwitches `
+                -AllowedBareSwitches $allowedBareSwitches `
+                -RequiredVariableParameters @{ OutputDir = 'evidenceDir' } `
+                -RequireNoProfile)) {
+            return $null
+        }
+        return $command
+    }
+
+    $controlledBuildCommands = @($parsed.AllCommands | Where-Object {
+            Test-IsControlledWindowsBuildCommand -CommandAst $_
+        })
+    if ($controlledBuildCommands.Count -ne 2) { return $false }
+
+    $candidateIfs = @($parsed.Ast.FindAll({
+                param($node)
+                if ($node -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
+                foreach ($command in $controlledBuildCommands) {
+                    if ($command.Extent.StartOffset -ge $node.Extent.StartOffset -and
+                        $command.Extent.EndOffset -le $node.Extent.EndOffset) {
+                        return $true
+                    }
+                }
+                return $false
+            }, $true))
+    if ($candidateIfs.Count -ne 1) { return $false }
+
+    $candidate = $candidateIfs[0]
+    if (@($candidate.Clauses).Count -ne 1 -or $null -eq $candidate.ElseClause) { return $false }
+    $condition = ([string]$candidate.Clauses[0].Item1.Extent.Text -replace '\s+', '').ToLowerInvariant()
+    $expectedCondition = '$skipbundleinput-eq''false'''
+    if (-not [string]::Equals($condition, $expectedCondition, [System.StringComparison]::Ordinal)) { return $false }
+
+    $bundleBranch = Get-ExactBuildCommandFromBranch -StatementBlock $candidate.Clauses[0].Item2 -RequireSkipBundle $false
+    $hostOnlyBranch = Get-ExactBuildCommandFromBranch -StatementBlock $candidate.ElseClause -RequireSkipBundle $true
+    if ($null -eq $bundleBranch -or $null -eq $hostOnlyBranch) { return $false }
+
+    # Both and only both controlled invocations must belong to the recognized
+    # branch pair; otherwise a decoy branch can coexist with an extra bundle run.
+    foreach ($command in $controlledBuildCommands) {
+        if ($command.Extent.StartOffset -ne $bundleBranch.Extent.StartOffset -and
+            $command.Extent.StartOffset -ne $hostOnlyBranch.Extent.StartOffset) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-ReleaseEvidenceProducerScriptContract {
+    <#
+    .SYNOPSIS
+    Verifies the complete controlled producer body, not just that it happens to
+    mention a build helper.
+
+    .DESCRIPTION
+    The producer executes before the verifier and therefore cannot be allowed
+    to run arbitrary setup commands that rewrite the dot-sourced helper or
+    redirect evidence to a stale path. Its grammar is deliberately narrow:
+    read-only Join-Path/Test-Path checks, a fixed pwsh -File producer using
+    `-OutputDir $evidenceDir`, one controlled GUID-namespaced assignment, and
+    one exact `dir=$evidenceDir` write to GITHUB_OUTPUT. Any other command,
+    assignment, member invocation, rebind, or output mechanism fails closed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
+        [Parameter(Mandatory = $true)][ValidateSet('run-release-build.ps1', 'run-android-host-pipeline.ps1')][string]$ScriptLeafName,
+        [switch]$RequireWindowsHostOnly
+    )
+
+    $parsed = Get-ReleasePowerShellRunAst -ScriptText $ScriptText
+    if (-not $parsed.Valid -or $null -eq $parsed.Ast) { return $false }
+    if (-not (Test-ReleasePowerShellAstHasBareEndBlock -Ast $parsed.Ast)) { return $false }
+    $expectedRelativePath = "scripts/{0}" -f $ScriptLeafName
+    $prefix = if ($ScriptLeafName -eq 'run-release-build.ps1') { 'windows' } else { 'android' }
+
+    function Test-IsControlledProducerBuildCommand {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        $allowedBareSwitches = if ($RequireWindowsHostOnly) { @('SkipBundle') } else { @() }
+        return Test-ReleasePowerShellFileInvocationExactArguments `
+                -CommandAst $CommandAst `
+                -ExpectedRelativePath $expectedRelativePath `
+                -AllowedBareSwitches $allowedBareSwitches `
+                -RequiredVariableParameters @{ OutputDir = 'evidenceDir' } `
+                -RequireNoProfile
+    }
+
+    function Test-IsExactSingleThrowGuard {
+        param(
+            [Parameter(Mandatory = $true)]$IfAst,
+            [Parameter(Mandatory = $true)][string]$ExpectedCondition
+        )
+
+        if ($IfAst -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            @($IfAst.Clauses).Count -ne 1 -or $null -ne $IfAst.ElseClause) {
+            return $false
+        }
+        $condition = (([string]$IfAst.Clauses[0].Item1.Extent.Text -replace '\s+', '')).ToLowerInvariant()
+        if (-not [string]::Equals($condition, $ExpectedCondition.ToLowerInvariant(), [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+        $body = @($IfAst.Clauses[0].Item2.Statements)
+        return ($body.Count -eq 1 -and $body[0] -is [System.Management.Automation.Language.ThrowStatementAst])
+    }
+
+    $assignments = @($parsed.Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+            }, $true))
+    $expectedAssignmentCount = if ($RequireWindowsHostOnly) { 3 } else { 2 }
+    if ($assignments.Count -ne $expectedAssignmentCount) { return $false }
+    $seenErrorActionPreference = $false
+    $evidenceAssignment = $null
+    $skipBundleAssignment = $null
+    $expectedEvidenceRhs = ('Join-Path$PWD("artifacts\release-build\' + $prefix + '-gitea-"+[guid]::NewGuid().ToString(''N''))').ToLowerInvariant()
+    foreach ($assignment in $assignments) {
+        if ($assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or
+            $assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+            return $false
+        }
+        $variableName = [string]$assignment.Left.VariablePath.UserPath
+        if ([string]::Equals($variableName, 'ErrorActionPreference', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($seenErrorActionPreference -or -not [string]::Equals(([string]$assignment.Right.Extent.Text).Trim(), "'Stop'", [System.StringComparison]::Ordinal)) {
+                return $false
+            }
+            $seenErrorActionPreference = $true
+            continue
+        }
+        if ([string]::Equals($variableName, 'evidenceDir', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -ne $evidenceAssignment) { return $false }
+            $actualRhs = (([string]$assignment.Right.Extent.Text -replace '\s+', '').Replace('/', '\')).ToLowerInvariant()
+            if (-not [string]::Equals($actualRhs, $expectedEvidenceRhs, [System.StringComparison]::Ordinal)) {
+                return $false
+            }
+            $evidenceAssignment = $assignment
+            continue
+        }
+        if ([string]::Equals($variableName, 'skipBundleInput', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $RequireWindowsHostOnly -or $null -ne $skipBundleAssignment -or
+                -not [string]::Equals((([string]$assignment.Right.Extent.Text -replace '\s+', '')).ToLowerInvariant(), '[string]$env:sf_release_skip_bundle_input', [System.StringComparison]::Ordinal)) {
+                return $false
+            }
+            $skipBundleAssignment = $assignment
+            continue
+        }
+        return $false
+    }
+    if (-not $seenErrorActionPreference -or $null -eq $evidenceAssignment -or
+        ($RequireWindowsHostOnly -and $null -eq $skipBundleAssignment)) { return $false }
+
+    $allowedCommands = @('join-path', 'test-path', 'out-file', 'pwsh', 'pwsh.exe', 'powershell', 'powershell.exe')
+    $buildCommands = @()
+    $outFileCommands = @()
+    foreach ($command in @($parsed.AllCommands)) {
+        $name = Get-ReleaseCommandFirstString -CommandAst $command
+        if ($null -eq $name) { return $false }
+        $normalizedName = $name.Trim().ToLowerInvariant()
+        if ($allowedCommands -notcontains $normalizedName) { return $false }
+        if (@('pwsh', 'pwsh.exe', 'powershell', 'powershell.exe') -contains $normalizedName) {
+            if (-not (Test-IsControlledProducerBuildCommand -CommandAst $command)) { return $false }
+            $buildCommands += $command
+        }
+        if ($normalizedName -eq 'out-file') { $outFileCommands += $command }
+    }
+
+    $expectedBuildCount = if ($RequireWindowsHostOnly) { 2 } else { 1 }
+    if ($buildCommands.Count -ne $expectedBuildCount -or $outFileCommands.Count -ne 1) { return $false }
+    $buildOffsets = @($buildCommands | ForEach-Object { [int]$_.Extent.StartOffset })
+    $firstBuildOffset = [int](($buildOffsets | Measure-Object -Minimum).Minimum)
+    $lastBuildOffset = [int](($buildOffsets | Measure-Object -Maximum).Maximum)
+    if ($evidenceAssignment.Extent.StartOffset -ge $firstBuildOffset) {
+        return $false
+    }
+
+    # The producer's observable side effects must have one fixed, fail-closed
+    # sequence. `$ErrorActionPreference = 'Stop'` does not reliably turn a
+    # native pwsh child-process non-zero exit into a terminating error, so the
+    # explicit `$LASTEXITCODE` guard is mandatory. The fresh-directory and
+    # manifest guards likewise prevent stale evidence reuse and false output
+    # publication after a producer that did not yield a manifest.
+    $rootStatements = @($parsed.Ast.EndBlock.Statements)
+    if ($rootStatements.Count -lt 7 -or
+        $rootStatements[0] -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $rootStatements[1] -isnot [System.Management.Automation.Language.AssignmentStatementAst]) {
+        return $false
+    }
+    if ($rootStatements[0].Extent.StartOffset -ne $assignments[0].Extent.StartOffset -or
+        $rootStatements[1].Extent.StartOffset -ne $evidenceAssignment.Extent.StartOffset) {
+        return $false
+    }
+    if ($RequireWindowsHostOnly) {
+        if ($rootStatements.Count -ne 9 -or
+            $rootStatements[2] -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or
+            $rootStatements[3] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[4] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[5] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[6] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[7] -isnot [System.Management.Automation.Language.IfStatementAst]) {
+            return $false
+        }
+        if ($rootStatements[2].Extent.StartOffset -ne $skipBundleAssignment.Extent.StartOffset -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[3] -ExpectedCondition "`$skipbundleinput-notin@('','true','false')") -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[4] -ExpectedCondition 'test-path-literalpath$evidencedir') -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[6] -ExpectedCondition '$lastexitcode-ne0') -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[7] -ExpectedCondition "-not(test-path-literalpath(join-path`$evidencedir'manifest.json')-pathtypeleaf)")) {
+            return $false
+        }
+        if ($rootStatements[3].Extent.StartOffset -le $skipBundleAssignment.Extent.StartOffset -or
+            $rootStatements[4].Extent.StartOffset -le $rootStatements[3].Extent.EndOffset -or
+            $firstBuildOffset -le $rootStatements[4].Extent.EndOffset -or
+            $rootStatements[6].Extent.StartOffset -le $lastBuildOffset -or
+            $rootStatements[7].Extent.StartOffset -le $rootStatements[6].Extent.EndOffset) {
+            return $false
+        }
+    } else {
+        if ($rootStatements.Count -ne 7 -or
+            $rootStatements[2] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[3] -isnot [System.Management.Automation.Language.PipelineAst] -or
+            @($rootStatements[3].PipelineElements).Count -ne 1 -or
+            $rootStatements[3].PipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst] -or
+            $rootStatements[4] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            $rootStatements[5] -isnot [System.Management.Automation.Language.IfStatementAst] -or
+            -not (Test-IsControlledProducerBuildCommand -CommandAst $rootStatements[3].PipelineElements[0]) -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[2] -ExpectedCondition 'test-path-literalpath$evidencedir') -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[4] -ExpectedCondition '$lastexitcode-ne0') -or
+            -not (Test-IsExactSingleThrowGuard -IfAst $rootStatements[5] -ExpectedCondition "-not(test-path-literalpath(join-path`$evidencedir'manifest.json')-pathtypeleaf)")) {
+            return $false
+        }
+        if ($firstBuildOffset -le $rootStatements[2].Extent.EndOffset -or
+            $rootStatements[4].Extent.StartOffset -le $lastBuildOffset -or
+            $rootStatements[5].Extent.StartOffset -le $rootStatements[4].Extent.EndOffset) {
+            return $false
+        }
+    }
+    $expectedThrowCount = if ($RequireWindowsHostOnly) { 4 } else { 3 }
+    if (@($parsed.Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ThrowStatementAst]
+                }, $true)).Count -ne $expectedThrowCount) {
+        return $false
+    }
+    if (-not $RequireWindowsHostOnly) {
+        $topLevelBuilds = @($parsed.TopLevelCommands | Where-Object { Test-IsControlledProducerBuildCommand -CommandAst $_ })
+        if ($topLevelBuilds.Count -ne 1) { return $false }
+    } elseif (-not (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $ScriptText)) {
+        return $false
+    }
+
+    # GUID construction is the only method invocation in a producer. Blocking
+    # every other member call closes direct .NET file-write and reflection paths.
+    foreach ($memberInvocation in @($parsed.Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+                }, $true))) {
+        $normalizedInvocation = (([string]$memberInvocation.Extent.Text -replace '\s+', '')).ToLowerInvariant()
+        if ($normalizedInvocation -notin @("[guid]::newguid()", "[guid]::newguid().tostring('n')")) { return $false }
+    }
+    if (@($parsed.Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+                }, $true)).Count -ne 0) {
+        return $false
+    }
+    # A producer must not mask a failed build or make the required output write
+    # unreachable. `throw` is intentionally allowed for fail-closed checks;
+    # returns/exits/catches/loops are not part of the controlled grammar.
+    if (@($parsed.Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ExitStatementAst] -or
+                    $node -is [System.Management.Automation.Language.ReturnStatementAst] -or
+                    $node -is [System.Management.Automation.Language.BreakStatementAst] -or
+                    $node -is [System.Management.Automation.Language.ContinueStatementAst] -or
+                    $node -is [System.Management.Automation.Language.TryStatementAst] -or
+                    $node -is [System.Management.Automation.Language.TrapStatementAst] -or
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -or
+                    $node -is [System.Management.Automation.Language.DataStatementAst] -or
+                    $node -is [System.Management.Automation.Language.ForStatementAst] -or
+                    $node -is [System.Management.Automation.Language.ForEachStatementAst] -or
+                    $node -is [System.Management.Automation.Language.WhileStatementAst] -or
+                    $node -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+                    $node -is [System.Management.Automation.Language.DoUntilStatementAst] -or
+                    $node -is [System.Management.Automation.Language.SwitchStatementAst]
+                }, $true)).Count -ne 0) {
+        return $false
+    }
+
+    $outputPipelines = @($rootStatements | Where-Object {
+            if ($_ -isnot [System.Management.Automation.Language.PipelineAst]) { return $false }
+            $elements = @($_.PipelineElements)
+            if ($elements.Count -ne 2 -or
+                $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst] -or
+                $elements[1] -isnot [System.Management.Automation.Language.CommandAst]) {
+                return $false
+            }
+            $outName = Get-ReleaseCommandFirstString -CommandAst $elements[1]
+            return ($null -ne $outName -and [string]::Equals($outName, 'Out-File', [System.StringComparison]::OrdinalIgnoreCase))
+        })
+    if ($outputPipelines.Count -ne 1) { return $false }
+    $outputPipeline = $outputPipelines[0]
+    $outputElements = @($outputPipeline.PipelineElements)
+    if (-not [string]::Equals(([string]$outputElements[0].Extent.Text).Trim(), '"dir=$evidenceDir"', [System.StringComparison]::Ordinal) -or
+        -not (Test-ReleaseCommandHasExactVariableParameterValue `
+            -CommandAst $outputElements[1] `
+            -ParameterName 'FilePath' `
+            -VariableName 'env:GITHUB_OUTPUT') -or
+        -not (Test-ReleaseCommandHasBareSwitchParameter -CommandAst $outputElements[1] -ParameterName 'Append')) {
+        return $false
+    }
+    $manifestGuardIndex = if ($RequireWindowsHostOnly) { 7 } else { 5 }
+    if ($outputPipeline.Extent.StartOffset -le $rootStatements[$manifestGuardIndex].Extent.EndOffset) {
+        return $false
+    }
+    return $true
+}
+
 function Test-ReleaseHostEvidenceVerifierOrder {
     <#
     .SYNOPSIS
@@ -3315,22 +4353,67 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     and full step-metadata binding.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$WorkflowPath
+        [Parameter(Mandatory = $true)][string]$WorkflowPath,
+        [switch]$RequireRetentionDays14,
+        [switch]$RequireCheckout,
+        [switch]$RequireFreshProducer
     )
 
     $requiredJobs = @('windows-host-evidence', 'android-host-evidence')
     $jobResults = @{}
+    $unavailableJobResults = @{}
+    foreach ($unavailableJobName in $requiredJobs) {
+        $unavailableJobResults[$unavailableJobName] = [pscustomobject]@{
+            Present = $false
+            HasVerifierBeforeUpload = $false
+            VerifierIndex = -1
+            UploadIndex = -1
+            CheckoutIndex = -1
+            ProducerIndex = -1
+            Reason = 'workflow metadata unavailable'
+            ShellOk = $false
+            ContinueOnErrorOk = $false
+            JobContinueOnErrorOk = $false
+            JobIfOk = $false
+            JobNeedsOk = $false
+            JobRunnerOk = $false
+            VerifierWorkingDirectoryOk = $false
+            CheckoutOk = $false
+            ProducerOk = $false
+            ProducerOutputIdOk = $false
+                ProducerHostOnlyOk = $false
+                RunTopologyOk = $false
+                UploadIfOk = $false
+            UploadContinueOnErrorOk = $false
+            UploadActionOk = $false
+            RetentionOk = $false
+            ScriptContractOk = $false
+            PathBindOk = $false
+        }
+    }
     $errors = New-Object System.Collections.Generic.List[string]
     $verifierCommand = 'Assert-ReleaseEvidencePackage'
     $requiredEvidenceLiteral = '${{ steps.evidence.outputs.dir }}'
     $allowedShells = @('pwsh', 'powershell')
+    $requiredCheckoutAction = 'actions/checkout@v4'
 
     if (-not (Test-Path -LiteralPath $WorkflowPath -PathType Leaf)) {
         return [pscustomobject]@{
             Valid = $false
             Engine = 'none'
             Errors = @("Workflow file not found: $WorkflowPath")
-            jobs = [hashtable]@{}
+            jobs = [hashtable]$unavailableJobResults
+            ActionReferences = @()
+            RunBlocks = @()
+            RootPermissionsPresent = $false
+            RootPermissionsKind = ''
+            RootPermissions = [pscustomobject]@{}
+            RootPermissionsKeysUnique = $false
+            RootPermissionsRawKeys = @()
+            JobPermissionRecords = @()
+            SkipBundleDefaultPresent = $false
+            SkipBundleDefaultKind = ''
+            SkipBundleDefault = ''
         }
     }
 
@@ -3341,7 +4424,7 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     # YAML engines extract full step metadata; command authenticity and controlled
     # binding are decided later in PowerShell (AST + fail-closed metadata rules).
     $pyScript = @'
-import sys, json
+import sys, json, re
 try:
     import yaml
 except ImportError:
@@ -3349,10 +4432,57 @@ except ImportError:
     sys.exit(0)
 
 path = sys.argv[1]
-required = ["windows-host-evidence", "android-host-evidence"]
+required = ["windows-host-evidence", "android-host-evidence", "frontend-gate", "secret-scan", "pester-release-tests"]
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+def construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "YAML merge keys are not allowed in workflow files", key_node.start_mark
+            )
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "found duplicate key: {0}".format(key), key_node.start_mark
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping
+)
 try:
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        source = f.read()
+    def has_explicit_root_on_key(text):
+        root_indent = None
+        for raw_line in text.splitlines():
+            line = raw_line.lstrip("\ufeff")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped in ("---", "{", "}"):
+                continue
+            key_match = re.match(r"^([ \t]*)(?:\"[^\"\r\n]+\"|'[^'\r\n]+'|[A-Za-z_][A-Za-z0-9_-]*)[ \t]*:", line)
+            if not key_match:
+                continue
+            if root_indent is None:
+                root_indent = key_match.group(1)
+            on_match = re.match(r"^([ \t]*)(?:on|[\"']on[\"'])[ \t]*:", line)
+            if on_match and root_indent == on_match.group(1):
+                return True
+        return False
+    # PyYAML parses YAML 1.1's unquoted `on` as Boolean True. Require the
+    # source-level trigger spelling so a `true:` mapping key cannot impersonate
+    # a runnable Gitea workflow.
+    has_explicit_on_key = has_explicit_root_on_key(source)
+    if re.search(r"(?m)^[ \t]*<<[ \t]*:", source):
+        raise ValueError("YAML merge keys are not allowed in workflow files")
+    if re.search(r"(?:^|[ \t,:\[{])(?:&|\*)[A-Za-z0-9_-]+", source):
+        raise ValueError("YAML anchors and aliases are not allowed in workflow files")
+    data = yaml.load(source, Loader=UniqueKeySafeLoader)
 except Exception as exc:
     print(json.dumps({"ok": False, "engine": "pyyaml", "error": "YAML parse error: " + str(exc)[:500], "jobs": {}}))
     sys.exit(0)
@@ -3366,17 +4496,85 @@ if not isinstance(jobs, dict):
     print(json.dumps({"ok": False, "engine": "pyyaml", "error": "Top-level jobs must be a mapping", "jobs": {}}))
     sys.exit(0)
 
+def scalar_kind(value):
+    return (
+        "mapping" if isinstance(value, dict) else
+        "sequence" if isinstance(value, list) else
+        "boolean" if isinstance(value, bool) else
+        "string" if isinstance(value, str) else
+        "null" if value is None else
+        "number" if isinstance(value, (int, float)) else
+        "other"
+    )
+
+def permissions_meta(owner):
+    present = isinstance(owner, dict) and "permissions" in owner
+    value = owner.get("permissions") if present else None
+    if not isinstance(value, dict):
+        return present, scalar_kind(value), {}, True, []
+    raw_keys = [str(key) for key in value.keys()]
+    normalized_keys = [key.lower() for key in raw_keys]
+    entries = {}
+    for key, raw in value.items():
+        entries[str(key)] = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+    return present, "mapping", entries, len(normalized_keys) == len(set(normalized_keys)), raw_keys
+
+def run_working_directory_meta(owner):
+    defaults = owner.get("defaults") if isinstance(owner, dict) else None
+    run_defaults = defaults.get("run") if isinstance(defaults, dict) else None
+    present = isinstance(run_defaults, dict) and "working-directory" in run_defaults
+    value = run_defaults.get("working-directory") if present else None
+    rendered = value if isinstance(value, str) else ("" if value is None else str(value))
+    return present, scalar_kind(value), rendered
+
+def run_shell_meta(owner):
+    defaults = owner.get("defaults") if isinstance(owner, dict) else None
+    run_defaults = defaults.get("run") if isinstance(defaults, dict) else None
+    present = isinstance(run_defaults, dict) and "shell" in run_defaults
+    value = run_defaults.get("shell") if present else None
+    rendered = value if isinstance(value, str) else ("" if value is None else str(value))
+    return present, scalar_kind(value), rendered
+
+def env_meta(owner):
+    present = isinstance(owner, dict) and "env" in owner
+    value = owner.get("env") if present else None
+    if not isinstance(value, dict):
+        return present, scalar_kind(value), {}, True, []
+    raw_keys = [str(key) for key in value.keys()]
+    normalized_keys = [key.lower() for key in raw_keys]
+    entries = {}
+    for key, raw in value.items():
+        entries[str(key)] = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+    return present, "mapping", entries, len(normalized_keys) == len(set(normalized_keys)), raw_keys
+
 def step_meta(i, step):
     uses = step.get("uses")
     run = step.get("run")
+    uses_present = "uses" in step
+    run_present = "run" in step
     shell = step.get("shell")
+    shell_present = "shell" in step
     name = step.get("name")
-    if_expr = step.get("if")
-    coe = step.get("continue-on-error")
+    step_id = step.get("id")
+    if_present = "if" in step
+    if_expr = step.get("if") if if_present else None
+    if_kind = scalar_kind(if_expr)
+    coe_present = "continue-on-error" in step
+    coe = step.get("continue-on-error") if coe_present else None
+    coe_kind = scalar_kind(coe)
+    working_directory_present = "working-directory" in step
+    working_directory = step.get("working-directory") if working_directory_present else None
+    working_directory_kind = scalar_kind(working_directory)
+    env_present, env_kind, env_entries, env_keys_unique, env_raw_keys = env_meta(step)
     with_block = step.get("with")
     with_path = ""
     with_name = ""
     with_retention = None
+    def with_scalar_meta(key):
+        present = isinstance(with_block, dict) and key in with_block
+        value = with_block.get(key) if present else None
+        rendered = value if isinstance(value, str) else ("" if value is None else str(value))
+        return present, scalar_kind(value), rendered
     if isinstance(with_block, dict):
         p = with_block.get("path")
         n = with_block.get("name")
@@ -3391,19 +4589,73 @@ def step_meta(i, step):
             with_retention = int(r)
         elif isinstance(r, str) and r.strip().isdigit():
             with_retention = int(r.strip())
+    with_path_present, with_path_kind, with_path_scalar = with_scalar_meta("path")
+    with_repository_present, with_repository_kind, with_repository = with_scalar_meta("repository")
+    with_ref_present, with_ref_kind, with_ref = with_scalar_meta("ref")
+    with_token_present, with_token_kind, with_token = with_scalar_meta("token")
+    with_ssh_key_present, with_ssh_key_kind, with_ssh_key = with_scalar_meta("ssh-key")
+    with_clean_present, with_clean_kind, with_clean = with_scalar_meta("clean")
+    raw_with_keys = [str(key) for key in with_block.keys()] if isinstance(with_block, dict) else []
+    normalized_with_keys = [key.lower() for key in raw_with_keys]
     return {
         "index": i,
         "name": name if isinstance(name, str) else "",
+        "id": step_id if isinstance(step_id, str) else "",
+        "id_present": "id" in step,
+        "id_kind": scalar_kind(step_id),
         "uses": uses if isinstance(uses, str) else "",
+        "uses_present": uses_present,
+        "uses_kind": scalar_kind(uses),
         "run": run if isinstance(run, str) else "",
+        "run_present": run_present,
+        "run_kind": scalar_kind(run),
         "shell": shell if isinstance(shell, str) else "",
+        "shell_present": shell_present,
+        "shell_kind": scalar_kind(shell),
         "if": if_expr if isinstance(if_expr, str) else ("" if if_expr is None else str(if_expr)),
+        "if_present": if_present,
+        "if_kind": if_kind,
         "continue_on_error": True if coe is True else (False if coe is False else None),
+        "continue_on_error_present": coe_present,
+        "continue_on_error_kind": coe_kind,
+        "working_directory": working_directory if isinstance(working_directory, str) else ("" if working_directory is None else str(working_directory)),
+        "working_directory_present": working_directory_present,
+        "working_directory_kind": working_directory_kind,
+        "env_present": env_present,
+        "env_kind": env_kind,
+        "env": env_entries,
+        "env_keys_unique": env_keys_unique,
+        "env_raw_keys": env_raw_keys,
         "with_path": with_path,
+        "with_path_scalar": with_path_scalar,
+        "with_path_present": with_path_present,
+        "with_path_kind": with_path_kind,
         "with_name": with_name,
         "with_retention_days": with_retention,
+        "with_raw_keys": raw_with_keys,
+        "with_keys": normalized_with_keys,
+        "with_keys_unique": len(normalized_with_keys) == len(set(normalized_with_keys)),
+        "with_repository": with_repository,
+        "with_repository_present": with_repository_present,
+        "with_repository_kind": with_repository_kind,
+        "with_ref": with_ref,
+        "with_ref_present": with_ref_present,
+        "with_ref_kind": with_ref_kind,
+        "with_token": with_token,
+        "with_token_present": with_token_present,
+        "with_token_kind": with_token_kind,
+        "with_ssh_key": with_ssh_key,
+        "with_ssh_key_present": with_ssh_key_present,
+        "with_ssh_key_kind": with_ssh_key_kind,
+        "with_clean": with_clean,
+        "with_clean_present": with_clean_present,
+        "with_clean_kind": with_clean_kind,
     }
 
+workflow_wd_present, workflow_wd_kind, workflow_wd = run_working_directory_meta(data)
+workflow_shell_present, workflow_shell_kind, workflow_shell = run_shell_meta(data)
+workflow_env_present, workflow_env_kind, workflow_env, workflow_env_keys_unique, workflow_env_raw_keys = env_meta(data)
+root_permissions_present, root_permissions_kind, root_permissions, root_permissions_keys_unique, root_permissions_raw_keys = permissions_meta(data)
 out = {}
 for name in required:
     job = jobs.get(name)
@@ -3419,15 +4671,169 @@ for name in required:
         if not isinstance(step, dict):
             continue
         rendered.append(step_meta(i, step))
-    out[name] = {"present": True, "steps": rendered, "reason": "ok"}
+    job_wd_present, job_wd_kind, job_wd = run_working_directory_meta(job)
+    job_shell_present, job_shell_kind, job_shell = run_shell_meta(job)
+    job_env_present, job_env_kind, job_env, job_env_keys_unique, job_env_raw_keys = env_meta(job)
+    job_coe_present = "continue-on-error" in job
+    job_coe = job.get("continue-on-error") if job_coe_present else None
+    job_if_present = "if" in job
+    job_if = job.get("if") if job_if_present else None
+    job_needs_present = "needs" in job
+    job_container_present = "container" in job
+    job_services_present = "services" in job
+    job_runs_on = job.get("runs-on")
+    job_permissions_present, job_permissions_kind, _, _, _ = permissions_meta(job)
+    out[name] = {
+        "present": True,
+        "steps": rendered,
+        "reason": "ok",
+        "defaults_run_working_directory": job_wd,
+        "defaults_run_working_directory_present": job_wd_present,
+        "defaults_run_working_directory_kind": job_wd_kind,
+        "defaults_run_shell": job_shell,
+        "defaults_run_shell_present": job_shell_present,
+        "defaults_run_shell_kind": job_shell_kind,
+        "env_present": job_env_present,
+        "env_kind": job_env_kind,
+        "env": job_env,
+        "env_keys_unique": job_env_keys_unique,
+        "env_raw_keys": job_env_raw_keys,
+        "continue_on_error": True if job_coe is True else (False if job_coe is False else None),
+        "continue_on_error_present": job_coe_present,
+        "continue_on_error_kind": scalar_kind(job_coe),
+        "if": job_if if isinstance(job_if, str) else ("" if job_if is None else str(job_if)),
+        "if_present": job_if_present,
+        "if_kind": scalar_kind(job_if),
+        "needs_present": job_needs_present,
+        "container_present": job_container_present,
+        "services_present": job_services_present,
+        "runs_on": job_runs_on if isinstance(job_runs_on, str) else ("" if job_runs_on is None else str(job_runs_on)),
+        "runs_on_kind": scalar_kind(job_runs_on),
+        "permissions_present": job_permissions_present,
+        "permissions_kind": job_permissions_kind,
+    }
 
-print(json.dumps({"ok": True, "engine": "pyyaml", "error": "", "jobs": out}))
+upload_artifact_references = []
+action_references = []
+run_blocks = []
+job_permission_records = []
+for job_name, job in jobs.items():
+    if not isinstance(job, dict):
+        continue
+    job_permissions_present, job_permissions_kind, _, _, _ = permissions_meta(job)
+    job_permission_records.append({"job": str(job_name), "present": job_permissions_present, "kind": job_permissions_kind})
+    job_coe_present = "continue-on-error" in job
+    job_coe = job.get("continue-on-error") if job_coe_present else None
+    job_if_present = "if" in job
+    job_if = job.get("if") if job_if_present else None
+    job_needs_present = "needs" in job
+    if "uses" in job:
+        job_uses = job.get("uses")
+        action_references.append({
+            "job": str(job_name), "index": -1, "scope": "job",
+            "uses": job_uses if isinstance(job_uses, str) else "",
+            "uses_kind": scalar_kind(job_uses),
+        })
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        continue
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        uses = step.get("uses")
+        run = step.get("run")
+        step_record = step_meta(index, step)
+        if "uses" in step:
+            action_references.append({
+                "job": str(job_name), "index": index, "scope": "step",
+                "uses": uses if isinstance(uses, str) else "",
+                "uses_kind": scalar_kind(uses),
+            })
+        if isinstance(run, str):
+            run_blocks.append({
+                "job": str(job_name), "index": index, "run": run,
+                "shell": step_record["shell"], "shell_kind": step_record["shell_kind"],
+                "if": step_record["if"], "if_present": step_record["if_present"], "if_kind": step_record["if_kind"],
+                "continue_on_error": step_record["continue_on_error"],
+                "continue_on_error_present": step_record["continue_on_error_present"],
+                "continue_on_error_kind": step_record["continue_on_error_kind"],
+                "job_if": job_if if isinstance(job_if, str) else ("" if job_if is None else str(job_if)),
+                "job_if_present": job_if_present, "job_if_kind": scalar_kind(job_if),
+                "job_continue_on_error": True if job_coe is True else (False if job_coe is False else None),
+                "job_continue_on_error_present": job_coe_present,
+                "job_continue_on_error_kind": scalar_kind(job_coe),
+                "job_needs_present": job_needs_present,
+            })
+        if isinstance(uses, str) and uses.lower().startswith("actions/upload-artifact"):
+            upload_artifact_references.append({"job": str(job_name), "index": index, "uses": uses})
+
+workflow_on_present = has_explicit_on_key
+workflow_on = (data.get("on") if "on" in data else data.get(True)) if has_explicit_on_key else None
+workflow_triggers = [str(key) for key in workflow_on.keys()] if isinstance(workflow_on, dict) else []
+skip_bundle_default_present = False
+skip_bundle_default = None
+if isinstance(workflow_on, dict):
+    dispatch = workflow_on.get("workflow_dispatch")
+    if isinstance(dispatch, dict):
+        inputs = dispatch.get("inputs")
+        if isinstance(inputs, dict):
+            skip_bundle = inputs.get("skip_bundle")
+            if isinstance(skip_bundle, dict) and "default" in skip_bundle:
+                skip_bundle_default_present = True
+                skip_bundle_default = skip_bundle.get("default")
+
+print(json.dumps({
+    "ok": True,
+    "engine": "pyyaml",
+    "error": "",
+    "workflow_defaults_run_working_directory": workflow_wd,
+    "workflow_defaults_run_working_directory_present": workflow_wd_present,
+    "workflow_defaults_run_working_directory_kind": workflow_wd_kind,
+    "workflow_defaults_run_shell": workflow_shell,
+    "workflow_defaults_run_shell_present": workflow_shell_present,
+    "workflow_defaults_run_shell_kind": workflow_shell_kind,
+    "workflow_env_present": workflow_env_present,
+    "workflow_env_kind": workflow_env_kind,
+    "workflow_env": workflow_env,
+    "workflow_env_keys_unique": workflow_env_keys_unique,
+    "workflow_env_raw_keys": workflow_env_raw_keys,
+    "workflow_on_present": workflow_on_present,
+    "workflow_on_kind": scalar_kind(workflow_on),
+    "workflow_triggers": workflow_triggers,
+    "upload_artifact_references": upload_artifact_references,
+    "action_references": action_references,
+    "run_blocks": run_blocks,
+    "root_permissions_present": root_permissions_present,
+    "root_permissions_kind": root_permissions_kind,
+    "root_permissions": root_permissions,
+    "root_permissions_keys_unique": root_permissions_keys_unique,
+    "root_permissions_raw_keys": root_permissions_raw_keys,
+    "job_permission_records": job_permission_records,
+    "skip_bundle_default_present": skip_bundle_default_present,
+    "skip_bundle_default_kind": scalar_kind(skip_bundle_default),
+    "skip_bundle_default": skip_bundle_default if isinstance(skip_bundle_default, str) else ("" if skip_bundle_default is None else str(skip_bundle_default)),
+    "jobs": out,
+}))
 '@
 
     $jsScript = @'
 const fs = require("fs");
 const path = process.argv[2];
 function emit(obj) { process.stdout.write(JSON.stringify(obj)); process.exit(0); }
+function hasExplicitRootOnKey(text) {
+  let rootIndent = null;
+  for (let line of text.split(/\r?\n/)) {
+    line = line.replace(/^\uFEFF/, "");
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed === "---" || trimmed === "{" || trimmed === "}") continue;
+    const key = /^([ \t]*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z_][A-Za-z0-9_-]*)[ \t]*:/.exec(line);
+    if (!key) continue;
+    if (rootIndent === null) rootIndent = key[1];
+    const on = /^([ \t]*)(?:on|["']on["'])[ \t]*:/.exec(line);
+    if (on && rootIndent === on[1]) return true;
+  }
+  return false;
+}
 let yaml;
 try { yaml = require("yaml"); }
 catch (_) {
@@ -3435,8 +4841,12 @@ catch (_) {
   catch (e2) { emit({ ok: false, engine: "node-yaml", error: "Neither yaml nor js-yaml installed", jobs: {} }); }
 }
 let data;
+let workflowSource = "";
 try {
   const text = fs.readFileSync(path, "utf8");
+  workflowSource = text;
+  if (/(^|\n)[ \t]*<<[ \t]*:/.test(text)) throw new Error("YAML merge keys are not allowed in workflow files");
+  if (/(^|[ \t,:\[{])(?:&|\*)[A-Za-z0-9_-]+/.test(text)) throw new Error("YAML anchors and aliases are not allowed in workflow files");
   data = yaml.load ? yaml.load(text) : yaml.parse(text);
 } catch (e) {
   emit({ ok: false, engine: "node-yaml", error: "YAML parse error: " + String(e && e.message ? e.message : e).slice(0, 500), jobs: {} });
@@ -3448,39 +4858,172 @@ const jobs = data.jobs;
 if (!jobs || typeof jobs !== "object" || Array.isArray(jobs)) {
   emit({ ok: false, engine: "node-yaml", error: "Top-level jobs must be a mapping", jobs: {} });
 }
+function scalarKind(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "sequence";
+  if (typeof value === "object") return "mapping";
+  return typeof value;
+}
+function permissionsMeta(owner) {
+  const present = !!owner && typeof owner === "object" && !Array.isArray(owner) && Object.prototype.hasOwnProperty.call(owner, "permissions");
+  const raw = present ? owner.permissions : null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { present: present, kind: scalarKind(raw), entries: {}, keysUnique: true, rawKeys: [] };
+  }
+  const rawKeys = Object.keys(raw).map((key) => String(key));
+  const normalizedKeys = rawKeys.map((key) => key.toLowerCase());
+  const entries = {};
+  for (const [key, value] of Object.entries(raw)) {
+    entries[String(key)] = typeof value === "string" ? value : (value == null ? "" : String(value));
+  }
+  return { present: present, kind: "mapping", entries: entries, keysUnique: normalizedKeys.length === new Set(normalizedKeys).size, rawKeys: rawKeys };
+}
+function runWorkingDirectoryMeta(owner) {
+  const defaults = owner && typeof owner.defaults === "object" && !Array.isArray(owner.defaults) ? owner.defaults : null;
+  const runDefaults = defaults && typeof defaults.run === "object" && !Array.isArray(defaults.run) ? defaults.run : null;
+  const present = !!runDefaults && Object.prototype.hasOwnProperty.call(runDefaults, "working-directory");
+  const raw = present ? runDefaults["working-directory"] : null;
+  return {
+    present: present,
+    kind: scalarKind(raw),
+    value: typeof raw === "string" ? raw : (raw == null ? "" : String(raw))
+  };
+}
+function runShellMeta(owner) {
+  const defaults = owner && typeof owner.defaults === "object" && !Array.isArray(owner.defaults) ? owner.defaults : null;
+  const runDefaults = defaults && typeof defaults.run === "object" && !Array.isArray(defaults.run) ? defaults.run : null;
+  const present = !!runDefaults && Object.prototype.hasOwnProperty.call(runDefaults, "shell");
+  const raw = present ? runDefaults.shell : null;
+  return {
+    present: present,
+    kind: scalarKind(raw),
+    value: typeof raw === "string" ? raw : (raw == null ? "" : String(raw))
+  };
+}
+function envMeta(owner) {
+  const present = !!owner && typeof owner === "object" && !Array.isArray(owner) && Object.prototype.hasOwnProperty.call(owner, "env");
+  const raw = present ? owner.env : null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { present: present, kind: scalarKind(raw), entries: {}, keysUnique: true, rawKeys: [] };
+  }
+  const rawKeys = Object.keys(raw).map((key) => String(key));
+  const normalizedKeys = rawKeys.map((key) => key.toLowerCase());
+  const entries = {};
+  for (const [key, value] of Object.entries(raw)) {
+    entries[String(key)] = typeof value === "string" ? value : (value == null ? "" : String(value));
+  }
+  return { present: present, kind: "mapping", entries: entries, keysUnique: normalizedKeys.length === new Set(normalizedKeys).size, rawKeys: rawKeys };
+}
 function stepMeta(i, step) {
   const uses = typeof step.uses === "string" ? step.uses : "";
   const run = typeof step.run === "string" ? step.run : "";
-  const shell = typeof step.shell === "string" ? step.shell : "";
+  const shellRaw = step.shell;
+  const shell = typeof shellRaw === "string" ? shellRaw : "";
   const name = typeof step.name === "string" ? step.name : "";
+  const idRaw = step.id;
+  const id = typeof idRaw === "string" ? idRaw : "";
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(step, key);
+  const ifPresent = hasOwn("if");
+  const ifRaw = ifPresent ? step.if : null;
+  const ifKind = ifRaw === null ? "null" : typeof ifRaw;
   let ifExpr = "";
-  if (typeof step.if === "string") ifExpr = step.if;
-  else if (step.if != null) ifExpr = String(step.if);
+  if (typeof ifRaw === "string") ifExpr = ifRaw;
+  else if (ifRaw != null) ifExpr = String(ifRaw);
+  const coePresent = hasOwn("continue-on-error");
+  const coeRaw = coePresent ? step["continue-on-error"] : null;
+  const coeKind = coeRaw === null ? "null" : typeof coeRaw;
   let coe = null;
-  if (step["continue-on-error"] === true) coe = true;
-  else if (step["continue-on-error"] === false) coe = false;
+  if (coeRaw === true) coe = true;
+  else if (coeRaw === false) coe = false;
+  const workingDirectoryPresent = hasOwn("working-directory");
+  const workingDirectoryRaw = workingDirectoryPresent ? step["working-directory"] : null;
+  const workingDirectoryKind = scalarKind(workingDirectoryRaw);
+  const stepEnv = envMeta(step);
   let withPath = "", withName = "", withRetention = null;
   if (step.with && typeof step.with === "object" && !Array.isArray(step.with)) {
     if (typeof step.with.path === "string") withPath = step.with.path;
     if (typeof step.with.name === "string") withName = step.with.name;
     const r = step.with["retention-days"];
-    if (typeof r === "number" && Number.isFinite(r)) withRetention = Math.trunc(r);
+    if (typeof r === "number" && Number.isFinite(r) && Number.isInteger(r)) withRetention = r;
     else if (typeof r === "string" && /^\d+$/.test(r.trim())) withRetention = parseInt(r.trim(), 10);
   }
+  const withScalarMeta = (key) => {
+    const present = !!step.with && typeof step.with === "object" && !Array.isArray(step.with) && Object.prototype.hasOwnProperty.call(step.with, key);
+    const raw = present ? step.with[key] : null;
+    return {
+      present: present,
+      kind: scalarKind(raw),
+      value: typeof raw === "string" ? raw : (raw == null ? "" : String(raw))
+    };
+  };
+  const withRepository = withScalarMeta("repository");
+  const withRef = withScalarMeta("ref");
+  const withToken = withScalarMeta("token");
+  const withSshKey = withScalarMeta("ssh-key");
+  const withClean = withScalarMeta("clean");
+  const withPathScalar = withScalarMeta("path");
+  const rawWithKeys = step.with && typeof step.with === "object" && !Array.isArray(step.with) ? Object.keys(step.with).map((key) => String(key)) : [];
+  const normalizedWithKeys = rawWithKeys.map((key) => key.toLowerCase());
   return {
     index: i,
     name: name,
+    id: id,
+    id_present: hasOwn("id"),
+    id_kind: scalarKind(idRaw),
     uses: uses,
+    uses_present: hasOwn("uses"),
+    uses_kind: scalarKind(step.uses),
     run: run,
+    run_present: hasOwn("run"),
+    run_kind: scalarKind(step.run),
     shell: shell,
+    shell_present: hasOwn("shell"),
+    shell_kind: scalarKind(shellRaw),
     if: ifExpr,
+    if_present: ifPresent,
+    if_kind: ifKind,
     continue_on_error: coe,
+    continue_on_error_present: coePresent,
+    continue_on_error_kind: coeKind,
+    working_directory: typeof workingDirectoryRaw === "string" ? workingDirectoryRaw : (workingDirectoryRaw == null ? "" : String(workingDirectoryRaw)),
+    working_directory_present: workingDirectoryPresent,
+    working_directory_kind: workingDirectoryKind,
+    env_present: stepEnv.present,
+    env_kind: stepEnv.kind,
+    env: stepEnv.entries,
+    env_keys_unique: stepEnv.keysUnique,
+    env_raw_keys: stepEnv.rawKeys,
     with_path: withPath,
+    with_path_scalar: withPathScalar.value,
+    with_path_present: withPathScalar.present,
+    with_path_kind: withPathScalar.kind,
     with_name: withName,
-    with_retention_days: withRetention
+    with_retention_days: withRetention,
+    with_raw_keys: rawWithKeys,
+    with_keys: normalizedWithKeys,
+    with_keys_unique: normalizedWithKeys.length === new Set(normalizedWithKeys).size,
+    with_repository: withRepository.value,
+    with_repository_present: withRepository.present,
+    with_repository_kind: withRepository.kind,
+    with_ref: withRef.value,
+    with_ref_present: withRef.present,
+    with_ref_kind: withRef.kind,
+    with_token: withToken.value,
+    with_token_present: withToken.present,
+    with_token_kind: withToken.kind,
+    with_ssh_key: withSshKey.value,
+    with_ssh_key_present: withSshKey.present,
+    with_ssh_key_kind: withSshKey.kind,
+    with_clean: withClean.value,
+    with_clean_present: withClean.present,
+    with_clean_kind: withClean.kind
   };
 }
-const required = ["windows-host-evidence", "android-host-evidence"];
+const required = ["windows-host-evidence", "android-host-evidence", "frontend-gate", "secret-scan", "pester-release-tests"];
+const workflowWorkingDirectory = runWorkingDirectoryMeta(data);
+const workflowRunShell = runShellMeta(data);
+const workflowEnv = envMeta(data);
+const rootPermissions = permissionsMeta(data);
 const out = {};
 for (const name of required) {
   const job = jobs[name];
@@ -3499,9 +5042,152 @@ for (const name of required) {
     if (!step || typeof step !== "object") continue;
     rendered.push(stepMeta(i, step));
   }
-  out[name] = { present: true, steps: rendered, reason: "ok" };
+  const jobWorkingDirectory = runWorkingDirectoryMeta(job);
+  const jobRunShell = runShellMeta(job);
+  const jobEnv = envMeta(job);
+  const jobCoePresent = Object.prototype.hasOwnProperty.call(job, "continue-on-error");
+  const jobCoeRaw = jobCoePresent ? job["continue-on-error"] : null;
+  const jobIfPresent = Object.prototype.hasOwnProperty.call(job, "if");
+  const jobIfRaw = jobIfPresent ? job.if : null;
+  const jobNeedsPresent = Object.prototype.hasOwnProperty.call(job, "needs");
+  const jobContainerPresent = Object.prototype.hasOwnProperty.call(job, "container");
+  const jobServicesPresent = Object.prototype.hasOwnProperty.call(job, "services");
+  const jobRunsOn = job["runs-on"];
+  const jobPermissions = permissionsMeta(job);
+  out[name] = {
+    present: true,
+    steps: rendered,
+    reason: "ok",
+    defaults_run_working_directory: jobWorkingDirectory.value,
+    defaults_run_working_directory_present: jobWorkingDirectory.present,
+    defaults_run_working_directory_kind: jobWorkingDirectory.kind,
+    defaults_run_shell: jobRunShell.value,
+    defaults_run_shell_present: jobRunShell.present,
+    defaults_run_shell_kind: jobRunShell.kind,
+    env_present: jobEnv.present,
+    env_kind: jobEnv.kind,
+    env: jobEnv.entries,
+    env_keys_unique: jobEnv.keysUnique,
+    env_raw_keys: jobEnv.rawKeys,
+    continue_on_error: jobCoeRaw === true ? true : (jobCoeRaw === false ? false : null),
+    continue_on_error_present: jobCoePresent,
+    continue_on_error_kind: scalarKind(jobCoeRaw),
+    if: typeof jobIfRaw === "string" ? jobIfRaw : (jobIfRaw == null ? "" : String(jobIfRaw)),
+    if_present: jobIfPresent,
+    if_kind: scalarKind(jobIfRaw),
+    needs_present: jobNeedsPresent,
+    container_present: jobContainerPresent,
+    services_present: jobServicesPresent,
+    runs_on: typeof jobRunsOn === "string" ? jobRunsOn : (jobRunsOn == null ? "" : String(jobRunsOn)),
+    runs_on_kind: scalarKind(jobRunsOn),
+    permissions_present: jobPermissions.present,
+    permissions_kind: jobPermissions.kind
+  };
 }
-emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
+const uploadArtifactReferences = [];
+const actionReferences = [];
+const runBlocks = [];
+const jobPermissionRecords = [];
+for (const [jobName, job] of Object.entries(jobs)) {
+  if (!job || typeof job !== "object" || Array.isArray(job)) continue;
+  const jobPermissions = permissionsMeta(job);
+  jobPermissionRecords.push({ job: String(jobName), present: jobPermissions.present, kind: jobPermissions.kind });
+  const jobCoePresent = Object.prototype.hasOwnProperty.call(job, "continue-on-error");
+  const jobCoeRaw = jobCoePresent ? job["continue-on-error"] : null;
+  const jobIfPresent = Object.prototype.hasOwnProperty.call(job, "if");
+  const jobIfRaw = jobIfPresent ? job.if : null;
+  const jobNeedsPresent = Object.prototype.hasOwnProperty.call(job, "needs");
+  if (Object.prototype.hasOwnProperty.call(job, "uses")) {
+    const jobUses = job.uses;
+    actionReferences.push({
+      job: String(jobName), index: -1, scope: "job",
+      uses: typeof jobUses === "string" ? jobUses : "", uses_kind: scalarKind(jobUses)
+    });
+  }
+  if (!Array.isArray(job.steps)) continue;
+  for (let index = 0; index < job.steps.length; index++) {
+    const step = job.steps[index];
+    if (!step || typeof step !== "object" || Array.isArray(step)) continue;
+    const stepRecord = stepMeta(index, step);
+    if (Object.prototype.hasOwnProperty.call(step, "uses")) {
+      actionReferences.push({
+        job: String(jobName), index, scope: "step",
+        uses: typeof step.uses === "string" ? step.uses : "", uses_kind: scalarKind(step.uses)
+      });
+    }
+    if (typeof step.run === "string") {
+      runBlocks.push({
+        job: String(jobName), index, run: step.run,
+        shell: stepRecord.shell, shell_kind: stepRecord.shell_kind,
+        if: stepRecord.if, if_present: stepRecord.if_present, if_kind: stepRecord.if_kind,
+        continue_on_error: stepRecord.continue_on_error,
+        continue_on_error_present: stepRecord.continue_on_error_present,
+        continue_on_error_kind: stepRecord.continue_on_error_kind,
+        job_if: typeof jobIfRaw === "string" ? jobIfRaw : (jobIfRaw == null ? "" : String(jobIfRaw)),
+        job_if_present: jobIfPresent, job_if_kind: scalarKind(jobIfRaw),
+        job_continue_on_error: jobCoeRaw === true ? true : (jobCoeRaw === false ? false : null),
+        job_continue_on_error_present: jobCoePresent,
+        job_continue_on_error_kind: scalarKind(jobCoeRaw),
+        job_needs_present: jobNeedsPresent
+      });
+    }
+    if (typeof step.uses === "string" && step.uses.toLowerCase().startsWith("actions/upload-artifact")) {
+      uploadArtifactReferences.push({ job: String(jobName), index: index, uses: step.uses });
+    }
+  }
+}
+// Node YAML implementations and PyYAML do not share YAML 1.1 key coercion.
+// Bind trigger presence to the literal root source key, not a parsed Boolean
+// key such as `true:`.
+const workflowOnPresent = hasExplicitRootOnKey(workflowSource);
+const workflowOn = workflowOnPresent
+  ? (Object.prototype.hasOwnProperty.call(data, "on") ? data.on
+    : (Object.prototype.hasOwnProperty.call(data, "true") ? data.true : null))
+  : null;
+const workflowTriggers = workflowOn && typeof workflowOn === "object" && !Array.isArray(workflowOn) ? Object.keys(workflowOn).map((key) => String(key)) : [];
+let skipBundleDefaultPresent = false, skipBundleDefault = null;
+if (workflowOn && typeof workflowOn === "object" && !Array.isArray(workflowOn)) {
+  const dispatch = workflowOn.workflow_dispatch;
+  if (dispatch && typeof dispatch === "object" && !Array.isArray(dispatch) && dispatch.inputs && typeof dispatch.inputs === "object" && !Array.isArray(dispatch.inputs)) {
+    const skipBundle = dispatch.inputs.skip_bundle;
+    if (skipBundle && typeof skipBundle === "object" && !Array.isArray(skipBundle) && Object.prototype.hasOwnProperty.call(skipBundle, "default")) {
+      skipBundleDefaultPresent = true;
+      skipBundleDefault = skipBundle.default;
+    }
+  }
+}
+emit({
+  ok: true,
+  engine: "node-yaml",
+  error: "",
+  workflow_defaults_run_working_directory: workflowWorkingDirectory.value,
+  workflow_defaults_run_working_directory_present: workflowWorkingDirectory.present,
+  workflow_defaults_run_working_directory_kind: workflowWorkingDirectory.kind,
+  workflow_defaults_run_shell: workflowRunShell.value,
+  workflow_defaults_run_shell_present: workflowRunShell.present,
+  workflow_defaults_run_shell_kind: workflowRunShell.kind,
+  workflow_env_present: workflowEnv.present,
+  workflow_env_kind: workflowEnv.kind,
+  workflow_env: workflowEnv.entries,
+  workflow_env_keys_unique: workflowEnv.keysUnique,
+  workflow_env_raw_keys: workflowEnv.rawKeys,
+  workflow_on_present: workflowOnPresent,
+  workflow_on_kind: scalarKind(workflowOn),
+  workflow_triggers: workflowTriggers,
+  upload_artifact_references: uploadArtifactReferences,
+  action_references: actionReferences,
+  run_blocks: runBlocks,
+  root_permissions_present: rootPermissions.present,
+  root_permissions_kind: rootPermissions.kind,
+  root_permissions: rootPermissions.entries,
+  root_permissions_keys_unique: rootPermissions.keysUnique,
+  root_permissions_raw_keys: rootPermissions.rawKeys,
+  job_permission_records: jobPermissionRecords,
+  skip_bundle_default_present: skipBundleDefaultPresent,
+  skip_bundle_default_kind: scalarKind(skipBundleDefault),
+  skip_bundle_default: typeof skipBundleDefault === "string" ? skipBundleDefault : (skipBundleDefault == null ? "" : String(skipBundleDefault)),
+  jobs: out
+});
 '@
 
     $parsed = $null
@@ -3560,7 +5246,18 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             Valid = $false
             Engine = 'none'
             Errors = @('No real YAML parser available for host evidence verifier order (need python+PyYAML or node with yaml/js-yaml). Structural-only checks are not accepted.')
-            jobs = [hashtable]@{}
+            jobs = [hashtable]$unavailableJobResults
+            ActionReferences = @()
+            RunBlocks = @()
+            RootPermissionsPresent = $false
+            RootPermissionsKind = ''
+            RootPermissions = [pscustomobject]@{}
+            RootPermissionsKeysUnique = $false
+            RootPermissionsRawKeys = @()
+            JobPermissionRecords = @()
+            SkipBundleDefaultPresent = $false
+            SkipBundleDefaultKind = ''
+            SkipBundleDefault = ''
         }
     }
 
@@ -3570,7 +5267,18 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             Valid = $false
             Engine = $engine
             Errors = @($msg)
-            jobs = [hashtable]@{}
+            jobs = [hashtable]$unavailableJobResults
+            ActionReferences = @()
+            RunBlocks = @()
+            RootPermissionsPresent = $false
+            RootPermissionsKind = ''
+            RootPermissions = [pscustomobject]@{}
+            RootPermissionsKeysUnique = $false
+            RootPermissionsRawKeys = @()
+            JobPermissionRecords = @()
+            SkipBundleDefaultPresent = $false
+            SkipBundleDefaultKind = ''
+            SkipBundleDefault = ''
         }
     }
 
@@ -3583,12 +5291,313 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
         return $Default
     }
 
-    function Test-IfAlwaysExpression {
-        param([AllowEmptyString()][string]$IfExpr)
-        if ([string]::IsNullOrWhiteSpace($IfExpr)) { return $false }
-        $t = $IfExpr.Trim()
-        # Fail closed on always() forms that force upload after a failed verifier.
-        return ($t -match '(?i)\balways\s*\(')
+    function Test-StepHasNoCondition {
+        param($Step)
+        $present = [bool](Get-StepProp -Step $Step -Name 'if_present' -Default $false)
+        # Controlled evidence steps need the field truly absent. An explicit empty
+        # scalar is parser/runner-version sensitive and must not be treated as a
+        # portable unconditional execution guarantee.
+        return (-not $present)
+    }
+
+    function Test-ContinueOnErrorDisabled {
+        param(
+            [bool]$Present,
+            [AllowEmptyString()][string]$Kind,
+            $Value
+        )
+        # Controlled evidence and CI gates need the field absent, not merely a
+        # parser-specific value that happens to coerce to false (YAML 1.1 `off` /
+        # `no` differ from YAML 1.2). The production workflows do not need this
+        # tolerance, so reject every explicit spelling.
+        return (-not $Present)
+    }
+
+    function Test-StepContinueOnErrorDisabled {
+        param($Step)
+        return Test-ContinueOnErrorDisabled `
+            -Present ([bool](Get-StepProp -Step $Step -Name 'continue_on_error_present' -Default $false)) `
+            -Kind ([string](Get-StepProp -Step $Step -Name 'continue_on_error_kind' -Default '')) `
+            -Value (Get-StepProp -Step $Step -Name 'continue_on_error' -Default $null)
+    }
+
+    function Test-RunWorkingDirectoryIsRepositoryDefault {
+        param(
+            [bool]$Present,
+            [AllowEmptyString()][string]$Kind,
+            [AllowEmptyString()][string]$Value
+        )
+        if (-not $Present) { return $true }
+        # Relative dot-sourcing is trusted only from the checkout root. An explicit
+        # empty scalar has the same runtime meaning as the default; every non-empty
+        # or non-string override can redirect the common helper to an attacker path.
+        return ($Kind -eq 'string' -and [string]::IsNullOrWhiteSpace($Value))
+    }
+
+    function Test-RunShellIsAbsent {
+        param([bool]$Present)
+        # A workflow/job default shell can wrap a command-shaped gate and mask
+        # its exit code. Governed steps either declare their required shell
+        # directly or inherit the platform default, never a defaults.run.shell.
+        return (-not $Present)
+    }
+
+    function Test-StepHasNoEnvironment {
+        param($Step)
+        # Metadata omission is not a safe default: a parser adapter must prove
+        # env absence before a trusted command name such as pwsh/npm is used.
+        return (-not [bool](Get-StepProp -Step $Step -Name 'env_present' -Default $true))
+    }
+
+    function Test-HostStepEnvironmentContract {
+        param(
+            [Parameter(Mandatory = $true)][string]$JobName,
+            [Parameter(Mandatory = $true)]$Step,
+            [int]$ProducerIndex
+        )
+
+        if (-not [bool](Get-StepProp -Step $Step -Name 'env_present' -Default $false)) {
+            return $true
+        }
+        # The sole controlled exception turns workflow_dispatch input into an
+        # inert environment value for the Windows producer. Everything else
+        # remains env-free so PATH/shell/tool identity cannot be shadowed.
+        $index = [int](Get-StepProp -Step $Step -Name 'index' -Default -1)
+        if ($JobName -ne 'windows-host-evidence' -or $index -ne $ProducerIndex -or
+            -not [string]::Equals(([string](Get-StepProp -Step $Step -Name 'env_kind' -Default '')).Trim(), 'mapping', [System.StringComparison]::Ordinal) -or
+            -not [bool](Get-StepProp -Step $Step -Name 'env_keys_unique' -Default $false)) {
+            return $false
+        }
+        $rawKeys = @((Get-StepProp -Step $Step -Name 'env_raw_keys' -Default @()) | ForEach-Object { ([string]$_).Trim() })
+        if ($rawKeys.Count -ne 1 -or -not [string]::Equals($rawKeys[0], 'SF_RELEASE_SKIP_BUNDLE_INPUT', [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+        $entries = Get-StepProp -Step $Step -Name 'env' -Default $null
+        $value = $null
+        if ($entries -is [System.Collections.IDictionary]) {
+            $value = $entries['SF_RELEASE_SKIP_BUNDLE_INPUT']
+        } elseif ($null -ne $entries -and $entries.PSObject.Properties.Name -contains 'SF_RELEASE_SKIP_BUNDLE_INPUT') {
+            $value = $entries.PSObject.Properties['SF_RELEASE_SKIP_BUNDLE_INPUT'].Value
+        } else {
+            return $false
+        }
+        return [string]::Equals([string]$value, '${{ github.event.inputs.skip_bundle }}', [System.StringComparison]::Ordinal)
+    }
+
+    function Test-HostStepExecutionShape {
+        param($Step)
+        # `uses` and `run` are mutually exclusive workflow-step execution
+        # modes. Do not assume a particular Gitea/act implementation will run
+        # the command when both fields appear: accepting the command text would
+        # turn a future ambiguous YAML edit into a false-green evidence claim.
+        $usesPresent = [bool](Get-StepProp -Step $Step -Name 'uses_present' -Default $false)
+        $runPresent = [bool](Get-StepProp -Step $Step -Name 'run_present' -Default $false)
+        if ($usesPresent -eq $runPresent) { return $false }
+        if ($usesPresent) {
+            return ([string]::Equals(([string](Get-StepProp -Step $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -and
+                -not [string]::IsNullOrWhiteSpace([string](Get-StepProp -Step $Step -Name 'uses' -Default '')))
+        }
+        return ([string]::Equals(([string](Get-StepProp -Step $Step -Name 'run_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -and
+            -not [string]::IsNullOrWhiteSpace([string](Get-StepProp -Step $Step -Name 'run' -Default '')))
+    }
+
+    function Test-HostJobEnvironmentContract {
+        param($Job)
+        if (-not [bool](Get-StepProp -Step $Job -Name 'env_present' -Default $false) -or
+            -not [string]::Equals([string](Get-StepProp -Step $Job -Name 'env_kind' -Default ''), 'mapping', [System.StringComparison]::Ordinal) -or
+            -not [bool](Get-StepProp -Step $Job -Name 'env_keys_unique' -Default $false)) {
+            return $false
+        }
+        $expected = [ordered]@{
+            CARGO_TARGET_DIR = ''
+            RUST_LOG          = 'info'
+        }
+        $rawKeys = @((Get-StepProp -Step $Job -Name 'env_raw_keys' -Default @()) | ForEach-Object { ([string]$_).Trim() })
+        if ($rawKeys.Count -ne $expected.Count) { return $false }
+        foreach ($expectedKey in $expected.Keys) {
+            if (@($rawKeys | Where-Object {
+                        [string]::Equals($_, [string]$expectedKey, [System.StringComparison]::Ordinal)
+                    }).Count -ne 1) {
+                return $false
+            }
+        }
+        $entries = Get-StepProp -Step $Job -Name 'env' -Default $null
+        foreach ($expectedKey in $expected.Keys) {
+            $value = $null
+            if ($entries -is [System.Collections.IDictionary]) {
+                $value = $entries[$expectedKey]
+            } elseif ($null -ne $entries -and $entries.PSObject.Properties.Name -contains $expectedKey) {
+                $value = $entries.PSObject.Properties[$expectedKey].Value
+            } else {
+                return $false
+            }
+            if (-not [string]::Equals([string]$value, [string]$expected[$expectedKey], [System.StringComparison]::Ordinal)) {
+                return $false
+            }
+        }
+        return $true
+    }
+
+    function Test-UploadArtifactActionReference {
+        param([AllowEmptyString()][string]$Uses)
+        if ([string]::IsNullOrWhiteSpace($Uses)) { return $false }
+        return $Uses.Trim().StartsWith('actions/upload-artifact', [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    function Test-UsesPinnedUploadArtifactV4 {
+        param([AllowEmptyString()][string]$Uses)
+        return [string]::Equals($Uses.Trim(), 'actions/upload-artifact@v4', [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    function Test-UsesPinnedCheckoutV4 {
+        param([AllowEmptyString()][string]$Uses)
+        return [string]::Equals($Uses.Trim(), $requiredCheckoutAction, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    function Test-CheckoutActionReference {
+        param([AllowEmptyString()][string]$Uses)
+        if ([string]::IsNullOrWhiteSpace($Uses)) { return $false }
+        return $Uses.Trim().StartsWith('actions/checkout', [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    function Test-RunReferencesControlledScript {
+        param(
+            [AllowEmptyString()][string]$Run,
+            [Parameter(Mandatory = $true)][string]$ScriptLeafName,
+            [switch]$RequireOutputDir
+        )
+        if ([string]::IsNullOrWhiteSpace($Run)) { return $false }
+        $requiredParameter = if ($RequireOutputDir) { 'OutputDir' } else { '' }
+        # Do not trust a leaf-name substring: comments, here-strings, Write-Host,
+        # and evil/run-release-build.ps1 must not count as evidence production.
+        return Test-ReleaseRunContainsPowerShellFileInvocation `
+            -ScriptText $Run `
+            -ExpectedRelativePath ("scripts/{0}" -f $ScriptLeafName) `
+            -RequiredParameter $requiredParameter
+    }
+
+    function ConvertTo-ReleaseControlledRunText {
+        param([AllowEmptyString()][string]$Text)
+        return (([string]$Text -replace '\s+', ' ').Trim())
+    }
+
+    function Test-ReleaseWindowsTauriCliSetupStepContract {
+        param($Step)
+        if ($null -eq $Step -or
+            -not (Test-HostStepExecutionShape -Step $Step) -or
+            -not [bool](Get-StepProp -Step $Step -Name 'run_present' -Default $false) -or
+            -not [bool](Get-StepProp -Step $Step -Name 'if_present' -Default $false) -or
+            -not [string]::Equals(([string](Get-StepProp -Step $Step -Name 'if_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals(([string](Get-StepProp -Step $Step -Name 'if' -Default '')).Trim(), "github.event.inputs.skip_bundle == 'false'", [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals(([string](Get-StepProp -Step $Step -Name 'shell' -Default '')).Trim(), 'pwsh', [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-StepContinueOnErrorDisabled -Step $Step) -or
+            -not (Test-RunWorkingDirectoryIsRepositoryDefault `
+                    -Present ([bool](Get-StepProp -Step $Step -Name 'working_directory_present' -Default $false)) `
+                    -Kind ([string](Get-StepProp -Step $Step -Name 'working_directory_kind' -Default '')) `
+                    -Value ([string](Get-StepProp -Step $Step -Name 'working_directory' -Default '')))) {
+            return $false
+        }
+        $expected = @'
+$ErrorActionPreference = 'Stop'
+$pinned = '2.11.2'
+cargo install tauri-cli --locked --version $pinned --force
+cargo tauri --version
+$ver = (& cargo tauri --version 2>&1 | Out-String).Trim()
+if ($ver -notmatch [regex]::Escape($pinned)) {
+  throw "Expected tauri-cli $pinned, got: $ver"
+}
+'@
+        return [string]::Equals(
+            (ConvertTo-ReleaseControlledRunText -Text ([string](Get-StepProp -Step $Step -Name 'run' -Default ''))),
+            (ConvertTo-ReleaseControlledRunText -Text $expected),
+            [System.StringComparison]::Ordinal
+        )
+    }
+
+    function Test-ReleaseAndroidTargetSetupStepContract {
+        param($Step)
+        if ($null -eq $Step -or
+            -not (Test-HostStepExecutionShape -Step $Step) -or
+            -not [bool](Get-StepProp -Step $Step -Name 'run_present' -Default $false) -or
+            -not (Test-StepHasNoCondition -Step $Step) -or
+            -not [string]::Equals(([string](Get-StepProp -Step $Step -Name 'shell' -Default '')).Trim(), 'pwsh', [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-StepContinueOnErrorDisabled -Step $Step) -or
+            -not (Test-RunWorkingDirectoryIsRepositoryDefault `
+                    -Present ([bool](Get-StepProp -Step $Step -Name 'working_directory_present' -Default $false)) `
+                    -Kind ([string](Get-StepProp -Step $Step -Name 'working_directory_kind' -Default '')) `
+                    -Value ([string](Get-StepProp -Step $Step -Name 'working_directory' -Default '')))) {
+            return $false
+        }
+        $expected = @'
+rustup target add aarch64-linux-android
+rustup target list --installed | Select-String 'aarch64-linux-android'
+'@
+        return [string]::Equals(
+            (ConvertTo-ReleaseControlledRunText -Text ([string](Get-StepProp -Step $Step -Name 'run' -Default ''))),
+            (ConvertTo-ReleaseControlledRunText -Text $expected),
+            [System.StringComparison]::Ordinal
+        )
+    }
+
+    function Test-ReleaseHostTrustedRunTopology {
+        param(
+            [Parameter(Mandatory = $true)][string]$JobName,
+            [Parameter(Mandatory = $true)][object[]]$Steps,
+            [int]$CheckoutIndex,
+            [int]$ProducerIndex,
+            [int]$VerifierIndex
+        )
+
+        $topologyErrors = New-Object System.Collections.Generic.List[string]
+        $expectedSetupCount = 0
+        foreach ($step in @($Steps)) {
+            if ($null -eq $step) { continue }
+            $run = ([string](Get-StepProp -Step $step -Name 'run' -Default '')).Trim()
+            if ([string]::IsNullOrWhiteSpace($run)) { continue }
+            try { $index = [int](Get-StepProp -Step $step -Name 'index' -Default -1) } catch { $index = -1 }
+            if ($index -eq $ProducerIndex -or $index -eq $VerifierIndex) { continue }
+
+            $isExpectedSetup = if ($JobName -eq 'windows-host-evidence') {
+                Test-ReleaseWindowsTauriCliSetupStepContract -Step $step
+            } else {
+                Test-ReleaseAndroidTargetSetupStepContract -Step $step
+            }
+            if (-not $isExpectedSetup) {
+                $topologyErrors.Add(("unexpected executable run step at index {0}; trusted host topology permits only the fixed setup, producer, and verifier scripts" -f $index)) | Out-Null
+                continue
+            }
+            $expectedSetupCount += 1
+            if ($index -le $CheckoutIndex -or $index -ge $ProducerIndex) {
+                $topologyErrors.Add(("trusted setup run step at index {0} must be after checkout and before the controlled producer" -f $index)) | Out-Null
+            }
+        }
+        if ($expectedSetupCount -ne 1) {
+            $topologyErrors.Add(("trusted host topology requires exactly one fixed setup run step before the producer (found {0})" -f $expectedSetupCount)) | Out-Null
+        }
+        return [pscustomobject]@{ Valid = ($topologyErrors.Count -eq 0); Errors = @($topologyErrors) }
+    }
+
+    $workflowDefaultWorkingDirectoryOk = Test-RunWorkingDirectoryIsRepositoryDefault `
+        -Present ([bool](Get-StepProp -Step $parsed -Name 'workflow_defaults_run_working_directory_present' -Default $false)) `
+        -Kind ([string](Get-StepProp -Step $parsed -Name 'workflow_defaults_run_working_directory_kind' -Default '')) `
+        -Value ([string](Get-StepProp -Step $parsed -Name 'workflow_defaults_run_working_directory' -Default ''))
+    $workflowDefaultShellOk = Test-RunShellIsAbsent `
+        -Present ([bool](Get-StepProp -Step $parsed -Name 'workflow_defaults_run_shell_present' -Default $true))
+    $workflowEnvironmentOk = -not [bool](Get-StepProp -Step $parsed -Name 'workflow_env_present' -Default $true)
+
+    $allUploadArtifactReferences = @($parsed.upload_artifact_references | Where-Object { $null -ne $_ })
+    $globalUploadTopologyOk = ($allUploadArtifactReferences.Count -eq $requiredJobs.Count)
+    if ($globalUploadTopologyOk) {
+        foreach ($requiredJobName in $requiredJobs) {
+            $jobUploads = @($allUploadArtifactReferences | Where-Object {
+                    [string]::Equals([string]$_.job, $requiredJobName, [System.StringComparison]::Ordinal)
+                })
+            if ($jobUploads.Count -ne 1 -or
+                -not (Test-UsesPinnedUploadArtifactV4 -Uses ([string]$jobUploads[0].uses))) {
+                $globalUploadTopologyOk = $false
+                break
+            }
+        }
     }
 
     foreach ($jobName in $requiredJobs) {
@@ -3621,18 +5630,29 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
 
         $uploadIdx = -1
         $verifierIdx = -1
+        $checkoutIdx = -1
         $uploadStep = $null
         $verifierStep = $null
+        $checkoutStep = $null
+        $uploadSteps = @()
+        $checkoutSteps = @()
+        $producerSteps = @()
+        $evidenceOutputIdSteps = @()
+        $producerScriptLeafName = if ($jobName -eq 'windows-host-evidence') { 'run-release-build.ps1' } else { 'run-android-host-pipeline.ps1' }
         foreach ($step in $steps) {
             if ($null -eq $step) { continue }
             $idx = -1
             try { $idx = [int](Get-StepProp -Step $step -Name 'index' -Default -1) } catch { $idx = -1 }
             $uses = [string](Get-StepProp -Step $step -Name 'uses' -Default '')
             $run = [string](Get-StepProp -Step $step -Name 'run' -Default '')
+            $stepId = [string](Get-StepProp -Step $step -Name 'id' -Default '')
 
-            if ($uploadIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($uses) -and $uses.StartsWith('actions/upload-artifact')) {
-                $uploadIdx = $idx
-                $uploadStep = $step
+            if (Test-UploadArtifactActionReference -Uses $uses) {
+                $uploadSteps += [pscustomobject]@{
+                    Index = $idx
+                    Step = $step
+                    Uses = $uses
+                }
             }
             if ($verifierIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($run)) {
                 if (Test-ReleaseRunInvokesCommand -ScriptText $run -CommandName $verifierCommand) {
@@ -3640,16 +5660,96 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
                     $verifierStep = $step
                 }
             }
+            if (Test-CheckoutActionReference -Uses $uses) {
+                $checkoutSteps += [pscustomobject]@{
+                    Index = $idx
+                    Step = $step
+                    Uses = $uses
+                }
+            }
+            if ($RequireFreshProducer -and
+                [string]::Equals($stepId.Trim(), 'evidence', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $evidenceOutputIdSteps += [pscustomobject]@{
+                    Index = $idx
+                    Step = $step
+                    Run = $run
+                }
+            }
+            if ($RequireFreshProducer -and (Test-RunReferencesControlledScript -Run $run -ScriptLeafName $producerScriptLeafName -RequireOutputDir)) {
+                $producerSteps += [pscustomobject]@{
+                    Index = $idx
+                    Step = $step
+                    Run = $run
+                }
+            }
+        }
+
+        if ($uploadSteps.Count -eq 1) {
+            $uploadIdx = [int]$uploadSteps[0].Index
+            $uploadStep = $uploadSteps[0].Step
+        }
+        if ($checkoutSteps.Count -eq 1) {
+            $checkoutIdx = [int]$checkoutSteps[0].Index
+            $checkoutStep = $checkoutSteps[0].Step
+        }
+        $producerIdx = -1
+        $producerStep = $null
+        if ($producerSteps.Count -eq 1) {
+            $producerIdx = [int]$producerSteps[0].Index
+            $producerStep = $producerSteps[0].Step
         }
 
         $reasonParts = New-Object System.Collections.Generic.List[string]
         $has = $false
         $shellOk = $false
         $continueOnErrorOk = $false
+        $verifierIfOk = $false
         $uploadIfOk = $false
+        $uploadContinueOnErrorOk = $false
+        $uploadActionOk = $false
+        $checkoutOk = (-not $RequireCheckout)
+        $producerOk = (-not $RequireFreshProducer)
+        $producerOutputIdOk = (-not $RequireFreshProducer)
+        $producerHostOnlyOk = (-not $RequireFreshProducer -or $jobName -ne 'windows-host-evidence')
+        $producerShellOk = (-not $RequireFreshProducer)
+        $producerEvidenceBindingOk = (-not $RequireFreshProducer)
+        $retentionOk = (-not $RequireRetentionDays14)
         $scriptContractOk = $false
+        $verifierWorkingDirectoryOk = $false
+        $runTopologyOk = (-not $RequireFreshProducer)
+        $trustedRunTopology = $null
+        $jobContinueOnErrorOk = Test-ContinueOnErrorDisabled `
+            -Present ([bool](Get-StepProp -Step $info -Name 'continue_on_error_present' -Default $false)) `
+            -Kind ([string](Get-StepProp -Step $info -Name 'continue_on_error_kind' -Default '')) `
+            -Value (Get-StepProp -Step $info -Name 'continue_on_error' -Default $null)
+        $jobIfOk = Test-StepHasNoCondition -Step $info
+        $jobNeedsOk = -not [bool](Get-StepProp -Step $info -Name 'needs_present' -Default $false)
+        $jobRunnerOk = ([string](Get-StepProp -Step $info -Name 'runs_on_kind' -Default '') -eq 'string' -and
+            [string]::Equals(([string](Get-StepProp -Step $info -Name 'runs_on' -Default '')).Trim(), 'windows-latest', [System.StringComparison]::OrdinalIgnoreCase))
+        $jobDefaultWorkingDirectoryOk = Test-RunWorkingDirectoryIsRepositoryDefault `
+            -Present ([bool](Get-StepProp -Step $info -Name 'defaults_run_working_directory_present' -Default $false)) `
+            -Kind ([string](Get-StepProp -Step $info -Name 'defaults_run_working_directory_kind' -Default '')) `
+            -Value ([string](Get-StepProp -Step $info -Name 'defaults_run_working_directory' -Default ''))
+        $jobDefaultShellOk = Test-RunShellIsAbsent `
+            -Present ([bool](Get-StepProp -Step $info -Name 'defaults_run_shell_present' -Default $true))
+        $jobEnvironmentOk = Test-HostJobEnvironmentContract -Job $info
+        $jobExecutionContextOk = (-not [bool](Get-StepProp -Step $info -Name 'container_present' -Default $true) -and
+            -not [bool](Get-StepProp -Step $info -Name 'services_present' -Default $true))
+        $stepEnvironmentOk = (@($steps | Where-Object {
+                    -not (Test-HostStepEnvironmentContract -JobName $jobName -Step $_ -ProducerIndex $producerIdx)
+                }).Count -eq 0)
+        $stepExecutionShapeOk = (@($steps | Where-Object { -not (Test-HostStepExecutionShape -Step $_) }).Count -eq 0)
         $pathBindOk = $false
         $scriptContract = $null
+        if ($RequireFreshProducer) {
+            $trustedRunTopology = Test-ReleaseHostTrustedRunTopology `
+                -JobName $jobName `
+                -Steps $steps `
+                -CheckoutIndex $checkoutIdx `
+                -ProducerIndex $producerIdx `
+                -VerifierIndex $verifierIdx
+            $runTopologyOk = [bool]$trustedRunTopology.Valid
+        }
 
         if (-not $present) {
             $reasonParts.Add($(if ($info.reason) { [string]$info.reason } else { 'job missing or not a mapping' })) | Out-Null
@@ -3657,11 +5757,175 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             $reasonParts.Add([string]$info.reason) | Out-Null
         } elseif ($verifierIdx -lt 0) {
             $reasonParts.Add('missing executable Assert-ReleaseEvidencePackage CommandAst invocation in run step') | Out-Null
-        } elseif ($uploadIdx -lt 0) {
+        } elseif ($uploadSteps.Count -eq 0) {
             $reasonParts.Add('missing actions/upload-artifact step') | Out-Null
+        } elseif ($uploadSteps.Count -ne 1) {
+            $reasonParts.Add(("host job must contain exactly one actions/upload-artifact@v4 step (found {0})" -f $uploadSteps.Count)) | Out-Null
+        } elseif ($RequireCheckout -and $checkoutSteps.Count -eq 0) {
+            $reasonParts.Add('host job must contain exactly one actions/checkout@v4 step before the controlled verifier') | Out-Null
+        } elseif ($RequireCheckout -and $checkoutSteps.Count -ne 1) {
+            $reasonParts.Add(("host job must contain exactly one actions/checkout@v4 step (found {0})" -f $checkoutSteps.Count)) | Out-Null
+        } elseif ($RequireCheckout -and $checkoutIdx -ge $verifierIdx) {
+            $reasonParts.Add('actions/checkout@v4 must run before the controlled verifier') | Out-Null
+        } elseif ($RequireFreshProducer -and $producerSteps.Count -eq 0) {
+            $reasonParts.Add(("host job must contain exactly one fresh evidence producer ({0}) before the controlled verifier" -f $producerScriptLeafName)) | Out-Null
+        } elseif ($RequireFreshProducer -and $producerSteps.Count -ne 1) {
+            $reasonParts.Add(("host job must contain exactly one fresh evidence producer ({0}; found {1})" -f $producerScriptLeafName, $producerSteps.Count)) | Out-Null
+        } elseif ($RequireFreshProducer -and $evidenceOutputIdSteps.Count -ne 1) {
+            $reasonParts.Add(("host job must assign id: evidence exactly once to the fresh producer (found {0})" -f $evidenceOutputIdSteps.Count)) | Out-Null
+        } elseif ($RequireFreshProducer -and $evidenceOutputIdSteps[0].Index -ne $producerIdx) {
+            $reasonParts.Add('id: evidence must belong to the controlled fresh evidence producer') | Out-Null
+        } elseif ($RequireFreshProducer -and $producerIdx -ge $verifierIdx) {
+            $reasonParts.Add('fresh evidence producer must run before the controlled verifier') | Out-Null
         } elseif ($verifierIdx -ge $uploadIdx) {
             $reasonParts.Add('Assert-ReleaseEvidencePackage is not before upload-artifact') | Out-Null
+        } elseif ($uploadIdx -ne ($verifierIdx + 1)) {
+            $reasonParts.Add('controlled verifier must be immediately followed by its only upload-artifact step') | Out-Null
         } else {
+            if (-not $globalUploadTopologyOk) {
+                $reasonParts.Add('workflow must contain exactly one actions/upload-artifact@v4 step in each required host job and no other upload-artifact steps') | Out-Null
+            }
+            if (-not $runTopologyOk) {
+                foreach ($topologyError in @($trustedRunTopology.Errors)) {
+                    $reasonParts.Add([string]$topologyError) | Out-Null
+                }
+            }
+            if (-not $jobContinueOnErrorOk) {
+                    $reasonParts.Add('host job continue-on-error must be absent') | Out-Null
+            }
+            if (-not $jobIfOk) {
+                $reasonParts.Add('host job must not set an if: condition') | Out-Null
+            }
+            if (-not $jobNeedsOk) {
+                $reasonParts.Add('host job must not set needs; a skipped or failed dependency can suppress evidence execution') | Out-Null
+            }
+            if (-not $jobRunnerOk) {
+                $reasonParts.Add('host job runs-on must be exactly windows-latest') | Out-Null
+            }
+            if (-not $workflowDefaultWorkingDirectoryOk) {
+                $reasonParts.Add('workflow defaults.run.working-directory must be absent or empty for repository-root verification') | Out-Null
+            }
+            if (-not $workflowDefaultShellOk) {
+                $reasonParts.Add('workflow defaults.run.shell must be absent for controlled host command execution') | Out-Null
+            }
+            if (-not $workflowEnvironmentOk) {
+                $reasonParts.Add('workflow env must be absent for controlled host command execution') | Out-Null
+            }
+            if (-not $jobDefaultWorkingDirectoryOk) {
+                $reasonParts.Add('job defaults.run.working-directory must be absent or empty for repository-root verification') | Out-Null
+            }
+            if (-not $jobDefaultShellOk) {
+                $reasonParts.Add('host job defaults.run.shell must be absent') | Out-Null
+            }
+            if (-not $jobEnvironmentOk) {
+                $reasonParts.Add('host job env must be exactly CARGO_TARGET_DIR="" and RUST_LOG="info" with exact key spelling') | Out-Null
+            }
+            if (-not $jobExecutionContextOk) {
+                $reasonParts.Add('host job must not set container or services') | Out-Null
+            }
+            if (-not $stepEnvironmentOk) {
+                $reasonParts.Add('controlled host job steps must not set env overrides, except the exact Windows producer skip_bundle input binding') | Out-Null
+            }
+            if (-not $stepExecutionShapeOk) {
+                $reasonParts.Add('each controlled host step must use exactly one execution mode (uses or run), never both or neither') | Out-Null
+            }
+            if ($RequireFreshProducer) {
+                $producerExecutionShapeOk = Test-HostStepExecutionShape -Step $producerStep
+                $producerIfOk = Test-StepHasNoCondition -Step $producerStep
+                $producerContinueOk = Test-StepContinueOnErrorDisabled -Step $producerStep
+                $producerWorkingDirectoryOk = Test-RunWorkingDirectoryIsRepositoryDefault `
+                    -Present ([bool](Get-StepProp -Step $producerStep -Name 'working_directory_present' -Default $false)) `
+                    -Kind ([string](Get-StepProp -Step $producerStep -Name 'working_directory_kind' -Default '')) `
+                    -Value ([string](Get-StepProp -Step $producerStep -Name 'working_directory' -Default ''))
+                if (-not $producerIfOk) {
+                    $reasonParts.Add('fresh evidence producer must not set an if: condition') | Out-Null
+                }
+                if (-not $producerExecutionShapeOk -or -not [bool](Get-StepProp -Step $producerStep -Name 'run_present' -Default $false)) {
+                    $reasonParts.Add('fresh evidence producer must be an unambiguous run-only step') | Out-Null
+                }
+                if (-not $producerContinueOk) {
+                    $reasonParts.Add('fresh evidence producer continue-on-error must be absent') | Out-Null
+                }
+                if (-not $producerWorkingDirectoryOk) {
+                    $reasonParts.Add('fresh evidence producer working-directory must be absent or empty') | Out-Null
+                }
+                $producerOutputIdOk = ($evidenceOutputIdSteps.Count -eq 1 -and $evidenceOutputIdSteps[0].Index -eq $producerIdx)
+                if (-not $producerOutputIdOk) {
+                    $reasonParts.Add('fresh evidence producer must own id: evidence so verifier/upload consume this run output') | Out-Null
+                }
+                if ($jobName -eq 'windows-host-evidence') {
+                    $producerHostOnlyOk = Test-ReleaseWindowsHostOnlyProducerScriptContract `
+                        -ScriptText ([string]$producerSteps[0].Run)
+                    if (-not $producerHostOnlyOk) {
+                        $reasonParts.Add('Windows fresh evidence producer must prove the empty/default input branch invokes real run-release-build.ps1 -SkipBundle') | Out-Null
+                    }
+                }
+                $producerShellOk = ([string](Get-StepProp -Step $producerStep -Name 'shell_kind' -Default '') -eq 'string' -and
+                    [string]::Equals(([string](Get-StepProp -Step $producerStep -Name 'shell' -Default '')).Trim(), 'pwsh', [System.StringComparison]::OrdinalIgnoreCase))
+                if (-not $producerShellOk) {
+                    $reasonParts.Add('fresh evidence producer shell must be exactly pwsh so its PowerShell AST contract matches runtime execution') | Out-Null
+                }
+                $producerEvidenceBindingOk = Test-ReleaseEvidenceProducerScriptContract `
+                    -ScriptText ([string]$producerSteps[0].Run) `
+                    -ScriptLeafName $producerScriptLeafName `
+                    -RequireWindowsHostOnly:($jobName -eq 'windows-host-evidence')
+                if (-not $producerEvidenceBindingOk) {
+                    $reasonParts.Add('fresh evidence producer must use only the controlled AST grammar and bind -OutputDir $evidenceDir to dir=$evidenceDir in GITHUB_OUTPUT') | Out-Null
+                }
+                $producerOk = $producerExecutionShapeOk -and $producerIfOk -and $producerContinueOk -and $producerWorkingDirectoryOk -and
+                    $producerOutputIdOk -and $producerHostOnlyOk -and $producerShellOk -and $producerEvidenceBindingOk
+            }
+            if ($RequireCheckout) {
+                $checkoutUses = [string](Get-StepProp -Step $checkoutStep -Name 'uses' -Default '')
+                $checkoutActionOk = Test-UsesPinnedCheckoutV4 -Uses $checkoutUses
+                $checkoutExecutionShapeOk = (Test-HostStepExecutionShape -Step $checkoutStep) -and
+                    [bool](Get-StepProp -Step $checkoutStep -Name 'uses_present' -Default $false)
+                $checkoutIfOk = Test-StepHasNoCondition -Step $checkoutStep
+                $checkoutContinueOk = Test-StepContinueOnErrorDisabled -Step $checkoutStep
+                # Checkout determines the helper that the verifier dot-sources.
+                # Keep its input surface deliberately tiny: the production workflow
+                # only needs fetch-depth. Unknown, case-variant, or duplicate-after-
+                # normalization keys (github-server-url, repository, token, path,
+                # sparse checkout, etc.) can redirect or alter the trusted checkout.
+                $checkoutRawWithKeys = @((Get-StepProp -Step $checkoutStep -Name 'with_raw_keys' -Default @()) | ForEach-Object {
+                        ([string]$_).Trim()
+                    })
+                $checkoutWithKeys = @($checkoutRawWithKeys | ForEach-Object {
+                        ([string]$_).Trim().ToLowerInvariant()
+                    })
+                $checkoutWithKeysUnique = [bool](Get-StepProp -Step $checkoutStep -Name 'with_keys_unique' -Default $false)
+                $allowedCheckoutWithKeys = @('fetch-depth')
+                $unsupportedCheckoutWithKeys = @($checkoutWithKeys | Where-Object {
+                        [string]::IsNullOrWhiteSpace($_) -or $allowedCheckoutWithKeys -notcontains $_
+                    })
+                $caseVariantCheckoutWithKeys = @($checkoutRawWithKeys | Where-Object {
+                        -not [string]::Equals($_, 'fetch-depth', [System.StringComparison]::Ordinal)
+                    })
+                $checkoutInputsOk = $checkoutWithKeysUnique -and $unsupportedCheckoutWithKeys.Count -eq 0 -and
+                    $caseVariantCheckoutWithKeys.Count -eq 0
+                if (-not $checkoutActionOk) {
+                    $reasonParts.Add(("checkout step must use exactly actions/checkout@v4 (got '{0}')" -f $checkoutUses)) | Out-Null
+                }
+                if (-not $checkoutExecutionShapeOk) {
+                    $reasonParts.Add('checkout step must be an unambiguous uses-only action step') | Out-Null
+                }
+                if (-not $checkoutIfOk) {
+                    $reasonParts.Add('checkout step must not set an if: condition') | Out-Null
+                }
+                if (-not $checkoutContinueOk) {
+                    $reasonParts.Add('checkout step continue-on-error must be absent') | Out-Null
+                }
+                if (-not $checkoutWithKeysUnique) {
+                    $reasonParts.Add('checkout step with keys must be unique after case-insensitive normalization') | Out-Null
+                }
+                if ($unsupportedCheckoutWithKeys.Count -gt 0) {
+                    $reasonParts.Add(("checkout step has unsupported with input(s): {0}; only fetch-depth is allowed" -f ($unsupportedCheckoutWithKeys -join ', '))) | Out-Null
+                }
+                if ($caseVariantCheckoutWithKeys.Count -gt 0) {
+                    $reasonParts.Add(("checkout step with keys must use exact lowercase spelling fetch-depth (got {0})" -f ($caseVariantCheckoutWithKeys -join ', '))) | Out-Null
+                }
+                $checkoutOk = $checkoutActionOk -and $checkoutExecutionShapeOk -and $checkoutIfOk -and $checkoutContinueOk -and $checkoutInputsOk
+            }
             # Controlled verifier step metadata
             $shell = ([string](Get-StepProp -Step $verifierStep -Name 'shell' -Default '')).Trim()
             if ($allowedShells -contains $shell) {
@@ -3670,21 +5934,32 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
                 $reasonParts.Add(("verifier step shell must be pwsh/powershell (got '{0}')" -f $shell)) | Out-Null
             }
 
-            $coeRaw = Get-StepProp -Step $verifierStep -Name 'continue_on_error' -Default $null
-            # Absent or explicit false is OK; true fails closed (would upload after verifier failure).
-            if ($null -eq $coeRaw -or $coeRaw -eq $false -or [string]::Equals([string]$coeRaw, 'False', [System.StringComparison]::OrdinalIgnoreCase)) {
-                $continueOnErrorOk = $true
-            } else {
-                $reasonParts.Add('verifier step must not set continue-on-error: true') | Out-Null
+            $verifierWorkingDirectoryOk = Test-RunWorkingDirectoryIsRepositoryDefault `
+                -Present ([bool](Get-StepProp -Step $verifierStep -Name 'working_directory_present' -Default $false)) `
+                -Kind ([string](Get-StepProp -Step $verifierStep -Name 'working_directory_kind' -Default '')) `
+                -Value ([string](Get-StepProp -Step $verifierStep -Name 'working_directory' -Default ''))
+            if (-not $verifierWorkingDirectoryOk) {
+                $reasonParts.Add('verifier step working-directory must be absent or empty (repository root required)') | Out-Null
             }
 
-            $vIf = [string](Get-StepProp -Step $verifierStep -Name 'if' -Default '')
-            if (Test-IfAlwaysExpression -IfExpr $vIf) {
-                # always() on verifier is odd but not the main upload bypass; still reject.
-                $reasonParts.Add('verifier step must not use if: always()') | Out-Null
+            if (Test-StepContinueOnErrorDisabled -Step $verifierStep) {
+                $continueOnErrorOk = $true
+            } else {
+                $reasonParts.Add('verifier step continue-on-error must be absent') | Out-Null
+            }
+
+            if (Test-StepHasNoCondition -Step $verifierStep) {
+                $verifierIfOk = $true
+            } else {
+                $reasonParts.Add('verifier step must not set an if: condition') | Out-Null
             }
 
             $run = [string](Get-StepProp -Step $verifierStep -Name 'run' -Default '')
+            $verifierExecutionShapeOk = (Test-HostStepExecutionShape -Step $verifierStep) -and
+                [bool](Get-StepProp -Step $verifierStep -Name 'run_present' -Default $false)
+            if (-not $verifierExecutionShapeOk) {
+                $reasonParts.Add('verifier step must be an unambiguous run-only step') | Out-Null
+            }
             $scriptContract = Test-ReleaseVerifierStepScriptContract -ScriptText $run
             if ($scriptContract.Valid) {
                 $scriptContractOk = $true
@@ -3695,16 +5970,40 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             }
 
             # Controlled upload step metadata
-            $uIf = [string](Get-StepProp -Step $uploadStep -Name 'if' -Default '')
-            if (Test-IfAlwaysExpression -IfExpr $uIf) {
-                $reasonParts.Add('upload-artifact step must not use if: always() (would upload after failed verifier)') | Out-Null
+            $uploadUses = [string](Get-StepProp -Step $uploadStep -Name 'uses' -Default '')
+            $uploadExecutionShapeOk = (Test-HostStepExecutionShape -Step $uploadStep) -and
+                [bool](Get-StepProp -Step $uploadStep -Name 'uses_present' -Default $false)
+            if ((Test-UsesPinnedUploadArtifactV4 -Uses $uploadUses) -and $uploadExecutionShapeOk) {
+                $uploadActionOk = $true
             } else {
-                $uploadIfOk = $true
+                $reasonParts.Add(("upload-artifact step must use exactly actions/upload-artifact@v4 (got '{0}')" -f $uploadUses)) | Out-Null
+                if (-not $uploadExecutionShapeOk) {
+                    $reasonParts.Add('upload-artifact step must be an unambiguous uses-only action step') | Out-Null
+                }
             }
 
-            $uCoe = Get-StepProp -Step $uploadStep -Name 'continue_on_error' -Default $null
-            if ($null -ne $uCoe -and ($uCoe -eq $true -or [string]::Equals([string]$uCoe, 'True', [System.StringComparison]::OrdinalIgnoreCase))) {
-                $reasonParts.Add('upload-artifact step must not set continue-on-error: true') | Out-Null
+            if (Test-StepHasNoCondition -Step $uploadStep) {
+                $uploadIfOk = $true
+            } else {
+                $reasonParts.Add('upload-artifact step must not set an if: condition') | Out-Null
+            }
+
+            if (Test-StepContinueOnErrorDisabled -Step $uploadStep) {
+                $uploadContinueOnErrorOk = $true
+            } else {
+                $reasonParts.Add('upload-artifact step continue-on-error must be absent') | Out-Null
+            }
+
+            if ($RequireRetentionDays14) {
+                $retentionRaw = Get-StepProp -Step $uploadStep -Name 'with_retention_days' -Default $null
+                try {
+                    $retentionOk = ($null -ne $retentionRaw -and [int]$retentionRaw -eq 14)
+                } catch {
+                    $retentionOk = $false
+                }
+                if (-not $retentionOk) {
+                    $reasonParts.Add('upload-artifact retention-days must be exactly 14') | Out-Null
+                }
             }
 
             $uploadPath = [string](Get-StepProp -Step $uploadStep -Name 'with_path' -Default '')
@@ -3720,7 +6019,14 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
                 $reasonParts.Add('verifier EvidenceDir and upload path are not both bound to steps.evidence.outputs.dir') | Out-Null
             }
 
-            if ($shellOk -and $continueOnErrorOk -and $uploadIfOk -and $scriptContractOk -and $pathBindOk -and $reasonParts.Count -eq 0) {
+            if ($globalUploadTopologyOk -and $jobContinueOnErrorOk -and $jobIfOk -and $jobNeedsOk -and $jobRunnerOk -and
+                $workflowDefaultWorkingDirectoryOk -and $workflowDefaultShellOk -and $workflowEnvironmentOk -and
+                $jobDefaultWorkingDirectoryOk -and $jobDefaultShellOk -and $jobEnvironmentOk -and $jobExecutionContextOk -and
+                $stepEnvironmentOk -and $stepExecutionShapeOk -and $verifierExecutionShapeOk -and $verifierWorkingDirectoryOk -and
+                $checkoutOk -and $producerOk -and $runTopologyOk -and $retentionOk -and
+                $shellOk -and $continueOnErrorOk -and $verifierIfOk -and
+                $uploadActionOk -and $uploadIfOk -and $uploadContinueOnErrorOk -and
+                $scriptContractOk -and $pathBindOk -and $reasonParts.Count -eq 0) {
                 $has = $true
             }
         }
@@ -3732,10 +6038,31 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             HasVerifierBeforeUpload = $has
             VerifierIndex = $verifierIdx
             UploadIndex = $uploadIdx
+            CheckoutIndex = $checkoutIdx
+            ProducerIndex = $producerIdx
             Reason = $reason
             ShellOk = $shellOk
             ContinueOnErrorOk = $continueOnErrorOk
+            JobContinueOnErrorOk = $jobContinueOnErrorOk
+            JobIfOk = $jobIfOk
+            JobNeedsOk = $jobNeedsOk
+            JobRunnerOk = $jobRunnerOk
+            VerifierWorkingDirectoryOk = $verifierWorkingDirectoryOk
+            JobDefaultShellOk = $jobDefaultShellOk
+            JobEnvironmentOk = $jobEnvironmentOk
+            JobExecutionContextOk = $jobExecutionContextOk
+            StepEnvironmentOk = $stepEnvironmentOk
+            CheckoutOk = $checkoutOk
+            ProducerOk = $producerOk
+            ProducerOutputIdOk = $producerOutputIdOk
+            ProducerHostOnlyOk = $producerHostOnlyOk
+            RunTopologyOk = $runTopologyOk
+            ProducerShellOk = $producerShellOk
+            ProducerEvidenceBindingOk = $producerEvidenceBindingOk
             UploadIfOk = $uploadIfOk
+            UploadContinueOnErrorOk = $uploadContinueOnErrorOk
+            UploadActionOk = $uploadActionOk
+            RetentionOk = $retentionOk
             ScriptContractOk = $scriptContractOk
             PathBindOk = $pathBindOk
         }
@@ -3749,6 +6076,421 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
         Engine = $engine
         Errors = @($errors)
         jobs = [hashtable]$jobResults
+        ActionReferences = @($parsed.action_references | Where-Object { $null -ne $_ })
+        RunBlocks = @($parsed.run_blocks | Where-Object { $null -ne $_ })
+        WorkflowDefaultsRunWorkingDirectoryPresent = [bool]$parsed.workflow_defaults_run_working_directory_present
+        WorkflowDefaultsRunWorkingDirectoryKind = [string]$parsed.workflow_defaults_run_working_directory_kind
+        WorkflowDefaultsRunWorkingDirectory = [string]$parsed.workflow_defaults_run_working_directory
+        WorkflowDefaultsRunShellPresent = [bool]$parsed.workflow_defaults_run_shell_present
+        WorkflowDefaultsRunShellKind = [string]$parsed.workflow_defaults_run_shell_kind
+        WorkflowDefaultsRunShell = [string]$parsed.workflow_defaults_run_shell
+        WorkflowEnvPresent = [bool]$parsed.workflow_env_present
+        WorkflowEnvKind = [string]$parsed.workflow_env_kind
+        WorkflowEnv = $parsed.workflow_env
+        WorkflowEnvKeysUnique = [bool]$parsed.workflow_env_keys_unique
+        WorkflowEnvRawKeys = @($parsed.workflow_env_raw_keys | Where-Object { $null -ne $_ })
+        WorkflowOnPresent = [bool]$parsed.workflow_on_present
+        WorkflowOnKind = [string]$parsed.workflow_on_kind
+        WorkflowTriggers = @($parsed.workflow_triggers | Where-Object { $null -ne $_ })
+        RootPermissionsPresent = [bool]$parsed.root_permissions_present
+        RootPermissionsKind = [string]$parsed.root_permissions_kind
+        RootPermissions = $parsed.root_permissions
+        RootPermissionsKeysUnique = [bool]$parsed.root_permissions_keys_unique
+        RootPermissionsRawKeys = @($parsed.root_permissions_raw_keys | Where-Object { $null -ne $_ })
+        JobPermissionRecords = @($parsed.job_permission_records | Where-Object { $null -ne $_ })
+        SkipBundleDefaultPresent = [bool]$parsed.skip_bundle_default_present
+        SkipBundleDefaultKind = [string]$parsed.skip_bundle_default_kind
+        SkipBundleDefault = [string]$parsed.skip_bundle_default
+    }
+}
+
+function Test-ReleaseGateRunBlockIsUnconditional {
+    <#
+    .SYNOPSIS
+    Returns true only when a parsed workflow run step cannot be skipped or allowed
+    to fail by workflow/job/step metadata.
+
+    .DESCRIPTION
+    This is intentionally stricter than checking the run body. A real CommandAst
+    inside `if: ${{ false }}` or a continue-on-error step is not a release gate.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$RunBlock,
+        [switch]$RequirePowerShellShell
+    )
+
+    function Get-RecordProp {
+        param($Record, [string]$Name, $Default = $null)
+        if ($null -ne $Record -and $Record.PSObject.Properties.Name -contains $Name) {
+            return $Record.$Name
+        }
+        return $Default
+    }
+
+    # Controlled CI gates deliberately require fields to be absent, rather than
+    # accepting parser-specific boolean spellings such as `off`/`no` as false.
+    if ([bool](Get-RecordProp -Record $RunBlock -Name 'if_present' -Default $false) -or
+        [bool](Get-RecordProp -Record $RunBlock -Name 'continue_on_error_present' -Default $false) -or
+        [bool](Get-RecordProp -Record $RunBlock -Name 'job_if_present' -Default $false) -or
+        [bool](Get-RecordProp -Record $RunBlock -Name 'job_continue_on_error_present' -Default $false) -or
+        [bool](Get-RecordProp -Record $RunBlock -Name 'job_needs_present' -Default $false)) {
+        return $false
+    }
+    if ($RequirePowerShellShell) {
+        $shell = ([string](Get-RecordProp -Record $RunBlock -Name 'shell' -Default '')).Trim().ToLowerInvariant()
+        if ($shell -notin @('pwsh', 'powershell')) { return $false }
+    }
+    return $true
+}
+
+function Test-ReleaseCiGateJobContract {
+    <#
+    .SYNOPSIS
+    Binds a required CI gate to its intended checked-out job and working
+    directory instead of accepting a command-shaped decoy anywhere in YAML.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$WorkflowMetadata,
+        [Parameter(Mandatory = $true)][ValidateSet('npm_ci', 'secret_scan')][string]$Gate
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $jobName = if ($Gate -eq 'npm_ci') { 'frontend-gate' } else { 'secret-scan' }
+    $expectedRunner = if ($Gate -eq 'npm_ci') { 'ubuntu-latest' } else { 'windows-latest' }
+
+    function Get-RecordValue {
+        param($Record, [string]$Name, $Default = $null)
+        if ($null -ne $Record -and $Record.PSObject.Properties.Name -contains $Name) { return $Record.$Name }
+        return $Default
+    }
+    function Test-FieldAbsent {
+        param($Record, [string]$PresentName)
+        return (-not [bool](Get-RecordValue -Record $Record -Name $PresentName -Default $false))
+    }
+    function Test-FieldExplicitlyAbsent {
+        param($Record, [string]$PresentName)
+        if ($null -eq $Record -or -not ($Record.PSObject.Properties.Name -contains $PresentName)) {
+            return $false
+        }
+        return (-not [bool]$Record.$PresentName)
+    }
+    function Test-CheckoutStepContract {
+        param($Step)
+        if ($null -eq $Step -or
+            -not [bool](Get-RecordValue -Record $Step -Name 'uses_present' -Default $false) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses' -Default '')).Trim(), 'actions/checkout@v4', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        if (-not (Test-FieldAbsent -Record $Step -PresentName 'if_present') -or
+            -not (Test-FieldAbsent -Record $Step -PresentName 'continue_on_error_present') -or
+            -not (Test-FieldAbsent -Record $Step -PresentName 'working_directory_present') -or
+            -not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'run_present') -or
+            -not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'env_present')) {
+            return $false
+        }
+        $rawKeys = @((Get-RecordValue -Record $Step -Name 'with_raw_keys' -Default @()) | ForEach-Object { ([string]$_).Trim() })
+        return ([bool](Get-RecordValue -Record $Step -Name 'with_keys_unique' -Default $false) -and
+            @($rawKeys | Where-Object { -not [string]::Equals($_, 'fetch-depth', [System.StringComparison]::Ordinal) }).Count -eq 0)
+    }
+    function Test-SetupNodeStepContract {
+        param($Step)
+        if ($null -eq $Step -or
+            -not [bool](Get-RecordValue -Record $Step -Name 'uses_present' -Default $false) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses' -Default '')).Trim(), 'actions/setup-node@v4', [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'run_present')) {
+            return $false
+        }
+        foreach ($field in @('if_present', 'continue_on_error_present', 'working_directory_present', 'shell_present')) {
+            if (-not (Test-FieldAbsent -Record $Step -PresentName $field)) { return $false }
+        }
+        if (-not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'env_present')) { return $false }
+        return $true
+    }
+
+    $job = Get-ReleaseWorkflowJobExact -WorkflowMetadata $WorkflowMetadata -JobName $jobName
+    if ($null -eq $job -or -not [bool](Get-RecordValue -Record $job -Name 'present' -Default $false)) {
+        $errors.Add("required CI job '$jobName' is missing") | Out-Null
+        return [pscustomobject]@{ Valid = $false; Errors = @($errors); Job = $jobName }
+    }
+    if ([string](Get-RecordValue -Record $job -Name 'runs_on_kind' -Default '') -ne 'string' -or
+        -not [string]::Equals(([string](Get-RecordValue -Record $job -Name 'runs_on' -Default '')).Trim(), $expectedRunner, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $errors.Add("CI job '$jobName' must run on $expectedRunner") | Out-Null
+    }
+    foreach ($field in @('if_present', 'continue_on_error_present', 'needs_present')) {
+        if (-not (Test-FieldAbsent -Record $job -PresentName $field)) {
+            $errors.Add("CI job '$jobName' must not set $field") | Out-Null
+        }
+    }
+    if (-not (Test-FieldAbsent -Record $WorkflowMetadata -PresentName 'WorkflowDefaultsRunWorkingDirectoryPresent')) {
+        $errors.Add('ci-gates workflow defaults.run.working-directory must be absent') | Out-Null
+    }
+    if (-not (Test-FieldExplicitlyAbsent -Record $WorkflowMetadata -PresentName 'WorkflowDefaultsRunShellPresent')) {
+        $errors.Add('ci-gates workflow defaults.run.shell must be absent') | Out-Null
+    }
+    if (-not (Test-FieldExplicitlyAbsent -Record $WorkflowMetadata -PresentName 'WorkflowEnvPresent')) {
+        $errors.Add('ci-gates workflow env must be absent') | Out-Null
+    }
+
+    $jobDefaultPresent = [bool](Get-RecordValue -Record $job -Name 'defaults_run_working_directory_present' -Default $false)
+    $jobDefaultKind = [string](Get-RecordValue -Record $job -Name 'defaults_run_working_directory_kind' -Default '')
+    $jobDefaultValue = ([string](Get-RecordValue -Record $job -Name 'defaults_run_working_directory' -Default '')).Trim()
+    if ($Gate -eq 'npm_ci') {
+        if (-not $jobDefaultPresent -or $jobDefaultKind -ne 'string' -or
+            -not [string]::Equals($jobDefaultValue, 'frontend', [System.StringComparison]::Ordinal)) {
+            $errors.Add("CI job '$jobName' must set defaults.run.working-directory exactly to frontend") | Out-Null
+        }
+    } elseif ($jobDefaultPresent) {
+        $errors.Add("CI job '$jobName' must use repository-root working directory") | Out-Null
+    }
+    if (-not (Test-FieldExplicitlyAbsent -Record $job -PresentName 'defaults_run_shell_present')) {
+        $errors.Add("CI job '$jobName' defaults.run.shell must be absent") | Out-Null
+    }
+    foreach ($field in @('env_present', 'container_present', 'services_present')) {
+        if (-not (Test-FieldExplicitlyAbsent -Record $job -PresentName $field)) {
+            $errors.Add("CI job '$jobName' must not set $field") | Out-Null
+        }
+    }
+
+    $steps = @((Get-RecordValue -Record $job -Name 'steps' -Default @()))
+    $checkoutSteps = @($steps | Where-Object { Test-CheckoutStepContract -Step $_ })
+    if ($checkoutSteps.Count -ne 1) {
+        $errors.Add("CI job '$jobName' must have exactly one unconditional repository checkout") | Out-Null
+    }
+
+    $gateSteps = @($steps | Where-Object {
+            $run = [string](Get-RecordValue -Record $_ -Name 'run' -Default '')
+            if ($Gate -eq 'npm_ci') {
+                return Test-ReleaseExactNpmCiGateScript -ScriptText $run
+            }
+            return Test-ReleaseExactSecretScanGateScript -ScriptText $run
+        })
+    if ($gateSteps.Count -ne 1) {
+        $errors.Add("CI job '$jobName' must have exactly one flat executable $Gate gate") | Out-Null
+    } else {
+        $gateStep = $gateSteps[0]
+        if (-not (Test-FieldExplicitlyAbsent -Record $gateStep -PresentName 'uses_present') -or
+            -not [bool](Get-RecordValue -Record $gateStep -Name 'run_present' -Default $false) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $gateStep -Name 'run_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal)) {
+            $errors.Add("$Gate gate step must be a run-only YAML step") | Out-Null
+        }
+        foreach ($field in @('if_present', 'continue_on_error_present', 'working_directory_present')) {
+            if (-not (Test-FieldAbsent -Record $gateStep -PresentName $field)) {
+                $errors.Add("$Gate gate step must not set $field") | Out-Null
+            }
+        }
+        if (-not (Test-FieldExplicitlyAbsent -Record $gateStep -PresentName 'env_present')) {
+            $errors.Add("$Gate gate step must not set env_present") | Out-Null
+        }
+        if ($Gate -eq 'npm_ci') {
+            if ([bool](Get-RecordValue -Record $gateStep -Name 'shell_present' -Default $false)) {
+                $errors.Add('npm ci gate must use the Ubuntu default shell (no shell override)') | Out-Null
+            }
+        } elseif ([string](Get-RecordValue -Record $gateStep -Name 'shell_kind' -Default '') -ne 'string' -or
+                  -not [string]::Equals(([string](Get-RecordValue -Record $gateStep -Name 'shell' -Default '')).Trim(), 'pwsh', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $errors.Add('secret scan gate must use shell: pwsh') | Out-Null
+        }
+        if ($checkoutSteps.Count -eq 1 -and
+            [int](Get-RecordValue -Record $checkoutSteps[0] -Name 'index' -Default -1) -ge [int](Get-RecordValue -Record $gateStep -Name 'index' -Default -1)) {
+            $errors.Add("CI job '$jobName' checkout must precede the $Gate gate") | Out-Null
+        }
+
+        # The gate must execute against the exact checkout it just received. An
+        # arbitrary run step between checkout and `npm ci`/secret scan can rewrite
+        # package metadata or the scan helper while leaving a command-shaped gate
+        # behind. Govern that prefix as a fixed, minimal topology.
+        $gateIndex = [int](Get-RecordValue -Record $gateStep -Name 'index' -Default -1)
+        $checkoutIndex = if ($checkoutSteps.Count -eq 1) { [int](Get-RecordValue -Record $checkoutSteps[0] -Name 'index' -Default -1) } else { -1 }
+        $preGateSteps = @($steps | Where-Object {
+                [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -lt $gateIndex
+            })
+        $expectedPreGateCount = if ($Gate -eq 'npm_ci') { 2 } else { 1 }
+        if ($checkoutIndex -ne 0 -or $preGateSteps.Count -ne $expectedPreGateCount) {
+            $errors.Add("CI job '$jobName' must use the fixed trusted checkout-to-$Gate topology") | Out-Null
+        }
+        if (@($steps | Where-Object { -not (Test-FieldExplicitlyAbsent -Record $_ -PresentName 'env_present') }).Count -gt 0) {
+            $errors.Add("CI job '$jobName' must not set step env overrides") | Out-Null
+        }
+        if ($Gate -eq 'npm_ci') {
+            $setupSteps = @($steps | Where-Object {
+                    [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 1
+                })
+            if ($gateIndex -ne 2 -or $setupSteps.Count -ne 1 -or -not (Test-SetupNodeStepContract -Step $setupSteps[0])) {
+                $errors.Add("CI job '$jobName' must run exactly checkout, actions/setup-node@v4, then npm ci before any other executable step") | Out-Null
+            }
+        } elseif ($gateIndex -ne 1) {
+            $errors.Add("CI job '$jobName' must run the secret scan immediately after checkout with no intervening executable step") | Out-Null
+        }
+    }
+
+    return [pscustomobject]@{ Valid = ($errors.Count -eq 0); Errors = @($errors); Job = $jobName }
+}
+
+function Get-ReleaseWorkflowJobExact {
+    <#
+    .SYNOPSIS
+    Finds a governed workflow job by its exact YAML key spelling.
+
+    .DESCRIPTION
+    PowerShell hashtable/property access is case-insensitive, while required CI
+    check identities can be case-sensitive in remote governance. Enumerate the
+    original metadata keys and reject casing drift rather than silently binding
+    `Frontend-Gate` to the governed `frontend-gate` contract.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$WorkflowMetadata,
+        [Parameter(Mandatory = $true)][string]$JobName
+    )
+
+    if ($null -eq $WorkflowMetadata -or $null -eq $WorkflowMetadata.jobs) { return $null }
+    $jobs = $WorkflowMetadata.jobs
+    $matches = New-Object System.Collections.Generic.List[object]
+    if ($jobs -is [System.Collections.IDictionary]) {
+        foreach ($key in @($jobs.Keys)) {
+            if ([string]::Equals([string]$key, $JobName, [System.StringComparison]::Ordinal)) {
+                $matches.Add($jobs[$key]) | Out-Null
+            }
+        }
+    } elseif ($null -ne $jobs) {
+        foreach ($property in @($jobs.PSObject.Properties)) {
+            if ([string]::Equals([string]$property.Name, $JobName, [System.StringComparison]::Ordinal)) {
+                $matches.Add($property.Value) | Out-Null
+            }
+        }
+    }
+    if ($matches.Count -ne 1) { return $null }
+    return $matches[0]
+}
+
+function Test-ReleasePesterYamlParserReadiness {
+    <#
+    .SYNOPSIS
+    Ensures the Windows Pester job installs a fixed real YAML parser before it
+    runs parser-backed release readiness tests.
+    #>
+    param([Parameter(Mandatory = $true)]$WorkflowMetadata)
+
+    function Get-RecordValue {
+        param($Record, [string]$Name, $Default = $null)
+        if ($null -ne $Record -and $Record.PSObject.Properties.Name -contains $Name) { return $Record.$Name }
+        return $Default
+    }
+    function Test-FieldAbsent {
+        param($Record, [string]$PresentName)
+        return (-not [bool](Get-RecordValue -Record $Record -Name $PresentName -Default $false))
+    }
+    function Test-FieldExplicitlyAbsent {
+        param($Record, [string]$PresentName)
+        if ($null -eq $Record -or -not ($Record.PSObject.Properties.Name -contains $PresentName)) { return $false }
+        return (-not [bool]$Record.$PresentName)
+    }
+    function Test-StepUnconditionalAtRepositoryRoot {
+        param($Step, [string]$Shell = '')
+        if ($null -eq $Step) { return $false }
+        foreach ($field in @('if_present', 'continue_on_error_present', 'working_directory_present')) {
+            if (-not (Test-FieldAbsent -Record $Step -PresentName $field)) { return $false }
+        }
+        if ([string]::IsNullOrWhiteSpace($Shell)) {
+            return ((-not [bool](Get-RecordValue -Record $Step -Name 'shell_present' -Default $false)) -and
+                (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'env_present'))
+        }
+        return ([string](Get-RecordValue -Record $Step -Name 'shell_kind' -Default '') -eq 'string' -and
+            [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'shell' -Default '')).Trim(), $Shell, [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'env_present'))
+    }
+    function Test-RunOnlyStep {
+        param($Step)
+        return ($null -ne $Step -and
+            (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'uses_present') -and
+            [bool](Get-RecordValue -Record $Step -Name 'run_present' -Default $false) -and
+            [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'run_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal))
+    }
+    function Test-UsesOnlyStep {
+        param($Step, [Parameter(Mandatory = $true)][string]$ExpectedUses)
+        return ($null -ne $Step -and
+            [bool](Get-RecordValue -Record $Step -Name 'uses_present' -Default $false) -and
+            [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -and
+            [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses' -Default '')).Trim(), $ExpectedUses, [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'run_present'))
+    }
+    function Test-PinnedPyYamlInstallScript {
+        param([AllowEmptyString()][string]$Run)
+        $expected = @'
+$ErrorActionPreference = 'Stop'
+python -m pip install 'PyYAML==6.0.2'
+python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+'@
+        return [string]::Equals((([string]$Run -replace '\s+', ' ').Trim()), (($expected -replace '\s+', ' ').Trim()), [System.StringComparison]::Ordinal)
+    }
+    function Test-PesterRunnerScript {
+        param([AllowEmptyString()][string]$Run)
+        $command = Get-ReleaseFlatSingleCommandAst -ScriptText $Run
+        if ($null -eq $command) { return $false }
+        return Test-ReleasePowerShellFileInvocationExactArguments `
+            -CommandAst $command `
+            -ExpectedRelativePath 'scripts/tests/run-release-build-tests.ps1' `
+                -RequireNoProfile
+    }
+    function Test-PesterCheckoutStep {
+        param($Step)
+        if ($null -eq $Step -or
+            -not (Test-UsesOnlyStep -Step $Step -ExpectedUses 'actions/checkout@v4') -or
+            -not (Test-StepUnconditionalAtRepositoryRoot -Step $Step)) {
+            return $false
+        }
+        $rawKeys = @((Get-RecordValue -Record $Step -Name 'with_raw_keys' -Default @()) | ForEach-Object { ([string]$_).Trim() })
+        if (-not [bool](Get-RecordValue -Record $Step -Name 'with_keys_unique' -Default $false)) { return $false }
+        foreach ($key in $rawKeys) {
+            if (-not [string]::Equals($key, 'fetch-depth', [System.StringComparison]::Ordinal)) { return $false }
+        }
+        return ($rawKeys.Count -le 1)
+    }
+
+    $job = Get-ReleaseWorkflowJobExact -WorkflowMetadata $WorkflowMetadata -JobName 'pester-release-tests'
+    if ($null -eq $job -or -not [bool](Get-RecordValue -Record $job -Name 'present' -Default $false) -or
+        [string](Get-RecordValue -Record $job -Name 'runs_on_kind' -Default '') -ne 'string' -or
+        -not [string]::Equals(([string](Get-RecordValue -Record $job -Name 'runs_on' -Default '')).Trim(), 'windows-latest', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ Valid = $false; Errors = @('pester-release-tests must be an exact Windows job') }
+    }
+    foreach ($field in @('if_present', 'continue_on_error_present', 'needs_present', 'env_present', 'container_present', 'services_present', 'defaults_run_shell_present')) {
+        if (-not (Test-FieldExplicitlyAbsent -Record $job -PresentName $field)) {
+            return [pscustomobject]@{ Valid = $false; Errors = @("pester-release-tests must not set $field") }
+        }
+    }
+    if ([bool](Get-RecordValue -Record $job -Name 'defaults_run_working_directory_present' -Default $true)) {
+        return [pscustomobject]@{ Valid = $false; Errors = @('pester-release-tests must use repository-root working directory') }
+    }
+    foreach ($field in @('WorkflowDefaultsRunWorkingDirectoryPresent', 'WorkflowDefaultsRunShellPresent', 'WorkflowEnvPresent')) {
+        if (-not (Test-FieldExplicitlyAbsent -Record $WorkflowMetadata -PresentName $field)) {
+            return [pscustomobject]@{ Valid = $false; Errors = @("ci-gates must not set $field for parser-backed Pester execution") }
+        }
+    }
+    $steps = @((Get-RecordValue -Record $job -Name 'steps' -Default @()))
+    if ($steps.Count -ne 5) {
+        return [pscustomobject]@{ Valid = $false; Errors = @('pester-release-tests is missing required parser setup steps') }
+    }
+    $checkout = @($steps | Where-Object { [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 0 })
+    $setupPython = @($steps | Where-Object { [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 1 })
+    $install = @($steps | Where-Object { [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 2 })
+    $runner = @($steps | Where-Object { [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 3 })
+    $secretScan = @($steps | Where-Object { [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 4 })
+    $valid = ($checkout.Count -eq 1 -and $setupPython.Count -eq 1 -and $install.Count -eq 1 -and $runner.Count -eq 1 -and $secretScan.Count -eq 1 -and
+        (Test-PesterCheckoutStep -Step $checkout[0]) -and
+        (Test-UsesOnlyStep -Step $setupPython[0] -ExpectedUses 'actions/setup-python@v5') -and
+        (Test-StepUnconditionalAtRepositoryRoot -Step $setupPython[0]) -and
+        (Test-RunOnlyStep -Step $install[0]) -and
+        (Test-StepUnconditionalAtRepositoryRoot -Step $install[0] -Shell 'pwsh') -and
+        (Test-PinnedPyYamlInstallScript -Run ([string](Get-RecordValue -Record $install[0] -Name 'run' -Default ''))) -and
+        (Test-RunOnlyStep -Step $runner[0]) -and
+        (Test-StepUnconditionalAtRepositoryRoot -Step $runner[0] -Shell 'pwsh') -and
+        (Test-PesterRunnerScript -Run ([string](Get-RecordValue -Record $runner[0] -Name 'run' -Default ''))) -and
+        (Test-RunOnlyStep -Step $secretScan[0]) -and
+        (Test-StepUnconditionalAtRepositoryRoot -Step $secretScan[0] -Shell 'pwsh') -and
+        (Test-ReleaseExactSecretScanGateScript -ScriptText ([string](Get-RecordValue -Record $secretScan[0] -Name 'run' -Default ''))))
+    return [pscustomobject]@{
+        Valid = $valid
+        Errors = if ($valid) { @() } else { @('pester-release-tests must install and verify PyYAML==6.0.2 immediately before parser-backed Pester execution') }
     }
 }
 
@@ -3769,6 +6511,9 @@ function Assert-ReleaseWorkflowStaticContract {
         host_only_default = $false
         real_yaml_parser_required = $false
         full_offline_verifier = $false
+        least_privilege_permissions = $false
+        ci_triggers = $false
+        pester_yaml_parser = $false
     }
     $errors = New-Object System.Collections.Generic.List[string]
 
@@ -3784,6 +6529,9 @@ function Assert-ReleaseWorkflowStaticContract {
     }
 
     $allText = ''
+    $workflowMetadata = @{}
+    $allActionReferenceRecords = @()
+    $allRunBlockRecords = @()
     foreach ($f in $files) {
         $text = Get-Content -LiteralPath $f.FullName -Raw
         $allText += "`n" + $text
@@ -3794,6 +6542,13 @@ function Assert-ReleaseWorkflowStaticContract {
         if (-not $syntax.Valid) {
             $errors.Add(("Workflow {0} failed YAML validation: {1}" -f $f.Name, ($syntax.Errors -join '; '))) | Out-Null
         }
+        $metadata = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $f.FullName
+        $workflowMetadata[$f.Name] = $metadata
+        if ($metadata.Engine -notmatch 'pyyaml|node-yaml') {
+            $errors.Add(("Workflow {0} could not extract runtime metadata with a real YAML parser (engine={1})" -f $f.Name, $metadata.Engine)) | Out-Null
+        }
+        $allActionReferenceRecords += @($metadata.ActionReferences | Where-Object { $null -ne $_ })
+        $allRunBlockRecords += @($metadata.RunBlocks | Where-Object { $null -ne $_ })
     }
 
     $requiredPins = @(
@@ -3801,54 +6556,149 @@ function Assert-ReleaseWorkflowStaticContract {
         'actions/setup-node@v4',
         'dtolnay/rust-toolchain@stable'
     )
+    $allowedActionReferences = @(
+        'actions/checkout@v4',
+        'actions/setup-node@v4',
+        'actions/setup-python@v5',
+        'actions/upload-artifact@v4',
+        'dtolnay/rust-toolchain@stable'
+    )
+    $actualActionReferences = @()
     $pinOk = $true
+    foreach ($actionRecord in $allActionReferenceRecords) {
+        $usesKind = if ($actionRecord.PSObject.Properties.Name -contains 'uses_kind') { [string]$actionRecord.uses_kind } else { 'string' }
+        $scope = if ($actionRecord.PSObject.Properties.Name -contains 'scope') { [string]$actionRecord.scope } else { 'step' }
+        if ($usesKind -ne 'string' -or [string]::IsNullOrWhiteSpace([string]$actionRecord.uses)) {
+            $pinOk = $false
+            $errors.Add(("Action reference must be a non-empty YAML string (job={0}, index={1})" -f $actionRecord.job, $actionRecord.index)) | Out-Null
+            continue
+        }
+        if (-not [string]::Equals($scope, 'step', [System.StringComparison]::Ordinal)) {
+            $pinOk = $false
+            $errors.Add(("Reusable/job-level uses is not allowed in release workflows (job={0})" -f $actionRecord.job)) | Out-Null
+            continue
+        }
+        $actualActionReferences += [string]$actionRecord.uses
+    }
     foreach ($pin in $requiredPins) {
-        if ($allText -notmatch [regex]::Escape($pin)) {
+        if ($actualActionReferences -notcontains $pin) {
             $pinOk = $false
             $errors.Add("Missing pinned action reference: $pin") | Out-Null
         }
     }
-    if ($allText -match 'actions/[A-Za-z0-9_-]+@main' -or $allText -match 'actions/[A-Za-z0-9_-]+@master') {
-        $pinOk = $false
-        $errors.Add('Unpinned @main/@master action reference is not allowed.') | Out-Null
+    foreach ($actionReference in $actualActionReferences) {
+        if ($allowedActionReferences -notcontains $actionReference) {
+            $pinOk = $false
+            $errors.Add("Action reference is not in the fixed allowlist: $actionReference") | Out-Null
+        }
     }
     $checks['actions_pinned'] = $pinOk
 
-    $checks['npm_ci'] = ($allText -match 'npm ci')
+    $permissionsOk = $true
+    foreach ($workflowName in @($workflowMetadata.Keys)) {
+        $metadata = $workflowMetadata[$workflowName]
+        $rootEntries = $null
+        if ($null -ne $metadata) { $rootEntries = $metadata.RootPermissions }
+        $rootKeys = if ($null -ne $metadata) { @($metadata.RootPermissionsRawKeys | ForEach-Object { [string]$_ }) } else { @() }
+        $contentsProperties = @()
+        if ($null -ne $rootEntries) {
+            $contentsProperties = @($rootEntries.PSObject.Properties | Where-Object { [string]::Equals([string]$_.Name, 'contents', [System.StringComparison]::Ordinal) })
+        }
+        $contentsProperty = if ($contentsProperties.Count -eq 1) { $contentsProperties[0] } else { $null }
+        $rootContents = if ($null -ne $contentsProperty) { [string]$contentsProperty.Value } else { '' }
+        $rootExact = ($null -ne $metadata -and [bool]$metadata.RootPermissionsPresent -and
+            [string]$metadata.RootPermissionsKind -eq 'mapping' -and [bool]$metadata.RootPermissionsKeysUnique -and
+            $rootKeys.Count -eq 1 -and $rootKeys[0] -eq 'contents' -and
+            [string]::Equals($rootContents.Trim(), 'read', [System.StringComparison]::Ordinal))
+        if (-not $rootExact) {
+            $permissionsOk = $false
+            $errors.Add(("Workflow {0} must declare exactly top-level permissions: contents: read" -f $workflowName)) | Out-Null
+        }
+        foreach ($jobPermission in @($metadata.JobPermissionRecords)) {
+            if ($null -ne $jobPermission -and [bool]$jobPermission.present) {
+                $permissionsOk = $false
+                $errors.Add(("Workflow {0} job {1} must not override permissions" -f $workflowName, $jobPermission.job)) | Out-Null
+            }
+        }
+    }
+    $checks['least_privilege_permissions'] = $permissionsOk
+
+    $ciMetadata = if ($workflowMetadata.ContainsKey('ci-gates.yml')) { $workflowMetadata['ci-gates.yml'] } else { $null }
+    $ciTriggers = if ($null -ne $ciMetadata -and $ciMetadata.PSObject.Properties.Name -contains 'WorkflowTriggers') {
+        @($ciMetadata.WorkflowTriggers | ForEach-Object { [string]$_ })
+    } else { @() }
+    $ciOnPresent = ($null -ne $ciMetadata -and $ciMetadata.PSObject.Properties.Name -contains 'WorkflowOnPresent' -and [bool]$ciMetadata.WorkflowOnPresent)
+    $ciOnKind = if ($null -ne $ciMetadata -and $ciMetadata.PSObject.Properties.Name -contains 'WorkflowOnKind') { [string]$ciMetadata.WorkflowOnKind } else { '' }
+    $checks['ci_triggers'] = ($ciOnPresent -and $ciOnKind -eq 'mapping' -and
+        $ciTriggers -contains 'push' -and $ciTriggers -contains 'pull_request')
+    if (-not $checks['ci_triggers']) {
+        $errors.Add('ci-gates.yml must declare mapping triggers for both push and pull_request.') | Out-Null
+    }
+    $npmGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $ciMetadata -Gate 'npm_ci'
+    $checks['npm_ci'] = [bool]$npmGate.Valid
     if (-not $checks['npm_ci']) {
-        $errors.Add('Workflows must use strict npm ci.') | Out-Null
+        foreach ($gateError in @($npmGate.Errors)) { $errors.Add([string]$gateError) | Out-Null }
     }
-    if ($allText -match 'npm install(?!\s)') {
-        # Allow only if not present; soft check against install.
-    }
-    if ($allText -match '(?m)^\s*run:\s*npm install\s*$') {
+    $hasNpmInstall = @($allRunBlockRecords | Where-Object {
+            Test-ReleaseRunContainsTopLevelNpmCommand -ScriptText ([string]$_.run) -Subcommand 'install'
+        }).Count -gt 0
+    if ($hasNpmInstall) {
         $checks['npm_ci'] = $false
-        $errors.Add('Workflows must not use bare npm install for release gates.') | Out-Null
+        $errors.Add('Workflows must not use npm install for release gates.') | Out-Null
     }
 
-    $checks['secret_scan'] = ($allText -match 'SecretScanOnly' -or $allText -match 'secret scan' -or $allText -match 'verify-release\.ps1')
+    $secretGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $ciMetadata -Gate 'secret_scan'
+    $checks['secret_scan'] = [bool]$secretGate.Valid
     if (-not $checks['secret_scan']) {
-        $errors.Add('Workflows must include a fail-closed secret scan step.') | Out-Null
+        foreach ($gateError in @($secretGate.Errors)) { $errors.Add([string]$gateError) | Out-Null }
     }
 
-    $checks['artifact_retention'] = ($allText -match 'retention-days:\s*14')
-    if (-not $checks['artifact_retention']) {
-        $errors.Add('Host evidence workflow must set artifact retention-days: 14.') | Out-Null
+    $pesterParser = Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $ciMetadata
+    $checks['pester_yaml_parser'] = [bool]$pesterParser.Valid
+    if (-not $checks['pester_yaml_parser']) {
+        foreach ($parserError in @($pesterParser.Errors)) { $errors.Add([string]$parserError) | Out-Null }
     }
 
     $hostWf = Join-Path $workflowDir 'release-host-evidence.yml'
     if (Test-Path -LiteralPath $hostWf) {
-        $hostText = Get-Content -LiteralPath $hostWf -Raw
-        # Comments may mention -BuildApk; only non-comment command lines are forbidden.
-        $hostOnly = ($hostText -match "default:\s*'true'") -and ($hostText -match 'SkipBundle') -and ($hostText -notmatch '(?m)^\s*[^#\r\n]*-BuildApk\b')
+        $hostMetadata = $workflowMetadata['release-host-evidence.yml']
+        # Job/step-order aware check via a real YAML parser. Fresh producer
+        # binding prevents a reusable runner workspace from selecting an older
+        # internally-valid evidence directory after the build step is skipped.
+        $order = Test-ReleaseHostEvidenceVerifierOrder `
+            -WorkflowPath $hostWf `
+            -RequireRetentionDays14 `
+            -RequireCheckout `
+            -RequireFreshProducer
+        $checks['full_offline_verifier'] = [bool]$order.Valid
+        $skipDefaultIsTrue = $false
+        if ($null -ne $hostMetadata -and [bool]$hostMetadata.SkipBundleDefaultPresent) {
+            # Avoid YAML 1.1/1.2 ambiguity (yes/on/off): the dispatch input is
+            # deliberately the literal string 'true'.
+            $skipDefaultIsTrue = ([string]$hostMetadata.SkipBundleDefaultKind -eq 'string' -and
+                [string]::Equals(([string]$hostMetadata.SkipBundleDefault).Trim(), 'true', [System.StringComparison]::Ordinal))
+        }
+        $windowsHostProducerOk = $false
+        if ($order.jobs.ContainsKey('windows-host-evidence')) {
+            $windowsHostProducerOk = [bool]$order.jobs['windows-host-evidence'].ProducerHostOnlyOk
+        }
+        $hostOnly = $skipDefaultIsTrue -and $windowsHostProducerOk
         $checks['host_only_default'] = $hostOnly
         if (-not $hostOnly) {
             $errors.Add('release-host-evidence must default to host-only (skip_bundle=true, no -BuildApk).') | Out-Null
         }
 
-        # Job/step-order aware check via real YAML parser (not full-text regex counts).
-        $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $hostWf
-        $checks['full_offline_verifier'] = [bool]$order.Valid
+        $retentionOk = $true
+        foreach ($hostJobName in @('windows-host-evidence', 'android-host-evidence')) {
+            if (-not $order.jobs.ContainsKey($hostJobName) -or -not [bool]$order.jobs[$hostJobName].RetentionOk) {
+                $retentionOk = $false
+                break
+            }
+        }
+        $checks['artifact_retention'] = $retentionOk
+        if (-not $retentionOk) {
+            $errors.Add('Each controlled host evidence upload must set retention-days: 14.') | Out-Null
+        }
         if (-not $order.Valid) {
             foreach ($e in @($order.Errors)) {
                 $errors.Add([string]$e) | Out-Null

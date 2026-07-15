@@ -29,12 +29,22 @@
   `scripts/run-release-build.ps1 -SkipBundle`.
 - Bundle evidence requires **explicit** `skip_bundle=false` **and** pinned
   `tauri-cli` install on the runner.
+- The Windows producer receives `skip_bundle` as a controlled environment value,
+  accepts only empty/`true`/`false`, and rejects any other manual/API value
+  before starting a build. It is deliberately not interpolated into PowerShell
+  source text.
 - Android job does **not** pass `-BuildApk`. Requesting APK without
   `ANDROID_HOME` / `NDK_HOME` fails closed in the host pipeline.
 - Artifacts use `retention-days: 14`.
-- `permissions: contents: read` only.
+- `permissions: contents: read` only. The repository static contract checks
+  that declaration; confirm that the installed Gitea runner/version enforces
+  it during remote preflight before treating it as an effective permission
+  boundary.
 - `concurrency` + `cancel-in-progress: true` per ref.
 - Secret scan is fail closed; never dump env or tokens into logs.
+- The Windows Pester job installs and imports pinned `PyYAML==6.0.2` before it
+  runs parser-backed workflow-contract tests; do not rely on a globally
+  preinstalled YAML package.
 
 ## Recommended runner labels
 
@@ -88,6 +98,8 @@ Minimum host permissions for a dedicated release evidence runner:
    - leave `skip_bundle=true` for host-only evidence (default);
    - set `skip_bundle=false` only after `cargo-tauri` is installed and you
      intentionally want bundle evidence.
+   - an empty tag-trigger input remains host-only; any other malformed value
+     must fail the producer before it executes a build.
 4. After the job finishes, download the artifact zip and verify offline:
 
 ```powershell
@@ -152,6 +164,13 @@ Missing dependencies, unauthorized bundle/APK, or missing YAML parser **fail clo
 6. Secret-like tokens in manifest/provenance notes/warnings → reject (values redacted).
 7. Structural-only YAML checks are **not** accepted for production workflow validation.
 8. Never treat local dry-run as remote CI success.
+9. Do not add `uses` and `run` to the same governed step, or job/workflow
+   shell/container/service/environment overrides: the static contract rejects
+   those ambiguous execution contexts. The sole approved step environment is
+   the Windows producer's exact `SF_RELEASE_SKIP_BUNDLE_INPUT` binding.
+10. The workflow action allowlist uses version tags/labels, not immutable
+    commit-SHA pins. Protect refs and verify the installed runner/action supply
+    chain separately.
 
 ## Registration note (token handling)
 

@@ -34,7 +34,9 @@ Added:
    `docs/operations/gitea-host-release-runner.md` (labels, least privilege,
    cache, retention, concurrency, manual `workflow_dispatch`, no tokens).
 5. **Pester suite** `scripts/tests/ReleaseBuild.RunnerReadiness.Tests.ps1`
-   (27 tests) registered in `run-release-build-tests.ps1`.
+   registered in `run-release-build-tests.ps1`. The initial readiness slice had
+   27 cases; the current adversarial suite contains 97 cases (see the latest
+   validation status below rather than treating the initial count as current).
 
 Also fixed three **test fixtures** that embedded static `sk-…` strings and
 blocked the repository-wide fail-closed secret scan. Fixtures now assemble
@@ -52,7 +54,7 @@ signed APKs, GUI acceptance, or device acceptance.
 | `scripts/release-build/ReleaseBuild.Common.ps1` | Preflight, offline verifier, workflow static contract helpers |
 | `scripts/test-release-runner-preflight.ps1` | **New** CLI for local preflight reports |
 | `scripts/verify-release-evidence.ps1` | **New** CLI for offline evidence package verification |
-| `scripts/tests/ReleaseBuild.RunnerReadiness.Tests.ps1` | **New** 27 Pester tests (RED→GREEN) |
+| `scripts/tests/ReleaseBuild.RunnerReadiness.Tests.ps1` | Initially 27 new Pester tests (RED→GREEN); current suite has 97 cases |
 | `scripts/tests/run-release-build-tests.ps1` | Registers readiness suite |
 | `docs/operations/gitea-host-release-runner.md` | **New** credential-free runner ops guide |
 | `docs/workstreams/RELEASE-RUNNER-READINESS-RESULT.md` | **New** this document |
@@ -66,12 +68,12 @@ signed APKs, GUI acceptance, or device acceptance.
 |-------|--------|
 | Local preflight for host-only Windows/Android/CI profiles | Proven locally |
 | Offline re-hash / package validation (incl. dry-run with `-AllowDryRun`) | Proven locally |
-| Workflow static governance (pins, npm ci, retention, host-only) | Proven locally via Pester + real PyYAML |
+| Workflow static governance (pins, npm ci, retention, host-only) | Historical pre-follow-up evidence at `45d84dd`; latest hardening still requires a writable host with a real YAML parser |
 | Remote Gitea Actions job execution | **Unverified** |
 | Bundle / APK / signing / publish | **Not performed** |
 | GUI / Android device acceptance | **not_claimable** |
 
-## Verification (raw)
+## Verification (raw, historical initial delivery)
 
 ### Full release Pester suite
 
@@ -79,7 +81,9 @@ signed APKs, GUI acceptance, or device acceptance.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/run-release-build-tests.ps1
 ```
 
-Result: **PASS** (exit 0)
+Historical result: **PASS** (exit 0). The current follow-up validation status
+appears in [Latest local verification status](#latest-local-verification-status)
+and supersedes this table for merge readiness.
 
 | Suite | Passed | Failed |
 |-------|--------|--------|
@@ -294,12 +298,131 @@ Further P0 hardening:
    `ForbiddenPayload` rejection. Prior endurance/SQLite runtime-assembled
    fixtures remain intact.
 
-Full suite after this pass: **150** Pester tests passed
-(37 + 14 + 31 + 68). Windows/Android dry-runs exit 0.
+At commit `45d84dd` (before the subsequent static-contract hardening below),
+the full suite recorded **150** Pester tests passed (37 + 14 + 31 + 68), with
+Windows/Android dry-runs exiting 0.
 `Invoke-ReleaseSecretScan` OK. `git diff --check main..HEAD` clean.
 
 **Still not proven:** remote Gitea runner execution, GUI acceptance, device
 acceptance, signing/publish.
+
+## Latest adversarial static-contract hardening (post-`45d84dd`)
+
+This follow-up closes additional fail-open routes found by independent review.
+
+1. **Fresh producer/output binding:** each host build now owns `id: evidence`,
+   creates a UUID-named controlled `-OutputDir`, verifies its own
+   `manifest.json`, and writes that exact directory to `$GITHUB_OUTPUT`.
+   The workflow no longer selects a `windows-*` / `android-*` directory by
+   latest timestamp, so residual self-hosted-runner evidence cannot be picked
+   up after a skipped or unrelated build.
+2. **Producer contract:** static validation now uses a restricted producer AST,
+   not merely a matching command. It permits only the fixed GUID-namespaced
+   `evidenceDir` assignment, read-only path checks, the controlled `pwsh -File`
+   build call(s), and one exact `dir=$evidenceDir` write to `GITHUB_OUTPUT`.
+   It also requires a fresh-directory guard, native `$LASTEXITCODE` guard, and
+   `manifest.json` guard before the output is published. The Windows-only
+   `skip_bundle` value is bound as an inert step environment value, exact-
+   allowlisted to empty/`true`/`false`, then branched on; it is no longer
+   interpolated into PowerShell source. The contract rejects producer-side
+   helper rewrites, stale/rebound output paths, `exit`/catch masking, arbitrary
+   commands, non-`pwsh` shells, malformed dispatch input, and false-valued
+   `-SkipBundle` switches. Its `id: evidence` must feed both verifier and upload.
+3. **Executable CI gates:** the required `frontend-gate` `npm ci` and
+   `secret-scan` command are each a single flat, unconditional command after an
+   exact checkout in the intended job and working directory. `exit 0`,
+   `Set-Location`, command/here-string decoys, fake jobs, and tolerated or
+   conditional steps cannot satisfy either gate. PowerShell launchers use a
+   closed `-NoProfile -File` grammar, so `-Command`, abbreviated `-Co`/`-Enc`,
+   `-WorkingDirectory`, and `-SecretScanOnly:$false` do not count.
+4. **Checkout integrity surface:** host and controlled CI checkouts are exact
+   `actions/checkout@v4`; their `with` keys must use the exact lowercase
+   `fetch-depth` spelling (if present), be unique, and otherwise fail closed.
+   `github-server-url`, repository/ref/token/path, case variants, and sparse
+   checkout-style inputs therefore fail closed.
+5. **Workflow governance:** non-string action `uses`, job-level reusable
+   workflow `uses`, and action references outside a fixed allowlist of
+   version tags/labels fail closed. Root permissions other than exact lowercase
+   `contents: read`, and any job-level permissions override, also fail closed.
+   PyYAML/Node parsing rejects duplicate keys, anchors, aliases, and merge
+   keys; controlled `if` and `continue-on-error` fields must be absent, avoiding
+   YAML 1.1/1.2 coercion ambiguity. The allowlist is **not** an immutable
+   commit-SHA supply-chain guarantee: a compromised or retagged upstream action
+   remains outside the protection offered by this repository-side contract.
+6. **Trigger continuity:** the raw workflow source must contain a root literal
+   `on:` (or quoted `"on":`) key before parser-normalized metadata is trusted,
+   and `ci-gates.yml` must contain both `push` and `pull_request`. A YAML 1.1
+   parser's `True` key cannot masquerade as the trigger, so removing or
+   replacing `on:` cannot leave a green static contract while making CI inert.
+7. **Trusted execution topology:** governed host jobs now permit only their
+   fixed setup run, controlled producer, verifier, and adjacent upload. The
+   `frontend-gate` prefix is exactly checkout → setup-node → `npm ci`, and the
+   `secret-scan` prefix is exactly checkout → scan. An intervening `run` step
+   cannot rewrite a helper, `package-lock`, or scan target while leaving a
+   command-shaped gate behind.
+8. **Closed PowerShell program grammar:** `using module`, `#requires`, named
+   blocks, and other preambles are rejected before restricted commands are
+   evaluated. Producer helper invocations also use an exact post-`-File`
+   argument set, so Android `-BuildApk`/`-DryRun` and other appended behavior
+   flags cannot retain a host-only green claim.
+9. **Execution-mode and context binding:** every controlled host step must be
+   exactly one of `uses` or `run`; an ambiguous step carrying both cannot make a
+   command-shaped verifier/gate look executed. Workflow/job default shells,
+   containers, services, and uncontrolled environment overrides are rejected.
+   The only host-step environment exception is the exact inert Windows
+   `skip_bundle` binding described above; host job environment remains exactly
+   `CARGO_TARGET_DIR=""` and `RUST_LOG="info"`.
+10. **Parser readiness and parser parity:** `pester-release-tests` now installs
+   and verifies `PyYAML==6.0.2` before parser-backed Pester contracts run.
+   Both metadata adapters label mappings consistently, reject numeric
+   anchor/alias names, and the Node path accepts only integral retention days.
+
+### Latest local verification status
+
+The Codex execution sandbox used for this follow-up has neither PyYAML nor Node
+`yaml`/`js-yaml`, and it rejects creation beneath the default
+`artifacts/release-build` root. The first condition correctly fail-closes
+workflow validation; together they prevent a truthful all-green parser-backed
+Pester or standalone default-output dry-run claim here.
+
+Completed in this sandbox:
+
+- PowerShell parser validation of changed helper and Pester source: PASS.
+- Direct AST adversarial probes: legitimate `npm ci`, secret-scan, and
+  producer invocations are recognized; here-string/`Write-Host` decoys,
+  `-Command`/`-Co`/`-Enc` launchers, false-valued switches, `exit 0` masking,
+  wrong working directories, stale-output rebinding, helper rewrites,
+  `using module`/`#requires` preambles, and appended Android/Windows behavior
+  flags are rejected.
+- The three non-parser suites passed: **37 + 14 + 32**. The parser-dependent
+  readiness suite ran **72/97**; its remaining **25** failures are all tests
+  that intentionally require a real YAML parser and therefore fail closed in
+  this sandbox. This is recorded as a blocked validation, not a passing suite.
+- Existing Windows and Android dry-run Pester coverage passed in the pipeline
+  suite using temporary output roots. Direct default-output dry-runs fail in
+  this sandbox at directory creation before any build work; no new remote CI,
+  GUI, device, signing, or publish claim follows.
+- Both embedded Node YAML adapters pass `node --check`; their runtime use still
+  requires the separately installed `yaml` or `js-yaml` package.
+- `Invoke-ReleaseSecretScan`: PASS.
+- `git diff --check`: PASS.
+
+Required before changing the recommendation to final merge-ready: rerun all
+four Pester files and Windows/Android dry-runs in a writable Windows host with
+PyYAML (or Node `yaml`/`js-yaml`) available and verify that all four Pester
+files are green. The current source contains 97 readiness Pester cases; no new
+remote runner, GUI, device, signing, or publish claim is made.
+
+The contract prevents a workflow-authored producer from rewriting the checked-in
+verification helper before invoking it. It intentionally does **not** claim to
+defend against a compromised runner profile, a compromised checkout/ref, a
+malicious action, or a process outside the controlled workflow steps that can
+modify the checkout on disk. Operators still need a protected ref and an
+isolated/clean runner; those are runner trust-boundary controls, not something
+a same-repository workflow can attest by static inspection alone. Likewise,
+`permissions: contents: read` is statically declared and checked here; whether
+the installed Gitea runner/version enforces it requires a remote preflight and
+is not locally claimed.
 
 ## Risks / follow-ups
 
@@ -310,9 +433,13 @@ acceptance, signing/publish.
    default workflow path remains host-only.
 3. Workflow static contract checks YAML/governance text contracts; it does not
    emulate Gitea Actions runtime semantics.
-4. Fixture string assembly is only for static scanners; runtime secret-shape
+4. Remote preflight should exercise tag/empty, `true`, `false`, and malformed
+   manual `skip_bundle` input. The producer now rejects malformed values as
+   inert data before branching, but this repository cannot attest the installed
+   Gitea server/runner's workflow-dispatch and expression compatibility.
+5. Fixture string assembly is only for static scanners; runtime secret-shape
    rejection tests remain intact.
-5. Creating symlinks/junctions in adversarial tests requires local filesystem
+6. Creating symlinks/junctions in adversarial tests requires local filesystem
    privilege; if mklink fails the suite surfaces that as a hard error.
 
 ## Recommendation

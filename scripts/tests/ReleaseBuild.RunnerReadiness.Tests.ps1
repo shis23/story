@@ -2029,6 +2029,1144 @@ jobs:
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    It 'fails closed on verifier or upload conditions and non-boolean continue-on-error values' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-control-meta-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        if: ${{ false }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Windows evidence
+        continue-on-error: false
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        continue-on-error: 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'if|continue-on-error|condition|failure'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects suffix-spoofed or extra dot-source and dynamic EvidenceDir rebinds' {
+        $suffixSpoof = @'
+$ErrorActionPreference = 'Stop'
+. .\evil\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $suffixResult = Test-ReleaseVerifierStepScriptContract -ScriptText $suffixSpoof
+        $suffixResult.Valid | Should Be $false
+        ($suffixResult.Errors -join ' ') | Should Match 'dot-source|ReleaseBuild\.Common\.ps1|exact'
+
+        $extraSource = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+. .\evil\override.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $extraSourceResult = Test-ReleaseVerifierStepScriptContract -ScriptText $extraSource
+        $extraSourceResult.Valid | Should Be $false
+        ($extraSourceResult.Errors -join ' ') | Should Match 'dot-source|extra|only'
+
+        $dynamicRebind = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$evidenceDir = $env:UNTRUSTED_EVIDENCE_DIR
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $dynamicRebindResult = Test-ReleaseVerifierStepScriptContract -ScriptText $dynamicRebind
+        $dynamicRebindResult.Valid | Should Be $false
+        ($dynamicRebindResult.Errors -join ' ') | Should Match 'EvidenceDir|bound|dynamic|steps\.evidence\.outputs\.dir'
+    }
+
+    It 'requires exactly one pinned upload-artifact v4 step per host job' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-extra-upload-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload verified Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+      - name: Upload extra unverified Windows evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          path: artifacts/unverified
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence with wrong action pin
+        uses: actions/upload-artifact@v3
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'exactly one|upload-artifact@v4|extra|pinned|v4'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects command-bearing setup and post-verification mutation statements' {
+        $commandBearingSetup = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$ignored = Invoke-Expression 'function Assert-ReleaseEvidencePackage { return @{ subject_count = 0 } }'
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $setupResult = Test-ReleaseVerifierStepScriptContract -ScriptText $commandBearingSetup
+        $setupResult.Valid | Should Be $false
+        ($setupResult.Errors -join ' ') | Should Match 'setup|assignment|command|flat'
+
+        $postVerificationMutation = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+Remove-Item -LiteralPath $evidenceDir -Force -Recurse
+'@
+        $postResult = Test-ReleaseVerifierStepScriptContract -ScriptText $postVerificationMutation
+        $postResult.Valid | Should Be $false
+        ($postResult.Errors -join ' ') | Should Match 'after Assert|terminal|post-verification|only'
+    }
+
+    It 'rejects command substitution hidden inside post-verification logging' {
+        $postVerificationSubexpression = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+Write-Host "$(Remove-Item -LiteralPath $evidenceDir -Force -Recurse)"
+'@
+        $result = Test-ReleaseVerifierStepScriptContract -ScriptText $postVerificationSubexpression
+        $result.Valid | Should Be $false
+        ($result.Errors -join ' ') | Should Match 'after Assert|terminal|post-verification|no statements'
+    }
+
+    It 'rejects abbreviated AllowDryRun parameters that PowerShell would bind at runtime' {
+        $abbreviatedSwitch = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir -AllowD
+'@
+        $result = Test-ReleaseVerifierStepScriptContract -ScriptText $abbreviatedSwitch
+        $result.Valid | Should Be $false
+        ($result.Errors -join ' ') | Should Match 'AllowDryRun|AllowD|dry-run'
+    }
+
+    It 'accepts only the exact controlled verifier invocation grammar' {
+        $subexpressionArgument = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir -Verbose:$(Remove-Item -LiteralPath $evidenceDir -Force -Recurse)
+'@
+        $subexpressionResult = Test-ReleaseVerifierStepScriptContract -ScriptText $subexpressionArgument
+        $subexpressionResult.Valid | Should Be $false
+        ($subexpressionResult.Errors -join ' ') | Should Match 'exact|EvidenceDir|argument|parameter|grammar'
+
+        $abbreviatedEvidenceDir = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -Evidence $evidenceDir
+'@
+        $abbreviatedResult = Test-ReleaseVerifierStepScriptContract -ScriptText $abbreviatedEvidenceDir
+        $abbreviatedResult.Valid | Should Be $false
+        ($abbreviatedResult.Errors -join ' ') | Should Match 'exact|EvidenceDir|parameter|grammar'
+    }
+
+    It 'rejects hidden PowerShell preambles that can execute before the controlled verifier' {
+        $usingModule = @'
+using module .\evil.psm1
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $usingResult = Test-ReleaseVerifierStepScriptContract -ScriptText $usingModule
+        $usingResult.Valid | Should Be $false
+        ($usingResult.Errors -join ' ') | Should Match 'using|preamble|bare|module'
+
+        $requiresModule = @'
+#requires -Modules evil
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $requiresResult = Test-ReleaseVerifierStepScriptContract -ScriptText $requiresModule
+        $requiresResult.Valid | Should Be $false
+        ($requiresResult.Errors -join ' ') | Should Match 'requires|preamble|bare|module'
+
+        $paramBlock = @'
+param([string]$Ignored)
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $paramResult = Test-ReleaseVerifierStepScriptContract -ScriptText $paramBlock
+        $paramResult.Valid | Should Be $false
+        ($paramResult.Errors -join ' ') | Should Match 'param|preamble|bare'
+    }
+
+    It 'rejects provider-qualified assignments that can shadow the controlled verifier command' {
+        $aliasOverride = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+${alias:Assert-ReleaseEvidencePackage} = 'Write-Output'
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $result = Test-ReleaseVerifierStepScriptContract -ScriptText $aliasOverride
+        $result.Valid | Should Be $false
+        ($result.Errors -join ' ') | Should Match 'local variable|qualified|scope|provider|assignment'
+
+        $redirectionSubexpression = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir > $(Set-Item -Path function:Assert-ReleaseEvidencePackage -Value { param($EvidenceDir) [pscustomobject]@{ Valid = $true } }; 'NUL')
+'@
+        $redirectionResult = Test-ReleaseVerifierStepScriptContract -ScriptText $redirectionSubexpression
+        $redirectionResult.Valid | Should Be $false
+        ($redirectionResult.Errors -join ' ') | Should Match 'redirection|exact|grammar|EvidenceDir'
+
+        $sideEffectingLhs = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$PSVersionTable[$(Set-Content -LiteralPath (Join-Path $evidenceDir 'tampered.txt') -Value 'x'; 'audit-key')] = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $lhsResult = Test-ReleaseVerifierStepScriptContract -ScriptText $sideEffectingLhs
+        $lhsResult.Valid | Should Be $false
+        ($lhsResult.Errors -join ' ') | Should Match 'simple variable|local variable|reachable|Assert'
+    }
+
+    It 'requires the verifier to run from the repository working directory' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-working-dir-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        working-directory: evil
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'working-directory|working directory|repository'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'requires the controlled verifier to be immediately followed by its only upload step' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-between-verify-upload-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Mutate after verification
+        shell: pwsh
+        run: Remove-Item -LiteralPath '${{ steps.evidence.outputs.dir }}' -Force -Recurse
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'immediately|adjacent|next step|upload'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects job-level tolerance, non-root working-directory defaults, and extra workflow uploads' {
+        $base = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+        $cases = @(
+            [pscustomobject]@{
+                Name = 'job continue-on-error'
+                Text = $base.Replace('    runs-on: windows-latest', "    runs-on: windows-latest`r`n    continue-on-error: true")
+                Pattern = 'continue-on-error'
+            },
+            [pscustomobject]@{
+                Name = 'job condition'
+                Text = $base.Replace('  windows-host-evidence:', "  windows-host-evidence:`r`n    if: `${{ false }}")
+                Pattern = 'job.*if:|if: condition'
+            },
+            [pscustomobject]@{
+                Name = 'job dependency'
+                Text = $base.Replace('  windows-host-evidence:', "  windows-host-evidence:`r`n    needs: skipped-prerequisite")
+                Pattern = 'needs|dependency'
+            },
+            [pscustomobject]@{
+                Name = 'workflow defaults working-directory'
+                Text = ("defaults:`r`n  run:`r`n    working-directory: evil`r`n`r`n" + $base)
+                Pattern = 'working-directory|repository'
+            },
+            [pscustomobject]@{
+                Name = 'workflow environment override'
+                Text = ("env:`r`n  PATH: C:\evil`r`n`r`n" + $base)
+                Pattern = 'workflow env|environment|env'
+            },
+            [pscustomobject]@{
+                Name = 'job default shell wrapper'
+                Text = $base.Replace('    runs-on: windows-latest', "    runs-on: windows-latest`r`n    defaults:`r`n      run:`r`n        shell: pwsh -Command `"& {0}; exit 0`"")
+                Pattern = 'defaults.run.shell|shell'
+            },
+            [pscustomobject]@{
+                Name = 'job PATH environment override'
+                Text = $base.Replace('    runs-on: windows-latest', "    runs-on: windows-latest`r`n    env:`r`n      PATH: C:\evil")
+                Pattern = 'host job env|environment|env'
+            },
+            [pscustomobject]@{
+                Name = 'job container override'
+                Text = $base.Replace('    runs-on: windows-latest', "    runs-on: windows-latest`r`n    container: attacker/command-shadow:latest")
+                Pattern = 'container|services'
+            },
+            [pscustomobject]@{
+                Name = 'producer step environment override'
+                Text = $base.Replace('        id: evidence', "        id: evidence`r`n        env:`r`n          PATH: C:\evil")
+                Pattern = 'step.*env|env override|environment'
+            },
+            [pscustomobject]@{
+                Name = 'job defaults working-directory'
+                Text = $base.Replace('    runs-on: windows-latest', "    runs-on: windows-latest`r`n    defaults:`r`n      run:`r`n        working-directory: evil")
+                Pattern = 'working-directory|repository'
+            },
+            [pscustomobject]@{
+                Name = 'extra artifact upload job'
+                Text = ($base + @'
+
+  unrelated-artifact:
+    runs-on: windows-latest
+    steps:
+      - name: Upload unverified data
+        uses: actions/upload-artifact@v4
+        with:
+          name: unrelated
+          path: artifacts/unverified
+'@)
+                Pattern = 'no other upload|exactly one|upload-artifact'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-governance-{0}" -f [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            try {
+                $wf = Join-Path $dir 'release-host-evidence.yml'
+                $case.Text | Set-Content -LiteralPath $wf -Encoding utf8
+                $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+                $order.Valid | Should Be $false
+                ($order.Errors -join ' ') | Should Match $case.Pattern
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'requires an unconditional checkout before verification and 14-day retention for each controlled upload' {
+        $base = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+        $cases = @(
+            [pscustomobject]@{
+                Name = 'checkout pin'
+                Text = $base.Replace('uses: actions/checkout@v4', 'uses: actions/checkout@v3')
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'checkout|actions/checkout@v4'
+            },
+            [pscustomobject]@{
+                Name = 'checkout condition'
+                Text = $base.Replace("        uses: actions/checkout@v4", "        if: `${{ false }}`r`n        uses: actions/checkout@v4")
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'checkout|if:'
+            },
+            [pscustomobject]@{
+                Name = 'checkout repository override'
+                Text = $base.Replace('          fetch-depth: 0', "          fetch-depth: 0`r`n          repository: attacker/poison")
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'repository|checkout|ref|ssh'
+            },
+            [pscustomobject]@{
+                Name = 'checkout unapproved with input'
+                Text = $base.Replace('          fetch-depth: 0', "          fetch-depth: 0`r`n          github-server-url: https://attacker.invalid")
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'checkout|with|input|github-server-url|unsupported'
+            },
+            [pscustomobject]@{
+                Name = 'checkout case-variant source override'
+                Text = $base.Replace('          fetch-depth: 0', "          fetch-depth: 0`r`n          Repository: attacker/poison")
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'checkout|with|input|repository|unsupported'
+            },
+            [pscustomobject]@{
+                Name = 'checkout duplicate normalized with key'
+                Text = $base.Replace('          fetch-depth: 0', "          fetch-depth: 0`r`n          Fetch-Depth: 1")
+                Switches = @{ RequireCheckout = $true }
+                Pattern = 'checkout|unique|duplicate|with'
+            },
+            [pscustomobject]@{
+                Name = 'retention'
+                Text = $base.Replace('retention-days: 14', 'retention-days: 1')
+                Switches = @{ RequireRetentionDays14 = $true }
+                Pattern = 'retention-days|14'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-production-policy-{0}" -f [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            try {
+                $wf = Join-Path $dir 'release-host-evidence.yml'
+                $case.Text | Set-Content -LiteralPath $wf -Encoding utf8
+                $splat = [hashtable]$case.Switches
+                $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf @splat
+                $order.Valid | Should Be $false
+                ($order.Errors -join ' ') | Should Match $case.Pattern
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'rejects a mutable non-allowlisted action reference in the production static contract' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-actions-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $ci | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            ($hostWorkflow + @'
+
+  mutable-action:
+    runs-on: windows-latest
+    steps:
+      - { name: Poison, uses: evil/action@main }
+'@) | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['actions_pinned'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'allowlist|evil/action@main|Action reference'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects non-string and job-level uses fields instead of silently omitting them from the action allowlist' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-uses-shape-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badHost = $hostWorkflow + @'
+
+  malformed-action-shape:
+    runs-on: windows-latest
+    steps:
+      - name: Non-string uses must not disappear
+        uses: false
+
+  reusable-workflow-shape:
+    uses: attacker/reusable-workflow@main
+'@
+            $ci | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $badHost | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['actions_pinned'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'Action reference|Reusable|uses|allowlist'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'requires exact top-level read-only permissions and no job-level override' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-permissions-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badCi = $ci.Replace('  contents: read', "  contents: write`r`n  packages: write")
+            $badHost = $hostWorkflow.Replace('    timeout-minutes: 60', "    timeout-minutes: 60`r`n    permissions: write-all")
+            $badCi | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $badHost | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['least_privilege_permissions'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'permissions|contents|override|read'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'rejects comment decoys for host-only, npm ci, and secret-scan claims' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-comment-decoys-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badCi = $ci.Replace('npm ci', 'npm install').Replace('pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly', 'Write-Host skipped') + "`r`n# npm ci ; SecretScanOnly`r`n"
+            $badHost = $hostWorkflow.Replace("default: 'true'", "default: 'false'") + "`r`n# default: 'true'; pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle`r`n"
+            $badCi | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $badHost | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['host_only_default'] | Should Be $false
+            $contract.checks['npm_ci'] | Should Be $false
+            $contract.checks['secret_scan'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'host-only|npm ci|secret scan'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'requires a non-conditional fresh evidence producer in the production static contract' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-producer-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badHost = $hostWorkflow.Replace(
+                '      - name: Windows host release build',
+                "      - name: Windows host release build`r`n        if: `${{ false }}"
+            )
+            $ci | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $badHost | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['full_offline_verifier'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'fresh evidence producer|producer.*if|producer.*condition'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'binds the controlled producer identity to a fresh OutputDir instead of a latest-directory lookup' {
+        $base = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+        $cases = @(
+            [pscustomobject]@{
+                Name = 'wrong producer output id'
+                Text = $base.Replace('id: evidence', 'id: stale-evidence')
+                Pattern = 'id: evidence|fresh evidence producer|producer'
+            },
+            [pscustomobject]@{
+                Name = 'no explicit output directory'
+                Text = $base.Replace(' -OutputDir $evidenceDir', '')
+                Pattern = 'fresh evidence producer|OutputDir|producer'
+            },
+            [pscustomobject]@{
+                Name = 'string decoy instead of controlled producer invocation'
+                Text = $base.Replace(
+                    'pwsh -NoProfile -File scripts/run-android-host-pipeline.ps1 -OutputDir $evidenceDir',
+                    "Write-Host 'scripts/run-android-host-pipeline.ps1 -OutputDir `$evidenceDir'"
+                )
+                Pattern = 'fresh evidence producer|run-android-host-pipeline|producer'
+            }
+        )
+        foreach ($case in $cases) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-producer-binding-{0}" -f [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            try {
+                $wf = Join-Path $dir 'release-host-evidence.yml'
+                $case.Text | Set-Content -LiteralPath $wf -Encoding utf8
+                $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf -RequireFreshProducer
+                $order.Valid | Should Be $false
+                ($order.Errors -join ' ') | Should Match $case.Pattern
+            } finally {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'rejects PowerShell here-string decoys for executable host-only, npm ci, and secret-scan claims' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-here-string-decoys-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badCi = $ci.Replace('npm ci', 'Write-Host skipped').Replace(
+                'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly',
+                'Write-Host skipped'
+            ) + @'
+
+  ast-string-decoy:
+    runs-on: windows-latest
+    steps:
+      - name: text that must not count as commands
+        shell: pwsh
+        run: |
+          @'
+          npm ci
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+          '@
+          Write-Host skipped
+'@
+            $badHost = $hostWorkflow.Replace(
+                'pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle',
+                'Write-Host skipped'
+            ) + @'
+
+  host-ast-string-decoy:
+    runs-on: windows-latest
+    steps:
+      - name: text that must not count as a host build
+        shell: pwsh
+        run: |
+          @'
+          pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle
+          '@
+          Write-Host skipped
+'@
+            $badCi | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $badHost | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['host_only_default'] | Should Be $false
+            $contract.checks['npm_ci'] | Should Be $false
+            $contract.checks['secret_scan'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'host-only|npm ci|secret scan'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'does not count conditional or tolerated npm ci and secret-scan steps as release gates' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-conditional-gates-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
+        try {
+            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $badCi = $ci.Replace('npm ci', 'Write-Host skipped').Replace(
+                'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly',
+                'Write-Host skipped'
+            ) + @'
+
+  conditional-gate-decoy:
+    runs-on: windows-latest
+    steps:
+      - name: Conditional npm ci must not count
+        if: ${{ false }}
+        shell: pwsh
+        run: npm ci
+      - name: Tolerated secret scan must not count
+        continue-on-error: true
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+'@
+            $badCi | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
+            $hostWorkflow | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
+            $contract.Valid | Should Be $false
+            $contract.checks['npm_ci'] | Should Be $false
+            $contract.checks['secret_scan'] | Should Be $false
+            ($contract.Errors -join ' ') | Should Match 'npm ci|secret scan'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'requires the Windows producer default and tag branch to execute the real host-only invocation' {
+        $safe = @'
+if ($skipBundleInput -eq 'false') {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+}
+'@
+        $unsafeDirectInterpolation = @'
+if ('${{ github.event.inputs.skip_bundle }}' -eq 'false') {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+}
+'@
+        $falseBranchDecoy = @'
+if ($false) {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+}
+'@
+        $reversedDefault = @'
+if ($skipBundleInput -eq 'false') {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+}
+'@
+        $extraBuild = @'
+if ($skipBundleInput -eq 'false') {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle -OutputDir $evidenceDir
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+}
+'@
+
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $safe) | Should Be $true
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $unsafeDirectInterpolation) | Should Be $false
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $falseBranchDecoy) | Should Be $false
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $reversedDefault) | Should Be $false
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $extraBuild) | Should Be $false
+    }
+
+    It 'requires the Windows producer to validate dispatch input as inert environment data before branching' {
+        $lines = @(Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'))
+        $runStart = -1
+        $runEnd = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -eq '        run: |' -and $i -gt 60 -and $i -lt 120) {
+                $runStart = $i
+                continue
+            }
+            if ($runStart -ge 0 -and $i -gt $runStart -and
+                $lines[$i] -eq '      - name: Offline verify Windows evidence package (fail-closed)') {
+                $runEnd = $i
+                break
+            }
+        }
+        $runStart | Should BeGreaterThan -1
+        $runEnd | Should BeGreaterThan $runStart
+        $body = @($lines[($runStart + 1)..($runEnd - 1)] |
+            Where-Object { $_ -match '^          ' } |
+            ForEach-Object { $_.Substring(10) }) -join "`n"
+        $inputGuard = @'
+if ($skipBundleInput -notin @('', 'true', 'false')) {
+  throw 'skip_bundle must be empty, true, or false.'
+}
+'@.Trim()
+        $unsafeInterpolation = $body.Replace(
+            '[string]$env:SF_RELEASE_SKIP_BUNDLE_INPUT',
+            @'
+[string]'${{ github.event.inputs.skip_bundle }}'
+'@.Trim()
+        )
+        $withoutAllowlist = $body.Replace($inputGuard, '')
+
+        (Test-ReleaseEvidenceProducerScriptContract `
+            -ScriptText $body `
+            -ScriptLeafName 'run-release-build.ps1' `
+            -RequireWindowsHostOnly) | Should Be $true
+        (Test-ReleaseEvidenceProducerScriptContract `
+            -ScriptText $unsafeInterpolation `
+            -ScriptLeafName 'run-release-build.ps1' `
+            -RequireWindowsHostOnly) | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract `
+            -ScriptText $withoutAllowlist `
+            -ScriptLeafName 'run-release-build.ps1' `
+            -RequireWindowsHostOnly) | Should Be $false
+    }
+
+    It 'rejects pwsh Command-before-File and false switch values' {
+        $commandBeforeFile = "pwsh -NoProfile -Command 'exit 0' -File scripts/verify-release.ps1 -SecretScanOnly"
+        $falseSecretSwitch = 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly:$false'
+        $falseBundleSwitch = @'
+if ($skipBundleInput -eq 'false') {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -OutputDir $evidenceDir
+} else {
+  pwsh -NoProfile -File scripts/run-release-build.ps1 -SkipBundle:$false -OutputDir $evidenceDir
+}
+'@
+
+        (Test-ReleaseRunContainsPowerShellFileInvocation `
+            -ScriptText $commandBeforeFile `
+            -ExpectedRelativePath 'scripts/verify-release.ps1' `
+            -RequiredParameter 'SecretScanOnly' `
+            -TopLevelOnly) | Should Be $false
+        (Test-ReleaseRunContainsPowerShellFileInvocation `
+            -ScriptText $falseSecretSwitch `
+            -ExpectedRelativePath 'scripts/verify-release.ps1' `
+            -RequiredParameter 'SecretScanOnly' `
+            -TopLevelOnly) | Should Be $false
+        (Test-ReleaseWindowsHostOnlyProducerScriptContract -ScriptText $falseBundleSwitch) | Should Be $false
+    }
+
+    It 'requires flat terminal command scripts for the npm and secret-scan gates' {
+        (Test-ReleaseExactNpmCiGateScript -ScriptText 'npm ci') | Should Be $true
+        (Test-ReleaseExactNpmCiGateScript -ScriptText 'npm ci; exit 0') | Should Be $false
+        (Test-ReleaseExactNpmCiGateScript -ScriptText "#requires -Modules evil`r`nnpm ci") | Should Be $false
+        (Test-ReleaseExactSecretScanGateScript -ScriptText 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly') | Should Be $true
+        (Test-ReleaseExactSecretScanGateScript -ScriptText 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly; exit 0') | Should Be $false
+        (Test-ReleaseExactSecretScanGateScript -ScriptText 'Set-Location evil; pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly') | Should Be $false
+        (Test-ReleaseExactSecretScanGateScript -ScriptText "using module .\\evil.psm1`r`npwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly") | Should Be $false
+    }
+
+    It 'requires producer OutputDir and GITHUB_OUTPUT to bind the same controlled variable' {
+        $safe = @'
+$ErrorActionPreference = 'Stop'
+$evidenceDir = Join-Path $PWD ("artifacts\release-build\android-gitea-" + [guid]::NewGuid().ToString('N'))
+if (Test-Path -LiteralPath $evidenceDir) {
+  throw 'Refusing to reuse an existing Android evidence directory.'
+}
+pwsh -NoProfile -File scripts/run-android-host-pipeline.ps1 -OutputDir $evidenceDir
+if ($LASTEXITCODE -ne 0) {
+  throw "Android host pipeline failed with exit code $LASTEXITCODE."
+}
+if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'manifest.json') -PathType Leaf)) {
+  throw 'Android host pipeline did not produce manifest.json in its controlled evidence directory.'
+}
+"dir=$evidenceDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+'@
+        $oldOutput = $safe.Replace('-OutputDir $evidenceDir', '-OutputDir C:\old-evidence')
+        $reboundOutput = $safe.Replace(
+            '"dir=$evidenceDir" | Out-File',
+            "`$evidenceDir = 'C:\old-evidence'`r`n`"dir=`$evidenceDir`" | Out-File"
+        )
+        $mutatesHelper = $safe.Replace(
+            'pwsh -NoProfile',
+            "Set-Content scripts\release-build\ReleaseBuild.Common.ps1 'poison'`r`npwsh -NoProfile"
+        )
+        $extraAndroidBehavior = $safe.Replace('-OutputDir $evidenceDir', '-BuildApk -OutputDir $evidenceDir')
+        $modulePreamble = "using module .\evil.psm1`r`n$($safe)"
+        $requiresPreamble = "#requires -Modules evil`r`n$($safe)"
+        $exitMask = $safe + "`r`nexit 0"
+        $missingNativeExitCheck = $safe.Replace(@'
+if ($LASTEXITCODE -ne 0) {
+  throw "Android host pipeline failed with exit code $LASTEXITCODE."
+}
+'@, '')
+        $missingFreshDirectoryCheck = $safe.Replace(@'
+if (Test-Path -LiteralPath $evidenceDir) {
+  throw 'Refusing to reuse an existing Android evidence directory.'
+}
+'@, '')
+        $missingManifestCheck = $safe.Replace(@'
+if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'manifest.json') -PathType Leaf)) {
+  throw 'Android host pipeline did not produce manifest.json in its controlled evidence directory.'
+}
+'@, '')
+
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $safe -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $true
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $oldOutput -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $reboundOutput -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $mutatesHelper -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $extraAndroidBehavior -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $modulePreamble -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $requiresPreamble -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $exitMask -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $missingFreshDirectoryCheck -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $missingNativeExitCheck -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+        (Test-ReleaseEvidenceProducerScriptContract -ScriptText $missingManifestCheck -ScriptLeafName 'run-android-host-pipeline.ps1') | Should Be $false
+    }
+
+    It 'rejects executable host steps that can mutate the checkout before the controlled producer' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-host-pre-producer-mutation-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $source = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            $tampered = $source.Replace(
+                '      - name: Install Rust toolchain',
+                @'
+      - name: Mutate verifier helper before evidence production
+        shell: pwsh
+        run: Set-Content scripts\release-build\ReleaseBuild.Common.ps1 'poison'
+
+      - name: Install Rust toolchain
+'@
+            )
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            $tampered | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder `
+                -WorkflowPath $wf `
+                -RequireCheckout `
+                -RequireFreshProducer `
+                -RequireRetentionDays14
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'topology|unexpected executable|run step|trusted'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'binds npm and secret gates to the intended checked-out job and working directory' {
+        function New-ContractStep {
+            param(
+                [int]$Index,
+                [string]$Uses = '',
+                [string]$Run = '',
+                [bool]$ShellPresent = $false,
+                [string]$Shell = '',
+                [bool]$WorkingDirectoryPresent = $false,
+                [bool]$EnvPresent = $false
+            )
+            $usesPresent = -not [string]::IsNullOrWhiteSpace($Uses)
+            $runPresent = -not [string]::IsNullOrWhiteSpace($Run)
+            return [pscustomobject]@{
+                index = $Index; uses = $Uses; run = $Run
+                uses_present = $usesPresent; uses_kind = if ($usesPresent) { 'string' } else { 'null' }
+                run_present = $runPresent; run_kind = if ($runPresent) { 'string' } else { 'null' }
+                if_present = $false; continue_on_error_present = $false
+                working_directory_present = $WorkingDirectoryPresent
+                shell_present = $ShellPresent; shell_kind = if ($ShellPresent) { 'string' } else { 'null' }; shell = $Shell
+                env_present = $EnvPresent
+                with_raw_keys = @(); with_keys_unique = $true
+            }
+        }
+        $frontend = [pscustomobject]@{
+            present = $true; runs_on_kind = 'string'; runs_on = 'ubuntu-latest'
+            if_present = $false; continue_on_error_present = $false; needs_present = $false
+            defaults_run_working_directory_present = $true; defaults_run_working_directory_kind = 'string'; defaults_run_working_directory = 'frontend'
+            defaults_run_shell_present = $false; env_present = $false; container_present = $false; services_present = $false
+            steps = @(
+                (New-ContractStep -Index 0 -Uses 'actions/checkout@v4'),
+                (New-ContractStep -Index 1 -Uses 'actions/setup-node@v4'),
+                (New-ContractStep -Index 2 -Run 'npm ci')
+            )
+        }
+        $secret = [pscustomobject]@{
+            present = $true; runs_on_kind = 'string'; runs_on = 'windows-latest'
+            if_present = $false; continue_on_error_present = $false; needs_present = $false
+            defaults_run_working_directory_present = $false; defaults_run_working_directory_kind = ''; defaults_run_working_directory = ''
+            defaults_run_shell_present = $false; env_present = $false; container_present = $false; services_present = $false
+            steps = @(
+                (New-ContractStep -Index 0 -Uses 'actions/checkout@v4'),
+                (New-ContractStep -Index 1 -Run 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly' -ShellPresent $true -Shell 'pwsh')
+            )
+        }
+        $metadata = [pscustomobject]@{
+            WorkflowDefaultsRunWorkingDirectoryPresent = $false
+            WorkflowDefaultsRunShellPresent = $false
+            WorkflowEnvPresent = $false
+            jobs = @{ 'frontend-gate' = $frontend; 'secret-scan' = $secret }
+        }
+
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'secret_scan').Valid | Should Be $true
+        $frontend.steps[2].working_directory_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $frontend.steps[2].working_directory_present = $false
+        $frontend.steps = @(
+            (New-ContractStep -Index 0 -Uses 'actions/checkout@v4'),
+            (New-ContractStep -Index 1 -Run "Set-Content package-lock.json 'poison'"),
+            (New-ContractStep -Index 2 -Uses 'actions/setup-node@v4'),
+            (New-ContractStep -Index 3 -Run 'npm ci')
+        )
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $secret.steps[0].index = 2
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'secret_scan').Valid | Should Be $false
+        $secret.steps[0].index = 0
+        $metadata.WorkflowDefaultsRunShellPresent = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $metadata.WorkflowDefaultsRunShellPresent = $false
+        $frontend.defaults_run_shell_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $frontend.defaults_run_shell_present = $false
+        $secret.steps[1].env_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'secret_scan').Valid | Should Be $false
+        $secret.steps[1].env_present = $false
+        $frontend.container_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $frontend.container_present = $false
+        # A step may not carry an allowed action and a command-shaped gate at
+        # the same time. Gitea/GitHub action semantics for that ambiguous YAML
+        # are not a proof that the run block executes.
+        $frontend.steps[2].uses = 'dtolnay/rust-toolchain@stable'
+        $frontend.steps[2].uses_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'npm_ci').Valid | Should Be $false
+        $frontend.steps[2].uses = ''
+        $frontend.steps[2].uses_present = $false
+        $secret.steps[1].uses = 'dtolnay/rust-toolchain@stable'
+        $secret.steps[1].uses_present = $true
+        (Test-ReleaseCiGateJobContract -WorkflowMetadata $metadata -Gate 'secret_scan').Valid | Should Be $false
+    }
+
+    It 'requires a pinned real YAML parser before parser-backed Pester contracts run' {
+        function New-PesterContractStep {
+            param(
+                [int]$Index,
+                [string]$Uses = '',
+                [string]$Run = '',
+                [bool]$ShellPresent = $false,
+                [string]$Shell = ''
+            )
+            $usesPresent = -not [string]::IsNullOrWhiteSpace($Uses)
+            $runPresent = -not [string]::IsNullOrWhiteSpace($Run)
+            return [pscustomobject]@{
+                index = $Index; uses = $Uses; run = $Run
+                uses_present = $usesPresent; uses_kind = if ($usesPresent) { 'string' } else { 'null' }
+                run_present = $runPresent; run_kind = if ($runPresent) { 'string' } else { 'null' }
+                if_present = $false; continue_on_error_present = $false
+                working_directory_present = $false
+                shell_present = $ShellPresent; shell_kind = if ($ShellPresent) { 'string' } else { 'null' }; shell = $Shell
+                env_present = $false
+                with_raw_keys = @(); with_keys_unique = $true
+            }
+        }
+        $pinnedInstall = @'
+$ErrorActionPreference = 'Stop'
+python -m pip install 'PyYAML==6.0.2'
+python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+'@
+        $pesterJob = [pscustomobject]@{
+            present = $true; runs_on_kind = 'string'; runs_on = 'windows-latest'
+            if_present = $false; continue_on_error_present = $false; needs_present = $false
+            defaults_run_working_directory_present = $false; defaults_run_shell_present = $false
+            env_present = $false; container_present = $false; services_present = $false
+            steps = @(
+                (New-PesterContractStep -Index 0 -Uses 'actions/checkout@v4'),
+                (New-PesterContractStep -Index 1 -Uses 'actions/setup-python@v5'),
+                (New-PesterContractStep -Index 2 -Run $pinnedInstall -ShellPresent $true -Shell 'pwsh'),
+                (New-PesterContractStep -Index 3 -Run 'pwsh -NoProfile -File scripts/tests/run-release-build-tests.ps1' -ShellPresent $true -Shell 'pwsh'),
+                (New-PesterContractStep -Index 4 -Run 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly' -ShellPresent $true -Shell 'pwsh')
+            )
+        }
+        $metadata = [pscustomobject]@{
+            WorkflowDefaultsRunWorkingDirectoryPresent = $false
+            WorkflowDefaultsRunShellPresent = $false
+            WorkflowEnvPresent = $false
+            jobs = @{ 'pester-release-tests' = $pesterJob }
+        }
+
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $true
+        $pesterJob.steps[1].uses = 'actions/setup-python@v4'
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+        $pesterJob.steps[1].uses = 'actions/setup-python@v5'
+        $pesterJob.if_present = $true
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+        $pesterJob.if_present = $false
+        $pesterJob.steps[0].with_raw_keys = @('repository')
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+        $pesterJob.steps[0].with_raw_keys = @()
+        $pesterJob.steps[3].env_present = $true
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+        $pesterJob.steps[3].env_present = $false
+        # `uses` plus a correct-looking `run` is deliberately rejected: a
+        # remote Actions engine may not execute the run block for that step.
+        $pesterJob.steps[3].uses = 'dtolnay/rust-toolchain@stable'
+        $pesterJob.steps[3].uses_present = $true
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+        $pesterJob.steps[3].uses = ''
+        $pesterJob.steps[3].uses_present = $false
+        $pesterJob.steps[1].run = "Write-Host 'decoy'"
+        $pesterJob.steps[1].run_present = $true
+        (Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $metadata).Valid | Should Be $false
+    }
 }
 
 Describe 'Release dry-run offline rehash readiness' {
