@@ -260,13 +260,15 @@ Further P0 hardening:
    `android-host-evidence` jobs call `Assert-ReleaseEvidencePackage` before
    upload. Weak schema/manual rehash-only loops are removed so mapping, sidecar
    grammar, reparse rejection, and recursive secret scan cannot be bypassed.
-3. **Static contract (job/step order):** `full_offline_verifier` is decided by
-   real YAML parse (`Test-ReleaseHostEvidenceVerifierOrder` via PyYAML or Node
-   yaml/js-yaml), not full-text string counts. Each of
-   `windows-host-evidence` / `android-host-evidence` must have an executable
-   `run` step containing `Assert-ReleaseEvidencePackage` **before**
-   `actions/upload-artifact`. Comment-only, missing, wrong job, or
-   verifier-after-upload fail closed. Structural YAML fallback is never PASS.
+3. **Static contract (job/step order + AST):** `full_offline_verifier` is decided
+   by real YAML parse (`Test-ReleaseHostEvidenceVerifierOrder` via PyYAML or
+   Node yaml/js-yaml), then PowerShell AST command detection
+   (`Test-ReleaseRunInvokesCommand`). Each of `windows-host-evidence` /
+   `android-host-evidence` must have a `run` step whose AST contains a real
+   `CommandAst` named `Assert-ReleaseEvidencePackage` **before**
+   `actions/upload-artifact`. Comment-only, `Write-Host` decoys, assignment /
+   string literals, missing, wrong job, or verifier-after-upload fail closed.
+   Structural YAML fallback is never PASS.
 4. **Main integration + M5 fixture:** merged `main` (`12b5f44`) into this
    branch. `evidence_retention_deterministic.rs::seal_refuses_secret_payload`
    now runtime-assembles its secret-shaped payload so
@@ -274,8 +276,8 @@ Further P0 hardening:
    `ForbiddenPayload` rejection. Prior endurance/SQLite runtime-assembled
    fixtures remain intact.
 
-Full suite after this pass: **142** Pester tests passed
-(37 + 14 + 31 + 60). Windows/Android dry-runs exit 0.
+Full suite after this pass: **144** Pester tests passed
+(37 + 14 + 31 + 62). Windows/Android dry-runs exit 0.
 `Invoke-ReleaseSecretScan` OK. `git diff --check main..HEAD` clean.
 
 **Still not proven:** remote Gitea runner execution, GUI acceptance, device

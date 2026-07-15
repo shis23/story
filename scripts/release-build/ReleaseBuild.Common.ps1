@@ -2824,6 +2824,63 @@ function Assert-ReleaseEvidencePackage {
     return $result
 }
 
+function Test-ReleaseRunInvokesCommand {
+    <#
+    .SYNOPSIS
+    Returns true only when PowerShell AST contains a real CommandAst whose command
+    name equals the requested command (not Write-Host/assignment string literals).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText,
+        [Parameter(Mandatory = $true)][string]$CommandName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ScriptText) -or [string]::IsNullOrWhiteSpace($CommandName)) {
+        return $false
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $ScriptText,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($null -eq $ast) {
+        return $false
+    }
+    # Fail closed on parse errors: cannot trust malformed run scripts as verifiers.
+    if ($null -ne $parseErrors -and @($parseErrors).Count -gt 0) {
+        return $false
+    }
+
+    $wanted = $CommandName.Trim()
+    $commands = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true)
+
+    foreach ($cmd in @($commands)) {
+        if ($null -eq $cmd -or $null -eq $cmd.CommandElements -or $cmd.CommandElements.Count -lt 1) {
+            continue
+        }
+        $first = $cmd.CommandElements[0]
+        $name = $null
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            $name = [string]$first.Value
+        } elseif ($first -is [System.Management.Automation.Language.CommandParameterAst]) {
+            continue
+        } else {
+            # Only accept bare command name constants, not expandable/scriptblock forms.
+            continue
+        }
+        if ([string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-ReleaseHostEvidenceVerifierOrder {
     <#
     .SYNOPSIS
@@ -2831,8 +2888,10 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     host job has an executable Assert-ReleaseEvidencePackage run step before upload.
 
     .DESCRIPTION
-    Fail-closed on missing jobs, comment-only mentions, verifier-after-upload, or
-    absence of a real YAML parser. Structural fallback is never treated as PASS.
+    Fail-closed on missing jobs, comment-only mentions, Write-Host/assignment
+    string decoys, verifier-after-upload, or absence of a real YAML parser.
+    Structural fallback is never treated as PASS. Command recognition uses
+    PowerShell AST CommandAst, not substring matching.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WorkflowPath
@@ -2841,6 +2900,7 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     $requiredJobs = @('windows-host-evidence', 'android-host-evidence')
     $jobResults = @{}
     $errors = New-Object System.Collections.Generic.List[string]
+    $verifierCommand = 'Assert-ReleaseEvidencePackage'
 
     if (-not (Test-Path -LiteralPath $WorkflowPath -PathType Leaf)) {
         return [pscustomobject]@{
@@ -2855,6 +2915,8 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     if (-not $pythonCmd) { $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue }
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 
+    # YAML engines only extract structured steps; command authenticity is decided
+    # later in PowerShell via AST (not substring checks inside Python/Node).
     $pyScript = @'
 import sys, json
 try:
@@ -2885,62 +2947,24 @@ out = {}
 for name in required:
     job = jobs.get(name)
     if not isinstance(job, dict):
-        out[name] = {
-            "present": False,
-            "has_verifier_before_upload": False,
-            "verifier_index": -1,
-            "upload_index": -1,
-            "reason": "job missing or not a mapping"
-        }
+        out[name] = {"present": False, "steps": [], "reason": "job missing or not a mapping"}
         continue
     steps = job.get("steps")
     if not isinstance(steps, list):
-        out[name] = {
-            "present": True,
-            "has_verifier_before_upload": False,
-            "verifier_index": -1,
-            "upload_index": -1,
-            "reason": "steps missing or not a list"
-        }
+        out[name] = {"present": True, "steps": [], "reason": "steps missing or not a list"}
         continue
-    verifier_idx = -1
-    upload_idx = -1
+    rendered = []
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
         uses = step.get("uses")
-        if isinstance(uses, str) and uses.startswith("actions/upload-artifact"):
-            if upload_idx < 0:
-                upload_idx = i
         run = step.get("run")
-        if isinstance(run, str) and "Assert-ReleaseEvidencePackage" in run:
-            # YAML run values exclude comments-only lines that are pure comments;
-            # still require a non-comment command occurrence.
-            has_cmd = False
-            for line in run.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if "Assert-ReleaseEvidencePackage" in stripped:
-                    has_cmd = True
-                    break
-            if has_cmd and verifier_idx < 0:
-                verifier_idx = i
-    ok = verifier_idx >= 0 and upload_idx >= 0 and verifier_idx < upload_idx
-    reason = "ok"
-    if verifier_idx < 0:
-        reason = "missing executable Assert-ReleaseEvidencePackage run step"
-    elif upload_idx < 0:
-        reason = "missing actions/upload-artifact step"
-    elif verifier_idx >= upload_idx:
-        reason = "Assert-ReleaseEvidencePackage is not before upload-artifact"
-    out[name] = {
-        "present": True,
-        "has_verifier_before_upload": ok,
-        "verifier_index": verifier_idx,
-        "upload_index": upload_idx,
-        "reason": reason
-    }
+        rendered.append({
+            "index": i,
+            "uses": uses if isinstance(uses, str) else "",
+            "run": run if isinstance(run, str) else ""
+        })
+    out[name] = {"present": True, "steps": rendered, "reason": "ok"}
 
 print(json.dumps({"ok": True, "engine": "pyyaml", "error": "", "jobs": out}))
 '@
@@ -2974,40 +2998,23 @@ const out = {};
 for (const name of required) {
   const job = jobs[name];
   if (!job || typeof job !== "object" || Array.isArray(job)) {
-    out[name] = { present: false, has_verifier_before_upload: false, verifier_index: -1, upload_index: -1, reason: "job missing or not a mapping" };
+    out[name] = { present: false, steps: [], reason: "job missing or not a mapping" };
     continue;
   }
   const steps = job.steps;
   if (!Array.isArray(steps)) {
-    out[name] = { present: true, has_verifier_before_upload: false, verifier_index: -1, upload_index: -1, reason: "steps missing or not a list" };
+    out[name] = { present: true, steps: [], reason: "steps missing or not a list" };
     continue;
   }
-  let verifierIdx = -1;
-  let uploadIdx = -1;
+  const rendered = [];
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!step || typeof step !== "object") continue;
-    const uses = step.uses;
-    if (typeof uses === "string" && uses.indexOf("actions/upload-artifact") === 0) {
-      if (uploadIdx < 0) uploadIdx = i;
-    }
-    const run = step.run;
-    if (typeof run === "string" && run.indexOf("Assert-ReleaseEvidencePackage") >= 0) {
-      let hasCmd = false;
-      for (const line of run.split(/\r?\n/)) {
-        const stripped = line.trim();
-        if (!stripped || stripped.charAt(0) === "#") continue;
-        if (stripped.indexOf("Assert-ReleaseEvidencePackage") >= 0) { hasCmd = true; break; }
-      }
-      if (hasCmd && verifierIdx < 0) verifierIdx = i;
-    }
+    const uses = typeof step.uses === "string" ? step.uses : "";
+    const run = typeof step.run === "string" ? step.run : "";
+    rendered.push({ index: i, uses: uses, run: run });
   }
-  let reason = "ok";
-  let ok = verifierIdx >= 0 && uploadIdx >= 0 && verifierIdx < uploadIdx;
-  if (verifierIdx < 0) reason = "missing executable Assert-ReleaseEvidencePackage run step";
-  else if (uploadIdx < 0) reason = "missing actions/upload-artifact step";
-  else if (verifierIdx >= uploadIdx) reason = "Assert-ReleaseEvidencePackage is not before upload-artifact";
-  out[name] = { present: true, has_verifier_before_upload: ok, verifier_index: verifierIdx, upload_index: uploadIdx, reason: reason };
+  out[name] = { present: true, steps: rendered, reason: "ok" };
 }
 emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
 '@
@@ -3098,16 +3105,57 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             }
             continue
         }
-        $has = [bool]$info.has_verifier_before_upload
+
+        $present = [bool]$info.present
+        $steps = @()
+        if ($info.PSObject.Properties.Name -contains 'steps' -and $null -ne $info.steps) {
+            $steps = @($info.steps)
+        }
+
+        $uploadIdx = -1
+        $verifierIdx = -1
+        foreach ($step in $steps) {
+            if ($null -eq $step) { continue }
+            $idx = -1
+            try { $idx = [int]$step.index } catch { $idx = -1 }
+            $uses = if ($step.PSObject.Properties.Name -contains 'uses') { [string]$step.uses } else { '' }
+            $run = if ($step.PSObject.Properties.Name -contains 'run') { [string]$step.run } else { '' }
+
+            if ($uploadIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($uses) -and $uses.StartsWith('actions/upload-artifact')) {
+                $uploadIdx = $idx
+            }
+            if ($verifierIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($run)) {
+                if (Test-ReleaseRunInvokesCommand -ScriptText $run -CommandName $verifierCommand) {
+                    $verifierIdx = $idx
+                }
+            }
+        }
+
+        $reason = 'ok'
+        $has = $false
+        if (-not $present) {
+            $reason = if ($info.reason) { [string]$info.reason } else { 'job missing or not a mapping' }
+        } elseif ($steps.Count -eq 0 -and $info.reason -and [string]$info.reason -ne 'ok') {
+            $reason = [string]$info.reason
+        } elseif ($verifierIdx -lt 0) {
+            $reason = 'missing executable Assert-ReleaseEvidencePackage CommandAst invocation in run step'
+        } elseif ($uploadIdx -lt 0) {
+            $reason = 'missing actions/upload-artifact step'
+        } elseif ($verifierIdx -ge $uploadIdx) {
+            $reason = 'Assert-ReleaseEvidencePackage is not before upload-artifact'
+        } else {
+            $has = $true
+        }
+
         $jobResults[$jobName] = [pscustomobject]@{
-            Present = [bool]$info.present
+            Present = $present
             HasVerifierBeforeUpload = $has
-            VerifierIndex = [int]$info.verifier_index
-            UploadIndex = [int]$info.upload_index
-            Reason = [string]$info.reason
+            VerifierIndex = $verifierIdx
+            UploadIndex = $uploadIdx
+            Reason = $reason
         }
         if (-not $has) {
-            $errors.Add(("job '{0}' full offline verifier order failed: {1}" -f $jobName, [string]$info.reason)) | Out-Null
+            $errors.Add(("job '{0}' full offline verifier order failed: {1}" -f $jobName, $reason)) | Out-Null
         }
     }
 

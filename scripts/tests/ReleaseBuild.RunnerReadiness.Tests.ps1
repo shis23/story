@@ -1561,6 +1561,103 @@ jobs:
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    It 'fails closed when both jobs only Write-Host the verifier name before upload (AST command required)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-writehost-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Fake verifier
+        shell: pwsh
+        run: |
+          Write-Host 'Assert-ReleaseEvidencePackage -EvidenceDir x'
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Fake verifier
+        shell: pwsh
+        run: |
+          Write-Host "Assert-ReleaseEvidencePackage -EvidenceDir x"
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|command|invoke|AST|executable'
+            # AST helper must not treat Write-Host string args as a real call.
+            $fake = Test-ReleaseRunInvokesCommand -ScriptText "Write-Host 'Assert-ReleaseEvidencePackage -EvidenceDir x'" -CommandName 'Assert-ReleaseEvidencePackage'
+            $fake | Should Be $false
+            $real = Test-ReleaseRunInvokesCommand -ScriptText 'Assert-ReleaseEvidencePackage -EvidenceDir x' -CommandName 'Assert-ReleaseEvidencePackage'
+            $real | Should Be $true
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when verifier name only appears in assignments or string literals (AST command required)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-assign-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Fake verifier assignment
+        shell: pwsh
+        run: |
+          $cmd = 'Assert-ReleaseEvidencePackage -EvidenceDir x'
+          Write-Output $cmd
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Fake verifier assignment
+        shell: pwsh
+        run: |
+          $name = "Assert-ReleaseEvidencePackage"
+          "call $name"
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: x
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|command|invoke|AST|executable'
+            $assign = Test-ReleaseRunInvokesCommand -ScriptText "`$cmd = 'Assert-ReleaseEvidencePackage -EvidenceDir x'; Write-Output `$cmd" -CommandName 'Assert-ReleaseEvidencePackage'
+            $assign | Should Be $false
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Describe 'Release dry-run offline rehash readiness' {
