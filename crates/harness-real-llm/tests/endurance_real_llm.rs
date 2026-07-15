@@ -70,8 +70,8 @@ fn require_endurance_budget() -> RealLlmRunBudget {
 /// - Ephemeral temp roots require `STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE=1`.
 fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidencePaths) {
     use harness_real_llm::evidence_retention::{
-        EVIDENCE_DIR_ENV, EvidenceRootPolicy, allocate_run_id, is_controlled_run_dirname,
-        open_endurance_run_paths, prepare_run_dir, resolve_evidence_root,
+        EVIDENCE_DIR_ENV, EvidenceRootPolicy, open_endurance_run_paths, resolve_evidence_root,
+        resolve_resume_run_dir,
     };
 
     let allow_ephemeral = std::env::var("STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE")
@@ -92,21 +92,22 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
         require_explicit: !allow_ephemeral,
     };
 
-    // Resume path: explicit EVIDENCE_DIR that already holds a checkpoint.
+    // Resume path: explicit EVIDENCE_DIR must pass durable-root / reparse / controlled
+    // namespace validation via resolve_resume_run_dir (never trust dirname alone).
     if let Ok(raw) = std::env::var(EVIDENCE_DIR_ENV) {
         let raw = raw.trim();
         if !raw.is_empty() {
             let path = PathBuf::from(raw);
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if path.is_dir()
-                && is_controlled_run_dirname(name)
-                && path.join("endurance_checkpoint.jsonl").exists()
-            {
-                let paths = EnduranceEvidencePaths::new(path.clone());
-                return (name.to_string(), path, paths);
+            if path.is_dir() && path.join("endurance_checkpoint.jsonl").exists() {
+                let validated = resolve_resume_run_dir(&path, &policy)
+                    .unwrap_or_else(|e| panic!("fail-closed resume evidence dir rejected: {e}"));
+                let name = validated
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let paths = EnduranceEvidencePaths::new(validated.clone());
+                return (name, validated, paths);
             }
         }
     }
@@ -116,8 +117,6 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
     let (run_id, paths) = open_endurance_run_paths(&root, stage.label())
         .unwrap_or_else(|e| panic!("failed to open exclusive evidence run dir: {e}"));
     let dir = paths.root.clone();
-    // Touch allocate helpers so resume/manual layouts stay consistent.
-    let _ = (allocate_run_id, prepare_run_dir);
     (run_id, dir, paths)
 }
 
@@ -816,8 +815,9 @@ async fn endurance_real_llm_full_100_turn() {
             assert!(paths.check_no_secrets().is_ok());
             // Evidence must be within size budget
             assert!(paths.total_size() < 2 * 1024 * 1024);
-            // Seal a durable, offline-verifiable run manifest (no secrets / no abs paths).
-            let seal = harness_real_llm::evidence_retention::seal_run(
+            // Seal + offline verify are hard requirements for a real Full/stage pass.
+            // Failure must fail the run — never downgrade to a warning.
+            let manifest = harness_real_llm::evidence_retention::seal_run(
                 &paths.root,
                 harness_real_llm::evidence_retention::SealOptions {
                     run_id: row.run_id.clone(),
@@ -837,20 +837,23 @@ async fn endurance_real_llm_full_100_turn() {
                     commit: std::env::var("STORYFORGE_EVAL_COMMIT").unwrap_or_default(),
                     branch: std::env::var("STORYFORGE_EVAL_BRANCH").unwrap_or_default(),
                 },
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{}",
+                    harness_real_llm::evidence_retention::format_seal_hard_error(&err)
+                )
+            });
+            eprintln!(
+                "[endurance] sealed run_manifest files={} status=completed",
+                manifest.files.len()
             );
-            match seal {
-                Ok(manifest) => {
-                    eprintln!(
-                        "[endurance] sealed run_manifest files={} status=completed",
-                        manifest.files.len()
-                    );
-                    harness_real_llm::evidence_retention::verify_run(&paths.root)
-                        .expect("offline verify after seal");
-                }
-                Err(err) => {
-                    eprintln!("[endurance] seal warning (fail-closed for retention): {err}");
-                }
-            }
+            harness_real_llm::evidence_retention::verify_run(&paths.root).unwrap_or_else(|err| {
+                panic!(
+                    "{}",
+                    harness_real_llm::evidence_retention::format_seal_hard_error(&err)
+                )
+            });
         }
         Err(err) => {
             eprintln!("ENDURANCE {} FAIL CLOSED: {err}", stage.label());

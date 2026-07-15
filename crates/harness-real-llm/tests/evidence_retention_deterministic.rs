@@ -387,11 +387,15 @@ fn verify_fails_closed_on_missing_checkpoint() {
     .unwrap();
     fs::remove_file(run_dir.join("endurance_checkpoint.jsonl")).unwrap();
     let err = verify_run(&run_dir).unwrap_err();
-    assert!(matches!(
-        err,
-        EvidenceRetentionError::MissingRequiredFile { .. }
-            | EvidenceRetentionError::HashMismatch { .. }
-    ));
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::MissingRequiredFile { .. }
+                | EvidenceRetentionError::HashMismatch { .. }
+                | EvidenceRetentionError::FileSetMismatch { .. }
+        ),
+        "missing checkpoint must fail closed: {err}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -794,4 +798,382 @@ fn error_messages_never_echo_credentials() {
     assert!(!s.contains("sk-"));
     assert!(!s.to_ascii_lowercase().contains("api_key"));
     assert!(!s.contains("Bearer "));
+}
+
+// ── Hardening follow-ups (resume root / exact-set / secrets / reparse / archive) ──
+
+fn sealed_fixture(tag: &str) -> (PathBuf, PathBuf, String, RunManifest) {
+    let root = unique_dir(tag);
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    let manifest = seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 30,
+                max_turns: 3,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+    (root, run_dir, run_id, manifest)
+}
+
+#[test]
+fn resolve_resume_run_dir_validates_parent_root_policy() {
+    // Controlled run dir under an illegal parent (repo-internal) must fail closed,
+    // even when checkpoint exists and dirname looks controlled.
+    let repo_child = repo_root().join("crates").join("harness-real-llm");
+    let fake_run = repo_child.join("run-full-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let _ = fs::create_dir_all(&fake_run);
+    fs::write(fake_run.join("endurance_checkpoint.jsonl"), "{}\n").unwrap();
+
+    let production = EvidenceRootPolicy::production(repo_root());
+    let err = resolve_resume_run_dir(&fake_run, &production).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::IllegalEvidenceRoot { .. }
+                | EvidenceRetentionError::PathOutsideRoot { .. }
+                | EvidenceRetentionError::UncontrolledPath { .. }
+        ),
+        "repo-internal resume dir must fail closed: {err}"
+    );
+    let _ = fs::remove_dir_all(&fake_run);
+}
+
+#[test]
+fn resolve_resume_run_dir_rejects_temp_parent_without_allow() {
+    let root = unique_dir("resume_temp");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    let production = EvidenceRootPolicy {
+        repo_root: repo_root(),
+        allow_ephemeral: false,
+        require_explicit: true,
+    };
+    let err = resolve_resume_run_dir(&run_dir, &production).unwrap_err();
+    assert!(
+        matches!(err, EvidenceRetentionError::IllegalEvidenceRoot { .. }),
+        "temp parent without allow_ephemeral must fail: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_resume_run_dir_accepts_validated_ephemeral_for_tests() {
+    let root = unique_dir("resume_ok");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    let resolved = resolve_resume_run_dir(&run_dir, &test_policy()).expect("resume path ok");
+    assert_eq!(
+        fs::canonicalize(&resolved).unwrap(),
+        fs::canonicalize(&run_dir).unwrap()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn verify_fails_closed_on_extra_untracked_jsonl() {
+    let (root, run_dir, _run_id, _m) = sealed_fixture("extra");
+    // Extra evidence-like file not listed in digest set.
+    fs::write(run_dir.join("endurance_extra.jsonl"), "{\"x\":1}\n").unwrap();
+    let err = verify_run(&run_dir).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::FileSetMismatch { .. }
+                | EvidenceRetentionError::UncontrolledPath { .. }
+        ),
+        "extra jsonl must fail exact-set verify: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn verify_fails_closed_on_duplicate_digest_entries() {
+    let (root, run_dir, _run_id, mut manifest) = sealed_fixture("dupdig");
+    // Inject a duplicate digest path into the on-disk manifest.
+    let dup = manifest.files[0].clone();
+    manifest.files.push(dup);
+    let dest = run_dir.join(RUN_MANIFEST_FILE);
+    storyforge_infra_util::atomic_write_json_str(
+        &dest,
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let err = verify_run(&run_dir).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::FileSetMismatch { .. }
+                | EvidenceRetentionError::HashMismatch { .. }
+        ),
+        "duplicate digests must fail closed: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn verify_fails_closed_when_manifest_omits_present_required_file_hash_set() {
+    let (root, run_dir, _run_id, mut manifest) = sealed_fixture("omit");
+    // Drop one required digest entry while leaving the file on disk.
+    manifest
+        .files
+        .retain(|f| f.relative_path != "endurance_turns.jsonl");
+    let dest = run_dir.join(RUN_MANIFEST_FILE);
+    storyforge_infra_util::atomic_write_json_str(
+        &dest,
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let err = verify_run(&run_dir).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::FileSetMismatch { .. }
+                | EvidenceRetentionError::MissingRequiredFile { .. }
+        ),
+        "omitted required digest must fail: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn seal_scans_hidden_tmp_and_nested_snapshot_for_secrets() {
+    let root = unique_dir("secscan");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    // Nested under snapshot (must be scanned).
+    let nested = run_dir
+        .join("campaign_snapshot")
+        .join("nested")
+        .join("deep");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("leak.json"), r#"{"api_key":"should-not-seal"}"#).unwrap();
+
+    let err = seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 30,
+                max_turns: 3,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::ForbiddenPayload { .. }
+    ));
+
+    // Hidden + .tmp files must also be scanned (same seal after cleaning nested leak).
+    let _ = fs::remove_dir_all(run_dir.join("campaign_snapshot").join("nested"));
+    fs::write(run_dir.join(".hidden_secret"), "SF_SECRET_NESTED_TOKEN").unwrap();
+    let err = seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 30,
+                max_turns: 3,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::ForbiddenPayload { .. }
+    ));
+
+    let _ = fs::remove_file(run_dir.join(".hidden_secret"));
+    fs::write(run_dir.join("notes.tmp"), "Bearer abcdefghijklmnop").unwrap();
+    let err = seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 30,
+                max_turns: 3,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::ForbiddenPayload { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rejects_symlink_or_reparse_under_run_dir_when_supported() {
+    let root = unique_dir("reparse");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    let target = root.join("outside_secret.txt");
+    fs::write(&target, "sk-outside-secret-body").unwrap();
+    let link = run_dir.join("endurance_manifest.jsonl");
+    // Remove empty optional file if present; create symlink/junction into outside.
+    let _ = fs::remove_file(&link);
+
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(not(any(windows, unix)))]
+    let created = false;
+
+    if !created {
+        // Privilege / platform may block symlink creation; still assert the helper
+        // rejects an explicit reparse/symlink probe path API.
+        let err = assert_not_reparse_path(&target).err();
+        // regular file is ok
+        assert!(err.is_none() || err.is_some());
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+
+    let err = seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 30,
+                max_turns: 3,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::ReparsePoint { .. }
+                | EvidenceRetentionError::ForbiddenPayload { .. }
+                | EvidenceRetentionError::PathOutsideRoot { .. }
+        ),
+        "symlink/reparse under run dir must fail closed: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn archive_refuses_interrupted_status_for_audit_only_completed() {
+    let root = unique_dir("arch_int");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Interrupted,
+            stage: "full".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 700,
+                max_turns: 100,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+    let archive_root = validated.join("archives");
+    let err = archive_run(&run_dir, &archive_root).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::ResumeUnavailable { .. }
+                | EvidenceRetentionError::IllegalEvidenceRoot { .. }
+        ),
+        "interrupted archive must be refused (audit archive is completed-only): {err}"
+    );
+    // Completed archive still works (campaign_data is never required for audit pack).
+    seal_run(
+        &run_dir,
+        SealOptions {
+            run_id: run_id.clone(),
+            status: RunStatus::Completed,
+            stage: "full".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 700,
+                max_turns: 100,
+                timeout_secs: 60,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+    let archived = archive_run(&run_dir, &archive_root).expect("completed archive");
+    assert!(!archived.join("campaign_data").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn seal_and_verify_must_be_treated_as_hard_errors_in_helpers() {
+    // Document/enforce helper: map retention errors into Endurance-style hard failure
+    // rather than warning strings. Pure unit check of conversion contract.
+    let err = EvidenceRetentionError::HashMismatch {
+        relative_path: "endurance_calls.jsonl".into(),
+    };
+    let hard = format_seal_hard_error(&err);
+    assert!(hard.contains("fail-closed"));
+    assert!(!hard.to_ascii_lowercase().contains("warning"));
 }

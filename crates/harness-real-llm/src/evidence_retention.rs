@@ -7,7 +7,7 @@
 //! Default root resolution is **conservative**: an explicit env/CLI root is
 //! required unless a test policy opts into ephemeral roots.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -60,10 +60,12 @@ pub enum EvidenceRetentionError {
     RunIdMismatch { detail: String },
     MissingRequiredFile { relative_path: String },
     HashMismatch { relative_path: String },
+    FileSetMismatch { detail: String },
     SchemaMismatch { detail: String },
     ForbiddenPayload { relative_path: String },
     InvalidRunId { detail: String },
     ResumeUnavailable { detail: String },
+    ReparsePoint { detail: String },
     Io { detail: String },
 }
 
@@ -91,6 +93,9 @@ impl std::fmt::Display for EvidenceRetentionError {
             Self::HashMismatch { relative_path } => {
                 write!(f, "content hash mismatch: {relative_path}")
             }
+            Self::FileSetMismatch { detail } => {
+                write!(f, "evidence file set mismatch: {detail}")
+            }
             Self::SchemaMismatch { detail } => write!(f, "schema mismatch: {detail}"),
             Self::ForbiddenPayload { relative_path } => {
                 write!(
@@ -100,6 +105,9 @@ impl std::fmt::Display for EvidenceRetentionError {
             }
             Self::InvalidRunId { detail } => write!(f, "invalid run id: {detail}"),
             Self::ResumeUnavailable { detail } => write!(f, "resume unavailable: {detail}"),
+            Self::ReparsePoint { detail } => {
+                write!(f, "symlink/junction/reparse point rejected: {detail}")
+            }
             Self::Io { detail } => write!(f, "evidence retention I/O error: {detail}"),
         }
     }
@@ -211,12 +219,101 @@ fn is_temp_like(path: &Path) -> bool {
 }
 
 fn looks_like_live_campaign_data(path: &Path, repo_root: &Path) -> bool {
-    if path_contains_component(path, "campaign_data") && is_under(repo_root, path) {
+    if path_contains_component(path, "campaign_data") {
         return true;
     }
     // Repo `data/` is the live app data home — never an evidence root.
     let live = repo_root.join("data");
     is_under(&live, path) || path == live
+}
+
+/// Reject symlink / junction / reparse points (Windows reparse or Unix symlink).
+pub fn assert_not_reparse_path(path: &Path) -> Result<(), EvidenceRetentionError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(EvidenceRetentionError::ReparsePoint {
+            detail: "symlink rejected".into(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(EvidenceRetentionError::ReparsePoint {
+                detail: "reparse/junction rejected".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_existing(path: &Path) -> Result<PathBuf, EvidenceRetentionError> {
+    assert_not_reparse_path(path)?;
+    fs::canonicalize(path).map_err(|e| EvidenceRetentionError::Io {
+        detail: format!("canonicalize failed: {e}"),
+    })
+}
+
+/// Ensure `path` (existing or not) stays inside `root` after canonical resolution.
+fn ensure_canonical_within(root: &Path, path: &Path) -> Result<PathBuf, EvidenceRetentionError> {
+    let root_c = canonicalize_existing(root)?;
+    if path.exists() {
+        let path_c = canonicalize_existing(path)?;
+        if path_c == root_c || path_c.starts_with(&root_c) {
+            return Ok(path_c);
+        }
+        return Err(EvidenceRetentionError::PathOutsideRoot {
+            detail: "resolved path escapes evidence root".into(),
+        });
+    }
+    // Non-existent: canonicalize parent and re-join final component.
+    let parent = path
+        .parent()
+        .ok_or_else(|| EvidenceRetentionError::PathOutsideRoot {
+            detail: "path has no parent".into(),
+        })?;
+    let parent_c = if parent.exists() {
+        canonicalize_existing(parent)?
+    } else {
+        // Walk up until an existing ancestor is found.
+        let mut cur = parent.to_path_buf();
+        while !cur.exists() {
+            cur = cur
+                .parent()
+                .ok_or_else(|| EvidenceRetentionError::PathOutsideRoot {
+                    detail: "no existing ancestor".into(),
+                })?
+                .to_path_buf();
+        }
+        let cur_c = canonicalize_existing(&cur)?;
+        // Rebuild relative suffix from cur -> parent under cur_c.
+        let suffix =
+            parent
+                .strip_prefix(&cur)
+                .map_err(|_| EvidenceRetentionError::PathOutsideRoot {
+                    detail: "cannot strip ancestor prefix".into(),
+                })?;
+        for c in suffix.components() {
+            if matches!(c, Component::ParentDir | Component::CurDir) {
+                return Err(EvidenceRetentionError::PathTraversal {
+                    detail: "relative components in non-existent path".into(),
+                });
+            }
+        }
+        cur_c.join(suffix)
+    };
+    let joined = parent_c.join(path.file_name().unwrap_or_default());
+    if joined == root_c || joined.starts_with(&root_c) {
+        Ok(joined)
+    } else {
+        Err(EvidenceRetentionError::PathOutsideRoot {
+            detail: "resolved path escapes evidence root".into(),
+        })
+    }
 }
 
 /// Validate that `candidate` may be used as an evidence root.
@@ -237,15 +334,14 @@ pub fn validate_evidence_root(
     if !candidate.exists() {
         fs::create_dir_all(candidate)?;
     }
+    assert_not_reparse_path(candidate)?;
     if !candidate.is_dir() {
         return Err(EvidenceRetentionError::IllegalEvidenceRoot {
             reason: "path is not a directory".into(),
         });
     }
 
-    let resolved = fs::canonicalize(candidate).map_err(|e| EvidenceRetentionError::Io {
-        detail: format!("canonicalize evidence root: {e}"),
-    })?;
+    let resolved = canonicalize_existing(candidate)?;
 
     let repo_c = fs::canonicalize(&policy.repo_root).unwrap_or_else(|_| policy.repo_root.clone());
     // Reject exact repo root and any descendant. A parent of the repo is allowed
@@ -285,6 +381,50 @@ pub fn validate_evidence_root(
     }
 
     Ok(resolved)
+}
+
+/// Validate a resume `STORYFORGE_EVAL_EVIDENCE_DIR` run path:
+/// controlled dirname, parent durable-root policy, no reparse, under parent.
+pub fn resolve_resume_run_dir(
+    run_dir: &Path,
+    policy: &EvidenceRootPolicy,
+) -> Result<PathBuf, EvidenceRetentionError> {
+    let raw = run_dir.to_string_lossy();
+    reject_path_traversal(raw.as_ref())?;
+    if !run_dir.exists() {
+        return Err(EvidenceRetentionError::ResumeUnavailable {
+            detail: "resume run directory does not exist".into(),
+        });
+    }
+    assert_not_reparse_path(run_dir)?;
+    let name = run_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if !is_controlled_run_dirname(name) {
+        return Err(EvidenceRetentionError::UncontrolledPath {
+            detail: "resume path is not a controlled run directory".into(),
+        });
+    }
+    let parent = run_dir
+        .parent()
+        .ok_or_else(|| EvidenceRetentionError::IllegalEvidenceRoot {
+            reason: "resume run dir has no parent root".into(),
+        })?;
+    let parent_c = validate_evidence_root(parent, policy)?;
+    let run_c = ensure_canonical_within(&parent_c, run_dir)?;
+    if !run_dir.join("endurance_checkpoint.jsonl").exists() {
+        return Err(EvidenceRetentionError::ResumeUnavailable {
+            detail: "resume run dir missing checkpoint".into(),
+        });
+    }
+    assert_not_reparse_path(&run_dir.join("endurance_checkpoint.jsonl"))?;
+    Ok(run_c)
+}
+
+/// Format a seal/verify failure as a hard fail-closed error (never a warning).
+pub fn format_seal_hard_error(err: &EvidenceRetentionError) -> String {
+    format!("fail-closed evidence seal/verify error: {err}")
 }
 
 /// Resolve the evidence root from optional CLI path / environment.
@@ -386,6 +526,7 @@ pub fn prepare_run_dir(root: &Path, run_id: &str) -> Result<PathBuf, EvidenceRet
             detail: "run id must match controlled namespace run-<stage>-<uuid>".into(),
         });
     }
+    assert_not_reparse_path(root)?;
     let dir = root.join(run_dirname_for_id(run_id));
     ensure_within_root(root, &dir)?;
     if dir.exists() {
@@ -394,30 +535,13 @@ pub fn prepare_run_dir(root: &Path, run_id: &str) -> Result<PathBuf, EvidenceRet
         });
     }
     fs::create_dir_all(&dir)?;
+    assert_not_reparse_path(&dir)?;
+    ensure_canonical_within(root, &dir)?;
     Ok(dir)
 }
 
 fn ensure_within_root(root: &Path, path: &Path) -> Result<(), EvidenceRetentionError> {
-    let root_c = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    // For non-existent paths, canonicalize parent + join name.
-    let path_c = if path.exists() {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        let parent = path.parent().unwrap_or(path);
-        let parent_c = if parent.exists() {
-            fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
-        } else {
-            parent.to_path_buf()
-        };
-        parent_c.join(path.file_name().unwrap_or_default())
-    };
-    if path_c == root_c || path_c.starts_with(&root_c) {
-        Ok(())
-    } else {
-        Err(EvidenceRetentionError::PathOutsideRoot {
-            detail: "resolved path escapes evidence root".into(),
-        })
-    }
+    ensure_canonical_within(root, path).map(|_| ())
 }
 
 // ── Manifest schema ─────────────────────────────────────────────────────────
@@ -533,36 +657,112 @@ fn rel_path_under(run_dir: &Path, file: &Path) -> Result<String, EvidenceRetenti
 
 fn is_live_working_dir(name: &str) -> bool {
     // Live mutable campaign state is not part of the sealed evidence envelope.
+    // Still scanned for secrets when present, but never hashed/archived.
     name == "campaign_data" || name == "archives" || name == "restore"
+}
+
+/// Files that participate in the sealed digest / archive set.
+///
+/// Exact-set verification must include every evidence-like artifact under the run
+/// dir so untracked JSONL / snapshot leaves cannot hide outside the digest table.
+fn is_sealed_evidence_file(rel: &str) -> bool {
+    if rel == RUN_MANIFEST_FILE {
+        return false; // envelope, not a subject digest
+    }
+    let first = rel.split('/').next().unwrap_or("");
+    if first == "campaign_data" || first == "archives" || first == "restore" {
+        return false;
+    }
+    // Probe / temp names are scanned for secrets but not sealed subjects.
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    if base.starts_with('.') || base.ends_with(".tmp") {
+        return false;
+    }
+    if REQUIRED_EVIDENCE_FILES.contains(&rel) || OPTIONAL_EVIDENCE_FILES.contains(&rel) {
+        return true;
+    }
+    // Any other JSONL under the run tree is controlled evidence and must be listed.
+    if rel.ends_with(".jsonl") {
+        return true;
+    }
+    // Snapshot tree files (never campaign_data).
+    first.contains("snapshot") || first.starts_with("campaign_")
 }
 
 fn scan_for_forbidden(run_dir: &Path) -> Result<(), EvidenceRetentionError> {
     fn walk(dir: &Path, run_dir: &Path) -> Result<(), EvidenceRetentionError> {
+        assert_not_reparse_path(dir)?;
+        ensure_canonical_within(run_dir, dir)?;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            assert_not_reparse_path(&path)?;
+            ensure_canonical_within(run_dir, &path)?;
             let name = entry.file_name().to_string_lossy().to_string();
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                return Err(EvidenceRetentionError::ReparsePoint {
+                    detail: "symlink entry rejected during scan".into(),
+                });
+            }
             if path.is_dir() {
-                if is_live_working_dir(&name) {
-                    continue;
-                }
+                // Always recurse, including live working dirs: secrets must not hide there.
                 walk(&path, run_dir)?;
                 continue;
             }
-            // Temporary probes / lock files are not sealed evidence.
-            if name.starts_with('.') || name.ends_with(".tmp") {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(&path)
-                && contains_forbidden_evidence_payload(&text)
-            {
+            // Scan ALL files, including hidden and .tmp — digest/archive sets are separate.
+            // Prefer full read when UTF-8; also scan lossy bytes for marker strings.
+            let bytes = fs::read(&path)?;
+            let text = String::from_utf8_lossy(&bytes);
+            if contains_forbidden_evidence_payload(&text) {
                 let rel = rel_path_under(run_dir, &path).unwrap_or_else(|_| "unknown".into());
                 return Err(EvidenceRetentionError::ForbiddenPayload { relative_path: rel });
+            }
+            let _ = name;
+        }
+        Ok(())
+    }
+    assert_not_reparse_path(run_dir)?;
+    walk(run_dir, run_dir)
+}
+
+/// Collect the exact set of sealed subject files currently on disk.
+fn collect_actual_sealed_files(run_dir: &Path) -> Result<BTreeSet<String>, EvidenceRetentionError> {
+    let mut out = BTreeSet::new();
+    fn walk(
+        dir: &Path,
+        run_dir: &Path,
+        out: &mut BTreeSet<String>,
+    ) -> Result<(), EvidenceRetentionError> {
+        assert_not_reparse_path(dir)?;
+        ensure_canonical_within(run_dir, dir)?;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            assert_not_reparse_path(&path)?;
+            ensure_canonical_within(run_dir, &path)?;
+            if entry.file_type()?.is_symlink() {
+                return Err(EvidenceRetentionError::ReparsePoint {
+                    detail: "symlink rejected while collecting sealed files".into(),
+                });
+            }
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_live_working_dir(&name) {
+                    continue;
+                }
+                walk(&path, run_dir, out)?;
+                continue;
+            }
+            let rel = rel_path_under(run_dir, &path)?;
+            if is_sealed_evidence_file(&rel) {
+                out.insert(rel);
             }
         }
         Ok(())
     }
-    walk(run_dir, run_dir)
+    walk(run_dir, run_dir, &mut out)?;
+    Ok(out)
 }
 
 fn collect_run_ids_from_jsonl(path: &Path) -> Result<BTreeSet<String>, EvidenceRetentionError> {
@@ -634,75 +834,57 @@ fn list_snapshot_dirs(run_dir: &Path) -> Result<Vec<String>, EvidenceRetentionEr
 }
 
 fn collect_file_digests(run_dir: &Path) -> Result<Vec<FileDigest>, EvidenceRetentionError> {
-    let mut files = Vec::new();
-    let mut seen = BTreeSet::new();
-
+    // Digest subjects must equal the actual sealed file set (exact-set).
+    let actual = collect_actual_sealed_files(run_dir)?;
     for name in REQUIRED_EVIDENCE_FILES {
-        let path = run_dir.join(name);
-        if !path.exists() {
+        if !actual.contains(*name) {
             return Err(EvidenceRetentionError::MissingRequiredFile {
                 relative_path: (*name).into(),
             });
         }
+    }
+    let mut files = Vec::new();
+    for rel in actual {
+        let path = run_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert_not_reparse_path(&path)?;
+        ensure_canonical_within(run_dir, &path)?;
         let (sha, size) = sha256_file(&path)?;
         files.push(FileDigest {
-            relative_path: (*name).into(),
+            relative_path: rel,
             sha256: sha,
             size_bytes: size,
         });
-        seen.insert((*name).to_string());
     }
-
-    for name in OPTIONAL_EVIDENCE_FILES {
-        let path = run_dir.join(name);
-        if path.exists() {
-            let (sha, size) = sha256_file(&path)?;
-            files.push(FileDigest {
-                relative_path: (*name).into(),
-                sha256: sha,
-                size_bytes: size,
-            });
-            seen.insert((*name).to_string());
-        }
-    }
-
-    // Include snapshot files (relative only).
-    for snap in list_snapshot_dirs(run_dir)? {
-        let snap_dir = run_dir.join(&snap);
-        collect_dir_digests(&snap_dir, run_dir, &mut files, &mut seen)?;
-    }
-
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(files)
 }
 
-fn collect_dir_digests(
-    dir: &Path,
+fn assert_exact_digest_set(
     run_dir: &Path,
-    files: &mut Vec<FileDigest>,
-    seen: &mut BTreeSet<String>,
+    manifest: &RunManifest,
 ) -> Result<(), EvidenceRetentionError> {
-    if !dir.exists() {
-        return Ok(());
+    let actual = collect_actual_sealed_files(run_dir)?;
+    let mut listed = BTreeSet::new();
+    for digest in &manifest.files {
+        if !listed.insert(digest.relative_path.clone()) {
+            return Err(EvidenceRetentionError::FileSetMismatch {
+                detail: format!("duplicate digest entry: {}", digest.relative_path),
+            });
+        }
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_dir_digests(&path, run_dir, files, seen)?;
-            continue;
-        }
-        let rel = rel_path_under(run_dir, &path)?;
-        if seen.contains(&rel) {
-            continue;
-        }
-        let (sha, size) = sha256_file(&path)?;
-        files.push(FileDigest {
-            relative_path: rel.clone(),
-            sha256: sha,
-            size_bytes: size,
+    if listed != actual {
+        let missing: Vec<_> = actual.difference(&listed).cloned().collect();
+        let extra: Vec<_> = listed.difference(&actual).cloned().collect();
+        return Err(EvidenceRetentionError::FileSetMismatch {
+            detail: format!("missing_in_manifest={missing:?} extra_in_manifest={extra:?}"),
         });
-        seen.insert(rel);
+    }
+    for name in REQUIRED_EVIDENCE_FILES {
+        if !listed.contains(*name) {
+            return Err(EvidenceRetentionError::MissingRequiredFile {
+                relative_path: (*name).into(),
+            });
+        }
     }
     Ok(())
 }
@@ -715,12 +897,14 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
             reason: "run directory does not exist".into(),
         });
     }
+    assert_not_reparse_path(run_dir)?;
     if !is_controlled_run_dirname(&opts.run_id) {
         return Err(EvidenceRetentionError::InvalidRunId {
             detail: "run id not in controlled namespace".into(),
         });
     }
 
+    // Secret scan covers the full tree (including hidden/.tmp/nested/live dirs).
     scan_for_forbidden(run_dir)?;
     assert_single_run_id(run_dir, &opts.run_id)?;
 
@@ -730,6 +914,7 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
             relative_path: "endurance_checkpoint.jsonl".into(),
         });
     }
+    assert_not_reparse_path(&paths.checkpoint_jsonl)?;
 
     let (accepted_turn_number, calls_used) =
         if let Some(cp) = read_latest_checkpoint(&paths.checkpoint_jsonl) {
@@ -775,20 +960,22 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
         calls_used,
     };
 
+    // Digest set must match on-disk sealed subjects before writing the envelope.
+    assert_exact_digest_set(run_dir, &manifest)?;
+
     let serialized = serde_json::to_string_pretty(&manifest)?;
     if contains_forbidden_evidence_payload(&serialized) {
         return Err(EvidenceRetentionError::ForbiddenPayload {
             relative_path: RUN_MANIFEST_FILE.into(),
         });
     }
-    // Refuse absolute host paths in the serialized manifest body.
-    if serialized.contains(":\\") || serialized.contains("\"/") && serialized.contains(":/") {
-        // Still allow normal JSON; check file digests already relative.
-    }
     for f in &manifest.files {
-        if Path::new(&f.relative_path).is_absolute() {
+        if Path::new(&f.relative_path).is_absolute()
+            || f.relative_path.contains("..")
+            || f.relative_path.contains(':')
+        {
             return Err(EvidenceRetentionError::PathOutsideRoot {
-                detail: "manifest must not record absolute paths".into(),
+                detail: "manifest must not record absolute or escaped paths".into(),
             });
         }
     }
@@ -798,14 +985,16 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
     Ok(manifest)
 }
 
-/// Offline verification: schema, single run id, required files, re-hash.
+/// Offline verification: schema, single run id, exact file set, re-hash.
 pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError> {
+    assert_not_reparse_path(run_dir)?;
     let manifest_path = run_dir.join(RUN_MANIFEST_FILE);
     if !manifest_path.exists() {
         return Err(EvidenceRetentionError::MissingRequiredFile {
             relative_path: RUN_MANIFEST_FILE.into(),
         });
     }
+    assert_not_reparse_path(&manifest_path)?;
     let raw = fs::read_to_string(&manifest_path)?;
     if contains_forbidden_evidence_payload(&raw) {
         return Err(EvidenceRetentionError::ForbiddenPayload {
@@ -826,19 +1015,12 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             detail: "manifest run_id not controlled".into(),
         });
     }
+    // Full-tree secret scan must match the seal path (hidden/.tmp/nested included).
     scan_for_forbidden(run_dir)?;
     assert_single_run_id(run_dir, &manifest.run_id)?;
+    assert_exact_digest_set(run_dir, &manifest)?;
 
-    // Required files must still exist.
-    for name in REQUIRED_EVIDENCE_FILES {
-        if !run_dir.join(name).exists() {
-            return Err(EvidenceRetentionError::MissingRequiredFile {
-                relative_path: (*name).into(),
-            });
-        }
-    }
-
-    // Re-hash every listed file.
+    // Re-hash every listed file with containment checks.
     for digest in &manifest.files {
         if digest.relative_path.contains("..")
             || Path::new(&digest.relative_path).is_absolute()
@@ -858,6 +1040,8 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
                 relative_path: digest.relative_path.clone(),
             });
         }
+        assert_not_reparse_path(&path)?;
+        ensure_canonical_within(run_dir, &path)?;
         let (sha, size) = sha256_file(&path)?;
         if sha != digest.sha256 || size != digest.size_bytes {
             return Err(EvidenceRetentionError::HashMismatch {
@@ -926,34 +1110,30 @@ pub fn load_resume_context(
 
 // ── Archive / restore ───────────────────────────────────────────────────────
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), EvidenceRetentionError> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
 /// Copy a sealed run into `archive_root/<run_id>/` and re-verify.
 ///
-/// Only the run manifest and files listed in the digest table are copied.
-/// Live `campaign_data` and other working directories are never archived.
+/// **Audit archive only for completed (or already archived) runs.**
+/// Interrupted/running/failed statuses are refused: this pack is not a resume
+/// vehicle for live `campaign_data`. Only digest-listed relative files + the
+/// run manifest are copied — never live campaign state.
 pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, EvidenceRetentionError> {
+    assert_not_reparse_path(run_dir)?;
     let manifest = verify_run(run_dir)?;
-    if matches!(manifest.status, RunStatus::Running) {
-        return Err(EvidenceRetentionError::ResumeUnavailable {
-            detail: "refusing to archive an active running status".into(),
-        });
+    match manifest.status {
+        RunStatus::Completed | RunStatus::Archived => {}
+        RunStatus::Running | RunStatus::Interrupted | RunStatus::Failed => {
+            return Err(EvidenceRetentionError::ResumeUnavailable {
+                detail: "archive is completed-audit only; refuse interrupted/running/failed packs (campaign_data is not portable resume state)".into(),
+            });
+        }
     }
-    fs::create_dir_all(archive_root)?;
-    let dest = archive_root.join(run_dirname_for_id(&manifest.run_id));
+    assert_not_reparse_path(archive_root)?;
+    if !archive_root.exists() {
+        fs::create_dir_all(archive_root)?;
+    }
+    let archive_root_c = canonicalize_existing(archive_root)?;
+    let dest = archive_root_c.join(run_dirname_for_id(&manifest.run_id));
+    ensure_canonical_within(&archive_root_c, &dest)?;
     if dest.exists() {
         return Err(EvidenceRetentionError::DuplicateRunId {
             run_id: manifest.run_id,
@@ -974,18 +1154,21 @@ pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, Evide
                 .relative_path
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
         );
+        assert_not_reparse_path(&from)?;
+        ensure_canonical_within(run_dir, &from)?;
         let to = dest.join(
             digest
                 .relative_path
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
         );
+        ensure_canonical_within(&dest, &to)?;
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&from, &to)?;
+        assert_not_reparse_path(&to)?;
     }
-    // Re-seal as Archived without changing file hashes of evidence payloads.
-    // We only rewrite the status field in the archived copy's manifest.
+    // Rewrite status to Archived without changing subject file hashes.
     let mut archived = manifest.clone();
     archived.status = RunStatus::Archived;
     archived.sealed_at_unix_ms = now_unix_ms();
@@ -996,8 +1179,6 @@ pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, Evide
         });
     }
     storyforge_infra_util::atomic_write_json_str(&dest.join(RUN_MANIFEST_FILE), &serialized)?;
-    // Re-hash after status rewrite — file digests exclude the manifest itself by design
-    // (manifest is the seal envelope). Verify still checks listed evidence files.
     verify_run(&dest)?;
     Ok(dest)
 }
@@ -1007,15 +1188,44 @@ pub fn restore_run(
     archive_dir: &Path,
     restore_root: &Path,
 ) -> Result<PathBuf, EvidenceRetentionError> {
+    assert_not_reparse_path(archive_dir)?;
     let manifest = verify_run(archive_dir)?;
-    fs::create_dir_all(restore_root)?;
-    let dest = restore_root.join(run_dirname_for_id(&manifest.run_id));
+    if !restore_root.exists() {
+        fs::create_dir_all(restore_root)?;
+    }
+    assert_not_reparse_path(restore_root)?;
+    let restore_root_c = canonicalize_existing(restore_root)?;
+    let dest = restore_root_c.join(run_dirname_for_id(&manifest.run_id));
+    ensure_canonical_within(&restore_root_c, &dest)?;
     if dest.exists() {
         return Err(EvidenceRetentionError::DuplicateRunId {
             run_id: manifest.run_id,
         });
     }
-    copy_dir_recursive(archive_dir, &dest)?;
+    // Copy only digest subjects + manifest (never follow unexpected links).
+    fs::create_dir_all(&dest)?;
+    for digest in &manifest.files {
+        let from = archive_dir.join(
+            digest
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
+        assert_not_reparse_path(&from)?;
+        ensure_canonical_within(archive_dir, &from)?;
+        let to = dest.join(
+            digest
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
+        ensure_canonical_within(&dest, &to)?;
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&from, &to)?;
+    }
+    let man_from = archive_dir.join(RUN_MANIFEST_FILE);
+    assert_not_reparse_path(&man_from)?;
+    fs::copy(&man_from, dest.join(RUN_MANIFEST_FILE))?;
     verify_run(&dest)?;
     Ok(dest)
 }
@@ -1068,7 +1278,8 @@ pub fn plan_retention_cleanup(
             reason: "retention root is not a directory".into(),
         });
     }
-    let root_c = fs::canonicalize(root)?;
+    assert_not_reparse_path(root)?;
+    let root_c = canonicalize_existing(root)?;
 
     let protect: BTreeSet<String> = opts.protect_run_ids.into_iter().collect();
     let only: BTreeSet<RunStatus> = if opts.only_statuses.is_empty() {
@@ -1081,11 +1292,18 @@ pub fn plan_retention_cleanup(
     for entry in fs::read_dir(&root_c)? {
         let entry = entry?;
         let path = entry.path();
+        // Skip / reject reparse candidates — never select junctions for deletion.
+        if assert_not_reparse_path(&path).is_err() {
+            continue;
+        }
         if !path.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         if !is_controlled_run_dirname(&name) {
+            continue;
+        }
+        if ensure_canonical_within(&root_c, &path).is_err() {
             continue;
         }
         if protect.contains(&name) {
@@ -1146,8 +1364,9 @@ pub fn apply_retention_cleanup(
     root: &Path,
     plan: &RetentionPlan,
 ) -> Result<Vec<PathBuf>, EvidenceRetentionError> {
-    let root_c = fs::canonicalize(root)?;
-    if fs::canonicalize(&plan.root)? != root_c {
+    assert_not_reparse_path(root)?;
+    let root_c = canonicalize_existing(root)?;
+    if canonicalize_existing(&plan.root)? != root_c {
         return Err(EvidenceRetentionError::PathOutsideRoot {
             detail: "plan root does not match apply root".into(),
         });
@@ -1161,7 +1380,8 @@ pub fn apply_retention_cleanup(
                 detail: "target is not a controlled run directory".into(),
             });
         }
-        ensure_within_root(&root_c, target)?;
+        assert_not_reparse_path(target)?;
+        ensure_canonical_within(&root_c, target)?;
         if !target.exists() {
             continue;
         }
@@ -1212,12 +1432,6 @@ pub fn redact_path_for_display(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "<path>".into())
-}
-
-// Silence unused import in some builds
-#[allow(dead_code)]
-fn _keep_btreemap() {
-    let _: BTreeMap<String, String> = BTreeMap::new();
 }
 
 #[cfg(test)]
