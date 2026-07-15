@@ -156,6 +156,12 @@ impl HarnessEnv {
         // Ensure an active DraftReady attempt exists for this variant.
         let (turn_id, attempt_id) =
             if let Some(existing) = self.turn_store.get_turn_by_variant(variant_id) {
+                if existing.input_node_id != input_node_id {
+                    return Err(format!(
+                        "existing turn input_node_id {} != requested {}",
+                        existing.input_node_id, input_node_id
+                    ));
+                }
                 let attempt = existing
                     .find_attempt_by_variant(variant_id)
                     .ok_or_else(|| "turn exists but attempt missing for variant".to_string())?;
@@ -188,7 +194,7 @@ impl HarnessEnv {
                 let mut record = TurnRecord::new(
                     campaign_id.clone(),
                     ctx.conversation_id.clone(),
-                    input_node_id,
+                    input_node_id.clone(),
                     camp.revision,
                 );
                 record.status = TurnStatus::DraftReady;
@@ -295,10 +301,30 @@ impl HarnessEnv {
             }
         }
 
+        let durable_batch = attempt.pending_state_changes.clone();
+        let batch_digest = durable_batch
+            .as_ref()
+            .map(crate::production_evidence::mutation_batch_digest);
+        let draft_hash = attempt.draft_hash.clone();
+        if turn.input_node_id != input_node_id {
+            return Err(format!(
+                "turn input_node_id {} != requested {}",
+                turn.input_node_id, input_node_id
+            ));
+        }
+        if attempt.variant_id != *variant_id {
+            return Err("attempt variant_id mismatch after production postprocess".into());
+        }
+
         Ok(crate::production_evidence::ProductionPostprocessProof {
             turn_id,
             attempt_id,
+            input_node_id,
+            turn_index: turn_number,
+            variant_id: variant_id.clone(),
+            draft_hash,
             summary_text: result.summary_text,
+            batch_digest,
             applied: true,
         })
     }

@@ -205,15 +205,21 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
     );
 
     // postprocess_applied-style inconsistency: service source + proof.applied=false
+    let variant_id = Id::new();
     let not_applied = WrittenProductionTurn {
         draft_text: "x".into(),
-        variant_id: Id::new(),
+        variant_id: variant_id.clone(),
         summary_text: Some("s".into()),
         chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
         postprocess_proof: Some(ProductionPostprocessProof {
             turn_id: Id::new(),
             attempt_id: Id::new(),
+            input_node_id: Id::new(),
+            turn_index: 1,
+            variant_id: variant_id.clone(),
+            draft_hash: "deadbeef".into(),
             summary_text: Some("s".into()),
+            batch_digest: None,
             applied: false,
         }),
     };
@@ -225,13 +231,18 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
     // synthetic + proof is inconsistent
     let mixed = WrittenProductionTurn {
         draft_text: "x".into(),
-        variant_id: Id::new(),
+        variant_id: variant_id.clone(),
         summary_text: Some("s".into()),
         chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
         postprocess_proof: Some(ProductionPostprocessProof {
             turn_id: Id::new(),
             attempt_id: Id::new(),
+            input_node_id: Id::new(),
+            turn_index: 1,
+            variant_id,
+            draft_hash: "deadbeef".into(),
             summary_text: Some("s".into()),
+            batch_digest: None,
             applied: true,
         }),
     };

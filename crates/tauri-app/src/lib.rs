@@ -499,6 +499,46 @@ fn save_active_campaign(data_dir: &Path, id: Option<&Id>) {
 
 // ─── AppState（M1 新增，注入到 Tauri managed state）─────────────────────────
 
+/// Operation-owned cancel handle for one start_writing / regenerate generation.
+///
+/// Pipeline, autofix and postprocess all clone `cancel_rx` at operation start.
+/// The global slot only keeps the sender + generation id so `cancel_writing`
+/// and compare-and-clear can target the correct generation.
+#[derive(Debug)]
+pub struct WritingCancelHandle {
+    pub operation_id: Id,
+    pub cancel_tx: watch::Sender<bool>,
+}
+
+/// Create a new writing operation cancel pair and install it into AppState.
+/// Any previous operation is cancelled first.
+fn begin_writing_operation(app: &AppState) -> (Id, watch::Receiver<bool>) {
+    let operation_id = Id::new();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    {
+        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = slot.take() {
+            let _ = existing.cancel_tx.send(true);
+        }
+        *slot = Some(WritingCancelHandle {
+            operation_id: operation_id.clone(),
+            cancel_tx,
+        });
+    }
+    (operation_id, cancel_rx)
+}
+
+/// Clear AppState.current_cancel only when it still belongs to this operation.
+fn clear_current_cancel_if(app: &AppState, operation_id: &Id) {
+    let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|handle| handle.operation_id == *operation_id)
+    {
+        *slot = None;
+    }
+}
+
 /// 应用全局状态
 pub struct AppState {
     /// App data directory used by stateful stores owned by this process.
@@ -509,8 +549,9 @@ pub struct AppState {
     pub log_store: Arc<LogStore>,
     /// 工具上下文（导入角色卡时同步更新，RwLock 支持运行时写入）
     pub tool_ctx: Arc<RwLock<ToolContext>>,
-    /// 当前运行的流水线 cancel sender（None = 无运行中的写作）
-    pub current_cancel: Mutex<Option<watch::Sender<bool>>>,
+    /// 当前运行的写作/regenerate 取消句柄（operation-owned）。
+    /// None = 无运行中的写作。
+    pub current_cancel: Mutex<Option<WritingCancelHandle>>,
     /// 等待前端插件处理最终 LLM messages prompt hook 的请求。
     prompt_hook_pending: PromptHookPendingMap,
     /// 当前活跃连接构造的 LLM client（None = 用 mock_llm）
@@ -2497,23 +2538,15 @@ async fn start_writing(
         None // 非 Campaign 模式，不创建 TurnRecord
     };
 
-    // 创建 cancel channel，sender 存进 AppState（前端可调 cancel_writing 触发）
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = slot.take() {
-            // 上一次写作未正常清理，先取消它
-            let _ = existing.send(true);
-        }
-        *slot = Some(cancel_tx);
-    }
+    // Operation-owned cancel: pipeline / autofix / postprocess all clone this receiver.
+    let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx)
+        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx.clone())
         .await;
 
     // ─── P2 后处理流水线（后台执行，不阻断成文返回）──────────────────────
@@ -2558,7 +2591,7 @@ async fn start_writing(
                     record.failure_reason = Some(format!("TurnAttempt 持久化失败: {e}"));
                     record.touch();
                 });
-                clear_current_cancel(&app);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
                     "TurnAttempt 持久化失败（已尝试软删无主 Draft）: {e}"
                 )));
@@ -2582,22 +2615,11 @@ async fn start_writing(
             .unwrap_or_default();
         let final_text = final_text.clone();
         let var_keys = postprocess_variable_keys(&ctx);
-        // Postprocess must subscribe to the same cancel source that cancel_writing triggers.
-        let pp_cancel_rx = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
+        // Reuse the operation-owned cancel receiver (no global re-subscribe / no fallback).
+        let pp_cancel_rx = cancel_rx.clone();
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
-        let cancel_for_fix = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
         let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
             final_text,
             QualityAutofixCtx {
@@ -2606,7 +2628,7 @@ async fn start_writing(
                 conversation_id: &conversation_id,
                 writing_ctx: &ctx,
                 event_tx: &event_tx,
-                cancel: cancel_for_fix,
+                cancel: cancel_rx.clone(),
                 log_prefix: "start_writing",
             },
         )
@@ -2638,7 +2660,7 @@ async fn start_writing(
                 service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
             {
                 let combined = service_fail_turn(&sink, &identity.turn_id, e);
-                clear_current_cancel(&app);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
                     "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
@@ -2651,6 +2673,7 @@ async fn start_writing(
         let pp_event_tx = event_tx.clone();
         let pp_runtime = ctx.campaign_runtime.clone();
         let app_for_pp = app.clone();
+        let operation_id_for_pp = operation_id.clone();
         tokio::spawn(async move {
             let result = run_shared_postprocess_background(
                 pipeline,
@@ -2668,7 +2691,7 @@ async fn start_writing(
             if let Err(e) = result {
                 tracing::error!("start_writing background postprocess failed closed: {e}");
             }
-            clear_current_cancel(&app_for_pp);
+            clear_current_cancel_if(&app_for_pp, &operation_id_for_pp);
         });
         // Defer clear_current_cancel to the spawn completion path below.
         // Skip the normal clear for the success path with background postprocess.
@@ -2689,14 +2712,14 @@ async fn start_writing(
                         record.touch();
                     });
                 }
-                clear_current_cancel(&app);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::from(format!("写作失败: {e}")));
             }
         }
     }
 
-    // 清理 cancel sender
-    clear_current_cancel(&app);
+    // No background postprocess path: clear only this operation.
+    clear_current_cancel_if(&app, &operation_id);
 
     match result {
         Ok((orig_text, node_id, _provenance)) => {
@@ -2928,6 +2951,14 @@ fn service_fail_turn(
     turn_id: &Id,
     original: production_postprocess::ProductionPostprocessError,
 ) -> production_postprocess::ProductionPostprocessError {
+    // Identity-validation errors must never mark/write the Turn.
+    if matches!(
+        original,
+        production_postprocess::ProductionPostprocessError::ScopeMismatch { .. }
+            | production_postprocess::ProductionPostprocessError::AttemptMissing { .. }
+    ) {
+        return original;
+    }
     match sink.mark_failed(turn_id, original.to_string()) {
         Ok(()) => original,
         Err(mark_error) => production_postprocess::ProductionPostprocessError::MarkFailed {
@@ -2948,12 +2979,6 @@ where
     get_turn_store()
         .with_turn_mut(turn_id, f)
         .map_err(|e| format!("保存 TurnRecord 失败: {e}"))
-}
-
-/// 清理 AppState.current_cancel（写作/重 roll 结束或提前失败时统一调用）。
-fn clear_current_cancel(app: &AppState) {
-    let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-    *slot = None;
 }
 
 /// 条件更新 TurnRecord：predicate 失败返回 Ok(false)，不改盘。
@@ -4972,8 +4997,8 @@ fn cancel_writing(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, TauriC
         .current_cancel
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some(tx) = slot.as_ref() {
-        let _ = tx.send(true);
+    if let Some(handle) = slot.as_ref() {
+        let _ = handle.cancel_tx.send(true);
         Ok(true)
     } else {
         Ok(false) // 无运行中的写作
@@ -5175,21 +5200,19 @@ async fn regenerate(
         fill_far_memory_hits(&mut ctx, &app, query).await;
     }
 
-    // cancel channel
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = slot.take() {
-            let _ = existing.send(true);
-        }
-        *slot = Some(cancel_tx);
-    }
+    // Operation-owned cancel for regenerate.
+    let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .regenerate(pipeline_req.clone(), &ctx, event_tx.clone(), cancel_rx)
+        .regenerate(
+            pipeline_req.clone(),
+            &ctx,
+            event_tx.clone(),
+            cancel_rx.clone(),
+        )
         .await;
 
     // ─── P2 后处理（best-effort，同 start_writing）─────────────────────────
@@ -5230,7 +5253,7 @@ async fn regenerate(
                             Some(format!("regenerate TurnAttempt 持久化失败: {e}"));
                         record.touch();
                     });
-                    clear_current_cancel(&app);
+                    clear_current_cancel_if(&app, &operation_id);
                     return Err(TauriCommandError::internal(format!(
                         "regenerate TurnAttempt 持久化失败（已尝试软删变体）: {e}"
                     )));
@@ -5257,22 +5280,11 @@ async fn regenerate(
                 .unwrap_or_default(),
             postprocess_variable_keys(&ctx),
         );
-        // Postprocess + autofix share the cancel_writing source.
-        let pp_rx = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
+        // Operation-owned cancel clones only (no global re-subscribe / no false fallback).
+        let pp_rx = cancel_rx.clone();
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
-        let cancel_for_fix = {
-            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref()
-                .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| watch::channel(false).1)
-        };
         // regenerate 返回的 node 即当前 node_id（variant 更新）
         let draft_node_for_fix = pipeline_req.node_id.clone();
         let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
@@ -5283,7 +5295,7 @@ async fn regenerate(
                 conversation_id: &pipeline_req.conversation_id,
                 writing_ctx: &ctx,
                 event_tx: &event_tx,
-                cancel: cancel_for_fix,
+                cancel: cancel_rx.clone(),
                 log_prefix: "regenerate",
             },
         )
@@ -5324,7 +5336,7 @@ async fn regenerate(
                 service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
             {
                 let combined = service_fail_turn(&sink, &identity.turn_id, e);
-                clear_current_cancel(&app);
+                clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
                     "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
                 )));
@@ -5347,14 +5359,14 @@ async fn regenerate(
         )
         .await
         {
-            clear_current_cancel(&app);
+            clear_current_cancel_if(&app, &operation_id);
             return Err(TauriCommandError::internal(format!(
                 "regenerate postprocess 关键失败: {e}"
             )));
         }
     }
 
-    clear_current_cancel(&app);
+    clear_current_cancel_if(&app, &operation_id);
 
     match result {
         Ok((orig_text, _provenance)) => Ok(prefer_autofix_response_text(response_text, orig_text)),
@@ -16771,15 +16783,9 @@ mod tests {
             assert!(slot.is_none());
         }
 
-        // 模拟 start_writing 设置 cancel sender
-        let (tx, rx) = watch::channel(false);
-        {
-            let mut slot = state
-                .current_cancel
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            *slot = Some(tx);
-        }
+        // 模拟 start_writing 设置 operation-owned cancel
+        let (_op_a, rx_a) = begin_writing_operation(&state);
+        assert!(!*rx_a.borrow());
 
         // 触发取消
         {
@@ -16787,19 +16793,175 @@ mod tests {
                 .current_cancel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let tx = slot.as_ref().unwrap();
-            let _ = tx.send(true);
+            let handle = slot.as_ref().unwrap();
+            let _ = handle.cancel_tx.send(true);
         }
-        assert!(*rx.borrow(), "cancel 应已触发");
+        assert!(*rx_a.borrow(), "cancel 应已触发");
 
-        // 清理
+        // 清理本 operation
+        let op = state
+            .current_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|h| h.operation_id.clone())
+            .unwrap();
+        clear_current_cancel_if(&state, &op);
+        assert!(
+            state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn operation_owned_cancel_interleaving_preserves_active_generation() {
+        let state = AppState::new_for_test();
+
+        // Operation A starts.
+        let (op_a, rx_a) = begin_writing_operation(&state);
+        assert!(!*rx_a.borrow());
+
+        // Operation B starts while A is still "postprocessing": A must observe cancel,
+        // and the global slot becomes B.
+        let (op_b, rx_b) = begin_writing_operation(&state);
+        assert_ne!(op_a, op_b);
+        assert!(*rx_a.borrow(), "starting B must cancel A");
+        assert!(!*rx_b.borrow());
         {
-            let mut slot = state
+            let slot = state
                 .current_cancel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            *slot = None;
+            assert_eq!(slot.as_ref().unwrap().operation_id, op_b);
         }
+
+        // A finishing must not clear B's sender.
+        clear_current_cancel_if(&state, &op_a);
+        {
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                slot.as_ref().map(|h| h.operation_id.clone()),
+                Some(op_b.clone()),
+                "A clear must not wipe B"
+            );
+        }
+        assert!(!*rx_b.borrow());
+
+        // cancel_writing still cancels the active generation B.
+        {
+            let slot = state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let _ = slot.as_ref().unwrap().cancel_tx.send(true);
+        }
+        assert!(*rx_b.borrow(), "active cancel must still reach B");
+
+        // B clear succeeds; stale A clear remains a no-op.
+        clear_current_cancel_if(&state, &op_b);
+        clear_current_cancel_if(&state, &op_a);
+        assert!(
+            state
+                .current_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scope_validation_errors_do_not_mark_turn_failed() {
+        use production_postprocess::{
+            JsonTurnAttemptSink, PostprocessIdentity, ProductionPostprocessError,
+            ProductionPostprocessService,
+        };
+        use std::sync::Arc;
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::turn::{TurnRecord, TurnStatus};
+
+        let dir =
+            std::env::temp_dir().join(format!("sf_scope_zero_write_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let campaign_store = Arc::new(campaign_store::CampaignStore::new(&dir));
+        let turn_store = Arc::new(turn_store::TurnStore::new(&dir));
+        let mut campaign = Campaign::new(Id::new(), "scope-zero");
+        campaign.lineage_id = Some(Id::new());
+        let campaign_id = campaign.id.clone();
+        campaign_store.save_campaign(campaign).unwrap();
+        let conversation_id = Id::from_str("conv-scope");
+        let attempt_id = Id::new();
+        let mut record = TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            Id::from_str("input"),
+            0,
+        );
+        record.status = TurnStatus::DraftReady;
+        record.attempts.push(turn_lifecycle::new_draft_attempt(
+            attempt_id.clone(),
+            Id::from_str("variant"),
+            "draft",
+            vec![],
+        ));
+        let turn_id = record.turn_id.clone();
+        turn_store.create_turn(record).unwrap();
+
+        let sink = JsonTurnAttemptSink {
+            turn_store: &turn_store,
+        };
+        let service = ProductionPostprocessService::new_json(&campaign_store, &sink);
+        let (_tx, cancel_rx) = watch::channel(false);
+        let before = turn_store.get_turn(&turn_id).unwrap();
+
+        let err = service
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: Id::from_str("other-campaign"),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: 1,
+                },
+                Some(storyforge_app_agent::PostProcessOutcome {
+                    summary: Some("must not write".into()),
+                    post_process: None,
+                }),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("cross campaign must fail");
+        assert!(matches!(
+            err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        // Adapter must not mark Failed for validation errors.
+        let combined = service_fail_turn(&BackendTurnAttemptSink, &turn_id, err);
+        assert!(matches!(
+            combined,
+            ProductionPostprocessError::ScopeMismatch { .. }
+        ));
+
+        let after = turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.failure_reason, before.failure_reason);
+        assert!(
+            after
+                .find_attempt(&attempt_id)
+                .unwrap()
+                .pending_state_changes
+                .is_none()
+        );
+        assert!(campaign_store.list_summaries(&campaign_id).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 验证 active_llm_or_mock：无活跃连接时回退 mock（关键 fallback 行为）

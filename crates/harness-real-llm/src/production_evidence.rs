@@ -56,8 +56,29 @@ impl ChronicleCandidateSource {
 pub struct ProductionPostprocessProof {
     pub turn_id: Id,
     pub attempt_id: Id,
+    pub input_node_id: Id,
+    pub turn_index: u32,
+    pub variant_id: Id,
+    pub draft_hash: String,
     pub summary_text: Option<String>,
+    /// Canonical digest of durable MutationBatch mutations (order-sensitive).
+    pub batch_digest: Option<String>,
     pub applied: bool,
+}
+
+/// Stable digest for a prepared MutationBatch used by harness proofs.
+pub fn mutation_batch_digest(batch: &storyforge_domain::turn::MutationBatch) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(batch.commit_id.as_str().as_bytes());
+    hasher.update(batch.expected_revision.to_le_bytes());
+    hasher.update(batch.target_revision.to_le_bytes());
+    for mutation in &batch.mutations {
+        let encoded = serde_json::to_string(mutation).unwrap_or_default();
+        hasher.update(encoded.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +235,23 @@ pub fn verify_production_postprocess_claim(
                     "production postprocess proof marked not applied".into(),
                 ));
             }
+            if proof.variant_id != written.variant_id {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof variant_id mismatch".into(),
+                ));
+            }
+            let expected_hash =
+                storyforge_tauri_app::turn_lifecycle::compute_draft_hash(&written.draft_text);
+            if proof.draft_hash != expected_hash {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof draft_hash mismatch".into(),
+                ));
+            }
+            if proof.summary_text.as_ref() != written.summary_text.as_ref() {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof summary mismatch".into(),
+                ));
+            }
             let turn = env.turn_store.get_turn(&proof.turn_id).ok_or_else(|| {
                 ProductionEvidenceError::Store(format!(
                     "missing turn {} for production postprocess proof",
@@ -223,6 +261,11 @@ pub fn verify_production_postprocess_claim(
             if &turn.campaign_id != campaign_id || &turn.conversation_id != conversation_id {
                 return Err(ProductionEvidenceError::InvalidConfig(
                     "production postprocess proof scope mismatch".into(),
+                ));
+            }
+            if turn.input_node_id != proof.input_node_id {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof input_node_id mismatch".into(),
                 ));
             }
             if turn.status != storyforge_domain::turn::TurnStatus::AwaitingAcceptance {
@@ -242,29 +285,53 @@ pub fn verify_production_postprocess_claim(
                     attempt.status
                 )));
             }
-            if attempt.variant_id != written.variant_id {
+            if attempt.variant_id != written.variant_id || attempt.variant_id != proof.variant_id {
                 return Err(ProductionEvidenceError::InvalidConfig(
                     "production postprocess proof variant mismatch".into(),
                 ));
             }
-            if proof.summary_text.as_ref() != written.summary_text.as_ref() {
+            if attempt.draft_hash != proof.draft_hash {
                 return Err(ProductionEvidenceError::InvalidConfig(
-                    "production postprocess proof summary mismatch".into(),
+                    "durable attempt draft_hash mismatches proof".into(),
+                ));
+            }
+            // Reject reuse of an old attempt proof against a different live attempt.
+            if let Some(active) = turn.active_attempt()
+                && active.attempt_id != proof.attempt_id
+            {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof targets non-active attempt".into(),
                 ));
             }
             if written.summary_text.is_some() {
-                let has_summary = attempt
-                    .pending_state_changes
-                    .as_ref()
-                    .map(|b| {
-                        b.mutations.iter().any(|m| {
-                            matches!(m, storyforge_domain::turn::Mutation::UpsertSummary(_))
-                        })
+                let summary_ok = attempt.pending_state_changes.as_ref().is_some_and(|b| {
+                    b.mutations.iter().any(|m| match m {
+                        storyforge_domain::turn::Mutation::UpsertSummary(s) => {
+                            Some(s.content.as_str()) == written.summary_text.as_deref()
+                                && s.turn == proof.turn_index
+                        }
+                        _ => false,
                     })
-                    .unwrap_or(false);
-                if !has_summary {
+                });
+                if !summary_ok {
                     return Err(ProductionEvidenceError::InvalidConfig(
-                        "summary claimed but durable batch lacks UpsertSummary".into(),
+                        "summary claimed but durable batch lacks exact UpsertSummary".into(),
+                    ));
+                }
+            }
+            match (&proof.batch_digest, &attempt.pending_state_changes) {
+                (Some(expected), Some(batch)) => {
+                    let actual = mutation_batch_digest(batch);
+                    if &actual != expected {
+                        return Err(ProductionEvidenceError::InvalidConfig(
+                            "production postprocess proof batch_digest mismatch".into(),
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ProductionEvidenceError::InvalidConfig(
+                        "production postprocess proof batch presence mismatch".into(),
                     ));
                 }
             }
