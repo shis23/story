@@ -115,6 +115,17 @@ pub struct PostprocessApplyRequest<'a> {
     pub derivation: DerivationComponents,
 }
 
+/// Result of a pre-accept postprocess write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostprocessApplyOutcome {
+    /// Candidate batch/derivation written and outbox Applied.
+    Applied,
+    /// Identical payload already applied; no mutation and no new outbox row.
+    AlreadyApplied,
+    /// Attempt belongs to the turn but is no longer the current writable attempt.
+    SkippedLate,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegenerateAttemptRequest<'a> {
     pub campaign_id: &'a Id,
@@ -268,7 +279,7 @@ impl SqlitePreacceptRepository {
         let payload = serde_json::json!({
             "attempt_id": request.attempt_id.as_str(),
             "draft_hash": final_hash,
-            "quality_error_count": request.quality_report.error_count(),
+            "quality_report": request.quality_report,
         });
         let payload_hash = hash_json(&payload)?;
 
@@ -302,7 +313,7 @@ impl SqlitePreacceptRepository {
         }
         let variant_id = active.variant_id.clone();
 
-        // Idempotent: same final hash + same quality error count already applied.
+        // Idempotent: same final hash + full canonical QualityReport already applied.
         if let Some(existing) =
             find_applied_outbox_tx(tx, request.attempt_id, PreacceptOutboxKind::AutofixSync)?
             && existing.payload_hash == payload_hash
@@ -365,12 +376,16 @@ impl SqlitePreacceptRepository {
 
     /// Apply postprocess output onto the still-current attempt.
     ///
-    /// Returns `Ok(true)` when applied, `Ok(false)` when the attempt is no longer
-    /// current (late result — fail closed without mutation).
+    /// Ownership and replay rules:
+    /// - `attempt_id` must belong to `turn_id` (cross-turn attempt → conflict, zero outbox).
+    /// - Identical already-applied payload → [`PostprocessApplyOutcome::AlreadyApplied`]
+    ///   with no new outbox row.
+    /// - Different payload after an Applied row → conflict, zero new outbox.
+    /// - Belonging but non-current attempt → [`PostprocessApplyOutcome::SkippedLate`].
     pub fn apply_postprocess(
         db: &mut Database,
         request: PostprocessApplyRequest<'_>,
-    ) -> Result<bool> {
+    ) -> Result<PostprocessApplyOutcome> {
         Self::apply_postprocess_with_fault(db, request, PreacceptFault::None)
     }
 
@@ -379,7 +394,7 @@ impl SqlitePreacceptRepository {
         db: &mut Database,
         request: PostprocessApplyRequest<'_>,
         fault: PreacceptFault,
-    ) -> Result<bool> {
+    ) -> Result<PostprocessApplyOutcome> {
         migrations::migrate(db)?;
         let now = chrono::Utc::now().to_rfc3339();
         let batch_fingerprint = request.batch.as_ref().map(batch_payload_hash).transpose()?;
@@ -402,7 +417,35 @@ impl SqlitePreacceptRepository {
             request.turn_id,
         )?;
 
-        // Late postprocess: only DraftReady / DerivingState + matching active attempt.
+        // Fail closed on cross-turn / missing attempt ownership before any outbox write.
+        let owned = turn.find_attempt(request.attempt_id).cloned();
+        let Some(owned_attempt) = owned else {
+            return Err(SqliteError::Conflict(format!(
+                "attempt {} does not belong to turn {}",
+                request.attempt_id, request.turn_id
+            )));
+        };
+
+        // Replay / conflict checks must run before the late-skip path, otherwise a
+        // successful AwaitingAcceptance state would be misclassified as Skipped.
+        if let Some(existing) = find_applied_outbox_tx(
+            tx,
+            request.attempt_id,
+            PreacceptOutboxKind::PostprocessApply,
+        )? {
+            if existing.payload_hash == payload_hash {
+                if fault == PreacceptFault::BeforeCommit {
+                    return Err(SqliteError::Other("injected failure before commit".into()));
+                }
+                uow.commit()?;
+                return Ok(PostprocessApplyOutcome::AlreadyApplied);
+            }
+            return Err(SqliteError::Conflict(format!(
+                "postprocess for attempt {} already applied with different payload",
+                request.attempt_id
+            )));
+        }
+
         let ready = matches!(
             turn.status,
             TurnStatus::DraftReady | TurnStatus::DerivingState
@@ -414,7 +457,6 @@ impl SqlitePreacceptRepository {
                 )
         });
         if !ready {
-            // Record skip for observability; do not mutate turn/conversation.
             insert_outbox(
                 tx,
                 &PreacceptOutboxRow {
@@ -424,10 +466,7 @@ impl SqlitePreacceptRepository {
                     turn_id: request.turn_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     kind: PreacceptOutboxKind::PostprocessApply,
-                    draft_hash: turn
-                        .find_attempt(request.attempt_id)
-                        .map(|a| a.draft_hash.clone())
-                        .unwrap_or_default(),
+                    draft_hash: owned_attempt.draft_hash.clone(),
                     payload_hash: payload_hash.clone(),
                     status: PreacceptOutboxStatus::Skipped,
                     payload_json: payload.to_string(),
@@ -439,23 +478,7 @@ impl SqlitePreacceptRepository {
                 return Err(SqliteError::Other("injected failure before commit".into()));
             }
             uow.commit()?;
-            return Ok(false);
-        }
-
-        // Idempotent replay of identical postprocess payload.
-        if let Some(existing) = find_applied_outbox_tx(
-            tx,
-            request.attempt_id,
-            PreacceptOutboxKind::PostprocessApply,
-        )? {
-            if existing.payload_hash == payload_hash {
-                uow.commit()?;
-                return Ok(true);
-            }
-            return Err(SqliteError::Conflict(format!(
-                "postprocess for attempt {} already applied with different payload",
-                request.attempt_id
-            )));
+            return Ok(PostprocessApplyOutcome::SkippedLate);
         }
 
         let draft_hash = {
@@ -471,8 +494,6 @@ impl SqlitePreacceptRepository {
         turn.touch();
         write_turn(tx, &turn)?;
 
-        // Conversation is not mutated by postprocess (candidate state only).
-        // Still re-read scope so drift fails closed.
         let conversation = load_conversation_tx(tx, request.conversation_id)?;
         validate_conversation_scope(&conversation, request.campaign_id, request.conversation_id)?;
 
@@ -493,7 +514,7 @@ impl SqlitePreacceptRepository {
             return Err(SqliteError::Other("injected failure before commit".into()));
         }
         uow.commit()?;
-        Ok(true)
+        Ok(PostprocessApplyOutcome::Applied)
     }
 
     pub fn append_regenerate_attempt(
@@ -539,6 +560,19 @@ impl SqlitePreacceptRepository {
             return Err(SqliteError::Conflict(format!(
                 "attempt {} already exists",
                 request.attempt_id
+            )));
+        }
+
+        let active = turn.active_attempt().ok_or_else(|| {
+            SqliteError::Conflict(format!(
+                "turn {} has no active attempt to regenerate",
+                turn.turn_id
+            ))
+        })?;
+        if &active.variant_id != request.previous_variant_id {
+            return Err(SqliteError::Conflict(format!(
+                "previous_variant_id {} is not the active attempt variant {} on turn {}",
+                request.previous_variant_id, active.variant_id, turn.turn_id
             )));
         }
 

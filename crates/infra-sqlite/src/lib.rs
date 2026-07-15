@@ -37,9 +37,10 @@ pub use exporter::{ReverseExportReport, ReverseExportResult, export_sqlite_to_js
 pub use importer::{ImportReport, ImportStatus, JsonImporter};
 pub use migrations::{Migration, builtin_migrations, current_version, migrate, migrate_with};
 pub use preaccept::{
-    AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyRequest,
-    PreacceptFault, PreacceptOutboxKind, PreacceptOutboxRow, PreacceptOutboxStatus,
-    PreacceptRecoverySnapshot, RegenerateAttemptRequest, SqlitePreacceptRepository,
+    AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyOutcome,
+    PostprocessApplyRequest, PreacceptFault, PreacceptOutboxKind, PreacceptOutboxRow,
+    PreacceptOutboxStatus, PreacceptRecoverySnapshot, RegenerateAttemptRequest,
+    SqlitePreacceptRepository,
 };
 pub use publication::{PublishFault, PublishOutcome, PublishRequest, SqliteChronicleRepository};
 pub use readiness::{

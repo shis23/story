@@ -17,8 +17,8 @@ use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::export_sqlite_to_json;
 use storyforge_infra_sqlite::migrations::{builtin_migrations, current_version, migrate};
 use storyforge_infra_sqlite::preaccept::{
-    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest, PreacceptFault,
-    PreacceptOutboxKind, PreacceptOutboxStatus, RegenerateAttemptRequest,
+    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyOutcome, PostprocessApplyRequest,
+    PreacceptFault, PreacceptOutboxKind, PreacceptOutboxStatus, RegenerateAttemptRequest,
     SqlitePreacceptRepository,
 };
 use storyforge_infra_sqlite::production::{SqliteProductionRepository, compute_draft_hash};
@@ -363,9 +363,36 @@ fn postprocess_apply_is_atomic_and_idempotent_on_replay() {
         batch: Some(batch.clone()),
         derivation: derivation.clone(),
     };
-    SqlitePreacceptRepository::apply_postprocess(&mut f.db, request.clone()).unwrap();
-    // Idempotent replay with identical payload.
-    SqlitePreacceptRepository::apply_postprocess(&mut f.db, request).unwrap();
+    let first = SqlitePreacceptRepository::apply_postprocess(&mut f.db, request.clone()).unwrap();
+    assert_eq!(first, PostprocessApplyOutcome::Applied);
+    let outbox_after_first =
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id).unwrap();
+    let pp_rows_after_first = outbox_after_first
+        .iter()
+        .filter(|r| r.kind == PreacceptOutboxKind::PostprocessApply)
+        .count();
+    assert_eq!(pp_rows_after_first, 1);
+
+    // Idempotent replay with identical payload: no new outbox rows.
+    let second = SqlitePreacceptRepository::apply_postprocess(&mut f.db, request).unwrap();
+    assert_eq!(second, PostprocessApplyOutcome::AlreadyApplied);
+    let outbox_after_replay =
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id).unwrap();
+    let pp_rows_after_replay = outbox_after_replay
+        .iter()
+        .filter(|r| r.kind == PreacceptOutboxKind::PostprocessApply)
+        .count();
+    assert_eq!(
+        pp_rows_after_replay, pp_rows_after_first,
+        "same-payload postprocess replay must not append outbox rows"
+    );
+    assert!(
+        !outbox_after_replay.iter().any(|r| {
+            r.kind == PreacceptOutboxKind::PostprocessApply
+                && r.status == PreacceptOutboxStatus::Skipped
+        }),
+        "successful postprocess replay must not record Skipped"
+    );
 
     let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
         .unwrap()
@@ -446,8 +473,9 @@ fn postprocess_skips_when_attempt_no_longer_current() {
         },
     )
     .unwrap();
-    assert!(
-        !applied,
+    assert_eq!(
+        applied,
+        PostprocessApplyOutcome::SkippedLate,
         "late postprocess must not revive superseded attempt"
     );
 
@@ -695,6 +723,364 @@ fn concurrent_draft_create_serializes_to_single_active_attempt() {
         .unwrap();
     assert_eq!(turn.attempts.len(), 1);
     assert_eq!(turn.status, TurnStatus::DraftReady);
+}
+
+#[test]
+fn postprocess_rejects_attempt_owned_by_another_turn_with_zero_outbox() {
+    let mut f = fixture();
+    let attempt_a = Id::from_str("attempt-cross-a");
+    SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_a,
+            draft_text: "turn A draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    let failed = SqlitePreacceptRepository::fail_incomplete_preaccept(&mut f.db).unwrap();
+    assert_eq!(failed, 1);
+
+    let mut turn_b = storyforge_domain::turn::TurnRecord::new(
+        f.campaign_id.clone(),
+        f.conversation_id.clone(),
+        Id::from_str("input-b"),
+        0,
+    );
+    turn_b.turn_id = Id::from_str("turn-preaccept-b");
+    turn_b.status = TurnStatus::Generating;
+    SqliteProductionRepository::save_turn(&mut f.db, &turn_b).unwrap();
+    let attempt_b = Id::from_str("attempt-cross-b");
+    let created_b = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &turn_b.turn_id,
+            attempt_id: &attempt_b,
+            draft_text: "turn B draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+
+    let outbox_before =
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &turn_b.turn_id).unwrap();
+    let before_count = outbox_before.len();
+
+    let mut batch = MutationBatch::new(Id::from_str("commit-cross"), 0);
+    batch.mutations.push(Mutation::FinalizeVariant {
+        variant_id: created_b.variant_id.clone(),
+    });
+    let err = SqlitePreacceptRepository::apply_postprocess(
+        &mut f.db,
+        PostprocessApplyRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &turn_b.turn_id,
+            attempt_id: &attempt_a,
+            batch: Some(batch),
+            derivation: DerivationComponents {
+                summary_derivation: DerivationStatus::Succeeded,
+                state_derivation: DerivationStatus::Succeeded,
+            },
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("attempt") || err.to_string().contains("turn"),
+        "cross-turn attempt must fail closed: {err}"
+    );
+
+    let outbox_after =
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &turn_b.turn_id).unwrap();
+    assert_eq!(
+        outbox_after.len(),
+        before_count,
+        "cross-turn postprocess must write zero outbox rows"
+    );
+    assert!(
+        !outbox_after
+            .iter()
+            .any(|r| r.kind == PreacceptOutboxKind::PostprocessApply),
+        "must not record Skipped/Applied outbox for foreign attempt"
+    );
+
+    let turn_b_loaded = SqliteProductionRepository::get_turn(&f.db, &turn_b.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn_b_loaded.status, TurnStatus::DraftReady);
+    assert!(
+        turn_b_loaded
+            .find_attempt(&attempt_b)
+            .unwrap()
+            .pending_state_changes
+            .is_none()
+    );
+}
+
+#[test]
+fn postprocess_same_payload_replay_is_idempotent_without_extra_outbox() {
+    let mut f = fixture();
+    let attempt_id = Id::from_str("attempt-pp-idem");
+    let created = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "idempotent postprocess",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    let mut batch = MutationBatch::new(Id::from_str("commit-pp-idem"), 0);
+    batch.mutations.push(Mutation::FinalizeVariant {
+        variant_id: created.variant_id.clone(),
+    });
+    let derivation = DerivationComponents {
+        summary_derivation: DerivationStatus::Succeeded,
+        state_derivation: DerivationStatus::Disabled,
+    };
+    let request = PostprocessApplyRequest {
+        campaign_id: &f.campaign_id,
+        conversation_id: &f.conversation_id,
+        turn_id: &f.turn_id,
+        attempt_id: &attempt_id,
+        batch: Some(batch.clone()),
+        derivation: derivation.clone(),
+    };
+    assert_eq!(
+        SqlitePreacceptRepository::apply_postprocess(&mut f.db, request.clone()).unwrap(),
+        PostprocessApplyOutcome::Applied
+    );
+    let rows_after_apply = SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .len();
+
+    assert_eq!(
+        SqlitePreacceptRepository::apply_postprocess(&mut f.db, request.clone()).unwrap(),
+        PostprocessApplyOutcome::AlreadyApplied
+    );
+    assert_eq!(
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+            .unwrap()
+            .len(),
+        rows_after_apply
+    );
+
+    let mut other = batch.clone();
+    other.commit_id = Id::from_str("commit-pp-different");
+    let err = SqlitePreacceptRepository::apply_postprocess(
+        &mut f.db,
+        PostprocessApplyRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            batch: Some(other),
+            derivation,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("different payload")
+            || err.to_string().contains("conflict")
+            || err.to_string().contains("already applied"),
+        "different postprocess payload must fail closed: {err}"
+    );
+    assert_eq!(
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+            .unwrap()
+            .len(),
+        rows_after_apply,
+        "conflicting payload must not append outbox"
+    );
+}
+
+#[test]
+fn regenerate_rejects_previous_variant_not_owned_by_active_attempt() {
+    let mut f = fixture();
+    let first = Id::from_str("attempt-reg-active");
+    let created = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &first,
+            draft_text: "active draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+
+    let conversation = SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+        .unwrap()
+        .unwrap();
+    let foreign_node = conversation.nodes[0].id.clone();
+    assert_ne!(foreign_node, created.variant_id);
+
+    let outbox_before = SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id).unwrap();
+    let before_len = outbox_before.len();
+
+    let err = SqlitePreacceptRepository::append_regenerate_attempt(
+        &mut f.db,
+        RegenerateAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            previous_variant_id: &foreign_node,
+            attempt_id: &Id::from_str("attempt-reg-bad"),
+            draft_text: "should not land",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("variant") || err.to_string().contains("active"),
+        "regenerate must require active attempt variant: {err}"
+    );
+
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.attempts.len(), 1);
+    assert_eq!(turn.active_attempt().unwrap().attempt_id, first);
+    assert_eq!(
+        SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+            .unwrap()
+            .len(),
+        before_len
+    );
+}
+
+#[test]
+fn autofix_idempotency_fingerprint_covers_full_quality_report() {
+    let mut f = fixture();
+    let attempt_id = Id::from_str("attempt-autofix-fp");
+    let created = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "original autofix body",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+
+    let final_text = "fixed body shared";
+    let report_a = QualityReport {
+        warnings: vec![QualityWarning {
+            code: QualityWarningCode::TooShort { char_count: 4 },
+            message: "report A".into(),
+            severity: QualitySeverity::Error,
+        }],
+    };
+    let report_b = QualityReport {
+        warnings: vec![QualityWarning {
+            code: QualityWarningCode::MetaDescription {
+                snippet: "leak".into(),
+            },
+            message: "report B".into(),
+            severity: QualitySeverity::Error,
+        }],
+    };
+    assert_eq!(report_a.error_count(), report_b.error_count());
+
+    SqlitePreacceptRepository::sync_autofix(
+        &mut f.db,
+        AutofixSyncRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            final_text,
+            quality_report: report_a.clone(),
+        },
+    )
+    .unwrap();
+    let autofix_rows_a = SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .iter()
+        .filter(|r| r.kind == PreacceptOutboxKind::AutofixSync)
+        .count();
+    assert_eq!(autofix_rows_a, 1);
+
+    SqlitePreacceptRepository::sync_autofix(
+        &mut f.db,
+        AutofixSyncRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            final_text,
+            quality_report: report_a.clone(),
+        },
+    )
+    .unwrap();
+    let autofix_rows_replay = SqlitePreacceptRepository::list_outbox_for_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .iter()
+        .filter(|r| r.kind == PreacceptOutboxKind::AutofixSync)
+        .count();
+    assert_eq!(
+        autofix_rows_replay, autofix_rows_a,
+        "identical quality report replay must not add outbox rows"
+    );
+
+    SqlitePreacceptRepository::sync_autofix(
+        &mut f.db,
+        AutofixSyncRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            final_text,
+            quality_report: report_b.clone(),
+        },
+    )
+    .unwrap();
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    let stored = turn
+        .find_attempt(&attempt_id)
+        .unwrap()
+        .quality_report
+        .as_ref()
+        .unwrap();
+    assert_eq!(stored.warnings[0].message, "report B");
+    assert!(matches!(
+        stored.warnings[0].code,
+        QualityWarningCode::MetaDescription { .. }
+    ));
+
+    let conversation = SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation
+            .find_node(&created.variant_id)
+            .unwrap()
+            .active()
+            .unwrap()
+            .content,
+        final_text
+    );
 }
 
 #[test]

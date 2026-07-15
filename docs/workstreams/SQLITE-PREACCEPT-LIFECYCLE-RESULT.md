@@ -17,6 +17,8 @@
 
 本线只交付可被后续 Tauri / postprocess 服务线接入的 **adapter contract + 测试证据**。
 
+返修后仍 **不接 production command**：未改 `tauri-app`、`TurnLifecycleService`、默认 backend。
+
 ## 交付范围对照
 
 | 计划项 | 结果 |
@@ -51,16 +53,25 @@
 
 - `SqlitePreacceptRepository::create_draft_attempt` / `_with_fault`
 - `sync_autofix` / `_with_fault`
-- `apply_postprocess` / `_with_fault` → `Ok(true)` 已应用，`Ok(false)` 迟到跳过
-- `append_regenerate_attempt` / `_with_fault`
+- `apply_postprocess` / `_with_fault` → `PostprocessApplyOutcome::{Applied, AlreadyApplied, SkippedLate}`
+- `append_regenerate_attempt` / `_with_fault`（`previous_variant_id` 必须等于当前 active Attempt 的 variant）
 - `mark_stale_after_edit`
 - `list_outbox_for_turn`
 - `recover_active_state`
 - `fail_incomplete_preaccept`
 - 类型：`DraftAttemptRequest` / `DraftAttemptOutcome` / `AutofixSyncRequest` /
-  `PostprocessApplyRequest` / `RegenerateAttemptRequest` /
+  `PostprocessApplyRequest` / `PostprocessApplyOutcome` / `RegenerateAttemptRequest` /
   `PreacceptOutboxRow` / `PreacceptOutboxKind` / `PreacceptOutboxStatus` /
   `PreacceptRecoverySnapshot` / `PreacceptFault`
+
+### Pre-accept 契约 hardening（返修）
+
+| 契约 | 行为 |
+| --- | --- |
+| postprocess ownership | `attempt_id` 必须属于目标 `turn_id`；跨 Turn → `Conflict`，**零 outbox 写入** |
+| postprocess replay | 同 payload → `AlreadyApplied`，不新增 Skipped/outbox；不同 payload → conflict |
+| regenerate variant | `previous_variant_id` 必须等于当前 active Attempt 的 variant，不能是会话内任意节点 |
+| autofix fingerprint | 幂等指纹覆盖完整 canonical `QualityReport`（不是只比 `error_count`） |
 
 `crates/infra-sqlite/src/lib.rs` 已 re-export。
 
@@ -104,7 +115,7 @@ schema 当前版本：`4`。
 
 ## 测试证据
 
-`crates/infra-sqlite/tests/preaccept_lifecycle.rs`（13）：
+`crates/infra-sqlite/tests/preaccept_lifecycle.rs`（17）：
 
 | 契约 | 测试 |
 | --- | --- |
@@ -113,9 +124,13 @@ schema 当前版本：`4`。
 | scope fail-closed | `create_draft_rejects_campaign_conversation_scope_mismatch` |
 | autofix 原子 + hash 一致 | `autofix_sync_rewrites_conversation_and_attempt_hash_atomically` |
 | autofix 故障回滚 | `autofix_fault_before_commit_leaves_original_draft_intact` |
+| autofix 完整 QualityReport 指纹 | `autofix_idempotency_fingerprint_covers_full_quality_report` |
 | postprocess 原子 + 幂等 replay | `postprocess_apply_is_atomic_and_idempotent_on_replay` |
+| postprocess 同 payload 不增 outbox | `postprocess_same_payload_replay_is_idempotent_without_extra_outbox` |
+| 跨 Turn attempt fail-closed 零 outbox | `postprocess_rejects_attempt_owned_by_another_turn_with_zero_outbox` |
 | 迟到 postprocess 跳过 | `postprocess_skips_when_attempt_no_longer_current` |
 | regenerate 取代旧 Attempt | `regenerate_supersedes_previous_attempt_atomically` |
+| regenerate 拒绝非 active variant | `regenerate_rejects_previous_variant_not_owned_by_active_attempt` |
 | 编辑 Stale 保留原 hash | `mark_stale_after_edit_keeps_hash_and_content_consistent` |
 | recovery / fail incomplete | `recovery_lists_active_preaccept_state_and_fail_incomplete_is_atomic` |
 | 并发 draft 串行 | `concurrent_draft_create_serializes_to_single_active_attempt` |
@@ -129,7 +144,7 @@ schema 当前版本：`4`。
 | 命令 | 结果 |
 | --- | --- |
 | `cargo fmt -p storyforge-infra-sqlite -- --check` | PASS（via `cargo fmt`） |
-| `cargo test -p storyforge-infra-sqlite` | PASS（含 13 preaccept + 既有 suites） |
+| `cargo test -p storyforge-infra-sqlite` | PASS（含 17 preaccept + 既有 suites） |
 | `cargo clippy -p storyforge-infra-sqlite --all-targets -- -D warnings` | PASS |
 | `git diff --check` | PASS |
 
