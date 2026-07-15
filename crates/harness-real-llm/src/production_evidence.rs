@@ -217,10 +217,15 @@ impl ProductionTurnWriter for FixedProductionPostprocessWriter {
 }
 
 /// Verify writer-claimed production postprocess against durable store state.
+///
+/// `expected_input_node_id` / `expected_turn_index` are the evidence loop's current
+/// turn identity. A valid proof from a different input/turn must not pass.
 pub fn verify_production_postprocess_claim(
     env: &HarnessEnv,
     campaign_id: &Id,
     conversation_id: &Id,
+    expected_input_node_id: &Id,
+    expected_turn_index: u32,
     written: &WrittenProductionTurn,
 ) -> Result<bool, ProductionEvidenceError> {
     match (written.chronicle_source, written.postprocess_proof.as_ref()) {
@@ -238,6 +243,19 @@ pub fn verify_production_postprocess_claim(
             if proof.variant_id != written.variant_id {
                 return Err(ProductionEvidenceError::InvalidConfig(
                     "production postprocess proof variant_id mismatch".into(),
+                ));
+            }
+            // Bind proof to the evidence loop's current turn identity.
+            if &proof.input_node_id != expected_input_node_id {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof input_node_id does not match evidence loop turn"
+                        .into(),
+                ));
+            }
+            if proof.turn_index != expected_turn_index {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof turn_index does not match evidence loop turn"
+                        .into(),
                 ));
             }
             let expected_hash =
@@ -263,7 +281,9 @@ pub fn verify_production_postprocess_claim(
                     "production postprocess proof scope mismatch".into(),
                 ));
             }
-            if turn.input_node_id != proof.input_node_id {
+            if turn.input_node_id != proof.input_node_id
+                || &turn.input_node_id != expected_input_node_id
+            {
                 return Err(ProductionEvidenceError::InvalidConfig(
                     "production postprocess proof input_node_id mismatch".into(),
                 ));
@@ -309,6 +329,7 @@ pub fn verify_production_postprocess_claim(
                         storyforge_domain::turn::Mutation::UpsertSummary(s) => {
                             Some(s.content.as_str()) == written.summary_text.as_deref()
                                 && s.turn == proof.turn_index
+                                && s.turn == expected_turn_index
                         }
                         _ => false,
                     })
@@ -325,6 +346,18 @@ pub fn verify_production_postprocess_claim(
                     if &actual != expected {
                         return Err(ProductionEvidenceError::InvalidConfig(
                             "production postprocess proof batch_digest mismatch".into(),
+                        ));
+                    }
+                    // MutationBatch must also target the evidence loop's current turn_index.
+                    let turn_bound = batch.mutations.iter().any(|m| match m {
+                        storyforge_domain::turn::Mutation::UpsertSummary(s) => {
+                            s.turn == expected_turn_index
+                        }
+                        _ => false,
+                    }) || written.summary_text.is_none();
+                    if written.summary_text.is_some() && !turn_bound {
+                        return Err(ProductionEvidenceError::InvalidConfig(
+                            "production postprocess proof MutationBatch turn_index mismatch".into(),
                         ));
                     }
                 }
@@ -685,8 +718,16 @@ pub async fn run_production_evidence_loop_with_hook<
             observed_chronicle_path = chronicle_path.into();
         }
         // Fail-closed verification of production postprocess claims.
-        let production_postprocess_complete =
-            verify_production_postprocess_claim(env, &campaign_id, &conversation_id, &written)?;
+        // Bind to this loop iteration's input_node_id + turn_index so a valid
+        // older-turn proof cannot certify the current turn.
+        let production_postprocess_complete = verify_production_postprocess_claim(
+            env,
+            &campaign_id,
+            &conversation_id,
+            &input_node_id,
+            turn_index,
+            &written,
+        )?;
         if production_postprocess_complete {
             production_service_turns += 1;
         } else if matches!(

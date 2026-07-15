@@ -32,8 +32,8 @@ use storyforge_domain::Id;
 use storyforge_domain::agent::RoundSummary;
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::turn::{
-    DerivationComponents, DerivationStatus, Mutation, MutationBatch, MutationBatchStatus,
-    QualityReport, TurnStatus,
+    AttemptStatus, DerivationComponents, DerivationStatus, Mutation, MutationBatch,
+    MutationBatchStatus, QualityReport, TurnStatus,
 };
 use tokio::sync::watch;
 
@@ -176,12 +176,17 @@ pub trait TurnAttemptSink: Send + Sync {
         turn_id: &Id,
     ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String>;
 
+    /// Atomically validate identity + writable status, then sync draft_hash/quality.
+    ///
+    /// `campaign_id`, `conversation_id`, `attempt_id`, and allowed statuses must be
+    /// checked inside the same durable mutation. Typed scope/attempt failures must
+    /// remain `ScopeMismatch` / `AttemptMissing` (never stringified as AutofixSync).
     fn sync_autofix(
         &self,
         identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
-    ) -> Result<(), String>;
+    ) -> Result<(), ProductionPostprocessError>;
 
     /// Returns Ok(true) when the attempt was current and writeback applied.
     /// Scope and attempt presence must already be validated by the service.
@@ -193,6 +198,59 @@ pub trait TurnAttemptSink: Send + Sync {
     ) -> Result<bool, String>;
 
     fn mark_failed(&self, turn_id: &Id, reason: String) -> Result<(), String>;
+}
+
+/// Allowed Turn/Attempt statuses for autofix draft_hash writeback.
+fn is_attempt_writable_for_autofix(
+    record: &storyforge_domain::turn::TurnRecord,
+    attempt_id: &Id,
+) -> bool {
+    matches!(
+        record.status,
+        TurnStatus::DraftReady | TurnStatus::DerivingState
+    ) && record.find_attempt(attempt_id).is_some_and(|attempt| {
+        matches!(
+            attempt.status,
+            AttemptStatus::DraftReady | AttemptStatus::DerivingState
+        )
+    })
+}
+
+/// Outcome of the autofix precondition checked under the sink lock.
+enum AutofixPrecondition {
+    /// campaign_id / conversation_id / attempt_id failed typed validation.
+    Typed(ProductionPostprocessError),
+    /// Scope+attempt identity matches but status is no longer writable
+    /// (superseded / committed / failed). Zero-write, non-fatal no-op.
+    NotWritable,
+}
+
+/// Map a locked TurnRecord into an autofix precondition (zero-write).
+fn autofix_precondition(
+    record: &storyforge_domain::turn::TurnRecord,
+    identity: &PostprocessIdentity,
+) -> AutofixPrecondition {
+    if record.campaign_id != identity.campaign_id {
+        return AutofixPrecondition::Typed(ProductionPostprocessError::ScopeMismatch {
+            field: "campaign_id",
+            expected: identity.campaign_id.to_string(),
+            actual: record.campaign_id.to_string(),
+        });
+    }
+    if record.conversation_id != identity.conversation_id {
+        return AutofixPrecondition::Typed(ProductionPostprocessError::ScopeMismatch {
+            field: "conversation_id",
+            expected: identity.conversation_id.to_string(),
+            actual: record.conversation_id.to_string(),
+        });
+    }
+    if record.find_attempt(&identity.attempt_id).is_none() {
+        return AutofixPrecondition::Typed(ProductionPostprocessError::AttemptMissing {
+            turn_id: identity.turn_id.to_string(),
+            attempt_id: identity.attempt_id.to_string(),
+        });
+    }
+    AutofixPrecondition::NotWritable
 }
 
 /// JSON TurnStore sink used by harness and isolated unit tests.
@@ -213,24 +271,41 @@ impl TurnAttemptSink for JsonTurnAttemptSink<'_> {
         identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
-    ) -> Result<(), String> {
-        let mut found = false;
-        self.turn_store
-            .with_turn_mut(&identity.turn_id, |record| {
-                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
-                    sync_attempt_after_autofix(att, final_text, report);
-                    found = true;
-                }
-                record.touch();
-            })
-            .map_err(|e| e.to_string())?;
-        if !found {
-            return Err(format!(
-                "attempt {} missing on turn {}",
-                identity.attempt_id, identity.turn_id
-            ));
+    ) -> Result<(), ProductionPostprocessError> {
+        // Capture typed validation failure under the same lock as the write decision.
+        let mut precondition: Option<AutofixPrecondition> = None;
+        let applied = self
+            .turn_store
+            .mutate_if(
+                &identity.turn_id,
+                |record| {
+                    if record.campaign_id != identity.campaign_id
+                        || record.conversation_id != identity.conversation_id
+                        || record.find_attempt(&identity.attempt_id).is_none()
+                        || !is_attempt_writable_for_autofix(record, &identity.attempt_id)
+                    {
+                        precondition = Some(autofix_precondition(record, identity));
+                        return false;
+                    }
+                    true
+                },
+                |record| {
+                    if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
+                        sync_attempt_after_autofix(att, final_text, report);
+                    }
+                    record.touch();
+                },
+            )
+            .map_err(ProductionPostprocessError::AutofixSync)?;
+        if applied {
+            Ok(())
+        } else {
+            match precondition {
+                Some(AutofixPrecondition::Typed(err)) => Err(err),
+                // Concurrent supersede / late status: leave durable state untouched.
+                Some(AutofixPrecondition::NotWritable) | None => Ok(()),
+            }
         }
-        Ok(())
     }
 
     fn attach_postprocess(
@@ -343,33 +418,17 @@ impl<'a> ProductionPostprocessService<'a> {
     }
 
     /// Sync quality_report + draft_hash onto the target attempt after autofix.
-    /// Storage failure must propagate so callers never return fixed text with a stale hash.
+    ///
+    /// Identity/status validation is atomic inside the sink. Typed `ScopeMismatch`
+    /// / `AttemptMissing` must propagate unchanged so adapters never `mark_failed`.
+    /// Storage failure must also propagate so callers never return fixed text with a stale hash.
     pub fn sync_autofix_attempt(
         &self,
         identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), ProductionPostprocessError> {
-        let record = self
-            .sink
-            .load_turn(&identity.turn_id)
-            .map_err(ProductionPostprocessError::AutofixSync)?
-            .ok_or_else(|| {
-                ProductionPostprocessError::AutofixSync(format!(
-                    "TurnRecord {} 不存在",
-                    identity.turn_id
-                ))
-            })?;
-        validate_identity_scope(&record, identity).map_err(|e| match e {
-            ProductionPostprocessError::ScopeMismatch { .. }
-            | ProductionPostprocessError::AttemptMissing { .. } => {
-                ProductionPostprocessError::AutofixSync(e.to_string())
-            }
-            other => other,
-        })?;
-        self.sink
-            .sync_autofix(identity, final_text, report)
-            .map_err(ProductionPostprocessError::AutofixSync)
+        self.sink.sync_autofix(identity, final_text, report)
     }
 
     /// Map runner output into DerivationComponents (summary/state tracked separately).
@@ -602,11 +661,20 @@ impl<'a> ProductionPostprocessService<'a> {
     }
 
     /// Best-effort fail-closed helper for adapters: try mark_failed and combine errors.
+    ///
+    /// Identity-validation errors must never write / mark the Turn.
     pub fn fail_turn_or_combine(
         &self,
         turn_id: &Id,
         original: ProductionPostprocessError,
     ) -> ProductionPostprocessError {
+        if matches!(
+            original,
+            ProductionPostprocessError::ScopeMismatch { .. }
+                | ProductionPostprocessError::AttemptMissing { .. }
+        ) {
+            return original;
+        }
         match self.mark_turn_failed(turn_id, original.to_string()) {
             Ok(()) => original,
             Err(mark_error) => ProductionPostprocessError::MarkFailed {
@@ -1542,8 +1610,9 @@ mod tests {
     async fn missing_attempt_returns_error_not_ok() {
         let fx = Fx::new("missing_attempt");
         let draft = "缺失 Attempt 必须 Err。".repeat(3);
-        let (turn_id, _attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let (turn_id, attempt_id, _) = fx.seed_draft_attempt(&draft);
         let sink = fx.sink();
+        let before = fx.turn_store.get_turn(&turn_id).unwrap();
         let err = fx
             .service(&sink)
             .sync_autofix_attempt(
@@ -1559,8 +1628,16 @@ mod tests {
             )
             .expect_err("missing attempt must not Ok");
         assert!(
-            matches!(err, ProductionPostprocessError::AutofixSync(ref msg) if msg.contains("missing") || msg.contains("ghost-attempt") || msg.contains("Attempt")),
+            matches!(err, ProductionPostprocessError::AttemptMissing { .. }),
             "unexpected: {err}"
+        );
+        // Typed validation errors must not mark Failed or mutate draft_hash.
+        let after = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.failure_reason, before.failure_reason);
+        assert_eq!(
+            after.find_attempt(&attempt_id).unwrap().draft_hash,
+            before.find_attempt(&attempt_id).unwrap().draft_hash
         );
 
         let (_tx, cancel_rx) = watch::channel(false);
@@ -1583,6 +1660,110 @@ mod tests {
             apply_err,
             ProductionPostprocessError::AttemptMissing { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_autofix_preserves_typed_scope_and_attempt_errors() {
+        let fx = Fx::new("sync_autofix_typed");
+        let draft = "typed identity validation 必须保留。".repeat(3);
+        let (turn_id, attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let sink = fx.sink();
+        let service = fx.service(&sink);
+        let before = fx.turn_store.get_turn(&turn_id).unwrap();
+        let original_hash = before.find_attempt(&attempt_id).unwrap().draft_hash.clone();
+
+        let camp_err = service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: Id::from_str("other-campaign"),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("cross campaign must fail");
+        assert!(matches!(
+            camp_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        // service_fail_turn / fail_turn_or_combine must not reclassify or mark.
+        let combined = service.fail_turn_or_combine(&turn_id, camp_err);
+        assert!(matches!(
+            combined,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+
+        let conv_err = service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: Id::from_str("other-conversation"),
+                    turn_number: 1,
+                },
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("cross conversation must fail");
+        assert!(matches!(
+            conv_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "conversation_id",
+                ..
+            }
+        ));
+
+        // Concurrent supersede: zero-write, no mark_failed.
+        fx.turn_store
+            .with_turn_mut(&turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Superseded;
+                }
+                record.touch();
+            })
+            .unwrap();
+        let superseded_before = fx.turn_store.get_turn(&turn_id).unwrap();
+        service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "superseded-must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect("superseded autofix is non-fatal zero-write");
+        let superseded_after = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(superseded_after.status, superseded_before.status);
+        assert_eq!(
+            superseded_after.failure_reason,
+            superseded_before.failure_reason
+        );
+        assert_eq!(
+            superseded_after
+                .find_attempt(&attempt_id)
+                .unwrap()
+                .draft_hash,
+            original_hash
+        );
+        assert_eq!(
+            superseded_after.find_attempt(&attempt_id).unwrap().status,
+            AttemptStatus::Superseded
+        );
+        assert!(fx.campaign_store.list_summaries(&fx.campaign_id).is_empty());
     }
 
     #[tokio::test]
@@ -1682,7 +1863,7 @@ mod tests {
             identity: &PostprocessIdentity,
             final_text: &str,
             report: QualityReport,
-        ) -> Result<(), String> {
+        ) -> Result<(), ProductionPostprocessError> {
             self.inner.sync_autofix(identity, final_text, report)
         }
 

@@ -2779,22 +2779,74 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         identity: &production_postprocess::PostprocessIdentity,
         final_text: &str,
         report: storyforge_domain::turn::QualityReport,
-    ) -> Result<(), String> {
-        let mut found = false;
-        update_turn_record(&identity.turn_id, |record| {
-            if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
-                turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
-                found = true;
-            }
-            record.touch();
-        })?;
-        if !found {
-            return Err(format!(
-                "attempt {} missing on turn {}",
-                identity.attempt_id, identity.turn_id
-            ));
+    ) -> Result<(), production_postprocess::ProductionPostprocessError> {
+        use production_postprocess::ProductionPostprocessError;
+        use storyforge_domain::turn::{AttemptStatus, TurnStatus};
+
+        // Capture typed validation under the same conditional durable mutation.
+        let mut precondition: Option<ProductionPostprocessError> = None;
+        let mut not_writable = false;
+        let applied = update_turn_record_if(
+            &identity.turn_id,
+            |record| {
+                if record.campaign_id != identity.campaign_id {
+                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                        field: "campaign_id",
+                        expected: identity.campaign_id.to_string(),
+                        actual: record.campaign_id.to_string(),
+                    });
+                    return false;
+                }
+                if record.conversation_id != identity.conversation_id {
+                    precondition = Some(ProductionPostprocessError::ScopeMismatch {
+                        field: "conversation_id",
+                        expected: identity.conversation_id.to_string(),
+                        actual: record.conversation_id.to_string(),
+                    });
+                    return false;
+                }
+                if record.find_attempt(&identity.attempt_id).is_none() {
+                    precondition = Some(ProductionPostprocessError::AttemptMissing {
+                        turn_id: identity.turn_id.to_string(),
+                        attempt_id: identity.attempt_id.to_string(),
+                    });
+                    return false;
+                }
+                let writable = matches!(
+                    record.status,
+                    TurnStatus::DraftReady | TurnStatus::DerivingState
+                ) && record.find_attempt(&identity.attempt_id).is_some_and(
+                    |attempt| {
+                        matches!(
+                            attempt.status,
+                            AttemptStatus::DraftReady | AttemptStatus::DerivingState
+                        )
+                    },
+                );
+                if !writable {
+                    not_writable = true;
+                    return false;
+                }
+                true
+            },
+            |record| {
+                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
+                    turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
+                }
+                record.touch();
+            },
+        )
+        .map_err(ProductionPostprocessError::AutofixSync)?;
+        if applied {
+            Ok(())
+        } else if let Some(err) = precondition {
+            Err(err)
+        } else if not_writable {
+            // Concurrent supersede / late status: durable zero-write, non-fatal.
+            Ok(())
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn attach_postprocess(
@@ -16883,7 +16935,7 @@ mod tests {
         };
         use std::sync::Arc;
         use storyforge_domain::campaign::Campaign;
-        use storyforge_domain::turn::{TurnRecord, TurnStatus};
+        use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
 
         let dir =
             std::env::temp_dir().join(format!("sf_scope_zero_write_{}", uuid::Uuid::new_v4()));
@@ -16918,7 +16970,27 @@ mod tests {
         let service = ProductionPostprocessService::new_json(&campaign_store, &sink);
         let (_tx, cancel_rx) = watch::channel(false);
         let before = turn_store.get_turn(&turn_id).unwrap();
+        let original_hash = before.find_attempt(&attempt_id).unwrap().draft_hash.clone();
 
+        let assert_zero_write = |label: &str| {
+            let after = turn_store.get_turn(&turn_id).unwrap();
+            assert_eq!(after.status, before.status, "{label}: status");
+            assert_eq!(
+                after.conversation_id, before.conversation_id,
+                "{label}: conversation"
+            );
+            assert_eq!(after.campaign_id, before.campaign_id, "{label}: campaign");
+            assert_eq!(after.failure_reason, before.failure_reason, "{label}: fail");
+            let att = after.find_attempt(&attempt_id).unwrap();
+            assert_eq!(att.draft_hash, original_hash, "{label}: draft_hash");
+            assert!(att.pending_state_changes.is_none(), "{label}: batch");
+            assert!(
+                campaign_store.list_summaries(&campaign_id).is_empty(),
+                "{label}: summaries"
+            );
+        };
+
+        // apply_outcome cross-campaign
         let err = service
             .apply_outcome(
                 &PostprocessIdentity {
@@ -16943,24 +17015,155 @@ mod tests {
                 ..
             }
         ));
-        // Adapter must not mark Failed for validation errors.
         let combined = service_fail_turn(&BackendTurnAttemptSink, &turn_id, err);
         assert!(matches!(
             combined,
             ProductionPostprocessError::ScopeMismatch { .. }
         ));
+        assert_zero_write("apply cross campaign");
 
-        let after = turn_store.get_turn(&turn_id).unwrap();
-        assert_eq!(after.status, before.status);
-        assert_eq!(after.failure_reason, before.failure_reason);
-        assert!(
-            after
-                .find_attempt(&attempt_id)
-                .unwrap()
-                .pending_state_changes
-                .is_none()
+        // start_writing / regenerate adapter path: sync_autofix via Backend sink.
+        // Install the same turn into the process JSON turn store used by BackendTurnAttemptSink.
+        // save_turn upserts so parallel tests / prior state cannot leave us without the record.
+        get_turn_store()
+            .save_turn(before.clone())
+            .expect("seed backend turn store");
+        let backend = BackendTurnAttemptSink;
+        // new_json only needs sink for autofix; campaign_store is unused on this path.
+        let backend_service =
+            ProductionPostprocessService::new_json(get_campaign_store(), &backend);
+
+        let camp_err = backend_service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: Id::from_str("other-campaign"),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend cross campaign");
+        assert!(matches!(
+            camp_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        let combined = service_fail_turn(&backend, &turn_id, camp_err);
+        assert!(matches!(
+            combined,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+        // zero-write on process turn store
+        let after_backend = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_backend.status, TurnStatus::DraftReady);
+        assert_eq!(after_backend.failure_reason, None);
+        assert_eq!(
+            after_backend.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
         );
-        assert!(campaign_store.list_summaries(&campaign_id).is_empty());
+
+        let conv_err = backend_service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: Id::from_str("other-conversation"),
+                    turn_number: 1,
+                },
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend cross conversation");
+        assert!(matches!(
+            conv_err,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "conversation_id",
+                ..
+            }
+        ));
+        let _ = service_fail_turn(&backend, &turn_id, conv_err);
+        let after_conv = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_conv.conversation_id, conversation_id);
+        assert_eq!(after_conv.failure_reason, None);
+        assert_eq!(
+            after_conv.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+
+        let miss_err = backend_service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: Id::from_str("ghost-attempt"),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("backend missing attempt");
+        assert!(matches!(
+            miss_err,
+            ProductionPostprocessError::AttemptMissing { .. }
+        ));
+        let _ = service_fail_turn(&backend, &turn_id, miss_err);
+        let after_miss = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(after_miss.status, TurnStatus::DraftReady);
+        assert_eq!(after_miss.failure_reason, None);
+        assert_eq!(
+            after_miss.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+
+        // Concurrent supersede: zero-write, no mark_failed.
+        get_turn_store()
+            .with_turn_mut(&turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::Superseded;
+                }
+                record.touch();
+            })
+            .unwrap();
+        backend_service
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "superseded-must-not-write",
+                QualityReport { warnings: vec![] },
+            )
+            .expect("superseded is non-fatal zero-write");
+        let after_super = get_turn_store().get_turn(&turn_id).unwrap();
+        assert_eq!(
+            after_super.find_attempt(&attempt_id).unwrap().status,
+            AttemptStatus::Superseded
+        );
+        assert_eq!(
+            after_super.find_attempt(&attempt_id).unwrap().draft_hash,
+            original_hash
+        );
+        assert_eq!(after_super.failure_reason, None);
+        assert_eq!(after_super.conversation_id, conversation_id);
+
+        // Cleanup process store entry so other tests are not polluted.
+        let _ = get_turn_store().with_turn_mut(&turn_id, |r| {
+            r.status = TurnStatus::Failed;
+            r.failure_reason = Some("test cleanup".into());
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 

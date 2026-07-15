@@ -190,6 +190,7 @@ fn real_eval_requires_explicit_fixture_override() {
 #[test]
 fn forged_production_postprocess_claim_without_proof_is_rejected() {
     let (env, _llm, campaign_id, conversation_id, _dir) = setup(2);
+    let loop_input = Id::from_str("loop-input-1");
     let forged = WrittenProductionTurn {
         draft_text: "forged".into(),
         variant_id: Id::new(),
@@ -197,8 +198,15 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
         chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
         postprocess_proof: None,
     };
-    let err = verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &forged)
-        .expect_err("forged claim must fail closed");
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &forged,
+    )
+    .expect_err("forged claim must fail closed");
     assert!(
         err.to_string().contains("without verified proof"),
         "unexpected: {err}"
@@ -214,7 +222,7 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
         postprocess_proof: Some(ProductionPostprocessProof {
             turn_id: Id::new(),
             attempt_id: Id::new(),
-            input_node_id: Id::new(),
+            input_node_id: loop_input.clone(),
             turn_index: 1,
             variant_id: variant_id.clone(),
             draft_hash: "deadbeef".into(),
@@ -223,9 +231,15 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
             applied: false,
         }),
     };
-    let err =
-        verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &not_applied)
-            .expect_err("applied=false must fail");
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &not_applied,
+    )
+    .expect_err("applied=false must fail");
     assert!(err.to_string().contains("not applied"), "unexpected: {err}");
 
     // synthetic + proof is inconsistent
@@ -237,7 +251,7 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
         postprocess_proof: Some(ProductionPostprocessProof {
             turn_id: Id::new(),
             attempt_id: Id::new(),
-            input_node_id: Id::new(),
+            input_node_id: loop_input.clone(),
             turn_index: 1,
             variant_id,
             draft_hash: "deadbeef".into(),
@@ -246,12 +260,89 @@ fn forged_production_postprocess_claim_without_proof_is_rejected() {
             applied: true,
         }),
     };
-    let err = verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &mixed)
-        .expect_err("synthetic+proof must fail");
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &loop_input,
+        1,
+        &mixed,
+    )
+    .expect_err("synthetic+proof must fail");
     assert!(
         err.to_string().contains("synthetic_chronicle_fixture"),
         "unexpected: {err}"
     );
+    env.cleanup();
+}
+
+#[tokio::test]
+async fn malicious_writer_cannot_reuse_prior_turn_proof() {
+    let (env, _llm, campaign_id, conversation_id, _dir) = setup(4);
+    let base_ctx = WritingContext::legacy(vec![], None, conversation_id.clone());
+    let ctx = env.fill_campaign_context(base_ctx);
+
+    // Produce a legitimate proof for turn 1 / input A.
+    let mut honest = FixedProductionPostprocessWriter {
+        summary_template: "第{turn}轮：诚实摘要。".into(),
+    };
+    // Seed a user message so input_node_id is stable for turn 1.
+    let input_t1 = env
+        .conv_store
+        .append_user_message(&conversation_id, "t1 intent".into())
+        .unwrap();
+    let written_t1 = honest
+        .write_turn(&env, &ctx, 1, "t1")
+        .await
+        .expect("honest turn1");
+    let proof_t1 = written_t1
+        .postprocess_proof
+        .clone()
+        .expect("honest proof required");
+    assert_eq!(proof_t1.input_node_id, input_t1);
+    assert_eq!(proof_t1.turn_index, 1);
+
+    // Evidence loop moves to turn 2 with a different input_node_id.
+    let input_t2 = env
+        .conv_store
+        .append_user_message(&conversation_id, "t2 intent".into())
+        .unwrap();
+    assert_ne!(input_t1, input_t2);
+
+    // Malicious writer reuses the valid turn-1 proof for turn 2.
+    let malicious = WrittenProductionTurn {
+        draft_text: written_t1.draft_text.clone(),
+        variant_id: written_t1.variant_id.clone(),
+        summary_text: written_t1.summary_text.clone(),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: Some(proof_t1),
+    };
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &input_t2,
+        2,
+        &malicious,
+    )
+    .expect_err("reused prior-turn proof must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("input_node_id") || msg.contains("turn_index"),
+        "unexpected: {msg}"
+    );
+
+    // Same for mismatched turn_index even if input is forced equal (proof still carries t1).
+    let err = verify_production_postprocess_claim(
+        &env,
+        &campaign_id,
+        &conversation_id,
+        &input_t1,
+        2,
+        &malicious,
+    )
+    .expect_err("turn_index mismatch must fail");
+    assert!(err.to_string().contains("turn_index"), "unexpected: {err}");
     env.cleanup();
 }
 
