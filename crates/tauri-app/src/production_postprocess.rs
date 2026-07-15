@@ -74,6 +74,19 @@ pub enum ProductionPostprocessError {
     BatchConstruction(String),
     /// Persisting Attempt/Turn failed; must propagate.
     Storage(String),
+    /// Identity campaign/conversation does not match the stored Turn.
+    ScopeMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    /// Target attempt is missing on the Turn.
+    AttemptMissing { turn_id: String, attempt_id: String },
+    /// Failed while trying to mark the Turn Failed after another error.
+    MarkFailed {
+        original: String,
+        mark_error: String,
+    },
 }
 
 impl std::fmt::Display for ProductionPostprocessError {
@@ -84,6 +97,28 @@ impl std::fmt::Display for ProductionPostprocessError {
                 write!(f, "postprocess mutation batch construction failed: {msg}")
             }
             Self::Storage(msg) => write!(f, "postprocess storage failed: {msg}"),
+            Self::ScopeMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "postprocess scope mismatch on {field}: expected {expected}, actual {actual}"
+            ),
+            Self::AttemptMissing {
+                turn_id,
+                attempt_id,
+            } => write!(
+                f,
+                "postprocess target attempt {attempt_id} missing on turn {turn_id}"
+            ),
+            Self::MarkFailed {
+                original,
+                mark_error,
+            } => write!(
+                f,
+                "postprocess failed ({original}) and mark_failed also failed: {mark_error}"
+            ),
         }
     }
 }
@@ -135,19 +170,24 @@ impl PostprocessRunner for FixedPostprocessRunner {
 
 /// Persistence adapter for Attempt/Turn mutations (JSON TurnStore or Tauri backend router).
 pub trait TurnAttemptSink: Send + Sync {
-    fn sync_autofix(
+    /// Load the turn for identity/scope checks. None = missing.
+    fn load_turn(
         &self,
         turn_id: &Id,
-        attempt_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String>;
+
+    fn sync_autofix(
+        &self,
+        identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), String>;
 
     /// Returns Ok(true) when the attempt was current and writeback applied.
+    /// Scope and attempt presence must already be validated by the service.
     fn attach_postprocess(
         &self,
-        turn_id: &Id,
-        attempt_id: &Id,
+        identity: &PostprocessIdentity,
         batch: Option<MutationBatch>,
         derivation: DerivationComponents,
     ) -> Result<bool, String>;
@@ -161,36 +201,54 @@ pub struct JsonTurnAttemptSink<'a> {
 }
 
 impl TurnAttemptSink for JsonTurnAttemptSink<'_> {
-    fn sync_autofix(
+    fn load_turn(
         &self,
         turn_id: &Id,
-        attempt_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        Ok(self.turn_store.get_turn(turn_id))
+    }
+
+    fn sync_autofix(
+        &self,
+        identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), String> {
+        let mut found = false;
         self.turn_store
-            .with_turn_mut(turn_id, |record| {
-                if let Some(att) = record.find_attempt_mut(attempt_id) {
+            .with_turn_mut(&identity.turn_id, |record| {
+                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
                     sync_attempt_after_autofix(att, final_text, report);
+                    found = true;
                 }
                 record.touch();
             })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if !found {
+            return Err(format!(
+                "attempt {} missing on turn {}",
+                identity.attempt_id, identity.turn_id
+            ));
+        }
+        Ok(())
     }
 
     fn attach_postprocess(
         &self,
-        turn_id: &Id,
-        attempt_id: &Id,
+        identity: &PostprocessIdentity,
         batch: Option<MutationBatch>,
         derivation: DerivationComponents,
     ) -> Result<bool, String> {
         self.turn_store
             .mutate_if(
-                turn_id,
-                |record| is_current_attempt_ready_for_postprocess(record, attempt_id),
+                &identity.turn_id,
                 |record| {
-                    if let Some(att) = record.find_attempt_mut(attempt_id) {
+                    record.campaign_id == identity.campaign_id
+                        && record.conversation_id == identity.conversation_id
+                        && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
+                },
+                |record| {
+                    if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
                         apply_postprocess_to_attempt(att, batch, derivation);
                     }
                     record.status = TurnStatus::AwaitingAcceptance;
@@ -209,6 +267,34 @@ impl TurnAttemptSink for JsonTurnAttemptSink<'_> {
             })
             .map_err(|e| e.to_string())
     }
+}
+
+/// Validate campaign/conversation identity against the durable Turn record.
+pub fn validate_identity_scope(
+    record: &storyforge_domain::turn::TurnRecord,
+    identity: &PostprocessIdentity,
+) -> Result<(), ProductionPostprocessError> {
+    if record.campaign_id != identity.campaign_id {
+        return Err(ProductionPostprocessError::ScopeMismatch {
+            field: "campaign_id",
+            expected: identity.campaign_id.to_string(),
+            actual: record.campaign_id.to_string(),
+        });
+    }
+    if record.conversation_id != identity.conversation_id {
+        return Err(ProductionPostprocessError::ScopeMismatch {
+            field: "conversation_id",
+            expected: identity.conversation_id.to_string(),
+            actual: record.conversation_id.to_string(),
+        });
+    }
+    if record.find_attempt(&identity.attempt_id).is_none() {
+        return Err(ProductionPostprocessError::AttemptMissing {
+            turn_id: identity.turn_id.to_string(),
+            attempt_id: identity.attempt_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Snapshot required to build Chronicle A / knowledge / task mutations.
@@ -260,13 +346,29 @@ impl<'a> ProductionPostprocessService<'a> {
     /// Storage failure must propagate so callers never return fixed text with a stale hash.
     pub fn sync_autofix_attempt(
         &self,
-        turn_id: &Id,
-        attempt_id: &Id,
+        identity: &PostprocessIdentity,
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), ProductionPostprocessError> {
+        let record = self
+            .sink
+            .load_turn(&identity.turn_id)
+            .map_err(ProductionPostprocessError::AutofixSync)?
+            .ok_or_else(|| {
+                ProductionPostprocessError::AutofixSync(format!(
+                    "TurnRecord {} 不存在",
+                    identity.turn_id
+                ))
+            })?;
+        validate_identity_scope(&record, identity).map_err(|e| match e {
+            ProductionPostprocessError::ScopeMismatch { .. }
+            | ProductionPostprocessError::AttemptMissing { .. } => {
+                ProductionPostprocessError::AutofixSync(e.to_string())
+            }
+            other => other,
+        })?;
         self.sink
-            .sync_autofix(turn_id, attempt_id, final_text, report)
+            .sync_autofix(identity, final_text, report)
             .map_err(ProductionPostprocessError::AutofixSync)
     }
 
@@ -335,17 +437,48 @@ impl<'a> ProductionPostprocessService<'a> {
         present_chars: &[String],
         cancel: &watch::Receiver<bool>,
     ) -> Result<ProductionPostprocessResult, ProductionPostprocessError> {
-        let derivation = Self::derive_components(&outcome);
-        let summary_text = outcome.as_ref().and_then(|o| o.summary.clone());
-
+        // Cancel first: never build or attach mutation candidates after cancellation.
         if *cancel.borrow() {
             return Ok(ProductionPostprocessResult {
                 applied: false,
                 skipped_reason: Some("cancelled".into()),
-                derivation,
-                summary_text,
+                derivation: DerivationComponents {
+                    summary_derivation: DerivationStatus::Disabled,
+                    state_derivation: DerivationStatus::Disabled,
+                },
+                summary_text: None,
                 batch: None,
-                outcome,
+                outcome: None,
+            });
+        }
+
+        let record = self
+            .sink
+            .load_turn(&identity.turn_id)
+            .map_err(ProductionPostprocessError::Storage)?
+            .ok_or_else(|| {
+                ProductionPostprocessError::Storage(format!(
+                    "TurnRecord {} 不存在",
+                    identity.turn_id
+                ))
+            })?;
+        validate_identity_scope(&record, identity)?;
+
+        let derivation = Self::derive_components(&outcome);
+        let summary_text = outcome.as_ref().and_then(|o| o.summary.clone());
+
+        // Re-check cancel after potentially slow batch construction inputs are ready.
+        if *cancel.borrow() {
+            return Ok(ProductionPostprocessResult {
+                applied: false,
+                skipped_reason: Some("cancelled".into()),
+                derivation: DerivationComponents {
+                    summary_derivation: DerivationStatus::Disabled,
+                    state_derivation: DerivationStatus::Disabled,
+                },
+                summary_text: None,
+                batch: None,
+                outcome: None,
             });
         }
 
@@ -357,14 +490,23 @@ impl<'a> ProductionPostprocessService<'a> {
             None => None,
         };
 
+        if *cancel.borrow() {
+            return Ok(ProductionPostprocessResult {
+                applied: false,
+                skipped_reason: Some("cancelled".into()),
+                derivation: DerivationComponents {
+                    summary_derivation: DerivationStatus::Disabled,
+                    state_derivation: DerivationStatus::Disabled,
+                },
+                summary_text: None,
+                batch: None,
+                outcome: None,
+            });
+        }
+
         let applied = self
             .sink
-            .attach_postprocess(
-                &identity.turn_id,
-                &identity.attempt_id,
-                batch.clone(),
-                derivation.clone(),
-            )
+            .attach_postprocess(identity, batch.clone(), derivation.clone())
             .map_err(ProductionPostprocessError::Storage)?;
 
         if applied {
@@ -382,7 +524,7 @@ impl<'a> ProductionPostprocessService<'a> {
                 skipped_reason: Some("late_or_superseded_attempt".into()),
                 derivation,
                 summary_text,
-                batch,
+                batch: None,
                 outcome,
             })
         }
@@ -398,12 +540,7 @@ impl<'a> ProductionPostprocessService<'a> {
         if sync_autofix
             && let (Some(identity), Some(report)) = (&req.identity, req.quality_report.clone())
         {
-            self.sync_autofix_attempt(
-                &identity.turn_id,
-                &identity.attempt_id,
-                &req.final_text,
-                report,
-            )?;
+            self.sync_autofix_attempt(identity, &req.final_text, report)?;
         }
 
         if *req.cancel.borrow() {
@@ -423,6 +560,21 @@ impl<'a> ProductionPostprocessService<'a> {
         let outcome = runner
             .run(&req.final_text, &req.present_chars, req.cancel.clone())
             .await;
+
+        // Cancel can land while the runner is finishing; discard outcome writeback.
+        if *req.cancel.borrow() {
+            return Ok(ProductionPostprocessResult {
+                applied: false,
+                skipped_reason: Some("cancelled".into()),
+                derivation: DerivationComponents {
+                    summary_derivation: DerivationStatus::Disabled,
+                    state_derivation: DerivationStatus::Disabled,
+                },
+                summary_text: None,
+                batch: None,
+                outcome: None,
+            });
+        }
 
         let Some(identity) = &req.identity else {
             return Ok(ProductionPostprocessResult {
@@ -447,6 +599,21 @@ impl<'a> ProductionPostprocessService<'a> {
         self.sink
             .mark_failed(turn_id, reason.into())
             .map_err(ProductionPostprocessError::Storage)
+    }
+
+    /// Best-effort fail-closed helper for adapters: try mark_failed and combine errors.
+    pub fn fail_turn_or_combine(
+        &self,
+        turn_id: &Id,
+        original: ProductionPostprocessError,
+    ) -> ProductionPostprocessError {
+        match self.mark_turn_failed(turn_id, original.to_string()) {
+            Ok(()) => original,
+            Err(mark_error) => ProductionPostprocessError::MarkFailed {
+                original: original.to_string(),
+                mark_error: mark_error.to_string(),
+            },
+        }
     }
 }
 
@@ -1151,8 +1318,13 @@ mod tests {
         let sink = fx.sink();
         fx.service(&sink)
             .sync_autofix_attempt(
-                &turn_id,
-                &attempt_id,
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
                 &fixed,
                 QualityReport { warnings: vec![] },
             )
@@ -1226,5 +1398,311 @@ mod tests {
             .filter(|m| matches!(m, Mutation::UpsertSummary(_)))
             .count();
         assert_eq!(summary_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_runner_discards_outcome_and_does_not_await_acceptance() {
+        let fx = Fx::new("cancel_race");
+        let draft = "取消必须丢弃已完成 runner 的 outcome。".repeat(3);
+        let (turn_id, attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let runner: Arc<dyn PostprocessRunner> = Arc::new(CancellableFixedRunner {
+            outcome: Some(sample_outcome("取消后不应写回")),
+            cancel_tx,
+        });
+        let sink = fx.sink();
+        let result = fx
+            .service(&sink)
+            .run(
+                ProductionPostprocessRequest {
+                    identity: Some(PostprocessIdentity {
+                        turn_id: turn_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        campaign_id: fx.campaign_id.clone(),
+                        conversation_id: fx.conversation_id.clone(),
+                        turn_number: 1,
+                    }),
+                    final_text: draft,
+                    quality_report: None,
+                    present_chars: vec![],
+                    cancel: cancel_rx,
+                },
+                runner,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!result.applied);
+        assert_eq!(result.skipped_reason.as_deref(), Some("cancelled"));
+        assert!(result.batch.is_none());
+        assert!(result.outcome.is_none());
+        let turn = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(turn.status, TurnStatus::DraftReady);
+        assert!(
+            turn.find_attempt(&attempt_id)
+                .unwrap()
+                .pending_state_changes
+                .is_none()
+        );
+        assert!(turn.find_attempt(&attempt_id).unwrap().derivation.is_none());
+    }
+
+    #[tokio::test]
+    async fn scope_mismatch_campaign_or_conversation_writes_nothing() {
+        let fx = Fx::new("scope");
+        let draft = "跨 scope 写回必须零 mutation。".repeat(3);
+        let (turn_id, attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let sink = fx.sink();
+        let service = fx.service(&sink);
+        let (_tx, cancel_rx) = watch::channel(false);
+
+        let bad_campaign = service
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: Id::from_str("other-campaign"),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                Some(sample_outcome("跨 campaign")),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("campaign mismatch must fail");
+        assert!(matches!(
+            bad_campaign,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+
+        let bad_conversation = service
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: Id::from_str("other-conversation"),
+                    turn_number: 1,
+                },
+                Some(sample_outcome("跨 conversation")),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("conversation mismatch must fail");
+        assert!(matches!(
+            bad_conversation,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "conversation_id",
+                ..
+            }
+        ));
+
+        // Same revision number on a different campaign must still fail by id, not revision.
+        let mut foreign = Campaign::new(Id::new(), "foreign");
+        foreign.lineage_id = Some(Id::new());
+        let foreign_id = foreign.id.clone();
+        fx.campaign_store.save_campaign(foreign).unwrap();
+        let same_rev_other_campaign = service
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: foreign_id,
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                Some(sample_outcome("revision 相同仍越界")),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("same revision different campaign must fail");
+        assert!(matches!(
+            same_rev_other_campaign,
+            ProductionPostprocessError::ScopeMismatch {
+                field: "campaign_id",
+                ..
+            }
+        ));
+
+        let turn = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(turn.status, TurnStatus::DraftReady);
+        assert!(
+            turn.find_attempt(&attempt_id)
+                .unwrap()
+                .pending_state_changes
+                .is_none()
+        );
+        assert!(fx.campaign_store.list_summaries(&fx.campaign_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_attempt_returns_error_not_ok() {
+        let fx = Fx::new("missing_attempt");
+        let draft = "缺失 Attempt 必须 Err。".repeat(3);
+        let (turn_id, _attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let sink = fx.sink();
+        let err = fx
+            .service(&sink)
+            .sync_autofix_attempt(
+                &PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: Id::from_str("ghost-attempt"),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                "fixed",
+                QualityReport { warnings: vec![] },
+            )
+            .expect_err("missing attempt must not Ok");
+        assert!(
+            matches!(err, ProductionPostprocessError::AutofixSync(ref msg) if msg.contains("missing") || msg.contains("ghost-attempt") || msg.contains("Attempt")),
+            "unexpected: {err}"
+        );
+
+        let (_tx, cancel_rx) = watch::channel(false);
+        let apply_err = fx
+            .service(&sink)
+            .apply_outcome(
+                &PostprocessIdentity {
+                    turn_id,
+                    attempt_id: Id::from_str("ghost-attempt"),
+                    campaign_id: fx.campaign_id.clone(),
+                    conversation_id: fx.conversation_id.clone(),
+                    turn_number: 1,
+                },
+                Some(sample_outcome("ghost")),
+                &[],
+                &cancel_rx,
+            )
+            .expect_err("apply missing attempt must Err");
+        assert!(matches!(
+            apply_err,
+            ProductionPostprocessError::AttemptMissing { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_attach_failure_propagates_and_fail_turn_combines_mark_errors() {
+        let fx = Fx::new("storage_fail");
+        let draft = "存储失败必须向上返回。".repeat(3);
+        let (turn_id, attempt_id, _) = fx.seed_draft_attempt(&draft);
+        let identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: fx.campaign_id.clone(),
+            conversation_id: fx.conversation_id.clone(),
+            turn_number: 1,
+        };
+        let sink = FailingAttachSink {
+            inner: fx.sink(),
+            fail_attach: true,
+            fail_mark: false,
+        };
+        let service = ProductionPostprocessService::new_json(&fx.campaign_store, &sink);
+        let (_tx, cancel_rx) = watch::channel(false);
+        let err = service
+            .apply_outcome(&identity, Some(sample_outcome("存储失败")), &[], &cancel_rx)
+            .expect_err("attach storage failure must propagate");
+        assert!(matches!(err, ProductionPostprocessError::Storage(_)));
+
+        // mark_failed success path after storage failure.
+        let sink_ok_mark = FailingAttachSink {
+            inner: fx.sink(),
+            fail_attach: true,
+            fail_mark: false,
+        };
+        let service_ok = ProductionPostprocessService::new_json(&fx.campaign_store, &sink_ok_mark);
+        let combined = service_ok.fail_turn_or_combine(
+            &turn_id,
+            ProductionPostprocessError::Storage("attach boom".into()),
+        );
+        assert!(matches!(combined, ProductionPostprocessError::Storage(_)));
+        assert_eq!(
+            fx.turn_store.get_turn(&turn_id).unwrap().status,
+            TurnStatus::Failed
+        );
+
+        // mark_failed itself failing must combine errors, never silent Ok.
+        let sink_fail_mark = FailingAttachSink {
+            inner: fx.sink(),
+            fail_attach: true,
+            fail_mark: true,
+        };
+        let service_fail =
+            ProductionPostprocessService::new_json(&fx.campaign_store, &sink_fail_mark);
+        let mark_err = service_fail.fail_turn_or_combine(
+            &turn_id,
+            ProductionPostprocessError::Storage("attach boom".into()),
+        );
+        assert!(matches!(
+            mark_err,
+            ProductionPostprocessError::MarkFailed { .. }
+        ));
+    }
+
+    /// Cancels the shared cancel channel while producing a fixed outcome.
+    struct CancellableFixedRunner {
+        outcome: Option<PostProcessOutcome>,
+        cancel_tx: watch::Sender<bool>,
+    }
+
+    #[async_trait]
+    impl PostprocessRunner for CancellableFixedRunner {
+        async fn run(
+            &self,
+            _final_text: &str,
+            _present_chars: &[String],
+            _cancel: watch::Receiver<bool>,
+        ) -> Option<PostProcessOutcome> {
+            let _ = self.cancel_tx.send(true);
+            self.outcome.clone()
+        }
+    }
+
+    struct FailingAttachSink<'a> {
+        inner: JsonTurnAttemptSink<'a>,
+        fail_attach: bool,
+        fail_mark: bool,
+    }
+
+    impl TurnAttemptSink for FailingAttachSink<'_> {
+        fn load_turn(
+            &self,
+            turn_id: &Id,
+        ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+            self.inner.load_turn(turn_id)
+        }
+
+        fn sync_autofix(
+            &self,
+            identity: &PostprocessIdentity,
+            final_text: &str,
+            report: QualityReport,
+        ) -> Result<(), String> {
+            self.inner.sync_autofix(identity, final_text, report)
+        }
+
+        fn attach_postprocess(
+            &self,
+            identity: &PostprocessIdentity,
+            batch: Option<MutationBatch>,
+            derivation: DerivationComponents,
+        ) -> Result<bool, String> {
+            if self.fail_attach {
+                return Err("injected attach storage failure".into());
+            }
+            self.inner.attach_postprocess(identity, batch, derivation)
+        }
+
+        fn mark_failed(&self, turn_id: &Id, reason: String) -> Result<(), String> {
+            if self.fail_mark {
+                return Err("injected mark_failed storage failure".into());
+            }
+            self.inner.mark_failed(turn_id, reason)
+        }
     }
 }

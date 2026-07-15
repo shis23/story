@@ -2582,7 +2582,13 @@ async fn start_writing(
             .unwrap_or_default();
         let final_text = final_text.clone();
         let var_keys = postprocess_variable_keys(&ctx);
-        let (pp_cancel_tx, pp_cancel_rx) = watch::channel(false);
+        // Postprocess must subscribe to the same cancel source that cancel_writing triggers.
+        let pp_cancel_rx = {
+            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref()
+                .map(|tx| tx.subscribe())
+                .unwrap_or_else(|| watch::channel(false).1)
+        };
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
@@ -2609,24 +2615,6 @@ async fn start_writing(
         response_text = Some(final_text.clone());
         // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash。
         // 关键同步失败必须传播：否则命令返回修复稿但 Attempt 仍指原稿 hash，Accept 会硬失败。
-        if let (Some(turn), Some(attempt_id)) = (&turn_record, &created_attempt_id) {
-            let report_for_attempt = quality_report.clone();
-            let attempt_id = attempt_id.clone();
-            let sink = BackendTurnAttemptSink;
-            if let Err(e) =
-                sink.sync_autofix(&turn.turn_id, &attempt_id, &final_text, report_for_attempt)
-            {
-                let _ =
-                    sink.mark_failed(&turn.turn_id, format!("auto-fix 后 Attempt 同步失败: {e}"));
-                clear_current_cancel(&app);
-                return Err(TauriCommandError::internal(format!(
-                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
-                )));
-            }
-        }
-
-        // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
-        let pp_event_tx = event_tx.clone();
         let pp_identity = match (&turn_record, &created_attempt_id, &ctx.campaign_id) {
             (Some(turn), Some(attempt_id), Some(campaign_id)) => {
                 Some(production_postprocess::PostprocessIdentity {
@@ -2639,9 +2627,32 @@ async fn start_writing(
             }
             _ => None,
         };
+        if let Some(identity) = &pp_identity {
+            let sink = BackendTurnAttemptSink;
+            // new_json is fine for autofix: it only uses sink, not batch_source.
+            let service = production_postprocess::ProductionPostprocessService::new_json(
+                get_campaign_store(),
+                &sink,
+            );
+            if let Err(e) =
+                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
+            {
+                let combined = service_fail_turn(&sink, &identity.turn_id, e);
+                clear_current_cancel(&app);
+                return Err(TauriCommandError::internal(format!(
+                    "auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
+                )));
+            }
+        }
+
+        // postprocess 后台跑，不阻塞 start_writing 返回；业务状态机走共享服务。
+        // Keep current_cancel alive until the background task finishes so cancel_writing
+        // can still reach postprocess after the command returns.
+        let pp_event_tx = event_tx.clone();
         let pp_runtime = ctx.campaign_runtime.clone();
+        let app_for_pp = app.clone();
         tokio::spawn(async move {
-            run_shared_postprocess_background(
+            let result = run_shared_postprocess_background(
                 pipeline,
                 ctx,
                 final_text,
@@ -2654,8 +2665,34 @@ async fn start_writing(
                 pp_runtime,
             )
             .await;
-            let _ = pp_cancel_tx;
+            if let Err(e) = result {
+                tracing::error!("start_writing background postprocess failed closed: {e}");
+            }
+            clear_current_cancel(&app_for_pp);
         });
+        // Defer clear_current_cancel to the spawn completion path below.
+        // Skip the normal clear for the success path with background postprocess.
+        match result {
+            Ok((orig_text, node_id, _provenance)) => {
+                let text = prefer_autofix_response_text(response_text, orig_text);
+                return Ok(serde_json::json!({
+                    "text": text,
+                    "conversation_id": conversation_id.to_string(),
+                    "node_id": node_id.to_string(),
+                }));
+            }
+            Err(e) => {
+                if let Some(ref turn) = turn_record {
+                    let _ = update_turn_record(&turn.turn_id, |record| {
+                        record.status = storyforge_domain::turn::TurnStatus::Failed;
+                        record.failure_reason = Some(format!("写作失败: {e}"));
+                        record.touch();
+                    });
+                }
+                clear_current_cancel(&app);
+                return Err(TauriCommandError::from(format!("写作失败: {e}")));
+            }
+        }
     }
 
     // 清理 cancel sender
@@ -2703,33 +2740,55 @@ fn sync_attempt_after_autofix(
 struct BackendTurnAttemptSink;
 
 impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
-    fn sync_autofix(
+    fn load_turn(
         &self,
         turn_id: &Id,
-        attempt_id: &Id,
+    ) -> Result<Option<storyforge_domain::turn::TurnRecord>, String> {
+        if sqlite_runtime::is_sqlite_active() {
+            sqlite_runtime::get_turn(turn_id)
+        } else {
+            Ok(get_turn_store().get_turn(turn_id))
+        }
+    }
+
+    fn sync_autofix(
+        &self,
+        identity: &production_postprocess::PostprocessIdentity,
         final_text: &str,
         report: storyforge_domain::turn::QualityReport,
     ) -> Result<(), String> {
-        update_turn_record(turn_id, |record| {
-            if let Some(att) = record.find_attempt_mut(attempt_id) {
+        let mut found = false;
+        update_turn_record(&identity.turn_id, |record| {
+            if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
                 turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
+                found = true;
             }
             record.touch();
-        })
+        })?;
+        if !found {
+            return Err(format!(
+                "attempt {} missing on turn {}",
+                identity.attempt_id, identity.turn_id
+            ));
+        }
+        Ok(())
     }
 
     fn attach_postprocess(
         &self,
-        turn_id: &Id,
-        attempt_id: &Id,
+        identity: &production_postprocess::PostprocessIdentity,
         batch: Option<storyforge_domain::turn::MutationBatch>,
         derivation: storyforge_domain::turn::DerivationComponents,
     ) -> Result<bool, String> {
         update_turn_record_if(
-            turn_id,
-            |record| is_current_attempt_ready_for_postprocess(record, attempt_id),
+            &identity.turn_id,
             |record| {
-                if let Some(att) = record.find_attempt_mut(attempt_id) {
+                record.campaign_id == identity.campaign_id
+                    && record.conversation_id == identity.conversation_id
+                    && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
+            },
+            |record| {
+                if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
                     turn_lifecycle::apply_postprocess_to_attempt(att, batch, derivation);
                 }
                 record.status = storyforge_domain::turn::TurnStatus::AwaitingAcceptance;
@@ -2749,8 +2808,12 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
 
 /// Shared production postprocess entry used by start_writing (spawned) and regenerate (awaited).
 ///
-/// Runs Summarizer/PostProcessor via pipeline (command-owned orchestration), then attaches
-/// results through ProductionPostprocessService so Attempt/Chronicle/guards stay shared.
+/// Runner orchestration still uses `PipelineOrchestrator::run_postprocess` at the command
+/// layer. Outcome writeback / guards / Chronicle candidates are owned by
+/// `ProductionPostprocessService`.
+///
+/// Returns `Ok(applied)` or `Err` for critical consistency failures that callers must
+/// surface (regenerate) / fail-closed (background start_writing).
 #[allow(clippy::too_many_arguments)]
 async fn run_shared_postprocess_background(
     pipeline: PipelineOrchestrator,
@@ -2763,12 +2826,12 @@ async fn run_shared_postprocess_background(
     cancel: watch::Receiver<bool>,
     identity: Option<production_postprocess::PostprocessIdentity>,
     runtime: Option<std::sync::Arc<CampaignRuntimeContext>>,
-) {
-    use production_postprocess::ProductionPostprocessService;
+) -> Result<bool, production_postprocess::ProductionPostprocessError> {
+    use production_postprocess::{ProductionPostprocessError, ProductionPostprocessService};
 
     if *cancel.borrow() {
         tracing::warn!("Phase A: postprocess 写回跳过——cancelled");
-        return;
+        return Ok(false);
     }
 
     let outcome = pipeline
@@ -2784,13 +2847,18 @@ async fn run_shared_postprocess_background(
         )
         .await;
 
+    if *cancel.borrow() {
+        tracing::warn!("Phase A: postprocess 写回跳过——cancelled after runner");
+        return Ok(false);
+    }
+
     let sink = BackendTurnAttemptSink;
     let Some(identity) = identity else {
         // 非 Campaign 路径：保持旧行为（直接写 store）
         if let Some(outcome) = outcome {
             persist_postprocess_outcome_async(&writing_ctx, outcome, present_chars).await;
         }
-        return;
+        return Ok(false);
     };
 
     let result = if sqlite_runtime::is_sqlite_active() {
@@ -2800,12 +2868,11 @@ async fn run_shared_postprocess_background(
                 service.apply_outcome(&identity, outcome, &present_chars, &cancel)
             }
             None => {
-                let _ = sink.mark_failed(
-                    &identity.turn_id,
+                let err = ProductionPostprocessError::BatchConstruction(
                     "sqlite postprocess has no CampaignRuntimeContext; refusing JSON fallback"
                         .into(),
                 );
-                return;
+                return Err(service_fail_turn(&sink, &identity.turn_id, err));
             }
         }
     } else {
@@ -2814,16 +2881,59 @@ async fn run_shared_postprocess_background(
     };
 
     match result {
-        Ok(result) if result.applied => {}
+        Ok(result) if result.applied => {
+            let (knowledge_count, variable_count, task_count) = result
+                .outcome
+                .as_ref()
+                .and_then(|o| o.post_process.as_ref())
+                .map(|pp| {
+                    (
+                        pp.knowledge_updates.len(),
+                        pp.variable_updates.len(),
+                        pp.task_updates.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            let _ = event_tx.send(PipelineEvent::PostProcessDone {
+                knowledge_count,
+                variable_count,
+                task_count,
+            });
+            Ok(true)
+        }
         Ok(result) => {
             if let Some(reason) = result.skipped_reason.as_deref() {
                 tracing::warn!("Phase A: postprocess 写回跳过——{reason}");
+                if reason == "cancelled" {
+                    let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                        reason: "postprocess cancelled".into(),
+                    });
+                }
             }
+            Ok(false)
         }
         Err(e) => {
             tracing::error!("Phase A: postprocess 失败: {e}");
-            let _ = sink.mark_failed(&identity.turn_id, e.to_string());
+            let combined = service_fail_turn(&sink, &identity.turn_id, e);
+            let _ = event_tx.send(PipelineEvent::PostProcessFailed {
+                reason: combined.to_string(),
+            });
+            Err(combined)
         }
+    }
+}
+
+fn service_fail_turn(
+    sink: &BackendTurnAttemptSink,
+    turn_id: &Id,
+    original: production_postprocess::ProductionPostprocessError,
+) -> production_postprocess::ProductionPostprocessError {
+    match sink.mark_failed(turn_id, original.to_string()) {
+        Ok(()) => original,
+        Err(mark_error) => production_postprocess::ProductionPostprocessError::MarkFailed {
+            original: original.to_string(),
+            mark_error,
+        },
     }
 }
 
@@ -5147,7 +5257,13 @@ async fn regenerate(
                 .unwrap_or_default(),
             postprocess_variable_keys(&ctx),
         );
-        let (_pp_tx, pp_rx) = watch::channel(false);
+        // Postprocess + autofix share the cancel_writing source.
+        let pp_rx = {
+            let slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
+            slot.as_ref()
+                .map(|tx| tx.subscribe())
+                .unwrap_or_else(|| watch::channel(false).1)
+        };
         // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
@@ -5182,28 +5298,6 @@ async fn regenerate(
             }
             None => None,
         };
-        if let (Some(turn), Some(att_id)) = (
-            active_turn_after_regenerate.as_ref(),
-            regen_attempt_id.as_ref(),
-        ) {
-            let report_for_attempt = quality_report.clone();
-            let att_id = att_id.clone();
-            let sink = BackendTurnAttemptSink;
-            if let Err(e) =
-                sink.sync_autofix(&turn.turn_id, &att_id, &final_text, report_for_attempt)
-            {
-                let _ = sink.mark_failed(
-                    &turn.turn_id,
-                    format!("regenerate auto-fix 后 Attempt 同步失败: {e}"),
-                );
-                clear_current_cancel(&app);
-                return Err(TauriCommandError::internal(format!(
-                    "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {e}"
-                )));
-            }
-        }
-
-        // regenerate 保持原同步语义：await 共享后处理后再返回命令结果。
         let pp_identity = match (
             active_turn_after_regenerate.as_ref(),
             regen_attempt_id.as_ref(),
@@ -5220,8 +5314,26 @@ async fn regenerate(
             }
             _ => None,
         };
+        if let Some(identity) = &pp_identity {
+            let sink = BackendTurnAttemptSink;
+            let service = production_postprocess::ProductionPostprocessService::new_json(
+                get_campaign_store(),
+                &sink,
+            );
+            if let Err(e) =
+                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
+            {
+                let combined = service_fail_turn(&sink, &identity.turn_id, e);
+                clear_current_cancel(&app);
+                return Err(TauriCommandError::internal(format!(
+                    "regenerate auto-fix 后 Attempt 同步失败（draft_hash/quality_report）: {combined}"
+                )));
+            }
+        }
+
+        // regenerate 保持同步语义：await 共享后处理；关键失败向上返回。
         let pp_runtime = ctx.campaign_runtime.clone();
-        run_shared_postprocess_background(
+        if let Err(e) = run_shared_postprocess_background(
             pipeline,
             ctx,
             final_text,
@@ -5233,13 +5345,16 @@ async fn regenerate(
             pp_identity,
             pp_runtime,
         )
-        .await;
+        .await
+        {
+            clear_current_cancel(&app);
+            return Err(TauriCommandError::internal(format!(
+                "regenerate postprocess 关键失败: {e}"
+            )));
+        }
     }
 
-    {
-        let mut slot = app.current_cancel.lock().unwrap_or_else(|p| p.into_inner());
-        *slot = None;
-    }
+    clear_current_cancel(&app);
 
     match result {
         Ok((orig_text, _provenance)) => Ok(prefer_autofix_response_text(response_text, orig_text)),

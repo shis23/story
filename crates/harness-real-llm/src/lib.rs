@@ -130,7 +130,7 @@ impl HarnessEnv {
     /// Apply the shared ProductionPostprocessService with a deterministic outcome.
     ///
     /// Creates a DraftReady Turn/Attempt if needed, attaches Chronicle A + candidates
-    /// via the same state machine as Tauri, and returns whether writeback applied.
+    /// via the same state machine as Tauri, and returns a verified writeback proof.
     pub async fn apply_production_postprocess(
         &self,
         ctx: &WritingContext,
@@ -138,9 +138,10 @@ impl HarnessEnv {
         draft_text: &str,
         summary_text: Option<String>,
         turn_number: u32,
-    ) -> Result<bool, String> {
+        input_node_id: Id,
+    ) -> Result<crate::production_evidence::ProductionPostprocessProof, String> {
         use storyforge_app_agent::PostProcessOutcome;
-        use storyforge_domain::turn::{QualityReport, TurnRecord, TurnStatus};
+        use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
         use storyforge_tauri_app::production_postprocess::{
             FixedPostprocessRunner, JsonTurnAttemptSink, PostprocessIdentity, PostprocessRunner,
             ProductionPostprocessRequest, ProductionPostprocessService,
@@ -166,14 +167,16 @@ impl HarnessEnv {
                     .ok_or_else(|| "campaign missing".to_string())?;
                 // Close any other active turn for this campaign first.
                 if let Some(active) = self.turn_store.get_active_turn(&campaign_id) {
-                    let _ = self.turn_store.with_turn_mut(&active.turn_id, |record| {
-                        if record.status.is_active() {
-                            record.status = TurnStatus::Failed;
-                            record.failure_reason =
-                                Some("superseded by harness production postprocess".into());
-                            record.touch();
-                        }
-                    });
+                    self.turn_store
+                        .with_turn_mut(&active.turn_id, |record| {
+                            if record.status.is_active() {
+                                record.status = TurnStatus::Failed;
+                                record.failure_reason =
+                                    Some("superseded by harness production postprocess".into());
+                                record.touch();
+                            }
+                        })
+                        .map_err(|e| format!("close prior active turn: {e}"))?;
                 }
                 let attempt = turn_lifecycle::new_draft_attempt(
                     Id::new(),
@@ -185,7 +188,7 @@ impl HarnessEnv {
                 let mut record = TurnRecord::new(
                     campaign_id.clone(),
                     ctx.conversation_id.clone(),
-                    Id::from_str("harness-input"),
+                    input_node_id,
                     camp.revision,
                 );
                 record.status = TurnStatus::DraftReady;
@@ -199,13 +202,15 @@ impl HarnessEnv {
                     turn_store: &self.turn_store,
                 };
                 let service = ProductionPostprocessService::new_json(&self.campaign_store, &sink);
+                let identity = PostprocessIdentity {
+                    turn_id: turn_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    campaign_id: campaign_id.clone(),
+                    conversation_id: ctx.conversation_id.clone(),
+                    turn_number,
+                };
                 service
-                    .sync_autofix_attempt(
-                        &turn_id,
-                        &attempt_id,
-                        draft_text,
-                        QualityReport { warnings: vec![] },
-                    )
+                    .sync_autofix_attempt(&identity, draft_text, QualityReport { warnings: vec![] })
                     .map_err(|e| e.to_string())?;
                 (turn_id, attempt_id)
             };
@@ -226,9 +231,9 @@ impl HarnessEnv {
             .run(
                 ProductionPostprocessRequest {
                     identity: Some(PostprocessIdentity {
-                        turn_id,
-                        attempt_id,
-                        campaign_id,
+                        turn_id: turn_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        campaign_id: campaign_id.clone(),
                         conversation_id: ctx.conversation_id.clone(),
                         turn_number,
                     }),
@@ -242,7 +247,60 @@ impl HarnessEnv {
             )
             .await
             .map_err(|e| e.to_string())?;
-        Ok(result.applied)
+        if !result.applied {
+            return Err(format!(
+                "production postprocess did not apply: {:?}",
+                result.skipped_reason
+            ));
+        }
+
+        // Verify durable writeback before returning a proof callers may trust.
+        let turn = self
+            .turn_store
+            .get_turn(&turn_id)
+            .ok_or_else(|| "turn missing after production postprocess".to_string())?;
+        if turn.status != TurnStatus::AwaitingAcceptance {
+            return Err(format!(
+                "turn status after postprocess is {:?}, expected AwaitingAcceptance",
+                turn.status
+            ));
+        }
+        let attempt = turn
+            .find_attempt(&attempt_id)
+            .ok_or_else(|| "attempt missing after production postprocess".to_string())?;
+        if attempt.status != AttemptStatus::AwaitingAcceptance {
+            return Err(format!(
+                "attempt status after postprocess is {:?}, expected AwaitingAcceptance",
+                attempt.status
+            ));
+        }
+        if attempt.pending_state_changes.is_none() && result.batch.is_none() {
+            // outcome may be empty, but derivation must still be recorded when applied.
+            if attempt.derivation.is_none() {
+                return Err("applied postprocess left no derivation/batch".into());
+            }
+        }
+        if result.summary_text.is_some() {
+            let has_summary = attempt
+                .pending_state_changes
+                .as_ref()
+                .map(|b| {
+                    b.mutations
+                        .iter()
+                        .any(|m| matches!(m, storyforge_domain::turn::Mutation::UpsertSummary(_)))
+                })
+                .unwrap_or(false);
+            if !has_summary {
+                return Err("summary outcome applied but UpsertSummary missing from batch".into());
+            }
+        }
+
+        Ok(crate::production_evidence::ProductionPostprocessProof {
+            turn_id,
+            attempt_id,
+            summary_text: result.summary_text,
+            applied: true,
+        })
     }
 
     /// 组装一个 campaign-mode 的 `WritingContext`（复用线上 `fill_campaign_runtime_from_store`）。

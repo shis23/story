@@ -49,10 +49,15 @@ impl ChronicleCandidateSource {
             Self::ProductionPostprocessService => "production_postprocess_service",
         }
     }
+}
 
-    fn is_production_complete(self) -> bool {
-        matches!(self, Self::ProductionPostprocessService)
-    }
+/// Verified proof that ProductionPostprocessService applied durable writeback.
+#[derive(Debug, Clone)]
+pub struct ProductionPostprocessProof {
+    pub turn_id: Id,
+    pub attempt_id: Id,
+    pub summary_text: Option<String>,
+    pub applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,9 +66,9 @@ pub struct WrittenProductionTurn {
     pub variant_id: Id,
     pub summary_text: Option<String>,
     pub chronicle_source: Option<ChronicleCandidateSource>,
-    /// When true, Turn/Attempt already prepared by ProductionPostprocessService;
-    /// evidence loop must not call prepare_awaiting_accept again.
-    pub postprocess_applied: bool,
+    /// Only set when shared service writeback was verified. Writers cannot
+    /// self-certify with a bare bool + chronicle_source pair.
+    pub postprocess_proof: Option<ProductionPostprocessProof>,
 }
 
 #[async_trait]
@@ -119,7 +124,7 @@ impl ProductionTurnWriter for PipelineProductionTurnWriter {
             variant_id,
             summary_text,
             chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
-            postprocess_applied: false,
+            postprocess_proof: None,
         })
     }
 }
@@ -154,25 +159,126 @@ impl ProductionTurnWriter for FixedProductionPostprocessWriter {
         let summary = self
             .summary_template
             .replace("{turn}", &turn_index.to_string());
-        let applied = env
+        // input node is the user message for this turn (created by the evidence loop).
+        // Fall back to a stable synthetic id only when the conversation has no user node yet.
+        let input_node_id = env
+            .conv_store
+            .get(&ctx.conversation_id)
+            .and_then(|c| {
+                c.nodes
+                    .iter()
+                    .rev()
+                    .find(|n| {
+                        n.active()
+                            .is_some_and(|v| v.role == storyforge_domain::conversation::Role::User)
+                    })
+                    .map(|n| n.id.clone())
+            })
+            .unwrap_or_else(|| Id::from_str(format!("harness-input-{turn_index}")));
+        let proof = env
             .apply_production_postprocess(
                 ctx,
                 &variant_id,
                 &draft,
                 Some(summary.clone()),
                 turn_index,
+                input_node_id,
             )
             .await?;
-        if !applied {
-            return Err("production postprocess did not apply to active attempt".into());
-        }
         Ok(WrittenProductionTurn {
             draft_text: draft,
             variant_id,
             summary_text: Some(summary),
             chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
-            postprocess_applied: true,
+            postprocess_proof: Some(proof),
         })
+    }
+}
+
+/// Verify writer-claimed production postprocess against durable store state.
+pub fn verify_production_postprocess_claim(
+    env: &HarnessEnv,
+    campaign_id: &Id,
+    conversation_id: &Id,
+    written: &WrittenProductionTurn,
+) -> Result<bool, ProductionEvidenceError> {
+    match (written.chronicle_source, written.postprocess_proof.as_ref()) {
+        (Some(ChronicleCandidateSource::ProductionPostprocessService), None) => {
+            Err(ProductionEvidenceError::InvalidConfig(
+                "production_postprocess_service claimed without verified proof".into(),
+            ))
+        }
+        (Some(ChronicleCandidateSource::ProductionPostprocessService), Some(proof)) => {
+            if !proof.applied {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof marked not applied".into(),
+                ));
+            }
+            let turn = env.turn_store.get_turn(&proof.turn_id).ok_or_else(|| {
+                ProductionEvidenceError::Store(format!(
+                    "missing turn {} for production postprocess proof",
+                    proof.turn_id
+                ))
+            })?;
+            if &turn.campaign_id != campaign_id || &turn.conversation_id != conversation_id {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof scope mismatch".into(),
+                ));
+            }
+            if turn.status != storyforge_domain::turn::TurnStatus::AwaitingAcceptance {
+                return Err(ProductionEvidenceError::InvalidConfig(format!(
+                    "turn status {:?} is not AwaitingAcceptance after production postprocess",
+                    turn.status
+                )));
+            }
+            let attempt = turn.find_attempt(&proof.attempt_id).ok_or_else(|| {
+                ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof attempt missing".into(),
+                )
+            })?;
+            if attempt.status != storyforge_domain::turn::AttemptStatus::AwaitingAcceptance {
+                return Err(ProductionEvidenceError::InvalidConfig(format!(
+                    "attempt status {:?} is not AwaitingAcceptance",
+                    attempt.status
+                )));
+            }
+            if attempt.variant_id != written.variant_id {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof variant mismatch".into(),
+                ));
+            }
+            if proof.summary_text.as_ref() != written.summary_text.as_ref() {
+                return Err(ProductionEvidenceError::InvalidConfig(
+                    "production postprocess proof summary mismatch".into(),
+                ));
+            }
+            if written.summary_text.is_some() {
+                let has_summary = attempt
+                    .pending_state_changes
+                    .as_ref()
+                    .map(|b| {
+                        b.mutations.iter().any(|m| {
+                            matches!(m, storyforge_domain::turn::Mutation::UpsertSummary(_))
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_summary {
+                    return Err(ProductionEvidenceError::InvalidConfig(
+                        "summary claimed but durable batch lacks UpsertSummary".into(),
+                    ));
+                }
+            }
+            Ok(true)
+        }
+        (Some(ChronicleCandidateSource::SyntheticChronicleFixture), Some(_)) => {
+            Err(ProductionEvidenceError::InvalidConfig(
+                "synthetic_chronicle_fixture cannot carry production postprocess proof".into(),
+            ))
+        }
+        (None, Some(_)) => Err(ProductionEvidenceError::InvalidConfig(
+            "postprocess proof present without chronicle_source".into(),
+        )),
+        _ => Ok(false),
     }
 }
 
@@ -429,7 +535,8 @@ pub async fn run_production_evidence_loop_with_hook<
     );
 
     let mut turns_accepted = 0u32;
-    let mut observed_production_postprocess_complete = false;
+    let mut production_service_turns = 0u32;
+    let mut synthetic_turns = 0u32;
     let mut observed_epochs = Vec::new();
     let mut observed_epoch_set = BTreeSet::new();
     let write_path = writer.write_path().to_string();
@@ -497,24 +604,29 @@ pub async fn run_production_evidence_loop_with_hook<
             return Err(ProductionEvidenceError::ZeroCalls { turn_index });
         }
 
-        let (chronicle_path, production_postprocess_complete) =
-            match (&written.summary_text, written.chronicle_source) {
-                (Some(_), Some(source)) => {
-                    (source.evidence_label(), source.is_production_complete())
-                }
-                (None, None) => ("none", false),
-                _ => {
-                    return Err(ProductionEvidenceError::InvalidConfig(
+        let chronicle_path = match (&written.summary_text, written.chronicle_source) {
+            (Some(_), Some(source)) => source.evidence_label(),
+            (None, None) => "none",
+            _ => {
+                return Err(ProductionEvidenceError::InvalidConfig(
                     "summary_text and chronicle_source must either both be present or both absent"
                         .into(),
                 ));
-                }
-            };
+            }
+        };
         if chronicle_path != "none" {
             observed_chronicle_path = chronicle_path.into();
         }
+        // Fail-closed verification of production postprocess claims.
+        let production_postprocess_complete =
+            verify_production_postprocess_claim(env, &campaign_id, &conversation_id, &written)?;
         if production_postprocess_complete {
-            observed_production_postprocess_complete = true;
+            production_service_turns += 1;
+        } else if matches!(
+            written.chronicle_source,
+            Some(ChronicleCandidateSource::SyntheticChronicleFixture)
+        ) {
+            synthetic_turns += 1;
         }
 
         deadline.check()?;
@@ -523,13 +635,13 @@ pub async fn run_production_evidence_loop_with_hook<
             conversation_id: conversation_id.clone(),
             variant_id: written.variant_id.clone(),
             draft_text: written.draft_text.clone(),
-            summary_text: written.summary_text,
+            summary_text: written.summary_text.clone(),
             turn_number: turn_index,
             quality_report: Some(storyforge_domain::turn::QualityReport { warnings: vec![] }),
             force_accept: false,
         };
-        // ProductionPostprocessService already attached Attempt/batch; do not re-prepare.
-        if !written.postprocess_applied {
+        // Only skip prepare when verified production proof exists.
+        if !production_postprocess_complete {
             probe.prepare_awaiting_accept_with_input_node(&accept_input, input_node_id);
         }
         deadline.check()?;
@@ -634,6 +746,9 @@ pub async fn run_production_evidence_loop_with_hook<
         elapsed_ms: deadline.started.elapsed().as_millis(),
         write_path,
         chronicle_path: observed_chronicle_path,
-        production_postprocess_complete: observed_production_postprocess_complete,
+        // Overall complete only when every accepted turn was verified production service.
+        production_postprocess_complete: turns_accepted > 0
+            && production_service_turns == turns_accepted
+            && synthetic_turns == 0,
     })
 }

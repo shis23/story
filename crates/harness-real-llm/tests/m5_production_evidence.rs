@@ -12,9 +12,10 @@ use harness_real_llm::evidence::{
 };
 use harness_real_llm::production_evidence::{
     ChronicleCandidateSource, FixedProductionPostprocessWriter, ProductionEvidenceConfig,
-    ProductionEvidenceStage, ProductionEvidenceStageHook, ProductionTurnWriter,
-    WrittenProductionTurn, require_explicit_fixture_path, require_fixture_file,
-    run_production_evidence_loop, run_production_evidence_loop_with_hook,
+    ProductionEvidenceStage, ProductionEvidenceStageHook, ProductionPostprocessProof,
+    ProductionTurnWriter, WrittenProductionTurn, require_explicit_fixture_path,
+    require_fixture_file, run_production_evidence_loop, run_production_evidence_loop_with_hook,
+    verify_production_postprocess_claim,
 };
 use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
@@ -100,7 +101,7 @@ impl ProductionTurnWriter for DeterministicTurnWriter {
             chronicle_source: self
                 .emit_summary
                 .then_some(ChronicleCandidateSource::SyntheticChronicleFixture),
-            postprocess_applied: false,
+            postprocess_proof: None,
         })
     }
 }
@@ -184,6 +185,63 @@ fn real_eval_requires_explicit_fixture_override() {
         path
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn forged_production_postprocess_claim_without_proof_is_rejected() {
+    let (env, _llm, campaign_id, conversation_id, _dir) = setup(2);
+    let forged = WrittenProductionTurn {
+        draft_text: "forged".into(),
+        variant_id: Id::new(),
+        summary_text: Some("forged summary".into()),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: None,
+    };
+    let err = verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &forged)
+        .expect_err("forged claim must fail closed");
+    assert!(
+        err.to_string().contains("without verified proof"),
+        "unexpected: {err}"
+    );
+
+    // postprocess_applied-style inconsistency: service source + proof.applied=false
+    let not_applied = WrittenProductionTurn {
+        draft_text: "x".into(),
+        variant_id: Id::new(),
+        summary_text: Some("s".into()),
+        chronicle_source: Some(ChronicleCandidateSource::ProductionPostprocessService),
+        postprocess_proof: Some(ProductionPostprocessProof {
+            turn_id: Id::new(),
+            attempt_id: Id::new(),
+            summary_text: Some("s".into()),
+            applied: false,
+        }),
+    };
+    let err =
+        verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &not_applied)
+            .expect_err("applied=false must fail");
+    assert!(err.to_string().contains("not applied"), "unexpected: {err}");
+
+    // synthetic + proof is inconsistent
+    let mixed = WrittenProductionTurn {
+        draft_text: "x".into(),
+        variant_id: Id::new(),
+        summary_text: Some("s".into()),
+        chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
+        postprocess_proof: Some(ProductionPostprocessProof {
+            turn_id: Id::new(),
+            attempt_id: Id::new(),
+            summary_text: Some("s".into()),
+            applied: true,
+        }),
+    };
+    let err = verify_production_postprocess_claim(&env, &campaign_id, &conversation_id, &mixed)
+        .expect_err("synthetic+proof must fail");
+    assert!(
+        err.to_string().contains("synthetic_chronicle_fixture"),
+        "unexpected: {err}"
+    );
+    env.cleanup();
 }
 
 #[tokio::test]
@@ -350,7 +408,7 @@ async fn loop_fails_closed_on_zero_llm_calls() {
                 variant_id,
                 summary_text: Some(format!("summary {turn_index}")),
                 chronicle_source: Some(ChronicleCandidateSource::SyntheticChronicleFixture),
-                postprocess_applied: false,
+                postprocess_proof: None,
             })
         }
     }
