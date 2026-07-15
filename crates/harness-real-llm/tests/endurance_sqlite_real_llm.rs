@@ -245,15 +245,17 @@ async fn run_sqlite_endurance_stage(
                 )
             }
             ScheduledAction::EarlyFactInject { probe_id } => {
+                // Keep probe id out of user intent (evidence/schedule only). Model sees a
+                // normal continuity beat; harness records probe_id in checkpoint metadata.
+                let _ = probe_id;
                 format!(
-                    "turn {turn_index}: inject early-fact probe fingerprint {}.",
-                    short_hash16(probe_id)
+                    "turn {turn_index}: advance the investigation with a concrete scene detail the party can recall later."
                 )
             }
             ScheduledAction::EarlyFactCheck { probe_id } => {
+                let _ = probe_id;
                 format!(
-                    "turn {turn_index}: check early-fact probe fingerprint {}.",
-                    short_hash16(probe_id)
+                    "turn {turn_index}: continue the scene and revisit earlier investigation details for continuity."
                 )
             }
             ScheduledAction::QualityAutofix { fixable } => {
@@ -338,13 +340,16 @@ async fn run_sqlite_endurance_stage(
                 }
                 Err(err) => {
                     let transient = err.contains("PlanParse")
+                        || err.contains("Plan 解析")
+                        || err.contains("未找到有效 Plan")
                         || err.contains("timeout")
                         || err.contains("Timeout")
                         || err.contains("520")
                         || err.contains("rate limit")
                         || err.contains("client_error")
                         || err.contains("LlmError")
-                        || err.contains("Internal");
+                        || err.contains("Internal")
+                        || err.contains("所有子 Agent 均失败");
                     eprintln!(
                         "[sqlite endurance {}] turn {turn_index} attempt {attempt}/{MAX_WRITE_ATTEMPTS} failed (transient={transient}): {err}",
                         stage.label()
