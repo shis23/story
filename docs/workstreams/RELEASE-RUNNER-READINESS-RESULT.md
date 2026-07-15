@@ -260,26 +260,33 @@ Further P0 hardening:
    `android-host-evidence` jobs call `Assert-ReleaseEvidencePackage` before
    upload. Weak schema/manual rehash-only loops are removed so mapping, sidecar
    grammar, reparse rejection, and recursive secret scan cannot be bypassed.
-3. **Static contract (job/step order + flat top-level AST):**
+3. **Static contract (controlled verifier + upload step metadata):**
    `full_offline_verifier` is decided by real YAML parse
-   (`Test-ReleaseHostEvidenceVerifierOrder` via PyYAML or Node yaml/js-yaml),
-   then PowerShell AST reachability checks (`Test-ReleaseRunInvokesCommand`).
-   Each of `windows-host-evidence` / `android-host-evidence` must have a `run`
-   step with a **top-level reachable** `CommandAst` named
-   `Assert-ReleaseEvidencePackage` **before** `actions/upload-artifact`.
+   (`Test-ReleaseHostEvidenceVerifierOrder` via PyYAML or Node yaml/js-yaml)
+   that extracts full step metadata (`shell`, `continue-on-error`, `if`,
+   `with.path`, `run`), then PowerShell AST + binding checks.
+   Each of `windows-host-evidence` / `android-host-evidence` must have a
+   controlled verifier `run` step **before** `actions/upload-artifact` with:
+   - `shell: pwsh` (or `powershell`)
+   - no `continue-on-error: true`
+   - no upload `if: always()`
+   - flat top-level reachable `Assert-ReleaseEvidencePackage` CommandAst
+   - required dot-source of `scripts/release-build/ReleaseBuild.Common.ps1`
+   - no `-AllowDryRun`
+   - `-EvidenceDir` and upload `with.path` both bound to
+     `${{ steps.evidence.outputs.dir }}`
    The verifier step is modeled as a **restricted flat script**: before the
    wanted command is reached, only simple assignments and a single-command
-   dot-source (`. path`) are allowed.
-   Accepted: bare top-level call, top-level assignment RHS
-   (`$result = Assert-...`), and production-like setup
-   (`$ErrorActionPreference=...` / `. .\scripts\release-build\...` /
-   `$evidenceDir=...` then Assert).
+   required dot-source are allowed (`Test-ReleaseRunInvokesCommand` +
+   `Test-ReleaseVerifierStepScriptContract`).
    Rejected: comment-only, `Write-Host`/string decoys, assignment-only names,
    commands inside `if`/loop/function/try-catch/nested scriptblock, any
    pre-verifier control flow (including `if ($true) { return|exit|throw }`),
-   arbitrary pre-verifier commands (e.g. `Write-Host` before Assert),
-   call-operator (`& path`) forms, multi-command pipelines, and calls after
-   top-level `return`/`exit`/`throw`. Structural YAML fallback is never PASS.
+   `shell: bash`, `continue-on-error: true`, upload `if: always()`, forged
+   common.ps1 source, path/EvidenceDir mismatch, `-AllowDryRun`, and calls
+   after top-level `return`/`exit`/`throw`. Structural YAML fallback is never
+   PASS. Production workflow text was not rewritten for this pass; it already
+   matches the controlled step shape.
 4. **Main integration + M5 fixture:** merged `main` (`12b5f44`) into this
    branch. `evidence_retention_deterministic.rs::seal_refuses_secret_payload`
    now runtime-assembles its secret-shaped payload so
@@ -287,8 +294,8 @@ Further P0 hardening:
    `ForbiddenPayload` rejection. Prior endurance/SQLite runtime-assembled
    fixtures remain intact.
 
-Full suite after this pass: **146** Pester tests passed
-(37 + 14 + 31 + 64). Windows/Android dry-runs exit 0.
+Full suite after this pass: **150** Pester tests passed
+(37 + 14 + 31 + 68). Windows/Android dry-runs exit 0.
 `Invoke-ReleaseSecretScan` OK. `git diff --check main..HEAD` clean.
 
 **Still not proven:** remote Gitea runner execution, GUI acceptance, device

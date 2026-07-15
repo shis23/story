@@ -3027,17 +3027,292 @@ function Test-ReleaseRunInvokesCommand {
     return $false
 }
 
+function Test-ReleaseVerifierStepScriptContract {
+    <#
+    .SYNOPSIS
+    Fail-closed checks for a host-evidence verifier run script beyond CommandAst reachability.
+
+    .DESCRIPTION
+    Requires a flat pwsh script that:
+      - sources scripts/release-build/ReleaseBuild.Common.ps1 via InvocationOperator Dot
+      - invokes Assert-ReleaseEvidencePackage without -AllowDryRun
+      - binds -EvidenceDir to either a literal steps.evidence.outputs.dir expression
+        or a variable previously assigned from that exact expression
+    Returns a PSCustomObject with Valid, Errors, EvidenceDirExpression.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ScriptText
+    )
+
+    $errs = New-Object System.Collections.Generic.List[string]
+    $evidenceExpr = $null
+    $requiredEvidenceLiteral = '${{ steps.evidence.outputs.dir }}'
+    $requiredDotSourceSuffix = 'scripts/release-build/ReleaseBuild.Common.ps1'
+    $wanted = 'Assert-ReleaseEvidencePackage'
+
+    if ([string]::IsNullOrWhiteSpace($ScriptText)) {
+        return [pscustomobject]@{
+            Valid = $false
+            Errors = @('verifier run script is empty')
+            EvidenceDirExpression = $null
+        }
+    }
+
+    if (-not (Test-ReleaseRunInvokesCommand -ScriptText $ScriptText -CommandName $wanted)) {
+        $errs.Add('missing top-level reachable Assert-ReleaseEvidencePackage CommandAst (flat script required)') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            Errors = @($errs)
+            EvidenceDirExpression = $null
+        }
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $ScriptText,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($null -eq $ast -or ($null -ne $parseErrors -and @($parseErrors).Count -gt 0)) {
+        $errs.Add('verifier run script failed PowerShell parse') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            Errors = @($errs)
+            EvidenceDirExpression = $null
+        }
+    }
+
+    $root = $ast.EndBlock
+    if ($null -eq $root -or $null -eq $root.Statements) {
+        $errs.Add('verifier run script has no statements') | Out-Null
+        return [pscustomobject]@{
+            Valid = $false
+            Errors = @($errs)
+            EvidenceDirExpression = $null
+        }
+    }
+
+    function Get-CommandNameFromAstLocal {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        if ($null -eq $CommandAst.CommandElements -or $CommandAst.CommandElements.Count -lt 1) {
+            return $null
+        }
+        $first = $CommandAst.CommandElements[0]
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            return [string]$first.Value
+        }
+        return $null
+    }
+
+    function Get-StringConstantValue {
+        param($Node)
+        if ($null -eq $Node) { return $null }
+        if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            return [string]$Node.Value
+        }
+        if ($Node -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            return Get-StringConstantValue -Node $Node.Expression
+        }
+        return $null
+    }
+
+    function Test-IsRequiredCommonDotSource {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        if ($CommandAst.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Dot) {
+            return $false
+        }
+        if ($null -eq $CommandAst.CommandElements -or $CommandAst.CommandElements.Count -lt 1) {
+            return $false
+        }
+        $first = $CommandAst.CommandElements[0]
+        $pathText = $null
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            $pathText = [string]$first.Value
+        } else {
+            $pathText = [string]$first.Extent.Text.Trim().Trim("'`"")
+        }
+        if ([string]::IsNullOrWhiteSpace($pathText)) {
+            return $false
+        }
+        $norm = ($pathText -replace '\\', '/').Trim()
+        return $norm.EndsWith($requiredDotSourceSuffix, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    function Get-EvidenceDirArgExpression {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        $elements = @($CommandAst.CommandElements)
+        for ($i = 0; $i -lt $elements.Count; $i++) {
+            $el = $elements[$i]
+            if ($el -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+                continue
+            }
+            $paramName = [string]$el.ParameterName
+            if (-not [string]::Equals($paramName, 'EvidenceDir', [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            if ($i + 1 -ge $elements.Count) {
+                return [pscustomobject]@{ Kind = 'missing-arg'; Expression = $null }
+            }
+            $arg = $elements[$i + 1]
+            if ($arg -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                return [pscustomobject]@{
+                    Kind = 'variable'
+                    Expression = [string]$arg.VariablePath.UserPath
+                }
+            }
+            $lit = Get-StringConstantValue -Node $arg
+            if ($null -ne $lit) {
+                return [pscustomobject]@{
+                    Kind = 'literal'
+                    Expression = $lit
+                }
+            }
+            return [pscustomobject]@{
+                Kind = 'unsupported'
+                Expression = [string]$arg.Extent.Text
+            }
+        }
+        return [pscustomobject]@{ Kind = 'missing-param'; Expression = $null }
+    }
+
+    function Test-CommandHasAllowDryRun {
+        param([Parameter(Mandatory = $true)]$CommandAst)
+        foreach ($el in @($CommandAst.CommandElements)) {
+            if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and
+                [string]::Equals([string]$el.ParameterName, 'AllowDryRun', [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    function Resolve-WantedCommandBinding {
+        param(
+            [Parameter(Mandatory = $true)]$CommandAst,
+            [Parameter(Mandatory = $true)]$VarMap
+        )
+        $localAllow = Test-CommandHasAllowDryRun -CommandAst $CommandAst
+        $argInfo = Get-EvidenceDirArgExpression -CommandAst $CommandAst
+        $expr = $null
+        $localErrs = New-Object System.Collections.Generic.List[string]
+        if ($argInfo.Kind -eq 'literal') {
+            $expr = [string]$argInfo.Expression
+        } elseif ($argInfo.Kind -eq 'variable') {
+            $vn = [string]$argInfo.Expression
+            if ($VarMap.ContainsKey($vn)) {
+                $expr = [string]$VarMap[$vn]
+            } else {
+                $localErrs.Add(("EvidenceDir variable `${0} is not bound to steps.evidence.outputs.dir before Assert" -f $vn)) | Out-Null
+            }
+        } elseif ($argInfo.Kind -eq 'missing-param' -or $argInfo.Kind -eq 'missing-arg') {
+            $localErrs.Add('Assert-ReleaseEvidencePackage is missing a bound -EvidenceDir argument') | Out-Null
+        } else {
+            $localErrs.Add('Assert-ReleaseEvidencePackage -EvidenceDir must be a constant or simple variable bound to steps.evidence.outputs.dir') | Out-Null
+        }
+        return [pscustomobject]@{
+            EvidenceDirExpression = $expr
+            AllowDryRun = $localAllow
+            Errors = @($localErrs)
+        }
+    }
+
+    $varBindings = @{}
+    $sawRequiredDotSource = $false
+    $sawWanted = $false
+    $allowDryRunSeen = $false
+
+    foreach ($stmt in @($root.Statements)) {
+        if ($null -eq $stmt) { continue }
+
+        if ($stmt -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            $leftName = $null
+            if ($stmt.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                $leftName = [string]$stmt.Left.VariablePath.UserPath
+            }
+            $rhsLit = Get-StringConstantValue -Node $stmt.Right
+            if ($null -ne $leftName -and $null -ne $rhsLit) {
+                $varBindings[$leftName] = $rhsLit
+            }
+
+            $rhs = $stmt.Right
+            if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst] -and
+                $rhs.Expression -is [System.Management.Automation.Language.PipelineAst]) {
+                $rhs = $rhs.Expression
+            }
+            if ($rhs -is [System.Management.Automation.Language.PipelineAst]) {
+                $els = @($rhs.PipelineElements)
+                if ($els.Count -eq 1 -and $els[0] -is [System.Management.Automation.Language.CommandAst]) {
+                    $cmd = $els[0]
+                    $name = Get-CommandNameFromAstLocal -CommandAst $cmd
+                    if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $sawWanted = $true
+                        $binding = Resolve-WantedCommandBinding -CommandAst $cmd -VarMap $varBindings
+                        if ($binding.AllowDryRun) { $allowDryRunSeen = $true }
+                        if ($null -ne $binding.EvidenceDirExpression) { $evidenceExpr = [string]$binding.EvidenceDirExpression }
+                        foreach ($be in @($binding.Errors)) { $errs.Add([string]$be) | Out-Null }
+                    }
+                }
+            }
+            continue
+        }
+
+        if ($stmt -is [System.Management.Automation.Language.PipelineAst]) {
+            $els = @($stmt.PipelineElements)
+            if ($els.Count -ne 1 -or $els[0] -isnot [System.Management.Automation.Language.CommandAst]) {
+                continue
+            }
+            $cmd = $els[0]
+            if (Test-IsRequiredCommonDotSource -CommandAst $cmd) {
+                $sawRequiredDotSource = $true
+                continue
+            }
+            $name = Get-CommandNameFromAstLocal -CommandAst $cmd
+            if ($null -ne $name -and [string]::Equals($name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $sawWanted = $true
+                $binding = Resolve-WantedCommandBinding -CommandAst $cmd -VarMap $varBindings
+                if ($binding.AllowDryRun) { $allowDryRunSeen = $true }
+                if ($null -ne $binding.EvidenceDirExpression) { $evidenceExpr = [string]$binding.EvidenceDirExpression }
+                foreach ($be in @($binding.Errors)) { $errs.Add([string]$be) | Out-Null }
+            }
+        }
+    }
+
+    if (-not $sawRequiredDotSource) {
+        $errs.Add('verifier run must dot-source scripts/release-build/ReleaseBuild.Common.ps1 before Assert') | Out-Null
+    }
+    if (-not $sawWanted) {
+        $errs.Add('missing Assert-ReleaseEvidencePackage CommandAst after flat-script walk') | Out-Null
+    }
+    if ($allowDryRunSeen) {
+        $errs.Add('verifier run must not pass -AllowDryRun (host evidence is not dry-run)') | Out-Null
+    }
+    if ([string]::IsNullOrWhiteSpace($evidenceExpr)) {
+        $errs.Add('verifier EvidenceDir binding could not be resolved') | Out-Null
+    } elseif (-not [string]::Equals($evidenceExpr.Trim(), $requiredEvidenceLiteral, [System.StringComparison]::Ordinal)) {
+        $errs.Add(("verifier EvidenceDir must be exactly '{0}' (got '{1}')" -f $requiredEvidenceLiteral, $evidenceExpr)) | Out-Null
+    }
+
+    return [pscustomobject]@{
+        Valid = ($errs.Count -eq 0)
+        Errors = @($errs)
+        EvidenceDirExpression = $evidenceExpr
+    }
+}
+
 function Test-ReleaseHostEvidenceVerifierOrder {
     <#
     .SYNOPSIS
     Parses release-host-evidence.yml with a real YAML engine and checks that each
-    host job has an executable Assert-ReleaseEvidencePackage run step before upload.
+    host job has a controlled Assert-ReleaseEvidencePackage run step before upload.
 
     .DESCRIPTION
     Fail-closed on missing jobs, comment-only mentions, Write-Host/assignment
-    string decoys, verifier-after-upload, or absence of a real YAML parser.
-    Structural fallback is never treated as PASS. Command recognition uses
-    PowerShell AST CommandAst, not substring matching.
+    string decoys, verifier-after-upload, wrong shell, continue-on-error, upload
+    if:always(), -AllowDryRun, forged common.ps1 source, EvidenceDir/path mismatch,
+    or absence of a real YAML parser. Structural fallback is never treated as PASS.
+    Command recognition uses PowerShell AST CommandAst with flat-script reachability
+    and full step-metadata binding.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WorkflowPath
@@ -3047,6 +3322,8 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     $jobResults = @{}
     $errors = New-Object System.Collections.Generic.List[string]
     $verifierCommand = 'Assert-ReleaseEvidencePackage'
+    $requiredEvidenceLiteral = '${{ steps.evidence.outputs.dir }}'
+    $allowedShells = @('pwsh', 'powershell')
 
     if (-not (Test-Path -LiteralPath $WorkflowPath -PathType Leaf)) {
         return [pscustomobject]@{
@@ -3061,8 +3338,8 @@ function Test-ReleaseHostEvidenceVerifierOrder {
     if (-not $pythonCmd) { $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue }
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 
-    # YAML engines only extract structured steps; command authenticity is decided
-    # later in PowerShell via AST (not substring checks inside Python/Node).
+    # YAML engines extract full step metadata; command authenticity and controlled
+    # binding are decided later in PowerShell (AST + fail-closed metadata rules).
     $pyScript = @'
 import sys, json
 try:
@@ -3089,6 +3366,44 @@ if not isinstance(jobs, dict):
     print(json.dumps({"ok": False, "engine": "pyyaml", "error": "Top-level jobs must be a mapping", "jobs": {}}))
     sys.exit(0)
 
+def step_meta(i, step):
+    uses = step.get("uses")
+    run = step.get("run")
+    shell = step.get("shell")
+    name = step.get("name")
+    if_expr = step.get("if")
+    coe = step.get("continue-on-error")
+    with_block = step.get("with")
+    with_path = ""
+    with_name = ""
+    with_retention = None
+    if isinstance(with_block, dict):
+        p = with_block.get("path")
+        n = with_block.get("name")
+        r = with_block.get("retention-days")
+        with_path = p if isinstance(p, str) else ""
+        with_name = n if isinstance(n, str) else ""
+        if isinstance(r, bool):
+            with_retention = None
+        elif isinstance(r, int):
+            with_retention = r
+        elif isinstance(r, float) and r == int(r):
+            with_retention = int(r)
+        elif isinstance(r, str) and r.strip().isdigit():
+            with_retention = int(r.strip())
+    return {
+        "index": i,
+        "name": name if isinstance(name, str) else "",
+        "uses": uses if isinstance(uses, str) else "",
+        "run": run if isinstance(run, str) else "",
+        "shell": shell if isinstance(shell, str) else "",
+        "if": if_expr if isinstance(if_expr, str) else ("" if if_expr is None else str(if_expr)),
+        "continue_on_error": True if coe is True else (False if coe is False else None),
+        "with_path": with_path,
+        "with_name": with_name,
+        "with_retention_days": with_retention,
+    }
+
 out = {}
 for name in required:
     job = jobs.get(name)
@@ -3103,13 +3418,7 @@ for name in required:
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
-        uses = step.get("uses")
-        run = step.get("run")
-        rendered.append({
-            "index": i,
-            "uses": uses if isinstance(uses, str) else "",
-            "run": run if isinstance(run, str) else ""
-        })
+        rendered.append(step_meta(i, step))
     out[name] = {"present": True, "steps": rendered, "reason": "ok"}
 
 print(json.dumps({"ok": True, "engine": "pyyaml", "error": "", "jobs": out}))
@@ -3139,6 +3448,38 @@ const jobs = data.jobs;
 if (!jobs || typeof jobs !== "object" || Array.isArray(jobs)) {
   emit({ ok: false, engine: "node-yaml", error: "Top-level jobs must be a mapping", jobs: {} });
 }
+function stepMeta(i, step) {
+  const uses = typeof step.uses === "string" ? step.uses : "";
+  const run = typeof step.run === "string" ? step.run : "";
+  const shell = typeof step.shell === "string" ? step.shell : "";
+  const name = typeof step.name === "string" ? step.name : "";
+  let ifExpr = "";
+  if (typeof step.if === "string") ifExpr = step.if;
+  else if (step.if != null) ifExpr = String(step.if);
+  let coe = null;
+  if (step["continue-on-error"] === true) coe = true;
+  else if (step["continue-on-error"] === false) coe = false;
+  let withPath = "", withName = "", withRetention = null;
+  if (step.with && typeof step.with === "object" && !Array.isArray(step.with)) {
+    if (typeof step.with.path === "string") withPath = step.with.path;
+    if (typeof step.with.name === "string") withName = step.with.name;
+    const r = step.with["retention-days"];
+    if (typeof r === "number" && Number.isFinite(r)) withRetention = Math.trunc(r);
+    else if (typeof r === "string" && /^\d+$/.test(r.trim())) withRetention = parseInt(r.trim(), 10);
+  }
+  return {
+    index: i,
+    name: name,
+    uses: uses,
+    run: run,
+    shell: shell,
+    if: ifExpr,
+    continue_on_error: coe,
+    with_path: withPath,
+    with_name: withName,
+    with_retention_days: withRetention
+  };
+}
 const required = ["windows-host-evidence", "android-host-evidence"];
 const out = {};
 for (const name of required) {
@@ -3156,9 +3497,7 @@ for (const name of required) {
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!step || typeof step !== "object") continue;
-    const uses = typeof step.uses === "string" ? step.uses : "";
-    const run = typeof step.run === "string" ? step.run : "";
-    rendered.push({ index: i, uses: uses, run: run });
+    rendered.push(stepMeta(i, step));
   }
   out[name] = { present: true, steps: rendered, reason: "ok" };
 }
@@ -3235,6 +3574,23 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
         }
     }
 
+    function Get-StepProp {
+        param($Step, [string]$Name, $Default = '')
+        if ($null -eq $Step) { return $Default }
+        if ($Step.PSObject.Properties.Name -contains $Name) {
+            return $Step.$Name
+        }
+        return $Default
+    }
+
+    function Test-IfAlwaysExpression {
+        param([AllowEmptyString()][string]$IfExpr)
+        if ([string]::IsNullOrWhiteSpace($IfExpr)) { return $false }
+        $t = $IfExpr.Trim()
+        # Fail closed on always() forms that force upload after a failed verifier.
+        return ($t -match '(?i)\balways\s*\(')
+    }
+
     foreach ($jobName in $requiredJobs) {
         $info = $null
         if ($parsed.jobs -and $parsed.jobs.PSObject.Properties.Name -contains $jobName) {
@@ -3248,6 +3604,11 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
                 VerifierIndex = -1
                 UploadIndex = -1
                 Reason = 'missing'
+                ShellOk = $false
+                ContinueOnErrorOk = $false
+                UploadIfOk = $false
+                ScriptContractOk = $false
+                PathBindOk = $false
             }
             continue
         }
@@ -3260,38 +3621,111 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
 
         $uploadIdx = -1
         $verifierIdx = -1
+        $uploadStep = $null
+        $verifierStep = $null
         foreach ($step in $steps) {
             if ($null -eq $step) { continue }
             $idx = -1
-            try { $idx = [int]$step.index } catch { $idx = -1 }
-            $uses = if ($step.PSObject.Properties.Name -contains 'uses') { [string]$step.uses } else { '' }
-            $run = if ($step.PSObject.Properties.Name -contains 'run') { [string]$step.run } else { '' }
+            try { $idx = [int](Get-StepProp -Step $step -Name 'index' -Default -1) } catch { $idx = -1 }
+            $uses = [string](Get-StepProp -Step $step -Name 'uses' -Default '')
+            $run = [string](Get-StepProp -Step $step -Name 'run' -Default '')
 
             if ($uploadIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($uses) -and $uses.StartsWith('actions/upload-artifact')) {
                 $uploadIdx = $idx
+                $uploadStep = $step
             }
             if ($verifierIdx -lt 0 -and -not [string]::IsNullOrWhiteSpace($run)) {
                 if (Test-ReleaseRunInvokesCommand -ScriptText $run -CommandName $verifierCommand) {
                     $verifierIdx = $idx
+                    $verifierStep = $step
                 }
             }
         }
 
-        $reason = 'ok'
+        $reasonParts = New-Object System.Collections.Generic.List[string]
         $has = $false
+        $shellOk = $false
+        $continueOnErrorOk = $false
+        $uploadIfOk = $false
+        $scriptContractOk = $false
+        $pathBindOk = $false
+        $scriptContract = $null
+
         if (-not $present) {
-            $reason = if ($info.reason) { [string]$info.reason } else { 'job missing or not a mapping' }
+            $reasonParts.Add($(if ($info.reason) { [string]$info.reason } else { 'job missing or not a mapping' })) | Out-Null
         } elseif ($steps.Count -eq 0 -and $info.reason -and [string]$info.reason -ne 'ok') {
-            $reason = [string]$info.reason
+            $reasonParts.Add([string]$info.reason) | Out-Null
         } elseif ($verifierIdx -lt 0) {
-            $reason = 'missing executable Assert-ReleaseEvidencePackage CommandAst invocation in run step'
+            $reasonParts.Add('missing executable Assert-ReleaseEvidencePackage CommandAst invocation in run step') | Out-Null
         } elseif ($uploadIdx -lt 0) {
-            $reason = 'missing actions/upload-artifact step'
+            $reasonParts.Add('missing actions/upload-artifact step') | Out-Null
         } elseif ($verifierIdx -ge $uploadIdx) {
-            $reason = 'Assert-ReleaseEvidencePackage is not before upload-artifact'
+            $reasonParts.Add('Assert-ReleaseEvidencePackage is not before upload-artifact') | Out-Null
         } else {
-            $has = $true
+            # Controlled verifier step metadata
+            $shell = ([string](Get-StepProp -Step $verifierStep -Name 'shell' -Default '')).Trim()
+            if ($allowedShells -contains $shell) {
+                $shellOk = $true
+            } else {
+                $reasonParts.Add(("verifier step shell must be pwsh/powershell (got '{0}')" -f $shell)) | Out-Null
+            }
+
+            $coeRaw = Get-StepProp -Step $verifierStep -Name 'continue_on_error' -Default $null
+            # Absent or explicit false is OK; true fails closed (would upload after verifier failure).
+            if ($null -eq $coeRaw -or $coeRaw -eq $false -or [string]::Equals([string]$coeRaw, 'False', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $continueOnErrorOk = $true
+            } else {
+                $reasonParts.Add('verifier step must not set continue-on-error: true') | Out-Null
+            }
+
+            $vIf = [string](Get-StepProp -Step $verifierStep -Name 'if' -Default '')
+            if (Test-IfAlwaysExpression -IfExpr $vIf) {
+                # always() on verifier is odd but not the main upload bypass; still reject.
+                $reasonParts.Add('verifier step must not use if: always()') | Out-Null
+            }
+
+            $run = [string](Get-StepProp -Step $verifierStep -Name 'run' -Default '')
+            $scriptContract = Test-ReleaseVerifierStepScriptContract -ScriptText $run
+            if ($scriptContract.Valid) {
+                $scriptContractOk = $true
+            } else {
+                foreach ($se in @($scriptContract.Errors)) {
+                    $reasonParts.Add([string]$se) | Out-Null
+                }
+            }
+
+            # Controlled upload step metadata
+            $uIf = [string](Get-StepProp -Step $uploadStep -Name 'if' -Default '')
+            if (Test-IfAlwaysExpression -IfExpr $uIf) {
+                $reasonParts.Add('upload-artifact step must not use if: always() (would upload after failed verifier)') | Out-Null
+            } else {
+                $uploadIfOk = $true
+            }
+
+            $uCoe = Get-StepProp -Step $uploadStep -Name 'continue_on_error' -Default $null
+            if ($null -ne $uCoe -and ($uCoe -eq $true -or [string]::Equals([string]$uCoe, 'True', [System.StringComparison]::OrdinalIgnoreCase))) {
+                $reasonParts.Add('upload-artifact step must not set continue-on-error: true') | Out-Null
+            }
+
+            $uploadPath = [string](Get-StepProp -Step $uploadStep -Name 'with_path' -Default '')
+            if ([string]::IsNullOrWhiteSpace($uploadPath)) {
+                $reasonParts.Add('upload-artifact step missing with.path bound to steps.evidence.outputs.dir') | Out-Null
+            } elseif (-not [string]::Equals($uploadPath.Trim(), $requiredEvidenceLiteral, [System.StringComparison]::Ordinal)) {
+                $reasonParts.Add(("upload-artifact with.path must be exactly '{0}' (got '{1}')" -f $requiredEvidenceLiteral, $uploadPath)) | Out-Null
+            } elseif ($scriptContractOk -and
+                      -not [string]::IsNullOrWhiteSpace([string]$scriptContract.EvidenceDirExpression) -and
+                      [string]::Equals([string]$scriptContract.EvidenceDirExpression.Trim(), $requiredEvidenceLiteral, [System.StringComparison]::Ordinal)) {
+                $pathBindOk = $true
+            } elseif ($scriptContractOk) {
+                $reasonParts.Add('verifier EvidenceDir and upload path are not both bound to steps.evidence.outputs.dir') | Out-Null
+            }
+
+            if ($shellOk -and $continueOnErrorOk -and $uploadIfOk -and $scriptContractOk -and $pathBindOk -and $reasonParts.Count -eq 0) {
+                $has = $true
+            }
         }
+
+        $reason = if ($reasonParts.Count -eq 0) { 'ok' } else { ($reasonParts -join '; ') }
 
         $jobResults[$jobName] = [pscustomobject]@{
             Present = $present
@@ -3299,6 +3733,11 @@ emit({ ok: true, engine: "node-yaml", error: "", jobs: out });
             VerifierIndex = $verifierIdx
             UploadIndex = $uploadIdx
             Reason = $reason
+            ShellOk = $shellOk
+            ContinueOnErrorOk = $continueOnErrorOk
+            UploadIfOk = $uploadIfOk
+            ScriptContractOk = $scriptContractOk
+            PathBindOk = $pathBindOk
         }
         if (-not $has) {
             $errors.Add(("job '{0}' full offline verifier order failed: {1}" -f $jobName, $reason)) | Out-Null

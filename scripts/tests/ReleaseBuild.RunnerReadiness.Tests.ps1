@@ -1406,11 +1406,14 @@ jobs:
       - name: Offline verify Windows evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
       - name: Upload Windows evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
   android-host-evidence:
     runs-on: windows-latest
@@ -1423,7 +1426,7 @@ jobs:
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
 '@ | Set-Content -LiteralPath $wf -Encoding utf8
             $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
@@ -1451,11 +1454,14 @@ jobs:
       - name: Offline verify Windows evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
       - name: Upload Windows evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
   android-host-evidence:
     runs-on: windows-latest
@@ -1463,12 +1469,15 @@ jobs:
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
       - name: Offline verify Android evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
 '@ | Set-Content -LiteralPath $wf -Encoding utf8
             $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
             $order.Valid | Should Be $false
@@ -1494,7 +1503,7 @@ jobs:
       - name: Upload Windows evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
   android-host-evidence:
     runs-on: windows-latest
@@ -1502,11 +1511,14 @@ jobs:
       - name: Offline verify Android evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
 '@ | Set-Content -LiteralPath $wf -Encoding utf8
             $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
@@ -1534,23 +1546,29 @@ jobs:
       - name: Upload Windows evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
       - name: Offline verify Windows evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
   android-host-evidence:
     runs-on: windows-latest
     steps:
       - name: Offline verify Android evidence package (fail-closed)
         shell: pwsh
         run: |
-          Assert-ReleaseEvidencePackage -EvidenceDir x
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
       - name: Upload Android evidence
         uses: actions/upload-artifact@v4
         with:
-          path: x
+          path: ${{ steps.evidence.outputs.dir }}
           retention-days: 14
 '@ | Set-Content -LiteralPath $wf -Encoding utf8
             $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
@@ -1773,6 +1791,240 @@ jobs:
             $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
             $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
             ($order.Errors -join ' ') | Should Match 'Assert-ReleaseEvidencePackage|missing|control|reachable|executable|command'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when verifier step uses shell bash despite CommandAst-shaped run text' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-bashshell-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: bash
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+          true
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+            ($order.Errors -join ' ') | Should Match 'shell|pwsh|bash'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when verifier step sets continue-on-error true' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-coe-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+            ($order.Errors -join ' ') | Should Match 'continue-on-error'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when upload uses if always after a controlled verifier' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-ifalways-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Windows evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $true
+            ($order.Errors -join ' ') | Should Match 'always\(|if:'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when verifier allows dry-run or forges common.ps1 source or path binding' {
+        # Unit: script contract rejects AllowDryRun / wrong dotsource / wrong EvidenceDir.
+        $good = @'
+$ErrorActionPreference = 'Stop'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+$evidenceDir = '${{ steps.evidence.outputs.dir }}'
+$result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+'@
+        $cGood = Test-ReleaseVerifierStepScriptContract -ScriptText $good
+        $cGood.Valid | Should Be $true
+
+        $cDry = Test-ReleaseVerifierStepScriptContract -ScriptText @'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+Assert-ReleaseEvidencePackage -EvidenceDir '${{ steps.evidence.outputs.dir }}' -AllowDryRun
+'@
+        $cDry.Valid | Should Be $false
+        ($cDry.Errors -join ' ') | Should Match 'AllowDryRun'
+
+        $cForge = Test-ReleaseVerifierStepScriptContract -ScriptText @'
+. .\scripts\evil\Fake.Common.ps1
+Assert-ReleaseEvidencePackage -EvidenceDir '${{ steps.evidence.outputs.dir }}'
+'@
+        $cForge.Valid | Should Be $false
+        ($cForge.Errors -join ' ') | Should Match 'dot-source|ReleaseBuild\.Common\.ps1'
+
+        $cPath = Test-ReleaseVerifierStepScriptContract -ScriptText @'
+. .\scripts\release-build\ReleaseBuild.Common.ps1
+Assert-ReleaseEvidencePackage -EvidenceDir 'artifacts/other'
+'@
+        $cPath.Valid | Should Be $false
+        ($cPath.Errors -join ' ') | Should Match 'EvidenceDir|steps\.evidence\.outputs\.dir'
+
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-wf-bind-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        try {
+            $wf = Join-Path $dir 'release-host-evidence.yml'
+            @'
+name: release-host-evidence
+on: workflow_dispatch
+jobs:
+  windows-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Windows evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\evil\Fake.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ steps.evidence.outputs.dir }}
+          retention-days: 14
+  android-host-evidence:
+    runs-on: windows-latest
+    steps:
+      - name: Offline verify Android evidence package (fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $evidenceDir = '${{ steps.evidence.outputs.dir }}'
+          $result = Assert-ReleaseEvidencePackage -EvidenceDir $evidenceDir -AllowDryRun
+      - name: Upload Android evidence
+        uses: actions/upload-artifact@v4
+        with:
+          path: some/other/path
+          retention-days: 14
+'@ | Set-Content -LiteralPath $wf -Encoding utf8
+            $order = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $wf
+            $order.Valid | Should Be $false
+            $order.jobs['windows-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            $order.jobs['android-host-evidence'].HasVerifierBeforeUpload | Should Be $false
+            ($order.Errors -join ' ') | Should Match 'dot-source|AllowDryRun|path|EvidenceDir|steps\.evidence\.outputs\.dir'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
