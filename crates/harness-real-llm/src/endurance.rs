@@ -68,9 +68,10 @@ impl EnduranceStage {
         match self {
             Self::DryRun => 0,
             Self::Canary => 30,
-            Self::Coverage => 120,
-            Self::Stability => 300,
-            Self::Full => 700,
+            // SQLite regenerate is first-draft + regenerate UoW (roughly 2x JSON write cost).
+            Self::Coverage => 220,
+            Self::Stability => 450,
+            Self::Full => 900,
         }
     }
 
@@ -674,7 +675,7 @@ pub struct EnduranceBudget {
 impl Default for EnduranceBudget {
     fn default() -> Self {
         Self {
-            max_calls: 700,
+            max_calls: 900,
             max_turns: 100,
             timeout_secs: 180,
             hard_deadline: None,
@@ -1595,7 +1596,7 @@ mod tests {
             );
         }
         assert_eq!(EnduranceStage::Full.target_turns(), 100);
-        assert_eq!(EnduranceStage::Full.max_calls(), 700);
+        assert_eq!(EnduranceStage::Full.max_calls(), 900);
         assert_eq!(EnduranceStage::Canary.target_turns(), 3);
         assert_eq!(EnduranceStage::Canary.max_calls(), 30);
     }

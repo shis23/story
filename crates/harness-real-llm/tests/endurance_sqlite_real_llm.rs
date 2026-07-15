@@ -608,11 +608,19 @@ async fn endurance_sqlite_real_llm_staged() {
     let mut budget = budget;
     if let Some(cp) = resume_cp.as_ref() {
         let remaining = stage.max_calls().saturating_sub(cp.calls_used);
-        budget.max_calls = remaining.max(1);
+        // Process-local BudgetedLlmClient budget must cover remaining work plus
+        // bounded Plan-parse retries; stage accounting still uses prior+runner calls.
+        let headroom = ((stage.target_turns().saturating_sub(cp.accepted_turn_number)) as u32)
+            .saturating_mul(12)
+            .max(40);
+        budget.max_calls = remaining.saturating_add(headroom).max(1);
         eprintln!(
-            "[sqlite endurance] resume budget: prior_calls={} remaining_calls={}",
-            cp.calls_used, budget.max_calls
+            "[sqlite endurance] resume budget: prior_calls={} remaining_stage={} process_max_calls={}",
+            cp.calls_used, remaining, budget.max_calls
         );
+    } else {
+        // Prefer stage budget if env default is lower.
+        budget.max_calls = budget.max_calls.max(stage.max_calls());
     }
     let llm = BudgetedLlmClient::wrap(require_real_llm(), &budget);
 
