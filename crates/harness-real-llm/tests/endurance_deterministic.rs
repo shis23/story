@@ -345,6 +345,8 @@ fn resume_from_evidence_dir_fails_closed_on_mixed_run_ids() {
     let mut mixed = cps[1].clone();
     mixed.run_id = "run-full-00000000-0000-0000-0000-000000000099".into();
     write_checkpoint(&cp_path, &mixed).unwrap();
+    // Unsealed resume requires an integrity baseline (auditable fail-closed path).
+    harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&run_dir).unwrap();
     let err = resume_from_evidence_dir(&run_dir, Some(&run_id));
     assert!(err.is_err(), "mixed run ids must fail closed");
     let _ = std::fs::remove_dir_all(root);
@@ -392,6 +394,7 @@ fn resume_from_evidence_dir_returns_next_turn_without_replay() {
         },
     )
     .unwrap();
+    harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&run_dir).unwrap();
     let (next, cp) = resume_from_evidence_dir(&run_dir, Some(&run_id)).unwrap();
     assert_eq!(next, 8);
     assert_eq!(cp.accepted_turn_number, 7);

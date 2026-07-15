@@ -1013,26 +1013,54 @@ fn discover_repo_root() -> PathBuf {
 
 /// Fail-closed resume gate for an existing evidence directory.
 ///
-/// When a checkpoint exists, `expected_run_id` (if provided) or the checkpoint's
-/// own `run_id` must match every evidence line and the optional sealed manifest.
-/// Mixed ids, schema drift, or missing checkpoint content fail closed.
+/// **Ordering:** recursive reparse/containment checks run first (metadata only).
+/// Checkpoint JSONL bodies are opened only after the tree is proven safe.
+/// Unsealed interrupted resume additionally requires a checkpoint integrity baseline.
 pub fn resume_from_evidence_dir(
     evidence_dir: &Path,
     expected_run_id: Option<&str>,
 ) -> Result<(u32, EnduranceCheckpoint), EnduranceError> {
-    let cp = read_latest_checkpoint(&evidence_dir.join("endurance_checkpoint.jsonl")).ok_or_else(
-        || {
+    // 1) Metadata-only tree safety before any body open.
+    if let Err(e) =
+        crate::evidence_retention::walk_reject_reparse_under_run_dir_public(evidence_dir)
+    {
+        return Err(EnduranceError::InvalidConfig(format!(
+            "fail-closed resume tree safety: {e}"
+        )));
+    }
+
+    // 2) Determine expected run id without trusting external paths.
+    // If caller did not provide one, read only after tree safety; still fail closed
+    // on schema/mixed ids via load_resume_context.
+    let expected = if let Some(id) = expected_run_id {
+        id.to_string()
+    } else {
+        // Safe to open checkpoint only after tree safety.
+        let cp_path = evidence_dir.join("endurance_checkpoint.jsonl");
+        let cp = read_latest_checkpoint(&cp_path).ok_or_else(|| {
             EnduranceError::InvalidConfig(
                 "resume requested but checkpoint missing or schema-invalid".into(),
             )
-        },
-    )?;
-    let expected = expected_run_id.unwrap_or(cp.run_id.as_str());
-    match crate::evidence_retention::load_resume_context(evidence_dir, expected) {
+        })?;
+        cp.run_id
+    };
+
+    match crate::evidence_retention::load_resume_context(evidence_dir, &expected) {
         Ok(ctx) => {
+            let cp = read_latest_checkpoint(&evidence_dir.join("endurance_checkpoint.jsonl"))
+                .ok_or_else(|| {
+                    EnduranceError::InvalidConfig(
+                        "resume requested but checkpoint missing or schema-invalid".into(),
+                    )
+                })?;
             if ctx.accepted_turn_number != cp.accepted_turn_number {
                 return Err(EnduranceError::InvalidConfig(
                     "resume context accepted_turn_number disagrees with checkpoint".into(),
+                ));
+            }
+            if cp.run_id != expected {
+                return Err(EnduranceError::InvalidConfig(
+                    "checkpoint run_id does not match expected".into(),
                 ));
             }
             Ok((ctx.next_turn, cp))

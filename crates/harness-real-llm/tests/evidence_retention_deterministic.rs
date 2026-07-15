@@ -1177,3 +1177,392 @@ fn seal_and_verify_must_be_treated_as_hard_errors_in_helpers() {
     assert!(hard.contains("fail-closed"));
     assert!(!hard.to_ascii_lowercase().contains("warning"));
 }
+
+// ── P0 resume reparse ordering + archive staging + retention hard verify ──
+
+fn try_symlink_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+fn try_symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+#[test]
+fn resume_rejects_campaign_data_reparse_before_any_checkpoint_open() {
+    // Adversarial: campaign_data is a junction/symlink to an outside payload.
+    // Resume safety must reject the tree BEFORE any checkpoint body is trusted
+    // as a resume decision, and must perform zero reads of the outside payload.
+    let root = unique_dir("adv_cd");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    let outside = unique_dir("outside_campaign");
+    let probe = outside.join("OUTSIDE_SHOULD_NOT_BE_READ.bin");
+    fs::write(&probe, b"OUTSIDE_PAYLOAD_MARKER_V1").unwrap();
+    // Optional canary that would change if touched.
+    let probe_meta_before = fs::metadata(&probe).unwrap().modified().ok();
+
+    let link = run_dir.join("campaign_data");
+    let created = try_symlink_dir(&outside, &link);
+    if !created {
+        // Platform/privilege may block symlink creation. Still assert the tree
+        // safety helper rejects an explicit reparse path when present.
+        let err = assert_tree_safe_for_resume(&run_dir, &test_policy());
+        // Without a reparse, fixture tree should currently pass; the important
+        // branch is exercised when creation succeeds.
+        let _ = err;
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        return;
+    }
+
+    // Resume entrypoints must fail closed on reparse under the run tree.
+    let err = resolve_resume_run_dir(&run_dir, &test_policy()).unwrap_err();
+    assert!(
+        matches!(err, EvidenceRetentionError::ReparsePoint { .. }),
+        "resolve_resume_run_dir must reject campaign_data reparse first: {err}"
+    );
+    let err = assert_tree_safe_for_resume(&run_dir, &test_policy()).unwrap_err();
+    assert!(
+        matches!(err, EvidenceRetentionError::ReparsePoint { .. }),
+        "tree safety must reject reparse before checkpoint consumption: {err}"
+    );
+    let err = harness_real_llm::endurance::resume_from_evidence_dir(&run_dir, Some(&run_id));
+    assert!(
+        err.is_err(),
+        "resume_from_evidence_dir must fail closed on reparse"
+    );
+
+    // Outside payload must remain unread/unmodified (best-effort mtime check).
+    let probe_meta_after = fs::metadata(&probe).unwrap().modified().ok();
+    assert_eq!(
+        probe_meta_before, probe_meta_after,
+        "outside campaign_data payload must not be touched"
+    );
+    // And never opened as text by our helpers (content still intact).
+    let body = fs::read(&probe).unwrap();
+    assert_eq!(body, b"OUTSIDE_PAYLOAD_MARKER_V1");
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[test]
+fn resume_rejects_checkpoint_symlink_before_open() {
+    let root = unique_dir("adv_cp");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    let outside = unique_dir("outside_cp");
+    let outside_cp = outside.join("endurance_checkpoint.jsonl");
+    fs::write(
+        &outside_cp,
+        r#"{"schema_version":"endurance-checkpoint-v1","run_id":"evil","accepted_turn_number":99}"#,
+    )
+    .unwrap();
+
+    let cp_link = run_dir.join("endurance_checkpoint.jsonl");
+    // Replace real checkpoint with a symlink to outside.
+    let _ = fs::remove_file(&cp_link);
+    let created = try_symlink_file(&outside_cp, &cp_link);
+    if !created {
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        return;
+    }
+
+    let err = resolve_resume_run_dir(&run_dir, &test_policy()).unwrap_err();
+    assert!(
+        matches!(err, EvidenceRetentionError::ReparsePoint { .. }),
+        "checkpoint symlink must be rejected before open: {err}"
+    );
+    let err = harness_real_llm::endurance::resume_from_evidence_dir(&run_dir, Some(&run_id));
+    assert!(err.is_err());
+    // Outside file content must still be the adversarial marker, proving we did not
+    // rewrite it; open-before-check would still be a logic bug even if content remains.
+    let outside_body = fs::read_to_string(&outside_cp).unwrap();
+    assert!(outside_body.contains("evil"));
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[test]
+fn unsealed_interrupted_resume_requires_checkpoint_integrity_baseline() {
+    let root = unique_dir("int_base");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "full").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    // No run_manifest.json => unsealed interrupted path.
+    // Tamper checkpoint body after write: integrity baseline must catch it when present,
+    // or the API must refuse to claim auditable fail-closed resume without baseline.
+    let cp_path = run_dir.join("endurance_checkpoint.jsonl");
+    let baseline = write_checkpoint_integrity_baseline(&run_dir).expect("baseline");
+    assert!(!baseline.sha256.is_empty());
+
+    // Mutate checkpoint after baseline.
+    let mut body = fs::read_to_string(&cp_path).unwrap();
+    body.push(' ');
+    fs::write(&cp_path, body).unwrap();
+
+    let err = load_resume_context(&run_dir, &run_id).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::HashMismatch { .. }
+                | EvidenceRetentionError::CheckpointIntegrity { .. }
+                | EvidenceRetentionError::ResumeUnavailable { .. }
+        ),
+        "tampered unsealed checkpoint must fail integrity baseline: {err}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn archive_uses_staging_then_atomic_publish_and_cleans_failed_stage() {
+    let (root, run_dir, run_id, _m) = sealed_fixture("arch_stage");
+    let archive_root = validate_evidence_root(&root, &test_policy())
+        .unwrap()
+        .join("archives");
+    let archived = archive_run(&run_dir, &archive_root).expect("archive");
+    assert!(archived.exists());
+    assert!(archived.join(RUN_MANIFEST_FILE).exists());
+    // No leftover staging dirs after success.
+    let leftovers: Vec<_> = fs::read_dir(&archive_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".staging") || n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "successful archive must not leave staging dirs: {leftovers:?}"
+    );
+    // Destination name is the run id (published), not a staging name.
+    assert_eq!(
+        archived.file_name().and_then(|s| s.to_str()),
+        Some(run_id.as_str())
+    );
+
+    // Failed archive (dest already exists) must be retry-safe and not leave new staging junk.
+    let err = archive_run(&run_dir, &archive_root).unwrap_err();
+    assert!(matches!(err, EvidenceRetentionError::DuplicateRunId { .. }));
+    let leftovers: Vec<_> = fs::read_dir(&archive_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".staging") || n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed archive retry must clean staging: {leftovers:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn restore_uses_staging_then_atomic_publish() {
+    let (root, run_dir, run_id, _m) = sealed_fixture("rest_stage");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let archive_root = validated.join("archives");
+    let archived = archive_run(&run_dir, &archive_root).unwrap();
+    let restore_root = validated.join("restore");
+    let restored = restore_run(&archived, &restore_root).expect("restore");
+    assert_eq!(
+        restored.file_name().and_then(|s| s.to_str()),
+        Some(run_id.as_str())
+    );
+    let leftovers: Vec<_> = fs::read_dir(&restore_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".staging") || n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "restore staging leftovers: {leftovers:?}"
+    );
+    verify_run(&restored).expect("restored verifies");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn retention_plan_and_apply_require_full_manifest_verify() {
+    let root = unique_dir("ret_hard");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+
+    // Completed + verified candidate.
+    let id_ok = allocate_run_id(&validated, "canary").unwrap();
+    let dir_ok = prepare_run_dir(&validated, &id_ok).unwrap();
+    write_sanitized_fixture(&dir_ok, &id_ok);
+    seal_run(
+        &dir_ok,
+        SealOptions {
+            run_id: id_ok.clone(),
+            status: RunStatus::Completed,
+            stage: "canary".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 10,
+                max_turns: 1,
+                timeout_secs: 10,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+
+    // Completed-looking but hash-tampered — must NOT be selected / deleted.
+    let id_bad = allocate_run_id(&validated, "coverage").unwrap();
+    let dir_bad = prepare_run_dir(&validated, &id_bad).unwrap();
+    write_sanitized_fixture(&dir_bad, &id_bad);
+    seal_run(
+        &dir_bad,
+        SealOptions {
+            run_id: id_bad.clone(),
+            status: RunStatus::Completed,
+            stage: "coverage".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 10,
+                max_turns: 1,
+                timeout_secs: 10,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+    let mut calls = fs::read_to_string(dir_bad.join("endurance_calls.jsonl")).unwrap();
+    calls.push('x');
+    fs::write(dir_bad.join("endurance_calls.jsonl"), calls).unwrap();
+
+    // Unsealed completed-looking dir (no manifest) — must never be selected.
+    let id_unsealed = allocate_run_id(&validated, "stability").unwrap();
+    let dir_unsealed = prepare_run_dir(&validated, &id_unsealed).unwrap();
+    write_sanitized_fixture(&dir_unsealed, &id_unsealed);
+
+    // Status drift: manifest says completed, then rewritten to running without re-seal.
+    // Plan may or may not have seen it; apply must refuse if targeted.
+    let id_drift = allocate_run_id(&validated, "full").unwrap();
+    let dir_drift = prepare_run_dir(&validated, &id_drift).unwrap();
+    write_sanitized_fixture(&dir_drift, &id_drift);
+    seal_run(
+        &dir_drift,
+        SealOptions {
+            run_id: id_drift.clone(),
+            status: RunStatus::Completed,
+            stage: "full".into(),
+            model_label: "mock".into(),
+            budget: BudgetSummary {
+                max_calls: 10,
+                max_turns: 1,
+                timeout_secs: 10,
+                max_tokens: None,
+            },
+            commit: String::new(),
+            branch: String::new(),
+        },
+    )
+    .unwrap();
+    // Force status field to running in place (invalidates audit trust).
+    let mut man: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir_drift.join(RUN_MANIFEST_FILE)).unwrap())
+            .unwrap();
+    man["status"] = serde_json::Value::String("running".into());
+    fs::write(
+        dir_drift.join(RUN_MANIFEST_FILE),
+        serde_json::to_string_pretty(&man).unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_retention_cleanup(
+        &validated,
+        RetentionOptions {
+            keep: 0,
+            protect_run_ids: vec![],
+            only_statuses: vec![RunStatus::Completed, RunStatus::Archived],
+        },
+    )
+    .expect("plan");
+
+    // Only fully verified completed/archived runs may appear.
+    for t in &plan.targets {
+        let name = t.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert_ne!(name, id_bad);
+        assert_ne!(name, id_unsealed);
+        assert_ne!(name, id_drift);
+        // Each target must still fully verify at plan time.
+        let m = verify_run(t).expect("planned target must verify");
+        assert!(matches!(
+            m.status,
+            RunStatus::Completed | RunStatus::Archived
+        ));
+        assert_eq!(m.run_id, name);
+    }
+    assert!(
+        plan.targets
+            .iter()
+            .any(|t| { t.file_name().and_then(|s| s.to_str()) == Some(id_ok.as_str()) }),
+        "verified completed run should be a cleanup candidate when keep=0"
+    );
+
+    // Apply must re-verify; invent a tampered target in a forged plan and ensure refusal.
+    let forged = RetentionPlan {
+        root: validated.clone(),
+        targets: vec![dir_bad.clone()],
+    };
+    let err = apply_retention_cleanup(&validated, &forged).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvidenceRetentionError::HashMismatch { .. }
+                | EvidenceRetentionError::FileSetMismatch { .. }
+                | EvidenceRetentionError::UncontrolledPath { .. }
+                | EvidenceRetentionError::ResumeUnavailable { .. }
+                | EvidenceRetentionError::Io { .. }
+        ),
+        "apply must refuse tampered/unverified target: {err}"
+    );
+    assert!(dir_bad.exists(), "tampered target must not be deleted");
+
+    let removed = apply_retention_cleanup(&validated, &plan).expect("apply verified plan");
+    assert!(removed.iter().any(|p| p == &dir_ok));
+    assert!(dir_bad.exists());
+    assert!(dir_unsealed.exists());
+    assert!(dir_drift.exists());
+    let _ = fs::remove_dir_all(root);
+}

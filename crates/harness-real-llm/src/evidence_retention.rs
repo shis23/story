@@ -26,6 +26,9 @@ pub const RETENTION_SCHEMA_VERSION: &str = "m5-evidence-retention-v1";
 /// File name of the atomic run manifest written by [`seal_run`].
 pub const RUN_MANIFEST_FILE: &str = "run_manifest.json";
 
+/// Sidecar integrity baseline for unsealed interrupted resume checkpoints.
+pub const CHECKPOINT_INTEGRITY_FILE: &str = "checkpoint_integrity.json";
+
 /// Controlled run directory prefix (namespace).
 pub const RUN_DIR_PREFIX: &str = "run-";
 
@@ -61,6 +64,7 @@ pub enum EvidenceRetentionError {
     MissingRequiredFile { relative_path: String },
     HashMismatch { relative_path: String },
     FileSetMismatch { detail: String },
+    CheckpointIntegrity { detail: String },
     SchemaMismatch { detail: String },
     ForbiddenPayload { relative_path: String },
     InvalidRunId { detail: String },
@@ -95,6 +99,9 @@ impl std::fmt::Display for EvidenceRetentionError {
             }
             Self::FileSetMismatch { detail } => {
                 write!(f, "evidence file set mismatch: {detail}")
+            }
+            Self::CheckpointIntegrity { detail } => {
+                write!(f, "checkpoint integrity failure: {detail}")
             }
             Self::SchemaMismatch { detail } => write!(f, "schema mismatch: {detail}"),
             Self::ForbiddenPayload { relative_path } => {
@@ -384,8 +391,23 @@ pub fn validate_evidence_root(
 }
 
 /// Validate a resume `STORYFORGE_EVAL_EVIDENCE_DIR` run path:
-/// controlled dirname, parent durable-root policy, no reparse, under parent.
+/// controlled dirname, parent durable-root policy, recursive reparse rejection,
+/// and containment of every path that resume may later open.
+///
+/// **Ordering guarantee:** this never reads checkpoint/JSONL bodies. It only
+/// inspects directory entries + metadata so adversarial reparse targets under
+/// `campaign_data` cannot be opened as a side effect of validation.
 pub fn resolve_resume_run_dir(
+    run_dir: &Path,
+    policy: &EvidenceRootPolicy,
+) -> Result<PathBuf, EvidenceRetentionError> {
+    assert_tree_safe_for_resume(run_dir, policy)
+}
+
+/// Recursive resume preflight: reject reparse/junction/symlink anywhere under the
+/// run dir (including `campaign_data`) and ensure every discovered path stays
+/// inside the controlled run directory. Does **not** read file bodies.
+pub fn assert_tree_safe_for_resume(
     run_dir: &Path,
     policy: &EvidenceRootPolicy,
 ) -> Result<PathBuf, EvidenceRetentionError> {
@@ -413,18 +435,153 @@ pub fn resolve_resume_run_dir(
         })?;
     let parent_c = validate_evidence_root(parent, policy)?;
     let run_c = ensure_canonical_within(&parent_c, run_dir)?;
-    if !run_dir.join("endurance_checkpoint.jsonl").exists() {
+
+    // Required checkpoint path must exist as a real non-reparse file under run_c
+    // before any body open is allowed by callers.
+    let cp = run_c.join("endurance_checkpoint.jsonl");
+    if !cp.exists() {
         return Err(EvidenceRetentionError::ResumeUnavailable {
             detail: "resume run dir missing checkpoint".into(),
         });
     }
-    assert_not_reparse_path(&run_dir.join("endurance_checkpoint.jsonl"))?;
+    assert_not_reparse_path(&cp)?;
+    ensure_canonical_within(&run_c, &cp)?;
+
+    // Recursively reject reparse and enforce containment for ALL entries that
+    // resume may later touch (campaign_data, evidence files, nested dirs).
+    walk_reject_reparse_and_escape(&run_c, &run_c)?;
     Ok(run_c)
+}
+
+fn walk_reject_reparse_and_escape(
+    dir: &Path,
+    run_root: &Path,
+) -> Result<(), EvidenceRetentionError> {
+    assert_not_reparse_path(dir)?;
+    ensure_canonical_within(run_root, dir)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Metadata-only checks; never open file contents here.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            return Err(EvidenceRetentionError::ReparsePoint {
+                detail: "symlink entry rejected before resume open".into(),
+            });
+        }
+        assert_not_reparse_path(&path)?;
+        ensure_canonical_within(run_root, &path)?;
+        if path.is_dir() {
+            walk_reject_reparse_and_escape(&path, run_root)?;
+        }
+    }
+    Ok(())
+}
+
+/// Public wrapper for endurance resume entrypoints: recursive reparse + containment.
+pub fn walk_reject_reparse_under_run_dir_public(
+    run_dir: &Path,
+) -> Result<(), EvidenceRetentionError> {
+    if !run_dir.exists() {
+        return Err(EvidenceRetentionError::ResumeUnavailable {
+            detail: "resume run directory does not exist".into(),
+        });
+    }
+    assert_not_reparse_path(run_dir)?;
+    walk_reject_reparse_and_escape(run_dir, run_dir)
 }
 
 /// Format a seal/verify failure as a hard fail-closed error (never a warning).
 pub fn format_seal_hard_error(err: &EvidenceRetentionError) -> String {
     format!("fail-closed evidence seal/verify error: {err}")
+}
+
+/// Checkpoint integrity baseline (sha256 + size) for unsealed interrupted resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointIntegrityBaseline {
+    pub schema_version: String,
+    pub relative_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub recorded_at_unix_ms: u128,
+}
+
+/// Write a non-secret integrity baseline for `endurance_checkpoint.jsonl`.
+///
+/// Required for unsealed interrupted resume to be considered auditable/fail-closed.
+pub fn write_checkpoint_integrity_baseline(
+    run_dir: &Path,
+) -> Result<CheckpointIntegrityBaseline, EvidenceRetentionError> {
+    assert_not_reparse_path(run_dir)?;
+    let cp = run_dir.join("endurance_checkpoint.jsonl");
+    if !cp.exists() {
+        return Err(EvidenceRetentionError::MissingRequiredFile {
+            relative_path: "endurance_checkpoint.jsonl".into(),
+        });
+    }
+    assert_not_reparse_path(&cp)?;
+    ensure_canonical_within(run_dir, &cp)?;
+    let (sha, size) = sha256_file(&cp)?;
+    let baseline = CheckpointIntegrityBaseline {
+        schema_version: "checkpoint-integrity-v1".into(),
+        relative_path: "endurance_checkpoint.jsonl".into(),
+        sha256: sha,
+        size_bytes: size,
+        recorded_at_unix_ms: now_unix_ms(),
+    };
+    let serialized = serde_json::to_string_pretty(&baseline)?;
+    if contains_forbidden_evidence_payload(&serialized) {
+        return Err(EvidenceRetentionError::ForbiddenPayload {
+            relative_path: CHECKPOINT_INTEGRITY_FILE.into(),
+        });
+    }
+    storyforge_infra_util::atomic_write_json_str(
+        &run_dir.join(CHECKPOINT_INTEGRITY_FILE),
+        &serialized,
+    )?;
+    Ok(baseline)
+}
+
+/// Verify checkpoint body against an on-disk integrity baseline.
+pub fn verify_checkpoint_integrity_baseline(
+    run_dir: &Path,
+) -> Result<CheckpointIntegrityBaseline, EvidenceRetentionError> {
+    assert_not_reparse_path(run_dir)?;
+    let base_path = run_dir.join(CHECKPOINT_INTEGRITY_FILE);
+    if !base_path.exists() {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "missing checkpoint integrity baseline for unsealed resume".into(),
+        });
+    }
+    assert_not_reparse_path(&base_path)?;
+    ensure_canonical_within(run_dir, &base_path)?;
+    let raw = fs::read_to_string(&base_path)?;
+    if contains_forbidden_evidence_payload(&raw) {
+        return Err(EvidenceRetentionError::ForbiddenPayload {
+            relative_path: CHECKPOINT_INTEGRITY_FILE.into(),
+        });
+    }
+    let baseline: CheckpointIntegrityBaseline = serde_json::from_str(&raw)?;
+    if baseline.schema_version != "checkpoint-integrity-v1" {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "checkpoint integrity schema drift".into(),
+        });
+    }
+    if baseline.relative_path != "endurance_checkpoint.jsonl" {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "integrity baseline path must be endurance_checkpoint.jsonl".into(),
+        });
+    }
+    let cp = run_dir.join("endurance_checkpoint.jsonl");
+    assert_not_reparse_path(&cp)?;
+    ensure_canonical_within(run_dir, &cp)?;
+    let (sha, size) = sha256_file(&cp)?;
+    if sha != baseline.sha256 || size != baseline.size_bytes {
+        return Err(EvidenceRetentionError::HashMismatch {
+            relative_path: "endurance_checkpoint.jsonl".into(),
+        });
+    }
+    Ok(baseline)
 }
 
 /// Resolve the evidence root from optional CLI path / environment.
@@ -1052,11 +1209,28 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
     Ok(manifest)
 }
 
-/// Fail-closed resume loader: verifies seal (when present) and extracts next turn.
+/// Fail-closed resume loader: tree safety first, then seal/baseline, then checkpoint body.
 pub fn load_resume_context(
     run_dir: &Path,
     expected_run_id: &str,
 ) -> Result<ResumeContext, EvidenceRetentionError> {
+    // Metadata-only recursive reparse/containment checks before any body open.
+    // Use a permissive ephemeral policy for the parent only when the caller already
+    // handed us a concrete run dir (tests); production callers must pre-validate via
+    // resolve_resume_run_dir with their real policy.
+    let policy = EvidenceRootPolicy::for_tests(
+        run_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(run_dir)
+            .to_path_buf(),
+    );
+    // Always enforce recursive reparse rejection + containment under the run dir.
+    // Parent durable-root policy is enforced by resolve_resume_run_dir in runners.
+    assert_not_reparse_path(run_dir)?;
+    walk_reject_reparse_and_escape(run_dir, run_dir)?;
+    let _ = policy;
+
     // Prefer mismatch over invalid-format when a sealed run is present so callers
     // cannot resume a different id into an existing run directory.
     let manifest_path = run_dir.join(RUN_MANIFEST_FILE);
@@ -1074,12 +1248,16 @@ pub fn load_resume_context(
                 detail: "expected run id not controlled".into(),
             });
         }
-        // Allow resume from unsealed interrupted runs, but still check ids.
+        // Unsealed interrupted resume is only auditable with an integrity baseline.
+        verify_checkpoint_integrity_baseline(run_dir)?;
         assert_single_run_id(run_dir, expected_run_id)?;
         RunStatus::Interrupted
     };
 
+    // Only now open checkpoint body.
     let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
+    assert_not_reparse_path(&paths.checkpoint_jsonl)?;
+    ensure_canonical_within(run_dir, &paths.checkpoint_jsonl)?;
     let cp = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
         EvidenceRetentionError::ResumeUnavailable {
             detail: "missing readable checkpoint".into(),
@@ -1094,6 +1272,25 @@ pub fn load_resume_context(
         return Err(EvidenceRetentionError::SchemaMismatch {
             detail: "checkpoint schema drift on resume".into(),
         });
+    }
+    // data_dir_rel must stay a single relative segment under the run dir when present.
+    if let Some(rel) = cp.data_dir_rel.as_deref() {
+        if rel.contains("..")
+            || rel.contains(':')
+            || rel.contains('/')
+            || rel.contains('\\')
+            || rel.is_empty()
+        {
+            return Err(EvidenceRetentionError::PathTraversal {
+                detail: "checkpoint data_dir_rel must be a single relative segment".into(),
+            });
+        }
+        let data_dir = run_dir.join(rel);
+        if data_dir.exists() {
+            assert_not_reparse_path(&data_dir)?;
+            ensure_canonical_within(run_dir, &data_dir)?;
+            walk_reject_reparse_and_escape(&data_dir, run_dir)?;
+        }
     }
 
     Ok(ResumeContext {
@@ -1110,14 +1307,43 @@ pub fn load_resume_context(
 
 // ── Archive / restore ───────────────────────────────────────────────────────
 
+fn staging_dir_name(run_id: &str) -> String {
+    format!(
+        ".staging-{}-{}",
+        run_dirname_for_id(run_id),
+        uuid::Uuid::new_v4()
+    )
+}
+
+fn publish_staged_dir(stage: &Path, dest: &Path) -> Result<(), EvidenceRetentionError> {
+    // Atomic-ish publish: rename staging -> final. On failure, remove staging.
+    match fs::rename(stage, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_dir_all(stage);
+            Err(EvidenceRetentionError::Io {
+                detail: format!("atomic publish rename failed: {e}"),
+            })
+        }
+    }
+}
+
+fn cleanup_stage(stage: &Path) {
+    let _ = fs::remove_dir_all(stage);
+}
+
 /// Copy a sealed run into `archive_root/<run_id>/` and re-verify.
 ///
 /// **Audit archive only for completed (or already archived) runs.**
 /// Interrupted/running/failed statuses are refused: this pack is not a resume
 /// vehicle for live `campaign_data`. Only digest-listed relative files + the
 /// run manifest are copied — never live campaign state.
+///
+/// Uses sibling staging → verify → atomic rename; failed stages are cleaned and
+/// the operation is retry-safe when the final dest is absent.
 pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, EvidenceRetentionError> {
     assert_not_reparse_path(run_dir)?;
+    walk_reject_reparse_and_escape(run_dir, run_dir)?;
     let manifest = verify_run(run_dir)?;
     match manifest.status {
         RunStatus::Completed | RunStatus::Archived => {}
@@ -1127,10 +1353,10 @@ pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, Evide
             });
         }
     }
-    assert_not_reparse_path(archive_root)?;
     if !archive_root.exists() {
         fs::create_dir_all(archive_root)?;
     }
+    assert_not_reparse_path(archive_root)?;
     let archive_root_c = canonicalize_existing(archive_root)?;
     let dest = archive_root_c.join(run_dirname_for_id(&manifest.run_id));
     ensure_canonical_within(&archive_root_c, &dest)?;
@@ -1139,56 +1365,79 @@ pub fn archive_run(run_dir: &Path, archive_root: &Path) -> Result<PathBuf, Evide
             run_id: manifest.run_id,
         });
     }
-    fs::create_dir_all(&dest)?;
-    for digest in &manifest.files {
-        if digest.relative_path.contains("..")
-            || Path::new(&digest.relative_path).is_absolute()
-            || digest.relative_path.contains(':')
-        {
-            return Err(EvidenceRetentionError::PathTraversal {
-                detail: "archive refused invalid relative path".into(),
+
+    let stage = archive_root_c.join(staging_dir_name(&manifest.run_id));
+    ensure_canonical_within(&archive_root_c, &stage)?;
+    if let Err(e) = (|| -> Result<(), EvidenceRetentionError> {
+        fs::create_dir_all(&stage)?;
+        for digest in &manifest.files {
+            if digest.relative_path.contains("..")
+                || Path::new(&digest.relative_path).is_absolute()
+                || digest.relative_path.contains(':')
+            {
+                return Err(EvidenceRetentionError::PathTraversal {
+                    detail: "archive refused invalid relative path".into(),
+                });
+            }
+            let from = run_dir.join(
+                digest
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
+            assert_not_reparse_path(&from)?;
+            ensure_canonical_within(run_dir, &from)?;
+            let to = stage.join(
+                digest
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
+            ensure_canonical_within(&stage, &to)?;
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&from, &to)?;
+            assert_not_reparse_path(&to)?;
+        }
+        // Rewrite status to Archived without changing subject file hashes.
+        let mut archived = manifest.clone();
+        archived.status = RunStatus::Archived;
+        archived.sealed_at_unix_ms = now_unix_ms();
+        let serialized = serde_json::to_string_pretty(&archived)?;
+        if contains_forbidden_evidence_payload(&serialized) {
+            return Err(EvidenceRetentionError::ForbiddenPayload {
+                relative_path: RUN_MANIFEST_FILE.into(),
             });
         }
-        let from = run_dir.join(
-            digest
-                .relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        assert_not_reparse_path(&from)?;
-        ensure_canonical_within(run_dir, &from)?;
-        let to = dest.join(
-            digest
-                .relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        ensure_canonical_within(&dest, &to)?;
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&from, &to)?;
-        assert_not_reparse_path(&to)?;
+        storyforge_infra_util::atomic_write_json_str(&stage.join(RUN_MANIFEST_FILE), &serialized)?;
+        verify_run(&stage)?;
+        Ok(())
+    })() {
+        cleanup_stage(&stage);
+        return Err(e);
     }
-    // Rewrite status to Archived without changing subject file hashes.
-    let mut archived = manifest.clone();
-    archived.status = RunStatus::Archived;
-    archived.sealed_at_unix_ms = now_unix_ms();
-    let serialized = serde_json::to_string_pretty(&archived)?;
-    if contains_forbidden_evidence_payload(&serialized) {
-        return Err(EvidenceRetentionError::ForbiddenPayload {
-            relative_path: RUN_MANIFEST_FILE.into(),
+
+    // Re-check dest absence before publish (retry safety).
+    if dest.exists() {
+        cleanup_stage(&stage);
+        return Err(EvidenceRetentionError::DuplicateRunId {
+            run_id: manifest.run_id,
         });
     }
-    storyforge_infra_util::atomic_write_json_str(&dest.join(RUN_MANIFEST_FILE), &serialized)?;
+    publish_staged_dir(&stage, &dest)?;
     verify_run(&dest)?;
     Ok(dest)
 }
 
 /// Restore an archived run into `restore_root/<run_id>/` and re-verify hashes.
+///
+/// Sibling staging → verify → atomic rename; failures clean the stage and leave
+/// no partial published directory.
 pub fn restore_run(
     archive_dir: &Path,
     restore_root: &Path,
 ) -> Result<PathBuf, EvidenceRetentionError> {
     assert_not_reparse_path(archive_dir)?;
+    walk_reject_reparse_and_escape(archive_dir, archive_dir)?;
     let manifest = verify_run(archive_dir)?;
     if !restore_root.exists() {
         fs::create_dir_all(restore_root)?;
@@ -1202,30 +1451,46 @@ pub fn restore_run(
             run_id: manifest.run_id,
         });
     }
-    // Copy only digest subjects + manifest (never follow unexpected links).
-    fs::create_dir_all(&dest)?;
-    for digest in &manifest.files {
-        let from = archive_dir.join(
-            digest
-                .relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        assert_not_reparse_path(&from)?;
-        ensure_canonical_within(archive_dir, &from)?;
-        let to = dest.join(
-            digest
-                .relative_path
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
-        ensure_canonical_within(&dest, &to)?;
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
+
+    let stage = restore_root_c.join(staging_dir_name(&manifest.run_id));
+    ensure_canonical_within(&restore_root_c, &stage)?;
+    if let Err(e) = (|| -> Result<(), EvidenceRetentionError> {
+        fs::create_dir_all(&stage)?;
+        for digest in &manifest.files {
+            let from = archive_dir.join(
+                digest
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
+            assert_not_reparse_path(&from)?;
+            ensure_canonical_within(archive_dir, &from)?;
+            let to = stage.join(
+                digest
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
+            ensure_canonical_within(&stage, &to)?;
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&from, &to)?;
         }
-        fs::copy(&from, &to)?;
+        let man_from = archive_dir.join(RUN_MANIFEST_FILE);
+        assert_not_reparse_path(&man_from)?;
+        fs::copy(&man_from, stage.join(RUN_MANIFEST_FILE))?;
+        verify_run(&stage)?;
+        Ok(())
+    })() {
+        cleanup_stage(&stage);
+        return Err(e);
     }
-    let man_from = archive_dir.join(RUN_MANIFEST_FILE);
-    assert_not_reparse_path(&man_from)?;
-    fs::copy(&man_from, dest.join(RUN_MANIFEST_FILE))?;
+    if dest.exists() {
+        cleanup_stage(&stage);
+        return Err(EvidenceRetentionError::DuplicateRunId {
+            run_id: manifest.run_id,
+        });
+    }
+    publish_staged_dir(&stage, &dest)?;
     verify_run(&dest)?;
     Ok(dest)
 }
@@ -1309,15 +1574,20 @@ pub fn plan_retention_cleanup(
         if protect.contains(&name) {
             continue;
         }
-        // Skip active running runs always.
-        let status = match read_status_quiet(&path) {
-            Some(s) => s,
-            None => continue, // unknown/unsealed — never auto-delete
+        // Full verify is required: no manifest / hash drift / schema issues => skip.
+        let Ok(manifest) = verify_run(&path) else {
+            continue;
         };
-        if matches!(status, RunStatus::Running | RunStatus::Interrupted) {
+        if manifest.run_id != name {
             continue;
         }
-        if !only.contains(&status) {
+        if matches!(
+            manifest.status,
+            RunStatus::Running | RunStatus::Interrupted | RunStatus::Failed
+        ) {
+            continue;
+        }
+        if !only.contains(&manifest.status) {
             continue;
         }
         let modified = entry
@@ -1342,20 +1612,6 @@ pub fn plan_retention_cleanup(
         root: root_c,
         targets,
     })
-}
-
-fn read_status_quiet(run_dir: &Path) -> Option<RunStatus> {
-    let raw = fs::read_to_string(run_dir.join(RUN_MANIFEST_FILE)).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let s = v.get("status")?.as_str()?;
-    match s {
-        "running" => Some(RunStatus::Running),
-        "interrupted" => Some(RunStatus::Interrupted),
-        "completed" => Some(RunStatus::Completed),
-        "failed" => Some(RunStatus::Failed),
-        "archived" => Some(RunStatus::Archived),
-        _ => None,
-    }
 }
 
 /// Apply a retention plan with path-boundary checks. Never deletes outside root
@@ -1385,12 +1641,25 @@ pub fn apply_retention_cleanup(
         if !target.exists() {
             continue;
         }
-        // Final status guard.
-        if let Some(status) = read_status_quiet(target)
-            && matches!(status, RunStatus::Running | RunStatus::Interrupted)
-        {
+        // Full re-verify at apply time: status drift / hash tamper / missing
+        // manifest all fail closed and refuse deletion.
+        let manifest = verify_run(target)?;
+        if manifest.run_id != name {
+            return Err(EvidenceRetentionError::RunIdMismatch {
+                detail: "retention target dirname does not match manifest run_id".into(),
+            });
+        }
+        if matches!(
+            manifest.status,
+            RunStatus::Running | RunStatus::Interrupted | RunStatus::Failed
+        ) {
             return Err(EvidenceRetentionError::UncontrolledPath {
-                detail: "refusing to delete active/interrupted run".into(),
+                detail: "refusing to delete active/interrupted/failed run".into(),
+            });
+        }
+        if !matches!(manifest.status, RunStatus::Completed | RunStatus::Archived) {
+            return Err(EvidenceRetentionError::UncontrolledPath {
+                detail: "retention apply only deletes completed/archived runs".into(),
             });
         }
         fs::remove_dir_all(target)?;

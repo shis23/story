@@ -477,6 +477,12 @@ async fn run_endurance_stage(
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(&paths.checkpoint_jsonl, &cp)?;
+        // Unsealed interrupted resume is only auditable with a checkpoint integrity baseline.
+        // Refresh after every accepted turn so crash recovery can fail closed on tamper.
+        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
+            .map_err(|e| {
+                EnduranceError::InvalidConfig(format!("checkpoint integrity baseline: {e}"))
+            })?;
 
         // Early-fact check: verify reachability in store
         if let ScheduledAction::EarlyFactCheck { probe_id } = &action {
