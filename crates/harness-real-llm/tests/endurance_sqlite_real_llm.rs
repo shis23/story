@@ -19,6 +19,7 @@ use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
 use harness_real_llm::require_real_llm;
 use harness_real_llm::sqlite_endurance::SqliteHarnessEnv;
+use storyforge_app_conversation::PartialRollTarget;
 use storyforge_app_pipeline::WritingContext;
 use storyforge_infra_llm::LlmClient;
 
@@ -266,33 +267,39 @@ async fn run_sqlite_endurance_stage(
             }
         };
 
-        if matches!(
-            action,
-            ScheduledAction::RegenerateOverall
-                | ScheduledAction::RegenerateEditor
-                | ScheduledAction::RegenerateSubagent
-        ) {
-            return Err(EnduranceError::InvalidConfig(format!(
-                "sqlite endurance stage {} turn {turn_index} scheduled regenerate but \
-                 SqliteHarnessEnv regenerate path is not enabled yet; use canary or extend adapter",
-                stage.label()
-            )));
-        }
-
         llm.set_tag(format!("sqlite-turn{turn_index}"));
         llm.set_role("pipeline");
+
+        let regen_targets = match &action {
+            ScheduledAction::RegenerateOverall => Some(vec![PartialRollTarget::Director]),
+            ScheduledAction::RegenerateEditor => Some(vec![PartialRollTarget::Editor]),
+            ScheduledAction::RegenerateSubagent => {
+                Some(vec![PartialRollTarget::Subagent("pending".into())])
+            }
+            _ => None,
+        };
 
         const MAX_WRITE_ATTEMPTS: usize = 3;
         let mut written = None;
         let mut last_err = None;
         for attempt in 1..=MAX_WRITE_ATTEMPTS {
             deadline.check()?;
-            let result = match tokio::time::timeout(
-                deadline.remaining()?,
-                env.write_accept_turn(&conversation_id, &intent, turn_index, &row.row_id),
-            )
-            .await
-            {
+            let fut = async {
+                if let Some(targets) = regen_targets.clone() {
+                    env.regenerate_accept_turn(
+                        &conversation_id,
+                        &intent,
+                        turn_index,
+                        &row.row_id,
+                        targets,
+                    )
+                    .await
+                } else {
+                    env.write_accept_turn(&conversation_id, &intent, turn_index, &row.row_id)
+                        .await
+                }
+            };
+            let result = match tokio::time::timeout(deadline.remaining()?, fut).await {
                 Ok(r) => r,
                 Err(_) => {
                     let _ = flush_samples(

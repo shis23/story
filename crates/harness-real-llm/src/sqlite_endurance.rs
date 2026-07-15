@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Deserialize;
 use storyforge_app_agent::{PostProcessOutcome, ToolContext};
-use storyforge_app_conversation::ConversationStore;
-use storyforge_app_pipeline::{PipelineOrchestrator, WritingContext};
+use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
+use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::Id;
 use storyforge_domain::Source;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
@@ -21,7 +21,7 @@ use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, Wo
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_sqlite::preaccept::{
     AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyOutcome, PostprocessApplyRequest,
-    PreacceptOutboxKind,
+    PreacceptOutboxKind, RegenerateAttemptRequest,
 };
 use storyforge_infra_vector::BruteForceStore;
 use storyforge_tauri_app::campaign_store::{CampaignStore, StoredCard};
@@ -400,6 +400,218 @@ impl SqliteHarnessEnv {
 
         Ok(SqliteTurnResult {
             draft_text,
+            variant_id,
+            turn_id,
+            attempt_id,
+            input_node_id,
+            postprocess_proof: proof,
+            accept,
+            observed,
+        })
+    }
+
+    /// Production-faithful regenerate: first draft land → pipeline regenerate →
+    /// `append_regenerate_attempt` → fixed postprocess → Accept.
+    ///
+    /// `targets` maps schedule slots:
+    /// - overall → empty/Director
+    /// - editor → Editor only
+    /// - subagent → first supporting instance character id when available
+    pub async fn regenerate_accept_turn(
+        &self,
+        conversation_id: &Id,
+        intent: &str,
+        turn_index: u32,
+        row_id: &str,
+        targets: Vec<PartialRollTarget>,
+    ) -> Result<SqliteTurnResult, String> {
+        let campaign_id = self
+            .active_campaign_id()
+            .ok_or_else(|| "active campaign required".to_string())?;
+
+        // Close any leftover active turn so the new Generating turn is exclusive.
+        if let Some(active) = sqlite_runtime::get_active_turn(&campaign_id)?
+            && active.status.is_active()
+        {
+            sqlite_runtime::update_turn_record(&active.turn_id, |record| {
+                if record.status.is_active() {
+                    record.status = TurnStatus::Failed;
+                    record.failure_reason =
+                        Some("superseded by sqlite endurance regenerate setup".into());
+                    record.touch();
+                }
+            })?;
+        }
+
+        let input_node_id = self
+            .conv_store
+            .append_user_message(conversation_id, intent.to_string())
+            .map_err(|e| e.to_string())?;
+
+        let base = WritingContext::legacy(vec![], None, conversation_id.clone());
+        let ctx = self.fill_campaign_context(base)?;
+
+        let camp = sqlite_runtime::get_campaign(&campaign_id)?
+            .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
+        let turn = TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            input_node_id.clone(),
+            camp.revision,
+        );
+        let turn_id = turn.turn_id.clone();
+        sqlite_runtime::save_turn(&turn)?;
+
+        let mut pipeline = self.new_pipeline();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let (draft_text, _provisional_node, provenance) = pipeline
+            .start_writing(
+                intent.to_string(),
+                &ctx,
+                event_tx.clone(),
+                cancel_rx.clone(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let first_attempt_id = Id::new();
+        let first_land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+            campaign_id: &campaign_id,
+            conversation_id,
+            turn_id: &turn_id,
+            attempt_id: &first_attempt_id,
+            draft_text: &draft_text,
+            pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
+            provenance,
+        })?;
+        self.conv_store.invalidate();
+        let previous_variant_id = first_land.variant_id;
+
+        // Prefer a real character id for Subagent-only regenerate when possible.
+        let mut targets = targets;
+        if targets
+            .iter()
+            .any(|t| matches!(t, PartialRollTarget::Subagent(_)))
+        {
+            if let Some(inst) = sqlite_runtime::list_instances(&campaign_id)?
+                .into_iter()
+                .find(|i| !i.name.trim().is_empty())
+            {
+                // Subagent target is the character label used in Director plan tasks.
+                targets = vec![PartialRollTarget::Subagent(inst.name.clone())];
+            } else {
+                targets = vec![PartialRollTarget::Editor];
+            }
+        }
+
+        let regen_req = RegenerateRequest {
+            conversation_id: conversation_id.clone(),
+            node_id: previous_variant_id.clone(),
+            targets,
+            hint: Some(format!("endurance regenerate turn {turn_index}")),
+            seed: None,
+        };
+        let (regen_text, regen_provenance) = pipeline
+            .regenerate(regen_req, &ctx, event_tx, cancel_rx)
+            .await
+            .map_err(|e| e.to_string())?;
+        if regen_text.trim().is_empty() {
+            return Err("sqlite regenerate returned empty draft".into());
+        }
+
+        let attempt_id = Id::new();
+        let land = sqlite_runtime::append_regenerate_attempt(RegenerateAttemptRequest {
+            campaign_id: &campaign_id,
+            conversation_id,
+            turn_id: &turn_id,
+            previous_variant_id: &previous_variant_id,
+            attempt_id: &attempt_id,
+            draft_text: &regen_text,
+            pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
+            provenance: Some(regen_provenance),
+        })?;
+        self.conv_store.invalidate();
+        let variant_id = land.variant_id;
+
+        let summary_text = Some(format!(
+            "endurance regenerate turn {turn_index} summary; probes remain non-secret fingerprints only"
+        ));
+        let proof = self
+            .apply_production_postprocess_sqlite(SqlitePostprocessRequest {
+                campaign_id: &campaign_id,
+                conversation_id,
+                turn_id: &turn_id,
+                attempt_id: &attempt_id,
+                variant_id: &variant_id,
+                draft_text: &regen_text,
+                summary_text,
+                turn_number: turn_index,
+                input_node_id: input_node_id.clone(),
+            })
+            .await?;
+
+        let accept = self.accept_variant(&campaign_id, conversation_id, &variant_id)?;
+        if !accept.ok {
+            return Err(accept
+                .error
+                .unwrap_or_else(|| "regenerate accept failed".into()));
+        }
+        self.conv_store.invalidate();
+
+        let outbox = sqlite_runtime::list_preaccept_outbox_for_turn(&turn_id).unwrap_or_default();
+        let outbox_kinds: Vec<String> = outbox
+            .iter()
+            .map(|r| match r.kind {
+                PreacceptOutboxKind::DraftReady => "draft_ready".into(),
+                PreacceptOutboxKind::AutofixSync => "autofix_sync".into(),
+                PreacceptOutboxKind::PostprocessApply => "postprocess_apply".into(),
+                PreacceptOutboxKind::Regenerate => "regenerate".into(),
+                PreacceptOutboxKind::EditStale => "edit_stale".into(),
+                PreacceptOutboxKind::RecoveryFail => "recovery_fail".into(),
+            })
+            .collect();
+
+        let mut observations = BTreeSet::new();
+        observations.insert(ObservationKey::SqliteAuthoritative);
+        observations.insert(ObservationKey::JsonFallbackFalse);
+        observations.insert(ObservationKey::CommandPath(
+            "sqlite_runtime::append_regenerate_attempt".into(),
+        ));
+        observations.insert(ObservationKey::ServicePath("pipeline.regenerate".into()));
+        observations.insert(ObservationKey::Regenerated);
+        observations.insert(ObservationKey::PostprocessApplied);
+        observations.insert(ObservationKey::Accepted);
+        observations.insert(ObservationKey::OutboxKind("regenerate".into()));
+        observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        observations.insert(ObservationKey::AgentRole("pipeline".into()));
+
+        let observed = ObservedCoverage {
+            row_id: row_id.to_string(),
+            turn_index,
+            command_path: "sqlite_runtime::append_regenerate_attempt".into(),
+            service_path: "pipeline.regenerate".into(),
+            agent_events: vec!["pipeline".into()],
+            turn_id16: short_hash16(turn_id.as_str()),
+            attempt_id16: short_hash16(attempt_id.as_str()),
+            variant_id16: short_hash16(variant_id.as_str()),
+            sqlite_post: SqlitePostcondition {
+                sqlite_authoritative: true,
+                json_fallback: false,
+                turn_status: format!("{:?}", accept.turn_status),
+                attempt_status: format!("{:?}", accept.attempt_status),
+                outbox_kinds,
+                campaign_revision_after: accept.campaign_revision_after,
+                postprocess_applied: proof.applied,
+                batch_digest16: proof.batch_digest.clone(),
+            },
+            observations,
+        };
+
+        Ok(SqliteTurnResult {
+            draft_text: regen_text,
             variant_id,
             turn_id,
             attempt_id,
