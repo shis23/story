@@ -344,12 +344,10 @@ impl SqlitePreacceptRepository {
             let attempt = turn.find_attempt_mut(request.attempt_id).ok_or_else(|| {
                 SqliteError::RecordNotFound(format!("attempt {}", request.attempt_id))
             })?;
+            // Stale is terminal and cannot be the active attempt; reactivation is
+            // intentionally unsupported. Callers must regenerate a fresh attempt.
             attempt.draft_hash = final_hash.clone();
             attempt.quality_report = Some(request.quality_report.clone());
-            if attempt.status == AttemptStatus::Stale {
-                // Autofix after edit re-validates the draft for accept path.
-                attempt.status = AttemptStatus::DraftReady;
-            }
         }
         turn.touch();
         write_turn(tx, &turn)?;
@@ -556,6 +554,12 @@ impl SqlitePreacceptRepository {
                 turn.turn_id, turn.status
             )));
         }
+        if turn.status == TurnStatus::Committing {
+            return Err(SqliteError::Conflict(format!(
+                "turn {} is Committing; cannot regenerate",
+                turn.turn_id
+            )));
+        }
         if attempt_exists_tx(tx, request.attempt_id)? {
             return Err(SqliteError::Conflict(format!(
                 "attempt {} already exists",
@@ -569,6 +573,12 @@ impl SqlitePreacceptRepository {
                 turn.turn_id
             ))
         })?;
+        if active.status == AttemptStatus::Committing {
+            return Err(SqliteError::Conflict(format!(
+                "active attempt {} is Committing; cannot regenerate",
+                active.attempt_id
+            )));
+        }
         if &active.variant_id != request.previous_variant_id {
             return Err(SqliteError::Conflict(format!(
                 "previous_variant_id {} is not the active attempt variant {} on turn {}",
@@ -686,9 +696,25 @@ impl SqlitePreacceptRepository {
 
         let mut turn = load_turn_tx(tx, turn_id)?;
         validate_turn_scope(&turn, campaign_id, conversation_id, turn_id)?;
+        if turn.status == TurnStatus::Committing {
+            return Err(SqliteError::Conflict(format!(
+                "turn {turn_id} is Committing; cannot mark stale"
+            )));
+        }
+        if turn.status.is_terminal() {
+            return Err(SqliteError::Conflict(format!(
+                "turn {turn_id} is terminal ({:?}); cannot mark stale",
+                turn.status
+            )));
+        }
         let attempt = turn
             .find_attempt(attempt_id)
             .ok_or_else(|| SqliteError::RecordNotFound(format!("attempt {attempt_id}")))?;
+        if attempt.status == AttemptStatus::Committing {
+            return Err(SqliteError::Conflict(format!(
+                "attempt {attempt_id} is Committing; cannot mark stale"
+            )));
+        }
         if !attempt.status.is_active() && attempt.status != AttemptStatus::Stale {
             return Err(SqliteError::Conflict(format!(
                 "attempt {attempt_id} is {:?}, cannot mark stale",

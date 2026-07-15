@@ -19,6 +19,8 @@
 
 返修后仍 **不接 production command**：未改 `tauri-app`、`TurnLifecycleService`、默认 backend。
 
+后续 hardening 补齐 Committing 守卫，并删除 `sync_autofix` 中不可达的 Stale 重激活承诺。
+
 ## 交付范围对照
 
 | 计划项 | 结果 |
@@ -71,7 +73,9 @@
 | postprocess ownership | `attempt_id` 必须属于目标 `turn_id`；跨 Turn → `Conflict`，**零 outbox 写入** |
 | postprocess replay | 同 payload → `AlreadyApplied`，不新增 Skipped/outbox；不同 payload → conflict |
 | regenerate variant | `previous_variant_id` 必须等于当前 active Attempt 的 variant，不能是会话内任意节点 |
+| regenerate/edit during Committing | Turn 或 active Attempt 为 `Committing` → `Conflict`，**零写入** conversation/turn/attempt/outbox |
 | autofix fingerprint | 幂等指纹覆盖完整 canonical `QualityReport`（不是只比 `error_count`） |
+| autofix vs Stale | `Stale` 为 terminal，不能成为 active；`sync_autofix` 不重激活 Stale（删除不可达分支） |
 
 `crates/infra-sqlite/src/lib.rs` 已 re-export。
 
@@ -115,7 +119,7 @@ schema 当前版本：`4`。
 
 ## 测试证据
 
-`crates/infra-sqlite/tests/preaccept_lifecycle.rs`（17）：
+`crates/infra-sqlite/tests/preaccept_lifecycle.rs`（20）：
 
 | 契约 | 测试 |
 | --- | --- |
@@ -131,7 +135,10 @@ schema 当前版本：`4`。
 | 迟到 postprocess 跳过 | `postprocess_skips_when_attempt_no_longer_current` |
 | regenerate 取代旧 Attempt | `regenerate_supersedes_previous_attempt_atomically` |
 | regenerate 拒绝非 active variant | `regenerate_rejects_previous_variant_not_owned_by_active_attempt` |
+| regenerate 拒绝 Committing 零写入 | `regenerate_rejects_committing_turn_with_zero_writes` |
 | 编辑 Stale 保留原 hash | `mark_stale_after_edit_keeps_hash_and_content_consistent` |
+| mark_stale 拒绝 Committing 零写入 | `mark_stale_rejects_committing_turn_or_attempt_with_zero_writes` |
+| autofix 不重激活 Stale | `sync_autofix_rejects_stale_attempt_instead_of_dead_reactivation` |
 | recovery / fail incomplete | `recovery_lists_active_preaccept_state_and_fail_incomplete_is_atomic` |
 | 并发 draft 串行 | `concurrent_draft_create_serializes_to_single_active_attempt` |
 | reverse export 分类 | `reverse_export_marks_preaccept_outbox_as_unsupported_without_silent_loss` |
@@ -144,7 +151,7 @@ schema 当前版本：`4`。
 | 命令 | 结果 |
 | --- | --- |
 | `cargo fmt -p storyforge-infra-sqlite -- --check` | PASS（via `cargo fmt`） |
-| `cargo test -p storyforge-infra-sqlite` | PASS（含 17 preaccept + 既有 suites） |
+| `cargo test -p storyforge-infra-sqlite` | PASS（含 20 preaccept + 既有 suites） |
 | `cargo clippy -p storyforge-infra-sqlite --all-targets -- -D warnings` | PASS |
 | `git diff --check` | PASS |
 

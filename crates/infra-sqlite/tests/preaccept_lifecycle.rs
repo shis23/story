@@ -78,6 +78,36 @@ fn quality_report_with_error() -> QualityReport {
     }
 }
 
+fn force_committing(db: &mut Database, turn_id: &Id, attempt_id: &Id) {
+    let mut turn = SqliteProductionRepository::get_turn(db, turn_id)
+        .unwrap()
+        .unwrap();
+    turn.status = TurnStatus::Committing;
+    turn.find_attempt_mut(attempt_id).unwrap().status = AttemptStatus::Committing;
+    turn.touch();
+    SqliteProductionRepository::save_turn(db, &turn).unwrap();
+}
+
+fn snapshot_preaccept(
+    db: &Database,
+    _campaign_id: &Id,
+    conversation_id: &Id,
+    turn_id: &Id,
+) -> (String, String, usize) {
+    let conversation = SqliteProductionRepository::get_conversation(db, conversation_id)
+        .unwrap()
+        .unwrap();
+    let turn = SqliteProductionRepository::get_turn(db, turn_id)
+        .unwrap()
+        .unwrap();
+    let outbox = SqlitePreacceptRepository::list_outbox_for_turn(db, turn_id).unwrap();
+    (
+        serde_json::to_string(&conversation).unwrap(),
+        serde_json::to_string(&turn).unwrap(),
+        outbox.len(),
+    )
+}
+
 #[test]
 fn create_draft_attempt_atomically_persists_conversation_and_attempt() {
     let mut f = fixture();
@@ -1080,6 +1110,182 @@ fn autofix_idempotency_fingerprint_covers_full_quality_report() {
             .unwrap()
             .content,
         final_text
+    );
+}
+
+#[test]
+fn regenerate_rejects_committing_turn_with_zero_writes() {
+    let mut f = fixture();
+    let attempt_id = Id::from_str("attempt-commit-regen");
+    let created = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "pre-commit draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    force_committing(&mut f.db, &f.turn_id, &attempt_id);
+    let before = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+
+    let err = SqlitePreacceptRepository::append_regenerate_attempt(
+        &mut f.db,
+        RegenerateAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            previous_variant_id: &created.variant_id,
+            attempt_id: &Id::from_str("attempt-commit-regen-new"),
+            draft_text: "must not land",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Committing") || err.to_string().contains("committing"),
+        "regenerate during Committing must fail closed: {err}"
+    );
+
+    let after = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+    assert_eq!(before, after, "zero writes to conversation/turn/outbox");
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Committing);
+    assert_eq!(turn.attempts.len(), 1);
+    assert_eq!(
+        turn.find_attempt(&attempt_id).unwrap().status,
+        AttemptStatus::Committing
+    );
+}
+
+#[test]
+fn mark_stale_rejects_committing_turn_or_attempt_with_zero_writes() {
+    let mut f = fixture();
+    let attempt_id = Id::from_str("attempt-commit-stale");
+    let created = SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "pre-commit draft",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    force_committing(&mut f.db, &f.turn_id, &attempt_id);
+    let before = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+
+    let err = SqlitePreacceptRepository::mark_stale_after_edit(
+        &mut f.db,
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.turn_id,
+        &attempt_id,
+        "must not overwrite committing draft",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Committing") || err.to_string().contains("committing"),
+        "mark_stale during Committing must fail closed: {err}"
+    );
+
+    let after = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+    assert_eq!(before, after, "zero writes to conversation/turn/outbox");
+    let conversation = SqliteProductionRepository::get_conversation(&f.db, &f.conversation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation
+            .find_node(&created.variant_id)
+            .unwrap()
+            .active()
+            .unwrap()
+            .content,
+        "pre-commit draft"
+    );
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Committing);
+    assert_eq!(
+        turn.find_attempt(&attempt_id).unwrap().status,
+        AttemptStatus::Committing
+    );
+}
+
+#[test]
+fn sync_autofix_rejects_stale_attempt_instead_of_dead_reactivation() {
+    let mut f = fixture();
+    let attempt_id = Id::from_str("attempt-stale-autofix");
+    SqlitePreacceptRepository::create_draft_attempt(
+        &mut f.db,
+        DraftAttemptRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            draft_text: "before stale",
+            pending_temporary_instances: vec![],
+            provenance: None,
+        },
+    )
+    .unwrap();
+    SqlitePreacceptRepository::mark_stale_after_edit(
+        &mut f.db,
+        &f.campaign_id,
+        &f.conversation_id,
+        &f.turn_id,
+        &attempt_id,
+        "edited stale body",
+    )
+    .unwrap();
+    let before = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+
+    let err = SqlitePreacceptRepository::sync_autofix(
+        &mut f.db,
+        AutofixSyncRequest {
+            campaign_id: &f.campaign_id,
+            conversation_id: &f.conversation_id,
+            turn_id: &f.turn_id,
+            attempt_id: &attempt_id,
+            final_text: "should not reactivate stale",
+            quality_report: QualityReport::default(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("active")
+            || err.to_string().contains("Stale")
+            || err.to_string().contains("stale")
+            || err.to_string().contains("writable"),
+        "stale attempt must not be silently reactivated by autofix: {err}"
+    );
+
+    let after = snapshot_preaccept(&f.db, &f.campaign_id, &f.conversation_id, &f.turn_id);
+    assert_eq!(
+        before, after,
+        "rejected autofix on stale must be zero-write"
+    );
+    let turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        turn.find_attempt(&attempt_id).unwrap().status,
+        AttemptStatus::Stale
+    );
+    assert_eq!(
+        turn.find_attempt(&attempt_id).unwrap().draft_hash,
+        compute_draft_hash("before stale")
     );
 }
 
