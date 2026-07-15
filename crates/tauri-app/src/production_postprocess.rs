@@ -197,7 +197,15 @@ pub trait TurnAttemptSink: Send + Sync {
         derivation: DerivationComponents,
     ) -> Result<bool, String>;
 
-    fn mark_failed(&self, turn_id: &Id, reason: String) -> Result<(), String>;
+    /// Conditionally mark Turn Failed only when `identity` still owns the current
+    /// writable Attempt. Must re-check campaign/conversation/attempt under the same
+    /// durable write. Returns Ok(true) when marked, Ok(false) when zero-write
+    /// (superseded / cancelled / not current), Err on storage failure.
+    fn mark_failed_if_current(
+        &self,
+        identity: &PostprocessIdentity,
+        reason: String,
+    ) -> Result<bool, String>;
 }
 
 /// Allowed Turn/Attempt statuses for autofix draft_hash writeback.
@@ -333,13 +341,25 @@ impl TurnAttemptSink for JsonTurnAttemptSink<'_> {
             .map_err(|e| e.to_string())
     }
 
-    fn mark_failed(&self, turn_id: &Id, reason: String) -> Result<(), String> {
+    fn mark_failed_if_current(
+        &self,
+        identity: &PostprocessIdentity,
+        reason: String,
+    ) -> Result<bool, String> {
         self.turn_store
-            .with_turn_mut(turn_id, |record| {
-                record.status = TurnStatus::Failed;
-                record.failure_reason = Some(reason);
-                record.touch();
-            })
+            .mutate_if(
+                &identity.turn_id,
+                |record| {
+                    record.campaign_id == identity.campaign_id
+                        && record.conversation_id == identity.conversation_id
+                        && is_current_attempt_ready_for_postprocess(record, &identity.attempt_id)
+                },
+                |record| {
+                    record.status = TurnStatus::Failed;
+                    record.failure_reason = Some(reason);
+                    record.touch();
+                },
+            )
             .map_err(|e| e.to_string())
     }
 }
@@ -649,23 +669,27 @@ impl<'a> ProductionPostprocessService<'a> {
         self.apply_outcome(identity, outcome, &req.present_chars, &req.cancel)
     }
 
-    /// Mark the Turn Failed when a hard storage/batch error must surface.
-    pub fn mark_turn_failed(
+    /// Mark the Turn Failed only when `identity` still owns the current writable Attempt.
+    ///
+    /// Returns Ok(true) when marked; Ok(false) when the identity is no longer current
+    /// (superseded / cancelled) and durable state was left untouched.
+    pub fn mark_turn_failed_if_current(
         &self,
-        turn_id: &Id,
+        identity: &PostprocessIdentity,
         reason: impl Into<String>,
-    ) -> Result<(), ProductionPostprocessError> {
+    ) -> Result<bool, ProductionPostprocessError> {
         self.sink
-            .mark_failed(turn_id, reason.into())
+            .mark_failed_if_current(identity, reason.into())
             .map_err(ProductionPostprocessError::Storage)
     }
 
-    /// Best-effort fail-closed helper for adapters: try mark_failed and combine errors.
+    /// Best-effort fail-closed helper for adapters: try mark_failed_if_current and combine.
     ///
-    /// Identity-validation errors must never write / mark the Turn.
+    /// Identity-validation errors never write. Storage/BatchConstruction only mark
+    /// Failed when `identity` is still the current Attempt; otherwise zero-write.
     pub fn fail_turn_or_combine(
         &self,
-        turn_id: &Id,
+        identity: &PostprocessIdentity,
         original: ProductionPostprocessError,
     ) -> ProductionPostprocessError {
         if matches!(
@@ -675,8 +699,8 @@ impl<'a> ProductionPostprocessService<'a> {
         ) {
             return original;
         }
-        match self.mark_turn_failed(turn_id, original.to_string()) {
-            Ok(()) => original,
+        match self.mark_turn_failed_if_current(identity, original.to_string()) {
+            Ok(_marked) => original,
             Err(mark_error) => ProductionPostprocessError::MarkFailed {
                 original: original.to_string(),
                 mark_error: mark_error.to_string(),
@@ -1693,7 +1717,14 @@ mod tests {
             }
         ));
         // service_fail_turn / fail_turn_or_combine must not reclassify or mark.
-        let combined = service.fail_turn_or_combine(&turn_id, camp_err);
+        let camp_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: attempt_id.clone(),
+            campaign_id: Id::from_str("other-campaign"),
+            conversation_id: fx.conversation_id.clone(),
+            turn_number: 1,
+        };
+        let combined = service.fail_turn_or_combine(&camp_identity, camp_err);
         assert!(matches!(
             combined,
             ProductionPostprocessError::ScopeMismatch {
@@ -1790,7 +1821,7 @@ mod tests {
             .expect_err("attach storage failure must propagate");
         assert!(matches!(err, ProductionPostprocessError::Storage(_)));
 
-        // mark_failed success path after storage failure.
+        // mark_failed_if_current success path after storage failure (identity still current).
         let sink_ok_mark = FailingAttachSink {
             inner: fx.sink(),
             fail_attach: true,
@@ -1798,7 +1829,7 @@ mod tests {
         };
         let service_ok = ProductionPostprocessService::new_json(&fx.campaign_store, &sink_ok_mark);
         let combined = service_ok.fail_turn_or_combine(
-            &turn_id,
+            &identity,
             ProductionPostprocessError::Storage("attach boom".into()),
         );
         assert!(matches!(combined, ProductionPostprocessError::Storage(_)));
@@ -1807,7 +1838,19 @@ mod tests {
             TurnStatus::Failed
         );
 
-        // mark_failed itself failing must combine errors, never silent Ok.
+        // Reset to DraftReady for the mark_failed storage-failure case.
+        fx.turn_store
+            .with_turn_mut(&turn_id, |record| {
+                record.status = TurnStatus::DraftReady;
+                record.failure_reason = None;
+                if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                    att.status = AttemptStatus::DraftReady;
+                }
+                record.touch();
+            })
+            .unwrap();
+
+        // mark_failed_if_current itself failing must combine errors, never silent Ok.
         let sink_fail_mark = FailingAttachSink {
             inner: fx.sink(),
             fail_attach: true,
@@ -1816,13 +1859,109 @@ mod tests {
         let service_fail =
             ProductionPostprocessService::new_json(&fx.campaign_store, &sink_fail_mark);
         let mark_err = service_fail.fail_turn_or_combine(
-            &turn_id,
+            &identity,
             ProductionPostprocessError::Storage("attach boom".into()),
         );
         assert!(matches!(
             mark_err,
             ProductionPostprocessError::MarkFailed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn late_storage_or_batch_error_after_regenerate_does_not_fail_new_attempt() {
+        let fx = Fx::new("late_mark_after_regen");
+        let draft = "旧 postprocess 在 regenerate 后不得标 Failed。".repeat(3);
+        let (turn_id, old_attempt_id, variant_id) = fx.seed_draft_attempt(&draft);
+        let old_identity = PostprocessIdentity {
+            turn_id: turn_id.clone(),
+            attempt_id: old_attempt_id.clone(),
+            campaign_id: fx.campaign_id.clone(),
+            conversation_id: fx.conversation_id.clone(),
+            turn_number: 1,
+        };
+
+        // Simulate regenerate: supersede old attempt, create a new current DraftReady attempt.
+        let new_attempt_id = Id::new();
+        fx.turn_store
+            .with_turn_mut(&turn_id, |record| {
+                if let Some(old) = record.find_attempt_mut(&old_attempt_id) {
+                    old.status = AttemptStatus::Superseded;
+                }
+                let mut new_attempt = turn_lifecycle::new_draft_attempt(
+                    new_attempt_id.clone(),
+                    variant_id.clone(),
+                    "regenerated draft",
+                    vec![],
+                );
+                new_attempt.status = AttemptStatus::DraftReady;
+                record.attempts.push(new_attempt);
+                record.status = TurnStatus::DraftReady;
+                record.failure_reason = None;
+                record.touch();
+            })
+            .unwrap();
+        let before = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(before.status, TurnStatus::DraftReady);
+        assert_eq!(
+            before.find_attempt(&new_attempt_id).unwrap().status,
+            AttemptStatus::DraftReady
+        );
+
+        // Old background postprocess hits BatchConstruction / Storage after regenerate.
+        let sink = FailingAttachSink {
+            inner: fx.sink(),
+            fail_attach: true,
+            fail_mark: false,
+        };
+        let service = ProductionPostprocessService::new_json(&fx.campaign_store, &sink);
+
+        for original in [
+            ProductionPostprocessError::BatchConstruction("late batch boom".into()),
+            ProductionPostprocessError::Storage("late attach boom".into()),
+        ] {
+            let combined = service.fail_turn_or_combine(&old_identity, original);
+            assert!(
+                matches!(
+                    combined,
+                    ProductionPostprocessError::BatchConstruction(_)
+                        | ProductionPostprocessError::Storage(_)
+                ),
+                "unexpected: {combined}"
+            );
+            let after = fx.turn_store.get_turn(&turn_id).unwrap();
+            assert_eq!(
+                after.status,
+                TurnStatus::DraftReady,
+                "old late error must not Fail turn"
+            );
+            assert_eq!(after.failure_reason, before.failure_reason);
+            assert_eq!(
+                after.find_attempt(&new_attempt_id).unwrap().status,
+                AttemptStatus::DraftReady,
+                "new attempt must stay DraftReady"
+            );
+            assert_eq!(
+                after.find_attempt(&old_attempt_id).unwrap().status,
+                AttemptStatus::Superseded
+            );
+            assert!(
+                after
+                    .find_attempt(&new_attempt_id)
+                    .unwrap()
+                    .pending_state_changes
+                    .is_none()
+            );
+        }
+
+        // Identity-scoped sink mark itself is also a zero-write.
+        let marked = sink
+            .mark_failed_if_current(&old_identity, "should not write".into())
+            .expect("mark is non-fatal when not current");
+        assert!(!marked, "superseded identity must not mark");
+        let after_mark = fx.turn_store.get_turn(&turn_id).unwrap();
+        assert_eq!(after_mark.status, TurnStatus::DraftReady);
+        assert_eq!(after_mark.failure_reason, None);
     }
 
     /// Cancels the shared cancel channel while producing a fixed outcome.
@@ -1879,11 +2018,15 @@ mod tests {
             self.inner.attach_postprocess(identity, batch, derivation)
         }
 
-        fn mark_failed(&self, turn_id: &Id, reason: String) -> Result<(), String> {
+        fn mark_failed_if_current(
+            &self,
+            identity: &PostprocessIdentity,
+            reason: String,
+        ) -> Result<bool, String> {
             if self.fail_mark {
                 return Err("injected mark_failed storage failure".into());
             }
-            self.inner.mark_failed(turn_id, reason)
+            self.inner.mark_failed_if_current(identity, reason)
         }
     }
 }

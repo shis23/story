@@ -8,7 +8,7 @@
 
 ## 结论
 
-共享 `ProductionPostprocessService` 已落地，并完成三轮 P0 返修：
+共享 `ProductionPostprocessService` 已落地，并完成四轮 P0 返修：
 
 ### 共享写回状态机
 - Attempt/derivation/MutationBatch/Chronicle A 候选
@@ -25,9 +25,16 @@
    `TurnAttemptSink::sync_autofix` 在**同一次** durable `mutate_if` 内校验
    `campaign_id` / `conversation_id` / `attempt_id` / 可写状态。
    typed `ScopeMismatch` / `AttemptMissing` 原样向上返回，**不得** stringify 成
-   `AutofixSync` 后再被 `service_fail_turn` / `fail_turn_or_combine` 调 `mark_failed`。
+   `AutofixSync` 后再被 `service_fail_turn` / `fail_turn_or_combine` 调 mark。
    并发 supersede / 非可写状态：零写入、非致命 no-op。
-3. **harness evidence 不可伪造**
+3. **identity-scoped mark_failed_if_current**
+   取消按 `turn_id` 无条件 `mark_failed`。
+   `mark_failed_if_current(identity, reason)` 在同一次条件写入中复核
+   campaign / conversation / attempt_id / 当前可写 Attempt。
+   旧 Attempt 已被 regenerate supersede 或已取消时零写入，保留新 Attempt。
+   只有本 identity 仍当前时，`Storage` / `BatchConstruction` 才能标该 Turn Failed。
+   SQLite `runtime=None` 提前错误统一走 `PostProcessFailed` 事件路径（不再旁路 return）。
+4. **harness evidence 不可伪造**
    `ProductionPostprocessProof` 绑定 `input_node_id` / `turn_index` / `variant_id` /
    `draft_hash` / `batch_digest` / 精确 summary。
    `verify_production_postprocess_claim` 接收 evidence loop **当前**
@@ -51,6 +58,7 @@
 | Attempt 缺失 typed Err | `missing_attempt_returns_error_not_ok` |
 | sync_autofix typed + supersede | `sync_autofix_preserves_typed_scope_and_attempt_errors` |
 | storage + mark 组合 | `storage_attach_failure_propagates_and_fail_turn_combines_mark_errors` |
+| 旧 postprocess 交错零写入 | `late_storage_or_batch_error_after_regenerate_does_not_fail_new_attempt` |
 | operation-owned 交错取消 | `operation_owned_cancel_interleaving_preserves_active_generation` |
 | adapter zero-write 回归 | `scope_validation_errors_do_not_mark_turn_failed` |
 | harness 共享路径 | `multi_turn_loop_uses_shared_production_postprocess_service` |
@@ -63,17 +71,11 @@
 cargo fmt --all -- --check
   PASS
 
-cargo test -p storyforge --lib
-  PASS: 267 passed; 3 ignored
-
 cargo test -p storyforge --lib production_postprocess
-  PASS: 10 passed
+  PASS: 11 passed
 
 cargo test -p storyforge --lib scope_validation_errors_do_not_mark_turn_failed
   PASS
-
-cargo test -p harness-real-llm --lib
-  PASS: 61 passed
 
 cargo test -p harness-real-llm --test m5_production_evidence
   PASS: 11 passed
@@ -90,7 +92,7 @@ git diff --check
 ## 修改文件
 
 - `crates/tauri-app/src/production_postprocess.rs`
-- `crates/tauri-app/src/lib.rs`（Backend atomic sync_autofix、adapter 回归）
+- `crates/tauri-app/src/lib.rs`
 - `crates/harness-real-llm/src/production_evidence.rs`
 - `crates/harness-real-llm/tests/m5_production_evidence.rs`
 - `docs/workstreams/PRODUCTION-POSTPROCESS-SERVICE-RESULT.md`
@@ -105,5 +107,5 @@ git diff --check
 
 ## 是否建议合并
 
-**建议合并（typed identity + 原子 autofix + evidence loop 绑定后）。**
+**建议合并（typed identity + 原子 autofix + identity-scoped mark + evidence loop 绑定后）。**
 默认行为未切 backend；关键取消/失败/scope/evidence 语义已有契约测试。
