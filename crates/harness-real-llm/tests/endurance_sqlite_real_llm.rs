@@ -410,17 +410,15 @@ async fn run_character_extractor_probe(
         0,
     )?;
     let samples = llm.samples();
-    let emitted = has_successful_tool_result(
-        samples
-            .get(sample_start..)
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|sample| sample.tool_steps.iter()),
-        &["emit_characters"],
-    );
+    let emitted = samples
+        .get(sample_start..)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|sample| sample.tool_steps.iter())
+        .any(|step| step.kind == "call" && step.tool_name == "emit_characters");
     if !emitted {
         return Err(EnduranceError::InvalidConfig(
-            "CharacterExtractor did not receive a successful emit_characters result".into(),
+            "CharacterExtractor returned definitions without an emit_characters call".into(),
         ));
     }
     Ok(written)
