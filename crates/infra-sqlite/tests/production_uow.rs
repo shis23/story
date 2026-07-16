@@ -9,10 +9,10 @@ use storyforge_domain::story_task::{StoryTask, TaskStatus};
 use storyforge_domain::turn::{
     AttemptStatus, KnowledgeMutation, Mutation, MutationBatch, TurnAttempt, TurnRecord, TurnStatus,
 };
-use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::production::{
     AcceptFault, AcceptOutcome, AcceptTurnRequest, SqliteProductionRepository, compute_draft_hash,
 };
+use storyforge_infra_sqlite::{Database, SqliteError};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -343,6 +343,77 @@ fn turn_and_attempt_domain_payloads_round_trip() {
     let stored_batch = attempt.pending_state_changes.unwrap();
     assert_eq!(stored_batch.commit_id, f.batch.commit_id);
     assert_eq!(stored_batch.mutations.len(), f.batch.mutations.len());
+}
+
+#[test]
+fn get_turn_by_variant_preserves_unique_and_missing_lookup_paths() {
+    let f = fixture();
+
+    let found = SqliteProductionRepository::get_turn_by_variant(&f.db, &f.node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.turn_id, f.turn_id);
+    assert!(
+        SqliteProductionRepository::get_turn_by_variant(&f.db, &Id::from_str("missing-variant"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn get_turn_by_variant_allows_regenerate_attempts_on_the_same_turn() {
+    let mut f = fixture();
+    let mut turn = SqliteProductionRepository::get_turn(&f.db, &f.turn_id)
+        .unwrap()
+        .unwrap();
+    let mut duplicate = turn.attempts[0].clone();
+    turn.attempts[0].status = AttemptStatus::Superseded;
+    duplicate.attempt_id = Id::from_str("attempt-duplicate-variant");
+    duplicate.status = AttemptStatus::AwaitingAcceptance;
+    turn.attempts.push(duplicate);
+    SqliteProductionRepository::save_turn(&mut f.db, &turn).unwrap();
+
+    let resolved = SqliteProductionRepository::get_turn_by_variant(&f.db, &f.node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.turn_id, f.turn_id);
+    assert_eq!(resolved.attempts.len(), 2);
+    assert_eq!(
+        resolved
+            .find_attempt_by_variant(&f.node_id)
+            .unwrap()
+            .attempt_id,
+        Id::from_str("attempt-duplicate-variant")
+    );
+}
+
+#[test]
+fn get_turn_by_variant_rejects_matches_owned_by_different_turns() {
+    let mut f = fixture();
+    let original_attempt = SqliteProductionRepository::get_attempt(&f.db, &f.attempt_id)
+        .unwrap()
+        .unwrap();
+    let mut second = TurnRecord::new(
+        f.campaign_id.clone(),
+        f.conversation_id.clone(),
+        Id::from_str("input-duplicate-variant"),
+        0,
+    );
+    second.turn_id = Id::from_str("turn-duplicate-variant");
+    second.status = TurnStatus::Failed;
+    let mut duplicate = original_attempt;
+    duplicate.attempt_id = Id::from_str("attempt-cross-turn-duplicate-variant");
+    duplicate.status = AttemptStatus::Stale;
+    duplicate.pending_state_changes = None;
+    second.attempts.push(duplicate);
+    SqliteProductionRepository::save_turn(&mut f.db, &second).unwrap();
+
+    let err = SqliteProductionRepository::get_turn_by_variant(&f.db, &f.node_id).unwrap_err();
+    assert!(matches!(
+        err,
+        SqliteError::Conflict(message)
+            if message.contains("variant_id") && message.contains("multiple turns")
+    ));
 }
 
 #[test]

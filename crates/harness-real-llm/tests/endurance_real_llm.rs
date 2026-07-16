@@ -71,7 +71,7 @@ fn require_endurance_budget() -> RealLlmRunBudget {
 fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidencePaths) {
     use harness_real_llm::evidence_retention::{
         EVIDENCE_DIR_ENV, EvidenceRootPolicy, open_endurance_run_paths, resolve_evidence_root,
-        resolve_resume_run_dir,
+        resolve_explicit_resume_run_dir,
     };
 
     let allow_ephemeral = std::env::var("STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE")
@@ -98,9 +98,9 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
         let raw = raw.trim();
         if !raw.is_empty() {
             let path = PathBuf::from(raw);
-            if path.is_dir() && path.join("endurance_checkpoint.jsonl").exists() {
-                let validated = resolve_resume_run_dir(&path, &policy)
-                    .unwrap_or_else(|e| panic!("fail-closed resume evidence dir rejected: {e}"));
+            if let Some(validated) = resolve_explicit_resume_run_dir(&path, &policy)
+                .unwrap_or_else(|e| panic!("fail-closed resume evidence dir rejected: {e}"))
+            {
                 let name = validated
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -479,6 +479,9 @@ async fn run_endurance_stage(
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: epoch_tracker.observed.clone(),
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(&paths.checkpoint_jsonl, &cp)?;
@@ -834,11 +837,7 @@ async fn endurance_real_llm_full_100_turn() {
                     run_id: row.run_id.clone(),
                     status: harness_real_llm::evidence_retention::RunStatus::Completed,
                     stage: row.stage.clone(),
-                    model_label: std::env::var("LLM_MODEL")
-                        .unwrap_or_default()
-                        .chars()
-                        .take(64)
-                        .collect(),
+                    model_label: std::env::var("LLM_MODEL").unwrap_or_default(),
                     budget: harness_real_llm::evidence_retention::BudgetSummary {
                         max_calls: row.max_calls,
                         max_turns: row.target_turns,

@@ -141,6 +141,8 @@ fn production_defaults_unchanged_200_4_h_e() {
 
 fn sample(tag: &str, role: &str, prompt: u32, cached: u32) -> UsageSample {
     UsageSample {
+        call_index: 1,
+        evidence_turn_index: 0,
         tag: tag.into(),
         role: role.into(),
         streaming: false,

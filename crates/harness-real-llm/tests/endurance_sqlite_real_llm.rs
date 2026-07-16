@@ -20,11 +20,18 @@ use harness_real_llm::coverage_ledger::{
 use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
 use harness_real_llm::resolve_llm_connection;
-use harness_real_llm::sqlite_endurance::{SqliteHarnessEnv, fixture_source_hash16};
+use harness_real_llm::sqlite_endurance::{
+    SqliteHarnessEnv, fixture_source_hash16, is_retryable_quality_blocked_error,
+};
+use sha2::{Digest, Sha256};
 use storyforge_app_conversation::PartialRollTarget;
 use storyforge_app_pipeline::WritingContext;
-use storyforge_domain::llm::{ReasoningMode, ToolMode};
+use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
+use storyforge_domain::llm::{LlmProtocol, ReasoningMode, ToolMode};
+use storyforge_domain::turn::{AttemptStatus, TurnRecord, TurnStatus};
 use storyforge_infra_llm::LlmClient;
+use storyforge_infra_llm::mock_client::MockLlmClient;
+use storyforge_infra_sqlite::preaccept::DraftAttemptRequest;
 
 fn parse_target_stage() -> EnduranceStage {
     let raw = std::env::var("STORYFORGE_EVAL_ENDURANCE_STAGE").unwrap_or_default();
@@ -96,21 +103,60 @@ fn parse_eval_reasoning_mode() -> ReasoningMode {
     }
 }
 
-fn resolve_git_provenance() -> (String, String) {
-    fn git(args: &[&str]) -> Option<String> {
-        let output = std::process::Command::new("git").args(args).output().ok()?;
+fn endpoint_identity_hash16(base_url: &str, protocol: &LlmProtocol) -> String {
+    let url = base_url.trim().trim_end_matches('/');
+    let normalized = if url.ends_with("/v1/chat/completions") {
+        url.to_string()
+    } else if url.ends_with("/v1") {
+        format!("{url}/chat/completions")
+    } else {
+        format!("{url}/v1/chat/completions")
+    };
+    let protocol = serde_json::to_string(protocol).unwrap_or_else(|_| "invalid-protocol".into());
+    short_hash16(&format!("{normalized}|{protocol}"))
+}
+
+fn model_identity_sha256(model: &str) -> String {
+    format!("{:x}", Sha256::digest(model.as_bytes()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitProvenance {
+    commit: String,
+    branch: String,
+}
+
+fn resolve_git_provenance() -> Result<GitProvenance, String> {
+    fn git(args: &[&str]) -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|error| format!("git invocation failed: {error}"))?;
         if !output.status.success() {
-            return None;
+            return Err(format!("git command failed: {}", args.join(" ")));
         }
         String::from_utf8(output.stdout)
-            .ok()
+            .map_err(|error| format!("git output was not UTF-8: {error}"))
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
     }
 
-    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_default();
-    let branch = git(&["branch", "--show-current"]).unwrap_or_else(|| "detached".into());
-    (commit, branch)
+    let commit = git(&["rev-parse", "HEAD"])?;
+    if commit.is_empty() {
+        return Err("git HEAD is empty".into());
+    }
+    let branch = git(&["branch", "--show-current"])?;
+    let status = git(&["status", "--porcelain", "--untracked-files=normal"])?;
+    if !status.is_empty() {
+        return Err("real evidence requires a clean git worktree".into());
+    }
+    Ok(GitProvenance {
+        commit,
+        branch: if branch.is_empty() {
+            "detached".into()
+        } else {
+            branch
+        },
+    })
 }
 
 fn require_endurance_budget() -> RealLlmRunBudget {
@@ -160,6 +206,649 @@ fn safe_error_summary(error: &str) -> String {
     )
 }
 
+const MAX_WRITE_ATTEMPTS: u32 = 5;
+const MAX_PROBE_ATTEMPTS: u32 = 3;
+// The SQLite real-model supplement is bounded by accepted turns, per-turn
+// attempts, probe attempts, request timeouts, and the suite deadline. Keep the
+// accounting field effectively unbounded instead of imposing an arbitrary
+// 220-call ceiling.
+const UNBOUNDED_CALL_ACCOUNTING_LIMIT: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupplementalProbe {
+    CharacterExtractor,
+    Meta,
+    Cache,
+}
+
+impl SupplementalProbe {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CharacterExtractor => "character_extractor",
+            Self::Meta => "meta",
+            Self::Cache => "cache",
+        }
+    }
+
+    fn attempts(self, state: &EnduranceProbeState) -> u32 {
+        match self {
+            Self::CharacterExtractor => state.character_extractor_attempts,
+            Self::Meta => state.meta_attempts,
+            Self::Cache => state.cache_attempts,
+        }
+    }
+
+    fn completed(self, state: &EnduranceProbeState) -> bool {
+        match self {
+            Self::CharacterExtractor => state.character_extractor_completed,
+            Self::Meta => state.meta_completed,
+            Self::Cache => state.cache_completed,
+        }
+    }
+
+    fn begin(self, state: &mut EnduranceProbeState) -> Result<(), String> {
+        if self.completed(state) {
+            return Err(format!("{} probe is already completed", self.label()));
+        }
+        if self.attempts(state) >= MAX_PROBE_ATTEMPTS {
+            return Err(format!("{} probe retry budget exhausted", self.label()));
+        }
+        match self {
+            Self::CharacterExtractor => {
+                state.character_extractor_attempts =
+                    state.character_extractor_attempts.saturating_add(1);
+            }
+            Self::Meta => {
+                state.meta_attempts = state.meta_attempts.saturating_add(1);
+            }
+            Self::Cache => {
+                state.cache_attempts = state.cache_attempts.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_completed(self, state: &mut EnduranceProbeState) {
+        match self {
+            Self::CharacterExtractor => state.character_extractor_completed = true,
+            Self::Meta => state.meta_completed = true,
+            Self::Cache => state.cache_completed = true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailureClass {
+    Transient,
+    QualityBlocked,
+    Fatal,
+}
+
+impl WriteFailureClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::QualityBlocked => "quality_blocked",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        self != Self::Fatal
+    }
+}
+
+fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailureClass {
+    if error.starts_with("nonretryable_accept:") {
+        return WriteFailureClass::Fatal;
+    }
+    if is_retryable_quality_blocked_error(error) {
+        return if matches!(action, ScheduledAction::QualityAutofix { fixable: true }) {
+            WriteFailureClass::Fatal
+        } else {
+            WriteFailureClass::QualityBlocked
+        };
+    }
+
+    if error.contains("PlanParse")
+        || error.contains("Plan 解析")
+        || error.contains("未找到有效 Plan")
+        || error.contains("already has active turn")
+        || error.contains("timeout")
+        || error.contains("Timeout")
+        || error.contains("超时")
+        || error.contains("空闲超时")
+        || error.contains("流式空闲")
+        || error.contains("HTTP 请求失败")
+        || error.contains("520")
+        || error.contains("rate limit")
+        || error.contains("client_error")
+        || error.contains("LlmError")
+        || error.contains("Internal")
+        || error.contains("所有子 Agent 均失败")
+        || error.contains("不在旧 Plan")
+        || error.contains("部分重 roll")
+        || error.contains("expected Generating")
+        || error.contains("is Failed")
+    {
+        WriteFailureClass::Transient
+    } else {
+        WriteFailureClass::Fatal
+    }
+}
+
+fn next_retry_state(
+    previous: Option<&EnduranceRetryState>,
+    turn_index: u32,
+    failure: WriteFailureClass,
+) -> Result<EnduranceRetryState, String> {
+    if let Some(previous) = previous
+        && previous.turn_index != turn_index
+    {
+        return Err("retry state belongs to a different turn".into());
+    }
+    let attempts_used = previous
+        .map(|state| state.attempts_used)
+        .unwrap_or(0)
+        .saturating_add(1);
+    if attempts_used > MAX_WRITE_ATTEMPTS {
+        return Err("write retry budget exhausted".into());
+    }
+    let quality_blocked_attempts = previous
+        .map(|state| state.quality_blocked_attempts)
+        .unwrap_or(0)
+        + u32::from(failure == WriteFailureClass::QualityBlocked);
+    Ok(EnduranceRetryState {
+        turn_index,
+        attempts_used,
+        quality_blocked_attempts,
+        last_failure_kind: failure.label().into(),
+        can_retry: failure.retryable() && attempts_used < MAX_WRITE_ATTEMPTS,
+    })
+}
+
+fn checkpoint_after_failed_attempt(
+    previous: Option<EnduranceCheckpoint>,
+    turn_index: u32,
+    durable_calls: u32,
+    retry_state: EnduranceRetryState,
+) -> Result<EnduranceCheckpoint, String> {
+    let mut checkpoint = previous.ok_or_else(|| "missing base checkpoint".to_string())?;
+    if checkpoint.accepted_turn_number.saturating_add(1) != turn_index {
+        return Err("retry checkpoint turn is not the next unaccepted turn".into());
+    }
+    if retry_state.turn_index != turn_index {
+        return Err("retry checkpoint state turn mismatch".into());
+    }
+    if durable_calls < checkpoint.calls_used {
+        return Err("durable call count moved backwards".into());
+    }
+    checkpoint.calls_used = durable_calls;
+    checkpoint.retry_state = Some(retry_state);
+    checkpoint.recorded_at_unix_ms = 0;
+    Ok(checkpoint)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptedAttemptAuditFailure {
+    ZeroCalls,
+    BudgetExhausted,
+}
+
+fn accepted_attempt_audit_failure(
+    calls_this_attempt: usize,
+    durable_calls: u32,
+    max_calls: u32,
+) -> Option<AcceptedAttemptAuditFailure> {
+    if calls_this_attempt == 0 {
+        Some(AcceptedAttemptAuditFailure::ZeroCalls)
+    } else if durable_calls > max_calls {
+        Some(AcceptedAttemptAuditFailure::BudgetExhausted)
+    } else {
+        None
+    }
+}
+
+fn persist_checkpoint_and_integrity(
+    paths: &EnduranceEvidencePaths,
+    checkpoint: &EnduranceCheckpoint,
+    label: &str,
+) -> Result<(), EnduranceError> {
+    if checkpoint.sqlite_authority.is_some() {
+        validate_live_sqlite_resume_authority(checkpoint)?;
+    }
+    let mut bound = checkpoint.clone();
+    bound.sqlite_authority = Some(capture_sqlite_authority_binding(&bound)?);
+    write_checkpoint(&paths.checkpoint_jsonl, &bound)?;
+    harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
+        .map(|_| ())
+        .map_err(|error| {
+            EnduranceError::InvalidConfig(format!("{label} checkpoint integrity baseline: {error}"))
+        })
+}
+
+fn validate_sqlite_authority_values(
+    checkpoint: &EnduranceCheckpoint,
+    campaign_revision: u64,
+    chronicle_revision: u64,
+    actual: &EnduranceSqliteAuthority,
+) -> Result<(), String> {
+    if checkpoint.campaign_revision != campaign_revision {
+        return Err("SQLite campaign revision does not match checkpoint".into());
+    }
+    if checkpoint.chronicle_revision != chronicle_revision {
+        return Err("SQLite chronicle revision does not match checkpoint".into());
+    }
+    if actual.committed_turns != u64::from(checkpoint.accepted_turn_number) {
+        return Err("SQLite committed-turn count does not match checkpoint".into());
+    }
+    let recorded = checkpoint
+        .sqlite_authority
+        .as_ref()
+        .ok_or_else(|| "checkpoint is missing SQLite authority binding".to_string())?;
+    if recorded != actual {
+        return Err("SQLite accepted-state authority binding drifted from checkpoint".into());
+    }
+    Ok(())
+}
+
+fn capture_sqlite_authority_binding(
+    checkpoint: &EnduranceCheckpoint,
+) -> Result<EnduranceSqliteAuthority, EnduranceError> {
+    let campaign_id = checkpoint
+        .campaign_id
+        .as_deref()
+        .map(storyforge_domain::Id::from_str)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "SQLite checkpoint is missing its campaign identity".into(),
+            )
+        })?;
+    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .map_err(EnduranceError::Writer)?
+        .ok_or_else(|| EnduranceError::Writer("checkpoint SQLite campaign is missing".into()))?;
+    let conversation_id = checkpoint
+        .conversation_id
+        .as_deref()
+        .map(storyforge_domain::Id::from_str)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "SQLite checkpoint is missing its conversation identity".into(),
+            )
+        })?;
+    let conversation = storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+        .map_err(EnduranceError::Writer)?
+        .ok_or_else(|| {
+            EnduranceError::Writer("checkpoint SQLite conversation is missing".into())
+        })?;
+    if conversation.campaign_id.as_ref() != Some(&campaign_id) {
+        return Err(EnduranceError::InvalidConfig(
+            "checkpoint SQLite conversation campaign scope drifted".into(),
+        ));
+    }
+    let audit = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot()
+        .map_err(EnduranceError::Writer)?;
+    if checkpoint.campaign_revision != campaign.revision
+        || checkpoint.chronicle_revision != campaign.chronicle_revision
+        || u64::from(checkpoint.accepted_turn_number) != audit.committed_turns
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "checkpoint revisions/count do not match live SQLite authority".into(),
+        ));
+    }
+    Ok(EnduranceSqliteAuthority {
+        accepted_content_sha256: audit.accepted_content_sha256,
+        committed_turns: audit.committed_turns,
+        accepted_conversation_nodes: conversation.nodes.len() as u64,
+        accepted_conversation_sha256: conversation_prefix_sha256(
+            &conversation,
+            conversation.nodes.len(),
+        )?,
+    })
+}
+
+fn conversation_prefix_sha256(
+    conversation: &Conversation,
+    node_count: usize,
+) -> Result<String, EnduranceError> {
+    if node_count > conversation.nodes.len() {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite conversation is shorter than its accepted checkpoint prefix".into(),
+        ));
+    }
+    let mut value = serde_json::to_value(conversation).map_err(|error| {
+        EnduranceError::InvalidConfig(format!("serialize SQLite conversation prefix: {error}"))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        EnduranceError::InvalidConfig("SQLite conversation payload is not an object".into())
+    })?;
+    object.remove("updated_at");
+    let nodes = object
+        .get_mut("nodes")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig("SQLite conversation payload has no node array".into())
+        })?;
+    nodes.truncate(node_count);
+    let encoded = serde_json::to_vec(&value).map_err(|error| {
+        EnduranceError::InvalidConfig(format!("encode SQLite conversation prefix: {error}"))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn validate_live_sqlite_resume_preconditions(
+    checkpoint: &EnduranceCheckpoint,
+) -> Result<(), EnduranceError> {
+    let campaign_id = checkpoint
+        .campaign_id
+        .as_deref()
+        .map(storyforge_domain::Id::from_str)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "resume checkpoint is missing SQLite campaign identity".into(),
+            )
+        })?;
+    let recorded = checkpoint.sqlite_authority.as_ref().ok_or_else(|| {
+        EnduranceError::InvalidConfig("checkpoint is missing SQLite authority binding".into())
+    })?;
+    let active_turns = storyforge_tauri_app::sqlite_runtime::list_active_turns()
+        .map_err(EnduranceError::Writer)?;
+    if active_turns.is_empty() {
+        return validate_live_sqlite_resume_authority(checkpoint);
+    }
+    if active_turns.len() != 1 {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite resume recovery requires exactly one global active Turn".into(),
+        ));
+    }
+    let active = &active_turns[0];
+    let conversation_id = checkpoint
+        .conversation_id
+        .as_deref()
+        .map(storyforge_domain::Id::from_str)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "resume checkpoint is missing SQLite conversation identity".into(),
+            )
+        })?;
+    if active.campaign_id != campaign_id
+        || active.conversation_id != conversation_id
+        || active.base_campaign_revision != checkpoint.campaign_revision
+        || !active.status.is_active()
+        || active.accepted_attempt_id.is_some()
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "global active Turn is outside the recoverable checkpoint scope".into(),
+        ));
+    }
+
+    let actual = capture_sqlite_authority_binding(checkpoint)?;
+    if recorded.committed_turns != actual.committed_turns {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite committed-turn authority drifted before recovery".into(),
+        ));
+    }
+    let conversation = storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+        .map_err(EnduranceError::Writer)?
+        .ok_or_else(|| EnduranceError::Writer("resume SQLite conversation is missing".into()))?;
+    let accepted_nodes = usize::try_from(recorded.accepted_conversation_nodes).map_err(|_| {
+        EnduranceError::InvalidConfig("accepted conversation node count exceeds usize".into())
+    })?;
+    if conversation.nodes.len() < accepted_nodes
+        || conversation_prefix_sha256(&conversation, accepted_nodes)?
+            != recorded.accepted_conversation_sha256
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite accepted conversation prefix drifted before recovery".into(),
+        ));
+    }
+
+    match conversation
+        .nodes
+        .iter()
+        .position(|node| node.id == active.input_node_id)
+    {
+        None if conversation.nodes.len() == accepted_nodes => Ok(()),
+        Some(index) if index == accepted_nodes => {
+            let expected_parent = index
+                .checked_sub(1)
+                .map(|parent_index| &conversation.nodes[parent_index].id);
+            if conversation.nodes[index].parent_id.as_ref() != expected_parent {
+                return Err(EnduranceError::InvalidConfig(
+                    "active Turn input is detached from the accepted conversation prefix".into(),
+                ));
+            }
+            let input = conversation.nodes[index].active().ok_or_else(|| {
+                EnduranceError::InvalidConfig("active Turn input node has no active variant".into())
+            })?;
+            if input.role != Role::User || input.status != VariantStatus::Final {
+                return Err(EnduranceError::InvalidConfig(
+                    "active Turn input anchor is not a final User node".into(),
+                ));
+            }
+            if conversation.nodes[index..]
+                .windows(2)
+                .any(|pair| pair[1].parent_id.as_ref() != Some(&pair[0].id))
+            {
+                return Err(EnduranceError::InvalidConfig(
+                    "active Turn conversation tail is not a contiguous chain".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(EnduranceError::InvalidConfig(
+            "active Turn input anchor would truncate accepted conversation history".into(),
+        )),
+    }
+}
+
+fn validate_live_sqlite_resume_authority(
+    checkpoint: &EnduranceCheckpoint,
+) -> Result<(), EnduranceError> {
+    if !storyforge_tauri_app::sqlite_runtime::list_active_turns()
+        .map_err(EnduranceError::Writer)?
+        .is_empty()
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite authority cannot be finalized while an active Turn remains".into(),
+        ));
+    }
+    let campaign_id = checkpoint
+        .campaign_id
+        .as_deref()
+        .map(storyforge_domain::Id::from_str)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "resume checkpoint is missing SQLite campaign identity".into(),
+            )
+        })?;
+    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .map_err(EnduranceError::Writer)?
+        .ok_or_else(|| EnduranceError::Writer("resume SQLite campaign is missing".into()))?;
+    let actual = capture_sqlite_authority_binding(checkpoint)?;
+    validate_sqlite_authority_values(
+        checkpoint,
+        campaign.revision,
+        campaign.chronicle_revision,
+        &actual,
+    )
+    .map_err(EnduranceError::InvalidConfig)
+}
+
+fn validate_continuous_turn_start_authority(
+    checkpoint: &EnduranceCheckpoint,
+    turn_index: u32,
+) -> Result<(), EnduranceError> {
+    if checkpoint.accepted_turn_number.saturating_add(1) != turn_index {
+        return Err(EnduranceError::InvalidConfig(
+            "durable checkpoint is not the immediate predecessor of this turn".into(),
+        ));
+    }
+    if let Some(retry) = checkpoint.retry_state.as_ref()
+        && retry.turn_index != turn_index
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "durable retry state belongs to another turn".into(),
+        ));
+    }
+    validate_live_sqlite_resume_authority(checkpoint)
+}
+
+fn begin_supplemental_probe(
+    paths: &EnduranceEvidencePaths,
+    probe: SupplementalProbe,
+) -> Result<(), EnduranceError> {
+    let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+        EnduranceError::InvalidConfig(format!(
+            "{} probe cannot begin without a durable checkpoint",
+            probe.label()
+        ))
+    })?;
+    probe
+        .begin(&mut checkpoint.probe_state)
+        .map_err(EnduranceError::InvalidConfig)?;
+    persist_checkpoint_and_integrity(paths, &checkpoint, probe.label())
+}
+
+fn finish_supplemental_probe(
+    paths: &EnduranceEvidencePaths,
+    probe: SupplementalProbe,
+    completed: bool,
+    model_label: &str,
+) -> Result<u32, EnduranceError> {
+    let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+        EnduranceError::InvalidConfig(format!(
+            "{} probe cannot finish without a durable checkpoint",
+            probe.label()
+        ))
+    })?;
+    let durable_calls = harness_real_llm::evidence_retention::reconcile_dangling_call_reservations(
+        &paths.root,
+        &checkpoint.run_id,
+        model_label,
+    )
+    .map_err(|error| {
+        EnduranceError::InvalidConfig(format!(
+            "{} call ledger reconciliation rejected: {error}",
+            probe.label()
+        ))
+    })?;
+    if durable_calls < checkpoint.calls_used {
+        return Err(EnduranceError::InvalidConfig(format!(
+            "{} probe durable call count moved backwards",
+            probe.label()
+        )));
+    }
+    checkpoint.calls_used = durable_calls;
+    if completed {
+        probe.mark_completed(&mut checkpoint.probe_state);
+    }
+    persist_checkpoint_and_integrity(paths, &checkpoint, probe.label())?;
+    Ok(durable_calls)
+}
+
+fn latest_probe_state(
+    paths: &EnduranceEvidencePaths,
+) -> Result<EnduranceProbeState, EnduranceError> {
+    read_latest_checkpoint(&paths.checkpoint_jsonl)
+        .map(|checkpoint| checkpoint.probe_state)
+        .ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "latest checkpoint is unavailable while preserving probe state".into(),
+            )
+        })
+}
+
+fn durable_probe_metrics(
+    path: &std::path::Path,
+    role: &str,
+) -> Result<(usize, u32), EnduranceError> {
+    let rows = harness_real_llm::evidence::read_evidence_lines(path)?;
+    let mut calls = 0usize;
+    let mut cached_tokens = 0u32;
+    for row in rows {
+        if row.get("role").and_then(|value| value.as_str()) != Some(role) {
+            continue;
+        }
+        calls = calls.saturating_add(1);
+        cached_tokens = cached_tokens.saturating_add(
+            row.get("cached_tokens")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0),
+        );
+    }
+    Ok((calls, cached_tokens))
+}
+
+fn durable_cache_probe_metrics(path: &std::path::Path) -> Result<(usize, u32), EnduranceError> {
+    let rows = harness_real_llm::evidence::read_evidence_lines(path)?;
+    let mut selected = Vec::new();
+    for tag in [
+        "sqlite-cache-stable-a",
+        "sqlite-cache-stable-b",
+        "sqlite-cache-invalidated",
+    ] {
+        let row = rows
+            .iter()
+            .rev()
+            .find(|row| {
+                row.get("role").and_then(|value| value.as_str()) == Some("cache_probe")
+                    && row.get("tag").and_then(|value| value.as_str()) == Some(tag)
+                    && row.get("outcome").and_then(|value| value.as_str()) == Some("ok")
+            })
+            .ok_or_else(|| {
+                EnduranceError::InvalidConfig(format!(
+                    "completed cache probe is missing successful durable tag {tag}"
+                ))
+            })?;
+        selected.push(row);
+    }
+    let stable_a = selected[0]
+        .get("request_fp16")
+        .and_then(|value| value.as_str());
+    let stable_b = selected[1]
+        .get("request_fp16")
+        .and_then(|value| value.as_str());
+    let invalidated = selected[2]
+        .get("request_fp16")
+        .and_then(|value| value.as_str());
+    if stable_a.is_none() || stable_a != stable_b || stable_b == invalidated {
+        return Err(EnduranceError::InvalidConfig(
+            "durable cache probe fingerprints do not prove stable/stable/invalidated".into(),
+        ));
+    }
+    let cached_tokens = selected.iter().fold(0u32, |total, row| {
+        total.saturating_add(
+            row.get("cached_tokens")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0),
+        )
+    });
+    Ok((selected.len(), cached_tokens))
+}
+
+fn last_request_fp16_for_turn(
+    path: &std::path::Path,
+    turn_index: u32,
+) -> Result<Option<String>, String> {
+    let rows = harness_real_llm::evidence::read_evidence_lines(path)
+        .map_err(|error| format!("read call evidence for resume fingerprint: {error}"))?;
+    Ok(rows.iter().rev().find_map(|row| {
+        let matches_turn =
+            row.get("turn_index").and_then(|value| value.as_u64()) == Some(u64::from(turn_index));
+        let succeeded = row.get("outcome").and_then(|value| value.as_str()) == Some("ok");
+        (matches_turn && succeeded)
+            .then(|| {
+                row.get("request_fp16")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .flatten()
+    }))
+}
+
 fn has_successful_tool_result<'a>(
     steps: impl IntoIterator<Item = &'a harness_real_llm::evidence::EvidenceToolStep>,
     tool_names: &[&str],
@@ -169,6 +858,35 @@ fn has_successful_tool_result<'a>(
             && step.ok == Some(true)
             && tool_names.contains(&step.tool_name.as_str())
     })
+}
+
+fn durable_successful_write_tool_call_steps(path: &std::path::Path) -> Result<usize, String> {
+    let rows = harness_real_llm::evidence::read_evidence_lines(path)
+        .map_err(|error| format!("read durable tool-call evidence: {error}"))?;
+    Ok(rows
+        .iter()
+        .filter(|row| row.get("outcome").and_then(|value| value.as_str()) == Some("ok"))
+        .filter(|row| {
+            row.get("assertion_results")
+                .and_then(|value| value.as_array())
+                .map(|assertions| {
+                    assertions.iter().any(|assertion| {
+                        assertion.get("name").and_then(|value| value.as_str())
+                            == Some("successful_write_attempt")
+                            && assertion.get("passed").and_then(|value| value.as_bool())
+                                == Some(true)
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .flat_map(|row| {
+            row.get("tool_steps")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter(|step| step.get("kind").and_then(|value| value.as_str()) == Some("call"))
+        .count())
 }
 
 fn validate_resume_identity(
@@ -189,7 +907,7 @@ fn validate_resume_identity(
 fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidencePaths) {
     use harness_real_llm::evidence_retention::{
         EVIDENCE_DIR_ENV, EvidenceRootPolicy, open_endurance_run_paths, resolve_evidence_root,
-        resolve_resume_run_dir,
+        resolve_explicit_resume_run_dir,
     };
 
     let allow_ephemeral = std::env::var("STORYFORGE_EVAL_ALLOW_EPHEMERAL_EVIDENCE")
@@ -214,9 +932,9 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
         let raw = raw.trim();
         if !raw.is_empty() {
             let path = PathBuf::from(raw);
-            if path.is_dir() && path.join("endurance_checkpoint.jsonl").exists() {
-                let validated = resolve_resume_run_dir(&path, &policy)
-                    .unwrap_or_else(|e| panic!("fail-closed resume evidence dir rejected: {e}"));
+            if let Some(validated) = resolve_explicit_resume_run_dir(&path, &policy)
+                .unwrap_or_else(|e| panic!("fail-closed resume evidence dir rejected: {e}"))
+            {
                 let name = validated
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -236,11 +954,13 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
     (run_id, dir, paths)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_samples(
     llm: &BudgetedLlmClient,
     call_writer: &EvidenceWriter,
     tool_writer: Option<&EvidenceWriter>,
     cursor: &mut usize,
+    successful_attempt: Option<bool>,
     run_id: &str,
     model_label: &str,
     turn_index: u32,
@@ -249,16 +969,24 @@ fn flush_samples(
     let turn_samples = samples.get(*cursor..).unwrap_or(&[]);
     let mut call_records = Vec::with_capacity(turn_samples.len());
     for sample in turn_samples {
+        let mut assertions = vec![harness_real_llm::evidence::AssertionResult {
+            name: "call_recorded".into(),
+            passed: sample.outcome == "ok",
+            detail: Some(format!("outcome={}", sample.outcome)),
+        }];
+        if let Some(passed) = successful_attempt {
+            assertions.push(harness_real_llm::evidence::AssertionResult {
+                name: "successful_write_attempt".into(),
+                passed,
+                detail: Some(passed.to_string()),
+            });
+        }
         let rec = sample.to_evidence_call(
             run_id,
             "endurance_sqlite",
             turn_index,
             model_label,
-            vec![harness_real_llm::evidence::AssertionResult {
-                name: "call_recorded".into(),
-                passed: sample.outcome == "ok",
-                detail: Some(format!("outcome={}", sample.outcome)),
-            }],
+            assertions,
         );
         call_writer.write_call(rec.clone())?;
         call_records.push(rec);
@@ -325,7 +1053,7 @@ async fn run_sqlite_meta_probe(
     let sample_start = llm.samples().len();
     llm.set_tag("sqlite-meta-probe");
     llm.set_role("meta");
-    meta_chat(
+    let probe_result = meta_chat(
         &runtime,
         &mut conversation,
         session,
@@ -334,16 +1062,18 @@ async fn run_sqlite_meta_probe(
         progress_tx,
     )
     .await
-    .map_err(|error| EnduranceError::Writer(format!("SQLite Meta probe: {error}")))?;
+    .map_err(|error| EnduranceError::Writer(format!("SQLite Meta probe: {error}")));
     let written = flush_samples(
         &llm,
         call_writer,
         Some(tool_writer),
         sample_cursor,
+        None,
         run_id,
         model_label,
         evidence_turn_index,
     )?;
+    probe_result?;
     let samples = llm.samples();
     let probe_steps = samples
         .get(sample_start..)
@@ -389,26 +1119,26 @@ async fn run_character_extractor_probe(
     let sample_start = llm.samples().len();
     llm.set_tag("sqlite-character-extractor-probe");
     llm.set_role("character_extractor");
-    let definitions =
+    let probe_result =
         storyforge_app_agent::extract_characters(&runtime, &character, &[], cancel_rx)
             .await
-            .map_err(|error| {
-                EnduranceError::Writer(format!("CharacterExtractor probe: {error}"))
-            })?;
-    if definitions.is_empty() {
-        return Err(EnduranceError::InvalidConfig(
-            "CharacterExtractor returned no definitions".into(),
-        ));
-    }
+            .map_err(|error| EnduranceError::Writer(format!("CharacterExtractor probe: {error}")));
     let written = flush_samples(
         &llm,
         call_writer,
         Some(tool_writer),
         sample_cursor,
+        None,
         run_id,
         model_label,
         0,
     )?;
+    let definitions = probe_result?;
+    if definitions.is_empty() {
+        return Err(EnduranceError::InvalidConfig(
+            "CharacterExtractor returned no definitions".into(),
+        ));
+    }
     let samples = llm.samples();
     let emitted = samples
         .get(sample_start..)
@@ -445,42 +1175,48 @@ async fn run_cache_fingerprint_probe(
         tools: None,
         params: SamplingParams::default(),
     };
+    let sample_start = llm.samples().len();
     llm.set_role("cache_probe");
-    llm.set_tag("sqlite-cache-stable-a");
-    llm.chat(&stable)
-        .await
-        .map_err(|error| EnduranceError::Writer(format!("cache probe A: {error}")))?;
-    llm.set_tag("sqlite-cache-stable-b");
-    llm.chat(&stable)
-        .await
-        .map_err(|error| EnduranceError::Writer(format!("cache probe B: {error}")))?;
-    let mut changed = stable.clone();
-    changed.messages[1] = ChatMessage::user("stable-input-v2");
-    llm.set_tag("sqlite-cache-invalidated");
-    llm.chat(&changed)
-        .await
-        .map_err(|error| EnduranceError::Writer(format!("cache probe C: {error}")))?;
+    let probe_result = async {
+        llm.set_tag("sqlite-cache-stable-a");
+        llm.chat(&stable)
+            .await
+            .map_err(|error| EnduranceError::Writer(format!("cache probe A: {error}")))?;
+        llm.set_tag("sqlite-cache-stable-b");
+        llm.chat(&stable)
+            .await
+            .map_err(|error| EnduranceError::Writer(format!("cache probe B: {error}")))?;
+        let mut changed = stable.clone();
+        changed.messages[1] = ChatMessage::user("stable-input-v2");
+        llm.set_tag("sqlite-cache-invalidated");
+        llm.chat(&changed)
+            .await
+            .map_err(|error| EnduranceError::Writer(format!("cache probe C: {error}")))?;
 
-    let samples = llm.samples();
-    let probe = samples.iter().rev().take(3).cloned().collect::<Vec<_>>();
-    if probe.len() != 3
-        || probe[0].request_fp16 == probe[1].request_fp16
-        || probe[1].request_fp16 != probe[2].request_fp16
-    {
-        return Err(EnduranceError::InvalidConfig(
-            "cache probe did not observe stable/stable/invalidated request fingerprints".into(),
-        ));
+        let samples = llm.samples();
+        let probe = samples.get(sample_start..).unwrap_or_default();
+        if probe.len() != 3
+            || probe[0].request_fp16 != probe[1].request_fp16
+            || probe[1].request_fp16 == probe[2].request_fp16
+        {
+            return Err(EnduranceError::InvalidConfig(
+                "cache probe did not observe stable/stable/invalidated request fingerprints".into(),
+            ));
+        }
+        Ok(probe.iter().map(|sample| sample.cached_tokens).sum())
     }
-    let cached_tokens = probe.iter().map(|sample| sample.cached_tokens).sum();
+    .await;
     let written = flush_samples(
         &llm,
         call_writer,
         Some(tool_writer),
         sample_cursor,
+        None,
         run_id,
         model_label,
         evidence_turn_index,
     )?;
+    let cached_tokens = probe_result?;
     Ok((written, cached_tokens))
 }
 
@@ -513,10 +1249,35 @@ struct SqliteEnduranceStageContext<'a> {
     conversation_id: storyforge_domain::Id,
     stage: EnduranceStage,
     budget: &'a RealLlmRunBudget,
+    call_limit: u32,
     paths: &'a EnduranceEvidencePaths,
     runtime_profile: RuntimeCoverageProfile,
     model_label: &'a str,
     run_identity: EnduranceRunIdentity,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CoverageLedgerEvidenceRow {
+    schema_version: String,
+    run_id: String,
+    observation: harness_real_llm::coverage_ledger::ObservedCoverage,
+}
+
+fn parse_coverage_ledger_evidence(
+    line: &str,
+    expected_run_id: &str,
+) -> Result<harness_real_llm::coverage_ledger::ObservedCoverage, EnduranceError> {
+    let evidence: CoverageLedgerEvidenceRow = serde_json::from_str(line).map_err(|error| {
+        EnduranceError::InvalidConfig(format!("coverage ledger parse: {error}"))
+    })?;
+    if evidence.schema_version != harness_real_llm::evidence::EVIDENCE_SCHEMA_VERSION
+        || evidence.run_id != expected_run_id
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "coverage ledger identity or schema drift".into(),
+        ));
+    }
+    Ok(evidence.observation)
 }
 
 async fn run_sqlite_endurance_stage(
@@ -529,6 +1290,7 @@ async fn run_sqlite_endurance_stage(
         conversation_id,
         stage,
         budget,
+        call_limit,
         paths,
         runtime_profile,
         model_label,
@@ -539,6 +1301,15 @@ async fn run_sqlite_endurance_stage(
     let extractor_probe_enabled = env_flag("STORYFORGE_EVAL_CHARACTER_EXTRACTOR_PROBE");
     let cache_probe_enabled = env_flag("STORYFORGE_EVAL_CACHE_PROBE");
     let supplemental_matrix = env_flag("STORYFORGE_EVAL_SUPPLEMENTAL_MATRIX");
+    if run_identity.supplemental_matrix != supplemental_matrix
+        || run_identity.meta_probe != meta_probe_enabled
+        || run_identity.character_extractor_probe != extractor_probe_enabled
+        || run_identity.cache_probe != cache_probe_enabled
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "run identity does not match requested supplemental probe matrix".into(),
+        ));
+    }
     if supplemental_matrix && target_turns != 12 {
         return Err(EnduranceError::InvalidConfig(
             "supplemental matrix requires STORYFORGE_EVAL_ENDURANCE_STAGE=coverage".into(),
@@ -580,7 +1351,7 @@ async fn run_sqlite_endurance_stage(
 
     if let Some(checkpoint) = resume_cp.as_ref() {
         let recorded =
-            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+            harness_real_llm::evidence_retention::count_budgeted_call_records(&paths.root, &run_id)
                 .map_err(|error| {
                     EnduranceError::InvalidConfig(format!("resume call ledger rejected: {error}"))
                 })?;
@@ -595,48 +1366,51 @@ async fn run_sqlite_endurance_stage(
     let deadline = SuiteDeadline::new(budget.hard_deadline_override(target_turns, stage));
     deadline.check()?;
 
-    let call_writer = if start_turn > 1 {
+    let is_resume = resume_cp.is_some();
+    let call_writer = if is_resume {
         EvidenceWriter::open_append(&paths.calls_jsonl, &run_id)?
     } else {
         EvidenceWriter::create(&paths.calls_jsonl, &run_id)?
     };
-    let tool_writer = if start_turn > 1 {
+    let tool_writer = if is_resume {
         EvidenceWriter::open_append(&paths.tool_trace_jsonl, &run_id)?
     } else {
         EvidenceWriter::create(&paths.tool_trace_jsonl, &run_id)?
     };
-    let turn_writer = if start_turn > 1 {
+    let turn_writer = if is_resume {
         EvidenceWriter::open_append(&paths.turns_jsonl, &run_id)?
     } else {
         EvidenceWriter::create(&paths.turns_jsonl, &run_id)?
     };
-    let ledger_path = paths.root.join("endurance_coverage_ledger.jsonl");
-    let mut ledger_lines = Vec::new();
-    if start_turn == 1 && ledger_path.exists() {
+    let ledger_path = paths.coverage_ledger_jsonl.clone();
+    if !is_resume && ledger_path.exists() {
         let _ = std::fs::remove_file(&ledger_path);
     }
     // Resume must reload previously sealed coverage observations; exact-set
     // verification is suite-wide, not process-local.
-    if start_turn > 1 && ledger_path.exists() {
+    if is_resume && ledger_path.exists() {
         let prior = std::fs::read_to_string(&ledger_path).map_err(EnduranceError::EvidenceIo)?;
         for line in prior.lines().filter(|l| !l.trim().is_empty()) {
-            let obs: harness_real_llm::coverage_ledger::ObservedCoverage =
-                serde_json::from_str(line).map_err(|e| {
-                    EnduranceError::InvalidConfig(format!("coverage ledger parse: {e}"))
-                })?;
-            ledger.record(obs.clone());
-            ledger_lines.push(line.to_string());
+            ledger.record(parse_coverage_ledger_evidence(line, &run_id)?);
         }
     }
 
     let mut turns_accepted = start_turn.saturating_sub(1);
-    // Assigned before first checkpoint read; initial values are never observed.
-    #[allow(clippy::needless_late_init, unused_assignments)]
-    let mut last_draft_hash16 = String::new();
-    #[allow(clippy::needless_late_init, unused_assignments)]
-    let mut last_campaign_revision = 0u64;
-    #[allow(clippy::needless_late_init, unused_assignments)]
-    let mut last_chronicle_revision = 0u64;
+    let authoritative_campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .map_err(EnduranceError::Writer)?
+        .ok_or_else(|| EnduranceError::Writer("active SQLite campaign missing".into()))?;
+    let mut last_draft_hash16 = resume_cp
+        .as_ref()
+        .map(|checkpoint| checkpoint.last_draft_hash16.clone())
+        .unwrap_or_default();
+    let mut last_campaign_revision = resume_cp
+        .as_ref()
+        .map(|checkpoint| checkpoint.campaign_revision)
+        .unwrap_or(authoritative_campaign.revision);
+    let mut last_chronicle_revision = resume_cp
+        .as_ref()
+        .map(|checkpoint| checkpoint.chronicle_revision)
+        .unwrap_or(authoritative_campaign.chronicle_revision);
     let mut epoch_tracker = EpochTracker::default();
     if let Some(cp) = resume_cp.as_ref() {
         for eid in &cp.observed_epoch_ids16 {
@@ -644,35 +1418,96 @@ async fn run_sqlite_endurance_stage(
         }
     }
 
-    let extractor_probe_calls = if extractor_probe_enabled && start_turn == 1 {
-        run_character_extractor_probe(
-            env,
-            llm.clone(),
-            &call_writer,
-            &tool_writer,
-            &mut sample_cursor,
-            &run_id,
-            model_label,
-        )
-        .await?
-    } else if extractor_probe_enabled {
-        let prior = harness_real_llm::evidence::read_evidence_lines(&paths.calls_jsonl)?;
-        let found = prior.iter().any(|value| {
-            value.get("role").and_then(|role| role.as_str()) == Some("character_extractor")
-        });
-        if !found {
+    if !is_resume {
+        let initial_checkpoint = EnduranceCheckpoint {
+            schema_version: EnduranceCheckpoint::schema_version().into(),
+            run_id: run_id.clone(),
+            stage: stage.label().into(),
+            accepted_turn_number: 0,
+            calls_used: 0,
+            max_calls: call_limit,
+            campaign_revision: last_campaign_revision,
+            chronicle_revision: last_chronicle_revision,
+            last_draft_hash16: String::new(),
+            last_summary_code: None,
+            context_epoch_id16: None,
+            early_fact_probe_ids: vec![],
+            early_fact_checked_passed: vec![],
+            campaign_id: Some(campaign_id.as_str().to_string()),
+            conversation_id: Some(conversation_id.as_str().to_string()),
+            data_dir_rel: Some("campaign_data".into()),
+            observed_epoch_ids16: vec![],
+            run_identity: Some(run_identity.clone()),
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
+            recorded_at_unix_ms: 0,
+        };
+        persist_checkpoint_and_integrity(paths, &initial_checkpoint, "initial")?;
+    }
+
+    if extractor_probe_enabled {
+        let completed = read_latest_checkpoint(&paths.checkpoint_jsonl)
+            .map(|checkpoint| {
+                SupplementalProbe::CharacterExtractor.completed(&checkpoint.probe_state)
+            })
+            .unwrap_or(false);
+        if !completed {
+            llm.set_evidence_turn_index(0);
+            begin_supplemental_probe(paths, SupplementalProbe::CharacterExtractor)?;
+            let probe_result = run_character_extractor_probe(
+                env,
+                llm.clone(),
+                &call_writer,
+                &tool_writer,
+                &mut sample_cursor,
+                &run_id,
+                model_label,
+            )
+            .await;
+            let durable_calls = finish_supplemental_probe(
+                paths,
+                SupplementalProbe::CharacterExtractor,
+                probe_result.is_ok(),
+                model_label,
+            )?;
+            if durable_calls > call_limit {
+                return Err(EnduranceError::BudgetExhausted {
+                    calls_used: durable_calls,
+                    max_calls: call_limit,
+                });
+            }
+            probe_result?;
+        }
+    }
+    let (extractor_probe_calls, _) = if extractor_probe_enabled {
+        let metrics = durable_probe_metrics(&paths.calls_jsonl, "character_extractor")?;
+        if metrics.0 == 0 {
             return Err(EnduranceError::InvalidConfig(
-                "resume evidence is missing the requested CharacterExtractor probe".into(),
+                "completed CharacterExtractor probe has no durable call evidence".into(),
             ));
         }
-        1
+        metrics
     } else {
-        0
+        (0, 0)
     };
-    let mut last_accepted_request_fp16: Option<String> = None;
+    let mut last_accepted_request_fp16 = match resume_cp.as_ref() {
+        Some(checkpoint) if checkpoint.accepted_turn_number > 0 => {
+            last_request_fp16_for_turn(&paths.calls_jsonl, checkpoint.accepted_turn_number)
+                .map_err(EnduranceError::InvalidConfig)?
+        }
+        _ => None,
+    };
 
     for turn_index in start_turn..=target_turns {
         deadline.check()?;
+        let turn_start_checkpoint =
+            read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+                EnduranceError::InvalidConfig(
+                    "continuous turn start has no durable checkpoint".into(),
+                )
+            })?;
+        validate_continuous_turn_start_authority(&turn_start_checkpoint, turn_index)?;
         let action = action_with_runtime_profile(
             scheduled_action_for_run(&schedule, turn_index, supplemental_matrix),
             runtime_profile,
@@ -765,6 +1600,7 @@ async fn run_sqlite_endurance_stage(
             }
         };
 
+        llm.set_evidence_turn_index(turn_index);
         llm.set_tag(format!("sqlite-turn{turn_index}"));
         llm.set_role("pipeline");
 
@@ -784,12 +1620,95 @@ async fn run_sqlite_endurance_stage(
             _ => None,
         };
 
-        const MAX_WRITE_ATTEMPTS: usize = 5;
-        let turn_sample_start = llm.samples().len();
+        let mut successful_attempt_sample_start = None;
+        let mut accepted_calls_this_attempt = None;
         let mut written = None;
         let mut last_err = None;
-        for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        let mut current_retry_state = match read_latest_checkpoint(&paths.checkpoint_jsonl)
+            .and_then(|checkpoint| checkpoint.retry_state)
+        {
+            Some(state) if state.turn_index == turn_index => Some(state),
+            Some(_) => {
+                return Err(EnduranceError::InvalidConfig(
+                    "durable retry state belongs to a different turn".into(),
+                ));
+            }
+            None => None,
+        };
+        if let Some(state) = current_retry_state.as_ref()
+            && (!state.can_retry || state.attempts_used >= MAX_WRITE_ATTEMPTS)
+        {
+            return Err(EnduranceError::InvalidConfig(format!(
+                "turn {turn_index} durable retry budget exhausted after {} attempts",
+                state.attempts_used
+            )));
+        }
+        let first_attempt = current_retry_state
+            .as_ref()
+            .map(|state| state.attempts_used.saturating_add(1))
+            .unwrap_or(1);
+        let base_failure_checkpoint = || {
+            read_latest_checkpoint(&paths.checkpoint_jsonl).or_else(|| {
+                Some(EnduranceCheckpoint {
+                    schema_version: EnduranceCheckpoint::schema_version().into(),
+                    run_id: run_id.clone(),
+                    stage: stage.label().into(),
+                    accepted_turn_number: turns_accepted,
+                    calls_used: 0,
+                    max_calls: call_limit,
+                    campaign_revision: last_campaign_revision,
+                    chronicle_revision: last_chronicle_revision,
+                    last_draft_hash16: last_draft_hash16.clone(),
+                    last_summary_code: None,
+                    context_epoch_id16: None,
+                    early_fact_probe_ids: vec![],
+                    early_fact_checked_passed: vec![],
+                    campaign_id: Some(campaign_id.as_str().to_string()),
+                    conversation_id: Some(conversation_id.as_str().to_string()),
+                    data_dir_rel: Some("campaign_data".into()),
+                    observed_epoch_ids16: epoch_tracker.observed.clone(),
+                    run_identity: Some(run_identity.clone()),
+                    retry_state: None,
+                    probe_state: EnduranceProbeState::default(),
+                    sqlite_authority: None,
+                    recorded_at_unix_ms: 0,
+                })
+            })
+        };
+        let persist_failed_attempt =
+            |retry_state: EnduranceRetryState, runner_calls: u32| -> Result<(), EnduranceError> {
+                let failure_base = base_failure_checkpoint().ok_or_else(|| {
+                    EnduranceError::InvalidConfig(
+                        "failed attempt has no durable checkpoint authority".into(),
+                    )
+                })?;
+                validate_live_sqlite_resume_preconditions(&failure_base)?;
+                // Always close and truncate an incomplete pre-land Turn before
+                // binding a retry checkpoint. If Accept raced to a terminal
+                // commit, the unchanged checkpoint revisions/count will make
+                // the authority capture below fail closed.
+                env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+                    .map_err(EnduranceError::Writer)?;
+                let failure_checkpoint = checkpoint_after_failed_attempt(
+                    Some(failure_base),
+                    turn_index,
+                    runner_calls,
+                    retry_state,
+                )
+                .map_err(EnduranceError::InvalidConfig)?;
+                validate_live_sqlite_resume_authority(&failure_checkpoint)?;
+                persist_checkpoint_and_integrity(paths, &failure_checkpoint, "failed-attempt")
+            };
+        for attempt in first_attempt..=MAX_WRITE_ATTEMPTS {
             deadline.check()?;
+            let attempt_checkpoint =
+                read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+                    EnduranceError::InvalidConfig(
+                        "attempt dispatch has no durable checkpoint authority".into(),
+                    )
+                })?;
+            validate_continuous_turn_start_authority(&attempt_checkpoint, turn_index)?;
+            let attempt_sample_start = llm.samples().len();
             let fut = async {
                 if let Some(targets) = regen_targets.clone() {
                     env.regenerate_accept_turn(
@@ -815,75 +1734,96 @@ async fn run_sqlite_endurance_stage(
             let result = match tokio::time::timeout(deadline.remaining()?, fut).await {
                 Ok(r) => r,
                 Err(_) => {
-                    let _ = flush_samples(
+                    flush_samples(
                         &llm,
                         &call_writer,
                         Some(&tool_writer),
                         &mut sample_cursor,
+                        Some(false),
                         &run_id,
                         model_label,
                         turn_index,
-                    );
+                    )?;
+                    let runner_calls =
+                        harness_real_llm::evidence_retention::reconcile_dangling_call_reservations(
+                            &paths.root,
+                            &run_id,
+                            model_label,
+                        )
+                        .map_err(|error| {
+                            EnduranceError::InvalidConfig(format!(
+                                "durable call ledger rejected after suite timeout: {error}"
+                            ))
+                        })?;
+                    // An outer deadline can race a just-completed SQLite Accept.
+                    // Persist the call ledger but make the attempt non-retryable:
+                    // a later process must fail closed instead of replaying an
+                    // ambiguously committed turn.
+                    let retry_state = next_retry_state(
+                        current_retry_state.as_ref(),
+                        turn_index,
+                        WriteFailureClass::Fatal,
+                    )
+                    .map_err(EnduranceError::InvalidConfig)?;
+                    persist_failed_attempt(retry_state, runner_calls)?;
+                    if runner_calls > call_limit {
+                        return Err(EnduranceError::BudgetExhausted {
+                            calls_used: runner_calls,
+                            max_calls: call_limit,
+                        });
+                    }
                     return Err(EnduranceError::SuiteTimeout);
                 }
             };
+            let successful_write_attempt = matches!(&result, Ok(written) if written.accept.ok);
             let calls_this_turn = flush_samples(
                 &llm,
                 &call_writer,
                 Some(&tool_writer),
                 &mut sample_cursor,
+                Some(successful_write_attempt),
                 &run_id,
                 model_label,
                 turn_index,
             )?;
-            let runner_calls = harness_real_llm::evidence_retention::count_evidence_call_records(
-                &paths.root,
-                &run_id,
-            )
-            .map_err(|error| {
-                EnduranceError::InvalidConfig(format!("durable call ledger rejected: {error}"))
-            })?;
-            if runner_calls > stage.max_calls() {
-                return Err(EnduranceError::BudgetExhausted {
-                    calls_used: runner_calls,
-                    max_calls: stage.max_calls(),
-                });
-            }
+            let runner_calls =
+                harness_real_llm::evidence_retention::reconcile_dangling_call_reservations(
+                    &paths.root,
+                    &run_id,
+                    model_label,
+                )
+                .map_err(|error| {
+                    EnduranceError::InvalidConfig(format!(
+                        "durable call ledger reconciliation rejected: {error}"
+                    ))
+                })?;
             match result {
                 Ok(w) => {
-                    if calls_this_turn == 0 {
-                        return Err(EnduranceError::ZeroCalls { turn_index });
-                    }
+                    accepted_calls_this_attempt = Some(calls_this_turn);
+                    successful_attempt_sample_start = Some(attempt_sample_start);
                     written = Some(w);
                     break;
                 }
                 Err(err) => {
-                    let transient = err.contains("PlanParse")
-                        || err.contains("Plan 解析")
-                        || err.contains("未找到有效 Plan")
-                        || err.contains("already has active turn")
-                        || err.contains("timeout")
-                        || err.contains("Timeout")
-                        || err.contains("超时")
-                        || err.contains("空闲超时")
-                        || err.contains("流式空闲")
-                        || err.contains("HTTP 请求失败")
-                        || err.contains("520")
-                        || err.contains("rate limit")
-                        || err.contains("client_error")
-                        || err.contains("LlmError")
-                        || err.contains("Internal")
-                        || err.contains("所有子 Agent 均失败")
-                        || err.contains("不在旧 Plan")
-                        || err.contains("部分重 roll")
-                        || err.contains("expected Generating")
-                        || err.contains("is Failed");
+                    let failure_class = classify_write_failure(&err, &action);
+                    let transient = failure_class.retryable();
+                    let retry_state =
+                        next_retry_state(current_retry_state.as_ref(), turn_index, failure_class)
+                            .map_err(EnduranceError::InvalidConfig)?;
+                    persist_failed_attempt(retry_state.clone(), runner_calls)?;
+                    current_retry_state = Some(retry_state);
                     eprintln!(
                         "[sqlite endurance {}] turn {turn_index} attempt {attempt}/{MAX_WRITE_ATTEMPTS} failed (transient={transient}, {})",
                         stage.label(),
                         safe_error_summary(&err)
                     );
                     last_err = Some(err);
+                    if runner_calls > call_limit {
+                        return Err(EnduranceError::BudgetExhausted {
+                            calls_used: runner_calls,
+                            max_calls: call_limit,
+                        });
+                    }
                     if !transient || attempt == MAX_WRITE_ATTEMPTS {
                         break;
                     }
@@ -911,7 +1851,7 @@ async fn run_sqlite_endurance_stage(
         last_chronicle_revision = written.accept.chronicle_revision_after;
         last_draft_hash16 = short_hash16(&written.accept.draft_hash);
         let durable_calls =
-            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+            harness_real_llm::evidence_retention::count_budgeted_call_records(&paths.root, &run_id)
                 .map_err(|error| {
                     EnduranceError::InvalidConfig(format!("accepted call ledger rejected: {error}"))
                 })?;
@@ -921,7 +1861,7 @@ async fn run_sqlite_endurance_stage(
             stage: stage.label().into(),
             accepted_turn_number: turn_index,
             calls_used: durable_calls,
-            max_calls: stage.max_calls(),
+            max_calls: call_limit,
             campaign_revision: last_campaign_revision,
             chronicle_revision: last_chronicle_revision,
             last_draft_hash16: last_draft_hash16.clone(),
@@ -934,18 +1874,30 @@ async fn run_sqlite_endurance_stage(
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: epoch_tracker.observed.clone(),
             run_identity: Some(run_identity.clone()),
+            retry_state: None,
+            probe_state: latest_probe_state(paths)?,
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
-        write_checkpoint(&paths.checkpoint_jsonl, &accepted_checkpoint)?;
-        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
-            .map_err(|error| {
-                EnduranceError::InvalidConfig(format!(
-                    "accepted checkpoint integrity baseline: {error}"
-                ))
-            })?;
+        persist_checkpoint_and_integrity(paths, &accepted_checkpoint, "accepted")?;
+        let accepted_audit_failure = accepted_attempt_audit_failure(
+            accepted_calls_this_attempt.unwrap_or(0),
+            durable_calls,
+            call_limit,
+        );
+        if accepted_audit_failure == Some(AcceptedAttemptAuditFailure::ZeroCalls) {
+            return Err(EnduranceError::ZeroCalls { turn_index });
+        }
 
         let current_samples = llm.samples();
-        let current_turn_samples = current_samples.get(turn_sample_start..).unwrap_or_default();
+        let successful_attempt_sample_start = successful_attempt_sample_start.ok_or_else(|| {
+            EnduranceError::InvalidConfig(
+                "accepted turn is missing its successful-attempt sample boundary".into(),
+            )
+        })?;
+        let current_turn_samples = current_samples
+            .get(successful_attempt_sample_start..)
+            .unwrap_or_default();
         let current_request_fp16 = current_turn_samples
             .last()
             .map(|sample| sample.request_fp16.clone());
@@ -1154,8 +2106,14 @@ async fn run_sqlite_endurance_stage(
         last_accepted_request_fp16 = current_request_fp16;
 
         ledger.record(observed.clone());
-        let line = serde_json::to_string(&observed).unwrap_or_default();
-        ledger_lines.push(line.clone());
+        let line = serde_json::to_string(&CoverageLedgerEvidenceRow {
+            schema_version: harness_real_llm::evidence::EVIDENCE_SCHEMA_VERSION.into(),
+            run_id: run_id.clone(),
+            observation: observed,
+        })
+        .map_err(|error| {
+            EnduranceError::InvalidConfig(format!("coverage ledger serialization: {error}"))
+        })?;
         // Durable per-turn append so resume can rebuild exact-set without replaying.
         {
             use std::io::Write;
@@ -1168,6 +2126,7 @@ async fn run_sqlite_endurance_stage(
                 .open(&ledger_path)
                 .map_err(EnduranceError::EvidenceIo)?;
             writeln!(f, "{line}").map_err(EnduranceError::EvidenceIo)?;
+            f.sync_data().map_err(EnduranceError::EvidenceIo)?;
         }
 
         let ctx = env
@@ -1236,7 +2195,7 @@ async fn run_sqlite_endurance_stage(
             stage: stage.label().into(),
             accepted_turn_number: turn_index,
             calls_used: durable_calls,
-            max_calls: stage.max_calls(),
+            max_calls: call_limit,
             campaign_revision: last_campaign_revision,
             chronicle_revision: last_chronicle_revision,
             last_draft_hash16: last_draft_hash16.clone(),
@@ -1249,13 +2208,18 @@ async fn run_sqlite_endurance_stage(
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: epoch_tracker.observed.clone(),
             run_identity: Some(run_identity.clone()),
+            retry_state: None,
+            probe_state: latest_probe_state(paths)?,
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
-        write_checkpoint(&paths.checkpoint_jsonl, &cp)?;
-        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
-            .map_err(|e| {
-                EnduranceError::InvalidConfig(format!("checkpoint integrity baseline: {e}"))
-            })?;
+        persist_checkpoint_and_integrity(paths, &cp, "turn-audit")?;
+        if accepted_audit_failure == Some(AcceptedAttemptAuditFailure::BudgetExhausted) {
+            return Err(EnduranceError::BudgetExhausted {
+                calls_used: durable_calls,
+                max_calls: call_limit,
+            });
+        }
         eprintln!(
             "[sqlite endurance {}] turn {turn_index}/{target_turns} accepted",
             stage.label()
@@ -1264,93 +2228,91 @@ async fn run_sqlite_endurance_stage(
 
     let mut meta_probe_calls = 0usize;
     if meta_probe_enabled {
-        meta_probe_calls = run_sqlite_meta_probe(
-            env,
-            llm.clone(),
-            &conversation_id,
-            &call_writer,
-            &tool_writer,
-            &mut sample_cursor,
-            &run_id,
-            model_label,
-            target_turns.saturating_add(1),
-        )
-        .await?;
-        let durable_calls =
-            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
-                .map_err(|error| {
-                    EnduranceError::InvalidConfig(format!("Meta call ledger rejected: {error}"))
-                })?;
-        if durable_calls > stage.max_calls() {
-            return Err(EnduranceError::BudgetExhausted {
-                calls_used: durable_calls,
-                max_calls: stage.max_calls(),
-            });
+        let completed = SupplementalProbe::Meta.completed(&latest_probe_state(paths)?);
+        if !completed {
+            llm.set_evidence_turn_index(target_turns.saturating_add(1));
+            begin_supplemental_probe(paths, SupplementalProbe::Meta)?;
+            let probe_result = run_sqlite_meta_probe(
+                env,
+                llm.clone(),
+                &conversation_id,
+                &call_writer,
+                &tool_writer,
+                &mut sample_cursor,
+                &run_id,
+                model_label,
+                target_turns.saturating_add(1),
+            )
+            .await;
+            let durable_calls = finish_supplemental_probe(
+                paths,
+                SupplementalProbe::Meta,
+                probe_result.is_ok(),
+                model_label,
+            )?;
+            if durable_calls > call_limit {
+                return Err(EnduranceError::BudgetExhausted {
+                    calls_used: durable_calls,
+                    max_calls: call_limit,
+                });
+            }
+            probe_result?;
         }
-        let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
-            EnduranceError::InvalidConfig("Meta probe cannot update missing checkpoint".into())
-        })?;
-        checkpoint.calls_used = durable_calls;
-        write_checkpoint(&paths.checkpoint_jsonl, &checkpoint)?;
-        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
-            .map_err(|error| {
-                EnduranceError::InvalidConfig(format!(
-                    "Meta checkpoint integrity baseline: {error}"
-                ))
-            })?;
+        meta_probe_calls = durable_probe_metrics(&paths.calls_jsonl, "meta")?.0;
+        if meta_probe_calls == 0 {
+            return Err(EnduranceError::InvalidConfig(
+                "completed Meta probe has no durable call evidence".into(),
+            ));
+        }
     }
 
     let mut cache_probe_calls = 0usize;
     let mut cache_probe_cached_tokens = 0u32;
     if cache_probe_enabled {
-        (cache_probe_calls, cache_probe_cached_tokens) = run_cache_fingerprint_probe(
-            llm.clone(),
-            &call_writer,
-            &tool_writer,
-            &mut sample_cursor,
-            &run_id,
-            model_label,
-            target_turns.saturating_add(2),
-        )
-        .await?;
-        let durable_calls =
-            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
-                .map_err(|error| {
-                    EnduranceError::InvalidConfig(format!("cache call ledger rejected: {error}"))
-                })?;
-        if durable_calls > stage.max_calls() {
-            return Err(EnduranceError::BudgetExhausted {
-                calls_used: durable_calls,
-                max_calls: stage.max_calls(),
-            });
+        let completed = SupplementalProbe::Cache.completed(&latest_probe_state(paths)?);
+        if !completed {
+            llm.set_evidence_turn_index(target_turns.saturating_add(2));
+            begin_supplemental_probe(paths, SupplementalProbe::Cache)?;
+            let probe_result = run_cache_fingerprint_probe(
+                llm.clone(),
+                &call_writer,
+                &tool_writer,
+                &mut sample_cursor,
+                &run_id,
+                model_label,
+                target_turns.saturating_add(2),
+            )
+            .await;
+            let durable_calls = finish_supplemental_probe(
+                paths,
+                SupplementalProbe::Cache,
+                probe_result.is_ok(),
+                model_label,
+            )?;
+            if durable_calls > call_limit {
+                return Err(EnduranceError::BudgetExhausted {
+                    calls_used: durable_calls,
+                    max_calls: call_limit,
+                });
+            }
+            probe_result?;
         }
-        let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
-            EnduranceError::InvalidConfig("cache probe cannot update missing checkpoint".into())
-        })?;
-        checkpoint.calls_used = durable_calls;
-        write_checkpoint(&paths.checkpoint_jsonl, &checkpoint)?;
-        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
-            .map_err(|error| {
-                EnduranceError::InvalidConfig(format!(
-                    "cache checkpoint integrity baseline: {error}"
-                ))
-            })?;
+        (cache_probe_calls, cache_probe_cached_tokens) =
+            durable_cache_probe_metrics(&paths.calls_jsonl)?;
+        if cache_probe_calls == 0 {
+            return Err(EnduranceError::InvalidConfig(
+                "completed cache probe has no durable call evidence".into(),
+            ));
+        }
     }
-
-    std::fs::write(&ledger_path, ledger_lines.join("\n") + "\n")
-        .map_err(EnduranceError::EvidenceIo)?;
 
     if let Err(ms) = ledger.exact_set_verify() {
         return Err(EnduranceError::InvalidConfig(format!(
             "coverage ledger exact-set failed: {ms:?}"
         )));
     }
-    let tool_call_steps = llm
-        .samples()
-        .iter()
-        .flat_map(|sample| sample.tool_steps.iter())
-        .filter(|step| step.kind == "call")
-        .count();
+    let tool_call_steps = durable_successful_write_tool_call_steps(&paths.calls_jsonl)
+        .map_err(EnduranceError::InvalidConfig)?;
     if tool_call_steps == 0 {
         return Err(EnduranceError::InvalidConfig(format!(
             "configured {} tool transport produced no actual tool-call steps",
@@ -1369,14 +2331,15 @@ async fn run_sqlite_endurance_stage(
     }
 
     let calls_used =
-        harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+        harness_real_llm::evidence_retention::count_budgeted_call_records(&paths.root, &run_id)
             .map_err(|error| {
                 EnduranceError::InvalidConfig(format!("final call ledger rejected: {error}"))
             })?;
-    let acceptance = classify_acceptance(
+    let acceptance = classify_acceptance_with_call_limit(
         stage,
         turns_accepted,
         calls_used,
+        call_limit,
         turns_accepted >= target_turns,
         false,
         false,
@@ -1448,7 +2411,7 @@ async fn run_sqlite_endurance_stage(
         target_turns,
         accepted_turns: turns_accepted,
         calls_used,
-        max_calls: stage.max_calls(),
+        max_calls: call_limit,
         elapsed_ms: deadline.started.elapsed().as_millis(),
         acceptance: acceptance.label().into(),
         summary_codes: vec![],
@@ -1497,6 +2460,32 @@ fn supplemental_matrix_fits_special_paths_into_twelve_accepted_turns() {
 }
 
 #[test]
+fn coverage_ledger_rows_bind_run_identity_at_the_top_level() {
+    let observation = harness_real_llm::coverage_ledger::ObservedCoverage {
+        row_id: "row-1".into(),
+        turn_index: 1,
+        command_path: "command".into(),
+        service_path: "service".into(),
+        agent_events: vec![],
+        turn_id16: "1111111111111111".into(),
+        attempt_id16: "2222222222222222".into(),
+        variant_id16: "3333333333333333".into(),
+        sqlite_post: harness_real_llm::coverage_ledger::SqlitePostcondition::default(),
+        observations: Default::default(),
+    };
+    let row = CoverageLedgerEvidenceRow {
+        schema_version: harness_real_llm::evidence::EVIDENCE_SCHEMA_VERSION.into(),
+        run_id: "run-coverage-a".into(),
+        observation,
+    };
+    let line = serde_json::to_string(&row).unwrap();
+    assert!(parse_coverage_ledger_evidence(&line, "run-coverage-a").is_ok());
+    assert!(parse_coverage_ledger_evidence(&line, "run-coverage-b").is_err());
+    let missing_identity = serde_json::to_string(&row.observation).unwrap();
+    assert!(parse_coverage_ledger_evidence(&missing_identity, "run-coverage-a").is_err());
+}
+
+#[test]
 fn successful_tool_result_requires_matching_ok_result() {
     use harness_real_llm::evidence::EvidenceToolStep;
 
@@ -1530,12 +2519,489 @@ fn successful_tool_result_requires_matching_ok_result() {
 }
 
 #[test]
+fn durable_tool_mode_proof_ignores_failed_retry_calls() {
+    let dir =
+        std::env::temp_dir().join(format!("sf-sqlite-durable-tools-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("calls.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            "{\"outcome\":\"ok\",\"assertion_results\":[{\"name\":\"successful_write_attempt\",\"passed\":false}],\"tool_steps\":[{\"kind\":\"call\"}]}\n",
+            "{\"outcome\":\"client_error\",\"assertion_results\":[{\"name\":\"successful_write_attempt\",\"passed\":true}],\"tool_steps\":[{\"kind\":\"call\"}]}\n",
+            "{\"outcome\":\"ok\",\"assertion_results\":[{\"name\":\"successful_write_attempt\",\"passed\":true}],\"tool_steps\":[{\"kind\":\"call\"},{\"kind\":\"result\"}]}\n"
+        ),
+    )
+    .unwrap();
+    let count = durable_successful_write_tool_call_steps(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
+    let private_probe = ScheduledAction::PrivateProbe {
+        probe_kind: PrivateProbeKind::NonOwnerLeak,
+    };
+    assert_eq!(
+        classify_write_failure("retryable_quality_blocked:error_count=1", &private_probe),
+        WriteFailureClass::QualityBlocked
+    );
+    assert_eq!(
+        classify_write_failure("stream idle timeout", &private_probe),
+        WriteFailureClass::Transient
+    );
+    assert_eq!(
+        classify_write_failure("campaign scope mismatch", &private_probe),
+        WriteFailureClass::Fatal
+    );
+    assert_eq!(
+        classify_write_failure(
+            "nonretryable_accept: storage timeout after terminal mark",
+            &private_probe,
+        ),
+        WriteFailureClass::Fatal
+    );
+    assert_eq!(
+        classify_write_failure(
+            "nonretryable_accept: Internal scope conflict",
+            &private_probe,
+        ),
+        WriteFailureClass::Fatal
+    );
+    assert_eq!(
+        classify_write_failure(
+            "retryable_quality_blocked:error_count=1",
+            &ScheduledAction::QualityAutofix { fixable: true },
+        ),
+        WriteFailureClass::Fatal,
+        "the explicit autofix row must not hide a residual quality failure by rerolling"
+    );
+
+    let mut state = None;
+    for attempt in 1..=MAX_WRITE_ATTEMPTS {
+        state =
+            Some(next_retry_state(state.as_ref(), 9, WriteFailureClass::QualityBlocked).unwrap());
+        assert_eq!(state.as_ref().unwrap().attempts_used, attempt);
+    }
+    assert!(!state.as_ref().unwrap().can_retry);
+    assert!(
+        next_retry_state(state.as_ref(), 9, WriteFailureClass::QualityBlocked).is_err(),
+        "a process restart must not reset the five-attempt ceiling"
+    );
+}
+
+#[test]
+fn retry_checkpoint_accounts_for_failed_calls_without_advancing_acceptance() {
+    let previous = EnduranceCheckpoint {
+        schema_version: EnduranceCheckpoint::schema_version().into(),
+        run_id: "run-coverage-00000000-0000-0000-0000-000000000001".into(),
+        stage: "coverage".into(),
+        accepted_turn_number: 8,
+        calls_used: 144,
+        max_calls: 220,
+        campaign_revision: 8,
+        chronicle_revision: 8,
+        last_draft_hash16: "draft12345678901".into(),
+        last_summary_code: None,
+        context_epoch_id16: None,
+        early_fact_probe_ids: vec![],
+        early_fact_checked_passed: vec![],
+        campaign_id: Some("campaign".into()),
+        conversation_id: Some("conversation".into()),
+        data_dir_rel: Some("campaign_data".into()),
+        observed_epoch_ids16: vec![],
+        run_identity: None,
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
+        recorded_at_unix_ms: 0,
+    };
+    let retry = EnduranceRetryState {
+        turn_index: 9,
+        attempts_used: 1,
+        quality_blocked_attempts: 1,
+        last_failure_kind: "quality_blocked".into(),
+        can_retry: true,
+    };
+    let updated = checkpoint_after_failed_attempt(Some(previous), 9, 155, retry).unwrap();
+    assert_eq!(updated.accepted_turn_number, 8);
+    assert_eq!(updated.calls_used, 155);
+    assert_eq!(updated.retry_state.unwrap().attempts_used, 1);
+}
+
+#[test]
+fn accepted_attempt_anomalies_are_deferred_until_after_durable_checkpoint() {
+    assert_eq!(
+        accepted_attempt_audit_failure(0, 15, 220),
+        Some(AcceptedAttemptAuditFailure::ZeroCalls)
+    );
+    assert_eq!(
+        accepted_attempt_audit_failure(3, 221, 220),
+        Some(AcceptedAttemptAuditFailure::BudgetExhausted)
+    );
+    assert_eq!(accepted_attempt_audit_failure(3, 220, 220), None);
+}
+
+#[test]
+fn supplemental_probe_state_is_bounded_and_terminal() {
+    let mut state = EnduranceProbeState::default();
+    SupplementalProbe::Meta.begin(&mut state).unwrap();
+    SupplementalProbe::Meta.begin(&mut state).unwrap();
+    SupplementalProbe::Meta.begin(&mut state).unwrap();
+    assert!(SupplementalProbe::Meta.begin(&mut state).is_err());
+    SupplementalProbe::Meta.mark_completed(&mut state);
+    assert!(SupplementalProbe::Meta.completed(&state));
+    assert!(SupplementalProbe::Meta.begin(&mut state).is_err());
+}
+
+#[test]
+fn resume_fingerprint_uses_last_accepted_turn_not_failed_call_tail() {
+    let dir = std::env::temp_dir().join(format!(
+        "sf-sqlite-resume-fingerprint-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("endurance_calls.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            "{\"turn_index\":8,\"request_fp16\":\"accepted-first\"}\n",
+            "{\"turn_index\":8,\"request_fp16\":\"accepted-last\",\"outcome\":\"ok\"}\n",
+            "{\"turn_index\":8,\"request_fp16\":\"same-turn-failed-tail\",\"outcome\":\"client_error\"}\n",
+            "{\"turn_index\":9,\"request_fp16\":\"failed-tail\",\"outcome\":\"client_error\"}\n"
+        ),
+    )
+    .unwrap();
+    let observed = last_request_fp16_for_turn(&path, 8).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(observed, Some("accepted-last".into()));
+}
+
+#[test]
+fn retry_recovery_discards_unaccepted_conversation_tail_and_fails_attempt() {
+    let dir =
+        std::env::temp_dir().join(format!("sf-sqlite-retry-recovery-{}", uuid::Uuid::new_v4()));
+    let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+    let env = SqliteHarnessEnv::bootstrap(dir, llm).unwrap();
+    let campaign_id = env.active_campaign_id().unwrap();
+    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap();
+    let conversation_id = campaign.conversation_id.unwrap();
+    let mut conversation = storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+        .unwrap()
+        .unwrap();
+    let original_nodes = conversation.nodes.len();
+    let mut checkpoint = EnduranceCheckpoint {
+        schema_version: EnduranceCheckpoint::schema_version().into(),
+        run_id: "run-coverage-00000000-0000-0000-0000-000000000099".into(),
+        stage: "coverage".into(),
+        accepted_turn_number: 0,
+        calls_used: 0,
+        max_calls: 220,
+        campaign_revision: campaign.revision,
+        chronicle_revision: campaign.chronicle_revision,
+        last_draft_hash16: String::new(),
+        last_summary_code: None,
+        context_epoch_id16: None,
+        early_fact_probe_ids: vec![],
+        early_fact_checked_passed: vec![],
+        campaign_id: Some(campaign_id.as_str().into()),
+        conversation_id: Some(conversation_id.as_str().into()),
+        data_dir_rel: Some("campaign_data".into()),
+        observed_epoch_ids16: vec![],
+        run_identity: None,
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
+        recorded_at_unix_ms: 0,
+    };
+    checkpoint.sqlite_authority = Some(capture_sqlite_authority_binding(&checkpoint).unwrap());
+    let accepted_before = checkpoint.sqlite_authority.clone().unwrap();
+    let input_node_id = conversation.append_message(Role::User, "retry fixture input".into());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&conversation).unwrap();
+
+    let turn = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        input_node_id,
+        campaign.revision,
+    );
+    let turn_id = turn.turn_id.clone();
+    storyforge_tauri_app::sqlite_runtime::save_turn(&turn).unwrap();
+    let attempt_id = storyforge_domain::Id::new();
+    storyforge_tauri_app::sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+        campaign_id: &campaign_id,
+        conversation_id: &conversation_id,
+        turn_id: &turn_id,
+        attempt_id: &attempt_id,
+        draft_text: "unaccepted retry draft",
+        pending_temporary_instances: vec![],
+        provenance: None,
+    })
+    .unwrap();
+
+    let with_unaccepted_tail = capture_sqlite_authority_binding(&checkpoint).unwrap();
+    assert_ne!(
+        accepted_before.accepted_content_sha256,
+        with_unaccepted_tail.accepted_content_sha256
+    );
+    validate_live_sqlite_resume_preconditions(&checkpoint).unwrap();
+    env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+        .unwrap();
+    validate_live_sqlite_resume_authority(&checkpoint).unwrap();
+
+    let recovered_turn = storyforge_tauri_app::sqlite_runtime::get_turn(&turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_turn.status, TurnStatus::Failed);
+    assert_eq!(
+        recovered_turn.find_attempt(&attempt_id).unwrap().status,
+        AttemptStatus::Failed
+    );
+    assert!(
+        storyforge_tauri_app::sqlite_runtime::get_active_turn(&campaign_id)
+            .unwrap()
+            .is_none()
+    );
+    let recovered_conversation =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(recovered_conversation.nodes.len(), original_nodes);
+    assert_eq!(
+        capture_sqlite_authority_binding(&checkpoint).unwrap(),
+        accepted_before,
+        "recovery must restore the exact accepted-state projection"
+    );
+
+    // Continuous (non-resume) turn starts must validate the preceding durable
+    // authority instead of silently rebinding unrelated SQLite drift.
+    let baseline_campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap();
+    let mut between_turn_drift = baseline_campaign.clone();
+    between_turn_drift.name.push_str("-between-turn-drift");
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&between_turn_drift).unwrap();
+    let before_continuous_reject =
+        storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert!(validate_continuous_turn_start_authority(&checkpoint, 1).is_err());
+    let after_continuous_reject =
+        storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert_eq!(
+        before_continuous_reject.canonical_content_sha256,
+        after_continuous_reject.canonical_content_sha256,
+        "continuous authority rejection must be zero-write"
+    );
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&baseline_campaign).unwrap();
+    validate_continuous_turn_start_authority(&checkpoint, 1).unwrap();
+
+    // A tail input must be linked directly to the accepted prefix. A detached
+    // input at the correct numeric index is still unsafe and must remain zero-write.
+    let mut detached_conversation =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    let detached_prefix_len = detached_conversation.nodes.len();
+    let detached_input =
+        detached_conversation.append_message(Role::User, "detached tail fixture".into());
+    detached_conversation.nodes[detached_prefix_len].parent_id = Some(storyforge_domain::Id::new());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&detached_conversation).unwrap();
+    let detached_turn = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        detached_input,
+        baseline_campaign.revision,
+    );
+    storyforge_tauri_app::sqlite_runtime::save_turn(&detached_turn).unwrap();
+    let before_detached = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert!(validate_live_sqlite_resume_preconditions(&checkpoint).is_err());
+    assert!(
+        env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+            .is_err()
+    );
+    let after_detached = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert_eq!(
+        before_detached.canonical_content_sha256, after_detached.canonical_content_sha256,
+        "detached input rejection must be zero-write"
+    );
+    storyforge_tauri_app::sqlite_runtime::recover_turns_on_startup().unwrap();
+    let mut restored_conversation =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    restored_conversation.nodes.truncate(detached_prefix_len);
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&restored_conversation).unwrap();
+    validate_live_sqlite_resume_authority(&checkpoint).unwrap();
+
+    // Crash idempotency: truncation may commit before the Turn/Attempt failure
+    // transaction. A validated restart must finish closing that active Turn
+    // without requiring the now-absent input anchor.
+    let mut crash_conversation =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    let crash_input = crash_conversation.append_message(Role::User, "crash-window fixture".into());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&crash_conversation).unwrap();
+    let crash_turn = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        crash_input,
+        campaign.revision,
+    );
+    let crash_turn_id = crash_turn.turn_id.clone();
+    storyforge_tauri_app::sqlite_runtime::save_turn(&crash_turn).unwrap();
+    let crash_attempt_id = storyforge_domain::Id::new();
+    storyforge_tauri_app::sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
+        campaign_id: &campaign_id,
+        conversation_id: &conversation_id,
+        turn_id: &crash_turn_id,
+        attempt_id: &crash_attempt_id,
+        draft_text: "crash-window draft",
+        pending_temporary_instances: vec![],
+        provenance: None,
+    })
+    .unwrap();
+    let mut already_truncated =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    already_truncated.nodes.truncate(original_nodes);
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&already_truncated).unwrap();
+    validate_live_sqlite_resume_preconditions(&checkpoint).unwrap();
+    env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+        .unwrap();
+    validate_live_sqlite_resume_authority(&checkpoint).unwrap();
+    let recovered_crash_turn = storyforge_tauri_app::sqlite_runtime::get_turn(&crash_turn_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_crash_turn.status, TurnStatus::Failed);
+    assert_eq!(
+        recovered_crash_turn
+            .find_attempt(&crash_attempt_id)
+            .unwrap()
+            .status,
+        AttemptStatus::Failed
+    );
+
+    // A forged active Turn may not point into the already checkpointed
+    // conversation prefix: preflight must reject before any recovery write.
+    let mut accepted_conversation = recovered_conversation;
+    let accepted_node =
+        accepted_conversation.append_message(Role::User, "accepted prefix fixture".into());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&accepted_conversation).unwrap();
+    checkpoint.sqlite_authority = Some(capture_sqlite_authority_binding(&checkpoint).unwrap());
+    let forged = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        accepted_node,
+        campaign.revision,
+    );
+    let forged_id = forged.turn_id.clone();
+    storyforge_tauri_app::sqlite_runtime::save_turn(&forged).unwrap();
+    let before_rejected_preflight =
+        storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert!(validate_live_sqlite_resume_preconditions(&checkpoint).is_err());
+    let after_rejected_preflight =
+        storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert_eq!(
+        before_rejected_preflight.canonical_content_sha256,
+        after_rejected_preflight.canonical_content_sha256,
+        "unsafe anchor rejection must be zero-write"
+    );
+    assert_eq!(
+        storyforge_tauri_app::sqlite_runtime::get_turn(&forged_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TurnStatus::Generating
+    );
+    storyforge_tauri_app::sqlite_runtime::recover_turns_on_startup().unwrap();
+
+    // Even with a valid recoverable tail, unrelated accepted-state drift must
+    // be detected after recovery and before a checkpoint can be rebound.
+    let original_campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap();
+    checkpoint.sqlite_authority = Some(capture_sqlite_authority_binding(&checkpoint).unwrap());
+    let mut drifted_campaign = original_campaign.clone();
+    drifted_campaign.name.push_str("-drift");
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&drifted_campaign).unwrap();
+    let mut active_conversation =
+        storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+            .unwrap()
+            .unwrap();
+    let safe_input =
+        active_conversation.append_message(Role::User, "recoverable tail fixture".into());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&active_conversation).unwrap();
+    let safe_active = TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        safe_input,
+        original_campaign.revision,
+    );
+    storyforge_tauri_app::sqlite_runtime::save_turn(&safe_active).unwrap();
+    validate_live_sqlite_resume_preconditions(&checkpoint).unwrap();
+    env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+        .unwrap();
+    assert!(
+        validate_live_sqlite_resume_authority(&checkpoint).is_err(),
+        "post-recovery validation must expose unrelated campaign drift"
+    );
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&original_campaign).unwrap();
+    validate_live_sqlite_resume_authority(&checkpoint).unwrap();
+
+    // The global startup recovery primitive must never be reached when more
+    // than one active Turn exists.
+    let missing_input_a = storyforge_domain::Id::new();
+    let missing_input_b = storyforge_domain::Id::new();
+    storyforge_tauri_app::sqlite_runtime::save_turn(&TurnRecord::new(
+        campaign_id.clone(),
+        conversation_id.clone(),
+        missing_input_a,
+        original_campaign.revision,
+    ))
+    .unwrap();
+    let mut foreign_campaign = storyforge_domain::campaign::Campaign::new(
+        original_campaign.card_id.clone(),
+        "foreign active fixture",
+    );
+    let foreign_conversation = Conversation::new(None, Some(foreign_campaign.id.clone()));
+    foreign_campaign.conversation_id = Some(foreign_conversation.id.clone());
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&foreign_campaign).unwrap();
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&foreign_conversation).unwrap();
+    storyforge_tauri_app::sqlite_runtime::save_turn(&TurnRecord::new(
+        foreign_campaign.id,
+        foreign_conversation.id,
+        missing_input_b,
+        foreign_campaign.revision,
+    ))
+    .unwrap();
+    let before_multiple = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert!(validate_live_sqlite_resume_preconditions(&checkpoint).is_err());
+    assert!(env.recover_incomplete_turn_for_retry(&campaign_id).is_err());
+    let after_multiple = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot().unwrap();
+    assert_eq!(
+        before_multiple.canonical_content_sha256, after_multiple.canonical_content_sha256,
+        "multiple-active rejection must be zero-write"
+    );
+    storyforge_tauri_app::sqlite_runtime::recover_turns_on_startup().unwrap();
+}
+
+#[test]
 fn resume_identity_rejects_stage_or_runtime_drift() {
     let expected = EnduranceRunIdentity {
         fixture_hash16: "fixture123456789".into(),
-        model_hash16: "model12345678901".into(),
+        model_sha256: "b".repeat(64),
+        endpoint_hash16: "endpoint12345678".into(),
         tool_mode: "native".into(),
         reasoning_mode: "disabled".into(),
+        code_revision16: "revision1234567".into(),
+        supplemental_matrix: true,
+        meta_probe: true,
+        character_extractor_probe: true,
+        cache_probe: true,
     };
     let mut checkpoint = EnduranceCheckpoint {
         schema_version: EnduranceCheckpoint::schema_version().into(),
@@ -1556,6 +3022,9 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
         data_dir_rel: Some("campaign_data".into()),
         observed_epoch_ids16: vec![],
         run_identity: Some(expected.clone()),
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
         recorded_at_unix_ms: 0,
     };
     assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_ok());
@@ -1564,6 +3033,42 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
     checkpoint.stage = "coverage".into();
     checkpoint.run_identity.as_mut().unwrap().tool_mode = "text_fallback".into();
     assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
+    checkpoint.run_identity.as_mut().unwrap().tool_mode = "native".into();
+    checkpoint.run_identity.as_mut().unwrap().code_revision16 = "different123456".into();
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
+    checkpoint.run_identity.as_mut().unwrap().code_revision16 = expected.code_revision16.clone();
+    checkpoint.run_identity.as_mut().unwrap().endpoint_hash16 = "different-endpt".into();
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
+
+    let authority = EnduranceSqliteAuthority {
+        accepted_content_sha256: "a".repeat(64),
+        committed_turns: 1,
+        accepted_conversation_nodes: 2,
+        accepted_conversation_sha256: "c".repeat(64),
+    };
+    checkpoint.sqlite_authority = Some(authority.clone());
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 1, &authority).is_ok());
+    assert!(validate_sqlite_authority_values(&checkpoint, 2, 1, &authority).is_err());
+    let drifted = EnduranceSqliteAuthority {
+        accepted_content_sha256: "b".repeat(64),
+        ..authority
+    };
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 1, &drifted).is_err());
+}
+
+#[test]
+fn model_identity_hashes_the_full_name_not_only_the_display_prefix() {
+    let prefix = "m".repeat(64);
+    let first = format!("{prefix}-first");
+    let second = format!("{prefix}-second");
+    assert_eq!(
+        first.chars().take(64).collect::<String>(),
+        second.chars().take(64).collect::<String>()
+    );
+    assert_ne!(
+        model_identity_sha256(&first),
+        model_identity_sha256(&second)
+    );
 }
 
 #[tokio::test]
@@ -1575,6 +3080,8 @@ async fn endurance_sqlite_real_llm_staged() {
     }
     let budget = require_endurance_budget();
     let stage = parse_target_stage();
+    let initial_git = resolve_git_provenance()
+        .unwrap_or_else(|error| panic!("git provenance unavailable: {error}"));
 
     let (run_id_for_log, dir, paths) = evidence_run_dir(stage);
     eprintln!(
@@ -1593,24 +3100,34 @@ async fn endurance_sqlite_real_llm_staged() {
         None
     };
 
-    let mut budget = budget;
-    if let Some(cp) = resume_cp.as_ref() {
-        let remaining = stage.max_calls().saturating_sub(cp.calls_used);
-        // Process-local BudgetedLlmClient budget must cover remaining work plus
-        // bounded Plan-parse retries; stage accounting still uses prior+runner calls.
-        let headroom = stage
-            .target_turns()
-            .saturating_sub(cp.accepted_turn_number)
-            .saturating_mul(12)
-            .max(40);
-        budget.max_calls = remaining.saturating_add(headroom).max(1);
-        eprintln!(
-            "[sqlite endurance] resume budget: prior_calls={} remaining_stage={} process_max_calls={}",
-            cp.calls_used, remaining, budget.max_calls
+    if let Some(checkpoint) = resume_cp.as_ref() {
+        let recorded = harness_real_llm::evidence_retention::count_budgeted_call_records(
+            &paths.root,
+            &checkpoint.run_id,
+        )
+        .unwrap_or_else(|error| panic!("fail-closed pre-recovery call ledger: {error}"));
+        assert_eq!(
+            recorded, checkpoint.calls_used,
+            "call ledger must match checkpoint before any SQLite recovery write"
         );
-    } else {
-        // Prefer stage budget if env default is lower.
-        budget.max_calls = budget.max_calls.max(stage.max_calls());
+    }
+
+    let mut budget = budget;
+    budget.max_turns = stage.target_turns();
+    budget.max_calls = UNBOUNDED_CALL_ACCOUNTING_LIMIT;
+    let prior_calls = resume_cp
+        .as_ref()
+        .map(|checkpoint| checkpoint.calls_used)
+        .unwrap_or(0);
+    if let Some(cp) = resume_cp.as_ref() {
+        assert_eq!(
+            cp.max_calls, UNBOUNDED_CALL_ACCOUNTING_LIMIT,
+            "resume checkpoint call-accounting policy changed"
+        );
+        eprintln!(
+            "[sqlite endurance] resume accounting: prior_calls={} (no fixed call ceiling)",
+            cp.calls_used
+        );
     }
     let connection = resolve_llm_connection()
         .unwrap_or_else(|error| panic!("real LLM connection unavailable: {error}"));
@@ -1630,21 +3147,43 @@ async fn endurance_sqlite_real_llm_staged() {
     let run_identity = EnduranceRunIdentity {
         fixture_hash16: fixture_source_hash16()
             .unwrap_or_else(|error| panic!("fixture identity unavailable: {error}")),
-        model_hash16: short_hash16(&model_label),
+        model_sha256: model_identity_sha256(&connection.model),
+        endpoint_hash16: endpoint_identity_hash16(&connection.base_url, &connection.protocol),
         tool_mode: runtime_profile.tool_mode.label().into(),
         reasoning_mode: runtime_profile.reasoning_mode.label().into(),
+        code_revision16: short_hash16(&initial_git.commit),
+        supplemental_matrix: env_flag("STORYFORGE_EVAL_SUPPLEMENTAL_MATRIX"),
+        meta_probe: env_flag("STORYFORGE_EVAL_META_PROBE"),
+        character_extractor_probe: env_flag("STORYFORGE_EVAL_CHARACTER_EXTRACTOR_PROBE"),
+        cache_probe: env_flag("STORYFORGE_EVAL_CACHE_PROBE"),
     };
     if let Some(checkpoint) = resume_cp.as_ref() {
         validate_resume_identity(checkpoint, stage, &run_identity)
             .unwrap_or_else(|error| panic!("fail-closed resume identity: {error}"));
     }
+    let reservation_writer = if resume_cp.is_some() {
+        harness_real_llm::evidence_retention::DurableCallReservationWriter::open_append(
+            &paths.root,
+            run_id_for_log.clone(),
+        )
+    } else {
+        harness_real_llm::evidence_retention::DurableCallReservationWriter::create(
+            &paths.root,
+            run_id_for_log.clone(),
+        )
+    }
+    .unwrap_or_else(|error| panic!("durable call reservation ledger unavailable: {error}"));
     let real_client = storyforge_infra_llm::create_client(&connection)
         .unwrap_or_else(|error| panic!("construct real LLM client: {error}"));
-    let llm = BudgetedLlmClient::wrap_with_reasoning(
+    let llm = BudgetedLlmClient::wrap_with_reasoning_and_reservations(
         Arc::from(real_client),
         &budget,
         Some(reasoning_override),
-    );
+        prior_calls,
+        run_id_for_log.clone(),
+        Arc::new(reservation_writer),
+    )
+    .unwrap_or_else(|error| panic!("durable budgeted client unavailable: {error}"));
 
     let env = if resume_cp.is_some() && data_dir.join("storyforge.sqlite3").exists() {
         let env =
@@ -1667,6 +3206,32 @@ async fn endurance_sqlite_real_llm_staged() {
         env.active_campaign_id()
             .expect("sqlite bootstrap sets active campaign")
     };
+    if let Some(checkpoint) = resume_cp.as_ref() {
+        validate_live_sqlite_resume_preconditions(checkpoint)
+            .unwrap_or_else(|error| panic!("fail-closed SQLite authority preflight: {error}"));
+        env.recover_checkpoint_validated_incomplete_turn(&campaign_id)
+            .unwrap_or_else(|error| panic!("sqlite retry recovery: {error}"));
+        validate_live_sqlite_resume_authority(checkpoint).unwrap_or_else(|error| {
+            panic!("fail-closed SQLite authority after retry recovery: {error}")
+        });
+        let reconciled =
+            harness_real_llm::evidence_retention::reconcile_dangling_call_reservations(
+                &paths.root,
+                &checkpoint.run_id,
+                &model_label,
+            )
+            .unwrap_or_else(|error| panic!("reconcile interrupted provider calls: {error}"));
+        assert_eq!(
+            reconciled, checkpoint.calls_used,
+            "resume call reservations changed after preflight"
+        );
+        let mut refreshed = read_latest_checkpoint(&paths.checkpoint_jsonl)
+            .expect("resume checkpoint remains readable after SQLite recovery");
+        refreshed.calls_used = reconciled;
+        refreshed.max_calls = UNBOUNDED_CALL_ACCOUNTING_LIMIT;
+        persist_checkpoint_and_integrity(&paths, &refreshed, "post-recovery")
+            .unwrap_or_else(|error| panic!("refresh post-recovery SQLite binding: {error}"));
+    }
     let conversation_id =
         if let Some(cp) = resume_cp.as_ref().and_then(|c| c.conversation_id.as_ref()) {
             storyforge_domain::Id::from_str(cp)
@@ -1685,6 +3250,7 @@ async fn endurance_sqlite_real_llm_staged() {
         conversation_id,
         stage,
         budget: &budget,
+        call_limit: UNBOUNDED_CALL_ACCOUNTING_LIMIT,
         paths: &paths,
         runtime_profile,
         model_label: &model_label,
@@ -1718,6 +3284,7 @@ async fn endurance_sqlite_real_llm_staged() {
                     run_id: row.run_id.clone(),
                     sqlite_schema_version: audit.sqlite_schema_version,
                     canonical_content_sha256: audit.canonical_content_sha256,
+                    accepted_content_sha256: audit.accepted_content_sha256,
                     turns: audit.turns,
                     attempts: audit.attempts,
                     committed_turns: audit.committed_turns,
@@ -1732,7 +3299,12 @@ async fn endurance_sqlite_real_llm_staged() {
             assert!(paths.check_no_secrets().is_ok());
             assert!(paths.total_size() < 2 * 1024 * 1024);
 
-            let (commit, branch) = resolve_git_provenance();
+            let final_git = resolve_git_provenance()
+                .unwrap_or_else(|error| panic!("final git provenance unavailable: {error}"));
+            assert_eq!(
+                final_git, initial_git,
+                "git provenance changed while the evidence run was active"
+            );
 
             let manifest = harness_real_llm::evidence_retention::seal_run(
                 &paths.root,
@@ -1740,15 +3312,15 @@ async fn endurance_sqlite_real_llm_staged() {
                     run_id: row.run_id.clone(),
                     status: harness_real_llm::evidence_retention::RunStatus::Completed,
                     stage: row.stage.clone(),
-                    model_label: model_label.clone(),
+                    model_label: connection.model.clone(),
                     budget: harness_real_llm::evidence_retention::BudgetSummary {
                         max_calls: row.max_calls,
                         max_turns: row.target_turns,
                         timeout_secs: budget.timeout_secs,
                         max_tokens: budget.max_tokens,
                     },
-                    commit,
-                    branch,
+                    commit: final_git.commit,
+                    branch: final_git.branch,
                 },
             )
             .unwrap_or_else(|err| {

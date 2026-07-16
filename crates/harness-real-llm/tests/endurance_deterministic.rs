@@ -248,6 +248,9 @@ fn checkpoint_rejects_sf_secret_marker() {
         data_dir_rel: None,
         observed_epoch_ids16: vec![],
         run_identity: None,
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
         recorded_at_unix_ms: 0,
     };
     assert!(write_checkpoint(&path, &cp).is_err());
@@ -370,6 +373,8 @@ fn resume_from_evidence_dir_returns_next_turn_without_replay() {
     let run_id = allocate_run_id(&validated, "full").unwrap();
     let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
     let cp_path = run_dir.join("endurance_checkpoint.jsonl");
+    std::fs::write(run_dir.join("endurance_calls.jsonl"), "").unwrap();
+    std::fs::write(run_dir.join("endurance_turns.jsonl"), "").unwrap();
     // Write a single checkpoint with the controlled run id.
     write_checkpoint(
         &cp_path,
@@ -377,10 +382,10 @@ fn resume_from_evidence_dir_returns_next_turn_without_replay() {
             schema_version: EnduranceCheckpoint::schema_version().into(),
             run_id: run_id.clone(),
             stage: "full".into(),
-            accepted_turn_number: 7,
-            calls_used: 40,
+            accepted_turn_number: 0,
+            calls_used: 0,
             max_calls: 700,
-            campaign_revision: 7,
+            campaign_revision: 0,
             chronicle_revision: 0,
             last_draft_hash16: "abcdabcdabcdabcd".into(),
             last_summary_code: Some("ok".into()),
@@ -392,14 +397,17 @@ fn resume_from_evidence_dir_returns_next_turn_without_replay() {
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: vec![],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 1,
         },
     )
     .unwrap();
     harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&run_dir).unwrap();
     let (next, cp) = resume_from_evidence_dir(&run_dir, Some(&run_id)).unwrap();
-    assert_eq!(next, 8);
-    assert_eq!(cp.accepted_turn_number, 7);
+    assert_eq!(next, 1);
+    assert_eq!(cp.accepted_turn_number, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 

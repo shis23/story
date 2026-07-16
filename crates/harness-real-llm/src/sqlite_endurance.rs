@@ -18,6 +18,7 @@ use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, PropagationPolicy};
+use storyforge_domain::conversation::{Role, VariantStatus};
 use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger};
 use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
 use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
@@ -42,6 +43,20 @@ use crate::evidence::short_hash16;
 use crate::production_evidence::{ProductionPostprocessProof, mutation_batch_digest};
 
 const FIXTURE_REL: &str = "fixtures/m5_sqlite_endurance_v1.json";
+const RETRYABLE_QUALITY_BLOCKED_PREFIX: &str = "retryable_quality_blocked:";
+
+pub fn is_retryable_quality_blocked_error(error: &str) -> bool {
+    error.starts_with(RETRYABLE_QUALITY_BLOCKED_PREFIX)
+}
+
+fn format_accept_error_for_runner(error: turn_lifecycle::AcceptError) -> String {
+    match error {
+        turn_lifecycle::AcceptError::QualityBlocked { error_count } => {
+            format!("{RETRYABLE_QUALITY_BLOCKED_PREFIX}error_count={error_count}")
+        }
+        other => format!("nonretryable_accept:{other}"),
+    }
+}
 
 /// Privacy-safe projection of live pipeline events. It deliberately stores no
 /// event text, character identifiers, prompts, or model output.
@@ -346,7 +361,6 @@ impl SqliteHarnessEnv {
         // Re-inject tool_ctx character material from fixture without re-seeding DB.
         let root = load_fixture(&fixture_path)?;
         env.inject_character_from_fixture(&root);
-        let _ = sqlite_runtime::recover_turns_on_startup()?;
         Ok(env)
     }
 
@@ -405,19 +419,151 @@ impl SqliteHarnessEnv {
         pipeline
     }
 
-    fn fail_active_turn_if_any(&self, campaign_id: &Id, reason: &str) -> Result<(), String> {
-        if let Some(active) = sqlite_runtime::get_active_turn(campaign_id)?
-            && active.status.is_active()
+    fn fail_active_turn_if_any(
+        &self,
+        campaign_id: &Id,
+        _reason: &str,
+        checkpoint_prefix_validated: bool,
+    ) -> Result<(), String> {
+        let active_turns = sqlite_runtime::list_active_turns()?;
+        if active_turns.is_empty() {
+            return Ok(());
+        }
+        if active_turns.len() != 1 {
+            return Err("retry recovery refuses multiple global active SQLite turns".into());
+        }
+        let active = &active_turns[0];
+        if &active.campaign_id != campaign_id || !active.status.is_active() {
+            return Err("retry recovery refuses a foreign active SQLite turn".into());
+        }
+        let campaign = sqlite_runtime::get_campaign(campaign_id)?
+            .ok_or_else(|| "retry recovery campaign is missing".to_string())?;
+        if active.base_campaign_revision != campaign.revision
+            || campaign.conversation_id.as_ref() != Some(&active.conversation_id)
+            || active.accepted_attempt_id.is_some()
         {
-            sqlite_runtime::update_turn_record(&active.turn_id, |record| {
-                if record.status.is_active() {
-                    record.status = TurnStatus::Failed;
-                    record.failure_reason = Some(reason.to_string());
-                    record.touch();
+            return Err("retry recovery active Turn scope or revision drifted".into());
+        }
+        let conversation = sqlite_runtime::get_conversation(&active.conversation_id)?
+            .ok_or_else(|| "retry recovery conversation is missing".to_string())?;
+        if conversation.campaign_id.as_ref() != Some(campaign_id) {
+            return Err("retry recovery conversation campaign scope drifted".into());
+        }
+        match conversation
+            .nodes
+            .iter()
+            .position(|node| node.id == active.input_node_id)
+        {
+            None if checkpoint_prefix_validated
+                || (active.status == TurnStatus::Generating && active.attempts.is_empty()) => {}
+            Some(index) => {
+                if index < conversation.archived_upto {
+                    return Err("retry recovery input anchor is inside archived history".into());
                 }
-            })?;
+                let expected_parent = index
+                    .checked_sub(1)
+                    .map(|parent_index| &conversation.nodes[parent_index].id);
+                if conversation.nodes[index].parent_id.as_ref() != expected_parent {
+                    return Err("retry recovery input anchor is detached from prior history".into());
+                }
+                let input = conversation.nodes[index].active().ok_or_else(|| {
+                    "retry recovery input anchor has no active variant".to_string()
+                })?;
+                if input.role != Role::User || input.status != VariantStatus::Final {
+                    return Err("retry recovery input anchor is not a final User node".into());
+                }
+                for pair in conversation.nodes[index..].windows(2) {
+                    if pair[1].parent_id.as_ref() != Some(&pair[0].id)
+                        || pair[1]
+                            .active()
+                            .is_none_or(|variant| variant.role != Role::Assistant)
+                    {
+                        return Err("retry recovery conversation tail is not a safe chain".into());
+                    }
+                }
+                self.conv_store.invalidate();
+                self.conv_store
+                    .truncate_from(&active.conversation_id, &active.input_node_id)
+                    .map_err(|error| error.to_string())?;
+            }
+            None => {
+                return Err("retry recovery active Turn input anchor is missing".into());
+            }
+        }
+        let recovered = sqlite_runtime::recover_turns_on_startup()?;
+        if recovered == 0 {
+            return Err("active SQLite turn was not closed by startup recovery".into());
+        }
+        self.conv_store.invalidate();
+        if !sqlite_runtime::list_active_turns()?.is_empty() {
+            return Err("active SQLite turn remains after retry recovery".into());
         }
         Ok(())
+    }
+
+    pub fn recover_incomplete_turn_for_retry(&self, campaign_id: &Id) -> Result<(), String> {
+        self.fail_active_turn_if_any(
+            campaign_id,
+            "superseded by sqlite endurance durable retry recovery",
+            false,
+        )
+    }
+
+    /// Complete recovery after the runner has already verified the durable
+    /// checkpoint's accepted conversation prefix and active-Turn scope. This
+    /// permits the idempotent crash point where truncation committed but the
+    /// Turn/Attempt failure transaction did not.
+    pub fn recover_checkpoint_validated_incomplete_turn(
+        &self,
+        campaign_id: &Id,
+    ) -> Result<(), String> {
+        self.fail_active_turn_if_any(
+            campaign_id,
+            "superseded by checkpoint-validated sqlite endurance retry recovery",
+            true,
+        )
+    }
+
+    fn begin_preland_turn(
+        &self,
+        campaign_id: &Id,
+        conversation_id: &Id,
+        intent: &str,
+        _recovery_reason: &str,
+    ) -> Result<(Id, Id), String> {
+        if !sqlite_runtime::list_active_turns()?.is_empty() {
+            return Err(
+                "active SQLite Turn requires checkpoint-validated recovery before a new write"
+                    .into(),
+            );
+        }
+        let campaign = sqlite_runtime::get_campaign(campaign_id)?
+            .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
+        if campaign.conversation_id.as_ref() != Some(conversation_id) {
+            return Err("campaign conversation scope mismatch for pre-land turn".into());
+        }
+        let mut conversation = sqlite_runtime::get_conversation(conversation_id)?
+            .ok_or_else(|| format!("conversation {conversation_id} missing"))?;
+        if conversation.campaign_id.as_ref() != Some(campaign_id) {
+            return Err("conversation campaign scope mismatch for pre-land turn".into());
+        }
+        // Build the User node in memory first, then persist the Turn before the
+        // conversation. Every crash point is recoverable: before save_turn no
+        // state changed; after save_turn recovery can fail the anchor; after
+        // save_conversation recovery can also truncate by input_node_id.
+        let input_node_id =
+            conversation.append_message(storyforge_domain::conversation::Role::User, intent.into());
+        let turn = TurnRecord::new(
+            campaign_id.clone(),
+            conversation_id.clone(),
+            input_node_id.clone(),
+            campaign.revision,
+        );
+        let turn_id = turn.turn_id.clone();
+        sqlite_runtime::save_turn(&turn)?;
+        sqlite_runtime::save_conversation(&conversation)?;
+        self.conv_store.invalidate();
+        Ok((input_node_id, turn_id))
     }
 
     /// Full production-faithful write: user msg → pipeline → preaccept draft →
@@ -439,16 +585,15 @@ impl SqliteHarnessEnv {
             .active_campaign_id()
             .ok_or_else(|| "active campaign required".to_string())?;
 
-        // Fail-closed retries must not leave a Generating turn blocking the next attempt.
-        self.fail_active_turn_if_any(
+        // Persist the input/Turn anchor before any model call. A process exit or
+        // model failure can then be recovered by input_node_id without leaving
+        // an orphan User node in the next retry's context.
+        let (input_node_id, turn_id) = self.begin_preland_turn(
             &campaign_id,
+            conversation_id,
+            intent,
             "superseded by sqlite endurance write retry/setup",
         )?;
-
-        let input_node_id = self
-            .conv_store
-            .append_user_message(conversation_id, intent.to_string())
-            .map_err(|e| e.to_string())?;
 
         let base = WritingContext::legacy(vec![], None, conversation_id.clone());
         let ctx = self.fill_campaign_context(base)?;
@@ -457,7 +602,6 @@ impl SqliteHarnessEnv {
         let (event_tx, event_task) = pipeline_observation_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        // Generate first, then open a fresh Generating turn immediately before land.
         let (draft_text, _provisional_node, provenance) = pipeline
             .start_writing(
                 intent.to_string(),
@@ -472,21 +616,6 @@ impl SqliteHarnessEnv {
         } else {
             draft_text
         };
-
-        self.fail_active_turn_if_any(
-            &campaign_id,
-            "superseded by sqlite endurance pre-land cleanup",
-        )?;
-        let camp = sqlite_runtime::get_campaign(&campaign_id)?
-            .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
-        let turn = TurnRecord::new(
-            campaign_id.clone(),
-            conversation_id.clone(),
-            input_node_id.clone(),
-            camp.revision,
-        );
-        let turn_id = turn.turn_id.clone();
-        sqlite_runtime::save_turn(&turn)?;
 
         let attempt_id = Id::new();
         let land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
@@ -673,15 +802,12 @@ impl SqliteHarnessEnv {
             .active_campaign_id()
             .ok_or_else(|| "active campaign required".to_string())?;
 
-        self.fail_active_turn_if_any(
+        let (input_node_id, turn_id) = self.begin_preland_turn(
             &campaign_id,
+            conversation_id,
+            intent,
             "superseded by sqlite endurance regenerate setup",
         )?;
-
-        let input_node_id = self
-            .conv_store
-            .append_user_message(conversation_id, intent.to_string())
-            .map_err(|e| e.to_string())?;
 
         let base = WritingContext::legacy(vec![], None, conversation_id.clone());
         let ctx = self.fill_campaign_context(base)?;
@@ -699,21 +825,6 @@ impl SqliteHarnessEnv {
             )
             .await
             .map_err(|e| e.to_string())?;
-
-        self.fail_active_turn_if_any(
-            &campaign_id,
-            "superseded by sqlite endurance regenerate pre-land cleanup",
-        )?;
-        let camp = sqlite_runtime::get_campaign(&campaign_id)?
-            .ok_or_else(|| format!("campaign {campaign_id} missing"))?;
-        let turn = TurnRecord::new(
-            campaign_id.clone(),
-            conversation_id.clone(),
-            input_node_id.clone(),
-            camp.revision,
-        );
-        let turn_id = turn.turn_id.clone();
-        sqlite_runtime::save_turn(&turn)?;
 
         let first_attempt_id = Id::new();
         let first_land = sqlite_runtime::create_draft_attempt(DraftAttemptRequest {
@@ -963,7 +1074,7 @@ impl SqliteHarnessEnv {
             }
             Err(e) => Ok(SqliteAcceptSummary {
                 ok: false,
-                error: Some(e.to_string()),
+                error: Some(format_accept_error_for_runner(e)),
                 campaign_revision_before: before.0,
                 campaign_revision_after: before.0,
                 chronicle_revision_before: before.1,
@@ -1432,6 +1543,29 @@ fn definition_from_fixture(d: &FixtureDefinition) -> CharacterDefinition {
 mod tests {
     use super::*;
 
+    struct AlwaysFailLlmClient;
+
+    #[async_trait::async_trait]
+    impl storyforge_infra_llm::LlmClient for AlwaysFailLlmClient {
+        async fn chat(
+            &self,
+            _request: &storyforge_domain::llm::ChatRequest,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            Err(storyforge_domain::llm::LlmError::Timeout)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &storyforge_domain::llm::ChatRequest,
+            _sender: tokio::sync::mpsc::UnboundedSender<storyforge_domain::llm::StreamChunk>,
+            _cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<storyforge_domain::llm::ChatResponse, storyforge_domain::llm::LlmError>
+        {
+            Err(storyforge_domain::llm::LlmError::Timeout)
+        }
+    }
+
     #[test]
     fn fixture_loads_and_hashes() {
         let path = fixture_path();
@@ -1451,6 +1585,112 @@ mod tests {
                 .map(|definition| definition.private_knowledge.len())
                 .sum::<usize>(),
             2
+        );
+    }
+
+    #[test]
+    fn accept_error_marker_is_typed_and_limited_to_quality_blocked() {
+        let retryable =
+            format_accept_error_for_runner(turn_lifecycle::AcceptError::QualityBlocked {
+                error_count: 1,
+            });
+        assert!(is_retryable_quality_blocked_error(&retryable));
+
+        let spoofed_storage = format_accept_error_for_runner(turn_lifecycle::AcceptError::Storage(
+            "retryable_quality_blocked:error_count=1".into(),
+        ));
+        assert!(!is_retryable_quality_blocked_error(&spoofed_storage));
+    }
+
+    #[tokio::test]
+    async fn preland_model_failures_leave_durable_turn_anchors_for_restart_recovery() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sf-sqlite-preland-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let env = SqliteHarnessEnv::bootstrap(data_dir, Arc::new(AlwaysFailLlmClient))
+            .expect("bootstrap SQLite harness");
+        let campaign_id = env.active_campaign_id().expect("active campaign");
+        let campaign = sqlite_runtime::get_campaign(&campaign_id)
+            .expect("read campaign")
+            .expect("campaign exists");
+        let conversation_id = campaign
+            .conversation_id
+            .clone()
+            .expect("campaign conversation");
+        let original_node_count = sqlite_runtime::get_conversation(&conversation_id)
+            .expect("read conversation")
+            .expect("conversation exists")
+            .nodes
+            .len();
+
+        let write_error = env
+            .write_accept_turn(
+                &conversation_id,
+                "synthetic failing write",
+                1,
+                "t001-write",
+                None,
+                false,
+            )
+            .await
+            .expect_err("injected model failure must abort write");
+        assert!(write_error.contains("超时") || write_error.contains("Timeout"));
+        let write_turn = sqlite_runtime::get_active_turn(&campaign_id)
+            .expect("read active write turn")
+            .expect("pre-land write must retain a durable active turn");
+        assert_eq!(write_turn.status, TurnStatus::Generating);
+        assert!(write_turn.attempts.is_empty());
+
+        env.recover_incomplete_turn_for_retry(&campaign_id)
+            .expect("recover failed pre-land write");
+        let recovered_write = sqlite_runtime::get_turn(&write_turn.turn_id)
+            .expect("read recovered write turn")
+            .expect("write turn exists");
+        assert_eq!(recovered_write.status, TurnStatus::Failed);
+        assert!(recovered_write.attempts.is_empty());
+        assert_eq!(
+            sqlite_runtime::get_conversation(&conversation_id)
+                .expect("read conversation after write recovery")
+                .expect("conversation exists")
+                .nodes
+                .len(),
+            original_node_count,
+            "restart recovery must remove the unaccepted write input node"
+        );
+
+        let regenerate_error = env
+            .regenerate_accept_turn(
+                &conversation_id,
+                "synthetic failing regenerate",
+                2,
+                "t002-regen",
+                Vec::new(),
+            )
+            .await
+            .expect_err("injected model failure must abort regenerate");
+        assert!(regenerate_error.contains("超时") || regenerate_error.contains("Timeout"));
+        let regenerate_turn = sqlite_runtime::get_active_turn(&campaign_id)
+            .expect("read active regenerate turn")
+            .expect("pre-land regenerate must retain a durable active turn");
+        assert_eq!(regenerate_turn.status, TurnStatus::Generating);
+        assert!(regenerate_turn.attempts.is_empty());
+
+        env.recover_incomplete_turn_for_retry(&campaign_id)
+            .expect("recover failed pre-land regenerate");
+        let recovered_regenerate = sqlite_runtime::get_turn(&regenerate_turn.turn_id)
+            .expect("read recovered regenerate turn")
+            .expect("regenerate turn exists");
+        assert_eq!(recovered_regenerate.status, TurnStatus::Failed);
+        assert!(recovered_regenerate.attempts.is_empty());
+        assert_eq!(
+            sqlite_runtime::get_conversation(&conversation_id)
+                .expect("read conversation after regenerate recovery")
+                .expect("conversation exists")
+                .nodes
+                .len(),
+            original_node_count,
+            "restart recovery must remove the unaccepted regenerate input node"
         );
     }
 }

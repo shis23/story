@@ -532,9 +532,54 @@ fn scheduled_eq(a: &ScheduledAction, b: &ScheduledAction) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnduranceRunIdentity {
     pub fixture_hash16: String,
-    pub model_hash16: String,
+    pub model_sha256: String,
+    /// Irreversible identity of normalized endpoint + wire protocol.
+    pub endpoint_hash16: String,
     pub tool_mode: String,
     pub reasoning_mode: String,
+    #[serde(default)]
+    pub code_revision16: String,
+    #[serde(default)]
+    pub supplemental_matrix: bool,
+    #[serde(default)]
+    pub meta_probe: bool,
+    #[serde(default)]
+    pub character_extractor_probe: bool,
+    #[serde(default)]
+    pub cache_probe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnduranceRetryState {
+    pub turn_index: u32,
+    pub attempts_used: u32,
+    pub quality_blocked_attempts: u32,
+    pub last_failure_kind: String,
+    pub can_retry: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnduranceProbeState {
+    pub character_extractor_attempts: u32,
+    pub character_extractor_completed: bool,
+    pub meta_attempts: u32,
+    pub meta_completed: bool,
+    pub cache_attempts: u32,
+    pub cache_completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnduranceSqliteAuthority {
+    /// Hash of accepted/terminal story state. Failed or incomplete Turn
+    /// lifecycle rows are excluded so a crash can be recovered without
+    /// weakening detection of unrelated SQLite drift.
+    pub accepted_content_sha256: String,
+    pub committed_turns: u64,
+    /// Number of durable conversation nodes accepted at this checkpoint.
+    pub accepted_conversation_nodes: u64,
+    /// SHA-256 of the accepted conversation prefix with volatile updated_at
+    /// removed. This prevents a forged active Turn from truncating history.
+    pub accepted_conversation_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,12 +615,21 @@ pub struct EnduranceCheckpoint {
     /// Immutable identity for fail-closed resume of real endurance runs.
     #[serde(default)]
     pub run_identity: Option<EnduranceRunIdentity>,
+    /// Durable bounded-reroll state for the next unaccepted turn.
+    #[serde(default)]
+    pub retry_state: Option<EnduranceRetryState>,
+    /// Durable bounded state for real-model probes outside accepted Turn writes.
+    #[serde(default)]
+    pub probe_state: EnduranceProbeState,
+    /// Read-only SQLite authority binding for crash-safe real-run resume.
+    #[serde(default)]
+    pub sqlite_authority: Option<EnduranceSqliteAuthority>,
     pub recorded_at_unix_ms: u128,
 }
 
 impl EnduranceCheckpoint {
     pub fn schema_version() -> &'static str {
-        "endurance-checkpoint-v1"
+        "endurance-checkpoint-v6"
     }
 }
 
@@ -610,6 +664,7 @@ pub fn write_checkpoint(path: &Path, cp: &EnduranceCheckpoint) -> std::io::Resul
         .open(path)?;
     use std::io::Write;
     writeln!(file, "{serialized}")?;
+    file.sync_data()?;
     Ok(())
 }
 
@@ -815,13 +870,30 @@ pub fn classify_acceptance(
     had_secret_violation: bool,
     had_missing_usage: bool,
 ) -> AcceptanceLevel {
+    classify_acceptance_with_call_limit(
+        stage,
+        accepted_turns,
+        calls_used,
+        stage.max_calls(),
+        invariants_passed,
+        had_secret_violation,
+        had_missing_usage,
+    )
+}
+
+pub fn classify_acceptance_with_call_limit(
+    stage: EnduranceStage,
+    accepted_turns: u32,
+    calls_used: u32,
+    max_calls: u32,
+    invariants_passed: bool,
+    had_secret_violation: bool,
+    had_missing_usage: bool,
+) -> AcceptanceLevel {
     if had_secret_violation || had_missing_usage {
         return AcceptanceLevel::Inconclusive;
     }
-    if accepted_turns >= stage.target_turns()
-        && invariants_passed
-        && calls_used <= stage.max_calls()
-    {
+    if accepted_turns >= stage.target_turns() && invariants_passed && calls_used <= max_calls {
         AcceptanceLevel::Pass
     } else {
         AcceptanceLevel::Partial
@@ -864,11 +936,14 @@ pub fn checkpoint_is_new(
 #[derive(Debug, Clone)]
 pub struct EnduranceEvidencePaths {
     pub root: PathBuf,
+    /// Write-ahead call reservations, synced before provider dispatch.
+    pub call_reservations_jsonl: PathBuf,
     pub calls_jsonl: PathBuf,
     pub turns_jsonl: PathBuf,
     pub checkpoint_jsonl: PathBuf,
     pub manifest_jsonl: PathBuf,
     pub phase_b_jsonl: PathBuf,
+    pub coverage_ledger_jsonl: PathBuf,
     /// Sanitized director/agent tool-loop timeline (offered → call → result).
     pub tool_trace_jsonl: PathBuf,
 }
@@ -876,11 +951,13 @@ pub struct EnduranceEvidencePaths {
 impl EnduranceEvidencePaths {
     pub fn new(root: PathBuf) -> Self {
         Self {
+            call_reservations_jsonl: root.join("endurance_call_reservations.jsonl"),
             calls_jsonl: root.join("endurance_calls.jsonl"),
             turns_jsonl: root.join("endurance_turns.jsonl"),
             checkpoint_jsonl: root.join("endurance_checkpoint.jsonl"),
             manifest_jsonl: root.join("endurance_manifest.jsonl"),
             phase_b_jsonl: root.join("endurance_phase_b.jsonl"),
+            coverage_ledger_jsonl: root.join("endurance_coverage_ledger.jsonl"),
             tool_trace_jsonl: root.join("endurance_tool_trace.jsonl"),
             root,
         }
@@ -889,11 +966,13 @@ impl EnduranceEvidencePaths {
     /// Total size of all evidence files in bytes.
     pub fn total_size(&self) -> u64 {
         [
+            &self.call_reservations_jsonl,
             &self.calls_jsonl,
             &self.turns_jsonl,
             &self.checkpoint_jsonl,
             &self.manifest_jsonl,
             &self.phase_b_jsonl,
+            &self.coverage_ledger_jsonl,
             &self.tool_trace_jsonl,
         ]
         .iter()
@@ -905,11 +984,14 @@ impl EnduranceEvidencePaths {
     /// Check that no evidence file contains forbidden payload.
     pub fn check_no_secrets(&self) -> Result<(), String> {
         for path in [
+            &self.call_reservations_jsonl,
             &self.calls_jsonl,
             &self.turns_jsonl,
             &self.checkpoint_jsonl,
             &self.manifest_jsonl,
             &self.phase_b_jsonl,
+            &self.coverage_ledger_jsonl,
+            &self.tool_trace_jsonl,
         ] {
             if let Ok(text) = std::fs::read_to_string(path)
                 && contains_forbidden_evidence_payload(&text)
@@ -1064,12 +1146,12 @@ pub fn resume_from_evidence_dir(
 
     match crate::evidence_retention::load_resume_context(evidence_dir, &expected) {
         Ok(ctx) => {
-            let cp = read_latest_checkpoint(&evidence_dir.join("endurance_checkpoint.jsonl"))
+            let mut cp = read_latest_checkpoint(&evidence_dir.join("endurance_checkpoint.jsonl"))
                 .ok_or_else(|| {
-                    EnduranceError::InvalidConfig(
-                        "resume requested but checkpoint missing or schema-invalid".into(),
-                    )
-                })?;
+                EnduranceError::InvalidConfig(
+                    "resume requested but checkpoint missing or schema-invalid".into(),
+                )
+            })?;
             if ctx.accepted_turn_number != cp.accepted_turn_number {
                 return Err(EnduranceError::InvalidConfig(
                     "resume context accepted_turn_number disagrees with checkpoint".into(),
@@ -1080,6 +1162,7 @@ pub fn resume_from_evidence_dir(
                     "checkpoint run_id does not match expected".into(),
                 ));
             }
+            cp.calls_used = ctx.calls_used;
             Ok((ctx.next_turn, cp))
         }
         Err(e) => Err(EnduranceError::InvalidConfig(format!(
@@ -1168,7 +1251,7 @@ pub fn dry_run_validate_with_policy(
     });
 
     let schema_ok = EVIDENCE_SCHEMA_VERSION == "eval-m5-phaseb-v1"
-        && crate::evidence_retention::RETENTION_SCHEMA_VERSION == "m5-evidence-retention-v1";
+        && crate::evidence_retention::RETENTION_SCHEMA_VERSION == "m5-evidence-retention-v2";
     assertions.push(AssertionResult {
         name: "schema_version_ok".into(),
         passed: schema_ok,
@@ -1313,6 +1396,9 @@ pub fn simulate_resumable_run(
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: vec![epoch_id16],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(checkpoint_path, &cp).expect("write checkpoint");
@@ -1592,6 +1678,37 @@ impl EpochTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_state_roundtrips_without_payload_content() {
+        let state = EnduranceRetryState {
+            turn_index: 9,
+            attempts_used: 2,
+            quality_blocked_attempts: 1,
+            last_failure_kind: "quality_blocked".into(),
+            can_retry: true,
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(!contains_forbidden_evidence_payload(&encoded));
+        let decoded: EnduranceRetryState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn probe_state_roundtrips_and_tracks_bounded_progress() {
+        let state = EnduranceProbeState {
+            character_extractor_attempts: 1,
+            character_extractor_completed: true,
+            meta_attempts: 2,
+            meta_completed: false,
+            cache_attempts: 0,
+            cache_completed: false,
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(!contains_forbidden_evidence_payload(&encoded));
+        let decoded: EnduranceProbeState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, state);
+    }
 
     // ── Stage definitions ──
 
@@ -1985,6 +2102,9 @@ mod tests {
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
         assert_eq!(resume_turn_from_checkpoint(Some(&cp)), 9);
@@ -2011,6 +2131,9 @@ mod tests {
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
         // Same turn, revision, hash → not new (duplicate)
@@ -2046,6 +2169,9 @@ mod tests {
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 123,
         };
         write_checkpoint(&path, &cp).unwrap();
@@ -2080,6 +2206,9 @@ mod tests {
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
             run_identity: None,
+            retry_state: None,
+            probe_state: EnduranceProbeState::default(),
+            sqlite_authority: None,
             recorded_at_unix_ms: 0,
         };
         let result = write_checkpoint(&path, &cp);

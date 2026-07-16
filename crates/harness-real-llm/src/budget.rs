@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use storyforge_domain::llm::{
     ChatRequest, ChatResponse, LlmError, ReasoningMode, StreamChunk, Usage,
 };
@@ -18,13 +19,15 @@ use tokio::sync::{mpsc, watch};
 
 use crate::evidence::{
     AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceToolStep,
-    RealLlmRunBudget, short_hash16,
+    RealLlmRunBudget, now_unix_ms, short_hash16,
 };
 use storyforge_domain::llm::ChatRole;
 
 /// 单次调用的脱敏 usage 样本（不落全文）。
 #[derive(Debug, Clone)]
 pub struct UsageSample {
+    pub call_index: u32,
+    pub evidence_turn_index: u32,
     pub tag: String,
     pub role: String,
     pub streaming: bool,
@@ -57,8 +60,13 @@ impl UsageSample {
         EvidenceCallRecord {
             schema_version: EVIDENCE_SCHEMA_VERSION.into(),
             run_id: run_id.into(),
+            call_index: self.call_index,
             suite: suite.into(),
-            turn_index,
+            turn_index: if self.evidence_turn_index == 0 {
+                turn_index
+            } else {
+                self.evidence_turn_index
+            },
             role: self.role.clone(),
             tag: self.tag.clone(),
             streaming: self.streaming,
@@ -276,6 +284,38 @@ fn extract_tool_trace(
 }
 
 /// 带预算上限与 usage 录制的 LLM 客户端包装。
+pub const CALL_RESERVATION_SCHEMA_VERSION: &str = "m5-call-reservation-v1";
+
+/// Privacy-safe write-ahead record persisted before a real provider dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallReservationRecord {
+    pub schema_version: String,
+    pub run_id: String,
+    pub call_index: u32,
+    pub turn_index: u32,
+    pub tag: String,
+    pub role: String,
+    pub streaming: bool,
+    pub request_fp16: String,
+    pub recorded_at_unix_ms: u128,
+}
+
+/// Synchronous fail-closed sink. Implementations must durably persist the
+/// reservation before returning success; the provider is called only afterward.
+pub trait DurableCallReservationSink: Send + Sync {
+    fn reserve(&self, record: &CallReservationRecord) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone)]
+struct ReservedCall {
+    call_index: u32,
+    turn_index: u32,
+    tag: String,
+    role: String,
+    streaming: bool,
+    request_fp16: String,
+}
+
 pub struct BudgetedLlmClient {
     inner: Arc<dyn LlmClient>,
     calls: AtomicU32,
@@ -287,6 +327,10 @@ pub struct BudgetedLlmClient {
     samples: Mutex<Vec<UsageSample>>,
     turn_tag: Mutex<String>,
     role_label: Mutex<String>,
+    evidence_turn_index: AtomicU32,
+    reservation_gate: Mutex<()>,
+    reservation_run_id: Option<String>,
+    reservation_sink: Option<Arc<dyn DurableCallReservationSink>>,
 }
 
 impl BudgetedLlmClient {
@@ -299,9 +343,45 @@ impl BudgetedLlmClient {
         budget: &RealLlmRunBudget,
         reasoning_override: Option<ReasoningMode>,
     ) -> Arc<Self> {
+        Self::build(inner, budget, reasoning_override, 0, None, None)
+    }
+
+    pub fn wrap_with_reasoning_and_reservations(
+        inner: Arc<dyn LlmClient>,
+        budget: &RealLlmRunBudget,
+        reasoning_override: Option<ReasoningMode>,
+        initial_calls: u32,
+        run_id: impl Into<String>,
+        reservation_sink: Arc<dyn DurableCallReservationSink>,
+    ) -> Result<Arc<Self>, String> {
+        if initial_calls > budget.max_calls {
+            return Err("initial durable calls exceed the configured global call budget".into());
+        }
+        let run_id = run_id.into();
+        if run_id.is_empty() {
+            return Err("durable reservation run id is empty".into());
+        }
+        Ok(Self::build(
+            inner,
+            budget,
+            reasoning_override,
+            initial_calls,
+            Some(run_id),
+            Some(reservation_sink),
+        ))
+    }
+
+    fn build(
+        inner: Arc<dyn LlmClient>,
+        budget: &RealLlmRunBudget,
+        reasoning_override: Option<ReasoningMode>,
+        initial_calls: u32,
+        reservation_run_id: Option<String>,
+        reservation_sink: Option<Arc<dyn DurableCallReservationSink>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            calls: AtomicU32::new(0),
+            calls: AtomicU32::new(initial_calls),
             max_calls: budget.max_calls,
             max_turns: budget.max_turns,
             timeout_secs: budget.timeout_secs.max(1),
@@ -310,6 +390,10 @@ impl BudgetedLlmClient {
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("boot".into()),
             role_label: Mutex::new("pipeline".into()),
+            evidence_turn_index: AtomicU32::new(0),
+            reservation_gate: Mutex::new(()),
+            reservation_run_id,
+            reservation_sink,
         })
     }
 
@@ -323,6 +407,10 @@ impl BudgetedLlmClient {
 
     pub fn set_role(&self, role: impl Into<String>) {
         *self.role_label.lock().expect("role lock") = role.into();
+    }
+
+    pub fn set_evidence_turn_index(&self, turn_index: u32) {
+        self.evidence_turn_index.store(turn_index, Ordering::SeqCst);
     }
 
     pub fn calls_used(&self) -> u32 {
@@ -353,17 +441,49 @@ impl BudgetedLlmClient {
         self.samples().iter().map(|s| s.completion_tokens).sum()
     }
 
-    fn reserve_call(&self) -> Result<(), LlmError> {
+    fn reserve_call(&self, req: &ChatRequest, streaming: bool) -> Result<ReservedCall, LlmError> {
+        let _gate = self
+            .reservation_gate
+            .lock()
+            .map_err(|_| LlmError::Internal("eval reservation gate poisoned".into()))?;
         // 先占位再调用，避免并发超支
-        let prev = self.calls.fetch_add(1, Ordering::SeqCst);
+        let prev = self.calls.load(Ordering::SeqCst);
         if prev >= self.max_calls {
-            self.calls.fetch_sub(1, Ordering::SeqCst);
             return Err(LlmError::Internal(format!(
                 "eval budget exhausted: max_calls={} already used={}",
                 self.max_calls, prev
             )));
         }
-        Ok(())
+        let call_index = prev.saturating_add(1);
+        let reserved = ReservedCall {
+            call_index,
+            turn_index: self.evidence_turn_index.load(Ordering::SeqCst),
+            tag: self.turn_tag.lock().expect("turn_tag lock").clone(),
+            role: self.role_label.lock().expect("role lock").clone(),
+            streaming,
+            request_fp16: short_hash16(&fingerprint_chat_request(req)),
+        };
+        if let Some(sink) = self.reservation_sink.as_ref() {
+            let run_id = self.reservation_run_id.as_ref().ok_or_else(|| {
+                LlmError::Internal("durable reservation run identity is missing".into())
+            })?;
+            let record = CallReservationRecord {
+                schema_version: CALL_RESERVATION_SCHEMA_VERSION.into(),
+                run_id: run_id.clone(),
+                call_index,
+                turn_index: reserved.turn_index,
+                tag: reserved.tag.clone(),
+                role: reserved.role.clone(),
+                streaming: reserved.streaming,
+                request_fp16: reserved.request_fp16.clone(),
+                recorded_at_unix_ms: now_unix_ms(),
+            };
+            sink.reserve(&record).map_err(|_| {
+                LlmError::Internal("durable eval call reservation failed closed".into())
+            })?;
+        }
+        self.calls.store(call_index, Ordering::SeqCst);
+        Ok(reserved)
     }
 
     fn effective_request(&self, req: &ChatRequest) -> ChatRequest {
@@ -386,16 +506,15 @@ impl BudgetedLlmClient {
 
     fn record(
         &self,
+        reserved: &ReservedCall,
         req: &ChatRequest,
         resp: Option<&ChatResponse>,
         usage: Option<Usage>,
         elapsed_ms: u128,
-        streaming: bool,
         outcome: &str,
     ) {
         let segs = messages_segment_summary(&req.messages);
         // 含 model / tools / sampling，避免仅 message 正文导致假稳定
-        let fp = fingerprint_chat_request(req);
         let usage = usage.unwrap_or(Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -405,14 +524,16 @@ impl BudgetedLlmClient {
         });
         let (tools_offered, tool_steps) = extract_tool_trace(req, resp);
         let sample = UsageSample {
-            tag: self.turn_tag.lock().expect("turn_tag lock").clone(),
-            role: self.role_label.lock().expect("role lock").clone(),
-            streaming,
+            call_index: reserved.call_index,
+            evidence_turn_index: reserved.turn_index,
+            tag: reserved.tag.clone(),
+            role: reserved.role.clone(),
+            streaming: reserved.streaming,
             prompt_tokens: usage.prompt_tokens,
             cached_tokens: usage.cached_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             completion_tokens: usage.completion_tokens,
-            request_fp16: short_hash16(&fp),
+            request_fp16: reserved.request_fp16.clone(),
             system_hash16: segs.system_hash.chars().take(16).collect(),
             history_hash16: segs.history_hash.chars().take(16).collect(),
             tail_hash16: segs.tail_hash.chars().take(16).collect(),
@@ -452,34 +573,41 @@ impl BudgetedLlmClient {
 #[async_trait]
 impl LlmClient for BudgetedLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.reserve_call()?;
         let req = self.effective_request(req);
+        let reserved = self.reserve_call(&req, false)?;
         let t0 = Instant::now();
         let fut = self.inner.chat(&req);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 self.record(
+                    &reserved,
                     &req,
                     None,
                     None,
                     t0.elapsed().as_millis(),
-                    false,
                     "client_error",
                 );
                 return Err(e);
             }
             Err(_) => {
-                self.record(&req, None, None, t0.elapsed().as_millis(), false, "timeout");
+                self.record(
+                    &reserved,
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    "timeout",
+                );
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
+            &reserved,
             &req,
             Some(&resp),
             resp.usage.clone(),
             t0.elapsed().as_millis(),
-            false,
             "ok",
         );
         Ok(resp)
@@ -491,34 +619,41 @@ impl LlmClient for BudgetedLlmClient {
         tx: mpsc::UnboundedSender<StreamChunk>,
         cancel: watch::Receiver<bool>,
     ) -> Result<ChatResponse, LlmError> {
-        self.reserve_call()?;
         let req = self.effective_request(req);
+        let reserved = self.reserve_call(&req, true)?;
         let t0 = Instant::now();
         let fut = self.inner.chat_stream(&req, tx, cancel);
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 self.record(
+                    &reserved,
                     &req,
                     None,
                     None,
                     t0.elapsed().as_millis(),
-                    true,
                     "client_error",
                 );
                 return Err(e);
             }
             Err(_) => {
-                self.record(&req, None, None, t0.elapsed().as_millis(), true, "timeout");
+                self.record(
+                    &reserved,
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    "timeout",
+                );
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
+            &reserved,
             &req,
             Some(&resp),
             resp.usage.clone(),
             t0.elapsed().as_millis(),
-            true,
             "ok",
         );
         Ok(resp)
@@ -530,6 +665,22 @@ mod tests {
     use super::*;
     use storyforge_domain::llm::ChatMessage;
     use storyforge_infra_llm::mock_client::MockLlmClient;
+
+    #[derive(Default)]
+    struct RecordingReservationSink {
+        records: Mutex<Vec<CallReservationRecord>>,
+        fail: bool,
+    }
+
+    impl DurableCallReservationSink for RecordingReservationSink {
+        fn reserve(&self, record: &CallReservationRecord) -> Result<(), String> {
+            if self.fail {
+                return Err("injected".into());
+            }
+            self.records.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
 
     fn dummy_req() -> ChatRequest {
         ChatRequest {
@@ -561,6 +712,114 @@ mod tests {
         );
         assert_eq!(client.calls_used(), 1);
         assert_eq!(client.samples().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_reservation_precedes_dispatch_and_survives_dropped_future() {
+        struct HangingClient {
+            invoked: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl LlmClient for HangingClient {
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                self.invoked.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+
+            async fn chat_stream(
+                &self,
+                req: &ChatRequest,
+                _tx: mpsc::UnboundedSender<StreamChunk>,
+                _cancel: watch::Receiver<bool>,
+            ) -> Result<ChatResponse, LlmError> {
+                self.chat(req).await
+            }
+        }
+
+        let invoked = Arc::new(AtomicU32::new(0));
+        let sink = Arc::new(RecordingReservationSink::default());
+        let budget = RealLlmRunBudget {
+            enabled: true,
+            max_calls: 5,
+            max_turns: 1,
+            timeout_secs: 30,
+            max_tokens: None,
+        };
+        let client = BudgetedLlmClient::wrap_with_reasoning_and_reservations(
+            Arc::new(HangingClient {
+                invoked: invoked.clone(),
+            }),
+            &budget,
+            None,
+            3,
+            "run-canary-00000000-0000-0000-0000-000000000001",
+            sink.clone(),
+        )
+        .unwrap();
+        client.set_evidence_turn_index(1);
+        let result =
+            tokio::time::timeout(Duration::from_millis(20), client.chat(&dummy_req())).await;
+        assert!(
+            result.is_err(),
+            "outer timeout must drop the hanging future"
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+        assert_eq!(client.calls_used(), 4);
+        assert!(client.samples().is_empty());
+        let records = sink.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call_index, 4);
+        assert_eq!(records[0].turn_index, 1);
+    }
+
+    #[tokio::test]
+    async fn reservation_failure_prevents_provider_dispatch() {
+        struct CountingClient(Arc<AtomicU32>);
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ChatResponse {
+                    content: "should-not-run".into(),
+                    tool_calls: vec![],
+                    finish_reason: None,
+                    usage: None,
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                req: &ChatRequest,
+                _tx: mpsc::UnboundedSender<StreamChunk>,
+                _cancel: watch::Receiver<bool>,
+            ) -> Result<ChatResponse, LlmError> {
+                self.chat(req).await
+            }
+        }
+        let invoked = Arc::new(AtomicU32::new(0));
+        let sink = Arc::new(RecordingReservationSink {
+            records: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let budget = RealLlmRunBudget {
+            enabled: true,
+            max_calls: 1,
+            max_turns: 1,
+            timeout_secs: 30,
+            max_tokens: None,
+        };
+        let client = BudgetedLlmClient::wrap_with_reasoning_and_reservations(
+            Arc::new(CountingClient(invoked.clone())),
+            &budget,
+            None,
+            0,
+            "run-canary-00000000-0000-0000-0000-000000000002",
+            sink,
+        )
+        .unwrap();
+        assert!(client.chat(&dummy_req()).await.is_err());
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        assert_eq!(client.calls_used(), 0);
     }
 
     #[test]
@@ -643,6 +902,10 @@ mod tests {
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("t".into()),
             role_label: Mutex::new("r".into()),
+            evidence_turn_index: AtomicU32::new(0),
+            reservation_gate: Mutex::new(()),
+            reservation_run_id: None,
+            reservation_sink: None,
         });
         let req = dummy_req();
         let result = client.chat(&req).await;

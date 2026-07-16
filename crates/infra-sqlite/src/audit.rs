@@ -14,6 +14,7 @@ use crate::{Database, Result, migrate};
 pub struct SqliteAuditSnapshot {
     pub sqlite_schema_version: u32,
     pub canonical_content_sha256: String,
+    pub accepted_content_sha256: String,
     pub turns: u64,
     pub attempts: u64,
     pub committed_turns: u64,
@@ -37,10 +38,11 @@ pub fn capture_audit_snapshot(db: &mut Database) -> Result<SqliteAuditSnapshot> 
     let snapshot = SqliteAuditSnapshot {
         sqlite_schema_version: sqlite_schema_version.max(0) as u32,
         canonical_content_sha256: canonical_content_hash(&tx)?,
+        accepted_content_sha256: accepted_content_hash(&tx)?,
         turns: count(&tx, "turns")?,
         attempts: count(&tx, "turn_attempts")?,
         committed_turns: tx.query_row(
-            "SELECT COUNT(*) FROM turns WHERE status IN ('Committed', 'Degraded')",
+            "SELECT COUNT(*) FROM turns WHERE status IN ('committed', 'degraded')",
             [],
             |row| row.get::<_, i64>(0),
         )? as u64,
@@ -60,6 +62,14 @@ fn count(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<u64> {
 }
 
 fn canonical_content_hash(tx: &rusqlite::Transaction<'_>) -> Result<String> {
+    canonical_hash(tx, false)
+}
+
+fn accepted_content_hash(tx: &rusqlite::Transaction<'_>) -> Result<String> {
+    canonical_hash(tx, true)
+}
+
+fn canonical_hash(tx: &rusqlite::Transaction<'_>, accepted_projection: bool) -> Result<String> {
     let tables = {
         let mut stmt = tx.prepare(
             "SELECT name FROM sqlite_master \
@@ -74,12 +84,15 @@ fn canonical_content_hash(tx: &rusqlite::Transaction<'_>) -> Result<String> {
         feed_bytes(&mut hasher, b"table");
         feed_bytes(&mut hasher, table.as_bytes());
 
-        let columns = {
+        let mut columns = {
             let pragma = format!("PRAGMA table_info({})", quote_identifier(&table));
             let mut stmt = tx.prepare(&pragma)?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        if accepted_projection && table == "conversations" {
+            columns.retain(|column| column != "updated_at");
+        }
         if columns.is_empty() {
             continue;
         }
@@ -92,15 +105,29 @@ fn canonical_content_hash(tx: &rusqlite::Transaction<'_>) -> Result<String> {
             .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
+        let where_clause = if accepted_projection {
+            match table.as_str() {
+                "turns" => " WHERE status IN ('committed', 'degraded')",
+                "turn_attempts" => {
+                    " WHERE turn_id IN (SELECT turn_id FROM turns WHERE status IN ('committed', 'degraded'))"
+                }
+                "preaccept_outbox" => {
+                    " WHERE turn_id IN (SELECT turn_id FROM turns WHERE status IN ('committed', 'degraded'))"
+                }
+                _ => "",
+            }
+        } else {
+            ""
+        };
         let query = format!(
-            "SELECT {column_list} FROM {} ORDER BY {column_list}",
+            "SELECT {column_list} FROM {}{where_clause} ORDER BY {column_list}",
             quote_identifier(&table)
         );
         let mut stmt = tx.prepare(&query)?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             feed_bytes(&mut hasher, b"row");
-            for index in 0..columns.len() {
+            for (index, column) in columns.iter().enumerate() {
                 match row.get_ref(index)? {
                     ValueRef::Null => feed_bytes(&mut hasher, b"null"),
                     ValueRef::Integer(value) => {
@@ -113,7 +140,18 @@ fn canonical_content_hash(tx: &rusqlite::Transaction<'_>) -> Result<String> {
                     }
                     ValueRef::Text(value) => {
                         feed_bytes(&mut hasher, b"text");
-                        feed_bytes(&mut hasher, value);
+                        if accepted_projection
+                            && table == "conversations"
+                            && column == "payload_json"
+                        {
+                            let mut payload: serde_json::Value = serde_json::from_slice(value)?;
+                            if let Some(object) = payload.as_object_mut() {
+                                object.remove("updated_at");
+                            }
+                            feed_bytes(&mut hasher, &serde_json::to_vec(&payload)?);
+                        } else {
+                            feed_bytes(&mut hasher, value);
+                        }
                     }
                     ValueRef::Blob(value) => {
                         feed_bytes(&mut hasher, b"blob");

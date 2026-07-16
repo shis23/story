@@ -329,6 +329,8 @@ mod tests {
 
         let samples = vec![
             UsageSample {
+                call_index: 1,
+                evidence_turn_index: 0,
                 tag: "boot".into(),
                 role: "pipeline".into(),
                 streaming: false,
@@ -349,6 +351,8 @@ mod tests {
                 tool_steps: vec![],
             },
             UsageSample {
+                call_index: 2,
+                evidence_turn_index: 0,
                 tag: "turn1".into(),
                 role: "editor".into(),
                 streaming: true,

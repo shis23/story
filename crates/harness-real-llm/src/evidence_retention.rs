@@ -7,23 +7,30 @@
 //! Default root resolution is **conservative**: an explicit env/CLI root is
 //! required unless a test policy opts into ephemeral roots.
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::io::{self, Read};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::budget::{
+    CALL_RESERVATION_SCHEMA_VERSION, CallReservationRecord, DurableCallReservationSink,
+};
 use crate::endurance::{
-    EnduranceCheckpoint, EnduranceEvidencePaths, EnduranceStageManifestRow, read_latest_checkpoint,
+    EnduranceCheckpoint, EnduranceEvidencePaths, EnduranceRunIdentity, EnduranceStageManifestRow,
+    read_latest_checkpoint,
 };
 use crate::evidence::{
-    EVIDENCE_SCHEMA_VERSION, contains_forbidden_evidence_payload, now_unix_ms, read_evidence_lines,
+    AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceTurnRecord,
+    EvidenceWriter, contains_forbidden_evidence_payload, now_unix_ms, read_evidence_lines,
+    short_hash16,
 };
 
 /// Schema id for the atomic per-run retention manifest.
-pub const RETENTION_SCHEMA_VERSION: &str = "m5-evidence-retention-v1";
+pub const RETENTION_SCHEMA_VERSION: &str = "m5-evidence-retention-v2";
 
 /// File name of the atomic run manifest written by [`seal_run`].
 pub const RUN_MANIFEST_FILE: &str = "run_manifest.json";
@@ -32,7 +39,7 @@ pub const RUN_MANIFEST_FILE: &str = "run_manifest.json";
 pub const CHECKPOINT_INTEGRITY_FILE: &str = "checkpoint_integrity.json";
 
 /// Schema id for the privacy-safe SQLite audit subject sealed with a run.
-pub const SQLITE_AUDIT_SCHEMA_VERSION: &str = "m5-sqlite-audit-v1";
+pub const SQLITE_AUDIT_SCHEMA_VERSION: &str = "m5-sqlite-audit-v2";
 
 /// Fixed relative path for the privacy-safe SQLite audit subject.
 pub const SQLITE_AUDIT_SUBJECT_FILE: &str = "sqlite_snapshot/sqlite_audit.json";
@@ -47,6 +54,8 @@ pub const EVIDENCE_ROOT_ENV: &str = "STORYFORGE_EVAL_EVIDENCE_ROOT";
 /// resolves to a validated root or a child under a validated root.
 pub const EVIDENCE_DIR_ENV: &str = "STORYFORGE_EVAL_EVIDENCE_DIR";
 
+pub const CALL_RESERVATIONS_FILE: &str = "endurance_call_reservations.jsonl";
+
 /// Required evidence file names sealed for endurance runs.
 const REQUIRED_EVIDENCE_FILES: &[&str] = &[
     "endurance_calls.jsonl",
@@ -56,6 +65,7 @@ const REQUIRED_EVIDENCE_FILES: &[&str] = &[
 
 /// Optional evidence files hashed when present.
 const OPTIONAL_EVIDENCE_FILES: &[&str] = &[
+    CALL_RESERVATIONS_FILE,
     "endurance_manifest.jsonl",
     "endurance_phase_b.jsonl",
     // Sanitized director/agent tool loop timeline (offered → call → result).
@@ -427,6 +437,20 @@ pub fn resolve_resume_run_dir(
     assert_tree_safe_for_resume(run_dir, policy)
 }
 
+/// Treat an explicitly named path as a resume run whenever it already exists.
+/// A present-but-incomplete controlled run must fail closed instead of silently
+/// causing allocation of a new sibling run.
+pub fn resolve_explicit_resume_run_dir(
+    run_dir: &Path,
+    policy: &EvidenceRootPolicy,
+) -> Result<Option<PathBuf>, EvidenceRetentionError> {
+    match fs::symlink_metadata(run_dir) {
+        Ok(_) => resolve_resume_run_dir(run_dir, policy).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Recursive resume preflight: reject reparse/junction/symlink anywhere under the
 /// run dir (including `campaign_data`) and ensure every discovered path stays
 /// inside the controlled run directory. Does **not** read file bodies.
@@ -526,6 +550,12 @@ pub struct CheckpointIntegrityBaseline {
     pub relative_path: String,
     pub sha256: String,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservations_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservations_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservations_size_bytes: Option<u64>,
     pub recorded_at_unix_ms: u128,
 }
 
@@ -545,11 +575,28 @@ pub fn write_checkpoint_integrity_baseline(
     assert_not_reparse_path(&cp)?;
     ensure_canonical_within(run_dir, &cp)?;
     let (sha, size) = sha256_file(&cp)?;
+    let reservations = run_dir.join(CALL_RESERVATIONS_FILE);
+    let (reservations_relative_path, reservations_sha256, reservations_size_bytes) =
+        if reservations.exists() {
+            assert_not_reparse_path(&reservations)?;
+            ensure_canonical_within(run_dir, &reservations)?;
+            let (sha256, size_bytes) = sha256_file(&reservations)?;
+            (
+                Some(CALL_RESERVATIONS_FILE.into()),
+                Some(sha256),
+                Some(size_bytes),
+            )
+        } else {
+            (None, None, None)
+        };
     let baseline = CheckpointIntegrityBaseline {
-        schema_version: "checkpoint-integrity-v1".into(),
+        schema_version: "checkpoint-integrity-v2".into(),
         relative_path: "endurance_checkpoint.jsonl".into(),
         sha256: sha,
         size_bytes: size,
+        reservations_relative_path,
+        reservations_sha256,
+        reservations_size_bytes,
         recorded_at_unix_ms: now_unix_ms(),
     };
     let serialized = serde_json::to_string_pretty(&baseline)?;
@@ -585,7 +632,7 @@ pub fn verify_checkpoint_integrity_baseline(
         });
     }
     let baseline: CheckpointIntegrityBaseline = serde_json::from_str(&raw)?;
-    if baseline.schema_version != "checkpoint-integrity-v1" {
+    if baseline.schema_version != "checkpoint-integrity-v2" {
         return Err(EvidenceRetentionError::SchemaMismatch {
             detail: "checkpoint integrity schema drift".into(),
         });
@@ -598,13 +645,201 @@ pub fn verify_checkpoint_integrity_baseline(
     let cp = run_dir.join("endurance_checkpoint.jsonl");
     assert_not_reparse_path(&cp)?;
     ensure_canonical_within(run_dir, &cp)?;
-    let (sha, size) = sha256_file(&cp)?;
-    if sha != baseline.sha256 || size != baseline.size_bytes {
+    if !matches_anchored_file_or_append_only_suffix(&cp, &baseline.sha256, baseline.size_bytes)? {
         return Err(EvidenceRetentionError::HashMismatch {
             relative_path: "endurance_checkpoint.jsonl".into(),
         });
     }
+    let reservations = run_dir.join(CALL_RESERVATIONS_FILE);
+    match (
+        baseline.reservations_relative_path.as_deref(),
+        baseline.reservations_sha256.as_deref(),
+        baseline.reservations_size_bytes,
+    ) {
+        (Some(CALL_RESERVATIONS_FILE), Some(expected_sha), Some(expected_size)) => {
+            if !reservations.is_file() {
+                return Err(EvidenceRetentionError::MissingRequiredFile {
+                    relative_path: CALL_RESERVATIONS_FILE.into(),
+                });
+            }
+            assert_not_reparse_path(&reservations)?;
+            ensure_canonical_within(run_dir, &reservations)?;
+            if !matches_anchored_file_or_append_only_suffix(
+                &reservations,
+                expected_sha,
+                expected_size,
+            )? {
+                return Err(EvidenceRetentionError::HashMismatch {
+                    relative_path: CALL_RESERVATIONS_FILE.into(),
+                });
+            }
+        }
+        (None, None, None) if !reservations.exists() => {}
+        _ => {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "checkpoint reservation integrity fields are inconsistent".into(),
+            });
+        }
+    }
     Ok(baseline)
+}
+
+fn read_call_reservations(
+    run_dir: &Path,
+    expected_run_id: &str,
+) -> Result<Vec<CallReservationRecord>, EvidenceRetentionError> {
+    let path = run_dir.join(CALL_RESERVATIONS_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    assert_not_reparse_path(&path)?;
+    ensure_canonical_within(run_dir, &path)?;
+    let mut records = Vec::new();
+    for (offset, value) in read_evidence_lines(&path)?.into_iter().enumerate() {
+        let record: CallReservationRecord =
+            serde_json::from_value(value).map_err(|_| EvidenceRetentionError::SchemaMismatch {
+                detail: "call reservation row is invalid".into(),
+            })?;
+        let expected_index = u32::try_from(offset)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(EvidenceRetentionError::CallCountMismatch {
+                expected: u32::MAX,
+                actual: u32::MAX,
+            })?;
+        if record.schema_version != CALL_RESERVATION_SCHEMA_VERSION
+            || record.run_id != expected_run_id
+            || record.call_index != expected_index
+            || record.request_fp16.len() != 16
+            || !record
+                .request_fp16
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            || record.tag.is_empty()
+            || record.tag.len() > 128
+            || record.role.is_empty()
+            || record.role.len() > 64
+        {
+            return Err(EvidenceRetentionError::SchemaMismatch {
+                detail: "call reservation sequence, identity, or fields are invalid".into(),
+            });
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// Fsync-before-network writer used by [`BudgetedLlmClient`].
+pub struct DurableCallReservationWriter {
+    run_dir: PathBuf,
+    run_id: String,
+    _run_lock: fs::File,
+    state: Mutex<DurableCallReservationWriterState>,
+}
+
+struct DurableCallReservationWriterState {
+    file: fs::File,
+    last_index: u32,
+}
+
+fn acquire_call_reservation_run_lock(run_dir: &Path) -> Result<fs::File, EvidenceRetentionError> {
+    let lock_path = run_dir.join(".call-reservations.active.lock");
+    if lock_path.exists() {
+        assert_not_reparse_path(&lock_path)?;
+        ensure_canonical_within(run_dir, &lock_path)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    file.try_lock()
+        .map_err(|_| EvidenceRetentionError::CheckpointIntegrity {
+            detail: "another process already owns this evidence run".into(),
+        })?;
+    Ok(file)
+}
+
+impl DurableCallReservationWriter {
+    pub fn create(
+        run_dir: &Path,
+        run_id: impl Into<String>,
+    ) -> Result<Self, EvidenceRetentionError> {
+        let run_id = run_id.into();
+        assert_not_reparse_path(run_dir)?;
+        let path = run_dir.join(CALL_RESERVATIONS_FILE);
+        let run_lock = acquire_call_reservation_run_lock(run_dir)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
+        file.sync_all()?;
+        Ok(Self {
+            run_dir: run_dir.to_path_buf(),
+            run_id,
+            _run_lock: run_lock,
+            state: Mutex::new(DurableCallReservationWriterState {
+                file,
+                last_index: 0,
+            }),
+        })
+    }
+
+    pub fn open_append(
+        run_dir: &Path,
+        run_id: impl Into<String>,
+    ) -> Result<Self, EvidenceRetentionError> {
+        let run_id = run_id.into();
+        let records = read_call_reservations(run_dir, &run_id)?;
+        if records.is_empty() && !run_dir.join(CALL_RESERVATIONS_FILE).is_file() {
+            return Err(EvidenceRetentionError::MissingRequiredFile {
+                relative_path: CALL_RESERVATIONS_FILE.into(),
+            });
+        }
+        let last_index = records.last().map(|record| record.call_index).unwrap_or(0);
+        let run_lock = acquire_call_reservation_run_lock(run_dir)?;
+        let path = run_dir.join(CALL_RESERVATIONS_FILE);
+        assert_not_reparse_path(&path)?;
+        ensure_canonical_within(run_dir, &path)?;
+        let file = OpenOptions::new().append(true).open(&path)?;
+        Ok(Self {
+            run_dir: run_dir.to_path_buf(),
+            run_id,
+            _run_lock: run_lock,
+            state: Mutex::new(DurableCallReservationWriterState { file, last_index }),
+        })
+    }
+}
+
+impl DurableCallReservationSink for DurableCallReservationWriter {
+    fn reserve(&self, record: &CallReservationRecord) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "call reservation writer lock poisoned".to_string())?;
+        if record.run_id != self.run_id
+            || record.schema_version != CALL_RESERVATION_SCHEMA_VERSION
+            || record.call_index != state.last_index.saturating_add(1)
+        {
+            return Err("call reservation identity or sequence rejected".into());
+        }
+        let serialized = serde_json::to_string(record)
+            .map_err(|_| "call reservation serialization rejected".to_string())?;
+        if contains_forbidden_evidence_payload(&serialized) {
+            return Err("call reservation payload rejected".into());
+        }
+        writeln!(state.file, "{serialized}")
+            .map_err(|_| "call reservation append failed".to_string())?;
+        state
+            .file
+            .sync_data()
+            .map_err(|_| "call reservation sync failed".to_string())?;
+        state.last_index = record.call_index;
+        write_checkpoint_integrity_baseline(&self.run_dir)
+            .map_err(|_| "call reservation integrity baseline update failed".to_string())?;
+        Ok(())
+    }
 }
 
 /// Resolve the evidence root from optional CLI path / environment.
@@ -760,6 +995,8 @@ pub struct RunManifest {
     pub status: RunStatus,
     pub stage: String,
     pub model_label: String,
+    #[serde(default)]
+    pub model_sha256: String,
     pub budget: BudgetSummary,
     pub commit: String,
     pub branch: String,
@@ -794,6 +1031,8 @@ pub struct SqliteAuditSubject {
     pub sqlite_schema_version: u32,
     /// SHA-256 of the caller's canonical, sanitized database-content inventory.
     pub canonical_content_sha256: String,
+    /// SHA-256 of accepted/terminal story state used for crash-safe resume.
+    pub accepted_content_sha256: String,
     pub turns: u64,
     pub attempts: u64,
     pub committed_turns: u64,
@@ -831,6 +1070,68 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64), EvidenceRetentionError>
         size += n as u64;
     }
     Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+fn sha256_file_prefix(path: &Path, prefix_size: u64) -> Result<String, EvidenceRetentionError> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut remaining = prefix_size;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let read = file.read(&mut buf[..wanted])?;
+        if read == 0 {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "append-only evidence was truncated below its anchored prefix".into(),
+            });
+        }
+        hasher.update(&buf[..read]);
+        remaining -= read as u64;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn matches_anchored_file_or_append_only_suffix(
+    path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<bool, EvidenceRetentionError> {
+    let (actual_sha256, actual_size) = sha256_file(path)?;
+    if actual_size == expected_size {
+        return Ok(actual_sha256 == expected_sha256);
+    }
+    if actual_size < expected_size {
+        return Ok(false);
+    }
+    if sha256_file_prefix(path, expected_size)? != expected_sha256 {
+        return Ok(false);
+    }
+    let body = fs::read(path)?;
+    let prefix_size = usize::try_from(expected_size).map_err(|_| {
+        EvidenceRetentionError::CheckpointIntegrity {
+            detail: "anchored JSONL prefix size is not addressable".into(),
+        }
+    })?;
+    let suffix =
+        body.get(prefix_size..)
+            .ok_or_else(|| EvidenceRetentionError::CheckpointIntegrity {
+                detail: "anchored JSONL suffix is outside the file".into(),
+            })?;
+    if suffix.is_empty() || !suffix.ends_with(b"\n") {
+        return Ok(false);
+    }
+    let suffix =
+        std::str::from_utf8(suffix).map_err(|_| EvidenceRetentionError::CheckpointIntegrity {
+            detail: "append-only evidence suffix is not UTF-8 JSONL".into(),
+        })?;
+    let mut rows = 0usize;
+    for line in suffix.lines() {
+        if line.trim().is_empty() || serde_json::from_str::<serde_json::Value>(line).is_err() {
+            return Ok(false);
+        }
+        rows = rows.saturating_add(1);
+    }
+    Ok(rows > 0)
 }
 
 fn to_relative_posix(path: &str) -> String {
@@ -984,24 +1285,26 @@ fn collect_run_ids_from_jsonl(path: &Path) -> Result<BTreeSet<String>, EvidenceR
         return Ok(ids);
     }
     for line in read_evidence_lines(path)? {
-        if let Some(id) = line.get("run_id").and_then(|v| v.as_str()) {
-            ids.insert(id.to_string());
-        }
+        let id = line
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| EvidenceRetentionError::SchemaMismatch {
+                detail: "sealed JSONL row is missing run_id".into(),
+            })?;
+        ids.insert(id.to_string());
     }
     Ok(ids)
 }
 
 fn assert_single_run_id(run_dir: &Path, expected: &str) -> Result<(), EvidenceRetentionError> {
-    let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
     let mut all = BTreeSet::new();
-    for p in [
-        &paths.calls_jsonl,
-        &paths.turns_jsonl,
-        &paths.checkpoint_jsonl,
-        &paths.manifest_jsonl,
-        &paths.phase_b_jsonl,
-    ] {
-        for id in collect_run_ids_from_jsonl(p)? {
+    for relative_path in collect_actual_sealed_files(run_dir)?
+        .into_iter()
+        .filter(|relative_path| relative_path.ends_with(".jsonl"))
+    {
+        let path = run_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        for id in collect_run_ids_from_jsonl(&path)? {
             all.insert(id);
         }
     }
@@ -1059,6 +1362,169 @@ pub fn count_evidence_call_records(
     })
 }
 
+fn validate_call_reservation_mapping(
+    run_dir: &Path,
+    expected_run_id: &str,
+    require_terminal: bool,
+) -> Result<u32, EvidenceRetentionError> {
+    let reservations = read_call_reservations(run_dir, expected_run_id)?;
+    let reservation_path = run_dir.join(CALL_RESERVATIONS_FILE);
+    if reservations.is_empty() && !reservation_path.exists() {
+        return count_evidence_call_records(run_dir, expected_run_id);
+    }
+    let mut reservation_by_index = BTreeMap::new();
+    for reservation in reservations {
+        reservation_by_index.insert(reservation.call_index, reservation);
+    }
+    let calls_path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).calls_jsonl;
+    let mut completed = BTreeSet::new();
+    if calls_path.exists() {
+        for value in read_evidence_lines(&calls_path)? {
+            let call: EvidenceCallRecord = serde_json::from_value(value).map_err(|_| {
+                EvidenceRetentionError::SchemaMismatch {
+                    detail: "call evidence row is not a typed EvidenceCallRecord".into(),
+                }
+            })?;
+            if call.schema_version != EVIDENCE_SCHEMA_VERSION || call.run_id != expected_run_id {
+                return Err(EvidenceRetentionError::MixedRunId {
+                    detail: format!("expected only {expected_run_id}"),
+                });
+            }
+            let reservation = reservation_by_index.get(&call.call_index).ok_or_else(|| {
+                EvidenceRetentionError::CheckpointIntegrity {
+                    detail: "call evidence has no matching durable reservation".into(),
+                }
+            })?;
+            if !completed.insert(call.call_index)
+                || call.request_fp16 != reservation.request_fp16
+                || call.turn_index != reservation.turn_index
+                || call.tag != reservation.tag
+                || call.role != reservation.role
+                || call.streaming != reservation.streaming
+            {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: "call evidence does not uniquely match its durable reservation".into(),
+                });
+            }
+        }
+    }
+    if require_terminal
+        && completed
+            != reservation_by_index
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "completed evidence has a dangling durable call reservation".into(),
+        });
+    }
+    u32::try_from(reservation_by_index.len()).map_err(|_| {
+        EvidenceRetentionError::CallCountMismatch {
+            expected: u32::MAX,
+            actual: u32::MAX,
+        }
+    })
+}
+
+/// Count the durable write-ahead reservations when present. Legacy runs
+/// without the reservation ledger fall back to completed call rows.
+pub fn count_budgeted_call_records(
+    run_dir: &Path,
+    expected_run_id: &str,
+) -> Result<u32, EvidenceRetentionError> {
+    validate_call_reservation_mapping(run_dir, expected_run_id, false)
+}
+
+fn require_call_reservation_ledger_for_typed_run(
+    run_dir: &Path,
+    checkpoint: &EnduranceCheckpoint,
+) -> Result<(), EvidenceRetentionError> {
+    if checkpoint.run_identity.is_some() && !run_dir.join(CALL_RESERVATIONS_FILE).is_file() {
+        return Err(EvidenceRetentionError::MissingRequiredFile {
+            relative_path: CALL_RESERVATIONS_FILE.into(),
+        });
+    }
+    Ok(())
+}
+
+/// Materialize conservative terminal rows for provider calls that were
+/// durably reserved but whose future was dropped or process was interrupted.
+/// These calls keep consuming budget and are never reissued under the same ID.
+pub fn reconcile_dangling_call_reservations(
+    run_dir: &Path,
+    expected_run_id: &str,
+    model_label: &str,
+) -> Result<u32, EvidenceRetentionError> {
+    let reservations = read_call_reservations(run_dir, expected_run_id)?;
+    if reservations.is_empty() {
+        return count_evidence_call_records(run_dir, expected_run_id);
+    }
+    let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
+    let mut completed = BTreeSet::new();
+    if paths.calls_jsonl.exists() {
+        for value in read_evidence_lines(&paths.calls_jsonl)? {
+            let call: EvidenceCallRecord = serde_json::from_value(value).map_err(|_| {
+                EvidenceRetentionError::SchemaMismatch {
+                    detail: "call evidence row is invalid during reconciliation".into(),
+                }
+            })?;
+            if call.run_id != expected_run_id || !completed.insert(call.call_index) {
+                return Err(EvidenceRetentionError::MixedRunId {
+                    detail: "call reconciliation found duplicate or foreign identity".into(),
+                });
+            }
+        }
+    }
+    let writer = EvidenceWriter::open_append(&paths.calls_jsonl, expected_run_id)?;
+    for reservation in &reservations {
+        if completed.contains(&reservation.call_index) {
+            continue;
+        }
+        writer.write_call(EvidenceCallRecord {
+            schema_version: EVIDENCE_SCHEMA_VERSION.into(),
+            run_id: expected_run_id.into(),
+            call_index: reservation.call_index,
+            suite: "endurance_sqlite".into(),
+            turn_index: reservation.turn_index,
+            role: reservation.role.clone(),
+            tag: reservation.tag.clone(),
+            streaming: reservation.streaming,
+            request_fp16: reservation.request_fp16.clone(),
+            system_hash16: "0000000000000000".into(),
+            history_hash16: "0000000000000000".into(),
+            tail_hash16: "0000000000000000".into(),
+            history_len: 0,
+            tail_parts: 0,
+            msg_count: 0,
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            completion_tokens: 0,
+            elapsed_ms: 0,
+            outcome: "interrupted_unknown".into(),
+            tools_offered: vec![],
+            tool_steps: vec![],
+            assertion_results: vec![
+                AssertionResult {
+                    name: "call_recorded".into(),
+                    passed: false,
+                    detail: Some("outcome=interrupted_unknown".into()),
+                },
+                AssertionResult {
+                    name: "successful_write_attempt".into(),
+                    passed: false,
+                    detail: Some("false".into()),
+                },
+            ],
+            model_label: model_label.chars().take(64).collect(),
+            recorded_at_unix_ms: 0,
+        })?;
+    }
+    write_checkpoint_integrity_baseline(run_dir)?;
+    validate_call_reservation_mapping(run_dir, expected_run_id, true)
+}
+
 fn controlled_stage_from_run_id(run_id: &str) -> Option<&str> {
     let rest = run_id.strip_prefix(RUN_DIR_PREFIX)?;
     rest.split_once('-').map(|(stage, _)| stage)
@@ -1068,7 +1534,7 @@ fn validate_turn_index_set(
     run_dir: &Path,
     expected_run_id: &str,
     accepted_turn_number: u32,
-) -> Result<(), EvidenceRetentionError> {
+) -> Result<bool, EvidenceRetentionError> {
     let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).turns_jsonl;
     if !path.is_file() {
         return Err(EvidenceRetentionError::MissingRequiredFile {
@@ -1079,37 +1545,28 @@ fn validate_turn_index_set(
     ensure_canonical_within(run_dir, &path)?;
 
     let mut actual = BTreeSet::new();
+    let mut records = Vec::new();
     for value in read_evidence_lines(&path)? {
-        let schema = value
-            .get("schema_version")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if schema != EVIDENCE_SCHEMA_VERSION {
+        let record: EvidenceTurnRecord =
+            serde_json::from_value(value).map_err(|_| EvidenceRetentionError::SchemaMismatch {
+                detail: "turn evidence row is not a typed EvidenceTurnRecord".into(),
+            })?;
+        if record.schema_version != EVIDENCE_SCHEMA_VERSION {
             return Err(EvidenceRetentionError::SchemaMismatch {
                 detail: "turn evidence schema drift".into(),
             });
         }
-        let run_id = value
-            .get("run_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if run_id != expected_run_id {
+        if record.run_id != expected_run_id {
             return Err(EvidenceRetentionError::MixedRunId {
                 detail: format!("expected only {expected_run_id}"),
             });
         }
-        let turn_index = value
-            .get("turn_index")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| EvidenceRetentionError::SchemaMismatch {
-                detail: "turn evidence requires a u32 turn_index".into(),
-            })?;
-        if turn_index == 0 || !actual.insert(turn_index) {
+        if record.turn_index == 0 || !actual.insert(record.turn_index) {
             return Err(EvidenceRetentionError::CheckpointIntegrity {
                 detail: "turn indices must be non-zero and unique".into(),
             });
         }
+        records.push(record);
     }
 
     let expected = (1..=accepted_turn_number).collect::<BTreeSet<_>>();
@@ -1121,15 +1578,53 @@ fn validate_turn_index_set(
             ),
         });
     }
-    Ok(())
+
+    let sqlite_rows = records
+        .iter()
+        .filter(|record| record.accept_path == "sqlite_runtime::accept_by_variant")
+        .count();
+    if sqlite_rows != 0 && sqlite_rows != records.len() {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "completed SQLite endurance evidence cannot mix accept paths".into(),
+        });
+    }
+    let sqlite_endurance = sqlite_rows == records.len() && !records.is_empty();
+    if sqlite_endurance {
+        for record in &records {
+            if !record.draft_accepted
+                || record.force_accept
+                || !record.production_postprocess_complete
+                || record.attempt_status != "Committed"
+                || !matches!(record.turn_status.as_str(), "Committed" | "Degraded")
+                || record.assertion_results.is_empty()
+                || record
+                    .assertion_results
+                    .iter()
+                    .any(|assertion| !assertion.passed)
+            {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: format!(
+                        "SQLite endurance turn {} is not a verified terminal production commit",
+                        record.turn_index
+                    ),
+                });
+            }
+        }
+    }
+    Ok(sqlite_endurance)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_latest_stage_manifest(
     run_dir: &Path,
     expected_run_id: &str,
     expected_stage: &str,
     accepted_turn_number: u32,
     calls_used: u32,
+    sqlite_endurance: bool,
+    actual_tool_call_steps: usize,
+    identity: Option<&EnduranceRunIdentity>,
+    budget: &BudgetSummary,
 ) -> Result<(), EvidenceRetentionError> {
     let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).manifest_jsonl;
     if !path.is_file() {
@@ -1165,9 +1660,261 @@ fn validate_latest_stage_manifest(
             detail: "latest stage manifest does not match the completed run".into(),
         });
     }
+    if row.max_calls != budget.max_calls
+        || row.target_turns != budget.max_turns
+        || row.calls_used > row.max_calls
+        || row.accepted_turns > row.target_turns
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "stage manifest budget does not match the sealed run budget".into(),
+        });
+    }
+    if sqlite_endurance
+        && (row.target_turns != accepted_turn_number
+            || row.calls_used > row.max_calls
+            || row.coverage_assertions.is_empty()
+            || row
+                .coverage_assertions
+                .iter()
+                .any(|assertion| !assertion.passed))
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail:
+                "completed SQLite stage manifest requires full target acceptance and passing coverage assertions"
+                    .into(),
+        });
+    }
+    if sqlite_endurance {
+        let mut assertions = BTreeMap::new();
+        for assertion in &row.coverage_assertions {
+            if assertions
+                .insert(assertion.name.as_str(), assertion)
+                .is_some()
+            {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: "completed SQLite stage manifest has duplicate assertion names".into(),
+                });
+            }
+        }
+        for required in [
+            "coverage_ledger_exact_set",
+            "actual_tool_mode",
+            "actual_reasoning_mode",
+            "sqlite_authoritative",
+            "json_fallback",
+            "gui_device_claimed",
+        ] {
+            if !assertions.contains_key(required) {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: format!(
+                        "completed SQLite stage manifest lacks required assertion {required}"
+                    ),
+                });
+            }
+        }
+        if let Some(identity) = identity {
+            let detail = |name: &str| {
+                assertions
+                    .get(name)
+                    .and_then(|assertion| assertion.detail.as_deref())
+                    .unwrap_or_default()
+            };
+            if detail("coverage_ledger_exact_set")
+                != format!("planned={} observed={}", row.target_turns, row.target_turns)
+                || detail("actual_reasoning_mode") != identity.reasoning_mode
+                || detail("sqlite_authoritative") != "true"
+                || detail("json_fallback") != "false"
+                || detail("gui_device_claimed") != "false"
+            {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: "completed SQLite assertion details contradict the run identity".into(),
+                });
+            }
+            let expected_tool_detail = format!(
+                "{};tool_call_steps={actual_tool_call_steps}",
+                identity.tool_mode
+            );
+            if actual_tool_call_steps == 0 || detail("actual_tool_mode") != expected_tool_detail {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: "completed SQLite tool-mode assertion is not evidence-backed".into(),
+                });
+            }
+            for (name, enabled) in [
+                ("sqlite_meta_campaign_tasks_probe", identity.meta_probe),
+                (
+                    "character_extractor_real_probe",
+                    identity.character_extractor_probe,
+                ),
+                ("cache_fingerprint_real_probe", identity.cache_probe),
+            ] {
+                let observed = detail(name);
+                if (enabled && (observed.is_empty() || observed == "not_requested"))
+                    || (!enabled && observed != "not_requested")
+                {
+                    return Err(EvidenceRetentionError::CheckpointIntegrity {
+                        detail: "supplemental assertion detail contradicts run identity".into(),
+                    });
+                }
+            }
+            if identity.supplemental_matrix && (row.stage != "coverage" || row.target_turns != 12) {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail:
+                        "supplemental matrix identity requires a complete 12-turn coverage stage"
+                            .into(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
+fn count_successful_write_tool_call_steps(
+    run_dir: &Path,
+    run_id: &str,
+) -> Result<usize, EvidenceRetentionError> {
+    let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).calls_jsonl;
+    let mut count = 0usize;
+    for value in read_evidence_lines(&path)? {
+        let call: EvidenceCallRecord =
+            serde_json::from_value(value).map_err(|_| EvidenceRetentionError::SchemaMismatch {
+                detail: "call evidence row is invalid while counting tool steps".into(),
+            })?;
+        if call.run_id != run_id {
+            return Err(EvidenceRetentionError::MixedRunId {
+                detail: format!("expected only {run_id}"),
+            });
+        }
+        let successful_write = call
+            .assertion_results
+            .iter()
+            .any(|assertion| assertion.name == "successful_write_attempt" && assertion.passed);
+        if successful_write {
+            count = count.saturating_add(
+                call.tool_steps
+                    .iter()
+                    .filter(|step| step.kind == "call")
+                    .count(),
+            );
+        }
+    }
+    Ok(count)
+}
+
+fn validate_sqlite_run_identity(
+    checkpoint: &EnduranceCheckpoint,
+) -> Result<(), EvidenceRetentionError> {
+    let identity = checkpoint.run_identity.as_ref().ok_or_else(|| {
+        EvidenceRetentionError::InvalidProvenance {
+            detail: "completed SQLite endurance evidence requires a run identity".into(),
+        }
+    })?;
+    if identity.fixture_hash16.is_empty()
+        || !is_sha256_hex(&identity.model_sha256)
+        || identity.endpoint_hash16.is_empty()
+        || identity.tool_mode.is_empty()
+        || identity.reasoning_mode.is_empty()
+        || identity.code_revision16.is_empty()
+    {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "completed SQLite endurance run identity is incomplete".into(),
+        });
+    }
+    let probes = &checkpoint.probe_state;
+    let probe_state_matches = identity.character_extractor_probe
+        == probes.character_extractor_completed
+        && identity.meta_probe == probes.meta_completed
+        && identity.cache_probe == probes.cache_completed
+        && (identity.character_extractor_probe || probes.character_extractor_attempts == 0)
+        && (identity.meta_probe || probes.meta_attempts == 0)
+        && (identity.cache_probe || probes.cache_attempts == 0);
+    if !probe_state_matches {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "completed SQLite probe state does not match the bound run identity".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sqlite_probe_calls(
+    run_dir: &Path,
+    run_id: &str,
+    identity: &EnduranceRunIdentity,
+) -> Result<(), EvidenceRetentionError> {
+    let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
+    let rows = read_evidence_lines(&paths.calls_jsonl)?;
+    let row_matches = |row: &serde_json::Value, role: &str| {
+        row.get("run_id").and_then(|value| value.as_str()) == Some(run_id)
+            && row.get("role").and_then(|value| value.as_str()) == Some(role)
+            && row.get("outcome").and_then(|value| value.as_str()) == Some("ok")
+    };
+    let has_tool_step = |row: &serde_json::Value, tool_name: &str, kind: &str, require_ok: bool| {
+        row.get("tool_steps")
+            .and_then(|value| value.as_array())
+            .map(|steps| {
+                steps.iter().any(|step| {
+                    step.get("tool_name").and_then(|value| value.as_str()) == Some(tool_name)
+                        && step.get("kind").and_then(|value| value.as_str()) == Some(kind)
+                        && (!require_ok
+                            || step.get("ok").and_then(|value| value.as_bool()) == Some(true))
+                })
+            })
+            .unwrap_or(false)
+    };
+
+    if identity.character_extractor_probe
+        && !rows.iter().any(|row| {
+            row_matches(row, "character_extractor")
+                && has_tool_step(row, "emit_characters", "call", false)
+        })
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "CharacterExtractor probe lacks successful durable tool-call evidence".into(),
+        });
+    }
+    if identity.meta_probe {
+        for tool in ["inspect_campaign", "inspect_tasks"] {
+            if !rows
+                .iter()
+                .any(|row| row_matches(row, "meta") && has_tool_step(row, tool, "result", true))
+            {
+                return Err(EvidenceRetentionError::CheckpointIntegrity {
+                    detail: format!("Meta probe lacks successful durable result for {tool}"),
+                });
+            }
+        }
+    }
+    if identity.cache_probe {
+        let mut fingerprints = Vec::new();
+        for tag in [
+            "sqlite-cache-stable-a",
+            "sqlite-cache-stable-b",
+            "sqlite-cache-invalidated",
+        ] {
+            let fingerprint = rows
+                .iter()
+                .rev()
+                .find(|row| {
+                    row_matches(row, "cache_probe")
+                        && row.get("tag").and_then(|value| value.as_str()) == Some(tag)
+                })
+                .and_then(|row| row.get("request_fp16"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| EvidenceRetentionError::CheckpointIntegrity {
+                    detail: format!("cache probe lacks successful durable tag {tag}"),
+                })?;
+            fingerprints.push(fingerprint);
+        }
+        if fingerprints[0] != fingerprints[1] || fingerprints[1] == fingerprints[2] {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "cache probe fingerprints do not prove stable/stable/invalidated requests"
+                    .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_completed_evidence_semantics(
     run_dir: &Path,
     status: RunStatus,
@@ -1176,6 +1923,7 @@ fn validate_completed_evidence_semantics(
     checkpoint: &EnduranceCheckpoint,
     accepted_turn_number: u32,
     calls_used: u32,
+    budget: &BudgetSummary,
 ) -> Result<(), EvidenceRetentionError> {
     if !matches!(status, RunStatus::Completed | RunStatus::Archived) {
         return Ok(());
@@ -1190,6 +1938,14 @@ fn validate_completed_evidence_semantics(
             detail: "run manifest, checkpoint, and controlled run id stages differ".into(),
         });
     }
+    if checkpoint.max_calls != budget.max_calls
+        || calls_used > checkpoint.max_calls
+        || accepted_turn_number > budget.max_turns
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "checkpoint budget does not match the sealed run budget".into(),
+        });
+    }
     if checkpoint.accepted_turn_number != accepted_turn_number
         || checkpoint.calls_used != calls_used
     {
@@ -1197,8 +1953,88 @@ fn validate_completed_evidence_semantics(
             detail: "checkpoint counters do not match the completed run manifest".into(),
         });
     }
-    validate_turn_index_set(run_dir, run_id, accepted_turn_number)?;
-    validate_latest_stage_manifest(run_dir, run_id, stage, accepted_turn_number, calls_used)
+    if checkpoint.retry_state.is_some() {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "completed evidence cannot retain a pending retry state".into(),
+        });
+    }
+    let sqlite_turns = validate_turn_index_set(run_dir, run_id, accepted_turn_number)?;
+    let sqlite_audit = load_sqlite_audit_subject(run_dir, run_id)?;
+    let sqlite_endurance = sqlite_turns || sqlite_audit.is_some();
+    let actual_tool_call_steps = if sqlite_endurance {
+        count_successful_write_tool_call_steps(run_dir, run_id)?
+    } else {
+        0
+    };
+    if sqlite_endurance {
+        if !sqlite_turns {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "SQLite audit subject requires typed SQLite endurance turn records".into(),
+            });
+        }
+        validate_sqlite_run_identity(checkpoint)?;
+        let identity = checkpoint.run_identity.as_ref().ok_or_else(|| {
+            EvidenceRetentionError::InvalidProvenance {
+                detail: "completed SQLite endurance evidence requires a run identity".into(),
+            }
+        })?;
+        validate_sqlite_probe_calls(run_dir, run_id, identity)?;
+        let audit = sqlite_audit.ok_or_else(|| EvidenceRetentionError::MissingRequiredFile {
+            relative_path: SQLITE_AUDIT_SUBJECT_FILE.into(),
+        })?;
+        if audit.committed_turns != u64::from(accepted_turn_number) {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "SQLite audit committed-turn count does not match checkpoint acceptance"
+                    .into(),
+            });
+        }
+        let authority = checkpoint.sqlite_authority.as_ref().ok_or_else(|| {
+            EvidenceRetentionError::CheckpointIntegrity {
+                detail: "completed SQLite evidence requires a checkpoint authority binding".into(),
+            }
+        })?;
+        if !is_sha256_hex(&authority.accepted_content_sha256)
+            || !is_sha256_hex(&authority.accepted_conversation_sha256)
+        {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "SQLite checkpoint authority contains an invalid hash".into(),
+            });
+        }
+        if authority.committed_turns != audit.committed_turns
+            || authority.accepted_content_sha256 != audit.accepted_content_sha256
+        {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "SQLite audit subject does not match the checkpoint authority binding"
+                    .into(),
+            });
+        }
+    }
+    validate_latest_stage_manifest(
+        run_dir,
+        run_id,
+        stage,
+        accepted_turn_number,
+        calls_used,
+        sqlite_endurance,
+        actual_tool_call_steps,
+        checkpoint.run_identity.as_ref(),
+        budget,
+    )
+}
+
+fn validate_checkpoint_code_revision(
+    checkpoint: &EnduranceCheckpoint,
+    commit: &str,
+) -> Result<(), EvidenceRetentionError> {
+    let Some(identity) = checkpoint.run_identity.as_ref() else {
+        return Ok(());
+    };
+    if identity.code_revision16.is_empty() || identity.code_revision16 != short_hash16(commit) {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "checkpoint code revision does not match the sealed commit".into(),
+        });
+    }
+    Ok(())
 }
 
 fn is_valid_commit_sha(value: &str) -> bool {
@@ -1242,16 +2078,28 @@ fn validate_manifest_provenance(manifest: &RunManifest) -> Result<(), EvidenceRe
             detail: "completed evidence requires a non-empty valid branch name".into(),
         });
     }
+    if !is_sha256_hex(&manifest.model_sha256) {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "completed evidence requires a full model identity hash".into(),
+        });
+    }
+    if manifest.calls_used > manifest.budget.max_calls
+        || manifest.accepted_turn_number > manifest.budget.max_turns
+    {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "completed evidence exceeds its declared call or turn budget".into(),
+        });
+    }
     Ok(())
 }
 
-fn validate_sqlite_audit_subject(
+fn load_sqlite_audit_subject(
     run_dir: &Path,
     expected_run_id: &str,
-) -> Result<(), EvidenceRetentionError> {
+) -> Result<Option<SqliteAuditSubject>, EvidenceRetentionError> {
     let path = run_dir.join(SQLITE_AUDIT_SUBJECT_FILE.replace('/', std::path::MAIN_SEPARATOR_STR));
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     assert_not_reparse_path(&path)?;
     ensure_canonical_within(run_dir, &path)?;
@@ -1272,11 +2120,8 @@ fn validate_sqlite_audit_subject(
             detail: "SQLite audit subject run_id mismatch".into(),
         });
     }
-    if subject.canonical_content_sha256.len() != 64
-        || !subject
-            .canonical_content_sha256
-            .chars()
-            .all(|c| c.is_ascii_hexdigit())
+    if !is_sha256_hex(&subject.canonical_content_sha256)
+        || !is_sha256_hex(&subject.accepted_content_sha256)
     {
         return Err(EvidenceRetentionError::SchemaMismatch {
             detail: "SQLite audit subject canonical hash is invalid".into(),
@@ -1287,7 +2132,14 @@ fn validate_sqlite_audit_subject(
             detail: "SQLite audit subject committed-turn count exceeds total turns".into(),
         });
     }
-    Ok(())
+    Ok(Some(subject))
+}
+
+fn validate_sqlite_audit_subject(
+    run_dir: &Path,
+    expected_run_id: &str,
+) -> Result<(), EvidenceRetentionError> {
+    load_sqlite_audit_subject(run_dir, expected_run_id).map(|_| ())
 }
 
 /// Atomically write a privacy-safe SQLite audit subject beneath a fixed
@@ -1313,11 +2165,8 @@ pub fn write_sqlite_audit_subject(
         });
     }
     if subject.schema_version != SQLITE_AUDIT_SCHEMA_VERSION
-        || subject.canonical_content_sha256.len() != 64
-        || !subject
-            .canonical_content_sha256
-            .chars()
-            .all(|c| c.is_ascii_hexdigit())
+        || !is_sha256_hex(&subject.canonical_content_sha256)
+        || !is_sha256_hex(&subject.accepted_content_sha256)
         || subject.committed_turns > subject.turns
     {
         return Err(EvidenceRetentionError::SchemaMismatch {
@@ -1348,6 +2197,10 @@ pub fn write_sqlite_audit_subject(
     ensure_canonical_within(run_dir, &dest)?;
     validate_sqlite_audit_subject(run_dir, expected_run_id)?;
     Ok(dest)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn list_snapshot_dirs(run_dir: &Path) -> Result<Vec<String>, EvidenceRetentionError> {
@@ -1445,6 +2298,18 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
         });
     }
     assert_not_reparse_path(run_dir)?;
+    let manifest_path = run_dir.join(RUN_MANIFEST_FILE);
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(_) => {
+            assert_not_reparse_path(&manifest_path)?;
+            ensure_canonical_within(run_dir, &manifest_path)?;
+            return Err(EvidenceRetentionError::ResumeUnavailable {
+                detail: "sealed evidence is immutable and cannot be resealed".into(),
+            });
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     if !is_controlled_run_dirname(&opts.run_id) {
         return Err(EvidenceRetentionError::InvalidRunId {
             detail: "run id not in controlled namespace".into(),
@@ -1479,15 +2344,21 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
             detail: "checkpoint schema drift".into(),
         });
     }
+    require_call_reservation_ledger_for_typed_run(run_dir, &checkpoint)?;
     let accepted_turn_number = checkpoint.accepted_turn_number;
     let calls_used = checkpoint.calls_used;
-    let recorded_calls = count_evidence_call_records(run_dir, &opts.run_id)?;
+    let recorded_calls = validate_call_reservation_mapping(
+        run_dir,
+        &opts.run_id,
+        matches!(opts.status, RunStatus::Completed | RunStatus::Archived),
+    )?;
     if recorded_calls != calls_used {
         return Err(EvidenceRetentionError::CallCountMismatch {
             expected: calls_used,
             actual: recorded_calls,
         });
     }
+    validate_checkpoint_code_revision(&checkpoint, &opts.commit)?;
     validate_completed_evidence_semantics(
         run_dir,
         opts.status,
@@ -1496,9 +2367,18 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
         &checkpoint,
         accepted_turn_number,
         calls_used,
+        &opts.budget,
     )?;
 
-    // Truncate model_label / commit / branch to non-sensitive short fields.
+    let model_sha256 = format!("{:x}", Sha256::digest(opts.model_label.as_bytes()));
+    if let Some(identity) = checkpoint.run_identity.as_ref()
+        && identity.model_sha256 != model_sha256
+    {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "seal model identity does not match the checkpoint".into(),
+        });
+    }
+    // Truncate model_label / commit / branch to non-sensitive display fields.
     let model_label = opts.model_label.chars().take(64).collect::<String>();
     let commit = opts.commit.chars().take(64).collect::<String>();
     let branch = opts.branch.chars().take(128).collect::<String>();
@@ -1512,6 +2392,7 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
         status: opts.status,
         stage: opts.stage,
         model_label,
+        model_sha256,
         budget: opts.budget,
         commit,
         branch,
@@ -1615,7 +2496,11 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             });
         }
     }
-    let recorded_calls = count_evidence_call_records(run_dir, &manifest.run_id)?;
+    let recorded_calls = validate_call_reservation_mapping(
+        run_dir,
+        &manifest.run_id,
+        matches!(manifest.status, RunStatus::Completed | RunStatus::Archived),
+    )?;
     if recorded_calls != manifest.calls_used {
         return Err(EvidenceRetentionError::CallCountMismatch {
             expected: manifest.calls_used,
@@ -1628,6 +2513,7 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             detail: "sealed checkpoint cannot be read".into(),
         }
     })?;
+    require_call_reservation_ledger_for_typed_run(run_dir, &checkpoint)?;
     if checkpoint.run_id != manifest.run_id
         || checkpoint.calls_used != manifest.calls_used
         || checkpoint.accepted_turn_number != manifest.accepted_turn_number
@@ -1636,6 +2522,14 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             detail: "manifest does not match latest checkpoint".into(),
         });
     }
+    if let Some(identity) = checkpoint.run_identity.as_ref()
+        && identity.model_sha256 != manifest.model_sha256
+    {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "manifest model identity does not match checkpoint".into(),
+        });
+    }
+    validate_checkpoint_code_revision(&checkpoint, &manifest.commit)?;
     validate_completed_evidence_semantics(
         run_dir,
         manifest.status,
@@ -1644,6 +2538,7 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
         &checkpoint,
         manifest.accepted_turn_number,
         manifest.calls_used,
+        &manifest.budget,
     )?;
     Ok(manifest)
 }
@@ -1680,7 +2575,12 @@ pub fn load_resume_context(
                 detail: "manifest run_id does not match expected".into(),
             });
         }
-        m.status
+        return Err(EvidenceRetentionError::ResumeUnavailable {
+            detail: format!(
+                "sealed {:?} evidence is immutable and cannot be resumed",
+                m.status
+            ),
+        });
     } else {
         if !is_controlled_run_dirname(expected_run_id) {
             return Err(EvidenceRetentionError::InvalidRunId {
@@ -1712,6 +2612,20 @@ pub fn load_resume_context(
             detail: "checkpoint schema drift on resume".into(),
         });
     }
+    require_call_reservation_ledger_for_typed_run(run_dir, &cp)?;
+    let durable_calls = if status == RunStatus::Interrupted {
+        let durable_calls = count_budgeted_call_records(run_dir, expected_run_id)?;
+        if durable_calls < cp.calls_used {
+            return Err(EvidenceRetentionError::CallCountMismatch {
+                expected: cp.calls_used,
+                actual: durable_calls,
+            });
+        }
+        validate_turn_index_set(run_dir, expected_run_id, cp.accepted_turn_number)?;
+        durable_calls
+    } else {
+        cp.calls_used
+    };
     // data_dir_rel must stay a single relative segment under the run dir when present.
     if let Some(rel) = cp.data_dir_rel.as_deref() {
         if rel.contains("..")
@@ -1737,7 +2651,7 @@ pub fn load_resume_context(
         status,
         accepted_turn_number: cp.accepted_turn_number,
         next_turn: cp.accepted_turn_number.saturating_add(1),
-        calls_used: cp.calls_used,
+        calls_used: durable_calls,
         data_dir_rel: cp.data_dir_rel,
         campaign_id: cp.campaign_id,
         conversation_id: cp.conversation_id,

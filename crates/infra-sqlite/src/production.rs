@@ -250,17 +250,23 @@ impl SqliteProductionRepository {
 
     /// Resolve a turn by any attempt's variant_id (Accept entrypoint).
     pub fn get_turn_by_variant(db: &Database, variant_id: &Id) -> Result<Option<TurnRecord>> {
-        let turn_id: Option<String> = db
-            .connection()
-            .query_row(
-                "SELECT turn_id FROM turn_attempts WHERE variant_id = ?1 LIMIT 1",
-                [variant_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match turn_id {
-            Some(id) => load_validated_turn(db.connection(), &Id::from_str(id)),
-            None => Ok(None),
+        let matches = {
+            let mut statement = db.connection().prepare(
+                "SELECT DISTINCT turn_id
+                 FROM turn_attempts
+                 WHERE variant_id = ?1
+                 ORDER BY turn_id",
+            )?;
+            statement
+                .query_map([variant_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        match matches.as_slice() {
+            [] => Ok(None),
+            [turn_id] => load_validated_turn(db.connection(), &Id::from_str(turn_id)),
+            _ => Err(SqliteError::Conflict(format!(
+                "variant_id {variant_id} resolves to multiple turns"
+            ))),
         }
     }
 

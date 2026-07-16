@@ -39,6 +39,10 @@ pub struct EvidenceToolStep {
 pub struct EvidenceCallRecord {
     pub schema_version: String,
     pub run_id: String,
+    /// Monotonic durable reservation index. Zero is only accepted for legacy
+    /// evidence that has no reservation ledger.
+    #[serde(default)]
+    pub call_index: u32,
     pub suite: String,
     pub turn_index: u32,
     pub role: String,
@@ -242,6 +246,7 @@ impl EvidenceWriter {
             ));
         }
         writeln!(file, "{line}")?;
+        file.sync_data()?;
         Ok(())
     }
 
@@ -351,7 +356,7 @@ pub fn sanitize_call_record(rec: &mut EvidenceCallRecord) {
     rec.history_hash16 = truncate_hex16(&rec.history_hash16);
     rec.tail_hash16 = truncate_hex16(&rec.tail_hash16);
     rec.outcome = match rec.outcome.as_str() {
-        "ok" | "client_error" | "timeout" => rec.outcome.clone(),
+        "ok" | "client_error" | "timeout" | "interrupted_unknown" => rec.outcome.clone(),
         _ => "client_error".into(),
     };
     if rec.model_label.len() > 64 {
@@ -645,6 +650,7 @@ mod tests {
         let rec = EvidenceCallRecord {
             schema_version: EVIDENCE_SCHEMA_VERSION.into(),
             run_id: "run-1".into(),
+            call_index: 1,
             suite: "unit".into(),
             turn_index: 1,
             role: "editor".into(),
@@ -732,6 +738,7 @@ mod tests {
         let call = EvidenceCallRecord {
             schema_version: EVIDENCE_SCHEMA_VERSION.into(),
             run_id: "run-t".into(),
+            call_index: 1,
             suite: "endurance_sqlite".into(),
             turn_index: 7,
             role: "pipeline".into(),
