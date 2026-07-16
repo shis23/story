@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use storyforge_domain::llm::{ChatRequest, ChatResponse, LlmError, StreamChunk, Usage};
+use storyforge_domain::llm::{
+    ChatRequest, ChatResponse, LlmError, ReasoningMode, StreamChunk, Usage,
+};
 use storyforge_domain::message_layout::{fingerprint_chat_request, messages_segment_summary};
 use storyforge_infra_llm::LlmClient;
 use tokio::sync::{mpsc, watch};
@@ -161,7 +163,11 @@ fn redact_tool_result_detail(tool_name: &str, result_json: &str) -> (bool, Optio
             let count = v
                 .get("summaries_count")
                 .and_then(|x| x.as_u64())
-                .or_else(|| v.get("summaries").and_then(|x| x.as_array()).map(|a| a.len() as u64))
+                .or_else(|| {
+                    v.get("summaries")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.len() as u64)
+                })
                 .unwrap_or(0);
             Some(format!("summaries_count={count}"))
         }
@@ -175,7 +181,8 @@ fn redact_tool_result_detail(tool_name: &str, result_json: &str) -> (bool, Optio
             Some(format!("results_count={count}"))
         }
         "get_chronicle" => {
-            let has = v.get("summary").is_some() || v.get("content").is_some() || v.get("code").is_some();
+            let has =
+                v.get("summary").is_some() || v.get("content").is_some() || v.get("code").is_some();
             Some(format!("hit={}", has))
         }
         _ => {
@@ -231,10 +238,7 @@ fn extract_tool_trace(
                 let tool_name = steps
                     .iter()
                     .rev()
-                    .find(|s| {
-                        s.kind == "call"
-                            && s.call_id16.as_deref() == id16.as_deref()
-                    })
+                    .find(|s| s.kind == "call" && s.call_id16.as_deref() == id16.as_deref())
                     .map(|s| s.tool_name.clone())
                     .unwrap_or_else(|| "unknown".into());
                 let (ok, detail) = redact_tool_result_detail(&tool_name, &msg.content);
@@ -279,6 +283,7 @@ pub struct BudgetedLlmClient {
     max_turns: u32,
     timeout_secs: u64,
     max_tokens: Option<u32>,
+    reasoning_override: Option<ReasoningMode>,
     samples: Mutex<Vec<UsageSample>>,
     turn_tag: Mutex<String>,
     role_label: Mutex<String>,
@@ -286,6 +291,14 @@ pub struct BudgetedLlmClient {
 
 impl BudgetedLlmClient {
     pub fn wrap(inner: Arc<dyn LlmClient>, budget: &RealLlmRunBudget) -> Arc<Self> {
+        Self::wrap_with_reasoning(inner, budget, None)
+    }
+
+    pub fn wrap_with_reasoning(
+        inner: Arc<dyn LlmClient>,
+        budget: &RealLlmRunBudget,
+        reasoning_override: Option<ReasoningMode>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             calls: AtomicU32::new(0),
@@ -293,10 +306,15 @@ impl BudgetedLlmClient {
             max_turns: budget.max_turns,
             timeout_secs: budget.timeout_secs.max(1),
             max_tokens: budget.max_tokens,
+            reasoning_override,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("boot".into()),
             role_label: Mutex::new("pipeline".into()),
         })
+    }
+
+    pub fn reasoning_override(&self) -> Option<ReasoningMode> {
+        self.reasoning_override.clone()
     }
 
     pub fn set_tag(&self, tag: impl Into<String>) {
@@ -352,6 +370,16 @@ impl BudgetedLlmClient {
         let mut effective = req.clone();
         if let Some(max_tokens) = self.max_tokens {
             effective.params.max_tokens = Some(max_tokens);
+            effective.params.max_tokens_explicit = true;
+        } else {
+            // Endurance defaults to provider-managed output sizing. Clear any
+            // legacy profile cap (notably 4096) unless the operator explicitly
+            // opted into STORYFORGE_EVAL_MAX_TOKENS.
+            effective.params.max_tokens = None;
+            effective.params.max_tokens_explicit = false;
+        }
+        if let Some(reasoning) = &self.reasoning_override {
+            effective.params.reasoning = reasoning.clone();
         }
         effective
     }
@@ -442,14 +470,7 @@ impl LlmClient for BudgetedLlmClient {
                 return Err(e);
             }
             Err(_) => {
-                self.record(
-                    &req,
-                    None,
-                    None,
-                    t0.elapsed().as_millis(),
-                    false,
-                    "timeout",
-                );
+                self.record(&req, None, None, t0.elapsed().as_millis(), false, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
@@ -488,14 +509,7 @@ impl LlmClient for BudgetedLlmClient {
                 return Err(e);
             }
             Err(_) => {
-                self.record(
-                    &req,
-                    None,
-                    None,
-                    t0.elapsed().as_millis(),
-                    true,
-                    "timeout",
-                );
+                self.record(&req, None, None, t0.elapsed().as_millis(), true, "timeout");
                 return Err(LlmError::Timeout);
             }
         };
@@ -564,6 +578,36 @@ mod tests {
         assert_eq!(source.params.max_tokens, None);
     }
 
+    #[test]
+    fn omitted_eval_limit_clears_legacy_small_request_cap() {
+        let mut source = dummy_req();
+        source.params.max_tokens = Some(4096);
+        source.params.max_tokens_explicit = false;
+        let client = BudgetedLlmClient::wrap(
+            Arc::new(MockLlmClient::with_defaults()),
+            &RealLlmRunBudget::default(),
+        );
+
+        let effective = client.effective_request(&source);
+        assert_eq!(effective.params.max_tokens, None);
+        assert!(!effective.params.max_tokens_explicit);
+        assert_eq!(source.params.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn eval_reasoning_override_changes_effective_request() {
+        let source = dummy_req();
+        let client = BudgetedLlmClient::wrap_with_reasoning(
+            Arc::new(MockLlmClient::with_defaults()),
+            &RealLlmRunBudget::default(),
+            Some(ReasoningMode::Native),
+        );
+
+        let effective = client.effective_request(&source);
+        assert_eq!(effective.params.reasoning, ReasoningMode::Native);
+        assert_eq!(source.params.reasoning, ReasoningMode::Disabled);
+    }
+
     #[tokio::test]
     async fn budget_timeout_returns_timeout_error() {
         struct SlowClient;
@@ -595,6 +639,7 @@ mod tests {
             max_turns: 1,
             timeout_secs: 1,
             max_tokens: None,
+            reasoning_override: None,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("t".into()),
             role_label: Mutex::new("r".into()),

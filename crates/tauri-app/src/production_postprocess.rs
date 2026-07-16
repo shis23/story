@@ -28,8 +28,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use storyforge_app_agent::PostProcessOutcome;
+use storyforge_app_conversation::PartialRollTarget;
+use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::Id;
-use storyforge_domain::agent::RoundSummary;
+use storyforge_domain::agent::{PipelineEvent, RoundSummary};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
 use storyforge_domain::turn::{
     AttemptStatus, DerivationComponents, DerivationStatus, Mutation, MutationBatch,
@@ -146,6 +148,120 @@ pub trait PostprocessRunner: Send + Sync {
         present_chars: &[String],
         cancel: watch::Receiver<bool>,
     ) -> Option<PostProcessOutcome>;
+}
+
+/// Shared inputs for the production DraftQualityGate + bounded one-shot Editor
+/// auto-fix. Tauri commands and the SQLite endurance harness use this exact
+/// orchestration path.
+pub struct QualityAutofixRequest<'a> {
+    pub pipeline: &'a mut PipelineOrchestrator,
+    pub draft_node_id: &'a Id,
+    pub conversation_id: &'a Id,
+    pub writing_ctx: &'a WritingContext,
+    pub event_tx: &'a tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    pub cancel: watch::Receiver<bool>,
+    pub log_prefix: &'a str,
+}
+
+/// Run the deterministic NarrativeContract quality gate, then perform at most
+/// one real Editor-only regenerate when Error-severity findings exist.
+pub async fn run_quality_gate_with_optional_editor_autofix(
+    mut final_text: String,
+    request: QualityAutofixRequest<'_>,
+) -> (String, QualityReport) {
+    let QualityAutofixRequest {
+        pipeline,
+        draft_node_id,
+        conversation_id,
+        writing_ctx,
+        event_tx,
+        cancel,
+        log_prefix,
+    } = request;
+    let contract = pipeline
+        .session()
+        .and_then(|session| session.plan.as_ref())
+        .map(|plan| {
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                plan,
+                writing_ctx.campaign_runtime.as_deref(),
+            )
+        });
+    let mut quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+        &final_text,
+        contract.as_ref(),
+    );
+    emit_quality_checked(event_tx, &quality_report);
+
+    if !quality_report.passed() {
+        for warning in &quality_report.warnings {
+            tracing::info!(target: "quality_gate", "{log_prefix} quality warning: {:?}", warning.code);
+        }
+    }
+
+    if quality_report.has_errors() {
+        let hint = storyforge_app_pipeline::quality_gate::build_quality_fix_hint(&quality_report);
+        tracing::info!(
+            target: "quality_gate",
+            "{log_prefix} quality errors={}, trying bounded 1x Editor auto-fix",
+            quality_report.error_count()
+        );
+        let regenerate = RegenerateRequest {
+            conversation_id: conversation_id.clone(),
+            node_id: draft_node_id.clone(),
+            targets: vec![PartialRollTarget::Editor],
+            hint: Some(hint),
+            seed: None,
+        };
+        match pipeline
+            .regenerate(regenerate, writing_ctx, event_tx.clone(), cancel)
+            .await
+        {
+            Ok((fixed_text, _)) => {
+                final_text = fixed_text;
+                let contract = pipeline
+                    .session()
+                    .and_then(|session| session.plan.as_ref())
+                    .map(|plan| {
+                        storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                            plan,
+                            writing_ctx.campaign_runtime.as_deref(),
+                        )
+                    });
+                quality_report =
+                    storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+                        &final_text,
+                        contract.as_ref(),
+                    );
+                emit_quality_checked(event_tx, &quality_report);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "quality_gate",
+                    "{log_prefix} bounded Editor auto-fix failed; retaining original draft: {error}"
+                );
+            }
+        }
+    }
+
+    (final_text, quality_report)
+}
+
+fn emit_quality_checked(
+    event_tx: &tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    report: &QualityReport,
+) {
+    let warnings = report
+        .warnings
+        .iter()
+        .map(|warning| warning.message.clone())
+        .collect();
+    let _ = event_tx.send(PipelineEvent::QualityChecked {
+        passed: report.passed(),
+        warning_count: report.warnings.len(),
+        error_count: report.error_count(),
+        warnings,
+    });
 }
 
 /// Deterministic runner used by harness / contract tests (no real model).

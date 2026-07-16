@@ -247,6 +247,7 @@ fn checkpoint_rejects_sf_secret_marker() {
         conversation_id: None,
         data_dir_rel: None,
         observed_epoch_ids16: vec![],
+        run_identity: None,
         recorded_at_unix_ms: 0,
     };
     assert!(write_checkpoint(&path, &cp).is_err());
@@ -390,6 +391,7 @@ fn resume_from_evidence_dir_returns_next_turn_without_replay() {
             conversation_id: Some("v".into()),
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: vec![],
+            run_identity: None,
             recorded_at_unix_ms: 1,
         },
     )

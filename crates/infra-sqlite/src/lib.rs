@@ -9,6 +9,7 @@
 //!
 //! 设计见 `docs/adr/0001-sqlite-migration-foundation.md`。
 
+pub mod audit;
 pub mod backend;
 pub mod connection;
 pub mod contract;
@@ -23,6 +24,7 @@ pub mod publication;
 pub mod readiness;
 pub mod unit_of_work;
 
+pub use audit::{SqliteAuditSnapshot, capture_audit_snapshot};
 pub use backend::{
     BackendDiagnostics, BackendSelection, BackendSelectionError, BackendSource,
     DEFAULT_BACKEND_ENV_VAR, PinnedBackend, StorageBackend,

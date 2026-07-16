@@ -41,7 +41,7 @@ use crate::evidence::{
 pub enum EnduranceStage {
     /// Zero model calls; validate fixture, output dir, budgets, schema, disk, secret guards.
     DryRun,
-    /// 3 accepted turns, ≤ 30 model calls.
+    /// 3 accepted turns, ≤ 60 model calls (real postprocess + fallback headroom).
     Canary,
     /// 12 accepted turns, ≤ 120 total model calls.
     Coverage,
@@ -67,7 +67,7 @@ impl EnduranceStage {
     pub fn max_calls(self) -> u32 {
         match self {
             Self::DryRun => 0,
-            Self::Canary => 30,
+            Self::Canary => 60,
             // SQLite regenerate is first-draft + regenerate UoW (roughly 2x JSON write cost).
             // Full also absorbs bounded Plan-parse retries across 100 accepted turns.
             Self::Coverage => 220,
@@ -529,6 +529,14 @@ fn scheduled_eq(a: &ScheduledAction, b: &ScheduledAction) -> bool {
 ///
 /// **No raw prompt, story text, private knowledge, or API response body** may be
 /// stored here — only non-secret stable ids, hashes, counts, and statuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnduranceRunIdentity {
+    pub fixture_hash16: String,
+    pub model_hash16: String,
+    pub tool_mode: String,
+    pub reasoning_mode: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnduranceCheckpoint {
     pub schema_version: String,
@@ -559,6 +567,9 @@ pub struct EnduranceCheckpoint {
     /// Observed epoch short-ids so resume can restore rollover evidence.
     #[serde(default)]
     pub observed_epoch_ids16: Vec<String>,
+    /// Immutable identity for fail-closed resume of real endurance runs.
+    #[serde(default)]
+    pub run_identity: Option<EnduranceRunIdentity>,
     pub recorded_at_unix_ms: u128,
 }
 
@@ -1301,6 +1312,7 @@ pub fn simulate_resumable_run(
             conversation_id: Some("sim-conversation".into()),
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: vec![epoch_id16],
+            run_identity: None,
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(checkpoint_path, &cp).expect("write checkpoint");
@@ -1603,7 +1615,7 @@ mod tests {
         assert_eq!(EnduranceStage::Full.target_turns(), 100);
         assert_eq!(EnduranceStage::Full.max_calls(), 1400);
         assert_eq!(EnduranceStage::Canary.target_turns(), 3);
-        assert_eq!(EnduranceStage::Canary.max_calls(), 30);
+        assert_eq!(EnduranceStage::Canary.max_calls(), 60);
     }
 
     #[test]
@@ -1915,7 +1927,14 @@ mod tests {
 
     #[test]
     fn classify_partial_when_budget_exceeded() {
-        let level = classify_acceptance(EnduranceStage::Canary, 3, 35, true, false, false);
+        let level = classify_acceptance(
+            EnduranceStage::Canary,
+            3,
+            EnduranceStage::Canary.max_calls() + 1,
+            true,
+            false,
+            false,
+        );
         assert_eq!(level, AcceptanceLevel::Partial);
     }
 
@@ -1965,6 +1984,7 @@ mod tests {
             conversation_id: None,
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
+            run_identity: None,
             recorded_at_unix_ms: 0,
         };
         assert_eq!(resume_turn_from_checkpoint(Some(&cp)), 9);
@@ -1990,6 +2010,7 @@ mod tests {
             conversation_id: None,
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
+            run_identity: None,
             recorded_at_unix_ms: 0,
         };
         // Same turn, revision, hash → not new (duplicate)
@@ -2024,6 +2045,7 @@ mod tests {
             conversation_id: None,
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
+            run_identity: None,
             recorded_at_unix_ms: 123,
         };
         write_checkpoint(&path, &cp).unwrap();
@@ -2057,6 +2079,7 @@ mod tests {
             conversation_id: None,
             data_dir_rel: None,
             observed_epoch_ids16: vec![],
+            run_identity: None,
             recorded_at_unix_ms: 0,
         };
         let result = write_checkpoint(&path, &cp);

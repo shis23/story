@@ -3,6 +3,7 @@ mod compress_job_store;
 mod connection_store;
 pub mod error;
 mod global_regex_store;
+pub mod meta_backend;
 mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
@@ -48,13 +49,13 @@ use storyforge_domain::preset::{
 use storyforge_domain::prompt_module::PromptProfile;
 use storyforge_infra_llm::LlmClient;
 use storyforge_infra_plugin_host::PluginRegistry;
-use storyforge_infra_sqlite::preaccept::{
-    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest, RegenerateAttemptRequest,
-};
 use storyforge_infra_plugin_host::mvu_runtime::MvuExecuteResponse;
 use storyforge_infra_regex::{
     RegexExecutionTarget, apply_reasoning_regex_to_think_blocks_at_depth,
     apply_regex_scripts_for_target_at_depth,
+};
+use storyforge_infra_sqlite::preaccept::{
+    AutofixSyncRequest, DraftAttemptRequest, PostprocessApplyRequest, RegenerateAttemptRequest,
 };
 use storyforge_infra_util::secret_store::{
     SecretStore, SystemSecretStore, is_secret_ref, make_secret_ref, resolve_secret_value,
@@ -2319,7 +2320,7 @@ struct QualityAutofixCtx<'a> {
 /// 对草稿跑 NarrativeContract QualityGate；若有 Error 且尚未 auto-fix，
 /// 仅 Editor 重跑一次（hint 来自警告摘要），再 gate。最多 1 次。
 async fn quality_gate_with_optional_editor_autofix(
-    mut final_text: String,
+    final_text: String,
     ctx: QualityAutofixCtx<'_>,
 ) -> (String, storyforge_domain::turn::QualityReport) {
     let QualityAutofixCtx {
@@ -2331,100 +2332,19 @@ async fn quality_gate_with_optional_editor_autofix(
         cancel,
         log_prefix,
     } = ctx;
-    let contract = pipeline
-        .session()
-        .and_then(|s| s.plan.as_ref())
-        .map(|plan| {
-            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                plan,
-                writing_ctx.campaign_runtime.as_deref(),
-            )
-        });
-    let mut quality_report = storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
-        &final_text,
-        contract.as_ref(),
-    );
-    let warning_msgs: Vec<String> = quality_report
-        .warnings
-        .iter()
-        .map(|w| w.message.clone())
-        .collect();
-    let _ = event_tx.send(PipelineEvent::QualityChecked {
-        passed: quality_report.passed(),
-        warning_count: quality_report.warnings.len(),
-        error_count: quality_report.error_count(),
-        warnings: warning_msgs,
-    });
-    if !quality_report.passed() {
-        for w in &quality_report.warnings {
-            tracing::info!(target: "quality_gate", "{log_prefix} 质量警告: {:?}", w.code);
-        }
-    }
-
-    if quality_report.has_errors() {
-        let hint = storyforge_app_pipeline::quality_gate::build_quality_fix_hint(&quality_report);
-        tracing::info!(
-            target: "quality_gate",
-            "{log_prefix} Error={}，尝试 1× Editor auto-fix",
-            quality_report.error_count()
-        );
-        let regen_req = RegenerateRequest {
-            conversation_id: conversation_id.clone(),
-            node_id: draft_node_id.clone(),
-            targets: vec![PartialRollTarget::Editor],
-            hint: Some(hint),
-            seed: None,
-        };
-        match pipeline
-            .regenerate(regen_req, writing_ctx, event_tx.clone(), cancel)
-            .await
-        {
-            Ok((fixed_text, _)) => {
-                final_text = fixed_text;
-                let contract2 = pipeline.session().and_then(|s| s.plan.as_ref()).map(|plan| {
-                    storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
-                        plan,
-                        writing_ctx.campaign_runtime.as_deref(),
-                    )
-                });
-                quality_report =
-                    storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
-                        &final_text,
-                        contract2.as_ref(),
-                    );
-                let warning_msgs: Vec<String> = quality_report
-                    .warnings
-                    .iter()
-                    .map(|w| w.message.clone())
-                    .collect();
-                let _ = event_tx.send(PipelineEvent::QualityChecked {
-                    passed: quality_report.passed(),
-                    warning_count: quality_report.warnings.len(),
-                    error_count: quality_report.error_count(),
-                    warnings: warning_msgs,
-                });
-                if !quality_report.passed() {
-                    for w in &quality_report.warnings {
-                        tracing::info!(
-                            target: "quality_gate",
-                            "{log_prefix} auto-fix 后仍有警告: {:?}",
-                            w.code
-                        );
-                    }
-                } else {
-                    tracing::info!(target: "quality_gate", "{log_prefix} auto-fix 后通过门禁");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "quality_gate",
-                    "{log_prefix} Editor auto-fix 失败（保留原稿）: {e}"
-                );
-            }
-        }
-    }
-
-    (final_text, quality_report)
+    production_postprocess::run_quality_gate_with_optional_editor_autofix(
+        final_text,
+        production_postprocess::QualityAutofixRequest {
+            pipeline,
+            draft_node_id,
+            conversation_id,
+            writing_ctx,
+            event_tx,
+            cancel,
+            log_prefix,
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -7405,6 +7325,11 @@ fn meta_accept_patch(
     patch_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "legacy Meta patch accept",
+    )
+    .map_err(TauriCommandError::validation)?;
     // P0-7 residual：legacy 世界书 patch 与 typed Meta 一样，活动 Turn 期间禁止直接写
     check_turn_barrier(state.inner())?;
 
@@ -7745,8 +7670,17 @@ fn meta_dismiss_patch(
 /// 变量 schema 不一致等问题。返回问题列表，空列表 = 健康。
 #[tauri::command]
 fn meta_health_check(campaign_id: String) -> Result<Vec<serde_json::Value>, TauriCommandError> {
-    let store = get_campaign_store();
     let cid = Id::from_str(&campaign_id);
+
+    if sqlite_runtime::is_sqlite_active() {
+        return meta_backend::sqlite_campaign_health_issues(&cid)
+            .map_err(TauriCommandError::storage)?
+            .into_iter()
+            .map(|issue| to_json_value(&issue, "campaign health issue"))
+            .collect();
+    }
+
+    let store = get_campaign_store();
 
     // 确认 campaign 存在
     let campaign = store
@@ -7838,6 +7772,11 @@ fn meta_propose_campaign_repairs(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "campaign repair proposals",
+    )
+    .map_err(TauriCommandError::validation)?;
     let store = get_campaign_store();
     meta_propose_campaign_repairs_in_store(store, &campaign_id, state.inner().as_ref())
 }
@@ -7973,6 +7912,8 @@ fn meta_preview_typed_patch(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, TauriCommandError> {
+    meta_backend::ensure_typed_patch_backend_supported(sqlite_runtime::is_sqlite_active())
+        .map_err(TauriCommandError::validation)?;
     let store = get_campaign_store();
     meta_preview_typed_patch_in_store(store, &patch_id, &campaign_id, state.inner().as_ref())
 }
@@ -8039,6 +7980,8 @@ fn meta_accept_typed_patch(
     campaign_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    meta_backend::ensure_typed_patch_backend_supported(sqlite_runtime::is_sqlite_active())
+        .map_err(TauriCommandError::validation)?;
     // Phase A 屏障：活动 Turn 存在时拒绝 Meta patch accept（防并发写竞争）
     let cid = Id::from_str(&campaign_id);
     reject_if_active_turn(&cid)?;
@@ -8547,6 +8490,12 @@ async fn meta_analyze_mvu_card(
 ) -> Result<MvuTranslationDetailDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "MVU translation analysis/persistence",
+    )
+    .map_err(TauriCommandError::validation)?;
+
     // 取原 Character
     let character = {
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
@@ -8615,8 +8564,13 @@ fn save_mvu_translation_to_store(
 
 /// Tauri command: 列所有已分析的 MVU 翻译
 #[tauri::command]
-fn meta_list_mvu_translations() -> Vec<MvuTranslationSummaryDto> {
-    get_campaign_store()
+fn meta_list_mvu_translations() -> Result<Vec<MvuTranslationSummaryDto>, TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "MVU translation listing",
+    )
+    .map_err(TauriCommandError::validation)?;
+    Ok(get_campaign_store()
         .list_all_mvu()
         .iter()
         .map(|m| MvuTranslationSummaryDto {
@@ -8628,21 +8582,28 @@ fn meta_list_mvu_translations() -> Vec<MvuTranslationSummaryDto> {
             fallback_count: m.translation.fallback_fragments.len(),
             analysis_confidence: m.translation.analysis_confidence,
         })
-        .collect()
+        .collect())
 }
 
 /// Tauri command: 查某角色卡的 MVU 翻译详情（前端渲染状态栏用）
 #[tauri::command]
-fn meta_get_mvu_translation(source_character_id: String) -> Option<MvuTranslationDetailDto> {
+fn meta_get_mvu_translation(
+    source_character_id: String,
+) -> Result<Option<MvuTranslationDetailDto>, TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "MVU translation lookup",
+    )
+    .map_err(TauriCommandError::validation)?;
     let store = get_campaign_store();
     let id = Id::from_str(source_character_id);
-    store.get_mvu(&id).map(|m| MvuTranslationDetailDto {
+    Ok(store.get_mvu(&id).map(|m| MvuTranslationDetailDto {
         source_character_id: m.source_character_id.as_str().to_string(),
         character_name: m.character_name.clone(),
         analyzed_at: m.analyzed_at.clone(),
         translation: m.translation.clone(),
         complexity: serde_json::Value::Null,
-    })
+    }))
 }
 
 /// Tauri command: 预览 MVU schema 合并结果（每个 definition 一条预览）
@@ -8650,6 +8611,11 @@ fn meta_get_mvu_translation(source_character_id: String) -> Option<MvuTranslatio
 fn meta_preview_mvu_apply(
     source_character_id: String,
 ) -> Result<Vec<MvuApplyPreview>, TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "MVU schema apply preview",
+    )
+    .map_err(TauriCommandError::validation)?;
     let store = get_campaign_store();
     let id = Id::from_str(&source_character_id);
     let mvu = store.get_mvu(&id).ok_or_else(|| {
@@ -8691,6 +8657,11 @@ fn meta_apply_mvu_schema(
     source_character_id: String,
     definition_id: String,
 ) -> Result<(), TauriCommandError> {
+    meta_backend::ensure_json_meta_backend_supported(
+        sqlite_runtime::is_sqlite_active(),
+        "MVU schema apply",
+    )
+    .map_err(TauriCommandError::validation)?;
     let store = get_campaign_store();
     meta_apply_mvu_schema_in_store(store, source_character_id, definition_id)
 }

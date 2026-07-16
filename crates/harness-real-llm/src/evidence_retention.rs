@@ -15,7 +15,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::endurance::{EnduranceEvidencePaths, read_latest_checkpoint};
+use crate::endurance::{
+    EnduranceCheckpoint, EnduranceEvidencePaths, EnduranceStageManifestRow, read_latest_checkpoint,
+};
 use crate::evidence::{
     EVIDENCE_SCHEMA_VERSION, contains_forbidden_evidence_payload, now_unix_ms, read_evidence_lines,
 };
@@ -28,6 +30,12 @@ pub const RUN_MANIFEST_FILE: &str = "run_manifest.json";
 
 /// Sidecar integrity baseline for unsealed interrupted resume checkpoints.
 pub const CHECKPOINT_INTEGRITY_FILE: &str = "checkpoint_integrity.json";
+
+/// Schema id for the privacy-safe SQLite audit subject sealed with a run.
+pub const SQLITE_AUDIT_SCHEMA_VERSION: &str = "m5-sqlite-audit-v1";
+
+/// Fixed relative path for the privacy-safe SQLite audit subject.
+pub const SQLITE_AUDIT_SUBJECT_FILE: &str = "sqlite_snapshot/sqlite_audit.json";
 
 /// Controlled run directory prefix (namespace).
 pub const RUN_DIR_PREFIX: &str = "run-";
@@ -71,6 +79,8 @@ pub enum EvidenceRetentionError {
     HashMismatch { relative_path: String },
     FileSetMismatch { detail: String },
     CheckpointIntegrity { detail: String },
+    InvalidProvenance { detail: String },
+    CallCountMismatch { expected: u32, actual: u32 },
     SchemaMismatch { detail: String },
     ForbiddenPayload { relative_path: String },
     InvalidRunId { detail: String },
@@ -109,6 +119,13 @@ impl std::fmt::Display for EvidenceRetentionError {
             Self::CheckpointIntegrity { detail } => {
                 write!(f, "checkpoint integrity failure: {detail}")
             }
+            Self::InvalidProvenance { detail } => {
+                write!(f, "invalid evidence provenance: {detail}")
+            }
+            Self::CallCountMismatch { expected, actual } => write!(
+                f,
+                "evidence call count mismatch: expected {expected}, recorded {actual}"
+            ),
             Self::SchemaMismatch { detail } => write!(f, "schema mismatch: {detail}"),
             Self::ForbiddenPayload { relative_path } => {
                 write!(
@@ -767,6 +784,25 @@ pub struct SealOptions {
     pub branch: String,
 }
 
+/// Privacy-safe, offline-verifiable SQLite audit facts captured from one
+/// consistent read transaction. It deliberately contains no story text,
+/// prompts, absolute paths, credentials, or live database bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteAuditSubject {
+    pub schema_version: String,
+    pub run_id: String,
+    pub sqlite_schema_version: u32,
+    /// SHA-256 of the caller's canonical, sanitized database-content inventory.
+    pub canonical_content_sha256: String,
+    pub turns: u64,
+    pub attempts: u64,
+    pub committed_turns: u64,
+    pub outbox_rows: u64,
+    pub round_summaries: u64,
+    pub publication_jobs: u64,
+    pub ledger_entries: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeContext {
     pub run_id: String,
@@ -889,6 +925,20 @@ fn scan_for_forbidden(run_dir: &Path) -> Result<(), EvidenceRetentionError> {
     walk(run_dir, run_dir)
 }
 
+/// Recursively validate an explicit evidence/review tree, including sibling
+/// directories outside the sealed run. This is the required opt-in gate for
+/// auxiliary review output: moving it outside the run root must not bypass
+/// secret scanning, reparse rejection, or canonical containment checks.
+pub fn verify_evidence_subject_tree(root: &Path) -> Result<(), EvidenceRetentionError> {
+    if !root.is_dir() {
+        return Err(EvidenceRetentionError::IllegalEvidenceRoot {
+            reason: "evidence subject tree does not exist or is not a directory".into(),
+        });
+    }
+    assert_not_reparse_path(root)?;
+    scan_for_forbidden(root)
+}
+
 /// Collect the exact set of sealed subject files currently on disk.
 fn collect_actual_sealed_files(run_dir: &Path) -> Result<BTreeSet<String>, EvidenceRetentionError> {
     let mut out = BTreeSet::new();
@@ -964,6 +1014,340 @@ fn assert_single_run_id(run_dir: &Path, expected: &str) -> Result<(), EvidenceRe
         });
     }
     Ok(())
+}
+
+/// Count and validate call records for a run. This is intentionally public so
+/// resume/checkpoint writers can reconcile durable JSONL state instead of
+/// trusting an in-memory counter after interruption.
+pub fn count_evidence_call_records(
+    run_dir: &Path,
+    expected_run_id: &str,
+) -> Result<u32, EvidenceRetentionError> {
+    let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).calls_jsonl;
+    if !path.is_file() {
+        return Err(EvidenceRetentionError::MissingRequiredFile {
+            relative_path: "endurance_calls.jsonl".into(),
+        });
+    }
+    assert_not_reparse_path(run_dir)?;
+    assert_not_reparse_path(&path)?;
+    ensure_canonical_within(run_dir, &path)?;
+    let lines = read_evidence_lines(&path)?;
+    for value in &lines {
+        let schema = value
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if schema != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceRetentionError::SchemaMismatch {
+                detail: "call evidence schema drift".into(),
+            });
+        }
+        let run_id = value
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if run_id != expected_run_id {
+            return Err(EvidenceRetentionError::MixedRunId {
+                detail: format!("expected only {expected_run_id}"),
+            });
+        }
+    }
+    u32::try_from(lines.len()).map_err(|_| EvidenceRetentionError::CallCountMismatch {
+        expected: u32::MAX,
+        actual: u32::MAX,
+    })
+}
+
+fn controlled_stage_from_run_id(run_id: &str) -> Option<&str> {
+    let rest = run_id.strip_prefix(RUN_DIR_PREFIX)?;
+    rest.split_once('-').map(|(stage, _)| stage)
+}
+
+fn validate_turn_index_set(
+    run_dir: &Path,
+    expected_run_id: &str,
+    accepted_turn_number: u32,
+) -> Result<(), EvidenceRetentionError> {
+    let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).turns_jsonl;
+    if !path.is_file() {
+        return Err(EvidenceRetentionError::MissingRequiredFile {
+            relative_path: "endurance_turns.jsonl".into(),
+        });
+    }
+    assert_not_reparse_path(&path)?;
+    ensure_canonical_within(run_dir, &path)?;
+
+    let mut actual = BTreeSet::new();
+    for value in read_evidence_lines(&path)? {
+        let schema = value
+            .get("schema_version")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if schema != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceRetentionError::SchemaMismatch {
+                detail: "turn evidence schema drift".into(),
+            });
+        }
+        let run_id = value
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if run_id != expected_run_id {
+            return Err(EvidenceRetentionError::MixedRunId {
+                detail: format!("expected only {expected_run_id}"),
+            });
+        }
+        let turn_index = value
+            .get("turn_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| EvidenceRetentionError::SchemaMismatch {
+                detail: "turn evidence requires a u32 turn_index".into(),
+            })?;
+        if turn_index == 0 || !actual.insert(turn_index) {
+            return Err(EvidenceRetentionError::CheckpointIntegrity {
+                detail: "turn indices must be non-zero and unique".into(),
+            });
+        }
+    }
+
+    let expected = (1..=accepted_turn_number).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: format!(
+                "turn index set must equal 1..={accepted_turn_number}; recorded_count={}",
+                actual.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_latest_stage_manifest(
+    run_dir: &Path,
+    expected_run_id: &str,
+    expected_stage: &str,
+    accepted_turn_number: u32,
+    calls_used: u32,
+) -> Result<(), EvidenceRetentionError> {
+    let path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).manifest_jsonl;
+    if !path.is_file() {
+        return Err(EvidenceRetentionError::MissingRequiredFile {
+            relative_path: "endurance_manifest.jsonl".into(),
+        });
+    }
+    assert_not_reparse_path(&path)?;
+    ensure_canonical_within(run_dir, &path)?;
+    let values = read_evidence_lines(&path)?;
+    let latest = values
+        .last()
+        .ok_or_else(|| EvidenceRetentionError::MissingRequiredFile {
+            relative_path: "endurance_manifest.jsonl (final row)".into(),
+        })?;
+    let row: EnduranceStageManifestRow = serde_json::from_value(latest.clone()).map_err(|_| {
+        EvidenceRetentionError::SchemaMismatch {
+            detail: "latest endurance stage manifest row is invalid".into(),
+        }
+    })?;
+    if row.schema_version != EnduranceCheckpoint::schema_version() {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "endurance stage manifest schema drift".into(),
+        });
+    }
+    if row.run_id != expected_run_id
+        || row.stage != expected_stage
+        || row.accepted_turns != accepted_turn_number
+        || row.calls_used != calls_used
+        || row.acceptance != "pass"
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "latest stage manifest does not match the completed run".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_completed_evidence_semantics(
+    run_dir: &Path,
+    status: RunStatus,
+    run_id: &str,
+    stage: &str,
+    checkpoint: &EnduranceCheckpoint,
+    accepted_turn_number: u32,
+    calls_used: u32,
+) -> Result<(), EvidenceRetentionError> {
+    if !matches!(status, RunStatus::Completed | RunStatus::Archived) {
+        return Ok(());
+    }
+    let controlled_stage = controlled_stage_from_run_id(run_id).ok_or_else(|| {
+        EvidenceRetentionError::InvalidRunId {
+            detail: "run id has no controlled stage segment".into(),
+        }
+    })?;
+    if stage != controlled_stage || checkpoint.stage != stage {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "run manifest, checkpoint, and controlled run id stages differ".into(),
+        });
+    }
+    if checkpoint.accepted_turn_number != accepted_turn_number
+        || checkpoint.calls_used != calls_used
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "checkpoint counters do not match the completed run manifest".into(),
+        });
+    }
+    validate_turn_index_set(run_dir, run_id, accepted_turn_number)?;
+    validate_latest_stage_manifest(run_dir, run_id, stage, accepted_turn_number, calls_used)
+}
+
+fn is_valid_commit_sha(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_valid_branch_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 128
+        || value != value.trim()
+        || value == "@"
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.ends_with(".lock")
+        || value.contains("..")
+        || value.contains("@{")
+        || value.contains("//")
+    {
+        return false;
+    }
+    !value.chars().any(|c| {
+        c.is_control() || c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) && value
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn validate_manifest_provenance(manifest: &RunManifest) -> Result<(), EvidenceRetentionError> {
+    if !matches!(manifest.status, RunStatus::Completed | RunStatus::Archived) {
+        return Ok(());
+    }
+    if !is_valid_commit_sha(&manifest.commit) {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "completed evidence requires a 7-40 character hexadecimal commit SHA".into(),
+        });
+    }
+    if !is_valid_branch_name(&manifest.branch) {
+        return Err(EvidenceRetentionError::InvalidProvenance {
+            detail: "completed evidence requires a non-empty valid branch name".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sqlite_audit_subject(
+    run_dir: &Path,
+    expected_run_id: &str,
+) -> Result<(), EvidenceRetentionError> {
+    let path = run_dir.join(SQLITE_AUDIT_SUBJECT_FILE.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if !path.exists() {
+        return Ok(());
+    }
+    assert_not_reparse_path(&path)?;
+    ensure_canonical_within(run_dir, &path)?;
+    let raw = fs::read_to_string(&path)?;
+    if contains_forbidden_evidence_payload(&raw) {
+        return Err(EvidenceRetentionError::ForbiddenPayload {
+            relative_path: SQLITE_AUDIT_SUBJECT_FILE.into(),
+        });
+    }
+    let subject: SqliteAuditSubject = serde_json::from_str(&raw)?;
+    if subject.schema_version != SQLITE_AUDIT_SCHEMA_VERSION {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "SQLite audit subject schema drift".into(),
+        });
+    }
+    if subject.run_id != expected_run_id {
+        return Err(EvidenceRetentionError::RunIdMismatch {
+            detail: "SQLite audit subject run_id mismatch".into(),
+        });
+    }
+    if subject.canonical_content_sha256.len() != 64
+        || !subject
+            .canonical_content_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "SQLite audit subject canonical hash is invalid".into(),
+        });
+    }
+    if subject.committed_turns > subject.turns {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "SQLite audit subject committed-turn count exceeds total turns".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Atomically write a privacy-safe SQLite audit subject beneath a fixed
+/// `sqlite_snapshot/` path. Live `campaign_data` and raw database bytes are
+/// deliberately not accepted by this API or included in the sealed file set.
+pub fn write_sqlite_audit_subject(
+    run_dir: &Path,
+    subject: &SqliteAuditSubject,
+) -> Result<PathBuf, EvidenceRetentionError> {
+    if !run_dir.is_dir() {
+        return Err(EvidenceRetentionError::IllegalEvidenceRoot {
+            reason: "run directory does not exist".into(),
+        });
+    }
+    assert_not_reparse_path(run_dir)?;
+    let expected_run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !is_controlled_run_dirname(expected_run_id) || subject.run_id != expected_run_id {
+        return Err(EvidenceRetentionError::RunIdMismatch {
+            detail: "SQLite audit subject must match its controlled run directory".into(),
+        });
+    }
+    if subject.schema_version != SQLITE_AUDIT_SCHEMA_VERSION
+        || subject.canonical_content_sha256.len() != 64
+        || !subject
+            .canonical_content_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+        || subject.committed_turns > subject.turns
+    {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "invalid SQLite audit subject".into(),
+        });
+    }
+
+    let snapshot_dir = run_dir.join("sqlite_snapshot");
+    ensure_canonical_within(run_dir, &snapshot_dir)?;
+    if !snapshot_dir.exists() {
+        fs::create_dir(&snapshot_dir)?;
+    }
+    assert_not_reparse_path(&snapshot_dir)?;
+    ensure_canonical_within(run_dir, &snapshot_dir)?;
+    let dest = snapshot_dir.join("sqlite_audit.json");
+    if dest.exists() {
+        assert_not_reparse_path(&dest)?;
+        ensure_canonical_within(run_dir, &dest)?;
+    }
+    let serialized = serde_json::to_string_pretty(subject)?;
+    if contains_forbidden_evidence_payload(&serialized) {
+        return Err(EvidenceRetentionError::ForbiddenPayload {
+            relative_path: SQLITE_AUDIT_SUBJECT_FILE.into(),
+        });
+    }
+    storyforge_infra_util::atomic_write_json_str(&dest, &serialized)?;
+    assert_not_reparse_path(&dest)?;
+    ensure_canonical_within(run_dir, &dest)?;
+    validate_sqlite_audit_subject(run_dir, expected_run_id)?;
+    Ok(dest)
 }
 
 fn list_snapshot_dirs(run_dir: &Path) -> Result<Vec<String>, EvidenceRetentionError> {
@@ -1070,6 +1454,7 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
     // Secret scan covers the full tree (including hidden/.tmp/nested/live dirs).
     scan_for_forbidden(run_dir)?;
     assert_single_run_id(run_dir, &opts.run_id)?;
+    validate_sqlite_audit_subject(run_dir, &opts.run_id)?;
 
     let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
     if !paths.checkpoint_jsonl.exists() {
@@ -1079,24 +1464,39 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
     }
     assert_not_reparse_path(&paths.checkpoint_jsonl)?;
 
-    let (accepted_turn_number, calls_used) =
-        if let Some(cp) = read_latest_checkpoint(&paths.checkpoint_jsonl) {
-            if cp.run_id != opts.run_id {
-                return Err(EvidenceRetentionError::RunIdMismatch {
-                    detail: "checkpoint run_id does not match seal options".into(),
-                });
-            }
-            if cp.schema_version != crate::endurance::EnduranceCheckpoint::schema_version() {
-                return Err(EvidenceRetentionError::SchemaMismatch {
-                    detail: "checkpoint schema drift".into(),
-                });
-            }
-            (cp.accepted_turn_number, cp.calls_used)
-        } else {
-            return Err(EvidenceRetentionError::ResumeUnavailable {
-                detail: "checkpoint present but unreadable or schema-invalid".into(),
-            });
-        };
+    let checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+        EvidenceRetentionError::ResumeUnavailable {
+            detail: "checkpoint present but unreadable or schema-invalid".into(),
+        }
+    })?;
+    if checkpoint.run_id != opts.run_id {
+        return Err(EvidenceRetentionError::RunIdMismatch {
+            detail: "checkpoint run_id does not match seal options".into(),
+        });
+    }
+    if checkpoint.schema_version != EnduranceCheckpoint::schema_version() {
+        return Err(EvidenceRetentionError::SchemaMismatch {
+            detail: "checkpoint schema drift".into(),
+        });
+    }
+    let accepted_turn_number = checkpoint.accepted_turn_number;
+    let calls_used = checkpoint.calls_used;
+    let recorded_calls = count_evidence_call_records(run_dir, &opts.run_id)?;
+    if recorded_calls != calls_used {
+        return Err(EvidenceRetentionError::CallCountMismatch {
+            expected: calls_used,
+            actual: recorded_calls,
+        });
+    }
+    validate_completed_evidence_semantics(
+        run_dir,
+        opts.status,
+        &opts.run_id,
+        &opts.stage,
+        &checkpoint,
+        accepted_turn_number,
+        calls_used,
+    )?;
 
     // Truncate model_label / commit / branch to non-sensitive short fields.
     let model_label = opts.model_label.chars().take(64).collect::<String>();
@@ -1122,6 +1522,7 @@ pub fn seal_run(run_dir: &Path, opts: SealOptions) -> Result<RunManifest, Eviden
         accepted_turn_number,
         calls_used,
     };
+    validate_manifest_provenance(&manifest)?;
 
     // Digest set must match on-disk sealed subjects before writing the envelope.
     assert_exact_digest_set(run_dir, &manifest)?;
@@ -1178,9 +1579,11 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             detail: "manifest run_id not controlled".into(),
         });
     }
+    validate_manifest_provenance(&manifest)?;
     // Full-tree secret scan must match the seal path (hidden/.tmp/nested included).
     scan_for_forbidden(run_dir)?;
     assert_single_run_id(run_dir, &manifest.run_id)?;
+    validate_sqlite_audit_subject(run_dir, &manifest.run_id)?;
     assert_exact_digest_set(run_dir, &manifest)?;
 
     // Re-hash every listed file with containment checks.
@@ -1212,6 +1615,36 @@ pub fn verify_run(run_dir: &Path) -> Result<RunManifest, EvidenceRetentionError>
             });
         }
     }
+    let recorded_calls = count_evidence_call_records(run_dir, &manifest.run_id)?;
+    if recorded_calls != manifest.calls_used {
+        return Err(EvidenceRetentionError::CallCountMismatch {
+            expected: manifest.calls_used,
+            actual: recorded_calls,
+        });
+    }
+    let checkpoint_path = EnduranceEvidencePaths::new(run_dir.to_path_buf()).checkpoint_jsonl;
+    let checkpoint = read_latest_checkpoint(&checkpoint_path).ok_or_else(|| {
+        EvidenceRetentionError::CheckpointIntegrity {
+            detail: "sealed checkpoint cannot be read".into(),
+        }
+    })?;
+    if checkpoint.run_id != manifest.run_id
+        || checkpoint.calls_used != manifest.calls_used
+        || checkpoint.accepted_turn_number != manifest.accepted_turn_number
+    {
+        return Err(EvidenceRetentionError::CheckpointIntegrity {
+            detail: "manifest does not match latest checkpoint".into(),
+        });
+    }
+    validate_completed_evidence_semantics(
+        run_dir,
+        manifest.status,
+        &manifest.run_id,
+        &manifest.stage,
+        &checkpoint,
+        manifest.accepted_turn_number,
+        manifest.calls_used,
+    )?;
     Ok(manifest)
 }
 

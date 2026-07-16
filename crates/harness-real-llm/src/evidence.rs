@@ -518,7 +518,7 @@ pub fn contains_forbidden_evidence_payload(serialized: &str) -> bool {
     let lower = serialized.to_ascii_lowercase();
     if lower.contains("\"api_key\"")
         || lower.contains("\"apikey\"")
-        || lower.contains("sk-")
+        || contains_secret_key_token(&lower)
         || lower.contains("bearer ")
         || lower.contains("-----begin")
     {
@@ -533,6 +533,22 @@ pub fn contains_forbidden_evidence_payload(serialized: &str) -> bool {
         return true;
     }
     false
+}
+
+fn contains_secret_key_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices("sk-").any(|(index, _)| {
+        let has_token_prefix =
+            index > 0 && matches!(bytes[index - 1], b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+        if has_token_prefix {
+            return false;
+        }
+        text[index + 3..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .count()
+            >= 1
+    })
 }
 
 /// 真实模型运行开关（默认关闭；无凭证时测试应 ignored，而不是假通过）。
@@ -687,6 +703,13 @@ mod tests {
         assert!(!contains_forbidden_evidence_payload(
             r#"{"request_fp16":"abc","role":"director"}"#
         ));
+        assert!(contains_forbidden_evidence_payload(&format!(
+            r#"{{"token":"{}{}"}}"#,
+            "s", "k-1234567890abcdef"
+        )));
+        assert!(!contains_forbidden_evidence_payload(
+            r#"{"task_id":"task-private-probe"}"#
+        ));
     }
 
     #[test]
@@ -727,10 +750,7 @@ mod tests {
             completion_tokens: 2,
             elapsed_ms: 3,
             outcome: "ok".into(),
-            tools_offered: vec![
-                "get_recent_summary".into(),
-                "search_chronicle".into(),
-            ],
+            tools_offered: vec!["get_recent_summary".into(), "search_chronicle".into()],
             tool_steps: vec![
                 EvidenceToolStep {
                     kind: "call".into(),

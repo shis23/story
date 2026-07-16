@@ -8,14 +8,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use storyforge_app_agent::{PostProcessOutcome, ToolContext};
 use storyforge_app_conversation::{ConversationStore, PartialRollTarget};
 use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingContext};
 use storyforge_domain::Id;
 use storyforge_domain::Source;
+use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
+use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, PropagationPolicy};
+use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger};
 use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
 use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
 use storyforge_infra_llm::LlmClient;
@@ -27,17 +30,122 @@ use storyforge_infra_vector::BruteForceStore;
 use storyforge_tauri_app::campaign_store::{CampaignStore, StoredCard};
 use storyforge_tauri_app::fill_campaign_runtime_from_sqlite;
 use storyforge_tauri_app::production_postprocess::{
-    FixedPostprocessRunner, PostprocessIdentity, PostprocessRunner, ProductionPostprocessError,
-    ProductionPostprocessRequest, ProductionPostprocessService, TurnAttemptSink,
+    PostprocessIdentity, ProductionPostprocessError, ProductionPostprocessService,
+    QualityAutofixRequest, TurnAttemptSink, run_quality_gate_with_optional_editor_autofix,
 };
 use storyforge_tauri_app::sqlite_runtime;
 use storyforge_tauri_app::turn_lifecycle;
 
 use crate::coverage_ledger::{ObservationKey, ObservedCoverage, SqlitePostcondition};
+use crate::endurance::{PrivateProbeKind, WorldInfoRouteSlot};
 use crate::evidence::short_hash16;
 use crate::production_evidence::{ProductionPostprocessProof, mutation_batch_digest};
 
 const FIXTURE_REL: &str = "fixtures/m5_sqlite_endurance_v1.json";
+
+/// Privacy-safe projection of live pipeline events. It deliberately stores no
+/// event text, character identifiers, prompts, or model output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineObservationCollector {
+    agent_roles: BTreeSet<String>,
+    subagent_indices: BTreeSet<usize>,
+    quality_error_counts: Vec<usize>,
+    editor_completion_count: usize,
+}
+
+impl PipelineObservationCollector {
+    pub fn observe(&mut self, event: &PipelineEvent) {
+        match event {
+            PipelineEvent::DirectorDone { .. } => {
+                self.agent_roles.insert("director".into());
+            }
+            PipelineEvent::SubagentDone { index, .. } => {
+                self.agent_roles.insert("subagent".into());
+                self.subagent_indices.insert(*index);
+            }
+            PipelineEvent::DraftReady { .. } => {
+                self.agent_roles.insert("editor".into());
+                self.editor_completion_count += 1;
+            }
+            PipelineEvent::QualityChecked { error_count, .. } => {
+                self.quality_error_counts.push(*error_count);
+            }
+            PipelineEvent::SummaryDone { .. } => {
+                self.agent_roles.insert("summarizer".into());
+            }
+            PipelineEvent::PostProcessDone { .. } => {
+                self.agent_roles.insert("postprocessor".into());
+            }
+            _ => {}
+        }
+    }
+
+    pub fn agent_events(&self) -> Vec<String> {
+        self.agent_roles.iter().cloned().collect()
+    }
+
+    pub fn subagent_count(&self) -> usize {
+        self.subagent_indices.len()
+    }
+
+    pub fn quality_checked(&self) -> bool {
+        !self.quality_error_counts.is_empty()
+    }
+
+    pub fn quality_error_counts(&self) -> &[usize] {
+        &self.quality_error_counts
+    }
+
+    pub fn completed_quality_autofix(&self) -> bool {
+        self.quality_error_counts
+            .first()
+            .is_some_and(|count| *count > 0)
+            && self.quality_error_counts.last() == Some(&0)
+            && self.quality_error_counts.len() >= 2
+            && self.editor_completion_count >= 2
+    }
+
+    pub fn require_roles(&self, required: &[&str]) -> Result<(), String> {
+        let missing = required
+            .iter()
+            .filter(|role| !self.agent_roles.contains(**role))
+            .copied()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "pipeline missing completed agent events: {missing:?}"
+            ))
+        }
+    }
+
+    fn observation_keys(&self) -> BTreeSet<ObservationKey> {
+        let mut out = BTreeSet::new();
+        for role in &self.agent_roles {
+            out.insert(ObservationKey::AgentRole(role.clone()));
+        }
+        if self.quality_checked() {
+            out.insert(ObservationKey::ToolEvent("quality_gate:evaluated".into()));
+        }
+        out
+    }
+}
+
+fn pipeline_observation_channel() -> (
+    tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
+    tokio::task::JoinHandle<PipelineObservationCollector>,
+) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut collector = PipelineObservationCollector::default();
+        while let Some(event) = event_rx.recv().await {
+            collector.observe(&event);
+        }
+        collector
+    });
+    (event_tx, task)
+}
 
 /// Process-owned SQLite endurance environment.
 pub struct SqliteHarnessEnv {
@@ -63,6 +171,10 @@ pub struct SqliteTurnResult {
     pub postprocess_proof: ProductionPostprocessProof,
     pub accept: SqliteAcceptSummary,
     pub observed: ObservedCoverage,
+    pub quality_warning_count: usize,
+    pub quality_error_count: usize,
+    pub autofix_applied: bool,
+    pub actual_subagent_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +198,9 @@ struct SqlitePostprocessRequest<'a> {
     attempt_id: &'a Id,
     variant_id: &'a Id,
     draft_text: &'a str,
-    summary_text: Option<String>,
+    quality_report: QualityReport,
+    outcome: Option<PostProcessOutcome>,
+    present_chars: Vec<String>,
     turn_number: u32,
     input_node_id: Id,
 }
@@ -98,6 +212,8 @@ struct FixtureRoot {
     must_not_reveal: Vec<String>,
     character: FixtureCharacter,
     definitions: Vec<FixtureDefinition>,
+    #[serde(default)]
+    tasks: Vec<FixtureTask>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,8 +247,14 @@ struct FixtureDefinition {
     role_type: String,
     persona_prompt: String,
     behavior_rules: String,
-    #[allow(dead_code)]
     private_knowledge: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureTask {
+    id: String,
+    title: String,
+    status: String,
 }
 
 impl SqliteHarnessEnv {
@@ -186,7 +308,7 @@ impl SqliteHarnessEnv {
     pub fn open_existing(data_dir: PathBuf, llm: Arc<dyn LlmClient>) -> Result<Self, String> {
         let db_path = data_dir.join("storyforge.sqlite3");
         if !db_path.exists() {
-            return Err(format!("sqlite db missing at {}", db_path.display()));
+            return Err("sqlite evidence database is missing".into());
         }
         sqlite_runtime::activate(&db_path)?;
         let persistence = sqlite_runtime::conversation_persistence()?;
@@ -209,8 +331,7 @@ impl SqliteHarnessEnv {
             data_dir.join("vectors.json"),
         ));
         let fixture_path = fixture_path();
-        let fixture_bytes = std::fs::read(&fixture_path).map_err(|e| e.to_string())?;
-        let fixture_hash16 = short_hash16(&String::from_utf8_lossy(&fixture_bytes));
+        let fixture_hash16 = fixture_source_hash16()?;
         let env = Self {
             data_dir,
             db_path,
@@ -284,7 +405,6 @@ impl SqliteHarnessEnv {
         pipeline
     }
 
-
     fn fail_active_turn_if_any(&self, campaign_id: &Id, reason: &str) -> Result<(), String> {
         if let Some(active) = sqlite_runtime::get_active_turn(campaign_id)?
             && active.status.is_active()
@@ -313,6 +433,7 @@ impl SqliteHarnessEnv {
         turn_index: u32,
         row_id: &str,
         summary_probe_id: Option<&str>,
+        force_quality_fault: bool,
     ) -> Result<SqliteTurnResult, String> {
         let campaign_id = self
             .active_campaign_id()
@@ -333,16 +454,24 @@ impl SqliteHarnessEnv {
         let ctx = self.fill_campaign_context(base)?;
 
         let mut pipeline = self.new_pipeline();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Drain events so the channel never fills in harness.
-        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (event_tx, event_task) = pipeline_observation_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         // Generate first, then open a fresh Generating turn immediately before land.
         let (draft_text, _provisional_node, provenance) = pipeline
-            .start_writing(intent.to_string(), &ctx, event_tx, cancel_rx)
+            .start_writing(
+                intent.to_string(),
+                &ctx,
+                event_tx.clone(),
+                cancel_rx.clone(),
+            )
             .await
             .map_err(|e| e.to_string())?;
+        let draft_text = if force_quality_fault {
+            format!("{draft_text}\n作为AI，我将为你继续创作。")
+        } else {
+            draft_text
+        };
 
         self.fail_active_turn_if_any(
             &campaign_id,
@@ -371,18 +500,56 @@ impl SqliteHarnessEnv {
         })?;
         self.conv_store.invalidate();
         let variant_id = land.variant_id;
+        let initial_draft_hash = land.draft_hash;
 
-        // Deterministic production postprocess (shared service + SQLite sink).
-        // Early-fact inject embeds the probe id in RoundSummary so later check turns
-        // can prove SQLite list_summaries retrieval without replaying story text.
-        let summary_text = Some(match summary_probe_id {
-            Some(pid) if !pid.trim().is_empty() => format!(
-                "endurance turn {turn_index} summary; early_fact_probe={pid}; fingerprints only"
-            ),
-            _ => format!(
-                "endurance turn {turn_index} summary; probes remain non-secret fingerprints only"
-            ),
-        });
+        // Same production QualityGate + bounded Editor auto-fix used by Tauri.
+        let (final_text, quality_report) = run_quality_gate_with_optional_editor_autofix(
+            draft_text,
+            QualityAutofixRequest {
+                pipeline: &mut pipeline,
+                draft_node_id: &variant_id,
+                conversation_id,
+                writing_ctx: &ctx,
+                event_tx: &event_tx,
+                cancel: cancel_rx.clone(),
+                log_prefix: "sqlite endurance write",
+            },
+        )
+        .await;
+        let quality_warning_count = quality_report.warnings.len();
+        let quality_error_count = quality_report.error_count();
+
+        let present_chars = pipeline
+            .session()
+            .and_then(|session| session.plan.as_ref())
+            .map(|plan| {
+                plan.subagent_tasks
+                    .iter()
+                    .map(|task| task.character_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut outcome = pipeline
+            .run_postprocess(
+                &final_text,
+                "",
+                &present_chars,
+                &[],
+                &ctx,
+                &event_tx,
+                cancel_rx.clone(),
+                &[],
+            )
+            .await;
+        // Early-fact probe material is appended to the actual Summarizer output.
+        // If the real Summarizer failed, no SummaryDone event is fabricated and
+        // coverage will fail closed.
+        if let Some(probe_id) = summary_probe_id.filter(|probe| !probe.trim().is_empty())
+            && let Some(real_outcome) = outcome.as_mut()
+            && let Some(summary) = real_outcome.summary.as_mut()
+        {
+            summary.push_str(&format!("; early_fact_probe={probe_id}"));
+        }
         let proof = self
             .apply_production_postprocess_sqlite(SqlitePostprocessRequest {
                 campaign_id: &campaign_id,
@@ -390,12 +557,28 @@ impl SqliteHarnessEnv {
                 turn_id: &turn_id,
                 attempt_id: &attempt_id,
                 variant_id: &variant_id,
-                draft_text: &draft_text,
-                summary_text,
+                draft_text: &final_text,
+                quality_report,
+                outcome,
+                present_chars: present_chars.clone(),
                 turn_number: turn_index,
                 input_node_id: input_node_id.clone(),
             })
             .await?;
+
+        // Close the channel and await the privacy-safe projection before Accept;
+        // evidence collection failure can never happen after a durable commit.
+        drop(event_tx);
+        let pipeline_observation = event_task
+            .await
+            .map_err(|error| format!("pipeline observation task failed: {error}"))?;
+        pipeline_observation.require_roles(&[
+            "director",
+            "subagent",
+            "editor",
+            "summarizer",
+            "postprocessor",
+        ])?;
 
         let accept = self.accept_variant(&campaign_id, conversation_id, &variant_id)?;
         if !accept.ok {
@@ -428,14 +611,14 @@ impl SqliteHarnessEnv {
         observations.insert(ObservationKey::Accepted);
         observations.insert(ObservationKey::OutboxKind("draft_ready".into()));
         observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
-        observations.insert(ObservationKey::AgentRole("pipeline".into()));
+        observations.extend(pipeline_observation.observation_keys());
 
         let observed = ObservedCoverage {
             row_id: row_id.to_string(),
             turn_index,
             command_path: "sqlite_runtime::create_draft_attempt".into(),
             service_path: "pipeline.start_writing".into(),
-            agent_events: vec!["pipeline".into()],
+            agent_events: pipeline_observation.agent_events(),
             turn_id16: short_hash16(turn_id.as_str()),
             attempt_id16: short_hash16(attempt_id.as_str()),
             variant_id16: short_hash16(variant_id.as_str()),
@@ -452,8 +635,11 @@ impl SqliteHarnessEnv {
             observations,
         };
 
+        let autofix_applied = proof.draft_hash != initial_draft_hash
+            && pipeline_observation.completed_quality_autofix();
+        let actual_subagent_count = pipeline_observation.subagent_count();
         Ok(SqliteTurnResult {
-            draft_text,
+            draft_text: final_text,
             variant_id,
             turn_id,
             attempt_id,
@@ -461,11 +647,15 @@ impl SqliteHarnessEnv {
             postprocess_proof: proof,
             accept,
             observed,
+            quality_warning_count,
+            quality_error_count,
+            autofix_applied,
+            actual_subagent_count,
         })
     }
 
     /// Production-faithful regenerate: first draft land → pipeline regenerate →
-    /// `append_regenerate_attempt` → fixed postprocess → Accept.
+    /// `append_regenerate_attempt` → real production postprocess → Accept.
     ///
     /// `targets` maps schedule slots:
     /// - overall → empty/Director
@@ -497,12 +687,16 @@ impl SqliteHarnessEnv {
         let ctx = self.fill_campaign_context(base)?;
 
         let mut pipeline = self.new_pipeline();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (event_tx, event_task) = pipeline_observation_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         let (draft_text, _provisional_node, provenance) = pipeline
-            .start_writing(intent.to_string(), &ctx, event_tx.clone(), cancel_rx.clone())
+            .start_writing(
+                intent.to_string(),
+                &ctx,
+                event_tx.clone(),
+                cancel_rx.clone(),
+            )
             .await
             .map_err(|e| e.to_string())?;
 
@@ -557,12 +751,10 @@ impl SqliteHarnessEnv {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            targets = if let Some(id) = plan_ids.into_iter().next() {
-                vec![PartialRollTarget::Subagent(id)]
-            } else {
-                // No subagent provenance: editor-only still exercises regenerate UoW.
-                vec![PartialRollTarget::Editor]
-            };
+            let id = plan_ids.into_iter().next().ok_or_else(|| {
+                "subagent regenerate requested but landed provenance has no subagent".to_string()
+            })?;
+            targets = vec![PartialRollTarget::Subagent(id)];
         }
 
         let regen_req = RegenerateRequest {
@@ -572,34 +764,10 @@ impl SqliteHarnessEnv {
             hint: Some(format!("endurance regenerate turn {turn_index}")),
             seed: None,
         };
-        let regen_result = pipeline
+        let (regen_text, regen_provenance) = pipeline
             .regenerate(regen_req, &ctx, event_tx.clone(), cancel_rx.clone())
-            .await;
-        let (regen_text, regen_provenance) = match regen_result {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e.to_string();
-                // Fall back to full regenerate when partial target is invalid for this draft.
-                if msg.contains("不在旧 Plan")
-                    || msg.contains("PartialRoll")
-                    || msg.contains("部分重 roll")
-                {
-                    let fallback = RegenerateRequest {
-                        conversation_id: conversation_id.clone(),
-                        node_id: previous_variant_id.clone(),
-                        targets: Vec::new(),
-                        hint: Some(format!("endurance regenerate fallback turn {turn_index}")),
-                        seed: None,
-                    };
-                    pipeline
-                        .regenerate(fallback, &ctx, event_tx, cancel_rx)
-                        .await
-                        .map_err(|e2| format!("regenerate fallback after {msg}: {e2}"))?
-                } else {
-                    return Err(msg);
-                }
-            }
-        };
+            .await
+            .map_err(|error| error.to_string())?;
         if regen_text.trim().is_empty() {
             return Err("sqlite regenerate returned empty draft".into());
         }
@@ -617,10 +785,45 @@ impl SqliteHarnessEnv {
         })?;
         self.conv_store.invalidate();
         let variant_id = land.variant_id;
+        let initial_draft_hash = land.draft_hash;
 
-        let summary_text = Some(format!(
-            "endurance regenerate turn {turn_index} summary; probes remain non-secret fingerprints only"
-        ));
+        let (final_text, quality_report) = run_quality_gate_with_optional_editor_autofix(
+            regen_text,
+            QualityAutofixRequest {
+                pipeline: &mut pipeline,
+                draft_node_id: &variant_id,
+                conversation_id,
+                writing_ctx: &ctx,
+                event_tx: &event_tx,
+                cancel: cancel_rx.clone(),
+                log_prefix: "sqlite endurance regenerate",
+            },
+        )
+        .await;
+        let quality_warning_count = quality_report.warnings.len();
+        let quality_error_count = quality_report.error_count();
+        let present_chars = pipeline
+            .session()
+            .and_then(|session| session.plan.as_ref())
+            .map(|plan| {
+                plan.subagent_tasks
+                    .iter()
+                    .map(|task| task.character_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let outcome = pipeline
+            .run_postprocess(
+                &final_text,
+                "",
+                &present_chars,
+                &[],
+                &ctx,
+                &event_tx,
+                cancel_rx.clone(),
+                &[],
+            )
+            .await;
         let proof = self
             .apply_production_postprocess_sqlite(SqlitePostprocessRequest {
                 campaign_id: &campaign_id,
@@ -628,12 +831,26 @@ impl SqliteHarnessEnv {
                 turn_id: &turn_id,
                 attempt_id: &attempt_id,
                 variant_id: &variant_id,
-                draft_text: &regen_text,
-                summary_text,
+                draft_text: &final_text,
+                quality_report,
+                outcome,
+                present_chars: present_chars.clone(),
                 turn_number: turn_index,
                 input_node_id: input_node_id.clone(),
             })
             .await?;
+
+        drop(event_tx);
+        let pipeline_observation = event_task
+            .await
+            .map_err(|error| format!("pipeline observation task failed: {error}"))?;
+        pipeline_observation.require_roles(&[
+            "director",
+            "subagent",
+            "editor",
+            "summarizer",
+            "postprocessor",
+        ])?;
 
         let accept = self.accept_variant(&campaign_id, conversation_id, &variant_id)?;
         if !accept.ok {
@@ -668,14 +885,14 @@ impl SqliteHarnessEnv {
         observations.insert(ObservationKey::Accepted);
         observations.insert(ObservationKey::OutboxKind("regenerate".into()));
         observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
-        observations.insert(ObservationKey::AgentRole("pipeline".into()));
+        observations.extend(pipeline_observation.observation_keys());
 
         let observed = ObservedCoverage {
             row_id: row_id.to_string(),
             turn_index,
             command_path: "sqlite_runtime::append_regenerate_attempt".into(),
             service_path: "pipeline.regenerate".into(),
-            agent_events: vec!["pipeline".into()],
+            agent_events: pipeline_observation.agent_events(),
             turn_id16: short_hash16(turn_id.as_str()),
             attempt_id16: short_hash16(attempt_id.as_str()),
             variant_id16: short_hash16(variant_id.as_str()),
@@ -692,8 +909,11 @@ impl SqliteHarnessEnv {
             observations,
         };
 
+        let autofix_applied = proof.draft_hash != initial_draft_hash
+            && pipeline_observation.completed_quality_autofix();
+        let actual_subagent_count = pipeline_observation.subagent_count();
         Ok(SqliteTurnResult {
-            draft_text: regen_text,
+            draft_text: final_text,
             variant_id,
             turn_id,
             attempt_id,
@@ -701,6 +921,10 @@ impl SqliteHarnessEnv {
             postprocess_proof: proof,
             accept,
             observed,
+            quality_warning_count,
+            quality_error_count,
+            autofix_applied,
+            actual_subagent_count,
         })
     }
 
@@ -759,11 +983,53 @@ impl SqliteHarnessEnv {
             .collect())
     }
 
+    /// Check only the final narrative for synthetic fixture leakage. The raw
+    /// forbidden values are never copied into evidence.
+    pub fn private_final_output_has_no_leak(&self, text: &str) -> Result<bool, String> {
+        let fixture = load_fixture(&fixture_path())?;
+        let normalized = text.to_lowercase();
+        Ok(fixture
+            .must_not_reveal
+            .iter()
+            .all(|forbidden| !normalized.contains(&forbidden.to_lowercase())))
+    }
+
+    /// Prove the selected world-info route using the same domain routing
+    /// methods consumed by production tools/context compilation.
+    pub fn world_info_route_observed(&self, route: WorldInfoRouteSlot, query: &str) -> bool {
+        let guard = self.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+        let Some(book) = guard.world_info.as_ref() else {
+            return false;
+        };
+        match route {
+            WorldInfoRouteSlot::Constant => book
+                .constant_entries()
+                .iter()
+                .any(|entry| entry.route == LoreRoute::Constant),
+            WorldInfoRouteSlot::Selective => book
+                .triggered_selective_entries(query)
+                .iter()
+                .any(|entry| entry.route == LoreRoute::Selective),
+            WorldInfoRouteSlot::Both => book
+                .triggered_selective_entries(query)
+                .iter()
+                .any(|entry| entry.route == LoreRoute::Both),
+        }
+    }
+
+    pub fn private_probe_slug(probe: &PrivateProbeKind) -> &'static str {
+        match probe {
+            PrivateProbeKind::OwnerRecall => "owner_recall",
+            PrivateProbeKind::NonOwnerLeak => "non_owner_leak",
+            PrivateProbeKind::NarrationLeak => "narration_leak",
+            PrivateProbeKind::MustNotReveal => "must_not_reveal",
+        }
+    }
+
     async fn apply_production_postprocess_sqlite(
         &self,
         req: SqlitePostprocessRequest<'_>,
     ) -> Result<ProductionPostprocessProof, String> {
-        // Empty quality report + draft hash sync via SQLite UoW.
         let identity = PostprocessIdentity {
             turn_id: req.turn_id.clone(),
             attempt_id: req.attempt_id.clone(),
@@ -772,8 +1038,7 @@ impl SqliteHarnessEnv {
             turn_number: req.turn_number,
         };
         let sink = SqliteGatewayTurnAttemptSink;
-        let quality = QualityReport { warnings: vec![] };
-        sink.sync_autofix(&identity, req.draft_text, quality)
+        sink.sync_autofix(&identity, req.draft_text, req.quality_report)
             .map_err(|e| e.to_string())?;
 
         let runtime = self
@@ -785,28 +1050,10 @@ impl SqliteHarnessEnv {
             .campaign_runtime
             .ok_or_else(|| "campaign runtime missing for SQLite postprocess".to_string())?;
 
-        let outcome = PostProcessOutcome {
-            summary: req.summary_text.clone(),
-            post_process: None,
-        };
-        let runner: Arc<dyn PostprocessRunner> = Arc::new(FixedPostprocessRunner {
-            outcome: Some(outcome),
-        });
         let service = ProductionPostprocessService::new_runtime(runtime.as_ref(), &sink);
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let result = service
-            .run(
-                ProductionPostprocessRequest {
-                    identity: Some(identity.clone()),
-                    final_text: req.draft_text.to_string(),
-                    quality_report: None,
-                    present_chars: vec![],
-                    cancel: cancel_rx,
-                },
-                runner,
-                false,
-            )
-            .await
+            .apply_outcome(&identity, req.outcome, &req.present_chars, &cancel_rx)
             .map_err(|e| e.to_string())?;
         if !result.applied {
             return Err(format!(
@@ -858,8 +1105,7 @@ impl SqliteHarnessEnv {
 
     fn seed_fixture(&self, path: &Path) -> Result<(Id, String), String> {
         let root = load_fixture(path)?;
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let fixture_hash = short_hash16(&String::from_utf8_lossy(&bytes));
+        let fixture_hash = fixture_source_hash16()?;
 
         let character = character_from_fixture(&root);
         self.inject_character_from_fixture(&root);
@@ -907,11 +1153,47 @@ impl SqliteHarnessEnv {
         campaign.conversation_id = Some(conversation_id);
         sqlite_runtime::save_campaign(&campaign)?;
 
+        let mut instance_by_definition = std::collections::HashMap::new();
         for def in &card.character_definitions {
             if matches!(def.role_type, RoleType::Protagonist | RoleType::Supporting) {
                 let inst = CharacterInstance::from_definition(campaign_id.clone(), def);
+                instance_by_definition.insert(def.id.clone(), inst.id.clone());
                 sqlite_runtime::save_instance(&inst)?;
             }
+        }
+
+        for fixture_definition in &root.definitions {
+            let definition_id = Id::from_str(&fixture_definition.id);
+            let Some(instance_id) = instance_by_definition.get(&definition_id) else {
+                continue;
+            };
+            for private_text in &fixture_definition.private_knowledge {
+                let mut entry = CharacterKnowledgeEntry::backstory(
+                    campaign_id.clone(),
+                    instance_id.clone(),
+                    private_text.clone(),
+                );
+                entry.set_propagation(PropagationPolicy::Private);
+                sqlite_runtime::save_knowledge(&entry)?;
+            }
+        }
+
+        for fixture_task in &root.tasks {
+            let mut task = StoryTask::user_planned(
+                campaign_id.clone(),
+                fixture_task.title.clone(),
+                "synthetic SQLite endurance fixture task",
+                vec![TaskTrigger::Manual],
+                0,
+            );
+            task.id = Id::from_str(&fixture_task.id);
+            task.status = match fixture_task.status.as_str() {
+                "active" => TaskStatus::Active,
+                "completed" => TaskStatus::Completed,
+                "abandoned" => TaskStatus::Abandoned,
+                _ => TaskStatus::Pending,
+            };
+            sqlite_runtime::save_task(&task)?;
         }
 
         // Temporary definition intentionally not instantiated until pipeline creates it.
@@ -1046,6 +1328,11 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL)
 }
 
+pub fn fixture_source_hash16() -> Result<String, String> {
+    let bytes = std::fs::read(fixture_path()).map_err(|error| error.to_string())?;
+    Ok(short_hash16(&String::from_utf8_lossy(&bytes)))
+}
+
 fn load_fixture(path: &Path) -> Result<FixtureRoot, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| e.to_string())
@@ -1157,5 +1444,13 @@ mod tests {
         assert_eq!(root.fixture_version, "m5_sqlite_endurance_v1");
         assert_eq!(root.safe_probe_facts.len(), 3);
         assert!(root.definitions.len() >= 4);
+        assert_eq!(root.tasks.len(), 1);
+        assert_eq!(
+            root.definitions
+                .iter()
+                .map(|definition| definition.private_knowledge.len())
+                .sum::<usize>(),
+            2
+        );
     }
 }

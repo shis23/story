@@ -4,7 +4,10 @@
 //! atomic manifests, offline hash verify, archive/restore, retention namespace
 //! protection, and fail-closed resume. Does not reconstruct the lost 45/100 run.
 
-use harness_real_llm::endurance::{EnduranceCheckpoint, EnduranceEvidencePaths, write_checkpoint};
+use harness_real_llm::endurance::{
+    EnduranceCheckpoint, EnduranceEvidencePaths, EnduranceStageManifestRow, write_checkpoint,
+    write_manifest_row,
+};
 use harness_real_llm::evidence::{
     EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceTurnRecord, EvidenceWriter,
     contains_forbidden_evidence_payload,
@@ -43,6 +46,11 @@ fn test_policy() -> EvidenceRootPolicy {
 
 fn write_sanitized_fixture(run_dir: &Path, run_id: &str) {
     fs::create_dir_all(run_dir).unwrap();
+    let stage = run_id
+        .strip_prefix("run-")
+        .and_then(|rest| rest.split_once('-'))
+        .map(|(stage, _)| stage)
+        .expect("controlled test run id");
     let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
     let calls = EvidenceWriter::create(&paths.calls_jsonl, run_id).unwrap();
     calls
@@ -117,7 +125,7 @@ fn write_sanitized_fixture(run_dir: &Path, run_id: &str) {
         &EnduranceCheckpoint {
             schema_version: EnduranceCheckpoint::schema_version().into(),
             run_id: run_id.into(),
-            stage: "canary".into(),
+            stage: stage.into(),
             accepted_turn_number: 1,
             calls_used: 1,
             max_calls: 30,
@@ -132,7 +140,30 @@ fn write_sanitized_fixture(run_dir: &Path, run_id: &str) {
             conversation_id: Some("conv-1".into()),
             data_dir_rel: Some("campaign_snapshot".into()),
             observed_epoch_ids16: vec!["1111111111111111".into()],
+            run_identity: None,
             recorded_at_unix_ms: 3,
+        },
+    )
+    .unwrap();
+
+    write_manifest_row(
+        &paths.manifest_jsonl,
+        &EnduranceStageManifestRow {
+            schema_version: EnduranceCheckpoint::schema_version().into(),
+            run_id: run_id.into(),
+            stage: stage.into(),
+            target_turns: 1,
+            accepted_turns: 1,
+            calls_used: 1,
+            max_calls: 30,
+            elapsed_ms: 9,
+            acceptance: "pass".into(),
+            summary_codes: vec!["ok".into()],
+            observed_epoch_ids16: vec!["1111111111111111".into()],
+            early_fact_probe_ids: vec![],
+            early_fact_checked_passed: vec![],
+            coverage_assertions: vec![],
+            recorded_at_unix_ms: 4,
         },
     )
     .unwrap();
@@ -145,6 +176,103 @@ fn write_sanitized_fixture(run_dir: &Path, run_id: &str) {
         r#"{"schema_version":"campaign-snapshot-marker-v1","kind":"empty"}"#,
     )
     .unwrap();
+}
+
+fn valid_completed_seal_options(run_id: &str, stage: &str) -> SealOptions {
+    SealOptions {
+        run_id: run_id.into(),
+        status: RunStatus::Completed,
+        stage: stage.into(),
+        model_label: "mock-model".into(),
+        budget: BudgetSummary {
+            max_calls: 30,
+            max_turns: 3,
+            timeout_secs: 120,
+            max_tokens: None,
+        },
+        commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        branch: "main".into(),
+    }
+}
+
+fn rewrite_jsonl(path: &Path, values: &[serde_json::Value]) {
+    let mut body = values
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.push('\n');
+    fs::write(path, body).unwrap();
+}
+
+fn append_latest_manifest_row(
+    run_dir: &Path,
+    run_id: &str,
+    stage: &str,
+    accepted_turns: u32,
+    calls_used: u32,
+    acceptance: &str,
+) {
+    let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
+    write_manifest_row(
+        &paths.manifest_jsonl,
+        &EnduranceStageManifestRow {
+            schema_version: EnduranceCheckpoint::schema_version().into(),
+            run_id: run_id.into(),
+            stage: stage.into(),
+            target_turns: accepted_turns,
+            accepted_turns,
+            calls_used,
+            max_calls: 30,
+            elapsed_ms: 10,
+            acceptance: acceptance.into(),
+            summary_codes: vec![],
+            observed_epoch_ids16: vec![],
+            early_fact_probe_ids: vec![],
+            early_fact_checked_passed: vec![],
+            coverage_assertions: vec![],
+            recorded_at_unix_ms: 5,
+        },
+    )
+    .unwrap();
+}
+
+fn refresh_manifest_digest(run_dir: &Path, relative_path: &str) {
+    let manifest_path = run_dir.join(RUN_MANIFEST_FILE);
+    let mut manifest: RunManifest =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let subject = run_dir.join(relative_path);
+    let (sha256, size_bytes) = sha256_file(&subject).unwrap();
+    let digest = manifest
+        .files
+        .iter_mut()
+        .find(|digest| digest.relative_path == relative_path)
+        .expect("sealed subject digest");
+    digest.sha256 = sha256;
+    digest.size_bytes = size_bytes;
+    fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+fn rewrite_checkpoint_counts(run_dir: &Path, accepted_turns: u32, calls_used: u32) {
+    let paths = EnduranceEvidencePaths::new(run_dir.to_path_buf());
+    let mut checkpoint: EnduranceCheckpoint = serde_json::from_value(
+        harness_real_llm::evidence::read_evidence_lines(&paths.checkpoint_jsonl)
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap(),
+    )
+    .unwrap();
+    checkpoint.accepted_turn_number = accepted_turns;
+    checkpoint.calls_used = calls_used;
+    rewrite_jsonl(
+        &paths.checkpoint_jsonl,
+        &[serde_json::to_value(checkpoint).unwrap()],
+    );
 }
 
 // ── Evidence root policy ──
@@ -254,6 +382,314 @@ fn prepare_run_dir_fails_closed_on_duplicate_run_id() {
 // ── Seal / verify / state machine ──
 
 #[test]
+fn seal_rejects_duplicate_missing_and_extra_turn_indices() {
+    for (tag, indices, accepted_turns) in [
+        ("duplicate", vec![1, 1], 1),
+        ("missing", vec![1], 2),
+        ("extra", vec![1, 2], 1),
+    ] {
+        let root = unique_dir(tag);
+        let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+        let run_id = allocate_run_id(&validated, "canary").unwrap();
+        let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+        write_sanitized_fixture(&run_dir, &run_id);
+        let paths = EnduranceEvidencePaths::new(run_dir.clone());
+        let base = harness_real_llm::evidence::read_evidence_lines(&paths.turns_jsonl)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let turns = indices
+            .into_iter()
+            .map(|index| {
+                let mut value = base.clone();
+                value["turn_index"] = serde_json::Value::from(index);
+                value
+            })
+            .collect::<Vec<_>>();
+        rewrite_jsonl(&paths.turns_jsonl, &turns);
+        rewrite_checkpoint_counts(&run_dir, accepted_turns, 1);
+        append_latest_manifest_row(&run_dir, &run_id, "canary", accepted_turns, 1, "pass");
+
+        let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary"))
+            .expect_err("invalid turn index set must fail closed");
+        assert!(
+            matches!(
+                err,
+                EvidenceRetentionError::CheckpointIntegrity { .. }
+                    | EvidenceRetentionError::SchemaMismatch { .. }
+            ),
+            "{tag} turn set must be rejected semantically: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn completed_seal_requires_current_final_stage_manifest() {
+    for (tag, mutate) in [
+        ("stale-stage", ("coverage", 1, 1, "pass")),
+        ("stale-turns", ("canary", 0, 1, "pass")),
+        ("stale-calls", ("canary", 1, 0, "pass")),
+        ("not-pass", ("canary", 1, 1, "partial")),
+    ] {
+        let root = unique_dir(tag);
+        let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+        let run_id = allocate_run_id(&validated, "canary").unwrap();
+        let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+        write_sanitized_fixture(&run_dir, &run_id);
+        append_latest_manifest_row(&run_dir, &run_id, mutate.0, mutate.1, mutate.2, mutate.3);
+
+        let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary"))
+            .expect_err("stale final stage manifest must fail closed");
+        assert!(
+            matches!(
+                err,
+                EvidenceRetentionError::CheckpointIntegrity { .. }
+                    | EvidenceRetentionError::SchemaMismatch { .. }
+            ),
+            "{tag} manifest must be rejected semantically: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    let root = unique_dir("missing-final-manifest");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    fs::remove_file(EnduranceEvidencePaths::new(run_dir.clone()).manifest_jsonl).unwrap();
+    let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary"))
+        .expect_err("completed seal without final manifest must fail closed");
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::MissingRequiredFile { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completed_seal_binds_stage_to_controlled_run_id_and_checkpoint() {
+    let root = unique_dir("stage-binding");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "full"))
+        .expect_err("seal stage must match run id and checkpoint stage");
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::CheckpointIntegrity { .. }
+            | EvidenceRetentionError::SchemaMismatch { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn verify_rechecks_turn_indices_and_latest_stage_manifest_after_rehash() {
+    for tag in ["verify-turns", "verify-manifest"] {
+        let root = unique_dir(tag);
+        let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+        let run_id = allocate_run_id(&validated, "canary").unwrap();
+        let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+        write_sanitized_fixture(&run_dir, &run_id);
+        seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary")).unwrap();
+        let paths = EnduranceEvidencePaths::new(run_dir.clone());
+
+        if tag == "verify-turns" {
+            let mut turns =
+                harness_real_llm::evidence::read_evidence_lines(&paths.turns_jsonl).unwrap();
+            turns.push(turns[0].clone());
+            rewrite_jsonl(&paths.turns_jsonl, &turns);
+            refresh_manifest_digest(&run_dir, "endurance_turns.jsonl");
+        } else {
+            append_latest_manifest_row(&run_dir, &run_id, "canary", 1, 0, "pass");
+            refresh_manifest_digest(&run_dir, "endurance_manifest.jsonl");
+        }
+
+        let err = verify_run(&run_dir)
+            .expect_err("offline verify must recheck semantic evidence consistency");
+        assert!(
+            matches!(
+                err,
+                EvidenceRetentionError::CheckpointIntegrity { .. }
+                    | EvidenceRetentionError::SchemaMismatch { .. }
+            ),
+            "{tag} semantic tampering must be rejected after digest refresh: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn completed_seal_requires_valid_git_provenance() {
+    for (commit, branch) in [
+        ("", "main"),
+        ("not-a-sha", "main"),
+        ("0123456", ""),
+        ("0123456", "bad branch"),
+        ("0123456", "refs/heads/../escape"),
+    ] {
+        let root = unique_dir("badgit");
+        let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+        let run_id = allocate_run_id(&validated, "canary").unwrap();
+        let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+        write_sanitized_fixture(&run_dir, &run_id);
+        let mut opts = valid_completed_seal_options(&run_id, "canary");
+        opts.commit = commit.into();
+        opts.branch = branch.into();
+
+        let err = seal_run(&run_dir, opts).unwrap_err();
+        assert!(
+            matches!(err, EvidenceRetentionError::InvalidProvenance { .. }),
+            "invalid completed provenance must fail closed: {commit:?} {branch:?}: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn verify_revalidates_completed_git_provenance() {
+    let root = unique_dir("verifygit");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary")).unwrap();
+
+    let path = run_dir.join(RUN_MANIFEST_FILE);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["commit"] = serde_json::Value::String(String::new());
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let err = verify_run(&run_dir).unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::InvalidProvenance { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn seal_and_verify_reconcile_call_log_count_with_checkpoint_and_manifest() {
+    let root = unique_dir("callcount");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+
+    assert_eq!(count_evidence_call_records(&run_dir, &run_id).unwrap(), 1);
+    let paths = EnduranceEvidencePaths::new(run_dir.clone());
+    let mut checkpoint: EnduranceCheckpoint = serde_json::from_value(
+        harness_real_llm::evidence::read_evidence_lines(&paths.checkpoint_jsonl)
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap(),
+    )
+    .unwrap();
+    checkpoint.calls_used = 2;
+    write_checkpoint(&paths.checkpoint_jsonl, &checkpoint).unwrap();
+    let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary")).unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::CallCountMismatch { .. }
+    ));
+
+    checkpoint.calls_used = 1;
+    write_checkpoint(&paths.checkpoint_jsonl, &checkpoint).unwrap();
+    seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary")).unwrap();
+    let path = run_dir.join(RUN_MANIFEST_FILE);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["calls_used"] = serde_json::Value::from(2);
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let err = verify_run(&run_dir).unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::CallCountMismatch { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn sqlite_audit_subject_is_sealed_without_live_campaign_data() {
+    let root = unique_dir("sqliteaudit");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sanitized_fixture(&run_dir, &run_id);
+    let live = run_dir.join("campaign_data");
+    fs::create_dir_all(&live).unwrap();
+    fs::write(live.join("live.sqlite3"), b"mutable-live-db").unwrap();
+
+    let subject = SqliteAuditSubject {
+        schema_version: SQLITE_AUDIT_SCHEMA_VERSION.into(),
+        run_id: run_id.clone(),
+        sqlite_schema_version: 4,
+        canonical_content_sha256: "a".repeat(64),
+        turns: 100,
+        attempts: 204,
+        committed_turns: 100,
+        outbox_rows: 0,
+        round_summaries: 1,
+        publication_jobs: 1,
+        ledger_entries: 100,
+    };
+    let written = write_sqlite_audit_subject(&run_dir, &subject).unwrap();
+    assert_eq!(
+        written.strip_prefix(&run_dir).unwrap(),
+        Path::new("sqlite_snapshot").join("sqlite_audit.json")
+    );
+
+    let manifest = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary")).unwrap();
+    assert!(manifest.snapshot_dirs.contains(&"sqlite_snapshot".into()));
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|f| f.relative_path == "sqlite_snapshot/sqlite_audit.json")
+    );
+    assert!(
+        manifest
+            .files
+            .iter()
+            .all(|f| !f.relative_path.starts_with("campaign_data/"))
+    );
+    verify_run(&run_dir).unwrap();
+
+    let mut tampered = subject.clone();
+    tampered.turns += 1;
+    fs::write(&written, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+    assert!(matches!(
+        verify_run(&run_dir).unwrap_err(),
+        EvidenceRetentionError::HashMismatch { .. }
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_review_tree_scan_cannot_be_bypassed_by_sibling_location() {
+    let root = unique_dir("reviewscan");
+    let review = root.join("sibling-review");
+    fs::create_dir_all(review.join("nested")).unwrap();
+    fs::write(review.join("nested").join("clean.json"), r#"{"count":1}"#).unwrap();
+    verify_evidence_subject_tree(&review).unwrap();
+
+    let secret = format!("{}{}", "Bearer ", "secret-review-token");
+    fs::write(review.join("nested").join("leak.txt"), secret).unwrap();
+    let err = verify_evidence_subject_tree(&review).unwrap_err();
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::ForbiddenPayload { .. }
+    ));
+    assert!(!err.to_string().contains("secret-review-token"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn seal_completed_run_writes_atomic_manifest_with_hashes() {
     let root = unique_dir("seal");
     let validated = validate_evidence_root(&root, &test_policy()).unwrap();
@@ -322,6 +758,7 @@ fn interrupted_and_resume_state_transitions_without_replaying_accepts() {
         timeout_secs: 180,
         max_tokens: Some(512),
     };
+    fs::remove_file(EnduranceEvidencePaths::new(run_dir.clone()).manifest_jsonl).unwrap();
     seal_run(
         &run_dir,
         SealOptions {
@@ -343,6 +780,7 @@ fn interrupted_and_resume_state_transitions_without_replaying_accepts() {
     assert_eq!(resume.status, RunStatus::Interrupted);
 
     // Mark completed after simulated continuation without replaying turn 1.
+    append_latest_manifest_row(&run_dir, &run_id, "full", 1, 1, "pass");
     let manifest = seal_run(
         &run_dir,
         SealOptions {
@@ -382,8 +820,8 @@ fn verify_fails_closed_on_missing_checkpoint() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -421,8 +859,8 @@ fn verify_fails_closed_on_tampered_hash() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -487,8 +925,8 @@ fn verify_fails_closed_on_mixed_run_ids() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -516,8 +954,8 @@ fn verify_fails_closed_on_schema_drift() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -551,8 +989,8 @@ fn resume_fails_closed_when_expected_run_id_mismatches() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -589,8 +1027,8 @@ fn seal_refuses_secret_payload() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -624,7 +1062,7 @@ fn archive_restore_and_rehash_roundtrip() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: "abc".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
             branch: "codex/m5-evidence-retention".into(),
         },
     )
@@ -675,8 +1113,8 @@ fn retention_only_deletes_completed_namespaced_runs_and_protects_active() {
                     timeout_secs: 10,
                     max_tokens: None,
                 },
-                commit: String::new(),
-                branch: String::new(),
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                branch: "main".into(),
             },
         )
         .unwrap();
@@ -701,8 +1139,8 @@ fn retention_only_deletes_completed_namespaced_runs_and_protects_active() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -825,8 +1263,8 @@ fn sealed_fixture(tag: &str) -> (PathBuf, PathBuf, String, RunManifest) {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -987,8 +1425,8 @@ fn seal_scans_hidden_tmp_and_nested_snapshot_for_secrets() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -1013,8 +1451,8 @@ fn seal_scans_hidden_tmp_and_nested_snapshot_for_secrets() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -1038,8 +1476,8 @@ fn seal_scans_hidden_tmp_and_nested_snapshot_for_secrets() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -1094,8 +1532,8 @@ fn rejects_symlink_or_reparse_under_run_dir_when_supported() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap_err();
@@ -1131,8 +1569,8 @@ fn archive_refuses_interrupted_status_for_audit_only_completed() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -1160,8 +1598,8 @@ fn archive_refuses_interrupted_status_for_audit_only_completed() {
                 timeout_secs: 60,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -1442,8 +1880,8 @@ fn retention_plan_and_apply_require_full_manifest_verify() {
                 timeout_secs: 10,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -1465,8 +1903,8 @@ fn retention_plan_and_apply_require_full_manifest_verify() {
                 timeout_secs: 10,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();
@@ -1497,8 +1935,8 @@ fn retention_plan_and_apply_require_full_manifest_verify() {
                 timeout_secs: 10,
                 max_tokens: None,
             },
-            commit: String::new(),
-            branch: String::new(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            branch: "main".into(),
         },
     )
     .unwrap();

@@ -14,18 +14,103 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harness_real_llm::budget::BudgetedLlmClient;
-use harness_real_llm::coverage_ledger::CoverageLedger;
+use harness_real_llm::coverage_ledger::{
+    CoverageLedger, ObservationKey, RuntimeCoverageProfile, action_with_runtime_profile,
+};
 use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
-use harness_real_llm::require_real_llm;
-use harness_real_llm::sqlite_endurance::SqliteHarnessEnv;
+use harness_real_llm::resolve_llm_connection;
+use harness_real_llm::sqlite_endurance::{SqliteHarnessEnv, fixture_source_hash16};
 use storyforge_app_conversation::PartialRollTarget;
 use storyforge_app_pipeline::WritingContext;
+use storyforge_domain::llm::{ReasoningMode, ToolMode};
 use storyforge_infra_llm::LlmClient;
 
 fn parse_target_stage() -> EnduranceStage {
     let raw = std::env::var("STORYFORGE_EVAL_ENDURANCE_STAGE").unwrap_or_default();
     EnduranceStage::from_label(&raw).unwrap_or(EnduranceStage::Canary)
+}
+
+fn scheduled_action_for_run(
+    schedule: &EnduranceSchedule,
+    turn: u32,
+    supplemental_matrix: bool,
+) -> ScheduledAction {
+    if !supplemental_matrix {
+        return schedule.action_for_turn(turn);
+    }
+    match turn {
+        1 => ScheduledAction::Write {
+            subagent_count: 1,
+            reasoning_mode: ReasoningModeSlot::Disabled,
+            tool_mode: ToolModeSlot::Native,
+            world_info_route: WorldInfoRouteSlot::Constant,
+        },
+        2 => ScheduledAction::Write {
+            subagent_count: 2,
+            reasoning_mode: ReasoningModeSlot::Disabled,
+            tool_mode: ToolModeSlot::Native,
+            world_info_route: WorldInfoRouteSlot::Selective,
+        },
+        3 => ScheduledAction::EarlyFactInject {
+            probe_id: "EF-SUPPLEMENT-ALPHA".into(),
+        },
+        4 => ScheduledAction::Write {
+            subagent_count: 3,
+            reasoning_mode: ReasoningModeSlot::Disabled,
+            tool_mode: ToolModeSlot::Native,
+            world_info_route: WorldInfoRouteSlot::Both,
+        },
+        5 => ScheduledAction::RegenerateOverall,
+        6 => ScheduledAction::RegenerateEditor,
+        7 => ScheduledAction::RegenerateSubagent,
+        8 => ScheduledAction::PrivateProbe {
+            probe_kind: PrivateProbeKind::OwnerRecall,
+        },
+        9 => ScheduledAction::PrivateProbe {
+            probe_kind: PrivateProbeKind::NonOwnerLeak,
+        },
+        10 => ScheduledAction::CacheInvalidate,
+        11 => ScheduledAction::EarlyFactCheck {
+            probe_id: "EF-SUPPLEMENT-ALPHA".into(),
+        },
+        12 => ScheduledAction::QualityAutofix { fixable: true },
+        _ => schedule.action_for_turn(turn),
+    }
+}
+
+fn parse_eval_reasoning_mode() -> ReasoningMode {
+    match std::env::var("STORYFORGE_EVAL_REASONING_MODE")
+        .unwrap_or_else(|_| "disabled".into())
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "disabled" | "off" | "none" => ReasoningMode::Disabled,
+        "native" | "thinking" => ReasoningMode::Native,
+        "prompted" | "cot" => ReasoningMode::Prompted,
+        other => panic!(
+            "STORYFORGE_EVAL_REASONING_MODE must be disabled, native, or prompted; got {other}"
+        ),
+    }
+}
+
+fn resolve_git_provenance() -> (String, String) {
+    fn git(args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git").args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_default();
+    let branch = git(&["branch", "--show-current"]).unwrap_or_else(|| "detached".into());
+    (commit, branch)
 }
 
 fn require_endurance_budget() -> RealLlmRunBudget {
@@ -40,6 +125,65 @@ fn require_endurance_budget() -> RealLlmRunBudget {
         panic!("STORYFORGE_EVAL_MAX_CALLS must be >= 1");
     }
     budget
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn safe_error_summary(error: &str) -> String {
+    let category = if error.contains("PlanParse") || error.contains("Plan 解析") {
+        "plan_parse"
+    } else if error.to_ascii_lowercase().contains("timeout") || error.contains("超时") {
+        "timeout"
+    } else if error.contains("rate limit") || error.contains("520") {
+        "provider_transient"
+    } else if error.contains("LlmError") || error.contains("client_error") {
+        "llm_client"
+    } else if error.contains("Storage") || error.contains("sqlite") {
+        "storage"
+    } else {
+        "pipeline"
+    };
+    format!(
+        "category={category} bytes={} hash16={}",
+        error.len(),
+        short_hash16(error)
+    )
+}
+
+fn has_successful_tool_result<'a>(
+    steps: impl IntoIterator<Item = &'a harness_real_llm::evidence::EvidenceToolStep>,
+    tool_names: &[&str],
+) -> bool {
+    steps.into_iter().any(|step| {
+        step.kind == "result"
+            && step.ok == Some(true)
+            && tool_names.contains(&step.tool_name.as_str())
+    })
+}
+
+fn validate_resume_identity(
+    checkpoint: &EnduranceCheckpoint,
+    expected_stage: EnduranceStage,
+    expected: &EnduranceRunIdentity,
+) -> Result<(), &'static str> {
+    if checkpoint.stage != expected_stage.label() {
+        return Err("checkpoint stage does not match requested stage");
+    }
+    match checkpoint.run_identity.as_ref() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(_) => Err("checkpoint run identity does not match fixture/model/runtime modes"),
+        None => Err("checkpoint is missing required run identity"),
+    }
 }
 
 fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidencePaths) {
@@ -135,6 +279,213 @@ fn flush_samples(
     Ok(written)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_sqlite_meta_probe(
+    env: &SqliteHarnessEnv,
+    llm: Arc<BudgetedLlmClient>,
+    conversation_id: &storyforge_domain::Id,
+    call_writer: &EvidenceWriter,
+    tool_writer: &EvidenceWriter,
+    sample_cursor: &mut usize,
+    run_id: &str,
+    model_label: &str,
+    evidence_turn_index: u32,
+) -> Result<usize, EnduranceError> {
+    use storyforge_app_agent::runtime::AgentRuntime;
+    use storyforge_app_meta::{MetaConversation, MetaSession, meta_chat};
+
+    let writing = env
+        .fill_campaign_context(WritingContext::legacy(
+            vec![],
+            None,
+            conversation_id.clone(),
+        ))
+        .map_err(EnduranceError::Writer)?;
+    let campaign_runtime = writing.campaign_runtime.ok_or_else(|| {
+        EnduranceError::InvalidConfig("Meta probe has no SQLite campaign runtime".into())
+    })?;
+    if campaign_runtime.tasks.is_empty() {
+        return Err(EnduranceError::InvalidConfig(
+            "Meta inspect_tasks probe requires a seeded SQLite task".into(),
+        ));
+    }
+
+    let session = Arc::new(MetaSession::new());
+    session.set_campaign_runtime(campaign_runtime);
+    let tool_ctx = Arc::new(
+        env.tool_ctx
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    );
+    let runtime = AgentRuntime::new(llm.clone() as Arc<dyn LlmClient>, tool_ctx);
+    let mut conversation = MetaConversation::new();
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sample_start = llm.samples().len();
+    llm.set_tag("sqlite-meta-probe");
+    llm.set_role("meta");
+    meta_chat(
+        &runtime,
+        &mut conversation,
+        session,
+        "请先实际调用 inspect_campaign 和 inspect_tasks，再用一句话报告；不要猜测。",
+        cancel_rx,
+        progress_tx,
+    )
+    .await
+    .map_err(|error| EnduranceError::Writer(format!("SQLite Meta probe: {error}")))?;
+    let written = flush_samples(
+        &llm,
+        call_writer,
+        Some(tool_writer),
+        sample_cursor,
+        run_id,
+        model_label,
+        evidence_turn_index,
+    )?;
+    let samples = llm.samples();
+    let probe_steps = samples
+        .get(sample_start..)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|sample| sample.tool_steps.iter())
+        .collect::<Vec<_>>();
+    for required in ["inspect_campaign", "inspect_tasks"] {
+        if !has_successful_tool_result(probe_steps.iter().copied(), &[required]) {
+            return Err(EnduranceError::InvalidConfig(format!(
+                "Meta probe did not receive a successful result from required tool {required}"
+            )));
+        }
+    }
+    Ok(written)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_character_extractor_probe(
+    env: &SqliteHarnessEnv,
+    llm: Arc<BudgetedLlmClient>,
+    call_writer: &EvidenceWriter,
+    tool_writer: &EvidenceWriter,
+    sample_cursor: &mut usize,
+    run_id: &str,
+    model_label: &str,
+) -> Result<usize, EnduranceError> {
+    use storyforge_app_agent::runtime::AgentRuntime;
+
+    let tool_ctx = Arc::new(
+        env.tool_ctx
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    );
+    let character = tool_ctx
+        .characters
+        .last()
+        .cloned()
+        .ok_or_else(|| EnduranceError::InvalidConfig("extractor fixture missing".into()))?;
+    let runtime = AgentRuntime::new(llm.clone() as Arc<dyn LlmClient>, tool_ctx);
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let sample_start = llm.samples().len();
+    llm.set_tag("sqlite-character-extractor-probe");
+    llm.set_role("character_extractor");
+    let definitions =
+        storyforge_app_agent::extract_characters(&runtime, &character, &[], cancel_rx)
+            .await
+            .map_err(|error| {
+                EnduranceError::Writer(format!("CharacterExtractor probe: {error}"))
+            })?;
+    if definitions.is_empty() {
+        return Err(EnduranceError::InvalidConfig(
+            "CharacterExtractor returned no definitions".into(),
+        ));
+    }
+    let written = flush_samples(
+        &llm,
+        call_writer,
+        Some(tool_writer),
+        sample_cursor,
+        run_id,
+        model_label,
+        0,
+    )?;
+    let samples = llm.samples();
+    let emitted = has_successful_tool_result(
+        samples
+            .get(sample_start..)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|sample| sample.tool_steps.iter()),
+        &["emit_characters"],
+    );
+    if !emitted {
+        return Err(EnduranceError::InvalidConfig(
+            "CharacterExtractor did not receive a successful emit_characters result".into(),
+        ));
+    }
+    Ok(written)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cache_fingerprint_probe(
+    llm: Arc<BudgetedLlmClient>,
+    call_writer: &EvidenceWriter,
+    tool_writer: &EvidenceWriter,
+    sample_cursor: &mut usize,
+    run_id: &str,
+    model_label: &str,
+    evidence_turn_index: u32,
+) -> Result<(usize, u32), EnduranceError> {
+    use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
+
+    let stable = ChatRequest {
+        model: model_label.to_string(),
+        messages: vec![
+            ChatMessage::system("Synthetic cache probe; answer with OK."),
+            ChatMessage::user("stable-input-v1"),
+        ],
+        tools: None,
+        params: SamplingParams::default(),
+    };
+    llm.set_role("cache_probe");
+    llm.set_tag("sqlite-cache-stable-a");
+    llm.chat(&stable)
+        .await
+        .map_err(|error| EnduranceError::Writer(format!("cache probe A: {error}")))?;
+    llm.set_tag("sqlite-cache-stable-b");
+    llm.chat(&stable)
+        .await
+        .map_err(|error| EnduranceError::Writer(format!("cache probe B: {error}")))?;
+    let mut changed = stable.clone();
+    changed.messages[1] = ChatMessage::user("stable-input-v2");
+    llm.set_tag("sqlite-cache-invalidated");
+    llm.chat(&changed)
+        .await
+        .map_err(|error| EnduranceError::Writer(format!("cache probe C: {error}")))?;
+
+    let samples = llm.samples();
+    let probe = samples.iter().rev().take(3).cloned().collect::<Vec<_>>();
+    if probe.len() != 3
+        || probe[0].request_fp16 == probe[1].request_fp16
+        || probe[1].request_fp16 != probe[2].request_fp16
+    {
+        return Err(EnduranceError::InvalidConfig(
+            "cache probe did not observe stable/stable/invalidated request fingerprints".into(),
+        ));
+    }
+    let cached_tokens = probe.iter().map(|sample| sample.cached_tokens).sum();
+    let written = flush_samples(
+        &llm,
+        call_writer,
+        Some(tool_writer),
+        sample_cursor,
+        run_id,
+        model_label,
+        evidence_turn_index,
+    )?;
+    Ok((written, cached_tokens))
+}
+
 trait HardDeadlineExt {
     fn hard_deadline_override(&self, turns: u32, stage: EnduranceStage) -> std::time::Duration;
 }
@@ -157,22 +508,57 @@ impl HardDeadlineExt for RealLlmRunBudget {
     }
 }
 
-async fn run_sqlite_endurance_stage(
-    env: &SqliteHarnessEnv,
+struct SqliteEnduranceStageContext<'a> {
+    env: &'a SqliteHarnessEnv,
     llm: Arc<BudgetedLlmClient>,
     campaign_id: storyforge_domain::Id,
     conversation_id: storyforge_domain::Id,
     stage: EnduranceStage,
-    budget: &RealLlmRunBudget,
-    paths: &EnduranceEvidencePaths,
+    budget: &'a RealLlmRunBudget,
+    paths: &'a EnduranceEvidencePaths,
+    runtime_profile: RuntimeCoverageProfile,
+    model_label: &'a str,
+    run_identity: EnduranceRunIdentity,
+}
+
+async fn run_sqlite_endurance_stage(
+    context: SqliteEnduranceStageContext<'_>,
 ) -> Result<EnduranceStageManifestRow, EnduranceError> {
+    let SqliteEnduranceStageContext {
+        env,
+        llm,
+        campaign_id,
+        conversation_id,
+        stage,
+        budget,
+        paths,
+        runtime_profile,
+        model_label,
+        run_identity,
+    } = context;
     let target_turns = stage.target_turns();
+    let meta_probe_enabled = env_flag("STORYFORGE_EVAL_META_PROBE");
+    let extractor_probe_enabled = env_flag("STORYFORGE_EVAL_CHARACTER_EXTRACTOR_PROBE");
+    let cache_probe_enabled = env_flag("STORYFORGE_EVAL_CACHE_PROBE");
+    let supplemental_matrix = env_flag("STORYFORGE_EVAL_SUPPLEMENTAL_MATRIX");
+    if supplemental_matrix && target_turns != 12 {
+        return Err(EnduranceError::InvalidConfig(
+            "supplemental matrix requires STORYFORGE_EVAL_ENDURANCE_STAGE=coverage".into(),
+        ));
+    }
     let schedule = EnduranceSchedule::new(target_turns);
     let planned: Vec<(u32, ScheduledAction)> = (1..=target_turns)
-        .map(|n| (n, schedule.action_for_turn(n)))
+        .map(|n| {
+            (
+                n,
+                action_with_runtime_profile(
+                    scheduled_action_for_run(&schedule, n, supplemental_matrix),
+                    runtime_profile,
+                ),
+            )
+        })
         .collect();
     let mut ledger = CoverageLedger::plan_from_schedule(planned);
-    let model_label = std::env::var("LLM_MODEL").unwrap_or_default();
 
     let (start_turn, resume_cp, run_id) = if paths.checkpoint_jsonl.exists() {
         let (next, cp) = resume_from_evidence_dir(&paths.root, None)?;
@@ -194,8 +580,19 @@ async fn run_sqlite_endurance_stage(
         (1, None, run_id)
     };
 
-    let prior_calls_used = resume_cp.as_ref().map(|c| c.calls_used).unwrap_or(0);
-    let calls_before = llm.calls_used();
+    if let Some(checkpoint) = resume_cp.as_ref() {
+        let recorded =
+            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+                .map_err(|error| {
+                    EnduranceError::InvalidConfig(format!("resume call ledger rejected: {error}"))
+                })?;
+        if recorded != checkpoint.calls_used {
+            return Err(EnduranceError::InvalidConfig(format!(
+                "resume call count mismatch: checkpoint={} durable={recorded}",
+                checkpoint.calls_used
+            )));
+        }
+    }
     let mut sample_cursor = llm.samples().len();
     let deadline = SuiteDeadline::new(budget.hard_deadline_override(target_turns, stage));
     deadline.check()?;
@@ -249,9 +646,39 @@ async fn run_sqlite_endurance_stage(
         }
     }
 
+    let extractor_probe_calls = if extractor_probe_enabled && start_turn == 1 {
+        run_character_extractor_probe(
+            env,
+            llm.clone(),
+            &call_writer,
+            &tool_writer,
+            &mut sample_cursor,
+            &run_id,
+            model_label,
+        )
+        .await?
+    } else if extractor_probe_enabled {
+        let prior = harness_real_llm::evidence::read_evidence_lines(&paths.calls_jsonl)?;
+        let found = prior.iter().any(|value| {
+            value.get("role").and_then(|role| role.as_str()) == Some("character_extractor")
+        });
+        if !found {
+            return Err(EnduranceError::InvalidConfig(
+                "resume evidence is missing the requested CharacterExtractor probe".into(),
+            ));
+        }
+        1
+    } else {
+        0
+    };
+    let mut last_accepted_request_fp16: Option<String> = None;
+
     for turn_index in start_turn..=target_turns {
         deadline.check()?;
-        let action = schedule.action_for_turn(turn_index);
+        let action = action_with_runtime_profile(
+            scheduled_action_for_run(&schedule, turn_index, supplemental_matrix),
+            runtime_profile,
+        );
         let row = ledger
             .planned
             .iter()
@@ -261,9 +688,22 @@ async fn run_sqlite_endurance_stage(
                 EnduranceError::InvalidConfig(format!("missing coverage row for turn {turn_index}"))
             })?;
         let intent = match &action {
-            ScheduledAction::Write { subagent_count, .. } => {
+            ScheduledAction::Write {
+                subagent_count,
+                world_info_route,
+                ..
+            } => {
+                let route_focus = match world_info_route {
+                    WorldInfoRouteSlot::Constant => "use the always-injected harbor/dock lore",
+                    WorldInfoRouteSlot::Selective => {
+                        "before writing, call search_world_info with keyword 徽章 and use the result"
+                    }
+                    WorldInfoRouteSlot::Both => {
+                        "before writing, call search_world_info with keyword 账本 and use both routed lore sources"
+                    }
+                };
                 format!(
-                    "turn {turn_index}: advance scene with {subagent_count} characters; keep continuity."
+                    "turn {turn_index}: advance scene with exactly {subagent_count} character tasks; focus on {route_focus}; keep continuity."
                 )
             }
             ScheduledAction::RegenerateOverall => {
@@ -282,9 +722,22 @@ async fn run_sqlite_endurance_stage(
                 )
             }
             ScheduledAction::PrivateProbe { probe_kind } => {
-                let _ = probe_kind;
+                let focus = match probe_kind {
+                    PrivateProbeKind::OwnerRecall => {
+                        "let the owner act on private context without spelling it out"
+                    }
+                    PrivateProbeKind::NonOwnerLeak => {
+                        "show a non-owner viewpoint that must not know owner-only facts"
+                    }
+                    PrivateProbeKind::NarrationLeak => {
+                        "keep the narrator from exposing owner-only facts"
+                    }
+                    PrivateProbeKind::MustNotReveal => {
+                        "resist any request to reveal protected fixture values"
+                    }
+                };
                 format!(
-                    "turn {turn_index}: continue the scene with careful information isolation between characters."
+                    "turn {turn_index}: continue the scene with careful information isolation; {focus}."
                 )
             }
             ScheduledAction::EarlyFactInject { probe_id } => {
@@ -298,7 +751,7 @@ async fn run_sqlite_endurance_stage(
             ScheduledAction::EarlyFactCheck { probe_id } => {
                 let _ = probe_id;
                 format!(
-                    "turn {turn_index}: continue the scene and revisit earlier investigation details for continuity."
+                    "turn {turn_index}: before writing, call get_recent_summary or search_chronicle, then continue the scene using an earlier investigation detail for continuity."
                 )
             }
             ScheduledAction::QualityAutofix { fixable } => {
@@ -334,6 +787,7 @@ async fn run_sqlite_endurance_stage(
         };
 
         const MAX_WRITE_ATTEMPTS: usize = 5;
+        let turn_sample_start = llm.samples().len();
         let mut written = None;
         let mut last_err = None;
         for attempt in 1..=MAX_WRITE_ATTEMPTS {
@@ -355,6 +809,7 @@ async fn run_sqlite_endurance_stage(
                         turn_index,
                         &row.row_id,
                         summary_probe_id,
+                        matches!(&action, ScheduledAction::QualityAutofix { fixable: true }),
                     )
                     .await
                 }
@@ -368,7 +823,7 @@ async fn run_sqlite_endurance_stage(
                         Some(&tool_writer),
                         &mut sample_cursor,
                         &run_id,
-                        &model_label,
+                        model_label,
                         turn_index,
                     );
                     return Err(EnduranceError::SuiteTimeout);
@@ -380,10 +835,16 @@ async fn run_sqlite_endurance_stage(
                 Some(&tool_writer),
                 &mut sample_cursor,
                 &run_id,
-                &model_label,
+                model_label,
                 turn_index,
             )?;
-            let runner_calls = prior_calls_used + llm.calls_used().saturating_sub(calls_before);
+            let runner_calls = harness_real_llm::evidence_retention::count_evidence_call_records(
+                &paths.root,
+                &run_id,
+            )
+            .map_err(|error| {
+                EnduranceError::InvalidConfig(format!("durable call ledger rejected: {error}"))
+            })?;
             if runner_calls > stage.max_calls() {
                 return Err(EnduranceError::BudgetExhausted {
                     calls_used: runner_calls,
@@ -420,8 +881,9 @@ async fn run_sqlite_endurance_stage(
                         || err.contains("expected Generating")
                         || err.contains("is Failed");
                     eprintln!(
-                        "[sqlite endurance {}] turn {turn_index} attempt {attempt}/{MAX_WRITE_ATTEMPTS} failed (transient={transient}): {err}",
-                        stage.label()
+                        "[sqlite endurance {}] turn {turn_index} attempt {attempt}/{MAX_WRITE_ATTEMPTS} failed (transient={transient}, {})",
+                        stage.label(),
+                        safe_error_summary(&err)
                     );
                     last_err = Some(err);
                     if !transient || attempt == MAX_WRITE_ATTEMPTS {
@@ -443,8 +905,222 @@ async fn run_sqlite_endurance_stage(
             ));
         }
 
+        // Durable accepted marker comes first. If any later audit/evidence step
+        // fails or the process stops, resume must never replay this committed
+        // turn. Missing later evidence is a fail-closed audit gap, not a retry.
+        turns_accepted += 1;
+        last_campaign_revision = written.accept.campaign_revision_after;
+        last_chronicle_revision = written.accept.chronicle_revision_after;
+        last_draft_hash16 = short_hash16(&written.accept.draft_hash);
+        let durable_calls =
+            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+                .map_err(|error| {
+                    EnduranceError::InvalidConfig(format!("accepted call ledger rejected: {error}"))
+                })?;
+        let accepted_checkpoint = EnduranceCheckpoint {
+            schema_version: EnduranceCheckpoint::schema_version().into(),
+            run_id: run_id.clone(),
+            stage: stage.label().into(),
+            accepted_turn_number: turn_index,
+            calls_used: durable_calls,
+            max_calls: stage.max_calls(),
+            campaign_revision: last_campaign_revision,
+            chronicle_revision: last_chronicle_revision,
+            last_draft_hash16: last_draft_hash16.clone(),
+            last_summary_code: written.accept.summary_code.clone(),
+            context_epoch_id16: None,
+            early_fact_probe_ids: vec![],
+            early_fact_checked_passed: vec![],
+            campaign_id: Some(campaign_id.as_str().to_string()),
+            conversation_id: Some(conversation_id.as_str().to_string()),
+            data_dir_rel: Some("campaign_data".into()),
+            observed_epoch_ids16: epoch_tracker.observed.clone(),
+            run_identity: Some(run_identity.clone()),
+            recorded_at_unix_ms: 0,
+        };
+        write_checkpoint(&paths.checkpoint_jsonl, &accepted_checkpoint)?;
+        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
+            .map_err(|error| {
+                EnduranceError::InvalidConfig(format!(
+                    "accepted checkpoint integrity baseline: {error}"
+                ))
+            })?;
+
+        let current_samples = llm.samples();
+        let current_turn_samples = current_samples.get(turn_sample_start..).unwrap_or_default();
+        let current_request_fp16 = current_turn_samples
+            .last()
+            .map(|sample| sample.request_fp16.clone());
+        let world_info_tool_succeeded = has_successful_tool_result(
+            current_turn_samples
+                .iter()
+                .flat_map(|sample| sample.tool_steps.iter()),
+            &["search_world_info"],
+        );
+        let remote_memory_tool_succeeded = has_successful_tool_result(
+            current_turn_samples
+                .iter()
+                .flat_map(|sample| sample.tool_steps.iter()),
+            &[
+                "get_recent_summary",
+                "search_chronicle",
+                "get_chronicle",
+                "search_vectors",
+            ],
+        );
+
+        if !env
+            .private_final_output_has_no_leak(&written.draft_text)
+            .map_err(EnduranceError::Writer)?
+        {
+            return Err(EnduranceError::SecretViolation(
+                "synthetic owner-only fixture value appeared in final narrative".into(),
+            ));
+        }
+
         let mut observed = written.observed.clone();
+        match &action {
+            ScheduledAction::Write {
+                reasoning_mode,
+                tool_mode,
+                world_info_route,
+                ..
+            } => {
+                observed
+                    .observations
+                    .insert(ObservationKey::CoverageLabel(format!(
+                        "subagent_count:{}",
+                        written.actual_subagent_count
+                    )));
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent(format!(
+                        "reasoning_mode:{}",
+                        reasoning_mode.label()
+                    )));
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent(format!(
+                        "tool_mode:{}",
+                        tool_mode.label()
+                    )));
+                if !env.world_info_route_observed(*world_info_route, &intent) {
+                    return Err(EnduranceError::InvalidConfig(format!(
+                        "world-info route {} was not available from the live fixture",
+                        world_info_route.label()
+                    )));
+                }
+                if matches!(
+                    world_info_route,
+                    WorldInfoRouteSlot::Selective | WorldInfoRouteSlot::Both
+                ) && !world_info_tool_succeeded
+                {
+                    return Err(EnduranceError::InvalidConfig(format!(
+                        "world-info route {} did not produce a successful search_world_info result",
+                        world_info_route.label()
+                    )));
+                }
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent(format!(
+                        "world_info_route_available:{}",
+                        world_info_route.label()
+                    )));
+            }
+            ScheduledAction::RegenerateOverall => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("regenerate:overall".into()));
+            }
+            ScheduledAction::RegenerateEditor => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("regenerate:editor_only".into()));
+            }
+            ScheduledAction::RegenerateSubagent => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("regenerate:subagent_only".into()));
+            }
+            ScheduledAction::PrivateProbe { probe_kind } => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent(format!(
+                        "private_final_output:{}:no_leak",
+                        SqliteHarnessEnv::private_probe_slug(probe_kind)
+                    )));
+            }
+            ScheduledAction::EarlyFactInject { probe_id } => {
+                let contents = env
+                    .list_summary_contents(&campaign_id)
+                    .map_err(EnduranceError::Writer)?;
+                if !contents.iter().any(|content| content.contains(probe_id)) {
+                    return Err(EnduranceError::Writer(format!(
+                        "early fact probe was not persisted by the actual Summarizer path: {}",
+                        short_hash16(probe_id)
+                    )));
+                }
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent(format!(
+                        "early_fact:injected:{probe_id}"
+                    )));
+            }
+            ScheduledAction::QualityAutofix { fixable } => {
+                if *fixable && (!written.autofix_applied || written.quality_error_count != 0) {
+                    return Err(EnduranceError::InvalidConfig(
+                        "quality autofix row did not complete a real Editor rewrite to zero errors"
+                            .into(),
+                    ));
+                }
+                if *fixable {
+                    observed.observations.insert(ObservationKey::AutofixSynced);
+                    observed
+                        .observations
+                        .insert(ObservationKey::OutboxKind("autofix_sync".into()));
+                    observed
+                        .observations
+                        .insert(ObservationKey::ToolEvent("autofix:fixed".into()));
+                } else {
+                    observed
+                        .observations
+                        .insert(ObservationKey::ToolEvent("autofix:rejected".into()));
+                }
+            }
+            ScheduledAction::CacheStable => {
+                let stable = current_request_fp16.is_some()
+                    && current_request_fp16 == last_accepted_request_fp16;
+                if !stable {
+                    return Err(EnduranceError::InvalidConfig(
+                        "cache-stable row did not preserve the actual request fingerprint".into(),
+                    ));
+                }
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("cache:stable".into()));
+            }
+            ScheduledAction::CacheInvalidate => {
+                let invalidated = current_request_fp16.is_some()
+                    && last_accepted_request_fp16.is_some()
+                    && current_request_fp16 != last_accepted_request_fp16;
+                if !invalidated {
+                    return Err(EnduranceError::InvalidConfig(
+                        "cache-invalidate row did not change the actual request fingerprint".into(),
+                    ));
+                }
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("cache:invalidated".into()));
+            }
+            ScheduledAction::EarlyFactCheck { .. } => {}
+        }
         if let ScheduledAction::EarlyFactCheck { probe_id } = &action {
+            if !remote_memory_tool_succeeded {
+                return Err(EnduranceError::InvalidConfig(
+                    "early-fact check did not receive a successful remote-memory tool result"
+                        .into(),
+                ));
+            }
             let contents = env
                 .list_summary_contents(&campaign_id)
                 .map_err(EnduranceError::Writer)?;
@@ -471,7 +1147,13 @@ async fn run_sqlite_endurance_stage(
                     "early_fact_check".into(),
                 ),
             );
+            observed
+                .observations
+                .insert(ObservationKey::ToolEvent(format!(
+                    "early_fact:sqlite_reachable_and_remote_tool_succeeded:{probe_id}"
+                )));
         }
+        last_accepted_request_fp16 = current_request_fp16;
 
         ledger.record(observed.clone());
         let line = serde_json::to_string(&observed).unwrap_or_default();
@@ -489,11 +1171,6 @@ async fn run_sqlite_endurance_stage(
                 .map_err(EnduranceError::EvidenceIo)?;
             writeln!(f, "{line}").map_err(EnduranceError::EvidenceIo)?;
         }
-
-        turns_accepted += 1;
-        last_campaign_revision = written.accept.campaign_revision_after;
-        last_chronicle_revision = written.accept.chronicle_revision_after;
-        last_draft_hash16 = short_hash16(&written.accept.draft_hash);
 
         let ctx = env
             .fill_campaign_context(WritingContext::legacy(
@@ -549,7 +1226,7 @@ async fn run_sqlite_endurance_stage(
             ],
             elapsed_ms: deadline.started.elapsed().as_millis(),
             write_path: Some("pipeline.start_writing+sqlite_runtime::create_draft_attempt"),
-            chronicle_path: Some("production_postprocess_service_fixed_runner"),
+            chronicle_path: Some("production_postprocess_service_real_agents"),
             accept_path: Some("sqlite_runtime::accept_by_variant"),
             production_postprocess_complete: Some(written.postprocess_proof.applied),
         });
@@ -560,7 +1237,7 @@ async fn run_sqlite_endurance_stage(
             run_id: run_id.clone(),
             stage: stage.label().into(),
             accepted_turn_number: turn_index,
-            calls_used: prior_calls_used + llm.calls_used().saturating_sub(calls_before),
+            calls_used: durable_calls,
             max_calls: stage.max_calls(),
             campaign_revision: last_campaign_revision,
             chronicle_revision: last_chronicle_revision,
@@ -573,6 +1250,7 @@ async fn run_sqlite_endurance_stage(
             conversation_id: Some(conversation_id.as_str().to_string()),
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: epoch_tracker.observed.clone(),
+            run_identity: Some(run_identity.clone()),
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(&paths.checkpoint_jsonl, &cp)?;
@@ -586,12 +1264,99 @@ async fn run_sqlite_endurance_stage(
         );
     }
 
+    let mut meta_probe_calls = 0usize;
+    if meta_probe_enabled {
+        meta_probe_calls = run_sqlite_meta_probe(
+            env,
+            llm.clone(),
+            &conversation_id,
+            &call_writer,
+            &tool_writer,
+            &mut sample_cursor,
+            &run_id,
+            model_label,
+            target_turns.saturating_add(1),
+        )
+        .await?;
+        let durable_calls =
+            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+                .map_err(|error| {
+                    EnduranceError::InvalidConfig(format!("Meta call ledger rejected: {error}"))
+                })?;
+        if durable_calls > stage.max_calls() {
+            return Err(EnduranceError::BudgetExhausted {
+                calls_used: durable_calls,
+                max_calls: stage.max_calls(),
+            });
+        }
+        let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+            EnduranceError::InvalidConfig("Meta probe cannot update missing checkpoint".into())
+        })?;
+        checkpoint.calls_used = durable_calls;
+        write_checkpoint(&paths.checkpoint_jsonl, &checkpoint)?;
+        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
+            .map_err(|error| {
+                EnduranceError::InvalidConfig(format!(
+                    "Meta checkpoint integrity baseline: {error}"
+                ))
+            })?;
+    }
+
+    let mut cache_probe_calls = 0usize;
+    let mut cache_probe_cached_tokens = 0u32;
+    if cache_probe_enabled {
+        (cache_probe_calls, cache_probe_cached_tokens) = run_cache_fingerprint_probe(
+            llm.clone(),
+            &call_writer,
+            &tool_writer,
+            &mut sample_cursor,
+            &run_id,
+            model_label,
+            target_turns.saturating_add(2),
+        )
+        .await?;
+        let durable_calls =
+            harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+                .map_err(|error| {
+                    EnduranceError::InvalidConfig(format!("cache call ledger rejected: {error}"))
+                })?;
+        if durable_calls > stage.max_calls() {
+            return Err(EnduranceError::BudgetExhausted {
+                calls_used: durable_calls,
+                max_calls: stage.max_calls(),
+            });
+        }
+        let mut checkpoint = read_latest_checkpoint(&paths.checkpoint_jsonl).ok_or_else(|| {
+            EnduranceError::InvalidConfig("cache probe cannot update missing checkpoint".into())
+        })?;
+        checkpoint.calls_used = durable_calls;
+        write_checkpoint(&paths.checkpoint_jsonl, &checkpoint)?;
+        harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
+            .map_err(|error| {
+                EnduranceError::InvalidConfig(format!(
+                    "cache checkpoint integrity baseline: {error}"
+                ))
+            })?;
+    }
+
     std::fs::write(&ledger_path, ledger_lines.join("\n") + "\n")
         .map_err(EnduranceError::EvidenceIo)?;
 
     if let Err(ms) = ledger.exact_set_verify() {
         return Err(EnduranceError::InvalidConfig(format!(
             "coverage ledger exact-set failed: {ms:?}"
+        )));
+    }
+    let tool_call_steps = llm
+        .samples()
+        .iter()
+        .flat_map(|sample| sample.tool_steps.iter())
+        .filter(|step| step.kind == "call")
+        .count();
+    if tool_call_steps == 0 {
+        return Err(EnduranceError::InvalidConfig(format!(
+            "configured {} tool transport produced no actual tool-call steps",
+            runtime_profile.tool_mode.label()
         )));
     }
     if let Err(msg) = paths.check_no_secrets() {
@@ -605,7 +1370,11 @@ async fn run_sqlite_endurance_stage(
         )));
     }
 
-    let calls_used = prior_calls_used + llm.calls_used().saturating_sub(calls_before);
+    let calls_used =
+        harness_real_llm::evidence_retention::count_evidence_call_records(&paths.root, &run_id)
+            .map_err(|error| {
+                EnduranceError::InvalidConfig(format!("final call ledger rejected: {error}"))
+            })?;
     let acceptance = classify_acceptance(
         stage,
         turns_accepted,
@@ -614,8 +1383,50 @@ async fn run_sqlite_endurance_stage(
         false,
         false,
     );
-    let mut coverage_assertions = schedule.coverage_report();
-    coverage_assertions.extend(ledger.assertion_results());
+    let mut coverage_assertions = ledger.assertion_results();
+    coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
+        name: "actual_tool_mode".into(),
+        passed: true,
+        detail: Some(format!(
+            "{};tool_call_steps={tool_call_steps}",
+            runtime_profile.tool_mode.label()
+        )),
+    });
+    coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
+        name: "actual_reasoning_mode".into(),
+        passed: true,
+        detail: Some(runtime_profile.reasoning_mode.label().into()),
+    });
+    coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
+        name: "sqlite_meta_campaign_tasks_probe".into(),
+        passed: !meta_probe_enabled || meta_probe_calls > 0,
+        detail: Some(if meta_probe_enabled {
+            format!("calls={meta_probe_calls};tools=inspect_campaign,inspect_tasks")
+        } else {
+            "not_requested".into()
+        }),
+    });
+    coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
+        name: "character_extractor_real_probe".into(),
+        passed: !extractor_probe_enabled || extractor_probe_calls > 0,
+        detail: Some(if extractor_probe_enabled {
+            format!("calls={extractor_probe_calls};tool=emit_characters")
+        } else {
+            "not_requested".into()
+        }),
+    });
+    coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
+        name: "cache_fingerprint_real_probe".into(),
+        passed: !cache_probe_enabled || cache_probe_calls == 3,
+        detail: Some(if cache_probe_enabled {
+            format!(
+                "calls={cache_probe_calls};cached_tokens={cache_probe_cached_tokens};provider_cache_hit_claimed={}",
+                cache_probe_cached_tokens > 0
+            )
+        } else {
+            "not_requested".into()
+        }),
+    });
     coverage_assertions.push(harness_real_llm::evidence::AssertionResult {
         name: "sqlite_authoritative".into(),
         passed: true,
@@ -656,6 +1467,105 @@ async fn run_sqlite_endurance_stage(
         )));
     }
     Ok(row)
+}
+
+#[test]
+fn supplemental_matrix_fits_special_paths_into_twelve_accepted_turns() {
+    let schedule = EnduranceSchedule::new(12);
+    assert!(matches!(
+        scheduled_action_for_run(&schedule, 4, true),
+        ScheduledAction::Write {
+            subagent_count: 3,
+            world_info_route: WorldInfoRouteSlot::Both,
+            ..
+        }
+    ));
+    assert!(matches!(
+        scheduled_action_for_run(&schedule, 5, true),
+        ScheduledAction::RegenerateOverall
+    ));
+    assert!(matches!(
+        scheduled_action_for_run(&schedule, 6, true),
+        ScheduledAction::RegenerateEditor
+    ));
+    assert!(matches!(
+        scheduled_action_for_run(&schedule, 7, true),
+        ScheduledAction::RegenerateSubagent
+    ));
+    assert!(matches!(
+        scheduled_action_for_run(&schedule, 12, true),
+        ScheduledAction::QualityAutofix { fixable: true }
+    ));
+}
+
+#[test]
+fn successful_tool_result_requires_matching_ok_result() {
+    use harness_real_llm::evidence::EvidenceToolStep;
+
+    let failed = EvidenceToolStep {
+        kind: "result".into(),
+        tool_name: "search_world_info".into(),
+        call_id16: None,
+        args_hash16: None,
+        args_len: None,
+        result_hash16: None,
+        result_len: None,
+        ok: Some(false),
+        detail: None,
+    };
+    let succeeded = EvidenceToolStep {
+        ok: Some(true),
+        ..failed.clone()
+    };
+    assert!(!has_successful_tool_result(
+        [&failed],
+        &["search_world_info"]
+    ));
+    assert!(has_successful_tool_result(
+        [&succeeded],
+        &["search_world_info"]
+    ));
+    assert!(!has_successful_tool_result(
+        [&succeeded],
+        &["get_recent_summary"]
+    ));
+}
+
+#[test]
+fn resume_identity_rejects_stage_or_runtime_drift() {
+    let expected = EnduranceRunIdentity {
+        fixture_hash16: "fixture123456789".into(),
+        model_hash16: "model12345678901".into(),
+        tool_mode: "native".into(),
+        reasoning_mode: "disabled".into(),
+    };
+    let mut checkpoint = EnduranceCheckpoint {
+        schema_version: EnduranceCheckpoint::schema_version().into(),
+        run_id: "run-coverage-00000000-0000-0000-0000-000000000001".into(),
+        stage: "coverage".into(),
+        accepted_turn_number: 1,
+        calls_used: 1,
+        max_calls: 220,
+        campaign_revision: 1,
+        chronicle_revision: 1,
+        last_draft_hash16: "draft12345678901".into(),
+        last_summary_code: None,
+        context_epoch_id16: None,
+        early_fact_probe_ids: vec![],
+        early_fact_checked_passed: vec![],
+        campaign_id: None,
+        conversation_id: None,
+        data_dir_rel: Some("campaign_data".into()),
+        observed_epoch_ids16: vec![],
+        run_identity: Some(expected.clone()),
+        recorded_at_unix_ms: 0,
+    };
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_ok());
+    checkpoint.stage = "canary".into();
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
+    checkpoint.stage = "coverage".into();
+    checkpoint.run_identity.as_mut().unwrap().tool_mode = "text_fallback".into();
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
 }
 
 #[tokio::test]
@@ -704,7 +1614,39 @@ async fn endurance_sqlite_real_llm_staged() {
         // Prefer stage budget if env default is lower.
         budget.max_calls = budget.max_calls.max(stage.max_calls());
     }
-    let llm = BudgetedLlmClient::wrap(require_real_llm(), &budget);
+    let connection = resolve_llm_connection()
+        .unwrap_or_else(|error| panic!("real LLM connection unavailable: {error}"));
+    let model_label = connection.model.chars().take(64).collect::<String>();
+    let reasoning_override = parse_eval_reasoning_mode();
+    let runtime_profile = RuntimeCoverageProfile {
+        reasoning_mode: match &reasoning_override {
+            ReasoningMode::Disabled => ReasoningModeSlot::Disabled,
+            ReasoningMode::Native => ReasoningModeSlot::Native,
+            ReasoningMode::Prompted => ReasoningModeSlot::Prompted,
+        },
+        tool_mode: match &connection.tool_mode {
+            ToolMode::Native => ToolModeSlot::Native,
+            ToolMode::TextFallback => ToolModeSlot::TextFallback,
+        },
+    };
+    let run_identity = EnduranceRunIdentity {
+        fixture_hash16: fixture_source_hash16()
+            .unwrap_or_else(|error| panic!("fixture identity unavailable: {error}")),
+        model_hash16: short_hash16(&model_label),
+        tool_mode: runtime_profile.tool_mode.label().into(),
+        reasoning_mode: runtime_profile.reasoning_mode.label().into(),
+    };
+    if let Some(checkpoint) = resume_cp.as_ref() {
+        validate_resume_identity(checkpoint, stage, &run_identity)
+            .unwrap_or_else(|error| panic!("fail-closed resume identity: {error}"));
+    }
+    let real_client = storyforge_infra_llm::create_client(&connection)
+        .unwrap_or_else(|error| panic!("construct real LLM client: {error}"));
+    let llm = BudgetedLlmClient::wrap_with_reasoning(
+        Arc::from(real_client),
+        &budget,
+        Some(reasoning_override),
+    );
 
     let env = if resume_cp.is_some() && data_dir.join("storyforge.sqlite3").exists() {
         let env =
@@ -738,15 +1680,18 @@ async fn endurance_sqlite_real_llm_staged() {
                 .expect("conversation bound on campaign")
         };
 
-    match run_sqlite_endurance_stage(
-        &env,
-        llm.clone(),
+    match run_sqlite_endurance_stage(SqliteEnduranceStageContext {
+        env: &env,
+        llm: llm.clone(),
         campaign_id,
         conversation_id,
         stage,
-        &budget,
-        &paths,
-    )
+        budget: &budget,
+        paths: &paths,
+        runtime_profile,
+        model_label: &model_label,
+        run_identity,
+    })
     .await
     {
         Ok(row) => {
@@ -760,8 +1705,36 @@ async fn endurance_sqlite_real_llm_staged() {
                 row.acceptance,
                 env.fixture_hash16
             );
+            let audit = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot()
+                .unwrap_or_else(|error| panic!("capture consistent SQLite audit: {error}"));
+            assert_eq!(
+                audit.committed_turns,
+                u64::from(row.accepted_turns),
+                "SQLite committed-turn count must match the accepted evidence row"
+            );
+            harness_real_llm::evidence_retention::write_sqlite_audit_subject(
+                &paths.root,
+                &harness_real_llm::evidence_retention::SqliteAuditSubject {
+                    schema_version:
+                        harness_real_llm::evidence_retention::SQLITE_AUDIT_SCHEMA_VERSION.into(),
+                    run_id: row.run_id.clone(),
+                    sqlite_schema_version: audit.sqlite_schema_version,
+                    canonical_content_sha256: audit.canonical_content_sha256,
+                    turns: audit.turns,
+                    attempts: audit.attempts,
+                    committed_turns: audit.committed_turns,
+                    outbox_rows: audit.outbox_rows,
+                    round_summaries: audit.round_summaries,
+                    publication_jobs: audit.publication_jobs,
+                    ledger_entries: audit.ledger_entries,
+                },
+            )
+            .unwrap_or_else(|error| panic!("write SQLite audit subject: {error}"));
+
             assert!(paths.check_no_secrets().is_ok());
             assert!(paths.total_size() < 2 * 1024 * 1024);
+
+            let (commit, branch) = resolve_git_provenance();
 
             let manifest = harness_real_llm::evidence_retention::seal_run(
                 &paths.root,
@@ -769,19 +1742,15 @@ async fn endurance_sqlite_real_llm_staged() {
                     run_id: row.run_id.clone(),
                     status: harness_real_llm::evidence_retention::RunStatus::Completed,
                     stage: row.stage.clone(),
-                    model_label: std::env::var("LLM_MODEL")
-                        .unwrap_or_default()
-                        .chars()
-                        .take(64)
-                        .collect(),
+                    model_label: model_label.clone(),
                     budget: harness_real_llm::evidence_retention::BudgetSummary {
                         max_calls: row.max_calls,
                         max_turns: row.target_turns,
                         timeout_secs: budget.timeout_secs,
                         max_tokens: budget.max_tokens,
                     },
-                    commit: std::env::var("STORYFORGE_EVAL_COMMIT").unwrap_or_default(),
-                    branch: std::env::var("STORYFORGE_EVAL_BRANCH").unwrap_or_default(),
+                    commit,
+                    branch,
                 },
             )
             .unwrap_or_else(|err| {
@@ -802,8 +1771,9 @@ async fn endurance_sqlite_real_llm_staged() {
             });
         }
         Err(err) => {
-            eprintln!("SQLITE ENDURANCE {} FAIL CLOSED: {err}", stage.label());
-            panic!("sqlite endurance stage {stage} failed closed: {err}");
+            let safe = safe_error_summary(&err.to_string());
+            eprintln!("SQLITE ENDURANCE {} FAIL CLOSED: {safe}", stage.label());
+            panic!("sqlite endurance stage {stage} failed closed: {safe}");
         }
     }
 }

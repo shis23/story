@@ -380,6 +380,34 @@ impl SqliteProductionRepository {
         Ok(())
     }
 
+    /// Persist a campaign-scoped knowledge row during setup/import paths.
+    pub fn save_knowledge(db: &mut Database, entry: &CharacterKnowledgeEntry) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO character_knowledge (knowledge_id, campaign_id, payload_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(knowledge_id) DO UPDATE SET
+                campaign_id=excluded.campaign_id, payload_json=excluded.payload_json
+            "#,
+            rusqlite::params![entry.id.as_str(), entry.campaign_id.as_str(), json(entry)?],
+        )?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    /// Persist a campaign-scoped story task during setup/import paths.
+    pub fn save_task(db: &mut Database, task: &StoryTask) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        write_task(tx, task)?;
+        uow.commit()?;
+        Ok(())
+    }
+
     /// Mark every non-terminal turn Failed. Used by SQLite startup recovery where
     /// accept is atomic (no multi-file Committing journal to replay).
     pub fn fail_incomplete_turns(db: &mut Database) -> Result<usize> {

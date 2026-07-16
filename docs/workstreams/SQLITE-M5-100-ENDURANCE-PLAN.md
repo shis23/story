@@ -1,9 +1,9 @@
 # SQLite + M5 100 轮真实模型集成计划
 
-> 状态：计划中；尚未进行本计划定义的真实模型运行。  
-> 基线：main @ 75385e8。  
-> 执行方式：用户已授权直接在 main 工作；工作区必须干净、只有一个写入者、分阶段提交、不 push。  
-> 结果文档：完成后新增 SQLITE-M5-100-ENDURANCE-RESULT.md。
+> 状态：历史 Full100 已完成；Native 12 + TextFallback 3 专项补测进行中。
+> 基线：main @ 75385e8。
+> 执行方式：用户已授权直接在 main 工作；分阶段提交、不 push。
+> 结果文档：补测完成并离线核验后更新 `SQLITE-M5-100-ENDURANCE-RESULT.md`。
 
 ## 1. 为什么不能直接把现有 100 轮改成 SQLite 模式后开跑
 

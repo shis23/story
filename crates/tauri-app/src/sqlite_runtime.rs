@@ -276,6 +276,22 @@ pub fn save_instance(
     })
 }
 
+pub fn save_knowledge(
+    entry: &storyforge_domain::character_knowledge::CharacterKnowledgeEntry,
+) -> Result<(), String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_knowledge(db, entry).map_err(|e| e.to_string())
+    })
+}
+
+pub fn save_task(task: &storyforge_domain::story_task::StoryTask) -> Result<(), String> {
+    with_db_mut(|db| SqliteProductionRepository::save_task(db, task).map_err(|e| e.to_string()))
+}
+
+pub fn capture_audit_snapshot() -> Result<storyforge_infra_sqlite::SqliteAuditSnapshot, String> {
+    with_db_mut(|db| storyforge_infra_sqlite::capture_audit_snapshot(db).map_err(|e| e.to_string()))
+}
+
 /// Atomic Accept through the SQLite production UoW.
 pub fn accept_by_variant(
     campaign_id: &Id,

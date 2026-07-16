@@ -478,6 +478,7 @@ async fn run_endurance_stage(
             conversation_id: Some(conversation_id.as_str().to_string()),
             data_dir_rel: Some("campaign_data".into()),
             observed_epoch_ids16: epoch_tracker.observed.clone(),
+            run_identity: None,
             recorded_at_unix_ms: 0,
         };
         write_checkpoint(&paths.checkpoint_jsonl, &cp)?;
