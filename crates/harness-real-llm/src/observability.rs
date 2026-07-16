@@ -345,6 +345,8 @@ mod tests {
                 msg_count: 1,
                 elapsed_ms: 1,
                 outcome: "ok".into(),
+                tools_offered: vec![],
+                tool_steps: vec![],
             },
             UsageSample {
                 tag: "turn1".into(),
@@ -363,6 +365,8 @@ mod tests {
                 msg_count: 4,
                 elapsed_ms: 2,
                 outcome: "ok".into(),
+                tools_offered: vec![],
+                tool_steps: vec![],
             },
         ];
         let (non_turn, turns) = partition_samples(&samples);

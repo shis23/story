@@ -47,7 +47,13 @@ const REQUIRED_EVIDENCE_FILES: &[&str] = &[
 ];
 
 /// Optional evidence files hashed when present.
-const OPTIONAL_EVIDENCE_FILES: &[&str] = &["endurance_manifest.jsonl", "endurance_phase_b.jsonl"];
+const OPTIONAL_EVIDENCE_FILES: &[&str] = &[
+    "endurance_manifest.jsonl",
+    "endurance_phase_b.jsonl",
+    // Sanitized director/agent tool loop timeline (offered → call → result).
+    "endurance_tool_trace.jsonl",
+    "endurance_coverage_ledger.jsonl",
+];
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 

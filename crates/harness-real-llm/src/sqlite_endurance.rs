@@ -247,7 +247,23 @@ impl SqliteHarnessEnv {
             return Ok(ctx);
         };
         fill_campaign_runtime_from_sqlite(&mut ctx, &self.tool_ctx, &active_id)?;
+        // Production-faithful: feed RoundSummary catalog into director remote-memory tools.
+        // Without this, get_recent_summary / search_chronicle see empty stores and never
+        // produce a complete tool-call evidence timeline.
+        self.sync_remote_memory_tools(&active_id)?;
         Ok(ctx)
+    }
+
+    /// Refresh ToolContext remote-memory sources from SQLite authority.
+    fn sync_remote_memory_tools(&self, campaign_id: &Id) -> Result<(), String> {
+        let summaries = sqlite_runtime::list_summaries(campaign_id)?;
+        let mut g = self.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        // get_recent_summary reads content list (tool reverses + takes limit).
+        g.archived_summaries = summaries.iter().map(|s| s.content.clone()).collect();
+        // search_chronicle / get_chronicle use the typed catalog.
+        g.chronicle_summaries = summaries;
+        g.reset_chronicle_tool_budget();
+        Ok(())
     }
 
     pub fn new_pipeline(&self) -> PipelineOrchestrator {

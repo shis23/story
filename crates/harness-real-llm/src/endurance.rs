@@ -858,6 +858,8 @@ pub struct EnduranceEvidencePaths {
     pub checkpoint_jsonl: PathBuf,
     pub manifest_jsonl: PathBuf,
     pub phase_b_jsonl: PathBuf,
+    /// Sanitized director/agent tool-loop timeline (offered → call → result).
+    pub tool_trace_jsonl: PathBuf,
 }
 
 impl EnduranceEvidencePaths {
@@ -868,6 +870,7 @@ impl EnduranceEvidencePaths {
             checkpoint_jsonl: root.join("endurance_checkpoint.jsonl"),
             manifest_jsonl: root.join("endurance_manifest.jsonl"),
             phase_b_jsonl: root.join("endurance_phase_b.jsonl"),
+            tool_trace_jsonl: root.join("endurance_tool_trace.jsonl"),
             root,
         }
     }
@@ -880,6 +883,7 @@ impl EnduranceEvidencePaths {
             &self.checkpoint_jsonl,
             &self.manifest_jsonl,
             &self.phase_b_jsonl,
+            &self.tool_trace_jsonl,
         ]
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())

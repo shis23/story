@@ -157,5 +157,7 @@ fn sample(tag: &str, role: &str, prompt: u32, cached: u32) -> UsageSample {
         msg_count: 1,
         elapsed_ms: 1,
         outcome: "ok".into(),
+        tools_offered: vec![],
+        tool_steps: vec![],
     }
 }

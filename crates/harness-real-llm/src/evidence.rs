@@ -11,6 +11,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// 脱敏的工具调用/结果步骤（无正文、无参数原文）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EvidenceToolStep {
+    /// `offered` | `call` | `result`
+    pub kind: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id16: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_hash16: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash16: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    /// 安全计数/枚举细节（如 summaries_count=3），禁止正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// 单次 LLM 调用的脱敏证据行。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceCallRecord {
@@ -36,6 +59,32 @@ pub struct EvidenceCallRecord {
     /// `ok` / `client_error` / `timeout`；禁止落供应商原始错误正文。
     #[serde(default = "default_call_outcome")]
     pub outcome: String,
+    /// 请求中声明的工具名列表（导演/子代理工具环）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_offered: Vec<String>,
+    /// 本轮响应发出的 tool_calls + 请求 history 中已执行的 tool results。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_steps: Vec<EvidenceToolStep>,
+    pub assertion_results: Vec<AssertionResult>,
+    pub model_label: String,
+    pub recorded_at_unix_ms: u128,
+}
+
+/// 单 turn 聚合的工具调用全过程（多 LLM 往返拼成一条时间线）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceToolTraceRecord {
+    pub schema_version: String,
+    pub run_id: String,
+    pub suite: String,
+    pub turn_index: u32,
+    pub role: String,
+    pub tag: String,
+    /// 是否出现远记忆相关工具（get_recent_summary / search_chronicle / search_vectors）。
+    pub remote_memory_tool_used: bool,
+    pub tools_offered: Vec<String>,
+    pub steps: Vec<EvidenceToolStep>,
+    pub call_count: usize,
+    pub result_count: usize,
     pub assertion_results: Vec<AssertionResult>,
     pub model_label: String,
     pub recorded_at_unix_ms: u128,
@@ -210,6 +259,20 @@ impl EvidenceWriter {
         self.write_json_line(&rec)
     }
 
+    pub fn write_tool_trace(&self, mut rec: EvidenceToolTraceRecord) -> std::io::Result<()> {
+        if rec.run_id.is_empty() {
+            rec.run_id = self.run_id.clone();
+        }
+        if rec.schema_version.is_empty() {
+            rec.schema_version = EVIDENCE_SCHEMA_VERSION.into();
+        }
+        if rec.recorded_at_unix_ms == 0 {
+            rec.recorded_at_unix_ms = now_unix_ms();
+        }
+        sanitize_tool_trace_record(&mut rec);
+        self.write_json_line(&rec)
+    }
+
     pub fn write_turn(&self, mut rec: EvidenceTurnRecord) -> std::io::Result<()> {
         if rec.run_id.is_empty() {
             rec.run_id = self.run_id.clone();
@@ -294,6 +357,119 @@ pub fn sanitize_call_record(rec: &mut EvidenceCallRecord) {
     if rec.model_label.len() > 64 {
         rec.model_label = rec.model_label.chars().take(64).collect();
     }
+    sanitize_tool_steps(&mut rec.tool_steps);
+    for name in &mut rec.tools_offered {
+        if name.len() > 64 {
+            *name = name.chars().take(64).collect();
+        }
+    }
+}
+
+fn sanitize_tool_steps(steps: &mut [EvidenceToolStep]) {
+    for step in steps {
+        if step.tool_name.len() > 64 {
+            step.tool_name = step.tool_name.chars().take(64).collect();
+        }
+        if let Some(id) = step.call_id16.as_mut() {
+            *id = truncate_hex16(id);
+        }
+        if let Some(h) = step.args_hash16.as_mut() {
+            *h = truncate_hex16(h);
+        }
+        if let Some(h) = step.result_hash16.as_mut() {
+            *h = truncate_hex16(h);
+        }
+        if let Some(detail) = step.detail.as_mut() {
+            *detail = redact_detail(detail);
+            if detail.len() > 120 {
+                *detail = detail.chars().take(120).collect();
+            }
+        }
+        match step.kind.as_str() {
+            "offered" | "call" | "result" => {}
+            _ => step.kind = "call".into(),
+        }
+    }
+}
+
+pub fn sanitize_tool_trace_record(rec: &mut EvidenceToolTraceRecord) {
+    for a in &mut rec.assertion_results {
+        if let Some(detail) = a.detail.as_mut() {
+            *detail = redact_detail(detail);
+        }
+    }
+    sanitize_tool_steps(&mut rec.steps);
+    for name in &mut rec.tools_offered {
+        if name.len() > 64 {
+            *name = name.chars().take(64).collect();
+        }
+    }
+    if rec.model_label.len() > 64 {
+        rec.model_label = rec.model_label.chars().take(64).collect();
+    }
+}
+
+/// 从一组 call 样本聚合 turn 级工具时间线。
+pub fn aggregate_tool_trace(
+    run_id: impl Into<String>,
+    suite: impl Into<String>,
+    turn_index: u32,
+    model_label: impl Into<String>,
+    calls: &[EvidenceCallRecord],
+) -> Option<EvidenceToolTraceRecord> {
+    let mut tools_offered = Vec::new();
+    let mut steps = Vec::new();
+    let mut role = "pipeline".to_string();
+    let mut tag = format!("sqlite-turn{turn_index}");
+    for c in calls {
+        if c.turn_index != turn_index {
+            continue;
+        }
+        role = c.role.clone();
+        tag = c.tag.clone();
+        for name in &c.tools_offered {
+            if !tools_offered.iter().any(|n| n == name) {
+                tools_offered.push(name.clone());
+            }
+        }
+        steps.extend(c.tool_steps.iter().cloned());
+    }
+    if tools_offered.is_empty() && steps.is_empty() {
+        return None;
+    }
+    let call_count = steps.iter().filter(|s| s.kind == "call").count();
+    let result_count = steps.iter().filter(|s| s.kind == "result").count();
+    let remote_memory_tool_used = steps.iter().any(|s| {
+        matches!(
+            s.tool_name.as_str(),
+            "get_recent_summary" | "search_chronicle" | "search_vectors" | "get_chronicle"
+        )
+    }) || tools_offered.iter().any(|n| {
+        matches!(
+            n.as_str(),
+            "get_recent_summary" | "search_chronicle" | "search_vectors" | "get_chronicle"
+        )
+    });
+    Some(EvidenceToolTraceRecord {
+        schema_version: EVIDENCE_SCHEMA_VERSION.into(),
+        run_id: run_id.into(),
+        suite: suite.into(),
+        turn_index,
+        role,
+        tag,
+        remote_memory_tool_used,
+        tools_offered,
+        steps,
+        call_count,
+        result_count,
+        assertion_results: vec![AssertionResult {
+            name: "tool_trace_recorded".into(),
+            passed: true,
+            detail: Some(format!("calls={call_count};results={result_count}")),
+        }],
+        model_label: model_label.into(),
+        recorded_at_unix_ms: 0,
+    })
 }
 
 pub fn sanitize_turn_record(rec: &mut EvidenceTurnRecord) {
@@ -471,6 +647,18 @@ mod tests {
             completion_tokens: 30,
             elapsed_ms: 12,
             outcome: "ok".into(),
+            tools_offered: vec!["get_recent_summary".into()],
+            tool_steps: vec![EvidenceToolStep {
+                kind: "call".into(),
+                tool_name: "get_recent_summary".into(),
+                call_id16: Some("aaaaaaaaaaaaaaaa".into()),
+                args_hash16: Some("bbbbbbbbbbbbbbbb".into()),
+                args_len: Some(12),
+                result_hash16: None,
+                result_len: None,
+                ok: None,
+                detail: Some("limit=3".into()),
+            }],
             assertion_results: vec![AssertionResult {
                 name: "non_empty".into(),
                 passed: true,
@@ -514,5 +702,72 @@ mod tests {
         let b = RealLlmRunBudget::default();
         assert!(!b.enabled);
         assert_eq!(b.max_calls, 0);
+    }
+
+    #[test]
+    fn aggregate_tool_trace_marks_remote_memory_without_payloads() {
+        let call = EvidenceCallRecord {
+            schema_version: EVIDENCE_SCHEMA_VERSION.into(),
+            run_id: "run-t".into(),
+            suite: "endurance_sqlite".into(),
+            turn_index: 7,
+            role: "pipeline".into(),
+            tag: "sqlite-turn7".into(),
+            streaming: true,
+            request_fp16: "aaaaaaaaaaaaaaaa".into(),
+            system_hash16: "bbbbbbbbbbbbbbbb".into(),
+            history_hash16: "cccccccccccccccc".into(),
+            tail_hash16: "dddddddddddddddd".into(),
+            history_len: 3,
+            tail_parts: 1,
+            msg_count: 5,
+            prompt_tokens: 10,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            completion_tokens: 2,
+            elapsed_ms: 3,
+            outcome: "ok".into(),
+            tools_offered: vec![
+                "get_recent_summary".into(),
+                "search_chronicle".into(),
+            ],
+            tool_steps: vec![
+                EvidenceToolStep {
+                    kind: "call".into(),
+                    tool_name: "get_recent_summary".into(),
+                    call_id16: Some("1111111111111111".into()),
+                    args_hash16: Some("2222222222222222".into()),
+                    args_len: Some(11),
+                    result_hash16: None,
+                    result_len: None,
+                    ok: None,
+                    detail: Some("limit=3".into()),
+                },
+                EvidenceToolStep {
+                    kind: "result".into(),
+                    tool_name: "get_recent_summary".into(),
+                    call_id16: Some("1111111111111111".into()),
+                    args_hash16: None,
+                    args_len: None,
+                    result_hash16: Some("3333333333333333".into()),
+                    result_len: Some(40),
+                    ok: Some(true),
+                    detail: Some("summaries_count=2".into()),
+                },
+            ],
+            assertion_results: vec![],
+            model_label: "mock".into(),
+            recorded_at_unix_ms: 1,
+        };
+        let trace = aggregate_tool_trace("run-t", "endurance_sqlite", 7, "mock", &[call])
+            .expect("trace present");
+        assert!(trace.remote_memory_tool_used);
+        assert_eq!(trace.call_count, 1);
+        assert_eq!(trace.result_count, 1);
+        let line = serde_json::to_string(&trace).unwrap();
+        assert!(!line.contains("sk-"));
+        assert!(!contains_forbidden_evidence_payload(&line));
+        assert!(line.contains("get_recent_summary"));
+        assert!(line.contains("summaries_count=2"));
     }
 }

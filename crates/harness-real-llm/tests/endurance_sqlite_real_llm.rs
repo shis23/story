@@ -94,7 +94,8 @@ fn evidence_run_dir(stage: EnduranceStage) -> (String, PathBuf, EnduranceEvidenc
 
 fn flush_samples(
     llm: &BudgetedLlmClient,
-    writer: &EvidenceWriter,
+    call_writer: &EvidenceWriter,
+    tool_writer: Option<&EvidenceWriter>,
     cursor: &mut usize,
     run_id: &str,
     model_label: &str,
@@ -102,8 +103,9 @@ fn flush_samples(
 ) -> Result<usize, EnduranceError> {
     let samples = llm.samples();
     let turn_samples = samples.get(*cursor..).unwrap_or(&[]);
+    let mut call_records = Vec::with_capacity(turn_samples.len());
     for sample in turn_samples {
-        writer.write_call(sample.to_evidence_call(
+        let rec = sample.to_evidence_call(
             run_id,
             "endurance_sqlite",
             turn_index,
@@ -113,7 +115,20 @@ fn flush_samples(
                 passed: sample.outcome == "ok",
                 detail: Some(format!("outcome={}", sample.outcome)),
             }],
-        ))?;
+        );
+        call_writer.write_call(rec.clone())?;
+        call_records.push(rec);
+    }
+    if let Some(tool_writer) = tool_writer
+        && let Some(trace) = harness_real_llm::evidence::aggregate_tool_trace(
+            run_id,
+            "endurance_sqlite",
+            turn_index,
+            model_label,
+            &call_records,
+        )
+    {
+        tool_writer.write_tool_trace(trace)?;
     }
     let written = turn_samples.len();
     *cursor = samples.len();
@@ -189,6 +204,11 @@ async fn run_sqlite_endurance_stage(
         EvidenceWriter::open_append(&paths.calls_jsonl, &run_id)?
     } else {
         EvidenceWriter::create(&paths.calls_jsonl, &run_id)?
+    };
+    let tool_writer = if start_turn > 1 {
+        EvidenceWriter::open_append(&paths.tool_trace_jsonl, &run_id)?
+    } else {
+        EvidenceWriter::create(&paths.tool_trace_jsonl, &run_id)?
     };
     let turn_writer = if start_turn > 1 {
         EvidenceWriter::open_append(&paths.turns_jsonl, &run_id)?
@@ -345,6 +365,7 @@ async fn run_sqlite_endurance_stage(
                     let _ = flush_samples(
                         &llm,
                         &call_writer,
+                        Some(&tool_writer),
                         &mut sample_cursor,
                         &run_id,
                         &model_label,
@@ -356,6 +377,7 @@ async fn run_sqlite_endurance_stage(
             let calls_this_turn = flush_samples(
                 &llm,
                 &call_writer,
+                Some(&tool_writer),
                 &mut sample_cursor,
                 &run_id,
                 &model_label,

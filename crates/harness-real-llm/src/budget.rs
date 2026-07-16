@@ -15,8 +15,10 @@ use storyforge_infra_llm::LlmClient;
 use tokio::sync::{mpsc, watch};
 
 use crate::evidence::{
-    AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, RealLlmRunBudget, short_hash16,
+    AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceToolStep,
+    RealLlmRunBudget, short_hash16,
 };
+use storyforge_domain::llm::ChatRole;
 
 /// 单次调用的脱敏 usage 样本（不落全文）。
 #[derive(Debug, Clone)]
@@ -37,6 +39,8 @@ pub struct UsageSample {
     pub msg_count: usize,
     pub elapsed_ms: u128,
     pub outcome: String,
+    pub tools_offered: Vec<String>,
+    pub tool_steps: Vec<EvidenceToolStep>,
 }
 
 impl UsageSample {
@@ -69,11 +73,202 @@ impl UsageSample {
             completion_tokens: self.completion_tokens,
             elapsed_ms: self.elapsed_ms,
             outcome: self.outcome.clone(),
+            tools_offered: self.tools_offered.clone(),
+            tool_steps: self.tool_steps.clone(),
             assertion_results: assertions,
             model_label: model_label.into(),
             recorded_at_unix_ms: 0,
         }
     }
+}
+
+fn redact_tool_args_detail(tool_name: &str, args_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let obj = v.as_object()?;
+    let mut parts = Vec::new();
+    match tool_name {
+        "get_recent_summary" => {
+            if let Some(limit) = obj.get("limit").and_then(|x| x.as_u64()) {
+                parts.push(format!("limit={limit}"));
+            }
+        }
+        "search_chronicle" | "search_vectors" | "search_world_info" => {
+            if let Some(q) = obj.get("query").and_then(|x| x.as_str()) {
+                parts.push(format!("query_len={}", q.chars().count()));
+                parts.push(format!("query_hash16={}", short_hash16(q)));
+            }
+            if let Some(limit) = obj.get("limit").and_then(|x| x.as_u64()) {
+                parts.push(format!("limit={limit}"));
+            }
+            if let Some(level) = obj.get("level").and_then(|x| x.as_str()) {
+                parts.push(format!("level={level}"));
+            }
+        }
+        "get_chronicle" => {
+            if let Some(code) = obj.get("code").and_then(|x| x.as_str()) {
+                parts.push(format!("code_hash16={}", short_hash16(code)));
+            }
+        }
+        "get_character" => {
+            if let Some(name) = obj
+                .get("name")
+                .or_else(|| obj.get("character_name"))
+                .and_then(|x| x.as_str())
+            {
+                parts.push(format!("name_hash16={}", short_hash16(name)));
+            }
+            if let Some(id) = obj
+                .get("id")
+                .or_else(|| obj.get("character_id"))
+                .and_then(|x| x.as_str())
+            {
+                parts.push(format!("id_hash16={}", short_hash16(id)));
+            }
+        }
+        _ => {
+            parts.push(format!("keys={}", obj.len()));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(";"))
+    }
+}
+
+fn redact_tool_result_detail(tool_name: &str, result_json: &str) -> (bool, Option<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result_json) else {
+        return (true, Some(format!("result_len={}", result_json.len())));
+    };
+    if let Some(err) = v.get("error").and_then(|x| x.as_str()) {
+        return (
+            false,
+            Some(format!(
+                "error_class={};error_len={}",
+                if err.contains("budget") {
+                    "budget"
+                } else if err.contains("Invalid JSON") {
+                    "bad_args"
+                } else {
+                    "tool_error"
+                },
+                err.chars().count()
+            )),
+        );
+    }
+    let detail = match tool_name {
+        "get_recent_summary" => {
+            let count = v
+                .get("summaries_count")
+                .and_then(|x| x.as_u64())
+                .or_else(|| v.get("summaries").and_then(|x| x.as_array()).map(|a| a.len() as u64))
+                .unwrap_or(0);
+            Some(format!("summaries_count={count}"))
+        }
+        "search_chronicle" | "search_vectors" | "search_world_info" => {
+            let count = v
+                .get("results")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .or_else(|| v.get("count").and_then(|x| x.as_u64()).map(|n| n as usize))
+                .unwrap_or(0);
+            Some(format!("results_count={count}"))
+        }
+        "get_chronicle" => {
+            let has = v.get("summary").is_some() || v.get("content").is_some() || v.get("code").is_some();
+            Some(format!("hit={}", has))
+        }
+        _ => {
+            let keys = v.as_object().map(|o| o.len()).unwrap_or(0);
+            Some(format!("keys={keys}"))
+        }
+    };
+    (true, detail)
+}
+
+fn extract_tool_trace(
+    req: &ChatRequest,
+    resp: Option<&ChatResponse>,
+) -> (Vec<String>, Vec<EvidenceToolStep>) {
+    let tools_offered = req
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut steps = Vec::new();
+    // History already contains prior assistant tool_calls + tool results from the loop.
+    for msg in &req.messages {
+        match msg.role {
+            ChatRole::Assistant => {
+                if let Some(tcs) = msg.tool_calls.as_ref() {
+                    for tc in tcs {
+                        steps.push(EvidenceToolStep {
+                            kind: "call".into(),
+                            tool_name: tc.function.name.clone(),
+                            call_id16: Some(short_hash16(&tc.id)),
+                            args_hash16: Some(short_hash16(&tc.function.arguments)),
+                            args_len: Some(tc.function.arguments.len()),
+                            result_hash16: None,
+                            result_len: None,
+                            ok: None,
+                            detail: redact_tool_args_detail(
+                                &tc.function.name,
+                                &tc.function.arguments,
+                            ),
+                        });
+                    }
+                }
+            }
+            ChatRole::Tool => {
+                let id16 = msg.tool_call_id.as_ref().map(|id| short_hash16(id));
+                // Try to pair with last unmatched call for tool_name.
+                let tool_name = steps
+                    .iter()
+                    .rev()
+                    .find(|s| {
+                        s.kind == "call"
+                            && s.call_id16.as_deref() == id16.as_deref()
+                    })
+                    .map(|s| s.tool_name.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let (ok, detail) = redact_tool_result_detail(&tool_name, &msg.content);
+                steps.push(EvidenceToolStep {
+                    kind: "result".into(),
+                    tool_name,
+                    call_id16: id16,
+                    args_hash16: None,
+                    args_len: None,
+                    result_hash16: Some(short_hash16(&msg.content)),
+                    result_len: Some(msg.content.len()),
+                    ok: Some(ok),
+                    detail,
+                });
+            }
+            _ => {}
+        }
+    }
+    if let Some(resp) = resp {
+        for tc in &resp.tool_calls {
+            steps.push(EvidenceToolStep {
+                kind: "call".into(),
+                tool_name: tc.function.name.clone(),
+                call_id16: Some(short_hash16(&tc.id)),
+                args_hash16: Some(short_hash16(&tc.function.arguments)),
+                args_len: Some(tc.function.arguments.len()),
+                result_hash16: None,
+                result_len: None,
+                ok: None,
+                detail: redact_tool_args_detail(&tc.function.name, &tc.function.arguments),
+            });
+        }
+    }
+    (tools_offered, steps)
 }
 
 /// 带预算上限与 usage 录制的 LLM 客户端包装。
@@ -164,6 +359,7 @@ impl BudgetedLlmClient {
     fn record(
         &self,
         req: &ChatRequest,
+        resp: Option<&ChatResponse>,
         usage: Option<Usage>,
         elapsed_ms: u128,
         streaming: bool,
@@ -179,6 +375,7 @@ impl BudgetedLlmClient {
             cached_tokens: 0,
             cache_creation_tokens: 0,
         });
+        let (tools_offered, tool_steps) = extract_tool_trace(req, resp);
         let sample = UsageSample {
             tag: self.turn_tag.lock().expect("turn_tag lock").clone(),
             role: self.role_label.lock().expect("role lock").clone(),
@@ -196,9 +393,20 @@ impl BudgetedLlmClient {
             msg_count: req.messages.len(),
             elapsed_ms,
             outcome: outcome.into(),
+            tools_offered,
+            tool_steps,
+        };
+        let tool_summary = if sample.tools_offered.is_empty() && sample.tool_steps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " tools_offered={} tool_steps={}",
+                sample.tools_offered.len(),
+                sample.tool_steps.len()
+            )
         };
         eprintln!(
-            "[eval-budget] call={} tag={} stream={} outcome={} prompt={} cached={} completion={} ms={}",
+            "[eval-budget] call={} tag={} stream={} outcome={} prompt={} cached={} completion={} ms={}{}",
             self.calls_used(),
             sample.tag,
             sample.streaming,
@@ -206,7 +414,8 @@ impl BudgetedLlmClient {
             sample.prompt_tokens,
             sample.cached_tokens,
             sample.completion_tokens,
-            sample.elapsed_ms
+            sample.elapsed_ms,
+            tool_summary
         );
         self.samples.lock().expect("samples lock").push(sample);
     }
@@ -222,16 +431,31 @@ impl LlmClient for BudgetedLlmClient {
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                self.record(&req, None, t0.elapsed().as_millis(), false, "client_error");
+                self.record(
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    false,
+                    "client_error",
+                );
                 return Err(e);
             }
             Err(_) => {
-                self.record(&req, None, t0.elapsed().as_millis(), false, "timeout");
+                self.record(
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    false,
+                    "timeout",
+                );
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
             &req,
+            Some(&resp),
             resp.usage.clone(),
             t0.elapsed().as_millis(),
             false,
@@ -253,16 +477,31 @@ impl LlmClient for BudgetedLlmClient {
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                self.record(&req, None, t0.elapsed().as_millis(), true, "client_error");
+                self.record(
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    true,
+                    "client_error",
+                );
                 return Err(e);
             }
             Err(_) => {
-                self.record(&req, None, t0.elapsed().as_millis(), true, "timeout");
+                self.record(
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    true,
+                    "timeout",
+                );
                 return Err(LlmError::Timeout);
             }
         };
         self.record(
             &req,
+            Some(&resp),
             resp.usage.clone(),
             t0.elapsed().as_millis(),
             true,
