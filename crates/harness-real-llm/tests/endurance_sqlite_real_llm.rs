@@ -186,16 +186,22 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn safe_error_summary(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
     let category = if error.contains("PlanParse") || error.contains("Plan 解析") {
         "plan_parse"
-    } else if error.to_ascii_lowercase().contains("timeout") || error.contains("超时") {
+    } else if lower.contains("timeout") || error.contains("超时") {
         "timeout"
-    } else if error.contains("rate limit") || error.contains("520") {
+    } else if lower.contains("rate limit") || error.contains("520") {
         "provider_transient"
-    } else if error.contains("LlmError") || error.contains("client_error") {
+    } else if error.contains("LlmError") || lower.contains("client_error") {
         "llm_client"
-    } else if error.contains("Storage") || error.contains("sqlite") {
+    } else if error.contains("Storage") || lower.contains("sqlite") {
         "storage"
+    } else if lower.contains("authority binding drifted")
+        || lower.contains("checkpoint")
+        || lower.contains("accepted-state")
+    {
+        "authority"
     } else {
         "pipeline"
     };
@@ -469,7 +475,20 @@ fn validate_sqlite_authority_values(
         .sqlite_authority
         .as_ref()
         .ok_or_else(|| "checkpoint is missing SQLite authority binding".to_string())?;
-    if recorded != actual {
+    // Accepted conversation prefix + committed turns are the hard identity of
+    // durable story progress. Campaign payload (context_epoch / chronicle_revision)
+    // may change during fill_campaign_runtime_from_sqlite before Accept; that
+    // rewrites accepted_content_sha256 without accepting a turn. Tolerate that
+    // only when chronicle advanced and the conversation binding is unchanged.
+    if recorded.committed_turns != actual.committed_turns
+        || recorded.accepted_conversation_nodes != actual.accepted_conversation_nodes
+        || recorded.accepted_conversation_sha256 != actual.accepted_conversation_sha256
+    {
+        return Err("SQLite accepted-state authority binding drifted from checkpoint".into());
+    }
+    if recorded.accepted_content_sha256 != actual.accepted_content_sha256
+        && chronicle_revision <= checkpoint.chronicle_revision
+    {
         return Err("SQLite accepted-state authority binding drifted from checkpoint".into());
     }
     Ok(())
@@ -3101,7 +3120,87 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
         accepted_content_sha256: "b".repeat(64),
         ..authority
     };
+    // Same chronicle with opaque payload drift is still fail-closed.
     assert!(validate_sqlite_authority_values(&checkpoint, 1, 1, &drifted).is_err());
+    // Context-epoch / chronicle fill rewrites campaign payload (accepted_content hash)
+    // without accepting turns; tolerate only when conversation binding is stable and
+    // chronicle advanced.
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 2, &drifted).is_ok());
+    let conversation_drifted = EnduranceSqliteAuthority {
+        accepted_conversation_sha256: "d".repeat(64),
+        ..authority
+    };
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 2, &conversation_drifted).is_err());
+}
+
+#[test]
+fn context_epoch_fill_may_rewrite_accepted_content_hash_without_blocking_retry() {
+    // Reproduces the live fail-closed path:
+    // fill_campaign_runtime_from_sqlite bumps chronicle/context_epoch → accepted_content
+    // hash changes → failed-attempt recovery must still rebind authority.
+    let dir = std::env::temp_dir().join(format!(
+        "sf-sqlite-context-fill-authority-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+    let env = SqliteHarnessEnv::bootstrap(dir.clone(), llm).unwrap();
+    let campaign_id = env.active_campaign_id().unwrap();
+    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap();
+    let conversation_id = campaign.conversation_id.clone().unwrap();
+    let mut checkpoint = EnduranceCheckpoint {
+        schema_version: EnduranceCheckpoint::schema_version().into(),
+        run_id: "run-coverage-00000000-0000-0000-0000-000000000654".into(),
+        stage: "coverage".into(),
+        accepted_turn_number: 0,
+        calls_used: 0,
+        max_calls: 220,
+        campaign_revision: campaign.revision,
+        chronicle_revision: campaign.chronicle_revision,
+        last_draft_hash16: String::new(),
+        last_summary_code: None,
+        context_epoch_id16: None,
+        early_fact_probe_ids: vec![],
+        early_fact_checked_passed: vec![],
+        campaign_id: Some(campaign_id.as_str().into()),
+        conversation_id: Some(conversation_id.as_str().into()),
+        data_dir_rel: Some("campaign_data".into()),
+        observed_epoch_ids16: vec![],
+        run_identity: None,
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
+        recorded_at_unix_ms: 0,
+    };
+    checkpoint.sqlite_authority = Some(capture_sqlite_authority_binding(&checkpoint).unwrap());
+    let before = checkpoint.sqlite_authority.clone().unwrap();
+
+    // Production fill path may persist epoch + chronicle before Accept.
+    let mut filled = campaign.clone();
+    filled.bump_chronicle_revision();
+    filled.name.push_str("-epoch-refresh");
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&filled).unwrap();
+
+    let after = capture_sqlite_authority_binding(&checkpoint).unwrap();
+    assert_ne!(
+        before.accepted_content_sha256, after.accepted_content_sha256,
+        "context fill must change accepted_content projection via campaign payload"
+    );
+    assert_eq!(before.accepted_conversation_sha256, after.accepted_conversation_sha256);
+    assert_eq!(before.committed_turns, after.committed_turns);
+
+    // Continuous turn start / failed-attempt rebind must not fail closed on this.
+    validate_live_sqlite_resume_authority(&checkpoint).unwrap();
+    validate_continuous_turn_start_authority(&checkpoint, 1).unwrap();
+
+    // Unrelated conversation drift remains fail-closed.
+    let mut conversation = storyforge_tauri_app::sqlite_runtime::get_conversation(&conversation_id)
+        .unwrap()
+        .unwrap();
+    conversation.append_message(Role::User, "forged accepted prefix".into());
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&conversation).unwrap();
+    assert!(validate_live_sqlite_resume_authority(&checkpoint).is_err());
 }
 
 #[test]
