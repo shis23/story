@@ -418,6 +418,27 @@ fn persist_checkpoint_and_integrity(
         validate_live_sqlite_resume_authority(checkpoint)?;
     }
     let mut bound = checkpoint.clone();
+    // Accept may be followed by production context fill / publication that
+    // advances chronicle_revision without changing accepted conversation.
+    // Rebind the durable checkpoint to the live monotone chronicle before seal.
+    if let Some(campaign_id) = bound.campaign_id.as_deref() {
+        let campaign_id = storyforge_domain::Id::from_str(campaign_id);
+        if let Some(campaign) = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+            .map_err(EnduranceError::Writer)?
+        {
+            if campaign.revision != bound.campaign_revision {
+                return Err(EnduranceError::InvalidConfig(
+                    "checkpoint campaign revision does not match live SQLite authority".into(),
+                ));
+            }
+            if campaign.chronicle_revision < bound.chronicle_revision {
+                return Err(EnduranceError::InvalidConfig(
+                    "SQLite chronicle revision regressed below checkpoint".into(),
+                ));
+            }
+            bound.chronicle_revision = campaign.chronicle_revision;
+        }
+    }
     bound.sqlite_authority = Some(capture_sqlite_authority_binding(&bound)?);
     write_checkpoint(&paths.checkpoint_jsonl, &bound)?;
     harness_real_llm::evidence_retention::write_checkpoint_integrity_baseline(&paths.root)
@@ -436,8 +457,10 @@ fn validate_sqlite_authority_values(
     if checkpoint.campaign_revision != campaign_revision {
         return Err("SQLite campaign revision does not match checkpoint".into());
     }
-    if checkpoint.chronicle_revision != chronicle_revision {
-        return Err("SQLite chronicle revision does not match checkpoint".into());
+    // fill_campaign_context / compressor may publish after Accept and
+    // monotonically bump chronicle_revision. Never allow regression.
+    if chronicle_revision < checkpoint.chronicle_revision {
+        return Err("SQLite chronicle revision regressed below checkpoint".into());
     }
     if actual.committed_turns != u64::from(checkpoint.accepted_turn_number) {
         return Err("SQLite committed-turn count does not match checkpoint".into());
@@ -489,11 +512,15 @@ fn capture_sqlite_authority_binding(
     let audit = storyforge_tauri_app::sqlite_runtime::capture_audit_snapshot()
         .map_err(EnduranceError::Writer)?;
     if checkpoint.campaign_revision != campaign.revision
-        || checkpoint.chronicle_revision != campaign.chronicle_revision
         || u64::from(checkpoint.accepted_turn_number) != audit.committed_turns
     {
         return Err(EnduranceError::InvalidConfig(
             "checkpoint revisions/count do not match live SQLite authority".into(),
+        ));
+    }
+    if campaign.chronicle_revision < checkpoint.chronicle_revision {
+        return Err(EnduranceError::InvalidConfig(
+            "SQLite chronicle revision regressed below checkpoint".into(),
         ));
     }
     Ok(EnduranceSqliteAuthority {
@@ -2136,6 +2163,23 @@ async fn run_sqlite_endurance_stage(
                 conversation_id.clone(),
             ))
             .map_err(EnduranceError::Writer)?;
+        // Production context fill can publish/compress and advance chronicle after
+        // Accept. Keep the durable runner cursor on the live monotone value so
+        // turn-audit authority binding does not fail closed on an expected bump.
+        let live_campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+            .map_err(EnduranceError::Writer)?
+            .ok_or_else(|| EnduranceError::Writer("campaign missing after context fill".into()))?;
+        if live_campaign.revision != last_campaign_revision {
+            return Err(EnduranceError::InvalidConfig(
+                "campaign revision drifted during post-accept context fill".into(),
+            ));
+        }
+        if live_campaign.chronicle_revision < last_chronicle_revision {
+            return Err(EnduranceError::InvalidConfig(
+                "SQLite chronicle revision regressed during post-accept context fill".into(),
+            ));
+        }
+        last_chronicle_revision = live_campaign.chronicle_revision;
         let epoch_id16 = ctx
             .context_epoch
             .as_ref()
@@ -2153,7 +2197,7 @@ async fn run_sqlite_endurance_stage(
             campaign_revision_before: written.accept.campaign_revision_before,
             campaign_revision_after: written.accept.campaign_revision_after,
             chronicle_revision_before: written.accept.chronicle_revision_before,
-            chronicle_revision_after: written.accept.chronicle_revision_after,
+            chronicle_revision_after: last_chronicle_revision,
             summary_code: written.accept.summary_code.clone(),
             draft_hash16: last_draft_hash16.clone(),
             text_len: written.draft_text.chars().count(),
@@ -3048,12 +3092,91 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
     };
     checkpoint.sqlite_authority = Some(authority.clone());
     assert!(validate_sqlite_authority_values(&checkpoint, 1, 1, &authority).is_ok());
+    // Monotone chronicle advance after Accept/context-fill is allowed.
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 2, &authority).is_ok());
     assert!(validate_sqlite_authority_values(&checkpoint, 2, 1, &authority).is_err());
+    // Chronicle must never regress.
+    assert!(validate_sqlite_authority_values(&checkpoint, 1, 0, &authority).is_err());
     let drifted = EnduranceSqliteAuthority {
         accepted_content_sha256: "b".repeat(64),
         ..authority
     };
     assert!(validate_sqlite_authority_values(&checkpoint, 1, 1, &drifted).is_err());
+}
+
+#[test]
+fn turn_audit_rebinding_allows_monotonic_chronicle_after_context_fill() {
+    let dir = std::env::temp_dir().join(format!(
+        "sf-sqlite-chronicle-advance-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
+    let env = SqliteHarnessEnv::bootstrap(dir.clone(), llm).unwrap();
+    let campaign_id = env.active_campaign_id().unwrap();
+    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
+        .unwrap()
+        .unwrap();
+    let conversation_id = campaign.conversation_id.clone().unwrap();
+    let mut checkpoint = EnduranceCheckpoint {
+        schema_version: EnduranceCheckpoint::schema_version().into(),
+        run_id: "run-coverage-00000000-0000-0000-0000-000000000321".into(),
+        stage: "coverage".into(),
+        accepted_turn_number: 0,
+        calls_used: 0,
+        max_calls: 220,
+        campaign_revision: campaign.revision,
+        chronicle_revision: campaign.chronicle_revision,
+        last_draft_hash16: String::new(),
+        last_summary_code: None,
+        context_epoch_id16: None,
+        early_fact_probe_ids: vec![],
+        early_fact_checked_passed: vec![],
+        campaign_id: Some(campaign_id.as_str().into()),
+        conversation_id: Some(conversation_id.as_str().into()),
+        data_dir_rel: Some("campaign_data".into()),
+        observed_epoch_ids16: vec![],
+        run_identity: None,
+        retry_state: None,
+        probe_state: EnduranceProbeState::default(),
+        sqlite_authority: None,
+        recorded_at_unix_ms: 0,
+    };
+    checkpoint.sqlite_authority = Some(capture_sqlite_authority_binding(&checkpoint).unwrap());
+
+    let mut advanced = campaign.clone();
+    advanced.bump_chronicle_revision();
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&advanced).unwrap();
+    assert!(
+        advanced.chronicle_revision > checkpoint.chronicle_revision,
+        "fixture must actually advance chronicle"
+    );
+
+    // Capture against an unbound checkpoint is allowed when only chronicle advanced.
+    let mut unbound = checkpoint.clone();
+    unbound.sqlite_authority = None;
+    unbound.chronicle_revision = advanced.chronicle_revision;
+    let actual = capture_sqlite_authority_binding(&unbound).unwrap();
+    assert_eq!(actual.committed_turns, 0);
+    unbound.sqlite_authority = Some(actual.clone());
+    validate_sqlite_authority_values(
+        &unbound,
+        advanced.revision,
+        advanced.chronicle_revision,
+        &actual,
+    )
+    .unwrap();
+
+    // Turn-audit checkpoints are rebound with sqlite_authority=None, same as production.
+    let paths = EnduranceEvidencePaths::new(dir.clone());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut turn_audit = checkpoint.clone();
+    turn_audit.sqlite_authority = None;
+    persist_checkpoint_and_integrity(&paths, &turn_audit, "turn-audit").unwrap();
+    let rebound = read_latest_checkpoint(&paths.checkpoint_jsonl).unwrap();
+    assert_eq!(rebound.campaign_revision, advanced.revision);
+    assert_eq!(rebound.chronicle_revision, advanced.chronicle_revision);
+    assert!(rebound.sqlite_authority.is_some());
+    validate_live_sqlite_resume_authority(&rebound).unwrap();
 }
 
 #[test]
