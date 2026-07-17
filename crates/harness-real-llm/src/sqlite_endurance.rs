@@ -378,6 +378,16 @@ impl SqliteHarnessEnv {
             let mut g = self.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
             g.campaign_runtime = None;
         }
+        // Production-faithful Prompt Module path: GUI fills active profile/modules before
+        // writing. Endurance previously used WritingContext::legacy (profile=None, modules=[]),
+        // so ReasoningMode::Prompted never injected role-specific CoT. Install the built-in
+        // default profile whenever the caller left modules empty.
+        if ctx.profile.is_none() || ctx.modules.is_empty() {
+            let (profile, modules) =
+                storyforge_domain::prompt_module::builtins::default_profile();
+            ctx.profile = Some(profile);
+            ctx.modules = modules;
+        }
         let Some(active_id) = self.active_campaign_id() else {
             return Ok(ctx);
         };
@@ -1564,6 +1574,46 @@ mod tests {
         {
             Err(storyforge_domain::llm::LlmError::Timeout)
         }
+    }
+
+    #[test]
+    fn fill_campaign_context_installs_default_prompt_profile_when_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "sf-endurance-prompt-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let env = SqliteHarnessEnv::bootstrap(dir.clone(), Arc::new(AlwaysFailLlmClient))
+            .expect("bootstrap");
+        let base = WritingContext::legacy(vec![], None, Id::new());
+        assert!(base.profile.is_none());
+        assert!(base.modules.is_empty());
+        let filled = env
+            .fill_campaign_context(base)
+            .expect("fill_campaign_context");
+        assert!(
+            filled.profile.is_some(),
+            "default PromptProfile must be installed for Prompted CoT"
+        );
+        assert!(
+            !filled.modules.is_empty(),
+            "builtin prompt modules must be installed"
+        );
+        let director_cot = filled
+            .profile
+            .as_ref()
+            .unwrap()
+            .selected_ids(
+                &storyforge_domain::agent::AgentRole::Director,
+                &storyforge_domain::prompt_module::ModuleCategory::Cot,
+            );
+        assert_eq!(
+            director_cot.first().map(|id| id.as_str()),
+            Some("builtin-cot-director-plan"),
+            "Director must select role-specific planning CoT"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
