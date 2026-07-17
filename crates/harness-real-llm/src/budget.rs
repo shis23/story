@@ -864,7 +864,8 @@ mod tests {
 
         let effective = client.effective_request(&source);
         assert_eq!(effective.params.reasoning, ReasoningMode::Native);
-        assert_eq!(source.params.reasoning, ReasoningMode::Disabled);
+        // SamplingParams::default 现为 Prompted；override 只改 effective 请求
+        assert_eq!(source.params.reasoning, ReasoningMode::Prompted);
     }
 
     #[tokio::test]

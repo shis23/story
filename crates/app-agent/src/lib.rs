@@ -23,7 +23,9 @@ pub use chronicle_compressor::{
     parse_compress_group_texts, plan_level_batch, publish_with_deterministic_texts,
     run_compress_if_needed,
 };
-pub use pipeline_postprocess::{PostProcessOutcome, run_postprocess_pipeline};
+pub use pipeline_postprocess::{
+    PostProcessOutcome, run_postprocess_pipeline, run_postprocess_pipeline_with_prompt,
+};
 pub use prompts::character_extractor::{
     CHARACTER_EXTRACTOR_SYSTEM_PROMPT, build_character_extractor_user_msg,
     make_character_extractor_config, register_character_extractor_tools,

@@ -50,11 +50,14 @@ pub enum LlmProtocol {
 /// 架构文档 §3 P1 + §6.2：原生 reasoning 与提示式 CoT 不可同时启用。
 /// 此枚举是单一事实来源；`build_request_body` 和 CoT 模块选择都读它。
 ///
-/// - `Disabled`：不启用任何推理引导（默认）。
+/// - `Disabled`：不启用任何推理引导。
 /// - `Native`：使用厂商原生 thinking/reasoning（如 DeepSeek-R1、Claude extended thinking）。
 ///   此时 CoT 提示模块**不会**注入系统提示，避免双重推理。
-/// - `Prompted`：使用提示词内嵌的思维链指引（`builtin-cot-generic`）。
+/// - `Prompted`：使用提示词内嵌的思维链指引（角色化 CoT 模块）。
 ///   此时请求体**不**带 thinking/reasoning 字段。
+///
+/// 枚举 `Default` 仍为 `Disabled`，保证旧 JSON 缺字段反序列化不改语义；
+/// 新建连接 / `SamplingParams::default()` 的产品默认见采样参数默认值（Prompted）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningMode {
     #[default]
@@ -100,7 +103,8 @@ impl Default for SamplingParams {
             // still leaked into connection records and direct request consumers.
             max_tokens: None,
             max_tokens_explicit: false,
-            reasoning: ReasoningMode::default(),
+            // 产品默认走 Prompted：注入角色化 CoT；旧连接 JSON 缺字段仍反序列化为 Disabled。
+            reasoning: ReasoningMode::Prompted,
             extra: None,
         }
     }
@@ -542,18 +546,19 @@ mod tests {
 
     #[test]
     fn reasoning_mode_default_is_disabled() {
+        // 枚举 Default 保持 Disabled，服务旧 JSON 缺字段
         assert_eq!(ReasoningMode::default(), ReasoningMode::Disabled);
     }
 
     #[test]
-    fn sampling_params_default_reasoning_is_disabled() {
+    fn sampling_params_default_reasoning_is_prompted() {
         let params = SamplingParams::default();
-        assert_eq!(params.reasoning, ReasoningMode::Disabled);
+        assert_eq!(params.reasoning, ReasoningMode::Prompted);
     }
 
     #[test]
     fn sampling_params_backward_compat_no_reasoning_field() {
-        // 旧 JSON 不含 reasoning 字段 → 反序列化为 Disabled
+        // 旧 JSON 不含 reasoning 字段 → 反序列化为 Disabled（非产品新建默认）
         let json = r#"{"temperature":1.0,"top_p":0.95,"max_tokens":4096}"#;
         let params: SamplingParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.reasoning, ReasoningMode::Disabled);

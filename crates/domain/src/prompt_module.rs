@@ -650,13 +650,18 @@ pub mod builtins {
     use super::*;
     use std::collections::HashMap;
 
-    /// 所有 Agent 角色
+    /// 创作三角 + 摘要（全角色化 CoT 适用面）
     fn all_roles() -> Vec<AgentRole> {
         vec![
             AgentRole::Director,
             AgentRole::Editor,
             AgentRole::Subagent("*".into()),
+            AgentRole::Summarizer,
         ]
+    }
+
+    fn director_only() -> Vec<AgentRole> {
+        vec![AgentRole::Director]
     }
 
     /// 编剧 Agent
@@ -664,12 +669,20 @@ pub mod builtins {
         vec![AgentRole::Editor]
     }
 
+    fn subagent_only() -> Vec<AgentRole> {
+        vec![AgentRole::Subagent("*".into())]
+    }
+
+    fn summarizer_only() -> Vec<AgentRole> {
+        vec![AgentRole::Summarizer]
+    }
+
     /// 编剧 + 子 Agent
     fn editor_and_subagent() -> Vec<AgentRole> {
         vec![AgentRole::Editor, AgentRole::Subagent("*".into())]
     }
 
-    /// 预置模块列表（6 个核心模块）
+    /// 预置模块列表（角色化 CoT + 文风/输出）
     pub fn preset_modules() -> Vec<PromptModule> {
         vec![
             // 1. 视角：第三人称（最常用）
@@ -705,28 +718,71 @@ pub mod builtins {
                 applicable_roles: editor_only(),
                 tags: vec!["约束".into(), "杀八股".into()],
             },
-            // 4. CoT：通用思维链（不绑定特定模型）
+            // 4. CoT：通用兜底（手绑用；不进 default profile）
             PromptModule {
                 id: Id::from_str("builtin-cot-generic"),
                 name: "通用思维链".into(),
                 category: ModuleCategory::Cot,
-                content: "【思考指引】\n在输出正文前，先在内部思考：\n1. 当前场景的核心冲突是什么？\n2. 各角色此刻的情绪状态和下一步动机\n3. 有哪些伏笔可以呼应？\n4. 上一段的结尾是什么？如何自然衔接？\n思考完毕后，直接输出正文，不要输出思考过程。".into(),
+                content: "【思考指引】\n在输出前内部确认：目标产物是什么、有哪些硬约束、有哪些不可跨越的信息边界。想清楚后只输出目标产物，不要输出思考过程。".into(),
                 exclusivity: Exclusivity::Single,
                 source: ModuleSource::BuiltIn,
                 applicable_roles: all_roles(),
                 tags: vec!["CoT".into(), "通用".into()],
             },
-
-            // 4b. CoT：场景清单五步（梁元结构吸收，仅 Prompted 注入）
+            // 4b. CoT：导演规划（梁元意图/结构/待决吸收；仅 Director）
+            PromptModule {
+                id: Id::from_str("builtin-cot-director-plan"),
+                name: "导演规划五步".into(),
+                category: ModuleCategory::Cot,
+                content: "【思考指引：导演规划】（内部完成，不要输出思考过程）\n1. 意图：解析用户输入的何时/何人/何事与言外之意；本轮可承诺什么。\n2. 结构：对照近期节拍，避免同构复读；必要时换推进角度。\n3. 待决：列 2–4 个待决项，每项≥2 选项，按不降智、动机驱动、本场不一次解决选定；写清冲突、对立目标、节拍与必须留下的未决。\n4. 分派：每人知/不知/误解；子任务只给合法可知信息；character_id 用实例 id（可先 list_characters 再 get_character）；禁止跨角色私密全知。\n5. 出口：只输出 Plan（scene_brief + ScenePlan + subagent_tasks）。任务可填 desire/at_hand/move。禁止正文、总结腔、元叙述。".into(),
+                exclusivity: Exclusivity::Single,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: director_only(),
+                tags: vec!["CoT".into(), "导演".into(), "梁元结构".into()],
+            },
+            // 4c. 兼容旧 id：场景清单五步 → 导演规划（避免旧 profile 选中后失语）
             PromptModule {
                 id: Id::from_str("builtin-cot-scene-checklist"),
                 name: "场景清单五步".into(),
                 category: ModuleCategory::Cot,
-                content: "【思考指引：场景清单】\n在输出前按五步内部思考（不要输出思考过程）：\n1. 解析用户意图：何时、何人、何事与言外之意。\n2. 对照近期结构，避免重复套路，必要时换推进角度。\n3. 情节待决：冲突、对立目标、节拍、本场不得一次解决的问题。\n4. 知识边界：每人知/不知/误解；禁止跨角色私密全知。\n5. 文风与可检项：避免破折号堆砌、否后肯、元叙述；然后只输出 Plan 或正文。".into(),
+                content: "【思考指引：导演规划】（内部完成，不要输出思考过程）\n1. 意图：解析用户输入的何时/何人/何事与言外之意；本轮可承诺什么。\n2. 结构：对照近期节拍，避免同构复读；必要时换推进角度。\n3. 待决：列 2–4 个待决项，每项≥2 选项，按不降智、动机驱动、本场不一次解决选定；写清冲突、对立目标、节拍与必须留下的未决。\n4. 分派：每人知/不知/误解；子任务只给合法可知信息；character_id 用实例 id（可先 list_characters 再 get_character）；禁止跨角色私密全知。\n5. 出口：只输出 Plan（scene_brief + ScenePlan + subagent_tasks）。任务可填 desire/at_hand/move。禁止正文、总结腔、元叙述。".into(),
                 exclusivity: Exclusivity::Single,
                 source: ModuleSource::BuiltIn,
-                applicable_roles: all_roles(),
-                tags: vec!["CoT".into(), "场景清单".into(), "梁元结构".into()],
+                applicable_roles: director_only(),
+                tags: vec!["CoT".into(), "场景清单".into(), "梁元结构".into(), "兼容".into()],
+            },
+            // 4d. CoT：编剧合并（反总结腔）
+            PromptModule {
+                id: Id::from_str("builtin-cot-editor-merge"),
+                name: "编剧合并三步".into(),
+                category: ModuleCategory::Cot,
+                content: "【思考指引：编剧合并】（内部完成，不要输出思考过程）\n1. 材料：Plan 的冲突/节拍；各表演谁在场、谁推进、谁只反应。\n2. 舞台：选定唯一叙述焦点；用动作与对白推进，不旁白解释剧情功能。\n3. 出口检查后只输出正文：禁止「本轮推进了…」「人物关系上…」「场景意义在于…」等总结/说明腔；禁止作者评论、预告、盘点；不写角色不知之事；不为凑字复读上一段。不要输出思考、标题或编辑说明。".into(),
+                exclusivity: Exclusivity::Single,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: editor_only(),
+                tags: vec!["CoT".into(), "编剧".into(), "反总结腔".into()],
+            },
+            // 4e. CoT：子 Agent 表演（梁元活人化压缩）
+            PromptModule {
+                id: Id::from_str("builtin-cot-subagent-perform"),
+                name: "角色表演四步".into(),
+                category: ModuleCategory::Cot,
+                content: "【思考指引：角色表演】（内部完成，不要输出思考过程）\n1. 我是谁：身份、当下情绪、与在场者关系；at_hand（正在做的事）。\n2. 我要什么：一个与用户指令无关的、自私而具体的即时欲望（desire）；它如何与任务角力。\n3. 我知什么：只用合法可知信息；不知则猜错、回避或追问；不替他人独白。\n4. 我怎么动：一个主动、可被看见的动作/对白（move）。只输出「我」的表演片段，不写他角完整心理、不写上帝全景、不写本轮剧情总结。".into(),
+                exclusivity: Exclusivity::Single,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: subagent_only(),
+                tags: vec!["CoT".into(), "子Agent".into(), "活人化".into()],
+            },
+            // 4f. CoT：摘要抽取
+            PromptModule {
+                id: Id::from_str("builtin-cot-summarizer-extract"),
+                name: "摘要抽取".into(),
+                category: ModuleCategory::Cot,
+                content: "【思考指引：摘要抽取】（内部完成，不要输出思考）\n1. 只圈本轮新发生：关系转折 > 关键事件 > 目标变化 > 冲突 > 道具/地点/时间 > 未决伏笔。\n2. 丢掉气氛描写与重复信息；不展望、不复述前情、不加评论。\n3. 压缩到 200–500 字后，只输出摘要正文。".into(),
+                exclusivity: Exclusivity::Single,
+                source: ModuleSource::BuiltIn,
+                applicable_roles: summarizer_only(),
+                tags: vec!["CoT".into(), "摘要".into()],
             },
             // 5. 输出规范：字数控制
             PromptModule {
@@ -749,15 +805,15 @@ pub mod builtins {
         // 构建 selections：每个 Agent 选中哪些模块
         let mut selections = HashMap::new();
 
-        // 导演：选中 CoT
+        // 导演：角色化规划 CoT
         let mut director_cats = HashMap::new();
         director_cats.insert(
             ModuleCategory::Cot,
-            vec![Id::from_str("builtin-cot-scene-checklist")],
+            vec![Id::from_str("builtin-cot-director-plan")],
         );
         selections.insert(AgentRole::Director, director_cats);
 
-        // 编剧：选中 第三人称 + 白描 + 杀八股 + 字数控制
+        // 编剧：第三人称 + 白描 + 杀八股 + 合并 CoT + 字数控制
         let mut editor_cats = HashMap::new();
         editor_cats.insert(
             ModuleCategory::Perspective,
@@ -772,18 +828,34 @@ pub mod builtins {
             vec![Id::from_str("builtin-quality-kill-bagu")],
         );
         editor_cats.insert(
+            ModuleCategory::Cot,
+            vec![Id::from_str("builtin-cot-editor-merge")],
+        );
+        editor_cats.insert(
             ModuleCategory::Output,
             vec![Id::from_str("builtin-output-word-count")],
         );
         selections.insert(AgentRole::Editor, editor_cats);
 
-        // 子 Agent：选中 字数控制
+        // 子 Agent：表演 CoT + 字数控制
         let mut sub_cats = HashMap::new();
+        sub_cats.insert(
+            ModuleCategory::Cot,
+            vec![Id::from_str("builtin-cot-subagent-perform")],
+        );
         sub_cats.insert(
             ModuleCategory::Output,
             vec![Id::from_str("builtin-output-word-count")],
         );
         selections.insert(AgentRole::Subagent("*".into()), sub_cats);
+
+        // 摘要：抽取 CoT
+        let mut sum_cats = HashMap::new();
+        sum_cats.insert(
+            ModuleCategory::Cot,
+            vec![Id::from_str("builtin-cot-summarizer-extract")],
+        );
+        selections.insert(AgentRole::Summarizer, sum_cats);
 
         let profile = PromptProfile {
             id: Id::from_str("builtin-default-v1"),
@@ -803,7 +875,8 @@ pub mod builtins {
         #[test]
         fn test_preset_modules_count() {
             let modules = preset_modules();
-            assert_eq!(modules.len(), 6);
+            // perspective/style/quality + generic + director + scene-compat + editor + sub + summarizer + word-count
+            assert_eq!(modules.len(), 10);
         }
 
         #[test]
@@ -818,11 +891,15 @@ pub mod builtins {
         fn test_default_profile_bindings() {
             let (profile, _modules) = default_profile();
 
-            // 导演应有 CoT
+            // 导演：角色化规划 CoT
             let director_cot = profile.selected_ids(&AgentRole::Director, &ModuleCategory::Cot);
             assert_eq!(director_cot.len(), 1);
+            assert_eq!(
+                director_cot[0],
+                Id::from_str("builtin-cot-director-plan")
+            );
 
-            // 编剧应有 视角 + 文风 + 质量 + 输出
+            // 编剧：视角 + 文风 + 质量 + 合并 CoT + 输出
             let editor_persp =
                 profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Perspective);
             assert_eq!(editor_persp.len(), 1);
@@ -830,13 +907,28 @@ pub mod builtins {
             assert_eq!(editor_style.len(), 1);
             let editor_quality = profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Quality);
             assert_eq!(editor_quality.len(), 1);
+            let editor_cot = profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Cot);
+            assert_eq!(editor_cot.len(), 1);
+            assert_eq!(editor_cot[0], Id::from_str("builtin-cot-editor-merge"));
             let editor_output = profile.selected_ids(&AgentRole::Editor, &ModuleCategory::Output);
             assert_eq!(editor_output.len(), 1);
 
-            // 子 Agent 应有 输出
+            // 子 Agent：表演 CoT + 输出
+            let sub_cot =
+                profile.selected_ids(&AgentRole::Subagent("*".into()), &ModuleCategory::Cot);
+            assert_eq!(sub_cot.len(), 1);
+            assert_eq!(sub_cot[0], Id::from_str("builtin-cot-subagent-perform"));
             let sub_output =
                 profile.selected_ids(&AgentRole::Subagent("*".into()), &ModuleCategory::Output);
             assert_eq!(sub_output.len(), 1);
+
+            // 摘要：抽取 CoT
+            let sum_cot = profile.selected_ids(&AgentRole::Summarizer, &ModuleCategory::Cot);
+            assert_eq!(sum_cot.len(), 1);
+            assert_eq!(
+                sum_cot[0],
+                Id::from_str("builtin-cot-summarizer-extract")
+            );
         }
 
         #[test]
@@ -892,8 +984,52 @@ pub mod builtins {
                 &crate::llm::ReasoningMode::Prompted,
             );
             assert!(
-                assembled.contains("思考指引"),
-                "Prompted 模式应注入 CoT 提示，实际: {assembled}"
+                assembled.contains("思考指引") && assembled.contains("导演规划"),
+                "Prompted 模式应注入导演规划 CoT，实际: {assembled}"
+            );
+        }
+
+        #[test]
+        fn test_assemble_prompted_editor_and_subagent_and_summarizer_cot() {
+            let (profile, modules) = default_profile();
+
+            let editor = assemble_system_prompt(
+                &AgentRole::Editor,
+                "你是编剧。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Prompted,
+            );
+            assert!(
+                editor.contains("编剧合并") && editor.contains("总结/说明腔"),
+                "Editor Prompted 应注入合并 CoT: {editor}"
+            );
+
+            let sub = assemble_system_prompt(
+                &AgentRole::Subagent("inst-1".into()),
+                "你是角色。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Prompted,
+            );
+            assert!(
+                sub.contains("角色表演") && sub.contains("desire"),
+                "Subagent Prompted 应注入表演 CoT: {sub}"
+            );
+
+            let sum = assemble_system_prompt(
+                &AgentRole::Summarizer,
+                "你是摘要。",
+                Some(&profile),
+                &modules,
+                "",
+                &crate::llm::ReasoningMode::Prompted,
+            );
+            assert!(
+                sum.contains("摘要抽取") && sum.contains("200–500"),
+                "Summarizer Prompted 应注入抽取 CoT: {sum}"
             );
         }
 

@@ -5602,7 +5602,7 @@ pub struct CreateConnectionDto {
     #[serde(default)]
     pub max_tokens_explicit: bool,
     /// A1：推理模式 "disabled" / "native" / "prompted"。
-    /// 默认 disabled。native = 使用厂商原生 thinking（自动注入），同时抑制 CoT 提示模块。
+    /// 默认 prompted（角色化 CoT）。native = 厂商原生 thinking，同时抑制 CoT 提示模块。
     #[serde(default)]
     pub reasoning: Option<String>,
     /// 厂商扩展参数（P3-3），透传到请求体顶层。key=字段名(如 thinking/reasoning_effort),
@@ -5640,9 +5640,13 @@ async fn create_connection(
                 .map(|s| match s {
                     "native" | "Native" => storyforge_domain::llm::ReasoningMode::Native,
                     "prompted" | "Prompted" => storyforge_domain::llm::ReasoningMode::Prompted,
-                    _ => storyforge_domain::llm::ReasoningMode::Disabled,
+                    "disabled" | "Disabled" | "off" | "none" => {
+                        storyforge_domain::llm::ReasoningMode::Disabled
+                    }
+                    _ => storyforge_domain::llm::ReasoningMode::Prompted,
                 })
-                .unwrap_or_default(),
+                // 新建连接默认 Prompted（与 SamplingParams::default 一致）
+                .unwrap_or(storyforge_domain::llm::ReasoningMode::Prompted),
             extra: req.extra,
         },
         tool_mode,

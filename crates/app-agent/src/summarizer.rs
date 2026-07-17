@@ -7,9 +7,12 @@ use tokio::sync::watch;
 use tracing::info;
 
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
-use storyforge_domain::llm::ChatResponse;
+use storyforge_domain::llm::{ChatResponse, ReasoningMode};
+use storyforge_domain::prompt_module::{PromptModule, PromptProfile};
 
-use crate::prompts::{build_summarizer_user_msg, make_summarizer_config};
+use crate::prompts::{
+    build_summarizer_user_msg, make_summarizer_config, make_summarizer_config_with_prompt,
+};
 use crate::runtime::AgentRuntime;
 use crate::tools::ToolRegistry;
 use crate::{AgentConfig, AgentError};
@@ -32,7 +35,38 @@ pub async fn run_summarizer(
     cancel: watch::Receiver<bool>,
     agent_profile_config: Option<&AgentProfileConfig>,
 ) -> Result<String, SummarizerError> {
-    let config: AgentConfig = make_summarizer_config(agent_profile_config);
+    run_summarizer_with_prompt(
+        runtime,
+        final_text,
+        scene_brief,
+        turn,
+        cancel,
+        agent_profile_config,
+        None,
+        &[],
+        &ReasoningMode::Disabled,
+    )
+    .await
+}
+
+/// 带 Prompt Module 的总结入口：Prompted 时注入摘要抽取 CoT。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_summarizer_with_prompt(
+    runtime: &AgentRuntime,
+    final_text: &str,
+    scene_brief: &str,
+    turn: u32,
+    cancel: watch::Receiver<bool>,
+    agent_profile_config: Option<&AgentProfileConfig>,
+    profile: Option<&PromptProfile>,
+    modules: &[PromptModule],
+    reasoning: &ReasoningMode,
+) -> Result<String, SummarizerError> {
+    let config: AgentConfig = if profile.is_some() || !modules.is_empty() {
+        make_summarizer_config_with_prompt(agent_profile_config, profile, modules, reasoning)
+    } else {
+        make_summarizer_config(agent_profile_config)
+    };
     let user_msg = build_summarizer_user_msg(final_text, scene_brief, turn);
     let registry = ToolRegistry::new(); // 总结 Agent 无工具，纯输出文本
 

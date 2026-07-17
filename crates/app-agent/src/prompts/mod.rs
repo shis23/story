@@ -20,4 +20,7 @@ pub use postprocess::{
     POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, build_postprocess_user_msg_with_summary,
     make_postprocess_config, register_postprocess_tools,
 };
-pub use summarizer::{SUMMARIZER_SYSTEM_PROMPT, build_summarizer_user_msg, make_summarizer_config};
+pub use summarizer::{
+    SUMMARIZER_SYSTEM_PROMPT, build_summarizer_user_msg, make_summarizer_config,
+    make_summarizer_config_with_prompt,
+};

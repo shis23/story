@@ -14,10 +14,12 @@ use tracing::{info, warn};
 
 use storyforge_domain::agent::PostProcessResult;
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
+use storyforge_domain::llm::ReasoningMode;
+use storyforge_domain::prompt_module::{PromptModule, PromptProfile};
 
 use crate::postprocess::{PostProcessError, run_postprocess};
 use crate::runtime::AgentRuntime;
-use crate::summarizer::{SummarizerError, run_summarizer};
+use crate::summarizer::{SummarizerError, run_summarizer_with_prompt};
 
 /// 后处理并行编排的产出
 ///
@@ -59,6 +61,45 @@ pub async fn run_postprocess_pipeline(
     agent_profile_config: Option<&AgentProfileConfig>,
     recent_summary_block: Option<&str>,
 ) -> PostProcessOutcome {
+    run_postprocess_pipeline_with_prompt(
+        runtime,
+        final_text,
+        scene_brief,
+        present_characters,
+        variable_keys,
+        turn,
+        story_clock,
+        cancel,
+        enable_postprocess,
+        enable_summarizer,
+        agent_profile_config,
+        recent_summary_block,
+        None,
+        &[],
+        &ReasoningMode::Disabled,
+    )
+    .await
+}
+
+/// 同 `run_postprocess_pipeline`，可注入 Prompt Module（Summarizer 的 Prompted CoT）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_postprocess_pipeline_with_prompt(
+    runtime: &AgentRuntime,
+    final_text: &str,
+    scene_brief: &str,
+    present_characters: &[String],
+    variable_keys: &[String],
+    turn: u32,
+    story_clock: &str,
+    cancel: watch::Receiver<bool>,
+    enable_postprocess: bool,
+    enable_summarizer: bool,
+    agent_profile_config: Option<&AgentProfileConfig>,
+    recent_summary_block: Option<&str>,
+    prompt_profile: Option<&PromptProfile>,
+    prompt_modules: &[PromptModule],
+    reasoning: &ReasoningMode,
+) -> PostProcessOutcome {
     // 各 clone 一份 cancel 给两个子任务
     let cancel_summary = cancel.clone();
     let cancel_postproc = cancel.clone();
@@ -85,13 +126,16 @@ pub async fn run_postprocess_pipeline(
             info!(target: "postprocess-pipeline", "剧情总结已被 AgentProfileConfig 关闭，跳过");
             return None;
         }
-        match run_summarizer(
+        match run_summarizer_with_prompt(
             runtime,
             &final_for_summary,
             &scene_for_summary,
             turn,
             cancel_summary,
             agent_profile_config,
+            prompt_profile,
+            prompt_modules,
+            reasoning,
         )
         .await
         {

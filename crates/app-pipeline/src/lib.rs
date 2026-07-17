@@ -101,6 +101,22 @@ const EDITOR_SYSTEM_PROMPT: &str = r#"你是编剧。收集所有子 Agent 的�
 
 const SUBAGENT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是角色 {name}。根据导演给你的任务和专属上下文，演出你这个角色在这场戏的行为/对白/心理。只演你自己，不要替别人说话。输出纯表演，不要解释。"#;
 
+/// 组装子 Agent 的 base system（含 Prompted 时的表演 CoT / 字数等模块）。
+fn assemble_subagent_base_prompt(
+    profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+    modules: &[storyforge_domain::prompt_module::PromptModule],
+    reasoning: &storyforge_domain::llm::ReasoningMode,
+) -> String {
+    storyforge_domain::prompt_module::assemble_system_prompt(
+        &AgentRole::Subagent("*".into()),
+        SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
+        profile,
+        modules,
+        "",
+        reasoning,
+    )
+}
+
 // ─── 重 roll 请求（应用层 DTO，对应设计 §3.7.3）────────────────────────────
 
 /// 重 roll 请求
@@ -876,11 +892,16 @@ impl PipelineOrchestrator {
             FAR_MEMORY_INJECT_LIMIT,
             &recent_texts,
         );
+        let subagent_base = assemble_subagent_base_prompt(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &self.reasoning_mode(),
+        );
         let subagent_results = spawn_subagents(
             plan.subagent_tasks.clone(),
             self.runtime.clone(),
             &director_config,
-            SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
+            &subagent_base,
             cancel.clone(),
             event_tx.clone(),
             effective_runtime,
@@ -1140,7 +1161,7 @@ impl PipelineOrchestrator {
             &ctx.recent_summaries,
             RECENT_SUMMARIES_INJECT_LIMIT,
         );
-        let mut outcome = storyforge_app_agent::run_postprocess_pipeline(
+        let mut outcome = storyforge_app_agent::run_postprocess_pipeline_with_prompt(
             &self.runtime,
             final_text,
             scene_brief,
@@ -1153,6 +1174,9 @@ impl PipelineOrchestrator {
             enable_summarizer,
             ctx.agent_profile_config.as_ref(),
             summary_block.as_deref(),
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &self.reasoning_mode(),
         )
         .await;
 
@@ -1549,11 +1573,16 @@ impl PipelineOrchestrator {
                 FAR_MEMORY_INJECT_LIMIT,
                 &recent_texts,
             );
+            let subagent_base = assemble_subagent_base_prompt(
+                ctx.profile.as_ref(),
+                &ctx.modules,
+                &self.reasoning_mode(),
+            );
             let subagent_results = spawn_subagents(
                 plan.subagent_tasks.clone(),
                 self.runtime.clone(),
                 &director_config,
-                SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
+                &subagent_base,
                 cancel.clone(),
                 event_tx.clone(),
                 effective_runtime,
@@ -1713,9 +1742,14 @@ impl PipelineOrchestrator {
                 // 重跑该子 Agent（单任务，注入 hint 到 system prompt）
                 let new_perf = {
                     // §22 cache 友好布局：persona + 常驻世界设定进 system，场景/相关设定/最近对话 + 任务 + hint 进 tail
+                    let subagent_base = assemble_subagent_base_prompt(
+                        ctx.profile.as_ref(),
+                        &ctx.modules,
+                        &self.reasoning_mode(),
+                    );
                     let stable_system = format!(
                         "{}\n\n你是角色 {}。\n\n{}",
-                        SUBAGENT_SYSTEM_PROMPT_TEMPLATE,
+                        subagent_base,
                         target_task.character_id,
                         format_subagent_context_stable(&target_task.context_package),
                     );

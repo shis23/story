@@ -7,6 +7,8 @@
 
 use storyforge_domain::agent::AgentRole;
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
+use storyforge_domain::llm::ReasoningMode;
+use storyforge_domain::prompt_module::{self, PromptModule, PromptProfile};
 
 use crate::AgentConfig;
 
@@ -36,16 +38,41 @@ pub const SUMMARIZER_SYSTEM_PROMPT: &str = r#"你是本轮剧情总结助手（r
 ///
 /// 若提供 `agent_profile_config`，从中读取 Summarizer 的 `model_override` 和
 /// `max_tool_rounds` 覆盖硬编码默认值（无 config = 当前硬编码值，向后兼容）。
+///
+/// `profile` / `modules` / `reasoning` 用于 Prompted 模式下注入摘要抽取 CoT；
+/// 任缺则退回纯 `SUMMARIZER_SYSTEM_PROMPT`（向后兼容）。
 pub fn make_summarizer_config(agent_profile_config: Option<&AgentProfileConfig>) -> AgentConfig {
+    make_summarizer_config_with_prompt(agent_profile_config, None, &[], &ReasoningMode::Disabled)
+}
+
+/// 带 Prompt Module / ReasoningMode 的总结配置（Prompted 时注入抽取 CoT）。
+pub fn make_summarizer_config_with_prompt(
+    agent_profile_config: Option<&AgentProfileConfig>,
+    profile: Option<&PromptProfile>,
+    modules: &[PromptModule],
+    reasoning: &ReasoningMode,
+) -> AgentConfig {
     let (model_override, rounds_override) = if let Some(apc) = agent_profile_config {
         let run = apc.run_config_for(&AgentRole::Summarizer);
         (run.model_override.clone(), run.max_tool_rounds)
     } else {
         (None, None)
     };
+    let system_prompt = if profile.is_some() || !modules.is_empty() {
+        prompt_module::assemble_system_prompt(
+            &AgentRole::Summarizer,
+            SUMMARIZER_SYSTEM_PROMPT,
+            profile,
+            modules,
+            "",
+            reasoning,
+        )
+    } else {
+        SUMMARIZER_SYSTEM_PROMPT.to_string()
+    };
     AgentConfig {
         role: AgentRole::Summarizer,
-        system_prompt: SUMMARIZER_SYSTEM_PROMPT.to_string(),
+        system_prompt,
         max_tool_rounds: rounds_override.unwrap_or(3),
         model: model_override.unwrap_or_else(|| "deepseek-chat".to_string()),
         tools: vec![],
