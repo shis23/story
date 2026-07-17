@@ -19,6 +19,7 @@ use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, PropagationPolicy};
 use storyforge_domain::conversation::{Role, VariantStatus};
+use storyforge_domain::llm::{ReasoningMode, SamplingParams};
 use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger};
 use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
 use storyforge_domain::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
@@ -174,6 +175,10 @@ pub struct SqliteHarnessEnv {
     pub llm: Arc<dyn LlmClient>,
     pub active_campaign: Mutex<Option<Id>>,
     pub fixture_hash16: String,
+    /// Connection-equivalent sampling used by `new_pipeline` for CoT assembly.
+    /// Eval sets `reasoning` from `STORYFORGE_EVAL_REASONING_MODE` so Prompted
+    /// injects role CoT; request-side override alone does not.
+    pub pipeline_sampling: Option<SamplingParams>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +315,7 @@ impl SqliteHarnessEnv {
             llm,
             active_campaign: Mutex::new(None),
             fixture_hash16: String::new(),
+            pipeline_sampling: None,
         };
         let fixture_path = fixture_path();
         let (campaign_id, fixture_hash) = env.seed_fixture(&fixture_path)?;
@@ -357,6 +363,7 @@ impl SqliteHarnessEnv {
             llm,
             active_campaign: Mutex::new(None),
             fixture_hash16,
+            pipeline_sampling: None,
         };
         // Re-inject tool_ctx character material from fixture without re-seeding DB.
         let root = load_fixture(&fixture_path)?;
@@ -370,6 +377,23 @@ impl SqliteHarnessEnv {
 
     pub fn active_campaign_id(&self) -> Option<Id> {
         self.active_campaign.lock().unwrap().clone()
+    }
+
+    /// Wire connection-level sampling into pipeline prompt assembly.
+    ///
+    /// `BudgetedLlmClient.reasoning_override` only rewrites outbound request
+    /// params after the prompt is built. CoT injection reads
+    /// `PipelineOrchestrator::reasoning_mode()`, which comes from this field.
+    pub fn set_pipeline_sampling(&mut self, sampling: Option<SamplingParams>) {
+        self.pipeline_sampling = sampling;
+    }
+
+    /// Convenience for eval arms: set only the reasoning mode on default sampling.
+    pub fn set_pipeline_reasoning(&mut self, reasoning: ReasoningMode) {
+        self.pipeline_sampling = Some(SamplingParams {
+            reasoning,
+            ..SamplingParams::default()
+        });
     }
 
     pub fn fill_campaign_context(&self, mut ctx: WritingContext) -> Result<WritingContext, String> {
@@ -418,11 +442,15 @@ impl SqliteHarnessEnv {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         tool_ctx.vector_store = Some(self.vector_store.clone());
-        let mut pipeline = PipelineOrchestrator::new(
+        // Must use new_with_sampling: assemble_system_prompt gates Cot modules on
+        // orchestrator.reasoning_mode(), not on BudgetedLlmClient overrides.
+        let mut pipeline = PipelineOrchestrator::new_with_sampling(
             self.llm.clone(),
             self.conv_store.clone(),
             Arc::new(tool_ctx),
             None,
+            None,
+            self.pipeline_sampling.clone(),
         );
         // SQLite production path: generation defers durable conversation land.
         pipeline.set_defer_conversation_land(true);
@@ -1613,6 +1641,43 @@ mod tests {
             Some("builtin-cot-director-plan"),
             "Director must select role-specific planning CoT"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_pipeline_uses_configured_reasoning_for_cot_assembly() {
+        let dir = std::env::temp_dir().join(format!(
+            "sf-endurance-pipeline-reasoning-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut env = SqliteHarnessEnv::bootstrap(dir.clone(), Arc::new(AlwaysFailLlmClient))
+            .expect("bootstrap");
+
+        // Default: no sampling → ReasoningMode::Disabled (enum Default), CoT skipped.
+        assert_eq!(
+            env.new_pipeline().reasoning_mode(),
+            ReasoningMode::Disabled,
+            "missing pipeline_sampling must keep CoT off"
+        );
+
+        env.set_pipeline_reasoning(ReasoningMode::Prompted);
+        assert_eq!(
+            env.new_pipeline().reasoning_mode(),
+            ReasoningMode::Prompted,
+            "Prompted must reach PipelineOrchestrator for Cot injection"
+        );
+
+        env.set_pipeline_reasoning(ReasoningMode::Disabled);
+        assert_eq!(
+            env.new_pipeline().reasoning_mode(),
+            ReasoningMode::Disabled
+        );
+
+        env.set_pipeline_reasoning(ReasoningMode::Native);
+        assert_eq!(env.new_pipeline().reasoning_mode(), ReasoningMode::Native);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

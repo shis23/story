@@ -3301,14 +3301,14 @@ async fn endurance_sqlite_real_llm_staged() {
     let llm = BudgetedLlmClient::wrap_with_reasoning_and_reservations(
         Arc::from(real_client),
         &budget,
-        Some(reasoning_override),
+        Some(reasoning_override.clone()),
         prior_calls,
         run_id_for_log.clone(),
         Arc::new(reservation_writer),
     )
     .unwrap_or_else(|error| panic!("durable budgeted client unavailable: {error}"));
 
-    let env = if resume_cp.is_some() && data_dir.join("storyforge.sqlite3").exists() {
+    let mut env = if resume_cp.is_some() && data_dir.join("storyforge.sqlite3").exists() {
         let env =
             SqliteHarnessEnv::open_existing(data_dir.clone(), llm.clone() as Arc<dyn LlmClient>)
                 .unwrap_or_else(|e| panic!("sqlite open_existing: {e}"));
@@ -3320,6 +3320,10 @@ async fn endurance_sqlite_real_llm_staged() {
         SqliteHarnessEnv::bootstrap(data_dir.clone(), llm.clone() as Arc<dyn LlmClient>)
             .unwrap_or_else(|e| panic!("sqlite bootstrap: {e}"))
     };
+    // BudgetedLlmClient.reasoning_override rewrites outbound request params only.
+    // Role CoT modules inject during assemble_system_prompt, which reads
+    // PipelineOrchestrator::reasoning_mode() from connection sampling.
+    env.set_pipeline_reasoning(reasoning_override);
 
     let campaign_id = if let Some(cp) = resume_cp.as_ref().and_then(|c| c.campaign_id.as_ref()) {
         let id = storyforge_domain::Id::from_str(cp);
