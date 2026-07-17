@@ -82,6 +82,11 @@ impl ToolCenter {
         );
         // Director 专属
         c.reg(
+            "list_characters",
+            "列可用角色权威索引（instance_id/name，不含详情）",
+            ToolScope::Roles(vec![AgentRole::Director]),
+        );
+        c.reg(
             "get_character",
             "查任意角色详情（Director 版，可见全部）",
             ToolScope::Roles(vec![AgentRole::Director]),
@@ -188,7 +193,7 @@ mod tests {
     fn director_default_tools_include_five() {
         let c = center();
         let names = c.default_tool_names_for(&AgentRole::Director);
-        // 3 个 All + 2 个 Director-only + 2 个 chronicle = 7
+        // 3 个 All + 3 个 Director-only + 2 个 chronicle = 8
         assert!(
             names.contains(&"search_world_info".into()),
             "missing search_world_info"
@@ -200,6 +205,10 @@ mod tests {
         assert!(
             names.contains(&"get_recent_summary".into()),
             "missing get_recent_summary"
+        );
+        assert!(
+            names.contains(&"list_characters".into()),
+            "missing list_characters"
         );
         assert!(
             names.contains(&"get_character".into()),
@@ -216,8 +225,8 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            7,
-            "Director should have 7 tools, got {}",
+            8,
+            "Director should have 8 tools, got {}",
             names.len()
         );
     }
@@ -305,16 +314,17 @@ mod tests {
     fn all_summaries_returns_all_tools() {
         let c = center();
         let summaries = c.all_summaries();
-        // 9 tools total:
+        // 10 tools total:
         //   search_world_info, search_vectors, get_recent_summary (All)
-        //   get_character, emit_plan (Director)
+        //   list_characters, get_character, emit_plan (Director)
         //   subagent.get_character (Subagent)
         //   compose (Editor)
         //   emit_postprocess (PostProcessor)
         //   emit_characters (CharacterExtractor)
+        // plus chronicle tools already counted via Director scope
         assert!(
-            summaries.len() >= 9,
-            "expected >= 9 tool summaries, got {}",
+            summaries.len() >= 10,
+            "expected >= 10 tool summaries, got {}",
             summaries.len()
         );
     }

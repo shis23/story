@@ -2,6 +2,7 @@
 ///
 /// 对应设计 §3.2 的 Agent 工具集。M1 实现：
 /// - search_world_info: 关键词搜索世界书（非向量，简单匹配）
+/// - list_characters: 导演列出可用角色权威索引（instance_id/name）
 /// - get_character: 获取角色卡详情
 /// - emit_plan: 导演输出 Plan
 /// - compose: 编剧输出成文（直接返回内容，不做工具调用）
@@ -330,13 +331,41 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
         },
     );
 
+    // list_characters: 导演专用角色权威索引（轻量 roster，不含 persona/backstory）
+    registry.register(
+        ToolSpec::function(
+            "list_characters",
+            "列出当前可用角色的权威索引（instance_id/name/role_type）。不确定角色名时先调用本工具，再用 instance_id 调 get_character / emit_plan。不返回 persona/backstory。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        |_args, ctx| {
+            Box::pin(async move {
+                let characters = character_roster_entries(&ctx);
+                let source = if ctx.campaign_runtime.is_some() {
+                    "campaign_instance"
+                } else {
+                    "flat_character"
+                };
+                Ok(serde_json::json!({
+                    "count": characters.len(),
+                    "source": source,
+                    "characters": characters,
+                    "hint": "Campaign 下 emit_plan.character_id 与 get_character 优先使用 instance_id；同名角色必须用 instance_id",
+                }))
+            })
+        },
+    );
+
     // get_character: 获取角色卡详情
     // 阶段 3：有 campaign_runtime 时优先查 Campaign 实例（含 definition/persona/behavior）
     // 无 campaign_runtime 或查不到实例时，退回旧的扁平 Character 逻辑
     registry.register(
         ToolSpec::function(
             "get_character",
-            "获取指定角色的详细信息。可传角色名或 instance_id。",
+            "获取指定角色的详细信息。可传角色名或 instance_id。不确定名字时先 list_characters；Campaign 下优先用 instance_id，同名角色必须用 instance_id。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -381,18 +410,20 @@ pub fn register_director_tools(registry: &mut ToolRegistry) {
                 let character = ctx
                     .characters
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| ToolError::NotFound(format!("角色 '{name}' 不存在")))?;
+                    .find(|c| c.name.eq_ignore_ascii_case(name));
+                if let Some(character) = character {
+                    return Ok(serde_json::json!({
+                        "name": character.name,
+                        "description": character.description,
+                        "personality": character.personality,
+                        "scenario": character.scenario,
+                        "first_mes": character.first_mes,
+                        "system_prompt": character.system_prompt,
+                        "source": "flat_character",
+                    }));
+                }
 
-                Ok(serde_json::json!({
-                    "name": character.name,
-                    "description": character.description,
-                    "personality": character.personality,
-                    "scenario": character.scenario,
-                    "first_mes": character.first_mes,
-                    "system_prompt": character.system_prompt,
-                    "source": "flat_character",
-                }))
+                Err(ToolError::NotFound(format_character_not_found(name, &ctx)))
             })
         },
     );
@@ -811,6 +842,72 @@ fn render_world_info_tool_content(content: &str, ctx: &ToolContext) -> String {
     })
 }
 
+/// 轻量角色索引条目（list_characters / NotFound candidates 共用）。
+///
+/// 只暴露定位字段，不返回 persona/backstory，避免把详情工具能力重复进列表。
+fn character_roster_entries(ctx: &ToolContext) -> Vec<Value> {
+    if let Some(runtime) = &ctx.campaign_runtime {
+        return runtime
+            .instances
+            .iter()
+            .map(|inst| {
+                let role_type = runtime
+                    .definition_for_instance(inst)
+                    .map(|d| format!("{:?}", d.role_type));
+                serde_json::json!({
+                    "instance_id": inst.id.as_str(),
+                    "name": inst.name,
+                    "definition_id": inst.definition_id.as_ref().map(|id| id.as_str()),
+                    "role_type": role_type,
+                    "is_temporary": inst.is_temporary,
+                })
+            })
+            .collect();
+    }
+
+    ctx.characters
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "is_temporary": false,
+            })
+        })
+        .collect()
+}
+
+/// Director get_character 未命中时的可恢复错误文案：附候选与 list 提示。
+fn format_character_not_found(query: &str, ctx: &ToolContext) -> String {
+    let candidates = character_roster_entries(ctx);
+    let mut msg = format!("角色 '{query}' 不存在");
+    if candidates.is_empty() {
+        msg.push_str("。当前无可用角色");
+        return msg;
+    }
+
+    let preview: Vec<String> = candidates
+        .iter()
+        .take(8)
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?;
+            if let Some(id) = c.get("instance_id").and_then(|v| v.as_str()) {
+                Some(format!("{name}({id})"))
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect();
+    if !preview.is_empty() {
+        msg.push_str("。候选: ");
+        msg.push_str(&preview.join(", "));
+    }
+    if candidates.len() > preview.len() {
+        msg.push_str(&format!(" …共{}人", candidates.len()));
+    }
+    msg.push_str("。请先 list_characters，Campaign 下优先使用 instance_id");
+    msg
+}
+
 /// 注册子 Agent 的工具（只读，受限）
 ///
 /// 阶段 4 改造：有 `current_character_instance_id` 时，get_character 只返回
@@ -1095,6 +1192,182 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "不存在的角色应返回错误");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Ghost") && err.contains("候选") && err.contains("list_characters"),
+            "NotFound 应附候选与 list 提示，实际: {err}"
+        );
+        assert!(
+            err.contains("Lin(inst-lin)"),
+            "候选应含权威 id，实际: {err}"
+        );
+    }
+
+    fn make_campaign_runtime_with_duplicate_dockers() -> Arc<CampaignRuntimeContext> {
+        let campaign = Campaign::new(Id::from_str("card-1"), "test-campaign");
+        let def_a = CharacterDefinition {
+            id: Id::from_str("def-docker-a"),
+            card_id: Id::from_str("card-1"),
+            name: "码头工人".into(),
+            persona_prompt: "worker a".into(),
+            behavior_rules: "lift".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Supporting,
+            variable_schema: default_character_variables(),
+        };
+        let def_b = CharacterDefinition {
+            id: Id::from_str("def-docker-b"),
+            card_id: Id::from_str("card-1"),
+            name: "码头工人".into(),
+            persona_prompt: "worker b".into(),
+            behavior_rules: "haul".into(),
+            base_backstory: vec![],
+            group: None,
+            role_type: RoleType::Supporting,
+            variable_schema: default_character_variables(),
+        };
+        let inst_a = CharacterInstance {
+            id: Id::from_str("inst-docker-a"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def_a.id.clone()),
+            name: "码头工人".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let inst_b = CharacterInstance {
+            id: Id::from_str("inst-docker-b"),
+            campaign_id: campaign.id.clone(),
+            definition_id: Some(def_b.id.clone()),
+            name: "码头工人".into(),
+            persona_override: None,
+            behavior_override: None,
+            variables: vec![],
+            is_temporary: false,
+        };
+        let mut definitions_by_id = std::collections::HashMap::new();
+        definitions_by_id.insert(def_a.id.clone(), def_a);
+        definitions_by_id.insert(def_b.id.clone(), def_b);
+        Arc::new(CampaignRuntimeContext {
+            campaign,
+            instances: vec![inst_a, inst_b],
+            definitions_by_id,
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_list_characters_returns_campaign_roster_without_persona() {
+        let runtime = make_campaign_runtime_with_duplicate_dockers();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        assert!(registry.has("list_characters"));
+
+        let result = registry
+            .dispatch("list_characters", serde_json::json!({}), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["source"], "campaign_instance");
+        let chars = result["characters"].as_array().unwrap();
+        assert_eq!(chars.len(), 2);
+        assert_eq!(chars[0]["name"], "码头工人");
+        assert_eq!(chars[0]["instance_id"], "inst-docker-a");
+        assert_eq!(chars[1]["instance_id"], "inst-docker-b");
+        assert!(chars[0].get("persona").is_none());
+        assert!(chars[0].get("backstory").is_none());
+        assert!(
+            result["hint"]
+                .as_str()
+                .unwrap_or("")
+                .contains("instance_id"),
+            "list 应提示优先用 instance_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_characters_falls_back_to_flat_characters() {
+        let ctx = Arc::new(ToolContext {
+            characters: vec![make_flat_character("Seraphina")],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let result = registry
+            .dispatch("list_characters", serde_json::json!({}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["source"], "flat_character");
+        assert_eq!(result["characters"][0]["name"], "Seraphina");
+        assert!(result["characters"][0].get("instance_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_character_not_found_lists_duplicate_name_candidates() {
+        let runtime = make_campaign_runtime_with_duplicate_dockers();
+        let ctx = Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: std::sync::Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: Some(runtime),
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        });
+
+        let mut registry = ToolRegistry::new();
+        register_director_tools(&mut registry);
+        let err = registry
+            .dispatch(
+                "get_character",
+                serde_json::json!({"name": "工人甲"}),
+                ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("工人甲"), "{err}");
+        assert!(err.contains("inst-docker-a"), "{err}");
+        assert!(err.contains("inst-docker-b"), "{err}");
+        assert!(err.contains("list_characters"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_subagent_registry_does_not_expose_list_characters() {
+        let mut registry = ToolRegistry::new();
+        register_subagent_tools(&mut registry);
+        assert!(
+            !registry.has("list_characters"),
+            "Subagent 不得暴露 list_characters，避免破信息隔离"
+        );
     }
 
     // ── 阶段 4：子 Agent get_character 信息隔离测试 ──
