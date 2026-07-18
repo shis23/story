@@ -384,8 +384,6 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
     }
 
     if error.contains("PlanParse")
-        || error.contains("PipelineError")
-        || error.contains("pipeline error")
         || error.contains("Plan 解析")
         || error.contains("未找到有效 Plan")
         || error.contains("already has active turn")
@@ -407,9 +405,23 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
         || error.contains("expected Generating")
         || error.contains("is Failed")
     {
-        WriteFailureClass::Transient
-    } else {
+        return WriteFailureClass::Transient;
+    }
+    // A pipeline-facing model failure is safe to retry here: no Accept has
+    // occurred, the active turn is recovered before the next attempt, and the
+    // retry budget is bounded by MAX_WRITE_ATTEMPTS. Treat only explicit
+    // authority/storage/scope failures as fatal; provider/model and parser
+    // failures otherwise use the existing transient path.
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("storage")
+        || lower.contains("sqlite")
+        || lower.contains("authority")
+        || lower.contains("scope mismatch")
+        || lower.contains("accepted-state")
+    {
         WriteFailureClass::Fatal
+    } else {
+        WriteFailureClass::Transient
     }
 }
 
@@ -2718,7 +2730,7 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     );
     assert_eq!(
         classify_write_failure(
-            "PipelineError::Regenerate(\"editor response was not parseable\")",
+            "regenerate failed: editor response was not parseable",
             &private_probe,
         ),
         WriteFailureClass::Transient,
