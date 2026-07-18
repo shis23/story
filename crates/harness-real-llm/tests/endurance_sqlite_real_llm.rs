@@ -331,6 +331,7 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
         || error.contains("client_error")
         || error.contains("LlmError")
         || error.contains("Internal")
+        || error.contains("pipeline missing completed agent events")
         || error.contains("所有子 Agent 均失败")
         || error.contains("不在旧 Plan")
         || error.contains("部分重 roll")
@@ -2613,6 +2614,14 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     assert_eq!(
         classify_write_failure("stream idle timeout", &private_probe),
         WriteFailureClass::Transient
+    );
+    assert_eq!(
+        classify_write_failure(
+            "pipeline missing completed agent events: [\"postprocessor\"]",
+            &private_probe,
+        ),
+        WriteFailureClass::Transient,
+        "a pre-Accept coverage gap must use the existing bounded retry path"
     );
     assert_eq!(
         classify_write_failure("campaign scope mismatch", &private_probe),
