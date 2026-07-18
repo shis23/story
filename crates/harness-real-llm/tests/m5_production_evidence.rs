@@ -31,6 +31,7 @@ impl LlmClient for DeterministicUsageClient {
     async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         Ok(ChatResponse {
             content: "deterministic draft".into(),
+            reasoning_content: Some("deterministic reasoning".into()),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(Usage {

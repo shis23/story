@@ -8,7 +8,9 @@ use std::sync::{Arc, Barrier};
 
 use storyforge_domain::Id;
 use storyforge_domain::campaign::Campaign;
-use storyforge_domain::conversation::{Conversation, Role, VariantStatus};
+use storyforge_domain::conversation::{
+    Conversation, Provenance, Role, SubagentSnapshot, VariantStatus,
+};
 use storyforge_domain::turn::{
     AttemptStatus, DerivationComponents, DerivationStatus, Mutation, MutationBatch, QualityReport,
     QualitySeverity, QualityWarning, QualityWarningCode, TurnStatus,
@@ -250,6 +252,23 @@ fn autofix_sync_rewrites_conversation_and_attempt_hash_atomically() {
 
     let fixed = "auto-fixed draft body";
     let report = quality_report_with_error();
+    let autofix_provenance = Provenance {
+        session_id: Id::from_str("autofix-session"),
+        plan: None,
+        subagent_results: vec![SubagentSnapshot {
+            character_id: "lin".into(),
+            full_text: "performance".into(),
+            character_instance_id: None,
+            display_name: None,
+            fallback_reason: None,
+            reasoning_content: Some("subagent reasoning".into()),
+        }],
+        profile_id: None,
+        seed: 1,
+        last_hint: None,
+        director_reasoning: Some("director reasoning".into()),
+        editor_reasoning: Some("autofix editor reasoning".into()),
+    };
     SqlitePreacceptRepository::sync_autofix(
         &mut f.db,
         AutofixSyncRequest {
@@ -259,6 +278,7 @@ fn autofix_sync_rewrites_conversation_and_attempt_hash_atomically() {
             attempt_id: &attempt_id,
             final_text: fixed,
             quality_report: report.clone(),
+            provenance: Some(autofix_provenance.clone()),
         },
     )
     .unwrap();
@@ -286,7 +306,26 @@ fn autofix_sync_rewrites_conversation_and_attempt_hash_atomically() {
         report.error_count()
     );
     assert_eq!(attempt.status, AttemptStatus::DraftReady);
+    assert_eq!(
+        attempt
+            .provenance
+            .as_ref()
+            .and_then(|p| p.editor_reasoning.as_deref()),
+        Some("autofix editor reasoning")
+    );
     assert_eq!(turn.status, TurnStatus::DraftReady);
+
+    assert_eq!(
+        conversation
+            .find_node(&created.variant_id)
+            .unwrap()
+            .active()
+            .unwrap()
+            .provenance
+            .as_ref()
+            .and_then(|p| p.editor_reasoning.as_deref()),
+        Some("autofix editor reasoning")
+    );
 
     // content hash must match active conversation text
     assert_eq!(
@@ -331,6 +370,7 @@ fn autofix_fault_before_commit_leaves_original_draft_intact() {
             attempt_id: &attempt_id,
             final_text: "should not stick",
             quality_report: QualityReport::default(),
+            provenance: None,
         },
         PreacceptFault::BeforeCommit,
     )
@@ -1040,6 +1080,7 @@ fn autofix_idempotency_fingerprint_covers_full_quality_report() {
             attempt_id: &attempt_id,
             final_text,
             quality_report: report_a.clone(),
+            provenance: None,
         },
     )
     .unwrap();
@@ -1059,6 +1100,7 @@ fn autofix_idempotency_fingerprint_covers_full_quality_report() {
             attempt_id: &attempt_id,
             final_text,
             quality_report: report_a.clone(),
+            provenance: None,
         },
     )
     .unwrap();
@@ -1081,6 +1123,7 @@ fn autofix_idempotency_fingerprint_covers_full_quality_report() {
             attempt_id: &attempt_id,
             final_text,
             quality_report: report_b.clone(),
+            provenance: None,
         },
     )
     .unwrap();
@@ -1260,6 +1303,7 @@ fn sync_autofix_rejects_stale_attempt_instead_of_dead_reactivation() {
             attempt_id: &attempt_id,
             final_text: "should not reactivate stale",
             quality_report: QualityReport::default(),
+            provenance: None,
         },
     )
     .unwrap_err();

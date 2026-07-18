@@ -88,6 +88,12 @@ pub struct Provenance {
     /// 上次重 roll 时附加的 hint（若有），便于二次重 roll 时 LLM 看到迭代历史
     #[serde(default)]
     pub last_hint: Option<String>,
+    /// 导演各 LLM 轮次实际返回的 reasoning/thinking。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub director_reasoning: Option<String>,
+    /// 编剧各 LLM 轮次实际返回的 reasoning/thinking。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_reasoning: Option<String>,
 }
 
 /// 子 Agent 产出快照（存进 Provenance，用于部分重 roll）
@@ -104,6 +110,9 @@ pub struct SubagentSnapshot {
     /// fallback 原因（阶段 5 新增）。如 "instance not found, fell back to context_package"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// 子 Agent 实际返回的 reasoning/thinking；与 full_text 分离。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl From<&Performance> for SubagentSnapshot {
@@ -114,6 +123,7 @@ impl From<&Performance> for SubagentSnapshot {
             character_instance_id: None,
             display_name: None,
             fallback_reason: None,
+            reasoning_content: p.reasoning_content.clone(),
         }
     }
 }

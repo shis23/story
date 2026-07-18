@@ -73,6 +73,12 @@ async function handleExplain() {
         v-else-if="result"
         class="bg-surface rounded-lg border border-line p-3 space-y-2 text-xs"
       >
+        <div
+          v-if="result.director_reasoning || result.editor_reasoning || result.subagents?.some(sa => sa.reasoning_content)"
+          class="rounded-md border border-warn/30 bg-warn/10 px-2 py-1.5 text-warn"
+        >
+          Reasoning 为供应商返回的原始审计数据，可能包含系统提示、检索材料或角色私密知识；仅在此显式查看。
+        </div>
         <div v-if="result.scene_brief" class="text-ink">
           <span class="text-ink-soft">场景：</span>{{ result.scene_brief }}
         </div>
@@ -88,6 +94,20 @@ async function handleExplain() {
           <span class="text-ink-soft">Hint：</span>{{ result.last_hint }}
         </div>
 
+        <details v-if="result.director_reasoning" class="mt-2">
+          <summary class="cursor-pointer text-ink-soft hover:text-ink">导演 reasoning</summary>
+          <div class="mt-1.5">
+            <CodeBlock :code="result.director_reasoning" language="text" wrap />
+          </div>
+        </details>
+
+        <details v-if="result.editor_reasoning" class="mt-2">
+          <summary class="cursor-pointer text-ink-soft hover:text-ink">编剧 reasoning</summary>
+          <div class="mt-1.5">
+            <CodeBlock :code="result.editor_reasoning" language="text" wrap />
+          </div>
+        </details>
+
         <!-- 子 Agent -->
         <div v-if="result.subagents && result.subagents.length > 0">
           <div class="font-medium text-ink mb-1">子 Agent</div>
@@ -100,6 +120,12 @@ async function handleExplain() {
               <div class="text-ink font-medium">{{ sa.display_name || ('Agent ' + (si + 1)) }}</div>
               <div v-if="sa.task_brief" class="text-ink-soft mt-0.5">{{ sa.task_brief }}</div>
               <div v-if="sa.output_preview" class="text-ink-soft mt-1 line-clamp-3">{{ sa.output_preview }}</div>
+              <details v-if="sa.reasoning_content" class="mt-1.5">
+                <summary class="cursor-pointer text-ink-soft hover:text-ink">查看 reasoning</summary>
+                <div class="mt-1.5">
+                  <CodeBlock :code="sa.reasoning_content" language="text" wrap />
+                </div>
+              </details>
             </div>
           </div>
         </div>

@@ -418,6 +418,7 @@ mod tests {
     fn make_resp(content: &str, tool_calls: Vec<ToolCall>) -> ChatResponse {
         ChatResponse {
             content: content.into(),
+            reasoning_content: None,
             tool_calls,
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -652,6 +653,7 @@ mod tests {
             let resp = self.chat(req).await?;
             let _ = tx.send(StreamChunk {
                 delta_content: Some(resp.content.clone()),
+                delta_reasoning_content: resp.reasoning_content.clone(),
                 delta_tool_calls: None,
                 finish_reason: resp.finish_reason.clone(),
             });
@@ -718,6 +720,7 @@ mod tests {
             let resp = self.chat(req).await?;
             let _ = tx.send(StreamChunk {
                 delta_content: Some(resp.content.clone()),
+                delta_reasoning_content: resp.reasoning_content.clone(),
                 delta_tool_calls: None,
                 finish_reason: resp.finish_reason.clone(),
             });
@@ -782,6 +785,7 @@ mod tests {
             let resp = self.chat(req).await?;
             let _ = tx.send(StreamChunk {
                 delta_content: Some(resp.content.clone()),
+                delta_reasoning_content: resp.reasoning_content.clone(),
                 delta_tool_calls: None,
                 finish_reason: resp.finish_reason.clone(),
             });
@@ -848,6 +852,7 @@ mod tests {
             let resp = self.chat(req).await?;
             let _ = tx.send(StreamChunk {
                 delta_content: Some(resp.content.clone()),
+                delta_reasoning_content: resp.reasoning_content.clone(),
                 delta_tool_calls: None,
                 finish_reason: resp.finish_reason.clone(),
             });

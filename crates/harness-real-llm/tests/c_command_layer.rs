@@ -567,10 +567,13 @@ fn c6_explain_generation() {
             character_instance_id: Some("inst-lin".into()),
             display_name: Some("林医生".into()),
             fallback_reason: None,
+            reasoning_content: Some("lin reasoning".into()),
         }],
         profile_id: None,
         seed: 42,
         last_hint: None,
+        director_reasoning: Some("director reasoning".into()),
+        editor_reasoning: Some("editor reasoning".into()),
     };
 
     let explanation = explain_generation(&provenance);

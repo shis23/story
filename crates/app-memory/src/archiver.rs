@@ -388,6 +388,7 @@ mod tests {
             *self.seen_model.lock().unwrap() = Some(req.model.clone());
             Ok(ChatResponse {
                 content: "archived memory summary".into(),
+                reasoning_content: None,
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,

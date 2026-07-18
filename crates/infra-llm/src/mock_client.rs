@@ -77,6 +77,7 @@ impl crate::LlmClient for MockLlmClient {
 
         Ok(ChatResponse {
             content,
+            reasoning_content: Some("mock provider reasoning".into()),
             tool_calls,
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -115,6 +116,7 @@ impl crate::LlmClient for MockLlmClient {
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
                         let _ = tx.send(StreamChunk {
                             delta_content: Some(ch.to_string()),
+                            delta_reasoning_content: None,
                             delta_tool_calls: None,
                             finish_reason: None,
                         });
@@ -130,6 +132,7 @@ impl crate::LlmClient for MockLlmClient {
             } else {
                 Some(content.clone())
             },
+            delta_reasoning_content: Some("mock provider reasoning".into()),
             delta_tool_calls: if tool_calls.is_empty() {
                 None
             } else {
@@ -140,6 +143,7 @@ impl crate::LlmClient for MockLlmClient {
 
         Ok(ChatResponse {
             content,
+            reasoning_content: Some("mock provider reasoning".into()),
             tool_calls,
             finish_reason: Some("stop".into()),
             usage: Some(Usage {

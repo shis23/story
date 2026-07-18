@@ -381,7 +381,7 @@ export async function getActiveConnection() {
 
 /**
  * 创建连接
- * @param {Object} req - { templateId?, name, baseUrl, protocol, model, apiKey, toolMode, temperature?, topP?, maxTokens?, extra? }
+ * @param {Object} req - { templateId?, name, baseUrl, protocol, model, apiKey, toolMode, temperature?, topP?, maxTokens?, reasoning?, extra? }
  * @returns {Promise<string>} 新连接 id
  */
 export async function createConnection(req) {
@@ -399,6 +399,7 @@ export async function createConnection(req) {
         top_p: req.topP ?? null,
         max_tokens: req.maxTokens ?? null,
         max_tokens_explicit: req.maxTokensExplicit ?? false,
+        reasoning: req.reasoning ?? 'disabled',
         // P3-3：厂商扩展参数（thinking/reasoning_effort 等），透传到请求体顶层
         extra: req.extra ?? null,
       },
@@ -435,6 +436,7 @@ export async function testConnection(req) {
         model: req.model,
         protocol: req.protocol,
         tool_mode: req.toolMode,
+        reasoning: req.reasoning ?? 'disabled',
       },
     })
   }

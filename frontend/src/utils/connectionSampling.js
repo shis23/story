@@ -8,3 +8,11 @@ export function normalizeOptionalMaxTokens(value) {
   }
   return parsed
 }
+
+export function normalizeReasoningMode(value) {
+  const mode = String(value ?? 'disabled').trim().toLowerCase() || 'disabled'
+  if (!['disabled', 'native', 'prompted'].includes(mode)) {
+    throw new Error('reasoning mode must be disabled, native, or prompted')
+  }
+  return mode
+}

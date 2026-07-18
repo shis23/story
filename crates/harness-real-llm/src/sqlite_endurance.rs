@@ -18,7 +18,7 @@ use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
 use storyforge_domain::character_knowledge::{CharacterKnowledgeEntry, PropagationPolicy};
-use storyforge_domain::conversation::{Role, VariantStatus};
+use storyforge_domain::conversation::{Provenance, Role, VariantStatus};
 use storyforge_domain::llm::{ReasoningMode, SamplingParams};
 use storyforge_domain::story_task::{StoryTask, TaskStatus, TaskTrigger};
 use storyforge_domain::turn::{AttemptStatus, QualityReport, TurnRecord, TurnStatus};
@@ -219,6 +219,7 @@ struct SqlitePostprocessRequest<'a> {
     variant_id: &'a Id,
     draft_text: &'a str,
     quality_report: QualityReport,
+    autofix_provenance: Option<Provenance>,
     outcome: Option<PostProcessOutcome>,
     present_chars: Vec<String>,
     turn_number: u32,
@@ -662,26 +663,29 @@ impl SqliteHarnessEnv {
             attempt_id: &attempt_id,
             draft_text: &draft_text,
             pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
-            provenance,
+            provenance: provenance.clone(),
         })?;
         self.conv_store.invalidate();
         let variant_id = land.variant_id;
         let initial_draft_hash = land.draft_hash;
 
         // Same production QualityGate + bounded Editor auto-fix used by Tauri.
-        let (final_text, quality_report) = run_quality_gate_with_optional_editor_autofix(
-            draft_text,
-            QualityAutofixRequest {
-                pipeline: &mut pipeline,
-                draft_node_id: &variant_id,
-                conversation_id,
-                writing_ctx: &ctx,
-                event_tx: &event_tx,
-                cancel: cancel_rx.clone(),
-                log_prefix: "sqlite endurance write",
-            },
-        )
-        .await;
+        let (final_text, quality_report, autofix_provenance) =
+            run_quality_gate_with_optional_editor_autofix(
+                draft_text,
+                QualityAutofixRequest {
+                    pipeline: &mut pipeline,
+                    draft_node_id: &variant_id,
+                    conversation_id,
+                    writing_ctx: &ctx,
+                    event_tx: &event_tx,
+                    cancel: cancel_rx.clone(),
+                    log_prefix: "sqlite endurance write",
+                    original_provenance: provenance,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         let quality_warning_count = quality_report.warnings.len();
         let quality_error_count = quality_report.error_count();
 
@@ -725,6 +729,7 @@ impl SqliteHarnessEnv {
                 variant_id: &variant_id,
                 draft_text: &final_text,
                 quality_report,
+                autofix_provenance,
                 outcome,
                 present_chars: present_chars.clone(),
                 turn_number: turn_index,
@@ -929,25 +934,28 @@ impl SqliteHarnessEnv {
             attempt_id: &attempt_id,
             draft_text: &regen_text,
             pending_temporary_instances: pipeline.pending_temporary_instances().to_vec(),
-            provenance: Some(regen_provenance),
+            provenance: Some(regen_provenance.clone()),
         })?;
         self.conv_store.invalidate();
         let variant_id = land.variant_id;
         let initial_draft_hash = land.draft_hash;
 
-        let (final_text, quality_report) = run_quality_gate_with_optional_editor_autofix(
-            regen_text,
-            QualityAutofixRequest {
-                pipeline: &mut pipeline,
-                draft_node_id: &variant_id,
-                conversation_id,
-                writing_ctx: &ctx,
-                event_tx: &event_tx,
-                cancel: cancel_rx.clone(),
-                log_prefix: "sqlite endurance regenerate",
-            },
-        )
-        .await;
+        let (final_text, quality_report, autofix_provenance) =
+            run_quality_gate_with_optional_editor_autofix(
+                regen_text,
+                QualityAutofixRequest {
+                    pipeline: &mut pipeline,
+                    draft_node_id: &variant_id,
+                    conversation_id,
+                    writing_ctx: &ctx,
+                    event_tx: &event_tx,
+                    cancel: cancel_rx.clone(),
+                    log_prefix: "sqlite endurance regenerate",
+                    original_provenance: Some(regen_provenance),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         let quality_warning_count = quality_report.warnings.len();
         let quality_error_count = quality_report.error_count();
         let present_chars = pipeline
@@ -981,6 +989,7 @@ impl SqliteHarnessEnv {
                 variant_id: &variant_id,
                 draft_text: &final_text,
                 quality_report,
+                autofix_provenance,
                 outcome,
                 present_chars: present_chars.clone(),
                 turn_number: turn_index,
@@ -1186,8 +1195,13 @@ impl SqliteHarnessEnv {
             turn_number: req.turn_number,
         };
         let sink = SqliteGatewayTurnAttemptSink;
-        sink.sync_autofix(&identity, req.draft_text, req.quality_report)
-            .map_err(|e| e.to_string())?;
+        sink.sync_autofix_with_provenance(
+            &identity,
+            req.draft_text,
+            req.quality_report,
+            req.autofix_provenance,
+        )
+        .map_err(|e| e.to_string())?;
 
         let runtime = self
             .fill_campaign_context(WritingContext::legacy(
@@ -1378,6 +1392,16 @@ impl TurnAttemptSink for SqliteGatewayTurnAttemptSink {
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), ProductionPostprocessError> {
+        self.sync_autofix_with_provenance(identity, final_text, report, None)
+    }
+
+    fn sync_autofix_with_provenance(
+        &self,
+        identity: &PostprocessIdentity,
+        final_text: &str,
+        report: QualityReport,
+        provenance: Option<Provenance>,
+    ) -> Result<(), ProductionPostprocessError> {
         // Typed precheck
         let turn = sqlite_runtime::get_turn(&identity.turn_id)
             .map_err(ProductionPostprocessError::AutofixSync)?
@@ -1424,6 +1448,7 @@ impl TurnAttemptSink for SqliteGatewayTurnAttemptSink {
             attempt_id: &identity.attempt_id,
             final_text,
             quality_report: report,
+            provenance,
         })
         .map_err(ProductionPostprocessError::AutofixSync)
     }

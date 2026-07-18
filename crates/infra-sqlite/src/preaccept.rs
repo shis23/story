@@ -103,6 +103,7 @@ pub struct AutofixSyncRequest<'a> {
     pub attempt_id: &'a Id,
     pub final_text: &'a str,
     pub quality_report: QualityReport,
+    pub provenance: Option<Provenance>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,10 +277,15 @@ impl SqlitePreacceptRepository {
         migrations::migrate(db)?;
         let final_hash = compute_draft_hash(request.final_text);
         let now = chrono::Utc::now().to_rfc3339();
+        let provenance_hash = match request.provenance.as_ref() {
+            Some(provenance) => Some(hash_json(&serde_json::to_value(provenance)?)?),
+            None => None,
+        };
         let payload = serde_json::json!({
             "attempt_id": request.attempt_id.as_str(),
             "draft_hash": final_hash,
             "quality_report": request.quality_report,
+            "provenance_hash": provenance_hash,
         });
         let payload_hash = hash_json(&payload)?;
 
@@ -331,6 +337,11 @@ impl SqlitePreacceptRepository {
                 .ok_or_else(|| SqliteError::RecordNotFound(format!("variant {variant_id}")))?;
             node.edit_active(request.final_text.to_string())
                 .map_err(SqliteError::Other)?;
+            if let Some(provenance) = request.provenance.clone()
+                && let Some(active) = node.active_mut()
+            {
+                active.provenance = Some(provenance);
+            }
         }
         conversation.updated_at = chrono::Utc::now();
         write_conversation(tx, &conversation)?;
@@ -348,6 +359,9 @@ impl SqlitePreacceptRepository {
             // intentionally unsupported. Callers must regenerate a fresh attempt.
             attempt.draft_hash = final_hash.clone();
             attempt.quality_report = Some(request.quality_report.clone());
+            if let Some(provenance) = request.provenance.clone() {
+                attempt.provenance = Some(provenance);
+            }
         }
         turn.touch();
         write_turn(tx, &turn)?;

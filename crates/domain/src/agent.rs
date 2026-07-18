@@ -348,6 +348,9 @@ pub struct Performance {
     pub inner_thoughts: String, // 内心独白
     /// 完整输出（合并 narrative/dialogue/inner_thoughts）
     pub full_text: String,
+    /// 供应商显式返回的 reasoning/thinking；不混入角色可见表演正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// 编剧的成文产出

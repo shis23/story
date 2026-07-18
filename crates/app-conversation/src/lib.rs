@@ -549,6 +549,29 @@ impl ConversationStore {
         })
     }
 
+    /// 编辑当前变体正文并同步替换溯源。用于有界 Editor auto-fix 在二次质量门
+    /// 失败时恢复原稿，或在同一 Draft identity 上原子对齐最终正文与 reasoning。
+    pub fn edit_variant_with_provenance(
+        &self,
+        conv_id: &Id,
+        node_id: &Id,
+        new_content: String,
+        provenance: Option<Provenance>,
+    ) -> Result<(), ConversationError> {
+        self.with_conversation_mut(conv_id, |conv| {
+            let node = conv
+                .find_node_mut(node_id)
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
+            let active = node
+                .active_mut()
+                .ok_or_else(|| ConversationError::NodeNotFound(node_id.to_string()))?;
+            active.content = new_content;
+            active.provenance = provenance;
+            conv.updated_at = Utc::now();
+            Ok(())
+        })
+    }
+
     /// 软删除当前变体（→ Discarded）
     pub fn soft_delete_variant(&self, conv_id: &Id, node_id: &Id) -> Result<(), ConversationError> {
         self.with_conversation_mut(conv_id, |conv| {
@@ -771,6 +794,8 @@ pub fn build_provenance(
         profile_id,
         seed,
         last_hint,
+        director_reasoning: None,
+        editor_reasoning: None,
     }
 }
 
@@ -822,6 +847,8 @@ pub fn build_provenance_with_campaign(
         profile_id,
         seed,
         last_hint,
+        director_reasoning: None,
+        editor_reasoning: None,
     }
 }
 
@@ -1330,10 +1357,13 @@ mod tests {
                 character_instance_id: None,
                 display_name: None,
                 fallback_reason: None,
+                reasoning_content: None,
             }],
             profile_id: None,
             seed: 42,
             last_hint: None,
+            director_reasoning: None,
+            editor_reasoning: None,
         };
         // 先加一个带 Provenance 的变体
         store
@@ -1428,6 +1458,8 @@ mod tests {
             profile_id: None,
             seed: 0,
             last_hint: None,
+            director_reasoning: None,
+            editor_reasoning: None,
         }
     }
 

@@ -35,6 +35,10 @@ pub struct UsageSample {
     pub cached_tokens: u32,
     pub cache_creation_tokens: u32,
     pub completion_tokens: u32,
+    pub reasoning_required: bool,
+    pub reasoning_captured: bool,
+    pub reasoning_chars: usize,
+    pub reasoning_hash16: String,
     pub request_fp16: String,
     pub system_hash16: String,
     pub history_hash16: String,
@@ -55,8 +59,19 @@ impl UsageSample {
         suite: impl Into<String>,
         turn_index: u32,
         model_label: impl Into<String>,
-        assertions: Vec<AssertionResult>,
+        mut assertions: Vec<AssertionResult>,
     ) -> EvidenceCallRecord {
+        assertions.push(AssertionResult {
+            name: "reasoning_captured".into(),
+            passed: !self.reasoning_required || self.reasoning_captured,
+            detail: Some(format!(
+                "required={};captured={};chars={};hash16={}",
+                self.reasoning_required,
+                self.reasoning_captured,
+                self.reasoning_chars,
+                self.reasoning_hash16
+            )),
+        });
         EvidenceCallRecord {
             schema_version: EVIDENCE_SCHEMA_VERSION.into(),
             run_id: run_id.into(),
@@ -523,6 +538,9 @@ impl BudgetedLlmClient {
             cache_creation_tokens: 0,
         });
         let (tools_offered, tool_steps) = extract_tool_trace(req, resp);
+        let reasoning_content = resp
+            .and_then(|response| response.reasoning_content.as_deref())
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let sample = UsageSample {
             call_index: reserved.call_index,
             evidence_turn_index: reserved.turn_index,
@@ -533,6 +551,12 @@ impl BudgetedLlmClient {
             cached_tokens: usage.cached_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             completion_tokens: usage.completion_tokens,
+            reasoning_required: req.params.reasoning != ReasoningMode::Disabled,
+            reasoning_captured: reasoning_content.is_some(),
+            reasoning_chars: reasoning_content
+                .map(|reasoning| reasoning.chars().count())
+                .unwrap_or(0),
+            reasoning_hash16: reasoning_content.map(short_hash16).unwrap_or_default(),
             request_fp16: reserved.request_fp16.clone(),
             system_hash16: segs.system_hash.chars().take(16).collect(),
             history_hash16: segs.history_hash.chars().take(16).collect(),
@@ -578,6 +602,9 @@ fn safe_llm_error_class(error: &LlmError) -> &'static str {
         LlmError::RateLimited(_) => "rate_limited",
         LlmError::ServerError(_) => "server_error",
         LlmError::StreamParse(_) => "stream_parse",
+        LlmError::MissingReasoning(_) => "missing_reasoning",
+        LlmError::ReasoningTooLarge(_) => "reasoning_too_large",
+        LlmError::ResponseTooLarge(_) => "response_too_large",
         LlmError::Cancelled => "cancelled",
         LlmError::Timeout => "timeout",
         LlmError::Internal(_) => "internal",
@@ -769,7 +796,21 @@ mod tests {
             "second call must be blocked: {second:?}"
         );
         assert_eq!(client.calls_used(), 1);
-        assert_eq!(client.samples().len(), 1);
+        let samples = client.samples();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].reasoning_required);
+        assert!(samples[0].reasoning_captured);
+        assert!(samples[0].reasoning_chars > 0);
+        assert_eq!(samples[0].reasoning_hash16.len(), 16);
+        let evidence = samples[0].to_evidence_call("run", "suite", 1, "model", vec![]);
+        assert!(evidence.assertion_results.iter().any(|assertion| {
+            assertion.name == "reasoning_captured"
+                && assertion.passed
+                && assertion
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("required=true"))
+        }));
     }
 
     #[tokio::test]
@@ -839,6 +880,7 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(ChatResponse {
                     content: "should-not-run".into(),
+                    reasoning_content: None,
                     tool_calls: vec![],
                     finish_reason: None,
                     usage: None,
@@ -935,6 +977,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 Ok(ChatResponse {
                     content: "late".into(),
+                    reasoning_content: None,
                     tool_calls: vec![],
                     finish_reason: None,
                     usage: None,

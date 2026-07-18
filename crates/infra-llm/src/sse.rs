@@ -2,7 +2,7 @@
 ///
 /// 设计来源：TT 的 SseEventAccumulator（手动按行解析 data:，不用 eventsource crate）。
 /// 流程：reqwest::Response::chunk() 循环 → 按 \n 分行 → 解析 data: → 空行时 dispatch。
-use storyforge_domain::llm::{LlmError, StreamChunk};
+use storyforge_domain::llm::{LlmError, MAX_LLM_RESPONSE_BYTES, MAX_REASONING_BYTES, StreamChunk};
 
 /// SSE 事件累积器（解析 data: 字段，空行时产出事件）
 ///
@@ -11,12 +11,18 @@ pub struct SseEventAccumulator {
     data: Vec<u8>,
     /// 累积的完整文本内容
     pub full_content: String,
+    /// 累积的供应商 reasoning/thinking；与可见正文严格分离。
+    pub full_reasoning_content: String,
     /// 累积的工具调用（按 stream index 增量合并）
     pub all_tool_calls: Vec<AccumulatedToolCall>,
     /// 最终的 finish_reason
     pub finish_reason: Option<String>,
     /// 末 chunk 的 usage（需请求时设 stream_options.include_usage=true 才有）
     pub usage: Option<storyforge_domain::llm::Usage>,
+    /// Prompted/Native 在完整响应验证前不得向下游暴露正文。
+    defer_delivery: bool,
+    deferred_chunks: Vec<StreamChunk>,
+    response_bytes: usize,
 }
 
 /// 累积中的工具调用（流式合并用，带 stream index）
@@ -37,10 +43,40 @@ impl SseEventAccumulator {
         Self {
             data: Vec::new(),
             full_content: String::new(),
+            full_reasoning_content: String::new(),
             all_tool_calls: Vec::new(),
             finish_reason: None,
             usage: None,
+            defer_delivery: false,
+            deferred_chunks: Vec::new(),
+            response_bytes: 0,
         }
+    }
+
+    /// 构造一个先完整捕获、验证成功后再统一下发的累积器。
+    pub fn new_deferred() -> Self {
+        Self {
+            defer_delivery: true,
+            ..Self::new()
+        }
+    }
+
+    /// 仅在调用方完成 reasoning fail-closed 校验后调用。
+    pub fn flush_deferred(&mut self, sender: &tokio::sync::mpsc::UnboundedSender<StreamChunk>) {
+        for chunk in self.deferred_chunks.drain(..) {
+            let _ = sender.send(chunk);
+        }
+    }
+
+    fn account_response_bytes(&mut self, additional: usize) -> Result<(), LlmError> {
+        let next = self.response_bytes.saturating_add(additional);
+        if next > MAX_LLM_RESPONSE_BYTES {
+            return Err(LlmError::ResponseTooLarge(format!(
+                "stream bytes={next}, limit={MAX_LLM_RESPONSE_BYTES}"
+            )));
+        }
+        self.response_bytes = next;
+        Ok(())
     }
 
     /// 处理一行数据（不含行尾 \n）
@@ -64,7 +100,18 @@ impl SseEventAccumulator {
             } else {
                 rest
             };
-            if !self.data.is_empty() {
+            let separator_bytes = usize::from(!self.data.is_empty());
+            let next = self
+                .data
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(rest.len());
+            if next > MAX_LLM_RESPONSE_BYTES {
+                return Err(LlmError::ResponseTooLarge(format!(
+                    "raw SSE event bytes={next}, limit={MAX_LLM_RESPONSE_BYTES}"
+                )));
+            }
+            if separator_bytes != 0 {
                 self.data.push(b'\n');
             }
             self.data.extend_from_slice(rest);
@@ -111,11 +158,23 @@ impl SseEventAccumulator {
         let delta = chunk.choices.first().map(|c| &c.delta);
 
         let delta_content = delta.and_then(|d| d.content.clone());
+        let delta_reasoning_content = delta.and_then(|d| d.reasoning_content.clone());
         let chunk_finish = chunk.choices.first().and_then(|c| c.finish_reason.clone());
 
         // 累积完整文本内容
         if let Some(ref text) = delta_content {
+            self.account_response_bytes(text.len())?;
             self.full_content.push_str(text);
+        }
+        if let Some(ref text) = delta_reasoning_content {
+            self.account_response_bytes(text.len())?;
+            let next_len = self.full_reasoning_content.len().saturating_add(text.len());
+            if next_len > MAX_REASONING_BYTES {
+                return Err(LlmError::ReasoningTooLarge(format!(
+                    "stream reasoning bytes={next_len}, limit={MAX_REASONING_BYTES}"
+                )));
+            }
+            self.full_reasoning_content.push_str(text);
         }
         // 累积工具调用（按 index 合并增量：第一个 chunk 给 id/name，后续给 arguments 片段）
         if let Some(calls) = chunk
@@ -124,6 +183,10 @@ impl SseEventAccumulator {
             .and_then(|c| c.delta.tool_calls.as_ref())
         {
             for call in calls {
+                let tool_delta_bytes = call.id.as_ref().map_or(0, String::len)
+                    + call.function.name.as_ref().map_or(0, String::len)
+                    + call.function.arguments.as_ref().map_or(0, String::len);
+                self.account_response_bytes(tool_delta_bytes)?;
                 // 按 index 找已存在的条目（流式合并的关键）
                 if let Some(existing) = self
                     .all_tool_calls
@@ -168,11 +231,16 @@ impl SseEventAccumulator {
         // tool_call 增量已在上面累积，流结束后由调用者从 accumulator 取完整结果）
         let stream_chunk = StreamChunk {
             delta_content,
+            delta_reasoning_content,
             delta_tool_calls: None,
             finish_reason: chunk_finish,
         };
 
-        let _ = sender.send(stream_chunk);
+        if self.defer_delivery {
+            self.deferred_chunks.push(stream_chunk);
+        } else {
+            let _ = sender.send(stream_chunk);
+        }
         Ok(())
     }
 }
@@ -211,6 +279,8 @@ pub(crate) mod openai_types {
     pub struct Delta {
         #[serde(default)]
         pub content: Option<String>,
+        #[serde(default, alias = "reasoning", alias = "thinking")]
+        pub reasoning_content: Option<String>,
         #[serde(default)]
         pub tool_calls: Option<Vec<StreamToolCallDelta>>,
     }
@@ -296,7 +366,98 @@ mod tests {
 
         let chunk = rx.try_recv().unwrap();
         assert_eq!(chunk.delta_content.as_deref(), Some("你好"));
+        assert!(chunk.delta_reasoning_content.is_none());
         assert!(chunk.finish_reason.is_none());
+    }
+
+    #[test]
+    fn test_sse_accumulator_captures_reasoning_content() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+
+        let first =
+            r#"{"choices":[{"delta":{"reasoning_content":"先检查约束，"},"finish_reason":null}]}"#;
+        let second = r#"{"choices":[{"delta":{"reasoning_content":"再生成正文。","content":"正文"},"finish_reason":"stop"}]}"#;
+        for json in [first, second] {
+            acc.on_line(format!("data: {json}").as_bytes(), &tx)
+                .unwrap();
+            acc.on_line(b"", &tx).unwrap();
+        }
+
+        let first_chunk = rx.try_recv().unwrap();
+        assert_eq!(
+            first_chunk.delta_reasoning_content.as_deref(),
+            Some("先检查约束，")
+        );
+        let second_chunk = rx.try_recv().unwrap();
+        assert_eq!(
+            second_chunk.delta_reasoning_content.as_deref(),
+            Some("再生成正文。")
+        );
+        assert_eq!(second_chunk.delta_content.as_deref(), Some("正文"));
+        assert_eq!(acc.full_reasoning_content, "先检查约束，再生成正文。");
+        assert_eq!(acc.full_content, "正文");
+    }
+
+    #[test]
+    fn deferred_accumulator_exposes_nothing_until_explicit_flush() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let event = r#"data: {"choices":[{"delta":{"content":"正文"},"finish_reason":"stop"}]}
+
+"#;
+
+        let mut buffer = Vec::new();
+        let mut acc = SseEventAccumulator::new_deferred();
+        forward_sse_events(event.as_bytes(), &mut buffer, &mut acc, &tx).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        acc.flush_deferred(&tx);
+        assert_eq!(
+            rx.try_recv().unwrap().delta_content.as_deref(),
+            Some("正文")
+        );
+    }
+
+    #[test]
+    fn reasoning_over_limit_fails_instead_of_truncating() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        acc.full_reasoning_content = "x".repeat(MAX_REASONING_BYTES);
+        let event =
+            br#"data: {"choices":[{"delta":{"reasoning_content":"x"},"finish_reason":null}]}
+
+"#;
+        let mut buffer = Vec::new();
+        let error = forward_sse_events(event, &mut buffer, &mut acc, &tx)
+            .expect_err("over-limit reasoning must fail closed");
+        assert!(matches!(error, LlmError::ReasoningTooLarge(_)));
+    }
+
+    #[test]
+    fn total_stream_response_over_limit_fails_before_deferred_buffering() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new_deferred();
+        acc.response_bytes = MAX_LLM_RESPONSE_BYTES;
+        let event = br#"data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}
+
+"#;
+        let mut buffer = Vec::new();
+        let error = forward_sse_events(event, &mut buffer, &mut acc, &tx)
+            .expect_err("over-limit stream must fail before deferred buffering");
+        assert!(matches!(error, LlmError::ResponseTooLarge(_)));
+        assert!(acc.deferred_chunks.is_empty());
+    }
+
+    #[test]
+    fn raw_sse_event_over_limit_fails_before_append() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = SseEventAccumulator::new();
+        acc.data = vec![b'x'; MAX_LLM_RESPONSE_BYTES];
+        let error = acc
+            .on_line(b"data: x", &tx)
+            .expect_err("oversized raw event must fail before append");
+        assert!(matches!(error, LlmError::ResponseTooLarge(_)));
+        assert_eq!(acc.data.len(), MAX_LLM_RESPONSE_BYTES);
     }
 
     #[test]

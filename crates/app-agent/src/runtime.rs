@@ -54,6 +54,46 @@ fn log_usage_observability(role: &AgentRole, round: u32, resp: &ChatResponse, ta
     }
 }
 
+fn capture_reasoning_round(
+    captured: &mut Vec<(u32, String)>,
+    round: u32,
+    response: &ChatResponse,
+) -> Result<(), AgentError> {
+    if let Some(reasoning) = response
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let current_bytes: usize = captured.iter().map(|(_, text)| text.len()).sum();
+        let next_bytes = current_bytes.saturating_add(reasoning.len());
+        if next_bytes > storyforge_domain::llm::MAX_REASONING_BYTES {
+            return Err(AgentError::Llm(
+                storyforge_domain::llm::LlmError::ReasoningTooLarge(format!(
+                    "tool-loop aggregate bytes={next_bytes}, limit={}",
+                    storyforge_domain::llm::MAX_REASONING_BYTES
+                )),
+            ));
+        }
+        captured.push((round, reasoning.to_string()));
+    }
+    Ok(())
+}
+
+fn with_captured_reasoning(mut response: ChatResponse, captured: &[(u32, String)]) -> ChatResponse {
+    response.reasoning_content = match captured {
+        [] => None,
+        [(_, reasoning)] => Some(reasoning.clone()),
+        rounds => Some(
+            rounds
+                .iter()
+                .map(|(round, reasoning)| format!("【LLM round {round}】\n{reasoning}"))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        ),
+    };
+    response
+}
+
 async fn execute_tool_call(
     tc: &ToolCall,
     tool_registry: &ToolRegistry,
@@ -248,6 +288,7 @@ impl AgentRuntime {
     ) -> Result<ChatResponse, AgentError> {
         let mut messages = vec![ChatMessage::system(&config.system_prompt)];
         messages.push(ChatMessage::user(&user_message));
+        let mut captured_reasoning = Vec::new();
 
         for round in 1..=config.max_tool_rounds {
             // 检查取消
@@ -290,6 +331,7 @@ impl AgentRuntime {
                 _ = cancel_fut => return Err(AgentError::Cancelled),
             };
             log_usage_observability(&config.role, round, &resp, "");
+            capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
 
             // 没有工具调用 = 模型直接输出文本
             if resp.tool_calls.is_empty() {
@@ -300,7 +342,7 @@ impl AgentRuntime {
                 {
                     // 检查是否是最终输出（没有工具定义时直接返回）
                     if req.tools.is_none() {
-                        return Ok(resp);
+                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
 
                     // drift recovery：注入提醒
@@ -325,7 +367,7 @@ impl AgentRuntime {
                 // 有内容 = 最终输出
                 info!(target: "app-agent", "{}: 第 {round} 轮完成，content_len={}", 
                     config.role, resp.content.len());
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
 
             // 有工具调用 → 执行
@@ -356,7 +398,7 @@ impl AgentRuntime {
             if successful_terminal_tool {
                 info!(target: "app-agent", "{}: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
         }
 
@@ -386,6 +428,7 @@ impl AgentRuntime {
     ) -> Result<ChatResponse, AgentError> {
         let mut messages = vec![ChatMessage::system(&config.system_prompt)];
         messages.push(ChatMessage::user(&user_message));
+        let mut captured_reasoning = Vec::new();
 
         for round in 1..=config.max_tool_rounds {
             if *cancel.borrow() {
@@ -427,6 +470,7 @@ impl AgentRuntime {
             let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
             let resp = resp_res.map_err(AgentError::Llm)?;
             log_usage_observability(&config.role, round, &resp, "[stream]");
+            capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
 
             // 没有工具调用 = 模型直接输出文本（最终输出）
             if resp.tool_calls.is_empty() {
@@ -438,7 +482,7 @@ impl AgentRuntime {
                     if !resp.content.is_empty() {
                         info!(target: "app-agent", "{}[stream]: 第 {round} 轮完成，content_len={}",
                             config.role, resp.content.len());
-                        return Ok(resp);
+                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
                     messages.push(ChatMessage::user("请输出内容。"));
                     continue;
@@ -452,7 +496,7 @@ impl AgentRuntime {
                         && probe(&resp.content)
                     {
                         info!(target: "app-agent", "{}[stream]: 第 {round} 轮探测到最终结果，提早终止", config.role);
-                        return Ok(resp);
+                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
                     warn!(target: "app-agent", "{}[stream]: 第 {round} 轮未调工具，注入 reminder", config.role);
                     messages.push(ChatMessage::assistant(&resp.content));
@@ -473,7 +517,7 @@ impl AgentRuntime {
 
                 info!(target: "app-agent", "{}[stream]: 第 {round} 轮完成，content_len={}",
                     config.role, resp.content.len());
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
 
             // 有工具调用 → 执行（同 run_tool_loop）
@@ -502,7 +546,7 @@ impl AgentRuntime {
             if successful_terminal_tool {
                 info!(target: "app-agent", "{}[stream]: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
         }
 
@@ -545,6 +589,7 @@ impl AgentRuntime {
         );
         let mut messages = layout.into_messages();
         let rounds = config.max_tool_rounds;
+        let mut captured_reasoning = Vec::new();
 
         for round in 1..=rounds {
             if *cancel.borrow() {
@@ -601,6 +646,7 @@ impl AgentRuntime {
             let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
             let resp = resp_res.map_err(AgentError::Llm)?;
             log_usage_observability(&config.role, round, &resp, "[layout]");
+            capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
 
             // 没有工具调用 = 模型直接输出文本（最终输出）
             if resp.tool_calls.is_empty() {
@@ -612,7 +658,7 @@ impl AgentRuntime {
                     if !resp.content.is_empty() {
                         info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
                             config.role, resp.content.len());
-                        return Ok(resp);
+                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
                     messages.push(ChatMessage::user("请输出内容。"));
                     continue;
@@ -624,7 +670,7 @@ impl AgentRuntime {
                         && probe(&resp.content)
                     {
                         info!(target: "app-agent", "{}[layout]: 第 {round} 轮探测到最终结果，提早终止", config.role);
-                        return Ok(resp);
+                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
                     warn!(target: "app-agent", "{}[layout]: 第 {round} 轮未调工具，注入 reminder", config.role);
                     messages.push(ChatMessage::assistant(&resp.content));
@@ -645,7 +691,7 @@ impl AgentRuntime {
 
                 info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
                     config.role, resp.content.len());
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
 
             // 有工具调用 → 执行
@@ -674,7 +720,7 @@ impl AgentRuntime {
             if successful_terminal_tool {
                 info!(target: "app-agent", "{}[layout]: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
-                return Ok(resp);
+                return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
         }
 
@@ -908,6 +954,7 @@ pub async fn spawn_subagents(
                     dialogue: String::new(),
                     inner_thoughts: String::new(),
                     full_text: resp.content,
+                    reasoning_content: resp.reasoning_content,
                 }),
                 Err(e) => Err(e),
             }
@@ -1186,6 +1233,7 @@ mod tests {
             if !resp.content.is_empty() {
                 let _ = tx.send(StreamChunk {
                     delta_content: Some(resp.content.clone()),
+                    delta_reasoning_content: resp.reasoning_content.clone(),
                     delta_tool_calls: None,
                     finish_reason: resp.finish_reason.clone(),
                 });
@@ -1213,6 +1261,7 @@ mod tests {
 
         ChatResponse {
             content: String::new(),
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: id.into(),
                 call_type: "function".into(),
@@ -1752,6 +1801,7 @@ mod tests {
 
         let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
             content: "hooked response".into(),
+            reasoning_content: None,
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -1818,6 +1868,7 @@ mod tests {
 
         let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
             content: "plain hooked response".into(),
+            reasoning_content: None,
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -1877,6 +1928,7 @@ mod tests {
 
         let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
             content: "stream hooked response".into(),
+            reasoning_content: None,
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -1945,6 +1997,7 @@ mod tests {
 
         let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
             content: "should not be called".into(),
+            reasoning_content: None,
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: Some(Usage {
@@ -2011,6 +2064,7 @@ mod tests {
 
         let llm = Arc::new(SequentialLlmClient::new(vec![ChatResponse {
             content: "subagent ok with enough narrative content to satisfy completion probe".into(),
+            reasoning_content: Some("subagent captured reasoning".into()),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
@@ -2079,6 +2133,13 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .ok()
+                .and_then(|performance| performance.reasoning_content.as_deref()),
+            Some("subagent captured reasoning")
+        );
         assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2091,6 +2152,7 @@ mod tests {
         let llm = Arc::new(SequentialLlmClient::new(vec![
             ChatResponse {
                 content: String::new(),
+                reasoning_content: Some("round one reasoning".into()),
                 tool_calls: vec![ToolCall {
                     id: "bad-args".into(),
                     call_type: "function".into(),
@@ -2109,6 +2171,7 @@ mod tests {
             },
             ChatResponse {
                 content: "fixed".into(),
+                reasoning_content: Some("round two reasoning".into()),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: Some(Usage {
@@ -2162,6 +2225,12 @@ mod tests {
 
         assert_eq!(resp.content, "fixed");
         assert_eq!(
+            resp.reasoning_content.as_deref(),
+            Some(
+                "【LLM round 1】\nround one reasoning\n\n---\n\n【LLM round 2】\nround two reasoning"
+            )
+        );
+        assert_eq!(
             dispatch_count.load(Ordering::SeqCst),
             0,
             "malformed arguments must not dispatch the real tool"
@@ -2176,6 +2245,25 @@ mod tests {
             .expect("bad arguments should be sent back as a tool result");
         assert_eq!(tool_error.tool_call_id.as_deref(), Some("bad-args"));
         assert!(tool_error.content.contains("Invalid JSON arguments"));
+    }
+
+    #[test]
+    fn aggregate_reasoning_over_limit_fails_closed() {
+        let mut captured = vec![(1, "x".repeat(storyforge_domain::llm::MAX_REASONING_BYTES))];
+        let response = ChatResponse {
+            content: String::new(),
+            reasoning_content: Some("y".into()),
+            tool_calls: vec![],
+            finish_reason: None,
+            usage: None,
+        };
+
+        let error = capture_reasoning_round(&mut captured, 2, &response)
+            .expect_err("aggregate over limit must fail closed");
+        assert!(matches!(
+            error,
+            AgentError::Llm(storyforge_domain::llm::LlmError::ReasoningTooLarge(_))
+        ));
     }
 
     // ── 阶段 4：Campaign 模式 spawn_subagents 测试 ──

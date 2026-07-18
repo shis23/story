@@ -2313,6 +2313,7 @@ struct QualityAutofixCtx<'a> {
     event_tx: &'a tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     cancel: watch::Receiver<bool>,
     log_prefix: &'a str,
+    original_provenance: Option<Provenance>,
 }
 
 /// 阶段 B：有界 1× Editor auto-fix。
@@ -2322,7 +2323,14 @@ struct QualityAutofixCtx<'a> {
 async fn quality_gate_with_optional_editor_autofix(
     final_text: String,
     ctx: QualityAutofixCtx<'_>,
-) -> (String, storyforge_domain::turn::QualityReport) {
+) -> Result<
+    (
+        String,
+        storyforge_domain::turn::QualityReport,
+        Option<Provenance>,
+    ),
+    storyforge_app_pipeline::PipelineError,
+> {
     let QualityAutofixCtx {
         pipeline,
         draft_node_id,
@@ -2331,6 +2339,7 @@ async fn quality_gate_with_optional_editor_autofix(
         event_tx,
         cancel,
         log_prefix,
+        original_provenance,
     } = ctx;
     production_postprocess::run_quality_gate_with_optional_editor_autofix(
         final_text,
@@ -2342,6 +2351,7 @@ async fn quality_gate_with_optional_editor_autofix(
             event_tx,
             cancel,
             log_prefix,
+            original_provenance,
         },
     )
     .await
@@ -2588,19 +2598,24 @@ async fn start_writing(
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // SQLite: use the authoritative landed variant id (not the provisional pipeline id).
-        let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
-            final_text,
-            QualityAutofixCtx {
-                pipeline: &mut pipeline,
-                draft_node_id: &landed_draft_node_id,
-                conversation_id: &conversation_id,
-                writing_ctx: &ctx,
-                event_tx: &event_tx,
-                cancel: cancel_rx.clone(),
-                log_prefix: "start_writing",
-            },
-        )
-        .await;
+        let (final_text, quality_report, autofix_provenance) =
+            quality_gate_with_optional_editor_autofix(
+                final_text,
+                QualityAutofixCtx {
+                    pipeline: &mut pipeline,
+                    draft_node_id: &landed_draft_node_id,
+                    conversation_id: &conversation_id,
+                    writing_ctx: &ctx,
+                    event_tx: &event_tx,
+                    cancel: cancel_rx.clone(),
+                    log_prefix: "start_writing",
+                    original_provenance: provenance.clone(),
+                },
+            )
+            .await
+            .map_err(|error| {
+                TauriCommandError::internal(format!("quality auto-fix failed closed: {error}"))
+            })?;
         // 返回给前端的必须是 auto-fix 后的正文
         response_text = Some(final_text.clone());
         // 质量报告挂到刚创建的 Attempt，便于 accept 前复查；auto-fix 后同步 draft_hash。
@@ -2624,9 +2639,12 @@ async fn start_writing(
                 get_campaign_store(),
                 &sink,
             );
-            if let Err(e) =
-                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
-            {
+            if let Err(e) = service.sync_autofix_attempt_with_provenance(
+                identity,
+                &final_text,
+                quality_report.clone(),
+                autofix_provenance.clone(),
+            ) {
                 let combined = service_fail_turn(&sink, identity, e);
                 clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
@@ -2752,6 +2770,16 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
         final_text: &str,
         report: storyforge_domain::turn::QualityReport,
     ) -> Result<(), production_postprocess::ProductionPostprocessError> {
+        self.sync_autofix_with_provenance(identity, final_text, report, None)
+    }
+
+    fn sync_autofix_with_provenance(
+        &self,
+        identity: &production_postprocess::PostprocessIdentity,
+        final_text: &str,
+        report: storyforge_domain::turn::QualityReport,
+        provenance: Option<Provenance>,
+    ) -> Result<(), production_postprocess::ProductionPostprocessError> {
         use production_postprocess::ProductionPostprocessError;
         use storyforge_domain::turn::{AttemptStatus, TurnStatus};
 
@@ -2805,6 +2833,7 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
                 attempt_id: &identity.attempt_id,
                 final_text,
                 quality_report: report,
+                provenance: provenance.clone(),
             })
             .map_err(ProductionPostprocessError::AutofixSync);
         }
@@ -2858,6 +2887,9 @@ impl production_postprocess::TurnAttemptSink for BackendTurnAttemptSink {
             |record| {
                 if let Some(att) = record.find_attempt_mut(&identity.attempt_id) {
                     turn_lifecycle::sync_attempt_after_autofix(att, final_text, report);
+                    if let Some(provenance) = provenance {
+                        att.provenance = Some(provenance);
+                    }
                 }
                 record.touch();
             },
@@ -5449,19 +5481,24 @@ async fn regenerate(
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // regenerate 返回的 node 即当前 node_id（variant 更新）
         let draft_node_for_fix = pipeline_req.node_id.clone();
-        let (final_text, quality_report) = quality_gate_with_optional_editor_autofix(
-            final_text,
-            QualityAutofixCtx {
-                pipeline: &mut pipeline,
-                draft_node_id: &draft_node_for_fix,
-                conversation_id: &pipeline_req.conversation_id,
-                writing_ctx: &ctx,
-                event_tx: &event_tx,
-                cancel: cancel_rx.clone(),
-                log_prefix: "regenerate",
-            },
-        )
-        .await;
+        let (final_text, quality_report, autofix_provenance) =
+            quality_gate_with_optional_editor_autofix(
+                final_text,
+                QualityAutofixCtx {
+                    pipeline: &mut pipeline,
+                    draft_node_id: &draft_node_for_fix,
+                    conversation_id: &pipeline_req.conversation_id,
+                    writing_ctx: &ctx,
+                    event_tx: &event_tx,
+                    cancel: cancel_rx.clone(),
+                    log_prefix: "regenerate",
+                    original_provenance: Some(provenance.clone()),
+                },
+            )
+            .await
+            .map_err(|error| {
+                TauriCommandError::internal(format!("quality auto-fix failed closed: {error}"))
+            })?;
         // 返回给前端的必须是 auto-fix 后的正文
         response_text = Some(final_text.clone());
         // 挂到 regenerate 新建的 Attempt：同步 quality_report + draft_hash（Accept 硬校验）。
@@ -5494,9 +5531,12 @@ async fn regenerate(
                 get_campaign_store(),
                 &sink,
             );
-            if let Err(e) =
-                service.sync_autofix_attempt(identity, &final_text, quality_report.clone())
-            {
+            if let Err(e) = service.sync_autofix_attempt_with_provenance(
+                identity,
+                &final_text,
+                quality_report.clone(),
+                autofix_provenance.clone(),
+            ) {
                 let combined = service_fail_turn(&sink, identity, e);
                 clear_current_cancel_if(&app, &operation_id);
                 return Err(TauriCommandError::internal(format!(
@@ -5643,10 +5683,10 @@ async fn create_connection(
                     "disabled" | "Disabled" | "off" | "none" => {
                         storyforge_domain::llm::ReasoningMode::Disabled
                     }
-                    _ => storyforge_domain::llm::ReasoningMode::Prompted,
+                    _ => storyforge_domain::llm::ReasoningMode::Disabled,
                 })
                 // 新建连接默认 Prompted（与 SamplingParams::default 一致）
-                .unwrap_or(storyforge_domain::llm::ReasoningMode::Prompted),
+                .unwrap_or(storyforge_domain::llm::ReasoningMode::Disabled),
             extra: req.extra,
         },
         tool_mode,
@@ -5764,6 +5804,9 @@ pub struct TestConnectionDto {
     pub model: String,
     pub protocol: String,
     pub tool_mode: String,
+    /// 与正式连接一致；Prompted/Native 测试会验证 reasoning 确实可捕获。
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 /// 测试连接结果
@@ -5789,7 +5832,19 @@ async fn test_connection(
         model: req.model,
         protocol,
         params: SamplingParams {
-            max_tokens: Some(16),
+            max_tokens: Some(256),
+            max_tokens_explicit: true,
+            reasoning: req
+                .reasoning
+                .as_deref()
+                .map(|mode| match mode {
+                    "native" | "Native" => storyforge_domain::llm::ReasoningMode::Native,
+                    "disabled" | "Disabled" | "off" | "none" => {
+                        storyforge_domain::llm::ReasoningMode::Disabled
+                    }
+                    _ => storyforge_domain::llm::ReasoningMode::Disabled,
+                })
+                .unwrap_or(storyforge_domain::llm::ReasoningMode::Disabled),
             ..Default::default()
         },
         tool_mode,
@@ -6059,7 +6114,16 @@ fn message_variant_display_dto(
         display_content: render_variant_display_content(variant, display_scripts, depth),
         created_at: variant.created_at,
         status: variant.status.clone(),
-        provenance: variant.provenance.clone(),
+        // 普通会话读取只返回重 roll 所需的非敏感溯源。reasoning 原文仅由
+        // meta_explain_generation 显式审计命令按需返回，避免页面加载即下发。
+        provenance: variant.provenance.clone().map(|mut provenance| {
+            provenance.director_reasoning = None;
+            provenance.editor_reasoning = None;
+            for subagent in &mut provenance.subagent_results {
+                subagent.reasoning_content = None;
+            }
+            provenance
+        }),
     }
 }
 
@@ -7475,6 +7539,7 @@ impl storyforge_app_meta::meta_conversation::GenerationExplainer for ConvGenerat
         Box::pin(async move {
             match tokio::task::spawn_blocking(move || {
                 explain_generation_from_conversation_store(conv_store, conversation_id, node_id)
+                    .map(storyforge_app_meta::GenerationExplanation::without_reasoning)
             })
             .await
             {
@@ -11408,6 +11473,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| storyforge_domain::llm::ChatResponse {
                     content: "recording mock fallback response".into(),
+                    reasoning_content: Some("recording mock fallback reasoning".into()),
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: None,
@@ -11443,6 +11509,7 @@ mod tests {
             let response = self.next_response();
             let _ = tx.send(storyforge_domain::llm::StreamChunk {
                 delta_content: Some(response.content.clone()),
+                delta_reasoning_content: response.reasoning_content.clone(),
                 delta_tool_calls: if response.tool_calls.is_empty() {
                     None
                 } else {
@@ -11457,6 +11524,7 @@ mod tests {
     fn mock_chat_response(content: impl Into<String>) -> storyforge_domain::llm::ChatResponse {
         storyforge_domain::llm::ChatResponse {
             content: content.into(),
+            reasoning_content: Some("recording mock reasoning".into()),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
@@ -12008,6 +12076,7 @@ mod tests {
         .to_string();
         let mvu_response = ChatResponse {
             content: String::new(),
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "mvu-smoke-tool-call".into(),
                 call_type: "function".into(),
@@ -14632,10 +14701,13 @@ mod tests {
                         character_instance_id: None,
                         display_name: Some("Alice".into()),
                         fallback_reason: None,
+                        reasoning_content: Some("alice reasoning".into()),
                     }],
                     profile_id: Some(Id::from_str("profile-1")),
                     seed: 7,
                     last_hint: Some("try again".into()),
+                    director_reasoning: Some("director reasoning".into()),
+                    editor_reasoning: Some("editor reasoning".into()),
                 }),
             )
             .unwrap();
@@ -14655,9 +14727,12 @@ mod tests {
         assert_eq!(explanation.seed, 7);
         assert_eq!(explanation.profile_id.as_deref(), Some("profile-1"));
         assert_eq!(explanation.last_hint.as_deref(), Some("try again"));
+        assert!(explanation.director_reasoning.is_none());
+        assert!(explanation.editor_reasoning.is_none());
         assert_eq!(explanation.subagents.len(), 1);
         assert_eq!(explanation.subagents[0].character_id, "alice");
         assert_eq!(explanation.subagents[0].display_name, "Alice");
+        assert!(explanation.subagents[0].reasoning_content.is_none());
         assert_eq!(explanation.subagents[0].output_preview, "Alice output");
 
         let _ = std::fs::remove_dir_all(&state.data_dir);
@@ -15227,6 +15302,49 @@ mod tests {
         assert_eq!(
             conversation.nodes[0].variants[0].content,
             "<think>raw chain</think> final raw"
+        );
+    }
+
+    #[test]
+    fn ordinary_conversation_dto_strips_captured_reasoning() {
+        let mut conversation = Conversation::new(Some("source-lin".into()), None);
+        conversation.append_ai_draft(
+            "visible".into(),
+            Some(Provenance {
+                session_id: Id::from_str("session-audit"),
+                plan: None,
+                subagent_results: vec![storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: "lin".into(),
+                    full_text: "performance".into(),
+                    character_instance_id: None,
+                    display_name: None,
+                    fallback_reason: None,
+                    reasoning_content: Some("subagent secret reasoning".into()),
+                }],
+                profile_id: None,
+                seed: 1,
+                last_hint: None,
+                director_reasoning: Some("director secret reasoning".into()),
+                editor_reasoning: Some("editor secret reasoning".into()),
+            }),
+        );
+
+        let dto = conversation_display_dto(&conversation, &[]);
+        let displayed = dto.nodes[0].variants[0]
+            .provenance
+            .as_ref()
+            .expect("non-reasoning provenance remains available");
+        assert!(displayed.director_reasoning.is_none());
+        assert!(displayed.editor_reasoning.is_none());
+        assert!(displayed.subagent_results[0].reasoning_content.is_none());
+
+        let stored = conversation.nodes[0].variants[0]
+            .provenance
+            .as_ref()
+            .expect("stored provenance remains intact for explicit audit");
+        assert_eq!(
+            stored.editor_reasoning.as_deref(),
+            Some("editor secret reasoning")
         );
     }
 

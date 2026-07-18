@@ -65,6 +65,31 @@ pub enum PipelineError {
     InvalidState(String),
 }
 
+fn validate_provenance_reasoning_budget(provenance: &Provenance) -> Result<(), PipelineError> {
+    let total_bytes = provenance
+        .director_reasoning
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(provenance.editor_reasoning.as_ref().map_or(0, String::len))
+        .saturating_add(
+            provenance
+                .subagent_results
+                .iter()
+                .filter_map(|snapshot| snapshot.reasoning_content.as_ref())
+                .map(String::len)
+                .sum::<usize>(),
+        );
+    if total_bytes > storyforge_domain::llm::MAX_PROVENANCE_REASONING_BYTES {
+        return Err(PipelineError::Llm(
+            storyforge_domain::llm::LlmError::ReasoningTooLarge(format!(
+                "provenance aggregate bytes={total_bytes}, limit={}",
+                storyforge_domain::llm::MAX_PROVENANCE_REASONING_BYTES
+            )),
+        ));
+    }
+    Ok(())
+}
+
 // ─── 编剧提示词（role_directive，模块系统通过 assemble_system_prompt 增强）───
 
 const DIRECTOR_SYSTEM_PROMPT: &str = r#"你是写作导演。用户给你写作意图，你要：
@@ -572,6 +597,23 @@ impl PipelineOrchestrator {
         Self::new_with_sampling(llm, conv_store, tool_ctx, mvu_runtime, None, None)
     }
 
+    /// 在非 SQLite-deferred 路径上，把同一 Draft identity 的正文与 provenance
+    /// 一起恢复/覆盖。SQLite 路径由 preaccept UoW 负责原子同步，因此这里不落地。
+    pub fn sync_autofix_draft(
+        &self,
+        conversation_id: &Id,
+        node_id: &Id,
+        text: String,
+        provenance: Option<Provenance>,
+    ) -> Result<(), PipelineError> {
+        if self.defer_conversation_land {
+            return Ok(());
+        }
+        self.conv_store
+            .edit_variant_with_provenance(conversation_id, node_id, text, provenance)
+            .map_err(PipelineError::Conversation)
+    }
+
     /// A1：带连接级采样参数的构造函数。
     /// `sampling` 从 active connection 注入，让 runtime 构建 ChatRequest 时
     /// 携带 reasoning 模式；同时保存到 orchestrator 供 prompt 组装层读取。
@@ -802,6 +844,7 @@ impl PipelineOrchestrator {
                 Some(&|content: &str| {
                     let fake_resp = storyforge_domain::llm::ChatResponse {
                         content: content.to_string(),
+                        reasoning_content: None,
                         tool_calls: vec![],
                         finish_reason: None,
                         usage: None,
@@ -1053,7 +1096,7 @@ impl PipelineOrchestrator {
         // ─── 阶段 4：写入对话树 ─────────────────────────────────────────
         self.state = PipelineState::Review;
 
-        let provenance = build_provenance_with_campaign(
+        let mut provenance = build_provenance_with_campaign(
             session_id.clone(),
             Some(plan.clone()),
             &performances,
@@ -1062,6 +1105,9 @@ impl PipelineOrchestrator {
             None, // last_hint（首次写作无 hint）
             effective_runtime_for_prov.as_deref(),
         );
+        provenance.director_reasoning = director_resp.reasoning_content.clone();
+        provenance.editor_reasoning = editor_resp.reasoning_content.clone();
+        validate_provenance_reasoning_budget(&provenance)?;
 
         // 写入对话树（可 defer：SQLite pre-accept UoW 拥有原子落点）
         let node_id = if self.defer_conversation_land {
@@ -1492,6 +1538,7 @@ impl PipelineOrchestrator {
                     Some(&|content: &str| {
                         let fake_resp = storyforge_domain::llm::ChatResponse {
                             content: content.to_string(),
+                            reasoning_content: None,
                             tool_calls: vec![],
                             finish_reason: None,
                             usage: None,
@@ -1643,6 +1690,7 @@ impl PipelineOrchestrator {
                     template_context.as_ref(),
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
+                    director_resp.reasoning_content.clone(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1660,6 +1708,7 @@ impl PipelineOrchestrator {
                     dialogue: String::new(),
                     inner_thoughts: String::new(),
                     full_text: s.full_text.clone(),
+                    reasoning_content: s.reasoning_content.clone(),
                 })
                 .collect();
 
@@ -1692,6 +1741,7 @@ impl PipelineOrchestrator {
                     template_context.as_ref(),
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
+                    provenance_old.director_reasoning.clone(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1843,6 +1893,7 @@ impl PipelineOrchestrator {
                             dialogue: String::new(),
                             inner_thoughts: String::new(),
                             full_text: resp.content,
+                            reasoning_content: resp.reasoning_content,
                         }),
                         Err(e) => Err(e),
                     }
@@ -1889,6 +1940,7 @@ impl PipelineOrchestrator {
                         dialogue: String::new(),
                         inner_thoughts: String::new(),
                         full_text: snap.full_text.clone(),
+                        reasoning_content: snap.reasoning_content.clone(),
                     });
                 }
             }
@@ -1917,6 +1969,7 @@ impl PipelineOrchestrator {
                     template_context.as_ref(),
                     &ctx.recent_summaries,
                     &ctx.far_memory_hits,
+                    provenance_old.director_reasoning.clone(),
                 )
                 .await?;
             return Ok((final_text, provenance));
@@ -1952,6 +2005,7 @@ impl PipelineOrchestrator {
         template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
         recent_summaries: &[storyforge_domain::agent::RoundSummary],
         far_memory_hits: &[FarMemoryHit],
+        director_reasoning: Option<String>,
     ) -> Result<(String, Provenance), PipelineError> {
         // 编剧开始前，检查取消
         if *cancel.borrow() {
@@ -2046,7 +2100,7 @@ impl PipelineOrchestrator {
             text: final_text.clone(),
         });
 
-        let provenance = build_provenance_with_campaign(
+        let mut provenance = build_provenance_with_campaign(
             session_id.clone(),
             Some(plan.clone()),
             performances,
@@ -2055,6 +2109,9 @@ impl PipelineOrchestrator {
             hint.map(String::from),
             campaign_runtime,
         );
+        provenance.director_reasoning = director_reasoning;
+        provenance.editor_reasoning = editor_resp.reasoning_content.clone();
+        validate_provenance_reasoning_budget(&provenance)?;
 
         // 写入对话树（variant 保留语义）：
         // - 重 roll **最后一条** AI 消息 → replace_active_variant（旧 active 降级
@@ -3212,6 +3269,39 @@ mod tests {
     };
     use storyforge_infra_llm::mock_client::{MockLlmClient, MockScript};
 
+    #[test]
+    fn provenance_reasoning_total_budget_fails_closed() {
+        let reasoning = "x".repeat(storyforge_domain::llm::MAX_REASONING_BYTES);
+        let mut provenance = Provenance {
+            session_id: Id::from_str("reasoning-budget"),
+            plan: None,
+            subagent_results: (0..3)
+                .map(|index| storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: format!("agent-{index}"),
+                    full_text: String::new(),
+                    character_instance_id: None,
+                    display_name: None,
+                    fallback_reason: None,
+                    reasoning_content: Some(reasoning.clone()),
+                })
+                .collect(),
+            profile_id: None,
+            seed: 0,
+            last_hint: None,
+            director_reasoning: Some(reasoning.clone()),
+            editor_reasoning: None,
+        };
+        assert!(validate_provenance_reasoning_budget(&provenance).is_ok());
+
+        provenance.editor_reasoning = Some(reasoning);
+        assert!(matches!(
+            validate_provenance_reasoning_budget(&provenance),
+            Err(PipelineError::Llm(
+                storyforge_domain::llm::LlmError::ReasoningTooLarge(_)
+            ))
+        ));
+    }
+
     /// 构造最小 mock 角色卡（满足 characters 非空校验）
     fn mock_character(name: &str) -> Arc<Character> {
         Arc::new(Character {
@@ -3321,7 +3411,18 @@ mod tests {
         assert!(text.contains("雨中告别") || text.contains("Seraphina") || text.len() > 50);
 
         // 验证 Provenance
-        assert!(provenance.is_some(), "应有 Provenance");
+        let provenance = provenance.expect("应有 Provenance");
+        assert_eq!(
+            provenance.director_reasoning.as_deref(),
+            Some("mock provider reasoning")
+        );
+        assert_eq!(
+            provenance.editor_reasoning.as_deref(),
+            Some("mock provider reasoning")
+        );
+        assert!(provenance.subagent_results.iter().all(|snapshot| {
+            snapshot.reasoning_content.as_deref() == Some("mock provider reasoning")
+        }));
 
         // 验证事件序列（drain 所有已发送的事件）
         let mut events = Vec::new();
@@ -4088,6 +4189,7 @@ mod tests {
                 character_instance_id: None,
                 display_name: None,
                 fallback_reason: None,
+                reasoning_content: None,
             }
         };
         let provenance = Provenance {
@@ -4101,6 +4203,8 @@ mod tests {
             profile_id: None,
             seed: 7,
             last_hint: None,
+            director_reasoning: None,
+            editor_reasoning: None,
         };
 
         let conv = conv_store.create(None, None);
@@ -5436,6 +5540,7 @@ mod tests {
                 dialogue: String::new(),
                 inner_thoughts: String::new(),
                 full_text: "我知道 SF_SECRET_CHEN_BADGE_X91".into(),
+                reasoning_content: None,
             },
             storyforge_domain::agent::Performance {
                 character_id: "inst-chen".into(),
@@ -5443,6 +5548,7 @@ mod tests {
                 dialogue: String::new(),
                 inner_thoughts: String::new(),
                 full_text: "我的秘密是 SF_SECRET_CHEN_BADGE_X91".into(),
+                reasoning_content: None,
             },
         ];
         let contract = NarrativeContract {

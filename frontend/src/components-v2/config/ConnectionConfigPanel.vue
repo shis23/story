@@ -17,7 +17,10 @@ import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import EmptyState from '../ui/EmptyState.vue'
-import { normalizeOptionalMaxTokens } from '../../utils/connectionSampling.js'
+import {
+  normalizeOptionalMaxTokens,
+  normalizeReasoningMode,
+} from '../../utils/connectionSampling.js'
 
 const emit = defineEmits(['close', 'changed'])
 
@@ -39,6 +42,7 @@ const form = reactive({
   temperature: 1.0,
   topP: 0.95,
   maxTokens: null,
+  reasoning: 'disabled',
   // P3-3：厂商扩展参数 JSON 文本（透传到请求体顶层，如 thinking/reasoning_effort）
   extraJson: '',
 })
@@ -86,6 +90,12 @@ const protocolOptions = [
 const toolModeOptions = [
   { value: 'native', label: '原生工具调用' },
   { value: 'text_fallback', label: '文本回退' },
+]
+
+const reasoningOptions = [
+  { value: 'prompted', label: 'Prompted（角色化指引 + 必须捕获）' },
+  { value: 'native', label: 'Native（厂商推理 + 必须捕获）' },
+  { value: 'disabled', label: 'Disabled（不要求推理）' },
 ]
 
 // 当前选中的模板对象（用于显示可选模型）
@@ -156,6 +166,7 @@ function applyTemplate(t) {
   if (t.base_url) form.baseUrl = t.base_url
   if (t.default_model) form.model = t.default_model
   form.toolMode = t.tool_mode === 'Native' ? 'native' : 'text_fallback'
+  form.reasoning = String(t.default_reasoning || 'disabled').toLowerCase()
   fetchedModels.value = [] // 切模板清空在线拉取的模型
 }
 
@@ -180,6 +191,7 @@ async function handleTest() {
       model: form.model,
       protocol: form.protocol,
       toolMode: form.toolMode,
+      reasoning: form.reasoning,
     })
   } catch (e) {
     testResult.value = { success: false, message: String(e) }
@@ -205,10 +217,12 @@ async function handleSave() {
     return
   }
   let maxTokens
+  let reasoning
   try {
     maxTokens = normalizeOptionalMaxTokens(form.maxTokens)
+    reasoning = normalizeReasoningMode(form.reasoning)
   } catch (e) {
-    error.value = 'max_tokens 必须是正整数，留空则使用模型默认上限'
+    error.value = String(e.message || e)
     return
   }
   saving.value = true
@@ -226,6 +240,7 @@ async function handleSave() {
       topP: parseFloat(form.topP),
       maxTokens,
       maxTokensExplicit: maxTokens !== null,
+      reasoning,
       extra,
     })
     await loadConnections()
@@ -378,6 +393,15 @@ async function handleSetActive(id) {
           <div class="space-y-1">
             <label class="text-[11px] text-ink-soft">工具调用模式</label>
             <Select v-model="form.toolMode" :options="toolModeOptions" />
+          </div>
+
+          <!-- 推理与捕获模式 -->
+          <div class="space-y-1">
+            <label class="text-[11px] text-ink-soft">推理模式</label>
+            <Select v-model="form.reasoning" :options="reasoningOptions" />
+            <div class="text-[10px] text-ink-faint">
+              Prompted/Native 会要求供应商返回 reasoning_content；缺失时本次生成失败，不再静默丢失思维链。
+            </div>
           </div>
 
           <!-- api_key -->

@@ -153,6 +153,7 @@ fn production_gateway_preaccept_lifecycle_full_matrix() {
         attempt_id: &attempt_id,
         final_text: fixed,
         quality_report: report.clone(),
+        provenance: None,
     })
     .expect("gateway sync_autofix");
     conversations.invalidate();

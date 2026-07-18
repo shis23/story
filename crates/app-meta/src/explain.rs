@@ -19,6 +19,8 @@ pub struct SubagentExplain {
     pub output_preview: String,
     /// fallback 原因（若有，如 "instance not found, fell back to context_package"）
     pub fallback_reason: Option<String>,
+    /// 供应商实际返回的子 Agent reasoning/thinking。
+    pub reasoning_content: Option<String>,
 }
 
 /// 本轮生成的确定性解释（纯数据，零 LLM）
@@ -34,6 +36,23 @@ pub struct GenerationExplanation {
     pub profile_id: Option<String>,
     /// 随机种子
     pub seed: u64,
+    /// 供应商实际返回的导演 reasoning/thinking。
+    pub director_reasoning: Option<String>,
+    /// 供应商实际返回的编剧 reasoning/thinking。
+    pub editor_reasoning: Option<String>,
+}
+
+impl GenerationExplanation {
+    /// 给外部 Meta Agent 的安全投影。保留生成结构与摘要，但不把原始 reasoning
+    /// 再发送给另一个模型；原文只通过本地显式审计命令展示。
+    pub fn without_reasoning(mut self) -> Self {
+        self.director_reasoning = None;
+        self.editor_reasoning = None;
+        for subagent in &mut self.subagents {
+            subagent.reasoning_content = None;
+        }
+        self
+    }
 }
 
 /// 从 Provenance 确定性生成解释（零 LLM）
@@ -90,6 +109,7 @@ pub fn explain_generation(provenance: &Provenance) -> GenerationExplanation {
                     .map(|b| b.to_string()),
                 output_preview,
                 fallback_reason: s.fallback_reason.clone(),
+                reasoning_content: s.reasoning_content.clone(),
             }
         })
         .collect();
@@ -103,6 +123,8 @@ pub fn explain_generation(provenance: &Provenance) -> GenerationExplanation {
             .as_ref()
             .map(|id| id.as_str().to_string()),
         seed: provenance.seed,
+        director_reasoning: provenance.director_reasoning.clone(),
+        editor_reasoning: provenance.editor_reasoning.clone(),
     }
 }
 
@@ -146,6 +168,7 @@ mod tests {
                     character_instance_id: None,
                     display_name: Some("Alice".into()),
                     fallback_reason: None,
+                    reasoning_content: Some("alice reasoning".into()),
                 },
                 SubagentSnapshot {
                     character_id: "bob".into(),
@@ -155,11 +178,14 @@ mod tests {
                     character_instance_id: None,
                     display_name: Some("Bob".into()),
                     fallback_reason: None,
+                    reasoning_content: Some("bob reasoning".into()),
                 },
             ],
             profile_id: Some(Id::from_str("profile-1")),
             seed: 42,
             last_hint: None,
+            director_reasoning: Some("director reasoning".into()),
+            editor_reasoning: Some("editor reasoning".into()),
         }
     }
 
@@ -179,6 +205,18 @@ mod tests {
         assert!(explanation.subagents[0].output_preview.contains("Alice"));
         assert_eq!(explanation.seed, 42);
         assert_eq!(explanation.profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(
+            explanation.director_reasoning.as_deref(),
+            Some("director reasoning")
+        );
+        assert_eq!(
+            explanation.editor_reasoning.as_deref(),
+            Some("editor reasoning")
+        );
+        assert_eq!(
+            explanation.subagents[0].reasoning_content.as_deref(),
+            Some("alice reasoning")
+        );
     }
 
     #[test]

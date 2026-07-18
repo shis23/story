@@ -47,17 +47,18 @@ pub enum LlmProtocol {
 
 /// 推理模式（三选一，互斥）
 ///
-/// 架构文档 §3 P1 + §6.2：原生 reasoning 与提示式 CoT 不可同时启用。
-/// 此枚举是单一事实来源；`build_request_body` 和 CoT 模块选择都读它。
+/// 架构文档 §3 P1 + §6.2：原生推理引导与提示式 CoT 引导互斥。
+/// 传输层如何启用 thinking/reasoning 由连接的 `extra` 厂商参数决定，
+/// 不把非标准字段强加给所有 OpenAI-compatible 服务。
 ///
 /// - `Disabled`：不启用任何推理引导。
 /// - `Native`：使用厂商原生 thinking/reasoning（如 DeepSeek-R1、Claude extended thinking）。
 ///   此时 CoT 提示模块**不会**注入系统提示，避免双重推理。
-/// - `Prompted`：使用提示词内嵌的思维链指引（角色化 CoT 模块）。
-///   此时请求体**不**带 thinking/reasoning 字段。
+/// - `Prompted`：使用提示词内嵌的思维链指引（角色化 CoT 模块），并要求供应商
+///   显式返回 thinking/reasoning 以供捕获；缺失时调用 fail-closed。
 ///
-/// 枚举 `Default` 仍为 `Disabled`，保证旧 JSON 缺字段反序列化不改语义；
-/// 新建连接 / `SamplingParams::default()` 的产品默认见采样参数默认值（Prompted）。
+/// 枚举与采样参数默认均为 `Disabled`，保证未知供应商/模型不会收到不支持的
+/// thinking 参数；需要审计捕获的连接必须显式选择 Prompted/Native。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningMode {
     #[default]
@@ -72,9 +73,9 @@ pub enum ReasoningMode {
 /// reasoning_effort 等非标准字段，避免每加一个扩展就改结构体。值为 JSON，
 /// 支持 `{"type":"enabled"}`（thinking）或 `"max"`（reasoning_effort）等任意形态。
 ///
-/// `reasoning` 是结构化的推理模式开关（A1）。当 `reasoning == Native` 时，
-/// `build_request_body` 会自动注入标准 thinking 参数；用户仍可通过 `extra`
-/// 覆盖或添加厂商特有字段（如 `reasoning_effort`）。
+/// `reasoning` 是结构化的推理模式开关（A1）。当 `reasoning != Disabled` 时，
+/// 客户端要求响应中必须捕获到 reasoning；厂商请求参数通过 `extra` 明确配置
+/// （如 `thinking` / `reasoning_effort`），避免假设存在通用协议字段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: Option<f32>,
@@ -103,8 +104,7 @@ impl Default for SamplingParams {
             // still leaked into connection records and direct request consumers.
             max_tokens: None,
             max_tokens_explicit: false,
-            // 产品默认走 Prompted：注入角色化 CoT；旧连接 JSON 缺字段仍反序列化为 Disabled。
-            reasoning: ReasoningMode::Prompted,
+            reasoning: ReasoningMode::Disabled,
             extra: None,
         }
     }
@@ -141,6 +141,9 @@ pub struct ConnectionTemplate {
     pub get_key_hint: String,
     /// 默认工具模式
     pub tool_mode: ToolMode,
+    /// 模板默认推理模式。仅在模板明确知道默认模型支持返回 reasoning 时启用。
+    #[serde(default)]
+    pub default_reasoning: ReasoningMode,
 }
 
 /// 内置连接模板（M1 只含 OpenAI 兼容协议的；Anthropic/Gemini 原生留 TODO）
@@ -158,6 +161,7 @@ pub fn builtin_connection_templates() -> Vec<ConnectionTemplate> {
             models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
             get_key_hint: "到 platform.deepseek.com 申请".into(),
             tool_mode: ToolMode::Native,
+            default_reasoning: ReasoningMode::Disabled,
         },
         ConnectionTemplate {
             id: "siliconflow".into(),
@@ -173,6 +177,7 @@ pub fn builtin_connection_templates() -> Vec<ConnectionTemplate> {
             ],
             get_key_hint: "到 cloud.siliconflow.cn 申请".into(),
             tool_mode: ToolMode::Native,
+            default_reasoning: ReasoningMode::Disabled,
         },
         ConnectionTemplate {
             id: "openai".into(),
@@ -183,6 +188,7 @@ pub fn builtin_connection_templates() -> Vec<ConnectionTemplate> {
             models: vec!["gpt-4o-mini".into(), "gpt-4o".into()],
             get_key_hint: "到 platform.openai.com 申请".into(),
             tool_mode: ToolMode::Native,
+            default_reasoning: ReasoningMode::Disabled,
         },
         ConnectionTemplate {
             id: "custom".into(),
@@ -193,6 +199,7 @@ pub fn builtin_connection_templates() -> Vec<ConnectionTemplate> {
             models: vec![],
             get_key_hint: "填入兼容 OpenAI 协议的服务地址".into(),
             tool_mode: ToolMode::Native,
+            default_reasoning: ReasoningMode::Disabled,
         },
     ]
 }
@@ -346,10 +353,28 @@ pub struct ChatRequest {
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub content: String,
+    /// 供应商显式返回的 reasoning/thinking 正文。
+    ///
+    /// 这不是从最终答案反推的内容；仅保存 API 实际返回的
+    /// `reasoning_content` / `reasoning` / `thinking` 字段。
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
 }
+
+/// 单次供应商响应允许保留的 reasoning 上限。
+///
+/// 超限时整次调用失败，不截断或伪装成完整捕获，避免 provider 驱动的
+/// 内存/SQLite 放大，同时维持“捕获必须完整”的 fail-closed 语义。
+pub const MAX_REASONING_BYTES: usize = 1024 * 1024;
+
+/// 单个最终 Provenance（导演 + Editor + 全部子 Agent）的 reasoning 总预算。
+/// 单响应与整轮双层限额共同防止子 Agent 数量放大持久化体积。
+pub const MAX_PROVENANCE_REASONING_BYTES: usize = 4 * MAX_REASONING_BYTES;
+
+/// 单次 HTTP/SSE 响应的总传输预算（正文、reasoning、工具调用增量合计）。
+pub const MAX_LLM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Token 用量
 ///
@@ -375,6 +400,8 @@ pub struct Usage {
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
     pub delta_content: Option<String>,
+    /// 供应商显式返回的流式 reasoning/thinking 增量；不得混入可见正文。
+    pub delta_reasoning_content: Option<String>,
     pub delta_tool_calls: Option<Vec<ToolCall>>,
     pub finish_reason: Option<String>,
 }
@@ -399,6 +426,15 @@ pub enum LlmError {
 
     #[error("流式解析错误: {0}")]
     StreamParse(String),
+
+    #[error("推理捕获缺失: {0}")]
+    MissingReasoning(String),
+
+    #[error("推理捕获超限: {0}")]
+    ReasoningTooLarge(String),
+
+    #[error("LLM 响应超限: {0}")]
+    ResponseTooLarge(String),
 
     #[error("取消")]
     Cancelled,
@@ -551,9 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn sampling_params_default_reasoning_is_prompted() {
+    fn sampling_params_default_reasoning_is_disabled() {
         let params = SamplingParams::default();
-        assert_eq!(params.reasoning, ReasoningMode::Prompted);
+        assert_eq!(params.reasoning, ReasoningMode::Disabled);
     }
 
     #[test]
@@ -574,6 +610,15 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         let deserialized: SamplingParams = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.reasoning, ReasoningMode::Native);
+    }
+
+    #[test]
+    fn builtin_templates_do_not_claim_reasoning_capture_for_unsupported_defaults() {
+        assert!(
+            builtin_connection_templates()
+                .iter()
+                .all(|template| template.default_reasoning == ReasoningMode::Disabled)
+        );
     }
 
     // ─── A2：Usage 缓存字段测试 ──────────────────────────────────────────

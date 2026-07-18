@@ -438,7 +438,7 @@ fn register_meta_runtime_tools(registry: &mut ToolRegistry, session: Arc<MetaSes
     registry.register(
         ToolSpec::function(
             "inspect_generation",
-            "解释某条消息的生成溯源。返回该轮的场景简述、各子 Agent 的角色/任务/输出摘要、最后的编剧提示、所用 Agent Profile 和随机种子。当用户问「为什么这么写」「这轮是怎么生成的」时调用。",
+            "解释某条消息的生成溯源。返回该轮的场景简述、各子 Agent 的角色/任务/输出摘要、最后的编剧提示、所用 Agent Profile 和随机种子；原始 reasoning 不会发送给 Meta 模型，只能由用户在本地生成溯源界面显式查看。当用户问「为什么这么写」「这轮是怎么生成的」时调用。",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -861,10 +861,13 @@ mod tests {
                 task_brief: Some("扮演 Alice，表达离别的不舍".into()),
                 output_preview: "Alice 望着窗外的雨。".into(),
                 fallback_reason: None,
+                reasoning_content: Some("alice reasoning".into()),
             }],
             last_hint: None,
             profile_id: Some("default".into()),
             seed: 42,
+            director_reasoning: Some("director reasoning".into()),
+            editor_reasoning: Some("editor reasoning".into()),
         }
     }
 

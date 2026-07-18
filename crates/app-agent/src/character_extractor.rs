@@ -256,6 +256,7 @@ pub mod tests {
     fn make_resp(content: &str, tool_calls: Vec<ToolCall>) -> ChatResponse {
         ChatResponse {
             content: content.into(),
+            reasoning_content: None,
             tool_calls,
             finish_reason: Some("stop".into()),
             usage: Some(Usage {

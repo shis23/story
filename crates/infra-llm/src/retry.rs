@@ -178,6 +178,7 @@ mod tests {
             } else {
                 Ok(ChatResponse {
                     content: "ok".into(),
+                    reasoning_content: None,
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: None,
@@ -196,6 +197,7 @@ mod tests {
             if let Ok(ref resp) = result {
                 let _ = tx.send(StreamChunk {
                     delta_content: Some(resp.content.clone()),
+                    delta_reasoning_content: resp.reasoning_content.clone(),
                     delta_tool_calls: None,
                     finish_reason: Some("stop".into()),
                 });
@@ -218,6 +220,9 @@ mod tests {
                 LlmError::RateLimited(s) => LlmError::RateLimited(s.clone()),
                 LlmError::ServerError(s) => LlmError::ServerError(s.clone()),
                 LlmError::StreamParse(s) => LlmError::StreamParse(s.clone()),
+                LlmError::MissingReasoning(s) => LlmError::MissingReasoning(s.clone()),
+                LlmError::ReasoningTooLarge(s) => LlmError::ReasoningTooLarge(s.clone()),
+                LlmError::ResponseTooLarge(s) => LlmError::ResponseTooLarge(s.clone()),
                 LlmError::Cancelled => LlmError::Cancelled,
                 LlmError::Timeout => LlmError::Timeout,
                 LlmError::Internal(s) => LlmError::Internal(s.clone()),

@@ -33,6 +33,7 @@ use storyforge_app_pipeline::{PipelineOrchestrator, RegenerateRequest, WritingCo
 use storyforge_domain::Id;
 use storyforge_domain::agent::{PipelineEvent, RoundSummary};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
+use storyforge_domain::conversation::Provenance;
 use storyforge_domain::turn::{
     AttemptStatus, DerivationComponents, DerivationStatus, Mutation, MutationBatch,
     MutationBatchStatus, QualityReport, TurnStatus,
@@ -161,14 +162,32 @@ pub struct QualityAutofixRequest<'a> {
     pub event_tx: &'a tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     pub cancel: watch::Receiver<bool>,
     pub log_prefix: &'a str,
+    /// 当前已落 Draft 的原始溯源；二次质量门失败时与原稿一同恢复。
+    pub original_provenance: Option<storyforge_domain::conversation::Provenance>,
+}
+
+fn quality_report_needs_editor_autofix(report: &QualityReport) -> bool {
+    !report.passed()
+}
+
+fn autofix_result_can_replace_original(report: &QualityReport) -> bool {
+    !report.has_errors()
 }
 
 /// Run the deterministic NarrativeContract quality gate, then perform at most
-/// one real Editor-only regenerate when Error-severity findings exist.
+/// one real Editor-only regenerate whenever any finding exists. The full report
+/// is returned as the Editor hint, including Warning-level style findings.
 pub async fn run_quality_gate_with_optional_editor_autofix(
     mut final_text: String,
     request: QualityAutofixRequest<'_>,
-) -> (String, QualityReport) {
+) -> Result<
+    (
+        String,
+        QualityReport,
+        Option<storyforge_domain::conversation::Provenance>,
+    ),
+    storyforge_app_pipeline::PipelineError,
+> {
     let QualityAutofixRequest {
         pipeline,
         draft_node_id,
@@ -177,7 +196,9 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
         event_tx,
         cancel,
         log_prefix,
+        original_provenance,
     } = request;
+    let original_text = final_text.clone();
     let contract = pipeline
         .session()
         .and_then(|session| session.plan.as_ref())
@@ -199,12 +220,13 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
         }
     }
 
-    if quality_report.has_errors() {
+    if quality_report_needs_editor_autofix(&quality_report) {
         let hint = storyforge_app_pipeline::quality_gate::build_quality_fix_hint(&quality_report);
         tracing::info!(
             target: "quality_gate",
-            "{log_prefix} quality errors={}, trying bounded 1x Editor auto-fix",
-            quality_report.error_count()
+            "{log_prefix} quality errors={}, warnings={}, trying bounded 1x Editor auto-fix",
+            quality_report.error_count(),
+            quality_report.warnings.len()
         );
         let regenerate = RegenerateRequest {
             conversation_id: conversation_id.clone(),
@@ -217,8 +239,7 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
             .regenerate(regenerate, writing_ctx, event_tx.clone(), cancel)
             .await
         {
-            Ok((fixed_text, _)) => {
-                final_text = fixed_text;
+            Ok((fixed_text, fixed_provenance)) => {
                 let contract = pipeline
                     .session()
                     .and_then(|session| session.plan.as_ref())
@@ -228,12 +249,36 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
                             writing_ctx.campaign_runtime.as_deref(),
                         )
                     });
-                quality_report =
+                let fixed_report =
                     storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
-                        &final_text,
+                        &fixed_text,
                         contract.as_ref(),
                     );
-                emit_quality_checked(event_tx, &quality_report);
+                emit_quality_checked(event_tx, &fixed_report);
+                if !autofix_result_can_replace_original(&fixed_report) {
+                    tracing::warn!(
+                        target: "quality_gate",
+                        "{log_prefix} bounded Editor auto-fix still has {} error(s); restoring original draft",
+                        fixed_report.error_count()
+                    );
+                    pipeline.sync_autofix_draft(
+                        conversation_id,
+                        draft_node_id,
+                        original_text.clone(),
+                        original_provenance.clone(),
+                    )?;
+                    final_text = original_text;
+                    quality_report =
+                        storyforge_app_pipeline::quality_gate::run_quality_gate_with_contract(
+                            &final_text,
+                            contract.as_ref(),
+                        );
+                    emit_quality_checked(event_tx, &quality_report);
+                } else {
+                    final_text = fixed_text;
+                    quality_report = fixed_report;
+                    return Ok((final_text, quality_report, Some(fixed_provenance)));
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -244,7 +289,7 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
         }
     }
 
-    (final_text, quality_report)
+    Ok((final_text, quality_report, None))
 }
 
 fn emit_quality_checked(
@@ -303,6 +348,18 @@ pub trait TurnAttemptSink: Send + Sync {
         final_text: &str,
         report: QualityReport,
     ) -> Result<(), ProductionPostprocessError>;
+
+    /// 与 `sync_autofix` 相同，但当 Editor auto-fix 真正被采用时，同时把最终
+    /// provenance/reasoning 与正文、draft_hash 原子对齐。默认实现保持旧适配器兼容。
+    fn sync_autofix_with_provenance(
+        &self,
+        identity: &PostprocessIdentity,
+        final_text: &str,
+        report: QualityReport,
+        _provenance: Option<Provenance>,
+    ) -> Result<(), ProductionPostprocessError> {
+        self.sync_autofix(identity, final_text, report)
+    }
 
     /// Returns Ok(true) when the attempt was current and writeback applied.
     /// Scope and attempt presence must already be validated by the service.
@@ -565,6 +622,17 @@ impl<'a> ProductionPostprocessService<'a> {
         report: QualityReport,
     ) -> Result<(), ProductionPostprocessError> {
         self.sink.sync_autofix(identity, final_text, report)
+    }
+
+    pub fn sync_autofix_attempt_with_provenance(
+        &self,
+        identity: &PostprocessIdentity,
+        final_text: &str,
+        report: QualityReport,
+        provenance: Option<Provenance>,
+    ) -> Result<(), ProductionPostprocessError> {
+        self.sink
+            .sync_autofix_with_provenance(identity, final_text, report, provenance)
     }
 
     /// Map runner output into DerivationComponents (summary/state tracked separately).
@@ -1308,6 +1376,75 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn style_warnings_require_editor_autofix_feedback() {
+        use storyforge_domain::turn::{QualitySeverity, QualityWarning, QualityWarningCode};
+
+        let report = QualityReport {
+            warnings: vec![
+                QualityWarning {
+                    code: QualityWarningCode::EmDashDensity { count: 1 },
+                    message: "草稿含破折号 1 处".into(),
+                    severity: QualitySeverity::Warning,
+                },
+                QualityWarning {
+                    code: QualityWarningCode::NegationThenAffirmation {
+                        sample: "不是甲，而是乙".into(),
+                    },
+                    message: "草稿含否后肯结构".into(),
+                    severity: QualitySeverity::Warning,
+                },
+            ],
+        };
+
+        assert!(quality_report_needs_editor_autofix(&report));
+    }
+
+    #[test]
+    fn every_quality_warning_is_returned_to_editor_once() {
+        use storyforge_domain::turn::{QualitySeverity, QualityWarning, QualityWarningCode};
+
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::NgramRepetition {
+                    n: 4,
+                    count: 3,
+                    sample: "重复片段".into(),
+                },
+                message: "轻微重复".into(),
+                severity: QualitySeverity::Warning,
+            }],
+        };
+
+        assert!(quality_report_needs_editor_autofix(&report));
+    }
+
+    #[test]
+    fn autofix_with_remaining_error_cannot_replace_original() {
+        use storyforge_domain::turn::{QualitySeverity, QualityWarning, QualityWarningCode};
+
+        let error_report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::PrivateKnowledgeLeak {
+                    secret_fingerprint: "deadbeef".into(),
+                    owner_id: None,
+                },
+                message: "private leak".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        assert!(!autofix_result_can_replace_original(&error_report));
+
+        let warning_only = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::EmDashDensity { count: 1 },
+                message: "one dash".into(),
+                severity: QualitySeverity::Warning,
+            }],
+        };
+        assert!(autofix_result_can_replace_original(&warning_only));
     }
 
     #[tokio::test]

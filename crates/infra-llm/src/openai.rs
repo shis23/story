@@ -30,14 +30,9 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         }
     }
 
-    // A1：ReasoningMode::Native 自动注入标准 thinking 参数。
-    // 用户可通过 extra 覆盖（extra 先注入，reasoning 后注入——但 Native 只在
-    // body 缺少 thinking 字段时补默认值，避免覆盖用户显式设置）。
-    if req.params.reasoning == storyforge_domain::llm::ReasoningMode::Native
-        && body.get("thinking").is_none()
-    {
-        body["thinking"] = serde_json::json!({ "type": "enabled" });
-    }
+    // thinking/reasoning_effort 不是 OpenAI-compatible 的通用字段。
+    // 需要它们的供应商由连接 `extra` 明确提供；ReasoningMode 只控制提示模块
+    // 与响应捕获要求，避免 gpt-4o / 普通 Qwen 等模型因未知字段直接 400。
 
     // 工具定义
     if let Some(tools) = &req.tools
@@ -105,6 +100,14 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse, String> 
         .unwrap_or("")
         .to_string();
 
+    // OpenAI-compatible providers use several names for surfaced reasoning.
+    // Preserve the exact returned string; never reconstruct reasoning from content.
+    let reasoning_content = ["reasoning_content", "reasoning", "thinking"]
+        .iter()
+        .find_map(|key| message.get(*key).and_then(|value| value.as_str()))
+        .filter(|text| !text.trim().is_empty())
+        .map(String::from);
+
     let tool_calls: Vec<ToolCall> = match message.get("tool_calls") {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
             tracing::warn!(target: "openai", "tool_calls 反序列化失败，已忽略: {e}");
@@ -123,6 +126,7 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse, String> 
 
     Ok(ChatResponse {
         content,
+        reasoning_content,
         tool_calls,
         finish_reason,
         usage,
@@ -223,9 +227,51 @@ mod tests {
 
         let resp = parse_response(&body).unwrap();
         assert_eq!(resp.content, "你好世界");
+        assert!(resp.reasoning_content.is_none());
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
         assert_eq!(resp.usage.unwrap().total_tokens, 15);
+    }
+
+    #[test]
+    fn test_parse_response_captures_provider_reasoning_content() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "先核对叙事契约，再按单一焦点合并。",
+                    "content": "正文"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&body).unwrap();
+        assert_eq!(resp.content, "正文");
+        assert_eq!(
+            resp.reasoning_content.as_deref(),
+            Some("先核对叙事契约，再按单一焦点合并。")
+        );
+    }
+
+    #[test]
+    fn test_parse_response_accepts_reasoning_alias() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "provider alias reasoning",
+                    "content": "answer"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&body).unwrap();
+        assert_eq!(
+            resp.reasoning_content.as_deref(),
+            Some("provider alias reasoning")
+        );
     }
 
     #[test]
@@ -256,7 +302,7 @@ mod tests {
     // ─── A1：ReasoningMode 注入测试 ─────────────────────────────────────
 
     #[test]
-    fn test_native_reasoning_injects_thinking() {
+    fn test_native_reasoning_does_not_invent_provider_thinking_parameter() {
         let req = ChatRequest {
             messages: vec![ChatMessage::user("test")],
             tools: None,
@@ -265,6 +311,40 @@ mod tests {
                 ..Default::default()
             },
             model: "deepseek-reasoner".into(),
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_prompted_reasoning_does_not_invent_provider_thinking_parameter() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Prompted,
+                ..Default::default()
+            },
+            model: "deepseek-v4-flash".into(),
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_prompted_reasoning_preserves_explicit_provider_thinking_parameter() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Prompted,
+                extra: Some(serde_json::Map::from_iter([(
+                    "thinking".into(),
+                    serde_json::json!({ "type": "enabled" }),
+                )])),
+                ..Default::default()
+            },
+            model: "deepseek-v4-flash".into(),
         };
         let body = build_request_body(&req);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -287,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_extra_overrides_default() {
-        // 用户通过 extra 显式设置 thinking，Native 不应覆盖
+        // 用户通过 extra 显式设置 thinking，Native 应原样保留
         let mut extra = serde_json::Map::new();
         extra.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
         let req = ChatRequest {
@@ -301,7 +381,6 @@ mod tests {
             model: "test".into(),
         };
         let body = build_request_body(&req);
-        // extra 先注入 thinking=disabled，Native 检测到 thinking 已存在，不覆盖
         assert_eq!(body["thinking"]["type"], "disabled");
     }
 
