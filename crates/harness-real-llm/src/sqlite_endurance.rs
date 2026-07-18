@@ -92,6 +92,13 @@ impl PipelineObservationCollector {
             PipelineEvent::PostProcessDone { .. } => {
                 self.agent_roles.insert("postprocessor".into());
             }
+            // Postprocess is intentionally best-effort in production. Record a
+            // failed attempt as an exercised postprocessor role so a degraded
+            // turn can be accepted and audited instead of being mistaken for
+            // a missing agent invocation.
+            PipelineEvent::PostProcessFailed { .. } => {
+                self.agent_roles.insert("postprocessor".into());
+            }
             _ => {}
         }
     }

@@ -371,6 +371,18 @@ fn pipeline_observation_collector_only_attests_real_agent_events() {
 }
 
 #[test]
+fn pipeline_observation_collector_attests_best_effort_postprocess_failure() {
+    let mut collector = PipelineObservationCollector::default();
+    collector.observe(&PipelineEvent::PostProcessFailed {
+        reason: "redacted failure".into(),
+    });
+    assert_eq!(collector.agent_events(), vec!["postprocessor".to_string()]);
+    collector
+        .require_roles(&["postprocessor"])
+        .expect("a failed best-effort attempt is still an exercised role");
+}
+
+#[test]
 fn run_level_connection_modes_replace_schedule_only_labels() {
     let scheduled = ScheduledAction::Write {
         subagent_count: 2,
