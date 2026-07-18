@@ -43,7 +43,7 @@ use crate::endurance::{PrivateProbeKind, WorldInfoRouteSlot};
 use crate::evidence::short_hash16;
 use crate::production_evidence::{ProductionPostprocessProof, mutation_batch_digest};
 
-const FIXTURE_REL: &str = "fixtures/m5_sqlite_endurance_v1.json";
+const FIXTURE_REL: &str = "fixtures/cot_three_arm_80turn_v1.json";
 const RETRYABLE_QUALITY_BLOCKED_PREFIX: &str = "retryable_quality_blocked:";
 
 pub fn is_retryable_quality_blocked_error(error: &str) -> bool {
@@ -235,6 +235,35 @@ struct FixtureRoot {
     definitions: Vec<FixtureDefinition>,
     #[serde(default)]
     tasks: Vec<FixtureTask>,
+    #[serde(default)]
+    evaluation: Option<FixtureEvaluation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureEvaluation {
+    target_turns: u32,
+    #[serde(default)]
+    checkpoint_turns: Vec<u32>,
+    turn_script: Vec<FixtureTurnSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FixtureTurnSpec {
+    pub turn: u32,
+    pub action: String,
+    #[serde(default)]
+    pub subagent_count: u32,
+    #[serde(default)]
+    pub world_info_route: String,
+    pub intent: String,
+    #[serde(default)]
+    pub fault_profile: Option<String>,
+    #[serde(default)]
+    pub summary_probe: Option<String>,
+    #[serde(default)]
+    pub must_retrieve: Vec<String>,
+    #[serde(default)]
+    pub checkpoint_after_accept: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +288,18 @@ struct FixtureWorldInfo {
     constant: bool,
     selective: bool,
     route: String,
+    #[serde(default)]
+    secondary_keys: Vec<String>,
+    #[serde(default)]
+    selective_logic: String,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    depth: usize,
+    #[serde(default)]
+    order: i32,
+    #[serde(default)]
+    is_global: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -619,6 +660,26 @@ impl SqliteHarnessEnv {
         summary_probe_id: Option<&str>,
         force_quality_fault: bool,
     ) -> Result<SqliteTurnResult, String> {
+        self.write_accept_turn_with_fault_profile(
+            conversation_id,
+            intent,
+            turn_index,
+            row_id,
+            summary_probe_id,
+            force_quality_fault.then_some("legacy_error_meta_and_format_leak"),
+        )
+        .await
+    }
+
+    pub async fn write_accept_turn_with_fault_profile(
+        &self,
+        conversation_id: &Id,
+        intent: &str,
+        turn_index: u32,
+        row_id: &str,
+        summary_probe_id: Option<&str>,
+        fault_profile: Option<&str>,
+    ) -> Result<SqliteTurnResult, String> {
         let campaign_id = self
             .active_campaign_id()
             .ok_or_else(|| "active campaign required".to_string())?;
@@ -649,10 +710,21 @@ impl SqliteHarnessEnv {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let draft_text = if force_quality_fault {
-            format!("{draft_text}\n作为AI，我将为你继续创作。")
-        } else {
-            draft_text
+        let draft_text = match fault_profile {
+            Some("warning_em_dash_and_negation_affirmation") => {
+                format!("{draft_text}\n潮线在门槛上折返——不是因为潮水退了，而是因为闸门先动了。")
+            }
+            Some("error_meta_and_format_leak") | Some("legacy_error_meta_and_format_leak") => {
+                format!("{draft_text}\n作为AI，我将为你继续创作。<think>format leak</think>")
+            }
+            Some("warning_ngram_repetition") => {
+                format!("{draft_text}\n盐灯照在石阶上。盐灯照在石阶上。盐灯照在石阶上。")
+            }
+            Some("warning_too_short") => "门响了。两人回头。".into(),
+            Some("error_non_owner_private_leak") => {
+                format!("{draft_text}\nOWNER_ONLY_NING_LARK_731")
+            }
+            _ => draft_text,
         };
 
         let attempt_id = Id::new();
@@ -1267,6 +1339,29 @@ impl SqliteHarnessEnv {
 
     fn seed_fixture(&self, path: &Path) -> Result<(Id, String), String> {
         let root = load_fixture(path)?;
+        let evaluation = root
+            .evaluation
+            .as_ref()
+            .ok_or_else(|| "fixture evaluation is missing".to_string())?;
+        if evaluation.target_turns != 80
+            || evaluation.turn_script.len() != 80
+            || evaluation
+                .turn_script
+                .iter()
+                .enumerate()
+                .any(|(index, turn)| turn.turn != index as u32 + 1)
+            || evaluation
+                .turn_script
+                .iter()
+                .filter(|turn| turn.checkpoint_after_accept)
+                .map(|turn| turn.turn)
+                .collect::<Vec<_>>()
+                != evaluation.checkpoint_turns
+        {
+            return Err(format!(
+                "fixture evaluation is not a contiguous 80-turn schedule"
+            ));
+        }
         let fixture_hash = fixture_source_hash16()?;
 
         let character = character_from_fixture(&root);
@@ -1498,12 +1593,33 @@ impl TurnAttemptSink for SqliteGatewayTurnAttemptSink {
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL)
+    let configured = std::env::var_os("STORYFORGE_EVAL_FIXTURE").map(PathBuf::from);
+    let path =
+        configured.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL));
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 pub fn fixture_source_hash16() -> Result<String, String> {
     let bytes = std::fs::read(fixture_path()).map_err(|error| error.to_string())?;
     Ok(short_hash16(&String::from_utf8_lossy(&bytes)))
+}
+
+pub fn fixture_turn_spec(turn: u32) -> Result<FixtureTurnSpec, String> {
+    let root = load_fixture(&fixture_path())?;
+    let evaluation = root
+        .evaluation
+        .ok_or_else(|| "fixture evaluation is missing".to_string())?;
+    evaluation
+        .turn_script
+        .into_iter()
+        .find(|spec| spec.turn == turn)
+        .ok_or_else(|| format!("fixture has no turn {turn}"))
 }
 
 fn load_fixture(path: &Path) -> Result<FixtureRoot, String> {
@@ -1517,23 +1633,32 @@ fn character_from_fixture(root: &FixtureRoot) -> Character {
         let route = match wi.route.as_str() {
             "selective" => LoreRoute::Selective,
             "both" => LoreRoute::Both,
+            "disabled" => LoreRoute::Disabled,
             _ => LoreRoute::Constant,
         };
+        let mut extra = std::collections::BTreeMap::new();
+        if wi.is_global {
+            extra.insert("is_global".into(), serde_json::Value::Bool(true));
+        }
         entries.push(WorldInfoEntry {
             st_id: Some(i as i32),
             keys: wi.keys.clone(),
-            secondary_keys: vec![],
+            secondary_keys: wi.secondary_keys.clone(),
             content: wi.content.clone(),
             constant: wi.constant,
             selective: wi.selective,
-            selective_logic: SelectiveLogic::And,
-            disabled: false,
+            selective_logic: match wi.selective_logic.to_ascii_lowercase().as_str() {
+                "or" => SelectiveLogic::Or,
+                "not" => SelectiveLogic::Not,
+                _ => SelectiveLogic::And,
+            },
+            disabled: wi.disabled,
             position: 0,
-            depth: 4,
-            order: i as i32,
+            depth: wi.depth as i32,
+            order: if wi.order == 0 { i as i32 } else { wi.order },
             route,
             extensions: serde_json::Value::Null,
-            extra: Default::default(),
+            extra,
         });
     }
     Character {
@@ -1637,16 +1762,16 @@ mod tests {
             path.display()
         );
         let root = load_fixture(&path).expect("fixture parse");
-        assert_eq!(root.fixture_version, "m5_sqlite_endurance_v1");
-        assert_eq!(root.safe_probe_facts.len(), 3);
-        assert!(root.definitions.len() >= 4);
-        assert_eq!(root.tasks.len(), 1);
+        assert_eq!(root.fixture_version, "cot_three_arm_80turn_v1");
+        assert_eq!(root.safe_probe_facts.len(), 6);
+        assert_eq!(root.definitions.len(), 6);
+        assert_eq!(root.tasks.len(), 9);
         assert_eq!(
             root.definitions
                 .iter()
                 .map(|definition| definition.private_knowledge.len())
                 .sum::<usize>(),
-            2
+            3
         );
     }
 

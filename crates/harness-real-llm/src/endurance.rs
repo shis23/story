@@ -11,7 +11,7 @@
 //! - enforces **hard suite-wide budgets** (max calls, per-call timeout, hard deadline);
 //! - writes **sanitized checkpoints** so an interruption resumes without replaying accepted
 //!   turns;
-//! - gates stages `3 → 12 → 30 → 100` accepted turns — a later stage may start only when the
+//! - gates stages `3 → 12 → 30 → 80 → 100` accepted turns — a later stage may start only when the
 //!   previous stage passes its invariants;
 //! - records a **machine-readable manifest** with usage, latency, cache, role, mode, hashes,
 //!   epoch/revision, Turn/Attempt status, Quality/autofix, Chronicle ranges, and assertions
@@ -47,7 +47,9 @@ pub enum EnduranceStage {
     Coverage,
     /// 30 accepted turns, ≤ 300 total model calls.
     Stability,
-    /// 100 accepted turns, ≤ 700 total model calls.
+    /// 80 accepted turns, ≤ 2800 total model calls. Long-coverage fixture stage.
+    LongCoverage,
+    /// 100 accepted turns, ≤ 3500 total model calls.
     Full,
 }
 
@@ -59,6 +61,7 @@ impl EnduranceStage {
             Self::Canary => 3,
             Self::Coverage => 12,
             Self::Stability => 30,
+            Self::LongCoverage => 80,
             Self::Full => 100,
         }
     }
@@ -72,7 +75,8 @@ impl EnduranceStage {
             // Full also absorbs bounded Plan-parse retries across 100 accepted turns.
             Self::Coverage => 220,
             Self::Stability => 450,
-            Self::Full => 1400,
+            Self::LongCoverage => 2800,
+            Self::Full => 3500,
         }
     }
 
@@ -83,7 +87,8 @@ impl EnduranceStage {
             Self::Canary => Some(Self::DryRun),
             Self::Coverage => Some(Self::Canary),
             Self::Stability => Some(Self::Coverage),
-            Self::Full => Some(Self::Stability),
+            Self::LongCoverage => Some(Self::Stability),
+            Self::Full => Some(Self::LongCoverage),
         }
     }
 
@@ -94,6 +99,7 @@ impl EnduranceStage {
             Self::Canary => "canary",
             Self::Coverage => "coverage",
             Self::Stability => "stability",
+            Self::LongCoverage => "long_coverage",
             Self::Full => "full",
         }
     }
@@ -105,6 +111,7 @@ impl EnduranceStage {
             "canary" => Some(Self::Canary),
             "coverage" => Some(Self::Coverage),
             "stability" => Some(Self::Stability),
+            "long_coverage" => Some(Self::LongCoverage),
             "full" => Some(Self::Full),
             _ => None,
         }
@@ -117,6 +124,7 @@ impl EnduranceStage {
             Self::Canary,
             Self::Coverage,
             Self::Stability,
+            Self::LongCoverage,
             Self::Full,
         ]
     }
@@ -793,7 +801,8 @@ impl std::error::Error for StageGateError {}
 /// - Canary → requires DryRun to have passed (or no predecessor row needed for DryRun).
 /// - Coverage → requires Canary to have reached ≥ 3 accepted turns.
 /// - Stability → requires Coverage to have reached ≥ 12 accepted turns.
-/// - Full → requires Stability to have reached ≥ 30 accepted turns.
+/// - LongCoverage → requires Stability to have reached ≥ 30 accepted turns.
+/// - Full → requires LongCoverage to have reached ≥ 80 accepted turns.
 pub fn check_stage_gate(
     stage: EnduranceStage,
     predecessor_row: Option<&EnduranceStageManifestRow>,
@@ -840,7 +849,7 @@ pub fn check_stage_gate(
                 })
             }
         }
-        EnduranceStage::Full => {
+        EnduranceStage::LongCoverage => {
             let row = predecessor_row.ok_or_else(|| StageGateError {
                 stage,
                 reason: "missing predecessor (Stability) manifest".into(),
@@ -854,6 +863,24 @@ pub fn check_stage_gate(
                         "predecessor only reached {} accepted turns (need {})",
                         row.accepted_turns,
                         EnduranceStage::Stability.target_turns()
+                    ),
+                })
+            }
+        }
+        EnduranceStage::Full => {
+            let row = predecessor_row.ok_or_else(|| StageGateError {
+                stage,
+                reason: "missing predecessor (LongCoverage) manifest".into(),
+            })?;
+            if row.accepted_turns >= EnduranceStage::LongCoverage.target_turns() {
+                Ok(())
+            } else {
+                Err(StageGateError {
+                    stage,
+                    reason: format!(
+                        "predecessor only reached {} accepted turns (need {})",
+                        row.accepted_turns,
+                        EnduranceStage::LongCoverage.target_turns()
                     ),
                 })
             }
@@ -1730,7 +1757,7 @@ mod tests {
             );
         }
         assert_eq!(EnduranceStage::Full.target_turns(), 100);
-        assert_eq!(EnduranceStage::Full.max_calls(), 1400);
+        assert_eq!(EnduranceStage::Full.max_calls(), 3500);
         assert_eq!(EnduranceStage::Canary.target_turns(), 3);
         assert_eq!(EnduranceStage::Canary.max_calls(), 60);
     }
@@ -1752,7 +1779,7 @@ mod tests {
         );
         assert_eq!(
             EnduranceStage::Full.predecessor(),
-            Some(EnduranceStage::Stability)
+            Some(EnduranceStage::LongCoverage)
         );
     }
 
@@ -1943,7 +1970,7 @@ mod tests {
     #[test]
     fn budget_for_stage_uses_stage_limits() {
         let b = EnduranceBudget::for_stage(EnduranceStage::Full);
-        assert_eq!(b.max_calls, 1400);
+        assert_eq!(b.max_calls, 3500);
         assert_eq!(b.max_turns, 100);
     }
 
@@ -2001,15 +2028,15 @@ mod tests {
     }
 
     #[test]
-    fn full_requires_stability_30_turns() {
+    fn full_requires_long_coverage_80_turns() {
         let good = EnduranceStageManifestRow {
             schema_version: "test".into(),
             run_id: "r".into(),
-            stage: EnduranceStage::Stability.label().into(),
-            target_turns: 30,
-            accepted_turns: 30,
-            calls_used: 200,
-            max_calls: 300,
+            stage: EnduranceStage::LongCoverage.label().into(),
+            target_turns: 80,
+            accepted_turns: 80,
+            calls_used: 2000,
+            max_calls: 2800,
             elapsed_ms: 100,
             acceptance: AcceptanceLevel::Pass.label().into(),
             summary_codes: vec![],
@@ -2022,7 +2049,7 @@ mod tests {
         assert!(check_stage_gate(EnduranceStage::Full, Some(&good)).is_ok());
 
         let short = EnduranceStageManifestRow {
-            accepted_turns: 25,
+            accepted_turns: 79,
             ..good
         };
         assert!(check_stage_gate(EnduranceStage::Full, Some(&short)).is_err());

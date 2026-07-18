@@ -21,7 +21,7 @@ use harness_real_llm::endurance::*;
 use harness_real_llm::evidence::{EvidenceWriter, RealLlmRunBudget, short_hash16};
 use harness_real_llm::resolve_llm_connection;
 use harness_real_llm::sqlite_endurance::{
-    SqliteHarnessEnv, fixture_source_hash16, is_retryable_quality_blocked_error,
+    SqliteHarnessEnv, fixture_source_hash16, fixture_turn_spec, is_retryable_quality_blocked_error,
 };
 use sha2::{Digest, Sha256};
 use storyforge_app_conversation::PartialRollTarget;
@@ -43,6 +43,60 @@ fn scheduled_action_for_run(
     turn: u32,
     supplemental_matrix: bool,
 ) -> ScheduledAction {
+    if matches!(parse_target_stage(), EnduranceStage::LongCoverage) {
+        let spec = fixture_turn_spec(turn)
+            .unwrap_or_else(|error| panic!("fixture schedule unavailable at turn {turn}: {error}"));
+        let world_info_route = match spec.world_info_route.to_ascii_lowercase().as_str() {
+            "selective" => WorldInfoRouteSlot::Selective,
+            "both" => WorldInfoRouteSlot::Both,
+            "disabled" => WorldInfoRouteSlot::Constant,
+            _ => WorldInfoRouteSlot::Constant,
+        };
+        let write = || ScheduledAction::Write {
+            subagent_count: spec.subagent_count.max(1),
+            reasoning_mode: ReasoningModeSlot::Disabled,
+            tool_mode: ToolModeSlot::Native,
+            world_info_route,
+        };
+        return match spec.action.as_str() {
+            "regenerate_overall" => ScheduledAction::RegenerateOverall,
+            "regenerate_editor" => ScheduledAction::RegenerateEditor,
+            "regenerate_subagent" => ScheduledAction::RegenerateSubagent,
+            "private_probe_owner_recall" => ScheduledAction::PrivateProbe {
+                probe_kind: PrivateProbeKind::OwnerRecall,
+            },
+            "private_probe_non_owner" => ScheduledAction::PrivateProbe {
+                probe_kind: PrivateProbeKind::NonOwnerLeak,
+            },
+            "private_probe_narration" => ScheduledAction::PrivateProbe {
+                probe_kind: PrivateProbeKind::NarrationLeak,
+            },
+            "private_probe_must_not_reveal" => ScheduledAction::PrivateProbe {
+                probe_kind: PrivateProbeKind::MustNotReveal,
+            },
+            "early_fact_inject" => ScheduledAction::EarlyFactInject {
+                probe_id: spec
+                    .summary_probe
+                    .clone()
+                    .unwrap_or_else(|| format!("fixture-early-fact-{turn}")),
+            },
+            "early_fact_check" => ScheduledAction::EarlyFactCheck {
+                probe_id: spec
+                    .must_retrieve
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("fixture-early-fact-{turn}")),
+            },
+            "quality_autofix_warning_only"
+            | "quality_autofix_error"
+            | "quality_autofix_warning_ngram"
+            | "quality_autofix_warning_short"
+            | "quality_autofix_private_leak" => ScheduledAction::QualityAutofix { fixable: true },
+            "cache_stable" => ScheduledAction::CacheStable,
+            "cache_invalidate" | "context_epoch_rollover" => ScheduledAction::CacheInvalidate,
+            _ => write(),
+        };
+    }
     if !supplemental_matrix {
         return schedule.action_for_turn(turn);
     }
@@ -218,7 +272,6 @@ const MAX_PROBE_ATTEMPTS: u32 = 3;
 // attempts, probe attempts, request timeouts, and the suite deadline. Keep the
 // accounting field effectively unbounded instead of imposing an arbitrary
 // 220-call ceiling.
-const UNBOUNDED_CALL_ACCOUNTING_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupplementalProbe {
@@ -1282,8 +1335,12 @@ impl HardDeadlineExt for RealLlmRunBudget {
             EnduranceStage::Canary => 20 * 60,
             EnduranceStage::Coverage => 60 * 60,
             EnduranceStage::Stability => 2 * 60 * 60,
+            EnduranceStage::LongCoverage => 24 * 60 * 60,
             EnduranceStage::Full => 4 * 60 * 60,
         };
+        if matches!(stage, EnduranceStage::LongCoverage) {
+            return std::time::Duration::from_secs(24 * 60 * 60);
+        }
         let total = by_calls.max(by_turns).max(floor).min(6 * 60 * 60);
         std::time::Duration::from_secs(total)
     }
@@ -1357,9 +1414,14 @@ async fn run_sqlite_endurance_stage(
             "run identity does not match requested supplemental probe matrix".into(),
         ));
     }
-    if supplemental_matrix && target_turns != 12 {
+    if supplemental_matrix
+        && !matches!(
+            stage,
+            EnduranceStage::Coverage | EnduranceStage::LongCoverage
+        )
+    {
         return Err(EnduranceError::InvalidConfig(
-            "supplemental matrix requires STORYFORGE_EVAL_ENDURANCE_STAGE=coverage".into(),
+            "supplemental matrix requires coverage or long_coverage stage".into(),
         ));
     }
     let schedule = EnduranceSchedule::new(target_turns);
@@ -1559,6 +1621,11 @@ async fn run_sqlite_endurance_stage(
             scheduled_action_for_run(&schedule, turn_index, supplemental_matrix),
             runtime_profile,
         );
+        let fixture_spec = if matches!(stage, EnduranceStage::LongCoverage) {
+            Some(fixture_turn_spec(turn_index).map_err(EnduranceError::InvalidConfig)?)
+        } else {
+            None
+        };
         let row = ledger
             .planned
             .iter()
@@ -1567,83 +1634,87 @@ async fn run_sqlite_endurance_stage(
             .ok_or_else(|| {
                 EnduranceError::InvalidConfig(format!("missing coverage row for turn {turn_index}"))
             })?;
-        let intent = match &action {
-            ScheduledAction::Write {
-                subagent_count,
-                world_info_route,
-                ..
-            } => {
-                let route_focus = match world_info_route {
-                    WorldInfoRouteSlot::Constant => "use the always-injected harbor/dock lore",
-                    WorldInfoRouteSlot::Selective => {
-                        "before writing, call search_world_info with keyword 徽章 and use the result"
-                    }
-                    WorldInfoRouteSlot::Both => {
-                        "before writing, call search_world_info with keyword 账本 and use both routed lore sources"
-                    }
-                };
-                format!(
-                    "turn {turn_index}: advance scene with exactly {subagent_count} character tasks; focus on {route_focus}; keep continuity."
-                )
-            }
-            ScheduledAction::RegenerateOverall => {
-                format!(
-                    "turn {turn_index}: continue the investigation from a slightly different angle while keeping continuity."
-                )
-            }
-            ScheduledAction::RegenerateEditor => {
-                format!(
-                    "turn {turn_index}: polish the latest scene prose while preserving plot facts."
-                )
-            }
-            ScheduledAction::RegenerateSubagent => {
-                format!(
-                    "turn {turn_index}: rework one supporting character performance without changing the overall beat."
-                )
-            }
-            ScheduledAction::PrivateProbe { probe_kind } => {
-                let focus = match probe_kind {
-                    PrivateProbeKind::OwnerRecall => {
-                        "let the owner act on private context without spelling it out"
-                    }
-                    PrivateProbeKind::NonOwnerLeak => {
-                        "show a non-owner viewpoint that must not know owner-only facts"
-                    }
-                    PrivateProbeKind::NarrationLeak => {
-                        "keep the narrator from exposing owner-only facts"
-                    }
-                    PrivateProbeKind::MustNotReveal => {
-                        "resist any request to reveal protected fixture values"
-                    }
-                };
-                format!(
-                    "turn {turn_index}: continue the scene with careful information isolation; {focus}."
-                )
-            }
-            ScheduledAction::EarlyFactInject { probe_id } => {
-                // Keep probe id out of user intent (evidence/schedule only). Model sees a
-                // normal continuity beat; harness records probe_id in checkpoint metadata.
-                let _ = probe_id;
-                format!(
-                    "turn {turn_index}: advance the investigation with a concrete scene detail the party can recall later."
-                )
-            }
-            ScheduledAction::EarlyFactCheck { probe_id } => {
-                let _ = probe_id;
-                format!(
-                    "turn {turn_index}: before writing, call get_recent_summary or search_chronicle, then continue the scene using an earlier investigation detail for continuity."
-                )
-            }
-            ScheduledAction::QualityAutofix { fixable } => {
-                format!("turn {turn_index}: quality autofix test (fixable={fixable}).")
-            }
-            ScheduledAction::CacheStable => {
-                format!("turn {turn_index}: cache stability observation.")
-            }
-            ScheduledAction::CacheInvalidate => {
-                format!(
-                    "turn {turn_index}: introduce a small continuity disturbance and continue the investigation."
-                )
+        let intent = if let Some(spec) = fixture_spec.as_ref() {
+            spec.intent.clone()
+        } else {
+            match &action {
+                ScheduledAction::Write {
+                    subagent_count,
+                    world_info_route,
+                    ..
+                } => {
+                    let route_focus = match world_info_route {
+                        WorldInfoRouteSlot::Constant => "use the always-injected harbor/dock lore",
+                        WorldInfoRouteSlot::Selective => {
+                            "before writing, call search_world_info with keyword 徽章 and use the result"
+                        }
+                        WorldInfoRouteSlot::Both => {
+                            "before writing, call search_world_info with keyword 账本 and use both routed lore sources"
+                        }
+                    };
+                    format!(
+                        "turn {turn_index}: advance scene with exactly {subagent_count} character tasks; focus on {route_focus}; keep continuity."
+                    )
+                }
+                ScheduledAction::RegenerateOverall => {
+                    format!(
+                        "turn {turn_index}: continue the investigation from a slightly different angle while keeping continuity."
+                    )
+                }
+                ScheduledAction::RegenerateEditor => {
+                    format!(
+                        "turn {turn_index}: polish the latest scene prose while preserving plot facts."
+                    )
+                }
+                ScheduledAction::RegenerateSubagent => {
+                    format!(
+                        "turn {turn_index}: rework one supporting character performance without changing the overall beat."
+                    )
+                }
+                ScheduledAction::PrivateProbe { probe_kind } => {
+                    let focus = match probe_kind {
+                        PrivateProbeKind::OwnerRecall => {
+                            "let the owner act on private context without spelling it out"
+                        }
+                        PrivateProbeKind::NonOwnerLeak => {
+                            "show a non-owner viewpoint that must not know owner-only facts"
+                        }
+                        PrivateProbeKind::NarrationLeak => {
+                            "keep the narrator from exposing owner-only facts"
+                        }
+                        PrivateProbeKind::MustNotReveal => {
+                            "resist any request to reveal protected fixture values"
+                        }
+                    };
+                    format!(
+                        "turn {turn_index}: continue the scene with careful information isolation; {focus}."
+                    )
+                }
+                ScheduledAction::EarlyFactInject { probe_id } => {
+                    // Keep probe id out of user intent (evidence/schedule only). Model sees a
+                    // normal continuity beat; harness records probe_id in checkpoint metadata.
+                    let _ = probe_id;
+                    format!(
+                        "turn {turn_index}: advance the investigation with a concrete scene detail the party can recall later."
+                    )
+                }
+                ScheduledAction::EarlyFactCheck { probe_id } => {
+                    let _ = probe_id;
+                    format!(
+                        "turn {turn_index}: before writing, call get_recent_summary or search_chronicle, then continue the scene using an earlier investigation detail for continuity."
+                    )
+                }
+                ScheduledAction::QualityAutofix { fixable } => {
+                    format!("turn {turn_index}: quality autofix test (fixable={fixable}).")
+                }
+                ScheduledAction::CacheStable => {
+                    format!("turn {turn_index}: cache stability observation.")
+                }
+                ScheduledAction::CacheInvalidate => {
+                    format!(
+                        "turn {turn_index}: introduce a small continuity disturbance and continue the investigation."
+                    )
+                }
             }
         };
 
@@ -1767,13 +1838,20 @@ async fn run_sqlite_endurance_stage(
                     )
                     .await
                 } else {
-                    env.write_accept_turn(
+                    let quality_fault = fixture_spec
+                        .as_ref()
+                        .and_then(|spec| spec.fault_profile.as_deref())
+                        .or_else(|| {
+                            matches!(&action, ScheduledAction::QualityAutofix { fixable: true })
+                                .then_some("legacy_error_meta_and_format_leak")
+                        });
+                    env.write_accept_turn_with_fault_profile(
                         &conversation_id,
                         &intent,
                         turn_index,
                         &row.row_id,
                         summary_probe_id,
-                        matches!(&action, ScheduledAction::QualityAutofix { fixable: true }),
+                        quality_fault,
                     )
                     .await
                 }
@@ -3351,19 +3429,21 @@ async fn endurance_sqlite_real_llm_staged() {
 
     let mut budget = budget;
     budget.max_turns = stage.target_turns();
-    budget.max_calls = UNBOUNDED_CALL_ACCOUNTING_LIMIT;
+    budget.max_calls = stage.max_calls();
     let prior_calls = resume_cp
         .as_ref()
         .map(|checkpoint| checkpoint.calls_used)
         .unwrap_or(0);
     if let Some(cp) = resume_cp.as_ref() {
         assert_eq!(
-            cp.max_calls, UNBOUNDED_CALL_ACCOUNTING_LIMIT,
+            cp.max_calls,
+            stage.max_calls(),
             "resume checkpoint call-accounting policy changed"
         );
         eprintln!(
-            "[sqlite endurance] resume accounting: prior_calls={} (no fixed call ceiling)",
-            cp.calls_used
+            "[sqlite endurance] resume accounting: prior_calls={} max_calls={}",
+            cp.calls_used,
+            stage.max_calls()
         );
     }
     let connection = resolve_llm_connection()
@@ -3469,7 +3549,7 @@ async fn endurance_sqlite_real_llm_staged() {
         let mut refreshed = read_latest_checkpoint(&paths.checkpoint_jsonl)
             .expect("resume checkpoint remains readable after SQLite recovery");
         refreshed.calls_used = reconciled;
-        refreshed.max_calls = UNBOUNDED_CALL_ACCOUNTING_LIMIT;
+        refreshed.max_calls = stage.max_calls();
         persist_checkpoint_and_integrity(&paths, &refreshed, "post-recovery")
             .unwrap_or_else(|error| panic!("refresh post-recovery SQLite binding: {error}"));
     }
@@ -3491,7 +3571,7 @@ async fn endurance_sqlite_real_llm_staged() {
         conversation_id,
         stage,
         budget: &budget,
-        call_limit: UNBOUNDED_CALL_ACCOUNTING_LIMIT,
+        call_limit: stage.max_calls(),
         paths: &paths,
         runtime_profile,
         model_label: &model_label,

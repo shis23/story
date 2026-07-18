@@ -787,7 +787,8 @@ mod tests {
             max_tokens: None,
         };
         let client = BudgetedLlmClient::wrap(inner, &budget);
-        let req = dummy_req();
+        let mut req = dummy_req();
+        req.params.reasoning = ReasoningMode::Prompted;
         let first = client.chat(&req).await;
         assert!(first.is_ok(), "first call should succeed");
         let second = client.chat(&req).await;
@@ -964,8 +965,8 @@ mod tests {
 
         let effective = client.effective_request(&source);
         assert_eq!(effective.params.reasoning, ReasoningMode::Native);
-        // SamplingParams::default 现为 Prompted；override 只改 effective 请求
-        assert_eq!(source.params.reasoning, ReasoningMode::Prompted);
+        // The production default is Disabled; an override only changes the effective request.
+        assert_eq!(source.params.reasoning, ReasoningMode::Disabled);
     }
 
     #[tokio::test]
