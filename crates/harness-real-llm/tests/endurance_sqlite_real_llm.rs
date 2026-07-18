@@ -384,6 +384,8 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
     }
 
     if error.contains("PlanParse")
+        || error.contains("PipelineError")
+        || error.contains("pipeline error")
         || error.contains("Plan 解析")
         || error.contains("未找到有效 Plan")
         || error.contains("already has active turn")
@@ -2713,6 +2715,14 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     assert_eq!(
         classify_write_failure("stream idle timeout", &private_probe),
         WriteFailureClass::Transient
+    );
+    assert_eq!(
+        classify_write_failure(
+            "PipelineError::Regenerate(\"editor response was not parseable\")",
+            &private_probe,
+        ),
+        WriteFailureClass::Transient,
+        "model-facing pipeline failures must use the bounded retry path"
     );
     assert_eq!(
         classify_write_failure(
