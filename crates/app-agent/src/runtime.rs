@@ -81,6 +81,13 @@ async fn execute_tool_call(
     }
 }
 
+fn tool_result_succeeded(result: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(result) {
+        Ok(value) => value.get("error").is_none(),
+        Err(_) => false,
+    }
+}
+
 /// Agent 运行时配置
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -89,7 +96,7 @@ pub struct AgentConfig {
     pub max_tool_rounds: u32,
     pub model: String,
     pub tools: Vec<ToolSpec>,
-    /// 终止工具列表：调用后立即返回响应（不等模型输出最终文本）。
+    /// 终止工具列表：成功调用后立即返回响应（不等模型输出最终文本）。
     /// 用于 emit_characters 等"声明任务完成"的工具。
     pub terminal_tools: Vec<String>,
 }
@@ -334,18 +341,19 @@ impl AgentRuntime {
             });
 
             // 执行每个工具调用
+            let mut successful_terminal_tool = false;
             for tc in &resp.tool_calls {
                 let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
+                if config.terminal_tools.contains(&tc.function.name)
+                    && tool_result_succeeded(&result_str)
+                {
+                    successful_terminal_tool = true;
+                }
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
-            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
-            if !config.terminal_tools.is_empty()
-                && resp
-                    .tool_calls
-                    .iter()
-                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
-            {
+            // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
+            if successful_terminal_tool {
                 info!(target: "app-agent", "{}: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
                 return Ok(resp);
@@ -479,18 +487,19 @@ impl AgentRuntime {
                 tool_call_id: None,
             });
 
+            let mut successful_terminal_tool = false;
             for tc in &resp.tool_calls {
                 let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
+                if config.terminal_tools.contains(&tc.function.name)
+                    && tool_result_succeeded(&result_str)
+                {
+                    successful_terminal_tool = true;
+                }
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
-            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
-            if !config.terminal_tools.is_empty()
-                && resp
-                    .tool_calls
-                    .iter()
-                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
-            {
+            // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
+            if successful_terminal_tool {
                 info!(target: "app-agent", "{}[stream]: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
                 return Ok(resp);
@@ -650,18 +659,19 @@ impl AgentRuntime {
                 tool_call_id: None,
             });
 
+            let mut successful_terminal_tool = false;
             for tc in &resp.tool_calls {
                 let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
+                if config.terminal_tools.contains(&tc.function.name)
+                    && tool_result_succeeded(&result_str)
+                {
+                    successful_terminal_tool = true;
+                }
                 messages.push(ChatMessage::tool_result(&tc.id, &result_str));
             }
 
-            // 终止工具检查：调用后立即返回（不等模型输出最终文本）
-            if !config.terminal_tools.is_empty()
-                && resp
-                    .tool_calls
-                    .iter()
-                    .any(|tc| config.terminal_tools.contains(&tc.function.name))
-            {
+            // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
+            if successful_terminal_tool {
                 info!(target: "app-agent", "{}[layout]: 第 {round} 轮调用了终止工具，立即返回",
                     config.role);
                 return Ok(resp);
@@ -1182,6 +1192,167 @@ mod tests {
             }
             Ok(resp)
         }
+    }
+
+    fn terminal_recovery_tool_ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext {
+            characters: vec![],
+            world_info: None,
+            vector_store: None,
+            archived_summaries: vec![],
+            chronicle_summaries: vec![],
+            chronicle_tool_budget: Arc::new(crate::tools::ChronicleToolBudget::new()),
+            campaign_runtime: None,
+            current_character_instance_id: None,
+            regex_scripts: vec![],
+        })
+    }
+
+    fn terminal_recovery_response(id: &str, arguments: &str) -> ChatResponse {
+        use storyforge_domain::llm::{FunctionCall, ToolCall};
+
+        ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_plan".into(),
+                    arguments: arguments.into(),
+                },
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+        }
+    }
+
+    fn terminal_recovery_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            storyforge_domain::llm::ToolSpec::function(
+                "emit_plan",
+                "emit plan",
+                serde_json::json!({}),
+            ),
+            |args, _ctx| Box::pin(async move { Ok(args) }),
+        );
+        registry
+    }
+
+    fn terminal_recovery_config() -> AgentConfig {
+        AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: "system".into(),
+            max_tool_rounds: 2,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec!["emit_plan".into()],
+        }
+    }
+
+    fn assert_terminal_recovery_requests(requests: &[ChatRequest]) {
+        assert_eq!(
+            requests.len(),
+            2,
+            "malformed terminal call must consume another round"
+        );
+        let tool_error = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ChatRole::Tool)
+            .expect("malformed terminal arguments should be returned to the model");
+        assert_eq!(tool_error.tool_call_id.as_deref(), Some("bad-terminal"));
+        assert!(tool_error.content.contains("Invalid JSON arguments"));
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_arguments_do_not_stop_plain_tool_loop() {
+        let llm = Arc::new(SequentialLlmClient::new(vec![
+            terminal_recovery_response("bad-terminal", r#"{"scene_brief":"broken""#),
+            terminal_recovery_response(
+                "good-terminal",
+                r#"{"scene_brief":"fixed","subagent_tasks":[]}"#,
+            ),
+        ]));
+        let runtime = AgentRuntime::new(llm.clone(), terminal_recovery_tool_ctx());
+        let registry = terminal_recovery_registry();
+        let (_tx, cancel) = watch::channel(false);
+
+        let response = runtime
+            .run_tool_loop(
+                &terminal_recovery_config(),
+                "user".into(),
+                &registry,
+                cancel,
+            )
+            .await
+            .expect("valid second terminal call should recover");
+
+        assert_eq!(response.tool_calls[0].id, "good-terminal");
+        assert_terminal_recovery_requests(&llm.requests());
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_arguments_do_not_stop_streaming_tool_loop() {
+        let llm = Arc::new(SequentialLlmClient::new(vec![
+            terminal_recovery_response("bad-terminal", r#"{"scene_brief":"broken""#),
+            terminal_recovery_response(
+                "good-terminal",
+                r#"{"scene_brief":"fixed","subagent_tasks":[]}"#,
+            ),
+        ]));
+        let runtime = AgentRuntime::new(llm.clone(), terminal_recovery_tool_ctx());
+        let registry = terminal_recovery_registry();
+        let (_tx, cancel) = watch::channel(false);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+
+        let response = runtime
+            .run_tool_loop_streaming(
+                &terminal_recovery_config(),
+                "user".into(),
+                &registry,
+                cancel,
+                progress_tx,
+                None,
+            )
+            .await
+            .expect("valid second terminal call should recover");
+
+        assert_eq!(response.tool_calls[0].id, "good-terminal");
+        assert_terminal_recovery_requests(&llm.requests());
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_arguments_do_not_stop_layout_tool_loop() {
+        let llm = Arc::new(SequentialLlmClient::new(vec![
+            terminal_recovery_response("bad-terminal", r#"{"scene_brief":"broken""#),
+            terminal_recovery_response(
+                "good-terminal",
+                r#"{"scene_brief":"fixed","subagent_tasks":[]}"#,
+            ),
+        ]));
+        let runtime = AgentRuntime::new(llm.clone(), terminal_recovery_tool_ctx());
+        let registry = terminal_recovery_registry();
+        let layout = MessageLayout::build()
+            .system("system")
+            .tail(|tail| tail.push("user"));
+        let (_tx, cancel) = watch::channel(false);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+
+        let response = runtime
+            .run_tool_loop_with_layout(
+                &terminal_recovery_config(),
+                layout,
+                &registry,
+                cancel,
+                progress_tx,
+                None,
+            )
+            .await
+            .expect("valid second terminal call should recover");
+
+        assert_eq!(response.tool_calls[0].id, "good-terminal");
+        assert_terminal_recovery_requests(&llm.requests());
     }
 
     #[test]
