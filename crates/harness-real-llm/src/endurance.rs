@@ -1473,6 +1473,7 @@ pub enum EnduranceError {
     StageGate(StageGateError),
     BudgetExhausted { calls_used: u32, max_calls: u32 },
     SuiteTimeout,
+    CheckpointStop { turn_index: u32 },
     EvidenceIo(std::io::Error),
     SecretViolation(String),
     MissingUsage { turn_index: u32 },
@@ -1494,6 +1495,12 @@ impl fmt::Display for EnduranceError {
                 write!(f, "budget exhausted: {calls_used}/{max_calls} calls used")
             }
             Self::SuiteTimeout => write!(f, "endurance suite timeout exhausted"),
+            Self::CheckpointStop { turn_index } => {
+                write!(
+                    f,
+                    "graceful checkpoint stop after accepted turn {turn_index}"
+                )
+            }
             Self::EvidenceIo(err) => write!(f, "evidence I/O error: {err}"),
             Self::SecretViolation(msg) => write!(f, "secret violation: {msg}"),
             Self::MissingUsage { turn_index } => {

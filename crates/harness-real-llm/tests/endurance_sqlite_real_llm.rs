@@ -239,6 +239,20 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn checkpoint_stop_after(turn_index: u32) -> bool {
+    std::env::var("STORYFORGE_EVAL_STOP_AFTER_ACCEPTED_TURNS")
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|value| value.parse::<u32>().ok())
+        .any(|turn| turn == turn_index)
+}
+
 fn safe_error_summary(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     let category = if error.contains("PlanParse") || error.contains("Plan 解析") {
@@ -2356,6 +2370,13 @@ async fn run_sqlite_endurance_stage(
             recorded_at_unix_ms: 0,
         };
         persist_checkpoint_and_integrity(paths, &cp, "turn-audit")?;
+        if checkpoint_stop_after(turn_index) && turn_index < target_turns {
+            eprintln!(
+                "[sqlite endurance {}] graceful checkpoint stop after turn {turn_index}",
+                stage.label()
+            );
+            return Err(EnduranceError::CheckpointStop { turn_index });
+        }
         if accepted_audit_failure == Some(AcceptedAttemptAuditFailure::BudgetExhausted) {
             return Err(EnduranceError::BudgetExhausted {
                 calls_used: durable_calls,
@@ -3660,6 +3681,12 @@ async fn endurance_sqlite_real_llm_staged() {
                     harness_real_llm::evidence_retention::format_seal_hard_error(&err)
                 )
             });
+        }
+        Err(EnduranceError::CheckpointStop { turn_index }) => {
+            eprintln!(
+                "SQLITE ENDURANCE {} CHECKPOINT STOP: accepted_turn={turn_index}",
+                stage.label()
+            );
         }
         Err(err) => {
             let safe = safe_error_summary(&err.to_string());
