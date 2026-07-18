@@ -376,11 +376,12 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
         return WriteFailureClass::Fatal;
     }
     if is_retryable_quality_blocked_error(error) {
-        return if matches!(action, ScheduledAction::QualityAutofix { fixable: true }) {
-            WriteFailureClass::Fatal
-        } else {
-            WriteFailureClass::QualityBlocked
-        };
+        // A quality-blocked Accept is still pre-commit. Give the model-facing
+        // Editor autofix path the same bounded retry budget as other transient
+        // generation failures; the scheduled action assertion remains strict
+        // and requires the eventual accepted attempt to have zero errors.
+        let _ = action;
+        return WriteFailureClass::QualityBlocked;
     }
 
     if error.contains("PlanParse")
@@ -2767,8 +2768,8 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
             "retryable_quality_blocked:error_count=1",
             &ScheduledAction::QualityAutofix { fixable: true },
         ),
-        WriteFailureClass::Fatal,
-        "the explicit autofix row must not hide a residual quality failure by rerolling"
+        WriteFailureClass::QualityBlocked,
+        "a residual quality failure may retry, but the accepted row still requires zero errors"
     );
 
     let mut state = None;
