@@ -9,7 +9,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 # shellcheck disable=SC1090
 set -a
-source "$ENV_FILE"
+source <(tr -d '\r' < "$ENV_FILE")
 set +a
 export STORYFORGE_EVAL_REAL_LLM=1
 export STORYFORGE_EVAL_EVIDENCE_ROOT="$EVID"
@@ -57,6 +57,7 @@ for r in disabled prompted; do
     export STORYFORGE_EVAL_REASONING_MODE="$r"
     export LLM_TOOL_MODE=native
     cd "$ROOT"
+    set +e
     cargo test -p harness-real-llm --test endurance_sqlite_real_llm endurance_sqlite_real_llm_staged -- --ignored --nocapture
     code=$?
     echo "exit=$code finished_unix=$(date +%s)" >>"$meta"

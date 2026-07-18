@@ -407,8 +407,7 @@ impl SqliteHarnessEnv {
         // so ReasoningMode::Prompted never injected role-specific CoT. Install the built-in
         // default profile whenever the caller left modules empty.
         if ctx.profile.is_none() || ctx.modules.is_empty() {
-            let (profile, modules) =
-                storyforge_domain::prompt_module::builtins::default_profile();
+            let (profile, modules) = storyforge_domain::prompt_module::builtins::default_profile();
             ctx.profile = Some(profile);
             ctx.modules = modules;
         }
@@ -1605,83 +1604,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_campaign_context_installs_default_prompt_profile_when_empty() {
-        let dir = std::env::temp_dir().join(format!(
-            "sf-endurance-prompt-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let env = SqliteHarnessEnv::bootstrap(dir.clone(), Arc::new(AlwaysFailLlmClient))
-            .expect("bootstrap");
-        let base = WritingContext::legacy(vec![], None, Id::new());
-        assert!(base.profile.is_none());
-        assert!(base.modules.is_empty());
-        let filled = env
-            .fill_campaign_context(base)
-            .expect("fill_campaign_context");
-        assert!(
-            filled.profile.is_some(),
-            "default PromptProfile must be installed for Prompted CoT"
-        );
-        assert!(
-            !filled.modules.is_empty(),
-            "builtin prompt modules must be installed"
-        );
-        let director_cot = filled
-            .profile
-            .as_ref()
-            .unwrap()
-            .selected_ids(
-                &storyforge_domain::agent::AgentRole::Director,
-                &storyforge_domain::prompt_module::ModuleCategory::Cot,
-            );
-        assert_eq!(
-            director_cot.first().map(|id| id.as_str()),
-            Some("builtin-cot-director-plan"),
-            "Director must select role-specific planning CoT"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn new_pipeline_uses_configured_reasoning_for_cot_assembly() {
-        let dir = std::env::temp_dir().join(format!(
-            "sf-endurance-pipeline-reasoning-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let mut env = SqliteHarnessEnv::bootstrap(dir.clone(), Arc::new(AlwaysFailLlmClient))
-            .expect("bootstrap");
-
-        // Default: no sampling → ReasoningMode::Disabled (enum Default), CoT skipped.
-        assert_eq!(
-            env.new_pipeline().reasoning_mode(),
-            ReasoningMode::Disabled,
-            "missing pipeline_sampling must keep CoT off"
-        );
-
-        env.set_pipeline_reasoning(ReasoningMode::Prompted);
-        assert_eq!(
-            env.new_pipeline().reasoning_mode(),
-            ReasoningMode::Prompted,
-            "Prompted must reach PipelineOrchestrator for Cot injection"
-        );
-
-        env.set_pipeline_reasoning(ReasoningMode::Disabled);
-        assert_eq!(
-            env.new_pipeline().reasoning_mode(),
-            ReasoningMode::Disabled
-        );
-
-        env.set_pipeline_reasoning(ReasoningMode::Native);
-        assert_eq!(env.new_pipeline().reasoning_mode(), ReasoningMode::Native);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn fixture_loads_and_hashes() {
         let path = fixture_path();
         assert!(
@@ -1718,12 +1640,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preland_model_failures_leave_durable_turn_anchors_for_restart_recovery() {
+    async fn preland_recovery_and_prompt_configuration_share_one_sqlite_process() {
         let data_dir = std::env::temp_dir().join(format!(
             "sf-sqlite-preland-recovery-{}",
             uuid::Uuid::new_v4()
         ));
-        let env = SqliteHarnessEnv::bootstrap(data_dir, Arc::new(AlwaysFailLlmClient))
+        let mut env = SqliteHarnessEnv::bootstrap(data_dir, Arc::new(AlwaysFailLlmClient))
             .expect("bootstrap SQLite harness");
         let campaign_id = env.active_campaign_id().expect("active campaign");
         let campaign = sqlite_runtime::get_campaign(&campaign_id)
@@ -1807,5 +1729,45 @@ mod tests {
             original_node_count,
             "restart recovery must remove the unaccepted regenerate input node"
         );
+
+        let base = WritingContext::legacy(vec![], None, Id::new());
+        assert!(base.profile.is_none());
+        assert!(base.modules.is_empty());
+        let filled = env
+            .fill_campaign_context(base)
+            .expect("fill_campaign_context");
+        assert!(
+            filled.profile.is_some(),
+            "default PromptProfile must be installed for Prompted CoT"
+        );
+        assert!(
+            !filled.modules.is_empty(),
+            "builtin prompt modules must be installed"
+        );
+        let director_cot = filled.profile.as_ref().unwrap().selected_ids(
+            &storyforge_domain::agent::AgentRole::Director,
+            &storyforge_domain::prompt_module::ModuleCategory::Cot,
+        );
+        assert_eq!(
+            director_cot.first().map(|id| id.as_str()),
+            Some("builtin-cot-director-plan"),
+            "Director must select role-specific planning CoT"
+        );
+
+        assert_eq!(
+            env.new_pipeline().reasoning_mode(),
+            ReasoningMode::Disabled,
+            "missing pipeline_sampling must keep CoT off"
+        );
+        env.set_pipeline_reasoning(ReasoningMode::Prompted);
+        assert_eq!(
+            env.new_pipeline().reasoning_mode(),
+            ReasoningMode::Prompted,
+            "Prompted must reach PipelineOrchestrator for Cot injection"
+        );
+        env.set_pipeline_reasoning(ReasoningMode::Disabled);
+        assert_eq!(env.new_pipeline().reasoning_mode(), ReasoningMode::Disabled);
+        env.set_pipeline_reasoning(ReasoningMode::Native);
+        assert_eq!(env.new_pipeline().reasoning_mode(), ReasoningMode::Native);
     }
 }

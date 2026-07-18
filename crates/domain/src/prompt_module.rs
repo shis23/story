@@ -894,10 +894,7 @@ pub mod builtins {
             // 导演：角色化规划 CoT
             let director_cot = profile.selected_ids(&AgentRole::Director, &ModuleCategory::Cot);
             assert_eq!(director_cot.len(), 1);
-            assert_eq!(
-                director_cot[0],
-                Id::from_str("builtin-cot-director-plan")
-            );
+            assert_eq!(director_cot[0], Id::from_str("builtin-cot-director-plan"));
 
             // 编剧：视角 + 文风 + 质量 + 合并 CoT + 输出
             let editor_persp =
@@ -925,10 +922,7 @@ pub mod builtins {
             // 摘要：抽取 CoT
             let sum_cot = profile.selected_ids(&AgentRole::Summarizer, &ModuleCategory::Cot);
             assert_eq!(sum_cot.len(), 1);
-            assert_eq!(
-                sum_cot[0],
-                Id::from_str("builtin-cot-summarizer-extract")
-            );
+            assert_eq!(sum_cot[0], Id::from_str("builtin-cot-summarizer-extract"));
         }
 
         #[test]

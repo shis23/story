@@ -9,7 +9,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 set -a
 # shellcheck disable=SC1090
-source "$ENV_FILE"
+source <(tr -d '\r' < "$ENV_FILE")
 set +a
 export STORYFORGE_EVAL_REAL_LLM=1
 export STORYFORGE_EVAL_EVIDENCE_ROOT="$EVID"
@@ -52,6 +52,7 @@ for r in "${REASONINGS[@]}"; do
       export LLM_TOOL_MODE="$t"
       cd "$ROOT"
       # serialise cargo test harness filter by env only; one process per arm
+      set +e
       cargo test -p harness-real-llm --test endurance_sqlite_real_llm endurance_sqlite_real_llm_staged -- --ignored --nocapture
       code=$?
       echo "exit=$code finished_unix=$(date +%s)" >>"$meta"

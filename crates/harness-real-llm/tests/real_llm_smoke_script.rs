@@ -61,3 +61,39 @@ fn eval_real_run_fails_before_cargo_when_fixture_override_is_missing() {
     assert!(stdout.contains("STORYFORGE_EVAL_FIXTURE_CARD"));
     assert!(!stdout.contains("RUN: cargo test"));
 }
+
+#[test]
+fn matrix_launchers_load_crlf_env_files_without_carriage_return_residue() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+
+    for name in ["run-cot-verify-matrix.sh", "run-reasoning-tool-matrix.sh"] {
+        let text = std::fs::read_to_string(repo_root.join("scripts").join(name))
+            .unwrap_or_else(|error| panic!("read {name}: {error}"));
+        assert!(
+            text.contains("source <(tr -d '\\r' < \"$ENV_FILE\")"),
+            "{name} must strip CRLF residue without relying on an interactive Git Bash profile"
+        );
+    }
+}
+
+#[test]
+fn matrix_launchers_record_nonzero_cargo_exit_codes() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+
+    for name in ["run-cot-verify-matrix.sh", "run-reasoning-tool-matrix.sh"] {
+        let text = std::fs::read_to_string(repo_root.join("scripts").join(name))
+            .unwrap_or_else(|error| panic!("read {name}: {error}"));
+        let cargo_pos = text
+            .find("cargo test -p harness-real-llm")
+            .expect("launcher must run the endurance cargo test");
+        assert!(
+            text[..cargo_pos].rfind("set +e").is_some(),
+            "{name} must disable errexit before cargo so meta always records exit="
+        );
+        assert!(text.contains("echo \"exit=$code finished_unix="));
+    }
+}

@@ -2742,7 +2742,7 @@ fn resume_fingerprint_uses_last_accepted_turn_not_failed_call_tail() {
 }
 
 #[test]
-fn retry_recovery_discards_unaccepted_conversation_tail_and_fails_attempt() {
+fn sqlite_retry_recovery_and_authority_rebinding_share_one_process() {
     let dir =
         std::env::temp_dir().join(format!("sf-sqlite-retry-recovery-{}", uuid::Uuid::new_v4()));
     let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
@@ -3050,6 +3050,9 @@ fn retry_recovery_discards_unaccepted_conversation_tail_and_fails_attempt() {
         "multiple-active rejection must be zero-write"
     );
     storyforge_tauri_app::sqlite_runtime::recover_turns_on_startup().unwrap();
+
+    assert_context_epoch_fill_rebinding(&original_campaign.card_id);
+    assert_turn_audit_rebinding(&original_campaign.card_id);
 }
 
 #[test]
@@ -3133,22 +3136,26 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
     assert!(validate_sqlite_authority_values(&checkpoint, 1, 2, &conversation_drifted).is_err());
 }
 
-#[test]
-fn context_epoch_fill_may_rewrite_accepted_content_hash_without_blocking_retry() {
+fn create_isolated_sqlite_campaign(
+    card_id: &storyforge_domain::Id,
+    name: &str,
+) -> (storyforge_domain::campaign::Campaign, Conversation) {
+    let mut campaign = storyforge_domain::campaign::Campaign::new(card_id.clone(), name);
+    let conversation = Conversation::new(None, Some(campaign.id.clone()));
+    campaign.conversation_id = Some(conversation.id.clone());
+    storyforge_tauri_app::sqlite_runtime::save_campaign(&campaign).unwrap();
+    storyforge_tauri_app::sqlite_runtime::save_conversation(&conversation).unwrap();
+    (campaign, conversation)
+}
+
+fn assert_context_epoch_fill_rebinding(card_id: &storyforge_domain::Id) {
     // Reproduces the live fail-closed path:
     // fill_campaign_runtime_from_sqlite bumps chronicle/context_epoch → accepted_content
     // hash changes → failed-attempt recovery must still rebind authority.
-    let dir = std::env::temp_dir().join(format!(
-        "sf-sqlite-context-fill-authority-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
-    let env = SqliteHarnessEnv::bootstrap(dir.clone(), llm).unwrap();
-    let campaign_id = env.active_campaign_id().unwrap();
-    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
-        .unwrap()
-        .unwrap();
-    let conversation_id = campaign.conversation_id.clone().unwrap();
+    let (campaign, conversation) =
+        create_isolated_sqlite_campaign(card_id, "context epoch authority fixture");
+    let campaign_id = campaign.id.clone();
+    let conversation_id = conversation.id.clone();
     let mut checkpoint = EnduranceCheckpoint {
         schema_version: EnduranceCheckpoint::schema_version().into(),
         run_id: "run-coverage-00000000-0000-0000-0000-000000000654".into(),
@@ -3187,7 +3194,10 @@ fn context_epoch_fill_may_rewrite_accepted_content_hash_without_blocking_retry()
         before.accepted_content_sha256, after.accepted_content_sha256,
         "context fill must change accepted_content projection via campaign payload"
     );
-    assert_eq!(before.accepted_conversation_sha256, after.accepted_conversation_sha256);
+    assert_eq!(
+        before.accepted_conversation_sha256,
+        after.accepted_conversation_sha256
+    );
     assert_eq!(before.committed_turns, after.committed_turns);
 
     // Continuous turn start / failed-attempt rebind must not fail closed on this.
@@ -3203,19 +3213,15 @@ fn context_epoch_fill_may_rewrite_accepted_content_hash_without_blocking_retry()
     assert!(validate_live_sqlite_resume_authority(&checkpoint).is_err());
 }
 
-#[test]
-fn turn_audit_rebinding_allows_monotonic_chronicle_after_context_fill() {
+fn assert_turn_audit_rebinding(card_id: &storyforge_domain::Id) {
     let dir = std::env::temp_dir().join(format!(
         "sf-sqlite-chronicle-advance-{}",
         uuid::Uuid::new_v4()
     ));
-    let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::with_defaults());
-    let env = SqliteHarnessEnv::bootstrap(dir.clone(), llm).unwrap();
-    let campaign_id = env.active_campaign_id().unwrap();
-    let campaign = storyforge_tauri_app::sqlite_runtime::get_campaign(&campaign_id)
-        .unwrap()
-        .unwrap();
-    let conversation_id = campaign.conversation_id.clone().unwrap();
+    let (campaign, conversation) =
+        create_isolated_sqlite_campaign(card_id, "turn audit authority fixture");
+    let campaign_id = campaign.id.clone();
+    let conversation_id = conversation.id.clone();
     let mut checkpoint = EnduranceCheckpoint {
         schema_version: EnduranceCheckpoint::schema_version().into(),
         run_id: "run-coverage-00000000-0000-0000-0000-000000000321".into(),

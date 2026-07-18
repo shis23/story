@@ -570,6 +570,20 @@ impl BudgetedLlmClient {
     }
 }
 
+fn safe_llm_error_class(error: &LlmError) -> &'static str {
+    match error {
+        LlmError::Http(_) => "http",
+        LlmError::Auth(_) => "auth",
+        LlmError::BadRequest(_) => "bad_request",
+        LlmError::RateLimited(_) => "rate_limited",
+        LlmError::ServerError(_) => "server_error",
+        LlmError::StreamParse(_) => "stream_parse",
+        LlmError::Cancelled => "cancelled",
+        LlmError::Timeout => "timeout",
+        LlmError::Internal(_) => "internal",
+    }
+}
+
 #[async_trait]
 impl LlmClient for BudgetedLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
@@ -580,6 +594,11 @@ impl LlmClient for BudgetedLlmClient {
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                eprintln!(
+                    "[eval-budget] call={} client_error_class={}",
+                    reserved.call_index,
+                    safe_llm_error_class(&e)
+                );
                 self.record(
                     &reserved,
                     &req,
@@ -626,6 +645,11 @@ impl LlmClient for BudgetedLlmClient {
         let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                eprintln!(
+                    "[eval-budget] call={} client_error_class={}",
+                    reserved.call_index,
+                    safe_llm_error_class(&e)
+                );
                 self.record(
                     &reserved,
                     &req,
@@ -665,6 +689,40 @@ mod tests {
     use super::*;
     use storyforge_domain::llm::ChatMessage;
     use storyforge_infra_llm::mock_client::MockLlmClient;
+
+    #[test]
+    fn safe_error_class_never_uses_provider_message_text() {
+        let cases = [
+            (LlmError::Http("secret-http-body".into()), "http"),
+            (LlmError::Auth("secret-auth-body".into()), "auth"),
+            (
+                LlmError::BadRequest("secret-bad-request".into()),
+                "bad_request",
+            ),
+            (
+                LlmError::RateLimited("secret-rate-limit".into()),
+                "rate_limited",
+            ),
+            (
+                LlmError::ServerError("secret-server-body".into()),
+                "server_error",
+            ),
+            (
+                LlmError::StreamParse("secret-stream-body".into()),
+                "stream_parse",
+            ),
+            (LlmError::Cancelled, "cancelled"),
+            (LlmError::Timeout, "timeout"),
+            (
+                LlmError::Internal("secret-internal-body".into()),
+                "internal",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(safe_llm_error_class(&error), expected);
+        }
+    }
 
     #[derive(Default)]
     struct RecordingReservationSink {

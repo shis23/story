@@ -1346,11 +1346,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register_director_tools(&mut registry);
         let err = registry
-            .dispatch(
-                "get_character",
-                serde_json::json!({"name": "工人甲"}),
-                ctx,
-            )
+            .dispatch("get_character", serde_json::json!({"name": "工人甲"}), ctx)
             .await
             .unwrap_err()
             .to_string();
