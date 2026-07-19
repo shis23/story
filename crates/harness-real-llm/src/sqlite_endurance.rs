@@ -857,10 +857,16 @@ impl SqliteHarnessEnv {
         ));
         observations.insert(ObservationKey::ServicePath("pipeline.start_writing".into()));
         observations.insert(ObservationKey::DraftLanded);
-        observations.insert(ObservationKey::PostprocessApplied);
+        observations.insert(if proof.applied {
+            ObservationKey::PostprocessApplied
+        } else {
+            ObservationKey::PostprocessFailed
+        });
         observations.insert(ObservationKey::Accepted);
         observations.insert(ObservationKey::OutboxKind("draft_ready".into()));
-        observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        if proof.applied {
+            observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        }
         observations.extend(pipeline_observation.observation_keys());
 
         let observed = ObservedCoverage {
@@ -1117,10 +1123,16 @@ impl SqliteHarnessEnv {
         ));
         observations.insert(ObservationKey::ServicePath("pipeline.regenerate".into()));
         observations.insert(ObservationKey::Regenerated);
-        observations.insert(ObservationKey::PostprocessApplied);
+        observations.insert(if proof.applied {
+            ObservationKey::PostprocessApplied
+        } else {
+            ObservationKey::PostprocessFailed
+        });
         observations.insert(ObservationKey::Accepted);
         observations.insert(ObservationKey::OutboxKind("regenerate".into()));
-        observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        if proof.applied {
+            observations.insert(ObservationKey::OutboxKind("postprocess_apply".into()));
+        }
         observations.extend(pipeline_observation.observation_keys());
 
         let observed = ObservedCoverage {

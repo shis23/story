@@ -25,6 +25,7 @@ pub enum ObservationKey {
     DraftLanded,
     AutofixSynced,
     PostprocessApplied,
+    PostprocessFailed,
     Accepted,
     OutboxKind(String),
     Regenerated,
@@ -45,6 +46,7 @@ impl ObservationKey {
             Self::DraftLanded => "draft_landed".into(),
             Self::AutofixSynced => "autofix_synced".into(),
             Self::PostprocessApplied => "postprocess_applied".into(),
+            Self::PostprocessFailed => "postprocess_failed".into(),
             Self::Accepted => "accepted".into(),
             Self::OutboxKind(s) => format!("outbox:{s}"),
             Self::Regenerated => "regenerated".into(),
@@ -259,8 +261,20 @@ impl CoverageLedger {
                 .iter()
                 .map(ObservationKey::as_tag)
                 .collect();
-            let missing: BTreeSet<String> = required.difference(&got).cloned().collect();
-            let extra: BTreeSet<String> = got.difference(&required).cloned().collect();
+            let mut missing: BTreeSet<String> = required.difference(&got).cloned().collect();
+            let mut extra: BTreeSet<String> = got.difference(&required).cloned().collect();
+            // Postprocess is explicitly best-effort. A durable failed
+            // postprocess is an auditable degraded outcome, not an applied
+            // outcome; accept the mutually exclusive marker without claiming
+            // that the mutation was applied.
+            if !obs.sqlite_post.postprocess_applied
+                && missing.contains("postprocess_applied")
+                && extra.contains("postprocess_failed")
+            {
+                missing.remove("postprocess_applied");
+                missing.remove("outbox:postprocess_apply");
+                extra.remove("postprocess_failed");
+            }
             if !missing.is_empty() {
                 mismatches.push(LedgerMismatch::Missing {
                     row_id: plan.row_id.clone(),
@@ -571,5 +585,40 @@ mod tests {
             err.iter()
                 .any(|m| matches!(m, LedgerMismatch::Missing { .. }))
         );
+    }
+
+    #[test]
+    fn exact_set_accepts_audited_degraded_postprocess_without_claiming_apply() {
+        let mut ledger = CoverageLedger::plan_from_schedule([(1, write_action())]);
+        let row = &ledger.planned[0];
+        let mut observations = row.required_observations.clone();
+        observations.remove(&ObservationKey::PostprocessApplied);
+        observations.insert(ObservationKey::PostprocessFailed);
+        let agent_events = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                ObservationKey::AgentRole(role) => Some(role.clone()),
+                _ => None,
+            })
+            .collect();
+        ledger.record(ObservedCoverage {
+            row_id: row.row_id.clone(),
+            turn_index: 1,
+            command_path: "sqlite_runtime::create_draft_attempt".into(),
+            service_path: "pipeline.start_writing".into(),
+            agent_events,
+            turn_id16: "t".into(),
+            attempt_id16: "a".into(),
+            variant_id16: "v".into(),
+            sqlite_post: SqlitePostcondition {
+                sqlite_authoritative: true,
+                json_fallback: false,
+                postprocess_applied: false,
+                outbox_kinds: vec!["draft_ready".into()],
+                ..Default::default()
+            },
+            observations,
+        });
+        assert!(ledger.exact_set_verify().is_ok());
     }
 }
