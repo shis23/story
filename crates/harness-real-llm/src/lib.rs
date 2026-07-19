@@ -10,6 +10,7 @@
 //! `storyforge::fill_campaign_runtime_from_store`（线上同一份逻辑）。
 //!
 //! 凭证：环境变量优先回退——有 `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL` 用之；
+//! `LLM_EXTRA_JSON` 可显式透传严格 JSON object 的厂商扩展参数；
 //! 否则读 `data/connections.json` 的 active 连接。真实 LLM 测试一律 `#[ignore]`，
 //! 由 `require_real_llm()` 早返保护，`cargo test` 默认零网络。
 //!
@@ -480,7 +481,8 @@ impl HarnessEnv {
 
 /// 解析真实 LLM 凭证。
 ///
-/// 优先级：`LLM_BASE_URL`+`LLM_API_KEY`+`LLM_MODEL` 环境变量 > `data/connections.json`
+/// 优先级：`LLM_BASE_URL`+`LLM_API_KEY`+`LLM_MODEL` 环境变量 > `data/connections.json`。
+/// 环境连接可通过 `LLM_EXTRA_JSON` 提供厂商扩展参数。
 /// active 连接（线上 `AppState::new` lib.rs:210-231 同款逻辑）。
 ///
 /// 返回 `Ok(conn)` 表示可构造真实 client；`Err(reason)` 表示无可用凭证。
@@ -494,6 +496,7 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
         api_key,
         model,
         std::env::var("LLM_TOOL_MODE").ok().as_deref(),
+        std::env::var("LLM_EXTRA_JSON").ok().as_deref(),
     )? {
         return Ok(conn);
     }
@@ -547,12 +550,15 @@ fn resolve_env_llm_connection(
     api_key: Option<String>,
     model: Option<String>,
     tool_mode_value: Option<&str>,
+    extra_json_value: Option<&str>,
 ) -> Result<Option<LlmConnection>, String> {
     let (Some(base_url), Some(api_key), Some(model)) = (base_url, api_key, model) else {
         return Ok(None);
     };
 
     let tool_mode = parse_env_tool_mode(tool_mode_value)?;
+    let mut params = SamplingParams::default();
+    params.extra = parse_env_extra_json(extra_json_value)?;
     Ok(Some(LlmConnection {
         id: Id::new(),
         name: "harness-env".into(),
@@ -560,9 +566,25 @@ fn resolve_env_llm_connection(
         api_key,
         model,
         protocol: LlmProtocol::OpenAi,
-        params: SamplingParams::default(),
+        params,
         tool_mode,
     }))
+}
+
+fn parse_env_extra_json(
+    value: Option<&str>,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|error| format!("LLM_EXTRA_JSON must be valid JSON: {error}"))?;
+    let object = parsed
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "LLM_EXTRA_JSON must be a JSON object".to_string())?;
+    Ok(Some(object))
 }
 
 fn parse_env_tool_mode(value: Option<&str>) -> Result<ToolMode, String> {
@@ -652,12 +674,53 @@ mod tests {
     }
 
     #[test]
+    fn env_extra_json_defaults_to_none() {
+        assert_eq!(parse_env_extra_json(None).unwrap(), None);
+        assert_eq!(parse_env_extra_json(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn env_extra_json_accepts_provider_object() {
+        let extra = parse_env_extra_json(Some(r#"{"thinking":{"type":"enabled"}}"#))
+            .unwrap()
+            .expect("non-empty object");
+
+        assert_eq!(extra["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn env_extra_json_rejects_non_object_and_invalid_json() {
+        let non_object = parse_env_extra_json(Some(r#"["thinking"]"#)).unwrap_err();
+        assert!(non_object.contains("LLM_EXTRA_JSON"));
+        assert!(non_object.contains("object"));
+
+        let invalid = parse_env_extra_json(Some("{")).unwrap_err();
+        assert!(invalid.contains("LLM_EXTRA_JSON"));
+    }
+
+    #[test]
+    fn env_connection_applies_provider_extra() {
+        let conn = resolve_env_llm_connection(
+            Some("https://example.invalid/v1".into()),
+            Some("secret".into()),
+            Some("model".into()),
+            Some("native"),
+            Some(r#"{"thinking":{"type":"disabled"}}"#),
+        )
+        .unwrap()
+        .expect("complete env credentials");
+
+        assert_eq!(conn.params.extra.unwrap()["thinking"]["type"], "disabled");
+    }
+
+    #[test]
     fn env_tool_mode_is_ignored_when_env_credentials_are_incomplete() {
         let conn = resolve_env_llm_connection(
             Some("https://example.invalid/v1/chat/completions".into()),
             None,
             Some("model".into()),
             Some("json_schema"),
+            Some("not-json"),
         )
         .expect("incomplete env credentials should fall back without parsing tool mode");
 

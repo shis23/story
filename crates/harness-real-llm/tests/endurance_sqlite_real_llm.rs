@@ -3,6 +3,7 @@
 //! Requires:
 //! - STORYFORGE_EVAL_REAL_LLM=1
 //! - LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+//! - LLM_EXTRA_JSON for provider-specific thinking controls when comparing reasoning arms
 //! - Prefer STORYFORGE_EVAL_EVIDENCE_ROOT (gitignored durable dir)
 //!
 //! Stages: STORYFORGE_EVAL_ENDURANCE_STAGE=canary|coverage|stability|full
@@ -172,6 +173,11 @@ fn endpoint_identity_hash16(base_url: &str, protocol: &LlmProtocol) -> String {
 
 fn model_identity_sha256(model: &str) -> String {
     format!("{:x}", Sha256::digest(model.as_bytes()))
+}
+
+fn provider_extra_hash16(extra: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
+    let canonical = serde_json::to_string(&extra).expect("provider extra must serialize");
+    short_hash16(&canonical)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3192,6 +3198,7 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
         fixture_hash16: "fixture123456789".into(),
         model_sha256: "b".repeat(64),
         endpoint_hash16: "endpoint12345678".into(),
+        provider_extra_hash16: "extra1234567890".into(),
         tool_mode: "native".into(),
         reasoning_mode: "disabled".into(),
         code_revision16: "revision1234567".into(),
@@ -3235,6 +3242,13 @@ fn resume_identity_rejects_stage_or_runtime_drift() {
     assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
     checkpoint.run_identity.as_mut().unwrap().code_revision16 = expected.code_revision16.clone();
     checkpoint.run_identity.as_mut().unwrap().endpoint_hash16 = "different-endpt".into();
+    assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
+    checkpoint.run_identity.as_mut().unwrap().endpoint_hash16 = expected.endpoint_hash16.clone();
+    checkpoint
+        .run_identity
+        .as_mut()
+        .unwrap()
+        .provider_extra_hash16 = "different-extra".into();
     assert!(validate_resume_identity(&checkpoint, EnduranceStage::Coverage, &expected).is_err());
 
     let authority = EnduranceSqliteAuthority {
@@ -3510,6 +3524,7 @@ async fn endurance_sqlite_real_llm_staged() {
             .unwrap_or_else(|error| panic!("fixture identity unavailable: {error}")),
         model_sha256: model_identity_sha256(&connection.model),
         endpoint_hash16: endpoint_identity_hash16(&connection.base_url, &connection.protocol),
+        provider_extra_hash16: provider_extra_hash16(connection.params.extra.as_ref()),
         tool_mode: runtime_profile.tool_mode.label().into(),
         reasoning_mode: runtime_profile.reasoning_mode.label().into(),
         code_revision16: short_hash16(&initial_git.commit),

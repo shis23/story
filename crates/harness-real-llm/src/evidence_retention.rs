@@ -1811,6 +1811,7 @@ fn validate_sqlite_run_identity(
     if identity.fixture_hash16.is_empty()
         || !is_sha256_hex(&identity.model_sha256)
         || identity.endpoint_hash16.is_empty()
+        || identity.provider_extra_hash16.is_empty()
         || identity.tool_mode.is_empty()
         || identity.reasoning_mode.is_empty()
         || identity.code_revision16.is_empty()

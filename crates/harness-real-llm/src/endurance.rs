@@ -543,6 +543,9 @@ pub struct EnduranceRunIdentity {
     pub model_sha256: String,
     /// Irreversible identity of normalized endpoint + wire protocol.
     pub endpoint_hash16: String,
+    /// Irreversible identity of provider-specific request extensions.
+    #[serde(default)]
+    pub provider_extra_hash16: String,
     pub tool_mode: String,
     pub reasoning_mode: String,
     #[serde(default)]
