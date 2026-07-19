@@ -402,8 +402,43 @@ impl WriteFailureClass {
     }
 }
 
+fn write_retry_delay(attempt: u32, failure: WriteFailureClass) -> std::time::Duration {
+    let seconds = match failure {
+        WriteFailureClass::QualityBlocked => 2,
+        WriteFailureClass::Transient => match attempt {
+            0 | 1 => 5,
+            2 => 15,
+            3 => 30,
+            _ => 60,
+        },
+        WriteFailureClass::Fatal => 0,
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
+fn retry_delay_within_deadline(
+    deadline: &SuiteDeadline,
+    requested: std::time::Duration,
+) -> Result<std::time::Duration, EnduranceError> {
+    let remaining = deadline.remaining()?;
+    if requested >= remaining {
+        Err(EnduranceError::SuiteTimeout)
+    } else {
+        Ok(requested)
+    }
+}
+
 fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailureClass {
     if error.starts_with("nonretryable_accept:") {
+        return WriteFailureClass::Fatal;
+    }
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("storage")
+        || lower.contains("sqlite")
+        || lower.contains("authority")
+        || lower.contains("scope mismatch")
+        || lower.contains("accepted-state")
+    {
         return WriteFailureClass::Fatal;
     }
     if is_retryable_quality_blocked_error(error) {
@@ -444,17 +479,7 @@ fn classify_write_failure(error: &str, action: &ScheduledAction) -> WriteFailure
     // retry budget is bounded by MAX_WRITE_ATTEMPTS. Treat only explicit
     // authority/storage/scope failures as fatal; provider/model and parser
     // failures otherwise use the existing transient path.
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("storage")
-        || lower.contains("sqlite")
-        || lower.contains("authority")
-        || lower.contains("scope mismatch")
-        || lower.contains("accepted-state")
-    {
-        WriteFailureClass::Fatal
-    } else {
-        WriteFailureClass::Transient
-    }
+    WriteFailureClass::Transient
 }
 
 fn next_retry_state(
@@ -2043,7 +2068,11 @@ async fn run_sqlite_endurance_stage(
                     if !transient || attempt == MAX_WRITE_ATTEMPTS {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let retry_delay = retry_delay_within_deadline(
+                        &deadline,
+                        write_retry_delay(attempt, failure_class),
+                    )?;
+                    tokio::time::sleep(retry_delay).await;
                 }
             }
         }
@@ -2809,6 +2838,14 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
         WriteFailureClass::Fatal
     );
     assert_eq!(
+        classify_write_failure("storage timeout during authority write", &private_probe),
+        WriteFailureClass::Fatal
+    );
+    assert_eq!(
+        classify_write_failure("Internal sqlite authority drift", &private_probe),
+        WriteFailureClass::Fatal
+    );
+    assert_eq!(
         classify_write_failure(
             "nonretryable_accept: storage timeout after terminal mark",
             &private_probe,
@@ -2841,6 +2878,45 @@ fn write_retry_policy_is_typed_bounded_and_autofix_strict() {
     assert!(
         next_retry_state(state.as_ref(), 9, WriteFailureClass::QualityBlocked).is_err(),
         "a process restart must not reset the five-attempt ceiling"
+    );
+}
+
+#[test]
+fn transient_write_retries_use_recovery_sized_backoff() {
+    assert_eq!(
+        write_retry_delay(1, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        write_retry_delay(2, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(15)
+    );
+    assert_eq!(
+        write_retry_delay(3, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        write_retry_delay(4, WriteFailureClass::Transient),
+        std::time::Duration::from_secs(60)
+    );
+    assert_eq!(
+        write_retry_delay(4, WriteFailureClass::QualityBlocked),
+        std::time::Duration::from_secs(2)
+    );
+
+    let ample = SuiteDeadline::new(std::time::Duration::from_secs(60));
+    assert_eq!(
+        retry_delay_within_deadline(&ample, write_retry_delay(1, WriteFailureClass::Transient))
+            .unwrap(),
+        std::time::Duration::from_secs(5)
+    );
+    let exhausted = SuiteDeadline::new(std::time::Duration::from_millis(1));
+    assert!(
+        retry_delay_within_deadline(
+            &exhausted,
+            write_retry_delay(4, WriteFailureClass::Transient)
+        )
+        .is_err()
     );
 }
 

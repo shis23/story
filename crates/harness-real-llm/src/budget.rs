@@ -15,7 +15,7 @@ use storyforge_domain::llm::{
 };
 use storyforge_domain::message_layout::{fingerprint_chat_request, messages_segment_summary};
 use storyforge_infra_llm::LlmClient;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::evidence::{
     AssertionResult, EVIDENCE_SCHEMA_VERSION, EvidenceCallRecord, EvidenceToolStep,
@@ -344,6 +344,10 @@ pub struct BudgetedLlmClient {
     turn_tag: Mutex<String>,
     role_label: Mutex<String>,
     evidence_turn_index: AtomicU32,
+    /// Real-provider evals keep logical Agent fan-out but serialize outbound
+    /// dispatches per arm. This prevents subagent/postprocess bursts from
+    /// exhausting unstable shared gateways while preserving call evidence.
+    dispatch_gate: Semaphore,
     reservation_gate: Mutex<()>,
     reservation_run_id: Option<String>,
     reservation_sink: Option<Arc<dyn DurableCallReservationSink>>,
@@ -447,6 +451,7 @@ impl BudgetedLlmClient {
             turn_tag: Mutex::new("boot".into()),
             role_label: Mutex::new("pipeline".into()),
             evidence_turn_index: AtomicU32::new(0),
+            dispatch_gate: Semaphore::new(1),
             reservation_gate: Mutex::new(()),
             reservation_run_id,
             reservation_sink,
@@ -498,7 +503,7 @@ impl BudgetedLlmClient {
     }
 
     fn reserve_call(&self, req: &ChatRequest, streaming: bool) -> Result<ReservedCall, LlmError> {
-        let _gate = self
+        let gate = self
             .reservation_gate
             .lock()
             .map_err(|_| LlmError::Internal("eval reservation gate poisoned".into()))?;
@@ -539,6 +544,7 @@ impl BudgetedLlmClient {
             })?;
         }
         self.calls.store(call_index, Ordering::SeqCst);
+        drop(gate);
         Ok(reserved)
     }
 
@@ -663,11 +669,30 @@ fn safe_llm_error_class(error: &LlmError) -> &'static str {
 #[async_trait]
 impl LlmClient for BudgetedLlmClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        let total_timeout = Duration::from_secs(self.timeout_secs);
+        let t0 = Instant::now();
+        let _dispatch_permit = tokio::time::timeout(total_timeout, self.dispatch_gate.acquire())
+            .await
+            .map_err(|_| LlmError::Timeout)?
+            .map_err(|_| LlmError::Internal("eval dispatch gate closed".into()))?;
         let req = self.effective_request(req);
         let reserved = self.reserve_call(&req, false)?;
-        let t0 = Instant::now();
+        let remaining = total_timeout
+            .checked_sub(t0.elapsed())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                self.record(
+                    &reserved,
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    "timeout",
+                );
+                LlmError::Timeout
+            })?;
         let fut = self.inner.chat(&req);
-        let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
+        let resp = match tokio::time::timeout(remaining, fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 eprintln!(
@@ -712,13 +737,56 @@ impl LlmClient for BudgetedLlmClient {
         &self,
         req: &ChatRequest,
         tx: mpsc::UnboundedSender<StreamChunk>,
-        cancel: watch::Receiver<bool>,
+        mut cancel: watch::Receiver<bool>,
     ) -> Result<ChatResponse, LlmError> {
+        if *cancel.borrow() {
+            return Err(LlmError::Cancelled);
+        }
+        let total_timeout = Duration::from_secs(self.timeout_secs);
+        let t0 = Instant::now();
+        let acquire = self.dispatch_gate.acquire();
+        tokio::pin!(acquire);
+        let queue_timeout = tokio::time::sleep(total_timeout);
+        tokio::pin!(queue_timeout);
+        let mut cancel_open = true;
+        let _dispatch_permit = loop {
+            tokio::select! {
+                permit = &mut acquire => {
+                    break permit.map_err(|_| {
+                        LlmError::Internal("eval dispatch gate closed".into())
+                    })?;
+                }
+                _ = &mut queue_timeout => return Err(LlmError::Timeout),
+                changed = cancel.changed(), if cancel_open => {
+                    match changed {
+                        Ok(()) if *cancel.borrow() => return Err(LlmError::Cancelled),
+                        Ok(()) => {}
+                        Err(_) => cancel_open = false,
+                    }
+                }
+            }
+        };
+        if *cancel.borrow() {
+            return Err(LlmError::Cancelled);
+        }
         let req = self.effective_request(req);
         let reserved = self.reserve_call(&req, true)?;
-        let t0 = Instant::now();
+        let remaining = total_timeout
+            .checked_sub(t0.elapsed())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                self.record(
+                    &reserved,
+                    &req,
+                    None,
+                    None,
+                    t0.elapsed().as_millis(),
+                    "timeout",
+                );
+                LlmError::Timeout
+            })?;
         let fut = self.inner.chat_stream(&req, tx, cancel);
-        let resp = match tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut).await {
+        let resp = match tokio::time::timeout(remaining, fut).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 eprintln!(
@@ -1045,6 +1113,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budgeted_client_serializes_provider_dispatches() {
+        struct ConcurrencyProbe {
+            active: Arc<AtomicU32>,
+            max_active: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl LlmClient for ConcurrencyProbe {
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ChatResponse {
+                    content: "ok".into(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    finish_reason: None,
+                    usage: None,
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                req: &ChatRequest,
+                _tx: mpsc::UnboundedSender<StreamChunk>,
+                _cancel: watch::Receiver<bool>,
+            ) -> Result<ChatResponse, LlmError> {
+                self.chat(req).await
+            }
+        }
+
+        let active = Arc::new(AtomicU32::new(0));
+        let max_active = Arc::new(AtomicU32::new(0));
+        let client = BudgetedLlmClient::wrap(
+            Arc::new(ConcurrencyProbe {
+                active,
+                max_active: max_active.clone(),
+            }),
+            &RealLlmRunBudget {
+                enabled: true,
+                max_calls: 2,
+                max_turns: 1,
+                timeout_secs: 30,
+                max_tokens: None,
+            },
+        );
+
+        let first = dummy_req();
+        let second = dummy_req();
+        let (first_result, second_result) = tokio::join!(client.chat(&first), client.chat(&second));
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_waiter_never_reserves_or_dispatches() {
+        struct HangingProbe(Arc<AtomicU32>);
+
+        #[async_trait]
+        impl LlmClient for HangingProbe {
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+
+            async fn chat_stream(
+                &self,
+                req: &ChatRequest,
+                _tx: mpsc::UnboundedSender<StreamChunk>,
+                _cancel: watch::Receiver<bool>,
+            ) -> Result<ChatResponse, LlmError> {
+                self.chat(req).await
+            }
+        }
+
+        let invoked = Arc::new(AtomicU32::new(0));
+        let client = BudgetedLlmClient::wrap(
+            Arc::new(HangingProbe(invoked.clone())),
+            &RealLlmRunBudget {
+                enabled: true,
+                max_calls: 2,
+                max_turns: 1,
+                timeout_secs: 30,
+                max_tokens: None,
+            },
+        );
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.chat(&dummy_req()).await });
+        while invoked.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.chat_stream(&dummy_req(), tx, cancel_rx),
+        )
+        .await
+        .expect("cancelled queue waiter must return promptly");
+
+        first.abort();
+        assert!(matches!(result, Err(LlmError::Cancelled)));
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+        assert_eq!(client.calls_used(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_dispatch_wait_counts_toward_total_timeout() {
+        struct HangingProbe(Arc<AtomicU32>);
+
+        #[async_trait]
+        impl LlmClient for HangingProbe {
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+
+            async fn chat_stream(
+                &self,
+                req: &ChatRequest,
+                _tx: mpsc::UnboundedSender<StreamChunk>,
+                _cancel: watch::Receiver<bool>,
+            ) -> Result<ChatResponse, LlmError> {
+                self.chat(req).await
+            }
+        }
+
+        let invoked = Arc::new(AtomicU32::new(0));
+        let client = BudgetedLlmClient::wrap(
+            Arc::new(HangingProbe(invoked.clone())),
+            &RealLlmRunBudget {
+                enabled: true,
+                max_calls: 2,
+                max_turns: 1,
+                timeout_secs: 1,
+                max_tokens: None,
+            },
+        );
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.chat(&dummy_req()).await });
+        while invoked.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let t0 = Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(1_500), client.chat(&dummy_req()))
+            .await
+            .expect("queued invocation must honor its own one-second budget");
+
+        first.abort();
+        assert!(matches!(result, Err(LlmError::Timeout)));
+        assert!(t0.elapsed() < Duration::from_millis(1_400));
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+        assert_eq!(client.calls_used(), 1);
+    }
+
+    #[tokio::test]
     async fn budget_timeout_returns_timeout_error() {
         struct SlowClient;
         #[async_trait]
@@ -1082,6 +1312,7 @@ mod tests {
             turn_tag: Mutex::new("t".into()),
             role_label: Mutex::new("r".into()),
             evidence_turn_index: AtomicU32::new(0),
+            dispatch_gate: Semaphore::new(1),
             reservation_gate: Mutex::new(()),
             reservation_run_id: None,
             reservation_sink: None,
