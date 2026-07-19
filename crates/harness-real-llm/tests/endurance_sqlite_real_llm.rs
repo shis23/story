@@ -3574,10 +3574,11 @@ async fn endurance_sqlite_real_llm_staged() {
     .unwrap_or_else(|error| panic!("durable call reservation ledger unavailable: {error}"));
     let real_client = storyforge_infra_llm::create_client(&connection)
         .unwrap_or_else(|error| panic!("construct real LLM client: {error}"));
-    let llm = BudgetedLlmClient::wrap_with_reasoning_and_reservations(
+    let llm = BudgetedLlmClient::wrap_with_reasoning_provider_extra_and_reservations(
         Arc::from(real_client),
         &budget,
         Some(reasoning_override.clone()),
+        connection.params.extra.clone(),
         prior_calls,
         run_id_for_log.clone(),
         Arc::new(reservation_writer),

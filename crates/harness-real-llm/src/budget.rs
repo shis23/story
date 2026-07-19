@@ -339,6 +339,7 @@ pub struct BudgetedLlmClient {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     reasoning_override: Option<ReasoningMode>,
+    provider_extra_override: Option<serde_json::Map<String, serde_json::Value>>,
     samples: Mutex<Vec<UsageSample>>,
     turn_tag: Mutex<String>,
     role_label: Mutex<String>,
@@ -358,13 +359,50 @@ impl BudgetedLlmClient {
         budget: &RealLlmRunBudget,
         reasoning_override: Option<ReasoningMode>,
     ) -> Arc<Self> {
-        Self::build(inner, budget, reasoning_override, 0, None, None)
+        Self::build(inner, budget, reasoning_override, None, 0, None, None)
+    }
+
+    pub fn wrap_with_reasoning_and_provider_extra(
+        inner: Arc<dyn LlmClient>,
+        budget: &RealLlmRunBudget,
+        reasoning_override: Option<ReasoningMode>,
+        provider_extra_override: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Arc<Self> {
+        Self::build(
+            inner,
+            budget,
+            reasoning_override,
+            provider_extra_override,
+            0,
+            None,
+            None,
+        )
     }
 
     pub fn wrap_with_reasoning_and_reservations(
         inner: Arc<dyn LlmClient>,
         budget: &RealLlmRunBudget,
         reasoning_override: Option<ReasoningMode>,
+        initial_calls: u32,
+        run_id: impl Into<String>,
+        reservation_sink: Arc<dyn DurableCallReservationSink>,
+    ) -> Result<Arc<Self>, String> {
+        Self::wrap_with_reasoning_provider_extra_and_reservations(
+            inner,
+            budget,
+            reasoning_override,
+            None,
+            initial_calls,
+            run_id,
+            reservation_sink,
+        )
+    }
+
+    pub fn wrap_with_reasoning_provider_extra_and_reservations(
+        inner: Arc<dyn LlmClient>,
+        budget: &RealLlmRunBudget,
+        reasoning_override: Option<ReasoningMode>,
+        provider_extra_override: Option<serde_json::Map<String, serde_json::Value>>,
         initial_calls: u32,
         run_id: impl Into<String>,
         reservation_sink: Arc<dyn DurableCallReservationSink>,
@@ -380,6 +418,7 @@ impl BudgetedLlmClient {
             inner,
             budget,
             reasoning_override,
+            provider_extra_override,
             initial_calls,
             Some(run_id),
             Some(reservation_sink),
@@ -390,6 +429,7 @@ impl BudgetedLlmClient {
         inner: Arc<dyn LlmClient>,
         budget: &RealLlmRunBudget,
         reasoning_override: Option<ReasoningMode>,
+        provider_extra_override: Option<serde_json::Map<String, serde_json::Value>>,
         initial_calls: u32,
         reservation_run_id: Option<String>,
         reservation_sink: Option<Arc<dyn DurableCallReservationSink>>,
@@ -402,6 +442,7 @@ impl BudgetedLlmClient {
             timeout_secs: budget.timeout_secs.max(1),
             max_tokens: budget.max_tokens,
             reasoning_override,
+            provider_extra_override,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("boot".into()),
             role_label: Mutex::new("pipeline".into()),
@@ -516,6 +557,13 @@ impl BudgetedLlmClient {
         if let Some(reasoning) = &self.reasoning_override {
             effective.params.reasoning = reasoning.clone();
         }
+        if let Some(defaults) = self.provider_extra_override.as_ref() {
+            let mut merged = defaults.clone();
+            if let Some(request_extra) = effective.params.extra.take() {
+                merged.extend(request_extra);
+            }
+            effective.params.extra = Some(merged);
+        }
         effective
     }
 
@@ -603,6 +651,7 @@ fn safe_llm_error_class(error: &LlmError) -> &'static str {
         LlmError::ServerError(_) => "server_error",
         LlmError::StreamParse(_) => "stream_parse",
         LlmError::MissingReasoning(_) => "missing_reasoning",
+        LlmError::UnexpectedReasoning(_) => "unexpected_reasoning",
         LlmError::ReasoningTooLarge(_) => "reasoning_too_large",
         LlmError::ResponseTooLarge(_) => "response_too_large",
         LlmError::Cancelled => "cancelled",
@@ -969,6 +1018,32 @@ mod tests {
         assert_eq!(source.params.reasoning, ReasoningMode::Disabled);
     }
 
+    #[test]
+    fn eval_provider_extra_override_is_in_effective_request_fingerprint() {
+        let source = dummy_req();
+        let extra = serde_json::Map::from_iter([(
+            "thinking".into(),
+            serde_json::json!({"type": "disabled"}),
+        )]);
+        let client = BudgetedLlmClient::wrap_with_reasoning_and_provider_extra(
+            Arc::new(MockLlmClient::with_defaults()),
+            &RealLlmRunBudget::default(),
+            Some(ReasoningMode::Disabled),
+            Some(extra),
+        );
+
+        let effective = client.effective_request(&source);
+
+        assert_eq!(
+            effective.params.extra.as_ref().unwrap()["thinking"]["type"],
+            "disabled"
+        );
+        assert_ne!(
+            fingerprint_chat_request(&effective),
+            fingerprint_chat_request(&source)
+        );
+    }
+
     #[tokio::test]
     async fn budget_timeout_returns_timeout_error() {
         struct SlowClient;
@@ -1002,6 +1077,7 @@ mod tests {
             timeout_secs: 1,
             max_tokens: None,
             reasoning_override: None,
+            provider_extra_override: None,
             samples: Mutex::new(Vec::new()),
             turn_tag: Mutex::new("t".into()),
             role_label: Mutex::new("r".into()),

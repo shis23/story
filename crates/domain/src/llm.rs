@@ -430,6 +430,9 @@ pub enum LlmError {
     #[error("推理捕获缺失: {0}")]
     MissingReasoning(String),
 
+    #[error("禁用推理时供应商仍返回推理: {0}")]
+    UnexpectedReasoning(String),
+
     #[error("推理捕获超限: {0}")]
     ReasoningTooLarge(String),
 

@@ -221,6 +221,7 @@ mod tests {
                 LlmError::ServerError(s) => LlmError::ServerError(s.clone()),
                 LlmError::StreamParse(s) => LlmError::StreamParse(s.clone()),
                 LlmError::MissingReasoning(s) => LlmError::MissingReasoning(s.clone()),
+                LlmError::UnexpectedReasoning(s) => LlmError::UnexpectedReasoning(s.clone()),
                 LlmError::ReasoningTooLarge(s) => LlmError::ReasoningTooLarge(s.clone()),
                 LlmError::ResponseTooLarge(s) => LlmError::ResponseTooLarge(s.clone()),
                 LlmError::Cancelled => LlmError::Cancelled,

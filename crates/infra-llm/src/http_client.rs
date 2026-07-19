@@ -32,6 +32,25 @@ fn validate_reasoning_capture(req: &ChatRequest, resp: &ChatResponse) -> Result<
         )));
     }
     if req.params.reasoning == storyforge_domain::llm::ReasoningMode::Disabled {
+        let provider_disabled = req
+            .params
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("thinking"))
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("disabled"));
+        if provider_disabled
+            && resp
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        {
+            return Err(LlmError::UnexpectedReasoning(format!(
+                "mode={:?}, model={}; provider thinking=disabled",
+                req.params.reasoning, req.model
+            )));
+        }
         return Ok(());
     }
     if resp
@@ -97,6 +116,8 @@ pub struct HttpLlmClient {
     base_url: String,
     api_key: String,
     model: String,
+    /// Provider-specific connection defaults applied at the final outbound boundary.
+    default_extra: Option<serde_json::Map<String, serde_json::Value>>,
     /// 是否使用 text_tools 降级（提示词注入 + XML/JSON 解析）
     text_fallback: bool,
 }
@@ -177,6 +198,7 @@ impl HttpLlmClient {
             base_url,
             api_key: conn.api_key.clone(),
             model: conn.model.clone(),
+            default_extra: conn.params.extra.clone(),
             text_fallback: false,
         })
     }
@@ -200,6 +222,17 @@ impl HttpLlmClient {
         }
     }
 
+    fn apply_connection_defaults(&self, req: &mut ChatRequest) {
+        let Some(defaults) = self.default_extra.as_ref() else {
+            return;
+        };
+        let mut merged = defaults.clone();
+        if let Some(request_extra) = req.params.extra.take() {
+            merged.extend(request_extra);
+        }
+        req.params.extra = Some(merged);
+    }
+
     /// 构建 Authorization header
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key)
@@ -212,6 +245,7 @@ impl crate::LlmClient for HttpLlmClient {
         let mut req = req.clone();
         // model 回退：连接配置的 model 优先于占位默认值
         req.model = self.effective_model(&req.model).to_string();
+        self.apply_connection_defaults(&mut req);
         // text_tools 降级：注入工具提示到 system prompt，移除 tools 字段
         if self.text_fallback
             && let Some(tools) = &req.tools
@@ -266,6 +300,7 @@ impl crate::LlmClient for HttpLlmClient {
         let mut req = req.clone();
         // model 回退：连接配置的 model 优先于占位默认值
         req.model = self.effective_model(&req.model).to_string();
+        self.apply_connection_defaults(&mut req);
         if self.text_fallback
             && let Some(tools) = &req.tools
         {
@@ -490,6 +525,10 @@ mod tests {
     use storyforge_domain::llm::{LlmProtocol, SamplingParams, ToolMode};
 
     fn make_client(model: &str) -> HttpLlmClient {
+        make_client_with_params(model, SamplingParams::default())
+    }
+
+    fn make_client_with_params(model: &str, params: SamplingParams) -> HttpLlmClient {
         let conn = LlmConnection {
             id: Id::from_str("test-conn"),
             name: "test".into(),
@@ -497,10 +536,58 @@ mod tests {
             api_key: "sk-test".into(),
             model: model.into(),
             protocol: LlmProtocol::OpenAi,
-            params: SamplingParams::default(),
+            params,
             tool_mode: ToolMode::Native,
         };
         HttpLlmClient::new(&conn).unwrap()
+    }
+
+    #[test]
+    fn connection_provider_extra_applies_to_requests_without_extra() {
+        let mut params = SamplingParams::default();
+        params.extra = Some(serde_json::Map::from_iter([(
+            "thinking".into(),
+            serde_json::json!({"type": "disabled"}),
+        )]));
+        let client = make_client_with_params("deepseek-v4-pro", params);
+        let mut req = ChatRequest {
+            messages: vec![],
+            tools: None,
+            params: SamplingParams::default(),
+            model: "deepseek-v4-pro".into(),
+        };
+
+        client.apply_connection_defaults(&mut req);
+
+        assert_eq!(req.params.extra.unwrap()["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn request_provider_extra_overrides_connection_key_and_preserves_other_defaults() {
+        let mut params = SamplingParams::default();
+        params.extra = Some(serde_json::Map::from_iter([
+            ("thinking".into(), serde_json::json!({"type": "disabled"})),
+            ("vendor_flag".into(), serde_json::json!(true)),
+        ]));
+        let client = make_client_with_params("deepseek-v4-pro", params);
+        let mut req = ChatRequest {
+            messages: vec![],
+            tools: None,
+            params: SamplingParams {
+                extra: Some(serde_json::Map::from_iter([(
+                    "thinking".into(),
+                    serde_json::json!({"type": "enabled"}),
+                )])),
+                ..SamplingParams::default()
+            },
+            model: "deepseek-v4-pro".into(),
+        };
+
+        client.apply_connection_defaults(&mut req);
+
+        let extra = req.params.extra.unwrap();
+        assert_eq!(extra["thinking"]["type"], "enabled");
+        assert_eq!(extra["vendor_flag"], true);
     }
 
     #[test]
@@ -590,6 +677,35 @@ mod tests {
         req.params.reasoning = storyforge_domain::llm::ReasoningMode::Prompted;
         resp.reasoning_content = Some("captured".into());
         assert!(validate_reasoning_capture(&req, &resp).is_ok());
+    }
+
+    #[test]
+    fn explicit_provider_thinking_disabled_rejects_returned_reasoning() {
+        let req = ChatRequest {
+            messages: vec![],
+            tools: None,
+            params: SamplingParams {
+                reasoning: storyforge_domain::llm::ReasoningMode::Disabled,
+                extra: Some(serde_json::Map::from_iter([(
+                    "thinking".into(),
+                    serde_json::json!({"type": "disabled"}),
+                )])),
+                ..Default::default()
+            },
+            model: "test".into(),
+        };
+        let resp = ChatResponse {
+            content: "answer".into(),
+            reasoning_content: Some("must not be returned".into()),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+        };
+
+        assert!(matches!(
+            validate_reasoning_capture(&req, &resp),
+            Err(LlmError::UnexpectedReasoning(_))
+        ));
     }
 
     #[test]

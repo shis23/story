@@ -939,6 +939,7 @@ impl HardDeadlineExt for RealLlmRunBudget {
             EnduranceStage::Canary => 20 * 60,
             EnduranceStage::Coverage => 60 * 60,
             EnduranceStage::Stability => 2 * 60 * 60,
+            EnduranceStage::LongCoverage => 4 * 60 * 60,
             EnduranceStage::Full => 4 * 60 * 60,
         };
         let total = by_calls.max(by_turns).max(floor).min(6 * 60 * 60);
