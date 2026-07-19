@@ -191,11 +191,13 @@ fn eval_pipeline_sampling(
 
 #[test]
 fn eval_pipeline_sampling_preserves_provider_thinking_extra() {
-    let mut base = storyforge_domain::llm::SamplingParams::default();
-    base.extra = Some(serde_json::Map::from_iter([(
-        "thinking".into(),
-        serde_json::json!({"type": "disabled"}),
-    )]));
+    let base = storyforge_domain::llm::SamplingParams {
+        extra: Some(serde_json::Map::from_iter([(
+            "thinking".into(),
+            serde_json::json!({"type": "disabled"}),
+        )])),
+        ..storyforge_domain::llm::SamplingParams::default()
+    };
 
     let effective = eval_pipeline_sampling(&base, ReasoningMode::Native);
 
@@ -524,6 +526,41 @@ fn accepted_attempt_audit_failure(
         Some(AcceptedAttemptAuditFailure::BudgetExhausted)
     } else {
         None
+    }
+}
+
+fn validate_cache_epoch_transition(
+    action: &ScheduledAction,
+    previous_epoch_id16: Option<&str>,
+    current_epoch_id16: Option<&str>,
+) -> Result<(), EnduranceError> {
+    let (previous, current) = match action {
+        ScheduledAction::CacheStable | ScheduledAction::CacheInvalidate => {
+            let previous = previous_epoch_id16.ok_or_else(|| {
+                EnduranceError::InvalidConfig(
+                    "cache assertion is missing the previous context epoch".into(),
+                )
+            })?;
+            let current = current_epoch_id16.ok_or_else(|| {
+                EnduranceError::InvalidConfig(
+                    "cache assertion is missing the current context epoch".into(),
+                )
+            })?;
+            (previous, current)
+        }
+        _ => return Ok(()),
+    };
+
+    match action {
+        ScheduledAction::CacheStable if previous != current => Err(EnduranceError::InvalidConfig(
+            "cache-stable row changed the context epoch".into(),
+        )),
+        ScheduledAction::CacheInvalidate if previous == current => {
+            Err(EnduranceError::InvalidConfig(
+                "cache-invalidate row did not change the context epoch".into(),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1658,13 +1695,9 @@ async fn run_sqlite_endurance_stage(
     } else {
         (0, 0)
     };
-    let mut last_accepted_request_fp16 = match resume_cp.as_ref() {
-        Some(checkpoint) if checkpoint.accepted_turn_number > 0 => {
-            last_request_fp16_for_turn(&paths.calls_jsonl, checkpoint.accepted_turn_number)
-                .map_err(EnduranceError::InvalidConfig)?
-        }
-        _ => None,
-    };
+    let mut last_context_epoch_id16 = resume_cp
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.context_epoch_id16.clone());
 
     for turn_index in start_turn..=target_turns {
         deadline.check()?;
@@ -2081,9 +2114,6 @@ async fn run_sqlite_endurance_stage(
         let current_turn_samples = current_samples
             .get(successful_attempt_sample_start..)
             .unwrap_or_default();
-        let current_request_fp16 = current_turn_samples
-            .last()
-            .map(|sample| sample.request_fp16.clone());
         let world_info_tool_succeeded = has_successful_tool_result(
             current_turn_samples
                 .iter()
@@ -2221,29 +2251,12 @@ async fn run_sqlite_endurance_stage(
                 }
             }
             ScheduledAction::CacheStable => {
-                let stable = current_request_fp16.is_some()
-                    && current_request_fp16 == last_accepted_request_fp16;
-                if !stable {
-                    return Err(EnduranceError::InvalidConfig(
-                        "cache-stable row did not preserve the actual request fingerprint".into(),
-                    ));
-                }
-                observed
-                    .observations
-                    .insert(ObservationKey::ToolEvent("cache:stable".into()));
+                // Validated against the frozen context epoch after production
+                // context fill. Full request fingerprints legitimately change
+                // as the conversation tail advances.
             }
             ScheduledAction::CacheInvalidate => {
-                let invalidated = current_request_fp16.is_some()
-                    && last_accepted_request_fp16.is_some()
-                    && current_request_fp16 != last_accepted_request_fp16;
-                if !invalidated {
-                    return Err(EnduranceError::InvalidConfig(
-                        "cache-invalidate row did not change the actual request fingerprint".into(),
-                    ));
-                }
-                observed
-                    .observations
-                    .insert(ObservationKey::ToolEvent("cache:invalidated".into()));
+                // Validated against the frozen context epoch below.
             }
             ScheduledAction::EarlyFactCheck { .. } => {}
         }
@@ -2286,32 +2299,6 @@ async fn run_sqlite_endurance_stage(
                     "early_fact:sqlite_reachable_and_remote_tool_succeeded:{probe_id}"
                 )));
         }
-        last_accepted_request_fp16 = current_request_fp16;
-
-        ledger.record(observed.clone());
-        let line = serde_json::to_string(&CoverageLedgerEvidenceRow {
-            schema_version: harness_real_llm::evidence::EVIDENCE_SCHEMA_VERSION.into(),
-            run_id: run_id.clone(),
-            observation: observed,
-        })
-        .map_err(|error| {
-            EnduranceError::InvalidConfig(format!("coverage ledger serialization: {error}"))
-        })?;
-        // Durable per-turn append so resume can rebuild exact-set without replaying.
-        {
-            use std::io::Write;
-            if let Some(parent) = ledger_path.parent() {
-                std::fs::create_dir_all(parent).map_err(EnduranceError::EvidenceIo)?;
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&ledger_path)
-                .map_err(EnduranceError::EvidenceIo)?;
-            writeln!(f, "{line}").map_err(EnduranceError::EvidenceIo)?;
-            f.sync_data().map_err(EnduranceError::EvidenceIo)?;
-        }
-
         let ctx = env
             .fill_campaign_context(WritingContext::legacy(
                 vec![],
@@ -2340,8 +2327,51 @@ async fn run_sqlite_endurance_stage(
             .context_epoch
             .as_ref()
             .map(|e| short_hash16(&e.epoch_id));
+        validate_cache_epoch_transition(
+            &action,
+            last_context_epoch_id16.as_deref(),
+            epoch_id16.as_deref(),
+        )?;
+        match &action {
+            ScheduledAction::CacheStable => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("cache:stable".into()));
+            }
+            ScheduledAction::CacheInvalidate => {
+                observed
+                    .observations
+                    .insert(ObservationKey::ToolEvent("cache:invalidated".into()));
+            }
+            _ => {}
+        }
+        last_context_epoch_id16 = epoch_id16.clone();
         if let Some(ref eid) = epoch_id16 {
             epoch_tracker.observe(eid);
+        }
+
+        ledger.record(observed.clone());
+        let line = serde_json::to_string(&CoverageLedgerEvidenceRow {
+            schema_version: harness_real_llm::evidence::EVIDENCE_SCHEMA_VERSION.into(),
+            run_id: run_id.clone(),
+            observation: observed,
+        })
+        .map_err(|error| {
+            EnduranceError::InvalidConfig(format!("coverage ledger serialization: {error}"))
+        })?;
+        // Durable per-turn append so resume can rebuild exact-set without replaying.
+        {
+            use std::io::Write;
+            if let Some(parent) = ledger_path.parent() {
+                std::fs::create_dir_all(parent).map_err(EnduranceError::EvidenceIo)?;
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&ledger_path)
+                .map_err(EnduranceError::EvidenceIo)?;
+            writeln!(f, "{line}").map_err(EnduranceError::EvidenceIo)?;
+            f.sync_data().map_err(EnduranceError::EvidenceIo)?;
         }
 
         let turn_rec = build_endurance_turn_record(EnduranceTurnRecordInput {
@@ -2864,6 +2894,56 @@ fn accepted_attempt_anomalies_are_deferred_until_after_durable_checkpoint() {
         Some(AcceptedAttemptAuditFailure::BudgetExhausted)
     );
     assert_eq!(accepted_attempt_audit_failure(3, 220, 220), None);
+}
+
+#[test]
+fn cache_transition_assertions_use_context_epoch_not_full_request_fingerprint() {
+    assert!(
+        validate_cache_epoch_transition(
+            &ScheduledAction::CacheStable,
+            Some("epoch-a"),
+            Some("epoch-a"),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_cache_epoch_transition(
+            &ScheduledAction::CacheInvalidate,
+            Some("epoch-a"),
+            Some("epoch-b"),
+        )
+        .is_ok()
+    );
+
+    let stable_error = validate_cache_epoch_transition(
+        &ScheduledAction::CacheStable,
+        Some("epoch-a"),
+        Some("epoch-b"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stable_error.contains("context epoch"));
+
+    let invalidate_error = validate_cache_epoch_transition(
+        &ScheduledAction::CacheInvalidate,
+        Some("epoch-a"),
+        Some("epoch-a"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(invalidate_error.contains("context epoch"));
+}
+
+#[test]
+fn cache_transition_assertions_fail_closed_without_both_epoch_ids() {
+    assert!(
+        validate_cache_epoch_transition(&ScheduledAction::CacheStable, None, Some("epoch-a"))
+            .is_err()
+    );
+    assert!(
+        validate_cache_epoch_transition(&ScheduledAction::CacheInvalidate, Some("epoch-a"), None)
+            .is_err()
+    );
 }
 
 #[test]

@@ -557,8 +557,10 @@ fn resolve_env_llm_connection(
     };
 
     let tool_mode = parse_env_tool_mode(tool_mode_value)?;
-    let mut params = SamplingParams::default();
-    params.extra = parse_env_extra_json(extra_json_value)?;
+    let params = SamplingParams {
+        extra: parse_env_extra_json(extra_json_value)?,
+        ..SamplingParams::default()
+    };
     Ok(Some(LlmConnection {
         id: Id::new(),
         name: "harness-env".into(),

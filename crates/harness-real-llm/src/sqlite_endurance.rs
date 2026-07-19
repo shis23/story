@@ -1377,9 +1377,7 @@ impl SqliteHarnessEnv {
                 .collect::<Vec<_>>()
                 != evaluation.checkpoint_turns
         {
-            return Err(format!(
-                "fixture evaluation is not a contiguous 80-turn schedule"
-            ));
+            return Err("fixture evaluation is not a contiguous 80-turn schedule".to_string());
         }
         let fixture_hash = fixture_source_hash16()?;
 
