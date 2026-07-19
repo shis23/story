@@ -180,6 +180,29 @@ fn provider_extra_hash16(extra: Option<&serde_json::Map<String, serde_json::Valu
     short_hash16(&canonical)
 }
 
+fn eval_pipeline_sampling(
+    base: &storyforge_domain::llm::SamplingParams,
+    reasoning: ReasoningMode,
+) -> storyforge_domain::llm::SamplingParams {
+    let mut effective = base.clone();
+    effective.reasoning = reasoning;
+    effective
+}
+
+#[test]
+fn eval_pipeline_sampling_preserves_provider_thinking_extra() {
+    let mut base = storyforge_domain::llm::SamplingParams::default();
+    base.extra = Some(serde_json::Map::from_iter([(
+        "thinking".into(),
+        serde_json::json!({"type": "disabled"}),
+    )]));
+
+    let effective = eval_pipeline_sampling(&base, ReasoningMode::Native);
+
+    assert_eq!(effective.reasoning, ReasoningMode::Native);
+    assert_eq!(effective.extra.unwrap()["thinking"]["type"], "disabled");
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitProvenance {
     commit: String,
@@ -3573,10 +3596,12 @@ async fn endurance_sqlite_real_llm_staged() {
         SqliteHarnessEnv::bootstrap(data_dir.clone(), llm.clone() as Arc<dyn LlmClient>)
             .unwrap_or_else(|e| panic!("sqlite bootstrap: {e}"))
     };
-    // BudgetedLlmClient.reasoning_override rewrites outbound request params only.
-    // Role CoT modules inject during assemble_system_prompt, which reads
-    // PipelineOrchestrator::reasoning_mode() from connection sampling.
-    env.set_pipeline_reasoning(reasoning_override);
+    // Preserve connection-level provider extensions (for example `thinking`) while
+    // applying the arm reasoning mode used by prompt assembly and capture checks.
+    env.set_pipeline_sampling(Some(eval_pipeline_sampling(
+        &connection.params,
+        reasoning_override,
+    )));
 
     let campaign_id = if let Some(cp) = resume_cp.as_ref().and_then(|c| c.campaign_id.as_ref()) {
         let id = storyforge_domain::Id::from_str(cp);
