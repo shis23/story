@@ -20,7 +20,7 @@
 | **会话历史 design + 生产接线** | ✅ | `design/history/*` + `adapter/useHistoryScreenAdapter.js` → AppV2 |
 | **活动概览 design + 生产接线** | ✅ | `design/overview/*` + `adapter/useOverviewScreenAdapter.js` → AppV2 |
 | **活动管理 design 屏 + adapter 脚手架** | ✅ 预览 | `design/campaign/*` + `adapter/useCampaignScreenAdapter.js`；生产仍 `CampaignPanel`（MVU/extract 红线） |
-| Meta 壳 design + adapter | ✅ 预览 | `design/meta/MetaScreen.vue` + `useMetaScreenAdapter`；生产仍 `MetaPanel`（mvu-applied 红线） |
+| Meta 壳 design 生产外包 | ✅ | `MetaPanel` 用 `design/meta/MetaScreen` 作纸面壳；业务 tab 仍 v2；`mvu-applied` 红线保留 |
 | AppFrame design | ✅ 预览 | `design/shell/AppFrame.vue`；生产仍 `AppShell` |
 | 旧面板 emoji/调试台残留清理 | ✅ | campaign/meta/config/debug 按钮与标题去 emoji |
 | 插件/卡内组件 | ✅ 未改坏 | `PluginHost` / `MvuJsRuntime` / `RichContent` / `MvuStatusBar` / `plugin-bridge` 冻结 |
@@ -75,7 +75,7 @@
 | 2 | 会话历史 | ✅ 重绘 + 生产接线 |
 | 3 | 活动概览 | ✅ 重绘 + 生产接线 |
 | 4 | Campaign 管理 | ✅ 重绘预览；生产仍 CampaignPanel（深度编辑） |
-| 5 | Meta 助手壳 | ✅ 壳预览；业务 tab 仍 v2 |
+| 5 | Meta 助手壳 | ✅ MetaPanel 已外包 MetaScreen；业务 tab 仍 v2 |
 | 6 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
 
 ### 接线必守（写作已满足）
