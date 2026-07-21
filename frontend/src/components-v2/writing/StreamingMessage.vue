@@ -93,8 +93,7 @@ const activeSubagents = computed(() => subagents.value.filter(s => s && s.status
             class="w-full flex items-center gap-2 px-2.5 min-h-[36px] text-xs hover:bg-surface-2 transition-colors"
           >
             <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="statusDot(s.status)"></span>
-            <span class="text-base shrink-0">{{ s.emoji || '🎭' }}</span>
-            <span class="text-ink truncate flex-1 text-left">{{ s.name || s.id || '子 Agent' }}</span>
+                        <span class="text-ink truncate flex-1 text-left">{{ s.name || s.id || '子 Agent' }}</span>
             <span v-if="s.status === 'running'" class="text-[10px] text-running">{{ s.progress || 0 }}%</span>
             <span class="text-[10px] text-ink-faint">{{ expandedSubagentIndices.has(i) ? '▾' : '▸' }}</span>
           </button>

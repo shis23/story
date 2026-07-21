@@ -308,12 +308,16 @@ function placementBadgeVariant(regex) {
                 @click.stop="handleImportAsModules(p)"
                 class="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-accent/70 hover:bg-accent-soft transition-colors"
                 title="导入为模块（可在导演配置中选择）"
-              >📦</button>
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 16v-7.5a2 2 0 0 0-1-1.73l-6.5-3.7a2 2 0 0 0-2 0L4.5 6.77a2 2 0 0 0-1 1.73V16a2 2 0 0 0 1 1.73l6.5 3.7a2 2 0 0 0 2 0l6.5-3.7a2 2 0 0 0 1-1.73z"/><path d="M4 7.2l8 4.55 8-4.55"/></svg>
+              </button>
               <button
                 @click.stop="handleDelete(p)"
                 class="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-err/70 hover:bg-err/15 transition-colors"
                 title="删除"
-              >🗑</button>
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              </button>
               <span class="text-ink-soft text-xs shrink-0">{{ expandedId === p.id ? '▲' : '▼' }}</span>
             </div>
 

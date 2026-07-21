@@ -151,7 +151,7 @@ function patchProposalResult(msg) {
               v-else-if="cardResult(msg)"
               class="mt-2 pt-2 border-t border-line text-xs space-y-1"
             >
-              <div class="font-medium text-ink">📋 角色卡「{{ cardResult(msg).name }}」</div>
+              <div class="font-medium text-ink">角色卡「{{ cardResult(msg).name }}」</div>
               <div v-if="cardResult(msg).issues.length > 0" class="text-warn">
                 ⚠ {{ cardResult(msg).issues.length }} 个问题
               </div>
@@ -163,7 +163,7 @@ function patchProposalResult(msg) {
               v-else-if="patchProposalResult(msg)"
               class="mt-2 pt-2 border-t border-line text-xs"
             >
-              <div class="font-medium text-accent">📝 提议 Patch（待采纳）</div>
+              <div class="font-medium text-accent">提议 Patch（待采纳）</div>
               <div class="text-ink-soft mt-0.5">{{ patchProposalResult(msg).description }}</div>
               <div class="text-ink-soft">{{ patchProposalResult(msg).action_count }} 个操作</div>
             </div>

@@ -285,7 +285,7 @@ defineExpose({ refreshMvuList })
     <Overlay
       :show="!!applyPreviewSource"
       side="center"
-      :title="applyPreviewSource ? ('📦 ' + applyPreviewSource.name + ' · Schema 合并预览') : ''"
+      :title="applyPreviewSource ? (applyPreviewSource.name + ' · Schema 合并预览') : ''"
       @update:show="(v) => { if (!v) closeApplyPreview() }"
     >
       <div v-if="applyPreviewLoading" class="p-6">

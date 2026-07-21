@@ -467,14 +467,14 @@ function readonly() {
                 class="flex-1"
                 :loading="saving"
                 @click="save"
-              >{{ saving ? '保存中…' : '💾 保存' }}</Button>
+              >{{ saving ? '保存中…' : '保存' }}</Button>
               <Button
                 v-if="readonly()"
                 variant="default"
                 size="md"
                 class="flex-1 border-dashed"
                 @click="duplicate(editing.id)"
-              >📋 复制为新配置</Button>
+              >复制为新配置</Button>
               <Button
                 variant="default"
                 size="md"

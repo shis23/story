@@ -39,9 +39,8 @@
 import { ref, computed, onMounted } from 'vue'
 import AppShell from './components-v2/shell/AppShell.vue'
 import CampaignOverview from './components-v2/writing/CampaignOverview.vue'
-import ConversationHistoryList from './components-v2/writing/ConversationHistoryList.vue'
-import ConversationViewport from './components-v2/writing/ConversationViewport.vue'
-import Composer from './components-v2/writing/Composer.vue'
+import WritingScreen from './design/writing/WritingScreen.vue'
+import HistoryScreen from './design/history/HistoryScreen.vue'
 import CampaignPanel from './components-v2/campaign/CampaignPanel.vue'
 import MetaPanel from './components-v2/meta/MetaPanel.vue'
 import NewCampaignForm from './components-v2/campaign/NewCampaignForm.vue'
@@ -53,6 +52,9 @@ import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import PluginHost from './components/PluginHost.vue'
+import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
+import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
+import RichContent from './components-v2/st/RichContent.vue'
 import {
   useWritingStore,
   useCampaignStore,
@@ -160,12 +162,12 @@ function setupConsoleForwarding() {
   }
 }
 
-// ─── 视图滚动桥：ConversationViewport 暴露 scrollToBottom，AppV2 转发为函数引用 ───
-const viewportRef = ref(null)
-function scrollToBottom() {
-  // viewport 仅在 write 视图存在；其他视图调用为 no-op
-  viewportRef.value?.scrollToBottom?.()
-}
+// ─── 视图滚动桥：WritingScreen 暴露 scrollToBottom，AppV2 转发为函数引用 ───
+  const writingScreenRef = ref(null)
+  function scrollToBottom() {
+    // 写作屏仅在 write 视图存在；其他视图调用为 no-op
+    writingScreenRef.value?.scrollToBottom?.()
+  }
 
 // ─── 功能面板 refs + 事件桥 ───
 // CampaignPanel ref：MetaPanel mvu-applied 后调用其 refreshActiveDetailTab（App.vue:56-61 链）
@@ -297,20 +299,43 @@ const newCampaignForm = useNewCampaignForm({
 const { openNewCampaignDialog } = newCampaignForm
 
 // 8. characterImport —— 角色卡导入
-const characterImport = useCharacterImport({
-  broadcastPluginEvent,
-  applySelectedOpeningMessage: greeting.applySelectedOpeningMessage,
-  normalizeGreetingSelection: greeting.normalizeGreetingSelection,
-})
-const { handleImport } = characterImport
+  const characterImport = useCharacterImport({
+    broadcastPluginEvent,
+    applySelectedOpeningMessage: greeting.applySelectedOpeningMessage,
+    normalizeGreetingSelection: greeting.normalizeGreetingSelection,
+  })
+  const { handleImport } = characterImport
 
-// ─── 模板装配辅助 ───
-// Composer 占位文案随写作模式变化（App.vue:1358）
-const composerPlaceholder = () =>
-  writing.writingMode === 'none' ? '请先导入角色卡或打开 Campaign…' : ''
+  // 9. writing screen adapter —— design/writing 纯展示层接线
+  const { screenProps: writingScreenProps, screenEvents: writingScreenEvents } =
+    useWritingScreenAdapter({
+      contentComponent: RichContent,
+      startWriting,
+      cancelWriting,
+      selectGreeting: greeting.selectGreeting,
+      openNewCampaign: openNewCampaignDialog,
+      handleImport,
+      viewHistory: () => ui.viewHistory(),
+      handleReroll,
+      handleRerollUser,
+      handleEditVariant,
+      handleAcceptVariant,
+      handleDeleteVariant,
+      handleBranch,
+      handleAddVariant,
+      handleSwitchVariant,
+    })
 
-// 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）
-async function hydrateActiveTurnQuality() {
+  // 10. history screen adapter —— design/history 纯展示层接线
+  const { screenProps: historyScreenProps, screenEvents: historyScreenEvents } =
+    useHistoryScreenAdapter({
+      openConversation,
+      handleDeleteConversation,
+      openNewCampaign: openNewCampaignDialog,
+    })
+
+  // 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）
+  async function hydrateActiveTurnQuality() {
   const campaignId = campaign.activeCampaign?.id
   if (!campaignId || writing.isWriting) return
   try {
@@ -356,39 +381,31 @@ onMounted(async () => {
         </template>
       </div>
       <!-- 根据 ui.currentView 切换 overview/history/write -->
-      <CampaignOverview
-        v-if="ui.currentView === 'overview'"
-        @open-campaign="ui.showCampaignPanel = true"
-        @new-campaign="openNewCampaignDialog"
-        @view-history="ui.viewHistory()"
-      />
-      <ConversationHistoryList
-        v-else-if="ui.currentView === 'history'"
-        @open="openConversation"
-        @delete="handleDeleteConversation"
-        @new-campaign="openNewCampaignDialog"
-      />
-      <ConversationViewport
+      <div v-if="ui.currentView === 'overview'" class="h-full overflow-y-auto">
+        <CampaignOverview
+          @open-campaign="ui.showCampaignPanel = true"
+          @new-campaign="openNewCampaignDialog"
+          @view-history="ui.viewHistory()"
+        />
+      </div>
+      <div v-else-if="ui.currentView === 'history'" class="h-full overflow-y-auto">
+        <HistoryScreen
+          v-bind="historyScreenProps"
+          v-on="historyScreenEvents"
+        />
+      </div>
+      <!-- 写作主屏：design/writing + adapter 接线（含 ComposerBar） -->
+      <WritingScreen
         v-else
-        ref="viewportRef"
-        :handlers="messageVariants"
-        :on-select-greeting="greeting.selectGreeting"
-        :on-new-campaign="openNewCampaignDialog"
-        :on-import="handleImport"
-        :on-view-history="ui.viewHistory"
+        ref="writingScreenRef"
+        class="h-full min-h-0"
+        v-bind="writingScreenProps"
+        v-on="writingScreenEvents"
       />
     </template>
 
     <template #composer>
-      <!-- 仅写作视图挂 Composer；概览/历史视图不占底部空间 -->
-      <Composer
-        v-if="ui.currentView === 'write'"
-        @start-writing="startWriting"
-        @cancel="cancelWriting"
-        :writing="writing.isWriting"
-        :disabled="writing.writingMode === 'none'"
-        :placeholder="composerPlaceholder()"
-      />
+      <!-- Composer 已并入 WritingScreen（稿纸下方指令条）；概览/历史不占底部 -->
     </template>
 
     <template #panels>

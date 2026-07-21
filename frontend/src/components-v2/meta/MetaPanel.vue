@@ -71,7 +71,7 @@ function onMvuApplied() {
 </script>
 
 <template>
-  <PanelHost :show="true" title="🔧 Meta 配置助手" side="left" @close="emit('close')">
+  <PanelHost :show="true" title="Meta 配置助手" side="left" @close="emit('close')">
     <div class="flex flex-col h-full">
       <!-- Tab 切换 + 全局错误/Patch 计数 -->
       <div class="shrink-0 px-3 pt-3">

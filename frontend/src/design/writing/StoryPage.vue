@@ -2,21 +2,19 @@
 /**
  * StoryPage — 稿纸页（重设计核心：写作区=桌面上的一张纸）。
  *
- * 结构（对齐 selected/20260721-board-desktop-v1-editorial-paper.png ②③）：
- *   - 页头：章节题（大）+ 元信息（字数/用时）+ 状态徽章（生成中/已完成）
- *   - 页体：消息以"文稿小节"呈现（用户意图=淡注，助手成文=正文段）
- *   - 页脚（流式中）：AI 正在生成… + 停止生成（页内，不依赖 Composer）
+ * 结构（对齐 selected 图②③）：
+ *   - 页头：章节题 + 元信息（字数/用时）+ 状态徽章
+ *   - 页体：消息以「文稿段落」呈现
+ *   - 页脚（流式中）：AI 正在生成… + 停止生成
  *
- * 纯展示；消息事件原样上抛（契约见 CONTRACT.md）。
+ * 纯展示；contentComponent / qualityAcceptHint / subagentRoles 由上层透传。
  */
 import { computed } from 'vue'
 import MessageItem from './MessageItem.vue'
 import StreamingBody from './StreamingBody.vue'
 
 const props = defineProps({
-  /** 页题（接线：Campaign 名 / 会话派生题） */
   title: { type: String, default: '' },
-  /** 用时等补充元信息（可选，无则隐去） */
   durationText: { type: String, default: '' },
   messages: { type: Array, default: () => [] },
   isWriting: { type: Boolean, default: false },
@@ -24,6 +22,10 @@ const props = defineProps({
   showPipeline: { type: Boolean, default: false },
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
+  qualityAcceptHint: { type: String, default: null },
+  contentComponent: { type: [Object, Function, String], default: null },
+  /** messageId -> [{id,label}] */
+  subagentRolesByMessage: { type: Object, default: () => ({}) },
 })
 
 const emit = defineEmits([
@@ -38,7 +40,6 @@ const emit = defineEmits([
   'branch',
 ])
 
-// 字数统计（CJK+字母数字，去空白）
 const wordCount = computed(() => {
   const all = props.messages
     .map((m) => {
@@ -65,16 +66,21 @@ const messageEvents = {
   'add-variant': (p) => emit('add-variant', p),
   'branch': (p) => emit('branch', p),
 }
+
+function rolesFor(message) {
+  return props.subagentRolesByMessage[message.id] || []
+}
 </script>
 
 <template>
   <div class="px-4 sm:px-8 py-6 sm:py-8">
     <div class="mx-auto w-full max-w-[760px] rounded-xl border border-line bg-surface shadow-rise">
-      <!-- 页头 -->
       <header class="px-6 sm:px-12 pt-8 sm:pt-10 pb-2">
         <div class="flex items-start gap-3">
           <div class="flex-1 min-w-0">
-            <h1 class="font-semibold text-[22px] sm:text-[24px] leading-snug text-ink">{{ title }}</h1>
+            <h1 class="font-semibold text-[22px] sm:text-[24px] leading-snug text-ink">
+              {{ title || '未命名文稿' }}
+            </h1>
             <p class="mt-1.5 text-xs text-ink-faint">
               <span>字数 {{ wordCount.toLocaleString() }}</span>
               <template v-if="durationText"><span class="mx-1.5">·</span><span>{{ durationText }}</span></template>
@@ -90,7 +96,6 @@ const messageEvents = {
         </div>
       </header>
 
-      <!-- 页体：文稿小节 -->
       <div class="px-6 sm:px-12 pb-4">
         <MessageItem
           v-for="m in messages"
@@ -98,18 +103,20 @@ const messageEvents = {
           :message="m"
           :busy="isWriting"
           :can-branch="canBranch"
+          :quality-accept-hint="qualityAcceptHint"
+          :content-component="contentComponent"
+          :subagent-roles="rolesFor(m)"
           v-on="messageEvents"
         />
 
-        <!-- 流式小节 -->
         <StreamingBody
           v-if="showPipeline && isWriting"
           :pipeline="pipeline"
           :role-label="streamingRoleLabel"
+          :content-component="contentComponent"
         />
       </div>
 
-      <!-- 页脚（流式中）：页内状态 + 停止 -->
       <footer
         v-if="isWriting"
         class="flex items-center gap-2 mx-6 sm:mx-12 mb-6 sm:mb-8 mt-2 rounded-lg border border-line bg-surface-2/50 px-4 py-2.5"
@@ -124,6 +131,7 @@ const messageEvents = {
           </span>
         </span>
         <button
+          type="button"
           @click="emit('cancel')"
           class="ml-auto min-h-8 px-3 rounded-md text-xs text-ink-soft border border-line bg-surface hover:border-err/40 hover:text-err transition-colors"
         >停止生成</button>

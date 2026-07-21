@@ -7,19 +7,29 @@
 
 ---
 
-## 1. 现状快照（已完成，勿返工）
+## 1. 现状快照（2026-07-22 更新）
 
 | 区块 | 状态 | 位置 |
 | --- | --- | --- |
 | 设计 token（浅色纸面默认 + `.dark` 夜读） | ✅ | `frontend/src/style.css` |
 | 主题切换默认浅色 | ✅ | `useTheme.js`、`index.html` |
 | 24 个基础 UI 组件换肤 | ✅ | `frontend/src/components-v2/ui/*` |
-| 壳：侧栏（桌面常驻/移动抽屉）+ TopBar | ✅ | `components-v2/shell/*` |
-| 写作区/历史/概览 三屏换肤（旧结构） | ✅ | `components-v2/writing/*` |
-| **新设计写作主屏（重绘·纯展示）** | ✅ 暂停于此 | `frontend/src/design/writing/`（预览 `http://localhost:1420/#design-writing`） |
-| 全量测试基线 | ✅ | `npm test` 313 + `npm run test:ui` 28 全绿 |
+| 壳：侧栏 + TopBar（纸面 token） | ✅ | `components-v2/shell/*` |
+| 旧 writing 三屏换肤 | ✅ 保留回退 | `components-v2/writing/*` |
+| **写作主屏 design + 生产接线** | ✅ | `design/writing/*` + `adapter/useWritingScreenAdapter.js` → AppV2 |
+| **会话历史 design + 生产接线** | ✅ | `design/history/*` + `adapter/useHistoryScreenAdapter.js` → AppV2 |
+| **活动管理 design 屏 + adapter 脚手架** | ✅ 预览 | `design/campaign/*` + `adapter/useCampaignScreenAdapter.js`；生产仍 `CampaignPanel`（MVU/extract 红线） |
+| Meta 壳 design | ✅ 预览 | `design/meta/MetaScreen.vue`；生产仍 `MetaPanel`（mvu-applied 红线） |
+| AppFrame design | ✅ 预览 | `design/shell/AppFrame.vue`；生产仍 `AppShell` |
+| 旧面板 emoji/调试台残留清理 | ✅ | campaign/meta/config/debug 按钮与标题去 emoji |
+| 插件/卡内组件 | ✅ 未改坏 | `PluginHost` / `MvuJsRuntime` / `RichContent` / `MvuStatusBar` / `plugin-bridge` 冻结 |
+| 全量测试基线 | ✅ | `npm test` 317 + `npm run test:ui` 28 + `npm run build` |
 
-**当前决策**：新前端设计暂停；先完成旧前端优化收尾（B2/B3/B4），保证全产品能用、统一观感；新前端后续按 §4 继续。
+**当前决策**：
+
+1. 主写作与历史已切到 **design + adapter** 生产路径。
+2. Campaign 深度管理（实例变量、MVU 条、角色提取、export/import 全路径）仍走已换肤的 `CampaignPanel`，避免破坏 Meta refresh 与卡内组件。
+3. 新屏预览：`#design-writing`、`#design-campaign`。
 
 ---
 
@@ -28,119 +38,96 @@
 ```text
 ┌─ frontend/src/design/            美术层（纯展示）
 │    只准：props 进、events 出、fixtures 演示、内联 SVG、token 取色
-│    禁止：import stores / composables / tauri-api / utils（lint 强制，见 §5）
-│    每屏三件套：组件 + fixtures.js + CONTRACT.md（或 api.d.ts）
+│    禁止：import stores / composables / tauri-api / utils
+│    每屏三件套：组件 + fixtures/demo + CONTRACT.md
 │
-├─ frontend/src/adapter/           适配层（接线 agent 的工作区）
-│    每屏一个 use<Screen>Adapter.js：
-│      读 store 字段 → 组装 screenProps
-│      组件 events → 调 composable handler
-│    只准 import：stores、composables、design 组件
+├─ frontend/src/adapter/           适配层
+│    useWritingScreenAdapter.js    ✅ 生产
+│    useHistoryScreenAdapter.js    ✅ 生产
+│    useCampaignScreenAdapter.js   ✅ 脚手架（预览/后续切换）
 │
-└─ stores / composables / tauri-api 功能层（现有，冻结约束见 §6）
+└─ stores / composables / tauri-api 功能层（冻结约束见 §6）
 ```
 
-**契约即 API**：美术层与功能层不见面，只通过该屏 `CONTRACT.md`（props↔store 映射、
-events→handler 映射、红线、验收）协作。首个完整范例：`frontend/src/design/writing/CONTRACT.md`。
+**契约即 API**：美术层与功能层不见面，只通过该屏 `CONTRACT.md` 协作。
 
-**预览通道**：`main.js` 按 hash 分流（`#design-writing` → fixture 演示页；其余 → 正式 AppV2）。
-新屏预览沿用此模式加 hash 分支；正式切换后删除对应分支。
+**预览通道**：`main.js` hash 分流（`#design-writing` / `#design-campaign`）。
 
 ---
 
-## 3. 计划 A：旧前端优化收尾（先能用，优先级最高）
+## 3. 计划 A：旧前端优化收尾 — **已完成**
 
-> 目标：全产品无"旧工程原型观感"残留；不动结构只换肤；每批完成后
-> `npm run build` + `npm test`(313) + `npm run test:ui`(28+) 全绿。
-> 任务卡模板见 `docs/VISUAL-REDESIGN-2026-07-21.md` §E；每卡必须附：只改路径清单、
-> 参考金样（`components-v2/writing/*` 或 `ui/*`）、禁止清单、四态+双主题验收。
-
-### A1. Campaign 主线（B2）— 先壳后件，2 批
-
-- **A1a（建议熟手/主模型做）**：`campaign/CampaignPanel.vue` 壳 + `campaign/NewCampaignForm.vue`
-  - ⚠️ 契约红线：CampaignPanel 的 `refreshActiveDetailTab` 暴露方法不许动；NewCampaignForm 与
-    `useNewCampaignForm` 的接线字段不许动。只改模板 class 与样式。
-- **A1b（可派弱模型，2 卡并行）**：
-  - 卡① `campaign/CampaignInstancesTab.vue` + `campaign/InstanceVariableEditor.vue`
-  - 卡② `campaign/CampaignKnowledgeTab.vue` + `campaign/CampaignTasksTab.vue` +
-        `campaign/CampaignSummariesTab.vue`
-  - 参照金样：`ui/DataTable.vue`、`ui/DataList.vue`、`writing/ConversationHistoryList.vue`
-- 卡③ `campaign/CardLibrary.vue` + `campaign/CardDetailPreview.vue` + `campaign/CampaignExportImportBar.vue`
-
-### A2. Meta / 配置（B3）— 2 卡并行
-
-- 卡④ `meta/MetaPanel.vue`（⚠️ `mvu-applied` + `lastConversationNode` 红线）+ `meta/MetaChat.vue`
-- 卡⑤ `config/ConnectionConfigPanel.vue` + `config/PresetPanel.vue` +
-      `config/PluginPanel.vue` + `config/AgentProfileManager.vue`
-- 其余 `meta/*`（HealthCheckPanel/TypedPatchList/PatchPreview/GenerationExplanation/MvuAnalyzer）
-  与 `st/*`（MvuStatusBar/StCompatibilityBadge 等）随卡④⑤附带换肤，或追加卡⑥。
-
-### A3. 调试退后区（B4）— 1 卡
-
-- 卡⑦ `shell/InspectorDrawer.vue` + `debug/*`（PipelineTracePanel/LogPanel/PluginEventLog/
-  PromptHookAuditLog）+ `components-v2/st/MvuJsRuntimeHost.vue` 外观
-- 原则：默认收起、低对比、mono 字号 12px，不追求精美，只去 glow/emoji/写死色。
-
-### A4. 收尾走查
-
-- 移动端窄屏主流程（导入→建 Campaign→写作→历史）人工走查。
-- 深浅两主题逐屏过一遍；`grep -rn "glow\|🎬\|🎭\|📋\|✏️\|🔄" frontend/src/components-v2` 应基本无残留。
+- A1 Campaign 面板：token 化 + LoadingState 补 import；保留能力结构。
+- A2 Meta / 配置：去 emoji 标题与按钮；纸面 token。
+- A3 调试区：LogPanel 图标 SVG 化；低对比 mono 风格保持。
+- A4 残留扫描：业务 UI 无 glow/紫/emoji 按钮；注释内 emoji 可保留。
 
 ---
 
-## 4. 计划 B：新前端重绘与切换（当前暂停，A 完成后或并行启动）
+## 4. 计划 B：新前端重绘与切换
 
-### B1. 继续重绘（美术层，`design/` 下每屏三件套）
-
-| 顺序 | 屏 | 参考 |
+| 顺序 | 屏 | 状态 |
 | --- | --- | --- |
-| ~~1~~ | ~~写作主屏~~ ✅ `design/writing/` | selected 图②③ |
-| 2 | Campaign 管理（含 4 Tab） | selected 图④ |
-| 3 | 会话历史 / 空态衍生 | selected 图① |
-| 4 | Meta 助手 / 连接配置 | 蓝图 §8-9（无图，先补 inbox 图再画） |
-| 5 | 壳（侧栏/TopBar/抽屉）v2 | selected 全图 |
+| 1 | 写作主屏 | ✅ 重绘 + 生产接线 |
+| 2 | 会话历史 | ✅ 重绘 + 生产接线 |
+| 3 | Campaign 管理 | ✅ 重绘预览；生产仍 CampaignPanel（深度编辑） |
+| 4 | Meta 助手壳 | ✅ 壳预览；业务 tab 仍 v2 |
+| 5 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
 
-### B2. 接线（适配层，接线 agent）
+### 接线必守（写作已满足）
 
-- 为每屏写 `adapter/use<Screen>Adapter.js`，按该屏 CONTRACT.md 映射；
-  首个样例待写：`adapter/useWritingScreenAdapter.js`（照 `design/writing/CONTRACT.md`）。
-- **接线必守**：8 个变体事件 payload 不变；`scrollToBottom` expose 签名不变；
-  正文渲染换回 `components-v2/st/RichContent.vue`；删除走 tauri `ask` 确认；
-  reroll 恢复三级菜单（整体/编剧/子Agent）。
-- 切换策略：**逐屏替换** AppV2 中的旧组件（先写作区，再其余），每换一屏跑全量测试+人工走查；
-  全切完后删 `main.js` 预览分支与旧 `components-v2/writing/*`。
+- 8 个变体事件 payload 不变。
+- `scrollToBottom` expose 签名不变。
+- 正文渲染注入 `RichContent`。
+- 删除走 tauri `ask` 确认。
+- reroll 三级菜单（整体/编剧/子Agent）。
+
+### 后续可选
+
+- 将 CampaignPanel 深度编辑（变量/MVU）以 slot 注入 `CampaignScreen` 后整屏切换。
+- MetaPanel 外包 `MetaScreen` 壳，不改子组件 props。
+- AppShell → AppFrame 切换时保留 `#panels` 挂载点（PluginHost/MvuJsRuntime）。
 
 ---
 
-## 5. 美术层 import 禁令（建议落地为 lint 规则）
+## 5. 美术层 import 禁令
 
-`frontend/eslint` 或构建约束（可后补）：`src/design/**` 禁止 import
-`stores/`、`composables/`、`tauri-api.js`、`plugin-bridge.js`、`utils/`、`components/`、
-`components-v2/`（RichContent 除外——接线时由适配层以 slot/prop 注入，或 CONTRACT 显式豁免）。
-临时人工检查：`grep -rn "from '../../stores\|from '../../composables\|tauri-api" frontend/src/design` 应无输出。
+`src/design/**` 禁止 import `stores/`、`composables/`、`tauri-api.js`、`plugin-bridge.js`、`utils/`、`components/`、`components-v2/`。
 
-## 6. 冻结与红线（任何 agent 不得突破）
+临时检查：
+
+```bash
+rg -n "from ['\"].*(stores|composables|tauri-api)" frontend/src/design
+```
+
+应无输出。
+
+---
+
+## 6. 冻结与红线
 
 - 冻结文件：`tauri-api.js`、`plugin-bridge.js`、`utils/**`、`mvu-runtime-bridge.js`、
-  `components/PluginHost.vue`、`components/MvuJsRuntime.vue`（协议与测试敏感结构）。
-- 契约红线：ChatMessage 8 emit（见 `design/writing/CONTRACT.md` 表）、
-  CampaignPanel `refreshActiveDetailTab`、MetaPanel `mvu-applied` + `lastConversationNode`。
-- store 字段 / composable 签名不动；确需动时先写「字段兼容策略」并获确认。
-- 视觉只准参考 `docs/效果预览/selected/`；`rejected/` 与旧 AppV2 截图禁止当规范。
+  `components/PluginHost.vue`、`components/MvuJsRuntime.vue`。
+- 契约红线：ChatMessage/MessageItem 8 emit、CampaignPanel `refreshActiveDetailTab`、
+  MetaPanel `mvu-applied` + `lastConversationNode`。
+- store 字段 / composable 签名不动。
+- 视觉只准参考 `docs/效果预览/selected/`。
 
-## 7. 已知陷阱（前车之鉴，验收必查）
+---
 
-1. **z token**：Tailwind 不生成 `--z-*` 命名类，须写 `z-[var(--z-overlay)]`（规格 §B2）。
-2. **headlessui 弹层动画**：禁裸用 `TransitionChild`（必须配 TransitionRoot）；
-   自卸载面板（ListboxOptions/MenuItems）用 Vue 原生 `<Transition>` 包裹。
-   happy-dom 测不出真实浏览器 transition 问题——**涉及弹层的卡必须 dev server 人工点一遍**。
-3. **Select** 已重写为 headlessui Listbox，回归测试 `tests/components-v2/select.test.mjs`。
-4. **不写死色值**：深浅主题只靠 token；`grep -rn "#[0-9a-fA-F]\{6\}" frontend/src/components-v2` 新增处应无。
+## 7. 已知陷阱
 
-## 8. 验收基线（每卡完成定义）
+1. **z token**：须写 `z-[var(--z-overlay)]`。
+2. **headlessui 弹层**：弹层相关改动必须 dev server 人工点。
+3. **AppShell 滚动**：主区 `overflow-hidden` + 子屏自滚动；overview/history 外包 `overflow-y-auto`。
+4. **不写死色值**：只用 token。
+
+---
+
+## 8. 验收基线
 
 1. `cd frontend && npm run build` ✅
-2. `npm test`（313）✅；`npm run test:ui`（28+）✅——样式断言随皮肤更新需注理由，逻辑断言不动
-3. `git diff --stat` 只含任务卡允许的文件
-4. 空/载/流/错四态 + 深浅双主题人工走查
-5. 汇报格式：每文件改动点 ≤5 行 + 测试结果 + 是否动测试及原因
+2. `npm test`（317）✅；`npm run test:ui`（28）✅
+3. 主写作路径可走通（design 屏）
+4. 插件 host / MVU runtime 仍挂载于 AppV2 `#panels`
+5. 深浅两主题人工走查

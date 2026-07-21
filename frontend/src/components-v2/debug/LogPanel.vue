@@ -140,9 +140,15 @@ defineExpose({ loadLogs })
       <h3 class="text-sm font-semibold text-ink">日志</h3>
       <Badge variant="neutral" size="sm">{{ logs.length }} 条</Badge>
       <div class="ml-auto flex items-center gap-1">
-        <IconButton size="sm" variant="ghost" title="刷新" @click="loadLogs">🔄</IconButton>
-        <IconButton size="sm" variant="ghost" title="导出 bundle" @click="handleExport">📦</IconButton>
-        <IconButton size="sm" variant="ghost" title="清空日志" @click="handleClear">🗑</IconButton>
+        <IconButton size="sm" variant="ghost" title="刷新" @click="loadLogs">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        </IconButton>
+        <IconButton size="sm" variant="ghost" title="导出 bundle" @click="handleExport">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v3.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+        </IconButton>
+        <IconButton size="sm" variant="ghost" title="清空日志" @click="handleClear">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </IconButton>
       </div>
     </header>
 

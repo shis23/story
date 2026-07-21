@@ -122,6 +122,19 @@ M5 endurance 默认不发送输出上限；如需显式 ceiling：
 $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 ```
 
+## 2026-07-22 前端解耦与视觉（本轮）
+
+权威入口：`docs/FRONTEND-DECOUPLING-AND-PLAN.md`。
+
+已落地：
+
+- 三层解耦：`design/`（纯展示）→ `adapter/`（接线）→ stores/composables/tauri。
+- **生产主路径**：写作 `WritingScreen` + `useWritingScreenAdapter`；历史 `HistoryScreen` + `useHistoryScreenAdapter`。
+- RichContent / 删除确认 / reroll 三级菜单 / `scrollToBottom` expose 按契约接好。
+- Campaign / Meta 深度面板仍用已换肤 `components-v2`（保护 `refreshActiveDetailTab`、`mvu-applied`、PluginHost、MvuJsRuntime）。
+- design 预览：`#design-writing`、`#design-campaign`。
+- 验证：`frontend` 下 `npm test`（317）、`npm run test:ui`（28）、`npm run build` 通过；未改 `plugin-bridge` / `tauri-api` 协议。
+
 ## 下一优先级
 
 1. 用已修复的 seal 路径重跑 SQLite Coverage Native 12（新 run id）并 seal+verify；再做 TextFallback 专项；不复活旧 45/100。
@@ -129,6 +142,7 @@ $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 3. CoT 三臂 × 80 轮：先核 Gate 0 确定性门，再跑真实三臂并写 RESULT（与 SQLite 封存分账）。
 4. 部署并实跑 Gitea runner，验证 workflow、上传包、subject/sidecar 和离线 re-hash。
 5. 由人工补桌面 GUI、Android 真机、签名包和真实第三方插件验收。
+6. 前端可选：Campaign 深度编辑 slot 注入后整屏切换 design CampaignScreen；AppShell→AppFrame；人工深浅主题与移动端走查。
 
 ## 交接约束
 

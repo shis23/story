@@ -382,7 +382,9 @@ async function handleSetActive(id) {
                 :loading="fetchingModels"
                 :title="'从 ' + form.baseUrl + ' 拉取模型列表'"
                 @click="handleFetchModels"
-              >🔍</Button>
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+              </Button>
             </div>
             <div v-if="fetchedModels.length" class="text-[10px] text-ink-faint mt-1">
               已拉取 {{ fetchedModels.length }} 个模型
@@ -483,14 +485,14 @@ async function handleSetActive(id) {
               class="flex-1"
               :loading="testing"
               @click="handleTest"
-            >{{ testing ? '测试中…' : '🔌 测试连接' }}</Button>
+            >{{ testing ? '测试中…' : '测试连接' }}</Button>
             <Button
               variant="primary"
               size="md"
               class="flex-1"
               :loading="saving"
               @click="handleSave"
-            >{{ saving ? '保存中…' : '💾 保存' }}</Button>
+            >{{ saving ? '保存中…' : '保存' }}</Button>
           </div>
         </div>
       </template>

@@ -31,15 +31,16 @@ const ui = useUiStore()
       </aside>
 
       <!-- 中写作区 -->
-      <main class="flex-1 flex flex-col min-w-0">
+      <main class="flex-1 flex flex-col min-w-0 min-h-0">
         <TopBar />
 
-        <!-- 中间内容(由父级 slot 注入:write/history/overview 视图) -->
-        <div class="flex-1 overflow-y-auto">
+        <!-- 中间内容：min-h-0 + overflow-hidden 让 WritingScreen 自己滚动；
+             overview/history 各自包一层 overflow-y-auto。 -->
+        <div class="flex-1 min-h-0 overflow-hidden flex flex-col">
           <slot name="content" />
         </div>
 
-        <!-- Composer slot(底部输入栏) -->
+        <!-- Composer slot（写作主屏已并入 design ComposerBar；其他视图可空） -->
         <slot name="composer" />
       </main>
 

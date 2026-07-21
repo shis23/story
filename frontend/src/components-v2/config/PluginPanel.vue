@@ -71,12 +71,12 @@ onMounted(loadPlugins)
 </script>
 
 <template>
-  <PanelHost :show="true" title="🔌 插件管理" side="left" @close="emit('close')">
+  <PanelHost :show="true" title="插件管理" side="left" @close="emit('close')">
     <template #header>
       <div class="flex items-center justify-between min-w-0 gap-2">
-        <h2 class="text-sm font-semibold text-ink truncate">🔌 插件管理</h2>
+        <h2 class="text-sm font-semibold text-ink truncate">插件管理</h2>
         <Button variant="default" size="sm" @click="showInstall = !showInstall">
-          {{ showInstall ? '取消' : '📦 安装插件' }}
+          {{ showInstall ? '取消' : '安装插件' }}
         </Button>
       </div>
     </template>
