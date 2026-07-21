@@ -63,11 +63,11 @@ StoryForge 已进入工程化发布候选阶段。Campaign-first 多 Agent 写�
 
 当前事实入口：`docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`。  
 计划：`docs/workstreams/SQLITE-M5-100-ENDURANCE-PLAN.md`。  
-RESULT：`SQLITE-M5-100-ENDURANCE-RESULT.md` **尚未提交**。
+RESULT：`docs/workstreams/SQLITE-M5-100-ENDURANCE-RESULT.md`（**Partial Evidence**，非封存 PASS）。
 
 - harness：`crates/harness-real-llm/src/sqlite_endurance.rs` 经 `sqlite_runtime` + `ProductionPostprocessService` + `accept_by_variant`。
 - 生产命令：`start_writing` / autofix / postprocess / regenerate / edit-stale 在 opt-in SQLite 下走 preaccept UoW。
-- 本地旁证：Native 12 曾 `turns=12/12 accepted`，seal/verify 因文件锁失败；**不得**写成 PASS。
+- 本地旁证：Native 12 曾 `turns=12/12 accepted`，seal 因 live SQLite 文件锁失败；2026-07-21 已修 seal 扫描，**未**重跑真实模型封存，**不得**写成 PASS。
 - Meta：campaign health 可读 SQLite；typed patch 等仍显式 unsupported。
 
 ## 存储边界
@@ -124,7 +124,7 @@ $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 
 ## 下一优先级
 
-1. SQLite 证据收口：修复 Native 12 seal 文件锁，完成 TextFallback 专项与 offline verify，提交 `SQLITE-M5-100-ENDURANCE-RESULT.md`（不复活旧 45/100）。
+1. 用已修复的 seal 路径重跑 SQLite Coverage Native 12（新 run id）并 seal+verify；再做 TextFallback 专项；不复活旧 45/100。
 2. 仅在 RESULT 需要时补 SQLite Meta UoW / 真机 opt-in 现场；未支持能力保持显式 unsupported。
 3. CoT 三臂 × 80 轮：先核 Gate 0 确定性门，再跑真实三臂并写 RESULT（与 SQLite 封存分账）。
 4. 部署并实跑 Gitea runner，验证 workflow、上传包、subject/sidecar 和离线 re-hash。

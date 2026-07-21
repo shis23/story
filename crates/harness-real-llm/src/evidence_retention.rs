@@ -1157,8 +1157,37 @@ fn rel_path_under(run_dir: &Path, file: &Path) -> Result<String, EvidenceRetenti
 
 fn is_live_working_dir(name: &str) -> bool {
     // Live mutable campaign state is not part of the sealed evidence envelope.
-    // Still scanned for secrets when present, but never hashed/archived.
+    // Text-like leaves are still scanned for secrets when present, but never hashed/archived.
     name == "campaign_data" || name == "archives" || name == "restore"
+}
+
+/// Process-owned lock files and live SQLite database siblings.
+///
+/// These can remain exclusively locked while the harness still holds the open DB /
+/// reservation writer during `seal_run`. They are never sealed subjects; secret
+/// scanning only needs text-like leaves under live dirs, not binary DB pages.
+fn is_live_binary_or_lock_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".call-reservations.active.lock"
+        || lower.ends_with(".active.lock")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".db")
+        || lower.ends_with("-wal")
+        || lower.ends_with("-shm")
+        || lower.ends_with(".db-wal")
+        || lower.ends_with(".db-shm")
+}
+
+fn is_sharing_or_lock_io_error(err: &io::Error) -> bool {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy => true,
+        _ => {
+            let raw = err.raw_os_error();
+            // Windows: ERROR_LOCK_VIOLATION (33), ERROR_SHARING_VIOLATION (32).
+            raw == Some(32) || raw == Some(33)
+        }
+    }
 }
 
 /// Files that participate in the sealed digest / archive set.
@@ -1190,7 +1219,7 @@ fn is_sealed_evidence_file(rel: &str) -> bool {
 }
 
 fn scan_for_forbidden(run_dir: &Path) -> Result<(), EvidenceRetentionError> {
-    fn walk(dir: &Path, run_dir: &Path) -> Result<(), EvidenceRetentionError> {
+    fn walk(dir: &Path, run_dir: &Path, under_live: bool) -> Result<(), EvidenceRetentionError> {
         assert_not_reparse_path(dir)?;
         ensure_canonical_within(run_dir, dir)?;
         for entry in fs::read_dir(dir)? {
@@ -1206,24 +1235,37 @@ fn scan_for_forbidden(run_dir: &Path) -> Result<(), EvidenceRetentionError> {
                 });
             }
             if path.is_dir() {
-                // Always recurse, including live working dirs: secrets must not hide there.
-                walk(&path, run_dir)?;
+                // Always recurse, including live working dirs: text secrets must not hide there.
+                let next_live = under_live || is_live_working_dir(&name);
+                walk(&path, run_dir, next_live)?;
                 continue;
             }
-            // Scan ALL files, including hidden and .tmp — digest/archive sets are separate.
+            // Process-owned lock files and live SQLite DB siblings can stay locked while
+            // seal/verify runs in the same process. They are not sealed subjects.
+            if is_live_binary_or_lock_file(&name) {
+                continue;
+            }
+            // Scan remaining files, including hidden and .tmp — digest/archive sets are separate.
             // Prefer full read when UTF-8; also scan lossy bytes for marker strings.
-            let bytes = fs::read(&path)?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if under_live && is_sharing_or_lock_io_error(&err) => {
+                    // Live mutable state may be exclusively locked by the open SQLite handle.
+                    // Do not fail seal solely because campaign_data pages cannot be read.
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             let text = String::from_utf8_lossy(&bytes);
             if contains_forbidden_evidence_payload(&text) {
                 let rel = rel_path_under(run_dir, &path).unwrap_or_else(|_| "unknown".into());
                 return Err(EvidenceRetentionError::ForbiddenPayload { relative_path: rel });
             }
-            let _ = name;
         }
         Ok(())
     }
     assert_not_reparse_path(run_dir)?;
-    walk(run_dir, run_dir)
+    walk(run_dir, run_dir, false)
 }
 
 /// Recursively validate an explicit evidence/review tree, including sibling

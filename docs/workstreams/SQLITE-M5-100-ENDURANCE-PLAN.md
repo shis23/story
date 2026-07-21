@@ -1,12 +1,12 @@
 # SQLite + M5 100 轮真实模型集成计划
 
-> 状态（2026-07-21 审计更新）：**Gate A/B 代码接线已进入 main**；真实模型证据 **未封存**。  
-> 本地旁证：Native 12 曾 `turns=12/12 accepted`，seal/verify 因文件锁失败；**无** `SQLITE-M5-100-ENDURANCE-RESULT.md`。  
-> 不得把“历史 Full100 / accepted 12/12”读成已提交 PASS。  
+> 状态（2026-07-21）：**Gate A/B 代码接线已进入 main**；真实模型证据 **Partial**。  
+> RESULT：`docs/workstreams/SQLITE-M5-100-ENDURANCE-RESULT.md`（诚实 partial：Native12 accepted 未 seal PASS）。  
+> 本地旁证：Native 12 曾 `turns=12/12 accepted`，seal 因 live SQLite 文件锁失败；本轮已修 seal 扫描，**未**重跑真实模型封存。  
+> 不得把 accepted 12/12 或 seal 代码修复读成 Full/Native 封存 PASS。  
 > 当前事实入口：`docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`。  
-> 计划起草基线：main @ `75385e8`；审计对照 HEAD：`bf36e04`。  
-> 执行方式：用户已授权直接在 main 工作；分阶段提交、不 push。  
-> 结果文档：补测完成并离线核验后**新建** `SQLITE-M5-100-ENDURANCE-RESULT.md`（目前不存在）。
+> 计划起草基线：main @ `75385e8`；审计对照 HEAD 见 RESULT。  
+> 执行方式：用户已授权直接在 main 工作；分阶段提交、不 push。
 
 ## 1. 为什么当初不能直接把现有 100 轮改成 SQLite 模式后开跑
 

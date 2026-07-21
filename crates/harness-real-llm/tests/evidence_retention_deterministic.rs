@@ -883,6 +883,50 @@ fn sqlite_audit_subject_is_sealed_without_live_campaign_data() {
 }
 
 #[test]
+fn seal_skips_live_sqlite_binaries_and_still_scans_text_secrets() {
+    // Native12 residual failure mode: campaign_data/storyforge.sqlite3 remains open
+    // while seal_run scans the tree. Binary DB pages and process lock files must not
+    // fail seal; text secrets under the same live dir must still fail closed.
+    let root = unique_dir("livesqlitescan");
+    let validated = validate_evidence_root(&root, &test_policy()).unwrap();
+    let run_id = allocate_run_id(&validated, "canary").unwrap();
+    let run_dir = prepare_run_dir(&validated, &run_id).unwrap();
+    write_sqlite_completed_fixture(&run_dir, &run_id);
+
+    let live = run_dir.join("campaign_data");
+    fs::create_dir_all(&live).unwrap();
+    fs::write(
+        live.join("storyforge.sqlite3"),
+        b"not-a-real-db-but-binary-like\0\0\0",
+    )
+    .unwrap();
+    fs::write(live.join("storyforge.sqlite3-wal"), b"wal-pages").unwrap();
+    fs::write(live.join("storyforge.sqlite3-shm"), b"shm-pages").unwrap();
+    fs::write(run_dir.join(".call-reservations.active.lock"), b"").unwrap();
+
+    // Text secret under live dir must still fail closed even when binary siblings exist.
+    fs::write(live.join("notes.json"), r#"{"api_key":"should-not-seal"}"#).unwrap();
+    let err = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary"))
+        .expect_err("text secret under live dir must still fail closed");
+    assert!(matches!(
+        err,
+        EvidenceRetentionError::ForbiddenPayload { .. }
+    ));
+
+    fs::remove_file(live.join("notes.json")).unwrap();
+    let manifest = seal_run(&run_dir, valid_completed_seal_options(&run_id, "canary"))
+        .expect("live sqlite binaries/locks must not block seal");
+    assert!(
+        manifest
+            .files
+            .iter()
+            .all(|f| !f.relative_path.starts_with("campaign_data/"))
+    );
+    verify_run(&run_dir).unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn sealed_completed_run_is_immutable_and_cannot_resume() {
     let root = unique_dir("sealed_no_resume");
     let run_id = allocate_run_id(&root, "canary").unwrap();
