@@ -38,9 +38,9 @@
  */
 import { ref, computed, onMounted } from 'vue'
 import AppShell from './components-v2/shell/AppShell.vue'
-import CampaignOverview from './components-v2/writing/CampaignOverview.vue'
 import WritingScreen from './design/writing/WritingScreen.vue'
 import HistoryScreen from './design/history/HistoryScreen.vue'
+import OverviewScreen from './design/overview/OverviewScreen.vue'
 import CampaignPanel from './components-v2/campaign/CampaignPanel.vue'
 import MetaPanel from './components-v2/meta/MetaPanel.vue'
 import NewCampaignForm from './components-v2/campaign/NewCampaignForm.vue'
@@ -54,6 +54,7 @@ import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
 import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
+import { useOverviewScreenAdapter } from './adapter/useOverviewScreenAdapter.js'
 import RichContent from './components-v2/st/RichContent.vue'
 import {
   useWritingStore,
@@ -334,6 +335,15 @@ const { openNewCampaignDialog } = newCampaignForm
       openNewCampaign: openNewCampaignDialog,
     })
 
+  // 11. overview screen adapter —— design/overview 纯展示层接线
+  const { screenProps: overviewScreenProps, screenEvents: overviewScreenEvents } =
+    useOverviewScreenAdapter({
+      openCampaign: () => { ui.showCampaignPanel = true },
+      viewHistory: () => ui.viewHistory(),
+      openNewCampaign: openNewCampaignDialog,
+      continueWriting: () => ui.viewWrite(),
+    })
+
   // 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）
   async function hydrateActiveTurnQuality() {
   const campaignId = campaign.activeCampaign?.id
@@ -382,10 +392,9 @@ onMounted(async () => {
       </div>
       <!-- 根据 ui.currentView 切换 overview/history/write -->
       <div v-if="ui.currentView === 'overview'" class="h-full overflow-y-auto">
-        <CampaignOverview
-          @open-campaign="ui.showCampaignPanel = true"
-          @new-campaign="openNewCampaignDialog"
-          @view-history="ui.viewHistory()"
+        <OverviewScreen
+          v-bind="overviewScreenProps"
+          v-on="overviewScreenEvents"
         />
       </div>
       <div v-else-if="ui.currentView === 'history'" class="h-full overflow-y-auto">

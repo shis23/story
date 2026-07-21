@@ -18,8 +18,9 @@
 | 旧 writing 三屏换肤 | ✅ 保留回退 | `components-v2/writing/*` |
 | **写作主屏 design + 生产接线** | ✅ | `design/writing/*` + `adapter/useWritingScreenAdapter.js` → AppV2 |
 | **会话历史 design + 生产接线** | ✅ | `design/history/*` + `adapter/useHistoryScreenAdapter.js` → AppV2 |
+| **活动概览 design + 生产接线** | ✅ | `design/overview/*` + `adapter/useOverviewScreenAdapter.js` → AppV2 |
 | **活动管理 design 屏 + adapter 脚手架** | ✅ 预览 | `design/campaign/*` + `adapter/useCampaignScreenAdapter.js`；生产仍 `CampaignPanel`（MVU/extract 红线） |
-| Meta 壳 design | ✅ 预览 | `design/meta/MetaScreen.vue`；生产仍 `MetaPanel`（mvu-applied 红线） |
+| Meta 壳 design + adapter | ✅ 预览 | `design/meta/MetaScreen.vue` + `useMetaScreenAdapter`；生产仍 `MetaPanel`（mvu-applied 红线） |
 | AppFrame design | ✅ 预览 | `design/shell/AppFrame.vue`；生产仍 `AppShell` |
 | 旧面板 emoji/调试台残留清理 | ✅ | campaign/meta/config/debug 按钮与标题去 emoji |
 | 插件/卡内组件 | ✅ 未改坏 | `PluginHost` / `MvuJsRuntime` / `RichContent` / `MvuStatusBar` / `plugin-bridge` 冻结 |
@@ -44,7 +45,9 @@
 ├─ frontend/src/adapter/           适配层
 │    useWritingScreenAdapter.js    ✅ 生产
 │    useHistoryScreenAdapter.js    ✅ 生产
+│    useOverviewScreenAdapter.js   ✅ 生产
 │    useCampaignScreenAdapter.js   ✅ 脚手架（预览/后续切换）
+│    useMetaScreenAdapter.js       ✅ 脚手架（预览/后续切换）
 │
 └─ stores / composables / tauri-api 功能层（冻结约束见 §6）
 ```
@@ -70,9 +73,10 @@
 | --- | --- | --- |
 | 1 | 写作主屏 | ✅ 重绘 + 生产接线 |
 | 2 | 会话历史 | ✅ 重绘 + 生产接线 |
-| 3 | Campaign 管理 | ✅ 重绘预览；生产仍 CampaignPanel（深度编辑） |
-| 4 | Meta 助手壳 | ✅ 壳预览；业务 tab 仍 v2 |
-| 5 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
+| 3 | 活动概览 | ✅ 重绘 + 生产接线 |
+| 4 | Campaign 管理 | ✅ 重绘预览；生产仍 CampaignPanel（深度编辑） |
+| 5 | Meta 助手壳 | ✅ 壳预览；业务 tab 仍 v2 |
+| 6 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
 
 ### 接线必守（写作已满足）
 
