@@ -131,9 +131,10 @@ $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 - 三层解耦：`design/`（纯展示）→ `adapter/`（接线）→ stores/composables/tauri。
 - **生产主路径**：写作 `WritingScreen`、历史 `HistoryScreen`、概览 `OverviewScreen` + 对应 adapter。
 - RichContent / 删除确认 / reroll 三级菜单 / `scrollToBottom` expose 按契约接好。
-- Campaign 深度面板仍用已换肤 `CampaignPanel`（保护 `refreshActiveDetailTab`）；MetaPanel 已外包 `MetaScreen` 纸面壳（`mvu-applied` 红线保留）。
+- CampaignPanel 已外包 `CampaignScreen` 全宽双栏（selected 图④），深度 Tab（含 MVU 状态条）经 slot 注入，`refreshActiveDetailTab` 保留。
+- MetaPanel 已外包 `MetaScreen` 纸面壳（`mvu-applied` 红线保留）。
 - PluginHost / MvuJsRuntime / plugin-bridge 未改。
-- design 预览：`#design-writing`、`#design-campaign`；Campaign/AppFrame design 与 adapter 脚手架已就绪。
+- design 预览：`#design-writing`、`#design-campaign`。
 - 验证：`frontend` 下 `npm test`（317）、`npm run test:ui`（28）、`npm run build` 通过；未改 `plugin-bridge` / `tauri-api` 协议。
 
 ## 下一优先级

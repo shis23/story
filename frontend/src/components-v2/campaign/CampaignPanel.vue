@@ -16,27 +16,21 @@ import { buildGreetingOptionsFromDetail } from '../../utils/campaignGreetingOpti
 import { refreshSubTab, subTabRefKey } from '../../utils/campaignTabRefresh.js'
 import { useCampaignStore } from '../../stores/campaign.js'
 import PanelHost from '../shell/PanelHost.vue'
-import Tabs from '../ui/Tabs.vue'
-import SegmentedControl from '../ui/SegmentedControl.vue'
 import Button from '../ui/Button.vue'
 import Input from '../ui/Input.vue'
 import Select from '../ui/Select.vue'
-import Badge from '../ui/Badge.vue'
 import EmptyState from '../ui/EmptyState.vue'
-import LoadingState from '../ui/LoadingState.vue'
+import CampaignScreen from '../../design/campaign/CampaignScreen.vue'
 
 const emit = defineEmits(['close', 'campaign-changed'])
 
 const campaignStore = useCampaignStore()
 const writingStore = useWritingStore()
 
-// ─── Tab 控制 ───
-const activeTab = ref('cards') // 'cards' | 'campaigns' | 'detail'
-const topTabs = [
-  { key: 'cards', label: '角色卡' },
-  { key: 'campaigns', label: '游玩档' },
-  { key: 'detail', label: '档详情' },
-]
+// ─── 壳模式：manage（双栏活动）| cards（角色卡库）───
+const shellMode = ref('manage') // 'manage' | 'cards'
+// 兼容旧 activeTab 语义：cards | campaigns | detail
+const activeTab = ref('detail')
 
 // ─── Cards 状态(CardLibrary 自管;此处仅持有 ref 用于导入后刷新) ───
 const cardLibraryRef = ref(null)
@@ -77,12 +71,10 @@ async function loadSelectedCampaignCardDetail() {
 // ─── Detail 状态 ───
 const selectedCampaignId = ref(null)
 const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'tasks' | 'summaries'
-const detailSubTabs = [
-  { label: '角色实例', value: 'instances' },
-  { label: '知识', value: 'knowledge' },
-  { label: '任务', value: 'tasks' },
-  { label: '摘要', value: 'summaries' },
-]
+
+const selectedCampaign = computed(
+  () => campaigns.value.find((c) => c.id === selectedCampaignId.value) || activeCampaign.value,
+)
 
 // ─── 子组件 template refs ───
 const instancesTabRef = ref(null)
@@ -107,8 +99,21 @@ onMounted(async () => {
     selectedCardId.value = activeCampaign.value.card_id
     selectedCampaignId.value = activeCampaign.value.id
     await loadSelectedCampaignCardDetail()
-    await refreshCampaigns()
     activeTab.value = 'detail'
+    shellMode.value = 'manage'
+  }
+  // 双栏列表展示全部活动（创建时仍用 selectedCardId 限定角色卡）
+  const savedCardId = selectedCardId.value
+  selectedCardId.value = null
+  await refreshCampaigns()
+  selectedCardId.value = savedCardId
+  // 若按卡过滤列表为空但已有活跃档，至少保证选中项可见
+  if (
+    selectedCampaignId.value &&
+    !campaigns.value.some((c) => c.id === selectedCampaignId.value) &&
+    activeCampaign.value
+  ) {
+    campaigns.value = [activeCampaign.value, ...campaigns.value]
   }
 })
 
@@ -119,10 +124,10 @@ async function refreshCards() {
 
 // ─── Campaigns 操作 ───
 async function refreshCampaigns() {
-  if (!selectedCardId.value) return
   loadingCampaigns.value = true
   try {
-    campaigns.value = await listCampaigns(selectedCardId.value)
+    // 有选中角色卡时按卡过滤；否则列出全部（对齐 design 双栏「我的活动」）
+    campaigns.value = await listCampaigns(selectedCardId.value || null)
   } finally {
     loadingCampaigns.value = false
   }
@@ -130,6 +135,7 @@ async function refreshCampaigns() {
 
 async function openCampaignsForCard(card) {
   selectedCardId.value = card.id
+  shellMode.value = 'manage'
   activeTab.value = 'campaigns'
   showNewCampaign.value = false
   await loadSelectedCampaignCardDetail()
@@ -184,8 +190,33 @@ async function handleSetActive(campaignId) {
 
 async function openCampaignDetail(campaignId) {
   selectedCampaignId.value = campaignId
+  shellMode.value = 'manage'
   activeTab.value = 'detail'
   // 子组件各自 onMounted 加载，不需要 refreshDetail 全拉
+}
+
+function onSelectCampaign(camp) {
+  if (!camp?.id) return
+  openCampaignDetail(camp.id)
+}
+
+function onChangeMode(mode) {
+  shellMode.value = mode
+  activeTab.value = mode === 'cards' ? 'cards' : (selectedCampaignId.value ? 'detail' : 'campaigns')
+}
+
+function onChangeDetailTab(tab) {
+  detailSubTab.value = tab
+  activeTab.value = 'detail'
+}
+
+async function onNewCampaignFromShell() {
+  if (!selectedCardId.value) {
+    shellMode.value = 'cards'
+    activeTab.value = 'cards'
+    return
+  }
+  await openNewCampaignForm()
 }
 
 // ─── 刷新当前活跃的 detail 子 tab ───
@@ -325,189 +356,96 @@ defineExpose({ refreshActiveDetailTab })
 </script>
 
 <template>
-  <PanelHost :show="true" title="Campaign 管理" side="left" @close="emit('close')">
-    <!-- Tab 切换(PanelHost 已提供滚动容器) -->
-    <div class="px-3 pt-3">
-      <Tabs v-model="activeTab" :tabs="topTabs">
-          <!-- 内容区 -->
-          <div class="space-y-3">
+  <!-- 全宽活动管理（对齐 selected 图④）；深度 Tab 经 #detail 注入，保留 MVU/变量编辑 -->
+  <PanelHost :show="true" title="" side="full" @close="emit('close')">
+    <CampaignScreen
+      class="h-full"
+      :mode="shellMode"
+      :campaigns="campaigns"
+      :selected-campaign-id="selectedCampaignId"
+      :selected-campaign="selectedCampaign"
+      :loading-campaigns="loadingCampaigns"
+      :detail-tab="detailSubTab"
+      :export-status="exportStatus"
+      :import-status="importStatus"
+      :exporting="exporting"
+      :importing="importingBundle"
+      @close="emit('close')"
+      @select-campaign="onSelectCampaign"
+      @set-active="handleSetActive"
+      @change-tab="onChangeDetailTab"
+      @change-mode="onChangeMode"
+      @new-campaign="onNewCampaignFromShell"
+      @export-st="handleExportStCards"
+      @export-bundle="handleExportBundle"
+      @import-bundle="handleImportBundle"
+      @refresh="refreshActiveDetailTab"
+    >
+      <template #cards>
+        <div class="space-y-3 max-w-4xl">
+          <div v-if="importStatus" class="text-xs text-ink-soft">{{ importStatus }}</div>
+          <CardLibrary
+            ref="cardLibraryRef"
+            @open-campaigns="openCampaignsForCard"
+          />
+        </div>
+      </template>
 
-            <!-- ═══ Tab 1: 角色卡 ═══ -->
-            <template v-if="activeTab === 'cards'">
-              <!-- 导入 Bundle 入口 -->
-              <div class="flex items-center justify-end gap-2">
-                <Button
-                  variant="default"
-                  size="sm"
-                  :disabled="importingBundle"
-                  @click="handleImportBundle"
-                >{{ importingBundle ? '导入中…' : '导入 Bundle' }}</Button>
-              </div>
-              <div v-if="importStatus" class="text-xs text-ink-soft">{{ importStatus }}</div>
-
-              <!-- CardLibrary 自管 loading/empty/列表/提取 -->
-              <CardLibrary
-                ref="cardLibraryRef"
-                @open-campaigns="openCampaignsForCard"
-              />
-            </template>
-
-            <!-- ═══ Tab 2: 游玩档 ═══ -->
-            <template v-if="activeTab === 'campaigns'">
-              <!-- 未选卡时提示选卡 -->
-              <EmptyState
-                v-if="!selectedCardId"
-                title="请先选择角色卡"
-                description="在「角色卡」tab 选择一张卡"
-              />
-
-              <template v-else>
-                <LoadingState v-if="loadingCampaigns" />
-
-                <EmptyState
-                  v-else-if="campaigns.length === 0 && !showNewCampaign"
-                  title="还没有游玩档"
-                >
-                  <template #action>
-                    <Button variant="primary" size="md" @click="openNewCampaignForm">新建游玩档</Button>
-                  </template>
-                </EmptyState>
-
-                <!-- 新建表单 -->
-                <div v-if="showNewCampaign" class="bg-surface rounded-lg border border-line p-3 space-y-2">
-                  <div class="text-xs font-medium text-ink">新建游玩档</div>
-                  <div v-if="newCampaignGreetingOptions.length > 1">
-                    <label class="text-xs text-ink-soft mb-1 block">开场白</label>
-                    <Select v-model="newCampaignGreetingIndex" :options="greetingOptions" />
-                  </div>
-                  <Input
-                    v-model="newCampaignName"
-                    placeholder="输入档名（如：第一周目）"
-                    @keyup.enter="handleCreateCampaign"
-                  />
-                  <div class="flex gap-2">
-                    <Button variant="default" size="md" class="flex-1" @click="showNewCampaign = false">取消</Button>
-                    <Button
-                      variant="primary"
-                      size="md"
-                      class="flex-1"
-                      :disabled="creatingCampaign || !newCampaignName.trim()"
-                      :loading="creatingCampaign"
-                      @click="handleCreateCampaign"
-                    >{{ creatingCampaign ? '创建中…' : '创建' }}</Button>
-                  </div>
-                </div>
-
-                <!-- Campaign 列表 -->
-                <div
-                  v-for="camp in campaigns"
-                  :key="camp.id"
-                  class="bg-surface rounded-lg border overflow-hidden cursor-pointer transition-colors"
-                  :class="activeCampaign?.id === camp.id ? 'border-accent' : 'border-line hover:border-accent-border'"
-                  @click="openCampaignDetail(camp.id)"
-                >
-                  <div class="flex items-center gap-3 px-3 py-2.5">
-                    <div class="flex-1 min-w-0">
-                      <div class="flex items-center gap-2">
-                        <span class="text-sm font-medium text-ink">{{ camp.name }}</span>
-                        <Badge v-if="activeCampaign?.id === camp.id" variant="accent" size="sm">活跃</Badge>
-                      </div>
-                      <div class="text-xs text-ink-soft">{{ camp.instance_count }} 个角色实例</div>
-                    </div>
-                    <Button
-                      v-if="activeCampaign?.id !== camp.id"
-                      variant="default"
-                      size="sm"
-                      @click.stop="handleSetActive(camp.id)"
-                    >设为活跃</Button>
-                    <span class="text-ink-soft text-xs">→</span>
-                  </div>
-                </div>
-
-                <!-- 新建按钮(有档时显示) -->
-                <Button
-                  v-if="campaigns.length > 0 && !showNewCampaign"
-                  variant="default"
-                  size="md"
-                  class="w-full border-dashed"
-                  @click="openNewCampaignForm"
-                >+ 新建游玩档</Button>
-              </template>
-            </template>
-
-            <!-- ═══ Tab 3: 档详情 ═══ -->
-            <template v-if="activeTab === 'detail'">
-              <!-- 未选档提示 -->
-              <EmptyState
-                v-if="!selectedCampaignId"
-                title="请先选择游玩档"
-                description="在「游玩档」tab 点击一个档"
-              />
-
-              <template v-else>
-                <!-- 导出按钮组 -->
-                <div class="bg-surface rounded-lg border border-line p-3 mb-3 space-y-2">
-                  <div class="text-xs font-medium text-ink mb-1">导出</div>
-                  <div class="flex gap-2">
-                    <Button
-                      variant="default"
-                      size="sm"
-                      class="flex-1"
-                      :disabled="exporting"
-                      @click="handleExportStCards()"
-                    >{{ exporting ? '导出中…' : 'ST 卡 PNG' }}</Button>
-                    <Button
-                      variant="default"
-                      size="sm"
-                      class="flex-1"
-                      :disabled="exporting"
-                      @click="handleExportBundle()"
-                    >{{ exporting ? '导出中…' : 'JSON Bundle' }}</Button>
-                  </div>
-                  <div v-if="exportStatus" class="text-xs text-ink-soft">{{ exportStatus }}</div>
-                </div>
-
-                <!-- 刷新按钮 -->
-                <div class="flex justify-end mb-2">
-                  <Button variant="default" size="sm" @click="refreshActiveDetailTab()">刷新</Button>
-                </div>
-
-                <!-- 子 Tab 切换条 -->
-                <div class="mb-3">
-                  <SegmentedControl v-model="detailSubTab" :options="detailSubTabs" />
-                </div>
-
-                <!-- ▸ 子 Tab: 角色实例 -->
-                <CampaignInstancesTab
-                  v-if="detailSubTab === 'instances'"
-                  ref="instancesTabRef"
-                  :campaign-id="selectedCampaignId"
-                />
-
-                <!-- ▸ 子 Tab: 知识 -->
-                <CampaignKnowledgeTab
-                  v-if="detailSubTab === 'knowledge'"
-                  ref="knowledgeTabRef"
-                  :campaign-id="selectedCampaignId"
-                />
-
-                <!-- ▸ 子 Tab: 任务 -->
-                <CampaignTasksTab
-                  v-if="detailSubTab === 'tasks'"
-                  ref="tasksTabRef"
-                  :campaign-id="selectedCampaignId"
-                />
-
-                <!-- ▸ 子 Tab: 摘要 -->
-                <CampaignSummariesTab
-                  v-if="detailSubTab === 'summaries'"
-                  ref="summariesTabRef"
-                  :campaign-id="selectedCampaignId"
-                />
-              </template>
-            </template>
+      <template #detail>
+        <!-- 新建游玩档表单（有选中卡时） -->
+        <div v-if="showNewCampaign" class="mb-4 rounded-xl border border-line bg-surface p-4 space-y-2 shadow-card">
+          <div class="text-xs font-medium text-ink">新建游玩档</div>
+          <div v-if="newCampaignGreetingOptions.length > 1">
+            <label class="text-xs text-ink-soft mb-1 block">开场白</label>
+            <Select v-model="newCampaignGreetingIndex" :options="greetingOptions" />
           </div>
-        </Tabs>
-      </div>
+          <Input
+            v-model="newCampaignName"
+            placeholder="输入档名（如：第一周目）"
+            @keyup.enter="handleCreateCampaign"
+          />
+          <div class="flex gap-2">
+            <Button variant="default" size="md" class="flex-1" @click="showNewCampaign = false">取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              class="flex-1"
+              :disabled="creatingCampaign || !newCampaignName.trim()"
+              :loading="creatingCampaign"
+              @click="handleCreateCampaign"
+            >{{ creatingCampaign ? '创建中…' : '创建' }}</Button>
+          </div>
+        </div>
+
+        <EmptyState
+          v-if="!selectedCampaignId"
+          title="请先选择活动"
+          description="从左侧列表选择，或新建一个游玩档"
+        />
+
+        <template v-else>
+          <CampaignInstancesTab
+            v-if="detailSubTab === 'instances'"
+            ref="instancesTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+          <CampaignKnowledgeTab
+            v-else-if="detailSubTab === 'knowledge'"
+            ref="knowledgeTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+          <CampaignTasksTab
+            v-else-if="detailSubTab === 'tasks'"
+            ref="tasksTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+          <CampaignSummariesTab
+            v-else
+            ref="summariesTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+        </template>
+      </template>
+    </CampaignScreen>
   </PanelHost>
 </template>

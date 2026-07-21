@@ -19,7 +19,7 @@
 | **写作主屏 design + 生产接线** | ✅ | `design/writing/*` + `adapter/useWritingScreenAdapter.js` → AppV2 |
 | **会话历史 design + 生产接线** | ✅ | `design/history/*` + `adapter/useHistoryScreenAdapter.js` → AppV2 |
 | **活动概览 design + 生产接线** | ✅ | `design/overview/*` + `adapter/useOverviewScreenAdapter.js` → AppV2 |
-| **活动管理 design 屏 + adapter 脚手架** | ✅ 预览 | `design/campaign/*` + `adapter/useCampaignScreenAdapter.js`；生产仍 `CampaignPanel`（MVU/extract 红线） |
+| **活动管理 design 壳生产外包** | ✅ | `CampaignPanel` 外包 `design/campaign/CampaignScreen` 全宽双栏；`#detail` 注入 Instances/Knowledge/Tasks/Summaries（含 MVU）；`refreshActiveDetailTab` 红线保留 |
 | Meta 壳 design 生产外包 | ✅ | `MetaPanel` 用 `design/meta/MetaScreen` 作纸面壳；业务 tab 仍 v2；`mvu-applied` 红线保留 |
 | AppFrame design | ✅ 预览 | `design/shell/AppFrame.vue`；生产仍 `AppShell` |
 | 旧面板 emoji/调试台残留清理 | ✅ | campaign/meta/config/debug 按钮与标题去 emoji |
@@ -74,7 +74,7 @@
 | 1 | 写作主屏 | ✅ 重绘 + 生产接线 |
 | 2 | 会话历史 | ✅ 重绘 + 生产接线 |
 | 3 | 活动概览 | ✅ 重绘 + 生产接线 |
-| 4 | Campaign 管理 | ✅ 重绘预览；生产仍 CampaignPanel（深度编辑） |
+| 4 | Campaign 管理 | ✅ CampaignPanel 外包 CampaignScreen；深度 Tab slot 注入 |
 | 5 | Meta 助手壳 | ✅ MetaPanel 已外包 MetaScreen；业务 tab 仍 v2 |
 | 6 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
 
