@@ -16,17 +16,17 @@ const emit = defineEmits(['select'])
 </script>
 
 <template>
-  <div class="pt-3 pb-2">
-    <div class="flex items-center gap-2 overflow-x-auto">
-      <span class="shrink-0 text-xs text-ink-soft">开场</span>
+  <div class="pt-2 pb-4">
+    <div class="flex items-center gap-2 overflow-x-auto pb-1">
+      <span class="shrink-0 text-[11px] tracking-wide text-ink-faint">开场</span>
       <button
         v-for="(option, i) in options"
         :key="option.label"
         @click="emit('select', i)"
-        class="shrink-0 min-h-[36px] px-3 rounded-lg text-xs font-medium border transition-colors"
+        class="shrink-0 min-h-8 px-3 rounded-full text-xs font-medium border transition-colors"
         :class="selectedIndex === i
-          ? 'bg-accent text-white border-accent shadow-glow-accent'
-          : 'bg-surface text-ink-soft border-line hover:border-accent hover:text-accent'"
+          ? 'bg-accent-soft text-accent-bright border-accent-border'
+          : 'bg-surface text-ink-soft border-line hover:border-accent-border hover:text-ink'"
       >
         {{ option.label }}
       </button>

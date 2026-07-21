@@ -87,7 +87,7 @@ const transitionClass = computed(() => {
       <span
         v-if="visible && content"
         :class="[
-          'absolute z-50 bg-surface-2 text-ink text-xs px-2 py-1 rounded shadow-float border border-line whitespace-nowrap pointer-events-none',
+          'absolute z-[var(--z-tooltip)] bg-surface text-ink text-xs px-2 py-1 rounded-md shadow-float border border-line whitespace-nowrap pointer-events-none',
           positionClass,
         ]"
         role="tooltip"

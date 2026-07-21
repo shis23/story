@@ -31,7 +31,7 @@ watch(
     :placeholder="placeholder"
     :disabled="disabled"
     :rows="rows"
-    class="w-full bg-surface-2 border border-line rounded-lg px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint transition-colors duration-150 focus:border-accent disabled:opacity-40 disabled:cursor-not-allowed resize-y"
+    class="w-full bg-surface border border-line rounded-md px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint transition-colors duration-150 outline-none focus:border-accent-border disabled:bg-surface-2 disabled:text-ink-faint disabled:cursor-not-allowed resize-y"
     @input="$emit('update:modelValue', $event.target.value)"
   />
 </template>

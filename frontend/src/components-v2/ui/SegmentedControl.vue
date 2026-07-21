@@ -19,7 +19,7 @@ function select(value) {
 
 <template>
   <div
-    class="inline-flex items-center gap-0.5 rounded-lg bg-surface-2 p-0.5"
+    class="inline-flex items-center gap-0.5 rounded-md bg-surface-2 border border-line p-0.5"
     :class="{ 'opacity-40 pointer-events-none': disabled }"
   >
     <button
@@ -29,7 +29,7 @@ function select(value) {
       class="px-3 py-1 text-xs rounded-md transition-colors duration-150 select-none"
       :class="
         modelValue === opt.value
-          ? 'bg-accent text-bg font-medium shadow-glow-accent'
+          ? 'bg-surface text-ink font-medium shadow-card'
           : 'text-ink-soft hover:text-ink'
       "
       @click="select(opt.value)"

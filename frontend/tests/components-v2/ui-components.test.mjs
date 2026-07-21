@@ -47,12 +47,12 @@ test('Toggle 关闭态渲染 line 类', () => {
   expect(cls).toContain('line')
 })
 
-test('SegmentedControl 选中项高亮 accent', () => {
+test('SegmentedControl 选中项为纸卡浮起（bg-surface + shadow-card）', () => {
   const w = mount(SegmentedControl, {
     props: { modelValue: 'b', options: [{ label: '甲', value: 'a' }, { label: '乙', value: 'b' }] },
   })
   const buttons = w.findAll('button')
-  expect(buttons[1].classes()).toEqual(expect.arrayContaining(['bg-accent']))
+  expect(buttons[1].classes()).toEqual(expect.arrayContaining(['bg-surface', 'shadow-card']))
 })
 
 test('SegmentedControl 点击切换 emit value', async () => {

@@ -8,14 +8,33 @@ defineEmits(['update:modelValue'])
 </script>
 
 <template>
-  <label class="inline-flex items-center gap-2 select-none" :class="{ 'opacity-40 cursor-not-allowed': disabled }">
+  <label
+    class="inline-flex items-center gap-2 select-none"
+    :class="disabled ? 'cursor-not-allowed' : 'cursor-pointer'"
+  >
     <input
       type="checkbox"
       :checked="modelValue"
       :disabled="disabled"
-      class="h-4 w-4 rounded border-line bg-surface-2 text-accent focus:ring-accent focus:ring-offset-0 cursor-pointer"
+      class="peer sr-only"
       @change="$emit('update:modelValue', $event.target.checked)"
     />
-    <span v-if="label" class="text-sm text-ink">{{ label }}</span>
+    <span
+      class="h-4 w-4 rounded-sm border flex items-center justify-center transition-colors duration-150"
+      :class="[
+        modelValue ? 'bg-accent border-accent' : 'bg-surface border-line',
+        disabled ? 'opacity-40' : 'peer-hover:border-accent-border',
+      ]"
+    >
+      <svg
+        v-if="modelValue"
+        class="text-white"
+        width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M5 12.5l4.5 4.5L19 7" />
+      </svg>
+    </span>
+    <span v-if="label" class="text-sm" :class="disabled ? 'text-ink-faint' : 'text-ink'">{{ label }}</span>
   </label>
 </template>

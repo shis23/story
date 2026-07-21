@@ -19,7 +19,8 @@ test('Button disabled 时 button 元素也 disabled', () => {
 test('Button loading 时不渲染 slot,显示 spinner', () => {
   const w = mount(Button, { props: { loading: true }, slots: { default: '发送' } })
   expect(w.text()).not.toContain('发送')
-  expect(w.text()).toContain('◌')
+  // 纸上编辑部皮肤:spinner 为内联 SVG(animate-spin),不再用 ◌ 字符
+  expect(w.html()).toContain('animate-spin')
 })
 
 test('Button 点击触发 click 事件', async () => {
@@ -40,8 +41,10 @@ test('Button danger variant 渲染 err 类', () => {
   expect(cls).toContain('err')
 })
 
-test('Button 默认 variant 含 surface-2', () => {
+test('Button 默认 variant 含纸卡底色与细线', () => {
   const w = mount(Button, { slots: { default: '默认' } })
   const cls = w.attributes('class') || ''
-  expect(cls).toContain('surface-2')
+  // 纸上编辑部皮肤:default = surface 纸卡 + line 细描边(不再是 surface-2)
+  expect(cls).toContain('bg-surface')
+  expect(cls).toContain('border-line')
 })

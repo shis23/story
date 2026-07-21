@@ -50,23 +50,23 @@ const qualityWarnings = computed(() => quality.value?.warnings || [])
 <template>
   <div
     v-if="hasReview"
-    class="mx-auto max-w-2xl px-4 sm:px-6"
+    class="mb-3"
   >
-    <div class="mb-2 rounded-lg border border-line/60 overflow-hidden">
+    <div class="rounded-lg border border-line bg-surface/60 overflow-hidden">
       <button
         @click="expanded = !expanded"
         class="w-full flex items-center gap-2 px-3 min-h-[36px] text-xs text-ink-soft hover:bg-surface-2 transition-colors"
       >
-        <span class="text-ink-faint">📋</span>
+        <span class="w-1.5 h-1.5 rounded-full bg-ok shrink-0"></span>
         <span>上一轮过程回顾</span>
         <span class="text-ink-faint">{{ directorDetail }}</span>
-        <span class="ml-auto text-[10px] text-ink-faint">{{ expanded ? '收起' : '展开' }}</span>
+        <span class="ml-auto text-[11px] text-ink-faint">{{ expanded ? '收起' : '展开' }}</span>
       </button>
 
-      <div v-if="expanded" class="px-3 pb-3 space-y-2 bg-surface/40">
+      <div v-if="expanded" class="px-3 pb-3 space-y-2 border-t border-line">
         <!-- 导演规划 -->
         <div v-if="directorOutput">
-          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">🎬 导演规划</div>
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wider pt-2.5 pb-1">导演规划</div>
           <div class="text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
             {{ directorOutput }}
           </div>
@@ -74,8 +74,8 @@ const qualityWarnings = computed(() => quality.value?.warnings || [])
 
         <!-- 子 Agent 产出 -->
         <div v-if="subagents.length">
-          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">
-            🎭 子 Agent · {{ subagents.filter(s => s.status === 'done').length }}/{{ subagents.length }}
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wider pt-2 pb-1">
+            子 Agent · {{ subagents.filter(s => s.status === 'done').length }}/{{ subagents.length }}
           </div>
           <div
             v-for="(s, i) in subagents"
@@ -83,7 +83,7 @@ const qualityWarnings = computed(() => quality.value?.warnings || [])
             class="rounded-md bg-surface-2/50 p-2"
           >
             <div class="flex items-center gap-2 text-xs">
-              <span>{{ s.emoji || '🎭' }}</span>
+              <span>{{ s.emoji || '·' }}</span>
               <span class="text-ink truncate">{{ s.name || s.id || '子 Agent' }}</span>
             </div>
             <div v-if="s.output" class="mt-1 text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
@@ -94,8 +94,8 @@ const qualityWarnings = computed(() => quality.value?.warnings || [])
 
         <!-- 编剧成文 -->
         <div v-if="editorOutput">
-          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">
-            ✍️ 编剧成文
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wider pt-2 pb-1">
+            编剧成文
           </div>
           <div class="text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
             {{ editorOutput }}
@@ -104,8 +104,8 @@ const qualityWarnings = computed(() => quality.value?.warnings || [])
 
         <!-- B3 质量门禁（warn-only） -->
         <div v-if="quality">
-          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wide pt-2 pb-1">
-            🧪 质量检查
+          <div class="text-[10px] font-medium text-ink-faint uppercase tracking-wider pt-2 pb-1">
+            质量检查
             <span
               class="ml-1 normal-case tracking-normal"
               :class="quality.passed ? 'text-ok' : 'text-warn'"

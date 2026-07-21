@@ -373,11 +373,16 @@ onMounted(async () => {
         ref="viewportRef"
         :handlers="messageVariants"
         :on-select-greeting="greeting.selectGreeting"
+        :on-new-campaign="openNewCampaignDialog"
+        :on-import="handleImport"
+        :on-view-history="ui.viewHistory"
       />
     </template>
 
     <template #composer>
+      <!-- 仅写作视图挂 Composer；概览/历史视图不占底部空间 -->
       <Composer
+        v-if="ui.currentView === 'write'"
         @start-writing="startWriting"
         @cancel="cancelWriting"
         :writing="writing.isWriting"

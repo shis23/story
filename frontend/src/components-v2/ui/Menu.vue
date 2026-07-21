@@ -4,7 +4,6 @@ import {
   MenuButton,
   MenuItems,
   MenuItem,
-  TransitionChild,
 } from '@headlessui/vue'
 
 defineProps({
@@ -23,26 +22,31 @@ defineEmits(['select'])
       <slot name="trigger" :open="open">
         <button
           type="button"
-          class="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 text-sm rounded-lg bg-surface-2 text-ink border border-line hover:border-accent-border transition-colors duration-150 select-none"
+          class="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 text-sm rounded-md bg-surface text-ink border border-line shadow-card hover:border-accent-border transition-colors duration-150 select-none"
         >
           {{ label }}
-          <span class="text-ink-soft text-xs">▾</span>
+          <svg
+            class="text-ink-soft transition-transform duration-150"
+            :class="open ? 'rotate-180' : ''"
+            width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+          >
+            <path d="M6 9l6 6 6-6" />
+          </svg>
         </button>
       </slot>
     </MenuButton>
 
-    <!-- 下拉面板（进出动画） -->
-    <TransitionChild
-      as="template"
-      enter="transition ease-[cubic-bezier(0.22,1,0.36,1)] duration-150"
-      enterFrom="opacity-0 -translate-y-1"
-      enterTo="opacity-100 translate-y-0"
-      leave="transition ease-[cubic-bezier(0.22,1,0.36,1)] duration-100"
-      leaveFrom="opacity-100 translate-y-0"
-      leaveTo="opacity-0 -translate-y-1"
+    <!-- 下拉面板（进出动画）：Vue 原生 Transition，MenuItems 关闭时自行卸载 -->
+    <Transition
+      enter-active-class="transition ease-[cubic-bezier(0.22,1,0.36,1)] duration-150"
+      enter-from-class="opacity-0 -translate-y-1"
+      enter-to-class="opacity-100 translate-y-0"
+      leave-active-class="transition ease-[cubic-bezier(0.22,1,0.36,1)] duration-100"
+      leave-from-class="opacity-100 translate-y-0"
+      leave-to-class="opacity-0 -translate-y-1"
     >
       <MenuItems
-        class="absolute right-0 mt-1 w-48 bg-surface rounded-lg shadow-float border border-line py-1 focus:outline-none"
+        class="absolute right-0 z-[var(--z-overlay)] mt-1 w-48 bg-surface rounded-lg shadow-rise border border-line py-1 focus:outline-none"
       >
         <!-- 默认 slot：渲染 MenuItem 列表，每项可拿到 active 与 select(key) -->
         <slot>
@@ -60,6 +64,6 @@ defineEmits(['select'])
           </MenuItem>
         </slot>
       </MenuItems>
-    </TransitionChild>
+    </Transition>
   </Menu>
 </template>

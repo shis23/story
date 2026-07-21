@@ -123,14 +123,14 @@ const overlayTransition = {
               v-if="title"
               class="flex items-center justify-between px-4 py-3 border-b border-line shrink-0"
             >
-              <h2 class="text-base font-medium text-ink">{{ title }}</h2>
+              <h2 class="text-base font-semibold text-ink">{{ title }}</h2>
               <button
                 type="button"
                 class="text-ink-soft hover:text-ink transition-colors px-1 -mr-1"
                 @click="isOpen = false"
                 aria-label="关闭"
               >
-                ✕
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
               </button>
             </div>
             <!-- 无标题时可选提供关闭按钮（showClose=false 抑制） -->
@@ -144,7 +144,7 @@ const overlayTransition = {
                 @click="isOpen = false"
                 aria-label="关闭"
               >
-                ✕
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
               </button>
             </div>
 

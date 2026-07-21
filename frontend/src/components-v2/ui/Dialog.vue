@@ -29,12 +29,12 @@ const isOpen = computed({
 const confirmBtnClass = computed(() => {
   switch (props.variant) {
     case 'danger':
-      return 'bg-err text-bg font-medium hover:opacity-90'
+      return 'text-err border border-err/40 hover:bg-err/10'
     case 'warn':
-      return 'bg-warn text-bg font-medium hover:opacity-90'
+      return 'bg-warn text-white font-medium hover:opacity-90'
     case 'confirm':
     default:
-      return 'bg-accent text-bg font-medium shadow-glow-accent hover:opacity-90'
+      return 'bg-accent text-white font-medium hover:bg-accent-bright'
   }
 })
 
@@ -76,11 +76,11 @@ function handleCancel() {
           leaveTo="opacity-0 scale-95"
         >
           <DialogPanel
-            class="w-full max-w-sm bg-surface rounded-xl shadow-float p-5"
+            class="w-full max-w-sm bg-surface border border-line rounded-xl shadow-float p-5"
           >
             <DialogTitle
               v-if="title"
-              class="text-lg text-ink font-medium"
+              class="text-lg text-ink font-semibold"
             >
               {{ title }}
             </DialogTitle>
@@ -94,14 +94,14 @@ function handleCancel() {
             <div class="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                class="inline-flex items-center justify-center px-3.5 py-1.5 text-sm rounded-lg bg-surface-2 text-ink border border-line hover:border-accent-border transition-colors duration-150 select-none"
+                class="inline-flex items-center justify-center px-3.5 py-1.5 text-sm rounded-md bg-surface text-ink border border-line shadow-card hover:border-accent-border transition-colors duration-150 select-none"
                 @click="handleCancel"
               >
                 {{ cancelText }}
               </button>
               <button
                 type="button"
-                class="inline-flex items-center justify-center px-3.5 py-1.5 text-sm rounded-lg transition-opacity duration-150 select-none"
+                class="inline-flex items-center justify-center px-3.5 py-1.5 text-sm rounded-md transition-colors duration-150 select-none"
                 :class="confirmBtnClass"
                 @click="handleConfirm"
               >

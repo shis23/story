@@ -49,23 +49,25 @@ const activeSubagents = computed(() => subagents.value.filter(s => s && s.status
 </script>
 
 <template>
-  <div class="px-4 sm:px-6 py-4 rounded-xl">
+  <div class="py-4">
     <!-- 角色标签 -->
-    <div class="flex items-center gap-2 mb-3">
-      <span class="text-xs font-medium text-accent">{{ roleLabel }}</span>
-      <span class="text-[10px] text-ink-faint">· 生成中</span>
+    <div class="flex items-center gap-2 mb-2.5">
+      <span class="text-xs font-medium tracking-wide text-accent">{{ roleLabel }}</span>
+      <span class="text-[11px] text-running flex items-center gap-1.5">
+        <span class="w-1.5 h-1.5 rounded-full bg-running animate-pulse"></span>生成中
+      </span>
     </div>
 
     <!-- ── Director 折叠块 ── -->
-    <div v-if="directorOutput || directorActive" class="mb-2 rounded-lg bg-surface/60 overflow-hidden">
+    <div v-if="directorOutput || directorActive" class="mb-2 rounded-lg border border-line bg-surface/70 overflow-hidden">
       <button
         @click="expandedDirector = !expandedDirector"
-        class="w-full flex items-center gap-2 px-3 min-h-[40px] text-xs text-ink-soft hover:bg-surface-2 transition-colors"
+        class="w-full flex items-center gap-2 px-3 min-h-[38px] text-xs text-ink-soft hover:bg-surface-2 transition-colors"
       >
         <span class="w-1.5 h-1.5 rounded-full" :class="statusDot(pipeline.director?.status)"></span>
-        <span>🎬 导演规划</span>
+        <span>导演规划</span>
         <span class="text-ink-faint">{{ pipeline.director?.detail || '' }}</span>
-        <span class="ml-auto text-[10px]">{{ expandedDirector ? '▾' : '▸' }}</span>
+        <span class="ml-auto text-[10px] text-ink-faint">{{ expandedDirector ? '收起' : '展开' }}</span>
       </button>
       <div v-if="expandedDirector && directorOutput" class="px-3 pb-2.5 text-[11px] text-ink-soft font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
         {{ directorOutput }}
@@ -73,16 +75,16 @@ const activeSubagents = computed(() => subagents.value.filter(s => s && s.status
     </div>
 
     <!-- ── 子 Agent 折叠块 ── -->
-    <div v-if="activeSubagents.length" class="mb-2 rounded-lg bg-surface/60 overflow-hidden">
+    <div v-if="activeSubagents.length" class="mb-2 rounded-lg border border-line bg-surface/70 overflow-hidden">
       <button
         @click="expandedSubagents = !expandedSubagents"
-        class="w-full flex items-center gap-2 px-3 min-h-[40px] text-xs text-ink-soft hover:bg-surface-2 transition-colors"
+        class="w-full flex items-center gap-2 px-3 min-h-[38px] text-xs text-ink-soft hover:bg-surface-2 transition-colors"
       >
-        <span>🎭 子 Agent · {{ activeSubagents.filter(s => s.status === 'done').length }}/{{ activeSubagents.length }}</span>
+        <span>子 Agent · {{ activeSubagents.filter(s => s.status === 'done').length }}/{{ activeSubagents.length }}</span>
         <span class="ml-auto flex items-center gap-1">
           <span v-for="(s, i) in activeSubagents" :key="s.id || i" class="w-1.5 h-1.5 rounded-full" :class="statusDot(s.status)"></span>
         </span>
-        <span class="text-[10px]">{{ expandedSubagents ? '▾' : '▸' }}</span>
+        <span class="text-[10px] text-ink-faint">{{ expandedSubagents ? '收起' : '展开' }}</span>
       </button>
       <div v-if="expandedSubagents" class="px-3 pb-2 space-y-1.5">
         <div v-for="(s, i) in activeSubagents" :key="s.id || i" class="rounded-md bg-surface-2/60 overflow-hidden">
@@ -111,10 +113,10 @@ const activeSubagents = computed(() => subagents.value.filter(s => s && s.status
     </div>
 
     <!-- ── Editor 逐字流式（衬线正文） ── -->
-    <div v-if="editorContent || editorRunning" class="text-ink prose-fiction text-[15px] leading-loose">
+    <div v-if="editorContent || editorRunning" class="text-ink prose-fiction text-[15.5px] leading-loose">
       <span v-html="formatContent(editorContent)"></span>
-      <!-- 打字光标 -->
-      <span v-if="editorRunning" class="inline-block w-0.5 h-4 bg-accent align-middle animate-pulse ml-0.5"></span>
+      <!-- 打字光标：细竖线，呼吸 -->
+      <span v-if="editorRunning" class="inline-block w-[2px] h-[1.05em] bg-accent align-text-bottom animate-pulse ml-0.5"></span>
     </div>
     <div v-else-if="editorDone" class="text-[11px] text-ink-faint italic">成文完成，等待落盘…</div>
   </div>

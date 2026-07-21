@@ -12,6 +12,24 @@ const ui = useUiStore()
   <div class="h-screen flex flex-col bg-bg overflow-hidden">
     <!-- 三栏主体 -->
     <div class="flex-1 flex min-h-0">
+      <!-- 左导航（桌面常驻；移动端走下方 Overlay 抽屉） -->
+      <aside class="hidden lg:block w-60 shrink-0 border-r border-line">
+        <PrimarySidebar
+          docked
+          @close="ui.showSidebar = false"
+          @new-campaign="$emit('new-campaign')"
+          @view-history="ui.viewHistory()"
+          @open-campaign="ui.showCampaignPanel = true"
+          @open-char-list="ui.showCharList = true"
+          @import="$emit('import')"
+          @open-conn="ui.showConnConfig = true"
+          @open-preset="ui.showPresetPanel = true"
+          @open-plugin="ui.showPluginPanel = true"
+          @open-agent-profile="ui.showAgentProfile = true"
+          @open-meta="ui.showMetaPanel = true"
+        />
+      </aside>
+
       <!-- 中写作区 -->
       <main class="flex-1 flex flex-col min-w-0">
         <TopBar />

@@ -5,87 +5,100 @@
 @import '@fontsource/inter/500.css';
 @import '@fontsource/inter/600.css';
 @import '@fontsource/inter/700.css';
-@import '@fontsource/noto-serif-sc/400.css';
-@import '@fontsource/noto-serif-sc/600.css';
 @import '@fontsource/jetbrains-mono/400.css';
 @import '@fontsource/jetbrains-mono/500.css';
 
-/* 暗色模式：由 <html class="dark"> 触发。默认深色（现代质感基调）。 */
+/* 主题：默认浅色「纸上编辑部」；夜读深色由 <html class="dark"> 触发。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
   /* 断点：xs 窄屏起步 */
   --breakpoint-xs: 30rem;
 
-  /* ── 深色基调（默认）：中性深灰带一丝冷紫，非纯黑 ── */
-  --color-bg: #0a0a0f;
-  --color-surface: #131319;
-  --color-surface-2: #1b1b23;
-  --color-line: #26262f;
+  /* ── 纸上编辑部（默认）：暖米白纸面 + 暖墨 + 金棕强调 ── */
+  --color-bg: #f6f3ec;
+  --color-surface: #fffdf7;
+  --color-surface-2: #eee9dd;
+  --color-line: #e2dccc;
 
-  /* 文字 */
-  --color-ink: #ececf1;
-  --color-ink-soft: #8a8a98;
-  --color-ink-faint: #55556a;
+  /* 文字：暖墨三档 */
+  --color-ink: #29241c;
+  --color-ink-soft: #6e6759;
+  --color-ink-faint: #a49c8a;
 
-  /* 强调：紫，配发光 */
-  --color-accent: #8b7cf6;
-  --color-accent-bright: #a594ff;
-  --color-accent-soft: rgba(139, 124, 246, 0.14);
-  --color-accent-border: rgba(139, 124, 246, 0.32);
+  /* 强调：金棕（赭石），无发光 */
+  --color-accent: #9a6425;
+  --color-accent-bright: #7d4f1a;
+  --color-accent-soft: rgba(154, 100, 37, 0.1);
+  --color-accent-border: rgba(154, 100, 37, 0.34);
 
-  /* 状态色（明度提一档，深底上发光感） */
-  --color-ok: #34d399;
-  --color-running: #60a5fa;
-  --color-wait: #71717f;
-  --color-warn: #fbbf24;
-  --color-err: #f87171;
+  /* 状态色：编辑部调色（墨绿 / 靛蓝灰 / 赭黄 / 赭红） */
+  --color-ok: #3e7c4f;
+  --color-running: #4a6d9c;
+  --color-wait: #99917e;
+  --color-warn: #a87b22;
+  --color-err: #b0432d;
   /* 别名兜底（早期组件误用 text-error/bg-error） */
-  --color-error: #f87171;
+  --color-error: #b0432d;
 
   /* 字体 */
   --font-sans: 'Inter', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-serif: 'Noto Serif SC', Georgia, 'Songti SC', serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
 
-  /* ── 发光阴影 token（shadow-* utility 命名空间） ── */
-  --shadow-glow-accent: 0 0 0 1px rgba(139, 124, 246, 0.35), 0 0 24px -4px rgba(139, 124, 246, 0.45);
-  --shadow-glow-ok: 0 0 0 1px rgba(52, 211, 153, 0.3), 0 0 20px -6px rgba(52, 211, 153, 0.5);
-  --shadow-glow-err: 0 0 0 1px rgba(248, 113, 113, 0.3), 0 0 20px -6px rgba(248, 113, 113, 0.5);
-  --shadow-float: 0 12px 40px -8px rgba(0, 0, 0, 0.55), 0 4px 12px -4px rgba(0, 0, 0, 0.4);
-  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-rise: 0 4px 16px -4px rgba(0, 0, 0, 0.5);
+  /* ── 纸感阴影：细线 + 克制落影，无发光 ── */
+  /* glow 旧名留用，语义重定义为 1px 状态描边 */
+  --shadow-glow-accent: 0 0 0 1px var(--color-accent-border);
+  --shadow-glow-ok: 0 0 0 1px color-mix(in srgb, var(--color-ok) 40%, transparent);
+  --shadow-glow-err: 0 0 0 1px color-mix(in srgb, var(--color-err) 45%, transparent);
+  --shadow-float: 0 18px 48px -14px rgba(41, 36, 28, 0.2), 0 4px 12px -6px rgba(41, 36, 28, 0.08);
+  --shadow-card: 0 1px 2px rgba(41, 36, 28, 0.05);
+  --shadow-rise: 0 2px 6px -2px rgba(41, 36, 28, 0.07), 0 10px 24px -10px rgba(41, 36, 28, 0.1);
+
+  /* 圆角：编辑部的克制圆角 */
+  --radius-xs: 0.125rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 1rem;
+
+  /* 弹层层级 */
+  --z-overlay: 40;
+  --z-drawer: 50;
+  --z-dialog: 60;
+  --z-toast: 70;
+  --z-tooltip: 80;
 
   /* 统一缓动 */
   --ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* ── 浅色模式覆盖（可选切换） ── */
-:root:not(.dark) {
-  --color-bg: #f7f7f9;
-  --color-surface: #ffffff;
-  --color-surface-2: #f1f1f4;
-  --color-line: #e6e6ec;
+/* ── 夜读深色（.dark）：暖深棕黑，非冷黑 ── */
+:root.dark {
+  --color-bg: #1b1712;
+  --color-surface: #241f18;
+  --color-surface-2: #2e2820;
+  --color-line: #3a3328;
 
-  --color-ink: #18181b;
-  --color-ink-soft: #6b6b78;
-  --color-ink-faint: #a0a0ac;
+  --color-ink: #ece4d3;
+  --color-ink-soft: #a89e8a;
+  --color-ink-faint: #6f6757;
 
-  --color-accent: #7c6aef;
-  --color-accent-bright: #6b58e0;
-  --color-accent-soft: rgba(124, 106, 239, 0.1);
-  --color-accent-border: rgba(124, 106, 239, 0.28);
+  --color-accent: #d2a55e;
+  --color-accent-bright: #e4bd7f;
+  --color-accent-soft: rgba(210, 165, 94, 0.13);
+  --color-accent-border: rgba(210, 165, 94, 0.38);
 
-  --color-ok: #16a34a;
-  --color-running: #2563eb;
-  --color-wait: #94a3b8;
-  --color-warn: #d97706;
-  --color-err: #dc2626;
-  --color-error: #dc2626;
+  --color-ok: #7fae85;
+  --color-running: #8aa5c6;
+  --color-wait: #6f6757;
+  --color-warn: #cfa055;
+  --color-err: #d2745f;
+  --color-error: #d2745f;
 
-  --shadow-glow-accent: 0 0 0 1px rgba(124, 106, 239, 0.3), 0 4px 16px -4px rgba(124, 106, 239, 0.35);
-  --shadow-float: 0 12px 40px -8px rgba(0, 0, 0, 0.18), 0 4px 12px -4px rgba(0, 0, 0, 0.1);
-  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.6) inset, 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-float: 0 18px 48px -14px rgba(0, 0, 0, 0.55), 0 4px 12px -6px rgba(0, 0, 0, 0.35);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-rise: 0 2px 6px -2px rgba(0, 0, 0, 0.35), 0 10px 24px -10px rgba(0, 0, 0, 0.4);
 }
 
 html, body, #app {
@@ -104,11 +117,11 @@ body {
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
 }
 
-/* ── 文学正文：衬线，书页感 ── */
+/* ── 长文正文：无衬线，松行高保障中文长读 ── */
 .prose-fiction {
-  font-family: var(--font-serif);
-  line-height: 1.9;
-  letter-spacing: 0.012em;
+  font-family: var(--font-sans);
+  line-height: 1.85;
+  letter-spacing: 0.01em;
 }
 .prose-fiction em { font-style: italic; opacity: 0.82; }
 .prose-fiction strong { font-weight: 600; }

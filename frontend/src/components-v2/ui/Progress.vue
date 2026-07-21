@@ -26,7 +26,7 @@ const fillClass = computed(() => variantFillClass[props.variant] || variantFillC
 </script>
 
 <template>
-  <div class="w-full bg-line rounded-full overflow-hidden h-1.5">
+  <div class="w-full bg-surface-2 rounded-full overflow-hidden h-1.5">
     <div
       v-if="indeterminate"
       :class="['h-full rounded-full progress-indeterminate', fillClass]"

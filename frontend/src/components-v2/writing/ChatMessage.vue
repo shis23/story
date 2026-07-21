@@ -104,85 +104,85 @@ function rerollUser() {
 </script>
 
 <template>
-  <div class="group px-4 sm:px-6 py-4 rounded-xl transition-colors duration-200 hover:bg-surface/40">
-    <div class="flex items-center gap-2 mb-3">
-      <span class="text-xs font-medium px-2 py-0.5 rounded-md"
+  <div class="group -mx-3 px-3 py-5 rounded-lg transition-colors duration-200 hover:bg-surface/70">
+    <div class="flex items-center gap-2.5 mb-2.5">
+      <span class="text-xs font-medium tracking-wide"
         :class="isUser ? 'text-ink-soft' : 'text-accent'">
         {{ message.role_label }}
       </span>
-      <div v-if="variantCount > 1" class="flex items-center gap-1 text-xs text-ink-soft">
-        <button @click="switchVariant(-1)" class="w-9 h-9 flex items-center justify-center rounded-md hover:bg-accent-soft transition-colors" aria-label="上一版本">‹</button>
-        <span>{{ message.active_variant + 1 }}/{{ variantCount }}</span>
-        <button @click="switchVariant(1)" class="w-9 h-9 flex items-center justify-center rounded-md hover:bg-accent-soft transition-colors" aria-label="下一版本">›</button>
-        <span v-if="currentVariant.status === 'discarded'" class="text-warn ml-1">· 旧版</span>
+      <div v-if="variantCount > 1" class="flex items-center gap-0.5 text-xs text-ink-soft border border-line rounded-full px-1 py-0.5">
+        <button @click="switchVariant(-1)" class="w-6 h-6 flex items-center justify-center rounded-full hover:bg-accent-soft hover:text-accent-bright transition-colors" aria-label="上一版本">‹</button>
+        <span class="px-1 tabular-nums">{{ message.active_variant + 1 }}/{{ variantCount }}</span>
+        <button @click="switchVariant(1)" class="w-6 h-6 flex items-center justify-center rounded-full hover:bg-accent-soft hover:text-accent-bright transition-colors" aria-label="下一版本">›</button>
+        <span v-if="currentVariant.status === 'discarded'" class="text-warn px-1">· 旧版</span>
       </div>
     </div>
 
     <div v-if="!editing"
-      class="text-[15px] leading-loose"
-      :class="isUser ? 'text-ink-soft pl-3 border-l-2 border-line' : 'text-ink prose-fiction'">
+      class="text-[15.5px] leading-loose"
+      :class="isUser ? 'text-ink-soft pl-4 border-l-2 border-line' : 'text-ink prose-fiction'">
       <RichContent :content="currentDisplayContent" :source-content="currentSourceContent" />
     </div>
 
-    <div v-else class="rounded-xl border border-accent bg-surface px-4 py-3">
+    <div v-else class="rounded-lg border border-accent-border bg-surface px-4 py-3 shadow-card">
       <textarea v-model="editContent" rows="4"
         class="w-full text-[15px] leading-relaxed bg-transparent resize-none focus:outline-none"></textarea>
       <div class="flex justify-end gap-2 mt-2">
-        <button @click="cancelEdit" class="min-h-[44px] px-4 text-sm rounded-lg hover:bg-accent-soft transition-colors">取消</button>
-        <button @click="saveEdit" class="min-h-[44px] px-4 text-sm rounded-lg bg-accent text-white hover:opacity-90 transition-colors">保存</button>
+        <button @click="cancelEdit" class="min-h-9 px-3.5 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
+        <button @click="saveEdit" class="min-h-9 px-3.5 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">保存</button>
       </div>
     </div>
 
-    <div v-if="isUser" class="flex items-center gap-2 mt-3 text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
-      <button @click="startEdit" :disabled="busy" class="min-h-[44px] px-3 text-sm rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">✏️ 编辑</button>
-      <button @click="rerollUser" :disabled="busy" class="min-h-[44px] px-3 text-sm rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">🔄 重roll</button>
+    <div v-if="isUser" class="flex items-center gap-1 mt-3 text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
+      <button @click="startEdit" :disabled="busy" class="min-h-9 px-2.5 text-[13px] rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">编辑</button>
+      <button @click="rerollUser" :disabled="busy" class="min-h-9 px-2.5 text-[13px] rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">重 roll</button>
     </div>
 
-    <div v-if="!isUser" class="flex flex-wrap items-center gap-2 mt-3 text-sm text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
-      <button @click="startEdit" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors">✏️ 编辑</button>
-      <button @click="acceptVariant" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft transition-colors"
-        :class="currentVariant.status === 'final' ? 'text-ok' : (qualityAcceptHint ? 'text-warn' : '')"
+    <div v-if="!isUser" class="flex flex-wrap items-center gap-1 mt-3 text-[13px] text-ink-soft opacity-60 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200">
+      <button @click="startEdit" class="min-h-9 px-2.5 rounded-md hover:bg-accent-soft hover:text-accent-bright transition-colors">编辑</button>
+      <button @click="acceptVariant" class="min-h-9 px-2.5 rounded-md hover:bg-accent-soft transition-colors"
+        :class="currentVariant.status === 'final' ? 'text-ok' : (qualityAcceptHint ? 'text-warn' : 'hover:text-accent-bright')"
         :title="qualityAcceptHint || undefined">
-        {{ currentVariant.status === 'final' ? '✅ 已采纳' : '☑️ 采纳' }}
+        {{ currentVariant.status === 'final' ? '已采纳' : '采纳' }}
       </button>
       <span
         v-if="qualityAcceptHint && currentVariant.status !== 'final'"
         class="text-[11px] text-warn"
         :title="(writing.pipeline.quality?.warnings || []).join('\n')"
       >{{ qualityAcceptHint }}</span>
-      <button v-if="canBranch" @click="branchMessage" :disabled="busy" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">分支</button>
+      <button v-if="canBranch" @click="branchMessage" :disabled="busy" class="min-h-9 px-2.5 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">分支</button>
 
       <BaseDropdown v-model="showRerollMenu" align="left" :min-width="220">
         <template #trigger>
-          <button :disabled="busy" class="min-h-[44px] px-3 rounded-lg hover:bg-accent-soft disabled:opacity-40 transition-colors">🔄 重roll ▾</button>
+          <button :disabled="busy" class="min-h-9 px-2.5 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">重 roll ▾</button>
         </template>
         <template #default="{ close }">
-          <button @click="close(); pickReroll('all')" class="w-full text-left min-h-[44px] px-3 hover:bg-accent-soft transition-colors">整体重 roll</button>
-          <button @click="close(); pickReroll('editor')" class="w-full text-left min-h-[44px] px-3 hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
+          <button @click="close(); pickReroll('all')" class="w-full text-left min-h-10 px-3 text-[13px] hover:bg-accent-soft transition-colors">整体重 roll</button>
+          <button @click="close(); pickReroll('editor')" class="w-full text-left min-h-10 px-3 text-[13px] hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
           <template v-if="subagentRoles.length">
             <div class="border-t border-line my-1"></div>
             <button v-for="role in subagentRoles" :key="role.id"
               @click="close(); pickReroll('subagent:' + role.id)"
-              class="w-full text-left min-h-[44px] px-3 text-accent hover:bg-accent-soft transition-colors">
-              ⭐ 只重跑 · {{ role.label }}（子Agent）
+              class="w-full text-left min-h-10 px-3 text-[13px] text-accent hover:bg-accent-soft transition-colors">
+              只重跑 · {{ role.label }}（子Agent）
             </button>
-            <div class="px-3 py-1.5 text-[11px] text-ink-soft">省 60% token</div>
+            <div class="px-3 py-1.5 text-[11px] text-ink-faint">省 60% token</div>
           </template>
-          <div v-if="!subagentRoles.length" class="px-3 py-2 text-[11px] text-ink-soft/60">无溯源信息，仅支持整体/编剧重 roll</div>
+          <div v-if="!subagentRoles.length" class="px-3 py-2 text-[11px] text-ink-faint">无溯源信息，仅支持整体/编剧重 roll</div>
         </template>
       </BaseDropdown>
 
-      <span v-if="currentVariant.provenance" class="text-[11px] text-ink-soft/70">seed {{ currentVariant.provenance.seed }}</span>
-      <button @click="deleteVariant" class="min-h-[44px] px-3 rounded-lg hover:bg-err/10 text-ink-soft hover:text-err transition-colors ml-auto">🗑 删除</button>
+      <span v-if="currentVariant.provenance" class="text-[11px] text-ink-faint font-mono">seed {{ currentVariant.provenance.seed }}</span>
+      <button @click="deleteVariant" class="min-h-9 px-2.5 rounded-md text-ink-faint hover:bg-err/10 hover:text-err transition-colors ml-auto">删除</button>
     </div>
 
-    <div v-if="showHintBox" class="mt-3 rounded-xl border border-accent/30 bg-accent-soft/40 p-3">
+    <div v-if="showHintBox" class="mt-3 rounded-lg border border-accent-border bg-accent-soft/40 p-3">
       <div class="text-xs text-ink-soft mb-2">附加提示（可选）：告诉 Agent 上次哪里有问题</div>
       <textarea v-model="hintInput" rows="2" placeholder="例如：角色 B 语气太冷；节奏太快；结尾太仓促…"
-        class="w-full text-sm rounded-lg border border-line bg-bg px-3 py-2 resize-none focus:outline-none focus:border-accent"></textarea>
+        class="w-full text-sm rounded-md border border-line bg-surface px-3 py-2 resize-none focus:outline-none focus:border-accent-border"></textarea>
       <div class="flex justify-end gap-2 mt-2">
-        <button @click="cancelHint" class="min-h-[44px] px-4 text-sm rounded-lg hover:bg-accent-soft transition-colors">取消</button>
-        <button @click="confirmReroll" class="min-h-[44px] px-4 text-sm rounded-lg bg-accent text-white hover:opacity-90 transition-colors">开始重 roll</button>
+        <button @click="cancelHint" class="min-h-9 px-3.5 text-[13px] rounded-md text-ink-soft hover:bg-surface-2 transition-colors">取消</button>
+        <button @click="confirmReroll" class="min-h-9 px-3.5 text-[13px] rounded-md bg-accent text-white hover:bg-accent-bright transition-colors">开始重 roll</button>
       </div>
     </div>
   </div>

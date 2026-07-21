@@ -21,9 +21,9 @@ function handleChange(index) {
 
 const tabClass = (selected) => {
   const base =
-    'px-3 py-2 text-sm border-b-2 transition-colors duration-150 select-none'
+    'px-3 py-2 -mb-px text-sm border-b-2 transition-colors duration-150 select-none'
   return selected
-    ? `${base} text-accent border-accent`
+    ? `${base} text-accent-bright border-accent`
     : `${base} text-ink-soft border-transparent hover:text-ink`
 }
 </script>

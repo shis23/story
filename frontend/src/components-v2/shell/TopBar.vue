@@ -17,29 +17,39 @@ const subtitle = computed(() => {
 </script>
 
 <template>
-  <header class="glass shrink-0 h-14 flex items-center gap-2 px-3 border-b border-line">
+  <header class="shrink-0 h-[52px] flex items-center gap-2 px-3 sm:px-4 bg-bg border-b border-line">
+    <!-- 移动端菜单（桌面侧栏常驻，隐藏） -->
     <button
-      class="w-11 h-11 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
+      class="lg:hidden w-10 h-10 flex items-center justify-center rounded-md text-ink-soft hover:bg-surface-2 transition-colors"
       @click="ui.showSidebar = true"
       aria-label="菜单"
     >
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
 
-    <div class="flex-1 min-w-0 text-center">
-      <div class="font-semibold text-ink truncate text-sm">{{ ui.pageTitle }}</div>
-      <div class="text-[11px] text-ink-soft truncate">{{ subtitle }}</div>
+    <!-- 标题：桌面左对齐面包屑感，移动端居中 -->
+    <div class="flex-1 min-w-0 text-center lg:text-left lg:pl-2">
+      <div class="font-semibold text-ink truncate text-[15px] leading-tight">{{ ui.pageTitle }}</div>
+      <div class="text-[11px] text-ink-faint truncate leading-tight mt-0.5">{{ subtitle }}</div>
     </div>
 
-    <div v-if="writing.isWriting" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-accent-soft">
-      <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse"></span>
-      <span class="text-[11px] text-accent font-medium">生成中</span>
+    <!-- 生成状态徽章 -->
+    <div
+      v-if="writing.isWriting"
+      class="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-running/30 bg-running/10"
+    >
+      <span class="w-1.5 h-1.5 rounded-full bg-running animate-pulse"></span>
+      <span class="text-[11px] text-running font-medium">生成中</span>
     </div>
 
+    <!-- 调试/高玩抽屉入口（退后：低对比图标） -->
     <button
-      class="w-11 h-11 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
+      class="w-10 h-10 flex items-center justify-center rounded-md text-ink-faint hover:text-ink-soft hover:bg-surface-2 transition-colors"
       @click="ui.showDebugDrawer = true"
-      aria-label="调试"
-    >🛠</button>
+      aria-label="过程与调试"
+      title="过程与调试"
+    >
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M14.5 4.5v15"/></svg>
+    </button>
   </header>
 </template>

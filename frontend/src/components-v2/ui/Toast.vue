@@ -31,9 +31,9 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    class="glass-strong shadow-float rounded-lg px-4 py-3 flex items-start gap-3 relative overflow-hidden"
+    class="bg-surface border border-line shadow-rise rounded-lg px-4 py-3 flex items-start gap-3 relative overflow-hidden"
   >
-    <!-- 左侧彩色竖线 -->
+    <!-- 左侧状态竖线（1px 细线语义，token 取色） -->
     <span
       :class="['absolute left-0 top-0 bottom-0 w-1', accentClass[props.variant] || accentClass.neutral]"
     />
@@ -46,10 +46,13 @@ onBeforeUnmount(() => {
     </div>
     <button
       type="button"
-      class="shrink-0 text-ink-faint hover:text-ink transition-colors"
+      class="shrink-0 text-ink-faint hover:text-ink transition-colors duration-150"
+      aria-label="关闭"
       @click="emit('close')"
     >
-      ✕
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+        <path d="M6 6l12 12M18 6L6 18" />
+      </svg>
     </button>
   </div>
 </template>

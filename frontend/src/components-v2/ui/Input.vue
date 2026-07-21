@@ -10,12 +10,12 @@ defineEmits(['update:modelValue'])
 
 function classes() {
   return [
-    'w-full bg-surface-2 border rounded-lg px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint',
-    'transition-colors duration-150',
-    'disabled:opacity-40 disabled:cursor-not-allowed',
+    'w-full bg-surface border rounded-md px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint',
+    'transition-colors duration-150 outline-none',
+    'disabled:bg-surface-2 disabled:text-ink-faint disabled:cursor-not-allowed',
     props.invalid
-      ? 'border-err/50 focus:border-err text-err'
-      : 'border-line focus:border-accent',
+      ? 'border-err/50 focus:border-err'
+      : 'border-line focus:border-accent-border',
   ]
 }
 </script>

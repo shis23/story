@@ -16,14 +16,15 @@ function cellValue(row, col) {
 </script>
 
 <template>
-  <div class="rounded-lg border border-line overflow-hidden">
+  <div class="rounded-lg border border-line bg-surface overflow-hidden">
     <table class="w-full text-sm">
       <thead>
-        <tr class="bg-surface-2 border-b border-line">
+        <tr class="border-b border-line">
           <th
             v-for="col in columns"
             :key="col.key"
-            class="text-left font-medium text-ink-soft px-3 py-2"
+            class="text-left text-xs font-medium text-ink-faint px-3 py-2"
+            :class="{ 'font-mono': col.mono }"
             :style="col.width ? { width: col.width } : {}"
           >
             {{ col.label }}
@@ -40,9 +41,14 @@ function cellValue(row, col) {
         <tr
           v-for="(row, ri) in rows"
           :key="ri"
-          class="border-b border-line last:border-0 hover:bg-surface-2/50 transition-colors"
+          class="border-b border-line last:border-0 hover:bg-surface-2/60 transition-colors"
         >
-          <td v-for="col in columns" :key="col.key" class="px-3 py-2 text-ink">
+          <td
+            v-for="col in columns"
+            :key="col.key"
+            class="px-3 py-2 text-ink"
+            :class="{ 'font-mono text-xs': col.mono }"
+          >
             <slot :name="`cell-${col.key}`" :row="row" :value="row[col.key]">
               {{ cellValue(row, col) }}
             </slot>

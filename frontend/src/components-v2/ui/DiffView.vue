@@ -26,23 +26,34 @@ function lines() {
   return result
 }
 const rowClass = {
-  added: 'bg-ok/10 text-ok',
-  removed: 'bg-err/10 text-err line-through opacity-70',
+  added: 'bg-ok/10',
+  removed: 'bg-err/10',
+  unchanged: '',
+}
+// 行首 +/− 等宽符号用状态色；行文本 removed 用删除线弱化
+const prefixClass = {
+  added: 'text-ok',
+  removed: 'text-err',
+  unchanged: 'text-ink-faint',
+}
+const textClass = {
+  added: 'text-ink',
+  removed: 'text-ink-soft line-through',
   unchanged: 'text-ink-soft',
 }
 const rowPrefix = { added: '+', removed: '−', unchanged: ' ' }
 </script>
 
 <template>
-  <div class="rounded-lg border border-line overflow-auto font-mono text-xs">
+  <div class="rounded-lg border border-line bg-surface overflow-auto font-mono text-xs">
     <div
       v-for="(row, i) in lines()"
       :key="i"
       class="px-2 py-0.5 flex gap-1"
       :class="rowClass[row.type]"
     >
-      <span class="select-none opacity-50">{{ rowPrefix[row.type] }}</span>
-      <span class="whitespace-pre-wrap break-all">{{ row.text }}</span>
+      <span class="select-none" :class="prefixClass[row.type]">{{ rowPrefix[row.type] }}</span>
+      <span class="whitespace-pre-wrap break-all" :class="textClass[row.type]">{{ row.text }}</span>
     </div>
   </div>
 </template>

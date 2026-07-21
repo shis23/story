@@ -10,9 +10,9 @@ const props = defineProps({
 defineEmits(['click'])
 
 const variantClass = {
-  default: 'bg-surface-2 text-ink border border-line hover:border-accent-border',
-  primary: 'bg-accent text-bg shadow-glow-accent hover:opacity-90',
-  danger: 'text-err border border-err/40 hover:bg-err/15',
+  default: 'bg-surface text-ink border border-line shadow-card hover:border-accent-border hover:text-accent-bright',
+  primary: 'bg-accent text-white hover:bg-accent-bright',
+  danger: 'text-err border border-err/40 hover:bg-err/10',
   ghost: 'text-ink-soft hover:text-ink hover:bg-surface-2',
 }
 
@@ -36,7 +36,9 @@ const sizeClass = {
     :disabled="disabled || loading"
     @click="$emit('click', $event)"
   >
-    <span v-if="loading" class="inline-block animate-spin opacity-70">◌</span>
+    <span v-if="loading" class="inline-block animate-spin opacity-70" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
+    </span>
     <slot v-else />
   </button>
 </template>
