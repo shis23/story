@@ -21,7 +21,7 @@
 | **活动概览 design + 生产接线** | ✅ | `design/overview/*` + `adapter/useOverviewScreenAdapter.js` → AppV2 |
 | **活动管理 design 壳生产外包** | ✅ | `CampaignPanel` 外包 `design/campaign/CampaignScreen` 全宽双栏；`#detail` 注入 Instances/Knowledge/Tasks/Summaries（含 MVU）；`refreshActiveDetailTab` 红线保留 |
 | Meta 壳 design 生产外包 | ✅ | `MetaPanel` 用 `design/meta/MetaScreen` 作纸面壳；业务 tab 仍 v2；`mvu-applied` 红线保留 |
-| AppFrame design | ✅ 预览 | `design/shell/AppFrame.vue`；生产仍 `AppShell` |
+| AppFrame design 生产切换 | ✅ | `AppV2` 根壳已改为 `design/shell/AppFrame.vue`；Inspector 覆盖式；`#panels` 保留 PluginHost/MvuJsRuntime |
 | 旧面板 emoji/调试台残留清理 | ✅ | campaign/meta/config/debug 按钮与标题去 emoji |
 | 插件/卡内组件 | ✅ 未改坏 | `PluginHost` / `MvuJsRuntime` / `RichContent` / `MvuStatusBar` / `plugin-bridge` 冻结 |
 | 全量测试基线 | ✅ | `npm test` 317 + `npm run test:ui` 28 + `npm run build` |
@@ -76,7 +76,7 @@
 | 3 | 活动概览 | ✅ 重绘 + 生产接线 |
 | 4 | Campaign 管理 | ✅ CampaignPanel 外包 CampaignScreen；深度 Tab slot 注入 |
 | 5 | Meta 助手壳 | ✅ MetaPanel 已外包 MetaScreen；业务 tab 仍 v2 |
-| 6 | AppFrame 壳 | ✅ 预览；生产仍 AppShell |
+| 6 | AppFrame 壳 | ✅ 生产切换完成（AppV2 根） |
 
 ### 接线必守（写作已满足）
 
@@ -90,7 +90,19 @@
 
 - 将 CampaignPanel 深度编辑（变量/MVU）以 slot 注入 `CampaignScreen` 后整屏切换。
 - MetaPanel 外包 `MetaScreen` 壳，不改子组件 props。
-- AppShell → AppFrame 切换时保留 `#panels` 挂载点（PluginHost/MvuJsRuntime）。
+- ~~AppShell → AppFrame~~：已完成；`#panels` 仍挂 PluginHost/MvuJsRuntime。
+
+### 人工/自动化走查（2026-07-22）
+
+| 项 | 证据 |
+| --- | --- |
+| AppFrame 生产挂载 | `AppV2.vue` 根组件 `AppFrame`；`tests/components-v2/app-frame-walkthrough.test.mjs` |
+| 深浅主题切换 | 侧栏「夜读模式」toggle；走查测试断言 `html.dark` + localStorage |
+| 移动端菜单 | TopBar 菜单按钮 → `ui.showSidebar`；走查测试窄屏 390 |
+| Inspector 覆盖式 | 不挤压主栏；走查测试打开调试后写作空态仍在 |
+| 连接弹层 | 侧栏「连接」打开配置面板 |
+| 插件 runtime | `list_plugins` 仍被调用；`PluginHost`/`MvuJsRuntime` 仍挂在 `#panels` |
+| 单元/UI/构建 | `npm test` 317；`npm run test:ui` 35；`npm run build` ✅ |
 
 ---
 

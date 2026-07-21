@@ -134,8 +134,10 @@ $env:STORYFORGE_EVAL_MAX_TOKENS='384000'
 - CampaignPanel 已外包 `CampaignScreen` 全宽双栏（selected 图④），深度 Tab（含 MVU 状态条）经 slot 注入，`refreshActiveDetailTab` 保留。
 - MetaPanel 已外包 `MetaScreen` 纸面壳（`mvu-applied` 红线保留）。
 - PluginHost / MvuJsRuntime / plugin-bridge 未改。
+- **AppFrame 生产切换完成**：AppV2 根壳为 `design/shell/AppFrame`（侧栏 232px / Inspector 覆盖式 / `#panels` 保留 PluginHost·MvuJsRuntime）。
 - design 预览：`#design-writing`、`#design-campaign`。
-- 验证：`frontend` 下 `npm test`（317）、`npm run test:ui`（28）、`npm run build` 通过；未改 `plugin-bridge` / `tauri-api` 协议。
+- 走查：`tests/components-v2/app-frame-walkthrough.test.mjs`（主题、移动菜单、Inspector、连接弹层、插件 list）。
+- 验证：`frontend` 下 `npm test`（317）、`npm run test:ui`（35）、`npm run build` 通过；未改 `plugin-bridge` / `tauri-api` 协议。
 
 ## 下一优先级
 

@@ -2,7 +2,8 @@
 /**
  * AppV2 — StoryForge 重构版根组件（Phase 8）
  *
- * 组装 AppShell + 三视图（overview/history/write）+ Composer + 功能面板。
+ * 组装 design AppFrame + 三视图（overview/history/write）+ 功能面板。
+ * Composer 已并入 WritingScreen；插件/MVU runtime 挂在 #panels。
  *
  * Composable 接线（核心）：
  *   ┌─ usePluginBridge()  无注入依赖，提供事件广播 / payload 构造 / prompt hook 编排
@@ -37,7 +38,10 @@
  *   - setupConsoleForwarding()     App.vue:402-412
  */
 import { ref, computed, onMounted } from 'vue'
-import AppShell from './components-v2/shell/AppShell.vue'
+import AppFrame from './design/shell/AppFrame.vue'
+import PrimarySidebar from './components-v2/shell/PrimarySidebar.vue'
+import TopBar from './components-v2/shell/TopBar.vue'
+import InspectorDrawer from './components-v2/shell/InspectorDrawer.vue'
 import WritingScreen from './design/writing/WritingScreen.vue'
 import HistoryScreen from './design/history/HistoryScreen.vue'
 import OverviewScreen from './design/overview/OverviewScreen.vue'
@@ -373,7 +377,34 @@ onMounted(async () => {
 </script>
 
 <template>
-  <AppShell @new-campaign="openNewCampaignDialog" @import="handleImport">
+  <!-- design/shell AppFrame：纯布局；侧栏/顶栏/调试经 slot 注入；#panels 保留插件 runtime -->
+  <AppFrame
+    :sidebar-open="ui.showSidebar"
+    :inspector-open="ui.showDebugDrawer"
+    @update:sidebar-open="(v) => { ui.showSidebar = v }"
+    @update:inspector-open="(v) => { ui.showDebugDrawer = v }"
+  >
+    <template #sidebar="{ docked }">
+      <PrimarySidebar
+        :docked="docked"
+        @close="ui.showSidebar = false"
+        @new-campaign="openNewCampaignDialog"
+        @view-history="ui.viewHistory()"
+        @open-campaign="ui.showCampaignPanel = true"
+        @open-char-list="ui.showCharList = true"
+        @import="handleImport"
+        @open-conn="ui.showConnConfig = true"
+        @open-preset="ui.showPresetPanel = true"
+        @open-plugin="ui.showPluginPanel = true"
+        @open-agent-profile="ui.showAgentProfile = true"
+        @open-meta="ui.showMetaPanel = true"
+      />
+    </template>
+
+    <template #topbar>
+      <TopBar />
+    </template>
+
     <template #content>
       <!-- 导入/抽取进度与错误提示条 -->
       <div
@@ -415,6 +446,10 @@ onMounted(async () => {
 
     <template #composer>
       <!-- Composer 已并入 WritingScreen（稿纸下方指令条）；概览/历史不占底部 -->
+    </template>
+
+    <template #inspector>
+      <InspectorDrawer />
     </template>
 
     <template #panels>
@@ -499,5 +534,5 @@ onMounted(async () => {
         />
       </div>
     </template>
-  </AppShell>
+  </AppFrame>
 </template>
