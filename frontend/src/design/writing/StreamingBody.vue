@@ -1,0 +1,83 @@
+<script setup>
+/**
+ * StreamingBody — 写作进行中的流式区（重设计，纯展示）。
+ *
+ * 结构变化（vs StreamingMessage.vue）：
+ *   - 过程（导演/子Agent）默认收成一行状态条，点开才看细节
+ *   - 成文正文是唯一主角，细竖线光标
+ */
+import { ref, computed } from 'vue'
+
+const props = defineProps({
+  pipeline: { type: Object, required: true },
+  roleLabel: { type: String, default: 'AI' },
+})
+
+const showProcess = ref(false)
+
+const editorOutput = computed(() => props.pipeline.editor?.output || '')
+const steps = computed(() => {
+  const list = []
+  if (props.pipeline.director) list.push({ key: 'director', label: '导演', ...props.pipeline.director })
+  for (const s of props.pipeline.subagents || []) {
+    if (s && s.status && s.status !== 'pending' && s.status !== 'idle')
+      list.push({ key: s.id, label: s.name || s.id, ...s })
+  }
+  if (props.pipeline.editor) list.push({ key: 'editor', label: '编剧', ...props.pipeline.editor })
+  return list
+})
+
+const dotClass = (status) =>
+  ({
+    running: 'bg-running animate-pulse',
+    done: 'bg-ok',
+    error: 'bg-err',
+    cancelled: 'bg-warn',
+  })[status] || 'bg-wait'
+
+function paragraphs(text) {
+  return text.split(/\n{2,}/).filter(Boolean)
+}
+</script>
+
+<template>
+  <article>
+    <header class="flex items-center gap-2 mb-2">
+      <span class="text-xs font-medium tracking-wide text-accent">{{ roleLabel }}</span>
+      <span class="flex items-center gap-1.5 text-[11px] text-running">
+        <span class="w-1.5 h-1.5 rounded-full bg-running animate-pulse"></span>生成中
+      </span>
+
+      <!-- 过程状态条：默认一行，可展开 -->
+      <button
+        @click="showProcess = !showProcess"
+        class="ml-auto flex items-center gap-1.5 min-h-7 px-2 rounded-md text-[11px] text-ink-faint hover:text-ink-soft hover:bg-surface-2 transition-colors"
+      >
+        <span class="flex items-center gap-1">
+          <span v-for="s in steps" :key="s.key" class="w-1.5 h-1.5 rounded-full" :class="dotClass(s.status)"></span>
+        </span>
+        过程 {{ steps.filter((s) => s.status === 'done').length }}/{{ steps.length }}
+        <svg
+          width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+          class="transition-transform duration-150" :class="showProcess ? 'rotate-180' : ''"
+        ><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+    </header>
+
+    <!-- 过程细节（展开） -->
+    <div v-if="showProcess" class="mb-3 rounded-lg border border-line bg-surface/70 divide-y divide-line overflow-hidden">
+      <div v-for="s in steps" :key="s.key" class="flex items-center gap-2 px-3 py-2 text-xs">
+        <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="dotClass(s.status)"></span>
+        <span class="text-ink">{{ s.label }}</span>
+        <span v-if="s.progress != null && s.status === 'running'" class="text-running tabular-nums">{{ s.progress }}%</span>
+        <span class="text-ink-faint truncate">{{ s.detail || '' }}</span>
+      </div>
+    </div>
+
+    <!-- 成文流式正文 -->
+    <div class="prose-fiction text-[15.5px] text-ink">
+      <p v-for="(p, i) in paragraphs(editorOutput)" :key="i" class="mb-4 last:mb-0">{{ p }}</p>
+      <span class="inline-block w-[2px] h-[1.05em] bg-accent align-text-bottom animate-pulse"></span>
+    </div>
+  </article>
+</template>
