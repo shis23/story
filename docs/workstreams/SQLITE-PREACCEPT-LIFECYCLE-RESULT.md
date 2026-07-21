@@ -4,22 +4,29 @@
 - 基线：`6f24d55`（plan）/ 工作基于 `8732e21` 事实面
 - 工作目录：`C:\tmp\storyforge-sqlite-preaccept`
 - 日期：2026-07-15
-- 默认 backend 仍为 **JSON**（未切换、未双写、未改 Tauri 命令）
+- 默认 backend 仍为 **JSON**（本线交付时未切换、未双写）
+
+> **Supersession（2026-07-21）**  
+> 下文 “尚未接 production command” 仅描述 **本 RESULT 冻结当日** 的交付范围。  
+> 之后 `main` 已通过 `88dd2c6` 等提交把 pre-accept UoW 接到 Tauri / `sqlite_runtime` / endurance adapter。  
+> 当前接线与证据边界以  
+> `docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`  
+> 与 `docs/HANDOFF.md` 为准。  
+> **不要** 把本历史 RESULT 读成“现在仍未接 production”。
 
 ## 结论（先读）
 
-**Repository 就绪，但尚未接 production command。**
+**本线交付：Repository 就绪；当时尚未接 production command。**  
+**当前 main（审计后）：production command / gateway 已接（见 supersession）。**
 
-| 状态 | 含义 |
-| --- | --- |
-| **Repository 就绪** | `infra-sqlite` 提供类型化 pre-accept UoW API；draft / Attempt 中间态 / autofix / postprocess / regenerate / edit-stale / recovery / 故障注入均可在单 `BEGIN IMMEDIATE` 事务内完成，且无 JSON/SQLite 双权威、无部分写入。 |
-| **已接 production command** | **未完成。** 未改 `tauri-app` 写作命令、`TurnLifecycleService`、启动选择器、默认 backend 或环境变量默认值。后续适配器线需把现有 JSON `TurnStore`/`ConversationStore` 调用换成这些 API。 |
+| 状态 | 含义（2026-07-15 本线） | 2026-07-21 main |
+| --- | --- | --- |
+| **Repository 就绪** | `infra-sqlite` 提供类型化 pre-accept UoW API；draft / Attempt 中间态 / autofix / postprocess / regenerate / edit-stale / recovery / 故障注入均可在单 `BEGIN IMMEDIATE` 事务内完成，且无 JSON/SQLite 双权威、无部分写入。 | 仍成立 |
+| **已接 production command** | **本线未完成。** 未改 `tauri-app` 写作命令、启动选择器、默认 backend。 | **已完成接线**：`sqlite_runtime` + Tauri `start_writing`/autofix/postprocess/regenerate/edit + harness endurance；默认仍 JSON |
 
-本线只交付可被后续 Tauri / postprocess 服务线接入的 **adapter contract + 测试证据**。
+本线当时只交付可被后续 Tauri / postprocess 服务线接入的 **adapter contract + 测试证据**。
 
-返修后仍 **不接 production command**：未改 `tauri-app`、`TurnLifecycleService`、默认 backend。
-
-后续 hardening 补齐 Committing 守卫，并删除 `sync_autofix` 中不可达的 Stale 重激活承诺。
+本线返修时仍不接 production command；后续 hardening 补齐 Committing 守卫，并删除 `sync_autofix` 中不可达的 Stale 重激活承诺。
 
 ## 交付范围对照
 

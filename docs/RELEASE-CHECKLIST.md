@@ -1,6 +1,6 @@
 # StoryForge 发布检查清单
 
-> 状态：2026-07-15 更新。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in 和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner 和打包结果必须逐项记录，不能用“理论通过”替代。
+> 状态：2026-07-21 文档同步。自动化基线、host-side release evidence、M5 endurance、SQLite opt-in（含 pre-accept 生产接线）和 workspace 严格门禁已纳入；真实卡、真实 LLM、GUI、Android 真机、远端 runner、SQLite 真实证据封存和打包结果必须逐项记录，不能用“理论通过”替代。SQLite 当前事实见 `docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`。
 
 > 自动化入口：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1`
 
@@ -49,8 +49,8 @@
 - `cargo test -p harness-real-llm` 全部确定性 suite 通过；真实模型用例按设计 ignored。
 - frontend `npm.cmd test` 311/311 通过，`npm.cmd run build` 通过；保留既有 Vite dynamic/static import warning。
 - Windows/Android host runner、manifest/provenance/hash/subject sidecar 与 Gitea workflow 已进入主线；远端 Gitea runner、完整 Tauri bundle 和 Android APK 本轮未实跑。
-- M5 runner 已进入主线；Canary/Coverage/Stability 通过，Full 留下 45/100 的历史 Partial Evidence。原始外部 JSONL/campaign data 已清理，不能续跑或独立重放；Chronicle 仍含 synthetic fixture，不得写成完整生产 Postprocess 验收。
-- SQLite opt-in 的 cutover、Accept/recovery/barrier、Chronicle publication、backup/reverse export 已通过确定性和 Windows host 测试；完整 pre-accept 生命周期和 Android 真机仍待验证。
+- M5 runner 已进入主线；旧 JSON 路径 Canary/Coverage/Stability 通过，Full 留下 45/100 的历史 Partial Evidence。原始外部 JSONL/campaign data 已清理，不能续跑或独立重放；不得写成完整生产 Postprocess / SQLite 验收。
+- SQLite opt-in：cutover、pre-accept UoW、Accept/recovery/barrier、Chronicle publication、backup/reverse export 已接生产路径（默认仍 JSON）；确定性生产网关测试见 `sqlite_preaccept_production_lifecycle`。**真实模型 SQLite RESULT 未提交**；Native 12 旁证曾 accepted 未 seal。Android 真机启用 SQLite 仍待验证。
 
 2026-07-07 已验证：
 

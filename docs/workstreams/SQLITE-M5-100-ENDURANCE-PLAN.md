@@ -1,34 +1,44 @@
 # SQLite + M5 100 轮真实模型集成计划
 
-> 状态：历史 Full100 已完成；Native 12 + TextFallback 3 专项补测进行中。
-> 基线：main @ 75385e8。
-> 执行方式：用户已授权直接在 main 工作；分阶段提交、不 push。
-> 结果文档：补测完成并离线核验后更新 `SQLITE-M5-100-ENDURANCE-RESULT.md`。
+> 状态（2026-07-21 审计更新）：**Gate A/B 代码接线已进入 main**；真实模型证据 **未封存**。  
+> 本地旁证：Native 12 曾 `turns=12/12 accepted`，seal/verify 因文件锁失败；**无** `SQLITE-M5-100-ENDURANCE-RESULT.md`。  
+> 不得把“历史 Full100 / accepted 12/12”读成已提交 PASS。  
+> 当前事实入口：`docs/workstreams/SQLITE-CURRENT-STATUS-AUDIT-2026-07-21.md`。  
+> 计划起草基线：main @ `75385e8`；审计对照 HEAD：`bf36e04`。  
+> 执行方式：用户已授权直接在 main 工作；分阶段提交、不 push。  
+> 结果文档：补测完成并离线核验后**新建** `SQLITE-M5-100-ENDURANCE-RESULT.md`（目前不存在）。
 
-## 1. 为什么不能直接把现有 100 轮改成 SQLite 模式后开跑
+## 1. 为什么当初不能直接把现有 100 轮改成 SQLite 模式后开跑
 
-当前已有一部分真实 SQLite 接线：启动选择、JSON 到 SQLite 的切换、Conversation
-持久化、Turn 的通用保存/更新、Accept、恢复和活动 Turn 屏障在 opt-in SQLite
-模式下已有权威路径；默认后端仍是 JSON。
+计划起草时，仅有部分 SQLite 接线：启动选择、JSON→SQLite cutover、Conversation
+持久化、Turn 通用保存/更新、Accept、恢复和活动 Turn 屏障；默认后端仍是 JSON。
 
-但是这不足以构成“SQLite 写作生命周期已完整接入”，也不足以构成“100 轮全
-agent 覆盖”。当前事实如下：
+那还不足以构成“SQLite 写作生命周期已完整接入”，也不足以构成“100 轮全
+agent 覆盖”。起草时的事实如下（**历史表**；2026-07-21 现状见下节）：
 
-| 项目 | 当前状态 | 为什么不能作为本次验收 |
+| 项目 | 起草时状态 | 为什么不能作为验收 |
 | --- | --- | --- |
-| SqlitePreacceptRepository | repository、migration、故障注入测试已存在 | Tauri 和 harness 尚未调用它；首稿、autofix、postprocess、regenerate、edit-stale 仍是分步持久化 |
-| 当前 endurance runner | 可调用真实模型并保存 checkpoint | HarnessEnv 固定使用 JSON CampaignStore、ConversationStore、TurnStore；Accept 走 JSON CommitProbe |
-| ScheduledAction | 有 100 轮覆盖表 | 大多数 action 只变成 intent 文本/证据标签；不会真的调用 regenerate、autofix、Meta、cache 失效或模式切换 |
-| postprocess/Chronicle | 有共享服务和 deterministic proof | 当前 endurance 记录 synthetic chronicle fixture，且 production_postprocess_complete 为 false |
-| Meta | 有一批确定性和 ignored real-LLM 测试 | 多个 Meta 命令仍依赖 legacy CampaignStore；SQLite 模式不能把它们当作已支持功能 |
+| SqlitePreacceptRepository | repository、migration、故障注入测试已存在 | 当时 Tauri/harness 尚未调用 |
+| 当时 endurance runner | 可调用真实模型并保存 checkpoint | 固定 JSON store + JSON CommitProbe |
+| ScheduledAction | 有 100 轮覆盖表 | 多数 action 只是 intent/标签 |
+| postprocess/Chronicle | 有共享服务与 deterministic proof | 存在 synthetic chronicle / 不完整 production claim |
+| Meta | 有确定性与 ignored real-LLM 测试 | 多个命令仍依赖 legacy CampaignStore |
 
-因此，只设置 STORYFORGE_STORAGE_BACKEND=sqlite 然后执行现有 Full 100，会得到
-一个“JSON harness 的普通写作耐久跑”，不能宣称 SQLite、全 agent、Meta、
-真实 postprocess 或各项功能已验收。
+因此，只设 `STORYFORGE_STORAGE_BACKEND=sqlite` 再跑旧 Full 100，只会得到
+“JSON harness 的普通写作耐久跑”，不能宣称 SQLite 全链路验收。
 
-本计划的核心原则是：先让同一条生产写作路径真正使用 SQLite pre-accept UoW，
-再让 endurance runner 调用那条路径；只要某项没有实际调用记录和 SQLite 落盘
-后置条件，就不计入覆盖。
+### 1.1 2026-07-21 代码现状（对照）
+
+| 项目 | 当前状态 | 仍不能宣称 |
+| --- | --- | --- |
+| SqlitePreacceptRepository | 仍在；并经 `sqlite_runtime` 暴露 | 单独 repository 测试 ≠ 真机/GUI 验收 |
+| 生产命令 pre-accept | **已接**：draft/autofix/postprocess/regenerate/edit-stale | 未提交真实 RESULT |
+| SQLite endurance adapter | **已存在**：`sqlite_endurance` 调 `create_draft_attempt` / `append_regenerate_attempt` / `ProductionPostprocessService` / `accept_by_variant` | seal 失败或无 RESULT 时不能 PASS |
+| Coverage ledger | 记录 command/service path 与 `sqlite_authoritative` | 缺 exact-set 封存报告 |
+| Meta | health 可读 SQLite；typed patch 等 **explicit unsupported** | 不能把 JSON Meta 记成 SQLite 覆盖 |
+
+本计划核心原则不变：同一条生产写作路径使用 SQLite pre-accept UoW；  
+无实际调用记录和 SQLite 后置条件的项不计入覆盖。
 
 本计划中的“真实模型”不是手机或 GUI 真机验收。它不产生 GUI、设备、远端 CI、
 签名或发布通过的声明。
