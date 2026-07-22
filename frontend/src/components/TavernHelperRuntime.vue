@@ -41,7 +41,7 @@
       ref="iframeRef"
       class="th-iframe"
       sandbox="allow-scripts"
-      :srcdoc="srcdoc"
+      :src="frameSrc"
       @load="onIframeLoad"
     />
   </div>
@@ -70,7 +70,9 @@ const props = defineProps({
 const emit = defineEmits(['done', 'error', 'var-write', 'status'])
 
 const iframeRef = ref(null)
-const srcdoc = ref(bootstrapSrcdoc())
+const srcdoc = ref('')
+const frameSrc = ref('about:blank')
+let frameBlobUrl = null
 const running = ref(false)
 const statuses = ref([])
 const lastError = ref(null)
@@ -195,6 +197,21 @@ function bootstrapSrcdoc() {
     sClose +
     '</head><body></body></html>'
   )
+}
+
+function revokeFrameBlob() {
+  if (frameBlobUrl) {
+    try { URL.revokeObjectURL(frameBlobUrl) } catch (_) {}
+    frameBlobUrl = null
+  }
+}
+
+function setFrameHtml(html) {
+  srcdoc.value = html
+  revokeFrameBlob()
+  const blob = new Blob([html], { type: 'text/html' })
+  frameBlobUrl = URL.createObjectURL(blob)
+  frameSrc.value = frameBlobUrl
 }
 
 function revokeBlobs() {
@@ -348,7 +365,7 @@ function ensureStatuses() {
   }))
 }
 
-async function waitReady(timeoutMs = 5000) {
+async function waitReady(timeoutMs = 15000) {
   const start = Date.now()
   while (!iframeReady.value) {
     if (Date.now() - start > timeoutMs) throw new Error('TH iframe not ready')
@@ -370,8 +387,8 @@ async function runAll() {
   try {
     // reload iframe clean slate
     iframeReady.value = false
-    srcdoc.value = bootstrapSrcdoc()
-    await waitReady()
+    setFrameHtml(bootstrapSrcdoc())
+    await waitReady(15000)
     if (seq !== runSeq) return
     const win = iframeRef.value?.contentWindow
     if (!win || typeof win.__sfThRunScripts !== 'function') {
@@ -416,7 +433,15 @@ async function runAll() {
 }
 
 function onIframeLoad() {
-  // ready comes via postMessage
+  // Fallback: if postMessage ready is delayed/blocked, mark ready when runner exists.
+  try {
+    const win = iframeRef.value?.contentWindow
+    if (win && typeof win.__sfThRunScripts === 'function') {
+      iframeReady.value = true
+    }
+  } catch (_) {
+    /* cross-origin not expected for blob */
+  }
 }
 
 watch(
@@ -434,8 +459,10 @@ onMounted(() => {
   bridgeHandler = onBridgeMessage
   window.addEventListener('message', bridgeHandler)
   ensureStatuses()
+  setFrameHtml(bootstrapSrcdoc())
   if (props.autoRun && scripts.value.length) {
-    runAll()
+    // wait a tick so iframe starts loading bootstrap before runAll reloads it
+    setTimeout(() => { runAll() }, 0)
   }
 })
 
@@ -443,6 +470,7 @@ onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   runSeq++
   revokeBlobs()
+  revokeFrameBlob()
 })
 
 async function invokeButton(btn) {

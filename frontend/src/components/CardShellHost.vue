@@ -24,7 +24,7 @@
       class="w-full flex-1 min-h-[120px] border-0 bg-surface"
       :style="iframeStyle"
       sandbox="allow-scripts"
-      :srcdoc="srcdoc"
+      :src="frameSrc"
       @load="onIframeLoad"
     />
   </div>
@@ -57,6 +57,8 @@ const emit = defineEmits(['loaded', 'error', 'message', 'var-write'])
 
 const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
+const frameSrc = ref('about:blank')
+let frameBlobUrl = null
 const loading = ref(false)
 const error = ref(null)
 const loadedUrl = ref(null)
@@ -79,6 +81,22 @@ function blankSrcdoc(msg) {
   return `<!doctype html><html><head><meta charset="utf-8"/>
 <style>html,body{margin:0;padding:12px;font:12px/1.5 system-ui,sans-serif;background:#0f0f10;color:#c8c8c8}</style>
 </head><body>${escapeHtml(msg)}</body></html>`
+}
+
+function revokeFrameBlob() {
+  if (frameBlobUrl) {
+    try { URL.revokeObjectURL(frameBlobUrl) } catch (_) {}
+    frameBlobUrl = null
+  }
+}
+
+function setFrameHtml(html) {
+  srcdoc.value = html
+  revokeFrameBlob()
+  // blob: URL so WebView2 executes scripts (srcdoc often does not in Tauri).
+  const blob = new Blob([html], { type: 'text/html' })
+  frameBlobUrl = URL.createObjectURL(blob)
+  frameSrc.value = frameBlobUrl
 }
 
 function escapeHtml(s) {
@@ -106,9 +124,16 @@ async function hostFetch(url) {
 
 function wrapRemoteHtml(html, pageUrl) {
   // Inject bridge BEFORE content so jQuery.load can be patched after jquery arrives.
-  // Also rewrite relative URLs is left to future; test-card shells use absolute CDN.
-  const bridge = `
-<script>
+  const sOpen = '<' + 'script>'
+  const sClose = '</' + 'script>'
+  let baseHref = ''
+  try {
+    if (pageUrl) baseHref = new URL('.', pageUrl).href
+  } catch (_) {
+    baseHref = pageUrl || ''
+  }
+  const baseTag = baseHref ? `<base href="${baseHref}">` : ''
+  const bridgeBody = `
 (function(){
   'use strict';
   var PAGE = ${JSON.stringify(pageUrl || '')};
@@ -182,17 +207,18 @@ function wrapRemoteHtml(html, pageUrl) {
   window.getChatVariable = window.getvar;
   window.setChatVariable = window.setvar;
 })();
-<\/script>`
+`
+  const bridge = sOpen + bridgeBody + sClose
 
-  // If the response is a full document, inject bridge into head; else wrap.
+  // If the response is a full document, inject bridge + base into head; else wrap.
   const hasHtml = /<html[\s>]/i.test(html)
   if (hasHtml) {
     if (/<head[\s>]/i.test(html)) {
-      return html.replace(/<head([^>]*)>/i, (m) => `${m}${bridge}`)
+      return html.replace(/<head([^>]*)>/i, (m) => `${m}${baseTag}${bridge}`)
     }
-    return html.replace(/<html([^>]*)>/i, (m) => `${m}<head>${bridge}</head>`)
+    return html.replace(/<html([^>]*)>/i, (m) => `${m}<head>${baseTag}${bridge}</head>`)
   }
-  return `<!doctype html><html><head><meta charset="utf-8"/>${bridge}
+  return `<!doctype html><html><head><meta charset="utf-8"/>${baseTag}${bridge}
 <style>html,body{margin:0;padding:0;background:transparent;}</style>
 </head><body>${html}</body></html>`
 }
@@ -209,21 +235,21 @@ async function loadShell() {
       if (res.kind !== 'text' || res.body_text == null) {
         throw new Error('远程壳不是文本 HTML: ' + (res.content_type || ''))
       }
-      srcdoc.value = wrapRemoteHtml(res.body_text, props.url)
+      setFrameHtml(wrapRemoteHtml(res.body_text, props.url))
       loadedUrl.value = props.url
       emit('loaded', { url: props.url, fromCache: res.from_cache })
     } else if (props.html) {
-      srcdoc.value = wrapRemoteHtml(props.html, null)
+      setFrameHtml(wrapRemoteHtml(props.html, null))
       loadedUrl.value = '(inline)'
       emit('loaded', { url: null, inline: true })
     } else {
-      srcdoc.value = blankSrcdoc('未指定壳 URL / HTML')
+      setFrameHtml(blankSrcdoc('未指定壳 URL / HTML'))
     }
   } catch (e) {
     if (seq !== loadSeq) return
     const msg = String(e?.message || e)
     error.value = msg
-    srcdoc.value = blankSrcdoc('加载失败：' + msg)
+    setFrameHtml(blankSrcdoc('加载失败：' + msg))
     emit('error', msg)
   } finally {
     if (seq === loadSeq) loading.value = false
@@ -309,6 +335,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   loadSeq++
+  revokeFrameBlob()
 })
 
 defineExpose({ reload: loadShell, retry })
