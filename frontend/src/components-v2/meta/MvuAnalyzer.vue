@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
 import {
-  listCharacters,
+  listCards,
   metaAnalyzeMvuCard,
   metaListMvuTranslations,
   metaPreviewMvuApply,
@@ -21,9 +21,11 @@ import Overlay from '../ui/Overlay.vue'
 const emit = defineEmits(['error', 'mvu-applied'])
 
 // ─── 状态 ───
-const characters = ref([]) // 角色卡列表（分析入口）
+// 用 list_cards（Campaign 卡库）而不是 list_characters（导入层 CharacterStore）：
+// 后者可能含已删卡/重复导入残留，且 id 语义与 meta_analyze 的 source_character_id 不一致。
+const cards = ref([])
 const selectedCardId = ref(null)
-const analyzingCardId = ref(null) // 正在分析的卡 ID
+const analyzingCardId = ref(null) // 正在分析的 source_character_id
 
 const mvuTranslations = ref([]) // 已分析的 MVU 翻译列表
 const activeDetail = ref(null) // 展开的 MVU 分析详情
@@ -36,16 +38,26 @@ const applyingDefId = ref(null) // 正在 apply 的 definition_id
 
 const error = ref('')
 
-// ─── 角色卡 Select 选项 ───
+// ─── 角色卡 Select：value = source_character_id（MVU 分析入参），按 source 去重 ───
 const cardOptions = computed(() => {
-  if (characters.value.length === 0) return []
-  return characters.value.map(c => ({ value: c.id, label: c.name }))
+  const seen = new Set()
+  const opts = []
+  for (const c of cards.value) {
+    const sourceId = c.source_character_id || c.id
+    if (!sourceId || seen.has(sourceId)) continue
+    seen.add(sourceId)
+    opts.push({
+      value: sourceId,
+      label: c.name || sourceId.slice(0, 8),
+    })
+  }
+  return opts
 })
 
 // ─── 初始化 ───
 onMounted(async () => {
   try {
-    characters.value = await listCharacters()
+    cards.value = await listCards()
   } catch (e) {
     console.error('加载角色卡失败:', e)
   }

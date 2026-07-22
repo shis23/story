@@ -6513,7 +6513,8 @@ fn log_query(filter: LogFilterDto, state: tauri::State<'_, Arc<AppState>>) -> Ve
             "frontend" => Some(LogKind::FrontendPlugin),
             _ => None,
         }),
-        level: filter.level.as_deref().and_then(|l| match l {
+        // 前端 Select 可能传 Error / error；统一大小写
+        level: filter.level.as_deref().and_then(|l| match l.to_ascii_lowercase().as_str() {
             "debug" => Some(LogLevel::Debug),
             "info" => Some(LogLevel::Info),
             "warn" => Some(LogLevel::Warn),

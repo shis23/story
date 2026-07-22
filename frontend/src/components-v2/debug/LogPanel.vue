@@ -1,21 +1,16 @@
 <script setup>
 /**
- * LogPanel — app/frontend 日志查询面板。
+ * LogPanel — 调试抽屉日志列表。
  *
- * 迁移自 src/components/LogPanel.vue。调 tauri-api:
- *   log_query / log_clear / log_export_bundle。
- * 用 ui/DataTable 渲染日志条(level / timestamp / message),支持 level 过滤(ui/Select)。
- * 复制 / 导出按钮。
- *
- * 保留原 tab(全部 / 后端 / LLM / 前端)与 level 过滤、刷新 / 清空 / 导出 bundle 行为。
+ * 不用窄表格 + break-all（Inspector 里会竖排字符）。
+ * 改为：卡片列表 + 消息自然换行；轮询刷新时保留滚动位置。
+ * 级别过滤：前端传小写，后端同时兼容大小写。
  */
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { logQuery, logClear, logExportBundle } from '../../tauri-api.js'
 import Tabs from '../ui/Tabs.vue'
 import Select from '../ui/Select.vue'
-import Button from '../ui/Button.vue'
 import IconButton from '../ui/IconButton.vue'
-import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
@@ -23,31 +18,126 @@ import LoadingState from '../ui/LoadingState.vue'
 const logs = ref([])
 const loading = ref(false)
 const activeTab = ref('all') // all | backend | llm | frontend
-const levelFilter = ref('') // '' = 全部
+const levelFilter = ref('') // '' = 全部；传小写给后端
+const listEl = ref(null)
+const expanded = ref(new Set())
+let pollTimer = null
+let firstLoad = true
 
-// ─── 加载日志 ───
-async function loadLogs() {
-  loading.value = true
-  const filter = { limit: 100 }
+const tabs = [
+  { key: 'all', label: '全部' },
+  { key: 'backend', label: '后端' },
+  { key: 'llm', label: 'LLM' },
+  { key: 'frontend', label: '前端' },
+]
+
+const levelOptions = [
+  { value: '', label: '全部级别' },
+  { value: 'error', label: 'Error' },
+  { value: 'warn', label: 'Warn' },
+  { value: 'info', label: 'Info' },
+  { value: 'debug', label: 'Debug' },
+]
+
+function levelVariant(level) {
+  switch (String(level || '').toLowerCase()) {
+    case 'error': return 'err'
+    case 'warn': return 'warn'
+    case 'info': return 'accent'
+    case 'debug': return 'neutral'
+    default: return 'neutral'
+  }
+}
+
+function kindLabel(kind) {
+  const k = String(kind || '')
+  if (k === 'Backend' || k === 'backend') return '后端'
+  if (k === 'LlmCall' || k === 'llm') return 'LLM'
+  if (k === 'FrontendPlugin' || k === 'frontend') return '前端'
+  return k || '—'
+}
+
+function formatTime(ts) {
+  try {
+    const d = new Date(ts)
+    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  } catch {
+    return ts
+  }
+}
+
+function isLong(message) {
+  return String(message || '').length > 160 || String(message || '').includes('\n')
+}
+
+function previewMessage(message) {
+  const s = String(message || '')
+  if (s.length <= 220) return s
+  return s.slice(0, 220) + '…'
+}
+
+function isOpen(id) {
+  return expanded.value.has(id)
+}
+
+function toggle(id) {
+  const next = new Set(expanded.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expanded.value = next
+}
+
+async function copyMessage(row) {
+  try {
+    await navigator.clipboard.writeText(row.message || '')
+  } catch {
+    // ignore
+  }
+}
+
+function captureScroll() {
+  const el = listEl.value
+  if (!el) return null
+  const max = el.scrollHeight - el.clientHeight
+  const nearBottom = max <= 0 || el.scrollTop >= max - 24
+  return { top: el.scrollTop, nearBottom }
+}
+
+async function restoreScroll(snap) {
+  await nextTick()
+  const el = listEl.value
+  if (!el || !snap) return
+  if (snap.nearBottom) {
+    el.scrollTop = el.scrollHeight
+  } else {
+    el.scrollTop = snap.top
+  }
+}
+
+async function loadLogs({ quiet = false } = {}) {
+  if (!quiet) loading.value = true
+  const scrollSnap = quiet || !firstLoad ? captureScroll() : null
+  const filter = { limit: 120 }
   if (activeTab.value !== 'all') filter.kind = activeTab.value
-  if (levelFilter.value) filter.level = levelFilter.value
+  // 后端历史只认小写；兼容 UI 若写成 Error 也统一
+  if (levelFilter.value) filter.level = String(levelFilter.value).toLowerCase()
   try {
     logs.value = await logQuery(filter)
   } catch (e) {
     console.error('加载日志失败:', e)
   } finally {
-    loading.value = false
+    if (!quiet) loading.value = false
+    firstLoad = false
+    if (scrollSnap) await restoreScroll(scrollSnap)
   }
 }
 
-// ─── 清空日志 ───
 async function handleClear() {
   const kind = activeTab.value === 'all' ? null : activeTab.value
   await logClear(kind)
   await loadLogs()
 }
 
-// ─── 导出 bundle(用 Tauri 文件对话框,与原实现一致) ───
 async function handleExport() {
   try {
     const bundle = await logExportBundle(true)
@@ -67,65 +157,20 @@ async function handleExport() {
   }
 }
 
-// ─── 切换 tab ───
 function onTabChange() {
+  firstLoad = true
   loadLogs()
 }
 
 function onLevelChange() {
+  firstLoad = true
   loadLogs()
 }
 
-// ─── 格式化时间 ───
-function formatTime(ts) {
-  try {
-    const d = new Date(ts)
-    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  } catch {
-    return ts
-  }
-}
-
-// ─── level → Badge variant(走主题 token) ───
-function levelVariant(level) {
-  switch (level) {
-    case 'Error': return 'err'
-    case 'Warn': return 'warn'
-    case 'Info': return 'accent'
-    case 'Debug': return 'neutral'
-    default: return 'neutral'
-  }
-}
-
-const tabs = [
-  { key: 'all', label: '全部' },
-  { key: 'backend', label: '后端' },
-  { key: 'llm', label: 'LLM' },
-  { key: 'frontend', label: '前端' },
-]
-
-const levelOptions = [
-  { value: '', label: '全部级别' },
-  { value: 'Error', label: 'Error' },
-  { value: 'Warn', label: 'Warn' },
-  { value: 'Info', label: 'Info' },
-  { value: 'Debug', label: 'Debug' },
-]
-
-// ─── DataTable 配置 ───
-const columns = [
-  { key: 'timestamp', label: '时间', width: '90px' },
-  { key: 'level', label: '级别', width: '80px' },
-  { key: 'kind', label: '来源', width: '80px' },
-  { key: 'message', label: '消息' },
-]
-
-// 定时轮询：写作/抽取产生的日志会持续写入 LogStore 内存 buffer，
-// 只 onMounted 拉一次的话用户看不到后续日志。3 秒轮询保证日志面板实时刷新。
-let pollTimer = null
 onMounted(() => {
   loadLogs()
-  pollTimer = setInterval(loadLogs, 3000)
+  // 静默轮询：不闪 Loading、尽量保持滚动位置
+  pollTimer = setInterval(() => loadLogs({ quiet: true }), 3000)
 })
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
@@ -135,12 +180,12 @@ defineExpose({ loadLogs })
 </script>
 
 <template>
-  <section class="flex flex-col gap-3">
-    <header class="flex items-center gap-2">
-      <h3 class="text-sm font-semibold text-ink">日志</h3>
+  <section class="flex flex-col gap-3 min-w-0">
+    <header class="flex items-center gap-2 min-w-0">
+      <h3 class="text-sm font-semibold text-ink shrink-0">日志</h3>
       <Badge variant="neutral" size="sm">{{ logs.length }} 条</Badge>
-      <div class="ml-auto flex items-center gap-1">
-        <IconButton size="sm" variant="ghost" title="刷新" @click="loadLogs">
+      <div class="ml-auto flex items-center gap-1 shrink-0">
+        <IconButton size="sm" variant="ghost" title="刷新" @click="loadLogs()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
         </IconButton>
         <IconButton size="sm" variant="ghost" title="导出 bundle" @click="handleExport">
@@ -153,34 +198,57 @@ defineExpose({ loadLogs })
     </header>
 
     <Tabs v-model="activeTab" :tabs="tabs" @update:model-value="onTabChange">
-      <div class="flex gap-2 mb-3">
-        <div class="min-w-[140px]">
+      <div class="flex gap-2 mb-3 min-w-0">
+        <div class="min-w-[140px] max-w-full">
           <Select v-model="levelFilter" :options="levelOptions" @update:model-value="onLevelChange" />
         </div>
       </div>
 
-      <LoadingState v-if="loading" />
+      <LoadingState v-if="loading && logs.length === 0" />
 
       <EmptyState
-        v-else-if="logs.length === 0"
+        v-else-if="!loading && logs.length === 0"
         title="暂无日志"
+        description="写作、连接与抽取过程中的 Info/Error 会显示在这里"
       />
 
-      <div v-else class="max-h-96 overflow-y-auto rounded-lg border border-line">
-        <DataTable :columns="columns" :rows="logs" empty-title="暂无日志">
-          <template #cell-timestamp="{ row }">
-            <span class="text-xs font-mono text-ink-faint">{{ formatTime(row.timestamp) }}</span>
-          </template>
-          <template #cell-level="{ row }">
+      <div
+        v-else
+        ref="listEl"
+        class="max-h-[28rem] overflow-y-auto overscroll-contain space-y-2 pr-0.5 min-w-0"
+      >
+        <article
+          v-for="row in logs"
+          :key="row.id"
+          class="rounded-lg border border-line bg-surface px-3 py-2.5 min-w-0"
+        >
+          <div class="flex items-center gap-2 flex-wrap min-w-0">
+            <span class="text-[11px] font-mono text-ink-faint shrink-0">{{ formatTime(row.timestamp) }}</span>
             <Badge :variant="levelVariant(row.level)" size="sm">{{ row.level }}</Badge>
-          </template>
-          <template #cell-kind="{ row }">
-            <span class="text-xs text-ink-soft">[{{ row.kind }}]</span>
-          </template>
-          <template #cell-message="{ row }">
-            <span class="text-xs font-mono text-ink break-all">{{ row.message }}</span>
-          </template>
-        </DataTable>
+            <span class="text-[11px] text-ink-soft shrink-0">{{ kindLabel(row.kind) }}</span>
+            <span
+              v-if="row.prompt_tokens != null"
+              class="text-[10px] font-mono text-ink-faint"
+            >{{ row.prompt_tokens }}+{{ row.completion_tokens ?? 0 }} tok</span>
+            <div class="ml-auto flex items-center gap-1 shrink-0">
+              <button
+                v-if="isLong(row.message)"
+                type="button"
+                class="text-[11px] text-ink-soft hover:text-ink px-1.5 py-0.5 rounded hover:bg-surface-2"
+                @click="toggle(row.id)"
+              >{{ isOpen(row.id) ? '收起' : '展开' }}</button>
+              <button
+                type="button"
+                class="text-[11px] text-ink-soft hover:text-ink px-1.5 py-0.5 rounded hover:bg-surface-2"
+                title="复制"
+                @click="copyMessage(row)"
+              >复制</button>
+            </div>
+          </div>
+          <pre
+            class="mt-1.5 text-xs text-ink whitespace-pre-wrap break-words font-mono leading-relaxed min-w-0 max-w-full"
+          >{{ isOpen(row.id) || !isLong(row.message) ? row.message : previewMessage(row.message) }}</pre>
+        </article>
       </div>
     </Tabs>
   </section>
