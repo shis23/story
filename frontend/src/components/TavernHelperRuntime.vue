@@ -280,7 +280,7 @@ function bootstrapSrcdoc() {
     "      console.info('[TH] Zod v4 ready (wrapped)');",
     "    }",
     "    if (!window.z || typeof window.z.object !== 'function') throw new Error('Zod global missing after load');",
-    "    if (!window.z.z) window.z.z = window.z;",
+    "    if (window.z && !window.z.z) { try { window.z = Object.assign({ z: window.z }, window.z); } catch (eZ) {} }",
     "    if (!window._) {",
     "      try {",
     "        await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; });",
