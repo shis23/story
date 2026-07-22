@@ -235,12 +235,9 @@ fn extract_from_tavern_helper(
             push_url(remote_urls, u);
         }
 
-        if let Some(url) = import_urls.first().cloned().or_else(|| {
-            // bare `import 'url'` only
-            http_urls.first().cloned()
-        }) {
-            // Prefer first ES import as entry when present
-            let entry_url = import_urls.first().cloned().unwrap_or(url);
+        // Only ES `import 'https://...'` becomes RemoteUrl.
+        // Bare CDN constants inside large IIFEs (创意工坊) must stay InlineJs.
+        if let Some(entry_url) = import_urls.first().cloned() {
             let deps: Vec<String> = import_urls
                 .iter()
                 .chain(http_urls.iter())
@@ -255,8 +252,8 @@ fn extract_from_tavern_helper(
                 trigger: "tavern_helper.scripts".into(),
                 buttons,
             });
-        } else if content.len() > 200 {
-            // Inline creative-workshop style script
+        } else if !content.trim().is_empty() {
+            // Inline creative-workshop style script / any non-import TH payload
             shells.push(CardFrontendShell {
                 kind: CardShellKind::TavernHelperModule,
                 entry: CardShellEntry::InlineJs { js: content },

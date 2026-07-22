@@ -129,8 +129,16 @@ function bootstrapSrcdoc() {
     });
   }
   window.__sfThHostFetchText = function(url){ return ask('fetch_text', { url: url }); };
-  window.__sfThHostFetchModuleBlob = function(url){ return ask('fetch_module_blob', { url: url }); };
+  // Parent returns SOURCE TEXT (not a parent-side blob URL). Create blob in THIS origin.
+  window.__sfThHostFetchModuleSource = function(url){ return ask('fetch_module_source', { url: url }); };
   window.__sfThReport = function(payload){ return ask('report', payload); };
+  window.__sfThLocalBlobs = [];
+  window.__sfThModuleSourceToBlob = function(code){
+    var blob = new Blob([code], { type: 'text/javascript' });
+    var u = URL.createObjectURL(blob);
+    window.__sfThLocalBlobs.push(u);
+    return u;
+  };
   window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };
   window.setvar = function(k, v){
     V[k] = v;
@@ -159,7 +167,8 @@ function bootstrapSrcdoc() {
       try {
         await window.__sfThReport({ index: i, label: item.label, state: 'running' });
         if (item.kind === 'remote_url'){
-          var blobUrl = await window.__sfThHostFetchModuleBlob(item.url);
+          var source = await window.__sfThHostFetchModuleSource(item.url);
+          var blobUrl = window.__sfThModuleSourceToBlob(source);
           await import(blobUrl);
         } else if (item.kind === 'inline_js'){
           await new Promise(function(resolve, reject){
@@ -276,18 +285,21 @@ function resolveUrl(base, rel) {
  * Host-mediated ES module graph:
  * fetch → rewrite absolute/relative imports to blob: URLs → object URL.
  */
-async function fetchModuleBlob(entryUrl, cache = new Map(), depth = 0) {
+/**
+ * Host-mediated ES module graph as SOURCE TEXT.
+ * Parent fetches code and inlines relative deps as absolute http(s) imports so
+ * the iframe can build same-origin blob URLs itself (parent blobs are opaque).
+ */
+async function fetchModuleSource(entryUrl, cache = new Map(), depth = 0) {
   if (depth > 12) throw new Error('module graph too deep: ' + entryUrl)
   if (cache.has(entryUrl)) return cache.get(entryUrl)
 
-  // placeholder to break cycles
   cache.set(entryUrl, null)
   let code = await hostFetchText(entryUrl)
 
-  // collect import specifiers: from 'x' | import 'x' | import('x')
-  const specs = new Set()
   const re =
     /(?:\bfrom\s+|\bimport\s*\(?|\bimport\s+)['"`]([^'"`]+)['"`]/g
+  const specs = new Set()
   let m
   while ((m = re.exec(code)) !== null) {
     const spec = m[1]
@@ -297,35 +309,32 @@ async function fetchModuleBlob(entryUrl, cache = new Map(), depth = 0) {
     }
   }
 
-  const rewriteMap = new Map()
+  // Rewrite relative imports to absolute http(s) so iframe can re-fetch via host.
+  if (specs.size) {
+    code = code.replace(re, (full, spec) => {
+      if (!(spec.startsWith('.') || spec.startsWith('/'))) return full
+      const abs = resolveUrl(entryUrl, spec)
+      if (!abs) return full
+      return full.replace(spec, abs)
+    })
+  }
+
+  // Pre-warm dependency sources (best effort) so first run fails less often.
   for (const spec of specs) {
     const abs =
       spec.startsWith('http://') || spec.startsWith('https://')
         ? spec
         : resolveUrl(entryUrl, spec)
-    if (!abs) continue
+    if (!abs || abs === entryUrl) continue
     try {
-      const childBlob = await fetchModuleBlob(abs, cache, depth + 1)
-      if (childBlob) rewriteMap.set(spec, childBlob)
+      await fetchModuleSource(abs, cache, depth + 1)
     } catch (e) {
-      // leave original; import will fail visibly
-      console.warn('[TH] dep fetch failed', abs, e)
+      console.warn('[TH] dep source fetch failed', abs, e)
     }
   }
 
-  if (rewriteMap.size) {
-    code = code.replace(re, (full, spec) => {
-      if (!rewriteMap.has(spec)) return full
-      const blob = rewriteMap.get(spec)
-      return full.replace(spec, blob)
-    })
-  }
-
-  const blob = new Blob([code], { type: 'text/javascript' })
-  const blobUrl = URL.createObjectURL(blob)
-  blobUrls.push(blobUrl)
-  cache.set(entryUrl, blobUrl)
-  return blobUrl
+  cache.set(entryUrl, code)
+  return code
 }
 
 async function onBridgeMessage(ev) {
@@ -364,9 +373,10 @@ async function onBridgeMessage(ev) {
       reply(text)
       return
     }
-    if (d.type === 'fetch_module_blob') {
-      const blob = await fetchModuleBlob(d.payload.url)
-      reply(blob)
+    if (d.type === 'fetch_module_blob' || d.type === 'fetch_module_source') {
+      // Return source text; iframe creates its own blob: URL.
+      const source = await fetchModuleSource(d.payload.url)
+      reply(source)
       return
     }
     if (d.type === 'report') {
