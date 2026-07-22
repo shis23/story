@@ -160,16 +160,108 @@ function bootstrapSrcdoc() {
   };
   window.tavernHelper = window.TavernHelper;
 
+  // ST / MagVarUpdate / destined-journey scripts expect free globals (not ESM imports).
+  // data_schema: const t=z; t.z.coerce... — global z must be Zod UMD exports (has .z).
+  window.__sfThEnsureGlobals = async function(){
+    async function loadClassic(url, check){
+      var code = await window.__sfThHostFetchText(url);
+      if (!code || code.length < 20) throw new Error('empty global script: ' + url);
+      var s = document.createElement('script');
+      s.text = code;
+      document.head.appendChild(s);
+      if (typeof check === 'function' && !check()) {
+        throw new Error('global script did not define expected symbol: ' + url);
+      }
+    }
+    if (!window.jQuery) {
+      await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', function(){ return !!window.jQuery; });
+    }
+    window.$ = window.jQuery || window.$;
+    if (!window.Vue) {
+      await loadClassic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });
+    }
+    if (!window.Zod) {
+      await loadClassic('https://cdn.jsdelivr.net/npm/zod@3.23.8/lib/index.umd.js', function(){ return !!window.Zod; });
+    }
+    // Zod UMD sets global.Zod; expose as z (namespace with nested .z)
+    window.z = window.Zod || window.z;
+    if (!window.z) throw new Error('Zod global missing after load');
+    if (!window._) {
+      try {
+        await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; });
+      } catch (e) {
+        console.warn('[TH] lodash load failed', e);
+        window._ = {
+          clamp: function(n,a,b){ return Math.min(b, Math.max(a, n)); },
+          get: function(o,k,d){ return d; },
+          set: function(){},
+          fromPairs: function(pairs){ var o={}; (pairs||[]).forEach(function(p){ if(p) o[p[0]]=p[1]; }); return o; },
+          toPairs: function(o){ return Object.keys(o||{}).map(function(k){ return [k, o[k]]; }); },
+          take: function(a,n){ return (a||[]).slice(0,n); },
+          uniq: function(a){ return Array.from(new Set(a||[])); },
+          pick: function(o, keys){ var r={}; (keys||[]).forEach(function(k){ if(o&&k in o) r[k]=o[k]; }); return r; },
+          mapValues: function(o, fn){ var r={}; Object.keys(o||{}).forEach(function(k){ r[k]=fn(o[k],k); }); return r; },
+          size: function(o){ return o ? (Array.isArray(o)?o.length:Object.keys(o).length) : 0; },
+        };
+      }
+    }
+    if (!window.Vue) throw new Error('Vue global missing after preload');
+    if (!window.$) throw new Error('jQuery global missing after preload');
+  };
+
+  // Host text → same-origin blob graph for remote ES modules (sandbox blocks free CDN import).
+  window.__sfThImportUrl = async function(entryUrl){
+    var cache = Object.create(null);
+    async function load(url){
+      if (cache[url]) return cache[url];
+      cache[url] = (async function(){
+        var code = await window.__sfThHostFetchModuleSource(url);
+        var re = new RegExp('(?:\\bfrom\\s+|\\bimport\\s*\\(?|\\bimport\\s+)[\'\"]([^\'\"]+)[\'\"]', 'g');
+        var specs = [];
+        var m;
+        while ((m = re.exec(code)) !== null) {
+          var spec = m[1];
+          if (!spec) continue;
+          if (spec.startsWith('http://') || spec.startsWith('https://') || spec.startsWith('.') || spec.startsWith('/')) {
+            specs.push(spec);
+          }
+        }
+        var map = Object.create(null);
+        for (var i = 0; i < specs.length; i++) {
+          var sp = specs[i];
+          var abs = sp;
+          if (sp.startsWith('.') || sp.startsWith('/')) {
+            try { abs = new URL(sp, url).href; } catch (e) { continue; }
+          }
+          try {
+            map[sp] = await load(abs);
+          } catch (e) {
+            console.warn('[TH] module dep failed', abs, e);
+          }
+        }
+        if (Object.keys(map).length) {
+          code = code.replace(re, function(full, spec){
+            if (!map[spec]) return full;
+            return full.replace(spec, map[spec]);
+          });
+        }
+        return window.__sfThModuleSourceToBlob(code);
+      })();
+      return cache[url];
+    }
+    var blobUrl = await load(entryUrl);
+    return import(blobUrl);
+  };
+
   window.__sfThRunScripts = async function(items){
+    await window.__sfThEnsureGlobals();
     var results = [];
     for (var i = 0; i < items.length; i++){
       var item = items[i];
       try {
         await window.__sfThReport({ index: i, label: item.label, state: 'running' });
         if (item.kind === 'remote_url'){
-          var source = await window.__sfThHostFetchModuleSource(item.url);
-          var blobUrl = window.__sfThModuleSourceToBlob(source);
-          await import(blobUrl);
+          await window.__sfThImportUrl(item.url);
         } else if (item.kind === 'inline_js'){
           await new Promise(function(resolve, reject){
             try {
