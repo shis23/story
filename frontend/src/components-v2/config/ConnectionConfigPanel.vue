@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { confirmDialog } from '../../components/base/BaseDialog.js'
 import {
   listConnectionTemplates,
@@ -100,6 +100,12 @@ function parseExtraParams() {
 const fetchedModels = ref([])
 const fetchingModels = ref(false)
 
+// 模型选择器：可搜索 + 可手输（不用 datalist，WebView 下箭头常点不动）
+const modelMenuOpen = ref(false)
+const modelHighlight = ref(-1)
+const modelInputRef = ref(null)
+const modelRootRef = ref(null)
+
 // 协议下拉
 const protocolOptions = [
   { value: 'openai', label: 'OpenAI' },
@@ -129,10 +135,99 @@ const modelOptions = computed(() => {
   return [...new Set([...tpl, ...fetchedModels.value])].map((m) => ({ value: m, label: m }))
 })
 
+// 按输入过滤；空输入展示全部（最多 200 条，避免超长列表卡顿）
+const filteredModelOptions = computed(() => {
+  const q = String(form.model || '').trim().toLowerCase()
+  const all = modelOptions.value
+  const list = q
+    ? all.filter((m) => String(m.value).toLowerCase().includes(q))
+    : all
+  return list.slice(0, 200)
+})
+
+function openModelMenu() {
+  modelMenuOpen.value = true
+  modelHighlight.value = filteredModelOptions.value.findIndex((m) => m.value === form.model)
+  if (modelHighlight.value < 0 && filteredModelOptions.value.length) {
+    modelHighlight.value = 0
+  }
+}
+
+function closeModelMenu() {
+  modelMenuOpen.value = false
+  modelHighlight.value = -1
+}
+
+function toggleModelMenu() {
+  if (modelMenuOpen.value) closeModelMenu()
+  else {
+    openModelMenu()
+    nextTick(() => modelInputRef.value?.focus?.())
+  }
+}
+
+function pickModel(value) {
+  form.model = value
+  closeModelMenu()
+}
+
+function onModelInput() {
+  // 手输时展开列表；有匹配则高亮第一项
+  if (!modelMenuOpen.value) openModelMenu()
+  else {
+    modelHighlight.value = filteredModelOptions.value.length ? 0 : -1
+  }
+}
+
+function onModelKeydown(e) {
+  const list = filteredModelOptions.value
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    if (!modelMenuOpen.value) openModelMenu()
+    if (!list.length) return
+    modelHighlight.value = (modelHighlight.value + 1 + list.length) % list.length
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    if (!modelMenuOpen.value) openModelMenu()
+    if (!list.length) return
+    modelHighlight.value = (modelHighlight.value - 1 + list.length) % list.length
+  } else if (e.key === 'Enter') {
+    if (modelMenuOpen.value && modelHighlight.value >= 0 && list[modelHighlight.value]) {
+      e.preventDefault()
+      pickModel(list[modelHighlight.value].value)
+    }
+  } else if (e.key === 'Escape') {
+    if (modelMenuOpen.value) {
+      e.preventDefault()
+      closeModelMenu()
+    }
+  }
+}
+
+function onDocPointerDown(e) {
+  if (!modelMenuOpen.value) return
+  const root = modelRootRef.value
+  if (root && !root.contains(e.target)) closeModelMenu()
+}
+
+watch(filteredModelOptions, (list) => {
+  if (!modelMenuOpen.value) return
+  if (!list.length) {
+    modelHighlight.value = -1
+    return
+  }
+  if (modelHighlight.value >= list.length) modelHighlight.value = 0
+})
+
 // 拉取在线模型列表
 async function handleFetchModels() {
   if (!form.baseUrl || !form.apiKey) {
-    error.value = '请先填完 base_url 和 api_key'
+    // 编辑态可能没填 key：提示要 key 才能拉列表
+    if (isEditing.value && editingHasKey.value && !form.apiKey) {
+      error.value = '拉取模型列表需要填入 API Key（编辑时不会回显已保存密钥）'
+    } else {
+      error.value = '请先填完 base_url 和 api_key'
+    }
     return
   }
   fetchingModels.value = true
@@ -143,13 +238,11 @@ async function handleFetchModels() {
       error.value = '服务商未返回模型列表，请手动输入或用模板默认'
     } else {
       fetchedModels.value = models
-      // P3-2 修复：不自动填充 models[0]。<datalist> 在输入框有值时只显示前缀匹配项,
-      // 自动填充会导致下拉只剩第一项（如只显示 minimax-m3）。保持输入框为空,
-      // 让用户点开下拉看到全部模型再选;仅在表单完全空(新建连接且无模板默认)时
-      // 才填第一个,避免空保存。
+      // 有候选后自动展开列表；仅在模型为空时预填第一项，避免覆盖用户已有选择
       if (!form.model) {
         form.model = models[0]
       }
+      openModelMenu()
     }
   } catch (e) {
     error.value = '拉取失败：' + e
@@ -159,8 +252,12 @@ async function handleFetchModels() {
 }
 
 onMounted(async () => {
+  document.addEventListener('pointerdown', onDocPointerDown, true)
   await Promise.all([loadTemplates(), loadConnections()])
   loading.value = false
+})
+onUnmounted(() => {
+  document.removeEventListener('pointerdown', onDocPointerDown, true)
 })
 
 async function loadTemplates() {
@@ -491,19 +588,94 @@ async function handleSetActive(id) {
             <Select v-model="form.protocol" :options="protocolOptions" />
           </div>
 
-          <!-- model（datalist：可选可输入 + 拉取按钮）-->
+          <!-- model：可搜索可手输下拉 + 拉取按钮（不用 datalist）-->
           <div class="space-y-1">
             <label class="text-[11px] text-ink-soft">模型</label>
             <div class="flex gap-1.5">
-              <input
-                v-model="form.model"
-                list="model-options-list"
-                placeholder="模型名（可手输或下拉选）"
-                class="flex-1 bg-surface-2 border border-line rounded-lg px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint font-mono focus:border-accent outline-none"
-              />
-              <datalist id="model-options-list">
-                <option v-for="m in modelOptions" :key="m.value" :value="m.value" />
-              </datalist>
+              <div ref="modelRootRef" class="relative flex-1 min-w-0">
+                <div
+                  class="flex items-center bg-surface-2 border rounded-lg transition-colors"
+                  :class="modelMenuOpen ? 'border-accent' : 'border-line focus-within:border-accent'"
+                >
+                  <input
+                    ref="modelInputRef"
+                    v-model="form.model"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    role="combobox"
+                    :aria-expanded="modelMenuOpen ? 'true' : 'false'"
+                    aria-autocomplete="list"
+                    aria-controls="model-options-listbox"
+                    placeholder="模型名（可手输或点箭头选）"
+                    class="flex-1 min-w-0 bg-transparent px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint font-mono outline-none"
+                    @focus="openModelMenu"
+                    @input="onModelInput"
+                    @keydown="onModelKeydown"
+                  />
+                  <button
+                    type="button"
+                    class="shrink-0 w-9 h-9 flex items-center justify-center text-ink-soft hover:text-ink transition-colors"
+                    :title="modelMenuOpen ? '收起列表' : '展开模型列表'"
+                    aria-label="展开模型列表"
+                    @click="toggleModelMenu"
+                  >
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="transition-transform duration-150"
+                      :class="modelMenuOpen ? 'rotate-180' : ''"
+                      aria-hidden="true"
+                    >
+                      <path d="M6 9l6 6 6-6" />
+                    </svg>
+                  </button>
+                </div>
+
+                <ul
+                  v-if="modelMenuOpen"
+                  id="model-options-listbox"
+                  role="listbox"
+                  class="absolute left-0 right-0 z-[var(--z-overlay)] mt-1 max-h-60 overflow-auto bg-surface border border-line rounded-lg shadow-rise py-1"
+                >
+                  <li
+                    v-if="!modelOptions.length"
+                    class="px-3 py-2 text-xs text-ink-faint"
+                  >
+                    暂无候选。可直接手输模型名，或先点右侧搜索拉取列表。
+                  </li>
+                  <li
+                    v-else-if="!filteredModelOptions.length"
+                    class="px-3 py-2 text-xs text-ink-faint"
+                  >
+                    无匹配「{{ form.model }}」。可继续手输完整模型名。
+                  </li>
+                  <li
+                    v-for="(m, idx) in filteredModelOptions"
+                    :key="m.value"
+                    role="option"
+                    :aria-selected="form.model === m.value ? 'true' : 'false'"
+                    class="px-3 py-1.5 text-sm font-mono cursor-pointer select-none truncate transition-colors"
+                    :class="[
+                      form.model === m.value
+                        ? 'bg-accent-soft text-accent-bright font-medium'
+                        : idx === modelHighlight
+                          ? 'bg-surface-2 text-ink'
+                          : 'text-ink hover:bg-surface-2',
+                    ]"
+                    @mousedown.prevent="pickModel(m.value)"
+                    @mouseenter="modelHighlight = idx"
+                  >
+                    {{ m.label }}
+                  </li>
+                </ul>
+              </div>
               <Button
                 variant="default"
                 size="md"
@@ -515,7 +687,7 @@ async function handleSetActive(id) {
               </Button>
             </div>
             <div v-if="fetchedModels.length" class="text-[10px] text-ink-faint mt-1">
-              已拉取 {{ fetchedModels.length }} 个模型
+              已拉取 {{ fetchedModels.length }} 个模型 · 点输入框或箭头可选，也可直接手输
             </div>
           </div>
 
