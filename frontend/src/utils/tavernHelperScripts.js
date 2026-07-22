@@ -12,7 +12,12 @@ export function parseShellEntry(entry) {
     return { kind: 'remote_url', url: entry.remote_url.url || null }
   }
   if (entry.inline_js && typeof entry.inline_js === 'object') {
-    return { kind: 'inline_js', js: entry.inline_js.js || null }
+    return {
+      kind: 'inline_js',
+      js: entry.inline_js.js || null,
+      deferred: !!entry.inline_js.deferred,
+      byteLen: entry.inline_js.byte_len || 0,
+    }
   }
   if (entry.inline_html && typeof entry.inline_html === 'object') {
     return { kind: 'inline_html', html: entry.inline_html.html || null }
@@ -43,8 +48,16 @@ export function orderedTavernHelperFromShells(shells) {
     const buttons = Array.isArray(s.buttons) ? s.buttons.filter(Boolean) : []
     if (parsed.kind === 'remote_url' && parsed.url) {
       out.push({ index: i++, label, kind: 'remote_url', url: parsed.url, deps, buttons })
-    } else if (parsed.kind === 'inline_js' && parsed.js) {
-      out.push({ index: i++, label, kind: 'inline_js', js: parsed.js, deps, buttons })
+    } else if (parsed.kind === 'inline_js' && (parsed.js || parsed.deferred)) {
+      out.push({
+        index: i++,
+        label,
+        kind: 'inline_js',
+        js: parsed.js || '',
+        deferred: !!parsed.deferred,
+        deps,
+        buttons,
+      })
     }
   }
   return out

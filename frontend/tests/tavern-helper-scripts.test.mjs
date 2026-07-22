@@ -93,3 +93,19 @@ test('collectVisibleThButtons unique preserve order', () => {
     ['重新读取初始变量', '重新处理变量', '命定创意工坊'],
   )
 })
+
+test('deferred inline_js without body is kept', () => {
+  const shells = [
+    {
+      kind: 'tavern_helper_module',
+      label: '创意工坊',
+      entry: { inline_js: { js: '', deferred: true, byte_len: 60000 } },
+      buttons: ['命定创意工坊'],
+      deps: [],
+    },
+  ]
+  const ordered = orderedTavernHelperFromShells(shells)
+  assert.equal(ordered.length, 1)
+  assert.equal(ordered[0].deferred, true)
+  assert.equal(ordered[0].js, '')
+})

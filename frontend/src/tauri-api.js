@@ -955,6 +955,14 @@ export async function cardShellFetchUrl(url) {
   throw new Error('card shell fetch requires Tauri host')
 }
 
+/** 按需取 deferred 的 TH inline 大脚本 */
+export async function getCardShellInlineJs(characterId, label) {
+  if (isTauri()) {
+    return await invoke('get_card_shell_inline_js', { characterId, label })
+  }
+  return ''
+}
+
 
 /** 获取当前活跃 Campaign */
 export async function getActiveCampaign() {

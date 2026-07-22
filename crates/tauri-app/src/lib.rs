@@ -10809,19 +10809,70 @@ fn get_card_shell_manifest(character_id: String) -> Result<CardShellManifestDto,
         .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
     let character = stored_info_to_character(&stored);
     let manifest = storyforge_domain::card_shell::extract_card_shell_manifest(&character);
+    // 大 inline TH（创意工坊 60KB+）不整包塞进 manifest，避免 IPC/前端一次反序列化撑爆 WebView。
+    // 前端按 label 再调 get_card_shell_inline_js 按需取正文。
+    let shells: Vec<serde_json::Value> = manifest
+        .shells
+        .iter()
+        .filter_map(|s| {
+            let mut v = serde_json::to_value(s).ok()?;
+            if let Some(entry) = v.get_mut("entry") {
+                if let Some(obj) = entry.get_mut("inline_js") {
+                    if let Some(js) = obj.get("js").and_then(|j| j.as_str()) {
+                        if js.len() > 8_192 {
+                            let len = js.len();
+                            obj.as_object_mut().map(|m| {
+                                m.insert("js".into(), serde_json::Value::String(String::new()));
+                                m.insert(
+                                    "deferred".into(),
+                                    serde_json::Value::Bool(true),
+                                );
+                                m.insert(
+                                    "byte_len".into(),
+                                    serde_json::Value::Number(len.into()),
+                                );
+                            });
+                        }
+                    }
+                }
+            }
+            Some(v)
+        })
+        .collect();
     Ok(CardShellManifestDto {
         character_id: stored.id.clone(),
-        shells: manifest
-            .shells
-            .iter()
-            .filter_map(|s| serde_json::to_value(s).ok())
-            .collect(),
+        shells,
         remote_urls: manifest.remote_urls.clone(),
         opening_home_url: manifest.opening_home_url().map(|s| s.to_string()),
         opening_custom_url: manifest.opening_custom_url().map(|s| s.to_string()),
         status_bar_url: manifest.status_bar_url().map(|s| s.to_string()),
         tavern_helper_count: manifest.tavern_helper_modules().len(),
     })
+}
+
+/// 按需取某条 TH inline JS 正文（manifest 里 deferred 的大脚本）。
+#[tauri::command]
+fn get_card_shell_inline_js(
+    character_id: String,
+    label: String,
+) -> Result<String, TauriCommandError> {
+    let stored = get_store()
+        .get(&character_id)
+        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    let character = stored_info_to_character(&stored);
+    let manifest = storyforge_domain::card_shell::extract_card_shell_manifest(&character);
+    for s in manifest.tavern_helper_modules() {
+        if s.label != label {
+            continue;
+        }
+        if let storyforge_domain::card_shell::CardShellEntry::InlineJs { js } = &s.entry {
+            return Ok(js.clone());
+        }
+    }
+    Err(TauriCommandError::not_found(format!(
+        "未找到 inline TH: {label}"
+    )))
 }
 
 #[tauri::command]
@@ -12082,6 +12133,7 @@ pub fn run() {
             set_campaign_world_info_route,
             get_character_world_info,
             get_card_shell_manifest,
+            get_card_shell_inline_js,
             card_shell_list_allowed_hosts,
             card_shell_allow_host,
             card_shell_fetch_url,

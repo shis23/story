@@ -188,6 +188,7 @@ const cardShellLabel = ref('')
 const cardShellLoading = ref(false)
 const cardShellShells = ref([])
 const cardShellThCount = ref(0)
+const cardShellCharacterId = ref(null)
 const shellVarAudit = createVariableWriteAudit(40)
 const shellVarAuditTick = ref(0)
 
@@ -220,6 +221,7 @@ async function refreshCardShellManifest() {
   cardShellLabel.value = ''
   cardShellShells.value = []
   cardShellThCount.value = 0
+  cardShellCharacterId.value = null
   let characterId =
     campaign.activeChar?.id ||
     campaign.activeCharDetail?.id ||
@@ -244,6 +246,7 @@ async function refreshCardShellManifest() {
     cardShellLabel.value = m?.character_id || characterId
     cardShellShells.value = Array.isArray(m?.shells) ? m.shells : []
     cardShellThCount.value = m?.tavern_helper_count || 0
+    cardShellCharacterId.value = characterId
   } catch (e) {
     console.error('getCardShellManifest:', e)
   } finally {
@@ -544,6 +547,7 @@ onMounted(async () => {
             <TavernHelperRuntime
               v-if="cardShellThCount"
               :shells="cardShellShells"
+              :character-id="cardShellCharacterId"
               :show-status="true"
               :auto-run="true"
               @var-write="onShellVarWrite"

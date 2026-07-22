@@ -53,12 +53,14 @@
  * No silent success: failures surface in status line.
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
-import { cardShellFetchUrl } from '../tauri-api.js'
+import { cardShellFetchUrl, getCardShellInlineJs } from '../tauri-api.js'
 import { orderedTavernHelperFromShells, collectVisibleThButtons } from '../utils/tavernHelperScripts.js'
 
 const props = defineProps({
   /** CardShellManifest.shells */
   shells: { type: Array, default: () => [] },
+  /** Character id for deferred inline JS fetch */
+  characterId: { type: String, default: null },
   /** Show status strip (default true for debug visibility) */
   showStatus: { type: Boolean, default: true },
   /** Auto-run when shells change */
@@ -375,12 +377,24 @@ async function runAll() {
     if (!win || typeof win.__sfThRunScripts !== 'function') {
       throw new Error('TH runner missing in iframe')
     }
-    const payload = scripts.value.map((s) => ({
-      kind: s.kind,
-      label: s.label,
-      url: s.url,
-      js: s.js,
-    }))
+    const payload = []
+    for (const s of scripts.value) {
+      let js = s.js
+      // deferred large inline: fetch on demand
+      if (s.kind === 'inline_js' && (!js || s.deferred) && props.characterId) {
+        try {
+          js = await getCardShellInlineJs(props.characterId, s.label)
+        } catch (e) {
+          throw new Error(`拉取 inline TH「${s.label}」失败: ${e?.message || e}`)
+        }
+      }
+      payload.push({
+        kind: s.kind,
+        label: s.label,
+        url: s.url,
+        js,
+      })
+    }
     const results = await win.__sfThRunScripts(payload)
     if (seq !== runSeq) return
     const failed = (results || []).filter((r) => !r.ok)
