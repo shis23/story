@@ -6,7 +6,6 @@ import PanelHost from '../shell/PanelHost.vue'
 import Button from '../ui/Button.vue'
 import Badge from '../ui/Badge.vue'
 import Toggle from '../ui/Toggle.vue'
-import DataList from '../ui/DataList.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 
@@ -19,19 +18,25 @@ const installJson = ref('')
 const installing = ref(false)
 const installError = ref('')
 const installSuccess = ref(false)
+/** 防止 Toggle 连点造成重入 */
+const togglingId = ref(null)
 
 async function loadPlugins() {
   loading.value = true
   try {
-    plugins.value = await listPlugins()
+    const list = await listPlugins()
+    plugins.value = Array.isArray(list) ? list : []
   } catch (e) {
     console.error('加载插件列表失败:', e)
+    plugins.value = []
+    // 浏览器无 Tauri 时不弹窗卡死，仅控制台
   } finally {
     loading.value = false
   }
 }
 
 async function doInstall() {
+  if (installing.value) return
   installError.value = ''
   installSuccess.value = false
   installing.value = true
@@ -39,6 +44,7 @@ async function doInstall() {
     await installPlugin(installJson.value)
     installSuccess.value = true
     installJson.value = ''
+    showInstall.value = false
     await loadPlugins()
   } catch (e) {
     installError.value = String(e)
@@ -58,12 +64,20 @@ async function doUninstall(plugin) {
   }
 }
 
-async function toggleEnabled(plugin) {
+async function toggleEnabled(plugin, next) {
+  if (togglingId.value === plugin.id) return
+  togglingId.value = plugin.id
+  const target = typeof next === 'boolean' ? next : !plugin.enabled
   try {
-    await setPluginEnabled(plugin.id, !plugin.enabled)
-    await loadPlugins()
+    await setPluginEnabled(plugin.id, target)
+    // 乐观更新，避免整表 loading 造成「卡死」感
+    const row = plugins.value.find((p) => p.id === plugin.id)
+    if (row) row.enabled = target
   } catch (e) {
     await alertDialog('操作失败: ' + e)
+    await loadPlugins()
+  } finally {
+    togglingId.value = null
   }
 }
 
@@ -73,7 +87,7 @@ onMounted(loadPlugins)
 <template>
   <PanelHost :show="true" title="插件管理" side="left" @close="emit('close')">
     <template #header>
-      <div class="flex items-center justify-between min-w-0 gap-2">
+      <div class="flex items-center justify-between min-w-0 gap-2 w-full pr-1">
         <h2 class="text-sm font-semibold text-ink truncate">插件管理</h2>
         <Button variant="default" size="sm" @click="showInstall = !showInstall">
           {{ showInstall ? '取消' : '安装插件' }}
@@ -82,95 +96,73 @@ onMounted(loadPlugins)
     </template>
 
     <!-- 安装区域 -->
-    <div v-if="showInstall" class="px-4 py-3 border-b border-line bg-surface/50 space-y-2">
+    <div v-if="showInstall" class="px-4 py-3 border-b border-line bg-surface-2/40 space-y-2">
       <div class="text-sm text-ink-soft">粘贴插件 manifest JSON：</div>
       <textarea
         v-model="installJson"
         class="w-full h-32 text-xs font-mono p-2 rounded border border-line bg-bg resize-none focus:outline-none focus:border-accent"
         placeholder='{ "id": "my-plugin", "name": "My Plugin", "version": "1.0.0", "entry_html": "<h1>Hello</h1>", ... }'
       />
-      <div class="flex justify-between items-center">
-        <div v-if="installError" class="text-xs text-err">{{ installError }}</div>
-        <div v-else-if="installSuccess" class="text-xs text-ok">✓ 安装成功</div>
+      <div class="flex justify-between items-center gap-2">
+        <div v-if="installError" class="text-xs text-err break-words min-w-0">{{ installError }}</div>
+        <div v-else-if="installSuccess" class="text-xs text-ok">安装成功</div>
         <Button
           variant="primary"
           size="md"
-          class="ml-auto"
+          class="ml-auto shrink-0"
           :loading="installing"
-          :disabled="!installJson.trim()"
+          :disabled="!installJson.trim() || installing"
           @click="doInstall"
         >{{ installing ? '安装中…' : '安装' }}</Button>
       </div>
     </div>
 
-    <!-- 插件列表 -->
-    <div class="p-4">
-      <LoadingState v-if="loading" />
+    <!-- 插件列表：不用 DataList 套卡片（避免双层边框 + 点击层干扰 Toggle） -->
+    <div class="p-4 space-y-3">
+      <LoadingState v-if="loading" label="加载插件…" />
 
       <EmptyState
         v-else-if="plugins.length === 0"
         title="暂无插件"
         description="点击上方「安装插件」添加"
-      >
-        <template #icon><span class="text-2xl">🧩</span></template>
-      </EmptyState>
+      />
 
-      <!-- 用 DataList 统一渲染插件项（插槽自定义） -->
-      <DataList
-        v-else
-        :items="plugins"
-        active-key="id"
-      >
-        <template #item="{ item }">
-          <div class="border border-line rounded-lg p-3 bg-surface">
-            <div class="flex items-start justify-between gap-2">
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2 flex-wrap">
-                  <span class="font-medium text-ink">{{ item.name }}</span>
-                  <Badge variant="neutral" size="sm">v{{ item.version }}</Badge>
-                  <Badge
-                    :variant="item.enabled ? 'ok' : 'neutral'"
-                    size="sm"
-                  >{{ item.enabled ? '已启用' : '已禁用' }}</Badge>
-                </div>
-                <div v-if="item.description" class="text-xs text-ink-soft mt-1 line-clamp-2">{{ item.description }}</div>
-                <div v-if="item.author" class="text-xs text-ink-faint mt-0.5">作者: {{ item.author }}</div>
+      <ul v-else class="space-y-2">
+        <li
+          v-for="item in plugins"
+          :key="item.id"
+          class="rounded-lg border border-line bg-surface p-3"
+        >
+          <div class="flex items-start justify-between gap-2">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="font-medium text-ink text-sm">{{ item.name }}</span>
+                <Badge variant="neutral" size="sm">v{{ item.version }}</Badge>
+                <Badge :variant="item.enabled ? 'ok' : 'neutral'" size="sm">
+                  {{ item.enabled ? '已启用' : '已禁用' }}
+                </Badge>
               </div>
-              <div class="flex items-center gap-2 shrink-0">
-                <Toggle
-                  :model-value="item.enabled"
-                  @update:model-value="toggleEnabled(item)"
-                />
-                <Button
-                  variant="danger"
-                  size="sm"
-                  @click="doUninstall(item)"
-                >卸载</Button>
-              </div>
+              <div v-if="item.description" class="text-xs text-ink-soft mt-1 line-clamp-2">{{ item.description }}</div>
+              <div v-if="item.author" class="text-xs text-ink-faint mt-0.5">作者: {{ item.author }}</div>
             </div>
-
-            <!-- 权限标签 -->
-            <div v-if="item.permissions?.length" class="flex flex-wrap gap-1 mt-2">
-              <Badge
-                v-for="perm in item.permissions"
-                :key="perm"
-                variant="accent"
-                size="sm"
-              >{{ perm }}</Badge>
-            </div>
-
-            <!-- UI 挂载点标签 -->
-            <div v-if="item.ui_slots?.length" class="flex flex-wrap gap-1 mt-1">
-              <Badge
-                v-for="slot in item.ui_slots"
-                :key="slot"
-                variant="neutral"
-                size="sm"
-              >📐 {{ slot }}</Badge>
+            <div class="flex items-center gap-2 shrink-0">
+              <Toggle
+                :model-value="!!item.enabled"
+                :disabled="togglingId === item.id"
+                @update:model-value="(v) => toggleEnabled(item, v)"
+              />
+              <Button variant="danger" size="sm" @click="doUninstall(item)">卸载</Button>
             </div>
           </div>
-        </template>
-      </DataList>
+
+          <div v-if="item.permissions?.length" class="flex flex-wrap gap-1 mt-2">
+            <Badge v-for="perm in item.permissions" :key="perm" variant="accent" size="sm">{{ perm }}</Badge>
+          </div>
+          <div v-if="item.ui_slots?.length" class="flex flex-wrap gap-1 mt-1">
+            <Badge v-for="slot in item.ui_slots" :key="slot" variant="neutral" size="sm">{{ slot }}</Badge>
+          </div>
+        </li>
+      </ul>
     </div>
   </PanelHost>
 </template>

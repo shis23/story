@@ -175,6 +175,19 @@ body {
   background-clip: padding-box;
 }
 
+/* ── 抽屉滚动井：底部可多拖一段 + 触控弹性（iOS rubber-band / overscroll） ── */
+.sf-drawer-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: auto;
+  scroll-padding-bottom: 3rem;
+}
+/* 桌面：滚到底时轻微回弹感（不依赖原生 rubber-band） */
+@supports (scroll-timeline: --sf none) {
+  .sf-drawer-scroll {
+    scroll-timeline: --sf y;
+  }
+}
+
 /* 选中文本 */
 ::selection {
   background: var(--color-accent-soft);

@@ -47,7 +47,8 @@ const form = reactive({
   extraJson: '',
 })
 
-const showAdvanced = ref(false)
+// 默认展开：抽屉底部有采样参数，折叠时用户常以为「没有」
+const showAdvanced = ref(true)
 const showKey = ref(false)
 const testing = ref(false)
 const testResult = ref(null)
@@ -427,39 +428,44 @@ async function handleSetActive(id) {
             </div>
           </div>
 
-          <!-- 高级（采样参数） -->
-          <div>
+          <!-- 采样参数（默认展开；抽屉可滚到底 + 底部留白） -->
+          <div class="rounded-lg border border-line bg-surface p-3 space-y-3">
             <button
+              type="button"
+              class="w-full flex items-center justify-between text-xs font-medium text-ink"
               @click="showAdvanced = !showAdvanced"
-              class="text-xs text-accent"
-            >{{ showAdvanced ? '▾ 收起采样参数' : '▸ 展开采样参数' }}</button>
-            <div v-if="showAdvanced" class="mt-2 grid grid-cols-3 gap-2">
-              <div class="space-y-1">
-                <label class="text-[10px] text-ink-soft">temperature</label>
-                <input v-model.number="form.temperature" type="number" step="0.1"
-                  class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
+            >
+              <span>采样参数</span>
+              <span class="text-ink-faint">{{ showAdvanced ? '收起' : '展开' }}</span>
+            </button>
+            <div v-show="showAdvanced" class="space-y-3">
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div class="space-y-1">
+                  <label class="text-[10px] text-ink-soft">temperature</label>
+                  <input v-model.number="form.temperature" type="number" step="0.1"
+                    class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1.5 text-xs text-ink focus:border-accent outline-none" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[10px] text-ink-soft">top_p</label>
+                  <input v-model.number="form.topP" type="number" step="0.05"
+                    class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1.5 text-xs text-ink focus:border-accent outline-none" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[10px] text-ink-soft">max_tokens（留空=默认）</label>
+                  <input v-model.number="form.maxTokens" type="number" min="1" step="256" placeholder="留空"
+                    class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1.5 text-xs text-ink focus:border-accent outline-none" />
+                </div>
               </div>
               <div class="space-y-1">
-                <label class="text-[10px] text-ink-soft">top_p</label>
-                <input v-model.number="form.topP" type="number" step="0.05"
-                  class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
+                <label class="text-[10px] text-ink-soft">扩展参数 JSON（thinking / reasoning_effort 等）</label>
+                <textarea
+                  v-model="form.extraJson"
+                  rows="2"
+                  placeholder='{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
+                  class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1.5 text-xs text-ink font-mono focus:border-accent outline-none"
+                ></textarea>
+                <div v-if="extraParseError" class="text-[10px] text-err">{{ extraParseError }}</div>
               </div>
-              <div class="space-y-1">
-                <label class="text-[10px] text-ink-soft">max_tokens（留空=模型默认）</label>
-                <input v-model.number="form.maxTokens" type="number" min="1" step="256" placeholder="留空"
-                  class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink focus:border-accent outline-none" />
-              </div>
-            </div>
-            <!-- P3-3：厂商扩展参数（thinking/reasoning_effort 等）-->
-            <div class="mt-2 space-y-1">
-              <label class="text-[10px] text-ink-soft">扩展参数 JSON（透传到请求体顶层，如 thinking / reasoning_effort）</label>
-              <textarea
-                v-model="form.extraJson"
-                rows="2"
-                placeholder='{"thinking":{"type":"enabled"},"reasoning_effort":"max"}'
-                class="w-full bg-surface-2 border border-line rounded-lg px-2 py-1 text-xs text-ink font-mono focus:border-accent outline-none"
-              ></textarea>
-              <div v-if="extraParseError" class="text-[10px] text-err">{{ extraParseError }}</div>
             </div>
           </div>
 

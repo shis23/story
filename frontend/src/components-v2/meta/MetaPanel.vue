@@ -73,6 +73,7 @@ function onMvuApplied() {
     title=""
     side="left"
     :show-chrome="false"
+    :body-scroll="false"
     @close="emit('close')"
   >
     <MetaScreen

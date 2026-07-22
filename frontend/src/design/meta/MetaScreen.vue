@@ -70,9 +70,9 @@ defineEmits(['close', 'change-tab'])
       </button>
     </nav>
 
-    <!-- 统一内容井：所有 tab 同宽同垫，禁止子项横向撑开 -->
-    <div class="flex-1 min-h-0 min-w-0 overflow-y-auto bg-bg">
-      <div class="w-full min-w-0 p-4">
+    <!-- 统一内容井：弹性滚动 + 底部留白；tab 同宽同垫 -->
+    <div class="sf-drawer-scroll flex-1 min-h-0 min-w-0 overflow-y-auto overscroll-y-contain bg-bg">
+      <div class="w-full min-w-0 p-4 pb-12">
         <slot :active-tab="activeTab" />
       </div>
     </div>

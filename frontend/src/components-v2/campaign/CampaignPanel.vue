@@ -357,7 +357,7 @@ defineExpose({ refreshActiveDetailTab })
 
 <template>
   <!-- 全宽活动管理（对齐 selected 图④）；深度 Tab 经 #detail 注入，保留 MVU/变量编辑 -->
-  <PanelHost :show="true" title="" side="full" @close="emit('close')">
+  <PanelHost :show="true" title="" side="full" :show-chrome="false" :body-scroll="false" @close="emit('close')">
     <CampaignScreen
       class="h-full"
       :mode="shellMode"

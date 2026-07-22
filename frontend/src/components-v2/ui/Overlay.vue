@@ -160,7 +160,14 @@ const overlayTransition = {
               </button>
             </div>
 
-            <div class="flex-1 min-h-0 min-w-0 overflow-auto">
+            <!-- 侧滑：overflow-hidden 交给 PanelHost 内容井滚动，避免双滚动抢手势；
+                 居中/全屏：自身可滚 -->
+            <div
+              class="flex-1 min-h-0 min-w-0 flex flex-col"
+              :class="side === 'left' || side === 'right' || side === 'full'
+                ? 'overflow-hidden'
+                : 'overflow-y-auto overscroll-y-contain sf-drawer-scroll'"
+            >
               <slot :close="() => (isOpen = false)" />
             </div>
           </DialogPanel>
