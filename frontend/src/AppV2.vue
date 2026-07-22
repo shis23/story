@@ -60,7 +60,7 @@ import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
 import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
 import { useOverviewScreenAdapter } from './adapter/useOverviewScreenAdapter.js'
-import RichContent from './components-v2/st/RichContent.vue'
+import ShellAwareContent from './components-v2/st/ShellAwareContent.vue'
 import {
   useWritingStore,
   useCampaignStore,
@@ -357,7 +357,7 @@ const { openNewCampaignDialog } = newCampaignForm
   // 9. writing screen adapter —— design/writing 纯展示层接线
   const { screenProps: writingScreenProps, screenEvents: writingScreenEvents } =
     useWritingScreenAdapter({
-      contentComponent: RichContent,
+      contentComponent: ShellAwareContent,
       startWriting,
       cancelWriting,
       selectGreeting: greeting.selectGreeting,
