@@ -5659,38 +5659,7 @@ async fn create_connection(
     req: CreateConnectionDto,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<String, TauriCommandError> {
-    let protocol = parse_protocol(&req.protocol)?;
-    let tool_mode = parse_tool_mode(&req.tool_mode)?;
-
-    let conn = LlmConnection {
-        id: Id::new(),
-        name: req.name,
-        base_url: req.base_url,
-        api_key: req.api_key,
-        model: req.model,
-        protocol,
-        params: SamplingParams {
-            temperature: req.temperature,
-            top_p: req.top_p,
-            max_tokens: req.max_tokens,
-            max_tokens_explicit: req.max_tokens_explicit,
-            reasoning: req
-                .reasoning
-                .as_deref()
-                .map(|s| match s {
-                    "native" | "Native" => storyforge_domain::llm::ReasoningMode::Native,
-                    "prompted" | "Prompted" => storyforge_domain::llm::ReasoningMode::Prompted,
-                    "disabled" | "Disabled" | "off" | "none" => {
-                        storyforge_domain::llm::ReasoningMode::Disabled
-                    }
-                    _ => storyforge_domain::llm::ReasoningMode::Disabled,
-                })
-                // 新建连接默认 Prompted（与 SamplingParams::default 一致）
-                .unwrap_or(storyforge_domain::llm::ReasoningMode::Disabled),
-            extra: req.extra,
-        },
-        tool_mode,
-    };
+    let conn = llm_connection_from_create_dto(req, Id::new())?;
 
     // 预先验证：构造 client 看是否成功（base_url 格式等）
     // 注意：不实际发请求，只验证能构造出 client
@@ -5698,6 +5667,71 @@ async fn create_connection(
         .map_err(|e| TauriCommandError::llm(format!("连接配置无效: {e}"), false))?;
 
     create_connection_with_store_async(state.inner().clone(), get_conn_store(), conn).await
+}
+
+/// 更新连接请求 DTO。`api_key` 为空字符串时保留原密钥。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConnectionDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub protocol: String,
+    pub model: String,
+    /// 空串 = 不改 key；非空 = 覆盖写入 SecretStore
+    #[serde(default)]
+    pub api_key: String,
+    pub tool_mode: String,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_tokens_explicit: bool,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// 编辑用连接详情（永不返回真实 api_key）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionEditDetailDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    /// 前端表单用小写："openai" / "anthropic" / ...
+    pub protocol: String,
+    pub tool_mode: String,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub max_tokens_explicit: bool,
+    pub reasoning: String,
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
+    pub has_api_key: bool,
+    pub active: bool,
+}
+
+/// 获取单条连接详情供编辑（不含 api_key 明文）。
+#[tauri::command]
+fn get_connection(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<ConnectionEditDetailDto, TauriCommandError> {
+    let active_id = state.active_conn_id();
+    let stored = get_conn_store()
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id}")))?;
+    Ok(connection_edit_detail_from_stored(
+        &stored,
+        active_id.as_deref() == Some(stored.id.as_str()),
+    ))
+}
+
+/// 更新已有连接。`api_key` 为空时保留原密钥。若该连接当前活跃，同步刷新内存 client。
+#[tauri::command]
+async fn update_connection(
+    req: UpdateConnectionDto,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    update_connection_with_store_async(state.inner().clone(), get_conn_store(), req).await
 }
 
 /// 删除连接（若为活跃的，同时清除活跃状态）
@@ -5769,6 +5803,162 @@ async fn create_connection_with_store_async(
     }
 
     Ok(conn_id)
+}
+
+async fn update_connection_with_store_async(
+    state: Arc<AppState>,
+    conn_store: Arc<ConnectionStore>,
+    req: UpdateConnectionDto,
+) -> Result<(), TauriCommandError> {
+    let id = req.id.trim().to_string();
+    if id.is_empty() {
+        return Err(TauriCommandError::validation("连接 id 不能为空"));
+    }
+    // api_key 可为空（保留原密钥）；其它字段与 create 相同校验
+    let draft = llm_connection_from_update_dto(req)?;
+    // 先用「保留/新 key」解析出可构造 client 的运行时配置再落盘
+    // 空 key：取现有 resolved key 仅用于 create_client 校验，不写回明文
+    let key_for_validate = if draft.api_key.trim().is_empty() {
+        conn_store
+            .resolved(&id)
+            .map_err(TauriCommandError::from)?
+            .ok_or_else(|| TauriCommandError::not_found(format!("连接不存在: {id}")))?
+            .api_key
+    } else {
+        draft.api_key.clone()
+    };
+    let mut validate_conn = draft.clone();
+    validate_conn.api_key = key_for_validate;
+    storyforge_infra_llm::create_client(&validate_conn)
+        .map_err(|e| TauriCommandError::llm(format!("连接配置无效: {e}"), false))?;
+
+    let _guard = state.active_connection_update.lock().await;
+    let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
+    let id_for_io = id.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        conn_store
+            .update_existing(&id_for_io, draft)
+            .map_err(|e| {
+                if e.contains("不存在") {
+                    TauriCommandError::not_found(e)
+                } else {
+                    TauriCommandError::storage(format!("存储写入失败: {e}"))
+                }
+            })
+    })
+    .await
+    .map_err(|e| TauriCommandError::internal(format!("更新连接持久化任务失败: {e}")))??;
+
+    if was_active {
+        state.apply_active_connection(&id, resolved)?;
+    }
+    Ok(())
+}
+
+fn llm_connection_from_create_dto(
+    req: CreateConnectionDto,
+    id: Id,
+) -> Result<LlmConnection, TauriCommandError> {
+    let protocol = parse_protocol(&req.protocol)?;
+    let tool_mode = parse_tool_mode(&req.tool_mode)?;
+    Ok(LlmConnection {
+        id,
+        name: req.name,
+        base_url: req.base_url,
+        api_key: req.api_key,
+        model: req.model,
+        protocol,
+        params: SamplingParams {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_tokens: req.max_tokens,
+            max_tokens_explicit: req.max_tokens_explicit,
+            reasoning: parse_reasoning_mode(req.reasoning.as_deref()),
+            extra: req.extra,
+        },
+        tool_mode,
+    })
+}
+
+fn llm_connection_from_update_dto(req: UpdateConnectionDto) -> Result<LlmConnection, TauriCommandError> {
+    let protocol = parse_protocol(&req.protocol)?;
+    let tool_mode = parse_tool_mode(&req.tool_mode)?;
+    Ok(LlmConnection {
+        id: Id::from_str(&req.id),
+        name: req.name,
+        base_url: req.base_url,
+        api_key: req.api_key,
+        model: req.model,
+        protocol,
+        params: SamplingParams {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_tokens: req.max_tokens,
+            max_tokens_explicit: req.max_tokens_explicit,
+            reasoning: parse_reasoning_mode(req.reasoning.as_deref()),
+            extra: req.extra,
+        },
+        tool_mode,
+    })
+}
+
+fn parse_reasoning_mode(s: Option<&str>) -> storyforge_domain::llm::ReasoningMode {
+    match s {
+        Some("native") | Some("Native") => storyforge_domain::llm::ReasoningMode::Native,
+        Some("prompted") | Some("Prompted") => storyforge_domain::llm::ReasoningMode::Prompted,
+        Some("disabled") | Some("Disabled") | Some("off") | Some("none") => {
+            storyforge_domain::llm::ReasoningMode::Disabled
+        }
+        // 与 create 路径一致：缺省 Disabled
+        _ => storyforge_domain::llm::ReasoningMode::Disabled,
+    }
+}
+
+fn protocol_to_form_str(p: &LlmProtocol) -> String {
+    match p {
+        LlmProtocol::OpenAi => "openai".into(),
+        LlmProtocol::Anthropic => "anthropic".into(),
+        LlmProtocol::Gemini => "gemini".into(),
+        LlmProtocol::Custom(s) => format!("custom:{s}"),
+    }
+}
+
+fn tool_mode_to_form_str(m: &ToolMode) -> String {
+    match m {
+        ToolMode::Native => "native".into(),
+        ToolMode::TextFallback => "text_fallback".into(),
+    }
+}
+
+fn reasoning_mode_to_form_str(m: &storyforge_domain::llm::ReasoningMode) -> String {
+    match m {
+        storyforge_domain::llm::ReasoningMode::Native => "native".into(),
+        storyforge_domain::llm::ReasoningMode::Prompted => "prompted".into(),
+        storyforge_domain::llm::ReasoningMode::Disabled => "disabled".into(),
+    }
+}
+
+fn connection_edit_detail_from_stored(
+    stored: &connection_store::StoredConnection,
+    active: bool,
+) -> ConnectionEditDetailDto {
+    let c = &stored.connection;
+    ConnectionEditDetailDto {
+        id: stored.id.clone(),
+        name: c.name.clone(),
+        base_url: c.base_url.clone(),
+        model: c.model.clone(),
+        protocol: protocol_to_form_str(&c.protocol),
+        tool_mode: tool_mode_to_form_str(&c.tool_mode),
+        temperature: c.params.temperature,
+        top_p: c.params.top_p,
+        max_tokens: c.params.max_tokens,
+        max_tokens_explicit: c.params.max_tokens_explicit,
+        reasoning: reasoning_mode_to_form_str(&c.params.reasoning),
+        extra: c.params.extra.clone(),
+        has_api_key: !c.api_key.is_empty(),
+        active,
+    }
 }
 
 async fn delete_connection_with_store_async(
@@ -11174,7 +11364,9 @@ pub fn run() {
             list_connection_templates,
             list_connections,
             get_active_connection,
+            get_connection,
             create_connection,
+            update_connection,
             delete_connection,
             set_active_connection,
             test_connection,
@@ -13885,6 +14077,112 @@ mod tests {
             reloaded.active_connection().unwrap().id.as_str(),
             "created-first"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_connection_async_keeps_key_and_refreshes_active() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_update_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        let conn = make_test_llm_connection("edit-active", "edit-secret-old");
+        create_connection_with_store_async(state.clone(), store.clone(), conn)
+            .await
+            .unwrap();
+        assert_eq!(state.active_conn_id().as_deref(), Some("edit-active"));
+
+        update_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            UpdateConnectionDto {
+                id: "edit-active".into(),
+                name: "renamed-active".into(),
+                base_url: "https://api.example.com/v1/chat/completions".into(),
+                protocol: "openai".into(),
+                model: "new-model".into(),
+                api_key: String::new(), // 留空保留原 key
+                tool_mode: "native".into(),
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                max_tokens: None,
+                max_tokens_explicit: false,
+                reasoning: Some("disabled".into()),
+                extra: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = store.get("edit-active").unwrap();
+        assert_eq!(stored.connection.name, "renamed-active");
+        assert_eq!(stored.connection.model, "new-model");
+        assert!(is_secret_ref(&stored.connection.api_key));
+        assert_eq!(
+            store.resolved("edit-active").unwrap().unwrap().api_key,
+            "edit-secret-old"
+        );
+        assert_eq!(state.active_conn_id().as_deref(), Some("edit-active"));
+
+        let raw = std::fs::read_to_string(dir.join("connections.json")).unwrap();
+        assert!(!raw.contains("edit-secret-old"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_update_connection_async_replaces_key_when_provided() {
+        let state = Arc::new(AppState::new_for_test());
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_conn_async_update_key_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_store = Arc::new(MemorySecretStore::default());
+        let store = Arc::new(ConnectionStore::new_with_secret_store(
+            &dir,
+            secret_store.clone(),
+        ));
+        store
+            .save(make_test_llm_connection("edit-key", "old-secret"))
+            .unwrap();
+
+        update_connection_with_store_async(
+            state.clone(),
+            store.clone(),
+            UpdateConnectionDto {
+                id: "edit-key".into(),
+                name: "edit-key".into(),
+                base_url: "https://api.example.com/v1/chat/completions".into(),
+                protocol: "openai".into(),
+                model: "test-model".into(),
+                api_key: "new-secret".into(),
+                tool_mode: "native".into(),
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                max_tokens_explicit: false,
+                reasoning: None,
+                extra: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.resolved("edit-key").unwrap().unwrap().api_key,
+            "new-secret"
+        );
+        // 非活跃更新不应误设 active
+        assert!(state.active_conn_id().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

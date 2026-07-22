@@ -101,6 +101,35 @@ impl ConnectionStore {
         Ok(stored)
     }
 
+    /// 更新已有连接。`connection.api_key` 为空时保留原 SecretRef / 明文 key。
+    ///
+    /// 返回解析后的运行时连接（含真实 api_key），供活跃连接热刷新 client。
+    pub fn update_existing(
+        &self,
+        id: &str,
+        mut connection: LlmConnection,
+    ) -> Result<LlmConnection, String> {
+        let existing = self
+            .get(id)
+            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        connection.id = storyforge_domain::Id::from_str(id);
+        if connection.api_key.trim().is_empty() {
+            // 保留磁盘上的 SecretRef，避免空串把 key 清掉
+            connection.api_key = existing.connection.api_key;
+        }
+        self.save(connection)?;
+        self.resolved(id)?
+            .ok_or_else(|| format!("连接不存在: {id}"))
+    }
+
+    /// 读取并解析为运行时连接（SecretRef → 真实 key）。不含 key 的展示请用 `get`。
+    pub fn resolved(&self, id: &str) -> Result<Option<LlmConnection>, String> {
+        match self.get(id) {
+            Some(stored) => Ok(Some(self.resolve_connection(&stored.connection)?)),
+            None => Ok(None),
+        }
+    }
+
     /// 列出所有连接
     pub fn list(&self) -> Vec<StoredConnection> {
         self.inner
@@ -473,5 +502,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_existing_keeps_key_when_api_key_empty() {
+        let (store, secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("edit-me")).unwrap();
+        let secret_ref = store.get("edit-me").unwrap().connection.api_key.clone();
+
+        let mut next = make_conn("edit-me");
+        next.name = "renamed".into();
+        next.model = "deepseek-v3".into();
+        next.api_key = String::new(); // 留空 = 不改 key
+        let resolved = store.update_existing("edit-me", next).unwrap();
+
+        assert_eq!(resolved.name, "renamed");
+        assert_eq!(resolved.model, "deepseek-v3");
+        assert_eq!(resolved.api_key, "sk-test");
+        assert_eq!(
+            store.get("edit-me").unwrap().connection.api_key,
+            secret_ref
+        );
+        assert_eq!(
+            secret_store.get_secret(&secret_ref).unwrap(),
+            "sk-test"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_existing_replaces_key_when_provided() {
+        let (store, secret_store, dir) = temp_store_with_secret_store();
+        store.save(make_conn("edit-key")).unwrap();
+        let secret_ref = store.get("edit-key").unwrap().connection.api_key.clone();
+
+        let mut next = make_conn("edit-key");
+        next.api_key = "sk-new-key".into();
+        let resolved = store.update_existing("edit-key", next).unwrap();
+
+        assert_eq!(resolved.api_key, "sk-new-key");
+        assert_eq!(
+            secret_store.get_secret(&secret_ref).unwrap(),
+            "sk-new-key",
+            "same SecretRef 槽位覆盖为新 key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_existing_missing_id_errors() {
+        let store = temp_store();
+        let err = store
+            .update_existing("nope", make_conn("nope"))
+            .unwrap_err();
+        assert!(err.contains("不存在"), "err={err}");
     }
 }

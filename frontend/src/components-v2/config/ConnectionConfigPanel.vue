@@ -4,7 +4,9 @@ import { confirmDialog } from '../../components/base/BaseDialog.js'
 import {
   listConnectionTemplates,
   listConnections,
+  getConnection,
   createConnection,
+  updateConnection,
   deleteConnection,
   setActiveConnection,
   testConnection,
@@ -47,6 +49,11 @@ const form = reactive({
   extraJson: '',
 })
 
+// 编辑模式：非空时表单更新已有连接（apiKey 空 = 保留原密钥）
+const editingId = ref(null)
+const editingHasKey = ref(false)
+const loadingEdit = ref(false)
+
 // 默认展开：抽屉底部有采样参数，折叠时用户常以为「没有」
 const showAdvanced = ref(true)
 const showKey = ref(false)
@@ -55,6 +62,18 @@ const testResult = ref(null)
 const saving = ref(false)
 const error = ref('')
 const extraParseError = ref('')
+
+const isEditing = computed(() => !!editingId.value)
+const formTitle = computed(() => (isEditing.value ? '编辑连接' : '新建连接'))
+const saveLabel = computed(() => {
+  if (saving.value) return isEditing.value ? '保存中…' : '保存中…'
+  return isEditing.value ? '保存修改' : '保存'
+})
+const apiKeyPlaceholder = computed(() => {
+  if (isEditing.value && editingHasKey.value) return '已保存密钥（留空不改）'
+  if (isEditing.value) return 'sk-...（此连接尚无密钥）'
+  return 'sk-...'
+})
 
 // 把 extraJson 文本解析为对象（空串=不传）。解析失败设 extraParseError 并返回 null。
 function parseExtraParams() {
@@ -172,14 +191,81 @@ function applyTemplate(t) {
 }
 
 function selectTemplate(t) {
+  if (isEditing.value) return // 编辑模式不覆盖已有字段
   applyTemplate(t)
   testResult.value = null
 }
 
+function resetFormToCreateDefaults() {
+  editingId.value = null
+  editingHasKey.value = false
+  form.templateId = templates.value[0]?.id || 'deepseek'
+  form.name = ''
+  form.baseUrl = templates.value[0]?.base_url || ''
+  form.protocol = 'openai'
+  form.model = templates.value[0]?.default_model || ''
+  form.apiKey = ''
+  form.toolMode = 'native'
+  form.temperature = 1.0
+  form.topP = 0.95
+  form.maxTokens = null
+  form.reasoning = 'disabled'
+  form.extraJson = ''
+  fetchedModels.value = []
+  testResult.value = null
+  extraParseError.value = ''
+  error.value = ''
+  if (templates.value[0]) applyTemplate(templates.value[0])
+}
+
+function cancelEdit() {
+  resetFormToCreateDefaults()
+}
+
+async function startEdit(id) {
+  loadingEdit.value = true
+  error.value = ''
+  testResult.value = null
+  try {
+    const detail = await getConnection(id)
+    if (!detail) {
+      error.value = '连接不存在或已删除'
+      return
+    }
+    editingId.value = detail.id
+    editingHasKey.value = !!detail.has_api_key
+    form.name = detail.name || ''
+    form.baseUrl = detail.base_url || ''
+    form.protocol = detail.protocol || 'openai'
+    form.model = detail.model || ''
+    form.apiKey = '' // 永不回填明文 key
+    form.toolMode = detail.tool_mode || 'native'
+    form.temperature = detail.temperature ?? 1.0
+    form.topP = detail.top_p ?? 0.95
+    form.maxTokens = detail.max_tokens ?? null
+    form.reasoning = detail.reasoning || 'disabled'
+    form.extraJson = detail.extra ? JSON.stringify(detail.extra, null, 2) : ''
+    fetchedModels.value = []
+    showAdvanced.value = true
+  } catch (e) {
+    error.value = '加载连接失败: ' + e
+  } finally {
+    loadingEdit.value = false
+  }
+}
+
 // 测试连接（用当前表单的临时配置，不持久化）
 async function handleTest() {
-  if (!form.baseUrl || !form.apiKey || !form.model) {
-    error.value = '请先填完 base_url / model / api_key'
+  if (!form.baseUrl || !form.model) {
+    error.value = '请先填完 base_url / model'
+    return
+  }
+  if (!form.apiKey) {
+    if (isEditing.value && editingHasKey.value) {
+      error.value = '测试连通性需要填入 API Key（编辑时不会回显已保存密钥）'
+    } else {
+      error.value = '请先填完 base_url / model / api_key'
+    }
     return
   }
   testing.value = true
@@ -201,14 +287,23 @@ async function handleTest() {
   }
 }
 
-// 保存连接
+// 保存连接（新建或更新）
 async function handleSave() {
   if (!form.name.trim()) {
     error.value = '请填写连接名称'
     return
   }
-  if (!form.baseUrl.trim() || !form.apiKey.trim() || !form.model.trim()) {
-    error.value = '请填写 base_url / model / api_key'
+  if (!form.baseUrl.trim() || !form.model.trim()) {
+    error.value = '请填写 base_url / model'
+    return
+  }
+  // 新建必须填 key；编辑可留空表示保留原 key
+  if (!isEditing.value && !form.apiKey.trim()) {
+    error.value = '请填写 api_key'
+    return
+  }
+  if (isEditing.value && !form.apiKey.trim() && !editingHasKey.value) {
+    error.value = '此连接尚无密钥，请填写 api_key'
     return
   }
   // 解析扩展参数 JSON（失败则阻断保存）
@@ -229,8 +324,7 @@ async function handleSave() {
   saving.value = true
   error.value = ''
   try {
-    await createConnection({
-      templateId: form.templateId,
+    const payload = {
       name: form.name,
       baseUrl: form.baseUrl,
       protocol: form.protocol,
@@ -243,13 +337,20 @@ async function handleSave() {
       maxTokensExplicit: maxTokens !== null,
       reasoning,
       extra,
-    })
+    }
+    if (isEditing.value) {
+      await updateConnection({ id: editingId.value, ...payload })
+    } else {
+      await createConnection({
+        templateId: form.templateId,
+        ...payload,
+      })
+    }
     await loadConnections()
-    form.name = ''
-    form.apiKey = ''
+    resetFormToCreateDefaults()
     emit('changed')
   } catch (e) {
-    error.value = '保存失败: ' + e
+    error.value = (isEditing.value ? '更新失败: ' : '保存失败: ') + e
   } finally {
     saving.value = false
   }
@@ -260,6 +361,9 @@ async function handleDelete(id) {
   if (!ok) return
   try {
     await deleteConnection(id)
+    if (editingId.value === id) {
+      resetFormToCreateDefaults()
+    }
     await loadConnections()
     emit('changed')
   } catch (e) {
@@ -296,7 +400,10 @@ async function handleSetActive(id) {
             v-for="c in connections"
             :key="c.id"
             class="flex items-center gap-2 p-2.5 rounded-lg border"
-            :class="c.active ? 'border-accent bg-accent-soft/40' : 'border-line bg-surface'"
+            :class="[
+              c.active ? 'border-accent bg-accent-soft/40' : 'border-line bg-surface',
+              editingId === c.id ? 'ring-1 ring-accent/50' : '',
+            ]"
           >
             <div class="flex-1 min-w-0">
               <div class="text-sm text-ink truncate">{{ c.name }}</div>
@@ -309,6 +416,12 @@ async function handleSetActive(id) {
               @click="handleSetActive(c.id)"
             >设为活跃</Button>
             <Badge v-else variant="accent" size="sm">● 活跃</Badge>
+            <Button
+              variant="default"
+              size="sm"
+              :loading="loadingEdit && editingId === c.id"
+              @click="startEdit(c.id)"
+            >编辑</Button>
             <Button
               variant="danger"
               size="sm"
@@ -326,12 +439,20 @@ async function handleSetActive(id) {
         <!-- 分隔 -->
         <div class="border-t border-line"></div>
 
-        <!-- 新建连接表单 -->
+        <!-- 新建 / 编辑表单 -->
         <div class="space-y-3">
-          <div class="text-xs text-ink-soft">新建连接</div>
+          <div class="flex items-center justify-between gap-2">
+            <div class="text-xs text-ink-soft">{{ formTitle }}</div>
+            <Button
+              v-if="isEditing"
+              variant="ghost"
+              size="sm"
+              @click="cancelEdit"
+            >取消编辑</Button>
+          </div>
 
-          <!-- 模板选择 -->
-          <div>
+          <!-- 模板选择（仅新建） -->
+          <div v-if="!isEditing">
             <div class="text-[11px] text-ink-soft mb-1.5">从模板选择</div>
             <div class="flex flex-wrap gap-1.5">
               <button
@@ -344,6 +465,12 @@ async function handleSetActive(id) {
                   : 'bg-surface-2 text-ink-soft hover:border-accent-border'"
               >{{ t.name }}</button>
             </div>
+          </div>
+          <div
+            v-else
+            class="text-[10px] text-ink-faint rounded-md border border-line bg-surface-2/60 px-2.5 py-2"
+          >
+            正在编辑「{{ form.name || '未命名' }}」。API Key 不会回显；留空保存表示保留原密钥，填新值则覆盖。
           </div>
 
           <!-- 名称 -->
@@ -409,12 +536,15 @@ async function handleSetActive(id) {
 
           <!-- api_key -->
           <div class="space-y-1">
-            <label class="text-[11px] text-ink-soft">API Key</label>
+            <label class="text-[11px] text-ink-soft">
+              API Key
+              <span v-if="isEditing && editingHasKey" class="text-ink-faint font-normal">（可选）</span>
+            </label>
             <div class="relative">
               <input
                 v-model="form.apiKey"
                 :type="showKey ? 'text' : 'password'"
-                placeholder="sk-..."
+                :placeholder="apiKeyPlaceholder"
                 class="w-full bg-surface-2 border border-line rounded-lg px-3 py-1.5 pr-10 text-sm text-ink placeholder:text-ink-faint font-mono focus:border-accent outline-none"
               />
               <button
@@ -423,7 +553,7 @@ async function handleSetActive(id) {
                 :title="showKey ? '隐藏' : '显示'"
               >{{ showKey ? '🙈' : '👁' }}</button>
             </div>
-            <div v-if="selectedTemplate?.get_key_hint" class="text-[10px] text-ink-faint mt-1">
+            <div v-if="!isEditing && selectedTemplate?.get_key_hint" class="text-[10px] text-ink-faint mt-1">
               {{ selectedTemplate.get_key_hint }}
             </div>
           </div>
@@ -498,7 +628,7 @@ async function handleSetActive(id) {
               class="flex-1"
               :loading="saving"
               @click="handleSave"
-            >{{ saving ? '保存中…' : '保存' }}</Button>
+            >{{ saveLabel }}</Button>
           </div>
         </div>
       </template>

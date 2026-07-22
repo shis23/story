@@ -380,10 +380,10 @@ export async function getActiveConnection() {
 }
 
 /**
- * 创建连接
- * @param {Object} req - { templateId?, name, baseUrl, protocol, model, apiKey, toolMode, temperature?, topP?, maxTokens?, reasoning?, extra? }
- * @returns {Promise<string>} 新连接 id
- */
+   * 创建连接
+   * @param {Object} req - { templateId?, name, baseUrl, protocol, model, apiKey, toolMode, temperature?, topP?, maxTokens?, reasoning?, extra? }
+   * @returns {Promise<string>} 新连接 id
+   */
 export async function createConnection(req) {
   if (isTauri()) {
     return await invoke('create_connection', {
@@ -406,6 +406,48 @@ export async function createConnection(req) {
     })
   }
   return 'mock-conn-id'
+}
+
+/**
+ * 获取单条连接详情供编辑（不含 api_key 明文）
+ * @returns {Promise<null | {
+ *   id: string, name: string, base_url: string, model: string,
+ *   protocol: string, tool_mode: string, temperature?: number, top_p?: number,
+ *   max_tokens?: number, max_tokens_explicit: boolean, reasoning: string,
+ *   extra?: object, has_api_key: boolean, active: boolean
+ * }>}
+ */
+export async function getConnection(id) {
+  if (isTauri()) {
+    return await invoke('get_connection', { id })
+  }
+  return null
+}
+
+/**
+ * 更新已有连接。apiKey 空串 = 保留原密钥。
+ * @param {Object} req - { id, name, baseUrl, protocol, model, apiKey?, toolMode, temperature?, topP?, maxTokens?, maxTokensExplicit?, reasoning?, extra? }
+ */
+export async function updateConnection(req) {
+  if (isTauri()) {
+    return await invoke('update_connection', {
+      req: {
+        id: req.id,
+        name: req.name,
+        base_url: req.baseUrl,
+        protocol: req.protocol,
+        model: req.model,
+        api_key: req.apiKey ?? '',
+        tool_mode: req.toolMode,
+        temperature: req.temperature ?? null,
+        top_p: req.topP ?? null,
+        max_tokens: req.maxTokens ?? null,
+        max_tokens_explicit: req.maxTokensExplicit ?? false,
+        reasoning: req.reasoning ?? 'disabled',
+        extra: req.extra ?? null,
+      },
+    })
+  }
 }
 
 /** 删除连接 */
