@@ -238,6 +238,12 @@ impl CardProject {
         };
         let novel_text = novel_text.into();
         let excerpts = sample_novel_excerpts(&novel_text, 12_000);
+        // Keep full text only when small; large novels rely on excerpts for prefill/re-run.
+        let stored_full_text = if novel_text.chars().count() > 80_000 {
+            None
+        } else {
+            Some(novel_text)
+        };
         let mut artifacts = CardArtifacts::default();
         artifacts.notes = if brief.trim().is_empty() {
             format!("小说改编：{}", novel_title)
@@ -269,7 +275,7 @@ impl CardProject {
             imported_character_id: None,
             source_character_id: None,
             source_stored_id: None,
-            novel_text: Some(novel_text),
+            novel_text: stored_full_text,
             novel_title: Some(novel_title),
             novel_excerpts: excerpts,
             created_at: now.clone(),
@@ -1692,9 +1698,20 @@ mod tests {
         assert_eq!(p.current_stage, STAGE_BASIC);
         assert!(!p.novel_excerpts.is_empty());
         assert_eq!(p.novel_title.as_deref(), Some("夜行录"));
+        // 1.2 万字级仍保留全文
+        assert!(p.novel_text.is_some());
         let prompt = build_novel_prefill_prompt(&p).expect("prefill prompt");
         assert!(prompt.contains("小说改编写卡预填师") || prompt.contains("预填"));
         assert!(prompt.contains("夜行录"));
+    }
+
+    #[test]
+    fn large_novel_drops_full_text_keeps_excerpts() {
+        let novel = "章".repeat(100_000);
+        let p = CardProject::new_from_novel("大书", "", "巨著", novel);
+        assert!(p.novel_text.is_none());
+        assert!(!p.novel_excerpts.is_empty());
+        assert!(build_novel_prefill_prompt(&p).is_ok());
     }
 
     #[test]

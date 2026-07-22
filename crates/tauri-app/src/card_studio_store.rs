@@ -101,4 +101,19 @@ mod tests {
         assert!(store.delete(&id).unwrap());
         assert!(store.get(&id).is_none());
     }
+
+    #[test]
+    fn novel_project_roundtrip_without_full_text_when_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CardStudioStore::new(dir.path());
+        let novel = "测".repeat(90_000);
+        let p = CardProject::new_from_novel("大书项目", "改编", "巨著", novel);
+        assert!(p.novel_text.is_none());
+        assert!(!p.novel_excerpts.is_empty());
+        let id = p.id.clone();
+        store.insert(p).unwrap();
+        let got = store.get(&id).unwrap();
+        assert!(got.novel_text.is_none());
+        assert!(!got.novel_excerpts.is_empty());
+    }
 }

@@ -1,11 +1,13 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { alertDialog } from '../../components/base/BaseDialog.js'
+import { alertDialog, confirmDialog } from '../../components/base/BaseDialog.js'
 import {
+  cardstudioCompile,
   cardstudioCompleteManualStage,
   cardstudioCreateFromCharacter,
   cardstudioCreateFromNovel,
   cardstudioCreateProject,
+  cardstudioDeleteProject,
   cardstudioGetProject,
   cardstudioImportCompiled,
   cardstudioListProjects,
@@ -50,6 +52,7 @@ const userNote = ref('')
 const allowAiFreewrite = ref(false)
 const checkReport = ref(null)
 const lastImport = ref(null)
+const lastCompile = ref(null)
 const seedHandledKey = ref('')
 
 const draft = ref(emptyArtifacts())
@@ -156,12 +159,103 @@ async function openProject(id) {
   statusText.value = ''
   checkReport.value = null
   lastImport.value = null
+  lastCompile.value = null
   try {
     project.value = await cardstudioGetProject(id)
     allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
     syncDraftFromProject()
   } catch (e) {
     await alertDialog('打开项目失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function deleteProjectById(id, name = '') {
+  if (!id) return
+  const ok = await confirmDialog(`确定删除写卡项目「${name || id}」？此操作不可恢复。`, {
+    title: '删除写卡项目',
+  })
+  if (!ok) return
+  busy.value = true
+  try {
+    await cardstudioDeleteProject(id)
+    if (project.value?.id === id) {
+      project.value = null
+      draft.value = emptyArtifacts()
+      checkReport.value = null
+      lastImport.value = null
+      lastCompile.value = null
+    }
+    await refreshProjects()
+    statusText.value = '项目已删除'
+  } catch (e) {
+    await alertDialog('删除失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function deleteCurrentProject() {
+  if (!project.value) return
+  await deleteProjectById(project.value.id, project.value.name)
+}
+
+function safeFileBase(name) {
+  const base = String(name || 'cardstudio')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 48)
+  return base || 'cardstudio'
+}
+
+async function exportStJson() {
+  if (!project.value) return
+  await saveArtifacts()
+  busy.value = true
+  try {
+    const compiled = await cardstudioCompile(project.value.id)
+    lastCompile.value = compiled
+    const json = JSON.stringify(compiled.st_card_json ?? {}, null, 2)
+    const fileName = `${safeFileBase(compiled.character_name || project.value.name || draft.value.name)}.json`
+    let saved = false
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      const { writeTextFile } = await import('@tauri-apps/plugin-fs')
+      const filePath = await save({
+        defaultPath: fileName,
+        filters: [{ name: 'ST Character JSON', extensions: ['json'] }],
+      })
+      if (filePath) {
+        await writeTextFile(filePath, json)
+        saved = true
+        statusText.value = `已导出 ST JSON：${filePath}`
+      }
+    } catch {
+      // fall through to browser download / clipboard
+    }
+    if (!saved) {
+      try {
+        const blob = new Blob([json], { type: 'application/json;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName
+        a.click()
+        URL.revokeObjectURL(url)
+        saved = true
+        statusText.value = `已下载 ST JSON：${fileName}`
+      } catch {
+        await navigator.clipboard.writeText(json)
+        statusText.value = '已复制 ST JSON 到剪贴板'
+        saved = true
+      }
+    }
+    if (compiled.warnings?.length) {
+      statusText.value += `（警告 ${compiled.warnings.length} 条）`
+    }
+  } catch (e) {
+    await alertDialog('导出失败: ' + e)
   } finally {
     busy.value = false
   }
@@ -293,7 +387,11 @@ async function saveArtifacts() {
   if (!project.value) return
   busy.value = true
   try {
-    project.value = await cardstudioUpdateArtifacts(project.value.id, draft.value)
+    const artifacts = {
+      ...draft.value,
+      style_notes: draft.value.style_notes?.trim() ? draft.value.style_notes : null,
+    }
+    project.value = await cardstudioUpdateArtifacts(project.value.id, artifacts)
     project.value = await cardstudioSetOptions(project.value.id, {
       allowAiFreewrite: allowAiFreewrite.value,
     })
@@ -471,22 +569,34 @@ watch(
 
     <div class="rounded-xl border border-line bg-surface p-3 shadow-card">
       <div class="text-xs font-medium text-ink mb-2">已有项目</div>
-      <EmptyState v-if="!loading && projects.length === 0" title="还没有写卡项目" description="先创建一个从零项目" />
+      <EmptyState v-if="!loading && projects.length === 0" title="还没有写卡项目" description="先创建一个从零 / 小说 / 修订项目" />
       <div v-else class="space-y-1">
-        <button
+        <div
           v-for="p in projects"
           :key="p.id"
-          type="button"
-          class="w-full text-left rounded-lg px-3 py-2 text-sm hover:bg-surface-2 border border-transparent"
-          :class="project?.id === p.id ? 'border-accent bg-surface-2' : ''"
-          @click="openProject(p.id)"
+          class="flex items-center gap-2 rounded-lg px-2 py-1 border"
+          :class="project?.id === p.id ? 'border-accent bg-surface-2' : 'border-transparent'"
         >
-          <div class="font-medium text-ink truncate">{{ p.name }}</div>
-          <div class="text-xs text-ink-soft truncate">
-            {{ p.mode === 'from_existing_card' ? '修订另存' : (p.mode === 'from_novel' ? '小说改编' : '从零') }}
-            · {{ p.current_stage }} · {{ p.updated_at }}
-          </div>
-        </button>
+          <button
+            type="button"
+            class="flex-1 min-w-0 text-left rounded-md px-1 py-1 text-sm hover:bg-surface-2"
+            @click="openProject(p.id)"
+          >
+            <div class="font-medium text-ink truncate">{{ p.name }}</div>
+            <div class="text-xs text-ink-soft truncate">
+              {{ p.mode === 'from_existing_card' ? '修订另存' : (p.mode === 'from_novel' ? '小说改编' : '从零') }}
+              · {{ p.current_stage }} · {{ p.updated_at }}
+            </div>
+          </button>
+          <Button
+            variant="ghost"
+            size="sm"
+            :disabled="busy"
+            @click.stop="deleteProjectById(p.id, p.name)"
+          >
+            删
+          </Button>
+        </div>
       </div>
     </div>
 
@@ -547,6 +657,14 @@ watch(
           <Input v-model="tagsText" />
           <label class="text-xs text-ink-soft">世界书（每行一条：`[蓝灯|]` 或 `[绿灯|关键词1,关键词2] 内容`）</label>
           <textarea v-model="worldviewText" rows="5" class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink font-mono" />
+          <label class="text-xs text-ink-soft">文风笔记 style_notes（可选，不进角色 description）</label>
+          <textarea
+            :value="draft.style_notes || ''"
+            rows="3"
+            class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink"
+            placeholder="白描、短句、禁用八股……（小说预填可生成）"
+            @input="draft.style_notes = $event.target.value"
+          />
         </div>
 
         <div class="flex flex-wrap gap-2">
@@ -577,6 +695,7 @@ watch(
           </template>
           <Button variant="default" size="sm" :disabled="busy" @click="runChecks">规则检查</Button>
           <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="runReview(true)">方法论审查</Button>
+          <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="exportStJson">导出 ST JSON</Button>
           <Button
             v-if="currentStage === 'compile_import' || project.stage_status?.review === 'done'"
             variant="primary"
@@ -587,6 +706,7 @@ watch(
           >
             {{ isReviseMode() || isNovelMode() ? '编译并另存为新卡' : '编译并导入卡库' }}
           </Button>
+          <Button variant="ghost" size="sm" :disabled="busy" @click="deleteCurrentProject">删除项目</Button>
         </div>
 
         <div v-if="checkReport" class="text-xs space-y-1 rounded-lg border border-line bg-surface-2/50 p-3">
@@ -604,6 +724,11 @@ watch(
             {{ issue.message }}
             <span v-if="issue.suggestion" class="text-ink-faint"> — {{ issue.suggestion }}</span>
           </div>
+        </div>
+
+        <div v-if="lastCompile" class="text-xs text-ink-soft">
+          最近编译预览：{{ lastCompile.character_name || '（未命名）' }}
+          <span v-if="lastCompile.warnings?.length"> · 警告 {{ lastCompile.warnings.length }} 条</span>
         </div>
 
         <div v-if="lastImport" class="text-xs text-ok">
