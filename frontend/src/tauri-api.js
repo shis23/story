@@ -807,8 +807,27 @@ export async function cardstudioCreateProject(name, brief) {
     last_error: null,
     last_stage_output: null,
     imported_character_id: null,
+    source_character_id: null,
+    source_stored_id: null,
     created_at: '2026-07-22 00:00:00',
     updated_at: '2026-07-22 00:00:00',
+  }
+}
+
+/** C: 从已有角色卡创建修订项目（默认另存） */
+export async function cardstudioCreateFromCharacter(characterId, brief = null) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_from_character', {
+      characterId,
+      brief: brief || null,
+    })
+  }
+  return {
+    id: 'mock-revise-1',
+    name: '修订（mock）',
+    mode: 'from_existing_card',
+    current_stage: 'review',
+    source_character_id: characterId,
   }
 }
 

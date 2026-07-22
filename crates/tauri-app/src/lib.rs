@@ -12317,6 +12317,7 @@ pub fn run() {
             // Card Studio Phase 1
             card_studio_api::cardstudio_list_projects,
             card_studio_api::cardstudio_create_project,
+            card_studio_api::cardstudio_create_from_character,
             card_studio_api::cardstudio_get_project,
             card_studio_api::cardstudio_delete_project,
             card_studio_api::cardstudio_update_artifacts,
@@ -12492,7 +12493,7 @@ pub fn run() {
 ///
 /// 新版 CharacterInfo 会持久化 ST round-trip 所需字段；旧数据缺失时仍按展示 DTO
 /// 中的 world_info_entries 做近似恢复。
-fn stored_info_to_character(
+pub(crate) fn stored_info_to_character(
     stored: &storage::StoredCharacter,
 ) -> storyforge_domain::character::Character {
     let embedded_world_info = stored

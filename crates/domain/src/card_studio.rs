@@ -1,6 +1,7 @@
-//! Card Studio Phase 1 domain: from-scratch card drafting, compile, checks.
+//! Card Studio Phase 1 domain: from-scratch drafting, reverse-parse revise, compile, checks.
 //!
 //! Independent of Campaign writing pipeline. Produces ST-compatible Character drafts.
+//! Mode C (`FromExistingCard`) always 另存 on compile/import — never overwrites source cards.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,8 @@ pub fn phase1_stage_ids() -> &'static [&'static str] {
 pub enum CardProjectMode {
     #[default]
     FromScratch,
+    /// 从已有角色卡反解析进入写卡工程（默认另存，不覆盖原卡）
+    FromExistingCard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -133,6 +136,12 @@ pub struct CardProject {
     pub last_stage_output: Option<String>,
     #[serde(default)]
     pub imported_character_id: Option<String>,
+    /// 反解析来源：Character domain id / source_character_id
+    #[serde(default)]
+    pub source_character_id: Option<String>,
+    /// 反解析来源：CharacterStore 存储 id（若有）
+    #[serde(default)]
+    pub source_stored_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -175,6 +184,57 @@ impl CardProject {
             last_error: None,
             last_stage_output: None,
             imported_character_id: None,
+            source_character_id: None,
+            source_stored_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Create a revise project from an existing Character (C path).
+    pub fn new_from_existing_character(
+        character: &Character,
+        stored_id: Option<String>,
+        brief: impl Into<String>,
+    ) -> Self {
+        let now = chrono_like_now();
+        let mut stage_status = std::collections::BTreeMap::new();
+        for id in phase1_stage_ids() {
+            // reverse-parse fills artifacts; mark generative stages ready for selective re-run
+            let status = match *id {
+                STAGE_BRIEF => StageStatus::Done,
+                STAGE_COMPILE_IMPORT => StageStatus::Pending,
+                STAGE_REVIEW => StageStatus::Ready,
+                _ => StageStatus::Ready,
+            };
+            stage_status.insert((*id).to_string(), status);
+        }
+
+        let artifacts = reverse_parse_character(character);
+        let brief = {
+            let b = brief.into();
+            if b.trim().is_empty() {
+                format!("修订已有角色卡：{}", character.name)
+            } else {
+                b
+            }
+        };
+
+        Self {
+            id: Id::new().to_string(),
+            name: format!("{}（修订）", character.name),
+            mode: CardProjectMode::FromExistingCard,
+            brief,
+            current_stage: STAGE_REVIEW.to_string(),
+            stage_status,
+            artifacts,
+            stage_pack_id: default_stage_pack_id(),
+            allow_ai_freewrite: false,
+            last_error: None,
+            last_stage_output: None,
+            imported_character_id: None,
+            source_character_id: Some(character.id.as_str().to_string()),
+            source_stored_id: stored_id,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -187,6 +247,47 @@ impl CardProject {
     pub fn set_stage_status(&mut self, stage_id: &str, status: StageStatus) {
         self.stage_status.insert(stage_id.to_string(), status);
         self.touch();
+    }
+}
+
+/// Reverse-parse a domain Character into editable CardArtifacts.
+pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
+    let worldview_entries = character
+        .embedded_world_info
+        .as_ref()
+        .map(|book| {
+            book.entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| WorldviewDraftEntry {
+                    keys: e.keys.clone(),
+                    content: e.content.clone(),
+                    constant: e.constant
+                        || matches!(e.route, LoreRoute::Constant | LoreRoute::Both),
+                    order: e.order,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    CardArtifacts {
+        name: character.name.clone(),
+        description: character.description.clone(),
+        personality: character.personality.clone(),
+        scenario: character.scenario.clone(),
+        first_mes: character.first_mes.clone(),
+        tags: character.tags.clone(),
+        creator: character.creator.clone(),
+        worldview_entries,
+        notes: format!(
+            "反解析自角色卡 {}（source={}）",
+            character.name,
+            character.id.as_str()
+        ),
+        personality_mode: Some("guided".into()),
+        personality_prompts: Vec::new(),
+        world_type: None,
+        opening_outline: None,
     }
 }
 
@@ -1223,5 +1324,56 @@ mod tests {
             .iter()
             .any(|i| i.code.starts_with("llm_") && matches!(i.severity, CheckSeverity::Warning)));
         assert_eq!(merged.source.as_deref(), Some("hybrid"));
+    }
+
+    fn sample_character() -> Character {
+        let arts = sample_ok_artifacts();
+        compile_artifacts(&arts).unwrap().character
+    }
+
+    #[test]
+    fn reverse_parse_roundtrip_core_fields() {
+        let ch = sample_character();
+        let arts = reverse_parse_character(&ch);
+        assert_eq!(arts.name, "秋青");
+        assert!(!arts.description.is_empty());
+        assert_eq!(arts.worldview_entries.len(), 2);
+        assert!(arts.worldview_entries.iter().any(|e| e.constant));
+        assert!(arts
+            .worldview_entries
+            .iter()
+            .any(|e| !e.constant && e.keys.iter().any(|k| k == "车站")));
+    }
+
+    #[test]
+    fn new_from_existing_sets_mode_and_source() {
+        let ch = sample_character();
+        let p = CardProject::new_from_existing_character(&ch, Some("stored-1".into()), "");
+        assert_eq!(p.mode, CardProjectMode::FromExistingCard);
+        assert_eq!(p.source_stored_id.as_deref(), Some("stored-1"));
+        assert_eq!(p.source_character_id.as_deref(), Some(ch.id.as_str()));
+        assert_eq!(p.current_stage, STAGE_REVIEW);
+        assert_eq!(p.artifacts.name, "秋青");
+        assert!(p.name.contains("修订"));
+        assert!(p.imported_character_id.is_none());
+        assert_eq!(
+            p.stage_status.get(STAGE_PERSONALITY),
+            Some(&StageStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn reverse_parse_recompile_is_new_character_id() {
+        let ch = sample_character();
+        let arts = reverse_parse_character(&ch);
+        let compiled = compile_artifacts(&arts).expect("recompile");
+        // 另存语义：编译产物必须是新 domain id，不能回写源卡 id
+        assert_ne!(compiled.character.id.as_str(), ch.id.as_str());
+        assert_eq!(compiled.character.name, ch.name);
+        assert!(compiled
+            .character
+            .tags
+            .iter()
+            .any(|t| t == "card-studio"));
     }
 }

@@ -18,7 +18,7 @@ import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import WorldInfoReadonlyPanel from './WorldInfoReadonlyPanel.vue'
 
-const emit = defineEmits(['open-campaigns', 'open-studio'])
+const emit = defineEmits(['open-campaigns', 'open-studio', 'revise-card'])
 
 // ─── Cards 状态 ───
 const cards = ref([])
@@ -88,7 +88,7 @@ function roleVariant(roleType) {
 <template>
   <div class="space-y-3">
     <div class="flex items-center justify-between gap-2">
-      <div class="text-xs text-ink-soft">导入已有卡，或用写卡工作室从零生成基础卡</div>
+      <div class="text-xs text-ink-soft">导入已有卡，写卡工作室从零生成，或在详情中修订补卡（另存）</div>
       <Button variant="primary" size="sm" @click="emit('open-studio')">写卡工作室</Button>
     </div>
 
@@ -148,9 +148,23 @@ function roleVariant(roleType) {
               <WorldInfoReadonlyPanel :character-id="card.source_character_id || cardDetail.source_character_id" />
             </div>
 
-            <!-- 开档按钮 -->
-            <div v-if="cardDetail.character_definitions.length > 0" class="pt-1">
-              <Button variant="primary" size="md" class="w-full" @click="emit('open-campaigns', card)">
+            <!-- 操作 -->
+            <div class="pt-1 grid gap-2" :class="cardDetail.character_definitions.length > 0 ? 'sm:grid-cols-2' : ''">
+              <Button
+                variant="default"
+                size="md"
+                class="w-full"
+                @click="emit('revise-card', card)"
+              >
+                写卡工作室修订
+              </Button>
+              <Button
+                v-if="cardDetail.character_definitions.length > 0"
+                variant="primary"
+                size="md"
+                class="w-full"
+                @click="emit('open-campaigns', card)"
+              >
                 管理游玩档 →
               </Button>
             </div>

@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { alertDialog } from '../../components/base/BaseDialog.js'
 import {
   cardstudioCompleteManualStage,
+  cardstudioCreateFromCharacter,
   cardstudioCreateProject,
   cardstudioGetProject,
   cardstudioImportCompiled,
@@ -11,12 +12,17 @@ import {
   cardstudioRunReview,
   cardstudioRunStage,
   cardstudioSetOptions,
+  cardstudioSetStage,
   cardstudioUpdateArtifacts,
 } from '../../tauri-api.js'
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import Input from '../ui/Input.vue'
 
+const props = defineProps({
+  /** optional { characterId, brief } to auto-open revise project */
+  seed: { type: Object, default: null },
+})
 const emit = defineEmits(['imported', 'close'])
 
 const STAGE_META = [
@@ -40,6 +46,7 @@ const userNote = ref('')
 const allowAiFreewrite = ref(false)
 const checkReport = ref(null)
 const lastImport = ref(null)
+const seedHandledKey = ref('')
 
 const draft = ref(emptyArtifacts())
 
@@ -155,6 +162,26 @@ async function openProject(id) {
   }
 }
 
+function isReviseMode(p = project.value) {
+  const mode = p?.mode
+  return mode === 'from_existing_card' || mode === 'FromExistingCard'
+}
+
+async function selectStage(stageId) {
+  if (!project.value || !stageId || busy.value) return
+  if (project.value.current_stage === stageId) return
+  busy.value = true
+  try {
+    project.value = await cardstudioSetStage(project.value.id, stageId)
+    syncDraftFromProject()
+    statusText.value = `已切换到阶段：${stageId}`
+  } catch (e) {
+    await alertDialog('切换阶段失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
 async function createProject() {
   if (!newName.value.trim()) {
     await alertDialog('请填写项目名')
@@ -172,6 +199,26 @@ async function createProject() {
     statusText.value = '已创建写卡项目（明月秋青方法论 pack）'
   } catch (e) {
     await alertDialog('创建失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function createFromCharacter(characterId, brief = '') {
+  if (!characterId) return
+  busy.value = true
+  statusText.value = '正在反解析角色卡…'
+  try {
+    const created = await cardstudioCreateFromCharacter(characterId, brief || null)
+    await refreshProjects()
+    project.value = created
+    allowAiFreewrite.value = !!created?.allow_ai_freewrite
+    syncDraftFromProject()
+    statusText.value = `已从已有卡创建修订项目（默认另存）：${created?.name || ''}`
+    // revise flow lands on review
+    checkReport.value = await cardstudioRunChecks(created.id)
+  } catch (e) {
+    await alertDialog('打开修订项目失败: ' + e)
   } finally {
     busy.value = false
   }
@@ -275,7 +322,9 @@ async function importCompiled() {
     lastImport.value = result
     project.value = await cardstudioGetProject(project.value.id)
     syncDraftFromProject()
-    statusText.value = `已导入角色卡：${result.character?.name || ''}（card ${result.card_id}）`
+    statusText.value = isReviseMode()
+      ? `已另存为新卡：${result.character?.name || ''}（card ${result.card_id}；原卡未覆盖）`
+      : `已导入角色卡：${result.character?.name || ''}（card ${result.card_id}）`
     emit('imported', result)
   } catch (e) {
     await alertDialog(String(e))
@@ -299,14 +348,31 @@ watch(
     checkReport.value = null
   },
 )
+
+watch(
+  () => props.seed,
+  async (seed) => {
+    if (!seed?.characterId) {
+      // allow same card to open a new revise project next time
+      seedHandledKey.value = ''
+      return
+    }
+    // include a nonce if provided so re-open after close always creates a fresh project
+    const key = `${seed.characterId}::${seed.brief || ''}::${seed.nonce || ''}`
+    if (seedHandledKey.value === key) return
+    seedHandledKey.value = key
+    await createFromCharacter(seed.characterId, seed.brief || '')
+  },
+  { immediate: true, deep: true },
+)
 </script>
 
 <template>
   <div class="space-y-4 max-w-4xl">
     <div class="flex items-center justify-between gap-2">
       <div>
-        <div class="text-sm font-medium text-ink">写卡工作室 · 从零创作</div>
-        <div class="text-xs text-ink-soft">阶段生成 → 编辑产物 → 检查 → 导入为可玩角色卡</div>
+        <div class="text-sm font-medium text-ink">写卡工作室 · 从零 / 修订</div>
+        <div class="text-xs text-ink-soft">阶段生成或反解析已有卡 → 编辑产物 → 检查 → 另存导入</div>
       </div>
       <Button variant="ghost" size="sm" @click="emit('close')">返回卡库</Button>
     </div>
@@ -336,7 +402,9 @@ watch(
           @click="openProject(p.id)"
         >
           <div class="font-medium text-ink truncate">{{ p.name }}</div>
-          <div class="text-xs text-ink-soft truncate">{{ p.current_stage }} · {{ p.updated_at }}</div>
+          <div class="text-xs text-ink-soft truncate">
+            {{ p.mode === 'from_existing_card' ? '修订另存' : '从零' }} · {{ p.current_stage }} · {{ p.updated_at }}
+          </div>
         </button>
       </div>
     </div>
@@ -344,20 +412,30 @@ watch(
     <template v-if="project">
       <div class="rounded-xl border border-line bg-surface p-3 shadow-card space-y-3">
         <div class="flex flex-wrap gap-2">
-          <span
+          <button
             v-for="s in stages"
             :key="s.id"
-            class="text-xs px-2 py-1 rounded-md border border-line"
+            type="button"
+            class="text-xs px-2 py-1 rounded-md border border-line hover:bg-surface-2"
             :class="[stageBadgeClass(s.status), currentStage === s.id ? 'ring-1 ring-accent' : '']"
+            :disabled="busy"
+            @click="selectStage(s.id)"
           >
             {{ s.label }} · {{ s.status }}
-          </span>
+          </button>
         </div>
 
         <div class="text-xs text-ink-soft" v-if="statusText">{{ statusText }}</div>
         <div class="text-xs text-err" v-if="project.last_error">{{ project.last_error }}</div>
         <div class="text-[11px] text-ink-faint">
-          提示词包：{{ project.stage_pack_id || 'mingyue_qiuqing_v1' }} · 性格默认协作（手写衍生优先）
+          提示词包：{{ project.stage_pack_id || 'mingyue_qiuqing_v1' }}
+          · 模式：{{ isReviseMode() ? '修订已有卡（另存）' : '从零创作' }}
+          · 性格默认协作（手写衍生优先）
+          <span v-if="isReviseMode()"> · 点击阶段可局部重跑</span>
+        </div>
+        <div v-if="project.source_character_id" class="text-[11px] text-ink-faint">
+          来源角色：{{ project.source_character_id }}
+          <span v-if="project.source_stored_id"> / store {{ project.source_stored_id }}</span>
         </div>
 
         <label class="flex items-center gap-2 text-xs text-ink-soft">
@@ -412,7 +490,7 @@ watch(
             :disabled="busy"
             @click="importCompiled"
           >
-            编译并导入卡库
+            {{ isReviseMode() ? '编译并另存为新卡' : '编译并导入卡库' }}
           </Button>
         </div>
 

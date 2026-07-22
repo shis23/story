@@ -27,6 +27,8 @@ pub struct CardProjectSummaryDto {
     pub current_stage: String,
     pub updated_at: String,
     pub imported_character_id: Option<String>,
+    pub mode: String,
+    pub source_character_id: Option<String>,
 }
 
 impl From<&CardProject> for CardProjectSummaryDto {
@@ -38,6 +40,15 @@ impl From<&CardProject> for CardProjectSummaryDto {
             current_stage: p.current_stage.clone(),
             updated_at: p.updated_at.clone(),
             imported_character_id: p.imported_character_id.clone(),
+            mode: match p.mode {
+                storyforge_domain::card_studio::CardProjectMode::FromScratch => {
+                    "from_scratch".into()
+                }
+                storyforge_domain::card_studio::CardProjectMode::FromExistingCard => {
+                    "from_existing_card".into()
+                }
+            },
+            source_character_id: p.source_character_id.clone(),
         }
     }
 }
@@ -78,6 +89,53 @@ pub fn cardstudio_create_project(
     get_card_studio_store()
         .insert(project)
         .map_err(|e| TauriCommandError::storage(e))
+}
+
+/// C path: open an existing imported character as a revise CardProject.
+///
+/// `character_id` may be CharacterStore id or domain source_character_id.
+#[tauri::command]
+pub fn cardstudio_create_from_character(
+    character_id: String,
+    brief: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CardProject, TauriCommandError> {
+    let stored = resolve_stored_character(&character_id)?;
+    let character = crate::stored_info_to_character(&stored);
+
+    // Ensure tool_ctx has it (best effort) so later extract/import paths stay consistent.
+    {
+        let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+        if !ctx
+            .characters
+            .iter()
+            .any(|c| c.id.as_str() == character.id.as_str() || c.name == character.name)
+        {
+            ctx.characters.push(Arc::new(character.clone()));
+        }
+    }
+
+    let project = CardProject::new_from_existing_character(
+        &character,
+        Some(stored.id.clone()),
+        brief.unwrap_or_default(),
+    );
+    get_card_studio_store()
+        .insert(project)
+        .map_err(|e| TauriCommandError::storage(e))
+}
+
+fn resolve_stored_character(character_id: &str) -> Result<crate::storage::StoredCharacter, TauriCommandError> {
+    let store = crate::get_store();
+    if let Some(s) = store.get(character_id) {
+        return Ok(s);
+    }
+    // fallback: match source_character_id
+    store
+        .list()
+        .into_iter()
+        .find(|s| s.info.source_character_id.as_deref() == Some(character_id))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))
 }
 
 #[tauri::command]
@@ -441,16 +499,23 @@ pub fn cardstudio_import_compiled(
     let character = compiled.character;
     let warnings = compiled.warnings;
 
-    // Persist into CharacterStore (same path shape as import_character).
+    // Always 另存: CharacterStore::save allocates a new stored id; never overwrite source.
+    let is_revise = matches!(
+        project.mode,
+        storyforge_domain::card_studio::CardProjectMode::FromExistingCard
+    );
     let info = CharacterInfo::from(&character);
     let stored = crate::get_store()
         .save(info)
         .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))?;
 
     // Sync tool_ctx so extract_characters / campaign can see the card.
+    // Dedup by domain id only — never drop another card merely because names match.
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
-        ctx.characters.retain(|c| c.name != character.name);
+        let new_id = character.id.as_str().to_string();
+        ctx.characters
+            .retain(|c| c.id.as_str() != new_id.as_str());
         let world_info = character.embedded_world_info.clone();
         ctx.characters.push(Arc::new(character.clone()));
         if let Some(wi) = world_info {
@@ -459,13 +524,19 @@ pub fn cardstudio_import_compiled(
     }
 
     // Seed a fallback CharacterCard so list_cards can open campaigns without forced LLM extract.
+    // CharacterCard::from_character uses a fresh card id + this character.id as source_character_id,
+    // so revise re-import lands as a new playable card (另存), not an overwrite of the source card.
     let mut card = CharacterCard::from_character(&character);
     let def = CharacterDefinition::fallback_from_character(&character, &[]);
     let definitions =
         storyforge_app_agent::attach_definitions_to_card(vec![def], &card.id);
     card.character_definitions = definitions;
     card.extraction_status = CharacterExtractionStatus::Fallback;
-    card.extraction_message = Some("Card Studio 从零导入，已生成单主角定义，可稍后重新识别。".into());
+    card.extraction_message = Some(if is_revise {
+        "Card Studio 修订另存导入，已生成单主角定义；原卡未覆盖，可稍后重新识别。".into()
+    } else {
+        "Card Studio 从零导入，已生成单主角定义，可稍后重新识别。".into()
+    });
     let stored_card = crate::get_campaign_store()
         .save_card(card)
         .map_err(|e| TauriCommandError::storage(format!("保存 CharacterCard 失败: {e}")))?;

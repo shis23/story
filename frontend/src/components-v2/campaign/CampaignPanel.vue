@@ -33,6 +33,7 @@ const writingStore = useWritingStore()
 const shellMode = ref('manage') // 'manage' | 'cards'
 // cards 模式下的子视图：library | studio
 const cardsView = ref('library')
+const studioSeed = ref(null) // { characterId, brief? }
 // 兼容旧 activeTab 语义：cards | campaigns | detail
 const activeTab = ref('detail')
 
@@ -252,7 +253,22 @@ function onChangeMode(mode) {
   activeTab.value = mode === 'cards' ? 'cards' : (selectedCampaignId.value ? 'detail' : 'campaigns')
   if (mode !== 'cards') {
     cardsView.value = 'library'
+    studioSeed.value = null
   }
+}
+
+function openStudioForRevise(card) {
+  const characterId = card?.source_character_id || card?.id
+  if (!characterId) return
+  studioSeed.value = {
+    characterId,
+    brief: `修订角色卡：${card?.name || characterId}`,
+    // ensure re-opening the same card always seeds a new revise project
+    nonce: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  }
+  shellMode.value = 'cards'
+  activeTab.value = 'cards'
+  cardsView.value = 'studio'
 }
 
 function onChangeDetailTab(tab) {
@@ -438,14 +454,16 @@ defineExpose({ refreshActiveDetailTab })
           <div v-if="importStatus" class="text-xs text-ink-soft">{{ importStatus }}</div>
           <CardStudio
             v-if="cardsView === 'studio'"
-            @close="cardsView = 'library'"
-            @imported="async () => { cardsView = 'library'; await refreshCards() }"
+            :seed="studioSeed"
+            @close="cardsView = 'library'; studioSeed = null"
+            @imported="async () => { cardsView = 'library'; studioSeed = null; await refreshCards() }"
           />
           <CardLibrary
             v-else
             ref="cardLibraryRef"
             @open-campaigns="openCampaignsForCard"
-            @open-studio="cardsView = 'studio'"
+            @open-studio="studioSeed = null; cardsView = 'studio'"
+            @revise-card="openStudioForRevise"
           />
         </div>
       </template>
