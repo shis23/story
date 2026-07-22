@@ -893,6 +893,13 @@ export async function updateCampaignWorldInfoEntry(req) {
   }
 }
 
+/** 仅切换本局世界书条目启用状态，保留正文、关键词与注入路由。 */
+export async function setCampaignWorldInfoEnabled(campaignId, entryIndex, enabled) {
+  if (isTauri()) {
+    return await invoke('set_campaign_world_info_enabled', { campaignId, entryIndex, enabled: !!enabled })
+  }
+}
+
 /** 删除本局世界书条目 */
 export async function deleteCampaignWorldInfoEntry(campaignId, entryIndex) {
   if (isTauri()) {

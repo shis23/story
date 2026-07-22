@@ -149,3 +149,39 @@ d547dd7 feat(card-shell): ordered tavern_helper runtime
 - home 环境检查现在能终止并显示实际诊断，而不是永远“加载中”。未提供的 TavernHelper 版本、EJS 与 MVU 能力明确报告为未找到/未检测到/异常，不能记为完整 ST 兼容。
 
 后续的唯一兼容性缺口是把上述三项接到真实 StoryForge 运行态；在此之前不应把环境检查写成通过，也不应把当前 card shell 宣称为 100% SillyTavern 等价。
+
+---
+
+## 2026-07-23 完成记录（取代上方兼容性缺口）
+
+`test-card.png` 所需的三项能力现已接入真实运行态：
+
+1. **TavernHelper + 活动世界书**：`getCharWorldbookNames('current')` 返回
+   `storyforge:campaign:<id>`，`getWorldbook` 读取 Campaign 世界书的真实条目名与
+   enabled 状态，`updateWorldbookWith` 只写回发生变化的 `disabled`。Rust DTO 保留
+   ST 的 `extra.comment` 作为条目名；写回命令不重写正文、关键词或 route。
+2. **EJS**：壳在宿主 allowlist 代持的 EJS 3.1.10 加载成功后，才把真实
+   `render` 函数和已启用的 `extension_settings.EjsTemplate` 暴露给
+   `SillyTavern.getContext()`。
+3. **MVU**：`MvuJsRuntime` 只在其 iframe 真正报告 `mvu:ready` 后发布运行态；
+   壳的 `waitGlobalInitialized('Mvu')` 通过桥接轮询该就绪态，超时仍会诚实失败。
+4. **消息内壳上下文**：`ShellAwareContent` 也传递活动 `campaign-id`。这消除了
+   顶层壳正常、消息内壳世界书为空的分裂状态。
+
+真实 Tauri 复验确认首页环境检查会自动进入 DLC；DLC 和核心选择加载真实项目，
+并完成“埃尔薇拉”禁用→保存→落盘→恢复的往返。状态栏、6/6 TH、多 Agent `cpa`
+日志和已采纳会话亦在同一构建中可见。详见
+`docs/workstreams/TEST-CARD-SHELL-EVIDENCE.md`。
+
+仍不作超出范围的承诺：这不是“所有 ST 插件 API 均等价”的声明，而是本卡当前
+依赖面已经有真实实现与桌面端证据。
+
+### 并发完整性复查
+
+- 当状态栏、开场和消息内壳同时挂载时，每个 iframe 使用独立 bridge session；非所属
+  宿主不会响应其 `campaign_worldbook_update`。
+- 同一 Campaign 的 shell 读取、差异计算和写回均在前端队列内执行，`CampaignStore`
+  的世界书读改写则在持锁的原子 mutation 内落盘，避免多壳、过期快照或相邻 DLC
+  开关覆盖彼此。
+- `Disabled` 路由不能再被 UI 误报为已启用：可由 ST 蓝/绿灯恢复时恢复（双灯恢复为
+  `Both`），否则返回可见错误。此项已有多宿主、过期快照、并发持久化和路由恢复回归测试。

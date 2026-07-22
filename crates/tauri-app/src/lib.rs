@@ -10491,6 +10491,9 @@ fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignWorldInfoEntryDto {
     pub index: usize,
+    /// ST entry comment (preferred) or a keyword fallback; exposed to the
+    /// Card Shell as the TavernHelper worldbook entry name.
+    pub name: String,
     pub keys: Vec<String>,
     pub secondary_keys: Vec<String>,
     /// 列表预览用截断正文（默认）；完整正文走 get_*_world_info_entry
@@ -10548,6 +10551,25 @@ fn entry_source_label(entry: &storyforge_domain::world_info::WorldInfoEntry) -> 
         .to_string()
 }
 
+fn world_info_entry_name(index: usize, entry: &storyforge_domain::world_info::WorldInfoEntry) -> String {
+    entry
+        .extra
+        .get("comment")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            entry
+                .keys
+                .iter()
+                .map(|key| key.trim())
+                .find(|key| !key.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| format!("world-info-{index}"))
+}
+
 const WORLD_INFO_LIST_PREVIEW_CHARS: usize = 240;
 
 fn truncate_world_info_content(content: &str, max_chars: usize) -> (String, bool, usize) {
@@ -10574,6 +10596,7 @@ fn world_info_entry_to_dto_preview(
     let (content, truncated, content_len) = truncate_world_info_content(&e.content, max_chars);
     CampaignWorldInfoEntryDto {
         index,
+        name: world_info_entry_name(index, e),
         keys: e.keys.clone(),
         secondary_keys: e.secondary_keys.clone(),
         content,
@@ -10595,6 +10618,7 @@ fn world_info_entry_to_dto_full(
 ) -> CampaignWorldInfoEntryDto {
     CampaignWorldInfoEntryDto {
         index,
+        name: world_info_entry_name(index, e),
         keys: e.keys.clone(),
         secondary_keys: e.secondary_keys.clone(),
         content: e.content.clone(),
@@ -10764,6 +10788,29 @@ fn update_campaign_world_info_entry(
     if let Ok(book) = store.get_world_info(&id) {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     }
+    Ok(())
+}
+
+/// Toggle a Campaign world-info entry without rewriting its body, keys, or
+/// injection route. Card Shell core selectors only own this enabled state.
+#[tauri::command]
+fn set_campaign_world_info_enabled(
+    campaign_id: String,
+    entry_index: usize,
+    enabled: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&campaign_id);
+    let store = get_campaign_store();
+    let book = store
+        .set_world_info_entry_enabled(&id, entry_index, enabled)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     Ok(())
 }
 
@@ -12226,6 +12273,7 @@ pub fn run() {
             list_campaign_world_info,
             add_campaign_world_info_entry,
             update_campaign_world_info_entry,
+            set_campaign_world_info_enabled,
             delete_campaign_world_info_entry,
             set_campaign_world_info_route,
             get_character_world_info,
@@ -20857,5 +20905,111 @@ mod tests {
             "JSON mode preserves its legacy restart behavior"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn campaign_world_info_dto_preserves_the_st_entry_comment_as_its_name() {
+        let mut entry = storyforge_domain::world_info::WorldInfoEntry {
+            st_id: Some(17),
+            keys: vec!["fallback key".into()],
+            secondary_keys: vec![],
+            content: "lore".into(),
+            constant: true,
+            selective: false,
+            selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+            disabled: false,
+            position: 0,
+            depth: 1,
+            order: 100,
+            route: storyforge_domain::world_info::LoreRoute::Constant,
+            extensions: serde_json::json!({}),
+            extra: Default::default(),
+        };
+        entry.extra.insert(
+            "comment".into(),
+            serde_json::Value::String("命定系统-阿比盖尔核心".into()),
+        );
+
+        let dto = world_info_entry_to_dto_full(7, &entry);
+
+        assert_eq!(dto.name, "命定系统-阿比盖尔核心");
+    }
+
+    #[test]
+    fn toggling_campaign_world_info_enabled_preserves_its_injection_route() {
+        let mut entry = storyforge_domain::world_info::WorldInfoEntry {
+            st_id: Some(18),
+            keys: vec!["core".into()],
+            secondary_keys: vec![],
+            content: "lore".into(),
+            constant: true,
+            selective: false,
+            selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+            disabled: false,
+            position: 0,
+            depth: 1,
+            order: 100,
+            route: storyforge_domain::world_info::LoreRoute::Constant,
+            extensions: serde_json::json!({}),
+            extra: Default::default(),
+        };
+
+        entry.set_enabled(false).unwrap();
+        assert!(entry.disabled);
+        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Constant));
+
+        entry.set_enabled(true).unwrap();
+        assert!(!entry.disabled);
+        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Constant));
+    }
+
+    #[test]
+    fn enabling_a_disabled_route_restores_its_st_derived_injection_route() {
+        let mut entry = storyforge_domain::world_info::WorldInfoEntry {
+            st_id: Some(19),
+            keys: vec!["core".into()],
+            secondary_keys: vec![],
+            content: "lore".into(),
+            constant: false,
+            selective: true,
+            selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+            disabled: true,
+            position: 0,
+            depth: 1,
+            order: 100,
+            route: storyforge_domain::world_info::LoreRoute::Disabled,
+            extensions: serde_json::json!({}),
+            extra: Default::default(),
+        };
+
+        entry.set_enabled(true).unwrap();
+
+        assert!(!entry.disabled);
+        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Selective));
+    }
+
+    #[test]
+    fn enabling_a_disabled_both_world_info_route_restores_both_injection_paths() {
+        let mut entry = storyforge_domain::world_info::WorldInfoEntry {
+            st_id: Some(20),
+            keys: vec!["hybrid core".into()],
+            secondary_keys: vec![],
+            content: "lore".into(),
+            constant: true,
+            selective: true,
+            selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+            disabled: true,
+            position: 0,
+            depth: 1,
+            order: 100,
+            route: storyforge_domain::world_info::LoreRoute::Disabled,
+            extensions: serde_json::json!({}),
+            extra: Default::default(),
+        };
+
+        entry.set_enabled(true).unwrap();
+
+        assert!(!entry.disabled);
+        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Both));
     }
 }

@@ -454,6 +454,45 @@ impl CampaignStore {
             .join(format!("{}.json", campaign_id.as_str()))
     }
 
+    fn read_world_info_file(&self, campaign_id: &Id) -> Result<WorldInfoBook, String> {
+        let path = self.world_info_path(campaign_id);
+        if !path.exists() {
+            return Ok(empty_world_info_book());
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read campaign world_info failed: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse campaign world_info failed: {e}"))
+    }
+
+    /// Apply one read-modify-write while retaining the world-info mutex across
+    /// the file write. Shells can be mounted more than once for a Campaign;
+    /// this makes independently delivered bridge updates atomic.
+    fn mutate_world_info<T, F>(
+        &self,
+        campaign_id: &Id,
+        mutate: F,
+    ) -> Result<(T, WorldInfoBook), String>
+    where
+        F: FnOnce(&mut WorldInfoBook) -> Result<T, String>,
+    {
+        self.ensure_json_write_allowed()?;
+        if self.get_campaign(campaign_id).is_none() {
+            return Err(format!("campaign not found: {}", campaign_id.as_str()));
+        }
+        let _ = std::fs::create_dir_all(&self.world_info_dir);
+        let path = self.world_info_path(campaign_id);
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
+        let mut book = match map.get(campaign_id.as_str()) {
+            Some(book) => book.clone(),
+            None => self.read_world_info_file(campaign_id)?,
+        };
+        let result = mutate(&mut book)?;
+        storyforge_infra_util::atomic_write_json(&path, &book)
+            .map_err(|e| format!("persist campaign world_info failed: {e}"))?;
+        map.insert(campaign_id.as_str().to_string(), book.clone());
+        Ok((result, book))
+    }
+
     fn delete_world_info_file(&self, campaign_id: &Id) {
         let path = self.world_info_path(campaign_id);
         if path.exists() {
@@ -469,22 +508,11 @@ impl CampaignStore {
         if self.json_access_disabled() {
             return Err("legacy JSON CampaignStore is disabled while SQLite is authoritative".into());
         }
-        {
-            let map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(book) = map.get(campaign_id.as_str()) {
-                return Ok(book.clone());
-            }
-        }
-        let path = self.world_info_path(campaign_id);
-        let book = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .map_err(|e| format!("read campaign world_info failed: {e}"))?;
-            serde_json::from_str(&raw)
-                .map_err(|e| format!("parse campaign world_info failed: {e}"))?
-        } else {
-            empty_world_info_book()
-        };
         let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(book) = map.get(campaign_id.as_str()) {
+            return Ok(book.clone());
+        }
+        let book = self.read_world_info_file(campaign_id)?;
         map.insert(campaign_id.as_str().to_string(), book.clone());
         Ok(book)
     }
@@ -497,9 +525,9 @@ impl CampaignStore {
         }
         let _ = std::fs::create_dir_all(&self.world_info_dir);
         let path = self.world_info_path(campaign_id);
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         storyforge_infra_util::atomic_write_json(&path, &book)
             .map_err(|e| format!("persist campaign world_info failed: {e}"))?;
-        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         map.insert(campaign_id.as_str().to_string(), book);
         Ok(())
     }
@@ -510,10 +538,6 @@ impl CampaignStore {
         campaign_id: &Id,
         template: &WorldInfoBook,
     ) -> Result<WorldInfoBook, String> {
-        let existing = self.get_world_info(campaign_id)?;
-        if !existing.entries.is_empty() {
-            return Ok(existing);
-        }
         let mut book = template.clone();
         // 标记条目来自卡模板（extensions 上挂 source，便于 UI 区分 user 新增）
         for entry in &mut book.entries {
@@ -524,8 +548,13 @@ impl CampaignStore {
                     .or_insert_with(|| serde_json::json!("card"));
             }
         }
-        self.set_world_info(campaign_id, book.clone())?;
-        Ok(book)
+        let (_, persisted) = self.mutate_world_info(campaign_id, |existing| {
+            if existing.entries.is_empty() {
+                *existing = book;
+            }
+            Ok(())
+        })?;
+        Ok(persisted)
     }
 
     pub fn add_world_info_entry(
@@ -533,16 +562,16 @@ impl CampaignStore {
         campaign_id: &Id,
         mut entry: WorldInfoEntry,
     ) -> Result<usize, String> {
-        let mut book = self.get_world_info(campaign_id)?;
         if entry.extensions.is_null() {
             entry.extensions = serde_json::json!({ "sf_source": "user" });
         } else if let Some(obj) = entry.extensions.as_object_mut() {
             obj.entry("sf_source")
                 .or_insert_with(|| serde_json::json!("user"));
         }
-        book.entries.push(entry);
-        let idx = book.entries.len() - 1;
-        self.set_world_info(campaign_id, book)?;
+        let (idx, _) = self.mutate_world_info(campaign_id, |book| {
+            book.entries.push(entry);
+            Ok(book.entries.len() - 1)
+        })?;
         Ok(idx)
     }
 
@@ -552,12 +581,14 @@ impl CampaignStore {
         entry_index: usize,
         entry: WorldInfoEntry,
     ) -> Result<(), String> {
-        let mut book = self.get_world_info(campaign_id)?;
-        if entry_index >= book.entries.len() {
-            return Err(format!("世界书条目索引越界: {entry_index}"));
-        }
-        book.entries[entry_index] = entry;
-        self.set_world_info(campaign_id, book)
+        self.mutate_world_info(campaign_id, |book| {
+            if entry_index >= book.entries.len() {
+                return Err(format!("世界书条目索引越界: {entry_index}"));
+            }
+            book.entries[entry_index] = entry;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn delete_world_info_entry(
@@ -565,12 +596,14 @@ impl CampaignStore {
         campaign_id: &Id,
         entry_index: usize,
     ) -> Result<(), String> {
-        let mut book = self.get_world_info(campaign_id)?;
-        if entry_index >= book.entries.len() {
-            return Err(format!("世界书条目索引越界: {entry_index}"));
-        }
-        book.entries.remove(entry_index);
-        self.set_world_info(campaign_id, book)
+        self.mutate_world_info(campaign_id, |book| {
+            if entry_index >= book.entries.len() {
+                return Err(format!("世界书条目索引越界: {entry_index}"));
+            }
+            book.entries.remove(entry_index);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn set_world_info_route(
@@ -579,16 +612,36 @@ impl CampaignStore {
         entry_index: usize,
         route: LoreRoute,
     ) -> Result<(), String> {
-        let mut book = self.get_world_info(campaign_id)?;
-        if entry_index >= book.entries.len() {
-            return Err(format!("世界书条目索引越界: {entry_index}"));
-        }
-        book.entries[entry_index].route = route;
-        book.entries[entry_index].disabled = matches!(
-            book.entries[entry_index].route,
-            LoreRoute::Disabled
-        );
-        self.set_world_info(campaign_id, book)
+        self.mutate_world_info(campaign_id, |book| {
+            if entry_index >= book.entries.len() {
+                return Err(format!("世界书条目索引越界: {entry_index}"));
+            }
+            book.entries[entry_index].route = route;
+            book.entries[entry_index].disabled = matches!(
+                book.entries[entry_index].route,
+                LoreRoute::Disabled
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Toggle one entry without letting parallel card-shell callbacks replace
+    /// a sibling entry with a stale full-book snapshot.
+    pub fn set_world_info_entry_enabled(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        enabled: bool,
+    ) -> Result<WorldInfoBook, String> {
+        let (_, book) = self.mutate_world_info(campaign_id, |book| {
+            let entry = book
+                .entries
+                .get_mut(entry_index)
+                .ok_or_else(|| format!("世界书条目索引越界: {entry_index}"))?;
+            entry.set_enabled(enabled)
+        })?;
+        Ok(book)
     }
 
     // ─── CharacterInstance CRUD ───────────────────────────────────────────
@@ -1353,6 +1406,75 @@ mod tests {
         assert!(store.delete_campaign(&camp_id).unwrap());
         assert!(!store.world_info_path(&camp_id).exists());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_world_info_enabled_updates_keep_both_entry_changes() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
+
+        let dir = temp_dir();
+        let store = Arc::new(CampaignStore::new(&dir));
+        store.save_card(make_card()).unwrap();
+        let campaign = Campaign::new(Id::from_str("card-1"), "world-info-atomic");
+        let campaign_id = campaign.id.clone();
+        store.create_campaign_with_instances(campaign).unwrap();
+
+        let entry = WorldInfoEntry {
+            st_id: None,
+            keys: vec!["atomic".into()],
+            secondary_keys: vec![],
+            content: "atomic lore".into(),
+            constant: false,
+            selective: true,
+            selective_logic: Default::default(),
+            disabled: false,
+            position: 0,
+            depth: 2,
+            order: 100,
+            route: LoreRoute::Selective,
+            extensions: serde_json::json!({}),
+            extra: Default::default(),
+        };
+        store
+            .set_world_info(
+                &campaign_id,
+                WorldInfoBook {
+                    entries: vec![entry.clone(), entry],
+                    source: storyforge_domain::Source::Native,
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = Arc::clone(&store);
+        let first_id = campaign_id.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = thread::spawn(move || {
+            first_barrier.wait();
+            first_store
+                .set_world_info_entry_enabled(&first_id, 0, false)
+                .unwrap();
+        });
+        let second_store = Arc::clone(&store);
+        let second_id = campaign_id.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = thread::spawn(move || {
+            second_barrier.wait();
+            second_store
+                .set_world_info_entry_enabled(&second_id, 1, false)
+                .unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let persisted = store.get_world_info(&campaign_id).unwrap();
+        assert!(persisted.entries.iter().all(|entry| entry.disabled));
+
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 

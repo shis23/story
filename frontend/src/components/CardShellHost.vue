@@ -37,13 +37,24 @@
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { cardShellFetchUrl } from '../tauri-api.js'
+import {
+  cardShellFetchUrl,
+  listCampaignWorldInfo,
+  setCampaignWorldInfoEnabled,
+} from '../tauri-api.js'
 import {
   createCardShellRuntimeCompatibilityScript,
+  isCardShellBridgeMessageForSession,
   makeCardShellInlineModuleId,
   ownsCardShellInlineModule,
   rewriteCardShellTopBridgeAccess,
 } from '../utils/cardShellDocument.js'
+import {
+  applyCampaignWorldbookEnabledUpdates,
+  enqueueCampaignWorldbookMutation,
+  mapCampaignWorldbookForTavernHelper,
+  resolveCampaignWorldbookEnabledUpdates,
+} from '../utils/cardShellWorldbook.js'
 import {
   generateBridgeScript,
   createHostHandler,
@@ -57,6 +68,8 @@ const props = defineProps({
   html: { type: String, default: null },
   /** Optional title for status line */
   label: { type: String, default: '' },
+  /** Active Campaign backing the card shell's TavernHelper worldbook APIs */
+  campaignId: { type: String, default: null },
   /** CSS height, e.g. 280px or 60vh */
   height: { type: String, default: '280px' },
   /** compact status bar mode */
@@ -93,6 +106,13 @@ const shellVirtualPlugin = {
 /** @type {Map<string, string>} host-side store for large inline modules */
 const inlineModuleSources = new Map()
 let inlineModuleSeq = 0
+let bridgeSessionSeq = 0
+let activeBridgeSession = ''
+
+function nextBridgeSession() {
+  bridgeSessionSeq += 1
+  return `${shellPluginId}:${Date.now().toString(36)}:${bridgeSessionSeq}`
+}
 
 const iframeStyle = computed(() => ({
   height: props.compact ? props.height || '96px' : props.height,
@@ -151,6 +171,43 @@ async function hostFetch(url) {
   throw new Error('empty shell body')
 }
 
+function shellWorldbookName() {
+  return props.campaignId ? `storyforge:campaign:${props.campaignId}` : ''
+}
+
+function assertShellWorldbookName(name) {
+  const expected = shellWorldbookName()
+  if (!expected || name !== expected) {
+    throw new Error('worldbook is not bound to the active StoryForge campaign')
+  }
+}
+
+async function getCampaignWorldbookForShell(name) {
+  assertShellWorldbookName(name)
+  const worldbook = await listCampaignWorldInfo(props.campaignId)
+  return mapCampaignWorldbookForTavernHelper(worldbook)
+}
+
+async function updateCampaignWorldbookForShell(name, requestedEntries) {
+  assertShellWorldbookName(name)
+  return await enqueueCampaignWorldbookMutation(props.campaignId, async () => {
+    const worldbook = await listCampaignWorldInfo(props.campaignId)
+    const updates = resolveCampaignWorldbookEnabledUpdates(worldbook?.entries, requestedEntries)
+    await applyCampaignWorldbookEnabledUpdates(updates, ({ entryIndex, enabled }) =>
+      setCampaignWorldInfoEnabled(props.campaignId, entryIndex, enabled),
+    )
+    return { updated: updates.length }
+  })
+}
+
+function getMvuRuntimeShellStatus() {
+  const runtime = window.__storyforgeMvuRuntime
+  return {
+    ready: Boolean(runtime?.isReady?.()),
+    runtime: runtime?.runtime || 'WebViewMvuRuntime',
+  }
+}
+
 
 /**
  * Replace inline type=module scripts with iframe-local importer calls.
@@ -190,7 +247,7 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
       JSON.stringify(entry + '#' + id) +
       ');' +
       '}catch(err){' +
-      'try{parent.postMessage({__sf_shell_bridge:true,type:"shell_runtime",payload:{kind:"module_error",detail:String((err&&err.message)||err)}},"*");}catch(_e){}' +
+      'try{parent.postMessage({__sf_shell_bridge:true,shellSession:window.__sfShellBridgeSession,type:"shell_runtime",payload:{kind:"module_error",detail:String((err&&err.message)||err)}},"*");}catch(_e){}' +
       'console.error("[CardShell] module boot", err);' +
       '}' +
       '})();' +
@@ -204,11 +261,11 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
   return parts.join('')
 }
 
-async function prepareShellDocument(html, pageUrl) {
+async function prepareShellDocument(html, pageUrl, bridgeSession) {
   // Remote card pages commonly ask `window.top.TavernHelper` for ST state.
   // The shell intentionally has an opaque sandbox origin, so route only the
   // known compatibility globals to its own plugin-bridge surface.
-  const wrapped = wrapRemoteHtml(rewriteCardShellTopBridgeAccess(html), pageUrl)
+  const wrapped = wrapRemoteHtml(rewriteCardShellTopBridgeAccess(html), pageUrl, bridgeSession)
   try {
     return await rewriteModuleScriptsInHtml(wrapped, pageUrl)
   } catch (e) {
@@ -217,7 +274,7 @@ async function prepareShellDocument(html, pageUrl) {
   }
 }
 
-function wrapRemoteHtml(html, pageUrl) {
+function wrapRemoteHtml(html, pageUrl, bridgeSession) {
   // Inject bridge + ST-like globals. Shells may be full docs or head+body fragments (no <html>).
   const sOpen = '<' + 'script>'
   const sClose = '</' + 'script>'
@@ -229,12 +286,15 @@ function wrapRemoteHtml(html, pageUrl) {
   }
   const baseTag = baseHref ? `<base href="${baseHref}">` : ''
   const pageJson = JSON.stringify(pageUrl || '')
+  const bridgeSessionJson = JSON.stringify(bridgeSession || '')
 
   // Bridge as string joins so regex escapes are not corrupted by template literals.
   const bridgeLines = [
     "(function(){",
     "  'use strict';",
     "  var PAGE = " + pageJson + ";",
+    "  var BRIDGE_SESSION = " + bridgeSessionJson + ";",
+    "  window.__sfShellBridgeSession = BRIDGE_SESSION;",
     "  function ask(type, payload){",
     "    return new Promise(function(resolve, reject){",
     "      var id = 'sf_' + Math.random().toString(36).slice(2);",
@@ -246,10 +306,11 @@ function wrapRemoteHtml(html, pageUrl) {
     "        else resolve(d.result);",
     "      }",
     "      window.addEventListener('message', onMsg);",
-    "      parent.postMessage({ __sf_shell_bridge: true, id: id, type: type, payload: payload || {} }, '*');",
+    "      parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, id: id, type: type, payload: payload || {} }, '*');",
     "      setTimeout(function(){ window.removeEventListener('message', onMsg); reject(new Error('shell bridge timeout')); }, 120000);",
     "    });",
     "  }",
+    "  window.__sfShellAsk = ask;",
     "  window.__sfHostFetchText = function(url){ return ask('fetch_text', { url: url }); };",
     "  window.__sfHostFetchDataUrl = function(url){ return ask('fetch_data_url', { url: url }); };",
     "  window.__sfShellLocalBlobs = [];",
@@ -339,7 +400,7 @@ function wrapRemoteHtml(html, pageUrl) {
     "    ].join(nl) + nl;",
     "  };",
     "  window.__sfShellReport = function(kind, detail){",
-    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: kind, detail: String(detail || '') } }, '*'); } catch (e) {}",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, type: 'shell_runtime', payload: { kind: kind, detail: String(detail || '') } }, '*'); } catch (e) {}",
     "  };",
     "  window.__sfShellRunInlineModule = async function(code, entryUrl){",
     "    try {",
@@ -432,6 +493,9 @@ function wrapRemoteHtml(html, pageUrl) {
     "    if (!window.Vue) {",
     "      await classic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });",
     "    }",
+    "    if (!window.ejs || typeof window.ejs.render !== 'function') {",
+    "      await classic('https://cdn.jsdelivr.net/npm/ejs@3.1.10/ejs.min.js', function(){ return !!window.ejs && typeof window.ejs.render === 'function'; });",
+    "    }",
     "    if (!window.z || typeof window.z.object !== 'function') {",
     "      var zodUrls = [",
     "        'https://testingcf.jsdelivr.net/npm/zod@4.4.3/+esm',",
@@ -473,9 +537,16 @@ function wrapRemoteHtml(html, pageUrl) {
     "    }",
     "    if (!window.Vue) throw new Error('Vue missing after shell preload');",
     "    if (!window.z || typeof window.z.object !== 'function') throw new Error('Zod missing after shell preload');",
-    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: 'preload_ok', detail: 'vue+jquery' } }, '*'); } catch (e0) {}",
+    "    if (!window.ejs || typeof window.ejs.render !== 'function') throw new Error('EJS missing after shell preload');",
+    "    var shellSettings = window.extension_settings || {};",
+    "    var ejsTemplate = { enabled: true, engine: 'ejs@3.1.10', render: window.ejs.render.bind(window.ejs) };",
+    "    shellSettings.EjsTemplate = ejsTemplate;",
+    "    window.extension_settings = shellSettings;",
+    "    if (window.SillyTavern) { window.SillyTavern.extension_settings = shellSettings; window.SillyTavern.extensionSettings = shellSettings; }",
+    "    if (window.TavernHelper) window.TavernHelper.renderTemplate = ejsTemplate.render;",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, type: 'shell_runtime', payload: { kind: 'preload_ok', detail: 'vue+jquery' } }, '*'); } catch (e0) {}",
     "  })().catch(function(err){",
-    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: 'preload_error', detail: String((err && err.message) || err) } }, '*'); } catch (e1) {}",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: BRIDGE_SESSION, type: 'shell_runtime', payload: { kind: 'preload_error', detail: String((err && err.message) || err) } }, '*'); } catch (e1) {}",
     "  });",
     "})();",
   ]
@@ -502,8 +573,10 @@ function wrapRemoteHtml(html, pageUrl) {
   const headInject =
     baseTag +
     stBridgeHtml +
-    sOpen + createCardShellRuntimeCompatibilityScript() + sClose +
     sOpen + bridgeLines.join('\n') + sClose +
+    sOpen + createCardShellRuntimeCompatibilityScript({
+      worldbookName: props.campaignId ? `storyforge:campaign:${props.campaignId}` : '',
+    }) + sClose +
     sOpen + preloadLines.join('\n') + sClose +
     sOpen + fetchPatchLines.join('\n') + sClose
 
@@ -538,6 +611,8 @@ function wrapRemoteHtml(html, pageUrl) {
 
 async function loadShell() {
   const seq = ++loadSeq
+  const bridgeSession = nextBridgeSession()
+  activeBridgeSession = bridgeSession
   error.value = null
   inlineModuleSources.clear()
   loadedUrl.value = null
@@ -549,12 +624,12 @@ async function loadShell() {
       if (res.kind !== 'text' || res.body_text == null) {
         throw new Error('远程壳不是文本 HTML: ' + (res.content_type || ''))
       }
-      const wrapped = await prepareShellDocument(res.body_text, props.url)
+      const wrapped = await prepareShellDocument(res.body_text, props.url, bridgeSession)
       setFrameHtml(wrapped)
       loadedUrl.value = props.url
       emit('loaded', { url: props.url, fromCache: res.from_cache })
     } else if (props.html) {
-      const wrapped = await prepareShellDocument(props.html, null)
+      const wrapped = await prepareShellDocument(props.html, null, bridgeSession)
       setFrameHtml(wrapped)
       loadedUrl.value = '(inline)'
       emit('loaded', { url: null, inline: true })
@@ -587,8 +662,7 @@ async function onBridgeMessage(ev) {
     if (stHostHandler) stHostHandler(ev)
     return
   }
-  if (!d || !d.__sf_shell_bridge) return
-  // blob/sandbox: source identity can be flaky; accept bridge messages without hard contentWindow match
+  if (!isCardShellBridgeMessageForSession(ev, activeBridgeSession)) return
   if (d.type === 'var_write') {
     emit('message', d)
     emit('var-write', d.payload || {})
@@ -645,6 +719,18 @@ async function onBridgeMessage(ev) {
       } else throw new Error('empty')
       return
     }
+    if (type === 'campaign_worldbook_get') {
+      reply(await getCampaignWorldbookForShell(payload.name))
+      return
+    }
+    if (type === 'campaign_worldbook_update') {
+      reply(await updateCampaignWorldbookForShell(payload.name, payload.entries))
+      return
+    }
+    if (type === 'mvu_status') {
+      reply(getMvuRuntimeShellStatus())
+      return
+    }
     if (type === 'fetch_inline_module') {
       const id = payload.id
       // All visible shell hosts receive the same parent-window message. A
@@ -661,7 +747,7 @@ async function onBridgeMessage(ev) {
 }
 
 watch(
-  () => [props.url, props.html],
+  () => [props.url, props.html, props.campaignId],
   () => {
     loadShell()
   },

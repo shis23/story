@@ -70,3 +70,44 @@
 ### 仍未完成
 
 要让 home 环境检查全绿，仍需实现真实的 TavernHelper 版本/世界书兼容层、EJS 模板引擎与可暴露给 card shell 的 MVU 运行时；在这些能力实际存在前，当前 UI 保持明确的不可用状态。
+
+## 2026-07-23 最终桌面复验（取代上方“仍未完成”判断）
+
+本节是在重新执行 `npm run build`、`cargo build -p storyforge` 后，用
+`target/debug/storyforge.exe` 的真实 WebView2 窗口完成；不是浏览器 mock 或
+单元测试替代品。
+
+| 验收项 | 真实证据 |
+| --- | --- |
+| 环境检查 | 从活动概览点击“继续写作”后，首页壳自动从 EnvCheck 进入 DLC 页。原卡仅在 TavernHelper ≥ 4.3.17、EJS 已存在且启用、`waitGlobalInitialized('Mvu')` 成功时才会发出 `next`；因此三项均为真实可用。 |
+| 首页与布局 | 消息内首页壳实际显示标题 `命定之诗与黄昏之歌`、英文副标题、制作团队、英灵殿、世界背景，并可滚动进入 DLC 与核心选择页。 |
+| 消息内世界书 | 修复 `ShellAwareContent` 未传入活动 Campaign ID 后，DLC“角色”页从错误空态恢复为真实 30 个条目（如埃尔薇拉、爱丽丝、安娜斯塔西娅等）。 |
+| DLC 写回 | UI 选择“埃尔薇拉”→“已启用”切为“已禁用”→“下一步/保存中”，活动书 `st_id=717622` 的 `disabled` 变为 `true`；再经相同 UI 路径恢复为 `false`。两次落盘均保留原 `Selective` 路由、6 个关键词和 2477 字正文。 |
+| 核心选择 | DLC 保存后实际进入“核心选择”；“特别推荐 / 中杯 / 这是什么杯”Tab 与推荐卡（妲丽安核心、null核心、类脑娘）可从活动世界书和远端分类数据加载。 |
+| 状态栏与 TH | 状态栏 6 个 Tab 均可见；实际点击“任务”显示“进行中 0”，点击“地图”显示“高清地图 / 超清地图”。TavernHelper 状态条为 6/6 `ok`。 |
+| 模型、Agent 与日志 | 当前会话为真实 `cpa` 多 Agent 结果，1,436 字已采纳。调试“日志”面板实际显示 83 条记录及成功的 `LLM cpa 完成` 条目（耗时、输入/输出 token、cache 命中）；例如 27,945 ms、4122+2189 token、cache 命中 2944。重启后内存 Trace 为 0 是预期行为，持久日志仍可见。 |
+
+本轮新增的回归保护：`ShellAwareContent` 从活动 Campaign store 绑定每个
+消息内 `CardShellHost` 的 `campaign-id`；此前只有 AppV2 顶层壳有此 prop，
+所以消息内壳的 `getCharWorldbookNames('current')` 返回空值并把 DLC 误显示为
+“未找到可用角色”。
+
+同一轮还将多条 DLC 开关的持久化改为顺序写入：Campaign 世界书是共享文件，
+并发写入会造成相邻条目的更新丢失。每个 iframe 现在携带独立桥接会话令牌，
+只有其所属宿主可以处理写回；同一 Campaign 的前端批次排队，后端读改写在同一
+互斥锁内原子落盘。前端回归断言多宿主批次的最大持久化并发数为 1；后端并发开关
+回归断言两个条目都会保留，避免相邻更新丢失。读取和差异计算也在同一 Campaign
+队列内完成，因此后来的 shell 意图不会基于过期快照被当成无操作。若条目以
+`Disabled` 路由保存，重新启用只会恢复由 ST 蓝/绿灯推导出的可用路由（蓝绿同时
+启用则恢复 `Both`），无法恢复时显式报错而不伪装为已启用。
+
+自动验证（本轮）：
+
+- `npm run test:all`：343 Node tests + 36 Vitest tests 通过。
+- `npm run build`：通过（仅已有 chunk-size/dynamic-import 警告）。
+- `scripts/run-card-shell-evidence.ps1`：通过（提取、allowlist、活动书、display、TH、变量出站）。
+- `cargo test -p storyforge --lib world_info`：6/6 通过（含并发持久化与 Disabled/Both 路由恢复）。
+
+范围说明：这证明 `test-card.png` 实际依赖的首页、状态栏、TH、EJS、MVU 与
+Campaign 世界书路径可运行；不宣称未被该卡使用的全部 SillyTavern 插件 API
+已经 100% 等价。

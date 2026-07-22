@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   createCardShellRuntimeCompatibilityScript,
+  isCardShellBridgeMessageForSession,
   makeCardShellInlineModuleId,
   ownsCardShellInlineModule,
   rewriteCardShellTopBridgeAccess,
@@ -23,6 +24,19 @@ test('only the shell owning an inline module answers its bridge request', () => 
   assert.equal(ownsCardShellInlineModule(statusModules, 'card-shell-status-mod-1'), true)
   assert.equal(ownsCardShellInlineModule(openingModules, 'card-shell-status-mod-1'), false)
   assert.equal(ownsCardShellInlineModule(openingModules, ''), false)
+})
+
+test('routes bridge messages to the host session that created the iframe', () => {
+  const matching = {
+    data: { __sf_shell_bridge: true, shellSession: 'status-host:1' },
+  }
+  const sibling = {
+    data: { __sf_shell_bridge: true, shellSession: 'message-host:1' },
+  }
+
+  assert.equal(isCardShellBridgeMessageForSession(matching, 'status-host:1'), true)
+  assert.equal(isCardShellBridgeMessageForSession(sibling, 'status-host:1'), false)
+  assert.equal(isCardShellBridgeMessageForSession({ data: { __sf_shell_bridge: true } }, 'status-host:1'), false)
 })
 
 test('rewrites known top-level ST globals to the isolated shell bridge', () => {
@@ -49,19 +63,49 @@ test('does not rewrite unrelated top-window access', () => {
 })
 
 test('provides diagnostic compatibility globals so a card reports unavailable features instead of hanging', async () => {
-  const script = createCardShellRuntimeCompatibilityScript()
+  const script = createCardShellRuntimeCompatibilityScript({
+    worldbookName: 'storyforge:campaign:campaign-a',
+  })
 
   assert.match(script, /window\.getTavernHelperVersion/)
   assert.match(script, /window\.waitGlobalInitialized/)
   assert.match(script, /Mvu unavailable in the StoryForge card shell/)
   assert.doesNotMatch(script, /window\.top/)
 
-  const shellWindow = { TavernHelper: {} }
+  const requests = []
+  const shellWindow = {
+    TavernHelper: {},
+    __sfShellAsk: async (type, payload) => {
+      requests.push({ type, payload })
+      if (type === 'mvu_status') return { ready: true }
+      if (type === 'campaign_worldbook_get') return [{ name: '命定系统-测试核心', enabled: true }]
+      if (type === 'campaign_worldbook_update') return { updated: 1 }
+      throw new Error(`unexpected request: ${type}`)
+    },
+  }
   Function('window', script)(shellWindow)
 
-  assert.equal(shellWindow.getTavernHelperVersion(), null)
-  await assert.rejects(shellWindow.waitGlobalInitialized('Mvu'), /Mvu unavailable in the StoryForge card shell/)
+  assert.equal(shellWindow.getTavernHelperVersion(), '4.3.17')
+  assert.equal(
+    shellWindow.TavernHelper.getCharWorldbookNames('current').primary,
+    'storyforge:campaign:campaign-a',
+  )
+  assert.deepEqual(
+    await shellWindow.TavernHelper.getWorldbook('storyforge:campaign:campaign-a'),
+    [{ name: '命定系统-测试核心', enabled: true }],
+  )
 
-  shellWindow.Mvu = { ready: true }
+  await shellWindow.TavernHelper.updateWorldbookWith(
+    'storyforge:campaign:campaign-a',
+    (entries) => entries.map((entry) => ({ ...entry, enabled: false })),
+  )
+  assert.deepEqual(requests.at(-1), {
+    type: 'campaign_worldbook_update',
+    payload: {
+      name: 'storyforge:campaign:campaign-a',
+      entries: [{ name: '命定系统-测试核心', enabled: false }],
+    },
+  })
+
   assert.equal(await shellWindow.waitGlobalInitialized('Mvu'), shellWindow.Mvu)
 })

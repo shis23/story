@@ -80,13 +80,27 @@ impl From<i32> for SelectiveLogic {
 impl WorldInfoEntry {
     /// 根据蓝绿灯自动计算默认路由
     pub fn default_route(&self) -> LoreRoute {
-        if self.constant {
-            LoreRoute::Constant
-        } else if self.selective {
-            LoreRoute::Selective
-        } else {
-            LoreRoute::Disabled
+        match (self.constant, self.selective) {
+            (true, true) => LoreRoute::Both,
+            (true, false) => LoreRoute::Constant,
+            (false, true) => LoreRoute::Selective,
+            (false, false) => LoreRoute::Disabled,
         }
+    }
+
+    /// Enable or disable an entry while preserving a meaningful injection
+    /// route. An entry that was explicitly routed as Disabled can only be
+    /// restored if its ST blue/green flags describe a usable default route.
+    pub fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled && matches!(self.route, LoreRoute::Disabled) {
+            let restored = self.default_route();
+            if matches!(restored, LoreRoute::Disabled) {
+                return Err("world-info entry has no injectable route to restore".into());
+            }
+            self.route = restored;
+        }
+        self.disabled = !enabled;
+        Ok(())
     }
 
     pub fn matches_query(&self, query: &str) -> bool {

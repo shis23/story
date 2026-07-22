@@ -547,6 +547,7 @@ onMounted(async () => {
             <CardShellHost
               v-if="cardShellStatusUrl"
               :url="cardShellStatusUrl"
+              :campaign-id="campaign.activeCampaign?.id || null"
               label="状态栏壳"
               compact
               height="110px"
@@ -555,6 +556,7 @@ onMounted(async () => {
             <CardShellHost
               v-if="cardShellOpeningUrl && (!writing.messages || writing.messages.length <= 1)"
               :url="cardShellOpeningUrl"
+              :campaign-id="campaign.activeCampaign?.id || null"
               label="开场壳"
               height="420px"
               @var-write="onShellVarWrite"

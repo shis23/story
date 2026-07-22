@@ -323,6 +323,15 @@ function onIframeLoad() {
   // shim 加载后会 postMessage mvu:ready
 }
 
+function publishRuntimeStatus() {
+  window.__storyforgeMvuRuntime = {
+    runtime: 'WebViewMvuRuntime',
+    isReady: () => iframeReady.value,
+    isAssetsLoaded: () => assetsLoaded,
+  }
+  window.dispatchEvent(new CustomEvent('storyforge:mvu-runtime-ready'))
+}
+
 function sendToIframe(msg) {
   const win = iframeRef.value?.contentWindow
   if (win) win.postMessage(msg, '*')
@@ -389,6 +398,7 @@ function onWindowMessage(event) {
 
   if (d.type === 'mvu:ready') {
     iframeReady.value = true
+    publishRuntimeStatus()
     if (pendingAssets) {
       handleLoadAssets(pendingAssets)
       pendingAssets = null
@@ -439,6 +449,9 @@ onUnmounted(() => {
   unlistenFns = []
   executeTimers.forEach(t => clearTimeout(t))
   executeTimers.clear()
+  if (window.__storyforgeMvuRuntime?.isReady?.() === iframeReady.value) {
+    delete window.__storyforgeMvuRuntime
+  }
 })
 
 defineExpose({
