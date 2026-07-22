@@ -616,3 +616,60 @@ L1 规则化；L2/L3 可用 LLM + 知识片段。
 5. 再拆 implementation plan
 
 在此之前不建议直接开工写业务代码。
+
+---
+
+## 14. 实现进度快照（2026-07-22 审阅回写）
+
+> 详细审查见 `docs/workstreams/CARD-STUDIO-PHASE1-STATUS-2026-07-22.md`  
+> 现行设计/计划：  
+> - `docs/superpowers/specs/2026-07-22-card-studio-phase1-design.md`  
+> - `docs/superpowers/plans/2026-07-22-card-studio-phase1.md`  
+> 分支：`feat/card-studio-phase1`（worktree）
+
+### 决策落地情况
+
+| 建议决策（§12） | 状态 |
+| --- | --- |
+| 主方案原生 Card Studio | ✅ 已按此实现 |
+| 顺序 A/C 基础 → B 蒸馏 → C 深度 | 🟡 A+最小 C 已做；B 仅 prefill MVP；深度 C/MVU 未做 |
+| 外部工具=规格来源非运行时 | ✅ 未嵌 CDN 写卡器 |
+| 先资产与编译器再花活 UI | ✅ pack 资产 + compile 优先于三栏 IDE |
+| 与 worldinfo/card-shell 隔离 | ✅ 独立 worktree 分支 |
+
+### 分期对照
+
+| 分期 | 文档目标 | 分支现状 |
+| --- | --- | --- |
+| Phase 0 资产 | 知识库/阶段/文风协议入库 | 🟡 明月秋青 + distill 协议已 embed；完整知识库 JSON 未全量迁入 |
+| Phase 1 A+最小 C | 从零基础卡 + 反填补强 | ✅ 基本达成（缺 GUI 金标证据） |
+| Phase 2 B 蒸馏 | 切分/公式书/总结账本/断点 | ❌ 未达成；仅有摘录 prefill |
+| Phase 3 深度 C/系统卡 | MVU/多定义/高级世界书 | ❌ 未开始 |
+
+### 验收金标对照（Phase 1）
+
+1. 20 分钟从一句话得到可导入 JSON/PNG — **工程路径具备 JSON；PNG/计时实机证据未写**  
+2. 导入后 extract + 开 Campaign — **import 有 fallback 定义；自动 extract 未绑**  
+3. 已有卡补世界书/开场并导出 — **C 修订+导出 ST JSON 具备；覆盖策略固定另存**
+
+### 代码入口（便于审计）
+
+- domain: `crates/domain/src/card_studio.rs`
+- assets: `crates/domain/assets/cardstudio/{mingyue_qiuqing_v1,mingyue_distill_v1}/`
+- tauri: `crates/tauri-app/src/card_studio_{api,store}.rs`
+- UI: `frontend/src/components-v2/campaign/CardStudio.vue`
+
+### 测试命令
+
+```bash
+cargo test -p storyforge-domain card_studio
+cargo test -p storyforge card_studio_store
+cargo check -p storyforge
+```
+
+### 下一步（实现之后，取代 §13 的“先别写代码”）
+
+1. 补真实 LLM GUI 金标记录（A/C）
+2. import 后导航/extract 体验
+3. 评估 draft PR 或继续 B Phase2（外置小说文档 + 队列）
+4. 与 main 上 worldinfo/card-shell 变更做合并策略
