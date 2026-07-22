@@ -107,90 +107,99 @@ function patchProposalResult(msg) {
 </script>
 
 <template>
-  <div class="flex flex-col h-full min-h-0">
-    <!-- 消息流 -->
-    <div ref="messagesEl" class="flex-1 overflow-y-auto p-3 space-y-3">
-      <EmptyState
-        v-if="messages.length === 0"
-        title="问 Meta 助手任何配置问题"
-        description="「看看世界书有没有冲突」「这张卡的状态栏怎么分析」"
-      />
-
+  <!-- 列布局：消息占满中间，输入条始终贴抽屉底 -->
+  <div class="flex flex-col h-full min-h-0 min-w-0 bg-bg">
+    <div
+      ref="messagesEl"
+      class="sf-drawer-scroll flex-1 min-h-0 overflow-y-auto overscroll-y-contain"
+    >
+      <!-- 空态：在消息区垂直居中，不把输入条顶飞 -->
       <div
-        v-for="msg in messages"
-        :key="msg.id"
-        class="flex"
-        :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
+        v-if="messages.length === 0"
+        class="h-full min-h-[200px] flex items-center justify-center px-4 py-8"
       >
-        <div
-          class="max-w-[85%] rounded-2xl px-3.5 py-2 text-sm"
-          :class="msg.role === 'user'
-            ? 'bg-accent text-bg rounded-br-md'
-            : 'bg-surface-2 text-ink rounded-bl-md border border-line'"
-        >
-          <div class="whitespace-pre-wrap">{{ msg.content }}</div>
-
-          <!-- 内嵌工具结果（诊断报告 / MVU 摘要） -->
-          <template v-if="hasToolResult(msg)">
-            <!-- 世界书诊断报告 -->
-            <div
-              v-if="worldInfoResult(msg)"
-              class="mt-2 pt-2 border-t border-line text-xs space-y-1"
-            >
-              <div class="font-medium text-ink">世界书诊断</div>
-              <div class="text-ink-soft">
-                共 {{ worldInfoResult(msg).total_entries }} 条 / 蓝灯 {{ worldInfoResult(msg).constant_count }} / 绿灯 {{ worldInfoResult(msg).selective_count }}
-              </div>
-              <div v-if="worldInfoResult(msg).conflicts.length > 0" class="text-warn">
-                ⚠ {{ worldInfoResult(msg).conflicts.length }} 处冲突
-              </div>
-            </div>
-
-            <!-- 角色卡诊断报告 -->
-            <div
-              v-else-if="cardResult(msg)"
-              class="mt-2 pt-2 border-t border-line text-xs space-y-1"
-            >
-              <div class="font-medium text-ink">角色卡「{{ cardResult(msg).name }}」</div>
-              <div v-if="cardResult(msg).issues.length > 0" class="text-warn">
-                ⚠ {{ cardResult(msg).issues.length }} 个问题
-              </div>
-              <div v-else class="text-ok">✓ 未发现问题</div>
-            </div>
-
-            <!-- Patch 提议卡片 -->
-            <div
-              v-else-if="patchProposalResult(msg)"
-              class="mt-2 pt-2 border-t border-line text-xs"
-            >
-              <div class="font-medium text-accent">提议 Patch（待采纳）</div>
-              <div class="text-ink-soft mt-0.5">{{ patchProposalResult(msg).description }}</div>
-              <div class="text-ink-soft">{{ patchProposalResult(msg).action_count }} 个操作</div>
-            </div>
-          </template>
-        </div>
+        <EmptyState
+          title="问 Meta 助手任何配置问题"
+          description="「看看世界书有没有冲突」「这张卡的状态栏怎么分析」"
+        />
       </div>
 
-      <!-- 流式加载指示 -->
-      <div v-if="loading && messages.length > 0 && messages[messages.length - 1].role === 'user'" class="flex justify-start">
-        <div class="bg-surface-2 text-ink-soft rounded-2xl rounded-bl-md px-3.5 py-2 text-sm border border-line">
-          <span class="inline-block animate-pulse">●●●</span>
+      <div v-else class="p-3 pb-4 space-y-3">
+        <div
+          v-for="msg in messages"
+          :key="msg.id"
+          class="flex"
+          :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
+        >
+          <div
+            class="max-w-[85%] rounded-2xl px-3.5 py-2 text-sm break-words"
+            :class="msg.role === 'user'
+              ? 'bg-accent text-bg rounded-br-md'
+              : 'bg-surface-2 text-ink rounded-bl-md border border-line'"
+          >
+            <div class="whitespace-pre-wrap">{{ msg.content }}</div>
+
+            <template v-if="hasToolResult(msg)">
+              <div
+                v-if="worldInfoResult(msg)"
+                class="mt-2 pt-2 border-t border-line text-xs space-y-1"
+              >
+                <div class="font-medium text-ink">世界书诊断</div>
+                <div class="text-ink-soft">
+                  共 {{ worldInfoResult(msg).total_entries }} 条 / 蓝灯 {{ worldInfoResult(msg).constant_count }} / 绿灯 {{ worldInfoResult(msg).selective_count }}
+                </div>
+                <div v-if="worldInfoResult(msg).conflicts.length > 0" class="text-warn">
+                  ⚠ {{ worldInfoResult(msg).conflicts.length }} 处冲突
+                </div>
+              </div>
+
+              <div
+                v-else-if="cardResult(msg)"
+                class="mt-2 pt-2 border-t border-line text-xs space-y-1"
+              >
+                <div class="font-medium text-ink">角色卡「{{ cardResult(msg).name }}」</div>
+                <div v-if="cardResult(msg).issues.length > 0" class="text-warn">
+                  ⚠ {{ cardResult(msg).issues.length }} 个问题
+                </div>
+                <div v-else class="text-ok">✓ 未发现问题</div>
+              </div>
+
+              <div
+                v-else-if="patchProposalResult(msg)"
+                class="mt-2 pt-2 border-t border-line text-xs"
+              >
+                <div class="font-medium text-accent">提议 Patch（待采纳）</div>
+                <div class="text-ink-soft mt-0.5">{{ patchProposalResult(msg).description }}</div>
+                <div class="text-ink-soft">{{ patchProposalResult(msg).action_count }} 个操作</div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div
+          v-if="loading && messages.length > 0 && messages[messages.length - 1].role === 'user'"
+          class="flex justify-start"
+        >
+          <div class="bg-surface-2 text-ink-soft rounded-2xl rounded-bl-md px-3.5 py-2 text-sm border border-line">
+            <span class="inline-block animate-pulse">●●●</span>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- 输入栏 -->
-    <div class="border-t border-line p-3 shrink-0">
-      <div class="flex gap-2">
+    <!-- 输入条：固定在对话区底部（= 抽屉底） -->
+    <div class="shrink-0 border-t border-line bg-surface p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+      <div class="flex gap-2 items-end">
         <Input
           v-model="userInput"
           placeholder="问 Meta 助手…（如：看看世界书有没有冲突）"
           :disabled="loading"
-          class="flex-1"
+          class="flex-1 min-w-0"
           @keyup.enter="handleSend"
         />
         <Button
           variant="primary"
+          class="shrink-0"
           :disabled="loading || !userInput.trim()"
           :loading="loading"
           @click="handleSend"

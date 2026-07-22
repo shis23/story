@@ -1,8 +1,9 @@
 <script setup>
 /**
  * MetaScreen — Meta 助手壳（重设计 · 纯展示）。
- * 固定宽度由外层 Overlay/PanelHost 控制；本组件只做顶栏 + tab + 内容区骨架。
- * 所有 tab 共用同一内容容器（同 padding / 同 min-width:0），避免空态文案长短导致视觉跳宽。
+ *
+ * fillContent=true（对话）：内容区填满剩余高度，子组件自管（消息滚 + 输入贴底）。
+ * fillContent=false（其它 tab）：内容区可滚，底部留白。
  */
 defineProps({
   activeTab: { type: String, default: 'chat' },
@@ -19,6 +20,8 @@ defineProps({
   pendingPatchCount: { type: Number, default: 0 },
   globalError: { type: String, default: '' },
   campaignName: { type: String, default: '' },
+  /** 对话等需要「输入贴底」的屏传 true */
+  fillContent: { type: Boolean, default: false },
 })
 
 defineEmits(['close', 'change-tab'])
@@ -70,8 +73,18 @@ defineEmits(['close', 'change-tab'])
       </button>
     </nav>
 
-    <!-- 统一内容井：弹性滚动 + 底部留白；tab 同宽同垫 -->
-    <div class="sf-drawer-scroll flex-1 min-h-0 min-w-0 overflow-y-auto overscroll-y-contain bg-bg">
+    <!-- 对话：填满高度，输入条由 MetaChat 贴底 -->
+    <div
+      v-if="fillContent"
+      class="flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden"
+    >
+      <slot :active-tab="activeTab" />
+    </div>
+    <!-- 其它 tab：可滚动 + 底部留白 -->
+    <div
+      v-else
+      class="sf-drawer-scroll flex-1 min-h-0 min-w-0 overflow-y-auto overscroll-y-contain bg-bg"
+    >
       <div class="w-full min-w-0 p-4 pb-12">
         <slot :active-tab="activeTab" />
       </div>
