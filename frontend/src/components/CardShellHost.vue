@@ -36,7 +36,13 @@
  * 与隐藏 MvuJsRuntime 职责分离：本组件负责呈现 + 宿主代持网络。
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { cardShellFetchUrl } from '../tauri-api.js'
+import {
+  generateBridgeScript,
+  createHostHandler,
+  MSG_REQUEST,
+} from '../plugin-bridge.js'
 
 const props = defineProps({
   /** Remote shell entry URL (preferred) */
@@ -64,6 +70,20 @@ const error = ref(null)
 const loadedUrl = ref(null)
 let loadSeq = 0
 let bridgeHandler = null
+let stHostHandler = null
+// Reuse PluginHost ST surface (plugin-bridge.js) instead of hand-rolled free globals.
+const shellPluginId = 'card-shell-' + Math.random().toString(36).slice(2, 10)
+const shellVirtualPlugin = {
+  id: shellPluginId,
+  permissions: [
+    'ReadVariables',
+    'WriteVariables',
+    'ReadMemory',
+    'ReadCharacter',
+    'ModifyPrompt',
+    'Generate',
+  ],
+}
 /** @type {Map<string, string>} host-side store for large inline modules */
 const inlineModuleSources = new Map()
 let inlineModuleSeq = 0
@@ -378,134 +398,13 @@ function wrapRemoteHtml(html, pageUrl) {
     "  var obs = new MutationObserver(function(){ patch$(); });",
     "  obs.observe(document.documentElement, { childList: true, subtree: true });",
     "  var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);",
-    "  var V = window.__sfShellVars || (window.__sfShellVars = {});",
-    "  // Multi-scope var bags used by status/home shells (ST getVariables API).",
-    "  var SCOPES = window.__sfShellVarScopes || (window.__sfShellVarScopes = {",
-    "    global: {},",
-    "    character: V,",
-    "    chat: {},",
-    "    message: {},",
-    "    script: {},",
-    "  });",
-    "  function scopeBag(opts){",
-    "    var type = (opts && opts.type) || 'character';",
-    "    if (!SCOPES[type]) SCOPES[type] = {};",
-    "    return SCOPES[type];",
-    "  }",
-    "  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };",
-    "  window.setvar = function(k, v){",
-    "    V[k] = v;",
-    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'var_write', payload: { key: k, value: v, scope: 'character' } }, '*'); } catch (e) {}",
-    "    return v;",
-    "  };",
-    "  window.getChatVariable = window.getvar;",
-    "  window.setChatVariable = window.setvar;",
-    "  // ST free functions expected by FrontEnd-for-destined-journey status shell",
-    "  window.getVariables = function(opts){",
-    "    var bag = scopeBag(opts);",
-    "    return Object.assign({}, bag);",
-    "  };",
-    "  window.setVariables = function(vars, opts){",
-    "    var bag = scopeBag(opts);",
-    "    if (vars && typeof vars === 'object') {",
-    "      Object.keys(vars).forEach(function(k){ bag[k] = vars[k]; });",
-    "      if (((opts && opts.type) || 'character') === 'character') {",
-    "        Object.keys(vars).forEach(function(k){",
-    "          try { parent.postMessage({ __sf_shell_bridge: true, type: 'var_write', payload: { key: k, value: vars[k], scope: 'character' } }, '*'); } catch (e) {}",
-    "        });",
-    "      }",
-    "    }",
-    "    return bag;",
-    "  };",
-    "  window.insertOrAssignVariables = function(vars, opts){",
-    "    return window.setVariables(vars, opts);",
-    "  };",
-    "  window.deleteVariable = function(key, opts){",
-    "    var bag = scopeBag(opts);",
-    "    delete bag[key];",
-    "    return true;",
-    "  };",
-    "  window.updateVariablesWith = async function(fn, opts){",
-    "    var bag = scopeBag(opts);",
-    "    var next = typeof fn === 'function' ? await fn(Object.assign({}, bag)) : bag;",
-    "    if (next && typeof next === 'object') {",
-    "      Object.keys(bag).forEach(function(k){ delete bag[k]; });",
-    "      Object.keys(next).forEach(function(k){ bag[k] = next[k]; });",
-    "    }",
-    "    return bag;",
-    "  };",
-    "  window.getChatMessages = function(){ return (window.SillyTavern && window.SillyTavern.chat) || []; };",
-    "  window.getLastMessageId = function(){",
-    "    var c = window.getChatMessages();",
-    "    return c.length ? c.length - 1 : -1;",
-    "  };",
-    "  // Status shell free functions (FrontEnd-for-destined-journey).",
-    "  window.getCurrentMessageId = window.getCurrentMessageId || function(){",
-    "    if (typeof window.__sfCurrentMessageId === 'number') return window.__sfCurrentMessageId;",
-    "    return window.getLastMessageId();",
-    "  };",
-    "  window.triggerSlash = window.triggerSlash || function(){ return Promise.resolve(''); };",
-    "  window.eventOn = window.eventOn || function(){ return function(){}; };",
-    "  window.eventEmit = window.eventEmit || function(){};",
-    "  window.eventRemoveListener = window.eventRemoveListener || function(){};",
-    "  window.substituteParams = window.substituteParams || function(s){ return String(s == null ? '' : s); };",
-    "  window.getScriptId = window.getScriptId || function(){ return 'storyforge-shell'; };",
-    "  window.getContext = window.getContext || function(){",
-    "    return {",
-    "      chat: window.getChatMessages(),",
-    "      characters: (window.SillyTavern && window.SillyTavern.characters) || [],",
-    "      characterId: (window.SillyTavern && window.SillyTavern.characterId) || 0,",
-    "      name1: (window.SillyTavern && window.SillyTavern.name1) || 'User',",
-    "      name2: (window.SillyTavern && window.SillyTavern.name2) || 'Assistant',",
-    "      getCurrentChatId: function(){ return (window.SillyTavern && window.SillyTavern.getCurrentChatId && window.SillyTavern.getCurrentChatId()) || 'storyforge-shell-chat'; },",
-    "      extensionSettings: (window.SillyTavern && window.SillyTavern.extensionSettings) || {},",
-    "      chatMetadata: {},",
-    "    };",
-    "  };",
-    "  // Minimal Mvu facade used by status shell when full MagVarUpdate already ran in TH iframe.",
-    "  if (!window.Mvu) {",
-    "    window.Mvu = {",
-    "      getMvuData: function(){ return window.getVariables({ type: 'character' }); },",
-    "      replaceMvuData: function(data){ return window.setVariables(data || {}, { type: 'character' }); },",
-    "      parseMessage: async function(){ return null; },",
-    "      getCurrentMvuData: function(){ return window.getVariables({ type: 'character' }); },",
-    "    };",
-    "  }",
-    "  try { globalThis.getCurrentMessageId = window.getCurrentMessageId; } catch (eG) {}",
-    "  try { globalThis.getVariables = window.getVariables; } catch (eG2) {}",
-    "  try { globalThis.insertOrAssignVariables = window.insertOrAssignVariables; } catch (eG3) {}",
-    "  try { globalThis.deleteVariable = window.deleteVariable; } catch (eG4) {}",
-    "  try { globalThis.triggerSlash = window.triggerSlash; } catch (eG5) {}",
-    "  try { globalThis.getContext = window.getContext; } catch (eG6) {}",
-    "  try { globalThis.Mvu = window.Mvu; } catch (eG7) {}",
-    "  window.TavernHelper = window.TavernHelper || {",
-    "    getVariable: window.getvar,",
-    "    setVariable: window.setvar,",
-    "    getVariables: function(opts){ return window.getVariables(opts || { type: 'character' }); },",
-    "    setVariables: function(vars, opts){ return window.setVariables(vars, opts); },",
-    "    insertOrAssignVariables: function(vars, opts){ return window.insertOrAssignVariables(vars, opts); },",
-    "    updateVariablesWith: function(fn, opts){ return window.updateVariablesWith(fn, opts); },",
-    "    getCharWorldbookNames: function(){ return { primary: null }; },",
-    "    getWorldbook: async function(){ return []; },",
-    "    updateWorldbookWith: async function(){ return []; },",
-    "  };",
-    "  window.tavernHelper = window.TavernHelper;",
-    "  if (!window.SillyTavern) {",
-    "    window.SillyTavern = {",
-    "      chat: [], extensionSettings: {}, characters: [], characterId: 0,",
-    "      name1: 'User', name2: 'Assistant',",
-    "      POPUP_TYPE: { TEXT: 1, CONFIRM: 2, INPUT: 3 },",
-    "      POPUP_RESULT: { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: -1 },",
-    "      ToolManager: { isToolCallingSupported: function(){ return false; } },",
-    "      getRequestHeaders: function(){ return { 'Content-Type': 'application/json' }; },",
-    "      getCurrentChatId: function(){ return 'storyforge-shell-chat'; },",
-    "      saveChat: async function(){ return true; },",
-    "      saveSettingsDebounced: function(){},",
-    "      callGenericPopup: async function(){ return -1; },",
-    "      registerMacro: function(){}, unregisterMacro: function(){},",
-    "    };",
-    "  }",
-    "})();",
+    "  // ST free APIs come from generateBridgeScript (plugin-bridge). Do not reimplement here.",
+"  try {",
+"    if (window.SillyTavern && Array.isArray(window.SillyTavern.chat) && window.SillyTavern.chat.length === 0) {",
+"      window.SillyTavern.chat.push({ name: 'Assistant', mes: '', message: '', is_user: false });",
+"    }",
+"  } catch (eSeed) {}",
+"})();",
   ]
   const preloadLines = [
     "(function(){",
@@ -589,8 +488,11 @@ function wrapRemoteHtml(html, pageUrl) {
     "})();",
   ]
 
+  // Existing full ST/TavernHelper/SillyTavern surface from plugin-bridge (do not reimplement).
+  const stBridgeHtml = generateBridgeScript(shellPluginId, '*')
   const headInject =
     baseTag +
+    stBridgeHtml +
     sOpen + bridgeLines.join('\n') + sClose +
     sOpen + preloadLines.join('\n') + sClose +
     sOpen + fetchPatchLines.join('\n') + sClose
@@ -670,6 +572,11 @@ function onIframeLoad() {
 
 async function onBridgeMessage(ev) {
   const d = ev.data
+  // Full ST API requests: reuse plugin-bridge host handler (same as PluginHost).
+  if (d && d.type === MSG_REQUEST && d.pluginId === shellPluginId) {
+    if (stHostHandler) stHostHandler(ev)
+    return
+  }
   if (!d || !d.__sf_shell_bridge) return
   // blob/sandbox: source identity can be flaky; accept bridge messages without hard contentWindow match
   if (d.type === 'var_write') {
@@ -752,12 +659,21 @@ watch(
 
 onMounted(() => {
   bridgeHandler = onBridgeMessage
+  stHostHandler = createHostHandler(shellVirtualPlugin, invoke, {
+    isTrustedSource: (event) => {
+      try {
+        if (iframeRef.value?.contentWindow && event.source === iframeRef.value.contentWindow) return true
+      } catch (_) {}
+      return !!(event?.data && event.data.pluginId === shellPluginId)
+    },
+  })
   window.addEventListener('message', bridgeHandler)
   loadShell()
 })
 
 onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
+  stHostHandler = null
   loadSeq++
   revokeFrameBlob()
 })

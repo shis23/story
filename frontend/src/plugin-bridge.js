@@ -831,7 +831,8 @@ export function generateBridgeScript(pluginId, hostOrigin = defaultHostOrigin())
     if (value.type === 'preset') {
       return hasOnlyKeys(['type', 'preset_id', 'presetId', 'name']);
     }
-    if (['local', 'chat', 'global'].includes(value.type)) {
+    // ST card shells also use character/script bags (FrontEnd-for-destined-journey).
+    if (['local', 'chat', 'global', 'character', 'script'].includes(value.type)) {
       return hasOnlyKeys(['type']);
     }
     return false;
