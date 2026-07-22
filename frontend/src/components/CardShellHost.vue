@@ -154,12 +154,20 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
     // Tiny module stub: fetch source from host by id, then run graph in iframe origin.
     const tag =
       '<' + sc + ' type="module">' +
+      '(async()=>{' +
+      'try{' +
       'await (window.__sfShellPreloadPromise || Promise.resolve());' +
+      'if (typeof window.__sfShellRunInlineModuleFromHost !== "function") throw new Error("shell runner missing");' +
       'await window.__sfShellRunInlineModuleFromHost(' +
       JSON.stringify(id) +
       ', ' +
       JSON.stringify(entry + '#' + id) +
       ');' +
+      '}catch(err){' +
+      'try{parent.postMessage({__sf_shell_bridge:true,type:"shell_runtime",payload:{kind:"module_error",detail:String((err&&err.message)||err)}},"*");}catch(_e){}' +
+      'console.error("[CardShell] module boot", err);' +
+      '}' +
+      '})();' +
       '</' + sc + '>'
     parts.push(tag)
     last = re.lastIndex
@@ -249,7 +257,7 @@ function wrapRemoteHtml(html, pageUrl) {
     "          var sp = specs[i];",
     "          var abs = sp;",
     "          if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, url).href; } catch (e) { continue; } }",
-    "          try { map[sp] = await load(abs); } catch (e) { console.warn('[CardShell] dep fail', abs, e); }",
+    "          map[sp] = await load(abs);",
     "        }",
     "        if (Object.keys(map).length) {",
     "          re = window.__sfShellImportSpecRe();",
@@ -269,30 +277,58 @@ function wrapRemoteHtml(html, pageUrl) {
 "    var code = await ask('fetch_inline_module', { id: id });",
 "    return window.__sfShellRunInlineModule(code, entryUrl);",
 "  };",
-"  window.__sfShellRunInlineModule = async function(code, entryUrl){",
-    "    var re = window.__sfShellImportSpecRe();",
-    "    var specs = [];",
-    "    var m;",
-    "    while ((m = re.exec(code)) !== null) {",
-    "      var spec = m[1];",
-    "      if (!spec) continue;",
-    "      if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
-    "    }",
-    "    var map = Object.create(null);",
-    "    for (var i = 0; i < specs.length; i++) {",
-    "      var sp = specs[i];",
-    "      var abs = sp;",
-    "      if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, entryUrl || 'https://shell.local/inline.js').href; } catch (e) { continue; } }",
-    "      try { map[sp] = await window.__sfShellResolveModuleBlob(abs); } catch (e) { console.warn('[CardShell] inline dep fail', abs, e); }",
-    "    }",
-    "    if (Object.keys(map).length) {",
-    "      re = window.__sfShellImportSpecRe();",
-    "      code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
-    "    }",
-    "    var blobUrl = window.__sfShellSourceToBlob(code);",
-    "    return import(blobUrl);",
+"  window.__sfShellBindGlobalsPreamble = function(){",
+    "    var nl = String.fromCharCode(10);",
+    "    return [",
+    "      'const __sfG = globalThis;',",
+    "      'const Vue = __sfG.Vue;',",
+    "      'const $ = __sfG.$ || __sfG.jQuery;',",
+    "      'const jQuery = __sfG.jQuery || __sfG.$;',",
+    "      'const _ = __sfG._;',",
+    "      'const getvar = __sfG.getvar;',",
+    "      'const setvar = __sfG.setvar;',",
+    "      'const TavernHelper = __sfG.TavernHelper || __sfG.tavernHelper;',",
+    "      'const tavernHelper = __sfG.tavernHelper || __sfG.TavernHelper;',",
+    "      'const SillyTavern = __sfG.SillyTavern;'",
+    "    ].join(nl) + nl;",
     "  };",
-    "  function patch$(){",
+    "  window.__sfShellReport = function(kind, detail){",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: kind, detail: String(detail || '') } }, '*'); } catch (e) {}",
+    "  };",
+    "  window.__sfShellRunInlineModule = async function(code, entryUrl){",
+    "    try {",
+    "      window.__sfShellReport('module_start', entryUrl || '');",
+    "      var re = window.__sfShellImportSpecRe();",
+    "      var specs = [];",
+    "      var m;",
+    "      while ((m = re.exec(code)) !== null) {",
+    "        var spec = m[1];",
+    "        if (!spec) continue;",
+    "        if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
+    "      }",
+    "      var map = Object.create(null);",
+    "      for (var i = 0; i < specs.length; i++) {",
+    "        var sp = specs[i];",
+    "        var abs = sp;",
+    "        if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, entryUrl || 'https://shell.local/inline.js').href; } catch (e) { throw new Error('bad relative import ' + sp); } }",
+    "        map[sp] = await window.__sfShellResolveModuleBlob(abs);",
+    "        if (!map[sp]) throw new Error('dep blob empty: ' + abs);",
+    "      }",
+    "      if (Object.keys(map).length) {",
+    "        re = window.__sfShellImportSpecRe();",
+    "        code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
+    "      }",
+    "      code = window.__sfShellBindGlobalsPreamble() + code;",
+    "      var blobUrl = window.__sfShellSourceToBlob(code);",
+    "      var mod = await import(blobUrl);",
+    "      window.__sfShellReport('module_ok', entryUrl || '');",
+    "      return mod;",
+    "    } catch (err) {",
+    "      window.__sfShellReport('module_error', (err && err.message) || err);",
+    "      throw err;",
+    "    }",
+    "  };",
+"  function patch$(){",
     "    if (!window.jQuery || window.jQuery.__sfLoadPatched) return !!window.jQuery;",
     "    var $ = window.jQuery;",
     "    $.fn.load = function(url, data, complete){",
@@ -343,6 +379,21 @@ function wrapRemoteHtml(html, pageUrl) {
     "    updateWorldbookWith: async function(){ return []; },",
     "  };",
     "  window.tavernHelper = window.TavernHelper;",
+    "  if (!window.SillyTavern) {",
+    "    window.SillyTavern = {",
+    "      chat: [], extensionSettings: {}, characters: [], characterId: 0,",
+    "      name1: 'User', name2: 'Assistant',",
+    "      POPUP_TYPE: { TEXT: 1, CONFIRM: 2, INPUT: 3 },",
+    "      POPUP_RESULT: { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: -1 },",
+    "      ToolManager: { isToolCallingSupported: function(){ return false; } },",
+    "      getRequestHeaders: function(){ return { 'Content-Type': 'application/json' }; },",
+    "      getCurrentChatId: function(){ return 'storyforge-shell-chat'; },",
+    "      saveChat: async function(){ return true; },",
+    "      saveSettingsDebounced: function(){},",
+    "      callGenericPopup: async function(){ return -1; },",
+    "      registerMacro: function(){}, unregisterMacro: function(){},",
+    "    };",
+    "  }",
     "})();",
   ]
   const preloadLines = [
@@ -365,7 +416,11 @@ function wrapRemoteHtml(html, pageUrl) {
     "    if (!window._) {",
     "      try { await classic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; }); } catch (e) { console.warn(e); }",
     "    }",
-    "  })();",
+    "    if (!window.Vue) throw new Error('Vue missing after shell preload');",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: 'preload_ok', detail: 'vue+jquery' } }, '*'); } catch (e0) {}",
+    "  })().catch(function(err){",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'shell_runtime', payload: { kind: 'preload_error', detail: String((err && err.message) || err) } }, '*'); } catch (e1) {}",
+    "  });",
     "})();",
   ]
   const fetchPatchLines = [
@@ -472,6 +527,19 @@ async function onBridgeMessage(ev) {
   if (d.type === 'var_write') {
     emit('message', d)
     emit('var-write', d.payload || {})
+    return
+  }
+  if (d.type === 'shell_runtime') {
+    const p = d.payload || {}
+    const kind = p.kind || ''
+    const detail = p.detail || ''
+    if (kind === 'module_error' || kind === 'preload_error') {
+      error.value = detail || kind
+      emit('error', error.value)
+    } else if (kind === 'module_ok' || kind === 'preload_ok' || kind === 'module_start') {
+      console.info('[CardShell]', kind, detail)
+    }
+    emit('message', d)
     return
   }
   if (!d.id) return
