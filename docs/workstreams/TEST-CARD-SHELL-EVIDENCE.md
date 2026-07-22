@@ -57,3 +57,16 @@
 - 手搓壳内 ST free function 易与已有 `plugin-bridge` 分叉；后续应以 bridge 为单一来源。  
 - 用户确认视觉正确后勿擅自回滚到旧 shim。  
 - 重启可能导致「同提交看起来又坏」；对比应用提交哈希 + 干净 `bash dev.sh`。
+
+## 2026-07-23 真实桌面 UI 续验
+
+- Tauri 桌面端 Campaign `命定之诗 UI验收 2026-07-23` 已实际完成一轮 `cpa` 多 Agent 写作；LLM 日志显示真实耗时、token 与 cache 命中。
+- 已实际点击变体的“采纳”，页面按钮状态变为“已采纳”，当前会话正文为 1,436 字。
+- 开场 home 与 status 壳同时挂载时的 inline module 串线已修复：每个宿主使用独立 module id，非拥有宿主静默忽略请求；home 可见 `命定之诗与黄昏之歌`、`Destined Poetry & Twilight Song` 与制作团队内容。
+- 概览页“继续写作”现在会恢复该 Campaign 最近更新的会话，而非进入空白写作页；已在 Tauri 中复验。
+- 首页“环境检查”不再永久显示“加载中”。它现在如实显示当前桥接能力：TavernHelper 版本未知、EJS 未检测到、MVU 异常/超时；这些项**不是通过**，也没有被伪造为可用。
+- 前端全套：`npm run test:all` 337 node tests + 35 Vitest tests 通过；`npm run build` 通过（仅现有 chunk-size/dynamic-import 警告）。
+
+### 仍未完成
+
+要让 home 环境检查全绿，仍需实现真实的 TavernHelper 版本/世界书兼容层、EJS 模板引擎与可暴露给 card shell 的 MVU 运行时；在这些能力实际存在前，当前 UI 保持明确的不可用状态。

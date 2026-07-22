@@ -93,6 +93,7 @@ import {
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
 import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
+import { findLatestCampaignConversation } from './utils/overviewNavigation.js'
 
 // ─── stores ───
 const writing = useWritingStore()
@@ -420,13 +421,27 @@ const { openNewCampaignDialog } = newCampaignForm
       openNewCampaign: openNewCampaignDialog,
     })
 
+  async function continueActiveCampaignWriting() {
+    const latestConversation = findLatestCampaignConversation(
+      campaign.conversationHistory,
+      campaign.activeCampaign?.id,
+    )
+
+    if (latestConversation) {
+      await openConversation(latestConversation)
+      return
+    }
+
+    ui.viewWrite()
+  }
+
   // 11. overview screen adapter —— design/overview 纯展示层接线
   const { screenProps: overviewScreenProps, screenEvents: overviewScreenEvents } =
     useOverviewScreenAdapter({
       openCampaign: () => { ui.showCampaignPanel = true },
       viewHistory: () => ui.viewHistory(),
       openNewCampaign: openNewCampaignDialog,
-      continueWriting: () => ui.viewWrite(),
+      continueWriting: continueActiveCampaignWriting,
     })
 
   // 活动 Turn 质量报告回填（刷新后 ProcessReview 仍可显示）

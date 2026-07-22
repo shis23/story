@@ -39,6 +39,12 @@ import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { cardShellFetchUrl } from '../tauri-api.js'
 import {
+  createCardShellRuntimeCompatibilityScript,
+  makeCardShellInlineModuleId,
+  ownsCardShellInlineModule,
+  rewriteCardShellTopBridgeAccess,
+} from '../utils/cardShellDocument.js'
+import {
   generateBridgeScript,
   createHostHandler,
   MSG_REQUEST,
@@ -168,7 +174,7 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
     const code = match[2] || ''
     if (!code.trim()) continue
     parts.push(html.slice(last, match.index))
-    const id = 'mod_' + (++inlineModuleSeq)
+    const id = makeCardShellInlineModuleId(shellPluginId, ++inlineModuleSeq)
     inlineModuleSources.set(id, code)
     const entry = pageUrl || 'https://shell.local/inline-module.js'
     // Tiny module stub: fetch source from host by id, then run graph in iframe origin.
@@ -199,7 +205,10 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
 }
 
 async function prepareShellDocument(html, pageUrl) {
-  const wrapped = wrapRemoteHtml(html, pageUrl)
+  // Remote card pages commonly ask `window.top.TavernHelper` for ST state.
+  // The shell intentionally has an opaque sandbox origin, so route only the
+  // known compatibility globals to its own plugin-bridge surface.
+  const wrapped = wrapRemoteHtml(rewriteCardShellTopBridgeAccess(html), pageUrl)
   try {
     return await rewriteModuleScriptsInHtml(wrapped, pageUrl)
   } catch (e) {
@@ -493,6 +502,7 @@ function wrapRemoteHtml(html, pageUrl) {
   const headInject =
     baseTag +
     stBridgeHtml +
+    sOpen + createCardShellRuntimeCompatibilityScript() + sClose +
     sOpen + bridgeLines.join('\n') + sClose +
     sOpen + preloadLines.join('\n') + sClose +
     sOpen + fetchPatchLines.join('\n') + sClose
@@ -637,9 +647,9 @@ async function onBridgeMessage(ev) {
     }
     if (type === 'fetch_inline_module') {
       const id = payload.id
-      if (!id || !inlineModuleSources.has(id)) {
-        throw new Error('unknown inline module id: ' + id)
-      }
+      // All visible shell hosts receive the same parent-window message. A
+      // non-owner must not race the source owner with an error response.
+      if (!ownsCardShellInlineModule(inlineModuleSources, id)) return
       reply(inlineModuleSources.get(id))
       return
     }

@@ -138,3 +138,14 @@ d547dd7 feat(card-shell): ordered tavern_helper runtime
 ## 一句话
 
 世界书分层与 TH 6/6、状态栏可渲染已到「能跑」；**test-card 开场金标页（制作团队）尚未对齐**，暂停功能改动，先以本文为进度真相源。
+
+---
+
+## 2026-07-23 续验更新（取代上述 home 错页判断）
+
+- 已在真实 Tauri UI 复现并修复多 shell 同时存在时的 module source 抢答：status/home 不再互相加载对方源码。
+- home 金标标题与制作团队内容已在首页壳和消息内首页壳显示；status 壳 Tab 与 TavernHelper 6/6 仍通过。
+- “继续写作”已改为打开当前 Campaign 的最近会话，真实 UI 已恢复已采纳的 1,436 字会话。
+- home 环境检查现在能终止并显示实际诊断，而不是永远“加载中”。未提供的 TavernHelper 版本、EJS 与 MVU 能力明确报告为未找到/未检测到/异常，不能记为完整 ST 兼容。
+
+后续的唯一兼容性缺口是把上述三项接到真实 StoryForge 运行态；在此之前不应把环境检查写成通过，也不应把当前 card shell 宣称为 100% SillyTavern 等价。
