@@ -186,6 +186,38 @@ function bootstrapSrcdoc() {
     return results;
   };
 
+  // Parent is cross-origin to blob: iframe — only postMessage, never contentWindow access.
+  window.addEventListener('message', function(ev){
+    var d = ev.data || {};
+    if (!d || !d.__sf_th_host) return;
+    if (d.type === 'run_scripts') {
+      window.__sfThRunScripts(d.items || []).then(function(results){
+        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, results: results }, '*');
+      }).catch(function(err){
+        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, error: String((err && err.message) || err) }, '*');
+      });
+      return;
+    }
+    if (d.type === 'button') {
+      try {
+        var name = (d.payload && d.payload.name) || '';
+        var th = window.TavernHelper || window.tavernHelper || {};
+        if (typeof th.triggerSlash === 'function') {
+          try { th.triggerSlash('/button ' + name); } catch (e1) {}
+        }
+        if (typeof window.triggerSlash === 'function') {
+          try { window.triggerSlash('/button ' + name); } catch (e2) {}
+        }
+        if (typeof window.eventEmit === 'function') {
+          window.eventEmit('th_button', d.payload || {});
+        }
+        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: true }, '*');
+      } catch (e) {
+        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: false, error: String((e && e.message) || e) }, '*');
+      }
+    }
+  });
+
   parent.postMessage({ __sf_th_bridge: true, type: 'ready' }, '*');
 })();
 `
@@ -299,13 +331,14 @@ async function fetchModuleBlob(entryUrl, cache = new Map(), depth = 0) {
 async function onBridgeMessage(ev) {
   const d = ev.data
   if (!d || !d.__sf_th_bridge) return
-  if (!iframeRef.value || (ev.source && ev.source !== iframeRef.value.contentWindow)) {
-    // allow ready without strict source on first paint in some webviews
-    if (d.type !== 'ready' && d.type !== 'var_write' && !d.id) return
-  }
+  // blob: iframe is cross-origin — do not require contentWindow identity.
 
   if (d.type === 'ready') {
     iframeReady.value = true
+    return
+  }
+  if (d.type === 'run_done' || d.type === 'button_done') {
+    // handled by waitForBridgeEvent listeners
     return
   }
   if (d.type === 'var_write') {
@@ -373,6 +406,32 @@ async function waitReady(timeoutMs = 15000) {
   }
 }
 
+function postToIframe(message) {
+  const win = iframeRef.value?.contentWindow
+  if (!win) throw new Error('TH iframe missing')
+  win.postMessage(message, '*')
+}
+
+function waitForBridgeEvent(type, requestId, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      window.removeEventListener('message', onMsg)
+      reject(new Error(`TH ${type} timeout`))
+    }, timeoutMs)
+    function onMsg(ev) {
+      const d = ev.data || {}
+      if (!d || !d.__sf_th_bridge) return
+      if (d.type !== type) return
+      if (requestId != null && d.requestId !== requestId) return
+      clearTimeout(timer)
+      window.removeEventListener('message', onMsg)
+      resolve(d)
+    }
+    window.addEventListener('message', onMsg)
+  })
+}
+
+
 async function runAll() {
   const seq = ++runSeq
   lastError.value = null
@@ -390,10 +449,6 @@ async function runAll() {
     setFrameHtml(bootstrapSrcdoc())
     await waitReady(15000)
     if (seq !== runSeq) return
-    const win = iframeRef.value?.contentWindow
-    if (!win || typeof win.__sfThRunScripts !== 'function') {
-      throw new Error('TH runner missing in iframe')
-    }
     const payload = []
     for (const s of scripts.value) {
       let js = s.js
@@ -402,7 +457,7 @@ async function runAll() {
         try {
           js = await getCardShellInlineJs(props.characterId, s.label)
         } catch (e) {
-          throw new Error(`拉取 inline TH「${s.label}」失败: ${e?.message || e}`)
+          throw new Error('fetch inline TH failed: ' + s.label + ' ' + (e?.message || e))
         }
       }
       payload.push({
@@ -412,9 +467,14 @@ async function runAll() {
         js,
       })
     }
-    const results = await win.__sfThRunScripts(payload)
+    const requestId = 'run_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+    const doneP = waitForBridgeEvent('run_done', requestId, 180000)
+    postToIframe({ __sf_th_host: true, type: 'run_scripts', requestId, items: payload })
+    const done = await doneP
     if (seq !== runSeq) return
-    const failed = (results || []).filter((r) => !r.ok)
+    if (done.error) throw new Error(done.error)
+    const results = done.results || []
+    const failed = results.filter((r) => !r.ok)
     if (failed.length) {
       lastError.value = failed.map((f) => `#${f.index + 1}: ${f.error}`).join(' | ')
       emit('error', lastError.value)
@@ -433,15 +493,7 @@ async function runAll() {
 }
 
 function onIframeLoad() {
-  // Fallback: if postMessage ready is delayed/blocked, mark ready when runner exists.
-  try {
-    const win = iframeRef.value?.contentWindow
-    if (win && typeof win.__sfThRunScripts === 'function') {
-      iframeReady.value = true
-    }
-  } catch (_) {
-    /* cross-origin not expected for blob */
-  }
+  // blob: is opaque to parent; readiness is only via postMessage {type:'ready'}.
 }
 
 watch(
@@ -477,47 +529,19 @@ async function invokeButton(btn) {
   lastError.value = null
   try {
     await waitReady()
-    const win = iframeRef.value?.contentWindow
-    if (!win) throw new Error('TH iframe missing')
-    // Prefer TH slash/button bridges; MagVarUpdate exposes buttons via TavernHelper / global hooks.
-    const th = win.TavernHelper || win.tavernHelper || {}
-    if (typeof th.triggerSlash === 'function') {
-      // Common ST pattern: /button name
-      try {
-        await th.triggerSlash(`/button ${btn.name}`)
-      } catch (_) {
-        /* fall through */
-      }
-    }
-    if (typeof win.triggerSlash === 'function') {
-      try {
-        await win.triggerSlash(`/button ${btn.name}`)
-      } catch (_) {
-        /* fall through */
-      }
-    }
-    // Direct event for scripts that listen
-    if (typeof win.eventEmit === 'function') {
-      win.eventEmit('th_button', { name: btn.name, script: btn.scriptLabel })
-    }
-    if (typeof th.eventEmit === 'function') {
-      th.eventEmit('th_button', { name: btn.name, script: btn.scriptLabel })
-    }
-    // MagVarUpdate / TH often register window handlers on button click names
-    const candidates = [
-      btn.name,
-      `button:${btn.name}`,
-      `th:${btn.name}`,
-    ]
-    for (const key of candidates) {
-      if (typeof win[key] === 'function') {
-        await win[key]()
-        break
-      }
-    }
+    const requestId = 'btn_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+    const doneP = waitForBridgeEvent('button_done', requestId, 30000)
+    postToIframe({
+      __sf_th_host: true,
+      type: 'button',
+      requestId,
+      payload: { name: btn.name, script: btn.scriptLabel },
+    })
+    const done = await doneP
+    if (done && done.ok === false) throw new Error(done.error || 'button failed')
     emit('status', { type: 'button', name: btn.name, script: btn.scriptLabel })
   } catch (e) {
-    lastError.value = `按钮「${btn.name}」: ${e?.message || e}`
+    lastError.value = 'button failed: ' + btn.name + ' ' + (e?.message || e)
     emit('error', lastError.value)
   }
 }
