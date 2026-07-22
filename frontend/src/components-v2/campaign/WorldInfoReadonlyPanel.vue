@@ -100,9 +100,7 @@ async function toggleExpand(entry) {
         expandedContent.value = full.content || ''
       }
     } catch (e) {
-      expandedContent.value = (entry.content || '') + '
-
-[完整正文加载失败] ' + e
+      expandedContent.value = `${entry.content || ''}\n\n[完整正文加载失败] ${e}`
     } finally {
       expanding.value = false
     }
