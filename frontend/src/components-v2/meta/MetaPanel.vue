@@ -8,18 +8,20 @@ import MvuAnalyzer from './MvuAnalyzer.vue'
 import GenerationExplanation from './GenerationExplanation.vue'
 import MetaScreen from '../../design/meta/MetaScreen.vue'
 
-// MetaPanel 容器（v2 重构，源自 src/components/MetaPanel.vue 826 行）。
+// MetaPanel 容器
 //
 // 契约红线（不可变）：
 //   props:  activeCampaign(Object) / lastConversationNode({conversation_id, node_id})
 //   emits:  close / mvu-applied
-//   mvu-applied 由 MvuAnalyzer 触发后冒泡，最终调用 CampaignPanel.refreshActiveDetailTab。
 //
-// 2026-07-22：外壳换为 design/meta/MetaScreen（纸面 tab 壳）；业务子组件不变。
+// 2026-07-22：
+//   - 外壳 design/meta/MetaScreen
+//   - 固定抽屉宽 panelWidthClass，各 tab 内容长短不再跳宽
+//   - showChrome=false，避免 PanelHost 空标题栏 + MetaScreen 顶栏双重 chrome
 
 const props = defineProps({
   activeCampaign: { type: Object, default: null },
-  lastConversationNode: { type: Object, default: null }, // { conversation_id, node_id }
+  lastConversationNode: { type: Object, default: null },
 })
 
 const emit = defineEmits(['close', 'mvu-applied'])
@@ -65,9 +67,17 @@ function onMvuApplied() {
 </script>
 
 <template>
-  <PanelHost :show="true" title="" side="left" @close="emit('close')">
+  <!-- 固定 420px：与内容无关的外壳宽度；移动端 100vw 封顶 -->
+  <PanelHost
+    :show="true"
+    title=""
+    side="left"
+    :show-chrome="false"
+    panel-width-class="w-[min(100vw,420px)]"
+    @close="emit('close')"
+  >
     <MetaScreen
-      class="h-full"
+      class="h-full w-full"
       :active-tab="activeTab"
       :tabs="tabs"
       :pending-patch-count="pendingPatchCount"
@@ -76,16 +86,21 @@ function onMvuApplied() {
       @close="emit('close')"
       @change-tab="activeTab = $event"
     >
-      <div v-show="activeTab === 'chat'" class="h-[calc(100vh-13rem)]">
+      <!-- 每个 tab 同一容器约束：min-w-0 + 满宽，禁止 EmptyState 文案把壳撑开 -->
+      <div
+        v-show="activeTab === 'chat'"
+        class="w-full min-w-0 h-[min(70vh,520px)] flex flex-col"
+      >
         <MetaChat
           ref="chatRef"
+          class="min-h-0 flex-1"
           @error="onError"
           @new-patch="onNewPatch"
           @new-typed-patches="onNewTypedPatches"
         />
       </div>
 
-      <div v-show="activeTab === 'patches'">
+      <div v-show="activeTab === 'patches'" class="w-full min-w-0">
         <PatchPreview
           ref="patchPreviewRef"
           @error="onError"
@@ -93,7 +108,7 @@ function onMvuApplied() {
         />
       </div>
 
-      <div v-show="activeTab === 'health'">
+      <div v-show="activeTab === 'health'" class="w-full min-w-0">
         <HealthCheckPanel
           ref="healthCheckRef"
           :active-campaign="activeCampaign"
@@ -101,7 +116,7 @@ function onMvuApplied() {
         />
       </div>
 
-      <div v-show="activeTab === 'mvu'">
+      <div v-show="activeTab === 'mvu'" class="w-full min-w-0">
         <MvuAnalyzer
           ref="mvuRef"
           @error="onError"
@@ -109,7 +124,7 @@ function onMvuApplied() {
         />
       </div>
 
-      <div v-show="activeTab === 'explain'">
+      <div v-show="activeTab === 'explain'" class="w-full min-w-0">
         <GenerationExplanation
           :last-conversation-node="lastConversationNode"
           @error="onError"

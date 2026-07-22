@@ -1,8 +1,8 @@
 <script setup>
 /**
  * MetaScreen — Meta 助手壳（重设计 · 纯展示）。
- * 内容区用 slots 注入既有 chat/patch/health/mvu/explain 能力组件，
- * design 层只负责纸面壳与 tab 呈现。
+ * 固定宽度由外层 Overlay/PanelHost 控制；本组件只做顶栏 + tab + 内容区骨架。
+ * 所有 tab 共用同一内容容器（同 padding / 同 min-width:0），避免空态文案长短导致视觉跳宽。
  */
 defineProps({
   activeTab: { type: String, default: 'chat' },
@@ -25,8 +25,8 @@ defineEmits(['close', 'change-tab'])
 </script>
 
 <template>
-  <div class="h-full flex flex-col bg-bg">
-    <header class="shrink-0 h-14 px-4 border-b border-line bg-surface flex items-center gap-3">
+  <div class="h-full w-full min-w-0 flex flex-col bg-bg">
+    <header class="shrink-0 h-14 px-4 border-b border-line bg-surface flex items-center gap-3 min-w-0">
       <div class="min-w-0 flex-1">
         <div class="text-[11px] text-ink-faint">Meta 助手</div>
         <h1 class="text-sm font-semibold text-ink truncate">
@@ -35,7 +35,7 @@ defineEmits(['close', 'change-tab'])
       </div>
       <button
         type="button"
-        class="min-h-8 w-8 rounded-md text-ink-faint hover:bg-surface-2 hover:text-ink transition-colors"
+        class="shrink-0 min-h-8 w-8 rounded-md text-ink-faint hover:bg-surface-2 hover:text-ink transition-colors"
         title="关闭"
         aria-label="关闭"
         @click="$emit('close')"
@@ -44,16 +44,19 @@ defineEmits(['close', 'change-tab'])
       </button>
     </header>
 
-    <div v-if="globalError" class="shrink-0 px-4 py-2 text-xs text-err border-b border-err/20 bg-err/10">
+    <div
+      v-if="globalError"
+      class="shrink-0 px-4 py-2 text-xs text-err border-b border-err/20 bg-err/10 break-words"
+    >
       {{ globalError }}
     </div>
 
-    <nav class="shrink-0 px-3 pt-2 border-b border-line bg-surface flex items-center gap-1 overflow-x-auto">
+    <nav class="shrink-0 px-2 pt-1 border-b border-line bg-surface flex items-center gap-0.5 overflow-x-auto min-w-0">
       <button
         v-for="t in tabs"
         :key="t.key"
         type="button"
-        class="min-h-10 px-3 text-[13px] border-b-2 -mb-px whitespace-nowrap transition-colors"
+        class="min-h-10 px-2.5 text-[13px] border-b-2 -mb-px whitespace-nowrap transition-colors shrink-0"
         :class="activeTab === t.key
           ? 'border-accent text-accent-bright font-medium'
           : 'border-transparent text-ink-soft hover:text-ink'"
@@ -67,8 +70,9 @@ defineEmits(['close', 'change-tab'])
       </button>
     </nav>
 
-    <div class="flex-1 min-h-0 overflow-y-auto bg-bg">
-      <div class="p-3 sm:p-4">
+    <!-- 统一内容井：所有 tab 同宽同垫，禁止子项横向撑开 -->
+    <div class="flex-1 min-h-0 min-w-0 overflow-y-auto bg-bg">
+      <div class="w-full min-w-0 p-4">
         <slot :active-tab="activeTab" />
       </div>
     </div>

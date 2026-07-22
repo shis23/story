@@ -14,6 +14,10 @@ if (hash === '#design-writing') {
   import('./design/campaign/CampaignScreenDemo.vue').then(({ default: Demo }) => {
     createApp(Demo).mount('#app')
   })
+} else if (hash === '#design-meta') {
+  import('./design/meta/MetaScreenDemo.vue').then(({ default: Demo }) => {
+    createApp(Demo).mount('#app')
+  })
 } else {
   createApp(AppV2).use(createPinia()).mount('#app')
 }

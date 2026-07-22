@@ -137,7 +137,7 @@ function patchProposalResult(msg) {
               v-if="worldInfoResult(msg)"
               class="mt-2 pt-2 border-t border-line text-xs space-y-1"
             >
-              <div class="font-medium text-ink">📊 世界书诊断</div>
+              <div class="font-medium text-ink">世界书诊断</div>
               <div class="text-ink-soft">
                 共 {{ worldInfoResult(msg).total_entries }} 条 / 蓝灯 {{ worldInfoResult(msg).constant_count }} / 绿灯 {{ worldInfoResult(msg).selective_count }}
               </div>

@@ -17,6 +17,12 @@ const props = defineProps({
   // 否则 Overlay 的 ✕ 会与子组件关闭键、以及 OS 标题栏 × 视觉重叠，
   // 用户看到「右上角两个 x」。无标题时默认仍渲染 ✕（center/full 弹窗需要）。
   showClose: { type: Boolean, default: true },
+  /**
+   * 固定面板宽度 class（覆盖 left/right 默认 max-w-sm）。
+   * 例：'w-full max-w-md' / 'w-[420px] max-w-[100vw]'
+   * 保证同一面板各 tab 内容不同时外壳宽度仍稳定。
+   */
+  panelWidthClass: { type: String, default: '' },
 })
 const emit = defineEmits(['update:show', 'update:modelValue', 'close'])
 
@@ -49,17 +55,18 @@ const panelWrapperClass = computed(() => {
 })
 
 const panelClass = computed(() => {
-  const base = 'bg-surface shadow-float flex flex-col overflow-hidden'
+  const base = 'bg-surface shadow-float flex flex-col overflow-hidden min-w-0'
+  const custom = props.panelWidthClass?.trim()
   switch (props.side) {
     case 'left':
-      return `${base} h-full w-full max-w-sm`
+      return `${base} h-full ${custom || 'w-full max-w-sm'}`
     case 'center':
-      return `${base} w-full max-w-lg rounded-xl`
+      return `${base} ${custom || 'w-full max-w-lg'} rounded-xl`
     case 'full':
       return `${base} h-full w-full`
     case 'right':
     default:
-      return `${base} h-full w-full max-w-sm`
+      return `${base} h-full ${custom || 'w-full max-w-sm'}`
   }
 })
 
