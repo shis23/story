@@ -1,0 +1,21 @@
+{
+  "id": "mingyue_qiuqing_v1",
+  "name": "明月秋青写卡方法论 v1",
+  "version": "1.0.0",
+  "source": "明月秋青写卡预设-标准+辅食.json",
+  "notes": "方法论与模板摘录；输出契约由 StoryForge 覆盖为可编译 JSON。默认协作，不代写性格衍生。",
+  "common": [
+    "common/creative_principles.md",
+    "common/absolute_zero.md"
+  ],
+  "stages": {
+    "basic": "stages/basic.md",
+    "personality": "stages/personality.md",
+    "worldview": "stages/worldview.md",
+    "opening": "stages/opening.md"
+  },
+  "defaults": {
+    "personality_mode": "guided",
+    "allow_ai_freewrite": false
+  }
+}

@@ -840,6 +840,17 @@ export async function cardstudioSetStage(id, stageId) {
   return null
 }
 
+export async function cardstudioSetOptions(id, { allowAiFreewrite = null, stagePackId = null } = {}) {
+  if (isTauri()) {
+    return await invoke('cardstudio_set_options', {
+      id,
+      allowAiFreewrite,
+      stagePackId,
+    })
+  }
+  return null
+}
+
 export async function cardstudioRunChecks(id) {
   if (isTauri()) {
     return await invoke('cardstudio_run_checks', { id })

@@ -9,6 +9,7 @@ import {
   cardstudioListProjects,
   cardstudioRunChecks,
   cardstudioRunStage,
+  cardstudioSetOptions,
   cardstudioUpdateArtifacts,
 } from '../../tauri-api.js'
 import Button from '../ui/Button.vue'
@@ -35,6 +36,7 @@ const statusText = ref('')
 const newName = ref('')
 const newBrief = ref('')
 const userNote = ref('')
+const allowAiFreewrite = ref(false)
 const checkReport = ref(null)
 const lastImport = ref(null)
 
@@ -51,6 +53,10 @@ function emptyArtifacts() {
     creator: '',
     worldview_entries: [],
     notes: '',
+    personality_mode: null,
+    personality_prompts: [],
+    world_type: null,
+    opening_outline: null,
   }
 }
 
@@ -127,6 +133,7 @@ function syncDraftFromProject() {
     ...emptyArtifacts(),
     ...project.value.artifacts,
     tags: [...(project.value.artifacts?.tags || [])],
+    personality_prompts: [...(project.value.artifacts?.personality_prompts || [])],
     worldview_entries: (project.value.artifacts?.worldview_entries || []).map((e) => ({ ...e, keys: [...(e.keys || [])] })),
   }
 }
@@ -138,6 +145,7 @@ async function openProject(id) {
   lastImport.value = null
   try {
     project.value = await cardstudioGetProject(id)
+    allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
     syncDraftFromProject()
   } catch (e) {
     await alertDialog('打开项目失败: ' + e)
@@ -158,8 +166,9 @@ async function createProject() {
     newBrief.value = ''
     await refreshProjects()
     project.value = created
+    allowAiFreewrite.value = !!created?.allow_ai_freewrite
     syncDraftFromProject()
-    statusText.value = '已创建写卡项目'
+    statusText.value = '已创建写卡项目（明月秋青方法论 pack）'
   } catch (e) {
     await alertDialog('创建失败: ' + e)
   } finally {
@@ -172,6 +181,10 @@ async function saveArtifacts() {
   busy.value = true
   try {
     project.value = await cardstudioUpdateArtifacts(project.value.id, draft.value)
+    project.value = await cardstudioSetOptions(project.value.id, {
+      allowAiFreewrite: allowAiFreewrite.value,
+    })
+    allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
     syncDraftFromProject()
     statusText.value = '产物已保存'
   } catch (e) {
@@ -323,14 +336,26 @@ watch(
 
         <div class="text-xs text-ink-soft" v-if="statusText">{{ statusText }}</div>
         <div class="text-xs text-err" v-if="project.last_error">{{ project.last_error }}</div>
+        <div class="text-[11px] text-ink-faint">
+          提示词包：{{ project.stage_pack_id || 'mingyue_qiuqing_v1' }} · 性格默认协作（手写衍生优先）
+        </div>
+
+        <label class="flex items-center gap-2 text-xs text-ink-soft">
+          <input v-model="allowAiFreewrite" type="checkbox" class="rounded border-line" />
+          允许 AI 代写性格衍生（默认关闭，对齐明月“手写优先”）
+        </label>
 
         <div class="grid gap-2">
           <label class="text-xs text-ink-soft">角色名</label>
           <Input v-model="draft.name" />
-          <label class="text-xs text-ink-soft">描述 description（外貌/背景/关系）</label>
+          <label class="text-xs text-ink-soft">描述 description（外貌/背景/关系，不含性格）</label>
           <textarea v-model="draft.description" rows="4" class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink" />
-          <label class="text-xs text-ink-soft">性格 personality</label>
-          <textarea v-model="draft.personality" rows="3" class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink" />
+          <label class="text-xs text-ink-soft">性格调色盘 personality（可含【待用户手写】）</label>
+          <textarea v-model="draft.personality" rows="4" class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink" />
+          <div v-if="draft.personality_prompts?.length" class="text-xs text-warn bg-warn/10 rounded-lg px-3 py-2 space-y-1">
+            <div class="font-medium">需要你补充的性格问题</div>
+            <div v-for="(q, i) in draft.personality_prompts" :key="i">· {{ q }}</div>
+          </div>
           <label class="text-xs text-ink-soft">场景 scenario</label>
           <textarea v-model="draft.scenario" rows="2" class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink" />
           <label class="text-xs text-ink-soft">开场白 first_mes</label>

@@ -93,6 +93,18 @@ pub struct CardArtifacts {
     pub worldview_entries: Vec<WorldviewDraftEntry>,
     #[serde(default)]
     pub notes: String,
+    /// guided = 协作整理；draft = 用户允许后的代写稿
+    #[serde(default)]
+    pub personality_mode: Option<String>,
+    /// 性格阶段需要用户补充的问题
+    #[serde(default)]
+    pub personality_prompts: Vec<String>,
+    /// A/B/C/unknown
+    #[serde(default)]
+    pub world_type: Option<String>,
+    /// 开场大纲（可选，便于用户回看）
+    #[serde(default)]
+    pub opening_outline: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +121,12 @@ pub struct CardProject {
     pub stage_status: std::collections::BTreeMap<String, StageStatus>,
     #[serde(default)]
     pub artifacts: CardArtifacts,
+    /// 使用的 stage pack id（默认明月秋青 v1）
+    #[serde(default = "default_stage_pack_id")]
+    pub stage_pack_id: String,
+    /// 是否允许 AI 在性格阶段代写衍生（默认 false，对齐明月“手写优先”）
+    #[serde(default)]
+    pub allow_ai_freewrite: bool,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -117,6 +135,10 @@ pub struct CardProject {
     pub imported_character_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_stage_pack_id() -> String {
+    "mingyue_qiuqing_v1".into()
 }
 
 fn default_current_stage() -> String {
@@ -148,6 +170,8 @@ impl CardProject {
             current_stage: STAGE_BRIEF.to_string(),
             stage_status,
             artifacts,
+            stage_pack_id: default_stage_pack_id(),
+            allow_ai_freewrite: false,
             last_error: None,
             last_stage_output: None,
             imported_character_id: None,
@@ -381,12 +405,65 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
     })
 }
 
+/// Embedded Mingyue Qiuqing methodology pack (StoryForge-adapted).
+mod pack_mingyue_v1 {
+    pub const CREATIVE_PRINCIPLES: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/creative_principles.md");
+    pub const ABSOLUTE_ZERO: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/absolute_zero.md");
+    pub const OUTPUT_CONTRACT: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/output_contract.md");
+    pub const BASIC: &str = include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/basic.md");
+    pub const PERSONALITY: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/personality.md");
+    pub const WORLDVIEW: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/worldview.md");
+    pub const OPENING: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/opening.md");
+}
+
+fn stage_template(stage_id: &str) -> Result<&'static str, String> {
+    match stage_id {
+        STAGE_BASIC => Ok(pack_mingyue_v1::BASIC),
+        STAGE_PERSONALITY => Ok(pack_mingyue_v1::PERSONALITY),
+        STAGE_WORLDVIEW => Ok(pack_mingyue_v1::WORLDVIEW),
+        STAGE_OPENING => Ok(pack_mingyue_v1::OPENING),
+        STAGE_BRIEF | STAGE_REVIEW | STAGE_COMPILE_IMPORT => {
+            Err(format!("阶段 {stage_id} 不需要 LLM 生成"))
+        }
+        other => Err(format!("未知阶段: {other}")),
+    }
+}
+
+fn stage_task_line(stage_id: &str, allow_ai_freewrite: bool) -> String {
+    match stage_id {
+        STAGE_BASIC => "当前任务：角色基础。只写基本信息/外貌差异化/背景/关系，严禁把性格写进 description。".into(),
+        STAGE_PERSONALITY if allow_ai_freewrite => {
+            "当前任务：性格调色盘（draft 模式）。用户已允许代写；仍须避免空洞标签，优先行为与语料。mode 填 draft。".into()
+        }
+        STAGE_PERSONALITY => {
+            "当前任务：性格调色盘（guided 协作模式，默认）。整理底色/主色/点缀结构；衍生与关键台词用【待用户手写】占位，并在 user_prompts 列出需要用户补充的问题。禁止替用户编造无关联衍生。mode 填 guided。".into()
+        }
+        STAGE_WORLDVIEW => {
+            "当前任务：世界观世界书条目。先判断 A/B/C 类型；用户没说的不扩展。输出 worldview_entries。".into()
+        }
+        STAGE_OPENING => {
+            "当前任务：开场白。优先整理用户已给信息为可用 first_mes；未提供的 outline 字段留空，不要脑补剧情。".into()
+        }
+        _ => format!("当前任务阶段：{stage_id}"),
+    }
+}
+
 /// Build LLM system+user prompts for generative stages.
+///
+/// System prompt is assembled from the Mingyue methodology pack:
+/// output contract + creative principles + absolute zero + stage template.
 pub fn build_stage_prompt(
     stage_id: &str,
     project: &CardProject,
     user_note: Option<&str>,
 ) -> Result<(String, String), String> {
+    let template = stage_template(stage_id)?;
     let arts = &project.artifacts;
     let brief = if project.brief.trim().is_empty() {
         arts.notes.as_str()
@@ -395,26 +472,44 @@ pub fn build_stage_prompt(
     };
     let note = user_note.unwrap_or("").trim();
 
-    let system = match stage_id {
-        STAGE_BASIC => "你是角色卡写卡助手。根据用户 brief 产出角色基础信息。只输出 JSON，不要 markdown 代码围栏。遵守：用户没说的不要编造；性格不要写进 description。字段：name, description, scenario, tags(数组)。description 写外貌/背景/关系，不含性格。",
-        STAGE_PERSONALITY => "你是角色卡写卡助手。根据已有角色基础与 brief 写性格文本。只输出 JSON：{ \"personality\": \"...\" }。避免单一标签堆砌，用可观察行为与内在驱动力描述。不要编造用户未提供的重大设定。",
-        STAGE_WORLDVIEW => "你是角色卡写卡助手。根据 brief 与角色信息产出 1-5 条世界书条目。只输出 JSON：{ \"worldview_entries\": [ { \"keys\": [\"词\"], \"content\": \"...\", \"constant\": true/false, \"order\": 100 } ] }。蓝灯 constant=true 用于核心世界设定；绿灯 false 需要 keys。不要空 content。",
-        STAGE_OPENING => "你是角色卡写卡助手。根据角色与场景写开场白 first_mes。只输出 JSON：{ \"first_mes\": \"...\" }。开场要给互动点，不要超长，不要替用户决定未确认的剧情走向。",
-        STAGE_BRIEF | STAGE_REVIEW | STAGE_COMPILE_IMPORT => {
-            return Err(format!("阶段 {stage_id} 不需要 LLM 生成"));
-        }
-        other => return Err(format!("未知阶段: {other}")),
-    };
+    // Detect freewrite intent from explicit project flag or user note keywords.
+    let freewrite = project.allow_ai_freewrite
+        || note.contains("允许代写")
+        || note.contains("自由发挥")
+        || note.contains("你可以写衍生")
+        || note.contains("AI代写");
+
+    let mut system = String::new();
+    system.push_str("# 角色\n");
+    system.push_str("你是 StoryForge 写卡引擎的阶段生成器，执行「明月秋青」写卡方法论（已去 ST 宿主宏与聊天人设）。\n");
+    system.push_str("你不是角色扮演陪伴，不使用“哥哥/秋青子”口吻；只产出可编译的结构化结果。\n\n");
+    system.push_str(pack_mingyue_v1::OUTPUT_CONTRACT);
+    system.push_str("\n\n# 写卡方法论 · 创作思路\n");
+    system.push_str(pack_mingyue_v1::CREATIVE_PRINCIPLES);
+    system.push_str("\n\n# 写卡方法论 · 绝对零度\n");
+    system.push_str(pack_mingyue_v1::ABSOLUTE_ZERO);
+    system.push_str("\n\n# 当前阶段模板\n");
+    system.push_str(template);
+    system.push_str("\n\n# 本轮任务约束\n");
+    system.push_str(&stage_task_line(stage_id, freewrite));
+    system.push_str("\n最终只输出 JSON 对象。\n");
 
     let mut user = String::new();
     user.push_str(&format!("# Brief\n{brief}\n\n"));
-    user.push_str(&format!("# 当前产物\n{}\n\n", serde_json::to_string_pretty(arts).unwrap_or_default()));
+    user.push_str(&format!(
+        "# 项目设置\n- stage_pack: {}\n- allow_ai_freewrite: {}\n- current_stage: {stage_id}\n\n",
+        project.stage_pack_id, freewrite
+    ));
+    user.push_str(&format!(
+        "# 当前产物 JSON\n{}\n\n",
+        serde_json::to_string_pretty(arts).unwrap_or_else(|_| "{}".into())
+    ));
     if !note.is_empty() {
         user.push_str(&format!("# 用户补充\n{note}\n\n"));
     }
-    user.push_str("请按系统要求输出 JSON。");
+    user.push_str("请严格按系统中的输出契约返回 JSON。");
 
-    Ok((system.to_string(), user))
+    Ok((system, user))
 }
 
 /// Apply a generative stage JSON patch onto artifacts.
@@ -443,10 +538,24 @@ pub fn apply_stage_json(stage_id: &str, artifacts: &mut CardArtifacts, value: &s
         STAGE_PERSONALITY => {
             if let Some(s) = value.get("personality").and_then(|v| v.as_str()) {
                 artifacts.personality = s.to_string();
-                Ok(())
             } else {
-                Err("personality 字段缺失".into())
+                return Err("personality 字段缺失".into());
             }
+            artifacts.personality_mode = value
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some("guided".into()));
+            artifacts.personality_prompts = value
+                .get("user_prompts")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(())
         }
         STAGE_WORLDVIEW => {
             let arr = value
@@ -485,15 +594,30 @@ pub fn apply_stage_json(stage_id: &str, artifacts: &mut CardArtifacts, value: &s
                 });
             }
             artifacts.worldview_entries = entries;
+            if let Some(t) = value.get("world_type").and_then(|v| v.as_str()) {
+                artifacts.world_type = Some(t.to_string());
+            }
+            if let Some(n) = value.get("notes").and_then(|v| v.as_str()) {
+                if !n.trim().is_empty() {
+                    if artifacts.notes.is_empty() {
+                        artifacts.notes = n.to_string();
+                    } else {
+                        artifacts.notes = format!("{}\n\n[世界观备注]\n{}", artifacts.notes, n);
+                    }
+                }
+            }
             Ok(())
         }
         STAGE_OPENING => {
             if let Some(s) = value.get("first_mes").and_then(|v| v.as_str()) {
                 artifacts.first_mes = s.to_string();
-                Ok(())
             } else {
-                Err("first_mes 字段缺失".into())
+                return Err("first_mes 字段缺失".into());
             }
+            if let Some(outline) = value.get("outline") {
+                artifacts.opening_outline = Some(outline.clone());
+            }
+            Ok(())
         }
         other => Err(format!("阶段 {other} 不支持 JSON 应用")),
     }
@@ -580,6 +704,10 @@ mod tests {
                 },
             ],
             notes: "从零测试".into(),
+            personality_mode: Some("guided".into()),
+            personality_prompts: vec![],
+            world_type: Some("B".into()),
+            opening_outline: None,
         }
     }
 
@@ -671,5 +799,46 @@ mod tests {
         let p = CardProject::new_from_scratch("x", "y");
         assert!(build_stage_prompt(STAGE_BRIEF, &p, None).is_err());
         assert!(build_stage_prompt(STAGE_BASIC, &p, Some("偏现代")).is_ok());
+    }
+
+    #[test]
+    fn build_stage_prompt_embeds_mingyue_methodology() {
+        let p = CardProject::new_from_scratch("秋青", "雨夜车站的旅人");
+        let (system, user) = build_stage_prompt(STAGE_BASIC, &p, None).unwrap();
+        // 来自明月方法论资产，而不是一行薄骨架
+        assert!(system.contains("绝对零度") || system.contains("白描") || system.contains("八股"));
+        assert!(system.contains("角色基础") || system.contains("template_basic") || system.contains("外貌"));
+        assert!(system.contains("只输出一个 JSON") || system.contains("JSON 对象") || system.contains("输出契约"));
+        assert!(system.len() > 2000, "system prompt should embed full stage pack, got {}", system.len());
+        assert!(user.contains("雨夜车站"));
+        assert!(user.contains("当前产物"));
+    }
+
+    #[test]
+    fn personality_prompt_defaults_to_guided_not_freewrite() {
+        let p = CardProject::new_from_scratch("x", "冷淡少年");
+        let (system, _) = build_stage_prompt(STAGE_PERSONALITY, &p, None).unwrap();
+        assert!(system.contains("guided") || system.contains("协作") || system.contains("待用户手写"));
+        assert!(!system.contains("draft 模式") || system.contains("guided"));
+        let (system2, _) =
+            build_stage_prompt(STAGE_PERSONALITY, &p, Some("允许代写，你可以写衍生")).unwrap();
+        assert!(system2.contains("draft") || system2.contains("代写"));
+    }
+
+    #[test]
+    fn apply_personality_keeps_prompts_and_mode() {
+        let mut a = CardArtifacts::default();
+        apply_stage_json(
+            STAGE_PERSONALITY,
+            &mut a,
+            &serde_json::json!({
+                "personality": "底色：克制\n主色：温柔\n衍生：【待用户手写】",
+                "mode": "guided",
+                "user_prompts": ["请手写一个反差衍生"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(a.personality_mode.as_deref(), Some("guided"));
+        assert_eq!(a.personality_prompts.len(), 1);
     }
 }

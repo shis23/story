@@ -130,6 +130,38 @@ pub fn cardstudio_set_stage(id: String, stage_id: String) -> Result<CardProject,
         .map_err(|e| TauriCommandError::storage(e))
 }
 
+/// Update project options (methodology switches).
+#[tauri::command]
+pub fn cardstudio_set_options(
+    id: String,
+    allow_ai_freewrite: Option<bool>,
+    stage_pack_id: Option<String>,
+) -> Result<CardProject, TauriCommandError> {
+    let store = get_card_studio_store();
+    let mut project = store
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
+    if let Some(v) = allow_ai_freewrite {
+        project.allow_ai_freewrite = v;
+    }
+    if let Some(pack) = stage_pack_id {
+        let pack = pack.trim();
+        if !pack.is_empty() {
+            // Phase 1 only ships mingyue_qiuqing_v1; reject unknown packs early.
+            if pack != "mingyue_qiuqing_v1" {
+                return Err(TauriCommandError::validation(format!(
+                    "未知 stage pack: {pack}（当前仅支持 mingyue_qiuqing_v1）"
+                )));
+            }
+            project.stage_pack_id = pack.to_string();
+        }
+    }
+    project.touch();
+    store
+        .update(project)
+        .map_err(|e| TauriCommandError::storage(e))
+}
+
 #[tauri::command]
 pub fn cardstudio_run_checks(id: String) -> Result<CheckReport, TauriCommandError> {
     let project = get_card_studio_store()

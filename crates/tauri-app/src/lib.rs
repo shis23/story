@@ -12321,6 +12321,7 @@ pub fn run() {
             card_studio_api::cardstudio_delete_project,
             card_studio_api::cardstudio_update_artifacts,
             card_studio_api::cardstudio_set_stage,
+            card_studio_api::cardstudio_set_options,
             card_studio_api::cardstudio_run_checks,
             card_studio_api::cardstudio_compile,
             card_studio_api::cardstudio_complete_manual_stage,
