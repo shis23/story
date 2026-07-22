@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   orderedTavernHelperFromShells,
   parseShellEntry,
+  collectVisibleThButtons,
 } from '../src/utils/tavernHelperScripts.js'
 
 test('parseShellEntry handles serde externally tagged remote_url', () => {
@@ -66,4 +67,29 @@ test('orderedTavernHelperFromShells preserves order and filters kinds', () => {
   assert.equal(ordered[1].kind, 'remote_url')
   assert.equal(ordered[2].kind, 'inline_js')
   assert.ok(ordered[2].js.length >= 300)
+})
+
+test('collectVisibleThButtons unique preserve order', () => {
+  const shells = [
+    {
+      kind: 'tavern_helper_module',
+      label: 'MVU',
+      entry: { remote_url: { url: 'https://example.com/a.js' } },
+      buttons: ['重新读取初始变量', '重新处理变量'],
+      deps: [],
+    },
+    {
+      kind: 'tavern_helper_module',
+      label: '工坊',
+      entry: { inline_js: { js: 'x'.repeat(300) } },
+      buttons: ['命定创意工坊', '重新读取初始变量'],
+      deps: [],
+    },
+  ]
+  const scripts = orderedTavernHelperFromShells(shells)
+  const buttons = collectVisibleThButtons(scripts)
+  assert.deepEqual(
+    buttons.map((b) => b.name),
+    ['重新读取初始变量', '重新处理变量', '命定创意工坊'],
+  )
 })

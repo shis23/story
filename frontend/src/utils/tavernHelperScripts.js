@@ -40,10 +40,27 @@ export function orderedTavernHelperFromShells(shells) {
     const parsed = parseShellEntry(s.entry)
     const label = s.label || `th#${i}`
     const deps = Array.isArray(s.deps) ? s.deps.slice() : []
+    const buttons = Array.isArray(s.buttons) ? s.buttons.filter(Boolean) : []
     if (parsed.kind === 'remote_url' && parsed.url) {
-      out.push({ index: i++, label, kind: 'remote_url', url: parsed.url, deps })
+      out.push({ index: i++, label, kind: 'remote_url', url: parsed.url, deps, buttons })
     } else if (parsed.kind === 'inline_js' && parsed.js) {
-      out.push({ index: i++, label, kind: 'inline_js', js: parsed.js, deps })
+      out.push({ index: i++, label, kind: 'inline_js', js: parsed.js, deps, buttons })
+    }
+  }
+  return out
+}
+
+
+/** Flatten unique visible TH buttons from ordered scripts (preserve first-seen order). */
+export function collectVisibleThButtons(scripts) {
+  const seen = new Set()
+  const out = []
+  for (const s of Array.isArray(scripts) ? scripts : []) {
+    for (const name of s.buttons || []) {
+      const n = String(name || '').trim()
+      if (!n || seen.has(n)) continue
+      seen.add(n)
+      out.push({ name: n, scriptLabel: s.label, scriptIndex: s.index })
     }
   }
   return out

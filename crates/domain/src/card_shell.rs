@@ -41,6 +41,9 @@ pub struct CardFrontendShell {
     pub label: String,
     /// Trigger hint (find_regex snippet or th-script).
     pub trigger: String,
+    /// Visible tavern_helper button labels (empty for regex shells).
+    #[serde(default)]
+    pub buttons: Vec<String>,
 }
 
 /// Full manifest for a character card.
@@ -154,6 +157,7 @@ fn extract_from_regex_script(
                 deps,
                 label: label.clone(),
                 trigger: find.clone(),
+                buttons: vec![],
             });
             push_url(remote_urls, &url);
         }
@@ -175,6 +179,7 @@ fn extract_from_regex_script(
             deps,
             label,
             trigger: find.clone(),
+            buttons: vec![],
         });
     }
 }
@@ -209,6 +214,7 @@ fn extract_from_tavern_helper(
             .and_then(|v| v.as_str())
             .unwrap_or("tavern_helper")
             .to_string();
+        let buttons = extract_visible_th_buttons(&sc);
         let content = sc
             .get("content")
             .or_else(|| sc.get("value"))
@@ -243,6 +249,7 @@ fn extract_from_tavern_helper(
                 deps,
                 label,
                 trigger: "tavern_helper.scripts".into(),
+                buttons,
             });
         } else if content.len() > 200 {
             // Inline creative-workshop style script
@@ -252,9 +259,38 @@ fn extract_from_tavern_helper(
                 deps: http_urls,
                 label,
                 trigger: "tavern_helper.scripts".into(),
+                buttons,
             });
         }
     }
+}
+
+
+fn extract_visible_th_buttons(sc: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let button = sc.get("button");
+    let buttons = button
+        .and_then(|b| b.get("buttons"))
+        .and_then(|v| v.as_array())
+        .or_else(|| sc.get("buttons").and_then(|v| v.as_array()));
+    let Some(arr) = buttons else {
+        return out;
+    };
+    for b in arr {
+        let visible = b
+            .get("visible")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !visible {
+            continue;
+        }
+        if let Some(name) = b.get("name").and_then(|v| v.as_str()) {
+            if !name.trim().is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn classify_shell_kind(find: &str, label: &str, url: &str) -> CardShellKind {
@@ -490,7 +526,12 @@ mod tests {
             "tavern_helper": {
                 "scripts": [
                     {"name": "【命定之诗】MVU beta", "enabled": true,
-                     "content": format!("import '{mvu}'")},
+                     "content": format!("import '{mvu}'"),
+                     "button": {"enabled": true, "buttons": [
+                        {"name": "重新读取初始变量", "visible": true},
+                        {"name": "清除旧楼层变量", "visible": false},
+                        {"name": "重新处理变量", "visible": true}
+                     ]}},
                     {"name": "【命定之诗】mvu zod", "enabled": true,
                      "content": format!("import '{schema}'")},
                     {"name": "【命定之诗】自动化脚本", "enabled": true,
@@ -538,6 +579,15 @@ mod tests {
         );
         assert!(manifest.remote_urls.iter().any(|u| u == home));
         assert!(manifest.remote_urls.iter().any(|u| u == mvu));
+        let mvu_shell = manifest
+            .tavern_helper_modules()
+            .into_iter()
+            .find(|s| s.label.contains("MVU beta"))
+            .expect("MVU shell");
+        assert_eq!(
+            mvu_shell.buttons,
+            vec!["重新读取初始变量".to_string(), "重新处理变量".to_string()]
+        );
     }
 
     #[test]

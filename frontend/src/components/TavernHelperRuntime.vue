@@ -23,6 +23,18 @@
       <div v-for="(s, i) in statuses" :key="i" class="truncate" :class="statusClass(s.state)">
         {{ i + 1 }}. {{ s.label }} — {{ s.state }}{{ s.detail ? ` · ${s.detail}` : '' }}
       </div>
+      <div v-if="visibleButtons.length" class="flex flex-wrap gap-1 pt-1">
+        <button
+          v-for="b in visibleButtons"
+          :key="b.name + ':' + b.scriptIndex"
+          type="button"
+          class="min-h-6 px-2 rounded border border-line bg-surface text-[11px] text-ink hover:border-accent-border hover:text-accent disabled:opacity-40"
+          :disabled="running || !iframeReady"
+          :title="b.scriptLabel"
+          @click="invokeButton(b)"
+        >{{ b.name }}</button>
+      </div>
+      <div v-if="lastWriteHint" class="text-[10px] text-ink-faint truncate">变量出站：{{ lastWriteHint }}</div>
       <div v-if="lastError" class="text-err break-words">{{ lastError }}</div>
     </div>
     <iframe
@@ -42,7 +54,7 @@
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { cardShellFetchUrl } from '../tauri-api.js'
-import { orderedTavernHelperFromShells } from '../utils/tavernHelperScripts.js'
+import { orderedTavernHelperFromShells, collectVisibleThButtons } from '../utils/tavernHelperScripts.js'
 
 const props = defineProps({
   /** CardShellManifest.shells */
@@ -61,11 +73,13 @@ const running = ref(false)
 const statuses = ref([])
 const lastError = ref(null)
 const iframeReady = ref(false)
+const lastWriteHint = ref('')
 let runSeq = 0
 let bridgeHandler = null
 const blobUrls = []
 
 const scripts = computed(() => orderedTavernHelperFromShells(props.shells))
+const visibleButtons = computed(() => collectVisibleThButtons(scripts.value))
 const summary = computed(() => {
   const n = scripts.value.length
   if (!n) return '无脚本'
@@ -276,7 +290,7 @@ async function onBridgeMessage(ev) {
     return
   }
   if (d.type === 'var_write') {
-    emit('var-write', d.payload || {})
+    noteVarWrite(d.payload || {})
     return
   }
 
@@ -417,7 +431,64 @@ onUnmounted(() => {
   revokeBlobs()
 })
 
-defineExpose({ runAll, scripts, statuses })
+async function invokeButton(btn) {
+  lastError.value = null
+  try {
+    await waitReady()
+    const win = iframeRef.value?.contentWindow
+    if (!win) throw new Error('TH iframe missing')
+    // Prefer TH slash/button bridges; MagVarUpdate exposes buttons via TavernHelper / global hooks.
+    const th = win.TavernHelper || win.tavernHelper || {}
+    if (typeof th.triggerSlash === 'function') {
+      // Common ST pattern: /button name
+      try {
+        await th.triggerSlash(`/button ${btn.name}`)
+      } catch (_) {
+        /* fall through */
+      }
+    }
+    if (typeof win.triggerSlash === 'function') {
+      try {
+        await win.triggerSlash(`/button ${btn.name}`)
+      } catch (_) {
+        /* fall through */
+      }
+    }
+    // Direct event for scripts that listen
+    if (typeof win.eventEmit === 'function') {
+      win.eventEmit('th_button', { name: btn.name, script: btn.scriptLabel })
+    }
+    if (typeof th.eventEmit === 'function') {
+      th.eventEmit('th_button', { name: btn.name, script: btn.scriptLabel })
+    }
+    // MagVarUpdate / TH often register window handlers on button click names
+    const candidates = [
+      btn.name,
+      `button:${btn.name}`,
+      `th:${btn.name}`,
+    ]
+    for (const key of candidates) {
+      if (typeof win[key] === 'function') {
+        await win[key]()
+        break
+      }
+    }
+    emit('status', { type: 'button', name: btn.name, script: btn.scriptLabel })
+  } catch (e) {
+    lastError.value = `按钮「${btn.name}」: ${e?.message || e}`
+    emit('error', lastError.value)
+  }
+}
+
+function noteVarWrite(payload) {
+  const key = payload?.key
+  if (!key) return
+  lastWriteHint.value = `${key}`
+  emit('var-write', payload || {})
+}
+
+defineExpose({ runAll, scripts, statuses, invokeButton, visibleButtons })
+
 </script>
 
 <style scoped>

@@ -87,9 +87,12 @@ import {
   logAppendFrontend,
   getCardShellManifest,
   getCard,
+  setCampaignVariable,
+  setCharacterVariable,
 } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
+import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
 
 // ─── stores ───
 const writing = useWritingStore()
@@ -185,6 +188,31 @@ const cardShellLabel = ref('')
 const cardShellLoading = ref(false)
 const cardShellShells = ref([])
 const cardShellThCount = ref(0)
+const shellVarAudit = createVariableWriteAudit(40)
+const shellVarAuditTick = ref(0)
+
+async function onShellVarWrite(payload) {
+  const campaignId = campaign.activeCampaign?.id || null
+  // Prefer first instance if map has exactly one; else campaign-scoped
+  const ids = Object.keys(campaign.instanceNameMap || {})
+  const instanceId = ids.length === 1 ? ids[0] : null
+  const result = await persistShellVariableWrite({
+    campaignId,
+    instanceId,
+    key: payload?.key,
+    value: payload?.value,
+    setCampaignVariable,
+    setCharacterVariable,
+    log: (level, message) => logAppendFrontend(level, message),
+  })
+  shellVarAudit.push({
+    key: payload?.key,
+    ok: result.ok,
+    scope: result.scope,
+    error: result.error || null,
+  })
+  shellVarAuditTick.value++
+}
 
 async function refreshCardShellManifest() {
   cardShellStatusUrl.value = null
@@ -504,18 +532,21 @@ onMounted(async () => {
               label="状态栏壳"
               compact
               height="110px"
+              @var-write="onShellVarWrite"
             />
             <CardShellHost
               v-if="cardShellOpeningUrl && (!writing.messages || writing.messages.length <= 1)"
               :url="cardShellOpeningUrl"
               label="开场壳"
               height="420px"
+              @var-write="onShellVarWrite"
             />
             <TavernHelperRuntime
               v-if="cardShellThCount"
               :shells="cardShellShells"
               :show-status="true"
               :auto-run="true"
+              @var-write="onShellVarWrite"
             />
           </div>
         </template>

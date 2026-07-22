@@ -53,7 +53,7 @@ const props = defineProps({
   rootClass: { type: String, default: '' },
 })
 
-const emit = defineEmits(['loaded', 'error', 'message'])
+const emit = defineEmits(['loaded', 'error', 'message', 'var-write'])
 
 const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
@@ -169,9 +169,16 @@ function wrapRemoteHtml(html, pageUrl) {
   // Also poll briefly for late jQuery
   var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);
 
-  // getvar/setvar stubs (host can extend later)
-  window.getvar = window.getvar || function(k, d){ return d; };
-  window.setvar = window.setvar || function(){};
+  // getvar/setvar: in-shell store + host outbox
+  var V = window.__sfShellVars || (window.__sfShellVars = {});
+  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };
+  window.setvar = function(k, v){
+    V[k] = v;
+    try {
+      parent.postMessage({ __sf_shell_bridge: true, type: 'var_write', payload: { key: k, value: v } }, '*');
+    } catch (e) {}
+    return v;
+  };
   window.getChatVariable = window.getvar;
   window.setChatVariable = window.setvar;
 })();
@@ -233,9 +240,15 @@ function onIframeLoad() {
 
 async function onBridgeMessage(ev) {
   const d = ev.data
-  if (!d || !d.__sf_shell_bridge || !d.id) return
+  if (!d || !d.__sf_shell_bridge) return
   // only accept from our iframe
   if (!iframeRef.value || ev.source !== iframeRef.value.contentWindow) return
+  if (d.type === 'var_write') {
+    emit('message', d)
+    emit('var-write', d.payload || {})
+    return
+  }
+  if (!d.id) return
   const type = d.type
   const payload = d.payload || {}
   const reply = (result, err) => {
