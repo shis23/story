@@ -77,23 +77,35 @@ export function useConversation(handlers = {}) {
     }
   }
 
-  // handleDeleteConversation(App.vue:456-473):deleteConversation + 刷新历史。
+  // handleDeleteConversation：一活动一对话 → 删除整局活动（会话+实例/知识/任务/总结）。
   async function handleDeleteConversation(conv, event) {
     if (event) event.stopPropagation()
-    const ok = await confirmDialog(`确定删除该会话？会话 ${conv.id?.slice(0, 8)} 的所有消息将被清除。`, { title: '删除确认' })
+    const label = conv.card_name || conv.name || conv.id?.slice?.(0, 8) || '这局故事'
+    const ok = await confirmDialog(
+      `确定删除「${label}」整局活动？\n\n将同时删除：对话正文、角色实例、知识、任务与总结。此操作不可恢复。`,
+      { title: '删除整局活动' },
+    )
     if (!ok) return
     try {
       await deleteConversation(conv.id)
-      // 若删的是当前会话，清空当前对话
+      // 若删的是当前会话 / 当前活动，清空写作态
       if (conv.id === campaign.currentConversationId) {
         writing.messages = []
         campaign.currentConversationId = null
         broadcastChatChanged('conversation_deleted', { conversationId: conv.id })
       }
+      if (conv.campaign_id && campaign.activeCampaign?.id === conv.campaign_id) {
+        campaign.activeCampaign = null
+      }
       await loadConversationHistory()
+      try {
+        campaign.activeCampaign = await getActiveCampaign()
+      } catch {
+        // 活跃活动可能已删，忽略
+      }
     } catch (e) {
-      console.error('删除会话失败:', e)
-      await alertDialog('删除会话失败: ' + e)
+      console.error('删除活动失败:', e)
+      await alertDialog('删除活动失败: ' + e)
     }
   }
 

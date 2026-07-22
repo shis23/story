@@ -830,6 +830,16 @@ export async function getCampaign(id) {
   return null
 }
 
+/**
+ * 删除整局活动（一 Campaign 一对话：级联会话 + 实例/知识/任务/总结）。
+ * @param {string} id - Campaign id
+ */
+export async function deleteCampaign(id) {
+  if (isTauri()) {
+    return await invoke('delete_campaign', { id })
+  }
+}
+
 /** 设置活跃 Campaign */
 export async function setActiveCampaign(id) {
   if (isTauri()) {

@@ -22,6 +22,7 @@
 | `close` | 关面板 |
 | `select-campaign` | 选中活动 |
 | `set-active` | `setActiveCampaign` + store 同步 |
+| `delete-campaign` | `deleteCampaign`：整局删除（会话+实例/知识/任务/总结） |
 | `change-tab` | 切换 detail tab 并懒加载 |
 | `new-campaign` | 打开 NewCampaignForm |
 | `export-st` / `export-bundle` / `import-bundle` | 既有导出导入 |

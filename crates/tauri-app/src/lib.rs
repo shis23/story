@@ -6175,17 +6175,137 @@ fn list_conversations(state: tauri::State<'_, Arc<AppState>>) -> Vec<Conversatio
         .collect()
 }
 
-/// 删除整个会话（含文件 + 缓存）
+/// 删除整个会话。
+///
+/// 一 Campaign 一对话：若该会话绑定了 Campaign（或某 Campaign 的 conversation_id 指向它），
+/// 则按 **整局活动** 级联删除（实例/知识/任务/总结 + 会话），而不是只清消息树。
 #[tauri::command]
 fn delete_conversation(
     conversation_id: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "conversation/campaign deletion is not available in the SQLite opt-in backend yet"
+                .to_string(),
+        ));
+    }
     let conv_id = Id::from_str(&conversation_id);
+    let store = get_campaign_store();
+
+    // 优先：会话自己记录的 campaign_id
+    let campaign_id = state
+        .conv_store
+        .get(&conv_id)
+        .and_then(|c| c.campaign_id.clone())
+        // 兜底：Campaign.conversation_id 反向指向（悬空/半绑定时）
+        .or_else(|| {
+            store
+                .list_campaigns()
+                .into_iter()
+                .find(|c| c.conversation_id.as_ref() == Some(&conv_id))
+                .map(|c| c.id)
+        });
+
+    if let Some(campaign_id) = campaign_id {
+        return delete_campaign_playthrough_in_store(
+            store,
+            state.conv_store.as_ref(),
+            state.inner().as_ref(),
+            &campaign_id,
+        );
+    }
+
+    // 无 Campaign 的遗留/孤儿会话：只删对话
     state
         .conv_store
         .delete(&conv_id)
         .map_err(|e| TauriCommandError::internal(e.to_string()))
+}
+
+/// 删除整局活动（一 Campaign 一对话模型的真相源删除）。
+///
+/// 级联：instances / knowledge / tasks / round_summaries + 绑定会话；
+/// 若删的是当前活跃活动，清除 active_campaign 指针。
+#[tauri::command]
+fn delete_campaign(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign deletion is not available in the SQLite opt-in backend yet".to_string(),
+        ));
+    }
+    let campaign_id = Id::from_str(&id);
+    delete_campaign_playthrough_in_store(
+        get_campaign_store(),
+        state.conv_store.as_ref(),
+        state.inner().as_ref(),
+        &campaign_id,
+    )
+}
+
+/// 删除一局 playthrough：Campaign 本体（含实例/知识/任务/总结）+ 绑定会话 + 活跃指针。
+fn delete_campaign_playthrough_in_store(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    state: &AppState,
+    campaign_id: &Id,
+) -> Result<(), TauriCommandError> {
+    let campaign = store.get_campaign(campaign_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!(
+            "找不到 campaign id={}",
+            campaign_id.as_str()
+        ))
+    })?;
+
+    // 收集应删除的会话 id：Campaign 绑定 + 反向 campaign_id 匹配（防只绑一边）
+    let mut conversation_ids = std::collections::HashSet::new();
+    if let Some(cid) = campaign.conversation_id.clone() {
+        conversation_ids.insert(cid);
+    }
+    if let Some(found) = conv_store.find_by_campaign(campaign_id) {
+        conversation_ids.insert(found.id);
+    }
+
+    // 先删 Campaign（级联 P2 集合），再删会话，避免写一半留下活动
+    let deleted = store
+        .delete_campaign(campaign_id)
+        .map_err(|e| TauriCommandError::storage(format!("删除活动失败: {e}")))?;
+    if !deleted {
+        return Err(TauriCommandError::not_found(format!(
+            "找不到 campaign id={}",
+            campaign_id.as_str()
+        )));
+    }
+
+    for conv_id in conversation_ids {
+        if let Err(e) = conv_store.delete(&conv_id) {
+            tracing::warn!(
+                "删除活动 {} 后清理会话 {} 失败: {e}",
+                campaign_id.as_str(),
+                conv_id.as_str()
+            );
+            return Err(TauriCommandError::storage(format!(
+                "活动已删除，但清理会话失败: {e}"
+            )));
+        }
+    }
+
+    // 清活跃指针
+    let mut active = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if active.as_ref() == Some(campaign_id) {
+        *active = None;
+        if !sqlite_runtime::is_sqlite_active() {
+            save_active_campaign(&state.data_dir, None);
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -11407,6 +11527,7 @@ pub fn run() {
             fork_campaign,
             list_campaigns,
             get_campaign,
+            delete_campaign,
             set_active_campaign,
             get_active_campaign,
             list_instances,
@@ -14700,6 +14821,107 @@ mod tests {
         assert!(store.list_campaigns().is_empty());
         assert!(store.list_all_instances().is_empty());
         assert!(conv_store.list().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_campaign_playthrough_cascades_conversation_and_summaries() {
+        use storyforge_domain::agent::RoundSummary;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_delete_playthrough_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("Delete Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.character_definitions
+            .push(make_test_character_definition(&card.id, "del-def", "Hero"));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+
+        let dto = create_campaign_in_store(
+            &store,
+            &conv_store,
+            card_id,
+            "playthrough-to-delete".into(),
+            Some("opening".into()),
+        )
+        .unwrap();
+        let campaign_id = Id::from_str(&dto.id);
+        let conversation_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
+
+        store
+            .add_summary(RoundSummary::new(
+                campaign_id.clone(),
+                conversation_id.clone(),
+                1,
+                "round one summary".into(),
+            ))
+            .unwrap();
+        assert_eq!(store.list_summaries(&campaign_id).len(), 1);
+        assert!(conv_store.get(&conversation_id).is_some());
+        assert!(!store.list_instances(&campaign_id).is_empty());
+
+        let state = AppState::new_for_test();
+        *state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
+
+        delete_campaign_playthrough_in_store(&store, &conv_store, &state, &campaign_id).unwrap();
+
+        assert!(store.get_campaign(&campaign_id).is_none());
+        assert!(store.list_instances(&campaign_id).is_empty());
+        assert!(store.list_summaries(&campaign_id).is_empty());
+        assert!(conv_store.get(&conversation_id).is_none());
+        assert!(
+            state
+                .active_campaign
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none(),
+            "active campaign pointer must clear"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_conversation_path_resolves_bound_campaign_and_cascades() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_delete_conv_cascades_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("C2 Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.character_definitions
+            .push(make_test_character_definition(&card.id, "c2-def", "N"));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+
+        let dto = create_campaign_in_store(&store, &conv_store, card_id, "c2".into(), None).unwrap();
+        let campaign_id = Id::from_str(&dto.id);
+        let conversation_id = Id::from_str(dto.conversation_id.as_deref().unwrap());
+        let state = AppState::new_for_test();
+
+        // 与 delete_conversation 命令一致：从会话反查 campaign 后整局删
+        let camp_from_conv = conv_store
+            .get(&conversation_id)
+            .and_then(|c| c.campaign_id)
+            .expect("conversation should bind campaign");
+        assert_eq!(camp_from_conv, campaign_id);
+        delete_campaign_playthrough_in_store(&store, &conv_store, &state, &camp_from_conv).unwrap();
+        assert!(store.get_campaign(&campaign_id).is_none());
+        assert!(conv_store.get(&conversation_id).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

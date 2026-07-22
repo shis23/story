@@ -35,6 +35,7 @@ const emit = defineEmits([
   'close',
   'select-campaign',
   'set-active',
+  'delete-campaign',
   'change-tab',
   'change-mode',
   'new-campaign',
@@ -197,6 +198,12 @@ function taskStatusClass(status) {
               class="min-h-8 px-3 rounded-md text-xs border border-line text-ink-soft hover:bg-surface-2 transition-colors"
               @click="emit('refresh')"
             >刷新</button>
+            <button
+              type="button"
+              class="min-h-8 px-3 rounded-md text-xs border border-err/40 text-err hover:bg-err/10 transition-colors"
+              title="删除整局活动（含对话与总结）"
+              @click="emit('delete-campaign', selectedCampaign)"
+            >删除活动</button>
           </div>
 
           <div class="flex items-center gap-1 border-b border-line">

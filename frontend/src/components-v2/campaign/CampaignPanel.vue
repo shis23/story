@@ -1,9 +1,9 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { alertDialog } from '../../components/base/BaseDialog.js'
+import { alertDialog, confirmDialog } from '../../components/base/BaseDialog.js'
 import {
   getCard,
-  listCampaigns, createCampaign, setActiveCampaign, getActiveCampaign, getActiveTurnQuality,
+  listCampaigns, createCampaign, deleteCampaign, setActiveCampaign, getActiveCampaign, getActiveTurnQuality,
   exportCampaignStCards, exportCampaignBundle, importCampaignBundle
 } from '../../tauri-api.js'
 import { useWritingStore } from '../../stores/writing.js'
@@ -186,6 +186,48 @@ async function handleSetActive(campaignId) {
     console.error('getActiveTurnQuality:', e)
   }
   emit('campaign-changed', activeCampaign.value)
+}
+
+/** 删除整局活动（一活动一对话：级联会话 + 实例/知识/任务/总结） */
+async function handleDeleteCampaign(camp) {
+  const id = camp?.id || selectedCampaignId.value
+  if (!id) return
+  const label = camp?.name || selectedCampaign.value?.name || id.slice(0, 8)
+  const ok = await confirmDialog(
+    `确定删除「${label}」整局活动？\n\n将同时删除：对话正文、角色实例、知识、任务与总结。此操作不可恢复。`,
+    { title: '删除整局活动' },
+  )
+  if (!ok) return
+  try {
+    await deleteCampaign(id)
+    const wasSelected = selectedCampaignId.value === id
+    const wasActive = activeCampaign.value?.id === id
+      || campaignStore.activeCampaign?.id === id
+    if (wasSelected) {
+      selectedCampaignId.value = null
+    }
+    if (wasActive) {
+      activeCampaign.value = null
+      campaignStore.activeCampaign = null
+      // 当前写作若绑在这局会话上，一并清空
+      if (
+        camp?.conversation_id
+        && campaignStore.currentConversationId === camp.conversation_id
+      ) {
+        writingStore.messages = []
+        campaignStore.currentConversationId = null
+      }
+    }
+    await refreshCampaigns()
+    activeCampaign.value = await getActiveCampaign()
+    campaignStore.activeCampaign = activeCampaign.value
+    if (!selectedCampaignId.value && activeCampaign.value?.id) {
+      selectedCampaignId.value = activeCampaign.value.id
+    }
+    emit('campaign-changed', activeCampaign.value)
+  } catch (e) {
+    await alertDialog('删除活动失败: ' + e)
+  }
 }
 
 async function openCampaignDetail(campaignId) {
@@ -373,6 +415,7 @@ defineExpose({ refreshActiveDetailTab })
       @close="emit('close')"
       @select-campaign="onSelectCampaign"
       @set-active="handleSetActive"
+      @delete-campaign="handleDeleteCampaign"
       @change-tab="onChangeDetailTab"
       @change-mode="onChangeMode"
       @new-campaign="onNewCampaignFromShell"
