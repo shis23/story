@@ -9,6 +9,7 @@ import {
 import { useWritingStore } from '../../stores/writing.js'
 import CampaignInstancesTab from './CampaignInstancesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
+import CampaignWorldInfoTab from './CampaignWorldInfoTab.vue'
 import CampaignTasksTab from './CampaignTasksTab.vue'
 import CampaignSummariesTab from './CampaignSummariesTab.vue'
 import CardLibrary from './CardLibrary.vue'
@@ -70,7 +71,7 @@ async function loadSelectedCampaignCardDetail() {
 
 // ─── Detail 状态 ───
 const selectedCampaignId = ref(null)
-const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'tasks' | 'summaries'
+const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'worldinfo' | 'tasks' | 'summaries'
 
 const selectedCampaign = computed(
   () => campaigns.value.find((c) => c.id === selectedCampaignId.value) || activeCampaign.value,
@@ -79,6 +80,7 @@ const selectedCampaign = computed(
 // ─── 子组件 template refs ───
 const instancesTabRef = ref(null)
 const knowledgeTabRef = ref(null)
+const worldInfoTabRef = ref(null)
 const tasksTabRef = ref(null)
 const summariesTabRef = ref(null)
 
@@ -266,6 +268,7 @@ function refreshActiveDetailTab() {
   const refMap = {
     instances: instancesTabRef,
     knowledge: knowledgeTabRef,
+    worldinfo: worldInfoTabRef,
     tasks: tasksTabRef,
     summaries: summariesTabRef,
   }
@@ -475,6 +478,11 @@ defineExpose({ refreshActiveDetailTab })
           <CampaignKnowledgeTab
             v-else-if="detailSubTab === 'knowledge'"
             ref="knowledgeTabRef"
+            :campaign-id="selectedCampaignId"
+          />
+          <CampaignWorldInfoTab
+            v-else-if="detailSubTab === 'worldinfo'"
+            ref="worldInfoTabRef"
             :campaign-id="selectedCampaignId"
           />
           <CampaignTasksTab

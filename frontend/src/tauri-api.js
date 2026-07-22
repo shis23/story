@@ -847,6 +847,74 @@ export async function setActiveCampaign(id) {
   }
 }
 
+// ─── Campaign 本局世界书（卡只读 / 活动可写）──────────────────────────────
+
+/** 列出本局世界书（惰性从卡模板拷贝） */
+export async function listCampaignWorldInfo(campaignId) {
+  if (isTauri()) {
+    return await invoke('list_campaign_world_info', { campaignId })
+  }
+  return { campaign_id: campaignId, entry_count: 0, constant_count: 0, selective_count: 0, entries: [] }
+}
+
+/** 新增本局世界书条目 */
+export async function addCampaignWorldInfoEntry(req) {
+  if (isTauri()) {
+    return await invoke('add_campaign_world_info_entry', {
+      req: {
+        campaign_id: req.campaignId,
+        keys: req.keys || [],
+        content: req.content || '',
+        constant: !!req.constant,
+        depth: req.depth ?? 2,
+        order: req.order ?? 100,
+      },
+    })
+  }
+  return 0
+}
+
+/** 更新本局世界书条目 */
+export async function updateCampaignWorldInfoEntry(req) {
+  if (isTauri()) {
+    return await invoke('update_campaign_world_info_entry', {
+      req: {
+        campaign_id: req.campaignId,
+        entry_index: req.entryIndex,
+        keys: req.keys || [],
+        content: req.content || '',
+        constant: !!req.constant,
+        disabled: !!req.disabled,
+        depth: req.depth ?? 2,
+        order: req.order ?? 100,
+        route: req.route || 'Selective',
+      },
+    })
+  }
+}
+
+/** 删除本局世界书条目 */
+export async function deleteCampaignWorldInfoEntry(campaignId, entryIndex) {
+  if (isTauri()) {
+    return await invoke('delete_campaign_world_info_entry', { campaignId, entryIndex })
+  }
+}
+
+/** 设置本局世界书路由 */
+export async function setCampaignWorldInfoRoute(campaignId, entryIndex, route) {
+  if (isTauri()) {
+    return await invoke('set_campaign_world_info_route', { campaignId, entryIndex, route })
+  }
+}
+
+/** 卡模板世界书只读 */
+export async function getCharacterWorldInfo(characterId) {
+  if (isTauri()) {
+    return await invoke('get_character_world_info', { characterId })
+  }
+  return { campaign_id: `card:${characterId}`, entry_count: 0, constant_count: 0, selective_count: 0, entries: [] }
+}
+
 /** 获取当前活跃 Campaign */
 export async function getActiveCampaign() {
   if (isTauri()) {

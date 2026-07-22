@@ -1304,6 +1304,23 @@ fn delete_world_info_entry(
 fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
     use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
+    // 有活跃活动时以本局世界书为唯一注入源（卡库写路径 rebuild 不应覆盖）
+    if !sqlite_runtime::is_sqlite_active() {
+        let active = state
+            .active_campaign
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(campaign_id) = active {
+            if let Ok(book) = get_campaign_store().get_world_info(&campaign_id) {
+                if !book.entries.is_empty() {
+                    apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
+                    return;
+                }
+            }
+        }
+    }
+
     let all_chars = get_store().list();
 
     // 找当前活跃角色名（tool_ctx.characters 里的）
@@ -7758,18 +7775,42 @@ fn meta_accept_patch(
         }
     }
 
-    // 持久化到 CharacterStore（同步 world_info_entries）
-    // 从 tool_ctx 取最新的世界书，按 is_global 分流回写：
-    //   - 全局条目：写回所有角色卡（跨卡共享语义）
-    //   - 非全局条目：只保留在各卡原有的非全局条目里（按 content 精确匹配，
-    //     不把 patch 修改的某卡私有条目覆盖到其他卡，也不丢失其他卡私有条目）
-    //
-    // 历史 bug：曾用 `all_stored.last()` 把整个合并视图（全局+多卡 merge）
-    // 全部写回最后一张卡，并把 is_global 硬编码 false，导致数据污染与全局标记丢失。
-    {
+    // 游玩态：世界书真相源是 Campaign 书，不写回角色卡模板。
+    // 无活跃活动时保留库维护路径（写回 CharacterStore 合并视图分流）。
+    let active_campaign_id = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(campaign_id) = active_campaign_id {
+        if !sqlite_runtime::is_sqlite_active() {
+            let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(ref world_info) = ctx.world_info {
+                if let Err(e) = get_campaign_store().set_world_info(&campaign_id, (**world_info).clone())
+                {
+                    tracing::warn!(
+                        "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
+                        campaign_id
+                    );
+                } else {
+                    tracing::info!(
+                        "meta_accept_patch 已写回本局世界书 campaign={} entries={}",
+                        campaign_id,
+                        world_info.entries.len()
+                    );
+                }
+            }
+        }
+    } else {
+        // 持久化到 CharacterStore（同步 world_info_entries）——仅库维护 / 无活动
+        // 从 tool_ctx 取最新的世界书，按 is_global 分流回写：
+        //   - 全局条目：写回所有角色卡（跨卡共享语义）
+        //   - 非全局条目：只保留在各卡原有的非全局条目里
+        //
+        // 历史 bug：曾用 `all_stored.last()` 把整个合并视图（全局+多卡 merge）
+        // 全部写回最后一张卡，并把 is_global 硬编码 false，导致数据污染与全局标记丢失。
         let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
         if let Some(ref world_info) = ctx.world_info {
-            // 从合并视图提取全局条目（Constant/Both = 全局），保留原始 is_global
             let global_entries: Vec<crate::WorldInfoEntryInfo> = world_info
                 .entries
                 .iter()
@@ -7790,15 +7831,11 @@ fn meta_accept_patch(
                     order: e.order,
                 })
                 .collect();
-            // 全局条目的 keys 集合（用于从各卡原有条目中排除已合并的全局条目，
-            // 防止各卡私有条目中的旧全局条目残留）
             let global_keys_set: std::collections::HashSet<String> =
                 global_entries.iter().map(|e| e.keys.join(",")).collect();
 
             let all_stored = get_store().list();
             for stored in &all_stored {
-                // 保留该卡的私有条目（is_global=false），并排除 keys 与全局条目重复的
-                // （这些已由全局条目覆盖，避免重复）
                 let preserved_private: Vec<crate::WorldInfoEntryInfo> = stored
                     .info
                     .world_info_entries
@@ -9656,9 +9693,69 @@ fn create_campaign_in_store(
         tracing::warn!("建 Campaign 时追加开场白失败: {e}");
     }
 
+    // 本局世界书：从卡模板（+ 其它卡 is_global）拷贝，活动侧可写、卡侧只读
+    if let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &stored) {
+        tracing::warn!("开档拷贝世界书失败 campaign={}: {e}", campaign.id);
+    }
+
     let mut dto = CampaignSummaryDto::from(&campaign);
     dto.instance_count = instance_count;
     Ok(dto)
+}
+
+/// 开档时将卡内嵌世界书（及其它卡 is_global 条目）写入 Campaign 旁路世界书文件。
+fn seed_campaign_world_info_from_card(
+    store: &campaign_store::CampaignStore,
+    campaign: &storyforge_domain::campaign::Campaign,
+    stored_card: &campaign_store::StoredCard,
+) -> Result<(), String> {
+    let template = resolve_template_world_info_for_card(stored_card);
+    store.ensure_world_info_from_book(&campaign.id, &template)?;
+    Ok(())
+}
+
+fn resolve_template_world_info_for_card(
+    stored_card: &campaign_store::StoredCard,
+) -> storyforge_domain::world_info::WorldInfoBook {
+    // 优先 CharacterStore 完整书；否则用 card 关联 source 上的 embedded 书
+    if let Some(sc) = stored_character_for_source_id(&stored_card.card.source_character_id) {
+        if let Some(book) = sc.info.embedded_world_info.clone() {
+            return merge_global_entries_into_book(book, &sc.info.name);
+        }
+        if let Some(book) = world_info_book_from_entries(&sc.info.world_info_entries) {
+            return merge_global_entries_into_book(book, &sc.info.name);
+        }
+    }
+    storyforge_domain::world_info::WorldInfoBook {
+        entries: Vec::new(),
+        source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
+    }
+}
+
+fn merge_global_entries_into_book(
+    mut book: storyforge_domain::world_info::WorldInfoBook,
+    active_name: &str,
+) -> storyforge_domain::world_info::WorldInfoBook {
+    let all = get_store().list();
+    for stored in all {
+        if stored.info.name == active_name {
+            continue;
+        }
+        for e in &stored.info.world_info_entries {
+            if !e.is_global {
+                continue;
+            }
+            let mut entry = world_info_entry_from_info(e);
+            if let Some(obj) = entry.extensions.as_object_mut() {
+                obj.insert("sf_source".into(), serde_json::json!("merged_global"));
+            } else {
+                entry.extensions = serde_json::json!({ "sf_source": "merged_global" });
+            }
+            book.entries.push(entry);
+        }
+    }
+    book
 }
 
 fn fork_campaign_in_store(
@@ -9719,6 +9816,22 @@ fn fork_campaign_in_store(
             .add_instance(instance)
             .map_err(|e| TauriCommandError::storage(format!("copy fork instance failed: {e}")))?;
         instance_count += 1;
+    }
+
+    // 本局世界书：fork 时深拷贝源活动书（没有则从卡模板 ensure）
+    match store.get_world_info(&source.id) {
+        Ok(book) if !book.entries.is_empty() => {
+            if let Err(e) = store.set_world_info(&campaign.id, book) {
+                tracing::warn!("fork 拷贝世界书失败: {e}");
+            }
+        }
+        _ => {
+            if let Some(card) = store.get_card(&campaign.card_id) {
+                if let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &card) {
+                    tracing::warn!("fork 惰性种子世界书失败: {e}");
+                }
+            }
+        }
     }
 
     let mut dto = CampaignSummaryDto::from(&campaign);
@@ -9843,6 +9956,23 @@ fn set_active_campaign(
         .unwrap_or_else(|p| p.into_inner()) = Some(campaign_id.clone());
     if !sqlite_runtime::is_sqlite_active() {
         save_active_campaign(&state.data_dir, Some(&campaign_id));
+        // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书
+        let store = get_campaign_store();
+        if let Ok(mut book) = store.get_world_info(&campaign_id) {
+            if book.entries.is_empty() {
+                if let Some(camp) = store.get_campaign(&campaign_id) {
+                    if let Some(card) = store.get_card(&camp.card_id) {
+                        let template = resolve_template_world_info_for_card(&card);
+                        if let Ok(seeded) =
+                            store.ensure_world_info_from_book(&campaign_id, &template)
+                        {
+                            book = seeded;
+                        }
+                    }
+                }
+            }
+            apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
+        }
     }
     Ok(())
 }
@@ -10346,6 +10476,328 @@ fn list_round_summaries(campaign_id: String) -> Vec<RoundSummaryDto> {
         .iter()
         .map(RoundSummaryDto::from)
         .collect()
+}
+
+// ─── Campaign 本局世界书（卡只读模板 / 活动可写真相源）──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignWorldInfoEntryDto {
+    pub index: usize,
+    pub keys: Vec<String>,
+    pub secondary_keys: Vec<String>,
+    pub content: String,
+    pub constant: bool,
+    pub selective: bool,
+    pub disabled: bool,
+    pub depth: i32,
+    pub order: i32,
+    pub route: String,
+    /// card | merged_global | user
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignWorldInfoDto {
+    pub campaign_id: String,
+    pub entry_count: usize,
+    pub constant_count: usize,
+    pub selective_count: usize,
+    pub entries: Vec<CampaignWorldInfoEntryDto>,
+}
+
+fn lore_route_to_str(route: &storyforge_domain::world_info::LoreRoute) -> String {
+    match route {
+        storyforge_domain::world_info::LoreRoute::Constant => "Constant".into(),
+        storyforge_domain::world_info::LoreRoute::Selective => "Selective".into(),
+        storyforge_domain::world_info::LoreRoute::Both => "Both".into(),
+        storyforge_domain::world_info::LoreRoute::Disabled => "Disabled".into(),
+    }
+}
+
+fn parse_lore_route(s: &str) -> Result<storyforge_domain::world_info::LoreRoute, TauriCommandError> {
+    match s {
+        "Constant" | "constant" => Ok(storyforge_domain::world_info::LoreRoute::Constant),
+        "Selective" | "selective" => Ok(storyforge_domain::world_info::LoreRoute::Selective),
+        "Both" | "both" => Ok(storyforge_domain::world_info::LoreRoute::Both),
+        "Disabled" | "disabled" => Ok(storyforge_domain::world_info::LoreRoute::Disabled),
+        other => Err(TauriCommandError::validation(format!("未知世界书路由: {other}"))),
+    }
+}
+
+fn entry_source_label(entry: &storyforge_domain::world_info::WorldInfoEntry) -> String {
+    entry
+        .extensions
+        .get("sf_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("card")
+        .to_string()
+}
+
+fn world_info_entry_to_dto(
+    index: usize,
+    e: &storyforge_domain::world_info::WorldInfoEntry,
+) -> CampaignWorldInfoEntryDto {
+    CampaignWorldInfoEntryDto {
+        index,
+        keys: e.keys.clone(),
+        secondary_keys: e.secondary_keys.clone(),
+        content: e.content.clone(),
+        constant: e.constant,
+        selective: e.selective,
+        disabled: e.disabled,
+        depth: e.depth,
+        order: e.order,
+        route: lore_route_to_str(&e.route),
+        source: entry_source_label(e),
+    }
+}
+
+fn book_to_campaign_world_info_dto(
+    campaign_id: &Id,
+    book: &storyforge_domain::world_info::WorldInfoBook,
+) -> CampaignWorldInfoDto {
+    let entries: Vec<_> = book
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| world_info_entry_to_dto(i, e))
+        .collect();
+    let constant_count = book.constant_entries().len();
+    let selective_count = book.selective_entries().len();
+    CampaignWorldInfoDto {
+        campaign_id: campaign_id.as_str().to_string(),
+        entry_count: entries.len(),
+        constant_count,
+        selective_count,
+        entries,
+    }
+}
+
+/// 列出本局世界书。若尚未拷贝且可从卡解析模板，则惰性 ensure。
+#[tauri::command]
+fn list_campaign_world_info(
+    campaign_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CampaignWorldInfoDto, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let store = get_campaign_store();
+    let id = Id::from_str(&campaign_id);
+    let camp = store
+        .get_campaign(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}")))?;
+    let mut book = store
+        .get_world_info(&id)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    if book.entries.is_empty() {
+        if let Some(card) = store.get_card(&camp.card_id) {
+            let template = resolve_template_world_info_for_card(&card);
+            book = store
+                .ensure_world_info_from_book(&id, &template)
+                .map_err(|e| TauriCommandError::storage(e))?;
+        }
+    }
+    apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
+    Ok(book_to_campaign_world_info_dto(&id, &book))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddCampaignWorldInfoDto {
+    pub campaign_id: String,
+    pub keys: Vec<String>,
+    pub content: String,
+    pub constant: bool,
+    #[serde(default = "default_depth")]
+    pub depth: i32,
+    #[serde(default = "default_order")]
+    pub order: i32,
+}
+
+#[tauri::command]
+fn add_campaign_world_info_entry(
+    req: AddCampaignWorldInfoDto,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<usize, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&req.campaign_id);
+    let route = if req.constant {
+        storyforge_domain::world_info::LoreRoute::Constant
+    } else {
+        storyforge_domain::world_info::LoreRoute::Selective
+    };
+    let entry = storyforge_domain::world_info::WorldInfoEntry {
+        st_id: None,
+        keys: req.keys,
+        secondary_keys: vec![],
+        content: req.content,
+        constant: req.constant,
+        selective: !req.constant,
+        selective_logic: storyforge_domain::world_info::SelectiveLogic::And,
+        disabled: false,
+        position: 0,
+        depth: req.depth,
+        order: req.order,
+        route,
+        extensions: serde_json::json!({ "sf_source": "user" }),
+        extra: Default::default(),
+    };
+    let store = get_campaign_store();
+    let idx = store
+        .add_world_info_entry(&id, entry)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    if let Ok(book) = store.get_world_info(&id) {
+        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
+    }
+    Ok(idx)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateCampaignWorldInfoDto {
+    pub campaign_id: String,
+    pub entry_index: usize,
+    pub keys: Vec<String>,
+    pub content: String,
+    pub constant: bool,
+    pub disabled: bool,
+    pub depth: i32,
+    pub order: i32,
+    pub route: String,
+}
+
+#[tauri::command]
+fn update_campaign_world_info_entry(
+    req: UpdateCampaignWorldInfoDto,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&req.campaign_id);
+    let store = get_campaign_store();
+    let book = store
+        .get_world_info(&id)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    let prev = book
+        .entries
+        .get(req.entry_index)
+        .ok_or_else(|| TauriCommandError::not_found(format!("条目索引越界: {}", req.entry_index)))?;
+    let route = parse_lore_route(&req.route)?;
+    let mut entry = prev.clone();
+    entry.keys = req.keys;
+    entry.content = req.content;
+    entry.constant = req.constant;
+    entry.selective = !req.constant;
+    entry.disabled = req.disabled || matches!(route, storyforge_domain::world_info::LoreRoute::Disabled);
+    entry.depth = req.depth;
+    entry.order = req.order;
+    entry.route = route;
+    store
+        .update_world_info_entry(&id, req.entry_index, entry)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    if let Ok(book) = store.get_world_info(&id) {
+        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_campaign_world_info_entry(
+    campaign_id: String,
+    entry_index: usize,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&campaign_id);
+    let store = get_campaign_store();
+    store
+        .delete_world_info_entry(&id, entry_index)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    if let Ok(book) = store.get_world_info(&id) {
+        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_campaign_world_info_route(
+    campaign_id: String,
+    entry_index: usize,
+    route: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&campaign_id);
+    let lore = parse_lore_route(&route)?;
+    let store = get_campaign_store();
+    store
+        .set_world_info_route(&id, entry_index, lore)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    if let Ok(book) = store.get_world_info(&id) {
+        apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
+    }
+    Ok(())
+}
+
+/// 卡模板世界书只读（供角色卡 UI，不可写路径）。
+/// `character_id` 可为 CharacterStore.id 或 CharacterCard.source_character_id。
+#[tauri::command]
+fn get_character_world_info(character_id: String) -> Result<CampaignWorldInfoDto, TauriCommandError> {
+    let stored = get_store()
+        .get(&character_id)
+        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    let book = stored
+        .info
+        .embedded_world_info
+        .clone()
+        .or_else(|| world_info_book_from_entries(&stored.info.world_info_entries))
+        .unwrap_or_else(|| storyforge_domain::world_info::WorldInfoBook {
+            entries: Vec::new(),
+            source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
+        });
+    // 伪 campaign_id 槽位仅用于 DTO 复用；UI 标注只读
+    let fake = Id::from_str(&format!("card:{}", stored.id));
+    Ok(book_to_campaign_world_info_dto(&fake, &book))
+}
+
+/// 若 `campaign_id` 是当前活跃活动，则把本局世界书写入 tool_ctx（写作注入真相源）。
+fn apply_campaign_world_info_to_tool_ctx(
+    state: &AppState,
+    campaign_id: &Id,
+    book: &storyforge_domain::world_info::WorldInfoBook,
+) {
+    let active = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if active.as_ref() != Some(campaign_id) {
+        return;
+    }
+    let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
+    if book.entries.is_empty() {
+        ctx.world_info = None;
+    } else {
+        ctx.world_info = Some(std::sync::Arc::new(book.clone()));
+    }
 }
 
 /// 活动 Turn 的质量门禁摘要（供前端刷新后回填 ProcessReview）。
@@ -11545,6 +11997,12 @@ pub fn run() {
             complete_task,
             abandon_task,
             list_round_summaries,
+            list_campaign_world_info,
+            add_campaign_world_info_entry,
+            update_campaign_world_info_entry,
+            delete_campaign_world_info_entry,
+            set_campaign_world_info_route,
+            get_character_world_info,
             get_active_turn_quality,
             // P3 Meta Agent / MVU 五合一 / ST 预设分类
             meta_start_conversation,

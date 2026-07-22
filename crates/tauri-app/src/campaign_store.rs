@@ -1,6 +1,6 @@
 //! Campaign / CharacterCard / CharacterInstance 持久化
 //!
-//! 分七个文件（对应 P1/P2/P3 设计决策）：
+//! 分文件（对应 P1/P2/P3 + 世界书分层）：
 //! - data/cards.json            —— CharacterCard（含 character_definitions）
 //! - data/campaigns.json        —— Campaign
 //! - data/instances.json        —— CharacterInstance（按 campaign_id 索引）
@@ -8,6 +8,7 @@
 //! - data/tasks.json            —— StoryTask（叙事计划任务，P2 新增）
 //! - data/round_summaries.json  —— RoundSummary（本轮剧情摘要，P2 新增）
 //! - data/mvu_translations.json —— StoredMvuTranslation（MVU 五合一产物，P3 新增）
+//! - data/campaign_world_info/{campaign_id}.json —— 本局世界书（卡模板只读，活动可写）
 //!
 //! 与现有 CharacterStore（扁平 Character）并存，向后兼容。
 
@@ -22,6 +23,7 @@ use storyforge_domain::character::{CharacterCard, RoleType};
 use storyforge_domain::character_knowledge::CharacterKnowledgeEntry;
 use storyforge_domain::mvu_translation::MvuTranslation;
 use storyforge_domain::story_task::StoryTask;
+use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
 
 // ─── CharacterCard 存储 ────────────────────────────────────────────────────
 
@@ -63,6 +65,8 @@ pub struct CampaignStore {
     tasks_path: PathBuf,
     summaries_path: PathBuf,
     mvu_path: PathBuf,
+    /// 本局世界书目录（每活动一文件，避免 campaigns.json 被 400+ 条目撑爆）
+    world_info_dir: PathBuf,
     /// 集合级缓存锁。写盘仍在对应集合锁内串行，避免锁外旧快照覆盖新快照。
     cards: Mutex<Vec<StoredCard>>,
     campaigns: Mutex<Vec<Campaign>>,
@@ -71,6 +75,8 @@ pub struct CampaignStore {
     tasks: Mutex<Vec<StoryTask>>,
     summaries: Mutex<Vec<RoundSummary>>,
     mvu: Mutex<Vec<StoredMvuTranslation>>,
+    /// campaign_id → 本局世界书（惰性装入）
+    world_info: Mutex<std::collections::HashMap<String, WorldInfoBook>>,
     /// When SQLite is the process authority, this legacy JSON store must not
     /// be read as a fallback or used as a secondary write target.
     json_access_disabled: AtomicBool,
@@ -85,6 +91,8 @@ impl CampaignStore {
         let tasks_path = data_dir.join("tasks.json");
         let summaries_path = data_dir.join("round_summaries.json");
         let mvu_path = data_dir.join("mvu_translations.json");
+        let world_info_dir = data_dir.join("campaign_world_info");
+        let _ = std::fs::create_dir_all(&world_info_dir);
 
         Self {
             cards: Mutex::new(load_or_default(&cards_path)),
@@ -94,6 +102,7 @@ impl CampaignStore {
             tasks: Mutex::new(load_or_default(&tasks_path)),
             summaries: Mutex::new(load_or_default(&summaries_path)),
             mvu: Mutex::new(load_or_default(&mvu_path)),
+            world_info: Mutex::new(std::collections::HashMap::new()),
             json_access_disabled: AtomicBool::new(false),
             cards_path,
             campaigns_path,
@@ -102,6 +111,7 @@ impl CampaignStore {
             tasks_path,
             summaries_path,
             mvu_path,
+            world_info_dir,
         }
     }
 
@@ -116,8 +126,10 @@ impl CampaignStore {
             tasks_path: PathBuf::new(),
             summaries_path: PathBuf::new(),
             mvu_path: PathBuf::new(),
+            world_info_dir: PathBuf::new(),
             cards: Mutex::new(Vec::new()),
             campaigns: Mutex::new(Vec::new()),
+            world_info: Mutex::new(std::collections::HashMap::new()),
             instances: Mutex::new(Vec::new()),
             knowledge: Mutex::new(Vec::new()),
             tasks: Mutex::new(Vec::new()),
@@ -421,7 +433,7 @@ impl CampaignStore {
         let changed = campaigns.len() != before;
         if changed {
             persist(&self.campaigns_path, &campaigns)?;
-            // 级联删除 instances + knowledge + tasks + round_summaries
+            // 级联删除 instances + knowledge + tasks + round_summaries + 本局世界书
             instances.retain(|i| i.campaign_id != *id);
             persist(&self.instances_path, &instances)?;
             knowledge.retain(|k| k.campaign_id != *id);
@@ -430,8 +442,153 @@ impl CampaignStore {
             persist(&self.tasks_path, &tasks)?;
             summaries.retain(|s| s.campaign_id != *id);
             persist(&self.summaries_path, &summaries)?;
+            self.delete_world_info_file(id);
         }
         Ok(changed)
+    }
+
+    // ─── Campaign 本局世界书（卡模板只读；活动可写）──────────────────────
+
+    fn world_info_path(&self, campaign_id: &Id) -> PathBuf {
+        self.world_info_dir
+            .join(format!("{}.json", campaign_id.as_str()))
+    }
+
+    fn delete_world_info_file(&self, campaign_id: &Id) {
+        let path = self.world_info_path(campaign_id);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Ok(mut map) = self.world_info.lock() {
+            map.remove(campaign_id.as_str());
+        }
+    }
+
+    /// 读取本局世界书。文件不存在返回空书（调用方应 ensure/copy）。
+    pub fn get_world_info(&self, campaign_id: &Id) -> Result<WorldInfoBook, String> {
+        if self.json_access_disabled() {
+            return Err("legacy JSON CampaignStore is disabled while SQLite is authoritative".into());
+        }
+        {
+            let map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(book) = map.get(campaign_id.as_str()) {
+                return Ok(book.clone());
+            }
+        }
+        let path = self.world_info_path(campaign_id);
+        let book = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read campaign world_info failed: {e}"))?;
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("parse campaign world_info failed: {e}"))?
+        } else {
+            empty_world_info_book()
+        };
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
+        map.insert(campaign_id.as_str().to_string(), book.clone());
+        Ok(book)
+    }
+
+    /// 整本替换本局世界书并落盘。
+    pub fn set_world_info(&self, campaign_id: &Id, book: WorldInfoBook) -> Result<(), String> {
+        self.ensure_json_write_allowed()?;
+        if self.get_campaign(campaign_id).is_none() {
+            return Err(format!("campaign not found: {}", campaign_id.as_str()));
+        }
+        let _ = std::fs::create_dir_all(&self.world_info_dir);
+        let path = self.world_info_path(campaign_id);
+        storyforge_infra_util::atomic_write_json(&path, &book)
+            .map_err(|e| format!("persist campaign world_info failed: {e}"))?;
+        let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
+        map.insert(campaign_id.as_str().to_string(), book);
+        Ok(())
+    }
+
+    /// 从卡模板书深拷贝到本局（开档 / 惰性迁移）。已有非空本局书则跳过。
+    pub fn ensure_world_info_from_book(
+        &self,
+        campaign_id: &Id,
+        template: &WorldInfoBook,
+    ) -> Result<WorldInfoBook, String> {
+        let existing = self.get_world_info(campaign_id)?;
+        if !existing.entries.is_empty() {
+            return Ok(existing);
+        }
+        let mut book = template.clone();
+        // 标记条目来自卡模板（extensions 上挂 source，便于 UI 区分 user 新增）
+        for entry in &mut book.entries {
+            if entry.extensions.is_null() {
+                entry.extensions = serde_json::json!({ "sf_source": "card" });
+            } else if let Some(obj) = entry.extensions.as_object_mut() {
+                obj.entry("sf_source")
+                    .or_insert_with(|| serde_json::json!("card"));
+            }
+        }
+        self.set_world_info(campaign_id, book.clone())?;
+        Ok(book)
+    }
+
+    pub fn add_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        mut entry: WorldInfoEntry,
+    ) -> Result<usize, String> {
+        let mut book = self.get_world_info(campaign_id)?;
+        if entry.extensions.is_null() {
+            entry.extensions = serde_json::json!({ "sf_source": "user" });
+        } else if let Some(obj) = entry.extensions.as_object_mut() {
+            obj.entry("sf_source")
+                .or_insert_with(|| serde_json::json!("user"));
+        }
+        book.entries.push(entry);
+        let idx = book.entries.len() - 1;
+        self.set_world_info(campaign_id, book)?;
+        Ok(idx)
+    }
+
+    pub fn update_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        entry: WorldInfoEntry,
+    ) -> Result<(), String> {
+        let mut book = self.get_world_info(campaign_id)?;
+        if entry_index >= book.entries.len() {
+            return Err(format!("世界书条目索引越界: {entry_index}"));
+        }
+        book.entries[entry_index] = entry;
+        self.set_world_info(campaign_id, book)
+    }
+
+    pub fn delete_world_info_entry(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+    ) -> Result<(), String> {
+        let mut book = self.get_world_info(campaign_id)?;
+        if entry_index >= book.entries.len() {
+            return Err(format!("世界书条目索引越界: {entry_index}"));
+        }
+        book.entries.remove(entry_index);
+        self.set_world_info(campaign_id, book)
+    }
+
+    pub fn set_world_info_route(
+        &self,
+        campaign_id: &Id,
+        entry_index: usize,
+        route: LoreRoute,
+    ) -> Result<(), String> {
+        let mut book = self.get_world_info(campaign_id)?;
+        if entry_index >= book.entries.len() {
+            return Err(format!("世界书条目索引越界: {entry_index}"));
+        }
+        book.entries[entry_index].route = route;
+        book.entries[entry_index].disabled = matches!(
+            book.entries[entry_index].route,
+            LoreRoute::Disabled
+        );
+        self.set_world_info(campaign_id, book)
     }
 
     // ─── CharacterInstance CRUD ───────────────────────────────────────────
@@ -1005,6 +1162,14 @@ pub(crate) fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<()
     })
 }
 
+fn empty_world_info_book() -> WorldInfoBook {
+    WorldInfoBook {
+        entries: Vec::new(),
+        source: storyforge_domain::Source::Native,
+        metadata: Default::default(),
+    }
+}
+
 // ─── 测试 ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1107,6 +1272,86 @@ mod tests {
 
         let all = store.list_cards();
         assert_eq!(all.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_campaign_world_info_copy_edit_does_not_touch_missing_file_until_set() {
+        use storyforge_domain::world_info::{LoreRoute, WorldInfoBook, WorldInfoEntry};
+
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        store.save_card(make_card()).unwrap();
+        let camp = Campaign::new(Id::from_str("card-1"), "wi-play");
+        let camp_id = camp.id.clone();
+        store.create_campaign_with_instances(camp).unwrap();
+
+        let template = WorldInfoBook {
+            entries: vec![WorldInfoEntry {
+                st_id: Some(1),
+                keys: vec!["圣都".into()],
+                secondary_keys: vec![],
+                content: "梵尼亚".into(),
+                constant: true,
+                selective: false,
+                selective_logic: Default::default(),
+                disabled: false,
+                position: 0,
+                depth: 2,
+                order: 100,
+                route: LoreRoute::Constant,
+                extensions: serde_json::json!({}),
+                extra: Default::default(),
+            }],
+            source: storyforge_domain::Source::ImportedFromST,
+            metadata: Default::default(),
+        };
+        let book = store
+            .ensure_world_info_from_book(&camp_id, &template)
+            .unwrap();
+        assert_eq!(book.entries.len(), 1);
+        assert_eq!(
+            book.entries[0].extensions.get("sf_source").and_then(|v| v.as_str()),
+            Some("card")
+        );
+
+        // 二次 ensure 不覆盖用户已有书
+        let mut user_book = book.clone();
+        user_book.entries[0].content = "用户改过".into();
+        store.set_world_info(&camp_id, user_book).unwrap();
+        let again = store
+            .ensure_world_info_from_book(&camp_id, &template)
+            .unwrap();
+        assert_eq!(again.entries[0].content, "用户改过");
+
+        store
+            .add_world_info_entry(
+                &camp_id,
+                WorldInfoEntry {
+                    st_id: None,
+                    keys: vec!["测试地点".into()],
+                    secondary_keys: vec![],
+                    content: "本局新增".into(),
+                    constant: false,
+                    selective: true,
+                    selective_logic: Default::default(),
+                    disabled: false,
+                    position: 0,
+                    depth: 2,
+                    order: 50,
+                    route: LoreRoute::Selective,
+                    extensions: serde_json::json!({}),
+                    extra: Default::default(),
+                },
+            )
+            .unwrap();
+        let listed = store.get_world_info(&camp_id).unwrap();
+        assert_eq!(listed.entries.len(), 2);
+        assert!(store.world_info_path(&camp_id).exists());
+
+        assert!(store.delete_campaign(&camp_id).unwrap());
+        assert!(!store.world_info_path(&camp_id).exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

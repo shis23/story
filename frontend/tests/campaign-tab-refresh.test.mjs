@@ -8,12 +8,19 @@ import {
 } from '../src/utils/campaignTabRefresh.js'
 
 test('DETAIL_SUB_TABS contains all expected sub-tab names', () => {
-  assert.deepEqual(DETAIL_SUB_TABS, ['instances', 'knowledge', 'tasks', 'summaries'])
+  assert.deepEqual(DETAIL_SUB_TABS, [
+    'instances',
+    'knowledge',
+    'worldinfo',
+    'tasks',
+    'summaries',
+  ])
 })
 
 test('SUB_TAB_REFS maps each sub-tab to a ref key', () => {
   assert.equal(SUB_TAB_REFS.instances, 'instancesTabRef')
   assert.equal(SUB_TAB_REFS.knowledge, 'knowledgeTabRef')
+  assert.equal(SUB_TAB_REFS.worldinfo, 'worldInfoTabRef')
   assert.equal(SUB_TAB_REFS.tasks, 'tasksTabRef')
   assert.equal(SUB_TAB_REFS.summaries, 'summariesTabRef')
 })

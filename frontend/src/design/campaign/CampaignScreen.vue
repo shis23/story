@@ -48,6 +48,7 @@ const emit = defineEmits([
 const tabs = [
   { key: 'instances', label: '实例' },
   { key: 'knowledge', label: '知识' },
+  { key: 'worldinfo', label: '世界书' },
   { key: 'tasks', label: '任务' },
   { key: 'summaries', label: '总结' },
 ]

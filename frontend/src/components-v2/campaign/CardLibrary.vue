@@ -16,6 +16,7 @@ import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
+import WorldInfoReadonlyPanel from './WorldInfoReadonlyPanel.vue'
 
 const emit = defineEmits(['open-campaigns'])
 
@@ -135,6 +136,11 @@ function roleVariant(roleType) {
                 <span v-if="def.group" class="text-ink-soft">{{ def.group }}</span>
               </div>
               <div class="text-ink-soft line-clamp-2">{{ def.persona_prompt }}</div>
+            </div>
+
+            <!-- 卡模板世界书（只读） -->
+            <div class="pt-2 border-t border-line">
+              <WorldInfoReadonlyPanel :character-id="card.source_character_id || cardDetail.source_character_id" />
             </div>
 
             <!-- 开档按钮 -->
