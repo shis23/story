@@ -831,6 +831,37 @@ export async function cardstudioCreateFromCharacter(characterId, brief = null) {
   }
 }
 
+/** B: 从小说正文创建改编项目（随后可 prefill） */
+export async function cardstudioCreateFromNovel(name, brief, novelTitle, novelText) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_from_novel', {
+      name: name || '',
+      brief: brief || '',
+      novelTitle: novelTitle || '',
+      novelText: novelText || '',
+    })
+  }
+  return {
+    id: 'mock-novel-1',
+    name: name || '小说改编（mock）',
+    mode: 'from_novel',
+    current_stage: 'basic',
+    novel_title: novelTitle,
+  }
+}
+
+/** B: 对 FromNovel 项目做 LLM 预填 */
+export async function cardstudioPrefillFromNovel(id, userNote = null, includeStyle = true) {
+  if (isTauri()) {
+    return await invoke('cardstudio_prefill_from_novel', {
+      id,
+      userNote: userNote || null,
+      includeStyle,
+    })
+  }
+  return null
+}
+
 export async function cardstudioGetProject(id) {
   if (isTauri()) {
     return await invoke('cardstudio_get_project', { id })

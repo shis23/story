@@ -12317,7 +12317,9 @@ pub fn run() {
             // Card Studio Phase 1
             card_studio_api::cardstudio_list_projects,
             card_studio_api::cardstudio_create_project,
+            card_studio_api::cardstudio_create_from_novel,
             card_studio_api::cardstudio_create_from_character,
+            card_studio_api::cardstudio_prefill_from_novel,
             card_studio_api::cardstudio_get_project,
             card_studio_api::cardstudio_delete_project,
             card_studio_api::cardstudio_update_artifacts,

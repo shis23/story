@@ -36,6 +36,8 @@ pub fn phase1_stage_ids() -> &'static [&'static str] {
 pub enum CardProjectMode {
     #[default]
     FromScratch,
+    /// 从小说摘录/全文蒸馏预填写卡工程（B path MVP）
+    FromNovel,
     /// 从已有角色卡反解析进入写卡工程（默认另存，不覆盖原卡）
     FromExistingCard,
 }
@@ -108,6 +110,9 @@ pub struct CardArtifacts {
     /// 开场大纲（可选，便于用户回看）
     #[serde(default)]
     pub opening_outline: Option<serde_json::Value>,
+    /// 文风提示/公式（B 路径；进 notes 旁路，不直接当 description）
+    #[serde(default)]
+    pub style_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +147,15 @@ pub struct CardProject {
     /// 反解析来源：CharacterStore 存储 id（若有）
     #[serde(default)]
     pub source_stored_id: Option<String>,
+    /// B 路径：小说原文（可截断；完整大文件后续可外置）
+    #[serde(default)]
+    pub novel_text: Option<String>,
+    /// B 路径：小说标题
+    #[serde(default)]
+    pub novel_title: Option<String>,
+    /// B 路径：切分后的摘录（用于 prefill / style）
+    #[serde(default)]
+    pub novel_excerpts: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -186,6 +200,78 @@ impl CardProject {
             imported_character_id: None,
             source_character_id: None,
             source_stored_id: None,
+            novel_text: None,
+            novel_title: None,
+            novel_excerpts: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Create a FromNovel project from pasted/imported text (B path MVP).
+    ///
+    /// Does not run LLM yet; stores excerpts and lands on BASIC ready for prefill.
+    pub fn new_from_novel(
+        name: impl Into<String>,
+        brief: impl Into<String>,
+        novel_title: impl Into<String>,
+        novel_text: impl Into<String>,
+    ) -> Self {
+        let now = chrono_like_now();
+        let mut stage_status = std::collections::BTreeMap::new();
+        for id in phase1_stage_ids() {
+            stage_status.insert((*id).to_string(), StageStatus::Pending);
+        }
+        // brief is given by novel intent; jump to basic prefill
+        stage_status.insert(STAGE_BRIEF.to_string(), StageStatus::Done);
+        stage_status.insert(STAGE_BASIC.to_string(), StageStatus::Ready);
+
+        let name = name.into();
+        let brief = brief.into();
+        let novel_title = {
+            let t = novel_title.into();
+            if t.trim().is_empty() {
+                name.clone()
+            } else {
+                t
+            }
+        };
+        let novel_text = novel_text.into();
+        let excerpts = sample_novel_excerpts(&novel_text, 12_000);
+        let mut artifacts = CardArtifacts::default();
+        artifacts.notes = if brief.trim().is_empty() {
+            format!("小说改编：{}", novel_title)
+        } else {
+            brief.clone()
+        };
+        artifacts.name = name.clone();
+
+        Self {
+            id: Id::new().to_string(),
+            name: if name.trim().is_empty() {
+                format!("{}（小说改编）", novel_title)
+            } else {
+                name
+            },
+            mode: CardProjectMode::FromNovel,
+            brief: if brief.trim().is_empty() {
+                format!("从小说《{}》改编角色卡", novel_title)
+            } else {
+                brief
+            },
+            current_stage: STAGE_BASIC.to_string(),
+            stage_status,
+            artifacts,
+            stage_pack_id: default_stage_pack_id(),
+            allow_ai_freewrite: false,
+            last_error: None,
+            last_stage_output: None,
+            imported_character_id: None,
+            source_character_id: None,
+            source_stored_id: None,
+            novel_text: Some(novel_text),
+            novel_title: Some(novel_title),
+            novel_excerpts: excerpts,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -235,6 +321,9 @@ impl CardProject {
             imported_character_id: None,
             source_character_id: Some(character.id.as_str().to_string()),
             source_stored_id: stored_id,
+            novel_text: None,
+            novel_title: None,
+            novel_excerpts: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -248,6 +337,196 @@ impl CardProject {
         self.stage_status.insert(stage_id.to_string(), status);
         self.touch();
     }
+}
+
+/// Sample head/mid/tail excerpts for B-path prefill without shipping whole novels into every prompt.
+pub fn sample_novel_excerpts(text: &str, max_chars_per_slice: usize) -> Vec<String> {
+    let cleaned = text.replace("\r\n", "\n");
+    let chars: Vec<char> = cleaned.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let n = max_chars_per_slice.max(500);
+    if chars.len() <= n {
+        return vec![chars.iter().collect()];
+    }
+    let head: String = chars.iter().take(n).collect();
+    let mid_start = chars.len().saturating_sub(n) / 2;
+    let mid: String = chars.iter().skip(mid_start).take(n).collect();
+    let tail: String = chars.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
+    let mut out = vec![head];
+    if mid_start > n / 2 {
+        out.push(mid);
+    }
+    if chars.len() > n * 2 {
+        out.push(tail);
+    }
+    out
+}
+
+/// Build prompt for novel → card prefill (B path).
+pub fn build_novel_prefill_prompt(project: &CardProject) -> Result<String, String> {
+    if project.novel_excerpts.is_empty()
+        && project
+            .novel_text
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err("小说正文为空，无法预填".into());
+    }
+    let excerpts = if project.novel_excerpts.is_empty() {
+        sample_novel_excerpts(project.novel_text.as_deref().unwrap_or(""), 12_000)
+    } else {
+        project.novel_excerpts.clone()
+    };
+    let body = excerpts
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("### 摘录 {}\n{}", i + 1, e))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(format!(
+        "{common}\n\n{task}\n\n## 用户 brief\n{brief}\n\n## 小说标题\n{title}\n\n## 小说摘录\n{body}\n",
+        common = DISTILL_PACK::COMMON,
+        task = DISTILL_PACK::PREFILL,
+        brief = if project.brief.trim().is_empty() {
+            "（未提供，请自选主卡角色）"
+        } else {
+            project.brief.as_str()
+        },
+        title = project
+            .novel_title
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(project.name.as_str()),
+        body = body,
+    ))
+}
+
+/// Build short style-sample prompt from stored excerpts.
+pub fn build_novel_style_prompt(project: &CardProject) -> Result<String, String> {
+    let sample = project
+        .novel_excerpts
+        .first()
+        .cloned()
+        .or_else(|| {
+            project
+                .novel_text
+                .as_ref()
+                .map(|t| sample_novel_excerpts(t, 6_000).into_iter().next().unwrap_or_default())
+        })
+        .unwrap_or_default();
+    if sample.trim().is_empty() {
+        return Err("无可用摘录做文风抽样".into());
+    }
+    Ok(format!(
+        "{common}\n\n{task}\n\n## 摘录\n{sample}\n",
+        common = DISTILL_PACK::COMMON,
+        task = DISTILL_PACK::STYLE,
+        sample = sample,
+    ))
+}
+
+/// Apply prefill JSON (from novel distill) onto artifacts.
+pub fn apply_novel_prefill_json(
+    artifacts: &mut CardArtifacts,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    apply_stage_json(STAGE_BASIC, artifacts, value)?;
+    if let Some(p) = value.get("personality").and_then(|v| v.as_str()) {
+        if !p.trim().is_empty() {
+            artifacts.personality = p.to_string();
+        }
+    }
+    if let Some(s) = value.get("scenario").and_then(|v| v.as_str()) {
+        if !s.trim().is_empty() {
+            artifacts.scenario = s.to_string();
+        }
+    }
+    if let Some(f) = value.get("first_mes").and_then(|v| v.as_str()) {
+        if !f.trim().is_empty() {
+            artifacts.first_mes = f.to_string();
+        }
+    }
+    if let Some(style) = value
+        .get("style_notes")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        artifacts.style_notes = Some(style.to_string());
+        if !artifacts.notes.contains("文风") {
+            artifacts.notes = format!(
+                "{}\n\n[文风笔记]\n{}",
+                artifacts.notes.trim(),
+                style
+            )
+            .trim()
+            .to_string();
+        }
+    }
+    if let Some(wt) = value.get("world_type").and_then(|v| v.as_str()) {
+        artifacts.world_type = Some(wt.to_string());
+    }
+    if let Some(arr) = value.get("worldview_entries").and_then(|v| v.as_array()) {
+        let mut entries = Vec::new();
+        for (i, item) in arr.iter().enumerate() {
+            let keys = item
+                .get("keys")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if content.trim().is_empty() {
+                continue;
+            }
+            let constant = item
+                .get("constant")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(keys.is_empty());
+            let order = item
+                .get("order")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32)
+                .unwrap_or(((i as i32) + 1) * 10);
+            entries.push(WorldviewDraftEntry {
+                keys,
+                content,
+                constant,
+                order,
+            });
+        }
+        if !entries.is_empty() {
+            artifacts.worldview_entries = entries;
+        }
+    }
+    if let Some(sec) = value.get("secondary_characters").and_then(|v| v.as_array()) {
+        let lines: Vec<String> = sec
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("- {s}"))
+            .collect();
+        if !lines.is_empty() {
+            artifacts.notes = format!(
+                "{}\n\n[配角]\n{}",
+                artifacts.notes.trim(),
+                lines.join("\n")
+            )
+            .trim()
+            .to_string();
+        }
+    }
+    Ok(())
 }
 
 /// Reverse-parse a domain Character into editable CardArtifacts.
@@ -288,6 +567,7 @@ pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
         personality_prompts: Vec::new(),
         world_type: None,
         opening_outline: None,
+        style_notes: None,
     }
 }
 
@@ -810,6 +1090,17 @@ mod pack_mingyue_v1 {
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/checkers/entry_selfcheck.md");
 }
 
+/// B-path novel distill prompts (adapted from 明月小说文风蒸馏总结工具; native MVP).
+#[allow(non_snake_case)]
+mod DISTILL_PACK {
+    pub const COMMON: &str =
+        include_str!("../assets/cardstudio/mingyue_distill_v1/common.md");
+    pub const PREFILL: &str =
+        include_str!("../assets/cardstudio/mingyue_distill_v1/prefill_card.md");
+    pub const STYLE: &str =
+        include_str!("../assets/cardstudio/mingyue_distill_v1/style_sample.md");
+}
+
 fn stage_template(stage_id: &str) -> Result<&'static str, String> {
     match stage_id {
         STAGE_BASIC => Ok(pack_mingyue_v1::BASIC),
@@ -1146,6 +1437,7 @@ mod tests {
             personality_prompts: vec![],
             world_type: Some("B".into()),
             opening_outline: None,
+            style_notes: None,
         }
     }
 
@@ -1375,5 +1667,56 @@ mod tests {
             .tags
             .iter()
             .any(|t| t == "card-studio"));
+    }
+
+    #[test]
+    fn sample_novel_excerpts_head_mid_tail() {
+        let text = "甲".repeat(30_000);
+        let ex = sample_novel_excerpts(&text, 1000);
+        assert!(ex.len() >= 2);
+        assert!(ex[0].chars().count() <= 1000);
+        let short = sample_novel_excerpts("短篇", 1000);
+        assert_eq!(short, vec!["短篇".to_string()]);
+    }
+
+    #[test]
+    fn new_from_novel_sets_mode_and_excerpts() {
+        let novel = format!(
+            "第一章\n{}\n中间转折\n{}\n结局\n{}",
+            "雨".repeat(4000),
+            "雪".repeat(4000),
+            "风".repeat(4000)
+        );
+        let p = CardProject::new_from_novel("改编试作", "想做旅人卡", "夜行录", novel);
+        assert_eq!(p.mode, CardProjectMode::FromNovel);
+        assert_eq!(p.current_stage, STAGE_BASIC);
+        assert!(!p.novel_excerpts.is_empty());
+        assert_eq!(p.novel_title.as_deref(), Some("夜行录"));
+        let prompt = build_novel_prefill_prompt(&p).expect("prefill prompt");
+        assert!(prompt.contains("小说改编写卡预填师") || prompt.contains("预填"));
+        assert!(prompt.contains("夜行录"));
+    }
+
+    #[test]
+    fn apply_novel_prefill_json_fills_worldview_and_style() {
+        let mut arts = CardArtifacts::default();
+        let v = serde_json::json!({
+            "name": "旅人",
+            "description": "斗笠遮脸的旅人。",
+            "personality": "寡言，但守诺。",
+            "scenario": "山道客栈。",
+            "first_mes": "他将湿斗笠挂到一边：…坐。",
+            "style_notes": "短句，白描，少形容词。",
+            "worldview_entries": [
+                {"keys": [], "content": "此世灵雨按节气降落。", "constant": true, "order": 10},
+                {"keys": ["客栈"], "content": "山道客栈收留失名旅人。", "constant": false, "order": 20}
+            ],
+            "secondary_characters": ["掌柜：只问来处不问去处"]
+        });
+        apply_novel_prefill_json(&mut arts, &v).unwrap();
+        assert_eq!(arts.name, "旅人");
+        assert_eq!(arts.worldview_entries.len(), 2);
+        assert!(arts.style_notes.as_deref().unwrap_or("").contains("白描"));
+        assert!(arts.notes.contains("配角"));
     }
 }

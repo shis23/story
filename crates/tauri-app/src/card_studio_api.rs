@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use storyforge_domain::card_studio::{
-    self, apply_stage_json, build_review_prompt, build_stage_prompt, compile_artifacts,
+    self, apply_novel_prefill_json, apply_stage_json, build_novel_prefill_prompt,
+    build_novel_style_prompt, build_review_prompt, build_stage_prompt, compile_artifacts,
     extract_json_object, merge_review_reports, phase1_stage_ids, run_checks, CardArtifacts,
     CardProject, CheckReport, StageStatus, STAGE_BASIC, STAGE_BRIEF, STAGE_COMPILE_IMPORT,
     STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
@@ -44,6 +45,7 @@ impl From<&CardProject> for CardProjectSummaryDto {
                 storyforge_domain::card_studio::CardProjectMode::FromScratch => {
                     "from_scratch".into()
                 }
+                storyforge_domain::card_studio::CardProjectMode::FromNovel => "from_novel".into(),
                 storyforge_domain::card_studio::CardProjectMode::FromExistingCard => {
                     "from_existing_card".into()
                 }
@@ -86,6 +88,39 @@ pub fn cardstudio_create_project(
         return Err(TauriCommandError::validation("项目名不能为空"));
     }
     let project = CardProject::new_from_scratch(name, brief);
+    get_card_studio_store()
+        .insert(project)
+        .map_err(|e| TauriCommandError::storage(e))
+}
+
+/// B path: create a project from novel text (paste/import). Prefill is a separate LLM call.
+#[tauri::command]
+pub fn cardstudio_create_from_novel(
+    name: String,
+    brief: String,
+    novel_title: String,
+    novel_text: String,
+) -> Result<CardProject, TauriCommandError> {
+    let novel_text = novel_text.trim();
+    if novel_text.is_empty() {
+        return Err(TauriCommandError::validation("小说正文不能为空"));
+    }
+    // Soft cap to keep store/prompt sane in MVP; users can truncate or split later.
+    if novel_text.chars().count() > 400_000 {
+        return Err(TauriCommandError::validation(
+            "小说正文过长（>40万字）。MVP 请先粘贴节选，或后续接外置文档切分。",
+        ));
+    }
+    let name = if name.trim().is_empty() {
+        if novel_title.trim().is_empty() {
+            "小说改编".into()
+        } else {
+            format!("{}（改编）", novel_title.trim())
+        }
+    } else {
+        name.trim().to_string()
+    };
+    let project = CardProject::new_from_novel(name, brief, novel_title, novel_text);
     get_card_studio_store()
         .insert(project)
         .map_err(|e| TauriCommandError::storage(e))
@@ -374,6 +409,134 @@ pub fn cardstudio_complete_manual_stage(
             )));
         }
     }
+    project.touch();
+    store
+        .update(project)
+        .map_err(|e| TauriCommandError::storage(e))
+}
+
+/// B path: LLM prefill card artifacts from novel excerpts.
+#[tauri::command]
+pub async fn cardstudio_prefill_from_novel(
+    id: String,
+    user_note: Option<String>,
+    include_style: Option<bool>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CardProject, TauriCommandError> {
+    let store = get_card_studio_store();
+    let mut project = store
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
+
+    if !matches!(
+        project.mode,
+        storyforge_domain::card_studio::CardProjectMode::FromNovel
+    ) {
+        return Err(TauriCommandError::validation(
+            "仅小说改编项目可执行 prefill_from_novel",
+        ));
+    }
+
+    let mut prompt = build_novel_prefill_prompt(&project).map_err(TauriCommandError::validation)?;
+    if let Some(note) = user_note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        prompt.push_str("\n\n## 用户补充\n");
+        prompt.push_str(note);
+    }
+
+    let llm = state.active_llm_or_mock();
+    let params = crate::get_conn_store()
+        .active_connection()
+        .map(|c| c.params)
+        .unwrap_or_else(|| SamplingParams {
+            temperature: Some(0.7),
+            max_tokens: Some(8192),
+            max_tokens_explicit: true,
+            ..Default::default()
+        });
+    let model = crate::get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "mock".into());
+    let req = ChatRequest {
+        messages: vec![
+            ChatMessage::system(
+                "你是 StoryForge Card Studio 的小说改编预填助手。严格按用户提示中的 <content> JSON 协议输出。",
+            ),
+            ChatMessage::user(prompt),
+        ],
+        tools: None,
+        params: params.clone(),
+        model: model.clone(),
+    };
+    let resp = llm
+        .chat(&req)
+        .await
+        .map_err(|e| TauriCommandError::llm(format!("小说预填失败: {e}"), false))?;
+    let raw = resp.content;
+    project.last_stage_output = Some(raw.clone());
+    let json = extract_json_object(&raw).map_err(|e| {
+        project.last_error = Some(e.clone());
+        let _ = store.update(project.clone());
+        TauriCommandError::validation(format!("预填 JSON 解析失败: {e}"))
+    })?;
+    if let Err(e) = apply_novel_prefill_json(&mut project.artifacts, &json) {
+        project.last_error = Some(e.clone());
+        let _ = store.update(project.clone());
+        return Err(TauriCommandError::validation(e));
+    }
+
+    // Optional style sample (best-effort; failures do not abort prefill).
+    if include_style.unwrap_or(true) {
+        if let Ok(style_prompt) = build_novel_style_prompt(&project) {
+            let style_req = ChatRequest {
+                messages: vec![
+                    ChatMessage::system("你是文风蒸馏师。只输出 <content> 内的文风公式。"),
+                    ChatMessage::user(style_prompt),
+                ],
+                tools: None,
+                params: SamplingParams {
+                    temperature: Some(0.5),
+                    max_tokens: Some(4096),
+                    max_tokens_explicit: true,
+                    ..Default::default()
+                },
+                model,
+            };
+            if let Ok(style_resp) = llm.chat(&style_req).await {
+                let style_raw = style_resp.content;
+                let style_body = style_raw
+                    .split("<content>")
+                    .nth(1)
+                    .and_then(|s| s.split("</content>").next())
+                    .unwrap_or(style_raw.as_str())
+                    .trim()
+                    .to_string();
+                if !style_body.is_empty() {
+                    project.artifacts.style_notes = Some(style_body.clone());
+                    if !project.artifacts.notes.contains("[文风笔记]") {
+                        project.artifacts.notes = format!(
+                            "{}\n\n[文风笔记]\n{}",
+                            project.artifacts.notes.trim(),
+                            style_body
+                        )
+                        .trim()
+                        .to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if !project.artifacts.name.trim().is_empty() {
+        project.name = project.artifacts.name.trim().to_string();
+    }
+    // After prefill, generative stages are ready for selective polish.
+    for sid in [STAGE_BASIC, STAGE_PERSONALITY, STAGE_WORLDVIEW, STAGE_OPENING] {
+        project.set_stage_status(sid, StageStatus::Ready);
+    }
+    project.set_stage_status(STAGE_REVIEW, StageStatus::Ready);
+    project.current_stage = STAGE_REVIEW.to_string();
+    project.last_error = None;
     project.touch();
     store
         .update(project)

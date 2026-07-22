@@ -1,0 +1,7 @@
+{
+  "id": "mingyue_distill_v1",
+  "name": "明月小说蒸馏 v1",
+  "source": "明月小说文风蒸馏总结工具",
+  "version": 1,
+  "notes": "Native Card Studio B-path scaffold. Full multi-hour segment pipelines are deferred; MVP uses excerpt prefill + optional style sample."
+}

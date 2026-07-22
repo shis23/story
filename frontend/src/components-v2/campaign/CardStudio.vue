@@ -4,10 +4,12 @@ import { alertDialog } from '../../components/base/BaseDialog.js'
 import {
   cardstudioCompleteManualStage,
   cardstudioCreateFromCharacter,
+  cardstudioCreateFromNovel,
   cardstudioCreateProject,
   cardstudioGetProject,
   cardstudioImportCompiled,
   cardstudioListProjects,
+  cardstudioPrefillFromNovel,
   cardstudioRunChecks,
   cardstudioRunReview,
   cardstudioRunStage,
@@ -42,6 +44,8 @@ const busy = ref(false)
 const statusText = ref('')
 const newName = ref('')
 const newBrief = ref('')
+const novelTitle = ref('')
+const novelText = ref('')
 const userNote = ref('')
 const allowAiFreewrite = ref(false)
 const checkReport = ref(null)
@@ -167,6 +171,17 @@ function isReviseMode(p = project.value) {
   return mode === 'from_existing_card' || mode === 'FromExistingCard'
 }
 
+function isNovelMode(p = project.value) {
+  const mode = p?.mode
+  return mode === 'from_novel' || mode === 'FromNovel'
+}
+
+function modeLabel(p = project.value) {
+  if (isReviseMode(p)) return '修订已有卡（另存）'
+  if (isNovelMode(p)) return '小说改编'
+  return '从零创作'
+}
+
 async function selectStage(stageId) {
   if (!project.value || !stageId || busy.value) return
   if (project.value.current_stage === stageId) return
@@ -219,6 +234,55 @@ async function createFromCharacter(characterId, brief = '') {
     checkReport.value = await cardstudioRunChecks(created.id)
   } catch (e) {
     await alertDialog('打开修订项目失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function createFromNovel() {
+  if (!novelText.value.trim()) {
+    await alertDialog('请粘贴小说正文（MVP 支持节选，建议 < 40 万字）')
+    return
+  }
+  busy.value = true
+  try {
+    const created = await cardstudioCreateFromNovel(
+      newName.value.trim() || novelTitle.value.trim() || '小说改编',
+      newBrief.value.trim() || `从小说改编：${novelTitle.value.trim() || '未命名'}`,
+      novelTitle.value.trim(),
+      novelText.value,
+    )
+    await refreshProjects()
+    project.value = created
+    allowAiFreewrite.value = !!created?.allow_ai_freewrite
+    syncDraftFromProject()
+    statusText.value = `已创建小说改编项目（摘录 ${created?.novel_excerpts?.length || 0} 段），可点「AI 预填」`
+  } catch (e) {
+    await alertDialog('创建小说项目失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function prefillFromNovel() {
+  if (!project.value || !isNovelMode()) return
+  await saveArtifacts()
+  busy.value = true
+  statusText.value = '正在从小说摘录预填角色卡…'
+  try {
+    project.value = await cardstudioPrefillFromNovel(project.value.id, userNote.value || null, true)
+    syncDraftFromProject()
+    userNote.value = ''
+    statusText.value = '小说预填完成：已进入检查阶段，可局部重跑各阶段精修'
+    checkReport.value = await cardstudioRunChecks(project.value.id)
+  } catch (e) {
+    await alertDialog('小说预填失败: ' + e)
+    try {
+      project.value = await cardstudioGetProject(project.value.id)
+      syncDraftFromProject()
+    } catch {
+      /* ignore */
+    }
   } finally {
     busy.value = false
   }
@@ -371,14 +435,14 @@ watch(
   <div class="space-y-4 max-w-4xl">
     <div class="flex items-center justify-between gap-2">
       <div>
-        <div class="text-sm font-medium text-ink">写卡工作室 · 从零 / 修订</div>
-        <div class="text-xs text-ink-soft">阶段生成或反解析已有卡 → 编辑产物 → 检查 → 另存导入</div>
+        <div class="text-sm font-medium text-ink">写卡工作室 · 从零 / 小说 / 修订</div>
+        <div class="text-xs text-ink-soft">阶段生成、小说预填或反解析已有卡 → 编辑产物 → 检查 → 另存导入</div>
       </div>
       <Button variant="ghost" size="sm" @click="emit('close')">返回卡库</Button>
     </div>
 
     <div class="rounded-xl border border-line bg-surface p-3 space-y-2 shadow-card">
-      <div class="text-xs font-medium text-ink">新建项目</div>
+      <div class="text-xs font-medium text-ink">新建 · 从零</div>
       <Input v-model="newName" placeholder="项目名 / 暂定角色名" />
       <textarea
         v-model="newBrief"
@@ -386,7 +450,22 @@ watch(
         class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink"
         placeholder="创作意图 brief：世界观类型、主角关系、想要的氛围…"
       />
-      <Button variant="primary" size="md" :loading="busy" :disabled="busy" @click="createProject">创建</Button>
+      <Button variant="primary" size="md" :loading="busy" :disabled="busy" @click="createProject">从零创建</Button>
+    </div>
+
+    <div class="rounded-xl border border-line bg-surface p-3 space-y-2 shadow-card">
+      <div class="text-xs font-medium text-ink">新建 · 小说改编（B · MVP）</div>
+      <div class="text-[11px] text-ink-faint">
+        粘贴 txt/节选（建议 &lt; 40 万字）。会切头/中/尾摘录后预填，不是整本多小时蒸馏流水线。
+      </div>
+      <Input v-model="novelTitle" placeholder="小说标题（可选）" />
+      <textarea
+        v-model="novelText"
+        rows="6"
+        class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink font-mono"
+        placeholder="粘贴小说正文或关键章节节选…"
+      />
+      <Button variant="primary" size="md" :loading="busy" :disabled="busy" @click="createFromNovel">创建小说项目</Button>
     </div>
 
     <div class="rounded-xl border border-line bg-surface p-3 shadow-card">
@@ -403,7 +482,8 @@ watch(
         >
           <div class="font-medium text-ink truncate">{{ p.name }}</div>
           <div class="text-xs text-ink-soft truncate">
-            {{ p.mode === 'from_existing_card' ? '修订另存' : '从零' }} · {{ p.current_stage }} · {{ p.updated_at }}
+            {{ p.mode === 'from_existing_card' ? '修订另存' : (p.mode === 'from_novel' ? '小说改编' : '从零') }}
+            · {{ p.current_stage }} · {{ p.updated_at }}
           </div>
         </button>
       </div>
@@ -429,13 +509,17 @@ watch(
         <div class="text-xs text-err" v-if="project.last_error">{{ project.last_error }}</div>
         <div class="text-[11px] text-ink-faint">
           提示词包：{{ project.stage_pack_id || 'mingyue_qiuqing_v1' }}
-          · 模式：{{ isReviseMode() ? '修订已有卡（另存）' : '从零创作' }}
+          · 模式：{{ modeLabel() }}
           · 性格默认协作（手写衍生优先）
-          <span v-if="isReviseMode()"> · 点击阶段可局部重跑</span>
+          <span v-if="isReviseMode() || isNovelMode()"> · 点击阶段可局部重跑</span>
         </div>
         <div v-if="project.source_character_id" class="text-[11px] text-ink-faint">
           来源角色：{{ project.source_character_id }}
           <span v-if="project.source_stored_id"> / store {{ project.source_stored_id }}</span>
+        </div>
+        <div v-if="isNovelMode()" class="text-[11px] text-ink-faint">
+          小说：{{ project.novel_title || '（未命名）' }}
+          · 摘录 {{ project.novel_excerpts?.length || 0 }} 段
         </div>
 
         <label class="flex items-center gap-2 text-xs text-ink-soft">
@@ -467,6 +551,16 @@ watch(
         <div class="flex flex-wrap gap-2">
           <Button variant="default" size="sm" :disabled="busy" @click="saveArtifacts">保存产物</Button>
           <Button
+            v-if="isNovelMode()"
+            variant="primary"
+            size="sm"
+            :loading="busy"
+            :disabled="busy"
+            @click="prefillFromNovel"
+          >
+            AI 预填（小说→卡）
+          </Button>
+          <Button
             v-if="currentStage === 'brief' || currentStage === 'review'"
             variant="primary"
             size="sm"
@@ -490,7 +584,7 @@ watch(
             :disabled="busy"
             @click="importCompiled"
           >
-            {{ isReviseMode() ? '编译并另存为新卡' : '编译并导入卡库' }}
+            {{ isReviseMode() || isNovelMode() ? '编译并另存为新卡' : '编译并导入卡库' }}
           </Button>
         </div>
 
