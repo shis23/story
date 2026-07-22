@@ -3,6 +3,7 @@ pub mod agent_profile_config;
 pub mod campaign;
 pub mod campaign_runtime;
 pub mod card_shell;
+pub mod card_studio;
 pub mod character;
 pub mod character_knowledge;
 pub mod chronicle;

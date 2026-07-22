@@ -13,6 +13,7 @@ import CampaignWorldInfoTab from './CampaignWorldInfoTab.vue'
 import CampaignTasksTab from './CampaignTasksTab.vue'
 import CampaignSummariesTab from './CampaignSummariesTab.vue'
 import CardLibrary from './CardLibrary.vue'
+import CardStudio from './CardStudio.vue'
 import { buildGreetingOptionsFromDetail } from '../../utils/campaignGreetingOptions.js'
 import { refreshSubTab, subTabRefKey } from '../../utils/campaignTabRefresh.js'
 import { useCampaignStore } from '../../stores/campaign.js'
@@ -30,6 +31,8 @@ const writingStore = useWritingStore()
 
 // ─── 壳模式：manage（双栏活动）| cards（角色卡库）───
 const shellMode = ref('manage') // 'manage' | 'cards'
+// cards 模式下的子视图：library | studio
+const cardsView = ref('library')
 // 兼容旧 activeTab 语义：cards | campaigns | detail
 const activeTab = ref('detail')
 
@@ -247,6 +250,9 @@ function onSelectCampaign(camp) {
 function onChangeMode(mode) {
   shellMode.value = mode
   activeTab.value = mode === 'cards' ? 'cards' : (selectedCampaignId.value ? 'detail' : 'campaigns')
+  if (mode !== 'cards') {
+    cardsView.value = 'library'
+  }
 }
 
 function onChangeDetailTab(tab) {
@@ -430,9 +436,16 @@ defineExpose({ refreshActiveDetailTab })
       <template #cards>
         <div class="space-y-3 max-w-4xl">
           <div v-if="importStatus" class="text-xs text-ink-soft">{{ importStatus }}</div>
+          <CardStudio
+            v-if="cardsView === 'studio'"
+            @close="cardsView = 'library'"
+            @imported="async () => { cardsView = 'library'; await refreshCards() }"
+          />
           <CardLibrary
+            v-else
             ref="cardLibraryRef"
             @open-campaigns="openCampaignsForCard"
+            @open-studio="cardsView = 'studio'"
           />
         </div>
       </template>

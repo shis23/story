@@ -1,5 +1,7 @@
 pub mod campaign_store;
 mod card_shell_cache;
+mod card_studio_api;
+mod card_studio_store;
 mod compress_job_store;
 mod connection_store;
 pub mod error;
@@ -105,7 +107,7 @@ static STORE: OnceLock<CharacterStore> = OnceLock::new();
 const EMBED_SECRET_KIND: &str = "embedder";
 const EMBED_SECRET_ID: &str = "default";
 
-fn get_store() -> &'static CharacterStore {
+pub(crate) fn get_store() -> &'static CharacterStore {
     STORE.get_or_init(|| {
         let data_dir = get_app_data_dir();
         CharacterStore::new(&data_dir)
@@ -114,13 +116,22 @@ fn get_store() -> &'static CharacterStore {
 
 static CONN_STORE: OnceLock<Arc<ConnectionStore>> = OnceLock::new();
 
-fn get_conn_store() -> Arc<ConnectionStore> {
+pub(crate) fn get_conn_store() -> Arc<ConnectionStore> {
     CONN_STORE
         .get_or_init(|| {
             let data_dir = get_app_data_dir();
             Arc::new(ConnectionStore::new(&data_dir))
         })
         .clone()
+}
+
+static CARD_STUDIO_STORE: OnceLock<card_studio_store::CardStudioStore> = OnceLock::new();
+
+pub(crate) fn get_card_studio_store() -> &'static card_studio_store::CardStudioStore {
+    CARD_STUDIO_STORE.get_or_init(|| {
+        let data_dir = get_app_data_dir();
+        card_studio_store::CardStudioStore::new(&data_dir)
+    })
 }
 
 static PRESET_STORE: OnceLock<PresetStore> = OnceLock::new();
@@ -151,7 +162,7 @@ fn get_card_shell_cache() -> &'static card_shell_cache::CardShellCache {
     CACHE.get_or_init(|| card_shell_cache::CardShellCache::new(&get_app_data_dir()))
 }
 
-fn get_campaign_store() -> &'static campaign_store::CampaignStore {
+pub(crate) fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     let store = CAMPAIGN_STORE.get_or_init(|| {
         if sqlite_runtime::is_sqlite_active() {
             campaign_store::CampaignStore::disabled()
@@ -12303,6 +12314,19 @@ pub fn run() {
             list_characters,
             get_character,
             delete_character,
+            // Card Studio Phase 1
+            card_studio_api::cardstudio_list_projects,
+            card_studio_api::cardstudio_create_project,
+            card_studio_api::cardstudio_get_project,
+            card_studio_api::cardstudio_delete_project,
+            card_studio_api::cardstudio_update_artifacts,
+            card_studio_api::cardstudio_set_stage,
+            card_studio_api::cardstudio_run_checks,
+            card_studio_api::cardstudio_compile,
+            card_studio_api::cardstudio_complete_manual_stage,
+            card_studio_api::cardstudio_run_stage,
+            card_studio_api::cardstudio_import_compiled,
+            card_studio_api::cardstudio_list_stages,
             update_world_info_route,
             update_world_info_entry,
             add_world_info_entry,

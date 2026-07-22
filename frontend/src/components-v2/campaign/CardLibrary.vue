@@ -18,7 +18,7 @@ import EmptyState from '../ui/EmptyState.vue'
 import LoadingState from '../ui/LoadingState.vue'
 import WorldInfoReadonlyPanel from './WorldInfoReadonlyPanel.vue'
 
-const emit = defineEmits(['open-campaigns'])
+const emit = defineEmits(['open-campaigns', 'open-studio'])
 
 // ─── Cards 状态 ───
 const cards = ref([])
@@ -87,12 +87,17 @@ function roleVariant(roleType) {
 
 <template>
   <div class="space-y-3">
+    <div class="flex items-center justify-between gap-2">
+      <div class="text-xs text-ink-soft">导入已有卡，或用写卡工作室从零生成基础卡</div>
+      <Button variant="primary" size="sm" @click="emit('open-studio')">写卡工作室</Button>
+    </div>
+
     <LoadingState v-if="loadingCards" />
 
     <EmptyState
       v-else-if="cards.length === 0"
       title="还没有角色卡"
-      description="请先导入角色卡"
+      description="请先导入角色卡，或打开写卡工作室从零创建"
     />
 
     <template v-else>

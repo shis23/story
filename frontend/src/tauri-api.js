@@ -773,6 +773,133 @@ export async function listCards() {
   return []
 }
 
+// ─── Card Studio Phase 1 ────────────────────────────────────────────────
+
+export async function cardstudioListProjects() {
+  if (isTauri()) {
+    return await invoke('cardstudio_list_projects')
+  }
+  return []
+}
+
+export async function cardstudioCreateProject(name, brief) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_project', { name, brief })
+  }
+  return {
+    id: 'mock-cardstudio-1',
+    name,
+    brief,
+    mode: 'from_scratch',
+    current_stage: 'brief',
+    stage_status: { brief: 'ready' },
+    artifacts: {
+      name,
+      description: '',
+      personality: '',
+      scenario: '',
+      first_mes: '',
+      tags: [],
+      creator: '',
+      worldview_entries: [],
+      notes: brief,
+    },
+    last_error: null,
+    last_stage_output: null,
+    imported_character_id: null,
+    created_at: '2026-07-22 00:00:00',
+    updated_at: '2026-07-22 00:00:00',
+  }
+}
+
+export async function cardstudioGetProject(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_get_project', { id })
+  }
+  return null
+}
+
+export async function cardstudioDeleteProject(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_delete_project', { id })
+  }
+  return true
+}
+
+export async function cardstudioUpdateArtifacts(id, artifacts) {
+  if (isTauri()) {
+    return await invoke('cardstudio_update_artifacts', { id, artifacts })
+  }
+  return null
+}
+
+export async function cardstudioSetStage(id, stageId) {
+  if (isTauri()) {
+    return await invoke('cardstudio_set_stage', { id, stageId })
+  }
+  return null
+}
+
+export async function cardstudioRunChecks(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_checks', { id })
+  }
+  return { ok: false, issues: [] }
+}
+
+export async function cardstudioCompile(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_compile', { id })
+  }
+  return { st_card_json: {}, warnings: [], character_name: '' }
+}
+
+export async function cardstudioCompleteManualStage(id, stageId) {
+  if (isTauri()) {
+    return await invoke('cardstudio_complete_manual_stage', { id, stageId })
+  }
+  return null
+}
+
+export async function cardstudioRunStage(id, stageId, userNote = null) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_stage', {
+      id,
+      stageId,
+      userNote: userNote || null,
+    })
+  }
+  return null
+}
+
+export async function cardstudioImportCompiled(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_import_compiled', { id })
+  }
+  return {
+    character: {
+      id: 'mock-imported',
+      name: 'mock',
+      description: '',
+      tags: [],
+      creator: '',
+      spec_version: '3.0',
+      world_info_count: 0,
+      has_renderable_assets: false,
+      imported_at: '2026-07-22 00:00:00',
+    },
+    card_id: 'mock-card',
+    warnings: [],
+  }
+}
+
+export async function cardstudioListStages() {
+  if (isTauri()) {
+    return await invoke('cardstudio_list_stages')
+  }
+  return ['brief', 'basic', 'personality', 'worldview', 'opening', 'review', 'compile_import']
+}
+
 /** 获取 CharacterCard 详情（含 character_definitions） */
 export async function getCard(id) {
   if (isTauri()) {
