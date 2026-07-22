@@ -171,11 +171,15 @@ fn extract_from_regex_script(
         || (replace.contains("<body") && replace.contains("<script"));
     if looks_html && replace.chars().count() > 80 {
         let deps = all_urls.clone();
+        // Huge ST display HTML (viewer shells 80KB+) must not ride the IPC manifest.
+        let html = if replace.len() > 8_192 {
+            String::new()
+        } else {
+            replace.clone()
+        };
         shells.push(CardFrontendShell {
             kind: CardShellKind::MessageHtml,
-            entry: CardShellEntry::InlineHtml {
-                html: replace.clone(),
-            },
+            entry: CardShellEntry::InlineHtml { html },
             deps,
             label,
             trigger: find.clone(),
@@ -314,13 +318,25 @@ fn classify_shell_kind(find: &str, label: &str, url: &str) -> CardShellKind {
 }
 
 fn capture_jquery_load_urls(text: &str) -> Vec<String> {
-    // $('body').load('URL') or $("body").load("URL") or optional spaces
+    // $('body').load('URL') / $("body").load("URL")
     let mut out = Vec::new();
-    let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
     let mut search_from = 0;
-    while let Some(rel) = lower[search_from..].find(".load(") {
+    while search_from < lower.len() {
+        let Some(rel) = lower[search_from..].find(".load(") else {
+            break;
+        };
         let abs = search_from + rel + ".load(".len();
+        if abs > text.len() {
+            break;
+        }
+        if !text.is_char_boundary(abs) {
+            search_from = abs + 1;
+            while search_from < text.len() && !text.is_char_boundary(search_from) {
+                search_from += 1;
+            }
+            continue;
+        }
         let rest = &text[abs..];
         let trimmed = rest.trim_start();
         let quote = trimmed.chars().next();
@@ -334,59 +350,57 @@ fn capture_jquery_load_urls(text: &str) -> Vec<String> {
             }
         }
         search_from = abs + 1;
-        if search_from >= bytes.len() {
-            break;
+        while search_from < text.len() && !text.is_char_boundary(search_from) {
+            search_from += 1;
         }
     }
     out
 }
 
 fn capture_http_urls(text: &str) -> Vec<String> {
+    // Advance by UTF-8 char boundaries — byte offsets panic on Chinese text.
     let mut out = Vec::new();
     let mut i = 0;
-    let b = text.as_bytes();
-    while i + 8 < b.len() {
-        if text[i..].starts_with("https://") || text[i..].starts_with("http://") {
+    let len = text.len();
+    while i < len {
+        let rest = &text[i..];
+        let scheme = if rest.starts_with("https://") {
+            Some(8)
+        } else if rest.starts_with("http://") {
+            Some(7)
+        } else {
+            None
+        };
+        if let Some(scheme_len) = scheme {
             let start = i;
-            i += if text[i..].starts_with("https://") {
-                8
-            } else {
-                7
-            };
-            while i < b.len() {
-                let c = b[i] as char;
-                if c.is_whitespace()
-                    || c == '\''
-                    || c == '"'
-                    || c == '`'
-                    || c == '<'
-                    || c == '>'
-                    || c == ')'
-                    || c == '('
-                    || c == ']'
-                    || c == '['
-                    || c == '}'
-                    || c == '{'
-                    || c == ','
-                    || c == ';'
+            i += scheme_len;
+            while i < len {
+                let Some(ch) = text[i..].chars().next() else {
+                    break;
+                };
+                if ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '\'' | '"' | '`' | '<' | '>' | ')' | '(' | ']' | '[' | '}' | '{' | ',' | ';'
+                    )
                 {
                     break;
                 }
-                i += 1;
+                i += ch.len_utf8();
             }
             let mut url = text[start..i].to_string();
-            // strip trailing punctuation common in HTML
             while url.ends_with('.') || url.ends_with(',') || url.ends_with('。') {
                 url.pop();
             }
-            if url.starts_with("http://") || url.starts_with("https://") {
-                // skip pure xmlns
-                if !url.contains("www.w3.org/2000/svg") {
-                    out.push(url);
-                }
+            if (url.starts_with("http://") || url.starts_with("https://"))
+                && !url.contains("www.w3.org/2000/svg")
+            {
+                out.push(url);
             }
+        } else if let Some(ch) = text[i..].chars().next() {
+            i += ch.len_utf8();
         } else {
-            i += 1;
+            break;
         }
     }
     out.sort();
@@ -619,5 +633,21 @@ mod tests {
         extract_from_regex_script(&script, &mut shells, &mut urls);
         assert_eq!(shells.len(), 1);
         assert_eq!(shells[0].kind, CardShellKind::StatusBar);
+    }
+
+    #[test]
+    fn chinese_text_does_not_panic_url_scan() {
+        // Regression: byte-index URL scan panicked on multi-byte UTF-8.
+        let text = "<details>
+<summary>变量更新中{{random::.::..::...}}</summary>
+$1
+</details>
+<script src=\"https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js\"></script>";
+        let urls = capture_http_urls(text);
+        assert!(urls.iter().any(|u| u.contains("js-yaml")));
+        let loads = capture_jquery_load_urls(
+            "变量更新中 $('body').load('https://testingcf.jsdelivr.net/x/home/index.html')",
+        );
+        assert_eq!(loads.len(), 1);
     }
 }
