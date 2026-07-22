@@ -34,7 +34,7 @@ function onTabChange(key) {
 </script>
 
 <template>
-  <div class="flex flex-col h-full w-80 bg-surface border-l border-line">
+  <div class="flex flex-col h-full w-full min-w-0 bg-surface border-l border-line">
     <div class="shrink-0 h-14 flex items-center justify-between px-4 border-b border-line">
       <span class="font-semibold text-ink text-sm">调试</span>
       <button

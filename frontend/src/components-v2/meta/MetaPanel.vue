@@ -67,13 +67,12 @@ function onMvuApplied() {
 </script>
 
 <template>
-  <!-- 固定 420px：与内容无关的外壳宽度；移动端 100vw 封顶 -->
+  <!-- 宽度走全局 --layout-drawer（Overlay 默认），与连接/预设/插件等侧栏抽屉一致 -->
   <PanelHost
     :show="true"
     title=""
     side="left"
     :show-chrome="false"
-    panel-width-class="w-[min(100vw,420px)]"
     @close="emit('close')"
   >
     <MetaScreen

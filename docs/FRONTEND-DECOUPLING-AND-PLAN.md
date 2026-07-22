@@ -131,12 +131,28 @@ rg -n "from ['\"].*(stores|composables|tauri-api)" frontend/src/design
 
 ---
 
-## 7. 已知陷阱
+## 7. 布局宽度契约（2026-07-22 统一）
+
+| token | 值 | 用途 |
+| --- | --- | --- |
+| `--layout-sidebar` | 232px | 桌面常驻导航 / 移动导航抽屉 |
+| `--layout-drawer` | 380px | **所有**侧滑功能面板（连接/预设/插件/Agent/Meta/角色卡） |
+| `--layout-inspector` | 320px | 右侧调试 Inspector（略窄） |
+| `--layout-dialog` | 32rem | 居中弹层（新建 Campaign 等） |
+
+规则：
+
+1. 侧滑面板走 `PanelHost`/`Overlay` 默认宽（已绑 `--layout-drawer`），**禁止**各面板再写 `max-w-sm` / `420px` 等魔法数。
+2. 旧 `BaseOverlay` 侧滑用 `size="drawer"`（或 left/right 默认 sm/md）同样落到 `--layout-drawer`。
+3. Campaign 管理是 `side="full"` 全屏工作台，不适用 drawer 宽。
+4. 内容再长也不撑壳、再空也不缩壳：靠固定 `w-[min(100vw,var(--layout-drawer))]` + 内层 `min-w-0`。
+
+## 8. 已知陷阱
 
 1. **z token**：须写 `z-[var(--z-overlay)]`。
 2. **headlessui 弹层**：弹层相关改动必须 dev server 人工点。
-3. **AppShell 滚动**：主区 `overflow-hidden` + 子屏自滚动；overview/history 外包 `overflow-y-auto`。
-4. **不写死色值**：只用 token。
+3. **AppShell/AppFrame 滚动**：主区 `overflow-hidden` + 子屏自滚动；overview/history 外包 `overflow-y-auto`。
+4. **不写死色值**：只用 token；宽度只用 `--layout-*`。
 
 ---
 

@@ -3,7 +3,7 @@
  * MetaScreenDemo — 设计预览（#design-meta）。
  * 固定宽抽屉 + 五 tab 空/有内容态，验证切换 tab 不跳宽。
  */
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 import MetaScreen from './MetaScreen.vue'
 
 const activeTab = ref('chat')
@@ -45,13 +45,12 @@ const health = {
   ],
 }
 
-const widthNote = computed(() => '外壳固定 420px · 切换 tab 宽度应不变')
 </script>
 
 <template>
   <div class="h-screen bg-bg flex flex-col">
     <div class="shrink-0 flex items-center gap-2 px-4 py-1.5 border-b border-line bg-surface-2/70">
-      <span class="text-[11px] text-ink-faint">设计预览 · Meta · {{ widthNote }}</span>
+      <span class="text-[11px] text-ink-faint">设计预览 · Meta · 外壳 --layout-drawer（380）· 切换 tab 宽度应不变</span>
       <button
         type="button"
         class="min-h-6 px-2 rounded text-[11px] text-ink-soft hover:bg-surface-2"
@@ -67,7 +66,7 @@ const widthNote = computed(() => '外壳固定 420px · 切换 tab 宽度应不�
 
     <!-- 仿真遮罩 + 固定宽抽屉（与生产 Overlay 一致） -->
     <div class="flex-1 relative bg-ink/10">
-      <div class="absolute inset-y-0 left-0 w-[min(100vw,420px)] border-r border-line shadow-float bg-bg flex flex-col">
+      <div class="absolute inset-y-0 left-0 w-[min(100vw,var(--layout-drawer))] border-r border-line shadow-float bg-bg flex flex-col">
         <MetaScreen
           class="h-full"
           :active-tab="activeTab"

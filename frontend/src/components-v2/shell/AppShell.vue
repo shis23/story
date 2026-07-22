@@ -13,7 +13,7 @@ const ui = useUiStore()
     <!-- 三栏主体 -->
     <div class="flex-1 flex min-h-0">
       <!-- 左导航（桌面常驻；移动端走下方 Overlay 抽屉） -->
-      <aside class="hidden lg:block w-60 shrink-0 border-r border-line">
+      <aside class="hidden lg:block w-[var(--layout-sidebar)] shrink-0 border-r border-line">
         <PrimarySidebar
           docked
           @close="ui.showSidebar = false"

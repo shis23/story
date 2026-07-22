@@ -9,7 +9,10 @@ let overflowCount = 0
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   title: { type: String, default: '' },
-  /** sm=28rem md=32rem lg=42rem 2xl=56rem full=全屏 */
+  /**
+   * sm/md/lg/2xl/full = 居中弹层档位；
+   * drawer = 侧滑功能抽屉（对齐 --layout-drawer，与 v2 Overlay 一致）
+   */
   size: { type: String, default: 'md' },
   /** 'drawer' = 底部抽屉（移动）/ 居中（桌面）；'center' = 始终居中；'left' = 左侧滑出；'right' = 右侧滑出 */
   position: { type: String, default: 'drawer' },
@@ -32,6 +35,8 @@ const sizeClass = computed(() => ({
   lg: 'sm:max-w-2xl',
   '2xl': 'sm:max-w-3xl',
   full: 'sm:max-w-4xl',
+  // 与 style.css --layout-drawer / v2 Overlay 默认侧滑同宽
+  drawer: 'w-[min(100vw,var(--layout-drawer))] max-w-none',
 }[props.size] || 'sm:max-w-lg'))
 
 // 定位：center 居中；drawer 底部抽屉(移动)/居中(桌面)；left/right 侧边滑出(贴边满高)
@@ -42,9 +47,12 @@ const positionClass = computed(() => {
   return 'items-end sm:items-center' // drawer
 })
 
-// 侧边抽屉宽度约束（left/right）；drawer/center 用 size
+// 侧边抽屉：默认固定 layout-drawer；size=drawer 时同宽；其余 size 仅作兼容覆盖
 const widthClass = computed(() => {
   if (props.position === 'left' || props.position === 'right') {
+    if (props.size === 'drawer' || !props.size || props.size === 'sm' || props.size === 'md') {
+      return 'w-[min(100vw,var(--layout-drawer))] shrink-0 h-full max-w-none'
+    }
     return 'w-full ' + sizeClass.value + ' h-full'
   }
   return 'w-full ' + sizeClass.value

@@ -90,7 +90,8 @@ function extractionClass(card) {
 </script>
 
 <template>
-  <BaseOverlay :model-value="true" title="角色卡列表" size="sm" position="left" @close="emit('close')">
+  <!-- size=drawer 对齐 --layout-drawer，与 v2 侧滑功能抽屉同宽 -->
+  <BaseOverlay :model-value="true" title="角色卡列表" size="drawer" position="left" @close="emit('close')">
     <template #header-extra>
       <span class="text-xs text-ink-soft">{{ cards.length }} 张</span>
     </template>

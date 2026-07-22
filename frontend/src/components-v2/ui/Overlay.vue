@@ -7,26 +7,30 @@ import {
   TransitionChild,
 } from '@headlessui/vue'
 
+/**
+ * Overlay — 统一弹层/抽屉。
+ *
+ * 宽度策略（纸上编辑部）：
+ *   left/right 默认固定 --layout-drawer（380px），内容再长也不撑开、再空也不缩。
+ *   center 默认 --layout-dialog；full 全屏。
+ *   可用 panelWidthClass 覆盖（仅特殊屏，如 Inspector）。
+ */
 const props = defineProps({
   show: { type: Boolean, default: false },
   modelValue: { type: Boolean, default: null },
   side: { type: String, default: 'right' }, // left | right | center | full
   title: { type: String, default: '' },
-  // P3-1 修复：是否渲染 Overlay 自带的关闭按钮 ✕。
-  // 子组件自带关闭按钮（如 PrimarySidebar/InspectorDrawer）时传 false，
-  // 否则 Overlay 的 ✕ 会与子组件关闭键、以及 OS 标题栏 × 视觉重叠，
-  // 用户看到「右上角两个 x」。无标题时默认仍渲染 ✕（center/full 弹窗需要）。
+  // P3-1：子组件自带关闭键时传 false，避免双 ×
   showClose: { type: Boolean, default: true },
   /**
-   * 固定面板宽度 class（覆盖 left/right 默认 max-w-sm）。
-   * 例：'w-full max-w-md' / 'w-[420px] max-w-[100vw]'
-   * 保证同一面板各 tab 内容不同时外壳宽度仍稳定。
+   * 覆盖默认宽度 class。
+   * 空字符串 = 使用布局 token 默认（推荐）。
+   * 例 Inspector：'w-[min(100vw,var(--layout-inspector))]'
    */
   panelWidthClass: { type: String, default: '' },
 })
 const emit = defineEmits(['update:show', 'update:modelValue', 'close'])
 
-// 兼容 v-model:show 与 v-model:modelValue 两种用法；modelValue 优先（若显式传了）
 const isOpen = computed({
   get() {
     if (props.modelValue !== null) return props.modelValue
@@ -39,7 +43,6 @@ const isOpen = computed({
   },
 })
 
-// 面板定位与过渡方向
 const panelWrapperClass = computed(() => {
   switch (props.side) {
     case 'left':
@@ -54,23 +57,29 @@ const panelWrapperClass = computed(() => {
   }
 })
 
+/** 默认：侧滑固定 drawer 宽；居中 dialog 宽；全屏 100% */
+const defaultSideWidth =
+  'w-[min(100vw,var(--layout-drawer))] shrink-0'
+const defaultCenterWidth =
+  'w-full max-w-[var(--layout-dialog)]'
+
 const panelClass = computed(() => {
   const base = 'bg-surface shadow-float flex flex-col overflow-hidden min-w-0'
   const custom = props.panelWidthClass?.trim()
   switch (props.side) {
     case 'left':
-      return `${base} h-full ${custom || 'w-full max-w-sm'}`
+    case 'right':
+      // 固定宽：min() 封顶视口；不用 max-w-only 以免内容把壳撑到不同视觉宽度
+      return `${base} h-full ${custom || defaultSideWidth}`
     case 'center':
-      return `${base} ${custom || 'w-full max-w-lg'} rounded-xl`
+      return `${base} ${custom || defaultCenterWidth} rounded-xl`
     case 'full':
       return `${base} h-full w-full`
-    case 'right':
     default:
-      return `${base} h-full ${custom || 'w-full max-w-sm'}`
+      return `${base} h-full ${custom || defaultSideWidth}`
   }
 })
 
-// 过渡动画方向：左右抽屉横向滑入，center/full 用淡入缩放
 const panelTransition = computed(() => {
   switch (props.side) {
     case 'left':
@@ -115,17 +124,14 @@ const overlayTransition = {
 
 <template>
   <TransitionRoot :show="isOpen" as="template">
-    <Dialog @close="isOpen = false" class="relative z-50">
-      <!-- 遮罩 -->
+    <Dialog @close="isOpen = false" class="relative z-[var(--z-drawer)]">
       <TransitionChild as="template" v-bind="overlayTransition">
         <div class="fixed inset-0 bg-bg/70" aria-hidden="true" />
       </TransitionChild>
 
-      <!-- 面板容器 -->
       <div :class="panelWrapperClass">
         <TransitionChild as="template" v-bind="panelTransition">
           <DialogPanel :class="panelClass">
-            <!-- 标题栏 -->
             <div
               v-if="title"
               class="flex items-center justify-between px-4 py-3 border-b border-line shrink-0"
@@ -140,7 +146,6 @@ const overlayTransition = {
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
               </button>
             </div>
-            <!-- 无标题时可选提供关闭按钮（showClose=false 抑制） -->
             <div
               v-else-if="showClose"
               class="absolute right-2 top-2 z-10"
@@ -155,8 +160,7 @@ const overlayTransition = {
               </button>
             </div>
 
-            <!-- 内容 -->
-            <div class="flex-1 overflow-auto">
+            <div class="flex-1 min-h-0 min-w-0 overflow-auto">
               <slot :close="() => (isOpen = false)" />
             </div>
           </DialogPanel>

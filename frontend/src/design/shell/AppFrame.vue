@@ -21,8 +21,8 @@ defineEmits(['update:sidebarOpen', 'update:inspectorOpen'])
 <template>
   <div class="h-screen flex flex-col bg-bg overflow-hidden">
     <div class="flex-1 flex min-h-0">
-      <!-- 桌面侧栏 232px -->
-      <aside class="hidden lg:flex w-[232px] shrink-0 border-r border-line bg-bg flex-col min-h-0">
+      <!-- 桌面侧栏：--layout-sidebar -->
+      <aside class="hidden lg:flex w-[var(--layout-sidebar)] shrink-0 border-r border-line bg-bg flex-col min-h-0">
         <slot name="sidebar" :docked="true" />
       </aside>
 
@@ -45,12 +45,12 @@ defineEmits(['update:sidebarOpen', 'update:inspectorOpen'])
     ></div>
     <div
       v-if="sidebarOpen"
-      class="lg:hidden fixed inset-y-0 left-0 z-[var(--z-drawer)] w-[232px] bg-bg border-r border-line shadow-float flex flex-col"
+      class="lg:hidden fixed inset-y-0 left-0 z-[var(--z-drawer)] w-[var(--layout-sidebar)] bg-bg border-r border-line shadow-float flex flex-col"
     >
       <slot name="sidebar" :docked="false" />
     </div>
 
-    <!-- Inspector：覆盖式（桌面+移动统一），不挤压写作栏 -->
+    <!-- Inspector：覆盖式；宽 --layout-inspector（略窄于功能抽屉） -->
     <div
       v-if="inspectorOpen"
       class="fixed inset-0 z-[var(--z-overlay)] bg-ink/25"
@@ -58,7 +58,7 @@ defineEmits(['update:sidebarOpen', 'update:inspectorOpen'])
     ></div>
     <div
       v-if="inspectorOpen"
-      class="fixed inset-y-0 right-0 z-[var(--z-drawer)] w-[min(100%,320px)] bg-surface border-l border-line shadow-float flex flex-col"
+      class="fixed inset-y-0 right-0 z-[var(--z-drawer)] w-[min(100vw,var(--layout-inspector))] bg-surface border-l border-line shadow-float flex flex-col"
     >
       <slot name="inspector" />
     </div>
