@@ -930,6 +930,7 @@ export async function getCardShellManifest(characterId) {
     opening_home_url: null,
     opening_custom_url: null,
     status_bar_url: null,
+    tavern_helper_count: 0,
   }
 }
 

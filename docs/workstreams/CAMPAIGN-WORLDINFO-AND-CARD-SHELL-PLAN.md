@@ -2,7 +2,7 @@
 
 > 状态：执行中（2026-07-22）
 >
-> **进度**：Phase 0–2 已落地（活动世界书存储/UI、卡只读、Meta 写活动书）。Phase 3–4 已落地提取器 + allowlist 缓存 + 可见 `CardShellHost`（写作屏 #shell 挂 status/opening）。Phase 5 消息 display 分流（`ShellAwareContent` + `extractShellMountsFromDisplay`）已接线写作正文。Phase 6 TH 顺序自动执行 / Phase 7 端到端截图证据仍待补。  
+> **进度**：Phase 0–2 已落地（活动世界书存储/UI、卡只读、Meta 写活动书）。Phase 3–4 已落地提取器 + allowlist 缓存 + 可见 `CardShellHost`（写作屏 #shell 挂 status/opening）。Phase 5 消息 display 分流（`ShellAwareContent` + `extractShellMountsFromDisplay`）已接线写作正文。Phase 6 TH 顺序自动执行（`TavernHelperRuntime` 宿主代持 ES module 图 + inline 工坊脚本，写作屏状态条可重跑）已落地。Phase 7 端到端截图证据仍待补。  
 > 硬约束：**不接受降级**（禁止用纯文本开场 / 禁网隐藏 iframe / 仅声明式状态栏冒充完成）。  
 > 金标卡：仓库根 `test-card.png`（命定之诗与黄昏之歌 v4.1）。
 

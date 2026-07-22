@@ -56,6 +56,7 @@ import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import CardShellHost from './components/CardShellHost.vue'
+import TavernHelperRuntime from './components/TavernHelperRuntime.vue'
 import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
 import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
@@ -182,11 +183,15 @@ const cardShellStatusUrl = ref(null)
 const cardShellOpeningUrl = ref(null)
 const cardShellLabel = ref('')
 const cardShellLoading = ref(false)
+const cardShellShells = ref([])
+const cardShellThCount = ref(0)
 
 async function refreshCardShellManifest() {
   cardShellStatusUrl.value = null
   cardShellOpeningUrl.value = null
   cardShellLabel.value = ''
+  cardShellShells.value = []
+  cardShellThCount.value = 0
   let characterId =
     campaign.activeChar?.id ||
     campaign.activeCharDetail?.id ||
@@ -209,6 +214,8 @@ async function refreshCardShellManifest() {
     // 优先首页；无则自定义开局
     cardShellOpeningUrl.value = m?.opening_home_url || m?.opening_custom_url || null
     cardShellLabel.value = m?.character_id || characterId
+    cardShellShells.value = Array.isArray(m?.shells) ? m.shells : []
+    cardShellThCount.value = m?.tavern_helper_count || 0
   } catch (e) {
     console.error('getCardShellManifest:', e)
   } finally {
@@ -487,7 +494,10 @@ onMounted(async () => {
         v-on="writingScreenEvents"
       >
         <template #shell>
-          <div v-if="cardShellStatusUrl || cardShellOpeningUrl" class="space-y-2 pb-2">
+          <div
+            v-if="cardShellStatusUrl || cardShellOpeningUrl || cardShellThCount"
+            class="space-y-2 pb-2"
+          >
             <CardShellHost
               v-if="cardShellStatusUrl"
               :url="cardShellStatusUrl"
@@ -500,6 +510,12 @@ onMounted(async () => {
               :url="cardShellOpeningUrl"
               label="开场壳"
               height="420px"
+            />
+            <TavernHelperRuntime
+              v-if="cardShellThCount"
+              :shells="cardShellShells"
+              :show-status="true"
+              :auto-run="true"
             />
           </div>
         </template>

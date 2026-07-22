@@ -10798,6 +10798,7 @@ pub struct CardShellManifestDto {
     pub opening_home_url: Option<String>,
     pub opening_custom_url: Option<String>,
     pub status_bar_url: Option<String>,
+    pub tavern_helper_count: usize,
 }
 
 #[tauri::command]
@@ -10819,6 +10820,7 @@ fn get_card_shell_manifest(character_id: String) -> Result<CardShellManifestDto,
         opening_home_url: manifest.opening_home_url().map(|s| s.to_string()),
         opening_custom_url: manifest.opening_custom_url().map(|s| s.to_string()),
         status_bar_url: manifest.status_bar_url().map(|s| s.to_string()),
+        tavern_helper_count: manifest.tavern_helper_modules().len(),
     })
 }
 

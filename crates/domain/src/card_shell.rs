@@ -84,6 +84,14 @@ impl CardShellManifest {
             None
         })
     }
+
+    /// Ordered tavern_helper modules (preserves card script order).
+    pub fn tavern_helper_modules(&self) -> Vec<&CardFrontendShell> {
+        self.shells
+            .iter()
+            .filter(|s| s.kind == CardShellKind::TavernHelperModule)
+            .collect()
+    }
 }
 
 /// Extract shell manifest from a Character domain model (extensions + regex).
