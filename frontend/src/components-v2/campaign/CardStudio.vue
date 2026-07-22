@@ -8,6 +8,7 @@ import {
   cardstudioImportCompiled,
   cardstudioListProjects,
   cardstudioRunChecks,
+  cardstudioRunReview,
   cardstudioRunStage,
   cardstudioSetOptions,
   cardstudioUpdateArtifacts,
@@ -238,7 +239,26 @@ async function runChecks() {
   busy.value = true
   try {
     checkReport.value = await cardstudioRunChecks(project.value.id)
-    statusText.value = checkReport.value.ok ? '检查通过' : '检查未通过'
+    statusText.value = checkReport.value.ok
+      ? `规则检查通过（${checkReport.value.score ?? '-'} 分）`
+      : `规则检查未通过（${checkReport.value.score ?? '-'} 分）`
+  } catch (e) {
+    await alertDialog(String(e))
+  } finally {
+    busy.value = false
+  }
+}
+
+async function runReview(useLlm = true) {
+  if (!project.value) return
+  await saveArtifacts()
+  busy.value = true
+  statusText.value = useLlm ? '正在做方法论审查（规则+LLM）…' : '正在做规则审查…'
+  try {
+    checkReport.value = await cardstudioRunReview(project.value.id, userNote.value || null, useLlm)
+    statusText.value = checkReport.value.ok
+      ? `审查通过（${checkReport.value.score ?? '-'} 分 · ${checkReport.value.source || 'rule'}）`
+      : `审查未通过（${checkReport.value.score ?? '-'} 分 · ${checkReport.value.source || 'rule'}）`
   } catch (e) {
     await alertDialog(String(e))
   } finally {
@@ -382,7 +402,8 @@ watch(
             <Input v-model="userNote" placeholder="本阶段补充说明（可选）" class="min-w-[12rem] flex-1" />
             <Button variant="primary" size="sm" :loading="busy" :disabled="busy" @click="runStage">AI 生成本阶段</Button>
           </template>
-          <Button variant="default" size="sm" :disabled="busy" @click="runChecks">结构检查</Button>
+          <Button variant="default" size="sm" :disabled="busy" @click="runChecks">规则检查</Button>
+          <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="runReview(true)">方法论审查</Button>
           <Button
             v-if="currentStage === 'compile_import' || project.stage_status?.review === 'done'"
             variant="primary"
@@ -395,12 +416,20 @@ watch(
           </Button>
         </div>
 
-        <div v-if="checkReport" class="text-xs space-y-1">
+        <div v-if="checkReport" class="text-xs space-y-1 rounded-lg border border-line bg-surface-2/50 p-3">
           <div :class="checkReport.ok ? 'text-ok' : 'text-err'">
             检查结果：{{ checkReport.ok ? '通过' : '未通过' }}
+            <span class="text-ink-soft"> · {{ checkReport.score ?? '-' }} 分 · {{ checkReport.source || 'rule' }}</span>
           </div>
+          <div v-if="checkReport.summary" class="text-ink-soft">{{ checkReport.summary }}</div>
           <div v-for="(issue, i) in checkReport.issues" :key="i" class="text-ink-soft">
-            [{{ issue.severity }}] {{ issue.message }}
+            <span :class="{
+              'text-err': issue.severity === 'error',
+              'text-warn': issue.severity === 'warning',
+              'text-ink-faint': issue.severity === 'info',
+            }">[{{ issue.severity }}{{ issue.field ? '/' + issue.field : '' }}]</span>
+            {{ issue.message }}
+            <span v-if="issue.suggestion" class="text-ink-faint"> — {{ issue.suggestion }}</span>
           </div>
         </div>
 

@@ -199,6 +199,10 @@ pub struct CheckIssue {
     pub code: String,
     pub message: String,
     pub severity: CheckSeverity,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub suggestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,68 +210,339 @@ pub struct CheckIssue {
 pub enum CheckSeverity {
     Error,
     Warning,
+    Info,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckReport {
     pub ok: bool,
     pub issues: Vec<CheckIssue>,
+    #[serde(default)]
+    pub score: Option<u32>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// rule | hybrid | llm
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
-/// Structural L1 checks for Phase 1.
+fn issue(
+    code: &str,
+    message: &str,
+    severity: CheckSeverity,
+    field: Option<&str>,
+    suggestion: Option<&str>,
+) -> CheckIssue {
+    CheckIssue {
+        code: code.into(),
+        message: message.into(),
+        severity,
+        field: field.map(|s| s.into()),
+        suggestion: suggestion.map(|s| s.into()),
+    }
+}
+
+fn contains_any(hay: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| hay.contains(n))
+}
+
+/// Structural + lightweight methodology heuristics (L1/L2).
 pub fn run_checks(artifacts: &CardArtifacts) -> CheckReport {
     let mut issues = Vec::new();
 
     if artifacts.name.trim().is_empty() {
-        issues.push(CheckIssue {
-            code: "name_required".into(),
-            message: "角色名不能为空".into(),
-            severity: CheckSeverity::Error,
-        });
+        issues.push(issue(
+            "name_required",
+            "角色名不能为空",
+            CheckSeverity::Error,
+            Some("name"),
+            Some("填写角色名"),
+        ));
     }
     if artifacts.description.trim().is_empty() {
-        issues.push(CheckIssue {
-            code: "description_required".into(),
-            message: "角色描述不能为空".into(),
-            severity: CheckSeverity::Error,
-        });
+        issues.push(issue(
+            "description_required",
+            "角色描述不能为空",
+            CheckSeverity::Error,
+            Some("description"),
+            Some("补齐基本信息/外貌差异化/背景/关系"),
+        ));
     }
     if artifacts.first_mes.trim().is_empty() {
-        issues.push(CheckIssue {
-            code: "first_mes_required".into(),
-            message: "开场白不能为空".into(),
-            severity: CheckSeverity::Error,
-        });
+        issues.push(issue(
+            "first_mes_required",
+            "开场白不能为空",
+            CheckSeverity::Error,
+            Some("first_mes"),
+            Some("写一段可互动的开场"),
+        ));
     }
     if artifacts.personality.trim().is_empty() {
-        issues.push(CheckIssue {
-            code: "personality_missing".into(),
-            message: "性格文本为空，建议补齐".into(),
-            severity: CheckSeverity::Warning,
-        });
+        issues.push(issue(
+            "personality_missing",
+            "性格文本为空，建议补齐",
+            CheckSeverity::Warning,
+            Some("personality"),
+            Some("至少写出底色/主色调"),
+        ));
+    }
+
+    // description should not mainly be personality dump
+    let desc = artifacts.description.as_str();
+    if !desc.trim().is_empty()
+        && contains_any(
+            desc,
+            &[
+                "性格：",
+                "性格是",
+                "性格特点",
+                "性格调色盘",
+                "底色：",
+                "主色调：",
+                "性格标签",
+            ],
+        )
+    {
+        issues.push(issue(
+            "description_has_personality",
+            "description 疑似混入性格内容（应放到 personality/调色盘）",
+            CheckSeverity::Warning,
+            Some("description"),
+            Some("把性格段落移到 personality，description 只保留外貌/背景/关系"),
+        ));
+    }
+
+    // bagua-ish wording heuristic
+    let joined = format!(
+        "{}\n{}\n{}",
+        artifacts.description, artifacts.personality, artifacts.first_mes
+    );
+    let bagua = [
+        "似乎",
+        "仿佛",
+        "宛如",
+        "如同",
+        "嘴角上扬",
+        "眼里闪过",
+        "指尖泛白",
+        "心湖",
+        "小兽",
+        "投石入湖",
+        "不是…而是",
+        "不是...而是",
+    ];
+    let hits: Vec<&str> = bagua.iter().copied().filter(|w| joined.contains(w)).collect();
+    if !hits.is_empty() {
+        issues.push(issue(
+            "bagua_wording",
+            &format!("检测到可能的八股措辞：{}", hits.join("、")),
+            CheckSeverity::Warning,
+            Some("general"),
+            Some("按绝对零度/白描改写：少模糊词与微表情套路，改写具体行为"),
+        ));
+    }
+
+    // personality guided placeholders
+    if artifacts
+        .personality_mode
+        .as_deref()
+        .unwrap_or("guided")
+        == "guided"
+        && !artifacts.personality.trim().is_empty()
+        && artifacts.personality.contains("【待用户手写】")
+    {
+        issues.push(issue(
+            "personality_pending_handwrite",
+            "性格仍有【待用户手写】占位，导入前建议补完衍生",
+            CheckSeverity::Info,
+            Some("personality"),
+            Some("按 user_prompts 手写衍生后再导入，或显式允许 AI 代写后重跑"),
+        ));
+    }
+
+    if artifacts.worldview_entries.is_empty() {
+        issues.push(issue(
+            "worldview_empty",
+            "尚无世界书条目",
+            CheckSeverity::Warning,
+            Some("worldview"),
+            Some("至少补 1 条蓝灯核心设定，或确认这是纯人设小卡"),
+        ));
     }
 
     for (idx, entry) in artifacts.worldview_entries.iter().enumerate() {
         if entry.content.trim().is_empty() {
-            issues.push(CheckIssue {
-                code: format!("worldview_{idx}_empty"),
-                message: format!("世界书条目 #{idx} 内容为空"),
-                severity: CheckSeverity::Error,
-            });
+            issues.push(issue(
+                &format!("worldview_{idx}_empty"),
+                &format!("世界书条目 #{idx} 内容为空"),
+                CheckSeverity::Error,
+                Some("worldview"),
+                Some("删除空条目或补正文"),
+            ));
+        } else if entry.content.trim().chars().count() < 12 {
+            issues.push(issue(
+                &format!("worldview_{idx}_too_short"),
+                &format!("世界书条目 #{idx} 过短，可能信息不足"),
+                CheckSeverity::Warning,
+                Some("worldview"),
+                Some("补充可检索的具体设定，避免空话"),
+            ));
         }
         if !entry.constant && entry.keys.iter().all(|k| k.trim().is_empty()) {
+            issues.push(issue(
+                &format!("worldview_{idx}_keys"),
+                &format!("世界书条目 #{idx} 为绿灯但缺少触发关键词"),
+                CheckSeverity::Error,
+                Some("worldview"),
+                Some("为绿灯条目填写 keys，或改成蓝灯 constant=true"),
+            ));
+        }
+        // tag-spec soft check: if content has <tag> style, ok; if long constant entry without any structure marker, info
+        if entry.constant
+            && entry.content.chars().count() > 80
+            && !entry.content.contains('<')
+            && !entry.content.contains("：")
+            && !entry.content.contains(":")
+        {
+            issues.push(issue(
+                &format!("worldview_{idx}_structure"),
+                &format!("世界书条目 #{idx} 较长且缺少结构标记，后续可按标签规范整理"),
+                CheckSeverity::Info,
+                Some("worldview"),
+                Some("可用小标题或 <名称_idN> 标签包裹，便于检索与维护"),
+            ));
+        }
+    }
+
+    if !artifacts.first_mes.trim().is_empty() {
+        let fm = artifacts.first_mes.as_str();
+        let interactive = contains_any(
+            fm,
+            &["？", "?", "你", "您", "咱们", "一起", "要不要", "……", "..."],
+        );
+        if !interactive && fm.chars().count() > 20 {
+            issues.push(issue(
+                "opening_no_hook",
+                "开场白可能缺少互动点/对用户的抓手",
+                CheckSeverity::Warning,
+                Some("first_mes"),
+                Some("补一个可回应的动作、问题或选择点"),
+            ));
+        }
+    }
+
+    let error_n = issues
+        .iter()
+        .filter(|i| matches!(i.severity, CheckSeverity::Error))
+        .count();
+    let warn_n = issues
+        .iter()
+        .filter(|i| matches!(i.severity, CheckSeverity::Warning))
+        .count();
+    let ok = error_n == 0;
+    let mut score: i32 = 100;
+    score -= (error_n as i32) * 25;
+    score -= (warn_n as i32) * 8;
+    score = score.clamp(0, 100);
+    let summary = if ok && warn_n == 0 {
+        "结构完整，启发式检查未发现明显问题".into()
+    } else if ok {
+        format!("可通过导入门槛，但仍有 {warn_n} 条建议")
+    } else {
+        format!("存在 {error_n} 个必须修复项")
+    };
+
+    CheckReport {
+        ok,
+        issues,
+        score: Some(score as u32),
+        summary: Some(summary),
+        source: Some("rule".into()),
+    }
+}
+
+/// Merge LLM review JSON into a base rule report (errors from rules still gate import).
+pub fn merge_review_reports(base: CheckReport, llm_value: &serde_json::Value) -> CheckReport {
+    let mut issues = base.issues;
+    if let Some(arr) = llm_value.get("issues").and_then(|v| v.as_array()) {
+        for item in arr {
+            let code = item
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("llm_issue")
+                .to_string();
+            let message = item
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if message.trim().is_empty() {
+                continue;
+            }
+            let severity = match item.get("severity").and_then(|v| v.as_str()).unwrap_or("warning") {
+                "error" => CheckSeverity::Error,
+                "info" => CheckSeverity::Info,
+                _ => CheckSeverity::Warning,
+            };
+            // LLM cannot alone invent hard blockers for missing core fields; demote unknown errors to warning
+            // unless code is clearly aligned with methodology.
+            let severity = if matches!(severity, CheckSeverity::Error)
+                && !code.contains("required")
+                && !code.contains("keys")
+                && !code.contains("empty")
+            {
+                CheckSeverity::Warning
+            } else {
+                severity
+            };
             issues.push(CheckIssue {
-                code: format!("worldview_{idx}_keys"),
-                message: format!("世界书条目 #{idx} 为绿灯但缺少触发关键词"),
-                severity: CheckSeverity::Error,
+                code: format!("llm_{code}"),
+                message,
+                severity,
+                field: item
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                suggestion: item
+                    .get("suggestion")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             });
         }
     }
 
-    let ok = !issues
+    let error_n = issues
         .iter()
-        .any(|i| matches!(i.severity, CheckSeverity::Error));
-    CheckReport { ok, issues }
+        .filter(|i| matches!(i.severity, CheckSeverity::Error))
+        .count();
+    let ok = error_n == 0;
+    let score = llm_value
+        .get("score")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .or(base.score)
+        .map(|s| {
+            // never higher than rule score if errors remain
+            if !ok {
+                s.min(60)
+            } else {
+                s
+            }
+        });
+    let summary = llm_value
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or(base.summary)
+        .map(|s| format!("{s}（规则+LLM）"));
+
+    CheckReport {
+        ok,
+        issues,
+        score,
+        summary,
+        source: Some("hybrid".into()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +686,10 @@ mod pack_mingyue_v1 {
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/creative_principles.md");
     pub const ABSOLUTE_ZERO: &str =
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/absolute_zero.md");
+    pub const TAG_SPEC: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/tag_spec.md");
+    pub const WORLDBOOK_CONFIG: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/common/worldbook_config.md");
     pub const OUTPUT_CONTRACT: &str =
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/output_contract.md");
     pub const BASIC: &str = include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/basic.md");
@@ -420,6 +699,14 @@ mod pack_mingyue_v1 {
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/worldview.md");
     pub const OPENING: &str =
         include_str!("../assets/cardstudio/mingyue_qiuqing_v1/stages/opening.md");
+    pub const REVIEW_CONTRACT: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/checkers/review_contract.md");
+    pub const WORLDBOOK_EVAL: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/checkers/worldbook_eval.md");
+    pub const WORLDVIEW_SELFCHECK: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/checkers/worldview_selfcheck.md");
+    pub const ENTRY_SELFCHECK: &str =
+        include_str!("../assets/cardstudio/mingyue_qiuqing_v1/checkers/entry_selfcheck.md");
 }
 
 fn stage_template(stage_id: &str) -> Result<&'static str, String> {
@@ -510,6 +797,56 @@ pub fn build_stage_prompt(
     user.push_str("请严格按系统中的输出契约返回 JSON。");
 
     Ok((system, user))
+}
+
+/// Build LLM prompt for methodology review (used after rule checks).
+pub fn build_review_prompt(
+    project: &CardProject,
+    rule_report: &CheckReport,
+    user_note: Option<&str>,
+) -> (String, String) {
+    let mut system = String::new();
+    system.push_str("你是 StoryForge 写卡审查器，执行明月秋青方法论与写卡知识库自查清单。\n");
+    system.push_str("不要扮演角色，不要输出角色卡正文，只输出审查 JSON。\n\n");
+    system.push_str(pack_mingyue_v1::REVIEW_CONTRACT);
+    system.push_str("\n\n# 创作原则\n");
+    system.push_str(pack_mingyue_v1::CREATIVE_PRINCIPLES);
+    system.push_str("\n\n# 绝对零度\n");
+    system.push_str(pack_mingyue_v1::ABSOLUTE_ZERO);
+    system.push_str("\n\n# 标签规范（软约束）\n");
+    system.push_str(pack_mingyue_v1::TAG_SPEC);
+    system.push_str("\n\n# 世界书配置指南（摘要审查用）\n");
+    // keep prompt bounded: first ~3500 chars of long guide
+    let wb = pack_mingyue_v1::WORLDBOOK_CONFIG;
+    system.push_str(if wb.len() > 3500 { &wb[..3500] } else { wb });
+    system.push_str("\n\n# 世界书评估\n");
+    system.push_str(pack_mingyue_v1::WORLDBOOK_EVAL);
+    system.push_str("\n\n# 世界观自查\n");
+    let wv = pack_mingyue_v1::WORLDVIEW_SELFCHECK;
+    system.push_str(if wv.len() > 3000 { &wv[..3000] } else { wv });
+    system.push_str("\n\n# 一般条目自查\n");
+    let entry = pack_mingyue_v1::ENTRY_SELFCHECK;
+    system.push_str(if entry.len() > 2500 {
+        &entry[..2500]
+    } else {
+        entry
+    });
+
+    let mut user = String::new();
+    user.push_str(&format!("# Brief\n{}\n\n", project.brief));
+    user.push_str(&format!(
+        "# Artifacts\n{}\n\n",
+        serde_json::to_string_pretty(&project.artifacts).unwrap_or_else(|_| "{}".into())
+    ));
+    user.push_str(&format!(
+        "# 规则检查结果（必须尊重 error 门槛）\n{}\n\n",
+        serde_json::to_string_pretty(rule_report).unwrap_or_else(|_| "{}".into())
+    ));
+    if let Some(n) = user_note.map(str::trim).filter(|s| !s.is_empty()) {
+        user.push_str(&format!("# 用户补充\n{n}\n\n"));
+    }
+    user.push_str("请输出审查 JSON。");
+    (system, user)
 }
 
 /// Apply a generative stage JSON patch onto artifacts.
@@ -840,5 +1177,51 @@ mod tests {
         .unwrap();
         assert_eq!(a.personality_mode.as_deref(), Some("guided"));
         assert_eq!(a.personality_prompts.len(), 1);
+    }
+
+    #[test]
+    fn run_checks_flags_description_personality_bleed_and_bagua() {
+        let mut a = sample_ok_artifacts();
+        a.description = "性格：温柔体贴。她仿佛小兽一样。".into();
+        a.personality = "底色：冷\n衍生：【待用户手写】".into();
+        a.personality_mode = Some("guided".into());
+        let report = run_checks(&a);
+        assert!(report.ok, "no hard errors expected");
+        assert!(report.issues.iter().any(|i| i.code == "description_has_personality"));
+        assert!(report.issues.iter().any(|i| i.code == "bagua_wording"));
+        assert!(report.issues.iter().any(|i| i.code == "personality_pending_handwrite"));
+        assert!(report.score.is_some());
+    }
+
+    #[test]
+    fn build_review_prompt_includes_selfcheck_assets() {
+        let p = CardProject::new_from_scratch("x", "y");
+        let report = run_checks(&p.artifacts);
+        let (system, user) = build_review_prompt(&p, &report, Some("重点看世界书"));
+        assert!(system.contains("审查") || system.contains("自查") || system.contains("评估"));
+        assert!(system.len() > 3000);
+        assert!(user.contains("规则检查结果"));
+        assert!(user.contains("重点看世界书"));
+    }
+
+    #[test]
+    fn merge_review_reports_demotes_soft_llm_errors() {
+        let base = run_checks(&sample_ok_artifacts());
+        let llm = serde_json::json!({
+            "ok": false,
+            "score": 70,
+            "summary": "建议润色",
+            "issues": [
+                {"code": "style", "severity": "error", "message": "文风可更白描", "field": "general", "suggestion": "删形容词"}
+            ]
+        });
+        let merged = merge_review_reports(base, &llm);
+        assert!(merged.ok);
+        assert!(merged.issues.iter().any(|i| i.code.starts_with("llm_")));
+        assert!(merged
+            .issues
+            .iter()
+            .any(|i| i.code.starts_with("llm_") && matches!(i.severity, CheckSeverity::Warning)));
+        assert_eq!(merged.source.as_deref(), Some("hybrid"));
     }
 }

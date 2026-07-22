@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use storyforge_domain::card_studio::{
-    self, apply_stage_json, build_stage_prompt, compile_artifacts, extract_json_object, phase1_stage_ids,
-    run_checks, CardArtifacts, CardProject, CheckReport, StageStatus, STAGE_BASIC, STAGE_BRIEF,
-    STAGE_COMPILE_IMPORT, STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
+    self, apply_stage_json, build_review_prompt, build_stage_prompt, compile_artifacts,
+    extract_json_object, merge_review_reports, phase1_stage_ids, run_checks, CardArtifacts,
+    CardProject, CheckReport, StageStatus, STAGE_BASIC, STAGE_BRIEF, STAGE_COMPILE_IMPORT,
+    STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
 };
 use storyforge_domain::character::{CharacterCard, CharacterDefinition, CharacterExtractionStatus};
 use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
@@ -168,6 +169,83 @@ pub fn cardstudio_run_checks(id: String) -> Result<CheckReport, TauriCommandErro
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     Ok(run_checks(&project.artifacts))
+}
+
+/// Rule checks + optional methodology LLM review (hybrid).
+#[tauri::command]
+pub async fn cardstudio_run_review(
+    id: String,
+    user_note: Option<String>,
+    use_llm: Option<bool>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CheckReport, TauriCommandError> {
+    let store = get_card_studio_store();
+    let mut project = store
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
+
+    let rule_report = run_checks(&project.artifacts);
+    let use_llm = use_llm.unwrap_or(true);
+    if !use_llm {
+        project.last_stage_output = Some(
+            serde_json::to_string_pretty(&rule_report).unwrap_or_else(|_| "{}".into()),
+        );
+        project.touch();
+        let _ = store.update(project);
+        return Ok(rule_report);
+    }
+
+    let (system, user) = build_review_prompt(&project, &rule_report, user_note.as_deref());
+    let llm = state.active_llm_or_mock();
+    let params = crate::get_conn_store()
+        .active_connection()
+        .map(|c| c.params)
+        .unwrap_or_else(|| SamplingParams {
+            temperature: Some(0.3),
+            max_tokens: Some(4096),
+            max_tokens_explicit: true,
+            ..Default::default()
+        });
+    let model = crate::get_conn_store()
+        .active_connection()
+        .map(|c| c.model)
+        .unwrap_or_else(|| "mock".into());
+    let req = ChatRequest {
+        messages: vec![ChatMessage::system(system), ChatMessage::user(user)],
+        tools: None,
+        params,
+        model,
+    };
+    let resp = llm
+        .chat(&req)
+        .await
+        .map_err(|e| TauriCommandError::llm(format!("写卡审查 LLM 调用失败: {e}"), false))?;
+    project.last_stage_output = Some(resp.content.clone());
+
+    let merged = match extract_json_object(&resp.content) {
+        Ok(v) => merge_review_reports(rule_report, &v),
+        Err(_) => {
+            let mut report = rule_report;
+            report.summary = Some(format!(
+                "{}（LLM 审查输出无法解析，已回退规则检查）",
+                report.summary.unwrap_or_default()
+            ));
+            report.source = Some("rule".into());
+            report
+        }
+    };
+
+    // Persist last review summary into notes lightly
+    if let Some(summary) = &merged.summary {
+        project.last_error = if merged.ok {
+            None
+        } else {
+            Some(summary.clone())
+        };
+    }
+    project.touch();
+    let _ = store.update(project);
+    Ok(merged)
 }
 
 #[tauri::command]

@@ -3,10 +3,12 @@
   "name": "明月秋青写卡方法论 v1",
   "version": "1.0.0",
   "source": "明月秋青写卡预设-标准+辅食.json",
-  "notes": "方法论与模板摘录；输出契约由 StoryForge 覆盖为可编译 JSON。默认协作，不代写性格衍生。",
+  "notes": "方法论+审查清单；输出契约由 StoryForge 覆盖为可编译 JSON。默认协作，不代写性格衍生。",
   "common": [
     "common/creative_principles.md",
-    "common/absolute_zero.md"
+    "common/absolute_zero.md",
+    "common/tag_spec.md",
+    "common/worldbook_config.md"
   ],
   "stages": {
     "basic": "stages/basic.md",
@@ -17,5 +19,11 @@
   "defaults": {
     "personality_mode": "guided",
     "allow_ai_freewrite": false
+  },
+  "checkers": {
+    "review_contract": "checkers/review_contract.md",
+    "worldbook_eval": "checkers/worldbook_eval.md",
+    "worldview_selfcheck": "checkers/worldview_selfcheck.md",
+    "entry_selfcheck": "checkers/entry_selfcheck.md"
   }
 }

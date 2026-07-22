@@ -12323,6 +12323,7 @@ pub fn run() {
             card_studio_api::cardstudio_set_stage,
             card_studio_api::cardstudio_set_options,
             card_studio_api::cardstudio_run_checks,
+            card_studio_api::cardstudio_run_review,
             card_studio_api::cardstudio_compile,
             card_studio_api::cardstudio_complete_manual_stage,
             card_studio_api::cardstudio_run_stage,

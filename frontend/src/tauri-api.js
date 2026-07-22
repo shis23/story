@@ -855,7 +855,18 @@ export async function cardstudioRunChecks(id) {
   if (isTauri()) {
     return await invoke('cardstudio_run_checks', { id })
   }
-  return { ok: false, issues: [] }
+  return { ok: false, issues: [], score: 0, summary: '', source: 'rule' }
+}
+
+export async function cardstudioRunReview(id, userNote = null, useLlm = true) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_review', {
+      id,
+      userNote: userNote || null,
+      useLlm,
+    })
+  }
+  return { ok: false, issues: [], score: 0, summary: 'mock', source: 'rule' }
 }
 
 export async function cardstudioCompile(id) {
