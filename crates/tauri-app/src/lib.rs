@@ -10493,6 +10493,7 @@ pub struct CampaignWorldInfoEntryDto {
     pub index: usize,
     pub keys: Vec<String>,
     pub secondary_keys: Vec<String>,
+    /// 列表预览用截断正文（默认）；完整正文走 get_*_world_info_entry
     pub content: String,
     pub constant: bool,
     pub selective: bool,
@@ -10502,6 +10503,12 @@ pub struct CampaignWorldInfoEntryDto {
     pub route: String,
     /// card | merged_global | user
     pub source: String,
+    /// 原文是否被截断
+    #[serde(default)]
+    pub content_truncated: bool,
+    /// 原文长度（字符）
+    #[serde(default)]
+    pub content_len: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10541,7 +10548,48 @@ fn entry_source_label(entry: &storyforge_domain::world_info::WorldInfoEntry) -> 
         .to_string()
 }
 
+const WORLD_INFO_LIST_PREVIEW_CHARS: usize = 240;
+
+fn truncate_world_info_content(content: &str, max_chars: usize) -> (String, bool, usize) {
+    let len = content.chars().count();
+    if len <= max_chars {
+        return (content.to_string(), false, len);
+    }
+    let preview: String = content.chars().take(max_chars).collect();
+    (format!("{preview}…"), true, len)
+}
+
 fn world_info_entry_to_dto(
+    index: usize,
+    e: &storyforge_domain::world_info::WorldInfoEntry,
+) -> CampaignWorldInfoEntryDto {
+    world_info_entry_to_dto_preview(index, e, WORLD_INFO_LIST_PREVIEW_CHARS)
+}
+
+fn world_info_entry_to_dto_preview(
+    index: usize,
+    e: &storyforge_domain::world_info::WorldInfoEntry,
+    max_chars: usize,
+) -> CampaignWorldInfoEntryDto {
+    let (content, truncated, content_len) = truncate_world_info_content(&e.content, max_chars);
+    CampaignWorldInfoEntryDto {
+        index,
+        keys: e.keys.clone(),
+        secondary_keys: e.secondary_keys.clone(),
+        content,
+        constant: e.constant,
+        selective: e.selective,
+        disabled: e.disabled,
+        depth: e.depth,
+        order: e.order,
+        route: lore_route_to_str(&e.route),
+        source: entry_source_label(e),
+        content_truncated: truncated,
+        content_len,
+    }
+}
+
+fn world_info_entry_to_dto_full(
     index: usize,
     e: &storyforge_domain::world_info::WorldInfoEntry,
 ) -> CampaignWorldInfoEntryDto {
@@ -10557,6 +10605,8 @@ fn world_info_entry_to_dto(
         order: e.order,
         route: lore_route_to_str(&e.route),
         source: entry_source_label(e),
+        content_truncated: false,
+        content_len: e.content.chars().count(),
     }
 }
 
@@ -10784,6 +10834,53 @@ fn get_character_world_info(character_id: String) -> Result<CampaignWorldInfoDto
     // 伪 campaign_id 槽位仅用于 DTO 复用；UI 标注只读
     let fake = Id::from_str(&format!("card:{}", stored.id));
     Ok(book_to_campaign_world_info_dto(&fake, &book))
+}
+
+/// 卡模板世界书单条完整正文（展开编辑/预览用，避免列表一次下发 1MB+）。
+#[tauri::command]
+fn get_character_world_info_entry(
+    character_id: String,
+    entry_index: usize,
+) -> Result<CampaignWorldInfoEntryDto, TauriCommandError> {
+    let stored = get_store()
+        .get(&character_id)
+        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    let book = stored
+        .info
+        .embedded_world_info
+        .clone()
+        .or_else(|| world_info_book_from_entries(&stored.info.world_info_entries))
+        .unwrap_or_else(|| storyforge_domain::world_info::WorldInfoBook {
+            entries: Vec::new(),
+            source: storyforge_domain::Source::Native,
+            metadata: Default::default(),
+        });
+    let entry = book.entries.get(entry_index).ok_or_else(|| {
+        TauriCommandError::not_found(format!("世界书条目索引越界: {entry_index}"))
+    })?;
+    Ok(world_info_entry_to_dto_full(entry_index, entry))
+}
+
+/// 本局世界书单条完整正文。
+#[tauri::command]
+fn get_campaign_world_info_entry(
+    campaign_id: String,
+    entry_index: usize,
+) -> Result<CampaignWorldInfoEntryDto, TauriCommandError> {
+    if sqlite_runtime::is_sqlite_active() {
+        return Err(TauriCommandError::validation(
+            "campaign world info is not available in the SQLite opt-in backend yet",
+        ));
+    }
+    let id = Id::from_str(&campaign_id);
+    let book = get_campaign_store()
+        .get_world_info(&id)
+        .map_err(|e| TauriCommandError::storage(e))?;
+    let entry = book.entries.get(entry_index).ok_or_else(|| {
+        TauriCommandError::not_found(format!("世界书条目索引越界: {entry_index}"))
+    })?;
+    Ok(world_info_entry_to_dto_full(entry_index, entry))
 }
 
 /// 若 `campaign_id` 是当前活跃活动，则把本局世界书写入 tool_ctx（写作注入真相源）。
@@ -12132,6 +12229,8 @@ pub fn run() {
             delete_campaign_world_info_entry,
             set_campaign_world_info_route,
             get_character_world_info,
+            get_character_world_info_entry,
+            get_campaign_world_info_entry,
             get_card_shell_manifest,
             get_card_shell_inline_js,
             card_shell_list_allowed_hosts,

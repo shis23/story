@@ -4,7 +4,7 @@
  * 可写路径在 CampaignWorldInfoTab（本局真相源）。
  */
 import { ref, computed, watch, onMounted } from 'vue'
-import { getCharacterWorldInfo } from '../../tauri-api.js'
+import { getCharacterWorldInfo, getCharacterWorldInfoEntry } from '../../tauri-api.js'
 import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
@@ -24,6 +24,8 @@ const book = ref(null)
 const routeFilter = ref('')
 const query = ref('')
 const expandedIndex = ref(null)
+const expandedContent = ref('')
+const expanding = ref(false)
 
 const routeOptions = [
   { value: '', label: '全部路由' },
@@ -82,8 +84,29 @@ function routeVariant(route) {
   return 'neutral'
 }
 
-function toggleExpand(entry) {
-  expandedIndex.value = expandedIndex.value === entry.index ? null : entry.index
+async function toggleExpand(entry) {
+  if (expandedIndex.value === entry.index) {
+    expandedIndex.value = null
+    expandedContent.value = ''
+    return
+  }
+  expandedIndex.value = entry.index
+  expandedContent.value = entry.content || ''
+  if (entry.content_truncated && props.characterId != null) {
+    expanding.value = true
+    try {
+      const full = await getCharacterWorldInfoEntry(props.characterId, entry.index)
+      if (expandedIndex.value === entry.index && full) {
+        expandedContent.value = full.content || ''
+      }
+    } catch (e) {
+      expandedContent.value = (entry.content || '') + '
+
+[完整正文加载失败] ' + e
+    } finally {
+      expanding.value = false
+    }
+  }
 }
 
 defineExpose({ refresh: load })
@@ -146,7 +169,8 @@ defineExpose({ refresh: load })
         class="rounded-lg border border-line bg-surface-2/50 p-3 text-xs text-ink font-mono whitespace-pre-wrap break-words"
       >
         <div class="text-ink-soft mb-1 font-sans">条目 #{{ expandedIndex }}（只读）</div>
-        {{ (book?.entries || []).find((e) => e.index === expandedIndex)?.content || '' }}
+        <span v-if="expanding" class="text-ink-faint font-sans">加载完整正文…</span>
+        <template v-else>{{ expandedContent }}</template>
       </div>
     </template>
   </div>

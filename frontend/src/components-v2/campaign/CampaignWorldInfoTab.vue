@@ -10,6 +10,7 @@ import {
   updateCampaignWorldInfoEntry,
   deleteCampaignWorldInfoEntry,
   setCampaignWorldInfoRoute,
+  getCampaignWorldInfoEntry,
 } from '../../tauri-api.js'
 import { confirmDialog, alertDialog } from '../../components/base/BaseDialog.js'
 import DataTable from '../ui/DataTable.vue'
@@ -133,13 +134,22 @@ function sourceLabel(s) {
   return '卡模板'
 }
 
-function openEdit(entry) {
+async function openEdit(entry) {
   if (expandedIndex.value === entry.index) {
     expandedIndex.value = null
     return
   }
   expandedIndex.value = entry.index
-  fillDraft(entry)
+  let full = entry
+  if (entry.content_truncated) {
+    try {
+      const dto = await getCampaignWorldInfoEntry(props.campaignId, entry.index)
+      if (dto) full = { ...entry, ...dto, content_truncated: false }
+    } catch (e) {
+      await alertDialog('加载完整正文失败: ' + e)
+    }
+  }
+  fillDraft(full)
 }
 
 async function handleAdd() {

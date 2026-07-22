@@ -915,6 +915,22 @@ export async function getCharacterWorldInfo(characterId) {
   return { campaign_id: `card:${characterId}`, entry_count: 0, constant_count: 0, selective_count: 0, entries: [] }
 }
 
+/** 卡模板世界书单条完整正文 */
+export async function getCharacterWorldInfoEntry(characterId, entryIndex) {
+  if (isTauri()) {
+    return await invoke('get_character_world_info_entry', { characterId, entryIndex })
+  }
+  return null
+}
+
+/** 本局世界书单条完整正文 */
+export async function getCampaignWorldInfoEntry(campaignId, entryIndex) {
+  if (isTauri()) {
+    return await invoke('get_campaign_world_info_entry', { campaignId, entryIndex })
+  }
+  return null
+}
+
 
 // ─── Card Shell（可见壳 + 宿主代持）────────────────────────────────────────
 
