@@ -196,7 +196,7 @@ const columns = [
 
       <div v-if="row.error" class="rounded-md border border-err/40 bg-err/10 px-3 py-2">
         <div class="text-xs font-medium text-err mb-1">错误</div>
-        <pre class="text-xs font-mono text-err/80 whitespace-pre-wrap break-all">{{ JSON.stringify(row.error, null, 2) }}</pre>
+        <pre class="text-xs font-mono text-err/80 whitespace-pre-wrap break-words">{{ JSON.stringify(row.error, null, 2) }}</pre>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-2">

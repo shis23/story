@@ -38,6 +38,7 @@ function onTabChange(key) {
     <div class="shrink-0 h-14 flex items-center justify-between px-4 border-b border-line">
       <span class="font-semibold text-ink text-sm">调试</span>
       <button
+        type="button"
         class="w-9 h-9 flex items-center justify-center rounded-lg text-ink-soft hover:bg-surface-2 transition-colors"
         @click="ui.showDebugDrawer = false"
         aria-label="关闭"
@@ -46,12 +47,14 @@ function onTabChange(key) {
       </button>
     </div>
 
-    <div class="flex-1 overflow-y-auto p-3">
+    <div class="sf-drawer-scroll flex-1 min-h-0 min-w-0 overflow-y-auto overscroll-y-contain p-3 pb-10">
       <Tabs v-model="activeTab" :tabs="tabs" @update:model-value="onTabChange">
-        <PipelineTracePanel v-if="activeTab === 'trace'" />
-        <PluginEventLog v-else-if="activeTab === 'events'" />
-        <PromptHookAuditLog v-else-if="activeTab === 'hooks'" />
-        <LogPanel v-else-if="activeTab === 'logs'" ref="logPanelRef" />
+        <div class="min-w-0 pt-1">
+          <PipelineTracePanel v-if="activeTab === 'trace'" />
+          <PluginEventLog v-else-if="activeTab === 'events'" />
+          <PromptHookAuditLog v-else-if="activeTab === 'hooks'" />
+          <LogPanel v-else-if="activeTab === 'logs'" ref="logPanelRef" />
+        </div>
       </Tabs>
     </div>
   </div>

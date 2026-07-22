@@ -21,7 +21,7 @@ function handleChange(index) {
 
 const tabClass = (selected) => {
   const base =
-    'px-3 py-2 -mb-px text-sm border-b-2 transition-colors duration-150 select-none'
+    'px-2.5 sm:px-3 py-2 -mb-px text-[13px] sm:text-sm border-b-2 transition-colors duration-150 select-none whitespace-nowrap shrink-0'
   return selected
     ? `${base} text-accent-bright border-accent`
     : `${base} text-ink-soft border-transparent hover:text-ink`
@@ -33,20 +33,21 @@ const tabClass = (selected) => {
     :selected-index="selectedIndex"
     @change="handleChange"
   >
-    <TabList class="flex gap-1 border-b border-line">
+    <!-- 窄抽屉内横向滚动，标签不换行挤成「插件 / 事 / 件」 -->
+    <TabList class="flex gap-0.5 border-b border-line overflow-x-auto min-w-0">
       <Tab
         v-for="tab in tabs"
         :key="tab.key"
         v-slot="{ selected }"
         as="template"
       >
-        <button :class="tabClass(selected)">
+        <button type="button" :class="tabClass(selected)">
           {{ tab.label }}
         </button>
       </Tab>
     </TabList>
 
-    <div class="pt-3 focus:outline-none">
+    <div class="pt-3 focus:outline-none min-w-0">
       <slot />
     </div>
   </TabGroup>
