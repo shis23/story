@@ -69,6 +69,7 @@ function emptyArtifacts() {
     personality_prompts: [],
     world_type: null,
     opening_outline: null,
+    style_notes: null,
   }
 }
 
