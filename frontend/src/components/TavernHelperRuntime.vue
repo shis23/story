@@ -106,222 +106,214 @@ function bootstrapSrcdoc() {
   // Avoid raw script tags as contiguous text in this SFC (Vue parser would close early).
   const sOpen = '<' + 'script>'
   const sClose = '</' + 'script>'
-  const body = `
-(function(){
-  'use strict';
-  var V = {};
-  function ask(type, payload){
-    return new Promise(function(resolve, reject){
-      var id = 'th_' + Math.random().toString(36).slice(2);
-      function onMsg(ev){
-        var d = ev.data || {};
-        if (!d || d.__sf_th_bridge_res !== id) return;
-        window.removeEventListener('message', onMsg);
-        if (d.error) reject(new Error(d.error));
-        else resolve(d.result);
-      }
-      window.addEventListener('message', onMsg);
-      parent.postMessage({ __sf_th_bridge: true, id: id, type: type, payload: payload || {} }, '*');
-      setTimeout(function(){
-        window.removeEventListener('message', onMsg);
-        reject(new Error('TH bridge timeout: ' + type));
-      }, 60000);
-    });
-  }
-  window.__sfThHostFetchText = function(url){ return ask('fetch_text', { url: url }); };
-  // Parent returns SOURCE TEXT (not a parent-side blob URL). Create blob in THIS origin.
-  window.__sfThHostFetchModuleSource = function(url){ return ask('fetch_module_source', { url: url }); };
-  window.__sfThReport = function(payload){ return ask('report', payload); };
-  window.__sfThLocalBlobs = [];
-  window.__sfThModuleSourceToBlob = function(code){
-    var blob = new Blob([code], { type: 'text/javascript' });
-    var u = URL.createObjectURL(blob);
-    window.__sfThLocalBlobs.push(u);
-    return u;
-  };
-  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };
-  window.setvar = function(k, v){
-    V[k] = v;
-    parent.postMessage({ __sf_th_bridge: true, type: 'var_write', payload: { key: k, value: v } }, '*');
-    return v;
-  };
-  window.getChatVariable = window.getvar;
-  window.setChatVariable = window.setvar;
-  window.eventOn = window.eventOn || function(){ return function(){}; };
-  window.eventEmit = window.eventEmit || function(){};
-  window.triggerSlash = window.triggerSlash || function(){ return Promise.resolve(''); };
-  window.TavernHelper = window.TavernHelper || {
-    getVariable: window.getvar,
-    setVariable: window.setvar,
-    getVariables: function(){ return Object.assign({}, V); },
-    eventOn: window.eventOn,
-    eventEmit: window.eventEmit,
-    triggerSlash: window.triggerSlash,
-  };
-  window.tavernHelper = window.TavernHelper;
-
-  // ST / MagVarUpdate / destined-journey scripts expect free globals (not ESM imports).
-  // data_schema: const t=z; t.z.coerce... — global z must be Zod UMD exports (has .z).
-  window.__sfThEnsureGlobals = async function(){
-    async function loadClassic(url, check){
-      var code = await window.__sfThHostFetchText(url);
-      if (!code || code.length < 20) throw new Error('empty global script: ' + url);
-      var s = document.createElement('script');
-      s.text = code;
-      document.head.appendChild(s);
-      if (typeof check === 'function' && !check()) {
-        throw new Error('global script did not define expected symbol: ' + url);
-      }
-    }
-    if (!window.jQuery) {
-      await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', function(){ return !!window.jQuery; });
-    }
-    window.$ = window.jQuery || window.$;
-    if (!window.Vue) {
-      await loadClassic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });
-    }
-    if (!window.Zod) {
-      await loadClassic('https://cdn.jsdelivr.net/npm/zod@3.23.8/lib/index.umd.js', function(){ return !!window.Zod; });
-    }
-    // Zod UMD sets global.Zod; expose as z (namespace with nested .z)
-    window.z = window.Zod || window.z;
-    if (!window.z) throw new Error('Zod global missing after load');
-    if (!window._) {
-      try {
-        await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; });
-      } catch (e) {
-        console.warn('[TH] lodash load failed', e);
-        window._ = {
-          clamp: function(n,a,b){ return Math.min(b, Math.max(a, n)); },
-          get: function(o,k,d){ return d; },
-          set: function(){},
-          fromPairs: function(pairs){ var o={}; (pairs||[]).forEach(function(p){ if(p) o[p[0]]=p[1]; }); return o; },
-          toPairs: function(o){ return Object.keys(o||{}).map(function(k){ return [k, o[k]]; }); },
-          take: function(a,n){ return (a||[]).slice(0,n); },
-          uniq: function(a){ return Array.from(new Set(a||[])); },
-          pick: function(o, keys){ var r={}; (keys||[]).forEach(function(k){ if(o&&k in o) r[k]=o[k]; }); return r; },
-          mapValues: function(o, fn){ var r={}; Object.keys(o||{}).forEach(function(k){ r[k]=fn(o[k],k); }); return r; },
-          size: function(o){ return o ? (Array.isArray(o)?o.length:Object.keys(o).length) : 0; },
-        };
-      }
-    }
-    if (!window.Vue) throw new Error('Vue global missing after preload');
-    if (!window.$) throw new Error('jQuery global missing after preload');
-  };
-
-  // Host text → same-origin blob graph for remote ES modules (sandbox blocks free CDN import).
-  window.__sfThImportUrl = async function(entryUrl){
-    var cache = Object.create(null);
-    async function load(url){
-      if (cache[url]) return cache[url];
-      cache[url] = (async function(){
-        var code = await window.__sfThHostFetchModuleSource(url);
-        var re = new RegExp('(?:\\bfrom\\s+|\\bimport\\s*\\(?|\\bimport\\s+)[\'\"]([^\'\"]+)[\'\"]', 'g');
-        var specs = [];
-        var m;
-        while ((m = re.exec(code)) !== null) {
-          var spec = m[1];
-          if (!spec) continue;
-          if (spec.startsWith('http://') || spec.startsWith('https://') || spec.startsWith('.') || spec.startsWith('/')) {
-            specs.push(spec);
-          }
-        }
-        var map = Object.create(null);
-        for (var i = 0; i < specs.length; i++) {
-          var sp = specs[i];
-          var abs = sp;
-          if (sp.startsWith('.') || sp.startsWith('/')) {
-            try { abs = new URL(sp, url).href; } catch (e) { continue; }
-          }
-          try {
-            map[sp] = await load(abs);
-          } catch (e) {
-            console.warn('[TH] module dep failed', abs, e);
-          }
-        }
-        if (Object.keys(map).length) {
-          code = code.replace(re, function(full, spec){
-            if (!map[spec]) return full;
-            return full.replace(spec, map[spec]);
-          });
-        }
-        return window.__sfThModuleSourceToBlob(code);
-      })();
-      return cache[url];
-    }
-    var blobUrl = await load(entryUrl);
-    return import(blobUrl);
-  };
-
-  window.__sfThRunScripts = async function(items){
-    await window.__sfThEnsureGlobals();
-    var results = [];
-    for (var i = 0; i < items.length; i++){
-      var item = items[i];
-      try {
-        await window.__sfThReport({ index: i, label: item.label, state: 'running' });
-        if (item.kind === 'remote_url'){
-          await window.__sfThImportUrl(item.url);
-        } else if (item.kind === 'inline_js'){
-          await new Promise(function(resolve, reject){
-            try {
-              var s = document.createElement('script');
-              s.text = item.js;
-              s.onload = function(){ resolve(); };
-              s.onerror = function(e){ reject(e || new Error('inline script error')); };
-              document.head.appendChild(s);
-              setTimeout(resolve, 0);
-            } catch (e) { reject(e); }
-          });
-        } else {
-          throw new Error('unknown th kind: ' + item.kind);
-        }
-        await window.__sfThReport({ index: i, label: item.label, state: 'ok' });
-        results.push({ index: i, ok: true });
-      } catch (e) {
-        var msg = String((e && e.message) || e);
-        await window.__sfThReport({ index: i, label: item.label, state: 'error', detail: msg });
-        results.push({ index: i, ok: false, error: msg });
-      }
-    }
-    return results;
-  };
-
-  // Parent is cross-origin to blob: iframe — only postMessage, never contentWindow access.
-  window.addEventListener('message', function(ev){
-    var d = ev.data || {};
-    if (!d || !d.__sf_th_host) return;
-    if (d.type === 'run_scripts') {
-      window.__sfThRunScripts(d.items || []).then(function(results){
-        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, results: results }, '*');
-      }).catch(function(err){
-        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, error: String((err && err.message) || err) }, '*');
-      });
-      return;
-    }
-    if (d.type === 'button') {
-      try {
-        var name = (d.payload && d.payload.name) || '';
-        var th = window.TavernHelper || window.tavernHelper || {};
-        if (typeof th.triggerSlash === 'function') {
-          try { th.triggerSlash('/button ' + name); } catch (e1) {}
-        }
-        if (typeof window.triggerSlash === 'function') {
-          try { window.triggerSlash('/button ' + name); } catch (e2) {}
-        }
-        if (typeof window.eventEmit === 'function') {
-          window.eventEmit('th_button', d.payload || {});
-        }
-        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: true }, '*');
-      } catch (e) {
-        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: false, error: String((e && e.message) || e) }, '*');
-      }
-    }
-  });
-
-  parent.postMessage({ __sf_th_bridge: true, type: 'ready' }, '*');
-})();
-`
+  // Build bootstrap as plain string joins (no nested template literal).
+  const lines = [
+    "(function(){",
+    "  'use strict';",
+    "  var V = {};",
+    "  function ask(type, payload){",
+    "    return new Promise(function(resolve, reject){",
+    "      var id = 'th_' + Math.random().toString(36).slice(2);",
+    "      function onMsg(ev){",
+    "        var d = ev.data || {};",
+    "        if (!d || d.__sf_th_bridge_res !== id) return;",
+    "        window.removeEventListener('message', onMsg);",
+    "        if (d.error) reject(new Error(d.error));",
+    "        else resolve(d.result);",
+    "      }",
+    "      window.addEventListener('message', onMsg);",
+    "      parent.postMessage({ __sf_th_bridge: true, id: id, type: type, payload: payload || {} }, '*');",
+    "      setTimeout(function(){",
+    "        window.removeEventListener('message', onMsg);",
+    "        reject(new Error('TH bridge timeout: ' + type));",
+    "      }, 120000);",
+    "    });",
+    "  }",
+    "  window.__sfThHostFetchText = function(url){ return ask('fetch_text', { url: url }); };",
+    "  window.__sfThHostFetchModuleSource = function(url){ return ask('fetch_module_source', { url: url }); };",
+    "  window.__sfThReport = function(payload){ return ask('report', payload); };",
+    "  window.__sfThLocalBlobs = [];",
+    "  window.__sfThModuleSourceToBlob = function(code){",
+    "    var blob = new Blob([code], { type: 'text/javascript' });",
+    "    var u = URL.createObjectURL(blob);",
+    "    window.__sfThLocalBlobs.push(u);",
+    "    return u;",
+    "  };",
+    "  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };",
+    "  window.setvar = function(k, v){",
+    "    V[k] = v;",
+    "    parent.postMessage({ __sf_th_bridge: true, type: 'var_write', payload: { key: k, value: v } }, '*');",
+    "    return v;",
+    "  };",
+    "  window.getChatVariable = window.getvar;",
+    "  window.setChatVariable = window.setvar;",
+    "  window.eventOn = window.eventOn || function(){ return function(){}; };",
+    "  window.eventEmit = window.eventEmit || function(){};",
+    "  window.triggerSlash = window.triggerSlash || function(){ return Promise.resolve(''); };",
+    "  window.TavernHelper = window.TavernHelper || {",
+    "    getVariable: window.getvar,",
+    "    setVariable: window.setvar,",
+    "    getVariables: function(){ return Object.assign({}, V); },",
+    "    eventOn: window.eventOn,",
+    "    eventEmit: window.eventEmit,",
+    "    triggerSlash: window.triggerSlash,",
+    "  };",
+    "  window.tavernHelper = window.TavernHelper;",
+    "  window.__sfThImportSpecRe = function(){",
+    "    var bs = String.fromCharCode(92);",
+    "    var sq = String.fromCharCode(39);",
+    "    var dq = String.fromCharCode(34);",
+    "    var qcls = sq + dq;",
+    "    var pat = '(?:' + bs + 'bfrom' + bs + 's+|' + bs + 'bimport' + bs + 's*' + bs + '(?|' + bs + 'bimport' + bs + 's+)[' + qcls + ']([^' + qcls + ']+)[' + qcls + ']';",
+    "    return new RegExp(pat, 'g');",
+    "  };",
+    "  window.__sfThEnsureGlobals = async function(){",
+    "    async function loadClassic(url, check){",
+    "      var code = await window.__sfThHostFetchText(url);",
+    "      if (!code || code.length < 20) throw new Error('empty global script: ' + url);",
+    "      var s = document.createElement('script');",
+    "      s.text = code;",
+    "      document.head.appendChild(s);",
+    "      if (typeof check === 'function' && !check()) {",
+    "        throw new Error('global script did not define expected symbol: ' + url);",
+    "      }",
+    "    }",
+    "    if (!window.jQuery) {",
+    "      await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', function(){ return !!window.jQuery; });",
+    "    }",
+    "    window.$ = window.jQuery || window.$;",
+    "    if (!window.Vue) {",
+    "      await loadClassic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });",
+    "    }",
+    "    if (!window.Zod) {",
+    "      await loadClassic('https://cdn.jsdelivr.net/npm/zod@3.23.8/lib/index.umd.js', function(){ return !!window.Zod; });",
+    "    }",
+    "    window.z = window.Zod || window.z;",
+    "    if (!window.z) throw new Error('Zod global missing after load');",
+    "    if (!window._) {",
+    "      try {",
+    "        await loadClassic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; });",
+    "      } catch (e) {",
+    "        console.warn('[TH] lodash load failed', e);",
+    "        window._ = {",
+    "          clamp: function(n,a,b){ return Math.min(b, Math.max(a, n)); },",
+    "          get: function(o,k,d){ return d; },",
+    "          set: function(){},",
+    "          fromPairs: function(pairs){ var o={}; (pairs||[]).forEach(function(p){ if(p) o[p[0]]=p[1]; }); return o; },",
+    "          toPairs: function(o){ return Object.keys(o||{}).map(function(k){ return [k, o[k]]; }); },",
+    "          take: function(a,n){ return (a||[]).slice(0,n); },",
+    "          uniq: function(a){ return Array.from(new Set(a||[])); },",
+    "          pick: function(o, keys){ var r={}; (keys||[]).forEach(function(k){ if(o&&k in o) r[k]=o[k]; }); return r; },",
+    "          mapValues: function(o, fn){ var r={}; Object.keys(o||{}).forEach(function(k){ r[k]=fn(o[k],k); }); return r; },",
+    "          size: function(o){ return o ? (Array.isArray(o)?o.length:Object.keys(o).length) : 0; },",
+    "        };",
+    "      }",
+    "    }",
+    "    if (!window.Vue) throw new Error('Vue global missing after preload');",
+    "    if (!window.$) throw new Error('jQuery global missing after preload');",
+    "  };",
+    "  window.__sfThImportUrl = async function(entryUrl){",
+    "    var cache = Object.create(null);",
+    "    async function load(url){",
+    "      if (cache[url]) return cache[url];",
+    "      cache[url] = (async function(){",
+    "        var code = await window.__sfThHostFetchModuleSource(url);",
+    "        var re = window.__sfThImportSpecRe();",
+    "        var specs = [];",
+    "        var m;",
+    "        while ((m = re.exec(code)) !== null) {",
+    "          var spec = m[1];",
+    "          if (!spec) continue;",
+    "          if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') {",
+    "            specs.push(spec);",
+    "          }",
+    "        }",
+    "        var map = Object.create(null);",
+    "        for (var i = 0; i < specs.length; i++) {",
+    "          var sp = specs[i];",
+    "          var abs = sp;",
+    "          if (sp.charAt(0) === '.' || sp.charAt(0) === '/') {",
+    "            try { abs = new URL(sp, url).href; } catch (e) { continue; }",
+    "          }",
+    "          try { map[sp] = await load(abs); } catch (e) { console.warn('[TH] module dep failed', abs, e); }",
+    "        }",
+    "        if (Object.keys(map).length) {",
+    "          re = window.__sfThImportSpecRe();",
+    "          code = code.replace(re, function(full, spec){",
+    "            if (!map[spec]) return full;",
+    "            return full.replace(spec, map[spec]);",
+    "          });",
+    "        }",
+    "        return window.__sfThModuleSourceToBlob(code);",
+    "      })();",
+    "      return cache[url];",
+    "    }",
+    "    var blobUrl = await load(entryUrl);",
+    "    return import(blobUrl);",
+    "  };",
+    "  window.__sfThRunScripts = async function(items){",
+    "    await window.__sfThEnsureGlobals();",
+    "    var results = [];",
+    "    for (var i = 0; i < items.length; i++){",
+    "      var item = items[i];",
+    "      try {",
+    "        await window.__sfThReport({ index: i, label: item.label, state: 'running' });",
+    "        if (item.kind === 'remote_url'){",
+    "          await window.__sfThImportUrl(item.url);",
+    "        } else if (item.kind === 'inline_js'){",
+    "          await new Promise(function(resolve, reject){",
+    "            try {",
+    "              var s = document.createElement('script');",
+    "              s.text = item.js;",
+    "              s.onload = function(){ resolve(); };",
+    "              s.onerror = function(e){ reject(e || new Error('inline script error')); };",
+    "              document.head.appendChild(s);",
+    "              setTimeout(resolve, 0);",
+    "            } catch (e) { reject(e); }",
+    "          });",
+    "        } else {",
+    "          throw new Error('unknown th kind: ' + item.kind);",
+    "        }",
+    "        await window.__sfThReport({ index: i, label: item.label, state: 'ok' });",
+    "        results.push({ index: i, ok: true });",
+    "      } catch (e) {",
+    "        var msg = String((e && e.message) || e);",
+    "        await window.__sfThReport({ index: i, label: item.label, state: 'error', detail: msg });",
+    "        results.push({ index: i, ok: false, error: msg });",
+    "      }",
+    "    }",
+    "    return results;",
+    "  };",
+    "  window.addEventListener('message', function(ev){",
+    "    var d = ev.data || {};",
+    "    if (!d || !d.__sf_th_host) return;",
+    "    if (d.type === 'run_scripts') {",
+    "      window.__sfThRunScripts(d.items || []).then(function(results){",
+    "        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, results: results }, '*');",
+    "      }).catch(function(err){",
+    "        parent.postMessage({ __sf_th_bridge: true, type: 'run_done', requestId: d.requestId, error: String((err && err.message) || err) }, '*');",
+    "      });",
+    "      return;",
+    "    }",
+    "    if (d.type === 'button') {",
+    "      try {",
+    "        var name = (d.payload && d.payload.name) || '';",
+    "        var th = window.TavernHelper || window.tavernHelper || {};",
+    "        if (typeof th.triggerSlash === 'function') { try { th.triggerSlash('/button ' + name); } catch (e1) {} }",
+    "        if (typeof window.triggerSlash === 'function') { try { window.triggerSlash('/button ' + name); } catch (e2) {} }",
+    "        if (typeof window.eventEmit === 'function') { window.eventEmit('th_button', d.payload || {}); }",
+    "        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: true }, '*');",
+    "      } catch (e) {",
+    "        parent.postMessage({ __sf_th_bridge: true, type: 'button_done', requestId: d.requestId, ok: false, error: String((e && e.message) || e) }, '*');",
+    "      }",
+    "    }",
+    "  });",
+    "  parent.postMessage({ __sf_th_bridge: true, type: 'ready' }, '*');",
+"  setTimeout(function(){ parent.postMessage({ __sf_th_bridge: true, type: 'ready' }, '*'); }, 50);",
+"  setTimeout(function(){ parent.postMessage({ __sf_th_bridge: true, type: 'ready' }, '*'); }, 250);",
+"})();",
+  ]
+  const body = lines.join('\n')
   return (
     '<!doctype html><html><head><meta charset="utf-8"/>' +
     '<style>html,body{margin:0;padding:0;background:transparent}</style>' +
@@ -500,7 +492,7 @@ function ensureStatuses() {
   }))
 }
 
-async function waitReady(timeoutMs = 15000) {
+async function waitReady(timeoutMs = 30000) {
   const start = Date.now()
   while (!iframeReady.value) {
     if (Date.now() - start > timeoutMs) throw new Error('TH iframe not ready')
@@ -549,7 +541,7 @@ async function runAll() {
     // reload iframe clean slate
     iframeReady.value = false
     setFrameHtml(bootstrapSrcdoc())
-    await waitReady(15000)
+    await waitReady(30000)
     if (seq !== runSeq) return
     const payload = []
     for (const s of scripts.value) {

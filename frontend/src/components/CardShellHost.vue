@@ -64,6 +64,9 @@ const error = ref(null)
 const loadedUrl = ref(null)
 let loadSeq = 0
 let bridgeHandler = null
+/** @type {Map<string, string>} host-side store for large inline modules */
+const inlineModuleSources = new Map()
+let inlineModuleSeq = 0
 
 const iframeStyle = computed(() => ({
   height: props.compact ? props.height || '96px' : props.height,
@@ -124,55 +127,10 @@ async function hostFetch(url) {
 
 
 /**
- * Host-mediate inline type=module scripts: fetch their import graph as same-origin blobs
- * and rewrite absolute/relative import specs so sandbox can execute without free network.
+ * Replace inline type=module scripts with iframe-local importer calls.
+ * Parent-origin blob: URLs are opaque to the shell iframe.
  */
-async function hostModuleBlobGraph(entryUrl, code, cache = new Map(), depth = 0) {
-  if (depth > 14) throw new Error('shell module graph too deep: ' + entryUrl)
-  if (cache.has(entryUrl)) return cache.get(entryUrl)
-  cache.set(entryUrl, null)
-  if (code == null) {
-    const res = await hostFetch(entryUrl)
-    if (res.kind !== 'text' || res.body_text == null) throw new Error('module not text: ' + entryUrl)
-    code = res.body_text
-  }
-  const re = /(?:\bfrom\s+|\bimport\s*\(?|\bimport\s+)['"`]([^'"`]+)['"`]/g
-  const specs = new Set()
-  let m
-  while ((m = re.exec(code)) !== null) {
-    const spec = m[1]
-    if (!spec) continue
-    if (spec.startsWith('http://') || spec.startsWith('https://') || spec.startsWith('.') || spec.startsWith('/')) {
-      specs.add(spec)
-    }
-  }
-  const rewriteMap = new Map()
-  for (const spec of specs) {
-    let abs = spec
-    if (spec.startsWith('.') || spec.startsWith('/')) {
-      try { abs = new URL(spec, entryUrl).href } catch { continue }
-    }
-    try {
-      const child = await hostModuleBlobGraph(abs, null, cache, depth + 1)
-      if (child) rewriteMap.set(spec, child)
-    } catch (e) {
-      console.warn('[CardShell] dep fetch failed', abs, e)
-    }
-  }
-  if (rewriteMap.size) {
-    code = code.replace(re, (full, spec) => {
-      if (!rewriteMap.has(spec)) return full
-      return full.replace(spec, rewriteMap.get(spec))
-    })
-  }
-  const blob = new Blob([code], { type: 'text/javascript' })
-  const blobUrl = URL.createObjectURL(blob)
-  cache.set(entryUrl, blobUrl)
-  return blobUrl
-}
-
 async function rewriteModuleScriptsInHtml(html, pageUrl) {
-  // Match inline type=module scripts (avoid raw "</" + "script>" text in this SFC).
   const sc = 'script'
   const re = new RegExp(
     '<' + sc + '\\b([^>]*?\\btype\\s*=\\s*["\']module["\'][^>]*)>([\\s\\S]*?)</' + sc + '>',
@@ -181,40 +139,35 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
   const parts = []
   let last = 0
   let match
-  const tasks = []
+  let n = 0
+  // Clear previous sources for this load path
+  // (caller may invoke prepare multiple times; keys are unique via seq)
   while ((match = re.exec(html)) !== null) {
     const attrs = match[1] || ''
     if (/\bsrc\s*=/i.test(attrs)) continue
     const code = match[2] || ''
     if (!code.trim()) continue
-    const start = match.index
-    const end = re.lastIndex
-    parts.push(html.slice(last, start))
-    const placeholder = `@@SF_MOD_${tasks.length}@@`
-    parts.push(placeholder)
-    last = end
+    parts.push(html.slice(last, match.index))
+    const id = 'mod_' + (++inlineModuleSeq)
+    inlineModuleSources.set(id, code)
     const entry = pageUrl || 'https://shell.local/inline-module.js'
-    tasks.push(
-      hostModuleBlobGraph(entry + '#mod' + tasks.length, code).then((blobUrl) => ({
-        placeholder,
-        // Await classic globals (Vue/jQuery) then import host-built blob graph.
-        tag:
-          '<' + sc + ' type="module">' +
-          'await (window.__sfShellPreloadPromise || Promise.resolve());' +
-          'await import(' + JSON.stringify(blobUrl) + ');' +
-          '</' + sc + '>',
-      })),
-    )
+    // Tiny module stub: fetch source from host by id, then run graph in iframe origin.
+    const tag =
+      '<' + sc + ' type="module">' +
+      'await (window.__sfShellPreloadPromise || Promise.resolve());' +
+      'await window.__sfShellRunInlineModuleFromHost(' +
+      JSON.stringify(id) +
+      ', ' +
+      JSON.stringify(entry + '#' + id) +
+      ');' +
+      '</' + sc + '>'
+    parts.push(tag)
+    last = re.lastIndex
+    n += 1
   }
-  if (!tasks.length) return html
+  if (!n) return html
   parts.push(html.slice(last))
-  const joined = parts.join('')
-  const resolved = await Promise.all(tasks)
-  let out = joined
-  for (const r of resolved) {
-    out = out.replace(r.placeholder, r.tag)
-  }
-  return out
+  return parts.join('')
 }
 
 async function prepareShellDocument(html, pageUrl) {
@@ -238,127 +191,206 @@ function wrapRemoteHtml(html, pageUrl) {
     baseHref = pageUrl || ''
   }
   const baseTag = baseHref ? `<base href="${baseHref}">` : ''
-  const bridgeBody = `
-(function(){
-  'use strict';
-  var PAGE = ${JSON.stringify(pageUrl || '')};
-  function ask(type, payload){
-    return new Promise(function(resolve, reject){
-      var id = 'sf_' + Math.random().toString(36).slice(2);
-      function onMsg(ev){
-        var d = ev.data || {};
-        if (!d || d.__sf_shell_bridge_res !== id) return;
-        window.removeEventListener('message', onMsg);
-        if (d.error) reject(new Error(d.error));
-        else resolve(d.result);
-      }
-      window.addEventListener('message', onMsg);
-      parent.postMessage({ __sf_shell_bridge: true, id: id, type: type, payload: payload || {} }, '*');
-      setTimeout(function(){ window.removeEventListener('message', onMsg); reject(new Error('shell bridge timeout')); }, 60000);
-    });
-  }
-  window.__sfHostFetchText = function(url){ return ask('fetch_text', { url: url }); };
-  window.__sfHostFetchDataUrl = function(url){ return ask('fetch_data_url', { url: url }); };
+  const pageJson = JSON.stringify(pageUrl || '')
 
-  function patch$(){
-    if (!window.jQuery || window.jQuery.__sfLoadPatched) return !!window.jQuery;
-    var $ = window.jQuery;
-    $.fn.load = function(url, data, complete){
-      var self = this;
-      var cb = complete;
-      if (typeof data === 'function') { cb = data; data = undefined; }
-      var href = url;
-      if (typeof url === 'string' && url.indexOf(' ') >= 0) href = url.split(' ')[0];
-      window.__sfHostFetchText(href).then(function(html){
-        try { self.html(html); } catch (e) {}
-        if (typeof cb === 'function') cb.call(self, html, 'success', null);
-      }).catch(function(err){
-        if (typeof cb === 'function') cb.call(self, null, 'error', err);
-        console.error('[CardShell] $.load failed', href, err);
-      });
-      return self;
-    };
-    $.getScript = function(url, success){
-      return window.__sfHostFetchText(url).then(function(code){
-        var s = document.createElement('script');
-        s.text = code;
-        document.head.appendChild(s);
-        if (typeof success === 'function') success();
-      });
-    };
-    $.__sfLoadPatched = true;
-    return true;
-  }
-  patch$();
-  var obs = new MutationObserver(function(){ patch$(); });
-  obs.observe(document.documentElement, { childList: true, subtree: true });
-  var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);
+  // Bridge as string joins so regex escapes are not corrupted by template literals.
+  const bridgeLines = [
+    "(function(){",
+    "  'use strict';",
+    "  var PAGE = " + pageJson + ";",
+    "  function ask(type, payload){",
+    "    return new Promise(function(resolve, reject){",
+    "      var id = 'sf_' + Math.random().toString(36).slice(2);",
+    "      function onMsg(ev){",
+    "        var d = ev.data || {};",
+    "        if (!d || d.__sf_shell_bridge_res !== id) return;",
+    "        window.removeEventListener('message', onMsg);",
+    "        if (d.error) reject(new Error(d.error));",
+    "        else resolve(d.result);",
+    "      }",
+    "      window.addEventListener('message', onMsg);",
+    "      parent.postMessage({ __sf_shell_bridge: true, id: id, type: type, payload: payload || {} }, '*');",
+    "      setTimeout(function(){ window.removeEventListener('message', onMsg); reject(new Error('shell bridge timeout')); }, 120000);",
+    "    });",
+    "  }",
+    "  window.__sfHostFetchText = function(url){ return ask('fetch_text', { url: url }); };",
+    "  window.__sfHostFetchDataUrl = function(url){ return ask('fetch_data_url', { url: url }); };",
+    "  window.__sfShellLocalBlobs = [];",
+    "  window.__sfShellModuleCache = Object.create(null);",
+    "  window.__sfShellSourceToBlob = function(code){",
+    "    var blob = new Blob([code], { type: 'text/javascript' });",
+    "    var u = URL.createObjectURL(blob);",
+    "    window.__sfShellLocalBlobs.push(u);",
+    "    return u;",
+    "  };",
+    "  window.__sfShellImportSpecRe = function(){",
+    "    var bs = String.fromCharCode(92);",
+    "    var sq = String.fromCharCode(39);",
+    "    var dq = String.fromCharCode(34);",
+    "    var qcls = sq + dq;",
+    "    var pat = '(?:' + bs + 'bfrom' + bs + 's+|' + bs + 'bimport' + bs + 's*' + bs + '(?|' + bs + 'bimport' + bs + 's+)[' + qcls + ']([^' + qcls + ']+)[' + qcls + ']';",
+    "    return new RegExp(pat, 'g');",
+    "  };",
+    "  window.__sfShellResolveModuleBlob = async function(entryUrl){",
+    "    async function load(url){",
+    "      if (window.__sfShellModuleCache[url]) return window.__sfShellModuleCache[url];",
+    "      window.__sfShellModuleCache[url] = (async function(){",
+    "        var code = await window.__sfHostFetchText(url);",
+    "        var re = window.__sfShellImportSpecRe();",
+    "        var specs = [];",
+    "        var m;",
+    "        while ((m = re.exec(code)) !== null) {",
+    "          var spec = m[1];",
+    "          if (!spec) continue;",
+    "          if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
+    "        }",
+    "        var map = Object.create(null);",
+    "        for (var i = 0; i < specs.length; i++) {",
+    "          var sp = specs[i];",
+    "          var abs = sp;",
+    "          if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, url).href; } catch (e) { continue; } }",
+    "          try { map[sp] = await load(abs); } catch (e) { console.warn('[CardShell] dep fail', abs, e); }",
+    "        }",
+    "        if (Object.keys(map).length) {",
+    "          re = window.__sfShellImportSpecRe();",
+    "          code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
+    "        }",
+    "        return window.__sfShellSourceToBlob(code);",
+    "      })();",
+    "      return window.__sfShellModuleCache[url];",
+    "    }",
+    "    return load(entryUrl);",
+    "  };",
+    "  window.__sfShellImportUrl = async function(entryUrl){",
+    "    var blobUrl = await window.__sfShellResolveModuleBlob(entryUrl);",
+    "    return import(blobUrl);",
+    "  };",
+    "  window.__sfShellRunInlineModuleFromHost = async function(id, entryUrl){",
+"    var code = await ask('fetch_inline_module', { id: id });",
+"    return window.__sfShellRunInlineModule(code, entryUrl);",
+"  };",
+"  window.__sfShellRunInlineModule = async function(code, entryUrl){",
+    "    var re = window.__sfShellImportSpecRe();",
+    "    var specs = [];",
+    "    var m;",
+    "    while ((m = re.exec(code)) !== null) {",
+    "      var spec = m[1];",
+    "      if (!spec) continue;",
+    "      if (spec.indexOf('http://') === 0 || spec.indexOf('https://') === 0 || spec.charAt(0) === '.' || spec.charAt(0) === '/') specs.push(spec);",
+    "    }",
+    "    var map = Object.create(null);",
+    "    for (var i = 0; i < specs.length; i++) {",
+    "      var sp = specs[i];",
+    "      var abs = sp;",
+    "      if (sp.charAt(0) === '.' || sp.charAt(0) === '/') { try { abs = new URL(sp, entryUrl || 'https://shell.local/inline.js').href; } catch (e) { continue; } }",
+    "      try { map[sp] = await window.__sfShellResolveModuleBlob(abs); } catch (e) { console.warn('[CardShell] inline dep fail', abs, e); }",
+    "    }",
+    "    if (Object.keys(map).length) {",
+    "      re = window.__sfShellImportSpecRe();",
+    "      code = code.replace(re, function(full, spec){ return map[spec] ? full.replace(spec, map[spec]) : full; });",
+    "    }",
+    "    var blobUrl = window.__sfShellSourceToBlob(code);",
+    "    return import(blobUrl);",
+    "  };",
+    "  function patch$(){",
+    "    if (!window.jQuery || window.jQuery.__sfLoadPatched) return !!window.jQuery;",
+    "    var $ = window.jQuery;",
+    "    $.fn.load = function(url, data, complete){",
+    "      var self = this;",
+    "      var cb = complete;",
+    "      if (typeof data === 'function') { cb = data; data = undefined; }",
+    "      var href = url;",
+    "      if (typeof url === 'string' && url.indexOf(' ') >= 0) href = url.split(' ')[0];",
+    "      window.__sfHostFetchText(href).then(function(html){",
+    "        try { self.html(html); } catch (e) {}",
+    "        if (typeof cb === 'function') cb.call(self, html, 'success', null);",
+    "      }).catch(function(err){",
+    "        if (typeof cb === 'function') cb.call(self, null, 'error', err);",
+    "        console.error('[CardShell] $.load failed', href, err);",
+    "      });",
+    "      return self;",
+    "    };",
+    "    $.getScript = function(url, success){",
+    "      return window.__sfHostFetchText(url).then(function(code){",
+    "        var s = document.createElement('script');",
+    "        s.text = code;",
+    "        document.head.appendChild(s);",
+    "        if (typeof success === 'function') success();",
+    "      });",
+    "    };",
+    "    $.__sfLoadPatched = true;",
+    "    return true;",
+    "  }",
+    "  patch$();",
+    "  var obs = new MutationObserver(function(){ patch$(); });",
+    "  obs.observe(document.documentElement, { childList: true, subtree: true });",
+    "  var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);",
+    "  var V = window.__sfShellVars || (window.__sfShellVars = {});",
+    "  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };",
+    "  window.setvar = function(k, v){",
+    "    V[k] = v;",
+    "    try { parent.postMessage({ __sf_shell_bridge: true, type: 'var_write', payload: { key: k, value: v } }, '*'); } catch (e) {}",
+    "    return v;",
+    "  };",
+    "  window.getChatVariable = window.getvar;",
+    "  window.setChatVariable = window.setvar;",
+    "  window.TavernHelper = window.TavernHelper || {",
+    "    getVariable: window.getvar,",
+    "    setVariable: window.setvar,",
+    "    getVariables: function(){ return Object.assign({}, V); },",
+    "    getCharWorldbookNames: function(){ return { primary: null }; },",
+    "    getWorldbook: async function(){ return []; },",
+    "    updateWorldbookWith: async function(){ return []; },",
+    "  };",
+    "  window.tavernHelper = window.TavernHelper;",
+    "})();",
+  ]
+  const preloadLines = [
+    "(function(){",
+    "  window.__sfShellPreloadPromise = (async function(){",
+    "    async function classic(url, pred){",
+    "      var code = await window.__sfHostFetchText(url);",
+    "      var s = document.createElement('script');",
+    "      s.text = code;",
+    "      document.head.appendChild(s);",
+    "      if (pred && !pred()) throw new Error('preload failed: ' + url);",
+    "    }",
+    "    if (!window.jQuery) {",
+    "      await classic('https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', function(){ return !!window.jQuery; });",
+    "      window.$ = window.jQuery;",
+    "    }",
+    "    if (!window.Vue) {",
+    "      await classic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });",
+    "    }",
+    "    if (!window._) {",
+    "      try { await classic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; }); } catch (e) { console.warn(e); }",
+    "    }",
+    "  })();",
+    "})();",
+  ]
+  const fetchPatchLines = [
+    "(function(){",
+    "  var nativeFetch = window.fetch ? window.fetch.bind(window) : null;",
+    "  window.fetch = function(input, init){",
+    "    try {",
+    "      var url = (typeof input === 'string') ? input : (input && input.url);",
+    "      if (url && (String(url).indexOf('http://') === 0 || String(url).indexOf('https://') === 0)) {",
+    "        return window.__sfHostFetchText(String(url)).then(function(text){",
+    "          return new Response(text, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });",
+    "        });",
+    "      }",
+    "    } catch (e) {}",
+    "    if (nativeFetch) return nativeFetch(input, init);",
+    "    return Promise.reject(new Error('fetch unavailable'));",
+    "  };",
+    "})();",
+  ]
 
-  var V = window.__sfShellVars || (window.__sfShellVars = {});
-  window.getvar = function(k, d){ return V[k] !== undefined ? V[k] : d; };
-  window.setvar = function(k, v){
-    V[k] = v;
-    try {
-      parent.postMessage({ __sf_shell_bridge: true, type: 'var_write', payload: { key: k, value: v } }, '*');
-    } catch (e) {}
-    return v;
-  };
-  window.getChatVariable = window.getvar;
-  window.setChatVariable = window.setvar;
-  window.TavernHelper = window.TavernHelper || {
-    getVariable: window.getvar,
-    setVariable: window.setvar,
-    getVariables: function(){ return Object.assign({}, V); },
-    getCharWorldbookNames: function(){ return { primary: null }; },
-    getWorldbook: async function(){ return []; },
-    updateWorldbookWith: async function(){ return []; },
-  };
-  window.tavernHelper = window.TavernHelper;
-})();
-`
-  const preloadBody = `
-(function(){
-  window.__sfShellPreloadPromise = (async function(){
-    async function classic(url, pred){
-      var code = await window.__sfHostFetchText(url);
-      var s = document.createElement('script');
-      s.text = code;
-      document.head.appendChild(s);
-      if (pred && !pred()) throw new Error('preload failed: ' + url);
-    }
-    if (!window.jQuery) {
-      await classic('https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js', function(){ return !!window.jQuery; });
-      window.$ = window.jQuery;
-    }
-    if (!window.Vue) {
-      await classic('https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js', function(){ return !!window.Vue; });
-    }
-    if (!window._) {
-      try {
-        await classic('https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js', function(){ return !!window._; });
-      } catch (e) { console.warn(e); }
-    }
-  })();
-})();
-`
-  const fetchPatchBody = `
-(function(){
-  var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
-  window.fetch = function(input, init){
-    try {
-      var url = (typeof input === 'string') ? input : (input && input.url);
-      if (url && (String(url).indexOf('http://') === 0 || String(url).indexOf('https://') === 0)) {
-        return window.__sfHostFetchText(String(url)).then(function(text){
-          return new Response(text, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
-        });
-      }
-    } catch (e) {}
-    if (nativeFetch) return nativeFetch(input, init);
-    return Promise.reject(new Error('fetch unavailable'));
-  };
-})();
-`
-  const headInject = baseTag + sOpen + bridgeBody + sClose + sOpen + preloadBody + sClose + sOpen + fetchPatchBody + sClose
+  const headInject =
+    baseTag +
+    sOpen + bridgeLines.join('\n') + sClose +
+    sOpen + preloadLines.join('\n') + sClose +
+    sOpen + fetchPatchLines.join('\n') + sClose
 
   let doc = html || ''
   const hasHtml = /<html[\s>]/i.test(doc)
@@ -392,6 +424,7 @@ function wrapRemoteHtml(html, pageUrl) {
 async function loadShell() {
   const seq = ++loadSeq
   error.value = null
+  inlineModuleSources.clear()
   loadedUrl.value = null
   loading.value = true
   try {
@@ -477,6 +510,14 @@ async function onBridgeMessage(ev) {
             btoa(unescape(encodeURIComponent(res.body_text))),
         )
       } else throw new Error('empty')
+      return
+    }
+    if (type === 'fetch_inline_module') {
+      const id = payload.id
+      if (!id || !inlineModuleSources.has(id)) {
+        throw new Error('unknown inline module id: ' + id)
+      }
+      reply(inlineModuleSources.get(id))
       return
     }
     emit('message', d)
