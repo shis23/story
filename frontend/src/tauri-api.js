@@ -915,6 +915,46 @@ export async function getCharacterWorldInfo(characterId) {
   return { campaign_id: `card:${characterId}`, entry_count: 0, constant_count: 0, selective_count: 0, entries: [] }
 }
 
+
+// ─── Card Shell（可见壳 + 宿主代持）────────────────────────────────────────
+
+/** 从角色卡 extensions/regex/tavern_helper 提取壳清单 */
+export async function getCardShellManifest(characterId) {
+  if (isTauri()) {
+    return await invoke('get_card_shell_manifest', { characterId })
+  }
+  return {
+    character_id: characterId,
+    shells: [],
+    remote_urls: [],
+    opening_home_url: null,
+    opening_custom_url: null,
+    status_bar_url: null,
+  }
+}
+
+export async function cardShellListAllowedHosts() {
+  if (isTauri()) {
+    return await invoke('card_shell_list_allowed_hosts')
+  }
+  return []
+}
+
+export async function cardShellAllowHost(host) {
+  if (isTauri()) {
+    return await invoke('card_shell_allow_host', { host })
+  }
+}
+
+/** 宿主代持拉取远程壳资源；失败抛错（不静默降级） */
+export async function cardShellFetchUrl(url) {
+  if (isTauri()) {
+    return await invoke('card_shell_fetch_url', { url })
+  }
+  throw new Error('card shell fetch requires Tauri host')
+}
+
+
 /** 获取当前活跃 Campaign */
 export async function getActiveCampaign() {
   if (isTauri()) {

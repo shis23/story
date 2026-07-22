@@ -106,6 +106,11 @@ const forward = (name) => (p) => emit(name, p)
           />
         </div>
 
+        <!-- 可见 Card Shell（开场/状态等）由生产 adapter 经 #shell 注入；design 层不 import 功能组件 -->
+        <div class="mx-auto w-full max-w-[760px] px-4 sm:px-8">
+          <slot name="shell" />
+        </div>
+
         <template v-if="showStory">
           <StoryPage
             :title="title"

@@ -1,6 +1,8 @@
 # Campaign 世界书 + 完整 Card Shell WebView
 
-> 状态：执行中（2026-07-22）  
+> 状态：执行中（2026-07-22）
+>
+> **进度**：Phase 0–2 已落地（活动世界书存储/UI、卡只读、Meta 写活动书）。Phase 3–4 已落地提取器 + allowlist 缓存 + 可见 `CardShellHost`（写作屏 #shell 挂 status/opening）。Phase 5–7（display 分流、TH 顺序执行、证据截图）进行中。  
 > 硬约束：**不接受降级**（禁止用纯文本开场 / 禁网隐藏 iframe / 仅声明式状态栏冒充完成）。  
 > 金标卡：仓库根 `test-card.png`（命定之诗与黄昏之歌 v4.1）。
 

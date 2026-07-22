@@ -1,4 +1,5 @@
 pub mod campaign_store;
+mod card_shell_cache;
 mod compress_job_store;
 mod connection_store;
 pub mod error;
@@ -142,6 +143,13 @@ fn get_global_regex_store() -> &'static global_regex_store::GlobalRegexStore {
 
 static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new();
 static COMPRESS_JOB_STORE: OnceLock<compress_job_store::CompressJobStore> = OnceLock::new();
+
+
+fn get_card_shell_cache() -> &'static card_shell_cache::CardShellCache {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<card_shell_cache::CardShellCache> = OnceLock::new();
+    CACHE.get_or_init(|| card_shell_cache::CardShellCache::new(&get_app_data_dir()))
+}
 
 fn get_campaign_store() -> &'static campaign_store::CampaignStore {
     let store = CAMPAIGN_STORE.get_or_init(|| {
@@ -10779,6 +10787,74 @@ fn get_character_world_info(character_id: String) -> Result<CampaignWorldInfoDto
 }
 
 /// 若 `campaign_id` 是当前活跃活动，则把本局世界书写入 tool_ctx（写作注入真相源）。
+
+// ─── Card Shell manifest + host-mediated fetch ─────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardShellManifestDto {
+    pub character_id: String,
+    pub shells: Vec<serde_json::Value>,
+    pub remote_urls: Vec<String>,
+    pub opening_home_url: Option<String>,
+    pub opening_custom_url: Option<String>,
+    pub status_bar_url: Option<String>,
+}
+
+#[tauri::command]
+fn get_card_shell_manifest(character_id: String) -> Result<CardShellManifestDto, TauriCommandError> {
+    let stored = get_store()
+        .get(&character_id)
+        .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
+        .ok_or_else(|| TauriCommandError::not_found(format!("角色卡不存在: {character_id}")))?;
+    let character = stored_info_to_character(&stored);
+    let manifest = storyforge_domain::card_shell::extract_card_shell_manifest(&character);
+    Ok(CardShellManifestDto {
+        character_id: stored.id.clone(),
+        shells: manifest
+            .shells
+            .iter()
+            .filter_map(|s| serde_json::to_value(s).ok())
+            .collect(),
+        remote_urls: manifest.remote_urls.clone(),
+        opening_home_url: manifest.opening_home_url().map(|s| s.to_string()),
+        opening_custom_url: manifest.opening_custom_url().map(|s| s.to_string()),
+        status_bar_url: manifest.status_bar_url().map(|s| s.to_string()),
+    })
+}
+
+#[tauri::command]
+fn card_shell_list_allowed_hosts() -> Vec<String> {
+    get_card_shell_cache().list_allowed_hosts()
+}
+
+#[tauri::command]
+fn card_shell_allow_host(host: String) -> Result<(), TauriCommandError> {
+    if host.trim().is_empty() {
+        return Err(TauriCommandError::validation("host 为空"));
+    }
+    get_card_shell_cache().allow_host(&host);
+    Ok(())
+}
+
+/// 宿主代持拉取远程壳资源（allowlist + 磁盘缓存）。失败显式返回错误，不降级为空成功。
+#[tauri::command]
+fn card_shell_fetch_url(url: String) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
+    let cache = get_card_shell_cache();
+    let client = cache
+        .build_client()
+        .map_err(|e| TauriCommandError::internal(e))?;
+    cache
+        .fetch_blocking_with_client(&url, &client)
+        .map_err(|e| {
+            if e.contains("allowlist") {
+                TauriCommandError::validation(e)
+            } else {
+                TauriCommandError::internal(e)
+            }
+        })
+}
+
+
 fn apply_campaign_world_info_to_tool_ctx(
     state: &AppState,
     campaign_id: &Id,
@@ -12003,6 +12079,10 @@ pub fn run() {
             delete_campaign_world_info_entry,
             set_campaign_world_info_route,
             get_character_world_info,
+            get_card_shell_manifest,
+            card_shell_list_allowed_hosts,
+            card_shell_allow_host,
+            card_shell_fetch_url,
             get_active_turn_quality,
             // P3 Meta Agent / MVU 五合一 / ST 预设分类
             meta_start_conversation,

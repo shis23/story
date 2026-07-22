@@ -55,6 +55,7 @@ import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 // 保留原位(未迁移 v2,功能简单/隐藏运行时):
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
+import CardShellHost from './components/CardShellHost.vue'
 import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
 import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
@@ -83,6 +84,8 @@ import {
   listInstances,
   listPlugins,
   logAppendFrontend,
+  getCardShellManifest,
+  getCard,
 } from './tauri-api.js'
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
@@ -168,11 +171,50 @@ function setupConsoleForwarding() {
 }
 
 // ─── 视图滚动桥：WritingScreen 暴露 scrollToBottom，AppV2 转发为函数引用 ───
-  const writingScreenRef = ref(null)
-  function scrollToBottom() {
-    // 写作屏仅在 write 视图存在；其他视图调用为 no-op
-    writingScreenRef.value?.scrollToBottom?.()
+const writingScreenRef = ref(null)
+function scrollToBottom() {
+  // 写作屏仅在 write 视图存在；其他视图调用为 no-op
+  writingScreenRef.value?.scrollToBottom?.()
+}
+
+// ─── 可见 Card Shell（开场/状态；宿主代持远程）──────────────────────────
+const cardShellStatusUrl = ref(null)
+const cardShellOpeningUrl = ref(null)
+const cardShellLabel = ref('')
+const cardShellLoading = ref(false)
+
+async function refreshCardShellManifest() {
+  cardShellStatusUrl.value = null
+  cardShellOpeningUrl.value = null
+  cardShellLabel.value = ''
+  let characterId =
+    campaign.activeChar?.id ||
+    campaign.activeCharDetail?.id ||
+    campaign.activeCharDetail?.source_character_id ||
+    null
+  // 活动路径：从 card_id 反查 source_character_id
+  if (!characterId && campaign.activeCampaign?.card_id) {
+    try {
+      const card = await getCard(campaign.activeCampaign.card_id)
+      characterId = card?.source_character_id || null
+    } catch (e) {
+      console.error('getCard for shell manifest:', e)
+    }
   }
+  if (!characterId) return
+  cardShellLoading.value = true
+  try {
+    const m = await getCardShellManifest(characterId)
+    cardShellStatusUrl.value = m?.status_bar_url || null
+    // 优先首页；无则自定义开局
+    cardShellOpeningUrl.value = m?.opening_home_url || m?.opening_custom_url || null
+    cardShellLabel.value = m?.character_id || characterId
+  } catch (e) {
+    console.error('getCardShellManifest:', e)
+  } finally {
+    cardShellLoading.value = false
+  }
+}
 
 // ─── 功能面板 refs + 事件桥 ───
 // CampaignPanel ref：MetaPanel mvu-applied 后调用其 refreshActiveDetailTab（App.vue:56-61 链）
@@ -203,6 +245,7 @@ async function handleSelectChar(char) {
   campaign.activeChar = char
   campaign.currentConversationId = null
   await loadCharDetail(char.id)
+  await refreshCardShellManifest()
   broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
     characterId: char.id,
     name: char.name,
@@ -369,6 +412,7 @@ onMounted(async () => {
     campaign.activeCampaign = await getActiveCampaign()
     await loadInstanceNameMap()
     await hydrateActiveTurnQuality()
+    await refreshCardShellManifest()
   } catch (e) { console.error('getActiveCampaign:', e) }
   await loadSidebarPlugins()
   setupConsoleForwarding()
@@ -441,7 +485,25 @@ onMounted(async () => {
         class="h-full min-h-0"
         v-bind="writingScreenProps"
         v-on="writingScreenEvents"
-      />
+      >
+        <template #shell>
+          <div v-if="cardShellStatusUrl || cardShellOpeningUrl" class="space-y-2 pb-2">
+            <CardShellHost
+              v-if="cardShellStatusUrl"
+              :url="cardShellStatusUrl"
+              label="状态栏壳"
+              compact
+              height="110px"
+            />
+            <CardShellHost
+              v-if="cardShellOpeningUrl && (!writing.messages || writing.messages.length <= 1)"
+              :url="cardShellOpeningUrl"
+              label="开场壳"
+              height="420px"
+            />
+          </div>
+        </template>
+      </WritingScreen>
     </template>
 
     <template #composer>
@@ -475,7 +537,7 @@ onMounted(async () => {
         v-if="ui.showCampaignPanel"
         ref="campaignPanelRef"
         @close="ui.showCampaignPanel = false; ui.showSidebar = true"
-        @campaign-changed="(c) => { campaign.activeCampaign = c; loadInstanceNameMap() }"
+        @campaign-changed="(c) => { campaign.activeCampaign = c; loadInstanceNameMap(); refreshCardShellManifest() }"
       />
 
       <!-- Meta 面板 -->
