@@ -106,9 +106,9 @@ const forward = (name) => (p) => emit(name, p)
           />
         </div>
 
-        <!-- 可见 Card Shell（开场/状态等）由生产 adapter 经 #shell 注入；design 层不 import 功能组件 -->
-        <div class="mx-auto w-full max-w-[760px] px-4 sm:px-8">
-          <slot name="shell" />
+        <!-- 完整开场独立成章，置于故事稿纸之前；design 层不 import 功能组件。 -->
+        <div v-if="$slots.opening" class="mx-auto w-full max-w-[980px] px-4 sm:px-8 pt-6 pb-2">
+          <slot name="opening" />
         </div>
 
         <template v-if="showStory">
@@ -133,7 +133,11 @@ const forward = (name) => (p) => emit(name, p)
             @delete-variant="forward('delete-variant')"
             @add-variant="forward('add-variant')"
             @branch="forward('branch')"
-          />
+          >
+            <template #after-messages>
+              <slot name="after-messages" />
+            </template>
+          </StoryPage>
           <div class="mx-auto w-full max-w-[760px] px-4 sm:px-8 pb-6">
             <ProcessTimeline v-if="hasReview" :pipeline="pipeline" />
           </div>

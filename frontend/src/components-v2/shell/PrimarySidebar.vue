@@ -179,6 +179,11 @@ function clickNew() {
       </div>
     </nav>
 
+    <!-- 运行诊断属于工作台侧栏，不占叙事正文的阅读流。 -->
+    <div v-if="$slots.runtime" class="shrink-0 border-t border-line bg-surface/35 px-3 py-3">
+      <slot name="runtime" :docked="docked" />
+    </div>
+
     <!-- 底部：主题切换 -->
     <div class="shrink-0 border-t border-line p-3">
       <button

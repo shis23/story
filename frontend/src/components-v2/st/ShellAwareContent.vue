@@ -6,7 +6,7 @@
  *
  * design 层仍可只注入 contentComponent=本组件；不破坏 MessageItem 契约。
  */
-import { computed } from 'vue'
+import { computed, inject } from 'vue'
 import RichContent from './RichContent.vue'
 import CardShellHost from '../../components/CardShellHost.vue'
 import { extractShellMountsFromDisplay } from '../../utils/cardShellDisplay.js'
@@ -20,7 +20,19 @@ const props = defineProps({
 const parsed = computed(() => extractShellMountsFromDisplay(props.content))
 const mounts = computed(() => parsed.value.mounts)
 const residual = computed(() => parsed.value.residualText)
-const hasShell = computed(() => mounts.value.length > 0)
+const messageShellLayout = inject('storyforgeCardShellLayout', null)
+const suppressedMessageShellUrls = computed(() => {
+  const source = messageShellLayout?.suppressedMessageShellUrls
+  const value = source && typeof source === 'object' && 'value' in source
+    ? source.value
+    : source
+  return Array.isArray(value) ? value : []
+})
+const renderedMounts = computed(() =>
+  mounts.value.filter((mount) => !suppressedMessageShellUrls.value.includes(mount.url)),
+)
+const hasParsedShell = computed(() => mounts.value.length > 0)
+const hasShell = computed(() => renderedMounts.value.length > 0)
 // Message-local shells are rendered outside AppV2's #shell slot. Bind them
 // explicitly to the active Campaign so their TavernHelper worldbook APIs use
 // the same persisted truth source as the visible status/opening shells.
@@ -49,7 +61,7 @@ function labelFor(kind) {
   <div class="shell-aware-content space-y-2">
     <template v-if="hasShell">
       <CardShellHost
-        v-for="(m, i) in mounts"
+        v-for="(m, i) in renderedMounts"
         :key="m.url + ':' + i"
         :url="m.url"
         :campaign-id="activeCampaignId"
@@ -57,15 +69,10 @@ function labelFor(kind) {
         :compact="compactFor(m.kind)"
         :height="heightFor(m.kind)"
       />
-      <RichContent
-        v-if="residual"
-        :content="residual"
-        :source-content="sourceContent"
-      />
     </template>
     <RichContent
-      v-else
-      :content="content"
+      v-if="residual || !hasParsedShell"
+      :content="hasParsedShell ? residual : content"
       :source-content="sourceContent"
     />
   </div>

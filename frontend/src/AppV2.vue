@@ -37,7 +37,7 @@
  *   - loadSidebarPlugins()         App.vue:113-127
  *   - setupConsoleForwarding()     App.vue:402-412
  */
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, provide } from 'vue'
 import AppFrame from './design/shell/AppFrame.vue'
 import PrimarySidebar from './components-v2/shell/PrimarySidebar.vue'
 import TopBar from './components-v2/shell/TopBar.vue'
@@ -192,6 +192,18 @@ const cardShellThCount = ref(0)
 const cardShellCharacterId = ref(null)
 const shellVarAudit = createVariableWriteAudit(40)
 const shellVarAuditTick = ref(0)
+
+// The page-level opening and status surfaces own their slots in the reading
+// layout. Suppress only matching display-content mounts so the same card shell
+// cannot appear once as a message iframe and once in its intended position.
+provide('storyforgeCardShellLayout', {
+  suppressedMessageShellUrls: computed(() => {
+    const urls = []
+    if (cardShellOpeningUrl.value) urls.push(cardShellOpeningUrl.value)
+    if (cardShellStatusUrl.value) urls.push(cardShellStatusUrl.value)
+    return urls
+  }),
+})
 
 async function onShellVarWrite(payload) {
   const campaignId = campaign.activeCampaign?.id || null
@@ -495,7 +507,19 @@ onMounted(async () => {
         @open-plugin="ui.showPluginPanel = true"
         @open-agent-profile="ui.showAgentProfile = true"
         @open-meta="ui.showMetaPanel = true"
-      />
+      >
+        <template #runtime>
+          <TavernHelperRuntime
+            v-if="cardShellThCount"
+            :shells="cardShellShells"
+            :character-id="cardShellCharacterId"
+            :show-status="true"
+            :auto-run="true"
+            placement="sidebar"
+            @var-write="onShellVarWrite"
+          />
+        </template>
+      </PrimarySidebar>
     </template>
 
     <template #topbar>
@@ -539,37 +563,32 @@ onMounted(async () => {
         v-bind="writingScreenProps"
         v-on="writingScreenEvents"
       >
-        <template #shell>
-          <div
-            v-if="cardShellStatusUrl || cardShellOpeningUrl || cardShellThCount"
-            class="space-y-2 pb-2"
-          >
+        <template #opening>
+          <CardShellHost
+            v-if="cardShellOpeningUrl"
+            :url="cardShellOpeningUrl"
+            :campaign-id="campaign.activeCampaign?.id || null"
+            label="序章"
+            height="min(68vh, 760px)"
+            root-class="overflow-hidden rounded-xl border border-line bg-surface shadow-rise"
+            @var-write="onShellVarWrite"
+          />
+        </template>
+        <template #after-messages>
+          <section v-if="cardShellStatusUrl" class="mt-6 border-t border-line pt-4">
+            <div class="mb-2 flex items-center gap-2 text-[11px] tracking-[0.12em] text-ink-faint">
+              <span class="h-px flex-1 bg-line"></span>
+              <span>当前状态</span>
+              <span class="h-px flex-1 bg-line"></span>
+            </div>
             <CardShellHost
-              v-if="cardShellStatusUrl"
               :url="cardShellStatusUrl"
               :campaign-id="campaign.activeCampaign?.id || null"
-              label="状态栏壳"
-              compact
-              height="110px"
+              label="状态栏"
+              height="300px"
               @var-write="onShellVarWrite"
             />
-            <CardShellHost
-              v-if="cardShellOpeningUrl && (!writing.messages || writing.messages.length <= 1)"
-              :url="cardShellOpeningUrl"
-              :campaign-id="campaign.activeCampaign?.id || null"
-              label="开场壳"
-              height="420px"
-              @var-write="onShellVarWrite"
-            />
-            <TavernHelperRuntime
-              v-if="cardShellThCount"
-              :shells="cardShellShells"
-              :character-id="cardShellCharacterId"
-              :show-status="true"
-              :auto-run="true"
-              @var-write="onShellVarWrite"
-            />
-          </div>
+          </section>
         </template>
       </WritingScreen>
     </template>

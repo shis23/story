@@ -6,35 +6,44 @@
   <div class="tavern-helper-runtime" :class="{ 'sr-only-runtime': !showStatus }">
     <div
       v-if="showStatus"
-      class="text-[11px] px-2 py-1 border border-line rounded-md bg-surface-2/40 text-ink-soft space-y-0.5"
+      class="text-[11px] border border-line rounded-md bg-surface-2/40 text-ink-soft"
+      :class="isSidebar ? 'px-2.5 py-2 shadow-card' : 'px-2 py-1 space-y-0.5'"
     >
       <div class="flex items-center gap-2">
         <span class="font-medium text-ink">TavernHelper</span>
         <span>{{ summary }}</span>
         <button
+          v-if="isSidebar"
           type="button"
-          class="ml-auto underline text-accent"
+          class="ml-auto px-1.5 py-0.5 rounded text-[10px] text-ink-soft hover:bg-surface hover:text-ink"
+          @click="detailsOpen = !detailsOpen"
+        >{{ detailsOpen ? '收起' : '详情' }}</button>
+        <button
+          type="button"
+          class="underline text-accent"
           :disabled="running"
           @click="runAll"
         >
           {{ running ? '执行中…' : '重新执行' }}
         </button>
       </div>
-      <div v-for="(s, i) in statuses" :key="i" class="truncate" :class="statusClass(s.state)">
-        {{ i + 1 }}. {{ s.label }} — {{ s.state }}{{ s.detail ? ` · ${s.detail}` : '' }}
+      <div v-if="!isSidebar || detailsOpen" class="mt-1 space-y-0.5">
+        <div v-for="(s, i) in statuses" :key="i" class="truncate" :class="statusClass(s.state)">
+          {{ i + 1 }}. {{ s.label }} — {{ s.state }}{{ s.detail ? ` · ${s.detail}` : '' }}
+        </div>
+        <div v-if="visibleButtons.length" class="flex flex-wrap gap-1 pt-1">
+          <button
+            v-for="b in visibleButtons"
+            :key="b.name + ':' + b.scriptIndex"
+            type="button"
+            class="min-h-6 px-2 rounded border border-line bg-surface text-[11px] text-ink hover:border-accent-border hover:text-accent disabled:opacity-40"
+            :disabled="running || !iframeReady"
+            :title="b.scriptLabel"
+            @click="invokeButton(b)"
+          >{{ b.name }}</button>
+        </div>
+        <div v-if="lastWriteHint" class="text-[10px] text-ink-faint truncate">变量出站：{{ lastWriteHint }}</div>
       </div>
-      <div v-if="visibleButtons.length" class="flex flex-wrap gap-1 pt-1">
-        <button
-          v-for="b in visibleButtons"
-          :key="b.name + ':' + b.scriptIndex"
-          type="button"
-          class="min-h-6 px-2 rounded border border-line bg-surface text-[11px] text-ink hover:border-accent-border hover:text-accent disabled:opacity-40"
-          :disabled="running || !iframeReady"
-          :title="b.scriptLabel"
-          @click="invokeButton(b)"
-        >{{ b.name }}</button>
-      </div>
-      <div v-if="lastWriteHint" class="text-[10px] text-ink-faint truncate">变量出站：{{ lastWriteHint }}</div>
       <div v-if="lastError" class="text-err break-words">{{ lastError }}</div>
     </div>
     <iframe
@@ -65,6 +74,8 @@ const props = defineProps({
   showStatus: { type: Boolean, default: true },
   /** Auto-run when shells change */
   autoRun: { type: Boolean, default: true },
+  /** Sidebar presentation keeps diagnostics compact until expanded. */
+  placement: { type: String, default: 'inline' },
 })
 
 const emit = defineEmits(['done', 'error', 'var-write', 'status'])
@@ -78,12 +89,14 @@ const statuses = ref([])
 const lastError = ref(null)
 const iframeReady = ref(false)
 const lastWriteHint = ref('')
+const detailsOpen = ref(false)
 let runSeq = 0
 let bridgeHandler = null
 const blobUrls = []
 
 const scripts = computed(() => orderedTavernHelperFromShells(props.shells))
 const visibleButtons = computed(() => collectVisibleThButtons(scripts.value))
+const isSidebar = computed(() => props.placement === 'sidebar')
 const summary = computed(() => {
   const n = scripts.value.length
   if (!n) return '无脚本'

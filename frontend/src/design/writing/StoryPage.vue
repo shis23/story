@@ -109,6 +109,9 @@ function rolesFor(message) {
           v-on="messageEvents"
         />
 
+        <!-- 当前状态紧随最后一条剧情，不抢占开场与正文的阅读顺序。 -->
+        <slot v-if="messages.length" name="after-messages" />
+
         <StreamingBody
           v-if="showPipeline && isWriting"
           :pipeline="pipeline"
