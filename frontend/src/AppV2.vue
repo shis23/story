@@ -37,7 +37,7 @@
  *   - loadSidebarPlugins()         App.vue:113-127
  *   - setupConsoleForwarding()     App.vue:402-412
  */
-import { ref, computed, onMounted, provide } from 'vue'
+import { ref, computed, onMounted, provide, watch } from 'vue'
 import AppFrame from './design/shell/AppFrame.vue'
 import PrimarySidebar from './components-v2/shell/PrimarySidebar.vue'
 import TopBar from './components-v2/shell/TopBar.vue'
@@ -56,7 +56,7 @@ import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import CardShellHost from './components/CardShellHost.vue'
-import CardShellDisclosure from './components/CardShellDisclosure.vue'
+import CardShellFloatingStatus from './components/CardShellFloatingStatus.vue'
 import TavernHelperRuntime from './components/TavernHelperRuntime.vue'
 import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
@@ -194,9 +194,26 @@ const cardShellThCount = ref(0)
 const cardShellCharacterId = ref(null)
 const shellVarAudit = createVariableWriteAudit(40)
 const shellVarAuditTick = ref(0)
+const openingShellArmed = ref(false)
+
+function armCardShellOpening() {
+  openingShellArmed.value = true
+}
+
+function disarmCardShellOpening() {
+  openingShellArmed.value = false
+}
+
+watch(
+  () => [writing.messages.length, writing.isWriting],
+  ([messageCount, isWriting]) => {
+    if (messageCount > 1 || isWriting) disarmCardShellOpening()
+  },
+)
+
 const showCardShellOpening = computed(() => shouldShowOpeningShell({
   openingUrl: cardShellOpeningUrl.value,
-  conversationId: campaign.currentConversationId,
+  openingArmed: openingShellArmed.value,
   messageCount: writing.messages.length,
   isWriting: writing.isWriting,
 }))
@@ -298,11 +315,13 @@ async function handleSelectChar(char) {
     writing.messages = []
     campaign.currentConversationId = null
     writing.selectedGreetingIndex = 0
+    disarmCardShellOpening()
     broadcastChatChanged('character_cleared')
     return
   }
   campaign.activeChar = char
   campaign.currentConversationId = null
+  armCardShellOpening()
   await loadCharDetail(char.id)
   await refreshCardShellManifest()
   broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
@@ -342,6 +361,7 @@ const conversation = useConversation({
   loadInstanceNameMap,
   loadCharDetail,
   applySelectedOpeningMessage: greeting.applySelectedOpeningMessage,
+  onConversationOpened: disarmCardShellOpening,
 })
 const {
   applyConversation,
@@ -401,6 +421,7 @@ const newCampaignForm = useNewCampaignForm({
   applyConversation,
   broadcastPluginEvent,
   loadConversationHistory,
+  openingShellStarted: armCardShellOpening,
   alertDialog,
 })
 const { openNewCampaignDialog } = newCampaignForm
@@ -452,6 +473,7 @@ const { openNewCampaignDialog } = newCampaignForm
       return
     }
 
+    armCardShellOpening()
     ui.viewWrite()
   }
 
@@ -584,18 +606,6 @@ onMounted(async () => {
             @var-write="onShellVarWrite"
           />
         </template>
-        <template #after-messages>
-          <CardShellDisclosure v-if="cardShellStatusUrl" label="当前状态">
-            <CardShellHost
-              :url="cardShellStatusUrl"
-              :campaign-id="campaign.activeCampaign?.id || null"
-              label="状态栏"
-              height="300px"
-              :show-status-line="false"
-              @var-write="onShellVarWrite"
-            />
-          </CardShellDisclosure>
-        </template>
       </WritingScreen>
     </template>
 
@@ -608,6 +618,20 @@ onMounted(async () => {
     </template>
 
     <template #panels>
+      <CardShellFloatingStatus
+        v-if="ui.currentView === 'write' && cardShellStatusUrl"
+      >
+        <CardShellHost
+          :url="cardShellStatusUrl"
+          :campaign-id="campaign.activeCampaign?.id || null"
+          label="状态栏"
+          height="100%"
+          root-class="h-full"
+          :show-status-line="false"
+          @var-write="onShellVarWrite"
+        />
+      </CardShellFloatingStatus>
+
       <!-- ═══ 管理面板（每个用 ui.show* 控制；close 同时关面板并恢复侧栏） ═══ -->
 
       <!-- 角色卡列表（保留原位组件,未迁 v2） -->
@@ -667,6 +691,7 @@ onMounted(async () => {
         :apply-conversation="applyConversation"
         :broadcast-plugin-event="broadcastPluginEvent"
         :load-conversation-history="loadConversationHistory"
+        :opening-shell-started="armCardShellOpening"
         :alert-dialog="alertDialog"
         @update:show="(v) => { newCampaignForm.showNewCampaignForm.value = v }"
         @close="newCampaignForm.showNewCampaignForm.value = false"

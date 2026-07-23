@@ -38,6 +38,7 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   applyConversation?: (conv: object) => void,
  *   broadcastPluginEvent?: (event: string, data?: object) => void,
  *   loadConversationHistory?: () => Promise<void> | void,
+ *   openingShellStarted?: (conversationId: string | null) => void,
  *   alertDialog?: (message: string) => Promise<void> | void,
  * }} [options]
  */
@@ -50,6 +51,7 @@ export function useNewCampaignForm(options = {}) {
   const applyConversation = options.applyConversation || (() => {})
   const broadcastPluginEvent = options.broadcastPluginEvent || (() => {})
   const loadConversationHistory = options.loadConversationHistory || (() => {})
+  const openingShellStarted = options.openingShellStarted || (() => {})
   const alertDialog = options.alertDialog || ((msg) => { console.error('alertDialog(未注入):', msg) })
 
   // 来源 App.vue:530-538
@@ -135,6 +137,7 @@ export function useNewCampaignForm(options = {}) {
           })
         }
       }
+      openingShellStarted(result.conversation_id || null)
       uiStore.showHistory = false // 切到写作视图
       await loadConversationHistory()
     } catch (e) {

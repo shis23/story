@@ -150,3 +150,14 @@ Campaign 世界书路径可运行；不宣称未被该卡使用的全部 SillyTa
 - `npm run test:all`：**346 Node tests + 46 Vitest tests** 通过。
 - `npm run build`：通过。
 - 代码复审：通过。
+
+## 2026-07-23 最终交互设计（最新）
+
+- **序章显示授权收紧**：仅由“新建 Campaign”“选择角色”或“继续写作时尚未有会话”的流程
+  显式授权显示；历史会话一律不显示序章。
+- **状态栏入口与生命周期**：状态栏改为右下悬浮球；点击后以项目的 Headless UI `Dialog`
+  全屏展开，关闭时卸载其 iframe。
+- **Dialog 交互保证**：使用 portal 与背景遮罩，并支持 Esc/backdrop 关闭和焦点管理。
+
+质量记录保持：`npm run test:all` **346 Node tests + 46 Vitest tests** 通过；
+`npm run build` 通过；最终代码审查通过。

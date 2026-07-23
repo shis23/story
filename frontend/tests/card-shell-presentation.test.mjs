@@ -2,11 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { normalizeShellHeight, shouldShowOpeningShell } from '../src/utils/cardShellPresentation.js'
 
-test('shows the opening shell only before a conversation has begun', () => {
+test('keeps the opening shell available for the first story message', () => {
   assert.equal(
     shouldShowOpeningShell({
       openingUrl: 'https://example.test/home/index.html',
-      conversationId: null,
+      conversationId: 'conversation-created-with-opening',
+      openingArmed: true,
       messageCount: 1,
       isWriting: false,
     }),
@@ -14,12 +15,12 @@ test('shows the opening shell only before a conversation has begun', () => {
   )
 })
 
-test('hides the opening shell once story writing has begun', () => {
+test('hides the opening shell once the story moves past its first message', () => {
   const openingUrl = 'https://example.test/home/index.html'
 
-  assert.equal(shouldShowOpeningShell({ openingUrl, conversationId: 'conv-1', messageCount: 1 }), false)
-  assert.equal(shouldShowOpeningShell({ openingUrl, conversationId: null, messageCount: 2 }), false)
-  assert.equal(shouldShowOpeningShell({ openingUrl, conversationId: null, messageCount: 1, isWriting: true }), false)
+  assert.equal(shouldShowOpeningShell({ openingUrl, openingArmed: true, messageCount: 2 }), false)
+  assert.equal(shouldShowOpeningShell({ openingUrl, openingArmed: true, messageCount: 1, isWriting: true }), false)
+  assert.equal(shouldShowOpeningShell({ openingUrl, openingArmed: false, messageCount: 1 }), false)
 })
 
 test('uses a safe natural iframe height instead of a short fixed pane', () => {

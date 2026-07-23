@@ -5,11 +5,11 @@
  */
 export function shouldShowOpeningShell({
   openingUrl,
-  conversationId = null,
+  openingArmed = false,
   messageCount = 0,
   isWriting = false,
 } = {}) {
-  return Boolean(openingUrl) && !conversationId && messageCount <= 1 && !isWriting
+  return Boolean(openingUrl) && openingArmed && messageCount <= 1 && !isWriting
 }
 
 /** Keep automatic shell height safe without turning it back into a tiny pane. */

@@ -35,6 +35,7 @@ export function useConversation(handlers = {}) {
   const loadInstanceNameMap = handlers.loadInstanceNameMap
   const loadCharDetail = handlers.loadCharDetail
   const applySelectedOpeningMessage = handlers.applySelectedOpeningMessage
+  const onConversationOpened = handlers.onConversationOpened || (() => {})
 
   // applyConversation(App.vue:416-438):node 数据 → messages 数组转换,写入 writingStore.messages。
   // 复用点:恢复对话、重 roll 后刷新、删除后刷新(单一事实源,避免前端臆测 variant 数组)。
@@ -115,6 +116,7 @@ export function useConversation(handlers = {}) {
       const conv = await getConversation(convSummary.id)
       if (!conv) return
 
+      onConversationOpened(convSummary)
       applyConversation(conv)
       campaign.currentConversationId = convSummary.id
       ui.showHistory = false

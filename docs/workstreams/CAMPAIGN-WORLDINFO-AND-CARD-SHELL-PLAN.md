@@ -230,3 +230,16 @@ d547dd7 feat(card-shell): ordered tavern_helper runtime
 - `npm run test:all`：**346 Node tests + 46 Vitest tests** 通过。
 - `npm run build`：通过。
 - 代码复审：通过。
+
+---
+
+## 2026-07-23 最终交互设计（最新）
+
+1. **序章的显式授权条件**：仅“新建 Campaign”“选择角色”以及“继续写作但尚未有会话”三种
+   流程可显示序章；历史会话不显示序章。
+2. **状态栏的按需全屏入口**：状态栏改为右下悬浮球。点击后使用项目的 Headless UI `Dialog`
+   全屏展开；关闭时卸载状态栏 iframe。
+3. **Dialog 行为**：Dialog 使用 portal 与背景遮罩，支持 Esc/backdrop 关闭及焦点管理。
+
+质量记录保持不变：`npm run test:all` **346 Node tests + 46 Vitest tests** 通过；
+`npm run build` 通过；最终代码审查通过。

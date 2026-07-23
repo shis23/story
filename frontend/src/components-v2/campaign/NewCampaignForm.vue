@@ -15,6 +15,7 @@ const props = defineProps({
   applyConversation: { type: Function, default: () => {} },
   broadcastPluginEvent: { type: Function, default: () => {} },
   loadConversationHistory: { type: Function, default: () => {} },
+  openingShellStarted: { type: Function, default: () => {} },
   alertDialog: { type: Function, default: null },
 })
 const emit = defineEmits(['update:show', 'close', 'created'])
@@ -25,6 +26,7 @@ const form = useNewCampaignForm({
   applyConversation: props.applyConversation,
   broadcastPluginEvent: props.broadcastPluginEvent,
   loadConversationHistory: props.loadConversationHistory,
+  openingShellStarted: props.openingShellStarted,
   alertDialog: props.alertDialog,
 })
 
