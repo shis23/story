@@ -56,6 +56,7 @@ import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 import CharacterList from './components/CharacterList.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import CardShellHost from './components/CardShellHost.vue'
+import CardShellDisclosure from './components/CardShellDisclosure.vue'
 import TavernHelperRuntime from './components/TavernHelperRuntime.vue'
 import PluginHost from './components/PluginHost.vue'
 import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
@@ -94,6 +95,7 @@ import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
 import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
 import { findLatestCampaignConversation } from './utils/overviewNavigation.js'
+import { shouldShowOpeningShell } from './utils/cardShellPresentation.js'
 
 // ─── stores ───
 const writing = useWritingStore()
@@ -192,6 +194,12 @@ const cardShellThCount = ref(0)
 const cardShellCharacterId = ref(null)
 const shellVarAudit = createVariableWriteAudit(40)
 const shellVarAuditTick = ref(0)
+const showCardShellOpening = computed(() => shouldShowOpeningShell({
+  openingUrl: cardShellOpeningUrl.value,
+  conversationId: campaign.currentConversationId,
+  messageCount: writing.messages.length,
+  isWriting: writing.isWriting,
+}))
 
 // The page-level opening and status surfaces own their slots in the reading
 // layout. Suppress only matching display-content mounts so the same card shell
@@ -561,34 +569,32 @@ onMounted(async () => {
         ref="writingScreenRef"
         class="h-full min-h-0"
         v-bind="writingScreenProps"
+        :show-opening="showCardShellOpening"
         v-on="writingScreenEvents"
       >
         <template #opening>
           <CardShellHost
-            v-if="cardShellOpeningUrl"
+            v-if="showCardShellOpening"
             :url="cardShellOpeningUrl"
             :campaign-id="campaign.activeCampaign?.id || null"
             label="序章"
-            height="min(68vh, 760px)"
+            height="760px"
+            :auto-height="true"
             root-class="overflow-hidden rounded-xl border border-line bg-surface shadow-rise"
             @var-write="onShellVarWrite"
           />
         </template>
         <template #after-messages>
-          <section v-if="cardShellStatusUrl" class="mt-6 border-t border-line pt-4">
-            <div class="mb-2 flex items-center gap-2 text-[11px] tracking-[0.12em] text-ink-faint">
-              <span class="h-px flex-1 bg-line"></span>
-              <span>当前状态</span>
-              <span class="h-px flex-1 bg-line"></span>
-            </div>
+          <CardShellDisclosure v-if="cardShellStatusUrl" label="当前状态">
             <CardShellHost
               :url="cardShellStatusUrl"
               :campaign-id="campaign.activeCampaign?.id || null"
               label="状态栏"
               height="300px"
+              :show-status-line="false"
               @var-write="onShellVarWrite"
             />
-          </section>
+          </CardShellDisclosure>
         </template>
       </WritingScreen>
     </template>

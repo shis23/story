@@ -34,6 +34,8 @@ const props = defineProps({
   qualityAcceptHint: { type: String, default: null },
   contentComponent: { type: [Object, Function, String], default: null },
   subagentRolesByMessage: { type: Object, default: () => ({}) },
+  /** Whether the caller has an active setup-only opening shell to render. */
+  showOpening: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
@@ -107,7 +109,7 @@ const forward = (name) => (p) => emit(name, p)
         </div>
 
         <!-- 完整开场独立成章，置于故事稿纸之前；design 层不 import 功能组件。 -->
-        <div v-if="$slots.opening" class="mx-auto w-full max-w-[980px] px-4 sm:px-8 pt-6 pb-2">
+        <div v-if="showOpening && $slots.opening" class="mx-auto w-full max-w-[980px] px-4 sm:px-8 pt-6 pb-2">
           <slot name="opening" />
         </div>
 

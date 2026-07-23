@@ -5,7 +5,7 @@
   -->
   <div class="card-shell-host w-full min-h-0 flex flex-col" :class="rootClass">
     <div
-      v-if="statusLine"
+      v-if="statusLine && (showStatusLine || error)"
       class="shrink-0 px-2 py-1 text-[11px] border-b border-line"
       :class="error ? 'text-err bg-err/10' : 'text-ink-soft bg-surface-2/50'"
     >
@@ -55,6 +55,7 @@ import {
   mapCampaignWorldbookForTavernHelper,
   resolveCampaignWorldbookEnabledUpdates,
 } from '../utils/cardShellWorldbook.js'
+import { normalizeShellHeight } from '../utils/cardShellPresentation.js'
 import {
   generateBridgeScript,
   createHostHandler,
@@ -74,6 +75,10 @@ const props = defineProps({
   height: { type: String, default: '280px' },
   /** compact status bar mode */
   compact: { type: Boolean, default: false },
+  /** Let setup-only shells grow to their actual document height. */
+  autoHeight: { type: Boolean, default: false },
+  /** Loading labels are useful in freeform shells but noisy inside a disclosure. */
+  showStatusLine: { type: Boolean, default: true },
   /** extra class on root */
   rootClass: { type: String, default: '' },
 })
@@ -87,6 +92,7 @@ let frameBlobUrl = null
 const loading = ref(false)
 const error = ref(null)
 const loadedUrl = ref(null)
+const measuredHeight = ref(null)
 let loadSeq = 0
 let bridgeHandler = null
 let stHostHandler = null
@@ -115,7 +121,9 @@ function nextBridgeSession() {
 }
 
 const iframeStyle = computed(() => ({
-  height: props.compact ? props.height || '96px' : props.height,
+  height: props.autoHeight && measuredHeight.value
+    ? `${measuredHeight.value}px`
+    : props.compact ? props.height || '96px' : props.height,
   minHeight: props.compact ? '72px' : '120px',
 }))
 
@@ -568,6 +576,27 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
     "})();",
   ]
 
+  // The sandboxed blob iframe cannot be measured from its parent. Report its
+  // document height over the existing session-bound shell bridge instead.
+  const resizeReporterLines = [
+    '(function(){',
+    '  var queued = false;',
+    '  function report(){',
+    '    queued = false;',
+    '    var root = document.documentElement;',
+    '    var body = document.body;',
+    '    var h = Math.max(root ? root.scrollHeight : 0, body ? body.scrollHeight : 0, root ? root.offsetHeight : 0, body ? body.offsetHeight : 0);',
+    "    try { parent.postMessage({ __sf_shell_bridge: true, shellSession: window.__sfShellBridgeSession, type: 'shell_resize', payload: { height: h } }, '*'); } catch (_) {}",
+    '  }',
+    '  function schedule(){ if (!queued) { queued = true; requestAnimationFrame(report); } }',
+    "  if (typeof ResizeObserver === 'function') { new ResizeObserver(schedule).observe(document.documentElement); }",
+    '  if (document.body && typeof MutationObserver === "function") { new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true }); }',
+    "  window.addEventListener('load', schedule);",
+    '  setTimeout(schedule, 0);',
+    '  setTimeout(schedule, 500);',
+    '})();',
+  ]
+
   // Existing full ST/TavernHelper/SillyTavern surface from plugin-bridge (do not reimplement).
   const stBridgeHtml = generateBridgeScript(shellPluginId, '*')
   const headInject =
@@ -578,7 +607,8 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
       worldbookName: props.campaignId ? `storyforge:campaign:${props.campaignId}` : '',
     }) + sClose +
     sOpen + preloadLines.join('\n') + sClose +
-    sOpen + fetchPatchLines.join('\n') + sClose
+    sOpen + fetchPatchLines.join('\n') + sClose +
+    sOpen + resizeReporterLines.join('\n') + sClose
 
   let doc = html || ''
   const hasHtml = /<html[\s>]/i.test(doc)
@@ -614,6 +644,7 @@ async function loadShell() {
   const bridgeSession = nextBridgeSession()
   activeBridgeSession = bridgeSession
   error.value = null
+  measuredHeight.value = null
   inlineModuleSources.clear()
   loadedUrl.value = null
   loading.value = true
@@ -663,6 +694,13 @@ async function onBridgeMessage(ev) {
     return
   }
   if (!isCardShellBridgeMessageForSession(ev, activeBridgeSession)) return
+  if (d.type === 'shell_resize') {
+    if (props.autoHeight) {
+      const height = normalizeShellHeight(d.payload?.height)
+      if (height) measuredHeight.value = height
+    }
+    return
+  }
   if (d.type === 'var_write') {
     emit('message', d)
     emit('var-write', d.payload || {})

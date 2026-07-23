@@ -12,11 +12,12 @@ const StoryPageStub = {
   `,
 }
 
-function mountWritingScreen() {
+function mountWritingScreen(showOpening = true) {
   return mount(WritingScreen, {
     props: {
       title: '命定之诗',
       messages: [{ id: 'assistant-1' }],
+      showOpening,
     },
     slots: {
       opening: '<section data-testid="opening-shell">完整开场</section>',
@@ -43,5 +44,11 @@ describe('WritingScreen runtime placement', () => {
 
     expect(opening.element.compareDocumentPosition(story.element) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(status.element.previousElementSibling?.dataset.testid).toBe('story-messages')
+  })
+
+  it('removes the opening shell container once setup is over', () => {
+    const wrapper = mountWritingScreen(false)
+
+    expect(wrapper.find('[data-testid="opening-shell"]').exists()).toBe(false)
   })
 })
