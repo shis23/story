@@ -57,6 +57,26 @@ impl TurnStore {
             .cloned()
     }
 
+    /// V7 幂等重放：按 variant 查已终态提交的 Turn。
+    ///
+    /// `get_turn_by_variant` 只看 active attempt——commit 后重复 accept 会
+    /// 查空。这里只命中「终态 + accepted attempt 正是该 variant」的 Turn，
+    /// 供 accept 幂等重放使用；Superseded/Stale 的同 variant 记录不会命中。
+    pub fn get_committed_turn_by_variant(&self, variant_id: &Id) -> Option<TurnRecord> {
+        let turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+        turns
+            .iter()
+            .find(|t| {
+                matches!(t.status, TurnStatus::Committed | TurnStatus::Degraded)
+                    && t.accepted_attempt_id.as_ref().is_some_and(|aid| {
+                        t.attempts
+                            .iter()
+                            .any(|a| &a.attempt_id == aid && &a.variant_id == variant_id)
+                    })
+            })
+            .cloned()
+    }
+
     /// 列出所有需要恢复的 Turn（status == Committing）。
     ///
     /// 启动恢复用：这些 Turn 的 MutationBatch 可能已部分写入，需要幂等重放。

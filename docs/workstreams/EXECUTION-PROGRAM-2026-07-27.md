@@ -44,11 +44,17 @@
   「从空白开始（解冻）」或「稍后手动修复（保持只读保护）」；
   tmp 恢复事件仅提示条。注意：m5 `hard_deadline_covers_final_context_fill_boundary`
   因 fsync 每轮成本上升改为宽 deadline + 动态睡过期限（时序脆弱性根除）。
-- [ ] **V7** 在售 bug 三件：①`sqlite_runtime.rs:484-496` 按子串 `e.contains("revision")`
-  分类错误 → DB 完整性损坏被报成"回合过期"，改 typed error 跨边界；
-  ②重复 accept 语义分歧：JSON 拒绝 vs SQLite 幂等 Ok——**统一为幂等 Ok**（评审判定
-  更优，SQLite 的 AlreadyCommitted replay 是有意为之）；③sqlite_runtime.rs:380-406
-  内联质量门改调 domain `quality_accept_decision`。完整共享状态机抽取排后（周级）。
+- [x] **V7** 三件 → **已修**：①infra-sqlite 新增 typed
+  `SqliteError::RevisionConflict {campaign, turn_base, expected, target}`，
+  accept_turn 的 revision CAS 用它；sqlite_runtime 适配层按类型匹配分类
+  （integrity 分歧不再被子串 "revision" 误报成回合过期），RevisionConflict
+  现携带真实 base/current。②重复 accept 统一幂等 Ok：JSON 路径
+  `get_committed_turn_by_variant`（turn_store，只命中终态+accepted attempt
+  的 variant）回退查找 + accept_by_variant 幂等重放分支（复用 attempt 上保留的
+  pending_state_changes 重建 AcceptOutcome，零盘上副作用）；测试
+  `duplicate_accept_replays_idempotently_after_commit` 断言重放输出与首次一致
+  且 revision 只 bump 一次。③SQLite 内联质量门改调 domain
+  `quality_accept_decision`（与 JSON 路径同源）。完整共享状态机抽取排后（周级）。
 
 ### P1 发布门禁
 

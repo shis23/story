@@ -617,13 +617,12 @@ impl SqliteProductionRepository {
             || campaign.revision != request.batch.expected_revision
             || request.batch.target_revision != request.batch.expected_revision.saturating_add(1)
         {
-            return Err(SqliteError::Conflict(format!(
-                "revision conflict: campaign={}, turn_base={}, expected={}, target={}",
-                campaign.revision,
-                turn.base_campaign_revision,
-                request.batch.expected_revision,
-                request.batch.target_revision
-            )));
+            return Err(SqliteError::RevisionConflict {
+                campaign: campaign.revision,
+                turn_base: turn.base_campaign_revision,
+                expected: request.batch.expected_revision,
+                target: request.batch.target_revision,
+            });
         }
 
         let mut conversation: Conversation = load_payload_tx(

@@ -366,14 +366,31 @@ impl<'a> TurnLifecycleService<'a> {
         variant_id: &Id,
         force_accept: bool,
     ) -> Result<AcceptOutcome, AcceptError> {
-        let turn = self
-            .turn_store
-            .get_turn_by_variant(variant_id)
-            .ok_or(AcceptError::NoTurnRecord)?;
-        let attempt = turn
-            .find_attempt_by_variant(variant_id)
-            .ok_or(AcceptError::NoAttempt)?
-            .clone();
+        // 常规路径查 active attempt；查空时回退终态查找（V7 幂等重放）：
+        // commit 后 attempt 已非 active，重复 accept 需要能定位到已提交记录。
+        let (turn, attempt) = match self.turn_store.get_turn_by_variant(variant_id) {
+            Some(turn) => {
+                let attempt = turn
+                    .find_attempt_by_variant(variant_id)
+                    .ok_or(AcceptError::NoAttempt)?
+                    .clone();
+                (turn, attempt)
+            }
+            None => {
+                let turn = self
+                    .turn_store
+                    .get_committed_turn_by_variant(variant_id)
+                    .ok_or(AcceptError::NoTurnRecord)?;
+                let attempt = turn
+                    .accepted_attempt_id
+                    .as_ref()
+                    .and_then(|aid| turn.find_attempt(aid))
+                    .filter(|a| a.variant_id == *variant_id)
+                    .cloned()
+                    .ok_or(AcceptError::NoAttempt)?;
+                (turn, attempt)
+            }
+        };
 
         if &turn.campaign_id != campaign_id {
             return Err(AcceptError::CampaignScopeMismatch {
@@ -385,6 +402,31 @@ impl<'a> TurnLifecycleService<'a> {
             return Err(AcceptError::ConversationScopeMismatch {
                 turn_conversation: turn.conversation_id.to_string(),
                 requested: conversation_id.to_string(),
+            });
+        }
+
+        // V7：重复 accept 幂等化——与 SQLite 的 AlreadyCommitted replay 对齐。
+        // 同一 attempt 已被采纳且 Turn 已终态：重放返回与首次一致的 AcceptOutcome，
+        // 不改任何盘上状态（网络重试/双击不再报 InvalidAttemptStatus）。
+        if attempt.status == AttemptStatus::Committed
+            && matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded)
+            && turn.accepted_attempt_id.as_ref() == Some(&attempt.attempt_id)
+        {
+            let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
+                AcceptError::Storage(format!(
+                    "terminal turn {} has no persisted MutationBatch for replay",
+                    turn.turn_id
+                ))
+            })?;
+            return Ok(AcceptOutcome {
+                turn_id: turn.turn_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                turn_status: turn.status.clone(),
+                attempt_status: AttemptStatus::Committed,
+                commit_as_degraded: turn.status == TurnStatus::Degraded,
+                campaign_revision_before: batch.expected_revision,
+                campaign_revision_after: batch.target_revision,
+                batch,
             });
         }
 
@@ -1094,9 +1136,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_accept_is_rejected_after_commit() {
+    fn duplicate_accept_replays_idempotently_after_commit() {
+        // V7：重复 accept 统一为幂等 Ok（对齐 SQLite AlreadyCommitted replay）。
+        // 网络重试/双击不再报错，且不产生任何第二次盘上副作用。
         let fx = Fixture::new("dup_accept");
-        let draft = "重复 accept 应被状态机拒绝。".repeat(3);
+        let draft = "重复 accept 幂等重放，不得二次提交。".repeat(3);
         let variant_id = fx.append_draft(&draft);
         fx.prepare_awaiting(
             &variant_id,
@@ -1104,23 +1148,21 @@ mod tests {
             Some(QualityReport { warnings: vec![] }),
             None,
         );
-        fx.service()
-            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
-            .unwrap();
-        let err = fx
+        let first = fx
             .service()
             .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
-            .expect_err("second accept must fail");
-        // After commit, no active attempt remains, so lookup by variant yields no TurnRecord/Attempt.
-        assert!(
-            matches!(
-                err,
-                AcceptError::NoTurnRecord
-                    | AcceptError::NoAttempt
-                    | AcceptError::InvalidAttemptStatus(_)
-            ),
-            "unexpected second-accept error: {err}"
-        );
+            .unwrap();
+        let replay = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
+            .expect("second accept must replay idempotently");
+        assert_eq!(replay.turn_id, first.turn_id);
+        assert_eq!(replay.attempt_id, first.attempt_id);
+        assert_eq!(replay.turn_status, TurnStatus::Committed);
+        assert_eq!(replay.attempt_status, AttemptStatus::Committed);
+        assert!(!replay.commit_as_degraded);
+        assert_eq!(replay.campaign_revision_before, first.campaign_revision_before);
+        assert_eq!(replay.campaign_revision_after, first.campaign_revision_after);
         let camp = fx.campaign_store.get_campaign(&fx.campaign_id).unwrap();
         assert_eq!(camp.revision, 1, "revision must bump only once");
     }

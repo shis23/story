@@ -44,6 +44,19 @@ pub enum SqliteError {
     #[error("production repository conflict: {0}")]
     Conflict(String),
 
+    /// Accept 的 revision CAS 失败（V7：typed 跨边界，适配层不得再按子串分类——
+    /// integrity 分歧等错误消息同样含 "revision" 字样，子串匹配会把 DB 损坏
+    /// 误报成"回合过期"）。
+    #[error(
+        "revision conflict: campaign={campaign}, turn_base={turn_base}, expected={expected}, target={target}"
+    )]
+    RevisionConflict {
+        campaign: u64,
+        turn_base: u64,
+        expected: u64,
+        target: u64,
+    },
+
     #[error("production repository record not found: {0}")]
     RecordNotFound(String),
 

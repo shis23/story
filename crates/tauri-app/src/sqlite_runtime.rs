@@ -12,7 +12,7 @@ use storyforge_app_conversation::{ConversationError, ConversationPersistence};
 use storyforge_domain::Id;
 use storyforge_domain::campaign::Campaign;
 use storyforge_domain::conversation::Conversation;
-use storyforge_domain::turn::{AttemptStatus, QualitySeverity, TurnRecord, TurnStatus};
+use storyforge_domain::turn::{AttemptStatus, TurnRecord, TurnStatus};
 use storyforge_infra_sqlite::Database;
 use storyforge_infra_sqlite::preaccept::{
     AutofixSyncRequest, DraftAttemptOutcome, DraftAttemptRequest, PostprocessApplyOutcome,
@@ -376,34 +376,18 @@ pub fn accept_by_variant(
         });
     }
 
-    // Quality gate: block errors unless force.
-    let commit_as_degraded = match attempt.quality_report.as_ref() {
-        Some(report)
-            if report
-                .warnings
-                .iter()
-                .any(|w| w.severity == QualitySeverity::Error)
-                && !force_accept =>
-        {
-            return Err(AcceptError::QualityBlocked {
-                error_count: report
-                    .warnings
-                    .iter()
-                    .filter(|w| w.severity == QualitySeverity::Error)
-                    .count(),
-            });
-        }
-        Some(report)
-            if report
-                .warnings
-                .iter()
-                .any(|w| w.severity == QualitySeverity::Error)
-                && force_accept =>
-        {
-            true
-        }
-        _ => false,
-    };
+    // Quality gate（V7：与 JSON 路径共用 domain 决策函数，杜绝两处内联实现漂移）。
+    let commit_as_degraded =
+        match storyforge_domain::turn::quality_accept_decision(
+            attempt.quality_report.as_ref(),
+            force_accept,
+        ) {
+            storyforge_domain::turn::QualityAcceptDecision::AllowCommit => false,
+            storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { .. } => true,
+            storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
+                return Err(AcceptError::QualityBlocked { error_count });
+            }
+        };
 
     let conversation = get_conversation(conversation_id)
         .map_err(AcceptError::Storage)?
@@ -471,6 +455,8 @@ pub fn accept_by_variant(
     })
     .map_err(AcceptError::Storage)?;
 
+    // V7：typed 错误跨边界分类。旧实现 `e.contains("revision")` 会把
+    // integrity 分歧（消息同样含 "revisions"）等 DB 损坏误报成"回合过期"。
     let outcome = with_db_mut(|db| {
         let request = AcceptTurnRequest {
             turn_id: &turn_id,
@@ -479,20 +465,20 @@ pub fn accept_by_variant(
             batch: &batch,
             terminal_status: terminal_status.clone(),
         };
-        SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
+        Ok(SqliteProductionRepository::accept_turn(db, request))
     })
-    .map_err(|e| {
-        // Map common conflict shapes.
-        if e.contains("revision") {
-            AcceptError::RevisionConflict {
-                base: campaign_revision_before,
-                current: campaign_revision_before,
-            }
-        } else if e.contains("not found") {
-            AcceptError::Storage(e)
-        } else {
-            AcceptError::Commit(e)
+    .map_err(AcceptError::Commit)?
+    .map_err(|e| match e {
+        storyforge_infra_sqlite::SqliteError::RevisionConflict {
+            campaign, turn_base, ..
+        } => AcceptError::RevisionConflict {
+            base: turn_base,
+            current: campaign,
+        },
+        storyforge_infra_sqlite::SqliteError::RecordNotFound(_) => {
+            AcceptError::Storage(e.to_string())
         }
+        other => AcceptError::Commit(other.to_string()),
     })?;
 
     let campaign_revision_after = get_campaign(&turn.campaign_id)
