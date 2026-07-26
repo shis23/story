@@ -4818,6 +4818,7 @@ fn build_mutation_batch(
         },
         outcome,
         present_chars,
+        &[],
     )
 }
 fn persist_postprocess_outcome_to_store(
@@ -4979,6 +4980,28 @@ pub fn normalize_knowledge_update_for_postprocess(
     present_ids: &std::collections::HashSet<String>,
     name_collisions: &std::collections::HashSet<String>,
 ) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
+    normalize_knowledge_update_for_postprocess_with_extras(
+        store,
+        camp_id,
+        update,
+        turn,
+        present_ids,
+        name_collisions,
+        &[],
+    )
+}
+
+/// V2 变体：`extra_instances` 是 attempt 上尚未落盘的临时角色，参与目标/来源解析。
+/// accept 时 `prepare_commit_batch` 前置 `UpsertInstance`，指向其 id 的条目落库安全。
+pub fn normalize_knowledge_update_for_postprocess_with_extras(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
+    turn: u32,
+    present_ids: &std::collections::HashSet<String>,
+    name_collisions: &std::collections::HashSet<String>,
+    extra_instances: &[storyforge_domain::campaign::CharacterInstance],
+) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
     use storyforge_domain::character_knowledge::PropagationPolicy;
 
     if update.propagation == PropagationPolicy::Private && update.broadcast.is_some() {
@@ -4994,11 +5017,16 @@ pub fn normalize_knowledge_update_for_postprocess(
 
     // 方向 1：广播分发——broadcast 非空时遍历 instances，每个生成一条 ToldByOther
     if let Some(ref broadcast) = update.broadcast {
-        return dispatch_broadcast(store, camp_id, update, turn, broadcast);
+        return dispatch_broadcast(store, camp_id, update, turn, broadcast, extra_instances);
     }
 
     // 非广播：单角色逻辑（原有 P3/P4 流程）
-    let target = match find_instance_by_name_or_id(store, camp_id, &update.character_id) {
+    let target = match find_instance_by_name_or_id_with_extras(
+        store,
+        camp_id,
+        &update.character_id,
+        extra_instances,
+    ) {
         Some(inst) => inst,
         None => {
             tracing::warn!(
@@ -5043,7 +5071,9 @@ pub fn normalize_knowledge_update_for_postprocess(
     let source_character_id = update
         .source_character_id
         .as_ref()
-        .and_then(|source_id| find_instance_by_name_or_id(store, camp_id, source_id))
+        .and_then(|source_id| {
+            find_instance_by_name_or_id_with_extras(store, camp_id, source_id, extra_instances)
+        })
         .map(|source| source.id);
     let source_knowledge_id =
         matching_source_knowledge_for_update(store, camp_id, update).map(|entry| entry.id);
@@ -5077,6 +5107,7 @@ fn dispatch_broadcast(
     update: &storyforge_domain::character_knowledge::CharacterKnowledgeUpdate,
     turn: u32,
     broadcast: &storyforge_domain::character_knowledge::BroadcastTarget,
+    extra_instances: &[storyforge_domain::campaign::CharacterInstance],
 ) -> Vec<storyforge_domain::character_knowledge::CharacterKnowledgeEntry> {
     use storyforge_domain::character_knowledge::BroadcastTarget;
 
@@ -5084,13 +5115,19 @@ fn dispatch_broadcast(
     let broadcaster_inst = update
         .source_character_id
         .as_ref()
-        .and_then(|sid| find_instance_by_name_or_id(store, camp_id, sid));
+        .and_then(|sid| find_instance_by_name_or_id_with_extras(store, camp_id, sid, extra_instances));
     let broadcaster_id = broadcaster_inst.as_ref().map(|i| i.id.clone());
     let source_character_id = broadcaster_id.clone();
     let source_knowledge_id =
         matching_source_knowledge_for_update(store, camp_id, update).map(|entry| entry.id);
 
-    let all_instances = store.list_instances(camp_id);
+    // V2: 未落盘临时角色也在广播受众内（本轮它们已是 campaign 成员，accept 时落库）
+    let mut all_instances = store.list_instances(camp_id);
+    for temp in extra_instances {
+        if temp.campaign_id == *camp_id && !all_instances.iter().any(|i| i.id == temp.id) {
+            all_instances.push(temp.clone());
+        }
+    }
 
     let targets: Vec<_> = match broadcast {
         BroadcastTarget::All => all_instances
@@ -5301,7 +5338,22 @@ pub(crate) fn find_instance_by_name_or_id(
     camp_id: &Id,
     name_or_id: &Id,
 ) -> Option<storyforge_domain::campaign::CharacterInstance> {
-    let instances = store.list_instances(camp_id);
+    find_instance_by_name_or_id_with_extras(store, camp_id, name_or_id, &[])
+}
+
+/// V2 变体：解析域 = 已持久化 instance + attempt 上未落盘的临时实例（按 id 去重）。
+pub(crate) fn find_instance_by_name_or_id_with_extras(
+    store: &campaign_store::CampaignStore,
+    camp_id: &Id,
+    name_or_id: &Id,
+    extra_instances: &[storyforge_domain::campaign::CharacterInstance],
+) -> Option<storyforge_domain::campaign::CharacterInstance> {
+    let mut instances = store.list_instances(camp_id);
+    for extra in extra_instances {
+        if extra.campaign_id == *camp_id && !instances.iter().any(|i| i.id == extra.id) {
+            instances.push(extra.clone());
+        }
+    }
     // 先精确 id 匹配
     if let Some(i) = instances.iter().find(|i| i.id == *name_or_id) {
         return Some(i.clone());

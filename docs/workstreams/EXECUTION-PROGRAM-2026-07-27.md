@@ -24,14 +24,15 @@
 - [x] **V1** regenerate present_chars 恒空 → **已修**（commit cd821d1）：
   `run_editor_and_commit`（app-pipeline，所有重 roll 粒度共同收尾）按
   start_writing 同语义填充 self.session；回归测试在 test_regenerate_full_with_hint。
-- [ ] **V2** 临时角色 postprocess 永久跳过（A.1 改版重新引入 Phase-6 bug）。修法（评审给定）：
-  postprocess 解析器补查 attempt 的 pending_temporary_instances（已带最终实例 id）——
-  JSON 路径：`production_postprocess.rs:939`（store.list_instances）与
-  `tauri-app/lib.rs:4862-4870`（normalize_knowledge_update_for_postprocess 跳过点）；
-  SQLite 路径：`build_runtime_mutation_batch`（production_postprocess.rs:1041-1199）
-  用的 pp_runtime 是**轮前快照**，with_temporaries_for 的 effective_runtime 未传播，
-  静默 skip 连 warn 都没有。修完**必须回写 CLAUDE.md 的 Phase 6 过期事实**
-  （现文写"临时实例在 postprocess 前落盘"——A.1 后已不成立）。
+- [x] **V2** 临时角色 postprocess 永久跳过 → **已修**：`apply_outcome` 从加载的
+  TurnRecord 取本 attempt 的 `pending_temporary_instances` 传入批构建；
+  JSON 路径经 `normalize_knowledge_update_for_postprocess_with_extras` +
+  `find_instance_by_name_or_id_with_extras`（原签名保留委托，~30 个测试调用点不动）；
+  SQLite 路径 `build_runtime_mutation_batch` 构建有效实例集（快照 + pending temps，
+  按 id 去重、跨 campaign 拒绝）。同名收紧与广播受众均计入 temps。
+  回归测试：`pending_temporary_instances_resolve_in_json_batch`（apply_outcome 全链路）
+  + `pending_temporary_instances_resolve_in_runtime_batch`（正反对照）。
+  CLAUDE.md Phase 6 过期事实已回写。
 - [ ] **V4** atomic_write 无 fsync/回退直写/损坏静默空集。修法：
   `crates/infra-util/src/lib.rs:22-36`——temp 文件 fsync 后 rename，rename 后 fsync
   父目录（Unix）；去掉直写回退（换 retry+硬错误）。损坏加载（campaign_store.rs:1192-1208

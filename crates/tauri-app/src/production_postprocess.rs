@@ -662,11 +662,16 @@ impl<'a> ProductionPostprocessService<'a> {
     }
 
     /// Build a Prepared MutationBatch (Chronicle A + candidates) without writing Campaign.
+    ///
+    /// `pending_temporary_instances`: attempt 上尚未落盘的临时角色（accept 时才经
+    /// `Mutation::UpsertInstance` 前置落库）。批构建阶段必须能解析它们，否则本轮
+    /// 临时角色的知识/变量目标会被静默跳过（V2）。
     pub fn build_mutation_batch(
         &self,
         persist_ctx: &PostprocessPersistContext,
         outcome: &PostProcessOutcome,
         present_chars: &[String],
+        pending_temporary_instances: &[storyforge_domain::campaign::CharacterInstance],
     ) -> Result<MutationBatch, ProductionPostprocessError> {
         match self.batch_source {
             MutationBatchSource::JsonStore(store) => Ok(build_json_mutation_batch(
@@ -674,6 +679,7 @@ impl<'a> ProductionPostprocessService<'a> {
                 persist_ctx,
                 outcome,
                 present_chars,
+                pending_temporary_instances,
             )),
             MutationBatchSource::Runtime(runtime) => {
                 if runtime.campaign.id != persist_ctx.campaign_id {
@@ -687,6 +693,7 @@ impl<'a> ProductionPostprocessService<'a> {
                     outcome,
                     present_chars,
                     runtime,
+                    pending_temporary_instances,
                 ))
             }
         }
@@ -745,10 +752,20 @@ impl<'a> ProductionPostprocessService<'a> {
             });
         }
 
+        // V2: attempt 上挂着的临时角色在 accept 前尚未进 store/runtime 快照，
+        // 批构建必须把它们纳入解析域，否则其知识/变量更新被静默丢弃。
+        let pending_temporary_instances: Vec<storyforge_domain::campaign::CharacterInstance> =
+            record
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == identity.attempt_id)
+                .map(|attempt| attempt.pending_temporary_instances.clone())
+                .unwrap_or_default();
+
         let batch = match &outcome {
             Some(o) => {
                 let pc = PostprocessPersistContext::from_identity(identity);
-                Some(self.build_mutation_batch(&pc, o, present_chars)?)
+                Some(self.build_mutation_batch(&pc, o, present_chars, &pending_temporary_instances)?)
             }
             None => None,
         };
@@ -894,11 +911,16 @@ impl<'a> ProductionPostprocessService<'a> {
 }
 
 /// JSON CampaignStore mutation builder (production default backend).
+///
+/// `pending_temporary_instances` 参与名字/ID 解析（V2）：accept 时
+/// `prepare_commit_batch` 会把它们的 `UpsertInstance` 前置，指向其 id 的
+/// mutation 落库安全。
 pub fn build_json_mutation_batch(
     store: &CampaignStore,
     persist_ctx: &PostprocessPersistContext,
     outcome: &PostProcessOutcome,
     present_chars: &[String],
+    pending_temporary_instances: &[storyforge_domain::campaign::CharacterInstance],
 ) -> MutationBatch {
     let camp_id = &persist_ctx.campaign_id;
     let commit_id = Id::new();
@@ -939,6 +961,10 @@ pub fn build_json_mutation_batch(
             for inst in store.list_instances(camp_id) {
                 *name_counts.entry(inst.name).or_insert(0) += 1;
             }
+            // V2: 未落盘临时角色同样参与同名收紧（与持久实例撞名时 name 路必须失效）
+            for temp in pending_temporary_instances {
+                *name_counts.entry(temp.name.clone()).or_insert(0) += 1;
+            }
             name_counts
                 .into_iter()
                 .filter(|(_, count)| *count >= 2)
@@ -947,13 +973,14 @@ pub fn build_json_mutation_batch(
         };
 
         for u in &pp.knowledge_updates {
-            let entries = crate::normalize_knowledge_update_for_postprocess(
+            let entries = crate::normalize_knowledge_update_for_postprocess_with_extras(
                 store,
                 camp_id,
                 u,
                 persist_ctx.turn,
                 &present_ids,
                 &name_collisions,
+                pending_temporary_instances,
             );
             for entry in entries {
                 mutations.push(Mutation::UpsertKnowledge(Box::new(
@@ -975,7 +1002,12 @@ pub fn build_json_mutation_batch(
 
         for vu in &pp.variable_updates {
             if let Some(inst_id) = &vu.instance_id {
-                if let Some(inst) = crate::find_instance_by_name_or_id(store, camp_id, inst_id) {
+                if let Some(inst) = crate::find_instance_by_name_or_id_with_extras(
+                    store,
+                    camp_id,
+                    inst_id,
+                    pending_temporary_instances,
+                ) {
                     let is_present = crate::is_postprocess_instance_present(
                         &inst,
                         inst_id,
@@ -1038,11 +1070,15 @@ pub fn build_json_mutation_batch(
 }
 
 /// Pure runtime-based builder (no JSON store reads). Used by SQLite opt-in path.
+///
+/// `runtime` 是轮前快照；`pending_temporary_instances` 是本 attempt 生成期间
+/// 新建、accept 前尚未进快照的临时角色（V2：必须纳入解析域）。
 pub fn build_runtime_mutation_batch(
     persist_ctx: &PostprocessPersistContext,
     outcome: &PostProcessOutcome,
     present_chars: &[String],
     runtime: &CampaignRuntimeContext,
+    pending_temporary_instances: &[storyforge_domain::campaign::CharacterInstance],
 ) -> MutationBatch {
     use storyforge_domain::character_knowledge::{
         BroadcastTarget, KnowledgeSource, PropagationPolicy,
@@ -1050,11 +1086,21 @@ pub fn build_runtime_mutation_batch(
     use storyforge_domain::turn::KnowledgeMutation;
 
     let campaign = &runtime.campaign;
+    // 有效实例集 = 快照实例 + attempt 挂载的临时实例（按 id 去重，跨 campaign 拒绝）
+    let instances: Vec<storyforge_domain::campaign::CharacterInstance> = {
+        let mut all = runtime.instances.clone();
+        for temp in pending_temporary_instances {
+            if temp.campaign_id == campaign.id && !all.iter().any(|i| i.id == temp.id) {
+                all.push(temp.clone());
+            }
+        }
+        all
+    };
     let mut mutations = Vec::new();
     let present_ids: std::collections::HashSet<String> = present_chars.iter().cloned().collect();
     let name_collisions: std::collections::HashSet<String> = {
         let mut counts = std::collections::HashMap::<String, usize>::new();
-        for instance in &runtime.instances {
+        for instance in &instances {
             *counts.entry(instance.name.clone()).or_default() += 1;
         }
         counts
@@ -1063,8 +1109,7 @@ pub fn build_runtime_mutation_batch(
             .collect()
     };
     let resolve_instance = |value: &Id| {
-        runtime
-            .instances
+        instances
             .iter()
             .find(|instance| instance.id == *value || instance.name == value.as_str())
             .cloned()
@@ -1155,14 +1200,12 @@ pub fn build_runtime_mutation_batch(
                 .and_then(resolve_instance);
             let source_character_id = source_instance.as_ref().map(|instance| instance.id.clone());
             let targets: Vec<_> = match &update.broadcast {
-                Some(BroadcastTarget::All) => runtime
-                    .instances
+                Some(BroadcastTarget::All) => instances
                     .iter()
                     .filter(|instance| Some(&instance.id) != source_character_id.as_ref())
                     .cloned()
                     .collect(),
-                Some(BroadcastTarget::Group(group)) => runtime
-                    .instances
+                Some(BroadcastTarget::Group(group)) => instances
                     .iter()
                     .filter(|instance| {
                         Some(&instance.id) != source_character_id.as_ref()
@@ -1341,13 +1384,21 @@ mod tests {
         }
 
         fn seed_draft_attempt(&self, draft: &str) -> (Id, Id, Id) {
+            self.seed_draft_attempt_with_temps(draft, vec![])
+        }
+
+        fn seed_draft_attempt_with_temps(
+            &self,
+            draft: &str,
+            temps: Vec<storyforge_domain::campaign::CharacterInstance>,
+        ) -> (Id, Id, Id) {
             let variant_id = self
                 .conv_store
                 .append_ai_draft(&self.conversation_id, draft.to_string(), None)
                 .unwrap();
             let camp = self.campaign_store.get_campaign(&self.campaign_id).unwrap();
             let attempt =
-                turn_lifecycle::new_draft_attempt(Id::new(), variant_id.clone(), draft, vec![]);
+                turn_lifecycle::new_draft_attempt(Id::new(), variant_id.clone(), draft, temps);
             let attempt_id = attempt.attempt_id.clone();
             let mut record = TurnRecord::new(
                 self.campaign_id.clone(),
@@ -1523,6 +1574,159 @@ mod tests {
             att.derivation.as_ref().unwrap().state_derivation,
             DerivationStatus::Succeeded
         );
+    }
+
+    /// V2 回归：attempt 上未落盘的临时角色必须能被 postprocess 批构建解析。
+    /// 之前 build_json_mutation_batch 只查 store.list_instances → 本轮临时角色的
+    /// 知识/变量更新被静默丢弃（accept 后永久丢失）。
+    #[tokio::test]
+    async fn pending_temporary_instances_resolve_in_json_batch() {
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let fx = Fx::new("temp_json");
+        let temp = storyforge_domain::campaign::CharacterInstance::temporary_with_overrides(
+            fx.campaign_id.clone(),
+            "苏禾",
+            None,
+            None,
+        );
+        let draft = "集市尽头，临时角色苏禾目睹了银鸦标记的交接。".repeat(3);
+        let (turn_id, attempt_id, _variant) =
+            fx.seed_draft_attempt_with_temps(&draft, vec![temp.clone()]);
+        let identity = PostprocessIdentity {
+            turn_id,
+            attempt_id,
+            campaign_id: fx.campaign_id.clone(),
+            conversation_id: fx.conversation_id.clone(),
+            turn_number: 1,
+        };
+        let outcome = PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("苏禾"),
+                    knowledge_text: "银鸦标记在集市完成了交接".into(),
+                    source: KnowledgeSource::Witnessed,
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: None,
+                    propagation: PropagationPolicy::Open,
+                }],
+                variable_updates: vec![VariableUpdate {
+                    instance_id: Some(Id::from_str("苏禾")),
+                    key: "警觉度".into(),
+                    value: serde_json::json!(3),
+                }],
+                parse_succeeded: true,
+                ..Default::default()
+            }),
+        };
+        let sink = fx.sink();
+        let (_tx, cancel_rx) = watch::channel(false);
+        let result = fx
+            .service(&sink)
+            .apply_outcome(
+                &identity,
+                Some(outcome),
+                &["苏禾".to_string()],
+                &cancel_rx,
+            )
+            .unwrap();
+        assert!(result.applied);
+        let batch = result.batch.expect("batch");
+        // 知识条目必须解析到临时实例的最终 id
+        assert!(
+            batch.mutations.iter().any(|m| matches!(
+                m,
+                Mutation::UpsertKnowledge(k) if k.character_id == temp.id
+            )),
+            "临时角色的知识更新必须解析到 pending 实例 id：{:?}",
+            batch.mutations
+        );
+        // 变量更新同样必须落到临时实例 id
+        assert!(
+            batch.mutations.iter().any(|m| matches!(
+                m,
+                Mutation::SetVariable { instance_id: Some(id), key, .. }
+                    if *id == temp.id && key == "警觉度"
+            )),
+            "临时角色的变量更新必须解析到 pending 实例 id：{:?}",
+            batch.mutations
+        );
+    }
+
+    /// V2 回归（SQLite 路径）：轮前快照 runtime 不含临时实例时，
+    /// pending_temporary_instances 参数必须补上解析域；不传则回到旧的静默丢弃。
+    #[test]
+    fn pending_temporary_instances_resolve_in_runtime_batch() {
+        use storyforge_domain::character_knowledge::{
+            CharacterKnowledgeUpdate, KnowledgeSource, PropagationPolicy,
+        };
+
+        let campaign = Campaign::new(Id::new(), "rt");
+        let camp_id = campaign.id.clone();
+        let temp = storyforge_domain::campaign::CharacterInstance::temporary_with_overrides(
+            camp_id.clone(),
+            "苏禾",
+            None,
+            None,
+        );
+        let runtime = CampaignRuntimeContext {
+            campaign,
+            instances: vec![],
+            definitions_by_id: Default::default(),
+            knowledge: vec![],
+            tasks: vec![],
+            turn: 1,
+        };
+        let persist_ctx = PostprocessPersistContext {
+            campaign_id: camp_id,
+            conversation_id: Id::new(),
+            turn: 1,
+        };
+        let outcome = PostProcessOutcome {
+            summary: None,
+            post_process: Some(PostProcessResult {
+                knowledge_updates: vec![CharacterKnowledgeUpdate {
+                    character_id: Id::from_str("苏禾"),
+                    knowledge_text: "银鸦标记在集市完成了交接".into(),
+                    source: KnowledgeSource::Witnessed,
+                    source_character_id: None,
+                    pinned: false,
+                    broadcast: None,
+                    propagation: PropagationPolicy::Open,
+                }],
+                variable_updates: vec![VariableUpdate {
+                    instance_id: Some(Id::from_str("苏禾")),
+                    key: "警觉度".into(),
+                    value: serde_json::json!(3),
+                }],
+                parse_succeeded: true,
+                ..Default::default()
+            }),
+        };
+        let present = vec!["苏禾".to_string()];
+
+        let with_temps =
+            build_runtime_mutation_batch(&persist_ctx, &outcome, &present, &runtime, &[temp.clone()]);
+        assert!(with_temps.mutations.iter().any(|m| matches!(
+            m,
+            Mutation::UpsertKnowledge(k) if k.character_id == temp.id
+        )));
+        assert!(with_temps.mutations.iter().any(|m| matches!(
+            m,
+            Mutation::SetVariable { instance_id: Some(id), .. } if *id == temp.id
+        )));
+
+        // 对照：不带 temps 时两条更新都解析失败（旧缺陷行为，证明参数是修复点）
+        let without_temps =
+            build_runtime_mutation_batch(&persist_ctx, &outcome, &present, &runtime, &[]);
+        assert!(!without_temps.mutations.iter().any(|m| matches!(
+            m,
+            Mutation::UpsertKnowledge(_) | Mutation::SetVariable { instance_id: Some(_), .. }
+        )));
     }
 
     #[tokio::test]
