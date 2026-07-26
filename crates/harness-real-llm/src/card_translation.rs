@@ -589,7 +589,9 @@ pub fn build_evidence(
             schema_keys_sample: translation
                 .variable_schema
                 .iter()
-                .take(40)
+                // 512：足够容纳整棵 schema 键集（forge 差分 V2-2 的覆盖率
+                // 分析需要全量键；键名无正文，脱敏性质不变）
+                .take(512)
                 .map(|f| f.key.clone())
                 .collect(),
             update_rules: translation.update_rules.len(),

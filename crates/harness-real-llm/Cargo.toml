@@ -20,6 +20,8 @@ storyforge-app-logging.workspace = true
 storyforge-tauri-app = { package = "storyforge", path = "../tauri-app" }
 serde.workspace = true
 serde_json.workspace = true
+# forge 差分 V2-2：解析 InitVar YAML 作 schema ground truth（仅测试基建用）
+serde_yaml = "0.9"
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
