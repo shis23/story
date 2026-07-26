@@ -64,6 +64,7 @@ import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
 import { useOverviewScreenAdapter } from './adapter/useOverviewScreenAdapter.js'
 import ShellAwareContent from './components-v2/st/ShellAwareContent.vue'
 import MvuStatusPanel from './components-v2/st/MvuStatusPanel.vue'
+import ShellVariableProposalBar from './components-v2/st/ShellVariableProposalBar.vue'
 import {
   useWritingStore,
   useCampaignStore,
@@ -97,6 +98,10 @@ import {
 import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
 import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
+import {
+  takeShellVariableProposal,
+  upsertShellVariableProposal,
+} from './utils/shellVariableProposals.js'
 import { findLatestCampaignConversation } from './utils/overviewNavigation.js'
 import { getOpeningShellPresentation } from './utils/cardShellPresentation.js'
 import { shouldShowOpeningShell } from './utils/cardShellPresentation.js'
@@ -265,7 +270,23 @@ provide('storyforgeCardShellLayout', {
   }),
 })
 
-async function onShellVarWrite(payload) {
+// ProposeVariableUpdate（M4）：卡 JS 发起的 var_write 不再直写一等变量。
+// bridge session token 对壳内任意脚本可读，消息本身证明不了来源可信；
+// 写入先入提案队列，用户在确认条上显式 应用/拒绝。用户点击的 MVU 交互
+// （dispatchMvuInteraction）保持直写——点击本身就是确认。
+const shellVarProposals = ref([])
+const shellVarApplyBusy = ref(false)
+
+function onShellVarWrite(payload) {
+  const before = shellVarProposals.value
+  shellVarProposals.value = upsertShellVariableProposal(before, payload)
+  if (shellVarProposals.value !== before) {
+    shellVarAudit.push({ key: payload?.key, ok: null, scope: 'proposed', error: null })
+    shellVarAuditTick.value++
+  }
+}
+
+async function persistShellProposal(proposal) {
   const campaignId = campaign.activeCampaign?.id || null
   // 与 MVU 交互分发（useMvuStatusPanel.dispatchMvuInteraction）同判据：
   // 优先「卡绑定实例恰一个」，回退全 campaign 单实例——两条写入路径的
@@ -278,18 +299,62 @@ async function onShellVarWrite(payload) {
   const result = await persistShellVariableWrite({
     campaignId,
     instanceId,
-    key: payload?.key,
-    value: payload?.value,
+    key: proposal.key,
+    value: proposal.value,
     setCampaignVariable,
     setCharacterVariable,
     log: (level, message) => logAppendFrontend(level, message),
   })
   shellVarAudit.push({
-    key: payload?.key,
+    key: proposal.key,
     ok: result.ok,
     scope: result.scope,
     error: result.error || null,
   })
+  shellVarAuditTick.value++
+  return result
+}
+
+async function applyShellVarProposal(id) {
+  if (shellVarApplyBusy.value) return
+  const { proposal, rest } = takeShellVariableProposal(shellVarProposals.value, id)
+  if (!proposal) return
+  shellVarApplyBusy.value = true
+  try {
+    shellVarProposals.value = rest
+    await persistShellProposal(proposal)
+  } finally {
+    shellVarApplyBusy.value = false
+  }
+}
+
+function rejectShellVarProposal(id) {
+  const { proposal, rest } = takeShellVariableProposal(shellVarProposals.value, id)
+  if (!proposal) return
+  shellVarProposals.value = rest
+  shellVarAudit.push({ key: proposal.key, ok: false, scope: 'rejected', error: null })
+  shellVarAuditTick.value++
+}
+
+async function applyAllShellVarProposals() {
+  if (shellVarApplyBusy.value) return
+  shellVarApplyBusy.value = true
+  try {
+    const pending = shellVarProposals.value
+    shellVarProposals.value = []
+    for (const proposal of pending) {
+      await persistShellProposal(proposal)
+    }
+  } finally {
+    shellVarApplyBusy.value = false
+  }
+}
+
+function rejectAllShellVarProposals() {
+  for (const proposal of shellVarProposals.value) {
+    shellVarAudit.push({ key: proposal.key, ok: false, scope: 'rejected', error: null })
+  }
+  shellVarProposals.value = []
   shellVarAuditTick.value++
 }
 
@@ -301,6 +366,8 @@ async function refreshCardShellManifest() {
   cardShellShells.value = []
   cardShellThCount.value = 0
   cardShellCharacterId.value = null
+  // 换卡/换 Campaign 后旧壳的待确认变量提案不得跨上下文生效
+  shellVarProposals.value = []
   const target = resolveCardShellManifestTarget({
     activeCampaign: campaign.activeCampaign,
     activeChar: campaign.activeChar,
@@ -708,6 +775,14 @@ onMounted(async () => {
           />
         </template>
         <template #after-messages>
+          <ShellVariableProposalBar
+            :proposals="shellVarProposals"
+            :busy="shellVarApplyBusy"
+            @apply="applyShellVarProposal"
+            @reject="rejectShellVarProposal"
+            @apply-all="applyAllShellVarProposals"
+            @reject-all="rejectAllShellVarProposals"
+          />
           <MvuStatusPanel
             :sections="mvuStatusSections"
             :interactions="mvuInteractionMappings"
