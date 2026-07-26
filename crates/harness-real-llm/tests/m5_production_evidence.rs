@@ -563,10 +563,13 @@ async fn hard_deadline_flushes_completed_samples_and_covers_accept_evidence_boun
         let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
         let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
         let mut cfg = config(&dir);
-        cfg.hard_deadline = Some(Duration::from_millis(100));
+        // 不变量：延迟 > deadline（超时必落在 stage 延迟期间）且 turn1 需在
+        // deadline 内跑到该 stage。100ms/250ms 在慢 CI 容器（3CPU+fsync）不够
+        // ——turn1 本身就可能超 100ms。放宽保持同一不变量。
+        cfg.hard_deadline = Some(Duration::from_secs(2));
         let hook = DelayAtStage {
             stage,
-            delay: Duration::from_millis(250),
+            delay: Duration::from_secs(3),
         };
         let mut writer = DeterministicTurnWriter { emit_summary: true };
         let err = run_production_evidence_loop_with_hook(
@@ -624,7 +627,9 @@ async fn hard_deadline_covers_final_context_fill_boundary() {
     let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
     let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
     let mut cfg = config(&dir);
-    let deadline = Duration::from_secs(8);
+    // 8s 在慢 CI 容器上被 16 轮（每轮 ~0.5s+，fsync+3CPU）压线击穿；
+    // 30s 给 ~1.8s/轮余量。runtime ≈ deadline+1s（动态睡）。
+    let deadline = Duration::from_secs(30);
     cfg.hard_deadline = Some(deadline);
     let hook = StallPastDeadlineAtStage {
         stage: ProductionEvidenceStage::BeforeFinalFill,
