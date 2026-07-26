@@ -23,14 +23,24 @@ permissions:
 jobs:
   rust-fmt:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # dtolnay/rust-toolchain 在 gitea.com 无镜像且 github.com 从国内 runner
+      # 不可达；改为幂等 rustup 安装（rsproxy 镜像 + runner 持久卷缓存）。
+      - name: Install Rust toolchain (mirror-friendly, idempotent)
+        run: |
+          export RUSTUP_DIST_SERVER=https://rsproxy.cn
+          export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_DIST_SERVER=https://rsproxy.cn" >> "$GITHUB_ENV"
+          echo "RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup" >> "$GITHUB_ENV"
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -55,10 +65,18 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install Rust toolchain (mirror-friendly, idempotent)
+        run: |
+          export RUSTUP_DIST_SERVER=https://rsproxy.cn
+          export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_DIST_SERVER=https://rsproxy.cn" >> "$GITHUB_ENV"
+          echo "RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup" >> "$GITHUB_ENV"
       - name: Setup Node (frontendDist for Tauri generate_context!)
         uses: actions/setup-node@v4
         with:
@@ -94,8 +112,18 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (mirror-friendly, idempotent)
+        run: |
+          export RUSTUP_DIST_SERVER=https://rsproxy.cn
+          export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_DIST_SERVER=https://rsproxy.cn" >> "$GITHUB_ENV"
+          echo "RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup" >> "$GITHUB_ENV"
       - name: Setup Node (frontendDist for Tauri generate_context!)
         uses: actions/setup-node@v4
         with:
@@ -135,6 +163,10 @@ jobs:
 
   pester-release-tests:
     # PowerShell release-helper Pester suite runs on a Windows runner.
+    # 当前仅京东云 Linux runner 在线；注册 Windows runner 后在仓库
+    # Settings → Actions → Variables 设 HAS_WINDOWS_RUNNER=true 启用。
+    # 本地等效门禁：scripts/verify-release.ps1（Pester + secret scan 全含）。
+    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -160,6 +192,8 @@ jobs:
           pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
 
   secret-scan:
+    # Windows runner 缺席时跳过（本地 verify-release.ps1 -SecretScanOnly 等效）。
+    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -175,6 +209,8 @@ jobs:
   workflow-syntax:
     # Real YAML parser required (PyYAML). Structural-only PowerShell checks
     # are not accepted for production workflow validation.
+    # Windows runner 缺席时跳过（本地 Pester 套件含同一 PyYAML 校验路径）。
+    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:

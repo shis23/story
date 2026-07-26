@@ -79,8 +79,13 @@
   强制重建）、清单变化自动收起。TavernHelperRuntime 新增 `visible` prop
   （真实版面 iframe，min(70vh,520px)）。var-write 走既有提案队列。
   测试：node×3（拆分器）+ vitest×5（dock 行为）。
-- [ ] **#21** 评测口径扩展：开场白 `<UpdateVariable>` 种子解析进 forge 差分作者树
-  （destiny 剩余"幻觉"里 世界.新闻/事件.莉莉.* 疑似合法种子变量），重算缺口性质。
+- [~] **#21** 评测口径扩展（代码已落，待重算分数）：
+  `extract_update_variable_seed_paths`（forge_differential.rs）解析开场白
+  `<UpdateVariable><JSONPatch>` 数组的 path（斜杠→点、`/-` 追加记号尾段丢弃、
+  非法块静默跳过）+ `collect_opening_seed_paths(forge_dir)` 汇总 开场白/*.txt；
+  alignment 测试作者树 = InitVar ∪ 开场白种子（打印两部分规模）。
+  单元测试锁定解析形态。重算：本地 STORYFORGE_FORGE_OUT + 证据目录重跑
+  `forge_schema_alignment_scores_translations`，更新 FORGE-DIFFERENTIAL 数字。
 - [x] **#22** SQLite 后端 MVU 补齐 → **已修**（比原计划更完整——根因是 SQLite
   后端根本没有 MVU 翻译权威）：V005 `mvu_translations` 表 + importer 迁移
   （老目录 manifest hash 稳定）+ repo/runtime CRUD + 两收集器 SQLite 分支
@@ -91,15 +96,41 @@
   （MVU 生成对接现有 analyze/apply、多 CharacterDefinition、世界书高级策略）。
   现有代码入口：domain/card_studio.rs、tauri-app/card_studio_{api,store}.rs、
   components-v2/campaign/CardStudio.vue。
-- [ ] **#24** 杂项：cardShellClearCache 按钮入电源模式设置区；vite 500kB chunk 分割；
-  cargo/npm 依赖审计。
+- [x] **#24** 杂项 → **已做**：
+  - 清空卡壳缓存按钮入 InspectorDrawer 页脚维护区（L6 UI 入口收尾）
+  - vite manualChunks：vendor-vue 133K + vendor-sanitize 29K 拆出，
+    主 chunk 674K→529K；warning limit 560（应用本体，注释注明理由）
+  - npm audit：postcss/glob-cli 已修；残余 6 high 全在 dev-only 测试链
+    （@vue/test-utils→js-beautify→brace-expansion），破坏性降级不值，
+    `npm audit --omit=dev` 生产 0 漏洞
+  - cargo audit：quinn-proto 0.11.14→0.11.16 已升（DoS 修复）；
+    quick-xml 0.39 两条 high 被 tauri-utils→plist 上游 pin，本地不可升
+    （待 tauri 发版跟进）；gtk3 绑定 unmaintained 系列为 Tauri Linux 栈固有
 
 ### P3 新专项（用户今晚拍板）
 
-- [ ] **#30 CI**：SSH 京东云（root@111.228.49.176）装 act_runner，注册到本机 Gitea
-  （127.0.0.1:3000，token 在用户全局 CLAUDE.md），让仓库现有 workflow 实跑出首次
-  绿证据；本机 `cargo tauri build` 出 Windows 安装包。参考
-  RELEASE-CI-EVIDENCE-RESULT.md 的 Unverified Items。
+- [~] **#30 CI**（进行中，基础设施全部就位）：
+  - **本机安装包证据 ✅**：`cargo tauri build` 双包成功——
+    `StoryForge_0.1.0_x64_en-US.msi`（11.3MB，sha256 48f0a905…a16bfd9f）、
+    `StoryForge_0.1.0_x64-setup.exe`（8.0MB，sha256 142ff7be…324807c5）。
+  - **act_runner ✅**：京东云 Docker 容器 `act_runner`（gitea/act_runner:latest，
+    runner 名 jd-linux-1，labels ubuntu-latest/ubuntu-22.04 →
+    catthehacker/ubuntu:act-22.04，capacity 1、--memory=10g --cpus=3、
+    持久卷 /opt/act_runner/toolcache/{rustup,cargo-home} 挂 /root/.rustup+.cargo）。
+    注册 token 经 `docker exec -u git gitea gitea actions generate-runner-token`。
+    状态脚本：`ssh root@111.228.49.176 /opt/act_runner/ci-status.sh`。
+  - **CI 首跑诊断**：全部 job 死于 `git clone github.com/actions/checkout` 超时
+    ——github.com 从京东云容器不可达（宿主间歇可达）。适配已做：
+    ①Gitea app.ini `[actions] DEFAULT_ACTIONS_URL=https://gitea.com`（官方
+    actions/* 镜像在 gitea.com，容器内实测可达）；②workflow dtolnay/rust-toolchain
+    → 幂等 rustup 安装（rsproxy.cn 镜像 + 持久卷缓存）；③windows job 加
+    `if: vars.HAS_WINDOWS_RUNNER == 'true'` 条件门（无 Windows runner 时显式
+    skip，不阻塞 linux 首绿；本地 verify-release.ps1 为等效门禁）。
+  - **CI 顺带抓出真实门禁违规并已修**：cargo fmt 漂移（26 文件 sweep）+
+    clippy 违规（domain 16 处 / infra-llm 2 处 / infra-regex 10 处 /
+    tauri-app 若干——collapsible_if、field_reassign_with_default、
+    redundant_closure、let_and_return）。
+  - 待收：clippy 全绿 → 推送 → 观察 linux 4 job 首绿。
 - [ ] **#31 盲测**：单 Agent vs 多 Agent 同提示多轮对比 + 盲评（中继
   https://cli.2529985.xyz/v1，key 用户每会话提供只进环境变量；模型
   deepseek-v4-pro/flash 可用）。产出决定流水线重设计的投入优先级。

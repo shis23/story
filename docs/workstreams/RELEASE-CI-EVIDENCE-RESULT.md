@@ -337,3 +337,53 @@ hardening slice. This workstream:
    SBOM inventory with non-dry-run `build_status=ok`.
 3. Install Tauri CLI + WebView2 on the Windows runner for full bundle evidence.
 4. Install Android SDK/NDK for APK evidence.
+
+---
+
+## 2026-07-27 落地更新：runner 已部署、本机安装包证据已产出
+
+前文 "Unverified Items" 的两大项已落地：
+
+### Windows 安装包证据（本机 cargo tauri build）
+
+| 产物 | 体积 | SHA-256 |
+| --- | --- | --- |
+| `target/release/bundle/msi/StoryForge_0.1.0_x64_en-US.msi` | 11.3 MB | `48f0a90528819222c38583da59cbb337003e4d3937dde423edccd195a16bfd9f` |
+| `target/release/bundle/nsis/StoryForge_0.1.0_x64-setup.exe` | 8.0 MB | `142ff7be38af7e87ea7de0d8d12faae116c364b2f5c21a52bc03df92324807c5` |
+
+release 编译 5m47s + WiX/NSIS 打包全通（tauri-cli 2.11.2）。未签名（与本文
+"Do NOT merge as a claim of signed artifacts" 口径一致）。
+
+### Gitea Actions runner（京东云）
+
+- 容器 `act_runner`（gitea/act_runner:latest v0.6.1），runner 名 `jd-linux-1`，
+  labels `ubuntu-latest`/`ubuntu-22.04` → `catthehacker/ubuntu:act-22.04`。
+- 配置 `/opt/act_runner/config.yaml`：capacity 1（防挤占核心服务）、
+  `--memory=10g --cpus=3`、持久卷 `toolcache/{rustup,cargo-home}` 挂
+  `/root/.rustup`+`/root/.cargo`（Rust 工具链跨 job 复用）。
+- 注册 token：`docker exec -u git gitea gitea actions generate-runner-token`。
+- 状态速查：`ssh root@111.228.49.176 /opt/act_runner/ci-status.sh`。
+
+### 国内网络适配（CI 首跑全灭的根因与修复）
+
+首跑四个 linux job 全部死于 `git clone https://github.com/actions/checkout`
+超时——github.com 从京东云容器网络不可达（宿主间歇可达，不可依赖）。修复：
+
+1. Gitea `app.ini` 增 `[actions] DEFAULT_ACTIONS_URL = https://gitea.com`
+   （官方 actions/checkout、setup-node 等在 gitea.com 有镜像，容器内实测可达）。
+2. `ci-gates.yml` 的 `dtolnay/rust-toolchain@stable`（gitea.com 无镜像）替换为
+   幂等 rustup 安装步骤：`RUSTUP_DIST_SERVER=https://rsproxy.cn` + rustup-init
+   （持久卷命中时秒过）。crates.io sparse 索引与静态件（index/static.crates.io）
+   实测可达，不需换源。
+3. 三个 windows job（pester/secret-scan/workflow-syntax）加
+   `if: vars.HAS_WINDOWS_RUNNER == 'true'` 条件门：无 Windows runner 时显式
+   skip 不阻塞 linux 首绿；本地 `scripts/verify-release.ps1` 为等效门禁。
+   注册 Windows runner 后在仓库 Settings → Actions → Variables 设该变量启用。
+
+### CI 首跑的意外收获
+
+fmt/clippy 门首次真实执行，抓出历史提交的真实违规并全部修复：
+cargo fmt 漂移 26 文件；clippy 违规 30+ 处（domain/infra-llm/infra-regex/
+tauri-app：collapsible_if、field_reassign_with_default、redundant_closure、
+cloned_ref_to_slice_refs、type_complexity、let_and_return）。本地
+`cargo clippy --workspace --all-targets -- -D warnings` 现为 0 error。
