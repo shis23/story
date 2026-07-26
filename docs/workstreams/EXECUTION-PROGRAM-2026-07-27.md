@@ -143,12 +143,19 @@
     tauri-app 若干——collapsible_if、field_reassign_with_default、
     redundant_closure、let_and_return）。
   - 待收：clippy 全绿 → 推送 → 观察 linux 4 job 首绿。
-- [ ] **#31 盲测**：单 Agent vs 多 Agent 同提示多轮对比 + 盲评（中继
-  https://cli.2529985.xyz/v1，key 用户每会话提供只进环境变量；模型
-  deepseek-v4-pro/flash 可用）。产出决定流水线重设计的投入优先级。
-- [ ] **#32** 流水线重设计起骨架（先找定稿方案文档：架构评审提到"已定稿未实现"，
-  文档位置待查——搜 docs/ 里 pipeline redesign / 流水线重设计）+ Android AND-2/AND-3
-  起步（PLAN-ANDROID.md 为准）。
+- [~] **#31 盲测**（骨架已入库 f3f2c86，LLM 驱动待写）：
+  定稿方案要求**四臂**（非两臂）——`blind_arm_matrix.rs` 骨架就位
+  （臂枚举/双盲随机化 presentation_order/多数票 majority_for_pair/
+  summarize_matrix 缺席臂显式清单；单测 3 例）。计划文档 v2 已对齐。
+  下一步：#[ignore] 集成测试接 LLM 驱动——solo_writer 臂上下文拼装 +
+  parallel_crew 臂走 PipelineOrchestrator + 裁判循环（key 只进 env）。
+- [~] **#32 流水线重设计**（第 1 步已落）：
+  **定稿文档找到了**＝ARCHITECTURE-REVIEW-2026-07-26.md 补记三（891 行起，
+  「设计定稿，未实现」）。要点：回合契约 / 三档生成（续写 80%·对手戏·大场面）/
+  确定性路由 / 执笔调用是圣域（四条设计法则）/ 干净执笔+全案卷差分审计 /
+  §11 落地顺序=①四臂盲测（已起骨架）②续写档（context compiler 首客户，
+  依赖 V1/V2 修复——今日已修）③对手戏 run_duet ④场景卡+大场面收编。
+  Android AND-2/AND-3（PLAN-ANDROID.md）未起步。
 
 ### 周级工程（起步后持续，不指望今天闭环）
 
