@@ -80,10 +80,11 @@ jobs:
       - name: Setup Node (frontendDist for Tauri generate_context!)
         # actions/setup-node 无本地镜像（gitea.com 迁移远端故障）；nodejs.org
         # 从 runner 容器可达，直下 tar 到持久 toolcache 卷（第二次 job 秒过）。
+        # node 22 LTS：`node --test` 的 glob 参数 v22+ 才支持（v20 当字面路径）。
         run: |
-          NODE_DIR=/opt/hostedtoolcache/storyforge-node20
+          NODE_DIR=/opt/hostedtoolcache/storyforge-node22
           if [ ! -x "$NODE_DIR/bin/node" ]; then
-            curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz -o /tmp/node.tar.xz
+            curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz -o /tmp/node.tar.xz
             mkdir -p "$NODE_DIR"
             tar -xJf /tmp/node.tar.xz -C "$NODE_DIR" --strip-components=1
           fi
@@ -133,10 +134,11 @@ jobs:
       - name: Setup Node (frontendDist for Tauri generate_context!)
         # actions/setup-node 无本地镜像（gitea.com 迁移远端故障）；nodejs.org
         # 从 runner 容器可达，直下 tar 到持久 toolcache 卷（第二次 job 秒过）。
+        # node 22 LTS：`node --test` 的 glob 参数 v22+ 才支持（v20 当字面路径）。
         run: |
-          NODE_DIR=/opt/hostedtoolcache/storyforge-node20
+          NODE_DIR=/opt/hostedtoolcache/storyforge-node22
           if [ ! -x "$NODE_DIR/bin/node" ]; then
-            curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz -o /tmp/node.tar.xz
+            curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz -o /tmp/node.tar.xz
             mkdir -p "$NODE_DIR"
             tar -xJf /tmp/node.tar.xz -C "$NODE_DIR" --strip-components=1
           fi
@@ -162,10 +164,11 @@ jobs:
       - name: Setup Node
         # actions/setup-node 无本地镜像（gitea.com 迁移远端故障）；nodejs.org
         # 从 runner 容器可达，直下 tar 到持久 toolcache 卷（第二次 job 秒过）。
+        # node 22 LTS：`node --test` 的 glob 参数 v22+ 才支持（v20 当字面路径）。
         run: |
-          NODE_DIR=/opt/hostedtoolcache/storyforge-node20
+          NODE_DIR=/opt/hostedtoolcache/storyforge-node22
           if [ ! -x "$NODE_DIR/bin/node" ]; then
-            curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz -o /tmp/node.tar.xz
+            curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz -o /tmp/node.tar.xz
             mkdir -p "$NODE_DIR"
             tar -xJf /tmp/node.tar.xz -C "$NODE_DIR" --strip-components=1
           fi
