@@ -811,12 +811,14 @@ mod tests {
                     content: "常驻设定：城市上空漂着看不见的岛。".into(),
                     constant: true,
                     order: 10,
+                    ..WorldviewDraftEntry::default()
                 },
                 WorldviewDraftEntry {
                     keys: vec!["天台".into(), "岛".into()],
                     content: "天台是离岛最近的地方。".into(),
                     constant: false,
                     order: 20,
+                    ..WorldviewDraftEntry::default()
                 },
             ],
             ..Default::default()

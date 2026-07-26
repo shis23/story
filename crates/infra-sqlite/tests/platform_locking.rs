@@ -83,10 +83,13 @@ fn database_can_be_reopened_after_close() {
 }
 
 #[test]
+#[cfg(windows)]
 fn windows_file_lock_prevents_concurrent_cutover() {
     // This test verifies that the cutover lock prevents two concurrent
     // cutover attempts from racing. On Windows the file handle denial
     // prevents the second lock acquisition.
+    // cfg(windows)：share_mode/OpenOptionsExt 是 Windows 专用 API，
+    // Linux CI 编译期就会炸（首个 Linux clippy run 抓到的真实跨平台缺陷）。
     let dir = TempDir::new().unwrap();
     sample_source(dir.path());
 

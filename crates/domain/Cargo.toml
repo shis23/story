@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# Phase 3 骨架：InitVar YAML 结构探针（apply_mvu_bootstrap_entry）
+serde_yaml = "0.9"
 chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true

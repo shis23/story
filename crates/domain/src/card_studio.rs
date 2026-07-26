@@ -63,6 +63,16 @@ pub struct WorldviewDraftEntry {
     pub constant: bool,
     #[serde(default = "default_order")]
     pub order: i32,
+    /// Phase 3 高级策略（骨架）：触发概率 0-100（None = 100%）。
+    /// 编译时写入 entry.extensions；ST 一等字段全量映射属 Phase 3 后续。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probability: Option<u8>,
+    /// Phase 3 高级策略（骨架）：排除递归触发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_recursion: Option<bool>,
+    /// Phase 3 高级策略（骨架）：条目分组（蓝绿灯分组策略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn default_order() -> i32 {
@@ -76,8 +86,25 @@ impl Default for WorldviewDraftEntry {
             content: String::new(),
             constant: false,
             order: 100,
+            probability: None,
+            exclude_recursion: None,
+            group: None,
         }
     }
+}
+
+/// Phase 3 骨架：多角色卡的附加 CharacterDefinition 草案。
+/// 编译时进 ST 卡 extensions.storyforge.extra_definitions；导入侧
+/// `extra_definitions_from_st_extensions` 取回并 attach 到 CharacterCard。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtraDefinitionDraft {
+    pub name: String,
+    #[serde(default)]
+    pub persona_prompt: String,
+    #[serde(default)]
+    pub behavior_rules: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -115,6 +142,9 @@ pub struct CardArtifacts {
     /// 文风提示/公式（B 路径；进 notes 旁路，不直接当 description）
     #[serde(default)]
     pub style_notes: Option<String>,
+    /// Phase 3 骨架：多角色卡附加定义草案（编译进 extensions 通道）
+    #[serde(default)]
+    pub extra_definitions: Vec<ExtraDefinitionDraft>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +546,7 @@ pub fn apply_novel_prefill_json(
                 content,
                 constant,
                 order,
+                ..WorldviewDraftEntry::default()
             });
         }
         if !entries.is_empty() {
@@ -553,6 +584,7 @@ pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
                     constant: e.constant
                         || matches!(e.route, LoreRoute::Constant | LoreRoute::Both),
                     order: e.order,
+                    ..WorldviewDraftEntry::default()
                 })
                 .collect::<Vec<_>>()
         })
@@ -577,6 +609,7 @@ pub fn reverse_parse_character(character: &Character) -> CardArtifacts {
         world_type: None,
         opening_outline: None,
         style_notes: None,
+        extra_definitions: Vec::new(),
     }
 }
 
@@ -988,6 +1021,18 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
                         "条目 #{i} 无 keys，已跳过 keys 校验（应被 checks 拦住）"
                     ));
                 }
+                // Phase 3 骨架：高级策略进 extensions（ST 一等字段全量映射后续做）
+                let mut ext = serde_json::Map::new();
+                if let Some(p) = e.probability {
+                    ext.insert("probability".into(), serde_json::json!(p.min(100)));
+                    ext.insert("useProbability".into(), serde_json::json!(true));
+                }
+                if let Some(x) = e.exclude_recursion {
+                    ext.insert("exclude_recursion".into(), serde_json::json!(x));
+                }
+                if let Some(g) = e.group.as_deref().filter(|g| !g.trim().is_empty()) {
+                    ext.insert("group".into(), serde_json::json!(g.trim()));
+                }
                 WorldInfoEntry {
                     st_id: Some(i as i32),
                     keys,
@@ -1001,7 +1046,7 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
                     depth: 4,
                     order: e.order,
                     route,
-                    extensions: serde_json::json!({}),
+                    extensions: serde_json::Value::Object(ext),
                     extra: Default::default(),
                 }
             })
@@ -1038,12 +1083,24 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
         creator: creator.clone(),
         character_version: "cardstudio-1".into(),
         alternate_greetings: Vec::new(),
-        extensions: serde_json::json!({
-            "storyforge": {
+        extensions: {
+            let mut sf = serde_json::json!({
                 "card_studio": true,
                 "phase": 1
+            });
+            // Phase 3 骨架：附加定义草案随卡携带（导入侧
+            // extra_definitions_from_st_extensions 取回 attach）
+            if !artifacts.extra_definitions.is_empty()
+                && let Some(obj) = sf.as_object_mut()
+            {
+                obj.insert(
+                    "extra_definitions".into(),
+                    serde_json::to_value(&artifacts.extra_definitions)
+                        .map_err(|e| format!("附加定义序列化失败: {e}"))?,
+                );
             }
-        }),
+            serde_json::json!({ "storyforge": sf })
+        },
         character_book: book.as_ref().map(|b| b.to_st_book()),
         extra: Default::default(),
     };
@@ -1070,6 +1127,76 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
         st_card_json,
         warnings,
     })
+}
+
+/// InitVar 条目的固定标记（内容前缀 + keys；MVU 分析器按内容含 "initvar"
+/// 识别并给大预算——见 mvu_analyzer 的 [InitVar] 预算规则）。
+pub const MVU_INITVAR_MARKER: &str = "[InitVar]";
+
+/// Phase 3 骨架：把 MVU InitVar YAML 草稿注入 artifacts 世界书。
+///
+/// 走普通 `WorldviewDraftEntry` 通道（constant 常驻 + `[InitVar]` 内容标记），
+/// 出卡闸门（content/keys/order roundtrip）与 forge 差分口径零改动即成立；
+/// 导入侧 MVU 分析器按内容关键字识别。幂等：已有 InitVar 条目则替换。
+pub fn apply_mvu_bootstrap_entry(
+    artifacts: &mut CardArtifacts,
+    initvar_yaml: &str,
+) -> Result<(), String> {
+    let yaml = initvar_yaml.trim();
+    if yaml.is_empty() {
+        return Err("InitVar YAML 为空".into());
+    }
+    serde_yaml_probe(yaml)?;
+    let content = format!("{MVU_INITVAR_MARKER}\n{yaml}");
+    let max_order = artifacts
+        .worldview_entries
+        .iter()
+        .map(|e| e.order)
+        .max()
+        .unwrap_or(0);
+    let entry = WorldviewDraftEntry {
+        keys: vec!["InitVar".into()],
+        content,
+        constant: true,
+        order: max_order + 10,
+        ..WorldviewDraftEntry::default()
+    };
+    if let Some(existing) = artifacts
+        .worldview_entries
+        .iter_mut()
+        .find(|e| e.content.starts_with(MVU_INITVAR_MARKER))
+    {
+        let order = existing.order;
+        *existing = WorldviewDraftEntry { order, ..entry };
+    } else {
+        artifacts.worldview_entries.push(entry);
+    }
+    Ok(())
+}
+
+/// 轻量 YAML 结构探针：拒绝把明显不是 mapping 的文本当 InitVar 落卡。
+fn serde_yaml_probe(yaml: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("InitVar YAML 解析失败: {e}"))?;
+    if !value.is_object() {
+        return Err("InitVar YAML 顶层必须是 mapping（变量树）".into());
+    }
+    Ok(())
+}
+
+/// Phase 3 骨架：从 ST 卡 extensions 取回附加定义草案（导入侧 attach 用）。
+/// 形态异常时返回空集（防御：extensions 是外来 JSON）。
+pub fn extra_definitions_from_st_extensions(
+    extensions: &serde_json::Value,
+) -> Vec<ExtraDefinitionDraft> {
+    extensions
+        .get("storyforge")
+        .and_then(|sf| sf.get("extra_definitions"))
+        .and_then(|v| serde_json::from_value::<Vec<ExtraDefinitionDraft>>(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !d.name.trim().is_empty())
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1551,6 +1678,7 @@ pub fn apply_stage_json(
                     content,
                     constant,
                     order,
+                    ..WorldviewDraftEntry::default()
                 });
             }
             artifacts.worldview_entries = entries;
@@ -1654,12 +1782,14 @@ mod tests {
                     content: "世界规则：灵视者能看见旧日残影。".into(),
                     constant: true,
                     order: 10,
+                    ..WorldviewDraftEntry::default()
                 },
                 WorldviewDraftEntry {
                     keys: vec!["车站".into(), "雨".into()],
                     content: "这座车站总在雨夜汇聚迷路的人。".into(),
                     constant: false,
                     order: 20,
+                    ..WorldviewDraftEntry::default()
                 },
             ],
             notes: "从零测试".into(),
@@ -1668,6 +1798,7 @@ mod tests {
             world_type: Some("B".into()),
             opening_outline: None,
             style_notes: None,
+            extra_definitions: Vec::new(),
         }
     }
 
@@ -2060,6 +2191,118 @@ mod tests {
         assert!(p.novel_text.is_none());
         assert!(!p.novel_excerpts.is_empty());
         assert!(build_novel_prefill_prompt(&p).is_ok());
+    }
+
+    /// Phase 3 骨架：InitVar 注入走普通世界书条目通道（闸门口径零改动）。
+    #[test]
+    fn mvu_bootstrap_entry_injects_and_replaces_idempotently() {
+        let mut arts = CardArtifacts {
+            name: "系统卡".into(),
+            worldview_entries: vec![WorldviewDraftEntry {
+                content: "常驻设定。".into(),
+                constant: true,
+                order: 10,
+                ..WorldviewDraftEntry::default()
+            }],
+            ..CardArtifacts::default()
+        };
+        apply_mvu_bootstrap_entry(&mut arts, "主角:\n  hp: 100\n  好感度: 0\n")
+            .expect("合法 YAML 注入成功");
+        assert_eq!(arts.worldview_entries.len(), 2);
+        let entry = &arts.worldview_entries[1];
+        assert!(entry.constant);
+        assert!(entry.content.starts_with(MVU_INITVAR_MARKER));
+        assert!(entry.content.contains("hp: 100"));
+        assert_eq!(entry.order, 20, "order = 现有最大 + 10");
+
+        // 幂等：再注入替换而非追加，order 保持
+        apply_mvu_bootstrap_entry(&mut arts, "主角:\n  hp: 50\n").unwrap();
+        assert_eq!(arts.worldview_entries.len(), 2);
+        assert!(arts.worldview_entries[1].content.contains("hp: 50"));
+        assert_eq!(arts.worldview_entries[1].order, 20);
+
+        // 非 mapping / 空 YAML 拒绝
+        assert!(apply_mvu_bootstrap_entry(&mut arts, "只是一句话").is_err());
+        assert!(apply_mvu_bootstrap_entry(&mut arts, "  ").is_err());
+
+        // 注入后可正常编译（InitVar 条目进 ST 世界书）
+        arts.description = "测试描述。".into();
+        arts.first_mes = "开场。".into();
+        let compiled = compile_artifacts(&arts).expect("编译成功");
+        let book = compiled.character.embedded_world_info.expect("世界书存在");
+        assert!(
+            book.entries
+                .iter()
+                .any(|e| e.content.starts_with(MVU_INITVAR_MARKER))
+        );
+    }
+
+    /// Phase 3 骨架：附加定义经 extensions 通道 round-trip。
+    #[test]
+    fn extra_definitions_round_trip_via_st_extensions() {
+        let arts = CardArtifacts {
+            name: "多角色卡".into(),
+            description: "两个角色。".into(),
+            first_mes: "开场。".into(),
+            extra_definitions: vec![
+                ExtraDefinitionDraft {
+                    name: "艾琳".into(),
+                    persona_prompt: "剑士，直率。".into(),
+                    behavior_rules: "先动手后动口。".into(),
+                    group: Some("主角团".into()),
+                },
+                ExtraDefinitionDraft {
+                    name: "  ".into(), // 空名应被提取端过滤
+                    ..ExtraDefinitionDraft::default()
+                },
+            ],
+            ..CardArtifacts::default()
+        };
+        let compiled = compile_artifacts(&arts).expect("编译成功");
+        let extensions = &compiled.st_card_json["data"]["extensions"];
+        let extracted = extra_definitions_from_st_extensions(extensions);
+        assert_eq!(extracted.len(), 1, "空名草案被过滤");
+        assert_eq!(extracted[0].name, "艾琳");
+        assert_eq!(extracted[0].group.as_deref(), Some("主角团"));
+
+        // 无附加定义时 extensions 不带该键、提取返回空
+        let plain = CardArtifacts {
+            name: "单角色".into(),
+            description: "d".into(),
+            first_mes: "f".into(),
+            ..CardArtifacts::default()
+        };
+        let plain_compiled = compile_artifacts(&plain).expect("编译成功");
+        let ext = &plain_compiled.st_card_json["data"]["extensions"];
+        assert!(ext["storyforge"].get("extra_definitions").is_none());
+        assert!(extra_definitions_from_st_extensions(ext).is_empty());
+    }
+
+    /// Phase 3 骨架：世界书高级策略字段进 entry.extensions。
+    #[test]
+    fn worldview_advanced_fields_land_in_entry_extensions() {
+        let arts = CardArtifacts {
+            name: "策略卡".into(),
+            description: "d".into(),
+            first_mes: "f".into(),
+            worldview_entries: vec![WorldviewDraftEntry {
+                keys: vec!["暗号".into()],
+                content: "概率触发条目。".into(),
+                constant: false,
+                order: 10,
+                probability: Some(30),
+                exclude_recursion: Some(true),
+                group: Some("支线".into()),
+            }],
+            ..CardArtifacts::default()
+        };
+        let compiled = compile_artifacts(&arts).expect("编译成功");
+        let book = compiled.character.embedded_world_info.expect("世界书");
+        let ext = &book.entries[0].extensions;
+        assert_eq!(ext["probability"], 30);
+        assert_eq!(ext["useProbability"], true);
+        assert_eq!(ext["exclude_recursion"], true);
+        assert_eq!(ext["group"], "支线");
     }
 
     #[test]

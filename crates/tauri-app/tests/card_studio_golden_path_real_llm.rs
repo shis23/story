@@ -357,12 +357,14 @@ fn c_path_source_artifacts() -> CardArtifacts {
                 content: "常驻：灯亮时，站台是安全的。".into(),
                 constant: true,
                 order: 10,
+                ..WorldviewDraftEntry::default()
             },
             WorldviewDraftEntry {
                 keys: vec!["纸罩灯".into(), "灯".into()],
                 content: "纸罩灯的火苗不怕雨，只怕谎话。".into(),
                 constant: false,
                 order: 20,
+                ..WorldviewDraftEntry::default()
             },
         ],
         ..Default::default()
