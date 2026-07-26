@@ -68,6 +68,9 @@ pub struct CompilePreviewDto {
 pub struct ImportCompiledResultDto {
     pub character: CharacterSummary,
     pub card_id: String,
+    /// domain Character.id（tool_ctx / extract_characters 的精确主键；
+    /// character.id 是 StoredCharacter 存储 id，两者无关）
+    pub source_character_id: String,
     pub warnings: Vec<String>,
 }
 
@@ -779,6 +782,7 @@ pub fn cardstudio_import_compiled(
     Ok(ImportCompiledResultDto {
         character: CharacterSummary::from(stored),
         card_id: stored_card.card.id.as_str().to_string(),
+        source_character_id: character.id.as_str().to_string(),
         warnings,
     })
 }

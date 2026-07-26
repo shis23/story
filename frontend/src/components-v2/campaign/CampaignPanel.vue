@@ -456,7 +456,8 @@ defineExpose({ refreshActiveDetailTab })
             v-if="cardsView === 'studio'"
             :seed="studioSeed"
             @close="cardsView = 'library'; studioSeed = null"
-            @imported="async () => { cardsView = 'library'; studioSeed = null; await refreshCards() }"
+            @imported="refreshCards"
+            @go-library="async () => { cardsView = 'library'; studioSeed = null; await refreshCards() }"
           />
           <CardLibrary
             v-else

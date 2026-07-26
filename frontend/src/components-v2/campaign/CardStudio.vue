@@ -20,6 +20,7 @@ import {
   cardstudioSetOptions,
   cardstudioSetStage,
   cardstudioUpdateArtifacts,
+  extractCharacters,
 } from '../../tauri-api.js'
 import Button from '../ui/Button.vue'
 import EmptyState from '../ui/EmptyState.vue'
@@ -29,7 +30,7 @@ const props = defineProps({
   /** optional { characterId, brief } to auto-open revise project */
   seed: { type: Object, default: null },
 })
-const emit = defineEmits(['imported', 'close'])
+const emit = defineEmits(['imported', 'close', 'go-library'])
 
 const STAGE_META = [
   { id: 'brief', label: '意图' },
@@ -560,6 +561,27 @@ async function importCompiled() {
   }
 }
 
+/** 导入成功后的一键导航：可选先跑角色识别，再回卡库 */
+async function goLibraryAfterImport(withExtract) {
+  if (!lastImport.value) return
+  const cardId = lastImport.value.card_id
+  if (withExtract) {
+    busy.value = true
+    statusText.value = '正在识别角色…'
+    try {
+      const extractId =
+        lastImport.value.source_character_id || lastImport.value.character?.id
+      await extractCharacters(extractId, { force: true })
+      statusText.value = '角色识别完成'
+    } catch (e) {
+      await alertDialog('角色识别失败（卡已导入，可稍后在卡库重试）: ' + e)
+    } finally {
+      busy.value = false
+    }
+  }
+  emit('go-library', { cardId })
+}
+
 function stageBadgeClass(status) {
   if (status === 'done') return 'text-ok'
   if (status === 'ready') return 'text-accent'
@@ -815,9 +837,15 @@ watch(
           <span v-if="lastCompile.warnings?.length"> · 警告 {{ lastCompile.warnings.length }} 条</span>
         </div>
 
-        <div v-if="lastImport" class="text-xs text-ok">
-          导入成功：{{ lastImport.character?.name }} / card {{ lastImport.card_id }}
-          <span v-if="lastImport.warnings?.length">；警告 {{ lastImport.warnings.length }} 条</span>
+        <div v-if="lastImport" class="text-xs space-y-2 rounded-lg border border-line bg-surface-2/50 p-3">
+          <div class="text-ok">
+            导入成功：{{ lastImport.character?.name }} / card {{ lastImport.card_id }}
+            <span v-if="lastImport.warnings?.length">；警告 {{ lastImport.warnings.length }} 条</span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <Button variant="primary" size="sm" :loading="busy" :disabled="busy" @click="goLibraryAfterImport(true)">识别角色并去卡库</Button>
+            <Button variant="default" size="sm" :disabled="busy" @click="goLibraryAfterImport(false)">去卡库查看</Button>
+          </div>
         </div>
 
         <details v-if="project.last_stage_output" class="text-xs">

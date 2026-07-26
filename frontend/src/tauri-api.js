@@ -977,6 +977,7 @@ export async function cardstudioImportCompiled(id) {
       imported_at: '2026-07-22 00:00:00',
     },
     card_id: 'mock-card',
+    source_character_id: 'mock-imported-domain',
     warnings: [],
   }
 }
