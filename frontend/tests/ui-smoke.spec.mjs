@@ -226,26 +226,30 @@ test.beforeEach(async ({ page }) => {
   await installTauriInvokeMock(page)
 })
 
+// AppV2 走查：桌面宽度下侧栏 docked 常显、调试抽屉是 docked 面板（非 dialog）、
+// 插件面板 inline 挂载。定位一律用 role/name，避免对 DOM 结构顺序的脆弱假设。
 test('opens the mocked Tauri app and visible panels', async ({ page }) => {
   await page.goto('/')
   await expect(page.locator('#app')).toBeVisible()
   await expect(page.locator('main')).toBeVisible()
   await page.screenshot({ path: `${artifactDir}/main.png`, fullPage: true })
 
-  await page.locator('header button').last().click()
-  await expect(page.locator('[role="dialog"]').last()).toBeVisible()
-  await expect(page.locator('aside')).toBeVisible()
-  await page.screenshot({ path: `${artifactDir}/debug-drawer.png`, fullPage: true })
-  await page.keyboard.press('Escape')
-  await expect(page.locator('[role="dialog"]')).toHaveCount(0)
-
-  await page.locator('header button').first().click()
-  await expect(page.locator('nav')).toBeVisible()
+  // 侧栏导航（desktop docked 常显）
+  await expect(page.getByRole('navigation')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Campaign 管理' })).toBeVisible()
   await page.screenshot({ path: `${artifactDir}/sidebar.png`, fullPage: true })
 
-  await page.locator('nav button').nth(8).click()
-  await expect(page.locator('[role="dialog"]').last()).toBeVisible()
-  await expect(page.locator('[role="dialog"]').last()).toContainText('UI Smoke Plugin')
+  // 调试抽屉：过程与调试 → 流水线 tab 出现
+  await page.getByRole('button', { name: '过程与调试' }).click()
+  await expect(page.getByRole('tab', { name: '流水线' })).toBeVisible()
+  await page.screenshot({ path: `${artifactDir}/debug-drawer.png`, fullPage: true })
+  // 关掉抽屉（overlay 模式的背景幕会拦截后续点击）
+  await page.getByRole('button', { name: '关闭' }).first().click()
+  await expect(page.getByRole('tab', { name: '流水线' })).toBeHidden()
+
+  // 插件面板：mock 的插件名可见
+  await page.getByRole('button', { name: '插件', exact: true }).click()
+  await expect(page.getByText('UI Smoke Plugin').first()).toBeVisible()
   await page.screenshot({ path: `${artifactDir}/plugin-panel.png`, fullPage: true })
 
   const calls = await page.evaluate(() => window.__UI_SMOKE_TAURI_CALLS__.map((call) => call.command))

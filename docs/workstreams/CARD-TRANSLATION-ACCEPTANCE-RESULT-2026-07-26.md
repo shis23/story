@@ -172,3 +172,34 @@
 - 复核判定 **SHIP**（评审代理独立重放验证：判据代码 + 测试 + build）。
 - workspace 全量回归（含本次接线）：70 个测试目标全 `ok`，0 失败；
   前端最终 node --test 380 / vitest 52 全过。
+
+## 异机复现指南（2026-07-27 补，发布门禁 P1）
+
+验收分两层，确定性层任何机器可跑，真实模型层需要凭证与验收卡：
+
+```powershell
+# 确定性层（无凭证；验收卡缺失时逐卡跳过、不 fail——CI 上属正常）
+cargo test -p harness-real-llm --test card_translation_acceptance
+
+# 真实模型层（#[ignore]）
+$env:LLM_BASE_URL='https://cli.2529985.xyz/v1'
+$env:LLM_API_KEY='<key，只进环境变量，绝不写入文件>'
+$env:LLM_MODEL='deepseek-v4-pro'
+$env:STORYFORGE_CT_MODELS='deepseek-v4-pro,deepseek-v4-flash'
+$env:STORYFORGE_LLM_TIMEOUT_SECS='600'
+cargo test -p harness-real-llm --test card_translation_acceptance -- --ignored --nocapture
+```
+
+环境变量总表：
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `STORYFORGE_CT_CARD_DESTINY` | 命定之诗卡 PNG 路径 | 仓库根 `test-card.png`（未入库的本机文件） |
+| `STORYFORGE_CT_CARD_QINGQING` | 卿卿卡 PNG 路径 | 仓库根 `卿卿 (33).png`（未入库） |
+| `STORYFORGE_CT_MODELS` | 逗号分隔的验收模型列表 | 必填（真实层） |
+| `STORYFORGE_CT_EVIDENCE_DIR` | 证据 JSON 输出目录，**必须绝对路径**（集成测试 cwd 在包目录，相对路径会写错地方） | `<repo>/artifacts/card-translation` |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 中继凭证与 require_real_llm 兜底模型 | 必填（真实层） |
+| `STORYFORGE_LLM_TIMEOUT_SECS` | 单请求超时（Cloudflare 边缘 ~100s 掐 524，流式已规避，仍建议 600） | 客户端默认 |
+
+异机所需材料：两张验收卡 PNG（个人素材，不入库，路径经上表 env 指入）+
+中继 key。证据 JSON 为脱敏格式（计数/键名/断言，无卡正文），可直接入库对比。

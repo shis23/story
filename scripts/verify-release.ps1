@@ -4,7 +4,8 @@ Runs the StoryForge release gate on Windows PowerShell.
 
 .DESCRIPTION
 Runs the release checks in a fixed fail-fast order:
-secret scan, cargo fmt, cargo clippy, cargo test, frontend tests, and frontend build.
+secret scan, cargo fmt, cargo clippy, cargo test, frontend unit tests,
+frontend component tests (vitest), and frontend build.
 
 The secret scan checks Git-tracked files only and excludes target, node_modules,
 frontend/dist, and .git. It reports rule names and locations without echoing
@@ -35,7 +36,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $script:StepNumber = 0
-$TotalSteps = if ($SecretScanOnly) { 1 } else { 6 }
+$TotalSteps = if ($SecretScanOnly) { 1 } else { 7 }
 
 function Find-RepoRoot {
     $start = (Get-Location).ProviderPath
@@ -160,6 +161,7 @@ try {
     Invoke-NativeStep -Name 'cargo clippy --workspace --all-targets -- -D warnings' -WorkingDirectory $repoRoot -Command @('cargo', 'clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
     Invoke-NativeStep -Name 'cargo test --workspace' -WorkingDirectory $repoRoot -Command @('cargo', 'test', '--workspace')
     Invoke-NativeStep -Name 'frontend npm.cmd test' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'test')
+    Invoke-NativeStep -Name 'frontend npm.cmd run test:ui (vitest)' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'test:ui')
     Invoke-NativeStep -Name 'frontend npm.cmd run build' -WorkingDirectory $frontendRoot -Command @('npm.cmd', 'run', 'build')
 
     Write-Host ''

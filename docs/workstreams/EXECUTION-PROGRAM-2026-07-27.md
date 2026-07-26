@@ -56,12 +56,18 @@
   且 revision 只 bump 一次。③SQLite 内联质量门改调 domain
   `quality_accept_decision`（与 JSON 路径同源）。完整共享状态机抽取排后（周级）。
 
-### P1 发布门禁
+### P1 发布门禁（2026-07-27 全部完成）
 
-- [ ] vitest 组件层入 `scripts/verify-release.ps1`（现只跑 npm test，见 :162）
-- [ ] Playwright UI smoke 死代码（@playwright/test 未声明、glob 不匹配、永远 skip）：修活或明确移除
-- [ ] CardStudio.vue（858 行）零测试 → 补挂载冒烟（照 app-frame-walkthrough.test.mjs 模式）
-- [ ] 真卡验收 env 覆盖已支持（STORYFORGE_CT_CARD_DESTINY/QINGQING），补文档说明异机复现
+- [x] vitest 组件层入 `scripts/verify-release.ps1`（新步骤 6/7 `npm run test:ui`）
+- [x] Playwright UI smoke **修活**：@playwright/test 入 devDependencies + 本机装
+  Chromium；spec 从旧 App.vue 假设重写为 AppV2 走查（role/name 定位：主界面 →
+  侧栏 → 调试抽屉开/关 → 插件面板 mock 插件可见 → IPC 调用清单断言）。
+  实跑绿：4 张截图 + test-results 无失败（artifacts/ui-smoke/20260727-030939）。
+  smoke:ui 不入严格门禁（需 dev server + 浏览器），保持手动/CI 可选步骤。
+- [x] CardStudio.vue 挂载冒烟 `tests/components-v2/card-studio.test.mjs`
+  （空列表态 / 列表渲染+打开项目阶段条 / 从零创建调用链，3 用例）
+- [x] 真卡验收异机复现指南补入 CARD-TRANSLATION-ACCEPTANCE-RESULT
+  （env 总表 + 证据目录绝对路径坑位）
 
 ### P2 既定队列（今晚早些时候排定）
 
