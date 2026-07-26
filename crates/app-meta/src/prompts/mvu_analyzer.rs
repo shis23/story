@@ -38,7 +38,7 @@ pub const MVU_ANALYZER_SYSTEM_PROMPT: &str = r#"你是卡内状态栏分析助�
 - 在场/分阶段人设用 EJS 控制器（<% getvar('stat_data.….是否在场') %>、好感度阈值分段拉取人设条目）
 - 变量引擎是远程 MagVarUpdate 框架（tavern_helper 一行 import），字段 schema 可能在远程 Zod 模块
 对这类卡的翻译要求：
-- variable_schema 从 [InitVar] 树 + 开场白 <UpdateVariable> 种子推导，保持原变量路径层级（如 stat_data.女性角色.某人.好感度），value_type 按值形态判断
+- variable_schema 从 [InitVar] 树 + 开场白 <UpdateVariable> 种子推导，保持原变量路径层级，统一用点记法且去掉 stat_data. 容器前缀（如 女性角色.某人.好感度，不写 stat_data.女性角色.某人.好感度，也不写 /女性角色/某人/好感度），value_type 按值形态判断
 - EJS 控制器翻译为 update_rules（写明变量、阈值区间、各区间效果），不要把 EJS 源码留在产物里
 - 远程框架本身不翻译（在 notes 里注明依赖）；只翻译卡专属逻辑
 
@@ -92,6 +92,7 @@ pub const MVU_ANALYZER_SYSTEM_PROMPT: &str = r#"你是卡内状态栏分析助�
 }
 
 【字段类型约束】
+- 变量 key 一律点记法路径（a.b.c），不带 stat_data. 前缀，不用 / 分隔；同构角色子树的模板占位符段用 {角色名} 形式（不用 <角色名>）。variable_schema、ui_bindings.variable_key、interactions 的 key 三处记法保持一致
 - value_type 取值：int / float / string / bool / json（小写）
 - display.kind 取值：bar（带 max）/ text / tag / icon（带 mapping）
 - interactions[].actions[].kind 取值：modify_variable（key+value_expr）/ trigger_next_turn（hint）/ multi（actions）/ run_original_js（js_snippet+description）

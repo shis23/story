@@ -91,6 +91,47 @@ test('plans a mapping into writes, hints, and skipped entries', () => {
   assert.equal(plan.skipped[1].kind, 'run_original_js')
 })
 
+test('plans across key notations: resolves stored key and rewrites target', () => {
+  // 存量变量以旧记法入库（stat_data. 前缀），action 键是归一化点记法：
+  // 取值要跨记法命中，写回要用已存储的键（不产生第二个变量）
+  const legacyStored = planMvuInteraction(
+    {
+      element_label: '受击',
+      actions: [{ kind: 'modify_variable', key: '主角.hp', value_expr: '-10' }],
+    },
+    { variables: [{ key: 'stat_data.主角.hp', value: 80 }] },
+  )
+  assert.deepEqual(legacyStored.writes, [{ key: 'stat_data.主角.hp', value: 70 }])
+
+  // 反向：action 键是旧记法，变量已是归一化键
+  const legacyAction = planMvuInteraction(
+    {
+      element_label: '受击',
+      actions: [{ kind: 'modify_variable', key: 'stat_data.主角.hp', value_expr: '-10' }],
+    },
+    { variables: [{ key: '主角.hp', value: 80 }] },
+  )
+  assert.deepEqual(legacyAction.writes, [{ key: '主角.hp', value: 70 }])
+
+  // 无现有变量：新变量用归一化键落盘
+  const fresh = planMvuInteraction(
+    {
+      element_label: '标记',
+      actions: [{ kind: 'modify_variable', key: '/世界/天气', value_expr: '雨' }],
+    },
+    { variables: [] },
+  )
+  assert.deepEqual(fresh.writes, [{ key: '世界.天气', value: '雨' }])
+})
+
+test('keyed delta expr matches target across notations', () => {
+  // key 与表达式前导标识符记法不同但归一后相同 → 按增量解释
+  assert.deepEqual(evaluateMvuValueExpr('stat_data.hp - 10', 80, 'hp'), { ok: true, value: 70 })
+  assert.deepEqual(evaluateMvuValueExpr('hp + 5', 80, 'stat_data.hp'), { ok: true, value: 85 })
+  // 归一后仍不同 → 拒绝（引用其他变量）
+  assert.equal(evaluateMvuValueExpr('stat_data.mp - 10', 80, 'hp').ok, false)
+})
+
 test('plans an empty mapping safely', () => {
   const plan = planMvuInteraction(null, {})
   assert.deepEqual(plan.writes, [])

@@ -5,6 +5,8 @@
 //   modify_variable { key, value_expr } / trigger_next_turn { hint }
 //   / multi { actions } / run_original_js { js_snippet, description }（留桩不执行）
 
+import { findMvuVariable, normalizeMvuKey } from './mvuKey.js'
+
 const MAX_FLATTEN_DEPTH = 5
 
 export function flattenInteractionActions(actions, depth = 0) {
@@ -53,10 +55,15 @@ export function evaluateMvuValueExpr(valueExpr, currentValue, key) {
     return { ok: true, value: delta }
   }
 
-  // "<ident> ± N"：ident 必须是目标变量本身（"hp - 10" 之于 key="hp"）
+  // "<ident> ± N"：ident 必须是目标变量本身（"hp - 10" 之于 key="hp"）。
+  // 记法归一后比对，兜住存量产物 key 与表达式记法不一致的情况
+  // （如 key="hp"，expr="stat_data.hp - 10"）
   const keyedDeltaMatch = raw.match(/^([\p{L}\p{N}_.]+)\s*([+-])\s*(\d+(?:\.\d+)?)$/u)
   if (keyedDeltaMatch && !/^\d/.test(keyedDeltaMatch[1])) {
-    if (key != null && keyedDeltaMatch[1] === key) {
+    const identMatchesKey =
+      key != null &&
+      (keyedDeltaMatch[1] === key || normalizeMvuKey(keyedDeltaMatch[1]) === normalizeMvuKey(key))
+    if (identMatchesKey) {
       const delta = Number(keyedDeltaMatch[3]) * (keyedDeltaMatch[2] === '-' ? -1 : 1)
       return { ok: true, value: (hasNumericCurrent ? current : 0) + delta }
     }
@@ -92,10 +99,13 @@ export function planMvuInteraction(mapping, { variables } = {}) {
   }
   for (const action of flattenInteractionActions(mapping?.actions)) {
     if (action.kind === 'modify_variable') {
-      const currentValue = vars.find((v) => v?.key === action.key)?.value
-      const result = evaluateMvuValueExpr(action.value_expr, currentValue, action.key)
+      // 跨记法查现有变量；写回优先用已存储的键（避免同一变量两种记法并存），
+      // 无现有变量时用归一化键落新变量
+      const targetVar = findMvuVariable(vars, action.key)
+      const result = evaluateMvuValueExpr(action.value_expr, targetVar?.value, action.key)
       if (result.ok) {
-        plan.writes.push({ key: action.key, value: result.value })
+        const writeKey = targetVar?.key || normalizeMvuKey(action.key) || action.key
+        plan.writes.push({ key: writeKey, value: result.value })
       } else {
         plan.skipped.push({ kind: action.kind, key: action.key, reason: result.reason })
       }

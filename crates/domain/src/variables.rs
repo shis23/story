@@ -151,6 +151,62 @@ pub fn merge_schema(base: &[VariableField], extra: &[VariableField]) -> Vec<Vari
     map.into_values().collect()
 }
 
+// ─── MVU 变量键记法归一化 ────────────────────────────────────────────────
+//
+// forge 差分实测（2026-07-26）：模型输出的变量键记法不稳定——同一张卡
+// pro 输出斜杠记法（/世界/时间）、flash 输出点记法，模板段有 {角色名} 和
+// <角色名> 两种写法，且常带 stat_data. 容器前缀。下游消费端（schema 应用、
+// ui_bindings 匹配、变量读写）只认字面键，必须在解析边界统一记法。
+// 前端镜像实现：frontend/src/utils/mvuKey.js（normalizeMvuKey）。
+
+/// 归一化 MVU 变量键记法为 canonical 形式：点记法、无 `stat_data.` 前缀、
+/// 模板占位符段统一 `{...}`。
+///
+/// - 斜杠记法 → 点记法：仅当键以 `/` 或 `stat_data/` 开头才转换，
+///   避免误伤名字里含 `/` 的普通键（如 `攻/防`）
+/// - 反复剥离 `stat_data.` 前缀（ST-MVU 的存储容器，原生变量无此层）
+/// - 段级 `<xxx>` → `{xxx}`
+/// - 去除首尾空白与空段
+pub fn normalize_mvu_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let dotted: String = if trimmed.starts_with('/') || trimmed.starts_with("stat_data/") {
+        trimmed.trim_start_matches('/').replace('/', ".")
+    } else {
+        trimmed.to_string()
+    };
+    let mut rest = dotted.as_str();
+    while let Some(stripped) = rest.strip_prefix("stat_data.") {
+        rest = stripped;
+    }
+    rest.split('.')
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            if seg.len() >= 2 && seg.starts_with('<') && seg.ends_with('>') {
+                format!("{{{}}}", &seg[1..seg.len() - 1])
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// 对一份 schema 的所有 key 做记法归一，归一后同 key 去重（先到先得）、
+/// 空 key 丢弃。用于 LLM 翻译产物入库前和存量产物应用前的边界清洗。
+pub fn normalize_schema_keys(fields: Vec<VariableField>) -> Vec<VariableField> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(fields.len());
+    for mut field in fields {
+        field.key = normalize_mvu_key(&field.key);
+        if field.key.is_empty() || !seen.insert(field.key.clone()) {
+            continue;
+        }
+        out.push(field);
+    }
+    out
+}
+
 // ─── MVU initvar 探测（字段级解析，对应设计 §19 / §23.3）─────────────────
 //
 // P1 阶段只做字段级解析：探测 ST 卡 extensions 里的结构化 stat_data / initvar
@@ -494,6 +550,64 @@ mod tests {
         let ext = serde_json::json!({"depth_prompt": {"prompt": "无关字段"}});
         let schema = extract_mvu_schema_from_extensions(&ext);
         assert!(schema.is_empty());
+    }
+
+    // ─── 键记法归一化测试 ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_mvu_key_notations() {
+        // 点记法（canonical）原样保留
+        assert_eq!(normalize_mvu_key("主角.属性.力量"), "主角.属性.力量");
+        // 斜杠记法（pro 实测输出）→ 点记法
+        assert_eq!(normalize_mvu_key("/世界/时间"), "世界.时间");
+        assert_eq!(normalize_mvu_key("/主角/属性/力量"), "主角.属性.力量");
+        // stat_data 前缀剥离（点/斜杠两种形态）
+        assert_eq!(normalize_mvu_key("stat_data.主角.好感度"), "主角.好感度");
+        assert_eq!(normalize_mvu_key("stat_data/主角/好感度"), "主角.好感度");
+        // 模板占位符段统一花括号
+        assert_eq!(normalize_mvu_key("女性角色.<角色名>.好感度"), "女性角色.{角色名}.好感度");
+        assert_eq!(normalize_mvu_key("女性角色.{角色名}.好感度"), "女性角色.{角色名}.好感度");
+        // 首尾空白与空段清理
+        assert_eq!(normalize_mvu_key("  hp  "), "hp");
+        assert_eq!(normalize_mvu_key("主角..hp"), "主角.hp");
+        // 不以 / 开头的含斜杠键不转换（可能是普通名字）
+        assert_eq!(normalize_mvu_key("攻/防"), "攻/防");
+        // 恰为 stat_data 本身不剥成空
+        assert_eq!(normalize_mvu_key("stat_data"), "stat_data");
+    }
+
+    #[test]
+    fn test_normalize_schema_keys_dedup_and_drop_empty() {
+        let fields = vec![
+            VariableField {
+                key: "stat_data.hp".into(),
+                label: "生命".into(),
+                value_type: VariableType::Int,
+                default: serde_json::json!(100),
+                description: None,
+                group: None,
+            },
+            VariableField {
+                key: "/hp".into(), // 归一后与上一条同 key → 去重，先到先得
+                label: "重复".into(),
+                value_type: VariableType::Int,
+                default: serde_json::json!(0),
+                description: None,
+                group: None,
+            },
+            VariableField {
+                key: "   ".into(), // 归一后为空 → 丢弃
+                label: "空".into(),
+                value_type: VariableType::String,
+                default: serde_json::json!(""),
+                description: None,
+                group: None,
+            },
+        ];
+        let out = normalize_schema_keys(fields);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "hp");
+        assert_eq!(out[0].label, "生命");
     }
 
     #[test]

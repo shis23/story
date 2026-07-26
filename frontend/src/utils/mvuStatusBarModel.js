@@ -1,5 +1,7 @@
+import { findMvuVariable } from './mvuKey.js'
+
 export function getMvuValue(variables, key) {
-  const found = (variables || []).find(item => item.key === key)
+  const found = findMvuVariable(variables, key)
   return found ? found.value : null
 }
 

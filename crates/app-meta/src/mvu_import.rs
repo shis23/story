@@ -25,7 +25,8 @@ use storyforge_domain::mvu_translation::{
 };
 use storyforge_domain::preset::Preset;
 use storyforge_domain::variables::{
-    VariableField, VariableType, extract_mvu_schema_from_extensions,
+    VariableField, VariableType, extract_mvu_schema_from_extensions, normalize_mvu_key,
+    normalize_schema_keys,
 };
 
 use crate::MetaError;
@@ -388,15 +389,17 @@ struct FallbackFragmentRaw {
 
 impl MvuTranslationRaw {
     fn into_translation(self, field_schema: &[VariableField]) -> MvuTranslation {
-        // variable_schema：LLM 输出优先，空则用 P1 已探测字段
-        let variable_schema = if self.variable_schema.is_empty() {
+        // variable_schema：LLM 输出优先，空则用 P1 已探测字段。
+        // 两路都过键记法归一（点记法/去 stat_data. 前缀/{} 占位符），
+        // 模型间记法漂移在此边界收敛（forge 差分 2026-07-26 实测）。
+        let variable_schema = normalize_schema_keys(if self.variable_schema.is_empty() {
             field_schema.to_vec()
         } else {
             self.variable_schema
                 .into_iter()
                 .map(|r| r.into_field())
                 .collect()
-        };
+        });
 
         let ui_bindings: Vec<UiBinding> = self
             .ui_bindings
@@ -404,9 +407,10 @@ impl MvuTranslationRaw {
             .filter(|b| !b.element.is_empty() && !b.variable_key.is_empty())
             .map(|b| UiBinding {
                 element: b.element,
-                variable_key: b.variable_key,
+                variable_key: normalize_mvu_key(&b.variable_key),
                 display: parse_display(&b.display),
             })
+            .filter(|b| !b.variable_key.is_empty())
             .collect();
 
         let interactions: Vec<InteractionMapping> = self
@@ -563,22 +567,45 @@ fn parse_action(val: &serde_json::Value) -> InteractionAction {
                 .unwrap_or("")
                 .to_string(),
         },
-        _ => InteractionAction::ModifyVariable {
-            key: val
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            value_expr: val
+        _ => {
+            let raw_key = val.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let key = normalize_mvu_key(raw_key);
+            let raw_expr = val
                 .get("value_expr")
                 .or_else(|| val.get("value"))
                 .map(|v| match v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 })
-                .unwrap_or_default(),
-        },
+                .unwrap_or_default();
+            let value_expr = rewrite_self_ref_expr(&raw_expr, raw_key, &key);
+            InteractionAction::ModifyVariable { key, value_expr }
+        }
     }
+}
+
+/// key 归一后，把 value_expr 里的键自引用（"hp - 10" 之于 key="hp"）同步改写。
+/// 前端 keyed-delta 解释要求表达式前导标识符与目标 key 一致，key 单方面归一
+/// 会导致失配（安全侧跳过但功能丢失）。只改写严格的「原 key ± 数字」形态。
+fn rewrite_self_ref_expr(expr: &str, raw_key: &str, norm_key: &str) -> String {
+    if raw_key.is_empty() || raw_key == norm_key {
+        return expr.to_string();
+    }
+    let trimmed = expr.trim();
+    if let Some(rest) = trimmed.strip_prefix(raw_key) {
+        let rest = rest.trim_start();
+        if let Some(num) = rest.strip_prefix('+').or_else(|| rest.strip_prefix('-')) {
+            let num = num.trim();
+            if !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && num.chars().any(|c| c.is_ascii_digit())
+            {
+                let sign = if rest.starts_with('+') { '+' } else { '-' };
+                return format!("{norm_key} {sign} {num}");
+            }
+        }
+    }
+    expr.to_string()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -917,6 +944,68 @@ mod tests {
         let resp = make_response(&content, vec![]);
         let t = parse_mvu_translation_from_response(&resp, &[]).unwrap();
         assert_eq!(t.ui_bindings.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_normalizes_key_notation_across_products() {
+        // 模型键记法漂移（斜杠 / stat_data 前缀 / <> 占位符）在解析边界收敛：
+        // variable_schema、ui_bindings、interactions 三处都归一，且 modify_variable
+        // 的键自引用表达式（"raw_key - 10"）同步改写为归一后 key。
+        let json = r#"{
+          "variable_schema": [
+            {"key": "/世界/时间", "label": "时间", "value_type": "string", "default": "清晨"},
+            {"key": "stat_data.主角.hp", "label": "生命", "value_type": "int", "default": 100},
+            {"key": "女性角色.<角色名>.好感度", "label": "好感", "value_type": "int", "default": 0}
+          ],
+          "ui_bindings": [
+            {"element": "hp_bar", "variable_key": "stat_data.主角.hp", "display": {"kind": "bar", "max": 100}}
+          ],
+          "update_rules": [],
+          "interactions": [
+            {"element_label": "受击", "actions": [{"kind": "modify_variable", "key": "stat_data.主角.hp", "value_expr": "stat_data.主角.hp - 10"}]}
+          ],
+          "fallback_fragments": [],
+          "routing": {"kind": "native"}
+        }"#;
+        let resp = make_response(json, vec![]);
+        let t = parse_mvu_translation_from_response(&resp, &[]).unwrap();
+
+        let keys: Vec<&str> = t.variable_schema.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, vec!["世界.时间", "主角.hp", "女性角色.{角色名}.好感度"]);
+
+        assert_eq!(t.ui_bindings[0].variable_key, "主角.hp");
+
+        match &t.interactions[0].actions[0] {
+            InteractionAction::ModifyVariable { key, value_expr } => {
+                assert_eq!(key, "主角.hp");
+                assert_eq!(value_expr, "主角.hp - 10");
+            }
+            other => panic!("应为 ModifyVariable，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_self_ref_expr_only_strict_delta_form() {
+        // 严格「原 key ± 数字」才改写
+        assert_eq!(
+            rewrite_self_ref_expr("stat_data.hp - 10", "stat_data.hp", "hp"),
+            "hp - 10"
+        );
+        assert_eq!(
+            rewrite_self_ref_expr("stat_data.hp+5.5", "stat_data.hp", "hp"),
+            "hp + 5.5"
+        );
+        // 非自引用 / 复杂表达式不动
+        assert_eq!(
+            rewrite_self_ref_expr("stat_data.mp - 10", "stat_data.hp", "hp"),
+            "stat_data.mp - 10"
+        );
+        assert_eq!(
+            rewrite_self_ref_expr("stat_data.hp * 2", "stat_data.hp", "hp"),
+            "stat_data.hp * 2"
+        );
+        // key 未变时不动
+        assert_eq!(rewrite_self_ref_expr("hp - 10", "hp", "hp"), "hp - 10");
     }
 
     #[test]
