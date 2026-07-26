@@ -233,7 +233,11 @@ fn build_worldbook_variable_section(card: &Character) -> Option<String> {
     let mut out = String::from(
         "【世界书变量条目（[InitVar]=初始变量数据（常为禁用态，属正常）；[mvu_update]=更新规则；请翻译进 variable_schema / update_rules）】\n",
     );
-    let mut budget = 14_000usize;
+    // 预算教训（2026-07-27，forge 差分定位）：destiny 两个模型 schema 覆盖率
+    // 恰好同为 50.9%——确定性输入截断的指纹，不是模型能力问题。[InitVar]
+    // 树是 variable_schema 的唯一事实来源，中段被 truncate 就意味着中段
+    // 子树永远进不了 schema，预算必须容得下整棵树。
+    let mut budget = 40_000usize;
     let mut hit = false;
     for entry in &book.entries {
         let comment = entry_comment(entry);
@@ -246,7 +250,9 @@ fn build_worldbook_variable_section(card: &Character) -> Option<String> {
         if !is_var_entry || budget == 0 {
             continue;
         }
-        let body = truncate_for_prompt(&entry.content, 4000.min(budget));
+        // [InitVar] 数据条目给大额度（整树不可截断），规则类条目维持小额度
+        let per_entry_cap = if c_lower.contains("initvar") { 24_000 } else { 4_000 };
+        let body = truncate_for_prompt(&entry.content, per_entry_cap.min(budget));
         budget = budget.saturating_sub(body.chars().count());
         out.push_str(&format!(
             "--- {}（{}{}）---\n{}\n",
@@ -562,6 +568,42 @@ mod tests {
             ]
         });
         card
+    }
+
+    #[test]
+    fn test_initvar_entry_survives_budget_without_middle_truncation() {
+        // 覆盖率缺口根因回归：大 [InitVar] 树的中段不得被截断。
+        // 旧预算（单条 4000/总 14000）会把 20K 字的树砍掉中间——
+        // 中段子树永远进不了 variable_schema，且两模型覆盖率完全一致。
+        use storyforge_domain::world_info::WorldInfoBook;
+        let mut lines = vec!["变量树:".to_string()];
+        for i in 0..800 {
+            lines.push(format!("  角色{i:03}:\n    好感度: {i}\n    等级: 1"));
+        }
+        // 中段哨兵：截断最先吃掉中间
+        lines.insert(400, "  中段哨兵角色:\n    唯一标记: 42".into());
+        let big_tree = lines.join("\n");
+        assert!(big_tree.chars().count() > 14_000, "样本必须超过旧总预算");
+
+        let st_book: storyforge_domain::character::StWorldInfoBook = serde_json::from_value(
+            serde_json::json!({
+                "entries": [{
+                    "id": 1, "keys": [], "content": big_tree,
+                    "constant": false, "selective": true, "enabled": false,
+                    "comment": "[InitVar]变量初始化"
+                }]
+            }),
+        )
+        .expect("st book json");
+        let mut card = make_card();
+        card.embedded_world_info = Some(WorldInfoBook::from_st(st_book));
+
+        let section = build_worldbook_variable_section(&card).expect("有变量条目");
+        assert!(
+            section.contains("中段哨兵角色"),
+            "InitVar 中段被截断，覆盖率缺口会复现"
+        );
+        assert!(section.contains("角色799"), "树尾也应保留");
     }
 
     #[test]
