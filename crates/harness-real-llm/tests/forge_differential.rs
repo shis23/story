@@ -12,8 +12,7 @@ use std::path::PathBuf;
 use harness_real_llm::card_translation::{load_card, repo_root};
 use harness_real_llm::forge_differential::{
     collect_opening_seed_paths, diff_contents, diff_sections, diff_worldbook, find_initvar_yaml,
-    flatten_initvar_yaml,
-    load_forge_state, schema_alignment,
+    flatten_initvar_yaml, load_forge_state, schema_alignment,
 };
 
 #[test]
