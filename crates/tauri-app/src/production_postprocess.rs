@@ -765,7 +765,12 @@ impl<'a> ProductionPostprocessService<'a> {
         let batch = match &outcome {
             Some(o) => {
                 let pc = PostprocessPersistContext::from_identity(identity);
-                Some(self.build_mutation_batch(&pc, o, present_chars, &pending_temporary_instances)?)
+                Some(self.build_mutation_batch(
+                    &pc,
+                    o,
+                    present_chars,
+                    &pending_temporary_instances,
+                )?)
             }
             None => None,
         };
@@ -1627,12 +1632,7 @@ mod tests {
         let (_tx, cancel_rx) = watch::channel(false);
         let result = fx
             .service(&sink)
-            .apply_outcome(
-                &identity,
-                Some(outcome),
-                &["苏禾".to_string()],
-                &cancel_rx,
-            )
+            .apply_outcome(&identity, Some(outcome), &["苏禾".to_string()], &cancel_rx)
             .unwrap();
         assert!(result.applied);
         let batch = result.batch.expect("batch");
@@ -1709,8 +1709,13 @@ mod tests {
         };
         let present = vec!["苏禾".to_string()];
 
-        let with_temps =
-            build_runtime_mutation_batch(&persist_ctx, &outcome, &present, &runtime, &[temp.clone()]);
+        let with_temps = build_runtime_mutation_batch(
+            &persist_ctx,
+            &outcome,
+            &present,
+            &runtime,
+            &[temp.clone()],
+        );
         assert!(with_temps.mutations.iter().any(|m| matches!(
             m,
             Mutation::UpsertKnowledge(k) if k.character_id == temp.id
@@ -1725,7 +1730,11 @@ mod tests {
             build_runtime_mutation_batch(&persist_ctx, &outcome, &present, &runtime, &[]);
         assert!(!without_temps.mutations.iter().any(|m| matches!(
             m,
-            Mutation::UpsertKnowledge(_) | Mutation::SetVariable { instance_id: Some(_), .. }
+            Mutation::UpsertKnowledge(_)
+                | Mutation::SetVariable {
+                    instance_id: Some(_),
+                    ..
+                }
         )));
     }
 

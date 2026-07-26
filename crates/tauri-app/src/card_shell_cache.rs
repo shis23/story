@@ -158,10 +158,7 @@ impl CardShellCache {
         let mut hasher = Sha256::new();
         hasher.update(url.as_bytes());
         let dig = hasher.finalize();
-        let hex = dig
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let hex = dig.iter().map(|b| format!("{b:02x}")).collect::<String>();
         // Keep a short readable suffix for debugging
         let suffix = url
             .rsplit('/')
@@ -196,7 +193,12 @@ impl CardShellCache {
         Some((path, bytes, content_type))
     }
 
-    pub fn write_cache(&self, url: &str, content_type: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    pub fn write_cache(
+        &self,
+        url: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, String> {
         let _ = std::fs::create_dir_all(&self.cache_dir);
         let path = self.cache_path_for_url(url);
         std::fs::write(&path, bytes).map_err(|e| format!("write cache failed: {e}"))?;
@@ -231,8 +233,8 @@ impl CardShellCache {
             .and_then(|value| value.as_str())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = std::fs::read(&path)
-            .map_err(|_| "card-shell cache resource not found".to_string())?;
+        let bytes =
+            std::fs::read(&path).map_err(|_| "card-shell cache resource not found".to_string())?;
         Ok((bytes, content_type))
     }
 
@@ -280,7 +282,9 @@ impl CardShellCache {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let expected_bytes = resp.content_length().and_then(|length| usize::try_from(length).ok());
+        let expected_bytes = resp
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok());
         if expected_bytes.is_some_and(|length| length > self.max_bytes) {
             return Err(format!(
                 "shell resource too large: {} bytes (max {}) url={url}",
@@ -534,7 +538,11 @@ mod tests {
     fn allow_host_extends_list() {
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
-        assert!(cache.is_url_allowed("https://files.catbox.moe/a.png").is_ok());
+        assert!(
+            cache
+                .is_url_allowed("https://files.catbox.moe/a.png")
+                .is_ok()
+        );
         cache.allow_host("example.com");
         assert!(cache.is_url_allowed("https://example.com/a.js").is_ok());
     }
@@ -544,9 +552,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
 
-        assert!(cache
-            .is_url_allowed("https://i.ibb.co/07F075B/Maplite.webp")
-            .is_ok());
+        assert!(
+            cache
+                .is_url_allowed("https://i.ibb.co/07F075B/Maplite.webp")
+                .is_ok()
+        );
         assert_eq!(cache.max_bytes, 40 * 1024 * 1024);
     }
 
@@ -555,9 +565,11 @@ mod tests {
         // L5：卿卿卡立绘/图鉴走 i.postimg.cc，白名单缺失时壳内 fetch 硬失败
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
-        assert!(cache
-            .is_url_allowed("https://i.postimg.cc/abc123/portrait.png")
-            .is_ok());
+        assert!(
+            cache
+                .is_url_allowed("https://i.postimg.cc/abc123/portrait.png")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -586,7 +598,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
         let path = cache
-            .write_cache("https://i.ibb.co/example/Map.webp", "image/webp", &[1, 2, 3])
+            .write_cache(
+                "https://i.ibb.co/example/Map.webp",
+                "image/webp",
+                &[1, 2, 3],
+            )
             .unwrap();
         let resource_name = path.file_name().unwrap().to_string_lossy().to_string();
 
@@ -594,7 +610,11 @@ mod tests {
             cache.read_protocol_resource(&resource_name).unwrap(),
             (vec![1, 2, 3], "image/webp".into())
         );
-        assert!(cache.read_protocol_resource("../../campaigns.json").is_err());
+        assert!(
+            cache
+                .read_protocol_resource("../../campaigns.json")
+                .is_err()
+        );
     }
 
     #[test]
@@ -614,7 +634,10 @@ mod tests {
             .expect("a cached standard map fallback");
 
         assert_eq!(result.url, DESTINY_ULTRA_MAP_URL);
-        assert_eq!(result.fallback_message.as_deref(), Some(ULTRA_MAP_FALLBACK_MESSAGE));
+        assert_eq!(
+            result.fallback_message.as_deref(),
+            Some(ULTRA_MAP_FALLBACK_MESSAGE)
+        );
         assert!(result.cache_url.is_some());
         assert!(result.body_base64.is_none());
     }
@@ -632,13 +655,21 @@ mod tests {
 
         let removed = cache.clear_cache().unwrap();
         assert!(removed >= 2, "对象与 meta 都应清掉, removed={removed}");
-        assert!(cache.read_cache("https://i.ibb.co/example/a.webp").is_none());
+        assert!(
+            cache
+                .read_cache("https://i.ibb.co/example/a.webp")
+                .is_none()
+        );
 
         // 清空后目录仍可写
         cache
             .write_cache("https://i.ibb.co/example/c.webp", "image/webp", &[5])
             .unwrap();
-        assert!(cache.read_cache("https://i.ibb.co/example/c.webp").is_some());
+        assert!(
+            cache
+                .read_cache("https://i.ibb.co/example/c.webp")
+                .is_some()
+        );
     }
 
     #[test]
@@ -660,10 +691,7 @@ mod tests {
             .expect("cached ultra map should be served");
 
         assert_eq!(result.url, DESTINY_ULTRA_MAP_URL);
-        assert!(
-            result.fallback_message.is_none(),
-            "缓存命中不应带兜底提示"
-        );
+        assert!(result.fallback_message.is_none(), "缓存命中不应带兜底提示");
         assert_eq!(
             result.body_base64.as_deref(),
             Some(b64(&[2u8; 8]).as_str()),
@@ -691,7 +719,11 @@ mod tests {
     fn rejects_ip_literal_redirect_targets_and_limits_unknown_length_bodies() {
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
-        assert!(cache.validate_fetch_url("http://127.0.0.1/internal").is_err());
+        assert!(
+            cache
+                .validate_fetch_url("http://127.0.0.1/internal")
+                .is_err()
+        );
 
         let body = std::io::Cursor::new(vec![0u8; 9]);
         assert!(read_limited_body(body, 8).is_err());

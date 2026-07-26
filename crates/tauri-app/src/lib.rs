@@ -156,7 +156,6 @@ fn get_global_regex_store() -> &'static global_regex_store::GlobalRegexStore {
 static CAMPAIGN_STORE: OnceLock<campaign_store::CampaignStore> = OnceLock::new();
 static COMPRESS_JOB_STORE: OnceLock<compress_job_store::CompressJobStore> = OnceLock::new();
 
-
 fn get_card_shell_cache() -> &'static card_shell_cache::CardShellCache {
     use std::sync::OnceLock;
     static CACHE: OnceLock<card_shell_cache::CardShellCache> = OnceLock::new();
@@ -5208,10 +5207,9 @@ fn dispatch_broadcast(
     use storyforge_domain::character_knowledge::BroadcastTarget;
 
     // 解析广播发起者（source_character_id）的 persisted id，用于排除自身 + 记录来源
-    let broadcaster_inst = update
-        .source_character_id
-        .as_ref()
-        .and_then(|sid| find_instance_by_name_or_id_with_extras(store, camp_id, sid, extra_instances));
+    let broadcaster_inst = update.source_character_id.as_ref().and_then(|sid| {
+        find_instance_by_name_or_id_with_extras(store, camp_id, sid, extra_instances)
+    });
     let broadcaster_id = broadcaster_inst.as_ref().map(|i| i.id.clone());
     let source_character_id = broadcaster_id.clone();
     let source_knowledge_id =
@@ -6043,7 +6041,10 @@ pub struct ConnectionEditDetailDto {
 
 /// 获取单条连接详情供编辑（不含 api_key 明文）。
 #[tauri::command]
-fn get_connection(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<ConnectionEditDetailDto, TauriCommandError> {
+fn get_connection(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ConnectionEditDetailDto, TauriCommandError> {
     let active_id = state.active_conn_id();
     let stored = get_conn_store()
         .get(&id)
@@ -6165,15 +6166,13 @@ async fn update_connection_with_store_async(
     let was_active = state.active_conn_id().as_deref() == Some(id.as_str());
     let id_for_io = id.clone();
     let resolved = tokio::task::spawn_blocking(move || {
-        conn_store
-            .update_existing(&id_for_io, draft)
-            .map_err(|e| {
-                if e.contains("不存在") {
-                    TauriCommandError::not_found(e)
-                } else {
-                    TauriCommandError::storage(format!("存储写入失败: {e}"))
-                }
-            })
+        conn_store.update_existing(&id_for_io, draft).map_err(|e| {
+            if e.contains("不存在") {
+                TauriCommandError::not_found(e)
+            } else {
+                TauriCommandError::storage(format!("存储写入失败: {e}"))
+            }
+        })
     })
     .await
     .map_err(|e| TauriCommandError::internal(format!("更新连接持久化任务失败: {e}")))??;
@@ -6209,7 +6208,9 @@ fn llm_connection_from_create_dto(
     })
 }
 
-fn llm_connection_from_update_dto(req: UpdateConnectionDto) -> Result<LlmConnection, TauriCommandError> {
+fn llm_connection_from_update_dto(
+    req: UpdateConnectionDto,
+) -> Result<LlmConnection, TauriCommandError> {
     let protocol = parse_protocol(&req.protocol)?;
     let tool_mode = parse_tool_mode(&req.tool_mode)?;
     Ok(LlmConnection {
@@ -6583,10 +6584,7 @@ fn delete_campaign_playthrough_in_store(
     campaign_id: &Id,
 ) -> Result<(), TauriCommandError> {
     let campaign = store.get_campaign(campaign_id).ok_or_else(|| {
-        TauriCommandError::not_found(format!(
-            "找不到 campaign id={}",
-            campaign_id.as_str()
-        ))
+        TauriCommandError::not_found(format!("找不到 campaign id={}", campaign_id.as_str()))
     })?;
 
     // 收集应删除的会话 id：Campaign 绑定 + 反向 campaign_id 匹配（防只绑一边）
@@ -6861,13 +6859,16 @@ fn log_query(filter: LogFilterDto, state: tauri::State<'_, Arc<AppState>>) -> Ve
             _ => None,
         }),
         // 前端 Select 可能传 Error / error；统一大小写
-        level: filter.level.as_deref().and_then(|l| match l.to_ascii_lowercase().as_str() {
-            "debug" => Some(LogLevel::Debug),
-            "info" => Some(LogLevel::Info),
-            "warn" => Some(LogLevel::Warn),
-            "error" => Some(LogLevel::Error),
-            _ => None,
-        }),
+        level: filter
+            .level
+            .as_deref()
+            .and_then(|l| match l.to_ascii_lowercase().as_str() {
+                "debug" => Some(LogLevel::Debug),
+                "info" => Some(LogLevel::Info),
+                "warn" => Some(LogLevel::Warn),
+                "error" => Some(LogLevel::Error),
+                _ => None,
+            }),
         keyword: filter.keyword,
         since: None,
         until: None,
@@ -8116,7 +8117,8 @@ fn meta_accept_patch(
         if !sqlite_runtime::is_sqlite_active() {
             let ctx = state.tool_ctx.read().unwrap_or_else(|p| p.into_inner());
             if let Some(ref world_info) = ctx.world_info {
-                if let Err(e) = get_campaign_store().set_world_info(&campaign_id, (**world_info).clone())
+                if let Err(e) =
+                    get_campaign_store().set_world_info(&campaign_id, (**world_info).clone())
                 {
                     tracing::warn!(
                         "meta_accept_patch 写回活动世界书失败 campaign={}: {e}",
@@ -10071,9 +10073,9 @@ fn apply_campaign_opening_in_store(
     if content.trim().is_empty() {
         return Err(TauriCommandError::validation("开场内容不能为空"));
     }
-    let campaign = store.get_campaign(campaign_id).ok_or_else(|| {
-        TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}"))
-    })?;
+    let campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}")))?;
     let conv_id = campaign
         .conversation_id
         .clone()
@@ -10926,13 +10928,17 @@ fn lore_route_to_str(route: &storyforge_domain::world_info::LoreRoute) -> String
     }
 }
 
-fn parse_lore_route(s: &str) -> Result<storyforge_domain::world_info::LoreRoute, TauriCommandError> {
+fn parse_lore_route(
+    s: &str,
+) -> Result<storyforge_domain::world_info::LoreRoute, TauriCommandError> {
     match s {
         "Constant" | "constant" => Ok(storyforge_domain::world_info::LoreRoute::Constant),
         "Selective" | "selective" => Ok(storyforge_domain::world_info::LoreRoute::Selective),
         "Both" | "both" => Ok(storyforge_domain::world_info::LoreRoute::Both),
         "Disabled" | "disabled" => Ok(storyforge_domain::world_info::LoreRoute::Disabled),
-        other => Err(TauriCommandError::validation(format!("未知世界书路由: {other}"))),
+        other => Err(TauriCommandError::validation(format!(
+            "未知世界书路由: {other}"
+        ))),
     }
 }
 
@@ -10945,7 +10951,10 @@ fn entry_source_label(entry: &storyforge_domain::world_info::WorldInfoEntry) -> 
         .to_string()
 }
 
-fn world_info_entry_name(index: usize, entry: &storyforge_domain::world_info::WorldInfoEntry) -> String {
+fn world_info_entry_name(
+    index: usize,
+    entry: &storyforge_domain::world_info::WorldInfoEntry,
+) -> String {
     entry
         .extra
         .get("comment")
@@ -11162,17 +11171,17 @@ fn update_campaign_world_info_entry(
     let book = store
         .get_world_info(&id)
         .map_err(|e| TauriCommandError::storage(e))?;
-    let prev = book
-        .entries
-        .get(req.entry_index)
-        .ok_or_else(|| TauriCommandError::not_found(format!("条目索引越界: {}", req.entry_index)))?;
+    let prev = book.entries.get(req.entry_index).ok_or_else(|| {
+        TauriCommandError::not_found(format!("条目索引越界: {}", req.entry_index))
+    })?;
     let route = parse_lore_route(&req.route)?;
     let mut entry = prev.clone();
     entry.keys = req.keys;
     entry.content = req.content;
     entry.constant = req.constant;
     entry.selective = !req.constant;
-    entry.disabled = req.disabled || matches!(route, storyforge_domain::world_info::LoreRoute::Disabled);
+    entry.disabled =
+        req.disabled || matches!(route, storyforge_domain::world_info::LoreRoute::Disabled);
     entry.depth = req.depth;
     entry.order = req.order;
     entry.route = route;
@@ -11257,7 +11266,9 @@ fn set_campaign_world_info_route(
 /// 卡模板世界书只读（供角色卡 UI，不可写路径）。
 /// `character_id` 可为 CharacterStore.id 或 CharacterCard.source_character_id。
 #[tauri::command]
-fn get_character_world_info(character_id: String) -> Result<CampaignWorldInfoDto, TauriCommandError> {
+fn get_character_world_info(
+    character_id: String,
+) -> Result<CampaignWorldInfoDto, TauriCommandError> {
     let stored = get_store()
         .get(&character_id)
         .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
@@ -11340,7 +11351,9 @@ pub struct CardShellManifestDto {
 }
 
 #[tauri::command]
-fn get_card_shell_manifest(character_id: String) -> Result<CardShellManifestDto, TauriCommandError> {
+fn get_card_shell_manifest(
+    character_id: String,
+) -> Result<CardShellManifestDto, TauriCommandError> {
     let stored = get_store()
         .get(&character_id)
         .or_else(|| stored_character_for_source_id(&Id::from_str(&character_id)))
@@ -11361,14 +11374,8 @@ fn get_card_shell_manifest(character_id: String) -> Result<CardShellManifestDto,
                             let len = js.len();
                             obj.as_object_mut().map(|m| {
                                 m.insert("js".into(), serde_json::Value::String(String::new()));
-                                m.insert(
-                                    "deferred".into(),
-                                    serde_json::Value::Bool(true),
-                                );
-                                m.insert(
-                                    "byte_len".into(),
-                                    serde_json::Value::Number(len.into()),
-                                );
+                                m.insert("deferred".into(), serde_json::Value::Bool(true));
+                                m.insert("byte_len".into(), serde_json::Value::Number(len.into()));
                             });
                         }
                     }
@@ -11438,7 +11445,9 @@ fn card_shell_clear_cache() -> Result<usize, TauriCommandError> {
 
 /// 宿主代持拉取远程壳资源（allowlist + 磁盘缓存）。失败显式返回错误，不降级为空成功。
 #[tauri::command]
-fn card_shell_fetch_url(url: String) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
+fn card_shell_fetch_url(
+    url: String,
+) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
     let cache = get_card_shell_cache();
     let client = cache
         .build_client()
@@ -11460,7 +11469,7 @@ fn card_shell_fetch_url(url: String) -> Result<card_shell_cache::ShellFetchResul
 fn card_shell_cache_protocol_response(
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    use tauri::http::{header, Method, Response, StatusCode};
+    use tauri::http::{Method, Response, StatusCode, header};
 
     let with_cors = |builder: tauri::http::response::Builder| {
         builder
@@ -11486,7 +11495,11 @@ fn card_shell_cache_protocol_response(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CACHE_CONTROL, "private, max-age=86400")
-            .body(if request.method() == Method::HEAD { Vec::new() } else { bytes })
+            .body(if request.method() == Method::HEAD {
+                Vec::new()
+            } else {
+                bytes
+            })
             .unwrap_or_else(|_| Response::new(Vec::new())),
         Err(_) => with_cors(Response::builder())
             .status(StatusCode::NOT_FOUND)
@@ -11495,7 +11508,6 @@ fn card_shell_cache_protocol_response(
             .unwrap_or_else(|_| Response::new(Vec::new())),
     }
 }
-
 
 fn apply_campaign_world_info_to_tool_ctx(
     state: &AppState,
@@ -13720,11 +13732,8 @@ mod tests {
             "variables.__complex_card_probe = true;"
         );
 
-        let rules = collect_mvu_update_rules(
-            &ctx,
-            &store,
-            std::slice::from_ref(&present_instance_id),
-        );
+        let rules =
+            collect_mvu_update_rules(&ctx, &store, std::slice::from_ref(&present_instance_id));
         assert_eq!(rules, vec!["damage reduces hp".to_string()]);
         let rules_dedup = collect_mvu_update_rules(
             &ctx,
@@ -16019,9 +16028,14 @@ mod tests {
             .map(|f| f.key.as_str())
             .collect();
         assert!(keys.contains(&"hp"), "stat_data.hp 应归一为 hp: {keys:?}");
-        assert!(keys.contains(&"世界.时间"), "斜杠键应归一为点记法: {keys:?}");
         assert!(
-            !keys.iter().any(|k| k.contains("stat_data") || k.contains('/')),
+            keys.contains(&"世界.时间"),
+            "斜杠键应归一为点记法: {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.contains("stat_data") || k.contains('/')),
             "不应残留旧记法键: {keys:?}"
         );
         let hp = updated_def
@@ -16215,9 +16229,8 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("不能为空"), "got {err}");
         let missing = Id::new();
-        let err =
-            apply_campaign_opening_in_store(&store, &conv_store, &missing, "scene-2".into())
-                .unwrap_err();
+        let err = apply_campaign_opening_in_store(&store, &conv_store, &missing, "scene-2".into())
+            .unwrap_err();
         assert!(err.to_string().contains("找不到"), "got {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -16306,7 +16319,8 @@ mod tests {
         let card_id = card.id.as_str().to_string();
         store.save_card(card).unwrap();
 
-        let dto = create_campaign_in_store(&store, &conv_store, card_id, "c2".into(), None).unwrap();
+        let dto =
+            create_campaign_in_store(&store, &conv_store, card_id, "c2".into(), None).unwrap();
         let campaign_id = Id::from_str(&dto.id);
         let conversation_id = Id::from_str(dto.conversation_id.as_deref().unwrap());
         let state = AppState::new_for_test();
@@ -21614,11 +21628,17 @@ mod tests {
 
         entry.set_enabled(false).unwrap();
         assert!(entry.disabled);
-        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Constant));
+        assert!(matches!(
+            entry.route,
+            storyforge_domain::world_info::LoreRoute::Constant
+        ));
 
         entry.set_enabled(true).unwrap();
         assert!(!entry.disabled);
-        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Constant));
+        assert!(matches!(
+            entry.route,
+            storyforge_domain::world_info::LoreRoute::Constant
+        ));
     }
 
     #[test]
@@ -21643,7 +21663,10 @@ mod tests {
         entry.set_enabled(true).unwrap();
 
         assert!(!entry.disabled);
-        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Selective));
+        assert!(matches!(
+            entry.route,
+            storyforge_domain::world_info::LoreRoute::Selective
+        ));
     }
 
     #[test]
@@ -21668,6 +21691,9 @@ mod tests {
         entry.set_enabled(true).unwrap();
 
         assert!(!entry.disabled);
-        assert!(matches!(entry.route, storyforge_domain::world_info::LoreRoute::Both));
+        assert!(matches!(
+            entry.route,
+            storyforge_domain::world_info::LoreRoute::Both
+        ));
     }
 }

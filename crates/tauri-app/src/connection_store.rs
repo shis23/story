@@ -109,9 +109,7 @@ impl ConnectionStore {
         id: &str,
         mut connection: LlmConnection,
     ) -> Result<LlmConnection, String> {
-        let existing = self
-            .get(id)
-            .ok_or_else(|| format!("连接不存在: {id}"))?;
+        let existing = self.get(id).ok_or_else(|| format!("连接不存在: {id}"))?;
         connection.id = storyforge_domain::Id::from_str(id);
         if connection.api_key.trim().is_empty() {
             // 保留磁盘上的 SecretRef，避免空串把 key 清掉
@@ -519,14 +517,8 @@ mod tests {
         assert_eq!(resolved.name, "renamed");
         assert_eq!(resolved.model, "deepseek-v3");
         assert_eq!(resolved.api_key, "sk-test");
-        assert_eq!(
-            store.get("edit-me").unwrap().connection.api_key,
-            secret_ref
-        );
-        assert_eq!(
-            secret_store.get_secret(&secret_ref).unwrap(),
-            "sk-test"
-        );
+        assert_eq!(store.get("edit-me").unwrap().connection.api_key, secret_ref);
+        assert_eq!(secret_store.get_secret(&secret_ref).unwrap(), "sk-test");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

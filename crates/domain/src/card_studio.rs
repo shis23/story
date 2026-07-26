@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::character::{Character, StCharacterCard, StCharacterData, StWorldInfoBook, StWorldInfoEntry};
+use crate::character::{
+    Character, StCharacterCard, StCharacterData, StWorldInfoBook, StWorldInfoEntry,
+};
 use crate::world_info::{LoreRoute, SelectiveLogic, WorldInfoBook, WorldInfoEntry};
 use crate::{Id, Source};
 
@@ -230,11 +232,7 @@ impl CardProject {
         let brief = brief.into();
         let novel_title = {
             let t = novel_title.into();
-            if t.trim().is_empty() {
-                name.clone()
-            } else {
-                t
-            }
+            if t.trim().is_empty() { name.clone() } else { t }
         };
         let novel_text = novel_text.into();
         let excerpts = sample_novel_excerpts(&novel_text, 12_000);
@@ -359,7 +357,14 @@ pub fn sample_novel_excerpts(text: &str, max_chars_per_slice: usize) -> Vec<Stri
     let head: String = chars.iter().take(n).collect();
     let mid_start = chars.len().saturating_sub(n) / 2;
     let mid: String = chars.iter().skip(mid_start).take(n).collect();
-    let tail: String = chars.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = chars
+        .iter()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     let mut out = vec![head];
     if mid_start > n / 2 {
         out.push(mid);
@@ -417,10 +422,12 @@ pub fn build_novel_style_prompt(project: &CardProject) -> Result<String, String>
         .first()
         .cloned()
         .or_else(|| {
-            project
-                .novel_text
-                .as_ref()
-                .map(|t| sample_novel_excerpts(t, 6_000).into_iter().next().unwrap_or_default())
+            project.novel_text.as_ref().map(|t| {
+                sample_novel_excerpts(t, 6_000)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            })
         })
         .unwrap_or_default();
     if sample.trim().is_empty() {
@@ -462,13 +469,9 @@ pub fn apply_novel_prefill_json(
     {
         artifacts.style_notes = Some(style.to_string());
         if !artifacts.notes.contains("文风") {
-            artifacts.notes = format!(
-                "{}\n\n[文风笔记]\n{}",
-                artifacts.notes.trim(),
-                style
-            )
-            .trim()
-            .to_string();
+            artifacts.notes = format!("{}\n\n[文风笔记]\n{}", artifacts.notes.trim(), style)
+                .trim()
+                .to_string();
         }
     }
     if let Some(wt) = value.get("world_type").and_then(|v| v.as_str()) {
@@ -523,13 +526,9 @@ pub fn apply_novel_prefill_json(
             .map(|s| format!("- {s}"))
             .collect();
         if !lines.is_empty() {
-            artifacts.notes = format!(
-                "{}\n\n[配角]\n{}",
-                artifacts.notes.trim(),
-                lines.join("\n")
-            )
-            .trim()
-            .to_string();
+            artifacts.notes = format!("{}\n\n[配角]\n{}", artifacts.notes.trim(), lines.join("\n"))
+                .trim()
+                .to_string();
         }
     }
     Ok(())
@@ -718,7 +717,11 @@ pub fn run_checks(artifacts: &CardArtifacts) -> CheckReport {
         "不是…而是",
         "不是...而是",
     ];
-    let hits: Vec<&str> = bagua.iter().copied().filter(|w| joined.contains(w)).collect();
+    let hits: Vec<&str> = bagua
+        .iter()
+        .copied()
+        .filter(|w| joined.contains(w))
+        .collect();
     if !hits.is_empty() {
         issues.push(issue(
             "bagua_wording",
@@ -730,11 +733,7 @@ pub fn run_checks(artifacts: &CardArtifacts) -> CheckReport {
     }
 
     // personality guided placeholders
-    if artifacts
-        .personality_mode
-        .as_deref()
-        .unwrap_or("guided")
-        == "guided"
+    if artifacts.personality_mode.as_deref().unwrap_or("guided") == "guided"
         && !artifacts.personality.trim().is_empty()
         && artifacts.personality.contains("【待用户手写】")
     {
@@ -866,7 +865,11 @@ pub fn merge_review_reports(base: CheckReport, llm_value: &serde_json::Value) ->
             if message.trim().is_empty() {
                 continue;
             }
-            let severity = match item.get("severity").and_then(|v| v.as_str()).unwrap_or("warning") {
+            let severity = match item
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("warning")
+            {
                 "error" => CheckSeverity::Error,
                 "info" => CheckSeverity::Info,
                 _ => CheckSeverity::Warning,
@@ -910,11 +913,7 @@ pub fn merge_review_reports(base: CheckReport, llm_value: &serde_json::Value) ->
         .or(base.score)
         .map(|s| {
             // never higher than rule score if errors remain
-            if !ok {
-                s.min(60)
-            } else {
-                s
-            }
+            if !ok { s.min(60) } else { s }
         });
     let summary = llm_value
         .get("summary")
@@ -981,7 +980,9 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
                     .filter(|k| !k.is_empty())
                     .collect();
                 if keys.is_empty() && !constant {
-                    warnings.push(format!("条目 #{i} 无 keys，已跳过 keys 校验（应被 checks 拦住）"));
+                    warnings.push(format!(
+                        "条目 #{i} 无 keys，已跳过 keys 校验（应被 checks 拦住）"
+                    ));
                 }
                 WorldInfoEntry {
                     st_id: Some(i as i32),
@@ -1049,8 +1050,8 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
         data: st_data,
     };
 
-    let st_card_json = serde_json::to_value(&st_card)
-        .map_err(|e| format!("序列化 ST 卡失败: {e}"))?;
+    let st_card_json =
+        serde_json::to_value(&st_card).map_err(|e| format!("序列化 ST 卡失败: {e}"))?;
 
     // Rebuild Character with Source::Native after from_st_card.
     let mut character = Character::from_st_card(st_card);
@@ -1102,12 +1103,14 @@ pub fn export_gate_checks(artifacts: &CardArtifacts, reimported: &Character) -> 
     out.push(gate(
         "gate.name_roundtrip",
         reimported.name == expected_name,
-        format!("导入后 name={:?}（期望 {:?}）", reimported.name, expected_name),
+        format!(
+            "导入后 name={:?}（期望 {:?}）",
+            reimported.name, expected_name
+        ),
     ));
     out.push(gate(
         "gate.first_mes_roundtrip",
-        !reimported.first_mes.trim().is_empty()
-            && reimported.first_mes == artifacts.first_mes,
+        !reimported.first_mes.trim().is_empty() && reimported.first_mes == artifacts.first_mes,
         format!(
             "导入后 first_mes {} 字符（期望与产物一致且非空）",
             reimported.first_mes.chars().count()
@@ -1270,7 +1273,11 @@ pub fn export_gate_checks(artifacts: &CardArtifacts, reimported: &Character) -> 
         ),
     ));
 
-    let expected_orders: Vec<i32> = artifacts.worldview_entries.iter().map(|e| e.order).collect();
+    let expected_orders: Vec<i32> = artifacts
+        .worldview_entries
+        .iter()
+        .map(|e| e.order)
+        .collect();
     let actual_orders: Vec<i32> = book
         .map(|b| b.entries.iter().map(|e| e.order).collect())
         .unwrap_or_default();
@@ -1315,12 +1322,10 @@ mod pack_mingyue_v1 {
 /// B-path novel distill prompts (adapted from 明月小说文风蒸馏总结工具; native MVP).
 #[allow(non_snake_case)]
 mod DISTILL_PACK {
-    pub const COMMON: &str =
-        include_str!("../assets/cardstudio/mingyue_distill_v1/common.md");
+    pub const COMMON: &str = include_str!("../assets/cardstudio/mingyue_distill_v1/common.md");
     pub const PREFILL: &str =
         include_str!("../assets/cardstudio/mingyue_distill_v1/prefill_card.md");
-    pub const STYLE: &str =
-        include_str!("../assets/cardstudio/mingyue_distill_v1/style_sample.md");
+    pub const STYLE: &str = include_str!("../assets/cardstudio/mingyue_distill_v1/style_sample.md");
 }
 
 fn stage_template(stage_id: &str) -> Result<&'static str, String> {
@@ -1464,7 +1469,11 @@ pub fn build_review_prompt(
 }
 
 /// Apply a generative stage JSON patch onto artifacts.
-pub fn apply_stage_json(stage_id: &str, artifacts: &mut CardArtifacts, value: &serde_json::Value) -> Result<(), String> {
+pub fn apply_stage_json(
+    stage_id: &str,
+    artifacts: &mut CardArtifacts,
+    value: &serde_json::Value,
+) -> Result<(), String> {
     match stage_id {
         STAGE_BASIC => {
             if let Some(s) = value.get("name").and_then(|v| v.as_str()) {
@@ -1524,10 +1533,7 @@ pub fn apply_stage_json(stage_id: &str, artifacts: &mut CardArtifacts, value: &s
                     .get("constant")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let order = item
-                    .get("order")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(100) as i32;
+                let order = item.get("order").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
                 let keys = item
                     .get("keys")
                     .and_then(|v| v.as_array())
@@ -1680,7 +1686,12 @@ mod tests {
         let report = run_checks(&CardArtifacts::default());
         assert!(!report.ok);
         assert!(report.issues.iter().any(|i| i.code == "name_required"));
-        assert!(report.issues.iter().any(|i| i.code == "description_required"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "description_required")
+        );
         assert!(report.issues.iter().any(|i| i.code == "first_mes_required"));
     }
 
@@ -1758,9 +1769,8 @@ mod tests {
         content_drift.embedded_world_info.as_mut().unwrap().entries[1].content =
             "被悄悄改写的正文".into();
         let checks = export_gate_checks(&a, &content_drift);
-        let by_name = |cs: &[GateCheck], n: &str| {
-            cs.iter().find(|c| c.name == n).expect("check exists").pass
-        };
+        let by_name =
+            |cs: &[GateCheck], n: &str| cs.iter().find(|c| c.name == n).expect("check exists").pass;
         assert!(!by_name(&checks, "gate.content_roundtrip"));
         assert!(by_name(&checks, "gate.keys_roundtrip"));
         assert!(by_name(&checks, "gate.insertion_order_roundtrip"));
@@ -1858,9 +1868,21 @@ mod tests {
         let (system, user) = build_stage_prompt(STAGE_BASIC, &p, None).unwrap();
         // 来自明月方法论资产，而不是一行薄骨架
         assert!(system.contains("绝对零度") || system.contains("白描") || system.contains("八股"));
-        assert!(system.contains("角色基础") || system.contains("template_basic") || system.contains("外貌"));
-        assert!(system.contains("只输出一个 JSON") || system.contains("JSON 对象") || system.contains("输出契约"));
-        assert!(system.len() > 2000, "system prompt should embed full stage pack, got {}", system.len());
+        assert!(
+            system.contains("角色基础")
+                || system.contains("template_basic")
+                || system.contains("外貌")
+        );
+        assert!(
+            system.contains("只输出一个 JSON")
+                || system.contains("JSON 对象")
+                || system.contains("输出契约")
+        );
+        assert!(
+            system.len() > 2000,
+            "system prompt should embed full stage pack, got {}",
+            system.len()
+        );
         assert!(user.contains("雨夜车站"));
         assert!(user.contains("当前产物"));
     }
@@ -1869,7 +1891,9 @@ mod tests {
     fn personality_prompt_defaults_to_guided_not_freewrite() {
         let p = CardProject::new_from_scratch("x", "冷淡少年");
         let (system, _) = build_stage_prompt(STAGE_PERSONALITY, &p, None).unwrap();
-        assert!(system.contains("guided") || system.contains("协作") || system.contains("待用户手写"));
+        assert!(
+            system.contains("guided") || system.contains("协作") || system.contains("待用户手写")
+        );
         assert!(!system.contains("draft 模式") || system.contains("guided"));
         let (system2, _) =
             build_stage_prompt(STAGE_PERSONALITY, &p, Some("允许代写，你可以写衍生")).unwrap();
@@ -1901,9 +1925,19 @@ mod tests {
         a.personality_mode = Some("guided".into());
         let report = run_checks(&a);
         assert!(report.ok, "no hard errors expected");
-        assert!(report.issues.iter().any(|i| i.code == "description_has_personality"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "description_has_personality")
+        );
         assert!(report.issues.iter().any(|i| i.code == "bagua_wording"));
-        assert!(report.issues.iter().any(|i| i.code == "personality_pending_handwrite"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "personality_pending_handwrite")
+        );
         assert!(report.score.is_some());
     }
 
@@ -1952,10 +1986,11 @@ mod tests {
         assert!(!arts.description.is_empty());
         assert_eq!(arts.worldview_entries.len(), 2);
         assert!(arts.worldview_entries.iter().any(|e| e.constant));
-        assert!(arts
-            .worldview_entries
-            .iter()
-            .any(|e| !e.constant && e.keys.iter().any(|k| k == "车站")));
+        assert!(
+            arts.worldview_entries
+                .iter()
+                .any(|e| !e.constant && e.keys.iter().any(|k| k == "车站"))
+        );
     }
 
     #[test]
@@ -1983,11 +2018,7 @@ mod tests {
         // 另存语义：编译产物必须是新 domain id，不能回写源卡 id
         assert_ne!(compiled.character.id.as_str(), ch.id.as_str());
         assert_eq!(compiled.character.name, ch.name);
-        assert!(compiled
-            .character
-            .tags
-            .iter()
-            .any(|t| t == "card-studio"));
+        assert!(compiled.character.tags.iter().any(|t| t == "card-studio"));
     }
 
     #[test]

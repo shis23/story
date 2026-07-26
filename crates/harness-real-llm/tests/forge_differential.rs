@@ -100,7 +100,12 @@ fn forge_differential_worldbook_semantics() {
             sections.forge_th_scripts
         );
         // V2-1：正文级对照（一对一组逐条归一化等值）
-        let contents = diff_contents(label, character.embedded_world_info.as_ref(), &forge, &forge_dir);
+        let contents = diff_contents(
+            label,
+            character.embedded_world_info.as_ref(),
+            &forge,
+            &forge_dir,
+        );
         eprintln!(
             "── {label} 正文对照 ──\n{}",
             serde_json::to_string_pretty(&contents).unwrap()

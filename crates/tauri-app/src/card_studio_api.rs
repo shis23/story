@@ -2,21 +2,21 @@
 
 use std::sync::Arc;
 
+use crate::card_studio_store::CardStudioStore;
+use crate::error::TauriCommandError;
+use crate::{AppState, CharacterInfo, CharacterSummary};
 use serde::{Deserialize, Serialize};
 use storyforge_domain::card_studio::{
-    self, apply_novel_prefill_json, apply_stage_json, build_novel_prefill_prompt,
+    self, CardArtifacts, CardProject, CheckReport, GateCheck, STAGE_BASIC, STAGE_BRIEF,
+    STAGE_COMPILE_IMPORT, STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
+    StageStatus, apply_novel_prefill_json, apply_stage_json, build_novel_prefill_prompt,
     build_novel_style_prompt, build_review_prompt, build_stage_prompt, compile_artifacts,
     export_gate_checks, extract_json_object, merge_review_reports, phase1_stage_ids, run_checks,
-    CardArtifacts, CardProject, CheckReport, GateCheck, StageStatus, STAGE_BASIC, STAGE_BRIEF,
-    STAGE_COMPILE_IMPORT, STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
 };
 use storyforge_domain::character::{
     CharacterCard, CharacterDefinition, CharacterExtractionStatus, StCharacterCard,
 };
 use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
-use crate::card_studio_store::CardStudioStore;
-use crate::error::TauriCommandError;
-use crate::{AppState, CharacterInfo, CharacterSummary};
 
 fn get_card_studio_store() -> &'static CardStudioStore {
     crate::get_card_studio_store()
@@ -165,7 +165,9 @@ pub fn cardstudio_create_from_character(
         .map_err(|e| TauriCommandError::storage(e))
 }
 
-fn resolve_stored_character(character_id: &str) -> Result<crate::storage::StoredCharacter, TauriCommandError> {
+fn resolve_stored_character(
+    character_id: &str,
+) -> Result<crate::storage::StoredCharacter, TauriCommandError> {
     let store = crate::get_store();
     if let Some(s) = store.get(character_id) {
         return Ok(s);
@@ -212,7 +214,10 @@ pub fn cardstudio_update_artifacts(
 }
 
 #[tauri::command]
-pub fn cardstudio_set_stage(id: String, stage_id: String) -> Result<CardProject, TauriCommandError> {
+pub fn cardstudio_set_stage(
+    id: String,
+    stage_id: String,
+) -> Result<CardProject, TauriCommandError> {
     if !phase1_stage_ids().contains(&stage_id.as_str()) {
         return Err(TauriCommandError::validation(format!(
             "未知阶段: {stage_id}"
@@ -285,9 +290,8 @@ pub async fn cardstudio_run_review(
     let rule_report = run_checks(&project.artifacts);
     let use_llm = use_llm.unwrap_or(true);
     if !use_llm {
-        project.last_stage_output = Some(
-            serde_json::to_string_pretty(&rule_report).unwrap_or_else(|_| "{}".into()),
-        );
+        project.last_stage_output =
+            Some(serde_json::to_string_pretty(&rule_report).unwrap_or_else(|_| "{}".into()));
         project.touch();
         let _ = store.update(project);
         return Ok(rule_report);
@@ -351,8 +355,7 @@ pub fn cardstudio_compile(id: String) -> Result<CompilePreviewDto, TauriCommandE
     let project = get_card_studio_store()
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
-    let compiled = compile_artifacts(&project.artifacts)
-        .map_err(TauriCommandError::validation)?;
+    let compiled = compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
     Ok(CompilePreviewDto {
         st_card_json: compiled.st_card_json,
         warnings: compiled.warnings,
@@ -415,8 +418,7 @@ pub fn cardstudio_export_png(id: String) -> Result<Vec<u8>, TauriCommandError> {
     let project = get_card_studio_store()
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
-    let compiled =
-        compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
+    let compiled = compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
     let st_card: StCharacterCard = serde_json::from_value(compiled.st_card_json)
         .map_err(|e| TauriCommandError::internal(format!("ST 卡 JSON 反序列化失败: {e}")))?;
     storyforge_infra_import::png::write_st_card_png(&st_card, None)
@@ -451,19 +453,17 @@ pub fn cardstudio_complete_manual_stage(
                     report
                         .issues
                         .iter()
-                        .filter(|i| {
-                            matches!(
-                                i.severity,
-                                card_studio::CheckSeverity::Error
-                            )
-                        })
+                        .filter(|i| matches!(i.severity, card_studio::CheckSeverity::Error))
                         .map(|i| i.message.clone())
                         .collect::<Vec<_>>()
                         .join("; "),
                 );
                 let _ = store.update(project.clone());
                 return Err(TauriCommandError::validation(
-                    project.last_error.clone().unwrap_or_else(|| "检查未通过".into()),
+                    project
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "检查未通过".into()),
                 ));
             }
             project.set_stage_status(STAGE_REVIEW, StageStatus::Done);
@@ -506,7 +506,11 @@ pub async fn cardstudio_prefill_from_novel(
     }
 
     let mut prompt = build_novel_prefill_prompt(&project).map_err(TauriCommandError::validation)?;
-    if let Some(note) = user_note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(note) = user_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         prompt.push_str("\n\n## 用户补充\n");
         prompt.push_str(note);
     }
@@ -599,7 +603,12 @@ pub async fn cardstudio_prefill_from_novel(
         project.name = project.artifacts.name.trim().to_string();
     }
     // After prefill, generative stages are ready for selective polish.
-    for sid in [STAGE_BASIC, STAGE_PERSONALITY, STAGE_WORLDVIEW, STAGE_OPENING] {
+    for sid in [
+        STAGE_BASIC,
+        STAGE_PERSONALITY,
+        STAGE_WORLDVIEW,
+        STAGE_OPENING,
+    ] {
         project.set_stage_status(sid, StageStatus::Ready);
     }
     project.set_stage_status(STAGE_REVIEW, StageStatus::Ready);
@@ -725,8 +734,7 @@ pub fn cardstudio_import_compiled(
         .get(&id)
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
 
-    let compiled =
-        compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
+    let compiled = compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
     let character = compiled.character;
     let warnings = compiled.warnings;
 
@@ -745,8 +753,7 @@ pub fn cardstudio_import_compiled(
     {
         let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
         let new_id = character.id.as_str().to_string();
-        ctx.characters
-            .retain(|c| c.id.as_str() != new_id.as_str());
+        ctx.characters.retain(|c| c.id.as_str() != new_id.as_str());
         let world_info = character.embedded_world_info.clone();
         ctx.characters.push(Arc::new(character.clone()));
         if let Some(wi) = world_info {
@@ -759,8 +766,7 @@ pub fn cardstudio_import_compiled(
     // so revise re-import lands as a new playable card (另存), not an overwrite of the source card.
     let mut card = CharacterCard::from_character(&character);
     let def = CharacterDefinition::fallback_from_character(&character, &[]);
-    let definitions =
-        storyforge_app_agent::attach_definitions_to_card(vec![def], &card.id);
+    let definitions = storyforge_app_agent::attach_definitions_to_card(vec![def], &card.id);
     card.character_definitions = definitions;
     card.extraction_status = CharacterExtractionStatus::Fallback;
     card.extraction_message = Some(if is_revise {
@@ -861,10 +867,9 @@ mod tests {
         let compiled = compile_artifacts(&project.artifacts).expect("compile");
         let st_card: StCharacterCard =
             serde_json::from_value(compiled.st_card_json).expect("st card json");
-        let png = storyforge_infra_import::png::write_st_card_png(&st_card, None)
-            .expect("png export");
-        let reimported =
-            storyforge_infra_import::import_character(&png).expect("png reimport");
+        let png =
+            storyforge_infra_import::png::write_st_card_png(&st_card, None).expect("png export");
+        let reimported = storyforge_infra_import::import_character(&png).expect("png reimport");
         assert_eq!(reimported.name, "闸门测试卡");
         assert_eq!(
             reimported

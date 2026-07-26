@@ -444,7 +444,9 @@ mod tests {
     #[test]
     fn test_mvu_rules_block_budget_truncation() {
         // 超出条数预算：只保留前 MVU_RULES_MAX_COUNT 条并附截断说明
-        let rules: Vec<String> = (0..100).map(|i| format!("规则编号{i}：某条件触发")).collect();
+        let rules: Vec<String> = (0..100)
+            .map(|i| format!("规则编号{i}：某条件触发"))
+            .collect();
         let block = render_mvu_update_rules_block(&rules).expect("非空规则应产出区块");
         assert!(block.contains("规则编号0"));
         assert!(block.contains("规则编号79"));

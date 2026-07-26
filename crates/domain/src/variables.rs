@@ -565,8 +565,14 @@ mod tests {
         assert_eq!(normalize_mvu_key("stat_data.主角.好感度"), "主角.好感度");
         assert_eq!(normalize_mvu_key("stat_data/主角/好感度"), "主角.好感度");
         // 模板占位符段统一花括号
-        assert_eq!(normalize_mvu_key("女性角色.<角色名>.好感度"), "女性角色.{角色名}.好感度");
-        assert_eq!(normalize_mvu_key("女性角色.{角色名}.好感度"), "女性角色.{角色名}.好感度");
+        assert_eq!(
+            normalize_mvu_key("女性角色.<角色名>.好感度"),
+            "女性角色.{角色名}.好感度"
+        );
+        assert_eq!(
+            normalize_mvu_key("女性角色.{角色名}.好感度"),
+            "女性角色.{角色名}.好感度"
+        );
         // 首尾空白与空段清理
         assert_eq!(normalize_mvu_key("  hp  "), "hp");
         assert_eq!(normalize_mvu_key("主角..hp"), "主角.hp");

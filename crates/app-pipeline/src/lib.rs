@@ -6150,7 +6150,17 @@ mod tests {
             reason: "test".into(),
         }];
         let outcome = orch
-            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &fragments, &[])
+            .run_postprocess(
+                "text",
+                "",
+                &[],
+                &[],
+                &ctx,
+                &event_tx,
+                cancel,
+                &fragments,
+                &[],
+            )
             .await;
         assert!(
             outcome.is_none(),

@@ -20,8 +20,8 @@ use storyforge_app_agent::runtime::AgentRuntime;
 use storyforge_app_agent::tools::ToolContext;
 use storyforge_domain::character::{Character, CharacterDefinition};
 use storyforge_domain::mvu_translation::{MvuRouting, MvuTranslation};
-use storyforge_infra_llm::LlmClient;
 use storyforge_domain::variables::extract_mvu_schema_from_extensions;
+use storyforge_infra_llm::LlmClient;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 验收期望与检查结构
@@ -190,10 +190,7 @@ pub fn import_checks(character: &Character, exp: &CardExpectations) -> Vec<Check
                     !e.disabled
                         && !e.constant
                         && e.keys.iter().any(|k| !k.trim().is_empty())
-                        && matches!(
-                            e.route,
-                            storyforge_domain::world_info::LoreRoute::Disabled
-                        )
+                        && matches!(e.route, storyforge_domain::world_info::LoreRoute::Disabled)
                 })
                 .count()
         })
@@ -240,7 +237,10 @@ pub fn classify_components(character: &Character) -> Vec<ComponentDisposition> {
                 .unwrap_or("(未命名)")
                 .to_string();
             let enabled = !s.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-            let replace = s.get("replaceString").and_then(|v| v.as_str()).unwrap_or("");
+            let replace = s
+                .get("replaceString")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let load_url = replace
                 .find("').load('")
                 .or_else(|| replace.find("\").load(\""))
@@ -310,10 +310,7 @@ fn extract_first_http_url(text: &str) -> Option<String> {
 }
 
 /// 组件归类的确定性检查：数量零漏项 + 分布合理
-pub fn component_checks(
-    components: &[ComponentDisposition],
-    exp: &CardExpectations,
-) -> Vec<Check> {
+pub fn component_checks(components: &[ComponentDisposition], exp: &CardExpectations) -> Vec<Check> {
     let regex_n = components
         .iter()
         .filter(|c| c.component == "regex_script")
@@ -441,7 +438,10 @@ pub fn translation_checks(
         defs.len() >= exp.min_definitions,
         format!("{} 个角色定义（下限 {}）", defs.len(), exp.min_definitions),
     ));
-    let empty_persona = defs.iter().filter(|d| d.persona_prompt.trim().is_empty()).count();
+    let empty_persona = defs
+        .iter()
+        .filter(|d| d.persona_prompt.trim().is_empty())
+        .count();
     out.push(check(
         "extract.personas_nonempty",
         empty_persona == 0,

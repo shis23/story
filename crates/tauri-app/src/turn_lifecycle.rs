@@ -1161,8 +1161,14 @@ mod tests {
         assert_eq!(replay.turn_status, TurnStatus::Committed);
         assert_eq!(replay.attempt_status, AttemptStatus::Committed);
         assert!(!replay.commit_as_degraded);
-        assert_eq!(replay.campaign_revision_before, first.campaign_revision_before);
-        assert_eq!(replay.campaign_revision_after, first.campaign_revision_after);
+        assert_eq!(
+            replay.campaign_revision_before,
+            first.campaign_revision_before
+        );
+        assert_eq!(
+            replay.campaign_revision_after,
+            first.campaign_revision_after
+        );
         let camp = fx.campaign_store.get_campaign(&fx.campaign_id).unwrap();
         assert_eq!(camp.revision, 1, "revision must bump only once");
     }

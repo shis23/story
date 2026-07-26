@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use storyforge_app_pipeline::WritingContext;
 use storyforge_domain::Id;
 use storyforge_domain::campaign::{Campaign, CharacterInstance};
 use storyforge_domain::campaign_runtime::CampaignRuntimeContext;
@@ -17,7 +18,6 @@ use storyforge_lib::sqlite_runtime;
 use storyforge_lib::{
     collect_mvu_fallback_fragments_for_backend, collect_mvu_update_rules_for_backend,
 };
-use storyforge_app_pipeline::WritingContext;
 
 #[test]
 fn sqlite_mvu_translation_authority_and_collectors() {
@@ -155,6 +155,10 @@ fn sqlite_mvu_translation_authority_and_collectors() {
     // ── 删除级联往返 ──
     assert!(sqlite_runtime::delete_mvu(&source_id).expect("delete ok"));
     assert!(!sqlite_runtime::delete_mvu(&source_id).expect("second delete ok"));
-    assert!(sqlite_runtime::get_mvu(&source_id).expect("get ok").is_none());
+    assert!(
+        sqlite_runtime::get_mvu(&source_id)
+            .expect("get ok")
+            .is_none()
+    );
     assert!(collect_mvu_update_rules_for_backend(&ctx, &["Alice".to_string()]).is_empty());
 }

@@ -2179,10 +2179,7 @@ mod tests {
             "imported book must retain disabled entries (marked disabled=true)"
         );
         assert!(
-            !book
-                .constant_entries()
-                .iter()
-                .any(|e| e.disabled),
+            !book.constant_entries().iter().any(|e| e.disabled),
             "disabled entries must never appear in constant injection"
         );
         assert!(

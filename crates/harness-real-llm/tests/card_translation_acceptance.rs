@@ -53,7 +53,10 @@ fn deterministic_import_and_component_checks() {
     let mut ran = 0;
     for (path, exp) in acceptance_cards() {
         if !path.exists() {
-            eprintln!("[skip] 卡文件不存在: {}（本机验收卡，CI 无此文件属正常）", path.display());
+            eprintln!(
+                "[skip] 卡文件不存在: {}（本机验收卡，CI 无此文件属正常）",
+                path.display()
+            );
             continue;
         }
         ran += 1;
@@ -112,8 +115,12 @@ async fn card_translation_acceptance_real_llm() {
     let extra: Option<serde_json::Map<String, serde_json::Value>> = {
         let raw = std::env::var("STORYFORGE_CT_EXTRA_JSON")
             .unwrap_or_else(|_| r#"{"reasoning_effort":"max"}"#.into());
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("STORYFORGE_CT_EXTRA_JSON 须为 JSON");
-        let map = v.as_object().cloned().expect("STORYFORGE_CT_EXTRA_JSON 须为 JSON 对象");
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).expect("STORYFORGE_CT_EXTRA_JSON 须为 JSON");
+        let map = v
+            .as_object()
+            .cloned()
+            .expect("STORYFORGE_CT_EXTRA_JSON 须为 JSON 对象");
         (!map.is_empty()).then_some(map)
     };
 
@@ -264,7 +271,12 @@ async fn card_translation_acceptance_real_llm() {
             );
         }
         if let Some(p) = &outcome.evidence_path {
-            eprintln!("[{}×{}] 证据: {}", outcome.label, outcome.model, p.display());
+            eprintln!(
+                "[{}×{}] 证据: {}",
+                outcome.label,
+                outcome.model,
+                p.display()
+            );
             evidence_paths.push(p.clone());
         }
         failures.extend(outcome.failures);

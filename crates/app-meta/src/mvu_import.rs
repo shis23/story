@@ -245,8 +245,7 @@ mod tool_arg_tolerance_tests {
             reasoning_content: None,
             finish_reason: None,
         };
-        let t = parse_mvu_translation_from_response(&resp, &[])
-            .expect("尾随垃圾不应导致解析失败");
+        let t = parse_mvu_translation_from_response(&resp, &[]).expect("尾随垃圾不应导致解析失败");
         assert_eq!(t.variable_schema.len(), 1);
         assert_eq!(t.update_rules.len(), 1);
     }
@@ -255,7 +254,8 @@ mod tool_arg_tolerance_tests {
     fn truncated_tool_args_fail_instead_of_yielding_near_empty_translation() {
         // 外层对象被截断未闭合，但内部含一个完整的小对象（单个 variable 字段）。
         // 括号配平回退不得把它误抓成"合法但近空"的翻译——应整体解析失败走降级。
-        let args = r#"{"variable_schema":[{"key":"hp","label":"生命","value_type":"int","default":100}"#;
+        let args =
+            r#"{"variable_schema":[{"key":"hp","label":"生命","value_type":"int","default":100}"#;
         let resp = ChatResponse {
             content: String::new(),
             tool_calls: vec![ToolCall {
@@ -971,7 +971,10 @@ mod tests {
         let t = parse_mvu_translation_from_response(&resp, &[]).unwrap();
 
         let keys: Vec<&str> = t.variable_schema.iter().map(|f| f.key.as_str()).collect();
-        assert_eq!(keys, vec!["世界.时间", "主角.hp", "女性角色.{角色名}.好感度"]);
+        assert_eq!(
+            keys,
+            vec!["世界.时间", "主角.hp", "女性角色.{角色名}.好感度"]
+        );
 
         assert_eq!(t.ui_bindings[0].variable_key, "主角.hp");
 

@@ -265,7 +265,11 @@ pub fn diff_worldbook(
         if ours_group.len() != forge_group.len() {
             cap_push(
                 &mut report.name_count_mismatches,
-                format!("{name} (ours={}, forge={})", ours_group.len(), forge_group.len()),
+                format!(
+                    "{name} (ours={}, forge={})",
+                    ours_group.len(),
+                    forge_group.len()
+                ),
             );
             continue;
         }
@@ -283,7 +287,11 @@ pub fn diff_worldbook(
                 format!(
                     "{name} (ours={}, forge={})",
                     if ours_enabled { "enabled" } else { "disabled" },
-                    if forge_entry.enabled { "enabled" } else { "disabled" }
+                    if forge_entry.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
                 ),
             );
         }
@@ -467,8 +475,7 @@ pub fn diff_sections(
         .unwrap_or(forge_greeting_files.len());
 
     let unique = |names: &[String]| -> Vec<String> {
-        let set: std::collections::BTreeSet<&str> =
-            names.iter().map(|n| n.trim()).collect();
+        let set: std::collections::BTreeSet<&str> = names.iter().map(|n| n.trim()).collect();
         set.into_iter().map(String::from).collect()
     };
     let ours_regex_unique_names = unique(&ours_regex_names);
@@ -730,7 +737,11 @@ pub fn schema_alignment(
         .count();
 
     let pct = |num: usize, den: usize| {
-        if den == 0 { 0.0 } else { (num as f64) * 100.0 / (den as f64) }
+        if den == 0 {
+            0.0
+        } else {
+            (num as f64) * 100.0 / (den as f64)
+        }
     };
     let hallucinated_count = normalized.len() - grounded;
 
@@ -752,14 +763,12 @@ pub fn schema_alignment(
 pub fn find_initvar_yaml(forge_dir: &Path) -> Option<std::path::PathBuf> {
     let dir = forge_dir.join("世界书");
     let read = std::fs::read_dir(&dir).ok()?;
-    read.flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.extension().is_some_and(|ext| ext == "yaml")
-                && p.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase().contains("initvar"))
-                    .unwrap_or(false)
-        })
+    read.flatten().map(|e| e.path()).find(|p| {
+        p.extension().is_some_and(|ext| ext == "yaml")
+            && p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase().contains("initvar"))
+                .unwrap_or(false)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -840,7 +849,13 @@ mod tests {
     fn test_diff_clean_match_holds_invariants() {
         let book = book_with(vec![
             entry("常驻设定", false, LoreRoute::Constant, 100, vec![]),
-            entry("在场角色", false, LoreRoute::Selective, 560, vec!["江离在场激活"]),
+            entry(
+                "在场角色",
+                false,
+                LoreRoute::Selective,
+                560,
+                vec!["江离在场激活"],
+            ),
             entry("禁用DLC", true, LoreRoute::Selective, 300, vec![]),
         ]);
         let report = diff_worldbook("样例", Some(&book), &sample_forge());
@@ -904,7 +919,10 @@ mod tests {
             }
         }));
         let report = diff_worldbook("样例", Some(&book), &forge);
-        assert_eq!(report.name_count_mismatches, vec!["战斗系统 (ours=2, forge=1)"]);
+        assert_eq!(
+            report.name_count_mismatches,
+            vec!["战斗系统 (ours=2, forge=1)"]
+        );
         assert!(report.enabled_mismatches.is_empty(), "{report:?}");
         assert!(report.route_mismatches.is_empty(), "{report:?}");
         assert!(report.hard_invariants_hold(), "{report:?}");

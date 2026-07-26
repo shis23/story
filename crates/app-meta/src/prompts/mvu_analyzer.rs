@@ -251,13 +251,21 @@ fn build_worldbook_variable_section(card: &Character) -> Option<String> {
             continue;
         }
         // [InitVar] 数据条目给大额度（整树不可截断），规则类条目维持小额度
-        let per_entry_cap = if c_lower.contains("initvar") { 24_000 } else { 4_000 };
+        let per_entry_cap = if c_lower.contains("initvar") {
+            24_000
+        } else {
+            4_000
+        };
         let body = truncate_for_prompt(&entry.content, per_entry_cap.min(budget));
         budget = budget.saturating_sub(body.chars().count());
         out.push_str(&format!(
             "--- {}（{}{}）---\n{}\n",
             comment,
-            if entry.disabled { "禁用/数据态" } else { "启用" },
+            if entry.disabled {
+                "禁用/数据态"
+            } else {
+                "启用"
+            },
             if entry.constant { "，常驻" } else { "" },
             body
         ));
@@ -303,9 +311,10 @@ fn build_tavern_helper_section(card: &Character) -> Option<String> {
     for s in scripts {
         let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-        if let Some(existing) = chosen.iter_mut().find(|(e, _)| {
-            e.get("name").and_then(|v| v.as_str()).unwrap_or("") == name
-        }) {
+        if let Some(existing) = chosen
+            .iter_mut()
+            .find(|(e, _)| e.get("name").and_then(|v| v.as_str()).unwrap_or("") == name)
+        {
             if enabled && !existing.1 {
                 *existing = (s, enabled);
             }
@@ -354,9 +363,17 @@ fn build_regex_summary_section(card: &Character) -> Option<String> {
         let name = s.get("scriptName").and_then(|v| v.as_str()).unwrap_or("");
         let disabled = s.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
         let find = s.get("findRegex").and_then(|v| v.as_str()).unwrap_or("");
-        let replace = s.get("replaceString").and_then(|v| v.as_str()).unwrap_or("");
+        let replace = s
+            .get("replaceString")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let markers: Vec<&str> = [
-            "<script", "<style", "Mvu", "_.set", "getvar", "triggerSlash",
+            "<script",
+            "<style",
+            "Mvu",
+            "_.set",
+            "getvar",
+            "triggerSlash",
         ]
         .into_iter()
         .filter(|m| replace.contains(*m))
@@ -585,16 +602,15 @@ mod tests {
         let big_tree = lines.join("\n");
         assert!(big_tree.chars().count() > 14_000, "样本必须超过旧总预算");
 
-        let st_book: storyforge_domain::character::StWorldInfoBook = serde_json::from_value(
-            serde_json::json!({
+        let st_book: storyforge_domain::character::StWorldInfoBook =
+            serde_json::from_value(serde_json::json!({
                 "entries": [{
                     "id": 1, "keys": [], "content": big_tree,
                     "constant": false, "selective": true, "enabled": false,
                     "comment": "[InitVar]变量初始化"
                 }]
-            }),
-        )
-        .expect("st book json");
+            }))
+            .expect("st book json");
         let mut card = make_card();
         card.embedded_world_info = Some(WorldInfoBook::from_st(st_book));
 

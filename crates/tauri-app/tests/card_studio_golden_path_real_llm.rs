@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use storyforge_domain::card_studio::{
+    CardArtifacts, CardProject, CheckReport, GateCheck, STAGE_BASIC, STAGE_BRIEF, STAGE_OPENING,
+    STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW, StageStatus, WorldviewDraftEntry,
     apply_stage_json, build_review_prompt, build_stage_prompt, compile_artifacts,
-    export_gate_checks, extract_json_object, merge_review_reports, run_checks, CardArtifacts,
-    CardProject, CheckReport, GateCheck, StageStatus, WorldviewDraftEntry, STAGE_BASIC,
-    STAGE_BRIEF, STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
+    export_gate_checks, extract_json_object, merge_review_reports, run_checks,
 };
 use storyforge_domain::character::StCharacterCard;
 use storyforge_domain::llm::{
@@ -30,7 +30,9 @@ use storyforge_domain::llm::{
 };
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
 }
 
 fn evidence_dir() -> PathBuf {
@@ -40,8 +42,8 @@ fn evidence_dir() -> PathBuf {
 }
 
 fn make_llm() -> Arc<dyn storyforge_infra_llm::LlmClient> {
-    let base_url = std::env::var("LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://cli.2529985.xyz/v1".into());
+    let base_url =
+        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://cli.2529985.xyz/v1".into());
     let api_key = std::env::var("LLM_API_KEY").expect("需设 LLM_API_KEY（只从环境读取）");
     let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
     let conn = LlmConnection {
@@ -225,13 +227,20 @@ fn assert_gate_pass(json_checks: &[GateCheck], png_checks: &[GateCheck], tag: &s
         .filter(|(_, c)| !c.pass)
         .map(|(l, c)| format!("[{l}] {}: {}", c.name, c.detail))
         .collect();
-    assert!(failed.is_empty(), "「{tag}」出卡闸门未过:\n{}", failed.join("\n"));
+    assert!(
+        failed.is_empty(),
+        "「{tag}」出卡闸门未过:\n{}",
+        failed.join("\n")
+    );
 }
 
 fn write_evidence(name: &str, value: &serde_json::Value) -> PathBuf {
     let path = evidence_dir().join(name);
-    std::fs::write(&path, serde_json::to_string_pretty(value).expect("序列化证据"))
-        .expect("写证据失败");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(value).expect("序列化证据"),
+    )
+    .expect("写证据失败");
     eprintln!("证据: {}", path.display());
     path
 }
@@ -258,7 +267,12 @@ async fn card_studio_a_path_golden_real_llm() {
     project.set_stage_status(STAGE_BASIC, StageStatus::Ready);
     project.current_stage = STAGE_BASIC.to_string();
 
-    for stage in [STAGE_BASIC, STAGE_PERSONALITY, STAGE_WORLDVIEW, STAGE_OPENING] {
+    for stage in [
+        STAGE_BASIC,
+        STAGE_PERSONALITY,
+        STAGE_WORLDVIEW,
+        STAGE_OPENING,
+    ] {
         drive_stage(&llm, &mut project, stage, None, &mut stage_log)
             .await
             .expect("阶段生成失败");
@@ -376,7 +390,10 @@ async fn card_studio_c_path_golden_real_llm() {
         project.artifacts.worldview_entries.len(),
         project.current_stage
     );
-    assert_eq!(project.artifacts.name, "灯下客", "reverse_parse 应回填基础字段");
+    assert_eq!(
+        project.artifacts.name, "灯下客",
+        "reverse_parse 应回填基础字段"
+    );
     assert_eq!(
         project.artifacts.worldview_entries.len(),
         2,

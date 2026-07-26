@@ -429,17 +429,16 @@ pub fn accept_by_variant(
     }
 
     // Quality gate（V7：与 JSON 路径共用 domain 决策函数，杜绝两处内联实现漂移）。
-    let commit_as_degraded =
-        match storyforge_domain::turn::quality_accept_decision(
-            attempt.quality_report.as_ref(),
-            force_accept,
-        ) {
-            storyforge_domain::turn::QualityAcceptDecision::AllowCommit => false,
-            storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { .. } => true,
-            storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
-                return Err(AcceptError::QualityBlocked { error_count });
-            }
-        };
+    let commit_as_degraded = match storyforge_domain::turn::quality_accept_decision(
+        attempt.quality_report.as_ref(),
+        force_accept,
+    ) {
+        storyforge_domain::turn::QualityAcceptDecision::AllowCommit => false,
+        storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { .. } => true,
+        storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
+            return Err(AcceptError::QualityBlocked { error_count });
+        }
+    };
 
     let conversation = get_conversation(conversation_id)
         .map_err(AcceptError::Storage)?
@@ -522,7 +521,9 @@ pub fn accept_by_variant(
     .map_err(AcceptError::Commit)?
     .map_err(|e| match e {
         storyforge_infra_sqlite::SqliteError::RevisionConflict {
-            campaign, turn_base, ..
+            campaign,
+            turn_base,
+            ..
         } => AcceptError::RevisionConflict {
             base: turn_base,
             current: campaign,

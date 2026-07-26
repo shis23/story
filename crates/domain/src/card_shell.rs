@@ -118,7 +118,10 @@ pub fn extract_card_shell_manifest(character: &Character) -> CardShellManifest {
     remote_urls.sort();
     remote_urls.dedup();
 
-    CardShellManifest { shells, remote_urls }
+    CardShellManifest {
+        shells,
+        remote_urls,
+    }
 }
 
 fn extract_from_regex_script(
@@ -146,11 +149,7 @@ fn extract_from_regex_script(
     if !load_urls.is_empty() {
         for url in load_urls {
             let kind = classify_shell_kind(find, &label, &url);
-            let deps: Vec<String> = all_urls
-                .iter()
-                .filter(|u| *u != &url)
-                .cloned()
-                .collect();
+            let deps: Vec<String> = all_urls.iter().filter(|u| *u != &url).cloned().collect();
             shells.push(CardFrontendShell {
                 kind,
                 entry: CardShellEntry::RemoteUrl { url: url.clone() },
@@ -205,10 +204,7 @@ fn extract_from_tavern_helper(
     };
 
     for sc in scripts {
-        let enabled = sc
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let enabled = sc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
         if !enabled {
             continue;
         }
@@ -266,7 +262,6 @@ fn extract_from_tavern_helper(
     }
 }
 
-
 fn extract_visible_th_buttons(sc: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     let button = sc.get("button");
@@ -278,10 +273,7 @@ fn extract_visible_th_buttons(sc: &serde_json::Value) -> Vec<String> {
         return out;
     };
     for b in arr {
-        let visible = b
-            .get("visible")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let visible = b.get("visible").and_then(|v| v.as_bool()).unwrap_or(true);
         if !visible {
             continue;
         }
@@ -388,7 +380,18 @@ fn capture_http_urls(text: &str) -> Vec<String> {
                 if ch.is_whitespace()
                     || matches!(
                         ch,
-                        '\'' | '"' | '`' | '<' | '>' | ')' | '(' | ']' | '[' | '}' | '{' | ',' | ';'
+                        '\'' | '"'
+                            | '`'
+                            | '<'
+                            | '>'
+                            | ')'
+                            | '('
+                            | ']'
+                            | '['
+                            | '}'
+                            | '{'
+                            | ','
+                            | ';'
                     )
                 {
                     break;
@@ -418,11 +421,7 @@ fn capture_http_urls(text: &str) -> Vec<String> {
 fn capture_es_module_urls(text: &str) -> Vec<String> {
     // import 'url' / import "url" / from 'url' / import('url')
     let mut out = Vec::new();
-    for (pat_start, _pat) in [
-        ("import ", true),
-        ("from ", true),
-        ("import(", true),
-    ] {
+    for (pat_start, _pat) in [("import ", true), ("from ", true), ("import(", true)] {
         let lower = text.to_ascii_lowercase();
         let mut search_from = 0;
         let needle = pat_start;
@@ -524,7 +523,8 @@ mod tests {
         let home = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/FrontEnd-for-destined-journey@1.6.2/dist/home/index.html";
         let custom = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/FrontEnd-for-destined-journey@1.6.2/dist/custom_start/index.html";
         let status = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/FrontEnd-for-destined-journey@1.6.2/dist/status/index.html";
-        let mvu = "https://testingcf.jsdelivr.net/gh/MagicalAstrogy/MagVarUpdate/artifact/bundle.js";
+        let mvu =
+            "https://testingcf.jsdelivr.net/gh/MagicalAstrogy/MagVarUpdate/artifact/bundle.js";
         let schema = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/FrontEnd-for-destined-journey@1.6.2/dist/data_schema/index.js";
         let auto = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/Automated-script-for-destined-journey@3.2.10/dist/index.js";
         let preload = "https://testingcf.jsdelivr.net/gh/The-poem-of-destiny/FrontEnd-for-destined-journey@1.6.2/dist/image_preload/index.js";
@@ -672,7 +672,11 @@ mod tests {
         );
         // 状态判定先于开场：带「开场后状态栏」字样的壳仍是状态壳
         assert_eq!(
-            classify_shell_kind("<StatusPlaceHolderImpl/>", "开场后状态栏", "https://x/s.html"),
+            classify_shell_kind(
+                "<StatusPlaceHolderImpl/>",
+                "开场后状态栏",
+                "https://x/s.html"
+            ),
             CardShellKind::StatusBar
         );
         // 普通消息壳不受影响

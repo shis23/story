@@ -996,7 +996,10 @@ fn mvu_payload_roundtrip_overwrite_and_delete() {
         .unwrap()
         .unwrap();
     assert_eq!(loaded["character_name"], "Alice");
-    assert_eq!(loaded["translation"]["update_rules"][0], "damage reduces hp");
+    assert_eq!(
+        loaded["translation"]["update_rules"][0],
+        "damage reduces hp"
+    );
 
     // 覆盖：同 source_character_id upsert 不产生第二行
     let mut updated = payload.clone();

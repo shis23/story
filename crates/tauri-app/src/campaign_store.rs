@@ -506,7 +506,9 @@ impl CampaignStore {
     /// 读取本局世界书。文件不存在返回空书（调用方应 ensure/copy）。
     pub fn get_world_info(&self, campaign_id: &Id) -> Result<WorldInfoBook, String> {
         if self.json_access_disabled() {
-            return Err("legacy JSON CampaignStore is disabled while SQLite is authoritative".into());
+            return Err(
+                "legacy JSON CampaignStore is disabled while SQLite is authoritative".into(),
+            );
         }
         let mut map = self.world_info.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(book) = map.get(campaign_id.as_str()) {
@@ -617,10 +619,8 @@ impl CampaignStore {
                 return Err(format!("世界书条目索引越界: {entry_index}"));
             }
             book.entries[entry_index].route = route;
-            book.entries[entry_index].disabled = matches!(
-                book.entries[entry_index].route,
-                LoreRoute::Disabled
-            );
+            book.entries[entry_index].disabled =
+                matches!(book.entries[entry_index].route, LoreRoute::Disabled);
             Ok(())
         })?;
         Ok(())
@@ -1365,7 +1365,10 @@ mod tests {
             .unwrap();
         assert_eq!(book.entries.len(), 1);
         assert_eq!(
-            book.entries[0].extensions.get("sf_source").and_then(|v| v.as_str()),
+            book.entries[0]
+                .extensions
+                .get("sf_source")
+                .and_then(|v| v.as_str()),
             Some("card")
         );
 

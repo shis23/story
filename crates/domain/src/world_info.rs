@@ -149,7 +149,11 @@ impl WorldInfoBook {
     /// 注入路径（constant_entries / triggered_selective_entries / matches_query）均已检查
     /// `disabled`，禁用条目不会进入提示词。
     pub fn from_st(st: crate::character::StWorldInfoBook) -> Self {
-        let entries = st.entries.into_iter().map(WorldInfoEntry::from_st).collect();
+        let entries = st
+            .entries
+            .into_iter()
+            .map(WorldInfoEntry::from_st)
+            .collect();
 
         Self {
             entries,

@@ -24,12 +24,12 @@
 pub mod budget;
 pub mod card_translation;
 pub mod commit_probe;
-pub mod forge_differential;
 pub mod context_compile_bench;
 pub mod coverage_ledger;
 pub mod endurance;
 pub mod evidence;
 pub mod evidence_retention;
+pub mod forge_differential;
 pub mod long_session;
 pub mod observability;
 pub mod phase_b_matrix;
