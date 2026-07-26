@@ -51,3 +51,26 @@ test('resolveShellSurfaces fills missing campaign fallbacks', () => {
   assert.equal(resolved[0].kind, 'status')
   assert.equal(resolved[1].kind, 'opening_home')
 })
+
+test('partitionShellMountsByTrust auto-mounts only card-manifest urls (H3)', async () => {
+  const { partitionShellMountsByTrust } = await import('../src/utils/cardShellDisplay.js')
+  const attacker = 'https://files.catbox.moe/attacker.html'
+  const mounts = [
+    { url: HOME, kind: 'opening_home' },
+    { url: attacker, kind: 'message_html' },
+  ]
+
+  const { allowed, needsConfirmation } = partitionShellMountsByTrust(mounts, [HOME])
+  assert.deepEqual(allowed.map((m) => m.url), [HOME])
+  assert.deepEqual(needsConfirmation.map((m) => m.url), [attacker])
+
+  // 用户显式放行后可挂载
+  const approved = partitionShellMountsByTrust(mounts, [HOME], [attacker])
+  assert.equal(approved.needsConfirmation.length, 0)
+  assert.equal(approved.allowed.length, 2)
+
+  // 无任何信任上下文（legacy/无 manifest）：全部需要确认，fail closed
+  const none = partitionShellMountsByTrust(mounts, null, null)
+  assert.equal(none.allowed.length, 0)
+  assert.equal(none.needsConfirmation.length, 2)
+})

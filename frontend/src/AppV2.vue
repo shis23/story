@@ -209,6 +209,7 @@ const cardShellOpeningGreetings = ref([])
 const cardShellLabel = ref('')
 const cardShellLoading = ref(false)
 const cardShellShells = ref([])
+const cardShellRemoteUrls = ref([])
 const cardShellThCount = ref(0)
 const cardShellCharacterId = ref(null)
 const shellVarAudit = createVariableWriteAudit(40)
@@ -267,6 +268,21 @@ provide('storyforgeCardShellLayout', {
     if (cardShellOpeningUrl.value) urls.push(cardShellOpeningUrl.value)
     if (cardShellStatusUrl.value) urls.push(cardShellStatusUrl.value)
     return urls
+  }),
+  // H3：消息内 .load 只对「卡 manifest 注册过的 URL」自动挂载；
+  // 其余（如卡正则把模型输出改写成任意 .load）必须经用户确认。
+  trustedMessageShellUrls: computed(() => {
+    const urls = new Set()
+    if (cardShellOpeningUrl.value) urls.add(cardShellOpeningUrl.value)
+    if (cardShellStatusUrl.value) urls.add(cardShellStatusUrl.value)
+    for (const shell of cardShellShells.value) {
+      const url = shell?.entry?.remote_url?.url
+      if (url) urls.add(url)
+    }
+    for (const url of cardShellRemoteUrls.value) {
+      if (url) urls.add(url)
+    }
+    return [...urls]
   }),
 })
 
@@ -364,6 +380,7 @@ async function refreshCardShellManifest() {
   cardShellOpeningGreetings.value = []
   cardShellLabel.value = ''
   cardShellShells.value = []
+  cardShellRemoteUrls.value = []
   cardShellThCount.value = 0
   cardShellCharacterId.value = null
   // 换卡/换 Campaign 后旧壳的待确认变量提案不得跨上下文生效
@@ -397,6 +414,7 @@ async function refreshCardShellManifest() {
     cardShellOpeningUrl.value = m?.opening_home_url || m?.opening_custom_url || null
     cardShellLabel.value = m?.character_id || characterId
     cardShellShells.value = Array.isArray(m?.shells) ? m.shells : []
+    cardShellRemoteUrls.value = Array.isArray(m?.remote_urls) ? m.remote_urls : []
     cardShellThCount.value = m?.tavern_helper_count || 0
     cardShellCharacterId.value = characterId
   } catch (e) {
