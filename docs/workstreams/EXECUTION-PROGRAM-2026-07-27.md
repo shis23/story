@@ -71,13 +71,21 @@
 
 ### P2 既定队列（今晚早些时候排定）
 
-- [ ] **#19 L7-A**：重型卡内嵌挂载。内联 TH 应用（卿卿 bgm/图鉴/cg，57-99K 脚本）目前在
-  0×0 不可见 iframe 执行。改为写作面折叠面板：默认收起 chip、展开才挂载（手势解锁
-  autoplay）、一次一个活跃。入口数据：卡 manifest 的 InlineHtml 壳清单。
+- [x] **#19 L7-A** → **已做**：`utils/heavyShellApps.js` 按 inline_js 字节量
+  （阈值 30K；重型应用 57-99K vs 逻辑脚本 <20K）把 TH 壳拆 light/heavy；
+  侧栏隐藏运行时只跑 light，写作面 `HeavyShellDock.vue`（after-messages 槽，
+  ShellVariableProposalBar 之上）承接 heavy：默认收起 chip（零执行）、
+  展开即挂载（点击手势 + iframe allow=autoplay）、一次一个活跃（key 换 label
+  强制重建）、清单变化自动收起。TavernHelperRuntime 新增 `visible` prop
+  （真实版面 iframe，min(70vh,520px)）。var-write 走既有提案队列。
+  测试：node×3（拆分器）+ vitest×5（dock 行为）。
 - [ ] **#21** 评测口径扩展：开场白 `<UpdateVariable>` 种子解析进 forge 差分作者树
   （destiny 剩余"幻觉"里 世界.新闻/事件.莉莉.* 疑似合法种子变量），重算缺口性质。
-- [ ] **#22** SQLite 后端 MVU 规则收集补齐：`collect_mvu_update_rules_for_backend`
-  SQLite 门跳过 → 实现（后处理【卡片变量更新规则】注入在 SQLite 后端缺失）。
+- [x] **#22** SQLite 后端 MVU 补齐 → **已修**（比原计划更完整——根因是 SQLite
+  后端根本没有 MVU 翻译权威）：V005 `mvu_translations` 表 + importer 迁移
+  （老目录 manifest hash 稳定）+ repo/runtime CRUD + 两收集器 SQLite 分支
+  （同语义：source 去重/空白过滤/payload 双形态兼容）+ meta list/get/analyze
+  解禁 + 删卡级联分流。集成测试独立进程 activate 全链路验证。
 - [ ] **#23** card-studio：P1 金标（导出 PNG 实机证据 + 导入后自动 extract/开 Campaign
   绑定）→ P2 蒸馏骨架（文档切分/文风公式/总结账本/断点）→ P3 系统卡骨架
   （MVU 生成对接现有 analyze/apply、多 CharacterDefinition、世界书高级策略）。

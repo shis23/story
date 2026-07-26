@@ -48,8 +48,9 @@
     </div>
     <iframe
       ref="iframeRef"
-      class="th-iframe"
+      :class="visible ? 'th-iframe-visible' : 'th-iframe'"
       sandbox="allow-scripts"
+      allow="autoplay; fullscreen"
       :src="frameSrc"
       @load="onIframeLoad"
     />
@@ -76,6 +77,12 @@ const props = defineProps({
   autoRun: { type: Boolean, default: true },
   /** Sidebar presentation keeps diagnostics compact until expanded. */
   placement: { type: String, default: 'inline' },
+  /**
+   * L7-A：可见挂载模式。重型卡应用（bgm/图鉴/cg）的 UI 在 iframe 内渲染，
+   * 0×0 隐藏执行等于白跑；visible=true 时 iframe 占真实版面
+   * （配合 allow=autoplay，展开点击的用户手势可解锁播放）。
+   */
+  visible: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['done', 'error', 'var-write', 'status'])
@@ -884,5 +891,13 @@ defineExpose({ runAll, scripts, statuses, invokeButton, visibleButtons })
   border: 0;
   opacity: 0;
   pointer-events: none;
+}
+.th-iframe-visible {
+  display: block;
+  width: 100%;
+  height: min(70vh, 520px);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
 }
 </style>

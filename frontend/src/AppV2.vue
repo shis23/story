@@ -66,6 +66,8 @@ import { useOverviewScreenAdapter } from './adapter/useOverviewScreenAdapter.js'
 import ShellAwareContent from './components-v2/st/ShellAwareContent.vue'
 import MvuStatusPanel from './components-v2/st/MvuStatusPanel.vue'
 import ShellVariableProposalBar from './components-v2/st/ShellVariableProposalBar.vue'
+import HeavyShellDock from './components-v2/st/HeavyShellDock.vue'
+import { splitHeavyThShells } from './utils/heavyShellApps.js'
 import {
   useWritingStore,
   useCampaignStore,
@@ -213,6 +215,9 @@ const cardShellShells = ref([])
 const cardShellRemoteUrls = ref([])
 const cardShellThCount = ref(0)
 const cardShellCharacterId = ref(null)
+// L7-A：重型 TH 应用（≥30K inline_js）拆给写作面 HeavyShellDock 可见挂载；
+// 隐藏运行时只跑常规逻辑脚本（拆分器：utils/heavyShellApps.js）。
+const cardShellSplit = computed(() => splitHeavyThShells(cardShellShells.value))
 const shellVarAudit = createVariableWriteAudit(40)
 const shellVarAuditTick = ref(0)
 const openingShellArmed = ref(false)
@@ -733,9 +738,10 @@ onMounted(async () => {
         @open-meta="ui.showMetaPanel = true"
       >
         <template #runtime>
+          <!-- L7-A：隐藏运行时只跑轻量逻辑脚本；重型可见应用归写作面 dock -->
           <TavernHelperRuntime
             v-if="cardShellThCount"
-            :shells="cardShellShells"
+            :shells="cardShellSplit.light"
             :character-id="cardShellCharacterId"
             :show-status="true"
             :auto-run="true"
@@ -803,6 +809,12 @@ onMounted(async () => {
           />
         </template>
         <template #after-messages>
+          <!-- L7-A：重型卡应用折叠 dock（默认收起，展开即挂载，一次一个活跃） -->
+          <HeavyShellDock
+            :shells="cardShellSplit.heavy"
+            :character-id="cardShellCharacterId"
+            @var-write="onShellVarWrite"
+          />
           <ShellVariableProposalBar
             :proposals="shellVarProposals"
             :busy="shellVarApplyBusy"
