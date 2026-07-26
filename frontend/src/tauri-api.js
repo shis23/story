@@ -773,6 +773,222 @@ export async function listCards() {
   return []
 }
 
+// ─── Card Studio Phase 1 ────────────────────────────────────────────────
+
+export async function cardstudioListProjects() {
+  if (isTauri()) {
+    return await invoke('cardstudio_list_projects')
+  }
+  return []
+}
+
+export async function cardstudioCreateProject(name, brief) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_project', { name, brief })
+  }
+  return {
+    id: 'mock-cardstudio-1',
+    name,
+    brief,
+    mode: 'from_scratch',
+    current_stage: 'brief',
+    stage_status: { brief: 'ready' },
+    artifacts: {
+      name,
+      description: '',
+      personality: '',
+      scenario: '',
+      first_mes: '',
+      tags: [],
+      creator: '',
+      worldview_entries: [],
+      notes: brief,
+    },
+    last_error: null,
+    last_stage_output: null,
+    imported_character_id: null,
+    source_character_id: null,
+    source_stored_id: null,
+    created_at: '2026-07-22 00:00:00',
+    updated_at: '2026-07-22 00:00:00',
+  }
+}
+
+/** C: 从已有角色卡创建修订项目（默认另存） */
+export async function cardstudioCreateFromCharacter(characterId, brief = null) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_from_character', {
+      characterId,
+      brief: brief || null,
+    })
+  }
+  return {
+    id: 'mock-revise-1',
+    name: '修订（mock）',
+    mode: 'from_existing_card',
+    current_stage: 'review',
+    source_character_id: characterId,
+  }
+}
+
+/** B: 从小说正文创建改编项目（随后可 prefill） */
+export async function cardstudioCreateFromNovel(name, brief, novelTitle, novelText) {
+  if (isTauri()) {
+    return await invoke('cardstudio_create_from_novel', {
+      name: name || '',
+      brief: brief || '',
+      novelTitle: novelTitle || '',
+      novelText: novelText || '',
+    })
+  }
+  return {
+    id: 'mock-novel-1',
+    name: name || '小说改编（mock）',
+    mode: 'from_novel',
+    current_stage: 'basic',
+    novel_title: novelTitle,
+  }
+}
+
+/** B: 对 FromNovel 项目做 LLM 预填 */
+export async function cardstudioPrefillFromNovel(id, userNote = null, includeStyle = true) {
+  if (isTauri()) {
+    return await invoke('cardstudio_prefill_from_novel', {
+      id,
+      userNote: userNote || null,
+      includeStyle,
+    })
+  }
+  return null
+}
+
+export async function cardstudioGetProject(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_get_project', { id })
+  }
+  return null
+}
+
+export async function cardstudioDeleteProject(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_delete_project', { id })
+  }
+  return true
+}
+
+export async function cardstudioUpdateArtifacts(id, artifacts) {
+  if (isTauri()) {
+    return await invoke('cardstudio_update_artifacts', { id, artifacts })
+  }
+  return null
+}
+
+export async function cardstudioSetStage(id, stageId) {
+  if (isTauri()) {
+    return await invoke('cardstudio_set_stage', { id, stageId })
+  }
+  return null
+}
+
+export async function cardstudioSetOptions(id, { allowAiFreewrite = null, stagePackId = null } = {}) {
+  if (isTauri()) {
+    return await invoke('cardstudio_set_options', {
+      id,
+      allowAiFreewrite,
+      stagePackId,
+    })
+  }
+  return null
+}
+
+export async function cardstudioRunChecks(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_checks', { id })
+  }
+  return { ok: false, issues: [], score: 0, summary: '', source: 'rule' }
+}
+
+export async function cardstudioRunReview(id, userNote = null, useLlm = true) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_review', {
+      id,
+      userNote: userNote || null,
+      useLlm,
+    })
+  }
+  return { ok: false, issues: [], score: 0, summary: 'mock', source: 'rule' }
+}
+
+export async function cardstudioCompile(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_compile', { id })
+  }
+  return { st_card_json: {}, warnings: [], character_name: '' }
+}
+
+/** 出卡质量闸门：compile → JSON/PNG round-trip 真实导入 → 确定性检查报告 */
+export async function cardstudioExportGate(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_export_gate', { id })
+  }
+  return { pass: true, character_name: '', warnings: [], json_checks: [], png_checks: [] }
+}
+
+/** 导出编译产物为 ST PNG 卡（返回字节数组） */
+export async function cardstudioExportPng(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_export_png', { id })
+  }
+  return []
+}
+
+export async function cardstudioCompleteManualStage(id, stageId) {
+  if (isTauri()) {
+    return await invoke('cardstudio_complete_manual_stage', { id, stageId })
+  }
+  return null
+}
+
+export async function cardstudioRunStage(id, stageId, userNote = null) {
+  if (isTauri()) {
+    return await invoke('cardstudio_run_stage', {
+      id,
+      stageId,
+      userNote: userNote || null,
+    })
+  }
+  return null
+}
+
+export async function cardstudioImportCompiled(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_import_compiled', { id })
+  }
+  return {
+    character: {
+      id: 'mock-imported',
+      name: 'mock',
+      description: '',
+      tags: [],
+      creator: '',
+      spec_version: '3.0',
+      world_info_count: 0,
+      has_renderable_assets: false,
+      imported_at: '2026-07-22 00:00:00',
+    },
+    card_id: 'mock-card',
+    source_character_id: 'mock-imported-domain',
+    warnings: [],
+  }
+}
+
+export async function cardstudioListStages() {
+  if (isTauri()) {
+    return await invoke('cardstudio_list_stages')
+  }
+  return ['brief', 'basic', 'personality', 'worldview', 'opening', 'review', 'compile_import']
+}
+
 /** 获取 CharacterCard 详情（含 character_definitions） */
 export async function getCard(id) {
   if (isTauri()) {
