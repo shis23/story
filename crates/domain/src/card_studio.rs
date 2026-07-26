@@ -1209,6 +1209,77 @@ pub fn export_gate_checks(artifacts: &CardArtifacts, reimported: &Character) -> 
         format!("spec_version={}（期望 3.x）", reimported.spec_version),
     ));
 
+    // ── forge 差分教训（2026-07-26）加的三维保真：内容字节 / keys 精确 /
+    // 插入顺序。计数与路由对了但正文或顺序漂了，卡照样坏——外部预言机
+    // （tavern-cards forge）对导入层验出的正是这三类回归。──────────────
+
+    let normalize_content = |s: &str| s.replace("\r\n", "\n").trim().to_string();
+    let expected_contents: Vec<String> = artifacts
+        .worldview_entries
+        .iter()
+        .map(|e| normalize_content(&e.content))
+        .collect();
+    let actual_contents: Vec<String> = book
+        .map(|b| {
+            b.entries
+                .iter()
+                .map(|e| normalize_content(&e.content))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push(gate(
+        "gate.content_roundtrip",
+        actual_contents == expected_contents,
+        format!(
+            "逐条正文（CRLF/首尾空白归一）比对：{}（顺序敏感）",
+            if actual_contents == expected_contents {
+                "全一致".to_string()
+            } else {
+                let first_diff = expected_contents
+                    .iter()
+                    .zip(actual_contents.iter())
+                    .position(|(a, b)| a != b)
+                    .map(|i| format!("首个差异在 #{i}"))
+                    .unwrap_or_else(|| "条数不同".to_string());
+                first_diff
+            }
+        ),
+    ));
+
+    let expected_keys: Vec<Vec<String>> = artifacts
+        .worldview_entries
+        .iter()
+        .map(|e| {
+            e.keys
+                .iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .collect();
+    let actual_keys: Vec<Vec<String>> = book
+        .map(|b| b.entries.iter().map(|e| e.keys.clone()).collect())
+        .unwrap_or_default();
+    out.push(gate(
+        "gate.keys_roundtrip",
+        actual_keys == expected_keys,
+        format!(
+            "逐条触发键精确比对（trim 后）：期望 {} 组，实际 {} 组",
+            expected_keys.len(),
+            actual_keys.len()
+        ),
+    ));
+
+    let expected_orders: Vec<i32> = artifacts.worldview_entries.iter().map(|e| e.order).collect();
+    let actual_orders: Vec<i32> = book
+        .map(|b| b.entries.iter().map(|e| e.order).collect())
+        .unwrap_or_default();
+    out.push(gate(
+        "gate.insertion_order_roundtrip",
+        actual_orders == expected_orders,
+        format!("插入顺序（insertion_order）：期望 {expected_orders:?}，实际 {actual_orders:?}"),
+    ));
+
     out
 }
 
@@ -1673,6 +1744,51 @@ mod tests {
         // 无关检查不受牵连
         assert!(by_name("gate.name_roundtrip").pass);
         assert!(by_name("gate.no_script_components").pass);
+    }
+
+    #[test]
+    fn export_gate_detects_content_keys_and_order_drift() {
+        // forge 差分三维：正文字节 / keys 精确 / 插入顺序。
+        // 计数与路由全对但这三样漂移的卡必须被闸门拦下。
+        let a = sample_ok_artifacts();
+        let compiled = compile_artifacts(&a).expect("compile");
+
+        // 正文漂移
+        let mut content_drift = compiled.character.clone();
+        content_drift.embedded_world_info.as_mut().unwrap().entries[1].content =
+            "被悄悄改写的正文".into();
+        let checks = export_gate_checks(&a, &content_drift);
+        let by_name = |cs: &[GateCheck], n: &str| {
+            cs.iter().find(|c| c.name == n).expect("check exists").pass
+        };
+        assert!(!by_name(&checks, "gate.content_roundtrip"));
+        assert!(by_name(&checks, "gate.keys_roundtrip"));
+        assert!(by_name(&checks, "gate.insertion_order_roundtrip"));
+
+        // keys 漂移（掉一个触发键，计数类检查全过）
+        let mut key_drift = compiled.character.clone();
+        key_drift.embedded_world_info.as_mut().unwrap().entries[1]
+            .keys
+            .pop();
+        let checks = export_gate_checks(&a, &key_drift);
+        assert!(!by_name(&checks, "gate.keys_roundtrip"));
+        assert!(by_name(&checks, "gate.content_roundtrip"));
+
+        // 插入顺序漂移
+        let mut order_drift = compiled.character.clone();
+        order_drift.embedded_world_info.as_mut().unwrap().entries[0].order = 999;
+        let checks = export_gate_checks(&a, &order_drift);
+        assert!(!by_name(&checks, "gate.insertion_order_roundtrip"));
+        assert!(by_name(&checks, "gate.content_roundtrip"));
+
+        // CRLF 差异是记法不是漂移：归一后应放行
+        let mut crlf_only = compiled.character.clone();
+        {
+            let entry = &mut crlf_only.embedded_world_info.as_mut().unwrap().entries[0];
+            entry.content = entry.content.replace('\n', "\r\n") + "\r\n";
+        }
+        let checks = export_gate_checks(&a, &crlf_only);
+        assert!(by_name(&checks, "gate.content_roundtrip"));
     }
 
     #[test]
