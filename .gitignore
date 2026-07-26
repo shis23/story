@@ -46,3 +46,11 @@ test-card-multi-b2.png
 
 # local extracts / scratch
 tmp/
+
+# 用户卡片素材（本地评测/写卡材料，绝不入库）
+卿卿 (33).png
+写卡知识库.json
+明月秋青-V10086.json
+明月秋青写卡预设-标准+辅食.json
+明月小说文风蒸馏总结工具.zip
+.worktrees/
