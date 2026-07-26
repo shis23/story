@@ -33,7 +33,7 @@ StoryForge 已经不是“角色卡 + 聊天框”的套壳。Campaign、Charact
 
 ### 2.2 截至本评估的工程状态
 
-- Rust workspace 实际为 15 个 crate；Tauri command 标注约 122 个。
+- Rust workspace 实际为 15 个 crate；Tauri command 标注约 122 个。（2026-07-26 注：当前为 16 个 crate / 142 个 command，as of `d36d433`；本节其余数字为 2026-07-11 时点快照）
 - `main` 相对本地跟踪的 `origin/main` 领先 21 个提交。
 - 原有未提交改动为 `frontend/src/components-v2/ui/Tabs.vue` 与 `frontend/tests/stores/plugin.test.mjs`。
 - Secret scan、Clippy、Rust workspace 750 项、前端 Node 212 项、Vitest 24 项和前端构建通过。

@@ -1,7 +1,7 @@
 # Campaign 世界书 + 完整 Card Shell WebView
 
-> 状态：**阶段性暂停改代码**（文档更新 2026-07-23）  
-> 当前 HEAD 相关提交：`8e97af8`（壳复用 `plugin-bridge` ST 面）  
+> 状态：**进行中**（状态头更新 2026-07-26；原"阶段性暂停改代码 @ 8e97af8"已被后续提交突破，下文历史记录保留）  
+> 当前 HEAD 相关提交：`d36d433`（restore first-turn opening）+ 未提交 card-shell WIP（storyforge-cache 协议 / 开场 chat seed / 壳变量持久化；工作区状态详见 `ARCHITECTURE-REVIEW-2026-07-26.md`）  
 > 金标卡：仓库根 `test-card.png`（命定之诗与黄昏之歌 v4.1）
 
 ## 硬约束（不变）

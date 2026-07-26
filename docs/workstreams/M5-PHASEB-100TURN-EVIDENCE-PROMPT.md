@@ -20,10 +20,10 @@ full-workspace gates until this branch's final verification.
 Read completely before editing:
 
 1. `docs/workstreams/M5-PHASEB-100TURN-EVIDENCE-PLAN.md`
-2. `docs/workstreams/M5-PRODUCTION-EVIDENCE-DAY-RESULT.md`
-3. `docs/workstreams/EVAL-M5-PHASEB-RESULT.md`
+2. `docs/archive/2026-07-26-completed-workstreams/M5-PRODUCTION-EVIDENCE-DAY-RESULT.md`（2026-07-26 归档）
+3. `docs/archive/2026-07-26-completed-workstreams/EVAL-M5-PHASEB-RESULT.md`（2026-07-26 归档）
 4. `docs/MEMORY-CONTEXT-COMPILER-SPEC-2026-07-11.md`
-5. `docs/workstreams/TURN-LIFECYCLE-SERVICE-RESULT.md`
+5. `docs/archive/2026-07-26-completed-workstreams/TURN-LIFECYCLE-SERVICE-RESULT.md`（2026-07-26 归档）
 
 Implement the entire vertical slice, not only a skeleton. Use TDD: add failing
 deterministic tests for scheduling, checkpoint/resume, budget limits, evidence

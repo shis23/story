@@ -24,7 +24,7 @@
 
 | 文件 | 冻结内容 | 断了会怎样 |
 |---|---|---|
-| `frontend/src/tauri-api.js` | 全部 export 函数名、所有 `invoke('命令名')` 字符串(~110 个)、`listen('mvu:load_card_assets'\|'mvu:unload_card'\|'mvu:execute')` 3 事件名 | 断前后端契约,所有后端调用失败 |
+| `frontend/src/tauri-api.js` | 全部 export 函数名、所有 `invoke('命令名')` 字符串(~110 个，2026-07-08 时点；2026-07-26 实际 133 个)、`listen('mvu:load_card_assets'\|'mvu:unload_card'\|'mvu:execute')` 3 事件名 | 断前后端契约,所有后端调用失败 |
 | `frontend/src/plugin-bridge.js` | 全部 export + `API_METHODS` 的 `command`/`permission` 字段、`ST_EVENT_TYPES` 全部事件名常量、6 个 `MSG_*` 协议常量、`DEFAULT_PLUGIN_HOOK_TIMEOUT_MS`/`PROMPT_HOOK_PERMISSION`/`READ_MEMORY_PERMISSION` | 断插件系统,57 个 plugin-bridge 测试失败 |
 | `frontend/src/utils/*.js`(17 个) | 每个文件的导出函数名和签名。清单见 §1.2 | 断 141 个回归测试的护城河 |
 | `frontend/src/mvu-runtime-bridge.js` | 全部 export | 断 10 个 mvu-runtime-bridge 测试 |

@@ -14,7 +14,7 @@ Cargo locks. CI configuration must not hard-code this workstation path.
 Read:
 
 1. `docs/workstreams/RELEASE-CI-EVIDENCE-PLAN.md`
-2. `docs/workstreams/RELEASE-BUILD-PIPELINE-RESULT.md`
+2. `docs/archive/2026-07-26-completed-workstreams/RELEASE-BUILD-PIPELINE-RESULT.md`（2026-07-26 归档）
 3. `docs/workstreams/RELEASE-BRONZE-RESULT.md`
 4. current release scripts and Pester tests.
 

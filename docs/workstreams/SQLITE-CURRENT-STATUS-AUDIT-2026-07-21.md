@@ -151,7 +151,7 @@ SQLite 不是“还没做”。在 `main@bf36e04`：
 | --- | --- |
 | 本文件 | 成为 2026-07-21 起 SQLite **当前事实**入口 |
 | `docs/HANDOFF.md` | 同步为当前接线与证据边界 |
-| `SQLITE-PREACCEPT-LIFECYCLE-RESULT.md` | 保留历史交付，顶部加 supersession 说明 |
+| `SQLITE-PREACCEPT-LIFECYCLE-RESULT.md` | 保留历史交付，顶部加 supersession 说明；2026-07-26 已归档至 `docs/archive/2026-07-26-completed-workstreams/` |
 | `SQLITE-M5-100-ENDURANCE-PLAN.md` | 更新状态行，避免“Full100 已完成”被读成已封存 |
 | `RELEASE-CHECKLIST.md` | 同步 pre-accept 已接线、证据未封存 |
 

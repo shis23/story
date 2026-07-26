@@ -12,6 +12,16 @@
 - UI smoke runner 已加入 `scripts/run-ui-smoke.ps1` 和 `frontend` 的 `npm run smoke:ui`，但当前环境缺少 `@playwright/test` 时只会记录 skip；它是浏览器级冒烟，不替代真实 Tauri 桌面 UI 截图和人工验收。
 - 当前文档口径：可以承诺 ST/插件主链路、常见别名、Slash 常用 shim、最终 messages 级 prompt hook 和 fail-open；不能承诺 ST 99 事件全集、完整 TavernHelper/Slash 冷门语义、完整插件沙箱或真实插件 Gold 档全通过。
 
+## 2026-07-26 文档整理增量
+
+> 最后核对 commit：`d36d433`（工作区另有未提交 card-shell WIP）
+
+- 数字事实修正：workspace 实际为 **16 个 crate**，`crates/tauri-app/src/lib.rs` 实际为 **142 个** `#[tauri::command]`。本文、README、`ARCHITECTURE-PROMPT-CACHE-OPTIMIZATION-2026-07-11.md` 中的旧数字（14/15 crate、110/122/125 命令）已修正或加时点注记。此类计数漂移的根治建议是改为脚本生成（见评审报告 P2-11）。
+- 已按归档惯例把 19 组已完结 workstream 文档（38 个文件）移入 `docs/archive/2026-07-26-completed-workstreams/`，逐组判定依据见该目录 README。保留的活跃 workstream：RELEASE-BRONZE（人工 GUI 验收未闭环）、RELEASE-CI-EVIDENCE / RELEASE-RUNNER-READINESS（Gitea runner 实跑未验证）、M5-PHASEB-100TURN-EVIDENCE（HANDOFF 引用的权威 M5 结果）、SQLite 现状/耐力专线、CoT 三臂专线、card-shell / Card Studio 专线。
+- 新增 `docs/workstreams/ARCHITECTURE-REVIEW-2026-07-26.md`：全库架构评审（65 条发现，其中 8 条经对抗核实）+ 整体战略判断 + 写作流水线重设计定稿（补记一/二/三）。
+- **本文事实与已核实发现的冲突预警**：评审确认 V1（regenerate 的 postprocess `present_chars` 恒空）与 V2（A.1 之后本轮临时角色的知识/变量在 postprocess 时被跳过）。因此本文阶段 6 段落中"临时 instance 在 postprocess 前落盘、知识/变量写回不再被跳过"的描述在 A.1 语义下**已过期**；修复落地时须同步回写本文与 CLAUDE.md 对应条目。
+- `CAMPAIGN-WORLDINFO-AND-CARD-SHELL-PLAN.md` 的"阶段性暂停改代码 @ 8e97af8"状态头已过期并更新为进行中（HEAD `d36d433` + 未提交 WIP）。
+
 ## 结论
 
 当前文档的大方向来自代码现状，核心架构判断成立；但 Campaign 主链路已经完成到 Phase 5，不能再按早期“写作流水线仍主要消费扁平 Character”的状态执行：
@@ -31,9 +41,9 @@
 
 ### Workspace 和命令数量
 
-- `Cargo.toml` 当前 workspace members 为 14 个 crate。
-- `crates/tauri-app/src/lib.rs` 当前存在 110 个 `#[tauri::command]` 标注的 Tauri command。
-- README 中“Rust workspace，14 个 crate”和“110 个命令”与当前代码一致。
+- `Cargo.toml` 当前 workspace members 为 16 个 crate（2026-07-26 核对，as of `d36d433`）。
+- `crates/tauri-app/src/lib.rs` 当前存在 142 个 `#[tauri::command]` 标注的 Tauri command（同上核对）。
+- README 中“Rust workspace，16 个 crate”和“142 个命令”与当前代码一致（2026-07-26 已同步修正）。
 
 ### Campaign 写作主链路
 
