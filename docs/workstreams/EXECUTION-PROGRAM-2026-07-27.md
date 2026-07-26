@@ -143,7 +143,11 @@
     tauri-app 若干——collapsible_if、field_reassign_with_default、
     redundant_closure、let_and_return）。
   - 待收：clippy 全绿 → 推送 → 观察 linux 4 job 首绿。
-- [~] **#31 盲测**（LLM 驱动已写、实测运行中）：
+- [x] **#31 盲测首轮完成**（964s 全绿，RESULT 见 BLIND-AB-PIPELINE-RESULT.md）：
+  质量不可区分（胜场 1:1:2 平）+ 成本硬数据 solo 111.6s vs 流水线 425.8s
+  （3.8×）→ 预注册口径落「优势不显著 → 重设计优先简化」，续写档默认化
+  获首份实证。关键方法论发现：裁判首位偏置 10/10（下轮必修一致性过滤
+  两向呈现）。原始条目存档：
   骨架 f3f2c86 + 集成测试 `tests/blind_arm_matrix_real_llm.rs`——
   双角色 fixture 卡（守灯人沈磐 × 调查员闻笛，无外部卡文件依赖）、
   4 意图、solo_writer 臂（同源 campaign 状态拼单发）vs parallel_crew 臂
