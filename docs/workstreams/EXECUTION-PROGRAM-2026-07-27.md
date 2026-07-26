@@ -91,11 +91,23 @@
   （老目录 manifest hash 稳定）+ repo/runtime CRUD + 两收集器 SQLite 分支
   （同语义：source 去重/空白过滤/payload 双形态兼容）+ meta list/get/analyze
   解禁 + 删卡级联分流。集成测试独立进程 activate 全链路验证。
-- [ ] **#23** card-studio：P1 金标（导出 PNG 实机证据 + 导入后自动 extract/开 Campaign
-  绑定）→ P2 蒸馏骨架（文档切分/文风公式/总结账本/断点）→ P3 系统卡骨架
-  （MVU 生成对接现有 analyze/apply、多 CharacterDefinition、世界书高级策略）。
-  现有代码入口：domain/card_studio.rs、tauri-app/card_studio_{api,store}.rs、
-  components-v2/campaign/CardStudio.vue。
+- [x] **#23** card-studio 起步范围完成：
+  - **P1 复核**：金标两项"待收尾"实际早已存在——PNG 实机证据
+    （golden-a/c-card.png）+ 导入后一键识别/开档链路
+    （goLibraryAfterImport(withExtract) → extractCharacters → 卡库 →
+    open-campaigns；fallback 定义免 LLM 即可开 Campaign）。无剩余工作。
+  - **P2 蒸馏骨架**（6dba655）：domain/novel_distill.rs——chunk_novel 段落
+    边界切分（超长段硬上限强切、char 区间不复制文本）、NovelDistillJob
+    状态机（Chunks→StyleFormula→Ledgers→Done，next_pending_chunk 即断点，
+    serde round-trip 锁定恢复）、DistillLedgers 四账本、DistillPrefill
+    一键预填包。LLM 驱动留 tauri-app 命令层接入位。
+  - **P3 系统卡骨架**（afb9c81）：apply_mvu_bootstrap_entry（InitVar YAML
+    经普通常驻世界书条目落卡，闸门口径零改动，分析器按内容关键字识别）、
+    extra_definitions 经 ST extensions round-trip（导入 attach 留接线位）、
+    世界书高级策略字段（probability/exclude_recursion/group →
+    entry.extensions）。
+  - LLM 驱动全量（蒸馏跑通样例小说、多定义 attach 接线、ST 一等字段映射）
+    为周级后续，见 FEASIBILITY Phase 2/3 交付表。
 - [x] **#24** 杂项 → **已做**：
   - 清空卡壳缓存按钮入 InspectorDrawer 页脚维护区（L6 UI 入口收尾）
   - vite manualChunks：vendor-vue 133K + vendor-sanitize 29K 拆出，

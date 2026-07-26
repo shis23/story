@@ -21,6 +21,7 @@
 //! - [`long_session`] ≥20 Accept + ContextEpoch membership 校验
 //! - [`phase_b_matrix`] Phase B A/B 对照矩阵
 
+pub mod blind_arm_matrix;
 pub mod budget;
 pub mod card_translation;
 pub mod commit_probe;
