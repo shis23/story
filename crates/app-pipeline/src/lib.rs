@@ -2157,6 +2157,26 @@ impl PipelineOrchestrator {
             state: self.state.clone(),
         });
 
+        // V1（ARCHITECTURE-REVIEW-2026-07-26）：session 此前只有 start_writing
+        // 赋值，regenerate 后 pipeline.session() 恒 None → Tauri 层导出的
+        // present_chars 恒空，postprocess 静默丢弃本轮 Witnessed/Inferred
+        // 知识，质量门 NarrativeContract 也无在场角色。与 start_writing
+        // 同语义填充（所有重 roll 粒度都汇于此收尾）。
+        self.session = Some(WritingSession {
+            id: session_id.clone(),
+            intent: hint
+                .map(String::from)
+                .unwrap_or_else(|| plan.scene_brief.clone()),
+            state: self.state.clone(),
+            plan: Some(plan.clone()),
+            subagent_results: performances.to_vec(),
+            draft: Some(Draft {
+                text: final_text.clone(),
+                attribution: vec![],
+            }),
+            seed,
+        });
+
         info!(target: "app-pipeline", "重 roll 完成: {} 字", final_text.len());
         Ok((final_text, provenance))
     }
@@ -4031,6 +4051,15 @@ mod tests {
             "重 roll 后应多 1 个 variant"
         );
         assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
+
+        // V1 回归：regenerate 后 session 必须已填充（含 plan），否则 Tauri 层
+        // 导出的 present_chars 恒空，postprocess 静默丢弃本轮知识写回
+        let session = orchestrator.session().expect("重 roll 后 session 应已填充");
+        let plan = session.plan.as_ref().expect("session.plan 应存在");
+        assert!(
+            !plan.subagent_tasks.is_empty(),
+            "plan.subagent_tasks 不应为空（present_chars 的来源）"
+        );
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
