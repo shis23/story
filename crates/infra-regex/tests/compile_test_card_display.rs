@@ -32,7 +32,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s0.clone()],
+        std::slice::from_ref(&s0),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -50,7 +50,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s1.clone()],
+        std::slice::from_ref(&s1),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -63,7 +63,7 @@ fn compile_test_card_display_scripts() {
     let s2 = make("script_2", "<StatusPlaceHolderImpl/>", "", "");
     match apply_regex_scripts_for_target(
         text,
-        &[s2.clone()],
+        std::slice::from_ref(&s2),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -81,7 +81,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s3.clone()],
+        std::slice::from_ref(&s3),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -99,7 +99,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s4.clone()],
+        std::slice::from_ref(&s4),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -117,7 +117,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s5.clone()],
+        std::slice::from_ref(&s5),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -135,7 +135,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s6.clone()],
+        std::slice::from_ref(&s6),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -153,7 +153,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s7.clone()],
+        std::slice::from_ref(&s7),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -171,7 +171,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s8.clone()],
+        std::slice::from_ref(&s8),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {
@@ -189,7 +189,7 @@ fn compile_test_card_display_scripts() {
     );
     match apply_regex_scripts_for_target(
         text,
-        &[s9.clone()],
+        std::slice::from_ref(&s9),
         RegexPlacement::Output,
         RegexExecutionTarget::Display,
     ) {

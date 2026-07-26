@@ -1374,13 +1374,12 @@ fn rebuild_world_info_in_tool_ctx(state: &tauri::State<'_, Arc<AppState>>) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        if let Some(campaign_id) = active {
-            if let Ok(book) = get_campaign_store().get_world_info(&campaign_id) {
-                if !book.entries.is_empty() {
-                    apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
-                    return;
-                }
-            }
+        if let Some(campaign_id) = active
+            && let Ok(book) = get_campaign_store().get_world_info(&campaign_id)
+            && !book.entries.is_empty()
+        {
+            apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
+            return;
         }
     }
 
@@ -10230,10 +10229,10 @@ fn fork_campaign_in_store(
             }
         }
         _ => {
-            if let Some(card) = store.get_card(&campaign.card_id) {
-                if let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &card) {
-                    tracing::warn!("fork 惰性种子世界书失败: {e}");
-                }
+            if let Some(card) = store.get_card(&campaign.card_id)
+                && let Err(e) = seed_campaign_world_info_from_card(store, &campaign, &card)
+            {
+                tracing::warn!("fork 惰性种子世界书失败: {e}");
             }
         }
     }
@@ -10363,16 +10362,13 @@ fn set_active_campaign(
         // 写作注入：活跃活动切换后 tool_ctx 改读本局世界书
         let store = get_campaign_store();
         if let Ok(mut book) = store.get_world_info(&campaign_id) {
-            if book.entries.is_empty() {
-                if let Some(camp) = store.get_campaign(&campaign_id) {
-                    if let Some(card) = store.get_card(&camp.card_id) {
-                        let template = resolve_template_world_info_for_card(&card);
-                        if let Ok(seeded) =
-                            store.ensure_world_info_from_book(&campaign_id, &template)
-                        {
-                            book = seeded;
-                        }
-                    }
+            if book.entries.is_empty()
+                && let Some(camp) = store.get_campaign(&campaign_id)
+                && let Some(card) = store.get_card(&camp.card_id)
+            {
+                let template = resolve_template_world_info_for_card(&card);
+                if let Ok(seeded) = store.ensure_world_info_from_book(&campaign_id, &template) {
+                    book = seeded;
                 }
             }
             apply_campaign_world_info_to_tool_ctx(state.inner(), &campaign_id, &book);
@@ -11076,14 +11072,14 @@ fn list_campaign_world_info(
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}")))?;
     let mut book = store
         .get_world_info(&id)
-        .map_err(|e| TauriCommandError::storage(e))?;
-    if book.entries.is_empty() {
-        if let Some(card) = store.get_card(&camp.card_id) {
-            let template = resolve_template_world_info_for_card(&card);
-            book = store
-                .ensure_world_info_from_book(&id, &template)
-                .map_err(|e| TauriCommandError::storage(e))?;
-        }
+        .map_err(TauriCommandError::storage)?;
+    if book.entries.is_empty()
+        && let Some(card) = store.get_card(&camp.card_id)
+    {
+        let template = resolve_template_world_info_for_card(&card);
+        book = store
+            .ensure_world_info_from_book(&id, &template)
+            .map_err(TauriCommandError::storage)?;
     }
     apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     Ok(book_to_campaign_world_info_dto(&id, &book))
@@ -11136,7 +11132,7 @@ fn add_campaign_world_info_entry(
     let store = get_campaign_store();
     let idx = store
         .add_world_info_entry(&id, entry)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     if let Ok(book) = store.get_world_info(&id) {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     }
@@ -11170,7 +11166,7 @@ fn update_campaign_world_info_entry(
     let store = get_campaign_store();
     let book = store
         .get_world_info(&id)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     let prev = book.entries.get(req.entry_index).ok_or_else(|| {
         TauriCommandError::not_found(format!("条目索引越界: {}", req.entry_index))
     })?;
@@ -11187,7 +11183,7 @@ fn update_campaign_world_info_entry(
     entry.route = route;
     store
         .update_world_info_entry(&id, req.entry_index, entry)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     if let Ok(book) = store.get_world_info(&id) {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     }
@@ -11212,7 +11208,7 @@ fn set_campaign_world_info_enabled(
     let store = get_campaign_store();
     let book = store
         .set_world_info_entry_enabled(&id, entry_index, enabled)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     Ok(())
 }
@@ -11232,7 +11228,7 @@ fn delete_campaign_world_info_entry(
     let store = get_campaign_store();
     store
         .delete_world_info_entry(&id, entry_index)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     if let Ok(book) = store.get_world_info(&id) {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     }
@@ -11256,7 +11252,7 @@ fn set_campaign_world_info_route(
     let store = get_campaign_store();
     store
         .set_world_info_route(&id, entry_index, lore)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     if let Ok(book) = store.get_world_info(&id) {
         apply_campaign_world_info_to_tool_ctx(state.inner(), &id, &book);
     }
@@ -11284,7 +11280,7 @@ fn get_character_world_info(
             metadata: Default::default(),
         });
     // 伪 campaign_id 槽位仅用于 DTO 复用；UI 标注只读
-    let fake = Id::from_str(&format!("card:{}", stored.id));
+    let fake = Id::from_str(format!("card:{}", stored.id));
     Ok(book_to_campaign_world_info_dto(&fake, &book))
 }
 
@@ -11328,7 +11324,7 @@ fn get_campaign_world_info_entry(
     let id = Id::from_str(&campaign_id);
     let book = get_campaign_store()
         .get_world_info(&id)
-        .map_err(|e| TauriCommandError::storage(e))?;
+        .map_err(TauriCommandError::storage)?;
     let entry = book.entries.get(entry_index).ok_or_else(|| {
         TauriCommandError::not_found(format!("世界书条目索引越界: {entry_index}"))
     })?;
@@ -11367,18 +11363,16 @@ fn get_card_shell_manifest(
         .iter()
         .filter_map(|s| {
             let mut v = serde_json::to_value(s).ok()?;
-            if let Some(entry) = v.get_mut("entry") {
-                if let Some(obj) = entry.get_mut("inline_js") {
-                    if let Some(js) = obj.get("js").and_then(|j| j.as_str()) {
-                        if js.len() > 8_192 {
-                            let len = js.len();
-                            obj.as_object_mut().map(|m| {
-                                m.insert("js".into(), serde_json::Value::String(String::new()));
-                                m.insert("deferred".into(), serde_json::Value::Bool(true));
-                                m.insert("byte_len".into(), serde_json::Value::Number(len.into()));
-                            });
-                        }
-                    }
+            if let Some(entry) = v.get_mut("entry")
+                && let Some(obj) = entry.get_mut("inline_js")
+                && let Some(js) = obj.get("js").and_then(|j| j.as_str())
+                && js.len() > 8_192
+            {
+                let len = js.len();
+                if let Some(m) = obj.as_object_mut() {
+                    m.insert("js".into(), serde_json::Value::String(String::new()));
+                    m.insert("deferred".into(), serde_json::Value::Bool(true));
+                    m.insert("byte_len".into(), serde_json::Value::Number(len.into()));
                 }
             }
             Some(v)
@@ -11449,9 +11443,7 @@ fn card_shell_fetch_url(
     url: String,
 ) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
     let cache = get_card_shell_cache();
-    let client = cache
-        .build_client()
-        .map_err(|e| TauriCommandError::internal(e))?;
+    let client = cache.build_client().map_err(TauriCommandError::internal)?;
     cache
         .fetch_blocking_with_client(&url, &client)
         .map_err(|e| {

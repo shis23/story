@@ -181,8 +181,10 @@ impl CardProject {
 
         let name = name.into();
         let brief = brief.into();
-        let mut artifacts = CardArtifacts::default();
-        artifacts.notes = brief.clone();
+        let mut artifacts = CardArtifacts {
+            notes: brief.clone(),
+            ..CardArtifacts::default()
+        };
         if artifacts.name.is_empty() {
             artifacts.name = name.clone();
         }
@@ -242,11 +244,13 @@ impl CardProject {
         } else {
             Some(novel_text)
         };
-        let mut artifacts = CardArtifacts::default();
-        artifacts.notes = if brief.trim().is_empty() {
-            format!("小说改编：{}", novel_title)
-        } else {
-            brief.clone()
+        let mut artifacts = CardArtifacts {
+            notes: if brief.trim().is_empty() {
+                format!("小说改编：{}", novel_title)
+            } else {
+                brief.clone()
+            },
+            ..CardArtifacts::default()
         };
         artifacts.name = name.clone();
 
@@ -447,20 +451,20 @@ pub fn apply_novel_prefill_json(
     value: &serde_json::Value,
 ) -> Result<(), String> {
     apply_stage_json(STAGE_BASIC, artifacts, value)?;
-    if let Some(p) = value.get("personality").and_then(|v| v.as_str()) {
-        if !p.trim().is_empty() {
-            artifacts.personality = p.to_string();
-        }
+    if let Some(p) = value.get("personality").and_then(|v| v.as_str())
+        && !p.trim().is_empty()
+    {
+        artifacts.personality = p.to_string();
     }
-    if let Some(s) = value.get("scenario").and_then(|v| v.as_str()) {
-        if !s.trim().is_empty() {
-            artifacts.scenario = s.to_string();
-        }
+    if let Some(s) = value.get("scenario").and_then(|v| v.as_str())
+        && !s.trim().is_empty()
+    {
+        artifacts.scenario = s.to_string();
     }
-    if let Some(f) = value.get("first_mes").and_then(|v| v.as_str()) {
-        if !f.trim().is_empty() {
-            artifacts.first_mes = f.to_string();
-        }
+    if let Some(f) = value.get("first_mes").and_then(|v| v.as_str())
+        && !f.trim().is_empty()
+    {
+        artifacts.first_mes = f.to_string();
     }
     if let Some(style) = value
         .get("style_notes")
@@ -1238,13 +1242,12 @@ pub fn export_gate_checks(artifacts: &CardArtifacts, reimported: &Character) -> 
             if actual_contents == expected_contents {
                 "全一致".to_string()
             } else {
-                let first_diff = expected_contents
+                expected_contents
                     .iter()
                     .zip(actual_contents.iter())
                     .position(|(a, b)| a != b)
                     .map(|i| format!("首个差异在 #{i}"))
-                    .unwrap_or_else(|| "条数不同".to_string());
-                first_diff
+                    .unwrap_or_else(|| "条数不同".to_string())
             }
         ),
     ));
@@ -1476,10 +1479,10 @@ pub fn apply_stage_json(
 ) -> Result<(), String> {
     match stage_id {
         STAGE_BASIC => {
-            if let Some(s) = value.get("name").and_then(|v| v.as_str()) {
-                if !s.trim().is_empty() {
-                    artifacts.name = s.trim().to_string();
-                }
+            if let Some(s) = value.get("name").and_then(|v| v.as_str())
+                && !s.trim().is_empty()
+            {
+                artifacts.name = s.trim().to_string();
             }
             if let Some(s) = value.get("description").and_then(|v| v.as_str()) {
                 artifacts.description = s.to_string();
@@ -1554,13 +1557,13 @@ pub fn apply_stage_json(
             if let Some(t) = value.get("world_type").and_then(|v| v.as_str()) {
                 artifacts.world_type = Some(t.to_string());
             }
-            if let Some(n) = value.get("notes").and_then(|v| v.as_str()) {
-                if !n.trim().is_empty() {
-                    if artifacts.notes.is_empty() {
-                        artifacts.notes = n.to_string();
-                    } else {
-                        artifacts.notes = format!("{}\n\n[世界观备注]\n{}", artifacts.notes, n);
-                    }
+            if let Some(n) = value.get("notes").and_then(|v| v.as_str())
+                && !n.trim().is_empty()
+            {
+                if artifacts.notes.is_empty() {
+                    artifacts.notes = n.to_string();
+                } else {
+                    artifacts.notes = format!("{}\n\n[世界观备注]\n{}", artifacts.notes, n);
                 }
             }
             Ok(())
@@ -1583,22 +1586,21 @@ pub fn apply_stage_json(
 /// Best-effort extract JSON object from model text.
 pub fn extract_json_object(text: &str) -> Result<serde_json::Value, String> {
     let trimmed = text.trim();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if v.is_object() {
-            return Ok(v);
-        }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && v.is_object()
+    {
+        return Ok(v);
     }
     // fenced ```json
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            if end > start {
-                let slice = &trimmed[start..=end];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
-                    if v.is_object() {
-                        return Ok(v);
-                    }
-                }
-            }
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}')
+        && end > start
+    {
+        let slice = &trimmed[start..=end];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice)
+            && v.is_object()
+        {
+            return Ok(v);
         }
     }
     Err("模型输出中未找到可用 JSON 对象".into())

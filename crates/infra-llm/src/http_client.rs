@@ -551,11 +551,13 @@ mod tests {
 
     #[test]
     fn connection_provider_extra_applies_to_requests_without_extra() {
-        let mut params = SamplingParams::default();
-        params.extra = Some(serde_json::Map::from_iter([(
-            "thinking".into(),
-            serde_json::json!({"type": "disabled"}),
-        )]));
+        let params = SamplingParams {
+            extra: Some(serde_json::Map::from_iter([(
+                "thinking".into(),
+                serde_json::json!({"type": "disabled"}),
+            )])),
+            ..SamplingParams::default()
+        };
         let client = make_client_with_params("deepseek-v4-pro", params);
         let mut req = ChatRequest {
             messages: vec![],
@@ -571,11 +573,13 @@ mod tests {
 
     #[test]
     fn request_provider_extra_overrides_connection_key_and_preserves_other_defaults() {
-        let mut params = SamplingParams::default();
-        params.extra = Some(serde_json::Map::from_iter([
-            ("thinking".into(), serde_json::json!({"type": "disabled"})),
-            ("vendor_flag".into(), serde_json::json!(true)),
-        ]));
+        let params = SamplingParams {
+            extra: Some(serde_json::Map::from_iter([
+                ("thinking".into(), serde_json::json!({"type": "disabled"})),
+                ("vendor_flag".into(), serde_json::json!(true)),
+            ])),
+            ..SamplingParams::default()
+        };
         let client = make_client_with_params("deepseek-v4-pro", params);
         let mut req = ChatRequest {
             messages: vec![],

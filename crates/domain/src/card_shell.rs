@@ -57,10 +57,10 @@ pub struct CardShellManifest {
 impl CardShellManifest {
     pub fn opening_home_url(&self) -> Option<&str> {
         self.shells.iter().find_map(|s| {
-            if s.kind == CardShellKind::OpeningHome {
-                if let CardShellEntry::RemoteUrl { url } = &s.entry {
-                    return Some(url.as_str());
-                }
+            if s.kind == CardShellKind::OpeningHome
+                && let CardShellEntry::RemoteUrl { url } = &s.entry
+            {
+                return Some(url.as_str());
             }
             None
         })
@@ -68,10 +68,10 @@ impl CardShellManifest {
 
     pub fn opening_custom_url(&self) -> Option<&str> {
         self.shells.iter().find_map(|s| {
-            if s.kind == CardShellKind::OpeningCustom {
-                if let CardShellEntry::RemoteUrl { url } = &s.entry {
-                    return Some(url.as_str());
-                }
+            if s.kind == CardShellKind::OpeningCustom
+                && let CardShellEntry::RemoteUrl { url } = &s.entry
+            {
+                return Some(url.as_str());
             }
             None
         })
@@ -79,10 +79,10 @@ impl CardShellManifest {
 
     pub fn status_bar_url(&self) -> Option<&str> {
         self.shells.iter().find_map(|s| {
-            if s.kind == CardShellKind::StatusBar {
-                if let CardShellEntry::RemoteUrl { url } = &s.entry {
-                    return Some(url.as_str());
-                }
+            if s.kind == CardShellKind::StatusBar
+                && let CardShellEntry::RemoteUrl { url } = &s.entry
+            {
+                return Some(url.as_str());
             }
             None
         })
@@ -277,10 +277,10 @@ fn extract_visible_th_buttons(sc: &serde_json::Value) -> Vec<String> {
         if !visible {
             continue;
         }
-        if let Some(name) = b.get("name").and_then(|v| v.as_str()) {
-            if !name.trim().is_empty() {
-                out.push(name.to_string());
-            }
+        if let Some(name) = b.get("name").and_then(|v| v.as_str())
+            && !name.trim().is_empty()
+        {
+            out.push(name.to_string());
         }
     }
     out

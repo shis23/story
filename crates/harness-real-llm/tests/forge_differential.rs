@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use harness_real_llm::card_translation::{load_card, repo_root};
 use harness_real_llm::forge_differential::{
-    diff_contents, diff_sections, diff_worldbook, find_initvar_yaml, flatten_initvar_yaml,
+    collect_opening_seed_paths, diff_contents, diff_sections, diff_worldbook, find_initvar_yaml,
+    flatten_initvar_yaml,
     load_forge_state, schema_alignment,
 };
 
@@ -157,10 +158,20 @@ fn forge_schema_alignment_scores_translations() {
             continue;
         };
         let yaml = std::fs::read_to_string(&initvar_path).expect("读 initvar yaml 失败");
-        let author = flatten_initvar_yaml(&yaml).expect("initvar yaml 解析失败");
+        let mut author = flatten_initvar_yaml(&yaml).expect("initvar yaml 解析失败");
         assert!(
             author.len() >= 20,
             "{label}: ground truth 叶数异常少（{}），解析可能失败",
+            author.len()
+        );
+        // #21：开场白 <UpdateVariable> 种子路径同属作者 ground truth
+        // （作者在开场白就地初始化的变量：世界.新闻、事件.* 等）
+        let seeds = collect_opening_seed_paths(&forge_dir);
+        let initvar_only = author.len();
+        author.extend(seeds.iter().cloned());
+        eprintln!(
+            "{label}: 作者树 = InitVar {initvar_only} 叶 + 开场白种子 {}（并集 {}）",
+            seeds.len(),
             author.len()
         );
 

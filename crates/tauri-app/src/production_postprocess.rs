@@ -1714,7 +1714,7 @@ mod tests {
             &outcome,
             &present,
             &runtime,
-            &[temp.clone()],
+            std::slice::from_ref(&temp),
         );
         assert!(with_temps.mutations.iter().any(|m| matches!(
             m,

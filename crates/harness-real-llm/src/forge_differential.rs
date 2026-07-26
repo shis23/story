@@ -759,6 +759,79 @@ pub fn schema_alignment(
     }
 }
 
+/// 从开场白文本抽 `<UpdateVariable><JSONPatch>` 种子变量路径（#21 评测口径扩展）。
+///
+/// 作者在开场白里就地初始化变量（`{"op":"replace","path":"/世界/时间",...}`）——
+/// 这些路径与 InitVar YAML 同属 ground truth；不并入会把合法翻译键
+/// （世界.新闻、事件.莉莉.*）误判为幻觉。
+/// path 归一：斜杠 → 点、尾段 `-`（JSON Patch 数组追加记号）丢弃、空段清理。
+/// 防御式解析：JSONPatch 块解析失败时静默跳过该块（评测基建不 panic）。
+pub fn extract_update_variable_seed_paths(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<UpdateVariable>") {
+        let after = &rest[start + "<UpdateVariable>".len()..];
+        let end = after.find("</UpdateVariable>").unwrap_or(after.len());
+        let block = &after[..end];
+        // 块内找首个 JSON 数组（JSONPatch 惯例）；配平失败就整块跳过
+        if let Some(lb) = block.find('[') {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, c) in block[lb..].char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(lb + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(rb) = close
+                && let Ok(serde_json::Value::Array(ops)) =
+                    serde_json::from_str::<serde_json::Value>(&block[lb..=rb])
+            {
+                for op in ops {
+                    let Some(path) = op.get("path").and_then(|p| p.as_str()) else {
+                        continue;
+                    };
+                    let key: String = path
+                        .split('/')
+                        .map(str::trim)
+                        .filter(|seg| !seg.is_empty() && *seg != "-")
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if !key.is_empty() {
+                        out.insert(key);
+                    }
+                }
+            }
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// 汇总 forge unpack 目录下所有开场白（开场白/*.txt）的 UpdateVariable 种子路径。
+pub fn collect_opening_seed_paths(forge_dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let dir = forge_dir.join("开场白");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for path in read.flatten().map(|e| e.path()) {
+        if path.extension().is_some_and(|ext| ext == "txt")
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            out.extend(extract_update_variable_seed_paths(&text));
+        }
+    }
+    out
+}
+
 /// 在 forge unpack 的世界书目录里找 InitVar YAML（名字大小写不定）
 pub fn find_initvar_yaml(forge_dir: &Path) -> Option<std::path::PathBuf> {
     let dir = forge_dir.join("世界书");
@@ -952,6 +1025,34 @@ mod tests {
             !leaves.iter().any(|l| l.contains("$meta")),
             "$ 开头的元数据键应跳过"
         );
+    }
+
+    #[test]
+    fn test_extract_update_variable_seed_paths() {
+        let text = r#"
+剧情开场文字……
+<UpdateVariable>
+  <JSONPatch>
+  [
+    { "op": "replace", "path": "/世界/时间", "value": "复兴纪元488年" },
+    { "op": "add", "path": "/主角/身份/-", "value": "被召唤的勇者" },
+    { "op": "replace", "path": "/事件/莉莉/侵蚀度", "value": 0 }
+  ]
+  </JSONPatch>
+</UpdateVariable>
+后续文本
+<UpdateVariable>[ { "op": "add", "path": "/世界/新闻/-", "value": "王都异变" } ]</UpdateVariable>
+<UpdateVariable>这块不是合法 JSON，应被静默跳过 [broken</UpdateVariable>
+"#;
+        let seeds = extract_update_variable_seed_paths(text);
+        assert!(seeds.contains("世界.时间"));
+        // `/-` 尾段（数组追加记号）丢弃后取父路径
+        assert!(seeds.contains("主角.身份"));
+        assert!(seeds.contains("事件.莉莉.侵蚀度"));
+        assert!(seeds.contains("世界.新闻"));
+        assert_eq!(seeds.len(), 4, "非法块不得贡献路径: {seeds:?}");
+
+        assert!(extract_update_variable_seed_paths("无标签文本").is_empty());
     }
 
     #[test]

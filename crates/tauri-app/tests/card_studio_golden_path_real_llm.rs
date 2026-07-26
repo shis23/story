@@ -186,10 +186,11 @@ async fn drive_review(
     }
 }
 
+/// 镜像 `run_export_gate` 的产物四元组：JSON 门 / PNG 门 / 卡 JSON / PNG 字节。
+type ExportGateOutcome = (Vec<GateCheck>, Vec<GateCheck>, serde_json::Value, Vec<u8>);
+
 /// 镜像 `run_export_gate`：compile → JSON/PNG 真实导入 round-trip → GateCheck。
-fn drive_export_gate(
-    artifacts: &CardArtifacts,
-) -> Result<(Vec<GateCheck>, Vec<GateCheck>, serde_json::Value, Vec<u8>), String> {
+fn drive_export_gate(artifacts: &CardArtifacts) -> Result<ExportGateOutcome, String> {
     let compiled = compile_artifacts(artifacts)?;
     let st_card: StCharacterCard = serde_json::from_value(compiled.st_card_json.clone())
         .map_err(|e| format!("ST 卡 JSON 反序列化失败: {e}"))?;

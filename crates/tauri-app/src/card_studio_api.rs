@@ -95,7 +95,7 @@ pub fn cardstudio_create_project(
     let project = CardProject::new_from_scratch(name, brief);
     get_card_studio_store()
         .insert(project)
-        .map_err(|e| TauriCommandError::storage(e))
+        .map_err(TauriCommandError::storage)
 }
 
 /// B path: create a project from novel text (paste/import). Prefill is a separate LLM call.
@@ -128,7 +128,7 @@ pub fn cardstudio_create_from_novel(
     let project = CardProject::new_from_novel(name, brief, novel_title, novel_text);
     get_card_studio_store()
         .insert(project)
-        .map_err(|e| TauriCommandError::storage(e))
+        .map_err(TauriCommandError::storage)
 }
 
 /// C path: open an existing imported character as a revise CardProject.
@@ -162,7 +162,7 @@ pub fn cardstudio_create_from_character(
     );
     get_card_studio_store()
         .insert(project)
-        .map_err(|e| TauriCommandError::storage(e))
+        .map_err(TauriCommandError::storage)
 }
 
 fn resolve_stored_character(
@@ -191,7 +191,7 @@ pub fn cardstudio_get_project(id: String) -> Result<CardProject, TauriCommandErr
 pub fn cardstudio_delete_project(id: String) -> Result<bool, TauriCommandError> {
     get_card_studio_store()
         .delete(&id)
-        .map_err(|e| TauriCommandError::storage(e))
+        .map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
@@ -208,9 +208,7 @@ pub fn cardstudio_update_artifacts(
         project.name = project.artifacts.name.trim().to_string();
     }
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
@@ -229,9 +227,7 @@ pub fn cardstudio_set_stage(
         .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
     project.current_stage = stage_id;
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 /// Update project options (methodology switches).
@@ -261,9 +257,7 @@ pub fn cardstudio_set_options(
         }
     }
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
@@ -478,9 +472,7 @@ pub fn cardstudio_complete_manual_stage(
         }
     }
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 /// B path: LLM prefill card artifacts from novel excerpts.
@@ -558,42 +550,42 @@ pub async fn cardstudio_prefill_from_novel(
     }
 
     // Optional style sample (best-effort; failures do not abort prefill).
-    if include_style.unwrap_or(true) {
-        if let Ok(style_prompt) = build_novel_style_prompt(&project) {
-            let style_req = ChatRequest {
-                messages: vec![
-                    ChatMessage::system("你是文风蒸馏师。只输出 <content> 内的文风公式。"),
-                    ChatMessage::user(style_prompt),
-                ],
-                tools: None,
-                params: SamplingParams {
-                    temperature: Some(0.5),
-                    max_tokens: Some(4096),
-                    max_tokens_explicit: true,
-                    ..Default::default()
-                },
-                model,
-            };
-            if let Ok(style_resp) = llm.chat(&style_req).await {
-                let style_raw = style_resp.content;
-                let style_body = style_raw
-                    .split("<content>")
-                    .nth(1)
-                    .and_then(|s| s.split("</content>").next())
-                    .unwrap_or(style_raw.as_str())
+    if include_style.unwrap_or(true)
+        && let Ok(style_prompt) = build_novel_style_prompt(&project)
+    {
+        let style_req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("你是文风蒸馏师。只输出 <content> 内的文风公式。"),
+                ChatMessage::user(style_prompt),
+            ],
+            tools: None,
+            params: SamplingParams {
+                temperature: Some(0.5),
+                max_tokens: Some(4096),
+                max_tokens_explicit: true,
+                ..Default::default()
+            },
+            model,
+        };
+        if let Ok(style_resp) = llm.chat(&style_req).await {
+            let style_raw = style_resp.content;
+            let style_body = style_raw
+                .split("<content>")
+                .nth(1)
+                .and_then(|s| s.split("</content>").next())
+                .unwrap_or(style_raw.as_str())
+                .trim()
+                .to_string();
+            if !style_body.is_empty() {
+                project.artifacts.style_notes = Some(style_body.clone());
+                if !project.artifacts.notes.contains("[文风笔记]") {
+                    project.artifacts.notes = format!(
+                        "{}\n\n[文风笔记]\n{}",
+                        project.artifacts.notes.trim(),
+                        style_body
+                    )
                     .trim()
                     .to_string();
-                if !style_body.is_empty() {
-                    project.artifacts.style_notes = Some(style_body.clone());
-                    if !project.artifacts.notes.contains("[文风笔记]") {
-                        project.artifacts.notes = format!(
-                            "{}\n\n[文风笔记]\n{}",
-                            project.artifacts.notes.trim(),
-                            style_body
-                        )
-                        .trim()
-                        .to_string();
-                    }
                 }
             }
         }
@@ -615,9 +607,7 @@ pub async fn cardstudio_prefill_from_novel(
     project.current_stage = STAGE_REVIEW.to_string();
     project.last_error = None;
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
@@ -719,9 +709,7 @@ pub async fn cardstudio_run_stage(
     }
 
     project.touch();
-    store
-        .update(project)
-        .map_err(|e| TauriCommandError::storage(e))
+    store.update(project).map_err(TauriCommandError::storage)
 }
 
 #[tauri::command]
