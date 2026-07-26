@@ -61,3 +61,19 @@ test('uses icon defaults and exposes JS fallback warning state', () => {
   assert.equal(hasMvuFallbackWarning(2), true)
   assert.equal(hasMvuFallbackWarning(0), false)
 })
+
+test('template-key bindings resolve per instance name', async () => {
+  const { getMvuValue, mvuBarPercent } = await import('../src/utils/mvuStatusBarModel.js')
+  const vars = [
+    { key: '女性角色.小美.好感度', value: 80 },
+    { key: '女性角色.阿离.好感度', value: 20 },
+  ]
+  assert.equal(getMvuValue(vars, '女性角色.{角色名}.好感度', '小美'), 80)
+  assert.equal(getMvuValue(vars, '女性角色.{角色名}.好感度', '阿离'), 20)
+  // 不传实例名 → 模板键无从展开，查不到
+  assert.equal(getMvuValue(vars, '女性角色.{角色名}.好感度'), null)
+
+  const binding = { variable_key: '女性角色.{角色名}.好感度', display: { kind: 'bar', max: 100 } }
+  assert.equal(mvuBarPercent(binding, vars, '小美'), 80)
+  assert.equal(mvuBarPercent(binding, vars, '阿离'), 20)
+})

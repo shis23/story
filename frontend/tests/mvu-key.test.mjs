@@ -41,3 +41,24 @@ test('findMvuVariable prefers exact match then falls back to normalized match', 
   assert.equal(findMvuVariable(vars, 'nonexistent'), null)
   assert.equal(findMvuVariable(null, 'hp'), null)
 })
+
+test('expandMvuTemplateKey substitutes placeholder segments with the instance name', async () => {
+  const { expandMvuTemplateKey, findMvuVariableForInstance } = await import('../src/utils/mvuKey.js')
+
+  assert.equal(expandMvuTemplateKey('女性角色.{角色名}.好感度', '小美'), '女性角色.小美.好感度')
+  // 无占位符 / 无实例名 → 原样
+  assert.equal(expandMvuTemplateKey('主角.hp', '小美'), '主角.hp')
+  assert.equal(expandMvuTemplateKey('女性角色.{角色名}.好感度', ''), '女性角色.{角色名}.好感度')
+  assert.equal(expandMvuTemplateKey(null, '小美'), '')
+
+  // 实例上下文取值：具体键优先，未命中回退字面模板键
+  const vars = [
+    { key: '女性角色.小美.好感度', value: 42 },
+    { key: '女性角色.{角色名}.好感度', value: 0 },
+  ]
+  assert.equal(findMvuVariableForInstance(vars, '女性角色.{角色名}.好感度', '小美')?.value, 42)
+  // 具体键不存在的实例 → 回退字面模板键（meta_apply 落入实例变量的形态）
+  assert.equal(findMvuVariableForInstance(vars, '女性角色.{角色名}.好感度', '阿离')?.value, 0)
+  // <> 记法占位符也先归一再展开
+  assert.equal(findMvuVariableForInstance(vars, '女性角色.<角色名>.好感度', '小美')?.value, 42)
+})

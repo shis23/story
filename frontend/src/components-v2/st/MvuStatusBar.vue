@@ -37,10 +37,12 @@ const props = defineProps({
 const uiBindings = computed(() => props.mvuState?.uiBindings ?? [])
 const variables = computed(() => props.mvuState?.variables ?? [])
 const fallbackCount = computed(() => props.mvuState?.fallbackCount ?? 0)
+// 实例节上下文：模板键（{角色名} 段）按本实例名展开后取值
+const instanceName = computed(() => props.mvuState?.instanceName ?? '')
 
 // bar 进度百分比（0-100），max 默认 100
 function barPercent(binding) {
-  return mvuBarPercent(binding, variables.value)
+  return mvuBarPercent(binding, variables.value, instanceName.value)
 }
 
 // bar 颜色：按百分比分级（>50 绿 / 25-50 黄 / <25 红）
@@ -54,16 +56,16 @@ function toNum(value) {
 }
 
 function getValue(key) {
-  return getMvuValue(variables.value, key)
+  return getMvuValue(variables.value, key, instanceName.value)
 }
 
 // icon 映射查找
 function iconFor(binding) {
-  return mvuIconFor(binding, variables.value, '·')
+  return mvuIconFor(binding, variables.value, '·', instanceName.value)
 }
 
 function displayValue(key) {
-  return mvuDisplayValue(variables.value, key)
+  return mvuDisplayValue(variables.value, key, '—', instanceName.value)
 }
 
 function showFallbackWarning() {

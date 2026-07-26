@@ -138,3 +138,35 @@ test('plans an empty mapping safely', () => {
   assert.deepEqual(plan.hints, [])
   assert.deepEqual(plan.skipped, [])
 })
+
+test('plans template-key actions against the bound instance', () => {
+  // 已有具体键变量 → 增量作用于它，写回具体键
+  const existing = planMvuInteraction(
+    {
+      element_label: '赠礼',
+      actions: [{ kind: 'modify_variable', key: '女性角色.{角色名}.好感度', value_expr: '+5' }],
+    },
+    { variables: [{ key: '女性角色.小美.好感度', value: 40 }], instanceName: '小美' },
+  )
+  assert.deepEqual(existing.writes, [{ key: '女性角色.小美.好感度', value: 45 }])
+
+  // 无现有变量 → 新变量用展开后的具体键落盘
+  const fresh = planMvuInteraction(
+    {
+      element_label: '赠礼',
+      actions: [{ kind: 'modify_variable', key: '女性角色.{角色名}.好感度', value_expr: '+5' }],
+    },
+    { variables: [], instanceName: '阿离' },
+  )
+  assert.deepEqual(fresh.writes, [{ key: '女性角色.阿离.好感度', value: 5 }])
+
+  // 无实例名 → 模板键原样（不瞎展开）
+  const noName = planMvuInteraction(
+    {
+      element_label: '赠礼',
+      actions: [{ kind: 'modify_variable', key: '女性角色.{角色名}.好感度', value_expr: '+5' }],
+    },
+    { variables: [] },
+  )
+  assert.deepEqual(noName.writes, [{ key: '女性角色.{角色名}.好感度', value: 5 }])
+})

@@ -97,17 +97,21 @@ export function useMvuStatusPanel(options = {}) {
 
     const sections = mvuStatusSections.value
     const variables = sections[0]?.mvuState?.variables || []
-    const plan = planMvuInteraction(mapping, { variables })
+    // 与 AppV2.onShellVarWrite 同判据（含回退）：卡绑定实例恰一个 → 该实例；
+    // 否则全 campaign 单实例回退——两条写入路径的作用域目标必须一致。
+    const nameMapIds = Object.keys(campaign.instanceNameMap || {})
+    const singleInstanceId =
+      (sections.length === 1 ? sections[0].instanceId : null) ||
+      (nameMapIds.length === 1 ? nameMapIds[0] : null)
+    // 模板键（{角色名} 段）按目标实例名展开
+    const singleInstanceName =
+      (sections.length === 1 ? sections[0].instanceName : '') ||
+      (singleInstanceId ? campaign.instanceNameMap?.[singleInstanceId] || '' : '')
+    const plan = planMvuInteraction(mapping, { variables, instanceName: singleInstanceName })
 
     mvuInteractionBusy.value = true
     const results = []
     try {
-      // 与 AppV2.onShellVarWrite 同判据（含回退）：卡绑定实例恰一个 → 该实例；
-      // 否则全 campaign 单实例回退——两条写入路径的作用域目标必须一致。
-      const nameMapIds = Object.keys(campaign.instanceNameMap || {})
-      const singleInstanceId =
-        (sections.length === 1 ? sections[0].instanceId : null) ||
-        (nameMapIds.length === 1 ? nameMapIds[0] : null)
       for (const write of plan.writes) {
         const key = singleInstanceId
           ? `instance:${singleInstanceId}:${write.key}`

@@ -5,7 +5,11 @@
 //   modify_variable { key, value_expr } / trigger_next_turn { hint }
 //   / multi { actions } / run_original_js { js_snippet, description }（留桩不执行）
 
-import { findMvuVariable, normalizeMvuKey } from './mvuKey.js'
+import {
+  expandMvuTemplateKey,
+  findMvuVariableForInstance,
+  normalizeMvuKey,
+} from './mvuKey.js'
 
 const MAX_FLATTEN_DEPTH = 5
 
@@ -89,7 +93,7 @@ export function evaluateMvuValueExpr(valueExpr, currentValue, key) {
  * 把一个 InteractionMapping 编成执行计划（纯函数，可测）：
  * { label, writes: [{key, value}], hints: [string], skipped: [{kind, reason, ...}] }
  */
-export function planMvuInteraction(mapping, { variables } = {}) {
+export function planMvuInteraction(mapping, { variables, instanceName } = {}) {
   const vars = Array.isArray(variables) ? variables : []
   const plan = {
     label: mapping?.element_label || '',
@@ -99,12 +103,13 @@ export function planMvuInteraction(mapping, { variables } = {}) {
   }
   for (const action of flattenInteractionActions(mapping?.actions)) {
     if (action.kind === 'modify_variable') {
-      // 跨记法查现有变量；写回优先用已存储的键（避免同一变量两种记法并存），
-      // 无现有变量时用归一化键落新变量
-      const targetVar = findMvuVariable(vars, action.key)
+      // 跨记法 + 模板键展开查现有变量；写回优先用已存储的键（避免同一变量
+      // 两种记法并存），无现有变量时用展开后的归一化键落新变量
+      const targetVar = findMvuVariableForInstance(vars, action.key, instanceName)
       const result = evaluateMvuValueExpr(action.value_expr, targetVar?.value, action.key)
       if (result.ok) {
-        const writeKey = targetVar?.key || normalizeMvuKey(action.key) || action.key
+        const expandedKey = expandMvuTemplateKey(normalizeMvuKey(action.key), instanceName)
+        const writeKey = targetVar?.key || expandedKey || action.key
         plan.writes.push({ key: writeKey, value: result.value })
       } else {
         plan.skipped.push({ kind: action.kind, key: action.key, reason: result.reason })

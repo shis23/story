@@ -22,6 +22,34 @@ export function normalizeMvuKey(raw) {
 }
 
 /**
+ * 模板占位符段展开：`女性角色.{角色名}.好感度` + 实例名「小美」→
+ * `女性角色.小美.好感度`。占位符段整段替换为实例名；无占位符或无实例名
+ * 时原样返回。调用方应先 normalizeMvuKey（<xxx> 统一成 {xxx}）。
+ */
+export function expandMvuTemplateKey(key, instanceName) {
+  const name = String(instanceName ?? '').trim()
+  const raw = String(key ?? '')
+  if (!name || !raw.includes('{')) return raw
+  return raw
+    .split('.')
+    .map((seg) => (/^\{.+\}$/.test(seg.trim()) ? name : seg))
+    .join('.')
+}
+
+/**
+ * 实例上下文取变量：模板键先按实例名展开查具体键（精确→归一化），
+ * 未命中回退字面模板键（meta_apply 会把模板键原样落进实例变量）。
+ */
+export function findMvuVariableForInstance(variables, key, instanceName) {
+  const expanded = expandMvuTemplateKey(normalizeMvuKey(key), instanceName)
+  if (expanded && expanded !== String(key ?? '')) {
+    const hit = findMvuVariable(variables, expanded)
+    if (hit) return hit
+  }
+  return findMvuVariable(variables, key)
+}
+
+/**
  * 在变量列表中查目标 key：先精确匹配（零风险快路径），
  * 再按归一化记法匹配（跨记法兜底）。找不到返回 null。
  */

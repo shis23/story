@@ -1,7 +1,9 @@
-import { findMvuVariable } from './mvuKey.js'
+import { findMvuVariableForInstance } from './mvuKey.js'
 
-export function getMvuValue(variables, key) {
-  const found = findMvuVariable(variables, key)
+// instanceName 可选：实例节上下文中模板键（女性角色.{角色名}.好感度）
+// 按实例名展开后查具体键，未命中回退字面键。
+export function getMvuValue(variables, key, instanceName = '') {
+  const found = findMvuVariableForInstance(variables, key, instanceName)
   return found ? found.value : null
 }
 
@@ -11,8 +13,8 @@ export function toMvuNumber(value) {
   return Number.isNaN(number) ? 0 : number
 }
 
-export function mvuBarPercent(binding, variables) {
-  const value = toMvuNumber(getMvuValue(variables, binding?.variable_key))
+export function mvuBarPercent(binding, variables, instanceName = '') {
+  const value = toMvuNumber(getMvuValue(variables, binding?.variable_key, instanceName))
   const max = binding?.display?.max ?? 100
   if (max <= 0) return 0
   return Math.max(0, Math.min(100, (value / max) * 100))
@@ -24,8 +26,8 @@ export function mvuBarColor(percent) {
   return 'bg-err'
 }
 
-export function mvuIconFor(binding, variables, fallbackIcon = '-') {
-  const value = getMvuValue(variables, binding?.variable_key)
+export function mvuIconFor(binding, variables, fallbackIcon = '-', instanceName = '') {
+  const value = getMvuValue(variables, binding?.variable_key, instanceName)
   const mapping = binding?.display?.mapping || {}
   const key = String(value)
   return mapping[key] || mapping._default || fallbackIcon
@@ -35,6 +37,6 @@ export function hasMvuFallbackWarning(fallbackCount) {
   return Number(fallbackCount) > 0
 }
 
-export function mvuDisplayValue(variables, key, fallback = '—') {
-  return getMvuValue(variables, key) ?? fallback
+export function mvuDisplayValue(variables, key, fallback = '—', instanceName = '') {
+  return getMvuValue(variables, key, instanceName) ?? fallback
 }

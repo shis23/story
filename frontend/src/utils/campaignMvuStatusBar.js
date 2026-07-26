@@ -19,6 +19,8 @@ export function buildInstanceMvuStatusBarProps({ instance, card, translationDeta
   return {
     definitionId: definition.id,
     sourceCharacterId: card?.source_character_id || translationDetail?.source_character_id || null,
+    // 模板键（{角色名} 段）在本实例节按此名展开取值
+    instanceName: instance?.name || '',
     uiBindings,
     variables: Array.isArray(variables) ? variables : [],
     fallbackCount: fallbackFragments.length,
