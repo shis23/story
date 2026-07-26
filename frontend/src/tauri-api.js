@@ -1201,6 +1201,22 @@ export async function cardShellClearCache() {
   return 0
 }
 
+/** V4 存储健康报告：blocking=true 的事件表示文件损坏且写栅栏生效（启动拦截用） */
+export async function storageHealthReport() {
+  if (isTauri()) {
+    return await invoke('storage_health_report')
+  }
+  return []
+}
+
+/** V4 用户确认损坏文件「从空白开始」→ 解除该路径写栅栏 */
+export async function storageHealthAcknowledge(path) {
+  if (isTauri()) {
+    return await invoke('storage_health_acknowledge', { path })
+  }
+  return false
+}
+
 /** 宿主代持拉取远程壳资源；失败抛错（不静默降级） */
 export async function cardShellFetchUrl(url) {
   if (isTauri()) {

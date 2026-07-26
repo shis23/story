@@ -42,6 +42,7 @@ import AppFrame from './design/shell/AppFrame.vue'
 import PrimarySidebar from './components-v2/shell/PrimarySidebar.vue'
 import TopBar from './components-v2/shell/TopBar.vue'
 import InspectorDrawer from './components-v2/shell/InspectorDrawer.vue'
+import StorageHealthGate from './components-v2/shell/StorageHealthGate.vue'
 import WritingScreen from './design/writing/WritingScreen.vue'
 import HistoryScreen from './design/history/HistoryScreen.vue'
 import OverviewScreen from './design/overview/OverviewScreen.vue'
@@ -707,6 +708,8 @@ onMounted(async () => {
 </script>
 
 <template>
+  <!-- V4 存储健康启动拦截：损坏未确认前盖住应用（写栅栏同时在后端拒绝写入） -->
+  <StorageHealthGate />
   <!-- design/shell AppFrame：纯布局；侧栏/顶栏/调试经 slot 注入；#panels 保留插件 runtime -->
   <AppFrame
     :sidebar-open="ui.showSidebar"

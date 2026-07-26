@@ -15,7 +15,16 @@ where
 
     let data = match std::fs::read_to_string(path) {
         Ok(data) => data,
-        Err(_) => return T::default(),
+        Err(io_error) => {
+            // V4：文件存在但读不出来 ≠ 首次运行——冻结写入 + 登记阻断事件，
+            // 否则下一次保存会把内存里的默认空集写回、覆盖可能可抢救的数据。
+            crate::storage_health::record_unrecoverable(
+                path,
+                &format!("读文件失败: {io_error}"),
+                None,
+            );
+            return T::default();
+        }
     };
 
     match serde_json::from_str(&data) {
@@ -26,11 +35,21 @@ where
             if let Ok(tmp_data) = std::fs::read_to_string(&tmp)
                 && let Ok(value) = serde_json::from_str(&tmp_data)
             {
+                // 数据无损恢复：仅登记提示事件，下次保存会用好数据重写主文件。
+                crate::storage_health::record_tmp_recovered(path, &error.to_string());
                 return value;
             }
 
             on_recovery_failed(path, &error);
-            let _ = std::fs::copy(path, path.with_extension("json.corrupt"));
+            let corrupt = path.with_extension("json.corrupt");
+            let backup_ok = std::fs::copy(path, &corrupt).is_ok();
+            // V4：不可恢复损坏 → 写栅栏冻结 + 阻断事件（前端启动拦截弹恢复引导，
+            // 用户确认「从空白开始」前，该文件的所有写入被拒绝）。
+            crate::storage_health::record_unrecoverable(
+                path,
+                &error.to_string(),
+                backup_ok.then_some(corrupt.as_path()),
+            );
             T::default()
         }
     }

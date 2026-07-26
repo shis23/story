@@ -596,15 +596,41 @@ async fn hard_deadline_flushes_completed_samples_and_covers_accept_evidence_boun
     }
 }
 
+/// 在指定 stage 停到 `sleep_until` 之后（动态睡过 suite deadline）。
+///
+/// 固定时长 sleep 会让本测试对每轮真实耗时敏感：所有轮次必须在 deadline 内
+/// 完成，超时必须恰好落在最终 context fill 边界。V4 fsync 后每轮持久化成本
+/// 上升，1s 窗口不再够用——deadline 放宽，hook 按绝对时间点睡过它。
+#[derive(Clone)]
+struct StallPastDeadlineAtStage {
+    stage: ProductionEvidenceStage,
+    sleep_until: std::time::Instant,
+}
+
+#[async_trait]
+impl ProductionEvidenceStageHook for StallPastDeadlineAtStage {
+    async fn on_stage(&self, stage: ProductionEvidenceStage, _turn_index: u32) {
+        if stage == self.stage {
+            let now = std::time::Instant::now();
+            if self.sleep_until > now {
+                tokio::time::sleep(self.sleep_until - now).await;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn hard_deadline_covers_final_context_fill_boundary() {
     let turns = DEFAULT_H_ANCHOR + DEFAULT_E + 1;
     let (env, llm, campaign_id, conversation_id, dir) = setup(turns);
     let mut cfg = config(&dir);
-    cfg.hard_deadline = Some(Duration::from_secs(1));
-    let hook = DelayAtStage {
+    let deadline = Duration::from_secs(8);
+    cfg.hard_deadline = Some(deadline);
+    let hook = StallPastDeadlineAtStage {
         stage: ProductionEvidenceStage::BeforeFinalFill,
-        delay: Duration::from_secs(2),
+        // runner 内部的 deadline 起点晚于这里的 Instant::now()，
+        // 多加 1s 保证睡醒时 runner 的 deadline 必然已过。
+        sleep_until: std::time::Instant::now() + deadline + Duration::from_secs(1),
     };
     let mut writer = DeterministicTurnWriter { emit_summary: true };
     let err = run_production_evidence_loop_with_hook(

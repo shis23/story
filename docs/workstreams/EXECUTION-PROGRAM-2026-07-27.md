@@ -33,11 +33,17 @@
   回归测试：`pending_temporary_instances_resolve_in_json_batch`（apply_outcome 全链路）
   + `pending_temporary_instances_resolve_in_runtime_batch`（正反对照）。
   CLAUDE.md Phase 6 过期事实已回写。
-- [ ] **V4** atomic_write 无 fsync/回退直写/损坏静默空集。修法：
-  `crates/infra-util/src/lib.rs:22-36`——temp 文件 fsync 后 rename，rename 后 fsync
-  父目录（Unix）；去掉直写回退（换 retry+硬错误）。损坏加载（campaign_store.rs:1192-1208
-  / json_store load_json_with_tmp_backup_or_default）不再静默返回空集：启动拦截 +
-  前端恢复引导（.corrupt/.tmp 恢复或确认从空开始），确认前不写盘。
+- [x] **V4** atomic_write 硬化 + 损坏启动拦截 → **已修**：
+  infra-util `atomic_write` temp fsync → rename（3 次退避重试，Unix rename 后
+  fsync 父目录），重试耗尽保留 .tmp 返回硬错误（去掉直写回退）；
+  新增 `write_fence` 模块（路径级写栅栏，无 UI 依赖）。
+  tauri-app `storage_health` 登记簿 + json_store 加载器接线：主文件损坏
+  .tmp 恢复 → 提示事件；不可恢复 / IO 读失败 → `.corrupt` 备份 + 冻结写入
+  + 阻断事件。命令 `storage_health_report` / `storage_health_acknowledge`；
+  前端 `StorageHealthGate.vue`（AppV2 顶层）：阻断事件全屏拦截，
+  「从空白开始（解冻）」或「稍后手动修复（保持只读保护）」；
+  tmp 恢复事件仅提示条。注意：m5 `hard_deadline_covers_final_context_fill_boundary`
+  因 fsync 每轮成本上升改为宽 deadline + 动态睡过期限（时序脆弱性根除）。
 - [ ] **V7** 在售 bug 三件：①`sqlite_runtime.rs:484-496` 按子串 `e.contains("revision")`
   分类错误 → DB 完整性损坏被报成"回合过期"，改 typed error 跨边界；
   ②重复 accept 语义分歧：JSON 拒绝 vs SQLite 幂等 Ok——**统一为幂等 Ok**（评审判定

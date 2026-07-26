@@ -7,32 +7,79 @@
 //! - `secret_store`：把 API key 写入系统凭据库，持久化文件只保存 SecretRef。
 
 pub mod secret_store;
+pub mod write_fence;
 
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-/// 原子写入字节流到 `path`：先写 `path.tmp`，再 `rename` 到 `path`。
+/// 原子写入字节流到 `path`：先写 `path.tmp`（fsync），再 `rename` 到 `path`。
 ///
-/// 若父目录不存在会自动创建。`rename` 失败（极少数文件系统/跨设备情况）
-/// 回退到直接写 `path`（降级但可用，至少不丢数据）。
+/// 若父目录不存在会自动创建。V4 硬化（2026-07-27）：
+/// - temp 文件写完后 `sync_all`，掉电时 rename 后的目标不会是空洞文件；
+/// - `rename` 失败带退避重试（Windows 上 AV/索引器短暂占用目标是常态），
+///   重试耗尽后返回硬错误并**保留 .tmp**（最新数据在 .tmp 里可恢复）——
+///   不再回退直接写 `path`（直写崩溃会撕裂主文件，比丢一次写危险得多）；
+/// - Unix 上 rename 成功后 fsync 父目录，保证 rename 本身落盘。
+/// - `write_fence` 冻结的路径拒绝写入（损坏未确认前不许固化空态）。
 ///
 /// 这是项目所有 store 的持久化统一入口，取代历史上散落各处的裸 `fs::write`。
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if write_fence::is_frozen(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "write fence active for {}: 存储文件损坏待用户确认，拒绝写入以免固化空态",
+                path.display()
+            ),
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // 用完整路径拼接 .tmp 后缀，避免 with_extension 在多扩展名文件上碰撞
     // （例如 data.json 和 data.json.bak 都会变成 data.tmp）
     let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&tmp_path, bytes)?;
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        tracing::error!("rename 失败，回退直接写: {e}");
-        // 回退直接写：成功时返回 Ok（降级但不丢数据），失败时返回 Err
-        return std::fs::write(path, bytes);
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
     }
-    Ok(())
+    let mut last_err = None;
+    for attempt in 0u32..3 {
+        match std::fs::rename(&tmp_path, path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(parent) = path.parent()
+                    && let Ok(dir) = std::fs::File::open(parent)
+                {
+                    let _ = dir.sync_all();
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "rename {} -> {} 失败（第 {} 次）: {e}",
+                    tmp_path.display(),
+                    path.display(),
+                    attempt + 1
+                );
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(20 << attempt));
+                }
+            }
+        }
+    }
+    // 重试耗尽：保留 .tmp（含最新数据，加载器可从中恢复），返回硬错误。
+    let e = last_err.unwrap_or_else(|| io::Error::other("rename failed"));
+    tracing::error!(
+        "rename 重试耗尽，保留 {} 供恢复（不回退直写，避免撕裂主文件）: {e}",
+        tmp_path.display()
+    );
+    Err(e)
 }
 
 /// 把可序列化数据以 pretty JSON 原子写入 `path`。

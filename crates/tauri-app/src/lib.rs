@@ -14,6 +14,7 @@ pub mod production_postprocess;
 pub mod sqlite_runtime;
 mod storage;
 pub mod storage_backend;
+pub mod storage_health;
 pub mod turn_coordinator;
 pub mod turn_lifecycle;
 pub mod turn_store;
@@ -5362,6 +5363,21 @@ pub(crate) fn find_instance_by_name_or_id_with_extras(
     instances
         .into_iter()
         .find(|i| i.name.as_str() == name_or_id.as_str())
+}
+
+/// V4：存储健康报告。启动时前端拉取；`blocking: true` 的事件表示对应文件
+/// 损坏且写栅栏生效，需要用户走恢复引导确认。
+#[tauri::command]
+fn storage_health_report() -> Vec<storage_health::StorageIncident> {
+    storage_health::incidents()
+}
+
+/// V4：用户确认损坏文件「从空白开始」→ 解除该路径的写栅栏（此后保存合法）。
+/// 返回是否确有该路径的冻结/阻断事件。
+#[tauri::command]
+fn storage_health_acknowledge(path: String) -> bool {
+    tracing::warn!("用户确认存储损坏文件从空白开始: {path}");
+    storage_health::acknowledge(&path)
 }
 
 /// Tauri command: 取消当前运行的写作流水线
@@ -12639,6 +12655,9 @@ pub fn run() {
             card_shell_clear_cache,
             card_shell_fetch_url,
             get_active_turn_quality,
+            // V4 存储健康：损坏启动拦截 + 恢复确认
+            storage_health_report,
+            storage_health_acknowledge,
             // P3 Meta Agent / MVU 五合一 / ST 预设分类
             meta_start_conversation,
             meta_chat,
