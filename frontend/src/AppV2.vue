@@ -105,6 +105,7 @@ import {
   buildOpeningChatSeed,
   resolveOpeningChatSelection,
   rewriteOpeningMessages,
+  selectOpeningGreetingOptions,
 } from './utils/cardShellOpeningChat.js'
 import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
 
@@ -235,9 +236,13 @@ const openingShellPresentation = computed(() => getOpeningShellPresentation(
 ))
 const openingShellChatSeed = computed(() => {
   if (!showCardShellOpening.value) return null
-  const fromStore = writing.greetingOptions || []
-  const options = (fromStore.length ? fromStore : cardShellOpeningGreetings.value)
-    .map((option) => (typeof option === 'string' ? { content: option } : option))
+  // Campaign 态一律用卡自己的 greetings：writing.greetingOptions 来自遗留
+  // activeCharDetail，可能属于此前点过的其它角色（H2）。
+  const options = selectOpeningGreetingOptions({
+    writingMode: writing.writingMode,
+    storeOptions: writing.greetingOptions,
+    cardGreetings: cardShellOpeningGreetings.value,
+  }).map((option) => (typeof option === 'string' ? { content: option } : option))
   if (!options.length && !cardShellOpeningUrl.value) return null
   return buildOpeningChatSeed(options, {
     selectedIndex: writing.selectedGreetingIndex,
@@ -404,9 +409,11 @@ const greeting = useGreeting({
  * setup-only opening surface.
  */
 async function onOpeningShellApplied(payload) {
-  const options = (writing.greetingOptions?.length
-    ? writing.greetingOptions
-    : cardShellOpeningGreetings.value)
+  const options = selectOpeningGreetingOptions({
+    writingMode: writing.writingMode,
+    storeOptions: writing.greetingOptions,
+    cardGreetings: cardShellOpeningGreetings.value,
+  })
   const selection = resolveOpeningChatSelection(payload, options)
   if (selection.greetingIndex != null && writing.writingMode === 'legacy') {
     greeting.selectGreeting(selection.greetingIndex)

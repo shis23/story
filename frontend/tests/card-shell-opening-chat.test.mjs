@@ -5,6 +5,7 @@ import {
   buildOpeningChatSwipes,
   resolveOpeningChatSelection,
   rewriteOpeningMessages,
+  selectOpeningGreetingOptions,
 } from '../src/utils/cardShellOpeningChat.js'
 
 test('builds ordered swipes from greeting options without empty or duplicate text', () => {
@@ -56,6 +57,47 @@ test('resolves a shell swipe selection back onto greeting options', () => {
   assert.deepEqual(
     resolveOpeningChatSelection({ swipe_id: null, mes: 'custom text' }, options),
     { greetingIndex: null, content: 'custom text' },
+  )
+})
+
+test('campaign mode always uses the card greetings, never legacy store options', () => {
+  const legacyResidue = [{ content: 'char-A opening' }]
+  const cardOwn = [{ content: 'card-B scene 1' }, { content: 'card-B scene 2' }]
+
+  // 旧角色 A 残留在 store 时，卡 B 的 Campaign 开场必须仍用卡 B 自己的 greetings
+  assert.deepEqual(
+    selectOpeningGreetingOptions({
+      writingMode: 'campaign',
+      storeOptions: legacyResidue,
+      cardGreetings: cardOwn,
+    }),
+    cardOwn,
+  )
+  // 卡 greetings 为空也不得回退到残留：宁可空，不写错人文本
+  assert.deepEqual(
+    selectOpeningGreetingOptions({
+      writingMode: 'campaign',
+      storeOptions: legacyResidue,
+      cardGreetings: [],
+    }),
+    [],
+  )
+})
+
+test('legacy mode keeps store options first with card fallback', () => {
+  const storeOptions = [{ content: 'store opening' }]
+  const cardGreetings = [{ content: 'card opening' }]
+  assert.deepEqual(
+    selectOpeningGreetingOptions({ writingMode: 'legacy', storeOptions, cardGreetings }),
+    storeOptions,
+  )
+  assert.deepEqual(
+    selectOpeningGreetingOptions({ writingMode: 'legacy', storeOptions: [], cardGreetings }),
+    cardGreetings,
+  )
+  assert.deepEqual(
+    selectOpeningGreetingOptions({ writingMode: 'none', storeOptions: null, cardGreetings: null }),
+    [],
   )
 })
 

@@ -52,6 +52,27 @@ export function buildOpeningChatSeed(greetingOptions = [], options = {}) {
 }
 
 /**
+ * Pick which greeting list feeds the opening shell.
+ *
+ * `storeOptions` (writing.greetingOptions) derives from the legacy
+ * `activeCharDetail`, which survives campaign creation. In campaign mode it can
+ * belong to a previously clicked character, so the campaign card's own
+ * greetings must always win — otherwise character A's openings hijack card B's
+ * opening shell and get persisted into B's conversation.
+ *
+ * @param {{ writingMode?: string,
+ *           storeOptions?: Array | null,
+ *           cardGreetings?: Array | null }} sources
+ * @returns {Array}
+ */
+export function selectOpeningGreetingOptions({ writingMode, storeOptions, cardGreetings } = {}) {
+  const store = Array.isArray(storeOptions) ? storeOptions : []
+  const card = Array.isArray(cardGreetings) ? cardGreetings : []
+  if (writingMode === 'campaign') return card
+  return store.length ? store : card
+}
+
+/**
  * Rewrite the single opening assistant message in place with the chosen
  * scenario text. Returns the new messages array, or `null` when the
  * conversation is no longer in a rewritable opening state (not exactly one
