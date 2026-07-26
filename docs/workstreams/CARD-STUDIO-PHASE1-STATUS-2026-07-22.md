@@ -195,7 +195,13 @@ cargo check -p storyforge
 - 测试：domain 23（+3 gate）、storyforge lib 299（+3 round-trip，含真实 infra-import
   JSON/PNG 双路径）、前端 node 380 + vitest 52 全绿。
 - 已知 flaky（非本线）：`harness-real-llm` `budget::queued_dispatch_wait_counts_toward_total_timeout`
-  在 workspace 并行负载下偶发失败，单跑稳定通过；已建议单独修复。
+  与 `infra-sqlite` `importer::concurrent_same_manifest_converges_to_one_completed_run`
+  在 workspace 并行负载下偶发失败，单跑均稳定通过。
+- **实机 golden path 已完成（High 缺口关闭）**：A 从零 / C 修订双路真实 LLM
+  （deepseek-v4-pro）验收全绿，出卡闸门 JSON+PNG 双 round-trip 9/9 PASS，
+  详见 `CARD-STUDIO-GOLDEN-PATH-RESULT-2026-07-26.md`。Runner:
+  `crates/tauri-app/tests/card_studio_golden_path_real_llm.rs`（`#[ignore]`）。
+  残留为 GUI 点击流复验（命令层语义已验）。
 
 ## 8. 审查人备注
 
