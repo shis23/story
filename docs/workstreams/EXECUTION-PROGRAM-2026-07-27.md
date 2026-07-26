@@ -143,12 +143,15 @@
     tauri-app 若干——collapsible_if、field_reassign_with_default、
     redundant_closure、let_and_return）。
   - 待收：clippy 全绿 → 推送 → 观察 linux 4 job 首绿。
-- [~] **#31 盲测**（骨架已入库 f3f2c86，LLM 驱动待写）：
-  定稿方案要求**四臂**（非两臂）——`blind_arm_matrix.rs` 骨架就位
-  （臂枚举/双盲随机化 presentation_order/多数票 majority_for_pair/
-  summarize_matrix 缺席臂显式清单；单测 3 例）。计划文档 v2 已对齐。
-  下一步：#[ignore] 集成测试接 LLM 驱动——solo_writer 臂上下文拼装 +
-  parallel_crew 臂走 PipelineOrchestrator + 裁判循环（key 只进 env）。
+- [~] **#31 盲测**（LLM 驱动已写、实测运行中）：
+  骨架 f3f2c86 + 集成测试 `tests/blind_arm_matrix_real_llm.rs`——
+  双角色 fixture 卡（守灯人沈磐 × 调查员闻笛，无外部卡文件依赖）、
+  4 意图、solo_writer 臂（同源 campaign 状态拼单发）vs parallel_crew 臂
+  （PipelineOrchestrator），每意图 3 轮双盲裁判（presentation_order
+  随机化、长度非优点声明、解析失败如实弃权）。
+  证据：artifacts/blind-ab/blind-two-arm-summary.json（脱敏）+
+  texts/（正文，gitignore）。运行命令见测试文件头（key 只进 env）。
+  跑完后按预注册口径写 RESULT 文档。
 - [~] **#32 流水线重设计**（第 1 步已落）：
   **定稿文档找到了**＝ARCHITECTURE-REVIEW-2026-07-26.md 补记三（891 行起，
   「设计定稿，未实现」）。要点：回合契约 / 三档生成（续写 80%·对手戏·大场面）/
