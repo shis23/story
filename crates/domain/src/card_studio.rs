@@ -1565,21 +1565,23 @@ pub fn build_review_prompt(
     system.push_str("\n\n# 标签规范（软约束）\n");
     system.push_str(pack_mingyue_v1::TAG_SPEC);
     system.push_str("\n\n# 世界书配置指南（摘要审查用）\n");
-    // keep prompt bounded: first ~3500 chars of long guide
-    let wb = pack_mingyue_v1::WORLDBOOK_CONFIG;
-    system.push_str(if wb.len() > 3500 { &wb[..3500] } else { wb });
+    // keep prompt bounded: first ~3500 bytes of long guide（char 边界安全）
+    system.push_str(truncate_at_char_boundary(
+        pack_mingyue_v1::WORLDBOOK_CONFIG,
+        3500,
+    ));
     system.push_str("\n\n# 世界书评估\n");
     system.push_str(pack_mingyue_v1::WORLDBOOK_EVAL);
     system.push_str("\n\n# 世界观自查\n");
-    let wv = pack_mingyue_v1::WORLDVIEW_SELFCHECK;
-    system.push_str(if wv.len() > 3000 { &wv[..3000] } else { wv });
+    system.push_str(truncate_at_char_boundary(
+        pack_mingyue_v1::WORLDVIEW_SELFCHECK,
+        3000,
+    ));
     system.push_str("\n\n# 一般条目自查\n");
-    let entry = pack_mingyue_v1::ENTRY_SELFCHECK;
-    system.push_str(if entry.len() > 2500 {
-        &entry[..2500]
-    } else {
-        entry
-    });
+    system.push_str(truncate_at_char_boundary(
+        pack_mingyue_v1::ENTRY_SELFCHECK,
+        2500,
+    ));
 
     let mut user = String::new();
     user.push_str(&format!("# Brief\n{}\n\n", project.brief));
@@ -1709,6 +1711,22 @@ pub fn apply_stage_json(
         }
         other => Err(format!("阶段 {other} 不支持 JSON 应用")),
     }
+}
+
+/// 按字节预算截断到最近的 char 边界。
+///
+/// 中文常量硬切字节（`&s[..3000]`）在多字节字符中间 panic；且资产文件的
+/// CRLF/LF 行尾差异会移动字节偏移——本地（CRLF）不炸不代表 CI（LF）不炸
+///（Linux CI 首个完整 rust-test run 抓到的真实跨平台缺陷）。
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Best-effort extract JSON object from model text.
@@ -2191,6 +2209,29 @@ mod tests {
         assert!(p.novel_text.is_none());
         assert!(!p.novel_excerpts.is_empty());
         assert!(build_novel_prefill_prompt(&p).is_ok());
+    }
+
+    /// 字节预算截断必须落在 char 边界（CRLF/LF 漂移下任意偏移都不 panic）。
+    #[test]
+    fn truncate_at_char_boundary_never_splits_multibyte() {
+        let text = "设定".repeat(1_000); // 每字 3 字节
+        for budget in 0..32 {
+            let cut = truncate_at_char_boundary(&text, budget);
+            assert!(cut.len() <= budget);
+            assert!(text.starts_with(cut));
+        }
+        assert_eq!(truncate_at_char_boundary("短", 100), "短");
+        assert_eq!(truncate_at_char_boundary("", 10), "");
+        // 关键回归：审查 prompt 装配对任意资产字节数不 panic
+        let report = CheckReport {
+            ok: true,
+            issues: vec![],
+            score: None,
+            summary: None,
+            source: None,
+        };
+        let project = CardProject::new_from_scratch("边界", "测试");
+        let _ = build_review_prompt(&project, &report, None);
     }
 
     /// Phase 3 骨架：InitVar 注入走普通世界书条目通道（闸门口径零改动）。

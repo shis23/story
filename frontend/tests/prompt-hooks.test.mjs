@@ -267,6 +267,7 @@ test('prompt hook audit stays fail-open for cyclic and hostile payloads', async 
   assert.equal(JSON.stringify(audits).includes('cycle source'), false)
   assert.equal(JSON.stringify(audits).includes('hostile getter private text'), false)
   assert.deepEqual(audits[1].changedKeys, ['count', 'hostile', 'prompt', 'self'])
+})
 
 // ─── Commit 2: budgets, unload, revocation, fail policy, correlation ────────
 
@@ -506,5 +507,4 @@ test('late duplicate generation does not revive a cancelled earlier generation',
   )
   assert.deepEqual(result, { prompt: 'gen2' })
   assert.equal(audits[0].generationId, 'gen-2')
-})
 })
