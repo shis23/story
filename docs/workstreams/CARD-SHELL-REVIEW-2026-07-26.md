@@ -124,3 +124,20 @@ UI 保真仍有 H4/H5/M5/L7 级缺口。两线结论互证「翻译为主干、�
 2. M3+M4+H3（安全三件套：CSP、Propose 化、挂壳来源分级——扩面前先补墙）
 3. H4+H5（卿卿类卡的 UI 通路）
 4. M1/M2/M5 → L 系列
+
+## 修复状态（2026-07-26 同日）
+
+前 7 条已修复入库（每条一 commit，带回归测试；cargo test --workspace +
+npm test + vitest 全绿）：
+
+| 条目 | commit | 方案摘要 |
+|---|---|---|
+| H1 | a25ae8f | 新增 `apply_campaign_opening` 命令（开场态校验 + edit_variant 落库）；前端 `rewriteOpeningMessages` 纯函数 + Campaign 分支同步调用 |
+| H2 | f5ac264 | `selectOpeningGreetingOptions`：campaign 态一律用卡 greetings，空也不回退残留 |
+| M3 | f3f9d54 | `buildShellCspMetaTag` 注入包装文档：default-src 'none'，网络向指令钉白名单，获取失败 fail closed |
+| M4 | 591a2c1 | var_write → 提案队列 + `ShellVariableProposalBar` 确认条；用户点击的 MVU 交互保持直写 |
+| H3 | 30b9912 | 消息 .load 仅卡 manifest 注册 URL 自动挂载，其余确认卡（本会话有效）；无信任上下文 fail closed |
+| H4 | 43a33ab | display 内含 script 的完整 HTML 文档 → CardShellHost html prop 沙箱挂载；信任锚=源文命中 manifest InlineHtml find_regex。偏离评审建议的「按 label 取回正文」：display_content 已带插值后正文，按 label 取回反丢捕获组，故不需要恢复命令 |
+| H5 | abde7b1 | classify_shell_kind 补 开场/intro//intro/ → OpeningCustom；状态判定提前；前端 classifyShellUrl 同步 |
+
+未处理：M1/M2/M5、L1-L7。
