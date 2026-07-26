@@ -53,6 +53,44 @@ use storyforge_tauri_app::campaign_store::CampaignStore;
 use storyforge_tauri_app::fill_campaign_runtime_from_store;
 use storyforge_tauri_app::turn_store::TurnStore;
 
+/// 惰性清扫历史泄漏的 harness 临时目录（>24h 的 `storyforge_harness_*`）。
+///
+/// harness 进程被 kill / panic 时 `cleanup()` 不会执行，tempdir 会积累
+/// （2026-07-26 实测清出 ~0.1GB）。每进程至多扫一次，全程 best-effort，
+/// 任何 IO 错误静默忽略。24h 阈值保证不碰并行运行中的其他 harness 进程。
+fn sweep_stale_harness_dirs() {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        sweep_stale_harness_dirs_in(
+            &std::env::temp_dir(),
+            std::time::Duration::from_secs(24 * 3600),
+        );
+    });
+}
+
+fn sweep_stale_harness_dirs_in(tmp: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("storyforge_harness_") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// 一次性环境：全部 tempdir，进程隔离，不污染真实 `data/`。
 pub struct HarnessEnv {
     pub data_dir: PathBuf,
@@ -69,6 +107,7 @@ pub struct HarnessEnv {
 impl HarnessEnv {
     /// 新建隔离环境。`llm` 由调用方提供（真实或 mock）。
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
+        sweep_stale_harness_dirs();
         let data_dir =
             std::env::temp_dir().join(format!("storyforge_harness_{}", uuid::Uuid::new_v4()));
         Self::open(data_dir, llm)
@@ -729,5 +768,28 @@ mod tests {
         .expect("incomplete env credentials should fall back without parsing tool mode");
 
         assert!(conn.is_none());
+    }
+
+    #[test]
+    fn sweep_removes_stale_harness_dirs_and_keeps_fresh_and_foreign() {
+        let root = std::env::temp_dir().join(format!("sf_sweep_test_{}", uuid::Uuid::new_v4()));
+        let stale = root.join("storyforge_harness_stale");
+        let foreign = root.join("other_project_dir");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(stale.join("f.json"), "{}").unwrap();
+
+        // max_age = 0：所有 storyforge_harness_* 视为陈旧 → 删；无关目录不碰
+        super::sweep_stale_harness_dirs_in(&root, std::time::Duration::ZERO);
+        assert!(!stale.exists(), "陈旧 harness 目录应被清扫");
+        assert!(foreign.exists(), "无关目录不得误删");
+
+        // max_age 极大：新目录一律保留
+        let fresh = root.join("storyforge_harness_fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        super::sweep_stale_harness_dirs_in(&root, std::time::Duration::from_secs(365 * 24 * 3600));
+        assert!(fresh.exists(), "未到期目录不得清扫");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
