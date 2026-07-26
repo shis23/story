@@ -137,3 +137,60 @@ describe('ShellAwareContent mount trust gate (H3)', () => {
     expect(wrapper.find('[data-testid="shell-mount-confirm"]').exists()).toBe(true)
   })
 })
+
+describe('ShellAwareContent in-place segmentation', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  const childKinds = (wrapper) => Array.from(wrapper.element.children).map((el) => {
+    const testid = el.getAttribute && el.getAttribute('data-testid')
+    if (testid) return testid
+    return el.tagName.toLowerCase()
+  })
+
+  it('renders narrative and shells interleaved in original order', () => {
+    const doc = '<body><div id="app"></div><script>battle()</script></body>'
+    const wrapper = mountWithLayout(
+      `叙事A。\n$('body').load('${HOME}')\n叙事B。\n${doc}\n叙事C。`,
+      { trusted: [HOME], inlineTriggers: [{ label: '战斗', trigger: '【战斗】' }] },
+      { sourceContent: '【战斗】回合开始' },
+    )
+
+    // 文本、.load 壳、文本、内联壳、文本——原文顺序
+    expect(childKinds(wrapper)).toEqual([
+      'rich-content-stub', 'article', 'rich-content-stub', 'article', 'rich-content-stub',
+    ])
+    const hosts = wrapper.findAllComponents(CardShellHostStub)
+    expect(hosts[0].props('url')).toBe(HOME)
+    expect(hosts[1].props('html')).toContain('battle()')
+  })
+
+  it('confirm card holds the shell position and approve swaps in place', async () => {
+    const attacker = 'https://files.catbox.moe/attacker.html'
+    const wrapper = mountWithLayout(`A\n$('body').load('${attacker}')\nB`, { trusted: [HOME] })
+
+    expect(childKinds(wrapper)).toEqual([
+      'rich-content-stub', 'shell-mount-confirm', 'rich-content-stub',
+    ])
+
+    await wrapper.find('[data-testid="shell-mount-approve"]').trigger('click')
+    expect(childKinds(wrapper)).toEqual([
+      'rich-content-stub', 'article', 'rich-content-stub',
+    ])
+    expect(wrapper.findComponent(CardShellHostStub).props('url')).toBe(attacker)
+  })
+
+  it('suppressed urls leave no shell at their position, surrounding text intact', () => {
+    const wrapper = mountWithLayout(
+      `A\n$('body').load('${HOME}')\nB`,
+      { suppressed: [HOME], trusted: [HOME] },
+    )
+    expect(childKinds(wrapper)).toEqual(['rich-content-stub', 'rich-content-stub'])
+  })
+
+  it('plain messages render as a single untouched text segment', () => {
+    const wrapper = mountWithLayout('普通叙事。\n\n\n\n空行保留。', {})
+    expect(childKinds(wrapper)).toEqual(['rich-content-stub'])
+  })
+})

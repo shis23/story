@@ -50,6 +50,138 @@ export function classifyShellUrl(url) {
 }
 
 /**
+ * Segment display_content into an ordered text/shell list (in-place rendering).
+ *
+ * The legacy extractors (`extractShellMountsFromDisplay` +
+ * `extractInlineShellDocsFromDisplay`) chain destructive replaces, so a shell's
+ * original position inside the narrative is lost and every shell renders
+ * hoisted above the text. This segmenter runs a single span-claiming pass over
+ * the ORIGINAL text so ShellAwareContent can render each shell exactly where
+ * the card placed it (酒馆助手 renders in place; cards are designed for that).
+ *
+ * Claim priority (must match the legacy pass order so nested patterns never
+ * double-match): fenced .load glue → body-script .load glue → bare .load call
+ * → inline HTML document. A region containing `.load` is always a load mount,
+ * never an inline doc. One deliberate edge: a bare `.load` inside a LARGER
+ * html document claims only the call span, so the surrounding document falls
+ * through to text rendering (sanitized, no execution) — hybrid shells like
+ * that don't exist in real cards and text is the safe degradation.
+ *
+ * Semantics preserved from the legacy path:
+ * - duplicate URLs: first occurrence becomes the mount, later ones are
+ *   stripped without rendering (one URL = one iframe);
+ * - no shells detected → a single text segment BYTE-IDENTICAL to the input
+ *   (blank-line collapsing must never leak into plain messages);
+ * - with shells, each text segment is collapsed (`\n{3,}` → `\n\n`) and
+ *   trimmed, empty segments dropped;
+ * - script-less HTML stays in text segments (RichContent, no sandbox needed).
+ *
+ * Streaming stability: content grows by appending, so `start` offsets of
+ * already-emitted segments never move mid-stream. A whole-text rewrite (e.g.
+ * display regex applied at stream end) may shift offsets once — inline shells
+ * keyed by `start` are allowed to remount at that moment; load shells key by
+ * URL and survive.
+ *
+ * @param {string} displayContent
+ * @returns {Array<{type:'text', content:string}
+ *   | {type:'shell', mode:'load', url:string, kind:string, start:number}
+ *   | {type:'shell', mode:'inline', html:string, kind:string, start:number}>}
+ */
+export function segmentShellContent(displayContent) {
+  const text = String(displayContent || '')
+  if (!text) return [{ type: 'text', content: text }]
+
+  const FENCE_GLUE_RE =
+    /```[\s\S]*?\$\(\s*['"]body['"]\s*\)\s*\.load\([\s\S]*?```/gi
+  const BODY_GLUE_RE =
+    /<body[^>]*>\s*<script[^>]*>\s*\$\(\s*['"]body['"]\s*\)\s*\.load\([\s\S]*?<\/script>\s*<\/body>/gi
+  const BARE_LOAD_RE =
+    /\$\(\s*['"]body['"]\s*\)\s*\.load\(\s*['"`]https?:\/\/[^'"`]+['"`]\s*\)/gi
+  const INLINE_DOC_RE =
+    /<!DOCTYPE\s+html[\s\S]*?<\/html\s*>|<html[\s>][\s\S]*?<\/html\s*>|<body[\s>][\s\S]*?<\/body\s*>/gi
+
+  /** @type {Array<{start:number, end:number, mode:string, urls?:string[], html?:string}>} */
+  const regions = []
+  const overlapsClaimed = (start, end) =>
+    regions.some((r) => start < r.end && end > r.start)
+
+  const passes = [
+    [FENCE_GLUE_RE, 'load'],
+    [BODY_GLUE_RE, 'load'],
+    [BARE_LOAD_RE, 'load'],
+    [INLINE_DOC_RE, 'inline'],
+  ]
+  for (const [re, mode] of passes) {
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const start = m.index
+      const end = start + m[0].length
+      if (overlapsClaimed(start, end)) continue
+      if (mode === 'inline') {
+        if (!/<script[\s>]/i.test(m[0])) continue
+        regions.push({ start, end, mode, html: m[0] })
+      } else {
+        const urls = extractLoadUrlsFrom(m[0])
+        if (!urls.length) continue
+        regions.push({ start, end, mode, urls })
+      }
+    }
+  }
+
+  if (!regions.length) return [{ type: 'text', content: text }]
+
+  regions.sort((a, b) => a.start - b.start)
+
+  const segments = []
+  const seenUrls = new Set()
+  const pushText = (raw) => {
+    const cleaned = raw.replace(/\n{3,}/g, '\n\n').trim()
+    if (cleaned) segments.push({ type: 'text', content: cleaned })
+  }
+  let cursor = 0
+  for (const region of regions) {
+    if (region.start > cursor) pushText(text.slice(cursor, region.start))
+    if (region.mode === 'inline') {
+      segments.push({
+        type: 'shell',
+        mode: 'inline',
+        html: region.html,
+        kind: 'message_html',
+        start: region.start,
+      })
+    } else {
+      for (const url of region.urls) {
+        if (seenUrls.has(url)) continue
+        seenUrls.add(url)
+        segments.push({
+          type: 'shell',
+          mode: 'load',
+          url,
+          kind: classifyShellUrl(url),
+          start: region.start,
+        })
+      }
+    }
+    cursor = region.end
+  }
+  if (cursor < text.length) pushText(text.slice(cursor))
+  return segments
+}
+
+function extractLoadUrlsFrom(regionText) {
+  const urls = []
+  const seen = new Set()
+  const re = new RegExp(LOAD_RE.source, LOAD_RE.flags)
+  let m
+  while ((m = re.exec(regionText)) !== null) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    urls.push(m[1])
+  }
+  return urls
+}
+
+/**
  * Extract executable inline HTML documents from display_content (H4).
  *
  * Cards without remote shells ship their UI as huge regex replace_strings

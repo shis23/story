@@ -141,3 +141,14 @@ npm test + vitest 全绿）：
 | H5 | abde7b1 | classify_shell_kind 补 开场/intro//intro/ → OpeningCustom；状态判定提前；前端 classifyShellUrl 同步 |
 
 未处理：M1/M2/M5、L1-L7。
+
+### 后续跟进（同日）
+
+- **消息壳原地渲染**：H4 通路的完成形态。`segmentShellContent`（cardShellDisplay.js）
+  单遍 span 认领（围栏胶水→body-script 胶水→裸 .load→内联文档），输出有序
+  text/shell 分段；ShellAwareContent 改为逐段渲染，壳出现在原文位置，不再吊顶。
+  语义保持：同 URL 首现渲染后续剥离、无壳消息逐字节原样、suppress 仅作用于
+  .load 壳（内联无 URL 不参与）。流式尾部追加时段偏移稳定（key 不变），全文
+  改写允许内联壳一次性重挂（测试显式承认）。新增 CardShellHost 沙箱等价测试：
+  :html 与 :url 同 sandbox 属性、html 路径断言 CSP + bridge 注入。确认门兼作
+  重内联壳的懒加载闸门——将来「记住信任」不得改成全自动挂载。
