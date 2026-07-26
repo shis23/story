@@ -587,9 +587,11 @@ mod tests {
         );
 
         assert!(result.body_base64.is_none());
+        // 缓存 URL 的 origin 按平台分流（WebView2 http 子域 / WebKitGTK 自定义
+        // scheme）——断言用同一常量，别硬编码单平台形态（Linux CI 抓到的）。
         assert_eq!(
             result.cache_url.as_deref(),
-            Some(format!("http://storyforge-cache.localhost/{resource_name}").as_str())
+            Some(format!("{LOCAL_PROTOCOL_ORIGIN}/{resource_name}").as_str())
         );
     }
 
