@@ -6491,6 +6491,24 @@ fn get_conversation(
     )
 }
 
+/// 插件通道读取对话（CARD-SHELL-REVIEW L4，严格门禁）：与 `get_conversation`
+/// 同一数据，但要求后端 PluginRegistry 中该插件已启用且声明 ReadMemory。
+/// fail closed：未注册的插件（含卡壳虚拟插件的临时 id）一律拒绝——前端权限
+/// 数组不再是唯一边界。
+#[tauri::command]
+fn plugin_get_conversation(
+    plugin_id: String,
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, TauriCommandError> {
+    use storyforge_infra_plugin_host::Permission;
+    state
+        .plugin_registry
+        .ensure_permission(&plugin_id, &Permission::ReadMemory)
+        .map_err(|e| TauriCommandError::validation(e.to_string()))?;
+    get_conversation(id, state)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ConversationDisplayDto {
     id: Id,
@@ -12506,6 +12524,7 @@ pub fn run() {
             list_conversations,
             delete_conversation,
             get_conversation,
+            plugin_get_conversation,
             // 重 roll 命令
             regenerate,
             // M1 对话操作命令

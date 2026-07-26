@@ -182,7 +182,9 @@ export const API_METHODS = {
   'character.list':   { permission: 'ReadCharacters',  command: 'plugin_list_characters', params: (_p, pluginId) => ({ pluginId }) },
   'character.get':    { permission: 'ReadCharacters',  command: 'plugin_read_character',  params: (p, pluginId) => ({ pluginId, characterId: p.id }) },
   'worldInfo.search': { permission: 'ReadWorldInfo',   command: 'plugin_read_world_info', params: (p, pluginId) => ({ pluginId, characterId: p.characterId }) },
-  'memory.getRecent': { permission: 'ReadMemory',      command: 'get_conversation',  params: (p) => ({ id: p.conversationId }) },
+  // L4 严格门禁：走插件通道命令，后端 PluginRegistry 二次校验 ReadMemory。
+  // 未注册的插件（含卡壳虚拟插件）后端直接拒绝，前端权限数组不再是唯一边界。
+  'memory.getRecent': { permission: 'ReadMemory',      command: 'plugin_get_conversation',  params: (p, pluginId) => ({ pluginId, id: p.conversationId }) },
   'variables.get':    { permissions: ['ReadVariables', 'WriteVariables'], command: 'plugin_get_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId }) },
   'variables.set':    { permission: 'WriteVariables',  command: 'plugin_set_variable', params: (p, pluginId) => ({ pluginId, campaignId: p.campaignId, instanceId: p.instanceId, key: p.key, value: p.value }) },
   'storage.get':      { permission: null,              command: null },  // 本地 localStorage，不走后端

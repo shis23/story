@@ -449,6 +449,15 @@ mod tests {
     }
 
     #[test]
+    fn test_permission_check_unregistered_plugin_fails_closed() {
+        // L4 严格门禁的地基：未注册的插件 id（如卡壳虚拟插件的随机临时 id）
+        // 必须 NotFound 拒绝，而不是放行——后端注册表是最终边界。
+        let registry = PluginRegistry::new();
+        let result = registry.ensure_permission("card-shell-abc123", &Permission::ReadMemory);
+        assert!(matches!(result, Err(PluginError::NotFound(_))));
+    }
+
+    #[test]
     fn test_permission_check_disabled_plugin() {
         let registry = PluginRegistry::new();
         registry
