@@ -9807,6 +9807,68 @@ fn create_campaign_in_store(
     Ok(dto)
 }
 
+/// 开场壳「开始旅程」选择落库：改写 Campaign 绑定会话的首条开场白。
+/// 仅当会话仍处于开场态（唯一一条消息且为 assistant）时允许改写；
+/// 已有后续消息时返回校验错误，避免壳选择覆盖真实写作历史。
+#[tauri::command]
+fn apply_campaign_opening(
+    campaign_id: String,
+    content: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), TauriCommandError> {
+    apply_campaign_opening_in_store(
+        get_campaign_store(),
+        state.conv_store.as_ref(),
+        &Id::from_str(&campaign_id),
+        content,
+    )
+}
+
+fn apply_campaign_opening_in_store(
+    store: &campaign_store::CampaignStore,
+    conv_store: &ConversationStore,
+    campaign_id: &Id,
+    content: String,
+) -> Result<(), TauriCommandError> {
+    use storyforge_domain::conversation::Role as ConvRole;
+
+    if content.trim().is_empty() {
+        return Err(TauriCommandError::validation("开场内容不能为空"));
+    }
+    let campaign = store.get_campaign(campaign_id).ok_or_else(|| {
+        TauriCommandError::not_found(format!("找不到 campaign id={campaign_id}"))
+    })?;
+    let conv_id = campaign
+        .conversation_id
+        .clone()
+        .or_else(|| conv_store.find_by_campaign(&campaign.id).map(|c| c.id))
+        .ok_or_else(|| {
+            TauriCommandError::not_found(format!("campaign 未绑定会话: {campaign_id}"))
+        })?;
+    let conv = conv_store
+        .get(&conv_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到会话 id={conv_id}")))?;
+    if conv.nodes.len() != 1 {
+        return Err(TauriCommandError::validation(
+            "会话已有后续消息，开场选择不可再改写",
+        ));
+    }
+    let node = &conv.nodes[0];
+    let is_assistant_opening = node
+        .active()
+        .map(|v| v.role == ConvRole::Assistant)
+        .unwrap_or(false);
+    if !is_assistant_opening {
+        return Err(TauriCommandError::validation(
+            "会话首条消息不是开场白，拒绝改写",
+        ));
+    }
+    let node_id = node.id.clone();
+    conv_store
+        .edit_variant(&conv_id, &node_id, content)
+        .map_err(|e| TauriCommandError::storage(format!("存储写入失败: {e}")))
+}
+
 /// 开档时将卡内嵌世界书（及其它卡 is_global 条目）写入 Campaign 旁路世界书文件。
 fn seed_campaign_world_info_from_card(
     store: &campaign_store::CampaignStore,
@@ -12391,6 +12453,7 @@ pub fn run() {
             get_card,
             delete_card,
             create_campaign,
+            apply_campaign_opening,
             fork_campaign,
             list_campaigns,
             get_campaign,
@@ -15719,6 +15782,105 @@ mod tests {
         assert!(store.list_campaigns().is_empty());
         assert!(store.list_all_instances().is_empty());
         assert!(conv_store.list().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_apply_campaign_opening_rewrites_first_assistant_message() {
+        use storyforge_domain::conversation::Role as ConvRole;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_apply_opening_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("Opening Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.character_definitions
+            .push(make_test_character_definition(&card.id, "op-def", "Hero"));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+
+        let dto =
+            create_campaign_in_store(&store, &conv_store, card_id, "opening".into(), None).unwrap();
+        let campaign_id = Id::from_str(&dto.id);
+        let conv_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
+        // 测试环境无全局 CharacterStore：手动播种开场白（生产路径由 create_campaign 写入）
+        conv_store
+            .append_final_message(&conv_id, ConvRole::Assistant, "scene-1".into())
+            .unwrap();
+
+        apply_campaign_opening_in_store(&store, &conv_store, &campaign_id, "scene-2".into())
+            .unwrap();
+
+        let conv = conv_store.get(&conv_id).unwrap();
+        assert_eq!(conv.nodes.len(), 1);
+        assert_eq!(conv.nodes[0].active_content(), "scene-2");
+
+        // 重载后仍是改写值：确认真正落盘而非仅缓存
+        let reloaded = ConversationStore::new(dir.join("conversations"));
+        assert_eq!(
+            reloaded.get(&conv_id).unwrap().nodes[0].active_content(),
+            "scene-2"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_apply_campaign_opening_rejects_after_conversation_grows() {
+        use storyforge_domain::conversation::Role as ConvRole;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_apply_opening_grown_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("Opening Grown Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.character_definitions
+            .push(make_test_character_definition(&card.id, "og-def", "Hero"));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+
+        let dto =
+            create_campaign_in_store(&store, &conv_store, card_id, "grown".into(), None).unwrap();
+        let campaign_id = Id::from_str(&dto.id);
+        let conv_id = Id::from_str(dto.conversation_id.as_deref().expect("bound conv"));
+        conv_store
+            .append_final_message(&conv_id, ConvRole::Assistant, "scene-1".into())
+            .unwrap();
+        conv_store
+            .append_user_message(&conv_id, "next turn".into())
+            .unwrap();
+
+        let err =
+            apply_campaign_opening_in_store(&store, &conv_store, &campaign_id, "scene-2".into())
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("后续消息"),
+            "expected opening-stale validation error, got {err}"
+        );
+        // 原开场未被改写
+        let conv = conv_store.get(&conv_id).unwrap();
+        assert_eq!(conv.nodes[0].active_content(), "scene-1");
+
+        // 空内容与未知 campaign 也拒绝
+        let err = apply_campaign_opening_in_store(&store, &conv_store, &campaign_id, "  ".into())
+            .unwrap_err();
+        assert!(err.to_string().contains("不能为空"), "got {err}");
+        let missing = Id::new();
+        let err =
+            apply_campaign_opening_in_store(&store, &conv_store, &missing, "scene-2".into())
+                .unwrap_err();
+        assert!(err.to_string().contains("找不到"), "got {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -52,6 +52,33 @@ export function buildOpeningChatSeed(greetingOptions = [], options = {}) {
 }
 
 /**
+ * Rewrite the single opening assistant message in place with the chosen
+ * scenario text. Returns the new messages array, or `null` when the
+ * conversation is no longer in a rewritable opening state (not exactly one
+ * assistant message) — callers must not touch history in that case.
+ *
+ * @param {Array<object> | null | undefined} messages
+ * @param {string} content
+ * @returns {Array<object> | null}
+ */
+export function rewriteOpeningMessages(messages, content) {
+  const list = Array.isArray(messages) ? messages : []
+  if (list.length !== 1 || list[0]?.role !== 'assistant') return null
+  const first = list[0]
+  const variants = Array.isArray(first.variants) ? first.variants : []
+  if (variants.length) {
+    const active = first.active_variant ?? 0
+    const nextVariants = variants.map((variant, index) => (
+      index === active
+        ? { ...variant, content, display_content: content }
+        : variant
+    ))
+    return [{ ...first, variants: nextVariants }]
+  }
+  return [{ ...first, content, display_content: content }]
+}
+
+/**
  * Map a shell swipe selection onto StoryForge greeting options / message text.
  *
  * @param {{ swipe_id?: number|null, mes?: string|null }} payload

@@ -800,6 +800,13 @@ export async function createCampaign(cardId, name, openingMessage = null) {
   return { id: 'mock-campaign-1', card_id: cardId, name, instance_count: 1 }
 }
 
+/** 开场壳选择落库：改写 Campaign 绑定会话的首条开场白（仅开场态可用） */
+export async function applyCampaignOpening(campaignId, content) {
+  if (isTauri()) {
+    return await invoke('apply_campaign_opening', { campaignId, content })
+  }
+}
+
 /** 列出 Campaign（可按 card_id 过滤） */
 export async function forkCampaign(sourceCampaignId, forkNodeId, name) {
   if (isTauri()) {

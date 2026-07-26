@@ -80,6 +80,7 @@ import { useNewCampaignForm } from './composables/useNewCampaignForm.js'
 import { useCharacterImport } from './composables/useCharacterImport.js'
 import { useMvuStatusPanel } from './composables/useMvuStatusPanel.js'
 import {
+  applyCampaignOpening,
   getVersion,
   getActiveCampaign,
   getActiveConnection,
@@ -103,6 +104,7 @@ import { resolveCardShellManifestTarget } from './utils/cardShellPresentation.js
 import {
   buildOpeningChatSeed,
   resolveOpeningChatSelection,
+  rewriteOpeningMessages,
 } from './utils/cardShellOpeningChat.js'
 import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
 
@@ -401,7 +403,7 @@ const greeting = useGreeting({
  * reloadCurrentChat. Apply that selection into StoryForge UI and close the
  * setup-only opening surface.
  */
-function onOpeningShellApplied(payload) {
+async function onOpeningShellApplied(payload) {
   const options = (writing.greetingOptions?.length
     ? writing.greetingOptions
     : cardShellOpeningGreetings.value)
@@ -411,30 +413,20 @@ function onOpeningShellApplied(payload) {
   } else if (selection.content) {
     // Campaign conversations already own message history. Prefer rewriting the
     // first assistant opening in-place so the chosen scenario is visible now.
-    const messages = writing.messages || []
-    if (messages.length === 1 && messages[0]?.role === 'assistant') {
-      const first = messages[0]
-      const variants = Array.isArray(first.variants) ? first.variants : []
-      if (variants.length) {
-        const active = first.active_variant ?? 0
-        const nextVariants = variants.map((variant, index) => (
-          index === active
-            ? {
-              ...variant,
-              content: selection.content,
-              display_content: selection.content,
-            }
-            : variant
-        ))
-        writing.messages = [{ ...first, variants: nextVariants }]
-      } else {
-        writing.messages = [{
-          ...first,
-          content: selection.content,
-          display_content: selection.content,
-        }]
+    const rewritten = rewriteOpeningMessages(writing.messages || [], selection.content)
+    if (rewritten) {
+      writing.messages = rewritten
+      // Campaign 会话历史由后端持有：本地改写必须同步落库，否则下一轮
+      // start_writing 仍基于旧开场生成，applyConversation 会静默回退。
+      if (writing.writingMode === 'campaign' && campaign.activeCampaign?.id) {
+        try {
+          await applyCampaignOpening(campaign.activeCampaign.id, selection.content)
+        } catch (e) {
+          console.error('applyCampaignOpening:', e)
+          logAppendFrontend('warn', `开场选择落库失败: ${e}`)
+        }
       }
-    } else if (messages.length === 0 && writing.writingMode === 'legacy') {
+    } else if ((writing.messages || []).length === 0 && writing.writingMode === 'legacy') {
       writing.messages = [greeting.buildOpeningMessage(selection.content)]
     }
     if (selection.greetingIndex != null) {
