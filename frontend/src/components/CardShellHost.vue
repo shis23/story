@@ -43,11 +43,13 @@ import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import {
   cardShellFetchUrl,
+  cardShellListAllowedHosts,
   getCampaignVariables,
   listCampaignWorldInfo,
   setCampaignVariable,
   setCampaignWorldInfoEnabled,
 } from '../tauri-api.js'
+import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
 import {
   createCardShellRuntimeCompatibilityScript,
   isCardShellBridgeMessageForSession,
@@ -137,6 +139,9 @@ let inlineModuleSeq = 0
 let bridgeSessionSeq = 0
 let activeBridgeSession = ''
 let shellSelectorVariables = {}
+// Allowlist snapshot for the CSP meta; empty = data:/blob:/cache-origin only
+// (fail closed: shells still work through the host fetch proxy).
+let shellAllowedHosts = []
 
 function nextBridgeSession() {
   bridgeSessionSeq += 1
@@ -716,7 +721,10 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, op
 
   // Existing full ST/TavernHelper/SillyTavern surface from plugin-bridge (do not reimplement).
   const stBridgeHtml = generateBridgeScript(shellPluginId, '*')
+  // CSP first so every element after it (including shell-authored tags) is
+  // bound to the fetch-proxy allowlist; tauri csp:null offers no outer policy.
   const headInject =
+    buildShellCspMetaTag(shellAllowedHosts) +
     baseTag +
     stBridgeHtml +
     sOpen + bridgeLines.join('\n') + sClose +
@@ -769,6 +777,12 @@ async function loadShell() {
   loading.value = true
   try {
     shellSelectorVariables = await loadShellSelectorVariables()
+    try {
+      shellAllowedHosts = await cardShellListAllowedHosts()
+    } catch (e) {
+      console.warn('[CardShell] allowlist fetch failed, CSP falls back to local-only', e)
+      shellAllowedHosts = []
+    }
     if (seq !== loadSeq) return
     if (props.url) {
       const res = await hostFetch(props.url)
