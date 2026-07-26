@@ -15,6 +15,7 @@ import PipelineTracePanel from '../debug/PipelineTracePanel.vue'
 import PluginEventLog from '../debug/PluginEventLog.vue'
 import PromptHookAuditLog from '../debug/PromptHookAuditLog.vue'
 import LogPanel from '../debug/LogPanel.vue'
+import { cardShellClearCache } from '../../tauri-api.js'
 
 const ui = useUiStore()
 
@@ -30,6 +31,24 @@ const tabs = [
 const logPanelRef = ref(null)
 function onTabChange(key) {
   if (key === 'logs') logPanelRef.value?.loadLogs?.()
+}
+
+// L6 收尾：卡壳磁盘缓存清空（壳资源刷新通道）。放调试抽屉页脚——
+// 专业工具面，不占写作面。
+const clearingShellCache = ref(false)
+const clearShellCacheResult = ref('')
+async function clearShellCache() {
+  if (clearingShellCache.value) return
+  clearingShellCache.value = true
+  clearShellCacheResult.value = ''
+  try {
+    const n = await cardShellClearCache()
+    clearShellCacheResult.value = `已清 ${n ?? 0} 个缓存对象`
+  } catch (e) {
+    clearShellCacheResult.value = `清空失败: ${e?.message || e}`
+  } finally {
+    clearingShellCache.value = false
+  }
 }
 </script>
 
@@ -56,6 +75,21 @@ function onTabChange(key) {
           <LogPanel v-else-if="activeTab === 'logs'" ref="logPanelRef" />
         </div>
       </Tabs>
+    </div>
+
+    <!-- 维护区：卡壳缓存刷新通道（L6 UI 入口） -->
+    <div class="shrink-0 border-t border-line px-3 py-2 flex items-center gap-2">
+      <button
+        type="button"
+        class="text-[11px] px-2 py-1 rounded-md border border-line text-ink-soft hover:text-ink hover:bg-surface-2 disabled:opacity-50"
+        :disabled="clearingShellCache"
+        @click="clearShellCache"
+      >
+        {{ clearingShellCache ? '清空中…' : '清空卡壳缓存' }}
+      </button>
+      <span v-if="clearShellCacheResult" class="text-[11px] text-ink-faint truncate">
+        {{ clearShellCacheResult }}
+      </span>
     </div>
   </div>
 </template>

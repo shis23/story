@@ -22,5 +22,18 @@ export default defineConfig({
     minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
     // 开启 sourcemap（调试用）
     sourcemap: !!process.env.TAURI_DEBUG,
+    rollupOptions: {
+      output: {
+        // 框架依赖拆 vendor：应用代码迭代不再重刷框架 chunk 缓存。
+        // 主 chunk 674K → 529K（vendor-vue 133K + vendor-sanitize 29K 拆出）。
+        manualChunks: {
+          'vendor-vue': ['vue', 'pinia', '@headlessui/vue'],
+          'vendor-sanitize': ['dompurify'],
+        },
+      },
+    },
+    // 529K 为应用代码本体（Tauri 本地加载，无网络传输代价）；
+    // 继续压需异步组件化，收益不抵回归风险——有意接受。
+    chunkSizeWarningLimit: 560,
   },
 })
