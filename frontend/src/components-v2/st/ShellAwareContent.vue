@@ -15,7 +15,9 @@ import { computed, inject, ref } from 'vue'
 import RichContent from './RichContent.vue'
 import CardShellHost from '../../components/CardShellHost.vue'
 import {
+  extractInlineShellDocsFromDisplay,
   extractShellMountsFromDisplay,
+  matchesAnyInlineShellTrigger,
   partitionShellMountsByTrust,
 } from '../../utils/cardShellDisplay.js'
 import { useCampaignStore } from '../../stores/campaign.js'
@@ -27,7 +29,11 @@ const props = defineProps({
 
 const parsed = computed(() => extractShellMountsFromDisplay(props.content))
 const mounts = computed(() => parsed.value.mounts)
-const residual = computed(() => parsed.value.residualText)
+// H4：.load 之外，display 里可执行的内联 HTML 文档（卡正则的巨型 replace
+// 输出）也走 CardShellHost 沙箱，而不是被 RichContent/DOMPurify 剥壳。
+const inlineParsed = computed(() => extractInlineShellDocsFromDisplay(parsed.value.residualText))
+const inlineDocs = computed(() => inlineParsed.value.docs)
+const residual = computed(() => inlineParsed.value.residualText)
 const messageShellLayout = inject('storyforgeCardShellLayout', null)
 
 function unwrapLayoutList(source) {
@@ -43,6 +49,9 @@ const suppressedMessageShellUrls = computed(() =>
 const trustedMessageShellUrls = computed(() =>
   unwrapLayoutList(messageShellLayout?.trustedMessageShellUrls),
 )
+const inlineShellTriggers = computed(() =>
+  unwrapLayoutList(messageShellLayout?.inlineShellTriggers),
+)
 const renderedMounts = computed(() =>
   mounts.value.filter((mount) => !suppressedMessageShellUrls.value.includes(mount.url)),
 )
@@ -55,12 +64,37 @@ const mountPartition = computed(() => partitionShellMountsByTrust(
 ))
 const allowedMounts = computed(() => mountPartition.value.allowed)
 const pendingMounts = computed(() => mountPartition.value.needsConfirmation)
-const hasParsedShell = computed(() => mounts.value.length > 0)
+
+// 内联文档的信任锚：消息源文命中卡 manifest 里 InlineHtml 壳的 find_regex
+// （即卡自己的正则真的会改写这条消息），否则逐条确认。
+const inlineDocsTrusted = computed(() => matchesAnyInlineShellTrigger(
+  props.sourceContent || props.content,
+  inlineShellTriggers.value,
+))
+const approvedInlineDocs = ref([])
+const allowedInlineDocs = computed(() => (
+  inlineDocsTrusted.value
+    ? inlineDocs.value
+    : inlineDocs.value.filter((_, i) => approvedInlineDocs.value.includes(i))
+))
+const pendingInlineDocs = computed(() => (
+  inlineDocsTrusted.value
+    ? []
+    : inlineDocs.value
+      .map((doc, i) => ({ doc, index: i }))
+      .filter(({ index }) => !approvedInlineDocs.value.includes(index))
+))
+const hasParsedShell = computed(() => mounts.value.length > 0 || inlineDocs.value.length > 0)
 const hasShell = computed(() => allowedMounts.value.length > 0)
 
 function approveShellUrl(url) {
   if (!url || approvedShellUrls.value.includes(url)) return
   approvedShellUrls.value = [...approvedShellUrls.value, url]
+}
+
+function approveInlineDoc(index) {
+  if (approvedInlineDocs.value.includes(index)) return
+  approvedInlineDocs.value = [...approvedInlineDocs.value, index]
 }
 
 // Message-local shells are rendered outside AppV2's #shell slot. Bind them
@@ -100,6 +134,31 @@ function labelFor(kind) {
         :height="heightFor(m.kind)"
       />
     </template>
+    <CardShellHost
+      v-for="(doc, i) in allowedInlineDocs"
+      :key="'inline:' + i"
+      :html="doc.html"
+      :campaign-id="activeCampaignId"
+      :label="labelFor(doc.kind)"
+      :auto-height="true"
+      :height="heightFor(doc.kind)"
+    />
+    <div
+      v-for="{ index } in pendingInlineDocs"
+      :key="'pending-inline:' + index"
+      class="rounded-lg border border-warn/40 bg-warn/5 px-3 py-2 text-xs space-y-1"
+      data-testid="shell-inline-confirm"
+    >
+      <div class="text-ink">消息包含可执行的内联界面，但未命中本卡的正则触发器：</div>
+      <button
+        type="button"
+        class="px-2 py-0.5 rounded border border-line text-ink-soft hover:text-ink"
+        data-testid="shell-inline-approve"
+        @click="approveInlineDoc(index)"
+      >
+        信任并挂载本次
+      </button>
+    </div>
     <div
       v-for="m in pendingMounts"
       :key="'pending:' + m.url"

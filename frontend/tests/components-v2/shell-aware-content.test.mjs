@@ -10,18 +10,19 @@ const HOME =
 
 const CardShellHostStub = {
   name: 'CardShellHost',
-  props: ['campaignId', 'url'],
+  props: ['campaignId', 'url', 'html'],
   template: '<article data-shell-host>{{ campaignId }}|{{ url }}</article>',
 }
 
-function mountWithLayout(content, layout = {}) {
+function mountWithLayout(content, layout = {}, props = {}) {
   return mount(ShellAwareContent, {
-    props: { content },
+    props: { content, ...props },
     global: {
       provide: {
         storyforgeCardShellLayout: {
           suppressedMessageShellUrls: computed(() => layout.suppressed || []),
           trustedMessageShellUrls: computed(() => layout.trusted || []),
+          inlineShellTriggers: computed(() => layout.inlineTriggers || []),
         },
       },
       stubs: {
@@ -89,6 +90,36 @@ describe('ShellAwareContent mount trust gate (H3)', () => {
     await wrapper.find('[data-testid="shell-mount-approve"]').trigger('click')
     expect(wrapper.findComponent(CardShellHostStub).props('url')).toBe(ATTACKER)
     expect(wrapper.find('[data-testid="shell-mount-confirm"]').exists()).toBe(false)
+  })
+
+  it('mounts inline executable docs when the card regex trigger matches the source (H4)', () => {
+    const doc = '<body class="cultivation"><script>boot()</script></body>'
+    const wrapper = mountWithLayout(
+      `境界提升。\n${doc}`,
+      { inlineTriggers: [{ label: '修炼界面', trigger: '【修炼界面】' }] },
+      { sourceContent: '【修炼界面】境界：筑基' },
+    )
+
+    const host = wrapper.findComponent(CardShellHostStub)
+    expect(host.exists()).toBe(true)
+    expect(host.props('html')).toContain('boot()')
+    expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(false)
+  })
+
+  it('gates inline docs behind confirmation when no card trigger matches (H4)', async () => {
+    const doc = '<body><script>exfiltrate()</script></body>'
+    const wrapper = mountWithLayout(
+      `叙事。\n${doc}`,
+      { inlineTriggers: [{ label: '修炼界面', trigger: '【修炼界面】' }] },
+      { sourceContent: '模型凭空输出的可执行文档' },
+    )
+
+    expect(wrapper.findComponent(CardShellHostStub).exists()).toBe(false)
+    expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(true)
+
+    await wrapper.find('[data-testid="shell-inline-approve"]').trigger('click')
+    expect(wrapper.findComponent(CardShellHostStub).props('html')).toContain('exfiltrate()')
+    expect(wrapper.find('[data-testid="shell-inline-confirm"]').exists()).toBe(false)
   })
 
   it('fails closed when no layout/trust context is provided', () => {

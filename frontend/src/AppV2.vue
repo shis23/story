@@ -269,6 +269,13 @@ provide('storyforgeCardShellLayout', {
     if (cardShellStatusUrl.value) urls.push(cardShellStatusUrl.value)
     return urls
   }),
+  // H4：卡 manifest 里 InlineHtml 壳的 find_regex 触发器——消息源文命中
+  // 才允许自动挂载 display 里的内联 HTML 文档（模型凭空输出的不算）。
+  inlineShellTriggers: computed(() =>
+    cardShellShells.value
+      .filter((shell) => shell?.entry?.inline_html)
+      .map((shell) => ({ label: shell.label || '', trigger: shell.trigger || '' })),
+  ),
   // H3：消息内 .load 只对「卡 manifest 注册过的 URL」自动挂载；
   // 其余（如卡正则把模型输出改写成任意 .load）必须经用户确认。
   trustedMessageShellUrls: computed(() => {

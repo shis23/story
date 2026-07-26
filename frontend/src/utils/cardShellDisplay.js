@@ -49,6 +49,82 @@ export function classifyShellUrl(url) {
 }
 
 /**
+ * Extract executable inline HTML documents from display_content (H4).
+ *
+ * Cards without remote shells ship their UI as huge regex replace_strings
+ * (修炼界面/战斗系统 80-171KB): the backend display regex interpolates them
+ * into display_content, where DOMPurify used to strip every script. Detect
+ * full documents (`<!DOCTYPE…>` / `<html…>` / `<body…>`) that contain a
+ * script and hand them to CardShellHost's inline `html` path instead.
+ * Script-less HTML stays in RichContent — static markup needs no sandbox.
+ *
+ * @param {string} displayContent
+ * @returns {{ docs: Array<{kind:string, html:string, inline:true}>, residualText: string }}
+ */
+export function extractInlineShellDocsFromDisplay(displayContent) {
+  const text = String(displayContent || '')
+  const re = /<!DOCTYPE\s+html[\s\S]*?<\/html\s*>|<html[\s>][\s\S]*?<\/html\s*>|<body[\s>][\s\S]*?<\/body\s*>/gi
+  const docs = []
+  const spans = []
+  let m
+  while ((m = re.exec(text)) !== null) {
+    const html = m[0]
+    if (!/<script[\s>]/i.test(html)) continue
+    docs.push({ kind: 'message_html', html, inline: true })
+    spans.push([m.index, m.index + html.length])
+  }
+  if (!docs.length) return { docs: [], residualText: text }
+  let out = ''
+  let last = 0
+  for (const [start, end] of spans) {
+    out += text.slice(last, start)
+    last = end
+  }
+  out += text.slice(last)
+  return { docs, residualText: out.replace(/\n{3,}/g, '\n\n').trim() }
+}
+
+/**
+ * Parse an ST find_regex string (`/pattern/flags` or bare pattern) into a
+ * JS RegExp. Returns null when the pattern does not compile.
+ * @param {string} trigger
+ * @returns {RegExp | null}
+ */
+export function parseStFindRegex(trigger) {
+  const t = String(trigger || '').trim()
+  if (!t) return null
+  const wrapped = t.match(/^\/([\s\S]+)\/([a-z]*)$/i)
+  try {
+    if (wrapped) {
+      return new RegExp(wrapped[1], wrapped[2].replace(/[^gimsuy]/g, ''))
+    }
+    return new RegExp(t)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * True when any card-manifest inline-shell trigger matches the message text.
+ * Anchors inline-document mounting to the card's own regex scripts: a doc in
+ * display_content only auto-mounts when the message actually contains the
+ * marker the card's find_regex rewrites (模型凭空输出的 <script> 文档不算).
+ *
+ * @param {string} sourceText message source (pre-display-regex) content
+ * @param {Array<{trigger?: string} | string>} triggers manifest InlineHtml shells
+ */
+export function matchesAnyInlineShellTrigger(sourceText, triggers) {
+  const text = String(sourceText || '')
+  if (!text) return false
+  for (const item of Array.isArray(triggers) ? triggers : []) {
+    const trigger = typeof item === 'string' ? item : item?.trigger
+    const re = parseStFindRegex(trigger)
+    if (re && re.test(text)) return true
+  }
+  return false
+}
+
+/**
  * Split message-mounted shells into auto-mountable and confirm-gated (H3).
  *
  * Shell documents get full bridge privileges, so a `.load(url)` appearing in

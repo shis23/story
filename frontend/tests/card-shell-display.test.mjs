@@ -74,3 +74,50 @@ test('partitionShellMountsByTrust auto-mounts only card-manifest urls (H3)', asy
   assert.equal(none.allowed.length, 0)
   assert.equal(none.needsConfirmation.length, 2)
 })
+
+test('extractInlineShellDocsFromDisplay lifts executable docs, keeps static html (H4)', async () => {
+  const { extractInlineShellDocsFromDisplay } = await import('../src/utils/cardShellDisplay.js')
+  const doc = '<body class="cultivation"><div id="app"></div><script>boot()</script></body>'
+  const staticHtml = '<body><p>纯静态段落</p></body>'
+  const display = `叙事前文。\n${doc}\n中间叙事。\n${staticHtml}\n结尾。`
+
+  const { docs, residualText } = extractInlineShellDocsFromDisplay(display)
+  assert.equal(docs.length, 1)
+  assert.equal(docs[0].kind, 'message_html')
+  assert.ok(docs[0].inline)
+  assert.match(docs[0].html, /boot\(\)/)
+  // 可执行文档从 residual 移除；无脚本的静态 HTML 留给 RichContent
+  assert.doesNotMatch(residualText, /boot\(\)/)
+  assert.match(residualText, /纯静态段落/)
+  assert.match(residualText, /叙事前文/)
+  assert.match(residualText, /结尾/)
+
+  // 无内联文档时原样返回
+  const none = extractInlineShellDocsFromDisplay('普通叙事，无 HTML。')
+  assert.equal(none.docs.length, 0)
+  assert.equal(none.residualText, '普通叙事，无 HTML。')
+})
+
+test('parseStFindRegex + matchesAnyInlineShellTrigger anchor docs to card regex (H4)', async () => {
+  const { parseStFindRegex, matchesAnyInlineShellTrigger } =
+    await import('../src/utils/cardShellDisplay.js')
+
+  const wrapped = parseStFindRegex('/【修炼界面】([\\s\\S]*?)【\\/修炼界面】/g')
+  assert.ok(wrapped instanceof RegExp)
+  assert.ok(wrapped.test('【修炼界面】境界：筑基【/修炼界面】'))
+
+  const bare = parseStFindRegex('【战斗系统】')
+  assert.ok(bare.test('回合开始【战斗系统】敌方先手'))
+
+  assert.equal(parseStFindRegex(''), null)
+  assert.equal(parseStFindRegex('([unclosed'), null)
+
+  const triggers = [
+    { label: '修炼界面', trigger: '/【修炼界面】([\\s\\S]*?)【\\/修炼界面】/g' },
+    { label: '战斗系统', trigger: '【战斗系统】' },
+  ]
+  assert.ok(matchesAnyInlineShellTrigger('【修炼界面】…【/修炼界面】', triggers))
+  assert.ok(!matchesAnyInlineShellTrigger('普通叙事', triggers))
+  assert.ok(!matchesAnyInlineShellTrigger('', triggers))
+  assert.ok(!matchesAnyInlineShellTrigger('【修炼界面】…【/修炼界面】', []))
+})
