@@ -623,6 +623,8 @@ impl AppState {
 
     fn new_with_data_dir(data_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
+        // AND-3：storage_meta 版本记录（升级检测基础；best-effort 不 panic）
+        touch_storage_meta(&data_dir);
         let conv_dir = data_dir.join("conversations");
         let log_dir = data_dir.join("logs");
 
@@ -6972,6 +6974,35 @@ fn log_export_bundle(
     Ok(bundle)
 }
 
+/// AND-3：`storage_meta.json`——记录 schema 版本与 app 版本轨迹。
+/// 首次运行写 first_created_*；每次启动更新 last_opened_*。
+/// 移动端升级不丢数据的最小可观测基础：升级后能看出「上次是哪个版本写的盘」。
+/// 全程 best-effort：读坏/写失败只 warn（AND-3 任务 4：不 panic）。
+fn touch_storage_meta(data_dir: &Path) {
+    let path = data_dir.join("storage_meta.json");
+    let now = chrono::Utc::now().to_rfc3339();
+    let version = env!("CARGO_PKG_VERSION");
+    let mut meta = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "schema": 1,
+                "first_created_at": now,
+                "first_created_version": version,
+            })
+        });
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("schema".into(), serde_json::json!(1));
+        obj.insert("last_opened_at".into(), serde_json::json!(now));
+        obj.insert("last_opened_version".into(), serde_json::json!(version));
+    }
+    if let Err(e) = storyforge_infra_util::atomic_write_json(&path, &meta) {
+        tracing::warn!("storage_meta 写入失败（不影响启动）: {e}");
+    }
+}
+
 fn diagnostic_context_for_data_dir(data_dir: &Path) -> serde_json::Value {
     const STORE_FILES: &[&str] = &[
         "connections.json",
@@ -6996,6 +7027,7 @@ fn diagnostic_context_for_data_dir(data_dir: &Path) -> serde_json::Value {
         "presets.json",
         "active_preset.json",
         "global_regex_scripts.json",
+        "storage_meta.json",
     ];
 
     let log_dir = data_dir.join("logs");
@@ -21211,6 +21243,39 @@ mod tests {
             quality_accept_decision(Some(&err), true),
             QualityAcceptDecision::ForceDegraded { error_count: 1 }
         ));
+    }
+
+    /// AND-3：storage_meta 首建/升级轨迹 + 损坏容错（不 panic）。
+    #[test]
+    fn storage_meta_records_version_trail_and_survives_corruption() {
+        let dir = std::env::temp_dir().join(format!("sf-meta-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("storage_meta.json");
+
+        // 首建：first_* 与 last_* 同版本
+        touch_storage_meta(&dir);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["first_created_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["last_opened_version"], env!("CARGO_PKG_VERSION"));
+        let first_created = v["first_created_at"].as_str().unwrap().to_string();
+
+        // 再次启动：first_* 保留，last_opened_at 更新
+        touch_storage_meta(&dir);
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v2["first_created_at"], first_created.as_str());
+
+        // 损坏文件：重建为新 meta（不 panic，不冻结启动）
+        std::fs::write(&path, "{ broken").unwrap();
+        touch_storage_meta(&dir);
+        let v3: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v3["schema"], 1);
+        assert!(v3["first_created_at"].is_string());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
