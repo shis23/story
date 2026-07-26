@@ -72,8 +72,14 @@ pub async fn analyze_mvu_card(
     let mut registry = ToolRegistry::new();
     register_mvu_tools(&mut registry);
 
+    // 走流式工具循环：分析 prompt 大、慢供应商/中继边缘（Cloudflare ~100s）会把
+    // 非流式请求掐成 524；SSE 首字节早到即不受该超时影响。progress 此处不消费，
+    // 起一个排水任务防 send 端报错。
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+
     let resp = match runtime
-        .run_tool_loop(&config, user_msg, &registry, cancel)
+        .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
         .await
     {
         Ok(r) => r,
@@ -120,11 +126,47 @@ pub fn parse_mvu_translation_from_response(
     resp: &ChatResponse,
     field_schema: &[VariableField],
 ) -> Result<MvuTranslation, String> {
-    // 层 1：emit_mvu_translation 工具调用
+    // 层 1：emit_mvu_translation 工具调用。
+    // 模型偶发在参数 JSON 后附加尾随文本（2026-07-26 真实验收观测：
+    // "trailing characters at column 16463"），严格 from_str 会整层 miss——
+    // 失败时用括号配平从参数串中抠出第一个合法对象兜底。
     for tc in &resp.tool_calls {
-        if tc.function.name == "emit_mvu_translation"
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+        if tc.function.name != "emit_mvu_translation" {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
             && let Ok(t) = parse_mvu_from_value(&val, field_schema)
+        {
+            return Ok(t);
+        }
+        if let Some(t) =
+            storyforge_app_agent::llm_parse::try_each_braces(&tc.function.arguments, |candidate| {
+                let val = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
+                // 防截断误抓（2026-07-26 终审 C 项）：候选必须携带至少一个五合一
+                // 顶层键（或已知包装键）。否则截断参数里的完整小嵌套对象（如单个
+                // variable_schema 条目）会被全 default 的 MvuTranslationRaw "成功"
+                // 解析成近空产物（confidence 0.5），绕过空壳判定被静默持久化。
+                let looks_like_translation = val.as_object().is_some_and(|obj| {
+                    [
+                        "variable_schema",
+                        "ui_bindings",
+                        "update_rules",
+                        "interactions",
+                        "fallback_fragments",
+                        "routing",
+                        "result",
+                        "mvu_translation",
+                        "translation",
+                        "data",
+                    ]
+                    .iter()
+                    .any(|k| obj.contains_key(*k))
+                });
+                if !looks_like_translation {
+                    return None;
+                }
+                parse_mvu_from_value(&val, field_schema).ok()
+            })
         {
             return Ok(t);
         }
@@ -178,6 +220,60 @@ fn parse_mvu_from_content(content: &str, field_schema: &[VariableField]) -> Opti
     }
 
     None
+}
+
+#[cfg(test)]
+mod tool_arg_tolerance_tests {
+    use super::*;
+    use storyforge_domain::llm::{ChatResponse, FunctionCall, ToolCall};
+
+    #[test]
+    fn tool_args_with_trailing_garbage_still_parse() {
+        let args = r#"{"variable_schema":[{"key":"hp","label":"生命","value_type":"int","default":100}],"ui_bindings":[],"update_rules":["r1"],"interactions":[],"fallback_fragments":[],"routing":{"kind":"native"},"analysis_confidence":0.8}以上就是翻译结果。"#;
+        let resp = ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_mvu_translation".into(),
+                    arguments: args.into(),
+                },
+            }],
+            usage: None,
+            reasoning_content: None,
+            finish_reason: None,
+        };
+        let t = parse_mvu_translation_from_response(&resp, &[])
+            .expect("尾随垃圾不应导致解析失败");
+        assert_eq!(t.variable_schema.len(), 1);
+        assert_eq!(t.update_rules.len(), 1);
+    }
+
+    #[test]
+    fn truncated_tool_args_fail_instead_of_yielding_near_empty_translation() {
+        // 外层对象被截断未闭合，但内部含一个完整的小对象（单个 variable 字段）。
+        // 括号配平回退不得把它误抓成"合法但近空"的翻译——应整体解析失败走降级。
+        let args = r#"{"variable_schema":[{"key":"hp","label":"生命","value_type":"int","default":100}"#;
+        let resp = ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t2".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "emit_mvu_translation".into(),
+                    arguments: args.into(),
+                },
+            }],
+            usage: None,
+            reasoning_content: None,
+            finish_reason: None,
+        };
+        assert!(
+            parse_mvu_translation_from_response(&resp, &[]).is_err(),
+            "截断参数应解析失败并走降级路径，而不是近空产物"
+        );
+    }
 }
 
 /// 把 JSON Value 解析成 MvuTranslation（字段对齐 domain 结构）

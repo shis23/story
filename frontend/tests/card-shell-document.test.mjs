@@ -109,3 +109,69 @@ test('provides diagnostic compatibility globals so a card reports unavailable fe
 
   assert.equal(await shellWindow.waitGlobalInitialized('Mvu'), shellWindow.Mvu)
 })
+
+test('maps selector variables and MVU writes to the shell persistence bridge', async () => {
+  const script = createCardShellRuntimeCompatibilityScript({
+    selectorVariables: {
+      'message:11': { stat_data: { '主角': { '生命值': 72 } } },
+      'character:current': { status_theme_id: 'parchment' },
+    },
+  })
+  const requests = []
+  const shellWindow = {
+    TavernHelper: {},
+    __sfShellAsk: async (type, payload) => {
+      requests.push({ type, payload })
+      if (type === 'mvu_status') return { ready: true }
+      if (type === 'shell_variables_set') return { ok: true }
+      throw new Error(`unexpected request: ${type}`)
+    },
+  }
+
+  Function('window', script)(shellWindow)
+
+  const messageSelector = { type: 'message', message_id: 11 }
+  assert.deepEqual(shellWindow.getVariables(messageSelector), {
+    stat_data: { '主角': { '生命值': 72 } },
+  })
+  assert.deepEqual(shellWindow.Mvu.getMvuData(messageSelector), {
+    stat_data: { '主角': { '生命值': 72 } },
+  })
+
+  await shellWindow.Mvu.replaceMvuData(
+    { stat_data: { '主角': { '生命值': 99 } } },
+    messageSelector,
+  )
+  await shellWindow.insertOrAssignVariables(
+    { status_theme_id: 'crimson' },
+    { type: 'character' },
+  )
+
+  assert.deepEqual(requests.filter((request) => request.type === 'shell_variables_set'), [
+    {
+      type: 'shell_variables_set',
+      payload: {
+        selector: messageSelector,
+        variables: { stat_data: { '主角': { '生命值': 99 } } },
+        mode: 'replace',
+      },
+    },
+    {
+      type: 'shell_variables_set',
+      payload: {
+        selector: { type: 'character' },
+        variables: { status_theme_id: 'crimson' },
+        mode: 'merge',
+      },
+    },
+  ])
+})
+
+test('encodes persisted selector data before injecting it into a shell script', () => {
+  const script = createCardShellRuntimeCompatibilityScript({
+    selectorVariables: { message: { stat_data: { note: '</script><img src=x>' } } },
+  })
+
+  assert.doesNotMatch(script, /<\/script>/i)
+  assert.match(script, /\\u003c\/script\\u003e/i)
+})

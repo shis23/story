@@ -2169,12 +2169,21 @@ mod tests {
         assert!(constant > 0, "expected constant route entries");
         assert!(selective > 0, "expected selective route entries");
         assert!(both > 0, "expected both-route entries");
-        // Intentional normalization: ST entries marked `disable: true` are
-        // filtered out on import (documented product boundary), so the imported
-        // book must never contain a disabled entry even though the source did.
+        // 2026-07-26 semantics change: ST entries marked `disable: true` (or v3
+        // `enabled: false`) are now RETAINED with `disabled=true` instead of being
+        // dropped — MVU cards store [InitVar]/DLC data in disabled entries and the
+        // card-shell worldbook bridge toggles them at runtime. Injection routes all
+        // check `disabled`, so they still never reach prompts.
         assert!(
-            !book.entries.iter().any(|e| e.disabled),
-            "imported book must not retain disabled entries (filtered by design)"
+            book.entries.iter().any(|e| e.disabled),
+            "imported book must retain disabled entries (marked disabled=true)"
+        );
+        assert!(
+            !book
+                .constant_entries()
+                .iter()
+                .any(|e| e.disabled),
+            "disabled entries must never appear in constant injection"
         );
         assert!(
             book.entries

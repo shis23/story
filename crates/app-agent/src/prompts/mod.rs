@@ -17,8 +17,8 @@ pub use chronicle_compressor::{
     make_chronicle_compressor_config,
 };
 pub use postprocess::{
-    POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, build_postprocess_user_msg_with_summary,
-    make_postprocess_config, register_postprocess_tools,
+    POSTPROCESS_SYSTEM_PROMPT, build_postprocess_user_msg, build_postprocess_user_msg_with_context,
+    build_postprocess_user_msg_with_summary, make_postprocess_config, register_postprocess_tools,
 };
 pub use summarizer::{
     SUMMARIZER_SYSTEM_PROMPT, build_summarizer_user_msg, make_summarizer_config,

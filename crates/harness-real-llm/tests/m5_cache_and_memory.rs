@@ -336,6 +336,7 @@ async fn accept_write_and_summarize(
             &event_tx,
             cancel_rx,
             &[],
+            &[],
         )
         .await;
 

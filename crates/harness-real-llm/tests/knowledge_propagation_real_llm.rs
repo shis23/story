@@ -190,6 +190,7 @@ async fn knowledge_propagation_postprocess_and_writeback_real_llm() {
         cancel_rx,
         Some(&profile),
         None,
+        &[],
     )
     .await
     .expect("postprocess 真实 LLM 调用失败");

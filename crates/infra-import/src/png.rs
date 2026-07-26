@@ -233,6 +233,53 @@ pub fn make_st_card(data: StCharacterData, spec_version: &str) -> StCharacterCar
 mod tests {
     use super::*;
 
+    /// 在占位 PNG 的 IEND 前插入任意 keyword 的 tEXt 块（测试 ccv3-only 卡用）
+    fn placeholder_png_with_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
+        let base = build_placeholder_png();
+        let mut out = Vec::with_capacity(base.len() + text.len() + 64);
+        out.extend_from_slice(&base[..8]);
+        let mut pos = 8usize;
+        while pos + 8 <= base.len() {
+            let length =
+                u32::from_be_bytes([base[pos], base[pos + 1], base[pos + 2], base[pos + 3]])
+                    as usize;
+            let chunk_type = [base[pos + 4], base[pos + 5], base[pos + 6], base[pos + 7]];
+            let total = 4 + 4 + length + 4;
+            if &chunk_type == b"IEND" {
+                let text_data = build_text_chunk(keyword, text);
+                write_chunk(&mut out, b"tEXt", &text_data);
+            }
+            out.extend_from_slice(&base[pos..pos + total]);
+            pos += total;
+            if &chunk_type == b"IEND" {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_import_falls_back_to_ccv3_only_chunk() {
+        // v3-only 卡：PNG 里只有 ccv3 块、无 chara 块（chara_card_v3 规范允许）
+        let card = StCharacterCard {
+            spec: Some("chara_card_v3".into()),
+            spec_version: Some("3.0".into()),
+            data: serde_json::from_value(serde_json::json!({ "name": "V3Only" }))
+                .expect("minimal st data"),
+        };
+        let json_bytes = serde_json::to_vec(&card).unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json_bytes);
+        let png = placeholder_png_with_text_chunk("ccv3", &b64);
+
+        let character = crate::import_character_from_png(&png).expect("ccv3-only 卡应可导入");
+        assert_eq!(character.name, "V3Only");
+        assert_eq!(character.spec_version, "3.0");
+
+        // 无 chara 也无 ccv3 → 仍然 fail-closed
+        let empty = placeholder_png_with_text_chunk("other", "x");
+        assert!(crate::import_character_from_png(&empty).is_err());
+    }
+
     #[test]
     fn test_png_signature_check() {
         let not_png = b"not a png";

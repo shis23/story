@@ -788,6 +788,7 @@ impl SqliteHarnessEnv {
                 &event_tx,
                 cancel_rx.clone(),
                 &[],
+                &[],
             )
             .await;
         // Early-fact probe material is appended to the actual Summarizer output.
@@ -1062,6 +1063,7 @@ impl SqliteHarnessEnv {
                 &ctx,
                 &event_tx,
                 cancel_rx.clone(),
+                &[],
                 &[],
             )
             .await;

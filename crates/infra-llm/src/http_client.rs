@@ -174,11 +174,18 @@ impl HttpLlmClient {
     pub fn new(conn: &LlmConnection) -> Result<Self, LlmError> {
         // 部分兼容网关（Cloudflare）会拦默认 reqwest UA；统一浏览器 UA。
         const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 StoryForge/0.1";
-        // 同步 client：connect timeout 30s + request timeout 120s
+        // 同步 client：connect timeout 30s + request timeout 默认 120s。
+        // 慢中继/深推理模型（一次请求 2-3 分钟）可用 STORYFORGE_LLM_TIMEOUT_SECS 放宽，
+        // 解析失败或未设置时保持 120s 不变。
+        let request_timeout_secs = std::env::var("STORYFORGE_LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(120);
         let client = reqwest::Client::builder()
             .user_agent(UA)
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(|e| LlmError::Internal(format!("构建 reqwest client 失败: {e}")))?;
 

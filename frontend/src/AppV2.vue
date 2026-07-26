@@ -63,6 +63,7 @@ import { useWritingScreenAdapter } from './adapter/useWritingScreenAdapter.js'
 import { useHistoryScreenAdapter } from './adapter/useHistoryScreenAdapter.js'
 import { useOverviewScreenAdapter } from './adapter/useOverviewScreenAdapter.js'
 import ShellAwareContent from './components-v2/st/ShellAwareContent.vue'
+import MvuStatusPanel from './components-v2/st/MvuStatusPanel.vue'
 import {
   useWritingStore,
   useCampaignStore,
@@ -77,6 +78,7 @@ import { useWriting } from './composables/useWriting.js'
 import { useMessageVariants } from './composables/useMessageVariants.js'
 import { useNewCampaignForm } from './composables/useNewCampaignForm.js'
 import { useCharacterImport } from './composables/useCharacterImport.js'
+import { useMvuStatusPanel } from './composables/useMvuStatusPanel.js'
 import {
   getVersion,
   getActiveCampaign,
@@ -95,7 +97,14 @@ import { ST_EVENT_TYPES } from './plugin-bridge.js'
 import { alertDialog } from './components/base/BaseDialog.js'
 import { persistShellVariableWrite, createVariableWriteAudit } from './utils/shellVariableOutbox.js'
 import { findLatestCampaignConversation } from './utils/overviewNavigation.js'
+import { getOpeningShellPresentation } from './utils/cardShellPresentation.js'
 import { shouldShowOpeningShell } from './utils/cardShellPresentation.js'
+import { resolveCardShellManifestTarget } from './utils/cardShellPresentation.js'
+import {
+  buildOpeningChatSeed,
+  resolveOpeningChatSelection,
+} from './utils/cardShellOpeningChat.js'
+import { buildGreetingOptionsFromDetail } from './utils/campaignGreetingOptions.js'
 
 // ─── stores ───
 const writing = useWritingStore()
@@ -187,6 +196,8 @@ function scrollToBottom() {
 // ─── 可见 Card Shell（开场/状态；宿主代持远程）──────────────────────────
 const cardShellStatusUrl = ref(null)
 const cardShellOpeningUrl = ref(null)
+/** Greeting texts for the opening shell's ST chat seed (first_mes + alternates). */
+const cardShellOpeningGreetings = ref([])
 const cardShellLabel = ref('')
 const cardShellLoading = ref(false)
 const cardShellShells = ref([])
@@ -217,6 +228,23 @@ const showCardShellOpening = computed(() => shouldShowOpeningShell({
   messageCount: writing.messages.length,
   isWriting: writing.isWriting,
 }))
+const openingShellPresentation = computed(() => getOpeningShellPresentation(
+  typeof window !== 'undefined' ? window.innerHeight : 900,
+))
+const openingShellChatSeed = computed(() => {
+  if (!showCardShellOpening.value) return null
+  const fromStore = writing.greetingOptions || []
+  const options = (fromStore.length ? fromStore : cardShellOpeningGreetings.value)
+    .map((option) => (typeof option === 'string' ? { content: option } : option))
+  if (!options.length && !cardShellOpeningUrl.value) return null
+  return buildOpeningChatSeed(options, {
+    selectedIndex: writing.selectedGreetingIndex,
+    name: campaign.activeCampaign?.name
+      || campaign.activeCharDetail?.name
+      || campaign.activeChar?.name
+      || 'Assistant',
+  })
+})
 
 // The page-level opening and status surfaces own their slots in the reading
 // layout. Suppress only matching display-content mounts so the same card shell
@@ -232,9 +260,14 @@ provide('storyforgeCardShellLayout', {
 
 async function onShellVarWrite(payload) {
   const campaignId = campaign.activeCampaign?.id || null
-  // Prefer first instance if map has exactly one; else campaign-scoped
+  // 与 MVU 交互分发（useMvuStatusPanel.dispatchMvuInteraction）同判据：
+  // 优先「卡绑定实例恰一个」，回退全 campaign 单实例——两条写入路径的
+  // instance 作用域目标必须一致，否则同一逻辑变量会分裂在两个作用域。
+  const cardBoundIds = mvuStatusSections.value.map((s) => s.instanceId)
   const ids = Object.keys(campaign.instanceNameMap || {})
-  const instanceId = ids.length === 1 ? ids[0] : null
+  const instanceId =
+    (cardBoundIds.length === 1 ? cardBoundIds[0] : null) ||
+    (ids.length === 1 ? ids[0] : null)
   const result = await persistShellVariableWrite({
     campaignId,
     instanceId,
@@ -256,23 +289,30 @@ async function onShellVarWrite(payload) {
 async function refreshCardShellManifest() {
   cardShellStatusUrl.value = null
   cardShellOpeningUrl.value = null
+  cardShellOpeningGreetings.value = []
   cardShellLabel.value = ''
   cardShellShells.value = []
   cardShellThCount.value = 0
   cardShellCharacterId.value = null
-  let characterId =
-    campaign.activeChar?.id ||
-    campaign.activeCharDetail?.id ||
-    campaign.activeCharDetail?.source_character_id ||
-    null
-  // 活动路径：从 card_id 反查 source_character_id
-  if (!characterId && campaign.activeCampaign?.card_id) {
+  const target = resolveCardShellManifestTarget({
+    activeCampaign: campaign.activeCampaign,
+    activeChar: campaign.activeChar,
+    activeCharDetail: campaign.activeCharDetail,
+  })
+  if (!target) return
+  let characterId = target.kind === 'character' ? target.characterId : null
+  // Campaign owns the surface: resolve its card even if a legacy character
+  // remains selected from the preceding workflow.
+  if (target.kind === 'campaign-card') {
     try {
-      const card = await getCard(campaign.activeCampaign.card_id)
+      const card = await getCard(target.cardId)
       characterId = card?.source_character_id || null
+      cardShellOpeningGreetings.value = buildGreetingOptionsFromDetail(card)
     } catch (e) {
       console.error('getCard for shell manifest:', e)
     }
+  } else if (campaign.activeCharDetail) {
+    cardShellOpeningGreetings.value = buildGreetingOptionsFromDetail(campaign.activeCharDetail)
   }
   if (!characterId) return
   cardShellLoading.value = true
@@ -355,6 +395,58 @@ const greeting = useGreeting({
   broadcastChatChanged,
   scrollToBottom,
 })
+
+/**
+ * Destiny home「开始旅程」ends by switching swipe_id and calling
+ * reloadCurrentChat. Apply that selection into StoryForge UI and close the
+ * setup-only opening surface.
+ */
+function onOpeningShellApplied(payload) {
+  const options = (writing.greetingOptions?.length
+    ? writing.greetingOptions
+    : cardShellOpeningGreetings.value)
+  const selection = resolveOpeningChatSelection(payload, options)
+  if (selection.greetingIndex != null && writing.writingMode === 'legacy') {
+    greeting.selectGreeting(selection.greetingIndex)
+  } else if (selection.content) {
+    // Campaign conversations already own message history. Prefer rewriting the
+    // first assistant opening in-place so the chosen scenario is visible now.
+    const messages = writing.messages || []
+    if (messages.length === 1 && messages[0]?.role === 'assistant') {
+      const first = messages[0]
+      const variants = Array.isArray(first.variants) ? first.variants : []
+      if (variants.length) {
+        const active = first.active_variant ?? 0
+        const nextVariants = variants.map((variant, index) => (
+          index === active
+            ? {
+              ...variant,
+              content: selection.content,
+              display_content: selection.content,
+            }
+            : variant
+        ))
+        writing.messages = [{ ...first, variants: nextVariants }]
+      } else {
+        writing.messages = [{
+          ...first,
+          content: selection.content,
+          display_content: selection.content,
+        }]
+      }
+    } else if (messages.length === 0 && writing.writingMode === 'legacy') {
+      writing.messages = [greeting.buildOpeningMessage(selection.content)]
+    }
+    if (selection.greetingIndex != null) {
+      writing.selectedGreetingIndex = selection.greetingIndex
+    }
+    broadcastChatChanged('opening_shell_applied', {
+      greetingIndex: selection.greetingIndex,
+      swipe_id: payload?.swipe_id,
+    })
+  }
+  disarmCardShellOpening()
+}
 
 // 3. conversation —— 会话装配 / 历史 / 打开 / 删除（注入范围外依赖）
 const conversation = useConversation({
@@ -453,6 +545,14 @@ const { openNewCampaignDialog } = newCampaignForm
       handleAddVariant,
       handleSwitchVariant,
     })
+
+  // 9.5 MVU 原生状态面板（after-messages 槽）：ui_bindings 渲染 + interactions 分发
+  const {
+    mvuStatusSections,
+    mvuInteractionMappings,
+    mvuInteractionBusy,
+    dispatchMvuInteraction,
+  } = useMvuStatusPanel({ startWriting })
 
   // 10. history screen adapter —— design/history 纯展示层接线
   const { screenProps: historyScreenProps, screenEvents: historyScreenEvents } =
@@ -600,10 +700,20 @@ onMounted(async () => {
             :url="cardShellOpeningUrl"
             :campaign-id="campaign.activeCampaign?.id || null"
             label="序章"
-            height="760px"
-            :auto-height="true"
+            :height="openingShellPresentation.height"
+            :auto-height="openingShellPresentation.autoHeight"
+            :opening-chat-seed="openingShellChatSeed"
             root-class="overflow-hidden rounded-xl border border-line bg-surface shadow-rise"
             @var-write="onShellVarWrite"
+            @opening-applied="onOpeningShellApplied"
+          />
+        </template>
+        <template #after-messages>
+          <MvuStatusPanel
+            :sections="mvuStatusSections"
+            :interactions="mvuInteractionMappings"
+            :busy="mvuInteractionBusy || writing.isWriting"
+            @interact="dispatchMvuInteraction"
           />
         </template>
       </WritingScreen>
@@ -691,6 +801,7 @@ onMounted(async () => {
         :apply-conversation="applyConversation"
         :broadcast-plugin-event="broadcastPluginEvent"
         :load-conversation-history="loadConversationHistory"
+        :refresh-card-shell-manifest="refreshCardShellManifest"
         :opening-shell-started="armCardShellOpening"
         :alert-dialog="alertDialog"
         @update:show="(v) => { newCampaignForm.showNewCampaignForm.value = v }"

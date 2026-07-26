@@ -52,19 +52,21 @@ pub fn import_character_from_json(data: &[u8]) -> Result<Character, ImportError>
     Ok(Character::from_st_card(card))
 }
 
-/// 从 PNG 文件导入角色卡（提取 tEXt "chara" 块）
+/// 从 PNG 文件导入角色卡（提取 tEXt "chara" 块，无则回退 v3 的 "ccv3" 块）
 pub fn import_character_from_png(data: &[u8]) -> Result<Character, ImportError> {
     let chunks = png::parse_png(data)?;
 
-    // 找 "chara" tEXt 块
-    let chara_text = chunks
-        .iter()
-        .find_map(|c| match c {
-            png::PngChunk::Text { keyword, text } if keyword.eq_ignore_ascii_case("chara") => {
+    // 找 "chara" tEXt 块；v3-only 卡可能只写 "ccv3" 块（chara_card_v3 规范），一并接受
+    let find_text = |wanted: &str| {
+        chunks.iter().find_map(|c| match c {
+            png::PngChunk::Text { keyword, text } if keyword.eq_ignore_ascii_case(wanted) => {
                 Some(text.as_str())
             }
             _ => None,
         })
+    };
+    let chara_text = find_text("chara")
+        .or_else(|| find_text("ccv3"))
         .ok_or(ImportError::NoCharacterData)?;
 
     // Base64 解码 → JSON 解析

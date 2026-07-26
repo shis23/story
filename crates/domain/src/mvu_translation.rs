@@ -352,6 +352,24 @@ fn collect_js_blob(assets: Option<&RenderableAssets>, extensions: &serde_json::V
         blob.push_str(script);
         blob.push('\n');
     }
+    // 新一代卡（命定之诗/卿卿形态）：卡逻辑在 extensions.tavern_helper.scripts，
+    // 只统计启用脚本；不统计会把 TH-only 卡误判为 PureData 并短路跳过 LLM 分析
+    if let Some(scripts) = extensions
+        .get("tavern_helper")
+        .and_then(|v| v.get("scripts"))
+        .and_then(|v| v.as_array())
+    {
+        for s in scripts {
+            let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !enabled {
+                continue;
+            }
+            if let Some(content) = s.get("content").and_then(|v| v.as_str()) {
+                blob.push_str(content);
+                blob.push('\n');
+            }
+        }
+    }
     blob
 }
 

@@ -55,6 +55,17 @@ pub struct StCharacterCard {
     pub data: StCharacterData,
 }
 
+/// 显式 `null` 容忍：野生 ST 导出会写 `"tags": null` 等，`#[serde(default)]`
+/// 只处理字段缺失，处理不了显式 null——用本助手把 null 落回 Default。
+fn null_to_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    let opt = Option::<T>::deserialize(de)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// ST 卡 data 字段
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StCharacterData {
@@ -73,13 +84,13 @@ pub struct StCharacterData {
     pub system_prompt: String,
     #[serde(default)]
     pub post_history_instructions: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tags: Vec<String>,
     #[serde(default)]
     pub creator: String,
     #[serde(default)]
     pub character_version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub alternate_greetings: Vec<String>,
     #[serde(default)]
     pub extensions: serde_json::Value,
@@ -104,7 +115,7 @@ pub struct StWorldInfoBook {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StWorldInfoEntry {
     pub id: Option<i32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub keys: Vec<String>,
     /// Older ST exports use singular `key` instead of `keys`.
     #[serde(default, rename = "key", skip_serializing)]

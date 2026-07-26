@@ -17,6 +17,7 @@ import ProcessTimeline from './ProcessTimeline.vue'
 import ComposerBar from './ComposerBar.vue'
 import EmptyHero from './EmptyHero.vue'
 import GreetingCards from './GreetingCards.vue'
+import { shouldShowEmptyWritingState } from '../../utils/cardShellPresentation.js'
 
 const props = defineProps({
   title: { type: String, default: '' },
@@ -67,8 +68,13 @@ function scrollToBottom() {
 
 defineExpose({ scrollToBottom })
 
-const isEmpty = computed(
-  () => props.messages.length === 0 && !props.isWriting && props.greetingOptions.length === 0,
+const isEmpty = computed(() =>
+  shouldShowEmptyWritingState({
+    showOpening: props.showOpening,
+    messageCount: props.messages.length,
+    isWriting: props.isWriting,
+    greetingCount: props.greetingOptions.length,
+  }),
 )
 
 const showStory = computed(

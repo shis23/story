@@ -83,8 +83,8 @@ impl WorldInfoEntry {
         match (self.constant, self.selective) {
             (true, true) => LoreRoute::Both,
             (true, false) => LoreRoute::Constant,
-            (false, true) => LoreRoute::Selective,
-            (false, false) => LoreRoute::Disabled,
+            // ST 语义：selective=false 只表示无副键过滤；非常驻条目一律按绿灯主键触发
+            (false, _) => LoreRoute::Selective,
         }
     }
 
@@ -142,13 +142,14 @@ fn any_key_matches(query_lower: &str, keys: &[String]) -> bool {
 
 impl WorldInfoBook {
     /// 从 ST 世界书结构转换为领域模型
+    ///
+    /// 禁用条目（v2 `disable:true` / v3 `enabled:false`）**保留**并标记 `disabled=true`，
+    /// 不再丢弃：MVU 卡把 `[InitVar]` 初始变量、DLC 事件等放在禁用条目里当数据用，
+    /// 运行时开关（card-shell worldbook bridge）也需要禁用条目在册才能重新启用。
+    /// 注入路径（constant_entries / triggered_selective_entries / matches_query）均已检查
+    /// `disabled`，禁用条目不会进入提示词。
     pub fn from_st(st: crate::character::StWorldInfoBook) -> Self {
-        let entries = st
-            .entries
-            .into_iter()
-            .filter(|e| !e.disable.unwrap_or(false)) // 过滤禁用条目
-            .map(WorldInfoEntry::from_st)
-            .collect();
+        let entries = st.entries.into_iter().map(WorldInfoEntry::from_st).collect();
 
         Self {
             entries,
@@ -201,15 +202,37 @@ impl WorldInfoEntry {
         let selective = st.selective;
         let position = st.position_as_i32();
 
+        // v2 用 `disable:true`；v3 导出用 `enabled:false`（落在 extra 里，wire 原样保留）
+        let v3_enabled = st
+            .extra
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let disabled = st.disable.unwrap_or(false) || !v3_enabled;
+
         let route = if constant && selective {
             LoreRoute::Both
         } else if constant {
             LoreRoute::Constant
-        } else if selective {
-            LoreRoute::Selective
         } else {
-            LoreRoute::Disabled
+            // ST 语义：selective=false 只表示"无副键过滤"，绿灯条目仍按主键触发。
+            // 旧映射把 (false,false) 判成 Disabled，会让大量普通关键词条目静默死档。
+            LoreRoute::Selective
         };
+
+        // v3 导出把 order 写成 insertion_order、depth 放进 extensions
+        let order = st.order.or_else(|| {
+            st.extra
+                .get("insertion_order")
+                .and_then(serde_json::Value::as_i64)
+                .map(|v| v as i32)
+        });
+        let depth = st.depth.or_else(|| {
+            st.extensions
+                .get("depth")
+                .and_then(serde_json::Value::as_i64)
+                .map(|v| v as i32)
+        });
 
         Self {
             st_id: st.id,
@@ -219,10 +242,10 @@ impl WorldInfoEntry {
             constant,
             selective,
             selective_logic: SelectiveLogic::from(st.selective_logic.unwrap_or(0)),
-            disabled: false,
+            disabled,
             position,
-            depth: st.depth.unwrap_or(2),
-            order: st.order.unwrap_or(100),
+            depth: depth.unwrap_or(2),
+            order: order.unwrap_or(100),
             route,
             extensions: st.extensions,
             extra: st.extra,
@@ -484,5 +507,108 @@ mod tests {
             vec!["both route lore"],
             "Both entries should also remain keyword-triggerable"
         );
+    }
+
+    fn st_entry_from_json(v: serde_json::Value) -> crate::character::StWorldInfoEntry {
+        serde_json::from_value(v).expect("st entry json should parse")
+    }
+
+    #[test]
+    fn from_st_keeps_v3_disabled_entries_as_disabled() {
+        // 卿卿/命定之诗形态：v3 导出用 enabled:false（顶层无 disable 字段）
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![
+                st_entry_from_json(serde_json::json!({
+                    "id": 1,
+                    "keys": [],
+                    "content": "[initvar] 初始变量 YAML",
+                    "constant": false,
+                    "selective": true,
+                    "enabled": false,
+                    "comment": "[initvar]变量初始化勿开"
+                })),
+                st_entry_from_json(serde_json::json!({
+                    "id": 2,
+                    "keys": ["旧版"],
+                    "content": "旧版战斗系统",
+                    "constant": true,
+                    "selective": false,
+                    "enabled": false
+                })),
+                st_entry_from_json(serde_json::json!({
+                    "id": 3,
+                    "keys": ["世界观"],
+                    "content": "active constant",
+                    "constant": true,
+                    "selective": false,
+                    "enabled": true
+                })),
+                st_entry_from_json(serde_json::json!({
+                    "id": 4,
+                    "keys": ["v2旧字段"],
+                    "content": "v2 disable flag",
+                    "constant": true,
+                    "selective": false,
+                    "disable": true
+                })),
+            ],
+            extra: Default::default(),
+        });
+
+        // 全部保留（不再丢弃），禁用位正确
+        assert_eq!(lore.entries.len(), 4);
+        assert!(lore.entries[0].disabled, "v3 enabled:false 应标记 disabled");
+        assert!(lore.entries[1].disabled);
+        assert!(!lore.entries[2].disabled);
+        assert!(lore.entries[3].disabled, "v2 disable:true 仍应生效");
+        // 禁用的 constant 条目不得进入常驻注入
+        assert_eq!(contents(lore.constant_entries()), vec!["active constant"]);
+        // 导出往返：disable 位写回
+        let st = lore.to_st_book();
+        assert_eq!(st.entries[1].disable, Some(true));
+        assert_eq!(st.entries[2].disable, Some(false));
+    }
+
+    #[test]
+    fn from_st_maps_plain_keyword_entries_to_selective_not_dead() {
+        // ST 语义：constant=false && selective=false 的普通关键词条目仍按主键触发
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "id": 9,
+                "keys": ["灯塔"],
+                "content": "plain keyword lore",
+                "constant": false,
+                "selective": false
+            }))],
+            extra: Default::default(),
+        });
+
+        assert_eq!(lore.entries[0].route, LoreRoute::Selective);
+        assert_eq!(
+            contents(lore.triggered_selective_entries("走向灯塔")),
+            vec!["plain keyword lore"]
+        );
+    }
+
+    #[test]
+    fn from_st_reads_v3_insertion_order_and_extensions_depth() {
+        let lore = WorldInfoBook::from_st(crate::character::StWorldInfoBook {
+            entries: vec![st_entry_from_json(serde_json::json!({
+                "id": 5,
+                "keys": ["江离在场激活"],
+                "content": "persona lore",
+                "constant": false,
+                "selective": true,
+                "insertion_order": 7,
+                "position": "before_char",
+                "extensions": { "depth": 3 }
+            }))],
+            extra: Default::default(),
+        });
+
+        let e = &lore.entries[0];
+        assert_eq!(e.order, 7, "v3 insertion_order 应作为 order 读入");
+        assert_eq!(e.depth, 3, "v3 extensions.depth 应作为 depth 读入");
+        assert_eq!(e.position, 0);
     }
 }

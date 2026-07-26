@@ -3,7 +3,11 @@
     可见 Card Shell：独立 iframe 源（srcdoc），allow-scripts only。
     远程 HTML/JS 由宿主代持拉取后注入；jQuery $.load 桥到父窗口 fetch。
   -->
-  <div class="card-shell-host w-full min-h-0 flex flex-col" :class="rootClass">
+  <div
+    class="card-shell-host w-full min-h-0 flex flex-col"
+    :class="rootClass"
+    :style="hostStyle"
+  >
     <div
       v-if="statusLine && (showStatusLine || error)"
       class="shrink-0 px-2 py-1 text-[11px] border-b border-line"
@@ -39,7 +43,9 @@ import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import {
   cardShellFetchUrl,
+  getCampaignVariables,
   listCampaignWorldInfo,
+  setCampaignVariable,
   setCampaignWorldInfoEnabled,
 } from '../tauri-api.js'
 import {
@@ -56,6 +62,17 @@ import {
   resolveCampaignWorldbookEnabledUpdates,
 } from '../utils/cardShellWorldbook.js'
 import { normalizeShellHeight } from '../utils/cardShellPresentation.js'
+import {
+  createCardShellFetchProxyScript,
+  createCardShellMapReadyFallbackScript,
+} from '../utils/cardShellFetchProxy.js'
+import {
+  CARD_SHELL_VARIABLES_KEY,
+  enqueueCardShellVariableMutation,
+  mergeCardShellVariables,
+  readCardShellVariables,
+  updateCardShellVariables,
+} from '../utils/cardShellVariableStore.js'
 import {
   generateBridgeScript,
   createHostHandler,
@@ -77,13 +94,18 @@ const props = defineProps({
   compact: { type: Boolean, default: false },
   /** Let setup-only shells grow to their actual document height. */
   autoHeight: { type: Boolean, default: false },
+  /**
+   * Opening home shells need a ST-compatible first chat message with
+   * `swipes` so「开始旅程」can switch scenario. Status shells leave this null.
+   */
+  openingChatSeed: { type: Object, default: null },
   /** Loading labels are useful in freeform shells but noisy inside a disclosure. */
   showStatusLine: { type: Boolean, default: true },
   /** extra class on root */
   rootClass: { type: String, default: '' },
 })
 
-const emit = defineEmits(['loaded', 'error', 'message', 'var-write'])
+const emit = defineEmits(['loaded', 'error', 'message', 'var-write', 'opening-applied'])
 
 const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
@@ -114,18 +136,36 @@ const inlineModuleSources = new Map()
 let inlineModuleSeq = 0
 let bridgeSessionSeq = 0
 let activeBridgeSession = ''
+let shellSelectorVariables = {}
 
 function nextBridgeSession() {
   bridgeSessionSeq += 1
   return `${shellPluginId}:${Date.now().toString(36)}:${bridgeSessionSeq}`
 }
 
-const iframeStyle = computed(() => ({
-  height: props.autoHeight && measuredHeight.value
-    ? `${measuredHeight.value}px`
-    : props.compact ? props.height || '96px' : props.height,
-  minHeight: props.compact ? '72px' : '120px',
-}))
+const resolvedShellHeight = computed(() => {
+  if (props.autoHeight && measuredHeight.value) return `${measuredHeight.value}px`
+  if (props.compact) return props.height || '96px'
+  return props.height
+})
+
+const hostStyle = computed(() => {
+  if (props.compact || props.autoHeight) return undefined
+  // Opening shells must force the outer host height too; otherwise flex
+  // children with min-h only collapse to the status-line strip in WebView2.
+  return {
+    height: resolvedShellHeight.value,
+    minHeight: resolvedShellHeight.value || '120px',
+  }
+})
+
+const iframeStyle = computed(() => {
+  const resolvedHeight = resolvedShellHeight.value
+  return {
+    height: resolvedHeight,
+    minHeight: props.compact ? '72px' : (props.autoHeight ? '120px' : resolvedHeight || '120px'),
+  }
+})
 
 const statusLine = computed(() => {
   if (error.value) return `壳加载失败：${error.value}`
@@ -167,6 +207,14 @@ function escapeHtml(s) {
 async function hostFetch(url) {
   const res = await cardShellFetchUrl(url)
   if (res.body_text != null) return { kind: 'text', ...res }
+  if (res.cache_url) {
+    return {
+      kind: 'cached-url',
+      cacheUrl: res.cache_url,
+      fallbackMessage: res.fallback_message || null,
+      ...res,
+    }
+  }
   if (res.body_base64) {
     // binary — return as data URL for images etc.
     const ct = res.content_type || 'application/octet-stream'
@@ -177,6 +225,30 @@ async function hostFetch(url) {
     }
   }
   throw new Error('empty shell body')
+}
+
+async function loadShellSelectorVariables() {
+  if (!props.campaignId) return {}
+  const values = await getCampaignVariables(props.campaignId)
+  return readCardShellVariables(values)
+}
+
+async function persistShellSelectorVariables(selector, variables, mode = 'replace') {
+  if (!props.campaignId) {
+    throw new Error('card shell variables require an active Campaign')
+  }
+
+  const next = await enqueueCardShellVariableMutation(props.campaignId, async () => {
+    const values = await getCampaignVariables(props.campaignId)
+    const current = readCardShellVariables(values)
+    const updated = mode === 'merge'
+      ? mergeCardShellVariables(current, selector, variables)
+      : updateCardShellVariables(current, selector, variables)
+    await setCampaignVariable(props.campaignId, CARD_SHELL_VARIABLES_KEY, updated)
+    return updated
+  })
+  shellSelectorVariables = next
+  return { ok: true }
 }
 
 function shellWorldbookName() {
@@ -269,11 +341,17 @@ async function rewriteModuleScriptsInHtml(html, pageUrl) {
   return parts.join('')
 }
 
-async function prepareShellDocument(html, pageUrl, bridgeSession) {
+async function prepareShellDocument(html, pageUrl, bridgeSession, selectorVariables, openingChatSeed) {
   // Remote card pages commonly ask `window.top.TavernHelper` for ST state.
   // The shell intentionally has an opaque sandbox origin, so route only the
   // known compatibility globals to its own plugin-bridge surface.
-  const wrapped = wrapRemoteHtml(rewriteCardShellTopBridgeAccess(html), pageUrl, bridgeSession)
+  const wrapped = wrapRemoteHtml(
+    rewriteCardShellTopBridgeAccess(html),
+    pageUrl,
+    bridgeSession,
+    selectorVariables,
+    openingChatSeed,
+  )
   try {
     return await rewriteModuleScriptsInHtml(wrapped, pageUrl)
   } catch (e) {
@@ -282,7 +360,7 @@ async function prepareShellDocument(html, pageUrl, bridgeSession) {
   }
 }
 
-function wrapRemoteHtml(html, pageUrl, bridgeSession) {
+function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, openingChatSeed = null) {
   // Inject bridge + ST-like globals. Shells may be full docs or head+body fragments (no <html>).
   const sOpen = '<' + 'script>'
   const sClose = '</' + 'script>'
@@ -295,6 +373,12 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
   const baseTag = baseHref ? `<base href="${baseHref}">` : ''
   const pageJson = JSON.stringify(pageUrl || '')
   const bridgeSessionJson = JSON.stringify(bridgeSession || '')
+  const openingChatSeedJson = JSON.stringify(openingChatSeed && typeof openingChatSeed === 'object'
+    ? openingChatSeed
+    : null)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
 
   // Bridge as string joins so regex escapes are not corrupted by template literals.
   const bridgeLines = [
@@ -477,11 +561,60 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
     "  obs.observe(document.documentElement, { childList: true, subtree: true });",
     "  var n = 0; var t = setInterval(function(){ if (patch$() || ++n > 40) clearInterval(t); }, 100);",
     "  // ST free APIs come from generateBridgeScript (plugin-bridge). Do not reimplement here.",
-"  try {",
-"    if (window.SillyTavern && Array.isArray(window.SillyTavern.chat) && window.SillyTavern.chat.length === 0) {",
-"      window.SillyTavern.chat.push({ name: 'Assistant', mes: '', message: '', is_user: false });",
+"  var OPENING_CHAT_SEED = " + openingChatSeedJson + ";",
+"  function seedOpeningChat(){",
+"    if (!OPENING_CHAT_SEED || !window.SillyTavern) return;",
+"    var chat = window.SillyTavern.chat;",
+"    if (!Array.isArray(chat)) {",
+"      chat = [];",
+"      try { window.SillyTavern.chat = chat; } catch (eChat) {}",
 "    }",
-"  } catch (eSeed) {}",
+"    var seed = OPENING_CHAT_SEED;",
+"    var entry = {",
+"      name: seed.name || 'Assistant',",
+"      is_user: false,",
+"      is_name: true,",
+"      mes: seed.mes || '',",
+"      message: seed.message || seed.mes || '',",
+"      swipe_id: (typeof seed.swipe_id === 'number') ? seed.swipe_id : -1,",
+"      swipes: Array.isArray(seed.swipes) ? seed.swipes.slice() : [seed.mes || '']",
+"    };",
+"    if (chat.length === 0) chat.push(entry);",
+"    else {",
+"      // Preserve any host-hydrated chat body, but always ensure swipes exist so",
+"      // Destiny's「开始旅程」can switch scenario instead of no-oping.",
+"      var first = chat[0] || {};",
+"      if (!Array.isArray(first.swipes) || !first.swipes.length) first.swipes = entry.swipes.slice();",
+"      if (typeof first.swipe_id !== 'number') first.swipe_id = entry.swipe_id;",
+"      if (!first.mes && entry.mes) first.mes = entry.mes;",
+"      if (!first.message && entry.message) first.message = entry.message;",
+"      chat[0] = first;",
+"    }",
+"  }",
+"  function installOpeningReloadHook(){",
+"    if (!OPENING_CHAT_SEED || !window.SillyTavern) return;",
+"    if (window.SillyTavern.__sfOpeningReloadHooked) return;",
+"    window.SillyTavern.__sfOpeningReloadHooked = true;",
+"    var prevReload = typeof window.SillyTavern.reloadCurrentChat === 'function'",
+"      ? window.SillyTavern.reloadCurrentChat.bind(window.SillyTavern)",
+"      : null;",
+"    window.SillyTavern.reloadCurrentChat = async function(){",
+"      try {",
+"        var first = (window.SillyTavern.chat && window.SillyTavern.chat[0]) || {};",
+"        await ask('opening_chat_applied', {",
+"          swipe_id: first.swipe_id,",
+"          mes: first.mes || first.message || '',",
+"          swipes: Array.isArray(first.swipes) ? first.swipes : []",
+"        });",
+"      } catch (err) {",
+"        console.error('[CardShell] opening_chat_applied failed', err);",
+"        throw err;",
+"      }",
+"      if (prevReload) return prevReload();",
+"      return true;",
+"    };",
+"  }",
+"  try { seedOpeningChat(); installOpeningReloadHook(); } catch (eSeed) {}",
 "})();",
   ]
   const preloadLines = [
@@ -558,23 +691,7 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
     "  });",
     "})();",
   ]
-  const fetchPatchLines = [
-    "(function(){",
-    "  var nativeFetch = window.fetch ? window.fetch.bind(window) : null;",
-    "  window.fetch = function(input, init){",
-    "    try {",
-    "      var url = (typeof input === 'string') ? input : (input && input.url);",
-    "      if (url && (String(url).indexOf('http://') === 0 || String(url).indexOf('https://') === 0)) {",
-    "        return window.__sfHostFetchText(String(url)).then(function(text){",
-    "          return new Response(text, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });",
-    "        });",
-    "      }",
-    "    } catch (e) {}",
-    "    if (nativeFetch) return nativeFetch(input, init);",
-    "    return Promise.reject(new Error('fetch unavailable'));",
-    "  };",
-    "})();",
-  ]
+  const fetchPatchLines = [createCardShellFetchProxyScript()]
 
   // The sandboxed blob iframe cannot be measured from its parent. Report its
   // document height over the existing session-bound shell bridge instead.
@@ -605,9 +722,11 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession) {
     sOpen + bridgeLines.join('\n') + sClose +
     sOpen + createCardShellRuntimeCompatibilityScript({
       worldbookName: props.campaignId ? `storyforge:campaign:${props.campaignId}` : '',
+      selectorVariables,
     }) + sClose +
     sOpen + preloadLines.join('\n') + sClose +
     sOpen + fetchPatchLines.join('\n') + sClose +
+    sOpen + createCardShellMapReadyFallbackScript() + sClose +
     sOpen + resizeReporterLines.join('\n') + sClose
 
   let doc = html || ''
@@ -649,18 +768,32 @@ async function loadShell() {
   loadedUrl.value = null
   loading.value = true
   try {
+    shellSelectorVariables = await loadShellSelectorVariables()
+    if (seq !== loadSeq) return
     if (props.url) {
       const res = await hostFetch(props.url)
       if (seq !== loadSeq) return
       if (res.kind !== 'text' || res.body_text == null) {
         throw new Error('远程壳不是文本 HTML: ' + (res.content_type || ''))
       }
-      const wrapped = await prepareShellDocument(res.body_text, props.url, bridgeSession)
+      const wrapped = await prepareShellDocument(
+        res.body_text,
+        props.url,
+        bridgeSession,
+        shellSelectorVariables,
+        props.openingChatSeed,
+      )
       setFrameHtml(wrapped)
       loadedUrl.value = props.url
       emit('loaded', { url: props.url, fromCache: res.from_cache })
     } else if (props.html) {
-      const wrapped = await prepareShellDocument(props.html, null, bridgeSession)
+      const wrapped = await prepareShellDocument(
+        props.html,
+        null,
+        bridgeSession,
+        shellSelectorVariables,
+        props.openingChatSeed,
+      )
       setFrameHtml(wrapped)
       loadedUrl.value = '(inline)'
       emit('loaded', { url: null, inline: true })
@@ -748,6 +881,9 @@ async function onBridgeMessage(ev) {
     if (type === 'fetch_data_url') {
       const res = await hostFetch(payload.url)
       if (res.kind === 'binary') reply(res.dataUrl)
+      else if (res.kind === 'cached-url') {
+        reply({ cacheUrl: res.cacheUrl, fallbackMessage: res.fallbackMessage || null })
+      }
       else if (res.body_text != null) {
         // text as data url
         reply(
@@ -763,6 +899,21 @@ async function onBridgeMessage(ev) {
     }
     if (type === 'campaign_worldbook_update') {
       reply(await updateCampaignWorldbookForShell(payload.name, payload.entries))
+      return
+    }
+    if (type === 'shell_variables_set') {
+      reply(await persistShellSelectorVariables(payload.selector, payload.variables, payload.mode))
+      return
+    }
+    if (type === 'opening_chat_applied') {
+      // Destiny home finishes setup by switching swipe + reloadCurrentChat.
+      // Surface that selection to the host so Campaign/legacy can apply it.
+      emit('opening-applied', {
+        swipe_id: payload.swipe_id,
+        mes: payload.mes || '',
+        swipes: Array.isArray(payload.swipes) ? payload.swipes : [],
+      })
+      reply({ ok: true })
       return
     }
     if (type === 'mvu_status') {
@@ -785,10 +936,11 @@ async function onBridgeMessage(ev) {
 }
 
 watch(
-  () => [props.url, props.html, props.campaignId],
+  () => [props.url, props.html, props.campaignId, props.openingChatSeed],
   () => {
     loadShell()
   },
+  { deep: true },
 )
 
 onMounted(() => {

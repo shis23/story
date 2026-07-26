@@ -42,10 +42,12 @@ describe('NewCampaignForm opening handoff', () => {
 
   it('arms the opening shell when a new Campaign creates its first conversation', async () => {
     const openingShellStarted = vi.fn()
+    const refreshCardShellManifest = vi.fn()
     const wrapper = mount(NewCampaignForm, {
       props: {
         show: false,
         openingShellStarted,
+        refreshCardShellManifest,
         loadInstanceNameMap: vi.fn(),
         applyConversation: vi.fn(),
         broadcastPluginEvent: vi.fn(),
@@ -68,6 +70,10 @@ describe('NewCampaignForm opening handoff', () => {
     await flushPromises()
 
     expect(openingShellStarted).toHaveBeenCalledWith('conversation-1')
+    expect(refreshCardShellManifest).toHaveBeenCalledTimes(1)
+    expect(refreshCardShellManifest.mock.invocationCallOrder[0]).toBeLessThan(
+      openingShellStarted.mock.invocationCallOrder[0],
+    )
     wrapper.unmount()
   })
 })

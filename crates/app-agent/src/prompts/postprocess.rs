@@ -44,6 +44,7 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 
 【任务二：变量更新】
 根据成文里发生的事，更新角色变量（hp/state/location/mood 等）或全局变量（story_clock/weather/world_state）。只输出真正发生了变化的字段。全局变量（无 instance_id）用于 story_clock 推进、天气变化、大势扭转等。
+如果用户消息里提供了【卡片变量更新规则】，那是这张卡翻译出的玩法规则（好感度增减条件、状态切换门槛等）。生成 variable_updates 时逐条对照：成文中出现了某条规则描述的触发情形，就按该规则计算对应变量的新值。规则与成文事实冲突时以成文为准；成文没有触发的规则不要凭空执行。
 
 【任务三：任务/伏笔更新】
 - 如果成文里新埋了伏笔或新出现了长期目标（如"老王说要三个月后复仇"），抽成新任务，trigger 用 event（事件描述）。
@@ -166,6 +167,72 @@ pub fn build_postprocess_user_msg_with_summary(
     story_clock: &str,
     recent_summary_block: Option<&str>,
 ) -> String {
+    build_postprocess_user_msg_with_context(
+        final_text,
+        present_characters,
+        variable_keys,
+        turn,
+        story_clock,
+        recent_summary_block,
+        &[],
+    )
+}
+
+/// MVU 规则注入预算：条数 / 单条字符 / 总字符上限。
+/// 卿卿级别的卡翻译出 40+ 条规则，预算按其 2 倍余量设定；超限截断并附说明。
+const MVU_RULES_MAX_COUNT: usize = 80;
+const MVU_RULES_MAX_CHARS_PER_RULE: usize = 400;
+const MVU_RULES_MAX_TOTAL_CHARS: usize = 12_000;
+
+/// 渲染【卡片变量更新规则】区块（去重 + 预算截断）。空输入返回 None。
+fn render_mvu_update_rules_block(rules: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut total_chars = 0usize;
+    let mut dropped = 0usize;
+    for rule in rules {
+        let trimmed = rule.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        if lines.len() >= MVU_RULES_MAX_COUNT || total_chars >= MVU_RULES_MAX_TOTAL_CHARS {
+            dropped += 1;
+            continue;
+        }
+        let clipped: String = if trimmed.chars().count() > MVU_RULES_MAX_CHARS_PER_RULE {
+            let mut s: String = trimmed.chars().take(MVU_RULES_MAX_CHARS_PER_RULE).collect();
+            s.push_str("……（截断）");
+            s
+        } else {
+            trimmed.to_string()
+        };
+        total_chars += clipped.chars().count();
+        lines.push(format!("- {clipped}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    if dropped > 0 {
+        lines.push(format!("（另有 {dropped} 条规则因预算截断未列出）"));
+    }
+    Some(format!(
+        "【卡片变量更新规则】\n{}\n（以上是这张卡翻译出的玩法规则。生成 variable_updates 时逐条对照，成文触发了哪条就按哪条计算变量新值。）",
+        lines.join("\n")
+    ))
+}
+
+/// 同 `build_postprocess_user_msg_with_summary`，可附加卡片翻译出的 MVU 变量更新规则
+/// （`MvuTranslation.update_rules`，由 tauri-app 从 CampaignStore 按在场角色收集）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_postprocess_user_msg_with_context(
+    final_text: &str,
+    present_characters: &[String],
+    variable_keys: &[String],
+    turn: u32,
+    story_clock: &str,
+    recent_summary_block: Option<&str>,
+    mvu_update_rules: &[String],
+) -> String {
     let mut parts = Vec::new();
     parts.push(format!(
         "【当前轮次】第 {turn} 轮（故事时间：{story_clock}）"
@@ -180,6 +247,9 @@ pub fn build_postprocess_user_msg_with_summary(
     ));
     if !variable_keys.is_empty() {
         parts.push(format!("【可更新变量】{}", variable_keys.join(", ")));
+    }
+    if let Some(block) = render_mvu_update_rules_block(mvu_update_rules) {
+        parts.push(block);
     }
     if let Some(block) = recent_summary_block
         .map(str::trim)
@@ -316,6 +386,84 @@ mod tests {
         assert!(msg.contains("林医生、陈警官"));
         assert!(msg.contains("hp, state"));
         assert!(msg.contains("林医生走进急诊室"));
+    }
+
+    #[test]
+    fn test_build_user_msg_with_context_includes_mvu_rules_block() {
+        let msg = build_postprocess_user_msg_with_context(
+            "江离递来一杯茶",
+            &["江离".to_string()],
+            &["好感度".to_string()],
+            3,
+            "第2天",
+            None,
+            &[
+                "角色赠送礼物或表达关心时，该角色好感度 +5".to_string(),
+                "  角色赠送礼物或表达关心时，该角色好感度 +5  ".to_string(), // 去重（含空白差异）
+                "主角受到攻击时 hp 按伤害值扣减".to_string(),
+            ],
+        );
+        assert!(msg.contains("【卡片变量更新规则】"));
+        assert!(msg.contains("- 角色赠送礼物或表达关心时，该角色好感度 +5"));
+        assert!(msg.contains("- 主角受到攻击时 hp 按伤害值扣减"));
+        assert_eq!(
+            msg.matches("好感度 +5").count(),
+            1,
+            "重复规则应去重只出现一次"
+        );
+        // 规则块应出现在成文之前（规则是读成文时的对照表）
+        let rules_pos = msg.find("【卡片变量更新规则】").unwrap();
+        let text_pos = msg.find("【本轮成文】").unwrap();
+        assert!(rules_pos < text_pos);
+    }
+
+    #[test]
+    fn test_build_user_msg_without_rules_has_no_rules_block() {
+        let msg = build_postprocess_user_msg_with_context(
+            "成文",
+            &["角色A".to_string()],
+            &["hp".to_string()],
+            1,
+            "第1天",
+            None,
+            &[],
+        );
+        assert!(!msg.contains("【卡片变量更新规则】"));
+        // 与旧签名保持字节级一致（回归保护：无规则时输出不变）
+        let legacy = build_postprocess_user_msg_with_summary(
+            "成文",
+            &["角色A".to_string()],
+            &["hp".to_string()],
+            1,
+            "第1天",
+            None,
+        );
+        assert_eq!(msg, legacy);
+    }
+
+    #[test]
+    fn test_mvu_rules_block_budget_truncation() {
+        // 超出条数预算：只保留前 MVU_RULES_MAX_COUNT 条并附截断说明
+        let rules: Vec<String> = (0..100).map(|i| format!("规则编号{i}：某条件触发")).collect();
+        let block = render_mvu_update_rules_block(&rules).expect("非空规则应产出区块");
+        assert!(block.contains("规则编号0"));
+        assert!(block.contains("规则编号79"));
+        assert!(!block.contains("规则编号80："));
+        assert!(block.contains("因预算截断未列出"));
+
+        // 单条超长：按字符截断
+        let long_rule = vec!["长".repeat(500)];
+        let block = render_mvu_update_rules_block(&long_rule).unwrap();
+        assert!(block.contains("……（截断）"));
+
+        // 全空白输入：无区块
+        assert!(render_mvu_update_rules_block(&["  ".to_string()]).is_none());
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_mvu_rules() {
+        // 系统提示词必须告诉 Agent 如何对待【卡片变量更新规则】区块
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("【卡片变量更新规则】"));
     }
 
     #[test]

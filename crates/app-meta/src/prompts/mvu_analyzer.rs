@@ -31,6 +31,17 @@ pub const MVU_ANALYZER_SYSTEM_PROMPT: &str = r#"你是卡内状态栏分析助�
 2. 翻译 = 把卡里的 JS 逻辑转成 tool-call 描述，不是抄 JS
 3. 元素级混合：对每个元素独立判断"能翻译/不能翻译"，不强制全卡统一。简单元素全部翻译（零 JS），复杂元素部分翻译部分兜底
 
+【新一代卡形态（重要）】
+很多卡不把变量放 extensions.mvu，而是：
+- 初始变量在世界书 [InitVar] 条目（YAML/JSON 树，常为禁用态当数据用，属正常）
+- 更新规则在世界书 [mvu_update] 条目（自然语言，指导模型输出 <UpdateVariable>/JSONPatch）
+- 在场/分阶段人设用 EJS 控制器（<% getvar('stat_data.….是否在场') %>、好感度阈值分段拉取人设条目）
+- 变量引擎是远程 MagVarUpdate 框架（tavern_helper 一行 import），字段 schema 可能在远程 Zod 模块
+对这类卡的翻译要求：
+- variable_schema 从 [InitVar] 树 + 开场白 <UpdateVariable> 种子推导，保持原变量路径层级（如 stat_data.女性角色.某人.好感度），value_type 按值形态判断
+- EJS 控制器翻译为 update_rules（写明变量、阈值区间、各区间效果），不要把 EJS 源码留在产物里
+- 远程框架本身不翻译（在 notes 里注明依赖）；只翻译卡专属逻辑
+
 【五合一产物】
 | 产物 | 字段 | 作用 |
 |------|------|------|
@@ -100,7 +111,10 @@ pub fn make_mvu_analyzer_config() -> AgentConfig {
         max_tool_rounds: 8,
         model: "deepseek-chat".to_string(),
         tools: vec![],
-        terminal_tools: vec![],
+        // emit_mvu_translation 是"声明任务完成"型工具，必须终止循环：
+        // 否则模型早期成功提交后循环继续空转，最终响应只剩一句"已完成"，
+        // 解析器 5 层兜底全 miss → 静默降级空壳（2026-07-26 真实验收抓获）
+        terminal_tools: vec!["emit_mvu_translation".into()],
     }
 }
 
@@ -176,12 +190,215 @@ pub fn build_mvu_analyzer_user_msg(
         truncate_for_prompt(&ext_str, 8000)
     ));
 
+    // 新一代卡（命定之诗/卿卿形态）：变量与规则藏在世界书 / tavern_helper / regex / 开场白里
+    if let Some(section) = build_worldbook_variable_section(card) {
+        parts.push(section);
+    }
+    if let Some(section) = build_worldbook_ejs_section(card) {
+        parts.push(section);
+    }
+    if let Some(section) = build_tavern_helper_section(card) {
+        parts.push(section);
+    }
+    if let Some(section) = build_regex_summary_section(card) {
+        parts.push(section);
+    }
+    if let Some(section) = build_greeting_seed_section(card) {
+        parts.push(section);
+    }
+
     parts.push(
         "请按指定 JSON 格式输出 MvuTranslation（调用 emit_mvu_translation 或直接输出 JSON）。"
             .into(),
     );
 
     parts.join("\n\n")
+}
+
+/// 世界书条目的 comment（ST 存在 entry-level `comment` 字段，落在 extra 里）
+fn entry_comment(entry: &storyforge_domain::world_info::WorldInfoEntry) -> String {
+    entry
+        .extra
+        .get("comment")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(无标题)")
+        .to_string()
+}
+
+/// 世界书里的变量条目（[InitVar] 初始值 / [mvu_update] 规则 / stat_data 引用）。
+/// 禁用条目也要收——MVU 卡的 [InitVar] 约定就是 enabled=false 当数据用。
+fn build_worldbook_variable_section(card: &Character) -> Option<String> {
+    let book = card.embedded_world_info.as_ref()?;
+    let mut out = String::from(
+        "【世界书变量条目（[InitVar]=初始变量数据（常为禁用态，属正常）；[mvu_update]=更新规则；请翻译进 variable_schema / update_rules）】\n",
+    );
+    let mut budget = 14_000usize;
+    let mut hit = false;
+    for entry in &book.entries {
+        let comment = entry_comment(entry);
+        let c_lower = comment.to_lowercase();
+        let is_var_entry = c_lower.contains("initvar")
+            || c_lower.contains("mvu")
+            || comment.contains("变量")
+            || entry.content.contains("UpdateVariable")
+            || entry.content.contains("stat_data") && comment.contains("规则");
+        if !is_var_entry || budget == 0 {
+            continue;
+        }
+        let body = truncate_for_prompt(&entry.content, 4000.min(budget));
+        budget = budget.saturating_sub(body.chars().count());
+        out.push_str(&format!(
+            "--- {}（{}{}）---\n{}\n",
+            comment,
+            if entry.disabled { "禁用/数据态" } else { "启用" },
+            if entry.constant { "，常驻" } else { "" },
+            body
+        ));
+        hit = true;
+    }
+    hit.then_some(out)
+}
+
+/// 世界书里的 EJS 控制器（<% %>：在场门控 / 好感度分阶段人设等）。
+/// 这些是用提示词模板手写的"变量驱动人设路由"，请翻译成 update_rules +
+/// variable_schema（如 是否在场 / 好感度 阶段阈值），不要原样保留 EJS。
+fn build_worldbook_ejs_section(card: &Character) -> Option<String> {
+    let book = card.embedded_world_info.as_ref()?;
+    let mut out = String::from(
+        "【世界书 EJS 控制器（变量驱动的在场/分阶段门控，请翻译为 variable_schema + update_rules，说明各阈值区间）】\n",
+    );
+    let mut budget = 12_000usize;
+    let mut count = 0usize;
+    for entry in &book.entries {
+        if !entry.content.contains("<%") || budget == 0 || count >= 25 {
+            continue;
+        }
+        let body = truncate_for_prompt(&entry.content, 1500.min(budget));
+        budget = budget.saturating_sub(body.chars().count());
+        out.push_str(&format!("--- {} ---\n{}\n", entry_comment(entry), body));
+        count += 1;
+    }
+    (count > 0).then_some(out)
+}
+
+/// tavern_helper 脚本清单（同名多版本按"启用优先"去重；短脚本给全文，长脚本给头部）
+fn build_tavern_helper_section(card: &Character) -> Option<String> {
+    let scripts = card
+        .extensions
+        .get("tavern_helper")
+        .and_then(|v| v.get("scripts"))
+        .and_then(|v| v.as_array())?;
+    if scripts.is_empty() {
+        return None;
+    }
+    // 去重：同名脚本保留启用版（卡内常带历史版本）
+    let mut chosen: Vec<(&serde_json::Value, bool)> = Vec::new();
+    for s in scripts {
+        let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        if let Some(existing) = chosen.iter_mut().find(|(e, _)| {
+            e.get("name").and_then(|v| v.as_str()).unwrap_or("") == name
+        }) {
+            if enabled && !existing.1 {
+                *existing = (s, enabled);
+            }
+        } else {
+            chosen.push((s, enabled));
+        }
+    }
+    let mut out = String::from(
+        "【tavern_helper 脚本（远程 import = 依赖框架，如 MagVarUpdate=MVU 变量引擎、mvu_zod=Zod schema；内联 = 卡自带逻辑）】\n",
+    );
+    for (s, enabled) in chosen.into_iter().take(16) {
+        let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("(未命名)");
+        let content = s.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let shown = if content.chars().count() <= 600 {
+            content.to_string()
+        } else {
+            format!(
+                "{}\n……（共 {} 字符，仅展示头部）",
+                content.chars().take(600).collect::<String>(),
+                content.chars().count()
+            )
+        };
+        out.push_str(&format!(
+            "--- {}（{}）---\n{}\n",
+            name,
+            if enabled { "启用" } else { "禁用" },
+            shown
+        ));
+    }
+    Some(out)
+}
+
+/// regex 界面脚本摘要（只给元数据与标记，不给巨型 HTML 正文）
+fn build_regex_summary_section(card: &Character) -> Option<String> {
+    let scripts = card
+        .extensions
+        .get("regex_scripts")
+        .and_then(|v| v.as_array())?;
+    if scripts.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "【regex 界面脚本摘要（状态栏/开局/战斗等 UI；含 Mvu/_.set 标记的界面读写变量，供 ui_bindings/interactions 判断）】\n",
+    );
+    for s in scripts.iter().take(24) {
+        let name = s.get("scriptName").and_then(|v| v.as_str()).unwrap_or("");
+        let disabled = s.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let find = s.get("findRegex").and_then(|v| v.as_str()).unwrap_or("");
+        let replace = s.get("replaceString").and_then(|v| v.as_str()).unwrap_or("");
+        let markers: Vec<&str> = [
+            "<script", "<style", "Mvu", "_.set", "getvar", "triggerSlash",
+        ]
+        .into_iter()
+        .filter(|m| replace.contains(*m))
+        .collect();
+        out.push_str(&format!(
+            "- {}（{}）find={} 替换体 {} 字符{}\n",
+            name,
+            if disabled { "禁用" } else { "启用" },
+            find.chars().take(60).collect::<String>(),
+            replace.chars().count(),
+            if markers.is_empty() {
+                String::new()
+            } else {
+                format!("，含标记: {}", markers.join(","))
+            }
+        ));
+    }
+    Some(out)
+}
+
+/// 开场白里的 <UpdateVariable> 初始状态种子（schema 的直接证据）
+fn build_greeting_seed_section(card: &Character) -> Option<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut sources: Vec<&str> = vec![card.first_mes.as_str()];
+    sources.extend(card.alternate_greetings.iter().map(|s| s.as_str()));
+    for text in sources {
+        let mut rest = text;
+        while let Some(start) = rest.find("<UpdateVariable>") {
+            let Some(end_rel) = rest[start..].find("</UpdateVariable>") else {
+                break;
+            };
+            let block = &rest[start..start + end_rel + "</UpdateVariable>".len()];
+            blocks.push(truncate_for_prompt(block, 3000));
+            rest = &rest[start + end_rel..];
+            if blocks.len() >= 3 {
+                break;
+            }
+        }
+        if blocks.len() >= 3 {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "【开场白初始变量种子（<UpdateVariable> 块，变量树/字段名的直接证据，请对齐 variable_schema）】\n{}",
+        blocks.join("\n---\n")
+    ))
 }
 
 /// 注册 MVU 分析 Agent 的工具
@@ -301,5 +518,101 @@ mod tests {
         let t = truncate_for_prompt(&s, 100);
         assert!(t.contains("省略"));
         assert!(t.len() < s.len());
+    }
+
+    /// 卿卿/命定之诗形态的迷你卡：变量在世界书，逻辑在 tavern_helper，UI 在 regex
+    fn make_new_generation_card() -> Character {
+        use storyforge_domain::world_info::WorldInfoBook;
+        let st_book: storyforge_domain::character::StWorldInfoBook = serde_json::from_value(
+            serde_json::json!({
+                "entries": [
+                    {
+                        "id": 1, "keys": [], "content": "主角:\n  好感度: 0\n  是否在场: false",
+                        "constant": false, "selective": true, "enabled": false,
+                        "comment": "[initvar]变量初始化勿开"
+                    },
+                    {
+                        "id": 2, "keys": [], "content": "每轮按剧情输出 <UpdateVariable> JSONPatch 更新 stat_data",
+                        "constant": true, "selective": false, "enabled": true,
+                        "comment": "[mvu_update]变量更新规则"
+                    },
+                    {
+                        "id": 3, "keys": [], "content": "<%_ var g = getvar('stat_data.主角.好感度', {defaults:0}); if (g >= 76) { _%><%- await getwi(null, '阶段04') %><%_ } _%>",
+                        "constant": true, "selective": false, "enabled": true,
+                        "comment": "某角色_分阶段人设"
+                    }
+                ]
+            }),
+        )
+        .expect("st book json");
+        let mut card = make_card();
+        card.embedded_world_info = Some(WorldInfoBook::from_st(st_book));
+        card.renderable_assets = None;
+        card.first_mes = "开场<UpdateVariable>{\"主角\":{\"好感度\":5}}</UpdateVariable>白".into();
+        card.extensions = serde_json::json!({
+            "tavern_helper": { "scripts": [
+                {"name": "MVUbeta", "enabled": true, "content": "import 'https://cdn.example/MagVarUpdate/bundle.js'"},
+                {"name": "战斗", "enabled": false, "content": "old version"},
+                {"name": "战斗", "enabled": true, "content": "new version"}
+            ]},
+            "regex_scripts": [
+                {"scriptName": "状态栏", "disabled": false, "findRegex": "<StatusPlaceHolderImpl/>",
+                 "replaceString": "<div><script>Mvu.getMvuData()</script></div>", "placement": [2]}
+            ]
+        });
+        card
+    }
+
+    #[test]
+    fn test_user_msg_includes_worldbook_th_regex_and_greeting_sections() {
+        let card = make_new_generation_card();
+        let report = storyforge_domain::mvu_translation::score_card_complexity(
+            card.renderable_assets.as_ref(),
+            &card.extensions,
+        );
+        let msg = build_mvu_analyzer_user_msg(&card, &report, &[]);
+
+        // 世界书变量条目：禁用的 [initvar] 也要在场
+        assert!(msg.contains("世界书变量条目"));
+        assert!(msg.contains("[initvar]变量初始化勿开"));
+        assert!(msg.contains("好感度: 0"));
+        assert!(msg.contains("[mvu_update]变量更新规则"));
+        // EJS 控制器
+        assert!(msg.contains("世界书 EJS 控制器"));
+        assert!(msg.contains("某角色_分阶段人设"));
+        // tavern_helper：同名脚本按启用版去重（只查 TH 区块，extensions 原样转储区不受影响）
+        let th_start = msg.find("【tavern_helper 脚本").expect("应有 TH 区块");
+        let th_section = &msg[th_start..];
+        let th_section = &th_section[..th_section[3..]
+            .find("【")
+            .map(|i| i + 3)
+            .unwrap_or(th_section.len())];
+        assert!(th_section.contains("MagVarUpdate"));
+        assert!(th_section.contains("new version"));
+        assert!(
+            !th_section.contains("old version"),
+            "同名禁用旧版应被启用版去重"
+        );
+        // regex 摘要：给标记不给正文
+        assert!(msg.contains("regex 界面脚本摘要"));
+        assert!(msg.contains("状态栏"));
+        // 开场白种子
+        assert!(msg.contains("开场白初始变量种子"));
+        assert!(msg.contains("好感度\":5"));
+    }
+
+    #[test]
+    fn test_th_only_card_is_not_pure_data() {
+        // 卡逻辑只在 tavern_helper 时不得短路成 PureData
+        let card = make_new_generation_card();
+        let report = storyforge_domain::mvu_translation::score_card_complexity(
+            card.renderable_assets.as_ref(),
+            &card.extensions,
+        );
+        assert_ne!(
+            report.classification,
+            storyforge_domain::mvu_translation::CardComplexity::PureData,
+            "启用 tavern_helper 脚本的卡不应判为 PureData"
+        );
     }
 }

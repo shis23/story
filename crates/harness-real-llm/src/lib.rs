@@ -22,6 +22,7 @@
 //! - [`phase_b_matrix`] Phase B A/B 对照矩阵
 
 pub mod budget;
+pub mod card_translation;
 pub mod commit_probe;
 pub mod context_compile_bench;
 pub mod coverage_ledger;

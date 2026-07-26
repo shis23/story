@@ -77,11 +77,13 @@ pub async fn run_postprocess_pipeline(
         None,
         &[],
         &ReasoningMode::Disabled,
+        &[],
     )
     .await
 }
 
-/// 同 `run_postprocess_pipeline`，可注入 Prompt Module（Summarizer 的 Prompted CoT）。
+/// 同 `run_postprocess_pipeline`，可注入 Prompt Module（Summarizer 的 Prompted CoT）
+/// 与卡翻译产物的 MVU 变量更新规则（PostProcessor 的【卡片变量更新规则】区块）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_postprocess_pipeline_with_prompt(
     runtime: &AgentRuntime,
@@ -99,6 +101,7 @@ pub async fn run_postprocess_pipeline_with_prompt(
     prompt_profile: Option<&PromptProfile>,
     prompt_modules: &[PromptModule],
     reasoning: &ReasoningMode,
+    mvu_update_rules: &[String],
 ) -> PostProcessOutcome {
     // 各 clone 一份 cancel 给两个子任务
     let cancel_summary = cancel.clone();
@@ -112,6 +115,7 @@ pub async fn run_postprocess_pipeline_with_prompt(
     let keys_for_postproc = variable_keys.to_vec();
     let clock_for_postproc = story_clock.to_string();
     let summary_block_for_postproc = recent_summary_block.map(str::to_string);
+    let rules_for_postproc = mvu_update_rules.to_vec();
 
     // runtime 需要在两个 spawn 里被引用——它在 run_tool_loop 里只借用 &self，
     // 但 spawn 要求 'static，所以这里靠 Arc 包装一份。runtime 内部的 llm/tool_ctx 本就是 Arc。
@@ -173,6 +177,7 @@ pub async fn run_postprocess_pipeline_with_prompt(
             cancel_postproc,
             agent_profile_config,
             summary_block_for_postproc.as_deref(),
+            &rules_for_postproc,
         )
         .await
         {

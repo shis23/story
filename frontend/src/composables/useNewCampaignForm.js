@@ -38,6 +38,7 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   applyConversation?: (conv: object) => void,
  *   broadcastPluginEvent?: (event: string, data?: object) => void,
  *   loadConversationHistory?: () => Promise<void> | void,
+ *   refreshCardShellManifest?: () => Promise<void> | void,
  *   openingShellStarted?: (conversationId: string | null) => void,
  *   alertDialog?: (message: string) => Promise<void> | void,
  * }} [options]
@@ -51,6 +52,7 @@ export function useNewCampaignForm(options = {}) {
   const applyConversation = options.applyConversation || (() => {})
   const broadcastPluginEvent = options.broadcastPluginEvent || (() => {})
   const loadConversationHistory = options.loadConversationHistory || (() => {})
+  const refreshCardShellManifest = options.refreshCardShellManifest || (() => {})
   const openingShellStarted = options.openingShellStarted || (() => {})
   const alertDialog = options.alertDialog || ((msg) => { console.error('alertDialog(未注入):', msg) })
 
@@ -115,6 +117,10 @@ export function useNewCampaignForm(options = {}) {
       await setActiveCampaign(result.id)
       campaignStore.activeCampaign = await getActiveCampaign()
       await loadInstanceNameMap()
+      // The opening URL belongs to the newly active card. Resolve it before
+      // arming the shell so a fresh Campaign cannot fall through to EmptyHero
+      // or display the previous Campaign's opening page.
+      await refreshCardShellManifest()
       showNewCampaignForm.value = false
       // 加载该 Campaign 绑定的对话（create_campaign 已自动建+开场白）
       if (result.conversation_id) {

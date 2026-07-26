@@ -102,18 +102,39 @@ pub fn build_character_extractor_user_msg(character: &Character) -> String {
         parts.push(format!("【对话示例】\n{}", character.mes_example));
     }
 
-    // 世界书条目全文（识别 NPC 的主要来源）
+    // 世界书条目全文（识别 NPC 的主要来源）。
+    // 新一代卡（命定之诗/卿卿形态）世界书可达数十万字符：启用条目优先、
+    // 逐条 + 总量双重截断，防 prompt 爆炸。
     if let Some(book) = &character.embedded_world_info
         && !book.entries.is_empty()
     {
         let mut wi = String::from("【世界书条目】\n");
-        for (i, entry) in book.entries.iter().enumerate() {
+        // 45K 字符 ≈ 30-45K token：兼顾覆盖率与慢中继的边缘超时（CF 524 上限 ~100s）
+        let mut budget = 45_000usize;
+        let mut truncated = false;
+        let ordered = book
+            .entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .chain(book.entries.iter().filter(|e| e.disabled));
+        for (i, entry) in ordered.enumerate() {
+            if budget == 0 {
+                truncated = true;
+                break;
+            }
+            let cap = 900.min(budget);
+            let body: String = entry.content.chars().take(cap).collect();
+            budget = budget.saturating_sub(body.chars().count());
             wi.push_str(&format!(
-                "--- 条目 {}（keys: {}）---\n{}\n",
+                "--- 条目 {}（keys: {}{}）---\n{}\n",
                 i + 1,
                 entry.keys.join(", "),
-                entry.content
+                if entry.disabled { "，禁用" } else { "" },
+                body
             ));
+        }
+        if truncated {
+            wi.push_str("……（世界书过长，其余条目省略）\n");
         }
         parts.push(wi);
     }

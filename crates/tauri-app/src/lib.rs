@@ -942,6 +942,9 @@ impl From<&storyforge_domain::character::Character> for CharacterInfo {
             .map(|b| {
                 b.entries
                     .iter()
+                    // 禁用条目（v3 enabled:false / v2 disable:true）保留在域模型里供翻译层
+                    // 与 campaign 开关使用，但不进 per-card 注入存储（保持旧行为）
+                    .filter(|e| !e.disabled)
                     .map(|e| WorldInfoEntryInfo {
                         keys: e.keys.clone(),
                         content: e.content.clone(),
@@ -1056,7 +1059,7 @@ fn import_character(
             }
             // 把绿灯世界书条目入库到向量存储（search_vectors 工具关键词搜索用）
             for entry in &wi.entries {
-                if !entry.constant && !entry.keys.is_empty() {
+                if !entry.disabled && !entry.constant && !entry.keys.is_empty() {
                     let _ = state.vector_store.upsert(VectorRecord {
                         id: Id::new(),
                         content: entry.content.clone(),
@@ -2620,6 +2623,7 @@ async fn start_writing(
         // Reuse the operation-owned cancel receiver (no global re-subscribe / no fallback).
         let pp_cancel_rx = cancel_rx.clone();
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
+        let mvu_rules = collect_mvu_update_rules_for_backend(&ctx, &present_chars);
 
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // SQLite: use the authoritative landed variant id (not the provisional pipeline id).
@@ -2696,6 +2700,7 @@ async fn start_writing(
                 present_chars,
                 var_keys,
                 mvu_fragments,
+                mvu_rules,
                 pp_event_tx,
                 pp_cancel_rx,
                 pp_identity,
@@ -3008,6 +3013,7 @@ async fn run_shared_postprocess_background(
     present_chars: Vec<String>,
     variable_keys: Vec<String>,
     fallback_fragments: Vec<storyforge_domain::mvu_translation::FallbackFragment>,
+    mvu_update_rules: Vec<String>,
     event_tx: tokio::sync::mpsc::UnboundedSender<PipelineEvent>,
     cancel: watch::Receiver<bool>,
     identity: Option<production_postprocess::PostprocessIdentity>,
@@ -3030,6 +3036,7 @@ async fn run_shared_postprocess_background(
             &event_tx,
             cancel.clone(),
             &fallback_fragments,
+            &mvu_update_rules,
         )
         .await;
 
@@ -4620,6 +4627,93 @@ fn collect_mvu_fallback_fragments_for_backend(
     }
 }
 
+/// CampaignStore.cards → source_character_id → MvuTranslation.update_rules
+///
+/// 与 `collect_mvu_fallback_fragments` 同型的查找链，但按 source 卡去重：
+/// 同一张卡的多个在场实例只贡献一次规则（规则是卡级玩法，不随实例数翻倍）。
+fn collect_mvu_update_rules(
+    ctx: &WritingContext,
+    store: &campaign_store::CampaignStore,
+    present_chars: &[String],
+) -> Vec<String> {
+    let runtime = match &ctx.campaign_runtime {
+        Some(rt) => rt,
+        None => return vec![],
+    };
+
+    let def_to_source: std::collections::HashMap<Id, Id> = store
+        .list_cards()
+        .iter()
+        .flat_map(|sc| {
+            let src = sc.card.source_character_id.clone();
+            sc.card
+                .character_definitions
+                .iter()
+                .map(move |d| (d.id.clone(), src.clone()))
+        })
+        .collect();
+
+    let mut visited_sources = std::collections::HashSet::new();
+    let mut rules = Vec::new();
+    for char_id_str in present_chars {
+        let char_id = Id::from_str(char_id_str);
+        let inst = runtime
+            .instances
+            .iter()
+            .find(|i| i.id == char_id || i.name == *char_id_str);
+        let inst = match inst {
+            Some(i) => i,
+            None => continue,
+        };
+        let def_id = match &inst.definition_id {
+            Some(d) => d,
+            None => continue,
+        };
+        let source_id = match def_to_source.get(def_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !visited_sources.insert(source_id.clone()) {
+            continue;
+        }
+        if let Some(stored) = store.get_mvu(source_id) {
+            let non_empty: Vec<String> = stored
+                .translation
+                .update_rules
+                .into_iter()
+                .filter(|r| !r.trim().is_empty())
+                .collect();
+            if !non_empty.is_empty() {
+                tracing::info!(
+                    target: "tauri-app",
+                    "[MVU] 角色 '{}' 所属卡贡献 {} 条变量更新规则",
+                    inst.name,
+                    non_empty.len()
+                );
+                rules.extend(non_empty);
+            }
+        }
+    }
+    rules
+}
+
+/// 同 `collect_mvu_fallback_fragments_for_backend` 的后端门：SQLite 未迁移
+/// MVU 翻译缓存前不读它的 JSON 文件当第二权威。
+fn collect_mvu_update_rules_for_backend(
+    ctx: &WritingContext,
+    present_chars: &[String],
+) -> Vec<String> {
+    if sqlite_runtime::is_sqlite_active() {
+        tracing::debug!(
+            count = present_chars.len(),
+            "sqlite backend skips JSON-only MVU update rules"
+        );
+        Vec::new()
+    } else {
+        collect_mvu_update_rules(ctx, get_campaign_store(), present_chars)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PostprocessPersistContext {
     campaign_id: Id,
@@ -5501,8 +5595,9 @@ async fn regenerate(
         );
         // Operation-owned cancel clones only (no global re-subscribe / no false fallback).
         let pp_rx = cancel_rx.clone();
-        // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）
+        // W10: 收集在场角色的 MVU fallback 片段（JS 执行用）+ 变量更新规则（注入后处理提示词）
         let mvu_fragments = collect_mvu_fallback_fragments_for_backend(&ctx, &present_chars);
+        let mvu_rules = collect_mvu_update_rules_for_backend(&ctx, &present_chars);
         // B3/B DraftQualityGate + 有界 1× Editor auto-fix
         // regenerate 返回的 node 即当前 node_id（variant 更新）
         let draft_node_for_fix = pipeline_req.node_id.clone();
@@ -5582,6 +5677,7 @@ async fn regenerate(
             present_chars,
             var_keys,
             mvu_fragments,
+            mvu_rules,
             event_tx.clone(),
             pp_rx,
             pp_identity,
@@ -11051,6 +11147,48 @@ fn card_shell_fetch_url(url: String) -> Result<card_shell_cache::ShellFetchResul
         })
 }
 
+/// Serve large, already-validated card assets from the host cache without
+/// moving them through the IPC bridge as base64. The URI path is an opaque
+/// generated cache filename, never a caller-provided local filesystem path.
+fn card_shell_cache_protocol_response(
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{header, Method, Response, StatusCode};
+
+    let with_cors = |builder: tauri::http::response::Builder| {
+        builder
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+    };
+    if request.method() == Method::OPTIONS {
+        return with_cors(Response::builder())
+            .status(StatusCode::NO_CONTENT)
+            .body(Vec::new())
+            .unwrap_or_else(|_| Response::new(Vec::new()));
+    }
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return with_cors(Response::builder())
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(b"method not allowed".to_vec())
+            .unwrap_or_else(|_| Response::new(Vec::new()));
+    }
+
+    let resource_name = request.uri().path().trim_start_matches('/');
+    match get_card_shell_cache().read_protocol_resource(resource_name) {
+        Ok((bytes, content_type)) => with_cors(Response::builder())
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "private, max-age=86400")
+            .body(if request.method() == Method::HEAD { Vec::new() } else { bytes })
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+        Err(_) => with_cors(Response::builder())
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(b"card-shell cache resource not found".to_vec())
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+    }
+}
+
 
 fn apply_campaign_world_info_to_tool_ctx(
     state: &AppState,
@@ -12138,6 +12276,9 @@ pub fn run() {
     let mvu_pending: MvuPendingMap = new_mvu_pending_map();
 
     tauri::Builder::default()
+        .register_uri_scheme_protocol(card_shell_cache::LOCAL_PROTOCOL_SCHEME, |_ctx, request| {
+            card_shell_cache_protocol_response(request)
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
@@ -13244,6 +13385,23 @@ mod tests {
         assert_eq!(
             fragments[0].js_snippet,
             "variables.__complex_card_probe = true;"
+        );
+
+        let rules = collect_mvu_update_rules(
+            &ctx,
+            &store,
+            std::slice::from_ref(&present_instance_id),
+        );
+        assert_eq!(rules, vec!["damage reduces hp".to_string()]);
+        let rules_dedup = collect_mvu_update_rules(
+            &ctx,
+            &store,
+            &[present_instance_id.clone(), character.name.clone()],
+        );
+        assert_eq!(
+            rules_dedup.len(),
+            1,
+            "同一张源卡的多个在场角色只应贡献一次规则"
         );
 
         let fragments_by_name = collect_mvu_fallback_fragments(&ctx, &store, &[character.name]);

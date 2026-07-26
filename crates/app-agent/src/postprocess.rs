@@ -20,7 +20,7 @@ use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse};
 use storyforge_domain::story_task::{NewTaskSpec, TaskStatus, TaskTrigger, TaskUpdate};
 
 use crate::prompts::{
-    build_postprocess_user_msg_with_summary, make_postprocess_config, register_postprocess_tools,
+    build_postprocess_user_msg_with_context, make_postprocess_config, register_postprocess_tools,
 };
 use crate::runtime::AgentRuntime;
 use crate::tools::{ToolRegistry, filter_registry_by_whitelist};
@@ -36,6 +36,9 @@ pub enum PostProcessError {
 ///
 /// `agent_profile_config`（可选）用于覆盖 PostProcessor 的 model/rounds 并过滤 tool_whitelist。
 /// 传 None = 当前硬编码默认值，向后兼容。
+///
+/// `mvu_update_rules`：卡翻译产物 `MvuTranslation.update_rules`（自然语言规则），
+/// 注入用户消息的【卡片变量更新规则】区块。空切片 = 无规则卡，输出与旧版一致。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_postprocess(
     runtime: &AgentRuntime,
@@ -47,15 +50,17 @@ pub async fn run_postprocess(
     cancel: watch::Receiver<bool>,
     agent_profile_config: Option<&AgentProfileConfig>,
     recent_summary_block: Option<&str>,
+    mvu_update_rules: &[String],
 ) -> Result<PostProcessResult, PostProcessError> {
     let config: AgentConfig = make_postprocess_config(agent_profile_config);
-    let user_msg = build_postprocess_user_msg_with_summary(
+    let user_msg = build_postprocess_user_msg_with_context(
         final_text,
         present_characters,
         variable_keys,
         turn,
         story_clock,
         recent_summary_block,
+        mvu_update_rules,
     );
 
     let mut registry = ToolRegistry::new();
@@ -626,6 +631,76 @@ mod tests {
         assert!(!r.is_empty(), "mock 后处理脚本应产出非空结果");
     }
 
+    /// 记录发出的用户消息并返回合法 JSON，验证注入内容确实进入请求
+    struct CaptureUserMsgClient {
+        seen_user_msgs: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl storyforge_infra_llm::LlmClient for CaptureUserMsgClient {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            let user_msg = req
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, storyforge_domain::llm::ChatRole::User))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.seen_user_msgs.lock().unwrap().push(user_msg);
+            Ok(make_resp(&sample_json(), vec![]))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<ChatResponse, LlmError> {
+            let resp = self.chat(req).await?;
+            let _ = tx.send(StreamChunk {
+                delta_content: Some(resp.content.clone()),
+                delta_reasoning_content: resp.reasoning_content.clone(),
+                delta_tool_calls: None,
+                finish_reason: resp.finish_reason.clone(),
+            });
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_postprocess_injects_mvu_update_rules_into_request() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm = Arc::new(CaptureUserMsgClient {
+            seen_user_msgs: seen.clone(),
+        });
+        let runtime = AgentRuntime::new(llm, empty_tool_context());
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        let result = run_postprocess(
+            &runtime,
+            "江离笑着递来一杯茶。",
+            &["江离".into()],
+            &["好感度".into()],
+            3,
+            "第3天",
+            cancel,
+            None,
+            None,
+            &["角色赠送礼物或表达关心时，该角色好感度 +5".to_string()],
+        )
+        .await
+        .expect("postprocess should succeed");
+
+        assert!(result.parse_succeeded);
+        let msgs = seen.lock().unwrap();
+        assert!(!msgs.is_empty());
+        assert!(
+            msgs[0].contains("【卡片变量更新规则】") && msgs[0].contains("好感度 +5"),
+            "发给 LLM 的用户消息必须包含卡片规则区块，实际: {}",
+            msgs[0].chars().take(200).collect::<String>()
+        );
+    }
+
     struct ToolDriftThenJsonClient {
         calls: Arc<AtomicUsize>,
         fallback_json: String,
@@ -681,6 +756,7 @@ mod tests {
             cancel,
             None,
             None,
+            &[],
         )
         .await
         .expect("postprocess should recover via direct JSON fallback");
@@ -748,6 +824,7 @@ mod tests {
             cancel,
             None,
             None,
+            &[],
         )
         .await
         .expect("postprocess should recover when primary tool path returns an empty JSON result");
@@ -813,6 +890,7 @@ mod tests {
             cancel,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -881,6 +959,7 @@ mod tests {
                 cancel,
                 None,
                 None,
+                &[],
             )
             .await
         });

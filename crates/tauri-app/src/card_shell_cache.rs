@@ -4,12 +4,29 @@
 //! process and served to CardShellHost. Non-allowlisted URLs fail explicitly.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+const RANGE_FETCH_THRESHOLD_BYTES: usize = 1024 * 1024;
+const RANGE_FETCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Avoid expanding large maps into base64 strings while they cross Tauri IPC.
+pub const LOCAL_PROTOCOL_BINARY_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+pub const LOCAL_PROTOCOL_SCHEME: &str = "storyforge-cache";
+const DESTINY_STANDARD_MAP_URL: &str = "https://i.ibb.co/07F075B/Maplite.webp";
+const DESTINY_ULTRA_MAP_URL: &str = "https://i.ibb.co/wFQqdywB/Map.webp";
+const ULTRA_MAP_FALLBACK_MESSAGE: &str = "超清地图源响应过慢，已暂时显示高清地图。";
+
+// On Windows and Android Tauri/Wry exposes a registered custom protocol under
+// an http localhost origin. macOS/Linux keep the native scheme origin.
+#[cfg(any(target_os = "windows", target_os = "android"))]
+const LOCAL_PROTOCOL_ORIGIN: &str = "http://storyforge-cache.localhost";
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+const LOCAL_PROTOCOL_ORIGIN: &str = "storyforge-cache://localhost";
 
 /// Default allowlist hosts for test-card and common ST card CDNs.
 pub fn default_allowed_hosts() -> Vec<String> {
@@ -20,6 +37,9 @@ pub fn default_allowed_hosts() -> Vec<String> {
         "fonts.googleapis.com".into(),
         "fonts.gstatic.com".into(),
         "files.catbox.moe".into(),
+        // The Destiny card's two map sources are served from this image CDN.
+        // Keep this explicit rather than allowing arbitrary image hosts.
+        "i.ibb.co".into(),
         "raw.githubusercontent.com".into(),
         "github.com".into(),
         "gitee.com".into(),
@@ -32,6 +52,12 @@ pub struct ShellFetchResult {
     pub content_type: String,
     pub body_text: Option<String>,
     pub body_base64: Option<String>,
+    /// Large binary assets are served by the local `storyforge-cache` protocol
+    /// so they never cross the Tauri IPC bridge as a base64 string.
+    pub cache_url: Option<String>,
+    /// An optional user-visible notice supplied when a known optional asset
+    /// intentionally falls back to its cached standard-resolution equivalent.
+    pub fallback_message: Option<String>,
     pub cached_path: String,
     pub from_cache: bool,
     pub byte_len: usize,
@@ -53,7 +79,9 @@ impl CardShellCache {
         Self {
             cache_dir,
             allowed_hosts: Mutex::new(allowed),
-            max_bytes: 12 * 1024 * 1024,
+            // The card's optional ultra map is about 31.5 MiB. Retain a hard
+            // ceiling while allowing the known, allowlisted visual resource.
+            max_bytes: 40 * 1024 * 1024,
             timeout: Duration::from_secs(30),
         }
     }
@@ -89,6 +117,17 @@ impl CardShellCache {
                 "URL host 不在 allowlist: {host}（url={url}）。可在设置中始终允许该 host。"
             ))
         }
+    }
+
+    /// Validate each concrete request URL, including every redirect target.
+    /// Card shells only need named, allowlisted CDN hosts; literal IP URLs are
+    /// never valid and would turn this fetcher into an SSRF primitive.
+    fn validate_fetch_url(&self, url: &str) -> Result<(), String> {
+        let host = host_of(url).ok_or_else(|| format!("cannot parse URL host: {url}"))?;
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Err(format!("IP-literal shell URL is not allowed: {url}"));
+        }
+        self.is_url_allowed(url)
     }
 
     fn cache_path_for_url(&self, url: &str) -> PathBuf {
@@ -151,20 +190,56 @@ impl CardShellCache {
         Ok(path)
     }
 
+    /// Read a generated cache object for the local WebView protocol. This
+    /// accepts only an opaque cache filename, never an arbitrary disk path.
+    pub fn read_protocol_resource(&self, resource_name: &str) -> Result<(Vec<u8>, String), String> {
+        if !is_safe_cache_resource_name(resource_name) {
+            return Err("invalid card-shell cache resource".into());
+        }
+        let path = self.cache_dir.join(resource_name);
+        let meta_path = path.with_extension("meta.json");
+        let meta_raw = std::fs::read_to_string(&meta_path)
+            .map_err(|_| "card-shell cache resource not found".to_string())?;
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw)
+            .map_err(|_| "card-shell cache metadata is invalid".to_string())?;
+        let content_type = meta
+            .get("content_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = std::fs::read(&path)
+            .map_err(|_| "card-shell cache resource not found".to_string())?;
+        Ok((bytes, content_type))
+    }
+
+    /// The upstream 31 MiB Destiny ultra map routinely stalls for minutes on
+    /// the image host. The card has a normal-resolution sibling and always
+    /// opens that first, so serve the cached sibling immediately rather than
+    /// freezing the map on a request the user cannot cancel or observe.
+    fn cached_optional_map_fallback(&self, url: &str) -> Option<ShellFetchResult> {
+        if url != DESTINY_ULTRA_MAP_URL {
+            return None;
+        }
+        let (path, bytes, content_type) = self.read_cache(DESTINY_STANDARD_MAP_URL)?;
+        let mut result = to_result(url, content_type, bytes, path, true);
+        result.fallback_message = Some(ULTRA_MAP_FALLBACK_MESSAGE.into());
+        Some(result)
+    }
+
     /// Fetch URL via host HTTP, with allowlist + cache. Text is for unit tests.
     pub fn fetch_blocking_with_client(
         &self,
         url: &str,
         client: &reqwest::blocking::Client,
     ) -> Result<ShellFetchResult, String> {
-        self.is_url_allowed(url)?;
+        self.validate_fetch_url(url)?;
+        if let Some(result) = self.cached_optional_map_fallback(url) {
+            return Ok(result);
+        }
         if let Some((path, bytes, content_type)) = self.read_cache(url) {
             return Ok(to_result(url, content_type, bytes, path, true));
         }
-        let resp = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("shell fetch network error: {e}"))?;
+        let (_final_url, resp) = self.send_checked_request(client, url, None)?;
         if !resp.status().is_success() {
             return Err(format!(
                 "shell fetch HTTP {}: {url}",
@@ -177,10 +252,23 @@ impl CardShellCache {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = resp
-            .bytes()
-            .map_err(|e| format!("shell fetch body error: {e}"))?
-            .to_vec();
+        let expected_bytes = resp.content_length().and_then(|length| usize::try_from(length).ok());
+        if expected_bytes.is_some_and(|length| length > self.max_bytes) {
+            return Err(format!(
+                "shell resource too large: {} bytes (max {}) url={url}",
+                expected_bytes.unwrap_or_default(),
+                self.max_bytes
+            ));
+        }
+        let bytes = if let Some(length) = expected_bytes {
+            if should_fetch_by_ranges(url, length) {
+                fetch_by_ranges(self, client, url, length)?
+            } else {
+                read_limited_body(resp, self.max_bytes)?
+            }
+        } else {
+            read_limited_body(resp, self.max_bytes)?
+        };
         if bytes.len() > self.max_bytes {
             return Err(format!(
                 "shell resource too large: {} bytes (max {}) url={url}",
@@ -196,9 +284,48 @@ impl CardShellCache {
         reqwest::blocking::Client::builder()
             .timeout(self.timeout)
             .user_agent("StoryForge-CardShell/0.1")
-            .redirect(reqwest::redirect::Policy::limited(5))
+            // Redirects are followed explicitly in `send_checked_request` so
+            // every hop passes the host and IP validation above.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("build shell http client: {e}"))
+    }
+
+    fn send_checked_request(
+        &self,
+        client: &reqwest::blocking::Client,
+        url: &str,
+        range: Option<&str>,
+    ) -> Result<(String, reqwest::blocking::Response), String> {
+        let mut current = url.to_string();
+        for redirect_count in 0..=5 {
+            self.validate_fetch_url(&current)?;
+            let mut request = client.get(&current);
+            if let Some(value) = range {
+                request = request.header(reqwest::header::RANGE, value);
+            }
+            let response = request
+                .send()
+                .map_err(|e| format!("shell fetch network error: {e}"))?;
+            if !response.status().is_redirection() {
+                return Ok((current, response));
+            }
+            if redirect_count == 5 {
+                return Err(format!("shell fetch exceeded redirect limit: {url}"));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| format!("shell redirect has no valid Location: {current}"))?;
+            let base = reqwest::Url::parse(&current)
+                .map_err(|e| format!("invalid shell redirect base URL {current}: {e}"))?;
+            current = base
+                .join(location)
+                .map_err(|e| format!("invalid shell redirect target {location}: {e}"))?
+                .to_string();
+        }
+        Err(format!("shell fetch exceeded redirect limit: {url}"))
     }
 }
 
@@ -219,11 +346,16 @@ fn to_result(
         || url.ends_with(".html")
         || url.ends_with(".htm")
         || url.ends_with(".mjs");
+    let cache_url = (!is_text && bytes.len() > LOCAL_PROTOCOL_BINARY_THRESHOLD_BYTES)
+        .then(|| cache_protocol_url_for_path(&path))
+        .flatten();
     let (body_text, body_base64) = if is_text {
         match String::from_utf8(bytes.clone()) {
             Ok(s) => (Some(s), None),
             Err(_) => (None, Some(b64(&bytes))),
         }
+    } else if cache_url.is_some() {
+        (None, None)
     } else {
         (None, Some(b64(&bytes)))
     };
@@ -232,6 +364,8 @@ fn to_result(
         content_type,
         body_text,
         body_base64,
+        cache_url,
+        fallback_message: None,
         cached_path: path.display().to_string(),
         from_cache,
         byte_len: bytes.len(),
@@ -278,6 +412,76 @@ pub fn host_of(url: &str) -> Option<String> {
     }
 }
 
+fn cache_protocol_url_for_path(path: &Path) -> Option<String> {
+    let resource_name = path.file_name()?.to_str()?;
+    is_safe_cache_resource_name(resource_name)
+        .then(|| format!("{LOCAL_PROTOCOL_ORIGIN}/{resource_name}"))
+}
+
+fn is_safe_cache_resource_name(resource_name: &str) -> bool {
+    let bytes = resource_name.as_bytes();
+    bytes.len() >= 64
+        && bytes[..64].iter().all(u8::is_ascii_hexdigit)
+        && bytes[64..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// ibb reliably serves the card's large WebP maps by byte range in the
+/// embedded app, while a single full-body request can stall after the headers.
+/// Keep the workaround restricted to that allowlisted host and substantial
+/// images; all other card resources retain the usual one-request path.
+fn should_fetch_by_ranges(url: &str, byte_len: usize) -> bool {
+    byte_len > RANGE_FETCH_THRESHOLD_BYTES && host_of(url).as_deref() == Some("i.ibb.co")
+}
+
+fn fetch_by_ranges(
+    cache: &CardShellCache,
+    client: &reqwest::blocking::Client,
+    url: &str,
+    expected_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(expected_bytes);
+    let mut start = 0usize;
+    while start < expected_bytes {
+        let end_exclusive = (start + RANGE_FETCH_CHUNK_BYTES).min(expected_bytes);
+        let end_inclusive = end_exclusive - 1;
+        let range = format!("bytes={start}-{end_inclusive}");
+        let (_final_url, response) = cache.send_checked_request(client, url, Some(&range))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "shell range fetch HTTP {}: {url}",
+                response.status().as_u16()
+            ));
+        }
+        let expected_chunk_len = end_exclusive - start;
+        let chunk = read_limited_body(response, expected_chunk_len)?;
+        if chunk.len() != expected_chunk_len {
+            return Err(format!(
+                "shell range fetch returned {} bytes, expected {expected_chunk_len}: {url}",
+                chunk.len()
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+        start = end_exclusive;
+    }
+    Ok(bytes)
+}
+
+fn read_limited_body<R: Read>(reader: R, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
+    limited
+        .read_to_end(&mut body)
+        .map_err(|e| format!("shell fetch body error: {e}"))?;
+    if body.len() > max_bytes {
+        return Err(format!(
+            "shell resource too large: more than {max_bytes} bytes"
+        ));
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +509,102 @@ mod tests {
         assert!(cache.is_url_allowed("https://files.catbox.moe/a.png").is_ok());
         cache.allow_host("example.com");
         assert!(cache.is_url_allowed("https://example.com/a.js").is_ok());
+    }
+
+    #[test]
+    fn defaults_allow_the_destiny_card_map_host_at_a_safe_map_size_limit() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+
+        assert!(cache
+            .is_url_allowed("https://i.ibb.co/07F075B/Maplite.webp")
+            .is_ok());
+        assert_eq!(cache.max_bytes, 40 * 1024 * 1024);
+    }
+
+    #[test]
+    fn keeps_large_binary_maps_out_of_the_ipc_base64_payload() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        let path = cache.cache_path_for_url("https://i.ibb.co/example/Map.webp");
+        let resource_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let result = to_result(
+            "https://i.ibb.co/example/Map.webp",
+            "image/webp".into(),
+            vec![0; LOCAL_PROTOCOL_BINARY_THRESHOLD_BYTES + 1],
+            path,
+            false,
+        );
+
+        assert!(result.body_base64.is_none());
+        assert_eq!(
+            result.cache_url.as_deref(),
+            Some(format!("http://storyforge-cache.localhost/{resource_name}").as_str())
+        );
+    }
+
+    #[test]
+    fn local_protocol_reads_only_safe_cache_resource_names() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        let path = cache
+            .write_cache("https://i.ibb.co/example/Map.webp", "image/webp", &[1, 2, 3])
+            .unwrap();
+        let resource_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        assert_eq!(
+            cache.read_protocol_resource(&resource_name).unwrap(),
+            (vec![1, 2, 3], "image/webp".into())
+        );
+        assert!(cache.read_protocol_resource("../../campaigns.json").is_err());
+    }
+
+    #[test]
+    fn optional_ultra_map_uses_the_cached_standard_map_with_a_visible_notice() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        cache
+            .write_cache(
+                DESTINY_STANDARD_MAP_URL,
+                "image/webp",
+                &vec![0; LOCAL_PROTOCOL_BINARY_THRESHOLD_BYTES + 1],
+            )
+            .unwrap();
+
+        let result = cache
+            .cached_optional_map_fallback(DESTINY_ULTRA_MAP_URL)
+            .expect("a cached standard map fallback");
+
+        assert_eq!(result.url, DESTINY_ULTRA_MAP_URL);
+        assert_eq!(result.fallback_message.as_deref(), Some(ULTRA_MAP_FALLBACK_MESSAGE));
+        assert!(result.cache_url.is_some());
+        assert!(result.body_base64.is_none());
+    }
+
+    #[test]
+    fn uses_byte_ranges_for_large_destiny_map_cdn_images() {
+        assert!(should_fetch_by_ranges(
+            "https://i.ibb.co/07F075B/Maplite.webp",
+            7 * 1024 * 1024,
+        ));
+        assert!(!should_fetch_by_ranges(
+            "https://testingcf.jsdelivr.net/npm/openseadragon/+esm",
+            7 * 1024 * 1024,
+        ));
+        assert!(!should_fetch_by_ranges(
+            "https://i.ibb.co/07F075B/Maplite.webp",
+            1024,
+        ));
+    }
+
+    #[test]
+    fn rejects_ip_literal_redirect_targets_and_limits_unknown_length_bodies() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        assert!(cache.validate_fetch_url("http://127.0.0.1/internal").is_err());
+
+        let body = std::io::Cursor::new(vec![0u8; 9]);
+        assert!(read_limited_body(body, 8).is_err());
     }
 
     #[test]

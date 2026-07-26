@@ -52,8 +52,13 @@ pub async fn extract_characters(
 
     info!(target: "character-extractor", "开始识别卡「{}」的角色", character.name);
 
+    // 流式工具循环：大卡的抽取 prompt 在慢中继上会被边缘超时（CF ~100s）掐成 524，
+    // SSE 流式首字节早到可规避；progress 不消费，排水任务防 send 报错
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+
     let resp = runtime
-        .run_tool_loop(&config, user_msg, &registry, cancel)
+        .run_tool_loop_streaming(&config, user_msg, &registry, cancel, progress_tx, None)
         .await?;
 
     let mut defs = parse_character_definitions_from_response(&resp)?;

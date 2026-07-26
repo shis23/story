@@ -1164,6 +1164,9 @@ impl PipelineOrchestrator {
     /// `fallback_fragments`：由调用方（tauri-app）从 CampaignStore 查 MvuTranslation 后
     /// 拆出的 JS 片段。pipeline 不依赖 CampaignStore，只接收已拆好的片段。
     ///
+    /// `mvu_update_rules`：同上，调用方从 MvuTranslation 拆出的自然语言变量更新规则，
+    /// 注入后处理 Agent 的【卡片变量更新规则】区块。空切片 = 无规则。
+    ///
     /// 返回 `Option<PostProcessOutcome>`：None 表示跳过，Some 表示跑过（产出可能为空）。
     #[allow(clippy::too_many_arguments)]
     pub async fn run_postprocess(
@@ -1176,6 +1179,7 @@ impl PipelineOrchestrator {
         event_tx: &mpsc::UnboundedSender<PipelineEvent>,
         cancel: watch::Receiver<bool>,
         fallback_fragments: &[FallbackFragment],
+        mvu_update_rules: &[String],
     ) -> Option<storyforge_app_agent::PostProcessOutcome> {
         let campaign_id = ctx.campaign_id.clone()?;
 
@@ -1223,6 +1227,7 @@ impl PipelineOrchestrator {
             ctx.profile.as_ref(),
             &ctx.modules,
             &self.reasoning_mode(),
+            mvu_update_rules,
         )
         .await;
 
@@ -4365,6 +4370,7 @@ mod tests {
                 &event_tx,
                 cancel,
                 &[],
+                &[],
             )
             .await;
         assert!(outcome.is_none(), "无 campaign 应跳过后处理");
@@ -4433,6 +4439,7 @@ mod tests {
                 &event_tx,
                 cancel,
                 &fragments,
+                &[],
             )
             .await
             .expect("campaign postprocess should run");
@@ -4476,6 +4483,7 @@ mod tests {
                 &ctx,
                 &event_tx,
                 cancel,
+                &[],
                 &[],
             )
             .await;
@@ -4555,6 +4563,7 @@ mod tests {
                 &ctx,
                 &event_tx,
                 cancel,
+                &[],
                 &[],
             )
             .await;
@@ -6112,7 +6121,7 @@ mod tests {
             reason: "test".into(),
         }];
         let outcome = orch
-            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &fragments)
+            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &fragments, &[])
             .await;
         assert!(
             outcome.is_none(),
@@ -6134,7 +6143,7 @@ mod tests {
         let (_tx, cancel) = watch::channel(false);
 
         let outcome = orch
-            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &[])
+            .run_postprocess("text", "", &[], &[], &ctx, &event_tx, cancel, &[], &[])
             .await;
         assert!(outcome.is_none(), "空 fragments + 无 campaign → 跳过");
     }
