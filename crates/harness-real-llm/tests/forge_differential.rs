@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 
 use harness_real_llm::card_translation::{load_card, repo_root};
-use harness_real_llm::forge_differential::{diff_worldbook, load_forge_state};
+use harness_real_llm::forge_differential::{
+    diff_sections, diff_worldbook, find_initvar_yaml, flatten_initvar_yaml, load_forge_state,
+    schema_alignment,
+};
 
 #[test]
 fn forge_differential_worldbook_semantics() {
@@ -79,8 +82,106 @@ fn forge_differential_worldbook_semantics() {
             "{label}: 主键分歧 {:?}",
             report.keys_mismatches
         );
+
+        // V2-3：开场白 / 正则 / tavern_helper 清单对照（计数硬断言，名字报告）
+        let sections = diff_sections(label, &character, &forge_dir, &forge);
+        eprintln!(
+            "── {label} section 清单 ──\n{}",
+            serde_json::to_string_pretty(&sections).unwrap()
+        );
+        assert!(
+            sections.counts_match(),
+            "{label}: section 计数不一致（非空开场白 {}/{}，正则去重 {}/{}，脚本去重 {}/{}）",
+            sections.ours_greetings,
+            sections.forge_greetings,
+            sections.ours_regex_unique,
+            sections.forge_regex,
+            sections.ours_th_unique,
+            sections.forge_th_scripts
+        );
         ran += 1;
     }
 
     assert!(ran > 0, "STORYFORGE_FORGE_OUT 已设但没有任何组合可跑");
+}
+
+/// V2-2：翻译 schema 对 InitVar ground truth 的覆盖率/幻觉率评测。
+///
+/// 额外前置：`STORYFORGE_CT_EVIDENCE_DIR` 指向验收证据目录
+/// （artifacts/card-translation，含 schema_keys_sample）。评测性质：
+/// 打印各模型分数；硬断言仅（a）ground truth 解析健全（b）幻觉率 ≤ 50%
+/// ——分数解读交给人，阈值防的是彻底脱轨。
+#[test]
+fn forge_schema_alignment_scores_translations() {
+    let Some(out_dir) = std::env::var_os("STORYFORGE_FORGE_OUT") else {
+        eprintln!("skip: STORYFORGE_FORGE_OUT 未设");
+        return;
+    };
+    let Some(evidence_dir) = std::env::var_os("STORYFORGE_CT_EVIDENCE_DIR") else {
+        eprintln!("skip: STORYFORGE_CT_EVIDENCE_DIR 未设（验收证据目录）");
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir);
+    let evidence_dir = PathBuf::from(evidence_dir);
+
+    let combos = [("命定之诗", "destiny"), ("卿卿", "qingqing")];
+    let mut ran = 0usize;
+    for (label, forge_sub) in combos {
+        let forge_dir = out_dir.join(forge_sub);
+        let Some(initvar_path) = find_initvar_yaml(&forge_dir) else {
+            eprintln!("skip {label}: 世界书目录无 initvar yaml");
+            continue;
+        };
+        let yaml = std::fs::read_to_string(&initvar_path).expect("读 initvar yaml 失败");
+        let author = flatten_initvar_yaml(&yaml).expect("initvar yaml 解析失败");
+        assert!(
+            author.len() >= 20,
+            "{label}: ground truth 叶数异常少（{}），解析可能失败",
+            author.len()
+        );
+
+        // 遍历该卡的所有模型证据文件
+        let Ok(entries) = std::fs::read_dir(&evidence_dir) else {
+            eprintln!("skip {label}: 证据目录不可读");
+            continue;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name else { continue };
+            if !name.starts_with(label) || !name.ends_with(".json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("读证据失败");
+            let evidence: serde_json::Value = serde_json::from_str(&raw).expect("证据 JSON 解析");
+            let model = evidence["model"].as_str().unwrap_or("?").to_string();
+            let keys: Vec<String> = evidence["stats"]["schema_keys_sample"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys.is_empty() {
+                continue;
+            }
+            let total_fields = evidence["stats"]["schema_fields"].as_u64().unwrap_or(0) as usize;
+            let keys_are_sample = keys.len() < total_fields;
+
+            let report = schema_alignment(label, &model, &keys, &author, keys_are_sample);
+            eprintln!(
+                "── {label} × {model} schema 对齐 ──\n{}",
+                serde_json::to_string_pretty(&report).unwrap()
+            );
+            assert!(
+                report.hallucination_pct <= 50.0,
+                "{label}×{model}: 幻觉率脱轨 {:.1}%（样例 {:?}）",
+                report.hallucination_pct,
+                report.hallucinated
+            );
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "环境已设但没有任何证据文件可评");
 }

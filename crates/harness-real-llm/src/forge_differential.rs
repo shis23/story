@@ -44,6 +44,18 @@ pub struct ForgeState {
     /// group → name → entry（group 常见为 "unknown"，可能有多组）
     #[serde(rename = "entryManifest", default)]
     pub entry_manifest: BTreeMap<String, BTreeMap<String, ForgeEntry>>,
+    /// 正则全量表（name → 配置对象）。大体积 replaceString 外置成
+    /// `正则/*.txt`（带 replace_file），小正则内联——目录文件数不是正则总数，
+    /// 这里才是权威计数。
+    #[serde(default)]
+    pub regex_scripts: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 开场白全量（first_mes + alternates），权威计数。
+    #[serde(default)]
+    pub first_messages: Option<Vec<serde_json::Value>>,
+    /// Zod schema 引导脚本被 forge 特化提取（schema.ts + state.zod），
+    /// 不写入 脚本/ 目录——TH 计数口径需要 +1。
+    #[serde(default)]
+    pub zod: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +334,330 @@ pub fn diff_worldbook(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// V2-3：section 清单对照（开场白 / 正则 / tavern_helper 脚本）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 非世界书面的清单对照。对照口径（与世界书差分同教义——我们保留全量，
+/// forge 做归并，比对按语义口径）：
+/// - 开场白：ours 按**非空**计数（实测卿卿原卡带一条空 alternate，
+///   我们保留、forge 丢弃）
+/// - 正则 / TH 脚本：卡内常带同名历史版本，forge 按名归并——硬断言比
+///   **去重名集**大小，原始数与收缩量入报告
+/// - 名字为宽松对照（forge 文件名经 sanitize，不可逆——缺口只报告不判失败）
+#[derive(Debug, Serialize)]
+pub struct SectionDiffReport {
+    pub card: String,
+    /// ours 非空开场白数（first_mes 非空计 1 + 非空 alternates）
+    pub ours_greetings: usize,
+    /// ours 空开场白数（保留但不参与对照）
+    pub ours_empty_greetings: usize,
+    pub forge_greetings: usize,
+    /// ours 原始正则条数（含同名历史版本）
+    pub ours_regex_raw: usize,
+    /// ours 去重名集大小（对照口径）
+    pub ours_regex_unique: usize,
+    pub forge_regex: usize,
+    pub ours_th_raw: usize,
+    pub ours_th_unique: usize,
+    pub forge_th_scripts: usize,
+    /// ours 有名、forge（归一化后）对不上的样例（上限 10，报告用）
+    pub regex_name_gaps: Vec<String>,
+    pub th_name_gaps: Vec<String>,
+}
+
+impl SectionDiffReport {
+    /// 硬不变量：非空开场白数一致 + 正则/TH 去重名集大小一致
+    pub fn counts_match(&self) -> bool {
+        self.ours_greetings == self.forge_greetings
+            && self.ours_regex_unique == self.forge_regex
+            && self.ours_th_unique == self.forge_th_scripts
+    }
+}
+
+/// 宽松归一化：只留字母/数字（forge 文件名 sanitize 会替换标点/空白）
+fn lenient_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn dir_file_stems(dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut stems: Vec<String> = read
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect();
+    stems.sort();
+    stems
+}
+
+fn name_gaps(ours_names: &[String], forge_stems: &[String]) -> Vec<String> {
+    let forge_set: std::collections::BTreeSet<String> =
+        forge_stems.iter().map(|s| lenient_name(s)).collect();
+    ours_names
+        .iter()
+        .filter(|n| !forge_set.contains(&lenient_name(n)))
+        .take(10)
+        .cloned()
+        .collect()
+}
+
+/// section 清单差分：开场白 / 正则 / tavern_helper 脚本。
+/// 正则与开场白优先用 state.json 权威计数（目录文件数做回退——
+/// forge 只把大体积正文外置成文件）。
+pub fn diff_sections(
+    card_label: &str,
+    character: &storyforge_domain::character::Character,
+    forge_dir: &Path,
+    forge: &ForgeState,
+) -> SectionDiffReport {
+    let non_empty_alternates = character
+        .alternate_greetings
+        .iter()
+        .filter(|g| !g.trim().is_empty())
+        .count();
+    let ours_greetings = usize::from(!character.first_mes.trim().is_empty()) + non_empty_alternates;
+    let ours_empty_greetings = character.alternate_greetings.len() - non_empty_alternates;
+
+    let ours_regex_names: Vec<String> = character
+        .extensions
+        .get("regex_scripts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("scriptName").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let ours_th_names: Vec<String> = character
+        .extensions
+        .get("tavern_helper")
+        .and_then(|v| v.get("scripts"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let forge_greeting_files = dir_file_stems(&forge_dir.join("开场白"));
+    let forge_script_files = dir_file_stems(&forge_dir.join("脚本"));
+
+    // 正则：state.regex_scripts 为权威（键即原始名，无 sanitize），目录回退
+    let (forge_regex, forge_regex_names): (usize, Vec<String>) = match &forge.regex_scripts {
+        Some(map) => (map.len(), map.keys().cloned().collect()),
+        None => {
+            let files = dir_file_stems(&forge_dir.join("正则"));
+            (files.len(), files)
+        }
+    };
+    let forge_greetings = forge
+        .first_messages
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(forge_greeting_files.len());
+
+    let unique = |names: &[String]| -> Vec<String> {
+        let set: std::collections::BTreeSet<&str> =
+            names.iter().map(|n| n.trim()).collect();
+        set.into_iter().map(String::from).collect()
+    };
+    let ours_regex_unique_names = unique(&ours_regex_names);
+    let ours_th_unique_names = unique(&ours_th_names);
+
+    // TH 对照名单 = 脚本/ 文件 stem + zod 特化脚本名（如有）
+    let mut forge_th_names = forge_script_files.clone();
+    let zod_script = forge
+        .zod
+        .as_ref()
+        .and_then(|z| z.get("scriptName"))
+        .and_then(|v| v.as_str());
+    if let Some(name) = zod_script {
+        forge_th_names.push(name.to_string());
+    }
+
+    SectionDiffReport {
+        card: card_label.to_string(),
+        ours_greetings,
+        ours_empty_greetings,
+        forge_greetings,
+        ours_regex_raw: ours_regex_names.len(),
+        ours_regex_unique: ours_regex_unique_names.len(),
+        forge_regex,
+        ours_th_raw: ours_th_names.len(),
+        ours_th_unique: ours_th_unique_names.len(),
+        forge_th_scripts: forge_th_names.len(),
+        regex_name_gaps: name_gaps(&ours_regex_unique_names, &forge_regex_names),
+        th_name_gaps: name_gaps(&ours_th_unique_names, &forge_th_names),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2-2：MVU schema 对照（InitVar YAML 作 ground truth，翻译产物打分）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 把 InitVar YAML 展平成叶路径集合（作者定义的变量树 ground truth）。
+///
+/// - mapping 递归拼路径；标量 / 序列 / 空 mapping 记为叶
+/// - `$` 开头的键是 MVU 元数据（$meta 等），跳过
+pub fn flatten_initvar_yaml(yaml: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("InitVar YAML 解析失败: {e}"))?;
+    let mut leaves = std::collections::BTreeSet::new();
+    flatten_yaml_value(&value, String::new(), &mut leaves);
+    Ok(leaves)
+}
+
+fn flatten_yaml_value(
+    value: &serde_yaml::Value,
+    path: String,
+    leaves: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        serde_yaml::Value::Mapping(map) if !map.is_empty() => {
+            for (k, v) in map {
+                let Some(key) = k.as_str() else { continue };
+                if key.starts_with('$') {
+                    continue;
+                }
+                let child = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                flatten_yaml_value(v, child, leaves);
+            }
+        }
+        _ => {
+            if !path.is_empty() {
+                leaves.insert(path);
+            }
+        }
+    }
+}
+
+/// 翻译 schema 与作者树的对齐报告（脱敏：只含键路径与计数）。
+#[derive(Debug, Serialize)]
+pub struct SchemaAlignmentReport {
+    pub card: String,
+    pub model: String,
+    /// 作者树叶路径数（ground truth 规模）
+    pub author_leaves: usize,
+    /// 参与对照的翻译键数
+    pub translated_keys: usize,
+    /// 翻译键是否只是样本（旧证据封顶 40；true 时覆盖率只是下界）
+    pub keys_are_sample: bool,
+    /// 有据键数（在作者树中存在前缀关系）
+    pub grounded: usize,
+    /// 幻觉键样例（作者树中无任何前缀关系；上限 20）
+    pub hallucinated: Vec<String>,
+    /// 幻觉率 %（hallucinated / translated）
+    pub hallucination_pct: f64,
+    /// 被覆盖的作者叶数
+    pub covered_leaves: usize,
+    /// 作者树覆盖率 %（样本时为下界）
+    pub coverage_pct: f64,
+}
+
+/// 归一化翻译键：
+/// - 斜杠记法 → 点记法（实测 pro 输出 `/世界/时间`，flash 输出点记法——
+///   模型间键记法不稳定，评测必须归一）
+/// - 去掉 `stat_data.` 前缀（翻译产物惯例带、作者树不带）
+fn normalize_translated_key(key: &str) -> String {
+    let k = key.trim().trim_start_matches('/').replace('/', ".");
+    k.strip_prefix("stat_data.").unwrap_or(&k).to_string()
+}
+
+/// 路径段匹配：`{角色名}` / `<xxx>` 形式的段是模板占位符，通配任意一段
+/// （实测 flash 输出参数化 schema——一条模板代表所有同构角色子树）。
+fn seg_match(key_seg: &str, leaf_seg: &str) -> bool {
+    let is_placeholder = (key_seg.starts_with('{') && key_seg.ends_with('}'))
+        || (key_seg.starts_with('<') && key_seg.ends_with('>'));
+    is_placeholder || key_seg == leaf_seg
+}
+
+/// 段级前缀关系：逐段比对（含占位符通配），一方是另一方的段前缀即相关
+fn path_related(key: &str, leaf: &str) -> bool {
+    let key_segs: Vec<&str> = key.split('.').collect();
+    let leaf_segs: Vec<&str> = leaf.split('.').collect();
+    let n = key_segs.len().min(leaf_segs.len());
+    key_segs[..n]
+        .iter()
+        .zip(&leaf_segs[..n])
+        .all(|(k, l)| seg_match(k, l))
+}
+
+/// 计算翻译 schema 与作者树的覆盖率 / 幻觉率
+pub fn schema_alignment(
+    card: &str,
+    model: &str,
+    translated_keys: &[String],
+    author_leaves: &std::collections::BTreeSet<String>,
+    keys_are_sample: bool,
+) -> SchemaAlignmentReport {
+    let normalized: Vec<String> = translated_keys
+        .iter()
+        .map(|k| normalize_translated_key(k))
+        .collect();
+
+    let mut grounded = 0usize;
+    let mut hallucinated = Vec::new();
+    for key in &normalized {
+        if author_leaves.iter().any(|leaf| path_related(key, leaf)) {
+            grounded += 1;
+        } else if hallucinated.len() < 20 {
+            hallucinated.push(key.clone());
+        }
+    }
+
+    let covered_leaves = author_leaves
+        .iter()
+        .filter(|leaf| normalized.iter().any(|key| path_related(key, leaf)))
+        .count();
+
+    let pct = |num: usize, den: usize| {
+        if den == 0 { 0.0 } else { (num as f64) * 100.0 / (den as f64) }
+    };
+    let hallucinated_count = normalized.len() - grounded;
+
+    SchemaAlignmentReport {
+        card: card.to_string(),
+        model: model.to_string(),
+        author_leaves: author_leaves.len(),
+        translated_keys: normalized.len(),
+        keys_are_sample,
+        grounded,
+        hallucinated,
+        hallucination_pct: pct(hallucinated_count, normalized.len()),
+        covered_leaves,
+        coverage_pct: pct(covered_leaves, author_leaves.len()),
+    }
+}
+
+/// 在 forge unpack 的世界书目录里找 InitVar YAML（名字大小写不定）
+pub fn find_initvar_yaml(forge_dir: &Path) -> Option<std::path::PathBuf> {
+    let dir = forge_dir.join("世界书");
+    let read = std::fs::read_dir(&dir).ok()?;
+    read.flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension().is_some_and(|ext| ext == "yaml")
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase().contains("initvar"))
+                    .unwrap_or(false)
+        })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 测试
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -467,6 +803,73 @@ mod tests {
         assert!(report.enabled_mismatches.is_empty(), "{report:?}");
         assert!(report.route_mismatches.is_empty(), "{report:?}");
         assert!(report.hard_invariants_hold(), "{report:?}");
+    }
+
+    #[test]
+    fn test_flatten_initvar_yaml_leaves_and_meta_skip() {
+        let yaml = r#"
+世界信息:
+  年号年份: 昭阳元年
+  大事件:
+    北狄入侵: false
+  $meta:
+    internal: true
+主角:
+  物品栏: {}
+女性角色:
+  江离:
+    好感度: 90
+"#;
+        let leaves = flatten_initvar_yaml(yaml).unwrap();
+        assert!(leaves.contains("世界信息.年号年份"));
+        assert!(leaves.contains("世界信息.大事件.北狄入侵"));
+        assert!(leaves.contains("主角.物品栏"), "空 mapping 应记为叶");
+        assert!(leaves.contains("女性角色.江离.好感度"));
+        assert!(
+            !leaves.iter().any(|l| l.contains("$meta")),
+            "$ 开头的元数据键应跳过"
+        );
+    }
+
+    #[test]
+    fn test_schema_alignment_scores_coverage_and_hallucination() {
+        let mut author = std::collections::BTreeSet::new();
+        author.insert("世界信息.年号年份".to_string());
+        author.insert("女性角色.江离.好感度".to_string());
+        author.insert("女性角色.江离.情绪".to_string());
+        author.insert("主角.物品栏".to_string());
+
+        let translated = vec![
+            "stat_data.女性角色.江离.好感度".to_string(), // 精确命中
+            "stat_data.女性角色.江离".to_string(),        // 对象级前缀 → 覆盖江离两叶
+            "stat_data.凭空捏造.魔力值".to_string(),      // 幻觉
+        ];
+        let report = schema_alignment("样例", "m", &translated, &author, false);
+        assert_eq!(report.grounded, 2);
+        assert_eq!(report.hallucinated, vec!["凭空捏造.魔力值".to_string()]);
+        assert!((report.hallucination_pct - 33.33).abs() < 0.4);
+        // 覆盖：江离.好感度（精确+前缀）、江离.情绪（前缀）→ 2/4
+        assert_eq!(report.covered_leaves, 2);
+        assert!((report.coverage_pct - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_schema_alignment_accepts_slash_and_template_notations() {
+        let mut author = std::collections::BTreeSet::new();
+        author.insert("主角.属性.力量".to_string());
+        author.insert("女性角色.江离.好感度".to_string());
+        author.insert("女性角色.沈若萱.好感度".to_string());
+
+        // 斜杠记法（实测 pro）+ 模板记法（实测 flash）
+        let translated = vec![
+            "/主角/属性/力量".to_string(),
+            "女性角色.{角色名}.好感度".to_string(),
+        ];
+        let report = schema_alignment("样例", "m", &translated, &author, false);
+        assert_eq!(report.grounded, 2, "{report:?}");
+        assert!(report.hallucinated.is_empty(), "{report:?}");
+        // 模板键应覆盖两个角色实例的好感度叶
+        assert_eq!(report.covered_leaves, 3, "{report:?}");
     }
 
     #[test]
