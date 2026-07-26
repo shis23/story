@@ -24,6 +24,7 @@
 pub mod budget;
 pub mod card_translation;
 pub mod commit_probe;
+pub mod forge_differential;
 pub mod context_compile_bench;
 pub mod coverage_ledger;
 pub mod endurance;
