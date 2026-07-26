@@ -414,6 +414,79 @@ impl SqliteProductionRepository {
         Ok(())
     }
 
+    // ─── MVU 翻译缓存（V005；payload 为上层 StoredMvuTranslation 全量 JSON）───
+
+    /// Upsert 一条 MVU 翻译（按 source_character_id 去重，同 JSON 店语义）。
+    pub fn save_mvu_payload(
+        db: &mut Database,
+        source_character_id: &Id,
+        character_name: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO mvu_translations (source_character_id, character_name, payload_json, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(source_character_id) DO UPDATE SET
+                character_name = excluded.character_name,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            "#,
+            rusqlite::params![
+                source_character_id.as_str(),
+                character_name,
+                json(payload)?,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        uow.commit()?;
+        Ok(())
+    }
+
+    pub fn get_mvu_payload(
+        db: &Database,
+        source_character_id: &Id,
+    ) -> Result<Option<serde_json::Value>> {
+        load_payload(
+            db.connection(),
+            "SELECT payload_json FROM mvu_translations WHERE source_character_id = ?1",
+            source_character_id.as_str(),
+        )
+    }
+
+    pub fn list_mvu_payloads(db: &Database) -> Result<Vec<serde_json::Value>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM mvu_translations ORDER BY source_character_id",
+            [],
+        )
+    }
+
+    /// 删某卡的 MVU 翻译（删卡级联用）。返回是否确有删除。
+    pub fn delete_mvu_payload(db: &mut Database, source_character_id: &Id) -> Result<bool> {
+        migrations::migrate(db)?;
+        let uow = UnitOfWork::begin(db.connection_mut())?;
+        let tx = uow.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM mvu_translations WHERE source_character_id = ?1",
+            [source_character_id.as_str()],
+        )?;
+        uow.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// definition_id 反查用：全部卡 payload（StoredCard JSON）。
+    pub fn list_card_payloads(db: &Database) -> Result<Vec<serde_json::Value>> {
+        load_payload_list(
+            db.connection(),
+            "SELECT payload_json FROM character_cards ORDER BY card_id",
+            [],
+        )
+    }
+
     /// Mark every non-terminal turn Failed. Used by SQLite startup recovery where
     /// accept is atomic (no multi-file Committing journal to replay).
     pub fn fail_incomplete_turns(db: &mut Database) -> Result<usize> {

@@ -33,7 +33,7 @@ fn audit_snapshot_is_consistent_counted_and_content_bound() {
     .unwrap();
 
     let first = capture_audit_snapshot(&mut db).unwrap();
-    assert_eq!(first.sqlite_schema_version, 4);
+    assert_eq!(first.sqlite_schema_version, 5);
     assert_eq!(first.turns, 1);
     assert_eq!(first.attempts, 1);
     assert_eq!(first.committed_turns, 1);

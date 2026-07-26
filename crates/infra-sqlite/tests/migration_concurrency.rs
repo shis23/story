@@ -26,12 +26,12 @@ fn concurrent_first_start_migrations_are_idempotent() {
     }
 
     let db = Database::open(path).unwrap();
-    assert_eq!(current_version(&db).unwrap(), 4);
+    assert_eq!(current_version(&db).unwrap(), 5);
     let rows: i64 = db
         .connection()
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(rows, 4);
+    assert_eq!(rows, 5);
 }

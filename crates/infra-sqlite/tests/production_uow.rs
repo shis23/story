@@ -978,3 +978,40 @@ fn concurrent_accepts_serialize_to_one_apply_and_one_replay() {
     assert_eq!(campaign.revision, 1);
     assert_eq!(campaign.chronicle_revision, 1);
 }
+
+/// #22：MVU 翻译 payload 的 save/get/list/delete 往返（V005 表）。
+#[test]
+fn mvu_payload_roundtrip_overwrite_and_delete() {
+    let mut db = Database::open_in_memory().unwrap();
+    let src = Id::from_str("char-mvu");
+    let payload = serde_json::json!({
+        "source_character_id": "char-mvu",
+        "character_name": "Alice",
+        "analyzed_at": "2026-07-27T00:00:00Z",
+        "translation": { "update_rules": ["damage reduces hp"] }
+    });
+    SqliteProductionRepository::save_mvu_payload(&mut db, &src, "Alice", &payload).unwrap();
+
+    let loaded = SqliteProductionRepository::get_mvu_payload(&db, &src)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded["character_name"], "Alice");
+    assert_eq!(loaded["translation"]["update_rules"][0], "damage reduces hp");
+
+    // 覆盖：同 source_character_id upsert 不产生第二行
+    let mut updated = payload.clone();
+    updated["character_name"] = serde_json::json!("Alice-改");
+    SqliteProductionRepository::save_mvu_payload(&mut db, &src, "Alice-改", &updated).unwrap();
+    let all = SqliteProductionRepository::list_mvu_payloads(&db).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["character_name"], "Alice-改");
+
+    // 删除：首删 true、再删 false、读回空
+    assert!(SqliteProductionRepository::delete_mvu_payload(&mut db, &src).unwrap());
+    assert!(!SqliteProductionRepository::delete_mvu_payload(&mut db, &src).unwrap());
+    assert!(
+        SqliteProductionRepository::get_mvu_payload(&db, &src)
+            .unwrap()
+            .is_none()
+    );
+}

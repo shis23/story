@@ -24,6 +24,7 @@ pub struct ImportReport {
     pub summaries: usize,
     pub conversations: usize,
     pub turns: usize,
+    pub mvu_translations: usize,
     pub skipped_as_duplicate: bool,
 }
 
@@ -181,6 +182,9 @@ impl<'a> JsonImporter<'a> {
             for turn in &snapshot.turns {
                 upsert_turn(tx, turn)?;
             }
+            for mvu in &snapshot.mvu_translations {
+                upsert_mvu_translation(tx, mvu)?;
+            }
 
             tx.execute(
                 r#"
@@ -205,6 +209,7 @@ impl<'a> JsonImporter<'a> {
             summaries: snapshot.summaries.len(),
             conversations: snapshot.conversations.len(),
             turns: snapshot.turns.len(),
+            mvu_translations: snapshot.mvu_translations.len(),
             skipped_as_duplicate: false,
         })
     }
@@ -223,6 +228,7 @@ fn duplicate_report(run_id: String, snapshot: &SourceSnapshot) -> ImportReport {
         summaries: snapshot.summaries.len(),
         conversations: snapshot.conversations.len(),
         turns: snapshot.turns.len(),
+        mvu_translations: snapshot.mvu_translations.len(),
         skipped_as_duplicate: true,
     }
 }
@@ -238,6 +244,7 @@ struct SourceSnapshot {
     summaries: Vec<Value>,
     conversations: Vec<Value>,
     turns: Vec<Value>,
+    mvu_translations: Vec<Value>,
 }
 
 fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
@@ -249,6 +256,7 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     let summaries = read_json_array(data_dir.join("round_summaries.json"), true)?;
     let turns = read_json_array(data_dir.join("turns.json"), true)?;
     let conversations = read_conversation_dir(data_dir.join("conversations"))?;
+    let mvu_translations = read_json_array(data_dir.join("mvu_translations.json"), true)?;
 
     let mut hasher = Sha256::new();
     hash_named_array(&mut hasher, "cards", &cards);
@@ -259,6 +267,11 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
     hash_named_array(&mut hasher, "round_summaries", &summaries);
     hash_named_array(&mut hasher, "turns", &turns);
     hash_named_array(&mut hasher, "conversations", &conversations);
+    // 注意：为保持既有已完成 run 的 manifest hash 稳定（幂等去重不被打破），
+    // mvu_translations 仅在非空时参与 hash——无 MVU 数据的老目录 hash 不变。
+    if !mvu_translations.is_empty() {
+        hash_named_array(&mut hasher, "mvu_translations", &mvu_translations);
+    }
     let manifest_hash = hex_encode(hasher.finalize());
 
     Ok(SourceSnapshot {
@@ -271,6 +284,7 @@ fn read_source_snapshot(data_dir: &Path) -> Result<SourceSnapshot> {
         summaries,
         conversations,
         turns,
+        mvu_translations,
     })
 }
 
@@ -384,6 +398,26 @@ fn upsert_card(tx: &rusqlite::Transaction<'_>, card: &Value) -> Result<()> {
             payload_json = excluded.payload_json
         "#,
         rusqlite::params![card_id, source_character_id, name, imported_at, payload],
+    )?;
+    Ok(())
+}
+
+/// StoredMvuTranslation { source_character_id, character_name, translation, analyzed_at }
+fn upsert_mvu_translation(tx: &rusqlite::Transaction<'_>, mvu: &Value) -> Result<()> {
+    let source_character_id = required_str(mvu, "source_character_id", "mvu_translation")?;
+    let character_name = optional_str(mvu, "character_name").unwrap_or_default();
+    let updated_at = optional_str(mvu, "analyzed_at").unwrap_or_default();
+    let payload = stable_json(mvu);
+    tx.execute(
+        r#"
+        INSERT INTO mvu_translations (source_character_id, character_name, payload_json, updated_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(source_character_id) DO UPDATE SET
+            character_name = excluded.character_name,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        "#,
+        rusqlite::params![source_character_id, character_name, payload, updated_at],
     )?;
     Ok(())
 }
@@ -943,6 +977,56 @@ mod tests {
             }]),
         );
         dir
+    }
+
+    /// #22：mvu_translations.json 进 SQLite 权威表；无该文件的老目录 hash 不变。
+    #[test]
+    fn imports_mvu_translations_and_keeps_legacy_hash_stable() {
+        let data = sample_data_dir();
+        let hash_without_mvu = {
+            let mut db = Database::open_in_memory().unwrap();
+            let report = JsonImporter::new(&mut db)
+                .import_data_dir(data.path())
+                .unwrap();
+            assert_eq!(report.mvu_translations, 0);
+            assert_eq!(table_count(&db, "mvu_translations").unwrap(), 0);
+            report.source_manifest_hash
+        };
+
+        // 老目录（无 mvu_translations.json）的 hash 必须与加字段前一致：
+        // 用相同内容重新读 snapshot，确认 hash 未受可选文件缺失影响。
+        let snapshot = read_source_snapshot(data.path()).unwrap();
+        assert_eq!(snapshot.manifest_hash, hash_without_mvu);
+
+        write_json(
+            &data.path().join("mvu_translations.json"),
+            &json!([{
+                "source_character_id": "char-1",
+                "character_name": "Alice",
+                "analyzed_at": "2026-07-27T00:00:00Z",
+                "translation": {
+                    "update_rules": ["damage reduces hp"],
+                    "fallback_fragments": [],
+                    "ui_bindings": []
+                }
+            }]),
+        );
+        let mut db = Database::open_in_memory().unwrap();
+        let report = JsonImporter::new(&mut db)
+            .import_data_dir(data.path())
+            .unwrap();
+        assert_eq!(report.mvu_translations, 1);
+        assert_ne!(report.source_manifest_hash, hash_without_mvu);
+        assert_eq!(table_count(&db, "mvu_translations").unwrap(), 1);
+        let stored: String = db
+            .connection()
+            .query_row(
+                "SELECT character_name FROM mvu_translations WHERE source_character_id = 'char-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "Alice");
     }
 
     #[test]

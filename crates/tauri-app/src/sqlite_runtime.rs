@@ -288,6 +288,58 @@ pub fn save_task(task: &storyforge_domain::story_task::StoryTask) -> Result<(), 
     with_db_mut(|db| SqliteProductionRepository::save_task(db, task).map_err(|e| e.to_string()))
 }
 
+// ─── MVU 翻译缓存（V005；#22 SQLite 权威補齐）────────────────────────────
+
+pub fn save_mvu(stored: &crate::campaign_store::StoredMvuTranslation) -> Result<(), String> {
+    let payload = serde_json::to_value(stored).map_err(|e| format!("序列化 MVU 翻译失败: {e}"))?;
+    with_db_mut(|db| {
+        SqliteProductionRepository::save_mvu_payload(
+            db,
+            &stored.source_character_id,
+            &stored.character_name,
+            &payload,
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+pub fn get_mvu(
+    source_character_id: &Id,
+) -> Result<Option<crate::campaign_store::StoredMvuTranslation>, String> {
+    let payload = with_db(|db| {
+        SqliteProductionRepository::get_mvu_payload(db, source_character_id)
+            .map_err(|e| e.to_string())
+    })?;
+    payload
+        .map(|value| {
+            serde_json::from_value(value).map_err(|e| format!("反序列化 MVU 翻译失败: {e}"))
+        })
+        .transpose()
+}
+
+pub fn list_mvu() -> Result<Vec<crate::campaign_store::StoredMvuTranslation>, String> {
+    let payloads =
+        with_db(|db| SqliteProductionRepository::list_mvu_payloads(db).map_err(|e| e.to_string()))?;
+    payloads
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value(value).map_err(|e| format!("反序列化 MVU 翻译失败: {e}"))
+        })
+        .collect()
+}
+
+pub fn delete_mvu(source_character_id: &Id) -> Result<bool, String> {
+    with_db_mut(|db| {
+        SqliteProductionRepository::delete_mvu_payload(db, source_character_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// definition_id → source_character_id 反查用：全部卡 payload（StoredCard JSON）。
+pub fn list_card_payloads() -> Result<Vec<serde_json::Value>, String> {
+    with_db(|db| SqliteProductionRepository::list_card_payloads(db).map_err(|e| e.to_string()))
+}
+
 pub fn capture_audit_snapshot() -> Result<storyforge_infra_sqlite::SqliteAuditSnapshot, String> {
     with_db_mut(|db| storyforge_infra_sqlite::capture_audit_snapshot(db).map_err(|e| e.to_string()))
 }

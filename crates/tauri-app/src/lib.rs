@@ -1215,7 +1215,14 @@ fn delete_character(
     // 两者常不同。新数据使用 CharacterInfo.source_character_id；旧数据兼容 StoredCharacter.id
     // 以及同会话 tool_ctx.characters 中按角色名找到的 Character.id。
     for source_id in &source_ids {
-        let _ = get_campaign_store().delete_mvu(source_id);
+        // #22：MVU 翻译级联删除按后端分流（SQLite → mvu_translations 表）
+        if sqlite_runtime::is_sqlite_active() {
+            if let Err(e) = sqlite_runtime::delete_mvu(source_id) {
+                tracing::warn!("SQLite MVU 翻译级联删除失败（{source_id}）: {e}");
+            }
+        } else {
+            let _ = get_campaign_store().delete_mvu(source_id);
+        }
         // 尝试用 StoredCharacter.id 直接查（旧路径，可能命中）
         if let Some(stored_card) = get_campaign_store().get_card_by_source(source_id) {
             // 桥接：通过角色名找到 Character.id，再查 card
@@ -4658,19 +4665,103 @@ fn collect_mvu_fallback_fragments(
 /// SQLite does not yet migrate the optional MVU translation cache. Do not
 /// read its JSON file as a hidden second authority; run postprocess without
 /// those optional snippets until MVU has a typed SQLite table.
-fn collect_mvu_fallback_fragments_for_backend(
+pub fn collect_mvu_fallback_fragments_for_backend(
     ctx: &WritingContext,
     present_chars: &[String],
 ) -> Vec<storyforge_domain::mvu_translation::FallbackFragment> {
     if sqlite_runtime::is_sqlite_active() {
-        tracing::debug!(
-            count = present_chars.len(),
-            "sqlite backend skips JSON-only MVU fallback fragments"
-        );
-        Vec::new()
+        // #22：SQLite 已是 MVU 翻译权威（V005 表 + importer 迁移），直接读它。
+        collect_mvu_from_sqlite(ctx, present_chars, false, |stored| {
+            stored
+                .translation
+                .fallback_fragments
+                .into_iter()
+                .filter(|f| !f.js_snippet.is_empty())
+                .collect()
+        })
     } else {
         collect_mvu_fallback_fragments(ctx, get_campaign_store(), present_chars)
     }
+}
+
+/// #22：SQLite 后端的 MVU 收集骨架——与 JSON 版同语义：
+/// present instance → definition_id → source 卡（def→source 反查表来自
+/// character_cards payload）→ mvu_translations 表取翻译，`extract` 挑字段。
+/// `dedup_sources=true` 时同一 source 卡只贡献一次（规则收集用）。
+fn collect_mvu_from_sqlite<T>(
+    ctx: &WritingContext,
+    present_chars: &[String],
+    dedup_sources: bool,
+    mut extract: impl FnMut(campaign_store::StoredMvuTranslation) -> Vec<T>,
+) -> Vec<T> {
+    let runtime = match &ctx.campaign_runtime {
+        Some(rt) => rt,
+        None => return vec![],
+    };
+    let payloads = match sqlite_runtime::list_card_payloads() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("[MVU] SQLite 卡 payload 读取失败，本轮不注入: {e}");
+            return vec![];
+        }
+    };
+    // payload 兼容两种形态：StoredCard 包装（生产写入）/ 裸 CharacterCard（旧 cutover 源）
+    let def_to_source: std::collections::HashMap<Id, Id> = payloads
+        .iter()
+        .filter_map(|value| {
+            let inner = value.get("card").unwrap_or(value);
+            serde_json::from_value::<storyforge_domain::character::CharacterCard>(inner.clone())
+                .ok()
+        })
+        .flat_map(|card| {
+            let src = card.source_character_id.clone();
+            card.character_definitions
+                .into_iter()
+                .map(move |d| (d.id, src.clone()))
+        })
+        .collect();
+
+    let mut visited_sources = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for char_id_str in present_chars {
+        let char_id = Id::from_str(char_id_str);
+        let inst = runtime
+            .instances
+            .iter()
+            .find(|i| i.id == char_id || i.name == *char_id_str);
+        let inst = match inst {
+            Some(i) => i,
+            None => continue,
+        };
+        let def_id = match &inst.definition_id {
+            Some(d) => d,
+            None => continue,
+        };
+        let source_id = match def_to_source.get(def_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        if dedup_sources && !visited_sources.insert(source_id.clone()) {
+            continue;
+        }
+        match sqlite_runtime::get_mvu(source_id) {
+            Ok(Some(stored)) => {
+                let items = extract(stored);
+                if !items.is_empty() {
+                    tracing::info!(
+                        target: "tauri-app",
+                        "[MVU] 角色 '{}' 所属卡贡献 {} 条 MVU 产物（SQLite）",
+                        inst.name,
+                        items.len()
+                    );
+                    out.extend(items);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("[MVU] SQLite 翻译读取失败（{}）: {e}", inst.name),
+        }
+    }
+    out
 }
 
 /// CampaignStore.cards → source_character_id → MvuTranslation.update_rules
@@ -4743,18 +4834,22 @@ fn collect_mvu_update_rules(
     rules
 }
 
-/// 同 `collect_mvu_fallback_fragments_for_backend` 的后端门：SQLite 未迁移
-/// MVU 翻译缓存前不读它的 JSON 文件当第二权威。
-fn collect_mvu_update_rules_for_backend(
+/// 后端分流：SQLite 活跃时读 mvu_translations 表（V005 起为权威），
+/// 否则读 JSON CampaignStore——两条路径同语义（按 source 卡去重）。
+pub fn collect_mvu_update_rules_for_backend(
     ctx: &WritingContext,
     present_chars: &[String],
 ) -> Vec<String> {
     if sqlite_runtime::is_sqlite_active() {
-        tracing::debug!(
-            count = present_chars.len(),
-            "sqlite backend skips JSON-only MVU update rules"
-        );
-        Vec::new()
+        // #22：SQLite 已是 MVU 翻译权威，规则收集不再空转（按 source 卡去重）。
+        collect_mvu_from_sqlite(ctx, present_chars, true, |stored| {
+            stored
+                .translation
+                .update_rules
+                .into_iter()
+                .filter(|r| !r.trim().is_empty())
+                .collect()
+        })
     } else {
         collect_mvu_update_rules(ctx, get_campaign_store(), present_chars)
     }
@@ -9142,11 +9237,7 @@ async fn meta_analyze_mvu_card(
 ) -> Result<MvuTranslationDetailDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
 
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
-        "MVU translation analysis/persistence",
-    )
-    .map_err(TauriCommandError::validation)?;
+    // #22：分析与持久化两个后端都支持——SQLite 活跃时写 mvu_translations 表。
 
     // 取原 Character
     let character = {
@@ -9177,7 +9268,7 @@ async fn meta_analyze_mvu_card(
         .await
         .map_err(|e| TauriCommandError::validation(format!("MVU 分析失败: {e}")))?;
 
-    // 持久化到 CampaignStore
+    // 持久化（后端分流：SQLite → mvu_translations 表；否则 JSON CampaignStore）
     let analyzed_at = chrono::Utc::now().to_rfc3339();
     let stored = campaign_store::StoredMvuTranslation {
         source_character_id: character.id.clone(),
@@ -9185,7 +9276,15 @@ async fn meta_analyze_mvu_card(
         translation: translation.clone(),
         analyzed_at: analyzed_at.clone(),
     };
-    save_mvu_translation_async(get_campaign_store(), stored).await?;
+    if sqlite_runtime::is_sqlite_active() {
+        let stored_for_sqlite = stored.clone();
+        tokio::task::spawn_blocking(move || sqlite_runtime::save_mvu(&stored_for_sqlite))
+            .await
+            .map_err(|e| TauriCommandError::internal(format!("保存 MVU 翻译任务失败: {e}")))?
+            .map_err(TauriCommandError::storage)?;
+    } else {
+        save_mvu_translation_async(get_campaign_store(), stored).await?;
+    }
 
     Ok(MvuTranslationDetailDto {
         source_character_id: character.id.as_str().to_string(),
@@ -9215,15 +9314,16 @@ fn save_mvu_translation_to_store(
 }
 
 /// Tauri command: 列所有已分析的 MVU 翻译
+///
+/// #22：SQLite 活跃时读 mvu_translations 表（V005 起为权威），不再拒绝。
 #[tauri::command]
 fn meta_list_mvu_translations() -> Result<Vec<MvuTranslationSummaryDto>, TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
-        "MVU translation listing",
-    )
-    .map_err(TauriCommandError::validation)?;
-    Ok(get_campaign_store()
-        .list_all_mvu()
+    let list = if sqlite_runtime::is_sqlite_active() {
+        sqlite_runtime::list_mvu().map_err(TauriCommandError::storage)?
+    } else {
+        get_campaign_store().list_all_mvu()
+    };
+    Ok(list
         .iter()
         .map(|m| MvuTranslationSummaryDto {
             source_character_id: m.source_character_id.as_str().to_string(),
@@ -9238,18 +9338,19 @@ fn meta_list_mvu_translations() -> Result<Vec<MvuTranslationSummaryDto>, TauriCo
 }
 
 /// Tauri command: 查某角色卡的 MVU 翻译详情（前端渲染状态栏用）
+///
+/// #22：SQLite 活跃时读 mvu_translations 表，不再拒绝。
 #[tauri::command]
 fn meta_get_mvu_translation(
     source_character_id: String,
 ) -> Result<Option<MvuTranslationDetailDto>, TauriCommandError> {
-    meta_backend::ensure_json_meta_backend_supported(
-        sqlite_runtime::is_sqlite_active(),
-        "MVU translation lookup",
-    )
-    .map_err(TauriCommandError::validation)?;
-    let store = get_campaign_store();
     let id = Id::from_str(source_character_id);
-    Ok(store.get_mvu(&id).map(|m| MvuTranslationDetailDto {
+    let found = if sqlite_runtime::is_sqlite_active() {
+        sqlite_runtime::get_mvu(&id).map_err(TauriCommandError::storage)?
+    } else {
+        get_campaign_store().get_mvu(&id)
+    };
+    Ok(found.map(|m| MvuTranslationDetailDto {
         source_character_id: m.source_character_id.as_str().to_string(),
         character_name: m.character_name.clone(),
         analyzed_at: m.analyzed_at.clone(),

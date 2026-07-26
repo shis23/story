@@ -47,6 +47,11 @@ pub fn builtin_migrations() -> Vec<Migration> {
             name: "preaccept_lifecycle",
             sql: include_str!("../migrations/V004__preaccept_lifecycle.sql"),
         },
+        Migration {
+            version: 5,
+            name: "mvu_translations",
+            sql: include_str!("../migrations/V005__mvu_translations.sql"),
+        },
     ]
 }
 
@@ -219,12 +224,12 @@ mod tests {
     fn migrate_applies_v1_and_is_idempotent() {
         let mut db = Database::open_in_memory().unwrap();
         let first = migrate(&mut db).unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4]);
-        assert_eq!(current_version(&db).unwrap(), 4);
+        assert_eq!(first, vec![1, 2, 3, 4, 5]);
+        assert_eq!(current_version(&db).unwrap(), 5);
 
         let second = migrate(&mut db).unwrap();
         assert!(second.is_empty());
-        assert_eq!(current_version(&db).unwrap(), 4);
+        assert_eq!(current_version(&db).unwrap(), 5);
 
         // 核心表应存在
         for table in [
@@ -239,6 +244,7 @@ mod tests {
             "chronicle_publication_jobs",
             "preaccept_outbox",
             "import_runs",
+            "mvu_translations",
         ] {
             let exists: i64 = db
                 .connection()
@@ -264,8 +270,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4]);
-        assert_eq!(current_version(&db).unwrap(), 4);
+        assert_eq!(migrate(&mut db).unwrap(), vec![2, 3, 4, 5]);
+        assert_eq!(current_version(&db).unwrap(), 5);
         let cards: i64 = db
             .connection()
             .query_row(
