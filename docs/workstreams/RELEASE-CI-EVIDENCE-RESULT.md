@@ -387,3 +387,15 @@ cargo fmt 漂移 26 文件；clippy 违规 30+ 处（domain/infra-llm/infra-rege
 tauri-app：collapsible_if、field_reassign_with_default、redundant_closure、
 cloned_ref_to_slice_refs、type_complexity、let_and_return）。本地
 `cargo clippy --workspace --all-targets -- -D warnings` 现为 0 error。
+
+### 首个完整绿 run（2026-07-27，run head c42cf2f）
+
+`ci-gates` 四 linux job 全 success：rust-fmt / rust-clippy（--workspace
+--all-targets -D warnings）/ rust-test（--workspace）/ frontend-gate
+（npm ci + node --test 418 + vite build）。windows 三 job 按
+HAS_WINDOWS_RUNNER 条件门显式 skip。
+
+四轮修复循环抓出的 5 个真实跨平台缺陷（每轮前进一个，全部修复入库）：
+platform_locking cfg 门、card_shell_cache URL 断言、card_studio UTF-8
+字节切 ×CRLF 漂移、prompt-hooks 未闭合 test 块（node22 cancelledByParent）、
+node --test glob 版本差异。前文 "Remote CI execution (unverified)" 状态解除。

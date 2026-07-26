@@ -121,7 +121,7 @@
 
 ### P3 新专项（用户今晚拍板）
 
-- [~] **#30 CI**（进行中，基础设施全部就位）：
+- [x] **#30 CI 完成**：
   - **本机安装包证据 ✅**：`cargo tauri build` 双包成功——
     `StoryForge_0.1.0_x64_en-US.msi`（11.3MB，sha256 48f0a905…a16bfd9f）、
     `StoryForge_0.1.0_x64-setup.exe`（8.0MB，sha256 142ff7be…324807c5）。
@@ -142,7 +142,16 @@
     clippy 违规（domain 16 处 / infra-llm 2 处 / infra-regex 10 处 /
     tauri-app 若干——collapsible_if、field_reassign_with_default、
     redundant_closure、let_and_return）。
-  - 待收：clippy 全绿 → 推送 → 观察 linux 4 job 首绿。
+  - **✅ 全绿达成（run c42cf2f）**：rust-fmt / rust-clippy / rust-test /
+    frontend-gate 四关 success——Gitea Actions 首个完整绿 run。
+    四轮修复循环共抓出 5 个真实跨平台缺陷（全部入库）：
+    ①platform_locking Windows API 无 cfg 门（E0433/E0599）
+    ②card_shell_cache 缓存 URL 断言硬编码 Windows 形态
+    ③card_studio 字节硬切中文常量 ×CRLF/LF 漂移 panic
+    （新增 truncate_at_char_boundary 治本）
+    ④prompt-hooks.test.mjs 未闭合 test 块（8 测试嵌套注册，node22 全灭）
+    ⑤node --test glob 参数 v22 起才支持（CI node 20→22 LTS）
+    另 m5 两个时序测试窗口按慢容器加宽（不变量保持）。
 - [x] **#31 盲测首轮完成**（964s 全绿，RESULT 见 BLIND-AB-PIPELINE-RESULT.md）：
   质量不可区分（胜场 1:1:2 平）+ 成本硬数据 solo 111.6s vs 流水线 425.8s
   （3.8×）→ 预注册口径落「优势不显著 → 重设计优先简化」，续写档默认化
