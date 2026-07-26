@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(client.calls_used(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_dispatch_wait_counts_toward_total_timeout() {
         struct HangingProbe(Arc<AtomicU32>);
 
@@ -1256,22 +1256,28 @@ mod tests {
                 max_tokens: None,
             },
         );
-        let first_client = client.clone();
-        let first = tokio::spawn(async move { first_client.chat(&dummy_req()).await });
-        while invoked.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        // Hold the gate directly instead of via a first in-flight `chat`: that
+        // call's own 1s budget would release the permit at nearly the same
+        // instant the queued call's deadline fires, so under parallel load the
+        // queued call could win the permit and reserve a second call slot.
+        let held_permit = client
+            .dispatch_gate
+            .acquire()
+            .await
+            .expect("dispatch gate open at start");
 
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let result = tokio::time::timeout(Duration::from_millis(1_500), client.chat(&dummy_req()))
             .await
             .expect("queued invocation must honor its own one-second budget");
+        drop(held_permit);
 
-        first.abort();
         assert!(matches!(result, Err(LlmError::Timeout)));
-        assert!(t0.elapsed() < Duration::from_millis(1_400));
-        assert_eq!(invoked.load(Ordering::SeqCst), 1);
-        assert_eq!(client.calls_used(), 1);
+        let waited = t0.elapsed();
+        assert!(waited >= Duration::from_secs(1));
+        assert!(waited < Duration::from_millis(1_400));
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        assert_eq!(client.calls_used(), 0);
     }
 
     #[tokio::test]
