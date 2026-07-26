@@ -64,6 +64,7 @@ import {
   resolveCampaignWorldbookEnabledUpdates,
 } from '../utils/cardShellWorldbook.js'
 import { normalizeShellHeight } from '../utils/cardShellPresentation.js'
+import { buildMvuStatDataTree } from '../utils/mvuStatTree.js'
 import {
   createCardShellFetchProxyScript,
   createCardShellMapReadyFallbackScript,
@@ -72,6 +73,7 @@ import {
   CARD_SHELL_VARIABLES_KEY,
   enqueueCardShellVariableMutation,
   mergeCardShellVariables,
+  patchCardShellVariables,
   readCardShellVariables,
   updateCardShellVariables,
 } from '../utils/cardShellVariableStore.js'
@@ -139,6 +141,8 @@ let inlineModuleSeq = 0
 let bridgeSessionSeq = 0
 let activeBridgeSession = ''
 let shellSelectorVariables = {}
+// M5：真实 Campaign 变量树快照（Mvu shim 只读底座），mvu_data_get 桥可刷新
+let shellMvuStatData = {}
 // Allowlist snapshot for the CSP meta; empty = data:/blob:/cache-origin only
 // (fail closed: shells still work through the host fetch proxy).
 let shellAllowedHosts = []
@@ -238,6 +242,12 @@ async function loadShellSelectorVariables() {
   return readCardShellVariables(values)
 }
 
+async function loadShellMvuStatData() {
+  if (!props.campaignId) return {}
+  const values = await getCampaignVariables(props.campaignId)
+  return buildMvuStatDataTree(values)
+}
+
 async function persistShellSelectorVariables(selector, variables, mode = 'replace') {
   if (!props.campaignId) {
     throw new Error('card shell variables require an active Campaign')
@@ -246,9 +256,13 @@ async function persistShellSelectorVariables(selector, variables, mode = 'replac
   const next = await enqueueCardShellVariableMutation(props.campaignId, async () => {
     const values = await getCampaignVariables(props.campaignId)
     const current = readCardShellVariables(values)
-    const updated = mode === 'merge'
-      ? mergeCardShellVariables(current, selector, variables)
-      : updateCardShellVariables(current, selector, variables)
+    // patch = 壳侧相对自身快照的键级 sets/deletes（M2 修复的新协议）；
+    // merge/replace 保留兼容已挂载的旧包装文档。
+    const updated = mode === 'patch'
+      ? patchCardShellVariables(current, selector, variables)
+      : mode === 'merge'
+        ? mergeCardShellVariables(current, selector, variables)
+        : updateCardShellVariables(current, selector, variables)
     await setCampaignVariable(props.campaignId, CARD_SHELL_VARIABLES_KEY, updated)
     return updated
   })
@@ -731,6 +745,7 @@ function wrapRemoteHtml(html, pageUrl, bridgeSession, selectorVariables = {}, op
     sOpen + createCardShellRuntimeCompatibilityScript({
       worldbookName: props.campaignId ? `storyforge:campaign:${props.campaignId}` : '',
       selectorVariables,
+      mvuStatData: shellMvuStatData,
     }) + sClose +
     sOpen + preloadLines.join('\n') + sClose +
     sOpen + fetchPatchLines.join('\n') + sClose +
@@ -777,6 +792,12 @@ async function loadShell() {
   loading.value = true
   try {
     shellSelectorVariables = await loadShellSelectorVariables()
+    try {
+      shellMvuStatData = await loadShellMvuStatData()
+    } catch (e) {
+      console.warn('[CardShell] MVU stat tree fetch failed, shim starts empty', e)
+      shellMvuStatData = {}
+    }
     try {
       shellAllowedHosts = await cardShellListAllowedHosts()
     } catch (e) {
@@ -934,6 +955,13 @@ async function onBridgeMessage(ev) {
       reply(getMvuRuntimeShellStatus())
       return
     }
+    if (type === 'mvu_data_get') {
+      // M5：Mvu shim 刷新只读 stat_data 底座（真实 Campaign 变量树）
+      const tree = await loadShellMvuStatData()
+      shellMvuStatData = tree
+      reply(tree)
+      return
+    }
     if (type === 'fetch_inline_module') {
       const id = payload.id
       // All visible shell hosts receive the same parent-window message. A
@@ -949,22 +977,39 @@ async function onBridgeMessage(ev) {
   }
 }
 
-watch(
-  () => [props.url, props.html, props.campaignId, props.openingChatSeed],
-  () => {
-    loadShell()
-  },
-  { deep: true },
+// M1：openingChatSeed 由父级 computed 每次求值产出新引用，deep watch 按引用
+// 触发会在无关状态变化（导入角色等）时重建进行中的设置 iframe——表单清空、
+// 在飞 ask 挂到超时。改比内容指纹：内容不变绝不重载。
+const shellIdentity = computed(() =>
+  JSON.stringify([
+    props.url ?? null,
+    props.html ?? null,
+    props.campaignId ?? null,
+    props.openingChatSeed ?? null,
+  ]),
 )
+watch(shellIdentity, () => {
+  loadShell()
+})
 
 onMounted(() => {
   bridgeHandler = onBridgeMessage
   stHostHandler = createHostHandler(shellVirtualPlugin, invoke, {
     isTrustedSource: (event) => {
+      // L3：旧回退「data.pluginId 字段匹配即信任」不校验来源窗口，任意页面
+      // 脚本可伪造。改为窗口归属判定：event.source 沿 parent 链归属本壳
+      // iframe 才可信（壳内嵌套子 iframe 的 TH 消息也在链上，功能不回退）。
       try {
-        if (iframeRef.value?.contentWindow && event.source === iframeRef.value.contentWindow) return true
+        const shellWindow = iframeRef.value?.contentWindow
+        if (!shellWindow || !event?.source) return false
+        let w = event.source
+        for (let i = 0; w && i < 10; i++) {
+          if (w === shellWindow) return true
+          if (w === w.parent) break
+          w = w.parent
+        }
       } catch (_) {}
-      return !!(event?.data && event.data.pluginId === shellPluginId)
+      return false
     },
   })
   window.addEventListener('message', bridgeHandler)

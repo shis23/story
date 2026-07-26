@@ -1193,6 +1193,14 @@ export async function cardShellAllowHost(host) {
   }
 }
 
+/** 清空卡壳磁盘缓存（L6 刷新通道）；返回清掉的对象数 */
+export async function cardShellClearCache() {
+  if (isTauri()) {
+    return await invoke('card_shell_clear_cache')
+  }
+  return 0
+}
+
 /** 宿主代持拉取远程壳资源；失败抛错（不静默降级） */
 export async function cardShellFetchUrl(url) {
   if (isTauri()) {

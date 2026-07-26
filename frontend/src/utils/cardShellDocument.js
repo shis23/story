@@ -24,7 +24,7 @@ export function rewriteCardShellTopBridgeAccess(html) {
  * letting the card show a concrete unsupported state instead of retaining its
  * initial loading placeholder forever.
  *
- * @param {{worldbookName?: string, selectorVariables?: Record<string, object>}} options
+ * @param {{worldbookName?: string, selectorVariables?: Record<string, object>, mvuStatData?: Record<string, unknown>}} options
  * @returns {string}
  */
 export function createCardShellRuntimeCompatibilityScript(options = {}) {
@@ -41,10 +41,16 @@ export function createCardShellRuntimeCompatibilityScript(options = {}) {
   const selectorVariables = scriptJson(options.selectorVariables && typeof options.selectorVariables === 'object'
     ? options.selectorVariables
     : {})
+  const mvuStatData = scriptJson(options.mvuStatData && typeof options.mvuStatData === 'object'
+    ? options.mvuStatData
+    : {})
   return [
     '(function(){',
     `  var WORLD_BOOK_NAME = ${worldbookName};`,
     `  var SELECTOR_VARIABLES = ${selectorVariables};`,
+    // M5：真实 Campaign 变量树（stat_data 底座，只读）。构建时注入快照，
+    // mvu_data_get 桥可刷新；壳自写的选择器桶按键覆盖其上。
+    `  var MVU_STAT_DATA = ${mvuStatData};`,
     '  function bridge(type, payload){',
     '    if (typeof window.__sfShellAsk !== "function") {',
     '      return Promise.reject(new Error("StoryForge card shell bridge is unavailable"));',
@@ -92,13 +98,30 @@ export function createCardShellRuntimeCompatibilityScript(options = {}) {
     '  }',
     '  function isSelector(value){ return isRecord(value) && typeof value.type === "string"; }',
     '  function getVariables(selector){ return clone(SELECTOR_VARIABLES[selectorKey(selector)]); }',
+    '  function diffVariables(prev, next){',
+    '    var sets = {}; var deletes = []; var k; var same;',
+    '    for (k in next) { if (Object.prototype.hasOwnProperty.call(next, k)) {',
+    '      try { same = JSON.stringify(prev[k]) === JSON.stringify(next[k]); } catch (_) { same = false; }',
+    '      if (!same) sets[k] = next[k];',
+    '    } }',
+    '    for (k in prev) { if (Object.prototype.hasOwnProperty.call(prev, k) && !Object.prototype.hasOwnProperty.call(next, k)) deletes.push(k); }',
+    '    return { sets: sets, deletes: deletes };',
+    '  }',
     '  function persistVariables(selector, variables, mode){',
     '    var next = clone(variables);',
     '    var writeMode = mode === "merge" ? "merge" : "replace";',
     '    var key = selectorKey(selector);',
-    '    if (writeMode === "merge") SELECTOR_VARIABLES[key] = Object.assign(getVariables(selector), next);',
-    '    else SELECTOR_VARIABLES[key] = next;',
-    '    var task = bridge("shell_variables_set", { selector: selector || { type: String(key).split(":")[0] }, variables: next, mode: writeMode });',
+    '    var payloadMode = writeMode; var payload = next;',
+    '    if (writeMode === "replace") {',
+    // M2：整桶 replace 携带的是本壳过期快照，会抹掉另一壳对同桶的写入。
+    // 改发相对本壳快照的键级补丁（sets/deletes），宿主按键应用，
+    // 本壳未触碰的键在宿主侧存活。
+    '      payloadMode = "patch"; payload = diffVariables(getVariables(selector), next);',
+    '      SELECTOR_VARIABLES[key] = next;',
+    '    } else {',
+    '      SELECTOR_VARIABLES[key] = Object.assign(getVariables(selector), next);',
+    '    }',
+    '    var task = bridge("shell_variables_set", { selector: selector || { type: String(key).split(":")[0] }, variables: payload, mode: payloadMode });',
     '    task.catch(function(error){ try { console.error("[CardShell] variable persistence failed", error); } catch (_) {} });',
     '    return task;',
     '  }',
@@ -152,12 +175,42 @@ export function createCardShellRuntimeCompatibilityScript(options = {}) {
     '  helper.replaceVariables = replaceVariables;',
     '  helper.updateVariablesWith = updateVariablesWith;',
     '  helper.deleteVariable = deleteVariable;',
+    '  function cloneValue(v){ try { return v === undefined ? null : JSON.parse(JSON.stringify(v)); } catch (_) { return null; } }',
+    '  function deepMergeRecords(base, extra){',
+    '    var out = isRecord(base) ? clone(base) : {};',
+    '    if (!isRecord(extra)) return out;',
+    '    for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) {',
+    '      out[k] = isRecord(out[k]) && isRecord(extra[k]) ? deepMergeRecords(out[k], extra[k]) : cloneValue(extra[k]);',
+    '    } }',
+    '    return out;',
+    '  }',
     '  var mvu = window.Mvu || {};',
     '  mvu.runtime = mvu.runtime || "StoryForge WebViewMvuRuntime";',
+    // M5：events 常量表——缺失时 eventOn(Mvu.events.…) 直接 TypeError 中止整段
+    // 内联脚本。宿主不发这些事件（监听是空转），但脚本余下部分得以执行。
+    '  mvu.events = mvu.events || {',
+    '    SINGLE_VARIABLE_UPDATED: "mag_variable_updated",',
+    '    VARIABLE_UPDATE_STARTED: "mag_variable_update_started",',
+    '    VARIABLE_UPDATE_ENDED: "mag_variable_update_ended"',
+    '  };',
+    '  function refreshMvuStatData(){',
+    '    return bridge("mvu_data_get", {}).then(function(data){',
+    '      if (isRecord(data)) MVU_STAT_DATA = data;',
+    '      return MVU_STAT_DATA;',
+    '    }).catch(function(){ return MVU_STAT_DATA; });',
+    '  }',
     '  mvu.isReady = function(){ return bridge("mvu_status", {}); };',
-    '  mvu.getMvuData = function(selector){ return getVariables(selector); };',
+    // M5：读侧桥接真实 Campaign 变量树（只读底座），壳自写桶键级覆盖其上；
+    // 写侧保持沙箱桶（不直写一等变量，与 M4 一致）。
+    '  mvu.getMvuData = function(selector){',
+    '    var local = getVariables(selector);',
+    '    local.stat_data = deepMergeRecords(MVU_STAT_DATA, isRecord(local.stat_data) ? local.stat_data : {});',
+    '    return local;',
+    '  };',
+    '  mvu.refreshMvuData = refreshMvuStatData;',
     '  mvu.replaceMvuData = function(value, selector){ return persistVariables(selector, value, "replace"); };',
     '  window.Mvu = mvu;',
+    '  refreshMvuStatData();',
     '  window.waitGlobalInitialized = window.waitGlobalInitialized || function(name){',
     '    var globalName = String(name || "");',
     '    if (globalName !== "Mvu") {',
@@ -168,7 +221,7 @@ export function createCardShellRuntimeCompatibilityScript(options = {}) {
     '    var deadline = Date.now() + 2500;',
     '    function check(){',
     '      return bridge("mvu_status", {}).then(function(status){',
-    '        if (status && status.ready) return window.Mvu;',
+    '        if (status && status.ready) return refreshMvuStatData().then(function(){ return window.Mvu; });',
     '        if (Date.now() >= deadline) throw new Error("Mvu unavailable in the StoryForge card shell");',
     '        return new Promise(function(resolve){ setTimeout(resolve, 50); }).then(check);',
     '      });',

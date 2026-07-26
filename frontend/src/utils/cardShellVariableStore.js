@@ -84,6 +84,24 @@ export function mergeCardShellVariables(snapshot, selector, variables) {
   return next
 }
 
+/**
+ * Apply a key-level patch (sets + deletes) computed by a shell against its own
+ * local view. Unlike a whole-bucket replace, keys this shell never touched
+ * survive — so an opening shell's theme keys cannot be erased by a status
+ * shell holding a stale snapshot (CARD-SHELL-REVIEW M2).
+ */
+export function patchCardShellVariables(snapshot, selector, patch) {
+  const next = normalizeCardShellVariables(snapshot)
+  const key = selectorKey(selector)
+  const bucket = cloneRecord(next[key])
+  Object.assign(bucket, isRecord(patch?.sets) ? cloneRecord(patch.sets) : {})
+  for (const name of Array.isArray(patch?.deletes) ? patch.deletes : []) {
+    if (typeof name === 'string') delete bucket[name]
+  }
+  next[key] = bucket
+  return next
+}
+
 // Visible opening/status shells are separate iframe hosts. Serialize their
 // read-modify-write cycles so a drawing save cannot erase a theme save made by
 // the other surface a moment earlier.
@@ -95,7 +113,9 @@ export function enqueueCardShellVariableMutation(campaignId, mutation) {
 
   const previous = campaignWriteTails.get(key) || Promise.resolve()
   const task = previous.catch(() => undefined).then(mutation)
-  const tail = task.finally(() => {
+  // 尾巴自身吞掉 rejection：调用方 await 的是 task，失败的 mutation 不该
+  // 额外触发一次全局 unhandledRejection（L2 测试实测暴露）。
+  const tail = task.catch(() => undefined).finally(() => {
     if (campaignWriteTails.get(key) === tail) campaignWriteTails.delete(key)
   })
   campaignWriteTails.set(key, tail)

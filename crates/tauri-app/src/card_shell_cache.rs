@@ -40,6 +40,10 @@ pub fn default_allowed_hosts() -> Vec<String> {
         // The Destiny card's two map sources are served from this image CDN.
         // Keep this explicit rather than allowing arbitrary image hosts.
         "i.ibb.co".into(),
+        // 卿卿卡的立绘/图鉴图床（CARD-SHELL-REVIEW L5）：不在白名单时壳内
+        // fetch() 硬失败且 <img> 只能直连网络（CSP 拦截、不缓存不代理）。
+        // 与 i.ibb.co 同理，点名主机而非放开任意图床。
+        "i.postimg.cc".into(),
         "raw.githubusercontent.com".into(),
         "github.com".into(),
         "gitee.com".into(),
@@ -89,6 +93,26 @@ impl CardShellCache {
     #[allow(dead_code)]
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// 清空磁盘缓存（L6：未 pin 依赖首取即冻结，需要手动刷新通道）。
+    /// 只清 card-shell-cache 目录自身内容，返回清掉的对象数。
+    pub fn clear_cache(&self) -> Result<usize, String> {
+        let entries =
+            std::fs::read_dir(&self.cache_dir).map_err(|e| format!("read cache dir: {e}"))?;
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ok = if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            if ok {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     pub fn list_allowed_hosts(&self) -> Vec<String> {
@@ -233,11 +257,15 @@ impl CardShellCache {
         client: &reqwest::blocking::Client,
     ) -> Result<ShellFetchResult, String> {
         self.validate_fetch_url(url)?;
-        if let Some(result) = self.cached_optional_map_fallback(url) {
-            return Ok(result);
-        }
+        // 自身缓存命中优先于标准图兜底：超清图一旦成功缓存过（如在标准图
+        // 之前抓取），必须能命中自己的缓存——否则标准图先缓存后超清图永不
+        // 可达（CARD-SHELL-REVIEW L1）。防卡死语义保留：仅在超清图未缓存
+        // 时才用标准图顶替，绝不为它发起分钟级网络请求。
         if let Some((path, bytes, content_type)) = self.read_cache(url) {
             return Ok(to_result(url, content_type, bytes, path, true));
+        }
+        if let Some(result) = self.cached_optional_map_fallback(url) {
+            return Ok(result);
         }
         let (_final_url, resp) = self.send_checked_request(client, url, None)?;
         if !resp.status().is_success() {
@@ -523,6 +551,16 @@ mod tests {
     }
 
     #[test]
+    fn defaults_allow_the_qingqing_card_image_host() {
+        // L5：卿卿卡立绘/图鉴走 i.postimg.cc，白名单缺失时壳内 fetch 硬失败
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        assert!(cache
+            .is_url_allowed("https://i.postimg.cc/abc123/portrait.png")
+            .is_ok());
+    }
+
+    #[test]
     fn keeps_large_binary_maps_out_of_the_ipc_base64_payload() {
         let dir = tempdir().unwrap();
         let cache = CardShellCache::new(dir.path());
@@ -579,6 +617,58 @@ mod tests {
         assert_eq!(result.fallback_message.as_deref(), Some(ULTRA_MAP_FALLBACK_MESSAGE));
         assert!(result.cache_url.is_some());
         assert!(result.body_base64.is_none());
+    }
+
+    #[test]
+    fn clear_cache_removes_objects_and_keeps_directory_usable() {
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        cache
+            .write_cache("https://i.ibb.co/example/a.webp", "image/webp", &[1, 2])
+            .unwrap();
+        cache
+            .write_cache("https://i.ibb.co/example/b.webp", "image/webp", &[3, 4])
+            .unwrap();
+
+        let removed = cache.clear_cache().unwrap();
+        assert!(removed >= 2, "对象与 meta 都应清掉, removed={removed}");
+        assert!(cache.read_cache("https://i.ibb.co/example/a.webp").is_none());
+
+        // 清空后目录仍可写
+        cache
+            .write_cache("https://i.ibb.co/example/c.webp", "image/webp", &[5])
+            .unwrap();
+        assert!(cache.read_cache("https://i.ibb.co/example/c.webp").is_some());
+    }
+
+    #[test]
+    fn cached_ultra_map_wins_over_standard_map_fallback() {
+        // L1 回归：超清图自身已缓存时必须命中自己的缓存，
+        // 不得被标准图兜底劫持。
+        let dir = tempdir().unwrap();
+        let cache = CardShellCache::new(dir.path());
+        cache
+            .write_cache(DESTINY_STANDARD_MAP_URL, "image/webp", &[1u8; 8])
+            .unwrap();
+        cache
+            .write_cache(DESTINY_ULTRA_MAP_URL, "image/webp", &[2u8; 8])
+            .unwrap();
+
+        let client = cache.build_client().unwrap();
+        let result = cache
+            .fetch_blocking_with_client(DESTINY_ULTRA_MAP_URL, &client)
+            .expect("cached ultra map should be served");
+
+        assert_eq!(result.url, DESTINY_ULTRA_MAP_URL);
+        assert!(
+            result.fallback_message.is_none(),
+            "缓存命中不应带兜底提示"
+        );
+        assert_eq!(
+            result.body_base64.as_deref(),
+            Some(b64(&[2u8; 8]).as_str()),
+            "应返回超清图自身字节而非标准图"
+        );
     }
 
     #[test]

@@ -146,14 +146,17 @@ test('maps selector variables and MVU writes to the shell persistence bridge', a
     { status_theme_id: 'crimson' },
     { type: 'character' },
   )
+  await shellWindow.deleteVariable({ type: 'character' }, 'status_theme_id')
 
+  // M2：replace 家族（replaceMvuData/deleteVariable）不再下发整桶快照，
+  // 而是相对本壳视图的键级补丁；merge 家族保持补丁语义。
   assert.deepEqual(requests.filter((request) => request.type === 'shell_variables_set'), [
     {
       type: 'shell_variables_set',
       payload: {
         selector: messageSelector,
-        variables: { stat_data: { '主角': { '生命值': 99 } } },
-        mode: 'replace',
+        variables: { sets: { stat_data: { '主角': { '生命值': 99 } } }, deletes: [] },
+        mode: 'patch',
       },
     },
     {
@@ -164,7 +167,47 @@ test('maps selector variables and MVU writes to the shell persistence bridge', a
         mode: 'merge',
       },
     },
+    {
+      type: 'shell_variables_set',
+      payload: {
+        selector: { type: 'character' },
+        variables: { sets: {}, deletes: ['status_theme_id'] },
+        mode: 'patch',
+      },
+    },
   ])
+})
+
+test('bridges real campaign stat data into the Mvu shim read path (M5)', async () => {
+  const script = createCardShellRuntimeCompatibilityScript({
+    selectorVariables: { 'message:current': { stat_data: { '主角': { '心情': '紧张' } } } },
+    mvuStatData: { '主角': { '生命值': 55, '心情': '平静' }, '世界': { '时间': '黄昏' } },
+  })
+  const shellWindow = {
+    TavernHelper: {},
+    __sfShellAsk: async (type) => {
+      if (type === 'mvu_data_get') return { '主角': { '生命值': 40 } }
+      if (type === 'mvu_status') return { ready: true }
+      throw new Error(`unexpected request: ${type}`)
+    },
+  }
+  Function('window', script)(shellWindow)
+
+  // events 常量表存在（缺失时 eventOn(Mvu.events.…) 会 TypeError 杀死整段脚本）
+  assert.equal(shellWindow.Mvu.events.VARIABLE_UPDATE_ENDED, 'mag_variable_update_ended')
+  assert.equal(shellWindow.Mvu.events.SINGLE_VARIABLE_UPDATED, 'mag_variable_updated')
+
+  // 注入的真实变量树打底，壳自写桶键级覆盖
+  const data = shellWindow.Mvu.getMvuData({ type: 'message' })
+  assert.deepEqual(data.stat_data, {
+    '主角': { '生命值': 55, '心情': '紧张' },
+    '世界': { '时间': '黄昏' },
+  })
+
+  // 刷新桥：底座替换为宿主返回的最新树
+  await shellWindow.Mvu.refreshMvuData()
+  const refreshed = shellWindow.Mvu.getMvuData({ type: 'message' })
+  assert.deepEqual(refreshed.stat_data, { '主角': { '生命值': 40, '心情': '紧张' } })
 })
 
 test('encodes persisted selector data before injecting it into a shell script', () => {

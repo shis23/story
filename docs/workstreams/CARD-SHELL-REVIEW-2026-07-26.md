@@ -142,6 +142,27 @@ npm test + vitest 全绿）：
 
 未处理：M1/M2/M5、L1-L7。
 
+### 低危清尾（2026-07-27）
+
+M1/M2/M5 与 L1/L2/L3/L5/L6 已修复入库（cargo + node + vitest 全绿）：
+
+| 条目 | 方案摘要 |
+|---|---|
+| M1 | CardShellHost 重载 watch 改比内容指纹（JSON 序列化 url/html/campaignId/openingChatSeed），无关状态变化不再重建进行中的设置 iframe |
+| M2 | 壳侧 replace 家族（setVariables/updateVariablesWith/deleteVariable/replaceMvuData）改发相对本壳快照的键级补丁（sets/deletes，`mode:"patch"`），宿主 `patchCardShellVariables` 按键应用；本壳未触碰的键存活。merge/replace 协议保留兼容已挂载旧壳 |
+| M5 | Mvu shim：注入真实 Campaign 变量树快照（`buildMvuStatDataTree`，点记法键按段展开）作 stat_data 只读底座，壳自写桶键级覆盖；`mvu_data_get` 桥可刷新（init + waitGlobalInitialized 各刷一次，另暴露 `Mvu.refreshMvuData`）；补 `Mvu.events` 常量表（缺失时 eventOn TypeError 杀死整段内联脚本）。写侧保持沙箱桶不变（与 M4 一致） |
+| L1 | fetch 顺序改为自身缓存命中 → 标准图兜底 → 网络；超清图缓存过即可命中，不再被标准图永久劫持。防卡死语义保留（未缓存的超清图仍不发起网络请求） |
+| L2 | `enqueueCardShellVariableMutation` 并发测试补齐（同 campaign 串行、异 campaign 互不阻塞、前驱失败不阻塞后继）；顺带修掉队列尾巴 rejection 未处理触发 unhandledRejection 的真实小 bug |
+| L3 | `isTrustedSource` 去掉「data.pluginId 字段匹配即信任」回退，改为 event.source 沿 parent 链归属本壳 iframe（嵌套子 iframe 的 TH 消息在链上，功能不回退） |
+| L5 | `i.postimg.cc` 加入默认白名单（点名主机，不放开任意图床）；卿卿立绘/图鉴走 fetch 代理 + 缓存 |
+| L6 | 新增 `card_shell_clear_cache` 命令 + 前端 wrapper `cardShellClearCache`：清空磁盘缓存作为未 pin 依赖的显式刷新通道（UI 入口后续接） |
+
+**维持不修（评估记录）**：
+- **L4**（get_conversation 后端插件门禁）：纵深防御项，需要后端权限矩阵扩展；
+  当下壳内拿不到会话 id，难利用。留待权限体系统一工程（V6 家族）。
+- **L7**（bgm/图鉴/cg 在 0×0 iframe 执行）：需要可见挂载的产品决策（消息区
+  内嵌 vs 独立面板）+ 自动播放手势策略，不是缺陷修复能覆盖的范围。
+
 ### 后续跟进（同日）
 
 - **消息壳原地渲染**：H4 通路的完成形态。`segmentShellContent`（cardShellDisplay.js）

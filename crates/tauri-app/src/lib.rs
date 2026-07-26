@@ -9230,10 +9230,14 @@ fn meta_apply_mvu_schema_in_store(
             )
         })?;
 
-    // 先计算预览，确认有变化
+    // 先计算预览，确认有变化。存量翻译产物可能带旧记法键（斜杠 / stat_data.
+    // 前缀 / <> 占位符），应用边界统一归一（新导入已在解析层归一，此处兜底）。
+    let normalized_mvu_schema = storyforge_domain::variables::normalize_schema_keys(
+        mvu.translation.variable_schema.clone(),
+    );
     let preview = compute_apply_preview(
         &def.variable_schema,
-        &mvu.translation.variable_schema,
+        &normalized_mvu_schema,
         def.id.as_str(),
         &def.name,
         &source_character_id,
@@ -11202,6 +11206,15 @@ fn card_shell_allow_host(host: String) -> Result<(), TauriCommandError> {
     Ok(())
 }
 
+/// 清空卡壳磁盘缓存（L6）：未 pin 的远程依赖首取即冻结，需要显式刷新通道。
+/// 返回清掉的缓存对象数；下次壳加载会重新拉取全部远程资源。
+#[tauri::command]
+fn card_shell_clear_cache() -> Result<usize, TauriCommandError> {
+    get_card_shell_cache()
+        .clear_cache()
+        .map_err(TauriCommandError::internal)
+}
+
 /// 宿主代持拉取远程壳资源（allowlist + 磁盘缓存）。失败显式返回错误，不降级为空成功。
 #[tauri::command]
 fn card_shell_fetch_url(url: String) -> Result<card_shell_cache::ShellFetchResult, TauriCommandError> {
@@ -12518,6 +12531,7 @@ pub fn run() {
             get_card_shell_inline_js,
             card_shell_list_allowed_hosts,
             card_shell_allow_host,
+            card_shell_clear_cache,
             card_shell_fetch_url,
             get_active_turn_quality,
             // P3 Meta Agent / MVU 五合一 / ST 预设分类
@@ -15723,6 +15737,74 @@ mod tests {
             .unwrap();
         assert_eq!(restored_hp.value, serde_json::json!(200));
         assert_eq!(restored_hp.last_updated_turn, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_meta_apply_mvu_schema_normalizes_legacy_key_notation() {
+        // 存量翻译产物可能带旧记法键（斜杠 / stat_data. 前缀）。应用边界必须
+        // 归一，否则同一变量以两种键并存（"stat_data.hp" 与 "hp"）。
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_mvu_apply_normalize_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let character = make_test_character("MVU Legacy Notation Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        let mut definition = make_test_character_definition(&card.id, "mvu-legacy-def", "Hero");
+        definition.variable_schema = vec![test_variable_field("hp", "HP", serde_json::json!(100))];
+        card.character_definitions.push(definition.clone());
+        store.save_card(card.clone()).unwrap();
+
+        store
+            .save_mvu(campaign_store::StoredMvuTranslation {
+                source_character_id: character.id.clone(),
+                character_name: character.name.clone(),
+                translation: storyforge_domain::mvu_translation::MvuTranslation::pure_data_fallback(
+                    vec![
+                        // 旧记法：stat_data. 前缀 → 应合并到已有 "hp" 而不是新增键
+                        test_variable_field("stat_data.hp", "Hit Points", serde_json::json!(200)),
+                        // 旧记法：斜杠 → 点
+                        test_variable_field("/世界/时间", "时间", serde_json::json!("清晨")),
+                    ],
+                ),
+                analyzed_at: "2026-07-27T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        meta_apply_mvu_schema_in_store(
+            &store,
+            character.id.as_str().to_string(),
+            definition.id.as_str().to_string(),
+        )
+        .unwrap();
+
+        let updated_card = store.get_card(&card.id).unwrap().card;
+        let updated_def = updated_card
+            .character_definitions
+            .iter()
+            .find(|def| def.id == definition.id)
+            .unwrap();
+        let keys: Vec<&str> = updated_def
+            .variable_schema
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect();
+        assert!(keys.contains(&"hp"), "stat_data.hp 应归一为 hp: {keys:?}");
+        assert!(keys.contains(&"世界.时间"), "斜杠键应归一为点记法: {keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.contains("stat_data") || k.contains('/')),
+            "不应残留旧记法键: {keys:?}"
+        );
+        let hp = updated_def
+            .variable_schema
+            .iter()
+            .find(|f| f.key == "hp")
+            .unwrap();
+        assert_eq!(hp.label, "Hit Points", "归一后应与已有 hp 合并覆盖");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
