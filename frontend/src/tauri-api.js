@@ -926,6 +926,22 @@ export async function cardstudioCompile(id) {
   return { st_card_json: {}, warnings: [], character_name: '' }
 }
 
+/** 出卡质量闸门：compile → JSON/PNG round-trip 真实导入 → 确定性检查报告 */
+export async function cardstudioExportGate(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_export_gate', { id })
+  }
+  return { pass: true, character_name: '', warnings: [], json_checks: [], png_checks: [] }
+}
+
+/** 导出编译产物为 ST PNG 卡（返回字节数组） */
+export async function cardstudioExportPng(id) {
+  if (isTauri()) {
+    return await invoke('cardstudio_export_png', { id })
+  }
+  return []
+}
+
 export async function cardstudioCompleteManualStage(id, stageId) {
   if (isTauri()) {
     return await invoke('cardstudio_complete_manual_stage', { id, stageId })

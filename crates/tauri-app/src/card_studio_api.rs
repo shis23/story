@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 use storyforge_domain::card_studio::{
     self, apply_novel_prefill_json, apply_stage_json, build_novel_prefill_prompt,
     build_novel_style_prompt, build_review_prompt, build_stage_prompt, compile_artifacts,
-    extract_json_object, merge_review_reports, phase1_stage_ids, run_checks, CardArtifacts,
-    CardProject, CheckReport, StageStatus, STAGE_BASIC, STAGE_BRIEF, STAGE_COMPILE_IMPORT,
-    STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
+    export_gate_checks, extract_json_object, merge_review_reports, phase1_stage_ids, run_checks,
+    CardArtifacts, CardProject, CheckReport, GateCheck, StageStatus, STAGE_BASIC, STAGE_BRIEF,
+    STAGE_COMPILE_IMPORT, STAGE_OPENING, STAGE_PERSONALITY, STAGE_REVIEW, STAGE_WORLDVIEW,
 };
-use storyforge_domain::character::{CharacterCard, CharacterDefinition, CharacterExtractionStatus};
+use storyforge_domain::character::{
+    CharacterCard, CharacterDefinition, CharacterExtractionStatus, StCharacterCard,
+};
 use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
 use crate::card_studio_store::CardStudioStore;
 use crate::error::TauriCommandError;
@@ -353,6 +355,69 @@ pub fn cardstudio_compile(id: String) -> Result<CompilePreviewDto, TauriCommandE
         warnings: compiled.warnings,
         character_name: compiled.character.name,
     })
+}
+
+/// 出卡质量闸门报告：JSON 与 PNG 两条导出路径各自 round-trip 后的确定性检查。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportGateReportDto {
+    pub pass: bool,
+    pub character_name: String,
+    pub warnings: Vec<String>,
+    pub json_checks: Vec<GateCheck>,
+    pub png_checks: Vec<GateCheck>,
+}
+
+/// 编译产物 → ST JSON / PNG 字节 → 真实 infra-import 导入路径 round-trip →
+/// domain 确定性检查。与 harness card_translation 的确定性验收同语义，
+/// 作为写卡线的出卡质量闸门（不依赖 harness crate）。
+fn run_export_gate(project: &CardProject) -> Result<ExportGateReportDto, String> {
+    let compiled = compile_artifacts(&project.artifacts)?;
+    let st_card: StCharacterCard = serde_json::from_value(compiled.st_card_json.clone())
+        .map_err(|e| format!("ST 卡 JSON 反序列化失败: {e}"))?;
+
+    let json_bytes = serde_json::to_vec(&compiled.st_card_json)
+        .map_err(|e| format!("ST 卡 JSON 序列化失败: {e}"))?;
+    let json_reimported = storyforge_infra_import::import_character(&json_bytes)
+        .map_err(|e| format!("JSON round-trip 导入失败: {e}"))?;
+    let json_checks = export_gate_checks(&project.artifacts, &json_reimported);
+
+    let png_bytes = storyforge_infra_import::png::write_st_card_png(&st_card, None)
+        .map_err(|e| format!("PNG 导出失败: {e}"))?;
+    let png_reimported = storyforge_infra_import::import_character(&png_bytes)
+        .map_err(|e| format!("PNG round-trip 导入失败: {e}"))?;
+    let png_checks = export_gate_checks(&project.artifacts, &png_reimported);
+
+    let pass = json_checks.iter().all(|c| c.pass) && png_checks.iter().all(|c| c.pass);
+    Ok(ExportGateReportDto {
+        pass,
+        character_name: compiled.character.name,
+        warnings: compiled.warnings,
+        json_checks,
+        png_checks,
+    })
+}
+
+#[tauri::command]
+pub fn cardstudio_export_gate(id: String) -> Result<ExportGateReportDto, TauriCommandError> {
+    let project = get_card_studio_store()
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
+    run_export_gate(&project).map_err(TauriCommandError::validation)
+}
+
+/// 导出编译产物为 ST PNG 卡（与 export_st_card_png 同一 PNG 写入层，
+/// 但源头是 Studio 编译产物而非 CharacterStore 已存卡）。
+#[tauri::command]
+pub fn cardstudio_export_png(id: String) -> Result<Vec<u8>, TauriCommandError> {
+    let project = get_card_studio_store()
+        .get(&id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("写卡项目不存在: {id}")))?;
+    let compiled =
+        compile_artifacts(&project.artifacts).map_err(TauriCommandError::validation)?;
+    let st_card: StCharacterCard = serde_json::from_value(compiled.st_card_json)
+        .map_err(|e| TauriCommandError::internal(format!("ST 卡 JSON 反序列化失败: {e}")))?;
+    storyforge_infra_import::png::write_st_card_png(&st_card, None)
+        .map_err(|e| TauriCommandError::internal(format!("PNG 导出失败: {e}")))
 }
 
 /// Mark non-LLM stages done / ready transitions without model calls.
@@ -724,4 +789,85 @@ pub fn cardstudio_list_stages() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storyforge_domain::card_studio::{CardProjectMode, WorldviewDraftEntry};
+
+    fn gate_test_project() -> CardProject {
+        let mut project = CardProject::new_from_scratch("gate-demo", "出卡闸门测试");
+        project.mode = CardProjectMode::FromScratch;
+        project.artifacts = CardArtifacts {
+            name: "闸门测试卡".into(),
+            description: "用于出卡质量闸门 round-trip 的最小卡。".into(),
+            personality: "沉稳，先观察后开口。".into(),
+            scenario: "黄昏的天台。".into(),
+            first_mes: "风把她的话吹散了一半：……你来了。".into(),
+            tags: vec!["测试".into()],
+            creator: "gate-test".into(),
+            worldview_entries: vec![
+                WorldviewDraftEntry {
+                    keys: vec![],
+                    content: "常驻设定：城市上空漂着看不见的岛。".into(),
+                    constant: true,
+                    order: 10,
+                },
+                WorldviewDraftEntry {
+                    keys: vec!["天台".into(), "岛".into()],
+                    content: "天台是离岛最近的地方。".into(),
+                    constant: false,
+                    order: 20,
+                },
+            ],
+            ..Default::default()
+        };
+        project
+    }
+
+    #[test]
+    fn export_gate_roundtrips_json_and_png_through_real_import() {
+        let project = gate_test_project();
+        let report = run_export_gate(&project).expect("gate 应能运行");
+        let failed: Vec<_> = report
+            .json_checks
+            .iter()
+            .chain(report.png_checks.iter())
+            .filter(|c| !c.pass)
+            .map(|c| format!("{}: {}", c.name, c.detail))
+            .collect();
+        assert!(report.pass, "出卡闸门未过:\n{}", failed.join("\n"));
+        assert_eq!(report.character_name, "闸门测试卡");
+        assert!(!report.json_checks.is_empty());
+        assert!(!report.png_checks.is_empty());
+    }
+
+    #[test]
+    fn export_gate_rejects_uncompilable_project() {
+        let mut project = gate_test_project();
+        project.artifacts.first_mes.clear();
+        let err = run_export_gate(&project).expect_err("缺 first_mes 应编译失败");
+        assert!(err.contains("编译前检查失败"), "err={err}");
+    }
+
+    #[test]
+    fn export_png_bytes_reimport_as_same_card() {
+        let project = gate_test_project();
+        let compiled = compile_artifacts(&project.artifacts).expect("compile");
+        let st_card: StCharacterCard =
+            serde_json::from_value(compiled.st_card_json).expect("st card json");
+        let png = storyforge_infra_import::png::write_st_card_png(&st_card, None)
+            .expect("png export");
+        let reimported =
+            storyforge_infra_import::import_character(&png).expect("png reimport");
+        assert_eq!(reimported.name, "闸门测试卡");
+        assert_eq!(
+            reimported
+                .embedded_world_info
+                .as_ref()
+                .map(|b| b.entries.len()),
+            Some(2)
+        );
+    }
 }

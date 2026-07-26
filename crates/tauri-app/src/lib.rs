@@ -12328,6 +12328,8 @@ pub fn run() {
             card_studio_api::cardstudio_run_checks,
             card_studio_api::cardstudio_run_review,
             card_studio_api::cardstudio_compile,
+            card_studio_api::cardstudio_export_gate,
+            card_studio_api::cardstudio_export_png,
             card_studio_api::cardstudio_complete_manual_stage,
             card_studio_api::cardstudio_run_stage,
             card_studio_api::cardstudio_import_compiled,

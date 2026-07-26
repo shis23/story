@@ -175,6 +175,28 @@ cargo check -p storyforge
 
 ---
 
+## 7.5 增量（2026-07-26，rebase 到 main 61b80bb 之后）
+
+- 分支已 rebase 到 main `61b80bb`（card-shell WIP + 卡片翻译线之后）。唯一冲突在
+  `crates/domain/src/lib.rs` / `crates/tauri-app/src/lib.rs` 的模块声明与
+  `get_campaign_store` 可见性（保留 card_shell_cache + 采用 `pub(crate)`），其余 7 个
+  commit 自动应用。`CARD-STUDIO-FEASIBILITY` 文档与 main 上的同内容副本自动去重。
+- **出卡质量闸门已落地**（原「立刻可做」方向 + 卡片翻译验收 harness 对齐）：
+  - domain `export_gate_checks(artifacts, reimported)`：与 harness card_translation
+    确定性验收同语义（世界书总数/全启用/常驻数/死路由/选择性 keys/组件零漏项/spec v3/
+    name/first_mes round-trip），期望值从 artifacts 精确导出而非固定阈值。
+  - `cardstudio_export_gate` 命令：compile → ST JSON 与 PNG 两条导出路径分别经真实
+    `infra-import::import_character` round-trip → 双份 GateCheck 报告。
+  - 不依赖 `harness-real-llm` crate（依赖方向相反：harness 依赖 tauri-app）。
+- **Studio 导出 ST PNG 已接**（原「立刻可做」#4）：`cardstudio_export_png` 复用
+  `infra-import::png::write_st_card_png`，前端「导出 ST PNG」按钮（Tauri 保存对话框，
+  浏览器降级下载）。
+- 前端「出卡质量闸门」按钮 + 报告面板（通过数汇总，仅列失败项）。
+- 测试：domain 23（+3 gate）、storyforge lib 299（+3 round-trip，含真实 infra-import
+  JSON/PNG 双路径）、前端 node 380 + vitest 52 全绿。
+- 已知 flaky（非本线）：`harness-real-llm` `budget::queued_dispatch_wait_counts_toward_total_timeout`
+  在 workspace 并行负载下偶发失败，单跑稳定通过；已建议单独修复。
+
 ## 8. 审查人备注
 
 本轮实现“能跑的原生写卡台”目标基本达成；相对最初可行性分析，**A 超预期补强了方法论 pack 与审查，C 达到最小另存修订，B 仅探路**。文档此前仍停在 Phase1 设计骨架，与代码漂移明显——应以本 STATUS 与更新后的 design/plan 为准。

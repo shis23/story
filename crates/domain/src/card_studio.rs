@@ -1067,6 +1067,151 @@ pub fn compile_artifacts(artifacts: &CardArtifacts) -> Result<CompileResult, Str
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 出卡质量闸门（确定性，无 LLM）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 出卡质量闸门单条检查结果。
+/// 与 harness card_translation 验收的 Check 同形（name/pass/detail），
+/// 但期望值不是固定阈值，而是从编译前 artifacts 精确导出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateCheck {
+    pub name: String,
+    pub pass: bool,
+    pub detail: String,
+}
+
+fn gate(name: &str, pass: bool, detail: String) -> GateCheck {
+    GateCheck {
+        name: name.into(),
+        pass,
+        detail,
+    }
+}
+
+/// 对「编译产物经真实导入路径 round-trip 后的 Character」做确定性检查。
+///
+/// 调用方（tauri-app）负责 round-trip：compile → 序列化 → infra-import
+/// `import_character` → 把重新导入的 Character 传进来。这里只做纯 domain 断言，
+/// 语义对齐 harness card_translation 的导入检查（世界书路由、禁用条目、组件归类），
+/// 差异在于 Studio 卡的期望是精确值（条目数、全启用、无脚本组件）而非下限阈值。
+pub fn export_gate_checks(artifacts: &CardArtifacts, reimported: &Character) -> Vec<GateCheck> {
+    let mut out = Vec::new();
+
+    let expected_name = artifacts.name.trim();
+    out.push(gate(
+        "gate.name_roundtrip",
+        reimported.name == expected_name,
+        format!("导入后 name={:?}（期望 {:?}）", reimported.name, expected_name),
+    ));
+    out.push(gate(
+        "gate.first_mes_roundtrip",
+        !reimported.first_mes.trim().is_empty()
+            && reimported.first_mes == artifacts.first_mes,
+        format!(
+            "导入后 first_mes {} 字符（期望与产物一致且非空）",
+            reimported.first_mes.chars().count()
+        ),
+    ));
+
+    let book = reimported.embedded_world_info.as_ref();
+    let total = book.map(|b| b.entries.len()).unwrap_or(0);
+    let expected_total = artifacts.worldview_entries.len();
+    out.push(gate(
+        "gate.book_total",
+        total == expected_total,
+        format!("{total} 条世界书（期望 {expected_total}）"),
+    ));
+
+    let disabled = book
+        .map(|b| b.entries.iter().filter(|e| e.disabled).count())
+        .unwrap_or(0);
+    out.push(gate(
+        "gate.book_all_enabled",
+        disabled == 0,
+        format!("{disabled} 条被标记禁用（Studio 编译应全启用）"),
+    ));
+
+    let constant = book
+        .map(|b| b.entries.iter().filter(|e| e.constant).count())
+        .unwrap_or(0);
+    let expected_constant = artifacts
+        .worldview_entries
+        .iter()
+        .filter(|e| e.constant)
+        .count();
+    out.push(gate(
+        "gate.constant_entries",
+        constant == expected_constant,
+        format!("{constant} 条常驻（期望 {expected_constant}）"),
+    ));
+
+    // 死路由检查：启用、非常驻、带主键的条目绝不能被路由成 Disabled
+    // （harness import.no_dead_keyword_routes 的 Studio 版）
+    let dead = book
+        .map(|b| {
+            b.entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && !e.constant
+                        && e.keys.iter().any(|k| !k.trim().is_empty())
+                        && matches!(e.route, LoreRoute::Disabled)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    out.push(gate(
+        "gate.no_dead_keyword_routes",
+        dead == 0,
+        format!("{dead} 条启用关键词条目被路由成 Disabled（应为 0）"),
+    ));
+
+    // 非常驻条目 keys 不得在 round-trip 中丢失（选择性条目失去 keys 即成死条目）
+    let keyless_selective = book
+        .map(|b| {
+            b.entries
+                .iter()
+                .filter(|e| !e.constant && !e.keys.iter().any(|k| !k.trim().is_empty()))
+                .count()
+        })
+        .unwrap_or(0);
+    out.push(gate(
+        "gate.selective_keys_retained",
+        keyless_selective == 0,
+        format!("{keyless_selective} 条选择性条目丢失 keys（应为 0）"),
+    ));
+
+    // 组件零漏项（Studio 版）：Phase 1 产卡不携带任何脚本组件；
+    // round-trip 后出现 regex_scripts / tavern_helper 即为编译或导入层污染
+    let regex_n = reimported
+        .extensions
+        .get("regex_scripts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let th_n = reimported
+        .extensions
+        .get("tavern_helper")
+        .and_then(|v| v.get("scripts"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    out.push(gate(
+        "gate.no_script_components",
+        regex_n == 0 && th_n == 0,
+        format!("regex_scripts={regex_n} tavern_helper={th_n}（Studio 卡应为 0/0）"),
+    ));
+
+    out.push(gate(
+        "gate.spec_v3",
+        reimported.spec_version.starts_with('3'),
+        format!("spec_version={}（期望 3.x）", reimported.spec_version),
+    ));
+
+    out
+}
+
 /// Embedded Mingyue Qiuqing methodology pack (StoryForge-adapted).
 mod pack_mingyue_v1 {
     pub const CREATIVE_PRINCIPLES: &str =
@@ -1493,6 +1638,60 @@ mod tests {
         assert!(book.entries[0].constant);
         assert!(!book.entries[1].constant);
         assert!(compiled.st_card_json.get("data").is_some());
+    }
+
+    #[test]
+    fn export_gate_passes_on_faithful_roundtrip() {
+        let a = sample_ok_artifacts();
+        let compiled = compile_artifacts(&a).expect("compile");
+        // domain 层用 from_st_card 模拟 round-trip；真实 infra-import 路径由
+        // tauri-app 的 export gate 测试覆盖
+        let st_card: StCharacterCard =
+            serde_json::from_value(compiled.st_card_json.clone()).expect("st card json");
+        let reimported = Character::from_st_card(st_card);
+        let checks = export_gate_checks(&a, &reimported);
+        let failed: Vec<_> = checks.iter().filter(|c| !c.pass).collect();
+        assert!(failed.is_empty(), "gate 应全过: {failed:?}");
+    }
+
+    #[test]
+    fn export_gate_detects_lost_entries_and_dead_routes() {
+        let a = sample_ok_artifacts();
+        let compiled = compile_artifacts(&a).expect("compile");
+        let mut damaged = compiled.character.clone();
+        {
+            let book = damaged.embedded_world_info.as_mut().expect("book");
+            // 丢一条 + 把选择性条目路由打死
+            book.entries.remove(0);
+            book.entries[0].route = LoreRoute::Disabled;
+        }
+        let checks = export_gate_checks(&a, &damaged);
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).expect("check exists");
+        assert!(!by_name("gate.book_total").pass);
+        assert!(!by_name("gate.constant_entries").pass);
+        assert!(!by_name("gate.no_dead_keyword_routes").pass);
+        // 无关检查不受牵连
+        assert!(by_name("gate.name_roundtrip").pass);
+        assert!(by_name("gate.no_script_components").pass);
+    }
+
+    #[test]
+    fn export_gate_detects_script_component_pollution() {
+        let a = sample_ok_artifacts();
+        let compiled = compile_artifacts(&a).expect("compile");
+        let mut polluted = compiled.character.clone();
+        polluted.extensions.as_object_mut().map(|m| {
+            m.insert(
+                "regex_scripts".into(),
+                serde_json::json!([{"scriptName": "sneaky", "replaceString": ""}]),
+            )
+        });
+        let checks = export_gate_checks(&a, &polluted);
+        let comp = checks
+            .iter()
+            .find(|c| c.name == "gate.no_script_components")
+            .expect("check exists");
+        assert!(!comp.pass);
     }
 
     #[test]

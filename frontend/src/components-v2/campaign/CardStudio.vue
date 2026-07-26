@@ -8,6 +8,8 @@ import {
   cardstudioCreateFromNovel,
   cardstudioCreateProject,
   cardstudioDeleteProject,
+  cardstudioExportGate,
+  cardstudioExportPng,
   cardstudioGetProject,
   cardstudioImportCompiled,
   cardstudioListProjects,
@@ -53,6 +55,7 @@ const allowAiFreewrite = ref(false)
 const checkReport = ref(null)
 const lastImport = ref(null)
 const lastCompile = ref(null)
+const gateReport = ref(null)
 const seedHandledKey = ref('')
 
 const draft = ref(emptyArtifacts())
@@ -160,6 +163,7 @@ async function openProject(id) {
   checkReport.value = null
   lastImport.value = null
   lastCompile.value = null
+  gateReport.value = null
   try {
     project.value = await cardstudioGetProject(id)
     allowAiFreewrite.value = !!project.value?.allow_ai_freewrite
@@ -186,6 +190,7 @@ async function deleteProjectById(id, name = '') {
       checkReport.value = null
       lastImport.value = null
       lastCompile.value = null
+      gateReport.value = null
     }
     await refreshProjects()
     statusText.value = '项目已删除'
@@ -256,6 +261,65 @@ async function exportStJson() {
     }
   } catch (e) {
     await alertDialog('导出失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function runExportGate() {
+  if (!project.value) return
+  await saveArtifacts()
+  busy.value = true
+  try {
+    gateReport.value = await cardstudioExportGate(project.value.id)
+    statusText.value = gateReport.value.pass
+      ? '出卡质量闸门：全部通过'
+      : '出卡质量闸门：存在未过项，见下方报告'
+  } catch (e) {
+    gateReport.value = null
+    await alertDialog('出卡质量闸门运行失败: ' + e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function exportStPng() {
+  if (!project.value) return
+  await saveArtifacts()
+  busy.value = true
+  try {
+    const bytes = await cardstudioExportPng(project.value.id)
+    const data = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes || [])
+    if (!data.length) throw new Error('PNG 内容为空')
+    const fileName = `${safeFileBase(draft.value.name || project.value.name)}.png`
+    let saved = false
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      const { writeFile } = await import('@tauri-apps/plugin-fs')
+      const filePath = await save({
+        defaultPath: fileName,
+        filters: [{ name: 'ST Character PNG', extensions: ['png'] }],
+      })
+      if (filePath) {
+        await writeFile(filePath, data)
+        saved = true
+        statusText.value = `已导出 ST PNG：${filePath}`
+      }
+    } catch {
+      // fall through to browser download
+    }
+    if (!saved) {
+      const blob = new Blob([data], { type: 'image/png' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      a.click()
+      URL.revokeObjectURL(url)
+      statusText.value = `已下载 ST PNG：${fileName}`
+    }
+  } catch (e) {
+    await alertDialog('PNG 导出失败: ' + e)
   } finally {
     busy.value = false
   }
@@ -696,6 +760,8 @@ watch(
           <Button variant="default" size="sm" :disabled="busy" @click="runChecks">规则检查</Button>
           <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="runReview(true)">方法论审查</Button>
           <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="exportStJson">导出 ST JSON</Button>
+          <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="exportStPng">导出 ST PNG</Button>
+          <Button variant="default" size="sm" :disabled="busy" :loading="busy" @click="runExportGate">出卡质量闸门</Button>
           <Button
             v-if="currentStage === 'compile_import' || project.stage_status?.review === 'done'"
             variant="primary"
@@ -724,6 +790,24 @@ watch(
             {{ issue.message }}
             <span v-if="issue.suggestion" class="text-ink-faint"> — {{ issue.suggestion }}</span>
           </div>
+        </div>
+
+        <div v-if="gateReport" class="text-xs space-y-1 rounded-lg border border-line bg-surface-2/50 p-3">
+          <div :class="gateReport.pass ? 'text-ok' : 'text-err'">
+            出卡质量闸门：{{ gateReport.pass ? '全部通过' : '未通过' }}
+            <span class="text-ink-soft"> · {{ gateReport.character_name || '（未命名）' }} · JSON+PNG 双路径 round-trip</span>
+          </div>
+          <div class="text-ink-soft">
+            JSON {{ (gateReport.json_checks || []).filter((c) => c.pass).length }}/{{ (gateReport.json_checks || []).length }} 项通过
+            · PNG {{ (gateReport.png_checks || []).filter((c) => c.pass).length }}/{{ (gateReport.png_checks || []).length }} 项通过
+          </div>
+          <template v-for="(group, gi) in [['JSON', gateReport.json_checks], ['PNG', gateReport.png_checks]]" :key="gi">
+            <div v-for="(c, i) in (group[1] || []).filter((c) => !c.pass)" :key="group[0] + i">
+              <span class="text-err">[{{ group[0] }} FAIL]</span>
+              {{ c.name }}：{{ c.detail }}
+            </div>
+          </template>
+          <div v-if="gateReport.warnings?.length" class="text-warn">编译警告：{{ gateReport.warnings.join('；') }}</div>
         </div>
 
         <div v-if="lastCompile" class="text-xs text-ink-soft">
