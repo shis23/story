@@ -17,6 +17,11 @@ test('classifyShellUrl maps test-card paths', () => {
   assert.equal(classifyShellUrl(HOME), 'opening_home')
   assert.equal(classifyShellUrl(STATUS), 'status')
   assert.equal(classifyShellUrl(CUSTOM), 'opening_custom')
+  // H5：/intro/ 与后端开场关键词对齐（卿卿类开场介绍页）
+  assert.equal(
+    classifyShellUrl('https://aireckchen-dot.example.com/qingqing/intro/index.html'),
+    'opening_custom',
+  )
 })
 
 test('extractShellMountsFromDisplay finds body.load urls and strips glue', () => {

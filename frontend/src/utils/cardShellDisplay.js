@@ -44,7 +44,8 @@ export function classifyShellUrl(url) {
   const u = String(url || '').toLowerCase()
   if (u.includes('/status/')) return 'status'
   if (u.includes('/home/')) return 'opening_home'
-  if (u.includes('custom_start')) return 'opening_custom'
+  // `/intro/` 与后端 classify_shell_kind 的开场关键词保持一致（H5）
+  if (u.includes('custom_start') || u.includes('/intro/')) return 'opening_custom'
   return 'message_html'
 }
 

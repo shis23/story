@@ -301,15 +301,25 @@ fn classify_shell_kind(find: &str, label: &str, url: &str) -> CardShellKind {
     if f.contains("首页") || l.contains("首页") || u.contains("/home/") {
         return CardShellKind::OpeningHome;
     }
-    if f.contains("customized") || l.contains("自定义") || u.contains("custom_start") {
-        return CardShellKind::OpeningCustom;
-    }
+    // 状态判定先于开场：避免「开场后状态栏」类 find/label 被误分为开场壳。
     if f.contains("statusplaceholder")
         || f.contains("status_placeholder")
         || l.contains("状态栏")
         || u.contains("/status/")
     {
         return CardShellKind::StatusBar;
+    }
+    // 卿卿类卡：first_mes 用【开场介绍】标记触发唯一 .load 开场壳，
+    // 关键词覆盖 开场/intro（find/label/URL 片段）。
+    if f.contains("customized")
+        || l.contains("自定义")
+        || u.contains("custom_start")
+        || f.contains("开场")
+        || l.contains("开场")
+        || l.contains("intro")
+        || u.contains("/intro/")
+    {
+        return CardShellKind::OpeningCustom;
     }
     CardShellKind::MessageHtml
 }
@@ -630,6 +640,46 @@ mod tests {
         extract_from_regex_script(&script, &mut shells, &mut urls);
         assert_eq!(shells.len(), 1);
         assert_eq!(shells[0].kind, CardShellKind::StatusBar);
+    }
+
+    #[test]
+    fn qingqing_opening_intro_marker_classifies_as_opening_shell() {
+        // 卿卿类卡：唯一 .load 壳由 first_mes 的【开场介绍】标记触发，
+        // 此前关键词表 miss → MessageHtml → 开场面从不武装（H5）。
+        let opening = "https://aireckchen-dot.example.com/qingqing/opening/index.html";
+        let extensions = serde_json::json!({
+            "regex_scripts": [
+                regex("开场介绍", "【开场介绍】",
+                    &format!("```\n<body>\n<script>\n$('body').load('{opening}')\n</script>\n</body>\n```")),
+            ],
+        });
+
+        let manifest = extract_card_shell_manifest(&char_with_ext(extensions));
+        assert_eq!(manifest.opening_custom_url(), Some(opening));
+
+        // 直接覆盖关键词矩阵
+        assert_eq!(
+            classify_shell_kind("【开场介绍】", "开场介绍", "https://x/opening.html"),
+            CardShellKind::OpeningCustom
+        );
+        assert_eq!(
+            classify_shell_kind("<intro>", "Intro Page", "https://x/page.html"),
+            CardShellKind::OpeningCustom
+        );
+        assert_eq!(
+            classify_shell_kind("<x>", "x", "https://x/intro/index.html"),
+            CardShellKind::OpeningCustom
+        );
+        // 状态判定先于开场：带「开场后状态栏」字样的壳仍是状态壳
+        assert_eq!(
+            classify_shell_kind("<StatusPlaceHolderImpl/>", "开场后状态栏", "https://x/s.html"),
+            CardShellKind::StatusBar
+        );
+        // 普通消息壳不受影响
+        assert_eq!(
+            classify_shell_kind("<action_info>", "战斗美化", "https://x/b.html"),
+            CardShellKind::MessageHtml
+        );
     }
 
     #[test]
