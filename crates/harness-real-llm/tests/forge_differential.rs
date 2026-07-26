@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use harness_real_llm::card_translation::{load_card, repo_root};
 use harness_real_llm::forge_differential::{
-    diff_sections, diff_worldbook, find_initvar_yaml, flatten_initvar_yaml, load_forge_state,
-    schema_alignment,
+    diff_contents, diff_sections, diff_worldbook, find_initvar_yaml, flatten_initvar_yaml,
+    load_forge_state, schema_alignment,
 };
 
 #[test]
@@ -99,6 +99,25 @@ fn forge_differential_worldbook_semantics() {
             sections.ours_th_unique,
             sections.forge_th_scripts
         );
+        // V2-1：正文级对照（一对一组逐条归一化等值）
+        let contents = diff_contents(label, character.embedded_world_info.as_ref(), &forge, &forge_dir);
+        eprintln!(
+            "── {label} 正文对照 ──\n{}",
+            serde_json::to_string_pretty(&contents).unwrap()
+        );
+        assert_eq!(
+            contents.missing_file, 0,
+            "{label}: forge manifest 声明的正文文件缺失 {} 个",
+            contents.missing_file
+        );
+        assert!(
+            contents.mismatched.is_empty(),
+            "{label}: 正文不一致 {:?}（{} 比较 / {} 一致）",
+            contents.mismatched,
+            contents.compared,
+            contents.matched
+        );
+
         ran += 1;
     }
 

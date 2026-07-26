@@ -502,6 +502,111 @@ pub fn diff_sections(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// V2-1：正文级对照（一对一组逐条归一化等值；报告只含名字/长度，无正文）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 正文对照报告。归一化口径：CRLF→LF + 去首尾空白。
+#[derive(Debug, Serialize)]
+pub struct ContentDiffReport {
+    pub card: String,
+    /// 参与比较的一对一条目数
+    pub compared: usize,
+    pub matched: usize,
+    /// manifest 声明的正文文件缺失/不可读
+    pub missing_file: usize,
+    /// 缺失/不可读样例：`name: 错误`（上限 5，诊断用）
+    pub missing_file_names: Vec<String>,
+    /// 重名组条目（无法配对，跳过正文比较）
+    pub skipped_dup_group: usize,
+    /// 不一致样例：`name (ours_len=X, forge_len=Y)`（上限 10，不含正文）
+    pub mismatched: Vec<String>,
+}
+
+fn normalize_content(s: &str) -> String {
+    s.replace("\r\n", "\n").trim().to_string()
+}
+
+/// 正文级差分：按 trim 名字一对一配对的条目，逐条与 forge 外置正文文件比对
+pub fn diff_contents(
+    card_label: &str,
+    book: Option<&WorldInfoBook>,
+    forge: &ForgeState,
+    forge_dir: &Path,
+) -> ContentDiffReport {
+    let forge_groups = forge.flat_entries();
+    let empty: Vec<storyforge_domain::world_info::WorldInfoEntry> = vec![];
+    let ours = book.map(|b| b.entries.as_slice()).unwrap_or(&empty);
+
+    let mut ours_groups: BTreeMap<&str, Vec<&storyforge_domain::world_info::WorldInfoEntry>> =
+        BTreeMap::new();
+    for entry in ours {
+        if let Some(name) = entry
+            .extra
+            .get("comment")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            ours_groups.entry(name).or_default().push(entry);
+        }
+    }
+
+    let mut report = ContentDiffReport {
+        card: card_label.to_string(),
+        compared: 0,
+        matched: 0,
+        missing_file: 0,
+        missing_file_names: vec![],
+        skipped_dup_group: 0,
+        mismatched: vec![],
+    };
+
+    for (name, ours_group) in &ours_groups {
+        let Some(forge_group) = forge_groups.get(name) else {
+            continue;
+        };
+        if ours_group.len() != 1 || forge_group.len() != 1 {
+            report.skipped_dup_group += ours_group.len();
+            continue;
+        }
+        // path 为 None 或空串 = 无外置正文文件（分组标记等空内容条目），不计
+        let Some(rel_path) = forge_group[0]
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let file_path = forge_dir.join(rel_path.replace('\\', "/"));
+        let forge_content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                report.missing_file += 1;
+                if report.missing_file_names.len() < 5 {
+                    report.missing_file_names.push(format!("{name}: {e}"));
+                }
+                continue;
+            }
+        };
+        report.compared += 1;
+        let ours_norm = normalize_content(&ours_group[0].content);
+        let forge_norm = normalize_content(&forge_content);
+        if ours_norm == forge_norm {
+            report.matched += 1;
+        } else if report.mismatched.len() < 10 {
+            report.mismatched.push(format!(
+                "{name} (ours_len={}, forge_len={})",
+                ours_norm.chars().count(),
+                forge_norm.chars().count()
+            ));
+        }
+    }
+
+    report
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // V2-2：MVU schema 对照（InitVar YAML 作 ground truth，翻译产物打分）
 // ═══════════════════════════════════════════════════════════════════════════
 
