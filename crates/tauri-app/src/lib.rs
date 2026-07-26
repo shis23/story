@@ -757,11 +757,45 @@ impl AppState {
 
     #[cfg(test)]
     fn new_for_test() -> Self {
+        Self::sweep_stale_test_data_dirs();
         let data_dir = std::env::temp_dir().join(format!(
             "storyforge-app-state-test-{}",
             uuid::Uuid::new_v4()
         ));
         Self::new_with_data_dir(data_dir)
+    }
+
+    /// 惰性清扫历史测试残留（>24h 的 storyforge-app-state-test-*）。
+    /// 测试结束不清理自身 data_dir（Drop 无钩子），跑一次 workspace 测试就
+    /// 落几十个目录（2026-07-27 实测积累 360 个）。每进程至多扫一次，
+    /// best-effort；24h 阈值不碰并行测试进程的目录。
+    #[cfg(test)]
+    fn sweep_stale_test_data_dirs() {
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        SWEEP.call_once(|| {
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name.starts_with("storyforge-app-state-test-")
+                    && !name.starts_with("storyforge_test_")
+                {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 3600));
+                if stale {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        });
     }
 
     /// 取一份 tool_ctx 快照（clone 出 Arc<ToolContext>），供本次流水线使用
