@@ -2,9 +2,8 @@
 /**
  * ComposerBar — 写作意图输入（重设计：稿纸下方的独立指令条）。
  *
- * 结构（对齐选定图②）：占位提示 + 快捷指令 chips + 圆形发送/停止键。
- * chips 为纯展示层预填（向 textarea 注入前缀文本），不发明后端能力——
- * 接线时原样作为 start-writing 文本发出即可。
+ * 结构：生成模式 + 写作意图 + 发送/停止键。
+ * 不展示只会预填文本的伪快捷能力，所有意图由用户直接输入。
  */
 import { ref } from 'vue'
 import { generationModeCatalog } from '../../utils/generationModes.js'
@@ -12,7 +11,7 @@ import { generationModeCatalog } from '../../utils/generationModes.js'
 const props = defineProps({
   writing: { type: Boolean, default: false },
   disabled: { type: Boolean, default: false },
-  placeholder: { type: String, default: '告诉你的想法，或用快捷指令开始…' },
+  placeholder: { type: String, default: '描述下一步想写什么…' },
   generationMode: { type: String, default: 'continuation' },
   showGenerationModes: { type: Boolean, default: false },
 })
@@ -21,21 +20,7 @@ const emit = defineEmits(['start-writing', 'cancel', 'update-generation-mode'])
 const intent = ref('')
 const textareaRef = ref(null)
 
-const chips = [
-  { label: '续写', prefix: '继续往下写：' },
-  { label: '润色', prefix: '润色这段文字：' },
-  { label: '扩写', prefix: '扩写这段：' },
-  { label: '改写', prefix: '换一种写法重写：' },
-  { label: '总结', prefix: '总结以上内容：' },
-]
-
 const generationModes = generationModeCatalog
-
-function applyChip(chip) {
-  if (props.disabled || props.writing) return
-  intent.value = chip.prefix
-  textareaRef.value?.focus()
-}
 
 function submit() {
   if (!intent.value.trim() || props.disabled || props.writing) return
@@ -72,7 +57,7 @@ function submit() {
 
     <div
       data-testid="composer-input-shell"
-      class="mx-3 flex items-end gap-2 rounded-xl bg-surface-2/65 px-3 py-2.5 transition-all focus-within:bg-bg focus-within:shadow-[inset_0_0_0_1px_var(--color-accent-border)]"
+      class="mx-3 mb-3 flex items-end gap-2 rounded-xl bg-surface-2/65 px-3 py-2.5 transition-all focus-within:bg-bg focus-within:shadow-[inset_0_0_0_1px_var(--color-accent-border)]"
     >
       <textarea
         ref="textareaRef"
@@ -109,20 +94,6 @@ function submit() {
       </button>
     </div>
 
-    <!-- 快捷指令 -->
-    <div class="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-2">
-      <button
-        v-for="chip in chips"
-        :key="chip.label"
-        @click="applyChip(chip)"
-        :disabled="disabled || writing"
-        class="min-h-7 rounded-full border border-transparent bg-surface-2/70 px-3 text-xs text-ink-soft transition-colors hover:border-accent-border hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40"
-      >{{ chip.label }}</button>
-      <span class="ml-auto text-[11px] text-ink-faint hidden sm:inline">
-        <template v-if="writing">写作中 · 点右侧停止键中断</template>
-        <template v-else>回车发送 · Shift+Enter 换行</template>
-      </span>
-    </div>
   </div>
 </template>
 

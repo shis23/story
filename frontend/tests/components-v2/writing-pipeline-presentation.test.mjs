@@ -73,11 +73,16 @@ describe('writing pipeline presentation', () => {
     const shell = wrapper.get('[data-testid="composer-input-shell"]')
     const textarea = wrapper.get('textarea')
     expect(wrapper.text()).not.toContain('重点')
+    for (const shortcut of ['润色', '扩写', '改写', '总结']) {
+      expect(wrapper.text()).not.toContain(shortcut)
+    }
     expect(shell.classes()).toContain('rounded-xl')
+    expect(shell.classes()).toContain('mb-3')
     expect(shell.classes()).not.toContain('border')
     expect(shell.classes()).not.toContain('border-line')
     expect(textarea.classes()).toContain('composer-textarea')
     expect(textarea.classes()).toContain('border-0')
     expect(textarea.attributes('aria-label')).toBe('写作意图')
+    expect(textarea.attributes('placeholder')).toBe('描述下一步想写什么…')
   })
 })
