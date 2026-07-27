@@ -3,7 +3,7 @@
     <iframe
       v-if="iframeSrc"
       ref="iframeRef"
-      :srcdoc="iframeSrc"
+      :src="iframeSrc"
       sandbox="allow-scripts"
       class="plugin-iframe"
       :style="iframeStyle"
@@ -81,6 +81,8 @@ import {
   mapPluginEventRecordToPluginEvents,
 } from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
+import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
+import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
 
 const props = defineProps({
   /** InstalledPluginDto */
@@ -110,15 +112,37 @@ const HOST_ORIGIN = window.location?.origin || '*'
 // must use '*'. Source checks below keep inbound messages scoped to this iframe.
 const PLUGIN_IFRAME_TARGET_ORIGIN = '*'
 
-// 构建 srcdoc：bridge script + 插件 HTML（entry_html 已由 iframe sandbox 隔离，
-// 但仍做消毒防止沙箱逃逸场景）
-const iframeSrc = computed(() => {
+// V5 CSP isolation: the plugin document is served on the isolated
+// storyforge-shell origin so its inline bridge does not inherit the main app
+// CSP. iframeDoc holds the full HTML (with its own shell CSP meta, mirroring
+// the HTTP header set by shell_doc_protocol.rs); iframeSrc holds the resolved
+// protocol URL and is what the iframe loads via :src.
+const iframeDoc = computed(() => {
   if (!props.plugin?.manifest?.entry_html && !props.plugin?.entry_html) return ''
   const rawHtml = props.plugin?.manifest?.entry_html || props.plugin?.entry_html || ''
   const entryHtml = DOMPurify.sanitize(rawHtml)
   const bridgeScript = generateBridgeScript(props.plugin.id, HOST_ORIGIN)
-  return `<!DOCTYPE html><html><head>${bridgeScript}</head><body>${entryHtml}</body></html>`
+  return `<!DOCTYPE html><html><head>${buildShellCspMetaTag([])}${bridgeScript}</head><body>${entryHtml}</body></html>`
 })
+const iframeSrc = ref('')
+
+// Re-register the document whenever the plugin's HTML changes.
+watch(iframeDoc, async (doc) => {
+  if (!doc) {
+    iframeSrc.value = ''
+    return
+  }
+  configureShellDocInvoke(invoke)
+  try {
+    iframeSrc.value = await registerShellDoc(doc)
+  } catch (e) {
+    // Non-Tauri fallback (tests): blob URL still renders the plugin.
+    const blob = new Blob([doc], { type: 'text/html' })
+    iframeSrc.value = URL.createObjectURL(blob)
+  }
+  // The plugin identity changed; reset ready state until the new bridge boots.
+  iframeReady.value = false
+}, { immediate: true })
 
 const iframeStyle = computed(() => ({
   width: '100%',

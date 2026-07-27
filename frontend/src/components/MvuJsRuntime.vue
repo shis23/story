@@ -4,7 +4,7 @@
        shim 通过 postMessage 与父通信，不依赖 same-origin；卡脚本若越权访问 parent 将被跨 origin 阻止并降级。 -->
   <iframe
     ref="iframeRef"
-    :srcdoc="iframeSrc"
+    :src="iframeSrc"
     sandbox="allow-scripts"
     style="position: absolute; width: 0; height: 0; border: none; opacity: 0; pointer-events: none;"
     @load="onIframeLoad"
@@ -40,6 +40,8 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { getTrustedMvuRuntimeMessage } from '../mvu-runtime-bridge.js'
+import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
+import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
 
 const iframeRef = ref(null)
 const iframeReady = ref(false)
@@ -315,7 +317,19 @@ window.addEventListener('message', function(e) {
 parent.postMessage({ type: 'mvu:ready' }, '*');
 })();`;
 
-const iframeSrc = '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>' + SHIM_SCRIPT + '<\/script></body></html>'
+// V5 CSP isolation: the MVU shim document is served on the isolated
+// storyforge-shell origin so its inline <script> does not inherit the main app
+// CSP (which forbids inline scripts). The document carries its own shell CSP
+// meta (mirrors the HTTP header set by shell_doc_protocol.rs).
+function buildMvuShellDoc() {
+  return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    buildShellCspMetaTag([]) +
+    '</head><body><script>' + SHIM_SCRIPT + '<\/script></body></html>'
+}
+
+// Resolved to a shell-doc URL in onMounted. Starts blank so the iframe never
+// loads an inline-script document that would inherit the main app CSP.
+const iframeSrc = ref('about:blank')
 
 // ─── iframe 通信 ────────────────────────────────────────────────────────
 
@@ -434,6 +448,18 @@ function onWindowMessage(event) {
 
 onMounted(async () => {
   window.addEventListener('message', onWindowMessage)
+
+  // V5 CSP isolation: register the shim document on the isolated shell origin.
+  configureShellDocInvoke(invoke)
+  try {
+    iframeSrc.value = await registerShellDoc(buildMvuShellDoc())
+  } catch (e) {
+    // Non-Tauri fallback (tests): keep the inline document via srcdoc is not
+    // possible here (we switched to :src), so degrade to a blob URL so the
+    // shim still runs in browser/test environments without the main app CSP.
+    const blob = new Blob([buildMvuShellDoc()], { type: 'text/html' })
+    iframeSrc.value = URL.createObjectURL(blob)
+  }
 
   const [u1, u2, u3] = await Promise.all([
     listen('mvu:load_card_assets', (ev) => handleLoadAssets(ev.payload)),
