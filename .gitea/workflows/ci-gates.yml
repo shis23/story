@@ -1,8 +1,21 @@
-# Gitea Actions: fast PR / push gates.
+# Gitea Actions: fast PR / push gates (Linux only).
 #
-# Runs formatting, strict Clippy, workspace tests, frontend tests/build,
-# Pester release-helper tests, and a fail-closed repository secret scan.
-# This workflow does NOT build host artifacts, APKs, or installers.
+# Runs formatting, strict Clippy, workspace tests, and frontend tests/build.
+# These four jobs run on ubuntu-latest and always reach a terminal state on a
+# normal push/PR.
+#
+# Windows-only gates (Pester release-helper suite, repository secret scan, and
+# workflow YAML syntax validation) live in windows-gates.yml. They were moved
+# out of this workflow because, on Gitea 1.26 + act_runner, a job-level `if`
+# guard is not evaluated before runner assignment: with no Windows runner, a
+# `runs-on: windows-latest` job stays at status=5 (blocked) forever, so the
+# whole ci-gates run never finishes and cannot be re-run. windows-gates.yml is
+# triggered only by manual workflow_dispatch or a v* tag, so an absent Windows
+# runner produces no blocked job here.
+#
+# This workflow does NOT build host artifacts, APKs, or installers. It does NOT
+# run the Windows-only Pester/secret-scan/workflow-syntax gates; run
+# windows-gates.yml (or the local scripts/verify-release.ps1) for those.
 name: ci-gates
 
 on:
@@ -10,6 +23,8 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # Allow controlled manual re-runs without manufacturing a business commit.
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref so stale pushes do not pile up.
 concurrency:
@@ -181,90 +196,3 @@ jobs:
         run: npm test
       - name: npm run build
         run: npm run build
-
-  pester-release-tests:
-    # PowerShell release-helper Pester suite runs on a Windows runner.
-    # 当前仅京东云 Linux runner 在线；注册 Windows runner 后在仓库
-    # Settings → Actions → Variables 设 HAS_WINDOWS_RUNNER=true 启用。
-    # 本地等效门禁：scripts/verify-release.ps1（Pester + secret scan 全含）。
-    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Python for parser-backed Pester contracts
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install pinned PyYAML for Pester contracts
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -m pip install 'PyYAML==6.0.2'
-          python -c "import yaml; assert yaml.__version__ == '6.0.2'"
-      - name: Run release-build Pester tests
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/tests/run-release-build-tests.ps1
-      - name: Verify release gate (secret scan only)
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
-
-  secret-scan:
-    # Windows runner 缺席时跳过（本地 verify-release.ps1 -SecretScanOnly 等效）。
-    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Repository secret scan (fail-closed, tracked + untracked)
-        shell: pwsh
-        run: |
-          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
-
-  workflow-syntax:
-    # Real YAML parser required (PyYAML). Structural-only PowerShell checks
-    # are not accepted for production workflow validation.
-    # Windows runner 缺席时跳过（本地 Pester 套件含同一 PyYAML 校验路径）。
-    if: ${{ vars.HAS_WINDOWS_RUNNER == 'true' }}
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install pinned PyYAML
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install 'PyYAML==6.0.2'
-          python -c "import yaml; print(yaml.__version__)"
-      - name: Validate workflow YAML syntax with PyYAML
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          . .\scripts\release-build\ReleaseBuild.Common.ps1
-          $dir = '.gitea\workflows'
-          $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.yml' -File) +
-                   @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
-          if ($files.Count -eq 0) { throw 'No workflow files found.' }
-          foreach ($f in $files) {
-            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
-            if ($result.Engine -notmatch 'pyyaml|node-yaml') {
-              throw "FAIL: $($f.Name) did not use a real YAML parser (engine=$($result.Engine))"
-            }
-            if (-not $result.Valid) {
-              Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
-              $result.Errors | ForEach-Object { Write-Host "  $_" }
-              exit 1
-            }
-            Write-Host "OK: $($f.Name) (engine=$($result.Engine))" -ForegroundColor Green
-          }

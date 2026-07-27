@@ -6643,7 +6643,7 @@ function Assert-ReleaseWorkflowStaticContract {
         $rootContents = if ($null -ne $contentsProperty) { [string]$contentsProperty.Value } else { '' }
         $rootExact = ($null -ne $metadata -and [bool]$metadata.RootPermissionsPresent -and
             [string]$metadata.RootPermissionsKind -eq 'mapping' -and [bool]$metadata.RootPermissionsKeysUnique -and
-            $rootKeys.Count -eq 1 -and $rootKeys[0] -eq 'contents' -and
+            @($rootKeys).Count -eq 1 -and $rootKeys[0] -eq 'contents' -and
             [string]::Equals($rootContents.Trim(), 'read', [System.StringComparison]::Ordinal))
         if (-not $rootExact) {
             $permissionsOk = $false
@@ -6659,6 +6659,14 @@ function Assert-ReleaseWorkflowStaticContract {
     $checks['least_privilege_permissions'] = $permissionsOk
 
     $ciMetadata = if ($workflowMetadata.ContainsKey('ci-gates.yml')) { $workflowMetadata['ci-gates.yml'] } else { $null }
+    # Windows-only gates (Pester, secret scan, workflow-syntax) live in
+    # windows-gates.yml, not ci-gates.yml: a job-level `if` guard with no
+    # matching runner never reaches `skipped` on Gitea 1.26, so they were moved
+    # to a separate dispatch/tag-triggered workflow to keep ci-gates terminal.
+    $windowsMetadata = if ($workflowMetadata.ContainsKey('windows-gates.yml')) { $workflowMetadata['windows-gates.yml'] } else { $null }
+    if ($null -eq $windowsMetadata) {
+        $errors.Add('windows-gates.yml is missing; Windows-only release gates have no workflow.') | Out-Null
+    }
     $ciTriggers = if ($null -ne $ciMetadata -and $ciMetadata.PSObject.Properties.Name -contains 'WorkflowTriggers') {
         @($ciMetadata.WorkflowTriggers | ForEach-Object { [string]$_ })
     } else { @() }
@@ -6682,13 +6690,17 @@ function Assert-ReleaseWorkflowStaticContract {
         $errors.Add('Workflows must not use npm install for release gates.') | Out-Null
     }
 
-    $secretGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $ciMetadata -Gate 'secret_scan'
+    # secret_scan and pester_yaml_parser gates now bind to windows-gates.yml,
+    # where those jobs actually live. The gate semantics are unchanged: the
+    # job must still exist, run on windows-latest, and follow the controlled
+    # step contract; it is not disguised as executed by a push.
+    $secretGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $windowsMetadata -Gate 'secret_scan'
     $checks['secret_scan'] = [bool]$secretGate.Valid
     if (-not $checks['secret_scan']) {
         foreach ($gateError in @($secretGate.Errors)) { $errors.Add([string]$gateError) | Out-Null }
     }
 
-    $pesterParser = Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $ciMetadata
+    $pesterParser = Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $windowsMetadata
     $checks['pester_yaml_parser'] = [bool]$pesterParser.Valid
     if (-not $checks['pester_yaml_parser']) {
         foreach ($parserError in @($pesterParser.Errors)) { $errors.Add([string]$parserError) | Out-Null }
@@ -6748,14 +6760,18 @@ function Assert-ReleaseWorkflowStaticContract {
     }
 
     $ciWf = Join-Path $workflowDir 'ci-gates.yml'
-    if (Test-Path -LiteralPath $ciWf) {
-        $ciText = Get-Content -LiteralPath $ciWf -Raw
-        $checks['real_yaml_parser_required'] = ($ciText -match 'PyYAML' -and $ciText -match 'Test-ReleaseWorkflowSyntax' -and $ciText -match 'pyyaml\|node-yaml')
-        if (-not $checks['real_yaml_parser_required']) {
-            $errors.Add('ci-gates must require a real YAML parser for workflow syntax validation.') | Out-Null
-        }
-    } else {
+    if (-not (Test-Path -LiteralPath $ciWf)) {
         $errors.Add('ci-gates.yml is missing.') | Out-Null
+    }
+    # The real-YAML-parser requirement (PyYAML==6.0.2 install + Test-ReleaseWorkflowSyntax
+    # invocation + pyyaml|node-yaml engine check) now lives in windows-gates.yml,
+    # which is where the workflow-syntax job runs. Search across all workflow text
+    # so the requirement is enforced regardless of which file holds the job.
+    $checks['real_yaml_parser_required'] = ($allText -match 'PyYAML' -and
+        $allText -match 'Test-ReleaseWorkflowSyntax' -and
+        $allText -match 'pyyaml\|node-yaml')
+    if (-not $checks['real_yaml_parser_required']) {
+        $errors.Add('A release workflow must require a real YAML parser for workflow syntax validation.') | Out-Null
     }
 
     return [pscustomobject]@{
