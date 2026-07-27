@@ -130,7 +130,7 @@ body {
   line-height: 1.85;
   letter-spacing: 0.01em;
 }
-.prose-fiction em { font-style: italic; opacity: 0.82; }
+.prose-fiction em { font-style: normal; opacity: 0.82; }
 .prose-fiction strong { font-weight: 600; }
 
 /* ── 玻璃层工具类 ── */

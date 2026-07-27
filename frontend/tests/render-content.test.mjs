@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import {
   formatContent,
   shouldRenderHtmlDisplay,
@@ -9,6 +10,14 @@ test('formats markdown text while escaping raw html', () => {
   assert.equal(
     formatContent('<script>alert(1)</script>\n**bold** and *aside*'),
     '&lt;script&gt;alert(1)&lt;/script&gt;<br><strong>bold</strong> and <em>aside</em>',
+  )
+})
+
+test('keeps emphasized fiction prose upright for Chinese readability', () => {
+  const styles = fs.readFileSync(new URL('../src/style.css', import.meta.url), 'utf8')
+  assert.match(
+    styles,
+    /\.prose-fiction em\s*\{[^}]*font-style:\s*normal;[^}]*opacity:\s*0\.82;/s,
   )
 })
 
