@@ -64,7 +64,6 @@ function submit() {
         @click="emit('update-generation-mode', mode.value)"
       >
         {{ mode.label }}
-        <span v-if="mode.featured" class="ml-1 text-[10px] opacity-75">重点</span>
       </button>
       <span class="ml-1 text-[10px] text-ink-faint">
         {{ generationModes.find((mode) => mode.value === generationMode)?.callEstimate }}

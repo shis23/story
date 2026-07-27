@@ -72,6 +72,7 @@ describe('writing pipeline presentation', () => {
 
     const shell = wrapper.get('[data-testid="composer-input-shell"]')
     const textarea = wrapper.get('textarea')
+    expect(wrapper.text()).not.toContain('重点')
     expect(shell.classes()).toContain('rounded-xl')
     expect(shell.classes()).not.toContain('border')
     expect(shell.classes()).not.toContain('border-line')
