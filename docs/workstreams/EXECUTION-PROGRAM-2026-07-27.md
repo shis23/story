@@ -194,6 +194,18 @@
   emotion_stage 与多意图/多 seed 标定进入 V2.1；Android AND-2/AND-3
   （PLAN-ANDROID.md）未起步。
 
+### 下一轮并行安排（2026-07-27 用户确认）
+
+- **暂停**多意图、多 seed 与 Duet cohort 评测，避免继续消耗模型时间与费用。
+- 三条独立代理线并行：Release CI 真实远端执行、Android Phase 6 第一切片、
+  V5 应用级 CSP；文件所有权、分支纪律和可复制提示词见
+  `PARALLEL-WORKSTREAM-HANDOFF-2026-07-27.md`。
+- Windows 桌面 Bronze 由主会话与用户共同实跑：主会话负责候选构建、隔离数据目录、
+  日志/存档核验，用户负责真实 GUI 点击和视觉确认；Runbook 见
+  `DESKTOP-BRONZE-LIVE-ACCEPTANCE-2026-07-27.md`。
+- V6 权限统一、SQLite/Accept 状态机收敛和 `tauri-app/src/lib.rs` 拆分暂不并行，
+  待 Android 第一切片结束后顺序执行，避免争抢核心文件。
+
 ### 周级工程（起步后持续，不指望今天闭环）
 
 V5 应用级 CSP（tauri.conf csp:null）、V6 权限体系统一（L4 已打第一桩）、

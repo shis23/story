@@ -3,6 +3,8 @@
 > 用途：自动化无法证明的桌面 GUI 与真实模型路径。
 > 约束：使用独立 dev-data，不读取/覆盖用户真实 Campaign。
 > 证据目录建议：`artifacts/bronze/B#-YYYY-MM-DD/`
+> 2026-07-27 的完整双人执行顺序、停止条件与证据纪律见
+> `DESKTOP-BRONZE-LIVE-ACCEPTANCE-2026-07-27.md`；本文继续作为 B1-B6 记录表。
 
 ## 公共前置
 
