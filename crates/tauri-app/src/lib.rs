@@ -326,10 +326,24 @@ static MVU_RUNTIME: OnceLock<Arc<WebViewMvuRuntime>> = OnceLock::new();
 
 /// 获取应用数据目录，优先使用 OS 标准位置（H-003 修复）。
 /// Windows: %APPDATA%/StoryForge
-/// macOS/Linux: $HOME/.local/share/storyforge
-/// 回退: exe_dir/data（兼容旧安装）
+/// macOS: $HOME/Library/Application Support/StoryForge
+/// Linux: $XDG_DATA_HOME/storyforge 或 $HOME/.local/share/storyforge
+/// Android: 应用沙箱内部 files 目录（AND-2/AND-3）
+///   - 优先读 `STORYFORGE_DATA_DIR` 环境变量（允许真机/调试覆盖与冒烟探针）
+///   - 否则落到 `/data/data/com.storyforge.app/files`（与 Tauri `app_data_dir()` 一致）
+/// 回退: exe_dir/data（兼容旧安装；Android 上 exe 在只读 APK 内，写入会失败并被上层捕获）
 fn get_app_data_dir() -> PathBuf {
-    let os_dir = if cfg!(target_os = "windows") {
+    let os_dir = if cfg!(target_os = "android") {
+        // AND-2：Android 必须把导入内容、连接配置、日志写入应用私有沙箱，
+        // 而非落到只读 APK 内或无意义的 XDG 路径。Tauri mobile 在 Builder
+        // 构造前尚不可用 `app.path()`，因此这里用约定路径 + 可覆盖环境变量。
+        std::env::var("STORYFORGE_DATA_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                Some(PathBuf::from("/data/data/com.storyforge.app/files"))
+            })
+    } else if cfg!(target_os = "windows") {
         std::env::var("APPDATA")
             .ok()
             .map(|appdata| PathBuf::from(appdata).join("StoryForge"))
@@ -13701,6 +13715,49 @@ mod tests {
             prefer_autofix_response_text(None, original.clone()),
             original
         );
+    }
+
+    /// AND-2：导入内容、连接配置和日志必须落到应用私有数据目录，而不是
+    /// 只读 APK 内或无意义的 XDG 路径。`get_app_data_dir()` 的 Android 分支
+    /// 必须优先使用 `STORYFORGE_DATA_DIR` 覆盖（真机冒烟探针/调试用），
+    /// 否则落到与 Tauri `app_data_dir()` 一致的包内 files 目录。
+    ///
+    /// 此测试在不修改进程环境变量的前提下（Edition 2024 下 set_var 为 unsafe，
+    /// 且并发测试间改 env 不稳定），固化两个可在桌面主机验证的不变量：
+    /// 1. 解析结果一定是已创建的目录（导入写入不会因目录缺失失败）；
+    /// 2. 桌面分支不会回退到 exe_dir/data（否则数据会落到不可预期的安装目录）。
+    /// Android 分支的 `/data/data/com.storyforge.app/files` 常量由代码评审与
+    /// 真机冒烟覆盖，不在桌面主机断言。
+    #[test]
+    fn get_app_data_dir_always_returns_created_dir_and_never_exe_fallback_on_desktop() {
+        let resolved = get_app_data_dir();
+        assert!(
+            resolved.exists() && resolved.is_dir(),
+            "get_app_data_dir 必须返回已创建的目录（导入/日志写入依赖），got {}",
+            resolved.display()
+        );
+        // 桌面平台不应回退到 exe_dir/data（HOME/APPDATA 解析失败时的兜底）。
+        // 注意：exe_dir/data 形如 `<install>/data`，与 OS 标准目录不同。
+        if cfg!(target_os = "windows") {
+            assert!(
+                resolved.ends_with("StoryForge") || resolved.ends_with("storyforge"),
+                "Windows data_dir 应落到 APPDATA/StoryForge，got {}",
+                resolved.display()
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                resolved.ends_with("StoryForge"),
+                "macOS data_dir 应落到 Library/Application Support/StoryForge，got {}",
+                resolved.display()
+            );
+        } else if !cfg!(target_os = "android") {
+            // Linux：OS 标准目录以 storyforge 结尾
+            assert!(
+                resolved.ends_with("storyforge"),
+                "Linux data_dir 应落到 XDG/HOME 下的 storyforge，got {}",
+                resolved.display()
+            );
+        }
     }
 
     use super::*;

@@ -876,4 +876,42 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
             );
         }
     }
+
+    /// AND-2（Android 系统选择器导入）契约固化：
+    /// 导入只接收文件字节切片，从不接收路径/URI/文件名——因此选择器返回的
+    /// 临时 content:// URI 是否被系统回收与导入成功无关。中文文件名、大文件、
+    /// Downloads/Documents 来源都只是字节来源，由前端 readFile 读入后以字节
+    /// 形式到达此函数。本测试固化该不变量，防止后续"为了方便"把路径参数加回。
+    #[test]
+    fn and2_import_accepts_only_bytes_independent_of_source_uri() {
+        // 中文角色名内容（不依赖文件名）能正确解析。
+        let card = serde_json::json!({
+            "spec": "chara_card_v2",
+            "spec_version": "3.0",
+            "data": {
+                "name": "梁元·测试角色",
+                "description": "中文名与内容"
+            }
+        });
+        let bytes = serde_json::to_vec(&card).expect("serialize");
+        let character = import_character(&bytes).expect("中文内容必须可导入");
+        assert_eq!(character.name, "梁元·测试角色");
+
+        // 边界：恰好等于上限的载荷应通过 size guard（> 判断），仅在格式判断处
+        // 失败；超限字节必须在 size guard 处被拒（PngError "文件过大"）。
+        let at_limit = vec![0u8; MAX_IMPORT_SIZE];
+        let at_limit_err = import_character(&at_limit).expect_err("全零字节非合法格式应被拒");
+        // 通过了 size guard → 错误文案不应是"文件过大"，而是格式解析错误
+        assert!(
+            !at_limit_err.to_string().contains("文件过大"),
+            "等于上限的载荷不应触发 size guard，got: {at_limit_err}"
+        );
+        let over_limit = vec![0u8; MAX_IMPORT_SIZE + 1];
+        let err = import_character(&over_limit).expect_err("超上限字节必须被拒");
+        assert!(matches!(err, ImportError::PngError(_)));
+        assert!(
+            err.to_string().contains("文件过大"),
+            "超上限错误文案应说明文件过大，got: {err}"
+        );
+    }
 }
