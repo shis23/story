@@ -52,6 +52,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m pip install 'PyYAML==6.0.2'
           python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+          $requiredPester = [version]'4.10.1'
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq $requiredPester })) {
+            Install-Module Pester -RequiredVersion $requiredPester -Scope CurrentUser -Force -SkipPublisherCheck -AllowClobber
+          }
+          Import-Module Pester -RequiredVersion $requiredPester -Force
+          if ((Get-Module Pester | Select-Object -First 1).Version -ne $requiredPester) {
+            throw "Expected Pester $requiredPester."
+          }
       - name: Run release-build Pester tests
         shell: pwsh
         run: |

@@ -72,32 +72,61 @@ const SHELL_DOC_CSP: &str = concat!(
     "form-action 'none'"
 );
 
+const MAX_SHELL_DOCS: usize = 128;
+const MAX_SHELL_DOC_BYTES: usize = 16 * 1024 * 1024;
+
 /// In-memory token → HTML registry. Tokens are opaque 32-byte hex strings.
-/// Entries are intentionally never persisted: a shell document is an ephemeral
-/// rendering surface for content the parent already holds in memory; on
-/// restart there is nothing to restore. The map grows only with live shells.
-#[derive(Default)]
+///
+/// A successful GET consumes the entry. HEAD only probes it, while the parent
+/// can explicitly unregister a document that was replaced before navigation.
+/// Size and entry-count limits keep a compromised renderer from turning this
+/// bridge into unbounded process memory.
 struct ShellDocRegistry {
     docs: Mutex<HashMap<String, Arc<String>>>,
+    max_docs: usize,
+    max_doc_bytes: usize,
 }
 
 impl ShellDocRegistry {
     fn new() -> Self {
+        Self::with_limits(MAX_SHELL_DOCS, MAX_SHELL_DOC_BYTES)
+    }
+
+    fn with_limits(max_docs: usize, max_doc_bytes: usize) -> Self {
         Self {
             docs: Mutex::new(HashMap::new()),
+            max_docs,
+            max_doc_bytes,
         }
     }
 
     /// Register a shell document and return an opaque token. The same HTML
     /// registered twice yields two distinct tokens (no dedup: callers may
     /// legitimately want independent documents for identical content).
-    fn register(&self, html: String) -> String {
-        let token = random_hex_token();
-        let arc = Arc::new(html);
-        // A token collision over 32 random bytes is astronomically unlikely;
-        // overwrite is harmless (the prior doc would simply be unreachable).
-        self.docs.lock().expect("shell-doc registry poisoned").insert(token.clone(), arc);
-        token
+    fn register(&self, html: String) -> Result<String, String> {
+        if html.len() > self.max_doc_bytes {
+            return Err(format!(
+                "shell document exceeds {} byte limit",
+                self.max_doc_bytes
+            ));
+        }
+
+        let mut docs = self.docs.lock().expect("shell-doc registry poisoned");
+        if docs.len() >= self.max_docs {
+            return Err(format!(
+                "shell document registry reached {} live entries",
+                self.max_docs
+            ));
+        }
+
+        for _ in 0..8 {
+            let token = random_hex_token();
+            if !docs.contains_key(&token) {
+                docs.insert(token.clone(), Arc::new(html));
+                return Ok(token);
+            }
+        }
+        Err("could not allocate a unique shell document token".to_string())
     }
 
     /// Look up a document by token. Returns a cloned Arc (cheap) so the
@@ -109,6 +138,17 @@ impl ShellDocRegistry {
             .get(token)
             .cloned()
     }
+
+    fn take(&self, token: &str) -> Option<Arc<String>> {
+        self.docs
+            .lock()
+            .expect("shell-doc registry poisoned")
+            .remove(token)
+    }
+
+    fn unregister(&self, token: &str) -> bool {
+        is_valid_token(token) && self.take(token).is_some()
+    }
 }
 
 fn get_shell_doc_registry() -> &'static ShellDocRegistry {
@@ -119,62 +159,38 @@ fn get_shell_doc_registry() -> &'static ShellDocRegistry {
 /// Public entry point used by the `card_shell_register_doc` Tauri command.
 /// Returns the opaque token only; the caller (frontend) builds the full URL
 /// as `<SHELL_DOC_ORIGIN>/<token>`.
-pub fn register_shell_doc(html: String) -> String {
+pub fn register_shell_doc(html: String) -> Result<String, String> {
     get_shell_doc_registry().register(html)
 }
 
-/// Generate 32 random hex bytes (64 hex chars). Uses the same approach as the
-/// rest of the crate (thread_rng via `rand` is already a dependency for
-/// sha256-based cache names? — no, avoid adding a crate dep: use a simple
-/// XorShift seeded from thread-local nanosecond time + thread id). 32 bytes of
-/// entropy is far beyond the ~16-byte collision-safety threshold for this
-/// in-process registry.
+pub fn unregister_shell_doc(token: &str) -> bool {
+    get_shell_doc_registry().unregister(token)
+}
+
+/// Generate a 64-character token from two independently generated UUID v4
+/// values. `Uuid::new_v4()` uses the operating system RNG; concatenating the
+/// compact forms preserves 244 random bits without adding another RNG API.
 fn random_hex_token() -> String {
-    // Process-local PRNG seeded from wall-clock nanos + an address. Entropy is
-    // sufficient because the registry is in-process and the threat model is
-    // "guessing a live token to read another shell's HTML", not cryptographic
-    // secrecy (the parent already owns the HTML it registers).
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u128> = Cell::new(seed());
-    }
-    fn seed() -> u128 {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0x9e3779b97f4a7c15);
-        // Fold in a stack address for per-thread divergence.
-        let addr = &0u8 as *const u8 as u128;
-        t ^ addr.rotate_left(17)
-    }
-    // 128-bit xorshift (Marsaglia).
-    STATE.with(|cell| {
-        let mut x = cell.get();
-        let mut out = String::with_capacity(64);
-        // Four 64-bit halves → 64 hex chars = 32 bytes of entropy.
-        for _ in 0..4 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let lo = x as u64;
-            out.push_str(&format!("{lo:016x}"));
-        }
-        cell.set(x);
-        out
-    })
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Validate a token before lookup: must be exactly 64 lowercase hex chars.
 /// Rejects empty, traversal, slashes, and non-hex — same strict posture as
 /// card_shell_cache.rs `is_safe_cache_resource_name`.
 fn is_valid_token(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && (!b.is_ascii_uppercase()))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && (!b.is_ascii_uppercase()))
 }
 
 /// The protocol response handler. Registered in lib.rs's tauri::Builder chain
 /// right after the `storyforge-cache` handler. Mirrors
-/// `card_shell_cache_protocol_response` (lib.rs:11763-11804): only GET/HEAD/
-/// OPTIONS are accepted; the path minus its leading '/' is the token; on miss
+/// `card_shell_cache_protocol_response` (lib.rs:11763-11804): only GET/HEAD
+/// are accepted; the path minus its leading '/' is the token; on miss
 /// or invalid token it returns 404. Every successful HTML response carries the
 /// shell-document `Content-Security-Policy` header.
 pub fn shell_doc_protocol_response(
@@ -182,34 +198,24 @@ pub fn shell_doc_protocol_response(
 ) -> tauri::http::Response<Vec<u8>> {
     use tauri::http::{Method, Response, StatusCode, header};
 
-    let with_cors = |builder: tauri::http::response::Builder| {
-        builder
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-    };
-
-    if request.method() == Method::OPTIONS {
-        return with_cors(Response::builder())
-            .status(StatusCode::NO_CONTENT)
-            .body(Vec::new())
-            .unwrap_or_else(|_| Response::new(Vec::new()));
-    }
     if request.method() != Method::GET && request.method() != Method::HEAD {
-        return with_cors(Response::builder())
+        return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(b"method not allowed".to_vec())
             .unwrap_or_else(|_| Response::new(Vec::new()));
     }
 
     let token = request.uri().path().trim_start_matches('/');
-    let body = if is_valid_token(token) {
+    let body = if !is_valid_token(token) {
+        None
+    } else if request.method() == Method::HEAD {
         get_shell_doc_registry().get(token)
     } else {
-        None
+        get_shell_doc_registry().take(token)
     };
 
     match body {
-        Some(html) => with_cors(Response::builder())
+        Some(html) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             // Authoritative shell policy; intersects with the document's own
@@ -222,9 +228,10 @@ pub fn shell_doc_protocol_response(
                 html.as_bytes().to_vec()
             })
             .unwrap_or_else(|_| Response::new(Vec::new())),
-        None => with_cors(Response::builder())
+        None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
             .body(b"shell document not found".to_vec())
             .unwrap_or_else(|_| Response::new(Vec::new())),
     }
@@ -244,8 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn register_then_get_returns_document_with_csp_header() {
-        let token = register_shell_doc("<!doctype html><body>hello".into());
+    fn register_then_get_returns_document_once_with_csp_header() {
+        let token = register_shell_doc("<!doctype html><body>hello".into())
+            .expect("register shell document");
         assert_eq!(token.len(), 64);
         assert!(is_valid_token(&token));
 
@@ -266,15 +274,27 @@ mod tests {
         assert!(csp.contains("script-src 'unsafe-inline'"));
         assert!(csp.contains("object-src 'none'"));
         assert_eq!(resp.body(), b"<!doctype html><body>hello");
+        assert!(
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "iframe navigation does not need wildcard CORS"
+        );
+
+        let replay = shell_doc_protocol_response(req(Method::GET, &format!("/{token}")));
+        assert_eq!(replay.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn head_returns_empty_body_with_same_headers() {
-        let token = register_shell_doc("<body>x".into());
+        let token = register_shell_doc("<body>x".into()).expect("register shell document");
         let resp = shell_doc_protocol_response(req(Method::HEAD, &format!("/{token}")));
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(header::CONTENT_SECURITY_POLICY));
         assert!(resp.body().is_empty());
+
+        let get_after_head = shell_doc_protocol_response(req(Method::GET, &format!("/{token}")));
+        assert_eq!(get_after_head.status(), StatusCode::OK);
     }
 
     #[test]
@@ -306,7 +326,7 @@ mod tests {
 
     #[test]
     fn non_get_methods_rejected() {
-        let token = register_shell_doc("<body>".into());
+        let token = register_shell_doc("<body>".into()).expect("register shell document");
         let resp = shell_doc_protocol_response(req(Method::POST, &format!("/{token}")));
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
         let resp = shell_doc_protocol_response(req(Method::PUT, &format!("/{token}")));
@@ -314,20 +334,41 @@ mod tests {
     }
 
     #[test]
-    fn options_preflight_returns_no_content() {
+    fn options_is_rejected_and_never_opens_wildcard_cors() {
         let resp = shell_doc_protocol_response(req(Method::OPTIONS, "/anything"));
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert_eq!(
-            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
-            "*"
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
         );
     }
 
     #[test]
     fn two_registrations_of_same_html_yield_distinct_tokens() {
-        let a = register_shell_doc("<body>same".into());
-        let b = register_shell_doc("<body>same".into());
+        let a = register_shell_doc("<body>same".into()).expect("first registration");
+        let b = register_shell_doc("<body>same".into()).expect("second registration");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn registry_rejects_oversized_documents_and_capacity_exhaustion() {
+        let registry = ShellDocRegistry::with_limits(1, 4);
+        assert!(registry.register("12345".into()).is_err());
+
+        let token = registry.register("1234".into()).expect("within limit");
+        assert!(registry.register("next".into()).is_err());
+        assert!(registry.unregister(&token));
+        assert!(registry.register("next".into()).is_ok());
+    }
+
+    #[test]
+    fn unregister_rejects_replay_and_malformed_tokens() {
+        let registry = ShellDocRegistry::with_limits(2, 64);
+        let token = registry.register("<body>x".into()).expect("register");
+        assert!(registry.unregister(&token));
+        assert!(!registry.unregister(&token));
+        assert!(!registry.unregister("../not-a-token"));
     }
 
     #[test]

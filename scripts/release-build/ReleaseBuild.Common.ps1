@@ -4467,7 +4467,6 @@ except ImportError:
     sys.exit(0)
 
 path = sys.argv[1]
-required = ["windows-host-evidence", "android-host-evidence", "frontend-gate", "secret-scan", "pester-release-tests"]
 class UniqueKeySafeLoader(yaml.SafeLoader):
     pass
 def construct_unique_mapping(loader, node, deep=False):
@@ -4692,8 +4691,8 @@ workflow_shell_present, workflow_shell_kind, workflow_shell = run_shell_meta(dat
 workflow_env_present, workflow_env_kind, workflow_env, workflow_env_keys_unique, workflow_env_raw_keys = env_meta(data)
 root_permissions_present, root_permissions_kind, root_permissions, root_permissions_keys_unique, root_permissions_raw_keys = permissions_meta(data)
 out = {}
-for name in required:
-    job = jobs.get(name)
+for name, job in jobs.items():
+    name = str(name)
     if not isinstance(job, dict):
         out[name] = {"present": False, "steps": [], "reason": "job missing or not a mapping"}
         continue
@@ -5054,14 +5053,12 @@ function stepMeta(i, step) {
     with_clean_kind: withClean.kind
   };
 }
-const required = ["windows-host-evidence", "android-host-evidence", "frontend-gate", "secret-scan", "pester-release-tests"];
 const workflowWorkingDirectory = runWorkingDirectoryMeta(data);
 const workflowRunShell = runShellMeta(data);
 const workflowEnv = envMeta(data);
 const rootPermissions = permissionsMeta(data);
 const out = {};
-for (const name of required) {
-  const job = jobs[name];
+for (const [name, job] of Object.entries(jobs)) {
   if (!job || typeof job !== "object" || Array.isArray(job)) {
     out[name] = { present: false, steps: [], reason: "job missing or not a mapping" };
     continue;
@@ -5404,7 +5401,7 @@ emit({
             return $false
         }
         $rawKeys = @((Get-StepProp -Step $Step -Name 'env_raw_keys' -Default @()) | ForEach-Object { ([string]$_).Trim() })
-        if ($rawKeys.Count -ne 1 -or -not [string]::Equals($rawKeys[0], 'SF_RELEASE_SKIP_BUNDLE_INPUT', [System.StringComparison]::Ordinal)) {
+        if (@($rawKeys).Count -ne 1 -or -not [string]::Equals(@($rawKeys)[0], 'SF_RELEASE_SKIP_BUNDLE_INPUT', [System.StringComparison]::Ordinal)) {
             return $false
         }
         $entries = Get-StepProp -Step $Step -Name 'env' -Default $null
@@ -5438,8 +5435,10 @@ emit({
 
     function Test-HostJobEnvironmentContract {
         param($Job)
-        if (-not [bool](Get-StepProp -Step $Job -Name 'env_present' -Default $false) -or
-            -not [string]::Equals([string](Get-StepProp -Step $Job -Name 'env_kind' -Default ''), 'mapping', [System.StringComparison]::Ordinal) -or
+        if (-not [bool](Get-StepProp -Step $Job -Name 'env_present' -Default $false)) {
+            return $true
+        }
+        if (-not [string]::Equals([string](Get-StepProp -Step $Job -Name 'env_kind' -Default ''), 'mapping', [System.StringComparison]::Ordinal) -or
             -not [bool](Get-StepProp -Step $Job -Name 'env_keys_unique' -Default $false)) {
             return $false
         }
@@ -5502,13 +5501,26 @@ emit({
             [switch]$RequireOutputDir
         )
         if ([string]::IsNullOrWhiteSpace($Run)) { return $false }
-        $requiredParameter = if ($RequireOutputDir) { 'OutputDir' } else { '' }
         # Do not trust a leaf-name substring: comments, here-strings, Write-Host,
         # and evil/run-release-build.ps1 must not count as evidence production.
-        return Test-ReleaseRunContainsPowerShellFileInvocation `
-            -ScriptText $Run `
-            -ExpectedRelativePath ("scripts/{0}" -f $ScriptLeafName) `
-            -RequiredParameter $requiredParameter
+        $parsedRun = Get-ReleasePowerShellRunAst -ScriptText $Run
+        if (-not $parsedRun.Valid) { return $false }
+        foreach ($command in @($parsedRun.AllCommands)) {
+            if (-not (Test-ReleasePowerShellFileInvocationShape `
+                    -CommandAst $command `
+                    -ExpectedRelativePath ("scripts/{0}" -f $ScriptLeafName) `
+                    -RequireNoProfile)) {
+                continue
+            }
+            if (-not $RequireOutputDir -or
+                (Test-ReleaseCommandHasExactVariableParameterValue `
+                    -CommandAst $command `
+                    -ParameterName 'OutputDir' `
+                    -VariableName 'evidenceDir')) {
+                return $true
+            }
+        }
+        return $false
     }
 
     function ConvertTo-ReleaseControlledRunText {
@@ -5702,15 +5714,18 @@ rustup target list --installed | Select-String 'aarch64-linux-android'
                     Uses = $uses
                 }
             }
-            if ($RequireFreshProducer -and
-                [string]::Equals($stepId.Trim(), 'evidence', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ([string]::Equals($stepId.Trim(), 'evidence', [System.StringComparison]::OrdinalIgnoreCase)) {
                 $evidenceOutputIdSteps += [pscustomobject]@{
                     Index = $idx
                     Step = $step
                     Run = $run
                 }
             }
-            if ($RequireFreshProducer -and (Test-RunReferencesControlledScript -Run $run -ScriptLeafName $producerScriptLeafName -RequireOutputDir)) {
+            # Locate the producer even when the caller only requests basic
+            # verifier ordering. The Windows producer is the sole step allowed
+            # to bind workflow_dispatch input through a tightly governed env
+            # key, so its identity cannot depend on RequireFreshProducer.
+            if (Test-RunReferencesControlledScript -Run $run -ScriptLeafName $producerScriptLeafName -RequireOutputDir) {
                 $producerSteps += [pscustomobject]@{
                     Index = $idx
                     Step = $step
@@ -6106,11 +6121,31 @@ rustup target list --installed | Select-String 'aarch64-linux-android'
         }
     }
 
+    # Preserve exact parsed metadata for every workflow job. The two controlled
+    # host-evidence jobs are replaced with their stricter verifier-order result,
+    # while CI gate governance consumes the untouched generic metadata for jobs
+    # such as frontend-gate, secret-scan and pester-release-tests.
+    $allJobResults = @{}
+    if ($null -ne $parsed.jobs) {
+        if ($parsed.jobs -is [System.Collections.IDictionary]) {
+            foreach ($key in @($parsed.jobs.Keys)) {
+                $allJobResults[[string]$key] = $parsed.jobs[$key]
+            }
+        } else {
+            foreach ($property in @($parsed.jobs.PSObject.Properties)) {
+                $allJobResults[[string]$property.Name] = $property.Value
+            }
+        }
+    }
+    foreach ($key in @($jobResults.Keys)) {
+        $allJobResults[[string]$key] = $jobResults[$key]
+    }
+
     return [pscustomobject]@{
         Valid = ($errors.Count -eq 0)
         Engine = $engine
         Errors = @($errors)
-        jobs = [hashtable]$jobResults
+        jobs = [hashtable]$allJobResults
         ActionReferences = @($parsed.action_references | Where-Object { $null -ne $_ })
         RunBlocks = @($parsed.run_blocks | Where-Object { $null -ne $_ })
         WorkflowDefaultsRunWorkingDirectoryPresent = [bool]$parsed.workflow_defaults_run_working_directory_present
@@ -6230,18 +6265,46 @@ function Test-ReleaseCiGateJobContract {
     }
     function Test-SetupNodeStepContract {
         param($Step)
-        if ($null -eq $Step -or
-            -not [bool](Get-RecordValue -Record $Step -Name 'uses_present' -Default $false) -or
-            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -or
-            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses' -Default '')).Trim(), 'actions/setup-node@v4', [System.StringComparison]::OrdinalIgnoreCase) -or
-            -not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'run_present')) {
+        if ($null -eq $Step) {
             return $false
         }
         foreach ($field in @('if_present', 'continue_on_error_present', 'working_directory_present', 'shell_present')) {
             if (-not (Test-FieldAbsent -Record $Step -PresentName $field)) { return $false }
         }
         if (-not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'env_present')) { return $false }
-        return $true
+
+        if ([bool](Get-RecordValue -Record $Step -Name 'uses_present' -Default $false)) {
+            return (
+                [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal) -and
+                [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'uses' -Default '')).Trim(), 'actions/setup-node@v4', [System.StringComparison]::OrdinalIgnoreCase) -and
+                (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'run_present')
+            )
+        }
+
+        if (-not (Test-FieldExplicitlyAbsent -Record $Step -PresentName 'uses_present') -or
+            -not [bool](Get-RecordValue -Record $Step -Name 'run_present' -Default $false) -or
+            -not [string]::Equals(([string](Get-RecordValue -Record $Step -Name 'run_kind' -Default '')).Trim(), 'string', [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+
+        $expected = @'
+set -euo pipefail
+NODE_VERSION=22.12.0
+NODE_DIR=/opt/hostedtoolcache/storyforge-node22
+if [ ! -x "$NODE_DIR/bin/node" ]; then
+  ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${ARCHIVE}" -o "/tmp/${ARCHIVE}"
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o /tmp/node-SHASUMS256.txt
+  (cd /tmp && grep "  ${ARCHIVE}$" node-SHASUMS256.txt | sha256sum -c -)
+  mkdir -p "$NODE_DIR"
+  tar -xJf "/tmp/${ARCHIVE}" -C "$NODE_DIR" --strip-components=1
+fi
+echo "$NODE_DIR/bin" >> "$GITHUB_PATH"
+"$NODE_DIR/bin/node" --version
+'@
+        $actualNormalized = (([string](Get-RecordValue -Record $Step -Name 'run' -Default '') -replace '\s+', ' ').Trim())
+        $expectedNormalized = (($expected -replace '\s+', ' ').Trim())
+        return [string]::Equals($actualNormalized, $expectedNormalized, [System.StringComparison]::Ordinal)
     }
 
     $job = Get-ReleaseWorkflowJobExact -WorkflowMetadata $WorkflowMetadata -JobName $jobName
@@ -6352,7 +6415,7 @@ function Test-ReleaseCiGateJobContract {
                     [int](Get-RecordValue -Record $_ -Name 'index' -Default -1) -eq 1
                 })
             if ($gateIndex -ne 2 -or $setupSteps.Count -ne 1 -or -not (Test-SetupNodeStepContract -Step $setupSteps[0])) {
-                $errors.Add("CI job '$jobName' must run exactly checkout, actions/setup-node@v4, then npm ci before any other executable step") | Out-Null
+                $errors.Add("CI job '$jobName' must run exactly checkout, a controlled Node 22 setup, then npm ci before any other executable step") | Out-Null
             }
         } elseif ($gateIndex -ne 1) {
             $errors.Add("CI job '$jobName' must run the secret scan immediately after checkout with no intervening executable step") | Out-Null
@@ -6455,6 +6518,14 @@ function Test-ReleasePesterYamlParserReadiness {
 $ErrorActionPreference = 'Stop'
 python -m pip install 'PyYAML==6.0.2'
 python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+$requiredPester = [version]'4.10.1'
+if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq $requiredPester })) {
+  Install-Module Pester -RequiredVersion $requiredPester -Scope CurrentUser -Force -SkipPublisherCheck -AllowClobber
+}
+Import-Module Pester -RequiredVersion $requiredPester -Force
+if ((Get-Module Pester | Select-Object -First 1).Version -ne $requiredPester) {
+  throw "Expected Pester $requiredPester."
+}
 '@
         return [string]::Equals((([string]$Run -replace '\s+', ' ').Trim()), (($expected -replace '\s+', ' ').Trim()), [System.StringComparison]::Ordinal)
     }
@@ -6643,7 +6714,7 @@ function Assert-ReleaseWorkflowStaticContract {
         $rootContents = if ($null -ne $contentsProperty) { [string]$contentsProperty.Value } else { '' }
         $rootExact = ($null -ne $metadata -and [bool]$metadata.RootPermissionsPresent -and
             [string]$metadata.RootPermissionsKind -eq 'mapping' -and [bool]$metadata.RootPermissionsKeysUnique -and
-            @($rootKeys).Count -eq 1 -and $rootKeys[0] -eq 'contents' -and
+            @($rootKeys).Count -eq 1 -and @($rootKeys)[0] -eq 'contents' -and
             [string]::Equals($rootContents.Trim(), 'read', [System.StringComparison]::Ordinal))
         if (-not $rootExact) {
             $permissionsOk = $false
@@ -6694,16 +6765,21 @@ function Assert-ReleaseWorkflowStaticContract {
     # where those jobs actually live. The gate semantics are unchanged: the
     # job must still exist, run on windows-latest, and follow the controlled
     # step contract; it is not disguised as executed by a push.
-    $secretGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $windowsMetadata -Gate 'secret_scan'
-    $checks['secret_scan'] = [bool]$secretGate.Valid
-    if (-not $checks['secret_scan']) {
-        foreach ($gateError in @($secretGate.Errors)) { $errors.Add([string]$gateError) | Out-Null }
-    }
+    if ($null -eq $windowsMetadata) {
+        $checks['secret_scan'] = $false
+        $checks['pester_yaml_parser'] = $false
+    } else {
+        $secretGate = Test-ReleaseCiGateJobContract -WorkflowMetadata $windowsMetadata -Gate 'secret_scan'
+        $checks['secret_scan'] = [bool]$secretGate.Valid
+        if (-not $checks['secret_scan']) {
+            foreach ($gateError in @($secretGate.Errors)) { $errors.Add([string]$gateError) | Out-Null }
+        }
 
-    $pesterParser = Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $windowsMetadata
-    $checks['pester_yaml_parser'] = [bool]$pesterParser.Valid
-    if (-not $checks['pester_yaml_parser']) {
-        foreach ($parserError in @($pesterParser.Errors)) { $errors.Add([string]$parserError) | Out-Null }
+        $pesterParser = Test-ReleasePesterYamlParserReadiness -WorkflowMetadata $windowsMetadata
+        $checks['pester_yaml_parser'] = [bool]$pesterParser.Valid
+        if (-not $checks['pester_yaml_parser']) {
+            foreach ($parserError in @($pesterParser.Errors)) { $errors.Add([string]$parserError) | Out-Null }
+        }
     }
 
     $hostWf = Join-Path $workflowDir 'release-host-evidence.yml'

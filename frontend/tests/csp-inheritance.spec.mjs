@@ -249,8 +249,8 @@ test('separate-origin shell document with its own CSP runs inline scripts (the i
   // shell origin. This models the post-fix main app: frame-src lists the
   // isolated shell origin (and blob:/data: for parity), nothing else changes.
   const fixCsp = APP_CSP.replace(
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost data:',
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test data:',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test',
   )
 
   const appHTML = `<!doctype html><html><head><meta charset="utf-8"></head><body>
@@ -315,8 +315,8 @@ test('isolated-origin shell boots a CardShell-style bridge and round-trips a mes
   })
 
   const fixCsp = APP_CSP.replace(
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost data:',
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test data:',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test',
   )
   const appHTML = `<!doctype html><html><head><meta charset="utf-8"></head><body>
     <div id="status">parent loaded</div>
@@ -434,8 +434,8 @@ test('isolated shell loads a storyforge-cache asset without CSP violation', asyn
     })
   })
   const fixCsp = APP_CSP.replace(
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost data:',
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test data:',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test',
   )
   const appHTML = `<!doctype html><html><head><meta charset="utf-8"></head><body>
     <iframe id="shell" src="http://shell.local.test/cache.html"></iframe>
@@ -502,8 +502,8 @@ test('shell self-CSP blocks unauthorized remote fetch even though inline scripts
     })
   })
   const fixCsp = APP_CSP.replace(
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost data:',
-    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test data:',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost',
+    'frame-src http://storyforge-shell.localhost storyforge-shell://localhost http://shell.local.test',
   )
   const appHTML = `<!doctype html><html><head><meta charset="utf-8"></head><body>
     <iframe id="shell" src="http://shell.local.test/egress.html"></iframe>

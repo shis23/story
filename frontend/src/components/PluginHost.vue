@@ -82,7 +82,11 @@ import {
 } from '../plugin-bridge.js'
 import { invoke } from '@tauri-apps/api/core'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
-import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
+import {
+  configureShellDocInvoke,
+  registerShellDoc,
+  releaseShellDoc,
+} from '../utils/shellDocUrl.js'
 
 const props = defineProps({
   /** InstalledPluginDto */
@@ -125,20 +129,39 @@ const iframeDoc = computed(() => {
   return `<!DOCTYPE html><html><head>${buildShellCspMetaTag([])}${bridgeScript}</head><body>${entryHtml}</body></html>`
 })
 const iframeSrc = ref('')
+let iframeUrl = null
 
 // Re-register the document whenever the plugin's HTML changes.
-watch(iframeDoc, async (doc) => {
+watch(iframeDoc, async (doc, _previousDoc, onCleanup) => {
+  let cancelled = false
+  onCleanup(() => { cancelled = true })
+
+  const previousUrl = iframeUrl
+  iframeUrl = null
+  if (previousUrl?.startsWith('blob:')) {
+    try { URL.revokeObjectURL(previousUrl) } catch (_) {}
+  } else if (previousUrl) {
+    void releaseShellDoc(previousUrl).catch(() => {})
+  }
+
   if (!doc) {
     iframeSrc.value = ''
     return
   }
   configureShellDocInvoke(invoke)
   try {
-    iframeSrc.value = await registerShellDoc(doc)
+    const nextUrl = await registerShellDoc(doc)
+    if (cancelled) {
+      void releaseShellDoc(nextUrl).catch(() => {})
+      return
+    }
+    iframeUrl = nextUrl
+    iframeSrc.value = nextUrl
   } catch (e) {
-    // Non-Tauri fallback (tests): blob URL still renders the plugin.
+    if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) throw e
     const blob = new Blob([doc], { type: 'text/html' })
-    iframeSrc.value = URL.createObjectURL(blob)
+    iframeUrl = URL.createObjectURL(blob)
+    iframeSrc.value = iframeUrl
   }
   // The plugin identity changed; reset ready state until the new bridge boots.
   iframeReady.value = false
@@ -297,6 +320,12 @@ onUnmounted(() => {
   hookBridge?.dispose()
   handler = null
   hookBridge = null
+  if (iframeUrl?.startsWith('blob:')) {
+    try { URL.revokeObjectURL(iframeUrl) } catch (_) {}
+  } else if (iframeUrl) {
+    void releaseShellDoc(iframeUrl).catch(() => {})
+  }
+  iframeUrl = null
 })
 
 // 插件变化时重建 handler

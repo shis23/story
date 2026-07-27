@@ -2,7 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vm from 'node:vm'
-import { getTrustedMvuRuntimeMessage } from '../src/mvu-runtime-bridge.js'
+import {
+  getTrustedMvuRuntimeMessage,
+  hasTauriRuntimeBridge,
+} from '../src/mvu-runtime-bridge.js'
 
 function extractRuntimeShimScript() {
   const source = fs.readFileSync(new URL('../src/components/MvuJsRuntime.vue', import.meta.url), 'utf8')
@@ -107,6 +110,12 @@ test('rejects MVU runtime messages before the iframe window is available', () =>
     getTrustedMvuRuntimeMessage({ source: {}, data: { type: 'mvu:ready' } }, null),
     null,
   )
+})
+
+test('subscribes to Tauri events only when the runtime bridge exists', () => {
+  assert.equal(hasTauriRuntimeBridge(undefined), false)
+  assert.equal(hasTauriRuntimeBridge({}), false)
+  assert.equal(hasTauriRuntimeBridge({ __TAURI_INTERNALS__: {} }), true)
 })
 
 test('MVU iframe shim captures direct variables assignments and _.set updates', () => {

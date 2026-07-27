@@ -88,16 +88,14 @@ export const APP_CACHE_ORIGINS = [
  *                             — Vue runtime injects scoped style; index.html
  *                               theme bootstrap is inline. Scripts are NOT
  *                               given 'unsafe-inline' — only styles.
- *   frame-src <shell origins> data:
+ *   frame-src <shell origins>
  *                             — ONLY the isolated storyforge-shell origin may
  *                               be framed (CardShellHost/TavernHelperRuntime/
  *                               MvuJsRuntime/PluginHost all load shell docs
- *                               there). data: retained for any non-shell data
- *                               iframe; blob: is intentionally NOT granted
- *                               because shell docs now load from the isolated
- *                               origin, and a parent-created blob: document
- *                               would inherit this app CSP (breaking its inline
- *                               bridges).
+ *                               there). data:/blob: are intentionally NOT
+ *                               granted because there is no production
+ *                               consumer and parent-created inline documents
+ *                               inherit this app CSP.
  *   object-src 'none'         — no plugins/Flash/Java.
  *   form-action 'none'        — no form submission from the app origin.
  *   base-uri 'none'           — forbid <base> hijack of relative URLs.
@@ -119,7 +117,7 @@ export const APP_CSP = [
   `media-src 'self' data: blob: ${APP_CACHE_ORIGINS.join(' ')}`,
   `font-src 'self' data: blob: ${APP_CACHE_ORIGINS.join(' ')}`,
   "style-src 'self' 'unsafe-inline'",
-  `frame-src ${APP_SHELL_DOC_ORIGINS.join(' ')} data:`,
+  `frame-src ${APP_SHELL_DOC_ORIGINS.join(' ')}`,
   "object-src 'none'",
   "form-action 'none'",
   "base-uri 'none'",

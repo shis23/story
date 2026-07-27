@@ -88,7 +88,7 @@ test('object-src, form-action and base-uri are locked down', () => {
   assert.deepEqual(APP_CSP_DIRECTIVES['base-uri'], ["'none'"])
 })
 
-test('frame-src allows ONLY the isolated shell origin (+ data:), not blob:', () => {
+test('frame-src allows only the isolated shell origins', () => {
   // V5 CSP isolation: shell documents are served from the dedicated
   // storyforge-shell origin so they do NOT inherit the main app policy
   // container. blob: is intentionally absent — a parent-created blob document
@@ -97,7 +97,8 @@ test('frame-src allows ONLY the isolated shell origin (+ data:), not blob:', () 
   for (const origin of APP_SHELL_DOC_ORIGINS) {
     assert.ok(fs.includes(origin), `frame-src must include ${origin}`)
   }
-  assert.ok(fs.includes('data:'), 'data: retained for non-shell data iframes')
+  assert.equal(fs.length, APP_SHELL_DOC_ORIGINS.length)
+  assert.ok(!fs.includes('data:'), 'no production data: iframe consumer exists')
   assert.ok(!fs.includes('blob:'), 'frame-src must NOT grant blob: (inheritance risk)')
 })
 

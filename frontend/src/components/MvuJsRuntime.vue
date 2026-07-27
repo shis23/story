@@ -39,9 +39,16 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
-import { getTrustedMvuRuntimeMessage } from '../mvu-runtime-bridge.js'
+import {
+  getTrustedMvuRuntimeMessage,
+  hasTauriRuntimeBridge,
+} from '../mvu-runtime-bridge.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
-import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
+import {
+  configureShellDocInvoke,
+  registerShellDoc,
+  releaseShellDoc,
+} from '../utils/shellDocUrl.js'
 
 const iframeRef = ref(null)
 const iframeReady = ref(false)
@@ -330,6 +337,8 @@ function buildMvuShellDoc() {
 // Resolved to a shell-doc URL in onMounted. Starts blank so the iframe never
 // loads an inline-script document that would inherit the main app CSP.
 const iframeSrc = ref('about:blank')
+let iframeUrl = null
+let disposed = false
 
 // ─── iframe 通信 ────────────────────────────────────────────────────────
 
@@ -452,24 +461,42 @@ onMounted(async () => {
   // V5 CSP isolation: register the shim document on the isolated shell origin.
   configureShellDocInvoke(invoke)
   try {
-    iframeSrc.value = await registerShellDoc(buildMvuShellDoc())
+    const nextUrl = await registerShellDoc(buildMvuShellDoc())
+    if (disposed) {
+      void releaseShellDoc(nextUrl).catch(() => {})
+      return
+    }
+    iframeUrl = nextUrl
+    iframeSrc.value = nextUrl
   } catch (e) {
     // Non-Tauri fallback (tests): keep the inline document via srcdoc is not
     // possible here (we switched to :src), so degrade to a blob URL so the
     // shim still runs in browser/test environments without the main app CSP.
+    if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) throw e
     const blob = new Blob([buildMvuShellDoc()], { type: 'text/html' })
-    iframeSrc.value = URL.createObjectURL(blob)
+    iframeUrl = URL.createObjectURL(blob)
+    iframeSrc.value = iframeUrl
   }
 
-  const [u1, u2, u3] = await Promise.all([
-    listen('mvu:load_card_assets', (ev) => handleLoadAssets(ev.payload)),
-    listen('mvu:unload_card', () => handleUnload()),
-    listen('mvu:execute', (ev) => handleExecute(ev.payload)),
-  ])
-  unlistenFns = [u1, u2, u3]
+  // The Vite/HMR browser surface has no Tauri event transport. Calling
+  // @tauri-apps/api/event.listen there throws from transformCallback during
+  // the mounted hook and pollutes every desktop acceptance run.
+  if (hasTauriRuntimeBridge(window)) {
+    const listeners = await Promise.all([
+      listen('mvu:load_card_assets', (ev) => handleLoadAssets(ev.payload)),
+      listen('mvu:unload_card', () => handleUnload()),
+      listen('mvu:execute', (ev) => handleExecute(ev.payload)),
+    ])
+    if (disposed) {
+      listeners.forEach(fn => fn())
+      return
+    }
+    unlistenFns = listeners
+  }
 })
 
 onUnmounted(() => {
+  disposed = true
   window.removeEventListener('message', onWindowMessage)
   unlistenFns.forEach(fn => fn())
   unlistenFns = []
@@ -478,6 +505,12 @@ onUnmounted(() => {
   if (window.__storyforgeMvuRuntime?.isReady?.() === iframeReady.value) {
     delete window.__storyforgeMvuRuntime
   }
+  if (iframeUrl?.startsWith('blob:')) {
+    try { URL.revokeObjectURL(iframeUrl) } catch (_) {}
+  } else if (iframeUrl) {
+    void releaseShellDoc(iframeUrl).catch(() => {})
+  }
+  iframeUrl = null
 })
 
 defineExpose({

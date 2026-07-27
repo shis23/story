@@ -50,7 +50,11 @@ import {
   setCampaignWorldInfoEnabled,
 } from '../tauri-api.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
-import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
+import {
+  configureShellDocInvoke,
+  registerShellDoc,
+  releaseShellDoc,
+} from '../utils/shellDocUrl.js'
 import {
   createCardShellRuntimeCompatibilityScript,
   isCardShellBridgeMessageForSession,
@@ -121,6 +125,7 @@ const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
 const frameSrc = ref('about:blank')
 let frameBlobUrl = null
+let frameRegistrationSeq = 0
 const loading = ref(false)
 const error = ref(null)
 const loadedUrl = ref(null)
@@ -196,12 +201,18 @@ function blankSrcdoc(msg) {
 }
 
 function clearFrameUrl() {
-  // Shell documents live in the Rust-side token registry; the iframe simply
-  // points away from the old URL. No blob URL to revoke.
+  const previous = frameBlobUrl
   frameBlobUrl = null
+  if (!previous) return
+  if (previous.startsWith('blob:')) {
+    try { URL.revokeObjectURL(previous) } catch (_) {}
+    return
+  }
+  void releaseShellDoc(previous).catch(() => {})
 }
 
 async function setFrameHtml(html) {
+  const registrationSeq = ++frameRegistrationSeq
   srcdoc.value = html
   clearFrameUrl()
   // Serve the shell document on the isolated storyforge-shell origin. CSP L3
@@ -210,11 +221,16 @@ async function setFrameHtml(html) {
   // its own shell CSP (HTTP header set in shell_doc_protocol.rs, mirrored as
   // the <meta> injected by buildShellCspMetaTag above).
   try {
-    frameBlobUrl = await registerShellDoc(html)
-    frameSrc.value = frameBlobUrl
+    const nextUrl = await registerShellDoc(html)
+    if (registrationSeq !== frameRegistrationSeq) {
+      void releaseShellDoc(nextUrl).catch(() => {})
+      return
+    }
+    frameBlobUrl = nextUrl
+    frameSrc.value = nextUrl
   } catch (e) {
-    // If the host command is unavailable (e.g. legacy/test harness), fall back
-    // to a blob URL so the shell still renders in non-Tauri environments.
+    // Browser-only test harnesses have no Tauri custom protocol.
+    if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) throw e
     const blob = new Blob([html], { type: 'text/html' })
     frameBlobUrl = URL.createObjectURL(blob)
     frameSrc.value = frameBlobUrl
@@ -1036,6 +1052,7 @@ onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   stHostHandler = null
   loadSeq++
+  frameRegistrationSeq++
   clearFrameUrl()
 })
 

@@ -10,3 +10,7 @@ export function getTrustedMvuRuntimeMessage(event, runtimeWindow) {
 
   return data
 }
+
+export function hasTauriRuntimeBridge(hostWindow) {
+  return Boolean(hostWindow && hostWindow.__TAURI_INTERNALS__)
+}

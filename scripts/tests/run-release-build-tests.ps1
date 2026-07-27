@@ -74,30 +74,26 @@ try {
         exit 0
     }
 
-    if (-not (Get-Module -ListAvailable -Name Pester)) {
-        throw 'Pester module is not installed. Install with: Install-Module Pester -Scope CurrentUser -Force'
+    # These tracked suites intentionally retain Pester 3/4 `Should Be` syntax.
+    # Pester 5 discovers the files but rejects that assertion grammar, which
+    # can turn a correctly configured Windows gate into an all-red false alarm.
+    $pesterModule = @(Get-Module -ListAvailable -Name Pester |
+            Where-Object { $_.Version.Major -lt 5 } |
+            Sort-Object Version -Descending |
+            Select-Object -First 1)
+    if ($pesterModule.Count -ne 1) {
+        throw "No compatible Pester 3.x/4.x module is installed. Install pinned Pester 4.10.1 before running this suite."
     }
 
-    Import-Module Pester -ErrorAction Stop
-
-    # Support both Pester 3.x (Windows default) and 4+/5+ if present.
-    $pesterModule = Get-Module Pester
+    Remove-Module Pester -Force -ErrorAction SilentlyContinue
+    Import-Module $pesterModule[0].Path -Force -ErrorAction Stop
+    $pesterModule = Get-Module Pester | Select-Object -First 1
     $version = $pesterModule.Version
     Write-Host ("Using Pester {0}" -f $version)
 
-    if ($version.Major -ge 5) {
-        $config = New-PesterConfiguration
-        $config.Run.Path = $testFiles
-        $config.Run.Exit = $false
-        $config.Run.PassThru = $true
-        $config.Output.Verbosity = 'Detailed'
-        $result = Invoke-Pester -Configuration $config
-        Assert-ReleasePesterResult -Result $result -Label 'release-build test suite'
-    } else {
-        foreach ($testFile in $testFiles) {
-            $result = Invoke-Pester -Path $testFile -PassThru
-            Assert-ReleasePesterResult -Result $result -Label $testFile
-        }
+    foreach ($testFile in $testFiles) {
+        $result = Invoke-Pester -Path $testFile -PassThru
+        Assert-ReleasePesterResult -Result $result -Label $testFile
     }
 
     Write-Host 'Release build tests passed.' -ForegroundColor Green

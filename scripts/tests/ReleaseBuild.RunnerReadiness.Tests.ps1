@@ -1336,6 +1336,22 @@ Describe 'Release workflow static governance (runner readiness)' {
         }
     }
 
+    It 'returns exact generic metadata for every parsed workflow job' {
+        $ciPath = Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml'
+        $ci = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $ciPath
+        $ci.Engine | Should Match 'pyyaml|node-yaml'
+        $ci.jobs.ContainsKey('frontend-gate') | Should Be $true
+        $ci.jobs['frontend-gate'].present | Should Be $true
+        $ci.jobs['frontend-gate'].runs_on | Should Be 'ubuntu-latest'
+        @($ci.jobs['frontend-gate'].steps).Count | Should BeGreaterThan 0
+
+        $windowsPath = Join-Path $RepoRoot '.gitea\workflows\windows-gates.yml'
+        $windows = Test-ReleaseHostEvidenceVerifierOrder -WorkflowPath $windowsPath
+        $windows.jobs.ContainsKey('secret-scan') | Should Be $true
+        $windows.jobs.ContainsKey('pester-release-tests') | Should Be $true
+        $windows.jobs['secret-scan'].runs_on | Should Be 'windows-latest'
+    }
+
     It 'asserts fixed action pins, npm ci, secret scan, retention, and host-only defaults' {
         $gov = Assert-ReleaseWorkflowStaticContract -RepoRoot $RepoRoot
         if (-not $gov.Valid) {
@@ -2480,7 +2496,7 @@ jobs:
             [pscustomobject]@{
                 Name = 'producer step environment override'
                 Text = $base.Replace('        id: evidence', "        id: evidence`r`n        env:`r`n          PATH: C:\evil")
-                Pattern = 'step.*env|env override|environment'
+                Pattern = 'step.*env|env override|environment|duplicate key.*env'
             },
             [pscustomobject]@{
                 Name = 'job defaults working-directory'
@@ -2586,8 +2602,18 @@ jobs:
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-actions-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
         try {
-            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
-            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            # Windows PowerShell 5's Get-Content still performs line splitting
+            # after decoding; some mis-decoded multibyte comment bytes can be
+            # interpreted as NEL and corrupt indentation. Read the UTF-8 text
+            # directly so this fixture preserves the tracked YAML byte shape.
+            $ci = [System.IO.File]::ReadAllText(
+                (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml'),
+                [System.Text.Encoding]::UTF8
+            )
+            $hostWorkflow = [System.IO.File]::ReadAllText(
+                (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'),
+                [System.Text.Encoding]::UTF8
+            )
             $ci | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
             ($hostWorkflow + @'
 
@@ -2787,8 +2813,20 @@ jobs:
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-release-contract-conditional-gates-{0}" -f [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path (Join-Path $dir '.gitea\workflows') | Out-Null
         try {
-            $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
-            $hostWorkflow = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml') -Raw
+            # Read directly as UTF-8. Windows PowerShell 5 can otherwise
+            # misinterpret multibyte Chinese comment bytes while line-splitting
+            # Get-Content input and corrupt the following YAML indentation.
+            $ci = [System.IO.File]::ReadAllText(
+                (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml'),
+                [System.Text.Encoding]::UTF8
+            )
+            $hostWorkflow = [System.IO.File]::ReadAllText(
+                (Join-Path $RepoRoot '.gitea\workflows\release-host-evidence.yml'),
+                [System.Text.Encoding]::UTF8
+            )
+            # Comments do not contribute executable gates; remove them to keep
+            # this adversarial fixture independent of legacy host code pages.
+            $ci = [regex]::Replace($ci, '(?m)^[ \t]*#[^\r\n]*(?:\r?\n|$)', '')
             $badCi = $ci.Replace('npm ci', 'Write-Host skipped').Replace(
                 'pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly',
                 'Write-Host skipped'
@@ -2806,13 +2844,22 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
 '@
-            $badCi | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\ci-gates.yml') -Encoding utf8
-            $hostWorkflow | Set-Content -LiteralPath (Join-Path $dir '.gitea\workflows\release-host-evidence.yml') -Encoding utf8
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText(
+                (Join-Path $dir '.gitea\workflows\ci-gates.yml'),
+                $badCi,
+                $utf8NoBom
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $dir '.gitea\workflows\release-host-evidence.yml'),
+                $hostWorkflow,
+                $utf8NoBom
+            )
             $contract = Assert-ReleaseWorkflowStaticContract -RepoRoot $dir
             $contract.Valid | Should Be $false
             $contract.checks['npm_ci'] | Should Be $false
             $contract.checks['secret_scan'] | Should Be $false
-            ($contract.Errors -join ' ') | Should Match 'npm ci|secret scan'
+            ($contract.Errors -join ' ') | Should Match 'npm[_ ]ci|secret scan'
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -2883,11 +2930,14 @@ if ($skipBundleInput -eq 'false') {
         $body = @($lines[($runStart + 1)..($runEnd - 1)] |
             Where-Object { $_ -match '^          ' } |
             ForEach-Object { $_.Substring(10) }) -join "`n"
-        $inputGuard = @'
-if ($skipBundleInput -notin @('', 'true', 'false')) {
-  throw 'skip_bundle must be empty, true, or false.'
-}
-'@.Trim()
+        # Build with the same LF separator used above. Windows PowerShell 5
+        # otherwise gives this here-string CRLF endings and Replace becomes a
+        # no-op, leaving the guard in the adversarial fixture.
+        $inputGuard = @(
+            "if (`$skipBundleInput -notin @('', 'true', 'false')) {"
+            "  throw 'skip_bundle must be empty, true, or false.'"
+            '}'
+        ) -join "`n"
         $unsafeInterpolation = $body.Replace(
             '[string]$env:SF_RELEASE_SKIP_BUNDLE_INPUT',
             @'
@@ -3150,6 +3200,14 @@ if (-not (Test-Path -LiteralPath (Join-Path $evidenceDir 'manifest.json') -PathT
 $ErrorActionPreference = 'Stop'
 python -m pip install 'PyYAML==6.0.2'
 python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+$requiredPester = [version]'4.10.1'
+if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq $requiredPester })) {
+  Install-Module Pester -RequiredVersion $requiredPester -Scope CurrentUser -Force -SkipPublisherCheck -AllowClobber
+}
+Import-Module Pester -RequiredVersion $requiredPester -Force
+if ((Get-Module Pester | Select-Object -First 1).Version -ne $requiredPester) {
+  throw "Expected Pester $requiredPester."
+}
 '@
         $pesterJob = [pscustomobject]@{
             present = $true; runs_on_kind = 'string'; runs_on = 'windows-latest'

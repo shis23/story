@@ -38,6 +38,7 @@ export const SHELL_DOC_ORIGIN = IS_WIN_OR_ANDROID
   : 'storyforge-shell://localhost'
 
 let _invoke = null
+const TOKEN_RE = /^[a-f0-9]{64}$/
 
 /**
  * Inject the Tauri `invoke` dependency. Avoids a hard import here so the module
@@ -61,7 +62,28 @@ export async function registerShellDoc(html) {
     throw new Error('registerShellDoc: Tauri invoke not configured (call configureShellDocInvoke)')
   }
   const token = await _invoke('card_shell_register_doc', { html })
+  if (typeof token !== 'string' || !TOKEN_RE.test(token)) {
+    throw new Error('registerShellDoc: invalid shell document token returned by host')
+  }
   return `${SHELL_DOC_ORIGIN}/${token}`
+}
+
+export function shellDocTokenFromUrl(url) {
+  if (typeof url !== 'string') return null
+  const prefix = `${SHELL_DOC_ORIGIN}/`
+  if (!url.startsWith(prefix)) return null
+  const token = url.slice(prefix.length)
+  return TOKEN_RE.test(token) ? token : null
+}
+
+/**
+ * Release a registered document that was replaced/unmounted before its first
+ * GET consumed the one-shot host entry. Invalid or non-shell URLs are ignored.
+ */
+export async function releaseShellDoc(url) {
+  const token = shellDocTokenFromUrl(url)
+  if (!_invoke || !token) return false
+  return Boolean(await _invoke('card_shell_unregister_doc', { token }))
 }
 
 /**
@@ -70,5 +92,8 @@ export async function registerShellDoc(html) {
  * not via Tauri) and by Node unit tests that only inspect URL shape.
  */
 export function shellDocUrlForToken(token) {
+  if (!TOKEN_RE.test(String(token || ''))) {
+    throw new Error('shellDocUrlForToken: invalid shell document token')
+  }
   return `${SHELL_DOC_ORIGIN}/${token}`
 }

@@ -67,7 +67,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { cardShellFetchUrl, getCardShellInlineJs } from '../tauri-api.js'
 import { orderedTavernHelperFromShells, collectVisibleThButtons } from '../utils/tavernHelperScripts.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
-import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
+import {
+  configureShellDocInvoke,
+  registerShellDoc,
+  releaseShellDoc,
+} from '../utils/shellDocUrl.js'
 
 const props = defineProps({
   /** CardShellManifest.shells */
@@ -98,6 +102,7 @@ const iframeRef = ref(null)
 const srcdoc = ref('')
 const frameSrc = ref('about:blank')
 let frameBlobUrl = null
+let frameRegistrationSeq = 0
 const running = ref(false)
 const statuses = ref([])
 const lastError = ref(null)
@@ -560,19 +565,31 @@ function bootstrapSrcdoc() {
 }
 
 function clearFrameUrl() {
-  // Shell documents live in the Rust-side token registry; no blob URL to revoke.
+  const previous = frameBlobUrl
   frameBlobUrl = null
+  if (!previous) return
+  if (previous.startsWith('blob:')) {
+    try { URL.revokeObjectURL(previous) } catch (_) {}
+    return
+  }
+  void releaseShellDoc(previous).catch(() => {})
 }
 
 async function setFrameHtml(html) {
+  const registrationSeq = ++frameRegistrationSeq
   srcdoc.value = html
   clearFrameUrl()
   // V5 CSP isolation: serve on the isolated storyforge-shell origin.
   try {
-    frameBlobUrl = await registerShellDoc(html)
-    frameSrc.value = frameBlobUrl
+    const nextUrl = await registerShellDoc(html)
+    if (registrationSeq !== frameRegistrationSeq) {
+      void releaseShellDoc(nextUrl).catch(() => {})
+      return
+    }
+    frameBlobUrl = nextUrl
+    frameSrc.value = nextUrl
   } catch (e) {
-    // Non-Tauri fallback (tests/legacy): blob URL still renders.
+    if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) throw e
     const blob = new Blob([html], { type: 'text/html' })
     frameBlobUrl = URL.createObjectURL(blob)
     frameSrc.value = frameBlobUrl
@@ -855,6 +872,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   runSeq++
+  frameRegistrationSeq++
   revokeBlobs()
   clearFrameUrl()
 })

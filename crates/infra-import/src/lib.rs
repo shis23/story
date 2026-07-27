@@ -923,7 +923,10 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
         let err = check_import_size(small_max + 1, small_max).expect_err("超上限必须被拒");
         assert!(matches!(err, ImportError::PngError(_)));
         let msg = err.to_string();
-        assert!(msg.contains("文件过大"), "错误文案应说明文件过大，got: {msg}");
+        assert!(
+            msg.contains("文件过大"),
+            "错误文案应说明文件过大，got: {msg}"
+        );
         assert!(
             msg.contains(&format!("上限 {} 字节", small_max)),
             "错误文案应含上限字节数，got: {msg}"

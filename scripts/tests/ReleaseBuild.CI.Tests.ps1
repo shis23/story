@@ -702,3 +702,12 @@ Describe 'ReleaseBuild host evidence workflow defaults' {
         $text | Should Match 'SkipBundle'
     }
 }
+
+Describe 'ReleaseBuild Pester runner compatibility' {
+    It 'selects a legacy-syntax-compatible Pester module and never routes these files through Pester 5' {
+        $runner = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts\tests\run-release-build-tests.ps1') -Raw
+        $runner | Should Match 'Version\.Major\s+-lt\s+5'
+        $runner | Should Match 'compatible Pester 3\.x/4\.x'
+        $runner | Should Not Match 'if\s*\(\$version\.Major\s+-ge\s+5\)'
+    }
+}
