@@ -65,7 +65,7 @@ describe('writing pipeline presentation', () => {
     expect(wrapper.text()).toContain('这是应该完整展示的正文，而不是最后三个字。')
   })
 
-  it('uses a unified editor surface without the browser textarea border', () => {
+  it('uses one focus surface without nested textarea outlines', () => {
     const wrapper = mount(ComposerBar, {
       props: { generationMode: 'continuation', showGenerationModes: true },
     })
@@ -73,6 +73,9 @@ describe('writing pipeline presentation', () => {
     const shell = wrapper.get('[data-testid="composer-input-shell"]')
     const textarea = wrapper.get('textarea')
     expect(shell.classes()).toContain('rounded-xl')
+    expect(shell.classes()).not.toContain('border')
+    expect(shell.classes()).not.toContain('border-line')
+    expect(textarea.classes()).toContain('composer-textarea')
     expect(textarea.classes()).toContain('border-0')
     expect(textarea.attributes('aria-label')).toBe('写作意图')
   })

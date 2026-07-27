@@ -73,7 +73,7 @@ function submit() {
 
     <div
       data-testid="composer-input-shell"
-      class="mx-3 flex items-end gap-2 rounded-xl border border-line bg-bg/70 px-3 py-2.5 transition-all focus-within:border-accent-border focus-within:bg-bg focus-within:ring-2 focus-within:ring-accent-soft"
+      class="mx-3 flex items-end gap-2 rounded-xl bg-surface-2/65 px-3 py-2.5 transition-all focus-within:bg-bg focus-within:shadow-[inset_0_0_0_1px_var(--color-accent-border)]"
     >
       <textarea
         ref="textareaRef"
@@ -82,7 +82,7 @@ function submit() {
         :placeholder="writing ? '写作中…' : placeholder"
         :disabled="disabled || writing"
         rows="1"
-        class="min-h-[3.5rem] max-h-36 flex-1 resize-none appearance-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-ink outline-none placeholder:text-ink-faint focus:outline-none focus:ring-0 disabled:opacity-50"
+        class="composer-textarea min-h-[3.5rem] max-h-36 flex-1 resize-none appearance-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-ink outline-none placeholder:text-ink-faint focus:outline-none focus:ring-0 disabled:opacity-50"
         @keydown.enter.exact.prevent="submit"
         @input="$event.target.style.height='auto'; $event.target.style.height=$event.target.scrollHeight+'px'"
       ></textarea>
@@ -126,3 +126,12 @@ function submit() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.composer-textarea:focus,
+.composer-textarea:focus-visible {
+  border: 0;
+  outline: none;
+  box-shadow: none !important;
+}
+</style>
