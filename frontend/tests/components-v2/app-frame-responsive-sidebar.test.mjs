@@ -43,6 +43,7 @@ describe('AppFrame responsive sidebar mounting', () => {
 
     expect(sidebarMounts).toBe(1)
     expect(wrapper.findAll('[data-testid="sidebar-probe"]')).toHaveLength(1)
+    expect(wrapper.get('aside').classes()).toContain('w-[min(100vw,var(--layout-sidebar))]')
   })
 
   it('keeps one hidden runtime mounted while the mobile drawer is closed', async () => {

@@ -47,6 +47,7 @@ const emit = defineEmits([
 
 const tabs = [
   { key: 'instances', label: '实例' },
+  { key: 'variables', label: '变量' },
   { key: 'knowledge', label: '知识' },
   { key: 'worldinfo', label: '世界书' },
   { key: 'tasks', label: '任务' },
@@ -163,7 +164,7 @@ function taskStatusClass(status) {
         <div v-if="!selectedCampaign" class="h-full flex items-center justify-center p-8 text-center">
           <div>
             <h2 class="font-semibold text-[18px] text-ink">选择或创建一个活动</h2>
-            <p class="mt-2 text-sm text-ink-soft">活动是长线故事的真相源：实例、知识、任务与总结都挂在这里。</p>
+            <p class="mt-2 text-sm text-ink-soft">活动是长线故事的真相源：实例、变量、知识、任务与总结都挂在这里。</p>
             <div class="mt-5 flex items-center justify-center gap-2">
               <button
                 type="button"

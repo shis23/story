@@ -85,6 +85,7 @@ fn multi_character_card() -> CharacterCard {
             // Extra should not auto-instantiate on campaign create.
             definition(&card_id, "def-extra", "Passerby", RoleType::Extra),
         ],
+        campaign_variable_schema: vec![],
         raw_card_json: serde_json::json!({
             "name": "Bronze Multi",
             "extensions": {},

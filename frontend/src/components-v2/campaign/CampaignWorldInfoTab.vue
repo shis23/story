@@ -13,7 +13,6 @@ import {
   getCampaignWorldInfoEntry,
 } from '../../tauri-api.js'
 import { confirmDialog, alertDialog } from '../../components/base/BaseDialog.js'
-import DataTable from '../ui/DataTable.vue'
 import Badge from '../ui/Badge.vue'
 import Button from '../ui/Button.vue'
 import Select from '../ui/Select.vue'
@@ -114,13 +113,6 @@ const filtered = computed(() => {
     return hay.includes(q)
   })
 })
-
-const columns = [
-  { key: 'route', label: '路由', width: '100px' },
-  { key: 'keys', label: '关键词', width: '140px' },
-  { key: 'content', label: '内容' },
-  { key: 'source', label: '来源', width: '90px' },
-]
 
 function routeVariant(route) {
   if (route === 'Constant' || route === 'Both') return 'ok'
@@ -238,23 +230,27 @@ defineExpose({ refresh: load })
 
 <template>
   <div class="space-y-3 min-w-0">
-    <div class="flex flex-wrap items-center gap-2">
-      <div class="text-xs text-ink-soft">
-        本局世界书
-        <template v-if="book">
-          · {{ book.entry_count }} 条 · 常驻 {{ book.constant_count }} · 触发
-          {{ book.selective_count }}
-        </template>
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0 text-xs text-ink-soft">
+          本局世界书
+          <template v-if="book">
+            · {{ book.entry_count }} 条 · 常驻 {{ book.constant_count }} · 触发
+            {{ book.selective_count }}
+          </template>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <Button size="sm" variant="primary" @click="showAdd = !showAdd">
+            {{ showAdd ? '取消新增' : '新增条目' }}
+          </Button>
+          <Button size="sm" variant="default" @click="load">刷新</Button>
+        </div>
       </div>
-      <div class="ml-auto flex flex-wrap gap-2">
-        <div class="min-w-[120px]">
+      <div class="grid grid-cols-[minmax(7.5rem,9rem)_minmax(0,1fr)] gap-2">
+        <div class="min-w-0">
           <Select v-model="routeFilter" :options="routeOptions" />
         </div>
-        <Input v-model="query" placeholder="搜索 keys / 内容" class="w-40" />
-        <Button size="sm" variant="primary" @click="showAdd = !showAdd">
-          {{ showAdd ? '取消新增' : '新增条目' }}
-        </Button>
-        <Button size="sm" variant="default" @click="load">刷新</Button>
+        <Input v-model="query" placeholder="搜索关键词或内容" />
       </div>
     </div>
 
@@ -282,36 +278,38 @@ defineExpose({ refresh: load })
       description="开档会从角色卡拷贝模板；也可在此为本局新增设定。"
     />
     <template v-else>
-      <DataTable :columns="columns" :rows="filtered" empty-title="无匹配">
-        <template #cell-route="{ row }">
-          <Badge :variant="routeVariant(row.route)" size="sm">{{ row.route }}</Badge>
-        </template>
-        <template #cell-keys="{ row }">
-          <span class="text-xs text-ink break-words">{{
-            (row.keys || []).join(', ') || '—'
-          }}</span>
-        </template>
-        <template #cell-content="{ row }">
+      <div class="overflow-hidden rounded-xl border border-line bg-surface">
+        <article
+          v-for="row in filtered"
+          :key="row.index"
+          data-testid="world-info-entry"
+          class="border-b border-line p-3.5 last:border-b-0 transition-colors hover:bg-surface-2/45"
+        >
+          <header class="flex items-center gap-2">
+            <Badge :variant="routeVariant(row.route)" size="sm">{{ row.route }}</Badge>
+            <span class="text-[11px] text-ink-faint">{{ sourceLabel(row.source) }}</span>
+            <div
+              data-testid="world-info-entry-actions"
+              class="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap"
+            >
+              <Button size="sm" variant="ghost" @click="openEdit(row)">
+                {{ expandedIndex === row.index ? '收起' : '编辑' }}
+              </Button>
+              <Button size="sm" variant="danger" @click="handleDelete(row)">删除</Button>
+            </div>
+          </header>
+          <div class="mt-2 text-xs font-medium leading-relaxed text-ink break-words">
+            {{ (row.keys || []).join(' · ') || '无关键词' }}
+          </div>
           <button
             type="button"
-            class="text-left text-xs text-ink break-words line-clamp-2 hover:text-accent w-full"
+            class="mt-1.5 w-full text-left text-xs leading-relaxed text-ink-soft break-words line-clamp-2 transition-colors hover:text-accent"
             @click="openEdit(row)"
           >
             {{ row.content }}
           </button>
-        </template>
-        <template #cell-source="{ row }">
-          <span class="text-[11px] text-ink-soft">{{ sourceLabel(row.source) }}</span>
-        </template>
-        <template #row-action="{ row }">
-          <div class="flex items-center gap-1">
-            <Button size="sm" variant="ghost" @click="openEdit(row)">
-              {{ expandedIndex === row.index ? '收起' : '编辑' }}
-            </Button>
-            <Button size="sm" variant="danger" @click="handleDelete(row)">删</Button>
-          </div>
-        </template>
-      </DataTable>
+        </article>
+      </div>
 
       <div
         v-if="expandedIndex != null"

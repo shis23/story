@@ -26,6 +26,8 @@ const props = defineProps({
   bodyScroll: { type: Boolean, default: true },
   /** Keep centered dialogs stable while their inner content changes. */
   fixedHeight: { type: Boolean, default: false },
+  /** Whether a side drawer rounds the edge exposed toward the page. */
+  sideRounded: { type: Boolean, default: true },
 })
 const emit = defineEmits(['update:modelValue', 'close'])
 
@@ -71,6 +73,7 @@ const heightClass = computed(() =>
 
 // 侧边抽屉圆角只在朝外那侧
 const sideRoundClass = computed(() => {
+  if (!props.sideRounded) return ''
   if (props.position === 'left') return 'rounded-r-2xl'
   if (props.position === 'right') return 'rounded-l-2xl'
   return ''

@@ -432,6 +432,7 @@ fn b6_private_source_blocks_name_collision_relay_and_group_broadcast() {
         name: "private-source-card".into(),
         source_character_id: Id::from_str("source-private"),
         character_definitions: vec![def_guard],
+        campaign_variable_schema: vec![],
         raw_card_json: serde_json::Value::Null,
         extraction_status: CharacterExtractionStatus::Extracted,
         extraction_message: None,

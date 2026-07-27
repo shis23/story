@@ -695,7 +695,7 @@ const { openNewCampaignDialog } = newCampaignForm
   // 11. overview screen adapter —— design/overview 纯展示层接线
   const { screenProps: overviewScreenProps, screenEvents: overviewScreenEvents } =
     useOverviewScreenAdapter({
-      openCampaign: () => { ui.showCampaignPanel = true },
+      openCampaign: () => { ui.openCampaignPanel() },
       viewHistory: () => ui.viewHistory(),
       openNewCampaign: openNewCampaignDialog,
       continueWriting: continueActiveCampaignWriting,
@@ -746,7 +746,7 @@ onMounted(async () => {
         @close="ui.showSidebar = false"
         @new-campaign="openNewCampaignDialog"
         @view-history="ui.viewHistory()"
-        @open-campaign="ui.showCampaignPanel = true"
+        @open-campaign="ui.openCampaignPanel()"
         @open-char-list="ui.showCharList = true"
         @import="handleImport"
         @open-conn="ui.showConnConfig = true"
@@ -902,6 +902,7 @@ onMounted(async () => {
       <CampaignPanel
         v-if="ui.showCampaignPanel"
         ref="campaignPanelRef"
+        :initial-tab="ui.campaignPanelTab"
         @close="ui.showCampaignPanel = false; ui.showSidebar = true"
         @campaign-changed="(c) => { campaign.activeCampaign = c; loadInstanceNameMap(); refreshCardShellManifest() }"
       />

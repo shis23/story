@@ -41,7 +41,7 @@ const emit = defineEmits(['open-campaign', 'new-campaign', 'view-history'])
         </span>
         <span class="flex-1">
           <span class="block text-sm font-medium text-ink">Campaign 面板</span>
-          <span class="block text-xs text-ink-faint mt-0.5">实例、知识、任务与摘要</span>
+          <span class="block text-xs text-ink-faint mt-0.5">实例、变量、知识、任务与摘要</span>
         </span>
         <span class="text-ink-faint group-hover:text-accent transition-colors" aria-hidden="true">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>

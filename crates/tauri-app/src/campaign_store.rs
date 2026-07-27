@@ -1249,6 +1249,7 @@ mod tests {
             name: "测试卡".into(),
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::Value::Null,
             extraction_status: CharacterExtractionStatus::Extracted,
             extraction_message: None,

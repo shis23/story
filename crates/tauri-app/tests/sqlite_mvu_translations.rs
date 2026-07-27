@@ -56,6 +56,7 @@ fn sqlite_mvu_translation_authority_and_collectors() {
         name: "MVU 测试卡".into(),
         source_character_id: source_id.clone(),
         character_definitions: vec![def_a.clone(), def_b.clone()],
+        campaign_variable_schema: vec![],
         raw_card_json: serde_json::Value::Null,
         extraction_status: Default::default(),
         extraction_message: None,

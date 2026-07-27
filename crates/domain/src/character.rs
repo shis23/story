@@ -502,6 +502,9 @@ pub struct CharacterCard {
     pub source_character_id: Id,
     /// 卡内角色定义（角色识别 Agent 产出）
     pub character_definitions: Vec<CharacterDefinition>,
+    /// 卡模板声明的 Campaign 级变量（仅接受显式全局作用域，不含普通 MVU 角色变量）。
+    #[serde(default)]
+    pub campaign_variable_schema: Vec<VariableField>,
     /// 原始 ST 卡 data 字段的 JSON（导出时 round-trip 保底，不丢扩展字段）
     ///
     /// 新数据由导入流程填入；旧数据缺失时 serde 默认 `Value::Null`（向后兼容）。
@@ -567,6 +570,10 @@ impl CharacterCard {
             name: character.name.clone(),
             source_character_id: character.id.clone(),
             character_definitions: vec![],
+            campaign_variable_schema:
+                crate::variables::extract_campaign_variable_schema_from_extensions(
+                    &character.extensions,
+                ),
             raw_card_json: character.raw_card_json.clone(),
             extraction_status: CharacterExtractionStatus::Unknown,
             extraction_message: None,
@@ -575,6 +582,14 @@ impl CharacterCard {
 
     pub fn extraction_succeeded(&self) -> bool {
         self.extraction_status == CharacterExtractionStatus::Extracted
+    }
+
+    /// 系统全局字段与卡模板字段合并后的有效 schema。
+    pub fn effective_campaign_variable_schema(&self) -> Vec<VariableField> {
+        merge_schema(
+            &crate::variables::default_campaign_variables(),
+            &self.campaign_variable_schema,
+        )
     }
 
     /// Parses card-scoped ST regex scripts from raw `data.extensions.regex_scripts`.
@@ -700,6 +715,7 @@ mod multi_character_tests {
                     variable_schema: vec![],
                 },
             ],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::Value::Null,
             extraction_status: CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -945,6 +961,7 @@ mod multi_character_tests {
             name: "Campaign Card".into(),
             source_character_id: Id::from_str("source-campaign"),
             character_definitions: vec![],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({
                 "name": "Campaign Card",
                 "extensions": {

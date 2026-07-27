@@ -44,6 +44,10 @@ told_by_other 时，character_id 是**被告知者**（谁收到了信息），s
 
 【任务二：变量更新】
 根据成文里发生的事，更新角色变量（hp/state/location/mood 等）或全局变量（story_clock/weather/world_state）。只输出真正发生了变化的字段。全局变量（无 instance_id）用于 story_clock 推进、天气变化、大势扭转等。
+严格遵守用户消息中【可更新变量（按作用域）】的清单：
+- 标记为“全局”的变量必须使用 instance_id=null。
+- 标记为“角色”的变量必须填写在场角色名。
+- 不得输出清单之外的 key，也不得把同名变量写到错误作用域。
 如果用户消息里提供了【卡片变量更新规则】，那是这张卡翻译出的玩法规则（好感度增减条件、状态切换门槛等）。生成 variable_updates 时逐条对照：成文中出现了某条规则描述的触发情形，就按该规则计算对应变量的新值。规则与成文事实冲突时以成文为准；成文没有触发的规则不要凭空执行。
 
 【任务三：任务/伏笔更新】
@@ -246,7 +250,10 @@ pub fn build_postprocess_user_msg_with_context(
         }
     ));
     if !variable_keys.is_empty() {
-        parts.push(format!("【可更新变量】{}", variable_keys.join(", ")));
+        parts.push(format!(
+            "【可更新变量（按作用域）】{}",
+            variable_keys.join(", ")
+        ));
     }
     if let Some(block) = render_mvu_update_rules_block(mvu_update_rules) {
         parts.push(block);
@@ -359,6 +366,13 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_requires_scope_safe_variable_updates() {
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("作用域"));
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("instance_id=null"));
+        assert!(POSTPROCESS_SYSTEM_PROMPT.contains("不得输出清单之外"));
+    }
+
+    #[test]
     fn test_prompt_forbids_verbose_output() {
         // P2-6：prompt 必须强制「纯 JSON 无解释」,否则冗长输出被截断导致解析失败。
         assert!(
@@ -386,6 +400,24 @@ mod tests {
         assert!(msg.contains("林医生、陈警官"));
         assert!(msg.contains("hp, state"));
         assert!(msg.contains("林医生走进急诊室"));
+    }
+
+    #[test]
+    fn test_build_user_msg_preserves_scoped_variable_catalog() {
+        let msg = build_postprocess_user_msg(
+            "城内冲突升级",
+            &["守卫".to_string()],
+            &[
+                "faction_tension（全局/阵营紧张度/int）".to_string(),
+                "mood（角色/情绪/string）".to_string(),
+            ],
+            4,
+            "第3天",
+        );
+
+        assert!(msg.contains("【可更新变量（按作用域）】"));
+        assert!(msg.contains("faction_tension（全局/阵营紧张度/int）"));
+        assert!(msg.contains("mood（角色/情绪/string）"));
     }
 
     #[test]

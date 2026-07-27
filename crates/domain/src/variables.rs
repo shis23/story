@@ -245,6 +245,26 @@ pub fn extract_mvu_schema_from_extensions(extensions: &serde_json::Value) -> Vec
     vec![]
 }
 
+/// 从卡扩展中读取明确标记为 Campaign 作用域的变量 schema。
+///
+/// 这里只接受显式全局路径，绝不把普通 `stat_data` / `mvu.initvar` 自动提升为
+/// Campaign 变量，避免把角色生命值、好感度等字段错误地共享给整局。
+pub fn extract_campaign_variable_schema_from_extensions(
+    extensions: &serde_json::Value,
+) -> Vec<VariableField> {
+    let candidates: &[&str] = &["storyforge.campaign_variables", "campaign_variables"];
+
+    for path in candidates {
+        if let Some(serde_json::Value::Object(map)) = pick_nested(extensions, path) {
+            let fields = normalize_schema_keys(parse_variable_objects(map));
+            if !fields.is_empty() {
+                return fields;
+            }
+        }
+    }
+    vec![]
+}
+
 /// 按点分路径取嵌套字段（extensions.mvu.initvar → 取 obj["mvu"]["initvar"]）
 fn pick_nested<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = root;
@@ -550,6 +570,52 @@ mod tests {
         let ext = serde_json::json!({"depth_prompt": {"prompt": "无关字段"}});
         let schema = extract_mvu_schema_from_extensions(&ext);
         assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn test_extract_campaign_variables_only_from_explicit_global_scope() {
+        let ext = serde_json::json!({
+            "storyforge": {
+                "campaign_variables": {
+                    "faction_tension": {
+                        "label": "阵营紧张度",
+                        "type": "int",
+                        "default": 12,
+                        "description": "各阵营爆发公开冲突的风险"
+                    }
+                }
+            },
+            "stat_data": {
+                "hp": 200
+            }
+        });
+
+        let schema = extract_campaign_variable_schema_from_extensions(&ext);
+
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].key, "faction_tension");
+        assert_eq!(schema[0].label, "阵营紧张度");
+        assert_eq!(schema[0].default, serde_json::json!(12));
+        assert!(
+            !schema.iter().any(|field| field.key == "hp"),
+            "普通 MVU stat_data 不能被静默提升为 Campaign 全局变量"
+        );
+    }
+
+    #[test]
+    fn test_extract_campaign_variables_accepts_top_level_explicit_alias() {
+        let ext = serde_json::json!({
+            "campaign_variables": {
+                "season": "春"
+            }
+        });
+
+        let schema = extract_campaign_variable_schema_from_extensions(&ext);
+
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].key, "season");
+        assert_eq!(schema[0].value_type, VariableType::String);
+        assert_eq!(schema[0].default, serde_json::json!("春"));
     }
 
     // ─── 键记法归一化测试 ──────────────────────────────────────────────────

@@ -107,6 +107,7 @@ function formatImportedAt(value) {
     size="drawer"
     position="left"
     :body-scroll="false"
+    :side-rounded="false"
     @close="emit('close')"
   >
     <template #header-extra>

@@ -10,6 +10,7 @@ import {
 test('DETAIL_SUB_TABS contains all expected sub-tab names', () => {
   assert.deepEqual(DETAIL_SUB_TABS, [
     'instances',
+    'variables',
     'knowledge',
     'worldinfo',
     'tasks',
@@ -19,6 +20,7 @@ test('DETAIL_SUB_TABS contains all expected sub-tab names', () => {
 
 test('SUB_TAB_REFS maps each sub-tab to a ref key', () => {
   assert.equal(SUB_TAB_REFS.instances, 'instancesTabRef')
+  assert.equal(SUB_TAB_REFS.variables, 'variablesTabRef')
   assert.equal(SUB_TAB_REFS.knowledge, 'knowledgeTabRef')
   assert.equal(SUB_TAB_REFS.worldinfo, 'worldInfoTabRef')
   assert.equal(SUB_TAB_REFS.tasks, 'tasksTabRef')
@@ -35,7 +37,6 @@ test('subTabRefKey returns known ref keys', () => {
 
 test('subTabRefKey returns null for unknown sub-tab names', () => {
   assert.equal(subTabRefKey('nonexistent'), null)
-  assert.equal(subTabRefKey('variables'), null)  // not a sub-tab in detail view
   assert.equal(subTabRefKey(''), null)
   assert.equal(subTabRefKey(null), null)
   assert.equal(subTabRefKey(undefined), null)

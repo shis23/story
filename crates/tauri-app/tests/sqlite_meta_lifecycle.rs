@@ -42,6 +42,7 @@ fn sqlite_meta_health_reads_authority_and_typed_patch_fails_closed() {
             name: "SQLite Meta Fixture".into(),
             source_character_id: Id::from_str("meta-source-1"),
             character_definitions: vec![definition],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({"fixture": true}),
             extraction_status: CharacterExtractionStatus::Extracted,
             extraction_message: None,

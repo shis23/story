@@ -5,6 +5,27 @@ const KNOWLEDGE_SOURCE_LABELS = {
   backstory: '📖 背景',
 }
 
+const BUILTIN_VARIABLE_LABELS = {
+  story_clock: '故事时间',
+  weather: '天气',
+  world_state: '世界大势',
+  hp: '生命值',
+  mp: '体力/精力',
+  state: '状态',
+  location: '位置',
+  mood: '情绪',
+  relationship_to_player: '与玩家关系',
+  inventory: '随身物品',
+  danger_level: '危险等级',
+  affection: '好感度',
+  trust: '信任度',
+  fatigue: '疲劳度',
+  health: '健康',
+  stamina: '体力',
+  mana: '魔力',
+  nearby: '是否在附近',
+}
+
 export function routingText(routing) {
   if (!routing) return ''
   if (routing.Native || routing.kind === 'native') return '原生'
@@ -58,4 +79,34 @@ export function formatJsonValue(value) {
   } catch {
     return String(value)
   }
+}
+
+export function parseVariableInput(value, type) {
+  if (type === 'bool') return value === true || value === 'true'
+  if (type === 'int') {
+    const parsed = Number.parseInt(value, 10)
+    return Number.isNaN(parsed) ? value : parsed
+  }
+  if (type === 'float') {
+    const parsed = Number.parseFloat(value)
+    return Number.isNaN(parsed) ? value : parsed
+  }
+  if (type === 'json') {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return value
+    }
+  }
+  return value
+}
+
+export function variableDisplayName(key, schemaLabel = '') {
+  const normalizedKey = String(key || '').trim()
+  const normalizedLabel = String(schemaLabel || '').trim()
+  if (normalizedLabel && normalizedLabel !== normalizedKey) return normalizedLabel
+  const builtIn = BUILTIN_VARIABLE_LABELS[normalizedKey.toLowerCase()]
+  if (builtIn) return builtIn
+  if (/[\u3400-\u9fff]/u.test(normalizedKey)) return normalizedKey
+  return normalizedKey.replace(/[._/-]+/g, ' ')
 }

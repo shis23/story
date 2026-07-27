@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { alertDialog, confirmDialog } from '../../components/base/BaseDialog.js'
 import {
   getCard,
@@ -8,6 +8,7 @@ import {
 } from '../../tauri-api.js'
 import { useWritingStore } from '../../stores/writing.js'
 import CampaignInstancesTab from './CampaignInstancesTab.vue'
+import CampaignVariablesTab from './CampaignVariablesTab.vue'
 import CampaignKnowledgeTab from './CampaignKnowledgeTab.vue'
 import CampaignWorldInfoTab from './CampaignWorldInfoTab.vue'
 import CampaignTasksTab from './CampaignTasksTab.vue'
@@ -15,7 +16,7 @@ import CampaignSummariesTab from './CampaignSummariesTab.vue'
 import CardLibrary from './CardLibrary.vue'
 import CardStudio from './CardStudio.vue'
 import { buildGreetingOptionsFromDetail } from '../../utils/campaignGreetingOptions.js'
-import { refreshSubTab, subTabRefKey } from '../../utils/campaignTabRefresh.js'
+import { DETAIL_SUB_TABS, refreshSubTab, subTabRefKey } from '../../utils/campaignTabRefresh.js'
 import { useCampaignStore } from '../../stores/campaign.js'
 import PanelHost from '../shell/PanelHost.vue'
 import Button from '../ui/Button.vue'
@@ -25,6 +26,9 @@ import EmptyState from '../ui/EmptyState.vue'
 import CampaignScreen from '../../design/campaign/CampaignScreen.vue'
 
 const emit = defineEmits(['close', 'campaign-changed'])
+const props = defineProps({
+  initialTab: { type: String, default: 'instances' },
+})
 
 const campaignStore = useCampaignStore()
 const writingStore = useWritingStore()
@@ -75,7 +79,7 @@ async function loadSelectedCampaignCardDetail() {
 
 // ─── Detail 状态 ───
 const selectedCampaignId = ref(null)
-const detailSubTab = ref('instances') // 'instances' | 'knowledge' | 'worldinfo' | 'tasks' | 'summaries'
+const detailSubTab = ref(DETAIL_SUB_TABS.includes(props.initialTab) ? props.initialTab : 'instances')
 
 const selectedCampaign = computed(
   () => campaigns.value.find((c) => c.id === selectedCampaignId.value) || activeCampaign.value,
@@ -83,10 +87,15 @@ const selectedCampaign = computed(
 
 // ─── 子组件 template refs ───
 const instancesTabRef = ref(null)
+const variablesTabRef = ref(null)
 const knowledgeTabRef = ref(null)
 const worldInfoTabRef = ref(null)
 const tasksTabRef = ref(null)
 const summariesTabRef = ref(null)
+
+watch(() => props.initialTab, (tab) => {
+  detailSubTab.value = DETAIL_SUB_TABS.includes(tab) ? tab : 'instances'
+})
 
 // ─── 导出状态 ───
 const exporting = ref(false)
@@ -289,6 +298,7 @@ async function onNewCampaignFromShell() {
 function refreshActiveDetailTab() {
   const refMap = {
     instances: instancesTabRef,
+    variables: variablesTabRef,
     knowledge: knowledgeTabRef,
     worldinfo: worldInfoTabRef,
     tasks: tasksTabRef,
@@ -303,6 +313,14 @@ function refreshActiveDetailTab() {
     }
   }
   refreshSubTab(detailSubTab.value, tabRefs)
+}
+
+async function handleInstanceRosterChanged() {
+  await refreshCampaigns()
+  if (activeCampaign.value?.id !== selectedCampaignId.value) return
+  activeCampaign.value = await getActiveCampaign()
+  campaignStore.activeCampaign = activeCampaign.value
+  emit('campaign-changed', activeCampaign.value)
 }
 
 // ─── 导出操作 ───
@@ -505,6 +523,12 @@ defineExpose({ refreshActiveDetailTab })
           <CampaignInstancesTab
             v-if="detailSubTab === 'instances'"
             ref="instancesTabRef"
+            :campaign-id="selectedCampaignId"
+            @refresh="handleInstanceRosterChanged"
+          />
+          <CampaignVariablesTab
+            v-else-if="detailSubTab === 'variables'"
+            ref="variablesTabRef"
             :campaign-id="selectedCampaignId"
           />
           <CampaignKnowledgeTab

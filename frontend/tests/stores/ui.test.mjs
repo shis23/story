@@ -16,6 +16,7 @@ test('ui store 初始状态', () => {
   assert.equal(s.importError, '')
   assert.equal(s.showCharList, false)
   assert.equal(s.showCampaignPanel, false)
+  assert.equal(s.campaignPanelTab, 'instances')
   assert.equal(s.showMetaPanel, false)
   assert.equal(s.showPresetPanel, false)
   assert.equal(s.showPluginPanel, false)
@@ -76,6 +77,26 @@ test('viewWrite 切到 write 视图', () => {
   const s = setup()
   s.viewWrite()
   assert.equal(s.showHistory, false)
+})
+
+test('openCampaignPanel 可从写作页直达总结或变量', () => {
+  const s = setup()
+
+  s.openCampaignPanel('summaries')
+  assert.equal(s.showCampaignPanel, true)
+  assert.equal(s.campaignPanelTab, 'summaries')
+
+  s.showCampaignPanel = false
+  s.openCampaignPanel('variables')
+  assert.equal(s.showCampaignPanel, true)
+  assert.equal(s.campaignPanelTab, 'variables')
+})
+
+test('openCampaignPanel 对未知标签回退到实例', () => {
+  const s = setup()
+  s.openCampaignPanel('unknown')
+  assert.equal(s.showCampaignPanel, true)
+  assert.equal(s.campaignPanelTab, 'instances')
 })
 
 test('togglePower 开启后同时打开 debug drawer', () => {

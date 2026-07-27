@@ -3,11 +3,12 @@
  */
 
 /** 所有支持的子 tab 名称 */
-export const DETAIL_SUB_TABS = ['instances', 'knowledge', 'worldinfo', 'tasks', 'summaries']
+export const DETAIL_SUB_TABS = ['instances', 'variables', 'knowledge', 'worldinfo', 'tasks', 'summaries']
 
 /** sub-tab 名称 → 映射键（与 CampaignPanel.vue 的 refMap 一致） */
 export const SUB_TAB_REFS = {
   instances: 'instancesTabRef',
+  variables: 'variablesTabRef',
   knowledge: 'knowledgeTabRef',
   worldinfo: 'worldInfoTabRef',
   tasks: 'tasksTabRef',
@@ -17,7 +18,7 @@ export const SUB_TAB_REFS = {
 /**
  * 查找指定子 tab 对应的 ref 键名。
  *
- * @param {string} subTabName - 'instances' | 'knowledge' | 'tasks' | 'summaries'
+ * @param {string} subTabName - 'instances' | 'variables' | 'knowledge' | 'worldinfo' | 'tasks' | 'summaries'
  * @returns {string|null} ref 键名，不认识时返回 null
  */
 export function subTabRefKey(subTabName) {

@@ -122,6 +122,7 @@ fn make_campaign_store() -> (std::path::PathBuf, CampaignStore, Id) {
         name: "knowledge-propagation-card".into(),
         source_character_id,
         character_definitions: definitions,
+        campaign_variable_schema: vec![],
         raw_card_json: serde_json::Value::Null,
         extraction_status: CharacterExtractionStatus::Extracted,
         extraction_message: None,

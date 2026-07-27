@@ -1266,6 +1266,26 @@ export async function getInstance(campaignId, instanceId) {
   return null
 }
 
+/** 向 Campaign 加入一个卡内角色，或创建一个临时角色 */
+export async function addCampaignInstance({
+  campaignId,
+  definitionId = null,
+  name = null,
+  persona = null,
+  behavior = null,
+}) {
+  if (isTauri()) {
+    return await invoke('add_campaign_instance', {
+      campaignId,
+      definitionId,
+      name,
+      persona,
+      behavior,
+    })
+  }
+  return null
+}
+
 /** 查角色实例的当前变量值 */
 export async function getCharacterVariables(campaignId, instanceId) {
   if (isTauri()) {
@@ -1287,6 +1307,43 @@ export async function getCampaignVariables(campaignId) {
     return await invoke('get_campaign_variables', { campaignId })
   }
   return []
+}
+
+/** 查 Campaign 全局变量 schema */
+export async function getCampaignVariableSchema(campaignId) {
+  if (isTauri()) {
+    return await invoke('get_campaign_variable_schema', { campaignId })
+  }
+  return []
+}
+
+/** 新增 Campaign 全局变量定义与初始值 */
+export async function addCampaignVariable({
+  campaignId,
+  key,
+  label,
+  valueType,
+  defaultValue,
+  description = null,
+}) {
+  if (isTauri()) {
+    return await invoke('add_campaign_variable', {
+      campaignId,
+      key,
+      label,
+      valueType,
+      defaultValue,
+      description,
+    })
+  }
+}
+
+/** 显式把卡模板新增的全局变量同步进旧 Campaign */
+export async function syncCampaignVariableSchema(campaignId) {
+  if (isTauri()) {
+    return await invoke('sync_campaign_variable_schema', { campaignId })
+  }
+  return { added: 0 }
 }
 
 /** 改 Campaign 全局变量 */

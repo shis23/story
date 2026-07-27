@@ -3,7 +3,7 @@
  * AppFrame — 应用壳（重设计 · 纯展示布局）。
  *
  * 对齐 selected 图：
- *   - 左栏 232px 常驻（lg+）；移动端抽屉
+ *   - 左栏 260px 常驻（lg+）；移动端抽屉
  *   - TopBar 52px
  *   - 主区自滚动；Inspector 覆盖式（不挤压写作栏）
  *
@@ -41,7 +41,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', syncDesktopBreakpoint
       -->
       <aside
         v-show="isDesktop || sidebarOpen"
-        class="w-[var(--layout-sidebar)] bg-bg flex flex-col min-h-0"
+        class="w-[min(100vw,var(--layout-sidebar))] bg-bg flex flex-col min-h-0"
         :class="isDesktop
           ? 'shrink-0 border-r border-line'
           : 'fixed inset-y-0 left-0 z-[var(--z-drawer)] border-r border-line shadow-float'"

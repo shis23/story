@@ -71,7 +71,7 @@
 
   /* ── 布局宽度（侧栏 / 抽屉 / 全屏管理壳）──
      所有从主导航打开的侧滑面板必须同宽；禁止各面板自写 max-w-sm / 420 等魔法数。 */
-  --layout-sidebar: 232px;   /* 桌面常驻导航 */
+  --layout-sidebar: 260px;   /* 桌面常驻导航 / 窄屏主抽屉 */
   --layout-drawer: 380px;    /* 左/右功能抽屉（连接/预设/插件/Meta/角色卡…） */
   --layout-inspector: 320px; /* 右侧调试 Inspector（略窄，退后区） */
   --layout-dialog: 32rem;    /* 居中确认/新建弹层 */

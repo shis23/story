@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useCampaignStore } from './campaign.js'
 import { useWritingStore } from './writing.js'
+import { DETAIL_SUB_TABS } from '../utils/campaignTabRefresh.js'
 
 // UI 状态:面板开关、视图路由、全局开关。
 // 来源 App.vue:25-28, 33-36, 63-66, 70-83, 92-94, 336-340。
@@ -14,6 +15,7 @@ export const useUiStore = defineStore('ui', () => {
   // 面板开关(全 v-if)
   const showCharList = ref(false) // App.vue:34
   const showCampaignPanel = ref(false) // App.vue:35
+  const campaignPanelTab = ref('instances')
   const showMetaPanel = ref(false) // App.vue:36
   const showPresetPanel = ref(false) // App.vue:63
   const showPluginPanel = ref(false) // App.vue:64
@@ -60,6 +62,11 @@ export const useUiStore = defineStore('ui', () => {
     showHistory.value = false
   }
 
+  function openCampaignPanel(tab = 'instances') {
+    campaignPanelTab.value = DETAIL_SUB_TABS.includes(tab) ? tab : 'instances'
+    showCampaignPanel.value = true
+  }
+
   // action:高玩模式切换(App.vue:97-100)
   function togglePower() {
     powerMode.value = !powerMode.value
@@ -74,6 +81,7 @@ export const useUiStore = defineStore('ui', () => {
     extracting,
     showCharList,
     showCampaignPanel,
+    campaignPanelTab,
     showMetaPanel,
     showPresetPanel,
     showPluginPanel,
@@ -90,6 +98,7 @@ export const useUiStore = defineStore('ui', () => {
     viewHistory,
     viewOverview,
     viewWrite,
+    openCampaignPanel,
     togglePower,
   }
 })

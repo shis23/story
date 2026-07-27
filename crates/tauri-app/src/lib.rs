@@ -4709,12 +4709,48 @@ fn append_missing_campaign_scoped_regex_scripts(
     }
 }
 
-/// 默认变量键列表（喂给后处理 Agent，让它知道有哪些字段可更新）
-fn default_variable_keys() -> Vec<String> {
-    storyforge_domain::variables::default_character_variables()
-        .iter()
-        .map(|f| f.key.clone())
-        .collect()
+fn postprocess_variable_type_name(
+    value_type: &storyforge_domain::variables::VariableType,
+) -> &'static str {
+    use storyforge_domain::variables::VariableType;
+    match value_type {
+        VariableType::Int => "int",
+        VariableType::Float => "float",
+        VariableType::String => "string",
+        VariableType::Bool => "bool",
+        VariableType::Json => "json",
+    }
+}
+
+fn postprocess_json_value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(number) if number.is_i64() => "int",
+        serde_json::Value::Number(_) => "float",
+        serde_json::Value::String(_) => "string",
+        _ => "json",
+    }
+}
+
+fn postprocess_variable_hint(key: &str, scope: &str, label: &str, value_type: &str) -> String {
+    format!("{key}（{scope}/{label}/{value_type}）")
+}
+
+fn insert_postprocess_schema_hint(
+    catalog: &mut std::collections::BTreeMap<String, String>,
+    scope_key: &str,
+    scope_label: &str,
+    field: &storyforge_domain::variables::VariableField,
+) {
+    catalog.insert(
+        format!("{scope_key}:{}", field.key),
+        postprocess_variable_hint(
+            &field.key,
+            scope_label,
+            &field.label,
+            postprocess_variable_type_name(&field.value_type),
+        ),
+    );
 }
 
 /// 后处理可更新变量键。
@@ -4722,44 +4758,59 @@ fn default_variable_keys() -> Vec<String> {
 /// 基础表提供常用角色/全局变量；CampaignRuntimeContext 提供当前卡自定义 schema、
 /// 已存在 Campaign 变量和 instance 变量，覆盖 MVU/initvar 与高玩自定义字段。
 fn postprocess_variable_keys(ctx: &WritingContext) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut push_key = |key: &str| {
-        if seen.insert(key.to_string()) {
-            keys.push(key.to_string());
-        }
-    };
+    let mut catalog = std::collections::BTreeMap::<String, String>::new();
 
-    for key in default_variable_keys() {
-        push_key(&key);
+    for field in storyforge_domain::variables::default_character_variables() {
+        insert_postprocess_schema_hint(&mut catalog, "character", "角色", &field);
     }
     for field in storyforge_domain::variables::default_campaign_variables() {
-        push_key(&field.key);
+        insert_postprocess_schema_hint(&mut catalog, "campaign", "全局", &field);
     }
 
     let Some(runtime) = &ctx.campaign_runtime else {
-        return keys;
+        return catalog.into_values().collect();
     };
 
+    for field in &runtime.campaign.variable_schema {
+        insert_postprocess_schema_hint(&mut catalog, "campaign", "全局", field);
+    }
     for variable in &runtime.campaign.variables {
-        push_key(&variable.key);
+        catalog
+            .entry(format!("campaign:{}", variable.key))
+            .or_insert_with(|| {
+                postprocess_variable_hint(
+                    &variable.key,
+                    "全局",
+                    &variable.key,
+                    postprocess_json_value_type_name(&variable.value),
+                )
+            });
     }
 
     let mut definitions: Vec<_> = runtime.definitions_by_id.values().collect();
     definitions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     for definition in definitions {
         for field in &definition.variable_schema {
-            push_key(&field.key);
+            insert_postprocess_schema_hint(&mut catalog, "character", "角色", field);
         }
     }
 
     for instance in &runtime.instances {
         for variable in &instance.variables {
-            push_key(&variable.key);
+            catalog
+                .entry(format!("character:{}", variable.key))
+                .or_insert_with(|| {
+                    postprocess_variable_hint(
+                        &variable.key,
+                        "角色",
+                        &variable.key,
+                        postprocess_json_value_type_name(&variable.value),
+                    )
+                });
         }
     }
 
-    keys
+    catalog.into_values().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -9936,6 +9987,7 @@ pub struct CardDetailDto {
     pub first_mes: String,
     pub alternate_greetings: Vec<String>,
     pub character_definitions: Vec<CharacterDefinitionDto>,
+    pub campaign_variable_schema: Vec<storyforge_domain::variables::VariableField>,
     pub definition_count: usize,
     pub character_count: usize,
     pub imported_at: String,
@@ -10081,6 +10133,9 @@ pub struct CharacterInstanceDto {
     pub campaign_id: String,
     pub definition_id: Option<String>,
     pub name: String,
+    /// Linked card definition role. Ad-hoc temporary instances use `extra`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_type: Option<String>,
     pub persona_override: Option<String>,
     pub behavior_override: Option<String>,
     pub is_temporary: bool,
@@ -10094,11 +10149,23 @@ impl From<&storyforge_domain::campaign::CharacterInstance> for CharacterInstance
             campaign_id: i.campaign_id.as_str().to_string(),
             definition_id: i.definition_id.as_ref().map(|d| d.as_str().to_string()),
             name: i.name.clone(),
+            role_type: i.is_temporary.then(|| "extra".to_string()),
             persona_override: i.persona_override.clone(),
             behavior_override: i.behavior_override.clone(),
             is_temporary: i.is_temporary,
             variables: i.variables.clone(),
         }
+    }
+}
+
+impl CharacterInstanceDto {
+    fn with_role_type(
+        instance: &storyforge_domain::campaign::CharacterInstance,
+        role_type: &storyforge_domain::character::RoleType,
+    ) -> Self {
+        let mut dto = Self::from(instance);
+        dto.role_type = Some(format!("{role_type:?}").to_lowercase());
+        dto
     }
 }
 
@@ -10113,7 +10180,9 @@ async fn extract_characters(
 ) -> Result<CardSummaryDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
     use storyforge_domain::character::CharacterExtractionStatus;
-    use storyforge_domain::variables::extract_mvu_schema_from_extensions;
+    use storyforge_domain::variables::{
+        extract_campaign_variable_schema_from_extensions, extract_mvu_schema_from_extensions,
+    };
 
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
     let character = {
@@ -10156,6 +10225,8 @@ async fn extract_characters(
 
     // MVU schema 探测
     let mvu_schema = extract_mvu_schema_from_extensions(&character.extensions);
+    card.campaign_variable_schema =
+        extract_campaign_variable_schema_from_extensions(&character.extensions);
     if !mvu_schema.is_empty() {
         tracing::info!(
             "卡「{}」探测到 {} 个 MVU 字段",
@@ -10297,6 +10368,7 @@ fn get_card(id: String) -> Result<CardDetailDto, TauriCommandError> {
             .iter()
             .map(CharacterDefinitionDto::from)
             .collect(),
+        campaign_variable_schema: stored.card.effective_campaign_variable_schema(),
         definition_count,
         character_count: definition_count,
         imported_at: stored.imported_at.clone(),
@@ -10358,13 +10430,15 @@ fn create_campaign_in_store(
     use storyforge_domain::conversation::Role as ConvRole;
 
     let card_id_value = Id::from_str(&card_id);
-    if store.get_card(&card_id_value).is_none() {
-        return Err(TauriCommandError::not_found(format!(
-            "找不到 card id={card_id}"
-        )));
-    }
-
-    let mut campaign = storyforge_domain::campaign::Campaign::new(card_id_value, name);
+    let stored_card = store
+        .get_card(&card_id_value)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card id={card_id}")))?;
+    let campaign_schema = stored_card.card.effective_campaign_variable_schema();
+    let mut campaign = storyforge_domain::campaign::Campaign::new_with_variable_schema(
+        card_id_value,
+        name,
+        &campaign_schema,
+    );
 
     // 自动建对话并绑定到 Campaign
     let conv = conv_store.create(Some(card_id.clone()), Some(campaign.id.clone()));
@@ -10554,6 +10628,7 @@ fn fork_campaign_in_store(
         fork_node_id.clone(),
     );
     campaign.variables = source.variables.clone();
+    campaign.variable_schema = source.variable_schema.clone();
     campaign.story_clock = source.story_clock.clone();
 
     let forked_conversation =
@@ -10765,10 +10840,12 @@ fn get_active_campaign(
 
 #[tauri::command]
 fn list_instances(campaign_id: String) -> Vec<CharacterInstanceDto> {
-    get_campaign_store()
-        .list_instances(&Id::from_str(&campaign_id))
+    let store = get_campaign_store();
+    let campaign_id = Id::from_str(&campaign_id);
+    store
+        .list_instances(&campaign_id)
         .iter()
-        .map(CharacterInstanceDto::from)
+        .map(|instance| character_instance_dto_from_store(store, instance))
         .collect()
 }
 
@@ -10777,10 +10854,136 @@ fn get_instance(
     campaign_id: String,
     instance_id: String,
 ) -> Result<CharacterInstanceDto, TauriCommandError> {
-    get_campaign_store()
+    let store = get_campaign_store();
+    store
         .get_instance(&Id::from_str(&campaign_id), &Id::from_str(&instance_id))
-        .map(|i| CharacterInstanceDto::from(&i))
+        .map(|instance| character_instance_dto_from_store(store, &instance))
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 instance {instance_id}")))
+}
+
+fn character_instance_dto_from_store(
+    store: &campaign_store::CampaignStore,
+    instance: &storyforge_domain::campaign::CharacterInstance,
+) -> CharacterInstanceDto {
+    let role_type = instance.definition_id.as_ref().and_then(|definition_id| {
+        let campaign = store.get_campaign(&instance.campaign_id)?;
+        let card = store.get_card(&campaign.card_id)?;
+        card.card
+            .character_definitions
+            .iter()
+            .find(|definition| definition.id == *definition_id)
+            .map(|definition| definition.role_type.clone())
+    });
+    match role_type.as_ref() {
+        Some(role_type) => CharacterInstanceDto::with_role_type(instance, role_type),
+        None => CharacterInstanceDto::from(instance),
+    }
+}
+
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_custom_character_text(
+    label: &str,
+    value: Option<&str>,
+    max_chars: usize,
+) -> Result<(), TauriCommandError> {
+    if value.is_some_and(|value| value.chars().count() > max_chars) {
+        return Err(TauriCommandError::validation(format!(
+            "{label}不能超过 {max_chars} 个字符"
+        )));
+    }
+    Ok(())
+}
+
+fn add_campaign_instance_to_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+    definition_id: Option<&Id>,
+    name: Option<String>,
+    persona: Option<String>,
+    behavior: Option<String>,
+) -> Result<CharacterInstanceDto, TauriCommandError> {
+    use storyforge_domain::campaign::CharacterInstance;
+
+    let campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let existing = store.list_instances(campaign_id);
+
+    let instance = if let Some(definition_id) = definition_id {
+        let card = store.get_card(&campaign.card_id).ok_or_else(|| {
+            TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id))
+        })?;
+        let definition = card
+            .card
+            .character_definitions
+            .iter()
+            .find(|definition| definition.id == *definition_id)
+            .ok_or_else(|| TauriCommandError::validation("该角色定义不属于当前活动的角色卡"))?;
+        if existing.iter().any(|instance| {
+            instance.definition_id.as_ref() == Some(definition_id)
+                || instance.name.eq_ignore_ascii_case(&definition.name)
+        }) {
+            return Err(TauriCommandError::validation(format!(
+                "角色「{}」已加入本局",
+                definition.name
+            )));
+        }
+        CharacterInstance::from_definition(campaign.id.clone(), definition)
+    } else {
+        let name = name.unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            return Err(TauriCommandError::validation("角色名称不能为空"));
+        }
+        validate_custom_character_text("角色名称", Some(&name), 80)?;
+        let persona = trimmed_optional(persona);
+        let behavior = trimmed_optional(behavior);
+        validate_custom_character_text("角色人设", persona.as_deref(), 10_000)?;
+        validate_custom_character_text("行为规则", behavior.as_deref(), 10_000)?;
+        if existing
+            .iter()
+            .any(|instance| instance.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(TauriCommandError::validation(format!(
+                "本局已有同名角色「{name}」"
+            )));
+        }
+        CharacterInstance::temporary_with_overrides(campaign.id.clone(), name, persona, behavior)
+    };
+
+    store
+        .add_instance(instance.clone())
+        .map_err(|error| TauriCommandError::storage(format!("添加角色失败: {error}")))?;
+    Ok(character_instance_dto_from_store(store, &instance))
+}
+
+/// Add a card-defined character or an ad-hoc temporary character to a Campaign.
+#[tauri::command]
+fn add_campaign_instance(
+    campaign_id: String,
+    definition_id: Option<String>,
+    name: Option<String>,
+    persona: Option<String>,
+    behavior: Option<String>,
+) -> Result<CharacterInstanceDto, TauriCommandError> {
+    let campaign_id = Id::from_str(&campaign_id);
+    reject_if_active_turn(&campaign_id)?;
+    let definition_id = definition_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Id::from_str);
+    add_campaign_instance_to_store(
+        get_campaign_store(),
+        &campaign_id,
+        definition_id.as_ref(),
+        name,
+        persona,
+        behavior,
+    )
 }
 
 /// 查角色实例的当前变量值
@@ -10826,6 +11029,163 @@ fn get_campaign_variables(
         .get_campaign(&Id::from_str(&campaign_id))
         .map(|c| c.variables)
         .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))
+}
+
+/// 查 Campaign 全局变量 schema（旧档由 serde 默认补系统字段）。
+#[tauri::command]
+fn get_campaign_variable_schema(
+    campaign_id: String,
+) -> Result<Vec<storyforge_domain::variables::VariableField>, TauriCommandError> {
+    get_campaign_store()
+        .get_campaign(&Id::from_str(&campaign_id))
+        .map(|campaign| campaign.variable_schema)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))
+}
+
+fn parse_campaign_variable_type(
+    value_type: &str,
+) -> Result<storyforge_domain::variables::VariableType, TauriCommandError> {
+    use storyforge_domain::variables::VariableType;
+    match value_type.trim().to_ascii_lowercase().as_str() {
+        "int" | "integer" => Ok(VariableType::Int),
+        "float" | "number" => Ok(VariableType::Float),
+        "string" | "text" => Ok(VariableType::String),
+        "bool" | "boolean" => Ok(VariableType::Bool),
+        "json" | "object" | "array" => Ok(VariableType::Json),
+        _ => Err(TauriCommandError::validation(format!(
+            "不支持的变量类型: {value_type}"
+        ))),
+    }
+}
+
+fn validate_campaign_variable_default(
+    value_type: &storyforge_domain::variables::VariableType,
+    value: &serde_json::Value,
+) -> Result<(), TauriCommandError> {
+    use storyforge_domain::variables::VariableType;
+    let valid = match value_type {
+        VariableType::Int => value.as_i64().is_some(),
+        VariableType::Float => value.as_f64().is_some(),
+        VariableType::String => value.as_str().is_some(),
+        VariableType::Bool => value.as_bool().is_some(),
+        VariableType::Json => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(TauriCommandError::validation("初始值与变量类型不匹配"))
+    }
+}
+
+fn validate_campaign_variable_input(
+    key: &str,
+    label: &str,
+    description: Option<&str>,
+    default_value: &serde_json::Value,
+) -> Result<(), TauriCommandError> {
+    let valid_key = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !key.split('.').any(|segment| segment.starts_with("__"));
+    if !valid_key {
+        return Err(TauriCommandError::validation(
+            "变量键名只能包含文字、数字、点、下划线或连字符，不能超过 128 字节或使用 __ 内部段",
+        ));
+    }
+    if label.chars().count() > 80 {
+        return Err(TauriCommandError::validation(
+            "变量中文名称不能超过 80 个字符",
+        ));
+    }
+    if description.is_some_and(|value| value.chars().count() > 500) {
+        return Err(TauriCommandError::validation("变量说明不能超过 500 个字符"));
+    }
+    if serde_json::to_vec(default_value)
+        .map(|bytes| bytes.len() > 64 * 1024)
+        .unwrap_or(true)
+    {
+        return Err(TauriCommandError::validation("变量初始值不能超过 64 KiB"));
+    }
+    Ok(())
+}
+
+/// 新增一个 Campaign 全局变量定义与初始值。
+#[tauri::command]
+fn add_campaign_variable(
+    campaign_id: String,
+    key: String,
+    label: String,
+    value_type: String,
+    default_value: serde_json::Value,
+    description: Option<String>,
+) -> Result<(), TauriCommandError> {
+    let campaign_id = Id::from_str(&campaign_id);
+    reject_if_active_turn(&campaign_id)?;
+    let key = storyforge_domain::variables::normalize_mvu_key(&key);
+    let label = label.trim();
+    let description = description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    validate_campaign_variable_input(&key, label, description.as_deref(), &default_value)?;
+    let value_type = parse_campaign_variable_type(&value_type)?;
+    validate_campaign_variable_default(&value_type, &default_value)?;
+    let field = storyforge_domain::variables::VariableField {
+        key: key.clone(),
+        label: if label.is_empty() {
+            key.clone()
+        } else {
+            label.to_string()
+        },
+        value_type,
+        default: default_value,
+        description,
+        group: Some("全局".into()),
+    };
+
+    let store = get_campaign_store();
+    let mut campaign = store
+        .get_campaign(&campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    campaign
+        .add_variable_field(field)
+        .map_err(TauriCommandError::validation)?;
+    store
+        .update_campaign(campaign)
+        .map_err(|error| TauriCommandError::storage(format!("新增 Campaign 变量失败: {error}")))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CampaignVariableSchemaSyncDto {
+    added: usize,
+}
+
+/// 把卡模板后来新增的全局 schema 显式同步进旧 Campaign。
+#[tauri::command]
+fn sync_campaign_variable_schema(
+    campaign_id: String,
+) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
+    let campaign_id = Id::from_str(&campaign_id);
+    reject_if_active_turn(&campaign_id)?;
+    sync_campaign_variable_schema_in_store(get_campaign_store(), &campaign_id)
+}
+
+fn sync_campaign_variable_schema_in_store(
+    store: &campaign_store::CampaignStore,
+    campaign_id: &Id,
+) -> Result<CampaignVariableSchemaSyncDto, TauriCommandError> {
+    let mut campaign = store
+        .get_campaign(campaign_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 campaign {campaign_id}")))?;
+    let card = store
+        .get_card(&campaign.card_id)
+        .ok_or_else(|| TauriCommandError::not_found(format!("找不到 card {}", campaign.card_id)))?;
+    let added = campaign.sync_variable_schema(&card.card.effective_campaign_variable_schema());
+    store
+        .update_campaign(campaign)
+        .map_err(|error| TauriCommandError::storage(format!("同步 Campaign 变量失败: {error}")))?;
+    Ok(CampaignVariableSchemaSyncDto { added })
 }
 
 /// 改 Campaign 全局变量
@@ -12936,6 +13296,7 @@ where
             name: bundle.campaign.name.clone(),
             source_character_id: new_source_character_id.clone(),
             character_definitions: bundle.definitions.clone(),
+            campaign_variable_schema: bundle.campaign.variable_schema.clone(),
             raw_card_json: serde_json::Value::Null,
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
             extraction_message: None,
@@ -13521,9 +13882,13 @@ pub fn run() {
             get_active_campaign,
             list_instances,
             get_instance,
+            add_campaign_instance,
             get_character_variables,
             set_character_variable,
             get_campaign_variables,
+            get_campaign_variable_schema,
+            add_campaign_variable,
+            sync_campaign_variable_schema,
             set_campaign_variable,
             promote_temporary_instance,
             // P2 后处理产出查询 / 任务管理
@@ -13751,6 +14116,50 @@ mod tests {
         assert_eq!(
             prefer_autofix_response_text(None, original.clone()),
             original
+        );
+    }
+
+    #[test]
+    fn campaign_variable_input_validation_accepts_unicode_keys_and_bounds_user_text() {
+        assert!(
+            validate_campaign_variable_input(
+                "世界.阵营_紧张度-1",
+                "阵营紧张度",
+                Some("整局共享"),
+                &serde_json::json!(12),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_campaign_variable_input("bad key", "坏键", None, &serde_json::Value::Null,)
+                .is_err()
+        );
+        assert!(
+            validate_campaign_variable_input(
+                "world.__internal",
+                "内部键",
+                None,
+                &serde_json::Value::Null,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_campaign_variable_input(
+                "valid",
+                &"名".repeat(81),
+                None,
+                &serde_json::Value::Null,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_campaign_variable_input(
+                "valid",
+                "名称",
+                Some(&"说".repeat(501)),
+                &serde_json::Value::Null,
+            )
+            .is_err()
         );
     }
 
@@ -14631,6 +15040,7 @@ mod tests {
             name: "Export Bundle Card".into(),
             source_character_id: source_id,
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({
                 "first_mes": "hello from export",
                 "alternate_greetings": ["alt export"]
@@ -14862,6 +15272,7 @@ mod tests {
             name: "Bundle Card".into(),
             source_character_id: old_source_id,
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({
                 "first_mes": "hello from raw",
                 "alternate_greetings": ["alt one", "alt two"]
@@ -15084,6 +15495,7 @@ mod tests {
             name: "Atomic Card".into(),
             source_character_id: Id::from_str("atomic-source"),
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({"first_mes": "hi"}),
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -15205,6 +15617,7 @@ mod tests {
             name: "Multi Card".into(),
             source_character_id: Id::from_str("vars-source"),
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({
                 "first_mes": "multi-open",
                 "alternate_greetings": ["m1", "m2"]
@@ -15393,6 +15806,7 @@ mod tests {
             name: "V".into(),
             source_character_id: Id::from_str("v-source"),
             character_definitions: vec![],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::Value::Null,
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Unknown,
             extraction_message: None,
@@ -15621,6 +16035,7 @@ mod tests {
             name: "Chronicle Card".into(),
             source_character_id: Id::from_str("chr-source"),
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({"first_mes": "hi"}),
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -15775,6 +16190,7 @@ mod tests {
             name: "Broken Card".into(),
             source_character_id: Id::from_str("brk-source"),
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({}),
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -15886,6 +16302,7 @@ mod tests {
             name: "Verified Card".into(),
             source_character_id: Id::from_str("vr-source"),
             character_definitions: definitions.clone(),
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({}),
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -16462,6 +16879,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn add_campaign_instance_from_card_definition_preserves_role_and_schema() {
+        use storyforge_domain::campaign::{Campaign, CharacterInstance};
+        use storyforge_domain::character::{CharacterCard, RoleType};
+        use storyforge_domain::variables::default_character_variables;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_add_card_instance_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let source = make_test_character("Roster");
+        let mut card = CharacterCard::from_character(&source);
+        card.id = Id::from_str("card-roster");
+        let hero = make_test_character_definition(&card.id, "def-hero", "Hero");
+        let mut extra = make_test_character_definition(&card.id, "def-extra", "Courier");
+        extra.role_type = RoleType::Extra;
+        extra.variable_schema = default_character_variables();
+        card.character_definitions = vec![hero.clone(), extra.clone()];
+        store.save_card(card).unwrap();
+
+        let campaign = Campaign::new(Id::from_str("card-roster"), "run");
+        store.save_campaign(campaign.clone()).unwrap();
+        store
+            .add_instance(CharacterInstance::from_definition(
+                campaign.id.clone(),
+                &hero,
+            ))
+            .unwrap();
+
+        let added =
+            add_campaign_instance_to_store(&store, &campaign.id, Some(&extra.id), None, None, None)
+                .unwrap();
+
+        assert_eq!(added.name, "Courier");
+        assert_eq!(added.definition_id.as_deref(), Some("def-extra"));
+        assert_eq!(added.role_type.as_deref(), Some("extra"));
+        assert!(!added.is_temporary);
+        assert!(!added.variables.is_empty());
+
+        let duplicate =
+            add_campaign_instance_to_store(&store, &campaign.id, Some(&extra.id), None, None, None)
+                .unwrap_err();
+        assert!(duplicate.to_string().contains("已加入"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_campaign_custom_instance_creates_validated_temporary_character() {
+        use storyforge_domain::campaign::Campaign;
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_add_custom_instance_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("card-custom"), "run");
+        store.save_campaign(campaign.clone()).unwrap();
+
+        let added = add_campaign_instance_to_store(
+            &store,
+            &campaign.id,
+            None,
+            Some("  渡鸦信使  ".into()),
+            Some("  寡言而警觉  ".into()),
+            Some("  只交付密信  ".into()),
+        )
+        .unwrap();
+
+        assert_eq!(added.name, "渡鸦信使");
+        assert_eq!(added.role_type.as_deref(), Some("extra"));
+        assert!(added.is_temporary);
+        assert_eq!(added.persona_override.as_deref(), Some("寡言而警觉"));
+        assert_eq!(added.behavior_override.as_deref(), Some("只交付密信"));
+
+        let duplicate = add_campaign_instance_to_store(
+            &store,
+            &campaign.id,
+            None,
+            Some("渡鸦信使".into()),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("同名角色"));
+
+        let blank = add_campaign_instance_to_store(
+            &store,
+            &campaign.id,
+            None,
+            Some("   ".into()),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(blank.to_string().contains("角色名称"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_variable_field(
         key: &str,
         label: &str,
@@ -16923,6 +17444,123 @@ mod tests {
         assert!(store.list_campaigns().is_empty());
         assert!(store.list_all_instances().is_empty());
         assert!(conv_store.list().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_campaign_in_store_initializes_card_global_variables() {
+        use storyforge_domain::variables::{VariableField, VariableType};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_create_campaign_globals_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+        let conv_store = ConversationStore::new(dir.join("conversations"));
+
+        let character = make_test_character("Global Variable Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        card.campaign_variable_schema = vec![VariableField {
+            key: "faction_tension".into(),
+            label: "阵营紧张度".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(12),
+            description: Some("整局共享的阵营冲突强度".into()),
+            group: Some("世界状态".into()),
+        }];
+        card.character_definitions
+            .push(make_test_character_definition(
+                &card.id,
+                "global-def",
+                "Hero",
+            ));
+        let card_id = card.id.as_str().to_string();
+        store.save_card(card).unwrap();
+
+        let dto =
+            create_campaign_in_store(&store, &conv_store, card_id, "globals".into(), None).unwrap();
+        let campaign = store.get_campaign(&Id::from_str(&dto.id)).unwrap();
+        let field = campaign
+            .variable_schema
+            .iter()
+            .find(|field| field.key == "faction_tension")
+            .expect("card global schema should be copied into campaign");
+        assert_eq!(field.label, "阵营紧张度");
+        assert_eq!(field.description.as_deref(), Some("整局共享的阵营冲突强度"));
+        assert_eq!(
+            campaign
+                .variables
+                .iter()
+                .find(|value| value.key == "faction_tension")
+                .map(|value| &value.value),
+            Some(&serde_json::json!(12))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sync_campaign_variable_schema_adds_missing_without_overwriting_current_value() {
+        use storyforge_domain::campaign::Campaign;
+        use storyforge_domain::variables::{VariableField, VariableType};
+
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_sync_campaign_globals_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = campaign_store::CampaignStore::new(&dir);
+
+        let character = make_test_character("Sync Global Source");
+        let mut card = storyforge_domain::character::CharacterCard::from_character(&character);
+        let card_id = card.id.clone();
+        store.save_card(card.clone()).unwrap();
+        let campaign = Campaign::new(card_id, "legacy");
+        let campaign_id = campaign.id.clone();
+        store.save_campaign(campaign).unwrap();
+
+        card.campaign_variable_schema = vec![VariableField {
+            key: "danger_level".into(),
+            label: "危险等级".into(),
+            value_type: VariableType::Int,
+            default: serde_json::json!(2),
+            description: Some("整局风险".into()),
+            group: Some("世界状态".into()),
+        }];
+        store.save_card(card.clone()).unwrap();
+
+        let first = sync_campaign_variable_schema_in_store(&store, &campaign_id).unwrap();
+        assert_eq!(first.added, 1);
+        let mut synced = store.get_campaign(&campaign_id).unwrap();
+        assert_eq!(
+            synced.get_variable("danger_level"),
+            Some(&serde_json::json!(2))
+        );
+
+        synced.set_variable("danger_level", serde_json::json!(77), 4);
+        store.update_campaign(synced).unwrap();
+        card.campaign_variable_schema[0].default = serde_json::json!(99);
+        card.campaign_variable_schema[0].description = Some("更新后的说明".into());
+        store.save_card(card).unwrap();
+
+        let second = sync_campaign_variable_schema_in_store(&store, &campaign_id).unwrap();
+        assert_eq!(second.added, 0);
+        let resynced = store.get_campaign(&campaign_id).unwrap();
+        assert_eq!(
+            resynced.get_variable("danger_level"),
+            Some(&serde_json::json!(77)),
+            "同步 schema 不得覆盖活动中已经变化的当前值"
+        );
+        assert_eq!(
+            resynced
+                .variable_schema
+                .iter()
+                .find(|field| field.key == "danger_level")
+                .and_then(|field| field.description.as_deref()),
+            Some("更新后的说明")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18160,6 +18798,7 @@ mod tests {
             name: "Test Card".into(),
             source_character_id: Id::from_str("source-card-1"),
             character_definitions: vec![],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::Value::Null,
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -18511,6 +19150,7 @@ mod tests {
             name: "Campaign Card".into(),
             source_character_id: Id::from_str("source-campaign"),
             character_definitions: vec![],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::json!({
                 "name": "Campaign Card",
                 "extensions": {
@@ -18624,6 +19264,7 @@ mod tests {
                 name: "Epoch Card".into(),
                 source_character_id: Id::from_str("src"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::json!({}),
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,
@@ -19397,19 +20038,24 @@ mod tests {
         let keys = postprocess_variable_keys(&ctx);
 
         for expected in [
-            "hp",
-            "story_clock",
-            "weather",
-            "stress",
-            "alarm_level",
-            "temporary_flag",
+            "hp（角色/生命值/int）",
+            "story_clock（全局/故事时间/string）",
+            "weather（全局/天气/string）",
+            "stress（角色/Stress/int）",
+            "alarm_level（全局/alarm_level/string）",
+            "temporary_flag（角色/temporary_flag/bool）",
         ] {
             assert!(
                 keys.contains(&expected.to_string()),
                 "missing key {expected}"
             );
         }
-        assert_eq!(keys.iter().filter(|key| key.as_str() == "hp").count(), 1);
+        assert_eq!(
+            keys.iter()
+                .filter(|key| key.starts_with("hp（角色/"))
+                .count(),
+            1
+        );
     }
 
     // ─── W6 方向 1：广播分发测试 ───────────────────────────────────────────
@@ -19537,6 +20183,7 @@ mod tests {
             name: "test card".into(),
             source_character_id: Id::from_str("src-1"),
             character_definitions: vec![def_guard, def_merchant, def_leader],
+            campaign_variable_schema: vec![],
             raw_card_json: serde_json::Value::Null,
             extraction_status: storyforge_domain::character::CharacterExtractionStatus::Extracted,
             extraction_message: None,
@@ -21130,6 +21777,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::Value::Null,
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,
@@ -21280,6 +21928,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::Value::Null,
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,
@@ -21403,6 +22052,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::Value::Null,
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,
@@ -21510,6 +22160,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::Value::Null,
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,
@@ -21620,6 +22271,7 @@ mod tests {
                 name: "测试卡".into(),
                 source_character_id: Id::from_str("src-1"),
                 character_definitions: vec![],
+                campaign_variable_schema: vec![],
                 raw_card_json: serde_json::Value::Null,
                 extraction_status:
                     storyforge_domain::character::CharacterExtractionStatus::Extracted,

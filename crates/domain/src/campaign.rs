@@ -7,7 +7,7 @@
 //! "instance" (session-level, carries this save's knowledge/state).
 
 use crate::Id;
-use crate::variables::VariableValue;
+use crate::variables::{VariableField, VariableValue};
 use serde::{Deserialize, Serialize};
 
 // --- Campaign -------------------------------------------------------------
@@ -22,6 +22,9 @@ pub struct Campaign {
     pub created_at: String,
     #[serde(default)]
     pub variables: Vec<VariableValue>,
+    /// Campaign 级变量定义。旧存档缺失时回退系统基础 schema。
+    #[serde(default = "crate::variables::default_campaign_variables")]
+    pub variable_schema: Vec<VariableField>,
     /// 该 Campaign 绑定的唯一对话 ID（一 Campaign 一对话模型）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<Id>,
@@ -60,17 +63,28 @@ fn default_story_clock() -> String {
 
 impl Campaign {
     pub fn new(card_id: Id, name: impl Into<String>) -> Self {
+        Self::new_with_variable_schema(card_id, name, &[])
+    }
+
+    /// 用卡模板提供的全局字段创建 Campaign；卡字段可覆盖系统同名默认值。
+    pub fn new_with_variable_schema(
+        card_id: Id,
+        name: impl Into<String>,
+        card_schema: &[VariableField],
+    ) -> Self {
         let name = name.into();
+        let variable_schema = crate::variables::merge_schema(
+            &crate::variables::default_campaign_variables(),
+            card_schema,
+        );
         Self {
             id: Id::new(),
             card_id,
             name,
             fork_from: None,
             created_at: now_iso(),
-            variables: crate::variables::init_values_from_schema(
-                &crate::variables::default_campaign_variables(),
-                0,
-            ),
+            variables: crate::variables::init_values_from_schema(&variable_schema, 0),
+            variable_schema,
             conversation_id: None,
             story_clock: default_story_clock(),
             revision: 0,
@@ -88,16 +102,15 @@ impl Campaign {
         fork_node_id: Id,
     ) -> Self {
         let name = name.into();
+        let variable_schema = crate::variables::default_campaign_variables();
         Self {
             id: Id::new(),
             card_id,
             name,
             fork_from: Some((source_campaign_id, fork_node_id)),
             created_at: now_iso(),
-            variables: crate::variables::init_values_from_schema(
-                &crate::variables::default_campaign_variables(),
-                0,
-            ),
+            variables: crate::variables::init_values_from_schema(&variable_schema, 0),
+            variable_schema,
             conversation_id: None,
             story_clock: default_story_clock(),
             revision: 0,
@@ -159,6 +172,49 @@ impl Campaign {
         if let Some(s) = clock_update {
             self.story_clock = s;
         }
+    }
+
+    /// 新增一个 Campaign 变量定义并用其默认值初始化当前值。
+    pub fn add_variable_field(&mut self, mut field: VariableField) -> Result<(), String> {
+        field.key = crate::variables::normalize_mvu_key(&field.key);
+        if field.key.is_empty() {
+            return Err("变量键名不能为空".into());
+        }
+        if self
+            .variable_schema
+            .iter()
+            .any(|existing| existing.key == field.key)
+        {
+            return Err(format!("变量已存在: {}", field.key));
+        }
+        if self.get_variable(&field.key).is_none() {
+            self.set_variable(&field.key, field.default.clone(), 0);
+        }
+        self.variable_schema.push(field);
+        self.variable_schema
+            .sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(())
+    }
+
+    /// 合并 schema，仅为缺失字段写入默认值。返回新增字段数。
+    pub fn sync_variable_schema(&mut self, schema: &[VariableField]) -> usize {
+        let merged = crate::variables::merge_schema(&self.variable_schema, schema);
+        let added = merged
+            .iter()
+            .filter(|field| {
+                !self
+                    .variable_schema
+                    .iter()
+                    .any(|existing| existing.key == field.key)
+            })
+            .count();
+        for field in &merged {
+            if self.get_variable(&field.key).is_none() {
+                self.set_variable(&field.key, field.default.clone(), 0);
+            }
+        }
+        self.variable_schema = merged;
+        added
     }
 }
 
@@ -303,6 +359,99 @@ mod tests {
         assert_eq!(campaign.story_clock, "Day 1");
         assert!(campaign.get_variable("story_clock").is_some());
         assert!(campaign.get_variable("weather").is_some());
+    }
+
+    #[test]
+    fn test_campaign_new_with_schema_merges_card_globals_and_initializes_values() {
+        let card_schema = vec![crate::variables::VariableField {
+            key: "faction_tension".into(),
+            label: "阵营紧张度".into(),
+            value_type: crate::variables::VariableType::Int,
+            default: serde_json::json!(12),
+            description: Some("公开冲突风险".into()),
+            group: Some("世界".into()),
+        }];
+
+        let campaign = Campaign::new_with_variable_schema(Id::new(), "schema-run", &card_schema);
+
+        assert!(
+            campaign
+                .variable_schema
+                .iter()
+                .any(|field| field.key == "story_clock")
+        );
+        assert!(
+            campaign
+                .variable_schema
+                .iter()
+                .any(|field| field.key == "faction_tension")
+        );
+        assert_eq!(
+            campaign.get_variable("faction_tension"),
+            Some(&serde_json::json!(12))
+        );
+    }
+
+    #[test]
+    fn test_campaign_add_variable_field_rejects_duplicates_and_keeps_schema_value_together() {
+        let mut campaign = Campaign::new(Id::new(), "schema-edit");
+        let field = crate::variables::VariableField {
+            key: "danger_level".into(),
+            label: "危险等级".into(),
+            value_type: crate::variables::VariableType::Int,
+            default: serde_json::json!(2),
+            description: None,
+            group: Some("全局".into()),
+        };
+
+        assert!(campaign.add_variable_field(field.clone()).is_ok());
+        assert_eq!(
+            campaign.get_variable("danger_level"),
+            Some(&serde_json::json!(2))
+        );
+        assert!(campaign.add_variable_field(field).is_err());
+    }
+
+    #[test]
+    fn test_campaign_add_variable_field_preserves_an_existing_orphan_value() {
+        let mut campaign = Campaign::new(Id::new(), "schema-repair");
+        campaign.set_variable("danger_level", serde_json::json!(77), 4);
+
+        campaign
+            .add_variable_field(crate::variables::VariableField {
+                key: "danger_level".into(),
+                label: "危险等级".into(),
+                value_type: crate::variables::VariableType::Int,
+                default: serde_json::json!(2),
+                description: Some("整局风险".into()),
+                group: Some("全局".into()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            campaign.get_variable("danger_level"),
+            Some(&serde_json::json!(77))
+        );
+    }
+
+    #[test]
+    fn test_campaign_sync_schema_counts_new_definitions_even_when_value_already_exists() {
+        let mut campaign = Campaign::new(Id::new(), "schema-sync-count");
+        campaign.set_variable("danger_level", serde_json::json!(77), 4);
+        let schema = vec![crate::variables::VariableField {
+            key: "danger_level".into(),
+            label: "危险等级".into(),
+            value_type: crate::variables::VariableType::Int,
+            default: serde_json::json!(2),
+            description: None,
+            group: Some("全局".into()),
+        }];
+
+        assert_eq!(campaign.sync_variable_schema(&schema), 1);
+        assert_eq!(
+            campaign.get_variable("danger_level"),
+            Some(&serde_json::json!(77))
+        );
     }
 
     #[test]

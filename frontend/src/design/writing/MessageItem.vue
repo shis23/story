@@ -202,55 +202,63 @@ function paragraphs(text) {
 
     <footer
       v-if="!editing"
-      class="mt-3 flex flex-wrap items-center gap-0.5 text-xs text-ink-soft transition-opacity duration-200 opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+      data-testid="message-footer"
+      class="mt-3 flex flex-nowrap items-center gap-2 text-xs text-ink-soft transition-opacity duration-200 opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
     >
-      <span class="text-ink-faint mr-1">{{ message.role_label }}<template v-if="seed != null"> · seed {{ seed }}</template></span>
-      <button type="button" @click="startEdit" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">编辑</button>
-      <button
-        type="button"
-        @click="emit('accept-variant', { nodeId: message.id })"
-        :disabled="busy"
-        class="min-h-7 px-2 rounded-md hover:bg-accent-soft transition-colors disabled:opacity-40"
-        :class="isFinal ? 'text-ok' : (qualityAcceptHint ? 'text-warn' : 'hover:text-accent-bright')"
-        :title="qualityAcceptHint || undefined"
-      >{{ isFinal ? '已采纳' : '采纳' }}</button>
-      <span v-if="qualityAcceptHint && !isFinal" class="text-[11px] text-warn">{{ qualityAcceptHint }}</span>
-
-      <!-- 重 roll 三级菜单 -->
-      <div class="relative">
+      <span class="min-w-0 flex-1 truncate text-ink-faint" :title="seed != null ? `${message.role_label} · seed ${seed}` : message.role_label">
+        {{ message.role_label }}<template v-if="seed != null"> · seed {{ seed }}</template>
+      </span>
+      <div
+        data-testid="message-actions"
+        class="flex shrink-0 items-center gap-0.5 whitespace-nowrap"
+      >
+        <button type="button" @click="startEdit" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">编辑</button>
         <button
           type="button"
-          @click="showRerollMenu = !showRerollMenu"
+          @click="emit('accept-variant', { nodeId: message.id })"
           :disabled="busy"
-          class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors"
-        >重 roll ▾</button>
-        <div
-          v-if="showRerollMenu"
-          class="absolute left-0 bottom-full mb-1 z-20 min-w-[200px] rounded-lg border border-line bg-surface shadow-float py-1"
-        >
-          <button type="button" @click="pickReroll('all')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">整体重 roll</button>
-          <button v-if="replayPolicy.editorOnly" type="button" @click="pickReroll('editor')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
-          <template v-if="(replayPolicy.editorOnly || replayPolicy.sequentialSuffix) && subagentRoles.length">
-            <div class="border-t border-line my-1"></div>
-            <button
-              v-for="role in subagentRoles"
-              :key="role.id"
-              type="button"
-              @click="pickReroll('subagent:' + role.id)"
-              class="w-full text-left min-h-9 px-3 text-[13px] text-accent hover:bg-accent-soft transition-colors"
-            >{{ replayPolicy.sequentialSuffix ? '从此角色起重演' : '只重跑' }} · {{ role.label }}</button>
-            <div class="px-3 py-1.5 text-[11px] text-ink-faint">
-              {{ replayPolicy.sequentialSuffix ? '该角色及其后的演出、编剧都会重新执行' : '复用其余阶段产物' }}
-            </div>
-          </template>
-          <div v-else-if="replayPolicy.editorOnly" class="px-3 py-2 text-[11px] text-ink-faint">无溯源信息，仅支持整体/编剧重 roll</div>
-          <div v-else class="px-3 py-2 text-[11px] text-ink-faint">当前模式会整体重写，确保各阶段产物一致</div>
-        </div>
-      </div>
+          class="min-h-7 px-2 rounded-md hover:bg-accent-soft transition-colors disabled:opacity-40"
+          :class="isFinal ? 'text-ok' : (qualityAcceptHint ? 'text-warn' : 'hover:text-accent-bright')"
+          :title="qualityAcceptHint || undefined"
+        >{{ isFinal ? '已采纳' : '采纳' }}</button>
+        <span v-if="qualityAcceptHint && !isFinal" class="text-[11px] text-warn">{{ qualityAcceptHint }}</span>
 
-      <button type="button" @click="emit('add-variant', { messageId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">添变体</button>
-      <button v-if="canBranch" type="button" @click="emit('branch', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">分支</button>
-      <button type="button" @click="emit('delete-variant', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md text-ink-faint hover:bg-err/10 hover:text-err disabled:opacity-40 transition-colors ml-auto">删除</button>
+        <!-- 重 roll 三级菜单 -->
+        <div class="relative">
+          <button
+            type="button"
+            @click="showRerollMenu = !showRerollMenu"
+            :disabled="busy"
+            class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors"
+          >重 roll ▾</button>
+          <div
+            v-if="showRerollMenu"
+            class="absolute left-0 bottom-full mb-1 z-20 min-w-[200px] rounded-lg border border-line bg-surface shadow-float py-1"
+          >
+            <button type="button" @click="pickReroll('all')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">整体重 roll</button>
+            <button v-if="replayPolicy.editorOnly" type="button" @click="pickReroll('editor')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
+            <template v-if="(replayPolicy.editorOnly || replayPolicy.sequentialSuffix) && subagentRoles.length">
+              <div class="border-t border-line my-1"></div>
+              <button
+                v-for="role in subagentRoles"
+                :key="role.id"
+                type="button"
+                @click="pickReroll('subagent:' + role.id)"
+                class="w-full text-left min-h-9 px-3 text-[13px] text-accent hover:bg-accent-soft transition-colors"
+              >{{ replayPolicy.sequentialSuffix ? '从此角色起重演' : '只重跑' }} · {{ role.label }}</button>
+              <div class="px-3 py-1.5 text-[11px] text-ink-faint">
+                {{ replayPolicy.sequentialSuffix ? '该角色及其后的演出、编剧都会重新执行' : '复用其余阶段产物' }}
+              </div>
+            </template>
+            <div v-else-if="replayPolicy.editorOnly" class="px-3 py-2 text-[11px] text-ink-faint">无溯源信息，仅支持整体/编剧重 roll</div>
+            <div v-else class="px-3 py-2 text-[11px] text-ink-faint">当前模式会整体重写，确保各阶段产物一致</div>
+          </div>
+        </div>
+
+        <button type="button" @click="emit('add-variant', { messageId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">添变体</button>
+        <button v-if="canBranch" type="button" @click="emit('branch', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors">分支</button>
+        <button type="button" @click="emit('delete-variant', { nodeId: message.id })" :disabled="busy" class="min-h-7 px-2 rounded-md text-ink-faint hover:bg-err/10 hover:text-err disabled:opacity-40 transition-colors">删除</button>
+      </div>
     </footer>
 
     <section
