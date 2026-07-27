@@ -12,8 +12,10 @@ const props = defineProps({
   writing: { type: Boolean, default: false },
   disabled: { type: Boolean, default: false },
   placeholder: { type: String, default: '告诉你的想法，或用快捷指令开始…' },
+  generationMode: { type: String, default: 'continuation' },
+  showGenerationModes: { type: Boolean, default: false },
 })
-const emit = defineEmits(['start-writing', 'cancel'])
+const emit = defineEmits(['start-writing', 'cancel', 'update-generation-mode'])
 
 const intent = ref('')
 const textareaRef = ref(null)
@@ -24,6 +26,12 @@ const chips = [
   { label: '扩写', prefix: '扩写这段：' },
   { label: '改写', prefix: '换一种写法重写：' },
   { label: '总结', prefix: '总结以上内容：' },
+]
+
+const generationModes = [
+  { value: 'continuation', label: '续写', hint: '单笔者' },
+  { value: 'duet', label: '对手戏', hint: 'A-B-A' },
+  { value: 'sequential_crew', label: '顺序剧组', hint: '逐角接戏' },
 ]
 
 function applyChip(chip) {
@@ -44,6 +52,24 @@ function submit() {
     class="rounded-xl border bg-surface px-4 py-3 shadow-card transition-colors"
     :class="writing ? 'border-line' : 'border-line focus-within:border-accent-border'"
   >
+    <div v-if="showGenerationModes" class="mb-2.5 flex items-center gap-1.5 flex-wrap" aria-label="生成模式">
+      <span class="mr-1 text-[11px] text-ink-faint">本轮模式</span>
+      <button
+        v-for="mode in generationModes"
+        :key="mode.value"
+        type="button"
+        :disabled="disabled || writing"
+        class="min-h-7 rounded-md border px-2.5 text-xs transition-colors disabled:opacity-40"
+        :class="generationMode === mode.value
+          ? 'border-accent-border bg-accent-soft text-accent-bright'
+          : 'border-line bg-surface-2 text-ink-soft hover:border-accent-border'"
+        :title="mode.hint"
+        @click="emit('update-generation-mode', mode.value)"
+      >
+        {{ mode.label }}
+        <span v-if="mode.value === 'sequential_crew'" class="ml-1 text-[10px] opacity-75">重点</span>
+      </button>
+    </div>
     <div class="flex items-end gap-3">
       <textarea
         ref="textareaRef"

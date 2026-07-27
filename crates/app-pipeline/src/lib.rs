@@ -5,6 +5,8 @@
 use std::sync::Arc;
 
 pub mod quality_gate;
+mod sequential_crew;
+mod turn_dossier;
 
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
@@ -17,6 +19,7 @@ use storyforge_domain::agent::{
 use storyforge_domain::agent_profile_config::AgentProfileConfig;
 use storyforge_domain::campaign::CharacterInstance;
 use storyforge_domain::conversation::Provenance;
+use storyforge_domain::generation::GenerationMode;
 use storyforge_domain::mvu_translation::FallbackFragment;
 use storyforge_domain::preset::{RegexPlacement, RegexScript};
 
@@ -71,6 +74,7 @@ fn validate_provenance_reasoning_budget(provenance: &Provenance) -> Result<(), P
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(provenance.editor_reasoning.as_ref().map_or(0, String::len))
+        .saturating_add(provenance.writer_reasoning.as_ref().map_or(0, String::len))
         .saturating_add(
             provenance
                 .subagent_results
@@ -126,6 +130,21 @@ const EDITOR_SYSTEM_PROMPT: &str = r#"你是编剧。收集所有子 Agent 的�
 
 const SUBAGENT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是角色 {name}。根据导演给你的任务和专属上下文，演出你这个角色在这场戏的行为/对白/心理。只演你自己，不要替别人说话。输出纯表演，不要解释。"#;
 
+const WRITER_SYSTEM_PROMPT: &str = r#"你是执笔者，不是故事里的任何角色。你的唯一任务是消费回合案卷并直接写出正文。
+
+硬约束：
+1. 如实扮演预期在场角色；角色知识的归属标注与认知边界是不可越过的事实边界。
+2. 写作前在内部检查：谁在场、各自想要什么、张力在哪里、本轮不该过早解决什么、每个开口者知道或不知道什么。
+3. 保持有限视角；不得让角色凭空知道他人的私密事实，不得把角色档案复述成说明书。
+4. 只输出正文，不输出分析、标题、说明、台账、JSON 或修改标记。第一行必须直接开始正文。
+5. 写到自然的交棒点，为下一轮保留可继续的动作、问题或张力。"#;
+
+const DUET_EDITOR_SYSTEM_PROMPT: &str = r#"你是对手戏场记定稿员。输入是已经按顺序发生的公开舞台记录。
+
+你只能做誊写：修正衔接、指代、标点、视角和必要的节奏断句。
+不得发明场记中不存在的事件、动作、台词、心理、事实或结局；不得改变各拍先后；不得泄露未进入公开场记的内心与私密知识。
+只输出连续正文，不要标题、说明、分析、台账或修改标记。"#;
+
 /// 组装子 Agent 的 base system（含 Prompted 时的表演 CoT / 字数等模块）。
 fn assemble_subagent_base_prompt(
     profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
@@ -153,6 +172,8 @@ pub struct RegenerateRequest {
     pub conversation_id: Id,
     pub node_id: Id,
     pub targets: Vec<PartialRollTarget>,
+    /// Current writing mode. `None` preserves the legacy big-scene reroll path.
+    pub generation_mode: Option<GenerationMode>,
     /// 用户附加提示词（可选），告知 Agent 上次哪里有问题
     pub hint: Option<String>,
     /// 随机种子（None = 新生成一个）
@@ -727,8 +748,62 @@ impl PipelineOrchestrator {
         event_tx: mpsc::UnboundedSender<PipelineEvent>,
         cancel: watch::Receiver<bool>,
     ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
+        self.start_writing_with_mode(intent, ctx, GenerationMode::BigScene, event_tx, cancel)
+            .await
+    }
+
+    /// Runs the writing pipeline with an explicit, auditable generation mode.
+    /// The legacy entry point remains a big-scene compatibility wrapper until
+    /// every caller supplies a mode.
+    pub async fn start_writing_with_mode(
+        &mut self,
+        intent: String,
+        ctx: &WritingContext,
+        generation_mode: GenerationMode,
+        event_tx: mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
+        self.start_writing_with_mode_at(intent, ctx, generation_mode, event_tx, cancel, None, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_writing_with_mode_at(
+        &mut self,
+        intent: String,
+        ctx: &WritingContext,
+        generation_mode: GenerationMode,
+        event_tx: mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+        history_before_node_id: Option<&Id>,
+        seed_override: Option<u64>,
+    ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
+        if generation_mode == GenerationMode::Continuation {
+            return self
+                .start_continuation_writer(
+                    intent,
+                    ctx,
+                    event_tx,
+                    cancel,
+                    history_before_node_id,
+                    seed_override,
+                )
+                .await;
+        }
+        if generation_mode == GenerationMode::Duet {
+            return self
+                .start_duet(
+                    intent,
+                    ctx,
+                    event_tx,
+                    cancel,
+                    history_before_node_id,
+                    seed_override,
+                )
+                .await;
+        }
         let session_id = Id::new();
-        let seed = rand_seed();
+        let seed = seed_override.unwrap_or_else(rand_seed);
         self.pending_temporary_instances.clear();
         // A2：本轮 seed 同时驱动 provenance 与模板 random/roll 宏
         let template_seed = ctx.template_random_seed.unwrap_or(seed);
@@ -788,7 +863,7 @@ impl PipelineOrchestrator {
         let (history, epoch_info) = self.conv_store.recent_history_with_epoch(
             &ctx.conversation_id,
             storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            None,
+            history_before_node_id,
         );
         if let Some(info) = &epoch_info {
             tracing::debug!(
@@ -940,20 +1015,37 @@ impl PipelineOrchestrator {
             &ctx.modules,
             &self.reasoning_mode(),
         );
-        let subagent_results = spawn_subagents(
-            plan.subagent_tasks.clone(),
-            self.runtime.clone(),
-            &director_config,
-            &subagent_base,
-            cancel.clone(),
-            event_tx.clone(),
-            effective_runtime,
-            max_concurrent,
-            ctx.agent_profile_config.as_ref(),
-            summary_block.as_deref(),
-            far_block.as_deref(),
-        )
-        .await;
+        let subagent_results = if generation_mode == GenerationMode::SequentialCrew {
+            sequential_crew::run_sequential_crew(
+                plan.subagent_tasks.clone(),
+                self.runtime.clone(),
+                &director_config,
+                &subagent_base,
+                cancel.clone(),
+                event_tx.clone(),
+                effective_runtime,
+                ctx.agent_profile_config.as_ref(),
+                summary_block.as_deref(),
+                far_block.as_deref(),
+                &intent,
+            )
+            .await
+        } else {
+            spawn_subagents(
+                plan.subagent_tasks.clone(),
+                self.runtime.clone(),
+                &director_config,
+                &subagent_base,
+                cancel.clone(),
+                event_tx.clone(),
+                effective_runtime,
+                max_concurrent,
+                ctx.agent_profile_config.as_ref(),
+                summary_block.as_deref(),
+                far_block.as_deref(),
+            )
+            .await
+        };
 
         // 处理子 Agent 结果
         let mut performances = Vec::new();
@@ -1026,7 +1118,7 @@ impl PipelineOrchestrator {
         let (editor_history, editor_epoch) = self.conv_store.recent_history_with_epoch(
             &ctx.conversation_id,
             storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
-            None,
+            history_before_node_id,
         );
         if let Some(info) = &editor_epoch {
             tracing::debug!(
@@ -1146,6 +1238,466 @@ impl PipelineOrchestrator {
 
         info!(target: "app-pipeline", "流水线完成: session={session_id}");
 
+        Ok((final_text, node_id, Some(provenance)))
+    }
+
+    /// Daily continuation mode: deterministic dossier compilation followed by
+    /// one clean Writer call. No Director, character subagents, or Editor are
+    /// involved in the prose-producing path.
+    async fn start_continuation_writer(
+        &mut self,
+        intent: String,
+        ctx: &WritingContext,
+        event_tx: mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+        history_before_node_id: Option<&Id>,
+        seed_override: Option<u64>,
+    ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
+        let session_id = Id::new();
+        let seed = seed_override.unwrap_or_else(rand_seed);
+        let template_seed = ctx.template_random_seed.unwrap_or(seed);
+        self.pending_temporary_instances.clear();
+
+        let _ = event_tx.send(PipelineEvent::Started {
+            session_id: session_id.to_string(),
+        });
+        if !has_available_characters(ctx) {
+            let message = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: message.into(),
+            });
+            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(message.into())));
+        }
+        if *cancel.borrow() {
+            return Err(self.abort_with(&event_tx, PipelineError::Cancelled));
+        }
+
+        let writer_intent = match apply_director_intent_regex(&intent, &ctx.regex_scripts) {
+            Ok(text) => text,
+            Err(error) => return Err(self.abort_with(&event_tx, error)),
+        };
+        let dossier = if let Some(runtime) = ctx.campaign_runtime.as_deref() {
+            turn_dossier::compile_turn_dossier(&writer_intent, runtime, &ctx.pending_tasks, 3)
+        } else {
+            turn_dossier::compile_legacy_turn_dossier(&writer_intent, &ctx.characters, 3)
+        };
+        let plan = Plan {
+            scene_brief: writer_intent.clone(),
+            subagent_tasks: dossier
+                .actors
+                .iter()
+                .map(|actor| SubagentTask {
+                    character_id: actor.id.clone(),
+                    brief: "由续写档执笔者统一扮演".into(),
+                    context_package: ContextPackage {
+                        character_brief: actor.persona.clone(),
+                        scene_brief: writer_intent.clone(),
+                        relevant_lore: vec![],
+                        constant_lore: vec![],
+                        recent_window: vec![],
+                        task: writer_intent.clone(),
+                    },
+                    current_desire: actor.agenda.clone(),
+                    ongoing_action: None,
+                    emotion_stage: None,
+                })
+                .collect(),
+            scene_plan: None,
+        };
+
+        self.state = PipelineState::Editing;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        let _ = event_tx.send(PipelineEvent::WriterStarted);
+
+        let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
+        let writer_config = make_writer_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &build_director_system_extra(ctx),
+            ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
+            &self.reasoning_mode(),
+        );
+        let (history, epoch_info) = self.conv_store.recent_history_with_epoch(
+            &ctx.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            history_before_node_id,
+        );
+        if let Some(info) = &epoch_info {
+            tracing::debug!(
+                target: "context_compiler",
+                epoch_id = %info.epoch_id,
+                start = info.start,
+                len = info.len,
+                dropped = info.dropped,
+                has_checkpoint = info.has_checkpoint,
+                "Writer history epoch"
+            );
+        }
+        let chronicle_source = if ctx.chronicle_prompt_catalog.is_empty() {
+            &ctx.recent_summaries
+        } else {
+            &ctx.chronicle_prompt_catalog
+        };
+        let chronicle_partition =
+            chronicle_partition_for_context(chronicle_source, ctx.context_epoch.as_ref());
+        let history = prepend_chronicle_history_prefix(history, &chronicle_partition);
+        let history = filter_history_to_near_raw_turns(history, &chronicle_partition.near_turns);
+        let writer_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(writer_config.system_prompt.clone())
+            .history(history)
+            .tail(|_| build_writer_tail(&dossier, ctx));
+
+        let (writer_progress_tx, mut writer_progress_rx) = mpsc::unbounded_channel::<String>();
+        let writer_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(delta) = writer_progress_rx.recv().await {
+                let _ = writer_event_tx.send(PipelineEvent::WriterProgress { delta });
+            }
+        });
+        let writer_response = match self
+            .runtime
+            .run_tool_loop_with_layout(
+                &writer_config,
+                writer_layout,
+                &ToolRegistry::new(),
+                cancel,
+                writer_progress_tx,
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.abort_with(&event_tx, PipelineError::Agent(error)));
+            }
+        };
+        let final_text =
+            match apply_editor_output_regex(&writer_response.content, &ctx.regex_scripts) {
+                Ok(text) => text,
+                Err(error) => return Err(self.abort_with(&event_tx, error)),
+            };
+        let _ = event_tx.send(PipelineEvent::DraftReady {
+            text: final_text.clone(),
+        });
+
+        self.state = PipelineState::Review;
+        let mut provenance = build_provenance_with_campaign(
+            session_id.clone(),
+            Some(plan.clone()),
+            &[],
+            None,
+            seed,
+            None,
+            ctx.campaign_runtime.as_deref(),
+        );
+        provenance.writer_reasoning = writer_response.reasoning_content;
+        validate_provenance_reasoning_budget(&provenance)?;
+        let node_id = if self.defer_conversation_land {
+            Id::new()
+        } else {
+            match self.conv_store.append_ai_draft(
+                &ctx.conversation_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Err(self.abort_with(&event_tx, PipelineError::Conversation(error)));
+                }
+            }
+        };
+
+        self.state = PipelineState::Committed;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        self.session = Some(WritingSession {
+            id: session_id,
+            intent,
+            state: self.state.clone(),
+            plan: Some(plan),
+            subagent_results: vec![],
+            draft: Some(Draft {
+                text: final_text.clone(),
+                attribution: vec![],
+            }),
+            seed,
+        });
+
+        Ok((final_text, node_id, Some(provenance)))
+    }
+
+    /// Two-actor exchange: deterministic staging, A→B→A public beats, then a
+    /// constrained Editor-lite transcription pass.
+    async fn start_duet(
+        &mut self,
+        intent: String,
+        ctx: &WritingContext,
+        event_tx: mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+        history_before_node_id: Option<&Id>,
+        seed_override: Option<u64>,
+    ) -> Result<(String, Id, Option<Provenance>), PipelineError> {
+        let session_id = Id::new();
+        let seed = seed_override.unwrap_or_else(rand_seed);
+        let template_seed = ctx.template_random_seed.unwrap_or(seed);
+        self.pending_temporary_instances.clear();
+        let _ = event_tx.send(PipelineEvent::Started {
+            session_id: session_id.to_string(),
+        });
+        if !has_available_characters(ctx) {
+            let message = "没有可用角色。请先导入角色卡或在 Campaign 中添加角色实例。";
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: message.into(),
+            });
+            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(message.into())));
+        }
+        let duet_intent = match apply_director_intent_regex(&intent, &ctx.regex_scripts) {
+            Ok(text) => text,
+            Err(error) => return Err(self.abort_with(&event_tx, error)),
+        };
+        let mut dossier = if let Some(runtime) = ctx.campaign_runtime.as_deref() {
+            turn_dossier::compile_turn_dossier(&duet_intent, runtime, &ctx.pending_tasks, 2)
+        } else {
+            turn_dossier::compile_legacy_turn_dossier(&duet_intent, &ctx.characters, 2)
+        };
+        if dossier.actors.len() != 2 {
+            let message = format!(
+                "对手戏需要恰好两位可用演员，当前编译到 {} 位",
+                dossier.actors.len()
+            );
+            let _ = event_tx.send(PipelineEvent::Error {
+                message: message.clone(),
+            });
+            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(message)));
+        }
+        dossier.actors.sort_by_key(|actor| {
+            duet_intent
+                .find(&actor.name)
+                .or_else(|| duet_intent.find(&actor.id))
+                .unwrap_or(usize::MAX)
+        });
+        let actor_task = |actor: &turn_dossier::ActorDossier| SubagentTask {
+            character_id: actor.id.clone(),
+            brief: format!("只表演 {} 的本拍言行，并在交棒点停下", actor.name),
+            context_package: ContextPackage {
+                character_brief: actor.persona.clone(),
+                scene_brief: duet_intent.clone(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: format!("回应当前公开场记，只写 {} 的言行", actor.name),
+            },
+            current_desire: actor.agenda.clone(),
+            ongoing_action: None,
+            emotion_stage: None,
+        };
+        let first = actor_task(&dossier.actors[0]);
+        let second = actor_task(&dossier.actors[1]);
+        let beat_tasks = vec![first.clone(), second, first];
+        let plan = Plan {
+            scene_brief: duet_intent.clone(),
+            subagent_tasks: beat_tasks.clone(),
+            scene_plan: None,
+        };
+
+        self.state = PipelineState::Delegating;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        for (index, task) in beat_tasks.iter().enumerate() {
+            let _ = event_tx.send(PipelineEvent::SubagentStarted {
+                character_id: task.character_id.clone(),
+                index,
+                total: beat_tasks.len(),
+            });
+        }
+        let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
+        let parent_config = make_writer_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &build_director_system_extra(ctx),
+            ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
+            &self.reasoning_mode(),
+        );
+        let subagent_base = assemble_subagent_base_prompt(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &self.reasoning_mode(),
+        );
+        let summary_block = render_recent_summaries_for_injection(
+            &ctx.recent_summaries,
+            RECENT_SUMMARIES_INJECT_LIMIT,
+        );
+        let recent_texts = ctx
+            .recent_summaries
+            .iter()
+            .map(|summary| summary.content.clone())
+            .collect::<Vec<_>>();
+        let far_block = render_far_memory_for_injection_excluding(
+            &ctx.far_memory_hits,
+            FAR_MEMORY_INJECT_LIMIT,
+            &recent_texts,
+        );
+        let beat_results = sequential_crew::run_sequential_crew(
+            beat_tasks,
+            self.runtime.clone(),
+            &parent_config,
+            &subagent_base,
+            cancel.clone(),
+            event_tx.clone(),
+            ctx.campaign_runtime.clone(),
+            ctx.agent_profile_config.as_ref(),
+            summary_block.as_deref(),
+            far_block.as_deref(),
+            &duet_intent,
+        )
+        .await;
+        let mut performances = Vec::new();
+        for (index, result) in beat_results.into_iter().enumerate() {
+            match result {
+                Ok(performance) => {
+                    let _ = event_tx.send(PipelineEvent::SubagentDone {
+                        character_id: performance.character_id.clone(),
+                        index,
+                        full_text: performance.full_text.clone(),
+                    });
+                    performances.push(performance);
+                }
+                Err(error) => {
+                    let character_id = plan.subagent_tasks[index].character_id.clone();
+                    let _ = event_tx.send(PipelineEvent::SubagentCancelled {
+                        character_id: character_id.clone(),
+                        index,
+                    });
+                    error!(target: "app-pipeline", "对手戏第 {} 拍（{}）失败: {}", index + 1, character_id, error);
+                }
+            }
+        }
+        if performances.is_empty() {
+            let message = "对手戏没有留下可定稿的公开场记";
+            return Err(self.abort_with(&event_tx, PipelineError::InvalidState(message.into())));
+        }
+        if *cancel.borrow() {
+            return Err(self.abort_with(&event_tx, PipelineError::Cancelled));
+        }
+
+        self.state = PipelineState::Editing;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        let _ = event_tx.send(PipelineEvent::EditorStarted);
+        let editor_config = make_duet_editor_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
+            &self.reasoning_mode(),
+        );
+        let contract =
+            storyforge_domain::narrative_contract::NarrativeContract::from_plan_and_runtime(
+                &plan,
+                ctx.campaign_runtime.as_deref(),
+            );
+        let performances_text = redact_performances_for_editor(&performances, Some(&contract));
+        let (history, _) = self.conv_store.recent_history_with_epoch(
+            &ctx.conversation_id,
+            storyforge_domain::conversation::DEFAULT_HISTORY_WINDOW_SIZE,
+            history_before_node_id,
+        );
+        let editor_layout = storyforge_domain::message_layout::MessageLayout::build()
+            .system(editor_config.system_prompt.clone())
+            .history(history)
+            .tail(|_| {
+                build_editor_tail(
+                    &duet_intent,
+                    &performances_text,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    Some(&contract),
+                )
+            });
+        let (editor_progress_tx, mut editor_progress_rx) = mpsc::unbounded_channel::<String>();
+        let editor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(delta) = editor_progress_rx.recv().await {
+                let _ = editor_event_tx.send(PipelineEvent::EditorProgress { delta });
+            }
+        });
+        let editor_response = match self
+            .runtime
+            .run_tool_loop_with_layout(
+                &editor_config,
+                editor_layout,
+                &ToolRegistry::new(),
+                cancel,
+                editor_progress_tx,
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.abort_with(&event_tx, PipelineError::Agent(error)));
+            }
+        };
+        let final_text =
+            match apply_editor_output_regex(&editor_response.content, &ctx.regex_scripts) {
+                Ok(text) => text,
+                Err(error) => return Err(self.abort_with(&event_tx, error)),
+            };
+        let _ = event_tx.send(PipelineEvent::DraftReady {
+            text: final_text.clone(),
+        });
+
+        self.state = PipelineState::Review;
+        let mut provenance = build_provenance_with_campaign(
+            session_id.clone(),
+            Some(plan.clone()),
+            &performances,
+            None,
+            seed,
+            None,
+            ctx.campaign_runtime.as_deref(),
+        );
+        provenance.editor_reasoning = editor_response.reasoning_content;
+        validate_provenance_reasoning_budget(&provenance)?;
+        let node_id = if self.defer_conversation_land {
+            Id::new()
+        } else {
+            match self.conv_store.append_ai_draft(
+                &ctx.conversation_id,
+                final_text.clone(),
+                Some(provenance.clone()),
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Err(self.abort_with(&event_tx, PipelineError::Conversation(error)));
+                }
+            }
+        };
+        self.state = PipelineState::Committed;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        self.session = Some(WritingSession {
+            id: session_id,
+            intent,
+            state: self.state.clone(),
+            plan: Some(plan),
+            subagent_results: performances,
+            draft: Some(Draft {
+                text: final_text.clone(),
+                attribution: vec![],
+            }),
+            seed,
+        });
         Ok((final_text, node_id, Some(provenance)))
     }
 
@@ -1386,10 +1938,6 @@ impl PipelineOrchestrator {
         info!(target: "app-pipeline", "重 roll 启动: session={session_id}, targets={:?}, hint={}",
             req.targets, hint.as_deref().unwrap_or("(无)"));
 
-        let _ = event_tx.send(PipelineEvent::Started {
-            session_id: session_id.to_string(),
-        });
-
         // 先校验合法性（复用 app-conversation 的约束检查）
         self.conv_store
             .validate_partial_roll(&req.conversation_id, &req.node_id, &req.targets)
@@ -1408,6 +1956,93 @@ impl PipelineOrchestrator {
                 .and_then(|v| v.provenance.clone())
                 .ok_or_else(|| PipelineError::Regenerate("旧 variant 无溯源信息".into()))?
         };
+
+        // The product modes regenerate through the same pipeline that created
+        // the draft. Fine-grained legacy rerolls do not have valid reusable
+        // artifacts for Writer, duet beats, or a sequential crew, so they are
+        // deliberately rejected instead of silently switching orchestration.
+        if let Some(generation_mode) = req
+            .generation_mode
+            .filter(|mode| *mode != GenerationMode::BigScene)
+        {
+            if !req.targets.is_empty() {
+                return Err(self.abort_with(
+                    &event_tx,
+                    PipelineError::Regenerate(
+                        "当前写作模式仅支持整体重写；局部重跑只适用于旧版大场面流水线".into(),
+                    ),
+                ));
+            }
+
+            let mut intent = provenance_old
+                .plan
+                .as_ref()
+                .map(|plan| plan.scene_brief.clone())
+                .unwrap_or_else(|| "重新创作".into());
+            if let Some(rewrite_hint) = hint.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+                intent.push_str("\n\n【重写要求】");
+                intent.push_str(rewrite_hint);
+            }
+
+            // Generate without appending a fresh message. JSON storage lands
+            // the result below as a variant of the requested node; SQLite
+            // callers retain their existing atomic landing unit of work.
+            let original_defer = self.defer_conversation_land;
+            self.defer_conversation_land = true;
+            let generated = self
+                .start_writing_with_mode_at(
+                    intent,
+                    ctx,
+                    generation_mode,
+                    event_tx.clone(),
+                    cancel,
+                    Some(&req.node_id),
+                    Some(seed),
+                )
+                .await;
+            self.defer_conversation_land = original_defer;
+            let (final_text, _, provenance) = generated?;
+            let mut provenance = provenance.ok_or_else(|| {
+                self.abort_with(
+                    &event_tx,
+                    PipelineError::Regenerate("重写完成但缺少溯源信息".into()),
+                )
+            })?;
+            provenance.last_hint = hint.clone();
+
+            if !original_defer {
+                let is_last_ai = self
+                    .conv_store
+                    .is_last_assistant_node(&req.conversation_id, &req.node_id)
+                    .map_err(|error| {
+                        self.abort_with(&event_tx, PipelineError::Conversation(error))
+                    })?;
+                let land = if is_last_ai {
+                    self.conv_store.replace_active_variant(
+                        &req.conversation_id,
+                        &req.node_id,
+                        final_text.clone(),
+                        Some(provenance.clone()),
+                    )
+                } else {
+                    self.conv_store.add_variant(
+                        &req.conversation_id,
+                        &req.node_id,
+                        final_text.clone(),
+                        Some(provenance.clone()),
+                    )
+                };
+                land.map_err(|error| {
+                    self.abort_with(&event_tx, PipelineError::Conversation(error))
+                })?;
+            }
+
+            return Ok((final_text, provenance));
+        }
+
+        let _ = event_tx.send(PipelineEvent::Started {
+            session_id: session_id.to_string(),
+        });
 
         // 判断重 roll 粒度
         let rerun_director = req
@@ -2812,6 +3447,125 @@ fn make_director_config(
     }
 }
 
+fn make_writer_config(
+    profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+    modules: &[storyforge_domain::prompt_module::PromptModule],
+    stable_world_info: &str,
+    agent_profile_config: Option<&AgentProfileConfig>,
+    template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+    reasoning: &storyforge_domain::llm::ReasoningMode,
+) -> AgentConfig {
+    let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+        &AgentRole::Writer,
+        WRITER_SYSTEM_PROMPT,
+        profile,
+        modules,
+        "",
+        reasoning,
+    );
+    if !stable_world_info.trim().is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(stable_world_info.trim());
+    }
+    if let Some(template_context) = template_context {
+        system_prompt = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            &system_prompt,
+            template_context,
+        );
+    }
+    let run = agent_profile_config.map(|config| config.run_config_for(&AgentRole::Writer));
+    AgentConfig {
+        role: AgentRole::Writer,
+        system_prompt,
+        max_tool_rounds: run.and_then(|config| config.max_tool_rounds).unwrap_or(5),
+        model: run
+            .and_then(|config| config.model_override.clone())
+            .unwrap_or_else(|| "deepseek-chat".into()),
+        tools: vec![],
+        terminal_tools: vec![],
+    }
+}
+
+fn make_duet_editor_config(
+    profile: Option<&storyforge_domain::prompt_module::PromptProfile>,
+    modules: &[storyforge_domain::prompt_module::PromptModule],
+    agent_profile_config: Option<&AgentProfileConfig>,
+    template_context: Option<&storyforge_domain::prompt_module::TemplateVarContext>,
+    reasoning: &storyforge_domain::llm::ReasoningMode,
+) -> AgentConfig {
+    let mut system_prompt = storyforge_domain::prompt_module::assemble_system_prompt(
+        &AgentRole::Editor,
+        DUET_EDITOR_SYSTEM_PROMPT,
+        profile,
+        modules,
+        "",
+        reasoning,
+    );
+    if let Some(template_context) = template_context {
+        system_prompt = storyforge_domain::prompt_module::replace_template_vars_with_context(
+            &system_prompt,
+            template_context,
+        );
+    }
+    let run = agent_profile_config.map(|config| config.run_config_for(&AgentRole::Editor));
+    AgentConfig {
+        role: AgentRole::Editor,
+        system_prompt,
+        max_tool_rounds: run.and_then(|config| config.max_tool_rounds).unwrap_or(3),
+        model: run
+            .and_then(|config| config.model_override.clone())
+            .unwrap_or_else(|| "deepseek-chat".into()),
+        tools: vec![],
+        terminal_tools: vec![],
+    }
+}
+
+fn build_writer_tail(
+    dossier: &turn_dossier::CompiledTurnDossier,
+    ctx: &WritingContext,
+) -> storyforge_domain::message_layout::VolatileTail {
+    use storyforge_domain::message_layout::VolatileTail;
+
+    let mut tail = VolatileTail::new().push(dossier.render_for_writer());
+    let selective_lore = build_triggered_selective_lore(&dossier.intent, ctx);
+    if !selective_lore.trim().is_empty() {
+        tail = tail.push(selective_lore);
+    }
+    if let Some(runtime) = &ctx.campaign_runtime {
+        let variables = storyforge_domain::variables::render_variables_for_injection(
+            &runtime.campaign.variables,
+            &[],
+        );
+        if !variables.trim().is_empty() {
+            tail = tail.push(variables);
+        }
+    }
+
+    let partition =
+        chronicle_partition_for_context(&ctx.recent_summaries, ctx.context_epoch.as_ref());
+    let mut excluded_turns = partition.near_turns;
+    excluded_turns.extend(partition.band_turns);
+    let tail_summaries = filter_summaries_excluding_turns(&ctx.recent_summaries, &excluded_turns);
+    if let Some(summaries) =
+        render_recent_summaries_for_injection(&tail_summaries, RECENT_SUMMARIES_INJECT_LIMIT)
+    {
+        tail = tail.push(summaries);
+    }
+    let recent_texts = ctx
+        .recent_summaries
+        .iter()
+        .map(|summary| summary.content.clone())
+        .collect::<Vec<_>>();
+    if let Some(memories) = render_far_memory_for_injection_excluding(
+        &ctx.far_memory_hits,
+        FAR_MEMORY_INJECT_LIMIT,
+        &recent_texts,
+    ) {
+        tail = tail.push(memories);
+    }
+    tail.push("直接续写正文。不得输出案卷复述、分析、台账或 JSON；遵守认知边界，写到自然交棒点。")
+}
+
 /// 构造编剧的易变末尾（§22 volatile tail）：场景 + 子产出 + 近期摘要 + 可选 hint
 ///
 /// Editor performance 硬 redaction：按 NarrativeContract 裁掉异己 private 探针。
@@ -3314,6 +4068,7 @@ mod tests {
             seed: 0,
             last_hint: None,
             director_reasoning: Some(reasoning.clone()),
+            writer_reasoning: None,
             editor_reasoning: None,
         };
         assert!(validate_provenance_reasoning_budget(&provenance).is_ok());
@@ -3385,6 +4140,369 @@ mod tests {
             min_depth: None,
             max_depth: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_crew_mode_runs_real_pipeline_in_actor_order() {
+        let plan = serde_json::json!({
+            "scene_brief": "A 与 B 围绕信封对峙",
+            "subagent_tasks": [
+                {
+                    "character_id": "A",
+                    "brief": "先把信封推给 B",
+                    "context_package": {
+                        "character_brief": "谨慎",
+                        "scene_brief": "密室对峙",
+                        "relevant_lore": [],
+                        "constant_lore": [],
+                        "recent_window": [],
+                        "task": "先把信封推给 B"
+                    }
+                },
+                {
+                    "character_id": "B",
+                    "brief": "回应 A",
+                    "context_package": {
+                        "character_brief": "多疑",
+                        "scene_brief": "密室对峙",
+                        "relevant_lore": [],
+                        "constant_lore": [],
+                        "recent_window": [],
+                        "task": "回应 A"
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![
+            MockScript {
+                match_keyword: DIRECTOR_SYSTEM_PROMPT.chars().take(8).collect(),
+                response_content: plan,
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: "顺序剧组演员协议".into(),
+                response_content: serde_json::json!({
+                    "narrative": "演员伸手按住信封。",
+                    "dialogue": "先说清楚。",
+                    "inner_thoughts": "这句话不会传给下一位演员。",
+                    "scene_close": false
+                })
+                .to_string(),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: EDITOR_SYSTEM_PROMPT.chars().take(8).collect(),
+                response_content: "灯灭后，信封仍停在两人之间。".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+        ]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_sequential_pipeline_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let ctx = WritingContext::legacy(
+            vec![mock_character("A"), mock_character("B")],
+            None,
+            conv_store.create(None, None).id,
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, _node_id, provenance) = orchestrator
+            .start_writing_with_mode(
+                "让 A 与 B 对峙".into(),
+                &ctx,
+                storyforge_domain::generation::GenerationMode::SequentialCrew,
+                event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("sequential crew pipeline should succeed");
+
+        assert_eq!(text, "灯灭后，信封仍停在两人之间。");
+        let snapshots = provenance.unwrap().subagent_results;
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].character_id, "A");
+        assert_eq!(snapshots[1].character_id, "B");
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| !snapshot.full_text.contains("不会传给下一位演员"))
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn continuation_mode_uses_one_writer_call_without_director_or_editor() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "你是执笔者".into(),
+            response_content: "林如没有立刻拆信，只把它推回灯下。".into(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_writer_pipeline_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let ctx = WritingContext::legacy(
+            vec![mock_character("林如")],
+            None,
+            conv_store.create(None, None).id,
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, _node_id, provenance) = orchestrator
+            .start_writing_with_mode(
+                "续写林如收到信后的反应".into(),
+                &ctx,
+                GenerationMode::Continuation,
+                event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("continuation writer should succeed");
+
+        assert_eq!(text, "林如没有立刻拆信，只把它推回灯下。");
+        let provenance = provenance.unwrap();
+        assert!(provenance.director_reasoning.is_none());
+        assert!(provenance.editor_reasoning.is_none());
+        assert!(provenance.writer_reasoning.is_some());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::DirectorStarted))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::EditorStarted))
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn full_regenerate_keeps_continuation_mode_and_lands_on_original_node() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "你是执笔者".into(),
+            response_content: "林如把信重新折好，压在未熄的灯下。".into(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_writer_regenerate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let conversation_id = conv_store.create(None, None).id;
+        let ctx =
+            WritingContext::legacy(vec![mock_character("林如")], None, conversation_id.clone());
+        let (start_tx, _start_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_start_cancel_tx, start_cancel_rx) = watch::channel(false);
+        let (_, node_id, _) = orchestrator
+            .start_writing_with_mode(
+                "续写林如收到信后的反应".into(),
+                &ctx,
+                GenerationMode::Continuation,
+                start_tx,
+                start_cancel_rx,
+            )
+            .await
+            .expect("initial continuation should succeed");
+        let variants_before = conv_store
+            .get(&conversation_id)
+            .unwrap()
+            .find_node(&node_id)
+            .unwrap()
+            .variants
+            .len();
+
+        let request = RegenerateRequest {
+            conversation_id: conversation_id.clone(),
+            node_id: node_id.clone(),
+            targets: vec![],
+            hint: Some("动作更克制".into()),
+            seed: Some(77),
+            generation_mode: Some(GenerationMode::Continuation),
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (text, provenance) = orchestrator
+            .regenerate(request, &ctx, event_tx, cancel_rx)
+            .await
+            .expect("continuation regenerate should succeed");
+
+        assert_eq!(text, "林如把信重新折好，压在未熄的灯下。");
+        assert_eq!(provenance.seed, 77);
+        assert_eq!(provenance.last_hint.as_deref(), Some("动作更克制"));
+        let node = conv_store
+            .get(&conversation_id)
+            .unwrap()
+            .find_node(&node_id)
+            .unwrap()
+            .clone();
+        assert_eq!(node.variants.len(), variants_before + 1);
+        assert_eq!(node.active().unwrap().content, text);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::WriterStarted))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::DirectorStarted))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::EditorStarted))
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn product_modes_reject_legacy_partial_rerolls() {
+        let (mut orchestrator, _conv_store, conversation_id, node_id, conv_dir) =
+            setup_with_first_draft().await;
+        let ctx = WritingContext::legacy(
+            vec![mock_character("Seraphina")],
+            None,
+            conversation_id.clone(),
+        );
+        let request = RegenerateRequest {
+            conversation_id,
+            node_id,
+            targets: vec![PartialRollTarget::Editor],
+            generation_mode: Some(GenerationMode::SequentialCrew),
+            hint: None,
+            seed: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let error = orchestrator
+            .regenerate(request, &ctx, event_tx, cancel_rx)
+            .await
+            .expect_err("product modes must reject artifact-incompatible partial rerolls");
+
+        assert!(matches!(
+            error,
+            PipelineError::Regenerate(message) if message.contains("仅支持整体重写")
+        ));
+        assert!(
+            !std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, PipelineEvent::EditorStarted))
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    #[tokio::test]
+    async fn duet_mode_runs_a_b_a_beats_then_editor_lite_without_director() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![
+            MockScript {
+                match_keyword: "顺序剧组演员协议".into(),
+                response_content: serde_json::json!({
+                    "narrative": "演员改变了站位。",
+                    "dialogue": "轮到你回答。",
+                    "inner_thoughts": "未说出口的判断。",
+                    "scene_close": false
+                })
+                .to_string(),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: "对手戏场记定稿员".into(),
+                response_content: "A 移开半步，把回答留给 B。".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+        ]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_duet_pipeline_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let mut orchestrator = PipelineOrchestrator::new(
+            llm,
+            conv_store.clone(),
+            Arc::new(ToolContext::empty()),
+            None,
+        );
+        let ctx = WritingContext::legacy(
+            vec![mock_character("A"), mock_character("B")],
+            None,
+            conv_store.create(None, None).id,
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, _node_id, provenance) = orchestrator
+            .start_writing_with_mode(
+                "A 先逼问 B".into(),
+                &ctx,
+                GenerationMode::Duet,
+                event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect("duet pipeline should succeed");
+
+        assert_eq!(text, "A 移开半步，把回答留给 B。");
+        let provenance = provenance.unwrap();
+        assert_eq!(
+            provenance
+                .subagent_results
+                .iter()
+                .map(|snapshot| snapshot.character_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "A"]
+        );
+        assert!(
+            provenance
+                .subagent_results
+                .iter()
+                .all(|snapshot| !snapshot.full_text.contains("未说出口"))
+        );
+        assert!(provenance.director_reasoning.is_none());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PipelineEvent::DirectorStarted))
+        );
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
     }
 
     /// 集成测试：用 MockLlmClient 跑完整 Director → Subagent → Editor 闭环
@@ -3946,6 +5064,7 @@ mod tests {
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: vec![PartialRollTarget::Editor],
+            generation_mode: None,
             hint: Some("节奏太快".into()),
             seed: None,
         };
@@ -3986,6 +5105,7 @@ mod tests {
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: vec![PartialRollTarget::Editor],
+            generation_mode: None,
             hint: None,
             seed: None,
         };
@@ -4027,6 +5147,7 @@ mod tests {
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: vec![], // 空 = 整体重 roll
+            generation_mode: None,
             hint: Some("角色 B 语气太冷".into()),
             seed: Some(42),
         };
@@ -4074,6 +5195,7 @@ mod tests {
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: vec![PartialRollTarget::Director], // 只重导演
+            generation_mode: None,
             hint: None,
             seed: None,
         };
@@ -4119,6 +5241,7 @@ mod tests {
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: vec![PartialRollTarget::Subagent(target_char.clone())],
+            generation_mode: None,
             hint: Some("语气太冷".into()),
             seed: None,
         };
@@ -4238,6 +5361,7 @@ mod tests {
             seed: 7,
             last_hint: None,
             director_reasoning: None,
+            writer_reasoning: None,
             editor_reasoning: None,
         };
 
@@ -4252,6 +5376,7 @@ mod tests {
                 PartialRollTarget::Subagent("Beta".into()),
                 PartialRollTarget::Subagent("Alpha".into()),
             ],
+            generation_mode: None,
             hint: None,
             seed: None,
         };

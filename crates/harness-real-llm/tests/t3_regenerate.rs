@@ -120,6 +120,7 @@ async fn regenerate_with_retry(
             conversation_id: conv_id.clone(),
             node_id: node_id.clone(),
             targets: targets.clone(),
+            generation_mode: None,
             hint: hint.clone(),
             seed: None,
         };
@@ -253,6 +254,7 @@ async fn t3_regenerate_director_only() {
         conversation_id: conv_id.clone(),
         node_id: node_id.clone(),
         targets: vec![PartialRollTarget::Director],
+        generation_mode: None,
         hint: None,
         seed: None,
     };

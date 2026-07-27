@@ -23,6 +23,8 @@ import {
   regenerate as apiRegenerate,
   editVariant as apiEditVariant,
   acceptVariant as apiAcceptVariant,
+  getActiveTurnReceipt as apiGetActiveTurnReceipt,
+  retryActiveTurnPostprocess as apiRetryActiveTurnPostprocess,
   deleteMessageFrom as apiDeleteMessageFrom,
   addVariant as apiAddVariant,
   switchVariant as apiSwitchVariant,
@@ -49,7 +51,10 @@ import { assistantRoleLabel } from '../utils/roleLabel.js'
  *   askForceAccept?: (message: string, options?: object) => Promise<boolean> | boolean,
  *   startWriting?: (intent: string, skipLocalPush?: boolean) => Promise<void>,
  *   beginPromptHookGeneration?: () => number,
- *   acceptVariantApi?: (conversationId: string, nodeId: string, forceAccept?: boolean) => Promise<unknown>,
+ *   regenerateApi?: (request: object, onEvent?: (event: object) => void) => Promise<unknown>,
+ *   acceptVariantApi?: (conversationId: string, nodeId: string, forceAccept?: boolean, selectedMutationIndices?: number[] | null) => Promise<unknown>,
+ *   getActiveTurnReceiptApi?: (campaignId: string, nodeId: string) => Promise<object | null>,
+ *   retryActiveTurnPostprocessApi?: (campaignId: string, nodeId: string) => Promise<object | null>,
  *   deleteMessageFromApi?: (conversationId: string, nodeId: string) => Promise<unknown>,
  *   getConversationApi?: (conversationId: string) => Promise<object | null>,
  * }} [options]
@@ -70,7 +75,11 @@ export function useMessageVariants(options = {}) {
   const alertDialog = options.alertDialog || ((msg) => { console.error('alertDialog(未注入):', msg) })
   const startWriting = options.startWriting || (() => { console.error('useMessageVariants: startWriting 未注入') })
   const beginPromptHookGeneration = options.beginPromptHookGeneration || (() => 0)
+  const regenerateApi = options.regenerateApi || apiRegenerate
   const acceptVariantApi = options.acceptVariantApi || apiAcceptVariant
+  const getActiveTurnReceiptApi = options.getActiveTurnReceiptApi || apiGetActiveTurnReceipt
+  const retryActiveTurnPostprocessApi =
+    options.retryActiveTurnPostprocessApi || apiRetryActiveTurnPostprocess
   const deleteMessageFromApi = options.deleteMessageFromApi || apiDeleteMessageFrom
   const getConversationApi = options.getConversationApi || getConversation
   const askForceAccept = options.askForceAccept || (async (message, dialogOptions) => {
@@ -144,10 +153,11 @@ export function useMessageVariants(options = {}) {
 
     try {
       beginPromptHookGeneration()
-      const result = await apiRegenerate({
+      const result = await regenerateApi({
         conversationId: campaignStore.currentConversationId,
         nodeId: messageId,
         targets,
+        generationMode: campaignStore.activeCampaign ? writingStore.generationMode : null,
         hint,
       }, (event) => handlePipelineEvent(event))
 
@@ -198,10 +208,31 @@ export function useMessageVariants(options = {}) {
 
   // 来源 App.vue:906-919 handleAcceptVariant
   // Quality Error 默认拦截；用户确认后 forceAccept → Degraded
-  async function handleAcceptVariant({ nodeId, forceAccept = false } = {}) {
+  async function handleAcceptVariant({
+    nodeId,
+    forceAccept = false,
+    selectedMutationIndices = null,
+    skipReceipt = false,
+  } = {}) {
     if (!campaignStore.currentConversationId) return
     const { variant, key } = acceptVariantIdentity(nodeId)
     if (variant?.status === 'final' || publishedTerminalAccepts.has(key)) return
+    if (
+      campaignStore.activeCampaign?.id &&
+      !skipReceipt &&
+      selectedMutationIndices === null
+    ) {
+      try {
+        const receipt = await getActiveTurnReceiptApi(campaignStore.activeCampaign.id, nodeId)
+        if (receipt) {
+          writingStore.openTurnReceipt(nodeId, receipt)
+          return
+        }
+      } catch (error) {
+        console.error('读取采纳小票失败:', error)
+        return
+      }
+    }
     // Keep the normal quality-gate attempt distinct from its later force retry.
     // Concurrent attempts of the same flavor share one promise; a direct force
     // click and a dialog-confirmed force retry also converge on the force key.
@@ -211,7 +242,12 @@ export function useMessageVariants(options = {}) {
 
     const task = (async () => {
       try {
-        await acceptVariantApi(campaignStore.currentConversationId, nodeId, forceAccept)
+        await acceptVariantApi(
+          campaignStore.currentConversationId,
+          nodeId,
+          forceAccept,
+          selectedMutationIndices,
+        )
         const msg = writingStore.messages.find((m) => m.id === nodeId)
         if (msg) {
           const acceptedVariant = msg.variants[msg.active_variant]
@@ -221,6 +257,7 @@ export function useMessageVariants(options = {}) {
         // fan-out. Mark before broadcasting so any synchronous/re-entrant
         // caller observes the terminal state too.
         rememberPublishedTerminalAccept(key)
+        writingStore.clearTurnReceipt()
         broadcastPluginEvent(ST_EVENT_TYPES.MESSAGE_RECEIVED, messageEventPayload(nodeId, {
           reason: 'accept_variant',
           terminalTurnCommit: true,
@@ -238,7 +275,12 @@ export function useMessageVariants(options = {}) {
               { title: '强制采纳确认', kind: 'warning' },
             )
             if (ok) {
-              return handleAcceptVariant({ nodeId, forceAccept: true })
+              return handleAcceptVariant({
+                nodeId,
+                forceAccept: true,
+                selectedMutationIndices: null,
+                skipReceipt: true,
+              })
             }
           } catch (dialogErr) {
             console.error('强制采纳确认失败:', dialogErr)
@@ -252,6 +294,25 @@ export function useMessageVariants(options = {}) {
       return await task
     } finally {
       pendingAccepts.delete(pendingKey)
+    }
+  }
+
+  async function handleRetryPostprocess({ nodeId } = {}) {
+    const campaignId = campaignStore.activeCampaign?.id
+    if (!campaignId || !nodeId) return
+    if (writingStore.pendingReceipt?.nodeId === nodeId) {
+      writingStore.pendingReceipt.retrying = true
+      writingStore.pendingReceipt.retry_error = null
+    }
+    try {
+      const receipt = await retryActiveTurnPostprocessApi(campaignId, nodeId)
+      if (receipt) writingStore.openTurnReceipt(nodeId, receipt)
+    } catch (error) {
+      console.error('重试记账失败:', error)
+      if (writingStore.pendingReceipt?.nodeId === nodeId) {
+        writingStore.pendingReceipt.retrying = false
+        writingStore.pendingReceipt.retry_error = String(error?.message || error || '')
+      }
     }
   }
 
@@ -311,10 +372,11 @@ export function useMessageVariants(options = {}) {
 
     try {
       beginPromptHookGeneration()
-      await apiRegenerate({
+      await regenerateApi({
         conversationId: campaignStore.currentConversationId,
         nodeId: aiMsg.id,
         targets: [],       // 空 = 整体重 roll
+        generationMode: campaignStore.activeCampaign ? writingStore.generationMode : null,
         hint: intent,       // user 的意图作为 hint 注入导演+编剧
       }, (event) => handlePipelineEvent(event))
 
@@ -431,6 +493,7 @@ export function useMessageVariants(options = {}) {
     handleReroll,
     handleEditVariant,
     handleAcceptVariant,
+    handleRetryPostprocess,
     handleDeleteVariant,
     handleRerollUser,
     handleBranch,

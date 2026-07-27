@@ -270,6 +270,8 @@ impl HarnessEnv {
         let outcome = PostProcessOutcome {
             summary: summary_text,
             post_process: None,
+            summary_attempted: true,
+            post_process_attempted: false,
         };
         let runner: Arc<dyn PostprocessRunner> = Arc::new(FixedPostprocessRunner {
             outcome: Some(outcome),

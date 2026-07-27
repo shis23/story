@@ -232,6 +232,7 @@ pub async fn run_quality_gate_with_optional_editor_autofix(
             conversation_id: conversation_id.clone(),
             node_id: draft_node_id.clone(),
             targets: vec![PartialRollTarget::Editor],
+            generation_mode: None,
             hint: Some(hint),
             seed: None,
         };
@@ -645,6 +646,8 @@ impl<'a> ProductionPostprocessService<'a> {
             Some(o) => DerivationComponents {
                 summary_derivation: if o.summary.is_some() {
                     DerivationStatus::Succeeded
+                } else if o.summary_attempted {
+                    DerivationStatus::Failed
                 } else {
                     DerivationStatus::Disabled
                 },
@@ -654,6 +657,8 @@ impl<'a> ProductionPostprocessService<'a> {
                     } else {
                         DerivationStatus::Failed
                     }
+                } else if o.post_process_attempted {
+                    DerivationStatus::Failed
                 } else {
                     DerivationStatus::Disabled
                 },
@@ -1431,6 +1436,8 @@ mod tests {
                 parse_succeeded: true,
                 ..Default::default()
             }),
+            summary_attempted: true,
+            post_process_attempted: true,
         }
     }
 
@@ -1627,6 +1634,8 @@ mod tests {
                 parse_succeeded: true,
                 ..Default::default()
             }),
+            summary_attempted: false,
+            post_process_attempted: true,
         };
         let sink = fx.sink();
         let (_tx, cancel_rx) = watch::channel(false);
@@ -1706,6 +1715,8 @@ mod tests {
                 parse_succeeded: true,
                 ..Default::default()
             }),
+            summary_attempted: false,
+            post_process_attempted: true,
         };
         let present = vec!["苏禾".to_string()];
 
@@ -1829,6 +1840,8 @@ mod tests {
                     parse_succeeded: false,
                     ..Default::default()
                 }),
+                summary_attempted: true,
+                post_process_attempted: true,
             }),
         });
         let sink = fx.sink();
@@ -1856,7 +1869,7 @@ mod tests {
         assert!(result.applied);
         assert_eq!(
             result.derivation.summary_derivation,
-            DerivationStatus::Disabled
+            DerivationStatus::Failed
         );
         assert_eq!(result.derivation.state_derivation, DerivationStatus::Failed);
         let turn = fx.turn_store.get_turn(&turn_id).unwrap();

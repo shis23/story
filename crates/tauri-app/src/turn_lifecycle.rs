@@ -175,6 +175,7 @@ pub enum AcceptError {
     QualityBlocked {
         error_count: usize,
     },
+    DerivationFailed,
     RevisionConflict {
         base: u64,
         current: u64,
@@ -209,6 +210,10 @@ impl std::fmt::Display for AcceptError {
             Self::QualityBlocked { error_count } => write!(
                 f,
                 "质量门禁拦截：存在 {error_count} 个 Error 级问题。可修复后重 roll，或 force_accept=true 强制接受（将标记为 Degraded）。"
+            ),
+            Self::DerivationFailed => write!(
+                f,
+                "记账推导存在失败项。请先重试后处理，或 force_accept=true 明确降级采纳（Turn 将标记为 Degraded）。"
             ),
             Self::RevisionConflict { base, current } => write!(
                 f,
@@ -437,10 +442,18 @@ impl<'a> TurnLifecycleService<'a> {
             )));
         }
 
+        let derivation_failed = attempt
+            .derivation
+            .as_ref()
+            .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
+        if derivation_failed && !force_accept {
+            return Err(AcceptError::DerivationFailed);
+        }
+
         let quality_decision =
             quality_accept_decision(attempt.quality_report.as_ref(), force_accept);
         let commit_as_degraded = match &quality_decision {
-            QualityAcceptDecision::AllowCommit => false,
+            QualityAcceptDecision::AllowCommit => derivation_failed,
             QualityAcceptDecision::ForceDegraded { .. } => true,
             QualityAcceptDecision::Block { error_count } => {
                 return Err(AcceptError::QualityBlocked {
@@ -766,7 +779,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use storyforge_domain::campaign::Campaign;
-    use storyforge_domain::turn::{QualityReport, QualityWarning, QualityWarningCode};
+    use storyforge_domain::turn::{
+        DerivationComponents, DerivationStatus, QualityReport, QualityWarning, QualityWarningCode,
+    };
 
     struct Fixture {
         _data_dir: std::path::PathBuf,
@@ -1023,6 +1038,61 @@ mod tests {
             .service()
             .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, true)
             .expect("force accept");
+        assert_eq!(outcome.turn_status, TurnStatus::Degraded);
+        assert!(outcome.commit_as_degraded);
+    }
+
+    #[test]
+    fn accept_requires_explicit_force_when_derivation_failed() {
+        let fx = Fixture::new("derivation_failed_block");
+        let draft = "后处理解析失败，但正文仍可由用户选择降级采纳。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let record = fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        fx.turn_store
+            .with_turn_mut(&record.turn_id, |turn| {
+                turn.active_attempt_mut().unwrap().derivation = Some(DerivationComponents {
+                    summary_derivation: DerivationStatus::Succeeded,
+                    state_derivation: DerivationStatus::Failed,
+                });
+            })
+            .unwrap();
+
+        let err = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, false)
+            .expect_err("failed derivation needs explicit degraded accept");
+        assert!(matches!(err, AcceptError::DerivationFailed));
+    }
+
+    #[test]
+    fn force_accept_marks_failed_derivation_degraded() {
+        let fx = Fixture::new("derivation_failed_force");
+        let draft = "后处理解析失败后，用户明确选择降级采纳。".repeat(3);
+        let variant_id = fx.append_draft(&draft);
+        let record = fx.prepare_awaiting(
+            &variant_id,
+            &draft,
+            Some(QualityReport { warnings: vec![] }),
+            None,
+        );
+        fx.turn_store
+            .with_turn_mut(&record.turn_id, |turn| {
+                turn.active_attempt_mut().unwrap().derivation = Some(DerivationComponents {
+                    summary_derivation: DerivationStatus::Succeeded,
+                    state_derivation: DerivationStatus::Failed,
+                });
+            })
+            .unwrap();
+
+        let outcome = fx
+            .service()
+            .accept_by_variant(&fx.campaign_id, &fx.conversation_id, &variant_id, true)
+            .expect("explicit force accept should preserve draft as degraded");
         assert_eq!(outcome.turn_status, TurnStatus::Degraded);
         assert!(outcome.commit_as_degraded);
     }

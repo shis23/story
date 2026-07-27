@@ -18,6 +18,8 @@ use crate::world_info::WorldInfoEntry;
 pub enum AgentRole {
     /// 导演：解析意图、查资料、分配任务
     Director,
+    /// 执笔者：在续写档中直接消费编译案卷并输出正文
+    Writer,
     /// 子 Agent：按角色表演（附带角色 ID，"*" 表示通配符，对所有子 Agent 生效）
     Subagent(String),
     /// 编剧：收集子产出、合并润色
@@ -74,6 +76,7 @@ impl AgentRole {
     fn as_str(&self) -> &'static str {
         match self {
             AgentRole::Director => "Director",
+            AgentRole::Writer => "Writer",
             AgentRole::Editor => "Editor",
             AgentRole::Meta => "Meta",
             AgentRole::CharacterExtractor => "CharacterExtractor",
@@ -87,6 +90,7 @@ impl AgentRole {
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "Director" => Some(AgentRole::Director),
+            "Writer" => Some(AgentRole::Writer),
             "Editor" => Some(AgentRole::Editor),
             "Meta" => Some(AgentRole::Meta),
             "CharacterExtractor" => Some(AgentRole::CharacterExtractor),
@@ -101,6 +105,7 @@ impl std::fmt::Display for AgentRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Director => write!(f, "导演"),
+            Self::Writer => write!(f, "执笔者"),
             Self::Subagent(id) => write!(f, "子Agent({id})"),
             Self::Editor => write!(f, "编剧"),
             Self::Meta => write!(f, "Meta"),
@@ -431,6 +436,10 @@ pub enum PipelineEvent {
     },
     /// 子 Agent 取消
     SubagentCancelled { character_id: String, index: usize },
+    /// 续写档执笔者开始
+    WriterStarted,
+    /// 续写档执笔者流式进度
+    WriterProgress { delta: String },
     /// 编剧开始
     EditorStarted,
     /// 编剧流式进度
@@ -500,6 +509,7 @@ mod tests {
     fn agent_role_unit_variants_roundtrip() {
         for role in [
             AgentRole::Director,
+            AgentRole::Writer,
             AgentRole::Editor,
             AgentRole::Meta,
             AgentRole::CharacterExtractor,

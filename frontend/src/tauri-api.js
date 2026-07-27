@@ -497,7 +497,7 @@ export async function testConnection(req) {
  * @param {string|null} openingMessage - 新建 legacy 对话时使用的角色卡开场白
  * @returns {Promise<{text: string, conversation_id: string, node_id: string}>} 写作结果（含对话/节点 ID 供重 roll）
  */
-export async function startWriting(intent, characterId, onEvent, conversationId, openingMessage) {
+export async function startWriting(intent, characterId, onEvent, conversationId, openingMessage, generationMode) {
   if (isTauri()) {
     const { Channel } = await import('@tauri-apps/api/core')
     const channel = new Channel()
@@ -509,6 +509,7 @@ export async function startWriting(intent, characterId, onEvent, conversationId,
       characterId: characterId || null,
       conversationId: conversationId || null,
       openingMessage: openingMessage || null,
+      generationMode: generationMode || null,
       onEvent: channel,
     })
   }
@@ -545,7 +546,7 @@ export async function cancelWriting() {
 /**
  * 重 roll（整体/只重编剧/只重某子 Agent，可附 hint）
  *
- * @param {Object} req - { conversationId, nodeId, targets: [{kind}], hint?, seed? }
+ * @param {Object} req - { conversationId, nodeId, targets: [{kind}], generationMode?, hint?, seed? }
  *   kind: 'director' | 'editor' | 'subagent:<角色名>'；targets 为空 = 整体重 roll
  * @param {function} onEvent - 事件回调
  * @returns {Promise<string>} 新 variant 的成文
@@ -562,6 +563,7 @@ export async function regenerate(req, onEvent) {
         conversation_id: req.conversationId,
         node_id: req.nodeId,
         targets: req.targets || [],
+        generation_mode: req.generationMode || null,
         hint: req.hint || null,
         seed: req.seed ?? null,
       },
@@ -612,12 +614,18 @@ export async function editVariant(conversationId, nodeId, newContent) {
 /** 采纳当前变体（Draft → Final）
  * @param {boolean} [forceAccept=false] Quality Error 时需二次确认后传 true → Degraded
  */
-export async function acceptVariant(conversationId, nodeId, forceAccept = false) {
+export async function acceptVariant(
+  conversationId,
+  nodeId,
+  forceAccept = false,
+  selectedMutationIndices = null,
+) {
   if (isTauri()) {
     return await invoke('accept_variant', {
       conversationId,
       nodeId,
       forceAccept: !!forceAccept,
+      selectedMutationIndices,
     })
   }
 }
@@ -1364,6 +1372,22 @@ export async function listRoundSummaries(campaignId) {
 export async function getActiveTurnQuality(campaignId) {
   if (isTauri()) {
     return await invoke('get_active_turn_quality', { campaignId })
+  }
+  return null
+}
+
+/** 读取 Campaign 当前草稿的 Accept-before 记账小票。 */
+export async function getActiveTurnReceipt(campaignId, nodeId) {
+  if (isTauri()) {
+    return await invoke('get_active_turn_receipt', { campaignId, nodeId })
+  }
+  return null
+}
+
+/** 仅重跑当前草稿的 Summarizer + PostProcessor，并返回新小票。 */
+export async function retryActiveTurnPostprocess(campaignId, nodeId) {
+  if (isTauri()) {
+    return await invoke('retry_active_turn_postprocess', { campaignId, nodeId })
   }
   return null
 }

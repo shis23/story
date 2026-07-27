@@ -81,6 +81,17 @@ export function usePipeline(handlers = {}) {
           writing.pipeline.subagents[event.data.index].status = 'cancelled'
         }
         break
+      case 'writer_started':
+        writing.pipeline.stateLabel = '执笔者续写'
+        writing.pipeline.editor = { status: 'running', detail: '读取回合案卷 · 直接成文', output: '' }
+        break
+      case 'writer_progress':
+        if (writing.pipeline.editor.status !== 'running') {
+          writing.pipeline.editor = { status: 'running', detail: '执笔中', output: '' }
+        }
+        writing.pipeline.editor.output += event.data.delta || ''
+        if (scrollToBottom) scrollToBottom()
+        break
       case 'editor_started':
         writing.pipeline.stateLabel = '编剧合并'
         writing.pipeline.editor = { status: 'running', detail: '合并 · 润色 · 成文', output: '' }

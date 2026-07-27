@@ -795,6 +795,7 @@ pub fn build_provenance(
         seed,
         last_hint,
         director_reasoning: None,
+        writer_reasoning: None,
         editor_reasoning: None,
     }
 }
@@ -848,6 +849,7 @@ pub fn build_provenance_with_campaign(
         seed,
         last_hint,
         director_reasoning: None,
+        writer_reasoning: None,
         editor_reasoning: None,
     }
 }
@@ -1363,6 +1365,7 @@ mod tests {
             seed: 42,
             last_hint: None,
             director_reasoning: None,
+            writer_reasoning: None,
             editor_reasoning: None,
         };
         // 先加一个带 Provenance 的变体
@@ -1459,6 +1462,7 @@ mod tests {
             seed: 0,
             last_hint: None,
             director_reasoning: None,
+            writer_reasoning: None,
             editor_reasoning: None,
         }
     }

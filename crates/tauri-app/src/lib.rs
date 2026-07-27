@@ -2200,6 +2200,11 @@ impl WritingEvent {
                     "index": index,
                 }),
             ),
+            PipelineEvent::WriterStarted => ("writer_started".into(), serde_json::json!({})),
+            PipelineEvent::WriterProgress { delta } => (
+                "writer_progress".into(),
+                serde_json::json!({ "delta": delta }),
+            ),
             PipelineEvent::EditorStarted => ("editor_started".into(), serde_json::json!({})),
             PipelineEvent::EditorProgress { delta } => (
                 "editor_progress".into(),
@@ -2438,12 +2443,215 @@ async fn quality_gate_with_optional_editor_autofix(
     .await
 }
 
+#[derive(Debug, Clone)]
+struct RouteActorSignal {
+    id: String,
+    name: String,
+    agenda: Option<String>,
+    private_facts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RouteTaskSignal {
+    related_actor_ids: Vec<String>,
+    imminent: bool,
+}
+
+fn normalized_route_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace() && !character.is_ascii_punctuation())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn private_fact_is_relevant(intent: &str, fact: &str) -> bool {
+    let intent = normalized_route_text(intent);
+    let fact = normalized_route_text(fact);
+    if fact.is_empty() || intent.is_empty() {
+        return false;
+    }
+    if intent.contains(&fact) {
+        return true;
+    }
+    let chars = fact.chars().collect::<Vec<_>>();
+    const ROUTE_STOP_FRAGMENTS: &[&str] = &[
+        "已经", "知道", "他们", "她们", "自己", "这个", "那个", "因为", "所以", "但是",
+    ];
+    chars
+        .windows(2)
+        .map(|window| window.iter().collect::<String>())
+        .any(|fragment| {
+            !ROUTE_STOP_FRAGMENTS.contains(&fragment.as_str()) && intent.contains(&fragment)
+        })
+}
+
+fn generation_route_signals_from_parts(
+    intent: &str,
+    actors: &[RouteActorSignal],
+    tasks: &[RouteTaskSignal],
+    explicit_mode: Option<storyforge_domain::generation::GenerationMode>,
+) -> storyforge_domain::generation::GenerationRouteSignals {
+    use storyforge_domain::generation::GenerationRouteSignals;
+
+    let large_scene_intent = [
+        "全员",
+        "所有人",
+        "众人",
+        "群像",
+        "宴会",
+        "舞会",
+        "会议",
+        "集会",
+        "战场",
+        "围攻",
+        "审判",
+        "多人",
+    ]
+    .iter()
+    .any(|keyword| intent.contains(keyword));
+    let high_tension = [
+        "对峙", "质问", "争吵", "冲突", "威胁", "决裂", "打斗", "厮杀", "紧张", "逼问",
+    ]
+    .iter()
+    .any(|keyword| intent.contains(keyword));
+
+    let explicitly_named = actors
+        .iter()
+        .filter(|actor| intent.contains(&actor.name) || intent.contains(&actor.id))
+        .map(|actor| actor.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let task_related = tasks
+        .iter()
+        .filter(|task| task.imminent)
+        .flat_map(|task| task.related_actor_ids.iter().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    let mut selected_ids = explicitly_named
+        .union(&task_related)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    if large_scene_intent {
+        selected_ids.extend(actors.iter().map(|actor| actor.id.clone()));
+    }
+    if selected_ids.is_empty()
+        && let Some(actor) = actors.first()
+    {
+        selected_ids.insert(actor.id.clone());
+    }
+    let selected = actors
+        .iter()
+        .filter(|actor| selected_ids.contains(&actor.id))
+        .collect::<Vec<_>>();
+    let relevant_private_knowledge_divergence = selected.len() == 2
+        && selected.iter().any(|actor| {
+            actor
+                .private_facts
+                .iter()
+                .any(|fact| private_fact_is_relevant(intent, fact))
+        });
+    let opposing_agendas = selected.len() == 2
+        && selected[0]
+            .agenda
+            .as_deref()
+            .zip(selected[1].agenda.as_deref())
+            .is_some_and(|(left, right)| {
+                !left.trim().is_empty()
+                    && !right.trim().is_empty()
+                    && normalized_route_text(left) != normalized_route_text(right)
+            });
+
+    GenerationRouteSignals {
+        explicit_mode,
+        principal_actor_count: selected.len(),
+        large_scene_intent,
+        imminent_task_count: tasks.iter().filter(|task| task.imminent).count(),
+        direct_interaction: selected.len() == 2 && explicitly_named.len() >= 2,
+        relevant_private_knowledge_divergence,
+        opposing_agendas,
+        high_tension,
+    }
+}
+
+fn generation_route_signals(
+    intent: &str,
+    ctx: &WritingContext,
+    explicit_mode: Option<storyforge_domain::generation::GenerationMode>,
+) -> storyforge_domain::generation::GenerationRouteSignals {
+    use storyforge_domain::character_knowledge::PropagationPolicy;
+    use storyforge_domain::story_task::{TaskStatus, TaskTrigger};
+
+    if let Some(runtime) = ctx.campaign_runtime.as_ref() {
+        let actors = runtime
+            .instances
+            .iter()
+            .map(|instance| RouteActorSignal {
+                id: instance.id.to_string(),
+                name: instance.name.clone(),
+                agenda: instance
+                    .variables
+                    .iter()
+                    .find(|variable| {
+                        matches!(
+                            variable.key.as_str(),
+                            "agenda" | "current_desire" | "goal" | "ongoing_action"
+                        )
+                    })
+                    .map(|variable| {
+                        variable
+                            .value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| variable.value.to_string())
+                    }),
+                private_facts: runtime
+                    .knowledge_for_instance(instance)
+                    .into_iter()
+                    .filter(|knowledge| matches!(knowledge.propagation, PropagationPolicy::Private))
+                    .map(|knowledge| knowledge.knowledge_text.clone())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let tasks = ctx
+            .pending_tasks
+            .iter()
+            .map(|task| RouteTaskSignal {
+                related_actor_ids: task
+                    .related_characters
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                imminent: matches!(task.status, TaskStatus::Active)
+                    || task.triggers.iter().any(|trigger| {
+                        matches!(
+                            trigger,
+                            TaskTrigger::TurnReminder { at_turn }
+                                if *at_turn <= ctx.turn.saturating_add(1)
+                        )
+                    }),
+            })
+            .collect::<Vec<_>>();
+        return generation_route_signals_from_parts(intent, &actors, &tasks, explicit_mode);
+    }
+
+    let actors = ctx
+        .characters
+        .iter()
+        .map(|character| RouteActorSignal {
+            id: character.id.to_string(),
+            name: character.name.clone(),
+            agenda: None,
+            private_facts: vec![],
+        })
+        .collect::<Vec<_>>();
+    generation_route_signals_from_parts(intent, &actors, &[], explicit_mode)
+}
+
 #[tauri::command]
 async fn start_writing(
     intent: String,
     character_id: Option<String>,
     conversation_id: Option<String>,
     opening_message: Option<String>,
+    generation_mode: Option<storyforge_domain::generation::GenerationMode>,
     state: tauri::State<'_, Arc<AppState>>,
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<serde_json::Value, TauriCommandError> {
@@ -2561,12 +2769,28 @@ async fn start_writing(
     // Operation-owned cancel: pipeline / autofix / postprocess all clone this receiver.
     let (operation_id, cancel_rx) = begin_writing_operation(&app);
 
+    let route_decision = storyforge_domain::generation::route_generation_mode(
+        &generation_route_signals(&intent, &ctx, generation_mode),
+    );
+    tracing::info!(
+        mode = ?route_decision.mode,
+        reason = ?route_decision.reason,
+        explicit = generation_mode.is_some(),
+        "selected writing generation mode"
+    );
+
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
         app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
     let result = pipeline
-        .start_writing(intent, &ctx, event_tx.clone(), cancel_rx.clone())
+        .start_writing_with_mode(
+            intent,
+            &ctx,
+            route_decision.mode,
+            event_tx.clone(),
+            cancel_rx.clone(),
+        )
         .await;
 
     // ─── P2 后处理流水线（后台执行，不阻断成文返回）──────────────────────
@@ -2775,6 +2999,8 @@ async fn start_writing(
                     "text": text,
                     "conversation_id": conversation_id.to_string(),
                     "node_id": landed_draft_node_id.to_string(),
+                    "generation_mode": route_decision.mode,
+                    "generation_route_reason": route_decision.reason,
                 }));
             }
             Err(e) => {
@@ -2801,6 +3027,8 @@ async fn start_writing(
                 "text": text,
                 "conversation_id": conversation_id.to_string(),
                 "node_id": node_id.to_string(),
+                "generation_mode": route_decision.mode,
+                "generation_route_reason": route_decision.reason,
             }))
         }
         Err(e) => {
@@ -5507,6 +5735,8 @@ pub struct RegenerateRequestDto {
     pub node_id: String,
     /// 目标列表（空 = 整体重 roll）
     pub targets: Vec<RegenerateTargetDto>,
+    /// 当前产品写作模式；缺省时走旧版大场面兼容路径。
+    pub generation_mode: Option<storyforge_domain::generation::GenerationMode>,
     /// 附加提示词（可选）
     pub hint: Option<String>,
     /// 随机种子（可选）
@@ -5621,6 +5851,7 @@ async fn regenerate(
         conversation_id: conversation_id.clone(),
         node_id: node_id.clone(),
         targets,
+        generation_mode: req.generation_mode,
         hint: req.hint,
         seed: req.seed,
     };
@@ -6774,6 +7005,7 @@ fn message_variant_display_dto(
         // meta_explain_generation 显式审计命令按需返回，避免页面加载即下发。
         provenance: variant.provenance.clone().map(|mut provenance| {
             provenance.director_reasoning = None;
+            provenance.writer_reasoning = None;
             provenance.editor_reasoning = None;
             for subagent in &mut provenance.subagent_results {
                 subagent.reasoning_content = None;
@@ -7198,6 +7430,7 @@ async fn accept_variant(
     conversation_id: String,
     node_id: String,
     force_accept: Option<bool>,
+    selected_mutation_indices: Option<Vec<usize>>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), TauriCommandError> {
     let conv_id = Id::from_str(&conversation_id);
@@ -7207,6 +7440,7 @@ async fn accept_variant(
         conv_id,
         nid,
         force_accept.unwrap_or(false),
+        selected_mutation_indices,
     )
     .await
 }
@@ -7216,6 +7450,7 @@ async fn accept_variant_async(
     conv_id: Id,
     node_id: Id,
     force_accept: bool,
+    selected_mutation_indices: Option<Vec<usize>>,
 ) -> Result<(), TauriCommandError> {
     // Phase A: Campaign 模式分流
     let active_campaign = {
@@ -7231,6 +7466,18 @@ async fn accept_variant_async(
 
     if let Some(campaign_id) = active_campaign {
         // Campaign 模式 → TurnCommit
+        if let Some(selected) = selected_mutation_indices.as_deref() {
+            // A committed replay has no active Turn left. In that case skip the
+            // already-applied receipt selection and let commit_turn_attempt
+            // return its existing idempotent result.
+            if get_active_turn_for_backend(&campaign_id)
+                .map_err(TauriCommandError::internal)?
+                .is_some()
+            {
+                apply_turn_receipt_selection(&campaign_id, &node_id, selected)
+                    .map_err(TauriCommandError::validation)?;
+            }
+        }
         commit_turn_attempt(&state, &campaign_id, &conv_id, &node_id, force_accept).await?;
     } else {
         // 非 Campaign 模式 → 保持现有行为（无 Turn quality 报告）
@@ -11566,6 +11813,442 @@ pub struct ActiveTurnQualityDto {
     pub warnings: Vec<String>,
 }
 
+/// Accept 前展示给用户的单条候选状态变化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnReceiptItemDto {
+    /// 对应 Prepared MutationBatch 中的稳定下标，确认时原样回传。
+    pub mutation_index: usize,
+    /// chronicle / knowledge / variable / task
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub selected_by_default: bool,
+}
+
+/// Campaign Turn 的 Accept-before 小票。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTurnReceiptDto {
+    pub turn_id: String,
+    pub attempt_id: String,
+    pub variant_id: String,
+    pub status: String,
+    pub ready: bool,
+    pub derivation_failed: bool,
+    pub can_retry: bool,
+    pub can_degraded_accept: bool,
+    pub notice: Option<String>,
+    pub items: Vec<TurnReceiptItemDto>,
+}
+
+fn mutation_is_receipt_reviewable(mutation: &storyforge_domain::turn::Mutation) -> bool {
+    !matches!(
+        mutation,
+        storyforge_domain::turn::Mutation::FinalizeVariant { .. }
+            | storyforge_domain::turn::Mutation::UpsertInstance(_)
+    )
+}
+
+fn receipt_items_from_batch(
+    batch: &storyforge_domain::turn::MutationBatch,
+) -> Vec<TurnReceiptItemDto> {
+    use storyforge_domain::turn::Mutation;
+
+    batch
+        .mutations
+        .iter()
+        .enumerate()
+        .filter_map(|(mutation_index, mutation)| {
+            let (kind, title, detail) = match mutation {
+                Mutation::UpsertSummary(summary) => (
+                    "chronicle",
+                    summary
+                        .headline
+                        .clone()
+                        .unwrap_or_else(|| "本轮纪要（Chronicle A）".into()),
+                    summary.content.clone(),
+                ),
+                Mutation::UpsertKnowledge(knowledge) => (
+                    "knowledge",
+                    "角色知识更新".into(),
+                    format!(
+                        "{} 得知：{}",
+                        knowledge.character_id, knowledge.knowledge_text
+                    ),
+                ),
+                Mutation::SetVariable {
+                    instance_id,
+                    key,
+                    value,
+                    ..
+                } => {
+                    let target = instance_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "Campaign".into());
+                    (
+                        "variable",
+                        format!("变量 · {key}"),
+                        format!("{target}: {key} → {value}"),
+                    )
+                }
+                Mutation::SetTaskStatus { task_id, status } => (
+                    "task",
+                    "任务状态变化".into(),
+                    format!("任务 {task_id} → {status:?}"),
+                ),
+                Mutation::UpsertNewTask(task) => (
+                    "task",
+                    format!("新任务 · {}", task.title),
+                    task.description.clone(),
+                ),
+                Mutation::FinalizeVariant { .. } | Mutation::UpsertInstance(_) => return None,
+            };
+            Some(TurnReceiptItemDto {
+                mutation_index,
+                kind: kind.into(),
+                title,
+                detail,
+                selected_by_default: true,
+            })
+        })
+        .collect()
+}
+
+/// 按小票勾选结果裁剪候选变更。正文 Finalize 与临时角色实例属于结构性
+/// mutation，始终保留，避免引用断裂；其余未勾选项不参与 Accept。
+fn retain_selected_receipt_mutations(
+    batch: &mut storyforge_domain::turn::MutationBatch,
+    selected_mutation_indices: &[usize],
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    if selected_mutation_indices
+        .iter()
+        .any(|index| *index >= batch.mutations.len())
+    {
+        return Err("小票包含已经失效的 mutation 下标，请刷新后重试".into());
+    }
+    let selected: HashSet<usize> = selected_mutation_indices.iter().copied().collect();
+    batch.mutations = std::mem::take(&mut batch.mutations)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mutation)| {
+            if !mutation_is_receipt_reviewable(&mutation) || selected.contains(&index) {
+                Some(mutation)
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(())
+}
+
+fn active_turn_receipt_from_record(
+    turn: &storyforge_domain::turn::TurnRecord,
+    variant_id: &Id,
+) -> Option<ActiveTurnReceiptDto> {
+    use storyforge_domain::turn::AttemptStatus;
+
+    let attempt = turn.find_attempt_by_variant(variant_id)?;
+    let derivation_failed = attempt
+        .derivation
+        .as_ref()
+        .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
+    let ready = attempt.status == AttemptStatus::AwaitingAcceptance;
+    let notice = if derivation_failed {
+        Some("记账推导有失败项：可重试，或明确降级采纳正文。".into())
+    } else if ready && attempt.pending_state_changes.is_none() {
+        Some("本轮没有可写入的纪要或状态变化。".into())
+    } else if !ready {
+        Some("记账仍在生成，请稍后刷新。".into())
+    } else {
+        None
+    };
+    Some(ActiveTurnReceiptDto {
+        turn_id: turn.turn_id.to_string(),
+        attempt_id: attempt.attempt_id.to_string(),
+        variant_id: attempt.variant_id.to_string(),
+        status: format!("{:?}", attempt.status),
+        ready,
+        derivation_failed,
+        can_retry: ready && derivation_failed,
+        can_degraded_accept: ready && derivation_failed,
+        notice,
+        items: attempt
+            .pending_state_changes
+            .as_ref()
+            .map(receipt_items_from_batch)
+            .unwrap_or_default(),
+    })
+}
+
+/// 读取活动 Attempt 的 Accept-before 小票，不修改任何状态。
+#[tauri::command]
+fn get_active_turn_receipt(
+    campaign_id: String,
+    node_id: String,
+) -> Result<Option<ActiveTurnReceiptDto>, TauriCommandError> {
+    let campaign_id = Id::from_str(&campaign_id);
+    let variant_id = Id::from_str(&node_id);
+    let Some(turn) =
+        get_active_turn_for_backend(&campaign_id).map_err(TauriCommandError::internal)?
+    else {
+        return Ok(None);
+    };
+    Ok(active_turn_receipt_from_record(&turn, &variant_id))
+}
+
+fn apply_turn_receipt_selection(
+    campaign_id: &Id,
+    variant_id: &Id,
+    selected_mutation_indices: &[usize],
+) -> Result<(), String> {
+    use storyforge_domain::turn::{AttemptStatus, MutationBatchStatus, TurnStatus};
+
+    let turn = get_active_turn_for_backend(campaign_id)?
+        .ok_or_else(|| "当前 Campaign 没有待采纳 Turn".to_string())?;
+    let turn_id = turn.turn_id.clone();
+    let attempt_id = turn
+        .find_attempt_by_variant(variant_id)
+        .ok_or_else(|| "小票对应的草稿已不是当前 Attempt".to_string())?
+        .attempt_id
+        .clone();
+    let mut selection_error: Option<String> = None;
+    let applied = update_turn_record_if(
+        &turn_id,
+        |record| {
+            record.campaign_id == *campaign_id
+                && record.status == TurnStatus::AwaitingAcceptance
+                && record.find_attempt(&attempt_id).is_some_and(|attempt| {
+                    attempt.variant_id == *variant_id
+                        && attempt.status == AttemptStatus::AwaitingAcceptance
+                })
+        },
+        |record| {
+            let Some(attempt) = record.find_attempt_mut(&attempt_id) else {
+                selection_error = Some("小票对应的 Attempt 已消失".into());
+                return;
+            };
+            match attempt.pending_state_changes.as_mut() {
+                Some(batch) if batch.status == MutationBatchStatus::Prepared => {
+                    if let Err(error) =
+                        retain_selected_receipt_mutations(batch, selected_mutation_indices)
+                    {
+                        selection_error = Some(error);
+                    }
+                }
+                Some(_) => selection_error = Some("候选变更已开始提交，不能再修改勾选项".into()),
+                None if selected_mutation_indices.is_empty() => {}
+                None => selection_error = Some("本轮没有可选择的候选变更".into()),
+            }
+            record.touch();
+        },
+    )?;
+    if !applied {
+        return Err("Turn 状态已变化，请刷新小票后重试".into());
+    }
+    if let Some(error) = selection_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn postprocess_present_characters(provenance: Option<&Provenance>) -> Vec<String> {
+    let Some(provenance) = provenance else {
+        return vec![];
+    };
+    let candidates: Vec<String> = provenance
+        .plan
+        .as_ref()
+        .map(|plan| {
+            plan.subagent_tasks
+                .iter()
+                .map(|task| task.character_id.clone())
+                .collect()
+        })
+        .filter(|characters: &Vec<String>| !characters.is_empty())
+        .unwrap_or_else(|| {
+            provenance
+                .subagent_results
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| snapshot.character_id.clone())
+                })
+                .collect()
+        });
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+/// 仅重跑当前草稿的 Summarizer + PostProcessor，不重写正文。
+#[tauri::command]
+async fn retry_active_turn_postprocess(
+    campaign_id: String,
+    node_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ActiveTurnReceiptDto, TauriCommandError> {
+    use storyforge_domain::turn::{AttemptStatus, TurnStatus};
+
+    let campaign_id = Id::from_str(&campaign_id);
+    let variant_id = Id::from_str(&node_id);
+    let active_campaign = state
+        .active_campaign
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if active_campaign.as_ref() != Some(&campaign_id) {
+        return Err(TauriCommandError::validation(
+            "只能重试当前打开 Campaign 的记账推导",
+        ));
+    }
+
+    let turn = get_active_turn_for_backend(&campaign_id)
+        .map_err(TauriCommandError::internal)?
+        .ok_or_else(|| TauriCommandError::validation("当前 Campaign 没有待采纳 Turn"))?;
+    let attempt = turn
+        .find_attempt_by_variant(&variant_id)
+        .cloned()
+        .ok_or_else(|| TauriCommandError::validation("该草稿已不是当前 Attempt"))?;
+    if attempt.status != AttemptStatus::AwaitingAcceptance
+        || !attempt
+            .derivation
+            .as_ref()
+            .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure)
+    {
+        return Err(TauriCommandError::validation(
+            "只有记账推导失败的待采纳草稿可以重试",
+        ));
+    }
+
+    let turn_id = turn.turn_id.clone();
+    let attempt_id = attempt.attempt_id.clone();
+
+    let conversation = state
+        .conv_store
+        .get(&turn.conversation_id)
+        .ok_or_else(|| TauriCommandError::internal("找不到草稿所属对话"))?;
+    let final_text = conversation
+        .nodes
+        .iter()
+        .find(|node| node.id == variant_id)
+        .and_then(|node| node.active())
+        .map(|variant| variant.content.clone())
+        .ok_or_else(|| TauriCommandError::internal("找不到待重试草稿正文"))?;
+
+    let snapshot = state.snapshot_tool_ctx();
+    let regex_character_id = conversation.character_id.clone();
+    let mut writing_ctx = WritingContext {
+        characters: snapshot.characters.clone(),
+        world_info: snapshot.world_info.clone(),
+        conversation_id: turn.conversation_id.clone(),
+        campaign_id: None,
+        turn: 0,
+        pending_tasks: vec![],
+        story_clock: String::new(),
+        profile: None,
+        modules: vec![],
+        regex_scripts: collect_scoped_regex_scripts(
+            regex_character_id.as_deref(),
+            &snapshot.characters,
+        ),
+        campaign_runtime: None,
+        agent_profile_config: None,
+        recent_summaries: vec![],
+        chronicle_prompt_catalog: vec![],
+        far_memory_hits: vec![],
+        template_random_seed: None,
+        context_epoch: None,
+        chronicle_revision: 0,
+    };
+    fill_regex_context(
+        &mut writing_ctx,
+        get_preset_store(),
+        get_global_regex_store(),
+    );
+    fill_profile_context(&mut writing_ctx, &state);
+    fill_agent_profile_context(&mut writing_ctx, &state);
+    fill_campaign_context_async(&mut writing_ctx, &state).await?;
+    if writing_ctx.campaign_id.as_ref() != Some(&campaign_id) {
+        return Err(TauriCommandError::validation(
+            "重试期间 Campaign 已切换，请重新打开小票",
+        ));
+    }
+
+    let present_characters = postprocess_present_characters(attempt.provenance.as_ref());
+    let variable_keys = postprocess_variable_keys(&writing_ctx);
+    let fallback_fragments =
+        collect_mvu_fallback_fragments_for_backend(&writing_ctx, &present_characters);
+    let mvu_update_rules = collect_mvu_update_rules_for_backend(&writing_ctx, &present_characters);
+    let pipeline = state.new_pipeline_with_regex(&writing_ctx.regex_scripts);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let identity = production_postprocess::PostprocessIdentity {
+        turn_id: turn_id.clone(),
+        attempt_id: attempt_id.clone(),
+        campaign_id: campaign_id.clone(),
+        conversation_id: turn.conversation_id.clone(),
+        turn_number: writing_ctx.turn,
+    };
+    let runtime = writing_ctx.campaign_runtime.clone();
+
+    // All fallible preparation above deliberately happens while the attempt is
+    // still AwaitingAcceptance. Only take the DerivingState lease immediately
+    // before the shared postprocess service starts, so a missing conversation,
+    // invalid Campaign context, or config load error cannot strand the Turn.
+    let transitioned = update_turn_record_if(
+        &turn_id,
+        |record| {
+            record.status == TurnStatus::AwaitingAcceptance
+                && record.find_attempt(&attempt_id).is_some_and(|candidate| {
+                    candidate.status == AttemptStatus::AwaitingAcceptance
+                        && candidate.variant_id == variant_id
+                })
+        },
+        |record| {
+            record.status = TurnStatus::DerivingState;
+            record.failure_reason = None;
+            if let Some(candidate) = record.find_attempt_mut(&attempt_id) {
+                candidate.status = AttemptStatus::DerivingState;
+            }
+            record.touch();
+        },
+    )
+    .map_err(TauriCommandError::internal)?;
+    if !transitioned {
+        return Err(TauriCommandError::validation(
+            "Turn 状态已变化，请刷新小票后重试",
+        ));
+    }
+
+    run_shared_postprocess_background(
+        pipeline,
+        writing_ctx,
+        final_text,
+        present_characters,
+        variable_keys,
+        fallback_fragments,
+        mvu_update_rules,
+        event_tx,
+        cancel_rx,
+        Some(identity),
+        runtime,
+    )
+    .await
+    .map_err(|error| TauriCommandError::internal(format!("重试记账失败: {error}")))?;
+
+    let refreshed = get_active_turn_for_backend(&campaign_id)
+        .map_err(TauriCommandError::internal)?
+        .ok_or_else(|| TauriCommandError::internal("重试后找不到活动 Turn"))?;
+    active_turn_receipt_from_record(&refreshed, &variant_id)
+        .ok_or_else(|| TauriCommandError::internal("重试后找不到活动 Attempt"))
+}
+
 /// 从 TurnRecord 提取活动 Attempt 的质量 DTO（无报告 → None）。
 fn active_turn_quality_from_record(
     turn: &storyforge_domain::turn::TurnRecord,
@@ -12792,6 +13475,8 @@ pub fn run() {
             card_shell_clear_cache,
             card_shell_fetch_url,
             get_active_turn_quality,
+            get_active_turn_receipt,
+            retry_active_turn_postprocess,
             // V4 存储健康：损坏启动拦截 + 恢复确认
             storage_health_report,
             storage_health_acknowledge,
@@ -13266,6 +13951,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tauri_state_for_test(&app_state),
             channel,
         )
@@ -13295,6 +13981,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tauri_state_for_test(&app_state),
             command_prompt_hook_channel(app_state.clone(), setup_marker),
         )
@@ -13317,6 +14004,7 @@ mod tests {
                 targets: vec![RegenerateTargetDto {
                     kind: "editor".into(),
                 }],
+                generation_mode: None,
                 hint: Some("Keep it brief.".into()),
                 seed: None,
             },
@@ -13780,6 +14468,8 @@ mod tests {
         };
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: Some("offline MVU plumbing smoke summary".into()),
+            summary_attempted: true,
+            post_process_attempted: true,
             post_process: Some(storyforge_domain::agent::PostProcessResult {
                 knowledge_updates: vec![],
                 variable_updates: vec![VariableUpdate {
@@ -16663,6 +17353,7 @@ mod tests {
                     seed: 7,
                     last_hint: Some("try again".into()),
                     director_reasoning: Some("director reasoning".into()),
+                    writer_reasoning: Some("writer reasoning".into()),
                     editor_reasoning: Some("editor reasoning".into()),
                 }),
             )
@@ -16684,6 +17375,7 @@ mod tests {
         assert_eq!(explanation.profile_id.as_deref(), Some("profile-1"));
         assert_eq!(explanation.last_hint.as_deref(), Some("try again"));
         assert!(explanation.director_reasoning.is_none());
+        assert!(explanation.writer_reasoning.is_none());
         assert!(explanation.editor_reasoning.is_none());
         assert_eq!(explanation.subagents.len(), 1);
         assert_eq!(explanation.subagents[0].character_id, "alice");
@@ -16765,6 +17457,7 @@ mod tests {
             conversation.id.clone(),
             node_id.clone(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -17281,6 +17974,7 @@ mod tests {
                 seed: 1,
                 last_hint: None,
                 director_reasoning: Some("director secret reasoning".into()),
+                writer_reasoning: Some("writer secret reasoning".into()),
                 editor_reasoning: Some("editor secret reasoning".into()),
             }),
         );
@@ -17291,6 +17985,7 @@ mod tests {
             .as_ref()
             .expect("non-reasoning provenance remains available");
         assert!(displayed.director_reasoning.is_none());
+        assert!(displayed.writer_reasoning.is_none());
         assert!(displayed.editor_reasoning.is_none());
         assert!(displayed.subagent_results[0].reasoning_content.is_none());
 
@@ -18262,6 +18957,8 @@ mod tests {
         };
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: Some("Lin found a clue.".into()),
+            summary_attempted: true,
+            post_process_attempted: true,
             post_process: Some(PostProcessResult {
                 knowledge_updates: vec![CharacterKnowledgeUpdate {
                     character_id: Id::from_str("Lin"),
@@ -18372,6 +19069,8 @@ mod tests {
         // outcome 包含一个未知角色名 + 一个已知角色/全局变量
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: None,
+            summary_attempted: false,
+            post_process_attempted: true,
             post_process: Some(PostProcessResult {
                 knowledge_updates: vec![],
                 variable_updates: vec![
@@ -18453,6 +19152,8 @@ mod tests {
 
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: None,
+            summary_attempted: false,
+            post_process_attempted: true,
             post_process: Some(PostProcessResult {
                 knowledge_updates: vec![],
                 variable_updates: vec![],
@@ -18508,6 +19209,8 @@ mod tests {
         // Witnessed 知识 + present_chars 空集：知识路径收紧拒绝写入
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: None,
+            summary_attempted: false,
+            post_process_attempted: true,
             post_process: Some(PostProcessResult {
                 knowledge_updates: vec![CharacterKnowledgeUpdate {
                     character_id: Id::from_str("Lin"),
@@ -19270,6 +19973,8 @@ mod tests {
                 },
                 Some(storyforge_app_agent::PostProcessOutcome {
                     summary: Some("must not write".into()),
+                    summary_attempted: true,
+                    post_process_attempted: false,
                     post_process: None,
                 }),
                 &[],
@@ -21160,6 +21865,7 @@ mod tests {
             conversation.id.clone(),
             node_id.clone(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -21196,6 +21902,7 @@ mod tests {
             conversation.id.clone(),
             node_id.clone(),
             false,
+            None,
         )
         .await;
         assert!(result.is_err(), "should reject historical/orphan attempt");
@@ -21243,6 +21950,187 @@ mod tests {
             quality_accept_decision(Some(&err), true),
             QualityAcceptDecision::ForceDegraded { error_count: 1 }
         ));
+    }
+
+    #[test]
+    fn turn_receipt_lists_only_user_reviewable_mutations() {
+        use storyforge_domain::turn::{Mutation, MutationBatch};
+
+        let campaign_id = Id::from_str("receipt-campaign");
+        let conversation_id = Id::from_str("receipt-conversation");
+        let variant_id = Id::from_str("receipt-variant");
+        let mut batch = MutationBatch::new(Id::from_str("receipt-commit"), 4);
+        batch.mutations.push(Mutation::UpsertSummary(Box::new(
+            storyforge_domain::agent::RoundSummary::new(
+                campaign_id,
+                conversation_id,
+                5,
+                "林秋确认了仓库钥匙的来源。".into(),
+            ),
+        )));
+        batch.mutations.push(Mutation::SetVariable {
+            instance_id: None,
+            key: "tension".into(),
+            value: serde_json::json!(7),
+            turn: 5,
+        });
+        batch.mutations.push(Mutation::FinalizeVariant {
+            variant_id: variant_id.clone(),
+        });
+        batch.mutations.push(Mutation::UpsertInstance(Box::new(
+            storyforge_domain::campaign::CharacterInstance::temporary(
+                Id::from_str("receipt-campaign"),
+                "守门人",
+            ),
+        )));
+
+        let items = receipt_items_from_batch(&batch);
+
+        assert_eq!(items.len(), 2, "结构性 mutation 不应混入用户小票");
+        assert_eq!(items[0].mutation_index, 0);
+        assert_eq!(items[0].kind, "chronicle");
+        assert!(items[0].detail.contains("仓库钥匙"));
+        assert_eq!(items[1].mutation_index, 1);
+        assert_eq!(items[1].kind, "variable");
+        assert!(items.iter().all(|item| item.selected_by_default));
+    }
+
+    #[test]
+    fn receipt_selection_preserves_structural_mutations() {
+        use storyforge_domain::turn::{Mutation, MutationBatch};
+
+        let variant_id = Id::from_str("receipt-filter-variant");
+        let mut batch = MutationBatch::new(Id::from_str("receipt-filter-commit"), 9);
+        batch.mutations.push(Mutation::SetVariable {
+            instance_id: None,
+            key: "keep".into(),
+            value: serde_json::json!(1),
+            turn: 10,
+        });
+        batch.mutations.push(Mutation::SetVariable {
+            instance_id: None,
+            key: "drop".into(),
+            value: serde_json::json!(2),
+            turn: 10,
+        });
+        batch.mutations.push(Mutation::FinalizeVariant {
+            variant_id: variant_id.clone(),
+        });
+        batch.mutations.push(Mutation::UpsertInstance(Box::new(
+            storyforge_domain::campaign::CharacterInstance::temporary(
+                Id::from_str("receipt-filter-campaign"),
+                "临时证人",
+            ),
+        )));
+
+        retain_selected_receipt_mutations(&mut batch, &[0]).unwrap();
+
+        assert_eq!(batch.mutations.len(), 3);
+        assert!(matches!(
+            &batch.mutations[0],
+            Mutation::SetVariable { key, .. } if key == "keep"
+        ));
+        assert!(matches!(
+            &batch.mutations[1],
+            Mutation::FinalizeVariant { variant_id: id } if id == &variant_id
+        ));
+        assert!(matches!(&batch.mutations[2], Mutation::UpsertInstance(_)));
+    }
+
+    #[test]
+    fn postprocess_retry_recovers_unique_present_characters_from_provenance() {
+        let provenance = Provenance {
+            session_id: Id::new(),
+            plan: None,
+            subagent_results: vec![
+                storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: "lin-qiu".into(),
+                    full_text: "A".into(),
+                    character_instance_id: None,
+                    display_name: Some("林秋".into()),
+                    fallback_reason: None,
+                    reasoning_content: None,
+                },
+                storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: "lin-qiu".into(),
+                    full_text: "B".into(),
+                    character_instance_id: None,
+                    display_name: Some("林秋".into()),
+                    fallback_reason: None,
+                    reasoning_content: None,
+                },
+                storyforge_domain::conversation::SubagentSnapshot {
+                    character_id: "chen".into(),
+                    full_text: "C".into(),
+                    character_instance_id: None,
+                    display_name: Some("陈警官".into()),
+                    fallback_reason: None,
+                    reasoning_content: None,
+                },
+            ],
+            profile_id: None,
+            seed: 1,
+            last_hint: None,
+            director_reasoning: None,
+            writer_reasoning: None,
+            editor_reasoning: None,
+        };
+
+        assert_eq!(
+            postprocess_present_characters(Some(&provenance)),
+            vec!["林秋".to_string(), "陈警官".to_string()]
+        );
+    }
+
+    #[test]
+    fn automatic_route_promotes_large_roster_to_sequential_crew() {
+        let actors = ["林秋", "陈默", "周岚", "守门人"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| RouteActorSignal {
+                id: format!("actor-{index}"),
+                name: name.into(),
+                agenda: None,
+                private_facts: vec![],
+            })
+            .collect::<Vec<_>>();
+        let signals = generation_route_signals_from_parts("所有人在审判厅对峙", &actors, &[], None);
+
+        assert_eq!(signals.principal_actor_count, 4);
+        assert!(signals.large_scene_intent);
+        assert_eq!(
+            storyforge_domain::generation::route_generation_mode(&signals).mode,
+            storyforge_domain::generation::GenerationMode::SequentialCrew,
+        );
+    }
+
+    #[test]
+    fn automatic_route_detects_explicit_two_actor_interaction() {
+        let actors = vec![
+            RouteActorSignal {
+                id: "lin".into(),
+                name: "林秋".into(),
+                agenda: Some("隐瞒钥匙".into()),
+                private_facts: vec!["钥匙藏在钟里".into()],
+            },
+            RouteActorSignal {
+                id: "chen".into(),
+                name: "陈默".into(),
+                agenda: Some("找出钥匙".into()),
+                private_facts: vec![],
+            },
+        ];
+        let signals =
+            generation_route_signals_from_parts("陈默围绕钥匙质问林秋", &actors, &[], None);
+
+        assert_eq!(signals.principal_actor_count, 2);
+        assert!(signals.direct_interaction);
+        assert!(signals.relevant_private_knowledge_divergence);
+        assert!(signals.opposing_agendas);
+        assert_eq!(
+            storyforge_domain::generation::route_generation_mode(&signals).mode,
+            storyforge_domain::generation::GenerationMode::Duet,
+        );
     }
 
     /// AND-3：storage_meta 首建/升级轨迹 + 损坏容错（不 panic）。
@@ -21326,6 +22214,8 @@ mod tests {
         };
         let outcome = storyforge_app_agent::PostProcessOutcome {
             summary: Some("第一轮摘要".into()),
+            summary_attempted: true,
+            post_process_attempted: true,
             post_process: Some(storyforge_domain::agent::PostProcessResult {
                 variable_updates: vec![storyforge_domain::agent::VariableUpdate {
                     instance_id: None,

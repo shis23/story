@@ -74,7 +74,7 @@ async function handleExplain() {
         class="bg-surface rounded-lg border border-line p-3 space-y-2 text-xs"
       >
         <div
-          v-if="result.director_reasoning || result.editor_reasoning || result.subagents?.some(sa => sa.reasoning_content)"
+          v-if="result.director_reasoning || result.writer_reasoning || result.editor_reasoning || result.subagents?.some(sa => sa.reasoning_content)"
           class="rounded-md border border-warn/30 bg-warn/10 px-2 py-1.5 text-warn"
         >
           Reasoning 为供应商返回的原始审计数据，可能包含系统提示、检索材料或角色私密知识；仅在此显式查看。
@@ -105,6 +105,13 @@ async function handleExplain() {
           <summary class="cursor-pointer text-ink-soft hover:text-ink">编剧 reasoning</summary>
           <div class="mt-1.5">
             <CodeBlock :code="result.editor_reasoning" language="text" wrap />
+          </div>
+        </details>
+
+        <details v-if="result.writer_reasoning" class="mt-2">
+          <summary class="cursor-pointer text-ink-soft hover:text-ink">执笔者 reasoning</summary>
+          <div class="mt-1.5">
+            <CodeBlock :code="result.writer_reasoning" language="text" wrap />
           </div>
         </details>
 

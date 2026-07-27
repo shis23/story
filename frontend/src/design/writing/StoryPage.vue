@@ -22,7 +22,9 @@ const props = defineProps({
   showPipeline: { type: Boolean, default: false },
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
+  allowPartialReroll: { type: Boolean, default: true },
   qualityAcceptHint: { type: String, default: null },
+  pendingReceipt: { type: Object, default: null },
   contentComponent: { type: [Object, Function, String], default: null },
   /** messageId -> [{id,label}] */
   subagentRolesByMessage: { type: Object, default: () => ({}) },
@@ -35,6 +37,8 @@ const emit = defineEmits([
   'switch-variant',
   'edit-variant',
   'accept-variant',
+  'retry-postprocess',
+  'dismiss-receipt',
   'delete-variant',
   'add-variant',
   'branch',
@@ -62,6 +66,8 @@ const messageEvents = {
   'switch-variant': (p) => emit('switch-variant', p),
   'edit-variant': (p) => emit('edit-variant', p),
   'accept-variant': (p) => emit('accept-variant', p),
+  'retry-postprocess': (p) => emit('retry-postprocess', p),
+  'dismiss-receipt': (p) => emit('dismiss-receipt', p),
   'delete-variant': (p) => emit('delete-variant', p),
   'add-variant': (p) => emit('add-variant', p),
   'branch': (p) => emit('branch', p),
@@ -103,7 +109,9 @@ function rolesFor(message) {
           :message="m"
           :busy="isWriting"
           :can-branch="canBranch"
+          :allow-partial-reroll="allowPartialReroll"
           :quality-accept-hint="qualityAcceptHint"
+          :turn-receipt="pendingReceipt?.nodeId === m.id ? pendingReceipt : null"
           :content-component="contentComponent"
           :subagent-roles="rolesFor(m)"
           v-on="messageEvents"

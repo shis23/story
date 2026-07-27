@@ -31,6 +31,10 @@ pub struct PostProcessOutcome {
     pub summary: Option<String>,
     /// 后处理三件套（后处理 Agent 成功且有产出则有；失败或被 `enable_postprocess=false` 关闭为 None）
     pub post_process: Option<PostProcessResult>,
+    /// true 表示本轮确实调用过 Summarizer；用于区分“关闭”与“调用失败”。
+    pub summary_attempted: bool,
+    /// true 表示本轮确实调用过 PostProcessor；用于区分“关闭”与“调用失败”。
+    pub post_process_attempted: bool,
 }
 
 /// 并行跑剧情总结 + 后处理 Agent
@@ -216,6 +220,8 @@ pub async fn run_postprocess_pipeline_with_prompt(
     PostProcessOutcome {
         summary,
         post_process,
+        summary_attempted: enable_summarizer,
+        post_process_attempted: enable_postprocess,
     }
 }
 
@@ -332,6 +338,8 @@ mod tests {
         .await;
 
         assert!(outcome.summary.is_none(), "summarizer 关闭应返回 None");
+        assert!(!outcome.summary_attempted);
+        assert!(outcome.post_process_attempted);
         assert!(outcome.post_process.is_some(), "postprocess 开启应正常产出");
     }
 
@@ -361,6 +369,8 @@ mod tests {
             "postprocess 关闭应返回 None"
         );
         assert!(outcome.summary.is_some(), "summarizer 开启应正常产出");
+        assert!(outcome.summary_attempted);
+        assert!(!outcome.post_process_attempted);
     }
 
     #[tokio::test]

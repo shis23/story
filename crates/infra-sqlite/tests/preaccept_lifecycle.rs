@@ -267,6 +267,7 @@ fn autofix_sync_rewrites_conversation_and_attempt_hash_atomically() {
         seed: 1,
         last_hint: None,
         director_reasoning: Some("director reasoning".into()),
+        writer_reasoning: None,
         editor_reasoning: Some("autofix editor reasoning".into()),
     };
     SqlitePreacceptRepository::sync_autofix(

@@ -38,6 +38,8 @@ pub struct GenerationExplanation {
     pub seed: u64,
     /// 供应商实际返回的导演 reasoning/thinking。
     pub director_reasoning: Option<String>,
+    /// 供应商实际返回的续写档执笔者 reasoning/thinking。
+    pub writer_reasoning: Option<String>,
     /// 供应商实际返回的编剧 reasoning/thinking。
     pub editor_reasoning: Option<String>,
 }
@@ -47,6 +49,7 @@ impl GenerationExplanation {
     /// 再发送给另一个模型；原文只通过本地显式审计命令展示。
     pub fn without_reasoning(mut self) -> Self {
         self.director_reasoning = None;
+        self.writer_reasoning = None;
         self.editor_reasoning = None;
         for subagent in &mut self.subagents {
             subagent.reasoning_content = None;
@@ -124,6 +127,7 @@ pub fn explain_generation(provenance: &Provenance) -> GenerationExplanation {
             .map(|id| id.as_str().to_string()),
         seed: provenance.seed,
         director_reasoning: provenance.director_reasoning.clone(),
+        writer_reasoning: provenance.writer_reasoning.clone(),
         editor_reasoning: provenance.editor_reasoning.clone(),
     }
 }
@@ -185,6 +189,7 @@ mod tests {
             seed: 42,
             last_hint: None,
             director_reasoning: Some("director reasoning".into()),
+            writer_reasoning: Some("writer reasoning".into()),
             editor_reasoning: Some("editor reasoning".into()),
         }
     }
@@ -212,6 +217,10 @@ mod tests {
         assert_eq!(
             explanation.editor_reasoning.as_deref(),
             Some("editor reasoning")
+        );
+        assert_eq!(
+            explanation.writer_reasoning.as_deref(),
+            Some("writer reasoning")
         );
         assert_eq!(
             explanation.subagents[0].reasoning_content.as_deref(),

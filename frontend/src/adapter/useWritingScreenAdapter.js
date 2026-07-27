@@ -83,10 +83,15 @@ export function useWritingScreenAdapter(handlers = {}) {
     showPipeline: writing.showPipeline,
     streamingRoleLabel: writing.streamingRoleLabel,
     canBranch: canBranch.value,
+    allowPartialReroll:
+      writing.writingMode !== 'campaign' || writing.generationMode === 'big_scene',
     greetingOptions: greetingOptions.value,
     selectedGreetingIndex: writing.selectedGreetingIndex,
     composerDisabled: composerDisabled.value,
     composerPlaceholder: composerPlaceholder.value,
+    generationMode: writing.generationMode,
+    showGenerationModes: writing.writingMode === 'campaign',
+    pendingReceipt: writing.pendingReceipt,
     qualityAcceptHint: qualityAcceptHint.value,
     contentComponent,
     subagentRolesByMessage: subagentRolesByMessage.value,
@@ -108,6 +113,7 @@ export function useWritingScreenAdapter(handlers = {}) {
 
   const screenEvents = {
     'start-writing': (text) => handlers.startWriting?.(text),
+    'update-generation-mode': (mode) => writing.setGenerationMode(mode),
     cancel: () => handlers.cancelWriting?.(),
     import: () => handlers.handleImport?.(),
     'new-campaign': () => handlers.openNewCampaign?.(),
@@ -118,6 +124,8 @@ export function useWritingScreenAdapter(handlers = {}) {
     'switch-variant': (p) => handlers.handleSwitchVariant?.(p),
     'edit-variant': (p) => handlers.handleEditVariant?.(p),
     'accept-variant': (p) => handlers.handleAcceptVariant?.(p),
+    'retry-postprocess': (p) => handlers.handleRetryPostprocess?.(p),
+    'dismiss-receipt': () => writing.clearTurnReceipt(),
     'delete-variant': (p) => onDeleteVariant(p),
     'add-variant': (p) => handlers.handleAddVariant?.(p),
     branch: (p) => handlers.handleBranch?.(p),

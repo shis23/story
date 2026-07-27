@@ -428,12 +428,20 @@ pub fn accept_by_variant(
         });
     }
 
+    let derivation_failed = attempt
+        .derivation
+        .as_ref()
+        .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
+    if derivation_failed && !force_accept {
+        return Err(AcceptError::DerivationFailed);
+    }
+
     // Quality gate（V7：与 JSON 路径共用 domain 决策函数，杜绝两处内联实现漂移）。
     let commit_as_degraded = match storyforge_domain::turn::quality_accept_decision(
         attempt.quality_report.as_ref(),
         force_accept,
     ) {
-        storyforge_domain::turn::QualityAcceptDecision::AllowCommit => false,
+        storyforge_domain::turn::QualityAcceptDecision::AllowCommit => derivation_failed,
         storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { .. } => true,
         storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
             return Err(AcceptError::QualityBlocked { error_count });

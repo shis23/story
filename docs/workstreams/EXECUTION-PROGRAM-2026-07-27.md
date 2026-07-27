@@ -14,7 +14,7 @@
 | git push 长期解 | **搁置**（继续用京东云隧道，见 memory push-via-jd-tunnel） |
 | 发布方向 | **双线并行**：桌面收尾照走，Android 约束到 AND-2（系统选择器文件导入）/AND-3（数据目录+迁移）先行 |
 | 发布 CI | **批准在京东云部署 act_runner** 注册 Gitea 实跑 workflow；本机跑 tauri build 出 Windows 安装包证据 |
-| 战略实验 | **都做**：多 Agent 盲测（用中继，先出证据）+ 写作流水线重设计（按已定稿方案起骨架） |
+| 战略实验 | **都做**：多 Agent 盲测首轮已完成；写作流水线重设计已落地（四档生成、Sequential Crew 主路径、按模式整体重写、Accept 前回合小票） |
 | V4 损坏恢复 | **启动拦截 + 恢复提示**（检测到主文件损坏不再静默空集：前端弹恢复引导，用户确认前不写盘） |
 
 ## 执行队列与状态
@@ -165,13 +165,17 @@
   证据：artifacts/blind-ab/blind-two-arm-summary.json（脱敏）+
   texts/（正文，gitignore）。运行命令见测试文件头（key 只进 env）。
   跑完后按预注册口径写 RESULT 文档。
-- [~] **#32 流水线重设计**（第 1 步已落）：
-  **定稿文档找到了**＝ARCHITECTURE-REVIEW-2026-07-26.md 补记三（891 行起，
-  「设计定稿，未实现」）。要点：回合契约 / 三档生成（续写 80%·对手戏·大场面）/
-  确定性路由 / 执笔调用是圣域（四条设计法则）/ 干净执笔+全案卷差分审计 /
-  §11 落地顺序=①四臂盲测（已起骨架）②续写档（context compiler 首客户，
-  依赖 V1/V2 修复——今日已修）③对手戏 run_duet ④场景卡+大场面收编。
-  Android AND-2/AND-3（PLAN-ANDROID.md）未起步。
+- [x] **#32 流水线重设计第一版**：
+  已按产品复核后的四档方案落地：续写、对手戏、Sequential Crew（群像重点主路径）、
+  旧大场面兼容档；显式选择按 Campaign 记忆，未显式指定时走确定性路由。
+  Turn Dossier 统一角色案卷与知识归属，Sequential Crew 只向后续演员公开已表演言行，
+  不传播 inner thoughts。Summarizer / PostProcessor 分工独立；Accept 前展示 Chronicle A、
+  知识、变量、任务 diff，允许逐条取消，失败可单独重试或显式降级采纳。
+  整体重写现沿用当前产品模式并落回原消息 variant；新三档只支持整体重写，旧
+  `big_scene` 兼容档继续保留 Editor/Subagent 局部重跑。
+  完整实施边界、暂缓项和验证基线见
+  `WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md`。可编辑场景卡、emotion_stage
+  标定和后续四臂质量评测仍待继续；Android AND-2/AND-3（PLAN-ANDROID.md）未起步。
 
 ### 周级工程（起步后持续，不指望今天闭环）
 

@@ -136,7 +136,7 @@ export function useWriting(options = {}) {
         : null
       const result = await startWritingApi(hookedIntent, charIdForWriting, (event) => {
         onPipelineEvent(event)
-      }, campaignStore.currentConversationId, openingMessage)
+      }, campaignStore.currentConversationId, openingMessage, writingStore.generationMode)
 
       // 后端已存开场白、user 意图和 AI 成文；重拉会话以拿到展示态 regex 内容。
       const text = result.text

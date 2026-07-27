@@ -9,6 +9,81 @@ function setup() {
   return useWritingStore()
 }
 
+test('generation mode is remembered independently for each campaign', () => {
+  setActivePinia(createPinia())
+  const writing = useWritingStore()
+  const campaign = useCampaignStore()
+  campaign.activeCampaign = { id: 'campaign-a', name: 'A' }
+
+  assert.equal(writing.generationMode, 'continuation')
+  writing.setGenerationMode('sequential_crew')
+  assert.equal(writing.generationMode, 'sequential_crew')
+
+  campaign.activeCampaign = { id: 'campaign-b', name: 'B' }
+  assert.equal(writing.generationMode, 'continuation')
+  writing.setGenerationMode('duet')
+  assert.equal(writing.generationMode, 'duet')
+
+  campaign.activeCampaign = { id: 'campaign-a', name: 'A' }
+  assert.equal(writing.generationMode, 'sequential_crew')
+})
+
+test('generation mode rejects unknown wire values', () => {
+  setActivePinia(createPinia())
+  const writing = useWritingStore()
+  const campaign = useCampaignStore()
+  campaign.activeCampaign = { id: 'campaign-a' }
+
+  writing.setGenerationMode('made_up_mode')
+
+  assert.equal(writing.generationMode, 'continuation')
+})
+
+test('generation mode memory survives store recreation but remains keyed by campaign', () => {
+  const values = new Map()
+  globalThis.localStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  }
+  try {
+    setActivePinia(createPinia())
+    let campaign = useCampaignStore()
+    let writing = useWritingStore()
+    campaign.activeCampaign = { id: 'campaign-persisted' }
+    writing.setGenerationMode('sequential_crew')
+
+    setActivePinia(createPinia())
+    campaign = useCampaignStore()
+    writing = useWritingStore()
+    campaign.activeCampaign = { id: 'campaign-persisted' }
+    assert.equal(writing.generationMode, 'sequential_crew')
+    campaign.activeCampaign = { id: 'campaign-new' }
+    assert.equal(writing.generationMode, 'continuation')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('turn receipt defaults every candidate to selected and can toggle by mutation index', () => {
+  const writing = setup()
+  writing.openTurnReceipt('node-1', {
+    turn_id: 'turn-1',
+    derivation_failed: false,
+    items: [
+      { mutation_index: 2, kind: 'chronicle', title: '纪要', detail: 'A', selected_by_default: true },
+      { mutation_index: 4, kind: 'variable', title: '变量', detail: 'B', selected_by_default: true },
+    ],
+  })
+
+  assert.equal(writing.pendingReceipt.nodeId, 'node-1')
+  assert.deepEqual(writing.selectedReceiptMutationIndices, [2, 4])
+
+  writing.setReceiptItemSelected(4, false)
+  assert.deepEqual(writing.selectedReceiptMutationIndices, [2])
+  writing.clearTurnReceipt()
+  assert.equal(writing.pendingReceipt, null)
+})
+
 test('writing store 初始状态', () => {
   const s = setup()
   assert.deepEqual(s.messages, [])

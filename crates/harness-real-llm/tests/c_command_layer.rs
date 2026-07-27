@@ -573,6 +573,7 @@ fn c6_explain_generation() {
         seed: 42,
         last_hint: None,
         director_reasoning: Some("director reasoning".into()),
+        writer_reasoning: None,
         editor_reasoning: Some("editor reasoning".into()),
     };
 

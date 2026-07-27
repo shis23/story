@@ -54,6 +54,40 @@ test('writing adapter derives quality accept hint from pipeline.quality', () => 
   assert.equal(screenProps.value.qualityAcceptHint, '质量警告 2')
 })
 
+test('writing adapter exposes and updates the campaign generation mode', () => {
+  const { writing, campaign } = setupStores()
+  campaign.activeCampaign = { id: 'campaign-a', name: 'A' }
+  const { screenProps, screenEvents } = useWritingScreenAdapter({})
+
+  assert.equal(screenProps.value.generationMode, 'continuation')
+  assert.equal(screenProps.value.allowPartialReroll, false)
+  screenEvents['update-generation-mode']('sequential_crew')
+
+  assert.equal(writing.generationMode, 'sequential_crew')
+  assert.equal(screenProps.value.generationMode, 'sequential_crew')
+  assert.equal(screenProps.value.allowPartialReroll, false)
+
+  screenEvents['update-generation-mode']('big_scene')
+  assert.equal(screenProps.value.allowPartialReroll, true)
+})
+
+test('writing adapter exposes turn receipt and forwards postprocess retry', async () => {
+  const { writing } = setupStores()
+  writing.openTurnReceipt('node-1', {
+    turn_id: 'turn-1',
+    items: [],
+    derivation_failed: true,
+  })
+  const calls = []
+  const { screenProps, screenEvents } = useWritingScreenAdapter({
+    handleRetryPostprocess: (payload) => calls.push(payload),
+  })
+
+  assert.equal(screenProps.value.pendingReceipt.nodeId, 'node-1')
+  await screenEvents['retry-postprocess']({ nodeId: 'node-1' })
+  assert.deepEqual(calls, [{ nodeId: 'node-1' }])
+})
+
 test('writing adapter forwards start-writing and wraps delete-variant', async () => {
   setupStores()
   const calls = []

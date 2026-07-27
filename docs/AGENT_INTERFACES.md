@@ -145,7 +145,7 @@ User Intent
 - 输出最终 Markdown 正文。
 - 不新增与 Subagent 冲突的关键事实，除非是必要的叙事衔接。
 
-当前 Editor 没有工具，直接输出正文。重 roll 时可以复用旧 Director Plan 或旧 Subagent 产出，并注入用户 hint。
+当前 Editor 没有工具，直接输出正文。旧 `big_scene` 兼容档局部重 roll 时可以复用 Director Plan 或 Subagent 产出，并注入用户 hint；续写、对手戏与 Sequential Crew 只允许按原模式整体重写，避免复用不匹配的阶段产物。
 
 目标：
 
@@ -257,6 +257,8 @@ Meta Agent 的方向不是“再做一个聊天助手”，而是 StoryForge 的
 - `DirectorStarted`
 - `DirectorProgress { delta }`
 - `DirectorDone { scene_brief, subagent_count }`
+- `WriterStarted`
+- `WriterProgress { delta }`
 - `SubagentStarted { character_id, index, total }`
 - `SubagentProgress { character_id, index, delta }`
 - `SubagentDone { character_id, index, full_text }`

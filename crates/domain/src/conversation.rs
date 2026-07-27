@@ -91,6 +91,9 @@ pub struct Provenance {
     /// 导演各 LLM 轮次实际返回的 reasoning/thinking。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub director_reasoning: Option<String>,
+    /// 续写档执笔者实际返回的 reasoning/thinking。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_reasoning: Option<String>,
     /// 编剧各 LLM 轮次实际返回的 reasoning/thinking。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_reasoning: Option<String>,

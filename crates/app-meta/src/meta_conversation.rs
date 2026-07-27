@@ -867,6 +867,7 @@ mod tests {
             profile_id: Some("default".into()),
             seed: 42,
             director_reasoning: Some("director reasoning".into()),
+            writer_reasoning: Some("writer reasoning".into()),
             editor_reasoning: Some("editor reasoning".into()),
         }
     }

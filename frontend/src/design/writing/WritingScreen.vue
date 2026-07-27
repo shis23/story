@@ -28,10 +28,14 @@ const props = defineProps({
   showPipeline: { type: Boolean, default: false },
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
+  allowPartialReroll: { type: Boolean, default: true },
   greetingOptions: { type: Array, default: () => [] },
   selectedGreetingIndex: { type: Number, default: 0 },
   composerDisabled: { type: Boolean, default: false },
   composerPlaceholder: { type: String, default: '' },
+  generationMode: { type: String, default: 'continuation' },
+  showGenerationModes: { type: Boolean, default: false },
+  pendingReceipt: { type: Object, default: null },
   qualityAcceptHint: { type: String, default: null },
   contentComponent: { type: [Object, Function, String], default: null },
   subagentRolesByMessage: { type: Object, default: () => ({}) },
@@ -41,6 +45,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   'start-writing',
+  'update-generation-mode',
   'cancel',
   'import',
   'new-campaign',
@@ -51,6 +56,8 @@ const emit = defineEmits([
   'switch-variant',
   'edit-variant',
   'accept-variant',
+  'retry-postprocess',
+  'dismiss-receipt',
   'delete-variant',
   'add-variant',
   'branch',
@@ -129,7 +136,9 @@ const forward = (name) => (p) => emit(name, p)
             :show-pipeline="showPipeline"
             :streaming-role-label="streamingRoleLabel"
             :can-branch="canBranch"
+            :allow-partial-reroll="allowPartialReroll"
             :quality-accept-hint="qualityAcceptHint"
+            :pending-receipt="pendingReceipt"
             :content-component="contentComponent"
             :subagent-roles-by-message="subagentRolesByMessage"
             @cancel="emit('cancel')"
@@ -138,6 +147,8 @@ const forward = (name) => (p) => emit(name, p)
             @switch-variant="forward('switch-variant')"
             @edit-variant="forward('edit-variant')"
             @accept-variant="forward('accept-variant')"
+            @retry-postprocess="forward('retry-postprocess')"
+            @dismiss-receipt="forward('dismiss-receipt')"
             @delete-variant="forward('delete-variant')"
             @add-variant="forward('add-variant')"
             @branch="forward('branch')"
@@ -159,7 +170,10 @@ const forward = (name) => (p) => emit(name, p)
           :writing="isWriting"
           :disabled="composerDisabled"
           :placeholder="composerPlaceholder"
+          :generation-mode="generationMode"
+          :show-generation-modes="showGenerationModes"
           @start-writing="emit('start-writing', $event)"
+          @update-generation-mode="emit('update-generation-mode', $event)"
           @cancel="emit('cancel')"
         />
       </div>

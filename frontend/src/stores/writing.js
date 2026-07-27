@@ -11,6 +11,25 @@ export const useWritingStore = defineStore('writing', () => {
   const showPipeline = ref(false) // App.vue:27 — 是否显示流水线过程
   const activeConnection = ref(null) // App.vue:342 — 当前活跃连接(顶栏显示用)
   const selectedGreetingIndex = ref(0) // App.vue:326 — 开场白选择索引
+  const generationModeByCampaign = ref({})
+  const pendingReceipt = ref(null)
+  const validGenerationModes = new Set([
+    'continuation',
+    'duet',
+    'sequential_crew',
+    'big_scene',
+  ])
+  try {
+    const saved = globalThis.localStorage?.getItem('storyforge:generation-mode-by-campaign')
+    const parsed = saved ? JSON.parse(saved) : null
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      generationModeByCampaign.value = Object.fromEntries(
+        Object.entries(parsed).filter(([, mode]) => validGenerationModes.has(mode)),
+      )
+    }
+  } catch {
+    // localStorage may be unavailable in tests/private contexts; in-memory scoping still works.
+  }
 
   // pipeline 状态机(App.vue:285-292)— 结构冻结,StreamingMessage 直接消费
   const pipeline = reactive({
@@ -32,6 +51,65 @@ export const useWritingStore = defineStore('writing', () => {
     if (campaign.activeChar) return 'legacy'
     return 'none'
   })
+
+  // 手动档位只记在当前 Campaign 名下，不形成跨故事的全局偏好。
+  const generationMode = computed(() => {
+    const campaign = useCampaignStore()
+    const campaignId = campaign.activeCampaign?.id
+    if (!campaignId) return 'continuation'
+    return generationModeByCampaign.value[campaignId] || 'continuation'
+  })
+
+  function setGenerationMode(mode) {
+    const campaign = useCampaignStore()
+    const campaignId = campaign.activeCampaign?.id
+    if (!campaignId || !validGenerationModes.has(mode)) return
+    generationModeByCampaign.value = {
+      ...generationModeByCampaign.value,
+      [campaignId]: mode,
+    }
+    try {
+      globalThis.localStorage?.setItem(
+        'storyforge:generation-mode-by-campaign',
+        JSON.stringify(generationModeByCampaign.value),
+      )
+    } catch {
+      // Preference persistence is best-effort and must never block writing.
+    }
+  }
+
+  const selectedReceiptMutationIndices = computed(() => {
+    const items = pendingReceipt.value?.items
+    if (!Array.isArray(items)) return []
+    return items
+      .filter((item) => item.selected)
+      .map((item) => item.mutation_index)
+  })
+
+  function openTurnReceipt(nodeId, dto) {
+    if (!nodeId || !dto) return
+    pendingReceipt.value = {
+      ...dto,
+      nodeId,
+      items: Array.isArray(dto.items)
+        ? dto.items.map((item) => ({
+          ...item,
+          selected: item.selected_by_default !== false,
+        }))
+        : [],
+    }
+  }
+
+  function setReceiptItemSelected(mutationIndex, selected) {
+    const item = pendingReceipt.value?.items?.find(
+      (candidate) => candidate.mutation_index === mutationIndex,
+    )
+    if (item) item.selected = !!selected
+  }
+
+  function clearTurnReceipt() {
+    pendingReceipt.value = null
+  }
 
   // 流式消息角色标签(App.vue:86-90,合并 314-317 的重复逻辑)
   const streamingRoleLabel = computed(() => {
@@ -91,6 +169,13 @@ export const useWritingStore = defineStore('writing', () => {
     selectedGreetingIndex,
     pipeline,
     writingMode,
+    generationMode,
+    setGenerationMode,
+    pendingReceipt,
+    selectedReceiptMutationIndices,
+    openTurnReceipt,
+    setReceiptItemSelected,
+    clearTurnReceipt,
     streamingRoleLabel,
     greetingOptions,
     selectedGreeting,

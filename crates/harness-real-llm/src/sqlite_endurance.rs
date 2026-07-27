@@ -1000,6 +1000,7 @@ impl SqliteHarnessEnv {
             conversation_id: conversation_id.clone(),
             node_id: previous_variant_id.clone(),
             targets: targets.clone(),
+            generation_mode: None,
             hint: Some(format!("endurance regenerate turn {turn_index}")),
             seed: None,
         };
