@@ -6,7 +6,7 @@
 ## 0. SHA 与纪律
 
 - base（开工 `main`）：`29513a600a404563ef5aad30ad52fa97b3d0c90a`
-- head：见本分支最新提交（提交后回填于本节末）。
+- head：`656b9e713c6b94ac5cfc31fa428403a37883474f`（`feat(security): pin main-app CSP and add contract tests (V5)`）。
 - worktree：`.worktrees/security-app-csp`（`.worktrees/` 已 gitignore）。
 - 未修改：`crates/tauri-app/src/lib.rs`、Android picker/manifest/capabilities、`.gitea/workflows/**`、`EXECUTION-PROGRAM-2026-07-27.md`。
 - 未做：V6 权限统一、`tauri-app/src/lib.rs` 巨石拆分。
@@ -123,8 +123,8 @@ Tauri 2 行为（官方 CSP 文档 + issue #3583）：`dangerousDisableAssetCspM
 实际做到的"接近证据"：
 
 - `cargo check -p storyforge` 通过 → `tauri-build`/`tauri-codegen` 在编译期成功解析新 CSP（无效 CSP 字符串会让 build.rs 失败）。
+- `cargo build -p storyforge --bin storyforge` **成功**（6m39s，`target/debug/storyforge.exe` 49MB）→ debug 二进制嵌入了生效的 CSP（编译期 codegen 把 CSP 注入产物）。**但未**在可见 WebView2 窗口里实测拦截行为。
 - `npm run build` 产出与 CSP 假设一致的 bundle（无 wasm、无远程 script src、仅 1 个会被 Tauri hash 覆盖的内联脚本）。
-- 二进制构建（`cargo build -p storyforge --bin storyforge`）进度见 §0 提交说明（若完成则 exe 嵌入了生效 CSP；但**未**在可见 WebView2 窗口里实测拦截行为）。
 
 **未做到 / 待主会话或用户实测**：
 
@@ -161,4 +161,4 @@ Tauri 2 行为（官方 CSP 文档 + issue #3583）：`dangerousDisableAssetCspM
 
 ---
 
-**head SHA（提交后）**：_待回填_（见 `git log -1 codex/security-app-csp`）。
+**head SHA**：`656b9e713c6b94ac5cfc31fa428403a37883474f`（见 `git log -1 codex/security-app-csp`）。
