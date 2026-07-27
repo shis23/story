@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost data: blob: http://storyforge-cache.localhost storyforge-cache://localhost; img-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://localhost; media-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://localhost; font-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://localhost; style-src 'self' 'unsafe-inline'; frame-src blob: data:; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
     }
   },
   "bundle": {
