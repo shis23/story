@@ -4,9 +4,8 @@
 //! 四臂（同一 Campaign 状态与意图，盲评成文质量与对话交互感）：
 //! 1. `SoloWriter`   — 单笔者 + 全量状态注入（续写档原型）
 //! 2. `ParallelCrew` — 当前生产平行流水线（Director→Subagent→Editor）
-//! 3. `SequentialCrew` — 顺序可见流水线（后者可见前者产出；**未实现**，
-//!    重设计"对手戏/顺序执行"的实现对象）
-//! 4. `DuetMerge`    — 场记 + 按拍交替续演合并（**未实现**）
+//! 3. `SequentialCrew` — 顺序可见流水线（后者可见前者公开产出）
+//! 4. `DuetMerge`    — 场记 + 按拍交替续演合并
 //!
 //! 本模块只提供确定性骨架：臂枚举、样本/裁决数据形态、双盲随机化配对、
 //! 多数票判定、汇总统计。LLM 驱动（各臂生成 + 裁判调用）由 #[ignore]
@@ -26,9 +25,9 @@ pub enum BlindArm {
     SoloWriter,
     /// 当前生产平行流水线
     ParallelCrew,
-    /// 顺序可见流水线（未实现——重设计实现对象）
+    /// 顺序可见流水线
     SequentialCrew,
-    /// 对手戏：场记 + 按拍交替续演（未实现）
+    /// 对手戏：场记 + 按拍交替续演
     DuetMerge,
 }
 
@@ -42,10 +41,9 @@ impl BlindArm {
         }
     }
 
-    /// 今天可跑的臂（其余为重设计实现对象；报告显式列出缺席臂——
-    /// 沿用「no silent caps」纪律，缺席不得伪装成已测）。
+    /// 当前产品实现是否可用于真实评测。
     pub fn implemented(self) -> bool {
-        matches!(self, Self::SoloWriter | Self::ParallelCrew)
+        true
     }
 
     pub fn all() -> [BlindArm; 4] {
@@ -110,6 +108,30 @@ pub fn presentation_order(
     }
 }
 
+/// Four-arm Latin-square presentation. Across four rounds every arm appears
+/// exactly once in every position, so a judge that merely prefers the first
+/// text cannot create a systematic winner.
+pub fn balanced_four_arm_order(seed: u64, intent_id: &str, round: u8) -> [BlindArm; 4] {
+    let mut hash: u64 = 0xcbf29ce484222325 ^ seed;
+    for byte in intent_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut arms = BlindArm::all();
+    if hash & 1 != 0 {
+        arms.swap(0, 1);
+    }
+    if hash & 2 != 0 {
+        arms.swap(2, 3);
+    }
+    if hash & 4 != 0 {
+        arms.reverse();
+    }
+    let shift = (round as usize) % arms.len();
+    arms.rotate_left(shift);
+    arms
+}
+
 /// 一对臂在一个意图上的多数票结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct PairMajority {
@@ -156,7 +178,7 @@ pub fn majority_for_pair(
     }
 }
 
-/// 矩阵汇总（含缺席臂显式清单）。
+/// 矩阵汇总（含本轮未生成臂的显式清单）。
 #[derive(Debug, Clone, Serialize)]
 pub struct BlindMatrixSummary {
     pub intents: usize,
@@ -164,7 +186,7 @@ pub struct BlindMatrixSummary {
     /// 各臂多数票胜场数
     pub wins: Vec<(String, usize)>,
     pub undecided: usize,
-    /// 未实现、未参与本轮盲测的臂（no silent caps）
+    /// 本轮没有生成样本的臂（no silent caps）
     pub absent_arms: Vec<String>,
     /// 各臂总耗时/补全 token（成本比判读用）
     pub cost: Vec<(String, u128, u64)>,
@@ -189,6 +211,7 @@ pub fn summarize_matrix(
     let mut cost: std::collections::BTreeMap<&'static str, (u128, u64)> = Default::default();
     let mut present: std::collections::BTreeSet<&'static str> = Default::default();
     for s in samples {
+        intents.insert(&s.intent_id);
         present.insert(s.arm.as_str());
         let entry = cost.entry(s.arm.as_str()).or_default();
         entry.0 += s.latency_ms;
@@ -263,6 +286,30 @@ mod tests {
     }
 
     #[test]
+    fn four_arm_order_is_position_balanced_across_four_rounds() {
+        let mut positions = std::collections::BTreeMap::<&'static str, Vec<usize>>::new();
+        for round in 0..4 {
+            for (position, arm) in balanced_four_arm_order(7, "intent-1", round)
+                .into_iter()
+                .enumerate()
+            {
+                positions.entry(arm.as_str()).or_default().push(position);
+            }
+        }
+
+        for arm in BlindArm::all() {
+            let mut seen = positions.remove(arm.as_str()).unwrap_or_default();
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2, 3], "{} position bias", arm.as_str());
+        }
+    }
+
+    #[test]
+    fn every_product_arm_is_now_implemented() {
+        assert!(BlindArm::all().into_iter().all(BlindArm::implemented));
+    }
+
+    #[test]
     fn majority_vote_and_tie_are_reported_honestly() {
         let verdicts = vec![
             verdict("i1", BlindArm::ParallelCrew, 0),
@@ -326,14 +373,26 @@ mod tests {
         assert_eq!(
             summary.absent_arms,
             vec!["sequential_crew".to_string(), "duet_merge".to_string()],
-            "未实现臂必须显式列缺席"
+            "本轮未生成的臂必须显式列缺席"
         );
         assert_eq!(summary.wins, vec![("parallel_crew".to_string(), 1)]);
-        // implemented() 与 absent 清单一致性
-        for arm in BlindArm::all() {
-            if !arm.implemented() {
-                assert!(summary.absent_arms.contains(&arm.as_str().to_string()));
-            }
-        }
+    }
+
+    #[test]
+    fn generated_intents_are_counted_without_in_process_judging() {
+        let samples = vec![ArmSample {
+            arm: BlindArm::SequentialCrew,
+            intent_id: "i1".into(),
+            text_chars: 1_000,
+            latency_ms: 1,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            text_fingerprint16: "cc".into(),
+        }];
+
+        let summary = summarize_matrix(&[], &samples, 0);
+
+        assert_eq!(summary.intents, 1);
+        assert!(summary.wins.is_empty());
     }
 }

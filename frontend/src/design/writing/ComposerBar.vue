@@ -7,6 +7,7 @@
  * 接线时原样作为 start-writing 文本发出即可。
  */
 import { ref } from 'vue'
+import { generationModeCatalog } from '../../utils/generationModes.js'
 
 const props = defineProps({
   writing: { type: Boolean, default: false },
@@ -28,11 +29,7 @@ const chips = [
   { label: '总结', prefix: '总结以上内容：' },
 ]
 
-const generationModes = [
-  { value: 'continuation', label: '续写', hint: '单笔者' },
-  { value: 'duet', label: '对手戏', hint: 'A-B-A' },
-  { value: 'sequential_crew', label: '顺序剧组', hint: '逐角接戏' },
-]
+const generationModes = generationModeCatalog
 
 function applyChip(chip) {
   if (props.disabled || props.writing) return
@@ -63,12 +60,15 @@ function submit() {
         :class="generationMode === mode.value
           ? 'border-accent-border bg-accent-soft text-accent-bright'
           : 'border-line bg-surface-2 text-ink-soft hover:border-accent-border'"
-        :title="mode.hint"
+        :title="`${mode.hint} · ${mode.callEstimate}`"
         @click="emit('update-generation-mode', mode.value)"
       >
         {{ mode.label }}
-        <span v-if="mode.value === 'sequential_crew'" class="ml-1 text-[10px] opacity-75">重点</span>
+        <span v-if="mode.featured" class="ml-1 text-[10px] opacity-75">重点</span>
       </button>
+      <span class="ml-1 text-[10px] text-ink-faint">
+        {{ generationModes.find((mode) => mode.value === generationMode)?.callEstimate }}
+      </span>
     </div>
     <div class="flex items-end gap-3">
       <textarea

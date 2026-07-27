@@ -545,9 +545,9 @@ pub fn resolve_llm_connection() -> Result<LlmConnection, String> {
         return Ok(conn);
     }
 
-    // 回退：读 data/connections.json 的 active 连接
-    let data_dir = exe_data_dir();
-    let path = data_dir.join("connections.json");
+    // 回退：读取生产应用数据目录里的 active 连接。Windows 正式版使用
+    // %APPDATA%/StoryForge；只有无法解析 OS 数据目录时才兼容旧 exe/data。
+    let path = default_connections_path();
     if !path.exists() {
         return Err(format!(
             "无 LLM 凭证：env 未设全 LLM_BASE_URL/API_KEY/MODEL，且 {} 不存在",
@@ -670,9 +670,45 @@ fn exe_data_dir() -> PathBuf {
     exe_dir.join("data")
 }
 
+fn default_connections_path() -> PathBuf {
+    connections_path_from_env_values(
+        std::env::var("STORYFORGE_APP_DATA_DIR").ok(),
+        std::env::var("APPDATA").ok(),
+    )
+}
+
+fn connections_path_from_env_values(explicit: Option<String>, appdata: Option<String>) -> PathBuf {
+    if let Some(explicit) = explicit
+        && !explicit.trim().is_empty()
+    {
+        return PathBuf::from(explicit).join("connections.json");
+    }
+    if cfg!(target_os = "windows")
+        && let Some(appdata) = appdata
+        && !appdata.trim().is_empty()
+    {
+        return PathBuf::from(appdata)
+            .join("StoryForge")
+            .join("connections.json");
+    }
+    exe_data_dir().join("connections.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_app_data_dir_controls_connection_fallback_path() {
+        let root = std::env::temp_dir().join("storyforge-harness-connection-path");
+        assert_eq!(
+            connections_path_from_env_values(
+                Some(root.to_string_lossy().into_owned()),
+                Some("ignored-appdata".into()),
+            ),
+            root.join("connections.json")
+        );
+    }
 
     #[test]
     fn env_tool_mode_defaults_to_native() {

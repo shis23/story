@@ -14,7 +14,7 @@
 | git push 长期解 | **搁置**（继续用京东云隧道，见 memory push-via-jd-tunnel） |
 | 发布方向 | **双线并行**：桌面收尾照走，Android 约束到 AND-2（系统选择器文件导入）/AND-3（数据目录+迁移）先行 |
 | 发布 CI | **批准在京东云部署 act_runner** 注册 Gitea 实跑 workflow；本机跑 tauri build 出 Windows 安装包证据 |
-| 战略实验 | **都做**：多 Agent 盲测首轮已完成；写作流水线重设计已落地（四档生成、Sequential Crew 主路径、按模式整体重写、Accept 前回合小票） |
+| 战略实验 | **已收口**：四臂真实生成 + 异模型子代理盲评已完成；写作流水线 V2 已落地（四档生成、Sequential Crew 主路径、成本预检、按模式重写、Accept 前回合小票） |
 | V4 损坏恢复 | **启动拦截 + 恢复提示**（检测到主文件损坏不再静默空集：前端弹恢复引导，用户确认前不写盘） |
 
 ## 执行队列与状态
@@ -183,9 +183,16 @@
   整体重写现沿用当前产品模式并落回原消息 variant；Sequential Crew 还支持从选中
   角色起向后重演，并以产物来源模式校验阻止旧稿误复用；续写、对手戏仍只支持整体重写，
   旧 `big_scene` 兼容档继续保留 Editor/Subagent 局部重跑。
+  三种前端产品入口已展示稳定调用量；未显式指定模式且自动升入 Sequential Crew 时，
+  后端在任何对话写入前 fail closed，要求调用方确认后显式重试。
+  四臂均已走 DeepSeek v4 Pro 真实产品路径；独立 Codex 子代理四轮 Latin-square
+  盲评中 parallel 4/4 第一、duet 在不适用的四角色题上 4/4 最后、sequential 与 solo
+  2:2。Sequential 后缀重演另以真实模型验证前缀不变、Director 不重启、只重放
+  目标角色及下游（539.77s，5 次调用）。
   完整实施边界、暂缓项和验证基线见
-  `WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md`。可编辑场景卡、emotion_stage
-  标定和后续四臂质量评测仍待继续；Android AND-2/AND-3（PLAN-ANDROID.md）未起步。
+  `WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md`。可编辑场景卡、Duet 第 k 拍重演、
+  emotion_stage 与多意图/多 seed 标定进入 V2.1；Android AND-2/AND-3
+  （PLAN-ANDROID.md）未起步。
 
 ### 周级工程（起步后持续，不指望今天闭环）
 

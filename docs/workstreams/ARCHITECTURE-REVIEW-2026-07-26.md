@@ -891,7 +891,7 @@ N 个 Subagent **互相看不见地**各写独白，Editor 事后缝合成"交�
 ## 2026-07-26 补记三：写作流水线重设计（完整设计讨论定稿）
 
 > 来源：补记二之后的多轮设计对话（产品经理视角起步，经五组质询逐层修订）。
-> 状态：**原始设计定稿；2026-07-27 已按产品复核后的四档方案落地第一版**。实现时将 Summarizer / PostProcessor 拆成独立职责，把回合小票前移到 Accept 之前，并把 Sequential Crew 提升为群像主路径；详见 [WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md](WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md)。§11 的四臂盲测仍是后续质量标定任务，不再作为代码骨架开工门槛。
+> 状态：**原始设计定稿；2026-07-27 写作流水线 V2 已收口**。Summarizer / PostProcessor 已拆成独立职责，回合小票位于 Accept 之前，Sequential Crew 是群像主路径；四臂真实生成、异模型子代理盲评试点与 Sequential Crew 真实后缀恢复验收均已完成。详见 [WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md](WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md) 与 [BLIND-AB-PIPELINE-RESULT.md](BLIND-AB-PIPELINE-RESULT.md)。多意图、多 seed 和双角色 Duet cohort 属于 V2.1 质量标定。
 > 阅读提示：本节是自洽的设计规格草案，与补记二的"评述"不同，可直接作为后续 PLAN 的母本。
 
 ### 1. 设计起点：回合契约

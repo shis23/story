@@ -460,9 +460,9 @@ impl crate::LlmClient for HttpLlmClient {
 /// 正规化 base_url 为完整的 chat completions 端点
 fn normalize_base_url(base_url: &str) -> String {
     let url = base_url.trim_end_matches('/');
-    if url.ends_with("/v1/chat/completions") {
+    if url.ends_with("/chat/completions") {
         url.to_string()
-    } else if url.ends_with("/v1") {
+    } else if url.ends_with("/v1") || url.ends_with("/v4") {
         format!("{url}/chat/completions")
     } else {
         format!("{url}/v1/chat/completions")
@@ -547,6 +547,18 @@ mod tests {
             tool_mode: ToolMode::Native,
         };
         HttpLlmClient::new(&conn).unwrap()
+    }
+
+    #[test]
+    fn coding_v4_base_url_keeps_provider_api_version() {
+        assert_eq!(
+            normalize_base_url("https://open.bigmodel.cn/api/coding/paas/v4"),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            normalize_base_url("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # 写作流水线 V2 实施说明（2026-07-27）
 
-> 状态：主生成与整体重写均已落地，并通过确定性测试与生产构建。
+> 状态：**V2 已收口**。主生成、整体/后缀重写、成本预检、四臂真实试跑和真实 Sequential Crew 恢复验收均已落地。
 > 决策来源：`ARCHITECTURE-REVIEW-2026-07-26.md` 的写作流水线重设计，以及 2026-07-27 的产品复核。
 
 ## 1. 本次确定的产品原则
@@ -13,12 +13,12 @@
 
 ## 2. 四种生成模式
 
-| 模式 | 适用场景 | 实际执行链 | 定位 |
-| --- | --- | --- | --- |
-| 续写 `continuation` | 日常推进、小节拍 | Writer 一次正文调用 → Summarizer → PostProcessor | 默认、最低成本 |
-| 对手戏 `duet` | 两名角色直接交锋或秘密分歧 | A → B → A 顺序接戏 → Editor-lite → Summarizer → PostProcessor | 两人结构隔离档 |
-| 顺序剧组 `sequential_crew` | 三人以上群像、复杂反应链 | Director → 按顺序逐个 Actor → Editor → Summarizer → PostProcessor | **重点群像主路径** |
-| 大场面 `big_scene` | 兼容旧工作流或 API 显式指定 | Director → 并行 Subagents → Editor → Summarizer → PostProcessor | 旧并行流水线兼容档 |
+| 模式 | 适用场景 | 实际执行链 | 调用量提示 | 定位 |
+| --- | --- | --- | --- | --- |
+| 续写 `continuation` | 日常推进、小节拍 | Writer 一次正文调用 → Summarizer → PostProcessor | 1 次正文 + 2 次廉价记账 | 默认、最低成本 |
+| 对手戏 `duet` | 两名角色直接交锋或秘密分歧 | A → B → A 顺序接戏 → Editor-lite → Summarizer → PostProcessor | 3–4 次正文编排 + 2 次廉价记账 | 两人结构隔离档 |
+| 顺序剧组 `sequential_crew` | 三人以上群像、复杂反应链 | Director → 按顺序逐个 Actor → Editor → Summarizer → PostProcessor | 2+N 次顺序编排 + 2 次廉价记账 | **重点群像主路径** |
+| 大场面 `big_scene` | 兼容旧工作流或 API 显式指定 | Director → 并行 Subagents → Editor → Summarizer → PostProcessor | 4+N 次正文编排 + 2 次廉价记账 | 旧并行流水线兼容档 |
 
 其中 Summarizer 与 PostProcessor 是两个独立调用和独立状态：
 
@@ -63,7 +63,7 @@
 
 总分达到 2 进入对手戏，否则续写。`emotion_stage` 暂不作为硬规则，等真实回合证据足够后再标定。
 
-前端当前提供显式模式选择，并将选择保存在 Campaign 级本地记忆中；未传模式的 API 调用才进入上述自动路由。后端响应会返回实际模式与路由理由，供后续 UI 解释和评测使用。
+前端提供显式模式选择、展示当前档位的预计调用量，并将选择保存在 Campaign 级本地记忆中。未传模式的 API 调用才进入上述自动路由；若自动规则建议升级到昂贵的 Sequential Crew，后端会在写入开场白或用户消息之前 fail closed，返回建议模式与 `2+N` 费用提示。调用方确认后须显式以 `generation_mode=sequential_crew` 重试，因此不会出现已经落下用户消息才询价、取消后留下半轮数据的情况。显式选择从不重复询问。
 
 ## 5. Turn Dossier（回合案卷）
 
@@ -99,8 +99,9 @@
 - Sequential Crew 已提高自动路由优先级；大场面档目前只由用户显式选择，不与 Sequential Crew 争抢自动群像路由。
 - 整体 `regenerate` 已按当前产品模式重演：续写仍只调用 Writer；对手戏仍执行 A→B→A；Sequential Crew 仍按顺序接戏。重写历史在目标消息前截断，产物落为原消息的新 variant，并保留用户 hint 与 seed。
 - 续写与对手戏仍只支持整体重写；Sequential Crew 支持“从选中角色起向后重演”，复用此前演员的公开场记并重跑选中角色、全部下游角色与 Editor。只有来源明确记录为 `sequential_crew` 的产物才开放该入口，旧稿或切换模式后的不匹配稿件会被前后端共同拒绝。`big_scene` 兼容档继续支持“只重 Editor / 只重某 Subagent”。对手戏从第 k 拍截断仍属暂缓项。
-- 原设计中的可编辑“场景卡”、基于真实质量数据的成本阈值确认，以及 `emotion_stage` 路由标定不在本次第一版范围。
-- 四臂盲测仍需执行，用于比较正文质量和校准路由，而不是阻塞当前结构落地。
+- 自动昂贵升档已经具备 fail-closed 成本确认，调用量提示已进入前端和后端稳定契约；基于更多真实样本调整具体阈值属于 V2.1 标定。
+- 四臂真实生成与外部盲评试点已经完成；方法、结果和限制见 `BLIND-AB-PIPELINE-RESULT.md`。
+- 可编辑“场景卡”、Duet 从第 k 拍截断重演、`emotion_stage` 路由标定和多意图/多 seed 质量矩阵属于 V2.1，不影响 V2 当前四档的正确性收口。
 
 ## 8. 主要代码落点
 
@@ -114,19 +115,24 @@
 | 后处理职责与尝试状态 | `crates/app-agent/src/pipeline_postprocess.rs` |
 | 回合小票、后处理重试、采纳过滤 | `crates/tauri-app/src/lib.rs`、`crates/tauri-app/src/turn_lifecycle.rs` |
 | 模式选择与 Campaign 记忆 | `frontend/src/design/writing/ComposerBar.vue`、`frontend/src/composables/usePipeline.js` |
+| 调用量产品契约 | `crates/domain/src/generation.rs`、`frontend/src/utils/generationModes.js` |
+| 四臂真实评测与恢复验收 | `crates/harness-real-llm/src/blind_arm_matrix.rs`、`crates/harness-real-llm/tests/blind_arm_matrix_real_llm.rs` |
 | 回合小票 UI | `frontend/src/design/writing/MessageItem.vue`、`frontend/src/stores/writing.js` |
 
 ## 9. 验证基线
 
-第一版完成时已覆盖：
+V2 收口时已覆盖：
 
 - 四种模式的序列与 Agent 调用边界；
 - 当前模式整体重写、原消息 variant 落点、seed/hint 保留与目标消息历史截断；
 - Sequential Crew 依赖安全的后缀重演、旧产物拒绝与兼容大场面局部重跑；
 - Sequential Crew 的顺序、失败重试和私有思维不泄漏；
 - 群像硬规则、对手戏评分与显式选择优先；
+- 前端调用量提示、自动昂贵升档的写入前 fail-closed 确认；
 - 回合小票首次拦截、逐项选择、结构 mutation 保留；
 - 后处理失败重试与显式降级；
 - JSON / SQLite Accept 生命周期一致性；
 - 前端 store、composable、adapter 单测；
+- 四臂真实产品路径生成、独立子代理 Latin-square 盲评；
+- DeepSeek v4 Pro 真实 Sequential Crew 后缀恢复：前缀保持、Director 不重启、仅重放目标及下游角色；
 - Rust workspace 编译和前端生产构建。

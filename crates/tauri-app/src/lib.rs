@@ -2645,6 +2645,22 @@ fn generation_route_signals(
     generation_route_signals_from_parts(intent, &actors, &[], explicit_mode)
 }
 
+fn enforce_generation_cost_confirmation(
+    decision: &storyforge_domain::generation::GenerationRouteDecision,
+) -> Result<(), TauriCommandError> {
+    if !decision.requires_cost_confirmation {
+        return Ok(());
+    }
+    let wire_mode =
+        serde_json::to_string(&decision.mode).unwrap_or_else(|_| "\"sequential_crew\"".to_string());
+    Err(TauriCommandError::validation(format!(
+        "自动路由建议升级到 {}（预计 {}）。为避免静默产生高成本调用，本轮尚未启动；请确认后显式重试 generation_mode={}。",
+        wire_mode.trim_matches('"'),
+        decision.mode.estimated_call_label(),
+        wire_mode.trim_matches('"'),
+    )))
+}
+
 #[tauri::command]
 async fn start_writing(
     intent: String,
@@ -2673,6 +2689,44 @@ async fn start_writing(
     // 构造写作上下文（从 tool_ctx 快照读取，导入的角色卡/世界书自动可见）
     let tool_snapshot = app.snapshot_tool_ctx();
 
+    // 在写入开场白/用户意图之前完成自动路由预检。自动升到昂贵群像档时
+    // fail closed，调用方须把建议模式作为显式 generation_mode 重试。
+    let provisional_conversation_id = conversation_id
+        .as_deref()
+        .map(Id::from_str)
+        .unwrap_or_default();
+    let mut ctx = WritingContext {
+        characters: tool_snapshot.characters.clone(),
+        world_info: tool_snapshot.world_info.clone(),
+        conversation_id: provisional_conversation_id,
+        campaign_id: None,
+        turn: 0,
+        pending_tasks: vec![],
+        story_clock: String::new(),
+        profile: None,
+        modules: vec![],
+        regex_scripts: vec![],
+        campaign_runtime: None,
+        agent_profile_config: None,
+        recent_summaries: vec![],
+        chronicle_prompt_catalog: vec![],
+        far_memory_hits: vec![],
+        template_random_seed: None,
+        context_epoch: None,
+        chronicle_revision: 0,
+    };
+    fill_campaign_context_async(&mut ctx, &app).await?;
+    let route_decision = storyforge_domain::generation::route_generation_mode(
+        &generation_route_signals(&intent, &ctx, generation_mode),
+    );
+    enforce_generation_cost_confirmation(&route_decision)?;
+    tracing::info!(
+        mode = ?route_decision.mode,
+        reason = ?route_decision.reason,
+        explicit = generation_mode.is_some(),
+        "selected writing generation mode"
+    );
+
     // 一 Campaign 一对话：Campaign 模式下用 Campaign 绑定的 conversation_id，
     // 覆盖前端传入的（前端可能在切档时传错或传 null）
     let legacy_opening_character = tool_snapshot.characters.first().cloned();
@@ -2688,37 +2742,16 @@ async fn start_writing(
     .await?;
     let conversation_id = start_target.conversation_id;
     let regex_character_id = start_target.regex_character_id;
-
-    let mut ctx = WritingContext {
-        characters: tool_snapshot.characters.clone(),
-        world_info: tool_snapshot.world_info.clone(),
-        conversation_id: conversation_id.clone(),
-        campaign_id: None,
-        turn: 0,
-        pending_tasks: vec![],
-        story_clock: String::new(),
-        profile: None,
-        modules: vec![],
-        regex_scripts: collect_scoped_regex_scripts(
-            regex_character_id.as_deref(),
-            &tool_snapshot.characters,
-        ),
-        campaign_runtime: None,
-        agent_profile_config: None,
-        recent_summaries: vec![],
-        chronicle_prompt_catalog: vec![],
-        far_memory_hits: vec![],
-        template_random_seed: None,
-        context_epoch: None,
-        chronicle_revision: 0,
-    };
+    ctx.conversation_id = conversation_id.clone();
+    let campaign_regex_scripts = std::mem::take(&mut ctx.regex_scripts);
+    ctx.regex_scripts =
+        collect_scoped_regex_scripts(regex_character_id.as_deref(), &tool_snapshot.characters);
+    append_missing_campaign_scoped_regex_scripts(&mut ctx, campaign_regex_scripts);
     fill_regex_context(&mut ctx, get_preset_store(), get_global_regex_store());
     // 从模块/Profile 存储加载预设配置
     fill_profile_context(&mut ctx, &app);
     // 从活跃 Agent Profile Config 加载运行时配置覆盖
     fill_agent_profile_context(&mut ctx, &app);
-    // 从活跃 Campaign 填充 P2 字段（任务注入导演 / 后处理需要）
-    fill_campaign_context_async(&mut ctx, &app).await?;
     // ContextCompiler：按用户意图自动召回 ArchivedSummary 远记忆
     fill_far_memory_hits(&mut ctx, &app, &intent).await;
 
@@ -2768,16 +2801,6 @@ async fn start_writing(
 
     // Operation-owned cancel: pipeline / autofix / postprocess all clone this receiver.
     let (operation_id, cancel_rx) = begin_writing_operation(&app);
-
-    let route_decision = storyforge_domain::generation::route_generation_mode(
-        &generation_route_signals(&intent, &ctx, generation_mode),
-    );
-    tracing::info!(
-        mode = ?route_decision.mode,
-        reason = ?route_decision.reason,
-        explicit = generation_mode.is_some(),
-        "selected writing generation mode"
-    );
 
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
@@ -22134,6 +22157,46 @@ mod tests {
             storyforge_domain::generation::route_generation_mode(&signals).mode,
             storyforge_domain::generation::GenerationMode::Duet,
         );
+    }
+
+    #[test]
+    fn automatic_expensive_route_requires_an_explicit_resubmission() {
+        use storyforge_domain::generation::{
+            GenerationMode, GenerationRouteDecision, GenerationRouteReason,
+        };
+        let decision = GenerationRouteDecision {
+            mode: GenerationMode::SequentialCrew,
+            reason: GenerationRouteReason::ActorCount,
+            requires_cost_confirmation: true,
+        };
+
+        let err = enforce_generation_cost_confirmation(&decision)
+            .expect_err("automatic expensive upgrade must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("sequential_crew"));
+        assert!(message.contains("2+N"));
+        assert!(message.contains("generation_mode"));
+    }
+
+    #[test]
+    fn cheap_or_explicit_route_needs_no_extra_confirmation() {
+        use storyforge_domain::generation::{
+            GenerationMode, GenerationRouteDecision, GenerationRouteReason,
+        };
+        for decision in [
+            GenerationRouteDecision {
+                mode: GenerationMode::Continuation,
+                reason: GenerationRouteReason::EconomyDefault,
+                requires_cost_confirmation: false,
+            },
+            GenerationRouteDecision {
+                mode: GenerationMode::SequentialCrew,
+                reason: GenerationRouteReason::ExplicitChoice,
+                requires_cost_confirmation: false,
+            },
+        ] {
+            enforce_generation_cost_confirmation(&decision).unwrap();
+        }
     }
 
     /// AND-3：storage_meta 首建/升级轨迹 + 损坏容错（不 panic）。

@@ -1,50 +1,58 @@
-//! 四臂盲测——首轮两臂实测（solo_writer vs parallel_crew，真实 LLM）。
+//! Four-arm production pipeline evaluation with position-balanced blind judging.
 //!
-//! 设计与判读口径：docs/workstreams/BLIND-AB-PIPELINE-PLAN.md（预注册）；
-//! 骨架：harness_real_llm::blind_arm_matrix。sequential_crew/duet_merge
-//! 未实现，报告 absent_arms 显式列出。
-//!
-//! 运行方式：
+//! Run with an OpenAI-compatible endpoint:
 //! ```text
-//! $env:LLM_BASE_URL='https://cli.2529985.xyz/v1'
-//! $env:LLM_API_KEY='<key>'                 # 只从环境读取
-//! $env:LLM_MODEL='deepseek-v4-pro'
+//! $env:LLM_BASE_URL='https://open.bigmodel.cn/api/coding/paas/v4'
+//! $env:LLM_API_KEY='<process-only secret>'
+//! $env:LLM_MODEL='glm-5.2'
 //! $env:STORYFORGE_LLM_TIMEOUT_SECS='600'
 //! cargo test -p harness-real-llm --test blind_arm_matrix_real_llm -- --ignored --nocapture
 //! ```
-//! 证据（脱敏：分数/胜负/成本/指纹，无正文）写 `artifacts/blind-ab/`；
-//! 正文样本写同目录 `texts/`（目录整体 gitignore，人工复核用）。
+//!
+//! The tracked evidence is privacy-safe: scores, arm identities, latency, usage,
+//! and hashes only. Full generated text is written below ignored `artifacts/` for
+//! local human review.
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use harness_real_llm::blind_arm_matrix::{
-    ArmSample, BlindArm, JudgeVerdict, majority_for_pair, presentation_order, summarize_matrix,
+    ArmSample, BlindArm, JudgeVerdict, balanced_four_arm_order, majority_for_pair, summarize_matrix,
 };
 use harness_real_llm::{HarnessEnv, require_real_llm};
-use storyforge_app_pipeline::WritingContext;
+use storyforge_app_conversation::PartialRollTarget;
+use storyforge_app_pipeline::{RegenerateRequest, WritingContext};
 use storyforge_domain::Source;
+use storyforge_domain::agent::PipelineEvent;
 use storyforge_domain::character::{Character, CharacterCard, CharacterDefinition, RoleType};
-use storyforge_domain::llm::{ChatMessage, ChatRequest, SamplingParams};
-use tokio::sync::{mpsc, watch};
+use storyforge_domain::generation::GenerationMode;
+use storyforge_domain::llm::{
+    ChatMessage, ChatRequest, ChatResponse, LlmError, SamplingParams, StreamChunk,
+};
+use storyforge_infra_llm::LlmClient;
+use tokio::sync::{Semaphore, mpsc, watch};
 
 const SEED: u64 = 20260727;
-const JUDGE_ROUNDS: u8 = 3;
+const JUDGE_ROUNDS: u8 = 4;
 
 fn intents() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "i1_opening",
-            "开场：夜雨初歇，两人在灯塔下初次交谈，铺陈各自来意。",
+            "开场：夜雨初歇，四人在灯塔下第一次交谈，铺陈各自来意；必须让每个人都以可辨认的方式参与。",
         ),
         (
             "i2_conflict",
-            "冲突升级：矛盾摊到明面，双方立场碰撞，不许和稀泥收场。",
+            "冲突升级：沉船旧案的关键证物被摆到明面，四方立场碰撞，不许和稀泥收场，也不许任何人凭空知道他人的秘密。",
         ),
         (
             "i3_ensemble",
-            "两人同场：一段有来有回的长对话，各自的声音要立得住。",
+            "群像推进：警铃突然响起，所有人必须在同一场景里作出相互衔接的行动与反应，人物声音要立得住。",
         ),
         (
             "i4_constraint",
-            "回收伏笔：灯塔停摆的原因被触及，但本轮不许彻底揭开谜底。",
+            "回收伏笔：灯塔停摆的原因被触及，但本轮不许彻底揭开谜底；结尾必须形成下一轮可行动的新局面。",
         ),
     ]
 }
@@ -73,36 +81,56 @@ fn fixture_character(id: &str, name: &str, persona: &str) -> Character {
     }
 }
 
-/// 双角色 fixture 卡：守灯人 + 来查旧案的访客（对手戏张力面）。
 fn fixture_card() -> CharacterCard {
-    let keeper = fixture_character(
-        "blind-keeper",
-        "沈磐",
-        "老守灯人，沉默寡言，守着灯塔与一桩三十年前的沉船旧事；绝不主动提旧案。",
-    );
-    let visitor = fixture_character(
-        "blind-visitor",
-        "闻笛",
-        "年轻的海事调查员，为三十年前沉船旧案而来，敏锐、执拗、不肯空手而归。",
-    );
-    let mut card = CharacterCard::from_character(&keeper);
-    let mut def_a = CharacterDefinition::fallback_from_character(&keeper, &[]);
-    def_a.role_type = RoleType::Protagonist;
-    let mut def_b = CharacterDefinition::fallback_from_character(&visitor, &[]);
-    def_b.name = "闻笛".into();
-    def_b.persona_prompt = visitor.personality.clone();
-    def_b.role_type = RoleType::Supporting;
+    let characters = [
+        fixture_character(
+            "blind-keeper",
+            "沈砚",
+            "老守灯人，沉默寡言，守着灯塔与三十年前的沉船旧事；绝不主动提旧案。",
+        ),
+        fixture_character(
+            "blind-investigator",
+            "闻笙",
+            "年轻海事调查员，为沉船旧案而来；敏锐、执拗，不肯空手而归。",
+        ),
+        fixture_character(
+            "blind-smuggler",
+            "贺川",
+            "熟悉暗礁的走私客，外表轻佻，真正目的在找回沉船上的账册。",
+        ),
+        fixture_character(
+            "blind-doctor",
+            "苏棠",
+            "岛上医生，克制冷静，知道当年伤员名单有一处被人为涂改。",
+        ),
+    ];
+    let mut card = CharacterCard::from_character(&characters[0]);
+    let definitions = characters
+        .iter()
+        .enumerate()
+        .map(|(index, character)| {
+            let mut definition = CharacterDefinition::fallback_from_character(character, &[]);
+            definition.role_type = if index == 0 {
+                RoleType::Protagonist
+            } else {
+                RoleType::Supporting
+            };
+            definition
+        })
+        .collect();
     card.character_definitions =
-        storyforge_app_agent::attach_definitions_to_card(vec![def_a, def_b], &card.id);
+        storyforge_app_agent::attach_definitions_to_card(definitions, &card.id);
     card
 }
 
 fn sha16(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let out = hasher.finalize();
-    out.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    let digest = Sha256::digest(text.as_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn artifacts_dir() -> std::path::PathBuf {
@@ -111,107 +139,182 @@ fn artifacts_dir() -> std::path::PathBuf {
         .join("..")
         .join("artifacts")
         .join("blind-ab");
-    std::fs::create_dir_all(dir.join("texts")).expect("建证据目录失败");
+    std::fs::create_dir_all(dir.join("texts")).expect("create blind evaluation directory");
     dir
 }
 
-/// solo_writer 臂：同源 campaign 状态拼单条提示直写（续写档原型的最简形态）。
-async fn run_solo_writer(
-    env: &HarnessEnv,
-    ctx: &WritingContext,
-    intent: &str,
-) -> Result<(String, u128, u64, u64), String> {
-    let runtime = ctx
-        .campaign_runtime
-        .as_ref()
-        .ok_or("solo 臂需要 campaign_runtime")?;
-    let mut roster = String::new();
-    for inst in &runtime.instances {
-        let def = runtime.definition_for_instance(inst);
-        roster.push_str(&format!(
-            "### {}\n人设：{}\n行为准则：{}\n",
-            inst.name,
-            inst.resolved_persona(def).unwrap_or("（无）"),
-            inst.resolved_behavior(def).unwrap_or("（无）"),
-        ));
-    }
-    let system = format!(
-        "你是一位单人执笔的小说家，独立完成整段叙事。\n\
-         场景：{}\n\n## 在场角色\n{roster}\n\
-         ## 写作要求\n- 用中文写一段完整的小说叙事（600-1000 字）\n\
-         - 每个角色的声音与知识边界要立得住；不代替用户行动\n\
-         - 只输出正文，不要任何解释或标题",
-        "海崖上的老灯塔，守灯人世代相传；灯已停摆三夜。"
-    );
-    let req = ChatRequest {
-        messages: vec![
-            ChatMessage::system(system),
-            ChatMessage::user(intent.to_string()),
-        ],
-        tools: None,
-        params: SamplingParams {
-            temperature: Some(0.7),
-            max_tokens: Some(8192),
-            max_tokens_explicit: true,
-            ..Default::default()
-        },
-        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into()),
-    };
-    let t0 = std::time::Instant::now();
-    let resp = env
-        .llm
-        .chat(&req)
-        .await
-        .map_err(|e| format!("solo 臂调用失败: {e}"))?;
-    let usage = resp.usage.clone().unwrap_or_default();
-    Ok((
-        resp.content,
-        t0.elapsed().as_millis(),
-        u64::from(usage.prompt_tokens),
-        u64::from(usage.completion_tokens),
-    ))
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct UsageTotals {
+    calls: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
-/// parallel_crew 臂：当前生产平行流水线。
-async fn run_parallel_crew(
+impl UsageTotals {
+    fn delta(self, before: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(before.calls),
+            prompt_tokens: self.prompt_tokens.saturating_sub(before.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(before.completion_tokens),
+        }
+    }
+}
+
+/// Records provider usage and serializes outbound dispatches. The production
+/// big-scene arm still schedules subagents concurrently, but this harness avoids
+/// turning a shared evaluation endpoint into an accidental load test.
+struct RecordingLlmClient {
+    inner: Arc<dyn LlmClient>,
+    dispatch_gate: Semaphore,
+    calls: AtomicU64,
+    tokens: Mutex<(u64, u64)>,
+}
+
+impl RecordingLlmClient {
+    fn new(inner: Arc<dyn LlmClient>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            dispatch_gate: Semaphore::new(1),
+            calls: AtomicU64::new(0),
+            tokens: Mutex::new((0, 0)),
+        })
+    }
+
+    fn snapshot(&self) -> UsageTotals {
+        let (prompt_tokens, completion_tokens) = *self.tokens.lock().expect("usage lock");
+        UsageTotals {
+            calls: self.calls.load(Ordering::SeqCst),
+            prompt_tokens,
+            completion_tokens,
+        }
+    }
+
+    fn record(&self, response: &ChatResponse) {
+        if let Some(usage) = response.usage.as_ref() {
+            let mut totals = self.tokens.lock().expect("usage lock");
+            totals.0 += u64::from(usage.prompt_tokens);
+            totals.1 += u64::from(usage.completion_tokens);
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for RecordingLlmClient {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        let _permit = self
+            .dispatch_gate
+            .acquire()
+            .await
+            .map_err(|_| LlmError::Internal("evaluation dispatch gate closed".into()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.inner.chat(request).await?;
+        self.record(&response);
+        Ok(response)
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+        tx: mpsc::UnboundedSender<StreamChunk>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ChatResponse, LlmError> {
+        let _permit = self
+            .dispatch_gate
+            .acquire()
+            .await
+            .map_err(|_| LlmError::Internal("evaluation dispatch gate closed".into()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.inner.chat_stream(request, tx, cancel).await?;
+        self.record(&response);
+        Ok(response)
+    }
+}
+
+fn mode_for_arm(arm: BlindArm) -> GenerationMode {
+    match arm {
+        BlindArm::SoloWriter => GenerationMode::Continuation,
+        BlindArm::ParallelCrew => GenerationMode::BigScene,
+        BlindArm::SequentialCrew => GenerationMode::SequentialCrew,
+        BlindArm::DuetMerge => GenerationMode::Duet,
+    }
+}
+
+struct ArmRun {
+    text: String,
+    latency_ms: u128,
+    usage: UsageTotals,
+}
+
+async fn run_arm(
     env: &HarnessEnv,
-    ctx: &WritingContext,
+    recorder: &RecordingLlmClient,
+    arm: BlindArm,
     intent: &str,
-) -> Result<(String, u128), String> {
+) -> Result<ArmRun, String> {
+    let conversation = env.conv_store.create(None, None);
+    let context = env.fill_campaign_context(WritingContext::legacy(vec![], None, conversation.id));
+    let before = recorder.snapshot();
+    let started = std::time::Instant::now();
     let mut pipeline = env.new_pipeline();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    let t0 = std::time::Instant::now();
-    let (text, _node, _prov) = pipeline
-        .start_writing(intent.to_string(), ctx, event_tx, cancel_rx)
+    let (text, _node_id, provenance) = pipeline
+        .start_writing_with_mode(
+            intent.to_string(),
+            &context,
+            mode_for_arm(arm),
+            event_tx,
+            cancel_rx,
+        )
         .await
-        .map_err(|e| format!("parallel 臂失败: {e}"))?;
-    Ok((text, t0.elapsed().as_millis()))
+        .map_err(|error| format!("{} failed: {error}", arm.as_str()))?;
+    let provenance =
+        provenance.ok_or_else(|| format!("{} returned no provenance", arm.as_str()))?;
+    if provenance.generation_mode != Some(mode_for_arm(arm)) {
+        return Err(format!("{} returned wrong provenance mode", arm.as_str()));
+    }
+    Ok(ArmRun {
+        text,
+        latency_ms: started.elapsed().as_millis(),
+        usage: recorder.snapshot().delta(before),
+    })
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct JudgeOut {
-    winner: String,
-    scores_first: [u8; 4],
-    scores_second: [u8; 4],
+    ranking: Vec<String>,
+    scores: BTreeMap<String, [u8; 4]>,
 }
 
-/// 裁判一轮（双盲：只见"文本甲/文本乙"）。解析失败重试一次。
+fn validate_judge_output(output: &JudgeOut) -> bool {
+    let expected = ["A", "B", "C", "D"];
+    output.ranking.len() == expected.len()
+        && expected
+            .iter()
+            .all(|label| output.ranking.iter().any(|ranked| ranked == label))
+        && output.scores.len() == expected.len()
+        && expected.iter().all(|label| {
+            output
+                .scores
+                .get(*label)
+                .is_some_and(|scores| scores.iter().all(|score| (1..=10).contains(score)))
+        })
+}
+
 async fn judge_once(
     env: &HarnessEnv,
     intent: &str,
-    first_text: &str,
-    second_text: &str,
+    ordered_texts: &[&str; 4],
 ) -> Result<JudgeOut, String> {
-    let system = "你是严格的小说评审。对比两段针对同一写作指令的叙事文本，按四个维度各打 1-10 分：\
-        ①角色一致性（人设/声音/知识边界，多角色时人物区分度）②情节推进（是否响应指令、有效事件密度）\
-        ③文风质量（叙事张力、重复率、AI 腔；注意：篇幅长短本身不是优点）④约束遵守（不代打用户、不出戏、格式干净）。\
-        只输出 JSON：{\"winner\":\"甲\"或\"乙\",\"scores_first\":[4个整数],\"scores_second\":[4个整数]}，无其他文字。";
+    let system = "你是严格的中文小说评审。比较四段响应同一指令的叙事文本。按四项分别打 1-10 分：角色一致性与人物区分、情节推进、文风质量、约束遵守。篇幅更长本身不是优点。你不知道文本来源，不得猜测生成方法。只输出 JSON：{\"ranking\":[\"A\",\"B\",\"C\",\"D\"],\"scores\":{\"A\":[四个整数],\"B\":[四个整数],\"C\":[四个整数],\"D\":[四个整数]}}。ranking 从最好到最差且四个标签各出现一次。";
     let user = format!(
-        "写作指令：{intent}\n\n【文本甲】\n{first_text}\n\n【文本乙】\n{second_text}\n\n请评审并输出 JSON。"
+        "写作指令：{intent}\n\n【文本 A】\n{}\n\n【文本 B】\n{}\n\n【文本 C】\n{}\n\n【文本 D】\n{}\n\n只输出 JSON。",
+        ordered_texts[0], ordered_texts[1], ordered_texts[2], ordered_texts[3]
     );
-    for _attempt in 0..2 {
-        let req = ChatRequest {
+    for _attempt in 0..3 {
+        let request = ChatRequest {
             messages: vec![
                 ChatMessage::system(system.to_string()),
                 ChatMessage::user(user.clone()),
@@ -219,173 +322,347 @@ async fn judge_once(
             tools: None,
             params: SamplingParams {
                 temperature: Some(0.2),
-                max_tokens: Some(2048),
+                max_tokens: Some(4096),
                 max_tokens_explicit: true,
                 ..Default::default()
             },
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into()),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "glm-5.2".into()),
         };
-        let resp = env
+        let response = env
             .llm
-            .chat(&req)
+            .chat(&request)
             .await
-            .map_err(|e| format!("裁判调用失败: {e}"))?;
-        let text = resp.content.trim();
-        let slice = match (text.find('{'), text.rfind('}')) {
-            (Some(a), Some(b)) if b > a => &text[a..=b],
+            .map_err(|error| format!("judge request failed: {error}"))?;
+        let text = response.content.trim();
+        let json = match (text.find('{'), text.rfind('}')) {
+            (Some(start), Some(end)) if end > start => &text[start..=end],
             _ => continue,
         };
-        if let Ok(out) = serde_json::from_str::<JudgeOut>(slice)
-            && (out.winner == "甲" || out.winner == "乙")
+        if let Ok(output) = serde_json::from_str::<JudgeOut>(json)
+            && validate_judge_output(&output)
         {
-            return Ok(out);
+            return Ok(output);
         }
     }
-    Err("裁判两次输出均不可解析".into())
+    Err("judge returned invalid JSON three times".into())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JudgeRoundEvidence {
+    intent_id: String,
+    round: u8,
+    presentation_order: Vec<String>,
+    ranking: Vec<String>,
+    scores: BTreeMap<String, [u8; 4]>,
+}
+
+fn arm_pairs() -> Vec<(BlindArm, BlindArm)> {
+    let arms = BlindArm::all();
+    let mut pairs = Vec::new();
+    for left_index in 0..arms.len() {
+        for right_index in (left_index + 1)..arms.len() {
+            pairs.push((arms[left_index], arms[right_index]));
+        }
+    }
+    pairs
+}
+
+async fn sequential_suffix_replay_acceptance(
+    env: &HarnessEnv,
+    recorder: &RecordingLlmClient,
+) -> Result<serde_json::Value, String> {
+    let conversation = env.conv_store.create(None, None);
+    let context = env.fill_campaign_context(WritingContext::legacy(
+        vec![],
+        None,
+        conversation.id.clone(),
+    ));
+    let mut pipeline = env.new_pipeline();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (_text, node_id, before_provenance) = pipeline
+        .start_writing_with_mode(
+            "群像验收：四人围绕失踪账册依次表态和行动，每个人都必须参与。".into(),
+            &context,
+            GenerationMode::SequentialCrew,
+            event_tx,
+            cancel_rx,
+        )
+        .await
+        .map_err(|error| format!("sequential setup failed: {error}"))?;
+    let before_provenance =
+        before_provenance.ok_or_else(|| "sequential setup returned no provenance".to_string())?;
+    if before_provenance.subagent_results.len() < 3 {
+        return Err(format!(
+            "sequential setup produced only {} actor performances",
+            before_provenance.subagent_results.len()
+        ));
+    }
+    let target_index = 1usize;
+    let target = before_provenance.subagent_results[target_index]
+        .character_id
+        .clone();
+    let prefix_hash = sha16(&before_provenance.subagent_results[0].full_text);
+    let before_usage = recorder.snapshot();
+    let request = RegenerateRequest {
+        conversation_id: conversation.id,
+        node_id,
+        targets: vec![PartialRollTarget::Subagent(target.clone())],
+        generation_mode: Some(GenerationMode::SequentialCrew),
+        hint: Some("让目标角色的回应更尖锐，并保持后续角色接戏连贯".into()),
+        seed: Some(SEED + 1),
+    };
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (replayed_text, after_provenance) = pipeline
+        .regenerate(request, &context, event_tx, cancel_rx)
+        .await
+        .map_err(|error| format!("sequential suffix replay failed: {error}"))?;
+
+    let mut replayed_indices = Vec::new();
+    let mut director_restarted = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            PipelineEvent::SubagentStarted { index, .. } => replayed_indices.push(index),
+            PipelineEvent::DirectorStarted => director_restarted = true,
+            _ => {}
+        }
+    }
+    let prefix_preserved = after_provenance
+        .subagent_results
+        .first()
+        .is_some_and(|snapshot| sha16(&snapshot.full_text) == prefix_hash);
+    if !prefix_preserved
+        || director_restarted
+        || replayed_indices.first().copied() != Some(target_index)
+        || after_provenance.generation_mode != Some(GenerationMode::SequentialCrew)
+        || replayed_text.trim().is_empty()
+    {
+        return Err(format!(
+            "suffix replay invariant failed: prefix={prefix_preserved}, director={director_restarted}, indices={replayed_indices:?}"
+        ));
+    }
+    Ok(serde_json::json!({
+        "target_character_id": target,
+        "target_index": target_index,
+        "actor_count": after_provenance.subagent_results.len(),
+        "prefix_preserved": prefix_preserved,
+        "director_restarted": director_restarted,
+        "replayed_indices": replayed_indices,
+        "result_fingerprint16": sha16(&replayed_text),
+        "usage": recorder.snapshot().delta(before_usage),
+    }))
 }
 
 #[tokio::test]
-#[ignore = "需要真实 LLM 凭证（LLM_BASE_URL/LLM_API_KEY/LLM_MODEL）"]
-async fn blind_two_arm_matrix_with_blind_judging() {
+#[ignore = "requires a real active LLM connection"]
+async fn provider_connection_and_native_tool_probe() {
+    use storyforge_domain::llm::ToolSpec;
+
     let llm = require_real_llm();
+    let request = ChatRequest {
+        messages: vec![ChatMessage::user(
+            "调用 echo_text 工具，参数 text 必须是 OK。不要直接回答。",
+        )],
+        tools: Some(vec![ToolSpec::function(
+            "echo_text",
+            "Echo text",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            }),
+        )]),
+        params: SamplingParams {
+            temperature: Some(0.0),
+            max_tokens: Some(1024),
+            max_tokens_explicit: true,
+            ..Default::default()
+        },
+        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
+    };
+    let response = llm.chat(&request).await.expect("real provider probe");
+    let call = response
+        .tool_calls
+        .first()
+        .expect("provider must return a native tool call");
+    assert_eq!(call.function.name, "echo_text");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap()["text"],
+        "OK"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real LLM credentials"]
+async fn blind_four_arm_generation_and_optional_self_judging() {
+    let recorder = RecordingLlmClient::new(require_real_llm());
+    let llm: Arc<dyn LlmClient> = recorder.clone();
     let env = HarnessEnv::new(llm);
     let dir = artifacts_dir();
 
-    // fixture campaign（双角色，无外部卡文件依赖——异机可复现）
     let stored = env.campaign_store.save_card(fixture_card()).unwrap();
-    let campaign_id = env.create_campaign(&stored.card, "blind-ab-campaign");
+    let campaign_id = env.create_campaign(&stored.card, "blind-four-arm-campaign");
     eprintln!("fixture campaign: {campaign_id}");
 
-    let mut samples: Vec<ArmSample> = Vec::new();
-    let mut verdicts: Vec<JudgeVerdict> = Vec::new();
-    let mut pairs = Vec::new();
+    let mut samples = Vec::<ArmSample>::new();
+    let mut verdicts = Vec::<JudgeVerdict>::new();
+    let mut judge_rounds = Vec::<JudgeRoundEvidence>::new();
+    let mut pair_majorities = Vec::new();
+    let self_judge = std::env::var("STORYFORGE_BLIND_SELF_JUDGE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
 
     for (intent_id, intent) in intents() {
-        // 每意图独立会话（同一轮初状态，不互相续写）
-        let conv_solo = env.conv_store.create(None, None).id;
-        let ctx_solo = env.fill_campaign_context(WritingContext::legacy(vec![], None, conv_solo));
-        let (solo_text, solo_ms, solo_pt, solo_ct) = run_solo_writer(&env, &ctx_solo, intent)
-            .await
-            .expect("solo 臂成功");
-
-        let conv_crew = env.conv_store.create(None, None).id;
-        let ctx_crew = env.fill_campaign_context(WritingContext::legacy(vec![], None, conv_crew));
-        let (crew_text, crew_ms) = run_parallel_crew(&env, &ctx_crew, intent)
-            .await
-            .expect("parallel 臂成功");
-
-        assert!(!solo_text.trim().is_empty(), "{intent_id}: solo 正文为空");
-        assert!(!crew_text.trim().is_empty(), "{intent_id}: crew 正文为空");
-
-        // 正文样本（人工复核用，gitignore 目录）
-        std::fs::write(
-            dir.join("texts").join(format!("{intent_id}_solo.txt")),
-            &solo_text,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("texts").join(format!("{intent_id}_crew.txt")),
-            &crew_text,
-        )
-        .unwrap();
-
-        samples.push(ArmSample {
-            arm: BlindArm::SoloWriter,
-            intent_id: intent_id.into(),
-            text_chars: solo_text.chars().count(),
-            latency_ms: solo_ms,
-            prompt_tokens: solo_pt,
-            completion_tokens: solo_ct,
-            text_fingerprint16: sha16(&solo_text),
-        });
-        samples.push(ArmSample {
-            arm: BlindArm::ParallelCrew,
-            intent_id: intent_id.into(),
-            text_chars: crew_text.chars().count(),
-            latency_ms: crew_ms,
-            prompt_tokens: 0, // pipeline usage 聚合不在此路径暴露；成本以墙钟对比
-            completion_tokens: 0,
-            text_fingerprint16: sha16(&crew_text),
-        });
-
-        // 裁判 3 轮，双盲乱序
-        for round in 0..JUDGE_ROUNDS {
-            let (first_arm, second_arm) = presentation_order(
-                SEED,
-                intent_id,
-                round,
-                BlindArm::SoloWriter,
-                BlindArm::ParallelCrew,
+        let mut texts = HashMap::<BlindArm, String>::new();
+        for arm in BlindArm::all() {
+            eprintln!("[{intent_id}] generating {}", arm.as_str());
+            let run = run_arm(&env, &recorder, arm, intent)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert!(
+                !run.text.trim().is_empty(),
+                "{intent_id}: empty {}",
+                arm.as_str()
             );
-            let (first_text, second_text) = if first_arm == BlindArm::SoloWriter {
-                (&solo_text, &crew_text)
-            } else {
-                (&crew_text, &solo_text)
-            };
-            match judge_once(&env, intent, first_text, second_text).await {
-                Ok(out) => {
-                    let winner = if out.winner == "甲" {
-                        first_arm
-                    } else {
-                        second_arm
-                    };
-                    eprintln!(
-                        "[{intent_id} r{round}] 甲={} 乙={} → 胜者 {}",
-                        first_arm.as_str(),
-                        second_arm.as_str(),
-                        winner.as_str()
-                    );
-                    verdicts.push(JudgeVerdict {
-                        intent_id: intent_id.into(),
-                        first_arm,
-                        second_arm,
-                        winner,
-                        scores_first: out.scores_first,
-                        scores_second: out.scores_second,
-                        judge_round: round,
-                    });
-                }
-                Err(e) => eprintln!("[{intent_id} r{round}] 裁判失败（如实弃权）: {e}"),
+            std::fs::write(
+                dir.join("texts")
+                    .join(format!("{intent_id}_{}.txt", arm.as_str())),
+                &run.text,
+            )
+            .unwrap();
+            samples.push(ArmSample {
+                arm,
+                intent_id: intent_id.into(),
+                text_chars: run.text.chars().count(),
+                latency_ms: run.latency_ms,
+                prompt_tokens: run.usage.prompt_tokens,
+                completion_tokens: run.usage.completion_tokens,
+                text_fingerprint16: sha16(&run.text),
+            });
+            texts.insert(arm, run.text);
+        }
+
+        for round in 0..if self_judge { JUDGE_ROUNDS } else { 0 } {
+            let order = balanced_four_arm_order(SEED, intent_id, round);
+            let ordered_texts = order.map(|arm| texts.get(&arm).unwrap().as_str());
+            let output = judge_once(&env, intent, &ordered_texts)
+                .await
+                .unwrap_or_else(|error| panic!("{intent_id} judge round {round}: {error}"));
+            let label_to_arm = ["A", "B", "C", "D"]
+                .into_iter()
+                .zip(order)
+                .collect::<HashMap<_, _>>();
+            let rank_by_arm = output
+                .ranking
+                .iter()
+                .enumerate()
+                .map(|(rank, label)| (label_to_arm[label.as_str()], rank))
+                .collect::<HashMap<_, _>>();
+            let score_by_arm = ["A", "B", "C", "D"]
+                .into_iter()
+                .map(|label| (label_to_arm[label], output.scores[label]))
+                .collect::<HashMap<_, _>>();
+
+            for (left, right) in arm_pairs() {
+                let winner = if rank_by_arm[&left] < rank_by_arm[&right] {
+                    left
+                } else {
+                    right
+                };
+                let left_position = order.iter().position(|arm| *arm == left).unwrap();
+                let right_position = order.iter().position(|arm| *arm == right).unwrap();
+                let (first_arm, second_arm) = if left_position < right_position {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                verdicts.push(JudgeVerdict {
+                    intent_id: intent_id.into(),
+                    first_arm,
+                    second_arm,
+                    winner,
+                    scores_first: score_by_arm[&first_arm],
+                    scores_second: score_by_arm[&second_arm],
+                    judge_round: round,
+                });
+            }
+            judge_rounds.push(JudgeRoundEvidence {
+                intent_id: intent_id.into(),
+                round,
+                presentation_order: order
+                    .into_iter()
+                    .map(|arm| arm.as_str().to_string())
+                    .collect(),
+                ranking: output.ranking,
+                scores: output.scores,
+            });
+        }
+
+        if self_judge {
+            for (left, right) in arm_pairs() {
+                pair_majorities.push(majority_for_pair(intent_id, left, right, &verdicts));
             }
         }
-        pairs.push(majority_for_pair(
-            intent_id,
-            BlindArm::SoloWriter,
-            BlindArm::ParallelCrew,
-            &verdicts,
-        ));
     }
 
-    let summary = summarize_matrix(&pairs, &samples, JUDGE_ROUNDS);
+    let summary = summarize_matrix(&pair_majorities, &samples, JUDGE_ROUNDS);
+    assert!(summary.absent_arms.is_empty(), "all four arms must run");
+    let suffix_replay = sequential_suffix_replay_acceptance(&env, &recorder)
+        .await
+        .expect("real sequential suffix replay acceptance");
     let evidence = serde_json::json!({
+        "schema_version": "blind-four-arm-v2",
         "seed": SEED,
         "model": std::env::var("LLM_MODEL").unwrap_or_default(),
+        "self_judge_enabled": self_judge,
+        "judge_protocol": if self_judge {
+            "provider-self-judge-four-way-latin-square-position-balanced"
+        } else {
+            "external-independent-panel-required"
+        },
+        "generated_intents": intents().len(),
         "samples": samples,
-        "verdicts": verdicts,
-        "pairs": pairs,
+        "judge_rounds": judge_rounds,
+        "pair_verdicts": verdicts,
+        "pair_majorities": pair_majorities,
         "summary": summary,
+        "sequential_suffix_replay": suffix_replay,
+        "total_provider_usage": recorder.snapshot(),
     });
-    let out_path = dir.join("blind-two-arm-summary.json");
-    std::fs::write(&out_path, serde_json::to_string_pretty(&evidence).unwrap()).unwrap();
+    let output_path = dir.join("blind-four-arm-summary.json");
+    std::fs::write(
+        &output_path,
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
     eprintln!(
-        "── 盲测汇总 ──\n{}\n证据: {}",
+        "four-arm summary:\n{}\nevidence: {}",
         serde_json::to_string_pretty(&summary).unwrap(),
-        out_path.display()
+        output_path.display()
     );
 
-    // 硬断言只防脱轨：全部意图有裁决（弃权不超 1/3），缺席臂如实登记
-    let total_verdicts = pairs
-        .iter()
-        .map(|p| p.left_votes + p.right_votes)
-        .sum::<usize>();
-    assert!(
-        total_verdicts * 3 >= (intents().len() * JUDGE_ROUNDS as usize) * 2,
-        "裁决弃权过多：{total_verdicts}"
-    );
-    assert_eq!(
-        summary.absent_arms,
-        vec!["sequential_crew".to_string(), "duet_merge".to_string()]
-    );
+    env.cleanup();
+}
 
+#[tokio::test]
+#[ignore = "requires real LLM credentials"]
+async fn sequential_suffix_replay_real_llm() {
+    let recorder = RecordingLlmClient::new(require_real_llm());
+    let llm: Arc<dyn LlmClient> = recorder.clone();
+    let env = HarnessEnv::new(llm);
+    let stored = env.campaign_store.save_card(fixture_card()).unwrap();
+    env.create_campaign(&stored.card, "sequential-suffix-replay-campaign");
+
+    let evidence = sequential_suffix_replay_acceptance(&env, &recorder)
+        .await
+        .expect("real sequential suffix replay acceptance");
+    let output_path = artifacts_dir().join("sequential-suffix-replay-summary.json");
+    std::fs::write(
+        &output_path,
+        serde_json::to_string_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    eprintln!("suffix replay evidence: {}", output_path.display());
     env.cleanup();
 }

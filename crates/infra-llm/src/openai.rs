@@ -4,6 +4,10 @@
 /// DeepSeek、Groq、Moonshot、OpenRouter 等都走此路径。
 use storyforge_domain::llm::{ChatMessage, ChatRequest, ChatResponse, ToolCall};
 
+fn quantize_sampling_float(value: f32) -> f64 {
+    (f64::from(value) * 100.0).round() / 100.0
+}
+
 /// 构建 OpenAI 兼容的请求 JSON
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -14,10 +18,10 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
 
     // 采样参数
     if let Some(temp) = req.params.temperature {
-        body["temperature"] = serde_json::json!(temp);
+        body["temperature"] = serde_json::json!(quantize_sampling_float(temp));
     }
     if let Some(top_p) = req.params.top_p {
-        body["top_p"] = serde_json::json!(top_p);
+        body["top_p"] = serde_json::json!(quantize_sampling_float(top_p));
     }
     if let Some(max_tokens) = req.params.max_tokens {
         body["max_tokens"] = serde_json::json!(max_tokens);
@@ -206,6 +210,25 @@ mod tests {
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn sampling_floats_are_quantized_for_strict_openai_compatible_providers() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            params: SamplingParams {
+                temperature: Some(0.7_f32),
+                top_p: Some(0.95_f32),
+                ..SamplingParams::default()
+            },
+            model: "glm-5.2".into(),
+        };
+
+        let encoded = serde_json::to_string(&build_request_body(&req)).unwrap();
+        assert!(encoded.contains("\"temperature\":0.7"), "{encoded}");
+        assert!(encoded.contains("\"top_p\":0.95"), "{encoded}");
+        assert!(!encoded.contains("0.949999"), "{encoded}");
     }
 
     #[test]

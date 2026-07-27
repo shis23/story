@@ -16,7 +16,7 @@ impl GenerationMode {
     pub fn estimated_call_label(self) -> &'static str {
         match self {
             Self::Continuation => "1 次正文 + 2 次廉价记账",
-            Self::Duet => "3–5 次正文编排 + 2 次廉价记账",
+            Self::Duet => "3–4 次正文编排 + 2 次廉价记账",
             Self::BigScene => "4+N 次正文编排 + 2 次廉价记账",
             Self::SequentialCrew => "2+N 次顺序编排 + 2 次廉价记账",
         }
@@ -225,6 +225,26 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<GenerationMode>("\"sequential_crew\"").unwrap(),
             GenerationMode::SequentialCrew,
+        );
+    }
+
+    #[test]
+    fn generation_mode_call_estimates_are_a_stable_product_contract() {
+        assert_eq!(
+            GenerationMode::Continuation.estimated_call_label(),
+            "1 次正文 + 2 次廉价记账"
+        );
+        assert_eq!(
+            GenerationMode::Duet.estimated_call_label(),
+            "3–4 次正文编排 + 2 次廉价记账"
+        );
+        assert_eq!(
+            GenerationMode::BigScene.estimated_call_label(),
+            "4+N 次正文编排 + 2 次廉价记账"
+        );
+        assert_eq!(
+            GenerationMode::SequentialCrew.estimated_call_label(),
+            "2+N 次顺序编排 + 2 次廉价记账"
         );
     }
 }
