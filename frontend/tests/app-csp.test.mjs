@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import url from 'node:url'
 
-import { APP_CSP, APP_CSP_DIRECTIVES, APP_CACHE_ORIGINS, parseCsp } from '../src/utils/appCsp.js'
+import { APP_CSP, APP_CSP_DIRECTIVES, APP_CACHE_ORIGINS, APP_SHELL_DOC_ORIGINS, parseCsp } from '../src/utils/appCsp.js'
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url))
 // tests/ -> frontend/ -> repo root.
@@ -52,13 +52,15 @@ test('NO directive grants arbitrary remote egress (the V5 regression guard)', ()
     }
   }
   // No public-network hostname may sneak into any directive. localhost is
-  // allowed only as the Tauri IPC / cache-protocol forms.
+  // allowed only as the Tauri IPC / the two registered custom protocols.
   for (const sources of Object.values(APP_CSP_DIRECTIVES)) {
     for (const src of sources) {
       if (/^https?:\/\//i.test(src)) {
         const host = src.replace(/^https?:\/\//i, '').split('/')[0]
         assert.ok(
-          host === 'ipc.localhost' || host === 'storyforge-cache.localhost',
+          host === 'ipc.localhost'
+            || host === 'storyforge-cache.localhost'
+            || host === 'storyforge-shell.localhost',
           `unexpected network host in CSP: ${src}`,
         )
       }
@@ -86,12 +88,17 @@ test('object-src, form-action and base-uri are locked down', () => {
   assert.deepEqual(APP_CSP_DIRECTIVES['base-uri'], ["'none'"])
 })
 
-test('frame-src allows blob: for the shell iframe and data:', () => {
-  // CardShellHost.vue creates a blob: document for the sandboxed card shell.
-  // Without frame-src blob: the shell cannot load at all.
+test('frame-src allows ONLY the isolated shell origin (+ data:), not blob:', () => {
+  // V5 CSP isolation: shell documents are served from the dedicated
+  // storyforge-shell origin so they do NOT inherit the main app policy
+  // container. blob: is intentionally absent — a parent-created blob document
+  // would inherit this CSP and have its inline bridges blocked.
   const fs = APP_CSP_DIRECTIVES['frame-src']
-  assert.ok(fs.includes('blob:'))
-  assert.ok(fs.includes('data:'))
+  for (const origin of APP_SHELL_DOC_ORIGINS) {
+    assert.ok(fs.includes(origin), `frame-src must include ${origin}`)
+  }
+  assert.ok(fs.includes('data:'), 'data: retained for non-shell data iframes')
+  assert.ok(!fs.includes('blob:'), 'frame-src must NOT grant blob: (inheritance risk)')
 })
 
 test('cache-protocol origins mirror card_shell_cache.rs + cardShellCsp.js', () => {
@@ -125,20 +132,35 @@ test('tauri.conf.json app.security.csp equals APP_CSP byte-for-byte', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Shell compatibility regression: the outer policy must not narrow channels
-// the shell iframe relies on. (The shell has its own meta CSP, but blob iframe
-// loading and the cache protocol still need to pass the OUTER policy because
-// the shell document is created by the trusted parent origin.)
+// Shell compatibility regression: the outer policy must let the shell load via
+// its ISOLATED origin and must NOT rely on blob: (which would inherit this
+// CSP). The shell document's own policy container is set by the
+// storyforge-shell protocol response (shell_doc_protocol.rs); it is not and
+// cannot be widened by this outer policy.
 // ---------------------------------------------------------------------------
 
-test('shell iframe channels survive the outer policy', () => {
-  // Parent creates `new Blob([html])` + createObjectURL, then loads it in a
-  // sandbox=allow-scripts iframe. frame-src must permit blob:.
-  assert.ok(APP_CSP_DIRECTIVES['frame-src'].includes('blob:'))
-  // Large cached assets are addressed as storyforge-cache URLs and may be
-  // fetched/img'd by both the app and the shell.
+test('shell iframe loads via the isolated origin, not blob:', () => {
+  for (const origin of APP_SHELL_DOC_ORIGINS) {
+    assert.ok(APP_CSP_DIRECTIVES['frame-src'].includes(origin))
+  }
+  assert.ok(!APP_CSP_DIRECTIVES['frame-src'].includes('blob:'))
+  // Large cached assets are addressed as storyforge-cache URLs and are
+  // fetch/img'd by both the app and the shell.
   for (const origin of APP_CACHE_ORIGINS) {
     assert.ok(APP_CSP_DIRECTIVES['connect-src'].includes(origin))
     assert.ok(APP_CSP_DIRECTIVES['img-src'].includes(origin))
   }
+})
+
+test('shell-doc origins mirror shell_doc_protocol.rs + shellDocUrl.js', () => {
+  assert.deepEqual(APP_SHELL_DOC_ORIGINS.sort(), [
+    'http://storyforge-shell.localhost',
+    'storyforge-shell://localhost',
+  ].sort())
+})
+
+test('no worker-src relaxation (no consumer)', () => {
+  // worker-src is intentionally omitted; it falls back to default-src 'self'.
+  // If a future worker need appears, add it per-consumer with a test.
+  assert.ok(!('worker-src' in APP_CSP_DIRECTIVES))
 })

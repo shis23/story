@@ -63,8 +63,11 @@
  * No silent success: failures surface in status line.
  */
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { cardShellFetchUrl, getCardShellInlineJs } from '../tauri-api.js'
 import { orderedTavernHelperFromShells, collectVisibleThButtons } from '../utils/tavernHelperScripts.js'
+import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
+import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
 
 const props = defineProps({
   /** CardShellManifest.shells */
@@ -86,6 +89,10 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['done', 'error', 'var-write', 'status'])
+
+// V5 CSP isolation: serve the TH bootstrap document on the isolated
+// storyforge-shell origin so its inline bridge does not inherit the main app CSP.
+configureShellDocInvoke(invoke)
 
 const iframeRef = ref(null)
 const srcdoc = ref('')
@@ -541,6 +548,9 @@ function bootstrapSrcdoc() {
   const body = lines.join('\n')
   return (
     '<!doctype html><html><head><meta charset="utf-8"/>' +
+    // V5 CSP isolation: shell document policy. Mirrors the HTTP header set by
+    // shell_doc_protocol.rs; both intersect to the same policy.
+    buildShellCspMetaTag([]) +
     '<style>html,body{margin:0;padding:0;background:transparent}</style>' +
     sOpen +
     body +
@@ -549,19 +559,24 @@ function bootstrapSrcdoc() {
   )
 }
 
-function revokeFrameBlob() {
-  if (frameBlobUrl) {
-    try { URL.revokeObjectURL(frameBlobUrl) } catch (_) {}
-    frameBlobUrl = null
-  }
+function clearFrameUrl() {
+  // Shell documents live in the Rust-side token registry; no blob URL to revoke.
+  frameBlobUrl = null
 }
 
-function setFrameHtml(html) {
+async function setFrameHtml(html) {
   srcdoc.value = html
-  revokeFrameBlob()
-  const blob = new Blob([html], { type: 'text/html' })
-  frameBlobUrl = URL.createObjectURL(blob)
-  frameSrc.value = frameBlobUrl
+  clearFrameUrl()
+  // V5 CSP isolation: serve on the isolated storyforge-shell origin.
+  try {
+    frameBlobUrl = await registerShellDoc(html)
+    frameSrc.value = frameBlobUrl
+  } catch (e) {
+    // Non-Tauri fallback (tests/legacy): blob URL still renders.
+    const blob = new Blob([html], { type: 'text/html' })
+    frameBlobUrl = URL.createObjectURL(blob)
+    frameSrc.value = frameBlobUrl
+  }
 }
 
 function revokeBlobs() {
@@ -841,7 +856,7 @@ onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   runSeq++
   revokeBlobs()
-  revokeFrameBlob()
+  clearFrameUrl()
 })
 
 async function invokeButton(btn) {

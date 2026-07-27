@@ -50,6 +50,7 @@ import {
   setCampaignWorldInfoEnabled,
 } from '../tauri-api.js'
 import { buildShellCspMetaTag } from '../utils/cardShellCsp.js'
+import { configureShellDocInvoke, registerShellDoc } from '../utils/shellDocUrl.js'
 import {
   createCardShellRuntimeCompatibilityScript,
   isCardShellBridgeMessageForSession,
@@ -110,6 +111,11 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['loaded', 'error', 'message', 'var-write', 'opening-applied'])
+
+// V5 CSP isolation: shell documents are served on the isolated storyforge-shell
+// origin so their inline bridges do not inherit the main app CSP. Configure the
+// shared helper with the same Tauri invoke this component already uses.
+configureShellDocInvoke(invoke)
 
 const iframeRef = ref(null)
 const srcdoc = ref(blankSrcdoc('准备加载…'))
@@ -189,20 +195,30 @@ function blankSrcdoc(msg) {
 </head><body>${escapeHtml(msg)}</body></html>`
 }
 
-function revokeFrameBlob() {
-  if (frameBlobUrl) {
-    try { URL.revokeObjectURL(frameBlobUrl) } catch (_) {}
-    frameBlobUrl = null
-  }
+function clearFrameUrl() {
+  // Shell documents live in the Rust-side token registry; the iframe simply
+  // points away from the old URL. No blob URL to revoke.
+  frameBlobUrl = null
 }
 
-function setFrameHtml(html) {
+async function setFrameHtml(html) {
   srcdoc.value = html
-  revokeFrameBlob()
-  // blob: URL so WebView2 executes scripts (srcdoc often does not in Tauri).
-  const blob = new Blob([html], { type: 'text/html' })
-  frameBlobUrl = URL.createObjectURL(blob)
-  frameSrc.value = frameBlobUrl
+  clearFrameUrl()
+  // Serve the shell document on the isolated storyforge-shell origin. CSP L3
+  // makes a blob/srcdoc doc inherit the creator's policy container; a strict
+  // main-app CSP would break the inline bridge. The isolated origin carries
+  // its own shell CSP (HTTP header set in shell_doc_protocol.rs, mirrored as
+  // the <meta> injected by buildShellCspMetaTag above).
+  try {
+    frameBlobUrl = await registerShellDoc(html)
+    frameSrc.value = frameBlobUrl
+  } catch (e) {
+    // If the host command is unavailable (e.g. legacy/test harness), fall back
+    // to a blob URL so the shell still renders in non-Tauri environments.
+    const blob = new Blob([html], { type: 'text/html' })
+    frameBlobUrl = URL.createObjectURL(blob)
+    frameSrc.value = frameBlobUrl
+  }
 }
 
 function escapeHtml(s) {
@@ -1020,7 +1036,7 @@ onUnmounted(() => {
   if (bridgeHandler) window.removeEventListener('message', bridgeHandler)
   stHostHandler = null
   loadSeq++
-  revokeFrameBlob()
+  clearFrameUrl()
 })
 
 defineExpose({ reload: loadShell, retry })
