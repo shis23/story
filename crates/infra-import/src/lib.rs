@@ -29,16 +29,25 @@ pub enum ImportError {
 /// 导入文件大小上限（100MB）。恶意/误操作的超大文件会耗尽内存。
 pub const MAX_IMPORT_SIZE: usize = 100 * 1024 * 1024;
 
+/// 检查导入字节是否超过大小上限。独立纯函数，便于用小阈值回归测试
+/// （避免在 CI 上分配接近 200 MiB 的真实缓冲）。
+///
+/// 返回 `Ok(())` 表示通过 size guard，可继续格式解析；返回 `Err` 表示
+/// 仅因大小被拒（不读内容、不解析格式）。
+pub fn check_import_size(data_len: usize, max: usize) -> Result<(), ImportError> {
+    if data_len > max {
+        return Err(ImportError::PngError(format!(
+            "文件过大（{} 字节，上限 {} 字节）",
+            data_len, max
+        )));
+    }
+    Ok(())
+}
+
 /// 从文件字节导入角色卡（自动判断 PNG / JSON）
 pub fn import_character(data: &[u8]) -> Result<Character, ImportError> {
     // H-7 防护：限制总大小，避免超大 JSON/PNG 耗尽内存
-    if data.len() > MAX_IMPORT_SIZE {
-        return Err(ImportError::PngError(format!(
-            "文件过大（{} 字节，上限 {} 字节）",
-            data.len(),
-            MAX_IMPORT_SIZE
-        )));
-    }
+    check_import_size(data.len(), MAX_IMPORT_SIZE)?;
     if is_png(data) {
         import_character_from_png(data)
     } else {
@@ -882,6 +891,9 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
     /// 临时 content:// URI 是否被系统回收与导入成功无关。中文文件名、大文件、
     /// Downloads/Documents 来源都只是字节来源，由前端 readFile 读入后以字节
     /// 形式到达此函数。本测试固化该不变量，防止后续"为了方便"把路径参数加回。
+    ///
+    /// 注意：此测试只证明 **parser 层**的字节契约，不证明 content:// picker /
+    /// readFile 的真机链路（那是 Android 运行时行为，需真机验证）。
     #[test]
     fn and2_import_accepts_only_bytes_independent_of_source_uri() {
         // 中文角色名内容（不依赖文件名）能正确解析。
@@ -896,22 +908,27 @@ Set SF_COMPLEX_CARD_FIXTURE or place test-card.png at the repo root."
         let bytes = serde_json::to_vec(&card).expect("serialize");
         let character = import_character(&bytes).expect("中文内容必须可导入");
         assert_eq!(character.name, "梁元·测试角色");
+    }
 
-        // 边界：恰好等于上限的载荷应通过 size guard（> 判断），仅在格式判断处
-        // 失败；超限字节必须在 size guard 处被拒（PngError "文件过大"）。
-        let at_limit = vec![0u8; MAX_IMPORT_SIZE];
-        let at_limit_err = import_character(&at_limit).expect_err("全零字节非合法格式应被拒");
-        // 通过了 size guard → 错误文案不应是"文件过大"，而是格式解析错误
-        assert!(
-            !at_limit_err.to_string().contains("文件过大"),
-            "等于上限的载荷不应触发 size guard，got: {at_limit_err}"
-        );
-        let over_limit = vec![0u8; MAX_IMPORT_SIZE + 1];
-        let err = import_character(&over_limit).expect_err("超上限字节必须被拒");
+    /// AND-2 size guard 边界：用小阈值纯函数 `check_import_size` 验证
+    /// "等于上限通过、超上限被拒"，避免在 CI 上分配接近 200 MiB 的真实缓冲
+    /// （旧实现同时持有 at_limit + over_limit 共 ~200 MiB）。
+    /// 生产 `MAX_IMPORT_SIZE` 不变；此测试只验 guard 逻辑，不测真实阈值。
+    #[test]
+    fn and2_import_size_guard_boundary_uses_strict_greater_than() {
+        let small_max = 16;
+        // 等于上限：通过（> 判断，等于不算超限）
+        assert!(check_import_size(small_max, small_max).is_ok());
+        // 超上限：被拒，错误文案含"文件过大"与具体字节数
+        let err = check_import_size(small_max + 1, small_max).expect_err("超上限必须被拒");
         assert!(matches!(err, ImportError::PngError(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("文件过大"), "错误文案应说明文件过大，got: {msg}");
         assert!(
-            err.to_string().contains("文件过大"),
-            "超上限错误文案应说明文件过大，got: {err}"
+            msg.contains(&format!("上限 {} 字节", small_max)),
+            "错误文案应含上限字节数，got: {msg}"
         );
+        // 远低于上限：通过
+        assert!(check_import_size(0, small_max).is_ok());
     }
 }
