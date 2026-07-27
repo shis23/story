@@ -1,0 +1,116 @@
+# Gitea Actions: Windows-only release gates.
+#
+# These jobs (Pester release-helper suite, repository secret scan, and workflow
+# YAML syntax validation) require a Windows runner, which is NOT registered in
+# this deployment. They were previously in ci-gates.yml behind a job-level
+# `if: vars.HAS_WINDOWS_RUNNER == 'true'` guard. On Gitea 1.26 + act_runner,
+# a job-level `if` is NOT evaluated before runner assignment: when no runner
+# matches `runs-on: windows-latest`, the job stays at status=5 (blocked) and
+# never becomes skipped, so the whole ci-gates run never reaches a terminal
+# state and cannot be re-run.
+#
+# Moving them into this separate workflow fixes that: these jobs only exist as
+# runs when this workflow is explicitly dispatched (or a v* tag is pushed), so
+# an absent Windows runner produces no run at all instead of a permanently
+# blocked one. The Linux ci-gates now always reach a terminal state.
+#
+# This workflow does NOT claim the Windows gates have run until a Windows
+# runner is registered and this workflow is dispatched successfully.
+name: windows-gates
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+# Cancel superseded Windows-gate runs on the same ref.
+concurrency:
+  group: windows-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: only read the repo contents.
+permissions:
+  contents: read
+
+jobs:
+  pester-release-tests:
+    # PowerShell release-helper Pester suite. Requires a registered Windows
+    # runner (Settings → Actions → Runners). Until one exists, dispatching this
+    # workflow will queue waiting for a runner; it will not silently pass.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python for parser-backed Pester contracts
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PyYAML for Pester contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install 'PyYAML==6.0.2'
+          python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+      - name: Run release-build Pester tests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/tests/run-release-build-tests.ps1
+      - name: Verify release gate (secret scan only)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+
+  secret-scan:
+    # Repository-wide fail-closed secret scan (tracked + untracked build inputs).
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Repository secret scan (fail-closed, tracked + untracked)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify-release.ps1 -SecretScanOnly
+
+  workflow-syntax:
+    # Real YAML parser required (PyYAML). Structural-only PowerShell checks
+    # are not accepted for production workflow validation.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PyYAML
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'PyYAML==6.0.2'
+          python -c "import yaml; print(yaml.__version__)"
+      - name: Validate workflow YAML syntax with PyYAML
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\release-build\ReleaseBuild.Common.ps1
+          $dir = '.gitea\workflows'
+          $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.yml' -File) +
+                   @(Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'No workflow files found.' }
+          foreach ($f in $files) {
+            $result = Test-ReleaseWorkflowSyntax -Path $f.FullName
+            if ($result.Engine -notmatch 'pyyaml|node-yaml') {
+              throw "FAIL: $($f.Name) did not use a real YAML parser (engine=$($result.Engine))"
+            }
+            if (-not $result.Valid) {
+              Write-Host "FAIL: $($f.Name)" -ForegroundColor Red
+              $result.Errors | ForEach-Object { Write-Host "  $_" }
+              exit 1
+            }
+            Write-Host "OK: $($f.Name) (engine=$($result.Engine))" -ForegroundColor Green
+          }

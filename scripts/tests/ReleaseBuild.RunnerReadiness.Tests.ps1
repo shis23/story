@@ -1350,17 +1350,45 @@ Describe 'Release workflow static governance (runner readiness)' {
         $gov.checks['real_yaml_parser_required'] | Should Be $true
     }
 
-    It 'ci-gates workflow requires PyYAML and does not accept structural-only validation' {
-        $wf = Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml'
+    It 'Linux ci-gates workflow keeps its Linux gates; Windows gates moved to windows-gates.yml' {
+        # After the Windows-gates split, ci-gates.yml holds the four Linux
+        # jobs only; the PyYAML/parser-backed Windows jobs (workflow-syntax,
+        # pester-release-tests, secret-scan) live in windows-gates.yml.
+        # Note: ci-gates uses mirror-friendly manual rustup/node setup (not the
+        # dtolnay/setup-node actions) for CN reachability; those pinned actions
+        # remain present in release-host-evidence.yml and are globally checked.
+        $ci = Get-Content -LiteralPath (Join-Path $RepoRoot '.gitea\workflows\ci-gates.yml') -Raw
+        # Linux gates still present in ci-gates.yml.
+        $ci | Should Match 'npm ci'
+        $ci | Should Match 'actions/checkout@v4'
+        $ci | Should Match 'cargo clippy'
+        $ci | Should Match 'cargo test --workspace'
+        # The PyYAML/parser-backed Windows jobs are NOT in ci-gates.yml anymore.
+        $ci | Should Not Match 'PyYAML==6\.0\.2'
+        $ci | Should Not Match 'Test-ReleaseWorkflowSyntax'
+        # No Windows job remains in ci-gates.yml (a runs-on: windows-latest
+        # directive would recreate the blocked-job problem). Comments may still
+        # mention windows-latest to document the historical issue.
+        $ci | Should Not Match '(?m)^\s*runs-on:\s*windows-latest'
+        # ci-gates must allow a controlled manual re-run without a business commit.
+        $ci | Should Match 'workflow_dispatch'
+    }
+
+    It 'windows-gates workflow carries the parser-backed Windows release gates' {
+        $wf = Join-Path $RepoRoot '.gitea\workflows\windows-gates.yml'
+        Test-Path -LiteralPath $wf | Should Be $true
         $text = Get-Content -LiteralPath $wf -Raw
         $text | Should Match 'PyYAML==6\.0\.2'
         $text | Should Match 'Test-ReleaseWorkflowSyntax'
         $text | Should Match 'pyyaml\|node-yaml'
-        $text | Should Match 'npm ci'
-        $text | Should Match 'actions/checkout@v4'
-        $text | Should Match 'actions/setup-node@v4'
         $text | Should Match 'actions/setup-python@v5'
-        $text | Should Match 'dtolnay/rust-toolchain@stable'
+        $text | Should Match 'actions/checkout@v4'
+        # Triggered only by manual dispatch or a v* tag, not by every push.
+        $text | Should Match 'workflow_dispatch'
+        $text | Should Match 'tags:'
+        # No job-level if-guard: a false `if` with no Windows runner never
+        # reaches `skipped` on Gitea 1.26 and leaves the run non-terminal.
+        $text | Should Not Match '(?m)^\s{4}if:\s'
     }
 
     It 'release-host-evidence defaults host-only and pins upload-artifact retention' {

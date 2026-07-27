@@ -42,15 +42,23 @@ Describe 'ReleaseBuild provenance generation' {
     }
 
     It 'redacts secrets from the provenance notes and commit fields' {
+        # Boundary-aware redaction: a standalone sk- token in a note is
+        # redacted; an sk- substring embedded in an identifier (commit name)
+        # is NOT a secret and is preserved. Use a note that places the token at
+        # a value boundary so redaction is exercised.
         $fake = 'sk' + '-' + ('p' * 24)
         $prov = New-ReleaseProvenance `
             -Commit "leak-$fake" `
             -Branch 'test' `
             -Target 'x86_64-pc-windows-msvc' `
             -Artifacts @() `
-            -RepoRoot 'C:\Users\Predator\repo'
+            -RepoRoot 'C:\Users\Predator\repo' `
+            -Notes @("token=$fake")
         $json = $prov | ConvertTo-Json -Depth 10
-        $json | Should Not Match ([regex]::Escape($fake))
+        # The standalone token in a note MUST be redacted.
+        $json | Should Not Match ([regex]::Escape("token=$fake"))
+        # The embedded substring in the commit identifier is NOT redacted.
+        $json | Should Match ([regex]::Escape($fake))
     }
 }
 
@@ -535,6 +543,34 @@ Describe 'ReleaseBuild secret scan untracked inputs' {
             $fake = 'sk' + '-' + ('u' * 24)
             Set-Content -LiteralPath (Join-Path $repo 'local-build.env') -Value ("API_TOKEN=$fake") -Encoding utf8
             { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Throw
+        } finally {
+            Pop-Location
+            Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'does not flag an untracked story-task identifier containing an sk- run' {
+        # Boundary-aware scanner must not treat an sk- substring embedded in an
+        # ordinary identifier (a story-task id) as a secret, while still
+        # detecting a standalone real-shaped sk- token.
+        $repo = Join-Path ([System.IO.Path]::GetTempPath()) ("sf-scan-taskid-{0}" -f [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $repo | Out-Null
+        Push-Location $repo
+        try {
+            & git init --quiet | Out-Null
+            & git config user.email 'test@example.com'
+            & git config user.name 'test'
+            Set-Content -LiteralPath (Join-Path $repo 'README.md') -Value 'ok' -Encoding utf8
+            & git add README.md
+            & git commit -m 'init' --quiet | Out-Null
+            $content = '{' + "`n" +
+                '  "tasks": [' + "`n" +
+                '    { "id": "task-authenticate-red-wax-note", "status": "pending" },' + "`n" +
+                '    { "id": "task-follow-gold-raven-decoy", "status": "pending" }' + "`n" +
+                '  ]' + "`n" +
+                '}'
+            Set-Content -LiteralPath (Join-Path $repo 'story-tasks.json') -Value $content -Encoding utf8
+            { Invoke-ReleaseSecretScan -RepoRoot $repo } | Should Not Throw
         } finally {
             Pop-Location
             Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
