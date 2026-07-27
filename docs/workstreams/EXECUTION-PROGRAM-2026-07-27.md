@@ -79,13 +79,22 @@
   强制重建）、清单变化自动收起。TavernHelperRuntime 新增 `visible` prop
   （真实版面 iframe，min(70vh,520px)）。var-write 走既有提案队列。
   测试：node×3（拆分器）+ vitest×5（dock 行为）。
-- [~] **#21** 评测口径扩展（代码已落，待重算分数）：
+- [x] **#21** 评测口径扩展（代码已落，**2026-07-27 真实重算全绿**）：
   `extract_update_variable_seed_paths`（forge_differential.rs）解析开场白
   `<UpdateVariable><JSONPatch>` 数组的 path（斜杠→点、`/-` 追加记号尾段丢弃、
   非法块静默跳过）+ `collect_opening_seed_paths(forge_dir)` 汇总 开场白/*.txt；
   alignment 测试作者树 = InitVar ∪ 开场白种子（打印两部分规模）。
-  单元测试锁定解析形态。重算：本地 STORYFORGE_FORGE_OUT + 证据目录重跑
-  `forge_schema_alignment_scores_translations`，更新 FORGE-DIFFERENTIAL 数字。
+  单元测试锁定解析形态。重算：用历史会话已生成的 forge unpack 产物
+  （确定性本地解析，无 LLM 无网络）+ `artifacts/card-translation/` 四份证据
+  重跑 `forge_schema_alignment_scores_translations`，全绿。数字与判读修正
+  见 `FORGE-DIFFERENTIAL-2026-07-26.md` 末节——关键更正：种子并入只影响
+  命定之诗（作者树 55→56，净增 1），卿卿种子 29 条全在 InitVar 内（净增 0，
+  分数不变）。命定 flash/pro 分别仍有 10/9 个当前口径未对齐键；完整 forge
+  产物证明其中至少 `事件.莉莉.*`、`事件.信号`、`主角.装备` 来自作者世界书
+  JS/EJS，故 14.49-20% 只能解释为当前有限 ground truth 下的未对齐率上界，
+  不能认定为模型虚构率。开场白种子扩展已按 #21 范围收口，JS/EJS 变量源
+  明确记录为评测口径边界。环境依赖测试改为 `#[ignore]`，仅 `--ignored` 显式
+  运行；缺 env 时失败，不再返回 `ok`。
 - [x] **#22** SQLite 后端 MVU 补齐 → **已修**（比原计划更完整——根因是 SQLite
   后端根本没有 MVU 翻译权威）：V005 `mvu_translations` 表 + importer 迁移
   （老目录 manifest hash 稳定）+ repo/runtime CRUD + 两收集器 SQLite 分支

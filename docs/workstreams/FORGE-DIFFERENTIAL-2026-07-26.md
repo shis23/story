@@ -163,18 +163,82 @@ STORYFORGE_FORGE_OUT=<out> cargo test -p harness-real-llm --test forge_different
 
 ## 2026-07-27 口径扩展：开场白 UpdateVariable 种子入作者树（#21）
 
-此前作者树只取 InitVar YAML，把作者在开场白 `<UpdateVariable><JSONPatch>`
-里就地初始化的变量（世界.新闻、事件.莉莉.* 等）误判为幻觉。
-`extract_update_variable_seed_paths` + `collect_opening_seed_paths` 并入后重算：
+此前作者树只取 InitVar YAML。`extract_update_variable_seed_paths` +
+`collect_opening_seed_paths` 把作者在开场白 `<UpdateVariable><JSONPatch>`
+里就地初始化的变量并入 ground truth 后重算。种子 path 归一：斜杠→点、
+尾段 `-`（JSON Patch 数组追加记号）丢弃、空段清理；非法块静默跳过。
 
-| 组合 | 作者树 | 翻译键 | 有据 | 幻觉率 | 覆盖率 |
-| --- | --- | --- | --- | --- | --- |
-| 命定之诗 × flash | 56（InitVar 55 + 种子 22 并集） | 69 | 59 | **14.5%** | 67.9% |
-| 命定之诗 × pro | 56 | 45 | 36 | **20.0%** | 66.1% |
-| 卿卿 × flash | 265（InitVar 265 + 种子 29 并集） | 32（样本） | 32 | **0.0%** | 100%（下界） |
-| 卿卿 × pro | 265 | 32（样本） | 32 | **0.0%** | 100%（下界） |
+**真实重算运行（2026-07-27）**：用历史会话已生成的 forge unpack 产物
+（确定性解析，无 LLM、无网络）+ `artifacts/card-translation/` 四份证据
+重跑 `forge_schema_alignment_scores_translations`，全绿。各组合作者树
+规模由测试 stdout 直接报出（"InitVar X 叶 + 开场白种子 Y（并集 Z）"）。
 
-判读：卿卿在新口径下完全干净（此前的"幻觉"全部是开场白种子变量）；
-命定之诗剩余幻觉率 14.5-20%——真实缺口收窄到模型虚构键，
-非评测口径问题。种子解析形态由单元测试锁定
-（JSONPatch 数组、`/-` 追加记号尾段丢弃、非法块静默跳过）。
+| 组合 | 作者树（并集） | 翻译键 | 有据 | 幻觉率¹ | 覆盖率 | 旧覆盖率 / 旧幻觉率（仅 InitVar） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 命定之诗 × flash | 56（InitVar 55 + 种子 22，净增 1） | 69 | 59 | **14.49%** | 67.86% | 67.3% / 14.5%（作者树 55） |
+| 命定之诗 × pro | 56（同上） | 45 | 36 | **20.0%** | 66.07% | 65.5% / 20.0%（作者树 55） |
+| 卿卿 × flash | 265（InitVar 265 + 种子 29，**净增 0**） | 32 | 32 | **0.0%** | 100% | 100% / 0%（无变化） |
+| 卿卿 × pro | 265（同上） | 32 | 32 | **0.0%** | 100% | 100% / 0%（无变化） |
+
+判读（已据真实重算修正）：
+
+- **种子并入只影响命定之诗**：22 条种子里 21 条与 InitVar 重叠，
+  净增 1 个作者键，作者树 55→56，覆盖率因此从 67.3%→67.86%、
+  65.5%→66.07%（分母变大）。
+- **卿卿种子 29 条全部已在 InitVar 树内**（并集 265 = InitVar 265，
+  净增 0），种子并入对卿卿分数**无任何影响**——卿卿本就是 0% 幻觉
+  （见上一节"修复后重测"表），并非"此前误判的幻觉被种子消除"。
+  （本节早先版本的判读把卿卿描述为"此前的幻觉全是开场白种子"，
+  与真实重算矛盾，特此更正。）
+- **命定之诗仍有当前口径未对齐键**：flash 10 个、pro 9 个，二者并集
+  10 个：`世界.新闻`、`世界.酒馆留言板`、`世界.午后茶会`、`主角.装备`、
+  `命定系统.核心机制`、`事件.信号`、
+  `事件.莉莉.{阶段,侵蚀度,已净化区域,净化次数}`。它们确实不在
+  InitVar 或开场白种子里，但**不能据此认定为模型虚构**：完整 forge
+  产物显示 `事件.莉莉.*`、`事件.信号` 由作者世界书 JS 初始化，
+  `主角.装备` 也被作者脚本读取。当前作者树尚未收集世界书 JS/EJS 中的
+  `getMessageVar` / `setMessageVar` 变量源。因此表中的 14.49-20% 只是
+  “相对 InitVar ∪ 开场白种子未对齐率”（真实幻觉率的上界），不是已经
+  坐实的模型虚构率。开场白种子口径扩展本身已完成；JS/EJS 变量源是后续
+  评测口径边界。
+
+¹ 字段名沿用评测器 `hallucination_pct`；在当前 ground truth 未覆盖全部作者
+变量源的情况下，应读作“未对齐率”。
+
+种子解析形态由单元测试锁定（`test_extract_update_variable_seed_paths`）：
+JSONPatch 数组、`/-` 追加记号尾段丢弃、非法块静默跳过。
+
+### 复现命令
+
+```bash
+# 前置：forge unpack 产物目录（历史会话已生成；forge CLI 来自
+# github.com/ai4rpg/tavern-cards，unpack 是确定性本地解析，不调 LLM 不联网）
+# 证据目录：artifacts/card-translation/（4 份 JSON，含 stats.schema_keys_sample）
+
+STORYFORGE_FORGE_OUT=<forge-out 目录，含 destiny/ 与 qingqing/> \
+STORYFORGE_CT_EVIDENCE_DIR=<artifacts/card-translation 绝对路径> \
+cargo test -p harness-real-llm --test forge_differential \
+    forge_schema_alignment_scores_translations -- --ignored --nocapture
+```
+
+该测试标记为 Rust `#[ignore]`：普通 `cargo test` 会明确报告 `ignored`，不会
+把未执行伪装成 `ok`。显式加 `--ignored` 后，两个 env 缺失会直接失败；本轮
+重算已显式设定两个 env，确保真实执行。
+
+### 输入指纹（防临时目录丢失后无法验明）
+
+- `test-card.png` SHA-256：
+  `20bd48496917b8474a2183c3c6cd56f7fa9b7d3704bdd100d704045048483a1b`
+- `卿卿 (33).png` SHA-256：
+  `d8397338ffdb9641afd99545fcd43f6e6eb55a7be749aad70748c6b61f4aef48`
+- Forge CLI：`https://github.com/ai4rpg/tavern-cards`，commit
+  `4a565bbe04b723405a1d763923acb9b15a56faa6`
+- 本轮 unpack 树指纹（每个文件先取 SHA-256，按相对路径排序，以
+  `<hash><两个空格><relative-path>` UTF-8、LF、无末尾换行拼接后再取 SHA-256）：
+  - `destiny/`：454 文件，2,874,598 bytes，
+    `764711fe2df73be15d4bd7ed46368b8a978eb8f03c0f3806d18ba9daf77a6bb0`
+  - `qingqing/`：142 文件，3,391,670 bytes，
+    `0cedf549da36135facfb87a02b522b422018b32a2bed7f78886b3519b60e4d79`
+
+源卡位于仓库根目录（被 `.gitignore` 排除）；即使历史 `%TEMP%` 解包目录被清理，
+仍可用上述固定 CLI commit 重新 unpack，并用树指纹核验输入一致性。

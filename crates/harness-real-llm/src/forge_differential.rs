@@ -762,8 +762,9 @@ pub fn schema_alignment(
 /// 从开场白文本抽 `<UpdateVariable><JSONPatch>` 种子变量路径（#21 评测口径扩展）。
 ///
 /// 作者在开场白里就地初始化变量（`{"op":"replace","path":"/世界/时间",...}`）——
-/// 这些路径与 InitVar YAML 同属 ground truth；不并入会把合法翻译键
-/// （世界.新闻、事件.莉莉.*）误判为幻觉。
+/// 这些路径与 InitVar YAML 同属当前评测的 ground truth；不并入会漏掉
+/// `世界.时间/地点`、`主角.种族/身份/职业/生命层级` 等合法种子键。
+/// 世界书 JS/EJS 中的 `getMessageVar` / `setMessageVar` 变量源不在本函数范围内。
 /// path 归一：斜杠 → 点、尾段 `-`（JSON Patch 数组追加记号）丢弃、空段清理。
 /// 防御式解析：JSONPatch 块解析失败时静默跳过该块（评测基建不 panic）。
 pub fn extract_update_variable_seed_paths(text: &str) -> std::collections::BTreeSet<String> {

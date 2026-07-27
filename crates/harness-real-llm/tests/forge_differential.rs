@@ -129,22 +129,21 @@ fn forge_differential_worldbook_semantics() {
     assert!(ran > 0, "STORYFORGE_FORGE_OUT 已设但没有任何组合可跑");
 }
 
-/// V2-2：翻译 schema 对 InitVar ground truth 的覆盖率/幻觉率评测。
+/// V2-2：翻译 schema 对 InitVar + 开场白种子 ground truth 的覆盖率/未对齐率评测。
 ///
 /// 额外前置：`STORYFORGE_CT_EVIDENCE_DIR` 指向验收证据目录
 /// （artifacts/card-translation，含 schema_keys_sample）。评测性质：
 /// 打印各模型分数；硬断言仅（a）ground truth 解析健全（b）幻觉率 ≤ 50%
-/// ——分数解读交给人，阈值防的是彻底脱轨。
+/// ——分数解读交给人，阈值防的是彻底脱轨。世界书 JS/EJS 变量源尚未纳入，
+/// 因此报告中的 `hallucinated` 仅表示“未在当前 ground truth 对齐”，不能单独
+/// 证明模型虚构。
 #[test]
+#[ignore = "需要 STORYFORGE_FORGE_OUT 与 STORYFORGE_CT_EVIDENCE_DIR；用 --ignored 显式运行"]
 fn forge_schema_alignment_scores_translations() {
-    let Some(out_dir) = std::env::var_os("STORYFORGE_FORGE_OUT") else {
-        eprintln!("skip: STORYFORGE_FORGE_OUT 未设");
-        return;
-    };
-    let Some(evidence_dir) = std::env::var_os("STORYFORGE_CT_EVIDENCE_DIR") else {
-        eprintln!("skip: STORYFORGE_CT_EVIDENCE_DIR 未设（验收证据目录）");
-        return;
-    };
+    let out_dir = std::env::var_os("STORYFORGE_FORGE_OUT")
+        .expect("STORYFORGE_FORGE_OUT 未设；该 ignored 测试必须显式提供 forge unpack 产物");
+    let evidence_dir = std::env::var_os("STORYFORGE_CT_EVIDENCE_DIR")
+        .expect("STORYFORGE_CT_EVIDENCE_DIR 未设；该 ignored 测试必须显式提供验收证据目录");
     let out_dir = PathBuf::from(out_dir);
     let evidence_dir = PathBuf::from(evidence_dir);
 
@@ -163,8 +162,8 @@ fn forge_schema_alignment_scores_translations() {
             "{label}: ground truth 叶数异常少（{}），解析可能失败",
             author.len()
         );
-        // #21：开场白 <UpdateVariable> 种子路径同属作者 ground truth
-        // （作者在开场白就地初始化的变量：世界.新闻、事件.* 等）
+        // #21：开场白 <UpdateVariable> 种子路径同属当前作者 ground truth
+        // （本批产物主要是 世界.时间/地点、主角.种族/身份/职业/生命层级 等）
         let seeds = collect_opening_seed_paths(&forge_dir);
         let initvar_only = author.len();
         author.extend(seeds.iter().cloned());
