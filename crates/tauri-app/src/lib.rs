@@ -11,6 +11,7 @@ mod module_store;
 mod mvu_webview_runtime;
 mod preset_store;
 pub mod production_postprocess;
+mod shell_doc_protocol;
 pub mod sqlite_runtime;
 mod storage;
 pub mod storage_backend;
@@ -11721,6 +11722,15 @@ fn card_shell_list_allowed_hosts() -> Vec<String> {
     get_card_shell_cache().list_allowed_hosts()
 }
 
+/// Register a shell document for the isolated `storyforge-shell` origin and
+/// return its opaque token. The frontend builds the iframe URL as
+/// `<shell_doc_protocol::SHELL_DOC_ORIGIN>/<token>`. V5 CSP isolation — see
+/// shell_doc_protocol.rs.
+#[tauri::command]
+fn card_shell_register_doc(html: String) -> Result<String, String> {
+    Ok(shell_doc_protocol::register_shell_doc(html))
+}
+
 #[tauri::command]
 fn card_shell_allow_host(host: String) -> Result<(), TauriCommandError> {
     if host.trim().is_empty() {
@@ -13328,6 +13338,14 @@ pub fn run() {
         .register_uri_scheme_protocol(card_shell_cache::LOCAL_PROTOCOL_SCHEME, |_ctx, request| {
             card_shell_cache_protocol_response(request)
         })
+        // V5 CSP isolation: serve shell documents (CardShell/TavernHelper/MVU/
+        // PluginHost iframes) on a dedicated origin so they do NOT inherit the
+        // main app's policy container. See shell_doc_protocol.rs. Android line
+        // of ownership: this is an additive registration on the shared Builder
+        // chain; it does not touch Android picker/data-dir logic.
+        .register_uri_scheme_protocol(shell_doc_protocol::SHELL_DOC_SCHEME, |_ctx, request| {
+            shell_doc_protocol::shell_doc_protocol_response(request)
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
@@ -13494,6 +13512,7 @@ pub fn run() {
             get_card_shell_manifest,
             get_card_shell_inline_js,
             card_shell_list_allowed_hosts,
+            card_shell_register_doc,
             card_shell_allow_host,
             card_shell_clear_cache,
             card_shell_fetch_url,
