@@ -339,7 +339,10 @@ fn pipeline_observation_collector_only_attests_real_agent_events() {
             error_count: 0,
             warnings: vec!["must not be retained".into()],
         },
-        PipelineEvent::PostProcessStarted,
+        PipelineEvent::PostProcessStarted {
+            summarizer_enabled: true,
+            postprocessor_enabled: true,
+        },
         PipelineEvent::SummaryDone { char_count: 80 },
         PipelineEvent::PostProcessDone {
             knowledge_count: 1,

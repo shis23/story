@@ -1755,7 +1755,10 @@ impl PipelineOrchestrator {
             return None;
         }
 
-        let _ = event_tx.send(PipelineEvent::PostProcessStarted);
+        let _ = event_tx.send(PipelineEvent::PostProcessStarted {
+            summarizer_enabled: enable_summarizer,
+            postprocessor_enabled: enable_postprocess,
+        });
         info!(
             target: "app-pipeline",
             "后处理流水线启动: campaign={campaign_id} turn={} postprocess={} summarizer={}",
@@ -6121,10 +6124,14 @@ mod tests {
             events.push(e);
         }
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, PipelineEvent::PostProcessStarted)),
-            "应有 PostProcessStarted"
+            events.iter().any(|e| matches!(
+                e,
+                PipelineEvent::PostProcessStarted {
+                    summarizer_enabled: true,
+                    postprocessor_enabled: true,
+                }
+            )),
+            "PostProcessStarted 应声明实际启用的两次模型调用"
         );
         assert!(
             events
@@ -6191,7 +6198,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, PipelineEvent::PostProcessStarted)),
+                .any(|e| matches!(e, PipelineEvent::PostProcessStarted { .. })),
             "全关时不应发 PostProcessStarted"
         );
         // 不应发 PostProcessFailed（区别于真失败）

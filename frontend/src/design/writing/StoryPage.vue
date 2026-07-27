@@ -126,6 +126,7 @@ function rolesFor(message) {
           v-if="showPipeline && isWriting"
           :pipeline="pipeline"
           :role-label="streamingRoleLabel"
+          :generation-mode="generationMode"
           :content-component="contentComponent"
         />
       </div>

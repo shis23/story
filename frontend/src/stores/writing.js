@@ -37,7 +37,8 @@ export const useWritingStore = defineStore('writing', () => {
     stateLabel: '',
     director: { status: 'idle', detail: '', output: '' },
     subagents: [],
-    editor: { status: 'idle', detail: '', output: '' },
+    editor: { status: 'idle', detail: '', output: '', role: null },
+    summary: { status: 'idle', detail: '', charCount: 0 },
     postprocess: { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' },
     // B3 DraftQualityGate 结果（warn-only；null = 本轮尚未检查）
     quality: null,

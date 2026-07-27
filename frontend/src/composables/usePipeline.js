@@ -83,30 +83,50 @@ export function usePipeline(handlers = {}) {
         break
       case 'writer_started':
         writing.pipeline.stateLabel = '执笔者续写'
-        writing.pipeline.editor = { status: 'running', detail: '读取回合案卷 · 直接成文', output: '' }
+        writing.pipeline.editor = {
+          role: 'writer',
+          status: 'running',
+          detail: '读取回合案卷 · 直接成文',
+          output: '',
+        }
         break
       case 'writer_progress':
+        // DraftReady 已携带权威全文；忽略异步通道中迟到的尾部 token，避免正文重复或退回 running。
+        if (writing.pipeline.editor.status === 'done') break
         if (writing.pipeline.editor.status !== 'running') {
-          writing.pipeline.editor = { status: 'running', detail: '执笔中', output: '' }
+          writing.pipeline.editor = { role: 'writer', status: 'running', detail: '执笔中', output: '' }
         }
         writing.pipeline.editor.output += event.data.delta || ''
         if (scrollToBottom) scrollToBottom()
         break
       case 'editor_started':
         writing.pipeline.stateLabel = '编剧合并'
-        writing.pipeline.editor = { status: 'running', detail: '合并 · 润色 · 成文', output: '' }
+        writing.pipeline.editor = {
+          role: 'editor',
+          status: 'running',
+          detail: '合并 · 润色 · 成文',
+          output: '',
+        }
         // Editor 逐字流式由 StreamingMessage 读 pipeline.editor.output 渲染，不再插占位消息
         break
       case 'editor_progress':
         // 累积编剧流式输出到 pipeline(StreamingMessage 实时渲染)
+        if (writing.pipeline.editor.status === 'done') break
         if (writing.pipeline.editor.status !== 'running') {
-          writing.pipeline.editor = { status: 'running', detail: '生成中', output: '' }
+          writing.pipeline.editor = { role: 'editor', status: 'running', detail: '生成中', output: '' }
         }
         writing.pipeline.editor.output += event.data.delta || ''
         if (scrollToBottom) scrollToBottom()
         break
       case 'draft_ready':
-        writing.pipeline.editor = { status: 'done', detail: '成文完成' }
+        writing.pipeline.editor = {
+          ...writing.pipeline.editor,
+          role: writing.pipeline.editor.role || 'editor',
+          status: 'done',
+          detail: writing.pipeline.editor.role === 'writer' ? '正文完成' : '成文完成',
+          // 后端 DraftReady.text 是最终正文，优先于可能尚未排空的流式 delta。
+          output: event.data?.text || writing.pipeline.editor.output || '',
+        }
         writing.pipeline.stateLabel = '已产出'
         // 成文由 applyConversation 推入正式消息;StreamingMessage 随 showPipeline=false 消失
         break
@@ -138,9 +158,17 @@ export function usePipeline(handlers = {}) {
         handlePromptHookRequest(event.data)
         break
       case 'postprocess_started':
-        writing.pipeline.postprocess = { status: 'running', detail: '提取知识 · 更新变量 · 检测任务', knowledge: 0, variable: 0, task: 0, reason: '' }
+        writing.pipeline.summary = event.data?.summarizer_enabled === false
+          ? { status: 'idle', detail: '', charCount: 0 }
+          : { status: 'running', detail: '提炼本轮剧情', charCount: 0 }
+        writing.pipeline.postprocess = event.data?.postprocessor_enabled === false
+          ? { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
+          : { status: 'running', detail: '更新知识 · 变量 · 任务', knowledge: 0, variable: 0, task: 0, reason: '' }
         break
       case 'postprocess_done':
+        if (writing.pipeline.summary.status === 'running') {
+          writing.pipeline.summary = { status: 'error', detail: '摘要未产出', charCount: 0 }
+        }
         writing.pipeline.postprocess = {
           status: 'done',
           detail: `知识 ${event.data.knowledge_count || 0} · 变量 ${event.data.variable_count || 0} · 任务 ${event.data.task_count || 0}`,
@@ -151,15 +179,23 @@ export function usePipeline(handlers = {}) {
         }
         break
       case 'postprocess_failed':
+        if (writing.pipeline.summary.status === 'running') {
+          writing.pipeline.summary = { status: 'error', detail: '摘要未产出', charCount: 0 }
+        }
         writing.pipeline.postprocess = { status: 'error', detail: '后处理失败', knowledge: 0, variable: 0, task: 0, reason: event.data.reason || '' }
         break
       case 'postprocess_skipped':
-        writing.pipeline.postprocess = { status: 'done', detail: '已跳过', knowledge: 0, variable: 0, task: 0, reason: event.data.reason || '' }
+        if (writing.pipeline.summary.status === 'running') {
+          writing.pipeline.summary = { status: 'error', detail: '摘要未产出', charCount: 0 }
+        }
+        // 配置关闭不是一次模型调用，保持 idle，避免回顾中虚增“状态记账”阶段。
+        writing.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: event.data.reason || '' }
         break
       case 'summary_done':
-        // 摘要是后处理子步骤，记到 postprocess detail
-        if (writing.pipeline.postprocess.status === 'running') {
-          writing.pipeline.postprocess.detail = `摘要 ${event.data.char_count || 0} 字 · 提取中`
+        writing.pipeline.summary = {
+          status: 'done',
+          detail: `摘要 ${event.data.char_count || 0} 字`,
+          charCount: event.data.char_count || 0,
         }
         break
       case 'error':

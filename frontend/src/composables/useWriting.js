@@ -98,7 +98,8 @@ export function useWriting(options = {}) {
     writingStore.pipeline.stateLabel = '准备中'
     writingStore.pipeline.director = { status: 'idle', detail: '', output: '' }
     writingStore.pipeline.subagents = []
-    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '' }
+    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '', role: null }
+    writingStore.pipeline.summary = { status: 'idle', detail: '', charCount: 0 }
     writingStore.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
     writingStore.pipeline.quality = null
     // 清除编剧流式消息占位（上次写作残留）

@@ -465,8 +465,11 @@ pub enum PipelineEvent {
         model: String,
         messages: Vec<ChatMessage>,
     },
-    /// 后处理流水线启动（总结 + 后处理并行）
-    PostProcessStarted,
+    /// 后处理流水线启动（总结 + 状态记账并行）；显式声明本轮实际启用的模型调用。
+    PostProcessStarted {
+        summarizer_enabled: bool,
+        postprocessor_enabled: bool,
+    },
     /// 后处理完成（三件套产出计数）
     PostProcessDone {
         knowledge_count: usize,

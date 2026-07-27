@@ -46,19 +46,19 @@ function submit() {
 
 <template>
   <div
-    class="rounded-xl border bg-surface px-4 py-3 shadow-card transition-colors"
-    :class="writing ? 'border-line' : 'border-line focus-within:border-accent-border'"
+    class="overflow-hidden rounded-2xl border bg-surface shadow-rise transition-all"
+    :class="writing ? 'border-line' : 'border-line focus-within:border-accent-border focus-within:shadow-card'"
   >
-    <div v-if="showGenerationModes" class="mb-2.5 flex items-center gap-1.5 flex-wrap" aria-label="生成模式">
-      <span class="mr-1 text-[11px] text-ink-faint">本轮模式</span>
+    <div v-if="showGenerationModes" class="flex flex-wrap items-center gap-1.5 px-4 pb-2 pt-3" aria-label="生成模式">
+      <span class="mr-1 text-[10px] font-medium uppercase tracking-[0.14em] text-ink-faint">本轮模式</span>
       <button
         v-for="mode in generationModes"
         :key="mode.value"
         type="button"
         :disabled="disabled || writing"
-        class="min-h-7 rounded-md border px-2.5 text-xs transition-colors disabled:opacity-40"
+        class="min-h-7 rounded-lg border px-2.5 text-xs transition-all disabled:opacity-40"
         :class="generationMode === mode.value
-          ? 'border-accent-border bg-accent-soft text-accent-bright'
+          ? 'border-accent-border bg-accent-soft text-accent-bright shadow-sm'
           : 'border-line bg-surface-2 text-ink-soft hover:border-accent-border'"
         :title="`${mode.hint} · ${mode.callEstimate}`"
         @click="emit('update-generation-mode', mode.value)"
@@ -70,14 +70,19 @@ function submit() {
         {{ generationModes.find((mode) => mode.value === generationMode)?.callEstimate }}
       </span>
     </div>
-    <div class="flex items-end gap-3">
+
+    <div
+      data-testid="composer-input-shell"
+      class="mx-3 flex items-end gap-2 rounded-xl border border-line bg-bg/70 px-3 py-2.5 transition-all focus-within:border-accent-border focus-within:bg-bg focus-within:ring-2 focus-within:ring-accent-soft"
+    >
       <textarea
         ref="textareaRef"
         v-model="intent"
+        aria-label="写作意图"
         :placeholder="writing ? '写作中…' : placeholder"
         :disabled="disabled || writing"
         rows="1"
-        class="flex-1 bg-transparent resize-none outline-none text-[15px] leading-relaxed text-ink placeholder:text-ink-faint max-h-36 disabled:opacity-50"
+        class="min-h-[3.5rem] max-h-36 flex-1 resize-none appearance-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-ink outline-none placeholder:text-ink-faint focus:outline-none focus:ring-0 disabled:opacity-50"
         @keydown.enter.exact.prevent="submit"
         @input="$event.target.style.height='auto'; $event.target.style.height=$event.target.scrollHeight+'px'"
       ></textarea>
@@ -86,9 +91,9 @@ function submit() {
         v-if="!writing"
         @click="submit"
         :disabled="!intent.trim() || disabled"
-        class="shrink-0 w-10 h-10 rounded-full flex items-center justify-center transition-colors"
+        class="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-all"
         :class="intent.trim() && !disabled
-          ? 'bg-accent text-white hover:bg-accent-bright shadow-card'
+          ? 'bg-accent text-white shadow-card hover:-translate-y-0.5 hover:bg-accent-bright'
           : 'bg-surface-2 text-ink-faint'"
         aria-label="开始写作"
       >
@@ -97,7 +102,7 @@ function submit() {
       <button
         v-else
         @click="emit('cancel')"
-        class="shrink-0 w-10 h-10 rounded-full flex items-center justify-center bg-err text-white hover:opacity-85 transition-opacity"
+        class="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-err text-white transition-opacity hover:opacity-85"
         aria-label="停止生成"
         title="停止生成"
       >
@@ -106,13 +111,13 @@ function submit() {
     </div>
 
     <!-- 快捷指令 -->
-    <div class="mt-2 flex items-center gap-1 flex-wrap">
+    <div class="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-2">
       <button
         v-for="chip in chips"
         :key="chip.label"
         @click="applyChip(chip)"
         :disabled="disabled || writing"
-        class="min-h-7 px-2.5 rounded-md text-xs text-ink-soft hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40 transition-colors"
+        class="min-h-7 rounded-full border border-transparent bg-surface-2/70 px-3 text-xs text-ink-soft transition-colors hover:border-accent-border hover:bg-accent-soft hover:text-accent-bright disabled:opacity-40"
       >{{ chip.label }}</button>
       <span class="ml-auto text-[11px] text-ink-faint hidden sm:inline">
         <template v-if="writing">写作中 · 点右侧停止键中断</template>

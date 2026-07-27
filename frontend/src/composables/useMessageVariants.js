@@ -137,7 +137,8 @@ export function useMessageVariants(options = {}) {
     writingStore.pipeline.stateLabel = `重 roll（${kind === 'all' ? '整体' : kind}）`
     writingStore.pipeline.director = { status: 'idle', detail: '', output: '' }
     writingStore.pipeline.subagents = []
-    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '' }
+    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '', role: null }
+    writingStore.pipeline.summary = { status: 'idle', detail: '', charCount: 0 }
     writingStore.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
     writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
 
@@ -335,7 +336,8 @@ export function useMessageVariants(options = {}) {
       writingStore.pipeline.stateLabel = ''
       writingStore.pipeline.director = { status: 'idle', detail: '', output: '' }
       writingStore.pipeline.subagents = []
-      writingStore.pipeline.editor = { status: 'idle', detail: '', output: '' }
+      writingStore.pipeline.editor = { status: 'idle', detail: '', output: '', role: null }
+      writingStore.pipeline.summary = { status: 'idle', detail: '', charCount: 0 }
       writingStore.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
       writingStore.showPipeline = false
     } catch (e) {
@@ -366,7 +368,8 @@ export function useMessageVariants(options = {}) {
     writingStore.pipeline.stateLabel = '重 roll（整体）'
     writingStore.pipeline.director = { status: 'idle', detail: '', output: '' }
     writingStore.pipeline.subagents = []
-    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '' }
+    writingStore.pipeline.editor = { status: 'idle', detail: '', output: '', role: null }
+    writingStore.pipeline.summary = { status: 'idle', detail: '', charCount: 0 }
     writingStore.pipeline.postprocess = { status: 'idle', detail: '', knowledge: 0, variable: 0, task: 0, reason: '' }
     writingStore.messages = writingStore.messages.filter((m) => m.id !== 'editor-streaming')
 

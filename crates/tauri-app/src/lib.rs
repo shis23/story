@@ -2239,9 +2239,16 @@ impl WritingEvent {
                     "messages": messages,
                 }),
             ),
-            PipelineEvent::PostProcessStarted => {
-                ("postprocess_started".into(), serde_json::json!({}))
-            }
+            PipelineEvent::PostProcessStarted {
+                summarizer_enabled,
+                postprocessor_enabled,
+            } => (
+                "postprocess_started".into(),
+                serde_json::json!({
+                    "summarizer_enabled": summarizer_enabled,
+                    "postprocessor_enabled": postprocessor_enabled,
+                }),
+            ),
             PipelineEvent::PostProcessDone {
                 knowledge_count,
                 variable_count,

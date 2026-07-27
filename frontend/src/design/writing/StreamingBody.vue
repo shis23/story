@@ -10,20 +10,39 @@ import { ref, computed } from 'vue'
 const props = defineProps({
   pipeline: { type: Object, required: true },
   roleLabel: { type: String, default: 'AI' },
+  generationMode: { type: String, default: 'continuation' },
   contentComponent: { type: [Object, Function, String], default: null },
 })
 
 const showProcess = ref(false)
 
 const editorOutput = computed(() => props.pipeline.editor?.output || '')
+const visibleStage = (stage) => stage && !['idle', 'pending'].includes(stage.status)
+const editorLabel = computed(() =>
+  (props.pipeline.editor?.role
+    ? props.pipeline.editor.role === 'writer'
+    : props.generationMode === 'continuation')
+    ? '执笔者'
+    : '编剧',
+)
 const steps = computed(() => {
   const list = []
-  if (props.pipeline.director) list.push({ key: 'director', label: '导演', ...props.pipeline.director })
+  if (visibleStage(props.pipeline.director)) {
+    list.push({ key: 'director', label: '导演', ...props.pipeline.director })
+  }
   for (const s of props.pipeline.subagents || []) {
-    if (s && s.status && s.status !== 'pending' && s.status !== 'idle')
+    if (visibleStage(s))
       list.push({ key: s.id, label: s.name || s.id, ...s })
   }
-  if (props.pipeline.editor) list.push({ key: 'editor', label: '编剧', ...props.pipeline.editor })
+  if (visibleStage(props.pipeline.editor)) {
+    list.push({ key: 'editor', label: editorLabel.value, ...props.pipeline.editor })
+  }
+  if (visibleStage(props.pipeline.summary)) {
+    list.push({ key: 'summary', label: '剧情摘要', ...props.pipeline.summary })
+  }
+  if (visibleStage(props.pipeline.postprocess)) {
+    list.push({ key: 'postprocess', label: '状态记账', ...props.pipeline.postprocess })
+  }
   return list
 })
 

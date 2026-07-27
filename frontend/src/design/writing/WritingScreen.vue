@@ -159,7 +159,7 @@ const forward = (name) => (p) => emit(name, p)
             </template>
           </StoryPage>
           <div class="mx-auto w-full max-w-[760px] px-4 sm:px-8 pb-6">
-            <ProcessTimeline v-if="hasReview" :pipeline="pipeline" />
+            <ProcessTimeline v-if="hasReview" :pipeline="pipeline" :generation-mode="generationMode" />
           </div>
         </template>
       </template>
