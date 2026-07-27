@@ -1,36 +1,89 @@
-# V5 应用级 CSP 收口 — RESULT（2026-07-27）
+# V5 应用级 CSP 收口 — RESULT（2026-07-27，返修版）
 
 > 工作流：V5 应用级 CSP。分支 `codex/security-app-csp`。**未 push**。
-> 结论：**PARTIAL** —— 静态 CSP、卡壳兼容回归、前端与 Rust 配置门全绿；WebView2 真机网络拦截实测受本代理环境限制未驱动（见 §6）。
+> 结论：**PARTIAL** —— 静态 CSP、**真实 Chromium CSP 行为测试**、卡壳/MVU/PluginHost 兼容回归、前端构建与 Rust 编译全绿；WebView2 真机网络拦截实测受本代理环境限制未驱动（见 §7）。
 
 ## 0. SHA 与纪律
 
 - base（开工 `main`）：`29513a600a404563ef5aad30ad52fa97b3d0c90a`
-- head：`656b9e713c6b94ac5cfc31fa428403a37883474f`（`feat(security): pin main-app CSP and add contract tests (V5)`）。
+- 返修前 head：`65a0f1a852eace2d31bed3312179cba6b8956a06`（首轮：feature `656b9e7` + 文档 `65a0f1a`）。
+- 返修后 head：见 §10 提交清单（`ac5b1e7` Rust → `b8bdac4` 前端+CSP → `9c5d919` 行为测试 → 本文档提交）。
 - worktree：`.worktrees/security-app-csp`（`.worktrees/` 已 gitignore）。
-- 未修改：`crates/tauri-app/src/lib.rs`、Android picker/manifest/capabilities、`.gitea/workflows/**`、`EXECUTION-PROGRAM-2026-07-27.md`。
-- 未做：V6 权限统一、`tauri-app/src/lib.rs` 巨石拆分。
+- **本轮新增对 `crates/tauri-app/src/lib.rs` 的最小接线**（提示明确授权；详见 §3.2）。未还原 Android picker/数据目录、CI、SQLite、写作流水线改动。
+- 未做：V6 权限统一。
 
-## 1. 资源通道清单（核实结论）
+## 1. 首轮设计错误与返修根因
 
-主应用（受信 UI origin）的实际资源通道，逐项代码核实：
+首轮（`656b9e7`）把主应用 `csp: null` 换成收紧策略，但**未处理 iframe 文档的 CSP 继承**，导致阻断级回归：
 
-| 通道 | 消费者 | CSP 处理 |
+- `default-src 'self'` + 无 `script-src` ⇒ 回落 `'self'`，禁内联脚本。
+- 但 4 个运行时在 iframe 文档里都用**内联脚本**：
+  - `CardShellHost.vue` / `TavernHelperRuntime.vue`：blob iframe + 内联 bridge。
+  - `MvuJsRuntime.vue`：`srcdoc` + 内联 `SHIM_SCRIPT`。
+  - `PluginHost.vue`：`srcdoc` + 内联 `bridgeScript`。
+- **CSP Level 3 规定**（`w3c.github.io/webappsec-csp/#security-inherit-csp`）：`blob:` / `srcdoc:` / `data:` / `about:blank` 文档**继承创建者 policy container**；多重策略只能**交集**收紧，iframe 自身 `<meta>` **不能放宽**继承的策略。
+- 因此首轮策略会**静默阻断所有 iframe 内联 bridge**，而 `buildShellCspMetaTag` 救不回。
+- 首轮 RESULT 与 `appCsp.js` 注释关于 "shell never bounded by outer policy" 的表述**错误**，已删除修正。
+
+### 1.1 可复现验证（真实 Chromium，非 jsdom/字符串检查）
+
+`frontend/tests/csp-inheritance.spec.mjs`（Playwright 驱动真实 Chromium CSP 引擎，8 例全绿）证明：
+1. blob iframe 内联脚本被继承主 CSP 阻断（复现回归）。
+2. srcdoc iframe 内联脚本被阻断（MvuJsRuntime/PluginHost 形态）。
+3. iframe 自身 `<meta>` CSP 无法救回被继承策略阻断的内联脚本（多重策略交集）。
+4. 隔离 origin 文档独立 policy container 可正常运行内联脚本（修复形态）。
+5. CardShell 风格 bridge 在隔离 origin 上 ready + ping/pong round-trip。
+6. 主应用 origin `fetch('https://example.com')` 被主 CSP `connect-src` 阻断（V5 外联保证）。
+7. 隔离 shell 可加载 `storyforge-cache` 协议资源，无 CSP 违规。
+8. shell 自身 CSP 仍阻断未授权远程外联（即便内联脚本可运行）。
+
+## 2. 修复：独立 origin 隔离文档
+
+新增受限 Tauri 自定义协议 `storyforge-shell`，按一次性 token 提供文档 HTML，文档自带 shell CSP（HTTP 头 + `<meta>` 双重）。主应用 `frame-src` **只**允许该 origin。保留 `sandbox="allow-scripts"`（**不**加 `allow-same-origin`）。
+
+### 2.1 三层 CSP 关系（正确模型）
+
+| 层 | 谁设置 | 作用于 | 能否放宽上一层 |
+| --- | --- | --- | --- |
+| 父 CSP（主应用 `app.security.csp`） | Tauri 配置 | 主应用 origin 文档 | — |
+| 继承 CSP | 自动 | 父创建的 blob/srcdoc/data/about:blank 子文档 | **不能**（只收紧） |
+| iframe 自身 CSP（`<meta>` / 协议响应头） | shell 文档 / 协议 | 该文档 | **不能**（与继承策略交集，只收紧） |
+
+**结论**：blob/srcdoc 形态下，iframe 内联脚本能否运行**取决于父 CSP**，shell 自身无法挽救。故必须让 shell 文档落在**不继承父 CSP 的独立 origin**（`storyforge-shell`），其 policy container 由协议响应头设定。
+
+## 3. Rust 侧实现
+
+### 3.1 新模块 `crates/tauri-app/src/shell_doc_protocol.rs`
+- `pub const SHELL_DOC_SCHEME = "storyforge-shell"`；平台 origin 常量（镜像 `card_shell_cache.rs:26-29`）：Win/Android `http://storyforge-shell.localhost`，macOS/Linux `storyforge-shell://localhost`。
+- 进程内 token registry：`static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<String>>>>`（镜像 `get_card_shell_cache()` lib.rs:159 的 OnceLock 单例）。`register_shell_doc(html) -> token`（32 字节随机 hex）。**不持久化**：shell 文档是父进程内存中内容的临时渲染面，重启无物可恢复。
+- `shell_doc_protocol_response(request)`：镜像 `card_shell_cache_protocol_response`（lib.rs:11763-11804）——只接受 GET/HEAD/OPTIONS；`path().trim_start_matches('/')` 作 token；严格校验（64 hex，拒遍历/空/斜杠）；命中返回 `200 text/html; charset=utf-8` + CORS 头 + **`Content-Security-Policy` 头**（= shell 策略，与 `buildShellCspContent([])` 同义）+ `Cache-Control: no-store`；未命中/非法 → 404（不带 CSP 头）。
+- 单测 8 例（全绿）：注册取回含 CSP 头、HEAD 空体、未知 token 404 不带 CSP、非法/遍历 token 404、非 GET 405、OPTIONS 预检 204、同 HTML 两次注册得不同 token、token 校验器严格性。
+
+### 3.2 `lib.rs` 最小接线（提示授权；与 Android 线的冲突协议）
+- `mod shell_doc_protocol;`（lib.rs 模块声明区）。
+- `tauri::Builder::default()` 链上新增一行 `.register_uri_scheme_protocol(shell_doc_protocol::SHELL_DOC_SCHEME, ...)`（紧随 `storyforge-cache` 注册之后）。
+- 新 Tauri 命令 `card_shell_register_doc(html) -> Result<String, String>`（挂入 `invoke_handler`）。
+- **未改 Android picker/数据目录/任何现有命令逻辑**。
+- **与 Android 线的 rebase/cherry-pick 协议**：`lib.rs:13328` 附近的 Builder 链是 Android 线共享热点。本线改动是**纯增量**（一行协议注册 + 一个独立命令 + 一个模块声明）。若 Android 线同区域改动，合入时按 Android-first 顺序 cherry-pick 本线的协议注册行与命令声明；模块声明独立无冲突。
+
+## 4. 前端迁移
+
+### 4.1 `frontend/src/utils/shellDocUrl.js`（新）
+封装 `registerShellDoc(html)` → `invoke('card_shell_register_doc')` → 返回 `<SHELL_DOC_ORIGIN>/<token>`；导出平台 origin（与 Rust 同步）+ `configureShellDocInvoke(invoke)`（注入依赖，保持可单测）+ `shellDocUrlForToken(token)`（测试 fixture）。
+
+### 4.2 4 个运行时迁移（均保留 `sandbox="allow-scripts"`，不加 allow-same-origin）
+| 组件 | 原 | 迁移后 |
 | --- | --- | --- |
-| 应用 bundle（Vite 产物） | 整个 UI | `default-src 'self'`（dev：`http://localhost:1420`，prod：Tauri custom-protocol origin） |
-| Tauri IPC（所有后端调用） | `frontend/src/tauri-api.js` 全部 `invoke(...)`：LLM、角色/预设导入、对话、密钥（keyring） | `connect-src ipc: http://ipc.localhost` |
-| 自定义缓存协议 `storyforge-cache` | 大资源（卡地图等）经 `card_shell_cache.rs` 写盘后由本地协议下发 | `connect-src`/`img-src`/`media-src`/`font-src` 含 `http://storyforge-cache.localhost`（Win/Android）与 `storyforge-cache://localhost`（macOS/Linux）两形态 |
-| `data:` / `blob:` | 内联资源、shell blob 文档、内存响应 | `connect-src`/`img-src`/`media-src`/`font-src` 含 `data:` `blob:` |
-| blob iframe | `CardShellHost.vue:204` 父进程 `new Blob([html])` + `createObjectURL` 加载 `sandbox="allow-scripts"` 卡文档 | `frame-src blob: data:` |
-| 远程图片/字体（主应用直连） | **无**。主应用不直连任何远程主机（LLM 走 Rust 后端） | 故不放开任何 `https://` |
-| 远程 CDN 脚本（jQuery/Vue/zod/Ejs/lodash/js-yaml） | `CardShellHost.vue:643-696`、`TavernHelperRuntime.vue:303-451` | **不属主应用 CSP**：经 `__sfHostFetchText`/`__sfThHostFetchText` → `ask('fetch_text')` postMessage → Rust `card_shell_cache.rs`（含 SSRF + allowlist），在 **shell iframe 内** 以内联脚本注入；由 shell 自身 CSP（`cardShellCsp.js`，M3 已修）约束 |
-| 卡壳 fetch proxy | `cardShellFetchProxy.js` 生成 shell 内 `window.fetch` monkey-patch，转 `__sfHostFetchDataUrl` | shell 内脚本，受 shell CSP 约束，与主应用 CSP 无关 |
+| `CardShellHost.vue` | blob URL（`URL.createObjectURL`） | `registerShellDoc(wrappedHtml)`；`:src`；保留 shell CSP meta（原有） |
+| `TavernHelperRuntime.vue` | blob URL | 同上；**新增** shell CSP meta（原无） |
+| `MvuJsRuntime.vue` | `:srcdoc` 常量内联脚本 | `buildMvuShellDoc()` + `registerShellDoc`；`:src`（onMounted 解析）；**新增** shell CSP meta |
+| `PluginHost.vue` | `:srcdoc` computed | `iframeDoc` computed + `watch` 重注册；`:src`；**新增** shell CSP meta |
 
-**关键不变量**：主应用 origin **零** 直连网络出口。所有远程资源需求都经 host-mediated fetch（Rust 侧 allowlist + IP 字面量/localhost 拒绝 + 重定向逐跳校验）。
+非 Tauri 环境（happy-dom/Vitest/Playwright IPC mock 未覆盖该命令时）回退 blob URL，保证测试与旧 harness 仍可渲染。
 
-## 2. 最终 CSP 指令
+## 5. 最终 CSP 指令
 
-`crates/tauri-app/tauri.conf.json` `app.security.csp`（与 `frontend/src/utils/appCsp.js` `APP_CSP` 字节一致，由 `app-csp.test.mjs` 守门）：
+`crates/tauri-app/tauri.conf.json` `app.security.csp`（与 `frontend/src/utils/appCsp.js` `APP_CSP` 字节一致，由 `app-csp.test.mjs` drift-guard 守门）：
 
 ```
 default-src 'self';
@@ -39,126 +92,67 @@ img-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://
 media-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://localhost;
 font-src 'self' data: blob: http://storyforge-cache.localhost storyforge-cache://localhost;
 style-src 'self' 'unsafe-inline';
-frame-src blob: data:;
-worker-src 'self' blob:;
+frame-src http://storyforge-shell.localhost storyforge-shell://localhost data:;
 object-src 'none';
 form-action 'none';
 base-uri 'none';
 ```
 
-Tauri 2 行为（官方 CSP 文档 + issue #3583）：`dangerousDisableAssetCspModification` 默认 `false`，故 `tauri-build`/`tauri-codegen` 在编译期自动为 `index.html` 的内联 `<script>`（本仓即主题 bootstrap 内联脚本）追加 SHA hash 到 `script-src`，并在生产注入 nonce。因此本策略 **不** 显式写 `script-src`（回落到 `default-src 'self'`），由 Tauri 在编译期补 hash/nonce。
+### 5.1 与首轮的差异（返修点）
+- `frame-src`：`blob: data:` → **`http://storyforge-shell.localhost storyforge-shell://localhost data:`**（只允许隔离 origin；去掉 blob，因父创建的 blob 文档会继承本 CSP 阻断内联 bridge）。
+- 删除 `worker-src 'self' blob:`：**无消费者**（无 worker 依赖）。回落 `default-src 'self'`。
+- `script-src` 仍不写（回落 `'self'`），Tauri 编译期 hash 覆盖 `index.html` 内联主题脚本。
 
-### 2.1 逐项放宽审计（消费者 + 威胁边界）
+### 5.2 逐源消费者审计（每个非 self 源对应真实消费者）
+| 源 | 消费者 |
+| --- | --- |
+| `ipc:` `http://ipc.localhost` | Tauri IPC（`frontend/src/tauri-api.js` 全部 `invoke`） |
+| `http://storyforge-cache.localhost` `storyforge-cache://localhost` | `card_shell_cache.rs` 大资源本地协议（两平台形态） |
+| `http://storyforge-shell.localhost` `storyforge-shell://localhost` | `shell_doc_protocol.rs` 隔离 shell 文档（4 个运行时 iframe） |
+| `data:` `blob:` | 内存资源（各指令） |
+| `'unsafe-inline'`（仅 style-src） | Vue scoped CSS + 主题 bootstrap |
 
-| 源 | 指令 | 消费者 | 威胁边界 / 为何必须 |
-| --- | --- | --- | --- |
-| `'self'` | default-src | 应用 bundle | 基线，仅本地产物 |
-| `ipc:` `http://ipc.localhost` | connect-src | Tauri IPC | Tauri 强制要求；IPC 是唯一后端通道 |
-| `http://storyforge-cache.localhost` | connect/img/media/font-src | `card_shell_cache.rs` 大资源本地协议（Win/Android 形态） | 本地注册协议，文件名由 sha256 派生 + 反遍历（`card_shell_cache.rs:195-213,421-428`）；非外网 |
-| `storyforge-cache://localhost` | 同上 | 同上（macOS/Linux 形态） | 同上 |
-| `data:` `blob:` | 多指令 | 内存资源、shell blob 文档 | 非网络；blob 指向进程内对象 |
-| `'unsafe-inline'`（仅 style-src） | style-src | Vue scoped CSS 注入 + `index.html` 主题 bootstrap | **仅样式**；脚本未授予 unsafe-inline（Tauri 编译期 hash 覆盖） |
-| `frame-src blob: data:` | frame-src | `CardShellHost.vue` shell iframe | 卡壳渲染必需；shell 自带更严 CSP |
-| `worker-src 'self' blob:` | worker-src | 潜在 bundled/blob worker | 预留；非网络 |
+### 5.3 DRIFT GUARD 说明（修正表述）
+`APP_CSP` 与 `tauri.conf.json` 是**手动维护的字节级副本**，**非构建时生成**，故**不是真正单一真相源**——它是 drift guard，由 `app-csp.test.mjs` 断言相等，漂移即构建失败。`appCsp.js` 注释已据此修正。
 
-### 2.2 明确未授予（且有测试断言其不存在）
+## 6. 被阻断场景（CSP 生效后）
+主应用 origin 下：`fetch`/`XHR`/`WebSocket`/`sendBeacon` 直连外网、`<img src=https://...>` 外泄、`<script src=https://...>`、`<iframe>/<object>/<embed>` 远程文档（`object-src 'none'` + `frame-src` 仅隔离 origin）、`<form>` 外网提交（`form-action 'none'`）、`<base>` 劫持（`base-uri 'none'`）。隔离 shell 内未授权外联由 shell 自身 CSP 阻断（见 §1.1 测试 8）。
 
-- 任何 `https://` / `http://` 远程主机（`http://ipc.localhost` 与 `http://storyforge-cache.localhost` 除外，二者均为本地）。
-- `*`。
-- `script-src 'unsafe-inline'` / `'unsafe-eval'`（无 WASM、无 eval 需求；`package.json` 无 wasm/onnx/sqlite 依赖，`dist/` 无 `.wasm`）。
-
-## 3. 被阻断场景（CSP 生效后）
-
-主应用 origin 下的以下外联将被 CSP 拦截（修复前 `csp:null` 全部畅通）：
-
-- 卡外脚本通过 `XMLHttpRequest`/`fetch` 直连任意外网（V5 核心缺口）。
-- `<img src="https://attacker/...">` / `new Image().src` 外泄（H3/L1 渲染正则注入路径，主应用层）。
-- `navigator.sendBeacon`、`WebSocket` 到外网。
-- `<script src="https://...">` 远程代码加载。
-- `<iframe>`/`<object>`/`<embed>` 加载远程文档或插件（`object-src 'none'` + `frame-src` 仅 blob:/data:）。
-- `<form>` 向外网提交（`form-action 'none'`）。
-- `<base>` 劫持相对 URL（`base-uri 'none'`）。
-
-> 注：卡壳 iframe 内的外联由 **shell CSP**（`cardShellCsp.js`，M3 已修）阻断；本策略是其外层补充，覆盖主应用 origin 直接发起的通道与 shell 文档的加载本身。
-
-## 4. 兼容限制
-
-1. **`style-src 'unsafe-inline'`**：Vue scoped CSS 与主题 bootstrap 必需。脚本未放宽。若将来要去掉，需把主题 bootstrap 改为外链或由 Tauri hash 注入覆盖（当前由编译期 hash 机制处理的是 `<script>`，非 `<style>`）。
-2. **自定义缓存协议两形态并存**：策略同时列 `http://storyforge-cache.localhost` 与 `storyforge-cache://localhost`，确保同一 bundle 在 Win/Android 与 macOS/Linux 都可用（镜像 `card_shell_cache.rs:27-29` 与 `cardShellCsp.js` `SHELL_CACHE_ORIGINS`）。
-3. **dev 模式**：`devUrl: http://localhost:1420` 属 `'self'` 在 Tauri dev 下的解析范畴；dev 下 Tauri 仍套用同一 CSP（未单独设 `devCsp`），与生产一致收紧。若 dev 工具链（如 HMR ws）触发拦截，后续可考虑加受限的 `devCsp`——本轮未引入，避免为便利放宽。
-
-## 5. 测试
-
-### 5.1 新增静态 CSP 契约测试（TDD fail-first → green）
-
-`frontend/tests/app-csp.test.mjs`（10 例，全绿）。重点：
-
-- **fail-first 守门**：`tauri.conf.json app.security.csp equals APP_CSP byte-for-byte` —— 在配置还是 `null` 时此例失败（已实测），配置更新后转绿。防"文档写了、配置仍 null"漂移。
-- **V5 回归守卫**：`NO directive grants arbitrary remote egress` —— 断言无 `*`/`https:`/`http:`（除两个 localhost）/`unsafe-eval`，且 `unsafe-inline` 仅 style-src。
-- **script-src 不含 unsafe-inline/unsafe-eval**。
-- **object-src/form-action/base-uri 锁死 'none'**。
-- **frame-src 允许 blob:/data:**（shell iframe 必需）。
-- **缓存协议源镜像** `card_shell_cache.rs` + `cardShellCsp.js`。
-- **shell 兼容回归**：外层策略不收窄 shell 依赖的 blob iframe 与缓存协议通道。
-
-`frontend/src/utils/appCsp.js` 导出 `APP_CSP`（与配置同款）、`APP_CACHE_ORIGINS`、`parseCsp`，既是测试锚点也是可审计的策略单一真相源。
-
-### 5.2 全量回归（命令 + 结果）
+## 7. 测试与验证（必跑项结果）
 
 | 命令 | 结果 |
 | --- | --- |
-| `cd frontend && npm test`（Node `--test`，含新 `app-csp.test.mjs`） | **441 pass / 0 fail** |
-| `cd frontend && npm run test:ui`（Vitest，含 CardShell/RichContent/ShellAwareContent/MVU/PluginHost） | **74 pass / 0 fail**（16 文件） |
-| `cd frontend && npm run build`（生产构建） | **成功**（`built in 4.08s`），`dist/` 无 `.wasm`，无远程 `src=`，仅 1 个内联主题 `<script>`（由 Tauri 编译期 hash 注入覆盖） |
-| `cd .worktrees/security-app-csp && cargo check -p storyforge` | **Finished**（4m08s）—— `tauri-build`/`tauri-codegen` 接受新 CSP 字符串 |
+| `cd frontend && npm test`（Node `--test`，含 `app-csp.test.mjs` 12 例） | **443 pass / 0 fail** |
+| `cd frontend && npm run test:ui`（Vitest，CardShell/RichContent/ShellAwareContent/MVU/PluginHost 组件） | **74 pass / 0 fail**（16 文件） |
+| `npx playwright test --config=playwright.csp.config.mjs`（**真实 Chromium CSP 行为**，8 例） | **8 pass / 0 fail** |
+| `cd frontend && npm run build` | **成功**（`built in 4.28s`），`dist/` 无 `.wasm`、无远程 script src |
+| `cargo check -p storyforge` | **Finished**（tauri-build 接受新 CSP + 新协议） |
+| `cargo test -p storyforge --lib shell_doc_protocol` | **8 pass / 0 fail** |
+| `cargo build -p storyforge --bin storyforge` | **成功**（1m57s，`target/debug/storyforge.exe`）→ 二进制嵌入新协议 + 命令 + 生效 CSP |
 | `git diff --check` | **CLEAN** |
-| `node --test tests/card-shell-csp.test.mjs`（shell CSP 跨策略回归） | **4 pass / 0 fail** |
 
-关键 UI 回归点：`card-shell-host-sandbox.test.mjs`（"wraps inline html into a CSP-pinned bridge document inside a sandboxed iframe"）、`shell-aware-content.test.mjs`（11 例）、`card-shell-floating-status`、`writing-screen-runtime-slots` 全绿——卡壳挂载链路未被外层 CSP 破坏。
+## 8. WebView2 smoke 层级 — PARTIAL（诚实）
+本代理环境**未真机驱动 WebView2**。所做"接近证据"：`cargo check`/`cargo build` 通过 → 新协议与命令编译进产物；真实 Chromium CSP 行为测试（§1.1）证明规范级行为。**未做**：可见 WebView2 窗口实测（主应用渲染无 CSP 违规、`fetch('https://...')` 被拦、真实卡 CardShell 执行、MVU/PluginHost ready）。按提示要求，**不**把 Chromium/Node 测试写成 WebView2 PASS。待主会话/用户实测项：见 §9。
 
-## 6. WebView2 smoke 层级 — PARTIAL
+## 9. Android / WebView2 待验项
+- **WebView2 真机**：启动产物，确认 (a) 主应用渲染无 CSP 违规；(b) DevTools Console 无 `Refused to ...`；(c) `fetch('https://example.com')` 被主 CSP 拦并报 `connect-src` 违规；(d) 加载真实卡（Destiny/卿卿）CardShell 正常执行；(e) MVU 与 PluginHost ready。
+- **Android WebView**：`http://storyforge-shell.localhost` 形态生效、卡壳渲染、MVU/PluginHost ready、网络拦截（与 Android 线并行，待其 RESULT 汇总）。
+- **blob iframe CSP 继承在 WebView2/Android 的实际行为**：架构评审 V5 建议；本线已用隔离 origin 规避该不确定性（shell 文档不再依赖继承），但真机回归仍需确认 `storyforge-shell` 协议在两端正常注册与响应。
 
-**诚实声明**：本代理环境**未能真机驱动 WebView2 窗口**进行运行时网络拦截实测。依据提示词第 37 行，不以浏览器/单元测试冒充 WebView2/Android 真机验证。
+## 10. 提交清单（独立逻辑提交，不 push）
+返修分提交：
+1. **Rust**（`ac5b1e7`）：`shell_doc_protocol.rs` + `lib.rs` 最小接线（协议注册 + 命令 + 模块声明）+ 单测。
+2. **前端 + CSP**（`b8bdac4`）：`shellDocUrl.js` + 4 运行时迁移 + `appCsp.js`/`tauri.conf.json`/`app-csp.test.mjs` 修正。
+3. **行为测试**（`9c5d919`）：`csp-inheritance.spec.mjs` + `playwright.csp.config.mjs`。
+4. **文档**（本提交）：本 RESULT（修正安全模型、SHA、消费者审计、Android 协议）。
 
-实际做到的"接近证据"：
+**分类**：feature commit = `ac5b1e7`、`b8bdac4`（code-under-test）；test commit = `9c5d919`；doc commit = 本提交。
 
-- `cargo check -p storyforge` 通过 → `tauri-build`/`tauri-codegen` 在编译期成功解析新 CSP（无效 CSP 字符串会让 build.rs 失败）。
-- `cargo build -p storyforge --bin storyforge` **成功**（6m39s，`target/debug/storyforge.exe` 49MB）→ debug 二进制嵌入了生效的 CSP（编译期 codegen 把 CSP 注入产物）。**但未**在可见 WebView2 窗口里实测拦截行为。
-- `npm run build` 产出与 CSP 假设一致的 bundle（无 wasm、无远程 script src、仅 1 个会被 Tauri hash 覆盖的内联脚本）。
+> `crates/tauri-app/gen/schemas/*.json` 仅 CRLF 空白变化（`git diff --ignore-all-space` 为空），**不**入提交。
 
-**未做到 / 待主会话或用户实测**：
-
-- 启动 `tauri dev` 或安装产物，在真实 WebView2 中：(a) 主应用正常渲染与交互；(b) DevTools Console 无 CSP 违规；(c) 手工触发一个被禁外连（如 console 执行 `fetch('https://example.com')`）确认被拦截并报 CSP 违规；(d) 加载一张真实卡（如 Destiny/卿卿）确认 shell iframe + 缓存协议 + CDN host-fetch 链路未受外层 CSP 影响。
-- Android WebView 真机：`http://storyforge-cache.localhost` 形态生效、卡壳渲染、网络拦截（本轮 Android 线并行，待 Android 线 RESULT 汇总）。
-
-## 7. Android 待验项
-
-- 本策略同时列 `http://storyforge-cache.localhost`，匹配 Android WebView 下 Tauri/Wry 的自定义协议映射（`card_shell_cache.rs:27` cfg）。
-- Android WebView 对 blob iframe 的 CSP 继承行为需真机确认（架构评审 V5 建议点）。卡壳另有自身 `<meta>` CSP 作为继承不可靠时的兜底（M3 已修，`CardShellHost.vue` headInject）。
-- 本轮不改 Android picker/manifest/capabilities；与 Android 线无文件冲突。
-
-## 8. 安全与代码审查
-
-- 策略单一真相源：`tauri.conf.json`（运行时）与 `appCsp.js`（测试锚点）字节一致，由测试守门。
-- 无 `*`、无任意 `https:`、无 `unsafe-eval`、`script-src` 无 `unsafe-inline`。
-- 每个非 `'self'` 源均有消费者与威胁边界记录（§2.1）。
-- 未为测试方便关闭 CSP；未把单元/构建测试写成视觉/网络实测（§6 如实标 PARTIAL）。
-- `git diff --check` clean；未 push。
-
-## 9. 提交
-
-独立逻辑提交（不 push）：
-- `feat(security): pin main-app CSP and add contract tests` —— `tauri.conf.json` + `appCsp.js` + `app-csp.test.mjs` + 本 RESULT。
-
-> 生成的 `crates/tauri-app/gen/schemas/*.json` 仅 CRLF 空白变化（`git diff --ignore-all-space` 为空），**不** 入本次提交。
-
-## 10. 剩余风险
-
-1. **WebView2 运行时未实测**（§6）：编译期解析正确 ≠ 运行时拦截行为已验。任何"已阻断"结论在真机复测前应视为高置信未验。
-2. **`style-src 'unsafe-inline'`** 是当前唯一放宽；若未来引入更严 CSP 工具链需先重构主题 bootstrap。
-3. **dev 模式 HMR**：若 dev 下 Vite HMR ws 触发 CSP 拦截，需加受限 `devCsp`（本轮未引入）。
-4. 本策略不解决 V6（插件 `get_conversation` 越权 / `start_writing` 误匹配）——那是另一条线，本轮明确不扩。
-
----
-
-**head SHA**：`656b9e713c6b94ac5cfc31fa428403a37883474f`（见 `git log -1 codex/security-app-csp`）。
+## 11. 剩余风险
+1. **WebView2/Android 真机未实测**（§8）：编译期与 Chromium 行为正确 ≠ WebView2 运行时已验。
+2. **`style-src 'unsafe-inline'`** 仍为唯一放宽。
+3. **lib.rs Builder 链**与 Android 线共享：纯增量，但合入需按 Android-first cherry-pick（§3.2）。
+4. shell 文档 token registry **不持久化**：重启后旧 shell URL 失效（符合预期，shell 是临时渲染面）。
+5. 本策略不解决 V6（插件越权）——另一条线。
