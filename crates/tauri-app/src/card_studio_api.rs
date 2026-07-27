@@ -292,7 +292,7 @@ pub async fn cardstudio_run_review(
     }
 
     let (system, user) = build_review_prompt(&project, &rule_report, user_note.as_deref());
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let params = crate::get_conn_store()
         .active_connection()
         .map(|c| c.params)
@@ -507,7 +507,7 @@ pub async fn cardstudio_prefill_from_novel(
         prompt.push_str(note);
     }
 
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let params = crate::get_conn_store()
         .active_connection()
         .map(|c| c.params)
@@ -642,7 +642,7 @@ pub async fn cardstudio_run_stage(
     let (system, user) = build_stage_prompt(&stage_id, &project, user_note.as_deref())
         .map_err(TauriCommandError::validation)?;
 
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let params = crate::get_conn_store()
         .active_connection()
         .map(|c| c.params)

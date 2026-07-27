@@ -24,6 +24,8 @@ const props = defineProps({
   showHeader: { type: Boolean, default: true },
   /** 内容区是否滚动；false 时去掉 overflow-y-auto，调用方自行管理内部滚动（如复杂分栏布局） */
   bodyScroll: { type: Boolean, default: true },
+  /** Keep centered dialogs stable while their inner content changes. */
+  fixedHeight: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue', 'close'])
 
@@ -63,6 +65,9 @@ const surfaceClass = computed(() =>
 )
 
 const isSide = computed(() => props.position === 'left' || props.position === 'right')
+const heightClass = computed(() =>
+  props.fixedHeight && !isSide.value ? 'h-[min(90dvh,52rem)]' : ''
+)
 
 // 侧边抽屉圆角只在朝外那侧
 const sideRoundClass = computed(() => {
@@ -70,6 +75,12 @@ const sideRoundClass = computed(() => {
   if (props.position === 'right') return 'rounded-l-2xl'
   return ''
 })
+
+const nonSideRoundClass = computed(() =>
+  props.position === 'center'
+    ? 'rounded-2xl'
+    : 'rounded-t-2xl sm:rounded-2xl'
+)
 
 // 动画名：left/right 侧滑；其余上移淡入
 const transitionName = computed(() =>
@@ -158,7 +169,12 @@ watch(
         <div
           ref="contentRef"
           class="flex flex-col w-full shadow-xl border border-line overflow-hidden"
-          :class="[widthClass, surfaceClass, isSide ? '' : 'max-h-[90vh] rounded-t-2xl sm:rounded-2xl', sideRoundClass]"
+          :class="[
+            widthClass,
+            surfaceClass,
+            heightClass,
+            isSide ? sideRoundClass : ['max-h-[90vh]', nonSideRoundClass],
+          ]"
           @click.stop
         >
           <!-- 默认顶栏 -->

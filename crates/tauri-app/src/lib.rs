@@ -566,8 +566,6 @@ fn clear_current_cancel_if(app: &AppState, operation_id: &Id) {
 pub struct AppState {
     /// App data directory used by stateful stores owned by this process.
     data_dir: PathBuf,
-    /// Mock LLM 客户端（fallback，无配置连接时用）
-    pub mock_llm: Arc<dyn LlmClient>,
     pub conv_store: Arc<ConversationStore>,
     pub log_store: Arc<LogStore>,
     /// 工具上下文（导入角色卡时同步更新，RwLock 支持运行时写入）
@@ -577,7 +575,7 @@ pub struct AppState {
     pub current_cancel: Mutex<Option<WritingCancelHandle>>,
     /// 等待前端插件处理最终 LLM messages prompt hook 的请求。
     prompt_hook_pending: PromptHookPendingMap,
-    /// 当前活跃连接构造的 LLM client（None = 用 mock_llm）
+    /// 当前活跃连接构造的 LLM client（None = 未配置，生产调用必须 fail closed）
     active_llm: Mutex<Option<Arc<dyn LlmClient>>>,
     /// 当前活跃连接的 ID（用于 get_active_connection 快速查询）
     active_conn_id: Mutex<Option<String>>,
@@ -627,10 +625,6 @@ impl AppState {
         touch_storage_meta(&data_dir);
         let conv_dir = data_dir.join("conversations");
         let log_dir = data_dir.join("logs");
-
-        // Mock 作为 fallback（无连接配置时用，保证流水线不崩）
-        let mock_llm: Arc<dyn LlmClient> =
-            Arc::new(storyforge_infra_llm::mock_client::MockLlmClient::with_defaults());
 
         let conv_store = if sqlite_runtime::is_sqlite_active() {
             let persistence = sqlite_runtime::conversation_persistence()
@@ -730,7 +724,6 @@ impl AppState {
 
         Self {
             data_dir: data_dir.clone(),
-            mock_llm,
             conv_store,
             log_store,
             tool_ctx,
@@ -810,16 +803,17 @@ impl AppState {
         Arc::new(ctx)
     }
 
-    /// 当前活跃的 LLM client（有配置用真实的，否则回退 mock）
-    ///
-    /// 正常路径前端会拦截（无连接时引导建连接），这里回退 mock 仅防崩。
-    pub fn active_llm_or_mock(&self) -> Arc<dyn LlmClient> {
+    /// 当前活跃的 LLM client。无连接时返回 None，禁止生产态回退开发 Mock。
+    pub fn active_llm(&self) -> Option<Arc<dyn LlmClient>> {
         let guard = self.active_llm.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(client) = guard.as_ref() {
-            client.clone()
-        } else {
-            self.mock_llm.clone()
-        }
+        guard.clone()
+    }
+
+    /// 获取真实活跃连接；所有需要 LLM 的生产入口统一 fail closed。
+    pub fn require_active_llm(&self) -> Result<Arc<dyn LlmClient>, TauriCommandError> {
+        self.active_llm().ok_or_else(|| {
+            TauriCommandError::llm("未配置活跃 LLM 连接，请先在设置中配置并启用连接。", false)
+        })
     }
 
     /// 当前活跃连接 ID
@@ -877,11 +871,14 @@ impl AppState {
     }
 
     /// 构造一个新的 PipelineOrchestrator（用活跃 LLM + 当前 tool_ctx 快照 + vector_store + MVU runtime）
-    pub fn new_pipeline(&self) -> PipelineOrchestrator {
+    pub fn new_pipeline(&self) -> Result<PipelineOrchestrator, TauriCommandError> {
         self.new_pipeline_with_regex(&[])
     }
 
-    pub fn new_pipeline_with_regex(&self, regex_scripts: &[RegexScript]) -> PipelineOrchestrator {
+    pub fn new_pipeline_with_regex(
+        &self,
+        regex_scripts: &[RegexScript],
+    ) -> Result<PipelineOrchestrator, TauriCommandError> {
         self.new_pipeline_with_regex_and_prompt_hook(regex_scripts, None)
     }
 
@@ -889,8 +886,8 @@ impl AppState {
         &self,
         regex_scripts: &[RegexScript],
         prompt_hook: Option<PromptHook>,
-    ) -> PipelineOrchestrator {
-        let llm = self.active_llm_or_mock();
+    ) -> Result<PipelineOrchestrator, TauriCommandError> {
+        let llm = self.require_active_llm()?;
         let mut tool_ctx = (*self.snapshot_tool_ctx()).clone();
         // 注入向量存储（search_vectors 工具用）
         tool_ctx.vector_store = Some(self.vector_store.clone());
@@ -916,7 +913,7 @@ impl AppState {
         if sqlite_runtime::is_sqlite_active() {
             pipeline.set_defer_conversation_land(true);
         }
-        pipeline
+        Ok(pipeline)
     }
 }
 
@@ -1145,8 +1142,7 @@ fn list_characters() -> Vec<CharacterSummary> {
 
 #[tauri::command]
 fn get_character(id: String) -> Result<CharacterInfo, TauriCommandError> {
-    get_store()
-        .get(&id)
+    stored_character_for_id_or_source_in_store(get_store(), &Id::from_str(&id))
         .map(|stored| stored.info)
         .ok_or_else(|| TauriCommandError::from(format!("角色卡不存在: {id}")))
 }
@@ -2672,6 +2668,7 @@ async fn start_writing(
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let app = state.inner().clone();
+    app.require_active_llm()?;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
 
     // Phase A 屏障：存在非 terminal Turn → 拒绝启动（在追加 user 消息之前）
@@ -2805,7 +2802,7 @@ async fn start_writing(
     // 每次用最新 tool_ctx 快照构造 orchestrator（保证导入后立刻生效）
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
-        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
+        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook))?;
     let result = pipeline
         .start_writing_with_mode(
             intent,
@@ -3646,12 +3643,21 @@ fn resolve_campaign_opening_message(
     )
 }
 
+fn stored_character_for_id_or_source_in_store(
+    store: &storage::CharacterStore,
+    character_id: &Id,
+) -> Option<storage::StoredCharacter> {
+    let id = character_id.as_str();
+    store.get(id).or_else(|| {
+        store
+            .list()
+            .into_iter()
+            .find(|stored| stored.info.source_character_id.as_deref() == Some(id))
+    })
+}
+
 fn stored_character_for_source_id(source_character_id: &Id) -> Option<storage::StoredCharacter> {
-    let source = source_character_id.as_str();
-    get_store()
-        .list()
-        .into_iter()
-        .find(|sc| sc.info.source_character_id.as_deref() == Some(source) || sc.id == source)
+    stored_character_for_id_or_source_in_store(get_store(), source_character_id)
 }
 
 fn resolve_opening_message_from_parts(
@@ -5835,6 +5841,7 @@ async fn regenerate(
     on_event: tauri::ipc::Channel<WritingEvent>,
 ) -> Result<String, TauriCommandError> {
     let app = state.inner().clone();
+    app.require_active_llm()?;
 
     // 解析 targets
     let targets: Vec<PartialRollTarget> = req
@@ -5945,7 +5952,7 @@ async fn regenerate(
 
     let prompt_hook = frontend_prompt_hook(event_tx.clone(), app.prompt_hook_pending.clone());
     let mut pipeline =
-        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook));
+        app.new_pipeline_with_regex_and_prompt_hook(&ctx.regex_scripts, Some(prompt_hook))?;
     let result = pipeline
         .regenerate(
             pipeline_req.clone(),
@@ -7684,7 +7691,13 @@ fn spawn_compress_job_worker(state: Arc<AppState>, job_id: Id) {
             .unwrap_or_else(|| Id::from_str("unknown-conv"));
         let entries = store.list_summaries(&campaign_id);
 
-        let llm = state.active_llm_or_mock();
+        let llm = match state.require_active_llm() {
+            Ok(llm) => llm,
+            Err(error) => {
+                let _ = job_store.mark_failed_or_retry(&job_id, error.to_string());
+                return;
+            }
+        };
         let tool_snapshot = state.snapshot_tool_ctx();
         let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_snapshot);
         let (_tx, cancel) = tokio::sync::watch::channel(false);
@@ -8107,7 +8120,7 @@ async fn archive_conversation(
         .unwrap_or_else(|p| p.into_inner())
         .clone()
         .ok_or("未配置嵌入 API，请先在设置中配置")?;
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let vector_store = state.vector_store.clone();
     let embedder = Arc::new(
         storyforge_infra_llm::Embedder::new(config)
@@ -8291,7 +8304,13 @@ async fn auto_archive_if_needed(state: &Arc<AppState>, conv_id: &Id) {
         }
     }
 
-    let llm = state.active_llm_or_mock();
+    let llm = match state.require_active_llm() {
+        Ok(llm) => llm,
+        Err(error) => {
+            tracing::debug!("自动归档跳过：{error}");
+            return;
+        }
+    };
     let vector_store = state.vector_store.clone();
     let embedder = match storyforge_infra_llm::Embedder::new(config) {
         Ok(e) => Arc::new(e),
@@ -8593,6 +8612,7 @@ async fn meta_chat(
     on_event: tauri::ipc::Channel<MetaStreamEvent>,
 ) -> Result<serde_json::Value, TauriCommandError> {
     let app = state.inner().clone();
+    let llm = app.require_active_llm()?;
     sync_meta_session_from_tool_ctx(&state);
 
     // 取出对话；不存在则返回错误（而非静默创建空对话，避免用户感觉"历史突然清空"）。
@@ -8607,8 +8627,7 @@ async fn meta_chat(
         })?
     };
 
-    // 构造 AgentRuntime（活跃 LLM 或 mock）
-    let llm = app.active_llm_or_mock();
+    // 构造 AgentRuntime（只允许真实活跃连接）
     let tool_ctx = app.snapshot_tool_ctx();
     let runtime = storyforge_app_agent::AgentRuntime::new(llm, tool_ctx);
 
@@ -9562,7 +9581,7 @@ async fn meta_analyze_mvu_card(
     );
 
     // 跑 LLM 五合一分析
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let tool_ctx = state.snapshot_tool_ctx();
     let runtime = AgentRuntime::new(llm, tool_ctx);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -9839,7 +9858,7 @@ async fn meta_classify_st_preset(
 
     let stored = load_preset_for_classification_async(get_preset_store(), preset_id).await?;
 
-    let llm = state.active_llm_or_mock();
+    let llm = state.require_active_llm()?;
     let tool_ctx = state.snapshot_tool_ctx();
     let runtime = AgentRuntime::new(llm, tool_ctx);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -9951,6 +9970,25 @@ impl From<&campaign_store::StoredCard> for CardSummaryDto {
 }
 
 const FALLBACK_EXTRACTION_MESSAGE: &str = "识别失败，已按单角色处理，可重新识别。";
+
+fn fallback_character_extraction(
+    character: &storyforge_domain::character::Character,
+    mvu_schema: &[storyforge_domain::variables::VariableField],
+) -> (
+    Vec<storyforge_domain::character::CharacterDefinition>,
+    storyforge_domain::character::CharacterExtractionStatus,
+    Option<String>,
+) {
+    use storyforge_domain::character::{CharacterDefinition, CharacterExtractionStatus};
+
+    (
+        vec![CharacterDefinition::fallback_from_character(
+            character, mvu_schema,
+        )],
+        CharacterExtractionStatus::Fallback,
+        Some(FALLBACK_EXTRACTION_MESSAGE.to_string()),
+    )
+}
 
 fn card_extraction_message(card: &storyforge_domain::character::CharacterCard) -> Option<String> {
     use storyforge_domain::character::CharacterExtractionStatus;
@@ -10067,7 +10105,7 @@ async fn extract_characters(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<CardSummaryDto, TauriCommandError> {
     use storyforge_app_agent::AgentRuntime;
-    use storyforge_domain::character::{CharacterDefinition, CharacterExtractionStatus};
+    use storyforge_domain::character::CharacterExtractionStatus;
     use storyforge_domain::variables::extract_mvu_schema_from_extensions;
 
     // 取原 Character（从 tool_ctx，启动恢复 + import_character 都同步过）
@@ -10119,28 +10157,34 @@ async fn extract_characters(
         );
     }
 
-    // 跑识别 Agent
-    let llm = state.active_llm_or_mock();
-    let tool_ctx = state.snapshot_tool_ctx();
-    let runtime = AgentRuntime::new(llm, tool_ctx);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
-
-    let definitions_result =
-        storyforge_app_agent::extract_characters(&runtime, &character, &mvu_schema, cancel_rx)
-            .await;
-
-    let (definitions, extraction_status, extraction_message) = match definitions_result {
-        Ok(defs) => (defs, CharacterExtractionStatus::Extracted, None),
-        Err(e) => {
-            tracing::warn!("角色识别失败，降级建单角色: {e}");
-            (
-                vec![CharacterDefinition::fallback_from_character(
-                    &character,
-                    &mvu_schema,
-                )],
-                CharacterExtractionStatus::Fallback,
-                Some(FALLBACK_EXTRACTION_MESSAGE.to_string()),
+    // 有真实连接时跑识别 Agent；无连接或调用失败时安全降级为源卡自身的单角色定义。
+    // 生产态绝不使用开发 Mock，避免示例人物污染持久化数据。
+    let (definitions, extraction_status, extraction_message) = match state.active_llm() {
+        Some(llm) => {
+            let tool_ctx = state.snapshot_tool_ctx();
+            let runtime = AgentRuntime::new(llm, tool_ctx);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            match storyforge_app_agent::extract_characters(
+                &runtime,
+                &character,
+                &mvu_schema,
+                cancel_rx,
             )
+            .await
+            {
+                Ok(defs) => (defs, CharacterExtractionStatus::Extracted, None),
+                Err(error) => {
+                    tracing::warn!("角色识别失败，降级建单角色: {error}");
+                    fallback_character_extraction(&character, &mvu_schema)
+                }
+            }
+        }
+        None => {
+            tracing::info!(
+                "未配置活跃 LLM，角色识别按源卡「{}」安全降级",
+                character.name
+            );
+            fallback_character_extraction(&character, &mvu_schema)
         }
     };
 
@@ -12208,7 +12252,7 @@ async fn retry_active_turn_postprocess(
     let fallback_fragments =
         collect_mvu_fallback_fragments_for_backend(&writing_ctx, &present_characters);
     let mvu_update_rules = collect_mvu_update_rules_for_backend(&writing_ctx, &present_characters);
-    let pipeline = state.new_pipeline_with_regex(&writing_ctx.regex_scripts);
+    let pipeline = state.new_pipeline_with_regex(&writing_ctx.regex_scripts)?;
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     let identity = production_postprocess::PostprocessIdentity {
@@ -13833,8 +13877,9 @@ mod tests {
     }
 
     fn state_with_recording_llm(llm: Arc<RecordingMockLlm>) -> Arc<AppState> {
-        let mut state = AppState::new_for_test();
-        state.mock_llm = llm as Arc<dyn LlmClient>;
+        let state = AppState::new_for_test();
+        *state.active_llm.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(llm as Arc<dyn LlmClient>);
         let state = Arc::new(state);
         {
             let mut ctx = state.tool_ctx.write().unwrap_or_else(|p| p.into_inner());
@@ -17705,6 +17750,29 @@ mod tests {
     }
 
     #[test]
+    fn character_detail_resolves_the_card_source_character_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "storyforge_test_character_detail_source_id_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = storage::CharacterStore::new(&dir);
+        let character = make_test_character("Seraphina");
+        let source_character_id = character.id.clone();
+        let stored = store.save(CharacterInfo::from(&character)).unwrap();
+
+        let by_storage_id =
+            stored_character_for_id_or_source_in_store(&store, &Id::from_str(&stored.id))
+                .expect("storage id should resolve");
+        let by_source_id = stored_character_for_id_or_source_in_store(&store, &source_character_id)
+            .expect("source character id from CardSummaryDto should resolve");
+
+        assert_eq!(by_source_id.id, by_storage_id.id);
+        assert_eq!(by_source_id.info.name, "Seraphina");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stored_world_info_both_route_restores_constant_and_selective_semantics() {
         let mut info = CharacterInfo::from(&make_test_character("Active Card"));
         info.world_info_entries = vec![WorldInfoEntryInfo {
@@ -20208,16 +20276,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 验证 active_llm_or_mock：无活跃连接时回退 mock（关键 fallback 行为）
+    /// 生产入口必须在无连接时 fail closed，不能把开发 Mock 当成真实模型。
     #[test]
-    fn test_active_llm_fallback_to_mock() {
+    fn test_missing_active_llm_fails_closed() {
         let state = AppState::new_for_test();
-        // 测试环境通常无活跃连接（除非 data/connections.json 恰好有）
-        // 这里测 clear 后回退 mock
         state.clear_active_connection();
         assert!(state.active_conn_id().is_none());
-        // 应返回 mock（不 panic）
-        let _client = state.active_llm_or_mock();
+
+        match state.require_active_llm() {
+            Err(TauriCommandError::Llm { message, retryable }) => {
+                assert!(message.contains("未配置"));
+                assert!(!retryable);
+            }
+            Ok(_) => panic!("missing connection must not return a fallback LLM client"),
+            Err(other) => panic!("expected LLM configuration error, got {other:?}"),
+        }
+    }
+
+    /// 无连接时角色识别应安全降级为源卡自身，不能写入 Mock 的示例人物。
+    #[test]
+    fn test_no_connection_extraction_uses_source_character_only() {
+        let character = make_test_character("Seraphina");
+
+        let (definitions, status, message) = fallback_character_extraction(&character, &[]);
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "Seraphina");
+        assert!(definitions.iter().all(|definition| {
+            definition.name != "林医生" && definition.name != "陈警官"
+        }));
+        assert_eq!(
+            status,
+            storyforge_domain::character::CharacterExtractionStatus::Fallback
+        );
+        assert_eq!(message.as_deref(), Some(FALLBACK_EXTRACTION_MESSAGE));
     }
 
     /// 验证协议字符串解析

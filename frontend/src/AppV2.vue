@@ -55,6 +55,7 @@ import PluginPanel from './components-v2/config/PluginPanel.vue'
 import AgentProfileManager from './components-v2/config/AgentProfileManager.vue'
 // 保留原位(未迁移 v2,功能简单/隐藏运行时):
 import CharacterList from './components/CharacterList.vue'
+import CharacterCardDetail from './components-v2/campaign/CharacterCardDetail.vue'
 import MvuJsRuntime from './components/MvuJsRuntime.vue'
 import CardShellHost from './components/CardShellHost.vue'
 import CardShellFloatingStatus from './components/CardShellFloatingStatus.vue'
@@ -145,6 +146,7 @@ async function loadInstanceNameMap() {
 // loadCharDetail（App.vue:661-669）：加载角色详情 + 归一化开场白索引
 // 依赖 greeting.normalizeGreetingSelection（下方声明；运行时调用时已初始化）
 async function loadCharDetail(id) {
+  campaign.activeCharDetail = null
   try {
     campaign.activeCharDetail = await getCharacter(id)
     writing.selectedGreetingIndex = 0
@@ -440,6 +442,7 @@ async function refreshCardShellManifest() {
 // ─── 功能面板 refs + 事件桥 ───
 // CampaignPanel ref：MetaPanel mvu-applied 后调用其 refreshActiveDetailTab（App.vue:56-61 链）
 const campaignPanelRef = ref(null)
+const showCharDetail = ref(false)
 
 // lastConversationNode：生成溯源入口（campaign store getter）
 const lastConversationNode = computed(() => campaign.lastConversationNode)
@@ -455,6 +458,7 @@ function handleMvuApplied() {
 async function handleSelectChar(char) {
   ui.showCharList = false
   if (!char) {
+    showCharDetail.value = false
     campaign.activeChar = null
     campaign.activeCharDetail = null
     writing.messages = []
@@ -468,12 +472,24 @@ async function handleSelectChar(char) {
   campaign.currentConversationId = null
   armCardShellOpening()
   await loadCharDetail(char.id)
+  if (campaign.activeCharDetail && char._card) {
+    campaign.activeCharDetail = {
+      ...campaign.activeCharDetail,
+      _card: char._card,
+    }
+  }
   await refreshCardShellManifest()
   broadcastPluginEvent(ST_EVENT_TYPES.CHARACTER_LOADED, {
     characterId: char.id,
     name: char.name,
   })
   greeting.applySelectedOpeningMessage()
+  showCharDetail.value = Boolean(campaign.activeCharDetail)
+}
+
+function enterSelectedCharacterWriting() {
+  showCharDetail.value = false
+  ui.viewWrite()
 }
 
 // ─── Composable 装配 ───
@@ -866,6 +882,13 @@ onMounted(async () => {
         :active-id="campaign.activeChar?.id"
         @select="handleSelectChar"
         @close="ui.showCharList = false; ui.showSidebar = true"
+      />
+
+      <CharacterCardDetail
+        v-if="showCharDetail && campaign.activeCharDetail"
+        :character="campaign.activeCharDetail"
+        @close="showCharDetail = false"
+        @write="enterSelectedCharacterWriting"
       />
 
       <!-- LLM 连接配置 -->

@@ -32,11 +32,11 @@ const tabs = [
 ]
 
 const levelOptions = [
-  { value: '', label: '全部级别' },
+  { value: '', label: '不限' },
   { value: 'error', label: 'Error' },
-  { value: 'warn', label: 'Warn' },
-  { value: 'info', label: 'Info' },
-  { value: 'debug', label: 'Debug' },
+  { value: 'warn', label: 'Warn 及以上' },
+  { value: 'info', label: 'Info 及以上' },
+  { value: 'debug', label: 'Debug 及以上' },
 ]
 
 function levelVariant(level) {
@@ -198,10 +198,12 @@ defineExpose({ loadLogs })
     </header>
 
     <Tabs v-model="activeTab" :tabs="tabs" @update:model-value="onTabChange">
-      <div class="flex gap-2 mb-3 min-w-0">
-        <div class="min-w-[140px] max-w-full">
+      <div class="flex items-end gap-2 mb-3 min-w-0">
+        <label class="min-w-[148px] max-w-full">
+          <span class="block mb-1 text-[11px] font-medium text-ink-soft">最低级别</span>
           <Select v-model="levelFilter" :options="levelOptions" @update:model-value="onLevelChange" />
-        </div>
+        </label>
+        <span class="pb-2 text-[10px] leading-none text-ink-faint whitespace-nowrap">保留更严重日志</span>
       </div>
 
       <LoadingState v-if="loading && logs.length === 0" />
