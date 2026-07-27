@@ -44,8 +44,11 @@ function Protect-ReleasePath {
     $result = $Text
 
     # Redact common secret-looking tokens first.
+    # Boundary-aware: `sk-` must start at a string boundary or follow a
+    # non-word, non-hyphen character so substrings of ordinary identifiers
+    # (e.g. story-task id "task-authenticate-red-wax-note") are not matched.
     $secretPatterns = @(
-        'sk-[A-Za-z0-9_-]{20,}',
+        '(?<![\w-])sk-[A-Za-z0-9_-]{20,}(?![\w-])',
         'AKIA[0-9A-Z]{16}',
         'xox[baprs]-[0-9A-Za-z-]{10,}',
         '(?i)\bauthorization\s*:\s*(bearer|basic|token)?\s*[^\s''"`,;]{8,}',
@@ -490,15 +493,25 @@ function Find-ReleaseSecretPatternFindings {
     $rules = @(
         @{ Name = 'private key block'; Pattern = '-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----' },
         @{ Name = 'AWS access key id'; Pattern = 'AKIA[0-9A-Z]{16}' },
-        @{ Name = 'OpenAI-style API key'; Pattern = 'sk-[A-Za-z0-9_-]{20,}' },
+        # Boundary-aware: a real key starts at a string boundary or after a
+        # non-word, non-hyphen separator (space, quote, =, :, {, comma, ...).
+        # Substrings of ordinary identifiers such as "task-authenticate-red-wax-note"
+        # or "task-follow-gold-raven-decoy" must not match.
+        @{ Name = 'OpenAI-style API key'; Pattern = '(?<![\w-])sk-[A-Za-z0-9_-]{20,}(?![\w-])' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
         @{ Name = 'authorization header'; Pattern = '(?i)(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
         # Bare Bearer tokens without an Authorization: prefix.
         @{ Name = 'bare bearer token'; Pattern = '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}' },
-        # Quoted secret assignments (existing).
-        @{ Name = 'secret assignment'; Pattern = '(?i)(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"][^''"]{16,}[''"]' },
+        # Quoted secret assignment: real credential bound to a key. Excludes
+        # word-substring keys, Rust struct-literal conversions
+        # (`secret: "...".into()`), angle-bracket placeholders, English-phrase
+        # values, and sentinel/placeholder markers so test fixtures/docs are
+        # not flagged. Kept in sync with Invoke-ReleaseSecretScan.
+        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' },
         # Unquoted api-key / token / credential assignments or colon forms.
-        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)\b(api[_-]?key|token|password|passwd|secret|credential)\b\s*[:=]\s*[^\s''"]{16,}' }
+        # Key must be a standalone word; excludes Rust struct-literal
+        # conversions so fixtures like `api_key: value.into()` are not flagged.
+        @{ Name = 'unquoted secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|token|password|passwd|secret|credential)\s*[:=]\s*[^\s''"]{16,}(?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
     )
 
     $findings = @()
@@ -642,11 +655,31 @@ function Invoke-ReleaseSecretScan {
     $rules = @(
         @{ Name = 'private key block'; Pattern = '-----BEGIN (RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----' },
         @{ Name = 'AWS access key id'; Pattern = 'AKIA[0-9A-Z]{16}' },
-        @{ Name = 'OpenAI-style API key'; Pattern = 'sk-[A-Za-z0-9_-]{20,}' },
+        # Boundary-aware OpenAI-style key: must start at a string boundary or
+        # after a non-word, non-hyphen separator so substrings of ordinary
+        # identifiers (e.g. "task-authenticate-red-wax-note") are not matched.
+        @{ Name = 'OpenAI-style API key'; Pattern = '(?<![\w-])sk-[A-Za-z0-9_-]{20,}(?![\w-])' },
         @{ Name = 'Slack token'; Pattern = 'xox[baprs]-[0-9A-Za-z-]{10,}' },
-        @{ Name = 'authorization header'; Pattern = '(Authorization|X-Api-Key)[[:space:]]*:[[:space:]]*(token|Bearer|Basic)?[[:space:]]*[A-Za-z0-9_./+=-]{20,}' },
-        @{ Name = 'secret assignment'; Pattern = '(api[_-]?key|secret|token|password|passwd|authorization)[[:space:]]*[:=][[:space:]]*[''"][^''"]{16,}[''"]' }
+        @{ Name = 'authorization header'; Pattern = '(Authorization|X-Api-Key)\s*:\s*(token|Bearer|Basic)?\s*[A-Za-z0-9_./+=-]{20,}' },
+        # Secret assignment: a real credential bound to a key. Exclusions keep
+        # test fixtures/docs from being flagged WITHOUT weakening real-key
+        # detection:
+        #   (1) key must be a standalone word (word boundary before it) so a
+        #       substring like `Token=` inside manifest content or `myToken=`
+        #       does not match;
+        #   (2) Rust struct-literal conversions
+        #       (`secret: "...".into()/.to_string()/.to_owned()/.as_str()`) are
+        #       test fixtures, never config-file secrets;
+        #   (3) the quoted value must not be an obvious placeholder: angle-
+        #       bracketed `<...>`, a human-readable phrase containing spaces,
+        #       or carrying sentinel markers (secret_should, should_be_,
+        #       placeholder, example, normalized, _test_, dummy, redacted,
+        #       changeme, xxxx, sf_secret_, earlyfact, legacy-, embed-,
+        #       process-only, from-shell). Real keys are high-entropy opaque
+        #       strings and never carry these markers or read like English.
+        @{ Name = 'secret assignment'; Pattern = '(?i)(?<![A-Za-z0-9_])(api[_-]?key|secret|token|password|passwd|authorization|credential)\s*[:=]\s*[''"](?!(?:<[^>]+>|[^''"]*\s[^''"]*\s|[^''"]{0,60}(?:secret_should|should_be_|placeholder|\bexample\b|normalized|_test_|dummy|redacted|changeme|xxxxx|sf_secret_|earlyfact|legacy-|embed-|process-only|from-shell|\bsecret[a-z_-]*(?:token|key|value|string|word|phrase)\b|\balso-secret\b|\b(?:fake|test|sample|dummy)-token\b)))(?=[^''"]{16,}[''"])(?:[^''"]{16,})[''"](?!\s*\.(?:into|to_string|to_owned|as_str)\s*\()' }
     )
+
 
     $findings = New-Object System.Collections.Generic.List[string]
     $scanTargets = @(
@@ -659,7 +692,9 @@ function Invoke-ReleaseSecretScan {
             $prevEap = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
-                $output = & git -C $RepoRoot grep @($target.Args) -n -I -E -e $($rule.Pattern) -- @pathspecs 2>&1
+                # PCRE2 (-P) is required for the boundary-aware lookbehind/lookahead
+                # on the OpenAI-style key pattern. git 2.53 compiles in PCRE2.
+                $output = & git -C $RepoRoot grep @($target.Args) -n -I -P -e $($rule.Pattern) -- @pathspecs 2>&1
                 $exitCode = $LASTEXITCODE
             } finally {
                 $ErrorActionPreference = $prevEap

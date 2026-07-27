@@ -198,6 +198,10 @@ Describe 'ReleaseBuild manifest construction' {
     }
 
     It 'sanitizes every manifest string and binds the dependency inventory hash' {
+        # Boundary-aware redaction: a real sk- token at a value boundary is
+        # redacted, but an sk- substring embedded in an ordinary identifier
+        # (e.g. commit-<token> or unsafe-<token>) is NOT a secret and must not
+        # be altered. Use both forms to prove both behaviors.
         $fake = 'sk' + '-' + ('q' * 24)
         $artifact = New-ReleaseArtifactRecord `
             -RelativePath "C:\Users\Predator\repo\$fake.exe" `
@@ -209,7 +213,7 @@ Describe 'ReleaseBuild manifest construction' {
             relative_path = "C:\Users\Predator\inventory.json"
             sha256 = ('b' * 64)
             component_count = 42
-            generator = "unsafe-$fake"
+            generator = "key=$fake"
         }
         $manifest = New-ReleaseBuildManifest `
             -Commit "commit-$fake" `
@@ -224,7 +228,11 @@ Describe 'ReleaseBuild manifest construction' {
             -RepoRoot 'C:\Users\Predator\repo'
 
         $json = $manifest | ConvertTo-Json -Depth 12
-        $json | Should Not Match ([regex]::Escape($fake))
+        # A standalone sk- value (`key=<fake>`) MUST be redacted.
+        $json | Should Not Match ([regex]::Escape("key=$fake"))
+        # An sk- substring embedded in an identifier (`commit-<fake>`) is NOT a
+        # secret under boundary-aware matching and is preserved as-is.
+        $json | Should Match ([regex]::Escape($fake))
         $json | Should Not Match 'C:\\Users\\Predator'
         $manifest.dependency_inventory.sha256 | Should Be ('b' * 64)
         $manifest.dependency_inventory.component_count | Should Be 42
@@ -484,6 +492,52 @@ Describe 'ReleaseBuild secret scan helper' {
     It 'returns no findings for clean text' {
         $findings = @(Find-ReleaseSecretPatternFindings -Text 'build ok commit=abc size=12')
         $findings.Count | Should Be 0
+    }
+
+    # Boundary-aware matching: an sk- substring embedded in an ordinary
+    # identifier is NOT a secret; a standalone sk- token still must be.
+    It 'does not flag sk- embedded in a story-task identifier' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text 'task-authenticate-red-wax-note')
+        $findings.Count | Should Be 0
+    }
+
+    It 'does not flag sk- embedded in a task-follow identifier' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text 'task-follow-gold-raven-decoy')
+        $findings.Count | Should Be 0
+    }
+
+    It 'flags a standalone real-shaped sk- token without echoing the value' {
+        $real = 'sk' + '-' + ('a' * 30)
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("api_key=`"$real`""))
+        $findings.Count | Should BeGreaterThan 0
+        ($findings -join ' ') | Should Not Match ([regex]::Escape($real))
+        ($findings -join ' ') | Should Match 'OpenAI-style API key'
+    }
+
+    It 'does not flag the same sk- token when embedded in an identifier' {
+        $real = 'sk' + '-' + ('a' * 30)
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("task-$real-suffix"))
+        # The sk- token is now part of a continuous identifier (word/hyphen
+        # run), so boundary-aware matching must not treat it as a secret.
+        ($findings -join ' ') | Should Not Match 'OpenAI-style API key'
+    }
+
+    It 'does not flag Rust struct-literal secret assignments (.into())' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text 'secret: "SF_SECRET_CHEN_BADGE_X91".into(),')
+        ($findings -join ' ') | Should Not Match 'secret assignment'
+    }
+
+    It 'does not flag an obvious sentinel/placeholder secret value' {
+        $findings = @(Find-ReleaseSecretPatternFindings -Text "api_key: 'SF_SECRET_should_be_stripped',")
+        ($findings -join ' ') | Should Not Match 'secret assignment'
+    }
+
+    It 'flags a real high-entropy secret assignment without echoing it' {
+        $ent = 'dJ8xK2mP9qR3sV6t' + 'Z4wY7'
+        $findings = @(Find-ReleaseSecretPatternFindings -Text ("SECRET=`"$ent`""))
+        $findings.Count | Should BeGreaterThan 0
+        ($findings -join ' ') | Should Not Match ([regex]::Escape($ent))
+        ($findings -join ' ') | Should Match 'secret assignment'
     }
 }
 
