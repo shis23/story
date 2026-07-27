@@ -570,6 +570,7 @@ fn c6_explain_generation() {
             reasoning_content: Some("lin reasoning".into()),
         }],
         profile_id: None,
+        generation_mode: None,
         seed: 42,
         last_hint: None,
         director_reasoning: Some("director reasoning".into()),

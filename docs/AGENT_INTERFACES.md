@@ -145,7 +145,7 @@ User Intent
 - 输出最终 Markdown 正文。
 - 不新增与 Subagent 冲突的关键事实，除非是必要的叙事衔接。
 
-当前 Editor 没有工具，直接输出正文。旧 `big_scene` 兼容档局部重 roll 时可以复用 Director Plan 或 Subagent 产出，并注入用户 hint；续写、对手戏与 Sequential Crew 只允许按原模式整体重写，避免复用不匹配的阶段产物。
+当前 Editor 没有工具，直接输出正文。旧 `big_scene` 兼容档局部重 roll 时可以复用 Director Plan 或 Subagent 产出，并注入用户 hint；Sequential Crew 可以复用目标角色之前的公开场记，从目标角色起依次重演后缀并重新运行 Editor，但必须验证原产物的 `generation_mode`；续写与对手戏只允许按原模式整体重写。
 
 目标：
 

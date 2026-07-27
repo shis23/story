@@ -98,7 +98,7 @@
 - `big_scene` 保留旧并行 Director/Subagents/Editor 流水线，现有调用方不被删除；当前写作栏只展示续写、对手戏、顺序剧组三种产品入口。
 - Sequential Crew 已提高自动路由优先级；大场面档目前只由用户显式选择，不与 Sequential Crew 争抢自动群像路由。
 - 整体 `regenerate` 已按当前产品模式重演：续写仍只调用 Writer；对手戏仍执行 A→B→A；Sequential Crew 仍按顺序接戏。重写历史在目标消息前截断，产物落为原消息的新 variant，并保留用户 hint 与 seed。
-- 新三种产品模式暂只支持整体重写，前端隐藏旧式局部入口，后端也会显式拒绝不兼容请求；`big_scene` 兼容档继续支持“只重 Editor / 只重某 Subagent”。对手戏从第 k 拍截断、Sequential Crew 单演员重演仍属暂缓项，不能假装已经具备。
+- 续写与对手戏仍只支持整体重写；Sequential Crew 支持“从选中角色起向后重演”，复用此前演员的公开场记并重跑选中角色、全部下游角色与 Editor。只有来源明确记录为 `sequential_crew` 的产物才开放该入口，旧稿或切换模式后的不匹配稿件会被前后端共同拒绝。`big_scene` 兼容档继续支持“只重 Editor / 只重某 Subagent”。对手戏从第 k 拍截断仍属暂缓项。
 - 原设计中的可编辑“场景卡”、基于真实质量数据的成本阈值确认，以及 `emotion_stage` 路由标定不在本次第一版范围。
 - 四臂盲测仍需执行，用于比较正文质量和校准路由，而不是阻塞当前结构落地。
 
@@ -109,6 +109,7 @@
 | 模式与路由领域模型 | `crates/domain/src/generation.rs` |
 | Turn Dossier 编译与知识边界 | `crates/app-pipeline/src/turn_dossier.rs` |
 | Sequential Crew 顺序执行 | `crates/app-pipeline/src/sequential_crew.rs` |
+| Sequential Crew 后缀重演与来源校验 | `crates/app-pipeline/src/lib.rs`、`frontend/src/utils/rerollPolicy.js` |
 | 四档编排 | `crates/app-pipeline/src/lib.rs` |
 | 后处理职责与尝试状态 | `crates/app-agent/src/pipeline_postprocess.rs` |
 | 回合小票、后处理重试、采纳过滤 | `crates/tauri-app/src/lib.rs`、`crates/tauri-app/src/turn_lifecycle.rs` |
@@ -121,7 +122,7 @@
 
 - 四种模式的序列与 Agent 调用边界；
 - 当前模式整体重写、原消息 variant 落点、seed/hint 保留与目标消息历史截断；
-- 新产品模式拒绝旧式局部重跑，兼容大场面保留原能力；
+- Sequential Crew 依赖安全的后缀重演、旧产物拒绝与兼容大场面局部重跑；
 - Sequential Crew 的顺序、失败重试和私有思维不泄漏；
 - 群像硬规则、对手戏评分与显式选择优先；
 - 回合小票首次拦截、逐项选择、结构 mutation 保留；

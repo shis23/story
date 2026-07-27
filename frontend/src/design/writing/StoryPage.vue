@@ -23,6 +23,7 @@ const props = defineProps({
   streamingRoleLabel: { type: String, default: 'AI' },
   canBranch: { type: Boolean, default: false },
   allowPartialReroll: { type: Boolean, default: true },
+  generationMode: { type: String, default: null },
   qualityAcceptHint: { type: String, default: null },
   pendingReceipt: { type: Object, default: null },
   contentComponent: { type: [Object, Function, String], default: null },
@@ -110,6 +111,7 @@ function rolesFor(message) {
           :busy="isWriting"
           :can-branch="canBranch"
           :allow-partial-reroll="allowPartialReroll"
+          :generation-mode="generationMode"
           :quality-accept-hint="qualityAcceptHint"
           :turn-receipt="pendingReceipt?.nodeId === m.id ? pendingReceipt : null"
           :content-component="contentComponent"

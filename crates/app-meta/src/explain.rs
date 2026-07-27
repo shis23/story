@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use storyforge_domain::conversation::Provenance;
+use storyforge_domain::generation::GenerationMode;
 
 /// 单个子 Agent 的解释条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,8 @@ pub struct GenerationExplanation {
     pub last_hint: Option<String>,
     /// 提示词预设 ID（若有）
     pub profile_id: Option<String>,
+    /// 实际生成这份产物的写作模式。
+    pub generation_mode: Option<GenerationMode>,
     /// 随机种子
     pub seed: u64,
     /// 供应商实际返回的导演 reasoning/thinking。
@@ -67,6 +70,7 @@ impl GenerationExplanation {
 ///   `character_instance_id: Option<String>`, `display_name: Option<String>`,
 ///   `fallback_reason: Option<String>`
 /// - `profile_id: Option<Id>` — 提示词预设 ID
+/// - `generation_mode: Option<GenerationMode>` — 实际生成模式（旧数据可为空）
 /// - `seed: u64` — 随机种子
 /// - `last_hint: Option<String>` — 上次重 roll hint
 ///
@@ -125,6 +129,7 @@ pub fn explain_generation(provenance: &Provenance) -> GenerationExplanation {
             .profile_id
             .as_ref()
             .map(|id| id.as_str().to_string()),
+        generation_mode: provenance.generation_mode,
         seed: provenance.seed,
         director_reasoning: provenance.director_reasoning.clone(),
         writer_reasoning: provenance.writer_reasoning.clone(),
@@ -186,6 +191,7 @@ mod tests {
                 },
             ],
             profile_id: Some(Id::from_str("profile-1")),
+            generation_mode: None,
             seed: 42,
             last_hint: None,
             director_reasoning: Some("director reasoning".into()),

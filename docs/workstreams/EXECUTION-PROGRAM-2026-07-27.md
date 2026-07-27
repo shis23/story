@@ -171,8 +171,9 @@
   Turn Dossier 统一角色案卷与知识归属，Sequential Crew 只向后续演员公开已表演言行，
   不传播 inner thoughts。Summarizer / PostProcessor 分工独立；Accept 前展示 Chronicle A、
   知识、变量、任务 diff，允许逐条取消，失败可单独重试或显式降级采纳。
-  整体重写现沿用当前产品模式并落回原消息 variant；新三档只支持整体重写，旧
-  `big_scene` 兼容档继续保留 Editor/Subagent 局部重跑。
+  整体重写现沿用当前产品模式并落回原消息 variant；Sequential Crew 还支持从选中
+  角色起向后重演，并以产物来源模式校验阻止旧稿误复用；续写、对手戏仍只支持整体重写，
+  旧 `big_scene` 兼容档继续保留 Editor/Subagent 局部重跑。
   完整实施边界、暂缓项和验证基线见
   `WRITING-PIPELINE-V2-IMPLEMENTATION-2026-07-27.md`。可编辑场景卡、emotion_stage
   标定和后续四臂质量评测仍待继续；Android AND-2/AND-3（PLAN-ANDROID.md）未起步。

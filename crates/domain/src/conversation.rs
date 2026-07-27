@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 use crate::agent::{Performance, Plan};
+use crate::generation::GenerationMode;
 use crate::llm::{ChatMessage, ChatRole};
 
 /// 反序列化时将 active_variant 钳制到有效范围，避免越界。
@@ -83,6 +84,9 @@ pub struct Provenance {
     pub subagent_results: Vec<SubagentSnapshot>,
     /// 当时用的提示词预设 ID
     pub profile_id: Option<Id>,
+    /// 实际生成这份产物的写作模式。旧数据缺省为 None，禁止据此复用阶段产物。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_mode: Option<GenerationMode>,
     /// 随机种子（重 roll 时可换）
     pub seed: u64,
     /// 上次重 roll 时附加的 hint（若有），便于二次重 roll 时 LLM 看到迭代历史

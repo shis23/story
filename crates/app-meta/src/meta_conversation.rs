@@ -865,6 +865,7 @@ mod tests {
             }],
             last_hint: None,
             profile_id: Some("default".into()),
+            generation_mode: None,
             seed: 42,
             director_reasoning: Some("director reasoning".into()),
             writer_reasoning: Some("writer reasoning".into()),

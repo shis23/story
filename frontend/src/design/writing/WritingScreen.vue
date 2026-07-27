@@ -137,6 +137,7 @@ const forward = (name) => (p) => emit(name, p)
             :streaming-role-label="streamingRoleLabel"
             :can-branch="canBranch"
             :allow-partial-reroll="allowPartialReroll"
+            :generation-mode="generationMode"
             :quality-accept-hint="qualityAcceptHint"
             :pending-receipt="pendingReceipt"
             :content-component="contentComponent"

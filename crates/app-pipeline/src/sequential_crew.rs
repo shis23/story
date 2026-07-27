@@ -169,8 +169,51 @@ pub(crate) async fn run_sequential_crew(
     opening: &str,
 ) -> Vec<Result<Performance, AgentError>> {
     let total = tasks.len();
+    run_sequential_crew_suffix(
+        tasks,
+        &[],
+        0,
+        total,
+        runtime,
+        director_config,
+        base_system_prompt,
+        cancel,
+        event_tx,
+        campaign_runtime,
+        agent_profile_config,
+        recent_summary_block,
+        far_memory_block,
+        opening,
+    )
+    .await
+}
+
+/// Replays a dependency-safe suffix of a sequential performance. Accepted
+/// prefix performances seed only the public stage record; the selected actor
+/// and every downstream actor run again with their original beat numbers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sequential_crew_suffix(
+    tasks: Vec<SubagentTask>,
+    prefix_performances: &[Performance],
+    beat_offset: usize,
+    beat_total: usize,
+    runtime: Arc<AgentRuntime>,
+    director_config: &AgentConfig,
+    base_system_prompt: &str,
+    cancel: watch::Receiver<bool>,
+    event_tx: mpsc::UnboundedSender<PipelineEvent>,
+    campaign_runtime: Option<Arc<CampaignRuntimeContext>>,
+    agent_profile_config: Option<&AgentProfileConfig>,
+    recent_summary_block: Option<&str>,
+    far_memory_block: Option<&str>,
+    opening: &str,
+) -> Vec<Result<Performance, AgentError>> {
+    let total = beat_total.max(beat_offset.saturating_add(tasks.len()));
     let mut stage = SequentialStageRecord::new(opening);
-    let mut results = Vec::with_capacity(total);
+    for performance in prefix_performances {
+        stage.push_performance(performance);
+    }
+    let mut results = Vec::with_capacity(tasks.len());
     let sequential_system = format!(
         "{base_system_prompt}\n\n你正在执行顺序剧组演员协议：严格服从本拍任务和结构化输出契约。"
     );
@@ -198,7 +241,7 @@ pub(crate) async fn run_sequential_crew(
                 &actor_id,
                 &original_instruction,
                 &stage,
-                index + 1,
+                beat_offset + index + 1,
                 total,
             );
             if attempt > 1 {
@@ -216,7 +259,7 @@ pub(crate) async fn run_sequential_crew(
                     if let PipelineEvent::SubagentProgress { delta, .. } = event {
                         let _ = forwarded_event_tx.send(PipelineEvent::SubagentProgress {
                             character_id: forwarded_actor_id.clone(),
-                            index,
+                            index: beat_offset + index,
                             delta,
                         });
                     }
@@ -398,6 +441,98 @@ mod tests {
         assert!(second_prompt.contains("演员把信封推到桌面中央"));
         assert!(second_prompt.contains("你自己看"));
         assert!(!second_prompt.contains("绝不能让下一位演员知道"));
+    }
+
+    #[tokio::test]
+    async fn suffix_replay_reuses_public_prefix_and_keeps_original_beat_numbers() {
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![MockScript {
+            match_keyword: "顺序剧组演员".into(),
+            response_content: serde_json::json!({
+                "narrative": "重演演员改变了站位。",
+                "dialogue": "继续。",
+                "inner_thoughts": "新的私密判断。",
+                "scene_close": false
+            })
+            .to_string(),
+            tool_calls: vec![],
+            stream: false,
+        }]));
+        let captured: CapturedPrompts = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_hook = captured.clone();
+        let hook = Arc::new(
+            move |ctx: storyforge_app_agent::runtime::PromptHookContext| {
+                let captured = captured_for_hook.clone();
+                Box::pin(async move {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((ctx.role, ctx.messages.clone()));
+                    Ok(ctx.messages)
+                }) as storyforge_app_agent::runtime::PromptHookFuture
+            },
+        );
+        let runtime = Arc::new(AgentRuntime::with_prompt_hook(
+            llm,
+            Arc::new(ToolContext::empty()),
+            hook,
+        ));
+        let director_config = AgentConfig {
+            role: AgentRole::Director,
+            system_prompt: String::new(),
+            max_tool_rounds: 1,
+            model: "mock".into(),
+            tools: vec![],
+            terminal_tools: vec![],
+        };
+        let prefix = performance(
+            "actor-a",
+            "A 已经把信封推到桌面中央。",
+            "轮到你了。",
+            "旧的私密判断绝不能进入重演场记。",
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let results = run_sequential_crew_suffix(
+            vec![task("actor-b"), task("actor-c")],
+            &[prefix],
+            1,
+            3,
+            runtime,
+            &director_config,
+            "角色表演基础约束",
+            cancel_rx,
+            event_tx,
+            None,
+            None,
+            None,
+            None,
+            "用户要求重演后半场。",
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_ok));
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let first_prompt = calls[0]
+            .1
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let second_prompt = calls[1]
+            .1
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_prompt.contains("第 2/3 拍"));
+        assert!(first_prompt.contains("A 已经把信封推到桌面中央"));
+        assert!(!first_prompt.contains("旧的私密判断"));
+        assert!(second_prompt.contains("第 3/3 拍"));
+        assert!(second_prompt.contains("重演演员改变了站位"));
+        assert!(!second_prompt.contains("新的私密判断"));
     }
 
     #[test]

@@ -264,6 +264,7 @@ fn autofix_sync_rewrites_conversation_and_attempt_hash_atomically() {
             reasoning_content: Some("subagent reasoning".into()),
         }],
         profile_id: None,
+        generation_mode: None,
         seed: 1,
         last_hint: None,
         director_reasoning: Some("director reasoning".into()),

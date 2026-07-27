@@ -12,6 +12,7 @@
  */
 import { ref, computed, watch } from 'vue'
 import VariantStrip from './VariantStrip.vue'
+import { rerollPolicy } from '../../utils/rerollPolicy.js'
 
 const props = defineProps({
   message: { type: Object, required: true },
@@ -19,6 +20,8 @@ const props = defineProps({
   canBranch: { type: Boolean, default: false },
   /** Product modes reroll the complete pipeline; legacy big-scene keeps artifact-level rerolls. */
   allowPartialReroll: { type: Boolean, default: true },
+  /** Currently selected product pipeline. Provenance is checked separately per variant. */
+  generationMode: { type: String, default: null },
   /** 质量门禁采纳提示文案（adapter 从 pipeline.quality 派生） */
   qualityAcceptHint: { type: String, default: null },
   turnReceipt: { type: Object, default: null },
@@ -48,6 +51,11 @@ const displayContent = computed(
 )
 const sourceContent = computed(() => currentVariant.value?.content ?? '')
 const seed = computed(() => currentVariant.value?.provenance?.seed)
+const replayPolicy = computed(() => rerollPolicy(
+  props.generationMode,
+  currentVariant.value?.provenance?.generation_mode ?? null,
+  props.allowPartialReroll,
+))
 const hasVariants = computed(() => (props.message.variants?.length || 0) > 1)
 const isFinal = computed(() => currentVariant.value?.status === 'final')
 const receiptSelection = ref({})
@@ -221,8 +229,8 @@ function paragraphs(text) {
           class="absolute left-0 bottom-full mb-1 z-20 min-w-[200px] rounded-lg border border-line bg-surface shadow-float py-1"
         >
           <button type="button" @click="pickReroll('all')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">整体重 roll</button>
-          <button v-if="allowPartialReroll" type="button" @click="pickReroll('editor')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
-          <template v-if="allowPartialReroll && subagentRoles.length">
+          <button v-if="replayPolicy.editorOnly" type="button" @click="pickReroll('editor')" class="w-full text-left min-h-9 px-3 text-[13px] hover:bg-accent-soft transition-colors">只重跑 · 编剧</button>
+          <template v-if="(replayPolicy.editorOnly || replayPolicy.sequentialSuffix) && subagentRoles.length">
             <div class="border-t border-line my-1"></div>
             <button
               v-for="role in subagentRoles"
@@ -230,10 +238,12 @@ function paragraphs(text) {
               type="button"
               @click="pickReroll('subagent:' + role.id)"
               class="w-full text-left min-h-9 px-3 text-[13px] text-accent hover:bg-accent-soft transition-colors"
-            >只重跑 · {{ role.label }}（子Agent）</button>
-            <div class="px-3 py-1.5 text-[11px] text-ink-faint">省 60% token</div>
+            >{{ replayPolicy.sequentialSuffix ? '从此角色起重演' : '只重跑' }} · {{ role.label }}</button>
+            <div class="px-3 py-1.5 text-[11px] text-ink-faint">
+              {{ replayPolicy.sequentialSuffix ? '该角色及其后的演出、编剧都会重新执行' : '复用其余阶段产物' }}
+            </div>
           </template>
-          <div v-else-if="allowPartialReroll" class="px-3 py-2 text-[11px] text-ink-faint">无溯源信息，仅支持整体/编剧重 roll</div>
+          <div v-else-if="replayPolicy.editorOnly" class="px-3 py-2 text-[11px] text-ink-faint">无溯源信息，仅支持整体/编剧重 roll</div>
           <div v-else class="px-3 py-2 text-[11px] text-ink-faint">当前模式会整体重写，确保各阶段产物一致</div>
         </div>
       </div>

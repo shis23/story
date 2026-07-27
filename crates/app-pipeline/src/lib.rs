@@ -1193,6 +1193,7 @@ impl PipelineOrchestrator {
             Some(plan.clone()),
             &performances,
             None, // profile_id
+            Some(generation_mode),
             seed,
             None, // last_hint（首次写作无 hint）
             effective_runtime_for_prov.as_deref(),
@@ -1389,6 +1390,7 @@ impl PipelineOrchestrator {
             Some(plan.clone()),
             &[],
             None,
+            Some(GenerationMode::Continuation),
             seed,
             None,
             ctx.campaign_runtime.as_deref(),
@@ -1662,6 +1664,7 @@ impl PipelineOrchestrator {
             Some(plan.clone()),
             &performances,
             None,
+            Some(GenerationMode::Duet),
             seed,
             None,
             ctx.campaign_runtime.as_deref(),
@@ -1957,6 +1960,20 @@ impl PipelineOrchestrator {
                 .ok_or_else(|| PipelineError::Regenerate("旧 variant 无溯源信息".into()))?
         };
 
+        let requests_legacy_partial = !req.targets.is_empty()
+            && matches!(req.generation_mode, None | Some(GenerationMode::BigScene));
+        if requests_legacy_partial
+            && provenance_old.generation_mode != Some(GenerationMode::BigScene)
+        {
+            return Err(self.abort_with(
+                &event_tx,
+                PipelineError::Regenerate(
+                    "局部重跑的来源模式不匹配；请整体重写，不能把旧稿或其他流水线产物当作大场面阶段产物复用"
+                        .into(),
+                ),
+            ));
+        }
+
         // The product modes regenerate through the same pipeline that created
         // the draft. Fine-grained legacy rerolls do not have valid reusable
         // artifacts for Writer, duet beats, or a sequential crew, so they are
@@ -1965,6 +1982,20 @@ impl PipelineOrchestrator {
             .generation_mode
             .filter(|mode| *mode != GenerationMode::BigScene)
         {
+            if generation_mode == GenerationMode::SequentialCrew && !req.targets.is_empty() {
+                return self
+                    .regenerate_sequential_suffix(
+                        &provenance_old,
+                        &req,
+                        ctx,
+                        event_tx,
+                        cancel,
+                        &session_id,
+                        seed,
+                        template_seed,
+                    )
+                    .await;
+            }
             if !req.targets.is_empty() {
                 return Err(self.abort_with(
                     &event_tx,
@@ -2318,6 +2349,7 @@ impl PipelineOrchestrator {
                     &performances,
                     &session_id,
                     seed,
+                    GenerationMode::BigScene,
                     hint.as_deref(),
                     &req,
                     event_tx,
@@ -2369,6 +2401,7 @@ impl PipelineOrchestrator {
                     &performances,
                     &session_id,
                     seed,
+                    GenerationMode::BigScene,
                     hint.as_deref(),
                     &req,
                     event_tx,
@@ -2597,6 +2630,7 @@ impl PipelineOrchestrator {
                     &performances,
                     &session_id,
                     seed,
+                    GenerationMode::BigScene,
                     hint.as_deref(),
                     &req,
                     event_tx,
@@ -2622,6 +2656,245 @@ impl PipelineOrchestrator {
         )))
     }
 
+    /// 从选中演员开始重演 Sequential Crew 后缀，再重新编剧并写入新 variant。
+    /// 旧计划和前缀公开场记可以复用，但来源模式、角色顺序和快照唯一性必须先验证。
+    #[allow(clippy::too_many_arguments)]
+    async fn regenerate_sequential_suffix(
+        &mut self,
+        provenance_old: &Provenance,
+        req: &RegenerateRequest,
+        ctx: &WritingContext,
+        event_tx: mpsc::UnboundedSender<PipelineEvent>,
+        cancel: watch::Receiver<bool>,
+        session_id: &Id,
+        seed: u64,
+        template_seed: u64,
+    ) -> Result<(String, Provenance), PipelineError> {
+        if provenance_old.generation_mode != Some(GenerationMode::SequentialCrew) {
+            return Err(self.abort_with(
+                &event_tx,
+                PipelineError::Regenerate(
+                    "只有由 Sequential Crew 生成并带有模式来源记录的产物，才能安全地从角色起向后重演"
+                        .into(),
+                ),
+            ));
+        }
+        let target_id = match req.targets.as_slice() {
+            [PartialRollTarget::Subagent(character_id)] => character_id,
+            _ => {
+                return Err(self.abort_with(
+                    &event_tx,
+                    PipelineError::Regenerate(
+                        "Sequential Crew 每次只能选择一个起始角色；系统会自动重演该角色及全部后续角色"
+                            .into(),
+                    ),
+                ));
+            }
+        };
+        let plan = provenance_old
+            .plan
+            .clone()
+            .ok_or_else(|| PipelineError::Regenerate("旧产物缺少 Sequential Crew 计划".into()))?;
+
+        let mut task_ids = std::collections::HashSet::new();
+        if plan
+            .subagent_tasks
+            .iter()
+            .any(|task| !task_ids.insert(task.character_id.as_str()))
+        {
+            return Err(self.abort_with(
+                &event_tx,
+                PipelineError::Regenerate(
+                    "旧 Sequential Crew 计划含重复角色，无法确定安全的重演边界".into(),
+                ),
+            ));
+        }
+        let start_index = plan
+            .subagent_tasks
+            .iter()
+            .position(|task| task.character_id == *target_id)
+            .ok_or_else(|| {
+                PipelineError::Regenerate(format!(
+                    "角色 '{target_id}' 不在旧 Sequential Crew 计划中"
+                ))
+            })?;
+
+        let mut snapshots = std::collections::HashMap::new();
+        for snapshot in &provenance_old.subagent_results {
+            if snapshots
+                .insert(snapshot.character_id.as_str(), snapshot)
+                .is_some()
+            {
+                return Err(self.abort_with(
+                    &event_tx,
+                    PipelineError::Regenerate(
+                        "旧 Sequential Crew 产物含重复角色快照，无法安全复用前缀".into(),
+                    ),
+                ));
+            }
+        }
+        let prefix_performances: Vec<storyforge_domain::agent::Performance> = plan.subagent_tasks
+            [..start_index]
+            .iter()
+            .filter_map(|task| snapshots.get(task.character_id.as_str()))
+            .map(|snapshot| storyforge_domain::agent::Performance {
+                character_id: snapshot.character_id.clone(),
+                narrative: snapshot.full_text.clone(),
+                dialogue: String::new(),
+                inner_thoughts: String::new(),
+                full_text: snapshot.full_text.clone(),
+                reasoning_content: snapshot.reasoning_content.clone(),
+            })
+            .collect();
+        let mut suffix_tasks = plan.subagent_tasks[start_index..].to_vec();
+        if let Some(hint) = req
+            .hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+        {
+            for task in &mut suffix_tasks {
+                task.context_package
+                    .task
+                    .push_str(&format!("\n\n{SUBAGENT_HINT_MARKER}{hint}"));
+            }
+        }
+
+        let _ = event_tx.send(PipelineEvent::Started {
+            session_id: session_id.to_string(),
+        });
+        self.state = PipelineState::Delegating;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        for (index, task) in suffix_tasks.iter().enumerate() {
+            let _ = event_tx.send(PipelineEvent::SubagentStarted {
+                character_id: task.character_id.clone(),
+                index: start_index + index,
+                total: plan.subagent_tasks.len(),
+            });
+        }
+
+        let template_context = prompt_template_context_for_writing(ctx, Some(template_seed));
+        let director_config = make_director_config(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &build_director_system_extra(ctx),
+            ctx.agent_profile_config.as_ref(),
+            template_context.as_ref(),
+            &self.reasoning_mode(),
+        );
+        let char_specs: Vec<(String, Option<String>, Option<String>)> = plan
+            .subagent_tasks
+            .iter()
+            .map(|task| {
+                let persona = (!task.context_package.character_brief.is_empty())
+                    .then(|| task.context_package.character_brief.clone());
+                (task.character_id.clone(), persona, None)
+            })
+            .collect();
+        let effective_runtime = if let Some(campaign_runtime) = &ctx.campaign_runtime {
+            let (updated, temporaries) = campaign_runtime.with_temporaries_for(&char_specs);
+            self.pending_temporary_instances = temporaries;
+            Some(Arc::new(updated))
+        } else {
+            ctx.campaign_runtime.clone()
+        };
+        let effective_runtime_for_provenance = effective_runtime.clone();
+        let summary_block = render_recent_summaries_for_injection(
+            &ctx.recent_summaries,
+            RECENT_SUMMARIES_INJECT_LIMIT,
+        );
+        let recent_texts: Vec<String> = ctx
+            .recent_summaries
+            .iter()
+            .map(|summary| summary.content.clone())
+            .collect();
+        let far_block = render_far_memory_for_injection_excluding(
+            &ctx.far_memory_hits,
+            FAR_MEMORY_INJECT_LIMIT,
+            &recent_texts,
+        );
+        let subagent_base = assemble_subagent_base_prompt(
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            &self.reasoning_mode(),
+        );
+        let suffix_results = sequential_crew::run_sequential_crew_suffix(
+            suffix_tasks,
+            &prefix_performances,
+            start_index,
+            plan.subagent_tasks.len(),
+            self.runtime.clone(),
+            &director_config,
+            &subagent_base,
+            cancel.clone(),
+            event_tx.clone(),
+            effective_runtime,
+            ctx.agent_profile_config.as_ref(),
+            summary_block.as_deref(),
+            far_block.as_deref(),
+            &plan.scene_brief,
+        )
+        .await;
+
+        let mut replayed = Vec::new();
+        for (index, result) in suffix_results.into_iter().enumerate() {
+            let absolute_index = start_index + index;
+            match result {
+                Ok(performance) => {
+                    let _ = event_tx.send(PipelineEvent::SubagentDone {
+                        character_id: performance.character_id.clone(),
+                        index: absolute_index,
+                        full_text: performance.full_text.clone(),
+                    });
+                    replayed.push(performance);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(PipelineEvent::SubagentCancelled {
+                        character_id: plan.subagent_tasks[absolute_index].character_id.clone(),
+                        index: absolute_index,
+                    });
+                    error!(target: "app-pipeline", "Sequential Crew 后缀重演失败: {error}");
+                }
+            }
+        }
+        if replayed.is_empty() {
+            return Err(self.abort_with(
+                &event_tx,
+                PipelineError::Regenerate("Sequential Crew 后缀中的所有角色都重演失败".into()),
+            ));
+        }
+
+        let mut performances = prefix_performances;
+        performances.extend(replayed);
+        self.state = PipelineState::Editing;
+        let _ = event_tx.send(PipelineEvent::StateChanged {
+            state: self.state.clone(),
+        });
+        self.run_editor_and_commit(
+            &plan,
+            &performances,
+            session_id,
+            seed,
+            GenerationMode::SequentialCrew,
+            req.hint.as_deref(),
+            req,
+            event_tx,
+            cancel,
+            ctx.profile.as_ref(),
+            &ctx.modules,
+            effective_runtime_for_provenance.as_deref(),
+            ctx.agent_profile_config.as_ref(),
+            &ctx.regex_scripts,
+            template_context.as_ref(),
+            &ctx.recent_summaries,
+            &ctx.far_memory_hits,
+            provenance_old.director_reasoning.clone(),
+        )
+        .await
+    }
+
     /// 内部：跑编剧 + 写入对话树（新 variant），返回 (成文, Provenance)
     ///
     /// 被 regenerate 的各路径复用。`hint` 注入到编剧 tail。
@@ -2633,6 +2906,7 @@ impl PipelineOrchestrator {
         performances: &[storyforge_domain::agent::Performance],
         session_id: &Id,
         seed: u64,
+        generation_mode: GenerationMode,
         hint: Option<&str>,
         req: &RegenerateRequest,
         event_tx: mpsc::UnboundedSender<PipelineEvent>,
@@ -2745,6 +3019,7 @@ impl PipelineOrchestrator {
             Some(plan.clone()),
             performances,
             None,
+            Some(generation_mode),
             seed,
             hint.map(String::from),
             campaign_runtime,
@@ -4065,6 +4340,7 @@ mod tests {
                 })
                 .collect(),
             profile_id: None,
+            generation_mode: None,
             seed: 0,
             last_hint: None,
             director_reasoning: Some(reasoning.clone()),
@@ -4231,7 +4507,12 @@ mod tests {
             .expect("sequential crew pipeline should succeed");
 
         assert_eq!(text, "灯灭后，信封仍停在两人之间。");
-        let snapshots = provenance.unwrap().subagent_results;
+        let provenance = provenance.unwrap();
+        assert_eq!(
+            provenance.generation_mode,
+            Some(GenerationMode::SequentialCrew)
+        );
+        let snapshots = provenance.subagent_results;
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].character_id, "A");
         assert_eq!(snapshots[1].character_id, "B");
@@ -4284,6 +4565,10 @@ mod tests {
 
         assert_eq!(text, "林如没有立刻拆信，只把它推回灯下。");
         let provenance = provenance.unwrap();
+        assert_eq!(
+            provenance.generation_mode,
+            Some(GenerationMode::Continuation)
+        );
         assert!(provenance.director_reasoning.is_none());
         assert!(provenance.editor_reasoning.is_none());
         assert!(provenance.writer_reasoning.is_some());
@@ -4391,7 +4676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_modes_reject_legacy_partial_rerolls() {
+    async fn sequential_mode_rejects_suffix_replay_for_legacy_artifacts() {
         let (mut orchestrator, _conv_store, conversation_id, node_id, conv_dir) =
             setup_with_first_draft().await;
         let ctx = WritingContext::legacy(
@@ -4402,7 +4687,7 @@ mod tests {
         let request = RegenerateRequest {
             conversation_id,
             node_id,
-            targets: vec![PartialRollTarget::Editor],
+            targets: vec![PartialRollTarget::Subagent("Seraphina".into())],
             generation_mode: Some(GenerationMode::SequentialCrew),
             hint: None,
             seed: None,
@@ -4412,11 +4697,11 @@ mod tests {
         let error = orchestrator
             .regenerate(request, &ctx, event_tx, cancel_rx)
             .await
-            .expect_err("product modes must reject artifact-incompatible partial rerolls");
+            .expect_err("legacy artifacts must not be reused as a sequential prefix");
 
         assert!(matches!(
             error,
-            PipelineError::Regenerate(message) if message.contains("仅支持整体重写")
+            PipelineError::Regenerate(message) if message.contains("只有由 Sequential Crew 生成")
         ));
         assert!(
             !std::iter::from_fn(|| event_rx.try_recv().ok())
@@ -5273,6 +5558,178 @@ mod tests {
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
 
+    #[tokio::test]
+    async fn sequential_regenerate_replays_selected_actor_and_downstream_suffix() {
+        let actor_response = |narrative: &str| {
+            serde_json::json!({
+                "narrative": narrative,
+                "dialogue": "continue",
+                "inner_thoughts": "private",
+                "scene_close": false
+            })
+            .to_string()
+        };
+        let llm: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![
+            MockScript {
+                match_keyword: "actor-b".into(),
+                response_content: actor_response("replayed-b"),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: "actor-c".into(),
+                response_content: actor_response("replayed-c"),
+                tool_calls: vec![],
+                stream: false,
+            },
+            MockScript {
+                match_keyword: EDITOR_SYSTEM_PROMPT.lines().next().unwrap().into(),
+                response_content: "edited sequential suffix".into(),
+                tool_calls: vec![],
+                stream: false,
+            },
+        ]));
+        let conv_dir = std::env::temp_dir().join(format!(
+            "storyforge_test_sequential_regen_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let conv_store = Arc::new(ConversationStore::new(conv_dir.clone()));
+        let tool_ctx = Arc::new(ToolContext::empty());
+        let mut orchestrator = PipelineOrchestrator::new(llm, conv_store.clone(), tool_ctx, None);
+
+        let task = |character_id: &str| SubagentTask {
+            character_id: character_id.into(),
+            brief: format!("{character_id} task"),
+            context_package: ContextPackage {
+                character_brief: format!("{character_id} persona"),
+                scene_brief: "sequential replay scene".into(),
+                relevant_lore: vec![],
+                constant_lore: vec![],
+                recent_window: vec![],
+                task: format!("{character_id} task"),
+            },
+            current_desire: None,
+            ongoing_action: None,
+            emotion_stage: None,
+        };
+        let snapshot = |character_id: &str, full_text: &str| {
+            storyforge_domain::conversation::SubagentSnapshot {
+                character_id: character_id.into(),
+                full_text: full_text.into(),
+                character_instance_id: None,
+                display_name: None,
+                fallback_reason: None,
+                reasoning_content: None,
+            }
+        };
+        let plan = Plan {
+            scene_brief: "sequential replay scene".into(),
+            subagent_tasks: vec![task("actor-a"), task("actor-b"), task("actor-c")],
+            scene_plan: None,
+        };
+        let provenance = Provenance {
+            session_id: Id::new(),
+            plan: Some(plan),
+            subagent_results: vec![
+                snapshot("actor-a", "old-a"),
+                snapshot("actor-b", "old-b"),
+                snapshot("actor-c", "old-c"),
+            ],
+            profile_id: None,
+            generation_mode: Some(GenerationMode::SequentialCrew),
+            seed: 7,
+            last_hint: None,
+            director_reasoning: Some("old director reasoning".into()),
+            writer_reasoning: None,
+            editor_reasoning: None,
+        };
+        let conv = conv_store.create(None, None);
+        let node_id = conv_store
+            .append_ai_draft(&conv.id, "old draft".into(), Some(provenance))
+            .unwrap();
+        let req = RegenerateRequest {
+            conversation_id: conv.id.clone(),
+            node_id: node_id.clone(),
+            targets: vec![PartialRollTarget::Subagent("actor-b".into())],
+            generation_mode: Some(GenerationMode::SequentialCrew),
+            hint: Some("make the exchange sharper".into()),
+            seed: Some(9),
+        };
+        let ctx = WritingContext::legacy(vec![mock_character("actor-a")], None, conv.id.clone());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let (text, provenance) = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await
+            .expect("sequential suffix replay should succeed");
+
+        assert_eq!(text, "edited sequential suffix");
+        assert_eq!(
+            provenance.generation_mode,
+            Some(GenerationMode::SequentialCrew)
+        );
+        assert_eq!(
+            provenance.last_hint.as_deref(),
+            Some("make the exchange sharper")
+        );
+        assert_eq!(
+            provenance.director_reasoning.as_deref(),
+            Some("old director reasoning")
+        );
+        assert_eq!(provenance.subagent_results[0].full_text, "old-a");
+        assert!(
+            provenance.subagent_results[1]
+                .full_text
+                .contains("replayed-b")
+        );
+        assert!(
+            provenance.subagent_results[2]
+                .full_text
+                .contains("replayed-c")
+        );
+
+        let mut started_indices = Vec::new();
+        let mut director_started = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                PipelineEvent::SubagentStarted { index, .. } => started_indices.push(index),
+                PipelineEvent::DirectorStarted => director_started = true,
+                _ => {}
+            }
+        }
+        assert_eq!(started_indices, vec![1, 2]);
+        assert!(
+            !director_started,
+            "suffix replay must reuse the original plan"
+        );
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let error = orchestrator
+            .regenerate(
+                RegenerateRequest {
+                    conversation_id: conv.id.clone(),
+                    node_id,
+                    targets: vec![PartialRollTarget::Subagent("actor-b".into())],
+                    generation_mode: Some(GenerationMode::BigScene),
+                    hint: None,
+                    seed: None,
+                },
+                &ctx,
+                event_tx,
+                cancel_rx,
+            )
+            .await
+            .expect_err("switching the selector must not reinterpret sequential artifacts");
+        assert!(matches!(
+            error,
+            PipelineError::Regenerate(message) if message.contains("来源模式不匹配")
+        ));
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
     // ─── P2 后处理流水线接入测试 ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -5358,6 +5815,7 @@ mod tests {
                 old_snapshot("Gamma", "old-gamma"),
             ],
             profile_id: None,
+            generation_mode: Some(GenerationMode::BigScene),
             seed: 7,
             last_hint: None,
             director_reasoning: None,

@@ -781,6 +781,7 @@ pub fn build_provenance(
     plan: Option<storyforge_domain::agent::Plan>,
     subagent_results: &[storyforge_domain::agent::Performance],
     profile_id: Option<Id>,
+    generation_mode: Option<storyforge_domain::generation::GenerationMode>,
     seed: u64,
     last_hint: Option<String>,
 ) -> Provenance {
@@ -792,6 +793,7 @@ pub fn build_provenance(
             .map(SubagentSnapshot::from)
             .collect(),
         profile_id,
+        generation_mode,
         seed,
         last_hint,
         director_reasoning: None,
@@ -806,11 +808,13 @@ pub fn build_provenance(
 /// 每个子 Agent 的 `character_instance_id`、`display_name` 和 `fallback_reason`。
 ///
 /// 匹配逻辑：按 `Performance.character_id` 优先匹配 instance.id，再匹配 instance.name。
+#[allow(clippy::too_many_arguments)]
 pub fn build_provenance_with_campaign(
     session_id: Id,
     plan: Option<storyforge_domain::agent::Plan>,
     subagent_results: &[storyforge_domain::agent::Performance],
     profile_id: Option<Id>,
+    generation_mode: Option<storyforge_domain::generation::GenerationMode>,
     seed: u64,
     last_hint: Option<String>,
     campaign_runtime: Option<&storyforge_domain::campaign_runtime::CampaignRuntimeContext>,
@@ -846,6 +850,7 @@ pub fn build_provenance_with_campaign(
         plan,
         subagent_results: subagent_snapshots,
         profile_id,
+        generation_mode,
         seed,
         last_hint,
         director_reasoning: None,
@@ -1362,6 +1367,7 @@ mod tests {
                 reasoning_content: None,
             }],
             profile_id: None,
+            generation_mode: None,
             seed: 42,
             last_hint: None,
             director_reasoning: None,
@@ -1459,6 +1465,7 @@ mod tests {
             plan: None,
             subagent_results: vec![],
             profile_id: None,
+            generation_mode: None,
             seed: 0,
             last_hint: None,
             director_reasoning: None,
