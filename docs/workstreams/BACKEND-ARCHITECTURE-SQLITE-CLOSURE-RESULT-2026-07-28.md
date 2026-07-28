@@ -247,4 +247,61 @@ Batch 2.4 消除 typed patch 的 Preview 与 Accept 两套前置条件判定逻�
 - **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
 - **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
 
+## 9. Gate 2 Batch 2.5 检查点（tool loop 合并为单一核心执行器）
+
+### 9.1 范围与策略
+
+Batch 2.5 消除 `app-agent/src/runtime.rs` 三个近似工具循环的重复实现。
+
+**改动前**：
+- `run_tool_loop`（非流式，供 chronicle compressor / postprocess / summarizer / mvu import）
+- `run_tool_loop_streaming`（流式 + `progress_tx` + `completion_probe`，供 character_extractor / meta_conversation / mvu_import）
+- `run_tool_loop_with_layout`（流式 + `MessageLayout` 初始消息 + round1 segment-diff 诊断，供 app-pipeline 的 director/writer/subagent 与 spawn_subagents）
+
+三者循环骨架（cancel 检查 → prompt hook → ChatRequest → LLM → drift recovery → 工具执行 → 终止判定）逐行相同，仅在消息来源、LLM 调用方式、进度转发、完成探测、layout 诊断处分叉；每份约 130 行，共 ~390 行重复。
+
+**改动后**：抽取私有 `run_tool_loop_core(config, messages, tool_registry, cancel, log_tag, progress_tx, completion_probe, pre_hook_segs)` 作为单一权威循环。三个 public 函数变为薄包装，各自提供变体特有输入（签名与调用点不变）：
+- `run_tool_loop`：`log_tag=""`、`progress_tx=None`、`completion_probe=None`、`pre_hook_segs=None`。
+- `run_tool_loop_streaming`：`log_tag="[stream]"`、`progress_tx=Some`、`completion_probe=传入`、`pre_hook_segs=None`。
+- `run_tool_loop_with_layout`：`log_tag="[layout]"`、`progress_tx=Some`、`completion_probe=传入`、`pre_hook_segs=Some(layout.segment_fingerprint())`。
+
+**行为保留**：
+- 非流式 LLM 调用仍走 `chat()` + 手写 cancel select；流式走 `chat_stream`（cancel 内置）。两者在 core 内按 `progress_tx.is_some()` 分支。
+- no-tool-call 分支统一为 F2/F3 形态（`tools_empty` 早返回 + `completion_probe` 早终止 + drift reminder + 空响应处理）；F1（plain）传 `completion_probe=None`，退化为既有 drift-recovery 行为（无早终止）。
+- layout 的 round1 segment-diff 诊断仅在 `pre_hook_segs=Some` 时触发。
+- 终止工具判定、`capture_reasoning_round`、`with_captured_reasoning`、`MaxRoundsExceeded` 语义完全不变。
+
+### 9.2 验证证据
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p storyforge-app-agent --all-targets -- -D warnings`：通过（`run_tool_loop_core` 加 `#[allow(clippy::too_many_arguments)]`，8 个参数是三版差异面的自然投影）。
+- `cargo test -p storyforge-app-agent`：125 passed、0 failed。
+- `cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`：通过。
+- `cargo test -p storyforge --no-default-features`：360 passed、3 ignored、0 failed（与 Batch 2.4 后相同，无回归）。
+- **parity 关键**：三组并行测试 `malformed_terminal_arguments_do_not_stop_plain_tool_loop` / `..._streaming_tool_loop` / `..._layout_tool_loop`（plain/streaming/layout 各一）全部通过，证明三版 terminal-recovery 行为逐字等价。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过。
+
+### 9.3 规模与未削弱项
+
+- 代码规模：`runtime.rs` 净 **−156 行**（2982 → 2824）；三份 ~130 行循环体合并为一份 ~150 行 core + 三个 ~15 行包装。
+- [x] 工具循环骨架只有一个权威实现（计划 §7.5）。
+- [x] plain 版 drift-recovery（无 completion_probe）行为保留：F1 传 None，drift reminder 分支不变。
+- [x] streaming / layout 版 `completion_probe` 早终止保留。
+- [x] layout 版 round1 segment-diff 诊断保留。
+- [x] 取消语义（pre-round check、prompt-hook select、LLM 调用内 cancel）三版均保留。
+- [x] 三个 public 函数签名与全部调用点（chronicle_compressor / postprocess / summarizer / mvu_import / character_extractor / meta_conversation / app-pipeline ×7 / spawn_subagents）未改动。
+- [x] 命令名/参数/DTO/事件/前端 IPC 合同：未改动（175/175 不变）。
+
+### 9.4 已知前置问题（非本批次引入）
+
+- `harness-real-llm` 的 `knowledge_propagation_real_llm.rs` / `writeback_isolation.rs` / `bronze_deterministic.rs` 引用 `storyforge_tauri_app::normalize_knowledge_update_for_postprocess` / `is_postprocess_instance_present` 报 `E0603` private。这是 Gate 1（`d340d99` 把 `commands` 设为私有 `mod commands;`）遗留的可见性问题，本批次未引入（stash 验证：main@08400a8 同样失败）。这些测试属 `default-features`（真实模型 harness），不在 Gate 2 确定性门禁（`--no-default-features`）内；修复需在 lib.rs 补 re-export 或迁移 harness 调用路径，建议作为独立 follow-up，不混入 Gate 2。
+
+### 9.5 Gate 2 剩余（按计划 §7）
+
+- **Batch 2.6（writing 阶段复用）**：start_writing / regenerate 的 Director/Subagent/Editor 仍各写一遍；`EditorStarted` 双发待消除。
+- **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
+- **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
+
 

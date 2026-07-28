@@ -663,4 +663,14 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 验证：`cargo fmt --all -- --check`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge-app-meta`（110 passed）、`cargo test -p storyforge --no-default-features`（360 passed、3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175、sqlite 68）均通过。
 - Gate 2 剩余：Batch 2.5（tool loop）、2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 8 节。
 
+## 25. Gate 2 Batch 2.5 检查点（tool loop 合并为单一核心执行器，2026-07-28）
+
+- Batch 2.5：`run_tool_loop` / `run_tool_loop_streaming` / `run_tool_loop_with_layout` 三者循环骨架相同、仅消息来源/LLM 调用方式/进度转发/完成探测/layout 诊断分叉。抽取私有 `run_tool_loop_core(config, messages, tool_registry, cancel, log_tag, progress_tx, completion_probe, pre_hook_segs)` 作为单一权威循环；三个 public 函数变为薄包装（签名与调用点不变）。
+- 行为保留：非流式走 `chat()` + 手写 cancel select，流式走 `chat_stream`；no-tool-call 分支统一为 F2/F3 形态（F1 传 `completion_probe=None` 退化为既有 drift-recovery）；layout round1 segment-diff 诊断仅在 `pre_hook_segs=Some` 触发；终止工具判定、reasoning capture、MaxRoundsExceeded 语义不变。
+- parity：三组并行测试 `malformed_terminal_arguments_do_not_stop_{plain,streaming,layout}_tool_loop` 全通过。
+- 规模：`runtime.rs` 净 −156 行（2982 → 2824）。
+- 验证：`cargo fmt --all -- --check`、`cargo clippy -p storyforge-app-agent --all-targets -- -D warnings`、`cargo test -p storyforge-app-agent`（125 passed）、`cargo clippy/test -p storyforge --no-default-features`（clippy 通过、360 passed）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175、sqlite 68）均通过。
+- 已知前置问题（非本批次引入）：`harness-real-llm`（default-features）引用 `normalize_knowledge_update_for_postprocess`/`is_postprocess_instance_present` 报 private（Gate 1 遗留），不在确定性门禁内，建议独立 follow-up。
+- Gate 2 剩余：Batch 2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 9 节。
+
 
