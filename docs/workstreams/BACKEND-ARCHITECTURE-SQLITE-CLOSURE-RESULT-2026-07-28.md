@@ -1,7 +1,7 @@
-# 后端架构拆分与 SQLite 收口：Gate 1 Campaign 子批结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：Gate 1 P2 记忆子批结果（2026-07-28）
 
-> 状态：**PASS（Gate 1 Campaign 子批）**。本结果记录 Gate 0 保护网与 Gate 1 前三批、世界书、变量、MVU runtime、Meta Agent、typed patch/MVU 和 Campaign 机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
-> 代码基线：`main@fbb93b6`。
+> 状态：**PASS（Gate 1 P2 记忆子批）**。本结果记录 Gate 0 保护网与 Gate 1 前三批、世界书、变量、MVU runtime、Meta Agent、typed patch/MVU、Campaign 和 P2 记忆机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
+> 代码基线：`main@15ae614`。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -17,7 +17,7 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | workspace crate | 16 |
-| `lib.rs` 行数 | 17,373（脚本按源码换行计数） |
+| `lib.rs` 行数 | 17,013（脚本按源码换行计数） |
 | `#[tauri::command]` 属性（`src/**/*.rs`） | 175 |
 | `generate_handler!` 注册命令（去重） | 175 |
 | `frontend/src/tauri-api.js` unique invoke | 162 |
@@ -81,7 +81,7 @@ Gate 0 确认以下项目必须继续处理：
 
 Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。Gate 1 前三批已完成：
 `presets`、`connections`、`diagnostics`、`import/export`、`cards`、`characters`、`plugins`、`card-shell` 已移入 `commands/`，根模块仅保留导入、注册和跨域接线。
-下一批为 P2 记忆/任务、Turn 操作和写作主链；这些命令与 pipeline 状态、AppState 和测试夹具耦合度最高，继续按域拆分并保持独立回滚点。
+下一批为 Turn 操作和写作主链；这些命令与 pipeline 状态、AppState 和测试夹具耦合度最高，继续按域拆分并保持独立回滚点。
 
 ## 6. Gate 1 第一批结果
 
@@ -183,3 +183,16 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
 - `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
 - 子批提交：`fbb93b6 refactor(tauri): split campaign and instance commands`。
+
+## 14. Gate 1 P2 记忆子批结果
+
+- 新增 `crates/tauri-app/src/commands/memory.rs`，移动角色知识、任务和 RoundSummary 命令。
+- 保持知识可见性/传播语义、任务状态转换、RoundSummary DTO 和前端 IPC 合同不变。
+- `lib.rs` 从 17,373 行降至 17,013 行。
+- `cargo fmt --all`：通过。
+- `cargo check -p storyforge --all-targets`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --lib`：344 passed / 3 ignored。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
+- 子批提交：`15ae614 refactor(tauri): split memory and task commands`。
