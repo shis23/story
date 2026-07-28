@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
 > 状态：**进行中（Gate 1 writing/conversations 子批、删除一致性返修已完成；Gate 1 总体和 SQLite 迁移仍未收口）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> code-under-test：`main@d0acea2`。
+> code-under-test：`main@d552344`。
 > document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
@@ -619,7 +619,9 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 
 ## 20. 2026-07-28 删除一致性与测试边界返修检查点
 
-- 代码提交：`0485d98 fix(storage): make playthrough deletion retryable`、`c5be471 fix(storage): satisfy rollback lint gate`、`d0acea2 fix(storage): close deletion consistency races`。
+- 代码提交：`0485d98 fix(storage): make playthrough deletion retryable`、`c5be471 fix(storage): satisfy rollback lint gate`、`d0acea2 fix(storage): close deletion consistency races`、`c10c9b5 fix(campaign): serialize active selection updates`、`d552344 test(campaign): make active update race deterministic`。
 - Campaign 删除先清理会话；会话失败时保留 Campaign，旧版本留下的孤立会话也可重试清理；CampaignStore 级联 JSON/本局世界书写入失败时执行补偿回滚，内存和磁盘快照均保持可重试。
 - 新增会话删除失败、孤立会话重试、级联写入失败回滚测试；writing 的 prompt-hook 与任务归一化纯测试已归位，命令级 start/regenerate 集成测试仍留在根模块。
+- 活跃 Campaign 切换与删除共用 `AppState.active_campaign_update` 串行锁；切换的校验、指针写盘和内存提交，以及删除的读取、清空/恢复指针和最终提交均处于同一更新临界区。
+- 新增成功、失败两类 Barrier 竞态测试，确认并发切换不会被旧 Campaign 删除路径覆盖，删除失败也不会回滚新选择。
 - 本检查点不代表 SQLite 事务、backend facade、迁移切换或 Gate 2–8 已完成。
