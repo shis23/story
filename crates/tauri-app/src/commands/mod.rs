@@ -1,3 +1,4 @@
+pub(crate) mod campaigns;
 pub(crate) mod card_shell;
 pub(crate) mod cards;
 pub(crate) mod characters;
