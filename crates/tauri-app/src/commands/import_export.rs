@@ -813,10 +813,10 @@ where
             }
             None => errors.push("rollback verification: CampaignStore has no data_dir".into()),
         }
-        if !errors.is_empty() {
-            if let Some(error) = delete_campaign_error {
-                errors.insert(0, error);
-            }
+        if !errors.is_empty()
+            && let Some(error) = delete_campaign_error
+        {
+            errors.insert(0, error);
         }
         if errors.is_empty() {
             Ok(())
