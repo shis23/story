@@ -1,7 +1,7 @@
-# 后端架构拆分与 SQLite 收口：Gate 1 世界书/变量子批结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：Gate 1 MVU runtime 子批结果（2026-07-28）
 
-> 状态：**PASS（Gate 1 世界书/变量子批）**。本结果记录 Gate 0 保护网与 Gate 1 前三批、世界书和变量机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
-> 代码基线：`main@5244de0`。
+> 状态：**PASS（Gate 1 MVU runtime 子批）**。本结果记录 Gate 0 保护网与 Gate 1 前三批、世界书、变量和 MVU runtime 机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
+> 代码基线：`main@852c7e4`。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -17,7 +17,7 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | workspace crate | 16 |
-| `lib.rs` 行数 | 19,776（脚本按源码换行计数） |
+| `lib.rs` 行数 | 19,732（脚本按源码换行计数） |
 | `#[tauri::command]` 属性（`src/**/*.rs`） | 175 |
 | `generate_handler!` 注册命令（去重） | 175 |
 | `frontend/src/tauri-api.js` unique invoke | 162 |
@@ -81,7 +81,7 @@ Gate 0 确认以下项目必须继续处理：
 
 Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁均已通过。Gate 1 前三批已完成：
 `presets`、`connections`、`diagnostics`、`import/export`、`cards`、`characters`、`plugins`、`card-shell` 已移入 `commands/`，根模块仅保留导入、注册和跨域接线。
-下一批为 `MVU`、`Meta`；两者耦合度较高，需单独建立更细的编译/测试检查点。
+下一批为 `Meta`；typed patch / MVU schema apply 与命令层耦合度较高，需单独建立更细的编译/测试检查点。
 
 ## 6. Gate 1 第一批结果
 
@@ -131,3 +131,16 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
 - `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
 - 子批提交：`48b6645 refactor(tauri): split world info commands`、`5244de0 refactor(tauri): split campaign variable commands`。
+
+## 10. Gate 1 MVU runtime 子批结果
+
+- 新增 `crates/tauri-app/src/commands/mvu.rs`，移动 W8 runtime ack/execute 命令。
+- 保持 pending request 生命周期、错误回传和前端 IPC 合同不变。
+- `lib.rs` 从 19,776 行降至 19,732 行。
+- `cargo fmt --all`：通过。
+- `cargo check -p storyforge --all-targets`：通过。
+- `cargo clippy -p storyforge --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge --lib`：344 passed / 3 ignored。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
+- 子批提交：`852c7e4 refactor(tauri): split mvu runtime commands`。
