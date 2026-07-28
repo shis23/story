@@ -633,3 +633,13 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 合同门禁：Tauri command 属性/注册 **175/175**，前端唯一 invoke **162**，缺失后端命令 **0**；完整命令快照、根实现泄漏、根测试零属性和域测试归属均受持续检查。
 - 验证通过：`cargo fmt --all -- --check`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --no-default-features`（351 passed、3 ignored）和 `node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）。
 - Gate 2 状态机、Gate 3 backend facade、Gate 4–8 SQLite 能力补齐、迁移/恢复、平台证据、默认切换和发布封存仍未完成。
+
+## 22. Gate 2 进行中检查点（2026-07-28）
+
+- 计划恢复：提交 `072fc53` 把本文件从摘要版恢复为完整 635 行 Gate 0–8 计划（用户修改，单独提交）。
+- Batch 2.1（提交 `ca048ae`）：`compute_draft_hash` 提升为 `crates/domain/src/turn.rs` 单一权威纯函数，JSON 与 SQLite 路径改为 re-export；新增 known-vector 测试证明 hex 输出与旧实现逐字节一致。
+- Batch 2.2（提交 `71e7884`）：抽取 backend-agnostic 的 `evaluate_accept_decision` 纯函数，承载 Accept 决策序言（scope、幂等终态重放、attempt 状态、derivation、quality gate、draft-hash、revision、batch/terminal-status）；JSON 与 SQLite 的 `accept_by_variant` 均改为先调用此函数，再各自执行后端特有的持久化（JSON 多步 CAS / SQLite 原子 UoW）；新增 7 个纯决策 parity 测试。
+- 验证：`cargo fmt --all -- --check`、`cargo check`、`cargo clippy -D warnings`、`cargo test -p storyforge --no-default-features`（358 passed、3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175）均通过。
+- 未削弱 revision CAS、fail-closed、`AcceptError` 分类或 active-turn barrier；未改变任何 command 名称/参数/DTO/事件/前端 IPC 合同。
+- Gate 2 剩余：Batch 2.3（postprocess builder 统一）、2.4（typed patch preview/apply 纯函数）、2.5（tool loop 合并）、2.6（writing 阶段复用）、2.7（取消/失败/重试事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 6 节。
+
