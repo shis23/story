@@ -1,7 +1,8 @@
 # 后端架构拆分与 SQLite 收口：Gate 1 子批结果（2026-07-28）
 
 > 状态：**PASS（Gate 1 已完成子批与返修）**。本结果记录 Gate 0 保护网及已完成的命令拆分子批；Gate 1 总体、backend facade 和 SQLite 彻底迁移仍未完成。
-> 当前代码基线：`main@c5be471`。
+> code-under-test：`main@d0acea2`。
+> document HEAD：本文件所在文档提交（紧随 code-under-test，避免把文档提交误当成被测代码）。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -225,11 +226,12 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 
 ## 18. 2026-07-28 拆分返修与删除一致性结果
 
-- 前置拆分提交：`cb79875 refactor(tauri): tighten command module boundaries`；本次返修提交：`0485d98 fix(storage): make playthrough deletion retryable`、`c5be471 fix(storage): satisfy rollback lint gate`。
+- 前置拆分提交：`cb79875 refactor(tauri): tighten command module boundaries`；本次返修提交：`0485d98 fix(storage): make playthrough deletion retryable`、`c5be471 fix(storage): satisfy rollback lint gate`、`d0acea2 fix(storage): close deletion consistency races`。
 - 两个新命令模块恢复为可读 UTF-8 中文源码；移除根模块通配导入，改为显式依赖列表。
 - writing/conversations 相关纯测试分别归位到所属模块；命令级 start/regenerate 集成测试仍保留在根模块；内部 DTO、路由和展示辅助恢复私有可见性。
 - Campaign 删除命令归回 `commands/campaigns.rs`，级联删除实现抽至 `playthrough_lifecycle.rs`，并改为先删会话、失败保留 Campaign 可重试；旧版本遗留的孤立会话也可补偿清理。
-- `CampaignStore::delete_campaign` 现在对 Campaign、实例、知识、任务、总结和本局世界书执行补偿回滚；导入回滚以最终内存/磁盘快照判定，避免把已成功补偿误报为失败。
-- 新增会话删除失败、孤立会话重试、级联写入失败回滚测试。
-- 当前 `lib.rs` 为 13,976 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
-- 返修验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --lib --no-default-features`（347 passed, 3 ignored）、前端合同测试 3/3 和 `git diff --check`，均通过。
+- `CampaignStore::delete_campaign` 现在对 Campaign、实例、知识、任务、总结和本局世界书执行补偿回滚；路径快照区分 Missing/RegularFile/Other，Other 路径拒绝操作且回滚绝不递归删除目录。
+- 世界书写入、Campaign 存在性检查和删除使用一致的 world-info → campaigns 锁顺序；新增 Barrier 并发测试验证删除后不会留下孤立世界书。
+- 活跃指针持久化失败会返回错误；启动阶段会丢弃指向不存在 Campaign 的旧指针；公开生命周期入口通过真实 `ConversationPersistence` 失败替身验证失败后重试。
+- 当前 `lib.rs` 为 14,042 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
+- 返修验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets --no-default-features`、`cargo clippy -p storyforge --all-targets --no-default-features -- -D warnings`、`cargo test -p storyforge --lib --no-default-features`（349 passed, 3 ignored）、前端合同测试 3/3 和 `git diff --check`，均通过。
