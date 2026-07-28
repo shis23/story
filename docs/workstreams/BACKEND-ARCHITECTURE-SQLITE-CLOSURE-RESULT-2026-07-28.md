@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 收口：Gate 1 子批结果（2026-07-28）
 
 > 状态：**PASS（Gate 1 已完成子批与返修）**。本结果记录 Gate 0 保护网及已完成的命令拆分子批；Gate 1 总体、backend facade 和 SQLite 彻底迁移仍未完成。
-> 当前代码基线：`main@0485d98`。
+> 当前代码基线：`main@c5be471`。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -225,7 +225,7 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 
 ## 18. 2026-07-28 拆分返修与删除一致性结果
 
-- 前置拆分提交：`cb79875 refactor(tauri): tighten command module boundaries`；本次返修提交：`0485d98 fix(storage): make playthrough deletion retryable`。
+- 前置拆分提交：`cb79875 refactor(tauri): tighten command module boundaries`；本次返修提交：`0485d98 fix(storage): make playthrough deletion retryable`、`c5be471 fix(storage): satisfy rollback lint gate`。
 - 两个新命令模块恢复为可读 UTF-8 中文源码；移除根模块通配导入，改为显式依赖列表。
 - writing/conversations 相关纯测试分别归位到所属模块；命令级 start/regenerate 集成测试仍保留在根模块；内部 DTO、路由和展示辅助恢复私有可见性。
 - Campaign 删除命令归回 `commands/campaigns.rs`，级联删除实现抽至 `playthrough_lifecycle.rs`，并改为先删会话、失败保留 Campaign 可重试；旧版本遗留的孤立会话也可补偿清理。
