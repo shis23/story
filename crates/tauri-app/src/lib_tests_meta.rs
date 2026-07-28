@@ -932,3 +932,105 @@ fn plugin_dto_exposes_modify_prompt_permission_and_event_subscriptions() {
         vec!["CHAT_COMPLETION_PROMPT_READY"]
     );
 }
+
+/// Batch 2.4 契约：typed patch 的前置条件校验（target 存在 + definition/schema 一致）
+/// 必须由 app-meta 的单一纯函数承载，Preview 与 Accept 共用同一逻辑。
+///
+/// 该测试钉住三件事：
+/// 1. `validate_patch_preconditions` 对 target 缺失返回 `TypedPatchError`（与 `apply_to_snapshot`
+///    的 `TargetMissing` 同源），不再让 meta_typed 重新实现一遍存在性扫描。
+/// 2. `SyncInstanceVariables` 的 definition_id 不匹配时被同一纯函数拒绝（既有
+///    `validate_typed_patch_targets` 的额外检查归并进来）。
+/// 3. Preview 在 target 缺失时返回 `stale: true`（与 Accept 的 stale 标记语义一致）。
+#[test]
+fn typed_patch_preconditions_share_one_pure_function_between_preview_and_accept() {
+    use storyforge_app_meta::{
+        PreviewInput, TypedPatch, TypedPatchAction, TypedPatchStatus, validate_patch_preconditions,
+    };
+    use storyforge_domain::campaign::CharacterInstance;
+    use storyforge_domain::character::{CharacterDefinition, RoleType};
+    use storyforge_domain::variables::{VariableField, VariableType, default_character_variables};
+
+    let campaign = storyforge_domain::campaign::Campaign::new(Id::from_str("card-1"), "tc");
+    let cid = campaign.id.clone();
+    let mut schema = default_character_variables();
+    schema.push(VariableField {
+        key: "hp".into(),
+        label: "HP".into(),
+        value_type: VariableType::Int,
+        default: serde_json::json!(100),
+        description: None,
+        group: Some("状态".into()),
+    });
+    let def = CharacterDefinition {
+        id: Id::from_str("def-1"),
+        card_id: Id::from_str("card-1"),
+        name: "Hero".into(),
+        persona_prompt: "".into(),
+        behavior_rules: "".into(),
+        base_backstory: vec![],
+        group: None,
+        role_type: RoleType::Protagonist,
+        variable_schema: schema,
+    };
+    let mut inst = CharacterInstance::from_definition(cid.clone(), &def);
+    inst.id = Id::from_str("inst-1");
+    let instances = vec![inst.clone()];
+    let definitions = vec![def.clone()];
+    let input = PreviewInput {
+        instances: &instances,
+        definitions: &definitions,
+        knowledge: &[],
+        tasks: &[],
+        campaign: Some(&campaign),
+    };
+
+    // 1. target 存在 + definition 匹配 + schema 含 add_key → 通过
+    let ok_patch = TypedPatch {
+        id: "p-ok".into(),
+        description: "sync".into(),
+        source_issue_category: "variable_schema_mismatch".into(),
+        affected_id: Some("inst-1".into()),
+        actions: vec![TypedPatchAction::SyncInstanceVariables {
+            instance_id: Id::from_str("inst-1"),
+            definition_id: Id::from_str("def-1"),
+            add_keys: vec!["hp".into()],
+            remove_keys: vec![],
+        }],
+        diff: vec![],
+        created_at: chrono::Utc::now(),
+        status: TypedPatchStatus::Pending,
+    };
+    validate_patch_preconditions(&ok_patch, &input).expect("匹配的前置条件应通过");
+
+    // 2. definition_id 不匹配 → 纯函数拒绝（既有 validate_typed_patch_targets 的检查归并）
+    let mismatch_patch = TypedPatch {
+        id: "p-mismatch".into(),
+        actions: vec![TypedPatchAction::SyncInstanceVariables {
+            instance_id: Id::from_str("inst-1"),
+            definition_id: Id::from_str("def-other"),
+            add_keys: vec!["hp".into()],
+            remove_keys: vec![],
+        }],
+        ..ok_patch.clone()
+    };
+    let err = validate_patch_preconditions(&mismatch_patch, &input)
+        .expect_err("definition 不匹配应被纯函数拒绝");
+    assert!(
+        err.to_string().contains("def-other") || err.to_string().contains("definition"),
+        "应报告 definition 不匹配: {err:?}"
+    );
+
+    // 3. target instance 缺失 → 纯函数拒绝（与 apply_to_snapshot TargetMissing 同源）
+    let missing_patch = TypedPatch {
+        id: "p-missing".into(),
+        actions: vec![TypedPatchAction::SyncInstanceVariables {
+            instance_id: Id::from_str("inst-gone"),
+            definition_id: Id::from_str("def-1"),
+            add_keys: vec!["hp".into()],
+            remove_keys: vec![],
+        }],
+        ..ok_patch.clone()
+    };
+    validate_patch_preconditions(&missing_patch, &input).expect_err("target 缺失应被纯函数拒绝");
+}

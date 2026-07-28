@@ -209,7 +209,10 @@ pub(crate) fn meta_preview_typed_patch_in_store(
         campaign: Some(&campaign),
     };
 
-    if storyforge_app_meta::is_patch_stale(patch, &input) {
+    // Preview 与 Accept 共用同一前置条件纯函数（Gate 2 Batch 2.4）：
+    // target 缺失或 definition/schema 前置条件不满足时都标 Stale，确保 Preview 看到的
+    // 可接受性与 Accept 的判定一致（不再出现「Preview 通过但 Accept 失败」）。
+    if storyforge_app_meta::validate_patch_preconditions(patch, &input).is_err() {
         patch.status = storyforge_app_meta::TypedPatchStatus::Stale;
         let patch_json = to_json_value(&*patch, "typed patch preview")?;
         return Ok(serde_json::json!({
@@ -384,125 +387,26 @@ pub(crate) fn validate_typed_patch_targets(
     knowledge: &[storyforge_domain::character_knowledge::CharacterKnowledgeEntry],
     tasks: &[storyforge_domain::story_task::StoryTask],
 ) -> Result<(), TauriCommandError> {
-    use storyforge_app_meta::TypedPatchAction;
-
-    for action in &patch.actions {
-        match action {
-            TypedPatchAction::SyncInstanceVariables {
-                instance_id,
-                definition_id,
-                add_keys,
-                ..
-            } => {
-                let instance = find_instance(instances, instance_id)?;
-                if instance.definition_id.as_ref() != Some(definition_id) {
-                    return Err(TauriCommandError::validation(format!(
-                        "Instance {} 已不再使用 definition {}",
-                        instance_id.as_str(),
-                        definition_id.as_str()
-                    )));
-                }
-                let definition = definitions
-                    .iter()
-                    .find(|d| &d.id == definition_id)
-                    .ok_or_else(|| {
-                        TauriCommandError::not_found(format!(
-                            "Definition 不存在: {}",
-                            definition_id.as_str()
-                        ))
-                    })?;
-                for key in add_keys {
-                    if !definition
-                        .variable_schema
-                        .iter()
-                        .any(|field| field.key == *key)
-                    {
-                        return Err(TauriCommandError::validation(format!(
-                            "Definition {} 缺少变量 schema: {}",
-                            definition_id.as_str(),
-                            key
-                        )));
-                    }
-                }
-            }
-            TypedPatchAction::PruneOrphanTaskReferences { task_id, .. }
-            | TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
-                ensure_task_exists(tasks, task_id)?;
-            }
-            TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
-                if !knowledge.iter().any(|entry| &entry.id == knowledge_id) {
-                    return Err(TauriCommandError::not_found(format!(
-                        "Knowledge 不存在: {}",
-                        knowledge_id.as_str()
-                    )));
-                }
-            }
-            TypedPatchAction::RepointInstanceDefinition {
-                instance_id,
-                new_definition_id,
-            } => {
-                ensure_instance_exists(instances, instance_id)?;
-                if let Some(definition_id) = new_definition_id {
-                    ensure_definition_exists(definitions, definition_id)?;
-                }
-            }
-            TypedPatchAction::UpdateCampaignVariable { .. } => {
-                if campaign.id.as_str().is_empty() {
-                    return Err(TauriCommandError::not_found("Campaign 不存在"));
-                }
-            }
-            TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
-                ensure_instance_exists(instances, instance_id)?;
-            }
-            TypedPatchAction::AddKnowledge { character_id, .. } => {
-                ensure_instance_exists(instances, character_id)?;
-            }
+    // 委托 app-meta 的单一纯函数：target 存在性 + SyncInstanceVariables 的
+    // definition/schema 前置条件都只此一份实现（Gate 2 Batch 2.4）。
+    let input = storyforge_app_meta::PreviewInput {
+        instances,
+        definitions,
+        knowledge,
+        tasks,
+        campaign: Some(campaign),
+    };
+    storyforge_app_meta::validate_patch_preconditions(patch, &input).map_err(|e| match e {
+        storyforge_app_meta::TypedPatchError::TargetMissing(msg) => {
+            TauriCommandError::not_found(msg)
         }
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_instance_exists(
-    instances: &[storyforge_domain::campaign::CharacterInstance],
-    instance_id: &Id,
-) -> Result<(), TauriCommandError> {
-    find_instance(instances, instance_id).map(|_| ())
-}
-
-pub(crate) fn find_instance<'a>(
-    instances: &'a [storyforge_domain::campaign::CharacterInstance],
-    instance_id: &Id,
-) -> Result<&'a storyforge_domain::campaign::CharacterInstance, TauriCommandError> {
-    instances
-        .iter()
-        .find(|instance| &instance.id == instance_id)
-        .ok_or_else(|| {
-            TauriCommandError::not_found(format!("Instance 不存在: {}", instance_id.as_str()))
-        })
-}
-
-pub(crate) fn ensure_definition_exists(
-    definitions: &[storyforge_domain::character::CharacterDefinition],
-    definition_id: &Id,
-) -> Result<(), TauriCommandError> {
-    definitions
-        .iter()
-        .any(|definition| &definition.id == definition_id)
-        .then_some(())
-        .ok_or_else(|| {
-            TauriCommandError::not_found(format!("Definition 不存在: {}", definition_id.as_str()))
-        })
-}
-
-pub(crate) fn ensure_task_exists(
-    tasks: &[storyforge_domain::story_task::StoryTask],
-    task_id: &Id,
-) -> Result<(), TauriCommandError> {
-    tasks
-        .iter()
-        .any(|task| &task.id == task_id)
-        .then_some(())
-        .ok_or_else(|| TauriCommandError::not_found(format!("Task 不存在: {}", task_id.as_str())))
+        storyforge_app_meta::TypedPatchError::PreconditionFailed(msg) => {
+            TauriCommandError::validation(msg)
+        }
+        storyforge_app_meta::TypedPatchError::Stale => {
+            TauriCommandError::validation("patch 已过期")
+        }
+    })
 }
 
 /// 执行单个 TypedPatchAction 到 CampaignStore（写盘辅助）

@@ -118,6 +118,9 @@ pub enum TypedPatchError {
     TargetMissing(String),
     #[error("patch 已过期")]
     Stale,
+    /// 前置条件不满足（definition 不匹配、schema key 缺失等 target 存在之外的语义校验）。
+    #[error("patch 前置条件失败: {0}")]
+    PreconditionFailed(String),
 }
 
 // ─── 纯函数实现 ──────────────────────────────────────────────────────────────
@@ -136,8 +139,20 @@ pub fn build_patch_for_issue(issue: &HealthIssue, input: &PreviewInput) -> Optio
 
 /// 检查 patch 是否过期：target id 是否仍存在于快照中。
 /// 返回 true = 过期（不应接受）。
+///
+/// 本函数只判 target 存在性；更严格的前置条件（definition 匹配、schema key 存在）
+/// 由 [`validate_patch_preconditions`] 承载。两者共用同一存在性判定路径。
 pub fn is_patch_stale(patch: &TypedPatch, input: &PreviewInput) -> bool {
-    patch.actions.iter().any(|action| match action {
+    patch
+        .actions
+        .iter()
+        .any(|action| action_target_missing(action, input))
+}
+
+/// 判定单条 action 的 target 是否缺失（存在性判定，`is_patch_stale` 与
+/// `validate_patch_preconditions` 共用，避免重复扫描）。
+fn action_target_missing(action: &TypedPatchAction, input: &PreviewInput) -> bool {
+    match action {
         TypedPatchAction::RepointInstanceDefinition { instance_id, .. } => {
             !input.instances.iter().any(|i| &i.id == instance_id)
         }
@@ -160,7 +175,108 @@ pub fn is_patch_stale(patch: &TypedPatch, input: &PreviewInput) -> bool {
         TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
             !input.tasks.iter().any(|t| &t.id == task_id)
         }
-    })
+    }
+}
+
+/// 校验 patch 在应用前的全部前置条件（target 存在 + definition/schema 一致）。
+///
+/// 这是 Preview 与 Accept **共用**的单一权威校验纯函数（Gate 2 Batch 2.4）：
+/// - target 存在性复用 [`action_target_missing`]（与 [`is_patch_stale`] 同源）；
+/// - `SyncInstanceVariables` 额外校验 instance.definition_id 与 action 的 definition_id
+///   一致、definition 存在、add_keys 均在 schema 内（既有
+///   `meta_typed::validate_typed_patch_targets` 的检查归并于此）。
+///
+/// 缺失 target 返回 `TypedPatchError::TargetMissing`；definition/schema 不匹配返回
+/// `TypedPatchError::PreconditionFailed`。调用方（Preview/Accept）各自决定如何映射到
+/// 用户可见错误或 stale 标记，但**判定逻辑只此一份**。
+pub fn validate_patch_preconditions(
+    patch: &TypedPatch,
+    input: &PreviewInput,
+) -> Result<(), TypedPatchError> {
+    for action in &patch.actions {
+        // 1. target 存在性（与 is_patch_stale 共用）
+        if action_target_missing(action, input) {
+            return Err(target_missing_error(action));
+        }
+        // 2. SyncInstanceVariables 的严格前置条件
+        if let TypedPatchAction::SyncInstanceVariables {
+            instance_id,
+            definition_id,
+            add_keys,
+            ..
+        } = action
+        {
+            let inst = input
+                .instances
+                .iter()
+                .find(|i| &i.id == instance_id)
+                .expect("target existence checked above");
+            if inst.definition_id.as_ref() != Some(definition_id) {
+                return Err(TypedPatchError::PreconditionFailed(format!(
+                    "Instance {} 已不再使用 definition {}",
+                    instance_id.as_str(),
+                    definition_id.as_str()
+                )));
+            }
+            let definition = input.definitions.iter().find(|d| &d.id == definition_id);
+            let Some(definition) = definition else {
+                return Err(TypedPatchError::TargetMissing(format!(
+                    "Definition 不存在: {}",
+                    definition_id.as_str()
+                )));
+            };
+            for key in add_keys {
+                if !definition
+                    .variable_schema
+                    .iter()
+                    .any(|field| field.key == *key)
+                {
+                    return Err(TypedPatchError::PreconditionFailed(format!(
+                        "Definition {} 缺少变量 schema: {}",
+                        definition_id.as_str(),
+                        key
+                    )));
+                }
+            }
+        }
+        // 3. RepointInstanceDefinition：若指定新 definition_id，必须存在于快照中。
+        if let TypedPatchAction::RepointInstanceDefinition {
+            new_definition_id: Some(definition_id),
+            ..
+        } = action
+            && !input.definitions.iter().any(|d| &d.id == definition_id)
+        {
+            return Err(TypedPatchError::TargetMissing(format!(
+                "Definition 不存在: {}",
+                definition_id.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 根据缺失的 target 类型生成 `TargetMissing` 错误消息（与 apply_action 的错误同源）。
+fn target_missing_error(action: &TypedPatchAction) -> TypedPatchError {
+    match action {
+        TypedPatchAction::RepointInstanceDefinition { instance_id, .. }
+        | TypedPatchAction::SyncInstanceVariables { instance_id, .. }
+        | TypedPatchAction::UpdateInstanceVariable { instance_id, .. } => {
+            TypedPatchError::TargetMissing(format!("instance {}", instance_id))
+        }
+        TypedPatchAction::DeleteOrphanKnowledge { knowledge_id } => {
+            TypedPatchError::TargetMissing(format!("knowledge {}", knowledge_id))
+        }
+        TypedPatchAction::PruneOrphanTaskReferences { task_id, .. }
+        | TypedPatchAction::UpdateTaskStatus { task_id, .. } => {
+            TypedPatchError::TargetMissing(format!("task {}", task_id))
+        }
+        TypedPatchAction::AddKnowledge { character_id, .. } => {
+            TypedPatchError::TargetMissing(format!("instance {}", character_id))
+        }
+        TypedPatchAction::UpdateCampaignVariable { .. } => {
+            TypedPatchError::TargetMissing("campaign (none)".into())
+        }
+    }
 }
 
 /// 把 patch 的 actions 应用到一份可变快照副本上（纯函数，验证语义正确用）。

@@ -33,7 +33,7 @@ pub use mvu_import::{
 pub use typed_patch::{
     FieldDiff, PreviewInput, PreviewInputMut, TypedPatch, TypedPatchAction, TypedPatchError,
     TypedPatchStatus, apply_to_snapshot, build_patch_for_issue, build_patch_from_action,
-    is_patch_stale,
+    is_patch_stale, validate_patch_preconditions,
 };
 
 // ─── 诊断报告 ──────────────────────────────────────────────────────────────
