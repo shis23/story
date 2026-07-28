@@ -1379,6 +1379,12 @@ Describe 'Release workflow static governance (runner readiness)' {
         $ci | Should Match 'actions/checkout@v4'
         $ci | Should Match 'cargo clippy'
         $ci | Should Match 'cargo test --workspace'
+        # Both Rust jobs install the same native dependency set. Transient
+        # archive.ubuntu.com failures must retry the install in-place so apt
+        # reuses already downloaded archives instead of restarting the job.
+        ([regex]::Matches($ci, 'for attempt in 1 2 3')).Count | Should Be 2
+        ([regex]::Matches($ci, 'Acquire::Retries=3')).Count | Should Be 4
+        ([regex]::Matches($ci, 'retrying with cached archives')).Count | Should Be 2
         # The PyYAML/parser-backed Windows jobs are NOT in ci-gates.yml anymore.
         $ci | Should Not Match 'PyYAML==6\.0\.2'
         $ci | Should Not Match 'Test-ReleaseWorkflowSyntax'
