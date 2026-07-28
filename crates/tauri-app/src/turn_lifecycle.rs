@@ -260,6 +260,159 @@ pub struct AcceptOutcome {
     pub batch: MutationBatch,
 }
 
+/// Backend-agnostic result of the pure Accept decision prologue.
+///
+/// Both JSON and SQLite load the turn/attempt/draft/campaign-revision from their
+/// own store, then call [`evaluate_accept_decision`]. The returned variant tells
+/// the caller what to persist: replay an already-committed turn without state
+/// change, or commit a freshly-validated batch. The decision logic (scope,
+/// derivation, quality gate, draft-hash, revision, batch) is implemented once;
+/// only the durable write mechanism differs per backend.
+#[derive(Debug, Clone)]
+pub enum AcceptDecision {
+    /// The turn/attempt is already terminal with a persisted batch. The caller
+    /// must re-confirm durability against its ledger/CAS and return the supplied
+    /// outcome unchanged. No state mutation is allowed.
+    Replay(AcceptOutcome),
+    /// The turn/attempt passed every permanent guard. The caller must commit
+    /// `batch` through its own CAS/UoW, then mark the turn terminal with
+    /// `terminal_status`.
+    Commit {
+        batch: MutationBatch,
+        terminal_status: TurnStatus,
+        commit_as_degraded: bool,
+        campaign_revision_before: u64,
+    },
+}
+
+/// Inputs every backend already gathers before Accept side effects.
+#[derive(Debug, Clone)]
+pub struct AcceptDecisionInput<'a> {
+    pub campaign_id: &'a Id,
+    pub conversation_id: &'a Id,
+    pub variant_id: &'a Id,
+    pub turn: &'a TurnRecord,
+    pub attempt: &'a TurnAttempt,
+    pub force_accept: bool,
+    /// Active variant content currently on disk (for the draft-hash guard).
+    pub current_draft_text: String,
+    /// Live campaign revision at decision time.
+    pub current_campaign_revision: u64,
+}
+
+/// Pure Accept decision shared by JSON and SQLite (Gate 2).
+///
+/// Performs the full permanent-guard sequence exactly once:
+/// campaign/conversation scope → idempotent terminal replay → attempt status →
+/// derivation → quality gate → draft-hash → revision → batch/terminal-status.
+/// Returns `Replay` when the turn is already terminal, or `Commit` with the
+/// prepared batch and intended terminal status. The caller owns the durable
+/// write (JSON CAS sequence or SQLite atomic UoW) and must preserve the typed
+/// error taxonomy returned here.
+pub fn evaluate_accept_decision(
+    input: &AcceptDecisionInput<'_>,
+) -> Result<AcceptDecision, AcceptError> {
+    let AcceptDecisionInput {
+        campaign_id,
+        conversation_id,
+        variant_id,
+        turn,
+        attempt,
+        force_accept,
+        current_draft_text,
+        current_campaign_revision,
+    } = input;
+    let force_accept = *force_accept;
+    let current_campaign_revision = *current_campaign_revision;
+
+    if &turn.campaign_id != *campaign_id {
+        return Err(AcceptError::CampaignScopeMismatch {
+            turn_campaign: turn.campaign_id.to_string(),
+            requested: campaign_id.to_string(),
+        });
+    }
+    if &turn.conversation_id != *conversation_id {
+        return Err(AcceptError::ConversationScopeMismatch {
+            turn_conversation: turn.conversation_id.to_string(),
+            requested: conversation_id.to_string(),
+        });
+    }
+
+    // Idempotent replay: same attempt already accepted and turn is terminal.
+    // Both backends re-confirm durability in their own store before returning.
+    if attempt.status == AttemptStatus::Committed
+        && matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded)
+        && turn.accepted_attempt_id.as_ref() == Some(&attempt.attempt_id)
+    {
+        let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
+            AcceptError::Storage(format!(
+                "terminal turn {} has no persisted MutationBatch for replay",
+                turn.turn_id
+            ))
+        })?;
+        return Ok(AcceptDecision::Replay(AcceptOutcome {
+            turn_id: turn.turn_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            turn_status: turn.status.clone(),
+            attempt_status: AttemptStatus::Committed,
+            commit_as_degraded: turn.status == TurnStatus::Degraded,
+            campaign_revision_before: batch.expected_revision,
+            campaign_revision_after: batch.target_revision,
+            batch,
+        }));
+    }
+
+    if attempt.status != AttemptStatus::AwaitingAcceptance {
+        return Err(AcceptError::InvalidAttemptStatus(format!(
+            "{:?}",
+            attempt.status
+        )));
+    }
+
+    let derivation_failed = attempt
+        .derivation
+        .as_ref()
+        .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
+    if derivation_failed && !force_accept {
+        return Err(AcceptError::DerivationFailed);
+    }
+
+    let quality_decision = quality_accept_decision(attempt.quality_report.as_ref(), force_accept);
+    let commit_as_degraded = match quality_decision {
+        QualityAcceptDecision::AllowCommit => derivation_failed,
+        QualityAcceptDecision::ForceDegraded { .. } => true,
+        QualityAcceptDecision::Block { error_count } => {
+            return Err(AcceptError::QualityBlocked { error_count });
+        }
+    };
+
+    // Draft-hash guard: the on-disk draft must match what was hashed at
+    // DraftReady. A mismatch means the draft was edited without re-derivation.
+    if compute_draft_hash(current_draft_text) != attempt.draft_hash {
+        return Err(AcceptError::DraftHashMismatch);
+    }
+
+    if turn.base_campaign_revision != current_campaign_revision {
+        return Err(AcceptError::RevisionConflict {
+            base: turn.base_campaign_revision,
+            current: current_campaign_revision,
+        });
+    }
+
+    let batch = prepare_commit_batch(attempt, variant_id, current_campaign_revision);
+    let terminal_status = if commit_as_degraded {
+        TurnStatus::Degraded
+    } else {
+        TurnStatus::Committed
+    };
+    Ok(AcceptDecision::Commit {
+        batch,
+        terminal_status,
+        commit_as_degraded,
+        campaign_revision_before: current_campaign_revision,
+    })
+}
+
 /// Shared lifecycle service over the production JSON stores.
 pub struct TurnLifecycleService<'a> {
     pub campaign_store: &'a CampaignStore,
@@ -362,6 +515,11 @@ impl<'a> TurnLifecycleService<'a> {
     }
 
     /// Production Accept: quality gate, draft_hash, revision CAS, MutationBatch apply.
+    ///
+    /// The pure decision (scope, derivation, quality, draft-hash, revision,
+    /// batch) is delegated to [`evaluate_accept_decision`], shared with the
+    /// SQLite path. This method owns only the JSON store reads and the
+    /// multi-step CAS persistence sequence.
     pub fn accept_by_variant(
         &self,
         campaign_id: &Id,
@@ -395,71 +553,6 @@ impl<'a> TurnLifecycleService<'a> {
             }
         };
 
-        if &turn.campaign_id != campaign_id {
-            return Err(AcceptError::CampaignScopeMismatch {
-                turn_campaign: turn.campaign_id.to_string(),
-                requested: campaign_id.to_string(),
-            });
-        }
-        if &turn.conversation_id != conversation_id {
-            return Err(AcceptError::ConversationScopeMismatch {
-                turn_conversation: turn.conversation_id.to_string(),
-                requested: conversation_id.to_string(),
-            });
-        }
-
-        // V7：重复 accept 幂等化——与 SQLite 的 AlreadyCommitted replay 对齐。
-        // 同一 attempt 已被采纳且 Turn 已终态：重放返回与首次一致的 AcceptOutcome，
-        // 不改任何盘上状态（网络重试/双击不再报 InvalidAttemptStatus）。
-        if attempt.status == AttemptStatus::Committed
-            && matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded)
-            && turn.accepted_attempt_id.as_ref() == Some(&attempt.attempt_id)
-        {
-            let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
-                AcceptError::Storage(format!(
-                    "terminal turn {} has no persisted MutationBatch for replay",
-                    turn.turn_id
-                ))
-            })?;
-            return Ok(AcceptOutcome {
-                turn_id: turn.turn_id.clone(),
-                attempt_id: attempt.attempt_id.clone(),
-                turn_status: turn.status.clone(),
-                attempt_status: AttemptStatus::Committed,
-                commit_as_degraded: turn.status == TurnStatus::Degraded,
-                campaign_revision_before: batch.expected_revision,
-                campaign_revision_after: batch.target_revision,
-                batch,
-            });
-        }
-
-        if attempt.status != AttemptStatus::AwaitingAcceptance {
-            return Err(AcceptError::InvalidAttemptStatus(format!(
-                "{:?}",
-                attempt.status
-            )));
-        }
-
-        let derivation_failed = attempt
-            .derivation
-            .as_ref()
-            .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
-        if derivation_failed && !force_accept {
-            return Err(AcceptError::DerivationFailed);
-        }
-
-        let quality_decision =
-            quality_accept_decision(attempt.quality_report.as_ref(), force_accept);
-        let commit_as_degraded = match &quality_decision {
-            QualityAcceptDecision::AllowCommit => derivation_failed,
-            QualityAcceptDecision::ForceDegraded { .. } => true,
-            QualityAcceptDecision::Block { error_count } => {
-                return Err(AcceptError::QualityBlocked {
-                    error_count: *error_count,
-                });
-            }
-        };
-
         // Always scope revision / mutations to the Turn's own campaign.
         let owner_campaign_id = turn.campaign_id.clone();
         let camp = self
@@ -467,117 +560,123 @@ impl<'a> TurnLifecycleService<'a> {
             .get_campaign(&owner_campaign_id)
             .ok_or(AcceptError::CampaignMissing)?;
         let campaign_revision_before = camp.revision;
-        if turn.base_campaign_revision != campaign_revision_before {
-            return Err(AcceptError::RevisionConflict {
-                base: turn.base_campaign_revision,
-                current: campaign_revision_before,
-            });
-        }
-
         let current_text = self.read_variant_content(conversation_id, variant_id);
-        if compute_draft_hash(&current_text) != attempt.draft_hash {
-            return Err(AcceptError::DraftHashMismatch);
-        }
 
-        let batch = prepare_commit_batch(&attempt, variant_id, campaign_revision_before);
-        let turn_id = turn.turn_id.clone();
-        let attempt_id = attempt.attempt_id.clone();
-        let batch_for_store = batch.clone();
-        let final_status = if commit_as_degraded {
-            TurnStatus::Degraded
-        } else {
-            TurnStatus::Committed
-        };
-        let intended = final_status.clone();
-        let cas_ok = self
-            .update_turn_record_if(
-                &turn_id,
-                |record| {
-                    record.status == TurnStatus::AwaitingAcceptance
-                        && record
-                            .find_attempt(&attempt_id)
-                            .is_some_and(|a| a.status == AttemptStatus::AwaitingAcceptance)
-                },
-                |record| {
-                    record.status = TurnStatus::Committing;
-                    record.intended_terminal_status = Some(intended);
-                    if let Some(att) = record.find_attempt_mut(&attempt_id) {
-                        att.status = AttemptStatus::Committing;
-                        att.pending_state_changes = Some(batch_for_store);
+        // Shared backend-agnostic decision prologue (Gate 2).
+        let decision = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id,
+            conversation_id,
+            variant_id,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept,
+            current_draft_text: current_text,
+            current_campaign_revision: campaign_revision_before,
+        })?;
+
+        match decision {
+            AcceptDecision::Replay(outcome) => Ok(outcome),
+            AcceptDecision::Commit {
+                batch,
+                terminal_status: final_status,
+                commit_as_degraded,
+                campaign_revision_before,
+            } => {
+                let turn_id = turn.turn_id.clone();
+                let attempt_id = attempt.attempt_id.clone();
+                let batch_for_store = batch.clone();
+                let intended = final_status.clone();
+                let cas_ok = self
+                    .update_turn_record_if(
+                        &turn_id,
+                        |record| {
+                            record.status == TurnStatus::AwaitingAcceptance
+                                && record
+                                    .find_attempt(&attempt_id)
+                                    .is_some_and(|a| a.status == AttemptStatus::AwaitingAcceptance)
+                        },
+                        |record| {
+                            record.status = TurnStatus::Committing;
+                            record.intended_terminal_status = Some(intended);
+                            if let Some(att) = record.find_attempt_mut(&attempt_id) {
+                                att.status = AttemptStatus::Committing;
+                                att.pending_state_changes = Some(batch_for_store);
+                            }
+                            record.touch();
+                        },
+                    )
+                    .map_err(AcceptError::Storage)?;
+                if !cas_ok {
+                    return Err(AcceptError::CasFailed);
+                }
+
+                let apply_result = turn_coordinator::with_campaign_lock(|| {
+                    // Reject every permanent error before any durable side effect. Apply the
+                    // idempotent Campaign batch before Final so a later conversation write
+                    // failure remains recoverable from the Committing journal.
+                    self.preflight_variant_acceptance(conversation_id, variant_id)?;
+                    Self::preflight_finalize_mutation(&batch, variant_id)?;
+                    CampaignMutationCoordinator::preflight_mutation_batch(
+                        self.campaign_store,
+                        &owner_campaign_id,
+                        &batch,
+                    )?;
+                    CampaignMutationCoordinator::apply_mutation_batch(
+                        self.campaign_store,
+                        &owner_campaign_id,
+                        &batch,
+                    )?;
+                    self.conv_store
+                        .accept_variant(conversation_id, variant_id)
+                        .map_err(|e| CommitError::Storage(format!("Draft → Final 失败: {e}")))?;
+                    Ok(())
+                });
+
+                if let Err(error) = apply_result {
+                    let permanent = matches!(
+                        &error,
+                        CommitError::CampaignNotFound(_)
+                            | CommitError::RevisionConflict { .. }
+                            | CommitError::MutationConflict(_)
+                    );
+                    if permanent {
+                        let reason = format!("commit preflight 失败: {error}");
+                        self.update_turn_record(&turn_id, |record| {
+                            record.status = TurnStatus::Failed;
+                            record.failure_reason = Some(reason);
+                            record.intended_terminal_status = None;
+                            if let Some(attempt) = record.find_attempt_mut(&attempt_id) {
+                                attempt.status = AttemptStatus::Failed;
+                            }
+                            record.touch();
+                        })
+                        .map_err(AcceptError::Storage)?;
                     }
-                    record.touch();
-                },
-            )
-            .map_err(AcceptError::Storage)?;
-        if !cas_ok {
-            return Err(AcceptError::CasFailed);
-        }
+                    // Storage/lock failures remain Committing for idempotent recovery.
+                    return Err(AcceptError::Commit(error.to_string()));
+                }
 
-        let apply_result = turn_coordinator::with_campaign_lock(|| {
-            // Reject every permanent error before any durable side effect. Apply the
-            // idempotent Campaign batch before Final so a later conversation write
-            // failure remains recoverable from the Committing journal.
-            self.preflight_variant_acceptance(conversation_id, variant_id)?;
-            Self::preflight_finalize_mutation(&batch, variant_id)?;
-            CampaignMutationCoordinator::preflight_mutation_batch(
-                self.campaign_store,
-                &owner_campaign_id,
-                &batch,
-            )?;
-            CampaignMutationCoordinator::apply_mutation_batch(
-                self.campaign_store,
-                &owner_campaign_id,
-                &batch,
-            )?;
-            self.conv_store
-                .accept_variant(conversation_id, variant_id)
-                .map_err(|e| CommitError::Storage(format!("Draft → Final 失败: {e}")))?;
-            Ok(())
-        });
+                // Side effects landed: terminal mark must surface persistence failure.
+                self.mark_terminal_after_side_effects(&turn_id, &attempt_id, final_status.clone())?;
 
-        if let Err(error) = apply_result {
-            let permanent = matches!(
-                &error,
-                CommitError::CampaignNotFound(_)
-                    | CommitError::RevisionConflict { .. }
-                    | CommitError::MutationConflict(_)
-            );
-            if permanent {
-                let reason = format!("commit preflight 失败: {error}");
-                self.update_turn_record(&turn_id, |record| {
-                    record.status = TurnStatus::Failed;
-                    record.failure_reason = Some(reason);
-                    record.intended_terminal_status = None;
-                    if let Some(attempt) = record.find_attempt_mut(&attempt_id) {
-                        attempt.status = AttemptStatus::Failed;
-                    }
-                    record.touch();
+                let campaign_revision_after = self
+                    .campaign_store
+                    .get_campaign(&owner_campaign_id)
+                    .map(|c| c.revision)
+                    .unwrap_or(campaign_revision_before);
+
+                Ok(AcceptOutcome {
+                    turn_id,
+                    attempt_id,
+                    turn_status: final_status,
+                    attempt_status: AttemptStatus::Committed,
+                    commit_as_degraded,
+                    campaign_revision_before,
+                    campaign_revision_after,
+                    batch,
                 })
-                .map_err(AcceptError::Storage)?;
             }
-            // Storage/lock failures remain Committing for idempotent recovery.
-            return Err(AcceptError::Commit(error.to_string()));
         }
-
-        // Side effects landed: terminal mark must surface persistence failure.
-        self.mark_terminal_after_side_effects(&turn_id, &attempt_id, final_status.clone())?;
-
-        let campaign_revision_after = self
-            .campaign_store
-            .get_campaign(&owner_campaign_id)
-            .map(|c| c.revision)
-            .unwrap_or(campaign_revision_before);
-
-        Ok(AcceptOutcome {
-            turn_id,
-            attempt_id,
-            turn_status: final_status,
-            attempt_status: AttemptStatus::Committed,
-            commit_as_degraded,
-            campaign_revision_before,
-            campaign_revision_after,
-            batch,
-        })
     }
 
     /// Persist terminal Turn/Attempt state after side effects. Errors must not be swallowed.
@@ -914,6 +1013,286 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
         assert_ne!(a, compute_draft_hash("hello-turn!"));
+    }
+
+    /// Build a minimal in-memory TurnRecord+TurnAttempt for pure-decision tests,
+    /// mirroring the shape both backends load before calling evaluate_accept_decision.
+    fn decision_fixture(
+        campaign_id: Id,
+        conversation_id: Id,
+        variant_id: Id,
+        draft: &str,
+        quality: Option<QualityReport>,
+    ) -> (TurnRecord, TurnAttempt) {
+        let mut batch = MutationBatch::new(Id::new(), 0);
+        batch.mutations.push(Mutation::FinalizeVariant {
+            variant_id: variant_id.clone(),
+        });
+        let attempt = TurnAttempt {
+            attempt_id: Id::new(),
+            variant_id: variant_id.clone(),
+            draft_hash: compute_draft_hash(draft),
+            status: AttemptStatus::AwaitingAcceptance,
+            pending_state_changes: Some(batch),
+            derivation: None,
+            quality_report: quality,
+            pending_temporary_instances: vec![],
+            provenance: None,
+            created_at: "t0".into(),
+        };
+        let mut record = TurnRecord::new(campaign_id, conversation_id, variant_id, 0);
+        record.status = TurnStatus::AwaitingAcceptance;
+        record.attempts.push(attempt.clone());
+        (record, attempt)
+    }
+
+    #[test]
+    fn accept_decision_allows_clean_commit() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let draft = "正文";
+        let (turn, attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            draft,
+            Some(QualityReport { warnings: vec![] }),
+        );
+        let decision = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: draft.into(),
+            current_campaign_revision: 0,
+        })
+        .expect("clean decision commits");
+        match decision {
+            AcceptDecision::Commit {
+                terminal_status,
+                commit_as_degraded,
+                campaign_revision_before,
+                batch,
+            } => {
+                assert_eq!(terminal_status, TurnStatus::Committed);
+                assert!(!commit_as_degraded);
+                assert_eq!(campaign_revision_before, 0);
+                assert!(
+                    batch
+                        .mutations
+                        .iter()
+                        .any(|m| matches!(m, Mutation::FinalizeVariant { .. }))
+                );
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_decision_blocks_quality_errors_without_force() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let draft = "正文";
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::FormatLeak {
+                    snippet: "```".into(),
+                },
+                message: "format".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        let (turn, attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            draft,
+            Some(report),
+        );
+        let err = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: draft.into(),
+            current_campaign_revision: 0,
+        })
+        .expect_err("error-quality blocks without force");
+        assert!(matches!(
+            err,
+            AcceptError::QualityBlocked { error_count: 1 }
+        ));
+    }
+
+    #[test]
+    fn accept_decision_force_marks_degraded() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let draft = "正文";
+        let report = QualityReport {
+            warnings: vec![QualityWarning {
+                code: QualityWarningCode::FormatLeak {
+                    snippet: "```".into(),
+                },
+                message: "format".into(),
+                severity: QualitySeverity::Error,
+            }],
+        };
+        let (turn, attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            draft,
+            Some(report),
+        );
+        let decision = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: true,
+            current_draft_text: draft.into(),
+            current_campaign_revision: 0,
+        })
+        .expect("force accept commits as degraded");
+        match decision {
+            AcceptDecision::Commit {
+                terminal_status,
+                commit_as_degraded,
+                ..
+            } => {
+                assert_eq!(terminal_status, TurnStatus::Degraded);
+                assert!(commit_as_degraded);
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_decision_rejects_edited_draft_hash() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let (turn, attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            "原稿",
+            Some(QualityReport { warnings: vec![] }),
+        );
+        let err = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: "被篡改的稿".into(),
+            current_campaign_revision: 0,
+        })
+        .expect_err("mismatched draft must block");
+        assert!(matches!(err, AcceptError::DraftHashMismatch));
+    }
+
+    #[test]
+    fn accept_decision_rejects_campaign_scope_mismatch() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let other_campaign = Id::new();
+        let (turn, attempt) = decision_fixture(
+            campaign,
+            conv.clone(),
+            variant.clone(),
+            "正文",
+            Some(QualityReport { warnings: vec![] }),
+        );
+        let err = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &other_campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: "正文".into(),
+            current_campaign_revision: 0,
+        })
+        .expect_err("cross-campaign must block");
+        assert!(matches!(err, AcceptError::CampaignScopeMismatch { .. }));
+    }
+
+    #[test]
+    fn accept_decision_rejects_revision_conflict() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let (turn, attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            "正文",
+            Some(QualityReport { warnings: vec![] }),
+        );
+        let err = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: "正文".into(),
+            current_campaign_revision: 5,
+        })
+        .expect_err("stale revision must block");
+        match err {
+            AcceptError::RevisionConflict { base, current } => {
+                assert_eq!(base, 0);
+                assert_eq!(current, 5);
+            }
+            other => panic!("expected RevisionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_decision_replays_terminal_turn_idempotently() {
+        let (campaign, conv, variant) = (Id::new(), Id::new(), Id::new());
+        let draft = "正文";
+        let (mut turn, mut attempt) = decision_fixture(
+            campaign.clone(),
+            conv.clone(),
+            variant.clone(),
+            draft,
+            Some(QualityReport { warnings: vec![] }),
+        );
+        // Simulate a committed turn: persist a batch and mark terminal.
+        let mut batch = MutationBatch::new(Id::new(), 0);
+        batch.target_revision = 1;
+        batch.mutations.push(Mutation::FinalizeVariant {
+            variant_id: variant.clone(),
+        });
+        attempt.status = AttemptStatus::Committed;
+        attempt.pending_state_changes = Some(batch.clone());
+        turn.status = TurnStatus::Committed;
+        turn.accepted_attempt_id = Some(attempt.attempt_id.clone());
+        turn.attempts = vec![attempt.clone()];
+
+        let decision = evaluate_accept_decision(&AcceptDecisionInput {
+            campaign_id: &campaign,
+            conversation_id: &conv,
+            variant_id: &variant,
+            turn: &turn,
+            attempt: &attempt,
+            force_accept: false,
+            current_draft_text: draft.into(),
+            current_campaign_revision: 1,
+        })
+        .expect("terminal turn replays");
+        match decision {
+            AcceptDecision::Replay(outcome) => {
+                assert_eq!(outcome.turn_status, TurnStatus::Committed);
+                assert_eq!(outcome.attempt_status, AttemptStatus::Committed);
+                assert!(!outcome.commit_as_degraded);
+                assert_eq!(outcome.campaign_revision_before, 0);
+                assert_eq!(outcome.campaign_revision_after, 1);
+            }
+            other => panic!("expected Replay, got {other:?}"),
+        }
     }
 
     #[test]

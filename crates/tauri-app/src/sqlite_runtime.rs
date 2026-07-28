@@ -21,7 +21,6 @@ use storyforge_infra_sqlite::preaccept::{
 };
 use storyforge_infra_sqlite::production::{
     AcceptOutcome as SqliteAcceptOutcome, AcceptTurnRequest, SqliteProductionRepository,
-    compute_draft_hash,
 };
 use storyforge_infra_sqlite::{current_version, migrate};
 
@@ -345,29 +344,24 @@ pub fn capture_audit_snapshot() -> Result<storyforge_infra_sqlite::SqliteAuditSn
 }
 
 /// Atomic Accept through the SQLite production UoW.
+///
+/// The pure decision (scope, derivation, quality, draft-hash, revision, batch)
+/// is delegated to [`crate::turn_lifecycle::evaluate_accept_decision`], shared
+/// with the JSON path. This function owns only the SQLite store reads and the
+/// atomic UoW persistence.
 pub fn accept_by_variant(
     campaign_id: &Id,
     conversation_id: &Id,
     variant_id: &Id,
     force_accept: bool,
 ) -> Result<crate::turn_lifecycle::AcceptOutcome, crate::turn_lifecycle::AcceptError> {
-    use crate::turn_lifecycle::{AcceptError, AcceptOutcome, prepare_commit_batch};
+    use crate::turn_lifecycle::{
+        AcceptDecision, AcceptDecisionInput, AcceptError, AcceptOutcome, evaluate_accept_decision,
+    };
 
     let turn = get_turn_by_variant(variant_id)
         .map_err(AcceptError::Storage)?
         .ok_or(AcceptError::NoTurnRecord)?;
-    if &turn.campaign_id != campaign_id {
-        return Err(AcceptError::CampaignScopeMismatch {
-            turn_campaign: turn.campaign_id.to_string(),
-            requested: campaign_id.to_string(),
-        });
-    }
-    if &turn.conversation_id != conversation_id {
-        return Err(AcceptError::ConversationScopeMismatch {
-            turn_conversation: turn.conversation_id.to_string(),
-            requested: conversation_id.to_string(),
-        });
-    }
 
     let attempt = turn
         .attempts
@@ -376,77 +370,6 @@ pub fn accept_by_variant(
         .find(|a| a.variant_id == *variant_id)
         .cloned()
         .ok_or(AcceptError::NoAttempt)?;
-    if attempt.status != AttemptStatus::AwaitingAcceptance
-        && turn.status != TurnStatus::AwaitingAcceptance
-    {
-        // Allow already-committed replay through the ledger below.
-        if !matches!(
-            turn.status,
-            TurnStatus::Committed | TurnStatus::Degraded | TurnStatus::Committing
-        ) {
-            return Err(AcceptError::InvalidAttemptStatus(format!(
-                "{:?}",
-                attempt.status
-            )));
-        }
-    }
-
-    // A retry after the SQLite UoW committed must reach the repository's
-    // mutation ledger unchanged. Do not re-prepare the Attempt: terminal
-    // records are no longer AwaitingAcceptance, but `accept_turn` can safely
-    // validate the persisted batch and return AlreadyCommitted.
-    if matches!(turn.status, TurnStatus::Committed | TurnStatus::Degraded) {
-        let batch = attempt.pending_state_changes.clone().ok_or_else(|| {
-            AcceptError::Storage(format!(
-                "terminal turn {} has no persisted MutationBatch for replay",
-                turn.turn_id
-            ))
-        })?;
-        let terminal_status = turn.status.clone();
-        let outcome = with_db_mut(|db| {
-            let request = AcceptTurnRequest {
-                turn_id: &turn.turn_id,
-                attempt_id: &attempt.attempt_id,
-                draft_hash: &attempt.draft_hash,
-                batch: &batch,
-                terminal_status: terminal_status.clone(),
-            };
-            SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
-        })
-        .map_err(AcceptError::Commit)?;
-        debug_assert!(matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted));
-
-        return Ok(AcceptOutcome {
-            turn_id: turn.turn_id,
-            attempt_id: attempt.attempt_id,
-            turn_status: terminal_status.clone(),
-            attempt_status: AttemptStatus::Committed,
-            commit_as_degraded: terminal_status == TurnStatus::Degraded,
-            campaign_revision_before: batch.expected_revision,
-            campaign_revision_after: batch.target_revision,
-            batch,
-        });
-    }
-
-    let derivation_failed = attempt
-        .derivation
-        .as_ref()
-        .is_some_and(storyforge_domain::turn::DerivationComponents::has_failure);
-    if derivation_failed && !force_accept {
-        return Err(AcceptError::DerivationFailed);
-    }
-
-    // Quality gate（V7：与 JSON 路径共用 domain 决策函数，杜绝两处内联实现漂移）。
-    let commit_as_degraded = match storyforge_domain::turn::quality_accept_decision(
-        attempt.quality_report.as_ref(),
-        force_accept,
-    ) {
-        storyforge_domain::turn::QualityAcceptDecision::AllowCommit => derivation_failed,
-        storyforge_domain::turn::QualityAcceptDecision::ForceDegraded { .. } => true,
-        storyforge_domain::turn::QualityAcceptDecision::Block { error_count } => {
-            return Err(AcceptError::QualityBlocked { error_count });
-        }
-    };
 
     let conversation = get_conversation(conversation_id)
         .map_err(AcceptError::Storage)?
@@ -458,109 +381,140 @@ pub fn accept_by_variant(
         .and_then(|n| n.active())
         .map(|v| v.content.clone())
         .unwrap_or_default();
-    if compute_draft_hash(&current_text) != attempt.draft_hash {
-        return Err(AcceptError::DraftHashMismatch);
-    }
 
     let camp = get_campaign(&turn.campaign_id)
         .map_err(AcceptError::Storage)?
         .ok_or(AcceptError::CampaignMissing)?;
     let campaign_revision_before = camp.revision;
-    if turn.base_campaign_revision != campaign_revision_before {
-        return Err(AcceptError::RevisionConflict {
-            base: turn.base_campaign_revision,
-            current: campaign_revision_before,
-        });
-    }
 
-    let batch = prepare_commit_batch(&attempt, variant_id, campaign_revision_before);
-    let terminal_status = if commit_as_degraded {
-        TurnStatus::Degraded
-    } else {
-        TurnStatus::Committed
-    };
-    let turn_id = turn.turn_id.clone();
-    let attempt_id = attempt.attempt_id.clone();
-    let draft_hash = attempt.draft_hash.clone();
-
-    // `SqliteProductionRepository` intentionally verifies that the exact
-    // candidate batch was durable before it finalizes. Persist the batch
-    // generated by the app service first; otherwise an empty postprocess
-    // candidate (which still needs FinalizeVariant) is rejected and force
-    // Accept can never close a normal draft.
-    with_db_mut(|db| {
-        let mut current = SqliteProductionRepository::get_turn(db, &turn_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("turn {turn_id} disappeared before accept preparation"))?;
-        if current.status != TurnStatus::AwaitingAcceptance {
-            return Err(format!(
-                "turn {turn_id} changed to {:?} before accept preparation",
-                current.status
-            ));
-        }
-        let stored_attempt = current
-            .find_attempt_mut(&attempt_id)
-            .ok_or_else(|| format!("attempt {attempt_id} disappeared before accept preparation"))?;
-        if stored_attempt.status != AttemptStatus::AwaitingAcceptance
-            || stored_attempt.draft_hash != draft_hash
-        {
-            return Err(format!(
-                "attempt {attempt_id} changed before accept preparation"
-            ));
-        }
-        stored_attempt.pending_state_changes = Some(batch.clone());
-        current.touch();
-        SqliteProductionRepository::save_turn(db, &current).map_err(|e| e.to_string())
-    })
-    .map_err(AcceptError::Storage)?;
-
-    // V7：typed 错误跨边界分类。旧实现 `e.contains("revision")` 会把
-    // integrity 分歧（消息同样含 "revisions"）等 DB 损坏误报成"回合过期"。
-    let outcome = with_db_mut(|db| {
-        let request = AcceptTurnRequest {
-            turn_id: &turn_id,
-            attempt_id: &attempt_id,
-            draft_hash: &draft_hash,
-            batch: &batch,
-            terminal_status: terminal_status.clone(),
-        };
-        Ok(SqliteProductionRepository::accept_turn(db, request))
-    })
-    .map_err(AcceptError::Commit)?
-    .map_err(|e| match e {
-        storyforge_infra_sqlite::SqliteError::RevisionConflict {
-            campaign,
-            turn_base,
-            ..
-        } => AcceptError::RevisionConflict {
-            base: turn_base,
-            current: campaign,
-        },
-        storyforge_infra_sqlite::SqliteError::RecordNotFound(_) => {
-            AcceptError::Storage(e.to_string())
-        }
-        other => AcceptError::Commit(other.to_string()),
+    // Shared backend-agnostic decision prologue (Gate 2).
+    let decision = evaluate_accept_decision(&AcceptDecisionInput {
+        campaign_id,
+        conversation_id,
+        variant_id,
+        turn: &turn,
+        attempt: &attempt,
+        force_accept,
+        current_draft_text: current_text,
+        current_campaign_revision: campaign_revision_before,
     })?;
 
-    let campaign_revision_after = get_campaign(&turn.campaign_id)
-        .ok()
-        .flatten()
-        .map(|c| c.revision)
-        .unwrap_or(campaign_revision_before + 1);
+    match decision {
+        AcceptDecision::Replay(outcome) => {
+            // Re-confirm durability against the SQLite mutation ledger. A retry
+            // after the UoW committed must reach `accept_turn`, which validates
+            // the persisted batch and returns AlreadyCommitted.
+            let batch = outcome.batch.clone();
+            let terminal_status = outcome.turn_status.clone();
+            let ledger_outcome = with_db_mut(|db| {
+                let request = AcceptTurnRequest {
+                    turn_id: &outcome.turn_id,
+                    attempt_id: &outcome.attempt_id,
+                    draft_hash: &attempt.draft_hash,
+                    batch: &batch,
+                    terminal_status: terminal_status.clone(),
+                };
+                SqliteProductionRepository::accept_turn(db, request).map_err(|e| e.to_string())
+            })
+            .map_err(AcceptError::Commit)?;
+            debug_assert!(matches!(
+                ledger_outcome,
+                SqliteAcceptOutcome::AlreadyCommitted
+            ));
+            Ok(outcome)
+        }
+        AcceptDecision::Commit {
+            batch,
+            terminal_status,
+            commit_as_degraded,
+            campaign_revision_before,
+        } => {
+            let turn_id = turn.turn_id.clone();
+            let attempt_id = attempt.attempt_id.clone();
+            let draft_hash = attempt.draft_hash.clone();
 
-    let _ = outcome; // Applied | AlreadyCommitted — both OK for the caller.
-    let _ = matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted);
+            // `SqliteProductionRepository` intentionally verifies that the exact
+            // candidate batch was durable before it finalizes. Persist the batch
+            // generated by the app service first; otherwise an empty postprocess
+            // candidate (which still needs FinalizeVariant) is rejected and force
+            // Accept can never close a normal draft.
+            with_db_mut(|db| {
+                let mut current = SqliteProductionRepository::get_turn(db, &turn_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("turn {turn_id} disappeared before accept preparation")
+                    })?;
+                if current.status != TurnStatus::AwaitingAcceptance {
+                    return Err(format!(
+                        "turn {turn_id} changed to {:?} before accept preparation",
+                        current.status
+                    ));
+                }
+                let stored_attempt = current.find_attempt_mut(&attempt_id).ok_or_else(|| {
+                    format!("attempt {attempt_id} disappeared before accept preparation")
+                })?;
+                if stored_attempt.status != AttemptStatus::AwaitingAcceptance
+                    || stored_attempt.draft_hash != draft_hash
+                {
+                    return Err(format!(
+                        "attempt {attempt_id} changed before accept preparation"
+                    ));
+                }
+                stored_attempt.pending_state_changes = Some(batch.clone());
+                current.touch();
+                SqliteProductionRepository::save_turn(db, &current).map_err(|e| e.to_string())
+            })
+            .map_err(AcceptError::Storage)?;
 
-    Ok(AcceptOutcome {
-        turn_id,
-        attempt_id,
-        turn_status: terminal_status,
-        attempt_status: AttemptStatus::Committed,
-        commit_as_degraded,
-        campaign_revision_before,
-        campaign_revision_after,
-        batch,
-    })
+            // V7：typed 错误跨边界分类。旧实现 `e.contains("revision")` 会把
+            // integrity 分歧（消息同样含 "revisions"）等 DB 损坏误报成"回合过期"。
+            let outcome = with_db_mut(|db| {
+                let request = AcceptTurnRequest {
+                    turn_id: &turn_id,
+                    attempt_id: &attempt_id,
+                    draft_hash: &draft_hash,
+                    batch: &batch,
+                    terminal_status: terminal_status.clone(),
+                };
+                Ok(SqliteProductionRepository::accept_turn(db, request))
+            })
+            .map_err(AcceptError::Commit)?
+            .map_err(|e| match e {
+                storyforge_infra_sqlite::SqliteError::RevisionConflict {
+                    campaign,
+                    turn_base,
+                    ..
+                } => AcceptError::RevisionConflict {
+                    base: turn_base,
+                    current: campaign,
+                },
+                storyforge_infra_sqlite::SqliteError::RecordNotFound(_) => {
+                    AcceptError::Storage(e.to_string())
+                }
+                other => AcceptError::Commit(other.to_string()),
+            })?;
+
+            let campaign_revision_after = get_campaign(&turn.campaign_id)
+                .ok()
+                .flatten()
+                .map(|c| c.revision)
+                .unwrap_or(campaign_revision_before + 1);
+
+            let _ = outcome; // Applied | AlreadyCommitted — both OK for the caller.
+            let _ = matches!(outcome, SqliteAcceptOutcome::AlreadyCommitted);
+
+            Ok(AcceptOutcome {
+                turn_id,
+                attempt_id,
+                turn_status: terminal_status,
+                attempt_status: AttemptStatus::Committed,
+                commit_as_degraded,
+                campaign_revision_before,
+                campaign_revision_after,
+                batch,
+            })
+        }
+    }
 }
 
 /// SQLite startup recovery: fail incomplete pre-accept turns (outbox-aware),
