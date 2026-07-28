@@ -1,7 +1,7 @@
 # 后端架构拆分与 SQLite 彻底收口计划（2026-07-28）
 
-> 状态：**Gate 0 已完成；Gate 1 第一至第三批、世界书/变量、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆和 Turn 子批完成，后续批次待执行**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
-> 起草基线：`main@2832030`。
+> 状态：**进行中（Gate 1 writing/conversations 子批及其返修已完成；Gate 1 总体和 SQLite 迁移仍未收口）**。本文件只建立执行顺序、边界和验收门槛，不代表后续阶段已经完成。
+> 当前基线：`main@cb79875`。
 > 主目标：先消除 `tauri-app/src/lib.rs` 巨石和双后端业务分叉，再补齐 SQLite 能力、完成迁移演练并切换默认后端。
 > 结果文档：执行时新建 `docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-RESULT-2026-07-28.md`，逐阶段记录真实证据。
 
@@ -167,7 +167,7 @@ crates/tauri-app/src/
 1. diagnostics、presets、connections（已完成，见 Gate 1 第一批提交）；
 2. import/export、cards、characters（已完成，见 Gate 1 第二批提交）；
 3. plugins、card-shell（已完成，见 Gate 1 第三批提交）；
-4. world-info、variables、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆、Turn（已完成，拆成独立子批）；writing 待执行；
+4. world-info、variables、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆、Turn、writing、conversations（已完成，拆成独立子批）；
 5. campaigns、turns；
 6. writing 与 pipeline command；
 7. inline tests 跟随被测域迁移。

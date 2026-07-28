@@ -1,7 +1,7 @@
-# 后端架构拆分与 SQLite 收口：Gate 1 Turn 子批结果（2026-07-28）
+# 后端架构拆分与 SQLite 收口：Gate 1 子批结果（2026-07-28）
 
-> 状态：**PASS（Gate 1 Turn 子批）**。本结果记录 Gate 0 保护网与 Gate 1 前三批、世界书、变量、MVU runtime、Meta Agent、typed patch/MVU、Campaign、P2 记忆和 Turn 机械拆分，不代表巨石拆分或 SQLite 彻底迁移已经完成。
-> 代码基线：`main@168ce32`。
+> 状态：**PASS（Gate 1 已完成子批与返修）**。本结果记录 Gate 0 保护网及已完成的命令拆分子批；Gate 1 总体、backend facade 和 SQLite 彻底迁移仍未完成。
+> 当前代码基线：`main@cb79875`。
 > 计划：`docs/workstreams/BACKEND-ARCHITECTURE-SQLITE-CLOSURE-PLAN-2026-07-28.md`。
 
 ## 1. Gate 0 产物
@@ -222,3 +222,12 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - 新增 `commands/conversations.rs`，根 `lib.rs` 移除会话列表/详情/删除及展示正则辅助；Campaign 级联删除保持原语义。
 - `lib.rs` 当前 14,360 行；命令属性/注册 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
 - 验证全绿：`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）、前端合同 3/3。
+
+## 20. 2026-07-28 拆分返修结果
+
+- 提交：`cb79875 refactor(tauri): tighten command module boundaries`。
+- 两个新命令模块恢复为可读 UTF-8 中文源码；移除根模块通配导入，改为显式依赖列表。
+- writing/conversations 相关纯测试分别归位到所属模块；内部 DTO、路由和展示辅助恢复私有可见性。
+- Campaign 删除命令归回 `commands/campaigns.rs`，级联删除实现抽至 `playthrough_lifecycle.rs`，由 Campaign 与 Conversation 命令共享。
+- 当前 `lib.rs` 为 14,116 行；命令属性/注册数 175/175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
+- 返修验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）、前端合同测试 3/3，均通过。
