@@ -2396,7 +2396,7 @@ impl PipelineOrchestrator {
             let _ = event_tx.send(PipelineEvent::StateChanged {
                 state: self.state.clone(),
             });
-            let _ = event_tx.send(PipelineEvent::EditorStarted);
+            // EditorStarted 由 run_editor_and_commit 统一发射（此前双发会重置前端已流式的编剧输出）。
 
             let (final_text, provenance) = self
                 .run_editor_and_commit(
@@ -2625,7 +2625,7 @@ impl PipelineOrchestrator {
             let _ = event_tx.send(PipelineEvent::StateChanged {
                 state: self.state.clone(),
             });
-            let _ = event_tx.send(PipelineEvent::EditorStarted);
+            // EditorStarted 由 run_editor_and_commit 统一发射（此前双发会重置前端已流式的编剧输出）。
 
             let (final_text, provenance) = self
                 .run_editor_and_commit(
@@ -5380,6 +5380,45 @@ mod tests {
         );
         // active 切到新 variant
         assert_eq!(node_after.active_variant, node_after.variants.len() - 1);
+
+        let _ = std::fs::remove_dir_all(&conv_dir);
+    }
+
+    /// Batch 2.6 契约：regenerate editor-only（路径 B）的 EditorStarted 事件只发一次。
+    ///
+    /// 改动前：路径 B 在调 run_editor_and_commit 前先发一次 EditorStarted，
+    /// helper 内部又发一次（双发）；前端 editor_started 处理会重置 editor.output，
+    /// 双发会清掉已经开始流式的编剧输出。
+    #[tokio::test]
+    async fn test_regenerate_editor_only_emits_editor_started_once() {
+        let (mut orchestrator, _conv_store, conv_id, node_id, conv_dir) =
+            setup_with_first_draft().await;
+
+        let req = RegenerateRequest {
+            conversation_id: conv_id.clone(),
+            node_id: node_id.clone(),
+            targets: vec![PartialRollTarget::Editor],
+            generation_mode: None,
+            hint: None,
+            seed: None,
+        };
+        let ctx = WritingContext::legacy(vec![mock_character("Seraphina")], None, conv_id.clone());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let result = orchestrator
+            .regenerate(req, &ctx, event_tx, cancel_rx)
+            .await;
+        assert!(result.is_ok(), "重 roll 编剧应成功: {:?}", result.err());
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let editor_started_count = events
+            .iter()
+            .filter(|event| matches!(event, PipelineEvent::EditorStarted))
+            .count();
+        assert_eq!(
+            editor_started_count, 1,
+            "EditorStarted 应只发一次（实际 {editor_started_count} 次）：双发会重置前端已流式的编剧输出"
+        );
 
         let _ = std::fs::remove_dir_all(&conv_dir);
     }
