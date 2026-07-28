@@ -1664,6 +1664,101 @@ mod tests {
         GenerationMode, GenerationRouteDecision, GenerationRouteReason,
     };
 
+    #[tokio::test]
+    async fn frontend_prompt_hook_round_trips_messages_through_pending_reply() {
+        use std::sync::Mutex;
+        use storyforge_domain::agent::AgentRole;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let hook = frontend_prompt_hook(event_tx, pending.clone());
+        let original = vec![ChatMessage::user("before hook")];
+
+        let hook_task = tokio::spawn(hook(PromptHookContext {
+            role: AgentRole::Editor,
+            round: 1,
+            model: "test-model".into(),
+            messages: original.clone(),
+        }));
+
+        let event = event_rx.recv().await.expect("hook should emit request");
+        let request_id = match event {
+            PipelineEvent::PromptHookRequest {
+                request_id,
+                role,
+                round,
+                model,
+                messages,
+            } => {
+                assert_eq!(role, AgentRole::Editor);
+                assert_eq!(round, 1);
+                assert_eq!(model, "test-model");
+                assert_eq!(messages[0].content, "before hook");
+                request_id
+            }
+            other => panic!("expected prompt hook request, got {other:?}"),
+        };
+
+        let sender = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&request_id)
+            .expect("pending reply sender should be registered");
+        sender
+            .send(PromptHookReply {
+                messages: Some(vec![
+                    ChatMessage::system("plugin system"),
+                    ChatMessage::user("after hook"),
+                ]),
+                error: None,
+            })
+            .unwrap();
+
+        let hooked = hook_task.await.unwrap().unwrap();
+        assert_eq!(hooked.len(), 2);
+        assert_eq!(hooked[0].content, "plugin system");
+        assert_eq!(hooked[1].content, "after hook");
+    }
+
+    #[tokio::test]
+    async fn frontend_prompt_hook_cleans_pending_request_when_cancelled() {
+        use std::sync::Mutex;
+        use storyforge_domain::agent::AgentRole;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
+        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let hook = frontend_prompt_hook(event_tx, pending.clone());
+
+        let hook_task = tokio::spawn(hook(PromptHookContext {
+            role: AgentRole::Editor,
+            round: 1,
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("before hook")],
+        }));
+
+        let event = event_rx.recv().await.expect("hook should emit request");
+        let request_id = match event {
+            PipelineEvent::PromptHookRequest { request_id, .. } => request_id,
+            other => panic!("expected prompt hook request, got {other:?}"),
+        };
+        assert!(
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&request_id)
+        );
+
+        hook_task.abort();
+        let _ = hook_task.await;
+
+        assert!(
+            !pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&request_id)
+        );
+    }
+
     #[test]
     fn automatic_route_promotes_large_roster_to_sequential_crew() {
         let actors = ["林秋", "陈默", "周岚", "守门人"]
@@ -1747,5 +1842,48 @@ mod tests {
         ] {
             enforce_generation_cost_confirmation(&decision).unwrap();
         }
+    }
+
+    #[test]
+    fn postprocess_task_update_skips_other_campaign() {
+        use storyforge_domain::story_task::{StoryTask, TaskStatus};
+
+        let task = StoryTask::user_planned(
+            Id::from_str("campaign-b"),
+            "Find the archive",
+            "Unrelated campaign task",
+            vec![],
+            1,
+        );
+
+        assert!(
+            normalize_task_update_for_postprocess(
+                &Id::from_str("campaign-a"),
+                task,
+                TaskStatus::Completed,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn postprocess_task_update_allows_current_campaign() {
+        use storyforge_domain::story_task::{StoryTask, TaskStatus};
+
+        let task = StoryTask::user_planned(
+            Id::from_str("campaign-a"),
+            "Find the archive",
+            "Current campaign task",
+            vec![],
+            1,
+        );
+
+        let updated = normalize_task_update_for_postprocess(
+            &Id::from_str("campaign-a"),
+            task,
+            TaskStatus::Completed,
+        )
+        .expect("same campaign task should update");
+        assert_eq!(updated.status, TaskStatus::Completed);
     }
 }

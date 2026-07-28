@@ -428,23 +428,122 @@ impl CampaignStore {
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         let mut summaries = self.summaries.lock().unwrap_or_else(|p| p.into_inner());
 
-        let before = campaigns.len();
-        campaigns.retain(|c| c.id != *id);
-        let changed = campaigns.len() != before;
-        if changed {
-            persist(&self.campaigns_path, &campaigns)?;
-            // 级联删除 instances + knowledge + tasks + round_summaries + 本局世界书
-            instances.retain(|i| i.campaign_id != *id);
-            persist(&self.instances_path, &instances)?;
-            knowledge.retain(|k| k.campaign_id != *id);
-            persist(&self.knowledge_path, &knowledge)?;
-            tasks.retain(|t| t.campaign_id != *id);
-            persist(&self.tasks_path, &tasks)?;
-            summaries.retain(|s| s.campaign_id != *id);
-            persist(&self.summaries_path, &summaries)?;
-            self.delete_world_info_file(id);
+        let changed = campaigns.iter().any(|campaign| campaign.id == *id);
+        if !changed {
+            return Ok(false);
         }
-        Ok(changed)
+
+        let next_campaigns: Vec<_> = campaigns
+            .iter()
+            .filter(|campaign| campaign.id != *id)
+            .cloned()
+            .collect();
+        let next_instances: Vec<_> = instances
+            .iter()
+            .filter(|instance| instance.campaign_id != *id)
+            .cloned()
+            .collect();
+        let next_knowledge: Vec<_> = knowledge
+            .iter()
+            .filter(|entry| entry.campaign_id != *id)
+            .cloned()
+            .collect();
+        let next_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.campaign_id != *id)
+            .cloned()
+            .collect();
+        let next_summaries: Vec<_> = summaries
+            .iter()
+            .filter(|summary| summary.campaign_id != *id)
+            .cloned()
+            .collect();
+
+        // Persist all JSON files before mutating any in-memory cache. If a later
+        // file fails, restore every file already written so deletion remains
+        // retryable instead of leaving a half-deleted aggregate.
+        let original_campaigns_file = self.campaigns_path.is_file();
+        let original_instances_file = self.instances_path.is_file();
+        let original_knowledge_file = self.knowledge_path.is_file();
+        let original_tasks_file = self.tasks_path.is_file();
+        let original_summaries_file = self.summaries_path.is_file();
+        let world_info_path = self.world_info_path(id);
+        let original_world_info = if world_info_path.is_file() {
+            Some(
+                std::fs::read_to_string(&world_info_path)
+                    .map_err(|error| format!("读取本局世界书以备删除回滚失败: {error}"))?,
+            )
+        } else {
+            None
+        };
+
+        let write_result = (|| {
+            persist(&self.campaigns_path, &next_campaigns)?;
+            persist(&self.instances_path, &next_instances)?;
+            persist(&self.knowledge_path, &next_knowledge)?;
+            persist(&self.tasks_path, &next_tasks)?;
+            persist(&self.summaries_path, &next_summaries)?;
+            if world_info_path.exists() {
+                if !world_info_path.is_file() {
+                    return Err(format!(
+                        "本局世界书路径不是普通文件，拒绝删除: {}",
+                        world_info_path.display()
+                    ));
+                }
+                std::fs::remove_file(&world_info_path)
+                    .map_err(|error| format!("删除本局世界书失败: {error}"))?;
+            }
+            Ok::<(), String>(())
+        })();
+
+        if let Err(error) = write_result {
+            let mut rollback_errors = Vec::new();
+            macro_rules! restore {
+                ($path:expr, $existed:expr, $original:expr) => {
+                    if let Err(rollback_error) = restore_json_file($path, $existed, $original) {
+                        rollback_errors.push(rollback_error);
+                    }
+                };
+            }
+            restore!(&self.campaigns_path, original_campaigns_file, &campaigns);
+            restore!(&self.instances_path, original_instances_file, &instances);
+            restore!(&self.knowledge_path, original_knowledge_file, &knowledge);
+            restore!(&self.tasks_path, original_tasks_file, &tasks);
+            restore!(&self.summaries_path, original_summaries_file, &summaries);
+            if let Some(raw) = original_world_info {
+                if let Err(rollback_error) =
+                    storyforge_infra_util::atomic_write_json_str(&world_info_path, &raw)
+                {
+                    rollback_errors.push(format!(
+                        "恢复本局世界书失败 {}: {rollback_error}",
+                        world_info_path.display()
+                    ));
+                }
+            } else if let Err(rollback_error) = remove_path_if_present(&world_info_path) {
+                rollback_errors.push(rollback_error);
+            }
+
+            return if rollback_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; 删除回滚也失败，数据需要恢复: {}",
+                    rollback_errors.join("; ")
+                ))
+            };
+        }
+
+        *campaigns = next_campaigns;
+        *instances = next_instances;
+        *knowledge = next_knowledge;
+        *tasks = next_tasks;
+        *summaries = next_summaries;
+        self.world_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id.as_str());
+
+        Ok(true)
     }
 
     // ─── Campaign 本局世界书（卡模板只读；活动可写）──────────────────────
@@ -491,16 +590,6 @@ impl CampaignStore {
             .map_err(|e| format!("persist campaign world_info failed: {e}"))?;
         map.insert(campaign_id.as_str().to_string(), book.clone());
         Ok((result, book))
-    }
-
-    fn delete_world_info_file(&self, campaign_id: &Id) {
-        let path = self.world_info_path(campaign_id);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        if let Ok(mut map) = self.world_info.lock() {
-            map.remove(campaign_id.as_str());
-        }
     }
 
     /// 读取本局世界书。文件不存在返回空书（调用方应 ensure/copy）。
@@ -1215,6 +1304,30 @@ pub(crate) fn persist<T: serde::Serialize>(path: &Path, data: &[T]) -> Result<()
     })
 }
 
+fn restore_json_file<T: serde::Serialize>(
+    path: &Path,
+    existed: bool,
+    data: &[T],
+) -> Result<(), String> {
+    if existed {
+        persist(path, data)
+    } else {
+        remove_path_if_present(path)
+    }
+}
+
+fn remove_path_if_present(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+            .map_err(|error| format!("删除回滚路径失败 {}: {error}", path.display()))
+    } else if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("删除回滚文件失败 {}: {error}", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
 fn empty_world_info_book() -> WorldInfoBook {
     WorldInfoBook {
         entries: Vec::new(),
@@ -1411,6 +1524,33 @@ mod tests {
         assert!(!store.world_info_path(&camp_id).exists());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_campaign_rolls_back_all_json_files_when_a_cascade_write_fails() {
+        let dir = temp_dir();
+        let store = CampaignStore::new(&dir);
+        let campaign = Campaign::new(Id::from_str("rollback-campaign"), "rollback");
+        let campaign_id = campaign.id.clone();
+        store.save_campaign(campaign.clone()).unwrap();
+        let instance = CharacterInstance::temporary(campaign_id.clone(), "Lin");
+        store.add_instance(instance.clone()).unwrap();
+
+        // A directory at the target path makes the knowledge write fail after
+        // campaigns and instances have already been persisted.
+        std::fs::create_dir(&store.knowledge_path).unwrap();
+        let error = store
+            .delete_campaign(&campaign_id)
+            .expect_err("cascade write failure should be surfaced");
+        assert!(error.contains("持久化失败"));
+        assert!(store.get_campaign(&campaign_id).is_some());
+        assert_eq!(store.list_instances(&campaign_id).len(), 1);
+
+        let reloaded = CampaignStore::new(&dir);
+        assert!(reloaded.get_campaign(&campaign_id).is_some());
+        assert_eq!(reloaded.list_instances(&campaign_id).len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -772,9 +772,13 @@ where
         let mut errors = Vec::new();
         // Always compensate known ids: a store method can mutate its cache before a
         // persistence error is returned, so a success flag alone is insufficient.
-        if let Err(e) = store.delete_campaign(&new_campaign_id) {
-            errors.push(format!("delete_campaign: {e}"));
-        }
+        // CampaignStore now restores its own files when a cascade write fails. Keep
+        // the returned error as diagnostic context, but only classify it as a
+        // rollback failure if the snapshot checks below prove compensation failed.
+        let delete_campaign_error = store
+            .delete_campaign(&new_campaign_id)
+            .err()
+            .map(|error| format!("delete_campaign: {error}"));
         if let Err(e) = store.delete_card(&new_card_id) {
             errors.push(format!("delete_card: {e}"));
         }
@@ -808,6 +812,11 @@ where
                 }
             }
             None => errors.push("rollback verification: CampaignStore has no data_dir".into()),
+        }
+        if !errors.is_empty() {
+            if let Some(error) = delete_campaign_error {
+                errors.insert(0, error);
+            }
         }
         if errors.is_empty() {
             Ok(())

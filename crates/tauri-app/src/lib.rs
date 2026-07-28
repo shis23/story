@@ -5260,63 +5260,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frontend_prompt_hook_round_trips_messages_through_pending_reply() {
-        use storyforge_app_agent::runtime::PromptHookContext;
-        use storyforge_domain::agent::AgentRole;
-        use storyforge_domain::llm::ChatMessage;
-
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
-        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let hook = frontend_prompt_hook(event_tx, pending.clone());
-        let original = vec![ChatMessage::user("before hook")];
-
-        let hook_task = tokio::spawn(hook(PromptHookContext {
-            role: AgentRole::Editor,
-            round: 1,
-            model: "test-model".into(),
-            messages: original.clone(),
-        }));
-
-        let event = event_rx.recv().await.expect("hook should emit request");
-        let request_id = match event {
-            PipelineEvent::PromptHookRequest {
-                request_id,
-                role,
-                round,
-                model,
-                messages,
-            } => {
-                assert_eq!(role, AgentRole::Editor);
-                assert_eq!(round, 1);
-                assert_eq!(model, "test-model");
-                assert_eq!(messages[0].content, "before hook");
-                request_id
-            }
-            other => panic!("expected prompt hook request, got {other:?}"),
-        };
-
-        let sender = pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&request_id)
-            .expect("pending reply sender should be registered");
-        sender
-            .send(PromptHookReply {
-                messages: Some(vec![
-                    ChatMessage::system("plugin system"),
-                    ChatMessage::user("after hook"),
-                ]),
-                error: None,
-            })
-            .unwrap();
-
-        let hooked = hook_task.await.unwrap().unwrap();
-        assert_eq!(hooked.len(), 2);
-        assert_eq!(hooked[0].content, "plugin system");
-        assert_eq!(hooked[1].content, "after hook");
-    }
-
-    #[tokio::test]
     async fn start_writing_command_prompt_hook_messages_reach_mock_llm() {
         let marker = "START_WRITING_COMMAND_HOOK_MARKER";
         let llm = Arc::new(RecordingMockLlm::new(vec![
@@ -5398,46 +5341,6 @@ mod tests {
         assert!(
             any_recorded_request_contains_marker(&llm, regenerate_marker),
             "mock LLM should receive marker appended by regenerate command prompt hook"
-        );
-    }
-
-    #[tokio::test]
-    async fn frontend_prompt_hook_cleans_pending_request_when_cancelled() {
-        use storyforge_app_agent::runtime::PromptHookContext;
-        use storyforge_domain::agent::AgentRole;
-        use storyforge_domain::llm::ChatMessage;
-
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PipelineEvent>();
-        let pending: PromptHookPendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let hook = frontend_prompt_hook(event_tx, pending.clone());
-
-        let hook_task = tokio::spawn(hook(PromptHookContext {
-            role: AgentRole::Editor,
-            round: 1,
-            model: "test-model".into(),
-            messages: vec![ChatMessage::user("before hook")],
-        }));
-
-        let event = event_rx.recv().await.expect("hook should emit request");
-        let request_id = match event {
-            PipelineEvent::PromptHookRequest { request_id, .. } => request_id,
-            other => panic!("expected prompt hook request, got {other:?}"),
-        };
-        assert!(
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&request_id)
-        );
-
-        hook_task.abort();
-        let _ = hook_task.await;
-
-        assert!(
-            !pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&request_id)
         );
     }
 
@@ -7247,8 +7150,8 @@ mod tests {
             other => panic!("expected storage error, got {other:?}"),
         };
         assert!(
-            message.contains("strict disk read failed") && message.contains("instances.json"),
-            "rollback verification must report unreadable disk state: {message}"
+            message.contains("导入角色实例失败") && !message.contains("回滚未完全验证"),
+            "rollback verification should preserve the original import error after compensation: {message}"
         );
 
         // Reload store from disk — in-memory empty is not enough.
@@ -10172,49 +10075,6 @@ mod tests {
         assert!(matches!(err, TauriCommandError::NotFound { .. }));
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_postprocess_task_update_skips_other_campaign() {
-        use storyforge_domain::story_task::{StoryTask, TaskStatus};
-
-        let task = StoryTask::user_planned(
-            Id::from_str("campaign-b"),
-            "Find the archive",
-            "Unrelated campaign task",
-            vec![],
-            1,
-        );
-
-        let updated = normalize_task_update_for_postprocess(
-            &Id::from_str("campaign-a"),
-            task,
-            TaskStatus::Completed,
-        );
-
-        assert!(updated.is_none());
-    }
-
-    #[test]
-    fn test_postprocess_task_update_allows_current_campaign() {
-        use storyforge_domain::story_task::{StoryTask, TaskStatus};
-
-        let task = StoryTask::user_planned(
-            Id::from_str("campaign-a"),
-            "Find the archive",
-            "Current campaign task",
-            vec![],
-            1,
-        );
-
-        let updated = normalize_task_update_for_postprocess(
-            &Id::from_str("campaign-a"),
-            task,
-            TaskStatus::Completed,
-        )
-        .expect("same campaign task should update");
-
-        assert_eq!(updated.status, TaskStatus::Completed);
     }
 
     #[test]
