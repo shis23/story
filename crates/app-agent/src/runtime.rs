@@ -18,7 +18,8 @@ use storyforge_domain::llm::{
     ToolSpec,
 };
 use storyforge_domain::message_layout::{
-    MessageLayout, PROMPT_LAYOUT_VERSION, fingerprint_messages, messages_segment_summary,
+    MessageLayout, PROMPT_LAYOUT_VERSION, SegmentFingerprint, fingerprint_messages,
+    messages_segment_summary,
 };
 use storyforge_infra_llm::LlmClient;
 
@@ -272,6 +273,9 @@ impl AgentRuntime {
 
     /// 运行工具循环（对应 TT 的 run_tool_loop）
     ///
+    /// 非流式版：LLM 调用走 `chat()`（带手写 cancel select）。供 chronicle compressor、
+    /// postprocess、summarizer、mvu import 等**无前端实时显示**的后台 agent 使用。
+    ///
     /// 流程：
     /// 1. 构造初始请求（system prompt + 用户消息）
     /// 2. 循环：调 LLM → 检查 tool_calls → 执行工具 → 追加结果 → 继续
@@ -288,123 +292,17 @@ impl AgentRuntime {
     ) -> Result<ChatResponse, AgentError> {
         let mut messages = vec![ChatMessage::system(&config.system_prompt)];
         messages.push(ChatMessage::user(&user_message));
-        let mut captured_reasoning = Vec::new();
-
-        for round in 1..=config.max_tool_rounds {
-            // 检查取消
-            if *cancel.borrow() {
-                info!(target: "app-agent", "{}: 第 {round} 轮前取消", config.role);
-                return Err(AgentError::Cancelled);
-            }
-
-            debug!(target: "app-agent", "{}: 第 {round}/{max} 轮",
-                config.role, max = config.max_tool_rounds);
-
-            let request_messages = self
-                .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
-                .await?;
-            log_request_observability(&config.role, round, &request_messages, "");
-
-            let req = ChatRequest {
-                messages: request_messages,
-                tools: if tool_registry.tool_specs().is_empty() {
-                    None
-                } else {
-                    Some(tool_registry.tool_specs())
-                },
-                // max_tokens 不设（None）：让模型/endpoint 用自己的默认 output 上限。
-                // 硬编码 4096 会导致大 input 任务（角色抽取等）output 空间不足返回空。
-                // A1：reasoning 模式由 sampling_override 透传（若 pipeline 注入了连接参数）。
-                params: self.build_params(),
-                model: config.model.clone(),
-            };
-
-            // 调 LLM（可取消）
-            let cancel_fut = {
-                let mut cancel = cancel.clone();
-                async move {
-                    let _ = cancel.wait_for(|&c| c).await;
-                }
-            };
-            let resp = tokio::select! {
-                result = self.llm.chat(&req) => result.map_err(AgentError::Llm)?,
-                _ = cancel_fut => return Err(AgentError::Cancelled),
-            };
-            log_usage_observability(&config.role, round, &resp, "");
-            capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
-
-            // 没有工具调用 = 模型直接输出文本
-            if resp.tool_calls.is_empty() {
-                // drift recovery：如果还有工具可用，提醒模型使用工具
-                if !resp.content.is_empty()
-                    && round < config.max_tool_rounds
-                    && !tool_registry.tool_specs().is_empty()
-                {
-                    // 检查是否是最终输出（没有工具定义时直接返回）
-                    if req.tools.is_none() {
-                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
-                    }
-
-                    // drift recovery：注入提醒
-                    warn!(target: "app-agent", "{}: 第 {round} 轮模型未调用工具，注入 reminder", config.role);
-                    messages.push(ChatMessage::assistant(&resp.content));
-                    messages.push(ChatMessage::user(
-                        "请继续使用工具完成任务。如果你已经完成，请直接输出最终结果。",
-                    ));
-                    continue;
-                }
-
-                // 没有内容也没有工具调用 = 空响应
-                if resp.content.is_empty() {
-                    warn!(target: "app-agent", "{}: 第 {round} 轮空响应", config.role);
-                    if round >= config.max_tool_rounds {
-                        return Err(AgentError::MaxRoundsExceeded);
-                    }
-                    messages.push(ChatMessage::user("请输出内容或调用工具。"));
-                    continue;
-                }
-
-                // 有内容 = 最终输出
-                info!(target: "app-agent", "{}: 第 {round} 轮完成，content_len={}", 
-                    config.role, resp.content.len());
-                return Ok(with_captured_reasoning(resp, &captured_reasoning));
-            }
-
-            // 有工具调用 → 执行
-            debug!(target: "app-agent", "{}: 第 {round} 轮调用 {} 个工具",
-                config.role, resp.tool_calls.len());
-
-            // 追加 assistant 消息（含 tool_calls）
-            messages.push(ChatMessage {
-                role: storyforge_domain::llm::ChatRole::Assistant,
-                content: resp.content.clone(),
-                tool_calls: Some(resp.tool_calls.clone()),
-                tool_call_id: None,
-            });
-
-            // 执行每个工具调用
-            let mut successful_terminal_tool = false;
-            for tc in &resp.tool_calls {
-                let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
-                if config.terminal_tools.contains(&tc.function.name)
-                    && tool_result_succeeded(&result_str)
-                {
-                    successful_terminal_tool = true;
-                }
-                messages.push(ChatMessage::tool_result(&tc.id, &result_str));
-            }
-
-            // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
-            if successful_terminal_tool {
-                info!(target: "app-agent", "{}: 第 {round} 轮调用了终止工具，立即返回",
-                    config.role);
-                return Ok(with_captured_reasoning(resp, &captured_reasoning));
-            }
-        }
-
-        error!(target: "app-agent", "{}: 超过最大轮次 {max}",
-            config.role, max = config.max_tool_rounds);
-        Err(AgentError::MaxRoundsExceeded)
+        self.run_tool_loop_core(
+            config,
+            messages,
+            tool_registry,
+            cancel,
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// 流式版工具循环（导演/编剧用，把输出 token 实时推给上层）
@@ -428,148 +326,25 @@ impl AgentRuntime {
     ) -> Result<ChatResponse, AgentError> {
         let mut messages = vec![ChatMessage::system(&config.system_prompt)];
         messages.push(ChatMessage::user(&user_message));
-        let mut captured_reasoning = Vec::new();
-
-        for round in 1..=config.max_tool_rounds {
-            if *cancel.borrow() {
-                info!(target: "app-agent", "{}: 第 {round} 轮前取消", config.role);
-                return Err(AgentError::Cancelled);
-            }
-
-            debug!(target: "app-agent", "{}[stream]: 第 {round}/{max} 轮",
-                config.role, max = config.max_tool_rounds);
-
-            let request_messages = self
-                .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
-                .await?;
-            log_request_observability(&config.role, round, &request_messages, "[stream]");
-
-            let req = ChatRequest {
-                messages: request_messages,
-                tools: if tool_registry.tool_specs().is_empty() {
-                    None
-                } else {
-                    Some(tool_registry.tool_specs())
-                },
-                // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
-                // A1：reasoning 模式由 sampling_override 透传
-                params: self.build_params(),
-                model: config.model.clone(),
-            };
-
-            // 流式调用：每个 delta_content 推给 progress_tx
-            let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<StreamChunk>();
-            let stream_fut = self.llm.chat_stream(&req, stream_tx, cancel.clone());
-            let forward_fut = async {
-                while let Some(chunk) = stream_rx.recv().await {
-                    if let Some(delta) = chunk.delta_content {
-                        let _ = progress_tx.send(delta);
-                    }
-                }
-            };
-            let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
-            let resp = resp_res.map_err(AgentError::Llm)?;
-            log_usage_observability(&config.role, round, &resp, "[stream]");
-            capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
-
-            // 没有工具调用 = 模型直接输出文本（最终输出）
-            if resp.tool_calls.is_empty() {
-                // 无可用工具 = 直接返回
-                if tool_registry.tool_specs().is_empty() {
-                    if resp.content.is_empty() && round >= config.max_tool_rounds {
-                        return Err(AgentError::MaxRoundsExceeded);
-                    }
-                    if !resp.content.is_empty() {
-                        info!(target: "app-agent", "{}[stream]: 第 {round} 轮完成，content_len={}",
-                            config.role, resp.content.len());
-                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
-                    }
-                    messages.push(ChatMessage::user("请输出内容。"));
-                    continue;
-                }
-
-                // drift recovery：有可用工具但模型没调
-                if !resp.content.is_empty() && round < config.max_tool_rounds {
-                    // 提早终止：如果 content 已是"最终结果"（探测回调返回 true），立即返回，
-                    // 不再注入 reminder（避免把已完成的输出逼进死循环）。
-                    if let Some(probe) = completion_probe
-                        && probe(&resp.content)
-                    {
-                        info!(target: "app-agent", "{}[stream]: 第 {round} 轮探测到最终结果，提早终止", config.role);
-                        return Ok(with_captured_reasoning(resp, &captured_reasoning));
-                    }
-                    warn!(target: "app-agent", "{}[stream]: 第 {round} 轮未调工具，注入 reminder", config.role);
-                    messages.push(ChatMessage::assistant(&resp.content));
-                    messages.push(ChatMessage::user(
-                        "请继续使用工具完成任务。如果你已经完成，请直接输出最终结果。",
-                    ));
-                    continue;
-                }
-
-                if resp.content.is_empty() {
-                    warn!(target: "app-agent", "{}[stream]: 第 {round} 轮空响应", config.role);
-                    if round >= config.max_tool_rounds {
-                        return Err(AgentError::MaxRoundsExceeded);
-                    }
-                    messages.push(ChatMessage::user("请输出内容或调用工具。"));
-                    continue;
-                }
-
-                info!(target: "app-agent", "{}[stream]: 第 {round} 轮完成，content_len={}",
-                    config.role, resp.content.len());
-                return Ok(with_captured_reasoning(resp, &captured_reasoning));
-            }
-
-            // 有工具调用 → 执行（同 run_tool_loop）
-            debug!(target: "app-agent", "{}[stream]: 第 {round} 轮调用 {} 个工具",
-                config.role, resp.tool_calls.len());
-
-            messages.push(ChatMessage {
-                role: storyforge_domain::llm::ChatRole::Assistant,
-                content: resp.content.clone(),
-                tool_calls: Some(resp.tool_calls.clone()),
-                tool_call_id: None,
-            });
-
-            let mut successful_terminal_tool = false;
-            for tc in &resp.tool_calls {
-                let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
-                if config.terminal_tools.contains(&tc.function.name)
-                    && tool_result_succeeded(&result_str)
-                {
-                    successful_terminal_tool = true;
-                }
-                messages.push(ChatMessage::tool_result(&tc.id, &result_str));
-            }
-
-            // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
-            if successful_terminal_tool {
-                info!(target: "app-agent", "{}[stream]: 第 {round} 轮调用了终止工具，立即返回",
-                    config.role);
-                return Ok(with_captured_reasoning(resp, &captured_reasoning));
-            }
-        }
-
-        error!(target: "app-agent", "{}[stream]: 超过最大轮次 {max}",
-            config.role, max = config.max_tool_rounds);
-        Err(AgentError::MaxRoundsExceeded)
+        self.run_tool_loop_core(
+            config,
+            messages,
+            tool_registry,
+            cancel,
+            "[stream]",
+            Some(&progress_tx),
+            completion_probe,
+            None,
+        )
+        .await
     }
 
-    /// 流式工具循环（cache 友好布局版，§22 / D46）
+    /// Layout 版工具循环（导演/编剧/子agent 用，初始 messages 来自 MessageLayout）
     ///
-    /// 与 `run_tool_loop_streaming` 逻辑相同，唯一区别：初始 messages 来自
-    /// `layout.into_messages()`（即 `[system, history..., tail]`），而非 `[system, user]`。
-    ///
-    /// 让导演/编剧/子 Agent 能把稳定内容（role_directive + 模块 + 蓝灯世界设定 +
-    /// 子 Agent persona）进 system 段、对话历史进 history 段（独立消息）、易变内容
-    /// （意图/变量/时钟/任务/场景）压尾，最大化 LLM KV cache 命中率。
-    ///
-    /// 工具调用轮次里追加的 assistant/tool_result 消息进 history 之后（末尾），
-    /// 不影响前缀稳定——前缀 system+history 跨轮 byte 一致即可 cache 命中。
-    ///
-    /// 注意：`config.system_prompt` 此处**不使用**（system 段已由 layout.stable_system
-    /// 提供，调用方应保证两者一致或 layout 优先）。保留 config 参数是为复用
-    /// max_tool_rounds/model/tools 等字段。
+    /// 和 `run_tool_loop_streaming` 逻辑相同，但初始 messages 由 `MessageLayout` 组装
+    /// （system + history + tail 三段），而非简单的 [system, user]。
+    /// layout 版还记录 round1 的 segment-diff（用于缓存命中解释）。
+    /// `config.system_prompt` 在 layout 版中被忽略（system 段来自 `layout.stable_system`）。
     pub async fn run_tool_loop_with_layout(
         &self,
         config: &AgentConfig,
@@ -587,77 +362,136 @@ impl AgentRuntime {
             config.role,
             pre_hook_segs.short_label()
         );
-        let mut messages = layout.into_messages();
+        let messages = layout.into_messages();
+        self.run_tool_loop_core(
+            config,
+            messages,
+            tool_registry,
+            cancel,
+            "[layout]",
+            Some(&progress_tx),
+            completion_probe,
+            Some(&pre_hook_segs),
+        )
+        .await
+    }
+
+    /// 单一权威工具循环核心（Gate 2 Batch 2.5）。
+    ///
+    /// `run_tool_loop` / `run_tool_loop_streaming` / `run_tool_loop_with_layout` 三者
+    /// 只是消息来源、LLM 调用方式（流式与否）、进度转发、完成探测与 layout 诊断不同；
+    /// 循环骨架（cancel 检查 → prompt hook → ChatRequest → LLM → drift recovery →
+    /// 工具执行 → 终止判定）完全一致，只此一份实现。
+    ///
+    /// 参数：
+    /// - `messages`：初始消息序列（plain/streaming 为 [system, user]；layout 为三段）。
+    /// - `log_tag`：日志后缀（`""` / `"[stream]"` / `"[layout]"`）。
+    /// - `progress_tx`：`Some` 时走流式 `chat_stream` 并转发 delta；`None` 时走非流式 `chat`。
+    /// - `completion_probe`：drift recovery 时的提早终止探测（plain 版传 None）。
+    /// - `pre_hook_segs`：layout 版的 round1 segment-diff 诊断（其他版传 None）。
+    #[allow(clippy::too_many_arguments)] // 单一权威循环核心：8 个参数是三版差异面的自然投影
+    async fn run_tool_loop_core(
+        &self,
+        config: &AgentConfig,
+        messages: Vec<ChatMessage>,
+        tool_registry: &ToolRegistry,
+        cancel: watch::Receiver<bool>,
+        log_tag: &str,
+        progress_tx: Option<&mpsc::UnboundedSender<String>>,
+        completion_probe: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+        pre_hook_segs: Option<&SegmentFingerprint>,
+    ) -> Result<ChatResponse, AgentError> {
+        let streaming = progress_tx.is_some();
         let rounds = config.max_tool_rounds;
+        let mut messages = messages;
         let mut captured_reasoning = Vec::new();
 
         for round in 1..=rounds {
+            // 检查取消
             if *cancel.borrow() {
-                info!(target: "app-agent", "{}[layout]: 第 {round} 轮前取消", config.role);
+                info!(target: "app-agent", "{}{tag}: 第 {round} 轮前取消", config.role, tag = log_tag);
                 return Err(AgentError::Cancelled);
             }
 
-            debug!(target: "app-agent", "{}[layout]: 第 {round}/{max} 轮",
-                config.role, max = rounds);
+            debug!(target: "app-agent", "{}{tag}: 第 {round}/{max} 轮",
+                config.role, max = rounds, tag = log_tag);
 
             let request_messages = self
                 .apply_prompt_hook_with_cancel(config, round, messages.clone(), cancel.clone())
                 .await?;
-            // round1：对比 hook 前后 system/history 是否被改写（缓存解释）
-            if round == 1 {
+            // layout 版 round1：对比 hook 前后 system/history 是否被改写（缓存解释）
+            if round == 1
+                && let Some(pre) = pre_hook_segs
+            {
                 let post = messages_segment_summary(&request_messages);
-                if post.system_hash != pre_hook_segs.system_hash
-                    || post.history_hash != pre_hook_segs.history_hash
-                {
+                if post.system_hash != pre.system_hash || post.history_hash != pre.history_hash {
                     info!(
                         target: "app-agent",
-                        "{}[layout]: prompt hook changed stable prefix pre={} post={}",
+                        "{}{tag}: prompt hook changed stable prefix pre={} post={}",
                         config.role,
-                        pre_hook_segs.short_label(),
-                        post.short_label()
+                        pre.short_label(),
+                        post.short_label(),
+                        tag = log_tag
                     );
                 }
             }
-            log_request_observability(&config.role, round, &request_messages, "[layout]");
+            log_request_observability(&config.role, round, &request_messages, log_tag);
 
+            let tools_empty = tool_registry.tool_specs().is_empty();
             let req = ChatRequest {
                 messages: request_messages,
-                tools: if tool_registry.tool_specs().is_empty() {
+                tools: if tools_empty {
                     None
                 } else {
                     Some(tool_registry.tool_specs())
                 },
-                // max_tokens 不设（None），同 run_tool_loop（避免 output 空间不足）
-                // A1：reasoning 模式由 sampling_override 透传
+                // max_tokens 不设（None）：让模型/endpoint 用自己的默认 output 上限。
+                // 硬编码 4096 会导致大 input 任务（角色抽取等）output 空间不足返回空。
+                // A1：reasoning 模式由 sampling_override 透传（若 pipeline 注入了连接参数）。
                 params: self.build_params(),
                 model: config.model.clone(),
             };
 
-            // 流式调用：每个 delta_content 推给 progress_tx
-            let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<StreamChunk>();
-            let stream_fut = self.llm.chat_stream(&req, stream_tx, cancel.clone());
-            let forward_fut = async {
-                while let Some(chunk) = stream_rx.recv().await {
-                    if let Some(delta) = chunk.delta_content {
-                        let _ = progress_tx.send(delta);
+            // 调 LLM：流式走 chat_stream（cancel 内置），非流式走 chat（手写 cancel select）
+            let resp = if streaming {
+                let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<StreamChunk>();
+                let stream_fut = self.llm.chat_stream(&req, stream_tx, cancel.clone());
+                let forward_fut = async {
+                    while let Some(chunk) = stream_rx.recv().await {
+                        if let Some(delta) = chunk.delta_content
+                            && let Some(tx) = progress_tx
+                        {
+                            let _ = tx.send(delta);
+                        }
                     }
+                };
+                let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
+                resp_res.map_err(AgentError::Llm)?
+            } else {
+                let cancel_fut = {
+                    let mut cancel = cancel.clone();
+                    async move {
+                        let _ = cancel.wait_for(|&c| c).await;
+                    }
+                };
+                tokio::select! {
+                    result = self.llm.chat(&req) => result.map_err(AgentError::Llm)?,
+                    _ = cancel_fut => return Err(AgentError::Cancelled),
                 }
             };
-            let (resp_res, _) = tokio::join!(stream_fut, forward_fut);
-            let resp = resp_res.map_err(AgentError::Llm)?;
-            log_usage_observability(&config.role, round, &resp, "[layout]");
+            log_usage_observability(&config.role, round, &resp, log_tag);
             capture_reasoning_round(&mut captured_reasoning, round, &resp)?;
 
             // 没有工具调用 = 模型直接输出文本（最终输出）
             if resp.tool_calls.is_empty() {
-                if tool_registry.tool_specs().is_empty() {
-                    // 无可用工具 = 直接返回
+                // 无可用工具 = 直接返回
+                if tools_empty {
                     if resp.content.is_empty() && round >= rounds {
                         return Err(AgentError::MaxRoundsExceeded);
                     }
                     if !resp.content.is_empty() {
-                        info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
-                            config.role, resp.content.len());
+                        info!(target: "app-agent", "{}{tag}: 第 {round} 轮完成，content_len={}",
+                            config.role, resp.content.len(), tag = log_tag);
                         return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
                     messages.push(ChatMessage::user("请输出内容。"));
@@ -666,13 +500,18 @@ impl AgentRuntime {
 
                 // drift recovery：有可用工具但模型没调
                 if !resp.content.is_empty() && round < rounds {
+                    // 提早终止：如果 content 已是"最终结果"（探测回调返回 true），立即返回，
+                    // 不再注入 reminder（避免把已完成的输出逼进死循环）。
+                    // plain 版（completion_probe=None）不会触发此分支，退化为 drift reminder。
                     if let Some(probe) = completion_probe
                         && probe(&resp.content)
                     {
-                        info!(target: "app-agent", "{}[layout]: 第 {round} 轮探测到最终结果，提早终止", config.role);
+                        info!(target: "app-agent", "{}{tag}: 第 {round} 轮探测到最终结果，提早终止",
+                            config.role, tag = log_tag);
                         return Ok(with_captured_reasoning(resp, &captured_reasoning));
                     }
-                    warn!(target: "app-agent", "{}[layout]: 第 {round} 轮未调工具，注入 reminder", config.role);
+                    warn!(target: "app-agent", "{}{tag}: 第 {round} 轮未调工具，注入 reminder",
+                        config.role, round = round, tag = log_tag);
                     messages.push(ChatMessage::assistant(&resp.content));
                     messages.push(ChatMessage::user(
                         "请继续使用工具完成任务。如果你已经完成，请直接输出最终结果。",
@@ -680,8 +519,10 @@ impl AgentRuntime {
                     continue;
                 }
 
+                // 没有内容也没有工具调用 = 空响应
                 if resp.content.is_empty() {
-                    warn!(target: "app-agent", "{}[layout]: 第 {round} 轮空响应", config.role);
+                    warn!(target: "app-agent", "{}{tag}: 第 {round} 轮空响应",
+                        config.role, round = round, tag = log_tag);
                     if round >= rounds {
                         return Err(AgentError::MaxRoundsExceeded);
                     }
@@ -689,15 +530,17 @@ impl AgentRuntime {
                     continue;
                 }
 
-                info!(target: "app-agent", "{}[layout]: 第 {round} 轮完成，content_len={}",
-                    config.role, resp.content.len());
+                // 有内容 = 最终输出
+                info!(target: "app-agent", "{}{tag}: 第 {round} 轮完成，content_len={}",
+                    config.role, resp.content.len(), tag = log_tag);
                 return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
 
             // 有工具调用 → 执行
-            debug!(target: "app-agent", "{}[layout]: 第 {round} 轮调用 {} 个工具",
-                config.role, resp.tool_calls.len());
+            debug!(target: "app-agent", "{}{tag}: 第 {round} 轮调用 {} 个工具",
+                config.role, resp.tool_calls.len(), tag = log_tag);
 
+            // 追加 assistant 消息（含 tool_calls）
             messages.push(ChatMessage {
                 role: storyforge_domain::llm::ChatRole::Assistant,
                 content: resp.content.clone(),
@@ -705,6 +548,7 @@ impl AgentRuntime {
                 tool_call_id: None,
             });
 
+            // 执行每个工具调用
             let mut successful_terminal_tool = false;
             for tc in &resp.tool_calls {
                 let result_str = execute_tool_call(tc, tool_registry, self.tool_ctx.clone()).await;
@@ -718,14 +562,14 @@ impl AgentRuntime {
 
             // 终止工具只有执行成功才结束；参数/工具错误必须反馈给模型继续修复。
             if successful_terminal_tool {
-                info!(target: "app-agent", "{}[layout]: 第 {round} 轮调用了终止工具，立即返回",
-                    config.role);
+                info!(target: "app-agent", "{}{tag}: 第 {round} 轮调用了终止工具，立即返回",
+                    config.role, tag = log_tag);
                 return Ok(with_captured_reasoning(resp, &captured_reasoning));
             }
         }
 
-        error!(target: "app-agent", "{}[layout]: 超过最大轮次 {max}",
-            config.role, max = rounds);
+        error!(target: "app-agent", "{}{tag}: 超过最大轮次 {max}",
+            config.role, max = rounds, tag = log_tag);
         Err(AgentError::MaxRoundsExceeded)
     }
 }
