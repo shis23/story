@@ -26,3 +26,7 @@ test('Gate 0 records the expected SQLite branch surface', () => {
 test('Gate 1 keeps concrete Tauri commands out of lib.rs', () => {
   assert.equal((libSource.match(/#\[tauri::command\]/g) ?? []).length, 0)
 })
+
+test('Gate 1 keeps lib.rs within the bootstrap boundary', () => {
+  assert.ok(libSource.split(/\r?\n/).length <= 2500)
+})
