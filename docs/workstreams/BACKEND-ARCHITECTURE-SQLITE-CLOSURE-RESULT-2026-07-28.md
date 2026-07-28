@@ -209,3 +209,10 @@ Gate 0 的保护网代码、测试隔离、合同测试和完整确定性门禁�
 - `node --test frontend/tests/tauri-command-contract.test.mjs`：3 passed / 0 failed。
 - `node scripts/architecture/backend-baseline.mjs`：command attributes 175、registered 175、frontend missing 0、SQLite active references 68。
 - 子批提交：`168ce32 refactor(tauri): split turn operation commands`。
+## 16. Gate 1 Writing 子批结果
+
+- 提交：`79a5b56 refactor(tauri): split writing commands`。
+- 新增 `crates/tauri-app/src/commands/writing.rs`，迁移 start_writing、prompt hook、自动修复、后处理归一化、BackendTurnAttemptSink 与 cancel_writing；根 `lib.rs` 仅保留跨域后处理接线和注册。
+- `lib.rs` 当前 14,721 行；`#[tauri::command]` 175，注册 175，前端唯一 invoke 162，缺失后端命令 0，SQLite active flag references 68。
+- 验证：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）、`node --test frontend/tests/tauri-command-contract.test.mjs`，均通过。
+- 结论：Writing 子批 PASS；Gate 1 总体仍未收口，bootstrap/AppState/注册与 inline tests 仍在 `lib.rs`，Gate 2 状态机、Gate 3 facade、Gate 4–8 SQLite/迁移/平台验收尚未完成。

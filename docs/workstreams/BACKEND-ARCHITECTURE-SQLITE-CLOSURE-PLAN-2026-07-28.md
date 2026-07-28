@@ -606,3 +606,9 @@ docs: seal backend and sqlite closure evidence
 
 Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合域开始机械
 拆分。不要直接从 `start_writing`、Accept 或 SQLite runtime 开刀。
+## 18. 2026-07-28 Writing 子批检查点
+
+- Gate 1 writing 主链机械拆分已完成：新增 `crates/tauri-app/src/commands/writing.rs`，包含 start_writing、prompt hook、quality autofix、后处理归一化与 cancel_writing。
+- 当前 `lib.rs` 为 14,721 行；命令属性/注册数为 175/175，前端唯一 invoke 162，缺失后端命令 0。
+- 通过条件：`cargo fmt --all`、`cargo check -p storyforge --all-targets`、`cargo clippy -p storyforge --all-targets -- -D warnings`、`cargo test -p storyforge --lib`（344 passed, 3 ignored）和前端合同测试。
+- Gate 1 尚未整体通过：仍需 bootstrap/AppState/注册与 inline tests 的收敛；Gate 2 状态机、Gate 3 backend facade、SQLite 能力补齐与迁移切换均未开始收口。
