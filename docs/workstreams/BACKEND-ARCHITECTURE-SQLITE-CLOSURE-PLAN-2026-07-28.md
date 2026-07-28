@@ -673,4 +673,12 @@ Gate 0 通过后，第二刀从 diagnostics/presets/connections 三个低耦合�
 - 已知前置问题（非本批次引入）：`harness-real-llm`（default-features）引用 `normalize_knowledge_update_for_postprocess`/`is_postprocess_instance_present` 报 private（Gate 1 遗留），不在确定性门禁内，建议独立 follow-up。
 - Gate 2 剩余：Batch 2.6（writing 阶段）、2.7（事件发射）、2.8（RESULT 收口）。详见 RESULT 文档第 9 节。
 
+## 26. Gate 2 Batch 2.6 检查点（EditorStarted 双发消除；阶段抽取 PARTIAL，2026-07-28）
+
+- Batch 2.6（已完成部分）：消除 regenerate 路径 B（`rerun_editor_only`）与路径 C（`rerun_subagents`）的 `EditorStarted` 双发——两路径在调 `run_editor_and_commit` 前各发一次，helper 内部又发一次；前端 `editor_started` 处理器重置 `editor.output`，双发清掉已流式的编剧输出（产品缺陷）。删除两处冗余发射，保留 `StateChanged{Editing}`；新增契约测试 `test_regenerate_editor_only_emits_editor_started_once`（RED→GREEN）。
+- Batch 2.6（PARTIAL，推迟）：Director/Subagent/Editor 阶段抽取未完成。`start_writing_with_mode_at` 与 regenerate 路径 A 的 Director（`:822-950` ≈ `:2113-2236`）、Subagent（`:952-1085` ≈ `:2238-2346`）阶段近逐行重复；start_writing 内联 Editor（`:1087-1242`）与 `run_editor_and_commit`（`:2906-3095`）近逐行重复。推迟理由：三阶段涉及深度 `&mut self` 状态/事件/编排，差异面（intent 来源、SequentialCrew 分支、落地语义）需全部参数化，覆盖 ~600 行核心写作路径；在缺乏真实模型回归护栏下强行合并风险偏高，可能引入 start/regenerate 微行为分叉。建议 Gate 6 后以独立子批执行（先 Editor→Director→Subagent，每步配 parity 测试）。
+- 验证：`cargo fmt --all -- --check`、`cargo clippy -p storyforge-app-pipeline --all-targets -- -D warnings`、`cargo test -p storyforge-app-pipeline`（110 passed）、`cargo test -p storyforge --no-default-features`（360 passed）、`node --test frontend/tests/tauri-command-contract.test.mjs`（8/8）、`node scripts/architecture/backend-baseline.mjs`（175/175、sqlite 68）均通过。
+- 未削弱：`EditorStarted` 路径 B/C 单发（契约钉住）；`StateChanged{Editing}` 保留；路径 A / sequential suffix / start_writing / start_duet 单发未动；命令/DTO/事件词汇/前端 IPC 合同未改（175/175）。
+- Gate 2 剩余：Batch 2.7（事件发射）、2.8（RESULT 收口，含 2.6 阶段抽取 PARTIAL 记录）。详见 RESULT 文档第 10 节。
+
 

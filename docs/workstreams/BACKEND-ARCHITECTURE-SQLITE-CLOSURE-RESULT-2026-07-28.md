@@ -304,4 +304,54 @@ Batch 2.5 消除 `app-agent/src/runtime.rs` 三个近似工具循环的重复实
 - **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
 - **Batch 2.8（RESULT 收口）**：待上述批次完成后追加最终 Gate 2 结论。
 
+## 10. Gate 2 Batch 2.6 检查点（EditorStarted 双发消除；阶段抽取 PARTIAL）
+
+### 10.1 已完成：EditorStarted 双发消除
+
+regenerate 的路径 B（`rerun_editor_only`）与路径 C（`rerun_subagents`）在调用 `run_editor_and_commit` 前各自发射了一次 `EditorStarted`，而 helper 内部（`lib.rs:2934`）又发射一次，导致**双发**。前端 `usePipeline.js` 的 `editor_started` 处理器会重置 `editor.output = ''`，双发会清掉已经开始流式的编剧输出（实际产品缺陷）。
+
+**修复**：删除路径 B（`lib.rs:2399`）与路径 C（`lib.rs:2628`）的冗余 `EditorStarted` 发射；保留各自的 `StateChanged{Editing}`（helper 设 state 但不重发 `StateChanged`）。`run_editor_and_commit` 内部发射点（`:2934`）保留为唯一规范发射点。
+
+**新增契约测试** `test_regenerate_editor_only_emits_editor_started_once`：RED 阶段实测双发（count=2），修复后 GREEN（count=1）。
+
+### 10.2 PARTIAL：Director / Subagent 阶段抽取（推迟）
+
+计划 §7.2 要求「把 Director、Subagent、Editor 阶段抽成可复用 stage functions；start_writing 与 regenerate 共享同一阶段实现」。本批次**未完成**此抽取，原因与边界如下（诚实记录，不虚报 PASS）：
+
+**重复现状**（`app-pipeline/src/lib.rs`，7,868 行）：
+- **Director 阶段**：`start_writing_with_mode_at`（`:822-950`）与 regenerate 路径 A（`:2113-2236`）近逐行重复（`has_available_characters` 守卫、`make_director_config` + registry + whitelist、`recent_history_with_epoch` + chronicle 分区、`director_layout`、`DirectorProgress` forwarder、`run_tool_loop_with_layout` + plan 探测、`parse_plan_from_response` + `DirectorDone`）。唯一真实差异：intent 来源（start_writing 用用户 intent；路径 A 从 `provenance_old.plan.scene_brief` 推导）与 node-id 来源。
+- **Subagent 阶段**：`start_writing_with_mode_at`（`:952-1085`）与 regenerate 路径 A（`:2238-2346`）近逐行重复（`Delegating` 状态、`SubagentStarted` 循环、`char_specs`/temporaries、`effective_runtime`、`max_concurrent`/`summary_block`/`far_block`/`subagent_base`、结果循环 `SubagentDone`/`SubagentCancelled`、全失败守卫）。真实差异：start_writing 有 SequentialCrew 分支；路径 A 总走 `spawn_subagents`。
+- **Editor 阶段**：`start_writing_with_mode_at` 内联（`:1087-1242`）与 `run_editor_and_commit`（`:2906-3095`）近逐行重复（`make_editor_config`、`NarrativeContract`、`redact_performances_for_editor`、`editor_layout`、`EditorProgress`、`run_tool_loop_with_layout`、`apply_editor_output_regex` + `DraftReady`）。真实差异：落地语义（start_writing 用 `append_ai_draft` 新节点；helper 用 `replace_active_variant`/`add_variant` 变体）与返回类型。
+
+**推迟理由**：
+1. 三阶段都涉及深度 `&mut self` 状态变更、事件发射与编排逻辑；start_writing 有 SequentialCrew 分支，落地语义不同（新节点 vs 变体）。抽取需要把 intent 来源、SequentialCrew 分支、node-id 来源、落地语义全部参数化，改动面覆盖 ~600 行核心写作路径。
+2. 计划硬约束「不在机械拆分阶段顺手改行为」「不削弱已有错误检查/权限检查」；当前确定性测试门禁（mock-LLM）虽全绿，但 Director/Subagent 抽取在没有真实模型回归证据下风险偏高，可能引入 start_writing / regenerate 之间的微行为分叉。
+3. EditorStarted 双发是**确定的产品缺陷**（前端流式输出被清），本批次已确定性修复并测试；阶段抽取属**架构整洁性**目标，可独立排期，不应在缺乏充分回归护栏时强行合并。
+
+**建议后续**：Director/Subagent/Editor 阶段抽取应在 Gate 6（真实模型证据）建立后，以独立子批执行——先抽 Editor（落地语义参数化，复用 `run_editor_and_commit`），再抽 Director（intent 来源参数化），最后抽 Subagent（SequentialCrew 分支参数化）。每步配 mock-LLM parity 测试 + 真实模型冒烟。
+
+### 10.3 验证证据（EditorStarted 修复）
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p storyforge-app-pipeline --all-targets -- -D warnings`：通过。
+- `cargo test -p storyforge-app-pipeline`：110 passed（既有 109 + 1 新契约测试）、0 failed。
+- `cargo test -p storyforge --no-default-features`：360 passed、3 ignored、0 failed（无回归）。
+- 既有 `test_regenerate_editor_only` / `test_regenerate_subagent_only` / `test_regenerate_full_with_hint` 等回归全通过。
+- `node --test frontend/tests/tauri-command-contract.test.mjs`：8 passed、0 failed。
+- `node scripts/architecture/backend-baseline.mjs`：175/175 注册一致，前端缺失 0，sqlite activeFlagReferences 68 不变。
+- `git diff --check`：通过。
+
+### 10.4 未削弱项核对
+
+- [x] `EditorStarted` 在 regenerate 路径 B/C 只发一次（契约测试钉住）。
+- [x] `StateChanged{Editing}` 在路径 B/C 仍发射（helper 不重发，故保留前置发射）。
+- [x] 路径 A（rerun_director）与 `regenerate_sequential_suffix` 本就单发，未受影响。
+- [x] start_writing / start_duet 的内联 EditorStarted 单发，未改动。
+- [x] 命令名/参数/DTO/事件词汇/前端 IPC 合同：未改动（175/175 不变；`editor_started` 事件本身保留，只是不再双发）。
+
+### 10.5 Gate 2 剩余（按计划 §7）
+
+- **Batch 2.7（取消/失败事件发射）**：`SubagentCancelled` 混淆真取消与 LLM 失败；cancel skip 重发为 `PostProcessFailed`。
+- **Batch 2.8（RESULT 收口）**：待 2.7 完成后追加最终 Gate 2 结论（含 2.6 阶段抽取 PARTIAL 的诚实记录）。
+
 
