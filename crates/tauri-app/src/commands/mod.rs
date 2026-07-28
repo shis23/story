@@ -5,6 +5,7 @@ pub(crate) mod characters;
 pub(crate) mod connections;
 pub(crate) mod diagnostics;
 pub(crate) mod import_export;
+pub(crate) mod memory;
 pub(crate) mod meta;
 pub(crate) mod meta_typed;
 pub(crate) mod mvu;
